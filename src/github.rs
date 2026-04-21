@@ -203,7 +203,12 @@ pub enum MintError {
     Jwt(#[from] jsonwebtoken::errors::Error),
     #[error("HTTP error: {0}")]
     Http(#[from] reqwest::Error),
-    #[error("GitHub returned {status}: {body}")]
+    /// `body` carries the full error payload GitHub returned; `Display`
+    /// truncates it so that logs pulling the error via `{err}` don't
+    /// inherit an unbounded-length payload (and get a lightly defensive
+    /// cap against any unexpected sensitive echo). Programmatic callers
+    /// that actually want the full body can destructure the variant.
+    #[error("GitHub returned {status}: {}", truncate_for_display(body))]
     ApiError { status: u16, body: String },
     #[error("GitHub returned a malformed expiry timestamp {0:?}")]
     BadExpiry(String),
@@ -258,6 +263,18 @@ fn parse_rfc3339_seconds(s: &str) -> Result<i64, MintError> {
     time::OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339)
         .map(|t| t.unix_timestamp())
         .map_err(|_| MintError::BadExpiry(s.to_string()))
+}
+
+/// Cap at 256 chars so an unbounded API payload can't balloon a log line.
+/// Counts chars (not bytes) to avoid slicing mid-multi-byte scalar value.
+const API_ERROR_DISPLAY_CAP: usize = 256;
+
+fn truncate_for_display(body: &str) -> String {
+    let mut out: String = body.chars().take(API_ERROR_DISPLAY_CAP).collect();
+    if body.chars().count() > API_ERROR_DISPLAY_CAP {
+        out.push_str("... (truncated)");
+    }
+    out
 }
 
 #[cfg(test)]
@@ -588,6 +605,49 @@ mod tests {
             iat >= before && iat <= after,
             "issued_at {iat} outside [{before}, {after}]"
         );
+    }
+
+    #[test]
+    fn api_error_display_truncates_long_bodies() {
+        let long_body = "x".repeat(API_ERROR_DISPLAY_CAP * 10);
+        let err = MintError::ApiError {
+            status: 500,
+            body: long_body.clone(),
+        };
+        let shown = format!("{err}");
+        assert!(
+            shown.len() < long_body.len(),
+            "display should be shorter than raw body"
+        );
+        assert!(
+            shown.contains("... (truncated)"),
+            "truncation marker missing: {shown}"
+        );
+    }
+
+    #[test]
+    fn api_error_display_leaves_short_bodies_intact() {
+        let body = "{\"message\": \"Not Found\"}";
+        let err = MintError::ApiError {
+            status: 404,
+            body: body.to_string(),
+        };
+        let shown = format!("{err}");
+        assert!(shown.contains(body), "short body should not be truncated: {shown}");
+        assert!(!shown.contains("truncated"));
+    }
+
+    #[test]
+    fn api_error_display_handles_multibyte_boundary() {
+        // If truncation sliced on byte boundaries rather than char
+        // boundaries, a body containing multi-byte scalars right at the
+        // cap would panic. Exercise that path explicitly.
+        let body = "é".repeat(API_ERROR_DISPLAY_CAP * 2);
+        let err = MintError::ApiError {
+            status: 422,
+            body,
+        };
+        let _ = format!("{err}");
     }
 
     #[test]
