@@ -27,6 +27,9 @@ pub enum SecretError {
         expected: u32,
     },
 
+    #[error("{path} is not a directory")]
+    NotADirectory { path: String },
+
     #[error("keyring error: {0}")]
     Keyring(String),
 

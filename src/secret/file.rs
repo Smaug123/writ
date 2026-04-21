@@ -1,8 +1,13 @@
 //! Filesystem-backed secret store.
 //!
 //! Secrets are stored as individual files under a base directory with mode
-//! 0600, and the base directory itself must have mode 0700 (no group or
-//! world access). Writes are atomic via tempfile + rename.
+//! 0600. The base directory itself must be a directory with no group or
+//! world access bits set — equivalent to the permission predicate SSH
+//! applies to `~/.ssh`. `create_or_open` creates new directories with
+//! exact mode 0700; `open` only enforces the "no group/world access"
+//! side, so a pre-existing directory the owner has further restricted
+//! (e.g. 0500 for read-only operation) is also accepted. Writes are
+//! atomic via tempfile + rename.
 
 use std::fs;
 use std::io::Write;
@@ -17,11 +22,21 @@ pub struct FileSecretStore {
 }
 
 impl FileSecretStore {
-    /// Open an existing store at `base`. The directory must already exist
-    /// and have mode 0700 (no access for anyone but the owner).
+    /// Open an existing store at `base`. `base` must already exist, be a
+    /// directory, and carry no group or world permission bits (i.e.
+    /// `mode & 0o077 == 0`). Owner bits aren't further constrained:
+    /// whether the caller has enough access to perform subsequent reads
+    /// or writes is their problem, not a security condition this method
+    /// enforces.
     pub fn open(base: impl Into<PathBuf>) -> Result<Self, SecretError> {
         let base = base.into();
-        let mode = fs::metadata(&base)?.permissions().mode() & 0o777;
+        let meta = fs::metadata(&base)?;
+        if !meta.is_dir() {
+            return Err(SecretError::NotADirectory {
+                path: base.display().to_string(),
+            });
+        }
+        let mode = meta.permissions().mode() & 0o777;
         if mode & 0o077 != 0 {
             return Err(SecretError::UnsafePermissions {
                 path: base.display().to_string(),
@@ -180,6 +195,43 @@ mod tests {
         fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o705)).unwrap();
         let err = FileSecretStore::open(dir.path()).unwrap_err();
         assert!(matches!(err, SecretError::UnsafePermissions { .. }));
+    }
+
+    /// Regression: `open` previously only checked the mode bits and not
+    /// `is_dir`, so a permission-safe *file* at the base path would have
+    /// been happily accepted as a store root.
+    #[test]
+    fn open_rejects_file_that_is_not_a_directory() {
+        let parent = TempDir::new().unwrap();
+        fs::set_permissions(parent.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let path = parent.path().join("not-a-dir");
+        {
+            let mut f = fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .mode(0o600)
+                .open(&path)
+                .unwrap();
+            f.write_all(b"hello").unwrap();
+        }
+        let err = FileSecretStore::open(&path).unwrap_err();
+        assert!(
+            matches!(err, SecretError::NotADirectory { .. }),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    /// Pins the "tighter than 0700 is fine" side of the documented
+    /// contract: 0500 is a permission-safe read-only mode the owner may
+    /// reasonably choose, and `open` must accept it. 0600 would also be
+    /// permission-safe by the group/world rule, but has no search bit and
+    /// so leaves TempDir unable to clean up its own scratch path — we use
+    /// 0500 to keep the test self-contained.
+    #[test]
+    fn open_accepts_directory_tighter_than_0700() {
+        let dir = TempDir::new().unwrap();
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o500)).unwrap();
+        let _ = FileSecretStore::open(dir.path()).expect("0500 dir should be accepted");
     }
 
     #[test]
