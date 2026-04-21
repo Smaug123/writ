@@ -6,7 +6,7 @@
 use agent_infra::core::{
     CapabilityRequest, CredentialGrant, GitHubAccess, GitHubGrantedScope, GitHubPermissions,
     GitHubRequest, GrantedScope, Jti, PolicyDecision, RepoRef, RequestId, SessionId, SessionRecord,
-    TtlSeconds, UnixSeconds,
+    TtlSeconds, UnixMillis,
 };
 use agent_infra::policy::{PolicyConfig, decide};
 use proptest::prelude::*;
@@ -77,8 +77,8 @@ fn arb_grant() -> impl Strategy<Value = CredentialGrant> {
             request_id: RequestId::new(),
             session_id: SessionId::new(),
             scope,
-            issued_at: UnixSeconds::from_i64(issued),
-            expires_at: UnixSeconds::from_i64(issued + ttl),
+            issued_at: UnixMillis::from_millis(issued),
+            expires_at: UnixMillis::from_millis(issued + ttl),
         }
     })
 }
@@ -94,8 +94,8 @@ fn arb_session() -> impl Strategy<Value = SessionRecord> {
             session_id: SessionId::new(),
             label,
             agent_model,
-            opened_at: UnixSeconds::from_i64(opened),
-            closed_at: closed.map(UnixSeconds::from_i64),
+            opened_at: UnixMillis::from_millis(opened),
+            closed_at: closed.map(UnixMillis::from_millis),
         })
 }
 

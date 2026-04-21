@@ -23,7 +23,7 @@
 
 use crate::core::{
     CredentialGrant, GitHubGrantedScope, GitHubPermissions, GrantedScope, Jti, RequestId,
-    SessionId, TtlSeconds, UnixSeconds,
+    SessionId, TtlSeconds, UnixMillis,
 };
 use crate::secret::{SecretError, SecretKey, SecretStore};
 use serde::{Deserialize, Serialize};
@@ -66,15 +66,15 @@ pub struct GitHubAppConfig {
 /// [`MintedToken::into_grant_and_token`]. Pairing the token and the
 /// grant through a single consuming call rules out a whole class of
 /// drift bugs where the audit record disagrees with the token that was
-/// actually handed to the agent (wrong `jti`, a fresh `UnixSeconds::now()`
+/// actually handed to the agent (wrong `jti`, a fresh `UnixMillis::now()`
 /// instead of the broker-clock reading the TTL check validated, a scope
 /// different from the one the minter signed for).
 #[derive(Debug)]
 pub struct MintedToken {
     token: String,
     jti: Jti,
-    issued_at: UnixSeconds,
-    expires_at: UnixSeconds,
+    issued_at: UnixMillis,
+    expires_at: UnixMillis,
     scope: GitHubGrantedScope,
 }
 
@@ -82,12 +82,12 @@ impl MintedToken {
     /// Broker-clock timestamp captured immediately before the mint request
     /// went out, and the reference against which GitHub's `expires_at` was
     /// compared for the TTL check.
-    pub fn issued_at(&self) -> UnixSeconds {
+    pub fn issued_at(&self) -> UnixMillis {
         self.issued_at
     }
 
     /// The expiry GitHub said it will enforce. Authoritative.
-    pub fn expires_at(&self) -> UnixSeconds {
+    pub fn expires_at(&self) -> UnixMillis {
         self.expires_at
     }
 
@@ -175,8 +175,12 @@ impl<S: SecretStore> GitHubMinter<S> {
             .get(&self.config.private_key_secret)?
             .ok_or_else(|| MintError::PrivateKeyMissing(self.config.private_key_secret.clone()))?;
 
-        let issued_at = UnixSeconds::now().as_i64();
-        let jwt = sign_jwt(&pem, self.config.app_id, issued_at)?;
+        // Broker clock at mint start, kept at millisecond resolution for
+        // the audit record. JWT `iat` is a whole-seconds claim, so the
+        // signing step only sees the floored value.
+        let issued_at = UnixMillis::now();
+        let issued_at_seconds = issued_at.as_seconds_floor();
+        let jwt = sign_jwt(&pem, self.config.app_id, issued_at_seconds)?;
 
         let url = format!(
             "{}/app/installations/{}/access_tokens",
@@ -211,33 +215,36 @@ impl<S: SecretStore> GitHubMinter<S> {
         }
 
         let parsed: MintResponse = resp.json().await?;
-        let expires_at = parse_rfc3339_seconds(&parsed.expires_at)?;
+        // GitHub's `expires_at` is whole-seconds-precision, so the TTL
+        // comparisons below stay in seconds and the audit record gets
+        // the timestamp lifted to millisecond space on the second boundary.
+        let expires_at_seconds = parse_rfc3339_seconds(&parsed.expires_at)?;
 
         // Defence-in-depth: GitHub should never return a token expiring at
         // or before our issue time, but if it did we'd otherwise happily
         // record a grant that was already dead and hand the agent a
         // useless token. Bail loudly instead.
-        if expires_at <= issued_at {
+        if expires_at_seconds <= issued_at_seconds {
             return Err(MintError::ExpiryNotInFuture {
-                issued_at,
-                actual_expires_at: expires_at,
+                issued_at: issued_at_seconds,
+                actual_expires_at: expires_at_seconds,
             });
         }
 
-        let max_allowed = issued_at + ttl.as_i64() + TTL_SKEW_TOLERANCE_SECONDS;
-        if expires_at > max_allowed {
+        let max_allowed = issued_at_seconds + ttl.as_i64() + TTL_SKEW_TOLERANCE_SECONDS;
+        if expires_at_seconds > max_allowed {
             return Err(MintError::TtlExceeded {
                 ttl_seconds: ttl.as_i64(),
-                issued_at,
-                actual_expires_at: expires_at,
+                issued_at: issued_at_seconds,
+                actual_expires_at: expires_at_seconds,
             });
         }
 
         Ok(MintedToken {
             token: parsed.token,
             jti: Jti::new(),
-            issued_at: UnixSeconds::from_i64(issued_at),
-            expires_at: UnixSeconds::from_i64(expires_at),
+            issued_at,
+            expires_at: UnixMillis::from_seconds(expires_at_seconds),
             scope,
         })
     }
@@ -463,7 +470,7 @@ mod tests {
             .await
             .expect("mint ok");
 
-        assert_eq!(minted.expires_at().as_i64(), expiry_ts);
+        assert_eq!(minted.expires_at().as_seconds_floor(), expiry_ts);
         let (token, _grant) = minted.into_grant_and_token(RequestId::new(), SessionId::new());
         assert_eq!(token, "ghs_fake_value");
     }
@@ -520,7 +527,7 @@ mod tests {
     /// ceiling tests against the broker's real clock rather than a pinned
     /// 2024 date the ceiling check would find trivially in the past.
     fn expiry_seconds_from_now(secs: i64) -> (i64, String) {
-        let ts = UnixSeconds::now().as_i64() + secs;
+        let ts = UnixMillis::now().as_seconds_floor() + secs;
         let formatted = time::OffsetDateTime::from_unix_timestamp(ts)
             .unwrap()
             .format(&time::format_description::well_known::Rfc3339)
@@ -607,7 +614,7 @@ mod tests {
             .mint(write_scope("o", "n"), TtlSeconds::new(3600).unwrap())
             .await
             .expect("mint within skew tolerance should succeed");
-        assert!(minted.expires_at().as_i64() > minted.issued_at().as_i64());
+        assert!(minted.expires_at().as_millis() > minted.issued_at().as_millis());
     }
 
     #[tokio::test]
@@ -644,14 +651,14 @@ mod tests {
             .await;
 
         let minter = minter_with_key(&server);
-        let before = UnixSeconds::now().as_i64();
+        let before = UnixMillis::now().as_millis();
         let minted = minter
             .mint(write_scope("o", "n"), TtlSeconds::new(3600).unwrap())
             .await
             .unwrap();
-        let after = UnixSeconds::now().as_i64();
+        let after = UnixMillis::now().as_millis();
 
-        let iat = minted.issued_at().as_i64();
+        let iat = minted.issued_at().as_millis();
         assert!(
             iat >= before && iat <= after,
             "issued_at {iat} outside [{before}, {after}]"
@@ -695,7 +702,7 @@ mod tests {
         assert_eq!(grant.session_id, session_id);
         assert_eq!(grant.issued_at, captured_issued_at);
         assert_eq!(grant.expires_at, captured_expires_at);
-        assert_eq!(grant.expires_at.as_i64(), expiry_ts);
+        assert_eq!(grant.expires_at.as_seconds_floor(), expiry_ts);
         assert_eq!(grant.scope, GrantedScope::GitHub(requested_scope));
     }
 

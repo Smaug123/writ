@@ -72,27 +72,42 @@ uuid_id!(
 
 // --- Timestamp --------------------------------------------------------
 
-/// A unix-epoch timestamp in seconds, always UTC.
+/// A unix-epoch timestamp in milliseconds, always UTC. Millisecond
+/// resolution is fine enough that parallel agent panes or a burst of
+/// GitHub calls within the same wall-clock second still get distinct
+/// received_at/issued_at/closed_at values, which the audit log relies on
+/// to reconstruct event order during replay.
 #[derive(Copy, Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(transparent)]
-pub struct UnixSeconds(i64);
+pub struct UnixMillis(i64);
 
-impl UnixSeconds {
+impl UnixMillis {
     pub fn now() -> Self {
-        Self(time::OffsetDateTime::now_utc().unix_timestamp())
+        // `unix_timestamp_nanos` is i128; dividing by 1_000_000 lands us in
+        // i64 millisecond space for any plausible calendar date.
+        let nanos = time::OffsetDateTime::now_utc().unix_timestamp_nanos();
+        Self((nanos / 1_000_000) as i64)
     }
-    pub fn from_i64(v: i64) -> Self {
+    pub fn from_millis(v: i64) -> Self {
         Self(v)
     }
-    pub fn as_i64(self) -> i64 {
+    pub fn as_millis(self) -> i64 {
         self.0
     }
-    pub fn add_seconds(self, s: i64) -> Self {
-        Self(self.0 + s)
+    /// Construct from a whole-number unix-seconds value (e.g. GitHub's
+    /// `expires_at`, JWT `iat`/`exp`). The resulting instant sits exactly
+    /// on a second boundary.
+    pub fn from_seconds(s: i64) -> Self {
+        Self(s.saturating_mul(1000))
+    }
+    /// Truncate to whole unix seconds. Needed where a wire format
+    /// (JWT claims, GitHub REST) only carries second precision.
+    pub fn as_seconds_floor(self) -> i64 {
+        self.0.div_euclid(1000)
     }
 }
 
-impl std::fmt::Display for UnixSeconds {
+impl std::fmt::Display for UnixMillis {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.0.fmt(f)
     }
@@ -210,9 +225,26 @@ mod tests {
     }
 
     #[test]
-    fn unix_seconds_serialises_as_integer() {
-        let t = UnixSeconds::from_i64(1_700_000_000);
-        assert_eq!(serde_json::to_string(&t).unwrap(), "1700000000");
+    fn unix_millis_serialises_as_integer() {
+        let t = UnixMillis::from_millis(1_700_000_000_123);
+        assert_eq!(serde_json::to_string(&t).unwrap(), "1700000000123");
+    }
+
+    #[test]
+    fn unix_millis_seconds_conversion_is_exact_at_boundaries() {
+        let t = UnixMillis::from_seconds(1_700_000_000);
+        assert_eq!(t.as_millis(), 1_700_000_000_000);
+        assert_eq!(t.as_seconds_floor(), 1_700_000_000);
+    }
+
+    #[test]
+    fn unix_millis_seconds_floor_truncates_towards_minus_infinity() {
+        // Negative timestamps are unusual but possible; `div_euclid`
+        // guarantees we round toward minus infinity so a pre-epoch ms
+        // value doesn't silently round the wrong way.
+        assert_eq!(UnixMillis::from_millis(1_500).as_seconds_floor(), 1);
+        assert_eq!(UnixMillis::from_millis(-1).as_seconds_floor(), -1);
+        assert_eq!(UnixMillis::from_millis(-1_000).as_seconds_floor(), -1);
     }
 
     #[test]

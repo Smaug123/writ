@@ -101,7 +101,14 @@ impl SecretStore for FileSecretStore {
 
     fn delete(&self, key: &SecretKey) -> Result<(), SecretError> {
         match fs::remove_file(self.path_for(key)) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                // fsync the parent dir so the unlink itself is durable: without
+                // this, a crash after `remove_file` returned could leave the
+                // dirent intact on disk and resurrect the secret on restart.
+                // Mirrors the parent-dir sync `put` does for the rename.
+                fs::File::open(&self.base)?.sync_all()?;
+                Ok(())
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(e.into()),
         }

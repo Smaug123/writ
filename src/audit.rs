@@ -24,8 +24,17 @@ use thiserror::Error;
 
 use crate::core::{
     CapabilityRequest, CredentialGrant, GrantedScope, Jti, PolicyDecision, RequestId, SessionId,
-    SessionRecord, UnixSeconds,
+    SessionRecord, UnixMillis,
 };
+
+/// How much a grant's effective lifetime may exceed the decision's TTL
+/// ceiling before the audit layer rejects the row. Backend minters compare
+/// a backend-reported expiry against their own clock and tolerate a small
+/// amount of skew; this constant is the audit layer's matching slack, so
+/// the skew allowance at mint time doesn't spuriously trip the divergence
+/// check. Anything larger here would start to hide real disagreement
+/// between the decision and the grant.
+const AUDIT_TTL_SKEW_TOLERANCE_MILLIS: i64 = 60_000;
 
 #[derive(Debug, Error)]
 pub enum AuditError {
@@ -49,7 +58,7 @@ pub enum AuditError {
 pub struct AuditedRequest<'a> {
     pub request_id: RequestId,
     pub session_id: SessionId,
-    pub received_at: UnixSeconds,
+    pub received_at: UnixMillis,
     pub request: &'a CapabilityRequest,
     pub decision: &'a PolicyDecision,
     pub grant: Option<&'a CredentialGrant>,
@@ -113,19 +122,19 @@ impl AuditLog {
                     s.session_id.as_uuid().to_string(),
                     s.label,
                     s.agent_model,
-                    s.opened_at.as_i64(),
-                    s.closed_at.map(UnixSeconds::as_i64),
+                    s.opened_at.as_millis(),
+                    s.closed_at.map(UnixMillis::as_millis),
                 ],
             )?;
             Ok(())
         })
     }
 
-    pub fn close_session(&self, id: SessionId, at: UnixSeconds) -> Result<(), AuditError> {
+    pub fn close_session(&self, id: SessionId, at: UnixMillis) -> Result<(), AuditError> {
         self.with_conn(|c| {
             c.execute(
                 "UPDATE session SET closed_at = ?2 WHERE session_id = ?1 AND closed_at IS NULL",
-                params![id.as_uuid().to_string(), at.as_i64()],
+                params![id.as_uuid().to_string(), at.as_millis()],
             )?;
             Ok(())
         })
@@ -148,24 +157,44 @@ impl AuditLog {
     /// Record one request + decision, and (if the decision was Grant)
     /// the matching credential grant, atomically in one transaction.
     pub fn record(&self, r: &AuditedRequest<'_>) -> Result<(), AuditError> {
-        let is_grant = matches!(r.decision, PolicyDecision::Grant { .. });
-        if is_grant && r.grant.is_none() {
-            return Err(AuditError::Invariant(
-                "decision was Grant but no grant record was supplied",
-            ));
-        }
-        if !is_grant && r.grant.is_some() {
-            return Err(AuditError::Invariant(
-                "decision was Deny but a grant record was supplied",
-            ));
-        }
-        if let Some(g) = r.grant {
-            if g.request_id != r.request_id {
-                return Err(AuditError::Invariant("grant.request_id != request.request_id"));
+        match (r.decision, r.grant) {
+            (PolicyDecision::Grant { scope, ttl }, Some(g)) => {
+                if g.request_id != r.request_id {
+                    return Err(AuditError::Invariant("grant.request_id != request.request_id"));
+                }
+                if g.session_id != r.session_id {
+                    return Err(AuditError::Invariant("grant.session_id != request.session_id"));
+                }
+                // The decision and the grant are both authority claims
+                // about the same request, so they must agree on what that
+                // authority is. A mismatch means replay would read two
+                // contradictory answers from the same row.
+                if g.scope != *scope {
+                    return Err(AuditError::Invariant("grant.scope != decision.scope"));
+                }
+                let lifetime_millis = g
+                    .expires_at
+                    .as_millis()
+                    .saturating_sub(g.issued_at.as_millis());
+                let max_millis = ttl
+                    .as_i64()
+                    .saturating_mul(1000)
+                    .saturating_add(AUDIT_TTL_SKEW_TOLERANCE_MILLIS);
+                if lifetime_millis > max_millis {
+                    return Err(AuditError::Invariant("grant lifetime exceeds decision ttl"));
+                }
             }
-            if g.session_id != r.session_id {
-                return Err(AuditError::Invariant("grant.session_id != request.session_id"));
+            (PolicyDecision::Grant { .. }, None) => {
+                return Err(AuditError::Invariant(
+                    "decision was Grant but no grant record was supplied",
+                ));
             }
+            (PolicyDecision::Deny { .. }, Some(_)) => {
+                return Err(AuditError::Invariant(
+                    "decision was Deny but a grant record was supplied",
+                ));
+            }
+            (PolicyDecision::Deny { .. }, None) => {}
         }
 
         let request_json = serde_json::to_string(r.request)?;
@@ -183,7 +212,7 @@ impl AuditLog {
                 params![
                     r.request_id.as_uuid().to_string(),
                     r.session_id.as_uuid().to_string(),
-                    r.received_at.as_i64(),
+                    r.received_at.as_millis(),
                     request_json,
                     decision_json,
                 ],
@@ -197,8 +226,8 @@ impl AuditLog {
                         r.request_id.as_uuid().to_string(),
                         r.session_id.as_uuid().to_string(),
                         scope_json,
-                        issued_at.as_i64(),
-                        expires_at.as_i64(),
+                        issued_at.as_millis(),
+                        expires_at.as_millis(),
                     ],
                 )?;
             }
@@ -212,9 +241,13 @@ impl AuditLog {
         id: SessionId,
     ) -> Result<Vec<CredentialGrant>, AuditError> {
         self.with_conn(|c| {
+            // Secondary sort on rowid so grants issued in the same instant
+            // still come back in insert order. Without it, `ORDER BY
+            // issued_at ASC` leaves same-timestamp rows in an unspecified
+            // order and replay can't reconstruct the real sequence.
             let mut stmt = c.prepare(
                 "SELECT jti, request_id, session_id, scope_json, issued_at, expires_at \
-                 FROM grant_log WHERE session_id = ?1 ORDER BY issued_at ASC",
+                 FROM grant_log WHERE session_id = ?1 ORDER BY issued_at ASC, rowid ASC",
             )?;
             let rows = stmt
                 .query_map(params![id.as_uuid().to_string()], grant_from_row)?
@@ -254,8 +287,8 @@ fn session_from_row(row: &Row<'_>) -> rusqlite::Result<SessionRecord> {
         session_id: SessionId::from_uuid(uuid),
         label,
         agent_model,
-        opened_at: UnixSeconds::from_i64(opened_at),
-        closed_at: closed_at.map(UnixSeconds::from_i64),
+        opened_at: UnixMillis::from_millis(opened_at),
+        closed_at: closed_at.map(UnixMillis::from_millis),
     })
 }
 
@@ -280,8 +313,8 @@ fn grant_from_row(row: &Row<'_>) -> rusqlite::Result<Result<CredentialGrant, Aud
             request_id: RequestId::from_uuid(request_id),
             session_id: SessionId::from_uuid(session_id),
             scope,
-            issued_at: UnixSeconds::from_i64(issued_at),
-            expires_at: UnixSeconds::from_i64(expires_at),
+            issued_at: UnixMillis::from_millis(issued_at),
+            expires_at: UnixMillis::from_millis(expires_at),
         })
     };
     Ok(parse())
@@ -330,7 +363,7 @@ mod tests {
             session_id: SessionId::new(),
             label: Some("test".into()),
             agent_model: Some("claude-opus-4-7".into()),
-            opened_at: UnixSeconds::from_i64(1_700_000_000),
+            opened_at: UnixMillis::from_millis(1_700_000_000),
             closed_at: None,
         }
     }
@@ -380,10 +413,10 @@ mod tests {
         let log = AuditLog::open_in_memory().unwrap();
         let s = sample_session();
         log.open_session(&s).unwrap();
-        log.close_session(s.session_id, UnixSeconds::from_i64(1_700_000_500))
+        log.close_session(s.session_id, UnixMillis::from_millis(1_700_000_500))
             .unwrap();
         let back = log.get_session(s.session_id).unwrap().unwrap();
-        assert_eq!(back.closed_at, Some(UnixSeconds::from_i64(1_700_000_500)));
+        assert_eq!(back.closed_at, Some(UnixMillis::from_millis(1_700_000_500)));
     }
 
     #[test]
@@ -393,12 +426,12 @@ mod tests {
         let log = AuditLog::open_in_memory().unwrap();
         let s = sample_session();
         log.open_session(&s).unwrap();
-        log.close_session(s.session_id, UnixSeconds::from_i64(100))
+        log.close_session(s.session_id, UnixMillis::from_millis(100))
             .unwrap();
-        log.close_session(s.session_id, UnixSeconds::from_i64(200))
+        log.close_session(s.session_id, UnixMillis::from_millis(200))
             .unwrap();
         let back = log.get_session(s.session_id).unwrap().unwrap();
-        assert_eq!(back.closed_at, Some(UnixSeconds::from_i64(100)));
+        assert_eq!(back.closed_at, Some(UnixMillis::from_millis(100)));
     }
 
     #[test]
@@ -419,14 +452,14 @@ mod tests {
             request_id,
             session_id: s.session_id,
             scope: scope.clone(),
-            issued_at: UnixSeconds::from_i64(1_700_000_100),
-            expires_at: UnixSeconds::from_i64(1_700_000_400),
+            issued_at: UnixMillis::from_millis(1_700_000_100),
+            expires_at: UnixMillis::from_millis(1_700_000_400),
         };
 
         log.record(&AuditedRequest {
             request_id,
             session_id: s.session_id,
-            received_at: UnixSeconds::from_i64(1_700_000_100),
+            received_at: UnixMillis::from_millis(1_700_000_100),
             request: &req,
             decision: &decision,
             grant: Some(&grant),
@@ -454,7 +487,7 @@ mod tests {
         log.record(&AuditedRequest {
             request_id,
             session_id: s.session_id,
-            received_at: UnixSeconds::from_i64(1_700_000_100),
+            received_at: UnixMillis::from_millis(1_700_000_100),
             request: &req,
             decision: &decision,
             grant: None,
@@ -479,14 +512,14 @@ mod tests {
             request_id,
             session_id: s.session_id,
             scope: sample_scope(),
-            issued_at: UnixSeconds::from_i64(1),
-            expires_at: UnixSeconds::from_i64(2),
+            issued_at: UnixMillis::from_millis(1),
+            expires_at: UnixMillis::from_millis(2),
         };
         let err = log
             .record(&AuditedRequest {
                 request_id,
                 session_id: s.session_id,
-                received_at: UnixSeconds::from_i64(1_700_000_100),
+                received_at: UnixMillis::from_millis(1_700_000_100),
                 request: &req,
                 decision: &decision,
                 grant: Some(&bogus_grant),
@@ -510,7 +543,7 @@ mod tests {
             .record(&AuditedRequest {
                 request_id,
                 session_id: s.session_id,
-                received_at: UnixSeconds::from_i64(1_700_000_100),
+                received_at: UnixMillis::from_millis(1_700_000_100),
                 request: &req,
                 decision: &decision,
                 grant: None,
@@ -604,14 +637,14 @@ mod tests {
                 request_id,
                 session_id: s.session_id,
                 scope: sample_scope(),
-                issued_at: UnixSeconds::from_i64(at),
-                expires_at: UnixSeconds::from_i64(at + 300),
+                issued_at: UnixMillis::from_millis(at),
+                expires_at: UnixMillis::from_millis(at + 300),
             };
             let request = sample_request();
             log.record(&AuditedRequest {
                 request_id,
                 session_id: s.session_id,
-                received_at: UnixSeconds::from_i64(at),
+                received_at: UnixMillis::from_millis(at),
                 request: &request,
                 decision: &decision,
                 grant: Some(&grant),
@@ -625,9 +658,187 @@ mod tests {
         let c = mk_grant(1500);
 
         let listed = log.list_grants_for_session(s.session_id).unwrap();
-        assert_eq!(listed.iter().map(|g| g.issued_at.as_i64()).collect::<Vec<_>>(),
+        assert_eq!(listed.iter().map(|g| g.issued_at.as_millis()).collect::<Vec<_>>(),
                    vec![1000, 1500, 2000]);
         assert_eq!(listed.iter().map(|g| g.jti).collect::<Vec<_>>(),
                    vec![a.jti, c.jti, b.jti]);
+    }
+
+    /// With millisecond resolution two grants can still share an
+    /// `issued_at`, so `list_grants_for_session` must fall back on insert
+    /// order rather than leaving the tie undefined. Record two rows with
+    /// identical timestamps and check they come back in the order they
+    /// were written.
+    #[test]
+    fn grants_with_identical_issued_at_preserve_insert_order() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+
+        let mk_grant = || {
+            let request_id = RequestId::new();
+            let decision = PolicyDecision::Grant {
+                scope: sample_scope(),
+                ttl: TtlSeconds::new(300).unwrap(),
+            };
+            let grant = CredentialGrant {
+                jti: Jti::new(),
+                request_id,
+                session_id: s.session_id,
+                scope: sample_scope(),
+                issued_at: UnixMillis::from_millis(5_000),
+                expires_at: UnixMillis::from_millis(5_300),
+            };
+            let request = sample_request();
+            log.record(&AuditedRequest {
+                request_id,
+                session_id: s.session_id,
+                received_at: UnixMillis::from_millis(5_000),
+                request: &request,
+                decision: &decision,
+                grant: Some(&grant),
+            })
+            .unwrap();
+            grant
+        };
+
+        let first = mk_grant();
+        let second = mk_grant();
+        let third = mk_grant();
+
+        let listed = log.list_grants_for_session(s.session_id).unwrap();
+        assert_eq!(
+            listed.iter().map(|g| g.jti).collect::<Vec<_>>(),
+            vec![first.jti, second.jti, third.jti]
+        );
+    }
+
+    /// If the decision grants one scope but the supplied grant record
+    /// carries a different one, the two rows would describe contradictory
+    /// authority for the same request. Reject at the application layer.
+    #[test]
+    fn record_rejects_grant_with_divergent_scope() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+
+        let request_id = RequestId::new();
+        let req = sample_request();
+        let decision_scope = sample_scope();
+        let decision = PolicyDecision::Grant {
+            scope: decision_scope,
+            ttl: TtlSeconds::new(300).unwrap(),
+        };
+        let other_scope = GrantedScope::GitHub(GitHubGrantedScope {
+            repository: RepoRef {
+                owner: "different".into(),
+                name: "repo".into(),
+            },
+            permissions: GitHubPermissions {
+                contents: Some(GitHubAccess::Read),
+                metadata: Some(GitHubAccess::Read),
+                ..Default::default()
+            },
+        });
+        let grant = CredentialGrant {
+            jti: Jti::new(),
+            request_id,
+            session_id: s.session_id,
+            scope: other_scope,
+            issued_at: UnixMillis::from_millis(1_000),
+            expires_at: UnixMillis::from_millis(2_000),
+        };
+
+        let err = log
+            .record(&AuditedRequest {
+                request_id,
+                session_id: s.session_id,
+                received_at: UnixMillis::from_millis(1_000),
+                request: &req,
+                decision: &decision,
+                grant: Some(&grant),
+            })
+            .unwrap_err();
+        assert!(matches!(err, AuditError::Invariant(_)), "got: {err:?}");
+    }
+
+    /// Same idea as scope divergence: if the grant's effective lifetime
+    /// grossly overshoots the decision's TTL ceiling, the two rows would
+    /// disagree on how long the authority lasts. The audit layer allows
+    /// a small skew (so minter clock tolerance doesn't spuriously trip
+    /// it) but rejects anything beyond that.
+    #[test]
+    fn record_rejects_grant_with_lifetime_exceeding_ttl() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+
+        let request_id = RequestId::new();
+        let req = sample_request();
+        let decision = PolicyDecision::Grant {
+            scope: sample_scope(),
+            ttl: TtlSeconds::new(60).unwrap(),
+        };
+        // Decision says 60s (60_000 ms). Grant lifetime is 1h (3_600_000 ms),
+        // well past the 60_000 ms skew tolerance.
+        let grant = CredentialGrant {
+            jti: Jti::new(),
+            request_id,
+            session_id: s.session_id,
+            scope: sample_scope(),
+            issued_at: UnixMillis::from_millis(0),
+            expires_at: UnixMillis::from_millis(3_600_000),
+        };
+
+        let err = log
+            .record(&AuditedRequest {
+                request_id,
+                session_id: s.session_id,
+                received_at: UnixMillis::from_millis(0),
+                request: &req,
+                decision: &decision,
+                grant: Some(&grant),
+            })
+            .unwrap_err();
+        assert!(matches!(err, AuditError::Invariant(_)), "got: {err:?}");
+    }
+
+    /// The other side of the boundary: a grant whose lifetime lands
+    /// exactly at the TTL+skew ceiling must still be accepted, otherwise
+    /// a minter operating inside its documented skew tolerance couldn't
+    /// record its own grants.
+    #[test]
+    fn record_accepts_grant_within_ttl_plus_skew() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+
+        let request_id = RequestId::new();
+        let req = sample_request();
+        let ttl_seconds: i64 = 300;
+        let decision = PolicyDecision::Grant {
+            scope: sample_scope(),
+            ttl: TtlSeconds::new(ttl_seconds).unwrap(),
+        };
+        // Lifetime = ttl + full skew tolerance, exactly on the boundary.
+        let lifetime_millis = ttl_seconds * 1000 + AUDIT_TTL_SKEW_TOLERANCE_MILLIS;
+        let grant = CredentialGrant {
+            jti: Jti::new(),
+            request_id,
+            session_id: s.session_id,
+            scope: sample_scope(),
+            issued_at: UnixMillis::from_millis(0),
+            expires_at: UnixMillis::from_millis(lifetime_millis),
+        };
+
+        log.record(&AuditedRequest {
+            request_id,
+            session_id: s.session_id,
+            received_at: UnixMillis::from_millis(0),
+            request: &req,
+            decision: &decision,
+            grant: Some(&grant),
+        })
+        .unwrap();
     }
 }

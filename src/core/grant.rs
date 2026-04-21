@@ -1,5 +1,5 @@
 use super::decision::GrantedScope;
-use super::{Jti, RequestId, SessionId, UnixSeconds};
+use super::{Jti, RequestId, SessionId, UnixMillis};
 use serde::{Deserialize, Serialize};
 
 /// The persistent record of one credential mint. The *token string itself is
@@ -12,8 +12,8 @@ pub struct CredentialGrant {
     pub request_id: RequestId,
     pub session_id: SessionId,
     pub scope: GrantedScope,
-    pub issued_at: UnixSeconds,
-    pub expires_at: UnixSeconds,
+    pub issued_at: UnixMillis,
+    pub expires_at: UnixMillis,
 }
 
 #[cfg(test)]
@@ -38,8 +38,8 @@ mod tests {
                     ..Default::default()
                 },
             }),
-            issued_at: UnixSeconds::from_i64(1_700_000_000),
-            expires_at: UnixSeconds::from_i64(1_700_000_300),
+            issued_at: UnixMillis::from_millis(1_700_000_000),
+            expires_at: UnixMillis::from_millis(1_700_000_300),
         };
         let j = serde_json::to_string(&g).unwrap();
         let back: CredentialGrant = serde_json::from_str(&j).unwrap();
