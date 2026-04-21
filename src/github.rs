@@ -156,7 +156,7 @@ const GITHUB_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 impl<S: SecretStore> GitHubMinter<S> {
     pub fn new(config: GitHubAppConfig, secrets: S) -> Self {
         let http = reqwest::Client::builder()
-            .user_agent("agent-infra-broker/0.1")
+            .user_agent("writ/0.1")
             .timeout(GITHUB_REQUEST_TIMEOUT)
             .connect_timeout(GITHUB_CONNECT_TIMEOUT)
             .build()

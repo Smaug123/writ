@@ -58,7 +58,7 @@ mod tests {
     fn sample_repo() -> RepoRef {
         RepoRef {
             owner: "smaug123".into(),
-            name: "agent-infra".into(),
+            name: "writ".into(),
         }
     }
 

@@ -3,12 +3,12 @@
 //! one-line assertion but it catches a surprising number of serde
 //! mistakes (typos in `rename_all`, adjacent-tag clashes, etc.).
 
-use agent_infra::core::{
+use writ::core::{
     CapabilityRequest, CredentialGrant, GitHubAccess, GitHubGrantedScope, GitHubPermissions,
     GitHubRequest, GrantedScope, Jti, MetadataAccess, PolicyDecision, RepoRef, RequestId,
     SessionId, SessionRecord, TtlSeconds, UnixMillis,
 };
-use agent_infra::policy::{PolicyConfig, decide};
+use writ::policy::{PolicyConfig, decide};
 use proptest::prelude::*;
 
 fn arb_repo() -> impl Strategy<Value = RepoRef> {

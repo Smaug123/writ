@@ -182,10 +182,10 @@ mod tests {
 
     #[test]
     fn repo_ref_parses_well_formed() {
-        let r: RepoRef = "smaug123/agent-infra".parse().unwrap();
+        let r: RepoRef = "smaug123/writ".parse().unwrap();
         assert_eq!(r.owner, "smaug123");
-        assert_eq!(r.name, "agent-infra");
-        assert_eq!(r.to_string(), "smaug123/agent-infra");
+        assert_eq!(r.name, "writ");
+        assert_eq!(r.to_string(), "smaug123/writ");
     }
 
     #[test]

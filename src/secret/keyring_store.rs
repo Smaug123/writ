@@ -62,7 +62,7 @@ mod tests {
     #[test]
     #[ignore]
     fn roundtrip_against_real_keyring() {
-        let service = format!("agent-infra-test-{}", Uuid::new_v4());
+        let service = format!("writ-test-{}", Uuid::new_v4());
         let store = KeyringSecretStore::new(service.clone());
         let k = SecretKey::new("probe").unwrap();
 

@@ -137,7 +137,7 @@ mod tests {
 
     #[test]
     fn write_on_allowlisted_repo_is_granted() {
-        let r = repo("smaug123", "agent-infra");
+        let r = repo("smaug123", "writ");
         let policy = policy_with(vec![r.clone()]);
         let req = CapabilityRequest::GitHub(GitHubRequest::Contents {
             access: GitHubAccess::Write,
@@ -150,7 +150,7 @@ mod tests {
 
     #[test]
     fn write_on_other_repo_is_denied() {
-        let policy = policy_with(vec![repo("smaug123", "agent-infra")]);
+        let policy = policy_with(vec![repo("smaug123", "writ")]);
         let req = CapabilityRequest::GitHub(GitHubRequest::Contents {
             access: GitHubAccess::Write,
             repo: repo("someone-else", "thing"),
@@ -246,7 +246,7 @@ mod tests {
     fn policy_config_parses_from_json() {
         let json = r#"{
             "default_ttl": 300,
-            "writable_repos": ["smaug123/agent-infra"]
+            "writable_repos": ["smaug123/writ"]
         }"#;
         let c: PolicyConfig = serde_json::from_str(json).unwrap();
         assert_eq!(c.default_ttl.as_i64(), 300);

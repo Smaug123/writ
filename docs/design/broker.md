@@ -1,4 +1,6 @@
-# Capability broker — design (v1)
+# writ — design (v1)
+
+A capability broker for local agents.
 
 ## One-line summary
 
@@ -88,7 +90,7 @@ The app's private key is the only long-lived secret the broker holds. It
 lives behind a `SecretStore` trait with two implementations:
 
 - **File backend** — 0600-permissioned PEM file under
-  `$XDG_DATA_HOME/agent-infra/` (or `~/.local/share/agent-infra/` fallback).
+  `$XDG_DATA_HOME/writ/` (or `~/.local/share/writ/` fallback).
   Works on macOS and Linux. The default.
 - **Keyring backend** — uses the `keyring` crate, which wraps macOS Keychain
   and Linux Secret Service. Opt-in via config.
@@ -112,7 +114,7 @@ variant; that's a lot of what a policy DSL buys you.
 
 ## Transport
 
-Local Unix socket at `$XDG_RUNTIME_DIR/agent-infra/broker.sock` (falling back
+Local Unix socket at `$XDG_RUNTIME_DIR/writ/writd.sock` (falling back
 to a well-known path under the user's home). Filesystem permissions
 (`0700` on the parent dir) are the auth boundary: if you can open the
 socket, you are trusted.
@@ -128,7 +130,7 @@ handler functions.
 
 ## Audit log
 
-SQLite at `$XDG_DATA_HOME/agent-infra/audit.db`. Schema:
+SQLite at `$XDG_DATA_HOME/writ/audit.db`. Schema:
 
 ```sql
 CREATE TABLE session (
@@ -177,7 +179,7 @@ is authenticated with the bot's installation token. This preserves
 contribution-graph attribution while keeping the credential ephemeral.
 
 Switching to bot-as-author later requires only a client-side change: the
-agent runs `git commit --author="agent-infra-bot[bot] <id+...@users.noreply.github.com>"`.
+agent runs `git commit --author="writ-bot[bot] <id+...@users.noreply.github.com>"`.
 No broker change is needed.
 
 ## Concurrency
@@ -227,8 +229,8 @@ src/
   server.rs           Unix socket listener + dispatch
   config.rs           TOML config loading
   bin/
-    agent-broker.rs   daemon
-    agent-identity.rs CLI client
+    writd.rs          daemon
+    writ.rs           CLI client
 docs/
   design/
     broker.md         this document
