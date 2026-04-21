@@ -4,10 +4,11 @@
 //! mistakes (typos in `rename_all`, adjacent-tag clashes, etc.).
 
 use agent_infra::core::{
-    CapabilityRequest, CredentialGrant, GitHubGrantedScope, GitHubPermissions, GitHubRequest,
-    GrantedScope, Jti, PolicyDecision, RepoRef, RequestId, SessionId, SessionRecord, TtlSeconds,
-    UnixSeconds,
+    CapabilityRequest, CredentialGrant, GitHubAccess, GitHubGrantedScope, GitHubPermissions,
+    GitHubRequest, GrantedScope, Jti, PolicyDecision, RepoRef, RequestId, SessionId, SessionRecord,
+    TtlSeconds, UnixSeconds,
 };
+use agent_infra::policy::{PolicyConfig, decide};
 use proptest::prelude::*;
 
 fn arb_repo() -> impl Strategy<Value = RepoRef> {
@@ -17,11 +18,8 @@ fn arb_repo() -> impl Strategy<Value = RepoRef> {
     })
 }
 
-fn arb_access() -> impl Strategy<Value = agent_infra::core::GitHubAccess> {
-    prop_oneof![
-        Just(agent_infra::core::GitHubAccess::Read),
-        Just(agent_infra::core::GitHubAccess::Write),
-    ]
+fn arb_access() -> impl Strategy<Value = GitHubAccess> {
+    prop_oneof![Just(GitHubAccess::Read), Just(GitHubAccess::Write)]
 }
 
 fn arb_github_request() -> impl Strategy<Value = GitHubRequest> {
@@ -135,5 +133,57 @@ proptest! {
         let rendered = repo.to_string();
         let parsed: RepoRef = rendered.parse().unwrap();
         prop_assert_eq!(parsed, repo);
+    }
+
+    /// Any write request whose repo is on the allowlist is granted; any
+    /// write whose repo is not is denied. This is the whole v1 policy.
+    #[test]
+    fn policy_write_is_granted_iff_repo_is_writable(
+        req in arb_github_request(),
+        writable in prop::collection::vec(arb_repo(), 0..5),
+    ) {
+        let policy = PolicyConfig {
+            writable_repos: writable.clone(),
+            default_ttl: TtlSeconds::new(300).unwrap(),
+        };
+        let wrapped = CapabilityRequest::GitHub(req.clone());
+        let is_write = matches!(
+            req,
+            GitHubRequest::Contents { access: GitHubAccess::Write, .. }
+                | GitHubRequest::Issues { access: GitHubAccess::Write, .. }
+                | GitHubRequest::PullRequests { access: GitHubAccess::Write, .. }
+        );
+        let on_allowlist = writable.iter().any(|r| r == req.repo());
+
+        match decide(&wrapped, &policy) {
+            PolicyDecision::Grant { .. } => {
+                if is_write {
+                    prop_assert!(on_allowlist, "granted write but repo not on allowlist: {req:?}");
+                }
+            }
+            PolicyDecision::Deny { .. } => {
+                prop_assert!(is_write && !on_allowlist, "denied non-write or allowlisted repo: {req:?}");
+            }
+        }
+    }
+
+    /// Every grant includes `metadata: read` (GitHub requires it on every
+    /// installation token) and the repo on the grant matches the requested repo.
+    #[test]
+    fn grants_include_metadata_and_match_repo(
+        req in arb_github_request(),
+    ) {
+        let policy = PolicyConfig {
+            writable_repos: vec![req.repo().clone()],
+            default_ttl: TtlSeconds::new(300).unwrap(),
+        };
+        let wrapped = CapabilityRequest::GitHub(req.clone());
+        match decide(&wrapped, &policy) {
+            PolicyDecision::Grant { scope: GrantedScope::GitHub(s), .. } => {
+                prop_assert_eq!(s.repository, req.repo().clone());
+                prop_assert_eq!(s.permissions.metadata, Some(GitHubAccess::Read));
+            }
+            PolicyDecision::Deny { reason } => prop_assert!(false, "unexpectedly denied: {reason}"),
+        }
     }
 }

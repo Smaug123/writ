@@ -16,10 +16,24 @@ pub enum PolicyDecision {
 }
 
 /// Time-to-live for a grant. Positive and bounded at construction time so
-/// that interior code can rely on `ttl > 0` and `ttl <= 3600`.
+/// that interior code can rely on `ttl > 0` and `ttl <= 3600`. Deserialisation
+/// runs the same check, so config-loaded values can't slip past the bounds.
 #[derive(Copy, Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-#[serde(transparent)]
+#[serde(try_from = "i64", into = "i64")]
 pub struct TtlSeconds(i64);
+
+impl TryFrom<i64> for TtlSeconds {
+    type Error = TtlError;
+    fn try_from(v: i64) -> Result<Self, Self::Error> {
+        Self::new(v)
+    }
+}
+
+impl From<TtlSeconds> for i64 {
+    fn from(t: TtlSeconds) -> Self {
+        t.0
+    }
+}
 
 /// Maximum TTL for a GitHub App installation token.
 pub const GITHUB_INSTALLATION_TOKEN_MAX_SECONDS: i64 = 3600;
@@ -138,5 +152,24 @@ mod tests {
         let p = GitHubPermissions::default();
         let j = serde_json::to_string(&p).unwrap();
         assert_eq!(j, "{}");
+    }
+
+    #[test]
+    fn ttl_deserialise_rejects_out_of_range() {
+        assert!(serde_json::from_str::<TtlSeconds>("0").is_err());
+        assert!(serde_json::from_str::<TtlSeconds>("-10").is_err());
+        assert!(
+            serde_json::from_str::<TtlSeconds>(&format!(
+                "{}",
+                GITHUB_INSTALLATION_TOKEN_MAX_SECONDS + 1
+            ))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn ttl_deserialise_accepts_valid() {
+        let t: TtlSeconds = serde_json::from_str("300").unwrap();
+        assert_eq!(t.as_i64(), 300);
     }
 }
