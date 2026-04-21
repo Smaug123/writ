@@ -48,8 +48,9 @@ impl FileSecretStore {
     }
 
     /// Open `base` if it exists; otherwise create it with mode 0700 and
-    /// open it. Either way, the resulting directory's mode is verified
-    /// to be at most 0700.
+    /// open it. Either way, the resulting directory is verified to have
+    /// no group or world permission bits set (owner bits are left to the
+    /// caller — see `open` for the full contract).
     pub fn create_or_open(base: impl Into<PathBuf>) -> Result<Self, SecretError> {
         let base = base.into();
         if !Path::new(&base).exists() {
@@ -90,6 +91,11 @@ impl SecretStore for FileSecretStore {
             f.sync_all()?;
         }
         fs::rename(&tmp, &dest)?;
+        // fsync the parent dir so the rename itself is durable: without
+        // this, a crash after `rename` returned could leave the new dirent
+        // unwritten and the secret apparently missing on restart. POSIX
+        // allows opening a directory read-only just to sync its metadata.
+        fs::File::open(&self.base)?.sync_all()?;
         Ok(())
     }
 
