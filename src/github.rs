@@ -164,6 +164,17 @@ impl<S: SecretStore> GitHubMinter<S> {
         let parsed: MintResponse = resp.json().await?;
         let expires_at = parse_rfc3339_seconds(&parsed.expires_at)?;
 
+        // Defence-in-depth: GitHub should never return a token expiring at
+        // or before our issue time, but if it did we'd otherwise happily
+        // record a grant that was already dead and hand the agent a
+        // useless token. Bail loudly instead.
+        if expires_at <= issued_at {
+            return Err(MintError::ExpiryNotInFuture {
+                issued_at,
+                actual_expires_at: expires_at,
+            });
+        }
+
         let max_allowed = issued_at + ttl.as_i64() + TTL_SKEW_TOLERANCE_SECONDS;
         if expires_at > max_allowed {
             return Err(MintError::TtlExceeded {
@@ -201,6 +212,13 @@ pub enum MintError {
     )]
     TtlExceeded {
         ttl_seconds: i64,
+        issued_at: i64,
+        actual_expires_at: i64,
+    },
+    #[error(
+        "GitHub issued a token with expiry {actual_expires_at} at or before its issue time {issued_at}"
+    )]
+    ExpiryNotInFuture {
         issued_at: i64,
         actual_expires_at: i64,
     },
@@ -353,6 +371,7 @@ mod tests {
     #[tokio::test]
     async fn mint_exchanges_jwt_for_installation_token() {
         let server = MockServer::start().await;
+        let (expiry_ts, expiry_str) = expiry_seconds_from_now(3600);
         Mock::given(method("POST"))
             .and(path("/app/installations/999/access_tokens"))
             .and(header("Accept", "application/vnd.github+json"))
@@ -363,7 +382,7 @@ mod tests {
             })))
             .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
                 "token": "ghs_fake_value",
-                "expires_at": "2024-01-01T00:00:00Z",
+                "expires_at": expiry_str,
                 "permissions": {"contents": "write", "metadata": "read"},
                 "repository_selection": "selected"
             })))
@@ -372,15 +391,13 @@ mod tests {
             .await;
 
         let minter = minter_with_key(&server);
-        // Use the fixture expiry of 2024-01-01, which is before any
-        // plausible test-run "now", so the TTL ceiling trivially holds.
         let minted = minter
             .mint(&write_scope("o", "n"), TtlSeconds::new(3600).unwrap())
             .await
             .expect("mint ok");
 
         assert_eq!(minted.token, "ghs_fake_value");
-        assert_eq!(minted.expires_at.as_i64(), 1_704_067_200);
+        assert_eq!(minted.expires_at.as_i64(), expiry_ts);
     }
 
     #[tokio::test]
@@ -450,6 +467,30 @@ mod tests {
             "permissions": {"contents": "write", "metadata": "read"},
             "repository_selection": "selected"
         }))
+    }
+
+    #[tokio::test]
+    async fn mint_rejects_past_dated_expiry() {
+        // GitHub should never hand us a token that's already expired, but
+        // if the API ever returns one (misconfigured enterprise clock,
+        // stale cache, bug) we must fail loudly rather than bank a dead
+        // grant. Use a timestamp well before any plausible test-run clock.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/app/installations/999/access_tokens"))
+            .respond_with(mock_mint_response("2000-01-01T00:00:00Z"))
+            .mount(&server)
+            .await;
+
+        let minter = minter_with_key(&server);
+        let err = minter
+            .mint(&write_scope("o", "n"), TtlSeconds::new(3600).unwrap())
+            .await
+            .expect_err("should reject past expiry");
+        assert!(
+            matches!(err, MintError::ExpiryNotInFuture { .. }),
+            "got: {err:?}"
+        );
     }
 
     #[tokio::test]
