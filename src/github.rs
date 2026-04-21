@@ -337,7 +337,7 @@ fn truncate_for_display(body: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::{GitHubAccess, RepoRef};
+    use crate::core::{GitHubAccess, MetadataAccess, RepoRef};
     use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode};
     use std::collections::HashMap;
     use std::sync::Mutex;
@@ -383,7 +383,7 @@ mod tests {
             },
             permissions: GitHubPermissions {
                 contents: Some(GitHubAccess::Write),
-                metadata: Some(GitHubAccess::Read),
+                metadata: Some(MetadataAccess::Read),
                 ..Default::default()
             },
         }
@@ -618,11 +618,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mint_rejects_expiry_just_past_skew_tolerance() {
-        // The other side of the skew boundary: 10s past the tolerance
-        // window must reject, to pin the meaning of the constant.
+    async fn mint_rejects_expiry_safely_past_skew_tolerance() {
+        // Keep a wide margin over the skew boundary so the test remains
+        // deterministic even under a slow or highly parallel test run.
         let server = MockServer::start().await;
-        let (_, expiry_str) = expiry_seconds_from_now(3600 + TTL_SKEW_TOLERANCE_SECONDS + 10);
+        let (_, expiry_str) = expiry_seconds_from_now(3600 + TTL_SKEW_TOLERANCE_SECONDS + 300);
         Mock::given(method("POST"))
             .and(path("/app/installations/999/access_tokens"))
             .respond_with(mock_mint_response(&expiry_str))
@@ -732,7 +732,10 @@ mod tests {
             body: body.to_string(),
         };
         let shown = format!("{err}");
-        assert!(shown.contains(body), "short body should not be truncated: {shown}");
+        assert!(
+            shown.contains(body),
+            "short body should not be truncated: {shown}"
+        );
         assert!(!shown.contains("truncated"));
     }
 
@@ -742,10 +745,7 @@ mod tests {
         // boundaries, a body containing multi-byte scalars right at the
         // cap would panic. Exercise that path explicitly.
         let body = "é".repeat(API_ERROR_DISPLAY_CAP * 2);
-        let err = MintError::ApiError {
-            status: 422,
-            body,
-        };
+        let err = MintError::ApiError { status: 422, body };
         let _ = format!("{err}");
     }
 

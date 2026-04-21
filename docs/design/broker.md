@@ -4,7 +4,7 @@
 
 A local daemon that mints short-lived, per-request-scoped credentials for agents
 (initially: GitHub App installation tokens) and keeps an append-only audit log
-of every request, decision, and grant.
+of every request, decision, grant, and post-policy mint failure.
 
 ## Why this shape
 
@@ -144,7 +144,8 @@ CREATE TABLE request (
   session_id    TEXT NOT NULL REFERENCES session(session_id),
   received_at   INTEGER NOT NULL,
   request_json  TEXT NOT NULL,
-  decision_json TEXT NOT NULL
+  decision_json TEXT NOT NULL,
+  mint_failure_json TEXT
 );
 
 CREATE TABLE grant (

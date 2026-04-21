@@ -5,17 +5,15 @@
 
 use agent_infra::core::{
     CapabilityRequest, CredentialGrant, GitHubAccess, GitHubGrantedScope, GitHubPermissions,
-    GitHubRequest, GrantedScope, Jti, PolicyDecision, RepoRef, RequestId, SessionId, SessionRecord,
-    TtlSeconds, UnixMillis,
+    GitHubRequest, GrantedScope, Jti, MetadataAccess, PolicyDecision, RepoRef, RequestId,
+    SessionId, SessionRecord, TtlSeconds, UnixMillis,
 };
 use agent_infra::policy::{PolicyConfig, decide};
 use proptest::prelude::*;
 
 fn arb_repo() -> impl Strategy<Value = RepoRef> {
-    ("[a-zA-Z0-9_-]{1,32}", "[a-zA-Z0-9_.-]{1,32}").prop_map(|(owner, name)| RepoRef {
-        owner,
-        name,
-    })
+    ("[a-zA-Z0-9_-]{1,32}", "[a-zA-Z0-9_.-]{1,32}")
+        .prop_map(|(owner, name)| RepoRef { owner, name })
 }
 
 fn arb_access() -> impl Strategy<Value = GitHubAccess> {
@@ -24,9 +22,12 @@ fn arb_access() -> impl Strategy<Value = GitHubAccess> {
 
 fn arb_github_request() -> impl Strategy<Value = GitHubRequest> {
     prop_oneof![
-        (arb_access(), arb_repo()).prop_map(|(access, repo)| GitHubRequest::Contents { access, repo }),
-        (arb_access(), arb_repo()).prop_map(|(access, repo)| GitHubRequest::Issues { access, repo }),
-        (arb_access(), arb_repo()).prop_map(|(access, repo)| GitHubRequest::PullRequests { access, repo }),
+        (arb_access(), arb_repo())
+            .prop_map(|(access, repo)| GitHubRequest::Contents { access, repo }),
+        (arb_access(), arb_repo())
+            .prop_map(|(access, repo)| GitHubRequest::Issues { access, repo }),
+        (arb_access(), arb_repo())
+            .prop_map(|(access, repo)| GitHubRequest::PullRequests { access, repo }),
         arb_repo().prop_map(|repo| GitHubRequest::Metadata { repo }),
     ]
 }
@@ -40,14 +41,16 @@ fn arb_permissions() -> impl Strategy<Value = GitHubPermissions> {
         prop::option::of(arb_access()),
         prop::option::of(arb_access()),
         prop::option::of(arb_access()),
-        prop::option::of(arb_access()),
+        prop::option::of(Just(MetadataAccess::Read)),
     )
-        .prop_map(|(contents, issues, pull_requests, metadata)| GitHubPermissions {
-            contents,
-            issues,
-            pull_requests,
-            metadata,
-        })
+        .prop_map(
+            |(contents, issues, pull_requests, metadata)| GitHubPermissions {
+                contents,
+                issues,
+                pull_requests,
+                metadata,
+            },
+        )
 }
 
 fn arb_scope() -> impl Strategy<Value = GrantedScope> {
@@ -181,7 +184,7 @@ proptest! {
         match decide(&wrapped, &policy) {
             PolicyDecision::Grant { scope: GrantedScope::GitHub(s), .. } => {
                 prop_assert_eq!(s.repository, req.repo().clone());
-                prop_assert_eq!(s.permissions.metadata, Some(GitHubAccess::Read));
+                prop_assert_eq!(s.permissions.metadata, Some(MetadataAccess::Read));
             }
             PolicyDecision::Deny { reason } => prop_assert!(false, "unexpectedly denied: {reason}"),
         }

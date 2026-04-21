@@ -20,7 +20,9 @@ pub enum SecretError {
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 
-    #[error("permissions on {path} are too permissive: got mode {mode:o}, expected at most {expected:o}")]
+    #[error(
+        "permissions on {path} are too permissive: got mode {mode:o}, expected at most {expected:o}"
+    )]
     UnsafePermissions {
         path: String,
         mode: u32,

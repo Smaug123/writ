@@ -19,7 +19,9 @@ pub struct CredentialGrant {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::{GitHubAccess, GitHubGrantedScope, GitHubPermissions, RepoRef};
+    use crate::core::{
+        GitHubAccess, GitHubGrantedScope, GitHubPermissions, MetadataAccess, RepoRef,
+    };
 
     #[test]
     fn grant_roundtrips() {
@@ -34,7 +36,7 @@ mod tests {
                 },
                 permissions: GitHubPermissions {
                     contents: Some(GitHubAccess::Read),
-                    metadata: Some(GitHubAccess::Read),
+                    metadata: Some(MetadataAccess::Read),
                     ..Default::default()
                 },
             }),

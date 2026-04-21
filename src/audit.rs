@@ -1,10 +1,11 @@
 //! Audit log backed by SQLite.
 //!
 //! The log is the system-of-record for broker activity: every session,
-//! every capability request, every credential grant lands here. The raw
-//! JSON for requests, decisions, and scopes is stored verbatim, so the
-//! log can be replayed to reconstruct history without depending on the
-//! broker binary staying source-compatible.
+//! every capability request, every credential grant, and every post-policy
+//! mint failure lands here. The raw JSON for requests, decisions, scopes,
+//! and mint failures is stored verbatim, so the log can be replayed to
+//! reconstruct history without depending on the broker binary staying
+//! source-compatible.
 //!
 //! The `request` and `grant_log` tables are strictly append-only: once a
 //! row lands it is never mutated or deleted. This is the part that
@@ -20,6 +21,7 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use rusqlite::{Connection, OptionalExtension, Row, params};
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::core::{
@@ -51,9 +53,26 @@ pub enum AuditError {
     Invariant(&'static str),
 }
 
-/// One audited request-and-decision, plus the grant record if the decision
-/// was `Grant`. Passing these together keeps request+grant writes atomic
-/// under a single transaction.
+/// The outcome of the post-policy mint step for one request.
+#[derive(Debug)]
+pub enum GrantOutcome<'a> {
+    /// No mint step was attempted because policy denied the request.
+    NotMinted,
+    /// Policy granted and the backend produced a credential grant.
+    Granted(&'a CredentialGrant),
+    /// Policy granted but the backend mint step failed. The request row still
+    /// lands in the audit log with the failure recorded.
+    MintFailed { error: &'a str },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct MintFailureRecord {
+    pub error: String,
+}
+
+/// One audited request-and-decision, plus the outcome of the mint step.
+/// Passing these together keeps the append-only audit rows for a request
+/// and its successful grant (if any) atomic under one transaction.
 #[derive(Debug)]
 pub struct AuditedRequest<'a> {
     pub request_id: RequestId,
@@ -61,7 +80,7 @@ pub struct AuditedRequest<'a> {
     pub received_at: UnixMillis,
     pub request: &'a CapabilityRequest,
     pub decision: &'a PolicyDecision,
-    pub grant: Option<&'a CredentialGrant>,
+    pub grant_outcome: GrantOutcome<'a>,
 }
 
 pub struct AuditLog {
@@ -100,15 +119,30 @@ impl AuditLog {
         // and orphan `request`/`grant_log` rows could slip in.
         conn.execute_batch("PRAGMA foreign_keys = ON;")?;
         conn.execute_batch(SCHEMA_SQL)?;
+        Self::ensure_request_mint_failure_column(conn)?;
         Ok(())
     }
 
-    fn with_conn<R>(&self, f: impl FnOnce(&Connection) -> Result<R, AuditError>) -> Result<R, AuditError> {
+    fn ensure_request_mint_failure_column(conn: &Connection) -> Result<(), AuditError> {
+        if table_has_column(conn, "request", "mint_failure_json")? {
+            return Ok(());
+        }
+        conn.execute("ALTER TABLE request ADD COLUMN mint_failure_json TEXT", [])?;
+        Ok(())
+    }
+
+    fn with_conn<R>(
+        &self,
+        f: impl FnOnce(&Connection) -> Result<R, AuditError>,
+    ) -> Result<R, AuditError> {
         let guard = self.conn.lock().map_err(|_| AuditError::Poisoned)?;
         f(&guard)
     }
 
-    fn with_conn_mut<R>(&self, f: impl FnOnce(&mut Connection) -> Result<R, AuditError>) -> Result<R, AuditError> {
+    fn with_conn_mut<R>(
+        &self,
+        f: impl FnOnce(&mut Connection) -> Result<R, AuditError>,
+    ) -> Result<R, AuditError> {
         let mut guard = self.conn.lock().map_err(|_| AuditError::Poisoned)?;
         f(&mut guard)
     }
@@ -154,16 +188,20 @@ impl AuditLog {
         })
     }
 
-    /// Record one request + decision, and (if the decision was Grant)
-    /// the matching credential grant, atomically in one transaction.
+    /// Record one request + decision, and the outcome of the subsequent mint
+    /// step, atomically in one transaction.
     pub fn record(&self, r: &AuditedRequest<'_>) -> Result<(), AuditError> {
-        match (r.decision, r.grant) {
-            (PolicyDecision::Grant { scope, ttl }, Some(g)) => {
+        match (r.decision, &r.grant_outcome) {
+            (PolicyDecision::Grant { scope, ttl }, GrantOutcome::Granted(g)) => {
                 if g.request_id != r.request_id {
-                    return Err(AuditError::Invariant("grant.request_id != request.request_id"));
+                    return Err(AuditError::Invariant(
+                        "grant.request_id != request.request_id",
+                    ));
                 }
                 if g.session_id != r.session_id {
-                    return Err(AuditError::Invariant("grant.session_id != request.session_id"));
+                    return Err(AuditError::Invariant(
+                        "grant.session_id != request.session_id",
+                    ));
                 }
                 // The decision and the grant are both authority claims
                 // about the same request, so they must agree on what that
@@ -184,37 +222,69 @@ impl AuditLog {
                     return Err(AuditError::Invariant("grant lifetime exceeds decision ttl"));
                 }
             }
-            (PolicyDecision::Grant { .. }, None) => {
+            (PolicyDecision::Grant { .. }, GrantOutcome::MintFailed { error }) => {
+                if error.is_empty() {
+                    return Err(AuditError::Invariant(
+                        "mint failure message must not be empty",
+                    ));
+                }
+            }
+            (PolicyDecision::Grant { .. }, GrantOutcome::NotMinted) => {
                 return Err(AuditError::Invariant(
-                    "decision was Grant but no grant record was supplied",
+                    "decision was Grant but no mint outcome was supplied",
                 ));
             }
-            (PolicyDecision::Deny { .. }, Some(_)) => {
+            (PolicyDecision::Deny { .. }, GrantOutcome::Granted(_)) => {
                 return Err(AuditError::Invariant(
                     "decision was Deny but a grant record was supplied",
                 ));
             }
-            (PolicyDecision::Deny { .. }, None) => {}
+            (PolicyDecision::Deny { .. }, GrantOutcome::MintFailed { .. }) => {
+                return Err(AuditError::Invariant(
+                    "decision was Deny but a mint failure was supplied",
+                ));
+            }
+            (PolicyDecision::Deny { .. }, GrantOutcome::NotMinted) => {}
         }
 
         let request_json = serde_json::to_string(r.request)?;
         let decision_json = serde_json::to_string(r.decision)?;
-        let grant_fields = match r.grant {
-            Some(g) => Some((g.jti, serde_json::to_string(&g.scope)?, g.issued_at, g.expires_at)),
-            None => None,
+        let grant_fields = match &r.grant_outcome {
+            GrantOutcome::Granted(g) => Some((
+                g.jti,
+                serde_json::to_string(&g.scope)?,
+                g.issued_at,
+                g.expires_at,
+            )),
+            GrantOutcome::NotMinted | GrantOutcome::MintFailed { .. } => None,
+        };
+        let mint_failure_json = match &r.grant_outcome {
+            GrantOutcome::MintFailed { error } => {
+                Some(serde_json::to_string(&MintFailureRecord {
+                    error: (*error).to_string(),
+                })?)
+            }
+            GrantOutcome::NotMinted | GrantOutcome::Granted(_) => None,
         };
 
         self.with_conn_mut(|c| {
             let tx = c.transaction()?;
             tx.execute(
-                "INSERT INTO request (request_id, session_id, received_at, request_json, decision_json) \
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                "INSERT INTO request (
+                     request_id,
+                     session_id,
+                     received_at,
+                     request_json,
+                     decision_json,
+                     mint_failure_json
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![
                     r.request_id.as_uuid().to_string(),
                     r.session_id.as_uuid().to_string(),
                     r.received_at.as_millis(),
                     request_json,
                     decision_json,
+                    mint_failure_json,
                 ],
             )?;
             if let Some((jti, scope_json, issued_at, expires_at)) = grant_fields {
@@ -281,8 +351,9 @@ fn session_from_row(row: &Row<'_>) -> rusqlite::Result<SessionRecord> {
     let agent_model: Option<String> = row.get(2)?;
     let opened_at: i64 = row.get(3)?;
     let closed_at: Option<i64> = row.get(4)?;
-    let uuid = uuid::Uuid::parse_str(&session_id_str)
-        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e)))?;
+    let uuid = uuid::Uuid::parse_str(&session_id_str).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+    })?;
     Ok(SessionRecord {
         session_id: SessionId::from_uuid(uuid),
         label,
@@ -320,6 +391,18 @@ fn grant_from_row(row: &Row<'_>) -> rusqlite::Result<Result<CredentialGrant, Aud
     Ok(parse())
 }
 
+fn table_has_column(conn: &Connection, table: &str, column: &str) -> Result<bool, AuditError> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let name: String = row.get(1)?;
+        if name == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 const SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS session (
     session_id  TEXT PRIMARY KEY,
@@ -334,7 +417,8 @@ CREATE TABLE IF NOT EXISTS request (
     session_id    TEXT NOT NULL REFERENCES session(session_id),
     received_at   INTEGER NOT NULL,
     request_json  TEXT NOT NULL,
-    decision_json TEXT NOT NULL
+    decision_json TEXT NOT NULL,
+    mint_failure_json TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_request_session ON request(session_id, received_at);
@@ -355,8 +439,10 @@ CREATE INDEX IF NOT EXISTS idx_grant_session ON grant_log(session_id, issued_at)
 mod tests {
     use super::*;
     use crate::core::{
-        GitHubAccess, GitHubGrantedScope, GitHubPermissions, GitHubRequest, RepoRef, TtlSeconds,
+        GitHubAccess, GitHubGrantedScope, GitHubPermissions, GitHubRequest, MetadataAccess,
+        RepoRef, TtlSeconds,
     };
+    use tempfile::NamedTempFile;
 
     fn sample_session() -> SessionRecord {
         SessionRecord {
@@ -387,7 +473,7 @@ mod tests {
             repository: sample_repo(),
             permissions: GitHubPermissions {
                 contents: Some(GitHubAccess::Write),
-                metadata: Some(GitHubAccess::Read),
+                metadata: Some(MetadataAccess::Read),
                 ..Default::default()
             },
         })
@@ -462,7 +548,7 @@ mod tests {
             received_at: UnixMillis::from_millis(1_700_000_100),
             request: &req,
             decision: &decision,
-            grant: Some(&grant),
+            grant_outcome: GrantOutcome::Granted(&grant),
         })
         .unwrap();
 
@@ -490,11 +576,15 @@ mod tests {
             received_at: UnixMillis::from_millis(1_700_000_100),
             request: &req,
             decision: &decision,
-            grant: None,
+            grant_outcome: GrantOutcome::NotMinted,
         })
         .unwrap();
 
-        assert!(log.list_grants_for_session(s.session_id).unwrap().is_empty());
+        assert!(
+            log.list_grants_for_session(s.session_id)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -522,14 +612,14 @@ mod tests {
                 received_at: UnixMillis::from_millis(1_700_000_100),
                 request: &req,
                 decision: &decision,
-                grant: Some(&bogus_grant),
+                grant_outcome: GrantOutcome::Granted(&bogus_grant),
             })
             .unwrap_err();
         assert!(matches!(err, AuditError::Invariant(_)));
     }
 
     #[test]
-    fn grant_missing_for_grant_decision_is_rejected() {
+    fn missing_mint_outcome_for_grant_decision_is_rejected() {
         let log = AuditLog::open_in_memory().unwrap();
         let s = sample_session();
         log.open_session(&s).unwrap();
@@ -546,7 +636,7 @@ mod tests {
                 received_at: UnixMillis::from_millis(1_700_000_100),
                 request: &req,
                 decision: &decision,
-                grant: None,
+                grant_outcome: GrantOutcome::NotMinted,
             })
             .unwrap_err();
         assert!(matches!(err, AuditError::Invariant(_)));
@@ -647,7 +737,7 @@ mod tests {
                 received_at: UnixMillis::from_millis(at),
                 request: &request,
                 decision: &decision,
-                grant: Some(&grant),
+                grant_outcome: GrantOutcome::Granted(&grant),
             })
             .unwrap();
             grant
@@ -658,10 +748,17 @@ mod tests {
         let c = mk_grant(1500);
 
         let listed = log.list_grants_for_session(s.session_id).unwrap();
-        assert_eq!(listed.iter().map(|g| g.issued_at.as_millis()).collect::<Vec<_>>(),
-                   vec![1000, 1500, 2000]);
-        assert_eq!(listed.iter().map(|g| g.jti).collect::<Vec<_>>(),
-                   vec![a.jti, c.jti, b.jti]);
+        assert_eq!(
+            listed
+                .iter()
+                .map(|g| g.issued_at.as_millis())
+                .collect::<Vec<_>>(),
+            vec![1000, 1500, 2000]
+        );
+        assert_eq!(
+            listed.iter().map(|g| g.jti).collect::<Vec<_>>(),
+            vec![a.jti, c.jti, b.jti]
+        );
     }
 
     /// With millisecond resolution two grants can still share an
@@ -696,7 +793,7 @@ mod tests {
                 received_at: UnixMillis::from_millis(5_000),
                 request: &request,
                 decision: &decision,
-                grant: Some(&grant),
+                grant_outcome: GrantOutcome::Granted(&grant),
             })
             .unwrap();
             grant
@@ -736,7 +833,7 @@ mod tests {
             },
             permissions: GitHubPermissions {
                 contents: Some(GitHubAccess::Read),
-                metadata: Some(GitHubAccess::Read),
+                metadata: Some(MetadataAccess::Read),
                 ..Default::default()
             },
         });
@@ -756,7 +853,7 @@ mod tests {
                 received_at: UnixMillis::from_millis(1_000),
                 request: &req,
                 decision: &decision,
-                grant: Some(&grant),
+                grant_outcome: GrantOutcome::Granted(&grant),
             })
             .unwrap_err();
         assert!(matches!(err, AuditError::Invariant(_)), "got: {err:?}");
@@ -797,7 +894,7 @@ mod tests {
                 received_at: UnixMillis::from_millis(0),
                 request: &req,
                 decision: &decision,
-                grant: Some(&grant),
+                grant_outcome: GrantOutcome::Granted(&grant),
             })
             .unwrap_err();
         assert!(matches!(err, AuditError::Invariant(_)), "got: {err:?}");
@@ -837,8 +934,129 @@ mod tests {
             received_at: UnixMillis::from_millis(0),
             request: &req,
             decision: &decision,
-            grant: Some(&grant),
+            grant_outcome: GrantOutcome::Granted(&grant),
         })
         .unwrap();
+    }
+
+    #[test]
+    fn record_grant_mint_failure_without_grant_row() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+
+        let request_id = RequestId::new();
+        let req = sample_request();
+        let decision = PolicyDecision::Grant {
+            scope: sample_scope(),
+            ttl: TtlSeconds::new(300).unwrap(),
+        };
+
+        log.record(&AuditedRequest {
+            request_id,
+            session_id: s.session_id,
+            received_at: UnixMillis::from_millis(1_700_000_100),
+            request: &req,
+            decision: &decision,
+            grant_outcome: GrantOutcome::MintFailed {
+                error: "GitHub returned 422: repository not installed",
+            },
+        })
+        .unwrap();
+
+        assert!(
+            log.list_grants_for_session(s.session_id)
+                .unwrap()
+                .is_empty()
+        );
+        let recorded = log
+            .with_conn(|c| {
+                let json = c.query_row(
+                    "SELECT mint_failure_json FROM request WHERE request_id = ?1",
+                    params![request_id.as_uuid().to_string()],
+                    |row| row.get::<_, Option<String>>(0),
+                )?;
+                Ok(json)
+            })
+            .unwrap()
+            .expect("mint failure json should be recorded");
+        let failure: MintFailureRecord = serde_json::from_str(&recorded).unwrap();
+        assert_eq!(
+            failure.error,
+            "GitHub returned 422: repository not installed"
+        );
+    }
+
+    #[test]
+    fn deny_with_mint_failure_is_rejected() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+
+        let request_id = RequestId::new();
+        let req = sample_request();
+        let decision = PolicyDecision::Deny {
+            reason: "no".into(),
+        };
+
+        let err = log
+            .record(&AuditedRequest {
+                request_id,
+                session_id: s.session_id,
+                received_at: UnixMillis::from_millis(1_700_000_100),
+                request: &req,
+                decision: &decision,
+                grant_outcome: GrantOutcome::MintFailed {
+                    error: "should not exist",
+                },
+            })
+            .unwrap_err();
+        assert!(matches!(err, AuditError::Invariant(_)));
+    }
+
+    #[test]
+    fn open_migrates_legacy_request_table_to_include_mint_failure_column() {
+        let db = NamedTempFile::new().unwrap();
+        let conn = Connection::open(db.path()).unwrap();
+        conn.execute_batch(
+            r#"
+CREATE TABLE session (
+    session_id  TEXT PRIMARY KEY,
+    label       TEXT,
+    agent_model TEXT,
+    opened_at   INTEGER NOT NULL,
+    closed_at   INTEGER
+);
+
+CREATE TABLE request (
+    request_id    TEXT PRIMARY KEY,
+    session_id    TEXT NOT NULL REFERENCES session(session_id),
+    received_at   INTEGER NOT NULL,
+    request_json  TEXT NOT NULL,
+    decision_json TEXT NOT NULL
+);
+
+CREATE INDEX idx_request_session ON request(session_id, received_at);
+
+CREATE TABLE grant_log (
+    jti         TEXT PRIMARY KEY,
+    request_id  TEXT NOT NULL REFERENCES request(request_id),
+    session_id  TEXT NOT NULL REFERENCES session(session_id),
+    scope_json  TEXT NOT NULL,
+    issued_at   INTEGER NOT NULL,
+    expires_at  INTEGER NOT NULL
+);
+
+CREATE INDEX idx_grant_session ON grant_log(session_id, issued_at);
+"#,
+        )
+        .unwrap();
+        drop(conn);
+
+        let log = AuditLog::open(db.path()).unwrap();
+        let has_column = log
+            .with_conn(|c| table_has_column(c, "request", "mint_failure_json"))
+            .unwrap();
+        assert!(has_column, "legacy request table should be migrated");
     }
 }

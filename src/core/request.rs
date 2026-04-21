@@ -75,9 +75,14 @@ mod tests {
 
     #[test]
     fn metadata_request_has_no_access_field() {
-        let r = CapabilityRequest::GitHub(GitHubRequest::Metadata { repo: sample_repo() });
+        let r = CapabilityRequest::GitHub(GitHubRequest::Metadata {
+            repo: sample_repo(),
+        });
         let j = serde_json::to_string(&r).unwrap();
-        assert!(!j.contains("access"), "serialised metadata request contained 'access': {j}");
+        assert!(
+            !j.contains("access"),
+            "serialised metadata request contained 'access': {j}"
+        );
     }
 
     #[test]
@@ -95,7 +100,9 @@ mod tests {
     /// every deployed client at once.
     #[test]
     fn github_variant_serialises_as_literal_github() {
-        let r = CapabilityRequest::GitHub(GitHubRequest::Metadata { repo: sample_repo() });
+        let r = CapabilityRequest::GitHub(GitHubRequest::Metadata {
+            repo: sample_repo(),
+        });
         let v: serde_json::Value = serde_json::to_value(&r).unwrap();
         assert_eq!(v["backend"], serde_json::Value::String("github".into()));
     }

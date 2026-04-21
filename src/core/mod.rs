@@ -7,7 +7,8 @@ mod request;
 mod session;
 
 pub use decision::{
-    GitHubGrantedScope, GitHubPermissions, GrantedScope, PolicyDecision, TtlError, TtlSeconds,
+    GitHubGrantedScope, GitHubPermissions, GrantedScope, MetadataAccess, PolicyDecision, TtlError,
+    TtlSeconds,
 };
 pub use grant::CredentialGrant;
 pub use request::{CapabilityRequest, GitHubRequest};

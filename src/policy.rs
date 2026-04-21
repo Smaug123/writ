@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::core::{
     CapabilityRequest, GitHubAccess, GitHubGrantedScope, GitHubPermissions, GitHubRequest,
-    GrantedScope, PolicyDecision, RepoRef, TtlSeconds,
+    GrantedScope, MetadataAccess, PolicyDecision, RepoRef, TtlSeconds,
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -63,9 +63,16 @@ fn decide_github(r: &GitHubRequest, policy: &PolicyConfig) -> PolicyDecision {
 fn is_write(r: &GitHubRequest) -> bool {
     matches!(
         r,
-        GitHubRequest::Contents { access: GitHubAccess::Write, .. }
-            | GitHubRequest::Issues { access: GitHubAccess::Write, .. }
-            | GitHubRequest::PullRequests { access: GitHubAccess::Write, .. }
+        GitHubRequest::Contents {
+            access: GitHubAccess::Write,
+            ..
+        } | GitHubRequest::Issues {
+            access: GitHubAccess::Write,
+            ..
+        } | GitHubRequest::PullRequests {
+            access: GitHubAccess::Write,
+            ..
+        }
     )
 }
 
@@ -74,7 +81,7 @@ fn is_write(r: &GitHubRequest) -> bool {
 /// installation token.
 fn permissions_for_request(r: &GitHubRequest) -> GitHubPermissions {
     let mut p = GitHubPermissions {
-        metadata: Some(GitHubAccess::Read),
+        metadata: Some(MetadataAccess::Read),
         ..Default::default()
     };
     match r {
@@ -123,7 +130,7 @@ mod tests {
         });
         let scope = expect_grant(decide(&req, &policy));
         assert_eq!(scope.permissions.contents, Some(GitHubAccess::Read));
-        assert_eq!(scope.permissions.metadata, Some(GitHubAccess::Read));
+        assert_eq!(scope.permissions.metadata, Some(MetadataAccess::Read));
         assert_eq!(scope.permissions.issues, None);
         assert_eq!(scope.permissions.pull_requests, None);
     }
@@ -163,7 +170,7 @@ mod tests {
             repo: repo("any", "repo"),
         });
         let scope = expect_grant(decide(&req, &policy));
-        assert_eq!(scope.permissions.metadata, Some(GitHubAccess::Read));
+        assert_eq!(scope.permissions.metadata, Some(MetadataAccess::Read));
         assert_eq!(scope.permissions.contents, None);
     }
 
@@ -217,7 +224,7 @@ mod tests {
         assert_eq!(scope.permissions.issues, Some(GitHubAccess::Write));
         assert_eq!(scope.permissions.contents, None);
         assert_eq!(scope.permissions.pull_requests, None);
-        assert_eq!(scope.permissions.metadata, Some(GitHubAccess::Read));
+        assert_eq!(scope.permissions.metadata, Some(MetadataAccess::Read));
     }
 
     #[test]

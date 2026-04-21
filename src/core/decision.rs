@@ -1,6 +1,18 @@
 use super::{GitHubAccess, RepoRef};
 use serde::{Deserialize, Serialize};
 
+/// Access level for the `metadata` GitHub App permission. GitHub does not
+/// offer `metadata: write` — the permission is read-only by construction —
+/// so this one-variant enum keeps that invariant checkable by the type
+/// system. The request side achieves the same thing by giving
+/// [`super::GitHubRequest::Metadata`] no `access` field at all; this is the
+/// matching constraint on the grant side.
+#[derive(Copy, Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MetadataAccess {
+    Read,
+}
+
 /// The output of the policy engine: grant the request (possibly with narrowed
 /// scope and bounded TTL), or deny it.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -99,7 +111,7 @@ pub struct GitHubPermissions {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub pull_requests: Option<GitHubAccess>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub metadata: Option<GitHubAccess>,
+    pub metadata: Option<MetadataAccess>,
 }
 
 #[cfg(test)]
@@ -109,7 +121,10 @@ mod tests {
     #[test]
     fn ttl_rejects_non_positive() {
         assert!(matches!(TtlSeconds::new(0), Err(TtlError::NonPositive(0))));
-        assert!(matches!(TtlSeconds::new(-1), Err(TtlError::NonPositive(-1))));
+        assert!(matches!(
+            TtlSeconds::new(-1),
+            Err(TtlError::NonPositive(-1))
+        ));
     }
 
     #[test]
@@ -136,7 +151,7 @@ mod tests {
                 },
                 permissions: GitHubPermissions {
                     contents: Some(GitHubAccess::Write),
-                    metadata: Some(GitHubAccess::Read),
+                    metadata: Some(MetadataAccess::Read),
                     ..Default::default()
                 },
             }),
@@ -197,5 +212,18 @@ mod tests {
         });
         let v: serde_json::Value = serde_json::to_value(&s).unwrap();
         assert_eq!(v["backend"], serde_json::Value::String("github".into()));
+    }
+
+    #[test]
+    fn metadata_access_serialises_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&MetadataAccess::Read).unwrap(),
+            r#""read""#
+        );
+    }
+
+    #[test]
+    fn metadata_permissions_reject_write_on_deserialise() {
+        assert!(serde_json::from_str::<GitHubPermissions>(r#"{"metadata":"write"}"#).is_err());
     }
 }
