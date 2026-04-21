@@ -5,3 +5,4 @@
 //! See `docs/design/broker.md` for the architecture overview.
 
 pub mod core;
+pub mod secret;
