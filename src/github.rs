@@ -21,7 +21,10 @@
 //! works unchanged. We record the `jti` we generated alongside the grant
 //! so webhooks observed later can be reconciled by time, actor, and repo.
 
-use crate::core::{GitHubGrantedScope, GitHubPermissions, Jti, TtlSeconds, UnixSeconds};
+use crate::core::{
+    CredentialGrant, GitHubGrantedScope, GitHubPermissions, GrantedScope, Jti, RequestId,
+    SessionId, TtlSeconds, UnixSeconds,
+};
 use crate::secret::{SecretError, SecretKey, SecretStore};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -56,22 +59,66 @@ pub struct GitHubAppConfig {
     pub api_base: String,
 }
 
-/// A freshly-minted installation token. The broker passes `token` through
-/// to the agent raw and persists `jti` + `issued_at` + `expires_at` in the
-/// audit log.
-#[derive(Clone, Debug)]
+/// A freshly-minted installation token, bundled with the metadata needed
+/// to build a matching audit record. Fields are private on purpose: the
+/// only way to get the raw token out — and the only way to produce a
+/// `CredentialGrant` for the audit log — is to consume this value via
+/// [`MintedToken::into_grant_and_token`]. Pairing the token and the
+/// grant through a single consuming call rules out a whole class of
+/// drift bugs where the audit record disagrees with the token that was
+/// actually handed to the agent (wrong `jti`, a fresh `UnixSeconds::now()`
+/// instead of the broker-clock reading the TTL check validated, a scope
+/// different from the one the minter signed for).
+#[derive(Debug)]
 pub struct MintedToken {
-    pub token: String,
-    pub jti: Jti,
+    token: String,
+    jti: Jti,
+    issued_at: UnixSeconds,
+    expires_at: UnixSeconds,
+    scope: GitHubGrantedScope,
+}
+
+impl MintedToken {
     /// Broker-clock timestamp captured immediately before the mint request
-    /// went out. Also the reference against which GitHub's `expires_at` is
-    /// compared for the TTL check, so downstream code should use *this*
-    /// value (not a fresh `UnixSeconds::now()`) when building the grant
-    /// record — otherwise the (issued_at, expires_at) pair in the audit
-    /// log won't match the pair the TTL check actually verified.
-    pub issued_at: UnixSeconds,
-    /// The expiry GitHub tells us it will enforce. Authoritative.
-    pub expires_at: UnixSeconds,
+    /// went out, and the reference against which GitHub's `expires_at` was
+    /// compared for the TTL check.
+    pub fn issued_at(&self) -> UnixSeconds {
+        self.issued_at
+    }
+
+    /// The expiry GitHub said it will enforce. Authoritative.
+    pub fn expires_at(&self) -> UnixSeconds {
+        self.expires_at
+    }
+
+    pub fn jti(&self) -> Jti {
+        self.jti
+    }
+
+    pub fn scope(&self) -> &GitHubGrantedScope {
+        &self.scope
+    }
+
+    /// Consume the minted token, returning the raw token string (to hand
+    /// to the agent) and the matching `CredentialGrant` (to record in the
+    /// audit log). The grant's `(jti, issued_at, expires_at, scope)` come
+    /// straight from the mint, so there's no way for them to drift from
+    /// what was actually issued.
+    pub fn into_grant_and_token(
+        self,
+        request_id: RequestId,
+        session_id: SessionId,
+    ) -> (String, CredentialGrant) {
+        let grant = CredentialGrant {
+            jti: self.jti,
+            request_id,
+            session_id,
+            scope: GrantedScope::GitHub(self.scope),
+            issued_at: self.issued_at,
+            expires_at: self.expires_at,
+        };
+        (self.token, grant)
+    }
 }
 
 /// Mints installation tokens for one `GitHubAppConfig` using long-lived
@@ -120,7 +167,7 @@ impl<S: SecretStore> GitHubMinter<S> {
     /// real lifetime outlives what the policy granted.
     pub async fn mint(
         &self,
-        scope: &GitHubGrantedScope,
+        scope: GitHubGrantedScope,
         ttl: TtlSeconds,
     ) -> Result<MintedToken, MintError> {
         let pem = self
@@ -137,20 +184,22 @@ impl<S: SecretStore> GitHubMinter<S> {
             self.config.installation_id
         );
 
-        let body = MintRequest {
-            repositories: vec![scope.repository.name.as_str()],
-            permissions: &scope.permissions,
+        let resp = {
+            // Scope the borrow so `scope` becomes owned again once the
+            // request body has been serialised and the send future begins.
+            let body = MintRequest {
+                repositories: vec![scope.repository.name.as_str()],
+                permissions: &scope.permissions,
+            };
+            self.http
+                .post(&url)
+                .bearer_auth(jwt)
+                .header("Accept", "application/vnd.github+json")
+                .header("X-GitHub-Api-Version", "2022-11-28")
+                .json(&body)
+                .send()
+                .await?
         };
-
-        let resp = self
-            .http
-            .post(&url)
-            .bearer_auth(jwt)
-            .header("Accept", "application/vnd.github+json")
-            .header("X-GitHub-Api-Version", "2022-11-28")
-            .json(&body)
-            .send()
-            .await?;
 
         let status = resp.status();
         if !status.is_success() {
@@ -189,6 +238,7 @@ impl<S: SecretStore> GitHubMinter<S> {
             jti: Jti::new(),
             issued_at: UnixSeconds::from_i64(issued_at),
             expires_at: UnixSeconds::from_i64(expires_at),
+            scope,
         })
     }
 }
@@ -409,12 +459,13 @@ mod tests {
 
         let minter = minter_with_key(&server);
         let minted = minter
-            .mint(&write_scope("o", "n"), TtlSeconds::new(3600).unwrap())
+            .mint(write_scope("o", "n"), TtlSeconds::new(3600).unwrap())
             .await
             .expect("mint ok");
 
-        assert_eq!(minted.token, "ghs_fake_value");
-        assert_eq!(minted.expires_at.as_i64(), expiry_ts);
+        assert_eq!(minted.expires_at().as_i64(), expiry_ts);
+        let (token, _grant) = minted.into_grant_and_token(RequestId::new(), SessionId::new());
+        assert_eq!(token, "ghs_fake_value");
     }
 
     #[tokio::test]
@@ -430,7 +481,7 @@ mod tests {
 
         let minter = minter_with_key(&server);
         match minter
-            .mint(&write_scope("o", "nope"), TtlSeconds::new(3600).unwrap())
+            .mint(write_scope("o", "nope"), TtlSeconds::new(3600).unwrap())
             .await
         {
             Err(MintError::ApiError { status, body }) => {
@@ -457,7 +508,7 @@ mod tests {
             InMemStore::default(),
         );
         match minter
-            .mint(&write_scope("o", "n"), TtlSeconds::new(3600).unwrap())
+            .mint(write_scope("o", "n"), TtlSeconds::new(3600).unwrap())
             .await
         {
             Err(MintError::PrivateKeyMissing(k)) => assert_eq!(k.as_str(), "absent"),
@@ -501,7 +552,7 @@ mod tests {
 
         let minter = minter_with_key(&server);
         let err = minter
-            .mint(&write_scope("o", "n"), TtlSeconds::new(3600).unwrap())
+            .mint(write_scope("o", "n"), TtlSeconds::new(3600).unwrap())
             .await
             .expect_err("should reject past expiry");
         assert!(
@@ -524,7 +575,7 @@ mod tests {
 
         let minter = minter_with_key(&server);
         match minter
-            .mint(&write_scope("o", "n"), TtlSeconds::new(300).unwrap())
+            .mint(write_scope("o", "n"), TtlSeconds::new(300).unwrap())
             .await
         {
             Err(MintError::TtlExceeded {
@@ -553,10 +604,10 @@ mod tests {
 
         let minter = minter_with_key(&server);
         let minted = minter
-            .mint(&write_scope("o", "n"), TtlSeconds::new(3600).unwrap())
+            .mint(write_scope("o", "n"), TtlSeconds::new(3600).unwrap())
             .await
             .expect("mint within skew tolerance should succeed");
-        assert!(minted.expires_at.as_i64() > minted.issued_at.as_i64());
+        assert!(minted.expires_at().as_i64() > minted.issued_at().as_i64());
     }
 
     #[tokio::test]
@@ -573,7 +624,7 @@ mod tests {
 
         let minter = minter_with_key(&server);
         let err = minter
-            .mint(&write_scope("o", "n"), TtlSeconds::new(3600).unwrap())
+            .mint(write_scope("o", "n"), TtlSeconds::new(3600).unwrap())
             .await
             .expect_err("should reject past-skew expiry");
         assert!(matches!(err, MintError::TtlExceeded { .. }), "got: {err:?}");
@@ -595,16 +646,57 @@ mod tests {
         let minter = minter_with_key(&server);
         let before = UnixSeconds::now().as_i64();
         let minted = minter
-            .mint(&write_scope("o", "n"), TtlSeconds::new(3600).unwrap())
+            .mint(write_scope("o", "n"), TtlSeconds::new(3600).unwrap())
             .await
             .unwrap();
         let after = UnixSeconds::now().as_i64();
 
-        let iat = minted.issued_at.as_i64();
+        let iat = minted.issued_at().as_i64();
         assert!(
             iat >= before && iat <= after,
             "issued_at {iat} outside [{before}, {after}]"
         );
+    }
+
+    #[tokio::test]
+    async fn into_grant_and_token_preserves_mint_fields() {
+        // The whole reason `MintedToken` exists as a distinct type is to
+        // make the (token, grant) pair come apart together so the audit
+        // record can't drift from what was actually issued. Pin that: the
+        // resulting grant must carry the same jti, issued_at, expires_at,
+        // and scope that the minter captured.
+        let server = MockServer::start().await;
+        let (expiry_ts, expiry_str) = expiry_seconds_from_now(3600);
+        Mock::given(method("POST"))
+            .and(path("/app/installations/999/access_tokens"))
+            .respond_with(mock_mint_response(&expiry_str))
+            .mount(&server)
+            .await;
+
+        let minter = minter_with_key(&server);
+        let requested_scope = write_scope("o", "n");
+        let minted = minter
+            .mint(requested_scope.clone(), TtlSeconds::new(3600).unwrap())
+            .await
+            .unwrap();
+
+        let captured_jti = minted.jti();
+        let captured_issued_at = minted.issued_at();
+        let captured_expires_at = minted.expires_at();
+        assert_eq!(minted.scope(), &requested_scope);
+
+        let request_id = RequestId::new();
+        let session_id = SessionId::new();
+        let (token, grant) = minted.into_grant_and_token(request_id, session_id);
+
+        assert_eq!(token, "ghs_fake_value");
+        assert_eq!(grant.jti, captured_jti);
+        assert_eq!(grant.request_id, request_id);
+        assert_eq!(grant.session_id, session_id);
+        assert_eq!(grant.issued_at, captured_issued_at);
+        assert_eq!(grant.expires_at, captured_expires_at);
+        assert_eq!(grant.expires_at.as_i64(), expiry_ts);
+        assert_eq!(grant.scope, GrantedScope::GitHub(requested_scope));
     }
 
     #[test]
