@@ -69,6 +69,9 @@ pub enum TtlError {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "backend", content = "scope")]
 pub enum GrantedScope {
+    // `rename_all = "snake_case"` would turn `GitHub` into `git_hub`, which is
+    // surprising for a wire format. Name it explicitly.
+    #[serde(rename = "github")]
     GitHub(GitHubGrantedScope),
 }
 
@@ -171,5 +174,21 @@ mod tests {
     fn ttl_deserialise_accepts_valid() {
         let t: TtlSeconds = serde_json::from_str("300").unwrap();
         assert_eq!(t.as_i64(), 300);
+    }
+
+    /// Pin the GitHub variant's wire name on the grant side too. Matches
+    /// the request side; inconsistency here would bite at the audit log
+    /// and any external replay tooling.
+    #[test]
+    fn granted_scope_github_variant_serialises_as_literal_github() {
+        let s = GrantedScope::GitHub(GitHubGrantedScope {
+            repository: RepoRef {
+                owner: "a".into(),
+                name: "b".into(),
+            },
+            permissions: GitHubPermissions::default(),
+        });
+        let v: serde_json::Value = serde_json::to_value(&s).unwrap();
+        assert_eq!(v["backend"], serde_json::Value::String("github".into()));
     }
 }

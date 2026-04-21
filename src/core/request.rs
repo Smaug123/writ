@@ -9,6 +9,9 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "backend", content = "request")]
 pub enum CapabilityRequest {
+    // `rename_all = "snake_case"` would turn `GitHub` into `git_hub`, which is
+    // surprising for a wire format. Name it explicitly.
+    #[serde(rename = "github")]
     GitHub(GitHubRequest),
 }
 
@@ -85,5 +88,15 @@ mod tests {
             repo: r.clone(),
         };
         assert_eq!(req.repo(), &r);
+    }
+
+    /// Pin the wire-level name of the GitHub backend. Regressing this
+    /// silently (e.g. via `rename_all` producing "git_hub") would break
+    /// every deployed client at once.
+    #[test]
+    fn github_variant_serialises_as_literal_github() {
+        let r = CapabilityRequest::GitHub(GitHubRequest::Metadata { repo: sample_repo() });
+        let v: serde_json::Value = serde_json::to_value(&r).unwrap();
+        assert_eq!(v["backend"], serde_json::Value::String("github".into()));
     }
 }
