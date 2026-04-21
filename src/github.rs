@@ -69,13 +69,28 @@ pub struct GitHubAppConfig {
 /// actually handed to the agent (wrong `jti`, a fresh `UnixMillis::now()`
 /// instead of the broker-clock reading the TTL check validated, a scope
 /// different from the one the minter signed for).
-#[derive(Debug)]
+///
+/// `Debug` is hand-rolled to redact the token string: a stray
+/// `tracing::debug!({minted:?})` or `dbg!` would otherwise spray a live
+/// credential into logs. All other fields are safe to print.
 pub struct MintedToken {
     token: String,
     jti: Jti,
     issued_at: UnixMillis,
     expires_at: UnixMillis,
     scope: GitHubGrantedScope,
+}
+
+impl std::fmt::Debug for MintedToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MintedToken")
+            .field("token", &"<redacted>")
+            .field("jti", &self.jti)
+            .field("issued_at", &self.issued_at)
+            .field("expires_at", &self.expires_at)
+            .field("scope", &self.scope)
+            .finish()
+    }
 }
 
 impl MintedToken {
@@ -215,6 +230,13 @@ impl<S: SecretStore> GitHubMinter<S> {
         }
 
         let parsed: MintResponse = resp.json().await?;
+        // Defence-in-depth: GitHub should never return a 2xx with an empty
+        // or whitespace-only token, but handing one to the agent would
+        // still record a successful grant for a credential that can't
+        // possibly authenticate. Bail loudly.
+        if parsed.token.trim().is_empty() {
+            return Err(MintError::EmptyToken);
+        }
         // GitHub's `expires_at` is whole-seconds-precision, so the TTL
         // comparisons below stay in seconds and the audit record gets
         // the timestamp lifted to millisecond space on the second boundary.
@@ -284,6 +306,8 @@ pub enum MintError {
         issued_at: i64,
         actual_expires_at: i64,
     },
+    #[error("GitHub returned a 2xx response with an empty token string")]
+    EmptyToken,
 }
 
 #[derive(Serialize)]
@@ -747,6 +771,59 @@ mod tests {
         let body = "é".repeat(API_ERROR_DISPLAY_CAP * 2);
         let err = MintError::ApiError { status: 422, body };
         let _ = format!("{err}");
+    }
+
+    #[tokio::test]
+    async fn mint_rejects_empty_token() {
+        // A 2xx response with a blank token would otherwise bank an
+        // audit record for a credential that can't authenticate.
+        let server = MockServer::start().await;
+        let (_, expiry_str) = expiry_seconds_from_now(3600);
+        Mock::given(method("POST"))
+            .and(path("/app/installations/999/access_tokens"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "token": "   ",
+                "expires_at": expiry_str,
+                "permissions": {"contents": "write", "metadata": "read"},
+                "repository_selection": "selected"
+            })))
+            .mount(&server)
+            .await;
+
+        let minter = minter_with_key(&server);
+        let err = minter
+            .mint(write_scope("o", "n"), TtlSeconds::new(3600).unwrap())
+            .await
+            .expect_err("empty token should be rejected");
+        assert!(matches!(err, MintError::EmptyToken), "got: {err:?}");
+    }
+
+    #[tokio::test]
+    async fn minted_token_debug_redacts_token_string() {
+        // A stray `{minted:?}` in a log line must not spray the live
+        // credential. Every other field stays printable so debug output
+        // remains useful.
+        let server = MockServer::start().await;
+        let (_, expiry_str) = expiry_seconds_from_now(3600);
+        Mock::given(method("POST"))
+            .and(path("/app/installations/999/access_tokens"))
+            .respond_with(mock_mint_response(&expiry_str))
+            .mount(&server)
+            .await;
+
+        let minter = minter_with_key(&server);
+        let minted = minter
+            .mint(write_scope("o", "n"), TtlSeconds::new(3600).unwrap())
+            .await
+            .unwrap();
+
+        let shown = format!("{minted:?}");
+        assert!(
+            !shown.contains("ghs_fake_value"),
+            "Debug output leaked token string: {shown}"
+        );
+        assert!(shown.contains("<redacted>"), "expected redaction marker: {shown}");
+        assert!(shown.contains("jti"), "other fields should still render: {shown}");
     }
 
     #[test]

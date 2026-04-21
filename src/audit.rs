@@ -51,6 +51,16 @@ pub enum AuditError {
 
     #[error("invariant violated: {0}")]
     Invariant(&'static str),
+
+    /// The on-disk schema was written by a newer broker than this binary
+    /// knows how to read. Refusing to open is the correctness-over-
+    /// availability call: a down-rev binary silently ignoring columns it
+    /// doesn't understand is how audit logs lose data.
+    #[error(
+        "audit DB schema version {found} is newer than this binary supports (max {supported}); \
+         upgrade the broker"
+    )]
+    SchemaTooNew { found: i32, supported: i32 },
 }
 
 /// The outcome of the post-policy mint step for one request.
@@ -94,11 +104,11 @@ impl std::fmt::Debug for AuditLog {
 }
 
 impl AuditLog {
-    /// Open (or create) an on-disk audit log. The schema is initialised
-    /// idempotently.
+    /// Open (or create) an on-disk audit log. The schema is brought up to
+    /// [`SCHEMA_VERSION`] by running any missing migrations in order.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, AuditError> {
-        let conn = Connection::open(path)?;
-        Self::init(&conn)?;
+        let mut conn = Connection::open(path)?;
+        Self::init(&mut conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -106,29 +116,20 @@ impl AuditLog {
 
     /// In-memory audit log, for tests.
     pub fn open_in_memory() -> Result<Self, AuditError> {
-        let conn = Connection::open_in_memory()?;
-        Self::init(&conn)?;
+        let mut conn = Connection::open_in_memory()?;
+        Self::init(&mut conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
     }
 
-    fn init(conn: &Connection) -> Result<(), AuditError> {
+    fn init(conn: &mut Connection) -> Result<(), AuditError> {
         // SQLite foreign_keys is per-connection and defaults to OFF, so the
-        // REFERENCES clauses in SCHEMA_SQL would otherwise be parsed-and-ignored
-        // and orphan `request`/`grant_log` rows could slip in.
+        // REFERENCES clauses in the v1 schema would otherwise be
+        // parsed-and-ignored and orphan `request`/`grant_log` rows could
+        // slip in. Must be set outside a transaction.
         conn.execute_batch("PRAGMA foreign_keys = ON;")?;
-        conn.execute_batch(SCHEMA_SQL)?;
-        Self::ensure_request_mint_failure_column(conn)?;
-        Ok(())
-    }
-
-    fn ensure_request_mint_failure_column(conn: &Connection) -> Result<(), AuditError> {
-        if table_has_column(conn, "request", "mint_failure_json")? {
-            return Ok(());
-        }
-        conn.execute("ALTER TABLE request ADD COLUMN mint_failure_json TEXT", [])?;
-        Ok(())
+        migrate(conn)
     }
 
     fn with_conn<R>(
@@ -391,20 +392,37 @@ fn grant_from_row(row: &Row<'_>) -> rusqlite::Result<Result<CredentialGrant, Aud
     Ok(parse())
 }
 
-fn table_has_column(conn: &Connection, table: &str, column: &str) -> Result<bool, AuditError> {
-    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
-    let mut rows = stmt.query([])?;
-    while let Some(row) = rows.next()? {
-        let name: String = row.get(1)?;
-        if name == column {
-            return Ok(true);
-        }
-    }
-    Ok(false)
+/// One versioned schema change. Migrations are applied in order; each
+/// one advances `PRAGMA user_version` to its own `version` when it
+/// commits, so a partial run (process killed mid-migration) resumes
+/// cleanly at the next open.
+///
+/// Rules for adding a new migration:
+///   1. Append a new entry with `version = SCHEMA_VERSION + 1`.
+///   2. Bump [`SCHEMA_VERSION`].
+///   3. Never edit a migration that has shipped — write another one.
+///   4. Never renumber. Versions are append-only, like the audit log they
+///      manage.
+struct Migration {
+    /// The schema version the DB is at *after* this migration commits.
+    version: i32,
+    sql: &'static str,
 }
 
-const SCHEMA_SQL: &str = r#"
-CREATE TABLE IF NOT EXISTS session (
+/// Highest schema version this binary knows how to read. An on-disk DB at
+/// a version higher than this is rejected with [`AuditError::SchemaTooNew`]
+/// rather than opened — we'd rather fail to start than silently drop data
+/// into a schema a newer broker wrote.
+const SCHEMA_VERSION: i32 = 2;
+
+/// The full migration history. Each entry documents exactly one state
+/// transition; the sequence of entries is the schema's lineage. Order
+/// matters and must be strictly ascending in `version`.
+const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        sql: r#"
+CREATE TABLE session (
     session_id  TEXT PRIMARY KEY,
     label       TEXT,
     agent_model TEXT,
@@ -412,18 +430,17 @@ CREATE TABLE IF NOT EXISTS session (
     closed_at   INTEGER
 );
 
-CREATE TABLE IF NOT EXISTS request (
+CREATE TABLE request (
     request_id    TEXT PRIMARY KEY,
     session_id    TEXT NOT NULL REFERENCES session(session_id),
     received_at   INTEGER NOT NULL,
     request_json  TEXT NOT NULL,
-    decision_json TEXT NOT NULL,
-    mint_failure_json TEXT
+    decision_json TEXT NOT NULL
 );
 
-CREATE INDEX IF NOT EXISTS idx_request_session ON request(session_id, received_at);
+CREATE INDEX idx_request_session ON request(session_id, received_at);
 
-CREATE TABLE IF NOT EXISTS grant_log (
+CREATE TABLE grant_log (
     jti         TEXT PRIMARY KEY,
     request_id  TEXT NOT NULL REFERENCES request(request_id),
     session_id  TEXT NOT NULL REFERENCES session(session_id),
@@ -432,8 +449,69 @@ CREATE TABLE IF NOT EXISTS grant_log (
     expires_at  INTEGER NOT NULL
 );
 
-CREATE INDEX IF NOT EXISTS idx_grant_session ON grant_log(session_id, issued_at);
-"#;
+CREATE INDEX idx_grant_session ON grant_log(session_id, issued_at);
+"#,
+    },
+    Migration {
+        version: 2,
+        sql: "ALTER TABLE request ADD COLUMN mint_failure_json TEXT;",
+    },
+];
+
+fn migrate(conn: &mut Connection) -> Result<(), AuditError> {
+    let mut current = user_version(conn)?;
+
+    // A v1-shaped DB written before we started tracking `user_version`
+    // would read as version 0 but already have the v1 tables. Fast-forward
+    // the pragma in-place so subsequent migrations apply cleanly.
+    if current == 0 && table_exists(conn, "session")? {
+        conn.pragma_update(None, "user_version", 1)?;
+        current = 1;
+    }
+
+    if current > SCHEMA_VERSION {
+        return Err(AuditError::SchemaTooNew {
+            found: current,
+            supported: SCHEMA_VERSION,
+        });
+    }
+
+    // Belt-and-braces: the compile-time shape of MIGRATIONS is the
+    // source of truth, so verify it matches SCHEMA_VERSION rather than
+    // trust two constants to stay in sync by convention.
+    debug_assert_eq!(
+        MIGRATIONS.last().map(|m| m.version),
+        Some(SCHEMA_VERSION),
+        "SCHEMA_VERSION must equal the last migration's version"
+    );
+    debug_assert!(
+        MIGRATIONS.windows(2).all(|w| w[0].version < w[1].version),
+        "migrations must be strictly ascending in version"
+    );
+
+    for m in MIGRATIONS.iter().filter(|m| m.version > current) {
+        let tx = conn.transaction()?;
+        tx.execute_batch(m.sql)?;
+        tx.pragma_update(None, "user_version", m.version)?;
+        tx.commit()?;
+    }
+    Ok(())
+}
+
+fn user_version(conn: &Connection) -> Result<i32, AuditError> {
+    Ok(conn.query_row("PRAGMA user_version", [], |row| row.get(0))?)
+}
+
+fn table_exists(conn: &Connection, name: &str) -> Result<bool, AuditError> {
+    let found: Option<String> = conn
+        .query_row(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            params![name],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(found.is_some())
+}
 
 #[cfg(test)]
 mod tests {
@@ -1014,6 +1092,50 @@ mod tests {
         assert!(matches!(err, AuditError::Invariant(_)));
     }
 
+    fn read_user_version(log: &AuditLog) -> i32 {
+        log.with_conn(user_version).unwrap()
+    }
+
+    fn column_exists(log: &AuditLog, table: &str, column: &str) -> bool {
+        log.with_conn(|c| {
+            let mut stmt = c.prepare(&format!("PRAGMA table_info({table})"))?;
+            let mut rows = stmt.query([])?;
+            while let Some(row) = rows.next()? {
+                let name: String = row.get(1)?;
+                if name == column {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn fresh_install_is_at_current_schema_version() {
+        let log = AuditLog::open_in_memory().unwrap();
+        assert_eq!(read_user_version(&log), SCHEMA_VERSION);
+        assert!(column_exists(&log, "request", "mint_failure_json"));
+    }
+
+    #[test]
+    fn reopen_at_current_version_is_a_noop() {
+        // The pragma check is what makes this cheap on startup; verify
+        // re-running migrate on an already-current DB doesn't error and
+        // doesn't bump the version past the supported max.
+        let db = NamedTempFile::new().unwrap();
+        {
+            let log = AuditLog::open(db.path()).unwrap();
+            assert_eq!(read_user_version(&log), SCHEMA_VERSION);
+        }
+        let log = AuditLog::open(db.path()).unwrap();
+        assert_eq!(read_user_version(&log), SCHEMA_VERSION);
+    }
+
+    /// A DB written before we started tracking `user_version` reads as
+    /// version 0 but already has the v1 tables. The fast-forward path
+    /// detects this and brings it up to current without trying to
+    /// re-create existing tables.
     #[test]
     fn open_migrates_legacy_request_table_to_include_mint_failure_column() {
         let db = NamedTempFile::new().unwrap();
@@ -1054,9 +1176,55 @@ CREATE INDEX idx_grant_session ON grant_log(session_id, issued_at);
         drop(conn);
 
         let log = AuditLog::open(db.path()).unwrap();
-        let has_column = log
-            .with_conn(|c| table_has_column(c, "request", "mint_failure_json"))
-            .unwrap();
-        assert!(has_column, "legacy request table should be migrated");
+        assert!(column_exists(&log, "request", "mint_failure_json"));
+        assert_eq!(read_user_version(&log), SCHEMA_VERSION);
+    }
+
+    /// A DB written by a future broker will carry a user_version beyond
+    /// what this binary knows. Refuse to open rather than risk silently
+    /// ignoring columns the newer schema relies on.
+    #[test]
+    fn open_rejects_schema_newer_than_supported() {
+        let db = NamedTempFile::new().unwrap();
+        {
+            // Build at current version, then tell the DB it's from the future.
+            let _ = AuditLog::open(db.path()).unwrap();
+            let c = Connection::open(db.path()).unwrap();
+            c.pragma_update(None, "user_version", SCHEMA_VERSION + 1)
+                .unwrap();
+        }
+        let err = AuditLog::open(db.path()).unwrap_err();
+        match err {
+            AuditError::SchemaTooNew { found, supported } => {
+                assert_eq!(found, SCHEMA_VERSION + 1);
+                assert_eq!(supported, SCHEMA_VERSION);
+            }
+            other => panic!("expected SchemaTooNew, got {other:?}"),
+        }
+    }
+
+    /// If a migration fails partway (process killed, disk full), the
+    /// next open must resume from the last successfully-committed version
+    /// rather than replay already-applied DDL. Each migration commits
+    /// its version bump in the same transaction as its DDL, so version
+    /// and schema can't disagree across restarts.
+    #[test]
+    fn partial_migration_resumes_from_last_committed_version() {
+        let db = NamedTempFile::new().unwrap();
+        {
+            // Apply migration 1 only, by running it directly and stopping.
+            let mut c = Connection::open(db.path()).unwrap();
+            c.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+            let tx = c.transaction().unwrap();
+            tx.execute_batch(MIGRATIONS[0].sql).unwrap();
+            tx.pragma_update(None, "user_version", MIGRATIONS[0].version)
+                .unwrap();
+            tx.commit().unwrap();
+        }
+
+        let log = AuditLog::open(db.path()).unwrap();
+        // Migration 2 should have been applied on open.
+        assert_eq!(read_user_version(&log), SCHEMA_VERSION);
+        assert!(column_exists(&log, "request", "mint_failure_json"));
     }
 }
