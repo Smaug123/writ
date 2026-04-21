@@ -236,17 +236,11 @@ mod tests {
     }
 
     #[test]
-    fn policy_config_parses_from_toml() {
-        let src = r#"
-            default_ttl = 300
-            writable_repos = ["smaug123/agent-infra"]
-        "#;
-        // We don't want a toml dependency yet; validate via json equivalent.
+    fn policy_config_parses_from_json() {
         let json = r#"{
             "default_ttl": 300,
             "writable_repos": ["smaug123/agent-infra"]
         }"#;
-        let _ = src;
         let c: PolicyConfig = serde_json::from_str(json).unwrap();
         assert_eq!(c.default_ttl.as_i64(), 300);
         assert_eq!(c.writable_repos.len(), 1);
