@@ -1,10 +1,20 @@
-//! Append-only audit log backed by SQLite.
+//! Audit log backed by SQLite.
 //!
 //! The log is the system-of-record for broker activity: every session,
 //! every capability request, every credential grant lands here. The raw
 //! JSON for requests, decisions, and scopes is stored verbatim, so the
 //! log can be replayed to reconstruct history without depending on the
 //! broker binary staying source-compatible.
+//!
+//! The `request` and `grant_log` tables are strictly append-only: once a
+//! row lands it is never mutated or deleted. This is the part that
+//! matters for audit-integrity claims.
+//!
+//! The `session` table carries open/close timestamps and is updated by
+//! `close_session`. Session lifecycle is a mutable record for
+//! convenience of querying, not an audit claim — the per-grant rows in
+//! `grant_log` are what get reconciled against observed side-effects,
+//! and those never move.
 
 use std::path::Path;
 use std::sync::Mutex;
@@ -76,6 +86,10 @@ impl AuditLog {
     }
 
     fn init(conn: &Connection) -> Result<(), AuditError> {
+        // SQLite foreign_keys is per-connection and defaults to OFF, so the
+        // REFERENCES clauses in SCHEMA_SQL would otherwise be parsed-and-ignored
+        // and orphan `request`/`grant_log` rows could slip in.
+        conn.execute_batch("PRAGMA foreign_keys = ON;")?;
         conn.execute_batch(SCHEMA_SQL)?;
         Ok(())
     }
@@ -503,6 +517,74 @@ mod tests {
             })
             .unwrap_err();
         assert!(matches!(err, AuditError::Invariant(_)));
+    }
+
+    /// Regression: without `PRAGMA foreign_keys = ON`, SQLite silently
+    /// ignores `REFERENCES` clauses and accepts orphan rows. Force a known
+    /// FK violation and check the broker refuses it.
+    #[test]
+    fn foreign_key_enforcement_rejects_orphan_grant_row() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+
+        // Bypass `record` (which would block this at the application layer)
+        // and write directly. The FK to `request(request_id)` must bite.
+        let err = log
+            .with_conn(|c| {
+                c.execute(
+                    "INSERT INTO grant_log (jti, request_id, session_id, scope_json, issued_at, expires_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![
+                        Jti::new().as_uuid().to_string(),
+                        RequestId::new().as_uuid().to_string(), // no matching request row
+                        s.session_id.as_uuid().to_string(),
+                        "{}",
+                        1_i64,
+                        2_i64,
+                    ],
+                )?;
+                Ok(())
+            })
+            .unwrap_err();
+        let AuditError::Sqlite(e) = err else {
+            panic!("expected sqlite FK error, got: {err:?}");
+        };
+        let msg = e.to_string().to_lowercase();
+        assert!(
+            msg.contains("foreign key"),
+            "expected FK violation, got: {e}"
+        );
+    }
+
+    /// Same as above but for the `session_id` FK from `request`. Belt and
+    /// braces — both FK paths matter.
+    #[test]
+    fn foreign_key_enforcement_rejects_orphan_request_row() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let err = log
+            .with_conn(|c| {
+                c.execute(
+                    "INSERT INTO request (request_id, session_id, received_at, request_json, decision_json) \
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        RequestId::new().as_uuid().to_string(),
+                        SessionId::new().as_uuid().to_string(), // no matching session row
+                        1_i64,
+                        "{}",
+                        "{}",
+                    ],
+                )?;
+                Ok(())
+            })
+            .unwrap_err();
+        let AuditError::Sqlite(e) = err else {
+            panic!("expected sqlite FK error, got: {err:?}");
+        };
+        assert!(
+            e.to_string().to_lowercase().contains("foreign key"),
+            "expected FK violation, got: {e}"
+        );
     }
 
     #[test]
