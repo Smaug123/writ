@@ -47,10 +47,6 @@ impl FileSecretStore {
     fn path_for(&self, key: &SecretKey) -> PathBuf {
         self.base.join(key.as_str())
     }
-
-    fn tmp_path_for(&self, key: &SecretKey) -> PathBuf {
-        self.base.join(format!("{}.tmp", key.as_str()))
-    }
 }
 
 impl SecretStore for FileSecretStore {
@@ -64,11 +60,14 @@ impl SecretStore for FileSecretStore {
 
     fn put(&self, key: &SecretKey, value: &str) -> Result<(), SecretError> {
         let dest = self.path_for(key);
-        let tmp = self.tmp_path_for(key);
+        // A leading '.' guarantees no collision with any real key, since
+        // `SecretKey::new` rejects names starting with '.'. A random suffix
+        // gives concurrent writers to distinct keys — or the same key —
+        // distinct temp paths, so neither clobbers the other mid-write.
+        let tmp = self.base.join(format!(".tmp.{}", uuid::Uuid::new_v4()));
         {
             let mut f = fs::OpenOptions::new()
-                .create(true)
-                .truncate(true)
+                .create_new(true)
                 .write(true)
                 .mode(0o600)
                 .open(&tmp)?;
@@ -123,6 +122,19 @@ mod tests {
         s.put(&key("a"), "first").unwrap();
         s.put(&key("a"), "second").unwrap();
         assert_eq!(s.get(&key("a")).unwrap().as_deref(), Some("second"));
+    }
+
+    /// Regression: an earlier version used `{key}.tmp` as the mid-write
+    /// filename, so writing key "foo" would clobber the already-stored
+    /// "foo.tmp" key. Temp paths are now UUID-suffixed and `.`-prefixed,
+    /// which cannot collide with any valid `SecretKey`.
+    #[test]
+    fn put_does_not_clobber_key_ending_in_dot_tmp() {
+        let (_tmp, s) = store();
+        s.put(&key("foo.tmp"), "survive").unwrap();
+        s.put(&key("foo"), "ok").unwrap();
+        assert_eq!(s.get(&key("foo.tmp")).unwrap().as_deref(), Some("survive"));
+        assert_eq!(s.get(&key("foo")).unwrap().as_deref(), Some("ok"));
     }
 
     #[test]
