@@ -15,9 +15,16 @@ pub enum PolicyDecision {
     },
 }
 
-/// Time-to-live for a grant. Positive and bounded at construction time so
-/// that interior code can rely on `ttl > 0` and `ttl <= 3600`. Deserialisation
-/// runs the same check, so config-loaded values can't slip past the bounds.
+/// Ceiling on the effective lifetime of a grant, in seconds. Positive and
+/// bounded at construction time so that interior code can rely on
+/// `ttl > 0` and `ttl <= 3600`. Deserialisation runs the same check, so
+/// config-loaded values can't slip past the bounds.
+///
+/// This is a *ceiling*, not an exact lifetime: backend mint steps compare
+/// the backend-reported expiry against `issued_at + ttl` (with a small
+/// skew tolerance) and refuse to produce a grant that would outlive it.
+/// The audit log's `expires_at` is always the backend-reported value, and
+/// may be shorter than `ttl` would imply.
 #[derive(Copy, Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(try_from = "i64", into = "i64")]
 pub struct TtlSeconds(i64);

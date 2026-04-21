@@ -26,8 +26,12 @@ pub struct PolicyConfig {
     #[serde(default)]
     pub writable_repos: Vec<RepoRef>,
 
-    /// TTL applied to every granted token. Bounded to the 1-hour installation
-    /// token ceiling by `TtlSeconds` itself.
+    /// Ceiling on effective grant lifetime. The audit log records the
+    /// backend-reported expiry, which may be shorter; if the backend can't
+    /// issue a token within this ceiling (GitHub's installation tokens are
+    /// always ~1 hour, and can't be asked for less), the mint step fails
+    /// rather than produce a grant that outlives the decision. Bounded to
+    /// the 1-hour installation token ceiling by `TtlSeconds` itself.
     pub default_ttl: TtlSeconds,
 }
 
