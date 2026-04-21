@@ -1,0 +1,229 @@
+//! Pure data types. No IO, no side effects. Everything here round-trips
+//! through serde and is safe to construct from tests.
+
+mod decision;
+mod grant;
+mod request;
+mod session;
+
+pub use decision::{
+    GitHubGrantedScope, GitHubPermissions, GrantedScope, PolicyDecision, TtlError, TtlSeconds,
+};
+pub use grant::CredentialGrant;
+pub use request::{CapabilityRequest, GitHubRequest};
+pub use session::SessionRecord;
+
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+// --- Nominal IDs ------------------------------------------------------
+
+macro_rules! uuid_id {
+    ($(#[$meta:meta])* $name:ident) => {
+        $(#[$meta])*
+        #[derive(Copy, Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+        #[serde(transparent)]
+        pub struct $name(Uuid);
+
+        impl $name {
+            // A `Default` impl would silently mint a fresh random UUID,
+            // which is a surprising meaning of "default value". Keep
+            // generation explicit.
+            #[allow(clippy::new_without_default)]
+            pub fn new() -> Self {
+                Self(Uuid::new_v4())
+            }
+            pub fn from_uuid(u: Uuid) -> Self {
+                Self(u)
+            }
+            pub fn as_uuid(self) -> Uuid {
+                self.0
+            }
+        }
+
+        impl std::fmt::Display for $name {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                self.0.fmt(f)
+            }
+        }
+
+        impl std::str::FromStr for $name {
+            type Err = uuid::Error;
+            fn from_str(s: &str) -> Result<Self, Self::Err> {
+                Ok(Self(Uuid::parse_str(s)?))
+            }
+        }
+    };
+}
+
+uuid_id!(
+    /// Broker-issued identity for one agent conversation.
+    SessionId
+);
+uuid_id!(
+    /// Identifies one capability request from an agent.
+    RequestId
+);
+uuid_id!(
+    /// Identifies one credential grant — the reconciliation key for
+    /// matching audit records against later-observed side effects.
+    Jti
+);
+
+// --- Timestamp --------------------------------------------------------
+
+/// A unix-epoch timestamp in seconds, always UTC.
+#[derive(Copy, Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct UnixSeconds(i64);
+
+impl UnixSeconds {
+    pub fn now() -> Self {
+        Self(time::OffsetDateTime::now_utc().unix_timestamp())
+    }
+    pub fn from_i64(v: i64) -> Self {
+        Self(v)
+    }
+    pub fn as_i64(self) -> i64 {
+        self.0
+    }
+    pub fn add_seconds(self, s: i64) -> Self {
+        Self(self.0 + s)
+    }
+}
+
+impl std::fmt::Display for UnixSeconds {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+// --- RepoRef ----------------------------------------------------------
+
+/// A GitHub repository reference in "owner/name" form. Serialised as a
+/// bare string.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct RepoRef {
+    pub owner: String,
+    pub name: String,
+}
+
+impl std::fmt::Display for RepoRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}/{}", self.owner, self.name)
+    }
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum RepoRefParseError {
+    #[error("expected 'owner/name', got '{0}'")]
+    Malformed(String),
+}
+
+impl std::str::FromStr for RepoRef {
+    type Err = RepoRefParseError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let (owner, name) = s
+            .split_once('/')
+            .ok_or_else(|| RepoRefParseError::Malformed(s.to_string()))?;
+        if owner.is_empty() || name.is_empty() || name.contains('/') {
+            return Err(RepoRefParseError::Malformed(s.to_string()));
+        }
+        Ok(Self {
+            owner: owner.to_string(),
+            name: name.to_string(),
+        })
+    }
+}
+
+impl Serialize for RepoRef {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for RepoRef {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        s.parse().map_err(serde::de::Error::custom)
+    }
+}
+
+// --- GitHubAccess -----------------------------------------------------
+
+/// Access level for a GitHub App permission.
+#[derive(Copy, Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GitHubAccess {
+    Read,
+    Write,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::str::FromStr;
+
+    #[test]
+    fn repo_ref_parses_well_formed() {
+        let r: RepoRef = "smaug123/agent-infra".parse().unwrap();
+        assert_eq!(r.owner, "smaug123");
+        assert_eq!(r.name, "agent-infra");
+        assert_eq!(r.to_string(), "smaug123/agent-infra");
+    }
+
+    #[test]
+    fn repo_ref_rejects_malformed() {
+        for bad in ["no-slash", "/name", "owner/", "a/b/c", "", "/"] {
+            assert!(
+                RepoRef::from_str(bad).is_err(),
+                "expected parse failure for {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn repo_ref_serde_is_bare_string() {
+        let r = RepoRef {
+            owner: "o".into(),
+            name: "n".into(),
+        };
+        let j = serde_json::to_string(&r).unwrap();
+        assert_eq!(j, r#""o/n""#);
+        let back: RepoRef = serde_json::from_str(&j).unwrap();
+        assert_eq!(back, r);
+    }
+
+    #[test]
+    fn ids_are_freshly_unique() {
+        let a = SessionId::new();
+        let b = SessionId::new();
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn id_roundtrips_through_string() {
+        let a = SessionId::new();
+        let s = a.to_string();
+        let back: SessionId = s.parse().unwrap();
+        assert_eq!(a, back);
+    }
+
+    #[test]
+    fn unix_seconds_serialises_as_integer() {
+        let t = UnixSeconds::from_i64(1_700_000_000);
+        assert_eq!(serde_json::to_string(&t).unwrap(), "1700000000");
+    }
+
+    #[test]
+    fn github_access_serialises_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&GitHubAccess::Read).unwrap(),
+            r#""read""#
+        );
+        assert_eq!(
+            serde_json::to_string(&GitHubAccess::Write).unwrap(),
+            r#""write""#
+        );
+    }
+}
