@@ -6,5 +6,6 @@
 
 pub mod audit;
 pub mod core;
+pub mod github;
 pub mod policy;
 pub mod secret;
