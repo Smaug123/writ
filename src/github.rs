@@ -82,10 +82,21 @@ pub struct GitHubMinter<S: SecretStore> {
     http: reqwest::Client,
 }
 
+/// Per-request timeout for calls out to GitHub. Above a few seconds GitHub is
+/// either degraded or the network has failed — waiting longer trades a failed
+/// request for a blocked caller, which is the wrong side of that bargain for
+/// a broker serving multiple agents.
+const GITHUB_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// Tighter cap on the TCP/TLS handshake specifically, so a black-holed route
+/// can't eat the full per-request budget before the body even starts.
+const GITHUB_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 impl<S: SecretStore> GitHubMinter<S> {
     pub fn new(config: GitHubAppConfig, secrets: S) -> Self {
         let http = reqwest::Client::builder()
             .user_agent("agent-infra-broker/0.1")
+            .timeout(GITHUB_REQUEST_TIMEOUT)
+            .connect_timeout(GITHUB_CONNECT_TIMEOUT)
             .build()
             .expect("reqwest client constructs with default config");
         Self {
