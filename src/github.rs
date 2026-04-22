@@ -22,7 +22,7 @@
 //! so webhooks observed later can be reconciled by time, actor, and repo.
 
 use crate::core::{
-    CredentialGrant, GitHubGrantedScope, GitHubPermissions, GrantedScope, Jti, RequestId,
+    CredentialGrant, GitHubGrantedScope, GitHubPermissions, GrantedScope, Jti, RepoRef, RequestId,
     SessionId, TtlSeconds, UnixMillis,
 };
 use crate::secret::{SecretError, SecretKey, SecretStore};
@@ -50,6 +50,15 @@ const TTL_SKEW_TOLERANCE_SECONDS: i64 = 60;
 pub struct GitHubAppConfig {
     pub app_id: u64,
     pub installation_id: u64,
+    /// The user or organisation that owns the installation. GitHub's
+    /// `POST /app/installations/{id}/access_tokens` endpoint takes an
+    /// *unqualified* `repositories` list, which the installation resolves
+    /// against its own set. A request asking for `openai/agent-infra` on
+    /// an installation that owns `patrick/agent-infra` would otherwise
+    /// mint a token for the wrong repo while the audit row claimed the
+    /// requested one. Keeping the installation owner in config lets the
+    /// minter reject the request before any token is issued.
+    pub installation_owner: String,
     /// Key under which the RSA private key (PEM) is stored in the
     /// broker's `SecretStore`. The broker never reads the key from disk
     /// or env directly — that's the secret store's job.
@@ -185,6 +194,18 @@ impl<S: SecretStore> GitHubMinter<S> {
         scope: GitHubGrantedScope,
         ttl: TtlSeconds,
     ) -> Result<MintedToken, MintError> {
+        // GitHub's `POST /access_tokens` takes an unqualified `repositories`
+        // list and resolves it against the installation, so a request whose
+        // owner doesn't match this installation would otherwise silently
+        // mint a same-named repo belonging to the installation's owner.
+        // Reject before signing anything.
+        if scope.repository.owner != self.config.installation_owner {
+            return Err(MintError::RepoNotInInstallation {
+                requested: scope.repository.clone(),
+                installation_owner: self.config.installation_owner.clone(),
+            });
+        }
+
         let pem = self
             .secrets
             .get(&self.config.private_key_secret)?
@@ -237,6 +258,40 @@ impl<S: SecretStore> GitHubMinter<S> {
         if parsed.token.trim().is_empty() {
             return Err(MintError::EmptyToken);
         }
+
+        // Verify GitHub minted the scope we asked for. On a "selected"
+        // installation the response enumerates the repositories the token
+        // actually covers; "all" means the installation grants every repo
+        // in the owner's account and the pre-flight owner check is the
+        // boundary. A mismatch here means our audit record would claim
+        // authority the token doesn't carry.
+        let expected = scope.repository.to_string();
+        match parsed.repository_selection {
+            RepositorySelection::Selected => {
+                if !parsed
+                    .repositories
+                    .iter()
+                    .any(|r| r.full_name == expected)
+                {
+                    return Err(MintError::UnexpectedRepositories {
+                        requested: scope.repository.clone(),
+                        returned: parsed
+                            .repositories
+                            .iter()
+                            .map(|r| r.full_name.clone())
+                            .collect(),
+                    });
+                }
+            }
+            RepositorySelection::All => {}
+        }
+        if parsed.permissions != scope.permissions {
+            return Err(MintError::UnexpectedPermissions {
+                requested: scope.permissions.clone(),
+                returned: parsed.permissions,
+            });
+        }
+
         // GitHub's `expires_at` is whole-seconds-precision, so the TTL
         // comparisons below stay in seconds and the audit record gets
         // the timestamp lifted to millisecond space on the second boundary.
@@ -308,6 +363,30 @@ pub enum MintError {
     },
     #[error("GitHub returned a 2xx response with an empty token string")]
     EmptyToken,
+    #[error(
+        "requested repository {requested} is not owned by the configured installation \
+         (owner {installation_owner:?})"
+    )]
+    RepoNotInInstallation {
+        requested: RepoRef,
+        installation_owner: String,
+    },
+    #[error(
+        "GitHub minted a token whose repository set {returned:?} does not include the requested \
+         repository {requested}"
+    )]
+    UnexpectedRepositories {
+        requested: RepoRef,
+        returned: Vec<String>,
+    },
+    #[error(
+        "GitHub minted a token with permissions {returned:?} that do not match the requested \
+         permissions {requested:?}"
+    )]
+    UnexpectedPermissions {
+        requested: GitHubPermissions,
+        returned: GitHubPermissions,
+    },
 }
 
 #[derive(Serialize)]
@@ -320,6 +399,30 @@ struct MintRequest<'a> {
 struct MintResponse {
     token: String,
     expires_at: String,
+    /// Permissions GitHub actually granted on the token. GitHub may narrow
+    /// these from the request (if the App itself lacks the permission on
+    /// this installation), so comparing the response against the requested
+    /// scope catches silent narrowing that would otherwise leave the audit
+    /// log describing stronger authority than the token carries.
+    #[serde(default)]
+    permissions: GitHubPermissions,
+    repository_selection: RepositorySelection,
+    /// Populated when `repository_selection` is `selected`. Omitted or
+    /// empty under `all`.
+    #[serde(default)]
+    repositories: Vec<MintResponseRepo>,
+}
+
+#[derive(Copy, Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum RepositorySelection {
+    All,
+    Selected,
+}
+
+#[derive(Deserialize)]
+struct MintResponseRepo {
+    full_name: String,
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
@@ -414,6 +517,10 @@ mod tests {
     }
 
     fn minter_with_key(server: &MockServer) -> GitHubMinter<InMemStore> {
+        minter_with_owner(server, "o")
+    }
+
+    fn minter_with_owner(server: &MockServer, installation_owner: &str) -> GitHubMinter<InMemStore> {
         let pk = SecretKey::new("gh-app-pk").unwrap();
         let store = InMemStore::default();
         store.put(&pk, TEST_PRIV_1).unwrap();
@@ -421,6 +528,7 @@ mod tests {
             GitHubAppConfig {
                 app_id: 42,
                 installation_id: 999,
+                installation_owner: installation_owner.into(),
                 private_key_secret: pk,
                 api_base: server.uri(),
             },
@@ -482,7 +590,8 @@ mod tests {
                 "token": "ghs_fake_value",
                 "expires_at": expiry_str,
                 "permissions": {"contents": "write", "metadata": "read"},
-                "repository_selection": "selected"
+                "repository_selection": "selected",
+                "repositories": [{"full_name": "o/n"}]
             })))
             .expect(1)
             .mount(&server)
@@ -533,6 +642,7 @@ mod tests {
             GitHubAppConfig {
                 app_id: 1,
                 installation_id: 1,
+                installation_owner: "o".into(),
                 private_key_secret: SecretKey::new("absent").unwrap(),
                 api_base: server.uri(),
             },
@@ -564,7 +674,8 @@ mod tests {
             "token": "ghs_fake_value",
             "expires_at": expires_at_rfc3339,
             "permissions": {"contents": "write", "metadata": "read"},
-            "repository_selection": "selected"
+            "repository_selection": "selected",
+            "repositories": [{"full_name": "o/n"}]
         }))
     }
 
@@ -785,7 +896,8 @@ mod tests {
                 "token": "   ",
                 "expires_at": expiry_str,
                 "permissions": {"contents": "write", "metadata": "read"},
-                "repository_selection": "selected"
+                "repository_selection": "selected",
+                "repositories": [{"full_name": "o/n"}]
             })))
             .mount(&server)
             .await;
@@ -796,6 +908,130 @@ mod tests {
             .await
             .expect_err("empty token should be rejected");
         assert!(matches!(err, MintError::EmptyToken), "got: {err:?}");
+    }
+
+    #[tokio::test]
+    async fn mint_refuses_request_whose_owner_is_not_the_installation_owner() {
+        // The installation owns `o/*`. A request for `someone-else/n` shares
+        // the name but not the owner; GitHub would resolve it against the
+        // installation and silently mint `o/n`, leaving the audit row
+        // claiming `someone-else/n`. Reject before the HTTP call.
+        let server = MockServer::start().await;
+        // Do not mount the mint endpoint: if the minter ever reaches it,
+        // wiremock returns 404 and the test will fail loudly on the wrong
+        // error variant.
+        let minter = minter_with_owner(&server, "o");
+        let err = minter
+            .mint(
+                write_scope("someone-else", "n"),
+                TtlSeconds::new(3600).unwrap(),
+            )
+            .await
+            .expect_err("cross-owner request must be refused");
+        match err {
+            MintError::RepoNotInInstallation {
+                requested,
+                installation_owner,
+            } => {
+                assert_eq!(requested.owner, "someone-else");
+                assert_eq!(installation_owner, "o");
+            }
+            other => panic!("expected RepoNotInInstallation, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn mint_rejects_when_response_lists_a_different_repo() {
+        // If GitHub returned a token whose `repositories` didn't include
+        // the one we asked for, handing it to the agent would bank an
+        // audit row for authority the token can't exercise. Reject.
+        let server = MockServer::start().await;
+        let (_, expiry_str) = expiry_seconds_from_now(3600);
+        Mock::given(method("POST"))
+            .and(path("/app/installations/999/access_tokens"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "token": "ghs_fake_value",
+                "expires_at": expiry_str,
+                "permissions": {"contents": "write", "metadata": "read"},
+                "repository_selection": "selected",
+                "repositories": [{"full_name": "o/not-the-one"}]
+            })))
+            .mount(&server)
+            .await;
+
+        let minter = minter_with_key(&server);
+        let err = minter
+            .mint(write_scope("o", "n"), TtlSeconds::new(3600).unwrap())
+            .await
+            .expect_err("divergent repositories must be rejected");
+        match err {
+            MintError::UnexpectedRepositories {
+                requested,
+                returned,
+            } => {
+                assert_eq!(requested.to_string(), "o/n");
+                assert_eq!(returned, vec!["o/not-the-one".to_string()]);
+            }
+            other => panic!("expected UnexpectedRepositories, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn mint_rejects_when_response_narrows_permissions() {
+        // GitHub may narrow permissions if the App itself lacks the
+        // requested level on this installation — e.g. we asked for
+        // contents:write, it replies contents:read. Handing the agent a
+        // token that's weaker than the audit record claims is a silent
+        // authority lie; reject instead.
+        let server = MockServer::start().await;
+        let (_, expiry_str) = expiry_seconds_from_now(3600);
+        Mock::given(method("POST"))
+            .and(path("/app/installations/999/access_tokens"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "token": "ghs_fake_value",
+                "expires_at": expiry_str,
+                "permissions": {"contents": "read", "metadata": "read"},
+                "repository_selection": "selected",
+                "repositories": [{"full_name": "o/n"}]
+            })))
+            .mount(&server)
+            .await;
+
+        let minter = minter_with_key(&server);
+        let err = minter
+            .mint(write_scope("o", "n"), TtlSeconds::new(3600).unwrap())
+            .await
+            .expect_err("narrowed permissions must be rejected");
+        assert!(
+            matches!(err, MintError::UnexpectedPermissions { .. }),
+            "got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mint_accepts_repository_selection_all() {
+        // An "all" installation doesn't enumerate repositories in the
+        // response — the owner-match pre-flight is the only check we can
+        // do on repo membership. Verify we don't spuriously reject the
+        // all-repos case.
+        let server = MockServer::start().await;
+        let (_, expiry_str) = expiry_seconds_from_now(3600);
+        Mock::given(method("POST"))
+            .and(path("/app/installations/999/access_tokens"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "token": "ghs_fake_value",
+                "expires_at": expiry_str,
+                "permissions": {"contents": "write", "metadata": "read"},
+                "repository_selection": "all"
+            })))
+            .mount(&server)
+            .await;
+
+        let minter = minter_with_key(&server);
+        minter
+            .mint(write_scope("o", "n"), TtlSeconds::new(3600).unwrap())
+            .await
+            .expect("mint under 'all' selection should succeed");
     }
 
     #[tokio::test]
