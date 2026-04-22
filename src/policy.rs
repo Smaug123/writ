@@ -60,20 +60,19 @@ fn decide_github(r: &GitHubRequest, policy: &PolicyConfig) -> PolicyDecision {
     }
 }
 
+/// Written as an exhaustive `match` (rather than `matches!`) on purpose:
+/// this function gates the `writable_repos` allowlist, so a new
+/// `GitHubRequest` variant that silently defaulted to `false` would
+/// bypass the allowlist entirely. The compiler must force the author of
+/// any future variant to decide explicitly whether writes on the new
+/// resource go through the allowlist.
 fn is_write(r: &GitHubRequest) -> bool {
-    matches!(
-        r,
-        GitHubRequest::Contents {
-            access: GitHubAccess::Write,
-            ..
-        } | GitHubRequest::Issues {
-            access: GitHubAccess::Write,
-            ..
-        } | GitHubRequest::PullRequests {
-            access: GitHubAccess::Write,
-            ..
-        }
-    )
+    match r {
+        GitHubRequest::Contents { access, .. }
+        | GitHubRequest::Issues { access, .. }
+        | GitHubRequest::PullRequests { access, .. } => matches!(access, GitHubAccess::Write),
+        GitHubRequest::Metadata { .. } => false,
+    }
 }
 
 /// The GitHub App permission set a mint step should carry for one request.
