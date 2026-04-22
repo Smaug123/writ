@@ -225,6 +225,17 @@ impl AuditLog {
                 if g.scope != *scope {
                     return Err(AuditError::Invariant("grant.scope != decision.scope"));
                 }
+                // An inverted expiry (expires before issued) is a row that
+                // makes no sense and silently passes the TTL-ceiling
+                // comparison below, because `i64::saturating_sub` produces
+                // a negative `lifetime_millis` that's trivially less than
+                // any positive ceiling. Reject explicitly so the sign-
+                // class can't slip through — the GitHub minter already
+                // guards the mint-time edge, but audit is the belt to
+                // its braces and must not rely on its own callers.
+                if g.expires_at < g.issued_at {
+                    return Err(AuditError::Invariant("grant expires before it was issued"));
+                }
                 let lifetime_millis = g
                     .expires_at
                     .as_millis()
@@ -1041,6 +1052,45 @@ mod tests {
                 request_id,
                 session_id: s.session_id,
                 received_at: UnixMillis::from_millis(0),
+                request: &req,
+                decision: &decision,
+                grant_outcome: GrantOutcome::Granted(&grant),
+            })
+            .unwrap_err();
+        assert!(matches!(err, AuditError::Invariant(_)), "got: {err:?}");
+    }
+
+    /// An inverted expiry (expires before issued) would otherwise slip
+    /// past the TTL-ceiling comparison because the signed
+    /// `saturating_sub` produces a negative lifetime that's trivially
+    /// under any positive ceiling. Explicit check catches the sign class.
+    #[test]
+    fn record_rejects_grant_with_expiry_before_issue() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+
+        let request_id = RequestId::new();
+        let req = sample_request();
+        let decision = PolicyDecision::Grant {
+            scope: sample_scope(),
+            ttl: TtlSeconds::new(300).unwrap(),
+        };
+        let grant = CredentialGrant {
+            jti: Jti::new(),
+            request_id,
+            session_id: s.session_id,
+            scope: sample_scope(),
+            issued_at: UnixMillis::from_millis(500),
+            // Deliberately before issued_at.
+            expires_at: UnixMillis::from_millis(100),
+        };
+
+        let err = log
+            .record(&AuditedRequest {
+                request_id,
+                session_id: s.session_id,
+                received_at: UnixMillis::from_millis(500),
                 request: &req,
                 decision: &decision,
                 grant_outcome: GrantOutcome::Granted(&grant),
