@@ -104,7 +104,7 @@ slot in behind the same trait.
 
 For v1, policy is a Rust `match` expression over `CapabilityRequest`. The
 policy config is a struct with fields like `writable_repos`, deserialised
-from a TOML file at startup. No DSL, no Cedar, no OPA.
+from a JSON file at startup. No DSL, no Cedar, no OPA.
 
 The shape of policy is still unclear — once we have half a dozen real-world
 policy decisions in our heads, we'll know what shape the externalisation
@@ -236,7 +236,7 @@ src/
   github.rs           GitHub App JWT + installation token exchange
   protocol.rs         wire protocol types (open_session, ...)
   server.rs           Unix socket listener + dispatch
-  config.rs           TOML config loading
+  config.rs           JSON config loading
   bin/
     writd.rs          daemon
     writ.rs           CLI client
