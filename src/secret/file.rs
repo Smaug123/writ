@@ -81,6 +81,11 @@ impl SecretStore for FileSecretStore {
         // gives concurrent writers to distinct keys — or the same key —
         // distinct temp paths, so neither clobbers the other mid-write.
         let tmp = self.base.join(format!(".tmp.{}", uuid::Uuid::new_v4()));
+        // Any error between now and the successful `rename` leaves the
+        // temp file orphaned; a Drop guard removes it best-effort on the
+        // error path. Disarm on success so the post-rename fsync can't
+        // undo the move.
+        let mut guard = TempFileGuard::new(tmp.clone());
         {
             let mut f = fs::OpenOptions::new()
                 .create_new(true)
@@ -91,6 +96,7 @@ impl SecretStore for FileSecretStore {
             f.sync_all()?;
         }
         fs::rename(&tmp, &dest)?;
+        guard.disarm();
         // fsync the parent dir so the rename itself is durable: without
         // this, a crash after `rename` returned could leave the new dirent
         // unwritten and the secret apparently missing on restart. POSIX
@@ -111,6 +117,37 @@ impl SecretStore for FileSecretStore {
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(e.into()),
+        }
+    }
+}
+
+/// RAII cleanup for the tempfile used by `put`. Every failure between
+/// open and rename would otherwise leave `.tmp.<uuid>` orphans in the
+/// secrets directory; on a flaky disk they accumulate indefinitely.
+/// Call `disarm` once the rename has succeeded to hand ownership of the
+/// dirent over to the final path.
+struct TempFileGuard {
+    path: Option<PathBuf>,
+}
+
+impl TempFileGuard {
+    fn new(path: PathBuf) -> Self {
+        Self { path: Some(path) }
+    }
+
+    fn disarm(&mut self) {
+        self.path = None;
+    }
+}
+
+impl Drop for TempFileGuard {
+    fn drop(&mut self) {
+        if let Some(p) = self.path.take() {
+            // Best-effort: if cleanup itself fails (e.g. permissions
+            // changed underneath us) there's nothing useful to do from
+            // Drop. The `.tmp.` prefix guarantees no collision with real
+            // keys, so a leaked orphan is a tidiness issue at worst.
+            let _ = fs::remove_file(&p);
         }
     }
 }
@@ -177,6 +214,49 @@ mod tests {
     fn delete_missing_is_noop() {
         let (_tmp, s) = store();
         s.delete(&key("never-existed")).unwrap();
+    }
+
+    #[test]
+    fn temp_file_guard_removes_path_on_drop() {
+        // The pattern `put` relies on: construct the guard, let it drop
+        // without calling disarm, the file goes away.
+        let (tmp, _s) = store();
+        let path = tmp.path().join(".tmp.unit-test");
+        fs::write(&path, b"x").unwrap();
+        assert!(path.exists());
+        {
+            let _guard = TempFileGuard::new(path.clone());
+        }
+        assert!(!path.exists(), "guard should have removed the tempfile");
+    }
+
+    #[test]
+    fn temp_file_guard_leaves_path_when_disarmed() {
+        // After a successful rename `put` disarms the guard so the final
+        // dirent isn't clobbered by Drop.
+        let (tmp, _s) = store();
+        let path = tmp.path().join(".tmp.unit-test-disarmed");
+        fs::write(&path, b"x").unwrap();
+        {
+            let mut guard = TempFileGuard::new(path.clone());
+            guard.disarm();
+        }
+        assert!(path.exists(), "disarmed guard must not remove the path");
+    }
+
+    #[test]
+    fn put_leaves_no_tempfile_orphans_on_success() {
+        // Sanity check on the happy path: once `put` returns Ok the only
+        // file in the base dir is the final one — no `.tmp.*` orphans
+        // from the guard's window.
+        let (tmp, s) = store();
+        s.put(&key("a"), "v").unwrap();
+        let orphans: Vec<_> = fs::read_dir(tmp.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .filter(|n| n.starts_with(".tmp."))
+            .collect();
+        assert!(orphans.is_empty(), "unexpected orphan tempfiles: {orphans:?}");
     }
 
     #[test]
