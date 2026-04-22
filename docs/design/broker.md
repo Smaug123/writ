@@ -150,7 +150,9 @@ CREATE TABLE request (
   mint_failure_json TEXT
 );
 
-CREATE TABLE grant (
+-- `grant` is a SQL keyword in some dialects, so the table is named
+-- `grant_log` even though the payload is still a credential grant.
+CREATE TABLE grant_log (
   jti         TEXT PRIMARY KEY,
   request_id  TEXT NOT NULL REFERENCES request(request_id),
   session_id  TEXT NOT NULL REFERENCES session(session_id),
@@ -160,13 +162,20 @@ CREATE TABLE grant (
 );
 ```
 
-Append-only. Timestamps are unix microseconds. JSON columns are the full
-serialised core types — verbose but cheap, and they round-trip exactly, so
-you can query the log and replay history if the broker's in-memory code
-needs it.
+Append-only. Timestamps are unix **milliseconds** (matching the
+`UnixMillis` core type — millisecond resolution keeps parallel agent
+panes or a burst of GitHub calls within the same wall-clock second
+distinguishable for replay). JSON columns are the full serialised core
+types — verbose but cheap, and they round-trip exactly, so you can query
+the log and replay history if the broker's in-memory code needs it.
 
-No migrations framework yet — a single embedded `CREATE TABLE IF NOT EXISTS`
-idempotent setup function.
+Schema evolution is managed by a tiny migration framework driven off
+SQLite's `PRAGMA user_version`: each migration commits its DDL and
+version bump in a single transaction, so a process killed mid-migration
+resumes cleanly at the next open. A DB at a higher version than this
+binary understands is refused rather than opened — that's the
+correctness-over-availability call, since a down-rev binary silently
+ignoring columns it doesn't understand is how audit logs lose data.
 
 ## Commit authorship
 
