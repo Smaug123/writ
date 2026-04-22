@@ -1009,6 +1009,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mint_rejects_response_with_unknown_permission_key() {
+        // GitHub adds a new App permission we don't yet model, and echoes
+        // it back on the token. The default serde behaviour would silently
+        // drop the unknown field, letting an over-grant slip past the
+        // widening check. `deny_unknown_fields` on GitHubPermissions turns
+        // this into a response parse failure, which surfaces as
+        // MintError::Http (the json body cannot be deserialised into
+        // MintResponse).
+        let server = MockServer::start().await;
+        let (_, expiry_str) = expiry_seconds_from_now(3600);
+        Mock::given(method("POST"))
+            .and(path("/app/installations/999/access_tokens"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "token": "ghs_fake_value",
+                "expires_at": expiry_str,
+                "permissions": {
+                    "contents": "write",
+                    "metadata": "read",
+                    "workflows": "write"
+                },
+                "repository_selection": "selected",
+                "repositories": [{"full_name": "o/n"}]
+            })))
+            .mount(&server)
+            .await;
+
+        let minter = minter_with_key(&server);
+        let err = minter
+            .mint(write_scope("o", "n"), TtlSeconds::new(3600).unwrap())
+            .await
+            .expect_err("unknown permission in response must not be silently accepted");
+        // reqwest wraps serde_json failures as a generic Http error.
+        assert!(matches!(err, MintError::Http(_)), "got: {err:?}");
+    }
+
+    #[tokio::test]
     async fn mint_accepts_repository_selection_all() {
         // An "all" installation doesn't enumerate repositories in the
         // response — the owner-match pre-flight is the only check we can

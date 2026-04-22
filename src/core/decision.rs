@@ -102,7 +102,17 @@ pub struct GitHubGrantedScope {
 
 /// GitHub App permissions supported by the broker. Unset fields are treated
 /// by the GitHub API as "no access at all", which is the safe default.
+///
+/// `deny_unknown_fields` is load-bearing: the GitHub-minter's post-response
+/// check (`parsed.permissions != scope.permissions`) compares the permissions
+/// echoed back by GitHub against the ones the policy asked for, to catch
+/// silent narrowing *and silent widening*. Without this attribute, a newly-
+/// added GitHub App permission that GitHub returned but we hadn't yet modelled
+/// would be dropped by the default serde deserializer before reaching the
+/// equality check, letting an over-grant slip into the agent's hands while
+/// the audit log described strictly less authority.
 #[derive(Clone, Debug, Eq, PartialEq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GitHubPermissions {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub contents: Option<GitHubAccess>,
