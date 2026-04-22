@@ -199,7 +199,17 @@ impl<S: SecretStore> GitHubMinter<S> {
         // owner doesn't match this installation would otherwise silently
         // mint a same-named repo belonging to the installation's owner.
         // Reject before signing anything.
-        if scope.repository.owner != self.config.installation_owner {
+        //
+        // GitHub resolves owner and repo names case-insensitively (it even
+        // returns responses in the *canonical* casing, not the casing the
+        // caller sent), so compare that way here too. Otherwise a config
+        // with `installation_owner = "smaug123"` against a canonical login
+        // of `Smaug123` would spuriously reject every request.
+        if !scope
+            .repository
+            .owner
+            .eq_ignore_ascii_case(&self.config.installation_owner)
+        {
             return Err(MintError::RepoNotInInstallation {
                 requested: scope.repository.clone(),
                 installation_owner: self.config.installation_owner.clone(),
@@ -265,13 +275,16 @@ impl<S: SecretStore> GitHubMinter<S> {
         // in the owner's account and the pre-flight owner check is the
         // boundary. A mismatch here means our audit record would claim
         // authority the token doesn't carry.
+        // GitHub returns `full_name` in the repo's canonical casing, which
+        // need not match the casing the caller supplied. Compare
+        // case-insensitively to match GitHub's own resolution semantics.
         let expected = scope.repository.to_string();
         match parsed.repository_selection {
             RepositorySelection::Selected => {
                 if !parsed
                     .repositories
                     .iter()
-                    .any(|r| r.full_name == expected)
+                    .any(|r| r.full_name.eq_ignore_ascii_case(&expected))
                 {
                     return Err(MintError::UnexpectedRepositories {
                         requested: scope.repository.clone(),
@@ -1006,6 +1019,62 @@ mod tests {
             matches!(err, MintError::UnexpectedPermissions { .. }),
             "got: {err:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn mint_owner_check_is_case_insensitive() {
+        // GitHub treats owner/repo names case-insensitively. A config that
+        // says `installation_owner = "smaug123"` against a request whose
+        // canonical owner is `Smaug123` must not be refused.
+        let server = MockServer::start().await;
+        let (_, expiry_str) = expiry_seconds_from_now(3600);
+        Mock::given(method("POST"))
+            .and(path("/app/installations/999/access_tokens"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "token": "ghs_fake_value",
+                "expires_at": expiry_str,
+                "permissions": {"contents": "write", "metadata": "read"},
+                "repository_selection": "selected",
+                "repositories": [{"full_name": "Smaug123/n"}]
+            })))
+            .mount(&server)
+            .await;
+
+        let minter = minter_with_owner(&server, "smaug123");
+        minter
+            .mint(write_scope("Smaug123", "n"), TtlSeconds::new(3600).unwrap())
+            .await
+            .expect("case-mismatched owner within installation should be accepted");
+    }
+
+    #[tokio::test]
+    async fn mint_accepts_response_with_canonical_casing() {
+        // The broker sent the lowercase casing; GitHub echoed back the
+        // canonical `Smaug123/WriT`. The repo-enumeration check must
+        // accept the match rather than trip UnexpectedRepositories on its
+        // own output.
+        let server = MockServer::start().await;
+        let (_, expiry_str) = expiry_seconds_from_now(3600);
+        Mock::given(method("POST"))
+            .and(path("/app/installations/999/access_tokens"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "token": "ghs_fake_value",
+                "expires_at": expiry_str,
+                "permissions": {"contents": "write", "metadata": "read"},
+                "repository_selection": "selected",
+                "repositories": [{"full_name": "Smaug123/WriT"}]
+            })))
+            .mount(&server)
+            .await;
+
+        let minter = minter_with_owner(&server, "smaug123");
+        minter
+            .mint(
+                write_scope("smaug123", "writ"),
+                TtlSeconds::new(3600).unwrap(),
+            )
+            .await
+            .expect("canonical-cased response must match case-insensitively");
     }
 
     #[tokio::test]
