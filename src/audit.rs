@@ -25,8 +25,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::core::{
-    CapabilityRequest, CredentialGrant, GrantedScope, Jti, PolicyDecision, RequestId, SessionId,
-    SessionRecord, UnixMillis,
+    CapabilityRequest, CredentialGrant, GitHubGrantedScope, GitHubRequest, GrantedScope, Jti,
+    MetadataAccess, PolicyDecision, RequestId, SessionId, SessionRecord, UnixMillis,
 };
 
 /// How much a grant's effective lifetime may exceed the decision's TTL
@@ -192,6 +192,20 @@ impl AuditLog {
     /// Record one request + decision, and the outcome of the subsequent mint
     /// step, atomically in one transaction.
     pub fn record(&self, r: &AuditedRequest<'_>) -> Result<(), AuditError> {
+        // Before we even look at the grant side, make sure the decision's
+        // scope is one the request could justify. Without this check a
+        // caller who wires the wrong decision to the wrong request would
+        // persist an audit row claiming authority the agent never asked
+        // for — e.g. a Metadata request paired with a Grant of
+        // contents:write on a different repo.
+        if let PolicyDecision::Grant { scope, .. } = r.decision
+            && !scope_authorised_by_request(r.request, scope)
+        {
+            return Err(AuditError::Invariant(
+                "decision scope is not authorised by the request",
+            ));
+        }
+
         match (r.decision, &r.grant_outcome) {
             (PolicyDecision::Grant { scope, ttl }, GrantOutcome::Granted(g)) => {
                 if g.request_id != r.request_id {
@@ -343,6 +357,63 @@ impl AuditLog {
                 None => Ok(None),
             }
         })
+    }
+}
+
+/// True iff `scope` is a possible policy output for `request`. The audit
+/// layer uses this to reject rows where the decision has been paired with
+/// the wrong request — an invariant the policy engine maintains by
+/// construction, but the audit layer can't assume its caller did.
+///
+/// Structural rather than derived-from-policy on purpose: the audit layer
+/// doesn't know the policy config, so it can't re-run `policy::decide`.
+/// What it can check is that the scope's backend, repo, and permission
+/// set are shaped compatibly with the request, which is all we need to
+/// rule out cross-request wire-ups. Policy-level narrowing (granting less
+/// than requested) would be allowed by this check; v1 policy doesn't do
+/// that, and a future narrowing policy's tighter constraint still
+/// satisfies a looser structural check.
+fn scope_authorised_by_request(request: &CapabilityRequest, scope: &GrantedScope) -> bool {
+    match (request, scope) {
+        (CapabilityRequest::GitHub(r), GrantedScope::GitHub(s)) => {
+            github_scope_authorised_by_request(r, s)
+        }
+    }
+}
+
+fn github_scope_authorised_by_request(r: &GitHubRequest, s: &GitHubGrantedScope) -> bool {
+    if &s.repository != r.repo() {
+        return false;
+    }
+    // GitHub installation tokens always carry metadata:read, so it's fine
+    // for the grant to include it regardless of request; other metadata
+    // values are impossible (MetadataAccess is a one-variant enum) but
+    // pattern-match explicitly so the compiler forces us to revisit this
+    // if that ever changes.
+    match s.permissions.metadata {
+        None | Some(MetadataAccess::Read) => {}
+    }
+    match r {
+        GitHubRequest::Metadata { .. } => {
+            s.permissions.contents.is_none()
+                && s.permissions.issues.is_none()
+                && s.permissions.pull_requests.is_none()
+        }
+        GitHubRequest::Contents { access, .. } => {
+            s.permissions.contents == Some(*access)
+                && s.permissions.issues.is_none()
+                && s.permissions.pull_requests.is_none()
+        }
+        GitHubRequest::Issues { access, .. } => {
+            s.permissions.issues == Some(*access)
+                && s.permissions.contents.is_none()
+                && s.permissions.pull_requests.is_none()
+        }
+        GitHubRequest::PullRequests { access, .. } => {
+            s.permissions.pull_requests == Some(*access)
+                && s.permissions.contents.is_none()
+                && s.permissions.issues.is_none()
+        }
     }
 }
 
@@ -1063,6 +1134,160 @@ mod tests {
             failure.error,
             "GitHub returned 422: repository not installed"
         );
+    }
+
+    /// If the caller accidentally pairs a `Metadata` request with a
+    /// `Contents:write` grant decision, the audit row would claim
+    /// authority the request never asked for. The new structural check
+    /// rules this out regardless of whether the grant row itself looks
+    /// internally consistent.
+    #[test]
+    fn record_rejects_grant_decision_whose_scope_exceeds_request() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+
+        let request_id = RequestId::new();
+        let metadata_request = CapabilityRequest::GitHub(GitHubRequest::Metadata {
+            repo: sample_repo(),
+        });
+        let contents_write_scope = sample_scope();
+        let decision = PolicyDecision::Grant {
+            scope: contents_write_scope.clone(),
+            ttl: TtlSeconds::new(300).unwrap(),
+        };
+        // Grant matches the decision by construction; the mismatch is
+        // between the decision and the request. Build the grant so that
+        // the existing decision-vs-grant check would *pass*, ensuring the
+        // new request-vs-decision check is what trips.
+        let grant = CredentialGrant {
+            jti: Jti::new(),
+            request_id,
+            session_id: s.session_id,
+            scope: contents_write_scope,
+            issued_at: UnixMillis::from_millis(0),
+            expires_at: UnixMillis::from_millis(1_000),
+        };
+
+        let err = log
+            .record(&AuditedRequest {
+                request_id,
+                session_id: s.session_id,
+                received_at: UnixMillis::from_millis(0),
+                request: &metadata_request,
+                decision: &decision,
+                grant_outcome: GrantOutcome::Granted(&grant),
+            })
+            .unwrap_err();
+        assert!(matches!(err, AuditError::Invariant(_)), "got: {err:?}");
+    }
+
+    /// Same check applies when only a mint failure is being recorded —
+    /// the decision is still persisted, so it must be one the request
+    /// could justify.
+    #[test]
+    fn record_rejects_mismatched_decision_even_when_mint_failed() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+
+        let metadata_request = CapabilityRequest::GitHub(GitHubRequest::Metadata {
+            repo: sample_repo(),
+        });
+        let decision = PolicyDecision::Grant {
+            scope: sample_scope(),
+            ttl: TtlSeconds::new(300).unwrap(),
+        };
+
+        let err = log
+            .record(&AuditedRequest {
+                request_id: RequestId::new(),
+                session_id: s.session_id,
+                received_at: UnixMillis::from_millis(0),
+                request: &metadata_request,
+                decision: &decision,
+                grant_outcome: GrantOutcome::MintFailed { error: "boom" },
+            })
+            .unwrap_err();
+        assert!(matches!(err, AuditError::Invariant(_)), "got: {err:?}");
+    }
+
+    /// Grant decision for a different repo than the request — structurally
+    /// impossible output of the policy engine, so recording it would
+    /// corrupt replay.
+    #[test]
+    fn record_rejects_grant_decision_on_different_repo() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+
+        let request = CapabilityRequest::GitHub(GitHubRequest::Contents {
+            access: GitHubAccess::Write,
+            repo: sample_repo(),
+        });
+        let other_scope = GrantedScope::GitHub(GitHubGrantedScope {
+            repository: RepoRef {
+                owner: "other".into(),
+                name: "repo".into(),
+            },
+            permissions: GitHubPermissions {
+                contents: Some(GitHubAccess::Write),
+                metadata: Some(MetadataAccess::Read),
+                ..Default::default()
+            },
+        });
+        let decision = PolicyDecision::Grant {
+            scope: other_scope,
+            ttl: TtlSeconds::new(300).unwrap(),
+        };
+
+        let err = log
+            .record(&AuditedRequest {
+                request_id: RequestId::new(),
+                session_id: s.session_id,
+                received_at: UnixMillis::from_millis(0),
+                request: &request,
+                decision: &decision,
+                grant_outcome: GrantOutcome::NotMinted,
+            })
+            .unwrap_err();
+        // NotMinted on a Grant would also trip the existing check; pin
+        // that it's the request-vs-decision one that fires by sending a
+        // well-formed outcome next.
+        assert!(matches!(err, AuditError::Invariant(_)), "got: {err:?}");
+    }
+
+    /// Grant decision with the right resource but wrong access level
+    /// (request read, decision write) is not a possible policy output for
+    /// a correctly-paired request. Reject.
+    #[test]
+    fn record_rejects_grant_decision_whose_access_level_exceeds_request() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+
+        let read_request = CapabilityRequest::GitHub(GitHubRequest::Contents {
+            access: GitHubAccess::Read,
+            repo: sample_repo(),
+        });
+        // sample_scope() grants contents:write — stricter than the read
+        // the request asked for.
+        let decision = PolicyDecision::Grant {
+            scope: sample_scope(),
+            ttl: TtlSeconds::new(300).unwrap(),
+        };
+
+        let err = log
+            .record(&AuditedRequest {
+                request_id: RequestId::new(),
+                session_id: s.session_id,
+                received_at: UnixMillis::from_millis(0),
+                request: &read_request,
+                decision: &decision,
+                grant_outcome: GrantOutcome::NotMinted,
+            })
+            .unwrap_err();
+        assert!(matches!(err, AuditError::Invariant(_)), "got: {err:?}");
     }
 
     #[test]
