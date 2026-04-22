@@ -540,6 +540,34 @@ CREATE INDEX idx_grant_session ON grant_log(session_id, issued_at);
     },
 ];
 
+// Belt-and-braces: the compile-time shape of MIGRATIONS is the source
+// of truth, so verify it matches SCHEMA_VERSION at compile time rather
+// than trust two constants to stay in sync by convention. A release
+// build with the constants out of sync (new SCHEMA_VERSION without a
+// matching migration, or a non-ascending version list) would otherwise
+// silently produce a broker that either runs migrations in the wrong
+// order (rolling `user_version` backwards) or never runs the new one at
+// all. These `const` blocks are evaluated by the compiler; no runtime
+// cost, no way to ship past them.
+const _: () = {
+    assert!(
+        !MIGRATIONS.is_empty(),
+        "MIGRATIONS must contain at least one entry"
+    );
+    assert!(
+        MIGRATIONS[MIGRATIONS.len() - 1].version == SCHEMA_VERSION,
+        "SCHEMA_VERSION must equal the last migration's version"
+    );
+    let mut i = 1;
+    while i < MIGRATIONS.len() {
+        assert!(
+            MIGRATIONS[i - 1].version < MIGRATIONS[i].version,
+            "migrations must be strictly ascending in version"
+        );
+        i += 1;
+    }
+};
+
 fn migrate(conn: &mut Connection) -> Result<(), AuditError> {
     let mut current = user_version(conn)?;
 
@@ -557,19 +585,6 @@ fn migrate(conn: &mut Connection) -> Result<(), AuditError> {
             supported: SCHEMA_VERSION,
         });
     }
-
-    // Belt-and-braces: the compile-time shape of MIGRATIONS is the
-    // source of truth, so verify it matches SCHEMA_VERSION rather than
-    // trust two constants to stay in sync by convention.
-    debug_assert_eq!(
-        MIGRATIONS.last().map(|m| m.version),
-        Some(SCHEMA_VERSION),
-        "SCHEMA_VERSION must equal the last migration's version"
-    );
-    debug_assert!(
-        MIGRATIONS.windows(2).all(|w| w[0].version < w[1].version),
-        "migrations must be strictly ascending in version"
-    );
 
     for m in MIGRATIONS.iter().filter(|m| m.version > current) {
         let tx = conn.transaction()?;
