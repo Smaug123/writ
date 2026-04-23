@@ -47,7 +47,9 @@ pub struct DaemonConfig {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SecretStoreConfig {
-    File { path: PathBuf },
+    File {
+        path: PathBuf,
+    },
     Keyring {
         #[serde(default = "default_keyring_service")]
         service: String,
@@ -121,8 +123,13 @@ mod tests {
         }"#;
         let c: DaemonConfig = serde_json::from_str(json).unwrap();
         assert_eq!(c.github.api_base, "https://github.example.com/api/v3");
-        assert_eq!(c.socket_path.as_deref(), Some(std::path::Path::new("/tmp/test.sock")));
-        assert!(matches!(c.secret_store, SecretStoreConfig::Keyring { service } if service == "writ"));
+        assert_eq!(
+            c.socket_path.as_deref(),
+            Some(std::path::Path::new("/tmp/test.sock"))
+        );
+        assert!(
+            matches!(c.secret_store, SecretStoreConfig::Keyring { service } if service == "writ")
+        );
     }
 
     #[test]

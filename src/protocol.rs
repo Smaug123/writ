@@ -51,7 +51,10 @@ pub enum ServerMessage {
     SessionClosed,
     /// Policy granted the request. `expires_at` is the backend-reported
     /// expiry in unix milliseconds; the grant is recorded in the audit log.
-    TokenGranted { token: String, expires_at: UnixMillis },
+    TokenGranted {
+        token: String,
+        expires_at: UnixMillis,
+    },
     /// Policy denied the request; `reason` is a human-readable explanation.
     Denied { reason: String },
     /// Something went wrong (mint error, unknown session, audit write
@@ -63,9 +66,10 @@ pub enum ServerMessage {
 impl std::fmt::Debug for ServerMessage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::SessionOpened { session_id } => {
-                f.debug_struct("SessionOpened").field("session_id", session_id).finish()
-            }
+            Self::SessionOpened { session_id } => f
+                .debug_struct("SessionOpened")
+                .field("session_id", session_id)
+                .finish(),
             Self::SessionClosed => write!(f, "SessionClosed"),
             // Token is a live credential; redact it in debug output so a
             // stray `dbg!` or tracing span doesn't spray it into logs.
@@ -74,12 +78,8 @@ impl std::fmt::Debug for ServerMessage {
                 .field("token", &"<redacted>")
                 .field("expires_at", expires_at)
                 .finish(),
-            Self::Denied { reason } => {
-                f.debug_struct("Denied").field("reason", reason).finish()
-            }
-            Self::Error { message } => {
-                f.debug_struct("Error").field("message", message).finish()
-            }
+            Self::Denied { reason } => f.debug_struct("Denied").field("reason", reason).finish(),
+            Self::Error { message } => f.debug_struct("Error").field("message", message).finish(),
         }
     }
 }
@@ -95,7 +95,10 @@ mod tests {
     }
 
     fn sample_repo() -> RepoRef {
-        RepoRef { owner: "o".into(), name: "n".into() }
+        RepoRef {
+            owner: "o".into(),
+            name: "n".into(),
+        }
     }
 
     // --- ClientMessage roundtrips -----------------------------------------
@@ -112,14 +115,19 @@ mod tests {
 
     #[test]
     fn open_session_without_fields_roundtrips() {
-        let msg = ClientMessage::OpenSession { label: None, agent_model: None };
+        let msg = ClientMessage::OpenSession {
+            label: None,
+            agent_model: None,
+        };
         let json = serde_json::to_string(&msg).unwrap();
         assert_eq!(serde_json::from_str::<ClientMessage>(&json).unwrap(), msg);
     }
 
     #[test]
     fn close_session_roundtrips() {
-        let msg = ClientMessage::CloseSession { session_id: fixed_session_id() };
+        let msg = ClientMessage::CloseSession {
+            session_id: fixed_session_id(),
+        };
         let json = serde_json::to_string(&msg).unwrap();
         assert_eq!(serde_json::from_str::<ClientMessage>(&json).unwrap(), msg);
     }
@@ -141,7 +149,9 @@ mod tests {
 
     #[test]
     fn session_opened_roundtrips() {
-        let msg = ServerMessage::SessionOpened { session_id: fixed_session_id() };
+        let msg = ServerMessage::SessionOpened {
+            session_id: fixed_session_id(),
+        };
         let json = serde_json::to_string(&msg).unwrap();
         assert_eq!(serde_json::from_str::<ServerMessage>(&json).unwrap(), msg);
     }
@@ -167,14 +177,18 @@ mod tests {
 
     #[test]
     fn denied_roundtrips() {
-        let msg = ServerMessage::Denied { reason: "not on allowlist".into() };
+        let msg = ServerMessage::Denied {
+            reason: "not on allowlist".into(),
+        };
         let json = serde_json::to_string(&msg).unwrap();
         assert_eq!(serde_json::from_str::<ServerMessage>(&json).unwrap(), msg);
     }
 
     #[test]
     fn error_roundtrips() {
-        let msg = ServerMessage::Error { message: "mint failed".into() };
+        let msg = ServerMessage::Error {
+            message: "mint failed".into(),
+        };
         let json = serde_json::to_string(&msg).unwrap();
         assert_eq!(serde_json::from_str::<ServerMessage>(&json).unwrap(), msg);
     }
@@ -183,9 +197,11 @@ mod tests {
 
     #[test]
     fn open_session_type_tag() {
-        let v: serde_json::Value =
-            serde_json::to_value(ClientMessage::OpenSession { label: None, agent_model: None })
-                .unwrap();
+        let v: serde_json::Value = serde_json::to_value(ClientMessage::OpenSession {
+            label: None,
+            agent_model: None,
+        })
+        .unwrap();
         assert_eq!(v["type"], "open_session");
     }
 
@@ -202,7 +218,9 @@ mod tests {
     fn request_type_tag() {
         let v: serde_json::Value = serde_json::to_value(ClientMessage::Request {
             session_id: fixed_session_id(),
-            capability: CapabilityRequest::GitHub(GitHubRequest::Metadata { repo: sample_repo() }),
+            capability: CapabilityRequest::GitHub(GitHubRequest::Metadata {
+                repo: sample_repo(),
+            }),
         })
         .unwrap();
         assert_eq!(v["type"], "request");
@@ -210,9 +228,11 @@ mod tests {
 
     #[test]
     fn open_session_omits_absent_fields() {
-        let v: serde_json::Value =
-            serde_json::to_value(ClientMessage::OpenSession { label: None, agent_model: None })
-                .unwrap();
+        let v: serde_json::Value = serde_json::to_value(ClientMessage::OpenSession {
+            label: None,
+            agent_model: None,
+        })
+        .unwrap();
         assert!(v.get("label").is_none());
         assert!(v.get("agent_model").is_none());
     }

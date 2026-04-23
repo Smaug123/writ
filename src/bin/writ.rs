@@ -105,7 +105,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     match args.cmd {
         Cmd::OpenSession { label, model } => {
-            let msg = ClientMessage::OpenSession { label, agent_model: model };
+            let msg = ClientMessage::OpenSession {
+                label,
+                agent_model: model,
+            };
             match call(&socket_path, &msg)? {
                 ServerMessage::SessionOpened { session_id } => println!("{session_id}"),
                 other => return Err(format!("unexpected response: {other:?}").into()),
@@ -123,19 +126,23 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        Cmd::Request { session_id, backend } => {
+        Cmd::Request {
+            session_id,
+            backend,
+        } => {
             let id: SessionId = session_id
                 .parse()
                 .map_err(|e| format!("invalid session ID: {e}"))?;
 
             let capability = build_capability(backend)?;
-            let msg = ClientMessage::Request { session_id: id, capability };
+            let msg = ClientMessage::Request {
+                session_id: id,
+                capability,
+            };
 
             match call(&socket_path, &msg)? {
                 ServerMessage::TokenGranted { token, .. } => print!("{token}"),
-                ServerMessage::Denied { reason } => {
-                    return Err(format!("denied: {reason}").into())
-                }
+                ServerMessage::Denied { reason } => return Err(format!("denied: {reason}").into()),
                 ServerMessage::Error { message } => return Err(message.into()),
                 other => return Err(format!("unexpected response: {other:?}").into()),
             }
@@ -157,15 +164,18 @@ fn build_capability(backend: BackendCmd) -> Result<CapabilityRequest, Box<dyn st
         .map_err(|e| format!("invalid repo '{repo_str}': {e}"))?;
 
     let github_req = match action {
-        GithubCmd::Contents { access, .. } => {
-            GitHubRequest::Contents { access: access.into(), repo }
-        }
-        GithubCmd::Issues { access, .. } => {
-            GitHubRequest::Issues { access: access.into(), repo }
-        }
-        GithubCmd::PullRequests { access, .. } => {
-            GitHubRequest::PullRequests { access: access.into(), repo }
-        }
+        GithubCmd::Contents { access, .. } => GitHubRequest::Contents {
+            access: access.into(),
+            repo,
+        },
+        GithubCmd::Issues { access, .. } => GitHubRequest::Issues {
+            access: access.into(),
+            repo,
+        },
+        GithubCmd::PullRequests { access, .. } => GitHubRequest::PullRequests {
+            access: access.into(),
+            repo,
+        },
         GithubCmd::Metadata { .. } => GitHubRequest::Metadata { repo },
     };
     Ok(CapabilityRequest::GitHub(github_req))

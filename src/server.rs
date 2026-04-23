@@ -67,7 +67,9 @@ pub async fn dispatch_message<S: SecretStore + Send + Sync>(
             };
             match state.audit.open_session(&record) {
                 Ok(()) => ServerMessage::SessionOpened { session_id },
-                Err(e) => ServerMessage::Error { message: e.to_string() },
+                Err(e) => ServerMessage::Error {
+                    message: e.to_string(),
+                },
             }
         }
 
@@ -76,13 +78,16 @@ pub async fn dispatch_message<S: SecretStore + Send + Sync>(
             // not an error. Idempotent close is fine for retry safety.
             match state.audit.close_session(session_id, UnixMillis::now()) {
                 Ok(()) => ServerMessage::SessionClosed,
-                Err(e) => ServerMessage::Error { message: e.to_string() },
+                Err(e) => ServerMessage::Error {
+                    message: e.to_string(),
+                },
             }
         }
 
-        ClientMessage::Request { session_id, capability } => {
-            dispatch_capability(session_id, capability, state).await
-        }
+        ClientMessage::Request {
+            session_id,
+            capability,
+        } => dispatch_capability(session_id, capability, state).await,
     }
 }
 
@@ -99,9 +104,13 @@ async fn dispatch_capability<S: SecretStore + Send + Sync>(
         Ok(None) => {
             return ServerMessage::Error {
                 message: format!("unknown session {session_id}"),
-            }
+            };
         }
-        Err(e) => return ServerMessage::Error { message: e.to_string() },
+        Err(e) => {
+            return ServerMessage::Error {
+                message: e.to_string(),
+            };
+        }
         Ok(Some(_)) => {}
     }
 
@@ -187,11 +196,12 @@ async fn handle_connection<S: SecretStore + Send + Sync + 'static>(
     let mut lines = BufReader::new(reader).lines();
     while let Some(line) = lines.next_line().await? {
         let response = match serde_json::from_str::<ClientMessage>(&line) {
-            Err(e) => ServerMessage::Error { message: format!("invalid request: {e}") },
+            Err(e) => ServerMessage::Error {
+                message: format!("invalid request: {e}"),
+            },
             Ok(msg) => dispatch_message(msg, &state).await,
         };
-        let mut json =
-            serde_json::to_string(&response).expect("ServerMessage always serializes");
+        let mut json = serde_json::to_string(&response).expect("ServerMessage always serializes");
         json.push('\n');
         writer.write_all(json.as_bytes()).await?;
     }
@@ -251,7 +261,10 @@ mod tests {
             Ok(self.0.lock().unwrap().get(key.as_str()).cloned())
         }
         fn put(&self, key: &SecretKey, value: &str) -> Result<(), SecretError> {
-            self.0.lock().unwrap().insert(key.as_str().to_string(), value.to_string());
+            self.0
+                .lock()
+                .unwrap()
+                .insert(key.as_str().to_string(), value.to_string());
             Ok(())
         }
         fn delete(&self, key: &SecretKey) -> Result<(), SecretError> {
@@ -294,12 +307,16 @@ mod tests {
     }
 
     fn repo(owner: &str, name: &str) -> RepoRef {
-        RepoRef { owner: owner.into(), name: name.into() }
+        RepoRef {
+            owner: owner.into(),
+            name: name.into(),
+        }
     }
 
     fn expiry_str_from_now(secs: i64) -> String {
         let t = time::OffsetDateTime::now_utc() + time::Duration::seconds(secs);
-        t.format(&time::format_description::well_known::Rfc3339).unwrap()
+        t.format(&time::format_description::well_known::Rfc3339)
+            .unwrap()
     }
 
     // --- Session lifecycle -----------------------------------------------
@@ -310,7 +327,10 @@ mod tests {
         let state = make_state(&server, vec![], "o");
 
         let resp = dispatch_message(
-            ClientMessage::OpenSession { label: Some("test".into()), agent_model: None },
+            ClientMessage::OpenSession {
+                label: Some("test".into()),
+                agent_model: None,
+            },
             &state,
         )
         .await;
@@ -332,7 +352,10 @@ mod tests {
         let state = make_state(&server, vec![], "o");
 
         let session_id = match dispatch_message(
-            ClientMessage::OpenSession { label: None, agent_model: None },
+            ClientMessage::OpenSession {
+                label: None,
+                agent_model: None,
+            },
             &state,
         )
         .await
@@ -341,8 +364,7 @@ mod tests {
             other => panic!("{other:?}"),
         };
 
-        let resp =
-            dispatch_message(ClientMessage::CloseSession { session_id }, &state).await;
+        let resp = dispatch_message(ClientMessage::CloseSession { session_id }, &state).await;
         assert_eq!(resp, ServerMessage::SessionClosed);
 
         let record = state.audit.get_session(session_id).unwrap().unwrap();
@@ -355,8 +377,13 @@ mod tests {
         let server = MockServer::start().await;
         let state = make_state(&server, vec![], "o");
         let unknown: SessionId = "00000000-0000-0000-0000-deadbeef0001".parse().unwrap();
-        let resp = dispatch_message(ClientMessage::CloseSession { session_id: unknown }, &state)
-            .await;
+        let resp = dispatch_message(
+            ClientMessage::CloseSession {
+                session_id: unknown,
+            },
+            &state,
+        )
+        .await;
         assert_eq!(resp, ServerMessage::SessionClosed);
     }
 
@@ -372,12 +399,10 @@ mod tests {
         let resp = dispatch_message(
             ClientMessage::Request {
                 session_id,
-                capability: CapabilityRequest::GitHub(
-                    crate::core::GitHubRequest::Contents {
-                        access: GitHubAccess::Write,
-                        repo: repo("o", "n"),
-                    },
-                ),
+                capability: CapabilityRequest::GitHub(crate::core::GitHubRequest::Contents {
+                    access: GitHubAccess::Write,
+                    repo: repo("o", "n"),
+                }),
             },
             &state,
         )
@@ -398,12 +423,10 @@ mod tests {
         let resp = dispatch_message(
             ClientMessage::Request {
                 session_id: unknown,
-                capability: CapabilityRequest::GitHub(
-                    crate::core::GitHubRequest::Contents {
-                        access: GitHubAccess::Read,
-                        repo: repo("o", "n"),
-                    },
-                ),
+                capability: CapabilityRequest::GitHub(crate::core::GitHubRequest::Contents {
+                    access: GitHubAccess::Read,
+                    repo: repo("o", "n"),
+                }),
             },
             &state,
         )
@@ -510,11 +533,12 @@ mod tests {
 
     // --- Helper ----------------------------------------------------------
 
-    async fn open_session<S: SecretStore + Send + Sync>(
-        state: &Arc<BrokerState<S>>,
-    ) -> SessionId {
+    async fn open_session<S: SecretStore + Send + Sync>(state: &Arc<BrokerState<S>>) -> SessionId {
         match dispatch_message(
-            ClientMessage::OpenSession { label: None, agent_model: None },
+            ClientMessage::OpenSession {
+                label: None,
+                agent_model: None,
+            },
             state,
         )
         .await
