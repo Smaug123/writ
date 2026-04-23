@@ -61,6 +61,12 @@ pub enum AuditError {
          upgrade the broker"
     )]
     SchemaTooNew { found: i32, supported: i32 },
+
+    #[error(
+        "audit DB has user_version 0 but contains only part of the legacy v1 schema; \
+         refuse to guess migration state"
+    )]
+    PartialLegacySchema,
 }
 
 /// The outcome of the post-policy mint step for one request.
@@ -571,12 +577,21 @@ const _: () = {
 fn migrate(conn: &mut Connection) -> Result<(), AuditError> {
     let mut current = user_version(conn)?;
 
-    // A v1-shaped DB written before we started tracking `user_version`
-    // would read as version 0 but already have the v1 tables. Fast-forward
-    // the pragma in-place so subsequent migrations apply cleanly.
-    if current == 0 && table_exists(conn, "session")? {
-        conn.pragma_update(None, "user_version", 1)?;
-        current = 1;
+    if current == 0 {
+        match legacy_schema_state(conn)? {
+            LegacySchemaState::Empty => {}
+            // A v1-shaped DB written before we started tracking
+            // `user_version` would read as version 0 but already have the
+            // v1 tables. Fast-forward the pragma in-place so subsequent
+            // migrations apply cleanly.
+            LegacySchemaState::CompleteV1 => {
+                conn.pragma_update(None, "user_version", 1)?;
+                current = 1;
+            }
+            LegacySchemaState::PartialOrInconsistent => {
+                return Err(AuditError::PartialLegacySchema);
+            }
+        }
     }
 
     if current > SCHEMA_VERSION {
@@ -599,15 +614,94 @@ fn user_version(conn: &Connection) -> Result<i32, AuditError> {
     Ok(conn.query_row("PRAGMA user_version", [], |row| row.get(0))?)
 }
 
-fn table_exists(conn: &Connection, name: &str) -> Result<bool, AuditError> {
-    let found: Option<String> = conn
-        .query_row(
-            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?1",
-            params![name],
-            |row| row.get(0),
-        )
-        .optional()?;
-    Ok(found.is_some())
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum LegacySchemaState {
+    Empty,
+    CompleteV1,
+    PartialOrInconsistent,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum TableShape {
+    Missing,
+    HasRequiredColumns,
+    MissingRequiredColumns,
+}
+
+fn legacy_schema_state(conn: &Connection) -> Result<LegacySchemaState, AuditError> {
+    let session = table_shape(
+        conn,
+        "session",
+        &[
+            "session_id",
+            "label",
+            "agent_model",
+            "opened_at",
+            "closed_at",
+        ],
+    )?;
+    let request = table_shape(
+        conn,
+        "request",
+        &[
+            "request_id",
+            "session_id",
+            "received_at",
+            "request_json",
+            "decision_json",
+        ],
+    )?;
+    let grant_log = table_shape(
+        conn,
+        "grant_log",
+        &[
+            "jti",
+            "request_id",
+            "session_id",
+            "scope_json",
+            "issued_at",
+            "expires_at",
+        ],
+    )?;
+
+    match (session, request, grant_log) {
+        (TableShape::Missing, TableShape::Missing, TableShape::Missing) => {
+            Ok(LegacySchemaState::Empty)
+        }
+        (
+            TableShape::HasRequiredColumns,
+            TableShape::HasRequiredColumns,
+            TableShape::HasRequiredColumns,
+        ) => Ok(LegacySchemaState::CompleteV1),
+        _ => Ok(LegacySchemaState::PartialOrInconsistent),
+    }
+}
+
+fn table_shape(
+    conn: &Connection,
+    name: &str,
+    required_columns: &[&str],
+) -> Result<TableShape, AuditError> {
+    let columns = table_columns(conn, name)?;
+    if columns.is_empty() {
+        return Ok(TableShape::Missing);
+    }
+    if required_columns
+        .iter()
+        .all(|required| columns.iter().any(|column| column == required))
+    {
+        Ok(TableShape::HasRequiredColumns)
+    } else {
+        Ok(TableShape::MissingRequiredColumns)
+    }
+}
+
+fn table_columns(conn: &Connection, name: &str) -> Result<Vec<String>, AuditError> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({name})"))?;
+    let columns = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(columns)
 }
 
 #[cfg(test)]
@@ -1409,6 +1503,16 @@ mod tests {
     }
 
     #[test]
+    fn open_initialises_empty_file_db_at_current_schema_version() {
+        let db = NamedTempFile::new().unwrap();
+        let log = AuditLog::open(db.path()).unwrap();
+        assert_eq!(read_user_version(&log), SCHEMA_VERSION);
+        assert!(column_exists(&log, "session", "session_id"));
+        assert!(column_exists(&log, "request", "mint_failure_json"));
+        assert!(column_exists(&log, "grant_log", "jti"));
+    }
+
+    #[test]
     fn reopen_at_current_version_is_a_noop() {
         // The pragma check is what makes this cheap on startup; verify
         // re-running migrate on an already-current DB doesn't error and
@@ -1468,6 +1572,39 @@ CREATE INDEX idx_grant_session ON grant_log(session_id, issued_at);
         let log = AuditLog::open(db.path()).unwrap();
         assert!(column_exists(&log, "request", "mint_failure_json"));
         assert_eq!(read_user_version(&log), SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn open_rejects_partial_legacy_schema_without_fast_forwarding_version() {
+        let db = NamedTempFile::new().unwrap();
+        {
+            let conn = Connection::open(db.path()).unwrap();
+            conn.execute_batch(
+                r#"
+CREATE TABLE session (
+    session_id  TEXT PRIMARY KEY,
+    label       TEXT,
+    agent_model TEXT,
+    opened_at   INTEGER NOT NULL,
+    closed_at   INTEGER
+);
+"#,
+            )
+            .unwrap();
+        }
+
+        let err = AuditLog::open(db.path()).unwrap_err();
+        assert!(
+            matches!(err, AuditError::PartialLegacySchema),
+            "expected PartialLegacySchema, got: {err:?}"
+        );
+
+        let conn = Connection::open(db.path()).unwrap();
+        assert_eq!(
+            user_version(&conn).unwrap(),
+            0,
+            "partial legacy schema must not be fast-forwarded"
+        );
     }
 
     /// A DB written by a future broker will carry a user_version beyond

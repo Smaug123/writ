@@ -133,8 +133,7 @@ impl RepoRef {
     /// keyed on `RepoRef` behave predictably; the broker only treats
     /// case as irrelevant when *comparing against GitHub-sourced names*.
     pub fn matches(&self, other: &Self) -> bool {
-        self.owner.eq_ignore_ascii_case(&other.owner)
-            && self.name.eq_ignore_ascii_case(&other.name)
+        self.owner.eq_ignore_ascii_case(&other.owner) && self.name.eq_ignore_ascii_case(&other.name)
     }
 }
 

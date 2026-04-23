@@ -269,12 +269,11 @@ impl<S: SecretStore> GitHubMinter<S> {
             return Err(MintError::EmptyToken);
         }
 
-        // Verify GitHub minted the scope we asked for. On a "selected"
-        // installation the response enumerates the repositories the token
-        // actually covers; "all" means the installation grants every repo
-        // in the owner's account and the pre-flight owner check is the
-        // boundary. A mismatch here means our audit record would claim
-        // authority the token doesn't carry.
+        // Verify GitHub minted the scope we asked for. We always request a
+        // single named repository, so a successful response must be
+        // repository_selection=selected and must enumerate exactly that repo.
+        // `all` means GitHub returned a token covering the whole installation,
+        // which is broader than the one-repo audit row we would record.
         //
         // The check has to be *exact*: if GitHub returned `[o/n, o/other]`
         // when we asked for `o/n`, the token is genuinely broader than the
@@ -304,7 +303,12 @@ impl<S: SecretStore> GitHubMinter<S> {
                     });
                 }
             }
-            RepositorySelection::All => {}
+            RepositorySelection::All => {
+                return Err(MintError::UnexpectedRepositorySelection {
+                    requested: scope.repository.clone(),
+                    returned: "all",
+                });
+            }
         }
         if parsed.permissions != scope.permissions {
             return Err(MintError::UnexpectedPermissions {
@@ -399,6 +403,14 @@ pub enum MintError {
     UnexpectedRepositories {
         requested: RepoRef,
         returned: Vec<String>,
+    },
+    #[error(
+        "GitHub minted a token with repository_selection={returned:?} while the requested \
+         repository was {requested}"
+    )]
+    UnexpectedRepositorySelection {
+        requested: RepoRef,
+        returned: &'static str,
     },
     #[error(
         "GitHub minted a token with permissions {returned:?} that do not match the requested \
@@ -541,7 +553,10 @@ mod tests {
         minter_with_owner(server, "o")
     }
 
-    fn minter_with_owner(server: &MockServer, installation_owner: &str) -> GitHubMinter<InMemStore> {
+    fn minter_with_owner(
+        server: &MockServer,
+        installation_owner: &str,
+    ) -> GitHubMinter<InMemStore> {
         let pk = SecretKey::new("gh-app-pk").unwrap();
         let store = InMemStore::default();
         store.put(&pk, TEST_PRIV_1).unwrap();
@@ -1030,10 +1045,7 @@ mod tests {
                 returned,
             } => {
                 assert_eq!(requested.to_string(), "o/n");
-                assert_eq!(
-                    returned,
-                    vec!["o/n".to_string(), "o/other".to_string()]
-                );
+                assert_eq!(returned, vec!["o/n".to_string(), "o/other".to_string()]);
             }
             other => panic!("expected UnexpectedRepositories, got {other:?}"),
         }
@@ -1164,15 +1176,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mint_accepts_repository_selection_all() {
-        // An "all" installation doesn't enumerate repositories in the
-        // response — the owner-match pre-flight is the only check we can
-        // do on repo membership. Verify we don't spuriously reject the
-        // all-repos case.
+    async fn mint_rejects_repository_selection_all() {
+        // The broker requested a one-repo token. If GitHub replies that the
+        // token covers "all" repos, the token is broader than the audit row
+        // would describe, so reject instead of handing it to the agent.
         let server = MockServer::start().await;
         let (_, expiry_str) = expiry_seconds_from_now(3600);
         Mock::given(method("POST"))
             .and(path("/app/installations/999/access_tokens"))
+            .and(body_json(serde_json::json!({
+                "repositories": ["n"],
+                "permissions": {"contents": "write", "metadata": "read"}
+            })))
             .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
                 "token": "ghs_fake_value",
                 "expires_at": expiry_str,
@@ -1183,10 +1198,20 @@ mod tests {
             .await;
 
         let minter = minter_with_key(&server);
-        minter
+        let err = minter
             .mint(write_scope("o", "n"), TtlSeconds::new(3600).unwrap())
             .await
-            .expect("mint under 'all' selection should succeed");
+            .expect_err("all-repos token must be rejected");
+        match err {
+            MintError::UnexpectedRepositorySelection {
+                requested,
+                returned,
+            } => {
+                assert_eq!(requested.to_string(), "o/n");
+                assert_eq!(returned, "all");
+            }
+            other => panic!("expected UnexpectedRepositorySelection, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -1213,8 +1238,14 @@ mod tests {
             !shown.contains("ghs_fake_value"),
             "Debug output leaked token string: {shown}"
         );
-        assert!(shown.contains("<redacted>"), "expected redaction marker: {shown}");
-        assert!(shown.contains("jti"), "other fields should still render: {shown}");
+        assert!(
+            shown.contains("<redacted>"),
+            "expected redaction marker: {shown}"
+        );
+        assert!(
+            shown.contains("jti"),
+            "other fields should still render: {shown}"
+        );
     }
 
     #[test]

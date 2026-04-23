@@ -256,7 +256,10 @@ mod tests {
             .map(|e| e.unwrap().file_name().into_string().unwrap())
             .filter(|n| n.starts_with(".tmp."))
             .collect();
-        assert!(orphans.is_empty(), "unexpected orphan tempfiles: {orphans:?}");
+        assert!(
+            orphans.is_empty(),
+            "unexpected orphan tempfiles: {orphans:?}"
+        );
     }
 
     #[test]
