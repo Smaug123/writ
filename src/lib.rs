@@ -8,4 +8,6 @@ pub mod audit;
 pub mod core;
 pub mod github;
 pub mod policy;
+pub mod protocol;
 pub mod secret;
+pub mod server;
