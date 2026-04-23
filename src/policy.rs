@@ -278,4 +278,59 @@ mod tests {
         let json = r#"{"default_ttl": 99999, "writable_repos": []}"#;
         assert!(serde_json::from_str::<PolicyConfig>(json).is_err());
     }
+
+    // --- Property-based ---------------------------------------------------
+
+    // Identifiers reachable via GitHub: no slash, no NUL, non-empty.
+    // Restrict to [a-zA-Z0-9_-] so `to_uppercase` gives a proper
+    // case-variant without hitting chars that fold unpredictably.
+    proptest::proptest! {
+        #[test]
+        fn write_granted_for_any_case_variant_of_allowlisted_repo(
+            owner in "[a-z][a-z0-9-]{0,19}",
+            name  in "[a-z][a-z0-9_-]{0,19}",
+        ) {
+            // Put the all-uppercase version on the allowlist; request with
+            // all-lowercase. These are always case-insensitively equal and
+            // never byte-equal, so we exercise the matches() path on every run.
+            let allowlist_entry = repo(&owner.to_uppercase(), &name.to_uppercase());
+            let request_repo   = repo(&owner,               &name);
+
+            let policy = policy_with(vec![allowlist_entry.clone()]);
+            let req = CapabilityRequest::GitHub(GitHubRequest::Contents {
+                access: GitHubAccess::Write,
+                repo: request_repo.clone(),
+            });
+
+            let scope = expect_grant(decide(&req, &policy));
+            // Granted scope carries the request's exact casing.
+            proptest::prop_assert_eq!(&scope.repository, &request_repo);
+            // It also matches the allowlist entry under GitHub semantics.
+            proptest::prop_assert!(scope.repository.matches(&allowlist_entry));
+        }
+
+        #[test]
+        fn write_denied_when_no_allowlist_entry_matches(
+            owner       in "[a-z][a-z0-9-]{0,19}",
+            name        in "[a-z][a-z0-9_-]{0,19}",
+            other_owner in "[a-z][a-z0-9-]{0,19}",
+            other_name  in "[a-z][a-z0-9_-]{0,19}",
+        ) {
+            let request     = repo(&owner,       &name);
+            let allowlisted = repo(&other_owner, &other_name);
+
+            // Only test cases where they're genuinely different repos.
+            proptest::prop_assume!(!request.matches(&allowlisted));
+
+            let policy = policy_with(vec![allowlisted]);
+            let req = CapabilityRequest::GitHub(GitHubRequest::Contents {
+                access: GitHubAccess::Write,
+                repo: request,
+            });
+            proptest::prop_assert!(
+                matches!(decide(&req, &policy), PolicyDecision::Deny { .. }),
+                "write on non-matching repo must be denied"
+            );
+        }
+    }
 }
