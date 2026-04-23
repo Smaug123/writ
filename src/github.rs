@@ -275,17 +275,25 @@ impl<S: SecretStore> GitHubMinter<S> {
         // in the owner's account and the pre-flight owner check is the
         // boundary. A mismatch here means our audit record would claim
         // authority the token doesn't carry.
+        //
+        // The check has to be *exact*: if GitHub returned `[o/n, o/other]`
+        // when we asked for `o/n`, the token is genuinely broader than the
+        // audit row would claim — recording a one-repo scope for a token
+        // that covers two would be the silent over-grant this whole boundary
+        // exists to prevent. So reject on any extra entry as well as on a
+        // missing one.
+        //
         // GitHub returns `full_name` in the repo's canonical casing, which
         // need not match the casing the caller supplied. Compare
         // case-insensitively to match GitHub's own resolution semantics.
         let expected = scope.repository.to_string();
         match parsed.repository_selection {
             RepositorySelection::Selected => {
-                if !parsed
-                    .repositories
-                    .iter()
-                    .any(|r| r.full_name.eq_ignore_ascii_case(&expected))
-                {
+                let matches_expected = parsed.repositories.len() == 1
+                    && parsed.repositories[0]
+                        .full_name
+                        .eq_ignore_ascii_case(&expected);
+                if !matches_expected {
                     return Err(MintError::UnexpectedRepositories {
                         requested: scope.repository.clone(),
                         returned: parsed
@@ -984,6 +992,48 @@ mod tests {
             } => {
                 assert_eq!(requested.to_string(), "o/n");
                 assert_eq!(returned, vec!["o/not-the-one".to_string()]);
+            }
+            other => panic!("expected UnexpectedRepositories, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn mint_rejects_when_response_lists_extra_repos() {
+        // "Selected" responses must enumerate *exactly* the repo we asked
+        // for; a superset means the token carries authority the audit row
+        // won't describe. Reject even when the requested repo is present.
+        let server = MockServer::start().await;
+        let (_, expiry_str) = expiry_seconds_from_now(3600);
+        Mock::given(method("POST"))
+            .and(path("/app/installations/999/access_tokens"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "token": "ghs_fake_value",
+                "expires_at": expiry_str,
+                "permissions": {"contents": "write", "metadata": "read"},
+                "repository_selection": "selected",
+                "repositories": [
+                    {"full_name": "o/n"},
+                    {"full_name": "o/other"}
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        let minter = minter_with_key(&server);
+        let err = minter
+            .mint(write_scope("o", "n"), TtlSeconds::new(3600).unwrap())
+            .await
+            .expect_err("superset of requested repos must be rejected");
+        match err {
+            MintError::UnexpectedRepositories {
+                requested,
+                returned,
+            } => {
+                assert_eq!(requested.to_string(), "o/n");
+                assert_eq!(
+                    returned,
+                    vec!["o/n".to_string(), "o/other".to_string()]
+                );
             }
             other => panic!("expected UnexpectedRepositories, got {other:?}"),
         }
