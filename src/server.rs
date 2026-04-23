@@ -226,22 +226,41 @@ async fn handle_connection<S: SecretStore + Send + Sync + 'static>(
 /// Listen on `socket_path`, spawning a task per connection. Returns only
 /// on a fatal listener error.
 ///
-/// The parent directory is created with mode 0700 before binding. A
-/// stale socket file is removed only after confirming nothing is
-/// listening on it; if a live daemon is already serving the path this
-/// function returns `ErrorKind::AddrInUse` without disturbing it.
+/// The parent directory is created with mode 0700 before binding. If
+/// the parent already exists with group or world access bits set the
+/// function returns `ErrorKind::PermissionDenied` without binding —
+/// any looser permission means a local attacker can connect to the
+/// credential socket. A stale socket file is removed only after
+/// confirming nothing is listening on it; if a live daemon is already
+/// serving the path this function returns `ErrorKind::AddrInUse`.
 pub async fn run<S: SecretStore + Send + Sync + 'static>(
     socket_path: &Path,
     state: Arc<BrokerState<S>>,
 ) -> io::Result<()> {
-    // Only create and lock down the parent directory if it doesn't yet
-    // exist. For a well-known path like /tmp/writ.sock the parent (/tmp)
-    // already exists and is world-writable; chmod-ing it would be wrong.
-    if let Some(parent) = socket_path.parent()
-        && !parent.exists()
-    {
-        std::fs::create_dir_all(parent)?;
-        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
+    if let Some(parent) = socket_path.parent() {
+        if !parent.exists() {
+            std::fs::create_dir_all(parent)?;
+            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
+        }
+        // The socket is the auth boundary: any process that can reach the
+        // parent directory can connect and request credentials. Refuse if
+        // the parent has group or world access bits, even if we didn't
+        // create it — we don't silently chmod a directory we don't own.
+        // Operators can fix with: chmod 700 <parent>.
+        let mode = std::fs::metadata(parent)?.permissions().mode();
+        if mode & 0o077 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "socket parent {} has group/world access bits (mode {:04o}); \
+                     refusing to bind: any local user could connect to the credential \
+                     socket. Fix with: chmod 700 {}",
+                    parent.display(),
+                    mode & 0o777,
+                    parent.display()
+                ),
+            ));
+        }
     }
 
     // Try to connect to the existing socket. A successful connection means
@@ -541,6 +560,9 @@ mod tests {
         let state = make_state(&server, vec![], "o");
 
         let dir = tempfile::tempdir().unwrap();
+        // The permission check in run() requires the parent to be 0700;
+        // tempfile creates 0755, so fix it before spawning.
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let sock_path = dir.path().join("test.sock");
 
         // Spawn the listener
