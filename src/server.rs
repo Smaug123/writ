@@ -161,12 +161,16 @@ async fn dispatch_capability<S: SecretStore + Send + Sync>(
                 decision: &decision,
                 grant_outcome: GrantOutcome::Granted(&grant),
             }) {
-                // The token is already live; we can't un-mint it. Returning
-                // Error would make the agent think the mint failed, which
-                // could trigger a retry and produce a second live token with
-                // still no audit row. Better to log loudly and hand back the
-                // token — one unlisted token is better than two.
+                // The audit log is the system of record. Delivering a token
+                // that isn't recorded would violate the broker's core
+                // invariant ("no unaudited grant"). The minted token is
+                // wasted; it expires on its own without ever being used.
+                // A transient disk issue will resolve on retry; a permanent
+                // one (full disk, corrupt DB) must be fixed by the operator.
                 eprintln!("AUDIT WRITE FAILED for jti={}: {e}", grant.jti);
+                return ServerMessage::Error {
+                    message: format!("credential was minted but could not be recorded; not delivering: {e}"),
+                };
             }
             ServerMessage::TokenGranted { token, expires_at }
         }
@@ -211,9 +215,10 @@ async fn handle_connection<S: SecretStore + Send + Sync + 'static>(
 /// Listen on `socket_path`, spawning a task per connection. Returns only
 /// on a fatal listener error.
 ///
-/// The parent directory is created with mode 0700 before binding; a
-/// stale socket file is removed first so restarts don't fail with
-/// EADDRINUSE.
+/// The parent directory is created with mode 0700 before binding. A
+/// stale socket file is removed only after confirming nothing is
+/// listening on it; if a live daemon is already serving the path this
+/// function returns `ErrorKind::AddrInUse` without disturbing it.
 pub async fn run<S: SecretStore + Send + Sync + 'static>(
     socket_path: &Path,
     state: Arc<BrokerState<S>>,
@@ -222,7 +227,20 @@ pub async fn run<S: SecretStore + Send + Sync + 'static>(
         std::fs::create_dir_all(parent)?;
         std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
     }
-    // Remove stale socket so bind doesn't fail with EADDRINUSE on restart.
+
+    // Try to connect to the existing socket. A successful connection means
+    // another writd is alive; refuse to displace it. A failed connection
+    // means the socket file (if any) is stale; remove it and bind fresh.
+    if let Ok(_probe) = std::os::unix::net::UnixStream::connect(socket_path) {
+        return Err(io::Error::new(
+            io::ErrorKind::AddrInUse,
+            format!(
+                "another writd is already running at {}; \
+                 stop it before starting a new one",
+                socket_path.display()
+            ),
+        ));
+    }
     let _ = std::fs::remove_file(socket_path);
 
     let listener = UnixListener::bind(socket_path)?;
