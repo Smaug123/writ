@@ -20,7 +20,7 @@ use crate::policy::PolicyConfig;
 ///     "private_key_secret": "gh-app-pk"
 ///   },
 ///   "policy": {
-///     "default_ttl": 300,
+///     "default_ttl": 3600,
 ///     "writable_repos": ["smaug123/writ"]
 ///   },
 ///   "secret_store": { "type": "file", "path": "/home/user/.config/writ/secrets" }
@@ -94,7 +94,7 @@ mod tests {
                 "private_key_secret": "gh-app-pk"
             },
             "policy": {
-                "default_ttl": 300,
+                "default_ttl": 3600,
                 "writable_repos": []
             },
             "secret_store": { "type": "file", "path": "/tmp/secrets" }
@@ -102,7 +102,7 @@ mod tests {
         let c: DaemonConfig = serde_json::from_str(json).unwrap();
         assert_eq!(c.github.app_id, 42);
         assert_eq!(c.github.api_base, "https://api.github.com");
-        assert_eq!(c.policy.default_ttl.as_i64(), 300);
+        assert_eq!(c.policy.default_ttl.as_i64(), 3600);
         assert!(c.socket_path.is_none());
     }
 

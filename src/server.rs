@@ -11,7 +11,7 @@
 //! All tests exercise [`dispatch_message`] directly.
 
 use std::io;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -130,7 +130,11 @@ async fn dispatch_capability<S: SecretStore + Send + Sync>(
             decision: &decision,
             grant_outcome: GrantOutcome::NotMinted,
         }) {
-            eprintln!("audit write failed for denied request {request_id}: {e}");
+            return ServerMessage::Error {
+                message: format!(
+                    "policy denied the request but the denial could not be recorded: {e}"
+                ),
+            };
         }
         return ServerMessage::Denied { reason };
     }
@@ -169,7 +173,9 @@ async fn dispatch_capability<S: SecretStore + Send + Sync>(
                 // one (full disk, corrupt DB) must be fixed by the operator.
                 eprintln!("AUDIT WRITE FAILED for jti={}: {e}", grant.jti);
                 return ServerMessage::Error {
-                    message: format!("credential was minted but could not be recorded; not delivering: {e}"),
+                    message: format!(
+                        "credential was minted but could not be recorded; not delivering: {e}"
+                    ),
                 };
             }
             ServerMessage::TokenGranted { token, expires_at }
@@ -185,7 +191,12 @@ async fn dispatch_capability<S: SecretStore + Send + Sync>(
                 decision: &decision,
                 grant_outcome: GrantOutcome::MintFailed { error: &error_str },
             }) {
-                eprintln!("audit write failed after mint failure for {request_id}: {ae}");
+                return ServerMessage::Error {
+                    message: format!(
+                        "mint failed and the failure could not be recorded: {ae} \
+                         (original mint error: {error_str})"
+                    ),
+                };
             }
             ServerMessage::Error { message: error_str }
         }
@@ -223,7 +234,12 @@ pub async fn run<S: SecretStore + Send + Sync + 'static>(
     socket_path: &Path,
     state: Arc<BrokerState<S>>,
 ) -> io::Result<()> {
-    if let Some(parent) = socket_path.parent() {
+    // Only create and lock down the parent directory if it doesn't yet
+    // exist. For a well-known path like /tmp/writ.sock the parent (/tmp)
+    // already exists and is world-writable; chmod-ing it would be wrong.
+    if let Some(parent) = socket_path.parent()
+        && !parent.exists()
+    {
         std::fs::create_dir_all(parent)?;
         std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
     }
@@ -241,7 +257,26 @@ pub async fn run<S: SecretStore + Send + Sync + 'static>(
             ),
         ));
     }
-    let _ = std::fs::remove_file(socket_path);
+
+    // Only remove the path if it's actually a socket. A regular file at
+    // the configured socket path almost certainly means operator error;
+    // silently clobbering it would be surprising and destructive.
+    match std::fs::metadata(socket_path) {
+        Ok(m) if !m.file_type().is_socket() => {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!(
+                    "{} exists but is not a socket; refusing to remove it",
+                    socket_path.display()
+                ),
+            ));
+        }
+        Ok(_) => {
+            std::fs::remove_file(socket_path)?;
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
 
     let listener = UnixListener::bind(socket_path)?;
     loop {
