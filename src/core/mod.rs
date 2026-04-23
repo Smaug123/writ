@@ -124,6 +124,20 @@ pub struct RepoRef {
     pub name: String,
 }
 
+impl RepoRef {
+    /// Case-insensitive equality, matching GitHub's own resolution
+    /// semantics for owner and repository names. Use this anywhere a
+    /// comparison crosses the GitHub boundary (policy allowlists,
+    /// response verification) so operator-typed casing doesn't cause
+    /// spurious mismatches. `PartialEq` is left exact so collections
+    /// keyed on `RepoRef` behave predictably; the broker only treats
+    /// case as irrelevant when *comparing against GitHub-sourced names*.
+    pub fn matches(&self, other: &Self) -> bool {
+        self.owner.eq_ignore_ascii_case(&other.owner)
+            && self.name.eq_ignore_ascii_case(&other.name)
+    }
+}
+
 impl std::fmt::Display for RepoRef {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}/{}", self.owner, self.name)
@@ -208,6 +222,37 @@ mod tests {
         assert_eq!(j, r#""o/n""#);
         let back: RepoRef = serde_json::from_str(&j).unwrap();
         assert_eq!(back, r);
+    }
+
+    #[test]
+    fn matches_is_case_insensitive_but_eq_is_not() {
+        let a = RepoRef {
+            owner: "Smaug123".into(),
+            name: "Writ".into(),
+        };
+        let b = RepoRef {
+            owner: "smaug123".into(),
+            name: "writ".into(),
+        };
+        assert!(a.matches(&b));
+        assert!(b.matches(&a));
+        assert_ne!(a, b, "PartialEq must stay exact so Hash/collections behave");
+    }
+
+    #[test]
+    fn matches_rejects_different_owner_or_name() {
+        let r = RepoRef {
+            owner: "o".into(),
+            name: "n".into(),
+        };
+        assert!(!r.matches(&RepoRef {
+            owner: "o".into(),
+            name: "m".into(),
+        }));
+        assert!(!r.matches(&RepoRef {
+            owner: "p".into(),
+            name: "n".into(),
+        }));
     }
 
     #[test]

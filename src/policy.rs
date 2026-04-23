@@ -45,7 +45,13 @@ pub fn decide(request: &CapabilityRequest, policy: &PolicyConfig) -> PolicyDecis
 fn decide_github(r: &GitHubRequest, policy: &PolicyConfig) -> PolicyDecision {
     if is_write(r) {
         let repo = r.repo();
-        if !policy.writable_repos.iter().any(|w| w == repo) {
+        // Case-insensitive match so a config entry like `Smaug123/Writ`
+        // still authorises a request for `smaug123/writ` — GitHub itself
+        // resolves those to the same repository, and the mint boundary
+        // already compares case-insensitively. A case-sensitive check
+        // here would deny writes the rest of the system would then
+        // happily perform against differently-cased config.
+        if !policy.writable_repos.iter().any(|w| w.matches(repo)) {
             return PolicyDecision::Deny {
                 reason: format!("write access to {repo} is not on the writable-repos allowlist"),
             };
@@ -160,6 +166,21 @@ mod tests {
             }
             other => panic!("expected Deny, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn writable_repos_match_is_case_insensitive() {
+        // Config typed `Smaug123/Writ` must still authorise a request
+        // for `smaug123/writ`; GitHub resolves those to the same repo
+        // and a case-sensitive check here would deny writes the rest
+        // of the stack would then perform anyway.
+        let policy = policy_with(vec![repo("Smaug123", "Writ")]);
+        let req = CapabilityRequest::GitHub(GitHubRequest::Contents {
+            access: GitHubAccess::Write,
+            repo: repo("smaug123", "writ"),
+        });
+        let scope = expect_grant(decide(&req, &policy));
+        assert_eq!(scope.repository, repo("smaug123", "writ"));
     }
 
     #[test]
