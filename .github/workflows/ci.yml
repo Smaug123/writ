@@ -59,7 +59,7 @@ jobs:
 
     - name: Build Nix package
       run: |
-        nix build .#packages.x86_64-linux.robocop-server --print-build-logs
+        nix build .#packages.x86_64-linux.default --print-build-logs
 
   all-required-checks-complete:
     if: ${{ always() }}
