@@ -12,18 +12,18 @@
         config.allowUnfree = true;
       };
 
-      agent-infra = pkgs.rustPlatform.buildRustPackage {
-        pname = "agent-infra";
+      writ = pkgs.rustPlatform.buildRustPackage {
+        pname = "writ";
         version = "0.1.0";
         src = pkgs.lib.cleanSource ./.;
         cargoLock.lockFile = ./Cargo.lock;
       };
       in
       {
-        packages.default = agent-infra;
+        packages.default = writ;
 
         devShells.default = pkgs.mkShell {
-          inputsFrom = [ agent-infra ];
+          inputsFrom = [ writ ];
 
           packages = [
             pkgs.cargo

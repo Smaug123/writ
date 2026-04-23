@@ -3,25 +3,6 @@
 version = 4
 
 [[package]]
-name = "agent-infra"
-version = "0.1.0"
-dependencies = [
- "jsonwebtoken",
- "keyring",
- "proptest",
- "reqwest",
- "rusqlite",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror",
- "time",
- "tokio",
- "uuid",
- "wiremock",
-]
-
-[[package]]
 name = "aho-corasick"
 version = "1.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2172,6 +2153,25 @@ dependencies = [
  "serde_json",
  "unicode-xid",
  "wasmparser",
+]
+
+[[package]]
+name = "writ"
+version = "0.1.0"
+dependencies = [
+ "jsonwebtoken",
+ "keyring",
+ "proptest",
+ "reqwest",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "time",
+ "tokio",
+ "uuid",
+ "wiremock",
 ]
 
 [[package]]

@@ -1,10 +1,12 @@
-# Capability broker — design (v1)
+# writ — design (v1)
+
+A capability broker for local agents.
 
 ## One-line summary
 
 A local daemon that mints short-lived, per-request-scoped credentials for agents
 (initially: GitHub App installation tokens) and keeps an append-only audit log
-of every request, decision, and grant.
+of every request, decision, grant, and post-policy mint failure.
 
 ## Why this shape
 
@@ -88,7 +90,7 @@ The app's private key is the only long-lived secret the broker holds. It
 lives behind a `SecretStore` trait with two implementations:
 
 - **File backend** — 0600-permissioned PEM file under
-  `$XDG_DATA_HOME/agent-infra/` (or `~/.local/share/agent-infra/` fallback).
+  `$XDG_DATA_HOME/writ/` (or `~/.local/share/writ/` fallback).
   Works on macOS and Linux. The default.
 - **Keyring backend** — uses the `keyring` crate, which wraps macOS Keychain
   and Linux Secret Service. Opt-in via config.
@@ -102,7 +104,7 @@ slot in behind the same trait.
 
 For v1, policy is a Rust `match` expression over `CapabilityRequest`. The
 policy config is a struct with fields like `writable_repos`, deserialised
-from a TOML file at startup. No DSL, no Cedar, no OPA.
+from a JSON file at startup. No DSL, no Cedar, no OPA.
 
 The shape of policy is still unclear — once we have half a dozen real-world
 policy decisions in our heads, we'll know what shape the externalisation
@@ -112,7 +114,7 @@ variant; that's a lot of what a policy DSL buys you.
 
 ## Transport
 
-Local Unix socket at `$XDG_RUNTIME_DIR/agent-infra/broker.sock` (falling back
+Local Unix socket at `$XDG_RUNTIME_DIR/writ/writd.sock` (falling back
 to a well-known path under the user's home). Filesystem permissions
 (`0700` on the parent dir) are the auth boundary: if you can open the
 socket, you are trusted.
@@ -128,7 +130,7 @@ handler functions.
 
 ## Audit log
 
-SQLite at `$XDG_DATA_HOME/agent-infra/audit.db`. Schema:
+SQLite at `$XDG_DATA_HOME/writ/audit.db`. Schema:
 
 ```sql
 CREATE TABLE session (
@@ -144,10 +146,13 @@ CREATE TABLE request (
   session_id    TEXT NOT NULL REFERENCES session(session_id),
   received_at   INTEGER NOT NULL,
   request_json  TEXT NOT NULL,
-  decision_json TEXT NOT NULL
+  decision_json TEXT NOT NULL,
+  mint_failure_json TEXT
 );
 
-CREATE TABLE grant (
+-- `grant` is a SQL keyword in some dialects, so the table is named
+-- `grant_log` even though the payload is still a credential grant.
+CREATE TABLE grant_log (
   jti         TEXT PRIMARY KEY,
   request_id  TEXT NOT NULL REFERENCES request(request_id),
   session_id  TEXT NOT NULL REFERENCES session(session_id),
@@ -157,13 +162,20 @@ CREATE TABLE grant (
 );
 ```
 
-Append-only. Timestamps are unix microseconds. JSON columns are the full
-serialised core types — verbose but cheap, and they round-trip exactly, so
-you can query the log and replay history if the broker's in-memory code
-needs it.
+Append-only. Timestamps are unix **milliseconds** (matching the
+`UnixMillis` core type — millisecond resolution keeps parallel agent
+panes or a burst of GitHub calls within the same wall-clock second
+distinguishable for replay). JSON columns are the full serialised core
+types — verbose but cheap, and they round-trip exactly, so you can query
+the log and replay history if the broker's in-memory code needs it.
 
-No migrations framework yet — a single embedded `CREATE TABLE IF NOT EXISTS`
-idempotent setup function.
+Schema evolution is managed by a tiny migration framework driven off
+SQLite's `PRAGMA user_version`: each migration commits its DDL and
+version bump in a single transaction, so a process killed mid-migration
+resumes cleanly at the next open. A DB at a higher version than this
+binary understands is refused rather than opened — that's the
+correctness-over-availability call, since a down-rev binary silently
+ignoring columns it doesn't understand is how audit logs lose data.
 
 ## Commit authorship
 
@@ -176,7 +188,7 @@ is authenticated with the bot's installation token. This preserves
 contribution-graph attribution while keeping the credential ephemeral.
 
 Switching to bot-as-author later requires only a client-side change: the
-agent runs `git commit --author="agent-infra-bot[bot] <id+...@users.noreply.github.com>"`.
+agent runs `git commit --author="writ-bot[bot] <id+...@users.noreply.github.com>"`.
 No broker change is needed.
 
 ## Concurrency
@@ -224,10 +236,10 @@ src/
   github.rs           GitHub App JWT + installation token exchange
   protocol.rs         wire protocol types (open_session, ...)
   server.rs           Unix socket listener + dispatch
-  config.rs           TOML config loading
+  config.rs           JSON config loading
   bin/
-    agent-broker.rs   daemon
-    agent-identity.rs CLI client
+    writd.rs          daemon
+    writ.rs           CLI client
 docs/
   design/
     broker.md         this document
