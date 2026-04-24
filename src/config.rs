@@ -22,14 +22,17 @@ use crate::policy::PolicyConfig;
 ///   "policy": {
 ///     "default_ttl": 3600,
 ///     "writable_repos": ["smaug123/writ"]
-///   },
-///   "secret_store": { "type": "file", "path": "/home/user/.config/writ/secrets" }
+///   }
 /// }
 /// ```
 #[derive(Debug, Deserialize)]
 pub struct DaemonConfig {
     pub github: GitHubAppConfig,
     pub policy: PolicyConfig,
+    /// Where long-lived secrets (notably the GitHub App private key) are
+    /// stored. Defaults to the file backend at [`default_secret_store_path`];
+    /// set to `{ "type": "keyring" }` to opt in to the OS keychain.
+    #[serde(default = "default_secret_store_config")]
     pub secret_store: SecretStoreConfig,
     /// Override the default Unix socket path. If absent, uses
     /// `$XDG_RUNTIME_DIR/writ/writd.sock` (see [`server::default_socket_path`]).
@@ -60,6 +63,23 @@ fn default_keyring_service() -> String {
     "writ".into()
 }
 
+fn default_secret_store_config() -> SecretStoreConfig {
+    SecretStoreConfig::File {
+        path: default_secret_store_path(),
+    }
+}
+
+/// Default base directory for the file secret store. Matches the
+/// `$XDG_DATA_HOME/writ/` location called out in `docs/design/broker.md`.
+pub fn default_secret_store_path() -> PathBuf {
+    if let Some(dir) = std::env::var_os("XDG_DATA_HOME") {
+        PathBuf::from(dir).join("writ/secrets")
+    } else {
+        let home = std::env::var_os("HOME").unwrap_or_else(|| "/tmp".into());
+        PathBuf::from(home).join(".local/share/writ/secrets")
+    }
+}
+
 /// Default location for the daemon config file.
 pub fn default_config_path() -> PathBuf {
     if let Some(dir) = std::env::var_os("XDG_CONFIG_HOME") {
@@ -86,6 +106,8 @@ mod tests {
 
     #[test]
     fn parses_minimal_config() {
+        // No `secret_store` key — the file backend at
+        // `default_secret_store_path()` is the documented default.
         let json = r#"{
             "github": {
                 "app_id": 42,
@@ -96,14 +118,16 @@ mod tests {
             "policy": {
                 "default_ttl": 3600,
                 "writable_repos": []
-            },
-            "secret_store": { "type": "file", "path": "/tmp/secrets" }
+            }
         }"#;
         let c: DaemonConfig = serde_json::from_str(json).unwrap();
         assert_eq!(c.github.app_id, 42);
         assert_eq!(c.github.api_base, "https://api.github.com");
         assert_eq!(c.policy.default_ttl.as_i64(), 3600);
         assert!(c.socket_path.is_none());
+        assert!(
+            matches!(c.secret_store, SecretStoreConfig::File { path } if path == default_secret_store_path())
+        );
     }
 
     #[test]

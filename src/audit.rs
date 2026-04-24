@@ -64,12 +64,6 @@ pub enum AuditError {
          upgrade the broker"
     )]
     SchemaTooNew { found: i32, supported: i32 },
-
-    #[error(
-        "audit DB has user_version 0 but contains only part of the legacy v1 schema; \
-         refuse to guess migration state"
-    )]
-    PartialLegacySchema,
 }
 
 /// JSON payload stored in the `mint_failure` table.
@@ -124,7 +118,7 @@ impl AuditLog {
 
     fn init(conn: &mut Connection) -> Result<(), AuditError> {
         // SQLite foreign_keys is per-connection and defaults to OFF, so the
-        // REFERENCES clauses in the v1 schema would otherwise be
+        // REFERENCES clauses in the schema would otherwise be
         // parsed-and-ignored and orphan `request`/`grant_log` rows could
         // slip in. Must be set outside a transaction.
         conn.execute_batch("PRAGMA foreign_keys = ON;")?;
@@ -571,12 +565,23 @@ struct Migration {
 /// a version higher than this is rejected with [`AuditError::SchemaTooNew`]
 /// rather than opened — we'd rather fail to start than silently drop data
 /// into a schema a newer broker wrote.
-const SCHEMA_VERSION: i32 = 5;
+const SCHEMA_VERSION: i32 = 1;
 
 /// The full migration history. Each entry documents exactly one state
 /// transition; the sequence of entries is the schema's lineage. Order
 /// matters and must be strictly ascending in `version`.
 const MIGRATIONS: &[Migration] = &[
+    // Initial schema. The two outcome tables (`grant_log` and
+    // `mint_failure`) are kept separate from `request` so the broker can
+    // pre-record a request before awaiting GitHub and append the outcome
+    // once the mint completes, while leaving `request` strictly
+    // append-only. Triggers enforce that:
+    //   - `request` rows can only be inserted while the referenced
+    //     session is open — belt-and-braces for the FK, which can say
+    //     "session exists" but not "is open", preserving `closed_at`
+    //     as a meaningful activity-window bound.
+    //   - a given `request_id` has at most one outcome row (grant xor
+    //     mint_failure), so replay never sees contradictory outcomes.
     Migration {
         version: 1,
         sql: r#"
@@ -608,23 +613,13 @@ CREATE TABLE grant_log (
 );
 
 CREATE INDEX idx_grant_session ON grant_log(session_id, issued_at);
-"#,
-    },
-    Migration {
-        version: 2,
-        sql: "ALTER TABLE request ADD COLUMN mint_failure_json TEXT;",
-    },
-    // Belt-and-braces for the session-open check in `record`: the FK
-    // from `request(session_id)` to `session(session_id)` ensures the
-    // referenced session exists, but cannot express "is open". A
-    // BEFORE-INSERT trigger raises SQLITE_CONSTRAINT_TRIGGER if the
-    // session has already been closed, so any writer that reaches the
-    // `request` table (including callers that bypass `AuditLog::record`)
-    // is stopped at the DB boundary instead of silently corrupting the
-    // activity-window bound that `closed_at` is supposed to provide.
-    Migration {
-        version: 3,
-        sql: r#"
+
+CREATE TABLE mint_failure (
+    request_id   TEXT PRIMARY KEY REFERENCES request(request_id),
+    failed_at    INTEGER NOT NULL,
+    failure_json TEXT NOT NULL
+);
+
 CREATE TRIGGER request_requires_open_session
 BEFORE INSERT ON request
 WHEN EXISTS (
@@ -634,23 +629,6 @@ WHEN EXISTS (
 BEGIN
     SELECT RAISE(ABORT, 'session is closed');
 END;
-"#,
-    },
-    // The post-mint outcome (success → grant_log; failure → mint_failure)
-    // lives in its own append-only row rather than mutating the `request`
-    // row. This preserves "request is strictly append-only" while letting
-    // the broker pre-record the request before awaiting GitHub: the
-    // outcome is appended only once the mint completes. Triggers enforce
-    // that a given request_id has at most one of the two outcome rows —
-    // a request either succeeded or failed, never both.
-    Migration {
-        version: 4,
-        sql: r#"
-CREATE TABLE mint_failure (
-    request_id   TEXT PRIMARY KEY REFERENCES request(request_id),
-    failed_at    INTEGER NOT NULL,
-    failure_json TEXT NOT NULL
-);
 
 CREATE TRIGGER mint_failure_excludes_grant
 BEFORE INSERT ON mint_failure
@@ -666,17 +644,6 @@ BEGIN
     SELECT RAISE(ABORT, 'mint failure already recorded for this request');
 END;
 "#,
-    },
-    // `mint_failure_json` on `request` is vestigial: migration 2 added it
-    // when the mint outcome was packed into the same row, and migration 4
-    // moved that outcome into its own `mint_failure` table. No code has
-    // written or read the column since — `record_mint_failure` targets
-    // the new table exclusively. Drop it now, while the schema is still
-    // pre-release and no operator has real audit data depending on it,
-    // so future readers don't puzzle over an unused column.
-    Migration {
-        version: 5,
-        sql: "ALTER TABLE request DROP COLUMN mint_failure_json;",
     },
 ];
 
@@ -709,24 +676,7 @@ const _: () = {
 };
 
 fn migrate(conn: &mut Connection) -> Result<(), AuditError> {
-    let mut current = user_version(conn)?;
-
-    if current == 0 {
-        match legacy_schema_state(conn)? {
-            LegacySchemaState::Empty => {}
-            // A v1-shaped DB written before we started tracking
-            // `user_version` would read as version 0 but already have the
-            // v1 tables. Fast-forward the pragma in-place so subsequent
-            // migrations apply cleanly.
-            LegacySchemaState::CompleteV1 => {
-                conn.pragma_update(None, "user_version", 1)?;
-                current = 1;
-            }
-            LegacySchemaState::PartialOrInconsistent => {
-                return Err(AuditError::PartialLegacySchema);
-            }
-        }
-    }
+    let current = user_version(conn)?;
 
     if current > SCHEMA_VERSION {
         return Err(AuditError::SchemaTooNew {
@@ -746,96 +696,6 @@ fn migrate(conn: &mut Connection) -> Result<(), AuditError> {
 
 fn user_version(conn: &Connection) -> Result<i32, AuditError> {
     Ok(conn.query_row("PRAGMA user_version", [], |row| row.get(0))?)
-}
-
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-enum LegacySchemaState {
-    Empty,
-    CompleteV1,
-    PartialOrInconsistent,
-}
-
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-enum TableShape {
-    Missing,
-    HasRequiredColumns,
-    MissingRequiredColumns,
-}
-
-fn legacy_schema_state(conn: &Connection) -> Result<LegacySchemaState, AuditError> {
-    let session = table_shape(
-        conn,
-        "session",
-        &[
-            "session_id",
-            "label",
-            "agent_model",
-            "opened_at",
-            "closed_at",
-        ],
-    )?;
-    let request = table_shape(
-        conn,
-        "request",
-        &[
-            "request_id",
-            "session_id",
-            "received_at",
-            "request_json",
-            "decision_json",
-        ],
-    )?;
-    let grant_log = table_shape(
-        conn,
-        "grant_log",
-        &[
-            "jti",
-            "request_id",
-            "session_id",
-            "scope_json",
-            "issued_at",
-            "expires_at",
-        ],
-    )?;
-
-    match (session, request, grant_log) {
-        (TableShape::Missing, TableShape::Missing, TableShape::Missing) => {
-            Ok(LegacySchemaState::Empty)
-        }
-        (
-            TableShape::HasRequiredColumns,
-            TableShape::HasRequiredColumns,
-            TableShape::HasRequiredColumns,
-        ) => Ok(LegacySchemaState::CompleteV1),
-        _ => Ok(LegacySchemaState::PartialOrInconsistent),
-    }
-}
-
-fn table_shape(
-    conn: &Connection,
-    name: &str,
-    required_columns: &[&str],
-) -> Result<TableShape, AuditError> {
-    let columns = table_columns(conn, name)?;
-    if columns.is_empty() {
-        return Ok(TableShape::Missing);
-    }
-    if required_columns
-        .iter()
-        .all(|required| columns.iter().any(|column| column == required))
-    {
-        Ok(TableShape::HasRequiredColumns)
-    } else {
-        Ok(TableShape::MissingRequiredColumns)
-    }
-}
-
-fn table_columns(conn: &Connection, name: &str) -> Result<Vec<String>, AuditError> {
-    let mut stmt = conn.prepare(&format!("PRAGMA table_info({name})"))?;
-    let columns = stmt
-        .query_map([], |row| row.get::<_, String>(1))?
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(columns)
 }
 
 #[cfg(test)]
@@ -1971,9 +1831,6 @@ mod tests {
         assert!(trigger_exists(&log, "request_requires_open_session"));
         assert!(trigger_exists(&log, "mint_failure_excludes_grant"));
         assert!(trigger_exists(&log, "grant_excludes_mint_failure"));
-        // Vestigial column dropped in migration 5; assert it's gone so a
-        // future resurrection of the old name is caught loudly.
-        assert!(!column_exists(&log, "request", "mint_failure_json"));
     }
 
     #[test]
@@ -2002,89 +1859,6 @@ mod tests {
         assert_eq!(read_user_version(&log), SCHEMA_VERSION);
     }
 
-    /// A DB written before we started tracking `user_version` reads as
-    /// version 0 but already has the v1 tables. The fast-forward path
-    /// detects this and brings it up to current without trying to
-    /// re-create existing tables.
-    #[test]
-    fn open_fast_forwards_legacy_v0_db_to_current_schema() {
-        let db = NamedTempFile::new().unwrap();
-        let conn = Connection::open(db.path()).unwrap();
-        conn.execute_batch(
-            r#"
-CREATE TABLE session (
-    session_id  TEXT PRIMARY KEY,
-    label       TEXT,
-    agent_model TEXT,
-    opened_at   INTEGER NOT NULL,
-    closed_at   INTEGER
-);
-
-CREATE TABLE request (
-    request_id    TEXT PRIMARY KEY,
-    session_id    TEXT NOT NULL REFERENCES session(session_id),
-    received_at   INTEGER NOT NULL,
-    request_json  TEXT NOT NULL,
-    decision_json TEXT NOT NULL
-);
-
-CREATE INDEX idx_request_session ON request(session_id, received_at);
-
-CREATE TABLE grant_log (
-    jti         TEXT PRIMARY KEY,
-    request_id  TEXT NOT NULL REFERENCES request(request_id),
-    session_id  TEXT NOT NULL REFERENCES session(session_id),
-    scope_json  TEXT NOT NULL,
-    issued_at   INTEGER NOT NULL,
-    expires_at  INTEGER NOT NULL
-);
-
-CREATE INDEX idx_grant_session ON grant_log(session_id, issued_at);
-"#,
-        )
-        .unwrap();
-        drop(conn);
-
-        let log = AuditLog::open(db.path()).unwrap();
-        assert!(!column_exists(&log, "request", "mint_failure_json"));
-        assert!(column_exists(&log, "mint_failure", "failure_json"));
-        assert!(trigger_exists(&log, "request_requires_open_session"));
-        assert_eq!(read_user_version(&log), SCHEMA_VERSION);
-    }
-
-    #[test]
-    fn open_rejects_partial_legacy_schema_without_fast_forwarding_version() {
-        let db = NamedTempFile::new().unwrap();
-        {
-            let conn = Connection::open(db.path()).unwrap();
-            conn.execute_batch(
-                r#"
-CREATE TABLE session (
-    session_id  TEXT PRIMARY KEY,
-    label       TEXT,
-    agent_model TEXT,
-    opened_at   INTEGER NOT NULL,
-    closed_at   INTEGER
-);
-"#,
-            )
-            .unwrap();
-        }
-
-        let err = AuditLog::open(db.path()).unwrap_err();
-        assert!(
-            matches!(err, AuditError::PartialLegacySchema),
-            "expected PartialLegacySchema, got: {err:?}"
-        );
-
-        let conn = Connection::open(db.path()).unwrap();
-        assert_eq!(
-            user_version(&conn).unwrap(),
-            0,
-            "partial legacy schema must not be fast-forwarded"
-        );
-    }
-
     /// A DB written by a future broker will carry a user_version beyond
     /// what this binary knows. Refuse to open rather than risk silently
     /// ignoring columns the newer schema relies on.
@@ -2106,33 +1880,5 @@ CREATE TABLE session (
             }
             other => panic!("expected SchemaTooNew, got {other:?}"),
         }
-    }
-
-    /// If a migration fails partway (process killed, disk full), the
-    /// next open must resume from the last successfully-committed version
-    /// rather than replay already-applied DDL. Each migration commits
-    /// its version bump in the same transaction as its DDL, so version
-    /// and schema can't disagree across restarts.
-    #[test]
-    fn partial_migration_resumes_from_last_committed_version() {
-        let db = NamedTempFile::new().unwrap();
-        {
-            // Apply migration 1 only, by running it directly and stopping.
-            let mut c = Connection::open(db.path()).unwrap();
-            c.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
-            let tx = c.transaction().unwrap();
-            tx.execute_batch(MIGRATIONS[0].sql).unwrap();
-            tx.pragma_update(None, "user_version", MIGRATIONS[0].version)
-                .unwrap();
-            tx.commit().unwrap();
-        }
-
-        let log = AuditLog::open(db.path()).unwrap();
-        // Every migration past the stopping point should have been
-        // applied on open.
-        assert_eq!(read_user_version(&log), SCHEMA_VERSION);
-        assert!(!column_exists(&log, "request", "mint_failure_json"));
-        assert!(column_exists(&log, "mint_failure", "failure_json"));
-        assert!(trigger_exists(&log, "request_requires_open_session"));
     }
 }
