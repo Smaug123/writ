@@ -27,11 +27,11 @@ use crate::core::{
 };
 use crate::secret::{SecretError, SecretKey, SecretStore};
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 
 fn default_api_base() -> String {
     "https://api.github.com".into()
 }
-use thiserror::Error;
 
 /// How long we ask the JWT to live. GitHub rejects anything over 10 minutes;
 /// leave a minute of headroom.

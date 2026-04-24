@@ -111,6 +111,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             };
             match call(&socket_path, &msg)? {
                 ServerMessage::SessionOpened { session_id } => println!("{session_id}"),
+                ServerMessage::Error { message } => return Err(message.into()),
                 other => return Err(format!("unexpected response: {other:?}").into()),
             }
         }
@@ -122,6 +123,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let msg = ClientMessage::CloseSession { session_id: id };
             match call(&socket_path, &msg)? {
                 ServerMessage::SessionClosed => {}
+                ServerMessage::Error { message } => return Err(message.into()),
                 other => return Err(format!("unexpected response: {other:?}").into()),
             }
         }
@@ -141,7 +143,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             };
 
             match call(&socket_path, &msg)? {
-                ServerMessage::TokenGranted { token, .. } => print!("{token}"),
+                ServerMessage::TokenGranted { token, .. } => println!("{token}"),
                 ServerMessage::Denied { reason } => return Err(format!("denied: {reason}").into()),
                 ServerMessage::Error { message } => return Err(message.into()),
                 other => return Err(format!("unexpected response: {other:?}").into()),

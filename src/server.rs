@@ -277,7 +277,7 @@ pub async fn run<S: SecretStore + Send + Sync + 'static>(
     // Try to connect to the existing socket. A successful connection means
     // another writd is alive; refuse to displace it. A failed connection
     // means the socket file (if any) is stale; remove it and bind fresh.
-    if let Ok(_probe) = std::os::unix::net::UnixStream::connect(socket_path) {
+    if UnixStream::connect(socket_path).await.is_ok() {
         return Err(io::Error::new(
             io::ErrorKind::AddrInUse,
             format!(
@@ -638,10 +638,8 @@ mod tests {
         tokio::spawn(async move {
             let _ = run(&path_clone, state_clone).await;
         });
-        // Give the listener time to bind
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
-        let stream = UnixStream::connect(&sock_path).await.unwrap();
+        let stream = connect_with_retries(&sock_path).await;
         let (reader, mut writer) = stream.into_split();
         let mut lines = BufReader::new(reader).lines();
 
@@ -687,6 +685,24 @@ mod tests {
         {
             ServerMessage::SessionOpened { session_id } => session_id,
             other => panic!("open_session failed: {other:?}"),
+        }
+    }
+
+    /// Wait for the spawned listener to finish binding. A short retry
+    /// loop beats `sleep(N)` because it succeeds the moment the bind
+    /// completes (fast path on unloaded CI) and still bounds the total
+    /// wait so a bug in `run()` surfaces as a test failure rather than
+    /// a hang.
+    async fn connect_with_retries(sock_path: &Path) -> UnixStream {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            match UnixStream::connect(sock_path).await {
+                Ok(s) => return s,
+                Err(_) if std::time::Instant::now() < deadline => {
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+                Err(e) => panic!("listener never came up at {}: {e}", sock_path.display()),
+            }
         }
     }
 }
