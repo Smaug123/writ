@@ -13,15 +13,15 @@ inspection.
 
 ## Where to start
 
-1. **[Getting started](getting-started.md)** — create a GitHub App,
+1. **[Getting started](./docs/user_facing/getting-started.md)** — create a GitHub App,
    install the daemon, make your first request.
-2. **[Configuration](configuration.md)** — `config.json` reference,
+2. **[Configuration](./docs/user_facing/configuration.md)** — `config.json` reference,
    default paths, secret-store options.
-3. **[CLI reference](cli-reference.md)** — every flag for `writ` and
+3. **[CLI reference](./docs/user_facing/cli-reference.md)** — every flag for `writ` and
    `writd`, with examples you can paste into an agent prompt.
-4. **[Policy](policy.md)** — when requests are granted, when they are
+4. **[Policy](./docs/user_facing/policy.md)** — when requests are granted, when they are
    denied, and how to expand the writable-repo allowlist.
-5. **[Audit log](audit-log.md)** — the SQLite schema, useful queries,
+5. **[Audit log](./docs/user_facing/audit-log.md)** — the SQLite schema, useful queries,
    and how to reconstruct what an agent did.
 
 ## What writ is not (today)
