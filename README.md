@@ -1,4 +1,4 @@
-# writ — user docs
+# writ
 
 `writ` is a local capability broker for coding agents. Instead of giving an
 agent a long-lived GitHub Personal Access Token, you run a small daemon
