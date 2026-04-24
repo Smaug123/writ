@@ -96,14 +96,25 @@ async fn dispatch_capability<S: SecretStore + Send + Sync>(
     capability: CapabilityRequest,
     state: &Arc<BrokerState<S>>,
 ) -> ServerMessage {
-    // Validate the session exists before minting anything. If we didn't
-    // check and later discovered the FK violation at audit-write time,
-    // the token would already be live with no audit row — the worst
-    // possible outcome for audit integrity.
+    // Validate the session exists *and* is still open before minting
+    // anything. If we didn't check and later discovered the FK violation
+    // (or session-closed invariant violation) at audit-write time, the
+    // token would already be live with no audit row — the worst possible
+    // outcome for audit integrity. The audit layer also re-checks
+    // "session is open" inside its own transaction because the minter's
+    // `await` gives a window in which CloseSession can land between here
+    // and there; that check is the authoritative one, this one just
+    // avoids a wasted mint in the common (non-racy) case and produces a
+    // cleaner error message for the client.
     match state.audit.get_session(session_id) {
         Ok(None) => {
             return ServerMessage::Error {
                 message: format!("unknown session {session_id}"),
+            };
+        }
+        Ok(Some(s)) if s.closed_at.is_some() => {
+            return ServerMessage::Error {
+                message: format!("session {session_id} is closed"),
             };
         }
         Err(e) => {
@@ -483,6 +494,62 @@ mod tests {
         assert!(
             matches!(resp, ServerMessage::Denied { .. }),
             "expected Denied, got {resp:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn request_on_closed_session_returns_error_without_minting() {
+        // If a client closes the session and then tries to mint, the
+        // broker must reject rather than issue a credential and audit
+        // it against a session that is already "quiet" on paper. This
+        // covers the happy-path (non-racy) case where the close lands
+        // before dispatch_capability starts; the audit-layer check is
+        // what catches the rare race where close lands during the
+        // minter's await, exercised in audit.rs.
+        let server = MockServer::start().await;
+        let state = make_state(&server, vec![repo("o", "n")], "o");
+        // If dispatch_capability failed to reject a closed session and
+        // the minter was still hit, the lack of a mount would cause the
+        // request to fall through to a 404 and mask the bug we're
+        // checking. Belt-and-braces: mount a handler that panics so a
+        // minting attempt becomes loud.
+        Mock::given(method("POST"))
+            .and(path("/app/installations/999/access_tokens"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let session_id = open_session(&state).await;
+        let close_resp = dispatch_message(ClientMessage::CloseSession { session_id }, &state).await;
+        assert_eq!(close_resp, ServerMessage::SessionClosed);
+
+        let resp = dispatch_message(
+            ClientMessage::Request {
+                session_id,
+                capability: CapabilityRequest::GitHub(crate::core::GitHubRequest::Contents {
+                    access: GitHubAccess::Read,
+                    repo: repo("o", "n"),
+                }),
+            },
+            &state,
+        )
+        .await;
+
+        match resp {
+            ServerMessage::Error { message } => {
+                assert!(message.contains("closed"), "got: {message}");
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+
+        // No audit row should have been recorded for the post-close
+        // request attempt.
+        assert!(
+            state
+                .audit
+                .list_grants_for_session(session_id)
+                .unwrap()
+                .is_empty()
         );
     }
 

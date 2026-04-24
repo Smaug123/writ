@@ -12,10 +12,13 @@
 //! matters for audit-integrity claims.
 //!
 //! The `session` table carries open/close timestamps and is updated by
-//! `close_session`. Session lifecycle is a mutable record for
-//! convenience of querying, not an audit claim — the per-grant rows in
-//! `grant_log` are what get reconciled against observed side-effects,
-//! and those never move.
+//! `close_session`; `closed_at` moves from NULL to a fixed timestamp
+//! exactly once, and a `request` row can only be written while the
+//! referenced session is open. That constraint is what makes
+//! `closed_at` a meaningful upper bound on the session's activity
+//! window during post-hoc review — the per-grant rows in `grant_log`
+//! are what get reconciled against observed side-effects, and those
+//! never move.
 
 use std::path::Path;
 use std::sync::Mutex;
@@ -301,6 +304,32 @@ impl AuditLog {
 
         self.with_conn_mut(|c| {
             let tx = c.transaction()?;
+
+            // A request can only be audited against an open session.
+            // `dispatch_capability` also checks this before minting, but
+            // the mint step awaits the network, so the session may have
+            // closed between that check and this transaction; the
+            // authoritative check lives here, inside the same tx as the
+            // INSERTs. Without it, a client could CloseSession and
+            // continue minting credentials on the same session ID, with
+            // audit rows landing after the session's own close timestamp
+            // — which would silently strip `closed_at` of its meaning as
+            // an activity-window bound. The existing FK covers "session
+            // exists"; it cannot express "session is open", which is why
+            // this check exists at all.
+            let session_closed_at: Option<Option<i64>> = tx
+                .query_row(
+                    "SELECT closed_at FROM session WHERE session_id = ?1",
+                    params![r.session_id.as_uuid().to_string()],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            match session_closed_at {
+                None => return Err(AuditError::Invariant("session does not exist")),
+                Some(Some(_)) => return Err(AuditError::Invariant("session is closed")),
+                Some(None) => {}
+            }
+
             tx.execute(
                 "INSERT INTO request (
                      request_id,
@@ -501,7 +530,7 @@ struct Migration {
 /// a version higher than this is rejected with [`AuditError::SchemaTooNew`]
 /// rather than opened — we'd rather fail to start than silently drop data
 /// into a schema a newer broker wrote.
-const SCHEMA_VERSION: i32 = 2;
+const SCHEMA_VERSION: i32 = 3;
 
 /// The full migration history. Each entry documents exactly one state
 /// transition; the sequence of entries is the schema's lineage. Order
@@ -543,6 +572,28 @@ CREATE INDEX idx_grant_session ON grant_log(session_id, issued_at);
     Migration {
         version: 2,
         sql: "ALTER TABLE request ADD COLUMN mint_failure_json TEXT;",
+    },
+    // Belt-and-braces for the session-open check in `record`: the FK
+    // from `request(session_id)` to `session(session_id)` ensures the
+    // referenced session exists, but cannot express "is open". A
+    // BEFORE-INSERT trigger raises SQLITE_CONSTRAINT_TRIGGER if the
+    // session has already been closed, so any writer that reaches the
+    // `request` table (including callers that bypass `AuditLog::record`)
+    // is stopped at the DB boundary instead of silently corrupting the
+    // activity-window bound that `closed_at` is supposed to provide.
+    Migration {
+        version: 3,
+        sql: r#"
+CREATE TRIGGER request_requires_open_session
+BEFORE INSERT ON request
+WHEN EXISTS (
+    SELECT 1 FROM session
+    WHERE session_id = NEW.session_id AND closed_at IS NOT NULL
+)
+BEGIN
+    SELECT RAISE(ABORT, 'session is closed');
+END;
+"#,
     },
 ];
 
@@ -1476,6 +1527,183 @@ mod tests {
         assert!(matches!(err, AuditError::Invariant(_)));
     }
 
+    /// A closed session must not accumulate further audit rows —
+    /// otherwise its `closed_at` no longer bounds the session's
+    /// activity window, which is the whole point of recording a close
+    /// timestamp. The check has to live inside `record`'s transaction
+    /// (belt) and inside a DB trigger (braces); this exercise covers
+    /// the belt.
+    #[test]
+    fn record_rejects_write_against_closed_session() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+        log.close_session(s.session_id, UnixMillis::from_millis(1_700_000_050))
+            .unwrap();
+
+        let request_id = RequestId::new();
+        let req = sample_request();
+        let scope = sample_scope();
+        let decision = PolicyDecision::Grant {
+            scope: scope.clone(),
+            ttl: TtlSeconds::new(300).unwrap(),
+        };
+        let grant = CredentialGrant {
+            jti: Jti::new(),
+            request_id,
+            session_id: s.session_id,
+            scope: scope.clone(),
+            issued_at: UnixMillis::from_millis(1_700_000_100),
+            expires_at: UnixMillis::from_millis(1_700_000_400),
+        };
+        let err = log
+            .record(&AuditedRequest {
+                request_id,
+                session_id: s.session_id,
+                received_at: UnixMillis::from_millis(1_700_000_100),
+                request: &req,
+                decision: &decision,
+                grant_outcome: GrantOutcome::Granted(&grant),
+            })
+            .unwrap_err();
+        assert!(
+            matches!(err, AuditError::Invariant("session is closed")),
+            "got: {err:?}"
+        );
+
+        // Neither table must carry the would-be audit row.
+        assert!(
+            log.list_grants_for_session(s.session_id)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(log.get_grant(grant.jti).unwrap().is_none());
+    }
+
+    /// Same rule applies to Deny and MintFailed audit rows: a closed
+    /// session must not accumulate any new rows, not just grant rows.
+    /// If it could, a denied post-close request would land as a normal
+    /// audit row despite the session already being "quiet" on paper.
+    #[test]
+    fn record_rejects_deny_against_closed_session() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+        log.close_session(s.session_id, UnixMillis::from_millis(1_700_000_050))
+            .unwrap();
+
+        let req = sample_request();
+        let decision = PolicyDecision::Deny {
+            reason: "any".into(),
+        };
+        let err = log
+            .record(&AuditedRequest {
+                request_id: RequestId::new(),
+                session_id: s.session_id,
+                received_at: UnixMillis::from_millis(1_700_000_100),
+                request: &req,
+                decision: &decision,
+                grant_outcome: GrantOutcome::NotMinted,
+            })
+            .unwrap_err();
+        assert!(
+            matches!(err, AuditError::Invariant("session is closed")),
+            "got: {err:?}"
+        );
+    }
+
+    /// Bypassing `record` (and therefore its in-transaction check) must
+    /// still be caught: the BEFORE-INSERT trigger on `request` raises
+    /// when the referenced session has `closed_at` set. This is the
+    /// "braces" to the application-layer belt — the DB refuses to hold
+    /// an audit row against a closed session even if the caller forgot
+    /// to check.
+    #[test]
+    fn trigger_rejects_direct_insert_against_closed_session() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+        log.close_session(s.session_id, UnixMillis::from_millis(1_700_000_050))
+            .unwrap();
+
+        let err = log
+            .with_conn(|c| {
+                c.execute(
+                    "INSERT INTO request (request_id, session_id, received_at, request_json, decision_json) \
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        RequestId::new().as_uuid().to_string(),
+                        s.session_id.as_uuid().to_string(),
+                        1_700_000_100_i64,
+                        "{}",
+                        "{}",
+                    ],
+                )?;
+                Ok(())
+            })
+            .unwrap_err();
+        let AuditError::Sqlite(e) = err else {
+            panic!("expected sqlite trigger error, got: {err:?}");
+        };
+        assert!(
+            e.to_string().to_lowercase().contains("session is closed"),
+            "expected trigger message, got: {e}"
+        );
+    }
+
+    /// An open session is still writable — a narrow regression test
+    /// that the new trigger's `WHEN` clause doesn't accidentally fire
+    /// when `closed_at IS NULL`.
+    #[test]
+    fn trigger_allows_insert_against_open_session() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+
+        log.with_conn(|c| {
+            c.execute(
+                "INSERT INTO request (request_id, session_id, received_at, request_json, decision_json) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    RequestId::new().as_uuid().to_string(),
+                    s.session_id.as_uuid().to_string(),
+                    1_700_000_100_i64,
+                    "{}",
+                    "{}",
+                ],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    /// A recorded audit row for an unknown session was previously
+    /// caught only by the FK; `record` now reports it explicitly so
+    /// the error is readable rather than leaking SQLite's message.
+    #[test]
+    fn record_rejects_write_against_nonexistent_session() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let phantom = SessionId::new();
+        let req = sample_request();
+        let decision = PolicyDecision::Deny {
+            reason: "any".into(),
+        };
+        let err = log
+            .record(&AuditedRequest {
+                request_id: RequestId::new(),
+                session_id: phantom,
+                received_at: UnixMillis::from_millis(1),
+                request: &req,
+                decision: &decision,
+                grant_outcome: GrantOutcome::NotMinted,
+            })
+            .unwrap_err();
+        assert!(
+            matches!(err, AuditError::Invariant("session does not exist")),
+            "got: {err:?}"
+        );
+    }
+
     fn read_user_version(log: &AuditLog) -> i32 {
         log.with_conn(user_version).unwrap()
     }
@@ -1495,11 +1723,24 @@ mod tests {
         .unwrap()
     }
 
+    fn trigger_exists(log: &AuditLog, name: &str) -> bool {
+        log.with_conn(|c| {
+            let count: i64 = c.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' AND name = ?1",
+                params![name],
+                |row| row.get(0),
+            )?;
+            Ok(count > 0)
+        })
+        .unwrap()
+    }
+
     #[test]
     fn fresh_install_is_at_current_schema_version() {
         let log = AuditLog::open_in_memory().unwrap();
         assert_eq!(read_user_version(&log), SCHEMA_VERSION);
         assert!(column_exists(&log, "request", "mint_failure_json"));
+        assert!(trigger_exists(&log, "request_requires_open_session"));
     }
 
     #[test]
@@ -1510,6 +1751,7 @@ mod tests {
         assert!(column_exists(&log, "session", "session_id"));
         assert!(column_exists(&log, "request", "mint_failure_json"));
         assert!(column_exists(&log, "grant_log", "jti"));
+        assert!(trigger_exists(&log, "request_requires_open_session"));
     }
 
     #[test]
@@ -1571,6 +1813,7 @@ CREATE INDEX idx_grant_session ON grant_log(session_id, issued_at);
 
         let log = AuditLog::open(db.path()).unwrap();
         assert!(column_exists(&log, "request", "mint_failure_json"));
+        assert!(trigger_exists(&log, "request_requires_open_session"));
         assert_eq!(read_user_version(&log), SCHEMA_VERSION);
     }
 
@@ -1650,8 +1893,10 @@ CREATE TABLE session (
         }
 
         let log = AuditLog::open(db.path()).unwrap();
-        // Migration 2 should have been applied on open.
+        // Every migration past the stopping point should have been
+        // applied on open.
         assert_eq!(read_user_version(&log), SCHEMA_VERSION);
         assert!(column_exists(&log, "request", "mint_failure_json"));
+        assert!(trigger_exists(&log, "request_requires_open_session"));
     }
 }
