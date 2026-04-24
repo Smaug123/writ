@@ -15,7 +15,7 @@ use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
 use crate::audit::{AuditLog, PreMintRecord};
@@ -209,14 +209,93 @@ async fn dispatch_capability<S: SecretStore + Send + Sync>(
     }
 }
 
+/// Maximum bytes we will buffer for a single newline-terminated request.
+/// An honest ClientMessage is a few hundred bytes (a long label plus a
+/// GitHubRequest); 64 KiB is three orders of magnitude above that. The
+/// cap exists so a peer that opens a connection and writes
+/// non-newline-terminated data can't make the broker allocate without
+/// bound — without it, `read_until(b'\n')` grows the buffer until the
+/// process OOMs.
+const MAX_LINE_BYTES: usize = 64 * 1024;
+
+/// Maximum idle time between reads on a connection. The CLI sends one
+/// message and reads one reply, so a healthy peer never approaches
+/// this. A stalled peer that connects and then goes quiet would
+/// otherwise pin a tokio task and an fd forever.
+const IDLE_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Read one newline-terminated line from `reader`, failing with
+/// `InvalidData` if the line would exceed `max` bytes (exclusive of the
+/// terminator). Returns `Ok(None)` on clean EOF before any bytes are
+/// seen, mirroring `AsyncBufReadExt::read_line`'s convention.
+async fn read_line_bounded<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    max: usize,
+) -> io::Result<Option<Vec<u8>>> {
+    let mut buf = Vec::new();
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            return Ok(if buf.is_empty() { None } else { Some(buf) });
+        }
+        if let Some(i) = available.iter().position(|&b| b == b'\n') {
+            if buf.len() + i > max {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("request line exceeds {max}-byte limit"),
+                ));
+            }
+            buf.extend_from_slice(&available[..i]);
+            reader.consume(i + 1);
+            if buf.last() == Some(&b'\r') {
+                buf.pop();
+            }
+            return Ok(Some(buf));
+        }
+        let len = available.len();
+        if buf.len() + len > max {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("request line exceeds {max}-byte limit"),
+            ));
+        }
+        buf.extend_from_slice(available);
+        reader.consume(len);
+    }
+}
+
 async fn handle_connection<S: SecretStore + Send + Sync + 'static>(
     stream: UnixStream,
     state: Arc<BrokerState<S>>,
 ) -> io::Result<()> {
     let (reader, mut writer) = stream.into_split();
-    let mut lines = BufReader::new(reader).lines();
-    while let Some(line) = lines.next_line().await? {
-        let response = match serde_json::from_str::<ClientMessage>(&line) {
+    let mut reader = BufReader::new(reader);
+    loop {
+        let read = tokio::time::timeout(
+            IDLE_READ_TIMEOUT,
+            read_line_bounded(&mut reader, MAX_LINE_BYTES),
+        )
+        .await;
+        let bytes = match read {
+            // Idle peer: close rather than hold the task open indefinitely.
+            Err(_elapsed) => return Ok(()),
+            Ok(Ok(Some(b))) => b,
+            Ok(Ok(None)) => return Ok(()),
+            Ok(Err(e)) if e.kind() == io::ErrorKind::InvalidData => {
+                // Oversize line: send a structured error back so the CLI
+                // surfaces something actionable, then close.
+                let resp = ServerMessage::Error {
+                    message: e.to_string(),
+                };
+                let mut json =
+                    serde_json::to_string(&resp).expect("ServerMessage always serializes");
+                json.push('\n');
+                let _ = writer.write_all(json.as_bytes()).await;
+                return Ok(());
+            }
+            Ok(Err(e)) => return Err(e),
+        };
+        let response = match serde_json::from_slice::<ClientMessage>(&bytes) {
             Err(e) => ServerMessage::Error {
                 message: format!("invalid request: {e}"),
             },
@@ -226,7 +305,70 @@ async fn handle_connection<S: SecretStore + Send + Sync + 'static>(
         json.push('\n');
         writer.write_all(json.as_bytes()).await?;
     }
-    Ok(())
+}
+
+/// Bind the listener, handling the stale-socket case safely.
+///
+/// Order matters: we attempt the bind first. If it fails with
+/// `AddrInUse`, only then do we probe for liveness. This is deliberate
+/// — probing first and then removing the file has a TOCTOU window where
+/// another `writd` could bind between our liveness check and our
+/// `remove_file`, and we'd delete the live daemon's socket. By
+/// attempting the bind first, the kernel adjudicates: if someone else
+/// is already bound, our `bind` fails, and we only rewrite the
+/// filesystem if the existing socket is confirmed stale.
+///
+/// A residual race remains: between confirming staleness (connect
+/// fails) and removing the file, a new `writd` could start and bind.
+/// Our `remove_file` would then delete its socket. The retry bind
+/// immediately after would fail with `AddrInUse` (the other daemon is
+/// still listening on the inode, even after the dentry was unlinked),
+/// and we return the error. The other daemon's socket *file* is gone
+/// but its listening socket is still serving — operator intervention
+/// (restart the surviving daemon) is needed. This is strictly better
+/// than the probe-first ordering, which could delete a live socket
+/// *and* then succeed in rebinding, stealing the identity. A proper
+/// fix requires an flock-protected lock file; that's a larger change.
+async fn bind_socket(socket_path: &Path) -> io::Result<UnixListener> {
+    match UnixListener::bind(socket_path) {
+        Ok(l) => return Ok(l),
+        Err(e) if e.kind() != io::ErrorKind::AddrInUse => return Err(e),
+        Err(_) => {}
+    }
+
+    // AddrInUse: either a live daemon or a stale socket file. Probe.
+    if UnixStream::connect(socket_path).await.is_ok() {
+        return Err(io::Error::new(
+            io::ErrorKind::AddrInUse,
+            format!(
+                "another writd is already running at {}; \
+                 stop it before starting a new one",
+                socket_path.display()
+            ),
+        ));
+    }
+
+    // Only remove the path if it's actually a socket. A regular file at
+    // the configured socket path almost certainly means operator error;
+    // silently clobbering it would be surprising and destructive.
+    match std::fs::metadata(socket_path) {
+        Ok(m) if !m.file_type().is_socket() => {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!(
+                    "{} exists but is not a socket; refusing to remove it",
+                    socket_path.display()
+                ),
+            ));
+        }
+        Ok(_) => std::fs::remove_file(socket_path)?,
+        // Someone else cleaned up between probe and metadata — fine,
+        // just proceed to rebind.
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+
+    UnixListener::bind(socket_path)
 }
 
 /// Listen on `socket_path`, spawning a task per connection. Returns only
@@ -269,41 +411,7 @@ pub async fn run<S: SecretStore + Send + Sync + 'static>(
         }
     }
 
-    // Try to connect to the existing socket. A successful connection means
-    // another writd is alive; refuse to displace it. A failed connection
-    // means the socket file (if any) is stale; remove it and bind fresh.
-    if UnixStream::connect(socket_path).await.is_ok() {
-        return Err(io::Error::new(
-            io::ErrorKind::AddrInUse,
-            format!(
-                "another writd is already running at {}; \
-                 stop it before starting a new one",
-                socket_path.display()
-            ),
-        ));
-    }
-
-    // Only remove the path if it's actually a socket. A regular file at
-    // the configured socket path almost certainly means operator error;
-    // silently clobbering it would be surprising and destructive.
-    match std::fs::metadata(socket_path) {
-        Ok(m) if !m.file_type().is_socket() => {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                format!(
-                    "{} exists but is not a socket; refusing to remove it",
-                    socket_path.display()
-                ),
-            ));
-        }
-        Ok(_) => {
-            std::fs::remove_file(socket_path)?;
-        }
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e),
-    }
-
-    let listener = UnixListener::bind(socket_path)?;
+    let listener = bind_socket(socket_path).await?;
     loop {
         let (stream, _) = listener.accept().await?;
         let state = Arc::clone(&state);
@@ -681,6 +789,144 @@ mod tests {
             ServerMessage::SessionOpened { session_id } => session_id,
             other => panic!("open_session failed: {other:?}"),
         }
+    }
+
+    // --- Bounded read_line -----------------------------------------------
+
+    /// Normal line within the cap: reads cleanly, strips trailing `\r`.
+    #[tokio::test]
+    async fn read_line_bounded_reads_up_to_newline() {
+        let mut input = &b"hello\r\n"[..];
+        let line = read_line_bounded(&mut input, 64).await.unwrap().unwrap();
+        assert_eq!(&line, b"hello");
+    }
+
+    /// EOF before any bytes is `Ok(None)`, matching AsyncBufReadExt::read_line.
+    #[tokio::test]
+    async fn read_line_bounded_returns_none_on_clean_eof() {
+        let mut input: &[u8] = b"";
+        assert!(read_line_bounded(&mut input, 64).await.unwrap().is_none());
+    }
+
+    /// EOF after bytes but without a newline yields whatever was read —
+    /// lets the caller decide whether a final unterminated frame is an
+    /// error (our caller treats the JSON parse failure as the error).
+    #[tokio::test]
+    async fn read_line_bounded_returns_partial_on_eof_without_newline() {
+        let mut input = &b"abc"[..];
+        let line = read_line_bounded(&mut input, 64).await.unwrap().unwrap();
+        assert_eq!(&line, b"abc");
+    }
+
+    /// A line exceeding the cap (even without a newline) is rejected
+    /// rather than buffered to completion — that's the whole point of
+    /// the cap.
+    #[tokio::test]
+    async fn read_line_bounded_rejects_oversize_without_newline() {
+        let big = vec![b'x'; 128];
+        let mut input = big.as_slice();
+        let err = read_line_bounded(&mut input, 64).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    /// Oversize with a newline also rejects, and does so without having
+    /// grown the internal buffer past the cap.
+    #[tokio::test]
+    async fn read_line_bounded_rejects_oversize_with_newline() {
+        let mut big = vec![b'x'; 128];
+        big.push(b'\n');
+        let mut input = big.as_slice();
+        let err = read_line_bounded(&mut input, 64).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    /// After the cap is hit, the connection-level handler reports a
+    /// structured error to the peer so a CLI surfaces something
+    /// actionable rather than a mystery-close.
+    #[tokio::test]
+    async fn oversize_request_over_socket_returns_structured_error() {
+        let server = MockServer::start().await;
+        let state = make_state(&server, vec![], "o");
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let sock_path = dir.path().join("test.sock");
+
+        let state_clone = Arc::clone(&state);
+        let path_clone = sock_path.clone();
+        tokio::spawn(async move {
+            let _ = run(&path_clone, state_clone).await;
+        });
+
+        let stream = connect_with_retries(&sock_path).await;
+        let (reader, mut writer) = stream.into_split();
+        let mut lines = BufReader::new(reader).lines();
+
+        // Write > MAX_LINE_BYTES non-newline bytes, then a newline.
+        let oversize = vec![b'x'; MAX_LINE_BYTES + 1];
+        writer.write_all(&oversize).await.unwrap();
+        writer.write_all(b"\n").await.unwrap();
+
+        let reply = lines.next_line().await.unwrap().unwrap();
+        let msg: ServerMessage = serde_json::from_str(&reply).unwrap();
+        match msg {
+            ServerMessage::Error { message } => {
+                assert!(message.contains("exceeds"), "got: {message}");
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    // --- Socket bind handling -------------------------------------------
+
+    /// Fresh parent directory with no pre-existing socket file: bind succeeds.
+    #[tokio::test]
+    async fn bind_socket_succeeds_on_empty_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("w.sock");
+        let l = bind_socket(&sock).await.unwrap();
+        assert!(sock.exists());
+        drop(l);
+    }
+
+    /// A leftover socket file with no live listener (stale) is detected
+    /// (connect fails), cleaned up, and the rebind succeeds.
+    #[tokio::test]
+    async fn bind_socket_reclaims_stale_socket_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("w.sock");
+        {
+            // Bind, then drop the listener. The socket *file* lingers
+            // (Rust doesn't rm on drop) but nothing is listening.
+            let _listener = UnixListener::bind(&sock).unwrap();
+        }
+        assert!(sock.exists(), "precondition: stale socket file present");
+        let l = bind_socket(&sock).await.unwrap();
+        assert!(sock.exists());
+        drop(l);
+    }
+
+    /// A live listener at the path must be refused — we don't want two
+    /// daemons fighting over the same credential socket.
+    #[tokio::test]
+    async fn bind_socket_refuses_to_displace_live_listener() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("w.sock");
+        let _live = UnixListener::bind(&sock).unwrap();
+        let err = bind_socket(&sock).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AddrInUse);
+        assert!(err.to_string().contains("already running"), "got: {err}");
+    }
+
+    /// A regular file (not a socket) at the configured path is operator
+    /// error; refuse rather than silently deleting arbitrary files.
+    #[tokio::test]
+    async fn bind_socket_refuses_to_delete_non_socket_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("w.sock");
+        std::fs::write(&sock, b"not a socket").unwrap();
+        let err = bind_socket(&sock).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
     }
 
     /// Wait for the spawned listener to finish binding. A short retry

@@ -571,7 +571,7 @@ struct Migration {
 /// a version higher than this is rejected with [`AuditError::SchemaTooNew`]
 /// rather than opened — we'd rather fail to start than silently drop data
 /// into a schema a newer broker wrote.
-const SCHEMA_VERSION: i32 = 4;
+const SCHEMA_VERSION: i32 = 5;
 
 /// The full migration history. Each entry documents exactly one state
 /// transition; the sequence of entries is the schema's lineage. Order
@@ -666,6 +666,17 @@ BEGIN
     SELECT RAISE(ABORT, 'mint failure already recorded for this request');
 END;
 "#,
+    },
+    // `mint_failure_json` on `request` is vestigial: migration 2 added it
+    // when the mint outcome was packed into the same row, and migration 4
+    // moved that outcome into its own `mint_failure` table. No code has
+    // written or read the column since — `record_mint_failure` targets
+    // the new table exclusively. Drop it now, while the schema is still
+    // pre-release and no operator has real audit data depending on it,
+    // so future readers don't puzzle over an unused column.
+    Migration {
+        version: 5,
+        sql: "ALTER TABLE request DROP COLUMN mint_failure_json;",
     },
 ];
 
@@ -1960,6 +1971,9 @@ mod tests {
         assert!(trigger_exists(&log, "request_requires_open_session"));
         assert!(trigger_exists(&log, "mint_failure_excludes_grant"));
         assert!(trigger_exists(&log, "grant_excludes_mint_failure"));
+        // Vestigial column dropped in migration 5; assert it's gone so a
+        // future resurrection of the old name is caught loudly.
+        assert!(!column_exists(&log, "request", "mint_failure_json"));
     }
 
     #[test]
@@ -1993,7 +2007,7 @@ mod tests {
     /// detects this and brings it up to current without trying to
     /// re-create existing tables.
     #[test]
-    fn open_migrates_legacy_request_table_to_include_mint_failure_column() {
+    fn open_fast_forwards_legacy_v0_db_to_current_schema() {
         let db = NamedTempFile::new().unwrap();
         let conn = Connection::open(db.path()).unwrap();
         conn.execute_batch(
@@ -2032,7 +2046,7 @@ CREATE INDEX idx_grant_session ON grant_log(session_id, issued_at);
         drop(conn);
 
         let log = AuditLog::open(db.path()).unwrap();
-        assert!(column_exists(&log, "request", "mint_failure_json"));
+        assert!(!column_exists(&log, "request", "mint_failure_json"));
         assert!(column_exists(&log, "mint_failure", "failure_json"));
         assert!(trigger_exists(&log, "request_requires_open_session"));
         assert_eq!(read_user_version(&log), SCHEMA_VERSION);
@@ -2117,7 +2131,7 @@ CREATE TABLE session (
         // Every migration past the stopping point should have been
         // applied on open.
         assert_eq!(read_user_version(&log), SCHEMA_VERSION);
-        assert!(column_exists(&log, "request", "mint_failure_json"));
+        assert!(!column_exists(&log, "request", "mint_failure_json"));
         assert!(column_exists(&log, "mint_failure", "failure_json"));
         assert!(trigger_exists(&log, "request_requires_open_session"));
     }

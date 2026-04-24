@@ -183,12 +183,23 @@ fn build_capability(backend: BackendCmd) -> Result<CapabilityRequest, Box<dyn st
     Ok(CapabilityRequest::GitHub(github_req))
 }
 
+/// One request, one reply. If the broker takes longer than this to
+/// respond, something is wrong and the CLI should bail rather than
+/// hang a shell pipeline. 60s is already far above any healthy
+/// round-trip (the broker's own IDLE_READ_TIMEOUT is 60s, and a
+/// healthy request/reply is milliseconds).
+const CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 fn call(
     socket_path: &Path,
     msg: &ClientMessage,
 ) -> Result<ServerMessage, Box<dyn std::error::Error>> {
     let stream = UnixStream::connect(socket_path)
         .map_err(|e| format!("cannot connect to {}: {e}", socket_path.display()))?;
+    // Apply to both sides so a stuck broker can't wedge the CLI on
+    // either write or read.
+    stream.set_read_timeout(Some(CALL_TIMEOUT))?;
+    stream.set_write_timeout(Some(CALL_TIMEOUT))?;
 
     let mut line = serde_json::to_string(msg)?;
     line.push('\n');
