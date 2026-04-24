@@ -156,7 +156,7 @@ proptest! {
                 | GitHubRequest::Issues { access: GitHubAccess::Write, .. }
                 | GitHubRequest::PullRequests { access: GitHubAccess::Write, .. }
         );
-        let on_allowlist = writable.iter().any(|r| r == req.repo());
+        let on_allowlist = writable.iter().any(|r| r.matches(req.repo()));
 
         match decide(&wrapped, &policy) {
             PolicyDecision::Grant { .. } => {

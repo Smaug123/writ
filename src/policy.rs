@@ -278,4 +278,44 @@ mod tests {
         let json = r#"{"default_ttl": 99999, "writable_repos": []}"#;
         assert!(serde_json::from_str::<PolicyConfig>(json).is_err());
     }
+
+    // --- Property-based ---------------------------------------------------
+
+    proptest::proptest! {
+        /// Oracle test: for every pair of (allowlist entry, request repo),
+        /// `decide` must agree with `RepoRef::matches` — which is the
+        /// ground-truth definition of GitHub's case-insensitive identity.
+        /// Using `[a-zA-Z]` patterns ensures that `matches` and `==` can
+        /// diverge (pure lowercase patterns never produce that divergence).
+        #[test]
+        fn policy_write_decision_matches_case_insensitive_allowlist_oracle(
+            al_owner in "[a-zA-Z][a-zA-Z0-9-]{0,19}",
+            al_name  in "[a-zA-Z][a-zA-Z0-9_-]{0,19}",
+            rq_owner in "[a-zA-Z][a-zA-Z0-9-]{0,19}",
+            rq_name  in "[a-zA-Z][a-zA-Z0-9_-]{0,19}",
+        ) {
+            let allowlist_entry = repo(&al_owner, &al_name);
+            let request_repo    = repo(&rq_owner, &rq_name);
+            let expected_grant  = allowlist_entry.matches(&request_repo);
+
+            let policy = policy_with(vec![allowlist_entry.clone()]);
+            let req = CapabilityRequest::GitHub(GitHubRequest::Contents {
+                access: GitHubAccess::Write,
+                repo: request_repo.clone(),
+            });
+
+            if expected_grant {
+                let scope = expect_grant(decide(&req, &policy));
+                // Granted scope carries the request's exact casing.
+                proptest::prop_assert_eq!(&scope.repository, &request_repo);
+                // And matches the allowlist entry under GitHub semantics.
+                proptest::prop_assert!(scope.repository.matches(&allowlist_entry));
+            } else {
+                proptest::prop_assert!(
+                    matches!(decide(&req, &policy), PolicyDecision::Deny { .. }),
+                    "write on non-matching repo must be denied"
+                );
+            }
+        }
+    }
 }

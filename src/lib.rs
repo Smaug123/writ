@@ -5,7 +5,10 @@
 //! See `docs/design/broker.md` for the architecture overview.
 
 pub mod audit;
+pub mod config;
 pub mod core;
 pub mod github;
 pub mod policy;
+pub mod protocol;
 pub mod secret;
+pub mod server;

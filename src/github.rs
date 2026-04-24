@@ -29,6 +29,10 @@ use crate::secret::{SecretError, SecretKey, SecretStore};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+fn default_api_base() -> String {
+    "https://api.github.com".into()
+}
+
 /// How long we ask the JWT to live. GitHub rejects anything over 10 minutes;
 /// leave a minute of headroom.
 const JWT_LIFETIME_SECONDS: i64 = 9 * 60;
@@ -46,7 +50,7 @@ const TTL_SKEW_TOLERANCE_SECONDS: i64 = 60;
 
 /// Static configuration for one GitHub App installation. One broker
 /// instance fronts one installation in v1.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct GitHubAppConfig {
     pub app_id: u64,
     pub installation_id: u64,
@@ -63,8 +67,9 @@ pub struct GitHubAppConfig {
     /// broker's `SecretStore`. The broker never reads the key from disk
     /// or env directly — that's the secret store's job.
     pub private_key_secret: SecretKey,
-    /// Base URL of the GitHub REST API, without trailing slash. Overridable
-    /// for tests (wiremock) or GitHub Enterprise Server.
+    /// Base URL of the GitHub REST API, without trailing slash. Defaults
+    /// to the public GitHub API; override for GitHub Enterprise Server.
+    #[serde(default = "default_api_base")]
     pub api_base: String,
 }
 

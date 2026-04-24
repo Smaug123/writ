@@ -13,6 +13,7 @@ mod keyring_store;
 pub use file::FileSecretStore;
 pub use keyring_store::KeyringSecretStore;
 
+use serde::Deserialize;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -79,6 +80,15 @@ impl std::fmt::Display for SecretKey {
     }
 }
 
+/// Parse-don't-validate: run the same checks `new` performs so a config
+/// file with an invalid key name fails at load time, not at first use.
+impl<'de> Deserialize<'de> for SecretKey {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        Self::new(s).map_err(serde::de::Error::custom)
+    }
+}
+
 /// Backing store for long-lived secrets. Implementations must be safe to
 /// share across threads.
 pub trait SecretStore: Send + Sync {
@@ -91,6 +101,21 @@ pub trait SecretStore: Send + Sync {
 
     /// Remove `key`. Deleting a missing key is a no-op (returns `Ok(())`).
     fn delete(&self, key: &SecretKey) -> Result<(), SecretError>;
+}
+
+/// Allows the daemon to hold a `Box<dyn SecretStore>` when the backend
+/// is chosen at runtime from config, without having to monomorphise the
+/// entire server stack twice.
+impl SecretStore for Box<dyn SecretStore> {
+    fn get(&self, key: &SecretKey) -> Result<Option<String>, SecretError> {
+        (**self).get(key)
+    }
+    fn put(&self, key: &SecretKey, value: &str) -> Result<(), SecretError> {
+        (**self).put(key, value)
+    }
+    fn delete(&self, key: &SecretKey) -> Result<(), SecretError> {
+        (**self).delete(key)
+    }
 }
 
 #[cfg(test)]
