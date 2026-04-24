@@ -18,7 +18,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
-use crate::audit::{AuditLog, AuditedRequest, GrantOutcome};
+use crate::audit::{AuditLog, PreMintRecord};
 use crate::core::{
     CapabilityRequest, GrantedScope, PolicyDecision, RequestId, SessionId, SessionRecord,
     TtlSeconds, UnixMillis,
@@ -96,16 +96,13 @@ async fn dispatch_capability<S: SecretStore + Send + Sync>(
     capability: CapabilityRequest,
     state: &Arc<BrokerState<S>>,
 ) -> ServerMessage {
-    // Validate the session exists *and* is still open before minting
-    // anything. If we didn't check and later discovered the FK violation
-    // (or session-closed invariant violation) at audit-write time, the
-    // token would already be live with no audit row — the worst possible
-    // outcome for audit integrity. The audit layer also re-checks
-    // "session is open" inside its own transaction because the minter's
-    // `await` gives a window in which CloseSession can land between here
-    // and there; that check is the authoritative one, this one just
-    // avoids a wasted mint in the common (non-racy) case and produces a
-    // cleaner error message for the client.
+    // Preflight the session for a readable client error. The
+    // authoritative check runs inside `record_pre_mint`'s transaction
+    // (and the `request_requires_open_session` trigger behind it) —
+    // without that, a CloseSession racing this check would land before
+    // the insert and we'd write against a closed session. This preflight
+    // only exists so the common "session is gone" case returns a clean
+    // message instead of leaking the generic audit-invariant string.
     match state.audit.get_session(session_id) {
         Ok(None) => {
             return ServerMessage::Error {
@@ -129,25 +126,33 @@ async fn dispatch_capability<S: SecretStore + Send + Sync>(
     let received_at = UnixMillis::now();
     let decision = policy::decide(&capability, &state.policy);
 
+    // Pre-record the request + decision *before* we await the backend
+    // mint. If we recorded only on the way back out, a crash (or a
+    // CloseSession that lands during the await and trips the
+    // session-closed check) would leave the broker having minted a
+    // credential with no audit trail — a direct violation of the
+    // "every request/decision is append-only audited" invariant in
+    // docs/design/broker.md. With pre-recording, the request row
+    // commits before any network I/O; the grant or mint-failure is
+    // appended once the mint completes.
+    if let Err(e) = state.audit.record_pre_mint(&PreMintRecord {
+        request_id,
+        session_id,
+        received_at,
+        request: &capability,
+        decision: &decision,
+    }) {
+        return ServerMessage::Error {
+            message: format!("request could not be recorded: {e}"),
+        };
+    }
+
     // Early-return on Deny: no await point follows, so the &decision
     // borrow is trivially scoped.
     if let PolicyDecision::Deny { reason } = &decision {
-        let reason = reason.clone();
-        if let Err(e) = state.audit.record(&AuditedRequest {
-            request_id,
-            session_id,
-            received_at,
-            request: &capability,
-            decision: &decision,
-            grant_outcome: GrantOutcome::NotMinted,
-        }) {
-            return ServerMessage::Error {
-                message: format!(
-                    "policy denied the request but the denial could not be recorded: {e}"
-                ),
-            };
-        }
-        return ServerMessage::Denied { reason };
+        return ServerMessage::Denied {
+            reason: reason.clone(),
+        };
     }
 
     // Decision is Grant. Extract scope/ttl (cloning) before the await
@@ -168,14 +173,7 @@ async fn dispatch_capability<S: SecretStore + Send + Sync>(
         Ok(minted) => {
             let expires_at = minted.expires_at();
             let (token, grant) = minted.into_grant_and_token(request_id, session_id);
-            if let Err(e) = state.audit.record(&AuditedRequest {
-                request_id,
-                session_id,
-                received_at,
-                request: &capability,
-                decision: &decision,
-                grant_outcome: GrantOutcome::Granted(&grant),
-            }) {
+            if let Err(e) = state.audit.record_grant(&grant) {
                 // The audit log is the system of record. Delivering a token
                 // that isn't recorded would violate the broker's core
                 // invariant ("no unaudited grant"). The minted token is
@@ -194,14 +192,11 @@ async fn dispatch_capability<S: SecretStore + Send + Sync>(
 
         Err(e) => {
             let error_str = e.to_string();
-            if let Err(ae) = state.audit.record(&AuditedRequest {
-                request_id,
-                session_id,
-                received_at,
-                request: &capability,
-                decision: &decision,
-                grant_outcome: GrantOutcome::MintFailed { error: &error_str },
-            }) {
+            if let Err(ae) =
+                state
+                    .audit
+                    .record_mint_failure(request_id, UnixMillis::now(), &error_str)
+            {
                 return ServerMessage::Error {
                     message: format!(
                         "mint failed and the failure could not be recorded: {ae} \

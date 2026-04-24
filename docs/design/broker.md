@@ -146,8 +146,7 @@ CREATE TABLE request (
   session_id    TEXT NOT NULL REFERENCES session(session_id),
   received_at   INTEGER NOT NULL,
   request_json  TEXT NOT NULL,
-  decision_json TEXT NOT NULL,
-  mint_failure_json TEXT
+  decision_json TEXT NOT NULL
 );
 
 -- `grant` is a SQL keyword in some dialects, so the table is named
@@ -160,7 +159,21 @@ CREATE TABLE grant_log (
   issued_at   INTEGER NOT NULL,
   expires_at  INTEGER NOT NULL
 );
+
+CREATE TABLE mint_failure (
+  request_id   TEXT PRIMARY KEY REFERENCES request(request_id),
+  failed_at    INTEGER NOT NULL,
+  failure_json TEXT NOT NULL
+);
 ```
+
+The broker writes in two phases: the `request` row commits *before* the
+backend mint is awaited, and the matching outcome (`grant_log` on success,
+`mint_failure` on failure) is appended once the mint completes. A crash
+between those two commits leaves the request row durable with no outcome
+row — an honest "in-flight at crash time" state that replay can recognise.
+Triggers enforce that a given `request_id` has at most one outcome row,
+so a request either succeeded or failed but never both.
 
 Append-only. Timestamps are unix **milliseconds** (matching the
 `UnixMillis` core type — millisecond resolution keeps parallel agent
