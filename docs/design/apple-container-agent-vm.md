@@ -327,6 +327,17 @@ if commit identity must be entirely broker-controlled.
 
 ## Tests and proof spikes
 
+First pure slice implemented in `src/core/agent_vm.rs`:
+
+- typed IPv4/IPv6 CIDRs with host-bit validation;
+- broker-managed agent network pools, with allocation as the only public path
+  to an `AgentNetwork`;
+- RFC1918 and ULA checks for pool bases;
+- broker port validation with explicit rejection of port 0;
+- structured PF ruleset descriptions plus a renderer;
+- property tests for host-bit rejection, subnet containment, allocation
+  injectivity, IPv4 `/24` stride, and rendered broker-port coverage.
+
 The next spike should run with a temporary internal network and a temporary PF
 anchor:
 
@@ -382,4 +393,3 @@ The confirmed pieces are:
 
 The unproven but plausible piece is the PF enforcement layer. That should be
 the next proof spike before implementing the full brokered agent runner.
-
