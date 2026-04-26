@@ -338,6 +338,10 @@ First pure slice implemented in `src/core/agent_vm.rs`:
 - property tests for host-bit rejection, subnet containment, allocation
   injectivity, IPv4 `/24` stride, and rendered broker-port coverage.
 
+The current `BrokerPort` type only proves "stable and unprivileged"; the
+privileged helper should add a configured `BrokerPortRange` check before
+loading PF rules.
+
 The next spike should run with a temporary internal network and a temporary PF
 anchor:
 

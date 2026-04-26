@@ -29,6 +29,11 @@ pub struct Ipv6Cidr {
     prefix: u8,
 }
 
+/// A broker listener port that is stable and unprivileged.
+///
+/// The privileged helper should later narrow this through a configured local
+/// range before installing PF rules; this type only excludes port 0 and
+/// privileged ports.
 #[derive(Copy, Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct BrokerPort(u16);
 
@@ -69,7 +74,6 @@ pub struct PfAnchorName(String);
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PfAllowRule {
     source: PfCidr,
-    destination_ports: BrokerPorts,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -85,6 +89,7 @@ pub struct PfDenyRule {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PfRuleset {
     anchor: PfAnchorName,
+    broker_ports: BrokerPorts,
     allow: Vec<PfAllowRule>,
     deny: Vec<PfDenyRule>,
 }
@@ -309,6 +314,14 @@ impl std::fmt::Display for PfCidr {
 
 impl PfAnchorName {
     fn for_session(session_id: SessionId) -> Self {
+        let session_id = session_id.to_string();
+        // `SessionId` is a UUID; its Display form is ASCII hex plus hyphens,
+        // so it is safe to use as one PF anchor path component.
+        debug_assert!(
+            session_id
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() || c == '-')
+        );
         Self(format!("writ/session/{session_id}"))
     }
 
@@ -318,11 +331,8 @@ impl PfAnchorName {
 }
 
 impl PfAllowRule {
-    fn new(source: PfCidr, destination_ports: BrokerPorts) -> Self {
-        Self {
-            source,
-            destination_ports,
-        }
+    fn new(source: PfCidr) -> Self {
+        Self { source }
     }
 
     pub fn family(&self) -> IpFamily {
@@ -331,10 +341,6 @@ impl PfAllowRule {
 
     pub fn source(&self) -> PfCidr {
         self.source
-    }
-
-    pub fn destination_ports(&self) -> &BrokerPorts {
-        &self.destination_ports
     }
 }
 
@@ -360,9 +366,15 @@ impl PfDenyRule {
 }
 
 impl PfRuleset {
-    fn new(anchor: PfAnchorName, allow: Vec<PfAllowRule>, deny: Vec<PfDenyRule>) -> Self {
+    fn new(
+        anchor: PfAnchorName,
+        broker_ports: BrokerPorts,
+        allow: Vec<PfAllowRule>,
+        deny: Vec<PfDenyRule>,
+    ) -> Self {
         Self {
             anchor,
+            broker_ports,
             allow,
             deny,
         }
@@ -370,6 +382,10 @@ impl PfRuleset {
 
     pub fn anchor(&self) -> &PfAnchorName {
         &self.anchor
+    }
+
+    pub fn broker_ports(&self) -> &BrokerPorts {
+        &self.broker_ports
     }
 
     pub fn allow(&self) -> &[PfAllowRule] {
@@ -386,12 +402,12 @@ pub fn session_pf_ruleset(
     network: AgentNetwork,
     broker_ports: &BrokerPorts,
 ) -> PfRuleset {
-    let ports = broker_ports.clone();
     PfRuleset::new(
         PfAnchorName::for_session(session_id),
+        broker_ports.clone(),
         vec![
-            PfAllowRule::new(PfCidr::Inet(network.ipv4()), ports.clone()),
-            PfAllowRule::new(PfCidr::Inet6(network.ipv6()), ports),
+            PfAllowRule::new(PfCidr::Inet(network.ipv4())),
+            PfAllowRule::new(PfCidr::Inet6(network.ipv6())),
         ],
         vec![
             PfDenyRule::new(PfCidr::Inet(network.ipv4()), "writ deny agent v4"),
@@ -402,12 +418,10 @@ pub fn session_pf_ruleset(
 
 pub fn render_pf(ruleset: &PfRuleset) -> String {
     let mut out = String::new();
-    if let Some(ports) = broker_ports_macro(ruleset) {
-        out.push_str(&format!(
-            "broker_ports = \"{{ {} }}\"\n\n",
-            ports.render_pf_set()
-        ));
-    }
+    out.push_str(&format!(
+        "broker_ports = \"{{ {} }}\"\n\n",
+        ruleset.broker_ports().render_pf_set()
+    ));
     for rule in ruleset.allow() {
         out.push_str(&format!(
             "pass in quick {} proto tcp from {} to any port $broker_ports keep state\n",
@@ -425,10 +439,6 @@ pub fn render_pf(ruleset: &PfRuleset) -> String {
         ));
     }
     out
-}
-
-fn broker_ports_macro(ruleset: &PfRuleset) -> Option<&BrokerPorts> {
-    ruleset.allow().first().map(PfAllowRule::destination_ports)
 }
 
 fn ipv4_mask(prefix: u8) -> u32 {
@@ -651,12 +661,19 @@ mod tests {
         ipv4_capacity.min(bounded_ipv6_capacity).min(65536)
     }
 
-    fn count_number_token(haystack: &str, needle: u16) -> usize {
-        let rendered = needle.to_string();
-        haystack
-            .split(|c: char| !c.is_ascii_digit())
-            .filter(|part| *part == rendered)
-            .count()
+    fn rendered_broker_ports(rendered: &str) -> Vec<u16> {
+        let line = rendered
+            .lines()
+            .find(|line| line.starts_with("broker_ports = "))
+            .expect("rendered PF rules should define broker_ports");
+        let ports = line
+            .strip_prefix("broker_ports = \"{ ")
+            .and_then(|rest| rest.strip_suffix(" }\""))
+            .expect("broker_ports macro should use the expected PF set syntax");
+        ports
+            .split(", ")
+            .map(|port| port.parse().unwrap())
+            .collect()
     }
 
     #[test]
@@ -749,6 +766,15 @@ mod tests {
             ruleset.anchor().as_str(),
             "writ/session/00000000-0000-0000-0000-000000000001",
         );
+        assert_eq!(
+            ruleset
+                .broker_ports()
+                .as_slice()
+                .iter()
+                .map(|p| p.get())
+                .collect::<Vec<_>>(),
+            vec![18080, 18081],
+        );
         assert_eq!(ruleset.allow().len(), 2);
         assert_eq!(ruleset.deny().len(), 2);
         assert_eq!(ruleset.allow()[0].source(), PfCidr::Inet(network.ipv4()));
@@ -828,9 +854,9 @@ mod tests {
             let ruleset = session_pf_ruleset(session_id(), network, &ports);
             let rendered = render_pf(&ruleset);
 
-            for port in ports.as_slice() {
-                prop_assert_eq!(count_number_token(&rendered, port.get()), 1);
-            }
+            let expected_ports = ports.as_slice().iter().map(|port| port.get()).collect::<Vec<_>>();
+            prop_assert_eq!(rendered_broker_ports(&rendered), expected_ports);
+            prop_assert_eq!(rendered.lines().filter(|line| line.starts_with("broker_ports = ")).count(), 1);
             prop_assert!(rendered.contains("port $broker_ports"));
         }
     }
