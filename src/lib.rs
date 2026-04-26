@@ -4,6 +4,7 @@
 //!
 //! See `docs/design/broker.md` for the architecture overview.
 
+pub mod agent_vm;
 pub mod audit;
 pub mod config;
 pub mod core;
