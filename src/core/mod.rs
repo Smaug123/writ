@@ -1,11 +1,17 @@
-//! Pure data types. No IO, no side effects. Everything here round-trips
-//! through serde and is safe to construct from tests.
+//! Pure data types. No IO, no side effects. Boundary types round-trip through
+//! serde; proof-carrying internal descriptions keep construction explicit.
 
+mod agent_vm;
 mod decision;
 mod grant;
 mod request;
 mod session;
 
+pub use agent_vm::{
+    AgentNetwork, AgentNetworkPool, AgentVmConfigError, BrokerPort, BrokerPorts, IpFamily,
+    Ipv4Cidr, Ipv6Cidr, PfAllowRule, PfAnchorName, PfCidr, PfDenyRule, PfRuleset, render_pf,
+    session_pf_ruleset,
+};
 pub use decision::{
     GitHubGrantedScope, GitHubPermissions, GrantedScope, MetadataAccess, PolicyDecision, TtlError,
     TtlSeconds,
