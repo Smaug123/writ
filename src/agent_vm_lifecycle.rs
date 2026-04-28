@@ -171,13 +171,19 @@ pub enum NetworkInspectionError {
 #[derive(Debug, thiserror::Error)]
 pub enum AgentVmLifecycleRunError {
     #[error(transparent)]
-    Start(#[from] StartFailure),
+    Start(Box<StartFailure>),
     #[error("start failed: {original}; cleanup also failed: {cleanup}")]
     CleanupAfterFailure {
         #[source]
-        original: StartFailure,
-        cleanup: CleanupErrors,
+        original: Box<StartFailure>,
+        cleanup: Box<CleanupErrors>,
     },
+}
+
+impl From<StartFailure> for AgentVmLifecycleRunError {
+    fn from(value: StartFailure) -> Self {
+        Self::Start(Box::new(value))
+    }
 }
 
 impl CleanupErrors {
@@ -748,7 +754,10 @@ fn fail_after_cleanup<T>(
 ) -> Result<T, AgentVmLifecycleRunError> {
     match run_cleanup(plan.cleanup_after_start_outcome(outcome)) {
         Ok(()) => Err(original.into()),
-        Err(cleanup) => Err(AgentVmLifecycleRunError::CleanupAfterFailure { original, cleanup }),
+        Err(cleanup) => Err(AgentVmLifecycleRunError::CleanupAfterFailure {
+            original: Box::new(original),
+            cleanup: Box::new(cleanup),
+        }),
     }
 }
 
@@ -1205,12 +1214,13 @@ mod tests {
 
         #[test]
         fn network_inspection_accepts_exact_match_and_rejects_each_mutated_field(index in any::<u8>()) {
+            let alternate_index = u16::from(index.wrapping_add(1));
             let index = u16::from(index);
             let plan = plan(index);
             let matching = inspection_for_plan(&plan);
             prop_assert_eq!(plan.validate_network_inspection(&matching), Ok(()));
 
-            let alternate = pool().allocate(u16::from(index.wrapping_add(1))).unwrap();
+            let alternate = pool().allocate(alternate_index).unwrap();
 
             let wrong_v4_subnet = AppleNetworkInspection {
                 ipv4_subnet: alternate.ipv4(),
