@@ -16,9 +16,13 @@ Requires:
 Environment overrides:
   WRIT_PROVE_IMAGE       OCI image to run, default alpine:latest
   WRIT_PROVE_IPV4_CIDR   internal Apple container subnet, default 192.168.252.0/24
+  WRIT_PROVE_IPV4_POOL   broker-owned IPv4 pool, default is the session /24's /16
   WRIT_PROVE_IPV6_CIDR   fallback IPv6 PF prefix for rendering if network inspect
                          reports none; IPv6 probes are skipped in that case,
                          default fd83:b6f2:e57:f536::/64
+  WRIT_PROVE_IPV6_POOL   broker-owned IPv6 pool, default is the session /64's /48
+  WRIT_PROVE_BROKER_PORT_MIN  minimum allowed broker port, default 49152
+  WRIT_PROVE_BROKER_PORT_MAX  maximum allowed broker port, default 65535
 EOF
 }
 
@@ -40,17 +44,20 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/writ-pf-proof.XXXXXX")"
 IMAGE="${WRIT_PROVE_IMAGE:-alpine:latest}"
 IPV4_CIDR="${WRIT_PROVE_IPV4_CIDR:-192.168.252.0/24}"
+IPV4_POOL="${WRIT_PROVE_IPV4_POOL:-}"
 IPV6_CIDR="${WRIT_PROVE_IPV6_CIDR:-fd83:b6f2:e57:f536::/64}"
+IPV6_POOL="${WRIT_PROVE_IPV6_POOL:-}"
+BROKER_PORT_MIN="${WRIT_PROVE_BROKER_PORT_MIN:-49152}"
+BROKER_PORT_MAX="${WRIT_PROVE_BROKER_PORT_MAX:-65535}"
 SESSION_ID="$(uuidgen | tr '[:upper:]' '[:lower:]')"
 SHORT_ID="${SESSION_ID%%-*}"
 NETWORK_NAME="writ-pf-${SHORT_ID}"
 VM_NAME="writ-pf-vm-${SHORT_ID}"
 BROKER_DIR="${TMP_DIR}/broker"
 FORBIDDEN_DIR="${TMP_DIR}/forbidden"
-PF_RULES_FILE="${TMP_DIR}/pf-rules.conf"
 NETWORK_INSPECT_FILE="${TMP_DIR}/network-inspect.txt"
-EMPTY_PF_FILE="${TMP_DIR}/empty-pf.conf"
 PF_ANCHOR=""
+HELPER=""
 BROKER_PID=""
 FORBIDDEN_PID=""
 FORBIDDEN_V6_PID=""
@@ -77,13 +84,12 @@ cleanup() {
   fi
 
   if [[ -n "$PF_ANCHOR" ]]; then
-    sudo pfctl -k "$IPV4_CIDR" -k 0.0.0.0/0 >/dev/null 2>&1 || true
-    sudo pfctl -k "$IPV6_CIDR" -k ::/0 >/dev/null 2>&1 || true
-    sudo pfctl -k "$IPV4_CIDR" >/dev/null 2>&1 || true
-    sudo pfctl -k "${IPV4_CIDR%/*}" >/dev/null 2>&1 || true
-    sudo pfctl -k "$IPV6_CIDR" >/dev/null 2>&1 || true
-    sudo pfctl -a "$PF_ANCHOR" -F rules >/dev/null 2>&1 || true
-    sudo pfctl -a "$PF_ANCHOR" -f "$EMPTY_PF_FILE" >/dev/null 2>&1 || true
+    sudo "$HELPER" remove \
+      --session-id "$SESSION_ID" \
+      --ipv4-pool "$IPV4_POOL" \
+      --ipv6-pool "$IPV6_POOL" \
+      --ipv4-cidr "$IPV4_CIDR" \
+      --ipv6-cidr "$IPV6_CIDR" >/dev/null 2>&1 || true
   fi
 
   if [[ -n "$BROKER_PID" ]]; then
@@ -139,6 +145,16 @@ import sys
 
 network = ipaddress.ip_network(sys.argv[1], strict=True)
 print(next(network.hosts()))
+PY
+}
+
+cidr_supernet() {
+  python3 - "$1" "$2" <<'PY'
+import ipaddress
+import sys
+
+network = ipaddress.ip_network(sys.argv[1], strict=True)
+print(network.supernet(new_prefix=int(sys.argv[2])))
 PY
 }
 
@@ -358,7 +374,6 @@ require_cmd sudo
 require_cmd uuidgen
 choose_cargo
 
-touch "$EMPTY_PF_FILE"
 mkdir -p "$BROKER_DIR" "$FORBIDDEN_DIR"
 printf 'broker-ok\n' >"${BROKER_DIR}/broker.txt"
 printf 'forbidden-open\n' >"${FORBIDDEN_DIR}/forbidden.txt"
@@ -376,9 +391,9 @@ if ! sudo pfctl -sr 2>/dev/null | grep -q 'anchor "writ/session/\*"'; then
   die 'missing top-level PF anchor; add `anchor "writ/session/*"` to /etc/pf.conf and reload PF'
 fi
 
-log "building PF renderer from the Rust core model"
-"${CARGO_CMD[@]}" build --quiet --bin writ-render-agent-vm-pf
-RENDERER="${ROOT_DIR}/target/debug/writ-render-agent-vm-pf"
+log "building PF helper from the Rust core model"
+"${CARGO_CMD[@]}" build --quiet --bin writ-agent-vm-pf-helper
+HELPER="${ROOT_DIR}/target/debug/writ-agent-vm-pf-helper"
 
 BROKER_PORT="$(pick_port)"
 FORBIDDEN_PORT="$(pick_port)"
@@ -418,6 +433,12 @@ else
   fi
   log "network inspect did not report an IPv6 /64; using fallback PF prefix ${IPV6_CIDR} and skipping IPv6 probes"
 fi
+if [[ -z "$IPV4_POOL" ]]; then
+  IPV4_POOL="$(cidr_supernet "$IPV4_CIDR" 16)"
+fi
+if [[ -z "$IPV6_POOL" ]]; then
+  IPV6_POOL="$(cidr_supernet "$IPV6_CIDR" 48)"
+fi
 if [[ -n "$INSPECT_IPV6_CIDR" && -n "$IPV6_GATEWAY" ]]; then
   IPV6_PROBES_ENABLED=1
   FORBIDDEN_V6_PORT="$(pick_port_ipv6)"
@@ -434,22 +455,21 @@ else
   log "network inspect did not report both an IPv6 subnet and gateway; IPv6 probes will be skipped"
 fi
 
-PF_ANCHOR="$("$RENDERER" \
+log "validating and loading PF anchor through helper"
+PF_ANCHOR="writ/session/${SESSION_ID}"
+LOADED_PF_ANCHOR="$(sudo "$HELPER" install \
   --session-id "$SESSION_ID" \
+  --ipv4-pool "$IPV4_POOL" \
+  --ipv6-pool "$IPV6_POOL" \
   --ipv4-cidr "$IPV4_CIDR" \
   --ipv6-cidr "$IPV6_CIDR" \
   --broker-port "$BROKER_PORT" \
-  anchor)"
-"$RENDERER" \
-  --session-id "$SESSION_ID" \
-  --ipv4-cidr "$IPV4_CIDR" \
-  --ipv6-cidr "$IPV6_CIDR" \
-  --broker-port "$BROKER_PORT" \
-  rules >"$PF_RULES_FILE"
-
-log "validating and loading PF anchor ${PF_ANCHOR}"
-sudo pfctl -n -f "$PF_RULES_FILE" >/dev/null
-sudo pfctl -a "$PF_ANCHOR" -f "$PF_RULES_FILE"
+  --broker-port-min "$BROKER_PORT_MIN" \
+  --broker-port-max "$BROKER_PORT_MAX")"
+if [[ "$LOADED_PF_ANCHOR" != "$PF_ANCHOR" ]]; then
+  die "helper loaded unexpected PF anchor ${LOADED_PF_ANCHOR}; expected ${PF_ANCHOR}"
+fi
+log "loaded PF anchor ${PF_ANCHOR}"
 
 log "starting VM ${VM_NAME} on ${NETWORK_NAME}"
 container run --name "$VM_NAME" \
@@ -510,7 +530,7 @@ cleanup
 trap - EXIT INT TERM
 assert_pf_anchor_empty
 if [[ "$IPV6_PROBES_ENABLED" -eq 1 ]]; then
-  log "PF proof succeeded for ${IPV4_CIDR} and ${IPV6_CIDR}; broker allowed, lateral host and direct egress blocked"
+  log "PF proof succeeded for ${IPV4_CIDR} and ${IPV6_CIDR}; broker allowed, forbidden host ports blocked; direct egress sanity probes failed"
 else
-  log "PF proof succeeded for ${IPV4_CIDR}; broker allowed, lateral host and direct IPv4/DNS egress blocked; IPv6 probes skipped"
+  log "PF proof succeeded for ${IPV4_CIDR}; broker allowed, forbidden host port blocked; direct IPv4/DNS sanity probes failed; IPv6 probes skipped"
 fi

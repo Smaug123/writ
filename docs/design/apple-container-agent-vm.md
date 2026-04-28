@@ -198,6 +198,23 @@ The helper must validate that:
 - generated PF rules parse with `pfctl -n` before being loaded;
 - cleanup only touches the matching session anchor.
 
+First manual helper slice implemented as `writ-agent-vm-pf-helper`:
+
+- `install` accepts the session ID, broker-owned IPv4/IPv6 pools, the requested
+  session IPv4/IPv6 subnets, broker ports, and a configured broker port range;
+- it validates the session subnets against the owned pools and the broker ports
+  against the configured range before rendering the existing `core::agent_vm`
+  PF ruleset;
+- it refuses to install unless PF is enabled and `pfctl -sr` contains the direct
+  `anchor "writ/session/*"` bootstrap;
+- it writes the rendered rules to a temporary file, runs `pfctl -n -f`, then
+  loads only the session anchor with `pfctl -a writ/session/<id> -f`;
+- `remove` is currently stateless and therefore accepts the session network
+  again; it kills live states for the validated session subnets and flushes
+  only the matching session anchor. This is acceptable for the manual helper,
+  but the daemonized helper should persist `(session_id, ipv4, ipv6)` on
+  install and reject mismatched removals.
+
 ### PF strategy
 
 The first implementation should be conservative:
@@ -340,9 +357,8 @@ First pure slice implemented in `src/core/agent_vm.rs`:
 - property tests for host-bit rejection, subnet containment, allocation
   injectivity, IPv4 `/24` stride, and rendered broker-port coverage.
 
-The current `BrokerPort` type only proves "stable and unprivileged"; the
-privileged helper should add a configured `BrokerPortRange` check before
-loading PF rules.
+`BrokerPort` proves "stable and unprivileged"; the privileged helper adds the
+configured `BrokerPortRange` check before loading PF rules.
 
 The next spike should run with a temporary internal network and a temporary PF
 anchor:
@@ -351,8 +367,8 @@ anchor:
 2. Start an internal-network VM.
 3. Verify the VM can reach the broker port.
 4. Verify the VM cannot reach the forbidden host port.
-5. Verify direct IPv4 internet still times out.
-6. Verify direct DNS still times out.
+5. Sanity-check that direct IPv4 internet still times out.
+6. Sanity-check that direct DNS still times out.
 7. Verify IPv6 cannot bypass the IPv4 rules.
 8. Verify cleanup removes rules, states, VM, and network.
 9. Repeat with two simultaneous session subnets to test rule independence.
@@ -371,13 +387,17 @@ Manual PF proof harness added in `scripts/prove-pf-internal-network.sh`:
 
 - creates a temporary Apple `container --internal` network and Alpine VM;
 - starts one host broker listener and one host forbidden listener;
-- renders the temporary `writ/session/<uuid>` PF anchor through
-  `src/core/agent_vm.rs`;
-- loads the anchor only after `pfctl -n` accepts the generated rules;
-- asserts broker reachability, forbidden-host-port blocking, direct IPv4
-  blocking, and direct external-DNS blocking; when network inspect reports
-  IPv6 and the VM has an address in that prefix, it also asserts host IPv6
-  lateral blocking and IPv6 non-bypass;
+- installs the temporary `writ/session/<uuid>` PF anchor through
+  `writ-agent-vm-pf-helper`, which renders through `src/core/agent_vm.rs` and
+  loads the anchor only after `pfctl -n` accepts the generated rules;
+- asserts broker reachability and forbidden-host-port blocking on the same
+  gateway address. This is the load-bearing PF check, because only PF can
+  distinguish those host ports;
+- also sanity-checks direct IPv4 and direct external-DNS blocking. Those probes
+  are not independent PF proof, because Apple `container --internal` is already
+  host-only and should fail them even with an empty session anchor;
+- when network inspect reports IPv6 and the VM has an address in that prefix,
+  it also asserts host IPv6 lateral blocking and IPv6 non-bypass;
 - stops the VM, removes the network, flushes the PF anchor, and kills matching
   PF states through `trap` cleanup.
 
@@ -395,7 +415,9 @@ Privileged proof result on 2026-04-28:
 - after adding the direct `anchor "writ/session/*"` bootstrap, the same
   harness passed for IPv4: the VM reached the broker port, the forbidden host
   port failed with `Connection refused` from PF `block return`, direct
-  `http://1.1.1.1/` failed, and external DNS via `1.1.1.1` failed;
+  `http://1.1.1.1/` failed, and external DNS via `1.1.1.1` failed. The
+  broker-vs-forbidden gateway-port result is the PF-specific evidence; the
+  internet and DNS failures are host-only-network sanity checks;
 - the successful run did not prove IPv6 because Apple `container network
   inspect` did not report both an IPv6 subnet and gateway, so the harness
   skipped IPv6 probes explicitly;
@@ -433,5 +455,7 @@ The confirmed pieces are:
   preserving a path to a host broker.
 - The guest rootfs is private and writable, so `/nix/store` can be private.
 
-The unproven but plausible piece is the PF enforcement layer. That should be
-the next proof spike before implementing the full brokered agent runner.
+PF enforcement has been proven for the IPv4 host-gateway port distinction:
+the VM can reach the broker port while a second host port on the same gateway
+is blocked by the session anchor. IPv6 enforcement and two simultaneous
+session subnets remain unproven.

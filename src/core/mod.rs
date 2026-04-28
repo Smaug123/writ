@@ -8,9 +8,9 @@ mod request;
 mod session;
 
 pub use agent_vm::{
-    AgentNetwork, AgentNetworkPool, AgentVmConfigError, BrokerPort, BrokerPorts, IpFamily,
-    Ipv4Cidr, Ipv6Cidr, PfAllowRule, PfAnchorName, PfCidr, PfDenyRule, PfRuleset, render_pf,
-    session_pf_ruleset,
+    AgentNetwork, AgentNetworkPool, AgentVmConfigError, BrokerPort, BrokerPortRange, BrokerPorts,
+    IpFamily, Ipv4Cidr, Ipv6Cidr, PfAllowRule, PfAnchorName, PfCidr, PfDenyRule, PfRuleset,
+    render_pf, session_pf_ruleset,
 };
 pub use decision::{
     GitHubGrantedScope, GitHubPermissions, GrantedScope, MetadataAccess, PolicyDecision, TtlError,

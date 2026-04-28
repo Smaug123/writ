@@ -5,9 +5,8 @@
 //! intend to install; an imperative edge can interpret those descriptions
 //! later.
 //!
-//! TODO: add the matching teardown description before wiring this to a helper:
-//! the helper must be able to flush the session anchor and kill live PF states
-//! for the allocated session subnets.
+//! The privileged edge in `agent_vm_firewall` validates broker-owned session
+//! networks before interpreting these descriptions as `pfctl` operations.
 
 use std::collections::BTreeSet;
 use std::net::{Ipv4Addr, Ipv6Addr};
@@ -39,6 +38,14 @@ pub struct BrokerPort(u16);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BrokerPorts(Vec<BrokerPort>);
+
+/// Configured local port range that the privileged helper may expose as broker
+/// listeners to agent VMs.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct BrokerPortRange {
+    min: BrokerPort,
+    max: BrokerPort,
+}
 
 /// A session network that was allocated from an [`AgentNetworkPool`].
 ///
@@ -118,8 +125,16 @@ pub enum AgentVmConfigError {
     PrivilegedBrokerPort(u16),
     #[error("at least one broker port is required")]
     EmptyBrokerPorts,
+    #[error("broker port range is empty: minimum {min} is greater than maximum {max}")]
+    EmptyBrokerPortRange { min: u16, max: u16 },
+    #[error("broker port {port} is outside configured range {min}-{max}")]
+    BrokerPortOutsideRange { port: u16, min: u16, max: u16 },
     #[error("subnet index {index} does not fit inside base prefix /{base_prefix}")]
     SubnetIndexOutOfRange { index: u16, base_prefix: u8 },
+    #[error("agent IPv4 subnet {subnet} is not inside configured pool {pool}")]
+    AgentIpv4SubnetOutsidePool { subnet: Ipv4Cidr, pool: Ipv4Cidr },
+    #[error("agent IPv6 subnet {subnet} is not inside configured pool {pool}")]
+    AgentIpv6SubnetOutsidePool { subnet: Ipv6Cidr, pool: Ipv6Cidr },
 }
 
 impl Ipv4Cidr {
@@ -230,6 +245,43 @@ impl BrokerPorts {
     }
 }
 
+impl BrokerPortRange {
+    pub fn new(min: u16, max: u16) -> Result<Self, AgentVmConfigError> {
+        if min > max {
+            return Err(AgentVmConfigError::EmptyBrokerPortRange { min, max });
+        }
+        Ok(Self {
+            min: BrokerPort::new(min)?,
+            max: BrokerPort::new(max)?,
+        })
+    }
+
+    pub fn min(self) -> BrokerPort {
+        self.min
+    }
+
+    pub fn max(self) -> BrokerPort {
+        self.max
+    }
+
+    pub fn contains(self, port: BrokerPort) -> bool {
+        self.min <= port && port <= self.max
+    }
+
+    pub fn require_contains(self, ports: &BrokerPorts) -> Result<(), AgentVmConfigError> {
+        for port in ports.as_slice() {
+            if !self.contains(*port) {
+                return Err(AgentVmConfigError::BrokerPortOutsideRange {
+                    port: port.get(),
+                    min: self.min.get(),
+                    max: self.max.get(),
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
 impl AgentNetwork {
     fn new(ipv4: Ipv4Cidr, ipv6: Ipv6Cidr) -> Result<Self, AgentVmConfigError> {
         if ipv4.prefix != AGENT_IPV4_PREFIX {
@@ -283,6 +335,22 @@ impl AgentNetworkPool {
         let ipv6 = allocate_ipv6_agent_subnet(self.ipv6_base, index)?;
         AgentNetwork::new(ipv4, ipv6)
     }
+
+    pub fn claim(self, ipv4: Ipv4Cidr, ipv6: Ipv6Cidr) -> Result<AgentNetwork, AgentVmConfigError> {
+        if !self.ipv4_base.contains_subnet(ipv4) {
+            return Err(AgentVmConfigError::AgentIpv4SubnetOutsidePool {
+                subnet: ipv4,
+                pool: self.ipv4_base,
+            });
+        }
+        if !self.ipv6_base.contains_subnet(ipv6) {
+            return Err(AgentVmConfigError::AgentIpv6SubnetOutsidePool {
+                subnet: ipv6,
+                pool: self.ipv6_base,
+            });
+        }
+        AgentNetwork::new(ipv4, ipv6)
+    }
 }
 
 impl IpFamily {
@@ -313,7 +381,7 @@ impl std::fmt::Display for PfCidr {
 }
 
 impl PfAnchorName {
-    fn for_session(session_id: SessionId) -> Self {
+    pub fn for_session(session_id: SessionId) -> Self {
         let session_id = session_id.to_string();
         // `SessionId` is a UUID; its Display form is ASCII hex plus hyphens,
         // so it is safe to use as one PF anchor path component.
@@ -758,6 +826,74 @@ mod tests {
     }
 
     #[test]
+    fn network_pool_claims_valid_session_subnets_inside_base() {
+        let pool = AgentNetworkPool::new(
+            Ipv4Cidr::new(Ipv4Addr::new(192, 168, 0, 0), 16).unwrap(),
+            Ipv6Cidr::new("fd83:b6f2:e57::".parse().unwrap(), 48).unwrap(),
+        )
+        .unwrap();
+        let allocated = pool.allocate(7).unwrap();
+        let claimed = pool.claim(allocated.ipv4(), allocated.ipv6()).unwrap();
+        assert_eq!(claimed, allocated);
+    }
+
+    #[test]
+    fn network_pool_claim_rejects_subnets_outside_base() {
+        let pool = AgentNetworkPool::new(
+            Ipv4Cidr::new(Ipv4Addr::new(192, 168, 0, 0), 16).unwrap(),
+            Ipv6Cidr::new("fd83:b6f2:e57::".parse().unwrap(), 48).unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            pool.claim(
+                Ipv4Cidr::new(Ipv4Addr::new(10, 0, 0, 0), 24).unwrap(),
+                Ipv6Cidr::new("fd83:b6f2:e57:1::".parse().unwrap(), 64).unwrap(),
+            ),
+            Err(AgentVmConfigError::AgentIpv4SubnetOutsidePool { .. })
+        ));
+        assert!(matches!(
+            pool.claim(
+                Ipv4Cidr::new(Ipv4Addr::new(192, 168, 1, 0), 24).unwrap(),
+                Ipv6Cidr::new("fd83:b6f2:e58::".parse().unwrap(), 64).unwrap(),
+            ),
+            Err(AgentVmConfigError::AgentIpv6SubnetOutsidePool { .. })
+        ));
+    }
+
+    #[test]
+    fn broker_port_range_rejects_empty_or_privileged_ranges() {
+        assert!(matches!(
+            BrokerPortRange::new(65535, 65534),
+            Err(AgentVmConfigError::EmptyBrokerPortRange {
+                min: 65535,
+                max: 65534,
+            })
+        ));
+        assert!(matches!(
+            BrokerPortRange::new(80, 65535),
+            Err(AgentVmConfigError::PrivilegedBrokerPort(80))
+        ));
+    }
+
+    #[test]
+    fn broker_port_range_validates_all_broker_ports() {
+        let range = BrokerPortRange::new(18080, 18081).unwrap();
+        assert!(range.require_contains(&sample_ports()).is_ok());
+        let err = BrokerPortRange::new(18081, 18081)
+            .unwrap()
+            .require_contains(&sample_ports())
+            .unwrap_err();
+        assert_eq!(
+            err,
+            AgentVmConfigError::BrokerPortOutsideRange {
+                port: 18080,
+                min: 18081,
+                max: 18081,
+            }
+        );
+    }
+
+    #[test]
     fn session_pf_ruleset_is_structured_and_inspectable() {
         let network = sample_pool().allocate(0).unwrap();
         let ruleset = session_pf_ruleset(session_id(), network, &sample_ports());
@@ -858,6 +994,25 @@ mod tests {
             prop_assert_eq!(rendered_broker_ports(&rendered), expected_ports);
             prop_assert_eq!(rendered.lines().filter(|line| line.starts_with("broker_ports = ")).count(), 1);
             prop_assert!(rendered.contains("port $broker_ports"));
+        }
+
+        #[test]
+        fn pool_claim_accepts_every_allocated_subnet((pool, index) in arb_pool_and_index()) {
+            let network = pool.allocate(index).unwrap();
+            prop_assert_eq!(pool.claim(network.ipv4(), network.ipv6()).unwrap(), network);
+        }
+
+        #[test]
+        fn broker_port_range_contains_exactly_ports_between_bounds(
+            left in 1024u16..=u16::MAX,
+            right in 1024u16..=u16::MAX,
+            port in 1024u16..=u16::MAX,
+        ) {
+            let min = left.min(right);
+            let max = left.max(right);
+            let range = BrokerPortRange::new(min, max).unwrap();
+            let port = BrokerPort::new(port).unwrap();
+            prop_assert_eq!(range.contains(port), min <= port.get() && port.get() <= max);
         }
     }
 }
