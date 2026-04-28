@@ -6,10 +6,10 @@
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::PathBuf;
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use writ::agent_vm_lifecycle::{
     AgentVmResources, AgentVmSessionPlan, AgentVmSessionStopPlan, AgentVmToolPaths, ContainerImage,
-    ProcessInvocation, start_agent_vm_session, stop_agent_vm_session,
+    Ipv6IsolationMode, ProcessInvocation, start_agent_vm_session, stop_agent_vm_session,
 };
 use writ::core::{
     AgentNetworkPool, BrokerPort, BrokerPortRange, BrokerPorts, Ipv4Cidr, Ipv6Cidr, SessionId,
@@ -74,6 +74,10 @@ struct StartArgs {
     #[arg(long, default_value_t = 512)]
     memory_mib: u32,
 
+    /// IPv6 isolation posture required before the guest command is released.
+    #[arg(long, value_enum, default_value = "dual-stack-required")]
+    ipv6_mode: Ipv6ModeArg,
+
     /// Print commands instead of executing them.
     #[arg(long)]
     dry_run: bool,
@@ -110,6 +114,23 @@ struct SessionArgs {
     /// Session subnet index inside both pools.
     #[arg(long)]
     subnet_index: u16,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+enum Ipv6ModeArg {
+    /// Require Apple network inspect to report and match the planned IPv6 subnet.
+    DualStackRequired,
+    /// Allow missing Apple IPv6 inspect data only after proving the guest has no routable IPv6.
+    Ipv4OnlyNoGuestIpv6,
+}
+
+impl From<Ipv6ModeArg> for Ipv6IsolationMode {
+    fn from(value: Ipv6ModeArg) -> Self {
+        match value {
+            Ipv6ModeArg::DualStackRequired => Self::DualStackRequired,
+            Ipv6ModeArg::Ipv4OnlyNoGuestIpv6 => Self::Ipv4OnlyNoGuestIpv6,
+        }
+    }
 }
 
 fn main() {
@@ -174,6 +195,7 @@ fn build_start_plan(
         args.session.subnet_index,
         broker_ports,
         broker_port_range,
+        args.ipv6_mode.into(),
         ContainerImage::new(args.image)?,
         args.guest_command,
         AgentVmResources::new(args.cpus, args.memory_mib)?,

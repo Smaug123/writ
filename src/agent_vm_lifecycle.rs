@@ -15,6 +15,22 @@ use crate::core::{
     Ipv6Cidr, SessionId,
 };
 
+const IPV4_ONLY_PRELAUNCH_SCRIPT: &str = concat!(
+    "set -eu\n",
+    "mkdir -p /run/writ-agent-vm\n",
+    "while [ ! -f /run/writ-agent-vm/start ]; do sleep 0.2; done\n",
+    "exec \"$@\"",
+);
+
+const GUEST_IPV6_PROBE_SCRIPT: &str = r#"set -e
+if ! command -v ip >/dev/null 2>&1; then echo writ-ip-command-missing; exit 77; fi
+ip -6 -o addr show 2>&1
+ip -6 route show default 2>&1"#;
+
+const GUEST_IPV6_PROBE_UNAVAILABLE_MARKER: &str = "writ-ip-command-missing";
+const GUEST_IPV6_PROBE_ATTEMPTS: usize = 40;
+const GUEST_IPV6_PROBE_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AgentVmSessionPlan {
     session_id: SessionId,
@@ -23,6 +39,7 @@ pub struct AgentVmSessionPlan {
     names: AgentVmNames,
     broker_ports: BrokerPorts,
     broker_port_range: BrokerPortRange,
+    ipv6_mode: Ipv6IsolationMode,
     image: ContainerImage,
     guest_command: Vec<String>,
     resources: AgentVmResources,
@@ -70,12 +87,24 @@ pub struct ProcessInvocation {
 pub struct AppleNetworkInspection {
     ipv4_subnet: Ipv4Cidr,
     ipv4_gateway: Ipv4Addr,
-    ipv6_subnet: Ipv6Cidr,
-    ipv6_gateway: Ipv6Addr,
+    ipv6_subnet: Option<Ipv6Cidr>,
+    ipv6_gateway: Option<Ipv6Addr>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BrokerUrl(String);
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum Ipv6IsolationMode {
+    DualStackRequired,
+    Ipv4OnlyNoGuestIpv6,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GuestIpv6Inspection {
+    addresses: Vec<Ipv6Addr>,
+    default_routes: Vec<String>,
+}
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum CompletedStartStep {
@@ -93,6 +122,9 @@ pub enum StartOutcome {
     ValidateNetworkInspectionFailed,
     InstallFirewallFailed,
     StartVmFailed,
+    ProbeGuestIpv6Failed,
+    ValidateGuestIpv6Failed,
+    ReleaseGuestCommandFailed,
 }
 
 #[derive(Debug, thiserror::Error, Eq, PartialEq)]
@@ -105,6 +137,8 @@ pub enum AgentVmLifecycleConfigError {
     EmptyCpuCount,
     #[error("memory must be at least 1 MiB")]
     EmptyMemory,
+    #[error("IPv4-only guest IPv6 preflight requires an explicit guest command")]
+    EmptyGuestCommandForIpv4OnlyNoGuestIpv6,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -137,6 +171,8 @@ pub enum StartFailure {
     Process(#[from] ProcessInvocationError),
     #[error(transparent)]
     NetworkInspection(#[from] NetworkInspectionError),
+    #[error(transparent)]
+    GuestIpv6Inspection(#[from] GuestIpv6InspectionError),
 }
 
 #[derive(Debug, thiserror::Error, Eq, PartialEq)]
@@ -166,6 +202,18 @@ pub enum NetworkInspectionError {
     },
     #[error("inspected IPv6 gateway {gateway} is outside planned subnet {subnet}")]
     Ipv6GatewayOutsideSubnet { subnet: Ipv6Cidr, gateway: Ipv6Addr },
+}
+
+#[derive(Debug, thiserror::Error, Eq, PartialEq)]
+pub enum GuestIpv6InspectionError {
+    #[error("guest image cannot prove IPv6 posture because it does not provide the `ip` command")]
+    ProbeToolUnavailable,
+    #[error("guest IPv6 probe output has invalid address {value:?}: {message}")]
+    InvalidAddress { value: String, message: String },
+    #[error("guest has non-link-local IPv6 address {0}")]
+    NonLinkLocalAddress(Ipv6Addr),
+    #[error("guest has IPv6 default route: {0}")]
+    DefaultRoute(String),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -229,7 +277,10 @@ pub fn cleanup_step_after_start_outcome(outcome: StartOutcome) -> Option<Complet
         | StartOutcome::ParseNetworkInspectionFailed
         | StartOutcome::ValidateNetworkInspectionFailed
         | StartOutcome::InstallFirewallFailed => Some(CompletedStartStep::NetworkCreated),
-        StartOutcome::StartVmFailed => Some(CompletedStartStep::FirewallInstalled),
+        StartOutcome::StartVmFailed
+        | StartOutcome::ProbeGuestIpv6Failed
+        | StartOutcome::ValidateGuestIpv6Failed
+        | StartOutcome::ReleaseGuestCommandFailed => Some(CompletedStartStep::FirewallInstalled),
     }
 }
 
@@ -241,12 +292,16 @@ impl AgentVmSessionPlan {
         subnet_index: u16,
         broker_ports: BrokerPorts,
         broker_port_range: BrokerPortRange,
+        ipv6_mode: Ipv6IsolationMode,
         image: ContainerImage,
         guest_command: Vec<String>,
         resources: AgentVmResources,
         tools: AgentVmToolPaths,
     ) -> Result<Self, AgentVmLifecycleConfigError> {
         broker_port_range.require_contains(&broker_ports)?;
+        if ipv6_mode == Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6 && guest_command.is_empty() {
+            return Err(AgentVmLifecycleConfigError::EmptyGuestCommandForIpv4OnlyNoGuestIpv6);
+        }
         let network = pool.allocate(subnet_index)?;
         Ok(Self {
             session_id,
@@ -255,6 +310,7 @@ impl AgentVmSessionPlan {
             names: AgentVmNames::for_session(session_id),
             broker_ports,
             broker_port_range,
+            ipv6_mode,
             image,
             guest_command,
             resources,
@@ -268,6 +324,10 @@ impl AgentVmSessionPlan {
 
     pub fn network(&self) -> AgentNetwork {
         self.network
+    }
+
+    pub fn ipv6_mode(&self) -> Ipv6IsolationMode {
+        self.ipv6_mode
     }
 
     pub fn names(&self) -> &AgentVmNames {
@@ -289,12 +349,17 @@ impl AgentVmSessionPlan {
     }
 
     pub fn start_invocations(&self) -> Vec<ProcessInvocation> {
-        vec![
+        let mut invocations = vec![
             self.create_network_invocation(),
             self.inspect_network_invocation(),
             self.install_firewall_invocation(),
             self.start_vm_invocation(),
-        ]
+        ];
+        if self.ipv6_mode == Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6 {
+            invocations.push(self.probe_guest_ipv6_invocation());
+            invocations.push(self.release_guest_command_invocation());
+        }
+        invocations
     }
 
     pub fn stop_invocations(&self) -> Vec<ProcessInvocation> {
@@ -372,17 +437,28 @@ impl AgentVmSessionPlan {
                 actual: inspection.ipv4_gateway,
             });
         }
-        if inspection.ipv6_subnet != self.network.ipv6() {
-            return Err(NetworkInspectionError::Ipv6SubnetMismatch {
-                expected: self.network.ipv6(),
-                actual: inspection.ipv6_subnet,
-            });
-        }
-        if !self.network.ipv6().contains_addr(inspection.ipv6_gateway) {
-            return Err(NetworkInspectionError::Ipv6GatewayOutsideSubnet {
-                subnet: self.network.ipv6(),
-                gateway: inspection.ipv6_gateway,
-            });
+        match (inspection.ipv6_subnet, inspection.ipv6_gateway) {
+            (Some(ipv6_subnet), Some(ipv6_gateway)) => {
+                if ipv6_subnet != self.network.ipv6() {
+                    return Err(NetworkInspectionError::Ipv6SubnetMismatch {
+                        expected: self.network.ipv6(),
+                        actual: ipv6_subnet,
+                    });
+                }
+                if !self.network.ipv6().contains_addr(ipv6_gateway) {
+                    return Err(NetworkInspectionError::Ipv6GatewayOutsideSubnet {
+                        subnet: self.network.ipv6(),
+                        gateway: ipv6_gateway,
+                    });
+                }
+            }
+            (Some(_), None) => return Err(NetworkInspectionError::MissingField("ipv6Gateway")),
+            (None, Some(_)) => return Err(NetworkInspectionError::MissingField("ipv6Subnet")),
+            (None, None) => {
+                if self.ipv6_mode == Ipv6IsolationMode::DualStackRequired {
+                    return Err(NetworkInspectionError::MissingField("ipv6Subnet"));
+                }
+            }
         }
         Ok(())
     }
@@ -429,8 +505,42 @@ impl AgentVmSessionPlan {
             "-d".to_string(),
             self.image.as_str().to_string(),
         ];
+        if self.ipv6_mode == Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6 {
+            args.extend([
+                "sh".to_string(),
+                "-c".to_string(),
+                IPV4_ONLY_PRELAUNCH_SCRIPT.to_string(),
+                "writ-agent-vm-prelaunch".to_string(),
+            ]);
+        }
         args.extend(self.guest_command.iter().cloned());
         ProcessInvocation::new(self.tools.container.clone(), args)
+    }
+
+    fn probe_guest_ipv6_invocation(&self) -> ProcessInvocation {
+        ProcessInvocation::new(
+            self.tools.container.clone(),
+            [
+                "exec".to_string(),
+                self.names.vm.clone(),
+                "sh".to_string(),
+                "-c".to_string(),
+                GUEST_IPV6_PROBE_SCRIPT.to_string(),
+            ],
+        )
+    }
+
+    fn release_guest_command_invocation(&self) -> ProcessInvocation {
+        ProcessInvocation::new(
+            self.tools.container.clone(),
+            [
+                "exec".to_string(),
+                self.names.vm.clone(),
+                "sh".to_string(),
+                "-c".to_string(),
+                "mkdir -p /run/writ-agent-vm && touch /run/writ-agent-vm/start".to_string(),
+            ],
+        )
     }
 }
 
@@ -620,7 +730,11 @@ impl ProcessInvocation {
         if output.status.success() {
             return Ok(());
         }
-        Err(ProcessInvocationError::Failed {
+        Err(self.failed_from_output(output))
+    }
+
+    fn failed_from_output(&self, output: std::process::Output) -> ProcessInvocationError {
+        ProcessInvocationError::Failed {
             program: self.program.display().to_string(),
             args: self.args_display(),
             status: output
@@ -629,7 +743,7 @@ impl ProcessInvocation {
                 .map(|code| code.to_string())
                 .unwrap_or_else(|| "signal".into()),
             stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
-        })
+        }
     }
 
     fn output(&self) -> Result<std::process::Output, ProcessInvocationError> {
@@ -657,9 +771,12 @@ impl AppleNetworkInspection {
         let ipv4_subnet = parse_ipv4_cidr_field("ipv4Subnet", &require_field(raw, "ipv4Subnet")?)?;
         let ipv4_gateway =
             parse_ipv4_addr_field("ipv4Gateway", &require_field(raw, "ipv4Gateway")?)?;
-        let ipv6_subnet = parse_ipv6_cidr_field("ipv6Subnet", &require_field(raw, "ipv6Subnet")?)?;
-        let ipv6_gateway =
-            parse_ipv6_addr_field("ipv6Gateway", &require_field(raw, "ipv6Gateway")?)?;
+        let ipv6_subnet = extract_network_field(raw, "ipv6Subnet")
+            .map(|raw| parse_ipv6_cidr_field("ipv6Subnet", &raw))
+            .transpose()?;
+        let ipv6_gateway = extract_network_field(raw, "ipv6Gateway")
+            .map(|raw| parse_ipv6_addr_field("ipv6Gateway", &raw))
+            .transpose()?;
         Ok(Self {
             ipv4_subnet,
             ipv4_gateway,
@@ -676,12 +793,72 @@ impl AppleNetworkInspection {
         self.ipv4_gateway
     }
 
-    pub fn ipv6_subnet(&self) -> Ipv6Cidr {
+    pub fn ipv6_subnet(&self) -> Option<Ipv6Cidr> {
         self.ipv6_subnet
     }
 
-    pub fn ipv6_gateway(&self) -> Ipv6Addr {
+    pub fn ipv6_gateway(&self) -> Option<Ipv6Addr> {
         self.ipv6_gateway
+    }
+}
+
+impl GuestIpv6Inspection {
+    pub fn parse(raw: &str) -> Result<Self, GuestIpv6InspectionError> {
+        let mut addresses = Vec::new();
+        let mut default_routes = Vec::new();
+        for line in raw.lines().map(str::trim).filter(|line| !line.is_empty()) {
+            if line == GUEST_IPV6_PROBE_UNAVAILABLE_MARKER {
+                return Err(GuestIpv6InspectionError::ProbeToolUnavailable);
+            }
+            if line.starts_with("default ") {
+                default_routes.push(line.to_string());
+                continue;
+            }
+            let fields = line.split_whitespace().collect::<Vec<_>>();
+            let Some(inet6_index) = fields.iter().position(|field| *field == "inet6") else {
+                continue;
+            };
+            let Some(raw_addr) = fields.get(inet6_index + 1) else {
+                continue;
+            };
+            let addr = raw_addr
+                .split_once('/')
+                .map(|(addr, _)| addr)
+                .unwrap_or(raw_addr)
+                .parse::<Ipv6Addr>()
+                .map_err(|e| GuestIpv6InspectionError::InvalidAddress {
+                    value: (*raw_addr).to_string(),
+                    message: e.to_string(),
+                })?;
+            addresses.push(addr);
+        }
+        Ok(Self {
+            addresses,
+            default_routes,
+        })
+    }
+
+    pub fn require_no_routable_ipv6(&self) -> Result<(), GuestIpv6InspectionError> {
+        if let Some(addr) = self
+            .addresses
+            .iter()
+            .copied()
+            .find(|addr| !ipv6_addr_is_local_only(*addr))
+        {
+            return Err(GuestIpv6InspectionError::NonLinkLocalAddress(addr));
+        }
+        if let Some(route) = self.default_routes.first() {
+            return Err(GuestIpv6InspectionError::DefaultRoute(route.clone()));
+        }
+        Ok(())
+    }
+
+    pub fn addresses(&self) -> &[Ipv6Addr] {
+        &self.addresses
+    }
+
+    pub fn default_routes(&self) -> &[String] {
+        &self.default_routes
     }
 }
 
@@ -700,16 +877,7 @@ pub fn start_agent_vm_session(plan: &AgentVmSessionPlan) -> Result<(), AgentVmLi
     let inspection_output = match inspect_invocation.output() {
         Ok(output) if output.status.success() => output,
         Ok(output) => {
-            let err = ProcessInvocationError::Failed {
-                program: inspect_invocation.program.display().to_string(),
-                args: inspect_invocation.args_display(),
-                status: output
-                    .status
-                    .code()
-                    .map(|code| code.to_string())
-                    .unwrap_or_else(|| "signal".into()),
-                stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
-            };
+            let err = inspect_invocation.failed_from_output(output);
             return fail_after_cleanup(err.into(), plan, StartOutcome::InspectNetworkFailed);
         }
         Err(err) => {
@@ -739,6 +907,20 @@ pub fn start_agent_vm_session(plan: &AgentVmSessionPlan) -> Result<(), AgentVmLi
     }
     if let Err(err) = plan.start_vm_invocation().run() {
         return fail_after_cleanup(err.into(), plan, StartOutcome::StartVmFailed);
+    }
+    if plan.ipv6_mode == Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6 {
+        let guest_ipv6 = match wait_for_guest_ipv6_inspection(plan) {
+            Ok(inspection) => inspection,
+            Err(err) => {
+                return fail_after_cleanup(err, plan, StartOutcome::ProbeGuestIpv6Failed);
+            }
+        };
+        if let Err(err) = guest_ipv6.require_no_routable_ipv6() {
+            return fail_after_cleanup(err.into(), plan, StartOutcome::ValidateGuestIpv6Failed);
+        }
+        if let Err(err) = plan.release_guest_command_invocation().run() {
+            return fail_after_cleanup(err.into(), plan, StartOutcome::ReleaseGuestCommandFailed);
+        }
     }
     Ok(())
 }
@@ -773,6 +955,37 @@ fn run_cleanup(invocations: Vec<ProcessInvocation>) -> Result<(), CleanupErrors>
     } else {
         Err(CleanupErrors::new(errors))
     }
+}
+
+fn wait_for_guest_ipv6_inspection(
+    plan: &AgentVmSessionPlan,
+) -> Result<GuestIpv6Inspection, StartFailure> {
+    let invocation = plan.probe_guest_ipv6_invocation();
+    let mut last_error = None;
+    for attempt in 0..GUEST_IPV6_PROBE_ATTEMPTS {
+        match invocation.output() {
+            Ok(output) if output.status.success() => {
+                return Ok(GuestIpv6Inspection::parse(&String::from_utf8_lossy(
+                    &output.stdout,
+                ))?);
+            }
+            Ok(output)
+                if output.status.code() == Some(77)
+                    && String::from_utf8_lossy(&output.stdout)
+                        .contains(GUEST_IPV6_PROBE_UNAVAILABLE_MARKER) =>
+            {
+                return Err(GuestIpv6InspectionError::ProbeToolUnavailable.into());
+            }
+            Ok(output) => last_error = Some(invocation.failed_from_output(output)),
+            Err(err) => last_error = Some(err),
+        }
+        if attempt + 1 < GUEST_IPV6_PROBE_ATTEMPTS {
+            std::thread::sleep(GUEST_IPV6_PROBE_DELAY);
+        }
+    }
+    Err(last_error
+        .expect("guest IPv6 probe attempts must record their last error")
+        .into())
 }
 
 fn require_field(raw: &str, key: &'static str) -> Result<String, NetworkInspectionError> {
@@ -928,6 +1141,14 @@ fn split_cidr_field<'a>(
         })
 }
 
+fn ipv6_addr_is_local_only(addr: Ipv6Addr) -> bool {
+    addr.is_loopback() || addr.is_unspecified() || ipv6_addr_is_link_local(addr)
+}
+
+fn ipv6_addr_is_link_local(addr: Ipv6Addr) -> bool {
+    (addr.segments()[0] & 0xffc0) == 0xfe80
+}
+
 fn shell_quote(raw: &str) -> String {
     if !raw.is_empty()
         && raw
@@ -979,16 +1200,24 @@ mod tests {
             Just(StartOutcome::ValidateNetworkInspectionFailed),
             Just(StartOutcome::InstallFirewallFailed),
             Just(StartOutcome::StartVmFailed),
+            Just(StartOutcome::ProbeGuestIpv6Failed),
+            Just(StartOutcome::ValidateGuestIpv6Failed),
+            Just(StartOutcome::ReleaseGuestCommandFailed),
         ]
     }
 
     fn plan(index: u16) -> AgentVmSessionPlan {
+        plan_with_ipv6_mode(index, Ipv6IsolationMode::DualStackRequired)
+    }
+
+    fn plan_with_ipv6_mode(index: u16, ipv6_mode: Ipv6IsolationMode) -> AgentVmSessionPlan {
         AgentVmSessionPlan::new(
             session_id(),
             pool(),
             index,
             ports(),
             BrokerPortRange::new(49152, 65535).unwrap(),
+            ipv6_mode,
             ContainerImage::new("alpine:latest").unwrap(),
             vec!["sleep".into(), "600".into()],
             AgentVmResources::new(1, 512).unwrap(),
@@ -1002,8 +1231,8 @@ mod tests {
         AppleNetworkInspection {
             ipv4_subnet: network.ipv4(),
             ipv4_gateway: network.ipv4_gateway(),
-            ipv6_subnet: network.ipv6(),
-            ipv6_gateway: Ipv6Addr::from(u128::from(network.ipv6().network()) + 1),
+            ipv6_subnet: Some(network.ipv6()),
+            ipv6_gateway: Some(Ipv6Addr::from(u128::from(network.ipv6().network()) + 1)),
         }
     }
 
@@ -1037,6 +1266,48 @@ mod tests {
         assert_eq!(&vm_args[0..2], ["run", "--name"]);
         assert!(
             vm_args.contains(&"writ-agent-vm-51b8fd0f-6c10-454c-b0e6-7df1d60e2e6d".to_string())
+        );
+    }
+
+    #[test]
+    fn ipv4_only_start_invocations_probe_before_releasing_guest_command() {
+        let invocations =
+            plan_with_ipv6_mode(252, Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6).start_invocations();
+        assert_eq!(invocations.len(), 6);
+        let start_vm_args = invocations[3].args_lossy();
+        assert_eq!(&start_vm_args[0..2], ["run", "--name"]);
+        assert!(start_vm_args.contains(&"sh".to_string()));
+        assert!(start_vm_args.contains(&"-c".to_string()));
+        assert!(
+            start_vm_args
+                .iter()
+                .any(|arg| arg.contains("/run/writ-agent-vm/start") && arg.contains("exec \"$@\""))
+        );
+        assert!(start_vm_args.ends_with(&[
+            "writ-agent-vm-prelaunch".into(),
+            "sleep".into(),
+            "600".into()
+        ]));
+
+        assert_eq!(
+            invocations[4].args_lossy(),
+            [
+                "exec",
+                "writ-agent-vm-51b8fd0f-6c10-454c-b0e6-7df1d60e2e6d",
+                "sh",
+                "-c",
+                GUEST_IPV6_PROBE_SCRIPT,
+            ]
+        );
+        assert_eq!(
+            invocations[5].args_lossy(),
+            [
+                "exec",
+                "writ-agent-vm-51b8fd0f-6c10-454c-b0e6-7df1d60e2e6d",
+                "sh",
+                "-c",
+                "mkdir -p /run/writ-agent-vm && touch /run/writ-agent-vm/start",
+            ]
         );
     }
 
@@ -1094,16 +1365,20 @@ mod tests {
     }
 
     #[test]
-    fn network_inspect_parser_requires_ipv6_fields() {
+    fn network_inspect_without_ipv6_is_explicitly_mode_dependent() {
         let raw = r#"
             mode: hostOnly
             ipv4Subnet: 192.168.252.0/24
             ipv4Gateway: 192.168.252.1
         "#;
+        let inspection = AppleNetworkInspection::parse(raw).unwrap();
         assert_eq!(
-            AppleNetworkInspection::parse(raw),
+            plan(252).validate_network_inspection(&inspection),
             Err(NetworkInspectionError::MissingField("ipv6Subnet"))
         );
+        plan_with_ipv6_mode(252, Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6)
+            .validate_network_inspection(&inspection)
+            .unwrap();
     }
 
     #[test]
@@ -1122,10 +1397,15 @@ mod tests {
         let parsed = AppleNetworkInspection::parse(&raw).unwrap();
         assert_eq!(parsed.ipv4_subnet().to_string(), "192.168.252.0/24");
         assert_eq!(parsed.ipv4_gateway(), Ipv4Addr::new(192, 168, 252, 1));
-        assert_eq!(parsed.ipv6_subnet().to_string(), "fd83:b6f2:e57:fc::/64");
+        assert_eq!(
+            parsed.ipv6_subnet().unwrap().to_string(),
+            "fd83:b6f2:e57:fc::/64"
+        );
         assert_eq!(
             parsed.ipv6_gateway(),
-            Ipv6Addr::from(0xfd83_b6f2_0e57_00fc_0000_0000_0000_0001u128)
+            Some(Ipv6Addr::from(
+                0xfd83_b6f2_0e57_00fc_0000_0000_0000_0001u128
+            ))
         );
     }
 
@@ -1172,6 +1452,70 @@ mod tests {
             AgentVmResources::new(1, 0),
             Err(AgentVmLifecycleConfigError::EmptyMemory)
         );
+        assert_eq!(
+            AgentVmSessionPlan::new(
+                session_id(),
+                pool(),
+                252,
+                ports(),
+                BrokerPortRange::new(49152, 65535).unwrap(),
+                Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6,
+                ContainerImage::new("alpine:latest").unwrap(),
+                Vec::new(),
+                AgentVmResources::new(1, 512).unwrap(),
+                AgentVmToolPaths::new("container", "writ-agent-vm-pf-helper", "sudo"),
+            ),
+            Err(AgentVmLifecycleConfigError::EmptyGuestCommandForIpv4OnlyNoGuestIpv6)
+        );
+    }
+
+    #[test]
+    fn guest_ipv6_posture_accepts_link_local_only() {
+        let inspection = GuestIpv6Inspection::parse(
+            r#"
+            1: lo    inet6 ::1/128 scope host
+            2: eth0    inet6 fe80::1234/64 scope link
+            "#,
+        )
+        .unwrap();
+        inspection.require_no_routable_ipv6().unwrap();
+        assert_eq!(inspection.addresses().len(), 2);
+        assert!(inspection.default_routes().is_empty());
+    }
+
+    #[test]
+    fn guest_ipv6_posture_rejects_global_scope_addresses_and_default_routes() {
+        let address =
+            GuestIpv6Inspection::parse("2: eth0    inet6 fd83:b6f2:e57:fc::2/64 scope global")
+                .unwrap()
+                .require_no_routable_ipv6()
+                .unwrap_err();
+        assert!(matches!(
+            address,
+            GuestIpv6InspectionError::NonLinkLocalAddress(addr)
+                if addr == Ipv6Addr::from(0xfd83_b6f2_0e57_00fc_0000_0000_0000_0002u128)
+        ));
+
+        let route = GuestIpv6Inspection::parse("default via fe80::1 dev eth0 metric 1024")
+            .unwrap()
+            .require_no_routable_ipv6()
+            .unwrap_err();
+        assert!(matches!(route, GuestIpv6InspectionError::DefaultRoute(_)));
+    }
+
+    #[test]
+    fn guest_ipv6_posture_reports_missing_probe_tool() {
+        assert_eq!(
+            GuestIpv6Inspection::parse(GUEST_IPV6_PROBE_UNAVAILABLE_MARKER),
+            Err(GuestIpv6InspectionError::ProbeToolUnavailable)
+        );
+    }
+
+    #[test]
+    fn guest_ipv6_probe_script_fails_closed_on_partial_probe_failure() {
+        assert!(GUEST_IPV6_PROBE_SCRIPT.starts_with("set -e\n"));
+        assert!(GUEST_IPV6_PROBE_SCRIPT.contains("addr show 2>&1"));
+        assert!(GUEST_IPV6_PROBE_SCRIPT.contains("route show default 2>&1"));
     }
 
     #[test]
@@ -1202,7 +1546,10 @@ mod tests {
                 | StartOutcome::ParseNetworkInspectionFailed
                 | StartOutcome::ValidateNetworkInspectionFailed
                 | StartOutcome::InstallFirewallFailed => 1,
-                StartOutcome::StartVmFailed => 3,
+                StartOutcome::StartVmFailed
+                | StartOutcome::ProbeGuestIpv6Failed
+                | StartOutcome::ValidateGuestIpv6Failed
+                | StartOutcome::ReleaseGuestCommandFailed => 3,
             };
             prop_assert_eq!(cleanup.len(), expected_len);
             let only_removes = cleanup.iter().all(|cmd| {
@@ -1243,7 +1590,7 @@ mod tests {
             prop_assert!(got_v4_gateway_mismatch);
 
             let wrong_v6_subnet = AppleNetworkInspection {
-                ipv6_subnet: alternate.ipv6(),
+                ipv6_subnet: Some(alternate.ipv6()),
                 ..matching.clone()
             };
             let got_v6_subnet_mismatch = matches!(
@@ -1253,7 +1600,7 @@ mod tests {
             prop_assert!(got_v6_subnet_mismatch);
 
             let wrong_v6_gateway = AppleNetworkInspection {
-                ipv6_gateway: Ipv6Addr::from(u128::from(alternate.ipv6().network()) + 1),
+                ipv6_gateway: Some(Ipv6Addr::from(u128::from(alternate.ipv6().network()) + 1)),
                 ..matching
             };
             let got_v6_gateway_mismatch = matches!(
@@ -1261,6 +1608,37 @@ mod tests {
                 Err(NetworkInspectionError::Ipv6GatewayOutsideSubnet { .. })
             );
             prop_assert!(got_v6_gateway_mismatch);
+        }
+
+        #[test]
+        fn guest_ipv6_posture_rejects_any_ula_address(
+            second in any::<u8>(),
+            third in any::<u16>(),
+            fourth in any::<u16>(),
+            host in 1u16..=u16::MAX,
+        ) {
+            let first_segment = 0xfd00u16 | u16::from(second);
+            let addr = Ipv6Addr::new(first_segment, third, fourth, 0, 0, 0, 0, host);
+            let raw = format!("2: eth0    inet6 {addr}/64 scope global");
+            let got = GuestIpv6Inspection::parse(&raw)
+                .unwrap()
+                .require_no_routable_ipv6();
+            prop_assert_eq!(got, Err(GuestIpv6InspectionError::NonLinkLocalAddress(addr)));
+        }
+
+        #[test]
+        fn guest_ipv6_posture_accepts_any_link_local_address(
+            low_first_segment_bits in 0u16..=0x003f,
+            second in any::<u16>(),
+            third in any::<u16>(),
+            host in any::<u16>(),
+        ) {
+            let addr = Ipv6Addr::new(0xfe80 | low_first_segment_bits, second, third, 0, 0, 0, 0, host);
+            let raw = format!("2: eth0    inet6 {addr}/64 scope link");
+            GuestIpv6Inspection::parse(&raw)
+                .unwrap()
+                .require_no_routable_ipv6()
+                .unwrap();
         }
     }
 }

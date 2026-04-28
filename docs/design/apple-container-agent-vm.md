@@ -245,6 +245,44 @@ IPv6 is still validated and filtered, but it is not handed to the guest as a
 broker endpoint until the VM-facing transport has explicit IPv6 binding and
 authentication semantics.
 
+Third manual lifecycle slice: explicit IPv6 posture:
+
+- the lifecycle plan now carries an explicit IPv6 isolation mode. The default
+  `dual-stack-required` mode preserves the original fail-closed behavior:
+  Apple `container network inspect` must report both IPv4 and IPv6 fields, and
+  the reported IPv6 subnet/gateway must match the broker-planned network;
+- `ipv4-only-no-guest-ipv6` is an explicit fallback for the current observed
+  Apple CLI behavior where the internal network reports IPv4 but not IPv6. In
+  this mode the runner still installs the PF anchor before starting any VM, but
+  starts the VM with a small guarded prelaunch command rather than immediately
+  running the authority-bearing agent command;
+- the guarded VM waits on `/run/writ-agent-vm/start`. While it is waiting, the
+  runner executes `ip -6` inside the guest and refuses to release the real
+  command unless the guest has no non-link-local IPv6 address and no IPv6
+  default route. If the image lacks the `ip` command, the start fails closed;
+- because this mode wraps and later `exec`s the requested command, it requires
+  an explicit guest command rather than relying on an image default command;
+- only after the guest IPv6 posture check passes does the runner touch the
+  start file, causing the guarded process to `exec` the requested guest
+  command. If probing or release fails, cleanup removes the VM, PF anchor, and
+  network.
+
+This mode is not a silent fallback. It is a separately named posture with its
+own proof obligation, because the guarantee is different: "no guest IPv6
+route/address exists" rather than "PF has been installed for the inspected
+IPv6 prefix." The PF helper still receives and installs rules for the
+broker-planned IPv6 prefix in this mode, but when Apple does not attach that
+prefix to the internal network those rules are not the active protection. The
+active protection is the pre-release guest proof that there is no routable IPv6
+state.
+
+That proof is point-in-time: it runs immediately before releasing the guarded
+guest command. The current assumption is that Apple `--internal` networks do
+not later inject IPv6 router advertisements or otherwise add a routable IPv6
+configuration after the probe. If that assumption fails in manual testing, this
+mode should stay disabled until the runner can continuously monitor IPv6 state
+or enforce an equivalent in-guest IPv6 disablement before release.
+
 ### PF strategy
 
 The first implementation should be conservative:
@@ -466,11 +504,20 @@ Manual lifecycle runner status:
 - `writ-agent-vm-runner start --dry-run` emits the intended ordering:
   `container network create`, `container network inspect`, helper `install`,
   then `container run` with the session network and no mount/publish flags;
+- with `--ipv6-mode ipv4-only-no-guest-ipv6`, dry-run start additionally emits
+  the guarded VM start, the guest IPv6 probe, and the release command in that
+  order. The authority-bearing guest command is embedded behind the guard and
+  is not executed until the release command runs;
 - `writ-agent-vm-runner stop --dry-run` emits cleanup in reverse authority
   order: VM removal, helper `remove`, then network removal;
-- non-dry-run start is expected to fail closed on the current observed Apple
-  CLI output until `container network inspect` reports the IPv6 fields needed
-  to prove that the PF IPv6 prefix matches the actual VM network.
+- non-dry-run start in default `dual-stack-required` mode is expected to fail
+  closed on the current observed Apple CLI output until `container network
+  inspect` reports the IPv6 fields needed to prove that the PF IPv6 prefix
+  matches the actual VM network;
+- non-dry-run start in `ipv4-only-no-guest-ipv6` mode should be manually
+  exercised on macOS with Apple `container`: it is intended to proceed on the
+  current IPv4-only inspect output only if the guest image can prove, via
+  `ip -6`, that no routable guest IPv6 posture exists.
 
 ## Risks
 
@@ -479,8 +526,10 @@ Manual lifecycle runner status:
   rules.
 - Host-only vmnet gateway addresses are reachable but not bindable. This
   pushes us toward wildcard binding plus filtering, or PF `rdr` if proven.
-- IPv6 must be handled explicitly. The lifecycle runner currently requires
-  `container network inspect` to report the IPv6 prefix before a VM can start.
+- IPv6 must be handled explicitly. The lifecycle runner either requires
+  `container network inspect` to report the IPv6 prefix or uses the separately
+  named `ipv4-only-no-guest-ipv6` posture to prove the guest has no routable
+  IPv6 before releasing the real command.
 - Existing host services bound to `0.0.0.0` are reachable from the VM unless
   blocked. This is the main isolation gap after switching to `--internal`.
 - Cleanup must remove live PF states. Otherwise an already-open connection may
