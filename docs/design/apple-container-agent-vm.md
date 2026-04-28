@@ -257,12 +257,12 @@ If this works, it avoids exposing the broker on wildcard host interfaces.
 
 ### Bootstrap
 
-macOS `/etc/pf.conf` defines Apple anchor points but not a `writ/*` anchor.
-Install a one-time top-level anchor for writ rather than loading under
-`com.apple/*`:
+macOS `/etc/pf.conf` defines Apple anchor points but not a writ session
+anchor. Install a one-time top-level rule that points directly at the
+per-session anchor path rather than loading under `com.apple/*`:
 
 ```pf
-anchor "writ/*"
+anchor "writ/session/*"
 ```
 
 The helper can then load session rules into anchors such as:
@@ -273,6 +273,8 @@ writ/session/<session-id>
 
 This bootstrap is a setup step and should be explicit in the installer docs.
 The broker should refuse to start VM sessions if the anchor point is missing.
+Do not rely on `anchor "writ/*"` for this shape: on macOS PF it may not
+evaluate rules loaded into the nested `writ/session/<session-id>` anchor.
 
 ## Nix inside the VM
 
@@ -364,6 +366,42 @@ After that, add Rust tests around the pure parts:
 
 The PF integration test will need a privileged test harness and should be
 opt-in. The pure rendering and allocation tests should run unprivileged.
+
+Manual PF proof harness added in `scripts/prove-pf-internal-network.sh`:
+
+- creates a temporary Apple `container --internal` network and Alpine VM;
+- starts one host broker listener and one host forbidden listener;
+- renders the temporary `writ/session/<uuid>` PF anchor through
+  `src/core/agent_vm.rs`;
+- loads the anchor only after `pfctl -n` accepts the generated rules;
+- asserts broker reachability, forbidden-host-port blocking, direct IPv4
+  blocking, and direct external-DNS blocking; when network inspect reports
+  IPv6 and the VM has an address in that prefix, it also asserts host IPv6
+  lateral blocking and IPv6 non-bypass;
+- stops the VM, removes the network, flushes the PF anchor, and kills matching
+  PF states through `trap` cleanup.
+
+It is deliberately not part of normal CI because it needs Apple `container`,
+`pfctl`, root privileges, and the one-time top-level
+`anchor "writ/session/*"` PF
+bootstrap.
+
+Privileged proof result on 2026-04-28:
+
+- with only the broader `anchor "writ/*"` bootstrap, the VM could reach the
+  broker port but could also reach the forbidden host port. That indicates
+  rules loaded into `writ/session/<session-id>` were not being evaluated by
+  that bootstrap shape on macOS PF;
+- after adding the direct `anchor "writ/session/*"` bootstrap, the same
+  harness passed for IPv4: the VM reached the broker port, the forbidden host
+  port failed with `Connection refused` from PF `block return`, direct
+  `http://1.1.1.1/` failed, and external DNS via `1.1.1.1` failed;
+- the successful run did not prove IPv6 because Apple `container network
+  inspect` did not report both an IPv6 subnet and gateway, so the harness
+  skipped IPv6 probes explicitly;
+- a follow-up run with `anchor "writ/session/*"` present and the broader
+  `anchor "writ/*"` absent also passed, so the broader anchor is unnecessary
+  for this harness.
 
 ## Risks
 
