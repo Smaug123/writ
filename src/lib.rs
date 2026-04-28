@@ -5,6 +5,7 @@
 //! See `docs/design/broker.md` for the architecture overview.
 
 pub mod agent_vm_firewall;
+pub mod agent_vm_lifecycle;
 pub mod audit;
 pub mod config;
 pub mod core;
