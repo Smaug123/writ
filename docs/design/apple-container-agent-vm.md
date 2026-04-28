@@ -215,6 +215,36 @@ First manual helper slice implemented as `writ-agent-vm-pf-helper`:
   but the daemonized helper should persist `(session_id, ipv4, ipv6)` on
   install and reject mismatched removals.
 
+Second manual lifecycle slice implemented as `writ-agent-vm-runner`:
+
+- `start` allocates the session subnet from broker-owned IPv4/IPv6 pools and
+  derives stable Apple container network/VM names from the session ID;
+- it creates the Apple `--internal` network, runs `container network inspect`,
+  and refuses to continue unless the reported IPv4 subnet/gateway and IPv6
+  subnet/gateway match the planned session network;
+- only after that inspection passes does it install the PF session anchor
+  through `writ-agent-vm-pf-helper`, and only after PF install succeeds does it
+  run the VM;
+- if network creation succeeds but inspection or PF install fails, it removes
+  the network before returning an error; if VM start fails after PF install, it
+  attempts VM removal, then removes the PF anchor and network. Cleanup
+  attempts all applicable steps and reports all cleanup errors, not only the
+  first one;
+- `stop` reconstructs the session network from the same session ID, pools, and
+  subnet index, then removes VM, PF anchor/states, and network in that order;
+- both `start` and `stop` support `--dry-run`, which prints the exact process
+  invocations without touching `container` or PF.
+
+This deliberately does not carry the proof harness's IPv6 fallback into the
+real lifecycle path. If Apple `container network inspect` does not report a
+usable IPv6 subnet and gateway, `writ-agent-vm-runner start` fails closed
+before installing PF rules or starting the VM.
+
+The runner advertises the broker URL over the IPv4 host-only gateway for now.
+IPv6 is still validated and filtered, but it is not handed to the guest as a
+broker endpoint until the VM-facing transport has explicit IPv6 binding and
+authentication semantics.
+
 ### PF strategy
 
 The first implementation should be conservative:
@@ -423,7 +453,24 @@ Privileged proof result on 2026-04-28:
   skipped IPv6 probes explicitly;
 - a follow-up run with `anchor "writ/session/*"` present and the broader
   `anchor "writ/*"` absent also passed, so the broader anchor is unnecessary
-  for this harness.
+  for this harness;
+- after replacing the proof-only renderer with `writ-agent-vm-pf-helper`, the
+  helper-backed harness also passed: it validated and loaded
+  `writ/session/<session-id>`, allowed the broker port, blocked the forbidden
+  host port on the same gateway, cleaned up the anchor through helper `remove`,
+  and again skipped IPv6 because no usable IPv6 subnet and gateway were
+  reported.
+
+Manual lifecycle runner status:
+
+- `writ-agent-vm-runner start --dry-run` emits the intended ordering:
+  `container network create`, `container network inspect`, helper `install`,
+  then `container run` with the session network and no mount/publish flags;
+- `writ-agent-vm-runner stop --dry-run` emits cleanup in reverse authority
+  order: VM removal, helper `remove`, then network removal;
+- non-dry-run start is expected to fail closed on the current observed Apple
+  CLI output until `container network inspect` reports the IPv6 fields needed
+  to prove that the PF IPv6 prefix matches the actual VM network.
 
 ## Risks
 
@@ -432,8 +479,8 @@ Privileged proof result on 2026-04-28:
   rules.
 - Host-only vmnet gateway addresses are reachable but not bindable. This
   pushes us toward wildcard binding plus filtering, or PF `rdr` if proven.
-- IPv6 must be handled explicitly. The internal network creates an IPv6 prefix
-  as well as IPv4.
+- IPv6 must be handled explicitly. The lifecycle runner currently requires
+  `container network inspect` to report the IPv6 prefix before a VM can start.
 - Existing host services bound to `0.0.0.0` are reachable from the VM unless
   blocked. This is the main isolation gap after switching to `--internal`.
 - Cleanup must remove live PF states. Otherwise an already-open connection may

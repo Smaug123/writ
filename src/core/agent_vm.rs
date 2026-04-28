@@ -164,6 +164,10 @@ impl Ipv4Cidr {
         self.prefix <= other.prefix
             && (u32::from(other.network) & ipv4_mask(self.prefix)) == u32::from(self.network)
     }
+
+    pub fn contains_addr(self, addr: Ipv4Addr) -> bool {
+        (u32::from(addr) & ipv4_mask(self.prefix)) == u32::from(self.network)
+    }
 }
 
 impl std::fmt::Display for Ipv4Cidr {
@@ -198,6 +202,10 @@ impl Ipv6Cidr {
     pub fn contains_subnet(self, other: Self) -> bool {
         self.prefix <= other.prefix
             && (u128::from(other.network) & ipv6_mask(self.prefix)) == u128::from(self.network)
+    }
+
+    pub fn contains_addr(self, addr: Ipv6Addr) -> bool {
+        (u128::from(addr) & ipv6_mask(self.prefix)) == u128::from(self.network)
     }
 }
 
@@ -299,6 +307,10 @@ impl AgentNetwork {
 
     pub fn ipv6(self) -> Ipv6Cidr {
         self.ipv6
+    }
+
+    pub fn ipv4_gateway(self) -> Ipv4Addr {
+        Ipv4Addr::from(u32::from(self.ipv4.network()) + 1)
     }
 }
 
@@ -789,7 +801,9 @@ mod tests {
         let first = pool.allocate(0).unwrap();
         let second = pool.allocate(1).unwrap();
         assert_eq!(first.ipv4().to_string(), "192.168.0.0/24");
+        assert_eq!(first.ipv4_gateway(), Ipv4Addr::new(192, 168, 0, 1));
         assert_eq!(second.ipv4().to_string(), "192.168.1.0/24");
+        assert_eq!(second.ipv4_gateway(), Ipv4Addr::new(192, 168, 1, 1));
         assert_eq!(first.ipv6().to_string(), "fd83:b6f2:e57::/64");
         assert_eq!(second.ipv6().to_string(), "fd83:b6f2:e57:1::/64");
     }
@@ -967,6 +981,7 @@ mod tests {
             let network = pool.allocate(index).unwrap();
             prop_assert!(pool.ipv4_base().contains_subnet(network.ipv4()));
             prop_assert!(pool.ipv6_base().contains_subnet(network.ipv6()));
+            prop_assert!(network.ipv4().contains_addr(network.ipv4_gateway()));
         }
 
         #[test]
