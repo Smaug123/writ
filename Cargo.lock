@@ -2282,6 +2282,7 @@ dependencies = [
  "clap",
  "jsonwebtoken",
  "keyring",
+ "libc",
  "proptest",
  "reqwest",
  "rusqlite",

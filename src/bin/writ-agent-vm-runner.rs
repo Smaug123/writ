@@ -8,8 +8,10 @@ use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use writ::agent_vm_lifecycle::{
-    AgentVmResources, AgentVmSessionPlan, AgentVmSessionStopPlan, AgentVmToolPaths, ContainerImage,
-    Ipv6IsolationMode, ProcessInvocation, start_agent_vm_session, stop_agent_vm_session,
+    AgentVmResources, AgentVmSessionPlan, AgentVmSessionStateStore, AgentVmSessionStopPlan,
+    AgentVmToolPaths, ContainerImage, Ipv6IsolationMode, ProcessInvocation,
+    default_agent_vm_state_dir, start_agent_vm_session, start_managed_agent_vm_session,
+    stop_agent_vm_session, stop_managed_agent_vm_session,
 };
 use writ::core::{
     AgentNetworkPool, BrokerPort, BrokerPortRange, BrokerPorts, Ipv4Cidr, Ipv6Cidr, SessionId,
@@ -43,6 +45,10 @@ enum Cmd {
     Start(StartArgs),
     /// Remove VM, firewall, and network for one session.
     Stop(StopArgs),
+    /// Start a VM session and persist the cleanup facts needed for managed stop.
+    ManagedStart(ManagedStartArgs),
+    /// Stop a VM session using only its persisted state record.
+    ManagedStop(ManagedStopArgs),
 }
 
 #[derive(Args)]
@@ -95,6 +101,31 @@ struct StopArgs {
     /// IPv6 isolation mode used when the session was started.
     #[arg(long, value_enum)]
     ipv6_mode: Ipv6ModeArg,
+
+    /// Print commands instead of executing them.
+    #[arg(long)]
+    dry_run: bool,
+}
+
+#[derive(Args)]
+struct ManagedStartArgs {
+    #[command(flatten)]
+    start: StartArgs,
+
+    /// Directory for managed session state records.
+    #[arg(long, env = "WRIT_AGENT_VM_STATE_DIR")]
+    state_dir: Option<PathBuf>,
+}
+
+#[derive(Args)]
+struct ManagedStopArgs {
+    /// Session UUID whose persisted state should drive cleanup.
+    #[arg(long)]
+    session_id: String,
+
+    /// Directory for managed session state records.
+    #[arg(long, env = "WRIT_AGENT_VM_STATE_DIR")]
+    state_dir: Option<PathBuf>,
 
     /// Print commands instead of executing them.
     #[arg(long)]
@@ -177,8 +208,45 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 stop_agent_vm_session(&plan)?;
             }
         }
+        Cmd::ManagedStart(args) => {
+            let dry_run = args.start.dry_run;
+            let state_dir = args.state_dir;
+            let plan = build_start_plan(args.start, tools)?;
+            if dry_run {
+                print_invocations(&plan.start_invocations());
+            } else {
+                let state_dir = resolve_state_dir(state_dir)?;
+                let store = AgentVmSessionStateStore::new(state_dir);
+                let state = start_managed_agent_vm_session(&store, &plan)?;
+                println!("session_id={}", state.session_id());
+                println!("network={}", state.names().network());
+                println!("vm={}", state.names().vm());
+                for url in state.broker_urls() {
+                    println!("broker_url={}", url.as_str());
+                }
+            }
+        }
+        Cmd::ManagedStop(args) => {
+            let dry_run = args.dry_run;
+            let session_id = parse_session_id(&args.session_id)?;
+            let state_dir = resolve_state_dir(args.state_dir)?;
+            let store = AgentVmSessionStateStore::new(state_dir);
+            if dry_run {
+                let state = store.load(session_id)?;
+                print_invocations(&state.to_stop_plan(tools).stop_invocations());
+            } else {
+                stop_managed_agent_vm_session(&store, session_id, tools)?;
+            }
+        }
     }
     Ok(())
+}
+
+fn resolve_state_dir(state_dir: Option<PathBuf>) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    Ok(match state_dir {
+        Some(path) => path,
+        None => default_agent_vm_state_dir()?,
+    })
 }
 
 fn build_start_plan(
@@ -227,16 +295,18 @@ struct ParsedSession {
 }
 
 fn parse_session(args: &SessionArgs) -> Result<ParsedSession, Box<dyn std::error::Error>> {
-    let session_id: SessionId = args
-        .session_id
-        .parse()
-        .map_err(|e| format!("invalid session ID: {e}"))?;
+    let session_id = parse_session_id(&args.session_id)?;
     let ipv4_pool = parse_ipv4_cidr(&args.ipv4_pool)?;
     let ipv6_pool = parse_ipv6_cidr(&args.ipv6_pool)?;
     Ok(ParsedSession {
         session_id,
         pool: AgentNetworkPool::new(ipv4_pool, ipv6_pool)?,
     })
+}
+
+fn parse_session_id(raw: &str) -> Result<SessionId, Box<dyn std::error::Error>> {
+    raw.parse()
+        .map_err(|e| format!("invalid session ID: {e}").into())
 }
 
 fn parse_ipv4_cidr(raw: &str) -> Result<Ipv4Cidr, Box<dyn std::error::Error>> {
@@ -321,7 +391,28 @@ mod tests {
         .unwrap();
         match cli.cmd {
             Cmd::Stop(args) => assert_eq!(args.ipv6_mode, Ipv6ModeArg::Ipv4OnlyNoGuestIpv6),
-            Cmd::Start(_) => panic!("expected stop command"),
+            Cmd::Start(_) | Cmd::ManagedStart(_) | Cmd::ManagedStop(_) => {
+                panic!("expected stop command")
+            }
+        }
+    }
+
+    #[test]
+    fn managed_stop_requires_only_session_id_for_cleanup_scope() {
+        let cli = Cli::try_parse_from([
+            "writ-agent-vm-runner",
+            "managed-stop",
+            "--session-id",
+            "51b8fd0f-6c10-454c-b0e6-7df1d60e2e6d",
+        ])
+        .unwrap();
+        match cli.cmd {
+            Cmd::ManagedStop(args) => {
+                assert_eq!(args.session_id, "51b8fd0f-6c10-454c-b0e6-7df1d60e2e6d");
+            }
+            Cmd::Start(_) | Cmd::Stop(_) | Cmd::ManagedStart(_) => {
+                panic!("expected managed-stop command")
+            }
         }
     }
 }

@@ -15,6 +15,7 @@ rusqlite = { version = "0.38", features = ["bundled"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "fs", "time", "sync", "io-util"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots", "http2"] }
 jsonwebtoken = "9"
+libc = "0.2"
 
 [dev-dependencies]
 proptest = "1"

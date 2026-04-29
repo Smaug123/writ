@@ -245,6 +245,48 @@ quiet-list cleanup postconditions:
   invocations that may be used for the lifecycle path without touching
   `container` or PF.
 
+First stateful lifecycle-manager slice implemented in `writ-agent-vm-runner`
+managed mode:
+
+- `managed-start` uses the same lifecycle plan as `start`, but first writes a
+  durable per-session state record under
+  `$XDG_STATE_HOME/writ/agent-vm-sessions` or
+  `~/.local/state/writ/agent-vm-sessions`, overrideable on managed commands
+  with `--state-dir` / `WRIT_AGENT_VM_STATE_DIR`. Empty `XDG_STATE_HOME` is
+  treated as unset, and missing or invalid `HOME` fails visibly rather than
+  falling back to a temporary directory. On Unix the state directory is
+  forced to mode `0700`, state files are created as `0600`, and file/directory
+  syncs are used around create, replace, and remove operations;
+- the record stores the session ID, broker-owned pools, subnet index, exact
+  derived IPv4/IPv6 subnets, firewall IPv6 scope, VM/network names, broker
+  ports and allowed port range, IPv6 mode, image, guest command, and resource
+  sizing. On read, these redundant facts are re-derived and cross-checked, so
+  a corrupted or hand-edited record fails closed instead of driving cleanup
+  with mismatched parameters;
+- if `managed-start` fails before creating any infrastructure, it removes the
+  state record. If it fails after partial infrastructure creation and rollback
+  cleanup also fails, the `Starting` record remains so `managed-stop` can retry
+  cleanup from recorded facts. Managed start and stop take a state-store OS
+  advisory lock while interpreting those records, and `Starting -> Running`
+  promotion only succeeds if the original `Starting` record is still present
+  and unchanged. The lock is blocking: a concurrent managed operation waits
+  until the current one releases the store lock, so a wedged runner process must
+  be killed or supervised by the caller before later managed operations can
+  proceed;
+- `managed-stop` accepts only `--session-id`, loads the recorded state, derives
+  the `AgentVmSessionStopPlan` from that record, accepts both `Starting` and
+  `Running` records, and removes the state file only after VM, PF, and network
+  cleanup report success. If cleanup fails, the record remains so the same
+  session can be retried without asking the caller to reconstruct subnet or
+  IPv6-mode arguments;
+- state schema version `1` is fail-closed. There is no migration path yet:
+  bumping the version rejects older records on disk until an explicit migrator
+  is implemented;
+- the existing stateless `start`/`stop` commands remain available for manual
+  proof harnesses and low-level debugging, but the production broker should
+  call the managed commands or the equivalent Rust `start_managed...` /
+  `stop_managed...` API.
+
 The runner advertises the broker URL over the IPv4 host-only gateway for now.
 In `dual-stack-required` mode, IPv6 is validated and filtered, but it is not
 handed to the guest as a broker endpoint until the VM-facing transport has

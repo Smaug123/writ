@@ -6,9 +6,16 @@
 //! descriptions as process invocations.
 
 use std::ffi::OsString;
+use std::fs::{self, File, OpenOptions};
+use std::io::Write;
 use std::net::{Ipv4Addr, Ipv6Addr};
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 use crate::core::{
     AgentNetwork, AgentNetworkPool, AgentVmConfigError, BrokerPortRange, BrokerPorts, Ipv4Cidr,
@@ -40,6 +47,7 @@ const RESOURCE_ABSENCE_DELAY: std::time::Duration = std::time::Duration::from_mi
 pub struct AgentVmSessionPlan {
     session_id: SessionId,
     pool: AgentNetworkPool,
+    subnet_index: u16,
     network: AgentNetwork,
     names: AgentVmNames,
     broker_ports: BrokerPorts,
@@ -59,6 +67,32 @@ pub struct AgentVmSessionStopPlan {
     firewall_ipv6: Option<Ipv6Cidr>,
     names: AgentVmNames,
     tools: AgentVmToolPaths,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AgentVmSessionState {
+    status: AgentVmSessionStateStatus,
+    session_id: SessionId,
+    pool: AgentNetworkPool,
+    subnet_index: u16,
+    network: AgentNetwork,
+    names: AgentVmNames,
+    broker_ports: BrokerPorts,
+    broker_port_range: BrokerPortRange,
+    ipv6_mode: Ipv6IsolationMode,
+    image: ContainerImage,
+    guest_command: Vec<String>,
+    resources: AgentVmResources,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AgentVmSessionStateStore {
+    dir: PathBuf,
+}
+
+#[derive(Debug)]
+struct AgentVmSessionStateLock {
+    _file: File,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -110,6 +144,13 @@ pub struct BrokerUrl(String);
 pub enum Ipv6IsolationMode {
     DualStackRequired,
     Ipv4OnlyNoGuestIpv6,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentVmSessionStateStatus {
+    Starting,
+    Running,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -246,6 +287,111 @@ pub enum AgentVmLifecycleRunError {
     },
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum AgentVmSessionStateError {
+    #[error("agent VM state file already exists for session {session_id}: {path}")]
+    AlreadyExists {
+        session_id: SessionId,
+        path: PathBuf,
+    },
+    #[error("agent VM state file does not exist for session {session_id}: {path}")]
+    NotFound {
+        session_id: SessionId,
+        path: PathBuf,
+    },
+    #[error("cannot {operation} agent VM state file {path}: {source}")]
+    Io {
+        operation: &'static str,
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    #[error("invalid JSON in agent VM state file {path}: {source}")]
+    Json {
+        path: PathBuf,
+        source: serde_json::Error,
+    },
+    #[error("unsupported agent VM state version {version}; supported version is {supported}")]
+    UnsupportedVersion { version: u32, supported: u32 },
+    #[error("corrupt agent VM state: {message}")]
+    Corrupt { message: String },
+    #[error("agent VM state mismatch for session {session_id}: {message}")]
+    StateMismatch {
+        session_id: SessionId,
+        message: String,
+    },
+}
+
+#[derive(Debug, thiserror::Error, Eq, PartialEq)]
+pub enum AgentVmStateDirError {
+    #[error("HOME is not set; pass --state-dir or set WRIT_AGENT_VM_STATE_DIR")]
+    HomeUnset,
+    #[error("XDG_STATE_HOME must be an absolute path when set, got {path}")]
+    XdgStateHomeRelative { path: PathBuf },
+    #[error("HOME must be an absolute path when deriving agent VM state dir, got {path}")]
+    HomeRelative { path: PathBuf },
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum AgentVmSessionManagerError {
+    #[error(transparent)]
+    State(#[from] AgentVmSessionStateError),
+    #[error(transparent)]
+    Start(#[from] AgentVmLifecycleRunError),
+    #[error(transparent)]
+    Stop(#[from] CleanupErrors),
+    #[error("start failed: {start}; removing state also failed: {state}")]
+    StartStateCleanup {
+        start: Box<AgentVmLifecycleRunError>,
+        state: Box<AgentVmSessionStateError>,
+    },
+    #[error(
+        "session started but recording running state failed: {state}; starting state remains for cleanup"
+    )]
+    RunningStateUpdateAfterStart {
+        state: Box<AgentVmSessionStateError>,
+    },
+    /// The VM, firewall, and network cleanup succeeded; only the local state
+    /// record removal failed. Retrying managed stop is safe and should remove
+    /// the stale record once the state directory is writable again.
+    #[error("session stopped but removing state failed: {state}")]
+    StateRemoveAfterStop {
+        state: Box<AgentVmSessionStateError>,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedAgentVmSessionState {
+    version: u32,
+    status: AgentVmSessionStateStatus,
+    session_id: SessionId,
+    ipv4_pool: String,
+    ipv6_pool: String,
+    subnet_index: u16,
+    ipv4_cidr: String,
+    ipv6_cidr: String,
+    firewall_ipv6_cidr: Option<String>,
+    network_name: String,
+    vm_name: String,
+    broker_ports: Vec<u16>,
+    broker_port_min: u16,
+    broker_port_max: u16,
+    ipv6_mode: PersistedIpv6IsolationMode,
+    image: String,
+    guest_command: Vec<String>,
+    cpus: u16,
+    memory_mib: u32,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum PersistedIpv6IsolationMode {
+    DualStackRequired,
+    Ipv4OnlyNoGuestIpv6,
+}
+
+const AGENT_VM_SESSION_STATE_VERSION: u32 = 1;
+
 impl From<StartFailure> for AgentVmLifecycleRunError {
     fn from(value: StartFailure) -> Self {
         Self::Start(Box::new(value))
@@ -320,12 +466,13 @@ impl AgentVmSessionPlan {
         if ipv6_mode == Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6 && guest_command.is_empty() {
             return Err(AgentVmLifecycleConfigError::EmptyGuestCommandForIpv4OnlyNoGuestIpv6);
         }
-        let network = pool.allocate(subnet_index)?;
+        let (network, names) = derive_session_network(session_id, pool, subnet_index)?;
         Ok(Self {
             session_id,
             pool,
+            subnet_index,
             network,
-            names: AgentVmNames::for_session(session_id),
+            names,
             broker_ports,
             broker_port_range,
             ipv6_mode,
@@ -342,6 +489,10 @@ impl AgentVmSessionPlan {
 
     pub fn network(&self) -> AgentNetwork {
         self.network
+    }
+
+    pub fn subnet_index(&self) -> u16 {
+        self.subnet_index
     }
 
     pub fn ipv6_mode(&self) -> Ipv6IsolationMode {
@@ -414,10 +565,7 @@ impl AgentVmSessionPlan {
     }
 
     fn firewall_ipv6_cidr(&self) -> Option<Ipv6Cidr> {
-        match self.ipv6_mode {
-            Ipv6IsolationMode::DualStackRequired => Some(self.network.ipv6()),
-            Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6 => None,
-        }
+        firewall_ipv6_cidr_for_mode(self.ipv6_mode, self.network)
     }
 
     fn create_network_invocation(&self) -> ProcessInvocation {
@@ -591,10 +739,7 @@ impl AgentVmSessionStopPlan {
         tools: AgentVmToolPaths,
     ) -> Result<Self, AgentVmLifecycleConfigError> {
         let network = pool.allocate(subnet_index)?;
-        let firewall_ipv6 = match ipv6_mode {
-            Ipv6IsolationMode::DualStackRequired => Some(network.ipv6()),
-            Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6 => None,
-        };
+        let firewall_ipv6 = firewall_ipv6_cidr_for_mode(ipv6_mode, network);
         Ok(Self {
             session_id,
             pool,
@@ -603,6 +748,28 @@ impl AgentVmSessionStopPlan {
             names: AgentVmNames::for_session(session_id),
             tools,
         })
+    }
+
+    fn from_validated_parts(
+        session_id: SessionId,
+        pool: AgentNetworkPool,
+        network: AgentNetwork,
+        firewall_ipv6: Option<Ipv6Cidr>,
+        names: AgentVmNames,
+        tools: AgentVmToolPaths,
+    ) -> Self {
+        // Persisted state has already been parsed and cross-checked against the
+        // pool, subnet index, session-derived names, and IPv6 mode. Reusing the
+        // recorded network keeps cleanup tied to exactly the facts that start
+        // persisted, rather than reinterpreting caller-supplied stop arguments.
+        Self {
+            session_id,
+            pool,
+            network,
+            firewall_ipv6,
+            names,
+            tools,
+        }
     }
 
     pub fn session_id(&self) -> SessionId {
@@ -714,6 +881,518 @@ impl AgentVmSessionStopPlan {
             ),
             self.names.network.clone(),
         )
+    }
+}
+
+impl AgentVmSessionState {
+    fn from_start_plan(plan: &AgentVmSessionPlan, status: AgentVmSessionStateStatus) -> Self {
+        Self {
+            status,
+            session_id: plan.session_id,
+            pool: plan.pool,
+            subnet_index: plan.subnet_index(),
+            network: plan.network,
+            names: plan.names.clone(),
+            broker_ports: plan.broker_ports.clone(),
+            broker_port_range: plan.broker_port_range,
+            ipv6_mode: plan.ipv6_mode,
+            image: plan.image.clone(),
+            guest_command: plan.guest_command.clone(),
+            resources: plan.resources,
+        }
+    }
+
+    #[cfg(test)]
+    fn from_json_bytes(raw: &[u8]) -> Result<Self, AgentVmSessionStateError> {
+        let persisted: PersistedAgentVmSessionState =
+            serde_json::from_slice(raw).map_err(|source| AgentVmSessionStateError::Json {
+                path: PathBuf::from("<memory>"),
+                source,
+            })?;
+        Self::from_persisted(persisted)
+    }
+
+    fn from_json_file(path: &Path, raw: &[u8]) -> Result<Self, AgentVmSessionStateError> {
+        let persisted: PersistedAgentVmSessionState =
+            serde_json::from_slice(raw).map_err(|source| AgentVmSessionStateError::Json {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        Self::from_persisted(persisted)
+    }
+
+    fn from_persisted(
+        persisted: PersistedAgentVmSessionState,
+    ) -> Result<Self, AgentVmSessionStateError> {
+        if persisted.version != AGENT_VM_SESSION_STATE_VERSION {
+            return Err(AgentVmSessionStateError::UnsupportedVersion {
+                version: persisted.version,
+                supported: AGENT_VM_SESSION_STATE_VERSION,
+            });
+        }
+
+        let ipv4_pool = parse_state_ipv4_cidr("ipv4_pool", &persisted.ipv4_pool)?;
+        let ipv6_pool = parse_state_ipv6_cidr("ipv6_pool", &persisted.ipv6_pool)?;
+        let pool = AgentNetworkPool::new(ipv4_pool, ipv6_pool)
+            .map_err(|err| corrupt_state(format!("invalid network pool: {err}")))?;
+        let recorded_ipv4 = parse_state_ipv4_cidr("ipv4_cidr", &persisted.ipv4_cidr)?;
+        let recorded_ipv6 = parse_state_ipv6_cidr("ipv6_cidr", &persisted.ipv6_cidr)?;
+        let firewall_ipv6 = persisted
+            .firewall_ipv6_cidr
+            .as_deref()
+            .map(|raw| parse_state_ipv6_cidr("firewall_ipv6_cidr", raw))
+            .transpose()?;
+        let broker_ports = BrokerPorts::new(
+            persisted
+                .broker_ports
+                .iter()
+                .copied()
+                .map(crate::core::BrokerPort::new)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|err| corrupt_state(format!("invalid broker port: {err}")))?,
+        )
+        .map_err(|err| corrupt_state(format!("invalid broker ports: {err}")))?;
+        let broker_port_range =
+            BrokerPortRange::new(persisted.broker_port_min, persisted.broker_port_max)
+                .map_err(|err| corrupt_state(format!("invalid broker port range: {err}")))?;
+        let ipv6_mode = persisted.ipv6_mode.into();
+        let image = ContainerImage::new(persisted.image)
+            .map_err(|err| corrupt_state(format!("invalid image: {err}")))?;
+        let resources = AgentVmResources::new(persisted.cpus, persisted.memory_mib)
+            .map_err(|err| corrupt_state(format!("invalid resources: {err}")))?;
+
+        broker_port_range
+            .require_contains(&broker_ports)
+            .map_err(|err| corrupt_state(format!("invalid broker ports: {err}")))?;
+        if ipv6_mode == Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6 && persisted.guest_command.is_empty()
+        {
+            return Err(corrupt_state(
+                "IPv4-only guest IPv6 preflight requires an explicit guest command",
+            ));
+        }
+
+        let (network, names) =
+            derive_session_network(persisted.session_id, pool, persisted.subnet_index)
+                .map_err(|err| corrupt_state(format!("invalid session network: {err}")))?;
+
+        if network.ipv4() != recorded_ipv4 {
+            return Err(corrupt_state(format!(
+                "recorded IPv4 subnet {recorded_ipv4} does not match pool/index allocation {}",
+                network.ipv4()
+            )));
+        }
+        if network.ipv6() != recorded_ipv6 {
+            return Err(corrupt_state(format!(
+                "recorded IPv6 subnet {recorded_ipv6} does not match pool/index allocation {}",
+                network.ipv6()
+            )));
+        }
+        if persisted.network_name != names.network() {
+            return Err(corrupt_state(format!(
+                "recorded network name {:?} does not match session-derived name {:?}",
+                persisted.network_name,
+                names.network()
+            )));
+        }
+        if persisted.vm_name != names.vm() {
+            return Err(corrupt_state(format!(
+                "recorded VM name {:?} does not match session-derived name {:?}",
+                persisted.vm_name,
+                names.vm()
+            )));
+        }
+        if firewall_ipv6 != firewall_ipv6_cidr_for_mode(ipv6_mode, network) {
+            return Err(corrupt_state(
+                "recorded firewall IPv6 scope does not match IPv6 mode".to_string(),
+            ));
+        }
+
+        Ok(Self {
+            status: persisted.status,
+            session_id: persisted.session_id,
+            pool,
+            subnet_index: persisted.subnet_index,
+            network,
+            names,
+            broker_ports,
+            broker_port_range,
+            ipv6_mode,
+            image,
+            guest_command: persisted.guest_command,
+            resources,
+        })
+    }
+
+    fn to_json_bytes(&self) -> Result<Vec<u8>, AgentVmSessionStateError> {
+        serde_json::to_vec_pretty(&PersistedAgentVmSessionState::from(self)).map_err(|source| {
+            AgentVmSessionStateError::Json {
+                path: PathBuf::from("<memory>"),
+                source,
+            }
+        })
+    }
+
+    fn with_status(&self, status: AgentVmSessionStateStatus) -> Self {
+        Self {
+            status,
+            ..self.clone()
+        }
+    }
+
+    pub fn status(&self) -> AgentVmSessionStateStatus {
+        self.status
+    }
+
+    pub fn session_id(&self) -> SessionId {
+        self.session_id
+    }
+
+    pub fn network(&self) -> AgentNetwork {
+        self.network
+    }
+
+    pub fn names(&self) -> &AgentVmNames {
+        &self.names
+    }
+
+    pub fn ipv6_mode(&self) -> Ipv6IsolationMode {
+        self.ipv6_mode
+    }
+
+    pub fn broker_urls(&self) -> Vec<BrokerUrl> {
+        self.broker_ports
+            .as_slice()
+            .iter()
+            .map(|port| {
+                BrokerUrl(format!(
+                    "http://{}:{}/",
+                    self.network.ipv4_gateway(),
+                    port.get()
+                ))
+            })
+            .collect()
+    }
+
+    pub fn to_stop_plan(&self, tools: AgentVmToolPaths) -> AgentVmSessionStopPlan {
+        AgentVmSessionStopPlan::from_validated_parts(
+            self.session_id,
+            self.pool,
+            self.network,
+            firewall_ipv6_cidr_for_mode(self.ipv6_mode, self.network),
+            self.names.clone(),
+            tools,
+        )
+    }
+}
+
+impl AgentVmSessionStateStore {
+    pub fn new(dir: impl Into<PathBuf>) -> Self {
+        Self { dir: dir.into() }
+    }
+
+    pub fn path_for(&self, session_id: SessionId) -> PathBuf {
+        self.dir.join(format!("{session_id}.json"))
+    }
+
+    fn lock_path(&self) -> PathBuf {
+        self.dir.join(".store.lock")
+    }
+
+    pub fn create_starting(
+        &self,
+        plan: &AgentVmSessionPlan,
+    ) -> Result<AgentVmSessionState, AgentVmSessionStateError> {
+        let _lock = self.lock_store()?;
+        self.create_starting_unlocked(plan)
+    }
+
+    pub fn mark_running(
+        &self,
+        state: &AgentVmSessionState,
+    ) -> Result<AgentVmSessionState, AgentVmSessionStateError> {
+        let _lock = self.lock_store()?;
+        self.mark_running_unlocked(state)
+    }
+
+    fn create_starting_unlocked(
+        &self,
+        plan: &AgentVmSessionPlan,
+    ) -> Result<AgentVmSessionState, AgentVmSessionStateError> {
+        let state = AgentVmSessionState::from_start_plan(plan, AgentVmSessionStateStatus::Starting);
+        self.write_new(&state)?;
+        Ok(state)
+    }
+
+    fn mark_running_unlocked(
+        &self,
+        state: &AgentVmSessionState,
+    ) -> Result<AgentVmSessionState, AgentVmSessionStateError> {
+        let current = self.load_unlocked(state.session_id())?;
+        if &current != state || state.status() != AgentVmSessionStateStatus::Starting {
+            return Err(state_mismatch(
+                state.session_id(),
+                "running promotion requires the unchanged Starting state record",
+            ));
+        }
+        let running = state.with_status(AgentVmSessionStateStatus::Running);
+        self.write_replace(&running)?;
+        Ok(running)
+    }
+
+    pub fn load(
+        &self,
+        session_id: SessionId,
+    ) -> Result<AgentVmSessionState, AgentVmSessionStateError> {
+        self.require_state_file_exists(session_id)?;
+        let _lock = self.lock_existing_store()?;
+        self.load_unlocked(session_id)
+    }
+
+    fn load_unlocked(
+        &self,
+        session_id: SessionId,
+    ) -> Result<AgentVmSessionState, AgentVmSessionStateError> {
+        let path = self.path_for(session_id);
+        let raw = fs::read(&path).map_err(|source| match source.kind() {
+            std::io::ErrorKind::NotFound => AgentVmSessionStateError::NotFound {
+                session_id,
+                path: path.clone(),
+            },
+            _ => AgentVmSessionStateError::Io {
+                operation: "read",
+                path: path.clone(),
+                source,
+            },
+        })?;
+        let state = AgentVmSessionState::from_json_file(&path, &raw)?;
+        if state.session_id() != session_id {
+            return Err(corrupt_state(format!(
+                "state file {} contains session {}, but was loaded as session {session_id}",
+                path.display(),
+                state.session_id()
+            )));
+        }
+        Ok(state)
+    }
+
+    pub fn remove(&self, session_id: SessionId) -> Result<(), AgentVmSessionStateError> {
+        let _lock = self.lock_store()?;
+        self.remove_unlocked(session_id)
+    }
+
+    fn remove_unlocked(&self, session_id: SessionId) -> Result<(), AgentVmSessionStateError> {
+        let path = self.path_for(session_id);
+        fs::remove_file(&path).map_err(|source| match source.kind() {
+            std::io::ErrorKind::NotFound => AgentVmSessionStateError::NotFound {
+                session_id,
+                path: path.clone(),
+            },
+            _ => AgentVmSessionStateError::Io {
+                operation: "remove",
+                path: path.clone(),
+                source,
+            },
+        })?;
+        self.sync_dir()
+    }
+
+    fn require_state_file_exists(
+        &self,
+        session_id: SessionId,
+    ) -> Result<(), AgentVmSessionStateError> {
+        let path = self.path_for(session_id);
+        fs::metadata(&path)
+            .map(|_| ())
+            .map_err(|source| match source.kind() {
+                std::io::ErrorKind::NotFound => AgentVmSessionStateError::NotFound {
+                    session_id,
+                    path: path.clone(),
+                },
+                _ => AgentVmSessionStateError::Io {
+                    operation: "stat",
+                    path: path.clone(),
+                    source,
+                },
+            })
+    }
+
+    fn lock_store(&self) -> Result<AgentVmSessionStateLock, AgentVmSessionStateError> {
+        self.ensure_dir()?;
+        self.open_lock(true)
+    }
+
+    fn lock_existing_store(&self) -> Result<AgentVmSessionStateLock, AgentVmSessionStateError> {
+        self.open_lock(false)
+    }
+
+    fn open_lock(&self, create: bool) -> Result<AgentVmSessionStateLock, AgentVmSessionStateError> {
+        let path = self.lock_path();
+        let mut options = OpenOptions::new();
+        options.read(true).write(true);
+        if create {
+            options.create(true);
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let file = options
+            .open(&path)
+            .map_err(|source| AgentVmSessionStateError::Io {
+                operation: "open lock",
+                path: path.clone(),
+                source,
+            })?;
+        lock_file_exclusive(&file, &path)?;
+        Ok(AgentVmSessionStateLock { _file: file })
+    }
+
+    fn write_new(&self, state: &AgentVmSessionState) -> Result<(), AgentVmSessionStateError> {
+        self.ensure_dir()?;
+        let final_path = self.path_for(state.session_id());
+        let temp_path = self.temp_path(state.session_id());
+        write_complete_file(&temp_path, &state.to_json_bytes()?)?;
+        let link_result = fs::hard_link(&temp_path, &final_path);
+        match link_result {
+            Ok(()) => {
+                let _ = fs::remove_file(&temp_path);
+                self.sync_dir()
+            }
+            Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => {
+                let _ = fs::remove_file(&temp_path);
+                Err(AgentVmSessionStateError::AlreadyExists {
+                    session_id: state.session_id(),
+                    path: final_path,
+                })
+            }
+            Err(source) => {
+                let _ = fs::remove_file(&temp_path);
+                Err(AgentVmSessionStateError::Io {
+                    operation: "create link",
+                    path: final_path,
+                    source,
+                })
+            }
+        }
+    }
+
+    fn write_replace(&self, state: &AgentVmSessionState) -> Result<(), AgentVmSessionStateError> {
+        self.ensure_dir()?;
+        let final_path = self.path_for(state.session_id());
+        let temp_path = self.temp_path(state.session_id());
+        write_complete_file(&temp_path, &state.to_json_bytes()?)?;
+        fs::rename(&temp_path, &final_path).map_err(|source| AgentVmSessionStateError::Io {
+            operation: "replace",
+            path: final_path.clone(),
+            source,
+        })?;
+        self.sync_dir()
+    }
+
+    fn ensure_dir(&self) -> Result<(), AgentVmSessionStateError> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+
+            let mut builder = fs::DirBuilder::new();
+            builder.recursive(true).mode(0o700);
+            builder
+                .create(&self.dir)
+                .map_err(|source| AgentVmSessionStateError::Io {
+                    operation: "create directory",
+                    path: self.dir.clone(),
+                    source,
+                })?;
+            fs::set_permissions(&self.dir, fs::Permissions::from_mode(0o700)).map_err(
+                |source| AgentVmSessionStateError::Io {
+                    operation: "set directory permissions",
+                    path: self.dir.clone(),
+                    source,
+                },
+            )?;
+            Ok(())
+        }
+
+        #[cfg(not(unix))]
+        {
+            fs::create_dir_all(&self.dir).map_err(|source| AgentVmSessionStateError::Io {
+                operation: "create directory",
+                path: self.dir.clone(),
+                source,
+            })
+        }
+    }
+
+    fn sync_dir(&self) -> Result<(), AgentVmSessionStateError> {
+        let dir = File::open(&self.dir).map_err(|source| AgentVmSessionStateError::Io {
+            operation: "open directory",
+            path: self.dir.clone(),
+            source,
+        })?;
+        dir.sync_all()
+            .map_err(|source| AgentVmSessionStateError::Io {
+                operation: "sync directory",
+                path: self.dir.clone(),
+                source,
+            })
+    }
+
+    fn temp_path(&self, session_id: SessionId) -> PathBuf {
+        self.dir
+            .join(format!(".{session_id}.{}.tmp", Uuid::new_v4()))
+    }
+}
+
+impl From<&AgentVmSessionState> for PersistedAgentVmSessionState {
+    fn from(value: &AgentVmSessionState) -> Self {
+        Self {
+            version: AGENT_VM_SESSION_STATE_VERSION,
+            status: value.status,
+            session_id: value.session_id,
+            ipv4_pool: value.pool.ipv4_base().to_string(),
+            ipv6_pool: value.pool.ipv6_base().to_string(),
+            subnet_index: value.subnet_index,
+            ipv4_cidr: value.network.ipv4().to_string(),
+            ipv6_cidr: value.network.ipv6().to_string(),
+            firewall_ipv6_cidr: match value.ipv6_mode {
+                Ipv6IsolationMode::DualStackRequired => Some(value.network.ipv6().to_string()),
+                Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6 => None,
+            },
+            network_name: value.names.network().to_string(),
+            vm_name: value.names.vm().to_string(),
+            broker_ports: value
+                .broker_ports
+                .as_slice()
+                .iter()
+                .map(|port| port.get())
+                .collect(),
+            broker_port_min: value.broker_port_range.min().get(),
+            broker_port_max: value.broker_port_range.max().get(),
+            ipv6_mode: value.ipv6_mode.into(),
+            image: value.image.as_str().to_string(),
+            guest_command: value.guest_command.clone(),
+            cpus: value.resources.cpus(),
+            memory_mib: value.resources.memory_mib(),
+        }
+    }
+}
+
+impl From<Ipv6IsolationMode> for PersistedIpv6IsolationMode {
+    fn from(value: Ipv6IsolationMode) -> Self {
+        match value {
+            Ipv6IsolationMode::DualStackRequired => Self::DualStackRequired,
+            Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6 => Self::Ipv4OnlyNoGuestIpv6,
+        }
+    }
+}
+
+impl From<PersistedIpv6IsolationMode> for Ipv6IsolationMode {
+    fn from(value: PersistedIpv6IsolationMode) -> Self {
+        match value {
+            PersistedIpv6IsolationMode::DualStackRequired => Self::DualStackRequired,
+            PersistedIpv6IsolationMode::Ipv4OnlyNoGuestIpv6 => Self::Ipv4OnlyNoGuestIpv6,
+        }
     }
 }
 
@@ -1055,6 +1734,108 @@ pub fn stop_agent_vm_session(plan: &AgentVmSessionStopPlan) -> Result<(), Cleanu
     run_stop_plan_cleanup(plan)
 }
 
+pub fn start_managed_agent_vm_session(
+    store: &AgentVmSessionStateStore,
+    plan: &AgentVmSessionPlan,
+) -> Result<AgentVmSessionState, AgentVmSessionManagerError> {
+    let _lock = store.lock_store()?;
+    let starting = store.create_starting_unlocked(plan)?;
+    if let Err(start) = start_agent_vm_session(plan) {
+        if start_failure_left_dirty_infrastructure(&start) {
+            return Err(start.into());
+        }
+        return match store.remove_unlocked(plan.session_id()) {
+            Ok(()) => Err(start.into()),
+            Err(state) => Err(AgentVmSessionManagerError::StartStateCleanup {
+                start: Box::new(start),
+                state: Box::new(state),
+            }),
+        };
+    }
+    store.mark_running_unlocked(&starting).map_err(|state| {
+        AgentVmSessionManagerError::RunningStateUpdateAfterStart {
+            state: Box::new(state),
+        }
+    })
+}
+
+fn start_failure_left_dirty_infrastructure(error: &AgentVmLifecycleRunError) -> bool {
+    matches!(error, AgentVmLifecycleRunError::CleanupAfterFailure { .. })
+}
+
+pub fn stop_managed_agent_vm_session(
+    store: &AgentVmSessionStateStore,
+    session_id: SessionId,
+    tools: AgentVmToolPaths,
+) -> Result<(), AgentVmSessionManagerError> {
+    let _lock = store.lock_store()?;
+    let state = store.load_unlocked(session_id)?;
+    // No wildcard: adding a future status must revisit managed-stop cleanup
+    // semantics before this match compiles.
+    match state.status() {
+        // A managed start that failed during rollback intentionally leaves a
+        // Starting record behind. It carries the same cleanup facts as a
+        // Running record, so managed stop must accept both.
+        AgentVmSessionStateStatus::Starting | AgentVmSessionStateStatus::Running => {}
+    }
+    stop_agent_vm_session(&state.to_stop_plan(tools))?;
+    store.remove_unlocked(session_id).map_err(|state| {
+        AgentVmSessionManagerError::StateRemoveAfterStop {
+            state: Box::new(state),
+        }
+    })
+}
+
+pub fn default_agent_vm_state_dir() -> Result<PathBuf, AgentVmStateDirError> {
+    default_agent_vm_state_dir_from_env(
+        std::env::var_os("XDG_STATE_HOME"),
+        std::env::var_os("HOME"),
+    )
+}
+
+fn default_agent_vm_state_dir_from_env(
+    xdg_state_home: Option<OsString>,
+    home: Option<OsString>,
+) -> Result<PathBuf, AgentVmStateDirError> {
+    if let Some(dir) = xdg_state_home.filter(|dir| !dir.as_os_str().is_empty()) {
+        let dir = PathBuf::from(dir);
+        if !dir.is_absolute() {
+            return Err(AgentVmStateDirError::XdgStateHomeRelative { path: dir });
+        }
+        return Ok(dir.join("writ/agent-vm-sessions"));
+    }
+
+    let home = home
+        .filter(|home| !home.as_os_str().is_empty())
+        .ok_or(AgentVmStateDirError::HomeUnset)?;
+    let home = PathBuf::from(home);
+    if !home.is_absolute() {
+        return Err(AgentVmStateDirError::HomeRelative { path: home });
+    }
+    Ok(home.join(".local/state/writ/agent-vm-sessions"))
+}
+
+fn derive_session_network(
+    session_id: SessionId,
+    pool: AgentNetworkPool,
+    subnet_index: u16,
+) -> Result<(AgentNetwork, AgentVmNames), AgentVmLifecycleConfigError> {
+    Ok((
+        pool.allocate(subnet_index)?,
+        AgentVmNames::for_session(session_id),
+    ))
+}
+
+fn firewall_ipv6_cidr_for_mode(
+    ipv6_mode: Ipv6IsolationMode,
+    network: AgentNetwork,
+) -> Option<Ipv6Cidr> {
+    match ipv6_mode {
+        Ipv6IsolationMode::DualStackRequired => Some(network.ipv6()),
+        Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6 => None,
+    }
+}
+
 fn fail_after_cleanup<T>(
     original: StartFailure,
     plan: &AgentVmSessionPlan,
@@ -1198,6 +1979,107 @@ fn resource_list_contains_exact_line(raw: &[u8], name: &str) -> bool {
     String::from_utf8_lossy(raw)
         .lines()
         .any(|line| line.trim() == name)
+}
+
+fn write_complete_file(path: &Path, contents: &[u8]) -> Result<(), AgentVmSessionStateError> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(path)
+        .map_err(|source| AgentVmSessionStateError::Io {
+            operation: "create",
+            path: path.to_path_buf(),
+            source,
+        })?;
+    file.write_all(contents)
+        .map_err(|source| AgentVmSessionStateError::Io {
+            operation: "write",
+            path: path.to_path_buf(),
+            source,
+        })?;
+    file.sync_all()
+        .map_err(|source| AgentVmSessionStateError::Io {
+            operation: "sync",
+            path: path.to_path_buf(),
+            source,
+        })
+}
+
+#[cfg(unix)]
+fn lock_file_exclusive(file: &File, path: &Path) -> Result<(), AgentVmSessionStateError> {
+    // SAFETY: `flock` only observes the valid file descriptor borrowed from
+    // `file`; the descriptor remains open for the lifetime of the returned
+    // lock guard.
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(AgentVmSessionStateError::Io {
+            operation: "lock",
+            path: path.to_path_buf(),
+            source: std::io::Error::last_os_error(),
+        })
+    }
+}
+
+#[cfg(not(unix))]
+fn lock_file_exclusive(_file: &File, _path: &Path) -> Result<(), AgentVmSessionStateError> {
+    Ok(())
+}
+
+fn parse_state_ipv4_cidr(
+    field: &'static str,
+    raw: &str,
+) -> Result<Ipv4Cidr, AgentVmSessionStateError> {
+    parse_state_cidr(field, raw, "IPv4", Ipv4Cidr::new)
+}
+
+fn parse_state_ipv6_cidr(
+    field: &'static str,
+    raw: &str,
+) -> Result<Ipv6Cidr, AgentVmSessionStateError> {
+    parse_state_cidr(field, raw, "IPv6", Ipv6Cidr::new)
+}
+
+fn parse_state_cidr<A, C>(
+    field: &'static str,
+    raw: &str,
+    family: &'static str,
+    construct: impl FnOnce(A, u8) -> Result<C, AgentVmConfigError>,
+) -> Result<C, AgentVmSessionStateError>
+where
+    A: std::str::FromStr,
+    A::Err: std::fmt::Display,
+{
+    let (addr, prefix) = raw
+        .split_once('/')
+        .ok_or_else(|| corrupt_state(format!("{field} must be a CIDR, got {raw:?}")))?;
+    let addr = addr
+        .parse::<A>()
+        .map_err(|err| corrupt_state(format!("{field} has invalid {family} address: {err}")))?;
+    let prefix = prefix
+        .parse::<u8>()
+        .map_err(|err| corrupt_state(format!("{field} has invalid prefix: {err}")))?;
+    construct(addr, prefix)
+        .map_err(|err| corrupt_state(format!("{field} is not a valid {family} CIDR: {err}")))
+}
+
+fn corrupt_state(message: impl Into<String>) -> AgentVmSessionStateError {
+    AgentVmSessionStateError::Corrupt {
+        message: message.into(),
+    }
+}
+
+fn state_mismatch(session_id: SessionId, message: impl Into<String>) -> AgentVmSessionStateError {
+    AgentVmSessionStateError::StateMismatch {
+        session_id,
+        message: message.into(),
+    }
 }
 
 fn wait_for_guest_ipv6_inspection(
@@ -1445,7 +2327,12 @@ fn shell_quote(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
+    use std::ffi::OsString;
+    use std::fs;
     use std::net::{Ipv4Addr, Ipv6Addr};
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
 
     use proptest::prelude::*;
     use uuid::Uuid;
@@ -1508,6 +2395,122 @@ mod tests {
         .unwrap()
     }
 
+    fn arb_ipv6_mode() -> impl Strategy<Value = Ipv6IsolationMode> {
+        prop_oneof![
+            Just(Ipv6IsolationMode::DualStackRequired),
+            Just(Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6),
+        ]
+    }
+
+    fn arb_broker_ports_and_range() -> impl Strategy<Value = (BrokerPorts, BrokerPortRange)> {
+        (
+            prop::collection::vec(1024u16..=65535, 1..=4),
+            0u16..=1024,
+            0u16..=1024,
+        )
+            .prop_map(|(ports, min_slack, max_slack)| {
+                let broker_ports = BrokerPorts::new(
+                    ports
+                        .iter()
+                        .copied()
+                        .map(BrokerPort::new)
+                        .collect::<Result<Vec<_>, _>>()
+                        .unwrap(),
+                )
+                .unwrap();
+                let min_port = broker_ports
+                    .as_slice()
+                    .iter()
+                    .map(|port| port.get())
+                    .min()
+                    .unwrap();
+                let max_port = broker_ports
+                    .as_slice()
+                    .iter()
+                    .map(|port| port.get())
+                    .max()
+                    .unwrap();
+                let range_min = min_port.saturating_sub(min_slack).max(1024);
+                let range_max = max_port.saturating_add(max_slack);
+                (
+                    broker_ports,
+                    BrokerPortRange::new(range_min, range_max).unwrap(),
+                )
+            })
+    }
+
+    fn arb_plan() -> impl Strategy<Value = AgentVmSessionPlan> {
+        (
+            any::<u128>(),
+            any::<u8>(),
+            any::<u8>(),
+            any::<u16>(),
+            any::<u16>(),
+            any::<u8>(),
+            arb_broker_ports_and_range(),
+            arb_ipv6_mode(),
+            "[a-z][a-z0-9]{0,7}(:[a-z0-9]{1,8})?",
+            prop::collection::vec("[a-z][a-z0-9_-]{0,7}", 1..=4),
+            1u16..=8,
+            64u32..=8192,
+        )
+            .prop_map(
+                |(
+                    raw_session_id,
+                    ipv4_second_octet,
+                    ula_suffix,
+                    ipv6_second_segment,
+                    ipv6_third_segment,
+                    subnet_index,
+                    (broker_ports, broker_port_range),
+                    ipv6_mode,
+                    image,
+                    guest_command,
+                    cpus,
+                    memory_mib,
+                )| {
+                    let pool = AgentNetworkPool::new(
+                        Ipv4Cidr::new(Ipv4Addr::new(10, ipv4_second_octet, 0, 0), 16).unwrap(),
+                        Ipv6Cidr::new(
+                            Ipv6Addr::new(
+                                0xfd00 | u16::from(ula_suffix),
+                                ipv6_second_segment,
+                                ipv6_third_segment,
+                                0,
+                                0,
+                                0,
+                                0,
+                                0,
+                            ),
+                            48,
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap();
+                    AgentVmSessionPlan::new(
+                        SessionId::from_uuid(Uuid::from_u128(raw_session_id)),
+                        pool,
+                        u16::from(subnet_index),
+                        broker_ports,
+                        broker_port_range,
+                        ipv6_mode,
+                        ContainerImage::new(image).unwrap(),
+                        guest_command,
+                        AgentVmResources::new(cpus, memory_mib).unwrap(),
+                        AgentVmToolPaths::new("container", "writ-agent-vm-pf-helper", "sudo"),
+                    )
+                    .unwrap()
+                },
+            )
+    }
+
+    fn arb_state_status() -> impl Strategy<Value = AgentVmSessionStateStatus> {
+        prop_oneof![
+            Just(AgentVmSessionStateStatus::Starting),
+            Just(AgentVmSessionStateStatus::Running),
+        ]
+    }
+
     fn inspection_for_plan(plan: &AgentVmSessionPlan) -> AppleNetworkInspection {
         let network = plan.network();
         AppleNetworkInspection {
@@ -1516,6 +2519,42 @@ mod tests {
             ipv6_subnet: Some(network.ipv6()),
             ipv6_gateway: Some(Ipv6Addr::from(u128::from(network.ipv6().network()) + 1)),
         }
+    }
+
+    fn state_json_value(state: &AgentVmSessionState) -> serde_json::Value {
+        serde_json::from_slice(&state.to_json_bytes().unwrap()).unwrap()
+    }
+
+    fn assert_state_json_rejected(raw: serde_json::Value) {
+        let encoded = serde_json::to_vec(&raw).unwrap();
+        let err = AgentVmSessionState::from_json_bytes(&encoded).unwrap_err();
+        assert!(matches!(err, AgentVmSessionStateError::Corrupt { .. }));
+    }
+
+    fn cleanup_error() -> ProcessInvocationError {
+        ProcessInvocationError::ResourceStillPresent {
+            program: "container".into(),
+            args: "network list --quiet".into(),
+            message: "network still appears in list".into(),
+        }
+    }
+
+    fn start_process_error() -> StartFailure {
+        StartFailure::Process(ProcessInvocationError::Run {
+            program: "container".into(),
+            args: "network create".into(),
+            source: std::io::Error::from(std::io::ErrorKind::NotFound),
+        })
+    }
+
+    #[cfg(unix)]
+    fn write_executable_script(dir: &Path, name: &str, contents: &str) -> PathBuf {
+        let path = dir.join(name);
+        fs::write(&path, contents).unwrap();
+        let mut permissions = fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&path, permissions).unwrap();
+        path
     }
 
     #[test]
@@ -2155,5 +3194,447 @@ mod tests {
                 .require_no_routable_ipv6()
                 .unwrap();
         }
+
+        #[test]
+        fn persisted_session_state_roundtrips_to_the_same_stop_plan(
+            plan in arb_plan(),
+            status in arb_state_status(),
+        ) {
+            let state = AgentVmSessionState::from_start_plan(
+                &plan,
+                status,
+            );
+            let encoded = state.to_json_bytes().unwrap();
+            let decoded = AgentVmSessionState::from_json_bytes(&encoded).unwrap();
+
+            prop_assert_eq!(&decoded, &state);
+            prop_assert_eq!(
+                decoded
+                    .to_stop_plan(AgentVmToolPaths::new("container", "writ-agent-vm-pf-helper", "sudo"))
+                    .stop_invocations(),
+                plan.stop_plan().stop_invocations()
+            );
+        }
+
+        #[test]
+        fn persisted_session_state_rejects_each_mutated_cross_checked_field(
+            plan in arb_plan(),
+        ) {
+            let state = AgentVmSessionState::from_start_plan(
+                &plan,
+                AgentVmSessionStateStatus::Running,
+            );
+            let alternate = plan
+                .pool
+                .allocate((plan.subnet_index().wrapping_add(1)) % 256)
+                .unwrap();
+            let mut rejected = 0;
+
+            let mut wrong_session_id = state_json_value(&state);
+            wrong_session_id["session_id"] = serde_json::Value::String(
+                SessionId::from_uuid(Uuid::from_u128(state.session_id().as_uuid().as_u128() ^ 1))
+                    .to_string(),
+            );
+            assert_state_json_rejected(wrong_session_id);
+            rejected += 1;
+
+            let current_ipv4_base = plan.pool.ipv4_base().network().octets();
+            let mut wrong_ipv4_pool = state_json_value(&state);
+            wrong_ipv4_pool["ipv4_pool"] = serde_json::Value::String(
+                Ipv4Cidr::new(
+                    Ipv4Addr::new(10, current_ipv4_base[1].wrapping_add(1), 0, 0),
+                    16,
+                )
+                .unwrap()
+                .to_string(),
+            );
+            assert_state_json_rejected(wrong_ipv4_pool);
+            rejected += 1;
+
+            let current_ipv6_base = plan.pool.ipv6_base().network().segments();
+            let mut wrong_ipv6_pool = state_json_value(&state);
+            wrong_ipv6_pool["ipv6_pool"] = serde_json::Value::String(
+                Ipv6Cidr::new(
+                    Ipv6Addr::new(
+                        current_ipv6_base[0] ^ 0x0100,
+                        current_ipv6_base[1],
+                        current_ipv6_base[2],
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                    ),
+                    48,
+                )
+                .unwrap()
+                .to_string(),
+            );
+            assert_state_json_rejected(wrong_ipv6_pool);
+            rejected += 1;
+
+            let mut wrong_subnet_index = state_json_value(&state);
+            wrong_subnet_index["subnet_index"] =
+                serde_json::Value::from(u64::from((plan.subnet_index().wrapping_add(1)) % 256));
+            assert_state_json_rejected(wrong_subnet_index);
+            rejected += 1;
+
+            let mut wrong_ipv4 = state_json_value(&state);
+            wrong_ipv4["ipv4_cidr"] = serde_json::Value::String(alternate.ipv4().to_string());
+            assert_state_json_rejected(wrong_ipv4);
+            rejected += 1;
+
+            let mut wrong_ipv6 = state_json_value(&state);
+            wrong_ipv6["ipv6_cidr"] = serde_json::Value::String(alternate.ipv6().to_string());
+            assert_state_json_rejected(wrong_ipv6);
+            rejected += 1;
+
+            let mut wrong_network_name = state_json_value(&state);
+            wrong_network_name["network_name"] =
+                serde_json::Value::String(format!("{}-wrong", state.names().network()));
+            assert_state_json_rejected(wrong_network_name);
+            rejected += 1;
+
+            let mut wrong_vm_name = state_json_value(&state);
+            wrong_vm_name["vm_name"] =
+                serde_json::Value::String(format!("{}-wrong", state.names().vm()));
+            assert_state_json_rejected(wrong_vm_name);
+            rejected += 1;
+
+            let mut wrong_firewall_ipv6 = state_json_value(&state);
+            wrong_firewall_ipv6["firewall_ipv6_cidr"] = match plan.ipv6_mode() {
+                Ipv6IsolationMode::DualStackRequired => serde_json::Value::Null,
+                Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6 => {
+                    serde_json::Value::String(state.network().ipv6().to_string())
+                }
+            };
+            assert_state_json_rejected(wrong_firewall_ipv6);
+            rejected += 1;
+
+            prop_assert_eq!(rejected, 9);
+        }
+    }
+
+    #[test]
+    fn managed_start_preserves_state_when_partial_start_cleanup_failed() {
+        let error = AgentVmLifecycleRunError::CleanupAfterFailure {
+            original: Box::new(start_process_error()),
+            cleanup: Box::new(CleanupErrors::new(vec![cleanup_error()])),
+        };
+        assert!(start_failure_left_dirty_infrastructure(&error));
+
+        let clean_error = AgentVmLifecycleRunError::Start(Box::new(start_process_error()));
+        assert!(!start_failure_left_dirty_infrastructure(&clean_error));
+    }
+
+    #[test]
+    fn managed_stop_failure_leaves_state_record_for_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = AgentVmSessionStateStore::new(dir.path());
+        let plan = plan_with_ipv6_mode(252, Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6);
+        let starting = store.create_starting(&plan).unwrap();
+        let running = store.mark_running(&starting).unwrap();
+        let missing_tool = dir.path().join("missing-tool");
+
+        let err = stop_managed_agent_vm_session(
+            &store,
+            plan.session_id(),
+            AgentVmToolPaths::new(&missing_tool, &missing_tool, &missing_tool),
+        )
+        .unwrap_err();
+        assert!(matches!(err, AgentVmSessionManagerError::Stop(_)));
+        assert_eq!(store.load(plan.session_id()).unwrap(), running);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_start_then_managed_stop_success_removes_state_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = AgentVmSessionStateStore::new(dir.path().join("state"));
+        let ok_tool = write_executable_script(
+            dir.path(),
+            "ok-tool",
+            "#!/bin/sh\n\
+             if [ \"$1\" = \"network\" ] && [ \"$2\" = \"inspect\" ]; then\n\
+             printf '%s\\n' 'ipv4Subnet: 192.168.252.0/24' 'ipv4Gateway: 192.168.252.1'\n\
+             fi\n\
+             exit 0\n",
+        );
+        let base_plan = plan_with_ipv6_mode(252, Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6);
+        let plan = AgentVmSessionPlan::new(
+            base_plan.session_id(),
+            base_plan.pool,
+            base_plan.subnet_index(),
+            base_plan.broker_ports.clone(),
+            base_plan.broker_port_range,
+            base_plan.ipv6_mode(),
+            base_plan.image.clone(),
+            base_plan.guest_command.clone(),
+            base_plan.resources,
+            AgentVmToolPaths::new(&ok_tool, &ok_tool, &ok_tool),
+        )
+        .unwrap();
+
+        let running = start_managed_agent_vm_session(&store, &plan).unwrap();
+        assert_eq!(running.status(), AgentVmSessionStateStatus::Running);
+        stop_managed_agent_vm_session(
+            &store,
+            plan.session_id(),
+            AgentVmToolPaths::new(&ok_tool, &ok_tool, &ok_tool),
+        )
+        .unwrap();
+
+        let missing = store.load(plan.session_id()).unwrap_err();
+        assert!(matches!(missing, AgentVmSessionStateError::NotFound { .. }));
+    }
+
+    #[test]
+    fn mark_running_does_not_recreate_removed_starting_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = AgentVmSessionStateStore::new(dir.path());
+        let plan = plan_with_ipv6_mode(252, Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6);
+        let starting = store.create_starting(&plan).unwrap();
+
+        store.remove(plan.session_id()).unwrap();
+        let err = store.mark_running(&starting).unwrap_err();
+
+        assert!(matches!(err, AgentVmSessionStateError::NotFound { .. }));
+        assert!(!store.path_for(plan.session_id()).exists());
+    }
+
+    #[test]
+    fn mark_running_rejects_changed_starting_record_as_state_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = AgentVmSessionStateStore::new(dir.path());
+        let plan = plan_with_ipv6_mode(252, Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6);
+        let starting = store.create_starting(&plan).unwrap();
+        let already_running = store.mark_running(&starting).unwrap();
+
+        let err = store.mark_running(&starting).unwrap_err();
+
+        assert!(matches!(
+            err,
+            AgentVmSessionStateError::StateMismatch { session_id, .. }
+                if session_id == plan.session_id()
+        ));
+        assert_eq!(store.load(plan.session_id()).unwrap(), already_running);
+    }
+
+    #[test]
+    fn state_store_rejects_duplicate_live_session_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = AgentVmSessionStateStore::new(dir.path());
+        let plan = plan_with_ipv6_mode(252, Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6);
+
+        let starting = store.create_starting(&plan).unwrap();
+        assert_eq!(starting.status(), AgentVmSessionStateStatus::Starting);
+        let duplicate = store.create_starting(&plan).unwrap_err();
+        assert!(matches!(
+            duplicate,
+            AgentVmSessionStateError::AlreadyExists { .. }
+        ));
+
+        let running = store.mark_running(&starting).unwrap();
+        assert_eq!(running.status(), AgentVmSessionStateStatus::Running);
+        assert_eq!(store.load(plan.session_id()).unwrap(), running);
+
+        store.remove(plan.session_id()).unwrap();
+        let missing = store.load(plan.session_id()).unwrap_err();
+        assert!(matches!(missing, AgentVmSessionStateError::NotFound { .. }));
+    }
+
+    #[test]
+    fn state_store_uses_one_store_lock_file_instead_of_per_session_lock_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = AgentVmSessionStateStore::new(dir.path());
+        for index in [1, 2, 3] {
+            let plan = plan_with_ipv6_mode(index, Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6);
+            store.create_starting(&plan).unwrap();
+            store.remove(plan.session_id()).unwrap();
+        }
+
+        let lock_files = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .filter(|name| name.to_string_lossy().ends_with(".lock"))
+            .collect::<Vec<_>>();
+
+        assert_eq!(lock_files, vec![OsString::from(".store.lock")]);
+    }
+
+    #[test]
+    fn state_store_load_missing_session_does_not_create_missing_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = dir.path().join("state");
+        let store = AgentVmSessionStateStore::new(&state_dir);
+        let session_id = session_id();
+
+        let err = store.load(session_id).unwrap_err();
+
+        assert!(matches!(err, AgentVmSessionStateError::NotFound { .. }));
+        assert!(!state_dir.exists());
+    }
+
+    #[test]
+    fn state_store_load_missing_session_does_not_create_lock_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = AgentVmSessionStateStore::new(dir.path());
+        let session_id = session_id();
+
+        let err = store.load(session_id).unwrap_err();
+
+        assert!(matches!(err, AgentVmSessionStateError::NotFound { .. }));
+        assert!(!dir.path().join(".store.lock").exists());
+    }
+
+    #[test]
+    fn state_store_rejects_record_whose_contents_do_not_match_filename_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = AgentVmSessionStateStore::new(dir.path());
+        let plan = plan_with_ipv6_mode(252, Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6);
+        let state = store.create_starting(&plan).unwrap();
+        let requested =
+            SessionId::from_uuid(Uuid::from_u128(state.session_id().as_uuid().as_u128() ^ 1));
+        fs::write(store.path_for(requested), state.to_json_bytes().unwrap()).unwrap();
+
+        let err = store.load(requested).unwrap_err();
+
+        assert!(matches!(
+            err,
+            AgentVmSessionStateError::Corrupt { message }
+                if message.contains("contains session")
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn state_store_lock_blocks_another_process() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("child-ready");
+        let store = AgentVmSessionStateStore::new(dir.path());
+        let lock = store.lock_store().unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("state_store_child_lock_probe")
+            .arg("--ignored")
+            .env("WRIT_LOCK_PROBE_STATE_DIR", dir.path())
+            .env("WRIT_LOCK_PROBE_MARKER", &marker)
+            .spawn()
+            .unwrap();
+
+        wait_for_path(&marker);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(child.try_wait().unwrap().is_none());
+
+        drop(lock);
+        let status = wait_for_child(&mut child);
+        assert!(status.success(), "child lock probe failed with {status}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore]
+    fn state_store_child_lock_probe() {
+        let Some(state_dir) = std::env::var_os("WRIT_LOCK_PROBE_STATE_DIR") else {
+            return;
+        };
+        let Some(marker) = std::env::var_os("WRIT_LOCK_PROBE_MARKER") else {
+            return;
+        };
+        fs::write(marker, b"ready").unwrap();
+        let store = AgentVmSessionStateStore::new(PathBuf::from(state_dir));
+        let plan = plan_with_ipv6_mode(252, Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6);
+        store.create_starting(&plan).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn wait_for_path(path: &Path) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !path.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for {}",
+                path.display()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    #[cfg(unix)]
+    fn wait_for_child(child: &mut std::process::Child) -> std::process::ExitStatus {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                return status;
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                panic!("timed out waiting for child lock probe");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn default_state_dir_treats_empty_xdg_as_unset_and_uses_home() {
+        let got = default_agent_vm_state_dir_from_env(
+            Some(OsString::from("")),
+            Some(OsString::from("/Users/example")),
+        )
+        .unwrap();
+        assert_eq!(
+            got,
+            PathBuf::from("/Users/example/.local/state/writ/agent-vm-sessions")
+        );
+    }
+
+    #[test]
+    fn default_state_dir_fails_when_home_is_unset_or_empty() {
+        assert_eq!(
+            default_agent_vm_state_dir_from_env(None, None),
+            Err(AgentVmStateDirError::HomeUnset)
+        );
+        assert_eq!(
+            default_agent_vm_state_dir_from_env(None, Some(OsString::from(""))),
+            Err(AgentVmStateDirError::HomeUnset)
+        );
+    }
+
+    #[test]
+    fn default_state_dir_rejects_relative_environment_paths() {
+        assert_eq!(
+            default_agent_vm_state_dir_from_env(
+                Some(OsString::from("relative/state")),
+                Some(OsString::from("/Users/example")),
+            ),
+            Err(AgentVmStateDirError::XdgStateHomeRelative {
+                path: PathBuf::from("relative/state")
+            })
+        );
+        assert_eq!(
+            default_agent_vm_state_dir_from_env(None, Some(OsString::from("relative/home"))),
+            Err(AgentVmStateDirError::HomeRelative {
+                path: PathBuf::from("relative/home")
+            })
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn state_store_creates_private_directory_and_file_permissions() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = dir.path().join("state");
+        let store = AgentVmSessionStateStore::new(&state_dir);
+        let plan = plan_with_ipv6_mode(252, Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6);
+
+        store.create_starting(&plan).unwrap();
+
+        let dir_mode = fs::metadata(&state_dir).unwrap().permissions().mode() & 0o777;
+        let file_mode = fs::metadata(store.path_for(plan.session_id()))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(dir_mode, 0o700);
+        assert_eq!(file_mode, 0o600);
     }
 }
