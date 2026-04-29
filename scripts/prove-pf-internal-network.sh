@@ -76,11 +76,10 @@ cleanup() {
   log "cleaning up VM, network, listeners, and PF anchor"
 
   if [[ -n "$VM_NAME" ]]; then
-    container rm -f "$VM_NAME" >/dev/null 2>&1 || {
-      container stop "$VM_NAME" >/dev/null 2>&1 || true
-      container delete "$VM_NAME" >/dev/null 2>&1 || true
-      container rm "$VM_NAME" >/dev/null 2>&1 || true
-    }
+    container rm -f "$VM_NAME" >/dev/null 2>&1 || true
+    container stop "$VM_NAME" >/dev/null 2>&1 || true
+    container delete "$VM_NAME" >/dev/null 2>&1 || true
+    container rm "$VM_NAME" >/dev/null 2>&1 || true
   fi
 
   if [[ -n "$PF_ANCHOR" ]]; then

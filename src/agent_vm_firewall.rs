@@ -12,21 +12,21 @@ use std::process::{Command, Output};
 use uuid::Uuid;
 
 use crate::core::{
-    AgentNetwork, AgentNetworkPool, AgentVmConfigError, BrokerPortRange, BrokerPorts, Ipv4Cidr,
-    Ipv6Cidr, PfAnchorName, PfRuleset, SessionId, render_pf, session_pf_ruleset,
+    AgentFirewallNetwork, AgentNetworkPool, AgentVmConfigError, BrokerPortRange, BrokerPorts,
+    Ipv4Cidr, Ipv6Cidr, PfAnchorName, PfRuleset, SessionId, render_pf, session_firewall_pf_ruleset,
 };
 
 pub const SESSION_BOOTSTRAP_ANCHOR: &str = r#"anchor "writ/session/*""#;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SessionFirewallInstall {
-    network: AgentNetwork,
+    network: AgentFirewallNetwork,
     ruleset: PfRuleset,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SessionFirewallRemoval {
-    network: AgentNetwork,
+    network: AgentFirewallNetwork,
     anchor: PfAnchorName,
 }
 
@@ -66,19 +66,19 @@ impl SessionFirewallInstall {
         session_id: SessionId,
         pool: AgentNetworkPool,
         ipv4: Ipv4Cidr,
-        ipv6: Ipv6Cidr,
+        ipv6: Option<Ipv6Cidr>,
         broker_ports: BrokerPorts,
         broker_port_range: BrokerPortRange,
     ) -> Result<Self, AgentVmConfigError> {
         broker_port_range.require_contains(&broker_ports)?;
-        let network = pool.claim(ipv4, ipv6)?;
+        let network = pool.claim_firewall(ipv4, ipv6)?;
         Ok(Self {
             network,
-            ruleset: session_pf_ruleset(session_id, network, &broker_ports),
+            ruleset: session_firewall_pf_ruleset(session_id, network, &broker_ports),
         })
     }
 
-    pub fn network(&self) -> AgentNetwork {
+    pub fn network(&self) -> AgentFirewallNetwork {
         self.network
     }
 
@@ -113,16 +113,16 @@ impl SessionFirewallRemoval {
         session_id: SessionId,
         pool: AgentNetworkPool,
         ipv4: Ipv4Cidr,
-        ipv6: Ipv6Cidr,
+        ipv6: Option<Ipv6Cidr>,
     ) -> Result<Self, AgentVmConfigError> {
-        let network = pool.claim(ipv4, ipv6)?;
+        let network = pool.claim_firewall(ipv4, ipv6)?;
         Ok(Self {
             network,
             anchor: PfAnchorName::for_session(session_id),
         })
     }
 
-    pub fn network(self) -> AgentNetwork {
+    pub fn network(self) -> AgentFirewallNetwork {
         self.network
     }
 
@@ -131,21 +131,27 @@ impl SessionFirewallRemoval {
     }
 
     pub fn invocations(&self) -> Vec<PfctlInvocation> {
-        vec![
-            PfctlInvocation::new(vec![
+        let mut invocations = vec![PfctlInvocation::new(vec![
+            "-k".to_string(),
+            self.network.ipv4().to_string(),
+            "-k".to_string(),
+            "0.0.0.0/0".to_string(),
+        ])];
+        if let Some(ipv6) = self.network.ipv6() {
+            invocations.push(PfctlInvocation::new(vec![
                 "-k".to_string(),
-                self.network.ipv4().to_string(),
-                "-k".to_string(),
-                "0.0.0.0/0".to_string(),
-            ]),
-            PfctlInvocation::new(vec![
-                "-k".to_string(),
-                self.network.ipv6().to_string(),
+                ipv6.to_string(),
                 "-k".to_string(),
                 "::/0".to_string(),
-            ]),
-            PfctlInvocation::new(["-a", self.anchor.as_str(), "-F", "rules"]),
-        ]
+            ]));
+        }
+        invocations.push(PfctlInvocation::new([
+            "-a",
+            self.anchor.as_str(),
+            "-F",
+            "rules",
+        ]));
+        invocations
     }
 }
 
@@ -334,7 +340,7 @@ mod tests {
             session_id(),
             pool(),
             ipv4(),
-            ipv6(),
+            Some(ipv6()),
             ports(),
             BrokerPortRange::new(49152, 64999).unwrap(),
         )
@@ -355,7 +361,7 @@ mod tests {
             session_id(),
             pool(),
             Ipv4Cidr::new(Ipv4Addr::new(192, 168, 253, 0), 24).unwrap(),
-            ipv6(),
+            Some(ipv6()),
             ports(),
             BrokerPortRange::new(49152, 65535).unwrap(),
         )
@@ -400,7 +406,8 @@ mod tests {
 
     #[test]
     fn removal_invocations_are_scoped_to_session_anchor_and_subnets() {
-        let removal = SessionFirewallRemoval::new(session_id(), pool(), ipv4(), ipv6()).unwrap();
+        let removal =
+            SessionFirewallRemoval::new(session_id(), pool(), ipv4(), Some(ipv6())).unwrap();
         let invocations = removal
             .invocations()
             .into_iter()
@@ -414,6 +421,34 @@ mod tests {
                     .map(String::from)
                     .collect::<Vec<_>>(),
                 vec!["-k", "fd83:b6f2:e57:f536::/64", "-k", "::/0"]
+                    .into_iter()
+                    .map(String::from)
+                    .collect::<Vec<_>>(),
+                vec![
+                    "-a",
+                    "writ/session/00000000-0000-0000-0000-000000000001",
+                    "-F",
+                    "rules",
+                ]
+                .into_iter()
+                .map(String::from)
+                .collect::<Vec<_>>(),
+            ]
+        );
+    }
+
+    #[test]
+    fn ipv4_only_removal_skips_ipv6_state_kill() {
+        let removal = SessionFirewallRemoval::new(session_id(), pool(), ipv4(), None).unwrap();
+        let invocations = removal
+            .invocations()
+            .into_iter()
+            .map(|i| i.args().to_vec())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            invocations,
+            vec![
+                vec!["-k", "192.168.252.0/24", "-k", "0.0.0.0/0"]
                     .into_iter()
                     .map(String::from)
                     .collect::<Vec<_>>(),

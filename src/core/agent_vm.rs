@@ -57,6 +57,17 @@ pub struct AgentNetwork {
     ipv6: Ipv6Cidr,
 }
 
+/// The source subnets that a PF session anchor should filter.
+///
+/// This is separate from [`AgentNetwork`] because some lifecycle modes prove
+/// that the guest has no routable IPv6 instead of installing a misleading IPv6
+/// rule for a broker-planned prefix Apple did not attach to the network.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct AgentFirewallNetwork {
+    ipv4: Ipv4Cidr,
+    ipv6: Option<Ipv6Cidr>,
+}
+
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct AgentNetworkPool {
     ipv4_base: Ipv4Cidr,
@@ -314,6 +325,39 @@ impl AgentNetwork {
     }
 }
 
+impl AgentFirewallNetwork {
+    // Keep construction module-private so callers claim firewall scopes through
+    // AgentNetworkPool rather than bypassing pool containment checks.
+    fn new(ipv4: Ipv4Cidr, ipv6: Option<Ipv6Cidr>) -> Result<Self, AgentVmConfigError> {
+        if ipv4.prefix != AGENT_IPV4_PREFIX {
+            return Err(AgentVmConfigError::AgentIpv4Prefix(ipv4.prefix));
+        }
+        if let Some(ipv6) = ipv6
+            && ipv6.prefix != AGENT_IPV6_PREFIX
+        {
+            return Err(AgentVmConfigError::AgentIpv6Prefix(ipv6.prefix));
+        }
+        Ok(Self { ipv4, ipv6 })
+    }
+
+    pub fn ipv4(self) -> Ipv4Cidr {
+        self.ipv4
+    }
+
+    pub fn ipv6(self) -> Option<Ipv6Cidr> {
+        self.ipv6
+    }
+}
+
+impl From<AgentNetwork> for AgentFirewallNetwork {
+    fn from(value: AgentNetwork) -> Self {
+        Self {
+            ipv4: value.ipv4(),
+            ipv6: Some(value.ipv6()),
+        }
+    }
+}
+
 impl AgentNetworkPool {
     pub fn new(ipv4_base: Ipv4Cidr, ipv6_base: Ipv6Cidr) -> Result<Self, AgentVmConfigError> {
         if ipv4_base.prefix > AGENT_IPV4_PREFIX {
@@ -362,6 +406,28 @@ impl AgentNetworkPool {
             });
         }
         AgentNetwork::new(ipv4, ipv6)
+    }
+
+    pub fn claim_firewall(
+        self,
+        ipv4: Ipv4Cidr,
+        ipv6: Option<Ipv6Cidr>,
+    ) -> Result<AgentFirewallNetwork, AgentVmConfigError> {
+        if !self.ipv4_base.contains_subnet(ipv4) {
+            return Err(AgentVmConfigError::AgentIpv4SubnetOutsidePool {
+                subnet: ipv4,
+                pool: self.ipv4_base,
+            });
+        }
+        if let Some(ipv6) = ipv6
+            && !self.ipv6_base.contains_subnet(ipv6)
+        {
+            return Err(AgentVmConfigError::AgentIpv6SubnetOutsidePool {
+                subnet: ipv6,
+                pool: self.ipv6_base,
+            });
+        }
+        AgentFirewallNetwork::new(ipv4, ipv6)
     }
 }
 
@@ -482,17 +548,28 @@ pub fn session_pf_ruleset(
     network: AgentNetwork,
     broker_ports: &BrokerPorts,
 ) -> PfRuleset {
+    session_firewall_pf_ruleset(session_id, network.into(), broker_ports)
+}
+
+pub fn session_firewall_pf_ruleset(
+    session_id: SessionId,
+    network: AgentFirewallNetwork,
+    broker_ports: &BrokerPorts,
+) -> PfRuleset {
+    let mut allow = vec![PfAllowRule::new(PfCidr::Inet(network.ipv4()))];
+    let mut deny = vec![PfDenyRule::new(
+        PfCidr::Inet(network.ipv4()),
+        "writ deny agent v4",
+    )];
+    if let Some(ipv6) = network.ipv6() {
+        allow.push(PfAllowRule::new(PfCidr::Inet6(ipv6)));
+        deny.push(PfDenyRule::new(PfCidr::Inet6(ipv6), "writ deny agent v6"));
+    }
     PfRuleset::new(
         PfAnchorName::for_session(session_id),
         broker_ports.clone(),
-        vec![
-            PfAllowRule::new(PfCidr::Inet(network.ipv4())),
-            PfAllowRule::new(PfCidr::Inet6(network.ipv6())),
-        ],
-        vec![
-            PfDenyRule::new(PfCidr::Inet(network.ipv4()), "writ deny agent v4"),
-            PfDenyRule::new(PfCidr::Inet6(network.ipv6()), "writ deny agent v6"),
-        ],
+        allow,
+        deny,
     )
 }
 
@@ -875,6 +952,23 @@ mod tests {
     }
 
     #[test]
+    fn network_pool_can_claim_ipv4_only_firewall_scope() {
+        let pool = AgentNetworkPool::new(
+            Ipv4Cidr::new(Ipv4Addr::new(192, 168, 0, 0), 16).unwrap(),
+            Ipv6Cidr::new("fd83:b6f2:e57::".parse().unwrap(), 48).unwrap(),
+        )
+        .unwrap();
+        let scope = pool
+            .claim_firewall(
+                Ipv4Cidr::new(Ipv4Addr::new(192, 168, 7, 0), 24).unwrap(),
+                None,
+            )
+            .unwrap();
+        assert_eq!(scope.ipv4().to_string(), "192.168.7.0/24");
+        assert_eq!(scope.ipv6(), None);
+    }
+
+    #[test]
     fn broker_port_range_rejects_empty_or_privileged_ranges() {
         assert!(matches!(
             BrokerPortRange::new(65535, 65534),
@@ -951,6 +1045,25 @@ mod tests {
         );
     }
 
+    #[test]
+    fn render_pf_can_render_ipv4_only_firewall_scope() {
+        let network = sample_pool().allocate(0).unwrap();
+        let firewall_scope = AgentFirewallNetwork::new(network.ipv4(), None).unwrap();
+        let ruleset = session_firewall_pf_ruleset(session_id(), firewall_scope, &sample_ports());
+        assert_eq!(ruleset.allow().len(), 1);
+        assert_eq!(ruleset.deny().len(), 1);
+        assert_eq!(
+            render_pf(&ruleset),
+            concat!(
+                "broker_ports = \"{ 18080, 18081 }\"\n",
+                "\n",
+                "pass in quick inet proto tcp from 192.168.126.0/24 to any port $broker_ports keep state\n",
+                "\n",
+                "block return in quick inet from 192.168.126.0/24 to any label \"writ deny agent v4\"\n",
+            ),
+        );
+    }
+
     proptest! {
         #[test]
         fn ipv4_constructor_rejects_any_host_bit(raw in any::<u32>(), prefix in 0u8..32) {
@@ -1015,6 +1128,14 @@ mod tests {
         fn pool_claim_accepts_every_allocated_subnet((pool, index) in arb_pool_and_index()) {
             let network = pool.allocate(index).unwrap();
             prop_assert_eq!(pool.claim(network.ipv4(), network.ipv6()).unwrap(), network);
+        }
+
+        #[test]
+        fn pool_claim_firewall_accepts_every_allocated_ipv4_without_ipv6((pool, index) in arb_pool_and_index()) {
+            let network = pool.allocate(index).unwrap();
+            let claimed = pool.claim_firewall(network.ipv4(), None).unwrap();
+            prop_assert_eq!(claimed.ipv4(), network.ipv4());
+            prop_assert_eq!(claimed.ipv6(), None);
         }
 
         #[test]

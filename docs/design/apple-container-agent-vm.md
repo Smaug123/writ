@@ -186,13 +186,13 @@ run as root; use a small privileged helper or launchd service that accepts
 only structured operations:
 
 ```text
-InstallSessionFirewall(session_id, ipv4_subnet, ipv6_prefix, broker_ports)
+InstallSessionFirewall(session_id, ipv4_subnet, optional_ipv6_prefix, broker_ports)
 RemoveSessionFirewall(session_id)
 ```
 
 The helper must validate that:
 
-- the subnet belongs to the broker-managed range;
+- every supplied subnet belongs to the broker-managed range;
 - the session ID is a safe anchor name component;
 - broker ports are in an allowed local range;
 - generated PF rules parse with `pfctl -n` before being loaded;
@@ -201,27 +201,30 @@ The helper must validate that:
 First manual helper slice implemented as `writ-agent-vm-pf-helper`:
 
 - `install` accepts the session ID, broker-owned IPv4/IPv6 pools, the requested
-  session IPv4/IPv6 subnets, broker ports, and a configured broker port range;
-- it validates the session subnets against the owned pools and the broker ports
-  against the configured range before rendering the existing `core::agent_vm`
-  PF ruleset;
+  session IPv4 subnet, an optional session IPv6 subnet, broker ports, and a
+  configured broker port range;
+- it validates the supplied session subnets against the owned pools and the
+  broker ports against the configured range before rendering the existing
+  `core::agent_vm` PF ruleset;
 - it refuses to install unless PF is enabled and `pfctl -sr` contains the direct
   `anchor "writ/session/*"` bootstrap;
 - it writes the rendered rules to a temporary file, runs `pfctl -n -f`, then
   loads only the session anchor with `pfctl -a writ/session/<id> -f`;
 - `remove` is currently stateless and therefore accepts the session network
-  again; it kills live states for the validated session subnets and flushes
-  only the matching session anchor. This is acceptable for the manual helper,
-  but the daemonized helper should persist `(session_id, ipv4, ipv6)` on
-  install and reject mismatched removals.
+  again; it kills live states for the validated supplied session subnets and
+  flushes only the matching session anchor. This is acceptable for the manual
+  helper, but the daemonized helper should persist `(session_id, ipv4,
+  optional_ipv6)` on install and reject mismatched removals.
 
-Second manual lifecycle slice implemented as `writ-agent-vm-runner`:
+Second manual lifecycle slice implemented as `writ-agent-vm-runner`, with
+quiet-list cleanup postconditions:
 
-- `start` allocates the session subnet from broker-owned IPv4/IPv6 pools and
+- `start` allocates the planned session subnet from broker-owned IPv4/IPv6 pools and
   derives stable Apple container network/VM names from the session ID;
 - it creates the Apple `--internal` network, runs `container network inspect`,
-  and refuses to continue unless the reported IPv4 subnet/gateway and IPv6
-  subnet/gateway match the planned session network;
+  and refuses to continue unless the reported IPv4 subnet/gateway match the
+  planned session network. In `dual-stack-required` mode it also requires the
+  reported IPv6 subnet/gateway to match the planned session network;
 - only after that inspection passes does it install the PF session anchor
   through `writ-agent-vm-pf-helper`, and only after PF install succeeds does it
   run the VM;
@@ -230,20 +233,22 @@ Second manual lifecycle slice implemented as `writ-agent-vm-runner`:
   attempts VM removal, then removes the PF anchor and network. Cleanup
   attempts all applicable steps and reports all cleanup errors, not only the
   first one;
-- `stop` reconstructs the session network from the same session ID, pools, and
-  subnet index, then removes VM, PF anchor/states, and network in that order;
+- `stop` reconstructs the session network and firewall scope from the same
+  session ID, pools, subnet index, and IPv6 mode, then removes the VM, PF
+  anchor/states, and network in that order. VM and network removal are
+  postcondition-checked with Apple Container quiet-list output: the runner does
+  not report success until the deleted resources are no longer observable in
+  `container list --all --quiet` and `container network list --quiet`;
+- `stop` requires an explicit `--ipv6-mode` so the removal firewall scope
+  matches the mode used at install time;
 - both `start` and `stop` support `--dry-run`, which prints the exact process
-  invocations without touching `container` or PF.
-
-This deliberately does not carry the proof harness's IPv6 fallback into the
-real lifecycle path. If Apple `container network inspect` does not report a
-usable IPv6 subnet and gateway, `writ-agent-vm-runner start` fails closed
-before installing PF rules or starting the VM.
+  invocations that may be used for the lifecycle path without touching
+  `container` or PF.
 
 The runner advertises the broker URL over the IPv4 host-only gateway for now.
-IPv6 is still validated and filtered, but it is not handed to the guest as a
-broker endpoint until the VM-facing transport has explicit IPv6 binding and
-authentication semantics.
+In `dual-stack-required` mode, IPv6 is validated and filtered, but it is not
+handed to the guest as a broker endpoint until the VM-facing transport has
+explicit IPv6 binding and authentication semantics.
 
 Third manual lifecycle slice: explicit IPv6 posture:
 
@@ -252,10 +257,11 @@ Third manual lifecycle slice: explicit IPv6 posture:
   Apple `container network inspect` must report both IPv4 and IPv6 fields, and
   the reported IPv6 subnet/gateway must match the broker-planned network;
 - `ipv4-only-no-guest-ipv6` is an explicit fallback for the current observed
-  Apple CLI behavior where the internal network reports IPv4 but not IPv6. In
-  this mode the runner still installs the PF anchor before starting any VM, but
-  starts the VM with a small guarded prelaunch command rather than immediately
-  running the authority-bearing agent command;
+  Apple CLI behavior where the internal network either omits IPv6 details or
+  reports an Apple-chosen ULA `/64` that is not the broker-planned prefix. In
+  this mode the runner installs an IPv4-only PF anchor before starting any VM,
+  then starts the VM with a small guarded prelaunch command rather than
+  immediately running the authority-bearing agent command;
 - the guarded VM waits on `/run/writ-agent-vm/start`. While it is waiting, the
   runner executes `ip -6` inside the guest and refuses to release the real
   command unless the guest has no non-link-local IPv6 address and no IPv6
@@ -270,11 +276,11 @@ Third manual lifecycle slice: explicit IPv6 posture:
 This mode is not a silent fallback. It is a separately named posture with its
 own proof obligation, because the guarantee is different: "no guest IPv6
 route/address exists" rather than "PF has been installed for the inspected
-IPv6 prefix." The PF helper still receives and installs rules for the
-broker-planned IPv6 prefix in this mode, but when Apple does not attach that
-prefix to the internal network those rules are not the active protection. The
-active protection is the pre-release guest proof that there is no routable IPv6
-state.
+IPv6 prefix." The runner deliberately omits `--ipv6-cidr` when installing the
+PF anchor in this mode; installing a rule for the broker-planned IPv6 prefix
+would be misleading when Apple attached a different ULA prefix. The active
+protection, and the only IPv6 enforcement in this mode, is the pre-release
+guest proof that there is no routable IPv6 state.
 
 That proof is point-in-time: it runs immediately before releasing the guarded
 guest command. The current assumption is that Apple `--internal` networks do
@@ -509,15 +515,39 @@ Manual lifecycle runner status:
   order. The authority-bearing guest command is embedded behind the guard and
   is not executed until the release command runs;
 - `writ-agent-vm-runner stop --dry-run` emits cleanup in reverse authority
-  order: VM removal, helper `remove`, then network removal;
+  order: VM removal attempts, helper `remove`, then network removal attempts.
+  Non-dry-run `stop` treats exact absence from `container list --all --quiet`
+  and `container network list --quiet`, not command exit alone or `inspect`
+  output, as the VM/network cleanup oracle. Stop requires explicit
+  `--ipv6-mode` to keep helper removal symmetric with helper install;
 - non-dry-run start in default `dual-stack-required` mode is expected to fail
   closed on the current observed Apple CLI output until `container network
   inspect` reports the IPv6 fields needed to prove that the PF IPv6 prefix
   matches the actual VM network;
 - non-dry-run start in `ipv4-only-no-guest-ipv6` mode should be manually
-  exercised on macOS with Apple `container`: it is intended to proceed on the
-  current IPv4-only inspect output only if the guest image can prove, via
-  `ip -6`, that no routable guest IPv6 posture exists.
+  exercised on macOS with Apple `container`: it is intended to proceed when
+  inspect either omits IPv6 entirely or reports an Apple-chosen ULA `/64`, but
+  only if the guest image can prove, via `ip -6`, that no routable guest IPv6
+  posture exists. A non-ULA observed IPv6 subnet, malformed prefix, IPv6
+  gateway without subnet, or gateway outside the subnet remains a hard failure.
+
+Manual runner lifecycle proof harness added in
+`scripts/prove-agent-vm-lifecycle.sh`:
+
+- builds `writ-agent-vm-pf-helper` and `writ-agent-vm-runner`;
+- starts host broker and forbidden listeners;
+- starts a real runner-managed session in `ipv4-only-no-guest-ipv6` mode with
+  a guarded guest command that writes a release marker and then sleeps;
+- asserts that the runner released the command, the guest has required probe
+  tools, the guest has no routable IPv6 posture after release, the broker port
+  is reachable, the forbidden host port is blocked, and direct IPv4/DNS sanity
+  probes fail;
+- stops the session through `writ-agent-vm-runner stop`;
+- asserts the VM and network are absent from Apple Container quiet-list output,
+  the PF anchor is empty, and any observed guest-IPv4 PF states are gone after
+  runner stop;
+- keeps trap cleanup as a fallback, but treats runner `stop` plus post-stop
+  assertions as the proof path.
 
 ## Risks
 

@@ -92,6 +92,10 @@ struct StopArgs {
     #[command(flatten)]
     session: SessionArgs,
 
+    /// IPv6 isolation mode used when the session was started.
+    #[arg(long, value_enum)]
+    ipv6_mode: Ipv6ModeArg,
+
     /// Print commands instead of executing them.
     #[arg(long)]
     dry_run: bool,
@@ -212,6 +216,7 @@ fn build_stop_plan(
         parsed.session_id,
         parsed.pool,
         args.session.subnet_index,
+        args.ipv6_mode.into(),
         tools,
     )?)
 }
@@ -269,4 +274,54 @@ fn default_pf_helper_path() -> PathBuf {
                 .map(|parent| parent.join("writ-agent-vm-pf-helper"))
         })
         .unwrap_or_else(|| PathBuf::from("writ-agent-vm-pf-helper"))
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::error::ErrorKind;
+
+    use super::*;
+
+    #[test]
+    fn stop_requires_explicit_ipv6_mode() {
+        let err = match Cli::try_parse_from([
+            "writ-agent-vm-runner",
+            "stop",
+            "--session-id",
+            "51b8fd0f-6c10-454c-b0e6-7df1d60e2e6d",
+            "--ipv4-pool",
+            "192.168.0.0/16",
+            "--ipv6-pool",
+            "fd83:b6f2:e57::/48",
+            "--subnet-index",
+            "252",
+        ]) {
+            Ok(_) => panic!("stop parsed without explicit IPv6 mode"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), ErrorKind::MissingRequiredArgument);
+    }
+
+    #[test]
+    fn stop_accepts_explicit_ipv6_mode() {
+        let cli = Cli::try_parse_from([
+            "writ-agent-vm-runner",
+            "stop",
+            "--session-id",
+            "51b8fd0f-6c10-454c-b0e6-7df1d60e2e6d",
+            "--ipv4-pool",
+            "192.168.0.0/16",
+            "--ipv6-pool",
+            "fd83:b6f2:e57::/48",
+            "--subnet-index",
+            "252",
+            "--ipv6-mode",
+            "ipv4-only-no-guest-ipv6",
+        ])
+        .unwrap();
+        match cli.cmd {
+            Cmd::Stop(args) => assert_eq!(args.ipv6_mode, Ipv6ModeArg::Ipv4OnlyNoGuestIpv6),
+            Cmd::Start(_) => panic!("expected stop command"),
+        }
+    }
 }

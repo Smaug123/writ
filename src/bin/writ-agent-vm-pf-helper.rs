@@ -69,7 +69,7 @@ struct SessionNetworkArgs {
     #[arg(long)]
     ipv4_pool: String,
 
-    /// Broker-owned IPv6 pool from which the session prefix must come.
+    /// Broker-owned IPv6 pool from which any session prefix must come.
     #[arg(long)]
     ipv6_pool: String,
 
@@ -77,9 +77,9 @@ struct SessionNetworkArgs {
     #[arg(long)]
     ipv4_cidr: String,
 
-    /// Agent session IPv6 prefix. Must be a /64 inside --ipv6-pool.
+    /// Agent session IPv6 prefix. If present, must be a /64 inside --ipv6-pool.
     #[arg(long)]
-    ipv6_cidr: String,
+    ipv6_cidr: Option<String>,
 }
 
 fn main() {
@@ -131,7 +131,7 @@ struct ParsedSessionNetwork {
     session_id: SessionId,
     pool: AgentNetworkPool,
     ipv4: Ipv4Cidr,
-    ipv6: Ipv6Cidr,
+    ipv6: Option<Ipv6Cidr>,
 }
 
 fn parse_session_network(
@@ -144,7 +144,7 @@ fn parse_session_network(
     let ipv4_pool = parse_ipv4_cidr(&args.ipv4_pool)?;
     let ipv6_pool = parse_ipv6_cidr(&args.ipv6_pool)?;
     let ipv4 = parse_ipv4_cidr(&args.ipv4_cidr)?;
-    let ipv6 = parse_ipv6_cidr(&args.ipv6_cidr)?;
+    let ipv6 = args.ipv6_cidr.as_deref().map(parse_ipv6_cidr).transpose()?;
     Ok(ParsedSessionNetwork {
         session_id,
         pool: AgentNetworkPool::new(ipv4_pool, ipv6_pool)?,

@@ -30,6 +30,11 @@ ip -6 route show default 2>&1"#;
 const GUEST_IPV6_PROBE_UNAVAILABLE_MARKER: &str = "writ-ip-command-missing";
 const GUEST_IPV6_PROBE_ATTEMPTS: usize = 40;
 const GUEST_IPV6_PROBE_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
+// Apple Container removals can lag command return briefly. Keep the
+// postcondition wait bounded: after three seconds, report that cleanup could
+// not prove absence instead of claiming success.
+const RESOURCE_ABSENCE_ATTEMPTS: usize = 30;
+const RESOURCE_ABSENCE_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AgentVmSessionPlan {
@@ -51,6 +56,7 @@ pub struct AgentVmSessionStopPlan {
     session_id: SessionId,
     pool: AgentNetworkPool,
     network: AgentNetwork,
+    firewall_ipv6: Option<Ipv6Cidr>,
     names: AgentVmNames,
     tools: AgentVmToolPaths,
 }
@@ -81,6 +87,12 @@ pub struct AgentVmToolPaths {
 pub struct ProcessInvocation {
     program: PathBuf,
     args: Vec<OsString>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ResourcePresenceProbe {
+    invocation: ProcessInvocation,
+    name: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -155,6 +167,12 @@ pub enum ProcessInvocationError {
         args: String,
         status: String,
         stderr: String,
+    },
+    #[error("{program} {args} still lists resource after cleanup: {message}")]
+    ResourceStillPresent {
+        program: String,
+        args: String,
+        message: String,
     },
 }
 
@@ -372,9 +390,7 @@ impl AgentVmSessionPlan {
     ) -> Vec<ProcessInvocation> {
         match completed {
             CompletedStartStep::None => Vec::new(),
-            CompletedStartStep::NetworkCreated => {
-                vec![self.stop_plan().remove_network_invocation()]
-            }
+            CompletedStartStep::NetworkCreated => self.stop_plan().network_removal_invocations(),
             CompletedStartStep::FirewallInstalled => self.stop_plan().stop_invocations(),
         }
     }
@@ -391,8 +407,16 @@ impl AgentVmSessionPlan {
             session_id: self.session_id,
             pool: self.pool,
             network: self.network,
+            firewall_ipv6: self.firewall_ipv6_cidr(),
             names: self.names.clone(),
             tools: self.tools.clone(),
+        }
+    }
+
+    fn firewall_ipv6_cidr(&self) -> Option<Ipv6Cidr> {
+        match self.ipv6_mode {
+            Ipv6IsolationMode::DualStackRequired => Some(self.network.ipv6()),
+            Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6 => None,
         }
     }
 
@@ -437,30 +461,42 @@ impl AgentVmSessionPlan {
                 actual: inspection.ipv4_gateway,
             });
         }
-        match (inspection.ipv6_subnet, inspection.ipv6_gateway) {
-            (Some(ipv6_subnet), Some(ipv6_gateway)) => {
-                if ipv6_subnet != self.network.ipv6() {
-                    return Err(NetworkInspectionError::Ipv6SubnetMismatch {
-                        expected: self.network.ipv6(),
-                        actual: ipv6_subnet,
-                    });
-                }
-                if !self.network.ipv6().contains_addr(ipv6_gateway) {
-                    return Err(NetworkInspectionError::Ipv6GatewayOutsideSubnet {
-                        subnet: self.network.ipv6(),
-                        gateway: ipv6_gateway,
-                    });
-                }
+        match self.ipv6_mode {
+            Ipv6IsolationMode::DualStackRequired => {
+                self.validate_dual_stack_ipv6_inspection(inspection)?;
             }
-            (Some(_), None) => return Err(NetworkInspectionError::MissingField("ipv6Gateway")),
-            (None, Some(_)) => return Err(NetworkInspectionError::MissingField("ipv6Subnet")),
-            (None, None) => {
-                if self.ipv6_mode == Ipv6IsolationMode::DualStackRequired {
-                    return Err(NetworkInspectionError::MissingField("ipv6Subnet"));
-                }
+            Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6 => {
+                validate_ipv4_only_observed_ipv6(inspection)?;
             }
         }
         Ok(())
+    }
+
+    fn validate_dual_stack_ipv6_inspection(
+        &self,
+        inspection: &AppleNetworkInspection,
+    ) -> Result<(), NetworkInspectionError> {
+        let expected_ipv6 = self.network.ipv6();
+        match (inspection.ipv6_subnet, inspection.ipv6_gateway) {
+            (Some(ipv6_subnet), Some(ipv6_gateway)) => {
+                if ipv6_subnet != expected_ipv6 {
+                    return Err(NetworkInspectionError::Ipv6SubnetMismatch {
+                        expected: expected_ipv6,
+                        actual: ipv6_subnet,
+                    });
+                }
+                if !expected_ipv6.contains_addr(ipv6_gateway) {
+                    return Err(NetworkInspectionError::Ipv6GatewayOutsideSubnet {
+                        subnet: expected_ipv6,
+                        gateway: ipv6_gateway,
+                    });
+                }
+                Ok(())
+            }
+            (Some(_), None) => Err(NetworkInspectionError::MissingField("ipv6Gateway")),
+            (None, Some(_)) => Err(NetworkInspectionError::MissingField("ipv6Subnet")),
+            (None, None) => Err(NetworkInspectionError::MissingField("ipv6Subnet")),
+        }
     }
 
     fn install_firewall_invocation(&self) -> ProcessInvocation {
@@ -475,9 +511,11 @@ impl AgentVmSessionPlan {
             OsString::from(self.pool.ipv6_base().to_string()),
             OsString::from("--ipv4-cidr"),
             OsString::from(self.network.ipv4().to_string()),
-            OsString::from("--ipv6-cidr"),
-            OsString::from(self.network.ipv6().to_string()),
         ];
+        if self.ipv6_mode == Ipv6IsolationMode::DualStackRequired {
+            args.push(OsString::from("--ipv6-cidr"));
+            args.push(OsString::from(self.network.ipv6().to_string()));
+        }
         for port in self.broker_ports.as_slice() {
             args.push(OsString::from("--broker-port"));
             args.push(OsString::from(port.get().to_string()));
@@ -549,13 +587,19 @@ impl AgentVmSessionStopPlan {
         session_id: SessionId,
         pool: AgentNetworkPool,
         subnet_index: u16,
+        ipv6_mode: Ipv6IsolationMode,
         tools: AgentVmToolPaths,
     ) -> Result<Self, AgentVmLifecycleConfigError> {
         let network = pool.allocate(subnet_index)?;
+        let firewall_ipv6 = match ipv6_mode {
+            Ipv6IsolationMode::DualStackRequired => Some(network.ipv6()),
+            Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6 => None,
+        };
         Ok(Self {
             session_id,
             pool,
             network,
+            firewall_ipv6,
             names: AgentVmNames::for_session(session_id),
             tools,
         })
@@ -574,48 +618,101 @@ impl AgentVmSessionStopPlan {
     }
 
     pub fn stop_invocations(&self) -> Vec<ProcessInvocation> {
+        let mut invocations = self.vm_removal_invocations();
+        invocations.push(self.remove_firewall_invocation());
+        invocations.extend(self.network_removal_invocations());
+        invocations
+    }
+
+    fn vm_removal_invocations(&self) -> Vec<ProcessInvocation> {
         vec![
-            self.remove_vm_invocation(),
-            self.remove_firewall_invocation(),
-            self.remove_network_invocation(),
+            ProcessInvocation::new(
+                self.tools.container.clone(),
+                ["rm".to_string(), "-f".to_string(), self.names.vm.clone()],
+            ),
+            ProcessInvocation::new(
+                self.tools.container.clone(),
+                ["stop".to_string(), self.names.vm.clone()],
+            ),
+            ProcessInvocation::new(
+                self.tools.container.clone(),
+                ["delete".to_string(), self.names.vm.clone()],
+            ),
+            ProcessInvocation::new(
+                self.tools.container.clone(),
+                ["rm".to_string(), self.names.vm.clone()],
+            ),
         ]
     }
 
-    fn remove_vm_invocation(&self) -> ProcessInvocation {
-        ProcessInvocation::new(
-            self.tools.container.clone(),
-            ["rm".to_string(), "-f".to_string(), self.names.vm.clone()],
+    fn vm_presence_probe(&self) -> ResourcePresenceProbe {
+        ResourcePresenceProbe::new(
+            ProcessInvocation::new(
+                self.tools.container.clone(),
+                [
+                    "list".to_string(),
+                    "--all".to_string(),
+                    "--quiet".to_string(),
+                ],
+            ),
+            self.names.vm.clone(),
         )
     }
 
     fn remove_firewall_invocation(&self) -> ProcessInvocation {
-        ProcessInvocation::new(
-            self.tools.sudo.clone(),
-            [
-                self.tools.pf_helper.as_os_str().to_os_string(),
-                OsString::from("remove"),
-                OsString::from("--session-id"),
-                OsString::from(self.session_id.to_string()),
-                OsString::from("--ipv4-pool"),
-                OsString::from(self.pool.ipv4_base().to_string()),
-                OsString::from("--ipv6-pool"),
-                OsString::from(self.pool.ipv6_base().to_string()),
-                OsString::from("--ipv4-cidr"),
-                OsString::from(self.network.ipv4().to_string()),
+        let mut args = vec![
+            self.tools.pf_helper.as_os_str().to_os_string(),
+            OsString::from("remove"),
+            OsString::from("--session-id"),
+            OsString::from(self.session_id.to_string()),
+            OsString::from("--ipv4-pool"),
+            OsString::from(self.pool.ipv4_base().to_string()),
+            OsString::from("--ipv6-pool"),
+            OsString::from(self.pool.ipv6_base().to_string()),
+            OsString::from("--ipv4-cidr"),
+            OsString::from(self.network.ipv4().to_string()),
+        ];
+        if let Some(ipv6) = self.firewall_ipv6 {
+            args.extend([
                 OsString::from("--ipv6-cidr"),
-                OsString::from(self.network.ipv6().to_string()),
-            ],
-        )
+                OsString::from(ipv6.to_string()),
+            ]);
+        }
+        ProcessInvocation::new(self.tools.sudo.clone(), args)
     }
 
-    fn remove_network_invocation(&self) -> ProcessInvocation {
-        ProcessInvocation::new(
-            self.tools.container.clone(),
-            [
-                "network".to_string(),
-                "rm".to_string(),
-                self.names.network.clone(),
-            ],
+    fn network_removal_invocations(&self) -> Vec<ProcessInvocation> {
+        vec![
+            ProcessInvocation::new(
+                self.tools.container.clone(),
+                [
+                    "network".to_string(),
+                    "rm".to_string(),
+                    self.names.network.clone(),
+                ],
+            ),
+            ProcessInvocation::new(
+                self.tools.container.clone(),
+                [
+                    "network".to_string(),
+                    "delete".to_string(),
+                    self.names.network.clone(),
+                ],
+            ),
+        ]
+    }
+
+    fn network_presence_probe(&self) -> ResourcePresenceProbe {
+        ResourcePresenceProbe::new(
+            ProcessInvocation::new(
+                self.tools.container.clone(),
+                [
+                    "network".to_string(),
+                    "list".to_string(),
+                    "--quiet".to_string(),
+                ],
+            ),
+            self.names.network.clone(),
         )
     }
 }
@@ -746,6 +843,14 @@ impl ProcessInvocation {
         }
     }
 
+    fn resource_still_present(&self, message: impl Into<String>) -> ProcessInvocationError {
+        ProcessInvocationError::ResourceStillPresent {
+            program: self.program.display().to_string(),
+            args: self.args_display(),
+            message: message.into(),
+        }
+    }
+
     fn output(&self) -> Result<std::process::Output, ProcessInvocationError> {
         Command::new(&self.program)
             .args(&self.args)
@@ -763,6 +868,27 @@ impl ProcessInvocation {
             .map(|arg| arg.to_string_lossy())
             .collect::<Vec<_>>()
             .join(" ")
+    }
+}
+
+impl ResourcePresenceProbe {
+    fn new(invocation: ProcessInvocation, name: String) -> Self {
+        Self { invocation, name }
+    }
+
+    fn contains_resource(&self) -> Result<bool, ProcessInvocationError> {
+        let output = self.invocation.output()?;
+        if !output.status.success() {
+            return Err(self.invocation.failed_from_output(output));
+        }
+        Ok(resource_list_contains_exact_line(
+            &output.stdout,
+            &self.name,
+        ))
+    }
+
+    fn resource_still_present(&self, message: impl Into<String>) -> ProcessInvocationError {
+        self.invocation.resource_still_present(message)
     }
 }
 
@@ -926,7 +1052,7 @@ pub fn start_agent_vm_session(plan: &AgentVmSessionPlan) -> Result<(), AgentVmLi
 }
 
 pub fn stop_agent_vm_session(plan: &AgentVmSessionStopPlan) -> Result<(), CleanupErrors> {
-    run_cleanup(plan.stop_invocations())
+    run_stop_plan_cleanup(plan)
 }
 
 fn fail_after_cleanup<T>(
@@ -934,7 +1060,7 @@ fn fail_after_cleanup<T>(
     plan: &AgentVmSessionPlan,
     outcome: StartOutcome,
 ) -> Result<T, AgentVmLifecycleRunError> {
-    match run_cleanup(plan.cleanup_after_start_outcome(outcome)) {
+    match run_cleanup_after_start_outcome(plan, outcome) {
         Ok(()) => Err(original.into()),
         Err(cleanup) => Err(AgentVmLifecycleRunError::CleanupAfterFailure {
             original: Box::new(original),
@@ -943,18 +1069,135 @@ fn fail_after_cleanup<T>(
     }
 }
 
-fn run_cleanup(invocations: Vec<ProcessInvocation>) -> Result<(), CleanupErrors> {
-    let mut errors = Vec::new();
-    for invocation in invocations {
-        if let Err(err) = invocation.run() {
-            errors.push(err);
+fn run_cleanup_after_start_outcome(
+    plan: &AgentVmSessionPlan,
+    outcome: StartOutcome,
+) -> Result<(), CleanupErrors> {
+    match cleanup_step_after_start_outcome(outcome) {
+        Some(CompletedStartStep::NetworkCreated) => {
+            single_cleanup_result(run_network_cleanup_until_absent(&plan.stop_plan()))
         }
+        Some(CompletedStartStep::FirewallInstalled) => run_stop_plan_cleanup(&plan.stop_plan()),
+        Some(CompletedStartStep::None) | None => Ok(()),
     }
+}
+
+fn single_cleanup_result(result: Result<(), ProcessInvocationError>) -> Result<(), CleanupErrors> {
+    result.map_err(|err| CleanupErrors::new(vec![err]))
+}
+
+fn run_stop_plan_cleanup(plan: &AgentVmSessionStopPlan) -> Result<(), CleanupErrors> {
+    let mut errors = Vec::new();
+    if let Err(err) = run_vm_cleanup_until_absent(plan) {
+        errors.push(err);
+    }
+    if let Err(err) = plan.remove_firewall_invocation().run() {
+        errors.push(err);
+    }
+    if let Err(err) = run_network_cleanup_until_absent(plan) {
+        errors.push(err);
+    }
+    finish_cleanup_errors(errors)
+}
+
+fn finish_cleanup_errors(errors: Vec<ProcessInvocationError>) -> Result<(), CleanupErrors> {
     if errors.is_empty() {
         Ok(())
     } else {
         Err(CleanupErrors::new(errors))
     }
+}
+
+fn run_vm_cleanup_until_absent(
+    plan: &AgentVmSessionStopPlan,
+) -> Result<(), ProcessInvocationError> {
+    run_cleanup_until_resource_absent(
+        &plan.vm_presence_probe(),
+        plan.vm_removal_invocations(),
+        "VM still appears in container list after removal attempts",
+    )
+}
+
+fn run_network_cleanup_until_absent(
+    plan: &AgentVmSessionStopPlan,
+) -> Result<(), ProcessInvocationError> {
+    run_cleanup_until_resource_absent(
+        &plan.network_presence_probe(),
+        plan.network_removal_invocations(),
+        "network still appears in container network list after removal attempts",
+    )
+}
+
+fn run_cleanup_until_resource_absent(
+    probe: &ResourcePresenceProbe,
+    removals: Vec<ProcessInvocation>,
+    still_present: &'static str,
+) -> Result<(), ProcessInvocationError> {
+    let removals_len = removals.len();
+    run_cleanup_until_resource_absent_with(
+        removals_len,
+        RESOURCE_ABSENCE_ATTEMPTS,
+        || probe.contains_resource(),
+        |index| {
+            // Absence from Apple Container's list output is the cleanup
+            // contract; individual removal commands may race or report
+            // already-removed resources after an earlier attempt succeeded.
+            let _ = removals[index].run();
+        },
+        || std::thread::sleep(RESOURCE_ABSENCE_DELAY),
+        || probe.resource_still_present(still_present),
+    )
+}
+
+fn run_cleanup_until_resource_absent_with<E>(
+    removal_count: usize,
+    absence_attempts: usize,
+    mut contains_resource: impl FnMut() -> Result<bool, E>,
+    mut run_removal: impl FnMut(usize),
+    mut wait_before_next_probe: impl FnMut(),
+    resource_still_present: impl FnOnce() -> E,
+) -> Result<(), E> {
+    let mut first_presence_error = match contains_resource() {
+        Ok(false) => return Ok(()),
+        Ok(true) => None,
+        Err(err) => Some(err),
+    };
+    for removal_index in 0..removal_count {
+        run_removal(removal_index);
+        match contains_resource() {
+            Ok(false) => return Ok(()),
+            Ok(true) => {}
+            Err(err) => {
+                if first_presence_error.is_none() {
+                    first_presence_error = Some(err);
+                }
+            }
+        }
+    }
+    for attempt in 0..absence_attempts {
+        match contains_resource() {
+            Ok(false) => return Ok(()),
+            Ok(true) => {}
+            Err(err) => {
+                if first_presence_error.is_none() {
+                    first_presence_error = Some(err);
+                }
+            }
+        }
+        if attempt + 1 < absence_attempts {
+            wait_before_next_probe();
+        }
+    }
+    if let Some(err) = first_presence_error {
+        return Err(err);
+    }
+    Err(resource_still_present())
+}
+
+fn resource_list_contains_exact_line(raw: &[u8], name: &str) -> bool {
+    String::from_utf8_lossy(raw)
+        .lines()
+        .any(|line| line.trim() == name)
 }
 
 fn wait_for_guest_ipv6_inspection(
@@ -1149,6 +1392,44 @@ fn ipv6_addr_is_link_local(addr: Ipv6Addr) -> bool {
     (addr.segments()[0] & 0xffc0) == 0xfe80
 }
 
+fn validate_ipv4_only_observed_ipv6(
+    inspection: &AppleNetworkInspection,
+) -> Result<(), NetworkInspectionError> {
+    let Some(ipv6_subnet) = inspection.ipv6_subnet else {
+        return match inspection.ipv6_gateway {
+            Some(_) => Err(NetworkInspectionError::MissingField("ipv6Subnet")),
+            None => Ok(()),
+        };
+    };
+    if ipv6_subnet.prefix() != 64 {
+        return Err(NetworkInspectionError::InvalidField {
+            field: "ipv6Subnet",
+            value: ipv6_subnet.to_string(),
+            message: "IPv4-only mode only accepts observed IPv6 /64 subnets".into(),
+        });
+    }
+    if !ipv6_cidr_is_ula(ipv6_subnet) {
+        return Err(NetworkInspectionError::InvalidField {
+            field: "ipv6Subnet",
+            value: ipv6_subnet.to_string(),
+            message: "IPv4-only mode only accepts observed IPv6 ULA subnets".into(),
+        });
+    }
+    if let Some(ipv6_gateway) = inspection.ipv6_gateway
+        && !ipv6_subnet.contains_addr(ipv6_gateway)
+    {
+        return Err(NetworkInspectionError::Ipv6GatewayOutsideSubnet {
+            subnet: ipv6_subnet,
+            gateway: ipv6_gateway,
+        });
+    }
+    Ok(())
+}
+
+fn ipv6_cidr_is_ula(cidr: Ipv6Cidr) -> bool {
+    (cidr.network().segments()[0] & 0xfe00) == 0xfc00
+}
+
 fn shell_quote(raw: &str) -> String {
     if !raw.is_empty()
         && raw
@@ -1163,6 +1444,7 @@ fn shell_quote(raw: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
     use std::net::{Ipv4Addr, Ipv6Addr};
 
     use proptest::prelude::*;
@@ -1262,6 +1544,7 @@ mod tests {
         assert_eq!(invocations[2].program(), Path::new("sudo"));
         let firewall_args = invocations[2].args_lossy();
         assert_eq!(&firewall_args[0..2], ["writ-agent-vm-pf-helper", "install"]);
+        assert!(firewall_args.contains(&"--ipv6-cidr".to_string()));
         let vm_args = invocations[3].args_lossy();
         assert_eq!(&vm_args[0..2], ["run", "--name"]);
         assert!(
@@ -1274,6 +1557,10 @@ mod tests {
         let invocations =
             plan_with_ipv6_mode(252, Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6).start_invocations();
         assert_eq!(invocations.len(), 6);
+        let firewall_args = invocations[2].args_lossy();
+        assert_eq!(&firewall_args[0..2], ["writ-agent-vm-pf-helper", "install"]);
+        assert!(!firewall_args.contains(&"--ipv6-cidr".to_string()));
+
         let start_vm_args = invocations[3].args_lossy();
         assert_eq!(&start_vm_args[0..2], ["run", "--name"]);
         assert!(start_vm_args.contains(&"sh".to_string()));
@@ -1314,7 +1601,7 @@ mod tests {
     #[test]
     fn stop_invocations_remove_vm_then_firewall_then_network() {
         let invocations = plan(252).stop_invocations();
-        assert_eq!(invocations.len(), 3);
+        assert_eq!(invocations.len(), 7);
         assert_eq!(
             invocations[0].args_lossy(),
             [
@@ -1323,34 +1610,98 @@ mod tests {
                 "writ-agent-vm-51b8fd0f-6c10-454c-b0e6-7df1d60e2e6d",
             ]
         );
-        let firewall_args = invocations[1].args_lossy();
-        assert_eq!(&firewall_args[0..2], ["writ-agent-vm-pf-helper", "remove"]);
+        assert_eq!(
+            invocations[1].args_lossy(),
+            ["stop", "writ-agent-vm-51b8fd0f-6c10-454c-b0e6-7df1d60e2e6d",]
+        );
         assert_eq!(
             invocations[2].args_lossy(),
+            [
+                "delete",
+                "writ-agent-vm-51b8fd0f-6c10-454c-b0e6-7df1d60e2e6d",
+            ]
+        );
+        assert_eq!(
+            invocations[3].args_lossy(),
+            ["rm", "writ-agent-vm-51b8fd0f-6c10-454c-b0e6-7df1d60e2e6d",]
+        );
+        let firewall_args = invocations[4].args_lossy();
+        assert_eq!(&firewall_args[0..2], ["writ-agent-vm-pf-helper", "remove"]);
+        assert_eq!(
+            invocations[5].args_lossy(),
             [
                 "network",
                 "rm",
                 "writ-agent-net-51b8fd0f-6c10-454c-b0e6-7df1d60e2e6d",
             ]
         );
+        assert_eq!(
+            invocations[6].args_lossy(),
+            [
+                "network",
+                "delete",
+                "writ-agent-net-51b8fd0f-6c10-454c-b0e6-7df1d60e2e6d",
+            ]
+        );
+    }
+
+    #[test]
+    fn ipv4_only_stop_invocations_omit_ipv6_firewall_scope() {
+        let invocations =
+            plan_with_ipv6_mode(252, Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6).stop_invocations();
+        let firewall_args = invocations[4].args_lossy();
+        assert_eq!(&firewall_args[0..2], ["writ-agent-vm-pf-helper", "remove"]);
+        assert!(!firewall_args.contains(&"--ipv6-cidr".to_string()));
+    }
+
+    #[test]
+    fn stop_cleanup_presence_probes_use_quiet_lists() {
+        let stop_plan = plan(252).stop_plan();
+        assert_eq!(
+            stop_plan.vm_presence_probe().invocation.args_lossy(),
+            ["list", "--all", "--quiet"]
+        );
+        assert_eq!(
+            stop_plan.network_presence_probe().invocation.args_lossy(),
+            ["network", "list", "--quiet"]
+        );
+    }
+
+    #[test]
+    fn resource_list_presence_requires_an_exact_quiet_line() {
+        let name = "writ-agent-vm-51b8fd0f-6c10-454c-b0e6-7df1d60e2e6d";
+        let listed = format!("other\n{name}\n{name}-old\n");
+        assert!(resource_list_contains_exact_line(listed.as_bytes(), name));
+        assert!(!resource_list_contains_exact_line(
+            format!("{name}-old\nother\n").as_bytes(),
+            name
+        ));
+        assert!(!resource_list_contains_exact_line(
+            format!("prefix-{name}\n").as_bytes(),
+            name
+        ));
     }
 
     #[test]
     fn failed_firewall_install_cleans_up_network_only() {
         let cleanup = plan(252).cleanup_after_partial_start(CompletedStartStep::NetworkCreated);
-        assert_eq!(cleanup.len(), 1);
+        assert_eq!(cleanup.len(), 2);
         let args = cleanup[0].args_lossy();
         assert_eq!(&args[0..2], ["network", "rm"]);
+        let args = cleanup[1].args_lossy();
+        assert_eq!(&args[0..2], ["network", "delete"]);
     }
 
     #[test]
     fn failed_vm_start_removes_vm_then_firewall_then_network() {
         let cleanup = plan(252).cleanup_after_partial_start(CompletedStartStep::FirewallInstalled);
-        assert_eq!(cleanup.len(), 3);
+        assert_eq!(cleanup.len(), 7);
         let remove_vm_args = cleanup[0].args_lossy();
-        let remove_firewall_args = cleanup[1].args_lossy();
-        let remove_network_args = cleanup[2].args_lossy();
+        let delete_vm_args = cleanup[2].args_lossy();
+        let remove_firewall_args = cleanup[4].args_lossy();
+        let remove_network_args = cleanup[5].args_lossy();
         assert_eq!(&remove_vm_args[0..2], ["rm", "-f"]);
+        assert_eq!(&delete_vm_args[0..1], ["delete"]);
         assert_eq!(
             &remove_firewall_args[0..2],
             ["writ-agent-vm-pf-helper", "remove"]
@@ -1379,6 +1730,72 @@ mod tests {
         plan_with_ipv6_mode(252, Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6)
             .validate_network_inspection(&inspection)
             .unwrap();
+    }
+
+    proptest! {
+        #[test]
+        fn ipv4_only_mode_accepts_observed_ula_ipv6_without_treating_it_as_pf_scope(index in any::<u8>()) {
+            let alternate_index = u16::from(index.wrapping_add(1));
+            let index = u16::from(index);
+            let dual_stack_plan = plan(index);
+            let ipv4_only_plan = plan_with_ipv6_mode(index, Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6);
+            let matching = inspection_for_plan(&dual_stack_plan);
+
+            let matching_subnet_without_gateway = AppleNetworkInspection {
+                ipv6_gateway: None,
+                ..matching.clone()
+            };
+            prop_assert_eq!(
+                dual_stack_plan.validate_network_inspection(&matching_subnet_without_gateway),
+                Err(NetworkInspectionError::MissingField("ipv6Gateway"))
+            );
+            prop_assert_eq!(
+                ipv4_only_plan.validate_network_inspection(&matching_subnet_without_gateway),
+                Ok(())
+            );
+
+            let alternate = pool().allocate(alternate_index).unwrap();
+            let apple_chosen_subnet_without_gateway = AppleNetworkInspection {
+                ipv6_subnet: Some(alternate.ipv6()),
+                ipv6_gateway: None,
+                ..matching.clone()
+            };
+            prop_assert_eq!(
+                ipv4_only_plan.validate_network_inspection(&apple_chosen_subnet_without_gateway),
+                Ok(())
+            );
+
+            let public_subnet_without_gateway = AppleNetworkInspection {
+                ipv6_subnet: Some(Ipv6Cidr::new("2001:db8::".parse().unwrap(), 64).unwrap()),
+                ipv6_gateway: None,
+                ..matching.clone()
+            };
+            let got_invalid_public_subnet = matches!(
+                ipv4_only_plan.validate_network_inspection(&public_subnet_without_gateway),
+                Err(NetworkInspectionError::InvalidField { field: "ipv6Subnet", .. })
+            );
+            prop_assert!(got_invalid_public_subnet);
+
+            let gateway_without_subnet = AppleNetworkInspection {
+                ipv6_subnet: None,
+                ..matching.clone()
+            };
+            prop_assert_eq!(
+                ipv4_only_plan.validate_network_inspection(&gateway_without_subnet),
+                Err(NetworkInspectionError::MissingField("ipv6Subnet"))
+            );
+
+            let outside_gateway = AppleNetworkInspection {
+                ipv6_subnet: Some(alternate.ipv6()),
+                ipv6_gateway: Some(Ipv6Addr::from(u128::from(alternate.ipv6().network()) + (1u128 << 64))),
+                ..matching
+            };
+            let got_gateway_outside_subnet = matches!(
+                ipv4_only_plan.validate_network_inspection(&outside_gateway),
+                Err(NetworkInspectionError::Ipv6GatewayOutsideSubnet { .. })
+            );
+            prop_assert!(got_gateway_outside_subnet);
+        }
     }
 
     #[test]
@@ -1520,13 +1937,111 @@ mod tests {
 
     #[test]
     fn cleanup_collects_every_failed_step() {
-        let errors = run_cleanup(vec![
+        let mut errors = Vec::new();
+        for invocation in [
             ProcessInvocation::new("/tmp/writ-missing-cleanup-one", ["one"]),
             ProcessInvocation::new("/tmp/writ-missing-cleanup-two", ["two"]),
-        ])
-        .unwrap_err();
+        ] {
+            errors.push(invocation.run().unwrap_err());
+        }
+        let errors = finish_cleanup_errors(errors).unwrap_err();
         assert_eq!(errors.errors().len(), 2);
         assert!(errors.to_string().contains("2 cleanup step(s) failed"));
+    }
+
+    #[test]
+    fn cleanup_absence_loop_stops_after_first_absent_probe() {
+        let mut outcomes = VecDeque::from([Ok(true), Ok(false)]);
+        let mut removals = Vec::new();
+        let mut waits = 0;
+        run_cleanup_until_resource_absent_with(
+            3,
+            5,
+            || outcomes.pop_front().expect("unexpected extra probe"),
+            |index| removals.push(index),
+            || waits += 1,
+            || "still present",
+        )
+        .unwrap();
+        assert_eq!(removals, vec![0]);
+        assert_eq!(waits, 0);
+        assert!(outcomes.is_empty());
+    }
+
+    #[test]
+    fn cleanup_absence_loop_tries_every_removal_before_polling() {
+        let mut outcomes = VecDeque::from([Ok(true), Ok(true), Ok(true), Ok(false)]);
+        let mut removals = Vec::new();
+        let mut waits = 0;
+        run_cleanup_until_resource_absent_with(
+            2,
+            3,
+            || outcomes.pop_front().expect("unexpected extra probe"),
+            |index| removals.push(index),
+            || waits += 1,
+            || "still present",
+        )
+        .unwrap();
+        assert_eq!(removals, vec![0, 1]);
+        assert_eq!(waits, 0);
+        assert!(outcomes.is_empty());
+    }
+
+    #[test]
+    fn cleanup_absence_loop_surfaces_first_presence_probe_error() {
+        let mut outcomes = VecDeque::from([
+            Err("first probe failed"),
+            Err("second probe failed"),
+            Err("third probe failed"),
+            Err("fourth probe failed"),
+            Err("fifth probe failed"),
+        ]);
+        let mut removals = Vec::new();
+        let mut waits = 0;
+        let err = run_cleanup_until_resource_absent_with(
+            2,
+            2,
+            || outcomes.pop_front().expect("unexpected extra probe"),
+            |index| removals.push(index),
+            || waits += 1,
+            || "still present",
+        )
+        .unwrap_err();
+        assert_eq!(err, "first probe failed");
+        assert_eq!(removals, vec![0, 1]);
+        assert_eq!(waits, 1);
+        assert!(outcomes.is_empty());
+    }
+
+    #[test]
+    fn cleanup_absence_loop_reports_still_present_after_bounded_retries() {
+        let mut outcomes = VecDeque::from([Ok(true), Ok(true), Ok(true), Ok(true), Ok(true)]);
+        let mut removals = Vec::new();
+        let mut waits = 0;
+        let err = run_cleanup_until_resource_absent_with(
+            2,
+            2,
+            || outcomes.pop_front().expect("unexpected extra probe"),
+            |index| removals.push(index),
+            || waits += 1,
+            || "still present",
+        )
+        .unwrap_err();
+        assert_eq!(err, "still present");
+        assert_eq!(removals, vec![0, 1]);
+        assert_eq!(waits, 1);
+        assert!(outcomes.is_empty());
+    }
+
+    #[test]
+    fn resource_still_present_error_names_cleanup_postcondition() {
+        let err = ProcessInvocation::new("container", ["list", "--quiet"])
+            .resource_still_present("VM still appears in container list");
+        assert!(matches!(
+            err,
+            ProcessInvocationError::ResourceStillPresent { message, .. }
+                if message == "VM still appears in container list"
+        ));
     }
 
     proptest! {
@@ -1545,11 +2060,11 @@ mod tests {
                 StartOutcome::InspectNetworkFailed
                 | StartOutcome::ParseNetworkInspectionFailed
                 | StartOutcome::ValidateNetworkInspectionFailed
-                | StartOutcome::InstallFirewallFailed => 1,
+                | StartOutcome::InstallFirewallFailed => 2,
                 StartOutcome::StartVmFailed
                 | StartOutcome::ProbeGuestIpv6Failed
                 | StartOutcome::ValidateGuestIpv6Failed
-                | StartOutcome::ReleaseGuestCommandFailed => 3,
+                | StartOutcome::ReleaseGuestCommandFailed => 7,
             };
             prop_assert_eq!(cleanup.len(), expected_len);
             let only_removes = cleanup.iter().all(|cmd| {
