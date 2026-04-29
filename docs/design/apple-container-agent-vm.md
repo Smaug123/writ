@@ -549,6 +549,38 @@ Manual runner lifecycle proof harness added in
 - keeps trap cleanup as a fallback, but treats runner `stop` plus post-stop
   assertions as the proof path.
 
+Manual two-session runner proof harness added in
+`scripts/prove-agent-vm-two-sessions.sh`:
+
+- builds `writ-agent-vm-pf-helper` and `writ-agent-vm-runner`;
+- starts two host broker listeners and one forbidden listener;
+- runs two full passes, one stopping session A first and one stopping session
+  B first. Each pass starts two real runner-managed sessions in
+  `ipv4-only-no-guest-ipv6` mode on different subnet indexes and different
+  broker ports;
+- asserts each VM reaches only its own broker port through its own host-only
+  gateway, and cannot reach the other session's broker port on that same
+  gateway. This is the load-bearing session-independence check, because both
+  tested broker listeners are live on the host at the same time;
+- asserts both VMs have no routable IPv6 posture and fail the
+  forbidden-host-port, direct IPv4, and direct DNS probes;
+- snapshots both PF anchors before teardown. After stopping the first session
+  in the pass, it verifies that the stopped session's VM, network, PF anchor,
+  and observed guest-IPv4 PF states are gone, the survivor's PF anchor is
+  unchanged, and the survivor still reaches its own broker while still failing
+  the stopped session's broker port;
+- stops the survivor and verifies its VM, network, PF anchor, and observed
+  guest-IPv4 PF states are gone;
+- keeps trap cleanup as a fallback.
+
+Manual macOS result on 2026-04-29: this harness passed in both teardown
+orders for subnet indexes 252 and 253. The run proved that two simultaneous
+runner-managed `ipv4-only-no-guest-ipv6` sessions can each reach only their
+own broker, cannot reach the other live session's broker port through their
+own gateway, keep the survivor's PF anchor unchanged after stopping the first
+session, and clean up both sessions' VMs, networks, PF anchors, and observed
+guest-IPv4 PF states.
+
 ## Risks
 
 - PF rule ordering on macOS can be surprising when other software also manages
@@ -583,5 +615,6 @@ The confirmed pieces are:
 
 PF enforcement has been proven for the IPv4 host-gateway port distinction:
 the VM can reach the broker port while a second host port on the same gateway
-is blocked by the session anchor. IPv6 enforcement and two simultaneous
-session subnets remain unproven.
+is blocked by the session anchor. Runner-managed two-session IPv4 isolation
+has also been proven manually in both teardown orders. Dual-stack IPv6 PF
+enforcement remains unproven.

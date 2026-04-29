@@ -95,6 +95,7 @@ cleanup() {
   fi
 
   if [[ -n "$HELPER" && -n "$IPV4_CIDR" ]]; then
+    local helper_remove
     helper_remove=(
       sudo "$HELPER" remove
       --session-id "$SESSION_ID"
