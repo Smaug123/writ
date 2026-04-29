@@ -179,6 +179,33 @@ The important shift from the current v1 broker is that credentials stay on the
 host side. The VM gets capabilities represented as broker API calls, not bearer
 tokens that can be replayed elsewhere.
 
+First VM HTTP transport slice implemented in `src/vm_http.rs`:
+
+- the broker may ask the OS for an ephemeral port by binding to port `0`, but
+  it must do so before starting the VM and must keep the returned listener
+  open. The transport helper checks the chosen port against the configured
+  `BrokerPortRange`; if repeated port-`0` binds do not land inside that range,
+  it scans the allowed range directly from a randomized offset. This keeps wide
+  ephemeral ranges cheap while still supporting narrow configured ranges such
+  as a two-port test harness range. The returned `BrokerPort` is the value the
+  lifecycle caller can install into PF, persist in session state, and advertise
+  to the guest;
+- each VM HTTP session has a generated bearer secret and an expected source
+  IPv4 subnet. Requests are authorized only when the TCP peer address is inside
+  the session subnet and the `Authorization: Bearer ...` value matches the
+  per-session secret. This is intentionally in addition to PF, because the
+  current proven PF strategy may require a wildcard host listener;
+- the listener runner has an explicit shutdown path and drains connection
+  handlers before returning, so the lifecycle owner does not have to abort a
+  detached accept loop during session teardown;
+- the only implemented VM route is `GET /v1/session`, which returns the
+  session identity and protocol version. Git, Nix, model, and signing
+  operations are deliberately not exposed until their host-side policy and
+  audit semantics are designed. Authentication denials are returned as HTTP
+  `401`/`403` today; durable audit rows for those denials belong in the next
+  broker-integration slice, where the VM HTTP runner has access to broker
+  audit state.
+
 ## Host-side filtering
 
 Use macOS PF (`pfctl`) with per-session anchors. The broker itself should not

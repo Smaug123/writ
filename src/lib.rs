@@ -14,3 +14,4 @@ pub mod policy;
 pub mod protocol;
 pub mod secret;
 pub mod server;
+pub mod vm_http;
