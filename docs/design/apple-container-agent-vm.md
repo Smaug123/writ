@@ -487,6 +487,30 @@ Commit signing options:
 Option 1 is a smaller first step. Option 2 is the cleaner authority boundary
 if commit identity must be entirely broker-controlled.
 
+First Git clone bundle model slice implemented in `src/vm_git.rs`:
+
+- the VM-facing route is pinned as `POST /v1/git/clone`, with a validated JSON
+  body containing a GitHub repo and optional Git ref. The route is not wired
+  into `src/vm_http.rs` yet;
+- repo, ref, secret-env-var, and host path inputs are parsed into typed values
+  before any command can be described. Invalid owner/name/ref syntax, relative
+  work/output paths, zero timeouts, and zero bundle-size limits fail before the
+  executor stage exists;
+- `VmGitCloneRequest::authorization_request()` derives the existing
+  `GitHubRequest::Contents { access: Read, ... }` capability, so the later
+  broker integration can reuse the current policy and audit path rather than
+  adding Git-specific policy plumbing;
+- `GitCloneBundlePlan` describes a host-side `git clone --mirror` followed by
+  `git bundle create`, using an askpass boundary and required secret
+  environment variable name. The plan carries no token value, and generated
+  command argv contains no token material: only static Git flags, the GitHub
+  HTTPS repo URL, local temp paths, and optionally the validated Git ref. Every
+  planned Git invocation also carries a clean Git-configuration environment
+  (`GIT_CONFIG_NOSYSTEM=1`, `GIT_CONFIG_GLOBAL=/dev/null`,
+  `GIT_CONFIG_COUNT=0`) so ambient `url.*.insteadOf`, credential helpers, or
+  environment-injected Git config cannot rewrite the HTTPS/App-token boundary
+  into SSH or user credentials.
+
 ## Tests and proof spikes
 
 First pure slice implemented in `src/core/agent_vm.rs`:
