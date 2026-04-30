@@ -1311,6 +1311,29 @@ mod tests {
         format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
     }
 
+    fn required_test_tool(name: &str) -> PathBuf {
+        let path = std::env::var_os("PATH")
+            .unwrap_or_else(|| panic!("PATH must contain {name} for vm_git tests"));
+        for dir in std::env::split_paths(&path) {
+            let candidate = if dir.is_absolute() {
+                dir.join(name)
+            } else {
+                std::env::current_dir().unwrap().join(dir).join(name)
+            };
+            match std::fs::metadata(&candidate) {
+                Ok(metadata) if is_executable_file(&metadata) => {
+                    // Preserve symlink spelling: bash changes behaviour when
+                    // invoked through its `sh` symlink.
+                    return candidate;
+                }
+                Ok(_) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => panic!("failed to inspect {}: {err}", candidate.display()),
+            }
+        }
+        panic!("required test tool {name} not found on PATH");
+    }
+
     fn fake_git_program(
         dir: &TempDir,
         clone_extra: &str,
@@ -1318,11 +1341,13 @@ mod tests {
     ) -> (PathBuf, PathBuf) {
         let git = dir.path().join("fake-git");
         let log = dir.path().join("fake-git.log");
+        let shell = required_test_tool("sh");
+        let mkdir = shell_quote(&required_test_tool("mkdir"));
         let script = format!(
-            r#"#!/bin/sh
+            r#"#!{shell}
 set -eu
 log={log}
-cwd=$(/bin/pwd)
+cwd=$(pwd)
 printf '%s|%s|%s|%s|%s|%s|%s\n' "$cwd" "${{GIT_CONFIG_NOSYSTEM-unset}}" "${{GIT_CONFIG_GLOBAL-unset}}" "${{GIT_CONFIG_COUNT-unset}}" "${{WRIT_GITHUB_TOKEN-unset}}" "${{HOME+set}}" "${{PATH+set}}" >> "$log"
 if [ "$1" = "-c" ]; then
     [ "$2" = "credential.helper=" ]
@@ -1332,7 +1357,7 @@ if [ "$1" = "-c" ]; then
     [ "$6" = "--mirror" ]
     [ "$7" = "--" ]
     [ "$8" = "https://github.com/smaug123/writ.git" ]
-    /bin/mkdir -p "$9"
+    {mkdir} -p "$9"
 {clone_extra}
     exit 0
 fi
@@ -1346,7 +1371,9 @@ if [ "$1" = "-C" ]; then
 fi
 exit 42
 "#,
+            shell = shell.display(),
             log = shell_quote(&log),
+            mkdir = mkdir,
             clone_extra = clone_extra,
             bundle_extra = bundle_extra,
         );
@@ -1450,9 +1477,15 @@ exit 42
 
     fn descendant_survivor_script(dir: &TempDir) -> PathBuf {
         let script = dir.path().join("descendant-survivor");
+        let shell = required_test_tool("sh");
+        let sleep = shell_quote(&required_test_tool("sleep"));
         std::fs::write(
             &script,
-            "#!/bin/sh\n# Ignore HUP so only process-group SIGKILL can satisfy the cleanup test.\ntrap '' HUP\n/bin/sleep 1\nprintf survived > \"$1\"\n",
+            format!(
+                "#!{}\n# Ignore HUP so only process-group SIGKILL can satisfy the cleanup test.\ntrap '' HUP\n{} 1\nprintf survived > \"$1\"\n",
+                shell.display(),
+                sleep,
+            ),
         )
         .unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -1906,7 +1939,8 @@ exit 42
         let dir = tempfile::tempdir().unwrap();
         let work = dir.path().join("work");
         let link = work.join("link-to-mirror");
-        let clone_extra = format!("/bin/ln -s \"$9\" {}\n", shell_quote(&link));
+        let ln = shell_quote(&required_test_tool("ln"));
+        let clone_extra = format!("{ln} -s \"$9\" {}\n", shell_quote(&link));
         let (git, _) = fake_git_program(&dir, &clone_extra, "");
         let plan = plan_with_paths(
             git,
@@ -1933,8 +1967,10 @@ exit 42
         let work = dir.path().join("work");
         let outside = dir.path().join("outside");
         let link = work.join("link-out");
+        let mkdir = shell_quote(&required_test_tool("mkdir"));
+        let ln = shell_quote(&required_test_tool("ln"));
         let clone_extra = format!(
-            "/bin/mkdir -p {}\n/bin/ln -s {} {}\n",
+            "{mkdir} -p {}\n{ln} -s {} {}\n",
             shell_quote(&outside),
             shell_quote(&outside),
             shell_quote(&link)
