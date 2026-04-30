@@ -511,6 +511,42 @@ First Git clone bundle model slice implemented in `src/vm_git.rs`:
   environment-injected Git config cannot rewrite the HTTPS/App-token boundary
   into SSH or user credentials.
 
+Second Git clone bundle executor slice implemented in `src/vm_git.rs`:
+
+- `run_git_clone_bundle()` executes the planned clone and bundle commands with
+  a cleared child environment, the clean Git-config variables above, null
+  stdin/stdout/stderr, and only the required token environment variable passed
+  to the clone step;
+- the executor creates the planned work directory with private `0700`
+  permissions, refuses a reused work directory, refuses a pre-existing bundle
+  path using no-follow metadata, requires the bundle path to live under the
+  work directory after lexical `..` normalisation, resolves relative `git`
+  through the parent `PATH` before clearing the child environment, runs Git
+  from `/` so broker-local `.git/config` cannot participate in config
+  discovery, and enforces the per-command timeout from the plan;
+- after clone and before bundle creation it canonicalises the mirror and
+  bundle parent paths, rejecting symlink layouts that would place the bundle
+  outside the work directory or inside the mirror repository despite passing
+  the earlier lexical check;
+- after bundle creation it verifies the output is a regular file, still
+  resolves inside the work directory and outside the mirror repository, and is
+  at or below the plan's maximum bundle size. Each Git subprocess runs in its
+  own process group with an armed cleanup guard immediately after spawn. For
+  success and nonzero-exit paths, the executor observes child exit without
+  reaping the leader, kills the process group, and only then reaps the leader
+  for `ExitStatus`; timeout, error, and future-cancellation cleanup also kill
+  the process group. This keeps ordinary Git helpers from continuing with the
+  secret-bearing environment after the executor returns;
+- the current maximum bundle size is an output admission check, not a disk
+  quota: clone and bundle creation can still consume temporary disk and IO
+  until Git exits or the timeout fires. A production resource-budget slice
+  still needs a bounded filesystem, per-run quota, or streaming bundle target
+  if the broker must cap disk consumption during Git execution. The executor
+  does not mint credentials and does not yet wire the route into
+  `src/vm_http.rs`; callers remain responsible for
+  supplying unique temporary paths and cleaning them up after streaming or
+  discarding the bundle.
+
 ## Tests and proof spikes
 
 First pure slice implemented in `src/core/agent_vm.rs`:
