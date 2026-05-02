@@ -1,12 +1,20 @@
 //! Daemon configuration loaded from a JSON file at startup.
 
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::PathBuf;
 use std::time::Duration;
 
 use serde::Deserialize;
 
-use crate::core::{AgentVmConfigError, BrokerPortRange};
+use crate::agent_vm_daemon::{
+    AgentVmDaemonRuntimeConfig, AgentVmDaemonRuntimeConfigError, AgentVmLifecycleRuntimeConfig,
+    AgentVmLifecycleRuntimeConfigError,
+};
+use crate::agent_vm_lifecycle::{
+    AgentVmLifecycleConfigError, AgentVmResources, AgentVmSessionStateStore, AgentVmStateDirError,
+    AgentVmToolPaths, ContainerImage, Ipv6IsolationMode, default_agent_vm_state_dir,
+};
+use crate::core::{AgentNetworkPool, AgentVmConfigError, BrokerPortRange, Ipv4Cidr, Ipv6Cidr};
 use crate::github::GitHubAppConfig;
 use crate::policy::PolicyConfig;
 use crate::vm_git::{
@@ -59,7 +67,31 @@ pub struct DaemonConfig {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentVmDaemonConfig {
+    pub lifecycle: AgentVmLifecycleConfig,
     pub vm_http: AgentVmHttpConfig,
+}
+
+/// JSON-deserialized lifecycle settings for daemon-managed agent VMs. Convert
+/// with [`AgentVmLifecycleConfig::to_runtime_config`] before use; runtime code
+/// receives [`AgentVmLifecycleRuntimeConfig`] instead.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentVmLifecycleConfig {
+    pub ipv4_pool: String,
+    pub ipv6_pool: String,
+    pub subnet_index_min: u16,
+    pub subnet_index_max: u16,
+    #[serde(default = "default_container_program")]
+    pub container: PathBuf,
+    #[serde(default = "default_sudo_program")]
+    pub sudo: PathBuf,
+    pub pf_helper: PathBuf,
+    #[serde(default)]
+    pub state_dir: Option<PathBuf>,
+    pub ipv6_mode: Ipv6IsolationMode,
+    pub image: String,
+    pub cpus: u16,
+    pub memory_mib: u32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -102,6 +134,67 @@ pub enum AgentVmHttpConfigError {
     GitClone(#[from] GitCloneBundlePlanError),
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum AgentVmDaemonConfigError {
+    #[error(transparent)]
+    VmHttp(#[from] AgentVmHttpConfigError),
+    #[error(transparent)]
+    AgentVm(#[from] AgentVmConfigError),
+    #[error(transparent)]
+    Lifecycle(#[from] AgentVmLifecycleConfigError),
+    #[error(transparent)]
+    StateDir(#[from] AgentVmStateDirError),
+    #[error(transparent)]
+    LifecycleRuntime(#[from] AgentVmLifecycleRuntimeConfigError),
+    #[error(transparent)]
+    Runtime(#[from] AgentVmDaemonRuntimeConfigError),
+    #[error("agent VM config field {field} has invalid CIDR {value:?}: {message}")]
+    InvalidCidr {
+        field: &'static str,
+        value: String,
+        message: String,
+    },
+}
+
+impl AgentVmDaemonConfig {
+    pub fn to_runtime_config(
+        &self,
+    ) -> Result<AgentVmDaemonRuntimeConfig, AgentVmDaemonConfigError> {
+        Ok(AgentVmDaemonRuntimeConfig::new(
+            self.lifecycle.to_runtime_config()?,
+            self.vm_http.to_runtime_config()?,
+        )?)
+    }
+}
+
+impl AgentVmLifecycleConfig {
+    pub fn to_runtime_config(
+        &self,
+    ) -> Result<AgentVmLifecycleRuntimeConfig, AgentVmDaemonConfigError> {
+        let ipv4_pool = parse_ipv4_cidr_config("ipv4_pool", &self.ipv4_pool)?;
+        let ipv6_pool = parse_ipv6_cidr_config("ipv6_pool", &self.ipv6_pool)?;
+        let pool = AgentNetworkPool::new(ipv4_pool, ipv6_pool)?;
+        let state_dir = match &self.state_dir {
+            Some(path) => path.clone(),
+            None => default_agent_vm_state_dir()?,
+        };
+        Ok(AgentVmLifecycleRuntimeConfig::new(
+            pool,
+            self.subnet_index_min,
+            self.subnet_index_max,
+            AgentVmSessionStateStore::new(state_dir),
+            self.ipv6_mode,
+            ContainerImage::new(self.image.clone())?,
+            AgentVmResources::new(self.cpus, self.memory_mib)?,
+            AgentVmToolPaths::new(
+                self.container.clone(),
+                self.pf_helper.clone(),
+                self.sudo.clone(),
+            ),
+        )?)
+    }
+}
+
 impl AgentVmHttpConfig {
     pub fn to_runtime_config(&self) -> Result<VmHttpGitRuntimeConfig, AgentVmHttpConfigError> {
         let broker_port_range = BrokerPortRange::new(self.broker_port_min, self.broker_port_max)?;
@@ -126,8 +219,72 @@ fn default_keyring_service() -> String {
     "writ".into()
 }
 
+fn default_container_program() -> PathBuf {
+    PathBuf::from("container")
+}
+
+fn default_sudo_program() -> PathBuf {
+    PathBuf::from("sudo")
+}
+
 fn default_vm_git_token_env() -> String {
     "WRIT_GIT_TOKEN".into()
+}
+
+fn parse_ipv4_cidr_config(
+    field: &'static str,
+    raw: &str,
+) -> Result<Ipv4Cidr, AgentVmDaemonConfigError> {
+    let (addr, prefix) =
+        raw.split_once('/')
+            .ok_or_else(|| AgentVmDaemonConfigError::InvalidCidr {
+                field,
+                value: raw.to_string(),
+                message: "missing '/'".into(),
+            })?;
+    let addr = addr
+        .parse::<Ipv4Addr>()
+        .map_err(|err| AgentVmDaemonConfigError::InvalidCidr {
+            field,
+            value: raw.to_string(),
+            message: err.to_string(),
+        })?;
+    let prefix = prefix
+        .parse::<u8>()
+        .map_err(|err| AgentVmDaemonConfigError::InvalidCidr {
+            field,
+            value: raw.to_string(),
+            message: err.to_string(),
+        })?;
+    Ipv4Cidr::new(addr, prefix).map_err(AgentVmDaemonConfigError::from)
+}
+
+fn parse_ipv6_cidr_config(
+    field: &'static str,
+    raw: &str,
+) -> Result<Ipv6Cidr, AgentVmDaemonConfigError> {
+    let (addr, prefix) =
+        raw.split_once('/')
+            .ok_or_else(|| AgentVmDaemonConfigError::InvalidCidr {
+                field,
+                value: raw.to_string(),
+                message: "missing '/'".into(),
+            })?;
+    let addr = addr
+        .parse::<Ipv6Addr>()
+        .map_err(|err| AgentVmDaemonConfigError::InvalidCidr {
+            field,
+            value: raw.to_string(),
+            message: err.to_string(),
+        })?;
+    let prefix = prefix
+        .parse::<u8>()
+        .map_err(|err| AgentVmDaemonConfigError::InvalidCidr {
+            field,
+            value: raw.to_string(),
+            message: err.to_string(),
+        })?;
+    Ipv6Cidr::new(addr, prefix).map_err(AgentVmDaemonConfigError::from)
 }
 
 fn default_secret_store_config() -> SecretStoreConfig {
@@ -225,7 +382,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_agent_vm_http_config_and_converts_to_runtime_config() {
+    fn parses_agent_vm_config_and_converts_to_runtime_config() {
         let json = r#"{
             "github": {
                 "app_id": 1,
@@ -235,6 +392,18 @@ mod tests {
             },
             "policy": { "default_ttl": 600, "writable_repos": [] },
             "agent_vm": {
+                "lifecycle": {
+                    "ipv4_pool": "192.168.0.0/16",
+                    "ipv6_pool": "fd83:b6f2:e57::/48",
+                    "subnet_index_min": 252,
+                    "subnet_index_max": 253,
+                    "pf_helper": "/usr/local/libexec/writ-agent-vm-pf-helper",
+                    "state_dir": "/var/folders/writ/agent-vm-state",
+                    "ipv6_mode": "ipv4_only_no_guest_ipv6",
+                    "image": "alpine:latest",
+                    "cpus": 1,
+                    "memory_mib": 512
+                },
                 "vm_http": {
                     "bind_addr": "0.0.0.0",
                     "broker_port_min": 18080,
@@ -250,15 +419,17 @@ mod tests {
         let c: DaemonConfig = serde_json::from_str(json).unwrap();
         let agent_vm = c.agent_vm.unwrap();
 
-        let runtime = agent_vm.vm_http.to_runtime_config().unwrap();
+        let runtime = agent_vm.to_runtime_config().unwrap();
 
-        assert_eq!(runtime.bind_addr(), Ipv4Addr::UNSPECIFIED);
-        assert_eq!(runtime.broker_port_range().min().get(), 18080);
-        assert_eq!(runtime.broker_port_range().max().get(), 18081);
+        assert_eq!(runtime.vm_http().bind_addr(), Ipv4Addr::UNSPECIFIED);
+        assert_eq!(runtime.vm_http().broker_port_range().min().get(), 18080);
+        assert_eq!(runtime.vm_http().broker_port_range().max().get(), 18081);
         assert_eq!(
-            runtime.git_clone().work_root(),
+            runtime.vm_http().git_clone().work_root(),
             PathBuf::from("/var/folders/writ/git-work")
         );
+        assert_eq!(runtime.lifecycle().subnet_index_min(), 252);
+        assert_eq!(runtime.lifecycle().subnet_index_max(), 253);
     }
 
     fn valid_agent_vm_http_config() -> AgentVmHttpConfig {
@@ -273,6 +444,40 @@ mod tests {
             clone_timeout_secs: 30,
             max_bundle_bytes: 1_048_576,
         }
+    }
+
+    fn valid_agent_vm_lifecycle_config() -> AgentVmLifecycleConfig {
+        AgentVmLifecycleConfig {
+            ipv4_pool: "192.168.0.0/16".into(),
+            ipv6_pool: "fd83:b6f2:e57::/48".into(),
+            subnet_index_min: 252,
+            subnet_index_max: 253,
+            container: PathBuf::from("container"),
+            sudo: PathBuf::from("sudo"),
+            pf_helper: PathBuf::from("/usr/local/libexec/writ-agent-vm-pf-helper"),
+            state_dir: Some(PathBuf::from("/var/folders/writ/agent-vm-state")),
+            ipv6_mode: Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6,
+            image: "alpine:latest".into(),
+            cpus: 1,
+            memory_mib: 512,
+        }
+    }
+
+    #[test]
+    fn agent_vm_config_rejects_non_wildcard_vm_http_bind_address() {
+        let mut vm_http = valid_agent_vm_http_config();
+        vm_http.bind_addr = Ipv4Addr::LOCALHOST;
+        let c = AgentVmDaemonConfig {
+            lifecycle: valid_agent_vm_lifecycle_config(),
+            vm_http,
+        };
+
+        assert!(matches!(
+            c.to_runtime_config(),
+            Err(AgentVmDaemonConfigError::Runtime(
+                AgentVmDaemonRuntimeConfigError::NonWildcardVmHttpBindAddr(addr)
+            )) if addr == Ipv4Addr::LOCALHOST
+        ));
     }
 
     #[test]

@@ -54,6 +54,29 @@ enum Cmd {
         #[command(subcommand)]
         backend: BackendCmd,
     },
+    /// Start or stop daemon-managed agent VMs.
+    AgentVm {
+        #[command(subcommand)]
+        action: AgentVmCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum AgentVmCmd {
+    /// Start an isolated agent VM and print its session details.
+    Start {
+        /// Human-readable description stored in the audit log.
+        #[arg(long)]
+        label: Option<String>,
+        /// Agent model identifier stored in the audit log.
+        #[arg(long)]
+        model: Option<String>,
+        /// Command to run inside the VM after lifecycle preflight succeeds.
+        #[arg(last = true, required = true)]
+        guest_command: Vec<String>,
+    },
+    /// Stop a daemon-managed agent VM.
+    Stop { session_id: String },
 }
 
 #[derive(Subcommand)]
@@ -149,6 +172,42 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 other => return Err(format!("unexpected response: {other:?}").into()),
             }
         }
+
+        Cmd::AgentVm { action } => match action {
+            AgentVmCmd::Start {
+                label,
+                model,
+                guest_command,
+            } => {
+                let msg = ClientMessage::StartAgentVm {
+                    label,
+                    agent_model: model,
+                    guest_command,
+                };
+                match call_with_timeout(&socket_path, &msg, AGENT_VM_CALL_TIMEOUT)? {
+                    ServerMessage::AgentVmStarted {
+                        session_id,
+                        broker_url,
+                    } => {
+                        println!("session_id={session_id}");
+                        println!("broker_url={broker_url}");
+                    }
+                    ServerMessage::Error { message } => return Err(message.into()),
+                    other => return Err(format!("unexpected response: {other:?}").into()),
+                }
+            }
+            AgentVmCmd::Stop { session_id } => {
+                let id: SessionId = session_id
+                    .parse()
+                    .map_err(|e| format!("invalid session ID: {e}"))?;
+                let msg = ClientMessage::StopAgentVm { session_id: id };
+                match call_with_timeout(&socket_path, &msg, AGENT_VM_CALL_TIMEOUT)? {
+                    ServerMessage::AgentVmStopped => {}
+                    ServerMessage::Error { message } => return Err(message.into()),
+                    other => return Err(format!("unexpected response: {other:?}").into()),
+                }
+            }
+        },
     }
     Ok(())
 }
@@ -189,17 +248,31 @@ fn build_capability(backend: BackendCmd) -> Result<CapabilityRequest, Box<dyn st
 /// round-trip (the broker's own IDLE_READ_TIMEOUT is 60s, and a
 /// healthy request/reply is milliseconds).
 const CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+// Apple Container startup/teardown can include image cold-start, PF work, and
+// guest preflight probes. Keep the CLI patient enough that the daemon can
+// return a definitive started/rolled-back result; a wedged daemon can hold the
+// CLI until this same bound expires. The broker's idle read timeout is between
+// request reads, not a response wall-time cap.
+const AGENT_VM_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
 fn call(
     socket_path: &Path,
     msg: &ClientMessage,
 ) -> Result<ServerMessage, Box<dyn std::error::Error>> {
+    call_with_timeout(socket_path, msg, CALL_TIMEOUT)
+}
+
+fn call_with_timeout(
+    socket_path: &Path,
+    msg: &ClientMessage,
+    timeout: std::time::Duration,
+) -> Result<ServerMessage, Box<dyn std::error::Error>> {
     let stream = UnixStream::connect(socket_path)
         .map_err(|e| format!("cannot connect to {}: {e}", socket_path.display()))?;
     // Apply to both sides so a stuck broker can't wedge the CLI on
     // either write or read.
-    stream.set_read_timeout(Some(CALL_TIMEOUT))?;
-    stream.set_write_timeout(Some(CALL_TIMEOUT))?;
+    stream.set_read_timeout(Some(timeout))?;
+    stream.set_write_timeout(Some(timeout))?;
 
     let mut line = serde_json::to_string(msg)?;
     line.push('\n');

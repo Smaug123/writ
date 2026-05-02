@@ -9,11 +9,12 @@ use std::sync::Arc;
 
 use clap::Parser;
 
+use writ::agent_vm_daemon::AgentVmDaemon;
 use writ::audit::AuditLog;
 use writ::config::{DaemonConfig, SecretStoreConfig, default_audit_db_path, default_config_path};
 use writ::github::GitHubMinter;
 use writ::secret::{FileSecretStore, KeyringSecretStore, SecretStore};
-use writ::server::{BrokerState, default_socket_path, run};
+use writ::server::{BrokerState, default_socket_path, run_with_agent_vm};
 
 #[derive(Parser)]
 #[command(name = "writd", about = "writ broker daemon")]
@@ -50,12 +51,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .audit_db
         .or(config.audit_db)
         .unwrap_or_else(default_audit_db_path);
-    // Validate at daemon startup; the next slice plumbs this through the
-    // agent-VM session API that owns per-session runtime handles.
-    let agent_vm_http = config
+    let agent_vm = config
         .agent_vm
         .as_ref()
-        .map(|agent_vm| agent_vm.vm_http.to_runtime_config())
+        .map(|agent_vm| agent_vm.to_runtime_config())
         .transpose()?;
 
     if let Some(parent) = audit_db_path.parent() {
@@ -80,14 +79,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     eprintln!("writd: listening on {}", socket_path.display());
-    if let Some(agent_vm_http) = &agent_vm_http {
+    let agent_vm = agent_vm.map(|config| {
+        let runtime = Arc::new(AgentVmDaemon::new(config));
         eprintln!(
-            "writd: agent VM HTTP Git clone runtime configured for {} ports {}-{}",
-            agent_vm_http.bind_addr(),
-            agent_vm_http.broker_port_range().min().get(),
-            agent_vm_http.broker_port_range().max().get()
+            "writd: agent VM runtime configured for {} ports {}-{}",
+            runtime.config().vm_http().bind_addr(),
+            runtime.config().vm_http().broker_port_range().min().get(),
+            runtime.config().vm_http().broker_port_range().max().get()
+        );
+        runtime
+    });
+    if let Some(agent_vm) = &agent_vm {
+        eprintln!(
+            "writd: agent VM subnet indexes {}-{}",
+            agent_vm.config().lifecycle().subnet_index_min(),
+            agent_vm.config().lifecycle().subnet_index_max()
         );
     }
-    run(&socket_path, state).await?;
+    run_with_agent_vm(&socket_path, state, agent_vm).await?;
     Ok(())
 }

@@ -42,6 +42,7 @@ const GUEST_IPV6_PROBE_DELAY: std::time::Duration = std::time::Duration::from_mi
 // not prove absence instead of claiming success.
 const RESOURCE_ABSENCE_ATTEMPTS: usize = 30;
 const RESOURCE_ABSENCE_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
+const GUEST_ENV_FILE_DISPLAY: &str = "<runtime-env-file>";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AgentVmSessionPlan {
@@ -54,6 +55,7 @@ pub struct AgentVmSessionPlan {
     broker_port_range: BrokerPortRange,
     ipv6_mode: Ipv6IsolationMode,
     image: ContainerImage,
+    guest_env: Vec<AgentVmGuestEnvVar>,
     guest_command: Vec<String>,
     resources: AgentVmResources,
     tools: AgentVmToolPaths,
@@ -104,6 +106,12 @@ pub struct AgentVmNames {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ContainerImage(String);
 
+#[derive(Clone, Eq, PartialEq)]
+pub struct AgentVmGuestEnvVar {
+    name: String,
+    value: String,
+}
+
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct AgentVmResources {
     cpus: u16,
@@ -124,6 +132,15 @@ pub struct ProcessInvocation {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AgentVmStartInvocation {
+    Static(ProcessInvocation),
+    RuntimeGuestEnvFile {
+        invocation: ProcessInvocation,
+        display_shell: String,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct ResourcePresenceProbe {
     invocation: ProcessInvocation,
     name: String,
@@ -140,7 +157,8 @@ pub struct AppleNetworkInspection {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BrokerUrl(String);
 
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Ipv6IsolationMode {
     DualStackRequired,
     Ipv4OnlyNoGuestIpv6,
@@ -192,6 +210,16 @@ pub enum AgentVmLifecycleConfigError {
     EmptyMemory,
     #[error("IPv4-only guest IPv6 preflight requires an explicit guest command")]
     EmptyGuestCommandForIpv4OnlyNoGuestIpv6,
+    #[error("guest environment variable name must not be empty")]
+    EmptyGuestEnvName,
+    #[error("guest environment variable name must start with ASCII letter or underscore: {0}")]
+    InvalidGuestEnvNameStart(String),
+    #[error(
+        "guest environment variable name must contain only ASCII letters, digits, or underscores: {0}"
+    )]
+    InvalidGuestEnvNameByte(String),
+    #[error("guest environment variable {name} value must not contain NUL or newline bytes")]
+    InvalidGuestEnvValue { name: String },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -232,6 +260,18 @@ pub enum StartFailure {
     NetworkInspection(#[from] NetworkInspectionError),
     #[error(transparent)]
     GuestIpv6Inspection(#[from] GuestIpv6InspectionError),
+    #[error(transparent)]
+    GuestEnvironment(#[from] GuestEnvironmentError),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum GuestEnvironmentError {
+    #[error("cannot {operation} guest environment file {path}: {source}")]
+    Io {
+        operation: &'static str,
+        path: PathBuf,
+        source: std::io::Error,
+    },
 }
 
 #[derive(Debug, thiserror::Error, Eq, PartialEq)]
@@ -318,6 +358,14 @@ pub enum AgentVmSessionStateError {
     StateMismatch {
         session_id: SessionId,
         message: String,
+    },
+    #[error(
+        "agent VM subnet index {subnet_index} is already allocated to session {existing_session_id}; cannot allocate it to session {requested_session_id}"
+    )]
+    SubnetIndexAlreadyAllocated {
+        subnet_index: u16,
+        existing_session_id: SessionId,
+        requested_session_id: SessionId,
     },
 }
 
@@ -462,6 +510,35 @@ impl AgentVmSessionPlan {
         resources: AgentVmResources,
         tools: AgentVmToolPaths,
     ) -> Result<Self, AgentVmLifecycleConfigError> {
+        Self::new_with_guest_env(
+            session_id,
+            pool,
+            subnet_index,
+            broker_ports,
+            broker_port_range,
+            ipv6_mode,
+            image,
+            Vec::new(),
+            guest_command,
+            resources,
+            tools,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_guest_env(
+        session_id: SessionId,
+        pool: AgentNetworkPool,
+        subnet_index: u16,
+        broker_ports: BrokerPorts,
+        broker_port_range: BrokerPortRange,
+        ipv6_mode: Ipv6IsolationMode,
+        image: ContainerImage,
+        guest_env: Vec<AgentVmGuestEnvVar>,
+        guest_command: Vec<String>,
+        resources: AgentVmResources,
+        tools: AgentVmToolPaths,
+    ) -> Result<Self, AgentVmLifecycleConfigError> {
         broker_port_range.require_contains(&broker_ports)?;
         if ipv6_mode == Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6 && guest_command.is_empty() {
             return Err(AgentVmLifecycleConfigError::EmptyGuestCommandForIpv4OnlyNoGuestIpv6);
@@ -477,6 +554,7 @@ impl AgentVmSessionPlan {
             broker_port_range,
             ipv6_mode,
             image,
+            guest_env,
             guest_command,
             resources,
             tools,
@@ -517,16 +595,25 @@ impl AgentVmSessionPlan {
             .collect()
     }
 
-    pub fn start_invocations(&self) -> Vec<ProcessInvocation> {
+    /// Describes the start command sequence. When guest environment variables
+    /// are configured, the VM-start step is represented as
+    /// [`AgentVmStartInvocation::RuntimeGuestEnvFile`] rather than as a
+    /// runnable [`ProcessInvocation`]; [`start_agent_vm_session`] writes the
+    /// real 0600 env file immediately before invoking `container run`.
+    pub fn start_invocations(&self) -> Vec<AgentVmStartInvocation> {
         let mut invocations = vec![
-            self.create_network_invocation(),
-            self.inspect_network_invocation(),
-            self.install_firewall_invocation(),
+            AgentVmStartInvocation::Static(self.create_network_invocation()),
+            AgentVmStartInvocation::Static(self.inspect_network_invocation()),
+            AgentVmStartInvocation::Static(self.install_firewall_invocation()),
             self.start_vm_invocation(),
         ];
         if self.ipv6_mode == Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6 {
-            invocations.push(self.probe_guest_ipv6_invocation());
-            invocations.push(self.release_guest_command_invocation());
+            invocations.push(AgentVmStartInvocation::Static(
+                self.probe_guest_ipv6_invocation(),
+            ));
+            invocations.push(AgentVmStartInvocation::Static(
+                self.release_guest_command_invocation(),
+            ));
         }
         invocations
     }
@@ -677,7 +764,21 @@ impl AgentVmSessionPlan {
         ProcessInvocation::new(self.tools.sudo.clone(), args)
     }
 
-    fn start_vm_invocation(&self) -> ProcessInvocation {
+    fn start_vm_invocation(&self) -> AgentVmStartInvocation {
+        let invocation = self.start_vm_invocation_with_env_file(None);
+        if self.guest_env.is_empty() {
+            AgentVmStartInvocation::Static(invocation)
+        } else {
+            AgentVmStartInvocation::RuntimeGuestEnvFile {
+                invocation,
+                display_shell: self
+                    .start_vm_invocation_with_env_file(Some(Path::new(GUEST_ENV_FILE_DISPLAY)))
+                    .display_shell(),
+            }
+        }
+    }
+
+    fn start_vm_invocation_with_env_file(&self, env_file: Option<&Path>) -> ProcessInvocation {
         let mut args = vec![
             "run".to_string(),
             "--name".to_string(),
@@ -689,8 +790,11 @@ impl AgentVmSessionPlan {
             "--memory".to_string(),
             format!("{}m", self.resources.memory_mib),
             "-d".to_string(),
-            self.image.as_str().to_string(),
         ];
+        if let Some(env_file) = env_file {
+            args.extend(["--env-file".to_string(), env_file.display().to_string()]);
+        }
+        args.push(self.image.as_str().to_string());
         if self.ipv6_mode == Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6 {
             args.extend([
                 "sh".to_string(),
@@ -701,6 +805,22 @@ impl AgentVmSessionPlan {
         }
         args.extend(self.guest_command.iter().cloned());
         ProcessInvocation::new(self.tools.container.clone(), args)
+    }
+
+    fn run_start_vm_invocation(&self) -> Result<(), StartFailure> {
+        if self.guest_env.is_empty() {
+            return self
+                .start_vm_invocation_with_env_file(None)
+                .run()
+                .map_err(StartFailure::from);
+        }
+        let env_file = TempGuestEnvFile::create(&self.guest_env)?;
+        // This relies on Apple Container consuming --env-file before
+        // `container run -d` returns; the host-side temp file is deleted as soon
+        // as the run command has accepted it.
+        self.start_vm_invocation_with_env_file(Some(env_file.path()))
+            .run()
+            .map_err(StartFailure::from)
     }
 
     fn probe_guest_ipv6_invocation(&self) -> ProcessInvocation {
@@ -1047,6 +1167,10 @@ impl AgentVmSessionState {
         self.session_id
     }
 
+    pub fn subnet_index(&self) -> u16 {
+        self.subnet_index
+    }
+
     pub fn network(&self) -> AgentNetwork {
         self.network
     }
@@ -1119,8 +1243,27 @@ impl AgentVmSessionStateStore {
         plan: &AgentVmSessionPlan,
     ) -> Result<AgentVmSessionState, AgentVmSessionStateError> {
         let state = AgentVmSessionState::from_start_plan(plan, AgentVmSessionStateStatus::Starting);
+        self.require_subnet_index_unallocated_unlocked(&state)?;
         self.write_new(&state)?;
         Ok(state)
+    }
+
+    fn require_subnet_index_unallocated_unlocked(
+        &self,
+        requested: &AgentVmSessionState,
+    ) -> Result<(), AgentVmSessionStateError> {
+        for existing in self.load_all_unlocked()? {
+            if existing.session_id() != requested.session_id()
+                && existing.subnet_index() == requested.subnet_index()
+            {
+                return Err(AgentVmSessionStateError::SubnetIndexAlreadyAllocated {
+                    subnet_index: requested.subnet_index(),
+                    existing_session_id: existing.session_id(),
+                    requested_session_id: requested.session_id(),
+                });
+            }
+        }
+        Ok(())
     }
 
     fn mark_running_unlocked(
@@ -1148,6 +1291,32 @@ impl AgentVmSessionStateStore {
         self.load_unlocked(session_id)
     }
 
+    pub fn load_all(&self) -> Result<Vec<AgentVmSessionState>, AgentVmSessionStateError> {
+        match fs::metadata(&self.dir) {
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => {
+                return Err(AgentVmSessionStateError::Io {
+                    operation: "stat directory",
+                    path: self.dir.clone(),
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::NotADirectory,
+                        "agent VM state path is not a directory",
+                    ),
+                });
+            }
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(source) => {
+                return Err(AgentVmSessionStateError::Io {
+                    operation: "stat directory",
+                    path: self.dir.clone(),
+                    source,
+                });
+            }
+        }
+        let _lock = self.open_lock(true)?;
+        self.load_all_unlocked()
+    }
+
     fn load_unlocked(
         &self,
         session_id: SessionId,
@@ -1173,6 +1342,50 @@ impl AgentVmSessionStateStore {
             )));
         }
         Ok(state)
+    }
+
+    fn load_all_unlocked(&self) -> Result<Vec<AgentVmSessionState>, AgentVmSessionStateError> {
+        let mut paths = Vec::new();
+        for entry in fs::read_dir(&self.dir).map_err(|source| AgentVmSessionStateError::Io {
+            operation: "read directory",
+            path: self.dir.clone(),
+            source,
+        })? {
+            let entry = entry.map_err(|source| AgentVmSessionStateError::Io {
+                operation: "read directory entry",
+                path: self.dir.clone(),
+                source,
+            })?;
+            let path = entry.path();
+            if path
+                .extension()
+                .is_some_and(|extension| extension == "json")
+            {
+                paths.push(path);
+            }
+        }
+        paths.sort();
+
+        let mut states = Vec::with_capacity(paths.len());
+        for path in paths {
+            let raw_session_id =
+                path.file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .ok_or_else(|| {
+                        corrupt_state(format!(
+                            "state file {} does not have a UTF-8 session-id filename",
+                            path.display()
+                        ))
+                    })?;
+            let session_id = raw_session_id.parse::<SessionId>().map_err(|err| {
+                corrupt_state(format!(
+                    "state file {} does not have a valid session-id filename: {err}",
+                    path.display()
+                ))
+            })?;
+            states.push(self.load_unlocked(session_id)?);
+        }
+        Ok(states)
     }
 
     pub fn remove(&self, session_id: SessionId) -> Result<(), AgentVmSessionStateError> {
@@ -1430,6 +1643,97 @@ impl ContainerImage {
     }
 }
 
+impl std::fmt::Debug for AgentVmGuestEnvVar {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AgentVmGuestEnvVar")
+            .field("name", &self.name)
+            .field("value", &"<redacted>")
+            .finish()
+    }
+}
+
+impl AgentVmGuestEnvVar {
+    /// Construct one environment variable for the transient Apple Container
+    /// env file. This type enforces shell-style names and single-line values;
+    /// callers should only pass value bytes that Apple's env-file parser will
+    /// preserve literally. The daemon currently uses it only for a broker URL
+    /// and opaque bearer token, which avoid leading/trailing whitespace, `#`,
+    /// and additional `=` parser ambiguities.
+    pub fn new(
+        name: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Result<Self, AgentVmLifecycleConfigError> {
+        let name = name.into();
+        let value = value.into();
+        validate_guest_env_name(&name)?;
+        if value
+            .bytes()
+            .any(|byte| matches!(byte, b'\0' | b'\n' | b'\r'))
+        {
+            return Err(AgentVmLifecycleConfigError::InvalidGuestEnvValue { name });
+        }
+        Ok(Self { name, value })
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn value(&self) -> &str {
+        &self.value
+    }
+}
+
+struct TempGuestEnvFile {
+    path: PathBuf,
+}
+
+impl TempGuestEnvFile {
+    fn create(vars: &[AgentVmGuestEnvVar]) -> Result<Self, GuestEnvironmentError> {
+        let path = std::env::temp_dir().join(format!("writ-agent-vm-env-{}", Uuid::new_v4()));
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options
+            .open(&path)
+            .map_err(|source| GuestEnvironmentError::Io {
+                operation: "create",
+                path: path.clone(),
+                source,
+            })?;
+        for var in vars {
+            writeln!(file, "{}={}", var.name(), var.value()).map_err(|source| {
+                GuestEnvironmentError::Io {
+                    operation: "write",
+                    path: path.clone(),
+                    source,
+                }
+            })?;
+        }
+        file.sync_all()
+            .map_err(|source| GuestEnvironmentError::Io {
+                operation: "sync",
+                path: path.clone(),
+                source,
+            })?;
+        Ok(Self { path })
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TempGuestEnvFile {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
 impl AgentVmResources {
     pub fn new(cpus: u16, memory_mib: u32) -> Result<Self, AgentVmLifecycleConfigError> {
         if cpus == 0 {
@@ -1547,6 +1851,29 @@ impl ProcessInvocation {
             .map(|arg| arg.to_string_lossy())
             .collect::<Vec<_>>()
             .join(" ")
+    }
+}
+
+impl AgentVmStartInvocation {
+    pub fn program(&self) -> &Path {
+        self.invocation().program()
+    }
+
+    pub fn args_lossy(&self) -> Vec<String> {
+        self.invocation().args_lossy()
+    }
+
+    pub fn display_shell(&self) -> String {
+        match self {
+            Self::Static(invocation) => invocation.display_shell(),
+            Self::RuntimeGuestEnvFile { display_shell, .. } => display_shell.clone(),
+        }
+    }
+
+    fn invocation(&self) -> &ProcessInvocation {
+        match self {
+            Self::Static(invocation) | Self::RuntimeGuestEnvFile { invocation, .. } => invocation,
+        }
     }
 }
 
@@ -1710,8 +2037,8 @@ pub fn start_agent_vm_session(plan: &AgentVmSessionPlan) -> Result<(), AgentVmLi
     if let Err(err) = plan.install_firewall_invocation().run() {
         return fail_after_cleanup(err.into(), plan, StartOutcome::InstallFirewallFailed);
     }
-    if let Err(err) = plan.start_vm_invocation().run() {
-        return fail_after_cleanup(err.into(), plan, StartOutcome::StartVmFailed);
+    if let Err(err) = plan.run_start_vm_invocation() {
+        return fail_after_cleanup(err, plan, StartOutcome::StartVmFailed);
     }
     if plan.ipv6_mode == Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6 {
         let guest_ipv6 = match wait_for_guest_ipv6_inspection(plan) {
@@ -1770,6 +2097,37 @@ pub fn stop_managed_agent_vm_session(
 ) -> Result<(), AgentVmSessionManagerError> {
     let _lock = store.lock_store()?;
     let state = store.load_unlocked(session_id)?;
+    cleanup_managed_agent_vm_session_unlocked(&state, tools)?;
+    remove_managed_agent_vm_session_state_unlocked(store, session_id)
+}
+
+/// Run VM, firewall, and network cleanup while preserving the persisted state
+/// record. The daemon uses this split form so audit close and VM HTTP shutdown
+/// can fail without losing the cleanup facts needed for a retry.
+pub fn cleanup_managed_agent_vm_session(
+    store: &AgentVmSessionStateStore,
+    session_id: SessionId,
+    tools: AgentVmToolPaths,
+) -> Result<(), AgentVmSessionManagerError> {
+    let _lock = store.lock_store()?;
+    let state = store.load_unlocked(session_id)?;
+    cleanup_managed_agent_vm_session_unlocked(&state, tools)
+}
+
+/// Remove a managed session state record after all daemon-side stop effects
+/// have completed successfully.
+pub fn remove_managed_agent_vm_session_state(
+    store: &AgentVmSessionStateStore,
+    session_id: SessionId,
+) -> Result<(), AgentVmSessionManagerError> {
+    let _lock = store.lock_store()?;
+    remove_managed_agent_vm_session_state_unlocked(store, session_id)
+}
+
+fn cleanup_managed_agent_vm_session_unlocked(
+    state: &AgentVmSessionState,
+    tools: AgentVmToolPaths,
+) -> Result<(), AgentVmSessionManagerError> {
     // No wildcard: adding a future status must revisit managed-stop cleanup
     // semantics before this match compiles.
     match state.status() {
@@ -1779,6 +2137,13 @@ pub fn stop_managed_agent_vm_session(
         AgentVmSessionStateStatus::Starting | AgentVmSessionStateStatus::Running => {}
     }
     stop_agent_vm_session(&state.to_stop_plan(tools))?;
+    Ok(())
+}
+
+fn remove_managed_agent_vm_session_state_unlocked(
+    store: &AgentVmSessionStateStore,
+    session_id: SessionId,
+) -> Result<(), AgentVmSessionManagerError> {
     store.remove_unlocked(session_id).map_err(|state| {
         AgentVmSessionManagerError::StateRemoveAfterStop {
             state: Box::new(state),
@@ -1834,6 +2199,26 @@ fn firewall_ipv6_cidr_for_mode(
         Ipv6IsolationMode::DualStackRequired => Some(network.ipv6()),
         Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6 => None,
     }
+}
+
+fn validate_guest_env_name(name: &str) -> Result<(), AgentVmLifecycleConfigError> {
+    let Some(first) = name.bytes().next() else {
+        return Err(AgentVmLifecycleConfigError::EmptyGuestEnvName);
+    };
+    if !first.is_ascii_alphabetic() && first != b'_' {
+        return Err(AgentVmLifecycleConfigError::InvalidGuestEnvNameStart(
+            name.to_string(),
+        ));
+    }
+    if !name
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    {
+        return Err(AgentVmLifecycleConfigError::InvalidGuestEnvNameByte(
+            name.to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn fail_after_cleanup<T>(
@@ -2511,6 +2896,15 @@ mod tests {
         ]
     }
 
+    fn arb_guest_env_value() -> impl Strategy<Value = String> {
+        prop::collection::vec(
+            prop_oneof![1u32..=9, 11u32..=12, 14u32..=0xd7ff, 0xe000u32..=0x10ffff]
+                .prop_map(|codepoint| char::from_u32(codepoint).unwrap()),
+            0..=64,
+        )
+        .prop_map(|chars| chars.into_iter().collect())
+    }
+
     fn inspection_for_plan(plan: &AgentVmSessionPlan) -> AppleNetworkInspection {
         let network = plan.network();
         AppleNetworkInspection {
@@ -2923,6 +3317,75 @@ mod tests {
             ),
             Err(AgentVmLifecycleConfigError::EmptyGuestCommandForIpv4OnlyNoGuestIpv6)
         );
+    }
+
+    #[test]
+    fn guest_environment_is_redacted_and_uses_env_file_in_start_invocation() {
+        let plan = AgentVmSessionPlan::new_with_guest_env(
+            session_id(),
+            pool(),
+            252,
+            ports(),
+            BrokerPortRange::new(49152, 65535).unwrap(),
+            Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6,
+            ContainerImage::new("alpine:latest").unwrap(),
+            vec![
+                AgentVmGuestEnvVar::new("WRIT_BROKER_URL", "http://192.168.252.1:51375/").unwrap(),
+                AgentVmGuestEnvVar::new("WRIT_BROKER_TOKEN", "writ-vm-secret").unwrap(),
+            ],
+            vec!["sleep".into(), "600".into()],
+            AgentVmResources::new(1, 512).unwrap(),
+            AgentVmToolPaths::new("container", "writ-agent-vm-pf-helper", "sudo"),
+        )
+        .unwrap();
+
+        let debug = format!("{plan:?}");
+        assert!(!debug.contains("writ-vm-secret"), "{debug}");
+        assert!(debug.contains("<redacted>"), "{debug}");
+
+        let start_invocations = plan.start_invocations();
+        let AgentVmStartInvocation::RuntimeGuestEnvFile {
+            invocation,
+            display_shell,
+        } = &start_invocations[3]
+        else {
+            panic!("guest env should make VM start a runtime-env-file step");
+        };
+        let start = invocation.args_lossy();
+        assert!(!start.iter().any(|arg| arg == "--env-file"));
+        assert!(!start.iter().any(|arg| arg.contains("writ-vm-secret")));
+        assert!(display_shell.contains("--env-file"));
+        assert!(display_shell.contains(GUEST_ENV_FILE_DISPLAY));
+        assert!(!display_shell.contains("writ-vm-secret"));
+    }
+
+    #[test]
+    fn guest_environment_rejects_shell_unsafe_names_and_env_file_breaking_values() {
+        assert!(matches!(
+            AgentVmGuestEnvVar::new("1BAD", "value"),
+            Err(AgentVmLifecycleConfigError::InvalidGuestEnvNameStart(_))
+        ));
+        assert!(matches!(
+            AgentVmGuestEnvVar::new("BAD-NAME", "value"),
+            Err(AgentVmLifecycleConfigError::InvalidGuestEnvNameByte(_))
+        ));
+        assert!(matches!(
+            AgentVmGuestEnvVar::new("GOOD_NAME", "line\nbreak"),
+            Err(AgentVmLifecycleConfigError::InvalidGuestEnvValue { .. })
+        ));
+    }
+
+    proptest! {
+        #[test]
+        fn guest_environment_accepts_any_shell_name_and_single_line_value(
+            name in "[A-Za-z_][A-Za-z0-9_]{0,32}",
+            value in arb_guest_env_value(),
+        ) {
+            let var = AgentVmGuestEnvVar::new(name.clone(), value.clone()).unwrap();
+
+            prop_assert_eq!(var.name(), name);
+            prop_assert_eq!(var.value(), value);
+        }
     }
 
     #[test]
@@ -3348,6 +3811,29 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn managed_cleanup_success_preserves_state_until_explicit_remove() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = AgentVmSessionStateStore::new(dir.path().join("state"));
+        let ok_tool = write_executable_script(dir.path(), "ok-tool", "#!/bin/sh\nexit 0\n");
+        let plan = plan_with_ipv6_mode(252, Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6);
+        let starting = store.create_starting(&plan).unwrap();
+        let running = store.mark_running(&starting).unwrap();
+
+        cleanup_managed_agent_vm_session(
+            &store,
+            plan.session_id(),
+            AgentVmToolPaths::new(&ok_tool, &ok_tool, &ok_tool),
+        )
+        .unwrap();
+        assert_eq!(store.load(plan.session_id()).unwrap(), running);
+
+        remove_managed_agent_vm_session_state(&store, plan.session_id()).unwrap();
+        let missing = store.load(plan.session_id()).unwrap_err();
+        assert!(matches!(missing, AgentVmSessionStateError::NotFound { .. }));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn managed_start_then_managed_stop_success_removes_state_record() {
         let dir = tempfile::tempdir().unwrap();
         let store = AgentVmSessionStateStore::new(dir.path().join("state"));
@@ -3444,6 +3930,39 @@ mod tests {
     }
 
     #[test]
+    fn state_store_rejects_duplicate_live_subnet_indexes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = AgentVmSessionStateStore::new(dir.path());
+        let first = plan_with_ipv6_mode(252, Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6);
+        let second = AgentVmSessionPlan::new(
+            SessionId::from_uuid(Uuid::from_u128(first.session_id().as_uuid().as_u128() ^ 1)),
+            pool(),
+            first.subnet_index(),
+            ports(),
+            BrokerPortRange::new(49152, 65535).unwrap(),
+            Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6,
+            ContainerImage::new("alpine:latest").unwrap(),
+            vec!["sleep".into(), "600".into()],
+            AgentVmResources::new(1, 512).unwrap(),
+            AgentVmToolPaths::new("container", "writ-agent-vm-pf-helper", "sudo"),
+        )
+        .unwrap();
+        store.create_starting(&first).unwrap();
+
+        let err = store.create_starting(&second).unwrap_err();
+
+        assert!(matches!(
+            err,
+            AgentVmSessionStateError::SubnetIndexAlreadyAllocated {
+                subnet_index: 252,
+                existing_session_id,
+                requested_session_id,
+            } if existing_session_id == first.session_id()
+                && requested_session_id == second.session_id()
+        ));
+    }
+
+    #[test]
     fn state_store_uses_one_store_lock_file_instead_of_per_session_lock_files() {
         let dir = tempfile::tempdir().unwrap();
         let store = AgentVmSessionStateStore::new(dir.path());
@@ -3485,6 +4004,17 @@ mod tests {
 
         assert!(matches!(err, AgentVmSessionStateError::NotFound { .. }));
         assert!(!dir.path().join(".store.lock").exists());
+    }
+
+    #[test]
+    fn state_store_load_all_accepts_existing_directory_before_first_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = dir.path().join("state");
+        fs::create_dir(&state_dir).unwrap();
+        let store = AgentVmSessionStateStore::new(&state_dir);
+
+        assert_eq!(store.load_all().unwrap(), Vec::new());
+        assert!(state_dir.join(".store.lock").exists());
     }
 
     #[test]

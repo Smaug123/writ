@@ -611,11 +611,53 @@ First daemon-owned VM HTTP runtime slice implemented in `src/vm_http.rs`,
   port. The returned `RunningVmHttpGitSession` owns the shutdown channel and
   task handle, and `shutdown().await` drains the VM HTTP runner. Dropping the
   running owner sends shutdown and aborts the task as a last-resort cleanup;
-- this still does not add a Unix-socket API to create agent VM sessions. The
-  next slice should add that protocol surface so `writd` can allocate the
-  session ID/subnet, prepare the VM HTTP runtime, build the managed lifecycle
-  plan with the returned broker port, start the VM, and persist enough state to
-  shut the HTTP task down with the VM.
+- this slice did not yet add a Unix-socket API to create agent VM sessions;
+  that protocol surface is the next implemented slice below.
+
+First daemon protocol lifecycle slice implemented in `src/agent_vm_daemon.rs`,
+`src/server.rs`, `src/protocol.rs`, and `src/bin/writ.rs`:
+
+- the host Unix-socket protocol now has `start_agent_vm` and `stop_agent_vm`
+  messages, exposed by the CLI as `writ agent-vm start -- <command>` and
+  `writ agent-vm stop <session-id>`. Starting an agent VM creates the audit
+  session inside `writd`; stopping the VM drives managed cleanup and closes the
+  audit session. These CLI calls use a longer timeout than ordinary token-mint
+  requests because Apple Container startup/teardown can include cold image
+  work, PF helper execution, and guest preflight probes;
+- `agent_vm.lifecycle` daemon config supplies the broker-owned IPv4/IPv6 pools,
+  allowed subnet-index range, managed state directory, Apple `container`,
+  `sudo`, and PF-helper tool paths, IPv6 isolation mode, image, and resource
+  sizing. `writd` validates both lifecycle and VM HTTP config at startup before
+  serving the socket. Managed agent VMs reject non-wildcard VM HTTP bind
+  addresses because the guest is told to reach the listener through its
+  per-session host-only gateway address;
+- `AgentVmDaemon` serializes start/stop operations in-process, scans persisted
+  managed session records to choose the first unused subnet index in the
+  configured range, prepares the VM HTTP listener to obtain the actual broker
+  port, then starts the managed lifecycle plan with that single selected broker
+  port. The VM HTTP task is spawned only after managed start reports success.
+  The managed state store also rejects a second live record with the same
+  subnet index under its file lock, so a second `writd` sharing the state
+  directory cannot race into the same `/24`;
+- the VM receives `WRIT_BROKER_URL` and `WRIT_BROKER_TOKEN` through a transient
+  `container run --env-file` rather than through command argv or persisted
+  state. The env file is created with `0600` permissions and removed after the
+  `container run` invocation returns. The managed state record stores the
+  broker port and cleanup facts, but not the bearer token;
+- on stop, the daemon first runs managed VM/PF/network cleanup from persisted
+  state while leaving the state record in place, so a mistyped or non-VM
+  session ID cannot close an unrelated audit session. After cleanup succeeds it
+  closes the audit session, shuts down the in-memory VM HTTP task, and only
+  then removes the state record. If any of those steps fail, the state record
+  remains so retrying `stop_agent_vm` can use the same recorded cleanup facts;
+- daemon restart recovery is still only partial: managed state survives and can
+  drive cleanup after a restart, but in-memory VM HTTP tasks and bearer tokens
+  do not. A restarted daemon should therefore treat existing records as cleanup
+  obligations until a later resurrection protocol can safely rebind equivalent
+  VM HTTP authority. In-process cancellation during `start_agent_vm` is also
+  treated as a crash/restart recovery case: state/audit may need follow-up
+  cleanup from the persisted record rather than relying on the original future
+  to run its rollback branch.
 
 ## Tests and proof spikes
 

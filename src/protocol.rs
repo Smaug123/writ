@@ -38,6 +38,20 @@ pub enum ClientMessage {
         session_id: SessionId,
         capability: CapabilityRequest,
     },
+    /// Start an isolated Apple-container agent VM managed by the daemon.
+    /// The daemon assigns the session ID and broker endpoint.
+    StartAgentVm {
+        /// Human-readable description stored in the audit log.
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        label: Option<String>,
+        /// Model identifier stored in the audit log.
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        agent_model: Option<String>,
+        /// Command to run inside the VM after lifecycle preflight succeeds.
+        guest_command: Vec<String>,
+    },
+    /// Stop a daemon-managed agent VM session and close its audit session.
+    StopAgentVm { session_id: SessionId },
 }
 
 /// A message from the broker to the agent.
@@ -57,6 +71,15 @@ pub enum ServerMessage {
     },
     /// Policy denied the request; `reason` is a human-readable explanation.
     Denied { reason: String },
+    /// A daemon-managed agent VM is running and can reach this broker URL from
+    /// inside the guest. The VM HTTP bearer token is injected into the guest
+    /// environment, not returned over the host protocol.
+    AgentVmStarted {
+        session_id: SessionId,
+        broker_url: String,
+    },
+    /// Acknowledges [`ClientMessage::StopAgentVm`].
+    AgentVmStopped,
     /// Something went wrong (mint error, unknown session, audit write
     /// failure, …). The agent should surface `message` to the user and
     /// not retry automatically.
@@ -79,6 +102,15 @@ impl std::fmt::Debug for ServerMessage {
                 .field("expires_at", expires_at)
                 .finish(),
             Self::Denied { reason } => f.debug_struct("Denied").field("reason", reason).finish(),
+            Self::AgentVmStarted {
+                session_id,
+                broker_url,
+            } => f
+                .debug_struct("AgentVmStarted")
+                .field("session_id", session_id)
+                .field("broker_url", broker_url)
+                .finish(),
+            Self::AgentVmStopped => write!(f, "AgentVmStopped"),
             Self::Error { message } => f.debug_struct("Error").field("message", message).finish(),
         }
     }
@@ -145,6 +177,26 @@ mod tests {
         assert_eq!(serde_json::from_str::<ClientMessage>(&json).unwrap(), msg);
     }
 
+    #[test]
+    fn start_agent_vm_roundtrips() {
+        let msg = ClientMessage::StartAgentVm {
+            label: Some("agent vm".into()),
+            agent_model: Some("gpt-test".into()),
+            guest_command: vec!["sleep".into(), "600".into()],
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert_eq!(serde_json::from_str::<ClientMessage>(&json).unwrap(), msg);
+    }
+
+    #[test]
+    fn stop_agent_vm_roundtrips() {
+        let msg = ClientMessage::StopAgentVm {
+            session_id: fixed_session_id(),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert_eq!(serde_json::from_str::<ClientMessage>(&json).unwrap(), msg);
+    }
+
     // --- ServerMessage roundtrips -----------------------------------------
 
     #[test]
@@ -182,6 +234,25 @@ mod tests {
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert_eq!(serde_json::from_str::<ServerMessage>(&json).unwrap(), msg);
+    }
+
+    #[test]
+    fn agent_vm_started_roundtrips() {
+        let msg = ServerMessage::AgentVmStarted {
+            session_id: fixed_session_id(),
+            broker_url: "http://192.168.252.1:51375/".into(),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert_eq!(serde_json::from_str::<ServerMessage>(&json).unwrap(), msg);
+    }
+
+    #[test]
+    fn agent_vm_stopped_roundtrips() {
+        let json = serde_json::to_string(&ServerMessage::AgentVmStopped).unwrap();
+        assert_eq!(
+            serde_json::from_str::<ServerMessage>(&json).unwrap(),
+            ServerMessage::AgentVmStopped,
+        );
     }
 
     #[test]
@@ -224,6 +295,34 @@ mod tests {
         })
         .unwrap();
         assert_eq!(v["type"], "request");
+    }
+
+    #[test]
+    fn agent_vm_type_tags() {
+        let start: serde_json::Value = serde_json::to_value(ClientMessage::StartAgentVm {
+            label: None,
+            agent_model: None,
+            guest_command: vec!["true".into()],
+        })
+        .unwrap();
+        assert_eq!(start["type"], "start_agent_vm");
+
+        let stop: serde_json::Value = serde_json::to_value(ClientMessage::StopAgentVm {
+            session_id: fixed_session_id(),
+        })
+        .unwrap();
+        assert_eq!(stop["type"], "stop_agent_vm");
+
+        let started: serde_json::Value = serde_json::to_value(ServerMessage::AgentVmStarted {
+            session_id: fixed_session_id(),
+            broker_url: "http://192.168.252.1:51375/".into(),
+        })
+        .unwrap();
+        assert_eq!(started["type"], "agent_vm_started");
+
+        let stopped: serde_json::Value =
+            serde_json::to_value(ServerMessage::AgentVmStopped).unwrap();
+        assert_eq!(stopped["type"], "agent_vm_stopped");
     }
 
     #[test]

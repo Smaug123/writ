@@ -18,6 +18,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
+use crate::agent_vm_daemon::AgentVmDaemon;
 use crate::audit::{AuditLog, PreMintRecord};
 use crate::core::{
     CapabilityRequest, GrantedScope, PolicyDecision, RequestId, SessionId, SessionRecord,
@@ -93,9 +94,20 @@ pub fn default_socket_path() -> PathBuf {
 /// Evaluate one [`ClientMessage`] and produce a [`ServerMessage`].
 /// This is the only function that touches business logic; the socket
 /// loop calls it once per line without knowing what it does.
-pub async fn dispatch_message<S: SecretStore + Send + Sync>(
+pub async fn dispatch_message<S: SecretStore + Send + Sync + 'static>(
     msg: ClientMessage,
     state: &Arc<BrokerState<S>>,
+) -> ServerMessage {
+    dispatch_message_with_agent_vm(msg, state, None).await
+}
+
+/// Evaluate one message with an optional daemon-managed agent VM controller.
+/// Use this entry point when `writd` was configured with agent-VM support; the
+/// simpler [`dispatch_message`] wrapper delegates here with no controller.
+pub async fn dispatch_message_with_agent_vm<S: SecretStore + Send + Sync + 'static>(
+    msg: ClientMessage,
+    state: &Arc<BrokerState<S>>,
+    agent_vm: Option<&Arc<AgentVmDaemon>>,
 ) -> ServerMessage {
     match msg {
         ClientMessage::OpenSession { label, agent_model } => {
@@ -130,6 +142,38 @@ pub async fn dispatch_message<S: SecretStore + Send + Sync>(
             session_id,
             capability,
         } => dispatch_capability(session_id, capability, state).await,
+        ClientMessage::StartAgentVm {
+            label,
+            agent_model,
+            guest_command,
+        } => match agent_vm {
+            Some(agent_vm) => match agent_vm
+                .start_session(Arc::clone(state), label, agent_model, guest_command)
+                .await
+            {
+                Ok(started) => ServerMessage::AgentVmStarted {
+                    session_id: started.session_id(),
+                    broker_url: started.broker_url().to_string(),
+                },
+                Err(err) => ServerMessage::Error {
+                    message: err.to_string(),
+                },
+            },
+            None => ServerMessage::Error {
+                message: "agent VM runtime is not configured".into(),
+            },
+        },
+        ClientMessage::StopAgentVm { session_id } => match agent_vm {
+            Some(agent_vm) => match agent_vm.stop_session(state, session_id).await {
+                Ok(()) => ServerMessage::AgentVmStopped,
+                Err(err) => ServerMessage::Error {
+                    message: err.to_string(),
+                },
+            },
+            None => ServerMessage::Error {
+                message: "agent VM runtime is not configured".into(),
+            },
+        },
     }
 }
 
@@ -325,6 +369,7 @@ async fn read_line_bounded<R: AsyncBufRead + Unpin>(
 async fn handle_connection<S: SecretStore + Send + Sync + 'static>(
     stream: UnixStream,
     state: Arc<BrokerState<S>>,
+    agent_vm: Option<Arc<AgentVmDaemon>>,
 ) -> io::Result<()> {
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
@@ -357,7 +402,7 @@ async fn handle_connection<S: SecretStore + Send + Sync + 'static>(
             Err(e) => ServerMessage::Error {
                 message: format!("invalid request: {e}"),
             },
-            Ok(msg) => dispatch_message(msg, &state).await,
+            Ok(msg) => dispatch_message_with_agent_vm(msg, &state, agent_vm.as_ref()).await,
         };
         let mut json = serde_json::to_string(&response).expect("ServerMessage always serializes");
         json.push('\n');
@@ -443,6 +488,17 @@ pub async fn run<S: SecretStore + Send + Sync + 'static>(
     socket_path: &Path,
     state: Arc<BrokerState<S>>,
 ) -> io::Result<()> {
+    run_with_agent_vm(socket_path, state, None).await
+}
+
+/// Listen on `socket_path` with an optional daemon-managed agent VM controller.
+/// Use this when `writd` was configured with agent-VM support; [`run`] delegates
+/// here with no controller for the ordinary broker-only daemon.
+pub async fn run_with_agent_vm<S: SecretStore + Send + Sync + 'static>(
+    socket_path: &Path,
+    state: Arc<BrokerState<S>>,
+    agent_vm: Option<Arc<AgentVmDaemon>>,
+) -> io::Result<()> {
     if let Some(parent) = socket_path.parent() {
         if !parent.exists() {
             std::fs::create_dir_all(parent)?;
@@ -473,8 +529,9 @@ pub async fn run<S: SecretStore + Send + Sync + 'static>(
     loop {
         let (stream, _) = listener.accept().await?;
         let state = Arc::clone(&state);
+        let agent_vm = agent_vm.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(stream, state).await {
+            if let Err(e) = handle_connection(stream, state, agent_vm).await {
                 eprintln!("connection error: {e}");
             }
         });
@@ -629,6 +686,42 @@ mod tests {
         )
         .await;
         assert_eq!(resp, ServerMessage::SessionClosed);
+    }
+
+    #[tokio::test]
+    async fn agent_vm_messages_fail_when_runtime_is_not_configured() {
+        let server = MockServer::start().await;
+        let state = make_state(&server, vec![], "o");
+
+        let start = dispatch_message(
+            ClientMessage::StartAgentVm {
+                label: None,
+                agent_model: None,
+                guest_command: vec!["true".into()],
+            },
+            &state,
+        )
+        .await;
+        assert_eq!(
+            start,
+            ServerMessage::Error {
+                message: "agent VM runtime is not configured".into()
+            }
+        );
+
+        let stop = dispatch_message(
+            ClientMessage::StopAgentVm {
+                session_id: "51b8fd0f-6c10-454c-b0e6-7df1d60e2e6d".parse().unwrap(),
+            },
+            &state,
+        )
+        .await;
+        assert_eq!(
+            stop,
+            ServerMessage::Error {
+                message: "agent VM runtime is not configured".into()
+            }
+        );
     }
 
     // --- Policy decisions ------------------------------------------------
@@ -848,7 +941,9 @@ mod tests {
 
     // --- Helper ----------------------------------------------------------
 
-    async fn open_session<S: SecretStore + Send + Sync>(state: &Arc<BrokerState<S>>) -> SessionId {
+    async fn open_session<S: SecretStore + Send + Sync + 'static>(
+        state: &Arc<BrokerState<S>>,
+    ) -> SessionId {
         match dispatch_message(
             ClientMessage::OpenSession {
                 label: None,

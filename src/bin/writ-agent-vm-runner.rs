@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use writ::agent_vm_lifecycle::{
     AgentVmResources, AgentVmSessionPlan, AgentVmSessionStateStore, AgentVmSessionStopPlan,
-    AgentVmToolPaths, ContainerImage, Ipv6IsolationMode, ProcessInvocation,
+    AgentVmStartInvocation, AgentVmToolPaths, ContainerImage, Ipv6IsolationMode, ProcessInvocation,
     default_agent_vm_state_dir, start_agent_vm_session, start_managed_agent_vm_session,
     stop_agent_vm_session, stop_managed_agent_vm_session,
 };
@@ -188,7 +188,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let dry_run = args.dry_run;
             let plan = build_start_plan(args, tools)?;
             if dry_run {
-                print_invocations(&plan.start_invocations());
+                print_start_invocations(&plan.start_invocations());
             } else {
                 start_agent_vm_session(&plan)?;
                 println!("session_id={}", plan.session_id());
@@ -213,7 +213,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let state_dir = args.state_dir;
             let plan = build_start_plan(args.start, tools)?;
             if dry_run {
-                print_invocations(&plan.start_invocations());
+                print_start_invocations(&plan.start_invocations());
             } else {
                 let state_dir = resolve_state_dir(state_dir)?;
                 let store = AgentVmSessionStateStore::new(state_dir);
@@ -331,6 +331,12 @@ fn split_cidr(raw: &str) -> Result<(&str, &str), Box<dyn std::error::Error>> {
 }
 
 fn print_invocations(invocations: &[ProcessInvocation]) {
+    for invocation in invocations {
+        println!("{}", invocation.display_shell());
+    }
+}
+
+fn print_start_invocations(invocations: &[AgentVmStartInvocation]) {
     for invocation in invocations {
         println!("{}", invocation.display_shell());
     }
