@@ -1352,8 +1352,10 @@ mod tests {
     fn write_fake_git_with_bundle_epilogue(dir: &Path, bundle_epilogue: &str) -> PathBuf {
         let git = dir.join("fake-git.sh");
         let log_path = shell_single_quote(&dir.join("fake-git.log"));
+        let shell = required_test_tool("sh");
+        let mkdir = shell_single_quote(&required_test_tool("mkdir"));
         let script = format!(
-            r#"#!/bin/sh
+            r#"#!{shell}
 set -eu
 printf '%s\n' "$*" >> {log}
 case " $* " in
@@ -1363,7 +1365,7 @@ case " $* " in
     fi
     mirror=
     for arg do mirror=$arg; done
-    /bin/mkdir -p "$mirror"
+    {mkdir} -p "$mirror"
     ;;
   *" bundle create "*)
     if [ "${{WRIT_GIT_TOKEN+x}}" = x ]; then
@@ -1391,7 +1393,9 @@ case " $* " in
     ;;
 esac
 "#,
+            shell = shell.display(),
             log = log_path,
+            mkdir = mkdir,
             bundle_epilogue = bundle_epilogue,
         );
         std::fs::write(&git, script).unwrap();
@@ -1404,9 +1408,33 @@ esac
         format!("'{}'", raw.replace('\'', "'\\''"))
     }
 
+    fn required_test_tool(name: &str) -> PathBuf {
+        let path = std::env::var_os("PATH")
+            .unwrap_or_else(|| panic!("PATH must contain {name} for vm_http tests"));
+        for dir in std::env::split_paths(&path) {
+            let candidate = if dir.is_absolute() {
+                dir.join(name)
+            } else {
+                std::env::current_dir().unwrap().join(dir).join(name)
+            };
+            match std::fs::metadata(&candidate) {
+                Ok(metadata)
+                    if metadata.is_file() && metadata.permissions().mode() & 0o111 != 0 =>
+                {
+                    return candidate;
+                }
+                Ok(_) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => panic!("failed to inspect {}: {err}", candidate.display()),
+            }
+        }
+        panic!("required test tool {name} not found on PATH");
+    }
+
     fn write_fake_askpass(dir: &Path) -> PathBuf {
         let askpass = dir.join("fake-askpass.sh");
-        std::fs::write(&askpass, "#!/bin/sh\nexit 1\n").unwrap();
+        let shell = required_test_tool("sh");
+        std::fs::write(&askpass, format!("#!{}\nexit 1\n", shell.display())).unwrap();
         std::fs::set_permissions(&askpass, std::fs::Permissions::from_mode(0o700)).unwrap();
         askpass
     }
@@ -2114,11 +2142,14 @@ esac
             .await;
 
         let temp = tempfile::tempdir().unwrap();
+        let chmod = shell_single_quote(&required_test_tool("chmod"));
         let fake_git = write_fake_git_with_bundle_epilogue(
             temp.path(),
-            r#"work_dir=${bundle%/*}
-work_root=${work_dir%/*}
-/bin/chmod 500 "$work_root""#,
+            &format!(
+                r#"work_dir=${{bundle%/*}}
+work_root=${{work_dir%/*}}
+{chmod} 500 "$work_root""#
+            ),
         );
         let service = git_clone_service_for_test(&state, &temp, fake_git);
         let clone_repo = GitCloneRepo::new(repo("o", "n")).unwrap();
