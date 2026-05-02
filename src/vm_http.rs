@@ -5,16 +5,26 @@
 //! a source-subnet check, then exposes only VM-safe broker operations.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use serde::Serialize;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 use tokio::task::JoinSet;
 
 use crate::core::{BrokerPort, BrokerPortRange, Ipv4Cidr, SessionId};
+use crate::secret::SecretStore;
+use crate::server::{BrokerState, CapabilityOutcome, request_capability};
+use crate::vm_git::{
+    GIT_BUNDLE_CONTENT_TYPE, GitCloneBundlePlan, GitCloneBundlePlanError, GitCloneBundleRunError,
+    GitCredentialBoundary, GitSecretValue, GitSecretValueError, VM_GIT_CLONE_PATH,
+    VmGitCloneErrorCode, VmGitCloneErrorResponse, VmGitCloneRequest, run_git_clone_bundle,
+};
 
 const MAX_VM_HTTP_HEAD_BYTES: usize = 16 * 1024;
+const MAX_VM_HTTP_BODY_BYTES: usize = 64 * 1024;
 const VM_HTTP_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const EPHEMERAL_BIND_ATTEMPTS: usize = 32;
 const MAX_VM_HTTP_CONNECTIONS: usize = 256;
@@ -40,7 +50,22 @@ pub struct VmHttpRequest {
     method: String,
     target: String,
     authorization: Option<String>,
+    content_length: Option<usize>,
     peer_addr: SocketAddr,
+}
+
+pub struct VmHttpGitCloneService<S: SecretStore> {
+    broker_state: Arc<BrokerState<S>>,
+    config: VmHttpGitCloneConfig,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VmHttpGitCloneConfig {
+    git_program: PathBuf,
+    credential: GitCredentialBoundary,
+    work_root: PathBuf,
+    timeout: std::time::Duration,
+    max_bundle_bytes: u64,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -84,6 +109,12 @@ enum VmHttpParseError {
     MalformedHeader,
     #[error("duplicate Authorization header")]
     DuplicateAuthorization,
+    #[error("duplicate Content-Length header")]
+    DuplicateContentLength,
+    #[error("invalid Content-Length header")]
+    InvalidContentLength,
+    #[error("Transfer-Encoding is not supported")]
+    UnsupportedTransferEncoding,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -94,6 +125,8 @@ enum VmHttpStatus {
     Forbidden,
     NotFound,
     MethodNotAllowed,
+    Gone,
+    InternalServerError,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -101,6 +134,12 @@ struct VmHttpResponse {
     status: VmHttpStatus,
     content_type: &'static str,
     body: Vec<u8>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct VmHttpHeadRead {
+    raw_head: Vec<u8>,
+    buffered_body: Vec<u8>,
 }
 
 #[derive(Serialize)]
@@ -192,12 +231,94 @@ impl VmHttpRequest {
             method: method.into(),
             target: target.into(),
             authorization,
+            content_length: None,
             peer_addr,
         }
     }
 
     pub fn peer_addr(&self) -> SocketAddr {
         self.peer_addr
+    }
+}
+
+impl<S: SecretStore> VmHttpGitCloneService<S> {
+    pub fn new(broker_state: Arc<BrokerState<S>>, config: VmHttpGitCloneConfig) -> Self {
+        Self {
+            broker_state,
+            config,
+        }
+    }
+}
+
+impl<S: SecretStore> Clone for VmHttpGitCloneService<S> {
+    fn clone(&self) -> Self {
+        Self {
+            broker_state: Arc::clone(&self.broker_state),
+            config: self.config.clone(),
+        }
+    }
+}
+
+impl VmHttpGitCloneConfig {
+    pub fn new(
+        git_program: impl Into<PathBuf>,
+        credential: GitCredentialBoundary,
+        work_root: impl Into<PathBuf>,
+        timeout: std::time::Duration,
+        max_bundle_bytes: u64,
+    ) -> Result<Self, GitCloneBundlePlanError> {
+        let git_program = git_program.into();
+        let work_root = work_root.into();
+        if git_program.as_os_str().is_empty() {
+            return Err(GitCloneBundlePlanError::EmptyPath {
+                field: "git_program",
+            });
+        }
+        if work_root.as_os_str().is_empty() {
+            return Err(GitCloneBundlePlanError::EmptyPath { field: "work_root" });
+        }
+        if !work_root.is_absolute() {
+            return Err(GitCloneBundlePlanError::RelativePath {
+                field: "work_root",
+                path: work_root,
+            });
+        }
+        if timeout.is_zero() {
+            return Err(GitCloneBundlePlanError::ZeroTimeout);
+        }
+        if max_bundle_bytes == 0 {
+            return Err(GitCloneBundlePlanError::ZeroMaxBundleBytes);
+        }
+        Ok(Self {
+            git_program,
+            credential,
+            work_root,
+            timeout,
+            max_bundle_bytes,
+        })
+    }
+
+    pub fn work_root(&self) -> &Path {
+        &self.work_root
+    }
+
+    fn plan_for_request(
+        &self,
+        request: VmGitCloneRequest,
+    ) -> Result<GitCloneBundlePlan, GitCloneBundlePlanError> {
+        let work_dir = self
+            .work_root
+            .join(format!("clone-{}", uuid::Uuid::new_v4().simple()));
+        let bundle_path = work_dir.join("repo.bundle");
+        GitCloneBundlePlan::new(
+            self.git_program.clone(),
+            request,
+            self.credential.clone(),
+            work_dir,
+            bundle_path,
+            self.timeout,
+            self.max_bundle_bytes,
+        )
     }
 }
 
@@ -256,6 +377,25 @@ pub async fn run_vm_http(listener: TcpListener, session: VmHttpSession) -> std::
 pub async fn run_vm_http_until_shutdown(
     listener: TcpListener,
     session: VmHttpSession,
+    shutdown: watch::Receiver<bool>,
+) -> std::io::Result<()> {
+    run_vm_http_runtime_until_shutdown::<Box<dyn SecretStore>>(listener, session, None, shutdown)
+        .await
+}
+
+pub async fn run_vm_http_with_git_until_shutdown<S: SecretStore + Send + Sync + 'static>(
+    listener: TcpListener,
+    session: VmHttpSession,
+    git_clone: VmHttpGitCloneService<S>,
+    shutdown: watch::Receiver<bool>,
+) -> std::io::Result<()> {
+    run_vm_http_runtime_until_shutdown(listener, session, Some(git_clone), shutdown).await
+}
+
+async fn run_vm_http_runtime_until_shutdown<S: SecretStore + Send + Sync + 'static>(
+    listener: TcpListener,
+    session: VmHttpSession,
+    git_clone: Option<VmHttpGitCloneService<S>>,
     mut shutdown: watch::Receiver<bool>,
 ) -> std::io::Result<()> {
     let mut handlers = JoinSet::new();
@@ -283,8 +423,9 @@ pub async fn run_vm_http_until_shutdown(
             accepted = listener.accept(), if handlers.len() < MAX_VM_HTTP_CONNECTIONS => {
                 let (stream, peer_addr) = accepted?;
                 let session = session.clone();
+                let git_clone = git_clone.clone();
                 handlers.spawn(async move {
-                    handle_vm_http_connection(stream, peer_addr, session).await
+                    handle_vm_http_connection(stream, peer_addr, session, git_clone).await
                 });
             }
         }
@@ -320,27 +461,61 @@ pub fn authorize_vm_http_request(
     }
 }
 
-async fn handle_vm_http_connection(
-    mut stream: TcpStream,
+async fn handle_vm_http_connection<S: SecretStore + Send + Sync + 'static>(
+    stream: TcpStream,
     peer_addr: SocketAddr,
     session: VmHttpSession,
+    git_clone: Option<VmHttpGitCloneService<S>>,
 ) -> std::io::Result<()> {
-    let response = match tokio::time::timeout(
+    handle_vm_http_connection_with_read_timeout(
+        stream,
+        peer_addr,
+        session,
+        git_clone,
         VM_HTTP_READ_TIMEOUT,
+    )
+    .await
+}
+
+async fn handle_vm_http_connection_with_read_timeout<S, T>(
+    mut stream: T,
+    peer_addr: SocketAddr,
+    session: VmHttpSession,
+    git_clone: Option<VmHttpGitCloneService<S>>,
+    read_timeout: std::time::Duration,
+) -> std::io::Result<()>
+where
+    S: SecretStore + Send + Sync + 'static,
+    T: AsyncRead + AsyncWrite + Unpin,
+{
+    let head = match tokio::time::timeout(
+        read_timeout,
         read_http_head_bounded(&mut stream, MAX_VM_HTTP_HEAD_BYTES),
     )
     .await
     {
         Err(_) => return Ok(()),
         Ok(Err(err)) if err.kind() == std::io::ErrorKind::InvalidData => {
-            VmHttpResponse::text(VmHttpStatus::BadRequest, err.to_string())
+            let response = VmHttpResponse::text(VmHttpStatus::BadRequest, err.to_string());
+            return stream.write_all(&response.to_bytes()).await;
         }
         Ok(Err(err)) => return Err(err),
-        Ok(Ok(raw)) => dispatch_vm_http_head(&session, peer_addr, &raw),
+        Ok(Ok(head)) => head,
     };
+
+    let response = dispatch_vm_http_head_and_body(
+        &session,
+        peer_addr,
+        head,
+        &mut stream,
+        git_clone,
+        read_timeout,
+    )
+    .await;
     stream.write_all(&response.to_bytes()).await
 }
 
+#[cfg(test)]
 fn dispatch_vm_http_head(
     session: &VmHttpSession,
     peer_addr: SocketAddr,
@@ -351,7 +526,7 @@ fn dispatch_vm_http_head(
         Err(err) => return VmHttpResponse::text(VmHttpStatus::BadRequest, err.to_string()),
     };
     match authorize_vm_http_request(session, &request) {
-        VmHttpAuthorization::Allow => route_vm_http_request(session, &request),
+        VmHttpAuthorization::Allow => route_session_endpoint(session, &request),
         VmHttpAuthorization::Deny(VmHttpAuthError::MissingBearerToken) => {
             VmHttpResponse::text(VmHttpStatus::Unauthorized, "missing bearer token")
         }
@@ -364,7 +539,83 @@ fn dispatch_vm_http_head(
     }
 }
 
-fn route_vm_http_request(session: &VmHttpSession, request: &VmHttpRequest) -> VmHttpResponse {
+async fn dispatch_vm_http_head_and_body<S, R>(
+    session: &VmHttpSession,
+    peer_addr: SocketAddr,
+    head: VmHttpHeadRead,
+    stream: &mut R,
+    git_clone: Option<VmHttpGitCloneService<S>>,
+    read_timeout: std::time::Duration,
+) -> VmHttpResponse
+where
+    S: SecretStore + Send + Sync,
+    R: AsyncRead + Unpin,
+{
+    let request = match parse_http_head(&head.raw_head, peer_addr) {
+        Ok(request) => request,
+        Err(err) => return VmHttpResponse::text(VmHttpStatus::BadRequest, err.to_string()),
+    };
+    match authorize_vm_http_request(session, &request) {
+        VmHttpAuthorization::Allow => {
+            route_authenticated_vm_http_request(
+                session,
+                &request,
+                head.buffered_body,
+                stream,
+                git_clone,
+                read_timeout,
+            )
+            .await
+        }
+        VmHttpAuthorization::Deny(VmHttpAuthError::MissingBearerToken) => {
+            VmHttpResponse::text(VmHttpStatus::Unauthorized, "missing bearer token")
+        }
+        VmHttpAuthorization::Deny(VmHttpAuthError::WrongBearerToken) => {
+            VmHttpResponse::text(VmHttpStatus::Unauthorized, "invalid bearer token")
+        }
+        VmHttpAuthorization::Deny(VmHttpAuthError::SourceOutsideSessionSubnet) => {
+            VmHttpResponse::text(VmHttpStatus::Forbidden, "source outside session subnet")
+        }
+    }
+}
+
+async fn route_authenticated_vm_http_request<S, R>(
+    session: &VmHttpSession,
+    request: &VmHttpRequest,
+    buffered_body: Vec<u8>,
+    stream: &mut R,
+    git_clone: Option<VmHttpGitCloneService<S>>,
+    read_timeout: std::time::Duration,
+) -> VmHttpResponse
+where
+    S: SecretStore + Send + Sync,
+    R: AsyncRead + Unpin,
+{
+    if request.target == VM_GIT_CLONE_PATH {
+        let Some(service) = git_clone else {
+            return VmHttpResponse::text(VmHttpStatus::NotFound, "not found");
+        };
+        if request.method != "POST" {
+            return VmHttpResponse::text(VmHttpStatus::NotFound, "not found");
+        }
+        let body = match read_http_body_for_git_clone_route(
+            stream,
+            request.content_length.unwrap_or(0),
+            buffered_body,
+            read_timeout,
+        )
+        .await
+        {
+            Ok(body) => body,
+            Err(response) => return response,
+        };
+        return handle_git_clone_request(session, &body, service).await;
+    }
+
+    route_session_endpoint(session, request)
+}
+
+fn route_session_endpoint(session: &VmHttpSession, request: &VmHttpRequest) -> VmHttpResponse {
     match (request.method.as_str(), request.target.as_str()) {
         ("GET", "/v1/session") => VmHttpResponse::json(
             VmHttpStatus::Ok,
@@ -382,10 +633,260 @@ fn route_vm_http_request(session: &VmHttpSession, request: &VmHttpRequest) -> Vm
     }
 }
 
+async fn read_http_body_for_git_clone_route<R: AsyncRead + Unpin>(
+    stream: &mut R,
+    content_length: usize,
+    buffered_body: Vec<u8>,
+    read_timeout: std::time::Duration,
+) -> Result<Vec<u8>, VmHttpResponse> {
+    match tokio::time::timeout(
+        read_timeout,
+        read_http_body_bounded(
+            stream,
+            content_length,
+            buffered_body,
+            MAX_VM_HTTP_BODY_BYTES,
+        ),
+    )
+    .await
+    {
+        Err(_) => Err(VmHttpResponse::text(
+            VmHttpStatus::BadRequest,
+            "incomplete request body",
+        )),
+        Ok(Ok(body)) => Ok(body),
+        Ok(Err(err)) if err.kind() == std::io::ErrorKind::InvalidData => Err(VmHttpResponse::text(
+            VmHttpStatus::BadRequest,
+            err.to_string(),
+        )),
+        Ok(Err(_)) => Err(VmHttpResponse::text(
+            VmHttpStatus::BadRequest,
+            "incomplete request body",
+        )),
+    }
+}
+
+async fn handle_git_clone_request<S: SecretStore + Send + Sync>(
+    session: &VmHttpSession,
+    body: &[u8],
+    service: VmHttpGitCloneService<S>,
+) -> VmHttpResponse {
+    let request = match serde_json::from_slice::<VmGitCloneRequest>(body) {
+        Ok(request) => request,
+        Err(err) => {
+            return git_error_response(
+                VmHttpStatus::BadRequest,
+                VmGitCloneErrorCode::InvalidRequest,
+                format!("invalid Git clone request: {err}"),
+            );
+        }
+    };
+
+    let capability = request.authorization_request();
+    let outcome = request_capability(session.session_id, capability, &service.broker_state).await;
+    let token = match git_clone_token_from_capability_outcome(outcome) {
+        Ok(token) => token,
+        Err(response) => return response,
+    };
+    let secret = match GitSecretValue::new(token) {
+        Ok(secret) => secret,
+        Err(err) => {
+            return git_error_response(
+                VmHttpStatus::InternalServerError,
+                VmGitCloneErrorCode::CloneFailed,
+                git_secret_error_message(err),
+            );
+        }
+    };
+    let plan = match service.config.plan_for_request(request) {
+        Ok(plan) => plan,
+        Err(err) => {
+            return git_error_response(
+                VmHttpStatus::InternalServerError,
+                VmGitCloneErrorCode::CloneFailed,
+                format!("invalid Git clone service configuration: {err}"),
+            );
+        }
+    };
+
+    match run_git_clone_bundle_and_read(&plan, &secret).await {
+        Ok(bundle) => VmHttpResponse {
+            status: VmHttpStatus::Ok,
+            content_type: GIT_BUNDLE_CONTENT_TYPE,
+            body: bundle,
+        },
+        Err(message) => git_error_response(
+            VmHttpStatus::InternalServerError,
+            VmGitCloneErrorCode::CloneFailed,
+            message,
+        ),
+    }
+}
+
+fn git_clone_token_from_capability_outcome(
+    outcome: CapabilityOutcome,
+) -> Result<String, VmHttpResponse> {
+    match outcome {
+        CapabilityOutcome::Granted { token, .. } => Ok(token),
+        CapabilityOutcome::Denied { reason } => Err(git_error_response(
+            VmHttpStatus::Forbidden,
+            VmGitCloneErrorCode::Denied,
+            reason,
+        )),
+        CapabilityOutcome::UnknownSession { .. } => Err(git_error_response(
+            VmHttpStatus::Unauthorized,
+            VmGitCloneErrorCode::Denied,
+            "session is not active",
+        )),
+        CapabilityOutcome::ClosedSession { .. } => Err(git_error_response(
+            VmHttpStatus::Gone,
+            VmGitCloneErrorCode::Denied,
+            "session is closed",
+        )),
+        CapabilityOutcome::Error { message } => {
+            eprintln!("VM HTTP Git clone credential request failed: {message}");
+            Err(git_error_response(
+                VmHttpStatus::InternalServerError,
+                VmGitCloneErrorCode::CloneFailed,
+                "credential request failed",
+            ))
+        }
+    }
+}
+
+async fn run_git_clone_bundle_and_read(
+    plan: &GitCloneBundlePlan,
+    secret: &GitSecretValue,
+) -> Result<Vec<u8>, String> {
+    prepare_git_work_root(plan.work_dir().parent().ok_or_else(|| {
+        format!(
+            "Git clone work directory has no parent: {}",
+            plan.work_dir().display()
+        )
+    })?)
+    .await?;
+
+    let work_dir = plan.work_dir().to_path_buf();
+    let run_result = async {
+        run_git_clone_bundle(plan, secret)
+            .await
+            .map_err(git_clone_run_error_message)?;
+        // TODO: stream the bundle into the HTTP response instead of buffering
+        // it here once the VM HTTP response type supports streaming bodies.
+        tokio::fs::read(plan.bundle_path()).await.map_err(|err| {
+            format!(
+                "cannot read Git bundle {}: {err}",
+                plan.bundle_path().display()
+            )
+        })
+    }
+    .await;
+
+    let cleanup_result = match tokio::fs::remove_dir_all(&work_dir).await {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(format!(
+            "cannot remove Git clone work directory {}: {err}",
+            work_dir.display()
+        )),
+    };
+
+    match (run_result, cleanup_result) {
+        (Ok(bundle), Ok(())) => Ok(bundle),
+        (Ok(_), Err(cleanup)) => Err(format!(
+            "Git clone completed but temporary artifacts were not removed: {cleanup}"
+        )),
+        (Err(original), Ok(())) => Err(original),
+        (Err(original), Err(cleanup)) => Err(format!("{original}; additionally, {cleanup}")),
+    }
+}
+
+async fn prepare_git_work_root(path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+
+    match tokio::fs::symlink_metadata(path).await {
+        Ok(metadata) => validate_git_work_root_metadata(path, &metadata),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            let mut builder = tokio::fs::DirBuilder::new();
+            builder.mode(0o700);
+            match builder.create(path).await {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let metadata = tokio::fs::symlink_metadata(path).await.map_err(|err| {
+                        format!(
+                            "cannot inspect Git clone work root {}: {err}",
+                            path.display()
+                        )
+                    })?;
+                    return validate_git_work_root_metadata(path, &metadata);
+                }
+                Err(err) => {
+                    return Err(format!(
+                        "cannot create Git clone work root {}: {err}",
+                        path.display()
+                    ));
+                }
+            }
+            tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+                .await
+                .map_err(|err| {
+                    format!(
+                        "cannot set Git clone work root permissions for {}: {err}",
+                        path.display()
+                    )
+                })
+        }
+        Err(err) => Err(format!(
+            "cannot inspect Git clone work root {}: {err}",
+            path.display()
+        )),
+    }
+}
+
+fn validate_git_work_root_metadata(
+    path: &Path,
+    metadata: &std::fs::Metadata,
+) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+
+    if !metadata.is_dir() {
+        return Err(format!(
+            "Git clone work root is not a directory: {}",
+            path.display()
+        ));
+    }
+    let mode = metadata.permissions().mode();
+    if mode & 0o077 != 0 {
+        return Err(format!(
+            "Git clone work root {} has group/world access bits (mode {:04o}); \
+             use a dedicated 0700 directory",
+            path.display(),
+            mode & 0o777
+        ));
+    }
+    Ok(())
+}
+
+fn git_error_response(
+    status: VmHttpStatus,
+    error: VmGitCloneErrorCode,
+    message: impl Into<String>,
+) -> VmHttpResponse {
+    VmHttpResponse::json(status, &VmGitCloneErrorResponse::new(error, message))
+}
+
+fn git_secret_error_message(err: GitSecretValueError) -> String {
+    format!("minted Git credential cannot be passed to Git: {err}")
+}
+
+fn git_clone_run_error_message(err: GitCloneBundleRunError) -> String {
+    format!("Git clone failed: {err}")
+}
+
 async fn read_http_head_bounded<R: AsyncRead + Unpin>(
     stream: &mut R,
     max: usize,
-) -> std::io::Result<Vec<u8>> {
+) -> std::io::Result<VmHttpHeadRead> {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 1024];
     loop {
@@ -397,20 +898,52 @@ async fn read_http_head_bounded<R: AsyncRead + Unpin>(
             ));
         }
 
-        for byte in &chunk[..read] {
-            if buf.len() == max {
+        buf.extend_from_slice(&chunk[..read]);
+        if let Some(index) = buf.windows(4).position(|window| window == b"\r\n\r\n") {
+            let head_end = index + 4;
+            if head_end > max {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     format!("HTTP request header exceeds {max}-byte limit"),
                 ));
             }
-
-            buf.push(*byte);
-            if buf.ends_with(b"\r\n\r\n") {
-                return Ok(buf);
-            }
+            let buffered_body = buf.split_off(head_end);
+            return Ok(VmHttpHeadRead {
+                raw_head: buf,
+                buffered_body,
+            });
+        }
+        if buf.len() > max {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("HTTP request header exceeds {max}-byte limit"),
+            ));
         }
     }
+}
+
+async fn read_http_body_bounded<R: AsyncRead + Unpin>(
+    stream: &mut R,
+    content_length: usize,
+    mut buffered_body: Vec<u8>,
+    max: usize,
+) -> std::io::Result<Vec<u8>> {
+    if content_length > max {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("HTTP request body exceeds {max}-byte limit"),
+        ));
+    }
+    if buffered_body.len() >= content_length {
+        buffered_body.truncate(content_length);
+        return Ok(buffered_body);
+    }
+
+    let mut body = buffered_body;
+    let already_buffered = body.len();
+    body.resize(content_length, 0);
+    stream.read_exact(&mut body[already_buffered..]).await?;
+    Ok(body)
 }
 
 fn parse_http_head(raw: &[u8], peer_addr: SocketAddr) -> Result<VmHttpRequest, VmHttpParseError> {
@@ -439,6 +972,7 @@ fn parse_http_head(raw: &[u8], peer_addr: SocketAddr) -> Result<VmHttpRequest, V
     }
 
     let mut authorization = None;
+    let mut content_length = None;
     for line in lines {
         let Some((name, value)) = line.split_once(':') else {
             return Err(VmHttpParseError::MalformedHeader);
@@ -449,14 +983,32 @@ fn parse_http_head(raw: &[u8], peer_addr: SocketAddr) -> Result<VmHttpRequest, V
             }
             authorization = Some(value.trim().to_string());
         }
+        if name.eq_ignore_ascii_case("content-length") {
+            if content_length.is_some() {
+                return Err(VmHttpParseError::DuplicateContentLength);
+            }
+            let value = value.trim();
+            if value.is_empty() || value.starts_with('+') || value.starts_with('-') {
+                return Err(VmHttpParseError::InvalidContentLength);
+            }
+            content_length = Some(
+                value
+                    .parse::<usize>()
+                    .map_err(|_| VmHttpParseError::InvalidContentLength)?,
+            );
+        }
+        if name.eq_ignore_ascii_case("transfer-encoding") {
+            return Err(VmHttpParseError::UnsupportedTransferEncoding);
+        }
     }
 
-    Ok(VmHttpRequest::new(
-        method.to_string(),
-        target.to_string(),
+    Ok(VmHttpRequest {
+        method: method.to_string(),
+        target: target.to_string(),
         authorization,
+        content_length,
         peer_addr,
-    ))
+    })
 }
 
 impl VmHttpResponse {
@@ -502,6 +1054,8 @@ impl VmHttpStatus {
             Self::Forbidden => "403 Forbidden",
             Self::NotFound => "404 Not Found",
             Self::MethodNotAllowed => "405 Method Not Allowed",
+            Self::Gone => "410 Gone",
+            Self::InternalServerError => "500 Internal Server Error",
         }
     }
 }
@@ -531,13 +1085,47 @@ fn report_vm_http_handler_result(result: Result<std::io::Result<()>, tokio::task
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::net::{Ipv6Addr, SocketAddrV4, SocketAddrV6};
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::Mutex;
 
     use proptest::prelude::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::*;
-    use crate::core::Ipv6Cidr;
+    use crate::audit::AuditLog;
+    use crate::core::{Ipv6Cidr, RepoRef, SessionRecord, TtlSeconds, UnixMillis};
+    use crate::github::{GitHubAppConfig, GitHubMinter};
+    use crate::policy::PolicyConfig;
+    use crate::secret::{SecretError, SecretKey};
+    use crate::vm_git::{GitCloneRepo, GitSecretEnvVar};
+
+    #[derive(Default)]
+    struct InMemStore(Mutex<HashMap<String, String>>);
+
+    impl SecretStore for InMemStore {
+        fn get(&self, key: &SecretKey) -> Result<Option<String>, SecretError> {
+            Ok(self.0.lock().unwrap().get(key.as_str()).cloned())
+        }
+
+        fn put(&self, key: &SecretKey, value: &str) -> Result<(), SecretError> {
+            self.0
+                .lock()
+                .unwrap()
+                .insert(key.as_str().to_string(), value.to_string());
+            Ok(())
+        }
+
+        fn delete(&self, key: &SecretKey) -> Result<(), SecretError> {
+            self.0.lock().unwrap().remove(key.as_str());
+            Ok(())
+        }
+    }
+
+    const TEST_PRIV: &str = include_str!("../tests/fixtures/rsa_test_1.pem");
 
     fn session_for_subnet(ipv4: Ipv4Cidr) -> VmHttpSession {
         VmHttpSession::new(
@@ -549,6 +1137,141 @@ mod tests {
 
     fn token() -> VmHttpBearerToken {
         VmHttpBearerToken::new("test-token-0123456789abcdef").unwrap()
+    }
+
+    fn repo(owner: &str, name: &str) -> RepoRef {
+        RepoRef {
+            owner: owner.into(),
+            name: name.into(),
+        }
+    }
+
+    fn make_broker_state(server: &MockServer) -> Arc<BrokerState<Box<dyn SecretStore>>> {
+        let pk = SecretKey::new("gh-app-pk").unwrap();
+        let store = InMemStore::default();
+        store.put(&pk, TEST_PRIV).unwrap();
+        Arc::new(BrokerState {
+            audit: AuditLog::open_in_memory().unwrap(),
+            minter: GitHubMinter::new(
+                GitHubAppConfig {
+                    app_id: 42,
+                    installation_id: 999,
+                    installation_owner: "o".into(),
+                    private_key_secret: pk,
+                    api_base: server.uri(),
+                },
+                Box::new(store) as Box<dyn SecretStore>,
+            ),
+            policy: PolicyConfig {
+                writable_repos: vec![],
+                default_ttl: TtlSeconds::new(3600).unwrap(),
+            },
+        })
+    }
+
+    fn open_audit_session(state: &BrokerState<Box<dyn SecretStore>>, session_id: SessionId) {
+        state
+            .audit
+            .open_session(&SessionRecord {
+                session_id,
+                label: Some("vm-http-test".into()),
+                agent_model: None,
+                opened_at: UnixMillis::now(),
+                closed_at: None,
+            })
+            .unwrap();
+    }
+
+    fn expiry_str_from_now(secs: i64) -> String {
+        let t = time::OffsetDateTime::now_utc() + time::Duration::seconds(secs);
+        t.format(&time::format_description::well_known::Rfc3339)
+            .unwrap()
+    }
+
+    fn write_fake_git(dir: &Path) -> PathBuf {
+        write_fake_git_with_bundle_epilogue(dir, "")
+    }
+
+    fn write_fake_git_with_bundle_epilogue(dir: &Path, bundle_epilogue: &str) -> PathBuf {
+        let git = dir.join("fake-git.sh");
+        let log_path = shell_single_quote(&dir.join("fake-git.log"));
+        let script = format!(
+            r#"#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> {log}
+case " $* " in
+  *" clone "*)
+    if [ "${{WRIT_GIT_TOKEN:-}}" != "ghs_vm_token" ]; then
+      exit 41
+    fi
+    mirror=
+    for arg do mirror=$arg; done
+    /bin/mkdir -p "$mirror"
+    ;;
+  *" bundle create "*)
+    if [ "${{WRIT_GIT_TOKEN+x}}" = x ]; then
+      exit 42
+    fi
+    bundle=
+    after_separator=0
+    for arg do
+      if [ "$after_separator" = 1 ]; then
+        bundle=$arg
+        break
+      fi
+      if [ "$arg" = "--" ]; then
+        after_separator=1
+      fi
+    done
+    if [ -z "$bundle" ]; then
+      exit 43
+    fi
+    printf 'bundle-from-fake-git\n' > "$bundle"
+    {bundle_epilogue}
+    ;;
+  *)
+    exit 64
+    ;;
+esac
+"#,
+            log = log_path,
+            bundle_epilogue = bundle_epilogue,
+        );
+        std::fs::write(&git, script).unwrap();
+        std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o700)).unwrap();
+        git
+    }
+
+    fn shell_single_quote(path: &Path) -> String {
+        let raw = path.to_string_lossy();
+        format!("'{}'", raw.replace('\'', "'\\''"))
+    }
+
+    fn write_fake_askpass(dir: &Path) -> PathBuf {
+        let askpass = dir.join("fake-askpass.sh");
+        std::fs::write(&askpass, "#!/bin/sh\nexit 1\n").unwrap();
+        std::fs::set_permissions(&askpass, std::fs::Permissions::from_mode(0o700)).unwrap();
+        askpass
+    }
+
+    fn git_clone_service_for_test(
+        state: &Arc<BrokerState<Box<dyn SecretStore>>>,
+        temp: &tempfile::TempDir,
+        fake_git: PathBuf,
+    ) -> VmHttpGitCloneService<Box<dyn SecretStore>> {
+        let askpass = write_fake_askpass(temp.path());
+        let credential =
+            GitCredentialBoundary::new(askpass, GitSecretEnvVar::new("WRIT_GIT_TOKEN").unwrap())
+                .unwrap();
+        let config = VmHttpGitCloneConfig::new(
+            fake_git,
+            credential,
+            temp.path().join("git-work"),
+            std::time::Duration::from_secs(5),
+            1024,
+        )
+        .unwrap();
+        VmHttpGitCloneService::new(Arc::clone(state), config)
     }
 
     fn request(source: Ipv4Addr, authorization: Option<String>) -> VmHttpRequest {
@@ -732,6 +1455,29 @@ mod tests {
     }
 
     #[test]
+    fn parser_rejects_duplicate_content_length_header() {
+        let raw =
+            b"POST /v1/git/clone HTTP/1.1\r\nContent-Length: 2\r\ncontent-length: 2\r\n\r\n{}";
+        let err = parse_http_head(
+            raw,
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(10, 1, 2, 3), 12345)),
+        )
+        .unwrap_err();
+        assert_eq!(err, VmHttpParseError::DuplicateContentLength);
+    }
+
+    #[test]
+    fn parser_rejects_transfer_encoding_header() {
+        let raw = b"POST /v1/git/clone HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n";
+        let err = parse_http_head(
+            raw,
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(10, 1, 2, 3), 12345)),
+        )
+        .unwrap_err();
+        assert_eq!(err, VmHttpParseError::UnsupportedTransferEncoding);
+    }
+
+    #[test]
     fn authenticated_session_route_returns_session_identity() {
         let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(10, 1, 2, 0), 24).unwrap());
         let response = dispatch_vm_http_head(
@@ -777,6 +1523,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn disabled_git_clone_route_is_not_found_for_all_methods() {
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(10, 1, 2, 0), 24).unwrap());
+        let peer = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(10, 1, 2, 3), 12345));
+
+        for method in ["GET", "POST"] {
+            let request = VmHttpRequest::new(
+                method,
+                VM_GIT_CLONE_PATH,
+                Some(bearer(token().as_str())),
+                peer,
+            );
+            let mut stream = tokio::io::empty();
+            let response = route_authenticated_vm_http_request(
+                &session,
+                &request,
+                Vec::new(),
+                &mut stream,
+                None::<VmHttpGitCloneService<Box<dyn SecretStore>>>,
+                VM_HTTP_READ_TIMEOUT,
+            )
+            .await;
+
+            assert_eq!(response.status, VmHttpStatus::NotFound);
+        }
+    }
+
+    #[tokio::test]
+    async fn enabled_git_clone_route_is_not_found_for_non_post_methods() {
+        let github = MockServer::start().await;
+        let state = make_broker_state(&github);
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+        let temp = tempfile::tempdir().unwrap();
+        let service = git_clone_service_for_test(&state, &temp, write_fake_git(temp.path()));
+        let request = VmHttpRequest::new(
+            "GET",
+            VM_GIT_CLONE_PATH,
+            Some(bearer(token().as_str())),
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 12345)),
+        );
+
+        let mut stream = tokio::io::empty();
+        let response = route_authenticated_vm_http_request(
+            &session,
+            &request,
+            Vec::new(),
+            &mut stream,
+            Some(service),
+            VM_HTTP_READ_TIMEOUT,
+        )
+        .await;
+
+        assert_eq!(response.status, VmHttpStatus::NotFound);
+    }
+
+    #[test]
+    fn git_clone_capability_denial_maps_to_forbidden_error_response() {
+        let response = git_clone_token_from_capability_outcome(CapabilityOutcome::Denied {
+            reason: "policy says no".into(),
+        })
+        .unwrap_err();
+
+        assert_eq!(response.status, VmHttpStatus::Forbidden);
+        let body: VmGitCloneErrorResponse = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(body.error(), VmGitCloneErrorCode::Denied);
+        assert_eq!(body.message(), "policy says no");
+    }
+
+    #[tokio::test]
     async fn bounded_reader_accepts_terminator_at_limit_before_body_bytes() {
         let head = b"GET /v1/session HTTP/1.1\r\n\r\n";
         let mut input = head.to_vec();
@@ -789,7 +1603,318 @@ mod tests {
         let got = read_http_head_bounded(&mut server, head.len())
             .await
             .unwrap();
-        assert_eq!(got, head);
+        assert_eq!(got.raw_head, head);
+        assert_eq!(got.buffered_body, b"body ignored after header");
+    }
+
+    #[tokio::test]
+    async fn body_reader_preserves_body_bytes_buffered_with_header() {
+        let head = b"POST /v1/git/clone HTTP/1.1\r\nContent-Length: 14\r\n\r\n";
+        let mut input = head.to_vec();
+        input.extend_from_slice(br#"{"repo":"o/n"}extra pipelined bytes"#);
+        let (mut client, mut server) = tokio::io::duplex(input.len() + 1);
+
+        client.write_all(&input).await.unwrap();
+        drop(client);
+
+        let got_head = read_http_head_bounded(&mut server, MAX_VM_HTTP_HEAD_BYTES)
+            .await
+            .unwrap();
+        let request = parse_http_head(
+            &got_head.raw_head,
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(10, 1, 2, 3), 12345)),
+        )
+        .unwrap();
+        let body = read_http_body_bounded(
+            &mut server,
+            request.content_length.unwrap(),
+            got_head.buffered_body,
+            MAX_VM_HTTP_BODY_BYTES,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(body, br#"{"repo":"o/n"}"#);
+    }
+
+    #[tokio::test]
+    async fn authorization_runs_before_body_limit_enforcement() {
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(10, 1, 2, 0), 24).unwrap());
+        let raw_head = format!(
+            "POST {VM_GIT_CLONE_PATH} HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
+            MAX_VM_HTTP_BODY_BYTES + 1
+        )
+        .into_bytes();
+        let mut stream = tokio::io::empty();
+        let response = dispatch_vm_http_head_and_body(
+            &session,
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(10, 1, 2, 3), 12345)),
+            VmHttpHeadRead {
+                raw_head,
+                buffered_body: Vec::new(),
+            },
+            &mut stream,
+            None::<VmHttpGitCloneService<Box<dyn SecretStore>>>,
+            VM_HTTP_READ_TIMEOUT,
+        )
+        .await;
+        assert_eq!(response.status, VmHttpStatus::Unauthorized);
+    }
+
+    #[tokio::test]
+    async fn session_route_does_not_read_declared_body() {
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(10, 1, 2, 0), 24).unwrap());
+        let raw_head = format!(
+            "GET /v1/session HTTP/1.1\r\nAuthorization: {}\r\nContent-Length: 1\r\n\r\n",
+            bearer(token().as_str())
+        )
+        .into_bytes();
+        let (_client, mut stream) = tokio::io::duplex(1);
+
+        let response = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            dispatch_vm_http_head_and_body(
+                &session,
+                SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(10, 1, 2, 3), 12345)),
+                VmHttpHeadRead {
+                    raw_head,
+                    buffered_body: Vec::new(),
+                },
+                &mut stream,
+                None::<VmHttpGitCloneService<Box<dyn SecretStore>>>,
+                VM_HTTP_READ_TIMEOUT,
+            ),
+        )
+        .await
+        .expect("session route must not wait for a declared body");
+
+        assert_eq!(response.status, VmHttpStatus::Ok);
+    }
+
+    #[tokio::test]
+    async fn disabled_git_clone_route_does_not_read_declared_body() {
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(10, 1, 2, 0), 24).unwrap());
+        let raw_head = format!(
+            "POST {VM_GIT_CLONE_PATH} HTTP/1.1\r\nAuthorization: {}\r\nContent-Length: 1\r\n\r\n",
+            bearer(token().as_str())
+        )
+        .into_bytes();
+        let (_client, mut stream) = tokio::io::duplex(1);
+
+        let response = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            dispatch_vm_http_head_and_body(
+                &session,
+                SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(10, 1, 2, 3), 12345)),
+                VmHttpHeadRead {
+                    raw_head,
+                    buffered_body: Vec::new(),
+                },
+                &mut stream,
+                None::<VmHttpGitCloneService<Box<dyn SecretStore>>>,
+                VM_HTTP_READ_TIMEOUT,
+            ),
+        )
+        .await
+        .expect("disabled Git clone route must not wait for a declared body");
+
+        assert_eq!(response.status, VmHttpStatus::NotFound);
+    }
+
+    #[tokio::test]
+    async fn enabled_git_clone_non_post_route_does_not_read_declared_body() {
+        let github = MockServer::start().await;
+        let state = make_broker_state(&github);
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+        let temp = tempfile::tempdir().unwrap();
+        let service = git_clone_service_for_test(&state, &temp, write_fake_git(temp.path()));
+        let raw_head = format!(
+            "GET {VM_GIT_CLONE_PATH} HTTP/1.1\r\nAuthorization: {}\r\nContent-Length: 1\r\n\r\n",
+            bearer(token().as_str())
+        )
+        .into_bytes();
+        let (_client, mut stream) = tokio::io::duplex(1);
+
+        let response = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            dispatch_vm_http_head_and_body(
+                &session,
+                SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 12345)),
+                VmHttpHeadRead {
+                    raw_head,
+                    buffered_body: Vec::new(),
+                },
+                &mut stream,
+                Some(service),
+                VM_HTTP_READ_TIMEOUT,
+            ),
+        )
+        .await
+        .expect("non-POST Git clone route must not wait for a declared body");
+
+        assert_eq!(response.status, VmHttpStatus::NotFound);
+    }
+
+    #[tokio::test]
+    async fn git_clone_work_root_is_created_private_and_existing_loose_dir_is_rejected() {
+        let temp = tempfile::tempdir().unwrap();
+        let created = temp.path().join("created");
+        prepare_git_work_root(&created).await.unwrap();
+        let created_mode = std::fs::metadata(&created).unwrap().permissions().mode() & 0o777;
+        assert_eq!(created_mode, 0o700);
+
+        let loose = temp.path().join("loose");
+        std::fs::create_dir(&loose).unwrap();
+        std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let err = prepare_git_work_root(&loose).await.unwrap_err();
+        assert!(err.contains("group/world access bits"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn git_clone_route_rejects_malformed_json_without_minting() {
+        let github = MockServer::start().await;
+        let state = make_broker_state(&github);
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+        let temp = tempfile::tempdir().unwrap();
+        let service = git_clone_service_for_test(&state, &temp, write_fake_git(temp.path()));
+
+        let response = handle_git_clone_request(&session, b"{not json", service).await;
+
+        assert_eq!(response.status, VmHttpStatus::BadRequest);
+        let body: VmGitCloneErrorResponse = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(body.error(), VmGitCloneErrorCode::InvalidRequest);
+        assert!(
+            state
+                .audit
+                .list_grants_for_session(session.session_id())
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn git_clone_route_maps_inactive_sessions_to_client_errors() {
+        let github = MockServer::start().await;
+        let state = make_broker_state(&github);
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+        let temp = tempfile::tempdir().unwrap();
+        let clone_repo = GitCloneRepo::new(repo("o", "n")).unwrap();
+        let request_body = serde_json::to_vec(&VmGitCloneRequest::new(clone_repo, None)).unwrap();
+
+        let unknown_service =
+            git_clone_service_for_test(&state, &temp, write_fake_git(temp.path()));
+        let unknown_response =
+            handle_git_clone_request(&session, &request_body, unknown_service).await;
+
+        assert_eq!(unknown_response.status, VmHttpStatus::Unauthorized);
+        let unknown_body: VmGitCloneErrorResponse =
+            serde_json::from_slice(&unknown_response.body).unwrap();
+        assert_eq!(unknown_body.error(), VmGitCloneErrorCode::Denied);
+        assert_eq!(unknown_body.message(), "session is not active");
+        assert!(
+            !unknown_body
+                .message()
+                .contains(&session.session_id().to_string())
+        );
+
+        open_audit_session(&state, session.session_id());
+        state
+            .audit
+            .close_session(session.session_id(), UnixMillis::now())
+            .unwrap();
+
+        let closed_service = git_clone_service_for_test(&state, &temp, write_fake_git(temp.path()));
+        let closed_response =
+            handle_git_clone_request(&session, &request_body, closed_service).await;
+
+        assert_eq!(closed_response.status, VmHttpStatus::Gone);
+        let closed_body: VmGitCloneErrorResponse =
+            serde_json::from_slice(&closed_response.body).unwrap();
+        assert_eq!(closed_body.error(), VmGitCloneErrorCode::Denied);
+        assert_eq!(closed_body.message(), "session is closed");
+        assert!(
+            state
+                .audit
+                .list_grants_for_session(session.session_id())
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn git_clone_route_hides_host_mint_errors_from_vm_response() {
+        let github = MockServer::start().await;
+        let state = make_broker_state(&github);
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+        open_audit_session(&state, session.session_id());
+        Mock::given(method("POST"))
+            .and(path("/app/installations/999/access_tokens"))
+            .respond_with(
+                ResponseTemplate::new(500).set_body_string("backend detail /private/tmp/secret"),
+            )
+            .expect(1)
+            .mount(&github)
+            .await;
+
+        let temp = tempfile::tempdir().unwrap();
+        let service = git_clone_service_for_test(&state, &temp, write_fake_git(temp.path()));
+        let clone_repo = GitCloneRepo::new(repo("o", "n")).unwrap();
+        let body = serde_json::to_vec(&VmGitCloneRequest::new(clone_repo, None)).unwrap();
+
+        let response = handle_git_clone_request(&session, &body, service).await;
+
+        assert_eq!(response.status, VmHttpStatus::InternalServerError);
+        let body: VmGitCloneErrorResponse = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(body.error(), VmGitCloneErrorCode::CloneFailed);
+        assert_eq!(body.message(), "credential request failed");
+        assert!(!body.message().contains("/private/tmp/secret"));
+    }
+
+    #[tokio::test]
+    async fn git_clone_route_reports_cleanup_failure_without_returning_bundle() {
+        let github = MockServer::start().await;
+        let state = make_broker_state(&github);
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+        open_audit_session(&state, session.session_id());
+        Mock::given(method("POST"))
+            .and(path("/app/installations/999/access_tokens"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "token": "ghs_vm_token",
+                "expires_at": expiry_str_from_now(3600),
+                "permissions": {"contents": "read", "metadata": "read"},
+                "repository_selection": "selected",
+                "repositories": [{"full_name": "o/n"}]
+            })))
+            .expect(1)
+            .mount(&github)
+            .await;
+
+        let temp = tempfile::tempdir().unwrap();
+        let fake_git = write_fake_git_with_bundle_epilogue(
+            temp.path(),
+            r#"work_dir=${bundle%/*}
+work_root=${work_dir%/*}
+/bin/chmod 500 "$work_root""#,
+        );
+        let service = git_clone_service_for_test(&state, &temp, fake_git);
+        let clone_repo = GitCloneRepo::new(repo("o", "n")).unwrap();
+        let body = serde_json::to_vec(&VmGitCloneRequest::new(clone_repo, None)).unwrap();
+
+        let response = handle_git_clone_request(&session, &body, service).await;
+
+        let work_root = temp.path().join("git-work");
+        std::fs::set_permissions(&work_root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(response.status, VmHttpStatus::InternalServerError);
+        let body: VmGitCloneErrorResponse = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(body.error(), VmGitCloneErrorCode::CloneFailed);
+        assert!(
+            body.message()
+                .contains("temporary artifacts were not removed"),
+            "{}",
+            body.message()
+        );
+        assert!(!body.message().contains("bundle-from-fake-git"));
+        assert_eq!(std::fs::read_dir(work_root).unwrap().count(), 1);
     }
 
     #[tokio::test]
@@ -929,6 +2054,152 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn vm_http_git_clone_route_mints_host_token_and_returns_bundle() {
+        let github = MockServer::start().await;
+        let state = make_broker_state(&github);
+        let session = VmHttpSession::new(
+            "51b8fd0f-6c10-454c-b0e6-7df1d60e2e6d".parse().unwrap(),
+            Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap(),
+            token(),
+        );
+        open_audit_session(&state, session.session_id());
+        Mock::given(method("POST"))
+            .and(path("/app/installations/999/access_tokens"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "token": "ghs_vm_token",
+                "expires_at": expiry_str_from_now(3600),
+                "permissions": {"contents": "read", "metadata": "read"},
+                "repository_selection": "selected",
+                "repositories": [{"full_name": "o/n"}]
+            })))
+            .expect(1)
+            .mount(&github)
+            .await;
+
+        let temp = tempfile::tempdir().unwrap();
+        let fake_git = write_fake_git(temp.path());
+        let service = git_clone_service_for_test(&state, &temp, fake_git);
+
+        let range = BrokerPortRange::new(1024, 65535).unwrap();
+        let bound = bind_ephemeral_vm_http_listener(Ipv4Addr::LOCALHOST, range)
+            .await
+            .unwrap();
+        let addr = bound.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let server = tokio::spawn(run_vm_http_with_git_until_shutdown(
+            bound.into_listener(),
+            session.clone(),
+            service,
+            shutdown_rx,
+        ));
+
+        let clone_repo = GitCloneRepo::new(repo("o", "n")).unwrap();
+        let body = serde_json::to_string(&VmGitCloneRequest::new(clone_repo, None)).unwrap();
+        let response = request_over_tcp(
+            addr,
+            &format!(
+                "POST {VM_GIT_CLONE_PATH} HTTP/1.1\r\nHost: localhost\r\nAuthorization: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                bearer(token().as_str()),
+                body.len(),
+                body
+            ),
+        )
+        .await;
+
+        shutdown_tx.send(true).unwrap();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), server)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(result.is_ok());
+
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response}");
+        assert!(
+            response.contains(&format!("Content-Type: {GIT_BUNDLE_CONTENT_TYPE}\r\n")),
+            "{response}"
+        );
+        assert!(response.ends_with("bundle-from-fake-git\n"), "{response}");
+        assert_eq!(
+            state
+                .audit
+                .list_grants_for_session(session.session_id())
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let git_log = std::fs::read_to_string(temp.path().join("fake-git.log")).unwrap();
+        assert!(git_log.contains("https://github.com/o/n.git"), "{git_log}");
+        assert!(!git_log.contains("ghs_vm_token"), "{git_log}");
+        let work_root_entries = std::fs::read_dir(temp.path().join("git-work"))
+            .unwrap()
+            .count();
+        assert_eq!(work_root_entries, 0);
+    }
+
+    #[tokio::test]
+    async fn vm_http_read_timeout_does_not_cancel_slow_git_clone_execution() {
+        let github = MockServer::start().await;
+        let state = make_broker_state(&github);
+        let session = VmHttpSession::new(
+            "51b8fd0f-6c10-454c-b0e6-7df1d60e2e6d".parse().unwrap(),
+            Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap(),
+            token(),
+        );
+        open_audit_session(&state, session.session_id());
+        Mock::given(method("POST"))
+            .and(path("/app/installations/999/access_tokens"))
+            .respond_with(
+                ResponseTemplate::new(201)
+                    .set_delay(std::time::Duration::from_millis(100))
+                    .set_body_json(serde_json::json!({
+                        "token": "ghs_vm_token",
+                        "expires_at": expiry_str_from_now(3600),
+                        "permissions": {"contents": "read", "metadata": "read"},
+                        "repository_selection": "selected",
+                        "repositories": [{"full_name": "o/n"}]
+                    })),
+            )
+            .expect(1)
+            .mount(&github)
+            .await;
+
+        let temp = tempfile::tempdir().unwrap();
+        let fake_git = write_fake_git(temp.path());
+        let service = git_clone_service_for_test(&state, &temp, fake_git);
+
+        let clone_repo = GitCloneRepo::new(repo("o", "n")).unwrap();
+        let body = serde_json::to_string(&VmGitCloneRequest::new(clone_repo, None)).unwrap();
+        let request = format!(
+            "POST {VM_GIT_CLONE_PATH} HTTP/1.1\r\nHost: localhost\r\nAuthorization: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            bearer(token().as_str()),
+            body.len(),
+            body
+        );
+        let (mut client, server_io) = tokio::io::duplex(64 * 1024);
+        let server = tokio::spawn(handle_vm_http_connection_with_read_timeout(
+            server_io,
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 34567)),
+            session,
+            Some(service),
+            std::time::Duration::from_millis(20),
+        ));
+
+        client.write_all(request.as_bytes()).await.unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        server.await.unwrap().unwrap();
+        let response = String::from_utf8(response).unwrap();
+
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response}");
+        assert!(response.ends_with("bundle-from-fake-git\n"), "{response}");
+        let work_root_entries = std::fs::read_dir(temp.path().join("git-work"))
+            .unwrap()
+            .count();
+        assert_eq!(work_root_entries, 0);
     }
 
     async fn request_over_tcp(addr: SocketAddr, request: &str) -> String {

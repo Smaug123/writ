@@ -37,6 +37,48 @@ pub struct BrokerState<S: SecretStore> {
     pub policy: PolicyConfig,
 }
 
+#[derive(Clone, Eq, PartialEq)]
+pub(crate) enum CapabilityOutcome {
+    Granted {
+        token: String,
+        expires_at: UnixMillis,
+    },
+    Denied {
+        reason: String,
+    },
+    UnknownSession {
+        session_id: SessionId,
+    },
+    ClosedSession {
+        session_id: SessionId,
+    },
+    Error {
+        message: String,
+    },
+}
+
+impl std::fmt::Debug for CapabilityOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Granted { expires_at, .. } => f
+                .debug_struct("Granted")
+                .field("token", &"<redacted>")
+                .field("expires_at", expires_at)
+                .finish(),
+            Self::Denied { reason } => f.debug_struct("Denied").field("reason", reason).finish(),
+            Self::UnknownSession { session_id } => f
+                .debug_struct("UnknownSession")
+                .field("session_id", session_id)
+                .finish(),
+            Self::ClosedSession { session_id } => f
+                .debug_struct("ClosedSession")
+                .field("session_id", session_id)
+                .finish(),
+            Self::Error { message } => f.debug_struct("Error").field("message", message).finish(),
+        }
+    }
+}
+
 /// Return the default Unix socket path. Uses `$XDG_RUNTIME_DIR/writ/writd.sock`
 /// when set, falling back to `$HOME/.local/run/writ/writd.sock`.
 pub fn default_socket_path() -> PathBuf {
@@ -96,6 +138,26 @@ async fn dispatch_capability<S: SecretStore + Send + Sync>(
     capability: CapabilityRequest,
     state: &Arc<BrokerState<S>>,
 ) -> ServerMessage {
+    match request_capability(session_id, capability, state).await {
+        CapabilityOutcome::Granted { token, expires_at } => {
+            ServerMessage::TokenGranted { token, expires_at }
+        }
+        CapabilityOutcome::Denied { reason } => ServerMessage::Denied { reason },
+        CapabilityOutcome::UnknownSession { session_id } => ServerMessage::Error {
+            message: format!("unknown session {session_id}"),
+        },
+        CapabilityOutcome::ClosedSession { session_id } => ServerMessage::Error {
+            message: format!("session {session_id} is closed"),
+        },
+        CapabilityOutcome::Error { message } => ServerMessage::Error { message },
+    }
+}
+
+pub(crate) async fn request_capability<S: SecretStore + Send + Sync>(
+    session_id: SessionId,
+    capability: CapabilityRequest,
+    state: &Arc<BrokerState<S>>,
+) -> CapabilityOutcome {
     // Preflight the session for a readable client error. The
     // authoritative check runs inside `record_pre_mint`'s transaction
     // (and the `request_requires_open_session` trigger behind it) —
@@ -105,17 +167,13 @@ async fn dispatch_capability<S: SecretStore + Send + Sync>(
     // message instead of leaking the generic audit-invariant string.
     match state.audit.get_session(session_id) {
         Ok(None) => {
-            return ServerMessage::Error {
-                message: format!("unknown session {session_id}"),
-            };
+            return CapabilityOutcome::UnknownSession { session_id };
         }
         Ok(Some(s)) if s.closed_at.is_some() => {
-            return ServerMessage::Error {
-                message: format!("session {session_id} is closed"),
-            };
+            return CapabilityOutcome::ClosedSession { session_id };
         }
         Err(e) => {
-            return ServerMessage::Error {
+            return CapabilityOutcome::Error {
                 message: e.to_string(),
             };
         }
@@ -142,7 +200,7 @@ async fn dispatch_capability<S: SecretStore + Send + Sync>(
         request: &capability,
         decision: &decision,
     }) {
-        return ServerMessage::Error {
+        return CapabilityOutcome::Error {
             message: format!("request could not be recorded: {e}"),
         };
     }
@@ -150,7 +208,7 @@ async fn dispatch_capability<S: SecretStore + Send + Sync>(
     // Early-return on Deny: no await point follows, so the &decision
     // borrow is trivially scoped.
     if let PolicyDecision::Deny { reason } = &decision {
-        return ServerMessage::Denied {
+        return CapabilityOutcome::Denied {
             reason: reason.clone(),
         };
     }
@@ -181,13 +239,13 @@ async fn dispatch_capability<S: SecretStore + Send + Sync>(
                 // A transient disk issue will resolve on retry; a permanent
                 // one (full disk, corrupt DB) must be fixed by the operator.
                 eprintln!("AUDIT WRITE FAILED for jti={}: {e}", grant.jti);
-                return ServerMessage::Error {
+                return CapabilityOutcome::Error {
                     message: format!(
                         "credential was minted but could not be recorded; not delivering: {e}"
                     ),
                 };
             }
-            ServerMessage::TokenGranted { token, expires_at }
+            CapabilityOutcome::Granted { token, expires_at }
         }
 
         Err(e) => {
@@ -197,14 +255,14 @@ async fn dispatch_capability<S: SecretStore + Send + Sync>(
                     .audit
                     .record_mint_failure(request_id, UnixMillis::now(), &error_str)
             {
-                return ServerMessage::Error {
+                return CapabilityOutcome::Error {
                     message: format!(
                         "mint failed and the failure could not be recorded: {ae} \
                          (original mint error: {error_str})"
                     ),
                 };
             }
-            ServerMessage::Error { message: error_str }
+            CapabilityOutcome::Error { message: error_str }
         }
     }
 }
@@ -574,6 +632,20 @@ mod tests {
     }
 
     // --- Policy decisions ------------------------------------------------
+
+    #[test]
+    fn capability_outcome_debug_redacts_granted_token() {
+        let outcome = CapabilityOutcome::Granted {
+            token: "ghs_should_not_print".into(),
+            expires_at: UnixMillis::from_millis(1_700_000_000_000),
+        };
+
+        let debug = format!("{outcome:?}");
+
+        assert!(!debug.contains("ghs_should_not_print"), "{debug}");
+        assert!(debug.contains("<redacted>"), "{debug}");
+        assert!(debug.contains("expires_at"), "{debug}");
+    }
 
     #[tokio::test]
     async fn request_not_on_allowlist_is_denied() {

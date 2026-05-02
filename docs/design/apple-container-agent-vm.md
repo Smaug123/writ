@@ -198,13 +198,14 @@ First VM HTTP transport slice implemented in `src/vm_http.rs`:
 - the listener runner has an explicit shutdown path and drains connection
   handlers before returning, so the lifecycle owner does not have to abort a
   detached accept loop during session teardown;
-- the only implemented VM route is `GET /v1/session`, which returns the
-  session identity and protocol version. Git, Nix, model, and signing
-  operations are deliberately not exposed until their host-side policy and
+- the base VM route is `GET /v1/session`, which returns the session identity
+  and protocol version. The Git clone route can be enabled by running the VM
+  HTTP listener with a `VmHttpGitCloneService`; Nix, model, and signing
+  operations remain deliberately unexposed until their host-side policy and
   audit semantics are designed. Authentication denials are returned as HTTP
-  `401`/`403` today; durable audit rows for those denials belong in the next
-  broker-integration slice, where the VM HTTP runner has access to broker
-  audit state.
+  `401`/`403` today; durable audit rows for those denials still need a
+  dedicated audit event shape, because they are transport-auth failures rather
+  than capability requests.
 
 ## Host-side filtering
 
@@ -490,8 +491,7 @@ if commit identity must be entirely broker-controlled.
 First Git clone bundle model slice implemented in `src/vm_git.rs`:
 
 - the VM-facing route is pinned as `POST /v1/git/clone`, with a validated JSON
-  body containing a GitHub repo and optional Git ref. The route is not wired
-  into `src/vm_http.rs` yet;
+  body containing a GitHub repo and optional Git ref;
 - repo, ref, secret-env-var, and host path inputs are parsed into typed values
   before any command can be described. Invalid owner/name/ref syntax, relative
   work/output paths, zero timeouts, and zero bundle-size limits fail before the
@@ -542,10 +542,52 @@ Second Git clone bundle executor slice implemented in `src/vm_git.rs`:
   until Git exits or the timeout fires. A production resource-budget slice
   still needs a bounded filesystem, per-run quota, or streaming bundle target
   if the broker must cap disk consumption during Git execution. The executor
-  does not mint credentials and does not yet wire the route into
-  `src/vm_http.rs`; callers remain responsible for
-  supplying unique temporary paths and cleaning them up after streaming or
-  discarding the bundle.
+  itself still does not mint credentials; callers supply the token boundary
+  explicitly.
+
+First VM HTTP Git clone integration slice implemented in `src/vm_http.rs` and
+`src/server.rs`:
+
+- the Unix-socket capability dispatcher now exposes a structured
+  `request_capability()` outcome so VM HTTP can reuse the same session
+  preflight, policy decision, pre-mint audit row, GitHub App mint, grant audit,
+  and mint-failure audit path without returning raw tokens to the guest;
+- the HTTP reader preserves body bytes that arrive in the same TCP read as the
+  headers, rejects duplicate or invalid `Content-Length` and any
+  `Transfer-Encoding`, and caps request bodies at 64 KiB. `POST
+  /v1/git/clone` parses that bounded JSON body into `VmGitCloneRequest` before
+  any Git command is planned. Other authenticated routes are selected before
+  body reads, so a bearer-bearing guest cannot occupy connection handlers by
+  declaring bodies on endpoints that do not consume them;
+- when the route is enabled with `VmHttpGitCloneService`, the broker derives
+  the read-only GitHub contents capability, mints a host-side installation
+  token, runs the existing bundle executor with that token only in the Git
+  subprocess environment, reads the resulting bundle, removes the per-request
+  clone directory, and returns `application/x-git-bundle` bytes to the VM.
+  Cleanup failure is a `500 clone_failed` response rather than a successful
+  bundle response, because leaving private repository artifacts on the host is
+  not a success state;
+- inactive sessions are treated as client-context failures on the VM HTTP
+  surface: an unknown session returns `401 denied`, a closed session returns
+  `410 denied`, and host-side mint/audit failures return a generic
+  `500 clone_failed` without echoing backend diagnostics to the VM. Non-`POST`
+  methods on `/v1/git/clone` return `404`, as does every method when the Git
+  route is not configured, so a guest cannot distinguish a disabled route from
+  an absent one by method probing;
+- the service creates each clone under a dedicated work root and refuses to use
+  an existing work root with group/world access bits. The per-request work
+  directory is still unique and `0700`, and is removed before the HTTP response
+  is reported as successful. Concurrent first requests may race to create the
+  work root; an `AlreadyExists` race is re-inspected and accepted only if the
+  resulting directory still satisfies the private-mode invariant;
+- the VM HTTP read timeout is scoped only to reading request headers and the
+  bounded request body. Capability minting and Git execution are not cancelled
+  by that transport read budget; Git subprocesses are bounded by the
+  `GitCloneBundlePlan` timeout so the clone cleanup path still runs;
+- this wires the route into the VM HTTP runner API, not yet into the production
+  daemon startup/config path. The next broker slice should decide how `writd`
+  owns the VM HTTP listener, Git binary/askpass paths, work root, size limit,
+  and shutdown alongside the managed VM lifecycle.
 
 ## Tests and proof spikes
 
