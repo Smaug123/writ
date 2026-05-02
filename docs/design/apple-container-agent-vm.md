@@ -822,6 +822,28 @@ own gateway, keep the survivor's PF anchor unchanged after stopping the first
 session, and clean up both sessions' VMs, networks, PF anchors, and observed
 guest-IPv4 PF states.
 
+Manual daemon proof harness added in `scripts/prove-agent-vm-daemon.sh`:
+
+- builds `writ`, `writd`, and `writ-agent-vm-pf-helper`;
+- starts a local fake GitHub API and configures `writd` to use it for
+  installation-token minting. The harness also supplies a fake host `git`
+  binary that creates a deterministic bundle, so the proof does not depend on
+  real GitHub availability or external network egress;
+- starts `writd` with a temporary config, file secret store, audit DB, managed
+  state directory, VM HTTP work root, and Unix socket;
+- starts the VM through the public Unix-socket CLI:
+  `writ agent-vm start -- <guest-command>`;
+- asserts the released guest command is running, the guest still has no
+  routable IPv6 posture, and the daemon-injected `WRIT_BROKER_URL` /
+  `WRIT_BROKER_TOKEN` environment variables are present;
+- from inside the VM, calls `GET /v1/session` and `POST /v1/git/clone` through
+  the daemon-owned VM HTTP listener. The clone route must mint through the fake
+  GitHub API, run the fake host `git` without leaking the token in argv, and
+  return the deterministic bundle bytes to the VM;
+- stops the session through `writ agent-vm stop <session-id>` and asserts the
+  VM, network, PF anchor, observed guest-IPv4 PF states, and managed state
+  record are gone.
+
 ## Risks
 
 - PF rule ordering on macOS can be surprising when other software also manages
