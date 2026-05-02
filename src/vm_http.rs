@@ -60,6 +60,26 @@ pub struct VmHttpGitCloneService<S: SecretStore> {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VmHttpGitRuntimeConfig {
+    bind_addr: Ipv4Addr,
+    broker_port_range: BrokerPortRange,
+    git_clone: VmHttpGitCloneConfig,
+}
+
+pub struct PreparedVmHttpGitSession<S: SecretStore + Send + Sync + 'static> {
+    listener: BoundVmHttpListener,
+    session: VmHttpSession,
+    git_clone: VmHttpGitCloneService<S>,
+}
+
+pub struct RunningVmHttpGitSession {
+    broker_port: BrokerPort,
+    bearer_token: VmHttpBearerToken,
+    shutdown: watch::Sender<bool>,
+    task: Option<tokio::task::JoinHandle<std::io::Result<()>>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VmHttpGitCloneConfig {
     git_program: PathBuf,
     credential: GitCredentialBoundary,
@@ -95,6 +115,20 @@ pub enum VmHttpBindError {
     Io(#[from] std::io::Error),
     #[error("could not bind a VM HTTP port in allowed range {min}-{max} after {attempts} attempts")]
     NoAllowedPort { attempts: usize, min: u16, max: u16 },
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum VmHttpGitRuntimeError {
+    #[error(transparent)]
+    Bind(#[from] VmHttpBindError),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum VmHttpGitRuntimeShutdownError {
+    #[error("VM HTTP task join failed: {0}")]
+    Join(#[from] tokio::task::JoinError),
+    #[error("VM HTTP server failed: {0}")]
+    Server(#[from] std::io::Error),
 }
 
 #[derive(Debug, thiserror::Error, Eq, PartialEq)]
@@ -259,6 +293,32 @@ impl<S: SecretStore> Clone for VmHttpGitCloneService<S> {
     }
 }
 
+impl VmHttpGitRuntimeConfig {
+    pub fn new(
+        bind_addr: Ipv4Addr,
+        broker_port_range: BrokerPortRange,
+        git_clone: VmHttpGitCloneConfig,
+    ) -> Self {
+        Self {
+            bind_addr,
+            broker_port_range,
+            git_clone,
+        }
+    }
+
+    pub fn bind_addr(&self) -> Ipv4Addr {
+        self.bind_addr
+    }
+
+    pub fn broker_port_range(&self) -> BrokerPortRange {
+        self.broker_port_range
+    }
+
+    pub fn git_clone(&self) -> &VmHttpGitCloneConfig {
+        &self.git_clone
+    }
+}
+
 impl VmHttpGitCloneConfig {
     pub fn new(
         git_program: impl Into<PathBuf>,
@@ -322,6 +382,80 @@ impl VmHttpGitCloneConfig {
     }
 }
 
+impl<S: SecretStore + Send + Sync + 'static> PreparedVmHttpGitSession<S> {
+    pub fn broker_port(&self) -> BrokerPort {
+        self.listener.broker_port()
+    }
+
+    pub fn bearer_token(&self) -> &VmHttpBearerToken {
+        self.session.bearer_token()
+    }
+
+    pub fn session(&self) -> &VmHttpSession {
+        &self.session
+    }
+
+    pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
+        self.listener.local_addr()
+    }
+
+    /// Start accepting VM HTTP requests.
+    ///
+    /// Call this only after installing PF rules for [`Self::broker_port`] and
+    /// after the VM start plan has the matching bearer token. The prepared
+    /// listener is already bound before `spawn`, but no guest connection can be
+    /// accepted until this method hands the listener to the runtime task.
+    pub fn spawn(self) -> RunningVmHttpGitSession {
+        let broker_port = self.listener.broker_port();
+        let bearer_token = self.session.bearer_token().clone();
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let task = tokio::spawn(run_vm_http_with_git_until_shutdown(
+            self.listener.into_listener(),
+            self.session,
+            self.git_clone,
+            shutdown_rx,
+        ));
+        RunningVmHttpGitSession {
+            broker_port,
+            bearer_token,
+            shutdown: shutdown_tx,
+            task: Some(task),
+        }
+    }
+}
+
+impl RunningVmHttpGitSession {
+    pub fn broker_port(&self) -> BrokerPort {
+        self.broker_port
+    }
+
+    pub fn bearer_token(&self) -> &VmHttpBearerToken {
+        &self.bearer_token
+    }
+
+    /// Request graceful shutdown and wait for the VM HTTP runtime task to exit.
+    ///
+    /// Prefer this explicit path during lifecycle teardown. Dropping the handle
+    /// still signals shutdown and aborts the task as a last-resort cleanup path,
+    /// but `shutdown` is the path that observes runtime failures.
+    pub async fn shutdown(mut self) -> Result<(), VmHttpGitRuntimeShutdownError> {
+        let _ = self.shutdown.send(true);
+        if let Some(task) = self.task.take() {
+            task.await??;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for RunningVmHttpGitSession {
+    fn drop(&mut self) {
+        let _ = self.shutdown.send(true);
+        if let Some(task) = &self.task {
+            task.abort();
+        }
+    }
+}
+
 pub async fn bind_ephemeral_vm_http_listener(
     bind_addr: Ipv4Addr,
     allowed_ports: BrokerPortRange,
@@ -365,6 +499,29 @@ pub async fn bind_ephemeral_vm_http_listener(
     }
 
     Err(VmHttpBindError::NoAllowedPort { attempts, min, max })
+}
+
+/// Bind and prepare a per-session VM HTTP Git runtime without accepting traffic.
+///
+/// The returned listener owns a concrete broker port before the VM is started.
+/// Lifecycle code should install PF rules for [`PreparedVmHttpGitSession::broker_port`],
+/// pass [`PreparedVmHttpGitSession::bearer_token`] to the guest, and only then
+/// call [`PreparedVmHttpGitSession::spawn`].
+pub async fn prepare_vm_http_git_session<S: SecretStore + Send + Sync + 'static>(
+    state: Arc<BrokerState<S>>,
+    config: &VmHttpGitRuntimeConfig,
+    session_id: SessionId,
+    source_ipv4: Ipv4Cidr,
+) -> Result<PreparedVmHttpGitSession<S>, VmHttpGitRuntimeError> {
+    let listener =
+        bind_ephemeral_vm_http_listener(config.bind_addr, config.broker_port_range).await?;
+    let session = VmHttpSession::new(session_id, source_ipv4, VmHttpBearerToken::generate());
+    let git_clone = VmHttpGitCloneService::new(state, config.git_clone.clone());
+    Ok(PreparedVmHttpGitSession {
+        listener,
+        session,
+        git_clone,
+    })
 }
 
 pub async fn run_vm_http(listener: TcpListener, session: VmHttpSession) -> std::io::Result<()> {
@@ -1259,19 +1416,25 @@ esac
         temp: &tempfile::TempDir,
         fake_git: PathBuf,
     ) -> VmHttpGitCloneService<Box<dyn SecretStore>> {
+        VmHttpGitCloneService::new(Arc::clone(state), git_clone_config_for_test(temp, fake_git))
+    }
+
+    fn git_clone_config_for_test(
+        temp: &tempfile::TempDir,
+        fake_git: PathBuf,
+    ) -> VmHttpGitCloneConfig {
         let askpass = write_fake_askpass(temp.path());
         let credential =
             GitCredentialBoundary::new(askpass, GitSecretEnvVar::new("WRIT_GIT_TOKEN").unwrap())
                 .unwrap();
-        let config = VmHttpGitCloneConfig::new(
+        VmHttpGitCloneConfig::new(
             fake_git,
             credential,
             temp.path().join("git-work"),
             std::time::Duration::from_secs(5),
             1024,
         )
-        .unwrap();
-        VmHttpGitCloneService::new(Arc::clone(state), config)
+        .unwrap()
     }
 
     fn request(source: Ipv4Addr, authorization: Option<String>) -> VmHttpRequest {
@@ -1768,6 +1931,67 @@ esac
         std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o755)).unwrap();
         let err = prepare_git_work_root(&loose).await.unwrap_err();
         assert!(err.contains("group/world access bits"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn prepare_vm_http_git_session_returns_in_range_broker_port_and_redacted_token() {
+        let github = MockServer::start().await;
+        let state = make_broker_state(&github);
+        let temp = tempfile::tempdir().unwrap();
+        let range = BrokerPortRange::new(1024, 65535).unwrap();
+        let config = VmHttpGitRuntimeConfig::new(
+            Ipv4Addr::LOCALHOST,
+            range,
+            git_clone_config_for_test(&temp, write_fake_git(temp.path())),
+        );
+        let session_id = "51b8fd0f-6c10-454c-b0e6-7df1d60e2e6d".parse().unwrap();
+        let source_ipv4 = Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap();
+
+        let prepared = prepare_vm_http_git_session(state, &config, session_id, source_ipv4)
+            .await
+            .unwrap();
+
+        assert!(range.contains(prepared.broker_port()));
+        assert_eq!(prepared.session().session_id(), session_id);
+        assert_eq!(prepared.session().source_ipv4(), source_ipv4);
+        assert!(prepared.bearer_token().as_str().starts_with("writ-vm-"));
+        assert!(
+            !format!("{:?}", prepared.bearer_token()).contains(prepared.bearer_token().as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn running_git_runtime_serves_session_and_shuts_down() {
+        let github = MockServer::start().await;
+        let state = make_broker_state(&github);
+        let temp = tempfile::tempdir().unwrap();
+        let config = VmHttpGitRuntimeConfig::new(
+            Ipv4Addr::LOCALHOST,
+            BrokerPortRange::new(1024, 65535).unwrap(),
+            git_clone_config_for_test(&temp, write_fake_git(temp.path())),
+        );
+        let session_id = "51b8fd0f-6c10-454c-b0e6-7df1d60e2e6d".parse().unwrap();
+        let source_ipv4 = Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap();
+        let prepared = prepare_vm_http_git_session(state, &config, session_id, source_ipv4)
+            .await
+            .unwrap();
+        let addr = prepared.local_addr().unwrap();
+        let token = prepared.bearer_token().as_str().to_string();
+
+        let running = prepared.spawn();
+        let response = request_over_tcp(
+            addr,
+            &format!(
+                "GET /v1/session HTTP/1.1\r\nHost: localhost\r\nAuthorization: {}\r\n\r\n",
+                bearer(&token)
+            ),
+        )
+        .await;
+
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response}");
+        assert!(response.contains(&session_id.to_string()), "{response}");
+        assert_eq!(running.bearer_token().as_str(), token);
+        running.shutdown().await.unwrap();
     }
 
     #[tokio::test]

@@ -50,6 +50,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .audit_db
         .or(config.audit_db)
         .unwrap_or_else(default_audit_db_path);
+    // Validate at daemon startup; the next slice plumbs this through the
+    // agent-VM session API that owns per-session runtime handles.
+    let agent_vm_http = config
+        .agent_vm
+        .as_ref()
+        .map(|agent_vm| agent_vm.vm_http.to_runtime_config())
+        .transpose()?;
 
     if let Some(parent) = audit_db_path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -73,6 +80,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     eprintln!("writd: listening on {}", socket_path.display());
+    if let Some(agent_vm_http) = &agent_vm_http {
+        eprintln!(
+            "writd: agent VM HTTP Git clone runtime configured for {} ports {}-{}",
+            agent_vm_http.bind_addr(),
+            agent_vm_http.broker_port_range().min().get(),
+            agent_vm_http.broker_port_range().max().get()
+        );
+    }
     run(&socket_path, state).await?;
     Ok(())
 }

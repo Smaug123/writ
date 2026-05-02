@@ -589,6 +589,34 @@ First VM HTTP Git clone integration slice implemented in `src/vm_http.rs` and
   owns the VM HTTP listener, Git binary/askpass paths, work root, size limit,
   and shutdown alongside the managed VM lifecycle.
 
+First daemon-owned VM HTTP runtime slice implemented in `src/vm_http.rs`,
+`src/config.rs`, and `src/bin/writd.rs`:
+
+- `DaemonConfig` now accepts an optional `agent_vm.vm_http` block containing
+  the wildcard/listen address, broker port range, Git binary, askpass program,
+  token environment variable name, Git work root, clone timeout, and maximum
+  returned bundle size. `writd` parses that block at startup into the typed
+  `VmHttpGitRuntimeConfig`, so bad port ranges, relative askpass/work-root
+  paths, invalid token environment names, zero timeouts, and zero bundle-size
+  limits fail before the daemon starts serving requests;
+- `prepare_vm_http_git_session()` is the per-session ownership primitive for
+  the later lifecycle/protocol slice. Given broker state, the daemon's static
+  runtime config, a session ID, and the session IPv4 subnet, it binds and keeps
+  open the VM HTTP listener, generates the bearer token, constructs the
+  `VmHttpSession`, and returns the selected `BrokerPort` before the VM is
+  started. The lifecycle caller can then install PF with the actual selected
+  port rather than predicting it;
+- `PreparedVmHttpGitSession::spawn()` starts the listener only after the caller
+  has finished the fail-closed lifecycle steps that depend on the selected
+  port. The returned `RunningVmHttpGitSession` owns the shutdown channel and
+  task handle, and `shutdown().await` drains the VM HTTP runner. Dropping the
+  running owner sends shutdown and aborts the task as a last-resort cleanup;
+- this still does not add a Unix-socket API to create agent VM sessions. The
+  next slice should add that protocol surface so `writd` can allocate the
+  session ID/subnet, prepare the VM HTTP runtime, build the managed lifecycle
+  plan with the returned broker port, start the VM, and persist enough state to
+  shut the HTTP task down with the VM.
+
 ## Tests and proof spikes
 
 First pure slice implemented in `src/core/agent_vm.rs`:
