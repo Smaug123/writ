@@ -43,6 +43,7 @@ const GUEST_IPV6_PROBE_DELAY: std::time::Duration = std::time::Duration::from_mi
 const RESOURCE_ABSENCE_ATTEMPTS: usize = 30;
 const RESOURCE_ABSENCE_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
 const GUEST_ENV_FILE_DISPLAY: &str = "<runtime-env-file>";
+const AGENT_VM_TMPFS_MOUNTS: &[&str] = &["/tmp", "/run", "/var/tmp", "/root"];
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AgentVmSessionPlan {
@@ -791,6 +792,9 @@ impl AgentVmSessionPlan {
             format!("{}m", self.resources.memory_mib),
             "-d".to_string(),
         ];
+        for mount in AGENT_VM_TMPFS_MOUNTS {
+            args.extend(["--tmpfs".to_string(), (*mount).to_string()]);
+        }
         if let Some(env_file) = env_file {
             args.extend(["--env-file".to_string(), env_file.display().to_string()]);
         }
@@ -2983,6 +2987,7 @@ mod tests {
         assert!(
             vm_args.contains(&"writ-agent-vm-51b8fd0f-6c10-454c-b0e6-7df1d60e2e6d".to_string())
         );
+        assert_tmpfs_mounts_present(&vm_args);
     }
 
     #[test]
@@ -2996,6 +3001,7 @@ mod tests {
 
         let start_vm_args = invocations[3].args_lossy();
         assert_eq!(&start_vm_args[0..2], ["run", "--name"]);
+        assert_tmpfs_mounts_present(&start_vm_args);
         assert!(start_vm_args.contains(&"sh".to_string()));
         assert!(start_vm_args.contains(&"-c".to_string()));
         assert!(
@@ -3357,6 +3363,14 @@ mod tests {
         assert!(display_shell.contains("--env-file"));
         assert!(display_shell.contains(GUEST_ENV_FILE_DISPLAY));
         assert!(!display_shell.contains("writ-vm-secret"));
+    }
+
+    fn assert_tmpfs_mounts_present(args: &[String]) {
+        let tmpfs_mounts = args
+            .windows(2)
+            .filter_map(|window| (window[0] == "--tmpfs").then_some(window[1].as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(tmpfs_mounts, AGENT_VM_TMPFS_MOUNTS);
     }
 
     #[test]

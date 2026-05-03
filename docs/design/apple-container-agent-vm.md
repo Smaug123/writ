@@ -766,7 +766,11 @@ First Darwin-hosted OCI assembly slice implemented in `flake.nix` and
   Linux Nix store paths; the current expectation is that Nix obtains them from
   substitutes or an available target builder. The remaining reduction slice is
   to shrink the proof image and/or split a smaller production image from
-  proof-only tools;
+  proof-only tools. The image also carries conventional empty runtime mount
+  points such as `/tmp`, `/run`, `/var/tmp`, and `/root`; the lifecycle runner
+  mounts those paths as tmpfs for each VM session so guest temp files, release
+  markers, and root-user tool state are per-session runtime state, not static
+  image content;
 - the proof harness now builds the current-host package attr
   `.#agent-vm-guest-image-${WRIT_PROVE_GUEST_SYSTEM}` and loads the resulting
   OCI archive directly with `container image load --input`.
@@ -862,7 +866,8 @@ Manual lifecycle runner status:
 
 - `writ-agent-vm-runner start --dry-run` emits the intended ordering:
   `container network create`, `container network inspect`, helper `install`,
-  then `container run` with the session network and no mount/publish flags;
+  then `container run` with the session network, tmpfs mounts for `/tmp`,
+  `/run`, `/var/tmp`, and `/root`, and no host bind/publish flags;
 - with `--ipv6-mode ipv4-only-no-guest-ipv6`, dry-run start additionally emits
   the guarded VM start, the guest IPv6 probe, and the release command in that
   order. The authority-bearing guest command is embedded behind the guard and

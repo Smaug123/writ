@@ -97,6 +97,12 @@
         let
           guestPkgs = mkPkgs guestSystem;
           writVm = mkCrossWritVm buildPkgs guestSystem;
+          guestRuntimeDirs = buildPkgs.runCommand "writ-agent-vm-guest-runtime-dirs" {} ''
+            install -d -m 1777 $out/tmp
+            install -d -m 1777 $out/var/tmp
+            install -d -m 0755 $out/run
+            install -d -m 0700 $out/root
+          '';
           guestRoot = buildPkgs.buildEnv {
             name = "writ-agent-vm-guest-root";
             paths = [
@@ -121,8 +127,25 @@
           image = nix2containerPkgs.nix2container.buildImage {
             name = "writ-agent-vm-guest";
             tag = "latest";
-            copyToRoot = [ guestRoot ];
+            copyToRoot = [ guestRuntimeDirs guestRoot ];
             arch = guestArchitecture guestSystem;
+            perms = [
+              {
+                path = guestRuntimeDirs;
+                regex = ".*/tmp$|.*/var/tmp$";
+                mode = "1777";
+              }
+              {
+                path = guestRuntimeDirs;
+                regex = ".*/var$|.*/run$";
+                mode = "0755";
+              }
+              {
+                path = guestRuntimeDirs;
+                regex = ".*/root$";
+                mode = "0700";
+              }
+            ];
             config = {
               Cmd = [ "/bin/sh" ];
               Env = [
