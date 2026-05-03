@@ -11,21 +11,27 @@ Requires:
   - macOS with Apple container installed and `container system start` already run
   - root privileges through sudo for pfctl
   - a top-level PF rule in /etc/pf.conf: anchor "writ/session/*"
-  - python3, curl, cargo or nix, and an Alpine-compatible image with sh, ip,
-    wget, and nslookup
+  - python3, curl, git, nix, cargo or the Nix dev shell, and either a Nix
+    builder for the selected Linux guest system or a preloaded guest image
+    containing sh, ip, git, writ-vm, wget, and nslookup
 
 What it proves:
   - writd starts an agent VM through the Unix-socket `start_agent_vm` protocol
   - the VM receives WRIT_BROKER_URL and WRIT_BROKER_TOKEN through the daemon
-  - the VM can call GET /v1/session on the daemon-owned VM HTTP listener
-  - the VM can call POST /v1/git/clone and receive a host-produced bundle
+  - the VM can call `writ-vm session` on the daemon-owned VM HTTP listener
+  - the VM can call `writ-vm git clone` and check out a host-produced bundle
   - `stop_agent_vm` removes the VM, network, PF anchor/states, and state record
 
 The GitHub API and host git binary are local fakes. This keeps the proof focused
 on Apple Container/PF/daemon wiring rather than real GitHub availability.
 
 Environment overrides:
-  WRIT_PROVE_IMAGE       OCI image to run, default alpine:latest
+  WRIT_PROVE_IMAGE       OCI image to run, default writ-agent-vm-guest:latest
+  WRIT_PROVE_BUILD_GUEST_IMAGE  build/load the Nix guest image, default auto
+                                (auto builds unless WRIT_PROVE_IMAGE is set)
+                                false/no/off/0 use a preloaded image
+  WRIT_PROVE_GUEST_SYSTEM  Nix guest image package system, default host-derived
+                           aarch64-linux or x86_64-linux
   WRIT_PROVE_IPV4_POOL   broker-owned IPv4 pool, default 192.168.0.0/16
   WRIT_PROVE_IPV6_POOL   broker-owned IPv6 pool, default fd83:b6f2:e57::/48
   WRIT_PROVE_SUBNET_INDEX  session subnet index, default 252
@@ -52,7 +58,13 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/writ-daemon-proof.XXXXXX")"
 chmod 700 "$TMP_DIR"
 
-IMAGE="${WRIT_PROVE_IMAGE:-alpine:latest}"
+if [[ -n "${WRIT_PROVE_IMAGE:-}" ]]; then
+  IMAGE="$WRIT_PROVE_IMAGE"
+  BUILD_GUEST_IMAGE="${WRIT_PROVE_BUILD_GUEST_IMAGE:-0}"
+else
+  IMAGE="writ-agent-vm-guest:latest"
+  BUILD_GUEST_IMAGE="${WRIT_PROVE_BUILD_GUEST_IMAGE:-auto}"
+fi
 IPV4_POOL="${WRIT_PROVE_IPV4_POOL:-192.168.0.0/16}"
 IPV6_POOL="${WRIT_PROVE_IPV6_POOL:-fd83:b6f2:e57::/48}"
 SUBNET_INDEX="${WRIT_PROVE_SUBNET_INDEX:-252}"
@@ -79,6 +91,7 @@ WRITD_LOG="${TMP_DIR}/writd.log"
 START_OUTPUT="${TMP_DIR}/agent-vm-start.txt"
 
 CARGO_CMD=()
+REAL_GIT=""
 WRIT_BIN=""
 WRITD_BIN=""
 HELPER=""
@@ -192,6 +205,53 @@ choose_cargo() {
   die "missing required command: cargo, or nix for the repo development shell"
 }
 
+choose_real_git() {
+  REAL_GIT="$(command -v git || true)"
+  [[ -n "$REAL_GIT" ]] || die "missing required command: git"
+}
+
+default_guest_system() {
+  case "$(uname -m)" in
+    arm64|aarch64)
+      printf 'aarch64-linux\n'
+      ;;
+    x86_64|amd64)
+      printf 'x86_64-linux\n'
+      ;;
+    *)
+      die "unsupported host architecture for default guest image: $(uname -m)"
+      ;;
+  esac
+}
+
+load_guest_image() {
+  case "$BUILD_GUEST_IMAGE" in
+    0|false|FALSE|False|no|NO|No|off|OFF|Off)
+      log "using preloaded guest image ${IMAGE}"
+      return
+      ;;
+    1|true|TRUE|True|yes|YES|Yes|on|ON|On|auto|AUTO|Auto)
+      ;;
+    *)
+      die "WRIT_PROVE_BUILD_GUEST_IMAGE must be auto, true/false, yes/no, on/off, or 1/0"
+      ;;
+  esac
+
+  require_cmd nix
+  local guest_system
+  guest_system="${WRIT_PROVE_GUEST_SYSTEM:-$(default_guest_system)}"
+  local image_attr="packages.${guest_system}.agent-vm-guest-image"
+
+  log "building guest OCI image ${IMAGE} from .#${image_attr}"
+  local image_archive
+  image_archive="$(cd "$ROOT_DIR" && nix build --no-link --print-out-paths ".#${image_attr}")" || \
+    die "failed to build guest OCI image .#${image_attr}"
+
+  log "loading guest OCI image ${IMAGE} into Apple container"
+  container image load --input "$image_archive" >/dev/null || \
+    die "failed to load guest OCI image archive ${image_archive}"
+}
+
 pick_port() {
   python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()'
 }
@@ -272,10 +332,14 @@ PY
 }
 
 write_fake_git() {
+  local escaped_real_git
+  escaped_real_git="$(printf "%s" "$REAL_GIT" | sed "s/'/'\\\\''/g")"
   cat >"$FAKE_GIT" <<EOF
 #!/bin/sh
 set -eu
+REAL_GIT='${escaped_real_git}'
 printf '%s\n' "\$*" >> '$(printf "%s" "$FAKE_GIT_ARGS_LOG" | sed "s/'/'\\\\''/g")'
+printf 'token_env=%s\n' "\${WRIT_GIT_TOKEN:+set}" >> '$(printf "%s" "$FAKE_GIT_ARGS_LOG" | sed "s/'/'\\\\''/g")'
 
 case " \$* " in
   *" clone "*)
@@ -287,10 +351,28 @@ case " \$* " in
     for arg in "\$@"; do
       mirror_dir="\$arg"
     done
-    /bin/mkdir -p "\$mirror_dir"
+    source_dir="\${mirror_dir}.source"
+    /bin/rm -rf "\$mirror_dir" "\$source_dir"
+    /bin/mkdir -p "\$source_dir"
+    "\$REAL_GIT" -C "\$source_dir" init >/dev/null
+    "\$REAL_GIT" -C "\$source_dir" config user.email proof@example.com
+    "\$REAL_GIT" -C "\$source_dir" config user.name 'writ proof'
+    "\$REAL_GIT" -C "\$source_dir" config commit.gpgsign false
+    printf '%s\n' "$PROOF_BUNDLE_MARKER" > "\$source_dir/README.md"
+    "\$REAL_GIT" -C "\$source_dir" add README.md
+    GIT_AUTHOR_DATE='2001-01-01T00:00:00Z' \
+      GIT_COMMITTER_DATE='2001-01-01T00:00:00Z' \
+    "\$REAL_GIT" -C "\$source_dir" commit -m 'proof bundle' >/dev/null
+    "\$REAL_GIT" -C "\$source_dir" branch -M main
+    "\$REAL_GIT" clone --mirror "\$source_dir" "\$mirror_dir" >/dev/null
+    /bin/rm -rf "\$source_dir"
     exit 0
     ;;
   *" bundle create "*)
+    if [ "\${WRIT_GIT_TOKEN+x}" = x ]; then
+      printf 'unexpected git token env during bundle creation\n' >&2
+      exit 26
+    fi
     bundle_path=""
     previous=""
     for arg in "\$@"; do
@@ -304,8 +386,7 @@ case " \$* " in
       printf 'missing bundle path\n' >&2
       exit 24
     fi
-    printf '%s\n' "$PROOF_BUNDLE_MARKER" > "\$bundle_path"
-    exit 0
+    exec "\$REAL_GIT" "\$@"
     ;;
   *)
     printf 'unexpected fake git invocation: %s\n' "\$*" >&2
@@ -507,6 +588,9 @@ assert_fake_git_used_cleanly() {
   if ! grep -Fq "bundle create --" "$FAKE_GIT_ARGS_LOG"; then
     die "fake git log does not show bundle creation"
   fi
+  if ! grep -Fxq "token_env=set" "$FAKE_GIT_ARGS_LOG"; then
+    die "fake git log does not show clone received the host-side token env"
+  fi
   if grep -Fq "$PROOF_TOKEN" "$FAKE_GIT_ARGS_LOG"; then
     die "fake git argv log leaked the proof token"
   fi
@@ -565,9 +649,11 @@ assert_state_removed() {
 
 require_cmd container
 require_cmd curl
+require_cmd git
 require_cmd python3
 require_cmd sudo
 choose_cargo
+choose_real_git
 
 IPV4_CIDR="$(cidr_alloc_subnet "$IPV4_POOL" 24 "$SUBNET_INDEX")"
 
@@ -583,6 +669,8 @@ if ! sudo pfctl -sr 2>/dev/null | grep -q 'anchor "writ/session/\*"'; then
   fi
   die 'missing top-level PF anchor; add `anchor "writ/session/*"` to /etc/pf.conf and reload PF'
 fi
+
+load_guest_image
 
 log "building daemon, CLI, and PF helper"
 (
@@ -631,7 +719,7 @@ PF_ANCHOR="writ/session/${SESSION_ID}"
 
 wait_for_released_guest_command
 expect_guest_success "guest has required probe tools" \
-  'command -v ip >/dev/null && command -v wget >/dev/null && command -v nslookup >/dev/null'
+  'command -v sh >/dev/null && command -v ip >/dev/null && command -v git >/dev/null && command -v writ-vm >/dev/null && command -v wget >/dev/null && command -v nslookup >/dev/null'
 assert_guest_has_no_routable_ipv6
 
 GUEST_IPV4="$(guest_ipv4_addr)"
@@ -640,15 +728,15 @@ log "guest IPv4 address is ${GUEST_IPV4}"
 
 expect_guest_success "guest sees daemon-injected broker URL and token" \
   'test -n "$WRIT_BROKER_URL" && test -n "$WRIT_BROKER_TOKEN"'
-expect_guest_success "VM can call daemon VM HTTP session endpoint" \
-  'wget -q -O - --header "Authorization: Bearer $WRIT_BROKER_TOKEN" "${WRIT_BROKER_URL}v1/session" | grep -q "\"api\":\"writ-vm-http\""'
-expect_guest_success "VM can request a host-produced Git bundle through daemon VM HTTP" \
-  "wget -q -O /tmp/writ-agent-vm-daemon.bundle \
-    --header \"Authorization: Bearer \${WRIT_BROKER_TOKEN}\" \
-    --header 'Content-Type: application/json' \
-    --post-data '{\"repo\":\"${PROOF_REPO_FULL}\"}' \
-    \"\${WRIT_BROKER_URL}v1/git/clone\" && \
-    grep -Fxq '${PROOF_BUNDLE_MARKER}' /tmp/writ-agent-vm-daemon.bundle"
+expect_guest_success "VM can call daemon VM HTTP session endpoint through writ-vm" \
+  "writ-vm session > /tmp/writ-agent-vm-session.json && \
+    grep -q '\"api\": \"writ-vm-http\"' /tmp/writ-agent-vm-session.json && \
+    grep -q '\"session_id\": \"${SESSION_ID}\"' /tmp/writ-agent-vm-session.json"
+expect_guest_success "VM can clone a host-produced Git bundle through writ-vm" \
+  "rm -rf /tmp/writ-agent-vm-checkout && \
+    writ-vm git clone '${PROOF_REPO_FULL}' /tmp/writ-agent-vm-checkout && \
+    git -C /tmp/writ-agent-vm-checkout rev-parse --is-inside-work-tree | grep -Fxq true && \
+    grep -Fxq '${PROOF_BUNDLE_MARKER}' /tmp/writ-agent-vm-checkout/README.md"
 assert_fake_git_used_cleanly
 
 log "stopping session through daemon"
@@ -661,4 +749,4 @@ assert_pf_anchor_empty
 assert_no_pf_state_for_guest
 assert_state_removed
 
-log "daemon lifecycle proof succeeded for ${IPV4_CIDR}; VM HTTP session and Git clone route worked, and daemon stop cleanup was verified"
+log "daemon lifecycle proof succeeded for ${IPV4_CIDR}; writ-vm session and Git clone worked inside the VM, and daemon stop cleanup was verified"

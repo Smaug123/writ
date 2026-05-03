@@ -686,6 +686,32 @@ First VM-side client slice implemented in `src/vm_client.rs` and
   not durable fetch authority; later fetch/push should be brokered operations
   rather than reuse of the one-shot bundle path.
 
+First guest image/proof integration slice implemented in `flake.nix` and
+`scripts/prove-agent-vm-daemon.sh`:
+
+- the flake now exposes Nix-built Linux OCI archives for the daemon-managed
+  guest image: `agent-vm-guest-image-aarch64-linux`,
+  `agent-vm-guest-image-x86_64-linux`, and a host-architecture-derived
+  `agent-vm-guest-image` alias. The archive is tagged
+  `writ-agent-vm-guest:latest` and contains `writ-vm`, guest-local Git, CA
+  roots, `sh`, `ip`, `wget`, `nslookup`, and the small GNU/POSIX tools used by
+  the proof harness. It deliberately does not ship host-side binaries such as
+  `writd`, the lifecycle runner, or the PF helper;
+- the daemon proof harness defaults to building the matching Nix guest image,
+  loading it with `container image load --input`, and starting the managed VM
+  from that image. This is currently a Linux Nix build requested from macOS, not
+  a Darwin-hosted cross build, so macOS requires a Nix builder for the selected
+  Linux guest system. Supplying `WRIT_PROVE_IMAGE` keeps the old "use an already
+  available image" path, and `WRIT_PROVE_BUILD_GUEST_IMAGE=0` uses a preloaded
+  `writ-agent-vm-guest:latest`;
+- the harness no longer treats raw `wget` against VM HTTP as the end-to-end
+  guest proof. Inside the VM it now runs `writ-vm session` and
+  `writ-vm git clone proof-owner/proof-repo /tmp/writ-agent-vm-checkout`,
+  then verifies the checkout content with guest-local Git. The fake host Git
+  still avoids real GitHub network access, but now materializes a real Git
+  repository and bundle rather than returning marker bytes, so the guest
+  client proves both the broker HTTP path and bundle consumption by Git.
+
 ## Tests and proof spikes
 
 First pure slice implemented in `src/core/agent_vm.rs`:
@@ -851,7 +877,8 @@ guest-IPv4 PF states.
 
 Manual daemon proof harness added in `scripts/prove-agent-vm-daemon.sh`:
 
-- builds `writ`, `writd`, and `writ-agent-vm-pf-helper`;
+- builds `writ`, `writd`, `writ-agent-vm-pf-helper`, and by default the Nix
+  guest OCI image containing `writ-vm`;
 - starts a local fake GitHub API and configures `writd` to use it for
   installation-token minting. The harness also supplies a fake host `git`
   binary that creates a deterministic bundle, so the proof does not depend on
@@ -863,10 +890,11 @@ Manual daemon proof harness added in `scripts/prove-agent-vm-daemon.sh`:
 - asserts the released guest command is running, the guest still has no
   routable IPv6 posture, and the daemon-injected `WRIT_BROKER_URL` /
   `WRIT_BROKER_TOKEN` environment variables are present;
-- from inside the VM, calls `GET /v1/session` and `POST /v1/git/clone` through
+- from inside the VM, runs `writ-vm session` and `writ-vm git clone` through
   the daemon-owned VM HTTP listener. The clone route must mint through the fake
-  GitHub API, run the fake host `git` without leaking the token in argv, and
-  return the deterministic bundle bytes to the VM;
+  GitHub API, run the fake host `git` without leaking the token in argv, return
+  a valid deterministic Git bundle to the VM client, and let guest-local Git
+  create a checkout from that bundle;
 - stops the session through `writ agent-vm stop <session-id>` and asserts the
   VM, network, PF anchor, observed guest-IPv4 PF states, and managed state
   record are gone.
