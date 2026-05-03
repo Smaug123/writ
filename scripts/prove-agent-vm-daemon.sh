@@ -11,8 +11,8 @@ Requires:
   - macOS with Apple container installed and `container system start` already run
   - root privileges through sudo for pfctl
   - a top-level PF rule in /etc/pf.conf: anchor "writ/session/*"
-  - python3, curl, git, nix, cargo or the Nix dev shell, and either a Nix
-    builder for the selected Linux guest system or a preloaded guest image
+  - python3, curl, git, nix, cargo or the Nix dev shell, and either Nix
+    substitutes/builders for the guest image closure or a preloaded guest image
     containing sh, ip, git, writ-vm, wget, and nslookup
 
 What it proves:
@@ -30,7 +30,7 @@ Environment overrides:
   WRIT_PROVE_BUILD_GUEST_IMAGE  build/load the Nix guest image, default auto
                                 (auto builds unless WRIT_PROVE_IMAGE is set)
                                 false/no/off/0 use a preloaded image
-  WRIT_PROVE_GUEST_SYSTEM  Nix guest image package system, default host-derived
+  WRIT_PROVE_GUEST_SYSTEM  Nix guest image target system, default host-derived
                            aarch64-linux or x86_64-linux
   WRIT_PROVE_IPV4_POOL   broker-owned IPv4 pool, default 192.168.0.0/16
   WRIT_PROVE_IPV6_POOL   broker-owned IPv6 pool, default fd83:b6f2:e57::/48
@@ -240,7 +240,7 @@ load_guest_image() {
   require_cmd nix
   local guest_system
   guest_system="${WRIT_PROVE_GUEST_SYSTEM:-$(default_guest_system)}"
-  local image_attr="packages.${guest_system}.agent-vm-guest-image"
+  local image_attr="agent-vm-guest-image-${guest_system}"
 
   log "building guest OCI image ${IMAGE} from .#${image_attr}"
   local image_archive

@@ -2,9 +2,11 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable-small";
     flake-utils.url = "github:numtide/flake-utils";
+    nix2container.url = "github:nlewo/nix2container";
+    nix2container.inputs.nixpkgs.follows = "nixpkgs";
   };
 
-  outputs = { nixpkgs, flake-utils, ... }:
+  outputs = { nixpkgs, flake-utils, nix2container, ... }:
     let
       inherit (nixpkgs) lib;
 
@@ -91,44 +93,36 @@
           };
         });
 
-      mkAgentVmGuestImage = guestSystem:
+      mkAgentVmGuestImage = buildPkgs: nix2containerPkgs: guestSystem:
         let
-          pkgs = mkPkgs guestSystem;
-          writVm = mkWrit pkgs {
-            pname = "writ-vm";
-            cargoBuildFeatures = [ "vm-client" ];
-            cargoBuildFlags = [ "--bin" "writ-vm" ];
-            cargoBuildNoDefaultFeatures = true;
-            doCheck = false;
-          };
-          guestRoot = pkgs.buildEnv {
+          guestPkgs = mkPkgs guestSystem;
+          writVm = mkCrossWritVm buildPkgs guestSystem;
+          guestRoot = buildPkgs.buildEnv {
             name = "writ-agent-vm-guest-root";
             paths = [
               writVm
-              pkgs.bash
-              pkgs.bind.dnsutils
-              pkgs.cacert
-              pkgs.coreutils
-              pkgs.findutils
-              pkgs.gawk
-              pkgs.gitMinimal
-              pkgs.gnugrep
-              pkgs.gnused
-              pkgs.iproute2
-              pkgs.wget
+              guestPkgs.bash
+              guestPkgs.bind.dnsutils
+              guestPkgs.cacert
+              guestPkgs.coreutils
+              guestPkgs.findutils
+              guestPkgs.gawk
+              guestPkgs.gitMinimal
+              guestPkgs.gnugrep
+              guestPkgs.gnused
+              guestPkgs.iproute2
+              guestPkgs.wget
             ];
             pathsToLink = [
               "/bin"
               "/etc"
             ];
           };
-          dockerArchive = pkgs.dockerTools.buildLayeredImage {
+          image = nix2containerPkgs.nix2container.buildImage {
             name = "writ-agent-vm-guest";
             tag = "latest";
-            # Apple Container loads this locally, so avoid spending build time compressing it.
-            compressor = "none";
-            contents = [ guestRoot ];
-            architecture = guestArchitecture guestSystem;
+            copyToRoot = [ guestRoot ];
+            arch = guestArchitecture guestSystem;
             config = {
               Cmd = [ "/bin/sh" ];
               Env = [
@@ -140,22 +134,21 @@
             };
           };
         in
-        pkgs.runCommand "writ-agent-vm-guest-${guestSystem}.oci.tar"
+        buildPkgs.runCommand "writ-agent-vm-guest-${guestSystem}.oci.tar"
           {
-            nativeBuildInputs = [ pkgs.skopeo ];
             passthru.imageName = "writ-agent-vm-guest";
             passthru.imageTag = "latest";
-            meta.description = "OCI archive for daemon-managed writ agent VMs";
+            passthru.image = image;
+            meta.description = "Darwin-buildable OCI archive for daemon-managed writ agent VMs";
           }
           ''
-            skopeo --insecure-policy copy \
-              docker-archive:${dockerArchive} \
-              oci-archive:$out:writ-agent-vm-guest:latest
+            ${image.copyTo}/bin/copy-to oci-archive:$out:writ-agent-vm-guest:latest
           '';
     in
     flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = mkPkgs system;
+        nix2containerPkgs = nix2container.packages.${system};
 
         writ = mkWrit pkgs {};
 
@@ -167,7 +160,7 @@
         guestImagePackages = lib.listToAttrs (map
           (guestSystem: {
             name = "agent-vm-guest-image-${guestSystem}";
-            value = mkAgentVmGuestImage guestSystem;
+            value = mkAgentVmGuestImage pkgs nix2containerPkgs guestSystem;
           })
           guestSystems);
         crossGuestBinaryPackages = lib.listToAttrs (map
@@ -180,7 +173,7 @@
       {
         packages = guestImagePackages // crossGuestBinaryPackages // {
           default = writ;
-          agent-vm-guest-image = mkAgentVmGuestImage defaultGuestSystem;
+          agent-vm-guest-image = mkAgentVmGuestImage pkgs nix2containerPkgs defaultGuestSystem;
           agent-vm-writ-vm-musl = mkCrossWritVm pkgs defaultGuestSystem;
         };
 

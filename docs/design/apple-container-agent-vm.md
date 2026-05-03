@@ -708,9 +708,7 @@ First guest image/proof integration slice implemented in `flake.nix` and
   `writd`, the lifecycle runner, or the PF helper;
 - the daemon proof harness defaults to building the matching Nix guest image,
   loading it with `container image load --input`, and starting the managed VM
-  from that image. This is currently a Linux Nix build requested from macOS, not
-  a Darwin-hosted cross build, so macOS requires a Nix builder for the selected
-  Linux guest system. Supplying `WRIT_PROVE_IMAGE` keeps the old "use an already
+  from that image. Supplying `WRIT_PROVE_IMAGE` keeps the old "use an already
   available image" path, and `WRIT_PROVE_BUILD_GUEST_IMAGE=0` uses a preloaded
   `writ-agent-vm-guest:latest`;
 - the harness no longer treats raw `wget` against VM HTTP as the end-to-end
@@ -750,9 +748,28 @@ First Darwin-hosted cross-build slice implemented in `flake.nix`:
   packages/closures, not necessarily single static files; the aarch64 output
   currently uses the musl dynamic loader from its Nix closure;
 - this proves the Rust guest client can be cross-compiled from macOS without a
-  Linux builder. It deliberately does not yet replace the guest OCI image
-  assembly, which still pulls Linux userland packages (`git`, `ip`, `wget`,
-  `nslookup`, CA roots, and shell/tools) from Linux package sets.
+  Linux builder. The OCI assembly slice below consumes this cross-built client;
+  the remaining target-specific inputs are Linux userland packages (`git`,
+  `ip`, `wget`, `nslookup`, CA roots, and shell/tools) from Linux package sets.
+
+First Darwin-hosted OCI assembly slice implemented in `flake.nix` and
+`scripts/prove-agent-vm-daemon.sh`:
+
+- the flake now uses `nix2container` to assemble the `agent-vm-guest-image-*`
+  OCI archives as packages for the current build host. On macOS,
+  `nix build .#agent-vm-guest-image-aarch64-linux` therefore runs the archive
+  assembly on Darwin instead of selecting `packages.aarch64-linux` and requiring
+  a Linux builder for the final image step;
+- the image root is a host-built symlink farm containing the cross-compiled
+  `writ-vm` guest package plus target Linux userland paths. Target packages
+  such as Git, `iproute2`, `wget`, `nslookup`, shell, and CA roots are still
+  Linux Nix store paths; the current expectation is that Nix obtains them from
+  substitutes or an available target builder. The remaining reduction slice is
+  to shrink the proof image and/or split a smaller production image from
+  proof-only tools;
+- the proof harness now builds the current-host package attr
+  `.#agent-vm-guest-image-${WRIT_PROVE_GUEST_SYSTEM}` and loads the resulting
+  OCI archive directly with `container image load --input`.
 
 ## Tests and proof spikes
 
