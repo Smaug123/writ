@@ -108,6 +108,21 @@
             if includeProofTools
             then "Darwin-buildable OCI archive for agent VM proof harnesses"
             else "Darwin-buildable OCI archive for daemon-managed writ agent VMs";
+          guestRequiredBins = [
+            "git"
+            "ip"
+            "nix"
+            "sh"
+            "writ-vm"
+          ];
+          guestRequiredBinCheck = lib.concatMapStringsSep "\n"
+            (name: ''
+              if [ ! -x "${guestRoot}/bin/${name}" ]; then
+                echo "guest image is missing required /bin/${name}" >&2
+                exit 1
+              fi
+            '')
+            guestRequiredBins;
           productionForbiddenBins = [
             "awk"
             "dig"
@@ -158,6 +173,7 @@
               guestPkgs.coreutils
               guestPkgs.gitMinimal
               guestPkgs.iproute2
+              guestPkgs.nix
             ] ++ lib.optionals includeProofTools proofTools;
             pathsToLink = [
               "/bin"
@@ -192,6 +208,7 @@
                 "PATH=/bin"
                 "SSL_CERT_FILE=/etc/ssl/certs/ca-bundle.crt"
                 "GIT_SSL_CAINFO=/etc/ssl/certs/ca-bundle.crt"
+                "NIX_SSL_CERT_FILE=/etc/ssl/certs/ca-bundle.crt"
               ];
               WorkingDir = "/";
             };
@@ -206,6 +223,7 @@
             meta.description = imageDescription;
           }
           ''
+            ${guestRequiredBinCheck}
             ${lib.optionalString includeProofTools proofToolCheck}
             ${lib.optionalString (!includeProofTools) productionForbiddenBinCheck}
             ${image.copyTo}/bin/copy-to oci-archive:$out:${imageName}:latest

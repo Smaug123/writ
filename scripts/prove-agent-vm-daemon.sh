@@ -13,7 +13,7 @@ Requires:
   - a top-level PF rule in /etc/pf.conf: anchor "writ/session/*"
   - python3, curl, git, nix, cargo or the Nix dev shell, and either Nix
     substitutes/builders for the guest image closure or a preloaded image
-    containing sh, ip, git, and writ-vm
+    containing sh, ip, git, nix, and writ-vm
 
 What it proves:
   - writd starts an agent VM through the Unix-socket `start_agent_vm` protocol
@@ -724,7 +724,9 @@ PF_ANCHOR="writ/session/${SESSION_ID}"
 
 wait_for_released_guest_command
 expect_guest_success "guest has required probe tools" \
-  'command -v sh >/dev/null && command -v ip >/dev/null && command -v git >/dev/null && command -v writ-vm >/dev/null'
+  'command -v sh >/dev/null && command -v ip >/dev/null && command -v git >/dev/null && command -v nix >/dev/null && command -v writ-vm >/dev/null'
+expect_guest_success "guest can start Nix CLI without network" \
+  'nix_version="$(nix --version)" && test -n "$nix_version"'
 assert_guest_has_no_routable_ipv6
 
 GUEST_IPV4="$(guest_ipv4_addr)"

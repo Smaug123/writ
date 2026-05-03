@@ -702,10 +702,10 @@ First guest image/proof integration slice implemented in `flake.nix` and
   guest image: `agent-vm-guest-image-aarch64-linux`,
   `agent-vm-guest-image-x86_64-linux`, and a host-architecture-derived
   `agent-vm-guest-image` alias. The archive is tagged
-  `writ-agent-vm-guest:latest` and contains `writ-vm`, guest-local Git, CA
-  roots, `sh`, `ip`, and the core utilities needed by the prelaunch/release
-  scripts. It deliberately does not ship host-side binaries such as `writd`,
-  the lifecycle runner, or the PF helper;
+  `writ-agent-vm-guest:latest` and contains `writ-vm`, guest-local Git, Nix,
+  CA roots, `sh`, `ip`, and the core utilities needed by the
+  prelaunch/release scripts. It deliberately does not ship host-side binaries
+  such as `writd`, the lifecycle runner, or the PF helper;
 - the daemon proof harness defaults to building the matching Nix production image,
   loading it with `container image load --input`, and starting the managed VM
   from that image. Supplying `WRIT_PROVE_IMAGE` keeps the old "use an already
@@ -787,6 +787,21 @@ First guest image reduction slice implemented in `flake.nix` and
 - the daemon proof harness now avoids proof-only guest tools in its assertions,
   so it defaults to the production `writ-agent-vm-guest:latest` image.
   Supplying `WRIT_PROVE_IMAGE` still opts into an externally-provided image.
+
+First guest Nix bootstrap slice implemented in `flake.nix` and
+`scripts/prove-agent-vm-daemon.sh`:
+
+- the production guest image now includes the Nix CLI and sets
+  `NIX_SSL_CERT_FILE` to the image CA bundle alongside Git's CA configuration;
+- the image archive build fails if the required production runtime commands
+  `git`, `ip`, `nix`, `sh`, or `writ-vm` are absent. The existing production
+  forbidden-bin check still rejects PATH-exposed proof-only tools under `/bin`
+  in the production image;
+- the daemon proof harness now asserts `command -v nix` and `nix --version`
+  inside the managed VM. This is deliberately a no-network bootstrap smoke:
+  it proves the Nix CLI can start in the isolated guest image, not that Nix can
+  fetch substituters or build derivations through broker policy. Brokered
+  substituter access remains a later slice.
 
 ## Tests and proof spikes
 
