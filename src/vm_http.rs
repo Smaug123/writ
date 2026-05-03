@@ -14,14 +14,20 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 use tokio::task::JoinSet;
 
-use crate::core::{BrokerPort, BrokerPortRange, Ipv4Cidr, SessionId};
+use crate::bearer::is_bearer_token_byte;
+use crate::core::{
+    BrokerPort, BrokerPortRange, CapabilityRequest, GitHubAccess, GitHubRequest, Ipv4Cidr,
+    SessionId,
+};
 use crate::secret::SecretStore;
 use crate::server::{BrokerState, CapabilityOutcome, request_capability};
-use crate::vm_client::is_bearer_token_byte;
 use crate::vm_git::{
-    GIT_BUNDLE_CONTENT_TYPE, GitCloneBundlePlan, GitCloneBundlePlanError, GitCloneBundleRunError,
-    GitCredentialBoundary, GitSecretValue, GitSecretValueError, VM_GIT_CLONE_PATH,
-    VmGitCloneErrorCode, VmGitCloneErrorResponse, VmGitCloneRequest, run_git_clone_bundle,
+    GIT_BUNDLE_CONTENT_TYPE, VM_GIT_CLONE_PATH, VmGitCloneErrorCode, VmGitCloneErrorResponse,
+    VmGitCloneRequest,
+};
+use crate::vm_git_bundle::{
+    GitCloneBundlePlan, GitCloneBundlePlanError, GitCloneBundleRunError, GitCredentialBoundary,
+    GitSecretValue, GitSecretValueError, run_git_clone_bundle,
 };
 
 const MAX_VM_HTTP_HEAD_BYTES: usize = 16 * 1024;
@@ -840,7 +846,7 @@ async fn handle_git_clone_request<S: SecretStore + Send + Sync>(
         }
     };
 
-    let capability = request.authorization_request();
+    let capability = git_clone_authorization_request(&request);
     let outcome = request_capability(session.session_id, capability, &service.broker_state).await;
     let token = match git_clone_token_from_capability_outcome(outcome) {
         Ok(token) => token,
@@ -879,6 +885,13 @@ async fn handle_git_clone_request<S: SecretStore + Send + Sync>(
             message,
         ),
     }
+}
+
+fn git_clone_authorization_request(request: &VmGitCloneRequest) -> CapabilityRequest {
+    CapabilityRequest::GitHub(GitHubRequest::Contents {
+        access: GitHubAccess::Read,
+        repo: request.repo().as_repo_ref().clone(),
+    })
 }
 
 fn git_clone_token_from_capability_outcome(
@@ -1255,7 +1268,8 @@ mod tests {
     use crate::github::{GitHubAppConfig, GitHubMinter};
     use crate::policy::PolicyConfig;
     use crate::secret::{SecretError, SecretKey};
-    use crate::vm_git::{GitCloneRepo, GitSecretEnvVar};
+    use crate::vm_git::GitCloneRepo;
+    use crate::vm_git_bundle::GitSecretEnvVar;
 
     #[derive(Default)]
     struct InMemStore(Mutex<HashMap<String, String>>);
@@ -1525,6 +1539,13 @@ esac
             VmHttpBearerToken::new("has\nnewline"),
             Err(VmHttpConfigError::InvalidBearerToken)
         );
+        for token in ["has+plus", "has/slash", "has=equals", "has:colon", "has@at"] {
+            assert_eq!(
+                VmHttpBearerToken::new(token),
+                Err(VmHttpConfigError::InvalidBearerToken),
+                "accepted {token:?}"
+            );
+        }
     }
 
     #[test]
@@ -1776,6 +1797,20 @@ esac
         let body: VmGitCloneErrorResponse = serde_json::from_slice(&response.body).unwrap();
         assert_eq!(body.error(), VmGitCloneErrorCode::Denied);
         assert_eq!(body.message(), "policy says no");
+    }
+
+    #[test]
+    fn git_clone_authorization_request_grants_github_contents_read_scope() {
+        let request =
+            VmGitCloneRequest::new(GitCloneRepo::new(repo("smaug123", "writ")).unwrap(), None);
+
+        match git_clone_authorization_request(&request) {
+            CapabilityRequest::GitHub(GitHubRequest::Contents { access, repo }) => {
+                assert_eq!(access, GitHubAccess::Read);
+                assert_eq!(repo, "smaug123/writ".parse::<RepoRef>().unwrap());
+            }
+            other => panic!("unexpected capability: {other:?}"),
+        }
     }
 
     #[tokio::test]

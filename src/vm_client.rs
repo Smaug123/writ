@@ -13,6 +13,7 @@ use std::process::{Command, ExitStatus, Stdio};
 
 use reqwest::Url;
 
+use crate::bearer::is_bearer_token_byte;
 use crate::vm_git::{
     GIT_BUNDLE_CONTENT_TYPE, GitCloneRef, GitCloneRepo, VM_GIT_CLONE_PATH, VmGitCloneErrorResponse,
     VmGitCloneRequest,
@@ -178,10 +179,6 @@ impl std::fmt::Debug for VmBrokerToken {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("VmBrokerToken(<redacted>)")
     }
-}
-
-pub(crate) fn is_bearer_token_byte(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~')
 }
 
 impl VmGitCloneCommand {
@@ -1031,6 +1028,15 @@ mod tests {
             VmClientConfig::new("http://192.168.252.1:18080", "has\nnewline"),
             Err(VmClientConfigError::InvalidToken)
         ));
+        for token in ["has+plus", "has/slash", "has=equals", "has:colon", "has@at"] {
+            assert!(
+                matches!(
+                    VmClientConfig::new("http://192.168.252.1:18080", token),
+                    Err(VmClientConfigError::InvalidToken)
+                ),
+                "accepted {token:?}"
+            );
+        }
     }
 
     fn valid_owner() -> impl Strategy<Value = String> {

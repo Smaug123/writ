@@ -394,7 +394,7 @@ mod tests {
     use crate::github::{GitHubAppConfig, GitHubMinter};
     use crate::policy::PolicyConfig;
     use crate::secret::{SecretError, SecretKey};
-    use crate::vm_git::{GitCredentialBoundary, GitSecretEnvVar};
+    use crate::vm_git_bundle::{GitCredentialBoundary, GitSecretEnvVar};
     use crate::vm_http::VmHttpGitCloneConfig;
 
     #[derive(Default)]

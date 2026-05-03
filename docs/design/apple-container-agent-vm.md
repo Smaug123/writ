@@ -488,18 +488,20 @@ Commit signing options:
 Option 1 is a smaller first step. Option 2 is the cleaner authority boundary
 if commit identity must be entirely broker-controlled.
 
-First Git clone bundle model slice implemented in `src/vm_git.rs`:
+First Git clone bundle model slice implemented in `src/vm_git.rs` and
+`src/vm_git_bundle.rs`:
 
 - the VM-facing route is pinned as `POST /v1/git/clone`, with a validated JSON
   body containing a GitHub repo and optional Git ref;
-- repo, ref, secret-env-var, and host path inputs are parsed into typed values
-  before any command can be described. Invalid owner/name/ref syntax, relative
+- repo and ref inputs are parsed into VM-safe wire types. Secret-env-var and
+  host path inputs are parsed separately in the host-only bundle module before
+  any command can be described. Invalid owner/name/ref syntax, relative
   work/output paths, zero timeouts, and zero bundle-size limits fail before the
-  executor stage exists;
-- `VmGitCloneRequest::authorization_request()` derives the existing
-  `GitHubRequest::Contents { access: Read, ... }` capability, so the later
-  broker integration can reuse the current policy and audit path rather than
-  adding Git-specific policy plumbing;
+  executor runs;
+- the VM HTTP route derives the existing `GitHubRequest::Contents { access:
+  Read, ... }` capability from the parsed clone request, so the broker
+  integration reuses the current policy and audit path rather than adding
+  Git-specific policy plumbing;
 - `GitCloneBundlePlan` describes a host-side `git clone --mirror` followed by
   `git bundle create`, using an askpass boundary and required secret
   environment variable name. The plan carries no token value, and generated
@@ -511,7 +513,7 @@ First Git clone bundle model slice implemented in `src/vm_git.rs`:
   environment-injected Git config cannot rewrite the HTTPS/App-token boundary
   into SSH or user credentials.
 
-Second Git clone bundle executor slice implemented in `src/vm_git.rs`:
+Second Git clone bundle executor slice implemented in `src/vm_git_bundle.rs`:
 
 - `run_git_clone_bundle()` executes the planned clone and bundle commands with
   a cleared child environment, the clean Git-config variables above, null
@@ -718,6 +720,22 @@ First guest image/proof integration slice implemented in `flake.nix` and
   still avoids real GitHub network access, but now materializes a real Git
   repository and bundle rather than returning marker bytes, so the guest
   client proves both the broker HTTP path and bundle consumption by Git.
+
+Second guest image/cross-build preparation slice implemented in `src/lib.rs`,
+`src/vm_git.rs`, `src/vm_git_bundle.rs`, and `src/bearer.rs`:
+
+- the VM-client Git module now contains only the guest-visible clone
+  request/response types, route constants, and GitHub repo/ref validation.
+  Host-only bundle planning, credential-boundary types, Git subprocess
+  execution, process-group cleanup, and related tests moved to
+  `vm_git_bundle`, which is compiled only with the default `host` feature;
+- `policy` and the host Unix-socket `protocol` are host-gated, so a
+  `--no-default-features --features vm-client` build no longer compiles daemon
+  policy/protocol modules the guest never uses;
+- the shared VM HTTP bearer-token byte predicate lives in a tiny common module
+  instead of in `vm_client`, keeping the validator available to both the host
+  HTTP endpoint and the guest client without implying the host endpoint depends
+  on guest client behaviour.
 
 ## Tests and proof spikes
 

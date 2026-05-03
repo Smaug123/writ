@@ -17,7 +17,7 @@ use crate::agent_vm_lifecycle::{
 use crate::core::{AgentNetworkPool, AgentVmConfigError, BrokerPortRange, Ipv4Cidr, Ipv6Cidr};
 use crate::github::GitHubAppConfig;
 use crate::policy::PolicyConfig;
-use crate::vm_git::{
+use crate::vm_git_bundle::{
     GitCloneBundlePlanError, GitCredentialBoundary, GitSecretEnvVar, GitSecretEnvVarError,
 };
 use crate::vm_http::{VmHttpGitCloneConfig, VmHttpGitRuntimeConfig};

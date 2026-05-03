@@ -12,12 +12,15 @@ pub mod agent_vm_firewall;
 pub mod agent_vm_lifecycle;
 #[cfg(feature = "host")]
 pub mod audit;
+pub(crate) mod bearer;
 #[cfg(feature = "host")]
 pub mod config;
 pub mod core;
 #[cfg(feature = "host")]
 pub mod github;
+#[cfg(feature = "host")]
 pub mod policy;
+#[cfg(feature = "host")]
 pub mod protocol;
 #[cfg(feature = "host")]
 pub mod secret;
@@ -27,5 +30,7 @@ pub mod server;
 pub mod vm_client;
 #[cfg(feature = "vm-client")]
 pub mod vm_git;
+#[cfg(feature = "host")]
+pub mod vm_git_bundle;
 #[cfg(feature = "host")]
 pub mod vm_http;
