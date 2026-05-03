@@ -12,8 +12,8 @@ Requires:
   - root privileges through sudo for pfctl
   - a top-level PF rule in /etc/pf.conf: anchor "writ/session/*"
   - python3, curl, git, nix, cargo or the Nix dev shell, and either Nix
-    substitutes/builders for the guest proof-image closure or a preloaded image
-    containing sh, ip, git, writ-vm, wget, and nslookup
+    substitutes/builders for the guest image closure or a preloaded image
+    containing sh, ip, git, and writ-vm
 
 What it proves:
   - writd starts an agent VM through the Unix-socket `start_agent_vm` protocol
@@ -26,8 +26,8 @@ The GitHub API and host git binary are local fakes. This keeps the proof focused
 on Apple Container/PF/daemon wiring rather than real GitHub availability.
 
 Environment overrides:
-  WRIT_PROVE_IMAGE       OCI image to run, default writ-agent-vm-guest-proof:latest
-  WRIT_PROVE_BUILD_GUEST_IMAGE  build/load the Nix proof image, default auto
+  WRIT_PROVE_IMAGE       OCI image to run, default writ-agent-vm-guest:latest
+  WRIT_PROVE_BUILD_GUEST_IMAGE  build/load the Nix guest image, default auto
                                 (auto builds unless WRIT_PROVE_IMAGE is set)
                                 false/no/off/0 use a preloaded image
   WRIT_PROVE_GUEST_SYSTEM  Nix guest image target system, default host-derived
@@ -62,7 +62,7 @@ if [[ -n "${WRIT_PROVE_IMAGE:-}" ]]; then
   IMAGE="$WRIT_PROVE_IMAGE"
   BUILD_GUEST_IMAGE="${WRIT_PROVE_BUILD_GUEST_IMAGE:-0}"
 else
-  IMAGE="writ-agent-vm-guest-proof:latest"
+  IMAGE="writ-agent-vm-guest:latest"
   BUILD_GUEST_IMAGE="${WRIT_PROVE_BUILD_GUEST_IMAGE:-auto}"
 fi
 IPV4_POOL="${WRIT_PROVE_IPV4_POOL:-192.168.0.0/16}"
@@ -240,9 +240,9 @@ load_guest_image() {
   require_cmd nix
   local guest_system
   guest_system="${WRIT_PROVE_GUEST_SYSTEM:-$(default_guest_system)}"
-  local image_attr="agent-vm-guest-proof-image-${guest_system}"
+  local image_attr="agent-vm-guest-image-${guest_system}"
 
-  log "building guest proof OCI image ${IMAGE} from .#${image_attr}"
+  log "building guest OCI image ${IMAGE} from .#${image_attr}"
   local image_archive
   image_archive="$(cd "$ROOT_DIR" && nix build --no-link --print-out-paths ".#${image_attr}")" || \
     die "failed to build guest OCI image .#${image_attr}"
@@ -551,7 +551,12 @@ wait_for_released_guest_command() {
 }
 
 guest_ipv4_addr() {
-  guest "ip -4 -o addr show scope global | awk '{print \$4}' | head -n 1 | cut -d/ -f1"
+  guest '
+    set -- $(ip -4 -o addr show scope global)
+    addr="${4:-}"
+    test -n "$addr"
+    printf "%s\n" "${addr%%/*}"
+  '
 }
 
 assert_guest_has_no_routable_ipv6() {
@@ -719,7 +724,7 @@ PF_ANCHOR="writ/session/${SESSION_ID}"
 
 wait_for_released_guest_command
 expect_guest_success "guest has required probe tools" \
-  'command -v sh >/dev/null && command -v ip >/dev/null && command -v git >/dev/null && command -v writ-vm >/dev/null && command -v wget >/dev/null && command -v nslookup >/dev/null'
+  'command -v sh >/dev/null && command -v ip >/dev/null && command -v git >/dev/null && command -v writ-vm >/dev/null'
 assert_guest_has_no_routable_ipv6
 
 GUEST_IPV4="$(guest_ipv4_addr)"
@@ -729,14 +734,14 @@ log "guest IPv4 address is ${GUEST_IPV4}"
 expect_guest_success "guest sees daemon-injected broker URL and token" \
   'test -n "$WRIT_BROKER_URL" && test -n "$WRIT_BROKER_TOKEN"'
 expect_guest_success "VM can call daemon VM HTTP session endpoint through writ-vm" \
-  "writ-vm session > /tmp/writ-agent-vm-session.json && \
-    grep -q '\"api\": \"writ-vm-http\"' /tmp/writ-agent-vm-session.json && \
-    grep -q '\"session_id\": \"${SESSION_ID}\"' /tmp/writ-agent-vm-session.json"
+  "session_json=\"\$(writ-vm session)\" && \
+    case \"\$session_json\" in *'\"api\": \"writ-vm-http\"'*) ;; *) printf '%s\n' \"\$session_json\"; exit 1;; esac && \
+    case \"\$session_json\" in *'\"session_id\": \"${SESSION_ID}\"'*) ;; *) printf '%s\n' \"\$session_json\"; exit 1;; esac"
 expect_guest_success "VM can clone a host-produced Git bundle through writ-vm" \
   "rm -rf /tmp/writ-agent-vm-checkout && \
     writ-vm git clone '${PROOF_REPO_FULL}' /tmp/writ-agent-vm-checkout && \
-    git -C /tmp/writ-agent-vm-checkout rev-parse --is-inside-work-tree | grep -Fxq true && \
-    grep -Fxq '${PROOF_BUNDLE_MARKER}' /tmp/writ-agent-vm-checkout/README.md"
+    test \"\$(git -C /tmp/writ-agent-vm-checkout rev-parse --is-inside-work-tree)\" = true && \
+    test \"\$(cat /tmp/writ-agent-vm-checkout/README.md)\" = '${PROOF_BUNDLE_MARKER}'"
 assert_fake_git_used_cleanly
 
 log "stopping session through daemon"

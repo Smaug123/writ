@@ -706,11 +706,11 @@ First guest image/proof integration slice implemented in `flake.nix` and
   roots, `sh`, `ip`, and the core utilities needed by the prelaunch/release
   scripts. It deliberately does not ship host-side binaries such as `writd`,
   the lifecycle runner, or the PF helper;
-- the daemon proof harness defaults to building the matching Nix proof image,
+- the daemon proof harness defaults to building the matching Nix production image,
   loading it with `container image load --input`, and starting the managed VM
   from that image. Supplying `WRIT_PROVE_IMAGE` keeps the old "use an already
   available image" path, and `WRIT_PROVE_BUILD_GUEST_IMAGE=0` uses a preloaded
-  `writ-agent-vm-guest-proof:latest`;
+  `writ-agent-vm-guest:latest`;
 - the harness no longer treats raw `wget` against VM HTTP as the end-to-end
   guest proof. Inside the VM it now runs `writ-vm session` and
   `writ-vm git clone proof-owner/proof-repo /tmp/writ-agent-vm-checkout`,
@@ -771,7 +771,7 @@ First Darwin-hosted OCI assembly slice implemented in `flake.nix` and
   session so guest temp files, release markers, and root-user tool state are
   per-session runtime state, not static image content;
 - the proof harness now builds the current-host package attr
-  `.#agent-vm-guest-proof-image-${WRIT_PROVE_GUEST_SYSTEM}` and loads the
+  `.#agent-vm-guest-image-${WRIT_PROVE_GUEST_SYSTEM}` and loads the
   resulting OCI archive directly with `container image load --input`.
 
 First guest image reduction slice implemented in `flake.nix` and
@@ -784,7 +784,8 @@ First guest image reduction slice implemented in `flake.nix` and
 - `agent-vm-guest-proof-image-*` is the manual proof image. It keeps the
   production runtime plus `wget`, `nslookup`, `awk`, and `grep`, and its archive
   build fails if any of those proof assertions tools are absent;
-- the daemon proof harness defaults to `writ-agent-vm-guest-proof:latest`.
+- the daemon proof harness now avoids proof-only guest tools in its assertions,
+  so it defaults to the production `writ-agent-vm-guest:latest` image.
   Supplying `WRIT_PROVE_IMAGE` still opts into an externally-provided image.
 
 ## Tests and proof spikes
