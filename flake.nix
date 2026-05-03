@@ -13,14 +13,19 @@
         config.allowUnfree = true;
       };
 
-      mkWrit = pkgs: { cargoBuildFlags ? [], doCheck ? true }:
+      mkWrit = pkgs: {
+        cargoBuildFeatures ? [],
+        cargoBuildFlags ? [],
+        cargoBuildNoDefaultFeatures ? false,
+        doCheck ? true
+      }:
         pkgs.rustPlatform.buildRustPackage {
         pname = "writ";
         version = "0.1.0";
         src = pkgs.lib.cleanSource ./.;
         cargoLock.lockFile = ./Cargo.lock;
         nativeCheckInputs = [ pkgs.git ];
-        inherit cargoBuildFlags doCheck;
+        inherit cargoBuildFeatures cargoBuildFlags cargoBuildNoDefaultFeatures doCheck;
       };
 
       guestSystems = [
@@ -37,7 +42,9 @@
         let
           pkgs = mkPkgs guestSystem;
           writVm = mkWrit pkgs {
+            cargoBuildFeatures = [ "vm-client" ];
             cargoBuildFlags = [ "--bin" "writ-vm" ];
+            cargoBuildNoDefaultFeatures = true;
             doCheck = false;
           };
           guestRoot = pkgs.buildEnv {

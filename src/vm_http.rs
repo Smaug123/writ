@@ -17,6 +17,7 @@ use tokio::task::JoinSet;
 use crate::core::{BrokerPort, BrokerPortRange, Ipv4Cidr, SessionId};
 use crate::secret::SecretStore;
 use crate::server::{BrokerState, CapabilityOutcome, request_capability};
+use crate::vm_client::is_bearer_token_byte;
 use crate::vm_git::{
     GIT_BUNDLE_CONTENT_TYPE, GitCloneBundlePlan, GitCloneBundlePlanError, GitCloneBundleRunError,
     GitCredentialBoundary, GitSecretValue, GitSecretValueError, VM_GIT_CLONE_PATH,
@@ -1215,10 +1216,6 @@ impl VmHttpStatus {
             Self::InternalServerError => "500 Internal Server Error",
         }
     }
-}
-
-pub(crate) fn is_bearer_token_byte(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~')
 }
 
 fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {

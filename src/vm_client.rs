@@ -17,7 +17,6 @@ use crate::vm_git::{
     GIT_BUNDLE_CONTENT_TYPE, GitCloneRef, GitCloneRepo, VM_GIT_CLONE_PATH, VmGitCloneErrorResponse,
     VmGitCloneRequest,
 };
-use crate::vm_http::is_bearer_token_byte;
 
 pub const VM_BROKER_URL_ENV: &str = "WRIT_BROKER_URL";
 pub const VM_BROKER_TOKEN_ENV: &str = "WRIT_BROKER_TOKEN";
@@ -179,6 +178,10 @@ impl std::fmt::Debug for VmBrokerToken {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("VmBrokerToken(<redacted>)")
     }
+}
+
+pub(crate) fn is_bearer_token_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~')
 }
 
 impl VmGitCloneCommand {

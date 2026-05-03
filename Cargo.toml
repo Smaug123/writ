@@ -3,6 +3,41 @@ name = "writ"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = ["host"]
+host = [
+    "vm-client",
+    "dep:jsonwebtoken",
+    "dep:keyring",
+    "dep:rusqlite",
+]
+vm-client = ["dep:reqwest"]
+
+[[bin]]
+name = "writ"
+path = "src/bin/writ.rs"
+required-features = ["host"]
+
+[[bin]]
+name = "writ-agent-vm-pf-helper"
+path = "src/bin/writ-agent-vm-pf-helper.rs"
+required-features = ["host"]
+
+[[bin]]
+name = "writ-agent-vm-runner"
+path = "src/bin/writ-agent-vm-runner.rs"
+required-features = ["host"]
+
+[[bin]]
+name = "writ-vm"
+path = "src/bin/writ-vm.rs"
+required-features = ["vm-client"]
+
+[[bin]]
+name = "writd"
+path = "src/bin/writd.rs"
+required-features = ["host"]
+
 [dependencies]
 clap = { version = "4", features = ["derive", "env"] }
 serde = { version = "1", features = ["derive"] }
@@ -10,11 +45,11 @@ serde_json = "1"
 uuid = { version = "1", features = ["v4", "serde"] }
 time = { version = "0.3", features = ["serde", "formatting", "parsing", "macros"] }
 thiserror = "2"
-keyring = { version = "3", features = ["apple-native", "linux-native"] }
-rusqlite = { version = "0.38", features = ["bundled"] }
+keyring = { version = "3", features = ["apple-native", "linux-native"], optional = true }
+rusqlite = { version = "0.38", features = ["bundled"], optional = true }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "fs", "time", "sync", "io-util", "process"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots", "http2"] }
-jsonwebtoken = "9"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots", "http2"], optional = true }
+jsonwebtoken = { version = "9", optional = true }
 libc = "0.2"
 
 [dev-dependencies]

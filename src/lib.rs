@@ -4,17 +4,28 @@
 //!
 //! See `docs/design/broker.md` for the architecture overview.
 
+#[cfg(feature = "host")]
 pub mod agent_vm_daemon;
+#[cfg(feature = "host")]
 pub mod agent_vm_firewall;
+#[cfg(feature = "host")]
 pub mod agent_vm_lifecycle;
+#[cfg(feature = "host")]
 pub mod audit;
+#[cfg(feature = "host")]
 pub mod config;
 pub mod core;
+#[cfg(feature = "host")]
 pub mod github;
 pub mod policy;
 pub mod protocol;
+#[cfg(feature = "host")]
 pub mod secret;
+#[cfg(feature = "host")]
 pub mod server;
+#[cfg(feature = "vm-client")]
 pub mod vm_client;
+#[cfg(feature = "vm-client")]
 pub mod vm_git;
+#[cfg(feature = "host")]
 pub mod vm_http;

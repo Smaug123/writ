@@ -689,6 +689,13 @@ First VM-side client slice implemented in `src/vm_client.rs` and
 First guest image/proof integration slice implemented in `flake.nix` and
 `scripts/prove-agent-vm-daemon.sh`:
 
+- Cargo now has a lean `vm-client` feature for the guest binary. The default
+  `host` feature still builds the daemon, audit log, GitHub minter, secret
+  stores, PF/lifecycle helpers, and VM HTTP server, but `cargo build
+  --no-default-features --features vm-client --bin writ-vm` builds only the
+  guest client surface and excludes host-only dependencies such as `keyring`,
+  `rusqlite`, and `jsonwebtoken`. This feature boundary is the prerequisite for
+  Darwin-hosted Linux cross compilation;
 - the flake now exposes Nix-built Linux OCI archives for the daemon-managed
   guest image: `agent-vm-guest-image-aarch64-linux`,
   `agent-vm-guest-image-x86_64-linux`, and a host-architecture-derived
