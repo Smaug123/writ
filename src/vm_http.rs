@@ -69,17 +69,25 @@ pub struct VmHttpGitCloneService<S: SecretStore> {
     config: VmHttpGitCloneConfig,
 }
 
+#[derive(Clone, Debug)]
+pub struct VmHttpNixCacheService {
+    config: VmHttpNixCacheConfig,
+    client: reqwest::Client,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VmHttpGitRuntimeConfig {
     bind_addr: Ipv4Addr,
     broker_port_range: BrokerPortRange,
     git_clone: VmHttpGitCloneConfig,
+    nix_cache: VmHttpNixCacheConfig,
 }
 
 pub struct PreparedVmHttpGitSession<S: SecretStore + Send + Sync + 'static> {
     listener: BoundVmHttpListener,
     session: VmHttpSession,
     git_clone: VmHttpGitCloneService<S>,
+    nix_cache: VmHttpNixCacheService,
 }
 
 pub struct RunningVmHttpGitSession {
@@ -96,6 +104,12 @@ pub struct VmHttpGitCloneConfig {
     work_root: PathBuf,
     timeout: std::time::Duration,
     max_bundle_bytes: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VmHttpNixCacheConfig {
+    upstream_base_url: reqwest::Url,
+    max_metadata_bytes: u64,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -117,6 +131,22 @@ pub enum VmHttpConfigError {
     EmptyBearerToken,
     #[error("VM HTTP bearer token must contain only unreserved ASCII token characters")]
     InvalidBearerToken,
+}
+
+#[derive(Debug, thiserror::Error, Eq, PartialEq)]
+pub enum VmHttpNixCacheConfigError {
+    #[error("Nix cache upstream URL must not be empty")]
+    EmptyUpstreamUrl,
+    #[error("Nix cache upstream URL {raw:?} is invalid: {message}")]
+    InvalidUpstreamUrl { raw: String, message: String },
+    #[error("Nix cache upstream URL {raw:?} uses unsupported scheme {scheme:?}")]
+    UnsupportedUpstreamScheme { raw: String, scheme: String },
+    #[error("Nix cache upstream URL must not contain embedded credentials: {0:?}")]
+    UpstreamUrlHasCredentials(String),
+    #[error("Nix cache upstream URL must not contain a query or fragment: {0:?}")]
+    UpstreamUrlHasQueryOrFragment(String),
+    #[error("Nix cache max metadata bytes must be greater than zero")]
+    EmptyMaxMetadataBytes,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -170,6 +200,7 @@ enum VmHttpStatus {
     NotFound,
     MethodNotAllowed,
     Gone,
+    BadGateway,
     InternalServerError,
 }
 
@@ -200,10 +231,18 @@ enum VmHttpAuthScheme {
     Basic,
 }
 
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum VmNixCacheRoute {
     CacheInfo,
-    NarInfo,
+    NarInfo { hash: String },
+}
+
+#[derive(Debug, thiserror::Error)]
+enum VmHttpNixCacheProxyError {
+    #[error("Nix cache upstream request failed: {0}")]
+    Request(#[from] reqwest::Error),
+    #[error("Nix cache upstream metadata response exceeds {max} bytes")]
+    ResponseTooLarge { max: u64 },
 }
 
 impl VmHttpSession {
@@ -316,16 +355,27 @@ impl<S: SecretStore> Clone for VmHttpGitCloneService<S> {
     }
 }
 
+impl VmHttpNixCacheService {
+    pub fn new(config: VmHttpNixCacheConfig) -> Self {
+        Self {
+            config,
+            client: reqwest::Client::new(),
+        }
+    }
+}
+
 impl VmHttpGitRuntimeConfig {
     pub fn new(
         bind_addr: Ipv4Addr,
         broker_port_range: BrokerPortRange,
         git_clone: VmHttpGitCloneConfig,
+        nix_cache: VmHttpNixCacheConfig,
     ) -> Self {
         Self {
             bind_addr,
             broker_port_range,
             git_clone,
+            nix_cache,
         }
     }
 
@@ -339,6 +389,10 @@ impl VmHttpGitRuntimeConfig {
 
     pub fn git_clone(&self) -> &VmHttpGitCloneConfig {
         &self.git_clone
+    }
+
+    pub fn nix_cache(&self) -> &VmHttpNixCacheConfig {
+        &self.nix_cache
     }
 }
 
@@ -405,6 +459,59 @@ impl VmHttpGitCloneConfig {
     }
 }
 
+impl VmHttpNixCacheConfig {
+    pub fn new(
+        upstream_base_url: impl AsRef<str>,
+        max_metadata_bytes: u64,
+    ) -> Result<Self, VmHttpNixCacheConfigError> {
+        let raw = upstream_base_url.as_ref();
+        if raw.is_empty() {
+            return Err(VmHttpNixCacheConfigError::EmptyUpstreamUrl);
+        }
+        if max_metadata_bytes == 0 {
+            return Err(VmHttpNixCacheConfigError::EmptyMaxMetadataBytes);
+        }
+        let mut url = reqwest::Url::parse(raw).map_err(|err| {
+            VmHttpNixCacheConfigError::InvalidUpstreamUrl {
+                raw: raw.to_string(),
+                message: err.to_string(),
+            }
+        })?;
+        if !matches!(url.scheme(), "http" | "https") {
+            return Err(VmHttpNixCacheConfigError::UnsupportedUpstreamScheme {
+                raw: raw.to_string(),
+                scheme: url.scheme().to_string(),
+            });
+        }
+        if !url.username().is_empty() || url.password().is_some() {
+            return Err(VmHttpNixCacheConfigError::UpstreamUrlHasCredentials(
+                raw.to_string(),
+            ));
+        }
+        if url.query().is_some() || url.fragment().is_some() {
+            return Err(VmHttpNixCacheConfigError::UpstreamUrlHasQueryOrFragment(
+                raw.to_string(),
+            ));
+        }
+        if !url.path().ends_with('/') {
+            let path = format!("{}/", url.path());
+            url.set_path(&path);
+        }
+        Ok(Self {
+            upstream_base_url: url,
+            max_metadata_bytes,
+        })
+    }
+
+    pub fn upstream_base_url(&self) -> &reqwest::Url {
+        &self.upstream_base_url
+    }
+
+    pub fn max_metadata_bytes(&self) -> u64 {
+        self.max_metadata_bytes
+    }
+}
+
 impl<S: SecretStore + Send + Sync + 'static> PreparedVmHttpGitSession<S> {
     pub fn broker_port(&self) -> BrokerPort {
         self.listener.broker_port()
@@ -436,6 +543,7 @@ impl<S: SecretStore + Send + Sync + 'static> PreparedVmHttpGitSession<S> {
             self.listener.into_listener(),
             self.session,
             self.git_clone,
+            self.nix_cache,
             shutdown_rx,
         ));
         RunningVmHttpGitSession {
@@ -540,10 +648,12 @@ pub async fn prepare_vm_http_git_session<S: SecretStore + Send + Sync + 'static>
         bind_ephemeral_vm_http_listener(config.bind_addr, config.broker_port_range).await?;
     let session = VmHttpSession::new(session_id, source_ipv4, VmHttpBearerToken::generate());
     let git_clone = VmHttpGitCloneService::new(state, config.git_clone.clone());
+    let nix_cache = VmHttpNixCacheService::new(config.nix_cache.clone());
     Ok(PreparedVmHttpGitSession {
         listener,
         session,
         git_clone,
+        nix_cache,
     })
 }
 
@@ -559,23 +669,34 @@ pub async fn run_vm_http_until_shutdown(
     session: VmHttpSession,
     shutdown: watch::Receiver<bool>,
 ) -> std::io::Result<()> {
-    run_vm_http_runtime_until_shutdown::<Box<dyn SecretStore>>(listener, session, None, shutdown)
-        .await
+    run_vm_http_runtime_until_shutdown::<Box<dyn SecretStore>>(
+        listener, session, None, None, shutdown,
+    )
+    .await
 }
 
 pub async fn run_vm_http_with_git_until_shutdown<S: SecretStore + Send + Sync + 'static>(
     listener: TcpListener,
     session: VmHttpSession,
     git_clone: VmHttpGitCloneService<S>,
+    nix_cache: VmHttpNixCacheService,
     shutdown: watch::Receiver<bool>,
 ) -> std::io::Result<()> {
-    run_vm_http_runtime_until_shutdown(listener, session, Some(git_clone), shutdown).await
+    run_vm_http_runtime_until_shutdown(
+        listener,
+        session,
+        Some(git_clone),
+        Some(nix_cache),
+        shutdown,
+    )
+    .await
 }
 
 async fn run_vm_http_runtime_until_shutdown<S: SecretStore + Send + Sync + 'static>(
     listener: TcpListener,
     session: VmHttpSession,
     git_clone: Option<VmHttpGitCloneService<S>>,
+    nix_cache: Option<VmHttpNixCacheService>,
     mut shutdown: watch::Receiver<bool>,
 ) -> std::io::Result<()> {
     let mut handlers = JoinSet::new();
@@ -604,8 +725,9 @@ async fn run_vm_http_runtime_until_shutdown<S: SecretStore + Send + Sync + 'stat
                 let (stream, peer_addr) = accepted?;
                 let session = session.clone();
                 let git_clone = git_clone.clone();
+                let nix_cache = nix_cache.clone();
                 handlers.spawn(async move {
-                    handle_vm_http_connection(stream, peer_addr, session, git_clone).await
+                    handle_vm_http_connection(stream, peer_addr, session, git_clone, nix_cache).await
                 });
             }
         }
@@ -686,12 +808,14 @@ async fn handle_vm_http_connection<S: SecretStore + Send + Sync + 'static>(
     peer_addr: SocketAddr,
     session: VmHttpSession,
     git_clone: Option<VmHttpGitCloneService<S>>,
+    nix_cache: Option<VmHttpNixCacheService>,
 ) -> std::io::Result<()> {
     handle_vm_http_connection_with_read_timeout(
         stream,
         peer_addr,
         session,
         git_clone,
+        nix_cache,
         VM_HTTP_READ_TIMEOUT,
     )
     .await
@@ -702,6 +826,7 @@ async fn handle_vm_http_connection_with_read_timeout<S, T>(
     peer_addr: SocketAddr,
     session: VmHttpSession,
     git_clone: Option<VmHttpGitCloneService<S>>,
+    nix_cache: Option<VmHttpNixCacheService>,
     read_timeout: std::time::Duration,
 ) -> std::io::Result<()>
 where
@@ -729,6 +854,7 @@ where
         head,
         &mut stream,
         git_clone,
+        nix_cache,
         read_timeout,
     )
     .await;
@@ -748,7 +874,7 @@ fn dispatch_vm_http_head(
     let auth_scheme = auth_scheme_for_target(&request.target);
     match authorize_vm_http_request_with_scheme(session, &request, auth_scheme) {
         VmHttpAuthorization::Allow if is_nix_cache_target(&request.target) => {
-            route_nix_cache_request(&request)
+            route_nix_cache_request_without_upstream(&request)
         }
         VmHttpAuthorization::Allow => route_session_endpoint(session, &request),
         VmHttpAuthorization::Deny(err) => auth_error_response(auth_scheme, err),
@@ -761,6 +887,7 @@ async fn dispatch_vm_http_head_and_body<S, R>(
     head: VmHttpHeadRead,
     stream: &mut R,
     git_clone: Option<VmHttpGitCloneService<S>>,
+    nix_cache: Option<VmHttpNixCacheService>,
     read_timeout: std::time::Duration,
 ) -> VmHttpResponse
 where
@@ -780,6 +907,7 @@ where
                 head.buffered_body,
                 stream,
                 git_clone,
+                nix_cache,
                 read_timeout,
             )
             .await
@@ -820,6 +948,7 @@ async fn route_authenticated_vm_http_request<S, R>(
     buffered_body: Vec<u8>,
     stream: &mut R,
     git_clone: Option<VmHttpGitCloneService<S>>,
+    nix_cache: Option<VmHttpNixCacheService>,
     read_timeout: std::time::Duration,
 ) -> VmHttpResponse
 where
@@ -827,7 +956,7 @@ where
     R: AsyncRead + Unpin,
 {
     if is_nix_cache_target(&request.target) {
-        return route_nix_cache_request(request);
+        return route_nix_cache_request(request, nix_cache.as_ref()).await;
     }
 
     if request.target == VM_GIT_CLONE_PATH {
@@ -854,7 +983,32 @@ where
     route_session_endpoint(session, request)
 }
 
-fn route_nix_cache_request(request: &VmHttpRequest) -> VmHttpResponse {
+async fn route_nix_cache_request(
+    request: &VmHttpRequest,
+    service: Option<&VmHttpNixCacheService>,
+) -> VmHttpResponse {
+    let Some(service) = service else {
+        return route_nix_cache_request_without_upstream(request);
+    };
+    let Some(route) = classify_nix_cache_target(&request.target) else {
+        return VmHttpResponse::text(VmHttpStatus::NotFound, "not found");
+    };
+    match request.method.as_str() {
+        "GET" | "HEAD" => match service
+            .fetch_metadata(request.method.as_str(), &route)
+            .await
+        {
+            Ok(response) => response,
+            Err(err) => {
+                eprintln!("VM HTTP Nix cache proxy failed: {err}");
+                VmHttpResponse::text(VmHttpStatus::BadGateway, "nix cache upstream failed")
+            }
+        },
+        _ => VmHttpResponse::text(VmHttpStatus::MethodNotAllowed, "method not allowed"),
+    }
+}
+
+fn route_nix_cache_request_without_upstream(request: &VmHttpRequest) -> VmHttpResponse {
     let Some(route) = classify_nix_cache_target(&request.target) else {
         return VmHttpResponse::text(VmHttpStatus::NotFound, "not found");
     };
@@ -864,13 +1018,86 @@ fn route_nix_cache_request(request: &VmHttpRequest) -> VmHttpResponse {
             "StoreDir: /nix/store\nWantMassQuery: 0\nPriority: 40\n",
         ),
         ("HEAD", VmNixCacheRoute::CacheInfo) => VmHttpResponse::text(VmHttpStatus::Ok, ""),
-        ("GET" | "HEAD", VmNixCacheRoute::NarInfo) => {
+        ("GET" | "HEAD", VmNixCacheRoute::NarInfo { .. }) => {
             VmHttpResponse::text(VmHttpStatus::NotFound, "not found")
         }
-        (_, VmNixCacheRoute::CacheInfo | VmNixCacheRoute::NarInfo) => {
+        (_, VmNixCacheRoute::CacheInfo | VmNixCacheRoute::NarInfo { .. }) => {
             VmHttpResponse::text(VmHttpStatus::MethodNotAllowed, "method not allowed")
         }
     }
+}
+
+impl VmHttpNixCacheService {
+    async fn fetch_metadata(
+        &self,
+        method: &str,
+        route: &VmNixCacheRoute,
+    ) -> Result<VmHttpResponse, VmHttpNixCacheProxyError> {
+        let url = self.upstream_url(route);
+        let is_head = method == "HEAD";
+        let method = match method {
+            "GET" => reqwest::Method::GET,
+            "HEAD" => reqwest::Method::HEAD,
+            _ => unreachable!("caller filters Nix cache proxy methods"),
+        };
+        let response = self.client.request(method, url).send().await?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(VmHttpResponse::text(VmHttpStatus::NotFound, "not found"));
+        }
+        if response.status() != reqwest::StatusCode::OK {
+            let status = response.status();
+            eprintln!("VM HTTP Nix cache upstream returned status {status}");
+            return Ok(VmHttpResponse::text(
+                VmHttpStatus::BadGateway,
+                "nix cache upstream returned unsupported status",
+            ));
+        }
+        if response
+            .content_length()
+            .is_some_and(|len| len > self.config.max_metadata_bytes)
+        {
+            return Err(VmHttpNixCacheProxyError::ResponseTooLarge {
+                max: self.config.max_metadata_bytes,
+            });
+        }
+        if is_head {
+            return Ok(VmHttpResponse::text(VmHttpStatus::Ok, ""));
+        }
+        let body =
+            read_upstream_metadata_body_bounded(response, self.config.max_metadata_bytes).await?;
+        Ok(VmHttpResponse {
+            status: VmHttpStatus::Ok,
+            content_type: "text/plain; charset=utf-8",
+            body,
+            www_authenticate: None,
+        })
+    }
+
+    fn upstream_url(&self, route: &VmNixCacheRoute) -> reqwest::Url {
+        let path = match route {
+            VmNixCacheRoute::CacheInfo => "nix-cache-info".to_string(),
+            VmNixCacheRoute::NarInfo { hash } => format!("{hash}.narinfo"),
+        };
+        self.config
+            .upstream_base_url
+            .join(&path)
+            .expect("Nix cache route paths are URL-safe relative paths")
+    }
+}
+
+async fn read_upstream_metadata_body_bounded(
+    mut response: reqwest::Response,
+    max: u64,
+) -> Result<Vec<u8>, VmHttpNixCacheProxyError> {
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        let new_len = body.len() as u64 + chunk.len() as u64;
+        if new_len > max {
+            return Err(VmHttpNixCacheProxyError::ResponseTooLarge { max });
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
 }
 
 fn route_session_endpoint(session: &VmHttpSession, request: &VmHttpRequest) -> VmHttpResponse {
@@ -906,7 +1133,9 @@ fn classify_nix_cache_target(target: &str) -> Option<VmNixCacheRoute> {
     let suffix = target.strip_prefix(&format!("{VM_NIX_CACHE_PATH_PREFIX}/"))?;
     let hash = suffix.strip_suffix(".narinfo")?;
     if is_nix_store_hash_part(hash) {
-        Some(VmNixCacheRoute::NarInfo)
+        Some(VmNixCacheRoute::NarInfo {
+            hash: hash.to_string(),
+        })
     } else {
         None
     }
@@ -1360,6 +1589,7 @@ impl VmHttpStatus {
             Self::NotFound => "404 Not Found",
             Self::MethodNotAllowed => "405 Method Not Allowed",
             Self::Gone => "410 Gone",
+            Self::BadGateway => "502 Bad Gateway",
             Self::InternalServerError => "500 Internal Server Error",
         }
     }
@@ -1634,6 +1864,19 @@ esac
         .unwrap()
     }
 
+    fn nix_cache_config_for_test() -> VmHttpNixCacheConfig {
+        VmHttpNixCacheConfig::new("http://127.0.0.1:9", 1024).unwrap()
+    }
+
+    fn nix_cache_service_for_test(
+        server: &MockServer,
+        max_metadata_bytes: u64,
+    ) -> VmHttpNixCacheService {
+        VmHttpNixCacheService::new(
+            VmHttpNixCacheConfig::new(server.uri(), max_metadata_bytes).unwrap(),
+        )
+    }
+
     fn request(source: Ipv4Addr, authorization: Option<String>) -> VmHttpRequest {
         VmHttpRequest::new(
             "GET",
@@ -1829,7 +2072,10 @@ esac
         #[test]
         fn valid_nix_store_hash_parts_are_narinfo_routes(hash in arb_nix_hash_part()) {
             let target = format!("{VM_NIX_CACHE_PATH_PREFIX}/{hash}.narinfo");
-            prop_assert_eq!(classify_nix_cache_target(&target), Some(VmNixCacheRoute::NarInfo));
+            prop_assert_eq!(
+                classify_nix_cache_target(&target),
+                Some(VmNixCacheRoute::NarInfo { hash })
+            );
         }
 
         #[test]
@@ -1960,6 +2206,170 @@ esac
         );
 
         assert_eq!(response.status, VmHttpStatus::NotFound);
+    }
+
+    #[test]
+    fn nix_cache_config_normalizes_base_urls_and_rejects_unsafe_shapes() {
+        let config = VmHttpNixCacheConfig::new("https://cache.example.test/base", 1024).unwrap();
+        assert_eq!(
+            config.upstream_base_url().as_str(),
+            "https://cache.example.test/base/"
+        );
+
+        assert_eq!(
+            VmHttpNixCacheConfig::new("", 1024),
+            Err(VmHttpNixCacheConfigError::EmptyUpstreamUrl)
+        );
+        assert_eq!(
+            VmHttpNixCacheConfig::new("https://cache.example.test", 0),
+            Err(VmHttpNixCacheConfigError::EmptyMaxMetadataBytes)
+        );
+        assert!(matches!(
+            VmHttpNixCacheConfig::new("file:///nix/store", 1024),
+            Err(VmHttpNixCacheConfigError::UnsupportedUpstreamScheme { .. })
+        ));
+        assert!(matches!(
+            VmHttpNixCacheConfig::new("https://user:pass@cache.example.test", 1024),
+            Err(VmHttpNixCacheConfigError::UpstreamUrlHasCredentials(_))
+        ));
+        assert!(matches!(
+            VmHttpNixCacheConfig::new("https://cache.example.test?x=1", 1024),
+            Err(VmHttpNixCacheConfigError::UpstreamUrlHasQueryOrFragment(_))
+        ));
+    }
+
+    async fn route_nix_cache_with_service(
+        method: &str,
+        target: String,
+        service: VmHttpNixCacheService,
+    ) -> VmHttpResponse {
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+        let request = nix_cache_request(
+            method,
+            target,
+            Ipv4Addr::LOCALHOST,
+            Some(basic(token().as_str())),
+        );
+        let mut stream = tokio::io::empty();
+        route_authenticated_vm_http_request(
+            &session,
+            &request,
+            Vec::new(),
+            &mut stream,
+            None::<VmHttpGitCloneService<Box<dyn SecretStore>>>,
+            Some(service),
+            VM_HTTP_READ_TIMEOUT,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn nix_cache_info_route_proxies_bounded_upstream_metadata() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/cache/nix-cache-info"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("StoreDir: /nix/store\nWantMassQuery: 1\nPriority: 30\n"),
+            )
+            .expect(1)
+            .mount(&upstream)
+            .await;
+        let service = VmHttpNixCacheService::new(
+            VmHttpNixCacheConfig::new(format!("{}/cache", upstream.uri()), 1024).unwrap(),
+        );
+
+        let response =
+            route_nix_cache_with_service("GET", VM_NIX_CACHE_INFO_PATH.into(), service).await;
+
+        assert_eq!(response.status, VmHttpStatus::Ok);
+        assert_eq!(
+            String::from_utf8(response.body).unwrap(),
+            "StoreDir: /nix/store\nWantMassQuery: 1\nPriority: 30\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn nix_cache_narinfo_route_proxies_valid_narinfo_paths() {
+        let upstream = MockServer::start().await;
+        let hash = "00000000000000000000000000000000";
+        Mock::given(method("GET"))
+            .and(path(format!("/{hash}.narinfo")))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(
+                    "StorePath: /nix/store/00000000000000000000000000000000-proof\n",
+                ),
+            )
+            .expect(1)
+            .mount(&upstream)
+            .await;
+        let service = nix_cache_service_for_test(&upstream, 1024);
+
+        let response = route_nix_cache_with_service(
+            "GET",
+            format!("{VM_NIX_CACHE_PATH_PREFIX}/{hash}.narinfo"),
+            service,
+        )
+        .await;
+
+        assert_eq!(response.status, VmHttpStatus::Ok);
+        assert!(
+            String::from_utf8(response.body)
+                .unwrap()
+                .contains("StorePath:")
+        );
+    }
+
+    #[tokio::test]
+    async fn nix_cache_route_maps_upstream_404_to_controlled_miss() {
+        let upstream = MockServer::start().await;
+        let hash = "00000000000000000000000000000000";
+        Mock::given(method("GET"))
+            .and(path(format!("/{hash}.narinfo")))
+            .respond_with(ResponseTemplate::new(404).set_body_string("upstream details"))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+        let service = nix_cache_service_for_test(&upstream, 1024);
+
+        let response = route_nix_cache_with_service(
+            "GET",
+            format!("{VM_NIX_CACHE_PATH_PREFIX}/{hash}.narinfo"),
+            service,
+        )
+        .await;
+
+        assert_eq!(response.status, VmHttpStatus::NotFound);
+        assert_eq!(String::from_utf8(response.body).unwrap(), "not found");
+    }
+
+    #[tokio::test]
+    async fn nix_cache_route_rejects_oversized_upstream_metadata() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/nix-cache-info"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("123456"))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+        let service = nix_cache_service_for_test(&upstream, 5);
+
+        let response =
+            route_nix_cache_with_service("GET", VM_NIX_CACHE_INFO_PATH.into(), service).await;
+
+        assert_eq!(response.status, VmHttpStatus::BadGateway);
+    }
+
+    #[tokio::test]
+    async fn nix_cache_route_rejects_non_get_head_without_contacting_upstream() {
+        let upstream = MockServer::start().await;
+        let service = nix_cache_service_for_test(&upstream, 1024);
+
+        let response =
+            route_nix_cache_with_service("POST", VM_NIX_CACHE_INFO_PATH.into(), service).await;
+
+        assert_eq!(response.status, VmHttpStatus::MethodNotAllowed);
+        upstream.verify().await;
     }
 
     #[test]
@@ -2094,6 +2504,7 @@ esac
                 Vec::new(),
                 &mut stream,
                 None::<VmHttpGitCloneService<Box<dyn SecretStore>>>,
+                None,
                 VM_HTTP_READ_TIMEOUT,
             )
             .await;
@@ -2123,6 +2534,7 @@ esac
             Vec::new(),
             &mut stream,
             Some(service),
+            None,
             VM_HTTP_READ_TIMEOUT,
         )
         .await;
@@ -2222,6 +2634,7 @@ esac
             },
             &mut stream,
             None::<VmHttpGitCloneService<Box<dyn SecretStore>>>,
+            None,
             VM_HTTP_READ_TIMEOUT,
         )
         .await;
@@ -2249,6 +2662,7 @@ esac
                 },
                 &mut stream,
                 None::<VmHttpGitCloneService<Box<dyn SecretStore>>>,
+                None,
                 VM_HTTP_READ_TIMEOUT,
             ),
         )
@@ -2279,6 +2693,7 @@ esac
                 },
                 &mut stream,
                 None::<VmHttpGitCloneService<Box<dyn SecretStore>>>,
+                None,
                 VM_HTTP_READ_TIMEOUT,
             ),
         )
@@ -2313,6 +2728,7 @@ esac
                 },
                 &mut stream,
                 Some(service),
+                None,
                 VM_HTTP_READ_TIMEOUT,
             ),
         )
@@ -2343,6 +2759,7 @@ esac
                 },
                 &mut stream,
                 None::<VmHttpGitCloneService<Box<dyn SecretStore>>>,
+                None,
                 VM_HTTP_READ_TIMEOUT,
             ),
         )
@@ -2377,6 +2794,7 @@ esac
             Ipv4Addr::LOCALHOST,
             range,
             git_clone_config_for_test(&temp, write_fake_git(temp.path())),
+            nix_cache_config_for_test(),
         );
         let session_id = "51b8fd0f-6c10-454c-b0e6-7df1d60e2e6d".parse().unwrap();
         let source_ipv4 = Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap();
@@ -2403,6 +2821,7 @@ esac
             Ipv4Addr::LOCALHOST,
             BrokerPortRange::new(1024, 65535).unwrap(),
             git_clone_config_for_test(&temp, write_fake_git(temp.path())),
+            nix_cache_config_for_test(),
         );
         let session_id = "51b8fd0f-6c10-454c-b0e6-7df1d60e2e6d".parse().unwrap();
         let source_ipv4 = Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap();
@@ -2865,6 +3284,7 @@ work_root=${{work_dir%/*}}
             bound.into_listener(),
             session.clone(),
             service,
+            VmHttpNixCacheService::new(nix_cache_config_for_test()),
             shutdown_rx,
         ));
 
@@ -2957,6 +3377,7 @@ work_root=${{work_dir%/*}}
             SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 34567)),
             session,
             Some(service),
+            None,
             std::time::Duration::from_millis(20),
         ));
 

@@ -20,7 +20,9 @@ use crate::policy::PolicyConfig;
 use crate::vm_git_bundle::{
     GitCloneBundlePlanError, GitCredentialBoundary, GitSecretEnvVar, GitSecretEnvVarError,
 };
-use crate::vm_http::{VmHttpGitCloneConfig, VmHttpGitRuntimeConfig};
+use crate::vm_http::{
+    VmHttpGitCloneConfig, VmHttpGitRuntimeConfig, VmHttpNixCacheConfig, VmHttpNixCacheConfigError,
+};
 
 /// Top-level daemon configuration. Loaded from a JSON file at startup;
 /// runtime-mutable config is not a goal for v1.
@@ -107,6 +109,8 @@ pub struct AgentVmHttpConfig {
     pub work_root: PathBuf,
     pub clone_timeout_secs: u64,
     pub max_bundle_bytes: u64,
+    pub nix_cache_url: String,
+    pub nix_cache_max_metadata_bytes: u64,
 }
 
 /// Which secret backend to use. The file backend is recommended for
@@ -132,6 +136,8 @@ pub enum AgentVmHttpConfigError {
     TokenEnv(#[from] GitSecretEnvVarError),
     #[error(transparent)]
     GitClone(#[from] GitCloneBundlePlanError),
+    #[error(transparent)]
+    NixCache(#[from] VmHttpNixCacheConfigError),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -207,10 +213,13 @@ impl AgentVmHttpConfig {
             Duration::from_secs(self.clone_timeout_secs),
             self.max_bundle_bytes,
         )?;
+        let nix_cache =
+            VmHttpNixCacheConfig::new(&self.nix_cache_url, self.nix_cache_max_metadata_bytes)?;
         Ok(VmHttpGitRuntimeConfig::new(
             self.bind_addr,
             broker_port_range,
             git_clone,
+            nix_cache,
         ))
     }
 }
@@ -412,7 +421,9 @@ mod tests {
                     "askpass_program": "/usr/local/libexec/writ-git-askpass",
                     "work_root": "/var/folders/writ/git-work",
                     "clone_timeout_secs": 30,
-                    "max_bundle_bytes": 1048576
+                    "max_bundle_bytes": 1048576,
+                    "nix_cache_url": "https://cache.nixos.org",
+                    "nix_cache_max_metadata_bytes": 1048576
                 }
             }
         }"#;
@@ -427,6 +438,14 @@ mod tests {
         assert_eq!(
             runtime.vm_http().git_clone().work_root(),
             PathBuf::from("/var/folders/writ/git-work")
+        );
+        assert_eq!(
+            runtime.vm_http().nix_cache().upstream_base_url().as_str(),
+            "https://cache.nixos.org/"
+        );
+        assert_eq!(
+            runtime.vm_http().nix_cache().max_metadata_bytes(),
+            1_048_576
         );
         assert_eq!(runtime.lifecycle().subnet_index_min(), 252);
         assert_eq!(runtime.lifecycle().subnet_index_max(), 253);
@@ -443,6 +462,8 @@ mod tests {
             work_root: PathBuf::from("/var/folders/writ/git-work"),
             clone_timeout_secs: 30,
             max_bundle_bytes: 1_048_576,
+            nix_cache_url: "https://cache.nixos.org".into(),
+            nix_cache_max_metadata_bytes: 1_048_576,
         }
     }
 
@@ -592,6 +613,32 @@ mod tests {
             c.to_runtime_config(),
             Err(AgentVmHttpConfigError::GitClone(
                 GitCloneBundlePlanError::ZeroMaxBundleBytes
+            ))
+        ));
+    }
+
+    #[test]
+    fn agent_vm_http_config_rejects_invalid_nix_cache_url() {
+        let mut c = valid_agent_vm_http_config();
+        c.nix_cache_url = "file:///nix/cache".into();
+
+        assert!(matches!(
+            c.to_runtime_config(),
+            Err(AgentVmHttpConfigError::NixCache(
+                VmHttpNixCacheConfigError::UnsupportedUpstreamScheme { .. }
+            ))
+        ));
+    }
+
+    #[test]
+    fn agent_vm_http_config_rejects_zero_nix_cache_metadata_limit() {
+        let mut c = valid_agent_vm_http_config();
+        c.nix_cache_max_metadata_bytes = 0;
+
+        assert!(matches!(
+            c.to_runtime_config(),
+            Err(AgentVmHttpConfigError::NixCache(
+                VmHttpNixCacheConfigError::EmptyMaxMetadataBytes
             ))
         ));
     }

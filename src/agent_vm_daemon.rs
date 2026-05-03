@@ -465,7 +465,7 @@ mod tests {
     use crate::policy::PolicyConfig;
     use crate::secret::{SecretError, SecretKey};
     use crate::vm_git_bundle::{GitCredentialBoundary, GitSecretEnvVar};
-    use crate::vm_http::VmHttpGitCloneConfig;
+    use crate::vm_http::{VmHttpGitCloneConfig, VmHttpNixCacheConfig};
 
     #[derive(Default)]
     struct InMemStore(StdMutex<std::collections::HashMap<String, String>>);
@@ -621,6 +621,7 @@ mod tests {
                     "0.0.0.0".parse().unwrap(),
                     BrokerPortRange::new(1024, 65535).unwrap(),
                     git_clone,
+                    VmHttpNixCacheConfig::new("http://127.0.0.1:9", 1024 * 1024).unwrap(),
                 ),
             )
             .unwrap(),

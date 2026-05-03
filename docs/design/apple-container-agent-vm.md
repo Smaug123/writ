@@ -867,6 +867,28 @@ First daemon-injected guest Nix config slice implemented in
   leakage into Nix output. This proves the injected config is sufficient for
   real guest Nix to authenticate to the VM HTTP route.
 
+First brokered Nix metadata proxy slice implemented in `src/vm_http.rs`,
+`src/config.rs`, and `scripts/prove-agent-vm-daemon.sh`:
+
+- `agent_vm.vm_http` now requires an explicit `nix_cache_url` plus a
+  nonzero `nix_cache_max_metadata_bytes`. Startup parsing normalises the
+  upstream base URL, accepts only `http`/`https`, rejects query/fragment
+  components and embedded credentials, and keeps the metadata byte cap typed in
+  the runtime config;
+- authenticated `GET`/`HEAD /v1/nix/cache/nix-cache-info` and valid
+  `/<hash>.narinfo` requests are proxied to that upstream. Response bodies are
+  read with a running byte counter, upstream 404s become controlled broker
+  404s, unsupported upstream statuses become 502s, and non-cache paths still
+  fail closed before reaching the upstream;
+- this remains a metadata-only proxy. NAR content streaming, signature/content
+  verification, cache-host allow-lists beyond the configured base URL, and
+  audit rows per Nix fetch are still separate slices;
+- the daemon proof harness now starts a local fake upstream binary cache and
+  verifies that guest Nix causes the daemon to fetch both `nix-cache-info` and
+  the target `.narinfo` from that upstream. The VM still observes a controlled
+  cache miss for the proof store path, but the miss is now through the proxy
+  rather than through a local skeleton response.
+
 ## Tests and proof spikes
 
 First pure slice implemented in `src/core/agent_vm.rs`:

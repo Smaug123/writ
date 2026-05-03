@@ -21,11 +21,13 @@ What it proves:
   - the VM can call `writ-vm session` on the daemon-owned VM HTTP listener
   - the VM can call `writ-vm git clone` and check out a host-produced bundle
   - the VM receives daemon-written Nix netrc/config and Nix reaches the
-    daemon-owned VM HTTP binary-cache route with authenticated Basic auth
+    daemon-owned VM HTTP binary-cache route with authenticated Basic auth;
+    the daemon proxies Nix metadata requests to a local fake upstream cache
   - `stop_agent_vm` removes the VM, network, PF anchor/states, and state record
 
-The GitHub API and host git binary are local fakes. This keeps the proof focused
-on Apple Container/PF/daemon wiring rather than real GitHub availability.
+The GitHub API, host git binary, and upstream Nix binary cache are local fakes.
+This keeps the proof focused on Apple Container/PF/daemon wiring rather than
+real GitHub or cache availability.
 
 Environment overrides:
   WRIT_PROVE_IMAGE       OCI image to run, default writ-agent-vm-guest:latest
@@ -85,10 +87,12 @@ STATE_DIR="${TMP_DIR}/state"
 SECRETS_DIR="${TMP_DIR}/secrets"
 GIT_WORK_ROOT="${TMP_DIR}/git-work"
 FAKE_GITHUB_SCRIPT="${TMP_DIR}/fake-github.py"
+FAKE_NIX_CACHE_SCRIPT="${TMP_DIR}/fake-nix-cache.py"
 FAKE_GIT="${TMP_DIR}/fake-git"
 FAKE_ASKPASS="${TMP_DIR}/fake-askpass"
 FAKE_GIT_ARGS_LOG="${TMP_DIR}/fake-git-args.log"
 FAKE_GITHUB_LOG="${TMP_DIR}/fake-github.log"
+FAKE_NIX_CACHE_LOG="${TMP_DIR}/fake-nix-cache.log"
 WRITD_LOG="${TMP_DIR}/writd.log"
 START_OUTPUT="${TMP_DIR}/agent-vm-start.txt"
 
@@ -99,6 +103,8 @@ WRITD_BIN=""
 HELPER=""
 FAKE_GITHUB_PORT=""
 FAKE_GITHUB_PID=""
+FAKE_NIX_CACHE_PORT=""
+FAKE_NIX_CACHE_PID=""
 WRITD_PID=""
 SESSION_ID=""
 NETWORK_NAME=""
@@ -122,6 +128,7 @@ dump_diagnostics() {
   printf '\n[prove-daemon] diagnostics for failed run under %s\n' "$TMP_DIR" >&2
   dump_log "writd log" "$WRITD_LOG"
   dump_log "fake GitHub log" "$FAKE_GITHUB_LOG"
+  dump_log "fake Nix cache log" "$FAKE_NIX_CACHE_LOG"
   dump_log "fake git argv log" "$FAKE_GIT_ARGS_LOG"
   dump_log "start output" "$START_OUTPUT"
   if [[ -d "$STATE_DIR" ]]; then
@@ -181,6 +188,10 @@ cleanup() {
   if [[ -n "$FAKE_GITHUB_PID" ]]; then
     kill "$FAKE_GITHUB_PID" >/dev/null 2>&1 || true
     wait "$FAKE_GITHUB_PID" 2>/dev/null || true
+  fi
+  if [[ -n "$FAKE_NIX_CACHE_PID" ]]; then
+    kill "$FAKE_NIX_CACHE_PID" >/dev/null 2>&1 || true
+    wait "$FAKE_NIX_CACHE_PID" 2>/dev/null || true
   fi
 
   if [[ "$status" -ne 0 ]]; then
@@ -333,6 +344,49 @@ server.serve_forever()
 PY
 }
 
+write_fake_nix_cache_server() {
+  cat >"$FAKE_NIX_CACHE_SCRIPT" <<'PY'
+import http.server
+import re
+import sys
+
+PORT = int(sys.argv[1])
+
+NIX_CACHE_INFO = b"StoreDir: /nix/store\nWantMassQuery: 0\nPriority: 30\n"
+NARINFO_RE = re.compile(r"^/[0-9abcdfghijklmnpqrsvwxyz]{32}\.narinfo$")
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def log_message(self, fmt, *args):
+        print(fmt % args, flush=True)
+
+    def _send(self, status, body=b""):
+        self.send_response(status)
+        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
+    def do_HEAD(self):
+        self.do_GET()
+
+    def do_GET(self):
+        if self.path == "/health":
+            self._send(200, b"ok\n")
+            return
+        if self.path == "/nix-cache-info":
+            self._send(200, NIX_CACHE_INFO)
+            return
+        if NARINFO_RE.match(self.path):
+            self._send(404, b"proof narinfo miss\n")
+            return
+        self._send(404, b"not found\n")
+
+server = http.server.ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
+server.serve_forever()
+PY
+}
+
 write_fake_git() {
   local escaped_real_git
   escaped_real_git="$(printf "%s" "$REAL_GIT" | sed "s/'/'\\\\''/g")"
@@ -422,6 +476,7 @@ write_config() {
     "$FAKE_ASKPASS" \
     "$GIT_WORK_ROOT" \
     "$FAKE_GITHUB_PORT" \
+    "$FAKE_NIX_CACHE_PORT" \
     "$PROOF_OWNER" <<'PY'
 import json
 import sys
@@ -443,6 +498,7 @@ import sys
     fake_askpass,
     git_work_root,
     fake_github_port,
+    fake_nix_cache_port,
     owner,
 ) = sys.argv[1:]
 
@@ -483,6 +539,8 @@ config = {
             "work_root": git_work_root,
             "clone_timeout_secs": 10,
             "max_bundle_bytes": 1048576,
+            "nix_cache_url": f"http://127.0.0.1:{fake_nix_cache_port}",
+            "nix_cache_max_metadata_bytes": 1048576,
         },
     },
 }
@@ -507,6 +565,22 @@ start_fake_github() {
     sleep 0.1
   done
   die "fake GitHub API did not start on port ${FAKE_GITHUB_PORT}"
+}
+
+start_fake_nix_cache() {
+  FAKE_NIX_CACHE_PORT="$(pick_port)"
+  write_fake_nix_cache_server
+  python3 "$FAKE_NIX_CACHE_SCRIPT" "$FAKE_NIX_CACHE_PORT" \
+    >"$FAKE_NIX_CACHE_LOG" 2>&1 &
+  FAKE_NIX_CACHE_PID="$!"
+  for _ in {1..50}; do
+    if curl --silent --fail --max-time 1 "http://127.0.0.1:${FAKE_NIX_CACHE_PORT}/health" \
+      >/dev/null 2>&1; then
+      return
+    fi
+    sleep 0.1
+  done
+  die "fake Nix cache did not start on port ${FAKE_NIX_CACHE_PORT}"
 }
 
 wait_for_writd_socket() {
@@ -600,6 +674,15 @@ assert_fake_git_used_cleanly() {
   fi
   if grep -Fq "$PROOF_TOKEN" "$FAKE_GIT_ARGS_LOG"; then
     die "fake git argv log leaked the proof token"
+  fi
+}
+
+assert_fake_nix_cache_used() {
+  if ! grep -Eq '"(GET|HEAD) /nix-cache-info ' "$FAKE_NIX_CACHE_LOG"; then
+    die "fake Nix cache log does not show nix-cache-info metadata request"
+  fi
+  if ! grep -Eq '"(GET|HEAD) /00000000000000000000000000000000\.narinfo ' "$FAKE_NIX_CACHE_LOG"; then
+    die "fake Nix cache log does not show narinfo metadata request"
   fi
 }
 
@@ -698,9 +781,10 @@ chmod 600 "${SECRETS_DIR}/gh-app-pk"
 
 write_fake_git
 start_fake_github
+start_fake_nix_cache
 write_config
 
-log "starting writd with fake GitHub API on port ${FAKE_GITHUB_PORT}"
+log "starting writd with fake GitHub API on port ${FAKE_GITHUB_PORT} and fake Nix cache on port ${FAKE_NIX_CACHE_PORT}"
 "$WRITD_BIN" --config "$CONFIG_FILE" --socket "$SOCKET_PATH" --audit-db "$AUDIT_DB" \
   >"$WRITD_LOG" 2>&1 &
 WRITD_PID="$!"
@@ -790,6 +874,7 @@ expect_guest_success "VM Nix reaches daemon VM HTTP cache route with injected ne
    dump_file "$stderr"
    exit 1'
 assert_fake_git_used_cleanly
+assert_fake_nix_cache_used
 
 log "stopping session through daemon"
 "$WRIT_BIN" --socket "$SOCKET_PATH" agent-vm stop "$SESSION_ID"
@@ -801,4 +886,4 @@ assert_pf_anchor_empty
 assert_no_pf_state_for_guest
 assert_state_removed
 
-log "daemon lifecycle proof succeeded for ${IPV4_CIDR}; writ-vm session, Git clone, and Nix cache auth worked inside the VM, and daemon stop cleanup was verified"
+log "daemon lifecycle proof succeeded for ${IPV4_CIDR}; writ-vm session, Git clone, and proxied Nix cache metadata worked inside the VM, and daemon stop cleanup was verified"
