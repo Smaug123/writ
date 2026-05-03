@@ -26,13 +26,58 @@ use crate::core::{
 use crate::secret::SecretStore;
 use crate::server::BrokerState;
 use crate::vm_http::{
-    RunningVmHttpGitSession, VmHttpGitRuntimeConfig, VmHttpGitRuntimeError,
-    VmHttpGitRuntimeShutdownError, prepare_vm_http_git_session,
+    RunningVmHttpGitSession, VM_NIX_BASIC_LOGIN, VM_NIX_CACHE_PATH_PREFIX, VmHttpGitRuntimeConfig,
+    VmHttpGitRuntimeError, VmHttpGitRuntimeShutdownError, prepare_vm_http_git_session,
 };
 
 pub use crate::vm_client::{
     VM_BROKER_TOKEN_ENV as AGENT_VM_BROKER_TOKEN_ENV, VM_BROKER_URL_ENV as AGENT_VM_BROKER_URL_ENV,
 };
+
+pub const AGENT_VM_NIX_CACHE_URL_ENV: &str = "WRIT_NIX_CACHE_URL";
+pub const AGENT_VM_NIX_BASIC_LOGIN_ENV: &str = "WRIT_NIX_BASIC_LOGIN";
+pub const AGENT_VM_NIX_NETRC_ENV: &str = "WRIT_NIX_NETRC";
+pub const AGENT_VM_NIX_NETRC_PATH: &str = "/run/writ-agent-vm/netrc";
+pub const AGENT_VM_NIX_CONF_DIR_ENV: &str = "NIX_CONF_DIR";
+pub const AGENT_VM_NIX_CONF_DIR: &str = "/run/writ-agent-vm/nix-conf";
+
+const AGENT_VM_GUEST_NIX_SETUP_SCRIPT: &str = r#"set -eu
+: "${WRIT_BROKER_TOKEN:?}"
+: "${WRIT_NIX_CACHE_URL:?}"
+: "${WRIT_NIX_BASIC_LOGIN:?}"
+: "${WRIT_NIX_NETRC:?}"
+: "${NIX_CONF_DIR:?}"
+
+case "$WRIT_NIX_CACHE_URL" in
+  http://*|https://*) ;;
+  *) echo "WRIT_NIX_CACHE_URL must be http or https" >&2; exit 64 ;;
+esac
+
+cache_authority="${WRIT_NIX_CACHE_URL#http://}"
+if [ "$cache_authority" = "$WRIT_NIX_CACHE_URL" ]; then
+  cache_authority="${WRIT_NIX_CACHE_URL#https://}"
+fi
+cache_host="${cache_authority%%/*}"
+cache_host="${cache_host%%:*}"
+if [ -z "$cache_host" ]; then
+  echo "WRIT_NIX_CACHE_URL has no host" >&2
+  exit 64
+fi
+
+mkdir -p /run/writ-agent-vm "$NIX_CONF_DIR"
+umask 077
+printf 'machine %s login %s password %s\n' \
+  "$cache_host" "$WRIT_NIX_BASIC_LOGIN" "$WRIT_BROKER_TOKEN" > "$WRIT_NIX_NETRC"
+{
+  printf 'experimental-features = nix-command\n'
+  printf 'netrc-file = %s\n' "$WRIT_NIX_NETRC"
+  printf 'access-tokens =\n'
+  printf 'substituters = %s\n' "$WRIT_NIX_CACHE_URL"
+  printf 'trusted-public-keys =\n'
+} > "$NIX_CONF_DIR/nix.conf"
+
+exec "$@"
+"#;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AgentVmDaemonRuntimeConfig {
@@ -294,6 +339,7 @@ impl AgentVmDaemon {
         .await?;
         let broker_port = prepared.broker_port();
         let broker_url = format!("http://{}:{}/", network.ipv4_gateway(), broker_port.get());
+        let nix_cache_url = nix_cache_url_for_broker_url(&broker_url);
         let broker_ports = BrokerPorts::new([broker_port])?;
         let guest_env = vec![
             AgentVmGuestEnvVar::new(AGENT_VM_BROKER_URL_ENV, broker_url.clone())?,
@@ -301,7 +347,12 @@ impl AgentVmDaemon {
                 AGENT_VM_BROKER_TOKEN_ENV,
                 prepared.bearer_token().as_str().to_string(),
             )?,
+            AgentVmGuestEnvVar::new(AGENT_VM_NIX_CACHE_URL_ENV, nix_cache_url)?,
+            AgentVmGuestEnvVar::new(AGENT_VM_NIX_BASIC_LOGIN_ENV, VM_NIX_BASIC_LOGIN)?,
+            AgentVmGuestEnvVar::new(AGENT_VM_NIX_NETRC_ENV, AGENT_VM_NIX_NETRC_PATH)?,
+            AgentVmGuestEnvVar::new(AGENT_VM_NIX_CONF_DIR_ENV, AGENT_VM_NIX_CONF_DIR)?,
         ];
+        let guest_command = wrap_guest_command_with_nix_setup(guest_command);
         let plan = AgentVmSessionPlan::new_with_guest_env(
             session_id,
             self.config.lifecycle.pool,
@@ -356,6 +407,25 @@ fn choose_subnet_index(
         min: lifecycle.subnet_index_min,
         max: lifecycle.subnet_index_max,
     })
+}
+
+fn nix_cache_url_for_broker_url(broker_url: &str) -> String {
+    format!(
+        "{}{}",
+        broker_url.trim_end_matches('/'),
+        VM_NIX_CACHE_PATH_PREFIX
+    )
+}
+
+fn wrap_guest_command_with_nix_setup(guest_command: Vec<String>) -> Vec<String> {
+    let mut wrapped = vec![
+        "sh".to_string(),
+        "-c".to_string(),
+        AGENT_VM_GUEST_NIX_SETUP_SCRIPT.to_string(),
+        "writ-agent-vm-nix-setup".to_string(),
+    ];
+    wrapped.extend(guest_command);
+    wrapped
 }
 
 impl AgentVmStarted {
@@ -611,9 +681,30 @@ mod tests {
             started.broker_url()
         )));
         assert!(env.contains(&format!("{AGENT_VM_BROKER_TOKEN_ENV}=writ-vm-")));
+        assert!(env.contains(&format!(
+            "{AGENT_VM_NIX_CACHE_URL_ENV}={}",
+            nix_cache_url_for_broker_url(started.broker_url())
+        )));
+        assert!(env.contains(&format!(
+            "{AGENT_VM_NIX_BASIC_LOGIN_ENV}={VM_NIX_BASIC_LOGIN}"
+        )));
+        assert!(env.contains(&format!(
+            "{AGENT_VM_NIX_NETRC_ENV}={AGENT_VM_NIX_NETRC_PATH}"
+        )));
+        assert!(env.contains(&format!(
+            "{AGENT_VM_NIX_CONF_DIR_ENV}={AGENT_VM_NIX_CONF_DIR}"
+        )));
         let args = fs::read_to_string(&args_log).unwrap();
         assert!(args.contains("--env-file"));
+        assert!(args.contains("writ-agent-vm-nix-setup"));
         assert!(!args.contains("writ-vm-"), "{args}");
+        let state_json = fs::read_to_string(
+            dir.path()
+                .join("state")
+                .join(format!("{}.json", started.session_id())),
+        )
+        .unwrap();
+        assert!(!state_json.contains("writ-vm-"), "{state_json}");
         let env_path = fs::read_to_string(&env_path_log).unwrap();
         assert!(
             !Path::new(env_path.trim()).exists(),
@@ -742,8 +833,35 @@ mod tests {
         assert!(audit_session.closed_at.is_some());
     }
 
+    #[test]
+    fn nix_cache_url_is_the_broker_url_under_the_cache_route() {
+        assert_eq!(
+            nix_cache_url_for_broker_url("http://192.168.252.1:51375/"),
+            "http://192.168.252.1:51375/v1/nix/cache"
+        );
+        assert_eq!(
+            nix_cache_url_for_broker_url("http://192.168.252.1:51375"),
+            "http://192.168.252.1:51375/v1/nix/cache"
+        );
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(32))]
+
+        #[test]
+        fn nix_setup_wrapper_preserves_guest_command_argv(
+            guest_command in prop::collection::vec(any::<String>(), 1..16),
+        ) {
+            let wrapped = wrap_guest_command_with_nix_setup(guest_command.clone());
+            prop_assert_eq!(&wrapped[..4], &[
+                "sh".to_string(),
+                "-c".to_string(),
+                AGENT_VM_GUEST_NIX_SETUP_SCRIPT.to_string(),
+                "writ-agent-vm-nix-setup".to_string(),
+            ]);
+            prop_assert_eq!(&wrapped[4..], guest_command.as_slice());
+            prop_assert!(!wrapped.join("\n").contains("writ-vm-"));
+        }
 
         #[test]
         fn choose_subnet_index_returns_first_unused_or_reports_full(

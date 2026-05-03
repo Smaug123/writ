@@ -37,7 +37,7 @@ const EPHEMERAL_BIND_ATTEMPTS: usize = 32;
 const MAX_VM_HTTP_CONNECTIONS: usize = 256;
 pub const VM_NIX_CACHE_PATH_PREFIX: &str = "/v1/nix/cache";
 const VM_NIX_CACHE_INFO_PATH: &str = "/v1/nix/cache/nix-cache-info";
-const VM_NIX_BASIC_LOGIN: &str = "writ-vm";
+pub const VM_NIX_BASIC_LOGIN: &str = "writ-vm";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VmHttpSession {

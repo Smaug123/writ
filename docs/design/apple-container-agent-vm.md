@@ -842,8 +842,30 @@ First VM HTTP Nix cache route slice implemented in `src/vm_http.rs` and
   server and runs host Nix with a temporary netrc file against the skeleton
   cache, proving Nix can authenticate to the broker route without putting the
   session token in the substituter URL, argv, stdout, or stderr;
-- the daemon does not yet inject guest Nix netrc/config. That is the next
-  integration step before the managed VM can run Nix through this route.
+- that route slice stopped short of injecting guest Nix netrc/config; the next
+  slice below wires that into managed VM start.
+
+First daemon-injected guest Nix config slice implemented in
+`src/agent_vm_daemon.rs` and `scripts/prove-agent-vm-daemon.sh`:
+
+- `start_agent_vm` now injects `WRIT_NIX_CACHE_URL`,
+  `WRIT_NIX_BASIC_LOGIN`, `WRIT_NIX_NETRC`, and `NIX_CONF_DIR` alongside the
+  existing VM HTTP broker URL/token. The cache URL is derived mechanically from
+  the per-session broker URL as `/v1/nix/cache`;
+- the daemon wraps the requested guest command in a small guest-local setup
+  script. Before executing the requested command it writes a `0600` netrc at
+  `/run/writ-agent-vm/netrc` with login `writ-vm` and the VM bearer token, and
+  writes `/run/writ-agent-vm/nix-conf/nix.conf` with `nix-command`,
+  `netrc-file`, empty ambient token/key settings, and the brokered cache as the
+  configured substituter;
+- the managed state file still does not persist the bearer value. Unit tests
+  assert the env-file and command argv carry no token in process argv/state, and
+  a property test checks the wrapper preserves the original guest argv exactly;
+- the daemon proof harness now runs host-started guest Nix inside the managed
+  VM against `$WRIT_NIX_CACHE_URL`. The expected result is a nonzero
+  authenticated cache miss from the skeleton route, not 401/403 and not token
+  leakage into Nix output. This proves the injected config is sufficient for
+  real guest Nix to authenticate to the VM HTTP route.
 
 ## Tests and proof spikes
 
@@ -1023,12 +1045,15 @@ Manual daemon proof harness added in `scripts/prove-agent-vm-daemon.sh`:
   `writ agent-vm start -- <guest-command>`;
 - asserts the released guest command is running, the guest still has no
   routable IPv6 posture, and the daemon-injected `WRIT_BROKER_URL` /
-  `WRIT_BROKER_TOKEN` environment variables are present;
-- from inside the VM, runs `writ-vm session` and `writ-vm git clone` through
-  the daemon-owned VM HTTP listener. The clone route must mint through the fake
-  GitHub API, run the fake host `git` without leaking the token in argv, return
-  a valid deterministic Git bundle to the VM client, and let guest-local Git
-  create a checkout from that bundle;
+  `WRIT_BROKER_TOKEN` environment variables are present. It also checks the
+  daemon-written Nix netrc/config paths exist inside the VM;
+- from inside the VM, runs `writ-vm session`, `writ-vm git clone`, and
+  `nix path-info --store "$WRIT_NIX_CACHE_URL"` through the daemon-owned VM
+  HTTP listener. The clone route must mint through the fake GitHub API, run the
+  fake host `git` without leaking the token in argv, return a valid
+  deterministic Git bundle to the VM client, and let guest-local Git create a
+  checkout from that bundle. The Nix route must authenticate with the
+  daemon-written netrc and fail only at the skeleton cache miss;
 - stops the session through `writ agent-vm stop <session-id>` and asserts the
   VM, network, PF anchor, observed guest-IPv4 PF states, and managed state
   record are gone.

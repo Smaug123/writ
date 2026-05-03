@@ -20,6 +20,8 @@ What it proves:
   - the VM receives WRIT_BROKER_URL and WRIT_BROKER_TOKEN through the daemon
   - the VM can call `writ-vm session` on the daemon-owned VM HTTP listener
   - the VM can call `writ-vm git clone` and check out a host-produced bundle
+  - the VM receives daemon-written Nix netrc/config and Nix reaches the
+    daemon-owned VM HTTP binary-cache route with authenticated Basic auth
   - `stop_agent_vm` removes the VM, network, PF anchor/states, and state record
 
 The GitHub API and host git binary are local fakes. This keeps the proof focused
@@ -735,6 +737,12 @@ log "guest IPv4 address is ${GUEST_IPV4}"
 
 expect_guest_success "guest sees daemon-injected broker URL and token" \
   'test -n "$WRIT_BROKER_URL" && test -n "$WRIT_BROKER_TOKEN"'
+expect_guest_success "guest sees daemon-written Nix cache auth config" \
+  'test -n "$WRIT_NIX_CACHE_URL" && \
+    test -n "$WRIT_NIX_NETRC" && \
+    test -n "$NIX_CONF_DIR" && \
+    test -f "$WRIT_NIX_NETRC" && \
+    test -f "$NIX_CONF_DIR/nix.conf"'
 expect_guest_success "VM can call daemon VM HTTP session endpoint through writ-vm" \
   "session_json=\"\$(writ-vm session)\" && \
     case \"\$session_json\" in *'\"api\": \"writ-vm-http\"'*) ;; *) printf '%s\n' \"\$session_json\"; exit 1;; esac && \
@@ -744,6 +752,43 @@ expect_guest_success "VM can clone a host-produced Git bundle through writ-vm" \
     writ-vm git clone '${PROOF_REPO_FULL}' /tmp/writ-agent-vm-checkout && \
     test \"\$(git -C /tmp/writ-agent-vm-checkout rev-parse --is-inside-work-tree)\" = true && \
     test \"\$(cat /tmp/writ-agent-vm-checkout/README.md)\" = '${PROOF_BUNDLE_MARKER}'"
+expect_guest_success "VM Nix reaches daemon VM HTTP cache route with injected netrc auth" \
+  'contains_file() {
+     needle="$1"
+     file="$2"
+     while IFS= read -r line; do
+       case "$line" in *"$needle"*) return 0;; esac
+     done < "$file"
+     return 1
+   }
+   dump_file() {
+     file="$1"
+     while IFS= read -r line; do printf "%s\n" "$line"; done < "$file"
+   }
+   store_path=/nix/store/00000000000000000000000000000000-writ-nix-route-proof
+   stdout=/tmp/writ-nix-cache.stdout
+   stderr=/tmp/writ-nix-cache.stderr
+   set +e
+   nix path-info --refresh --store "$WRIT_NIX_CACHE_URL" "$store_path" >"$stdout" 2>"$stderr"
+   rc=$?
+   set -e
+   if [ "$rc" -eq 0 ]; then
+     printf "Nix unexpectedly succeeded for %s\n" "$store_path"
+     exit 1
+   fi
+   if contains_file "$WRIT_BROKER_TOKEN" "$stdout" || contains_file "$WRIT_BROKER_TOKEN" "$stderr"; then
+     printf "Nix output leaked the VM broker token\n"
+     exit 1
+   fi
+   if contains_file "401" "$stderr" || contains_file "403" "$stderr"; then
+     dump_file "$stderr"
+     exit 1
+   fi
+   if contains_file "404" "$stderr" || contains_file "not valid" "$stderr" || contains_file "does not exist" "$stderr"; then
+     exit 0
+   fi
+   dump_file "$stderr"
+   exit 1'
 assert_fake_git_used_cleanly
 
 log "stopping session through daemon"
@@ -756,4 +801,4 @@ assert_pf_anchor_empty
 assert_no_pf_state_for_guest
 assert_state_removed
 
-log "daemon lifecycle proof succeeded for ${IPV4_CIDR}; writ-vm session and Git clone worked inside the VM, and daemon stop cleanup was verified"
+log "daemon lifecycle proof succeeded for ${IPV4_CIDR}; writ-vm session, Git clone, and Nix cache auth worked inside the VM, and daemon stop cleanup was verified"
