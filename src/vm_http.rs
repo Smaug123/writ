@@ -35,6 +35,9 @@ const MAX_VM_HTTP_BODY_BYTES: usize = 64 * 1024;
 const VM_HTTP_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const EPHEMERAL_BIND_ATTEMPTS: usize = 32;
 const MAX_VM_HTTP_CONNECTIONS: usize = 256;
+pub const VM_NIX_CACHE_PATH_PREFIX: &str = "/v1/nix/cache";
+const VM_NIX_CACHE_INFO_PATH: &str = "/v1/nix/cache/nix-cache-info";
+const VM_NIX_BASIC_LOGIN: &str = "writ-vm";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VmHttpSession {
@@ -103,8 +106,8 @@ pub enum VmHttpAuthorization {
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum VmHttpAuthError {
-    MissingBearerToken,
-    WrongBearerToken,
+    MissingCredentials,
+    WrongCredentials,
     SourceOutsideSessionSubnet,
 }
 
@@ -175,6 +178,7 @@ struct VmHttpResponse {
     status: VmHttpStatus,
     content_type: &'static str,
     body: Vec<u8>,
+    www_authenticate: Option<&'static str>,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -188,6 +192,18 @@ struct SessionResponse {
     session_id: SessionId,
     api: &'static str,
     version: u32,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum VmHttpAuthScheme {
+    Bearer,
+    Basic,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum VmNixCacheRoute {
+    CacheInfo,
+    NarInfo,
 }
 
 impl VmHttpSession {
@@ -606,6 +622,14 @@ pub fn authorize_vm_http_request(
     session: &VmHttpSession,
     request: &VmHttpRequest,
 ) -> VmHttpAuthorization {
+    authorize_vm_http_request_with_scheme(session, request, auth_scheme_for_target(&request.target))
+}
+
+fn authorize_vm_http_request_with_scheme(
+    session: &VmHttpSession,
+    request: &VmHttpRequest,
+    scheme: VmHttpAuthScheme,
+) -> VmHttpAuthorization {
     let IpAddr::V4(source) = request.peer_addr.ip() else {
         return VmHttpAuthorization::Deny(VmHttpAuthError::SourceOutsideSessionSubnet);
     };
@@ -613,15 +637,47 @@ pub fn authorize_vm_http_request(
         return VmHttpAuthorization::Deny(VmHttpAuthError::SourceOutsideSessionSubnet);
     }
     let Some(header) = request.authorization.as_deref() else {
-        return VmHttpAuthorization::Deny(VmHttpAuthError::MissingBearerToken);
+        return VmHttpAuthorization::Deny(VmHttpAuthError::MissingCredentials);
     };
+    match scheme {
+        VmHttpAuthScheme::Bearer => authorize_bearer_header(session, header),
+        VmHttpAuthScheme::Basic => authorize_basic_header(session, header),
+    }
+}
+
+fn authorize_bearer_header(session: &VmHttpSession, header: &str) -> VmHttpAuthorization {
     let Some(token) = header.strip_prefix("Bearer ") else {
-        return VmHttpAuthorization::Deny(VmHttpAuthError::WrongBearerToken);
+        return VmHttpAuthorization::Deny(VmHttpAuthError::WrongCredentials);
     };
     if constant_time_eq(token.as_bytes(), session.bearer_token.as_str().as_bytes()) {
         VmHttpAuthorization::Allow
     } else {
-        VmHttpAuthorization::Deny(VmHttpAuthError::WrongBearerToken)
+        VmHttpAuthorization::Deny(VmHttpAuthError::WrongCredentials)
+    }
+}
+
+fn authorize_basic_header(session: &VmHttpSession, header: &str) -> VmHttpAuthorization {
+    let Some(encoded) = header.strip_prefix("Basic ") else {
+        return VmHttpAuthorization::Deny(VmHttpAuthError::WrongCredentials);
+    };
+    let expected = basic_authorization_value(session);
+    if constant_time_eq(encoded.as_bytes(), expected.as_bytes()) {
+        VmHttpAuthorization::Allow
+    } else {
+        VmHttpAuthorization::Deny(VmHttpAuthError::WrongCredentials)
+    }
+}
+
+fn basic_authorization_value(session: &VmHttpSession) -> String {
+    let credentials = format!("{VM_NIX_BASIC_LOGIN}:{}", session.bearer_token.as_str());
+    base64_standard(credentials.as_bytes())
+}
+
+fn auth_scheme_for_target(target: &str) -> VmHttpAuthScheme {
+    if is_nix_cache_target(target) {
+        VmHttpAuthScheme::Basic
+    } else {
+        VmHttpAuthScheme::Bearer
     }
 }
 
@@ -689,17 +745,13 @@ fn dispatch_vm_http_head(
         Ok(request) => request,
         Err(err) => return VmHttpResponse::text(VmHttpStatus::BadRequest, err.to_string()),
     };
-    match authorize_vm_http_request(session, &request) {
+    let auth_scheme = auth_scheme_for_target(&request.target);
+    match authorize_vm_http_request_with_scheme(session, &request, auth_scheme) {
+        VmHttpAuthorization::Allow if is_nix_cache_target(&request.target) => {
+            route_nix_cache_request(&request)
+        }
         VmHttpAuthorization::Allow => route_session_endpoint(session, &request),
-        VmHttpAuthorization::Deny(VmHttpAuthError::MissingBearerToken) => {
-            VmHttpResponse::text(VmHttpStatus::Unauthorized, "missing bearer token")
-        }
-        VmHttpAuthorization::Deny(VmHttpAuthError::WrongBearerToken) => {
-            VmHttpResponse::text(VmHttpStatus::Unauthorized, "invalid bearer token")
-        }
-        VmHttpAuthorization::Deny(VmHttpAuthError::SourceOutsideSessionSubnet) => {
-            VmHttpResponse::text(VmHttpStatus::Forbidden, "source outside session subnet")
-        }
+        VmHttpAuthorization::Deny(err) => auth_error_response(auth_scheme, err),
     }
 }
 
@@ -719,7 +771,8 @@ where
         Ok(request) => request,
         Err(err) => return VmHttpResponse::text(VmHttpStatus::BadRequest, err.to_string()),
     };
-    match authorize_vm_http_request(session, &request) {
+    let auth_scheme = auth_scheme_for_target(&request.target);
+    match authorize_vm_http_request_with_scheme(session, &request, auth_scheme) {
         VmHttpAuthorization::Allow => {
             route_authenticated_vm_http_request(
                 session,
@@ -731,15 +784,33 @@ where
             )
             .await
         }
-        VmHttpAuthorization::Deny(VmHttpAuthError::MissingBearerToken) => {
-            VmHttpResponse::text(VmHttpStatus::Unauthorized, "missing bearer token")
-        }
-        VmHttpAuthorization::Deny(VmHttpAuthError::WrongBearerToken) => {
-            VmHttpResponse::text(VmHttpStatus::Unauthorized, "invalid bearer token")
-        }
-        VmHttpAuthorization::Deny(VmHttpAuthError::SourceOutsideSessionSubnet) => {
+        VmHttpAuthorization::Deny(err) => auth_error_response(auth_scheme, err),
+    }
+}
+
+fn auth_error_response(scheme: VmHttpAuthScheme, err: VmHttpAuthError) -> VmHttpResponse {
+    match err {
+        VmHttpAuthError::SourceOutsideSessionSubnet => {
             VmHttpResponse::text(VmHttpStatus::Forbidden, "source outside session subnet")
         }
+        VmHttpAuthError::MissingCredentials => match scheme {
+            VmHttpAuthScheme::Bearer => {
+                VmHttpResponse::unauthorized("Bearer", "missing bearer token")
+            }
+            VmHttpAuthScheme::Basic => VmHttpResponse::unauthorized(
+                "Basic realm=\"writ-nix-cache\"",
+                "missing basic credentials",
+            ),
+        },
+        VmHttpAuthError::WrongCredentials => match scheme {
+            VmHttpAuthScheme::Bearer => {
+                VmHttpResponse::unauthorized("Bearer", "invalid bearer token")
+            }
+            VmHttpAuthScheme::Basic => VmHttpResponse::unauthorized(
+                "Basic realm=\"writ-nix-cache\"",
+                "invalid basic credentials",
+            ),
+        },
     }
 }
 
@@ -755,6 +826,10 @@ where
     S: SecretStore + Send + Sync,
     R: AsyncRead + Unpin,
 {
+    if is_nix_cache_target(&request.target) {
+        return route_nix_cache_request(request);
+    }
+
     if request.target == VM_GIT_CLONE_PATH {
         let Some(service) = git_clone else {
             return VmHttpResponse::text(VmHttpStatus::NotFound, "not found");
@@ -779,6 +854,25 @@ where
     route_session_endpoint(session, request)
 }
 
+fn route_nix_cache_request(request: &VmHttpRequest) -> VmHttpResponse {
+    let Some(route) = classify_nix_cache_target(&request.target) else {
+        return VmHttpResponse::text(VmHttpStatus::NotFound, "not found");
+    };
+    match (request.method.as_str(), route) {
+        ("GET", VmNixCacheRoute::CacheInfo) => VmHttpResponse::text(
+            VmHttpStatus::Ok,
+            "StoreDir: /nix/store\nWantMassQuery: 0\nPriority: 40\n",
+        ),
+        ("HEAD", VmNixCacheRoute::CacheInfo) => VmHttpResponse::text(VmHttpStatus::Ok, ""),
+        ("GET" | "HEAD", VmNixCacheRoute::NarInfo) => {
+            VmHttpResponse::text(VmHttpStatus::NotFound, "not found")
+        }
+        (_, VmNixCacheRoute::CacheInfo | VmNixCacheRoute::NarInfo) => {
+            VmHttpResponse::text(VmHttpStatus::MethodNotAllowed, "method not allowed")
+        }
+    }
+}
+
 fn route_session_endpoint(session: &VmHttpSession, request: &VmHttpRequest) -> VmHttpResponse {
     match (request.method.as_str(), request.target.as_str()) {
         ("GET", "/v1/session") => VmHttpResponse::json(
@@ -795,6 +889,34 @@ fn route_session_endpoint(session: &VmHttpSession, request: &VmHttpRequest) -> V
         }
         _ => VmHttpResponse::text(VmHttpStatus::NotFound, "not found"),
     }
+}
+
+fn is_nix_cache_target(target: &str) -> bool {
+    target == VM_NIX_CACHE_PATH_PREFIX
+        || target == VM_NIX_CACHE_INFO_PATH
+        || target
+            .strip_prefix(VM_NIX_CACHE_PATH_PREFIX)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+fn classify_nix_cache_target(target: &str) -> Option<VmNixCacheRoute> {
+    if target == VM_NIX_CACHE_INFO_PATH {
+        return Some(VmNixCacheRoute::CacheInfo);
+    }
+    let suffix = target.strip_prefix(&format!("{VM_NIX_CACHE_PATH_PREFIX}/"))?;
+    let hash = suffix.strip_suffix(".narinfo")?;
+    if is_nix_store_hash_part(hash) {
+        Some(VmNixCacheRoute::NarInfo)
+    } else {
+        None
+    }
+}
+
+fn is_nix_store_hash_part(value: &str) -> bool {
+    value.len() == 32
+        && value
+            .bytes()
+            .all(|byte| b"0123456789abcdfghijklmnpqrsvwxyz".contains(&byte))
 }
 
 async fn read_http_body_for_git_clone_route<R: AsyncRead + Unpin>(
@@ -878,6 +1000,7 @@ async fn handle_git_clone_request<S: SecretStore + Send + Sync>(
             status: VmHttpStatus::Ok,
             content_type: GIT_BUNDLE_CONTENT_TYPE,
             body: bundle,
+            www_authenticate: None,
         },
         Err(message) => git_error_response(
             VmHttpStatus::InternalServerError,
@@ -1188,6 +1311,7 @@ impl VmHttpResponse {
             status,
             content_type: "application/json",
             body: serde_json::to_vec(value).expect("VM HTTP response always serializes"),
+            www_authenticate: None,
         }
     }
 
@@ -1196,6 +1320,16 @@ impl VmHttpResponse {
             status,
             content_type: "text/plain; charset=utf-8",
             body: body.into().into_bytes(),
+            www_authenticate: None,
+        }
+    }
+
+    fn unauthorized(challenge: &'static str, body: impl Into<String>) -> Self {
+        Self {
+            status: VmHttpStatus::Unauthorized,
+            content_type: "text/plain; charset=utf-8",
+            body: body.into().into_bytes(),
+            www_authenticate: Some(challenge),
         }
     }
 
@@ -1207,8 +1341,8 @@ impl VmHttpResponse {
             self.body.len()
         )
         .into_bytes();
-        if self.status == VmHttpStatus::Unauthorized {
-            out.extend_from_slice(b"WWW-Authenticate: Bearer\r\n");
+        if let Some(challenge) = self.www_authenticate {
+            out.extend_from_slice(format!("WWW-Authenticate: {challenge}\r\n").as_bytes());
         }
         out.extend_from_slice(b"\r\n");
         out.extend_from_slice(&self.body);
@@ -1240,6 +1374,30 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
         diff |= usize::from(left_byte ^ right_byte);
     }
     diff == 0
+}
+
+fn base64_standard(input: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        let first = chunk[0];
+        let second = chunk.get(1).copied().unwrap_or(0);
+        let third = chunk.get(2).copied().unwrap_or(0);
+
+        out.push(ALPHABET[usize::from(first >> 2)] as char);
+        out.push(ALPHABET[usize::from(((first & 0b0000_0011) << 4) | (second >> 4))] as char);
+        if chunk.len() > 1 {
+            out.push(ALPHABET[usize::from(((second & 0b0000_1111) << 2) | (third >> 6))] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(ALPHABET[usize::from(third & 0b0011_1111)] as char);
+        } else {
+            out.push('=');
+        }
+    }
+    out
 }
 
 fn report_vm_http_handler_result(result: Result<std::io::Result<()>, tokio::task::JoinError>) {
@@ -1489,6 +1647,57 @@ esac
         format!("Bearer {value}")
     }
 
+    fn basic(value: &str) -> String {
+        format!(
+            "Basic {}",
+            base64_standard(format!("{VM_NIX_BASIC_LOGIN}:{value}").as_bytes())
+        )
+    }
+
+    fn nix_cache_request(
+        method: impl Into<String>,
+        target: impl Into<String>,
+        source: Ipv4Addr,
+        authorization: Option<String>,
+    ) -> VmHttpRequest {
+        VmHttpRequest::new(
+            method,
+            target,
+            authorization,
+            SocketAddr::V4(SocketAddrV4::new(source, 34567)),
+        )
+    }
+
+    fn arb_nix_hash_part() -> impl Strategy<Value = String> {
+        prop::collection::vec(
+            prop::sample::select(
+                b"0123456789abcdfghijklmnpqrsvwxyz"
+                    .iter()
+                    .copied()
+                    .map(char::from)
+                    .collect::<Vec<_>>(),
+            ),
+            32,
+        )
+        .prop_map(|chars| chars.into_iter().collect())
+    }
+
+    fn arb_wrong_length_nix_hash_part() -> impl Strategy<Value = String> {
+        prop_oneof![0usize..32, 33usize..64].prop_flat_map(|len| {
+            prop::collection::vec(
+                prop::sample::select(
+                    b"0123456789abcdfghijklmnpqrsvwxyz"
+                        .iter()
+                        .copied()
+                        .map(char::from)
+                        .collect::<Vec<_>>(),
+                ),
+                len,
+            )
+            .prop_map(|chars| chars.into_iter().collect())
+        })
+    }
+
     fn arbitrary_socket_addr() -> impl Strategy<Value = SocketAddr> {
         prop_oneof![
             (any::<[u8; 4]>(), any::<u16>())
@@ -1616,6 +1825,18 @@ esac
             let request = VmHttpRequest::new("GET", "/v1/session", authorization, peer_addr);
             let _ = authorize_vm_http_request(&session, &request);
         }
+
+        #[test]
+        fn valid_nix_store_hash_parts_are_narinfo_routes(hash in arb_nix_hash_part()) {
+            let target = format!("{VM_NIX_CACHE_PATH_PREFIX}/{hash}.narinfo");
+            prop_assert_eq!(classify_nix_cache_target(&target), Some(VmNixCacheRoute::NarInfo));
+        }
+
+        #[test]
+        fn wrong_length_nix_store_hash_parts_are_not_narinfo_routes(hash in arb_wrong_length_nix_hash_part()) {
+            let target = format!("{VM_NIX_CACHE_PATH_PREFIX}/{hash}.narinfo");
+            prop_assert_eq!(classify_nix_cache_target(&target), None);
+        }
     }
 
     #[test]
@@ -1625,16 +1846,139 @@ esac
 
         assert_eq!(
             authorize_vm_http_request(&session, &request(source, None)),
-            VmHttpAuthorization::Deny(VmHttpAuthError::MissingBearerToken)
+            VmHttpAuthorization::Deny(VmHttpAuthError::MissingCredentials)
         );
         assert_eq!(
             authorize_vm_http_request(&session, &request(source, Some("Basic nope".into()))),
-            VmHttpAuthorization::Deny(VmHttpAuthError::WrongBearerToken)
+            VmHttpAuthorization::Deny(VmHttpAuthError::WrongCredentials)
         );
         assert_eq!(
             authorize_vm_http_request(&session, &request(source, Some(bearer("wrong")))),
-            VmHttpAuthorization::Deny(VmHttpAuthError::WrongBearerToken)
+            VmHttpAuthorization::Deny(VmHttpAuthError::WrongCredentials)
         );
+    }
+
+    #[test]
+    fn nix_cache_routes_accept_basic_auth_only() {
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(10, 1, 2, 0), 24).unwrap());
+        let source = Ipv4Addr::new(10, 1, 2, 42);
+
+        assert_eq!(
+            authorize_vm_http_request(
+                &session,
+                &nix_cache_request(
+                    "GET",
+                    VM_NIX_CACHE_INFO_PATH,
+                    source,
+                    Some(basic(token().as_str()))
+                ),
+            ),
+            VmHttpAuthorization::Allow
+        );
+        assert_eq!(
+            authorize_vm_http_request(
+                &session,
+                &nix_cache_request(
+                    "GET",
+                    VM_NIX_CACHE_INFO_PATH,
+                    source,
+                    Some(bearer(token().as_str()))
+                ),
+            ),
+            VmHttpAuthorization::Deny(VmHttpAuthError::WrongCredentials)
+        );
+        assert_eq!(
+            authorize_vm_http_request(
+                &session,
+                &nix_cache_request("GET", VM_NIX_CACHE_INFO_PATH, source, Some(basic("wrong"))),
+            ),
+            VmHttpAuthorization::Deny(VmHttpAuthError::WrongCredentials)
+        );
+    }
+
+    #[test]
+    fn non_nix_routes_do_not_accept_basic_auth() {
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(10, 1, 2, 0), 24).unwrap());
+        let source = Ipv4Addr::new(10, 1, 2, 42);
+
+        assert_eq!(
+            authorize_vm_http_request(&session, &request(source, Some(basic(token().as_str())))),
+            VmHttpAuthorization::Deny(VmHttpAuthError::WrongCredentials)
+        );
+    }
+
+    #[test]
+    fn nix_cache_auth_challenge_is_basic() {
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(10, 1, 2, 0), 24).unwrap());
+        let response = dispatch_vm_http_head(
+            &session,
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(10, 1, 2, 3), 12345)),
+            format!("GET {VM_NIX_CACHE_INFO_PATH} HTTP/1.1\r\n\r\n").as_bytes(),
+        );
+
+        assert_eq!(response.status, VmHttpStatus::Unauthorized);
+        let wire = String::from_utf8(response.to_bytes()).unwrap();
+        assert!(
+            wire.contains("WWW-Authenticate: Basic realm=\"writ-nix-cache\""),
+            "{wire}"
+        );
+        assert!(!wire.contains("WWW-Authenticate: Bearer"), "{wire}");
+    }
+
+    #[test]
+    fn nix_cache_info_route_returns_binary_cache_metadata() {
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(10, 1, 2, 0), 24).unwrap());
+        let response = dispatch_vm_http_head(
+            &session,
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(10, 1, 2, 3), 12345)),
+            format!(
+                "GET {VM_NIX_CACHE_INFO_PATH} HTTP/1.1\r\nAuthorization: {}\r\n\r\n",
+                basic(token().as_str())
+            )
+            .as_bytes(),
+        );
+
+        assert_eq!(response.status, VmHttpStatus::Ok);
+        let body = String::from_utf8(response.body).unwrap();
+        assert!(body.contains("StoreDir: /nix/store"), "{body}");
+        assert!(body.contains("WantMassQuery: 0"), "{body}");
+        assert!(body.contains("Priority: 40"), "{body}");
+    }
+
+    #[test]
+    fn nix_cache_narinfo_route_returns_controlled_miss() {
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(10, 1, 2, 0), 24).unwrap());
+        let target = format!("{VM_NIX_CACHE_PATH_PREFIX}/00000000000000000000000000000000.narinfo");
+        let response = dispatch_vm_http_head(
+            &session,
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(10, 1, 2, 3), 12345)),
+            format!(
+                "GET {target} HTTP/1.1\r\nAuthorization: {}\r\n\r\n",
+                basic(token().as_str())
+            )
+            .as_bytes(),
+        );
+
+        assert_eq!(response.status, VmHttpStatus::NotFound);
+    }
+
+    #[test]
+    fn nix_cache_path_classifier_rejects_non_cache_protocol_paths() {
+        for target in [
+            VM_NIX_CACHE_PATH_PREFIX,
+            "/v1/nix/cache/",
+            "/v1/nix/cache/not-a-store-hash.narinfo",
+            "/v1/nix/cache/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee.narinfo",
+            "/v1/nix/cache/00000000000000000000000000000000.nar",
+            "/v1/nix/cache/subdir/00000000000000000000000000000000.narinfo",
+            "/v1/nix/cacheevil/00000000000000000000000000000000.narinfo",
+        ] {
+            assert_eq!(
+                classify_nix_cache_target(target),
+                None,
+                "accepted {target:?}"
+            );
+        }
     }
 
     #[test]
@@ -1976,6 +2320,36 @@ esac
         .expect("non-POST Git clone route must not wait for a declared body");
 
         assert_eq!(response.status, VmHttpStatus::NotFound);
+    }
+
+    #[tokio::test]
+    async fn nix_cache_route_does_not_read_declared_body() {
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(10, 1, 2, 0), 24).unwrap());
+        let raw_head = format!(
+            "GET {VM_NIX_CACHE_INFO_PATH} HTTP/1.1\r\nAuthorization: {}\r\nContent-Length: 1\r\n\r\n",
+            basic(token().as_str())
+        )
+        .into_bytes();
+        let (_client, mut stream) = tokio::io::duplex(1);
+
+        let response = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            dispatch_vm_http_head_and_body(
+                &session,
+                SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(10, 1, 2, 3), 12345)),
+                VmHttpHeadRead {
+                    raw_head,
+                    buffered_body: Vec::new(),
+                },
+                &mut stream,
+                None::<VmHttpGitCloneService<Box<dyn SecretStore>>>,
+                VM_HTTP_READ_TIMEOUT,
+            ),
+        )
+        .await
+        .expect("Nix cache route must not wait for a declared body");
+
+        assert_eq!(response.status, VmHttpStatus::Ok);
     }
 
     #[tokio::test]
@@ -2341,6 +2715,117 @@ work_root=${{work_dir%/*}}
             .unwrap()
             .unwrap();
         assert!(result.is_ok());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires host Nix; proves real Nix netrc auth against the VM HTTP cache route"]
+    async fn nix_cli_can_authenticate_to_vm_http_nix_cache_route_with_netrc() {
+        let _nix = required_test_tool("nix");
+        let temp = tempfile::tempdir().unwrap();
+        let netrc = temp.path().join("netrc");
+        let token = token();
+        std::fs::write(
+            &netrc,
+            format!(
+                "machine 127.0.0.1 login {VM_NIX_BASIC_LOGIN} password {}\n",
+                token.as_str()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&netrc, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let range = BrokerPortRange::new(1024, 65535).unwrap();
+        let bound = bind_ephemeral_vm_http_listener(Ipv4Addr::LOCALHOST, range)
+            .await
+            .unwrap();
+        let addr = bound.local_addr().unwrap();
+        let session = VmHttpSession::new(
+            "51b8fd0f-6c10-454c-b0e6-7df1d60e2e6d".parse().unwrap(),
+            Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap(),
+            token.clone(),
+        );
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let server = tokio::spawn(run_vm_http_until_shutdown(
+            bound.into_listener(),
+            session,
+            shutdown_rx,
+        ));
+
+        let store_url = format!(
+            "http://127.0.0.1:{port}{VM_NIX_CACHE_PATH_PREFIX}",
+            port = addr.port()
+        );
+        let store_path = "/nix/store/00000000000000000000000000000000-writ-nix-route-proof";
+        let args = [
+            "path-info",
+            "--refresh",
+            "--store",
+            &store_url,
+            "--option",
+            "experimental-features",
+            "nix-command",
+            "--option",
+            "access-tokens",
+            "",
+            "--option",
+            "substituters",
+            "",
+            "--option",
+            "trusted-public-keys",
+            "",
+            "--option",
+            "netrc-file",
+            netrc.to_str().unwrap(),
+            store_path,
+        ];
+        for arg in &args {
+            assert!(!arg.contains(token.as_str()), "token leaked into Nix argv");
+        }
+        assert!(!store_url.contains(token.as_str()));
+
+        let home = temp.path().join("home");
+        let xdg_config = temp.path().join("xdg-config");
+        let nix_conf = temp.path().join("nix-conf");
+        std::fs::create_dir(&home).unwrap();
+        std::fs::create_dir(&xdg_config).unwrap();
+        std::fs::create_dir(&nix_conf).unwrap();
+        std::fs::write(nix_conf.join("nix.conf"), "").unwrap();
+
+        let output = tokio::process::Command::new("nix")
+            .args(args)
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .env("HOME", &home)
+            .env("XDG_CONFIG_HOME", &xdg_config)
+            .env("NIX_CONF_DIR", &nix_conf)
+            .env("NIX_CONFIG", "")
+            .env("TMPDIR", std::env::temp_dir())
+            .output()
+            .await
+            .unwrap();
+
+        shutdown_tx.send(true).unwrap();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), server)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(result.is_ok());
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success(),
+            "proof path should miss in the skeleton cache\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert!(!stdout.contains(token.as_str()), "token leaked to stdout");
+        assert!(!stderr.contains(token.as_str()), "token leaked to stderr");
+        assert!(!stderr.contains("401"), "Nix was not authorized:\n{stderr}");
+        assert!(!stderr.contains("403"), "Nix was forbidden:\n{stderr}");
+        assert!(
+            stderr.contains("404") || stderr.contains("is not valid"),
+            "expected authenticated cache miss, got status {:?}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+            output.status
+        );
     }
 
     #[tokio::test]

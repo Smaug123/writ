@@ -823,6 +823,28 @@ First Nix substituter authentication proof slice implemented in
   The proof does not yet proxy real upstream caches, verify signatures, or
   stream NAR contents.
 
+First VM HTTP Nix cache route slice implemented in `src/vm_http.rs` and
+`scripts/prove-vm-http-nix-cache-route.sh`:
+
+- the VM HTTP dispatcher now treats `/v1/nix/cache/*` as a separate auth
+  surface: the existing source-subnet check still applies, but credentials are
+  accepted as HTTP Basic with login `writ-vm` and the session bearer token as
+  the password. Existing `/v1/session` and `/v1/git/clone` routes continue to
+  require Bearer authorization;
+- the initial cache implementation is deliberately a skeleton. It serves
+  `GET`/`HEAD /v1/nix/cache/nix-cache-info` with cache metadata for
+  `/nix/store`, returns a controlled 404 for well-formed `.narinfo` requests,
+  and rejects all other cache paths. There is no upstream proxy, signature
+  verification, NAR streaming, or store-realisation path in this slice;
+- unit and property tests cover route classification, Basic-vs-Bearer
+  separation, Basic challenge headers, no body read for cheap cache routes, and
+  controlled cache misses. The ignored proof harness starts the real VM HTTP
+  server and runs host Nix with a temporary netrc file against the skeleton
+  cache, proving Nix can authenticate to the broker route without putting the
+  session token in the substituter URL, argv, stdout, or stderr;
+- the daemon does not yet inject guest Nix netrc/config. That is the next
+  integration step before the managed VM can run Nix through this route.
+
 ## Tests and proof spikes
 
 First pure slice implemented in `src/core/agent_vm.rs`:
