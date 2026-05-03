@@ -93,10 +93,56 @@
           };
         });
 
-      mkAgentVmGuestImage = buildPkgs: nix2containerPkgs: guestSystem:
+      mkAgentVmGuestImage = buildPkgs: nix2containerPkgs: {
+        guestSystem,
+        includeProofTools ? false
+      }:
         let
           guestPkgs = mkPkgs guestSystem;
           writVm = mkCrossWritVm buildPkgs guestSystem;
+          imageName =
+            if includeProofTools
+            then "writ-agent-vm-guest-proof"
+            else "writ-agent-vm-guest";
+          imageDescription =
+            if includeProofTools
+            then "Darwin-buildable OCI archive for agent VM proof harnesses"
+            else "Darwin-buildable OCI archive for daemon-managed writ agent VMs";
+          productionForbiddenBins = [
+            "awk"
+            "dig"
+            "find"
+            "grep"
+            "nslookup"
+            "sed"
+            "wget"
+          ];
+          productionForbiddenBinCheck = lib.concatMapStringsSep "\n"
+            (name: ''
+              if [ -e "${guestRoot}/bin/${name}" ]; then
+                echo "production guest image unexpectedly contains /bin/${name}" >&2
+                exit 1
+              fi
+            '')
+            productionForbiddenBins;
+          proofTools = [
+            guestPkgs.bind.dnsutils
+            guestPkgs.gawk
+            guestPkgs.gnugrep
+            guestPkgs.wget
+          ];
+          proofToolCheck = lib.concatMapStringsSep "\n"
+            (name: ''
+              if [ ! -x "${guestRoot}/bin/${name}" ]; then
+                echo "proof guest image is missing required /bin/${name}" >&2
+                exit 1
+              fi
+            '')
+            [ "awk" "grep" "nslookup" "wget" ];
+          # Keep these mount points in sync with AGENT_VM_TMPFS_MOUNTS in
+          # src/agent_vm_lifecycle.rs. The lifecycle mounts them as tmpfs; the
+          # image carries conventional targets so the rootfs is sane even before
+          # runtime mounts are applied.
           guestRuntimeDirs = buildPkgs.runCommand "writ-agent-vm-guest-runtime-dirs" {} ''
             install -d -m 1777 $out/tmp
             install -d -m 1777 $out/var/tmp
@@ -108,24 +154,18 @@
             paths = [
               writVm
               guestPkgs.bash
-              guestPkgs.bind.dnsutils
               guestPkgs.cacert
               guestPkgs.coreutils
-              guestPkgs.findutils
-              guestPkgs.gawk
               guestPkgs.gitMinimal
-              guestPkgs.gnugrep
-              guestPkgs.gnused
               guestPkgs.iproute2
-              guestPkgs.wget
-            ];
+            ] ++ lib.optionals includeProofTools proofTools;
             pathsToLink = [
               "/bin"
               "/etc"
             ];
           };
           image = nix2containerPkgs.nix2container.buildImage {
-            name = "writ-agent-vm-guest";
+            name = imageName;
             tag = "latest";
             copyToRoot = [ guestRuntimeDirs guestRoot ];
             arch = guestArchitecture guestSystem;
@@ -157,15 +197,18 @@
             };
           };
         in
-        buildPkgs.runCommand "writ-agent-vm-guest-${guestSystem}.oci.tar"
+        buildPkgs.runCommand "${imageName}-${guestSystem}.oci.tar"
           {
-            passthru.imageName = "writ-agent-vm-guest";
+            passthru.includedProofTools = includeProofTools;
+            passthru.imageName = imageName;
             passthru.imageTag = "latest";
             passthru.image = image;
-            meta.description = "Darwin-buildable OCI archive for daemon-managed writ agent VMs";
+            meta.description = imageDescription;
           }
           ''
-            ${image.copyTo}/bin/copy-to oci-archive:$out:writ-agent-vm-guest:latest
+            ${lib.optionalString includeProofTools proofToolCheck}
+            ${lib.optionalString (!includeProofTools) productionForbiddenBinCheck}
+            ${image.copyTo}/bin/copy-to oci-archive:$out:${imageName}:latest
           '';
     in
     flake-utils.lib.eachDefaultSystem (system:
@@ -183,7 +226,18 @@
         guestImagePackages = lib.listToAttrs (map
           (guestSystem: {
             name = "agent-vm-guest-image-${guestSystem}";
-            value = mkAgentVmGuestImage pkgs nix2containerPkgs guestSystem;
+            value = mkAgentVmGuestImage pkgs nix2containerPkgs {
+              inherit guestSystem;
+            };
+          })
+          guestSystems);
+        guestProofImagePackages = lib.listToAttrs (map
+          (guestSystem: {
+            name = "agent-vm-guest-proof-image-${guestSystem}";
+            value = mkAgentVmGuestImage pkgs nix2containerPkgs {
+              inherit guestSystem;
+              includeProofTools = true;
+            };
           })
           guestSystems);
         crossGuestBinaryPackages = lib.listToAttrs (map
@@ -194,9 +248,15 @@
           guestSystems);
       in
       {
-        packages = guestImagePackages // crossGuestBinaryPackages // {
+        packages = guestImagePackages // guestProofImagePackages // crossGuestBinaryPackages // {
           default = writ;
-          agent-vm-guest-image = mkAgentVmGuestImage pkgs nix2containerPkgs defaultGuestSystem;
+          agent-vm-guest-image = mkAgentVmGuestImage pkgs nix2containerPkgs {
+            guestSystem = defaultGuestSystem;
+          };
+          agent-vm-guest-proof-image = mkAgentVmGuestImage pkgs nix2containerPkgs {
+            guestSystem = defaultGuestSystem;
+            includeProofTools = true;
+          };
           agent-vm-writ-vm-musl = mkCrossWritVm pkgs defaultGuestSystem;
         };
 

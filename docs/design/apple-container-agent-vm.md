@@ -703,14 +703,14 @@ First guest image/proof integration slice implemented in `flake.nix` and
   `agent-vm-guest-image-x86_64-linux`, and a host-architecture-derived
   `agent-vm-guest-image` alias. The archive is tagged
   `writ-agent-vm-guest:latest` and contains `writ-vm`, guest-local Git, CA
-  roots, `sh`, `ip`, `wget`, `nslookup`, and the small GNU/POSIX tools used by
-  the proof harness. It deliberately does not ship host-side binaries such as
-  `writd`, the lifecycle runner, or the PF helper;
-- the daemon proof harness defaults to building the matching Nix guest image,
+  roots, `sh`, `ip`, and the core utilities needed by the prelaunch/release
+  scripts. It deliberately does not ship host-side binaries such as `writd`,
+  the lifecycle runner, or the PF helper;
+- the daemon proof harness defaults to building the matching Nix proof image,
   loading it with `container image load --input`, and starting the managed VM
   from that image. Supplying `WRIT_PROVE_IMAGE` keeps the old "use an already
   available image" path, and `WRIT_PROVE_BUILD_GUEST_IMAGE=0` uses a preloaded
-  `writ-agent-vm-guest:latest`;
+  `writ-agent-vm-guest-proof:latest`;
 - the harness no longer treats raw `wget` against VM HTTP as the end-to-end
   guest proof. Inside the VM it now runs `writ-vm session` and
   `writ-vm git clone proof-owner/proof-repo /tmp/writ-agent-vm-checkout`,
@@ -750,30 +750,42 @@ First Darwin-hosted cross-build slice implemented in `flake.nix`:
 - this proves the Rust guest client can be cross-compiled from macOS without a
   Linux builder. The OCI assembly slice below consumes this cross-built client;
   the remaining target-specific inputs are Linux userland packages (`git`,
-  `ip`, `wget`, `nslookup`, CA roots, and shell/tools) from Linux package sets.
+  `ip`, CA roots, shell, and core utilities) from Linux package sets.
 
 First Darwin-hosted OCI assembly slice implemented in `flake.nix` and
 `scripts/prove-agent-vm-daemon.sh`:
 
 - the flake now uses `nix2container` to assemble the `agent-vm-guest-image-*`
-  OCI archives as packages for the current build host. On macOS,
-  `nix build .#agent-vm-guest-image-aarch64-linux` therefore runs the archive
-  assembly on Darwin instead of selecting `packages.aarch64-linux` and requiring
-  a Linux builder for the final image step;
+  and `agent-vm-guest-proof-image-*` OCI archives as packages for the current
+  build host. On macOS, `nix build .#agent-vm-guest-image-aarch64-linux`
+  therefore runs the archive assembly on Darwin instead of selecting
+  `packages.aarch64-linux` and requiring a Linux builder for the final image
+  step;
 - the image root is a host-built symlink farm containing the cross-compiled
   `writ-vm` guest package plus target Linux userland paths. Target packages
-  such as Git, `iproute2`, `wget`, `nslookup`, shell, and CA roots are still
-  Linux Nix store paths; the current expectation is that Nix obtains them from
-  substitutes or an available target builder. The remaining reduction slice is
-  to shrink the proof image and/or split a smaller production image from
-  proof-only tools. The image also carries conventional empty runtime mount
-  points such as `/tmp`, `/run`, `/var/tmp`, and `/root`; the lifecycle runner
-  mounts those paths as tmpfs for each VM session so guest temp files, release
-  markers, and root-user tool state are per-session runtime state, not static
-  image content;
+  such as Git, `iproute2`, shell, core utilities, and CA roots are still Linux
+  Nix store paths; the current expectation is that Nix obtains them from
+  substitutes or an available target builder. The image also carries
+  conventional empty runtime mount points such as `/tmp`, `/run`, `/var/tmp`,
+  and `/root`; the lifecycle runner mounts those paths as tmpfs for each VM
+  session so guest temp files, release markers, and root-user tool state are
+  per-session runtime state, not static image content;
 - the proof harness now builds the current-host package attr
-  `.#agent-vm-guest-image-${WRIT_PROVE_GUEST_SYSTEM}` and loads the resulting
-  OCI archive directly with `container image load --input`.
+  `.#agent-vm-guest-proof-image-${WRIT_PROVE_GUEST_SYSTEM}` and loads the
+  resulting OCI archive directly with `container image load --input`.
+
+First guest image reduction slice implemented in `flake.nix` and
+`scripts/prove-agent-vm-daemon.sh`:
+
+- `agent-vm-guest-image-*` is now the production/default image and intentionally
+  excludes proof-only `/bin` tools such as `wget`, `nslookup`, `awk`, `grep`,
+  `sed`, and `find`. The production archive build fails if those names appear
+  in the root symlink farm;
+- `agent-vm-guest-proof-image-*` is the manual proof image. It keeps the
+  production runtime plus `wget`, `nslookup`, `awk`, and `grep`, and its archive
+  build fails if any of those proof assertions tools are absent;
+- the daemon proof harness defaults to `writ-agent-vm-guest-proof:latest`.
+  Supplying `WRIT_PROVE_IMAGE` still opts into an externally-provided image.
 
 ## Tests and proof spikes
 

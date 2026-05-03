@@ -43,6 +43,9 @@ const GUEST_IPV6_PROBE_DELAY: std::time::Duration = std::time::Duration::from_mi
 const RESOURCE_ABSENCE_ATTEMPTS: usize = 30;
 const RESOURCE_ABSENCE_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
 const GUEST_ENV_FILE_DISPLAY: &str = "<runtime-env-file>";
+// Keep this list in sync with guestRuntimeDirs in flake.nix. The image
+// provides conventional mount targets, and the lifecycle makes them writable
+// per-session tmpfs state at container start.
 const AGENT_VM_TMPFS_MOUNTS: &[&str] = &["/tmp", "/run", "/var/tmp", "/root"];
 
 #[derive(Clone, Debug, Eq, PartialEq)]

@@ -12,7 +12,7 @@ Requires:
   - root privileges through sudo for pfctl
   - a top-level PF rule in /etc/pf.conf: anchor "writ/session/*"
   - python3, curl, git, nix, cargo or the Nix dev shell, and either Nix
-    substitutes/builders for the guest image closure or a preloaded guest image
+    substitutes/builders for the guest proof-image closure or a preloaded image
     containing sh, ip, git, writ-vm, wget, and nslookup
 
 What it proves:
@@ -26,8 +26,8 @@ The GitHub API and host git binary are local fakes. This keeps the proof focused
 on Apple Container/PF/daemon wiring rather than real GitHub availability.
 
 Environment overrides:
-  WRIT_PROVE_IMAGE       OCI image to run, default writ-agent-vm-guest:latest
-  WRIT_PROVE_BUILD_GUEST_IMAGE  build/load the Nix guest image, default auto
+  WRIT_PROVE_IMAGE       OCI image to run, default writ-agent-vm-guest-proof:latest
+  WRIT_PROVE_BUILD_GUEST_IMAGE  build/load the Nix proof image, default auto
                                 (auto builds unless WRIT_PROVE_IMAGE is set)
                                 false/no/off/0 use a preloaded image
   WRIT_PROVE_GUEST_SYSTEM  Nix guest image target system, default host-derived
@@ -62,7 +62,7 @@ if [[ -n "${WRIT_PROVE_IMAGE:-}" ]]; then
   IMAGE="$WRIT_PROVE_IMAGE"
   BUILD_GUEST_IMAGE="${WRIT_PROVE_BUILD_GUEST_IMAGE:-0}"
 else
-  IMAGE="writ-agent-vm-guest:latest"
+  IMAGE="writ-agent-vm-guest-proof:latest"
   BUILD_GUEST_IMAGE="${WRIT_PROVE_BUILD_GUEST_IMAGE:-auto}"
 fi
 IPV4_POOL="${WRIT_PROVE_IPV4_POOL:-192.168.0.0/16}"
@@ -240,9 +240,9 @@ load_guest_image() {
   require_cmd nix
   local guest_system
   guest_system="${WRIT_PROVE_GUEST_SYSTEM:-$(default_guest_system)}"
-  local image_attr="agent-vm-guest-image-${guest_system}"
+  local image_attr="agent-vm-guest-proof-image-${guest_system}"
 
-  log "building guest OCI image ${IMAGE} from .#${image_attr}"
+  log "building guest proof OCI image ${IMAGE} from .#${image_attr}"
   local image_archive
   image_archive="$(cd "$ROOT_DIR" && nix build --no-link --print-out-paths ".#${image_attr}")" || \
     die "failed to build guest OCI image .#${image_attr}"
