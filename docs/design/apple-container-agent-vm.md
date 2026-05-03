@@ -803,6 +803,26 @@ First guest Nix bootstrap slice implemented in `flake.nix` and
   fetch substituters or build derivations through broker policy. Brokered
   substituter access remains a later slice.
 
+First Nix substituter authentication proof slice implemented in
+`scripts/prove-nix-substituter-auth.sh`:
+
+- the harness starts a host-local fake HTTP binary cache, creates a temporary
+  `0600` netrc file, and runs host Nix with isolated `HOME`,
+  `XDG_CONFIG_HOME`, `NIX_CONF_DIR`, and empty `NIX_CONFIG`;
+- Nix is pointed at the fake cache with `nix path-info --store <cache-url>` for
+  a deliberately missing store path. The command is expected to fail after the
+  cache says the narinfo is missing; the captured cache request log is the
+  oracle;
+- the passing proof shows Nix requests `/nix-cache-info` and the target
+  `.narinfo` path with netrc-derived HTTP Basic authorization, while the raw
+  session token is absent from the substituter URL, Nix argv, stdout, and
+  stderr;
+- this selects the first brokered-substituter auth shape: the guest can receive
+  a broker URL plus a session-scoped netrc entry, and the VM HTTP Nix route
+  should authenticate Basic credentials in addition to its source-subnet check.
+  The proof does not yet proxy real upstream caches, verify signatures, or
+  stream NAR contents.
+
 ## Tests and proof spikes
 
 First pure slice implemented in `src/core/agent_vm.rs`:
