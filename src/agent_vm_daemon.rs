@@ -30,8 +30,9 @@ use crate::vm_http::{
     VmHttpGitRuntimeShutdownError, prepare_vm_http_git_session,
 };
 
-pub const AGENT_VM_BROKER_URL_ENV: &str = "WRIT_BROKER_URL";
-pub const AGENT_VM_BROKER_TOKEN_ENV: &str = "WRIT_BROKER_TOKEN";
+pub use crate::vm_client::{
+    VM_BROKER_TOKEN_ENV as AGENT_VM_BROKER_TOKEN_ENV, VM_BROKER_URL_ENV as AGENT_VM_BROKER_URL_ENV,
+};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AgentVmDaemonRuntimeConfig {

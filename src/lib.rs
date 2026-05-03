@@ -15,5 +15,6 @@ pub mod policy;
 pub mod protocol;
 pub mod secret;
 pub mod server;
+pub mod vm_client;
 pub mod vm_git;
 pub mod vm_http;

@@ -659,6 +659,33 @@ First daemon protocol lifecycle slice implemented in `src/agent_vm_daemon.rs`,
   cleanup from the persisted record rather than relying on the original future
   to run its rollback branch.
 
+First VM-side client slice implemented in `src/vm_client.rs` and
+`src/bin/writ-vm.rs`:
+
+- the guest now has a small `writ-vm` CLI that reads the daemon-injected
+  `WRIT_BROKER_URL` and `WRIT_BROKER_TOKEN` values, or accepts explicit
+  overrides for tests;
+- `writ-vm session` calls `GET /v1/session` and prints the broker's session
+  descriptor JSON;
+- `writ-vm git clone <owner>/<repo> [destination] [--ref <ref>]` posts the
+  structured `VmGitCloneRequest` to `/v1/git/clone`, requires the broker's
+  `application/x-git-bundle` response, refuses responses above the VM client's
+  bounded bundle-size cap before buffering them, writes the bundle to a `0600`
+  temporary file next to the requested checkout, invokes guest-local Git, and
+  removes the temporary bundle afterwards. Full refs such as
+  `refs/heads/main` are fetched from the bundle and checked out detached,
+  because `git clone --branch refs/heads/main` does not resolve that spelling
+  from a bundle. The explicit-ref path conservatively rejects an existing
+  destination before `git init`, so it does not have weaker overwrite behaviour
+  than the plain `git clone` path;
+- the VM client never receives GitHub credentials. Its bearer secret is used
+  only for the VM HTTP broker request and is redacted from debug output. The
+  subsequent guest-local Git command receives neither `WRIT_BROKER_URL` nor
+  `WRIT_BROKER_TOKEN`; it reads only from the temporary bundle path and the
+  requested checkout destination. Any resulting checkout `origin` is therefore
+  not durable fetch authority; later fetch/push should be brokered operations
+  rather than reuse of the one-shot bundle path.
+
 ## Tests and proof spikes
 
 First pure slice implemented in `src/core/agent_vm.rs`:
