@@ -737,6 +737,23 @@ Second guest image/cross-build preparation slice implemented in `src/lib.rs`,
   HTTP endpoint and the guest client without implying the host endpoint depends
   on guest client behaviour.
 
+First Darwin-hosted cross-build slice implemented in `flake.nix`:
+
+- the flake exposes standalone musl Linux guest-client binary packages:
+  `agent-vm-writ-vm-aarch64-linux-musl`,
+  `agent-vm-writ-vm-x86_64-linux-musl`, and the host-architecture-derived
+  `agent-vm-writ-vm-musl` alias;
+- each package uses the `vm-client` feature, `--no-default-features`, and
+  `--bin writ-vm`, with checks disabled because the target binary is not
+  executable on the Darwin builder. The current target triples are
+  `aarch64-unknown-linux-musl` and `x86_64-unknown-linux-musl`. These are Nix
+  packages/closures, not necessarily single static files; the aarch64 output
+  currently uses the musl dynamic loader from its Nix closure;
+- this proves the Rust guest client can be cross-compiled from macOS without a
+  Linux builder. It deliberately does not yet replace the guest OCI image
+  assembly, which still pulls Linux userland packages (`git`, `ip`, `wget`,
+  `nslookup`, CA roots, and shell/tools) from Linux package sets.
+
 ## Tests and proof spikes
 
 First pure slice implemented in `src/core/agent_vm.rs`:
