@@ -358,6 +358,9 @@ pub fn default_audit_db_path() -> PathBuf {
 mod tests {
     use super::*;
 
+    const TEST_NIX_CACHE_PUBLIC_KEY: &str =
+        "cache.example-1:IsGkyTbr2sed7tWowgiPcI0ZHhBAHoGQ7TyYRweyzwE=";
+
     #[test]
     fn parses_minimal_config() {
         // No `secret_store` key — the file backend at
@@ -446,7 +449,7 @@ mod tests {
                     "max_bundle_bytes": 1048576,
                     "nix_cache_url": "https://cache.nixos.org",
                     "nix_cache_trusted_public_keys": [
-                        "cache.nixos.org-1:QUJDRA=="
+                        "cache.example-1:IsGkyTbr2sed7tWowgiPcI0ZHhBAHoGQ7TyYRweyzwE="
                     ],
                     "nix_cache_max_metadata_bytes": 1048576,
                     "nix_cache_max_nar_bytes": 67108864
@@ -480,7 +483,7 @@ mod tests {
                 .nix_cache()
                 .trusted_public_keys()
                 .nix_conf_value(),
-            "cache.nixos.org-1:QUJDRA=="
+            TEST_NIX_CACHE_PUBLIC_KEY
         );
         assert_eq!(runtime.lifecycle().subnet_index_min(), 252);
         assert_eq!(runtime.lifecycle().subnet_index_max(), 253);
@@ -718,12 +721,15 @@ mod tests {
     #[test]
     fn agent_vm_http_config_rejects_invalid_nix_cache_trusted_public_key() {
         let mut c = valid_agent_vm_http_config();
-        c.nix_cache_trusted_public_keys = vec!["cache key:QUJDRA==".into()];
+        c.nix_cache_trusted_public_keys = vec![format!(
+            "cache key:{}",
+            TEST_NIX_CACHE_PUBLIC_KEY.split_once(':').unwrap().1
+        )];
 
         assert!(matches!(
             c.to_runtime_config(),
             Err(AgentVmHttpConfigError::NixTrustedPublicKeys(err))
-                if err.index() == 0 && err.raw() == "cache key:QUJDRA=="
+                if err.index() == 0 && err.raw().starts_with("cache key:")
         ));
     }
 

@@ -7,8 +7,10 @@ edition = "2024"
 default = ["host"]
 host = [
     "vm-client",
+    "dep:base64",
     "dep:jsonwebtoken",
     "dep:keyring",
+    "dep:ring",
     "dep:rusqlite",
 ]
 vm-client = ["dep:reqwest"]
@@ -50,6 +52,8 @@ rusqlite = { version = "0.38", features = ["bundled"], optional = true }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "fs", "time", "sync", "io-util", "process"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots", "http2"], optional = true }
 jsonwebtoken = { version = "9", optional = true }
+base64 = { version = "0.22", optional = true }
+ring = { version = "0.17", optional = true }
 libc = "0.2"
 
 [dev-dependencies]

@@ -25,7 +25,7 @@ use crate::core::{
 };
 use crate::nix_cache::{
     NixCacheNarFileName, NixNarInfoError, NixStoreHashPart, NixTrustedPublicKeys,
-    parse_narinfo_for_store_hash,
+    parse_signed_narinfo_for_store_hash,
 };
 use crate::secret::SecretStore;
 use crate::server::{BrokerState, CapabilityOutcome, request_capability};
@@ -1412,7 +1412,8 @@ impl<S: SecretStore> VmHttpNixCacheService<S> {
                 }
             };
         if let VmNixCacheRoute::NarInfo { hash } = route
-            && let Err(err) = parse_narinfo_for_store_hash(&body, hash)
+            && let Err(err) =
+                parse_signed_narinfo_for_store_hash(&body, hash, self.config.trusted_public_keys())
         {
             eprintln!("VM HTTP Nix cache upstream narinfo was rejected: {err}");
             let error = narinfo_audit_error_label(&err);
@@ -1678,6 +1679,17 @@ fn narinfo_audit_error_label(err: &NixNarInfoError) -> &'static str {
         NixNarInfoError::DuplicateNarHash => "duplicate upstream narinfo NarHash",
         NixNarInfoError::EmptyNarHash => "empty upstream narinfo NarHash",
         NixNarInfoError::InvalidNarHash { .. } => "invalid upstream narinfo NarHash",
+        NixNarInfoError::MissingNarSize => "missing upstream narinfo NarSize",
+        NixNarInfoError::DuplicateNarSize => "duplicate upstream narinfo NarSize",
+        NixNarInfoError::EmptyNarSize => "empty upstream narinfo NarSize",
+        NixNarInfoError::InvalidNarSize { .. } => "invalid upstream narinfo NarSize",
+        NixNarInfoError::MissingReferences => "missing upstream narinfo References",
+        NixNarInfoError::DuplicateReferences => "duplicate upstream narinfo References",
+        NixNarInfoError::InvalidReferences { .. } => "invalid upstream narinfo References",
+        NixNarInfoError::MissingSignature => "missing upstream narinfo Sig",
+        NixNarInfoError::InvalidSignature { .. } => "invalid upstream narinfo Sig",
+        NixNarInfoError::UntrustedSignatureKey => "untrusted upstream narinfo Sig key",
+        NixNarInfoError::SignatureMismatch => "mismatched upstream narinfo Sig",
         NixNarInfoError::StorePathHashMismatch { .. } => {
             "mismatched upstream narinfo StorePath hash"
         }
@@ -2330,6 +2342,20 @@ mod tests {
     use crate::vm_git_bundle::GitSecretEnvVar;
 
     const TEST_GIT_CLONE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+    const TEST_NIX_CACHE_PUBLIC_KEY: &str =
+        "cache.example:IsGkyTbr2sed7tWowgiPcI0ZHhBAHoGQ7TyYRweyzwE=";
+    const TEST_SIGNED_NARINFO: &str = concat!(
+        "StorePath: /nix/store/rzv95bakh41zrn5ji23pfc11x5vq2z4d-src\n",
+        "URL: nar/05cwbm7srkm5hvm6s7pa8yw2n57vgfrfmsz3p2sy8h9cnki9415f.nar.xz\n",
+        "Compression: xz\n",
+        "FileHash: sha256:05cwbm7srkm5hvm6s7pa8yw2n57vgfrfmsz3p2sy8h9cnki9415f\n",
+        "FileSize: 128\n",
+        "NarHash: sha256:0n62ny3wh4ayp887m60r6ja1p7hrdqnlaq2avb1177zc5gmm6nny\n",
+        "NarSize: 120\n",
+        "References: \n",
+        "Sig: cache.example:ioaqsTngbhwHmkI+4GKXEkuV0WvrIQ0+SUVlVvIix5A7h31h6oE5hpQbq/rGvH10QLVtYm82sdIM3e2SBGqMAA==\n",
+        "CA: fixed:sha256:1ivkzvg86cqy19yf9bg4aaqf6a9prfbjn18jclk6k2w2c9is5kf1\n",
+    );
 
     #[derive(Default)]
     struct InMemStore(Mutex<HashMap<String, String>>);
@@ -2580,6 +2606,23 @@ esac
         VmHttpNixCacheService::new(
             Arc::clone(state),
             VmHttpNixCacheConfig::new(server.uri(), max_metadata_bytes, max_nar_bytes).unwrap(),
+        )
+    }
+
+    fn signed_nix_cache_service_for_test(
+        state: &Arc<BrokerState<Box<dyn SecretStore>>>,
+        server: &MockServer,
+        max_metadata_bytes: u64,
+    ) -> VmHttpNixCacheService<Box<dyn SecretStore>> {
+        VmHttpNixCacheService::new(
+            Arc::clone(state),
+            VmHttpNixCacheConfig::new_with_trusted_public_keys(
+                server.uri(),
+                max_metadata_bytes,
+                1024,
+                NixTrustedPublicKeys::from_strings([TEST_NIX_CACHE_PUBLIC_KEY]).unwrap(),
+            )
+            .unwrap(),
         )
     }
 
@@ -3126,19 +3169,14 @@ esac
         let state = make_broker_state(&upstream);
         let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
         open_audit_session(&state, session.session_id());
-        let hash = "00000000000000000000000000000000";
-        let upstream_body = concat!(
-            "StorePath: /nix/store/00000000000000000000000000000000-proof\n",
-            "URL: nar/proof.nar.xz\n",
-            "NarHash: sha256:0\n",
-        );
+        let hash = "rzv95bakh41zrn5ji23pfc11x5vq2z4d";
         Mock::given(method("GET"))
             .and(path(format!("/{hash}.narinfo")))
-            .respond_with(ResponseTemplate::new(200).set_body_string(upstream_body))
+            .respond_with(ResponseTemplate::new(200).set_body_string(TEST_SIGNED_NARINFO))
             .expect(1)
             .mount(&upstream)
             .await;
-        let service = nix_cache_service_for_test(&state, &upstream, 1024);
+        let service = signed_nix_cache_service_for_test(&state, &upstream, 1024);
 
         let response = route_nix_cache_with_service(
             &session,
@@ -3149,7 +3187,7 @@ esac
         .await;
 
         assert_eq!(response.status, VmHttpStatus::Ok);
-        assert_eq!(response.body, upstream_body.as_bytes());
+        assert_eq!(response.body, TEST_SIGNED_NARINFO.as_bytes());
         let entries = state
             .audit
             .list_nix_cache_requests_for_session(session.session_id())
@@ -3179,7 +3217,7 @@ esac
             Mock::given(method("GET"))
                 .and(path(format!("/{hash}.narinfo")))
                 .respond_with(ResponseTemplate::new(200).set_body_string(format!(
-                    "StorePath: /nix/store/00000000000000000000000000000000-proof\nURL: {nar_url}\n"
+                    "StorePath: /nix/store/00000000000000000000000000000000-proof\nURL: {nar_url}\nNarHash: sha256:0\nNarSize: 120\nReferences: \nSig: cache.example:ioaqsTngbhwHmkI+4GKXEkuV0WvrIQ0+SUVlVvIix5A7h31h6oE5hpQbq/rGvH10QLVtYm82sdIM3e2SBGqMAA==\n"
                 )))
                 .expect(1)
                 .mount(&upstream)
@@ -3223,6 +3261,10 @@ esac
                 "StorePath: /nix/store/00000000000000000000000000000000-proof\n",
                 "URL: nar/proof.nar.xz\n",
                 "URL: nar/other.nar.xz\n",
+                "NarHash: sha256:0\n",
+                "NarSize: 120\n",
+                "References: \n",
+                "Sig: cache.example:ioaqsTngbhwHmkI+4GKXEkuV0WvrIQ0+SUVlVvIix5A7h31h6oE5hpQbq/rGvH10QLVtYm82sdIM3e2SBGqMAA==\n",
             )))
             .expect(1)
             .mount(&upstream)
@@ -3262,7 +3304,7 @@ esac
         Mock::given(method("GET"))
             .and(path(format!("/{requested_hash}.narinfo")))
             .respond_with(ResponseTemplate::new(200).set_body_string(format!(
-                "StorePath: /nix/store/{upstream_hash}-proof\nURL: nar/proof.nar.xz\nNarHash: sha256:0\n"
+                "StorePath: /nix/store/{upstream_hash}-proof\nURL: nar/proof.nar.xz\nNarHash: sha256:0\nNarSize: 120\nReferences: \nSig: cache.example:ioaqsTngbhwHmkI+4GKXEkuV0WvrIQ0+SUVlVvIix5A7h31h6oE5hpQbq/rGvH10QLVtYm82sdIM3e2SBGqMAA==\n"
             )))
             .expect(1)
             .mount(&upstream)
@@ -3290,6 +3332,65 @@ esac
             entries[0].error.as_deref(),
             Some("mismatched upstream narinfo StorePath hash")
         );
+    }
+
+    #[tokio::test]
+    async fn nix_cache_narinfo_route_requires_trusted_signature() {
+        let cases = [
+            (
+                TEST_SIGNED_NARINFO.replace(
+                    "Sig: cache.example:ioaqsTngbhwHmkI+4GKXEkuV0WvrIQ0+SUVlVvIix5A7h31h6oE5hpQbq/rGvH10QLVtYm82sdIM3e2SBGqMAA==\n",
+                    "",
+                ),
+                "missing upstream narinfo Sig",
+            ),
+            (
+                TEST_SIGNED_NARINFO.replace("Sig: cache.example:", "Sig: cache.other:"),
+                "untrusted upstream narinfo Sig key",
+            ),
+            (
+                TEST_SIGNED_NARINFO.replace(
+                    "ioaqsTngbhwHmkI+4GKXEkuV0WvrIQ0+SUVlVvIix5A7h31h6oE5hpQbq/rGvH10QLVtYm82sdIM3e2SBGqMAA==",
+                    "AoaqsTngbhwHmkI+4GKXEkuV0WvrIQ0+SUVlVvIix5A7h31h6oE5hpQbq/rGvH10QLVtYm82sdIM3e2SBGqMAA==",
+                ),
+                "mismatched upstream narinfo Sig",
+            ),
+        ];
+
+        for (body, expected_error) in cases {
+            let upstream = MockServer::start().await;
+            let state = make_broker_state(&upstream);
+            let session =
+                session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+            open_audit_session(&state, session.session_id());
+            let hash = "rzv95bakh41zrn5ji23pfc11x5vq2z4d";
+            Mock::given(method("GET"))
+                .and(path(format!("/{hash}.narinfo")))
+                .respond_with(ResponseTemplate::new(200).set_body_string(body))
+                .expect(1)
+                .mount(&upstream)
+                .await;
+            let service = signed_nix_cache_service_for_test(&state, &upstream, 2048);
+
+            let response = route_nix_cache_with_service(
+                &session,
+                "GET",
+                format!("{VM_NIX_CACHE_PATH_PREFIX}/{hash}.narinfo"),
+                service,
+            )
+            .await;
+
+            assert_eq!(response.status, VmHttpStatus::BadGateway);
+            let entries = state
+                .audit
+                .list_nix_cache_requests_for_session(session.session_id())
+                .unwrap();
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].route, NixCacheAuditRoute::NarInfo);
+            assert_eq!(entries[0].http_status, Some(502));
+            assert_eq!(entries[0].upstream_status, Some(200));
+            assert_eq!(entries[0].error.as_deref(), Some(expected_error));
+        }
     }
 
     #[tokio::test]

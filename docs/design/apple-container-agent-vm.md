@@ -932,19 +932,21 @@ First brokered Nix NAR transport slice implemented in `src/vm_http.rs`,
   before the body is complete, stream-truncation or body-read failures are
   recorded in the Nix cache audit outcome rather than converted into a different
   VM-visible status after the fact;
-- this is still only cache transport. The metadata-admission slices below
-  constrain `.narinfo` structure before forwarding, but the broker still does
-  not sign `.narinfo`, verify upstream cache signatures, or check NAR content
-  hashes itself. Those remain follow-on slices before treating the VM as able
-  to build entirely from brokered cache authority.
+- this slice was still only cache transport. The metadata-admission slices
+  below constrain `.narinfo` structure and signatures before forwarding, but
+  the broker still does not sign `.narinfo` itself or check NAR content hashes.
+  Those remain follow-on slices before treating the VM as able to build
+  entirely from brokered cache authority.
 
 First brokered Nix cache trust-key plumbing slice implemented in
 `src/nix_cache.rs`, `src/config.rs`, and `src/agent_vm_daemon.rs`:
 
 - `agent_vm.vm_http` now accepts optional
-  `nix_cache_trusted_public_keys`, parsed as Nix `name:base64` public keys.
+  `nix_cache_trusted_public_keys`, parsed as Nix cache public-key strings.
   The parser rejects empty values, whitespace/control-byte shapes, multiple
-  separators, and malformed base64 padding before the runtime config is built;
+  separators, malformed base64 padding, and, after the later signature slice,
+  public-key material that is not a 32-byte Ed25519 public key before the
+  runtime config is built;
 - daemon-managed VM start joins those typed keys into the generated guest
   `nix.conf` as `trusted-public-keys = ...`. The field defaults to an empty
   list so the current proof harness can keep exercising authenticated cache
@@ -972,9 +974,9 @@ First signed Nix substitute-realisation proof slice implemented in
   realised store object contents inside the isolated guest;
 - this proves real guest Nix can authenticate to the brokered VM HTTP cache
   route, trust the daemon-configured cache key, fetch metadata and NAR bytes
-  through the daemon, and realise a signed substitute. It still relies on guest
-  Nix for signature/content verification; broker-side verification remains a
-  separate policy-hardening slice.
+  through the daemon, and realise a signed substitute. At this point it still
+  relied on guest Nix for signature/content verification; the later broker-side
+  signature slice below narrows that to NAR body hash verification.
 
 First broker-side Nix `.narinfo` admission slice implemented in
 `src/nix_cache.rs` and `src/vm_http.rs`:
@@ -997,13 +999,37 @@ First broker-side Nix `.narinfo` admission slice implemented in
 - rejected upstream metadata becomes an audited `502` with a bounded static
   error label identifying the rejected field or mismatch class. `HEAD` remains
   a bounded upstream existence check;
-- this is broker-side metadata admission, not broker-side signature or NAR body
-  hash verification. A malicious or buggy upstream can no longer swap the
-  `StorePath` hash while preserving a safe `URL`, but it can still return
-  structurally valid metadata with a signed-but-untrusted key, a bad signature,
-  or a NAR body that does not match `NarHash`; guest Nix still catches those
-  cases. Broker-side signature/content verification remains a later hardening
-  slice.
+- this slice was broker-side metadata admission, not broker-side signature or
+  NAR body hash verification. A malicious or buggy upstream could no longer
+  swap the `StorePath` hash while preserving a safe `URL`, but it could still
+  return structurally valid metadata with a signed-but-untrusted key, a bad
+  signature, or a NAR body that does not match `NarHash`; guest Nix still
+  caught those cases. The signature slice below removes the untrusted/bad
+  signature cases from the VM-visible surface.
+
+First broker-side Nix `.narinfo` signature-verification slice implemented in
+`src/nix_cache.rs` and `src/vm_http.rs`:
+
+- `NixTrustedPublicKey` now parses Nix cache public keys as named 32-byte
+  Ed25519 keys, not just syntactic `name:base64` strings. Invalid key lengths
+  and duplicate key names fail during daemon/config construction before the VM
+  can be started with ambiguous or unverifiable trust material;
+- `.narinfo` admission now parses `NarSize`, `References`, and one-or-more
+  `Sig` fields in addition to `StorePath`, `URL`, and `NarHash`. The signature
+  fingerprint is the Nix binary-cache fingerprint
+  `1;<store-path>;<nar-hash>;<nar-size>;<comma-separated full reference paths>`,
+  pinned by a fixture generated with the local Nix CLI;
+- successful `GET /v1/nix/cache/<hash>.narinfo` forwarding now requires at
+  least one `Sig` whose key name matches a configured trusted public key and
+  whose Ed25519 signature verifies that fingerprint. Missing signatures,
+  malformed signatures, untrusted key names, trusted-key signature mismatch,
+  malformed `NarSize`, and malformed `References` fail closed as audited
+  `502`s with bounded static labels. `HEAD` remains an existence-only upstream
+  check;
+- Nix signatures do not cover the `URL` field, so the earlier broker URL
+  admission rule remains load-bearing: a signed `.narinfo` can only direct the
+  VM to a single broker-admitted `nar/<safe-filename>` route. NAR body hash
+  verification against signed `NarHash` remains the next hardening slice.
 
 ## Tests and proof spikes
 

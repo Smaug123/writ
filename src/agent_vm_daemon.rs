@@ -486,6 +486,11 @@ mod tests {
     use crate::vm_git_bundle::{GitCredentialBoundary, GitSecretEnvVar};
     use crate::vm_http::{VmHttpGitCloneConfig, VmHttpNixCacheConfig};
 
+    const TEST_NIX_CACHE_PUBLIC_KEY: &str =
+        "cache.example-1:IsGkyTbr2sed7tWowgiPcI0ZHhBAHoGQ7TyYRweyzwE=";
+    const SECOND_TEST_NIX_CACHE_PUBLIC_KEY: &str =
+        "cache.example-2:KinekIvGUnCJ2dP5u+7MmV9svoga1i9pbI98OXh+zZg=";
+
     #[derive(Default)]
     struct InMemStore(StdMutex<std::collections::HashMap<String, String>>);
 
@@ -644,10 +649,7 @@ mod tests {
                         "http://127.0.0.1:9",
                         1024 * 1024,
                         1024 * 1024,
-                        NixTrustedPublicKeys::from_strings(
-                            ["cache.example-1:QUJDRA==".to_string()],
-                        )
-                        .unwrap(),
+                        NixTrustedPublicKeys::from_strings([TEST_NIX_CACHE_PUBLIC_KEY]).unwrap(),
                     )
                     .unwrap(),
                 ),
@@ -721,7 +723,7 @@ mod tests {
             "{AGENT_VM_NIX_NETRC_ENV}={AGENT_VM_NIX_NETRC_PATH}"
         )));
         assert!(env.contains(&format!(
-            "{AGENT_VM_NIX_TRUSTED_PUBLIC_KEYS_ENV}=cache.example-1:QUJDRA=="
+            "{AGENT_VM_NIX_TRUSTED_PUBLIC_KEYS_ENV}={TEST_NIX_CACHE_PUBLIC_KEY}"
         )));
         assert!(env.contains(&format!(
             "{AGENT_VM_NIX_CONF_DIR_ENV}={AGENT_VM_NIX_CONF_DIR}"
@@ -882,7 +884,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let netrc = dir.path().join("run").join("netrc");
         let nix_conf_dir = dir.path().join("nix-conf");
-        let trusted_public_keys = "cache.example-1:QUJDRA== cache.example-2:RUZHSA==";
+        let trusted_public_keys =
+            format!("{TEST_NIX_CACHE_PUBLIC_KEY} {SECOND_TEST_NIX_CACHE_PUBLIC_KEY}");
 
         let status = Command::new("sh")
             .arg("-c")
@@ -896,7 +899,7 @@ mod tests {
             )
             .env("WRIT_NIX_BASIC_LOGIN", VM_NIX_BASIC_LOGIN)
             .env("WRIT_NIX_NETRC", &netrc)
-            .env(AGENT_VM_NIX_TRUSTED_PUBLIC_KEYS_ENV, trusted_public_keys)
+            .env(AGENT_VM_NIX_TRUSTED_PUBLIC_KEYS_ENV, &trusted_public_keys)
             .env("NIX_CONF_DIR", &nix_conf_dir)
             .status()
             .unwrap();
