@@ -175,6 +175,15 @@ pub enum AgentVmSessionStateStatus {
     Running,
 }
 
+impl AgentVmSessionStateStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Starting => "starting",
+            Self::Running => "running",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GuestIpv6Inspection {
     addresses: Vec<Ipv6Addr>,

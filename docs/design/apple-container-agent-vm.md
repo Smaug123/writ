@@ -623,13 +623,14 @@ First daemon-owned VM HTTP runtime slice implemented in `src/vm_http.rs`,
 First daemon protocol lifecycle slice implemented in `src/agent_vm_daemon.rs`,
 `src/server.rs`, `src/protocol.rs`, and `src/bin/writ.rs`:
 
-- the host Unix-socket protocol now has `start_agent_vm` and `stop_agent_vm`
-  messages, exposed by the CLI as `writ agent-vm start -- <command>` and
-  `writ agent-vm stop <session-id>`. Starting an agent VM creates the audit
-  session inside `writd`; stopping the VM drives managed cleanup and closes the
-  audit session. These CLI calls use a longer timeout than ordinary token-mint
-  requests because Apple Container startup/teardown can include cold image
-  work, PF helper execution, and guest preflight probes;
+- the host Unix-socket protocol now has `start_agent_vm`, `stop_agent_vm`, and
+  `list_agent_vms` messages, exposed by the CLI as
+  `writ agent-vm start -- <command>`, `writ agent-vm stop <session-id>`, and
+  `writ agent-vm list`. Starting an agent VM creates the audit session inside
+  `writd`; stopping the VM drives managed cleanup and closes the audit session.
+  These CLI calls use a longer timeout than ordinary token-mint requests
+  because Apple Container startup/teardown can include cold image work, PF
+  helper execution, and guest preflight probes;
 - `agent_vm.lifecycle` daemon config supplies the broker-owned IPv4/IPv6 pools,
   allowed subnet-index range, managed state directory, Apple `container`,
   `sudo`, and PF-helper tool paths, IPv6 isolation mode, image, and resource
@@ -656,14 +657,21 @@ First daemon protocol lifecycle slice implemented in `src/agent_vm_daemon.rs`,
   closes the audit session, shuts down the in-memory VM HTTP task, and only
   then removes the state record. If any of those steps fail, the state record
   remains so retrying `stop_agent_vm` can use the same recorded cleanup facts;
-- daemon restart recovery is still only partial: managed state survives and can
-  drive cleanup after a restart, but in-memory VM HTTP tasks and bearer tokens
-  do not. A restarted daemon should therefore treat existing records as cleanup
-  obligations until a later resurrection protocol can safely rebind equivalent
-  VM HTTP authority. In-process cancellation during `start_agent_vm` is also
-  treated as a crash/restart recovery case: state/audit may need follow-up
-  cleanup from the persisted record rather than relying on the original future
-  to run its rollback branch.
+- daemon restart recovery is intentionally cleanup-first: managed state
+  survives and can drive cleanup after a restart, but in-memory VM HTTP tasks
+  and bearer tokens do not. The Unix-socket protocol now exposes
+  `list_agent_vms`, surfaced as `writ agent-vm list`, which reports persisted
+  records with `runtime=detached` when the restarted daemon has no attached VM
+  HTTP task. Listing is observational and does not wait behind the daemon's
+  start/stop lifecycle mutex, so it remains useful while investigating a slow
+  or stuck start; `runtime` is therefore a retryable snapshot, not an
+  authority boundary. Operators can then run `writ agent-vm stop <session-id>`
+  without reconstructing subnet or firewall scope by hand. A later resurrection
+  protocol may safely rebind equivalent VM HTTP authority; until then, detached
+  records are cleanup obligations. In-process cancellation during
+  `start_agent_vm` is also treated as a crash/restart recovery case:
+  state/audit may need follow-up cleanup from the persisted record rather than
+  relying on the original future to run its rollback branch.
 
 First VM-side client slice implemented in `src/vm_client.rs` and
 `src/bin/writ-vm.rs`:

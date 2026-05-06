@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use clap::{Parser, Subcommand, ValueEnum};
 
 use writ::core::{AgentKind, CapabilityRequest, GitHubAccess, GitHubRequest, RepoRef, SessionId};
-use writ::protocol::{ClientMessage, ServerMessage};
+use writ::protocol::{AgentVmSessionInfo, ClientMessage, ServerMessage};
 use writ::server::default_socket_path;
 
 #[derive(Parser)]
@@ -83,6 +83,8 @@ enum AgentVmCmd {
     },
     /// Stop a daemon-managed agent VM.
     Stop { session_id: String },
+    /// List daemon-managed agent VM state records.
+    List,
 }
 
 #[derive(Subcommand)]
@@ -220,6 +222,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     other => return Err(format!("unexpected response: {other:?}").into()),
                 }
             }
+            AgentVmCmd::List => {
+                let msg = ClientMessage::ListAgentVms;
+                match call_with_timeout(&socket_path, &msg, AGENT_VM_CALL_TIMEOUT)? {
+                    ServerMessage::AgentVmSessions { sessions } => {
+                        let mut out = std::io::stdout().lock();
+                        write_agent_vm_sessions(&mut out, &sessions)?;
+                    }
+                    ServerMessage::Error { message } => return Err(message.into()),
+                    other => return Err(format!("unexpected response: {other:?}").into()),
+                }
+            }
         },
     }
     Ok(())
@@ -257,6 +270,35 @@ fn build_capability(backend: BackendCmd) -> Result<CapabilityRequest, Box<dyn st
         GithubCmd::Metadata { .. } => GitHubRequest::Metadata { repo },
     };
     Ok(CapabilityRequest::GitHub(github_req))
+}
+
+fn write_agent_vm_sessions(
+    out: &mut dyn Write,
+    sessions: &[AgentVmSessionInfo],
+) -> std::io::Result<()> {
+    for (index, session) in sessions.iter().enumerate() {
+        if index > 0 {
+            writeln!(out)?;
+        }
+        writeln!(out, "session_id={}", session.session_id)?;
+        writeln!(out, "status={}", session.status.as_str())?;
+        writeln!(out, "subnet_index={}", session.subnet_index)?;
+        writeln!(
+            out,
+            "runtime={}",
+            if session.runtime_attached {
+                "attached"
+            } else {
+                "detached"
+            }
+        )?;
+        writeln!(out, "vm={}", session.vm_name)?;
+        writeln!(out, "network={}", session.network_name)?;
+        for broker_url in &session.broker_urls {
+            writeln!(out, "broker_url={broker_url}")?;
+        }
+    }
+    Ok(())
 }
 
 /// One request, one reply. If the broker takes longer than this to
@@ -303,4 +345,59 @@ fn call_with_timeout(
     reader.read_line(&mut reply)?;
 
     Ok(serde_json::from_str(reply.trim_end_matches('\n'))?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn agent_vm_list_output_is_key_value_and_marks_runtime_attachment() {
+        let detached_id: SessionId = "51b8fd0f-6c10-454c-b0e6-7df1d60e2e6d".parse().unwrap();
+        let attached_id: SessionId = "b7960f37-3888-48a9-b0bb-a4edcaab2194".parse().unwrap();
+        let sessions = vec![
+            AgentVmSessionInfo {
+                session_id: detached_id,
+                status: writ::agent_vm_lifecycle::AgentVmSessionStateStatus::Running,
+                subnet_index: 252,
+                vm_name: format!("writ-agent-vm-{detached_id}"),
+                network_name: format!("writ-agent-net-{detached_id}"),
+                broker_urls: vec!["http://192.168.252.1:51375/".into()],
+                runtime_attached: false,
+            },
+            AgentVmSessionInfo {
+                session_id: attached_id,
+                status: writ::agent_vm_lifecycle::AgentVmSessionStateStatus::Starting,
+                subnet_index: 253,
+                vm_name: format!("writ-agent-vm-{attached_id}"),
+                network_name: format!("writ-agent-net-{attached_id}"),
+                broker_urls: vec!["http://192.168.253.1:51376/".into()],
+                runtime_attached: true,
+            },
+        ];
+        let mut out = Vec::new();
+
+        write_agent_vm_sessions(&mut out, &sessions).unwrap();
+
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            concat!(
+                "session_id=51b8fd0f-6c10-454c-b0e6-7df1d60e2e6d\n",
+                "status=running\n",
+                "subnet_index=252\n",
+                "runtime=detached\n",
+                "vm=writ-agent-vm-51b8fd0f-6c10-454c-b0e6-7df1d60e2e6d\n",
+                "network=writ-agent-net-51b8fd0f-6c10-454c-b0e6-7df1d60e2e6d\n",
+                "broker_url=http://192.168.252.1:51375/\n",
+                "\n",
+                "session_id=b7960f37-3888-48a9-b0bb-a4edcaab2194\n",
+                "status=starting\n",
+                "subnet_index=253\n",
+                "runtime=attached\n",
+                "vm=writ-agent-vm-b7960f37-3888-48a9-b0bb-a4edcaab2194\n",
+                "network=writ-agent-net-b7960f37-3888-48a9-b0bb-a4edcaab2194\n",
+                "broker_url=http://192.168.253.1:51376/\n",
+            )
+        );
+    }
 }

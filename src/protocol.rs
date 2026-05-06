@@ -12,7 +12,21 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::agent_vm_lifecycle::AgentVmSessionStateStatus;
 use crate::core::{AgentKind, CapabilityRequest, SessionId, UnixMillis};
+
+/// A persisted daemon-managed agent VM session as reported by
+/// [`ServerMessage::AgentVmSessions`].
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AgentVmSessionInfo {
+    pub session_id: SessionId,
+    pub status: AgentVmSessionStateStatus,
+    pub subnet_index: u16,
+    pub vm_name: String,
+    pub network_name: String,
+    pub broker_urls: Vec<String>,
+    pub runtime_attached: bool,
+}
 
 /// A message from the agent to the broker.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -60,6 +74,9 @@ pub enum ClientMessage {
     },
     /// Stop a daemon-managed agent VM session and close its audit session.
     StopAgentVm { session_id: SessionId },
+    /// List persisted daemon-managed agent VM sessions. Records without an
+    /// attached in-memory runtime are cleanup obligations after daemon restart.
+    ListAgentVms,
 }
 
 /// A message from the broker to the agent.
@@ -88,6 +105,8 @@ pub enum ServerMessage {
     },
     /// Acknowledges [`ClientMessage::StopAgentVm`].
     AgentVmStopped,
+    /// Reports persisted daemon-managed agent VM sessions.
+    AgentVmSessions { sessions: Vec<AgentVmSessionInfo> },
     /// Something went wrong (mint error, unknown session, audit write
     /// failure, …). The agent should surface `message` to the user and
     /// not retry automatically.
@@ -119,6 +138,10 @@ impl std::fmt::Debug for ServerMessage {
                 .field("broker_url", broker_url)
                 .finish(),
             Self::AgentVmStopped => write!(f, "AgentVmStopped"),
+            Self::AgentVmSessions { sessions } => f
+                .debug_struct("AgentVmSessions")
+                .field("sessions", sessions)
+                .finish(),
             Self::Error { message } => f.debug_struct("Error").field("message", message).finish(),
         }
     }
@@ -208,6 +231,13 @@ mod tests {
         assert_eq!(serde_json::from_str::<ClientMessage>(&json).unwrap(), msg);
     }
 
+    #[test]
+    fn list_agent_vms_roundtrips() {
+        let msg = ClientMessage::ListAgentVms;
+        let json = serde_json::to_string(&msg).unwrap();
+        assert_eq!(serde_json::from_str::<ClientMessage>(&json).unwrap(), msg);
+    }
+
     // --- ServerMessage roundtrips -----------------------------------------
 
     #[test]
@@ -264,6 +294,23 @@ mod tests {
             serde_json::from_str::<ServerMessage>(&json).unwrap(),
             ServerMessage::AgentVmStopped,
         );
+    }
+
+    #[test]
+    fn agent_vm_sessions_roundtrips() {
+        let msg = ServerMessage::AgentVmSessions {
+            sessions: vec![AgentVmSessionInfo {
+                session_id: fixed_session_id(),
+                status: AgentVmSessionStateStatus::Running,
+                subnet_index: 252,
+                vm_name: format!("writ-agent-vm-{}", fixed_session_id()),
+                network_name: format!("writ-agent-net-{}", fixed_session_id()),
+                broker_urls: vec!["http://192.168.252.1:51375/".into()],
+                runtime_attached: false,
+            }],
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert_eq!(serde_json::from_str::<ServerMessage>(&json).unwrap(), msg);
     }
 
     #[test]
@@ -336,6 +383,15 @@ mod tests {
         let stopped: serde_json::Value =
             serde_json::to_value(ServerMessage::AgentVmStopped).unwrap();
         assert_eq!(stopped["type"], "agent_vm_stopped");
+
+        let list: serde_json::Value = serde_json::to_value(ClientMessage::ListAgentVms).unwrap();
+        assert_eq!(list["type"], "list_agent_vms");
+
+        let sessions: serde_json::Value = serde_json::to_value(ServerMessage::AgentVmSessions {
+            sessions: Vec::new(),
+        })
+        .unwrap();
+        assert_eq!(sessions["type"], "agent_vm_sessions");
     }
 
     #[test]

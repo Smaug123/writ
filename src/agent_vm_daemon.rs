@@ -23,6 +23,7 @@ use crate::core::{
     AgentKind, AgentNetwork, AgentNetworkPool, AgentVmConfigError, BrokerPorts, SessionId,
     SessionRecord, UnixMillis,
 };
+use crate::protocol::AgentVmSessionInfo;
 use crate::secret::SecretStore;
 use crate::server::BrokerState;
 use crate::vm_http::{
@@ -333,6 +334,32 @@ impl AgentVmDaemon {
         }
     }
 
+    pub async fn list_sessions(&self) -> Result<Vec<AgentVmSessionInfo>, AgentVmDaemonError> {
+        // Listing is observational. Avoid the lifecycle mutex so an operator
+        // can inspect persisted cleanup obligations while a start/stop is slow
+        // or wedged; the state-store lock and running-runtime mutex provide a
+        // bounded snapshot that may be retried.
+        let store = self.config.lifecycle.state_store.clone();
+        let states = tokio::task::spawn_blocking(move || store.load_all()).await??;
+        let running = self.running.lock().await;
+        Ok(states
+            .into_iter()
+            .map(|state| AgentVmSessionInfo {
+                session_id: state.session_id(),
+                status: state.status(),
+                subnet_index: state.subnet_index(),
+                vm_name: state.names().vm().to_string(),
+                network_name: state.names().network().to_string(),
+                broker_urls: state
+                    .broker_urls()
+                    .into_iter()
+                    .map(|url| url.as_str().to_string())
+                    .collect(),
+                runtime_attached: running.contains_key(&state.session_id()),
+            })
+            .collect())
+    }
+
     async fn start_session_after_audit_opened<S: SecretStore + Send + Sync + 'static>(
         &self,
         state: Arc<BrokerState<S>>,
@@ -478,6 +505,7 @@ mod tests {
     use crate::audit::AuditLog;
     use proptest::prelude::*;
 
+    use crate::agent_vm_lifecycle::AgentVmSessionStateStatus;
     use crate::core::{
         BrokerPort, BrokerPortRange, BrokerPorts, Ipv4Cidr, Ipv6Cidr, RepoRef, TtlSeconds,
     };
@@ -749,6 +777,25 @@ mod tests {
             "guest env file should be removed after container run"
         );
 
+        let sessions = daemon.list_sessions().await.unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].session_id, started.session_id());
+        assert_eq!(sessions[0].status, AgentVmSessionStateStatus::Running);
+        assert_eq!(sessions[0].subnet_index, 252);
+        assert_eq!(
+            sessions[0].vm_name.as_str(),
+            format!("writ-agent-vm-{}", started.session_id())
+        );
+        assert_eq!(
+            sessions[0].network_name.as_str(),
+            format!("writ-agent-net-{}", started.session_id())
+        );
+        assert_eq!(
+            sessions[0].broker_urls.as_slice(),
+            &[started.broker_url().to_string()]
+        );
+        assert!(sessions[0].runtime_attached);
+
         daemon
             .stop_session(&state, started.session_id())
             .await
@@ -872,6 +919,33 @@ mod tests {
         assert!(state_store.load(session_id).is_err());
         let audit_session = state.audit.get_session(session_id).unwrap().unwrap();
         assert!(audit_session.closed_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn daemon_list_reports_persisted_session_without_runtime_as_detached() {
+        let dir = tempfile::tempdir().unwrap();
+        let args_log = dir.path().join("args.log");
+        let env_path_log = dir.path().join("env-path.log");
+        let env_log = dir.path().join("env.log");
+        let fake_tool = write_fake_tool(dir.path(), &args_log, &env_path_log, &env_log);
+        let (config, state_store) = daemon_config(dir.path(), &fake_tool);
+        occupy_subnet(&state_store, 252);
+        let state = state_store.load_all().unwrap().pop().unwrap();
+        let daemon = AgentVmDaemon::new(config);
+
+        let sessions = daemon.list_sessions().await.unwrap();
+
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].session_id, state.session_id());
+        assert_eq!(sessions[0].status, AgentVmSessionStateStatus::Starting);
+        assert_eq!(sessions[0].subnet_index, state.subnet_index());
+        assert_eq!(sessions[0].vm_name.as_str(), state.names().vm());
+        assert_eq!(sessions[0].network_name.as_str(), state.names().network());
+        assert_eq!(
+            sessions[0].broker_urls.as_slice(),
+            &["http://192.168.252.1:51375/".to_string()]
+        );
+        assert!(!sessions[0].runtime_attached);
     }
 
     #[test]
