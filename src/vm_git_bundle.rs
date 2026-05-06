@@ -16,7 +16,7 @@ use tokio::process::Command;
 use crate::vm_git::{GitCloneRepo, VmGitCloneRequest};
 
 const DEFAULT_MIRROR_DIR_NAME: &str = "mirror.git";
-const GITHUB_HTTPS_BASE: &str = "https://github.com";
+pub const DEFAULT_GIT_CLONE_BASE_URL: &str = "https://github.com";
 const CLEAN_GIT_CONFIG_ENV: [(&str, &str); 3] = [
     ("GIT_CONFIG_NOSYSTEM", "1"),
     ("GIT_CONFIG_GLOBAL", "/dev/null"),
@@ -31,6 +31,17 @@ const CHILD_EXIT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 pub struct GitCredentialBoundary {
     askpass_program: PathBuf,
     token_env: GitSecretEnvVar,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GitCloneBaseUrl {
+    url: reqwest::Url,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GitCloneBundleSource {
+    request: VmGitCloneRequest,
+    clone_base_url: GitCloneBaseUrl,
 }
 
 #[derive(Clone, Eq, Hash, PartialEq)]
@@ -48,7 +59,7 @@ pub struct GitSecretValue(String);
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GitCloneBundlePlan {
     git_program: PathBuf,
-    request: VmGitCloneRequest,
+    source: GitCloneBundleSource,
     credential: GitCredentialBoundary,
     work_dir: PathBuf,
     mirror_dir: PathBuf,
@@ -105,6 +116,16 @@ pub enum GitSecretValueError {
 
 #[derive(Debug, thiserror::Error, Eq, PartialEq)]
 pub enum GitCloneBundlePlanError {
+    #[error("Git clone base URL must not be empty")]
+    EmptyGitCloneBaseUrl,
+    #[error("Git clone base URL {raw:?} is invalid: {message}")]
+    InvalidGitCloneBaseUrl { raw: String, message: String },
+    #[error("Git clone base URL {raw:?} uses unsupported scheme {scheme:?}")]
+    UnsupportedGitCloneBaseUrlScheme { raw: String, scheme: String },
+    #[error("Git clone base URL must not contain embedded credentials: {0:?}")]
+    GitCloneBaseUrlHasCredentials(String),
+    #[error("Git clone base URL must not contain a query or fragment: {0:?}")]
+    GitCloneBaseUrlHasQueryOrFragment(String),
     #[error("{field} path must not be empty")]
     EmptyPath { field: &'static str },
     #[error("{field} path must be absolute: {path}")]
@@ -224,6 +245,80 @@ impl GitCredentialBoundary {
     }
 }
 
+impl GitCloneBaseUrl {
+    pub fn github() -> Self {
+        Self::parse(DEFAULT_GIT_CLONE_BASE_URL)
+            .expect("default Git clone base URL is a valid HTTPS URL")
+    }
+
+    pub fn parse(raw: impl AsRef<str>) -> Result<Self, GitCloneBundlePlanError> {
+        let raw = raw.as_ref();
+        if raw.is_empty() {
+            return Err(GitCloneBundlePlanError::EmptyGitCloneBaseUrl);
+        }
+        let mut url = reqwest::Url::parse(raw).map_err(|err| {
+            GitCloneBundlePlanError::InvalidGitCloneBaseUrl {
+                raw: raw.to_string(),
+                message: err.to_string(),
+            }
+        })?;
+        if !matches!(url.scheme(), "http" | "https") {
+            return Err(GitCloneBundlePlanError::UnsupportedGitCloneBaseUrlScheme {
+                raw: raw.to_string(),
+                scheme: url.scheme().to_string(),
+            });
+        }
+        if !url.username().is_empty() || url.password().is_some() {
+            return Err(GitCloneBundlePlanError::GitCloneBaseUrlHasCredentials(
+                raw.to_string(),
+            ));
+        }
+        if url.query().is_some() || url.fragment().is_some() {
+            return Err(GitCloneBundlePlanError::GitCloneBaseUrlHasQueryOrFragment(
+                raw.to_string(),
+            ));
+        }
+        if !url.path().ends_with('/') {
+            let path = format!("{}/", url.path());
+            url.set_path(&path);
+        }
+        Ok(Self { url })
+    }
+
+    pub fn as_str(&self) -> &str {
+        self.url.as_str()
+    }
+
+    pub fn repo_url(&self, repo: &GitCloneRepo) -> String {
+        let repo_ref = repo.as_repo_ref();
+        let mut url = self.url.clone();
+        let path = format!("{}{}/{}.git", url.path(), repo_ref.owner, repo_ref.name);
+        url.set_path(&path);
+        url.to_string()
+    }
+}
+
+impl GitCloneBundleSource {
+    pub fn github(request: VmGitCloneRequest) -> Self {
+        Self::new(request, GitCloneBaseUrl::github())
+    }
+
+    pub fn new(request: VmGitCloneRequest, clone_base_url: GitCloneBaseUrl) -> Self {
+        Self {
+            request,
+            clone_base_url,
+        }
+    }
+
+    pub fn request(&self) -> &VmGitCloneRequest {
+        &self.request
+    }
+
+    pub fn clone_base_url(&self) -> &GitCloneBaseUrl {
+        &self.clone_base_url
+    }
+}
+
 impl GitSecretEnvVar {
     pub fn new(raw: impl Into<String>) -> Result<Self, GitSecretEnvVarError> {
         let raw = raw.into();
@@ -300,6 +395,26 @@ impl GitCloneBundlePlan {
         timeout: Duration,
         max_bundle_bytes: u64,
     ) -> Result<Self, GitCloneBundlePlanError> {
+        Self::new_with_source(
+            git_program,
+            GitCloneBundleSource::github(request),
+            credential,
+            work_dir,
+            bundle_path,
+            timeout,
+            max_bundle_bytes,
+        )
+    }
+
+    pub fn new_with_source(
+        git_program: impl Into<PathBuf>,
+        source: GitCloneBundleSource,
+        credential: GitCredentialBoundary,
+        work_dir: impl Into<PathBuf>,
+        bundle_path: impl Into<PathBuf>,
+        timeout: Duration,
+        max_bundle_bytes: u64,
+    ) -> Result<Self, GitCloneBundlePlanError> {
         let git_program = git_program.into();
         let work_dir = work_dir.into();
         let bundle_path = bundle_path.into();
@@ -330,7 +445,7 @@ impl GitCloneBundlePlan {
 
         Ok(Self {
             git_program,
-            request,
+            source,
             credential,
             work_dir,
             mirror_dir,
@@ -341,11 +456,15 @@ impl GitCloneBundlePlan {
     }
 
     pub fn request(&self) -> &VmGitCloneRequest {
-        &self.request
+        self.source.request()
     }
 
     pub fn credential(&self) -> &GitCredentialBoundary {
         &self.credential
+    }
+
+    pub fn clone_base_url(&self) -> &GitCloneBaseUrl {
+        self.source.clone_base_url()
     }
 
     pub fn work_dir(&self) -> &Path {
@@ -388,7 +507,7 @@ impl GitCloneBundlePlan {
                 OsString::from("clone"),
                 OsString::from("--mirror"),
                 OsString::from("--"),
-                OsString::from(github_https_url(self.request.repo())),
+                OsString::from(self.clone_base_url().repo_url(self.request().repo())),
                 self.mirror_dir.as_os_str().to_os_string(),
             ],
             self.clone_mirror_env(),
@@ -405,7 +524,7 @@ impl GitCloneBundlePlan {
             OsString::from("--"),
             self.bundle_path.as_os_str().to_os_string(),
         ];
-        match self.request.git_ref() {
+        match self.request().git_ref() {
             Some(git_ref) => args.push(OsString::from(git_ref.as_str())),
             None => args.push(OsString::from("--all")),
         }
@@ -974,8 +1093,9 @@ fn require_absolute_path(field: &'static str, path: &Path) -> Result<(), GitClon
     Ok(())
 }
 
+#[cfg(test)]
 fn github_https_url(repo: &GitCloneRepo) -> String {
-    format!("{GITHUB_HTTPS_BASE}/{repo}.git")
+    GitCloneBaseUrl::github().repo_url(repo)
 }
 
 #[cfg(test)]
@@ -1115,7 +1235,7 @@ exit 42
     }
 
     async fn wait_for_path_or_finished<T>(path: &Path, handle: &tokio::task::JoinHandle<T>) {
-        for _ in 0..300 {
+        for _ in 0..1000 {
             if path.exists() {
                 return;
             }
@@ -1176,6 +1296,31 @@ exit 42
             raw.truncate(255);
             raw
         })
+    }
+
+    fn git_clone_base_url_strategy() -> impl Strategy<Value = (String, String)> {
+        (
+            prop_oneof![Just("http"), Just("https")],
+            prop::collection::vec(
+                prop_oneof![
+                    (b'a'..=b'z').prop_map(char::from),
+                    (b'0'..=b'9').prop_map(char::from),
+                ],
+                1..16,
+            ),
+            prop::collection::vec(ref_component_strategy(), 0..4),
+        )
+            .prop_map(|(scheme, host_chars, path_components)| {
+                let host = host_chars.into_iter().collect::<String>();
+                let path = if path_components.is_empty() {
+                    String::new()
+                } else {
+                    format!("/{}", path_components.join("/"))
+                };
+                let raw = format!("{scheme}://{host}.example{path}");
+                let expected_prefix = format!("{scheme}://{host}.example{path}/");
+                (raw, expected_prefix)
+            })
     }
 
     fn token_strategy() -> impl Strategy<Value = String> {
@@ -1262,6 +1407,66 @@ exit 42
             let plan_debug = format!("{plan:?}");
             prop_assert!(!plan_debug.contains(&token), "plan debug leaked token {token:?}: {plan_debug}");
         }
+
+        #[test]
+        fn clone_base_url_is_the_only_repo_url_prefix(
+            owner in owner_strategy(),
+            name in repo_name_strategy(),
+            (base_raw, expected_prefix) in git_clone_base_url_strategy(),
+        ) {
+            let repo_ref: RepoRef = format!("{owner}/{name}").parse().unwrap();
+            let clone_repo = GitCloneRepo::new(repo_ref).unwrap();
+            let base = GitCloneBaseUrl::parse(&base_raw).unwrap();
+            let expected_url = format!("{expected_prefix}{owner}/{name}.git");
+
+            prop_assert_eq!(base.repo_url(&clone_repo), expected_url.clone());
+
+            let plan = GitCloneBundlePlan::new_with_source(
+                "git",
+                GitCloneBundleSource::new(VmGitCloneRequest::new(clone_repo, None), base),
+                credential(),
+                "/tmp/writ-clone-work",
+                "/tmp/writ-clone-work/out.bundle",
+                Duration::from_secs(30),
+                64 * 1024 * 1024,
+            ).unwrap();
+            let clone_args = plan.commands().clone_mirror().display_args_lossy();
+            prop_assert!(clone_args.contains(&expected_url));
+            prop_assert!(!clone_args.contains(&github_https_url(plan.request().repo())));
+        }
+    }
+
+    #[test]
+    fn clone_base_url_rejects_unsafe_shapes() {
+        assert!(matches!(
+            GitCloneBaseUrl::parse(""),
+            Err(GitCloneBundlePlanError::EmptyGitCloneBaseUrl)
+        ));
+        assert!(matches!(
+            GitCloneBaseUrl::parse("github.com"),
+            Err(GitCloneBundlePlanError::InvalidGitCloneBaseUrl { .. })
+        ));
+        assert!(matches!(
+            GitCloneBaseUrl::parse("ssh://github.com"),
+            Err(GitCloneBundlePlanError::UnsupportedGitCloneBaseUrlScheme { scheme, .. })
+                if scheme == "ssh"
+        ));
+        assert!(matches!(
+            GitCloneBaseUrl::parse("https://user:token@github.com"),
+            Err(GitCloneBundlePlanError::GitCloneBaseUrlHasCredentials(_))
+        ));
+        assert!(matches!(
+            GitCloneBaseUrl::parse("https://github.com?owner=o"),
+            Err(GitCloneBundlePlanError::GitCloneBaseUrlHasQueryOrFragment(
+                _
+            ))
+        ));
+        assert!(matches!(
+            GitCloneBaseUrl::parse("https://github.com#repos"),
+            Err(GitCloneBundlePlanError::GitCloneBaseUrlHasQueryOrFragment(
+                _
+            ))
+        ));
     }
 
     #[test]

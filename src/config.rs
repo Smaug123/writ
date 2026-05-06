@@ -19,7 +19,8 @@ use crate::github::GitHubAppConfig;
 use crate::nix_cache::{NixTrustedPublicKeys, NixTrustedPublicKeysError};
 use crate::policy::PolicyConfig;
 use crate::vm_git_bundle::{
-    GitCloneBundlePlanError, GitCredentialBoundary, GitSecretEnvVar, GitSecretEnvVarError,
+    DEFAULT_GIT_CLONE_BASE_URL, GitCloneBaseUrl, GitCloneBundlePlanError, GitCredentialBoundary,
+    GitSecretEnvVar, GitSecretEnvVarError,
 };
 use crate::vm_http::{
     VmHttpGitCloneConfig, VmHttpGitRuntimeConfig, VmHttpNixCacheConfig, VmHttpNixCacheConfigError,
@@ -104,6 +105,8 @@ pub struct AgentVmHttpConfig {
     pub broker_port_min: u16,
     pub broker_port_max: u16,
     pub git_program: PathBuf,
+    #[serde(default = "default_git_clone_base_url")]
+    pub git_clone_base_url: String,
     pub askpass_program: PathBuf,
     #[serde(default = "default_vm_git_token_env")]
     pub token_env: String,
@@ -212,8 +215,10 @@ impl AgentVmHttpConfig {
         let broker_port_range = BrokerPortRange::new(self.broker_port_min, self.broker_port_max)?;
         let token_env = GitSecretEnvVar::new(self.token_env.clone())?;
         let credential = GitCredentialBoundary::new(self.askpass_program.clone(), token_env)?;
-        let git_clone = VmHttpGitCloneConfig::new(
+        let clone_base_url = GitCloneBaseUrl::parse(&self.git_clone_base_url)?;
+        let git_clone = VmHttpGitCloneConfig::new_with_clone_base_url(
             self.git_program.clone(),
+            clone_base_url,
             credential,
             self.work_root.clone(),
             Duration::from_secs(self.clone_timeout_secs),
@@ -250,6 +255,10 @@ fn default_sudo_program() -> PathBuf {
 
 fn default_vm_git_token_env() -> String {
     "WRIT_GIT_TOKEN".into()
+}
+
+fn default_git_clone_base_url() -> String {
+    DEFAULT_GIT_CLONE_BASE_URL.into()
 }
 
 fn parse_ipv4_cidr_config(
@@ -430,6 +439,7 @@ mod tests {
                     "broker_port_min": 18080,
                     "broker_port_max": 18081,
                     "git_program": "/usr/bin/git",
+                    "git_clone_base_url": "https://github.com",
                     "askpass_program": "/usr/local/libexec/writ-git-askpass",
                     "work_root": "/var/folders/writ/git-work",
                     "clone_timeout_secs": 30,
@@ -482,6 +492,7 @@ mod tests {
             broker_port_min: 18080,
             broker_port_max: 18081,
             git_program: PathBuf::from("/usr/bin/git"),
+            git_clone_base_url: DEFAULT_GIT_CLONE_BASE_URL.into(),
             askpass_program: PathBuf::from("/usr/local/libexec/writ-git-askpass"),
             token_env: "WRIT_GIT_TOKEN".into(),
             work_root: PathBuf::from("/var/folders/writ/git-work"),
@@ -582,6 +593,27 @@ mod tests {
                 GitCloneBundlePlanError::EmptyPath {
                     field: "git_program"
                 }
+            ))
+        ));
+    }
+
+    #[test]
+    fn agent_vm_http_config_rejects_unsafe_git_clone_base_url() {
+        let mut c = valid_agent_vm_http_config();
+        c.git_clone_base_url = "ssh://github.com".into();
+
+        assert!(matches!(
+            c.to_runtime_config(),
+            Err(AgentVmHttpConfigError::GitClone(
+                GitCloneBundlePlanError::UnsupportedGitCloneBaseUrlScheme { scheme, .. }
+            )) if scheme == "ssh"
+        ));
+
+        c.git_clone_base_url = "https://user:token@github.com".into();
+        assert!(matches!(
+            c.to_runtime_config(),
+            Err(AgentVmHttpConfigError::GitClone(
+                GitCloneBundlePlanError::GitCloneBaseUrlHasCredentials(_)
             ))
         ));
     }

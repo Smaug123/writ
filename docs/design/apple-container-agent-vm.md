@@ -505,9 +505,12 @@ First Git clone bundle model slice implemented in `src/vm_git.rs` and
 - `GitCloneBundlePlan` describes a host-side `git clone --mirror` followed by
   `git bundle create`, using an askpass boundary and required secret
   environment variable name. The plan carries no token value, and generated
-  command argv contains no token material: only static Git flags, the GitHub
-  HTTPS repo URL, local temp paths, and optionally the validated Git ref. Every
-  planned Git invocation also carries a clean Git-configuration environment
+  command argv contains no token material: only static Git flags, the parsed
+  Git clone base URL plus GitHub owner/repo path, local temp paths, and
+  optionally the validated Git ref. The clone base URL defaults to
+  `https://github.com`, and startup config may override it only with an
+  `http`/`https` URL without credentials, query, or fragment. Every planned Git
+  invocation also carries a clean Git-configuration environment
   (`GIT_CONFIG_NOSYSTEM=1`, `GIT_CONFIG_GLOBAL=/dev/null`,
   `GIT_CONFIG_COUNT=0`) so ambient `url.*.insteadOf`, credential helpers, or
   environment-injected Git config cannot rewrite the HTTPS/App-token boundary
@@ -596,11 +599,12 @@ First daemon-owned VM HTTP runtime slice implemented in `src/vm_http.rs`,
 
 - `DaemonConfig` now accepts an optional `agent_vm.vm_http` block containing
   the wildcard/listen address, broker port range, Git binary, askpass program,
-  token environment variable name, Git work root, clone timeout, and maximum
-  returned bundle size. `writd` parses that block at startup into the typed
-  `VmHttpGitRuntimeConfig`, so bad port ranges, relative askpass/work-root
-  paths, invalid token environment names, zero timeouts, and zero bundle-size
-  limits fail before the daemon starts serving requests;
+  token environment variable name, Git clone base URL, Git work root, clone
+  timeout, and maximum returned bundle size. `writd` parses that block at
+  startup into the typed `VmHttpGitRuntimeConfig`, so bad port ranges, unsafe
+  clone base URLs, relative askpass/work-root paths, invalid token environment
+  names, zero timeouts, and zero bundle-size limits fail before the daemon
+  starts serving requests;
 - `prepare_vm_http_git_session()` is the per-session ownership primitive for
   the later lifecycle/protocol slice. Given broker state, the daemon's static
   runtime config, a session ID, and the session IPv4 subnet, it binds and keeps
@@ -1140,9 +1144,12 @@ Manual daemon proof harness added in `scripts/prove-agent-vm-daemon.sh`:
 - builds `writ`, `writd`, `writ-agent-vm-pf-helper`, and by default the Nix
   guest OCI image containing `writ-vm`;
 - starts a local fake GitHub API and configures `writd` to use it for
-  installation-token minting. The harness also supplies a fake host `git`
-  binary that creates a deterministic bundle, so the proof does not depend on
-  real GitHub availability or external network egress;
+  installation-token minting. The harness also starts a local Basic-auth Git
+  smart-HTTP origin containing a deterministic proof repo, and configures the
+  daemon's Git clone base URL to that origin. The host Git binary is real, so
+  the proof exercises the production `git clone --mirror` / `git bundle
+  create` executor without depending on real GitHub availability or external
+  network egress;
 - starts `writd` with a temporary config, file secret store, audit DB, managed
   state directory, VM HTTP work root, and Unix socket;
 - starts the VM through the public Unix-socket CLI:
@@ -1152,12 +1159,13 @@ Manual daemon proof harness added in `scripts/prove-agent-vm-daemon.sh`:
   `WRIT_BROKER_TOKEN` environment variables are present. It also checks the
   daemon-written Nix netrc/config paths exist inside the VM;
 - from inside the VM, runs `writ-vm session`, `writ-vm git clone`, and
-  `nix path-info --store "$WRIT_NIX_CACHE_URL"` through the daemon-owned VM
-  HTTP listener. The clone route must mint through the fake GitHub API, run the
-  fake host `git` without leaking the token in argv, return a valid
-  deterministic Git bundle to the VM client, and let guest-local Git create a
-  checkout from that bundle. The Nix route must authenticate with the
-  daemon-written netrc and fail only at the skeleton cache miss;
+  `nix copy --from "$WRIT_NIX_CACHE_URL" <proof-store-path>` through the
+  daemon-owned VM HTTP listener. The clone route must mint through the fake
+  GitHub API, run real host Git against the local origin through askpass Basic
+  auth without leaking the token into proof logs, return a valid deterministic
+  Git bundle to the VM client, and let guest-local Git create a checkout from
+  that bundle. The Nix route must authenticate with the daemon-written netrc
+  and realise the signed proof store path through the brokered cache proxy;
 - stops the session through `writ agent-vm stop <session-id>` and asserts the
   VM, network, PF anchor, observed guest-IPv4 PF states, and managed state
   record are gone.

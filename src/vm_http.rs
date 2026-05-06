@@ -31,8 +31,9 @@ use crate::vm_git::{
     VmGitCloneRequest,
 };
 use crate::vm_git_bundle::{
-    GitCloneBundlePlan, GitCloneBundlePlanError, GitCloneBundleRunError, GitCredentialBoundary,
-    GitSecretValue, GitSecretValueError, run_git_clone_bundle,
+    GitCloneBaseUrl, GitCloneBundlePlan, GitCloneBundlePlanError, GitCloneBundleRunError,
+    GitCloneBundleSource, GitCredentialBoundary, GitSecretValue, GitSecretValueError,
+    run_git_clone_bundle,
 };
 
 const MAX_VM_HTTP_HEAD_BYTES: usize = 16 * 1024;
@@ -105,6 +106,7 @@ pub struct RunningVmHttpGitSession {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VmHttpGitCloneConfig {
     git_program: PathBuf,
+    clone_base_url: GitCloneBaseUrl,
     credential: GitCredentialBoundary,
     work_root: PathBuf,
     timeout: std::time::Duration,
@@ -460,6 +462,24 @@ impl VmHttpGitCloneConfig {
         timeout: std::time::Duration,
         max_bundle_bytes: u64,
     ) -> Result<Self, GitCloneBundlePlanError> {
+        Self::new_with_clone_base_url(
+            git_program,
+            GitCloneBaseUrl::github(),
+            credential,
+            work_root,
+            timeout,
+            max_bundle_bytes,
+        )
+    }
+
+    pub fn new_with_clone_base_url(
+        git_program: impl Into<PathBuf>,
+        clone_base_url: GitCloneBaseUrl,
+        credential: GitCredentialBoundary,
+        work_root: impl Into<PathBuf>,
+        timeout: std::time::Duration,
+        max_bundle_bytes: u64,
+    ) -> Result<Self, GitCloneBundlePlanError> {
         let git_program = git_program.into();
         let work_root = work_root.into();
         if git_program.as_os_str().is_empty() {
@@ -484,6 +504,7 @@ impl VmHttpGitCloneConfig {
         }
         Ok(Self {
             git_program,
+            clone_base_url,
             credential,
             work_root,
             timeout,
@@ -503,9 +524,9 @@ impl VmHttpGitCloneConfig {
             .work_root
             .join(format!("clone-{}", uuid::Uuid::new_v4().simple()));
         let bundle_path = work_dir.join("repo.bundle");
-        GitCloneBundlePlan::new(
+        GitCloneBundlePlan::new_with_source(
             self.git_program.clone(),
-            request,
+            GitCloneBundleSource::new(request, self.clone_base_url.clone()),
             self.credential.clone(),
             work_dir,
             bundle_path,

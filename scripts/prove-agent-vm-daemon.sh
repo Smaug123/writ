@@ -26,9 +26,10 @@ What it proves:
     realises a proof store path through it
   - `stop_agent_vm` removes the VM, network, PF anchor/states, and state record
 
-The GitHub API, host git binary, and upstream Nix binary cache are local fakes.
-This keeps the proof focused on Apple Container/PF/daemon wiring rather than
-real GitHub or cache availability.
+The GitHub API, Git origin, and upstream Nix binary cache are local fakes. The
+host Git binary is real: it clones from the local origin over HTTP and creates
+the bundle through the production executor. This keeps the proof focused on
+Apple Container/PF/daemon wiring rather than real GitHub or cache availability.
 
 Note: the signed-cache setup adds one tiny fixed-output proof file to the host
 Nix store. Its contents are constant, so repeated runs reuse the same store
@@ -96,12 +97,15 @@ FAKE_NIX_CACHE_DIR="${TMP_DIR}/fake-nix-cache"
 FAKE_NIX_CACHE_SECRET_KEY="${TMP_DIR}/fake-nix-cache.sec"
 FAKE_NIX_CACHE_PUBLIC_KEY_FILE="${TMP_DIR}/fake-nix-cache.pub"
 FAKE_NIX_PROOF_SOURCE="${TMP_DIR}/writ-nix-route-proof"
+FAKE_GIT_ORIGIN_ROOT="${TMP_DIR}/fake-git-origin"
+FAKE_GIT_ORIGIN_SOURCE="${TMP_DIR}/fake-git-origin-source"
 FAKE_GITHUB_SCRIPT="${TMP_DIR}/fake-github.py"
+FAKE_GIT_ORIGIN_SCRIPT="${TMP_DIR}/fake-git-origin.py"
 FAKE_NIX_CACHE_SCRIPT="${TMP_DIR}/fake-nix-cache.py"
-FAKE_GIT="${TMP_DIR}/fake-git"
 FAKE_ASKPASS="${TMP_DIR}/fake-askpass"
-FAKE_GIT_ARGS_LOG="${TMP_DIR}/fake-git-args.log"
+FAKE_ASKPASS_LOG="${TMP_DIR}/fake-askpass.log"
 FAKE_GITHUB_LOG="${TMP_DIR}/fake-github.log"
+FAKE_GIT_ORIGIN_LOG="${TMP_DIR}/fake-git-origin.log"
 FAKE_NIX_CACHE_LOG="${TMP_DIR}/fake-nix-cache.log"
 WRITD_LOG="${TMP_DIR}/writd.log"
 START_OUTPUT="${TMP_DIR}/agent-vm-start.txt"
@@ -113,6 +117,8 @@ WRITD_BIN=""
 HELPER=""
 FAKE_GITHUB_PORT=""
 FAKE_GITHUB_PID=""
+FAKE_GIT_ORIGIN_PORT=""
+FAKE_GIT_ORIGIN_PID=""
 FAKE_NIX_CACHE_PORT=""
 FAKE_NIX_CACHE_PID=""
 FAKE_NIX_CACHE_PUBLIC_KEY=""
@@ -140,8 +146,9 @@ dump_diagnostics() {
   printf '\n[prove-daemon] diagnostics for failed run under %s\n' "$TMP_DIR" >&2
   dump_log "writd log" "$WRITD_LOG"
   dump_log "fake GitHub log" "$FAKE_GITHUB_LOG"
+  dump_log "fake Git origin log" "$FAKE_GIT_ORIGIN_LOG"
   dump_log "fake Nix cache log" "$FAKE_NIX_CACHE_LOG"
-  dump_log "fake git argv log" "$FAKE_GIT_ARGS_LOG"
+  dump_log "fake askpass log" "$FAKE_ASKPASS_LOG"
   dump_log "start output" "$START_OUTPUT"
   if [[ -d "$STATE_DIR" ]]; then
     printf '\n[prove-daemon] ==== state records: %s ====\n' "$STATE_DIR" >&2
@@ -200,6 +207,10 @@ cleanup() {
   if [[ -n "$FAKE_GITHUB_PID" ]]; then
     kill "$FAKE_GITHUB_PID" >/dev/null 2>&1 || true
     wait "$FAKE_GITHUB_PID" 2>/dev/null || true
+  fi
+  if [[ -n "$FAKE_GIT_ORIGIN_PID" ]]; then
+    kill "$FAKE_GIT_ORIGIN_PID" >/dev/null 2>&1 || true
+    wait "$FAKE_GIT_ORIGIN_PID" 2>/dev/null || true
   fi
   if [[ -n "$FAKE_NIX_CACHE_PID" ]]; then
     kill "$FAKE_NIX_CACHE_PID" >/dev/null 2>&1 || true
@@ -424,76 +435,156 @@ server.serve_forever()
 PY
 }
 
-write_fake_git() {
-  local escaped_real_git
-  escaped_real_git="$(printf "%s" "$REAL_GIT" | sed "s/'/'\\\\''/g")"
-  cat >"$FAKE_GIT" <<EOF
+write_fake_askpass() {
+  cat >"$FAKE_ASKPASS" <<EOF
 #!/bin/sh
 set -eu
-REAL_GIT='${escaped_real_git}'
-printf '%s\n' "\$*" >> '$(printf "%s" "$FAKE_GIT_ARGS_LOG" | sed "s/'/'\\\\''/g")'
-printf 'token_env=%s\n' "\${WRIT_GIT_TOKEN:+set}" >> '$(printf "%s" "$FAKE_GIT_ARGS_LOG" | sed "s/'/'\\\\''/g")'
-
-case " \$* " in
-  *" clone "*)
-    if [ "\${WRIT_GIT_TOKEN:-}" != "$PROOF_TOKEN" ]; then
-      printf 'missing expected git token env\n' >&2
-      exit 23
-    fi
-    mirror_dir=""
-    for arg in "\$@"; do
-      mirror_dir="\$arg"
-    done
-    source_dir="\${mirror_dir}.source"
-    /bin/rm -rf "\$mirror_dir" "\$source_dir"
-    /bin/mkdir -p "\$source_dir"
-    "\$REAL_GIT" -C "\$source_dir" init >/dev/null
-    "\$REAL_GIT" -C "\$source_dir" config user.email proof@example.com
-    "\$REAL_GIT" -C "\$source_dir" config user.name 'writ proof'
-    "\$REAL_GIT" -C "\$source_dir" config commit.gpgsign false
-    printf '%s\n' "$PROOF_BUNDLE_MARKER" > "\$source_dir/README.md"
-    "\$REAL_GIT" -C "\$source_dir" add README.md
-    GIT_AUTHOR_DATE='2001-01-01T00:00:00Z' \
-      GIT_COMMITTER_DATE='2001-01-01T00:00:00Z' \
-    "\$REAL_GIT" -C "\$source_dir" commit -m 'proof bundle' >/dev/null
-    "\$REAL_GIT" -C "\$source_dir" branch -M main
-    "\$REAL_GIT" clone --mirror "\$source_dir" "\$mirror_dir" >/dev/null
-    /bin/rm -rf "\$source_dir"
-    exit 0
-    ;;
-  *" bundle create "*)
-    if [ "\${WRIT_GIT_TOKEN+x}" = x ]; then
-      printf 'unexpected git token env during bundle creation\n' >&2
-      exit 26
-    fi
-    bundle_path=""
-    previous=""
-    for arg in "\$@"; do
-      if [ "\$previous" = "--" ]; then
-        bundle_path="\$arg"
-        break
-      fi
-      previous="\$arg"
-    done
-    if [ -z "\$bundle_path" ]; then
-      printf 'missing bundle path\n' >&2
-      exit 24
-    fi
-    exec "\$REAL_GIT" "\$@"
-    ;;
-  *)
-    printf 'unexpected fake git invocation: %s\n' "\$*" >&2
-    exit 25
-    ;;
+prompt="\${1:-}"
+printf 'prompt=%s\n' "\$prompt" >> '$(printf "%s" "$FAKE_ASKPASS_LOG" | sed "s/'/'\\\\''/g")'
+case "\$prompt" in
+  *Username*) printf 'x-access-token\n' ;;
+  *Password*) printf '%s\n' "\${WRIT_GIT_TOKEN:?missing WRIT_GIT_TOKEN for git askpass}" ;;
+  *) printf 'unexpected askpass prompt: %s\n' "\$prompt" >&2; exit 1 ;;
 esac
 EOF
-  chmod 700 "$FAKE_GIT"
-
-  cat >"$FAKE_ASKPASS" <<'EOF'
-#!/bin/sh
-printf 'x-access-token\n'
-EOF
   chmod 700 "$FAKE_ASKPASS"
+}
+
+prepare_fake_git_origin() {
+  mkdir -p "${FAKE_GIT_ORIGIN_ROOT}/${PROOF_OWNER}"
+  "$REAL_GIT" -C "$TMP_DIR" init "$FAKE_GIT_ORIGIN_SOURCE" >/dev/null
+  "$REAL_GIT" -C "$FAKE_GIT_ORIGIN_SOURCE" config user.email proof@example.com
+  "$REAL_GIT" -C "$FAKE_GIT_ORIGIN_SOURCE" config user.name 'writ proof'
+  "$REAL_GIT" -C "$FAKE_GIT_ORIGIN_SOURCE" config commit.gpgsign false
+  printf '%s\n' "$PROOF_BUNDLE_MARKER" > "${FAKE_GIT_ORIGIN_SOURCE}/README.md"
+  "$REAL_GIT" -C "$FAKE_GIT_ORIGIN_SOURCE" add README.md
+  GIT_AUTHOR_DATE='2001-01-01T00:00:00Z' \
+    GIT_COMMITTER_DATE='2001-01-01T00:00:00Z' \
+    "$REAL_GIT" -C "$FAKE_GIT_ORIGIN_SOURCE" commit -m 'proof bundle' >/dev/null
+  "$REAL_GIT" -C "$FAKE_GIT_ORIGIN_SOURCE" branch -M main
+  "$REAL_GIT" clone --bare \
+    "$FAKE_GIT_ORIGIN_SOURCE" \
+    "${FAKE_GIT_ORIGIN_ROOT}/${PROOF_OWNER}/${PROOF_REPO}.git" >/dev/null
+  "$REAL_GIT" -C "${FAKE_GIT_ORIGIN_ROOT}/${PROOF_OWNER}/${PROOF_REPO}.git" \
+    update-server-info
+}
+
+write_fake_git_origin_server() {
+  cat >"$FAKE_GIT_ORIGIN_SCRIPT" <<'PY'
+import base64
+import http.server
+import os
+import subprocess
+import sys
+import urllib.parse
+
+PORT = int(sys.argv[1])
+PROJECT_ROOT = sys.argv[2]
+TOKEN = sys.argv[3]
+GIT = sys.argv[4]
+EXPECTED_AUTH = "Basic " + base64.b64encode(
+    f"x-access-token:{TOKEN}".encode()
+).decode()
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def log_message(self, fmt, *args):
+        print(fmt % args, flush=True)
+
+    def _send(self, status, body=b"", headers=()):
+        self.send_response(status)
+        for name, value in headers:
+            self.send_header(name, value)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
+    def _authorized(self):
+        return self.headers.get("Authorization", "") == EXPECTED_AUTH
+
+    def _challenge(self):
+        print(f"auth=denied path={self.path}", flush=True)
+        self._send(
+            401,
+            b"auth required\n",
+            [("WWW-Authenticate", 'Basic realm="writ-proof-git"')],
+        )
+
+    def do_HEAD(self):
+        self.do_GET()
+
+    def do_GET(self):
+        self._handle_git()
+
+    def do_POST(self):
+        self._handle_git()
+
+    def _handle_git(self):
+        if self.path == "/health":
+            self._send(200, b"ok\n")
+            return
+        if not self._authorized():
+            self._challenge()
+            return
+
+        parsed = urllib.parse.urlsplit(self.path)
+        length = int(self.headers.get("Content-Length", "0") or "0")
+        body = self.rfile.read(length)
+        print(f"auth=ok method={self.command} path={parsed.path}", flush=True)
+
+        env = {
+            "GIT_PROJECT_ROOT": PROJECT_ROOT,
+            "GIT_HTTP_EXPORT_ALL": "1",
+            "PATH_INFO": parsed.path,
+            "QUERY_STRING": parsed.query,
+            "REQUEST_METHOD": self.command,
+            "CONTENT_TYPE": self.headers.get("Content-Type", ""),
+            "CONTENT_LENGTH": str(length),
+            "REMOTE_USER": "x-access-token",
+        }
+        proc = subprocess.run(
+            [GIT, "http-backend"],
+            input=body,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+            check=False,
+        )
+        if proc.stderr:
+            sys.stderr.buffer.write(proc.stderr)
+            sys.stderr.flush()
+        if proc.returncode != 0:
+            self._send(500, b"git http-backend failed\n")
+            return
+
+        raw = proc.stdout
+        marker = b"\r\n\r\n"
+        if marker in raw:
+            header_bytes, response_body = raw.split(marker, 1)
+        elif b"\n\n" in raw:
+            header_bytes, response_body = raw.split(b"\n\n", 1)
+        else:
+            self._send(500, b"git http-backend returned malformed CGI response\n")
+            return
+
+        status = 200
+        headers = []
+        for line in header_bytes.replace(b"\r\n", b"\n").split(b"\n"):
+            if not line:
+                continue
+            name, value = line.decode("iso-8859-1").split(":", 1)
+            value = value.strip()
+            if name.lower() == "status":
+                status = int(value.split(" ", 1)[0])
+            elif name.lower() == "content-length":
+                continue
+            else:
+                headers.append((name, value))
+        self._send(status, response_body, headers)
+
+server = http.server.ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
+server.serve_forever()
+PY
 }
 
 write_config() {
@@ -509,7 +600,8 @@ write_config() {
     "$HELPER" \
     "$BROKER_PORT_MIN" \
     "$BROKER_PORT_MAX" \
-    "$FAKE_GIT" \
+    "$REAL_GIT" \
+    "$FAKE_GIT_ORIGIN_PORT" \
     "$FAKE_ASKPASS" \
     "$GIT_WORK_ROOT" \
     "$FAKE_GITHUB_PORT" \
@@ -532,7 +624,8 @@ import sys
     helper,
     broker_port_min,
     broker_port_max,
-    fake_git,
+    real_git,
+    fake_git_origin_port,
     fake_askpass,
     git_work_root,
     fake_github_port,
@@ -572,7 +665,8 @@ config = {
             "bind_addr": "0.0.0.0",
             "broker_port_min": int(broker_port_min),
             "broker_port_max": int(broker_port_max),
-            "git_program": fake_git,
+            "git_program": real_git,
+            "git_clone_base_url": f"http://127.0.0.1:{fake_git_origin_port}",
             "askpass_program": fake_askpass,
             "token_env": "WRIT_GIT_TOKEN",
             "work_root": git_work_root,
@@ -626,6 +720,26 @@ start_fake_github() {
     sleep 0.1
   done
   die "fake GitHub API did not start on port ${FAKE_GITHUB_PORT}"
+}
+
+start_fake_git_origin() {
+  FAKE_GIT_ORIGIN_PORT="$(pick_port)"
+  write_fake_git_origin_server
+  python3 "$FAKE_GIT_ORIGIN_SCRIPT" \
+    "$FAKE_GIT_ORIGIN_PORT" \
+    "$FAKE_GIT_ORIGIN_ROOT" \
+    "$PROOF_TOKEN" \
+    "$REAL_GIT" \
+    >"$FAKE_GIT_ORIGIN_LOG" 2>&1 &
+  FAKE_GIT_ORIGIN_PID="$!"
+  for _ in {1..50}; do
+    if curl --silent --fail --max-time 1 "http://127.0.0.1:${FAKE_GIT_ORIGIN_PORT}/health" \
+      >/dev/null 2>&1; then
+      return
+    fi
+    sleep 0.1
+  done
+  die "fake Git origin did not start on port ${FAKE_GIT_ORIGIN_PORT}"
 }
 
 start_fake_nix_cache() {
@@ -723,18 +837,21 @@ assert_guest_has_no_routable_ipv6() {
   log "pass: guest has no routable IPv6 address or default route"
 }
 
-assert_fake_git_used_cleanly() {
-  if ! grep -Fq "clone --mirror -- https://github.com/${PROOF_REPO_FULL}.git" "$FAKE_GIT_ARGS_LOG"; then
-    die "fake git log does not show the expected clone URL"
+assert_real_git_origin_used_cleanly() {
+  if ! grep -Fq "auth=ok method=GET path=/${PROOF_REPO_FULL}.git/info/refs" "$FAKE_GIT_ORIGIN_LOG"; then
+    die "fake Git origin log does not show the expected info/refs request"
   fi
-  if ! grep -Fq "bundle create --" "$FAKE_GIT_ARGS_LOG"; then
-    die "fake git log does not show bundle creation"
+  if ! grep -Fq "auth=ok method=POST path=/${PROOF_REPO_FULL}.git/git-upload-pack" "$FAKE_GIT_ORIGIN_LOG"; then
+    die "fake Git origin log does not show the expected upload-pack request"
   fi
-  if ! grep -Fxq "token_env=set" "$FAKE_GIT_ARGS_LOG"; then
-    die "fake git log does not show clone received the host-side token env"
+  if ! grep -Fq "Username" "$FAKE_ASKPASS_LOG"; then
+    die "askpass log does not show a username prompt from host Git"
   fi
-  if grep -Fq "$PROOF_TOKEN" "$FAKE_GIT_ARGS_LOG"; then
-    die "fake git argv log leaked the proof token"
+  if ! grep -Fq "Password" "$FAKE_ASKPASS_LOG"; then
+    die "askpass log does not show a password prompt from host Git"
+  fi
+  if grep -Fq "$PROOF_TOKEN" "$FAKE_GIT_ORIGIN_LOG" "$FAKE_ASKPASS_LOG"; then
+    die "host Git proof logs leaked the proof token"
   fi
 }
 
@@ -848,13 +965,15 @@ chmod 700 "$SECRETS_DIR"
 cp "${ROOT_DIR}/tests/fixtures/rsa_test_1.pem" "${SECRETS_DIR}/gh-app-pk"
 chmod 600 "${SECRETS_DIR}/gh-app-pk"
 
-write_fake_git
+write_fake_askpass
+prepare_fake_git_origin
 prepare_fake_nix_cache
 start_fake_github
+start_fake_git_origin
 start_fake_nix_cache
 write_config
 
-log "starting writd with fake GitHub API on port ${FAKE_GITHUB_PORT} and fake Nix cache on port ${FAKE_NIX_CACHE_PORT}"
+log "starting writd with fake GitHub API on port ${FAKE_GITHUB_PORT}, fake Git origin on port ${FAKE_GIT_ORIGIN_PORT}, and fake Nix cache on port ${FAKE_NIX_CACHE_PORT}"
 "$WRITD_BIN" --config "$CONFIG_FILE" --socket "$SOCKET_PATH" --audit-db "$AUDIT_DB" \
   >"$WRITD_LOG" 2>&1 &
 WRITD_PID="$!"
@@ -949,7 +1068,7 @@ expect_guest_success "VM Nix realises a signed store path through daemon VM HTTP
      exit 1
    fi
    test "$(cat "$store_path")" = '"'"$PROOF_NIX_MARKER"'"''
-assert_fake_git_used_cleanly
+assert_real_git_origin_used_cleanly
 assert_fake_nix_cache_used
 
 log "stopping session through daemon"
