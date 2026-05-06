@@ -110,11 +110,19 @@ pub async fn dispatch_message_with_agent_vm<S: SecretStore + Send + Sync + 'stat
     agent_vm: Option<&Arc<AgentVmDaemon>>,
 ) -> ServerMessage {
     match msg {
-        ClientMessage::OpenSession { label, agent_model } => {
+        ClientMessage::OpenSession {
+            label,
+            agent_kind,
+            agent_model,
+        } => {
+            if state.minter.requires_agent_kind() && agent_kind.is_none() {
+                return missing_agent_kind_for_registry_response();
+            }
             let session_id = SessionId::new();
             let record = SessionRecord {
                 session_id,
                 label,
+                agent_kind,
                 agent_model,
                 opened_at: UnixMillis::now(),
                 closed_at: None,
@@ -144,25 +152,37 @@ pub async fn dispatch_message_with_agent_vm<S: SecretStore + Send + Sync + 'stat
         } => dispatch_capability(session_id, capability, state).await,
         ClientMessage::StartAgentVm {
             label,
+            agent_kind,
             agent_model,
             guest_command,
-        } => match agent_vm {
-            Some(agent_vm) => match agent_vm
-                .start_session(Arc::clone(state), label, agent_model, guest_command)
-                .await
-            {
-                Ok(started) => ServerMessage::AgentVmStarted {
-                    session_id: started.session_id(),
-                    broker_url: started.broker_url().to_string(),
+        } => {
+            if state.minter.requires_agent_kind() && agent_kind.is_none() {
+                return missing_agent_kind_for_registry_response();
+            }
+            match agent_vm {
+                Some(agent_vm) => match agent_vm
+                    .start_session(
+                        Arc::clone(state),
+                        label,
+                        agent_kind,
+                        agent_model,
+                        guest_command,
+                    )
+                    .await
+                {
+                    Ok(started) => ServerMessage::AgentVmStarted {
+                        session_id: started.session_id(),
+                        broker_url: started.broker_url().to_string(),
+                    },
+                    Err(err) => ServerMessage::Error {
+                        message: err.to_string(),
+                    },
                 },
-                Err(err) => ServerMessage::Error {
-                    message: err.to_string(),
+                None => ServerMessage::Error {
+                    message: "agent VM runtime is not configured".into(),
                 },
-            },
-            None => ServerMessage::Error {
-                message: "agent VM runtime is not configured".into(),
-            },
-        },
+            }
+        }
         ClientMessage::StopAgentVm { session_id } => match agent_vm {
             Some(agent_vm) => match agent_vm.stop_session(state, session_id).await {
                 Ok(()) => ServerMessage::AgentVmStopped,
@@ -174,6 +194,12 @@ pub async fn dispatch_message_with_agent_vm<S: SecretStore + Send + Sync + 'stat
                 message: "agent VM runtime is not configured".into(),
             },
         },
+    }
+}
+
+fn missing_agent_kind_for_registry_response() -> ServerMessage {
+    ServerMessage::Error {
+        message: "agent kind is required when github_apps is configured; open the session with --agent claude or --agent codex".into(),
     }
 }
 
@@ -209,7 +235,7 @@ pub(crate) async fn request_capability<S: SecretStore + Send + Sync>(
     // the insert and we'd write against a closed session. This preflight
     // only exists so the common "session is gone" case returns a clean
     // message instead of leaking the generic audit-invariant string.
-    match state.audit.get_session(session_id) {
+    let session = match state.audit.get_session(session_id) {
         Ok(None) => {
             return CapabilityOutcome::UnknownSession { session_id };
         }
@@ -221,8 +247,8 @@ pub(crate) async fn request_capability<S: SecretStore + Send + Sync>(
                 message: e.to_string(),
             };
         }
-        Ok(Some(_)) => {}
-    }
+        Ok(Some(session)) => session,
+    };
 
     let request_id = RequestId::new();
     let received_at = UnixMillis::now();
@@ -269,7 +295,10 @@ pub(crate) async fn request_capability<S: SecretStore + Send + Sync>(
         PolicyDecision::Deny { .. } => unreachable!("handled above"),
     };
 
-    let mint_result = state.minter.mint(github_scope, ttl).await;
+    let mint_result = state
+        .minter
+        .mint_for_agent(session.agent_kind, github_scope, ttl)
+        .await;
 
     match mint_result {
         Ok(minted) => {
@@ -541,11 +570,11 @@ pub async fn run_with_agent_vm<S: SecretStore + Send + Sync + 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::{GitHubAccess, RepoRef};
-    use crate::github::{GitHubAppConfig, GitHubMinter};
+    use crate::core::{AgentKind, GitHubAccess, RepoRef};
+    use crate::github::{GitHubAppConfig, GitHubAppRegistryConfig, GitHubMinter};
     use crate::policy::PolicyConfig;
     use crate::secret::{SecretError, SecretKey, SecretStore};
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, HashMap};
     use std::sync::Mutex;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::UnixStream;
@@ -607,6 +636,53 @@ mod tests {
         })
     }
 
+    fn make_agent_registry_state(server: &MockServer) -> Arc<BrokerState<InMemStore>> {
+        make_agent_registry_state_for_agents(server, &[AgentKind::Claude, AgentKind::Codex])
+    }
+
+    fn make_agent_registry_state_for_agents(
+        server: &MockServer,
+        agents: &[AgentKind],
+    ) -> Arc<BrokerState<InMemStore>> {
+        let claude_pk = SecretKey::new("claude-pk").unwrap();
+        let codex_pk = SecretKey::new("codex-pk").unwrap();
+        let store = InMemStore::default();
+        store.put(&claude_pk, TEST_PRIV).unwrap();
+        store.put(&codex_pk, TEST_PRIV).unwrap();
+        let mut apps = BTreeMap::new();
+        for agent in agents {
+            let config = match agent {
+                AgentKind::Claude => GitHubAppConfig {
+                    app_id: 101,
+                    installation_id: 111,
+                    installation_owner: "o".into(),
+                    private_key_secret: claude_pk.clone(),
+                    api_base: server.uri(),
+                },
+                AgentKind::Codex => GitHubAppConfig {
+                    app_id: 202,
+                    installation_id: 222,
+                    installation_owner: "o".into(),
+                    private_key_secret: codex_pk.clone(),
+                    api_base: server.uri(),
+                },
+            };
+            apps.insert(*agent, config);
+        }
+        let minter = GitHubMinter::new_registry(
+            GitHubAppRegistryConfig::for_agent_apps(apps).unwrap(),
+            store,
+        );
+        Arc::new(BrokerState {
+            audit: AuditLog::open_in_memory().unwrap(),
+            minter,
+            policy: PolicyConfig {
+                writable_repos: Vec::new(),
+                default_ttl: crate::core::TtlSeconds::new(3600).unwrap(),
+            },
+        })
+    }
+
     fn repo(owner: &str, name: &str) -> RepoRef {
         RepoRef {
             owner: owner.into(),
@@ -630,6 +706,7 @@ mod tests {
         let resp = dispatch_message(
             ClientMessage::OpenSession {
                 label: Some("test".into()),
+                agent_kind: None,
                 agent_model: None,
             },
             &state,
@@ -655,6 +732,7 @@ mod tests {
         let session_id = match dispatch_message(
             ClientMessage::OpenSession {
                 label: None,
+                agent_kind: None,
                 agent_model: None,
             },
             &state,
@@ -696,6 +774,7 @@ mod tests {
         let start = dispatch_message(
             ClientMessage::StartAgentVm {
                 label: None,
+                agent_kind: None,
                 agent_model: None,
                 guest_command: vec!["true".into()],
             },
@@ -887,6 +966,206 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn request_uses_github_app_for_session_agent_kind() {
+        let server = MockServer::start().await;
+        let state = make_agent_registry_state(&server);
+        let session_id = match dispatch_message(
+            ClientMessage::OpenSession {
+                label: None,
+                agent_kind: Some(AgentKind::Codex),
+                agent_model: Some("claude-opus-misleading".into()),
+            },
+            &state,
+        )
+        .await
+        {
+            ServerMessage::SessionOpened { session_id } => session_id,
+            other => panic!("open_session failed: {other:?}"),
+        };
+
+        Mock::given(method("POST"))
+            .and(path("/app/installations/111/access_tokens"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/app/installations/222/access_tokens"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "token": "ghs_codex_token",
+                "expires_at": expiry_str_from_now(3600),
+                "permissions": {"contents": "read", "metadata": "read"},
+                "repository_selection": "selected",
+                "repositories": [{"full_name": "o/n"}]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let resp = dispatch_message(
+            ClientMessage::Request {
+                session_id,
+                capability: CapabilityRequest::GitHub(crate::core::GitHubRequest::Contents {
+                    access: GitHubAccess::Read,
+                    repo: repo("o", "n"),
+                }),
+            },
+            &state,
+        )
+        .await;
+
+        match resp {
+            ServerMessage::TokenGranted { token, .. } => {
+                assert_eq!(token, "ghs_codex_token");
+            }
+            other => panic!("expected TokenGranted, got {other:?}"),
+        }
+
+        let grants = state.audit.list_grants_for_session(session_id).unwrap();
+        assert_eq!(grants.len(), 1);
+        assert_eq!(grants[0].github_app_id, Some(202));
+    }
+
+    #[tokio::test]
+    async fn legacy_github_config_uses_legacy_app_even_when_agent_kind_is_set() {
+        let server = MockServer::start().await;
+        let state = make_state(&server, vec![repo("o", "n")], "o");
+        let session_id = open_session_with_agent_kind(&state, Some(AgentKind::Codex)).await;
+
+        Mock::given(method("POST"))
+            .and(path("/app/installations/999/access_tokens"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "token": "ghs_legacy_token",
+                "expires_at": expiry_str_from_now(3600),
+                "permissions": {"contents": "read", "metadata": "read"},
+                "repository_selection": "selected",
+                "repositories": [{"full_name": "o/n"}]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let resp = dispatch_message(
+            ClientMessage::Request {
+                session_id,
+                capability: CapabilityRequest::GitHub(crate::core::GitHubRequest::Contents {
+                    access: GitHubAccess::Read,
+                    repo: repo("o", "n"),
+                }),
+            },
+            &state,
+        )
+        .await;
+
+        match resp {
+            ServerMessage::TokenGranted { token, .. } => {
+                assert_eq!(token, "ghs_legacy_token");
+            }
+            other => panic!("expected TokenGranted, got {other:?}"),
+        }
+
+        let grants = state.audit.list_grants_for_session(session_id).unwrap();
+        assert_eq!(grants.len(), 1);
+        assert_eq!(grants[0].github_app_id, Some(42));
+    }
+
+    #[tokio::test]
+    async fn agent_registry_rejects_session_open_without_agent_kind() {
+        let server = MockServer::start().await;
+        let state = make_agent_registry_state(&server);
+
+        Mock::given(method("POST"))
+            .and(path("/app/installations/111/access_tokens"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/app/installations/222/access_tokens"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let resp = dispatch_message(
+            ClientMessage::OpenSession {
+                label: None,
+                agent_kind: None,
+                agent_model: Some("claude-opus-misleading".into()),
+            },
+            &state,
+        )
+        .await;
+
+        match resp {
+            ServerMessage::Error { message } => {
+                assert!(message.contains("--agent claude"), "got: {message}");
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_registry_rejects_agent_vm_start_without_agent_kind() {
+        let server = MockServer::start().await;
+        let state = make_agent_registry_state(&server);
+
+        let resp = dispatch_message(
+            ClientMessage::StartAgentVm {
+                label: None,
+                agent_kind: None,
+                agent_model: None,
+                guest_command: vec!["true".into()],
+            },
+            &state,
+        )
+        .await;
+
+        match resp {
+            ServerMessage::Error { message } => {
+                assert!(message.contains("github_apps"), "got: {message}");
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_registry_reports_missing_app_for_session_agent_kind() {
+        let server = MockServer::start().await;
+        let state = make_agent_registry_state_for_agents(&server, &[AgentKind::Claude]);
+        let session_id = open_session_with_agent_kind(&state, Some(AgentKind::Codex)).await;
+
+        Mock::given(method("POST"))
+            .and(path("/app/installations/111/access_tokens"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let resp = dispatch_message(
+            ClientMessage::Request {
+                session_id,
+                capability: CapabilityRequest::GitHub(crate::core::GitHubRequest::Contents {
+                    access: GitHubAccess::Read,
+                    repo: repo("o", "n"),
+                }),
+            },
+            &state,
+        )
+        .await;
+
+        match resp {
+            ServerMessage::Error { message } => {
+                assert!(
+                    message.contains("no GitHub App is configured for agent kind codex"),
+                    "got: {message}"
+                );
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
     // --- Integration: full socket round-trip -----------------------------
 
     #[tokio::test]
@@ -914,6 +1193,7 @@ mod tests {
         // Open session
         let open_msg = serde_json::to_string(&ClientMessage::OpenSession {
             label: Some("integration".into()),
+            agent_kind: None,
             agent_model: None,
         })
         .unwrap()
@@ -944,9 +1224,17 @@ mod tests {
     async fn open_session<S: SecretStore + Send + Sync + 'static>(
         state: &Arc<BrokerState<S>>,
     ) -> SessionId {
+        open_session_with_agent_kind(state, None).await
+    }
+
+    async fn open_session_with_agent_kind<S: SecretStore + Send + Sync + 'static>(
+        state: &Arc<BrokerState<S>>,
+        agent_kind: Option<AgentKind>,
+    ) -> SessionId {
         match dispatch_message(
             ClientMessage::OpenSession {
                 label: None,
+                agent_kind,
                 agent_model: None,
             },
             state,

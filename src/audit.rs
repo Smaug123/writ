@@ -28,8 +28,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::core::{
-    CapabilityRequest, CredentialGrant, GitHubGrantedScope, GitHubRequest, GrantedScope, Jti,
-    MetadataAccess, PolicyDecision, RequestId, SessionId, SessionRecord, UnixMillis,
+    AgentKind, CapabilityRequest, CredentialGrant, GitHubGrantedScope, GitHubRequest, GrantedScope,
+    Jti, MetadataAccess, PolicyDecision, RequestId, SessionId, SessionRecord, UnixMillis,
 };
 
 /// How much a grant's effective lifetime may exceed the decision's TTL
@@ -197,11 +197,12 @@ impl AuditLog {
     pub fn open_session(&self, s: &SessionRecord) -> Result<(), AuditError> {
         self.with_conn(|c| {
             c.execute(
-                "INSERT INTO session (session_id, label, agent_model, opened_at, closed_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                "INSERT INTO session (session_id, label, agent_kind, agent_model, opened_at, closed_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![
                     s.session_id.as_uuid().to_string(),
                     s.label,
+                    s.agent_kind.map(AgentKind::as_str),
                     s.agent_model,
                     s.opened_at.as_millis(),
                     s.closed_at.map(UnixMillis::as_millis),
@@ -225,7 +226,7 @@ impl AuditLog {
         self.with_conn(|c| {
             let row = c
                 .query_row(
-                    "SELECT session_id, label, agent_model, opened_at, closed_at \
+                    "SELECT session_id, label, agent_kind, agent_model, opened_at, closed_at \
                      FROM session WHERE session_id = ?1",
                     params![id.as_uuid().to_string()],
                     session_from_row,
@@ -449,6 +450,11 @@ impl AuditLog {
     /// audit row even if the session has since gone quiet on paper.
     pub fn record_grant(&self, grant: &CredentialGrant) -> Result<(), AuditError> {
         let grant_scope_json = serde_json::to_string(&grant.scope)?;
+        let github_app_id = grant
+            .github_app_id
+            .ok_or(AuditError::Invariant("grant.github_app_id is missing"))?;
+        let github_app_id = i64::try_from(github_app_id)
+            .map_err(|_| AuditError::Invariant("grant.github_app_id exceeds SQLite integer"))?;
 
         self.with_conn_mut(|c| {
             let tx = c.transaction()?;
@@ -510,12 +516,13 @@ impl AuditLog {
             }
 
             tx.execute(
-                "INSERT INTO grant_log (jti, request_id, session_id, scope_json, issued_at, expires_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                "INSERT INTO grant_log (jti, request_id, session_id, github_app_id, scope_json, issued_at, expires_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 params![
                     grant.jti.as_uuid().to_string(),
                     grant.request_id.as_uuid().to_string(),
                     grant.session_id.as_uuid().to_string(),
+                    github_app_id,
                     grant_scope_json,
                     grant.issued_at.as_millis(),
                     grant.expires_at.as_millis(),
@@ -595,7 +602,7 @@ impl AuditLog {
             // issued_at ASC` leaves same-timestamp rows in an unspecified
             // order and replay can't reconstruct the real sequence.
             let mut stmt = c.prepare(
-                "SELECT jti, request_id, session_id, scope_json, issued_at, expires_at \
+                "SELECT jti, request_id, session_id, github_app_id, scope_json, issued_at, expires_at \
                  FROM grant_log WHERE session_id = ?1 ORDER BY issued_at ASC, rowid ASC",
             )?;
             let rows = stmt
@@ -609,7 +616,7 @@ impl AuditLog {
         self.with_conn(|c| {
             let row = c
                 .query_row(
-                    "SELECT jti, request_id, session_id, scope_json, issued_at, expires_at \
+                    "SELECT jti, request_id, session_id, github_app_id, scope_json, issued_at, expires_at \
                      FROM grant_log WHERE jti = ?1",
                     params![jti.as_uuid().to_string()],
                     grant_from_row,
@@ -739,21 +746,40 @@ impl NixCacheAuditRoute {
 }
 
 fn session_from_row(row: &Row<'_>) -> rusqlite::Result<SessionRecord> {
-    let session_id_str: String = row.get(0)?;
-    let label: Option<String> = row.get(1)?;
-    let agent_model: Option<String> = row.get(2)?;
-    let opened_at: i64 = row.get(3)?;
-    let closed_at: Option<i64> = row.get(4)?;
+    let session_id_str: String = row.get("session_id")?;
+    let label: Option<String> = row.get("label")?;
+    let agent_kind: Option<SqlAgentKind> = row.get("agent_kind")?;
+    let agent_model: Option<String> = row.get("agent_model")?;
+    let opened_at: i64 = row.get("opened_at")?;
+    let closed_at: Option<i64> = row.get("closed_at")?;
     let uuid = uuid::Uuid::parse_str(&session_id_str).map_err(|e| {
         rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
     })?;
     Ok(SessionRecord {
         session_id: SessionId::from_uuid(uuid),
         label,
+        agent_kind: agent_kind.map(SqlAgentKind::into_inner),
         agent_model,
         opened_at: UnixMillis::from_millis(opened_at),
         closed_at: closed_at.map(UnixMillis::from_millis),
     })
+}
+
+struct SqlAgentKind(AgentKind);
+
+impl SqlAgentKind {
+    fn into_inner(self) -> AgentKind {
+        self.0
+    }
+}
+
+impl rusqlite::types::FromSql for SqlAgentKind {
+    fn column_result(value: rusqlite::types::ValueRef<'_>) -> rusqlite::types::FromSqlResult<Self> {
+        let raw = value.as_str()?;
+        raw.parse::<AgentKind>()
+            .map(Self)
+            .map_err(|err| rusqlite::types::FromSqlError::Other(Box::new(err)))
+    }
 }
 
 fn nix_cache_audit_entry_from_row(
@@ -836,12 +862,13 @@ fn u16_from_sql_status(value: i64) -> Result<u16, AuditError> {
 }
 
 fn grant_from_row(row: &Row<'_>) -> rusqlite::Result<Result<CredentialGrant, AuditError>> {
-    let jti_str: String = row.get(0)?;
-    let request_id_str: String = row.get(1)?;
-    let session_id_str: String = row.get(2)?;
-    let scope_json: String = row.get(3)?;
-    let issued_at: i64 = row.get(4)?;
-    let expires_at: i64 = row.get(5)?;
+    let jti_str: String = row.get("jti")?;
+    let request_id_str: String = row.get("request_id")?;
+    let session_id_str: String = row.get("session_id")?;
+    let github_app_id: Option<i64> = row.get("github_app_id")?;
+    let scope_json: String = row.get("scope_json")?;
+    let issued_at: i64 = row.get("issued_at")?;
+    let expires_at: i64 = row.get("expires_at")?;
 
     let parse = || -> Result<CredentialGrant, AuditError> {
         let jti = uuid::Uuid::parse_str(&jti_str)
@@ -850,11 +877,18 @@ fn grant_from_row(row: &Row<'_>) -> rusqlite::Result<Result<CredentialGrant, Aud
             .map_err(|_| AuditError::Invariant("grant row: request_id not a uuid"))?;
         let session_id = uuid::Uuid::parse_str(&session_id_str)
             .map_err(|_| AuditError::Invariant("grant row: session_id not a uuid"))?;
+        let github_app_id = github_app_id
+            .map(|id| {
+                u64::try_from(id)
+                    .map_err(|_| AuditError::Invariant("grant row: github_app_id is negative"))
+            })
+            .transpose()?;
         let scope: GrantedScope = serde_json::from_str(&scope_json)?;
         Ok(CredentialGrant {
             jti: Jti::from_uuid(jti),
             request_id: RequestId::from_uuid(request_id),
             session_id: SessionId::from_uuid(session_id),
+            github_app_id,
             scope,
             issued_at: UnixMillis::from_millis(issued_at),
             expires_at: UnixMillis::from_millis(expires_at),
@@ -884,7 +918,7 @@ struct Migration {
 /// a version higher than this is rejected with [`AuditError::SchemaTooNew`]
 /// rather than opened — we'd rather fail to start than silently drop data
 /// into a schema a newer broker wrote.
-const SCHEMA_VERSION: i32 = 3;
+const SCHEMA_VERSION: i32 = 5;
 
 /// The full migration history. Each entry documents exactly one state
 /// transition; the sequence of entries is the schema's lineage. Order
@@ -1097,6 +1131,20 @@ BEGIN
 END;
 "#,
     },
+    Migration {
+        version: 4,
+        sql: r#"
+ALTER TABLE session
+    ADD COLUMN agent_kind TEXT CHECK (agent_kind IN ('claude', 'codex'));
+"#,
+    },
+    Migration {
+        version: 5,
+        sql: r#"
+ALTER TABLE grant_log
+    ADD COLUMN github_app_id INTEGER CHECK (github_app_id IS NULL OR github_app_id >= 0);
+"#,
+    },
 ];
 
 // Belt-and-braces: the compile-time shape of MIGRATIONS is the source
@@ -1154,8 +1202,8 @@ fn user_version(conn: &Connection) -> Result<i32, AuditError> {
 mod tests {
     use super::*;
     use crate::core::{
-        GitHubAccess, GitHubGrantedScope, GitHubPermissions, GitHubRequest, MetadataAccess,
-        RepoRef, TtlSeconds,
+        AgentKind, GitHubAccess, GitHubGrantedScope, GitHubPermissions, GitHubRequest,
+        MetadataAccess, RepoRef, TtlSeconds,
     };
     use tempfile::NamedTempFile;
 
@@ -1163,6 +1211,7 @@ mod tests {
         SessionRecord {
             session_id: SessionId::new(),
             label: Some("test".into()),
+            agent_kind: Some(AgentKind::Claude),
             agent_model: Some("claude-opus-4-7".into()),
             opened_at: UnixMillis::from_millis(1_700_000_000),
             closed_at: None,
@@ -1472,6 +1521,7 @@ mod tests {
             jti: Jti::new(),
             request_id,
             session_id: s.session_id,
+            github_app_id: Some(42),
             scope: scope.clone(),
             issued_at: UnixMillis::from_millis(1_700_000_100),
             expires_at: UnixMillis::from_millis(1_700_000_400),
@@ -1492,6 +1542,46 @@ mod tests {
         assert_eq!(grants, vec![grant.clone()]);
         let got = log.get_grant(grant.jti).unwrap().unwrap();
         assert_eq!(got, grant);
+    }
+
+    #[test]
+    fn record_grant_rejects_missing_github_app_id() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+
+        let request_id = RequestId::new();
+        let req = sample_request();
+        let scope = sample_scope();
+        let decision = PolicyDecision::Grant {
+            scope: scope.clone(),
+            ttl: TtlSeconds::new(300).unwrap(),
+        };
+        pre_mint(
+            &log,
+            request_id,
+            s.session_id,
+            &req,
+            &decision,
+            UnixMillis::from_millis(1_700_000_100),
+        )
+        .unwrap();
+
+        let grant = CredentialGrant {
+            jti: Jti::new(),
+            request_id,
+            session_id: s.session_id,
+            github_app_id: None,
+            scope,
+            issued_at: UnixMillis::from_millis(1_700_000_100),
+            expires_at: UnixMillis::from_millis(1_700_000_400),
+        };
+
+        let err = log.record_grant(&grant).unwrap_err();
+        assert!(
+            matches!(err, AuditError::Invariant("grant.github_app_id is missing")),
+            "got: {err:?}"
+        );
     }
 
     #[test]
@@ -1550,6 +1640,7 @@ mod tests {
             jti: Jti::new(),
             request_id,
             session_id: s.session_id,
+            github_app_id: Some(42),
             scope: sample_scope(),
             issued_at: UnixMillis::from_millis(1),
             expires_at: UnixMillis::from_millis(2),
@@ -1570,6 +1661,7 @@ mod tests {
             jti: Jti::new(),
             request_id: RequestId::new(),
             session_id: s.session_id,
+            github_app_id: Some(42),
             scope: sample_scope(),
             issued_at: UnixMillis::from_millis(1),
             expires_at: UnixMillis::from_millis(2),
@@ -1678,6 +1770,7 @@ mod tests {
                 jti: Jti::new(),
                 request_id,
                 session_id: s.session_id,
+                github_app_id: Some(42),
                 scope: sample_scope(),
                 issued_at: UnixMillis::from_millis(at),
                 expires_at: UnixMillis::from_millis(at + 300),
@@ -1735,6 +1828,7 @@ mod tests {
                 jti: Jti::new(),
                 request_id,
                 session_id: s.session_id,
+                github_app_id: Some(42),
                 scope: sample_scope(),
                 issued_at: UnixMillis::from_millis(5_000),
                 expires_at: UnixMillis::from_millis(5_300),
@@ -1807,6 +1901,7 @@ mod tests {
             jti: Jti::new(),
             request_id,
             session_id: s.session_id,
+            github_app_id: Some(42),
             scope: other_scope,
             issued_at: UnixMillis::from_millis(1_000),
             expires_at: UnixMillis::from_millis(2_000),
@@ -1849,6 +1944,7 @@ mod tests {
             jti: Jti::new(),
             request_id,
             session_id: s.session_id,
+            github_app_id: Some(42),
             scope: sample_scope(),
             issued_at: UnixMillis::from_millis(0),
             expires_at: UnixMillis::from_millis(3_600_000),
@@ -1888,6 +1984,7 @@ mod tests {
             jti: Jti::new(),
             request_id,
             session_id: s.session_id,
+            github_app_id: Some(42),
             scope: sample_scope(),
             issued_at: UnixMillis::from_millis(500),
             // Deliberately before issued_at.
@@ -1931,6 +2028,7 @@ mod tests {
             jti: Jti::new(),
             request_id,
             session_id: s.session_id,
+            github_app_id: Some(42),
             scope: sample_scope(),
             issued_at: UnixMillis::from_millis(0),
             expires_at: UnixMillis::from_millis(lifetime_millis),
@@ -2018,6 +2116,7 @@ mod tests {
                 jti: Jti::new(),
                 request_id,
                 session_id: s.session_id,
+                github_app_id: Some(42),
                 scope: sample_scope(),
                 issued_at: UnixMillis::from_millis(0),
                 expires_at: UnixMillis::from_millis(1_000),
@@ -2308,6 +2407,7 @@ mod tests {
             jti: Jti::new(),
             request_id,
             session_id: s.session_id,
+            github_app_id: Some(42),
             scope: sample_scope(),
             issued_at: UnixMillis::from_millis(1_700_000_200),
             expires_at: UnixMillis::from_millis(1_700_000_500),
@@ -2481,6 +2581,8 @@ mod tests {
         let log = AuditLog::open_in_memory().unwrap();
         assert_eq!(read_user_version(&log), SCHEMA_VERSION);
         assert!(column_exists(&log, "mint_failure", "request_id"));
+        assert!(column_exists(&log, "session", "agent_kind"));
+        assert!(column_exists(&log, "grant_log", "github_app_id"));
         assert!(trigger_exists(&log, "request_requires_open_session"));
         assert!(trigger_exists(&log, "mint_failure_excludes_grant"));
         assert!(trigger_exists(&log, "grant_excludes_mint_failure"));
@@ -2498,8 +2600,10 @@ mod tests {
         let log = AuditLog::open(db.path()).unwrap();
         assert_eq!(read_user_version(&log), SCHEMA_VERSION);
         assert!(column_exists(&log, "session", "session_id"));
+        assert!(column_exists(&log, "session", "agent_kind"));
         assert!(column_exists(&log, "request", "decision_json"));
         assert!(column_exists(&log, "grant_log", "jti"));
+        assert!(column_exists(&log, "grant_log", "github_app_id"));
         assert!(column_exists(&log, "mint_failure", "failure_json"));
         assert!(column_exists(&log, "nix_cache_request", "request_id"));
         assert!(column_exists(&log, "nix_cache_outcome", "request_id"));
@@ -2540,6 +2644,8 @@ mod tests {
         assert_eq!(read_user_version(&log), SCHEMA_VERSION);
         assert!(column_exists(&log, "nix_cache_request", "decision"));
         assert!(column_exists(&log, "nix_cache_outcome", "response_bytes"));
+        assert!(column_exists(&log, "session", "agent_kind"));
+        assert!(column_exists(&log, "grant_log", "github_app_id"));
         assert!(trigger_exists(
             &log,
             "nix_cache_request_requires_open_session"
@@ -2577,6 +2683,56 @@ mod tests {
         assert_eq!(read_user_version(&log), SCHEMA_VERSION);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].route, NixCacheAuditRoute::Nar);
+    }
+
+    #[test]
+    fn open_migrates_v4_grant_rows_without_github_app_id() {
+        let db = NamedTempFile::new().unwrap();
+        let session_id = SessionId::new();
+        let request_id = RequestId::new();
+        let jti = Jti::new();
+        {
+            let mut conn = Connection::open(db.path()).unwrap();
+            let tx = conn.transaction().unwrap();
+            for migration in MIGRATIONS.iter().take(4) {
+                tx.execute_batch(migration.sql).unwrap();
+            }
+            tx.pragma_update(None, "user_version", 4).unwrap();
+            tx.execute(
+                "INSERT INTO session (session_id, label, agent_kind, agent_model, opened_at, closed_at) \
+                 VALUES (?1, NULL, 'claude', NULL, 1, NULL)",
+                params![session_id.as_uuid().to_string()],
+            )
+            .unwrap();
+            tx.execute(
+                "INSERT INTO request (request_id, session_id, received_at, request_json, decision_json) \
+                 VALUES (?1, ?2, 2, '{}', '{}')",
+                params![
+                    request_id.as_uuid().to_string(),
+                    session_id.as_uuid().to_string(),
+                ],
+            )
+            .unwrap();
+            tx.execute(
+                "INSERT INTO grant_log (jti, request_id, session_id, scope_json, issued_at, expires_at) \
+                 VALUES (?1, ?2, ?3, ?4, 3, 4)",
+                params![
+                    jti.as_uuid().to_string(),
+                    request_id.as_uuid().to_string(),
+                    session_id.as_uuid().to_string(),
+                    serde_json::to_string(&sample_scope()).unwrap(),
+                ],
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+
+        let log = AuditLog::open(db.path()).unwrap();
+
+        assert_eq!(read_user_version(&log), SCHEMA_VERSION);
+        assert!(column_exists(&log, "grant_log", "github_app_id"));
+        let grant = log.get_grant(jti).unwrap().unwrap();
+        assert_eq!(grant.github_app_id, None);
     }
 
     /// A DB written by a future broker will carry a user_version beyond

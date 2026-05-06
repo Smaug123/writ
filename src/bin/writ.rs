@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand, ValueEnum};
 
-use writ::core::{CapabilityRequest, GitHubAccess, GitHubRequest, RepoRef, SessionId};
+use writ::core::{AgentKind, CapabilityRequest, GitHubAccess, GitHubRequest, RepoRef, SessionId};
 use writ::protocol::{ClientMessage, ServerMessage};
 use writ::server::default_socket_path;
 
@@ -42,6 +42,9 @@ enum Cmd {
         /// Human-readable description stored in the audit log.
         #[arg(long)]
         label: Option<String>,
+        /// Session agent identity used for GitHub App selection.
+        #[arg(long, value_parser = parse_agent_kind)]
+        agent: Option<AgentKind>,
         /// Agent model identifier stored in the audit log.
         #[arg(long)]
         model: Option<String>,
@@ -68,6 +71,9 @@ enum AgentVmCmd {
         /// Human-readable description stored in the audit log.
         #[arg(long)]
         label: Option<String>,
+        /// Session agent identity used for GitHub App selection.
+        #[arg(long, value_parser = parse_agent_kind)]
+        agent: Option<AgentKind>,
         /// Agent model identifier stored in the audit log.
         #[arg(long)]
         model: Option<String>,
@@ -127,9 +133,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let socket_path = args.socket.unwrap_or_else(default_socket_path);
 
     match args.cmd {
-        Cmd::OpenSession { label, model } => {
+        Cmd::OpenSession {
+            label,
+            agent,
+            model,
+        } => {
             let msg = ClientMessage::OpenSession {
                 label,
+                agent_kind: agent,
                 agent_model: model,
             };
             match call(&socket_path, &msg)? {
@@ -176,11 +187,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         Cmd::AgentVm { action } => match action {
             AgentVmCmd::Start {
                 label,
+                agent,
                 model,
                 guest_command,
             } => {
                 let msg = ClientMessage::StartAgentVm {
                     label,
+                    agent_kind: agent,
                     agent_model: model,
                     guest_command,
                 };
@@ -210,6 +223,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         },
     }
     Ok(())
+}
+
+fn parse_agent_kind(raw: &str) -> Result<AgentKind, String> {
+    raw.parse::<AgentKind>().map_err(|err| err.to_string())
 }
 
 fn build_capability(backend: BackendCmd) -> Result<CapabilityRequest, Box<dyn std::error::Error>> {

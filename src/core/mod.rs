@@ -18,7 +18,7 @@ pub use decision::{
 };
 pub use grant::CredentialGrant;
 pub use request::{CapabilityRequest, GitHubRequest};
-pub use session::SessionRecord;
+pub use session::{AgentKind, SessionRecord};
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;

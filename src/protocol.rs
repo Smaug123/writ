@@ -12,7 +12,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::core::{CapabilityRequest, SessionId, UnixMillis};
+use crate::core::{AgentKind, CapabilityRequest, SessionId, UnixMillis};
 
 /// A message from the agent to the broker.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -25,6 +25,10 @@ pub enum ClientMessage {
         /// the audit log; ignored by policy.
         #[serde(skip_serializing_if = "Option::is_none", default)]
         label: Option<String>,
+        /// Trusted coarse agent identity used by the broker to choose
+        /// authority-bearing backend configuration.
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        agent_kind: Option<AgentKind>,
         /// Model identifier, e.g. "claude-opus-4-7". Informational only.
         #[serde(skip_serializing_if = "Option::is_none", default)]
         agent_model: Option<String>,
@@ -44,6 +48,10 @@ pub enum ClientMessage {
         /// Human-readable description stored in the audit log.
         #[serde(skip_serializing_if = "Option::is_none", default)]
         label: Option<String>,
+        /// Trusted coarse agent identity used by the broker to choose
+        /// authority-bearing backend configuration.
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        agent_kind: Option<AgentKind>,
         /// Model identifier stored in the audit log.
         #[serde(skip_serializing_if = "Option::is_none", default)]
         agent_model: Option<String>,
@@ -139,6 +147,7 @@ mod tests {
     fn open_session_with_fields_roundtrips() {
         let msg = ClientMessage::OpenSession {
             label: Some("fix bug 42".into()),
+            agent_kind: Some(AgentKind::Claude),
             agent_model: Some("claude-opus-4-7".into()),
         };
         let json = serde_json::to_string(&msg).unwrap();
@@ -149,6 +158,7 @@ mod tests {
     fn open_session_without_fields_roundtrips() {
         let msg = ClientMessage::OpenSession {
             label: None,
+            agent_kind: None,
             agent_model: None,
         };
         let json = serde_json::to_string(&msg).unwrap();
@@ -181,6 +191,7 @@ mod tests {
     fn start_agent_vm_roundtrips() {
         let msg = ClientMessage::StartAgentVm {
             label: Some("agent vm".into()),
+            agent_kind: Some(AgentKind::Codex),
             agent_model: Some("gpt-test".into()),
             guest_command: vec!["sleep".into(), "600".into()],
         };
@@ -270,6 +281,7 @@ mod tests {
     fn open_session_type_tag() {
         let v: serde_json::Value = serde_json::to_value(ClientMessage::OpenSession {
             label: None,
+            agent_kind: None,
             agent_model: None,
         })
         .unwrap();
@@ -301,6 +313,7 @@ mod tests {
     fn agent_vm_type_tags() {
         let start: serde_json::Value = serde_json::to_value(ClientMessage::StartAgentVm {
             label: None,
+            agent_kind: None,
             agent_model: None,
             guest_command: vec!["true".into()],
         })
@@ -329,10 +342,12 @@ mod tests {
     fn open_session_omits_absent_fields() {
         let v: serde_json::Value = serde_json::to_value(ClientMessage::OpenSession {
             label: None,
+            agent_kind: None,
             agent_model: None,
         })
         .unwrap();
         assert!(v.get("label").is_none());
+        assert!(v.get("agent_kind").is_none());
         assert!(v.get("agent_model").is_none());
     }
 
@@ -374,7 +389,7 @@ mod tests {
             label in proptest::option::of("[^\n]{0,100}"),
             agent_model in proptest::option::of("[^\n]{0,80}"),
         ) {
-            let msg = ClientMessage::OpenSession { label, agent_model };
+            let msg = ClientMessage::OpenSession { label, agent_kind: None, agent_model };
             let json = serde_json::to_string(&msg).unwrap();
             let back: ClientMessage = serde_json::from_str(&json).unwrap();
             prop_assert_eq!(msg, back);

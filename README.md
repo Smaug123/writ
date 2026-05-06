@@ -11,6 +11,10 @@ The model is one credential per action, scoped to one repo and one
 permission, expiring within an hour, and recorded in SQLite for later
 inspection.
 
+If Claude and Codex should push under different GitHub App identities,
+configure `github_apps.claude` and `github_apps.codex`, then open sessions
+with `--agent claude` or `--agent codex`.
+
 ## Where to start
 
 1. **[Getting started](./docs/user_facing/getting-started.md)** — create a GitHub App,
@@ -29,7 +33,7 @@ inspection.
 - Not a remote service. It listens on a Unix socket; you must already
   trust anyone who can open that socket.
 - Not multi-tenant. One daemon per user; one GitHub App installation per
-  daemon.
+  configured agent kind.
 - Not a webhook receiver. The audit log records what the broker minted;
   it does not (yet) reconcile against what GitHub actually saw.
 - Not an interactive approval prompt. Every request is auto-granted or

@@ -69,10 +69,17 @@ idempotent — audit rows outlive their session.
 ## Credentials
 
 The broker mints **GitHub App installation tokens** by signing a 10-minute JWT
-with the app's RSA private key and exchanging it at
+with the selected app's RSA private key and exchanging it at
 `/app/installations/{id}/access_tokens`. The POST body narrows both the
 repository set and the permission set at mint time, so each grant carries the
 minimum rights sufficient to perform the one requested action.
+
+The original single-App config remains supported. When `github_apps` is
+configured instead, the broker selects the App from the session `agent_kind`
+(`claude` or `codex`), not from free-form `agent_model` text and not from the
+capability request. That value is session-level input, not proof that the
+calling process is actually Claude or Codex; the transport boundary supplies
+that assurance.
 
 The broker does **not** wrap these in its own token format. It hands the raw
 installation token to the agent and logs the grant. The token's `jti` (we
@@ -136,6 +143,7 @@ SQLite at `$XDG_DATA_HOME/writ/audit.db`. Schema:
 CREATE TABLE session (
   session_id  TEXT PRIMARY KEY,
   label       TEXT,
+  agent_kind  TEXT,
   agent_model TEXT,
   opened_at   INTEGER NOT NULL,
   closed_at   INTEGER
@@ -152,12 +160,13 @@ CREATE TABLE request (
 -- `grant` is a SQL keyword in some dialects, so the table is named
 -- `grant_log` even though the payload is still a credential grant.
 CREATE TABLE grant_log (
-  jti         TEXT PRIMARY KEY,
-  request_id  TEXT NOT NULL REFERENCES request(request_id),
-  session_id  TEXT NOT NULL REFERENCES session(session_id),
-  scope_json  TEXT NOT NULL,
-  issued_at   INTEGER NOT NULL,
-  expires_at  INTEGER NOT NULL
+  jti           TEXT PRIMARY KEY,
+  request_id    TEXT NOT NULL REFERENCES request(request_id),
+  session_id    TEXT NOT NULL REFERENCES session(session_id),
+  github_app_id INTEGER,
+  scope_json    TEXT NOT NULL,
+  issued_at     INTEGER NOT NULL,
+  expires_at    INTEGER NOT NULL
 );
 
 CREATE TABLE mint_failure (

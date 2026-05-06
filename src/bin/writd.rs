@@ -12,7 +12,7 @@ use clap::Parser;
 use writ::agent_vm_daemon::AgentVmDaemon;
 use writ::audit::AuditLog;
 use writ::config::{DaemonConfig, SecretStoreConfig, default_audit_db_path, default_config_path};
-use writ::github::GitHubMinter;
+use writ::github::{GitHubAppRegistryConfig, GitHubMinter};
 use writ::secret::{FileSecretStore, KeyringSecretStore, SecretStore};
 use writ::server::{BrokerState, default_socket_path, run_with_agent_vm};
 
@@ -41,18 +41,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|e| format!("cannot read config {}: {e}", config_path.display()))?;
     let config: DaemonConfig = serde_json::from_str(&json)
         .map_err(|e| format!("invalid config {}: {e}", config_path.display()))?;
+    let DaemonConfig {
+        github,
+        github_apps,
+        policy,
+        agent_vm,
+        secret_store,
+        socket_path,
+        audit_db,
+    } = config;
+    let github = GitHubAppRegistryConfig::from_parts(github, github_apps)?;
 
     let socket_path = args
         .socket
-        .or(config.socket_path)
+        .or(socket_path)
         .unwrap_or_else(default_socket_path);
 
     let audit_db_path = args
         .audit_db
-        .or(config.audit_db)
+        .or(audit_db)
         .unwrap_or_else(default_audit_db_path);
-    let agent_vm = config
-        .agent_vm
+    let agent_vm = agent_vm
         .as_ref()
         .map(|agent_vm| agent_vm.to_runtime_config())
         .transpose()?;
@@ -61,20 +70,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::fs::create_dir_all(parent)?;
     }
     let audit = AuditLog::open(&audit_db_path)?;
-    let policy = config.policy;
-    let github = config.github;
 
     // Dispatch on the secret store type at the binary boundary so the
     // library stays fully generic. Both arms produce the same concrete
     // `BrokerState<Box<dyn SecretStore>>`, just via different constructors.
-    let store: Box<dyn SecretStore> = match config.secret_store {
+    let store: Box<dyn SecretStore> = match secret_store {
         SecretStoreConfig::File { path } => Box::new(FileSecretStore::create_or_open(path)?),
         SecretStoreConfig::Keyring { service } => Box::new(KeyringSecretStore::new(service)),
     };
 
     let state = Arc::new(BrokerState {
         audit,
-        minter: GitHubMinter::new(github, store),
+        minter: GitHubMinter::new_registry(github, store),
         policy,
     });
 

@@ -36,19 +36,25 @@ A 60-second timeout is applied to each request; if the daemon takes
 longer than that, the CLI bails rather than wedging the agent's
 pipeline.
 
-### `writ open-session [--label <text>] [--model <text>]`
+### `writ open-session [--label <text>] [--agent claude|codex] [--model <text>]`
 
 Opens a session and prints its UUID to stdout.
 
 | Flag      | Description                                                                                       |
 | --------- | ------------------------------------------------------------------------------------------------- |
 | `--label` | Free-form description shown in the audit log. Use it: `--label "fixing bug 42"`. Optional.        |
+| `--agent` | Selects which configured GitHub App is used when `github_apps` is configured. Optional for legacy `github` config. |
 | `--model` | Agent/model identifier shown in the audit log, e.g. `claude-opus-4-7`. Optional.                  |
 
-Both are stored verbatim and ignored by policy.
+`--label` and `--model` are stored verbatim and ignored by policy.
+`--agent` is not free-form: the broker treats it as the session's
+identity for selecting `github_apps.claude` or `github_apps.codex`.
+It does not authenticate that the calling process is actually Claude
+or Codex; that is the operator's job, usually through the socket or VM
+boundary.
 
 ```bash
-SESSION=$(writ open-session --label "fixing bug 42" --model claude-opus-4-7)
+SESSION=$(writ open-session --label "fixing bug 42" --agent claude --model claude-opus-4-7)
 ```
 
 ### `writ close-session <session-id>`

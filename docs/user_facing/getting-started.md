@@ -89,6 +89,9 @@ talking to GitHub at all — that's how it stops a typo'd request like
 permitted on any repo the installation can see, since the GitHub App
 itself enforces the installation boundary.
 
+If you have separate Claude and Codex GitHub Apps, use `github_apps`
+instead of `github`; see [Configuration](configuration.md#github--github_apps).
+
 ## 5. Run the daemon
 
 ```bash
@@ -122,7 +125,7 @@ session UUID, then a `ghs_…` token printed to stdout, then nothing.
 A real agent recipe looks like:
 
 ```bash
-SESSION=$(writ open-session --label "fixing bug 42" --model claude-opus-4-7)
+SESSION=$(writ open-session --label "fixing bug 42" --agent claude --model claude-opus-4-7)
 TOKEN=$(writ request "$SESSION" github contents write smaug123/writ)
 git -c "http.extraheader=Authorization: Bearer $TOKEN" \
     push origin HEAD

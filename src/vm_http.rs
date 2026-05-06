@@ -2639,6 +2639,7 @@ mod tests {
             .open_session(&SessionRecord {
                 session_id,
                 label: Some("vm-http-test".into()),
+                agent_kind: None,
                 agent_model: None,
                 opened_at: UnixMillis::now(),
                 closed_at: None,

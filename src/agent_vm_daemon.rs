@@ -20,8 +20,8 @@ use crate::agent_vm_lifecycle::{
 };
 use crate::audit::AuditError;
 use crate::core::{
-    AgentNetwork, AgentNetworkPool, AgentVmConfigError, BrokerPorts, SessionId, SessionRecord,
-    UnixMillis,
+    AgentKind, AgentNetwork, AgentNetworkPool, AgentVmConfigError, BrokerPorts, SessionId,
+    SessionRecord, UnixMillis,
 };
 use crate::secret::SecretStore;
 use crate::server::BrokerState;
@@ -258,6 +258,7 @@ impl AgentVmDaemon {
         &self,
         state: Arc<BrokerState<S>>,
         label: Option<String>,
+        agent_kind: Option<AgentKind>,
         agent_model: Option<String>,
         guest_command: Vec<String>,
     ) -> Result<AgentVmStarted, AgentVmDaemonError> {
@@ -273,6 +274,7 @@ impl AgentVmDaemon {
         state.audit.open_session(&SessionRecord {
             session_id,
             label,
+            agent_kind,
             agent_model,
             opened_at: UnixMillis::now(),
             closed_at: None,
@@ -691,6 +693,7 @@ mod tests {
             .start_session(
                 Arc::clone(&state),
                 Some("agent vm".into()),
+                Some(AgentKind::Codex),
                 Some("gpt-test".into()),
                 vec!["sleep".into(), "600".into()],
             )
@@ -704,6 +707,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(audit_session.label.as_deref(), Some("agent vm"));
+        assert_eq!(audit_session.agent_kind, Some(AgentKind::Codex));
         assert!(audit_session.closed_at.is_none());
 
         let env = fs::read_to_string(&env_log).unwrap();
@@ -774,6 +778,7 @@ mod tests {
             .open_session(&SessionRecord {
                 session_id,
                 label: Some("ordinary broker session".into()),
+                agent_kind: None,
                 agent_model: None,
                 opened_at: UnixMillis::now(),
                 closed_at: None,
@@ -810,6 +815,7 @@ mod tests {
             .start_session(
                 Arc::clone(&state),
                 Some("subnet pool exhausted".into()),
+                None,
                 None,
                 vec!["sleep".into(), "600".into()],
             )
@@ -848,6 +854,7 @@ mod tests {
             .start_session(
                 Arc::clone(&state),
                 Some("container network create fails".into()),
+                None,
                 None,
                 vec!["sleep".into(), "600".into()],
             )

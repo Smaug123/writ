@@ -5,9 +5,9 @@
 
 use proptest::prelude::*;
 use writ::core::{
-    CapabilityRequest, CredentialGrant, GitHubAccess, GitHubGrantedScope, GitHubPermissions,
-    GitHubRequest, GrantedScope, Jti, MetadataAccess, PolicyDecision, RepoRef, RequestId,
-    SessionId, SessionRecord, TtlSeconds, UnixMillis,
+    AgentKind, CapabilityRequest, CredentialGrant, GitHubAccess, GitHubGrantedScope,
+    GitHubPermissions, GitHubRequest, GrantedScope, Jti, MetadataAccess, PolicyDecision, RepoRef,
+    RequestId, SessionId, SessionRecord, TtlSeconds, UnixMillis,
 };
 use writ::policy::{PolicyConfig, decide};
 
@@ -74,32 +74,41 @@ fn arb_decision() -> impl Strategy<Value = PolicyDecision> {
 }
 
 fn arb_grant() -> impl Strategy<Value = CredentialGrant> {
-    (arb_scope(), 0i64..10_000_000_000, 1i64..=3600).prop_map(|(scope, issued, ttl)| {
-        CredentialGrant {
+    (
+        arb_scope(),
+        prop::option::of(0u64..1_000_000),
+        0i64..10_000_000_000,
+        1i64..=3600,
+    )
+        .prop_map(|(scope, github_app_id, issued, ttl)| CredentialGrant {
             jti: Jti::new(),
             request_id: RequestId::new(),
             session_id: SessionId::new(),
+            github_app_id,
             scope,
             issued_at: UnixMillis::from_millis(issued),
             expires_at: UnixMillis::from_millis(issued + ttl),
-        }
-    })
+        })
 }
 
 fn arb_session() -> impl Strategy<Value = SessionRecord> {
     (
         prop::option::of("[a-zA-Z0-9 ]{0,64}"),
+        prop::option::of(prop_oneof![Just(AgentKind::Claude), Just(AgentKind::Codex)]),
         prop::option::of("[a-zA-Z0-9.-]{0,64}"),
         0i64..10_000_000_000,
         prop::option::of(0i64..10_000_000_000),
     )
-        .prop_map(|(label, agent_model, opened, closed)| SessionRecord {
-            session_id: SessionId::new(),
-            label,
-            agent_model,
-            opened_at: UnixMillis::from_millis(opened),
-            closed_at: closed.map(UnixMillis::from_millis),
-        })
+        .prop_map(
+            |(label, agent_kind, agent_model, opened, closed)| SessionRecord {
+                session_id: SessionId::new(),
+                label,
+                agent_kind,
+                agent_model,
+                opened_at: UnixMillis::from_millis(opened),
+                closed_at: closed.map(UnixMillis::from_millis),
+            },
+        )
 }
 
 proptest! {

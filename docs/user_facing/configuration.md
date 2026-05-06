@@ -22,6 +22,8 @@ The CLI client (`writ`) finds the socket via `--socket`, the
 
 ## Full config reference
 
+Use exactly one of `github` or `github_apps`.
+
 ```json
 {
   "github": {
@@ -41,7 +43,44 @@ The CLI client (`writ`) finds the socket via `--socket`, the
 }
 ```
 
-### `github`
+For separate Claude and Codex GitHub App identities, use:
+
+```json
+{
+  "github_apps": {
+    "claude": {
+      "app_id": 12345,
+      "installation_id": 67890,
+      "installation_owner": "smaug123",
+      "private_key_secret": "claude-gh-app-pk"
+    },
+    "codex": {
+      "app_id": 22345,
+      "installation_id": 77890,
+      "installation_owner": "smaug123",
+      "private_key_secret": "codex-gh-app-pk"
+    }
+  },
+  "policy": {
+    "default_ttl": 3600,
+    "writable_repos": ["smaug123/writ"]
+  }
+}
+```
+
+### `github` / `github_apps`
+
+`github` is the legacy single-App configuration. It is used for every
+session, even if the client supplies `--agent`; the agent kind is still
+recorded on the session for audit context. `github_apps` is keyed by
+session agent kind (`claude` or `codex`); when it is configured,
+sessions must be opened with `--agent claude` or `--agent codex` before
+a GitHub token can be minted.
+
+The broker treats `--agent` as the session identity for GitHub App
+selection. It does not authenticate that the calling process is actually
+Claude or Codex. Operators must enforce that at the transport boundary,
+for example with Unix socket permissions or VM launch controls.
 
 | Field                | Required | Description                                                                  |
 | -------------------- | -------- | ---------------------------------------------------------------------------- |
@@ -84,8 +123,8 @@ defaults.
 
 ## Secret stores
 
-The broker holds exactly one long-lived secret: the GitHub App RSA
-private key. There are two backends.
+The broker holds one long-lived secret per configured GitHub App: that
+App's RSA private key. There are two backends.
 
 ### File (default)
 

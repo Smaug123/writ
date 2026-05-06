@@ -16,6 +16,7 @@ authority to do.
 CREATE TABLE session (
   session_id  TEXT PRIMARY KEY,
   label       TEXT,
+  agent_kind  TEXT,
   agent_model TEXT,
   opened_at   INTEGER NOT NULL,
   closed_at   INTEGER
@@ -30,12 +31,13 @@ CREATE TABLE request (
 );
 
 CREATE TABLE grant_log (
-  jti         TEXT PRIMARY KEY,
-  request_id  TEXT NOT NULL REFERENCES request(request_id),
-  session_id  TEXT NOT NULL REFERENCES session(session_id),
-  scope_json  TEXT NOT NULL,
-  issued_at   INTEGER NOT NULL,
-  expires_at  INTEGER NOT NULL
+  jti           TEXT PRIMARY KEY,
+  request_id    TEXT NOT NULL REFERENCES request(request_id),
+  session_id    TEXT NOT NULL REFERENCES session(session_id),
+  github_app_id INTEGER,
+  scope_json    TEXT NOT NULL,
+  issued_at     INTEGER NOT NULL,
+  expires_at    INTEGER NOT NULL
 );
 
 CREATE TABLE mint_failure (
@@ -94,7 +96,8 @@ A few invariants worth knowing:
   `nix_cache_outcome`.
 - **The token itself is never stored.** Only the metadata that proves
   it was issued — the `jti` (a UUID the broker generates), the
-  `scope_json`, and timestamps.
+  `github_app_id`, `scope_json`, and timestamps. Older rows written
+  before schema version 5 may have `github_app_id = NULL`.
 - **Closing a session is advisory.** Audit rows outlive their session;
   forgetting to call `writ close-session` does not lose anything.
 
@@ -127,7 +130,9 @@ SELECT
   datetime(g.issued_at/1000, 'unixepoch')  AS issued,
   datetime(g.expires_at/1000, 'unixepoch') AS expires,
   s.label,
+  s.agent_kind,
   s.agent_model,
+  g.github_app_id,
   g.scope_json
 FROM grant_log g
 JOIN session s USING (session_id)
@@ -214,7 +219,7 @@ WHERE NOT EXISTS (
 ### Sessions still open
 
 ```sql
-SELECT session_id, label, agent_model,
+SELECT session_id, label, agent_kind, agent_model,
        datetime(opened_at/1000, 'unixepoch') AS opened
 FROM session
 WHERE closed_at IS NULL

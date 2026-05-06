@@ -1,5 +1,6 @@
 //! Daemon configuration loaded from a JSON file at startup.
 
+use std::collections::BTreeMap;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -14,7 +15,9 @@ use crate::agent_vm_lifecycle::{
     AgentVmLifecycleConfigError, AgentVmResources, AgentVmSessionStateStore, AgentVmStateDirError,
     AgentVmToolPaths, ContainerImage, Ipv6IsolationMode, default_agent_vm_state_dir,
 };
-use crate::core::{AgentNetworkPool, AgentVmConfigError, BrokerPortRange, Ipv4Cidr, Ipv6Cidr};
+use crate::core::{
+    AgentKind, AgentNetworkPool, AgentVmConfigError, BrokerPortRange, Ipv4Cidr, Ipv6Cidr,
+};
 use crate::github::GitHubAppConfig;
 use crate::nix_cache::{NixTrustedPublicKeys, NixTrustedPublicKeysError};
 use crate::policy::PolicyConfig;
@@ -46,7 +49,14 @@ use crate::vm_http::{
 /// ```
 #[derive(Debug, Deserialize)]
 pub struct DaemonConfig {
-    pub github: GitHubAppConfig,
+    /// Legacy single GitHub App configuration. Mutually exclusive with
+    /// `github_apps`.
+    #[serde(default)]
+    pub github: Option<GitHubAppConfig>,
+    /// Agent-keyed GitHub Apps. Use this when Claude and Codex should push
+    /// under different GitHub App identities.
+    #[serde(default)]
+    pub github_apps: BTreeMap<AgentKind, GitHubAppConfig>,
     pub policy: PolicyConfig,
     /// Optional static configuration for agent-VM HTTP sessions. It does not
     /// start a VM by itself; per-session lifecycle code supplies the session
@@ -357,6 +367,7 @@ pub fn default_audit_db_path() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::github::{GitHubAppRegistryConfig, GitHubAppRegistryConfigError};
 
     const TEST_NIX_CACHE_PUBLIC_KEY: &str =
         "cache.example-1:IsGkyTbr2sed7tWowgiPcI0ZHhBAHoGQ7TyYRweyzwE=";
@@ -378,14 +389,22 @@ mod tests {
             }
         }"#;
         let c: DaemonConfig = serde_json::from_str(json).unwrap();
-        assert_eq!(c.github.app_id, 42);
-        assert_eq!(c.github.api_base, "https://api.github.com");
+        let github = c.github.as_ref().unwrap();
+        assert_eq!(github.app_id, 42);
+        assert_eq!(github.api_base, "https://api.github.com");
+        assert!(c.github_apps.is_empty());
         assert_eq!(c.policy.default_ttl.as_i64(), 3600);
         assert!(c.agent_vm.is_none());
         assert!(c.socket_path.is_none());
         assert!(
-            matches!(c.secret_store, SecretStoreConfig::File { path } if path == default_secret_store_path())
+            matches!(&c.secret_store, SecretStoreConfig::File { path } if *path == default_secret_store_path())
         );
+        let DaemonConfig {
+            github,
+            github_apps,
+            ..
+        } = c;
+        assert!(GitHubAppRegistryConfig::from_parts(github, github_apps).is_ok());
     }
 
     #[test]
@@ -404,7 +423,10 @@ mod tests {
             "audit_db": "/tmp/audit.db"
         }"#;
         let c: DaemonConfig = serde_json::from_str(json).unwrap();
-        assert_eq!(c.github.api_base, "https://github.example.com/api/v3");
+        assert_eq!(
+            c.github.as_ref().unwrap().api_base,
+            "https://github.example.com/api/v3"
+        );
         assert_eq!(
             c.socket_path.as_deref(),
             Some(std::path::Path::new("/tmp/test.sock"))
@@ -412,6 +434,75 @@ mod tests {
         assert!(
             matches!(c.secret_store, SecretStoreConfig::Keyring { service } if service == "writ")
         );
+    }
+
+    #[test]
+    fn parses_agent_keyed_github_apps() {
+        let json = r#"{
+            "github_apps": {
+                "claude": {
+                    "app_id": 1,
+                    "installation_id": 2,
+                    "installation_owner": "o",
+                    "private_key_secret": "claude-pk"
+                },
+                "codex": {
+                    "app_id": 3,
+                    "installation_id": 4,
+                    "installation_owner": "o",
+                    "private_key_secret": "codex-pk"
+                }
+            },
+            "policy": { "default_ttl": 600, "writable_repos": [] }
+        }"#;
+        let c: DaemonConfig = serde_json::from_str(json).unwrap();
+        let DaemonConfig {
+            github,
+            github_apps,
+            ..
+        } = c;
+        let registry = GitHubAppRegistryConfig::from_parts(github, github_apps).unwrap();
+
+        assert!(registry.legacy_app().is_none());
+        assert_eq!(
+            registry.agent_apps()[&AgentKind::Claude]
+                .private_key_secret
+                .as_str(),
+            "claude-pk"
+        );
+        assert_eq!(
+            registry.agent_apps()[&AgentKind::Codex]
+                .private_key_secret
+                .as_str(),
+            "codex-pk"
+        );
+    }
+
+    #[test]
+    fn rejects_ambiguous_github_app_config_shapes() {
+        let json = r#"{
+            "github": {
+                "app_id": 1,
+                "installation_id": 2,
+                "installation_owner": "o",
+                "private_key_secret": "legacy-pk"
+            },
+            "github_apps": {
+                "codex": {
+                    "app_id": 3,
+                    "installation_id": 4,
+                    "installation_owner": "o",
+                    "private_key_secret": "codex-pk"
+                }
+            },
+            "policy": { "default_ttl": 600, "writable_repos": [] }
+        }"#;
+        let c: DaemonConfig = serde_json::from_str(json).unwrap();
+
+        assert!(matches!(
+            GitHubAppRegistryConfig::from_parts(c.github, c.github_apps),
+            Err(GitHubAppRegistryConfigError::Ambiguous)
+        ));
     }
 
     #[test]
