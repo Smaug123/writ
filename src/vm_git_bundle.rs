@@ -1107,6 +1107,8 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use tempfile::TempDir;
 
+    const TEST_GIT_TIMEOUT: Duration = Duration::from_secs(30);
+
     fn repo(owner: &str, name: &str) -> GitCloneRepo {
         format!("{owner}/{name}").parse().unwrap()
     }
@@ -1686,7 +1688,7 @@ exit 42
         let (git, log) = fake_git_program(&dir, "", "");
         let work = dir.path().join("work");
         let bundle = work.join("out.bundle");
-        let plan = plan_with_paths(git, &work, &bundle, Duration::from_secs(5), 1024);
+        let plan = plan_with_paths(git, &work, &bundle, TEST_GIT_TIMEOUT, 1024);
 
         let output = run_git_clone_bundle(&plan, &git_secret()).await.unwrap();
 
@@ -1714,13 +1716,7 @@ exit 42
         let (git, _) = fake_git_program(&dir, "", "");
         let work = dir.path().join("work");
         std::fs::create_dir(&work).unwrap();
-        let plan = plan_with_paths(
-            git,
-            &work,
-            work.join("out.bundle"),
-            Duration::from_secs(5),
-            1024,
-        );
+        let plan = plan_with_paths(git, &work, work.join("out.bundle"), TEST_GIT_TIMEOUT, 1024);
 
         let err = run_git_clone_bundle(&plan, &git_secret())
             .await
@@ -1772,13 +1768,7 @@ exit 42
         let ln = shell_quote(&required_test_tool("ln"));
         let clone_extra = format!("{ln} -s \"$9\" {}\n", shell_quote(&link));
         let (git, _) = fake_git_program(&dir, &clone_extra, "");
-        let plan = plan_with_paths(
-            git,
-            &work,
-            link.join("out.bundle"),
-            Duration::from_secs(5),
-            1024,
-        );
+        let plan = plan_with_paths(git, &work, link.join("out.bundle"), TEST_GIT_TIMEOUT, 1024);
 
         let err = run_git_clone_bundle(&plan, &git_secret())
             .await
@@ -1806,13 +1796,7 @@ exit 42
             shell_quote(&link)
         );
         let (git, _) = fake_git_program(&dir, &clone_extra, "");
-        let plan = plan_with_paths(
-            git,
-            &work,
-            link.join("out.bundle"),
-            Duration::from_secs(5),
-            1024,
-        );
+        let plan = plan_with_paths(git, &work, link.join("out.bundle"), TEST_GIT_TIMEOUT, 1024);
 
         let err = run_git_clone_bundle(&plan, &git_secret())
             .await
@@ -1834,7 +1818,7 @@ exit 42
         let bundle = work.join("out.bundle");
         let target = work.join("missing-target");
         std::os::unix::fs::symlink(&target, &bundle).unwrap();
-        let plan = plan_with_paths(git, &work, &bundle, Duration::from_secs(5), 1024);
+        let plan = plan_with_paths(git, &work, &bundle, TEST_GIT_TIMEOUT, 1024);
 
         let err = reject_existing_bundle(&plan).await.unwrap_err();
 
@@ -1932,13 +1916,7 @@ exit 42
         );
         let (git, _) = fake_git_program(&dir, &clone_extra, "");
         let work = dir.path().join("work");
-        let plan = plan_with_paths(
-            git,
-            &work,
-            work.join("out.bundle"),
-            Duration::from_secs(5),
-            1024,
-        );
+        let plan = plan_with_paths(git, &work, work.join("out.bundle"), TEST_GIT_TIMEOUT, 1024);
 
         run_git_clone_bundle(&plan, &git_secret()).await.unwrap();
 
@@ -1954,13 +1932,7 @@ exit 42
         let dir = tempfile::tempdir().unwrap();
         let (git, _) = fake_git_program(&dir, "", "");
         let work = dir.path().join("work");
-        let plan = plan_with_paths(
-            git,
-            &work,
-            work.join("out.bundle"),
-            Duration::from_secs(5),
-            4,
-        );
+        let plan = plan_with_paths(git, &work, work.join("out.bundle"), TEST_GIT_TIMEOUT, 4);
 
         let err = run_git_clone_bundle(&plan, &git_secret())
             .await

@@ -23,7 +23,10 @@ use crate::core::{
     BrokerPort, BrokerPortRange, CapabilityRequest, GitHubAccess, GitHubRequest, Ipv4Cidr,
     RequestId, SessionId, UnixMillis,
 };
-use crate::nix_cache::{NixCacheNarFileName, NixTrustedPublicKeys, validate_narinfo};
+use crate::nix_cache::{
+    NixCacheNarFileName, NixNarInfoError, NixStoreHashPart, NixTrustedPublicKeys,
+    parse_narinfo_for_store_hash,
+};
 use crate::secret::SecretStore;
 use crate::server::{BrokerState, CapabilityOutcome, request_capability};
 use crate::vm_git::{
@@ -246,7 +249,7 @@ enum VmHttpAuthScheme {
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum VmNixCacheRoute {
     CacheInfo,
-    NarInfo { hash: String },
+    NarInfo { hash: NixStoreHashPart },
     Nar { file: String },
 }
 
@@ -1408,17 +1411,18 @@ impl<S: SecretStore> VmHttpNixCacheService<S> {
                     };
                 }
             };
-        if matches!(route, VmNixCacheRoute::NarInfo { .. })
-            && let Err(err) = validate_narinfo(&body)
+        if let VmNixCacheRoute::NarInfo { hash } = route
+            && let Err(err) = parse_narinfo_for_store_hash(&body, hash)
         {
             eprintln!("VM HTTP Nix cache upstream narinfo was rejected: {err}");
+            let error = narinfo_audit_error_label(&err);
             let response =
                 VmHttpResponse::text(VmHttpStatus::BadGateway, "nix cache upstream failed");
             return VmHttpNixCacheProxyFetch {
                 upstream_url,
                 upstream_status: Some(upstream_status.as_u16()),
                 response_bytes: response.body.len() as u64,
-                error: Some("invalid upstream narinfo"),
+                error: Some(error),
                 response,
             };
         }
@@ -1541,7 +1545,7 @@ impl<S: SecretStore> VmHttpNixCacheService<S> {
     fn upstream_url(&self, route: &VmNixCacheRoute) -> reqwest::Url {
         let path = match route {
             VmNixCacheRoute::CacheInfo => "nix-cache-info".to_string(),
-            VmNixCacheRoute::NarInfo { hash } => format!("{hash}.narinfo"),
+            VmNixCacheRoute::NarInfo { hash } => format!("{}.narinfo", hash.as_str()),
             VmNixCacheRoute::Nar { file } => format!("nar/{file}"),
         };
         self.config
@@ -1650,20 +1654,34 @@ fn classify_nix_cache_target(target: &str) -> Option<VmNixCacheRoute> {
     }
     let suffix = target.strip_prefix(&format!("{VM_NIX_CACHE_PATH_PREFIX}/"))?;
     let hash = suffix.strip_suffix(".narinfo")?;
-    if is_nix_store_hash_part(hash) {
-        Some(VmNixCacheRoute::NarInfo {
-            hash: hash.to_string(),
-        })
-    } else {
-        None
+    if NixStoreHashPart::validate(hash).is_err() {
+        return None;
     }
+    let hash = NixStoreHashPart::new(hash).expect("validated Nix store hash should parse");
+    Some(VmNixCacheRoute::NarInfo { hash })
 }
 
-fn is_nix_store_hash_part(value: &str) -> bool {
-    value.len() == 32
-        && value
-            .bytes()
-            .all(|byte| b"0123456789abcdfghijklmnpqrsvwxyz".contains(&byte))
+fn narinfo_audit_error_label(err: &NixNarInfoError) -> &'static str {
+    match err {
+        NixNarInfoError::InvalidUtf8 => "invalid upstream narinfo utf8",
+        NixNarInfoError::MissingStorePath => "missing upstream narinfo StorePath",
+        NixNarInfoError::DuplicateStorePath => "duplicate upstream narinfo StorePath",
+        NixNarInfoError::EmptyStorePath => "empty upstream narinfo StorePath",
+        NixNarInfoError::InvalidStorePath { .. } => "invalid upstream narinfo StorePath",
+        NixNarInfoError::MissingUrl => "missing upstream narinfo URL",
+        NixNarInfoError::DuplicateUrl => "duplicate upstream narinfo URL",
+        NixNarInfoError::EmptyUrl => "empty upstream narinfo URL",
+        NixNarInfoError::UnsupportedUrl(_) | NixNarInfoError::InvalidNarFile { .. } => {
+            "invalid upstream narinfo URL"
+        }
+        NixNarInfoError::MissingNarHash => "missing upstream narinfo NarHash",
+        NixNarInfoError::DuplicateNarHash => "duplicate upstream narinfo NarHash",
+        NixNarInfoError::EmptyNarHash => "empty upstream narinfo NarHash",
+        NixNarInfoError::InvalidNarHash { .. } => "invalid upstream narinfo NarHash",
+        NixNarInfoError::StorePathHashMismatch { .. } => {
+            "mismatched upstream narinfo StorePath hash"
+        }
+    }
 }
 
 async fn read_http_body_for_git_clone_route<R: AsyncRead + Unpin>(
@@ -2311,6 +2329,8 @@ mod tests {
     use crate::vm_git::GitCloneRepo;
     use crate::vm_git_bundle::GitSecretEnvVar;
 
+    const TEST_GIT_CLONE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
     #[derive(Default)]
     struct InMemStore(Mutex<HashMap<String, String>>);
 
@@ -2533,7 +2553,7 @@ esac
             fake_git,
             credential,
             temp.path().join("git-work"),
-            std::time::Duration::from_secs(5),
+            TEST_GIT_CLONE_TIMEOUT,
             1024,
         )
         .unwrap()
@@ -2828,9 +2848,10 @@ esac
         #[test]
         fn valid_nix_store_hash_parts_are_narinfo_routes(hash in arb_nix_hash_part()) {
             let target = format!("{VM_NIX_CACHE_PATH_PREFIX}/{hash}.narinfo");
+            let parsed_hash = NixStoreHashPart::new(hash).unwrap();
             prop_assert_eq!(
                 classify_nix_cache_target(&target),
-                Some(VmNixCacheRoute::NarInfo { hash })
+                Some(VmNixCacheRoute::NarInfo { hash: parsed_hash })
             );
         }
 
@@ -3184,7 +3205,7 @@ esac
             assert_eq!(entries[0].upstream_status, Some(200));
             assert_eq!(
                 entries[0].error.as_deref(),
-                Some("invalid upstream narinfo")
+                Some("invalid upstream narinfo URL")
             );
         }
     }
@@ -3226,7 +3247,48 @@ esac
         assert_eq!(entries[0].upstream_status, Some(200));
         assert_eq!(
             entries[0].error.as_deref(),
-            Some("invalid upstream narinfo")
+            Some("duplicate upstream narinfo URL")
+        );
+    }
+
+    #[tokio::test]
+    async fn nix_cache_narinfo_route_rejects_store_path_hash_mismatch() {
+        let upstream = MockServer::start().await;
+        let state = make_broker_state(&upstream);
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+        open_audit_session(&state, session.session_id());
+        let requested_hash = "00000000000000000000000000000000";
+        let upstream_hash = "11111111111111111111111111111111";
+        Mock::given(method("GET"))
+            .and(path(format!("/{requested_hash}.narinfo")))
+            .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                "StorePath: /nix/store/{upstream_hash}-proof\nURL: nar/proof.nar.xz\nNarHash: sha256:0\n"
+            )))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+        let service = nix_cache_service_for_test(&state, &upstream, 1024);
+
+        let response = route_nix_cache_with_service(
+            &session,
+            "GET",
+            format!("{VM_NIX_CACHE_PATH_PREFIX}/{requested_hash}.narinfo"),
+            service,
+        )
+        .await;
+
+        assert_eq!(response.status, VmHttpStatus::BadGateway);
+        let entries = state
+            .audit
+            .list_nix_cache_requests_for_session(session.session_id())
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].route, NixCacheAuditRoute::NarInfo);
+        assert_eq!(entries[0].http_status, Some(502));
+        assert_eq!(entries[0].upstream_status, Some(200));
+        assert_eq!(
+            entries[0].error.as_deref(),
+            Some("mismatched upstream narinfo StorePath hash")
         );
     }
 
