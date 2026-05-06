@@ -1,6 +1,9 @@
 //! Host-side Nix binary-cache configuration types.
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct NixCacheNarFileName(String);
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct NixTrustedPublicKey(String);
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -29,11 +32,110 @@ pub enum NixTrustedPublicKeyError {
 }
 
 #[derive(Debug, thiserror::Error, Eq, PartialEq)]
+pub enum NixCacheNarFileNameError {
+    #[error("NAR filename must not be empty")]
+    Empty,
+    #[error("NAR filename is too long; maximum is 255 bytes")]
+    TooLong,
+    #[error("NAR filename must not start or end with '.'")]
+    DotBoundary,
+    #[error("NAR filename must not contain '/'")]
+    Slash,
+    #[error("NAR filename contains an invalid byte")]
+    InvalidByte,
+}
+
+#[derive(Debug, thiserror::Error, Eq, PartialEq)]
+pub enum NixNarInfoError {
+    #[error("narinfo is not UTF-8")]
+    InvalidUtf8,
+    #[error("narinfo is missing URL")]
+    MissingUrl,
+    #[error("narinfo contains duplicate URL")]
+    DuplicateUrl,
+    #[error("narinfo URL must not be empty")]
+    EmptyUrl,
+    #[error("narinfo URL must be nar/<safe-filename>, got {0:?}")]
+    UnsupportedUrl(String),
+    #[error("narinfo URL {url:?} contains invalid NAR filename: {source}")]
+    InvalidNarFile {
+        url: String,
+        source: NixCacheNarFileNameError,
+    },
+}
+
+#[derive(Debug, thiserror::Error, Eq, PartialEq)]
 #[error("Nix trusted public key at index {index} {raw:?} is invalid: {source}")]
 pub struct NixTrustedPublicKeysError {
     index: usize,
     raw: String,
     source: NixTrustedPublicKeyError,
+}
+
+impl NixCacheNarFileName {
+    pub fn new(raw: impl Into<String>) -> Result<Self, NixCacheNarFileNameError> {
+        let raw = raw.into();
+        Self::validate(&raw)?;
+        Ok(Self(raw))
+    }
+
+    pub fn validate(raw: &str) -> Result<(), NixCacheNarFileNameError> {
+        if raw.is_empty() {
+            return Err(NixCacheNarFileNameError::Empty);
+        }
+        if raw.len() > 255 {
+            return Err(NixCacheNarFileNameError::TooLong);
+        }
+        if raw.starts_with('.') || raw.ends_with('.') {
+            return Err(NixCacheNarFileNameError::DotBoundary);
+        }
+        if raw.contains('/') {
+            return Err(NixCacheNarFileNameError::Slash);
+        }
+        if !raw
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'+'))
+        {
+            return Err(NixCacheNarFileNameError::InvalidByte);
+        }
+        Ok(())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+pub fn validate_narinfo(bytes: &[u8]) -> Result<(), NixNarInfoError> {
+    let raw = std::str::from_utf8(bytes).map_err(|_| NixNarInfoError::InvalidUtf8)?;
+    let mut url = None;
+    for line in raw.lines() {
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        if key != "URL" {
+            continue;
+        }
+        if url.is_some() {
+            return Err(NixNarInfoError::DuplicateUrl);
+        }
+        // Nix-generated narinfos use `URL: nar/...`; `URL:nar/...` is also
+        // unambiguous. Tabs or extra spaces remain in the value and fail
+        // closed against the URL/filename policy below.
+        let value = value.strip_prefix(' ').unwrap_or(value);
+        if value.is_empty() {
+            return Err(NixNarInfoError::EmptyUrl);
+        }
+        url = Some(value);
+    }
+    let url = url.ok_or(NixNarInfoError::MissingUrl)?;
+    let Some(file) = url.strip_prefix("nar/") else {
+        return Err(NixNarInfoError::UnsupportedUrl(url.to_string()));
+    };
+    NixCacheNarFileName::validate(file).map_err(|source| NixNarInfoError::InvalidNarFile {
+        url: url.to_string(),
+        source,
+    })
 }
 
 impl NixTrustedPublicKey {
@@ -159,6 +261,75 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
+    fn valid_nar_file_name() -> impl Strategy<Value = String> {
+        let first = prop_oneof![b'a'..=b'z', b'A'..=b'Z', b'0'..=b'9', Just(b'_'),];
+        let rest = prop::collection::vec(
+            prop_oneof![
+                b'a'..=b'z',
+                b'A'..=b'Z',
+                b'0'..=b'9',
+                Just(b'-'),
+                Just(b'.'),
+                Just(b'_'),
+                Just(b'+'),
+            ],
+            0..80,
+        );
+        (first, rest).prop_map(|(first, rest)| {
+            let mut bytes = Vec::with_capacity(1 + rest.len());
+            bytes.push(first);
+            bytes.extend(rest);
+            if bytes.last() == Some(&b'.') {
+                *bytes.last_mut().unwrap() = b'x';
+            }
+            String::from_utf8(bytes).unwrap()
+        })
+    }
+
+    fn invalid_nar_url() -> impl Strategy<Value = String> {
+        prop_oneof![
+            Just(String::new()),
+            valid_nar_file_name().prop_map(|file| format!("/nar/{file}")),
+            valid_nar_file_name().prop_map(|file| format!("https://cache.example/nar/{file}")),
+            valid_nar_file_name().prop_map(|file| format!("nar/subdir/{file}")),
+            valid_nar_file_name().prop_map(|file| format!("nar/../{file}")),
+            valid_nar_file_name().prop_map(|file| format!("nar/{file}?download=1")),
+            valid_nar_file_name().prop_map(|file| format!("nar/{file}#fragment")),
+            valid_nar_file_name().prop_map(|file| format!("nar/.{file}")),
+            valid_nar_file_name().prop_map(|file| format!("nar/{file}.")),
+        ]
+    }
+
+    fn narinfo_other_field() -> impl Strategy<Value = String> {
+        let name = prop_oneof![
+            Just("StorePath"),
+            Just("NarHash"),
+            Just("Sig"),
+            Just("Deriver"),
+            Just("References"),
+            Just("FileHash"),
+            Just("FileSize"),
+            Just("Compression"),
+        ];
+        let value = prop::collection::vec(
+            prop_oneof![
+                b'a'..=b'z',
+                b'A'..=b'Z',
+                b'0'..=b'9',
+                Just(b' '),
+                Just(b':'),
+                Just(b'/'),
+                Just(b'.'),
+                Just(b'-'),
+                Just(b'_'),
+                Just(b'='),
+            ],
+            0..80,
+        );
+        (name, value)
+            .prop_map(|(name, value)| format!("{name}: {}\n", String::from_utf8(value).unwrap()))
+    }
+
     fn valid_key_name() -> impl Strategy<Value = String> {
         let first = prop_oneof![b'a'..=b'z', b'A'..=b'Z', b'0'..=b'9',];
         let rest = prop::collection::vec(
@@ -219,6 +390,35 @@ mod tests {
 
     proptest! {
         #[test]
+        fn valid_narinfo_urls_parse_amid_arbitrary_other_fields(
+            file in valid_nar_file_name(),
+            before in prop::collection::vec(narinfo_other_field(), 0..8),
+            after in prop::collection::vec(narinfo_other_field(), 0..8),
+        ) {
+            let raw = format!(
+                "{}Sig: cache.example:abc:def\nDeriver: /nix/store/00000000000000000000000000000000-proof:drv\nReferences: aaa bbb:ccc\nURL: nar/{file}\n{}",
+                before.concat(),
+                after.concat(),
+            );
+
+            prop_assert_eq!(validate_narinfo(raw.as_bytes()), Ok(()));
+        }
+
+        #[test]
+        fn invalid_narinfo_urls_are_rejected(url in invalid_nar_url()) {
+            let raw = format!(
+                "StorePath: /nix/store/00000000000000000000000000000000-proof\nURL: {url}\n"
+            );
+
+            prop_assert!(validate_narinfo(raw.as_bytes()).is_err());
+        }
+
+        #[test]
+        fn narinfo_parser_is_total_for_arbitrary_bytes(bytes in prop::collection::vec(any::<u8>(), 0..4096)) {
+            let _ = validate_narinfo(&bytes);
+        }
+
+        #[test]
         fn generated_valid_trusted_public_keys_parse(
             name in valid_key_name(),
             key in valid_base64_key_material(),
@@ -268,6 +468,62 @@ mod tests {
             let second = format!("{second_name}:{second_key}");
             let keys = NixTrustedPublicKeys::from_strings([first.clone(), second.clone()]).unwrap();
             prop_assert_eq!(keys.nix_conf_value(), format!("{first} {second}"));
+        }
+    }
+
+    #[test]
+    fn malformed_narinfo_urls_are_rejected() {
+        let cases = [
+            ("StorePath: /nix/store/x\n", NixNarInfoError::MissingUrl),
+            ("URL: \n", NixNarInfoError::EmptyUrl),
+            (
+                "URL: nar/proof.nar\nURL: nar/other.nar\n",
+                NixNarInfoError::DuplicateUrl,
+            ),
+            (
+                "URL: https://cache.example/nar/proof.nar\n",
+                NixNarInfoError::UnsupportedUrl("https://cache.example/nar/proof.nar".into()),
+            ),
+            (
+                "URL: ../proof.nar\n",
+                NixNarInfoError::UnsupportedUrl("../proof.nar".into()),
+            ),
+            (
+                "URL: nar/subdir/proof.nar\n",
+                NixNarInfoError::InvalidNarFile {
+                    url: "nar/subdir/proof.nar".into(),
+                    source: NixCacheNarFileNameError::Slash,
+                },
+            ),
+            (
+                "URL: nar/proof.nar?download=1\n",
+                NixNarInfoError::InvalidNarFile {
+                    url: "nar/proof.nar?download=1".into(),
+                    source: NixCacheNarFileNameError::InvalidByte,
+                },
+            ),
+            (
+                "URL: nar/.proof.nar\n",
+                NixNarInfoError::InvalidNarFile {
+                    url: "nar/.proof.nar".into(),
+                    source: NixCacheNarFileNameError::DotBoundary,
+                },
+            ),
+            (
+                "URL: nar/proof.nar.\n",
+                NixNarInfoError::InvalidNarFile {
+                    url: "nar/proof.nar.".into(),
+                    source: NixCacheNarFileNameError::DotBoundary,
+                },
+            ),
+            (
+                "URL: /nar/proof.nar\n",
+                NixNarInfoError::UnsupportedUrl("/nar/proof.nar".into()),
+            ),
+        ];
+
+        for (raw, expected) in cases {
+            assert_eq!(validate_narinfo(raw.as_bytes()), Err(expected), "{raw:?}");
         }
     }
 

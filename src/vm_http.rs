@@ -23,7 +23,7 @@ use crate::core::{
     BrokerPort, BrokerPortRange, CapabilityRequest, GitHubAccess, GitHubRequest, Ipv4Cidr,
     RequestId, SessionId, UnixMillis,
 };
-use crate::nix_cache::NixTrustedPublicKeys;
+use crate::nix_cache::{NixCacheNarFileName, NixTrustedPublicKeys, validate_narinfo};
 use crate::secret::SecretStore;
 use crate::server::{BrokerState, CapabilityOutcome, request_capability};
 use crate::vm_git::{
@@ -1408,6 +1408,20 @@ impl<S: SecretStore> VmHttpNixCacheService<S> {
                     };
                 }
             };
+        if matches!(route, VmNixCacheRoute::NarInfo { .. })
+            && let Err(err) = validate_narinfo(&body)
+        {
+            eprintln!("VM HTTP Nix cache upstream narinfo was rejected: {err}");
+            let response =
+                VmHttpResponse::text(VmHttpStatus::BadGateway, "nix cache upstream failed");
+            return VmHttpNixCacheProxyFetch {
+                upstream_url,
+                upstream_status: Some(upstream_status.as_u16()),
+                response_bytes: response.body.len() as u64,
+                error: Some("invalid upstream narinfo"),
+                response,
+            };
+        }
         let response_bytes = body.len() as u64;
         VmHttpNixCacheProxyFetch {
             upstream_url,
@@ -1627,7 +1641,7 @@ fn classify_nix_cache_target(target: &str) -> Option<VmNixCacheRoute> {
         return Some(VmNixCacheRoute::CacheInfo);
     }
     if let Some(file) = target.strip_prefix(&format!("{VM_NIX_CACHE_PATH_PREFIX}/nar/")) {
-        if is_nix_cache_nar_file(file) {
+        if NixCacheNarFileName::validate(file).is_ok() {
             return Some(VmNixCacheRoute::Nar {
                 file: file.to_string(),
             });
@@ -1643,17 +1657,6 @@ fn classify_nix_cache_target(target: &str) -> Option<VmNixCacheRoute> {
     } else {
         None
     }
-}
-
-fn is_nix_cache_nar_file(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= 255
-        && !value.starts_with('.')
-        && !value.ends_with('.')
-        && !value.contains('/')
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'+'))
 }
 
 fn is_nix_store_hash_part(value: &str) -> bool {
@@ -3103,13 +3106,14 @@ esac
         let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
         open_audit_session(&state, session.session_id());
         let hash = "00000000000000000000000000000000";
+        let upstream_body = concat!(
+            "StorePath: /nix/store/00000000000000000000000000000000-proof\n",
+            "URL: nar/proof.nar.xz\n",
+            "NarHash: sha256:0\n",
+        );
         Mock::given(method("GET"))
             .and(path(format!("/{hash}.narinfo")))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_string(
-                    "StorePath: /nix/store/00000000000000000000000000000000-proof\n",
-                ),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_string(upstream_body))
             .expect(1)
             .mount(&upstream)
             .await;
@@ -3124,11 +3128,7 @@ esac
         .await;
 
         assert_eq!(response.status, VmHttpStatus::Ok);
-        assert!(
-            String::from_utf8(response.body)
-                .unwrap()
-                .contains("StorePath:")
-        );
+        assert_eq!(response.body, upstream_body.as_bytes());
         let entries = state
             .audit
             .list_nix_cache_requests_for_session(session.session_id())
@@ -3138,6 +3138,96 @@ esac
         assert_eq!(entries[0].decision, NixCacheAuditDecision::Allow);
         assert_eq!(entries[0].http_status, Some(200));
         assert_eq!(entries[0].upstream_status, Some(200));
+    }
+
+    #[tokio::test]
+    async fn nix_cache_narinfo_route_rejects_unsafe_nar_urls() {
+        for nar_url in [
+            "https://cache.example/nar/proof.nar.xz",
+            "../proof.nar.xz",
+            "nar/subdir/proof.nar.xz",
+            "/nar/proof.nar.xz",
+            "nar/proof.nar.xz?download=1",
+        ] {
+            let upstream = MockServer::start().await;
+            let state = make_broker_state(&upstream);
+            let session =
+                session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+            open_audit_session(&state, session.session_id());
+            let hash = "00000000000000000000000000000000";
+            Mock::given(method("GET"))
+                .and(path(format!("/{hash}.narinfo")))
+                .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                    "StorePath: /nix/store/00000000000000000000000000000000-proof\nURL: {nar_url}\n"
+                )))
+                .expect(1)
+                .mount(&upstream)
+                .await;
+            let service = nix_cache_service_for_test(&state, &upstream, 1024);
+
+            let response = route_nix_cache_with_service(
+                &session,
+                "GET",
+                format!("{VM_NIX_CACHE_PATH_PREFIX}/{hash}.narinfo"),
+                service,
+            )
+            .await;
+
+            assert_eq!(response.status, VmHttpStatus::BadGateway, "{nar_url}");
+            let entries = state
+                .audit
+                .list_nix_cache_requests_for_session(session.session_id())
+                .unwrap();
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].route, NixCacheAuditRoute::NarInfo);
+            assert_eq!(entries[0].http_status, Some(502));
+            assert_eq!(entries[0].upstream_status, Some(200));
+            assert_eq!(
+                entries[0].error.as_deref(),
+                Some("invalid upstream narinfo")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn nix_cache_narinfo_route_rejects_duplicate_nar_urls() {
+        let upstream = MockServer::start().await;
+        let state = make_broker_state(&upstream);
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+        open_audit_session(&state, session.session_id());
+        let hash = "00000000000000000000000000000000";
+        Mock::given(method("GET"))
+            .and(path(format!("/{hash}.narinfo")))
+            .respond_with(ResponseTemplate::new(200).set_body_string(concat!(
+                "StorePath: /nix/store/00000000000000000000000000000000-proof\n",
+                "URL: nar/proof.nar.xz\n",
+                "URL: nar/other.nar.xz\n",
+            )))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+        let service = nix_cache_service_for_test(&state, &upstream, 1024);
+
+        let response = route_nix_cache_with_service(
+            &session,
+            "GET",
+            format!("{VM_NIX_CACHE_PATH_PREFIX}/{hash}.narinfo"),
+            service,
+        )
+        .await;
+
+        assert_eq!(response.status, VmHttpStatus::BadGateway);
+        let entries = state
+            .audit
+            .list_nix_cache_requests_for_session(session.session_id())
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].http_status, Some(502));
+        assert_eq!(entries[0].upstream_status, Some(200));
+        assert_eq!(
+            entries[0].error.as_deref(),
+            Some("invalid upstream narinfo")
+        );
     }
 
     #[tokio::test]

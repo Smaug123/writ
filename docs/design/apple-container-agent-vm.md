@@ -932,10 +932,11 @@ First brokered Nix NAR transport slice implemented in `src/vm_http.rs`,
   before the body is complete, stream-truncation or body-read failures are
   recorded in the Nix cache audit outcome rather than converted into a different
   VM-visible status after the fact;
-- this is still only cache transport. It does not sign `.narinfo`, verify
-  upstream cache signatures, check NAR content hashes in the broker, or create a
-  complete substitute-realisation proof. Those remain follow-on slices before
-  treating the VM as able to build entirely from brokered cache authority.
+- this is still only cache transport. The later metadata-admission slice below
+  constrains `.narinfo` NAR URLs before forwarding, but the broker still does
+  not sign `.narinfo`, verify upstream cache signatures, or check NAR content
+  hashes itself. Those remain follow-on slices before treating the VM as able
+  to build entirely from brokered cache authority.
 
 First brokered Nix cache trust-key plumbing slice implemented in
 `src/nix_cache.rs`, `src/config.rs`, and `src/agent_vm_daemon.rs`:
@@ -974,6 +975,30 @@ First signed Nix substitute-realisation proof slice implemented in
   through the daemon, and realise a signed substitute. It still relies on guest
   Nix for signature/content verification; broker-side verification remains a
   separate policy-hardening slice.
+
+First broker-side Nix `.narinfo` admission slice implemented in
+`src/nix_cache.rs` and `src/vm_http.rs`:
+
+- `validate_narinfo()` reads bounded upstream `.narinfo` metadata before the
+  broker forwards a successful `GET /v1/nix/cache/<hash>.narinfo` response to
+  the VM. The parser preserves the original body for forwarding, but checks
+  the `URL:` field against typed filename policy;
+- a forwarded `.narinfo` must contain exactly one non-empty `URL:` value of the
+  form `nar/<safe-filename>`. Absolute URLs, leading slashes, traversal,
+  query/fragment-like bytes, extra path segments, duplicate `URL:` fields, and
+  missing URLs fail closed before the VM sees the metadata;
+- the safe filename rule is shared with the VM HTTP `/v1/nix/cache/nar/<file>`
+  classifier through `NixCacheNarFileName`, so the parser and route cannot
+  drift on which NAR body paths the broker is willing to proxy;
+- rejected upstream metadata becomes an audited `502` with
+  `invalid upstream narinfo`. `HEAD` remains a bounded upstream existence check;
+- this is broker-side metadata path admission, not broker-side signature,
+  store-path, or NAR-hash verification. A malicious or buggy upstream can still
+  return structurally valid metadata for the wrong store object or content; the
+  guest Nix signature/content checks catch those swaps. The broker only rejects
+  metadata that would make the VM fetch a NAR path outside the broker's admitted
+  `nar/<safe-filename>` route, and broker-side verification remains a later
+  hardening slice.
 
 ## Tests and proof spikes
 
