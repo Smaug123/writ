@@ -22,12 +22,17 @@ What it proves:
   - the VM can call `writ-vm git clone` and check out a host-produced bundle
   - the VM receives daemon-written Nix netrc/config and Nix reaches the
     daemon-owned VM HTTP binary-cache route with authenticated Basic auth;
-    the daemon proxies Nix metadata requests to a local fake upstream cache
+    the daemon proxies a signed local fake upstream cache and guest Nix
+    realises a proof store path through it
   - `stop_agent_vm` removes the VM, network, PF anchor/states, and state record
 
 The GitHub API, host git binary, and upstream Nix binary cache are local fakes.
 This keeps the proof focused on Apple Container/PF/daemon wiring rather than
 real GitHub or cache availability.
+
+Note: the signed-cache setup adds one tiny fixed-output proof file to the host
+Nix store. Its contents are constant, so repeated runs reuse the same store
+entry rather than accumulating new proof paths.
 
 Environment overrides:
   WRIT_PROVE_IMAGE       OCI image to run, default writ-agent-vm-guest:latest
@@ -79,6 +84,7 @@ PROOF_REPO="proof-repo"
 PROOF_REPO_FULL="${PROOF_OWNER}/${PROOF_REPO}"
 PROOF_TOKEN="ghs_daemon_proof_token"
 PROOF_BUNDLE_MARKER="fake-git-bundle-from-daemon"
+PROOF_NIX_MARKER="signed-nix-cache-from-daemon"
 
 CONFIG_FILE="${TMP_DIR}/writd-config.json"
 SOCKET_PATH="${TMP_DIR}/writd.sock"
@@ -86,6 +92,10 @@ AUDIT_DB="${TMP_DIR}/audit.db"
 STATE_DIR="${TMP_DIR}/state"
 SECRETS_DIR="${TMP_DIR}/secrets"
 GIT_WORK_ROOT="${TMP_DIR}/git-work"
+FAKE_NIX_CACHE_DIR="${TMP_DIR}/fake-nix-cache"
+FAKE_NIX_CACHE_SECRET_KEY="${TMP_DIR}/fake-nix-cache.sec"
+FAKE_NIX_CACHE_PUBLIC_KEY_FILE="${TMP_DIR}/fake-nix-cache.pub"
+FAKE_NIX_PROOF_SOURCE="${TMP_DIR}/writ-nix-route-proof"
 FAKE_GITHUB_SCRIPT="${TMP_DIR}/fake-github.py"
 FAKE_NIX_CACHE_SCRIPT="${TMP_DIR}/fake-nix-cache.py"
 FAKE_GIT="${TMP_DIR}/fake-git"
@@ -105,6 +115,8 @@ FAKE_GITHUB_PORT=""
 FAKE_GITHUB_PID=""
 FAKE_NIX_CACHE_PORT=""
 FAKE_NIX_CACHE_PID=""
+FAKE_NIX_CACHE_PUBLIC_KEY=""
+PROOF_NIX_STORE_PATH=""
 WRITD_PID=""
 SESSION_ID=""
 NETWORK_NAME=""
@@ -347,40 +359,65 @@ PY
 write_fake_nix_cache_server() {
   cat >"$FAKE_NIX_CACHE_SCRIPT" <<'PY'
 import http.server
-import re
+import pathlib
 import sys
 
 PORT = int(sys.argv[1])
-
-NIX_CACHE_INFO = b"StoreDir: /nix/store\nWantMassQuery: 0\nPriority: 30\n"
-NARINFO_RE = re.compile(r"^/[0-9abcdfghijklmnpqrsvwxyz]{32}\.narinfo$")
+CACHE_ROOT = pathlib.Path(sys.argv[2]).resolve()
 
 class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         print(fmt % args, flush=True)
 
-    def _send(self, status, body=b""):
+    def _send_bytes(self, status, body=b"", content_type="text/plain"):
         self.send_response(status)
-        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         if self.command != "HEAD":
             self.wfile.write(body)
+
+    def _send_file(self, path):
+        content_type = (
+            "text/plain"
+            if path.name == "nix-cache-info" or path.suffix == ".narinfo"
+            else "application/octet-stream"
+        )
+        size = path.stat().st_size
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(size))
+        self.end_headers()
+        if self.command == "HEAD":
+            return
+        with path.open("rb") as f:
+            while True:
+                chunk = f.read(1024 * 1024)
+                if not chunk:
+                    return
+                self.wfile.write(chunk)
 
     def do_HEAD(self):
         self.do_GET()
 
     def do_GET(self):
         if self.path == "/health":
-            self._send(200, b"ok\n")
+            self._send_bytes(200, b"ok\n")
             return
-        if self.path == "/nix-cache-info":
-            self._send(200, NIX_CACHE_INFO)
+        rel = self.path.split("?", 1)[0].lstrip("/")
+        if not rel:
+            self._send_bytes(404, b"not found\n")
             return
-        if NARINFO_RE.match(self.path):
-            self._send(404, b"proof narinfo miss\n")
+        path = (CACHE_ROOT / rel).resolve()
+        try:
+            path.relative_to(CACHE_ROOT)
+        except ValueError:
+            self._send_bytes(404, b"not found\n")
             return
-        self._send(404, b"not found\n")
+        if path.is_file():
+            self._send_file(path)
+            return
+        self._send_bytes(404, b"not found\n")
 
 server = http.server.ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
 server.serve_forever()
@@ -477,6 +514,7 @@ write_config() {
     "$GIT_WORK_ROOT" \
     "$FAKE_GITHUB_PORT" \
     "$FAKE_NIX_CACHE_PORT" \
+    "$FAKE_NIX_CACHE_PUBLIC_KEY" \
     "$PROOF_OWNER" <<'PY'
 import json
 import sys
@@ -499,6 +537,7 @@ import sys
     git_work_root,
     fake_github_port,
     fake_nix_cache_port,
+    fake_nix_cache_public_key,
     owner,
 ) = sys.argv[1:]
 
@@ -540,6 +579,7 @@ config = {
             "clone_timeout_secs": 10,
             "max_bundle_bytes": 1048576,
             "nix_cache_url": f"http://127.0.0.1:{fake_nix_cache_port}",
+            "nix_cache_trusted_public_keys": [fake_nix_cache_public_key],
             "nix_cache_max_metadata_bytes": 1048576,
             "nix_cache_max_nar_bytes": 67108864,
         },
@@ -550,6 +590,26 @@ with open(config_path, "w", encoding="utf-8") as f:
     json.dump(config, f, indent=2)
     f.write("\n")
 PY
+}
+
+prepare_fake_nix_cache() {
+  mkdir -p "$FAKE_NIX_CACHE_DIR"
+  printf '%s\n' "$PROOF_NIX_MARKER" >"$FAKE_NIX_PROOF_SOURCE"
+  PROOF_NIX_STORE_PATH="$(nix-store --add-fixed sha256 "$FAKE_NIX_PROOF_SOURCE")" || \
+    die "failed to add proof file to host Nix store"
+  nix-store --generate-binary-cache-key \
+    writ-proof-cache-1 \
+    "$FAKE_NIX_CACHE_SECRET_KEY" \
+    "$FAKE_NIX_CACHE_PUBLIC_KEY_FILE" || \
+    die "failed to generate fake Nix cache signing key"
+  FAKE_NIX_CACHE_PUBLIC_KEY="$(cat "$FAKE_NIX_CACHE_PUBLIC_KEY_FILE")"
+  nix copy --to "file://${FAKE_NIX_CACHE_DIR}?secret-key=${FAKE_NIX_CACHE_SECRET_KEY}" \
+    "$PROOF_NIX_STORE_PATH" >/dev/null || \
+    die "failed to populate signed fake Nix cache"
+  if ! find "$FAKE_NIX_CACHE_DIR" -maxdepth 1 -name '*.narinfo' -type f -print -quit \
+    | grep -q .; then
+    die "signed fake Nix cache did not contain a narinfo"
+  fi
 }
 
 start_fake_github() {
@@ -571,7 +631,7 @@ start_fake_github() {
 start_fake_nix_cache() {
   FAKE_NIX_CACHE_PORT="$(pick_port)"
   write_fake_nix_cache_server
-  python3 "$FAKE_NIX_CACHE_SCRIPT" "$FAKE_NIX_CACHE_PORT" \
+  python3 "$FAKE_NIX_CACHE_SCRIPT" "$FAKE_NIX_CACHE_PORT" "$FAKE_NIX_CACHE_DIR" \
     >"$FAKE_NIX_CACHE_LOG" 2>&1 &
   FAKE_NIX_CACHE_PID="$!"
   for _ in {1..50}; do
@@ -682,8 +742,14 @@ assert_fake_nix_cache_used() {
   if ! grep -Eq '"(GET|HEAD) /nix-cache-info ' "$FAKE_NIX_CACHE_LOG"; then
     die "fake Nix cache log does not show nix-cache-info metadata request"
   fi
-  if ! grep -Eq '"(GET|HEAD) /00000000000000000000000000000000\.narinfo ' "$FAKE_NIX_CACHE_LOG"; then
+  local store_hash
+  store_hash="$(basename "$PROOF_NIX_STORE_PATH")"
+  store_hash="${store_hash%%-*}"
+  if ! grep -Eq "\"(GET|HEAD) /${store_hash}\\.narinfo " "$FAKE_NIX_CACHE_LOG"; then
     die "fake Nix cache log does not show narinfo metadata request"
+  fi
+  if ! grep -Eq '"GET /nar/[^"]+\.nar(\.[^" ]+)? ' "$FAKE_NIX_CACHE_LOG"; then
+    die "fake Nix cache log does not show NAR body request"
   fi
 }
 
@@ -741,6 +807,8 @@ assert_state_removed() {
 require_cmd container
 require_cmd curl
 require_cmd git
+require_cmd nix
+require_cmd nix-store
 require_cmd python3
 require_cmd sudo
 choose_cargo
@@ -781,6 +849,7 @@ cp "${ROOT_DIR}/tests/fixtures/rsa_test_1.pem" "${SECRETS_DIR}/gh-app-pk"
 chmod 600 "${SECRETS_DIR}/gh-app-pk"
 
 write_fake_git
+prepare_fake_nix_cache
 start_fake_github
 start_fake_nix_cache
 write_config
@@ -823,11 +892,21 @@ log "guest IPv4 address is ${GUEST_IPV4}"
 expect_guest_success "guest sees daemon-injected broker URL and token" \
   'test -n "$WRIT_BROKER_URL" && test -n "$WRIT_BROKER_TOKEN"'
 expect_guest_success "guest sees daemon-written Nix cache auth config" \
-  'test -n "$WRIT_NIX_CACHE_URL" && \
+  'contains_file() {
+     needle="$1"
+     file="$2"
+     while IFS= read -r line; do
+       case "$line" in *"$needle"*) return 0;; esac
+     done < "$file"
+     return 1
+   }
+   test -n "$WRIT_NIX_CACHE_URL" && \
     test -n "$WRIT_NIX_NETRC" && \
+    test -n "$WRIT_NIX_TRUSTED_PUBLIC_KEYS" && \
     test -n "$NIX_CONF_DIR" && \
     test -f "$WRIT_NIX_NETRC" && \
-    test -f "$NIX_CONF_DIR/nix.conf"'
+    test -f "$NIX_CONF_DIR/nix.conf" && \
+    contains_file "$WRIT_NIX_TRUSTED_PUBLIC_KEYS" "$NIX_CONF_DIR/nix.conf"'
 expect_guest_success "VM can call daemon VM HTTP session endpoint through writ-vm" \
   "session_json=\"\$(writ-vm session)\" && \
     case \"\$session_json\" in *'\"api\": \"writ-vm-http\"'*) ;; *) printf '%s\n' \"\$session_json\"; exit 1;; esac && \
@@ -837,7 +916,7 @@ expect_guest_success "VM can clone a host-produced Git bundle through writ-vm" \
     writ-vm git clone '${PROOF_REPO_FULL}' /tmp/writ-agent-vm-checkout && \
     test \"\$(git -C /tmp/writ-agent-vm-checkout rev-parse --is-inside-work-tree)\" = true && \
     test \"\$(cat /tmp/writ-agent-vm-checkout/README.md)\" = '${PROOF_BUNDLE_MARKER}'"
-expect_guest_success "VM Nix reaches daemon VM HTTP cache route with injected netrc auth" \
+expect_guest_success "VM Nix realises a signed store path through daemon VM HTTP cache" \
   'contains_file() {
      needle="$1"
      file="$2"
@@ -850,17 +929,13 @@ expect_guest_success "VM Nix reaches daemon VM HTTP cache route with injected ne
      file="$1"
      while IFS= read -r line; do printf "%s\n" "$line"; done < "$file"
    }
-   store_path=/nix/store/00000000000000000000000000000000-writ-nix-route-proof
+   store_path='"$PROOF_NIX_STORE_PATH"'
    stdout=/tmp/writ-nix-cache.stdout
    stderr=/tmp/writ-nix-cache.stderr
    set +e
-   nix path-info --refresh --store "$WRIT_NIX_CACHE_URL" "$store_path" >"$stdout" 2>"$stderr"
+   nix copy --refresh --from "$WRIT_NIX_CACHE_URL" "$store_path" >"$stdout" 2>"$stderr"
    rc=$?
    set -e
-   if [ "$rc" -eq 0 ]; then
-     printf "Nix unexpectedly succeeded for %s\n" "$store_path"
-     exit 1
-   fi
    if contains_file "$WRIT_BROKER_TOKEN" "$stdout" || contains_file "$WRIT_BROKER_TOKEN" "$stderr"; then
      printf "Nix output leaked the VM broker token\n"
      exit 1
@@ -869,11 +944,11 @@ expect_guest_success "VM Nix reaches daemon VM HTTP cache route with injected ne
      dump_file "$stderr"
      exit 1
    fi
-   if contains_file "404" "$stderr" || contains_file "not valid" "$stderr" || contains_file "does not exist" "$stderr"; then
-     exit 0
+   if [ "$rc" -ne 0 ]; then
+     dump_file "$stderr"
+     exit 1
    fi
-   dump_file "$stderr"
-   exit 1'
+   test "$(cat "$store_path")" = '"'"$PROOF_NIX_MARKER"'"''
 assert_fake_git_used_cleanly
 assert_fake_nix_cache_used
 
@@ -887,4 +962,4 @@ assert_pf_anchor_empty
 assert_no_pf_state_for_guest
 assert_state_removed
 
-log "daemon lifecycle proof succeeded for ${IPV4_CIDR}; writ-vm session, Git clone, and proxied Nix cache metadata worked inside the VM, and daemon stop cleanup was verified"
+log "daemon lifecycle proof succeeded for ${IPV4_CIDR}; writ-vm session, Git clone, and signed Nix substitute realisation worked inside the VM, and daemon stop cleanup was verified"

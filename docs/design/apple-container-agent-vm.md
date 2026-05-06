@@ -949,6 +949,28 @@ First brokered Nix cache trust-key plumbing slice implemented in
   cache's public key, and prove a real substitute can be realised through the
   brokered VM HTTP cache route.
 
+First signed Nix substitute-realisation proof slice implemented in
+`scripts/prove-agent-vm-daemon.sh`:
+
+- the daemon proof harness now creates an ephemeral Nix binary-cache signing
+  keypair, adds a tiny proof file to the host Nix store, and uses `nix copy
+  --to file://...?secret-key=...` to populate a signed local fake cache. The
+  proof file is fixed-output and constant, so it leaves one small reusable host
+  `/nix/store` path rather than accumulating per-run store entries;
+- the generated public key is inserted into
+  `agent_vm.vm_http.nix_cache_trusted_public_keys`, so the guest keeps normal
+  Nix signature verification enabled rather than disabling it with
+  `require-sigs = false`;
+- the fake upstream cache is now file-backed and serves `/nix-cache-info`,
+  the signed `.narinfo`, and the referenced `nar/...` body. The VM proof runs
+  `nix copy --from "$WRIT_NIX_CACHE_URL" <proof-store-path>` and checks the
+  realised store object contents inside the isolated guest;
+- this proves real guest Nix can authenticate to the brokered VM HTTP cache
+  route, trust the daemon-configured cache key, fetch metadata and NAR bytes
+  through the daemon, and realise a signed substitute. It still relies on guest
+  Nix for signature/content verification; broker-side verification remains a
+  separate policy-hardening slice.
+
 ## Tests and proof spikes
 
 First pure slice implemented in `src/core/agent_vm.rs`:
