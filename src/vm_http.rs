@@ -14,10 +14,14 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 use tokio::task::JoinSet;
 
+use crate::audit::{
+    AuditError, NixCacheAuditDecision, NixCacheAuditRoute, NixCacheOutcomeRecord,
+    NixCacheRequestRecord,
+};
 use crate::bearer::is_bearer_token_byte;
 use crate::core::{
     BrokerPort, BrokerPortRange, CapabilityRequest, GitHubAccess, GitHubRequest, Ipv4Cidr,
-    SessionId,
+    RequestId, SessionId, UnixMillis,
 };
 use crate::secret::SecretStore;
 use crate::server::{BrokerState, CapabilityOutcome, request_capability};
@@ -69,8 +73,8 @@ pub struct VmHttpGitCloneService<S: SecretStore> {
     config: VmHttpGitCloneConfig,
 }
 
-#[derive(Clone, Debug)]
-pub struct VmHttpNixCacheService {
+pub struct VmHttpNixCacheService<S: SecretStore> {
+    broker_state: Arc<BrokerState<S>>,
     config: VmHttpNixCacheConfig,
     client: reqwest::Client,
 }
@@ -87,7 +91,7 @@ pub struct PreparedVmHttpGitSession<S: SecretStore + Send + Sync + 'static> {
     listener: BoundVmHttpListener,
     session: VmHttpSession,
     git_clone: VmHttpGitCloneService<S>,
-    nix_cache: VmHttpNixCacheService,
+    nix_cache: VmHttpNixCacheService<S>,
 }
 
 pub struct RunningVmHttpGitSession {
@@ -237,9 +241,18 @@ enum VmNixCacheRoute {
     NarInfo { hash: String },
 }
 
+#[derive(Debug)]
+struct VmHttpNixCacheProxyFetch {
+    response: VmHttpResponse,
+    upstream_url: String,
+    upstream_status: Option<u16>,
+    response_bytes: u64,
+    error: Option<&'static str>,
+}
+
 #[derive(Debug, thiserror::Error)]
-enum VmHttpNixCacheProxyError {
-    #[error("Nix cache upstream request failed: {0}")]
+enum VmHttpNixCacheBodyReadError {
+    #[error("Nix cache upstream body read failed: {0}")]
     Request(#[from] reqwest::Error),
     #[error("Nix cache upstream metadata response exceeds {max} bytes")]
     ResponseTooLarge { max: u64 },
@@ -355,11 +368,22 @@ impl<S: SecretStore> Clone for VmHttpGitCloneService<S> {
     }
 }
 
-impl VmHttpNixCacheService {
-    pub fn new(config: VmHttpNixCacheConfig) -> Self {
+impl<S: SecretStore> VmHttpNixCacheService<S> {
+    pub fn new(broker_state: Arc<BrokerState<S>>, config: VmHttpNixCacheConfig) -> Self {
         Self {
+            broker_state,
             config,
             client: reqwest::Client::new(),
+        }
+    }
+}
+
+impl<S: SecretStore> Clone for VmHttpNixCacheService<S> {
+    fn clone(&self) -> Self {
+        Self {
+            broker_state: Arc::clone(&self.broker_state),
+            config: self.config.clone(),
+            client: self.client.clone(),
         }
     }
 }
@@ -647,8 +671,8 @@ pub async fn prepare_vm_http_git_session<S: SecretStore + Send + Sync + 'static>
     let listener =
         bind_ephemeral_vm_http_listener(config.bind_addr, config.broker_port_range).await?;
     let session = VmHttpSession::new(session_id, source_ipv4, VmHttpBearerToken::generate());
-    let git_clone = VmHttpGitCloneService::new(state, config.git_clone.clone());
-    let nix_cache = VmHttpNixCacheService::new(config.nix_cache.clone());
+    let git_clone = VmHttpGitCloneService::new(Arc::clone(&state), config.git_clone.clone());
+    let nix_cache = VmHttpNixCacheService::new(state, config.nix_cache.clone());
     Ok(PreparedVmHttpGitSession {
         listener,
         session,
@@ -679,7 +703,7 @@ pub async fn run_vm_http_with_git_until_shutdown<S: SecretStore + Send + Sync + 
     listener: TcpListener,
     session: VmHttpSession,
     git_clone: VmHttpGitCloneService<S>,
-    nix_cache: VmHttpNixCacheService,
+    nix_cache: VmHttpNixCacheService<S>,
     shutdown: watch::Receiver<bool>,
 ) -> std::io::Result<()> {
     run_vm_http_runtime_until_shutdown(
@@ -696,7 +720,7 @@ async fn run_vm_http_runtime_until_shutdown<S: SecretStore + Send + Sync + 'stat
     listener: TcpListener,
     session: VmHttpSession,
     git_clone: Option<VmHttpGitCloneService<S>>,
-    nix_cache: Option<VmHttpNixCacheService>,
+    nix_cache: Option<VmHttpNixCacheService<S>>,
     mut shutdown: watch::Receiver<bool>,
 ) -> std::io::Result<()> {
     let mut handlers = JoinSet::new();
@@ -808,7 +832,7 @@ async fn handle_vm_http_connection<S: SecretStore + Send + Sync + 'static>(
     peer_addr: SocketAddr,
     session: VmHttpSession,
     git_clone: Option<VmHttpGitCloneService<S>>,
-    nix_cache: Option<VmHttpNixCacheService>,
+    nix_cache: Option<VmHttpNixCacheService<S>>,
 ) -> std::io::Result<()> {
     handle_vm_http_connection_with_read_timeout(
         stream,
@@ -826,7 +850,7 @@ async fn handle_vm_http_connection_with_read_timeout<S, T>(
     peer_addr: SocketAddr,
     session: VmHttpSession,
     git_clone: Option<VmHttpGitCloneService<S>>,
-    nix_cache: Option<VmHttpNixCacheService>,
+    nix_cache: Option<VmHttpNixCacheService<S>>,
     read_timeout: std::time::Duration,
 ) -> std::io::Result<()>
 where
@@ -887,7 +911,7 @@ async fn dispatch_vm_http_head_and_body<S, R>(
     head: VmHttpHeadRead,
     stream: &mut R,
     git_clone: Option<VmHttpGitCloneService<S>>,
-    nix_cache: Option<VmHttpNixCacheService>,
+    nix_cache: Option<VmHttpNixCacheService<S>>,
     read_timeout: std::time::Duration,
 ) -> VmHttpResponse
 where
@@ -912,7 +936,22 @@ where
             )
             .await
         }
-        VmHttpAuthorization::Deny(err) => auth_error_response(auth_scheme, err),
+        VmHttpAuthorization::Deny(err) => {
+            let response = auth_error_response(auth_scheme, err);
+            if is_nix_cache_target(&request.target) {
+                return record_nix_cache_local_response(
+                    nix_cache.as_ref(),
+                    session,
+                    &request,
+                    NixCacheAuditDecision::Deny {
+                        reason: nix_cache_auth_error_reason(err).to_string(),
+                    },
+                    response,
+                    None,
+                );
+            }
+            response
+        }
     }
 }
 
@@ -948,7 +987,7 @@ async fn route_authenticated_vm_http_request<S, R>(
     buffered_body: Vec<u8>,
     stream: &mut R,
     git_clone: Option<VmHttpGitCloneService<S>>,
-    nix_cache: Option<VmHttpNixCacheService>,
+    nix_cache: Option<VmHttpNixCacheService<S>>,
     read_timeout: std::time::Duration,
 ) -> VmHttpResponse
 where
@@ -956,7 +995,7 @@ where
     R: AsyncRead + Unpin,
 {
     if is_nix_cache_target(&request.target) {
-        return route_nix_cache_request(request, nix_cache.as_ref()).await;
+        return route_nix_cache_request(session, request, nix_cache.as_ref()).await;
     }
 
     if request.target == VM_GIT_CLONE_PATH {
@@ -983,28 +1022,158 @@ where
     route_session_endpoint(session, request)
 }
 
-async fn route_nix_cache_request(
+async fn route_nix_cache_request<S: SecretStore>(
+    session: &VmHttpSession,
     request: &VmHttpRequest,
-    service: Option<&VmHttpNixCacheService>,
+    service: Option<&VmHttpNixCacheService<S>>,
 ) -> VmHttpResponse {
     let Some(service) = service else {
         return route_nix_cache_request_without_upstream(request);
     };
     let Some(route) = classify_nix_cache_target(&request.target) else {
-        return VmHttpResponse::text(VmHttpStatus::NotFound, "not found");
+        let response = VmHttpResponse::text(VmHttpStatus::NotFound, "not found");
+        return record_nix_cache_local_response(
+            Some(service),
+            session,
+            request,
+            NixCacheAuditDecision::Allow,
+            response,
+            None,
+        );
     };
-    match request.method.as_str() {
-        "GET" | "HEAD" => match service
-            .fetch_metadata(request.method.as_str(), &route)
-            .await
-        {
-            Ok(response) => response,
-            Err(err) => {
-                eprintln!("VM HTTP Nix cache proxy failed: {err}");
-                VmHttpResponse::text(VmHttpStatus::BadGateway, "nix cache upstream failed")
-            }
-        },
-        _ => VmHttpResponse::text(VmHttpStatus::MethodNotAllowed, "method not allowed"),
+
+    if !matches!(request.method.as_str(), "GET" | "HEAD") {
+        let response = VmHttpResponse::text(VmHttpStatus::MethodNotAllowed, "method not allowed");
+        return record_nix_cache_local_response(
+            Some(service),
+            session,
+            request,
+            NixCacheAuditDecision::Allow,
+            response,
+            Some(&route),
+        );
+    }
+
+    let request_id = RequestId::new();
+    if let Err(err) = record_nix_cache_request(
+        service,
+        request_id,
+        session,
+        request,
+        NixCacheAuditDecision::Allow,
+        Some(&route),
+    ) {
+        eprintln!("VM HTTP Nix cache audit request write failed: {err}");
+        return VmHttpResponse::text(VmHttpStatus::InternalServerError, "audit write failed");
+    }
+
+    let fetch = service
+        .fetch_metadata(request.method.as_str(), &route)
+        .await;
+    if let Err(err) = record_nix_cache_outcome(service, request_id, &fetch) {
+        eprintln!("VM HTTP Nix cache audit outcome write failed: {err}");
+        return VmHttpResponse::text(VmHttpStatus::InternalServerError, "audit write failed");
+    }
+    fetch.response
+}
+
+fn record_nix_cache_local_response<S: SecretStore>(
+    service: Option<&VmHttpNixCacheService<S>>,
+    session: &VmHttpSession,
+    request: &VmHttpRequest,
+    decision: NixCacheAuditDecision,
+    response: VmHttpResponse,
+    route: Option<&VmNixCacheRoute>,
+) -> VmHttpResponse {
+    let Some(service) = service else {
+        return response;
+    };
+    let request_id = RequestId::new();
+    if let Err(err) =
+        record_nix_cache_request(service, request_id, session, request, decision, route)
+    {
+        eprintln!("VM HTTP Nix cache audit request write failed: {err}");
+        return VmHttpResponse::text(VmHttpStatus::InternalServerError, "audit write failed");
+    }
+    let fetch = VmHttpNixCacheProxyFetch {
+        upstream_url: String::new(),
+        upstream_status: None,
+        response_bytes: response.body.len() as u64,
+        error: None,
+        response,
+    };
+    if let Err(err) = record_nix_cache_outcome(service, request_id, &fetch) {
+        eprintln!("VM HTTP Nix cache audit outcome write failed: {err}");
+        return VmHttpResponse::text(VmHttpStatus::InternalServerError, "audit write failed");
+    }
+    fetch.response
+}
+
+fn record_nix_cache_request<S: SecretStore>(
+    service: &VmHttpNixCacheService<S>,
+    request_id: RequestId,
+    session: &VmHttpSession,
+    request: &VmHttpRequest,
+    decision: NixCacheAuditDecision,
+    route: Option<&VmNixCacheRoute>,
+) -> Result<(), AuditError> {
+    service
+        .broker_state
+        .audit
+        .record_nix_cache_request(&NixCacheRequestRecord {
+            request_id,
+            session_id: session.session_id(),
+            received_at: UnixMillis::now(),
+            method: &request.method,
+            target: &request.target,
+            route: nix_cache_audit_route(request, route),
+            decision: &decision,
+        })
+}
+
+fn record_nix_cache_outcome<S: SecretStore>(
+    service: &VmHttpNixCacheService<S>,
+    request_id: RequestId,
+    fetch: &VmHttpNixCacheProxyFetch,
+) -> Result<(), AuditError> {
+    let upstream_url = if fetch.upstream_url.is_empty() {
+        None
+    } else {
+        Some(fetch.upstream_url.as_str())
+    };
+    service
+        .broker_state
+        .audit
+        .record_nix_cache_outcome(&NixCacheOutcomeRecord {
+            request_id,
+            completed_at: UnixMillis::now(),
+            http_status: fetch.response.status.code(),
+            upstream_url,
+            upstream_status: fetch.upstream_status,
+            response_bytes: fetch.response_bytes,
+            error: fetch.error,
+        })
+}
+
+fn nix_cache_audit_route(
+    request: &VmHttpRequest,
+    route: Option<&VmNixCacheRoute>,
+) -> NixCacheAuditRoute {
+    let route = route
+        .cloned()
+        .or_else(|| classify_nix_cache_target(&request.target));
+    match route {
+        Some(VmNixCacheRoute::CacheInfo) => NixCacheAuditRoute::CacheInfo,
+        Some(VmNixCacheRoute::NarInfo { .. }) => NixCacheAuditRoute::NarInfo,
+        None => NixCacheAuditRoute::Unsupported,
+    }
+}
+
+fn nix_cache_auth_error_reason(err: VmHttpAuthError) -> &'static str {
+    match err {
+        VmHttpAuthError::MissingCredentials => "missing credentials",
+        VmHttpAuthError::WrongCredentials => "wrong credentials",
+        VmHttpAuthError::SourceOutsideSessionSubnet => "source outside session subnet",
     }
 }
 
@@ -1027,50 +1196,116 @@ fn route_nix_cache_request_without_upstream(request: &VmHttpRequest) -> VmHttpRe
     }
 }
 
-impl VmHttpNixCacheService {
+impl<S: SecretStore> VmHttpNixCacheService<S> {
     async fn fetch_metadata(
         &self,
         method: &str,
         route: &VmNixCacheRoute,
-    ) -> Result<VmHttpResponse, VmHttpNixCacheProxyError> {
+    ) -> VmHttpNixCacheProxyFetch {
         let url = self.upstream_url(route);
+        let upstream_url = url.to_string();
         let is_head = method == "HEAD";
         let method = match method {
             "GET" => reqwest::Method::GET,
             "HEAD" => reqwest::Method::HEAD,
             _ => unreachable!("caller filters Nix cache proxy methods"),
         };
-        let response = self.client.request(method, url).send().await?;
+        let response = match self.client.request(method, url).send().await {
+            Ok(response) => response,
+            Err(err) => {
+                eprintln!("VM HTTP Nix cache upstream request failed: {err}");
+                let response =
+                    VmHttpResponse::text(VmHttpStatus::BadGateway, "nix cache upstream failed");
+                return VmHttpNixCacheProxyFetch {
+                    upstream_url,
+                    upstream_status: None,
+                    response_bytes: response.body.len() as u64,
+                    error: Some("upstream request failed"),
+                    response,
+                };
+            }
+        };
+        let upstream_status = response.status();
         if response.status() == reqwest::StatusCode::NOT_FOUND {
-            return Ok(VmHttpResponse::text(VmHttpStatus::NotFound, "not found"));
+            let response = VmHttpResponse::text(VmHttpStatus::NotFound, "not found");
+            return VmHttpNixCacheProxyFetch {
+                upstream_url,
+                upstream_status: Some(404),
+                response_bytes: response.body.len() as u64,
+                error: None,
+                response,
+            };
         }
         if response.status() != reqwest::StatusCode::OK {
             let status = response.status();
             eprintln!("VM HTTP Nix cache upstream returned status {status}");
-            return Ok(VmHttpResponse::text(
+            let response = VmHttpResponse::text(
                 VmHttpStatus::BadGateway,
                 "nix cache upstream returned unsupported status",
-            ));
+            );
+            return VmHttpNixCacheProxyFetch {
+                upstream_url,
+                upstream_status: Some(status.as_u16()),
+                response_bytes: response.body.len() as u64,
+                error: Some("unsupported upstream status"),
+                response,
+            };
         }
         if response
             .content_length()
             .is_some_and(|len| len > self.config.max_metadata_bytes)
         {
-            return Err(VmHttpNixCacheProxyError::ResponseTooLarge {
-                max: self.config.max_metadata_bytes,
-            });
+            let response =
+                VmHttpResponse::text(VmHttpStatus::BadGateway, "nix cache upstream failed");
+            return VmHttpNixCacheProxyFetch {
+                upstream_url,
+                upstream_status: Some(upstream_status.as_u16()),
+                response_bytes: response.body.len() as u64,
+                error: Some("upstream response too large"),
+                response,
+            };
         }
         if is_head {
-            return Ok(VmHttpResponse::text(VmHttpStatus::Ok, ""));
+            let response = VmHttpResponse::text(VmHttpStatus::Ok, "");
+            return VmHttpNixCacheProxyFetch {
+                upstream_url,
+                upstream_status: Some(200),
+                response_bytes: 0,
+                error: None,
+                response,
+            };
         }
         let body =
-            read_upstream_metadata_body_bounded(response, self.config.max_metadata_bytes).await?;
-        Ok(VmHttpResponse {
-            status: VmHttpStatus::Ok,
-            content_type: "text/plain; charset=utf-8",
-            body,
-            www_authenticate: None,
-        })
+            match read_upstream_metadata_body_bounded(response, self.config.max_metadata_bytes)
+                .await
+            {
+                Ok(body) => body,
+                Err(err) => {
+                    eprintln!("VM HTTP Nix cache upstream body read failed: {err}");
+                    let response =
+                        VmHttpResponse::text(VmHttpStatus::BadGateway, "nix cache upstream failed");
+                    return VmHttpNixCacheProxyFetch {
+                        upstream_url,
+                        upstream_status: Some(upstream_status.as_u16()),
+                        response_bytes: response.body.len() as u64,
+                        error: Some(err.audit_error_label()),
+                        response,
+                    };
+                }
+            };
+        let response_bytes = body.len() as u64;
+        VmHttpNixCacheProxyFetch {
+            upstream_url,
+            upstream_status: Some(200),
+            response_bytes,
+            error: None,
+            response: VmHttpResponse {
+                status: VmHttpStatus::Ok,
+                content_type: "text/plain; charset=utf-8",
+                body,
+                www_authenticate: None,
+            },
+        }
     }
 
     fn upstream_url(&self, route: &VmNixCacheRoute) -> reqwest::Url {
@@ -1088,16 +1323,25 @@ impl VmHttpNixCacheService {
 async fn read_upstream_metadata_body_bounded(
     mut response: reqwest::Response,
     max: u64,
-) -> Result<Vec<u8>, VmHttpNixCacheProxyError> {
+) -> Result<Vec<u8>, VmHttpNixCacheBodyReadError> {
     let mut body = Vec::new();
     while let Some(chunk) = response.chunk().await? {
         let new_len = body.len() as u64 + chunk.len() as u64;
         if new_len > max {
-            return Err(VmHttpNixCacheProxyError::ResponseTooLarge { max });
+            return Err(VmHttpNixCacheBodyReadError::ResponseTooLarge { max });
         }
         body.extend_from_slice(&chunk);
     }
     Ok(body)
+}
+
+impl VmHttpNixCacheBodyReadError {
+    fn audit_error_label(&self) -> &'static str {
+        match self {
+            Self::Request(_) => "upstream body read failed",
+            Self::ResponseTooLarge { .. } => "upstream response too large",
+        }
+    }
 }
 
 fn route_session_endpoint(session: &VmHttpSession, request: &VmHttpRequest) -> VmHttpResponse {
@@ -1593,6 +1837,20 @@ impl VmHttpStatus {
             Self::InternalServerError => "500 Internal Server Error",
         }
     }
+
+    fn code(self) -> u16 {
+        match self {
+            Self::Ok => 200,
+            Self::BadRequest => 400,
+            Self::Unauthorized => 401,
+            Self::Forbidden => 403,
+            Self::NotFound => 404,
+            Self::MethodNotAllowed => 405,
+            Self::Gone => 410,
+            Self::BadGateway => 502,
+            Self::InternalServerError => 500,
+        }
+    }
 }
 
 fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
@@ -1869,10 +2127,12 @@ esac
     }
 
     fn nix_cache_service_for_test(
+        state: &Arc<BrokerState<Box<dyn SecretStore>>>,
         server: &MockServer,
         max_metadata_bytes: u64,
-    ) -> VmHttpNixCacheService {
+    ) -> VmHttpNixCacheService<Box<dyn SecretStore>> {
         VmHttpNixCacheService::new(
+            Arc::clone(state),
             VmHttpNixCacheConfig::new(server.uri(), max_metadata_bytes).unwrap(),
         )
     }
@@ -2239,11 +2499,11 @@ esac
     }
 
     async fn route_nix_cache_with_service(
+        session: &VmHttpSession,
         method: &str,
         target: String,
-        service: VmHttpNixCacheService,
+        service: VmHttpNixCacheService<Box<dyn SecretStore>>,
     ) -> VmHttpResponse {
-        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
         let request = nix_cache_request(
             method,
             target,
@@ -2252,7 +2512,7 @@ esac
         );
         let mut stream = tokio::io::empty();
         route_authenticated_vm_http_request(
-            &session,
+            session,
             &request,
             Vec::new(),
             &mut stream,
@@ -2266,32 +2526,52 @@ esac
     #[tokio::test]
     async fn nix_cache_info_route_proxies_bounded_upstream_metadata() {
         let upstream = MockServer::start().await;
+        let state = make_broker_state(&upstream);
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+        open_audit_session(&state, session.session_id());
+        let upstream_body = "StoreDir: /nix/store\nWantMassQuery: 1\nPriority: 30\n";
         Mock::given(method("GET"))
             .and(path("/cache/nix-cache-info"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_string("StoreDir: /nix/store\nWantMassQuery: 1\nPriority: 30\n"),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_string(upstream_body))
             .expect(1)
             .mount(&upstream)
             .await;
         let service = VmHttpNixCacheService::new(
+            Arc::clone(&state),
             VmHttpNixCacheConfig::new(format!("{}/cache", upstream.uri()), 1024).unwrap(),
         );
 
         let response =
-            route_nix_cache_with_service("GET", VM_NIX_CACHE_INFO_PATH.into(), service).await;
+            route_nix_cache_with_service(&session, "GET", VM_NIX_CACHE_INFO_PATH.into(), service)
+                .await;
 
         assert_eq!(response.status, VmHttpStatus::Ok);
-        assert_eq!(
-            String::from_utf8(response.body).unwrap(),
-            "StoreDir: /nix/store\nWantMassQuery: 1\nPriority: 30\n"
+        assert_eq!(String::from_utf8(response.body).unwrap(), upstream_body);
+        let entries = state
+            .audit
+            .list_nix_cache_requests_for_session(session.session_id())
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].route, NixCacheAuditRoute::CacheInfo);
+        assert_eq!(entries[0].decision, NixCacheAuditDecision::Allow);
+        assert_eq!(entries[0].http_status, Some(200));
+        assert_eq!(entries[0].upstream_status, Some(200));
+        assert_eq!(entries[0].response_bytes, Some(upstream_body.len() as u64));
+        assert!(
+            entries[0]
+                .upstream_url
+                .as_deref()
+                .unwrap()
+                .ends_with("/cache/nix-cache-info")
         );
     }
 
     #[tokio::test]
     async fn nix_cache_narinfo_route_proxies_valid_narinfo_paths() {
         let upstream = MockServer::start().await;
+        let state = make_broker_state(&upstream);
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+        open_audit_session(&state, session.session_id());
         let hash = "00000000000000000000000000000000";
         Mock::given(method("GET"))
             .and(path(format!("/{hash}.narinfo")))
@@ -2303,9 +2583,10 @@ esac
             .expect(1)
             .mount(&upstream)
             .await;
-        let service = nix_cache_service_for_test(&upstream, 1024);
+        let service = nix_cache_service_for_test(&state, &upstream, 1024);
 
         let response = route_nix_cache_with_service(
+            &session,
             "GET",
             format!("{VM_NIX_CACHE_PATH_PREFIX}/{hash}.narinfo"),
             service,
@@ -2318,11 +2599,23 @@ esac
                 .unwrap()
                 .contains("StorePath:")
         );
+        let entries = state
+            .audit
+            .list_nix_cache_requests_for_session(session.session_id())
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].route, NixCacheAuditRoute::NarInfo);
+        assert_eq!(entries[0].decision, NixCacheAuditDecision::Allow);
+        assert_eq!(entries[0].http_status, Some(200));
+        assert_eq!(entries[0].upstream_status, Some(200));
     }
 
     #[tokio::test]
     async fn nix_cache_route_maps_upstream_404_to_controlled_miss() {
         let upstream = MockServer::start().await;
+        let state = make_broker_state(&upstream);
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+        open_audit_session(&state, session.session_id());
         let hash = "00000000000000000000000000000000";
         Mock::given(method("GET"))
             .and(path(format!("/{hash}.narinfo")))
@@ -2330,9 +2623,10 @@ esac
             .expect(1)
             .mount(&upstream)
             .await;
-        let service = nix_cache_service_for_test(&upstream, 1024);
+        let service = nix_cache_service_for_test(&state, &upstream, 1024);
 
         let response = route_nix_cache_with_service(
+            &session,
             "GET",
             format!("{VM_NIX_CACHE_PATH_PREFIX}/{hash}.narinfo"),
             service,
@@ -2341,35 +2635,144 @@ esac
 
         assert_eq!(response.status, VmHttpStatus::NotFound);
         assert_eq!(String::from_utf8(response.body).unwrap(), "not found");
+        let entries = state
+            .audit
+            .list_nix_cache_requests_for_session(session.session_id())
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].http_status, Some(404));
+        assert_eq!(entries[0].upstream_status, Some(404));
+        assert_eq!(entries[0].error, None);
     }
 
     #[tokio::test]
     async fn nix_cache_route_rejects_oversized_upstream_metadata() {
         let upstream = MockServer::start().await;
+        let state = make_broker_state(&upstream);
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+        open_audit_session(&state, session.session_id());
         Mock::given(method("GET"))
             .and(path("/nix-cache-info"))
             .respond_with(ResponseTemplate::new(200).set_body_string("123456"))
             .expect(1)
             .mount(&upstream)
             .await;
-        let service = nix_cache_service_for_test(&upstream, 5);
+        let service = nix_cache_service_for_test(&state, &upstream, 5);
 
         let response =
-            route_nix_cache_with_service("GET", VM_NIX_CACHE_INFO_PATH.into(), service).await;
+            route_nix_cache_with_service(&session, "GET", VM_NIX_CACHE_INFO_PATH.into(), service)
+                .await;
 
         assert_eq!(response.status, VmHttpStatus::BadGateway);
+        let entries = state
+            .audit
+            .list_nix_cache_requests_for_session(session.session_id())
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].http_status, Some(502));
+        assert_eq!(entries[0].upstream_status, Some(200));
+        assert_eq!(
+            entries[0].error.as_deref(),
+            Some("upstream response too large")
+        );
+    }
+
+    #[tokio::test]
+    async fn nix_cache_route_audits_unsupported_upstream_status() {
+        let upstream = MockServer::start().await;
+        let state = make_broker_state(&upstream);
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+        open_audit_session(&state, session.session_id());
+        Mock::given(method("GET"))
+            .and(path("/nix-cache-info"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("backend detail"))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+        let service = nix_cache_service_for_test(&state, &upstream, 1024);
+
+        let response =
+            route_nix_cache_with_service(&session, "GET", VM_NIX_CACHE_INFO_PATH.into(), service)
+                .await;
+
+        assert_eq!(response.status, VmHttpStatus::BadGateway);
+        let entries = state
+            .audit
+            .list_nix_cache_requests_for_session(session.session_id())
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].http_status, Some(502));
+        assert_eq!(entries[0].upstream_status, Some(500));
+        assert_eq!(
+            entries[0].error.as_deref(),
+            Some("unsupported upstream status")
+        );
     }
 
     #[tokio::test]
     async fn nix_cache_route_rejects_non_get_head_without_contacting_upstream() {
         let upstream = MockServer::start().await;
-        let service = nix_cache_service_for_test(&upstream, 1024);
+        let state = make_broker_state(&upstream);
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+        open_audit_session(&state, session.session_id());
+        let service = nix_cache_service_for_test(&state, &upstream, 1024);
 
         let response =
-            route_nix_cache_with_service("POST", VM_NIX_CACHE_INFO_PATH.into(), service).await;
+            route_nix_cache_with_service(&session, "POST", VM_NIX_CACHE_INFO_PATH.into(), service)
+                .await;
 
         assert_eq!(response.status, VmHttpStatus::MethodNotAllowed);
         upstream.verify().await;
+        let entries = state
+            .audit
+            .list_nix_cache_requests_for_session(session.session_id())
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].route, NixCacheAuditRoute::CacheInfo);
+        assert_eq!(entries[0].http_status, Some(405));
+        assert_eq!(entries[0].upstream_url, None);
+    }
+
+    #[tokio::test]
+    async fn nix_cache_auth_denial_is_audited_without_contacting_upstream() {
+        let upstream = MockServer::start().await;
+        let state = make_broker_state(&upstream);
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+        open_audit_session(&state, session.session_id());
+        let service = nix_cache_service_for_test(&state, &upstream, 1024);
+        let raw_head = format!("GET {VM_NIX_CACHE_INFO_PATH} HTTP/1.1\r\n\r\n").into_bytes();
+        let mut stream = tokio::io::empty();
+
+        let response = dispatch_vm_http_head_and_body(
+            &session,
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 12345)),
+            VmHttpHeadRead {
+                raw_head,
+                buffered_body: Vec::new(),
+            },
+            &mut stream,
+            None::<VmHttpGitCloneService<Box<dyn SecretStore>>>,
+            Some(service),
+            VM_HTTP_READ_TIMEOUT,
+        )
+        .await;
+
+        assert_eq!(response.status, VmHttpStatus::Unauthorized);
+        upstream.verify().await;
+        let entries = state
+            .audit
+            .list_nix_cache_requests_for_session(session.session_id())
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].decision,
+            NixCacheAuditDecision::Deny {
+                reason: "missing credentials".into()
+            }
+        );
+        assert_eq!(entries[0].route, NixCacheAuditRoute::CacheInfo);
+        assert_eq!(entries[0].http_status, Some(401));
+        assert_eq!(entries[0].upstream_url, None);
     }
 
     #[test]
@@ -3284,7 +3687,7 @@ work_root=${{work_dir%/*}}
             bound.into_listener(),
             session.clone(),
             service,
-            VmHttpNixCacheService::new(nix_cache_config_for_test()),
+            VmHttpNixCacheService::new(Arc::clone(&state), nix_cache_config_for_test()),
             shutdown_rx,
         ));
 

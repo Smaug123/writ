@@ -1,7 +1,8 @@
 # Audit log
 
-Every session, every request, every grant, and every mint failure is
-written to a SQLite database. By default it lives at
+Every session, every capability request, every grant, every mint
+failure, and every brokered VM Nix cache request is written to a
+SQLite database. By default it lives at
 `$XDG_DATA_HOME/writ/audit.db`. The log is append-only: nothing is
 updated except `session.closed_at`.
 
@@ -42,6 +43,31 @@ CREATE TABLE mint_failure (
   failed_at    INTEGER NOT NULL,
   failure_json TEXT NOT NULL
 );
+
+CREATE TABLE nix_cache_request (
+  request_id   TEXT PRIMARY KEY,
+  session_id   TEXT NOT NULL REFERENCES session(session_id),
+  received_at  INTEGER NOT NULL,
+  method       TEXT NOT NULL,
+  target       TEXT NOT NULL,
+  route        TEXT NOT NULL CHECK (route IN ('cache_info', 'narinfo', 'unsupported')),
+  decision     TEXT NOT NULL CHECK (decision IN ('allow', 'deny')),
+  deny_reason  TEXT,
+  CHECK (
+    (decision = 'allow' AND deny_reason IS NULL)
+    OR (decision = 'deny' AND deny_reason IS NOT NULL AND deny_reason != '')
+  )
+);
+
+CREATE TABLE nix_cache_outcome (
+  request_id      TEXT PRIMARY KEY REFERENCES nix_cache_request(request_id),
+  completed_at    INTEGER NOT NULL,
+  http_status     INTEGER NOT NULL CHECK (http_status BETWEEN 100 AND 599),
+  upstream_url    TEXT,
+  upstream_status INTEGER CHECK (upstream_status BETWEEN 100 AND 599),
+  response_bytes  INTEGER NOT NULL CHECK (response_bytes >= 0),
+  error           TEXT CHECK (error IS NULL OR error != '')
+);
 ```
 
 A few invariants worth knowing:
@@ -56,6 +82,16 @@ A few invariants worth knowing:
 - **A request has at most one outcome.** Triggers enforce that a given
   `request_id` appears in *either* `grant_log` *or* `mint_failure`,
   never both.
+- **Nix cache requests use their own request/outcome pair.**
+  `nix_cache_request` commits before the broker contacts the upstream
+  binary cache. `nix_cache_outcome` records the broker HTTP status,
+  optional upstream URL/status, response byte count, and a bounded
+  error label. A crash between those two commits leaves a Nix cache
+  request with no outcome.
+- **Nix cache auth denials are audited without upstream contact.**
+  They appear as `decision = 'deny'` with a `deny_reason`, no
+  upstream URL/status, and the HTTP status returned to the VM in
+  `nix_cache_outcome`.
 - **The token itself is never stored.** Only the metadata that proves
   it was issued — the `jti` (a UUID the broker generates), the
   `scope_json`, and timestamps.
@@ -127,6 +163,30 @@ LIMIT 10;
 The `failure_json` includes GitHub's response body when the mint failed
 because of an HTTP error.
 
+### VM Nix cache activity
+
+```sql
+SELECT
+  datetime(r.received_at/1000, 'unixepoch') AS received,
+  r.method,
+  r.target,
+  r.route,
+  r.decision,
+  r.deny_reason,
+  o.http_status,
+  o.upstream_status,
+  o.response_bytes,
+  o.error
+FROM nix_cache_request r
+LEFT JOIN nix_cache_outcome o USING (request_id)
+WHERE r.session_id = '00000000-0000-0000-0000-...'
+ORDER BY r.received_at DESC;
+```
+
+For auth denials, `decision` is `deny` and `deny_reason` names the
+transport failure. For upstream cache misses, `decision` is `allow`,
+`http_status` is `404`, and `upstream_status` is usually `404`.
+
 ### Requests in flight at crash time
 
 ```sql
@@ -138,6 +198,18 @@ WHERE NOT EXISTS (SELECT 1 FROM grant_log    WHERE request_id = request.request_
 
 If this returns rows during normal operation, look at the daemon log
 to see if it crashed. Empty during steady state.
+
+For brokered Nix cache requests, use the matching query:
+
+```sql
+SELECT request_id, session_id, received_at, method, target, route, decision
+FROM nix_cache_request
+WHERE NOT EXISTS (
+  SELECT 1
+  FROM nix_cache_outcome
+  WHERE request_id = nix_cache_request.request_id
+);
+```
 
 ### Sessions still open
 

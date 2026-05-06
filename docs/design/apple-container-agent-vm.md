@@ -203,9 +203,9 @@ First VM HTTP transport slice implemented in `src/vm_http.rs`:
   HTTP listener with a `VmHttpGitCloneService`; Nix, model, and signing
   operations remain deliberately unexposed until their host-side policy and
   audit semantics are designed. Authentication denials are returned as HTTP
-  `401`/`403` today; durable audit rows for those denials still need a
-  dedicated audit event shape, because they are transport-auth failures rather
-  than capability requests.
+  `401`/`403`; routes that are not ordinary capability mints need their own
+  durable audit shapes because transport-auth failures are not GitHub
+  capability requests.
 
 ## Host-side filtering
 
@@ -881,13 +881,34 @@ First brokered Nix metadata proxy slice implemented in `src/vm_http.rs`,
   404s, unsupported upstream statuses become 502s, and non-cache paths still
   fail closed before reaching the upstream;
 - this remains a metadata-only proxy. NAR content streaming, signature/content
-  verification, cache-host allow-lists beyond the configured base URL, and
-  audit rows per Nix fetch are still separate slices;
+  verification, and cache-host allow-lists beyond the configured base URL are
+  still separate slices;
 - the daemon proof harness now starts a local fake upstream binary cache and
   verifies that guest Nix causes the daemon to fetch both `nix-cache-info` and
   the target `.narinfo` from that upstream. The VM still observes a controlled
   cache miss for the proof store path, but the miss is now through the proxy
   rather than through a local skeleton response.
+
+First brokered Nix cache audit slice implemented in `src/audit.rs` and
+`src/vm_http.rs`:
+
+- audit schema version 2 adds `nix_cache_request` and `nix_cache_outcome`.
+  The request row records the session, method, target, classified route
+  (`nix-cache-info`, `.narinfo`, or unsupported), and allow/deny decision.
+  The outcome row records the broker HTTP status, optional upstream URL and
+  upstream status, response byte count, and a bounded error label;
+- the VM HTTP Nix cache route writes the request row before contacting the
+  upstream cache. If that write fails, the route fails closed with `500`
+  instead of making an unaudited upstream request. The outcome row is written
+  before a proxied response is returned to the VM, so success, controlled
+  misses, unsupported upstream statuses, and response-size failures all have
+  durable outcomes;
+- Basic-auth denials for Nix cache paths are also audited without contacting
+  the upstream. This gives transport-auth failures their own audit shape
+  instead of trying to encode them as GitHub capability requests;
+- unit tests cover the schema migration, closed/missing-session rejection,
+  orphan-outcome rejection, success, controlled miss, local method rejection,
+  auth denial, oversized metadata, and unsupported upstream status audit rows.
 
 ## Tests and proof spikes
 
