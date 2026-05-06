@@ -1026,10 +1026,46 @@ First broker-side Nix `.narinfo` signature-verification slice implemented in
   malformed `NarSize`, and malformed `References` fail closed as audited
   `502`s with bounded static labels. `HEAD` remains an existence-only upstream
   check;
-- Nix signatures do not cover the `URL` field, so the earlier broker URL
-  admission rule remains load-bearing: a signed `.narinfo` can only direct the
-  VM to a single broker-admitted `nar/<safe-filename>` route. NAR body hash
-  verification against signed `NarHash` remains the next hardening slice.
+- Nix signatures do not cover the `URL` or `Compression` fields, so the
+  earlier broker URL admission rule remains load-bearing and the body slice
+  below admits on the tuple `(URL, Compression, NarHash, NarSize)`: a signed
+  `.narinfo` can only direct the VM to a single broker-admitted
+  `nar/<safe-filename>` route with one explicit compression/hash/size contract.
+
+First broker-side Nix NAR body-verification slice implemented in
+`src/nix_cache.rs` and `src/vm_http.rs`:
+
+- signed `.narinfo` admission now also parses `Compression` and records an
+  in-memory per-session admission for the exact `nar/<safe-filename>` together
+  with the signed `NarHash`, `NarSize`, and compression mode. The admission map
+  is intentionally per-session-lifetime and unbounded because entries are small
+  and eviction would make a valid NAR follow-up request order-dependent.
+  Admission fails closed if signed `NarSize` exceeds the configured
+  `nix_cache_max_nar_bytes`, if `NarHash` is not a broker-verifiable SHA-256
+  digest, or if a later signed `.narinfo` tries to reuse the same NAR filename
+  with different compression/hash/size metadata. Two store paths may point to
+  the same NAR filename only when that body metadata is identical;
+- authenticated `GET`/`HEAD /v1/nix/cache/nar/<file>` now requires that prior
+  signed admission before contacting the upstream cache. This closes the
+  direct-NAR path where a VM could request a safe-looking NAR filename that no
+  signed metadata had authorized;
+- successful NAR `GET` is now buffered up to `nix_cache_max_nar_bytes`, decoded
+  for supported compression modes (`xz` and `none`), checked against signed
+  `NarSize`, and hashed with SHA-256 before the broker returns `200` to the VM.
+  XZ decoding runs on Tokio's blocking pool with an explicit liblzma memlimit
+  of `nix_cache_max_nar_bytes + 16 MiB`; peak broker memory is bounded by the
+  compressed body, signed `NarSize`, and that decoder-state budget.
+  Decompression failure, decoded-size mismatch, task failure, and hash mismatch
+  all become audited `502`s. This trades streaming for correctness: the broker
+  no longer sends success headers before it knows the body matches the signed
+  metadata. The proxied `Content-Type` remains `application/x-nix-nar` for both
+  raw and compressed NAR bytes, matching binary-cache practice; Nix uses the
+  narinfo URL/compression metadata to interpret the body;
+- NAR `HEAD` remains an existence/length check because it has no body to hash,
+  but it still requires prior signed admission and a bounded upstream
+  `Content-Length`. Guest Nix still performs its own signature/content checks;
+  the broker-side check is a defense-in-depth boundary that prevents a buggy or
+  malicious upstream from delivering bytes that contradict admitted metadata.
 
 ## Tests and proof spikes
 

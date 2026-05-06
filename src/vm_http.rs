@@ -4,9 +4,11 @@
 //! endpoint authenticates one managed agent VM session with a bearer secret and
 //! a source-subnet check, then exposes only VM-safe broker operations.
 
+use std::collections::HashMap;
+use std::io::Read as _;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -24,7 +26,8 @@ use crate::core::{
     RequestId, SessionId, UnixMillis,
 };
 use crate::nix_cache::{
-    NixCacheNarFileName, NixNarInfoError, NixStoreHashPart, NixTrustedPublicKeys,
+    NixCacheNarFileName, NixNarBodyHashError, NixNarCompression, NixNarHash, NixNarInfo,
+    NixNarInfoError, NixNarSize, NixStoreHashPart, NixTrustedPublicKeys,
     parse_signed_narinfo_for_store_hash,
 };
 use crate::secret::SecretStore;
@@ -47,6 +50,7 @@ const MAX_VM_HTTP_CONNECTIONS: usize = 256;
 pub const VM_NIX_CACHE_PATH_PREFIX: &str = "/v1/nix/cache";
 const VM_NIX_CACHE_INFO_PATH: &str = "/v1/nix/cache/nix-cache-info";
 pub const VM_NIX_BASIC_LOGIN: &str = "writ-vm";
+const XZ_DECODER_MEMLIMIT_OVERHEAD: u64 = 16 * 1024 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VmHttpSession {
@@ -82,6 +86,11 @@ pub struct VmHttpNixCacheService<S: SecretStore> {
     broker_state: Arc<BrokerState<S>>,
     config: VmHttpNixCacheConfig,
     client: reqwest::Client,
+    // This service is constructed once per prepared VM HTTP session. Admission
+    // state is intentionally kept for that session runtime lifetime. Entries
+    // are small, and eviction would risk turning a valid NAR follow-up request
+    // into an order-dependent cache miss.
+    admitted_nars: Arc<Mutex<HashMap<NixCacheNarFileName, VmHttpNixCacheAdmittedNar>>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -250,7 +259,7 @@ enum VmHttpAuthScheme {
 enum VmNixCacheRoute {
     CacheInfo,
     NarInfo { hash: NixStoreHashPart },
-    Nar { file: String },
+    Nar { file: NixCacheNarFileName },
 }
 
 #[derive(Debug)]
@@ -262,30 +271,23 @@ struct VmHttpNixCacheProxyFetch {
     error: Option<&'static str>,
 }
 
-struct VmHttpNixCacheNarStream<S: SecretStore> {
-    service: VmHttpNixCacheService<S>,
-    request_id: RequestId,
-    upstream_url: String,
-    upstream_status: u16,
-    content_length: u64,
-    response: reqwest::Response,
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct VmHttpNixCacheAdmittedNar {
+    file: NixCacheNarFileName,
+    compression: NixNarCompression,
+    nar_hash: NixNarHash,
+    nar_size: NixNarSize,
 }
 
-enum VmHttpDispatch<S: SecretStore> {
+enum VmHttpDispatch {
     Buffered(VmHttpResponse),
-    NarStream(Box<VmHttpNixCacheNarStream<S>>),
-}
-
-enum VmHttpNixCacheRouteFetch<S: SecretStore> {
-    Buffered(VmHttpNixCacheProxyFetch),
-    NarStream(Box<VmHttpNixCacheNarStream<S>>),
 }
 
 #[derive(Debug, thiserror::Error)]
 enum VmHttpNixCacheBodyReadError {
-    #[error("Nix cache upstream body read failed: {0}")]
+    #[error("Nix cache upstream response body read failed: {0}")]
     Request(#[from] reqwest::Error),
-    #[error("Nix cache upstream metadata response exceeds {max} bytes")]
+    #[error("Nix cache upstream response exceeds {max} bytes")]
     ResponseTooLarge { max: u64 },
 }
 
@@ -293,6 +295,33 @@ enum VmHttpNixCacheBodyReadError {
 enum VmHttpNixCacheNarLengthError {
     Missing,
     TooLarge { max: u64, actual: u64 },
+}
+
+#[derive(Debug, thiserror::Error, Eq, PartialEq)]
+enum VmHttpNixCacheNarAdmissionError {
+    #[error("signed narinfo NarSize {actual} exceeds configured max {max}")]
+    NarSizeTooLarge { max: u64, actual: u64 },
+    #[error("signed narinfo NarHash cannot be verified by the broker: {source}")]
+    InvalidNarHash { source: NixNarBodyHashError },
+    #[error("signed narinfo conflicts with earlier metadata for NAR {file}")]
+    ConflictingNarFile { file: NixCacheNarFileName },
+}
+
+#[derive(Debug, thiserror::Error, Eq, PartialEq)]
+enum VmHttpNixCacheNarVerifyError {
+    #[error("NAR verification task failed: {message}")]
+    VerifierTask { message: String },
+    #[error("compressed NAR body could not be decoded: {message}")]
+    Decode { message: String },
+    #[error("decoded NAR size {actual} does not match signed NarSize {expected}")]
+    SizeMismatch { expected: u64, actual: u64 },
+    #[error("NAR body hash is invalid: {0}")]
+    Hash(#[from] NixNarBodyHashError),
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum VmHttpNixCacheNarBodyLengthError {
+    Mismatch { expected: u64, actual: u64 },
 }
 
 impl VmHttpSession {
@@ -411,6 +440,7 @@ impl<S: SecretStore> VmHttpNixCacheService<S> {
             broker_state,
             config,
             client: reqwest::Client::new(),
+            admitted_nars: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
@@ -421,6 +451,7 @@ impl<S: SecretStore> Clone for VmHttpNixCacheService<S> {
             broker_state: Arc::clone(&self.broker_state),
             config: self.config.clone(),
             client: self.client.clone(),
+            admitted_nars: Arc::clone(&self.admitted_nars),
         }
     }
 }
@@ -997,7 +1028,7 @@ async fn dispatch_vm_http_head_and_body<S, R>(
     git_clone: Option<VmHttpGitCloneService<S>>,
     nix_cache: Option<VmHttpNixCacheService<S>>,
     read_timeout: std::time::Duration,
-) -> VmHttpDispatch<S>
+) -> VmHttpDispatch
 where
     S: SecretStore + Send + Sync,
     R: AsyncRead + Unpin,
@@ -1076,7 +1107,7 @@ async fn route_authenticated_vm_http_request<S, R>(
     git_clone: Option<VmHttpGitCloneService<S>>,
     nix_cache: Option<VmHttpNixCacheService<S>>,
     read_timeout: std::time::Duration,
-) -> VmHttpDispatch<S>
+) -> VmHttpDispatch
 where
     S: SecretStore + Send + Sync,
     R: AsyncRead + Unpin,
@@ -1115,7 +1146,7 @@ async fn route_nix_cache_request<S: SecretStore>(
     session: &VmHttpSession,
     request: &VmHttpRequest,
     service: Option<VmHttpNixCacheService<S>>,
-) -> VmHttpDispatch<S> {
+) -> VmHttpDispatch {
     let Some(service) = service else {
         return route_nix_cache_request_without_upstream(request).into();
     };
@@ -1159,23 +1190,13 @@ async fn route_nix_cache_request<S: SecretStore>(
             .into();
     }
 
-    let fetch = service
-        .fetch_route(request.method.as_str(), &route, request_id)
-        .await;
-    match fetch {
-        VmHttpNixCacheRouteFetch::Buffered(fetch) => {
-            if let Err(err) = record_nix_cache_outcome(&service, request_id, &fetch) {
-                eprintln!("VM HTTP Nix cache audit outcome write failed: {err}");
-                return VmHttpResponse::text(
-                    VmHttpStatus::InternalServerError,
-                    "audit write failed",
-                )
-                .into();
-            }
-            fetch.response.into()
-        }
-        VmHttpNixCacheRouteFetch::NarStream(stream) => VmHttpDispatch::NarStream(stream),
+    let fetch = service.fetch_route(request.method.as_str(), &route).await;
+    if let Err(err) = record_nix_cache_outcome(&service, request_id, &fetch) {
+        eprintln!("VM HTTP Nix cache audit outcome write failed: {err}");
+        return VmHttpResponse::text(VmHttpStatus::InternalServerError, "audit write failed")
+            .into();
     }
+    fetch.response.into()
 }
 
 fn record_nix_cache_local_response<S: SecretStore>(
@@ -1302,17 +1323,12 @@ fn route_nix_cache_request_without_upstream(request: &VmHttpRequest) -> VmHttpRe
 }
 
 impl<S: SecretStore> VmHttpNixCacheService<S> {
-    async fn fetch_route(
-        &self,
-        method: &str,
-        route: &VmNixCacheRoute,
-        request_id: RequestId,
-    ) -> VmHttpNixCacheRouteFetch<S> {
+    async fn fetch_route(&self, method: &str, route: &VmNixCacheRoute) -> VmHttpNixCacheProxyFetch {
         match route {
             VmNixCacheRoute::CacheInfo | VmNixCacheRoute::NarInfo { .. } => {
-                VmHttpNixCacheRouteFetch::Buffered(self.fetch_metadata(method, route).await)
+                self.fetch_metadata(method, route).await
             }
-            VmNixCacheRoute::Nar { .. } => self.fetch_nar(method, route, request_id).await,
+            VmNixCacheRoute::Nar { .. } => self.fetch_nar(method, route).await,
         }
     }
 
@@ -1393,39 +1409,55 @@ impl<S: SecretStore> VmHttpNixCacheService<S> {
                 response,
             };
         }
-        let body =
-            match read_upstream_metadata_body_bounded(response, self.config.max_metadata_bytes)
-                .await
-            {
-                Ok(body) => body,
+        let body = match read_upstream_body_bounded(response, self.config.max_metadata_bytes).await
+        {
+            Ok(body) => body,
+            Err(err) => {
+                eprintln!("VM HTTP Nix cache upstream body read failed: {err}");
+                let response =
+                    VmHttpResponse::text(VmHttpStatus::BadGateway, "nix cache upstream failed");
+                return VmHttpNixCacheProxyFetch {
+                    upstream_url,
+                    upstream_status: Some(upstream_status.as_u16()),
+                    response_bytes: response.body.len() as u64,
+                    error: Some(err.audit_error_label()),
+                    response,
+                };
+            }
+        };
+        if let VmNixCacheRoute::NarInfo { hash } = route {
+            let narinfo = match parse_signed_narinfo_for_store_hash(
+                &body,
+                hash,
+                self.config.trusted_public_keys(),
+            ) {
+                Ok(narinfo) => narinfo,
                 Err(err) => {
-                    eprintln!("VM HTTP Nix cache upstream body read failed: {err}");
+                    eprintln!("VM HTTP Nix cache upstream narinfo was rejected: {err}");
+                    let error = narinfo_audit_error_label(&err);
                     let response =
                         VmHttpResponse::text(VmHttpStatus::BadGateway, "nix cache upstream failed");
                     return VmHttpNixCacheProxyFetch {
                         upstream_url,
                         upstream_status: Some(upstream_status.as_u16()),
                         response_bytes: response.body.len() as u64,
-                        error: Some(err.audit_error_label()),
+                        error: Some(error),
                         response,
                     };
                 }
             };
-        if let VmNixCacheRoute::NarInfo { hash } = route
-            && let Err(err) =
-                parse_signed_narinfo_for_store_hash(&body, hash, self.config.trusted_public_keys())
-        {
-            eprintln!("VM HTTP Nix cache upstream narinfo was rejected: {err}");
-            let error = narinfo_audit_error_label(&err);
-            let response =
-                VmHttpResponse::text(VmHttpStatus::BadGateway, "nix cache upstream failed");
-            return VmHttpNixCacheProxyFetch {
-                upstream_url,
-                upstream_status: Some(upstream_status.as_u16()),
-                response_bytes: response.body.len() as u64,
-                error: Some(error),
-                response,
-            };
+            if let Err(err) = self.admit_narinfo(&narinfo) {
+                eprintln!("VM HTTP Nix cache upstream narinfo admission failed: {err}");
+                let response =
+                    VmHttpResponse::text(VmHttpStatus::BadGateway, "nix cache upstream failed");
+                return VmHttpNixCacheProxyFetch {
+                    upstream_url,
+                    upstream_status: Some(upstream_status.as_u16()),
+                    response_bytes: response.body.len() as u64,
+                    error: Some(err.audit_error_label()),
+                    response,
+                };
+            }
         }
         let response_bytes = body.len() as u64;
         VmHttpNixCacheProxyFetch {
@@ -1443,12 +1475,21 @@ impl<S: SecretStore> VmHttpNixCacheService<S> {
         }
     }
 
-    async fn fetch_nar(
-        &self,
-        method: &str,
-        route: &VmNixCacheRoute,
-        request_id: RequestId,
-    ) -> VmHttpNixCacheRouteFetch<S> {
+    async fn fetch_nar(&self, method: &str, route: &VmNixCacheRoute) -> VmHttpNixCacheProxyFetch {
+        let VmNixCacheRoute::Nar { file } = route else {
+            unreachable!("caller dispatches only NAR routes to fetch_nar");
+        };
+        let Some(admission) = self.admitted_nar(file) else {
+            let response =
+                VmHttpResponse::text(VmHttpStatus::BadGateway, "nix cache upstream failed");
+            return VmHttpNixCacheProxyFetch {
+                upstream_url: String::new(),
+                upstream_status: None,
+                response_bytes: response.body.len() as u64,
+                error: Some("unadmitted upstream nar"),
+                response,
+            };
+        };
         let url = self.upstream_url(route);
         let upstream_url = url.to_string();
         let is_head = method == "HEAD";
@@ -1463,25 +1504,25 @@ impl<S: SecretStore> VmHttpNixCacheService<S> {
                 eprintln!("VM HTTP Nix cache NAR upstream request failed: {err}");
                 let response =
                     VmHttpResponse::text(VmHttpStatus::BadGateway, "nix cache upstream failed");
-                return VmHttpNixCacheRouteFetch::Buffered(VmHttpNixCacheProxyFetch {
+                return VmHttpNixCacheProxyFetch {
                     upstream_url,
                     upstream_status: None,
                     response_bytes: response.body.len() as u64,
                     error: Some("upstream request failed"),
                     response,
-                });
+                };
             }
         };
         let upstream_status = response.status();
         if upstream_status == reqwest::StatusCode::NOT_FOUND {
             let response = VmHttpResponse::text(VmHttpStatus::NotFound, "not found");
-            return VmHttpNixCacheRouteFetch::Buffered(VmHttpNixCacheProxyFetch {
+            return VmHttpNixCacheProxyFetch {
                 upstream_url,
                 upstream_status: Some(404),
                 response_bytes: response.body.len() as u64,
                 error: None,
                 response,
-            });
+            };
         }
         if upstream_status != reqwest::StatusCode::OK {
             eprintln!("VM HTTP Nix cache NAR upstream returned status {upstream_status}");
@@ -1489,13 +1530,13 @@ impl<S: SecretStore> VmHttpNixCacheService<S> {
                 VmHttpStatus::BadGateway,
                 "nix cache upstream returned unsupported status",
             );
-            return VmHttpNixCacheRouteFetch::Buffered(VmHttpNixCacheProxyFetch {
+            return VmHttpNixCacheProxyFetch {
                 upstream_url,
                 upstream_status: Some(upstream_status.as_u16()),
                 response_bytes: response.body.len() as u64,
                 error: Some("unsupported upstream status"),
                 response,
-            });
+            };
         }
 
         let content_length = match validate_nar_content_length(
@@ -1506,13 +1547,13 @@ impl<S: SecretStore> VmHttpNixCacheService<S> {
             Err(error) => {
                 let response =
                     VmHttpResponse::text(VmHttpStatus::BadGateway, "nix cache upstream failed");
-                return VmHttpNixCacheRouteFetch::Buffered(VmHttpNixCacheProxyFetch {
+                return VmHttpNixCacheProxyFetch {
                     upstream_url,
                     upstream_status: Some(upstream_status.as_u16()),
                     response_bytes: response.body.len() as u64,
                     error: Some(error.audit_error_label()),
                     response,
-                });
+                };
             }
         };
 
@@ -1524,23 +1565,76 @@ impl<S: SecretStore> VmHttpNixCacheService<S> {
                 content_length: Some(content_length),
                 www_authenticate: None,
             };
-            return VmHttpNixCacheRouteFetch::Buffered(VmHttpNixCacheProxyFetch {
+            return VmHttpNixCacheProxyFetch {
                 upstream_url,
                 upstream_status: Some(200),
                 response_bytes: 0,
                 error: None,
                 response,
-            });
+            };
         }
 
-        VmHttpNixCacheRouteFetch::NarStream(Box::new(VmHttpNixCacheNarStream {
-            service: self.clone(),
-            request_id,
+        let body = match read_upstream_body_bounded(response, self.config.max_nar_bytes).await {
+            Ok(body) => body,
+            Err(err) => {
+                eprintln!("VM HTTP Nix cache NAR upstream body read failed: {err}");
+                let response =
+                    VmHttpResponse::text(VmHttpStatus::BadGateway, "nix cache upstream failed");
+                return VmHttpNixCacheProxyFetch {
+                    upstream_url,
+                    upstream_status: Some(upstream_status.as_u16()),
+                    response_bytes: response.body.len() as u64,
+                    error: Some(err.audit_error_label()),
+                    response,
+                };
+            }
+        };
+        if let Err(err) = validate_nar_body_length(body.len() as u64, content_length) {
+            let response =
+                VmHttpResponse::text(VmHttpStatus::BadGateway, "nix cache upstream failed");
+            return VmHttpNixCacheProxyFetch {
+                upstream_url,
+                upstream_status: Some(upstream_status.as_u16()),
+                response_bytes: body.len() as u64,
+                error: Some(err.audit_error_label()),
+                response,
+            };
+        }
+        let response_bytes = body.len() as u64;
+        let body =
+            match verify_nar_body_on_blocking_thread(admission, body, self.config.max_nar_bytes)
+                .await
+            {
+                Ok(body) => body,
+                Err(err) => {
+                    eprintln!("VM HTTP Nix cache NAR body was rejected: {err}");
+                    let response =
+                        VmHttpResponse::text(VmHttpStatus::BadGateway, "nix cache upstream failed");
+                    return VmHttpNixCacheProxyFetch {
+                        upstream_url,
+                        upstream_status: Some(upstream_status.as_u16()),
+                        response_bytes,
+                        error: Some(err.audit_error_label()),
+                        response,
+                    };
+                }
+            };
+        VmHttpNixCacheProxyFetch {
             upstream_url,
-            upstream_status: upstream_status.as_u16(),
-            content_length,
-            response,
-        }))
+            upstream_status: Some(200),
+            response_bytes,
+            error: None,
+            response: VmHttpResponse {
+                status: VmHttpStatus::Ok,
+                // Nix takes the compression contract from the admitted
+                // narinfo URL/Compression metadata. Binary caches commonly use
+                // this content type for both raw and compressed NAR payloads.
+                content_type: "application/x-nix-nar",
+                body,
+                content_length: Some(content_length),
+                www_authenticate: None,
+            },
+        }
     }
 
     fn upstream_url(&self, route: &VmNixCacheRoute) -> reqwest::Url {
@@ -1554,6 +1648,41 @@ impl<S: SecretStore> VmHttpNixCacheService<S> {
             .join(&path)
             .expect("Nix cache route paths are URL-safe relative paths")
     }
+
+    fn admit_narinfo(&self, narinfo: &NixNarInfo) -> Result<(), VmHttpNixCacheNarAdmissionError> {
+        let admission = VmHttpNixCacheAdmittedNar::from_narinfo(narinfo);
+        let actual = admission.nar_size.get();
+        let max = self.config.max_nar_bytes;
+        if actual > max {
+            return Err(VmHttpNixCacheNarAdmissionError::NarSizeTooLarge { max, actual });
+        }
+        admission
+            .nar_hash
+            .validate_sha256_body_hash_shape()
+            .map_err(|source| VmHttpNixCacheNarAdmissionError::InvalidNarHash { source })?;
+
+        let mut admitted_nars = self
+            .admitted_nars
+            .lock()
+            .expect("Nix cache admission lock should not be poisoned");
+        if let Some(existing) = admitted_nars.get(&admission.file)
+            && existing != &admission
+        {
+            return Err(VmHttpNixCacheNarAdmissionError::ConflictingNarFile {
+                file: admission.file,
+            });
+        }
+        admitted_nars.insert(admission.file.clone(), admission);
+        Ok(())
+    }
+
+    fn admitted_nar(&self, file: &NixCacheNarFileName) -> Option<VmHttpNixCacheAdmittedNar> {
+        self.admitted_nars
+            .lock()
+            .expect("Nix cache admission lock should not be poisoned")
+            .get(file)
+            .cloned()
+    }
 }
 
 fn upstream_content_length(response: &reqwest::Response) -> Option<u64> {
@@ -1566,13 +1695,16 @@ fn upstream_content_length(response: &reqwest::Response) -> Option<u64> {
         .ok()
 }
 
-async fn read_upstream_metadata_body_bounded(
+async fn read_upstream_body_bounded(
     mut response: reqwest::Response,
     max: u64,
 ) -> Result<Vec<u8>, VmHttpNixCacheBodyReadError> {
     let mut body = Vec::new();
     while let Some(chunk) = response.chunk().await? {
-        let new_len = body.len() as u64 + chunk.len() as u64;
+        let chunk_len = u64::try_from(chunk.len()).expect("HTTP chunk length fits in u64");
+        let new_len = (body.len() as u64)
+            .checked_add(chunk_len)
+            .expect("HTTP response byte count overflowed before configured bound check");
         if new_len > max {
             return Err(VmHttpNixCacheBodyReadError::ResponseTooLarge { max });
         }
@@ -1606,12 +1738,168 @@ fn validate_nar_content_length(
     Ok(content_length)
 }
 
+fn validate_nar_body_length(
+    actual: u64,
+    expected: u64,
+) -> Result<(), VmHttpNixCacheNarBodyLengthError> {
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(VmHttpNixCacheNarBodyLengthError::Mismatch { expected, actual })
+    }
+}
+
 impl VmHttpNixCacheNarLengthError {
     fn audit_error_label(self) -> &'static str {
         match self {
             Self::Missing => "upstream nar content length missing",
             Self::TooLarge { .. } => "upstream nar response too large",
         }
+    }
+}
+
+impl VmHttpNixCacheNarBodyLengthError {
+    fn audit_error_label(self) -> &'static str {
+        match self {
+            Self::Mismatch { .. } => "upstream nar content length mismatch",
+        }
+    }
+}
+
+impl VmHttpNixCacheNarAdmissionError {
+    fn audit_error_label(&self) -> &'static str {
+        match self {
+            Self::NarSizeTooLarge { .. } => "upstream narinfo NarSize too large",
+            Self::ConflictingNarFile { .. } => "conflicting upstream narinfo metadata",
+            Self::InvalidNarHash { source } => nar_body_hash_error_label(source),
+        }
+    }
+}
+
+impl VmHttpNixCacheAdmittedNar {
+    fn from_narinfo(narinfo: &NixNarInfo) -> Self {
+        Self {
+            file: narinfo.nar_file().clone(),
+            compression: narinfo.compression(),
+            nar_hash: narinfo.nar_hash().clone(),
+            nar_size: narinfo.nar_size(),
+        }
+    }
+}
+
+async fn verify_nar_body_on_blocking_thread(
+    admission: VmHttpNixCacheAdmittedNar,
+    body: Vec<u8>,
+    max_nar_bytes: u64,
+) -> Result<Vec<u8>, VmHttpNixCacheNarVerifyError> {
+    tokio::task::spawn_blocking(move || {
+        verify_nar_body(&admission, &body, max_nar_bytes)?;
+        Ok(body)
+    })
+    .await
+    .map_err(|err| VmHttpNixCacheNarVerifyError::VerifierTask {
+        message: err.to_string(),
+    })?
+}
+
+fn verify_nar_body(
+    admission: &VmHttpNixCacheAdmittedNar,
+    body: &[u8],
+    max_nar_bytes: u64,
+) -> Result<(), VmHttpNixCacheNarVerifyError> {
+    match admission.compression {
+        NixNarCompression::None => verify_raw_nar_body(admission, body),
+        NixNarCompression::Xz => {
+            // Peak memory is bounded by compressed Content-Length plus signed
+            // NarSize plus the explicit decoder-state memlimit below;
+            // decompression runs on the blocking pool because xz is
+            // synchronous and can be CPU-heavy on hostile input.
+            let raw_body = decode_xz_nar_body(body, admission.nar_size.get(), max_nar_bytes)?;
+            verify_raw_nar_body(admission, &raw_body)
+        }
+    }
+}
+
+fn verify_raw_nar_body(
+    admission: &VmHttpNixCacheAdmittedNar,
+    raw_body: &[u8],
+) -> Result<(), VmHttpNixCacheNarVerifyError> {
+    let actual = raw_body.len() as u64;
+    let expected = admission.nar_size.get();
+    if actual != expected {
+        return Err(VmHttpNixCacheNarVerifyError::SizeMismatch { expected, actual });
+    }
+    admission.nar_hash.verify_sha256_body(raw_body)?;
+    Ok(())
+}
+
+fn decode_xz_nar_body(
+    body: &[u8],
+    expected_size: u64,
+    max_nar_bytes: u64,
+) -> Result<Vec<u8>, VmHttpNixCacheNarVerifyError> {
+    let memlimit = xz_decoder_memlimit(max_nar_bytes)?;
+    let stream = xz2::stream::Stream::new_stream_decoder(memlimit, xz2::stream::CONCATENATED)
+        .map_err(|err| VmHttpNixCacheNarVerifyError::Decode {
+            message: err.to_string(),
+        })?;
+    let capacity =
+        usize::try_from(expected_size).map_err(|_| VmHttpNixCacheNarVerifyError::Decode {
+            message: format!("signed NarSize {expected_size} does not fit in usize"),
+        })?;
+    let mut decoder = xz2::read::XzDecoder::new_stream(std::io::Cursor::new(body), stream);
+    let mut decoded = Vec::with_capacity(capacity);
+    let mut chunk = [0_u8; 8192];
+    loop {
+        let read =
+            decoder
+                .read(&mut chunk)
+                .map_err(|err| VmHttpNixCacheNarVerifyError::Decode {
+                    message: err.to_string(),
+                })?;
+        if read == 0 {
+            break;
+        }
+        decoded.extend_from_slice(&chunk[..read]);
+        if decoded.len() as u64 > expected_size {
+            return Err(VmHttpNixCacheNarVerifyError::SizeMismatch {
+                expected: expected_size,
+                actual: decoded.len() as u64,
+            });
+        }
+    }
+    Ok(decoded)
+}
+
+fn xz_decoder_memlimit(max_nar_bytes: u64) -> Result<u64, VmHttpNixCacheNarVerifyError> {
+    max_nar_bytes
+        .checked_add(XZ_DECODER_MEMLIMIT_OVERHEAD)
+        .ok_or_else(|| VmHttpNixCacheNarVerifyError::Decode {
+            message: format!(
+                "configured max NAR bytes {max_nar_bytes} leaves no room for xz decoder overhead"
+            ),
+        })
+}
+
+impl VmHttpNixCacheNarVerifyError {
+    fn audit_error_label(&self) -> &'static str {
+        match self {
+            Self::Decode { .. } => "upstream nar decompression failed",
+            Self::SizeMismatch { .. } => "mismatched upstream nar size",
+            Self::Hash(source) => nar_body_hash_error_label(source),
+            Self::VerifierTask { .. } => "nar verification task failed",
+        }
+    }
+}
+
+fn nar_body_hash_error_label(error: &NixNarBodyHashError) -> &'static str {
+    match error {
+        NixNarBodyHashError::UnsupportedAlgorithm { .. } => {
+            "unsupported upstream nar hash algorithm"
+        }
+        NixNarBodyHashError::InvalidDigestLength { .. }
+        | NixNarBodyHashError::InvalidDigestByte => "invalid upstream nar hash digest",
+        NixNarBodyHashError::Mismatch { .. } => "mismatched upstream nar hash",
     }
 }
 
@@ -1646,12 +1934,9 @@ fn classify_nix_cache_target(target: &str) -> Option<VmNixCacheRoute> {
         return Some(VmNixCacheRoute::CacheInfo);
     }
     if let Some(file) = target.strip_prefix(&format!("{VM_NIX_CACHE_PATH_PREFIX}/nar/")) {
-        if NixCacheNarFileName::validate(file).is_ok() {
-            return Some(VmNixCacheRoute::Nar {
-                file: file.to_string(),
-            });
-        }
-        return None;
+        return NixCacheNarFileName::new(file)
+            .ok()
+            .map(|file| VmNixCacheRoute::Nar { file });
     }
     let suffix = target.strip_prefix(&format!("{VM_NIX_CACHE_PATH_PREFIX}/"))?;
     let hash = suffix.strip_suffix(".narinfo")?;
@@ -1675,6 +1960,10 @@ fn narinfo_audit_error_label(err: &NixNarInfoError) -> &'static str {
         NixNarInfoError::UnsupportedUrl(_) | NixNarInfoError::InvalidNarFile { .. } => {
             "invalid upstream narinfo URL"
         }
+        NixNarInfoError::MissingCompression => "missing upstream narinfo Compression",
+        NixNarInfoError::DuplicateCompression => "duplicate upstream narinfo Compression",
+        NixNarInfoError::EmptyCompression => "empty upstream narinfo Compression",
+        NixNarInfoError::InvalidCompression { .. } => "invalid upstream narinfo Compression",
         NixNarInfoError::MissingNarHash => "missing upstream narinfo NarHash",
         NixNarInfoError::DuplicateNarHash => "duplicate upstream narinfo NarHash",
         NixNarInfoError::EmptyNarHash => "empty upstream narinfo NarHash",
@@ -2137,17 +2426,16 @@ impl VmHttpResponse {
     }
 }
 
-impl<S: SecretStore> From<VmHttpResponse> for VmHttpDispatch<S> {
+impl From<VmHttpResponse> for VmHttpDispatch {
     fn from(response: VmHttpResponse) -> Self {
         Self::Buffered(response)
     }
 }
 
-impl<S: SecretStore> VmHttpDispatch<S> {
+impl VmHttpDispatch {
     async fn write_to<W: AsyncWrite + Unpin>(self, out: &mut W) -> std::io::Result<()> {
         match self {
             Self::Buffered(response) => out.write_all(&response.to_bytes()).await,
-            Self::NarStream(stream) => (*stream).write_to(out).await,
         }
     }
 
@@ -2155,92 +2443,6 @@ impl<S: SecretStore> VmHttpDispatch<S> {
     fn into_buffered(self) -> VmHttpResponse {
         match self {
             Self::Buffered(response) => response,
-            Self::NarStream(_) => panic!("expected buffered VM HTTP response, got NAR stream"),
-        }
-    }
-}
-
-impl<S: SecretStore> VmHttpNixCacheNarStream<S> {
-    async fn write_to<W: AsyncWrite + Unpin>(mut self, out: &mut W) -> std::io::Result<()> {
-        let head = format!(
-            "HTTP/1.1 {}\r\nContent-Type: application/x-nix-nar\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-            VmHttpStatus::Ok.status_line(),
-            self.content_length
-        );
-
-        let mut response_bytes = 0_u64;
-        let mut error = None;
-        let mut result_error = None;
-
-        if let Err(err) = out.write_all(head.as_bytes()).await {
-            error = Some("downstream nar write failed");
-            result_error = Some(err);
-        } else {
-            loop {
-                match self.response.chunk().await {
-                    Ok(Some(chunk)) => {
-                        let chunk_len =
-                            u64::try_from(chunk.len()).expect("NAR chunk length fits in u64");
-                        response_bytes = response_bytes
-                            .checked_add(chunk_len)
-                            .expect("NAR byte count overflowed before declared length check");
-                        if response_bytes > self.content_length {
-                            error = Some("upstream nar exceeded declared content length");
-                            result_error = Some(std::io::Error::other(
-                                "upstream nar exceeded declared content length",
-                            ));
-                            break;
-                        }
-                        if let Err(err) = out.write_all(&chunk).await {
-                            error = Some("downstream nar write failed");
-                            result_error = Some(err);
-                            break;
-                        }
-                    }
-                    Ok(None) => break,
-                    Err(err) => {
-                        eprintln!("VM HTTP Nix cache NAR stream failed: {err}");
-                        error = Some("upstream nar body read failed");
-                        result_error = Some(std::io::Error::other("upstream nar body read failed"));
-                        break;
-                    }
-                }
-            }
-        }
-        if error.is_none() && response_bytes != self.content_length {
-            error = Some("upstream nar ended before declared content length");
-            result_error = Some(std::io::Error::other(
-                "upstream nar ended before declared content length",
-            ));
-        }
-
-        let audit_result =
-            self.service
-                .broker_state
-                .audit
-                .record_nix_cache_outcome(&NixCacheOutcomeRecord {
-                    request_id: self.request_id,
-                    completed_at: UnixMillis::now(),
-                    http_status: VmHttpStatus::Ok.code(),
-                    upstream_url: Some(&self.upstream_url),
-                    upstream_status: Some(self.upstream_status),
-                    response_bytes,
-                    error,
-                });
-
-        match (result_error, audit_result) {
-            (Some(stream_err), Err(audit_err)) => {
-                eprintln!(
-                    "VM HTTP Nix cache audit stream outcome write failed after stream error: {audit_err}"
-                );
-                Err(stream_err)
-            }
-            (None, Err(audit_err)) => {
-                eprintln!("VM HTTP Nix cache audit stream outcome write failed: {audit_err}");
-                Err(std::io::Error::other("audit write failed after NAR stream"))
-            }
-            (Some(stream_err), Ok(())) => Err(stream_err),
-            (None, Ok(())) => Ok(()),
         }
     }
 }
@@ -2321,13 +2523,14 @@ fn report_vm_http_handler_result(result: Result<std::io::Result<()>, tokio::task
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::io::Write as _;
     use std::net::{Ipv6Addr, SocketAddrV4, SocketAddrV6};
     use std::os::unix::fs::PermissionsExt;
-    use std::pin::Pin;
     use std::sync::Mutex;
-    use std::task::{Context, Poll};
 
+    use base64::Engine as _;
     use proptest::prelude::*;
+    use ring::signature::KeyPair as _;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -2356,32 +2559,16 @@ mod tests {
         "Sig: cache.example:ioaqsTngbhwHmkI+4GKXEkuV0WvrIQ0+SUVlVvIix5A7h31h6oE5hpQbq/rGvH10QLVtYm82sdIM3e2SBGqMAA==\n",
         "CA: fixed:sha256:1ivkzvg86cqy19yf9bg4aaqf6a9prfbjn18jclk6k2w2c9is5kf1\n",
     );
+    const TEST_NAR_FILE: &str = "05cwbm7srkm5hvm6s7pa8yw2n57vgfrfmsz3p2sy8h9cnki9415f.nar.xz";
+    const TEST_RAW_NAR_BASE64: &str = concat!(
+        "DQAAAAAAAABuaXgtYXJjaGl2ZS0xAAAAAQAAAAAAAAAoAAAAAAAAAAQAAAAAAAAAdHlwZQAAAAAH",
+        "AAAAAAAAAHJlZ3VsYXIACAAAAAAAAABjb250ZW50cwUAAAAAAAAAcHJvb2YAAAABAAAAAAAAACkA",
+        "AAAAAAAA",
+    );
+    const TEST_SIGNING_KEY_NAME: &str = "cache.example";
 
     #[derive(Default)]
     struct InMemStore(Mutex<HashMap<String, String>>);
-
-    struct AlwaysFailWriter;
-
-    impl AsyncWrite for AlwaysFailWriter {
-        fn poll_write(
-            self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-            _buf: &[u8],
-        ) -> Poll<std::io::Result<usize>> {
-            Poll::Ready(Err(std::io::Error::new(
-                std::io::ErrorKind::BrokenPipe,
-                "test writer is closed",
-            )))
-        }
-
-        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-            Poll::Ready(Ok(()))
-        }
-
-        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-            Poll::Ready(Ok(()))
-        }
-    }
 
     impl SecretStore for InMemStore {
         fn get(&self, key: &SecretKey) -> Result<Option<String>, SecretError> {
@@ -2614,16 +2801,136 @@ esac
         server: &MockServer,
         max_metadata_bytes: u64,
     ) -> VmHttpNixCacheService<Box<dyn SecretStore>> {
+        signed_nix_cache_service_for_test_with_limits(state, server, max_metadata_bytes, 1024)
+    }
+
+    fn signed_nix_cache_service_for_test_with_limits(
+        state: &Arc<BrokerState<Box<dyn SecretStore>>>,
+        server: &MockServer,
+        max_metadata_bytes: u64,
+        max_nar_bytes: u64,
+    ) -> VmHttpNixCacheService<Box<dyn SecretStore>> {
         VmHttpNixCacheService::new(
             Arc::clone(state),
             VmHttpNixCacheConfig::new_with_trusted_public_keys(
                 server.uri(),
                 max_metadata_bytes,
-                1024,
+                max_nar_bytes,
                 NixTrustedPublicKeys::from_strings([TEST_NIX_CACHE_PUBLIC_KEY]).unwrap(),
             )
             .unwrap(),
         )
+    }
+
+    fn signed_nix_cache_service_for_test_with_key(
+        state: &Arc<BrokerState<Box<dyn SecretStore>>>,
+        server: &MockServer,
+        trusted_key: String,
+        max_nar_bytes: u64,
+    ) -> VmHttpNixCacheService<Box<dyn SecretStore>> {
+        VmHttpNixCacheService::new(
+            Arc::clone(state),
+            VmHttpNixCacheConfig::new_with_trusted_public_keys(
+                server.uri(),
+                4096,
+                max_nar_bytes,
+                NixTrustedPublicKeys::from_strings([trusted_key]).unwrap(),
+            )
+            .unwrap(),
+        )
+    }
+
+    fn test_ed25519_key_pair() -> ring::signature::Ed25519KeyPair {
+        ring::signature::Ed25519KeyPair::from_seed_unchecked(&[7_u8; 32]).unwrap()
+    }
+
+    fn trusted_public_key_for_test(
+        name: &str,
+        key_pair: &ring::signature::Ed25519KeyPair,
+    ) -> String {
+        format!("{name}:{}", base64_standard(key_pair.public_key().as_ref()))
+    }
+
+    fn nar_hash_for_body(body: &[u8]) -> String {
+        let digest = ring::digest::digest(&ring::digest::SHA256, body);
+        let digest: [u8; 32] = digest
+            .as_ref()
+            .try_into()
+            .expect("ring SHA-256 digest length should be 32 bytes");
+        format!(
+            "sha256:{}",
+            crate::nix_cache::nix_base32_encode_sha256_digest(&digest)
+        )
+    }
+
+    fn signed_test_narinfo(
+        key_pair: &ring::signature::Ed25519KeyPair,
+        store_hash: &str,
+        store_name: &str,
+        nar_file: &str,
+        compression: NixNarCompression,
+        nar_hash: &str,
+        nar_size: u64,
+    ) -> String {
+        let store_path = format!("/nix/store/{store_hash}-{store_name}");
+        let fingerprint = format!("1;{store_path};{nar_hash};{nar_size};");
+        let signature = base64_standard(key_pair.sign(fingerprint.as_bytes()).as_ref());
+        format!(
+            "StorePath: {store_path}\n\
+             URL: nar/{nar_file}\n\
+             Compression: {compression}\n\
+             NarHash: {nar_hash}\n\
+             NarSize: {nar_size}\n\
+             References: \n\
+             Sig: {TEST_SIGNING_KEY_NAME}:{signature}\n",
+        )
+    }
+
+    fn test_raw_nar_body() -> Vec<u8> {
+        base64::engine::general_purpose::STANDARD
+            .decode(TEST_RAW_NAR_BASE64)
+            .unwrap()
+    }
+
+    fn test_xz_nar_body() -> Vec<u8> {
+        xz_nar_body_for(&test_raw_nar_body())
+    }
+
+    fn xz_nar_body_for(raw: &[u8]) -> Vec<u8> {
+        let mut encoder = xz2::write::XzEncoder::new(Vec::new(), 6);
+        encoder.write_all(raw).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    fn multi_stream_xz_body_for(raw: &[u8]) -> Vec<u8> {
+        let split = raw.len() / 2;
+        let mut body = xz_nar_body_for(&raw[..split]);
+        body.extend_from_slice(&xz_nar_body_for(&raw[split..]));
+        body
+    }
+
+    fn admitted_nar_for_body(
+        file: &str,
+        compression: NixNarCompression,
+        raw_body: &[u8],
+    ) -> VmHttpNixCacheAdmittedNar {
+        VmHttpNixCacheAdmittedNar {
+            file: NixCacheNarFileName::new(file).unwrap(),
+            compression,
+            nar_hash: NixNarHash::new(nar_hash_for_body(raw_body)).unwrap(),
+            nar_size: NixNarSize::new(&raw_body.len().to_string()).unwrap(),
+        }
+    }
+
+    fn test_signed_narinfo() -> NixNarInfo {
+        let expected_hash = NixStoreHashPart::new("rzv95bakh41zrn5ji23pfc11x5vq2z4d").unwrap();
+        let keys = NixTrustedPublicKeys::from_strings([TEST_NIX_CACHE_PUBLIC_KEY]).unwrap();
+        parse_signed_narinfo_for_store_hash(TEST_SIGNED_NARINFO.as_bytes(), &expected_hash, &keys)
+            .unwrap()
+    }
+
+    fn admit_test_nar(service: &VmHttpNixCacheService<Box<dyn SecretStore>>) {
+        service.admit_narinfo(&test_signed_narinfo()).unwrap();
     }
 
     fn request(source: Ipv4Addr, authorization: Option<String>) -> VmHttpRequest {
@@ -2907,9 +3214,10 @@ esac
         #[test]
         fn valid_nix_cache_nar_filenames_are_nar_routes(file in arb_nix_nar_file()) {
             let target = format!("{VM_NIX_CACHE_PATH_PREFIX}/nar/{file}");
+            let parsed_file = NixCacheNarFileName::new(file).unwrap();
             prop_assert_eq!(
                 classify_nix_cache_target(&target),
-                Some(VmNixCacheRoute::Nar { file })
+                Some(VmNixCacheRoute::Nar { file: parsed_file })
             );
         }
 
@@ -2917,6 +3225,25 @@ esac
         fn invalid_nix_cache_nar_filename_characters_are_not_nar_routes(file in arb_nix_nar_file_with_invalid_char()) {
             let target = format!("{VM_NIX_CACHE_PATH_PREFIX}/nar/{file}");
             prop_assert_eq!(classify_nix_cache_target(&target), None);
+        }
+
+        #[test]
+        fn generated_nar_bodies_verify_against_their_admitted_metadata(
+            raw_body in prop::collection::vec(any::<u8>(), 0..512),
+            use_xz in any::<bool>(),
+        ) {
+            let compression = if use_xz {
+                NixNarCompression::Xz
+            } else {
+                NixNarCompression::None
+            };
+            let wire_body = if use_xz {
+                xz_nar_body_for(&raw_body)
+            } else {
+                raw_body.clone()
+            };
+            let admission = admitted_nar_for_body("generated.nar", compression, &raw_body);
+            verify_nar_body(&admission, &wire_body, 512).unwrap();
         }
     }
 
@@ -3094,6 +3421,31 @@ esac
         );
     }
 
+    #[test]
+    fn xz_nar_body_rejects_decoded_size_smaller_than_signed_size() {
+        let raw_body = test_raw_nar_body();
+        let short_body = &raw_body[..raw_body.len() - 1];
+        let admission = admitted_nar_for_body(TEST_NAR_FILE, NixNarCompression::Xz, &raw_body);
+
+        let result = verify_nar_body(&admission, &xz_nar_body_for(short_body), 1024);
+
+        assert_eq!(
+            result,
+            Err(VmHttpNixCacheNarVerifyError::SizeMismatch {
+                expected: raw_body.len() as u64,
+                actual: short_body.len() as u64,
+            })
+        );
+    }
+
+    #[test]
+    fn xz_nar_body_accepts_concatenated_streams() {
+        let raw_body = test_raw_nar_body();
+        let admission = admitted_nar_for_body(TEST_NAR_FILE, NixNarCompression::Xz, &raw_body);
+
+        verify_nar_body(&admission, &multi_stream_xz_body_for(&raw_body), 1024).unwrap();
+    }
+
     async fn route_nix_cache_with_service(
         session: &VmHttpSession,
         method: &str,
@@ -3177,6 +3529,7 @@ esac
             .mount(&upstream)
             .await;
         let service = signed_nix_cache_service_for_test(&state, &upstream, 1024);
+        let service_for_admission_check = service.clone();
 
         let response = route_nix_cache_with_service(
             &session,
@@ -3188,6 +3541,11 @@ esac
 
         assert_eq!(response.status, VmHttpStatus::Ok);
         assert_eq!(response.body, TEST_SIGNED_NARINFO.as_bytes());
+        assert!(
+            service_for_admission_check
+                .admitted_nar(&NixCacheNarFileName::new(TEST_NAR_FILE).unwrap())
+                .is_some()
+        );
         let entries = state
             .audit
             .list_nix_cache_requests_for_session(session.session_id())
@@ -3197,6 +3555,185 @@ esac
         assert_eq!(entries[0].decision, NixCacheAuditDecision::Allow);
         assert_eq!(entries[0].http_status, Some(200));
         assert_eq!(entries[0].upstream_status, Some(200));
+    }
+
+    #[tokio::test]
+    async fn nix_cache_narinfo_route_rejects_admitted_nar_size_above_limit() {
+        let upstream = MockServer::start().await;
+        let state = make_broker_state(&upstream);
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+        open_audit_session(&state, session.session_id());
+        let hash = "rzv95bakh41zrn5ji23pfc11x5vq2z4d";
+        Mock::given(method("GET"))
+            .and(path(format!("/{hash}.narinfo")))
+            .respond_with(ResponseTemplate::new(200).set_body_string(TEST_SIGNED_NARINFO))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+        let service = signed_nix_cache_service_for_test_with_limits(&state, &upstream, 1024, 119);
+
+        let response = route_nix_cache_with_service(
+            &session,
+            "GET",
+            format!("{VM_NIX_CACHE_PATH_PREFIX}/{hash}.narinfo"),
+            service,
+        )
+        .await;
+
+        assert_eq!(response.status, VmHttpStatus::BadGateway);
+        let entries = state
+            .audit
+            .list_nix_cache_requests_for_session(session.session_id())
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].route, NixCacheAuditRoute::NarInfo);
+        assert_eq!(entries[0].http_status, Some(502));
+        assert_eq!(entries[0].upstream_status, Some(200));
+        assert_eq!(
+            entries[0].error.as_deref(),
+            Some("upstream narinfo NarSize too large")
+        );
+    }
+
+    #[tokio::test]
+    async fn nix_cache_narinfo_route_rejects_conflicting_admission_for_same_nar_file() {
+        let upstream = MockServer::start().await;
+        let state = make_broker_state(&upstream);
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+        open_audit_session(&state, session.session_id());
+        let key_pair = test_ed25519_key_pair();
+        let trusted_key = trusted_public_key_for_test(TEST_SIGNING_KEY_NAME, &key_pair);
+        let hash_a = "00000000000000000000000000000000";
+        let hash_b = "11111111111111111111111111111111";
+        let body_a = signed_test_narinfo(
+            &key_pair,
+            hash_a,
+            "proof-a",
+            "shared.nar",
+            NixNarCompression::None,
+            &nar_hash_for_body(b"first"),
+            5,
+        );
+        let body_b = signed_test_narinfo(
+            &key_pair,
+            hash_b,
+            "proof-b",
+            "shared.nar",
+            NixNarCompression::None,
+            &nar_hash_for_body(b"second"),
+            6,
+        );
+        Mock::given(method("GET"))
+            .and(path(format!("/{hash_a}.narinfo")))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body_a))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/{hash_b}.narinfo")))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body_b))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+        let service =
+            signed_nix_cache_service_for_test_with_key(&state, &upstream, trusted_key, 64);
+
+        let first = route_nix_cache_with_service(
+            &session,
+            "GET",
+            format!("{VM_NIX_CACHE_PATH_PREFIX}/{hash_a}.narinfo"),
+            service.clone(),
+        )
+        .await;
+        let second = route_nix_cache_with_service(
+            &session,
+            "GET",
+            format!("{VM_NIX_CACHE_PATH_PREFIX}/{hash_b}.narinfo"),
+            service,
+        )
+        .await;
+
+        assert_eq!(first.status, VmHttpStatus::Ok);
+        assert_eq!(second.status, VmHttpStatus::BadGateway);
+        let entries = state
+            .audit
+            .list_nix_cache_requests_for_session(session.session_id())
+            .unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].decision, NixCacheAuditDecision::Allow);
+        assert_eq!(entries[1].route, NixCacheAuditRoute::NarInfo);
+        assert_eq!(entries[1].http_status, Some(502));
+        assert_eq!(entries[1].upstream_status, Some(200));
+        assert_eq!(
+            entries[1].error.as_deref(),
+            Some("conflicting upstream narinfo metadata")
+        );
+    }
+
+    #[tokio::test]
+    async fn nix_cache_narinfo_route_rejects_unverifiable_nar_hash_shapes_at_admission() {
+        let cases = [
+            (
+                "00000000000000000000000000000000",
+                "sha512:0000000000000000000000000000000000000000000000000000",
+                "unsupported upstream nar hash algorithm",
+            ),
+            (
+                "11111111111111111111111111111111",
+                "sha256:0",
+                "invalid upstream nar hash digest",
+            ),
+            (
+                "22222222222222222222222222222222",
+                "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+                "invalid upstream nar hash digest",
+            ),
+        ];
+        for (hash, nar_hash, expected_error) in cases {
+            let upstream = MockServer::start().await;
+            let state = make_broker_state(&upstream);
+            let session =
+                session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+            open_audit_session(&state, session.session_id());
+            let key_pair = test_ed25519_key_pair();
+            let trusted_key = trusted_public_key_for_test(TEST_SIGNING_KEY_NAME, &key_pair);
+            let body = signed_test_narinfo(
+                &key_pair,
+                hash,
+                "proof",
+                "proof.nar",
+                NixNarCompression::None,
+                nar_hash,
+                5,
+            );
+            Mock::given(method("GET"))
+                .and(path(format!("/{hash}.narinfo")))
+                .respond_with(ResponseTemplate::new(200).set_body_string(body))
+                .expect(1)
+                .mount(&upstream)
+                .await;
+            let service =
+                signed_nix_cache_service_for_test_with_key(&state, &upstream, trusted_key, 64);
+
+            let response = route_nix_cache_with_service(
+                &session,
+                "GET",
+                format!("{VM_NIX_CACHE_PATH_PREFIX}/{hash}.narinfo"),
+                service,
+            )
+            .await;
+
+            assert_eq!(response.status, VmHttpStatus::BadGateway, "{nar_hash}");
+            let entries = state
+                .audit
+                .list_nix_cache_requests_for_session(session.session_id())
+                .unwrap();
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].route, NixCacheAuditRoute::NarInfo);
+            assert_eq!(entries[0].http_status, Some(502));
+            assert_eq!(entries[0].upstream_status, Some(200));
+            assert_eq!(entries[0].error.as_deref(), Some(expected_error));
+        }
     }
 
     #[tokio::test]
@@ -3217,7 +3754,7 @@ esac
             Mock::given(method("GET"))
                 .and(path(format!("/{hash}.narinfo")))
                 .respond_with(ResponseTemplate::new(200).set_body_string(format!(
-                    "StorePath: /nix/store/00000000000000000000000000000000-proof\nURL: {nar_url}\nNarHash: sha256:0\nNarSize: 120\nReferences: \nSig: cache.example:ioaqsTngbhwHmkI+4GKXEkuV0WvrIQ0+SUVlVvIix5A7h31h6oE5hpQbq/rGvH10QLVtYm82sdIM3e2SBGqMAA==\n"
+                    "StorePath: /nix/store/00000000000000000000000000000000-proof\nURL: {nar_url}\nCompression: xz\nNarHash: sha256:0\nNarSize: 120\nReferences: \nSig: cache.example:ioaqsTngbhwHmkI+4GKXEkuV0WvrIQ0+SUVlVvIix5A7h31h6oE5hpQbq/rGvH10QLVtYm82sdIM3e2SBGqMAA==\n"
                 )))
                 .expect(1)
                 .mount(&upstream)
@@ -3261,6 +3798,7 @@ esac
                 "StorePath: /nix/store/00000000000000000000000000000000-proof\n",
                 "URL: nar/proof.nar.xz\n",
                 "URL: nar/other.nar.xz\n",
+                "Compression: xz\n",
                 "NarHash: sha256:0\n",
                 "NarSize: 120\n",
                 "References: \n",
@@ -3304,7 +3842,7 @@ esac
         Mock::given(method("GET"))
             .and(path(format!("/{requested_hash}.narinfo")))
             .respond_with(ResponseTemplate::new(200).set_body_string(format!(
-                "StorePath: /nix/store/{upstream_hash}-proof\nURL: nar/proof.nar.xz\nNarHash: sha256:0\nNarSize: 120\nReferences: \nSig: cache.example:ioaqsTngbhwHmkI+4GKXEkuV0WvrIQ0+SUVlVvIix5A7h31h6oE5hpQbq/rGvH10QLVtYm82sdIM3e2SBGqMAA==\n"
+                "StorePath: /nix/store/{upstream_hash}-proof\nURL: nar/proof.nar.xz\nCompression: xz\nNarHash: sha256:0\nNarSize: 120\nReferences: \nSig: cache.example:ioaqsTngbhwHmkI+4GKXEkuV0WvrIQ0+SUVlVvIix5A7h31h6oE5hpQbq/rGvH10QLVtYm82sdIM3e2SBGqMAA==\n"
             )))
             .expect(1)
             .mount(&upstream)
@@ -3394,68 +3932,66 @@ esac
     }
 
     #[tokio::test]
-    async fn nix_cache_nar_route_streams_bounded_nar_body_and_audits_completion() {
+    async fn nix_cache_nar_route_requires_prior_signed_narinfo_admission() {
         let upstream = MockServer::start().await;
         let state = make_broker_state(&upstream);
-        let session = VmHttpSession::new(
-            "51b8fd0f-6c10-454c-b0e6-7df1d60e2e6d".parse().unwrap(),
-            Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap(),
-            token(),
-        );
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
         open_audit_session(&state, session.session_id());
-        let nar_body = "nix-archive-1\nproof\n";
+        let service = signed_nix_cache_service_for_test(&state, &upstream, 1024);
+
+        let response = route_nix_cache_with_service(
+            &session,
+            "GET",
+            format!("{VM_NIX_CACHE_PATH_PREFIX}/nar/{TEST_NAR_FILE}"),
+            service,
+        )
+        .await;
+
+        assert_eq!(response.status, VmHttpStatus::BadGateway);
+        upstream.verify().await;
+        let entries = state
+            .audit
+            .list_nix_cache_requests_for_session(session.session_id())
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].route, NixCacheAuditRoute::Nar);
+        assert_eq!(entries[0].http_status, Some(502));
+        assert_eq!(entries[0].upstream_status, None);
+        assert_eq!(entries[0].error.as_deref(), Some("unadmitted upstream nar"));
+    }
+
+    #[tokio::test]
+    async fn nix_cache_nar_route_buffers_verifies_and_audits_nar_body() {
+        let upstream = MockServer::start().await;
+        let state = make_broker_state(&upstream);
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+        open_audit_session(&state, session.session_id());
+        let nar_body = test_xz_nar_body();
         Mock::given(method("GET"))
-            .and(path("/nar/proof.nar.xz"))
+            .and(path(format!("/nar/{TEST_NAR_FILE}")))
             .respond_with(
                 ResponseTemplate::new(200)
                     .insert_header("Content-Type", "application/x-nix-nar")
-                    .set_body_string(nar_body),
+                    .set_body_bytes(nar_body.clone()),
             )
             .expect(1)
             .mount(&upstream)
             .await;
-        let service = nix_cache_service_for_test_with_limits(&state, &upstream, 1024, 1024);
+        let service = signed_nix_cache_service_for_test_with_limits(&state, &upstream, 1024, 1024);
+        admit_test_nar(&service);
 
-        let range = BrokerPortRange::new(1024, 65535).unwrap();
-        let bound = bind_ephemeral_vm_http_listener(Ipv4Addr::LOCALHOST, range)
-            .await
-            .unwrap();
-        let addr = bound.local_addr().unwrap();
-        let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let server = tokio::spawn(run_vm_http_runtime_until_shutdown(
-            bound.into_listener(),
-            session.clone(),
-            None::<VmHttpGitCloneService<Box<dyn SecretStore>>>,
-            Some(service),
-            shutdown_rx,
-        ));
-
-        let response = request_over_tcp(
-            addr,
-            &format!(
-                "GET {VM_NIX_CACHE_PATH_PREFIX}/nar/proof.nar.xz HTTP/1.1\r\nHost: localhost\r\nAuthorization: {}\r\n\r\n",
-                basic(token().as_str())
-            ),
+        let response = route_nix_cache_with_service(
+            &session,
+            "GET",
+            format!("{VM_NIX_CACHE_PATH_PREFIX}/nar/{TEST_NAR_FILE}"),
+            service,
         )
         .await;
 
-        shutdown_tx.send(true).unwrap();
-        let result = tokio::time::timeout(std::time::Duration::from_secs(1), server)
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(result.is_ok());
-
-        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response}");
-        assert!(
-            response.contains("Content-Type: application/x-nix-nar\r\n"),
-            "{response}"
-        );
-        assert!(
-            response.contains(&format!("Content-Length: {}\r\n", nar_body.len())),
-            "{response}"
-        );
-        assert!(response.ends_with(nar_body), "{response}");
+        assert_eq!(response.status, VmHttpStatus::Ok);
+        assert_eq!(response.content_type, "application/x-nix-nar");
+        assert_eq!(response.content_length, Some(nar_body.len() as u64));
+        assert_eq!(response.body, nar_body);
         let entries = state
             .audit
             .list_nix_cache_requests_for_session(session.session_id())
@@ -3465,64 +4001,179 @@ esac
         assert_eq!(entries[0].decision, NixCacheAuditDecision::Allow);
         assert_eq!(entries[0].http_status, Some(200));
         assert_eq!(entries[0].upstream_status, Some(200));
-        assert_eq!(entries[0].response_bytes, Some(nar_body.len() as u64));
+        assert_eq!(entries[0].response_bytes, Some(response.body.len() as u64));
         assert_eq!(entries[0].error, None);
         assert!(
             entries[0]
                 .upstream_url
                 .as_deref()
                 .unwrap()
-                .ends_with("/nar/proof.nar.xz")
+                .ends_with(&format!("/nar/{TEST_NAR_FILE}"))
         );
     }
 
     #[tokio::test]
-    async fn nix_cache_nar_stream_audits_downstream_write_failure() {
+    async fn nix_cache_nar_route_verifies_uncompressed_nar_body() {
         let upstream = MockServer::start().await;
         let state = make_broker_state(&upstream);
         let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
         open_audit_session(&state, session.session_id());
+        let key_pair = test_ed25519_key_pair();
+        let trusted_key = trusted_public_key_for_test(TEST_SIGNING_KEY_NAME, &key_pair);
+        let hash = "00000000000000000000000000000000";
+        let nar_file = "plain.nar";
+        let nar_body = b"plain-nar-body".to_vec();
+        let narinfo = signed_test_narinfo(
+            &key_pair,
+            hash,
+            "plain",
+            nar_file,
+            NixNarCompression::None,
+            &nar_hash_for_body(&nar_body),
+            nar_body.len() as u64,
+        );
         Mock::given(method("GET"))
-            .and(path("/nar/proof.nar.xz"))
-            .respond_with(ResponseTemplate::new(200).set_body_string("nix-archive-1\n"))
+            .and(path(format!("/{hash}.narinfo")))
+            .respond_with(ResponseTemplate::new(200).set_body_string(narinfo))
             .expect(1)
             .mount(&upstream)
             .await;
-        let service = nix_cache_service_for_test_with_limits(&state, &upstream, 1024, 1024);
-        let request = nix_cache_request(
+        Mock::given(method("GET"))
+            .and(path(format!("/nar/{nar_file}")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Type", "application/x-nix-nar")
+                    .set_body_bytes(nar_body.clone()),
+            )
+            .expect(1)
+            .mount(&upstream)
+            .await;
+        let service =
+            signed_nix_cache_service_for_test_with_key(&state, &upstream, trusted_key, 64);
+
+        let narinfo_response = route_nix_cache_with_service(
+            &session,
             "GET",
-            format!("{VM_NIX_CACHE_PATH_PREFIX}/nar/proof.nar.xz"),
-            Ipv4Addr::LOCALHOST,
-            Some(basic(token().as_str())),
-        );
+            format!("{VM_NIX_CACHE_PATH_PREFIX}/{hash}.narinfo"),
+            service.clone(),
+        )
+        .await;
+        let nar_response = route_nix_cache_with_service(
+            &session,
+            "GET",
+            format!("{VM_NIX_CACHE_PATH_PREFIX}/nar/{nar_file}"),
+            service,
+        )
+        .await;
 
-        let dispatch = route_nix_cache_request(&session, &request, Some(service)).await;
-        let mut writer = AlwaysFailWriter;
-        let err = dispatch.write_to(&mut writer).await.unwrap_err();
+        assert_eq!(narinfo_response.status, VmHttpStatus::Ok);
+        assert_eq!(nar_response.status, VmHttpStatus::Ok);
+        assert_eq!(nar_response.content_type, "application/x-nix-nar");
+        assert_eq!(nar_response.content_length, Some(nar_body.len() as u64));
+        assert_eq!(nar_response.body, nar_body);
+        let entries = state
+            .audit
+            .list_nix_cache_requests_for_session(session.session_id())
+            .unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].decision, NixCacheAuditDecision::Allow);
+        assert_eq!(entries[1].route, NixCacheAuditRoute::Nar);
+        assert_eq!(entries[1].decision, NixCacheAuditDecision::Allow);
+        assert_eq!(entries[1].error, None);
+    }
 
-        assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
+    #[tokio::test]
+    async fn nix_cache_nar_route_rejects_hash_mismatch_before_forwarding_body() {
+        let upstream = MockServer::start().await;
+        let state = make_broker_state(&upstream);
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+        open_audit_session(&state, session.session_id());
+        let mut raw = test_raw_nar_body();
+        let tampered_index = raw.len() - 2;
+        raw[tampered_index] ^= 0x01;
+        let mut encoder = xz2::write::XzEncoder::new(Vec::new(), 6);
+        encoder.write_all(&raw).unwrap();
+        let tampered = encoder.finish().unwrap();
+        Mock::given(method("GET"))
+            .and(path(format!("/nar/{TEST_NAR_FILE}")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(tampered))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+        let service = signed_nix_cache_service_for_test_with_limits(&state, &upstream, 1024, 1024);
+        admit_test_nar(&service);
+
+        let response = route_nix_cache_with_service(
+            &session,
+            "GET",
+            format!("{VM_NIX_CACHE_PATH_PREFIX}/nar/{TEST_NAR_FILE}"),
+            service,
+        )
+        .await;
+
+        assert_eq!(response.status, VmHttpStatus::BadGateway);
         let entries = state
             .audit
             .list_nix_cache_requests_for_session(session.session_id())
             .unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].route, NixCacheAuditRoute::Nar);
-        assert_eq!(entries[0].http_status, Some(200));
-        assert_eq!(entries[0].response_bytes, Some(0));
+        assert_eq!(entries[0].http_status, Some(502));
+        assert_eq!(entries[0].upstream_status, Some(200));
         assert_eq!(
             entries[0].error.as_deref(),
-            Some("downstream nar write failed")
+            Some("mismatched upstream nar hash")
         );
     }
 
     #[tokio::test]
-    async fn nix_cache_nar_head_is_bounded_and_buffered() {
+    async fn nix_cache_nar_route_rejects_decoded_size_mismatch() {
+        let upstream = MockServer::start().await;
+        let state = make_broker_state(&upstream);
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+        open_audit_session(&state, session.session_id());
+        let mut raw = test_raw_nar_body();
+        raw.push(0);
+        let mut encoder = xz2::write::XzEncoder::new(Vec::new(), 6);
+        encoder.write_all(&raw).unwrap();
+        let oversized = encoder.finish().unwrap();
+        Mock::given(method("GET"))
+            .and(path(format!("/nar/{TEST_NAR_FILE}")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(oversized))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+        let service = signed_nix_cache_service_for_test_with_limits(&state, &upstream, 1024, 1024);
+        admit_test_nar(&service);
+
+        let response = route_nix_cache_with_service(
+            &session,
+            "GET",
+            format!("{VM_NIX_CACHE_PATH_PREFIX}/nar/{TEST_NAR_FILE}"),
+            service,
+        )
+        .await;
+
+        assert_eq!(response.status, VmHttpStatus::BadGateway);
+        let entries = state
+            .audit
+            .list_nix_cache_requests_for_session(session.session_id())
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].error.as_deref(),
+            Some("mismatched upstream nar size")
+        );
+    }
+
+    #[tokio::test]
+    async fn nix_cache_nar_head_is_bounded_and_requires_admission() {
         let upstream = MockServer::start().await;
         let state = make_broker_state(&upstream);
         let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
         open_audit_session(&state, session.session_id());
         Mock::given(method("HEAD"))
-            .and(path("/nar/proof.nar.xz"))
+            .and(path(format!("/nar/{TEST_NAR_FILE}")))
             .respond_with(
                 ResponseTemplate::new(200)
                     .insert_header("Content-Length", "123")
@@ -3531,12 +4182,13 @@ esac
             .expect(1)
             .mount(&upstream)
             .await;
-        let service = nix_cache_service_for_test_with_limits(&state, &upstream, 1024, 1024);
+        let service = signed_nix_cache_service_for_test_with_limits(&state, &upstream, 1024, 1024);
+        admit_test_nar(&service);
 
         let response = route_nix_cache_with_service(
             &session,
             "HEAD",
-            format!("{VM_NIX_CACHE_PATH_PREFIX}/nar/proof.nar.xz"),
+            format!("{VM_NIX_CACHE_PATH_PREFIX}/nar/{TEST_NAR_FILE}"),
             service,
         )
         .await;
@@ -3563,17 +4215,18 @@ esac
         let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
         open_audit_session(&state, session.session_id());
         Mock::given(method("GET"))
-            .and(path("/nar/proof.nar.xz"))
-            .respond_with(ResponseTemplate::new(200).set_body_string("123456"))
+            .and(path(format!("/nar/{TEST_NAR_FILE}")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![b'x'; 129]))
             .expect(1)
             .mount(&upstream)
             .await;
-        let service = nix_cache_service_for_test_with_limits(&state, &upstream, 1024, 5);
+        let service = signed_nix_cache_service_for_test_with_limits(&state, &upstream, 1024, 128);
+        admit_test_nar(&service);
 
         let response = route_nix_cache_with_service(
             &session,
             "GET",
-            format!("{VM_NIX_CACHE_PATH_PREFIX}/nar/proof.nar.xz"),
+            format!("{VM_NIX_CACHE_PATH_PREFIX}/nar/{TEST_NAR_FILE}"),
             service,
         )
         .await;

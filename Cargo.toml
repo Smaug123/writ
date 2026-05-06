@@ -12,6 +12,7 @@ host = [
     "dep:keyring",
     "dep:ring",
     "dep:rusqlite",
+    "dep:xz2",
 ]
 vm-client = ["dep:reqwest"]
 
@@ -54,6 +55,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 jsonwebtoken = { version = "9", optional = true }
 base64 = { version = "0.22", optional = true }
 ring = { version = "0.17", optional = true }
+xz2 = { version = "0.1", features = ["static"], optional = true }
 libc = "0.2"
 
 [dev-dependencies]

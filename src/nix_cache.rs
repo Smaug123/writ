@@ -4,6 +4,8 @@ use base64::Engine as _;
 
 const NIX_STORE_HASH_LEN: usize = 32;
 const NIX_STORE_HASH_ALPHABET: &[u8] = b"0123456789abcdfghijklmnpqrsvwxyz";
+const NIX_SHA256_DIGEST_LEN: usize = 32;
+const NIX_SHA256_BASE32_LEN: usize = 52;
 const NIX_ED25519_PUBLIC_KEY_LEN: usize = 32;
 const NIX_ED25519_SIGNATURE_LEN: usize = 64;
 
@@ -25,6 +27,12 @@ pub struct NixNarHash(String);
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct NixNarSize(u64);
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub enum NixNarCompression {
+    None,
+    Xz,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct NixNarReferences(Vec<NixStorePath>);
 
@@ -38,6 +46,7 @@ pub struct NixNarSignature {
 pub struct NixNarInfo {
     store_path: NixStorePath,
     nar_file: NixCacheNarFileName,
+    compression: NixNarCompression,
     nar_hash: NixNarHash,
     nar_size: NixNarSize,
     references: NixNarReferences,
@@ -135,6 +144,18 @@ pub enum NixNarHashError {
 }
 
 #[derive(Debug, thiserror::Error, Eq, PartialEq)]
+pub enum NixNarBodyHashError {
+    #[error("NarHash algorithm {algorithm:?} is not supported for broker-side NAR verification")]
+    UnsupportedAlgorithm { algorithm: String },
+    #[error("NarHash sha256 digest must be 52 Nix base32 bytes, got {actual}")]
+    InvalidDigestLength { actual: usize },
+    #[error("NarHash sha256 digest contains a non-Nix-base32 byte")]
+    InvalidDigestByte,
+    #[error("NAR body SHA-256 does not match NarHash")]
+    Mismatch { expected: String, actual: String },
+}
+
+#[derive(Debug, thiserror::Error, Eq, PartialEq)]
 pub enum NixNarSizeError {
     #[error("NarSize must contain only decimal digits")]
     InvalidByte,
@@ -142,6 +163,12 @@ pub enum NixNarSizeError {
     LeadingZero,
     #[error("NarSize does not fit in u64")]
     Overflow,
+}
+
+#[derive(Debug, thiserror::Error, Eq, PartialEq)]
+pub enum NixNarCompressionError {
+    #[error("Compression value is not supported")]
+    Unsupported,
 }
 
 #[derive(Debug, thiserror::Error, Eq, PartialEq)]
@@ -211,6 +238,17 @@ pub enum NixNarInfoError {
     InvalidNarHash {
         raw: String,
         source: NixNarHashError,
+    },
+    #[error("narinfo is missing Compression")]
+    MissingCompression,
+    #[error("narinfo contains duplicate Compression")]
+    DuplicateCompression,
+    #[error("narinfo Compression must not be empty")]
+    EmptyCompression,
+    #[error("narinfo Compression {raw:?} is invalid: {source}")]
+    InvalidCompression {
+        raw: String,
+        source: NixNarCompressionError,
     },
     #[error("narinfo is missing NarSize")]
     MissingNarSize,
@@ -360,6 +398,12 @@ impl NixCacheNarFileName {
     }
 }
 
+impl std::fmt::Display for NixCacheNarFileName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 impl NixNarHash {
     pub fn new(raw: impl Into<String>) -> Result<Self, NixNarHashError> {
         let raw = raw.into();
@@ -387,6 +431,63 @@ impl NixNarHash {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    pub fn algorithm(&self) -> &str {
+        self.0
+            .split_once(':')
+            .expect("parsed NarHash always contains algorithm separator")
+            .0
+    }
+
+    pub fn digest(&self) -> &str {
+        self.0
+            .split_once(':')
+            .expect("parsed NarHash always contains digest separator")
+            .1
+    }
+
+    pub fn validate_sha256_body_hash_shape(&self) -> Result<(), NixNarBodyHashError> {
+        let algorithm = self.algorithm();
+        if algorithm != "sha256" {
+            return Err(NixNarBodyHashError::UnsupportedAlgorithm {
+                algorithm: algorithm.to_string(),
+            });
+        }
+        let expected = self.digest();
+        if expected.len() != NIX_SHA256_BASE32_LEN {
+            return Err(NixNarBodyHashError::InvalidDigestLength {
+                actual: expected.len(),
+            });
+        }
+        if !expected
+            .bytes()
+            .all(|byte| NIX_STORE_HASH_ALPHABET.contains(&byte))
+        {
+            return Err(NixNarBodyHashError::InvalidDigestByte);
+        }
+        Ok(())
+    }
+
+    pub fn verify_sha256_body(&self, body: &[u8]) -> Result<(), NixNarBodyHashError> {
+        // Keep this defensive check here even when the VM HTTP admission path
+        // already checked the shape; this public method should be correct when
+        // called directly.
+        self.validate_sha256_body_hash_shape()?;
+        let expected = self.digest();
+        let digest = ring::digest::digest(&ring::digest::SHA256, body);
+        let digest: [u8; NIX_SHA256_DIGEST_LEN] = digest
+            .as_ref()
+            .try_into()
+            .expect("ring SHA-256 digest length should be 32 bytes");
+        let actual = nix_base32_encode_sha256_digest(&digest);
+        if actual != expected {
+            return Err(NixNarBodyHashError::Mismatch {
+                expected: expected.to_string(),
+                actual,
+            });
+        }
+        Ok(())
+    }
 }
 
 impl NixNarSize {
@@ -409,6 +510,29 @@ impl NixNarSize {
 impl std::fmt::Display for NixNarSize {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.0)
+    }
+}
+
+impl NixNarCompression {
+    pub fn new(raw: &str) -> Result<Self, NixNarCompressionError> {
+        match raw {
+            "none" => Ok(Self::None),
+            "xz" => Ok(Self::Xz),
+            _ => Err(NixNarCompressionError::Unsupported),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Xz => "xz",
+        }
+    }
+}
+
+impl std::fmt::Display for NixNarCompression {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -494,6 +618,10 @@ impl NixNarInfo {
         &self.nar_file
     }
 
+    pub fn compression(&self) -> NixNarCompression {
+        self.compression
+    }
+
     pub fn nar_hash(&self) -> &NixNarHash {
         &self.nar_hash
     }
@@ -525,6 +653,7 @@ pub fn parse_narinfo(bytes: &[u8]) -> Result<NixNarInfo, NixNarInfoError> {
     let raw = std::str::from_utf8(bytes).map_err(|_| NixNarInfoError::InvalidUtf8)?;
     let mut store_path = None;
     let mut url = None;
+    let mut compression = None;
     let mut nar_hash = None;
     let mut nar_size = None;
     let mut references = None;
@@ -564,6 +693,15 @@ pub fn parse_narinfo(bytes: &[u8]) -> Result<NixNarInfo, NixNarInfoError> {
                     return Err(NixNarInfoError::EmptyNarHash);
                 }
                 nar_hash = Some(value);
+            }
+            "Compression" => {
+                if compression.is_some() {
+                    return Err(NixNarInfoError::DuplicateCompression);
+                }
+                if value.is_empty() {
+                    return Err(NixNarInfoError::EmptyCompression);
+                }
+                compression = Some(value);
             }
             "NarSize" => {
                 if nar_size.is_some() {
@@ -618,6 +756,13 @@ pub fn parse_narinfo(bytes: &[u8]) -> Result<NixNarInfo, NixNarInfoError> {
         raw: nar_hash.to_string(),
         source,
     })?;
+    let compression = compression.ok_or(NixNarInfoError::MissingCompression)?;
+    let compression = NixNarCompression::new(compression).map_err(|source| {
+        NixNarInfoError::InvalidCompression {
+            raw: compression.to_string(),
+            source,
+        }
+    })?;
     let nar_size = nar_size.ok_or(NixNarInfoError::MissingNarSize)?;
     let nar_size = NixNarSize::new(nar_size).map_err(|source| NixNarInfoError::InvalidNarSize {
         raw: nar_size.to_string(),
@@ -635,6 +780,7 @@ pub fn parse_narinfo(bytes: &[u8]) -> Result<NixNarInfo, NixNarInfoError> {
     Ok(NixNarInfo {
         store_path,
         nar_file,
+        compression,
         nar_hash,
         nar_size,
         references,
@@ -693,6 +839,21 @@ pub fn verify_narinfo_signature(
     } else {
         Err(NixNarInfoError::UntrustedSignatureKey)
     }
+}
+
+pub fn nix_base32_encode_sha256_digest(digest: &[u8; NIX_SHA256_DIGEST_LEN]) -> String {
+    let mut encoded = String::with_capacity(NIX_SHA256_BASE32_LEN);
+    for n in (0..NIX_SHA256_BASE32_LEN).rev() {
+        let bit = n * 5;
+        let byte_index = bit / 8;
+        let bit_offset = bit % 8;
+        debug_assert!(byte_index < NIX_SHA256_DIGEST_LEN);
+        let current = digest[byte_index] as u16;
+        let next = digest.get(byte_index + 1).copied().unwrap_or(0) as u16;
+        let value = (current >> bit_offset) | (next << (8 - bit_offset));
+        encoded.push(NIX_STORE_HASH_ALPHABET[(value & 0x1f) as usize] as char);
+    }
+    encoded
 }
 
 impl NixTrustedPublicKey {
@@ -878,6 +1039,10 @@ mod tests {
         MissingUrl,
         DuplicateUrl,
         UnsafeUrl,
+        MissingCompression,
+        DuplicateCompression,
+        EmptyCompression,
+        BadCompression,
         MissingNarHash,
         DuplicateNarHash,
         MalformedNarHash,
@@ -1002,7 +1167,6 @@ mod tests {
             Just("Deriver"),
             Just("FileHash"),
             Just("FileSize"),
-            Just("Compression"),
             Just("CA"),
         ];
         let value = prop::collection::vec(
@@ -1034,6 +1198,10 @@ mod tests {
             Just(NarInfoMutation::MissingUrl),
             Just(NarInfoMutation::DuplicateUrl),
             Just(NarInfoMutation::UnsafeUrl),
+            Just(NarInfoMutation::MissingCompression),
+            Just(NarInfoMutation::DuplicateCompression),
+            Just(NarInfoMutation::EmptyCompression),
+            Just(NarInfoMutation::BadCompression),
             Just(NarInfoMutation::MissingNarHash),
             Just(NarInfoMutation::DuplicateNarHash),
             Just(NarInfoMutation::MalformedNarHash),
@@ -1060,7 +1228,7 @@ mod tests {
 
     fn narinfo_body(hash: &str, name: &str, file: &str, nar_hash: &str) -> String {
         format!(
-            "StorePath: /nix/store/{hash}-{name}\nURL: nar/{file}\nNarHash: {nar_hash}\nNarSize: 120\nReferences: \nSig: {TEST_SIGNATURE}\n"
+            "StorePath: /nix/store/{hash}-{name}\nURL: nar/{file}\nCompression: xz\nNarHash: {nar_hash}\nNarSize: 120\nReferences: \nSig: {TEST_SIGNATURE}\n"
         )
     }
 
@@ -1081,11 +1249,11 @@ mod tests {
         match mutation {
             NarInfoMutation::MissingStorePath => {
                 format!(
-                    "URL: nar/{file}\nNarHash: {nar_hash}\nNarSize: 120\nReferences: \nSig: {TEST_SIGNATURE}\n"
+                    "URL: nar/{file}\nCompression: xz\nNarHash: {nar_hash}\nNarSize: 120\nReferences: \nSig: {TEST_SIGNATURE}\n"
                 )
             }
             NarInfoMutation::DuplicateStorePath => format!(
-                "StorePath: /nix/store/{hash}-{name}\nStorePath: /nix/store/{hash}-{name}\nURL: nar/{file}\nNarHash: {nar_hash}\nNarSize: 120\nReferences: \nSig: {TEST_SIGNATURE}\n"
+                "StorePath: /nix/store/{hash}-{name}\nStorePath: /nix/store/{hash}-{name}\nURL: nar/{file}\nCompression: xz\nNarHash: {nar_hash}\nNarSize: 120\nReferences: \nSig: {TEST_SIGNATURE}\n"
             ),
             NarInfoMutation::WrongStoreHash => {
                 let wrong = different_hash(hash);
@@ -1093,74 +1261,86 @@ mod tests {
             }
             NarInfoMutation::BadStorePathPrefix => {
                 format!(
-                    "StorePath: /bad/store/{hash}-{name}\nURL: nar/{file}\nNarHash: {nar_hash}\nNarSize: 120\nReferences: \nSig: {TEST_SIGNATURE}\n"
+                    "StorePath: /bad/store/{hash}-{name}\nURL: nar/{file}\nCompression: xz\nNarHash: {nar_hash}\nNarSize: 120\nReferences: \nSig: {TEST_SIGNATURE}\n"
                 )
             }
             NarInfoMutation::BadStorePathName => {
                 format!(
-                    "StorePath: /nix/store/{hash}-{name}:bad\nURL: nar/{file}\nNarHash: {nar_hash}\nNarSize: 120\nReferences: \nSig: {TEST_SIGNATURE}\n"
+                    "StorePath: /nix/store/{hash}-{name}:bad\nURL: nar/{file}\nCompression: xz\nNarHash: {nar_hash}\nNarSize: 120\nReferences: \nSig: {TEST_SIGNATURE}\n"
                 )
             }
             NarInfoMutation::MissingUrl => {
                 format!(
-                    "StorePath: /nix/store/{hash}-{name}\nNarHash: {nar_hash}\nNarSize: 120\nReferences: \nSig: {TEST_SIGNATURE}\n"
+                    "StorePath: /nix/store/{hash}-{name}\nCompression: xz\nNarHash: {nar_hash}\nNarSize: 120\nReferences: \nSig: {TEST_SIGNATURE}\n"
                 )
             }
             NarInfoMutation::DuplicateUrl => format!(
-                "StorePath: /nix/store/{hash}-{name}\nURL: nar/{file}\nURL: nar/{file}\nNarHash: {nar_hash}\nNarSize: 120\nReferences: \nSig: {TEST_SIGNATURE}\n"
+                "StorePath: /nix/store/{hash}-{name}\nURL: nar/{file}\nURL: nar/{file}\nCompression: xz\nNarHash: {nar_hash}\nNarSize: 120\nReferences: \nSig: {TEST_SIGNATURE}\n"
             ),
             NarInfoMutation::UnsafeUrl => format!(
-                "StorePath: /nix/store/{hash}-{name}\nURL: nar/subdir/{file}\nNarHash: {nar_hash}\nNarSize: 120\nReferences: \nSig: {TEST_SIGNATURE}\n"
+                "StorePath: /nix/store/{hash}-{name}\nURL: nar/subdir/{file}\nCompression: xz\nNarHash: {nar_hash}\nNarSize: 120\nReferences: \nSig: {TEST_SIGNATURE}\n"
+            ),
+            NarInfoMutation::MissingCompression => format!(
+                "StorePath: /nix/store/{hash}-{name}\nURL: nar/{file}\nNarHash: {nar_hash}\nNarSize: 120\nReferences: \nSig: {TEST_SIGNATURE}\n"
+            ),
+            NarInfoMutation::DuplicateCompression => format!(
+                "StorePath: /nix/store/{hash}-{name}\nURL: nar/{file}\nCompression: xz\nCompression: xz\nNarHash: {nar_hash}\nNarSize: 120\nReferences: \nSig: {TEST_SIGNATURE}\n"
+            ),
+            NarInfoMutation::EmptyCompression => format!(
+                "StorePath: /nix/store/{hash}-{name}\nURL: nar/{file}\nCompression: \nNarHash: {nar_hash}\nNarSize: 120\nReferences: \nSig: {TEST_SIGNATURE}\n"
+            ),
+            NarInfoMutation::BadCompression => format!(
+                "StorePath: /nix/store/{hash}-{name}\nURL: nar/{file}\nCompression: bzip2\nNarHash: {nar_hash}\nNarSize: 120\nReferences: \nSig: {TEST_SIGNATURE}\n"
             ),
             NarInfoMutation::MissingNarHash => {
                 format!(
-                    "StorePath: /nix/store/{hash}-{name}\nURL: nar/{file}\nNarSize: 120\nReferences: \nSig: {TEST_SIGNATURE}\n"
+                    "StorePath: /nix/store/{hash}-{name}\nURL: nar/{file}\nCompression: xz\nNarSize: 120\nReferences: \nSig: {TEST_SIGNATURE}\n"
                 )
             }
             NarInfoMutation::DuplicateNarHash => format!(
-                "StorePath: /nix/store/{hash}-{name}\nURL: nar/{file}\nNarHash: {nar_hash}\nNarHash: {nar_hash}\nNarSize: 120\nReferences: \nSig: {TEST_SIGNATURE}\n"
+                "StorePath: /nix/store/{hash}-{name}\nURL: nar/{file}\nCompression: xz\nNarHash: {nar_hash}\nNarHash: {nar_hash}\nNarSize: 120\nReferences: \nSig: {TEST_SIGNATURE}\n"
             ),
             NarInfoMutation::MalformedNarHash => format!(
-                "StorePath: /nix/store/{hash}-{name}\nURL: nar/{file}\nNarHash: sha256:{}:extra\nNarSize: 120\nReferences: \nSig: {TEST_SIGNATURE}\n",
+                "StorePath: /nix/store/{hash}-{name}\nURL: nar/{file}\nCompression: xz\nNarHash: sha256:{}:extra\nNarSize: 120\nReferences: \nSig: {TEST_SIGNATURE}\n",
                 nar_hash_digest(nar_hash),
             ),
             NarInfoMutation::EmptyNarHashAlgorithm => format!(
-                "StorePath: /nix/store/{hash}-{name}\nURL: nar/{file}\nNarHash: :{}\nNarSize: 120\nReferences: \nSig: {TEST_SIGNATURE}\n",
+                "StorePath: /nix/store/{hash}-{name}\nURL: nar/{file}\nCompression: xz\nNarHash: :{}\nNarSize: 120\nReferences: \nSig: {TEST_SIGNATURE}\n",
                 nar_hash_digest(nar_hash),
             ),
             NarInfoMutation::BadNarHashAlgorithm => format!(
-                "StorePath: /nix/store/{hash}-{name}\nURL: nar/{file}\nNarHash: SHA256:{}\nNarSize: 120\nReferences: \nSig: {TEST_SIGNATURE}\n",
+                "StorePath: /nix/store/{hash}-{name}\nURL: nar/{file}\nCompression: xz\nNarHash: SHA256:{}\nNarSize: 120\nReferences: \nSig: {TEST_SIGNATURE}\n",
                 nar_hash_digest(nar_hash),
             ),
             NarInfoMutation::BadNarHashDigest => format!(
-                "StorePath: /nix/store/{hash}-{name}\nURL: nar/{file}\nNarHash: {nar_hash}@\nNarSize: 120\nReferences: \nSig: {TEST_SIGNATURE}\n"
+                "StorePath: /nix/store/{hash}-{name}\nURL: nar/{file}\nCompression: xz\nNarHash: {nar_hash}@\nNarSize: 120\nReferences: \nSig: {TEST_SIGNATURE}\n"
             ),
             NarInfoMutation::MissingNarSize => format!(
-                "StorePath: /nix/store/{hash}-{name}\nURL: nar/{file}\nNarHash: {nar_hash}\nReferences: \nSig: {TEST_SIGNATURE}\n"
+                "StorePath: /nix/store/{hash}-{name}\nURL: nar/{file}\nCompression: xz\nNarHash: {nar_hash}\nReferences: \nSig: {TEST_SIGNATURE}\n"
             ),
             NarInfoMutation::DuplicateNarSize => format!(
-                "StorePath: /nix/store/{hash}-{name}\nURL: nar/{file}\nNarHash: {nar_hash}\nNarSize: 120\nNarSize: 120\nReferences: \nSig: {TEST_SIGNATURE}\n"
+                "StorePath: /nix/store/{hash}-{name}\nURL: nar/{file}\nCompression: xz\nNarHash: {nar_hash}\nNarSize: 120\nNarSize: 120\nReferences: \nSig: {TEST_SIGNATURE}\n"
             ),
             NarInfoMutation::EmptyNarSize => format!(
-                "StorePath: /nix/store/{hash}-{name}\nURL: nar/{file}\nNarHash: {nar_hash}\nNarSize: \nReferences: \nSig: {TEST_SIGNATURE}\n"
+                "StorePath: /nix/store/{hash}-{name}\nURL: nar/{file}\nCompression: xz\nNarHash: {nar_hash}\nNarSize: \nReferences: \nSig: {TEST_SIGNATURE}\n"
             ),
             NarInfoMutation::BadNarSize => format!(
-                "StorePath: /nix/store/{hash}-{name}\nURL: nar/{file}\nNarHash: {nar_hash}\nNarSize: 0120\nReferences: \nSig: {TEST_SIGNATURE}\n"
+                "StorePath: /nix/store/{hash}-{name}\nURL: nar/{file}\nCompression: xz\nNarHash: {nar_hash}\nNarSize: 0120\nReferences: \nSig: {TEST_SIGNATURE}\n"
             ),
             NarInfoMutation::MissingReferences => format!(
-                "StorePath: /nix/store/{hash}-{name}\nURL: nar/{file}\nNarHash: {nar_hash}\nNarSize: 120\nSig: {TEST_SIGNATURE}\n"
+                "StorePath: /nix/store/{hash}-{name}\nURL: nar/{file}\nCompression: xz\nNarHash: {nar_hash}\nNarSize: 120\nSig: {TEST_SIGNATURE}\n"
             ),
             NarInfoMutation::DuplicateReferences => format!(
-                "StorePath: /nix/store/{hash}-{name}\nURL: nar/{file}\nNarHash: {nar_hash}\nNarSize: 120\nReferences: \nReferences: \nSig: {TEST_SIGNATURE}\n"
+                "StorePath: /nix/store/{hash}-{name}\nURL: nar/{file}\nCompression: xz\nNarHash: {nar_hash}\nNarSize: 120\nReferences: \nReferences: \nSig: {TEST_SIGNATURE}\n"
             ),
             NarInfoMutation::BadReferences => format!(
-                "StorePath: /nix/store/{hash}-{name}\nURL: nar/{file}\nNarHash: {nar_hash}\nNarSize: 120\nReferences: bad/reference\nSig: {TEST_SIGNATURE}\n"
+                "StorePath: /nix/store/{hash}-{name}\nURL: nar/{file}\nCompression: xz\nNarHash: {nar_hash}\nNarSize: 120\nReferences: bad/reference\nSig: {TEST_SIGNATURE}\n"
             ),
             NarInfoMutation::MissingSignature => format!(
-                "StorePath: /nix/store/{hash}-{name}\nURL: nar/{file}\nNarHash: {nar_hash}\nNarSize: 120\nReferences: \n"
+                "StorePath: /nix/store/{hash}-{name}\nURL: nar/{file}\nCompression: xz\nNarHash: {nar_hash}\nNarSize: 120\nReferences: \n"
             ),
             NarInfoMutation::BadSignature => format!(
-                "StorePath: /nix/store/{hash}-{name}\nURL: nar/{file}\nNarHash: {nar_hash}\nNarSize: 120\nReferences: \nSig: bad signature\n"
+                "StorePath: /nix/store/{hash}-{name}\nURL: nar/{file}\nCompression: xz\nNarHash: {nar_hash}\nNarSize: 120\nReferences: \nSig: bad signature\n"
             ),
         }
     }
@@ -1192,6 +1372,13 @@ mod tests {
             NarInfoMutation::UnsafeUrl => NixNarInfoError::InvalidNarFile {
                 url: format!("nar/subdir/{file}"),
                 source: NixCacheNarFileNameError::Slash,
+            },
+            NarInfoMutation::MissingCompression => NixNarInfoError::MissingCompression,
+            NarInfoMutation::DuplicateCompression => NixNarInfoError::DuplicateCompression,
+            NarInfoMutation::EmptyCompression => NixNarInfoError::EmptyCompression,
+            NarInfoMutation::BadCompression => NixNarInfoError::InvalidCompression {
+                raw: "bzip2".into(),
+                source: NixNarCompressionError::Unsupported,
             },
             NarInfoMutation::MissingNarHash => NixNarInfoError::MissingNarHash,
             NarInfoMutation::DuplicateNarHash => NixNarInfoError::DuplicateNarHash,
@@ -1293,7 +1480,7 @@ mod tests {
             after in prop::collection::vec(narinfo_non_semantic_field(), 0..8),
         ) {
             let raw = format!(
-                "{}Deriver: /nix/store/00000000000000000000000000000000-proof:drv\nStorePath: /nix/store/{hash}-{name}\nURL: nar/{file}\nNarHash: {nar_hash}\nNarSize: 120\nReferences: \nSig: {TEST_SIGNATURE}\n{}",
+                "{}Deriver: /nix/store/00000000000000000000000000000000-proof:drv\nStorePath: /nix/store/{hash}-{name}\nURL: nar/{file}\nCompression: xz\nNarHash: {nar_hash}\nNarSize: 120\nReferences: \nSig: {TEST_SIGNATURE}\n{}",
                 before.concat(),
                 after.concat(),
             );
@@ -1304,6 +1491,7 @@ mod tests {
             prop_assert_eq!(parsed.store_path().as_str(), format!("/nix/store/{hash}-{name}"));
             prop_assert_eq!(parsed.store_path().hash().as_str(), hash.as_str());
             prop_assert_eq!(parsed.nar_file().as_str(), file.as_str());
+            prop_assert_eq!(parsed.compression(), NixNarCompression::Xz);
             prop_assert_eq!(parsed.nar_hash().as_str(), nar_hash.as_str());
             prop_assert_eq!(parsed.nar_size().get(), 120);
         }
@@ -1389,6 +1577,45 @@ mod tests {
     }
 
     #[test]
+    fn nix_base32_sha256_matches_nix_fixture_for_empty_file() {
+        let digest = ring::digest::digest(&ring::digest::SHA256, b"");
+        let digest: [u8; NIX_SHA256_DIGEST_LEN] = digest.as_ref().try_into().unwrap();
+
+        assert_eq!(
+            nix_base32_encode_sha256_digest(&digest),
+            "0mdqa9w1p6cmli6976v4wi0sw9r4p5prkj7lzfd1877wk11c9c73",
+        );
+    }
+
+    #[test]
+    fn nar_hash_verifies_sha256_body_and_rejects_mismatch() {
+        let hash =
+            NixNarHash::new("sha256:0mdqa9w1p6cmli6976v4wi0sw9r4p5prkj7lzfd1877wk11c9c73").unwrap();
+
+        hash.verify_sha256_body(b"").unwrap();
+        assert!(matches!(
+            hash.verify_sha256_body(b"not empty"),
+            Err(NixNarBodyHashError::Mismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn nar_hash_body_verification_rejects_unsupported_shapes() {
+        assert_eq!(
+            NixNarHash::new("sha1:0mdqa9w1p6cmli6976v4wi0sw9r4p5prkj7lzfd1877wk11c9c73")
+                .unwrap()
+                .verify_sha256_body(b""),
+            Err(NixNarBodyHashError::UnsupportedAlgorithm {
+                algorithm: "sha1".into()
+            })
+        );
+        assert_eq!(
+            NixNarHash::new("sha256:0").unwrap().verify_sha256_body(b""),
+            Err(NixNarBodyHashError::InvalidDigestLength { actual: 1 })
+        );
+    }
+
+    #[test]
     fn nix_generated_signed_narinfo_verifies_with_trusted_key() {
         let expected_hash = NixStoreHashPart::new("rzv95bakh41zrn5ji23pfc11x5vq2z4d").unwrap();
         let keys = NixTrustedPublicKeys::from_strings([TEST_PUBLIC_KEY]).unwrap();
@@ -1400,6 +1627,7 @@ mod tests {
         )
         .unwrap();
 
+        assert_eq!(parsed.compression(), NixNarCompression::Xz);
         assert_eq!(parsed.nar_size().get(), 120);
         assert_eq!(parsed.references().iter().count(), 0);
         assert_eq!(parsed.signatures()[0].key_name(), "cache.example");
@@ -1430,6 +1658,7 @@ mod tests {
             ],
         );
         assert_eq!(parsed.nar_size().get(), 216);
+        assert_eq!(parsed.compression(), NixNarCompression::Xz);
         assert_eq!(parsed.signatures()[0].key_name(), "cache.refs");
     }
 
@@ -1474,8 +1703,9 @@ mod tests {
     #[test]
     fn malformed_narinfo_urls_are_rejected() {
         let prefix = "StorePath: /nix/store/00000000000000000000000000000000-proof\n";
-        let suffix =
-            format!("NarHash: sha256:0\nNarSize: 120\nReferences: \nSig: {TEST_SIGNATURE}\n");
+        let suffix = format!(
+            "Compression: xz\nNarHash: sha256:0\nNarSize: 120\nReferences: \nSig: {TEST_SIGNATURE}\n"
+        );
         let cases = vec![
             (
                 format!("URL: nar/proof.nar\n{suffix}"),
@@ -1509,25 +1739,25 @@ mod tests {
             ),
             (
                 format!(
-                    "{prefix}URL: nar/proof.nar\nNarSize: 120\nReferences: \nSig: {TEST_SIGNATURE}\n"
+                    "{prefix}URL: nar/proof.nar\nCompression: xz\nNarSize: 120\nReferences: \nSig: {TEST_SIGNATURE}\n"
                 ),
                 NixNarInfoError::MissingNarHash,
             ),
             (
                 format!(
-                    "{prefix}URL: nar/proof.nar\nNarHash: \nNarSize: 120\nReferences: \nSig: {TEST_SIGNATURE}\n"
+                    "{prefix}URL: nar/proof.nar\nCompression: xz\nNarHash: \nNarSize: 120\nReferences: \nSig: {TEST_SIGNATURE}\n"
                 ),
                 NixNarInfoError::EmptyNarHash,
             ),
             (
                 format!(
-                    "{prefix}URL: nar/proof.nar\nNarHash: sha256:0\nNarHash: sha256:0\nNarSize: 120\nReferences: \nSig: {TEST_SIGNATURE}\n"
+                    "{prefix}URL: nar/proof.nar\nCompression: xz\nNarHash: sha256:0\nNarHash: sha256:0\nNarSize: 120\nReferences: \nSig: {TEST_SIGNATURE}\n"
                 ),
                 NixNarInfoError::DuplicateNarHash,
             ),
             (
                 format!(
-                    "{prefix}URL: nar/proof.nar\nNarHash: sha256:0:extra\nNarSize: 120\nReferences: \nSig: {TEST_SIGNATURE}\n"
+                    "{prefix}URL: nar/proof.nar\nCompression: xz\nNarHash: sha256:0:extra\nNarSize: 120\nReferences: \nSig: {TEST_SIGNATURE}\n"
                 ),
                 NixNarInfoError::InvalidNarHash {
                     raw: "sha256:0:extra".into(),
