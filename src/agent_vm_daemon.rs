@@ -621,7 +621,8 @@ mod tests {
                     "0.0.0.0".parse().unwrap(),
                     BrokerPortRange::new(1024, 65535).unwrap(),
                     git_clone,
-                    VmHttpNixCacheConfig::new("http://127.0.0.1:9", 1024 * 1024).unwrap(),
+                    VmHttpNixCacheConfig::new("http://127.0.0.1:9", 1024 * 1024, 1024 * 1024)
+                        .unwrap(),
                 ),
             )
             .unwrap(),

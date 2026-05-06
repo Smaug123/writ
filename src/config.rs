@@ -111,6 +111,7 @@ pub struct AgentVmHttpConfig {
     pub max_bundle_bytes: u64,
     pub nix_cache_url: String,
     pub nix_cache_max_metadata_bytes: u64,
+    pub nix_cache_max_nar_bytes: u64,
 }
 
 /// Which secret backend to use. The file backend is recommended for
@@ -213,8 +214,11 @@ impl AgentVmHttpConfig {
             Duration::from_secs(self.clone_timeout_secs),
             self.max_bundle_bytes,
         )?;
-        let nix_cache =
-            VmHttpNixCacheConfig::new(&self.nix_cache_url, self.nix_cache_max_metadata_bytes)?;
+        let nix_cache = VmHttpNixCacheConfig::new(
+            &self.nix_cache_url,
+            self.nix_cache_max_metadata_bytes,
+            self.nix_cache_max_nar_bytes,
+        )?;
         Ok(VmHttpGitRuntimeConfig::new(
             self.bind_addr,
             broker_port_range,
@@ -423,7 +427,8 @@ mod tests {
                     "clone_timeout_secs": 30,
                     "max_bundle_bytes": 1048576,
                     "nix_cache_url": "https://cache.nixos.org",
-                    "nix_cache_max_metadata_bytes": 1048576
+                    "nix_cache_max_metadata_bytes": 1048576,
+                    "nix_cache_max_nar_bytes": 67108864
                 }
             }
         }"#;
@@ -447,6 +452,7 @@ mod tests {
             runtime.vm_http().nix_cache().max_metadata_bytes(),
             1_048_576
         );
+        assert_eq!(runtime.vm_http().nix_cache().max_nar_bytes(), 67_108_864);
         assert_eq!(runtime.lifecycle().subnet_index_min(), 252);
         assert_eq!(runtime.lifecycle().subnet_index_max(), 253);
     }
@@ -464,6 +470,7 @@ mod tests {
             max_bundle_bytes: 1_048_576,
             nix_cache_url: "https://cache.nixos.org".into(),
             nix_cache_max_metadata_bytes: 1_048_576,
+            nix_cache_max_nar_bytes: 67_108_864,
         }
     }
 
@@ -639,6 +646,19 @@ mod tests {
             c.to_runtime_config(),
             Err(AgentVmHttpConfigError::NixCache(
                 VmHttpNixCacheConfigError::EmptyMaxMetadataBytes
+            ))
+        ));
+    }
+
+    #[test]
+    fn agent_vm_http_config_rejects_zero_nix_cache_nar_limit() {
+        let mut c = valid_agent_vm_http_config();
+        c.nix_cache_max_nar_bytes = 0;
+
+        assert!(matches!(
+            c.to_runtime_config(),
+            Err(AgentVmHttpConfigError::NixCache(
+                VmHttpNixCacheConfigError::EmptyMaxNarBytes
             ))
         ));
     }

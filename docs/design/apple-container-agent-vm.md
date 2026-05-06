@@ -870,19 +870,19 @@ First daemon-injected guest Nix config slice implemented in
 First brokered Nix metadata proxy slice implemented in `src/vm_http.rs`,
 `src/config.rs`, and `scripts/prove-agent-vm-daemon.sh`:
 
-- `agent_vm.vm_http` now requires an explicit `nix_cache_url` plus a
-  nonzero `nix_cache_max_metadata_bytes`. Startup parsing normalises the
-  upstream base URL, accepts only `http`/`https`, rejects query/fragment
-  components and embedded credentials, and keeps the metadata byte cap typed in
-  the runtime config;
+- `agent_vm.vm_http` now requires an explicit `nix_cache_url`, a nonzero
+  `nix_cache_max_metadata_bytes`, and, after the NAR slice below, a nonzero
+  `nix_cache_max_nar_bytes`. Startup parsing normalises the upstream base URL,
+  accepts only `http`/`https`, rejects query/fragment components and embedded
+  credentials, and keeps the byte caps typed in the runtime config;
 - authenticated `GET`/`HEAD /v1/nix/cache/nix-cache-info` and valid
   `/<hash>.narinfo` requests are proxied to that upstream. Response bodies are
   read with a running byte counter, upstream 404s become controlled broker
   404s, unsupported upstream statuses become 502s, and non-cache paths still
   fail closed before reaching the upstream;
-- this remains a metadata-only proxy. NAR content streaming, signature/content
-  verification, and cache-host allow-lists beyond the configured base URL are
-  still separate slices;
+- at this point the proxy was still metadata-only. NAR content streaming,
+  signature/content verification, and cache-host allow-lists beyond the
+  configured base URL remained separate slices;
 - the daemon proof harness now starts a local fake upstream binary cache and
   verifies that guest Nix causes the daemon to fetch both `nix-cache-info` and
   the target `.narinfo` from that upstream. The VM still observes a controlled
@@ -892,9 +892,10 @@ First brokered Nix metadata proxy slice implemented in `src/vm_http.rs`,
 First brokered Nix cache audit slice implemented in `src/audit.rs` and
 `src/vm_http.rs`:
 
-- audit schema version 2 adds `nix_cache_request` and `nix_cache_outcome`.
+- audit schema version 2 adds `nix_cache_request` and `nix_cache_outcome`;
+  schema version 3 widens the route enum to include bounded NAR body requests.
   The request row records the session, method, target, classified route
-  (`nix-cache-info`, `.narinfo`, or unsupported), and allow/deny decision.
+  (`nix-cache-info`, `.narinfo`, NAR body, or unsupported), and allow/deny decision.
   The outcome row records the broker HTTP status, optional upstream URL and
   upstream status, response byte count, and a bounded error label;
 - the VM HTTP Nix cache route writes the request row before contacting the
@@ -909,6 +910,28 @@ First brokered Nix cache audit slice implemented in `src/audit.rs` and
 - unit tests cover the schema migration, closed/missing-session rejection,
   orphan-outcome rejection, success, controlled miss, local method rejection,
   auth denial, oversized metadata, and unsupported upstream status audit rows.
+
+First brokered Nix NAR transport slice implemented in `src/vm_http.rs`,
+`src/config.rs`, and `src/audit.rs`:
+
+- authenticated `GET`/`HEAD /v1/nix/cache/nar/<file>` requests now proxy to
+  the configured upstream binary cache when `<file>` is a single safe filename
+  segment. Paths with slashes, dot-directory traversal, spaces, query strings,
+  percent-encoded separators, empty names, or leading/trailing dots are
+  rejected before contacting the upstream;
+- NAR responses require an upstream `Content-Length` and that length must be at
+  or below `nix_cache_max_nar_bytes`. Missing lengths and oversized declared
+  lengths fail as audited `502` responses before body streaming begins. `HEAD`
+  is handled as a bounded metadata check with an empty body;
+- successful `GET` streams the NAR body from upstream to the VM instead of
+  buffering it in broker memory. Because the HTTP status and headers are sent
+  before the body is complete, stream-truncation or body-read failures are
+  recorded in the Nix cache audit outcome rather than converted into a different
+  VM-visible status after the fact;
+- this is still only cache transport. It does not sign `.narinfo`, verify
+  upstream cache signatures, check NAR content hashes in the broker, or create a
+  complete substitute-realisation proof. Those remain follow-on slices before
+  treating the VM as able to build entirely from brokered cache authority.
 
 ## Tests and proof spikes
 

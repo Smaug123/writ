@@ -541,6 +541,7 @@ config = {
             "max_bundle_bytes": 1048576,
             "nix_cache_url": f"http://127.0.0.1:{fake_nix_cache_port}",
             "nix_cache_max_metadata_bytes": 1048576,
+            "nix_cache_max_nar_bytes": 67108864,
         },
     },
 }

@@ -90,6 +90,7 @@ pub struct PreMintRecord<'a> {
 pub enum NixCacheAuditRoute {
     CacheInfo,
     NarInfo,
+    Nar,
     Unsupported,
 }
 
@@ -721,6 +722,7 @@ impl NixCacheAuditRoute {
         match self {
             Self::CacheInfo => "cache_info",
             Self::NarInfo => "narinfo",
+            Self::Nar => "nar",
             Self::Unsupported => "unsupported",
         }
     }
@@ -729,6 +731,7 @@ impl NixCacheAuditRoute {
         match raw {
             "cache_info" => Ok(Self::CacheInfo),
             "narinfo" => Ok(Self::NarInfo),
+            "nar" => Ok(Self::Nar),
             "unsupported" => Ok(Self::Unsupported),
             _ => Err(AuditError::Invariant("Nix cache audit route is invalid")),
         }
@@ -881,7 +884,7 @@ struct Migration {
 /// a version higher than this is rejected with [`AuditError::SchemaTooNew`]
 /// rather than opened — we'd rather fail to start than silently drop data
 /// into a schema a newer broker wrote.
-const SCHEMA_VERSION: i32 = 2;
+const SCHEMA_VERSION: i32 = 3;
 
 /// The full migration history. Each entry documents exactly one state
 /// transition; the sequence of entries is the schema's lineage. Order
@@ -991,6 +994,97 @@ CREATE TABLE nix_cache_outcome (
     response_bytes INTEGER NOT NULL CHECK (response_bytes >= 0),
     error          TEXT CHECK (error IS NULL OR error != '')
 );
+
+CREATE TRIGGER nix_cache_request_requires_open_session
+BEFORE INSERT ON nix_cache_request
+WHEN EXISTS (
+    SELECT 1 FROM session
+    WHERE session_id = NEW.session_id AND closed_at IS NOT NULL
+)
+BEGIN
+    SELECT RAISE(ABORT, 'session is closed');
+END;
+"#,
+    },
+    Migration {
+        version: 3,
+        sql: r#"
+DROP TRIGGER nix_cache_request_requires_open_session;
+DROP INDEX idx_nix_cache_request_session;
+
+ALTER TABLE nix_cache_outcome RENAME TO nix_cache_outcome_v2;
+ALTER TABLE nix_cache_request RENAME TO nix_cache_request_v2;
+
+CREATE TABLE nix_cache_request (
+    request_id   TEXT PRIMARY KEY,
+    session_id   TEXT NOT NULL REFERENCES session(session_id),
+    received_at  INTEGER NOT NULL,
+    method       TEXT NOT NULL,
+    target       TEXT NOT NULL,
+    route        TEXT NOT NULL CHECK (route IN ('cache_info', 'narinfo', 'nar', 'unsupported')),
+    decision     TEXT NOT NULL CHECK (decision IN ('allow', 'deny')),
+    deny_reason  TEXT,
+    CHECK (
+        (decision = 'allow' AND deny_reason IS NULL)
+        OR (decision = 'deny' AND deny_reason IS NOT NULL AND deny_reason != '')
+    )
+);
+
+INSERT INTO nix_cache_request (
+    request_id,
+    session_id,
+    received_at,
+    method,
+    target,
+    route,
+    decision,
+    deny_reason
+)
+SELECT
+    request_id,
+    session_id,
+    received_at,
+    method,
+    target,
+    route,
+    decision,
+    deny_reason
+FROM nix_cache_request_v2;
+
+CREATE INDEX idx_nix_cache_request_session
+    ON nix_cache_request(session_id, received_at);
+
+CREATE TABLE nix_cache_outcome (
+    request_id     TEXT PRIMARY KEY REFERENCES nix_cache_request(request_id),
+    completed_at   INTEGER NOT NULL,
+    http_status    INTEGER NOT NULL CHECK (http_status BETWEEN 100 AND 599),
+    upstream_url   TEXT,
+    upstream_status INTEGER CHECK (upstream_status BETWEEN 100 AND 599),
+    response_bytes INTEGER NOT NULL CHECK (response_bytes >= 0),
+    error          TEXT CHECK (error IS NULL OR error != '')
+);
+
+INSERT INTO nix_cache_outcome (
+    request_id,
+    completed_at,
+    http_status,
+    upstream_url,
+    upstream_status,
+    response_bytes,
+    error
+)
+SELECT
+    request_id,
+    completed_at,
+    http_status,
+    upstream_url,
+    upstream_status,
+    response_bytes,
+    error
+FROM nix_cache_outcome_v2;
+
+DROP TABLE nix_cache_outcome_v2;
+DROP TABLE nix_cache_request_v2;
 
 CREATE TRIGGER nix_cache_request_requires_open_session
 BEFORE INSERT ON nix_cache_request
@@ -1266,6 +1360,41 @@ mod tests {
         assert_eq!(entries[0].http_status, Some(401));
         assert_eq!(entries[0].upstream_url, None);
         assert_eq!(entries[0].upstream_status, None);
+    }
+
+    #[test]
+    fn nix_cache_nar_request_route_roundtrips() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+        let request_id = RequestId::new();
+
+        record_nix_cache_request(
+            &log,
+            request_id,
+            s.session_id,
+            &NixCacheAuditDecision::Allow,
+            NixCacheAuditRoute::Nar,
+        )
+        .unwrap();
+        log.record_nix_cache_outcome(&NixCacheOutcomeRecord {
+            request_id,
+            completed_at: UnixMillis::from_millis(1_700_000_130),
+            http_status: 200,
+            upstream_url: Some("https://cache.example.test/nar/proof.nar.xz"),
+            upstream_status: Some(200),
+            response_bytes: 8192,
+            error: None,
+        })
+        .unwrap();
+
+        let entries = log
+            .list_nix_cache_requests_for_session(s.session_id)
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].route, NixCacheAuditRoute::Nar);
+        assert_eq!(entries[0].http_status, Some(200));
+        assert_eq!(entries[0].response_bytes, Some(8192));
     }
 
     #[test]
@@ -2415,6 +2544,39 @@ mod tests {
             &log,
             "nix_cache_request_requires_open_session"
         ));
+    }
+
+    #[test]
+    fn open_migrates_v2_database_to_nar_cache_audit_schema() {
+        let db = NamedTempFile::new().unwrap();
+        {
+            let mut conn = Connection::open(db.path()).unwrap();
+            let tx = conn.transaction().unwrap();
+            tx.execute_batch(MIGRATIONS[0].sql).unwrap();
+            tx.execute_batch(MIGRATIONS[1].sql).unwrap();
+            tx.pragma_update(None, "user_version", 2).unwrap();
+            tx.commit().unwrap();
+        }
+
+        let log = AuditLog::open(db.path()).unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+        let request_id = RequestId::new();
+        record_nix_cache_request(
+            &log,
+            request_id,
+            s.session_id,
+            &NixCacheAuditDecision::Allow,
+            NixCacheAuditRoute::Nar,
+        )
+        .unwrap();
+
+        let entries = log
+            .list_nix_cache_requests_for_session(s.session_id)
+            .unwrap();
+        assert_eq!(read_user_version(&log), SCHEMA_VERSION);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].route, NixCacheAuditRoute::Nar);
     }
 
     /// A DB written by a future broker will carry a user_version beyond
