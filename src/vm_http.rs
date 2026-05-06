@@ -23,6 +23,7 @@ use crate::core::{
     BrokerPort, BrokerPortRange, CapabilityRequest, GitHubAccess, GitHubRequest, Ipv4Cidr,
     RequestId, SessionId, UnixMillis,
 };
+use crate::nix_cache::NixTrustedPublicKeys;
 use crate::secret::SecretStore;
 use crate::server::{BrokerState, CapabilityOutcome, request_capability};
 use crate::vm_git::{
@@ -115,6 +116,7 @@ pub struct VmHttpNixCacheConfig {
     upstream_base_url: reqwest::Url,
     max_metadata_bytes: u64,
     max_nar_bytes: u64,
+    trusted_public_keys: NixTrustedPublicKeys,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -519,6 +521,20 @@ impl VmHttpNixCacheConfig {
         max_metadata_bytes: u64,
         max_nar_bytes: u64,
     ) -> Result<Self, VmHttpNixCacheConfigError> {
+        Self::new_with_trusted_public_keys(
+            upstream_base_url,
+            max_metadata_bytes,
+            max_nar_bytes,
+            NixTrustedPublicKeys::empty(),
+        )
+    }
+
+    pub fn new_with_trusted_public_keys(
+        upstream_base_url: impl AsRef<str>,
+        max_metadata_bytes: u64,
+        max_nar_bytes: u64,
+        trusted_public_keys: NixTrustedPublicKeys,
+    ) -> Result<Self, VmHttpNixCacheConfigError> {
         let raw = upstream_base_url.as_ref();
         if raw.is_empty() {
             return Err(VmHttpNixCacheConfigError::EmptyUpstreamUrl);
@@ -559,6 +575,7 @@ impl VmHttpNixCacheConfig {
             upstream_base_url: url,
             max_metadata_bytes,
             max_nar_bytes,
+            trusted_public_keys,
         })
     }
 
@@ -572,6 +589,10 @@ impl VmHttpNixCacheConfig {
 
     pub fn max_nar_bytes(&self) -> u64 {
         self.max_nar_bytes
+    }
+
+    pub fn trusted_public_keys(&self) -> &NixTrustedPublicKeys {
+        &self.trusted_public_keys
     }
 }
 

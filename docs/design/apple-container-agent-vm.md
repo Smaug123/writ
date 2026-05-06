@@ -933,6 +933,22 @@ First brokered Nix NAR transport slice implemented in `src/vm_http.rs`,
   complete substitute-realisation proof. Those remain follow-on slices before
   treating the VM as able to build entirely from brokered cache authority.
 
+First brokered Nix cache trust-key plumbing slice implemented in
+`src/nix_cache.rs`, `src/config.rs`, and `src/agent_vm_daemon.rs`:
+
+- `agent_vm.vm_http` now accepts optional
+  `nix_cache_trusted_public_keys`, parsed as Nix `name:base64` public keys.
+  The parser rejects empty values, whitespace/control-byte shapes, multiple
+  separators, and malformed base64 padding before the runtime config is built;
+- daemon-managed VM start joins those typed keys into the generated guest
+  `nix.conf` as `trusted-public-keys = ...`. The field defaults to an empty
+  list so the current proof harness can keep exercising authenticated cache
+  misses against an unsigned fake cache;
+- this deliberately does not disable Nix signature checks. The next proof slice
+  should generate a signed fake binary cache, configure the daemon with that
+  cache's public key, and prove a real substitute can be realised through the
+  brokered VM HTTP cache route.
+
 ## Tests and proof spikes
 
 First pure slice implemented in `src/core/agent_vm.rs`:

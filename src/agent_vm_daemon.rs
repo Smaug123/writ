@@ -38,6 +38,7 @@ pub const AGENT_VM_NIX_CACHE_URL_ENV: &str = "WRIT_NIX_CACHE_URL";
 pub const AGENT_VM_NIX_BASIC_LOGIN_ENV: &str = "WRIT_NIX_BASIC_LOGIN";
 pub const AGENT_VM_NIX_NETRC_ENV: &str = "WRIT_NIX_NETRC";
 pub const AGENT_VM_NIX_NETRC_PATH: &str = "/run/writ-agent-vm/netrc";
+pub const AGENT_VM_NIX_TRUSTED_PUBLIC_KEYS_ENV: &str = "WRIT_NIX_TRUSTED_PUBLIC_KEYS";
 pub const AGENT_VM_NIX_CONF_DIR_ENV: &str = "NIX_CONF_DIR";
 pub const AGENT_VM_NIX_CONF_DIR: &str = "/run/writ-agent-vm/nix-conf";
 
@@ -46,6 +47,7 @@ const AGENT_VM_GUEST_NIX_SETUP_SCRIPT: &str = r#"set -eu
 : "${WRIT_NIX_CACHE_URL:?}"
 : "${WRIT_NIX_BASIC_LOGIN:?}"
 : "${WRIT_NIX_NETRC:?}"
+: "${WRIT_NIX_TRUSTED_PUBLIC_KEYS:=}"
 : "${NIX_CONF_DIR:?}"
 
 case "$WRIT_NIX_CACHE_URL" in
@@ -64,7 +66,11 @@ if [ -z "$cache_host" ]; then
   exit 64
 fi
 
-mkdir -p /run/writ-agent-vm "$NIX_CONF_DIR"
+netrc_dir="${WRIT_NIX_NETRC%/*}"
+if [ "$netrc_dir" = "$WRIT_NIX_NETRC" ]; then
+  netrc_dir=.
+fi
+mkdir -p "$netrc_dir" "$NIX_CONF_DIR"
 umask 077
 printf 'machine %s login %s password %s\n' \
   "$cache_host" "$WRIT_NIX_BASIC_LOGIN" "$WRIT_BROKER_TOKEN" > "$WRIT_NIX_NETRC"
@@ -73,7 +79,11 @@ printf 'machine %s login %s password %s\n' \
   printf 'netrc-file = %s\n' "$WRIT_NIX_NETRC"
   printf 'access-tokens =\n'
   printf 'substituters = %s\n' "$WRIT_NIX_CACHE_URL"
-  printf 'trusted-public-keys =\n'
+  if [ -n "$WRIT_NIX_TRUSTED_PUBLIC_KEYS" ]; then
+    printf 'trusted-public-keys = %s\n' "$WRIT_NIX_TRUSTED_PUBLIC_KEYS"
+  else
+    printf 'trusted-public-keys =\n'
+  fi
 } > "$NIX_CONF_DIR/nix.conf"
 
 exec "$@"
@@ -340,6 +350,12 @@ impl AgentVmDaemon {
         let broker_port = prepared.broker_port();
         let broker_url = format!("http://{}:{}/", network.ipv4_gateway(), broker_port.get());
         let nix_cache_url = nix_cache_url_for_broker_url(&broker_url);
+        let trusted_public_keys = self
+            .config
+            .vm_http
+            .nix_cache()
+            .trusted_public_keys()
+            .nix_conf_value();
         let broker_ports = BrokerPorts::new([broker_port])?;
         let guest_env = vec![
             AgentVmGuestEnvVar::new(AGENT_VM_BROKER_URL_ENV, broker_url.clone())?,
@@ -350,6 +366,7 @@ impl AgentVmDaemon {
             AgentVmGuestEnvVar::new(AGENT_VM_NIX_CACHE_URL_ENV, nix_cache_url)?,
             AgentVmGuestEnvVar::new(AGENT_VM_NIX_BASIC_LOGIN_ENV, VM_NIX_BASIC_LOGIN)?,
             AgentVmGuestEnvVar::new(AGENT_VM_NIX_NETRC_ENV, AGENT_VM_NIX_NETRC_PATH)?,
+            AgentVmGuestEnvVar::new(AGENT_VM_NIX_TRUSTED_PUBLIC_KEYS_ENV, trusted_public_keys)?,
             AgentVmGuestEnvVar::new(AGENT_VM_NIX_CONF_DIR_ENV, AGENT_VM_NIX_CONF_DIR)?,
         ];
         let guest_command = wrap_guest_command_with_nix_setup(guest_command);
@@ -453,6 +470,7 @@ mod tests {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
+    use std::process::Command;
     use std::sync::Mutex as StdMutex;
 
     use crate::audit::AuditLog;
@@ -462,6 +480,7 @@ mod tests {
         BrokerPort, BrokerPortRange, BrokerPorts, Ipv4Cidr, Ipv6Cidr, RepoRef, TtlSeconds,
     };
     use crate::github::{GitHubAppConfig, GitHubMinter};
+    use crate::nix_cache::NixTrustedPublicKeys;
     use crate::policy::PolicyConfig;
     use crate::secret::{SecretError, SecretKey};
     use crate::vm_git_bundle::{GitCredentialBoundary, GitSecretEnvVar};
@@ -621,8 +640,16 @@ mod tests {
                     "0.0.0.0".parse().unwrap(),
                     BrokerPortRange::new(1024, 65535).unwrap(),
                     git_clone,
-                    VmHttpNixCacheConfig::new("http://127.0.0.1:9", 1024 * 1024, 1024 * 1024)
+                    VmHttpNixCacheConfig::new_with_trusted_public_keys(
+                        "http://127.0.0.1:9",
+                        1024 * 1024,
+                        1024 * 1024,
+                        NixTrustedPublicKeys::from_strings(
+                            ["cache.example-1:QUJDRA==".to_string()],
+                        )
                         .unwrap(),
+                    )
+                    .unwrap(),
                 ),
             )
             .unwrap(),
@@ -692,6 +719,9 @@ mod tests {
         )));
         assert!(env.contains(&format!(
             "{AGENT_VM_NIX_NETRC_ENV}={AGENT_VM_NIX_NETRC_PATH}"
+        )));
+        assert!(env.contains(&format!(
+            "{AGENT_VM_NIX_TRUSTED_PUBLIC_KEYS_ENV}=cache.example-1:QUJDRA=="
         )));
         assert!(env.contains(&format!(
             "{AGENT_VM_NIX_CONF_DIR_ENV}={AGENT_VM_NIX_CONF_DIR}"
@@ -844,6 +874,40 @@ mod tests {
         assert_eq!(
             nix_cache_url_for_broker_url("http://192.168.252.1:51375"),
             "http://192.168.252.1:51375/v1/nix/cache"
+        );
+    }
+
+    #[test]
+    fn guest_nix_setup_script_writes_configured_trusted_public_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let netrc = dir.path().join("run").join("netrc");
+        let nix_conf_dir = dir.path().join("nix-conf");
+        let trusted_public_keys = "cache.example-1:QUJDRA== cache.example-2:RUZHSA==";
+
+        let status = Command::new("sh")
+            .arg("-c")
+            .arg(AGENT_VM_GUEST_NIX_SETUP_SCRIPT)
+            .arg("writ-agent-vm-nix-setup")
+            .arg("true")
+            .env("WRIT_BROKER_TOKEN", "writ-vm-token")
+            .env(
+                "WRIT_NIX_CACHE_URL",
+                "http://192.168.252.1:51375/v1/nix/cache",
+            )
+            .env("WRIT_NIX_BASIC_LOGIN", VM_NIX_BASIC_LOGIN)
+            .env("WRIT_NIX_NETRC", &netrc)
+            .env(AGENT_VM_NIX_TRUSTED_PUBLIC_KEYS_ENV, trusted_public_keys)
+            .env("NIX_CONF_DIR", &nix_conf_dir)
+            .status()
+            .unwrap();
+
+        assert!(status.success());
+        let nix_conf = fs::read_to_string(nix_conf_dir.join("nix.conf")).unwrap();
+        assert!(nix_conf.contains(&format!("trusted-public-keys = {trusted_public_keys}\n")));
+        let netrc = fs::read_to_string(netrc).unwrap();
+        assert_eq!(
+            netrc,
+            "machine 192.168.252.1 login writ-vm password writ-vm-token\n"
         );
     }
 

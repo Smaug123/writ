@@ -16,6 +16,7 @@ use crate::agent_vm_lifecycle::{
 };
 use crate::core::{AgentNetworkPool, AgentVmConfigError, BrokerPortRange, Ipv4Cidr, Ipv6Cidr};
 use crate::github::GitHubAppConfig;
+use crate::nix_cache::{NixTrustedPublicKeys, NixTrustedPublicKeysError};
 use crate::policy::PolicyConfig;
 use crate::vm_git_bundle::{
     GitCloneBundlePlanError, GitCredentialBoundary, GitSecretEnvVar, GitSecretEnvVarError,
@@ -110,6 +111,8 @@ pub struct AgentVmHttpConfig {
     pub clone_timeout_secs: u64,
     pub max_bundle_bytes: u64,
     pub nix_cache_url: String,
+    #[serde(default)]
+    pub nix_cache_trusted_public_keys: Vec<String>,
     pub nix_cache_max_metadata_bytes: u64,
     pub nix_cache_max_nar_bytes: u64,
 }
@@ -139,6 +142,8 @@ pub enum AgentVmHttpConfigError {
     GitClone(#[from] GitCloneBundlePlanError),
     #[error(transparent)]
     NixCache(#[from] VmHttpNixCacheConfigError),
+    #[error(transparent)]
+    NixTrustedPublicKeys(#[from] NixTrustedPublicKeysError),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -214,10 +219,13 @@ impl AgentVmHttpConfig {
             Duration::from_secs(self.clone_timeout_secs),
             self.max_bundle_bytes,
         )?;
-        let nix_cache = VmHttpNixCacheConfig::new(
+        let trusted_public_keys =
+            NixTrustedPublicKeys::from_strings(self.nix_cache_trusted_public_keys.clone())?;
+        let nix_cache = VmHttpNixCacheConfig::new_with_trusted_public_keys(
             &self.nix_cache_url,
             self.nix_cache_max_metadata_bytes,
             self.nix_cache_max_nar_bytes,
+            trusted_public_keys,
         )?;
         Ok(VmHttpGitRuntimeConfig::new(
             self.bind_addr,
@@ -427,6 +435,9 @@ mod tests {
                     "clone_timeout_secs": 30,
                     "max_bundle_bytes": 1048576,
                     "nix_cache_url": "https://cache.nixos.org",
+                    "nix_cache_trusted_public_keys": [
+                        "cache.nixos.org-1:QUJDRA=="
+                    ],
                     "nix_cache_max_metadata_bytes": 1048576,
                     "nix_cache_max_nar_bytes": 67108864
                 }
@@ -453,6 +464,14 @@ mod tests {
             1_048_576
         );
         assert_eq!(runtime.vm_http().nix_cache().max_nar_bytes(), 67_108_864);
+        assert_eq!(
+            runtime
+                .vm_http()
+                .nix_cache()
+                .trusted_public_keys()
+                .nix_conf_value(),
+            "cache.nixos.org-1:QUJDRA=="
+        );
         assert_eq!(runtime.lifecycle().subnet_index_min(), 252);
         assert_eq!(runtime.lifecycle().subnet_index_max(), 253);
     }
@@ -469,6 +488,7 @@ mod tests {
             clone_timeout_secs: 30,
             max_bundle_bytes: 1_048_576,
             nix_cache_url: "https://cache.nixos.org".into(),
+            nix_cache_trusted_public_keys: Vec::new(),
             nix_cache_max_metadata_bytes: 1_048_576,
             nix_cache_max_nar_bytes: 67_108_864,
         }
@@ -660,6 +680,18 @@ mod tests {
             Err(AgentVmHttpConfigError::NixCache(
                 VmHttpNixCacheConfigError::EmptyMaxNarBytes
             ))
+        ));
+    }
+
+    #[test]
+    fn agent_vm_http_config_rejects_invalid_nix_cache_trusted_public_key() {
+        let mut c = valid_agent_vm_http_config();
+        c.nix_cache_trusted_public_keys = vec!["cache key:QUJDRA==".into()];
+
+        assert!(matches!(
+            c.to_runtime_config(),
+            Err(AgentVmHttpConfigError::NixTrustedPublicKeys(err))
+                if err.index() == 0 && err.raw() == "cache key:QUJDRA=="
         ));
     }
 

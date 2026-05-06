@@ -1663,9 +1663,10 @@ impl AgentVmGuestEnvVar {
     /// Construct one environment variable for the transient Apple Container
     /// env file. This type enforces shell-style names and single-line values;
     /// callers should only pass value bytes that Apple's env-file parser will
-    /// preserve literally. The daemon currently uses it only for a broker URL
-    /// and opaque bearer token, which avoid leading/trailing whitespace, `#`,
-    /// and additional `=` parser ambiguities.
+    /// preserve literally. The daemon currently uses values such as broker
+    /// URLs, paths, cache public-key lists, and opaque bearer tokens, which
+    /// avoid leading/trailing whitespace, `#`, and additional `=` parser
+    /// ambiguities.
     pub fn new(
         name: impl Into<String>,
         value: impl Into<String>,

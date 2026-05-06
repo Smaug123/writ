@@ -19,6 +19,8 @@ pub mod core;
 #[cfg(feature = "host")]
 pub mod github;
 #[cfg(feature = "host")]
+pub mod nix_cache;
+#[cfg(feature = "host")]
 pub mod policy;
 #[cfg(feature = "host")]
 pub mod protocol;
