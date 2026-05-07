@@ -762,7 +762,10 @@ fn validate_git_ref(raw: &str) -> Result<(), GitCloneRefError> {
         }
     }
     for component in raw.split('/') {
-        if component.starts_with('.') || component.ends_with(".lock") {
+        if component.starts_with('.') || component.ends_with('.') {
+            return Err(GitCloneRefError::ForbiddenSequence("."));
+        }
+        if component.ends_with(".lock") {
             return Err(GitCloneRefError::ForbiddenSequence(".lock"));
         }
     }
@@ -811,7 +814,10 @@ fn validate_git_branch_name(raw: &str) -> Result<(), GitBranchNameError> {
         }
     }
     for component in raw.split('/') {
-        if component.starts_with('.') || component.ends_with(".lock") {
+        if component.starts_with('.') || component.ends_with('.') {
+            return Err(GitBranchNameError::ForbiddenSequence("."));
+        }
+        if component.ends_with(".lock") {
             return Err(GitBranchNameError::ForbiddenSequence(".lock"));
         }
     }
@@ -834,6 +840,8 @@ fn validate_git_object_id(raw: &str) -> Result<(), GitObjectIdError> {
 mod tests {
     use super::*;
     use proptest::prelude::*;
+    use std::path::PathBuf;
+    use std::process::Command;
 
     fn repo(owner: &str, name: &str) -> GitCloneRepo {
         format!("{owner}/{name}").parse().unwrap()
@@ -892,6 +900,35 @@ mod tests {
         git_ref_strategy()
     }
 
+    fn git_branch_oracle_char_strategy() -> impl Strategy<Value = char> {
+        prop_oneof![
+            ascii_alnum(),
+            Just('/'),
+            Just('.'),
+            Just('_'),
+            Just('-'),
+            Just('@'),
+            Just('{'),
+            Just(' '),
+            Just('~'),
+            Just('^'),
+            Just(':'),
+            Just('?'),
+            Just('*'),
+            Just('['),
+            Just('\\'),
+        ]
+    }
+
+    fn git_branch_oracle_candidate_strategy() -> impl Strategy<Value = String> {
+        prop_oneof![
+            git_branch_strategy(),
+            invalid_git_branch_strategy(),
+            prop::collection::vec(git_branch_oracle_char_strategy(), 0..40)
+                .prop_map(|chars| chars.into_iter().collect()),
+        ]
+    }
+
     fn object_id_strategy() -> impl Strategy<Value = String> {
         "[0-9a-fA-F]{40}"
     }
@@ -908,6 +945,7 @@ mod tests {
             "[A-Za-z0-9._-]{0,20}".prop_map(|prefix| format!("{prefix}/.hidden")),
             "[A-Za-z0-9._-]{0,20}".prop_map(|prefix| format!("{prefix}.lock/x")),
             "[A-Za-z0-9_-]{0,20}".prop_map(|prefix| format!("{prefix}.")),
+            "[A-Za-z0-9_-]{1,20}".prop_map(|component| format!("feature/{component}./y")),
             Just("@".to_string()),
             "[A-Za-z0-9._/-]{0,20}".prop_map(|prefix| format!("{prefix}:x")),
             "[A-Za-z0-9._/-]{0,20}".prop_map(|prefix| format!("{prefix} x")),
@@ -944,6 +982,32 @@ mod tests {
 
     fn push_limits() -> VmGitPushBodyLimits {
         VmGitPushBodyLimits::new(4096, 1024, 1024).unwrap()
+    }
+
+    fn required_test_tool(name: &str) -> PathBuf {
+        let path = std::env::var_os("PATH")
+            .unwrap_or_else(|| panic!("PATH must contain {name} for vm_git tests"));
+        for dir in std::env::split_paths(&path) {
+            let candidate = if dir.is_absolute() {
+                dir.join(name)
+            } else {
+                std::env::current_dir().unwrap().join(dir).join(name)
+            };
+            if candidate.is_file() {
+                return candidate;
+            }
+        }
+        panic!("{name} not found on PATH for vm_git tests");
+    }
+
+    fn git_check_ref_format_branch_accepts(raw: &str) -> bool {
+        Command::new(required_test_tool("git"))
+            .args(["check-ref-format", "--branch", raw])
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .unwrap_or_else(|err| panic!("failed to run git check-ref-format: {err}"))
+            .status
+            .success()
     }
 
     proptest! {
@@ -993,6 +1057,25 @@ mod tests {
             prop_assert!(
                 raw.parse::<GitBranchName>().is_err(),
                 "accepted invalid branch {raw:?}"
+            );
+        }
+
+        #[test]
+        fn git_branch_validator_matches_git_check_ref_format_branch_and_broker_rules(
+            raw in git_branch_oracle_candidate_strategy(),
+        ) {
+            let git_accepts = git_check_ref_format_branch_accepts(&raw);
+            let expected = git_accepts
+                && !raw.starts_with("refs/")
+                && raw != "@"
+                && !raw.split('/').any(|component| component.ends_with('.'));
+            let actual = raw.parse::<GitBranchName>().is_ok();
+
+            prop_assert_eq!(
+                actual,
+                expected,
+                "validator disagrees with git check-ref-format plus broker branch rules for {:?}",
+                raw
             );
         }
 

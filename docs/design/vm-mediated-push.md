@@ -109,10 +109,10 @@ Add VM-facing push types beside the clone types:
 - `VmGitPushReceipt`.
 
 `GitBranchName` is a branch name, not a full ref. Parsing rejects empty names,
-path traversal, control bytes, leading dash, ref lock suffixes, double slash,
-`..`, `@{`, `\`, and any name for which `refs/heads/<name>` would fail
-`git check-ref-format --branch` equivalently. Interior code constructs
-`refs/heads/<branch>` itself.
+path traversal, control bytes, leading dash, ref lock suffixes, path components
+ending in `.`, double slash, `..`, `@{`, `\`, bare `@`, and any name for which
+`refs/heads/<name>` would fail `git check-ref-format --branch` equivalently.
+Interior code constructs `refs/heads/<branch>` itself.
 
 `GitObjectId` is a lowercase or uppercase 40-hex string normalized to lowercase
 at the boundary.
@@ -162,8 +162,8 @@ For one authenticated VM push request:
 
 1. Parse the length-prefixed request body into typed metadata and bounded bundle
    bytes.
-2. Record `git_push_request` with the parsed intent, session ID, received time,
-   and initial decision state before minting credentials or contacting GitHub.
+2. Record `git_push_request` with the parsed intent, session ID, and received
+   time before minting credentials or contacting GitHub.
 3. Request a contents-write capability through the existing broker path.
    This records the ordinary capability request, policy decision, grant, or
    mint failure. If policy denies, record a denied push outcome and stop.
@@ -256,8 +256,10 @@ CREATE TABLE git_push_outcome (
 );
 ```
 
-Exact column names can change during implementation, but these invariants must
-not:
+Exact column names can change during implementation. The current
+implementation reifies the decision state through the presence or absence of
+`git_push_attempt` and `git_push_outcome` rows rather than a
+`git_push_request.decision` column, but these invariants must not change:
 
 - `git_push_request` requires an open session and commits before minting or
   contacting GitHub.

@@ -801,9 +801,9 @@ impl AuditLog {
     pub fn record_git_push_attempt(&self, r: &GitPushAttemptRecord) -> Result<(), AuditError> {
         self.with_conn_mut(|c| {
             let tx = c.transaction()?;
-            let push_request: Option<(String, String, String, String, String, String)> = tx
+            let push_request: Option<(String, String, String, String, String)> = tx
                 .query_row(
-                    "SELECT session_id, repo, branch, expected_remote_head, new_head, push_request_id
+                    "SELECT session_id, repo, branch, expected_remote_head, new_head
                      FROM git_push_request
                      WHERE push_request_id = ?1",
                     params![r.push_request_id.as_uuid().to_string()],
@@ -814,7 +814,6 @@ impl AuditLog {
                             row.get(2)?,
                             row.get(3)?,
                             row.get(4)?,
-                            row.get(5)?,
                         ))
                     },
                 )
@@ -825,15 +824,21 @@ impl AuditLog {
                 request_branch,
                 request_old_head,
                 request_new_head,
-                _,
             )) = push_request
             else {
                 return Err(AuditError::Invariant("git push request does not exist"));
             };
 
-            if request_repo != r.repo.to_string() {
-                return Err(AuditError::Invariant("git push attempt repo differs from request"));
+            let request_repo = request_repo
+                .parse::<GitCloneRepo>()
+                .map_err(|_| AuditError::Invariant("git push request repo is invalid"))?;
+            if !request_repo.as_repo_ref().matches(r.repo.as_repo_ref()) {
+                return Err(AuditError::Invariant(
+                    "git push attempt repo differs from request",
+                ));
             }
+            // Branch refnames are case-sensitive. Unlike GitHub owner/repo
+            // names, a case-only branch change can target a different ref.
             if request_branch != r.branch.as_str() {
                 return Err(AuditError::Invariant(
                     "git push attempt branch differs from request",
@@ -1227,7 +1232,7 @@ impl AuditLog {
                      r.repo,
                      r.branch,
                      r.expected_remote_head,
-                     r.new_head,
+                     r.new_head AS request_new_head,
                      a.push_attempt_id,
                      a.capability_request_id,
                      a.grant_jti,
@@ -1612,23 +1617,23 @@ fn nix_cache_audit_entry_from_row(
 fn git_push_audit_entry_from_row(
     row: &Row<'_>,
 ) -> rusqlite::Result<Result<GitPushAuditEntry, AuditError>> {
-    let push_request_id_str: String = row.get(0)?;
-    let session_id_str: String = row.get(1)?;
-    let received_at: i64 = row.get(2)?;
-    let repo_str: String = row.get(3)?;
-    let branch_str: String = row.get(4)?;
-    let expected_remote_head_str: String = row.get(5)?;
-    let new_head_str: String = row.get(6)?;
-    let push_attempt_id_str: Option<String> = row.get(7)?;
-    let capability_request_id_str: Option<String> = row.get(8)?;
-    let grant_jti_str: Option<String> = row.get(9)?;
-    let planned_at: Option<i64> = row.get(10)?;
-    let old_head_str: Option<String> = row.get(11)?;
-    let attempted_new_head_str: Option<String> = row.get(12)?;
-    let completed_at: Option<i64> = row.get(13)?;
-    let result_str: Option<String> = row.get(14)?;
-    let github_status: Option<i64> = row.get(15)?;
-    let message: Option<String> = row.get(16)?;
+    let push_request_id_str: String = row.get("push_request_id")?;
+    let session_id_str: String = row.get("session_id")?;
+    let received_at: i64 = row.get("received_at")?;
+    let repo_str: String = row.get("repo")?;
+    let branch_str: String = row.get("branch")?;
+    let expected_remote_head_str: String = row.get("expected_remote_head")?;
+    let new_head_str: String = row.get("request_new_head")?;
+    let push_attempt_id_str: Option<String> = row.get("push_attempt_id")?;
+    let capability_request_id_str: Option<String> = row.get("capability_request_id")?;
+    let grant_jti_str: Option<String> = row.get("grant_jti")?;
+    let planned_at: Option<i64> = row.get("planned_at")?;
+    let old_head_str: Option<String> = row.get("old_head")?;
+    let attempted_new_head_str: Option<String> = row.get("attempted_new_head")?;
+    let completed_at: Option<i64> = row.get("completed_at")?;
+    let result_str: Option<String> = row.get("result")?;
+    let github_status: Option<i64> = row.get("github_status")?;
+    let message: Option<String> = row.get("message")?;
 
     let parse = || -> Result<GitPushAuditEntry, AuditError> {
         let push_request_id = uuid::Uuid::parse_str(&push_request_id_str)
@@ -2356,6 +2361,7 @@ mod tests {
         AgentKind, GitHubAccess, GitHubGrantedScope, GitHubPermissions, GitHubRequest,
         MetadataAccess, RepoRef, TtlSeconds,
     };
+    use proptest::prelude::*;
     use tempfile::NamedTempFile;
 
     fn sample_session() -> SessionRecord {
@@ -2396,6 +2402,14 @@ mod tests {
 
     fn sample_git_repo() -> GitCloneRepo {
         GitCloneRepo::new(sample_repo()).unwrap()
+    }
+
+    fn git_repo(owner: &str, name: &str) -> GitCloneRepo {
+        GitCloneRepo::new(RepoRef {
+            owner: owner.into(),
+            name: name.into(),
+        })
+        .unwrap()
     }
 
     fn git_oid(nibble: char) -> GitObjectId {
@@ -2450,6 +2464,117 @@ mod tests {
         };
         log.record_grant(&grant).unwrap();
         grant
+    }
+
+    #[derive(Clone, Debug)]
+    enum GitPushAuditScript {
+        ValidAttempted {
+            result: GitPushOutcomeResult,
+            github_status: Option<u16>,
+            close_before_outcome: bool,
+            attempt_repo_case_differs: bool,
+        },
+        ValidUnattempted {
+            result: GitPushOutcomeResult,
+            close_before_outcome: bool,
+        },
+        RequestAfterClose,
+        AttemptBeforeRequest,
+        AttemptMissingGrant,
+        AttemptMismatchedRepo,
+        AttemptMismatchedBranch,
+        OutcomeWithoutRequest,
+        OutcomeRequiresAttemptWithoutAttempt {
+            result: GitPushOutcomeResult,
+        },
+        OutcomeUnexpectedAttempt {
+            result: GitPushOutcomeResult,
+        },
+        OutcomeDifferentRequest {
+            result: GitPushOutcomeResult,
+        },
+    }
+
+    fn attempted_git_push_result_strategy() -> impl Strategy<Value = GitPushOutcomeResult> {
+        prop_oneof![
+            Just(GitPushOutcomeResult::Pushed),
+            Just(GitPushOutcomeResult::LeaseRejected),
+            Just(GitPushOutcomeResult::PushRejected),
+            Just(GitPushOutcomeResult::PushFailed),
+            Just(GitPushOutcomeResult::AuditFailedAfterPush),
+        ]
+    }
+
+    fn unattempted_git_push_result_strategy() -> impl Strategy<Value = GitPushOutcomeResult> {
+        prop_oneof![
+            Just(GitPushOutcomeResult::Denied),
+            Just(GitPushOutcomeResult::ValidationFailed),
+        ]
+    }
+
+    fn github_status_strategy() -> impl Strategy<Value = Option<u16>> {
+        prop_oneof![Just(None), (100u16..=599).prop_map(Some)]
+    }
+
+    fn git_push_audit_script_strategy() -> impl Strategy<Value = GitPushAuditScript> {
+        prop_oneof![
+            (
+                attempted_git_push_result_strategy(),
+                github_status_strategy(),
+                any::<bool>(),
+                any::<bool>(),
+            )
+                .prop_map(
+                    |(result, github_status, close_before_outcome, attempt_repo_case_differs)| {
+                        GitPushAuditScript::ValidAttempted {
+                            result,
+                            github_status,
+                            close_before_outcome,
+                            attempt_repo_case_differs,
+                        }
+                    },
+                ),
+            (unattempted_git_push_result_strategy(), any::<bool>()).prop_map(
+                |(result, close_before_outcome)| GitPushAuditScript::ValidUnattempted {
+                    result,
+                    close_before_outcome,
+                },
+            ),
+            Just(GitPushAuditScript::RequestAfterClose),
+            Just(GitPushAuditScript::AttemptBeforeRequest),
+            Just(GitPushAuditScript::AttemptMissingGrant),
+            Just(GitPushAuditScript::AttemptMismatchedRepo),
+            Just(GitPushAuditScript::AttemptMismatchedBranch),
+            Just(GitPushAuditScript::OutcomeWithoutRequest),
+            attempted_git_push_result_strategy().prop_map(|result| {
+                GitPushAuditScript::OutcomeRequiresAttemptWithoutAttempt { result }
+            },),
+            unattempted_git_push_result_strategy()
+                .prop_map(|result| GitPushAuditScript::OutcomeUnexpectedAttempt { result }),
+            attempted_git_push_result_strategy()
+                .prop_map(|result| GitPushAuditScript::OutcomeDifferentRequest { result }),
+        ]
+    }
+
+    fn git_push_attempt_record(
+        push_attempt_id: RequestId,
+        push_request_id: RequestId,
+        capability_request_id: RequestId,
+        grant_jti: Jti,
+        repo: GitCloneRepo,
+        branch: GitBranchName,
+    ) -> GitPushAttemptRecord {
+        GitPushAttemptRecord {
+            push_attempt_id,
+            push_request_id,
+            capability_request_id,
+            grant_jti,
+            planned_at: UnixMillis::from_millis(1_700_000_120),
+            repo,
+            branch,
+            old_head: git_oid('1'),
+            new_head: git_oid('2'),
+        }
     }
 
     #[test]
@@ -2997,6 +3122,312 @@ mod tests {
         assert_eq!(entry.result, Some(GitPushOutcomeResult::Pushed));
         assert_eq!(entry.github_status, None);
         assert_eq!(entry.message.as_deref(), Some("pushed"));
+    }
+
+    proptest! {
+        #[test]
+        fn git_push_audit_state_machine_rejects_out_of_order_or_mismatched_rows(
+            script in git_push_audit_script_strategy(),
+        ) {
+            let log = AuditLog::open_in_memory().unwrap();
+            let s = sample_session();
+            log.open_session(&s).unwrap();
+
+            let push_request_id = RequestId::new();
+            let push_request = sample_git_push_request_record(push_request_id, s.session_id);
+            let capability_request_id = RequestId::new();
+            let push_attempt_id = RequestId::new();
+
+            match script {
+                GitPushAuditScript::ValidAttempted {
+                    result,
+                    github_status,
+                    close_before_outcome,
+                    attempt_repo_case_differs,
+                } => {
+                    log.record_git_push_request(&push_request).unwrap();
+                    let grant = record_sample_write_grant(&log, s.session_id, capability_request_id);
+                    let attempt_repo = if attempt_repo_case_differs {
+                        git_repo("O", "N")
+                    } else {
+                        sample_git_repo()
+                    };
+                    log.record_git_push_attempt(&git_push_attempt_record(
+                        push_attempt_id,
+                        push_request_id,
+                        capability_request_id,
+                        grant.jti,
+                        attempt_repo,
+                        "main".parse().unwrap(),
+                    ))
+                    .unwrap();
+                    if close_before_outcome {
+                        log.close_session(s.session_id, UnixMillis::from_millis(1_700_000_125))
+                            .unwrap();
+                    }
+                    log.record_git_push_outcome(&GitPushOutcomeRecord {
+                        push_request_id,
+                        push_attempt_id: Some(push_attempt_id),
+                        completed_at: UnixMillis::from_millis(1_700_000_130),
+                        result,
+                        github_status,
+                        message: "state-machine outcome",
+                    })
+                    .unwrap();
+
+                    let entries = log.list_git_pushes_for_session(s.session_id).unwrap();
+                    assert_eq!(
+                        entries,
+                        vec![GitPushAuditEntry {
+                            push_request_id,
+                            session_id: s.session_id,
+                            received_at: push_request.received_at,
+                            repo: push_request.repo,
+                            branch: push_request.branch,
+                            expected_remote_head: push_request.expected_remote_head,
+                            new_head: push_request.new_head,
+                            push_attempt_id: Some(push_attempt_id),
+                            capability_request_id: Some(capability_request_id),
+                            grant_jti: Some(grant.jti),
+                            planned_at: Some(UnixMillis::from_millis(1_700_000_120)),
+                            old_head: Some(git_oid('1')),
+                            attempted_new_head: Some(git_oid('2')),
+                            completed_at: Some(UnixMillis::from_millis(1_700_000_130)),
+                            result: Some(result),
+                            github_status,
+                            message: Some("state-machine outcome".into()),
+                        }]
+                    );
+                }
+                GitPushAuditScript::ValidUnattempted {
+                    result,
+                    close_before_outcome,
+                } => {
+                    log.record_git_push_request(&push_request).unwrap();
+                    if close_before_outcome {
+                        log.close_session(s.session_id, UnixMillis::from_millis(1_700_000_125))
+                            .unwrap();
+                    }
+                    log.record_git_push_outcome(&GitPushOutcomeRecord {
+                        push_request_id,
+                        push_attempt_id: None,
+                        completed_at: UnixMillis::from_millis(1_700_000_130),
+                        result,
+                        github_status: None,
+                        message: "state-machine outcome",
+                    })
+                    .unwrap();
+
+                    let entries = log.list_git_pushes_for_session(s.session_id).unwrap();
+                    assert_eq!(
+                        entries,
+                        vec![GitPushAuditEntry {
+                            push_request_id,
+                            session_id: s.session_id,
+                            received_at: push_request.received_at,
+                            repo: push_request.repo,
+                            branch: push_request.branch,
+                            expected_remote_head: push_request.expected_remote_head,
+                            new_head: push_request.new_head,
+                            push_attempt_id: None,
+                            capability_request_id: None,
+                            grant_jti: None,
+                            planned_at: None,
+                            old_head: None,
+                            attempted_new_head: None,
+                            completed_at: Some(UnixMillis::from_millis(1_700_000_130)),
+                            result: Some(result),
+                            github_status: None,
+                            message: Some("state-machine outcome".into()),
+                        }]
+                    );
+                }
+                GitPushAuditScript::RequestAfterClose => {
+                    log.close_session(s.session_id, UnixMillis::from_millis(1_700_000_090))
+                        .unwrap();
+                    assert!(log.record_git_push_request(&push_request).is_err());
+                }
+                GitPushAuditScript::AttemptBeforeRequest => {
+                    let grant = record_sample_write_grant(&log, s.session_id, capability_request_id);
+                    let err = log
+                        .record_git_push_attempt(&git_push_attempt_record(
+                            push_attempt_id,
+                            push_request_id,
+                            capability_request_id,
+                            grant.jti,
+                            sample_git_repo(),
+                            "main".parse().unwrap(),
+                        ))
+                        .unwrap_err();
+                    assert!(
+                        matches!(err, AuditError::Invariant("git push request does not exist")),
+                        "got: {err:?}"
+                    );
+                }
+                GitPushAuditScript::AttemptMissingGrant => {
+                    log.record_git_push_request(&push_request).unwrap();
+                    let err = log
+                        .record_git_push_attempt(&git_push_attempt_record(
+                            push_attempt_id,
+                            push_request_id,
+                            capability_request_id,
+                            Jti::new(),
+                            sample_git_repo(),
+                            "main".parse().unwrap(),
+                        ))
+                        .unwrap_err();
+                    assert!(
+                        matches!(err, AuditError::Invariant("git push grant does not exist")),
+                        "got: {err:?}"
+                    );
+                }
+                GitPushAuditScript::AttemptMismatchedRepo => {
+                    log.record_git_push_request(&push_request).unwrap();
+                    let grant = record_sample_write_grant(&log, s.session_id, capability_request_id);
+                    let err = log
+                        .record_git_push_attempt(&git_push_attempt_record(
+                            push_attempt_id,
+                            push_request_id,
+                            capability_request_id,
+                            grant.jti,
+                            git_repo("o", "other"),
+                            "main".parse().unwrap(),
+                        ))
+                        .unwrap_err();
+                    assert!(
+                        matches!(
+                            err,
+                            AuditError::Invariant("git push attempt repo differs from request")
+                        ),
+                        "got: {err:?}"
+                    );
+                }
+                GitPushAuditScript::AttemptMismatchedBranch => {
+                    log.record_git_push_request(&push_request).unwrap();
+                    let grant = record_sample_write_grant(&log, s.session_id, capability_request_id);
+                    let err = log
+                        .record_git_push_attempt(&git_push_attempt_record(
+                            push_attempt_id,
+                            push_request_id,
+                            capability_request_id,
+                            grant.jti,
+                            sample_git_repo(),
+                            "Main".parse().unwrap(),
+                        ))
+                        .unwrap_err();
+                    assert!(
+                        matches!(
+                            err,
+                            AuditError::Invariant("git push attempt branch differs from request")
+                        ),
+                        "got: {err:?}"
+                    );
+                }
+                GitPushAuditScript::OutcomeWithoutRequest => {
+                    let err = log
+                        .record_git_push_outcome(&GitPushOutcomeRecord {
+                            push_request_id,
+                            push_attempt_id: None,
+                            completed_at: UnixMillis::from_millis(1_700_000_130),
+                            result: GitPushOutcomeResult::Denied,
+                            github_status: None,
+                            message: "policy denied",
+                        })
+                        .unwrap_err();
+                    assert!(matches!(err, AuditError::Sqlite(_)), "got: {err:?}");
+                }
+                GitPushAuditScript::OutcomeRequiresAttemptWithoutAttempt { result } => {
+                    log.record_git_push_request(&push_request).unwrap();
+                    let err = log
+                        .record_git_push_outcome(&GitPushOutcomeRecord {
+                            push_request_id,
+                            push_attempt_id: None,
+                            completed_at: UnixMillis::from_millis(1_700_000_130),
+                            result,
+                            github_status: None,
+                            message: "attempt required",
+                        })
+                        .unwrap_err();
+                    assert!(
+                        matches!(
+                            err,
+                            AuditError::Invariant("git push outcome result requires an attempt")
+                        ),
+                        "got: {err:?}"
+                    );
+                }
+                GitPushAuditScript::OutcomeUnexpectedAttempt { result } => {
+                    log.record_git_push_request(&push_request).unwrap();
+                    let grant = record_sample_write_grant(&log, s.session_id, capability_request_id);
+                    log.record_git_push_attempt(&git_push_attempt_record(
+                        push_attempt_id,
+                        push_request_id,
+                        capability_request_id,
+                        grant.jti,
+                        sample_git_repo(),
+                        "main".parse().unwrap(),
+                    ))
+                    .unwrap();
+                    let err = log
+                        .record_git_push_outcome(&GitPushOutcomeRecord {
+                            push_request_id,
+                            push_attempt_id: Some(push_attempt_id),
+                            completed_at: UnixMillis::from_millis(1_700_000_130),
+                            result,
+                            github_status: None,
+                            message: "attempt not expected",
+                        })
+                        .unwrap_err();
+                    assert!(
+                        matches!(
+                            err,
+                            AuditError::Invariant(
+                                "git push outcome result must not reference an attempt"
+                            )
+                        ),
+                        "got: {err:?}"
+                    );
+                }
+                GitPushAuditScript::OutcomeDifferentRequest { result } => {
+                    log.record_git_push_request(&push_request).unwrap();
+                    let second_push_request_id = RequestId::new();
+                    log.record_git_push_request(&sample_git_push_request_record(
+                        second_push_request_id,
+                        s.session_id,
+                    ))
+                    .unwrap();
+                    let grant = record_sample_write_grant(&log, s.session_id, capability_request_id);
+                    log.record_git_push_attempt(&git_push_attempt_record(
+                        push_attempt_id,
+                        push_request_id,
+                        capability_request_id,
+                        grant.jti,
+                        sample_git_repo(),
+                        "main".parse().unwrap(),
+                    ))
+                    .unwrap();
+                    let err = log
+                        .record_git_push_outcome(&GitPushOutcomeRecord {
+                            push_request_id: second_push_request_id,
+                            push_attempt_id: Some(push_attempt_id),
+                            completed_at: UnixMillis::from_millis(1_700_000_130),
+                            result,
+                            github_status: None,
+                            message: "wrong attempt",
+                        })
+                        .unwrap_err();
+                    assert!(
+                        matches!(
+                            err,
+                            AuditError::Invariant(
+                                "git push outcome attempt belongs to a different request"
+                            )
+                        ),
+                        "got: {err:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
