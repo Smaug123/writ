@@ -23,6 +23,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use writ::core::{AgentKind, CapabilityRequest, GitHubAccess, GitHubRequest, RepoRef, SessionId};
 use writ::protocol::{AgentVmSessionInfo, ClientMessage, ServerMessage};
 use writ::server::default_socket_path;
+use writ::vm_git::{AgentVmWorkspaceBootstrap, GitCloneRepo, WorkspaceWarmMode};
 
 #[derive(Parser)]
 #[command(name = "writ", about = "writ broker client")]
@@ -77,6 +78,15 @@ enum AgentVmCmd {
         /// Agent model identifier stored in the audit log.
         #[arg(long)]
         model: Option<String>,
+        /// GitHub repository to clone into the VM before starting the agent.
+        #[arg(long)]
+        repo: Option<String>,
+        /// Destination path for the clean checkout. Defaults to /workspace/<repo-name>.
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        /// Workspace warmup level to complete before starting the agent.
+        #[arg(long, value_enum)]
+        warm: Option<WorkspaceWarmArg>,
         /// Command to run inside the VM after lifecycle preflight succeeds.
         #[arg(last = true, required = true)]
         guest_command: Vec<String>,
@@ -112,6 +122,14 @@ enum GithubCmd {
 enum Access {
     Read,
     Write,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, ValueEnum)]
+enum WorkspaceWarmArg {
+    None,
+    Sources,
+    #[value(name = "devshell", alias = "dev-shell")]
+    DevShell,
 }
 
 impl From<Access> for GitHubAccess {
@@ -191,15 +209,25 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 label,
                 agent,
                 model,
+                repo,
+                workspace,
+                warm,
                 guest_command,
             } => {
+                let workspace = build_workspace_bootstrap(repo, workspace, warm)?;
+                let timeout = if workspace.is_some() {
+                    AGENT_VM_WORKSPACE_CALL_TIMEOUT
+                } else {
+                    AGENT_VM_CALL_TIMEOUT
+                };
                 let msg = ClientMessage::StartAgentVm {
                     label,
                     agent_kind: agent,
                     agent_model: model,
+                    workspace,
                     guest_command,
                 };
-                match call_with_timeout(&socket_path, &msg, AGENT_VM_CALL_TIMEOUT)? {
+                match call_with_timeout(&socket_path, &msg, timeout)? {
                     ServerMessage::AgentVmStarted {
                         session_id,
                         broker_url,
@@ -240,6 +268,45 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
 fn parse_agent_kind(raw: &str) -> Result<AgentKind, String> {
     raw.parse::<AgentKind>().map_err(|err| err.to_string())
+}
+
+fn build_workspace_bootstrap(
+    repo: Option<String>,
+    destination: Option<PathBuf>,
+    warm: Option<WorkspaceWarmArg>,
+) -> Result<Option<AgentVmWorkspaceBootstrap>, Box<dyn std::error::Error>> {
+    let Some(raw_repo) = repo else {
+        if destination.is_some() {
+            return Err("--workspace requires --repo".into());
+        }
+        if warm.is_some() {
+            return Err("--warm requires --repo".into());
+        }
+        return Ok(None);
+    };
+    if let Some(destination) = destination.as_ref() {
+        if destination.to_str().is_none() {
+            return Err("--workspace path must be valid UTF-8".into());
+        }
+    }
+    let repo: GitCloneRepo = raw_repo
+        .parse()
+        .map_err(|err| format!("invalid GitHub repository {raw_repo:?}: {err}"))?;
+    Ok(Some(AgentVmWorkspaceBootstrap {
+        repo,
+        destination,
+        warm: warm.unwrap_or(WorkspaceWarmArg::DevShell).into(),
+    }))
+}
+
+impl From<WorkspaceWarmArg> for WorkspaceWarmMode {
+    fn from(value: WorkspaceWarmArg) -> Self {
+        match value {
+            WorkspaceWarmArg::None => Self::None,
+            WorkspaceWarmArg::Sources => Self::Sources,
+            WorkspaceWarmArg::DevShell => Self::DevShell,
+        }
+    }
 }
 
 fn build_capability(backend: BackendCmd) -> Result<CapabilityRequest, Box<dyn std::error::Error>> {
@@ -307,12 +374,16 @@ fn write_agent_vm_sessions(
 /// round-trip (the broker's own IDLE_READ_TIMEOUT is 60s, and a
 /// healthy request/reply is milliseconds).
 const CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
-// Apple Container startup/teardown can include image cold-start, PF work, and
-// guest preflight probes. Keep the CLI patient enough that the daemon can
-// return a definitive started/rolled-back result; a wedged daemon can hold the
-// CLI until this same bound expires. The broker's idle read timeout is between
-// request reads, not a response wall-time cap.
+// Apple Container startup/teardown can include image cold-start, PF work, guest
+// preflight probes. Keep the CLI patient enough that the daemon can return a
+// definitive started/rolled-back result; a wedged daemon can hold the CLI until
+// this same bound expires. The broker's idle read timeout is between request
+// reads, not a response wall-time cap.
 const AGENT_VM_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+// Workspace starts may spend most of their time waiting for Nix substitute
+// prefetching, and the daemon's workspace bootstrap timeout is 20 minutes.
+const AGENT_VM_WORKSPACE_CALL_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(30 * 60);
 
 fn call(
     socket_path: &Path,
@@ -399,5 +470,49 @@ mod tests {
                 "broker_url=http://192.168.253.1:51376/\n",
             )
         );
+    }
+
+    #[test]
+    fn workspace_related_flags_require_repo() {
+        assert!(
+            build_workspace_bootstrap(None, Some(PathBuf::from("/workspace/repo")), None)
+                .unwrap_err()
+                .to_string()
+                .contains("--workspace requires --repo")
+        );
+        assert!(
+            build_workspace_bootstrap(None, None, Some(WorkspaceWarmArg::Sources))
+                .unwrap_err()
+                .to_string()
+                .contains("--warm requires --repo")
+        );
+    }
+
+    #[test]
+    fn workspace_bootstrap_defaults_to_devshell_warmup_when_repo_is_set() {
+        let workspace = build_workspace_bootstrap(Some("owner/repo".into()), None, None)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(workspace.repo.to_string(), "owner/repo");
+        assert_eq!(workspace.destination, None);
+        assert_eq!(workspace.warm, WorkspaceWarmMode::DevShell);
+    }
+
+    #[test]
+    fn workspace_bootstrap_accepts_explicit_none_warmup() {
+        let workspace = build_workspace_bootstrap(
+            Some("owner/repo".into()),
+            Some(PathBuf::from("/workspace/repo")),
+            Some(WorkspaceWarmArg::None),
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(
+            workspace.destination,
+            Some(PathBuf::from("/workspace/repo"))
+        );
+        assert_eq!(workspace.warm, WorkspaceWarmMode::None);
     }
 }

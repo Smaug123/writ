@@ -123,6 +123,16 @@ pub struct NixCacheOutcomeRecord<'a> {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AgentVmWorkspaceBootstrapAuditRecord {
+    pub session_id: SessionId,
+    pub requested_at: UnixMillis,
+    pub repo: String,
+    pub destination: String,
+    pub branch: String,
+    pub warm: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NixCacheAuditEntry {
     pub request_id: RequestId,
     pub session_id: SessionId,
@@ -233,6 +243,86 @@ impl AuditLog {
                 )
                 .optional()?;
             Ok(row)
+        })
+    }
+
+    pub fn record_agent_vm_workspace_bootstrap(
+        &self,
+        r: &AgentVmWorkspaceBootstrapAuditRecord,
+    ) -> Result<(), AuditError> {
+        if r.repo.is_empty() {
+            return Err(AuditError::Invariant(
+                "agent VM workspace repo must not be empty",
+            ));
+        }
+        if r.destination.is_empty() {
+            return Err(AuditError::Invariant(
+                "agent VM workspace destination must not be empty",
+            ));
+        }
+        if r.branch.is_empty() {
+            return Err(AuditError::Invariant(
+                "agent VM workspace branch must not be empty",
+            ));
+        }
+        if !matches!(r.warm.as_str(), "none" | "sources" | "devshell") {
+            return Err(AuditError::Invariant(
+                "agent VM workspace warm mode is invalid",
+            ));
+        }
+
+        self.with_conn_mut(|c| {
+            let tx = c.transaction()?;
+            let session_closed_at: Option<Option<i64>> = tx
+                .query_row(
+                    "SELECT closed_at FROM session WHERE session_id = ?1",
+                    params![r.session_id.as_uuid().to_string()],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            match session_closed_at {
+                None => return Err(AuditError::Invariant("session does not exist")),
+                Some(Some(_)) => return Err(AuditError::Invariant("session is closed")),
+                Some(None) => {}
+            }
+
+            tx.execute(
+                "INSERT INTO agent_vm_workspace_bootstrap (
+                     session_id,
+                     requested_at,
+                     repo,
+                     destination,
+                     branch,
+                     warm
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    r.session_id.as_uuid().to_string(),
+                    r.requested_at.as_millis(),
+                    &r.repo,
+                    &r.destination,
+                    &r.branch,
+                    &r.warm,
+                ],
+            )?;
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
+    pub fn get_agent_vm_workspace_bootstrap(
+        &self,
+        id: SessionId,
+    ) -> Result<Option<AgentVmWorkspaceBootstrapAuditRecord>, AuditError> {
+        self.with_conn(|c| {
+            c.query_row(
+                "SELECT session_id, requested_at, repo, destination, branch, warm
+                 FROM agent_vm_workspace_bootstrap
+                 WHERE session_id = ?1",
+                params![id.as_uuid().to_string()],
+                agent_vm_workspace_bootstrap_from_row,
+            )
+            .optional()
+            .map_err(AuditError::from)
         })
     }
 
@@ -724,6 +814,22 @@ fn github_scope_authorised_by_request(r: &GitHubRequest, s: &GitHubGrantedScope)
     }
 }
 
+fn agent_vm_workspace_bootstrap_from_row(
+    row: &Row<'_>,
+) -> rusqlite::Result<AgentVmWorkspaceBootstrapAuditRecord> {
+    let session_id: uuid::Uuid = row.get::<_, String>(0)?.parse().map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+    })?;
+    Ok(AgentVmWorkspaceBootstrapAuditRecord {
+        session_id: SessionId::from_uuid(session_id),
+        requested_at: UnixMillis::from_millis(row.get(1)?),
+        repo: row.get(2)?,
+        destination: row.get(3)?,
+        branch: row.get(4)?,
+        warm: row.get(5)?,
+    })
+}
+
 impl NixCacheAuditRoute {
     fn as_str(self) -> &'static str {
         match self {
@@ -918,7 +1024,7 @@ struct Migration {
 /// a version higher than this is rejected with [`AuditError::SchemaTooNew`]
 /// rather than opened — we'd rather fail to start than silently drop data
 /// into a schema a newer broker wrote.
-const SCHEMA_VERSION: i32 = 5;
+const SCHEMA_VERSION: i32 = 6;
 
 /// The full migration history. Each entry documents exactly one state
 /// transition; the sequence of entries is the schema's lineage. Order
@@ -1145,6 +1251,29 @@ ALTER TABLE grant_log
     ADD COLUMN github_app_id INTEGER CHECK (github_app_id IS NULL OR github_app_id >= 0);
 "#,
     },
+    Migration {
+        version: 6,
+        sql: r#"
+CREATE TABLE agent_vm_workspace_bootstrap (
+    session_id   TEXT PRIMARY KEY REFERENCES session(session_id),
+    requested_at INTEGER NOT NULL,
+    repo         TEXT NOT NULL CHECK (repo != ''),
+    destination  TEXT NOT NULL CHECK (destination != ''),
+    branch       TEXT NOT NULL CHECK (branch != ''),
+    warm         TEXT NOT NULL CHECK (warm IN ('none', 'sources', 'devshell'))
+);
+
+CREATE TRIGGER agent_vm_workspace_bootstrap_requires_open_session
+BEFORE INSERT ON agent_vm_workspace_bootstrap
+WHEN EXISTS (
+    SELECT 1 FROM session
+    WHERE session_id = NEW.session_id AND closed_at IS NOT NULL
+)
+BEGIN
+    SELECT RAISE(ABORT, 'session is closed');
+END;
+"#,
+    },
 ];
 
 // Belt-and-braces: the compile-time shape of MIGRATIONS is the source
@@ -1282,6 +1411,60 @@ mod tests {
             .unwrap();
         let back = log.get_session(s.session_id).unwrap().unwrap();
         assert_eq!(back.closed_at, Some(UnixMillis::from_millis(100)));
+    }
+
+    #[test]
+    fn agent_vm_workspace_bootstrap_roundtrips() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+        let record = AgentVmWorkspaceBootstrapAuditRecord {
+            session_id: s.session_id,
+            requested_at: UnixMillis::from_millis(1_700_000_100),
+            repo: "owner/repo".into(),
+            destination: "/workspace/repo".into(),
+            branch: "main".into(),
+            warm: "devshell".into(),
+        };
+
+        log.record_agent_vm_workspace_bootstrap(&record).unwrap();
+
+        assert_eq!(
+            log.get_agent_vm_workspace_bootstrap(s.session_id)
+                .unwrap()
+                .unwrap(),
+            record
+        );
+    }
+
+    #[test]
+    fn agent_vm_workspace_bootstrap_requires_open_session() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        let record = AgentVmWorkspaceBootstrapAuditRecord {
+            session_id: s.session_id,
+            requested_at: UnixMillis::from_millis(1_700_000_100),
+            repo: "owner/repo".into(),
+            destination: "/workspace/repo".into(),
+            branch: "main".into(),
+            warm: "none".into(),
+        };
+
+        let err = log
+            .record_agent_vm_workspace_bootstrap(&record)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            AuditError::Invariant("session does not exist")
+        ));
+
+        log.open_session(&s).unwrap();
+        log.close_session(s.session_id, UnixMillis::from_millis(1_700_000_200))
+            .unwrap();
+        let err = log
+            .record_agent_vm_workspace_bootstrap(&record)
+            .unwrap_err();
+        assert!(matches!(err, AuditError::Invariant("session is closed")));
     }
 
     /// Helper: stash the request+decision row so subsequent `record_grant`
@@ -2588,9 +2771,18 @@ mod tests {
         assert!(trigger_exists(&log, "grant_excludes_mint_failure"));
         assert!(column_exists(&log, "nix_cache_request", "route"));
         assert!(column_exists(&log, "nix_cache_outcome", "upstream_status"));
+        assert!(column_exists(
+            &log,
+            "agent_vm_workspace_bootstrap",
+            "session_id"
+        ));
         assert!(trigger_exists(
             &log,
             "nix_cache_request_requires_open_session"
+        ));
+        assert!(trigger_exists(
+            &log,
+            "agent_vm_workspace_bootstrap_requires_open_session"
         ));
     }
 
@@ -2607,10 +2799,15 @@ mod tests {
         assert!(column_exists(&log, "mint_failure", "failure_json"));
         assert!(column_exists(&log, "nix_cache_request", "request_id"));
         assert!(column_exists(&log, "nix_cache_outcome", "request_id"));
+        assert!(column_exists(&log, "agent_vm_workspace_bootstrap", "warm"));
         assert!(trigger_exists(&log, "request_requires_open_session"));
         assert!(trigger_exists(
             &log,
             "nix_cache_request_requires_open_session"
+        ));
+        assert!(trigger_exists(
+            &log,
+            "agent_vm_workspace_bootstrap_requires_open_session"
         ));
     }
 
@@ -2646,6 +2843,7 @@ mod tests {
         assert!(column_exists(&log, "nix_cache_outcome", "response_bytes"));
         assert!(column_exists(&log, "session", "agent_kind"));
         assert!(column_exists(&log, "grant_log", "github_app_id"));
+        assert!(column_exists(&log, "agent_vm_workspace_bootstrap", "repo"));
         assert!(trigger_exists(
             &log,
             "nix_cache_request_requires_open_session"
@@ -2733,6 +2931,33 @@ mod tests {
         assert!(column_exists(&log, "grant_log", "github_app_id"));
         let grant = log.get_grant(jti).unwrap().unwrap();
         assert_eq!(grant.github_app_id, None);
+    }
+
+    #[test]
+    fn open_migrates_v5_database_to_agent_vm_workspace_bootstrap_schema() {
+        let db = NamedTempFile::new().unwrap();
+        {
+            let mut conn = Connection::open(db.path()).unwrap();
+            let tx = conn.transaction().unwrap();
+            for migration in MIGRATIONS.iter().take(5) {
+                tx.execute_batch(migration.sql).unwrap();
+            }
+            tx.pragma_update(None, "user_version", 5).unwrap();
+            tx.commit().unwrap();
+        }
+
+        let log = AuditLog::open(db.path()).unwrap();
+
+        assert_eq!(read_user_version(&log), SCHEMA_VERSION);
+        assert!(column_exists(
+            &log,
+            "agent_vm_workspace_bootstrap",
+            "destination"
+        ));
+        assert!(trigger_exists(
+            &log,
+            "agent_vm_workspace_bootstrap_requires_open_session"
+        ));
     }
 
     /// A DB written by a future broker will carry a user_version beyond

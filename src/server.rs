@@ -154,6 +154,7 @@ pub async fn dispatch_message_with_agent_vm<S: SecretStore + Send + Sync + 'stat
             label,
             agent_kind,
             agent_model,
+            workspace,
             guest_command,
         } => {
             if state.minter.requires_agent_kind() && agent_kind.is_none() {
@@ -166,6 +167,7 @@ pub async fn dispatch_message_with_agent_vm<S: SecretStore + Send + Sync + 'stat
                         label,
                         agent_kind,
                         agent_model,
+                        workspace,
                         guest_command,
                     )
                     .await
@@ -787,6 +789,7 @@ mod tests {
                 label: None,
                 agent_kind: None,
                 agent_model: None,
+                workspace: None,
                 guest_command: vec!["true".into()],
             },
             &state,
@@ -1135,6 +1138,7 @@ mod tests {
                 label: None,
                 agent_kind: None,
                 agent_model: None,
+                workspace: None,
                 guest_command: vec!["true".into()],
             },
             &state,

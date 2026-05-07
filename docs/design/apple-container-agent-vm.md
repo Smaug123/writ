@@ -19,6 +19,22 @@ The broker should remain an ordinary user process where possible. Privileged
 operations should live behind a small, auditable helper with a narrow command
 set.
 
+Treat every guest-originated broker request as hostile, and at minimum treat the
+guest VM as compromised once the agent command has started. The VM may honestly
+run the requested agent, or it may send arbitrary VM HTTP requests using its
+session bearer secret. Repository-controlled bootstrap work, including devshell
+warmup, is not a relaxation of that boundary. Therefore every interaction with
+Git, Nix, model APIs, signing, or any other outside authority must continue to
+cross a broker endpoint that authenticates the session, parses the request into
+typed data, applies policy, enforces size and resource bounds, and audits the
+outcome. Guest-side convenience commands are ergonomic wrappers only; they are
+not part of the authority boundary.
+
+The workspace-bootstrap upgrade intentionally has no managed-state migration
+path. Operators upgrading across that change must stop and remove all existing
+daemon-managed VMs before starting the new daemon. Persisted records from older
+versions are cleanup obligations only, not resumable sessions.
+
 ## Empirical findings
 
 Observed on macOS 26.4.1 with Apple `container` CLI 0.11.0 after
@@ -1074,6 +1090,56 @@ First broker-side Nix NAR body-verification slice implemented in
   `Content-Length`. Guest Nix still performs its own signature/content checks;
   the broker-side check is a defense-in-depth boundary that prevents a buggy or
   malicious upstream from delivering bytes that contradict admitted metadata.
+
+First workspace bootstrap slice implemented in `src/protocol.rs`,
+`src/bin/writ.rs`, `src/bin/writ-vm.rs`, `src/vm_git.rs`, `src/vm_client.rs`,
+`src/agent_vm_daemon.rs`, and `src/audit.rs`:
+
+- `start_agent_vm` accepts an optional structured workspace bootstrap containing
+  a GitHub `owner/name` repository, an optional destination, and a warmup mode
+  (`none`, `sources`, or `devshell`). The first production CLI surface assumes
+  branch `main`, no submodules, and no Git LFS. The default destination is
+  `/workspace/<repo-name>`, and non-default destinations must be absolute;
+- the daemon still uses the existing managed lifecycle state machine, but when
+  a workspace is requested it wraps the guest command in a second in-guest gate.
+  The lifecycle may release the container process, but that process waits for
+  `/run/writ-agent-vm/broker-ready` before attempting any brokered clone. The
+  daemon starts VM HTTP, touches that readiness file with `container exec`, and
+  then polls `/run/writ-agent-vm/bootstrap-ok` or
+  `/run/writ-agent-vm/bootstrap-failed`. `writ agent-vm start` does not return
+  success until the workspace bootstrap reports success. Plain VM operations
+  keep the shorter CLI timeout; only workspace starts use the longer timeout
+  needed for substitute prefetching;
+- each workspace start records a session-linked
+  `agent_vm_workspace_bootstrap` audit row before lifecycle startup begins,
+  including repository, resolved destination, branch, and warmup mode. The
+  per-request Git and Nix cache audit rows remain the authority trail for the
+  individual broker interactions;
+- `writ-vm workspace init` requests only `refs/heads/main` through the existing
+  host-produced Git bundle route, initialises a normal checkout, adds a
+  credential-free `https://github.com/<owner>/<repo>.git` origin, creates local
+  branch `main`, sets its upstream to `origin/main`, and verifies the worktree
+  is clean after clone and warmup. The VM still never receives GitHub
+  credentials, and the resulting `origin` URL is not usable authority without a
+  later brokered fetch/push operation;
+- `sources` warmup runs Nix flake metadata refresh with lockfile writes
+  disabled. `devshell` warmup additionally runs
+  `nix develop .#default --command true`. Both use the daemon-injected brokered
+  Nix cache configuration and pass Nix options intended to avoid local or remote
+  builds (`builders =`, `max-jobs = 0`, `fallback = false`), so startup fails
+  visibly if the devshell closure is not available from configured
+  substituters. The flake feature is enabled only in the workspace bootstrap
+  wrapper; non-workspace VM sessions keep the narrower Nix setup. This is
+  source/substitute prefetching only: the daemon does not run `cargo build`,
+  `nix build`, or other repository build commands as part of first-version
+  bootstrap;
+- Cargo dependency-source prefetching remains deliberately outside this first
+  slice. A generic Rust workspace can require crates.io or Git dependency
+  network access after the devshell starts, and the VM has no general outbound
+  HTTP authority. A future slice should either broker Cargo source
+  materialisation from `Cargo.lock` into an out-of-repo cache or require
+  project-level vendoring/Nix source derivations before claiming full
+  cargo-offline readiness.
 
 ## Tests and proof spikes
 

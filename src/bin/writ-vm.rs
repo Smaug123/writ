@@ -11,9 +11,9 @@ use clap::{Parser, Subcommand};
 
 use writ::vm_client::{
     VM_BROKER_TOKEN_ENV, VM_BROKER_URL_ENV, VmClientConfig, VmClientConfigError, VmGitCloneCommand,
-    clone_from_broker, get_session_json,
+    VmWorkspaceInitCommand, clone_from_broker, get_session_json, init_workspace_from_broker,
 };
-use writ::vm_git::{GitCloneRef, GitCloneRepo};
+use writ::vm_git::{GitCloneRef, GitCloneRepo, WorkspaceWarmMode};
 
 #[derive(Parser)]
 #[command(name = "writ-vm", about = "guest-side writ VM broker client")]
@@ -37,6 +37,11 @@ enum Cmd {
         #[command(subcommand)]
         action: GitCmd,
     },
+    /// Workspace operations mediated by the host broker.
+    Workspace {
+        #[command(subcommand)]
+        action: WorkspaceCmd,
+    },
 }
 
 #[derive(Subcommand)]
@@ -54,6 +59,34 @@ enum GitCmd {
         #[arg(long, default_value = "git")]
         git: PathBuf,
     },
+}
+
+#[derive(Subcommand)]
+enum WorkspaceCmd {
+    /// Initialise a clean workspace checkout through the host broker.
+    Init {
+        /// Repository in owner/name form.
+        repo: String,
+        /// Destination checkout path. Defaults to /workspace/<repo-name>.
+        destination: Option<PathBuf>,
+        /// Warmup level to complete before returning.
+        #[arg(long, default_value = "devshell")]
+        warm: WorkspaceWarmArg,
+        /// Git executable inside the guest.
+        #[arg(long, default_value = "git")]
+        git: PathBuf,
+        /// Nix executable inside the guest.
+        #[arg(long, default_value = "nix")]
+        nix: PathBuf,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, clap::ValueEnum)]
+enum WorkspaceWarmArg {
+    None,
+    Sources,
+    #[value(name = "devshell", alias = "dev-shell")]
+    DevShell,
 }
 
 #[tokio::main]
@@ -87,6 +120,21 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 println!("{}", destination.display());
             }
         },
+        Cmd::Workspace { action } => match action {
+            WorkspaceCmd::Init {
+                repo,
+                destination,
+                warm,
+                git,
+                nix,
+            } => {
+                let repo = parse_repo(&repo)?;
+                let command =
+                    VmWorkspaceInitCommand::new(repo, destination, warm.into(), git, nix)?;
+                let destination = init_workspace_from_broker(&config, &command).await?;
+                println!("{}", destination.display());
+            }
+        },
     }
     Ok(())
 }
@@ -111,6 +159,16 @@ fn parse_repo(raw: &str) -> Result<GitCloneRepo, Box<dyn std::error::Error>> {
 fn parse_git_ref(raw: &str) -> Result<GitCloneRef, Box<dyn std::error::Error>> {
     raw.parse()
         .map_err(|error| format!("invalid Git ref {raw:?}: {error}").into())
+}
+
+impl From<WorkspaceWarmArg> for WorkspaceWarmMode {
+    fn from(value: WorkspaceWarmArg) -> Self {
+        match value {
+            WorkspaceWarmArg::None => Self::None,
+            WorkspaceWarmArg::Sources => Self::Sources,
+            WorkspaceWarmArg::DevShell => Self::DevShell,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -160,5 +218,35 @@ mod tests {
         let help = String::from_utf8(help).unwrap();
         assert!(help.contains(VM_BROKER_TOKEN_ENV), "{help}");
         assert!(!help.contains("writ-vm-secret"), "{help}");
+    }
+
+    #[test]
+    fn workspace_init_accepts_warm_none() {
+        let args = Args::try_parse_from([
+            "writ-vm",
+            "workspace",
+            "init",
+            "owner/repo",
+            "--warm",
+            "none",
+        ])
+        .unwrap();
+
+        match args.cmd {
+            Cmd::Workspace {
+                action:
+                    WorkspaceCmd::Init {
+                        repo,
+                        destination,
+                        warm,
+                        ..
+                    },
+            } => {
+                assert_eq!(repo, "owner/repo");
+                assert_eq!(destination, None);
+                assert_eq!(warm, WorkspaceWarmArg::None);
+            }
+            _ => panic!("unexpected command"),
+        }
     }
 }

@@ -8,6 +8,7 @@
 //! GitHub-specific owner/name syntax on top because this endpoint always
 //! targets GitHub repositories.
 
+use std::path::PathBuf;
 use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
@@ -16,6 +17,8 @@ use crate::core::RepoRef;
 
 pub const VM_GIT_CLONE_PATH: &str = "/v1/git/clone";
 pub const GIT_BUNDLE_CONTENT_TYPE: &str = "application/x-git-bundle";
+pub const DEFAULT_WORKSPACE_ROOT: &str = "/workspace";
+pub const DEFAULT_WORKSPACE_BRANCH: &str = "main";
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct VmGitCloneRequest {
@@ -34,6 +37,28 @@ pub struct GitCloneRef(String);
 pub struct VmGitCloneErrorResponse {
     error: VmGitCloneErrorCode,
     message: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AgentVmWorkspaceBootstrap {
+    pub repo: GitCloneRepo,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub destination: Option<PathBuf>,
+    #[serde(default)]
+    pub warm: WorkspaceWarmMode,
+}
+
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceWarmMode {
+    None,
+    Sources,
+    #[default]
+    DevShell,
+}
+
+pub fn default_workspace_destination(repo: &GitCloneRepo) -> PathBuf {
+    PathBuf::from(DEFAULT_WORKSPACE_ROOT).join(&repo.as_repo_ref().name)
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

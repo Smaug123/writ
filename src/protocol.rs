@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::agent_vm_lifecycle::AgentVmSessionStateStatus;
 use crate::core::{AgentKind, CapabilityRequest, SessionId, UnixMillis};
+use crate::vm_git::AgentVmWorkspaceBootstrap;
 
 /// A persisted daemon-managed agent VM session as reported by
 /// [`ServerMessage::AgentVmSessions`].
@@ -69,6 +70,10 @@ pub enum ClientMessage {
         /// Model identifier stored in the audit log.
         #[serde(skip_serializing_if = "Option::is_none", default)]
         agent_model: Option<String>,
+        /// Optional clean repo checkout and source/substitute warmup to
+        /// complete before the guest agent command starts.
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        workspace: Option<AgentVmWorkspaceBootstrap>,
         /// Command to run inside the VM after lifecycle preflight succeeds.
         guest_command: Vec<String>,
     },
@@ -151,7 +156,9 @@ impl std::fmt::Debug for ServerMessage {
 mod tests {
     use super::*;
     use crate::core::{GitHubAccess, GitHubRequest, RepoRef};
+    use crate::vm_git::{GitCloneRepo, WorkspaceWarmMode};
     use proptest::prelude::*;
+    use std::path::PathBuf;
 
     fn fixed_session_id() -> SessionId {
         "00000000-0000-0000-0000-000000000001".parse().unwrap()
@@ -162,6 +169,10 @@ mod tests {
             owner: "o".into(),
             name: "n".into(),
         }
+    }
+
+    fn sample_clone_repo() -> GitCloneRepo {
+        "owner/repo".parse().unwrap()
     }
 
     // --- ClientMessage roundtrips -----------------------------------------
@@ -216,7 +227,25 @@ mod tests {
             label: Some("agent vm".into()),
             agent_kind: Some(AgentKind::Codex),
             agent_model: Some("gpt-test".into()),
+            workspace: None,
             guest_command: vec!["sleep".into(), "600".into()],
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert_eq!(serde_json::from_str::<ClientMessage>(&json).unwrap(), msg);
+    }
+
+    #[test]
+    fn start_agent_vm_with_workspace_roundtrips() {
+        let msg = ClientMessage::StartAgentVm {
+            label: Some("agent vm".into()),
+            agent_kind: Some(AgentKind::Codex),
+            agent_model: Some("gpt-test".into()),
+            workspace: Some(AgentVmWorkspaceBootstrap {
+                repo: sample_clone_repo(),
+                destination: Some(PathBuf::from("/workspace/repo")),
+                warm: WorkspaceWarmMode::DevShell,
+            }),
+            guest_command: vec!["codex".into()],
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert_eq!(serde_json::from_str::<ClientMessage>(&json).unwrap(), msg);
@@ -362,6 +391,7 @@ mod tests {
             label: None,
             agent_kind: None,
             agent_model: None,
+            workspace: None,
             guest_command: vec!["true".into()],
         })
         .unwrap();

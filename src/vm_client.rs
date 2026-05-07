@@ -15,13 +15,15 @@ use reqwest::Url;
 
 use crate::bearer::is_bearer_token_byte;
 use crate::vm_git::{
-    GIT_BUNDLE_CONTENT_TYPE, GitCloneRef, GitCloneRepo, VM_GIT_CLONE_PATH, VmGitCloneErrorResponse,
-    VmGitCloneRequest,
+    DEFAULT_WORKSPACE_BRANCH, GIT_BUNDLE_CONTENT_TYPE, GitCloneRef, GitCloneRepo,
+    VM_GIT_CLONE_PATH, VmGitCloneErrorResponse, VmGitCloneRequest, WorkspaceWarmMode,
+    default_workspace_destination,
 };
 
 pub const VM_BROKER_URL_ENV: &str = "WRIT_BROKER_URL";
 pub const VM_BROKER_TOKEN_ENV: &str = "WRIT_BROKER_TOKEN";
 pub const DEFAULT_VM_CLIENT_MAX_BUNDLE_BYTES: u64 = 512 * 1024 * 1024;
+pub const DEFAULT_DEVSHELL_ATTR: &str = ".#default";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VmClientConfig {
@@ -40,17 +42,42 @@ pub struct VmGitCloneCommand {
     git_program: PathBuf,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VmWorkspaceInitCommand {
+    repo: GitCloneRepo,
+    destination: PathBuf,
+    warm: WorkspaceWarmMode,
+    git_program: PathBuf,
+    nix_program: PathBuf,
+}
+
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum VmGitCloneStep {
     Clone,
     Init,
     Fetch,
     Checkout,
+    RemoteAdd,
+    CheckoutBranch,
+    SetUpstream,
+    Status,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum VmWorkspaceWarmStep {
+    FlakeMetadata,
+    DevShell,
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum VmGitCloneCommandError {
     #[error("destination path must not be empty")]
+    EmptyDestination,
+}
+
+#[derive(Debug, thiserror::Error, Eq, PartialEq)]
+pub enum VmWorkspaceInitCommandError {
+    #[error("workspace destination path must not be empty")]
     EmptyDestination,
 }
 
@@ -106,6 +133,19 @@ pub enum VmClientError {
         status: ExitStatus,
         stderr: String,
     },
+    #[error("{step} command could not be spawned: {source}")]
+    NixSpawn {
+        step: VmWorkspaceWarmStep,
+        source: std::io::Error,
+    },
+    #[error("{step} command failed with status {status}: {stderr}")]
+    NixFailed {
+        step: VmWorkspaceWarmStep,
+        status: ExitStatus,
+        stderr: String,
+    },
+    #[error("workspace checkout is dirty after bootstrap: {status}")]
+    WorkspaceDirty { status: String },
 }
 
 struct TempBundle {
@@ -215,6 +255,51 @@ impl VmGitCloneCommand {
     }
 }
 
+impl VmWorkspaceInitCommand {
+    pub fn new(
+        repo: GitCloneRepo,
+        destination: Option<PathBuf>,
+        warm: WorkspaceWarmMode,
+        git_program: impl Into<PathBuf>,
+        nix_program: impl Into<PathBuf>,
+    ) -> Result<Self, VmWorkspaceInitCommandError> {
+        let destination = match destination {
+            Some(path) => path,
+            None => default_workspace_destination(&repo),
+        };
+        if destination.as_os_str().is_empty() {
+            return Err(VmWorkspaceInitCommandError::EmptyDestination);
+        }
+        Ok(Self {
+            repo,
+            destination,
+            warm,
+            git_program: git_program.into(),
+            nix_program: nix_program.into(),
+        })
+    }
+
+    pub fn repo(&self) -> &GitCloneRepo {
+        &self.repo
+    }
+
+    pub fn destination(&self) -> &Path {
+        &self.destination
+    }
+
+    pub fn warm(&self) -> WorkspaceWarmMode {
+        self.warm
+    }
+
+    pub fn git_program(&self) -> &Path {
+        &self.git_program
+    }
+
+    pub fn nix_program(&self) -> &Path {
+        &self.nix_program
+    }
+}
+
 pub async fn get_session_json(config: &VmClientConfig) -> Result<serde_json::Value, VmClientError> {
     let response = reqwest::Client::new()
         .get(config.endpoint("/v1/session"))
@@ -239,6 +324,28 @@ pub async fn clone_from_broker(
         command.destination(),
         &bundle,
     )?;
+    Ok(command.destination().to_path_buf())
+}
+
+pub async fn init_workspace_from_broker(
+    config: &VmClientConfig,
+    command: &VmWorkspaceInitCommand,
+) -> Result<PathBuf, VmClientError> {
+    // This is the one-shot `writ-vm` CLI path. The HTTP fetch is async, but
+    // the subsequent Git and Nix subprocesses intentionally run synchronously
+    // because this process has no other work to schedule.
+    let git_ref = GitCloneRef::new(format!("refs/heads/{DEFAULT_WORKSPACE_BRANCH}"))
+        .expect("default workspace branch must be a valid branch ref");
+    let request = VmGitCloneRequest::new(command.repo().clone(), Some(git_ref));
+    let bundle = fetch_git_clone_bundle(config, &request).await?;
+    init_workspace_from_bundle_with_git(
+        command.git_program(),
+        command.repo(),
+        command.destination(),
+        &bundle,
+    )?;
+    warm_workspace(command)?;
+    require_clean_workspace(command.git_program(), command.destination())?;
     Ok(command.destination().to_path_buf())
 }
 
@@ -285,6 +392,97 @@ fn clone_bundle_with_git_from_cwd(
         }
         None => clone_all_from_bundle(git_program, destination, temp.path(), cwd),
     }
+}
+
+fn init_workspace_from_bundle_with_git(
+    git_program: &Path,
+    repo: &GitCloneRepo,
+    destination: &Path,
+    bundle: &[u8],
+) -> Result<(), VmClientError> {
+    let cwd = std::env::current_dir().map_err(|source| VmClientError::Io {
+        operation: "read current directory",
+        path: PathBuf::from("."),
+        source,
+    })?;
+    init_workspace_from_bundle_with_git_from_cwd(git_program, repo, destination, bundle, &cwd)
+}
+
+fn init_workspace_from_bundle_with_git_from_cwd(
+    git_program: &Path,
+    repo: &GitCloneRepo,
+    destination: &Path,
+    bundle: &[u8],
+    cwd: &Path,
+) -> Result<(), VmClientError> {
+    reject_existing_destination(destination, cwd)?;
+    create_destination_parent(destination, cwd)?;
+    let temp = TempBundle::create_near(destination, bundle, cwd)?;
+    run_git_command(
+        git_program,
+        VmGitCloneStep::Init,
+        vec![
+            OsString::from("init"),
+            OsString::from("--"),
+            destination.as_os_str().to_os_string(),
+        ],
+        cwd,
+    )?;
+    run_git_command(
+        git_program,
+        VmGitCloneStep::RemoteAdd,
+        vec![
+            OsString::from("-C"),
+            destination.as_os_str().to_os_string(),
+            OsString::from("remote"),
+            OsString::from("add"),
+            OsString::from("origin"),
+            OsString::from(canonical_github_origin_url(repo)),
+        ],
+        cwd,
+    )?;
+    run_git_command(
+        git_program,
+        VmGitCloneStep::Fetch,
+        vec![
+            OsString::from("-C"),
+            destination.as_os_str().to_os_string(),
+            OsString::from("fetch"),
+            OsString::from("--"),
+            temp.path().as_os_str().to_os_string(),
+            OsString::from(format!(
+                "refs/heads/{branch}:refs/remotes/origin/{branch}",
+                branch = DEFAULT_WORKSPACE_BRANCH
+            )),
+        ],
+        cwd,
+    )?;
+    run_git_command(
+        git_program,
+        VmGitCloneStep::CheckoutBranch,
+        vec![
+            OsString::from("-C"),
+            destination.as_os_str().to_os_string(),
+            OsString::from("checkout"),
+            OsString::from("-B"),
+            OsString::from(DEFAULT_WORKSPACE_BRANCH),
+            OsString::from(format!("refs/remotes/origin/{DEFAULT_WORKSPACE_BRANCH}")),
+        ],
+        cwd,
+    )?;
+    run_git_command(
+        git_program,
+        VmGitCloneStep::SetUpstream,
+        vec![
+            OsString::from("-C"),
+            destination.as_os_str().to_os_string(),
+            OsString::from("branch"),
+            OsString::from("--set-upstream-to"),
+            OsString::from(format!("origin/{DEFAULT_WORKSPACE_BRANCH}")),
+            OsString::from(DEFAULT_WORKSPACE_BRANCH),
+        ],
+        cwd,
+    )
 }
 
 fn clone_all_from_bundle(
@@ -372,6 +570,33 @@ fn run_git_command(
     })
 }
 
+fn run_git_command_output(
+    git_program: &Path,
+    step: VmGitCloneStep,
+    args: Vec<OsString>,
+    cwd: &Path,
+) -> Result<std::process::Output, VmClientError> {
+    let output = Command::new(git_program)
+        .args(args)
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .env_remove(VM_BROKER_URL_ENV)
+        .env_remove(VM_BROKER_TOKEN_ENV)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()
+        .map_err(|source| VmClientError::GitSpawn { step, source })?;
+    if output.status.success() {
+        return Ok(output);
+    }
+    Err(VmClientError::GitFailed {
+        step,
+        status: output.status,
+        stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+    })
+}
+
 impl std::fmt::Display for VmGitCloneStep {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -379,6 +604,19 @@ impl std::fmt::Display for VmGitCloneStep {
             Self::Init => f.write_str("git init"),
             Self::Fetch => f.write_str("git fetch"),
             Self::Checkout => f.write_str("git checkout"),
+            Self::RemoteAdd => f.write_str("git remote add"),
+            Self::CheckoutBranch => f.write_str("git checkout branch"),
+            Self::SetUpstream => f.write_str("git branch --set-upstream-to"),
+            Self::Status => f.write_str("git status"),
+        }
+    }
+}
+
+impl std::fmt::Display for VmWorkspaceWarmStep {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::FlakeMetadata => f.write_str("nix flake metadata"),
+            Self::DevShell => f.write_str("nix develop"),
         }
     }
 }
@@ -547,6 +785,137 @@ fn reject_existing_destination(destination: &Path, cwd: &Path) -> Result<(), VmC
     }
 }
 
+fn create_destination_parent(destination: &Path, cwd: &Path) -> Result<(), VmClientError> {
+    let Some(parent) = destination
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    else {
+        return Ok(());
+    };
+    let parent = if parent.is_absolute() {
+        parent.to_path_buf()
+    } else {
+        cwd.join(parent)
+    };
+    fs::create_dir_all(&parent).map_err(|source| VmClientError::Io {
+        operation: "create workspace parent directory",
+        path: parent,
+        source,
+    })
+}
+
+fn canonical_github_origin_url(repo: &GitCloneRepo) -> String {
+    let repo_ref = repo.as_repo_ref();
+    format!(
+        "https://github.com/{}/{}.git",
+        repo_ref.owner, repo_ref.name
+    )
+}
+
+fn warm_workspace(command: &VmWorkspaceInitCommand) -> Result<(), VmClientError> {
+    match command.warm() {
+        WorkspaceWarmMode::None => Ok(()),
+        WorkspaceWarmMode::Sources => run_nix_flake_metadata(command),
+        WorkspaceWarmMode::DevShell => {
+            run_nix_flake_metadata(command)?;
+            run_nix_develop_true(command)
+        }
+    }
+}
+
+fn run_nix_flake_metadata(command: &VmWorkspaceInitCommand) -> Result<(), VmClientError> {
+    run_nix_command(
+        command.nix_program(),
+        VmWorkspaceWarmStep::FlakeMetadata,
+        vec![
+            OsString::from("--option"),
+            OsString::from("builders"),
+            OsString::from(""),
+            OsString::from("--option"),
+            OsString::from("max-jobs"),
+            OsString::from("0"),
+            OsString::from("--option"),
+            OsString::from("fallback"),
+            OsString::from("false"),
+            OsString::from("flake"),
+            OsString::from("metadata"),
+            OsString::from("--refresh"),
+            OsString::from("--no-write-lock-file"),
+        ],
+        command.destination(),
+    )
+}
+
+fn run_nix_develop_true(command: &VmWorkspaceInitCommand) -> Result<(), VmClientError> {
+    run_nix_command(
+        command.nix_program(),
+        VmWorkspaceWarmStep::DevShell,
+        vec![
+            OsString::from("--option"),
+            OsString::from("builders"),
+            OsString::from(""),
+            OsString::from("--option"),
+            OsString::from("max-jobs"),
+            OsString::from("0"),
+            OsString::from("--option"),
+            OsString::from("fallback"),
+            OsString::from("false"),
+            OsString::from("develop"),
+            OsString::from("--no-write-lock-file"),
+            OsString::from(DEFAULT_DEVSHELL_ATTR),
+            OsString::from("--command"),
+            OsString::from("true"),
+        ],
+        command.destination(),
+    )
+}
+
+fn run_nix_command(
+    nix_program: &Path,
+    step: VmWorkspaceWarmStep,
+    args: Vec<OsString>,
+    cwd: &Path,
+) -> Result<(), VmClientError> {
+    let output = Command::new(nix_program)
+        .args(args)
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .env_remove(VM_BROKER_URL_ENV)
+        .env_remove(VM_BROKER_TOKEN_ENV)
+        .output()
+        .map_err(|source| VmClientError::NixSpawn { step, source })?;
+    if output.status.success() {
+        return Ok(());
+    }
+    Err(VmClientError::NixFailed {
+        step,
+        status: output.status,
+        stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+    })
+}
+
+fn require_clean_workspace(git_program: &Path, destination: &Path) -> Result<(), VmClientError> {
+    let output = run_git_command_output(
+        git_program,
+        VmGitCloneStep::Status,
+        vec![
+            OsString::from("-C"),
+            destination.as_os_str().to_os_string(),
+            OsString::from("status"),
+            OsString::from("--porcelain=v1"),
+        ],
+        Path::new("/"),
+    )?;
+    let status = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if status.is_empty() {
+        Ok(())
+    } else {
+        Err(VmClientError::WorkspaceDirty { status })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -655,6 +1024,12 @@ mod tests {
              if [ \"${{1:-}}\" = '-C' ]; then\n\
              dest=\"$2\"\n\
              shift 2\n\
+             if [ \"${{1:-}}\" = 'remote' ]; then\n\
+             test \"${{2:-}}\" = 'add'\n\
+             test \"${{3:-}}\" = 'origin'\n\
+             test -n \"${{4:-}}\"\n\
+             exit 0\n\
+             fi\n\
              if [ \"${{1:-}}\" = 'fetch' ]; then\n\
              shift\n\
              test \"${{1:-}}\" = '--'\n\
@@ -665,9 +1040,24 @@ mod tests {
              exit 0\n\
              fi\n\
              if [ \"${{1:-}}\" = 'checkout' ]; then\n\
+             if [ \"${{2:-}}\" = '-B' ]; then\n\
+             test \"${{3:-}}\" = 'main'\n\
+             test \"${{4:-}}\" = 'refs/remotes/origin/main'\n\
+             exit 0\n\
+             fi\n\
              test \"${{2:-}}\" = '--detach'\n\
              test \"${{3:-}}\" = 'FETCH_HEAD'\n\
              test -f \"$dest/FETCH_HEAD\"\n\
+             exit 0\n\
+             fi\n\
+             if [ \"${{1:-}}\" = 'branch' ]; then\n\
+             test \"${{2:-}}\" = '--set-upstream-to'\n\
+             test \"${{3:-}}\" = 'origin/main'\n\
+             test \"${{4:-}}\" = 'main'\n\
+             exit 0\n\
+             fi\n\
+             if [ \"${{1:-}}\" = 'status' ]; then\n\
+             test \"${{2:-}}\" = '--porcelain=v1'\n\
              exit 0\n\
              fi\n\
              fi\n\
@@ -943,6 +1333,140 @@ mod tests {
             .unwrap();
         assert!(head.status.success());
         assert_eq!(String::from_utf8_lossy(&head.stdout).trim(), "HEAD");
+    }
+
+    #[test]
+    fn workspace_init_creates_clean_main_branch_tracking_origin_from_bundle() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = required_test_tool("git");
+        let source = dir.path().join("source");
+        let bundle = dir.path().join("main.bundle");
+        let checkout = dir.path().join("checkout");
+
+        let source_arg = source.to_str().unwrap();
+        run_test_git(&git, &["init", "--", source_arg]);
+        run_test_git(
+            &git,
+            &["-C", source_arg, "config", "user.email", "a@example.com"],
+        );
+        run_test_git(&git, &["-C", source_arg, "config", "user.name", "a"]);
+        run_test_git(
+            &git,
+            &["-C", source_arg, "config", "commit.gpgsign", "false"],
+        );
+        fs::write(source.join("file.txt"), "hello\n").unwrap();
+        run_test_git(&git, &["-C", source_arg, "add", "file.txt"]);
+        run_test_git(&git, &["-C", source_arg, "commit", "-m", "init"]);
+        run_test_git(&git, &["-C", source_arg, "branch", "-M", "main"]);
+        run_test_git(
+            &git,
+            &[
+                "-C",
+                source_arg,
+                "bundle",
+                "create",
+                bundle.to_str().unwrap(),
+                "refs/heads/main",
+            ],
+        );
+
+        init_workspace_from_bundle_with_git_from_cwd(
+            &git,
+            &repo(),
+            &checkout,
+            &fs::read(&bundle).unwrap(),
+            dir.path(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(checkout.join("file.txt")).unwrap(),
+            "hello\n"
+        );
+        let branch = Command::new(&git)
+            .args([
+                "-C",
+                checkout.to_str().unwrap(),
+                "rev-parse",
+                "--abbrev-ref",
+                "HEAD",
+            ])
+            .output()
+            .unwrap();
+        assert!(branch.status.success());
+        assert_eq!(String::from_utf8_lossy(&branch.stdout).trim(), "main");
+        let upstream = Command::new(&git)
+            .args([
+                "-C",
+                checkout.to_str().unwrap(),
+                "rev-parse",
+                "--abbrev-ref",
+                "--symbolic-full-name",
+                "@{u}",
+            ])
+            .output()
+            .unwrap();
+        assert!(upstream.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&upstream.stdout).trim(),
+            "origin/main"
+        );
+        let status = Command::new(&git)
+            .args(["-C", checkout.to_str().unwrap(), "status", "--porcelain=v1"])
+            .output()
+            .unwrap();
+        assert!(status.status.success());
+        assert_eq!(String::from_utf8_lossy(&status.stdout).trim(), "");
+    }
+
+    #[tokio::test]
+    async fn workspace_init_from_broker_posts_main_ref_and_does_not_leak_token_to_git() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = write_fake_git(dir.path());
+        let (broker_url, captured) = serve_once(http_response(
+            "200 OK",
+            "application/x-git-bundle",
+            b"bundle bytes",
+        ))
+        .await;
+        let config = VmClientConfig::new(broker_url, "writ-vm-secret").unwrap();
+        let checkout = dir.path().join("checkout");
+        let command = VmWorkspaceInitCommand::new(
+            repo(),
+            Some(checkout.clone()),
+            WorkspaceWarmMode::None,
+            git,
+            "nix",
+        )
+        .unwrap();
+
+        let initialized = init_workspace_from_broker(&config, &command).await.unwrap();
+
+        assert_eq!(initialized, checkout);
+        let request = captured.lock().unwrap().clone();
+        assert!(request.contains(r#""repo":"owner/repo""#), "{request}");
+        assert!(request.contains(r#""ref":"refs/heads/main""#), "{request}");
+        let git_log = fs::read_to_string(dir.path().join("git.log")).unwrap();
+        assert!(
+            git_log.contains("fetch -- ")
+                && git_log.contains("refs/heads/main:refs/remotes/origin/main"),
+            "{git_log}"
+        );
+        assert!(
+            git_log.contains("remote add origin https://github.com/owner/repo.git"),
+            "{git_log}"
+        );
+        assert!(
+            git_log.contains("checkout -B main refs/remotes/origin/main"),
+            "{git_log}"
+        );
+        assert!(
+            git_log.contains("branch --set-upstream-to origin/main main"),
+            "{git_log}"
+        );
+        assert!(!git_log.contains("writ-vm-secret"), "{git_log}");
+        assert!(git_log.contains("broker_url=unset"), "{git_log}");
+        assert!(git_log.contains("broker_token=unset"), "{git_log}");
     }
 
     #[tokio::test]

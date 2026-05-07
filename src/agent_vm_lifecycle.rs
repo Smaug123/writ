@@ -451,7 +451,7 @@ enum PersistedIpv6IsolationMode {
     Ipv4OnlyNoGuestIpv6,
 }
 
-const AGENT_VM_SESSION_STATE_VERSION: u32 = 1;
+const AGENT_VM_SESSION_STATE_VERSION: u32 = 2;
 
 impl From<StartFailure> for AgentVmLifecycleRunError {
     fn from(value: StartFailure) -> Self {
@@ -1782,6 +1782,10 @@ impl AgentVmToolPaths {
             pf_helper: pf_helper.into(),
             sudo: sudo.into(),
         }
+    }
+
+    pub fn container(&self) -> &Path {
+        &self.container
     }
 }
 

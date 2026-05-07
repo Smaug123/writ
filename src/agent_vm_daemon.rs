@@ -8,7 +8,10 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::net::Ipv4Addr;
+use std::path::PathBuf;
+use std::process::Command;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use tokio::sync::Mutex;
 
@@ -18,7 +21,7 @@ use crate::agent_vm_lifecycle::{
     ContainerImage, Ipv6IsolationMode, cleanup_managed_agent_vm_session,
     remove_managed_agent_vm_session_state, start_managed_agent_vm_session,
 };
-use crate::audit::AuditError;
+use crate::audit::{AgentVmWorkspaceBootstrapAuditRecord, AuditError};
 use crate::core::{
     AgentKind, AgentNetwork, AgentNetworkPool, AgentVmConfigError, BrokerPorts, SessionId,
     SessionRecord, UnixMillis,
@@ -26,6 +29,10 @@ use crate::core::{
 use crate::protocol::AgentVmSessionInfo;
 use crate::secret::SecretStore;
 use crate::server::BrokerState;
+use crate::vm_git::{
+    AgentVmWorkspaceBootstrap, DEFAULT_WORKSPACE_BRANCH, WorkspaceWarmMode,
+    default_workspace_destination,
+};
 use crate::vm_http::{
     RunningVmHttpGitSession, VM_NIX_BASIC_LOGIN, VM_NIX_CACHE_PATH_PREFIX, VmHttpGitRuntimeConfig,
     VmHttpGitRuntimeError, VmHttpGitRuntimeShutdownError, prepare_vm_http_git_session,
@@ -42,6 +49,14 @@ pub const AGENT_VM_NIX_NETRC_PATH: &str = "/run/writ-agent-vm/netrc";
 pub const AGENT_VM_NIX_TRUSTED_PUBLIC_KEYS_ENV: &str = "WRIT_NIX_TRUSTED_PUBLIC_KEYS";
 pub const AGENT_VM_NIX_CONF_DIR_ENV: &str = "NIX_CONF_DIR";
 pub const AGENT_VM_NIX_CONF_DIR: &str = "/run/writ-agent-vm/nix-conf";
+const AGENT_VM_WORKSPACE_BROKER_READY_PATH: &str = "/run/writ-agent-vm/broker-ready";
+const AGENT_VM_WORKSPACE_BOOTSTRAP_OK_PATH: &str = "/run/writ-agent-vm/bootstrap-ok";
+const AGENT_VM_WORKSPACE_BOOTSTRAP_FAILED_PATH: &str = "/run/writ-agent-vm/bootstrap-failed";
+const AGENT_VM_WORKSPACE_BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(20 * 60);
+const AGENT_VM_WORKSPACE_BOOTSTRAP_QUICK_POLL_INTERVAL: Duration = Duration::from_millis(500);
+const AGENT_VM_WORKSPACE_BOOTSTRAP_SLOW_POLL_INTERVAL: Duration = Duration::from_secs(2);
+const AGENT_VM_WORKSPACE_BOOTSTRAP_QUICK_POLLS: u32 = 10;
+const AGENT_VM_WORKSPACE_BOOTSTRAP_FAILURE_MESSAGE_LIMIT: usize = 16 * 1024;
 
 const AGENT_VM_GUEST_NIX_SETUP_SCRIPT: &str = r#"set -eu
 : "${WRIT_BROKER_TOKEN:?}"
@@ -87,6 +102,92 @@ printf 'machine %s login %s password %s\n' \
   fi
 } > "$NIX_CONF_DIR/nix.conf"
 
+exec "$@"
+"#;
+
+const AGENT_VM_GUEST_WORKSPACE_BOOTSTRAP_SCRIPT: &str = r#"set -eu
+: "${WRIT_BROKER_TOKEN:?}"
+: "${WRIT_NIX_CACHE_URL:?}"
+: "${WRIT_NIX_BASIC_LOGIN:?}"
+: "${WRIT_NIX_NETRC:?}"
+: "${WRIT_NIX_TRUSTED_PUBLIC_KEYS:=}"
+: "${NIX_CONF_DIR:?}"
+
+repo="$1"
+destination="$2"
+warm="$3"
+shift 3
+
+case "$WRIT_NIX_CACHE_URL" in
+  http://*|https://*) ;;
+  *) echo "WRIT_NIX_CACHE_URL must be http or https" >&2; exit 64 ;;
+esac
+
+cache_authority="${WRIT_NIX_CACHE_URL#http://}"
+if [ "$cache_authority" = "$WRIT_NIX_CACHE_URL" ]; then
+  cache_authority="${WRIT_NIX_CACHE_URL#https://}"
+fi
+cache_host="${cache_authority%%/*}"
+cache_host="${cache_host%%:*}"
+if [ -z "$cache_host" ]; then
+  echo "WRIT_NIX_CACHE_URL has no host" >&2
+  exit 64
+fi
+
+netrc_dir="${WRIT_NIX_NETRC%/*}"
+if [ "$netrc_dir" = "$WRIT_NIX_NETRC" ]; then
+  netrc_dir=.
+fi
+mkdir -p "$netrc_dir" "$NIX_CONF_DIR" /run/writ-agent-vm
+umask 077
+printf 'machine %s login %s password %s\n' \
+  "$cache_host" "$WRIT_NIX_BASIC_LOGIN" "$WRIT_BROKER_TOKEN" > "$WRIT_NIX_NETRC"
+{
+  printf 'experimental-features = nix-command flakes\n'
+  printf 'netrc-file = %s\n' "$WRIT_NIX_NETRC"
+  printf 'access-tokens =\n'
+  printf 'substituters = %s\n' "$WRIT_NIX_CACHE_URL"
+  if [ -n "$WRIT_NIX_TRUSTED_PUBLIC_KEYS" ]; then
+    printf 'trusted-public-keys = %s\n' "$WRIT_NIX_TRUSTED_PUBLIC_KEYS"
+  else
+    printf 'trusted-public-keys =\n'
+  fi
+} > "$NIX_CONF_DIR/nix.conf"
+
+while [ ! -f /run/writ-agent-vm/broker-ready ]; do
+  sleep 0.2
+done
+
+set +e
+writ-vm workspace init "$repo" "$destination" --warm "$warm" \
+  > /run/writ-agent-vm/bootstrap.stdout \
+  2> /run/writ-agent-vm/bootstrap.stderr
+code=$?
+set -e
+if [ "$code" -ne 0 ]; then
+  set +e
+  {
+    printf 'writ-vm workspace init failed with exit %s\n' "$code"
+    if [ -s /run/writ-agent-vm/bootstrap.stderr ]; then
+      printf '%s\n' 'stderr:'
+      cat /run/writ-agent-vm/bootstrap.stderr
+    fi
+  } > /run/writ-agent-vm/bootstrap-failed
+  set -e
+  # Stay alive so the daemon can inspect bootstrap-failed before the lifecycle
+  # cleanup path tears the VM down. Exiting here races the daemon's poller.
+  while :; do sleep 3600; done
+fi
+
+rm -f /run/writ-agent-vm/bootstrap.stdout /run/writ-agent-vm/bootstrap.stderr
+if ! cd "$destination"; then
+  set +e
+  printf 'workspace destination disappeared before agent exec: %s\n' "$destination" \
+    > /run/writ-agent-vm/bootstrap-failed
+  set -e
+  while :; do sleep 3600; done
+fi
+touch /run/writ-agent-vm/bootstrap-ok
 exec "$@"
 "#;
 
@@ -138,6 +239,10 @@ pub enum AgentVmLifecycleRuntimeConfigError {
 pub enum AgentVmDaemonError {
     #[error("agent VM guest command must not be empty")]
     EmptyGuestCommand,
+    #[error("agent VM workspace destination must be absolute: {0}")]
+    RelativeWorkspaceDestination(PathBuf),
+    #[error("agent VM workspace destination must be valid UTF-8: {0}")]
+    NonUtf8WorkspaceDestination(PathBuf),
     #[error("no available agent VM subnet index in configured range {min}-{max}")]
     NoAvailableSubnet { min: u16, max: u16 },
     #[error("agent VM start for session {session_id} failed: {source}")]
@@ -158,6 +263,25 @@ pub enum AgentVmDaemonError {
     Manager(#[from] AgentVmSessionManagerError),
     #[error("agent VM lifecycle task failed: {0}")]
     Join(#[from] tokio::task::JoinError),
+    #[error("agent VM workspace bootstrap {step} command could not be spawned: {source}")]
+    WorkspaceBootstrapSpawn {
+        step: &'static str,
+        source: std::io::Error,
+    },
+    #[error("agent VM workspace bootstrap {step} command failed with status {status}: {stderr}")]
+    WorkspaceBootstrapCommandFailed {
+        step: &'static str,
+        status: String,
+        stderr: String,
+    },
+    #[error("agent VM workspace bootstrap failed: {message}")]
+    WorkspaceBootstrapFailed { message: String },
+    #[error("agent VM workspace bootstrap timed out after {timeout:?}")]
+    WorkspaceBootstrapTimedOut { timeout: Duration },
+    #[error(
+        "agent VM workspace bootstrap failed ({bootstrap}), and cleanup also failed: {cleanup}"
+    )]
+    WorkspaceBootstrapCleanupFailed { bootstrap: String, cleanup: String },
     #[error("agent VM audit operation failed: {0}")]
     Audit(#[from] AuditError),
     #[error(transparent)]
@@ -261,6 +385,7 @@ impl AgentVmDaemon {
         label: Option<String>,
         agent_kind: Option<AgentKind>,
         agent_model: Option<String>,
+        workspace: Option<AgentVmWorkspaceBootstrap>,
         guest_command: Vec<String>,
     ) -> Result<AgentVmStarted, AgentVmDaemonError> {
         // The lower lifecycle layer keeps dual-stack manual starts compatible
@@ -281,10 +406,22 @@ impl AgentVmDaemon {
             closed_at: None,
         })?;
 
-        match self
-            .start_session_after_audit_opened(Arc::clone(&state), session_id, guest_command)
+        let start_result = async {
+            if let Some(workspace) = workspace.as_ref() {
+                let record = workspace_bootstrap_audit_record(session_id, workspace)?;
+                state.audit.record_agent_vm_workspace_bootstrap(&record)?;
+            }
+            self.start_session_after_audit_opened(
+                Arc::clone(&state),
+                session_id,
+                workspace,
+                guest_command,
+            )
             .await
-        {
+        }
+        .await;
+
+        match start_result {
             Ok(started) => Ok(started),
             Err(err) => {
                 close_audit_session_best_effort(&state, session_id);
@@ -334,6 +471,124 @@ impl AgentVmDaemon {
         }
     }
 
+    async fn release_and_wait_for_workspace_bootstrap(
+        &self,
+        vm_name: &str,
+    ) -> Result<(), AgentVmDaemonError> {
+        self.release_and_wait_for_workspace_bootstrap_with_timeout(
+            vm_name,
+            AGENT_VM_WORKSPACE_BOOTSTRAP_TIMEOUT,
+        )
+        .await
+    }
+
+    async fn release_and_wait_for_workspace_bootstrap_with_timeout(
+        &self,
+        vm_name: &str,
+        timeout: Duration,
+    ) -> Result<(), AgentVmDaemonError> {
+        self.run_container_exec_shell(
+            vm_name,
+            "release workspace bootstrap",
+            &format!(
+                "mkdir -p /run/writ-agent-vm && touch {}",
+                AGENT_VM_WORKSPACE_BROKER_READY_PATH
+            ),
+        )
+        .await?;
+
+        let start = Instant::now();
+        let mut poll_count = 0;
+        loop {
+            let output = self
+                .run_container_exec_shell(
+                    vm_name,
+                    "inspect workspace bootstrap",
+                    &format!(
+                        "if [ -f {ok} ]; then printf ok; \
+                         elif [ -f {failed} ]; then printf 'failed\\n'; cat {failed}; \
+                         else printf pending; fi",
+                        ok = AGENT_VM_WORKSPACE_BOOTSTRAP_OK_PATH,
+                        failed = AGENT_VM_WORKSPACE_BOOTSTRAP_FAILED_PATH,
+                    ),
+                )
+                .await?;
+            let status = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if status == "ok" {
+                return Ok(());
+            }
+            if let Some(message) = status.strip_prefix("failed") {
+                let message = normalise_workspace_bootstrap_failure_message(message.trim());
+                return Err(AgentVmDaemonError::WorkspaceBootstrapFailed {
+                    message: if message.is_empty() {
+                        "guest did not report a failure message".into()
+                    } else {
+                        message
+                    },
+                });
+            }
+            if start.elapsed() >= timeout {
+                return Err(AgentVmDaemonError::WorkspaceBootstrapTimedOut { timeout });
+            }
+            let poll_interval = workspace_bootstrap_poll_interval(poll_count);
+            poll_count = poll_count.saturating_add(1);
+            tokio::time::sleep(poll_interval).await;
+        }
+    }
+
+    async fn run_container_exec_shell(
+        &self,
+        vm_name: &str,
+        step: &'static str,
+        script: &str,
+    ) -> Result<std::process::Output, AgentVmDaemonError> {
+        let container = self.config.lifecycle.tools.container().to_path_buf();
+        let vm_name = vm_name.to_string();
+        let script = script.to_string();
+        let output = tokio::task::spawn_blocking(move || {
+            Command::new(container)
+                .args(["exec", &vm_name, "sh", "-c", &script])
+                .output()
+        })
+        .await?
+        .map_err(|source| AgentVmDaemonError::WorkspaceBootstrapSpawn { step, source })?;
+        if output.status.success() {
+            return Ok(output);
+        }
+        Err(AgentVmDaemonError::WorkspaceBootstrapCommandFailed {
+            step,
+            status: output
+                .status
+                .code()
+                .map(|code| code.to_string())
+                .unwrap_or_else(|| "signal".into()),
+            stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        })
+    }
+
+    async fn cleanup_failed_started_session(
+        &self,
+        session_id: SessionId,
+    ) -> Result<(), AgentVmDaemonError> {
+        let store = self.config.lifecycle.state_store.clone();
+        let tools = self.config.lifecycle.tools.clone();
+        tokio::task::spawn_blocking(move || {
+            cleanup_managed_agent_vm_session(&store, session_id, tools)
+        })
+        .await??;
+
+        if let Some(running) = self.running.lock().await.remove(&session_id) {
+            running.shutdown().await?;
+        }
+
+        let store = self.config.lifecycle.state_store.clone();
+        tokio::task::spawn_blocking(move || {
+            remove_managed_agent_vm_session_state(&store, session_id)
+        })
+        .await??;
+        Ok(())
+    }
+
     pub async fn list_sessions(&self) -> Result<Vec<AgentVmSessionInfo>, AgentVmDaemonError> {
         // Listing is observational. Avoid the lifecycle mutex so an operator
         // can inspect persisted cleanup obligations while a start/stop is slow
@@ -364,6 +619,7 @@ impl AgentVmDaemon {
         &self,
         state: Arc<BrokerState<S>>,
         session_id: SessionId,
+        workspace: Option<AgentVmWorkspaceBootstrap>,
         guest_command: Vec<String>,
     ) -> Result<AgentVmStarted, AgentVmDaemonError> {
         let lifecycle = self.config.lifecycle.clone();
@@ -398,7 +654,7 @@ impl AgentVmDaemon {
             AgentVmGuestEnvVar::new(AGENT_VM_NIX_TRUSTED_PUBLIC_KEYS_ENV, trusted_public_keys)?,
             AgentVmGuestEnvVar::new(AGENT_VM_NIX_CONF_DIR_ENV, AGENT_VM_NIX_CONF_DIR)?,
         ];
-        let guest_command = wrap_guest_command_with_nix_setup(guest_command);
+        let guest_command = wrap_guest_command(workspace.as_ref(), guest_command)?;
         let plan = AgentVmSessionPlan::new_with_guest_env(
             session_id,
             self.config.lifecycle.pool,
@@ -422,6 +678,21 @@ impl AgentVmDaemon {
 
         let running = prepared.spawn();
         self.running.lock().await.insert(session_id, running);
+        if workspace.is_some() {
+            if let Err(err) = self
+                .release_and_wait_for_workspace_bootstrap(plan.names().vm())
+                .await
+            {
+                let bootstrap = err.to_string();
+                if let Err(cleanup) = self.cleanup_failed_started_session(session_id).await {
+                    return Err(AgentVmDaemonError::WorkspaceBootstrapCleanupFailed {
+                        bootstrap,
+                        cleanup: cleanup.to_string(),
+                    });
+                }
+                return Err(err);
+            }
+        }
         Ok(AgentVmStarted {
             session_id,
             broker_url,
@@ -463,15 +734,132 @@ fn nix_cache_url_for_broker_url(broker_url: &str) -> String {
     )
 }
 
+fn wrap_guest_command(
+    workspace: Option<&AgentVmWorkspaceBootstrap>,
+    guest_command: Vec<String>,
+) -> Result<Vec<String>, AgentVmDaemonError> {
+    match workspace {
+        Some(workspace) => wrap_guest_command_with_workspace_bootstrap(workspace, guest_command),
+        None => Ok(wrap_guest_command_with_nix_setup(guest_command)),
+    }
+}
+
 fn wrap_guest_command_with_nix_setup(guest_command: Vec<String>) -> Vec<String> {
+    shell_wrapped_command(
+        AGENT_VM_GUEST_NIX_SETUP_SCRIPT,
+        "writ-agent-vm-nix-setup",
+        std::iter::empty::<String>(),
+        guest_command,
+    )
+}
+
+fn wrap_guest_command_with_workspace_bootstrap(
+    workspace: &AgentVmWorkspaceBootstrap,
+    guest_command: Vec<String>,
+) -> Result<Vec<String>, AgentVmDaemonError> {
+    let destination = workspace_destination(workspace)?;
+    let destination_arg = destination
+        .to_str()
+        .map(str::to_owned)
+        .ok_or_else(|| AgentVmDaemonError::NonUtf8WorkspaceDestination(destination.clone()))?;
+    Ok(shell_wrapped_command(
+        AGENT_VM_GUEST_WORKSPACE_BOOTSTRAP_SCRIPT,
+        "writ-agent-vm-workspace-bootstrap",
+        [
+            workspace.repo.to_string(),
+            destination_arg,
+            workspace_warm_arg(workspace.warm).to_string(),
+        ],
+        guest_command,
+    ))
+}
+
+fn shell_wrapped_command(
+    script: &str,
+    argv0: &str,
+    prefix_args: impl IntoIterator<Item = String>,
+    guest_command: Vec<String>,
+) -> Vec<String> {
     let mut wrapped = vec![
         "sh".to_string(),
         "-c".to_string(),
-        AGENT_VM_GUEST_NIX_SETUP_SCRIPT.to_string(),
-        "writ-agent-vm-nix-setup".to_string(),
+        script.to_string(),
+        argv0.into(),
     ];
+    wrapped.extend(prefix_args);
     wrapped.extend(guest_command);
     wrapped
+}
+
+fn workspace_destination(
+    workspace: &AgentVmWorkspaceBootstrap,
+) -> Result<PathBuf, AgentVmDaemonError> {
+    let destination = workspace
+        .destination
+        .clone()
+        .unwrap_or_else(|| default_workspace_destination(&workspace.repo));
+    if !destination.is_absolute() {
+        return Err(AgentVmDaemonError::RelativeWorkspaceDestination(
+            destination,
+        ));
+    }
+    Ok(destination)
+}
+
+fn workspace_bootstrap_audit_record(
+    session_id: SessionId,
+    workspace: &AgentVmWorkspaceBootstrap,
+) -> Result<AgentVmWorkspaceBootstrapAuditRecord, AgentVmDaemonError> {
+    let destination = workspace_destination(workspace)?;
+    let destination = destination
+        .to_str()
+        .map(str::to_owned)
+        .ok_or_else(|| AgentVmDaemonError::NonUtf8WorkspaceDestination(destination.clone()))?;
+    Ok(AgentVmWorkspaceBootstrapAuditRecord {
+        session_id,
+        requested_at: UnixMillis::now(),
+        repo: workspace.repo.to_string(),
+        destination,
+        branch: DEFAULT_WORKSPACE_BRANCH.to_string(),
+        warm: workspace_warm_arg(workspace.warm).to_string(),
+    })
+}
+
+fn workspace_warm_arg(mode: WorkspaceWarmMode) -> &'static str {
+    match mode {
+        WorkspaceWarmMode::None => "none",
+        WorkspaceWarmMode::Sources => "sources",
+        WorkspaceWarmMode::DevShell => "devshell",
+    }
+}
+
+fn workspace_bootstrap_poll_interval(poll_count: u32) -> Duration {
+    if poll_count < AGENT_VM_WORKSPACE_BOOTSTRAP_QUICK_POLLS {
+        AGENT_VM_WORKSPACE_BOOTSTRAP_QUICK_POLL_INTERVAL
+    } else {
+        AGENT_VM_WORKSPACE_BOOTSTRAP_SLOW_POLL_INTERVAL
+    }
+}
+
+fn normalise_workspace_bootstrap_failure_message(raw: &str) -> String {
+    let mut out = String::new();
+    let mut truncated = false;
+    for ch in raw.chars() {
+        let ch = if ch.is_control() && ch != '\n' && ch != '\t' {
+            '?'
+        } else {
+            ch
+        };
+        if out.len() + ch.len_utf8() > AGENT_VM_WORKSPACE_BOOTSTRAP_FAILURE_MESSAGE_LIMIT {
+            truncated = true;
+            break;
+        }
+        out.push(ch);
+    }
+    if truncated {
+        out.push_str("\n[truncated]");
+    }
+    out
 }
 
 impl AgentVmStarted {
@@ -624,6 +1012,84 @@ mod tests {
         path
     }
 
+    fn write_fake_workspace_failure_tool(
+        dir: &Path,
+        args_log: &Path,
+        env_path_log: &Path,
+        env_log: &Path,
+    ) -> PathBuf {
+        let path = dir.join("fake-workspace-failure-tool");
+        let script = format!(
+            "#!/bin/sh\n\
+             printf '%s\\n' \"$*\" >> {args_log}\n\
+             if [ \"$1\" = \"network\" ] && [ \"$2\" = \"inspect\" ]; then\n\
+             printf '%s\\n' 'ipv4Subnet: 192.168.252.0/24' 'ipv4Gateway: 192.168.252.1'\n\
+             fi\n\
+             if [ \"$1\" = \"run\" ]; then\n\
+             while [ \"$#\" -gt 0 ]; do\n\
+             if [ \"$1\" = \"--env-file\" ]; then\n\
+             printf '%s\\n' \"$2\" > {env_path_log}\n\
+             cat \"$2\" > {env_log}\n\
+             fi\n\
+             shift\n\
+             done\n\
+             fi\n\
+             if [ \"$1\" = \"exec\" ]; then\n\
+             case \"${{5:-}}\" in\n\
+             *bootstrap-failed*) printf 'failed\\nsimulated workspace failure\\n' ;;\n\
+             esac\n\
+             fi\n\
+             exit 0\n",
+            args_log = shell_quote(args_log),
+            env_path_log = shell_quote(env_path_log),
+            env_log = shell_quote(env_log),
+        );
+        fs::write(&path, script).unwrap();
+        let mut permissions = fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&path, permissions).unwrap();
+        path
+    }
+
+    fn write_fake_workspace_success_tool(
+        dir: &Path,
+        args_log: &Path,
+        env_path_log: &Path,
+        env_log: &Path,
+    ) -> PathBuf {
+        let path = dir.join("fake-workspace-success-tool");
+        let script = format!(
+            "#!/bin/sh\n\
+             printf '%s\\n' \"$*\" >> {args_log}\n\
+             if [ \"$1\" = \"network\" ] && [ \"$2\" = \"inspect\" ]; then\n\
+             printf '%s\\n' 'ipv4Subnet: 192.168.252.0/24' 'ipv4Gateway: 192.168.252.1'\n\
+             fi\n\
+             if [ \"$1\" = \"run\" ]; then\n\
+             while [ \"$#\" -gt 0 ]; do\n\
+             if [ \"$1\" = \"--env-file\" ]; then\n\
+             printf '%s\\n' \"$2\" > {env_path_log}\n\
+             cat \"$2\" > {env_log}\n\
+             fi\n\
+             shift\n\
+             done\n\
+             fi\n\
+             if [ \"$1\" = \"exec\" ]; then\n\
+             case \"${{5:-}}\" in\n\
+             *bootstrap-failed*) printf 'ok' ;;\n\
+             esac\n\
+             fi\n\
+             exit 0\n",
+            args_log = shell_quote(args_log),
+            env_path_log = shell_quote(env_path_log),
+            env_log = shell_quote(env_log),
+        );
+        fs::write(&path, script).unwrap();
+        let mut permissions = fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&path, permissions).unwrap();
+        path
+    }
+
     fn agent_vm_pool() -> AgentNetworkPool {
         AgentNetworkPool::new(
             Ipv4Cidr::new("192.168.0.0".parse().unwrap(), 16).unwrap(),
@@ -723,6 +1189,7 @@ mod tests {
                 Some("agent vm".into()),
                 Some(AgentKind::Codex),
                 Some("gpt-test".into()),
+                None,
                 vec!["sleep".into(), "600".into()],
             )
             .await
@@ -864,6 +1331,7 @@ mod tests {
                 Some("subnet pool exhausted".into()),
                 None,
                 None,
+                None,
                 vec!["sleep".into(), "600".into()],
             )
             .await
@@ -903,6 +1371,7 @@ mod tests {
                 Some("container network create fails".into()),
                 None,
                 None,
+                None,
                 vec!["sleep".into(), "600".into()],
             )
             .await
@@ -919,6 +1388,108 @@ mod tests {
         assert!(state_store.load(session_id).is_err());
         let audit_session = state.audit.get_session(session_id).unwrap().unwrap();
         assert!(audit_session.closed_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn daemon_workspace_bootstrap_success_records_audit_intent() {
+        let dir = tempfile::tempdir().unwrap();
+        let args_log = dir.path().join("args.log");
+        let env_path_log = dir.path().join("env-path.log");
+        let env_log = dir.path().join("env.log");
+        let fake_tool =
+            write_fake_workspace_success_tool(dir.path(), &args_log, &env_path_log, &env_log);
+        let (config, _) = daemon_config(dir.path(), &fake_tool);
+        let state = make_state();
+        let daemon = AgentVmDaemon::new(config);
+        let workspace = AgentVmWorkspaceBootstrap {
+            repo: "owner/repo".parse().unwrap(),
+            destination: None,
+            warm: WorkspaceWarmMode::Sources,
+        };
+
+        let started = daemon
+            .start_session(
+                Arc::clone(&state),
+                Some("workspace bootstrap success".into()),
+                None,
+                None,
+                Some(workspace),
+                vec!["codex".into()],
+            )
+            .await
+            .unwrap();
+
+        let audit_record = state
+            .audit
+            .get_agent_vm_workspace_bootstrap(started.session_id())
+            .unwrap()
+            .unwrap();
+        assert_eq!(audit_record.repo, "owner/repo");
+        assert_eq!(audit_record.destination, "/workspace/repo");
+        assert_eq!(audit_record.branch, DEFAULT_WORKSPACE_BRANCH);
+        assert_eq!(audit_record.warm, "sources");
+
+        daemon
+            .stop_session(&state, started.session_id())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn daemon_workspace_bootstrap_failure_removes_state_and_closes_audit_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let args_log = dir.path().join("args.log");
+        let env_path_log = dir.path().join("env-path.log");
+        let env_log = dir.path().join("env.log");
+        let fake_tool =
+            write_fake_workspace_failure_tool(dir.path(), &args_log, &env_path_log, &env_log);
+        let (config, state_store) = daemon_config(dir.path(), &fake_tool);
+        let state = make_state();
+        let daemon = AgentVmDaemon::new(config);
+        let workspace = AgentVmWorkspaceBootstrap {
+            repo: "owner/repo".parse().unwrap(),
+            destination: Some(PathBuf::from("/workspace/repo")),
+            warm: WorkspaceWarmMode::None,
+        };
+
+        let err = daemon
+            .start_session(
+                Arc::clone(&state),
+                Some("workspace bootstrap failure".into()),
+                None,
+                None,
+                Some(workspace),
+                vec!["codex".into()],
+            )
+            .await
+            .unwrap_err();
+
+        let session_id = match err {
+            AgentVmDaemonError::StartFailed { session_id, source } => {
+                assert!(matches!(
+                    *source,
+                    AgentVmDaemonError::WorkspaceBootstrapFailed { .. }
+                ));
+                session_id
+            }
+            other => panic!("unexpected workspace bootstrap error: {other:?}"),
+        };
+        assert!(state_store.load_all().unwrap().is_empty());
+        assert!(daemon.running.lock().await.is_empty());
+        let audit_session = state.audit.get_session(session_id).unwrap().unwrap();
+        assert_eq!(
+            audit_session.label.as_deref(),
+            Some("workspace bootstrap failure")
+        );
+        assert!(audit_session.closed_at.is_some());
+        let audit_record = state
+            .audit
+            .get_agent_vm_workspace_bootstrap(session_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(audit_record.repo, "owner/repo");
+        assert_eq!(audit_record.destination, "/workspace/repo");
+        assert_eq!(audit_record.warm, "none");
     }
 
     #[tokio::test]
@@ -995,6 +1566,109 @@ mod tests {
         );
     }
 
+    #[test]
+    fn non_workspace_nix_setup_does_not_enable_flakes() {
+        assert!(AGENT_VM_GUEST_NIX_SETUP_SCRIPT.contains("experimental-features = nix-command"));
+        assert!(!AGENT_VM_GUEST_NIX_SETUP_SCRIPT.contains("nix-command flakes"));
+        assert!(AGENT_VM_GUEST_WORKSPACE_BOOTSTRAP_SCRIPT.contains("nix-command flakes"));
+    }
+
+    #[test]
+    fn workspace_bootstrap_script_mentions_sentinel_paths() {
+        assert!(
+            AGENT_VM_GUEST_WORKSPACE_BOOTSTRAP_SCRIPT
+                .contains(AGENT_VM_WORKSPACE_BROKER_READY_PATH)
+        );
+        assert!(
+            AGENT_VM_GUEST_WORKSPACE_BOOTSTRAP_SCRIPT
+                .contains(AGENT_VM_WORKSPACE_BOOTSTRAP_OK_PATH)
+        );
+        assert!(
+            AGENT_VM_GUEST_WORKSPACE_BOOTSTRAP_SCRIPT
+                .contains(AGENT_VM_WORKSPACE_BOOTSTRAP_FAILED_PATH)
+        );
+    }
+
+    #[test]
+    fn workspace_bootstrap_poll_interval_backs_off_after_initial_polls() {
+        assert_eq!(
+            workspace_bootstrap_poll_interval(0),
+            AGENT_VM_WORKSPACE_BOOTSTRAP_QUICK_POLL_INTERVAL
+        );
+        assert_eq!(
+            workspace_bootstrap_poll_interval(AGENT_VM_WORKSPACE_BOOTSTRAP_QUICK_POLLS - 1),
+            AGENT_VM_WORKSPACE_BOOTSTRAP_QUICK_POLL_INTERVAL
+        );
+        assert_eq!(
+            workspace_bootstrap_poll_interval(AGENT_VM_WORKSPACE_BOOTSTRAP_QUICK_POLLS),
+            AGENT_VM_WORKSPACE_BOOTSTRAP_SLOW_POLL_INTERVAL
+        );
+    }
+
+    #[test]
+    fn workspace_bootstrap_failure_message_is_bounded_and_control_scrubbed() {
+        let raw = format!(
+            "\u{1b}[31m{}\u{7}",
+            "x".repeat(AGENT_VM_WORKSPACE_BOOTSTRAP_FAILURE_MESSAGE_LIMIT + 32)
+        );
+
+        let message = normalise_workspace_bootstrap_failure_message(&raw);
+
+        assert!(
+            message.len()
+                <= AGENT_VM_WORKSPACE_BOOTSTRAP_FAILURE_MESSAGE_LIMIT + "\n[truncated]".len()
+        );
+        assert!(!message.contains('\u{1b}'));
+        assert!(message.ends_with("[truncated]"));
+    }
+
+    #[tokio::test]
+    async fn workspace_bootstrap_wait_reports_timeout_at_supplied_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let args_log = dir.path().join("args.log");
+        let env_path_log = dir.path().join("env-path.log");
+        let env_log = dir.path().join("env.log");
+        let fake_tool = write_fake_tool(dir.path(), &args_log, &env_path_log, &env_log);
+        let (config, _) = daemon_config(dir.path(), &fake_tool);
+        let daemon = AgentVmDaemon::new(config);
+
+        let err = daemon
+            .release_and_wait_for_workspace_bootstrap_with_timeout(
+                "writ-agent-vm-test",
+                Duration::ZERO,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            AgentVmDaemonError::WorkspaceBootstrapTimedOut {
+                timeout: Duration::ZERO
+            }
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_bootstrap_rejects_non_utf8_destination() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let workspace = AgentVmWorkspaceBootstrap {
+            repo: "owner/repo".parse().unwrap(),
+            destination: Some(PathBuf::from(OsString::from_vec(vec![b'/', 0xff]))),
+            warm: WorkspaceWarmMode::None,
+        };
+
+        let err = wrap_guest_command_with_workspace_bootstrap(&workspace, vec!["true".into()])
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            AgentVmDaemonError::NonUtf8WorkspaceDestination(_)
+        ));
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(32))]
 
@@ -1010,6 +1684,36 @@ mod tests {
                 "writ-agent-vm-nix-setup".to_string(),
             ]);
             prop_assert_eq!(&wrapped[4..], guest_command.as_slice());
+            prop_assert!(!wrapped.join("\n").contains("writ-vm-"));
+        }
+
+        #[test]
+        fn workspace_bootstrap_wrapper_preserves_guest_command_argv(
+            guest_command in prop::collection::vec(any::<String>(), 1..16),
+            warm in prop_oneof![
+                Just(WorkspaceWarmMode::None),
+                Just(WorkspaceWarmMode::Sources),
+                Just(WorkspaceWarmMode::DevShell),
+            ],
+        ) {
+            let workspace = AgentVmWorkspaceBootstrap {
+                repo: "owner/repo".parse().unwrap(),
+                destination: Some(PathBuf::from("/workspace/repo")),
+                warm,
+            };
+            let wrapped = wrap_guest_command_with_workspace_bootstrap(&workspace, guest_command.clone()).unwrap();
+            prop_assert_eq!(&wrapped[..4], &[
+                "sh".to_string(),
+                "-c".to_string(),
+                AGENT_VM_GUEST_WORKSPACE_BOOTSTRAP_SCRIPT.to_string(),
+                "writ-agent-vm-workspace-bootstrap".to_string(),
+            ]);
+            prop_assert_eq!(&wrapped[4..7], &[
+                "owner/repo".to_string(),
+                "/workspace/repo".to_string(),
+                workspace_warm_arg(warm).to_string(),
+            ]);
+            prop_assert_eq!(&wrapped[7..], guest_command.as_slice());
             prop_assert!(!wrapped.join("\n").contains("writ-vm-"));
         }
 
