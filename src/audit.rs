@@ -31,9 +31,11 @@ use crate::agent_run::{
     AgentPromptSummary, AgentRunId, AgentRunOutcome, AgentRunStreamSummary, AgentRunTerminalStatus,
 };
 use crate::core::{
-    AgentKind, CapabilityRequest, CredentialGrant, GitHubGrantedScope, GitHubRequest, GrantedScope,
-    Jti, MetadataAccess, PolicyDecision, RequestId, SessionId, SessionRecord, UnixMillis,
+    AgentKind, CapabilityRequest, CredentialGrant, GitHubAccess, GitHubGrantedScope, GitHubRequest,
+    GrantedScope, Jti, MetadataAccess, PolicyDecision, RequestId, SessionId, SessionRecord,
+    UnixMillis,
 };
+use crate::vm_git::{GitBranchName, GitCloneRepo, GitObjectId};
 
 /// How much a grant's effective lifetime may exceed the decision's TTL
 /// ceiling before the audit layer rejects the row. Backend minters compare
@@ -135,6 +137,51 @@ pub struct NixCacheOutcomeRecord<'a> {
     pub error: Option<&'a str>,
 }
 
+#[derive(Debug)]
+pub struct GitPushRequestRecord {
+    pub push_request_id: RequestId,
+    pub session_id: SessionId,
+    pub received_at: UnixMillis,
+    pub repo: GitCloneRepo,
+    pub branch: GitBranchName,
+    pub expected_remote_head: GitObjectId,
+    pub new_head: GitObjectId,
+}
+
+#[derive(Debug)]
+pub struct GitPushAttemptRecord {
+    pub push_attempt_id: RequestId,
+    pub push_request_id: RequestId,
+    pub capability_request_id: RequestId,
+    pub grant_jti: Jti,
+    pub planned_at: UnixMillis,
+    pub repo: GitCloneRepo,
+    pub branch: GitBranchName,
+    pub old_head: GitObjectId,
+    pub new_head: GitObjectId,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum GitPushOutcomeResult {
+    Denied,
+    ValidationFailed,
+    Pushed,
+    LeaseRejected,
+    PushRejected,
+    PushFailed,
+    AuditFailedAfterPush,
+}
+
+#[derive(Debug)]
+pub struct GitPushOutcomeRecord<'a> {
+    pub push_request_id: RequestId,
+    pub push_attempt_id: Option<RequestId>,
+    pub completed_at: UnixMillis,
+    pub result: GitPushOutcomeResult,
+    pub github_status: Option<u16>,
+    pub message: &'a str,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AgentVmWorkspaceBootstrapAuditRecord {
     pub session_id: SessionId,
@@ -175,6 +222,27 @@ pub struct NixCacheAuditEntry {
     pub upstream_status: Option<u16>,
     pub response_bytes: Option<u64>,
     pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GitPushAuditEntry {
+    pub push_request_id: RequestId,
+    pub session_id: SessionId,
+    pub received_at: UnixMillis,
+    pub repo: GitCloneRepo,
+    pub branch: GitBranchName,
+    pub expected_remote_head: GitObjectId,
+    pub new_head: GitObjectId,
+    pub push_attempt_id: Option<RequestId>,
+    pub capability_request_id: Option<RequestId>,
+    pub grant_jti: Option<Jti>,
+    pub planned_at: Option<UnixMillis>,
+    pub old_head: Option<GitObjectId>,
+    pub attempted_new_head: Option<GitObjectId>,
+    pub completed_at: Option<UnixMillis>,
+    pub result: Option<GitPushOutcomeResult>,
+    pub github_status: Option<u16>,
+    pub message: Option<String>,
 }
 
 pub struct AuditLog {
@@ -685,6 +753,239 @@ impl AuditLog {
         })
     }
 
+    /// Persist a parsed VM Git push request before any credential mint,
+    /// remote fetch, or external push is attempted.
+    pub fn record_git_push_request(&self, r: &GitPushRequestRecord) -> Result<(), AuditError> {
+        self.with_conn_mut(|c| {
+            let tx = c.transaction()?;
+            let session_closed_at: Option<Option<i64>> = tx
+                .query_row(
+                    "SELECT closed_at FROM session WHERE session_id = ?1",
+                    params![r.session_id.as_uuid().to_string()],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            match session_closed_at {
+                None => return Err(AuditError::Invariant("session does not exist")),
+                Some(Some(_)) => return Err(AuditError::Invariant("session is closed")),
+                Some(None) => {}
+            }
+
+            tx.execute(
+                "INSERT INTO git_push_request (
+                     push_request_id,
+                     session_id,
+                     received_at,
+                     repo,
+                     branch,
+                     expected_remote_head,
+                     new_head
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    r.push_request_id.as_uuid().to_string(),
+                    r.session_id.as_uuid().to_string(),
+                    r.received_at.as_millis(),
+                    r.repo.to_string(),
+                    r.branch.as_str(),
+                    r.expected_remote_head.as_str(),
+                    r.new_head.as_str(),
+                ],
+            )?;
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
+    /// Persist the exact push the broker is about to attempt. This must
+    /// happen after host-side validation and before the external `git push`.
+    pub fn record_git_push_attempt(&self, r: &GitPushAttemptRecord) -> Result<(), AuditError> {
+        self.with_conn_mut(|c| {
+            let tx = c.transaction()?;
+            let push_request: Option<(String, String, String, String, String, String)> = tx
+                .query_row(
+                    "SELECT session_id, repo, branch, expected_remote_head, new_head, push_request_id
+                     FROM git_push_request
+                     WHERE push_request_id = ?1",
+                    params![r.push_request_id.as_uuid().to_string()],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                            row.get(5)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            let Some((
+                push_session,
+                request_repo,
+                request_branch,
+                request_old_head,
+                request_new_head,
+                _,
+            )) = push_request
+            else {
+                return Err(AuditError::Invariant("git push request does not exist"));
+            };
+
+            if request_repo != r.repo.to_string() {
+                return Err(AuditError::Invariant("git push attempt repo differs from request"));
+            }
+            if request_branch != r.branch.as_str() {
+                return Err(AuditError::Invariant(
+                    "git push attempt branch differs from request",
+                ));
+            }
+            if request_old_head != r.old_head.as_str() {
+                return Err(AuditError::Invariant(
+                    "git push attempt old head differs from request",
+                ));
+            }
+            if request_new_head != r.new_head.as_str() {
+                return Err(AuditError::Invariant(
+                    "git push attempt new head differs from request",
+                ));
+            }
+
+            let grant: Option<(String, String, String)> = tx
+                .query_row(
+                    "SELECT request_id, session_id, scope_json
+                     FROM grant_log
+                     WHERE jti = ?1",
+                    params![r.grant_jti.as_uuid().to_string()],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()?;
+            let Some((grant_request_id, grant_session_id, grant_scope_json)) = grant else {
+                return Err(AuditError::Invariant("git push grant does not exist"));
+            };
+            if grant_request_id != r.capability_request_id.as_uuid().to_string() {
+                return Err(AuditError::Invariant(
+                    "git push grant is not for the recorded capability request",
+                ));
+            }
+            if grant_session_id != push_session {
+                return Err(AuditError::Invariant(
+                    "git push grant session differs from push request session",
+                ));
+            }
+            let scope: GrantedScope = serde_json::from_str(&grant_scope_json)?;
+            match scope {
+                GrantedScope::GitHub(scope)
+                    if scope.repository.matches(r.repo.as_repo_ref())
+                        && scope.permissions.contents == Some(GitHubAccess::Write) => {}
+                GrantedScope::GitHub(_) => {
+                    return Err(AuditError::Invariant(
+                        "git push grant is not contents:write for the requested repo",
+                    ));
+                }
+            }
+
+            tx.execute(
+                "INSERT INTO git_push_attempt (
+                     push_attempt_id,
+                     push_request_id,
+                     capability_request_id,
+                     grant_jti,
+                     planned_at,
+                     repo,
+                     branch,
+                     old_head,
+                     new_head
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    r.push_attempt_id.as_uuid().to_string(),
+                    r.push_request_id.as_uuid().to_string(),
+                    r.capability_request_id.as_uuid().to_string(),
+                    r.grant_jti.as_uuid().to_string(),
+                    r.planned_at.as_millis(),
+                    r.repo.to_string(),
+                    r.branch.as_str(),
+                    r.old_head.as_str(),
+                    r.new_head.as_str(),
+                ],
+            )?;
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
+    /// Append the terminal broker-visible result for a VM Git push request.
+    /// This is permitted after session close because the request was accepted
+    /// while the session was open.
+    pub fn record_git_push_outcome(&self, r: &GitPushOutcomeRecord<'_>) -> Result<(), AuditError> {
+        if r.message.is_empty() {
+            return Err(AuditError::Invariant(
+                "git push outcome message must not be empty",
+            ));
+        }
+        if let Some(status) = r.github_status
+            && !(100..=599).contains(&status)
+        {
+            return Err(AuditError::Invariant(
+                "git push outcome GitHub status must be 100..599",
+            ));
+        }
+        if git_push_result_requires_attempt(r.result) && r.push_attempt_id.is_none() {
+            return Err(AuditError::Invariant(
+                "git push outcome result requires an attempt",
+            ));
+        }
+        if !git_push_result_requires_attempt(r.result) && r.push_attempt_id.is_some() {
+            return Err(AuditError::Invariant(
+                "git push outcome result must not reference an attempt",
+            ));
+        }
+
+        self.with_conn_mut(|c| {
+            let tx = c.transaction()?;
+            if let Some(push_attempt_id) = r.push_attempt_id {
+                let attempt_request_id: Option<String> = tx
+                    .query_row(
+                        "SELECT push_request_id
+                         FROM git_push_attempt
+                         WHERE push_attempt_id = ?1",
+                        params![push_attempt_id.as_uuid().to_string()],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                match attempt_request_id {
+                    Some(id) if id == r.push_request_id.as_uuid().to_string() => {}
+                    Some(_) => {
+                        return Err(AuditError::Invariant(
+                            "git push outcome attempt belongs to a different request",
+                        ));
+                    }
+                    None => return Err(AuditError::Invariant("git push attempt does not exist")),
+                }
+            }
+
+            tx.execute(
+                "INSERT INTO git_push_outcome (
+                     push_request_id,
+                     push_attempt_id,
+                     completed_at,
+                     result,
+                     github_status,
+                     message
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    r.push_request_id.as_uuid().to_string(),
+                    r.push_attempt_id.map(|id| id.as_uuid().to_string()),
+                    r.completed_at.as_millis(),
+                    r.result.as_str(),
+                    r.github_status.map(i64::from),
+                    r.message,
+                ],
+            )?;
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
     /// Append the grant produced by a successful mint. The matching
     /// request row must already have been persisted via
     /// [`AuditLog::record_pre_mint`]; the FK on `grant_log.request_id`
@@ -912,6 +1213,46 @@ impl AuditLog {
             rows.into_iter().collect::<Result<Vec<_>, _>>()
         })
     }
+
+    pub fn list_git_pushes_for_session(
+        &self,
+        id: SessionId,
+    ) -> Result<Vec<GitPushAuditEntry>, AuditError> {
+        self.with_conn(|c| {
+            let mut stmt = c.prepare(
+                "SELECT
+                     r.push_request_id,
+                     r.session_id,
+                     r.received_at,
+                     r.repo,
+                     r.branch,
+                     r.expected_remote_head,
+                     r.new_head,
+                     a.push_attempt_id,
+                     a.capability_request_id,
+                     a.grant_jti,
+                     a.planned_at,
+                     a.old_head,
+                     a.new_head AS attempted_new_head,
+                     o.completed_at,
+                     o.result,
+                     o.github_status,
+                     o.message
+                 FROM git_push_request r
+                 LEFT JOIN git_push_attempt a ON a.push_request_id = r.push_request_id
+                 LEFT JOIN git_push_outcome o ON o.push_request_id = r.push_request_id
+                 WHERE r.session_id = ?1
+                 ORDER BY r.received_at ASC, r.rowid ASC",
+            )?;
+            let rows = stmt
+                .query_map(
+                    params![id.as_uuid().to_string()],
+                    git_push_audit_entry_from_row,
+                )?
+                .collect::<Result<Vec<_>, _>>()?;
+            rows.into_iter().collect::<Result<Vec<_>, _>>()
+        })
+    }
 }
 
 /// True iff `scope` is a possible policy output for `request`. The audit
@@ -1123,6 +1464,46 @@ impl NixCacheAuditRoute {
     }
 }
 
+impl GitPushOutcomeResult {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Denied => "denied",
+            Self::ValidationFailed => "validation_failed",
+            Self::Pushed => "pushed",
+            Self::LeaseRejected => "lease_rejected",
+            Self::PushRejected => "push_rejected",
+            Self::PushFailed => "push_failed",
+            Self::AuditFailedAfterPush => "audit_failed_after_push",
+        }
+    }
+
+    fn from_str(raw: &str) -> Result<Self, AuditError> {
+        match raw {
+            "denied" => Ok(Self::Denied),
+            "validation_failed" => Ok(Self::ValidationFailed),
+            "pushed" => Ok(Self::Pushed),
+            "lease_rejected" => Ok(Self::LeaseRejected),
+            "push_rejected" => Ok(Self::PushRejected),
+            "push_failed" => Ok(Self::PushFailed),
+            "audit_failed_after_push" => Ok(Self::AuditFailedAfterPush),
+            _ => Err(AuditError::Invariant(
+                "Git push audit outcome result is invalid",
+            )),
+        }
+    }
+}
+
+fn git_push_result_requires_attempt(result: GitPushOutcomeResult) -> bool {
+    matches!(
+        result,
+        GitPushOutcomeResult::Pushed
+            | GitPushOutcomeResult::LeaseRejected
+            | GitPushOutcomeResult::PushRejected
+            | GitPushOutcomeResult::PushFailed
+            | GitPushOutcomeResult::AuditFailedAfterPush
+    )
+}
+
 fn session_from_row(row: &Row<'_>) -> rusqlite::Result<SessionRecord> {
     let session_id_str: String = row.get("session_id")?;
     let label: Option<String> = row.get("label")?;
@@ -1226,6 +1607,168 @@ fn nix_cache_audit_entry_from_row(
         })
     };
     Ok(parse())
+}
+
+fn git_push_audit_entry_from_row(
+    row: &Row<'_>,
+) -> rusqlite::Result<Result<GitPushAuditEntry, AuditError>> {
+    let push_request_id_str: String = row.get(0)?;
+    let session_id_str: String = row.get(1)?;
+    let received_at: i64 = row.get(2)?;
+    let repo_str: String = row.get(3)?;
+    let branch_str: String = row.get(4)?;
+    let expected_remote_head_str: String = row.get(5)?;
+    let new_head_str: String = row.get(6)?;
+    let push_attempt_id_str: Option<String> = row.get(7)?;
+    let capability_request_id_str: Option<String> = row.get(8)?;
+    let grant_jti_str: Option<String> = row.get(9)?;
+    let planned_at: Option<i64> = row.get(10)?;
+    let old_head_str: Option<String> = row.get(11)?;
+    let attempted_new_head_str: Option<String> = row.get(12)?;
+    let completed_at: Option<i64> = row.get(13)?;
+    let result_str: Option<String> = row.get(14)?;
+    let github_status: Option<i64> = row.get(15)?;
+    let message: Option<String> = row.get(16)?;
+
+    let parse = || -> Result<GitPushAuditEntry, AuditError> {
+        let push_request_id = uuid::Uuid::parse_str(&push_request_id_str)
+            .map_err(|_| AuditError::Invariant("Git push audit row: request id not a uuid"))?;
+        let session_id = uuid::Uuid::parse_str(&session_id_str)
+            .map_err(|_| AuditError::Invariant("Git push audit row: session id not a uuid"))?;
+        let repo = repo_str
+            .parse::<GitCloneRepo>()
+            .map_err(|_| AuditError::Invariant("Git push audit row: repo is invalid"))?;
+        let branch = branch_str
+            .parse::<GitBranchName>()
+            .map_err(|_| AuditError::Invariant("Git push audit row: branch is invalid"))?;
+        let expected_remote_head =
+            expected_remote_head_str
+                .parse::<GitObjectId>()
+                .map_err(|_| {
+                    AuditError::Invariant("Git push audit row: expected remote head is invalid")
+                })?;
+        let new_head = new_head_str
+            .parse::<GitObjectId>()
+            .map_err(|_| AuditError::Invariant("Git push audit row: new head is invalid"))?;
+
+        let has_attempt = push_attempt_id_str.is_some()
+            || capability_request_id_str.is_some()
+            || grant_jti_str.is_some()
+            || planned_at.is_some()
+            || old_head_str.is_some()
+            || attempted_new_head_str.is_some();
+        let (
+            push_attempt_id,
+            capability_request_id,
+            grant_jti,
+            planned_at,
+            old_head,
+            attempted_new_head,
+        ) = if has_attempt {
+            let push_attempt_id = parse_required_request_id(
+                push_attempt_id_str,
+                "Git push audit row: attempt id missing or invalid",
+            )?;
+            let capability_request_id = parse_required_request_id(
+                capability_request_id_str,
+                "Git push audit row: capability request id missing or invalid",
+            )?;
+            let grant_jti = parse_required_jti(
+                grant_jti_str,
+                "Git push audit row: grant jti missing or invalid",
+            )?;
+            let planned_at = planned_at.ok_or(AuditError::Invariant(
+                "Git push audit row: planned_at missing",
+            ))?;
+            let old_head = old_head_str
+                .ok_or(AuditError::Invariant(
+                    "Git push audit row: old head missing",
+                ))?
+                .parse::<GitObjectId>()
+                .map_err(|_| AuditError::Invariant("Git push audit row: old head invalid"))?;
+            let attempted_new_head = attempted_new_head_str
+                .ok_or(AuditError::Invariant(
+                    "Git push audit row: attempted new head missing",
+                ))?
+                .parse::<GitObjectId>()
+                .map_err(|_| {
+                    AuditError::Invariant("Git push audit row: attempted new head invalid")
+                })?;
+            (
+                Some(push_attempt_id),
+                Some(capability_request_id),
+                Some(grant_jti),
+                Some(UnixMillis::from_millis(planned_at)),
+                Some(old_head),
+                Some(attempted_new_head),
+            )
+        } else {
+            (None, None, None, None, None, None)
+        };
+
+        let (completed_at, result, message) = match (completed_at, result_str, message) {
+            (None, None, None) => (None, None, None),
+            (Some(completed_at), Some(result), Some(message)) if !message.is_empty() => (
+                Some(UnixMillis::from_millis(completed_at)),
+                Some(GitPushOutcomeResult::from_str(&result)?),
+                Some(message),
+            ),
+            _ => {
+                return Err(AuditError::Invariant(
+                    "Git push audit row: incomplete outcome",
+                ));
+            }
+        };
+        let github_status = github_status
+            .map(|value| {
+                let status = u16::try_from(value).map_err(|_| {
+                    AuditError::Invariant("Git push audit row: GitHub status out of range")
+                })?;
+                if !(100..=599).contains(&status) {
+                    return Err(AuditError::Invariant(
+                        "Git push audit row: GitHub status outside HTTP range",
+                    ));
+                }
+                Ok(status)
+            })
+            .transpose()?;
+
+        Ok(GitPushAuditEntry {
+            push_request_id: RequestId::from_uuid(push_request_id),
+            session_id: SessionId::from_uuid(session_id),
+            received_at: UnixMillis::from_millis(received_at),
+            repo,
+            branch,
+            expected_remote_head,
+            new_head,
+            push_attempt_id,
+            capability_request_id,
+            grant_jti,
+            planned_at,
+            old_head,
+            attempted_new_head,
+            completed_at,
+            result,
+            github_status,
+            message,
+        })
+    };
+    Ok(parse())
+}
+
+fn parse_required_request_id(
+    raw: Option<String>,
+    error: &'static str,
+) -> Result<RequestId, AuditError> {
+    let raw = raw.ok_or(AuditError::Invariant(error))?;
+    let uuid = uuid::Uuid::parse_str(&raw).map_err(|_| AuditError::Invariant(error))?;
+    Ok(RequestId::from_uuid(uuid))
+}
+
+fn parse_required_jti(raw: Option<String>, error: &'static str) -> Result<Jti, AuditError> {
+    let raw = raw.ok_or(AuditError::Invariant(error))?;
+    let uuid = uuid::Uuid::parse_str(&raw).map_err(|_| AuditError::Invariant(error))?;
+    Ok(Jti::from_uuid(uuid))
 }
 
 fn u16_from_sql_status(value: i64) -> Result<u16, AuditError> {
@@ -1371,7 +1914,7 @@ struct Migration {
 /// a version higher than this is rejected with [`AuditError::SchemaTooNew`]
 /// rather than opened — we'd rather fail to start than silently drop data
 /// into a schema a newer broker wrote.
-const SCHEMA_VERSION: i32 = 7;
+const SCHEMA_VERSION: i32 = 8;
 
 /// The full migration history. Each entry documents exactly one state
 /// transition; the sequence of entries is the schema's lineage. Order
@@ -1660,6 +2203,99 @@ BEGIN
 END;
 "#,
     },
+    Migration {
+        version: 8,
+        sql: r#"
+CREATE TABLE git_push_request (
+    push_request_id      TEXT PRIMARY KEY,
+    session_id           TEXT NOT NULL REFERENCES session(session_id),
+    received_at          INTEGER NOT NULL,
+    repo                 TEXT NOT NULL CHECK (repo != ''),
+    branch               TEXT NOT NULL CHECK (branch != ''),
+    expected_remote_head TEXT NOT NULL CHECK (length(expected_remote_head) = 40),
+    new_head             TEXT NOT NULL CHECK (length(new_head) = 40)
+);
+
+CREATE INDEX idx_git_push_request_session
+    ON git_push_request(session_id, received_at);
+
+CREATE TABLE git_push_attempt (
+    push_attempt_id      TEXT PRIMARY KEY,
+    push_request_id      TEXT NOT NULL UNIQUE REFERENCES git_push_request(push_request_id),
+    capability_request_id TEXT NOT NULL REFERENCES request(request_id),
+    grant_jti            TEXT NOT NULL REFERENCES grant_log(jti),
+    planned_at           INTEGER NOT NULL,
+    repo                 TEXT NOT NULL CHECK (repo != ''),
+    branch               TEXT NOT NULL CHECK (branch != ''),
+    old_head             TEXT NOT NULL CHECK (length(old_head) = 40),
+    new_head             TEXT NOT NULL CHECK (length(new_head) = 40)
+);
+
+CREATE TABLE git_push_outcome (
+    push_request_id TEXT PRIMARY KEY REFERENCES git_push_request(push_request_id),
+    push_attempt_id TEXT REFERENCES git_push_attempt(push_attempt_id),
+    completed_at    INTEGER NOT NULL,
+    result          TEXT NOT NULL CHECK (
+        result IN (
+            'denied',
+            'validation_failed',
+            'pushed',
+            'lease_rejected',
+            'push_rejected',
+            'push_failed',
+            'audit_failed_after_push'
+        )
+    ),
+    github_status   INTEGER CHECK (github_status BETWEEN 100 AND 599),
+    message         TEXT NOT NULL CHECK (message != ''),
+    CHECK (
+        (result IN ('denied', 'validation_failed') AND push_attempt_id IS NULL)
+        OR (
+            result IN (
+                'pushed',
+                'lease_rejected',
+                'push_rejected',
+                'push_failed',
+                'audit_failed_after_push'
+            )
+            AND push_attempt_id IS NOT NULL
+        )
+    )
+);
+
+CREATE TRIGGER git_push_request_requires_open_session
+BEFORE INSERT ON git_push_request
+WHEN EXISTS (
+    SELECT 1 FROM session
+    WHERE session_id = NEW.session_id AND closed_at IS NOT NULL
+)
+BEGIN
+    SELECT RAISE(ABORT, 'session is closed');
+END;
+
+CREATE TRIGGER git_push_attempt_requires_matching_grant
+BEFORE INSERT ON git_push_attempt
+WHEN NOT EXISTS (
+    SELECT 1 FROM grant_log
+    WHERE jti = NEW.grant_jti AND request_id = NEW.capability_request_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'git push grant does not match capability request');
+END;
+
+CREATE TRIGGER git_push_outcome_attempt_matches_request
+BEFORE INSERT ON git_push_outcome
+WHEN NEW.push_attempt_id IS NOT NULL
+ AND NOT EXISTS (
+    SELECT 1 FROM git_push_attempt
+    WHERE push_attempt_id = NEW.push_attempt_id
+      AND push_request_id = NEW.push_request_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'git push attempt belongs to a different request');
+END;
+"#,
+    },
 ];
 
 // Belt-and-braces: the compile-time shape of MIGRATIONS is the source
@@ -1756,6 +2392,64 @@ mod tests {
                 ..Default::default()
             },
         })
+    }
+
+    fn sample_git_repo() -> GitCloneRepo {
+        GitCloneRepo::new(sample_repo()).unwrap()
+    }
+
+    fn git_oid(nibble: char) -> GitObjectId {
+        std::iter::repeat_n(nibble, 40)
+            .collect::<String>()
+            .parse()
+            .unwrap()
+    }
+
+    fn sample_git_push_request_record(
+        push_request_id: RequestId,
+        session_id: SessionId,
+    ) -> GitPushRequestRecord {
+        GitPushRequestRecord {
+            push_request_id,
+            session_id,
+            received_at: UnixMillis::from_millis(1_700_000_100),
+            repo: sample_git_repo(),
+            branch: "main".parse().unwrap(),
+            expected_remote_head: git_oid('1'),
+            new_head: git_oid('2'),
+        }
+    }
+
+    fn record_sample_write_grant(
+        log: &AuditLog,
+        session_id: SessionId,
+        capability_request_id: RequestId,
+    ) -> CredentialGrant {
+        let req = sample_request();
+        let scope = sample_scope();
+        pre_mint(
+            log,
+            capability_request_id,
+            session_id,
+            &req,
+            &PolicyDecision::Grant {
+                scope: scope.clone(),
+                ttl: TtlSeconds::new(300).unwrap(),
+            },
+            UnixMillis::from_millis(1_700_000_110),
+        )
+        .unwrap();
+        let grant = CredentialGrant {
+            jti: Jti::new(),
+            request_id: capability_request_id,
+            session_id,
+            github_app_id: Some(42),
+            scope,
+            issued_at: UnixMillis::from_millis(1_700_000_110),
+            expires_at: UnixMillis::from_millis(1_700_000_410),
+        };
+        log.record_grant(&grant).unwrap();
+        grant
     }
 
     #[test]
@@ -2233,6 +2927,287 @@ mod tests {
                 upstream_status: None,
                 response_bytes: 0,
                 error: Some("upstream request failed"),
+            })
+            .unwrap_err();
+        let AuditError::Sqlite(e) = err else {
+            panic!("expected sqlite FK error, got: {err:?}");
+        };
+        assert!(
+            e.to_string().to_lowercase().contains("foreign key"),
+            "expected FK violation, got: {e}"
+        );
+    }
+
+    #[test]
+    fn git_push_request_attempt_and_outcome_roundtrip() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+        let push_request_id = RequestId::new();
+        let push_request = sample_git_push_request_record(push_request_id, s.session_id);
+        log.record_git_push_request(&push_request).unwrap();
+
+        let capability_request_id = RequestId::new();
+        let grant = record_sample_write_grant(&log, s.session_id, capability_request_id);
+        let push_attempt_id = RequestId::new();
+        log.record_git_push_attempt(&GitPushAttemptRecord {
+            push_attempt_id,
+            push_request_id,
+            capability_request_id,
+            grant_jti: grant.jti,
+            planned_at: UnixMillis::from_millis(1_700_000_120),
+            repo: sample_git_repo(),
+            branch: "main".parse().unwrap(),
+            old_head: git_oid('1'),
+            new_head: git_oid('2'),
+        })
+        .unwrap();
+        log.record_git_push_outcome(&GitPushOutcomeRecord {
+            push_request_id,
+            push_attempt_id: Some(push_attempt_id),
+            completed_at: UnixMillis::from_millis(1_700_000_130),
+            result: GitPushOutcomeResult::Pushed,
+            github_status: None,
+            message: "pushed",
+        })
+        .unwrap();
+
+        let entries = log.list_git_pushes_for_session(s.session_id).unwrap();
+        assert_eq!(entries.len(), 1);
+        let entry = &entries[0];
+        assert_eq!(entry.push_request_id, push_request_id);
+        assert_eq!(entry.session_id, s.session_id);
+        assert_eq!(entry.repo, sample_git_repo());
+        assert_eq!(entry.branch, "main".parse::<GitBranchName>().unwrap());
+        assert_eq!(entry.expected_remote_head, git_oid('1'));
+        assert_eq!(entry.new_head, git_oid('2'));
+        assert_eq!(entry.push_attempt_id, Some(push_attempt_id));
+        assert_eq!(entry.capability_request_id, Some(capability_request_id));
+        assert_eq!(entry.grant_jti, Some(grant.jti));
+        assert_eq!(
+            entry.planned_at,
+            Some(UnixMillis::from_millis(1_700_000_120))
+        );
+        assert_eq!(entry.old_head, Some(git_oid('1')));
+        assert_eq!(entry.attempted_new_head, Some(git_oid('2')));
+        assert_eq!(
+            entry.completed_at,
+            Some(UnixMillis::from_millis(1_700_000_130))
+        );
+        assert_eq!(entry.result, Some(GitPushOutcomeResult::Pushed));
+        assert_eq!(entry.github_status, None);
+        assert_eq!(entry.message.as_deref(), Some("pushed"));
+    }
+
+    #[test]
+    fn git_push_request_requires_open_session_but_outcome_can_land_after_close() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        let push_request_id = RequestId::new();
+        let request = sample_git_push_request_record(push_request_id, s.session_id);
+
+        let missing = log.record_git_push_request(&request).unwrap_err();
+        assert!(
+            matches!(missing, AuditError::Invariant("session does not exist")),
+            "got: {missing:?}"
+        );
+
+        log.open_session(&s).unwrap();
+        log.record_git_push_request(&request).unwrap();
+        log.close_session(s.session_id, UnixMillis::from_millis(1_700_000_125))
+            .unwrap();
+
+        let closed_request = sample_git_push_request_record(RequestId::new(), s.session_id);
+        let closed = log.record_git_push_request(&closed_request).unwrap_err();
+        assert!(
+            matches!(closed, AuditError::Invariant("session is closed")),
+            "got: {closed:?}"
+        );
+
+        log.record_git_push_outcome(&GitPushOutcomeRecord {
+            push_request_id,
+            push_attempt_id: None,
+            completed_at: UnixMillis::from_millis(1_700_000_130),
+            result: GitPushOutcomeResult::ValidationFailed,
+            github_status: None,
+            message: "remote head moved",
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn git_push_attempt_requires_matching_contents_write_grant() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+        let push_request_id = RequestId::new();
+        log.record_git_push_request(&sample_git_push_request_record(
+            push_request_id,
+            s.session_id,
+        ))
+        .unwrap();
+
+        let missing_grant = log
+            .record_git_push_attempt(&GitPushAttemptRecord {
+                push_attempt_id: RequestId::new(),
+                push_request_id,
+                capability_request_id: RequestId::new(),
+                grant_jti: Jti::new(),
+                planned_at: UnixMillis::from_millis(1_700_000_120),
+                repo: sample_git_repo(),
+                branch: "main".parse().unwrap(),
+                old_head: git_oid('1'),
+                new_head: git_oid('2'),
+            })
+            .unwrap_err();
+        assert!(
+            matches!(
+                missing_grant,
+                AuditError::Invariant("git push grant does not exist")
+            ),
+            "got: {missing_grant:?}"
+        );
+
+        let capability_request_id = RequestId::new();
+        let other_repo = RepoRef {
+            owner: "o".into(),
+            name: "other".into(),
+        };
+        let other_request = CapabilityRequest::GitHub(GitHubRequest::Contents {
+            access: GitHubAccess::Write,
+            repo: other_repo.clone(),
+        });
+        let other_scope = GrantedScope::GitHub(GitHubGrantedScope {
+            repository: other_repo,
+            permissions: GitHubPermissions {
+                contents: Some(GitHubAccess::Write),
+                metadata: Some(MetadataAccess::Read),
+                ..Default::default()
+            },
+        });
+        pre_mint(
+            &log,
+            capability_request_id,
+            s.session_id,
+            &other_request,
+            &PolicyDecision::Grant {
+                scope: other_scope.clone(),
+                ttl: TtlSeconds::new(300).unwrap(),
+            },
+            UnixMillis::from_millis(1_700_000_110),
+        )
+        .unwrap();
+        let wrong_repo_grant = CredentialGrant {
+            jti: Jti::new(),
+            request_id: capability_request_id,
+            session_id: s.session_id,
+            github_app_id: Some(42),
+            scope: other_scope,
+            issued_at: UnixMillis::from_millis(1_700_000_110),
+            expires_at: UnixMillis::from_millis(1_700_000_410),
+        };
+        log.record_grant(&wrong_repo_grant).unwrap();
+
+        let wrong_repo = log
+            .record_git_push_attempt(&GitPushAttemptRecord {
+                push_attempt_id: RequestId::new(),
+                push_request_id,
+                capability_request_id,
+                grant_jti: wrong_repo_grant.jti,
+                planned_at: UnixMillis::from_millis(1_700_000_120),
+                repo: sample_git_repo(),
+                branch: "main".parse().unwrap(),
+                old_head: git_oid('1'),
+                new_head: git_oid('2'),
+            })
+            .unwrap_err();
+        assert!(
+            matches!(
+                wrong_repo,
+                AuditError::Invariant(
+                    "git push grant is not contents:write for the requested repo"
+                )
+            ),
+            "got: {wrong_repo:?}"
+        );
+    }
+
+    #[test]
+    fn git_push_outcome_enforces_attempt_requirement() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+        let push_request_id = RequestId::new();
+        log.record_git_push_request(&sample_git_push_request_record(
+            push_request_id,
+            s.session_id,
+        ))
+        .unwrap();
+
+        let pushed_without_attempt = log
+            .record_git_push_outcome(&GitPushOutcomeRecord {
+                push_request_id,
+                push_attempt_id: None,
+                completed_at: UnixMillis::from_millis(1_700_000_130),
+                result: GitPushOutcomeResult::Pushed,
+                github_status: None,
+                message: "pushed",
+            })
+            .unwrap_err();
+        assert!(
+            matches!(
+                pushed_without_attempt,
+                AuditError::Invariant("git push outcome result requires an attempt")
+            ),
+            "got: {pushed_without_attempt:?}"
+        );
+
+        let capability_request_id = RequestId::new();
+        let grant = record_sample_write_grant(&log, s.session_id, capability_request_id);
+        let push_attempt_id = RequestId::new();
+        log.record_git_push_attempt(&GitPushAttemptRecord {
+            push_attempt_id,
+            push_request_id,
+            capability_request_id,
+            grant_jti: grant.jti,
+            planned_at: UnixMillis::from_millis(1_700_000_120),
+            repo: sample_git_repo(),
+            branch: "main".parse().unwrap(),
+            old_head: git_oid('1'),
+            new_head: git_oid('2'),
+        })
+        .unwrap();
+
+        let denied_with_attempt = log
+            .record_git_push_outcome(&GitPushOutcomeRecord {
+                push_request_id,
+                push_attempt_id: Some(push_attempt_id),
+                completed_at: UnixMillis::from_millis(1_700_000_130),
+                result: GitPushOutcomeResult::Denied,
+                github_status: None,
+                message: "policy denied",
+            })
+            .unwrap_err();
+        assert!(
+            matches!(
+                denied_with_attempt,
+                AuditError::Invariant("git push outcome result must not reference an attempt")
+            ),
+            "got: {denied_with_attempt:?}"
+        );
+    }
+
+    #[test]
+    fn git_push_outcome_without_request_is_rejected() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let err = log
+            .record_git_push_outcome(&GitPushOutcomeRecord {
+                push_request_id: RequestId::new(),
+                push_attempt_id: None,
+                completed_at: UnixMillis::from_millis(1),
+                result: GitPushOutcomeResult::Denied,
+                github_status: None,
+                message: "policy denied",
             })
             .unwrap_err();
         let AuditError::Sqlite(e) = err else {
@@ -3344,6 +4319,25 @@ mod tests {
         assert!(column_exists(&log, "agent_run", "prompt_sha256"));
         assert!(column_exists(&log, "agent_run_outcome", "stdout_path"));
         assert!(trigger_exists(&log, "agent_run_requires_open_session"));
+        assert!(column_exists(
+            &log,
+            "git_push_request",
+            "expected_remote_head"
+        ));
+        assert!(column_exists(&log, "git_push_attempt", "grant_jti"));
+        assert!(column_exists(&log, "git_push_outcome", "result"));
+        assert!(trigger_exists(
+            &log,
+            "git_push_request_requires_open_session"
+        ));
+        assert!(trigger_exists(
+            &log,
+            "git_push_attempt_requires_matching_grant"
+        ));
+        assert!(trigger_exists(
+            &log,
+            "git_push_outcome_attempt_matches_request"
+        ));
     }
 
     #[test]
@@ -3362,6 +4356,9 @@ mod tests {
         assert!(column_exists(&log, "agent_vm_workspace_bootstrap", "warm"));
         assert!(column_exists(&log, "agent_run", "prompt_redacted_preview"));
         assert!(column_exists(&log, "agent_run_outcome", "stderr_sha256"));
+        assert!(column_exists(&log, "git_push_request", "new_head"));
+        assert!(column_exists(&log, "git_push_attempt", "old_head"));
+        assert!(column_exists(&log, "git_push_outcome", "message"));
         assert!(trigger_exists(&log, "request_requires_open_session"));
         assert!(trigger_exists(
             &log,
@@ -3372,6 +4369,10 @@ mod tests {
             "agent_vm_workspace_bootstrap_requires_open_session"
         ));
         assert!(trigger_exists(&log, "agent_run_requires_open_session"));
+        assert!(trigger_exists(
+            &log,
+            "git_push_request_requires_open_session"
+        ));
     }
 
     #[test]
@@ -3544,6 +4545,43 @@ mod tests {
         assert!(column_exists(&log, "agent_run", "prompt_sha256"));
         assert!(column_exists(&log, "agent_run_outcome", "stdout_path"));
         assert!(trigger_exists(&log, "agent_run_requires_open_session"));
+    }
+
+    #[test]
+    fn open_migrates_v7_database_to_git_push_audit_schema() {
+        let db = NamedTempFile::new().unwrap();
+        {
+            let mut conn = Connection::open(db.path()).unwrap();
+            let tx = conn.transaction().unwrap();
+            for migration in MIGRATIONS.iter().take(7) {
+                tx.execute_batch(migration.sql).unwrap();
+            }
+            tx.pragma_update(None, "user_version", 7).unwrap();
+            tx.commit().unwrap();
+        }
+
+        let log = AuditLog::open(db.path()).unwrap();
+
+        assert_eq!(read_user_version(&log), SCHEMA_VERSION);
+        assert!(column_exists(&log, "git_push_request", "repo"));
+        assert!(column_exists(
+            &log,
+            "git_push_attempt",
+            "capability_request_id"
+        ));
+        assert!(column_exists(&log, "git_push_outcome", "github_status"));
+        assert!(trigger_exists(
+            &log,
+            "git_push_request_requires_open_session"
+        ));
+        assert!(trigger_exists(
+            &log,
+            "git_push_attempt_requires_matching_grant"
+        ));
+        assert!(trigger_exists(
+            &log,
+            "git_push_outcome_attempt_matches_request"
+        ));
     }
 
     /// A DB written by a future broker will carry a user_version beyond
