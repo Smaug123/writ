@@ -185,6 +185,45 @@ pub async fn dispatch_message_with_agent_vm<S: SecretStore + Send + Sync + 'stat
                 },
             }
         }
+        ClientMessage::StartAgentRun {
+            label,
+            agent_kind,
+            agent_model,
+            workspace,
+            prompt,
+        } => match agent_vm {
+            Some(agent_vm) => {
+                debug_assert!(
+                    prompt.byte_len()
+                        <= u64::try_from(crate::agent_run::MAX_AGENT_PROMPT_BYTES)
+                            .expect("agent prompt byte limit fits in u64"),
+                    "AgentPrompt validates prompt size before dispatch"
+                );
+                match agent_vm
+                    .start_agent_run_session(
+                        Arc::clone(state),
+                        label,
+                        agent_kind,
+                        agent_model,
+                        workspace,
+                        prompt,
+                    )
+                    .await
+                {
+                    Ok(started) => ServerMessage::AgentRunStarted {
+                        session_id: started.session_id(),
+                        run_id: started.run_id(),
+                        broker_url: started.broker_url().to_string(),
+                    },
+                    Err(err) => ServerMessage::Error {
+                        message: err.to_string(),
+                    },
+                }
+            }
+            None => ServerMessage::Error {
+                message: "agent VM runtime is not configured".into(),
+            },
+        },
         ClientMessage::StopAgentVm { session_id } => match agent_vm {
             Some(agent_vm) => match agent_vm.stop_session(state, session_id).await {
                 Ok(()) => ServerMessage::AgentVmStopped,

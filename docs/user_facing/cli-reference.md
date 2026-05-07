@@ -105,13 +105,13 @@ repository, and runs the selected agent command there.
 
 This stage does **not** launch Claude or Codex yet. It uses the same VM
 lifecycle and workspace bootstrap path as `writ agent-vm start`, but the guest
-command is a stub:
+command is the stage adapter:
 
 ```text
-echo <agent> <prompt>
+writ-vm agent run --run-id <uuid> --agent <agent>
 ```
 
-With the default `--warm devshell`, the stub is executed inside the default
+With the default `--warm devshell`, the adapter is executed inside the default
 devshell with the same no-build/no-lockfile envelope used by workspace
 devshell warmup:
 
@@ -120,13 +120,14 @@ nix --option builders "" \
   --option max-jobs 0 \
   --option fallback false \
   develop --no-write-lock-file .#default \
-  --command echo <agent> <prompt>
+  --command writ-vm agent run --run-id <uuid> --agent <agent>
 ```
 
 Successful output is the managed VM session descriptor:
 
 ```text
 session_id=<uuid>
+run_id=<uuid>
 broker_url=http://192.168.X.1:<port>/
 ```
 
@@ -134,7 +135,7 @@ broker_url=http://192.168.X.1:<port>/
 | ------------- | -------------------------------------------------------------------------------------------- |
 | `--repo`      | GitHub repository in `owner/repo` form. Required.                                             |
 | `--agent`     | Agent identity, `claude` or `codex`. Required; also selects the configured GitHub App.        |
-| `--prompt`    | Prompt passed to the stage stub. Required. It is process argv and appears in VM lifecycle state until stop. |
+| `--prompt`    | Prompt sent to the daemon as protocol data and fetched once by the guest through the VM broker. Required and capped at 1 MiB. It is not placed in guest argv or daemon lifecycle state, but the local shell can still expose this flag value before `writ` sends it. |
 | `--warm`      | Workspace warmup: `none`, `sources`, or `devshell`. Default: `devshell`.                     |
 | `--workspace` | Override checkout destination. Defaults to `/workspace/<repo-name>`.                          |
 | `--label`     | Optional audit-log session label.                                                            |

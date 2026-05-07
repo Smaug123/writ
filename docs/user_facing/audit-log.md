@@ -1,8 +1,9 @@
 # Audit log
 
 Every session, every capability request, every grant, every mint
-failure, and every brokered VM Nix cache request is written to a
-SQLite database. By default it lives at
+failure, every brokered VM Nix cache request, and every managed agent
+run prompt/outcome record is written to a SQLite database. By default
+it lives at
 `$XDG_DATA_HOME/writ/audit.db`. The log is append-only: nothing is
 updated except `session.closed_at`.
 
@@ -70,6 +71,31 @@ CREATE TABLE nix_cache_outcome (
   response_bytes  INTEGER NOT NULL CHECK (response_bytes >= 0),
   error           TEXT CHECK (error IS NULL OR error != '')
 );
+
+CREATE TABLE agent_run (
+  run_id                  TEXT PRIMARY KEY,
+  session_id              TEXT NOT NULL REFERENCES session(session_id),
+  requested_at            INTEGER NOT NULL,
+  agent_kind              TEXT NOT NULL CHECK (agent_kind IN ('claude', 'codex')),
+  prompt_bytes            INTEGER NOT NULL CHECK (prompt_bytes >= 0),
+  prompt_sha256           TEXT NOT NULL CHECK (length(prompt_sha256) = 64),
+  prompt_redacted_preview TEXT NOT NULL CHECK (prompt_redacted_preview != '')
+);
+
+CREATE TABLE agent_run_outcome (
+  run_id           TEXT PRIMARY KEY REFERENCES agent_run(run_id),
+  completed_at     INTEGER NOT NULL,
+  status           TEXT NOT NULL CHECK (status IN ('succeeded', 'failed')),
+  exit_code        INTEGER NOT NULL,
+  stdout_path      TEXT NOT NULL CHECK (stdout_path != ''),
+  stdout_bytes     INTEGER NOT NULL CHECK (stdout_bytes >= 0),
+  stdout_sha256    TEXT NOT NULL CHECK (length(stdout_sha256) = 64),
+  stdout_truncated INTEGER NOT NULL CHECK (stdout_truncated IN (0, 1)),
+  stderr_path      TEXT NOT NULL CHECK (stderr_path != ''),
+  stderr_bytes     INTEGER NOT NULL CHECK (stderr_bytes >= 0),
+  stderr_sha256    TEXT NOT NULL CHECK (length(stderr_sha256) = 64),
+  stderr_truncated INTEGER NOT NULL CHECK (stderr_truncated IN (0, 1))
+);
 ```
 
 A few invariants worth knowing:
@@ -94,6 +120,19 @@ A few invariants worth knowing:
   They appear as `decision = 'deny'` with a `deny_reason`, no
   upstream URL/status, and the HTTP status returned to the VM in
   `nix_cache_outcome`.
+- **Agent prompts are not stored raw.** `agent_run` stores the prompt byte
+  length, SHA-256, and a redacted preview marker. The prompt itself is carried
+  over the host protocol and the authenticated one-shot VM prompt route, capped
+  at 1 MiB, and not written into SQLite.
+- **Agent stream bodies are not stored in SQLite.** `agent_run_outcome` stores
+  private stdout/stderr file paths, byte counts, SHA-256 values, truncation
+  flags, terminal status, and exit code. The stream files are separate
+  artifacts owned by the runtime. This stage defines their privacy and audit
+  shape; a retention, quota, and cleanup policy is still required before real
+  Claude/Codex runs use this path.
+- **Agent run outcome can arrive after session close.** Starting an agent run
+  requires an open session, but recording the terminal outcome is allowed after
+  advisory close so teardown can still capture failure state.
 - **The token itself is never stored.** Only the metadata that proves
   it was issued — the `jti` (a UUID the broker generates), the
   `github_app_id`, `scope_json`, and timestamps. Older rows written
@@ -192,6 +231,27 @@ For auth denials, `decision` is `deny` and `deny_reason` names the
 transport failure. For upstream cache misses, `decision` is `allow`,
 `http_status` is `404`, and `upstream_status` is usually `404`.
 
+### Agent runs and outcomes
+
+```sql
+SELECT
+  datetime(r.requested_at/1000, 'unixepoch') AS requested,
+  r.run_id,
+  r.agent_kind,
+  r.prompt_bytes,
+  r.prompt_sha256,
+  o.status,
+  o.exit_code,
+  o.stdout_bytes,
+  o.stderr_bytes,
+  o.stdout_truncated,
+  o.stderr_truncated
+FROM agent_run r
+LEFT JOIN agent_run_outcome o USING (run_id)
+WHERE r.session_id = '00000000-0000-0000-0000-...'
+ORDER BY r.requested_at DESC;
+```
+
 ### Requests in flight at crash time
 
 ```sql
@@ -213,6 +273,18 @@ WHERE NOT EXISTS (
   SELECT 1
   FROM nix_cache_outcome
   WHERE request_id = nix_cache_request.request_id
+);
+```
+
+For managed agent runs, use the matching query:
+
+```sql
+SELECT run_id, session_id, requested_at, agent_kind, prompt_bytes
+FROM agent_run
+WHERE NOT EXISTS (
+  SELECT 1
+  FROM agent_run_outcome
+  WHERE run_id = agent_run.run_id
 );
 ```
 

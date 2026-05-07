@@ -20,13 +20,11 @@ use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand, ValueEnum};
 
+use writ::agent_run::AgentPrompt;
 use writ::core::{AgentKind, CapabilityRequest, GitHubAccess, GitHubRequest, RepoRef, SessionId};
 use writ::protocol::{AgentVmSessionInfo, ClientMessage, ServerMessage};
 use writ::server::default_socket_path;
-use writ::vm_git::{
-    AgentVmWorkspaceBootstrap, DEFAULT_DEVSHELL_ATTR, GitCloneRepo, WorkspaceWarmMode,
-    nix_develop_command_args,
-};
+use writ::vm_git::{AgentVmWorkspaceBootstrap, GitCloneRepo, WorkspaceWarmMode};
 
 #[derive(Parser)]
 #[command(name = "writ", about = "writ broker client")]
@@ -288,14 +286,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             } => {
                 let warm_mode = warm.into();
                 let workspace = build_workspace_bootstrap_from_repo(repo, workspace, warm_mode)?;
-                let guest_command = build_agent_run_guest_command(agent, prompt, warm_mode);
-                start_agent_vm(
+                start_agent_run(
                     &socket_path,
                     label,
-                    Some(agent),
+                    agent,
                     model,
-                    Some(workspace),
-                    guest_command,
+                    workspace,
+                    AgentPrompt::try_new(prompt)?,
                 )?;
             }
         },
@@ -333,6 +330,37 @@ fn start_agent_vm(
             broker_url,
         } => {
             println!("session_id={session_id}");
+            println!("broker_url={broker_url}");
+            Ok(())
+        }
+        ServerMessage::Error { message } => Err(message.into()),
+        other => Err(format!("unexpected response: {other:?}").into()),
+    }
+}
+
+fn start_agent_run(
+    socket_path: &Path,
+    label: Option<String>,
+    agent_kind: AgentKind,
+    agent_model: Option<String>,
+    workspace: AgentVmWorkspaceBootstrap,
+    prompt: AgentPrompt,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let msg = ClientMessage::StartAgentRun {
+        label,
+        agent_kind,
+        agent_model,
+        workspace,
+        prompt,
+    };
+    match call_with_timeout(socket_path, &msg, AGENT_VM_WORKSPACE_CALL_TIMEOUT)? {
+        ServerMessage::AgentRunStarted {
+            session_id,
+            run_id,
+            broker_url,
+        } => {
+            println!("session_id={session_id}");
+            println!("run_id={run_id}");
             println!("broker_url={broker_url}");
             Ok(())
         }
@@ -381,22 +409,6 @@ fn build_workspace_bootstrap_from_repo(
         destination,
         warm,
     })
-}
-
-fn build_agent_run_guest_command(
-    agent: AgentKind,
-    prompt: String,
-    warm: WorkspaceWarmMode,
-) -> Vec<String> {
-    let mut stub = vec!["echo".to_string(), agent.as_str().to_string(), prompt];
-    if warm != WorkspaceWarmMode::DevShell {
-        return stub;
-    }
-
-    let mut command = vec!["nix".to_string()];
-    command.extend(nix_develop_command_args(DEFAULT_DEVSHELL_ATTR));
-    command.append(&mut stub);
-    command
 }
 
 impl From<WorkspaceWarmArg> for WorkspaceWarmMode {
@@ -694,45 +706,24 @@ mod tests {
     }
 
     #[test]
-    fn agent_run_devshell_warmup_runs_stub_inside_default_devshell() {
-        let command = build_agent_run_guest_command(
-            AgentKind::Claude,
-            "fix the failing test".into(),
+    fn agent_run_protocol_message_redacts_prompt_in_debug() {
+        let workspace = build_workspace_bootstrap_from_repo(
+            "owner/repo".into(),
+            None,
             WorkspaceWarmMode::DevShell,
-        );
+        )
+        .unwrap();
+        let msg = ClientMessage::StartAgentRun {
+            label: None,
+            agent_kind: AgentKind::Claude,
+            agent_model: None,
+            workspace,
+            prompt: AgentPrompt::try_new("SECRET prompt").unwrap(),
+        };
 
-        assert_eq!(
-            command,
-            vec![
-                "nix",
-                "--option",
-                "builders",
-                "",
-                "--option",
-                "max-jobs",
-                "0",
-                "--option",
-                "fallback",
-                "false",
-                "develop",
-                "--no-write-lock-file",
-                ".#default",
-                "--command",
-                "echo",
-                "claude",
-                "fix the failing test",
-            ]
-        );
-    }
+        let debug = format!("{msg:?}");
 
-    #[test]
-    fn agent_run_non_devshell_warmup_runs_direct_stub() {
-        let command = build_agent_run_guest_command(
-            AgentKind::Codex,
-            "summarise state".into(),
-            WorkspaceWarmMode::Sources,
-        );
-
-        assert_eq!(command, vec!["echo", "codex", "summarise state"]);
+        assert!(!debug.contains("SECRET prompt"), "{debug}");
+        assert!(debug.contains("<redacted>"), "{debug}");
     }
 }

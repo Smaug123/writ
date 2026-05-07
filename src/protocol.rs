@@ -12,6 +12,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::agent_run::{AgentPrompt, AgentRunId};
 use crate::agent_vm_lifecycle::AgentVmSessionStateStatus;
 use crate::core::{AgentKind, CapabilityRequest, SessionId, UnixMillis};
 use crate::vm_git::AgentVmWorkspaceBootstrap;
@@ -77,6 +78,26 @@ pub enum ClientMessage {
         /// Command to run inside the VM after lifecycle preflight succeeds.
         guest_command: Vec<String>,
     },
+    /// Start a product-level agent run in a daemon-managed VM. The prompt is
+    /// carried as protocol data and must not be copied into guest argv or
+    /// lifecycle state.
+    StartAgentRun {
+        /// Human-readable description stored in the audit log.
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        label: Option<String>,
+        /// Trusted coarse agent identity used by the broker to choose
+        /// authority-bearing backend configuration and the guest adapter.
+        agent_kind: AgentKind,
+        /// Model identifier stored in the audit log.
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        agent_model: Option<String>,
+        /// Required clean repo checkout and source/substitute warmup to
+        /// complete before the guest agent command starts.
+        workspace: AgentVmWorkspaceBootstrap,
+        /// Prompt to deliver to the guest agent over the brokered prompt
+        /// channel. Debug output redacts this value.
+        prompt: AgentPrompt,
+    },
     /// Stop a daemon-managed agent VM session and close its audit session.
     StopAgentVm { session_id: SessionId },
     /// List persisted daemon-managed agent VM sessions. Records without an
@@ -106,6 +127,14 @@ pub enum ServerMessage {
     /// environment, not returned over the host protocol.
     AgentVmStarted {
         session_id: SessionId,
+        broker_url: String,
+    },
+    /// A product-level agent run was started. The prompt itself is not
+    /// returned; `run_id` is the stable handle used by the VM prompt/log
+    /// contract.
+    AgentRunStarted {
+        session_id: SessionId,
+        run_id: AgentRunId,
         broker_url: String,
     },
     /// Acknowledges [`ClientMessage::StopAgentVm`].
@@ -140,6 +169,16 @@ impl std::fmt::Debug for ServerMessage {
             } => f
                 .debug_struct("AgentVmStarted")
                 .field("session_id", session_id)
+                .field("broker_url", broker_url)
+                .finish(),
+            Self::AgentRunStarted {
+                session_id,
+                run_id,
+                broker_url,
+            } => f
+                .debug_struct("AgentRunStarted")
+                .field("session_id", session_id)
+                .field("run_id", run_id)
                 .field("broker_url", broker_url)
                 .finish(),
             Self::AgentVmStopped => write!(f, "AgentVmStopped"),
@@ -252,6 +291,24 @@ mod tests {
     }
 
     #[test]
+    fn start_agent_run_roundtrips_with_prompt_as_protocol_data() {
+        let msg = ClientMessage::StartAgentRun {
+            label: Some("agent run".into()),
+            agent_kind: AgentKind::Claude,
+            agent_model: Some("claude-test".into()),
+            workspace: AgentVmWorkspaceBootstrap {
+                repo: sample_clone_repo(),
+                destination: Some(PathBuf::from("/workspace/repo")),
+                warm: WorkspaceWarmMode::Sources,
+            },
+            prompt: AgentPrompt::new("fix the failing test"),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert_eq!(serde_json::from_str::<ClientMessage>(&json).unwrap(), msg);
+        assert!(json.contains("fix the failing test"));
+    }
+
+    #[test]
     fn stop_agent_vm_roundtrips() {
         let msg = ClientMessage::StopAgentVm {
             session_id: fixed_session_id(),
@@ -310,6 +367,17 @@ mod tests {
     fn agent_vm_started_roundtrips() {
         let msg = ServerMessage::AgentVmStarted {
             session_id: fixed_session_id(),
+            broker_url: "http://192.168.252.1:51375/".into(),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert_eq!(serde_json::from_str::<ServerMessage>(&json).unwrap(), msg);
+    }
+
+    #[test]
+    fn agent_run_started_roundtrips() {
+        let msg = ServerMessage::AgentRunStarted {
+            session_id: fixed_session_id(),
+            run_id: "00000000-0000-0000-0000-000000000777".parse().unwrap(),
             broker_url: "http://192.168.252.1:51375/".into(),
         };
         let json = serde_json::to_string(&msg).unwrap();
@@ -414,6 +482,28 @@ mod tests {
             serde_json::to_value(ServerMessage::AgentVmStopped).unwrap();
         assert_eq!(stopped["type"], "agent_vm_stopped");
 
+        let run: serde_json::Value = serde_json::to_value(ClientMessage::StartAgentRun {
+            label: None,
+            agent_kind: AgentKind::Claude,
+            agent_model: None,
+            workspace: AgentVmWorkspaceBootstrap {
+                repo: sample_clone_repo(),
+                destination: None,
+                warm: WorkspaceWarmMode::None,
+            },
+            prompt: AgentPrompt::new("secret prompt"),
+        })
+        .unwrap();
+        assert_eq!(run["type"], "start_agent_run");
+
+        let run_started: serde_json::Value = serde_json::to_value(ServerMessage::AgentRunStarted {
+            session_id: fixed_session_id(),
+            run_id: "00000000-0000-0000-0000-000000000777".parse().unwrap(),
+            broker_url: "http://192.168.252.1:51375/".into(),
+        })
+        .unwrap();
+        assert_eq!(run_started["type"], "agent_run_started");
+
         let list: serde_json::Value = serde_json::to_value(ClientMessage::ListAgentVms).unwrap();
         assert_eq!(list["type"], "list_agent_vms");
 
@@ -465,6 +555,26 @@ mod tests {
         let debug = format!("{msg:?}");
         assert!(!debug.contains("ghs_secret_value"));
         assert!(debug.contains("<redacted>"));
+    }
+
+    #[test]
+    fn start_agent_run_debug_redacts_prompt() {
+        let msg = ClientMessage::StartAgentRun {
+            label: None,
+            agent_kind: AgentKind::Codex,
+            agent_model: None,
+            workspace: AgentVmWorkspaceBootstrap {
+                repo: sample_clone_repo(),
+                destination: None,
+                warm: WorkspaceWarmMode::None,
+            },
+            prompt: AgentPrompt::new("SECRET prompt"),
+        };
+
+        let debug = format!("{msg:?}");
+
+        assert!(!debug.contains("SECRET prompt"), "{debug}");
+        assert!(debug.contains("<redacted>"), "{debug}");
     }
 
     // --- Property-based ---------------------------------------------------

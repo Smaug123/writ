@@ -15,13 +15,14 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::Mutex;
 
+use crate::agent_run::{AgentPrompt, AgentRunId};
 use crate::agent_vm_lifecycle::{
     AgentVmGuestEnvVar, AgentVmLifecycleConfigError, AgentVmResources, AgentVmSessionManagerError,
     AgentVmSessionPlan, AgentVmSessionStateError, AgentVmSessionStateStore, AgentVmToolPaths,
     ContainerImage, Ipv6IsolationMode, cleanup_managed_agent_vm_session,
     remove_managed_agent_vm_session_state, start_managed_agent_vm_session,
 };
-use crate::audit::{AgentVmWorkspaceBootstrapAuditRecord, AuditError};
+use crate::audit::{AgentRunAuditRecord, AgentVmWorkspaceBootstrapAuditRecord, AuditError};
 use crate::core::{
     AgentKind, AgentNetwork, AgentNetworkPool, AgentVmConfigError, BrokerPorts, SessionId,
     SessionRecord, UnixMillis,
@@ -30,12 +31,13 @@ use crate::protocol::AgentVmSessionInfo;
 use crate::secret::SecretStore;
 use crate::server::BrokerState;
 use crate::vm_git::{
-    AgentVmWorkspaceBootstrap, DEFAULT_WORKSPACE_BRANCH, WorkspaceWarmMode,
-    default_workspace_destination,
+    AgentVmWorkspaceBootstrap, DEFAULT_DEVSHELL_ATTR, DEFAULT_WORKSPACE_BRANCH, WorkspaceWarmMode,
+    default_workspace_destination, nix_develop_command_args,
 };
 use crate::vm_http::{
-    RunningVmHttpGitSession, VM_NIX_BASIC_LOGIN, VM_NIX_CACHE_PATH_PREFIX, VmHttpGitRuntimeConfig,
-    VmHttpGitRuntimeError, VmHttpGitRuntimeShutdownError, prepare_vm_http_git_session,
+    RunningVmHttpGitSession, VM_NIX_BASIC_LOGIN, VM_NIX_CACHE_PATH_PREFIX, VmHttpAgentRunService,
+    VmHttpGitRuntimeConfig, VmHttpGitRuntimeError, VmHttpGitRuntimeShutdownError,
+    prepare_vm_http_git_session_with_agent_runs,
 };
 
 pub use crate::vm_client::{
@@ -218,6 +220,13 @@ pub struct AgentVmDaemon {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AgentVmStarted {
     session_id: SessionId,
+    broker_url: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AgentRunStarted {
+    session_id: SessionId,
+    run_id: AgentRunId,
     broker_url: String,
 }
 
@@ -416,6 +425,7 @@ impl AgentVmDaemon {
                 session_id,
                 workspace,
                 guest_command,
+                None,
             )
             .await
         }
@@ -423,6 +433,69 @@ impl AgentVmDaemon {
 
         match start_result {
             Ok(started) => Ok(started),
+            Err(err) => {
+                close_audit_session_best_effort(&state, session_id);
+                Err(AgentVmDaemonError::StartFailed {
+                    session_id,
+                    source: Box::new(err),
+                })
+            }
+        }
+    }
+
+    pub async fn start_agent_run_session<S: SecretStore + Send + Sync + 'static>(
+        &self,
+        state: Arc<BrokerState<S>>,
+        label: Option<String>,
+        agent_kind: AgentKind,
+        agent_model: Option<String>,
+        workspace: AgentVmWorkspaceBootstrap,
+        prompt: AgentPrompt,
+    ) -> Result<AgentRunStarted, AgentVmDaemonError> {
+        let _guard = self.lifecycle_lock.lock().await;
+        let session_id = SessionId::new();
+        let run_id = AgentRunId::new();
+        state.audit.open_session(&SessionRecord {
+            session_id,
+            label,
+            agent_kind: Some(agent_kind),
+            agent_model,
+            opened_at: UnixMillis::now(),
+            closed_at: None,
+        })?;
+
+        let start_result = async {
+            let workspace_record = workspace_bootstrap_audit_record(session_id, &workspace)?;
+            state
+                .audit
+                .record_agent_vm_workspace_bootstrap(&workspace_record)?;
+            state.audit.record_agent_run(&AgentRunAuditRecord {
+                run_id,
+                session_id,
+                requested_at: UnixMillis::now(),
+                agent_kind,
+                prompt: prompt.summary(),
+            })?;
+            let agent_runs = VmHttpAgentRunService::new();
+            agent_runs.insert_prompt(run_id, prompt.clone());
+            let guest_command = build_agent_run_guest_command(agent_kind, run_id, workspace.warm);
+            self.start_session_after_audit_opened(
+                Arc::clone(&state),
+                session_id,
+                Some(workspace),
+                guest_command,
+                Some(agent_runs),
+            )
+            .await
+        }
+        .await;
+
+        match start_result {
+            Ok(started) => Ok(AgentRunStarted {
+                session_id: started.session_id(),
+                run_id,
+                broker_url: started.broker_url().to_string(),
+            }),
             Err(err) => {
                 close_audit_session_best_effort(&state, session_id);
                 Err(AgentVmDaemonError::StartFailed {
@@ -621,15 +694,17 @@ impl AgentVmDaemon {
         session_id: SessionId,
         workspace: Option<AgentVmWorkspaceBootstrap>,
         guest_command: Vec<String>,
+        agent_runs: Option<VmHttpAgentRunService>,
     ) -> Result<AgentVmStarted, AgentVmDaemonError> {
         let lifecycle = self.config.lifecycle.clone();
         let (subnet_index, network) =
             tokio::task::spawn_blocking(move || choose_subnet_index(&lifecycle)).await??;
-        let prepared = prepare_vm_http_git_session(
+        let prepared = prepare_vm_http_git_session_with_agent_runs(
             Arc::clone(&state),
             &self.config.vm_http,
             session_id,
             network.ipv4(),
+            agent_runs,
         )
         .await?;
         let broker_port = prepared.broker_port();
@@ -790,6 +865,30 @@ fn shell_wrapped_command(
     wrapped
 }
 
+fn build_agent_run_guest_command(
+    agent_kind: AgentKind,
+    run_id: AgentRunId,
+    warm: WorkspaceWarmMode,
+) -> Vec<String> {
+    let mut command = vec![
+        "writ-vm".to_string(),
+        "agent".to_string(),
+        "run".to_string(),
+        "--run-id".to_string(),
+        run_id.to_string(),
+        "--agent".to_string(),
+        agent_kind.as_str().to_string(),
+    ];
+    if warm != WorkspaceWarmMode::DevShell {
+        return command;
+    }
+
+    let mut wrapped = vec!["nix".to_string()];
+    wrapped.extend(nix_develop_command_args(DEFAULT_DEVSHELL_ATTR));
+    wrapped.append(&mut command);
+    wrapped
+}
+
 fn workspace_destination(
     workspace: &AgentVmWorkspaceBootstrap,
 ) -> Result<PathBuf, AgentVmDaemonError> {
@@ -864,6 +963,20 @@ fn normalise_workspace_bootstrap_failure_message(raw: &str) -> String {
 impl AgentVmStarted {
     pub fn session_id(&self) -> SessionId {
         self.session_id
+    }
+
+    pub fn broker_url(&self) -> &str {
+        &self.broker_url
+    }
+}
+
+impl AgentRunStarted {
+    pub fn session_id(&self) -> SessionId {
+        self.session_id
+    }
+
+    pub fn run_id(&self) -> AgentRunId {
+        self.run_id
     }
 
     pub fn broker_url(&self) -> &str {
@@ -1570,6 +1683,55 @@ mod tests {
         assert!(AGENT_VM_GUEST_NIX_SETUP_SCRIPT.contains("experimental-features = nix-command"));
         assert!(!AGENT_VM_GUEST_NIX_SETUP_SCRIPT.contains("nix-command flakes"));
         assert!(AGENT_VM_GUEST_WORKSPACE_BOOTSTRAP_SCRIPT.contains("nix-command flakes"));
+    }
+
+    #[test]
+    fn agent_run_guest_command_contains_run_id_and_agent_but_not_prompt() {
+        let run_id: AgentRunId = "00000000-0000-0000-0000-000000000201".parse().unwrap();
+        let prompt = AgentPrompt::new("SECRET prompt");
+
+        let command =
+            build_agent_run_guest_command(AgentKind::Claude, run_id, WorkspaceWarmMode::Sources);
+
+        assert_eq!(
+            command,
+            vec![
+                "writ-vm",
+                "agent",
+                "run",
+                "--run-id",
+                "00000000-0000-0000-0000-000000000201",
+                "--agent",
+                "claude",
+            ]
+        );
+        assert!(!format!("{command:?}").contains(prompt.as_str()));
+    }
+
+    #[test]
+    fn agent_run_devshell_command_wraps_without_adding_prompt() {
+        let run_id: AgentRunId = "00000000-0000-0000-0000-000000000202".parse().unwrap();
+        let prompt = AgentPrompt::new("SECRET prompt");
+
+        let command =
+            build_agent_run_guest_command(AgentKind::Codex, run_id, WorkspaceWarmMode::DevShell);
+
+        assert!(command.starts_with(&[
+            "nix".to_string(),
+            "--option".to_string(),
+            "builders".to_string(),
+            "".to_string(),
+        ]));
+        assert!(command.ends_with(&[
+            "writ-vm".to_string(),
+            "agent".to_string(),
+            "run".to_string(),
+            "--run-id".to_string(),
+            "00000000-0000-0000-0000-000000000202".to_string(),
+            "--agent".to_string(),
+            "codex".to_string(),
+        ]));
+        assert!(!format!("{command:?}").contains(prompt.as_str()));
     }
 
     #[test]

@@ -13,6 +13,9 @@ use std::process::{Command, ExitStatus, Stdio};
 
 use reqwest::Url;
 
+use crate::agent_run::{
+    AgentPrompt, AgentRunId, VmAgentRunPromptResponse, vm_agent_run_prompt_path,
+};
 use crate::bearer::is_bearer_token_byte;
 use crate::vm_git::{
     DEFAULT_DEVSHELL_ATTR, DEFAULT_WORKSPACE_BRANCH, GIT_BUNDLE_CONTENT_TYPE, GitCloneRef,
@@ -309,6 +312,24 @@ pub async fn get_session_json(config: &VmClientConfig) -> Result<serde_json::Val
     response
         .json::<serde_json::Value>()
         .await
+        .map_err(VmClientError::from)
+}
+
+pub async fn fetch_agent_run_prompt(
+    config: &VmClientConfig,
+    run_id: AgentRunId,
+) -> Result<AgentPrompt, VmClientError> {
+    let response = reqwest::Client::new()
+        .get(config.endpoint(&vm_agent_run_prompt_path(run_id)))
+        .bearer_auth(config.bearer_token().as_str())
+        .send()
+        .await?;
+    let response = require_success(response).await?;
+    require_content_type(&response, "application/json")?;
+    response
+        .json::<VmAgentRunPromptResponse>()
+        .await
+        .map(VmAgentRunPromptResponse::into_prompt)
         .map_err(VmClientError::from)
 }
 
@@ -1144,6 +1165,34 @@ mod tests {
                 message
             } if message == "method not allowed"
         ));
+    }
+
+    #[tokio::test]
+    async fn fetch_agent_run_prompt_gets_one_run_prompt_with_bearer_token() {
+        let run_id: AgentRunId = "00000000-0000-0000-0000-000000000501".parse().unwrap();
+        let prompt = AgentPrompt::new("SECRET prompt");
+        let body =
+            serde_json::to_vec(&VmAgentRunPromptResponse::new(run_id, prompt.clone())).unwrap();
+        let (broker_url, captured) =
+            serve_once(http_response("200 OK", "application/json", &body)).await;
+        let config = VmClientConfig::new(broker_url, "writ-vm-secret").unwrap();
+
+        let fetched = fetch_agent_run_prompt(&config, run_id).await.unwrap();
+
+        assert_eq!(fetched, prompt);
+        let request = captured.lock().unwrap().clone();
+        assert!(
+            request.starts_with(
+                "GET /v1/agent-runs/00000000-0000-0000-0000-000000000501/prompt HTTP/1.1"
+            ),
+            "{request}"
+        );
+        assert!(
+            request.contains("authorization: Bearer writ-vm-secret")
+                || request.contains("Authorization: Bearer writ-vm-secret"),
+            "{request}"
+        );
+        assert!(!format!("{fetched:?}").contains(prompt.as_str()));
     }
 
     #[tokio::test]

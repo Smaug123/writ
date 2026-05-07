@@ -16,6 +16,9 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 use tokio::task::JoinSet;
 
+use crate::agent_run::{
+    AgentPrompt, AgentRunId, VM_AGENT_RUN_PATH_PREFIX, VmAgentRunPromptResponse,
+};
 use crate::audit::{
     AuditError, NixCacheAuditDecision, NixCacheAuditRoute, NixCacheOutcomeRecord,
     NixCacheRequestRecord,
@@ -93,6 +96,11 @@ pub struct VmHttpNixCacheService<S: SecretStore> {
     admitted_nars: Arc<Mutex<HashMap<NixCacheNarFileName, VmHttpNixCacheAdmittedNar>>>,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct VmHttpAgentRunService {
+    prompts: Arc<Mutex<HashMap<AgentRunId, AgentPrompt>>>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VmHttpGitRuntimeConfig {
     bind_addr: Ipv4Addr,
@@ -106,6 +114,13 @@ pub struct PreparedVmHttpGitSession<S: SecretStore + Send + Sync + 'static> {
     session: VmHttpSession,
     git_clone: VmHttpGitCloneService<S>,
     nix_cache: VmHttpNixCacheService<S>,
+    agent_runs: Option<VmHttpAgentRunService>,
+}
+
+struct VmHttpServices<S: SecretStore> {
+    git_clone: Option<VmHttpGitCloneService<S>>,
+    nix_cache: Option<VmHttpNixCacheService<S>>,
+    agent_runs: Option<VmHttpAgentRunService>,
 }
 
 pub struct RunningVmHttpGitSession {
@@ -456,6 +471,58 @@ impl<S: SecretStore> Clone for VmHttpNixCacheService<S> {
     }
 }
 
+impl VmHttpAgentRunService {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn insert_prompt(&self, run_id: AgentRunId, prompt: AgentPrompt) {
+        self.prompts
+            .lock()
+            .expect("agent run prompt lock should not be poisoned")
+            .insert(run_id, prompt);
+    }
+
+    fn take_prompt(&self, run_id: AgentRunId) -> Option<AgentPrompt> {
+        self.prompts
+            .lock()
+            .expect("agent run prompt lock should not be poisoned")
+            .remove(&run_id)
+    }
+}
+
+impl<S: SecretStore> VmHttpServices<S> {
+    fn none() -> Self {
+        Self {
+            git_clone: None,
+            nix_cache: None,
+            agent_runs: None,
+        }
+    }
+
+    fn with_git(
+        git_clone: VmHttpGitCloneService<S>,
+        nix_cache: VmHttpNixCacheService<S>,
+        agent_runs: Option<VmHttpAgentRunService>,
+    ) -> Self {
+        Self {
+            git_clone: Some(git_clone),
+            nix_cache: Some(nix_cache),
+            agent_runs,
+        }
+    }
+}
+
+impl<S: SecretStore> Clone for VmHttpServices<S> {
+    fn clone(&self) -> Self {
+        Self {
+            git_clone: self.git_clone.clone(),
+            nix_cache: self.nix_cache.clone(),
+            agent_runs: self.agent_runs.clone(),
+        }
+    }
+}
+
 impl VmHttpGitRuntimeConfig {
     pub fn new(
         bind_addr: Ipv4Addr,
@@ -683,6 +750,7 @@ impl<S: SecretStore + Send + Sync + 'static> PreparedVmHttpGitSession<S> {
             self.session,
             self.git_clone,
             self.nix_cache,
+            self.agent_runs,
             shutdown_rx,
         ));
         RunningVmHttpGitSession {
@@ -783,6 +851,16 @@ pub async fn prepare_vm_http_git_session<S: SecretStore + Send + Sync + 'static>
     session_id: SessionId,
     source_ipv4: Ipv4Cidr,
 ) -> Result<PreparedVmHttpGitSession<S>, VmHttpGitRuntimeError> {
+    prepare_vm_http_git_session_with_agent_runs(state, config, session_id, source_ipv4, None).await
+}
+
+pub async fn prepare_vm_http_git_session_with_agent_runs<S: SecretStore + Send + Sync + 'static>(
+    state: Arc<BrokerState<S>>,
+    config: &VmHttpGitRuntimeConfig,
+    session_id: SessionId,
+    source_ipv4: Ipv4Cidr,
+    agent_runs: Option<VmHttpAgentRunService>,
+) -> Result<PreparedVmHttpGitSession<S>, VmHttpGitRuntimeError> {
     let listener =
         bind_ephemeral_vm_http_listener(config.bind_addr, config.broker_port_range).await?;
     let session = VmHttpSession::new(session_id, source_ipv4, VmHttpBearerToken::generate());
@@ -793,6 +871,7 @@ pub async fn prepare_vm_http_git_session<S: SecretStore + Send + Sync + 'static>
         session,
         git_clone,
         nix_cache,
+        agent_runs,
     })
 }
 
@@ -809,7 +888,10 @@ pub async fn run_vm_http_until_shutdown(
     shutdown: watch::Receiver<bool>,
 ) -> std::io::Result<()> {
     run_vm_http_runtime_until_shutdown::<Box<dyn SecretStore>>(
-        listener, session, None, None, shutdown,
+        listener,
+        session,
+        VmHttpServices::none(),
+        shutdown,
     )
     .await
 }
@@ -819,13 +901,13 @@ pub async fn run_vm_http_with_git_until_shutdown<S: SecretStore + Send + Sync + 
     session: VmHttpSession,
     git_clone: VmHttpGitCloneService<S>,
     nix_cache: VmHttpNixCacheService<S>,
+    agent_runs: Option<VmHttpAgentRunService>,
     shutdown: watch::Receiver<bool>,
 ) -> std::io::Result<()> {
     run_vm_http_runtime_until_shutdown(
         listener,
         session,
-        Some(git_clone),
-        Some(nix_cache),
+        VmHttpServices::with_git(git_clone, nix_cache, agent_runs),
         shutdown,
     )
     .await
@@ -834,8 +916,7 @@ pub async fn run_vm_http_with_git_until_shutdown<S: SecretStore + Send + Sync + 
 async fn run_vm_http_runtime_until_shutdown<S: SecretStore + Send + Sync + 'static>(
     listener: TcpListener,
     session: VmHttpSession,
-    git_clone: Option<VmHttpGitCloneService<S>>,
-    nix_cache: Option<VmHttpNixCacheService<S>>,
+    services: VmHttpServices<S>,
     mut shutdown: watch::Receiver<bool>,
 ) -> std::io::Result<()> {
     let mut handlers = JoinSet::new();
@@ -863,10 +944,9 @@ async fn run_vm_http_runtime_until_shutdown<S: SecretStore + Send + Sync + 'stat
             accepted = listener.accept(), if handlers.len() < MAX_VM_HTTP_CONNECTIONS => {
                 let (stream, peer_addr) = accepted?;
                 let session = session.clone();
-                let git_clone = git_clone.clone();
-                let nix_cache = nix_cache.clone();
+                let services = services.clone();
                 handlers.spawn(async move {
-                    handle_vm_http_connection(stream, peer_addr, session, git_clone, nix_cache).await
+                    handle_vm_http_connection(stream, peer_addr, session, services).await
                 });
             }
         }
@@ -946,15 +1026,13 @@ async fn handle_vm_http_connection<S: SecretStore + Send + Sync + 'static>(
     stream: TcpStream,
     peer_addr: SocketAddr,
     session: VmHttpSession,
-    git_clone: Option<VmHttpGitCloneService<S>>,
-    nix_cache: Option<VmHttpNixCacheService<S>>,
+    services: VmHttpServices<S>,
 ) -> std::io::Result<()> {
     handle_vm_http_connection_with_read_timeout(
         stream,
         peer_addr,
         session,
-        git_clone,
-        nix_cache,
+        services,
         VM_HTTP_READ_TIMEOUT,
     )
     .await
@@ -964,8 +1042,7 @@ async fn handle_vm_http_connection_with_read_timeout<S, T>(
     mut stream: T,
     peer_addr: SocketAddr,
     session: VmHttpSession,
-    git_clone: Option<VmHttpGitCloneService<S>>,
-    nix_cache: Option<VmHttpNixCacheService<S>>,
+    services: VmHttpServices<S>,
     read_timeout: std::time::Duration,
 ) -> std::io::Result<()>
 where
@@ -992,8 +1069,7 @@ where
         peer_addr,
         head,
         &mut stream,
-        git_clone,
-        nix_cache,
+        services,
         read_timeout,
     )
     .await;
@@ -1025,8 +1101,7 @@ async fn dispatch_vm_http_head_and_body<S, R>(
     peer_addr: SocketAddr,
     head: VmHttpHeadRead,
     stream: &mut R,
-    git_clone: Option<VmHttpGitCloneService<S>>,
-    nix_cache: Option<VmHttpNixCacheService<S>>,
+    services: VmHttpServices<S>,
     read_timeout: std::time::Duration,
 ) -> VmHttpDispatch
 where
@@ -1047,8 +1122,7 @@ where
                 &request,
                 head.buffered_body,
                 stream,
-                git_clone,
-                nix_cache,
+                services,
                 read_timeout,
             )
             .await
@@ -1057,7 +1131,7 @@ where
             let response = auth_error_response(auth_scheme, err);
             if is_nix_cache_target(&request.target) {
                 return record_nix_cache_local_response(
-                    nix_cache.as_ref(),
+                    services.nix_cache.as_ref(),
                     session,
                     &request,
                     NixCacheAuditDecision::Deny {
@@ -1104,8 +1178,7 @@ async fn route_authenticated_vm_http_request<S, R>(
     request: &VmHttpRequest,
     buffered_body: Vec<u8>,
     stream: &mut R,
-    git_clone: Option<VmHttpGitCloneService<S>>,
-    nix_cache: Option<VmHttpNixCacheService<S>>,
+    services: VmHttpServices<S>,
     read_timeout: std::time::Duration,
 ) -> VmHttpDispatch
 where
@@ -1113,11 +1186,11 @@ where
     R: AsyncRead + Unpin,
 {
     if is_nix_cache_target(&request.target) {
-        return route_nix_cache_request(session, request, nix_cache).await;
+        return route_nix_cache_request(session, request, services.nix_cache).await;
     }
 
     if request.target == VM_GIT_CLONE_PATH {
-        let Some(service) = git_clone else {
+        let Some(service) = services.git_clone else {
             return VmHttpResponse::text(VmHttpStatus::NotFound, "not found").into();
         };
         if request.method != "POST" {
@@ -1137,6 +1210,17 @@ where
         return handle_git_clone_request(session, &body, service)
             .await
             .into();
+    }
+
+    if let Some(run_id) = parse_agent_run_prompt_target(&request.target) {
+        let Some(service) = services.agent_runs else {
+            return VmHttpResponse::text(VmHttpStatus::NotFound, "not found").into();
+        };
+        if request.method != "GET" {
+            return VmHttpResponse::text(VmHttpStatus::MethodNotAllowed, "method not allowed")
+                .into();
+        }
+        return route_agent_run_prompt_request(run_id, &service).into();
     }
 
     route_session_endpoint(session, request).into()
@@ -1921,6 +2005,30 @@ fn route_session_endpoint(session: &VmHttpSession, request: &VmHttpRequest) -> V
     }
 }
 
+fn parse_agent_run_prompt_target(target: &str) -> Option<AgentRunId> {
+    let suffix = target
+        .strip_prefix(VM_AGENT_RUN_PATH_PREFIX)?
+        .strip_prefix('/')?;
+    let raw_id = suffix.strip_suffix("/prompt")?;
+    if raw_id.contains('/') {
+        return None;
+    }
+    raw_id.parse().ok()
+}
+
+fn route_agent_run_prompt_request(
+    run_id: AgentRunId,
+    service: &VmHttpAgentRunService,
+) -> VmHttpResponse {
+    let Some(prompt) = service.take_prompt(run_id) else {
+        return VmHttpResponse::text(VmHttpStatus::NotFound, "not found");
+    };
+    VmHttpResponse::json(
+        VmHttpStatus::Ok,
+        &VmAgentRunPromptResponse::new(run_id, prompt),
+    )
+}
+
 fn is_nix_cache_target(target: &str) -> bool {
     target == VM_NIX_CACHE_PATH_PREFIX
         || target == VM_NIX_CACHE_INFO_PATH
@@ -2547,6 +2655,32 @@ mod tests {
     const TEST_GIT_CLONE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
     const TEST_NIX_CACHE_PUBLIC_KEY: &str =
         "cache.example:IsGkyTbr2sed7tWowgiPcI0ZHhBAHoGQ7TyYRweyzwE=";
+
+    type TestVmHttpServices = VmHttpServices<Box<dyn SecretStore>>;
+
+    fn no_services() -> TestVmHttpServices {
+        VmHttpServices::none()
+    }
+
+    fn services_with_git(
+        git_clone: VmHttpGitCloneService<Box<dyn SecretStore>>,
+    ) -> TestVmHttpServices {
+        VmHttpServices {
+            git_clone: Some(git_clone),
+            nix_cache: None,
+            agent_runs: None,
+        }
+    }
+
+    fn services_with_nix_cache(
+        nix_cache: VmHttpNixCacheService<Box<dyn SecretStore>>,
+    ) -> TestVmHttpServices {
+        VmHttpServices {
+            git_clone: None,
+            nix_cache: Some(nix_cache),
+            agent_runs: None,
+        }
+    }
     const TEST_SIGNED_NARINFO: &str = concat!(
         "StorePath: /nix/store/rzv95bakh41zrn5ji23pfc11x5vq2z4d-src\n",
         "URL: nar/05cwbm7srkm5hvm6s7pa8yw2n57vgfrfmsz3p2sy8h9cnki9415f.nar.xz\n",
@@ -3447,6 +3581,26 @@ esac
         verify_nar_body(&admission, &multi_stream_xz_body_for(&raw_body), 1024).unwrap();
     }
 
+    #[test]
+    fn agent_run_prompt_route_returns_prompt_once() {
+        let service = VmHttpAgentRunService::new();
+        let run_id: AgentRunId = "00000000-0000-0000-0000-000000000401".parse().unwrap();
+        let prompt = AgentPrompt::new("SECRET prompt");
+        service.insert_prompt(run_id, prompt.clone());
+
+        let response = route_agent_run_prompt_request(run_id, &service);
+
+        assert_eq!(response.status, VmHttpStatus::Ok);
+        let body: VmAgentRunPromptResponse = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(body.run_id(), run_id);
+        assert_eq!(body.prompt(), &prompt);
+        let debug = format!("{body:?}");
+        assert!(!debug.contains(prompt.as_str()), "{debug}");
+
+        let second = route_agent_run_prompt_request(run_id, &service);
+        assert_eq!(second.status, VmHttpStatus::NotFound);
+    }
+
     async fn route_nix_cache_with_service(
         session: &VmHttpSession,
         method: &str,
@@ -3465,8 +3619,7 @@ esac
             &request,
             Vec::new(),
             &mut stream,
-            None::<VmHttpGitCloneService<Box<dyn SecretStore>>>,
-            Some(service),
+            services_with_nix_cache(service),
             VM_HTTP_READ_TIMEOUT,
         )
         .await
@@ -4388,8 +4541,7 @@ esac
                 buffered_body: Vec::new(),
             },
             &mut stream,
-            None::<VmHttpGitCloneService<Box<dyn SecretStore>>>,
-            Some(service),
+            services_with_nix_cache(service),
             VM_HTTP_READ_TIMEOUT,
         )
         .await
@@ -4554,8 +4706,7 @@ esac
                 &request,
                 Vec::new(),
                 &mut stream,
-                None::<VmHttpGitCloneService<Box<dyn SecretStore>>>,
-                None,
+                no_services(),
                 VM_HTTP_READ_TIMEOUT,
             )
             .await
@@ -4563,6 +4714,33 @@ esac
 
             assert_eq!(response.status, VmHttpStatus::NotFound);
         }
+    }
+
+    #[tokio::test]
+    async fn disabled_agent_run_prompt_route_is_not_found() {
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(10, 1, 2, 0), 24).unwrap());
+        let run_id: AgentRunId = "00000000-0000-0000-0000-000000000402".parse().unwrap();
+        let target = crate::agent_run::vm_agent_run_prompt_path(run_id);
+        let request = VmHttpRequest::new(
+            "GET",
+            &target,
+            Some(bearer(token().as_str())),
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(10, 1, 2, 3), 12345)),
+        );
+
+        let mut stream = tokio::io::empty();
+        let response = route_authenticated_vm_http_request(
+            &session,
+            &request,
+            Vec::new(),
+            &mut stream,
+            no_services(),
+            VM_HTTP_READ_TIMEOUT,
+        )
+        .await
+        .into_buffered();
+
+        assert_eq!(response.status, VmHttpStatus::NotFound);
     }
 
     #[tokio::test]
@@ -4585,8 +4763,7 @@ esac
             &request,
             Vec::new(),
             &mut stream,
-            Some(service),
-            None,
+            services_with_git(service),
             VM_HTTP_READ_TIMEOUT,
         )
         .await
@@ -4686,8 +4863,7 @@ esac
                 buffered_body: Vec::new(),
             },
             &mut stream,
-            None::<VmHttpGitCloneService<Box<dyn SecretStore>>>,
-            None,
+            no_services(),
             VM_HTTP_READ_TIMEOUT,
         )
         .await
@@ -4715,8 +4891,7 @@ esac
                     buffered_body: Vec::new(),
                 },
                 &mut stream,
-                None::<VmHttpGitCloneService<Box<dyn SecretStore>>>,
-                None,
+                no_services(),
                 VM_HTTP_READ_TIMEOUT,
             ),
         )
@@ -4747,8 +4922,7 @@ esac
                     buffered_body: Vec::new(),
                 },
                 &mut stream,
-                None::<VmHttpGitCloneService<Box<dyn SecretStore>>>,
-                None,
+                no_services(),
                 VM_HTTP_READ_TIMEOUT,
             ),
         )
@@ -4783,8 +4957,7 @@ esac
                     buffered_body: Vec::new(),
                 },
                 &mut stream,
-                Some(service),
-                None,
+                services_with_git(service),
                 VM_HTTP_READ_TIMEOUT,
             ),
         )
@@ -4815,8 +4988,7 @@ esac
                     buffered_body: Vec::new(),
                 },
                 &mut stream,
-                None::<VmHttpGitCloneService<Box<dyn SecretStore>>>,
-                None,
+                no_services(),
                 VM_HTTP_READ_TIMEOUT,
             ),
         )
@@ -5343,6 +5515,7 @@ work_root=${{work_dir%/*}}
             session.clone(),
             service,
             VmHttpNixCacheService::new(Arc::clone(&state), nix_cache_config_for_test()),
+            None,
             shutdown_rx,
         ));
 
@@ -5434,8 +5607,7 @@ work_root=${{work_dir%/*}}
             server_io,
             SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 34567)),
             session,
-            Some(service),
-            None,
+            services_with_git(service),
             std::time::Duration::from_millis(20),
         ));
 

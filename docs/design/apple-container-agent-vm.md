@@ -1147,32 +1147,58 @@ First agent-runner UX slice implemented in `src/bin/writ.rs`:
   claude|codex --prompt <text> [--warm none|sources|devshell]`. This is a
   top-level product command, separate from the lower-level
   `writ agent-vm start -- <guest-command>` debugging surface;
-- the command deliberately does not add a daemon protocol variant. It
-  desugars to the existing `start_agent_vm` message with a required workspace
-  bootstrap, the selected `agent_kind`, optional label/model metadata, and the
-  same workspace warmup enum used by `agent-vm start`;
-- for this stage the selected agent runtime is a stub. The guest command is
-  `echo <agent> <prompt>`. With the default `--warm devshell`, the stub is
-  executed through the same no-build/no-lockfile envelope as workspace devshell
-  warmup:
+- the command uses a product-level daemon protocol message,
+  `StartAgentRun`. The prompt is protocol data on the host Unix socket, not
+  part of the guest command. The daemon assigns an `AgentRunId`, records only
+  prompt metadata in the audit log, stores the raw prompt in memory for the
+  VM HTTP broker, and advertises a one-shot authenticated prompt route:
+
+  ```text
+  GET /v1/agent-runs/<run-id>/prompt
+  ```
+
+  The route returns the prompt at most once and is protected by the same VM
+  bearer token and source-subnet check as the Git/Nix VM HTTP routes. The
+  prompt is not copied into guest argv, guest environment, daemon lifecycle
+  state, or SQLite audit rows. The current CLI still accepts `--prompt <text>`,
+  so the local shell boundary can expose it before `writ` sends the request.
+  `AgentPrompt` rejects values above 1 MiB before they can enter the daemon or
+  VM prompt route;
+- for this stage the selected agent runtime is a fake/stage adapter. The
+  guest command is `writ-vm agent run --run-id <run-id> --agent <agent>`. With
+  the default `--warm devshell`, the command is executed through the same
+  no-build/no-lockfile envelope as workspace devshell warmup:
 
   ```text
   nix --option builders "" \
     --option max-jobs 0 \
     --option fallback false \
     develop --no-write-lock-file .#default \
-    --command echo <agent> <prompt>
+    --command writ-vm agent run --run-id <run-id> --agent <agent>
   ```
 
   Workspace bootstrap has already proved that the default devshell can be
-  entered; these flags keep the final stub invocation in the same correctness
-  envelope. With lesser warm modes the stub runs directly after the requested
-  bootstrap;
-- because this stage passes the prompt as guest process argv, the prompt is
-  also present in the daemon-managed lifecycle state record until the session
-  is stopped and the record is removed. A later real-agent slice should decide
-  whether prompts belong in argv, a transient guest file, or a brokered
-  runtime input channel before treating prompts as potentially sensitive.
+  entered; these flags keep the final adapter invocation in the same
+  correctness envelope. With lesser warm modes the adapter runs directly after
+  the requested bootstrap;
+- `src/agent_run.rs` defines the fake-agent prompt/log contract before real
+  Claude/Codex integration: the prompt is written to the agent process on
+  stdin, stdout and stderr are drained concurrently into private per-run
+  `<log-root>/<run-id>/stdout.log` and `stderr.log` files, retained bytes are
+  bounded, the full streams are hashed and counted, and the outcome exposes
+  terminal status plus exit code. The stream files intentionally outlive the VM
+  session because audit rows point at them, but real Claude/Codex wiring must
+  first add a retention, quota, and GC policy for `<log-root>`. Tests exercise
+  fake agents that succeed, fail, write both streams, receive quoted prompt
+  text on stdin, and emit large streams that must be drained without retaining
+  unbounded log bodies;
+- the audit schema has `agent_run` and `agent_run_outcome` rows. `agent_run`
+  stores run/session identity, selected agent kind, prompt byte length, prompt
+  SHA-256, and a redacted preview marker. `agent_run_outcome` stores status,
+  exit code, stream paths, stream byte counts, stream hashes, and truncation
+  flags. Wiring VM-side outcome upload/recording into the managed lifecycle is
+  the next integration step before a real Claude/Codex adapter replaces the
+  fake stage adapter.
 
 ## Tests and proof spikes
 
