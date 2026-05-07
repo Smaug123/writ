@@ -15,15 +15,14 @@ use reqwest::Url;
 
 use crate::bearer::is_bearer_token_byte;
 use crate::vm_git::{
-    DEFAULT_WORKSPACE_BRANCH, GIT_BUNDLE_CONTENT_TYPE, GitCloneRef, GitCloneRepo,
-    VM_GIT_CLONE_PATH, VmGitCloneErrorResponse, VmGitCloneRequest, WorkspaceWarmMode,
-    default_workspace_destination,
+    DEFAULT_DEVSHELL_ATTR, DEFAULT_WORKSPACE_BRANCH, GIT_BUNDLE_CONTENT_TYPE, GitCloneRef,
+    GitCloneRepo, VM_GIT_CLONE_PATH, VmGitCloneErrorResponse, VmGitCloneRequest, WorkspaceWarmMode,
+    default_workspace_destination, nix_develop_command_args,
 };
 
 pub const VM_BROKER_URL_ENV: &str = "WRIT_BROKER_URL";
 pub const VM_BROKER_TOKEN_ENV: &str = "WRIT_BROKER_TOKEN";
 pub const DEFAULT_VM_CLIENT_MAX_BUNDLE_BYTES: u64 = 512 * 1024 * 1024;
-pub const DEFAULT_DEVSHELL_ATTR: &str = ".#default";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VmClientConfig {
@@ -847,25 +846,15 @@ fn run_nix_flake_metadata(command: &VmWorkspaceInitCommand) -> Result<(), VmClie
 }
 
 fn run_nix_develop_true(command: &VmWorkspaceInitCommand) -> Result<(), VmClientError> {
+    let mut args: Vec<OsString> = nix_develop_command_args(DEFAULT_DEVSHELL_ATTR)
+        .into_iter()
+        .map(OsString::from)
+        .collect();
+    args.push(OsString::from("true"));
     run_nix_command(
         command.nix_program(),
         VmWorkspaceWarmStep::DevShell,
-        vec![
-            OsString::from("--option"),
-            OsString::from("builders"),
-            OsString::from(""),
-            OsString::from("--option"),
-            OsString::from("max-jobs"),
-            OsString::from("0"),
-            OsString::from("--option"),
-            OsString::from("fallback"),
-            OsString::from("false"),
-            OsString::from("develop"),
-            OsString::from("--no-write-lock-file"),
-            OsString::from(DEFAULT_DEVSHELL_ATTR),
-            OsString::from("--command"),
-            OsString::from("true"),
-        ],
+        args,
         command.destination(),
     )
 }

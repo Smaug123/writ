@@ -1141,6 +1141,39 @@ First workspace bootstrap slice implemented in `src/protocol.rs`,
   project-level vendoring/Nix source derivations before claiming full
   cargo-offline readiness.
 
+First agent-runner UX slice implemented in `src/bin/writ.rs`:
+
+- the host CLI now exposes `writ agent run --repo <owner/repo> --agent
+  claude|codex --prompt <text> [--warm none|sources|devshell]`. This is a
+  top-level product command, separate from the lower-level
+  `writ agent-vm start -- <guest-command>` debugging surface;
+- the command deliberately does not add a daemon protocol variant. It
+  desugars to the existing `start_agent_vm` message with a required workspace
+  bootstrap, the selected `agent_kind`, optional label/model metadata, and the
+  same workspace warmup enum used by `agent-vm start`;
+- for this stage the selected agent runtime is a stub. The guest command is
+  `echo <agent> <prompt>`. With the default `--warm devshell`, the stub is
+  executed through the same no-build/no-lockfile envelope as workspace devshell
+  warmup:
+
+  ```text
+  nix --option builders "" \
+    --option max-jobs 0 \
+    --option fallback false \
+    develop --no-write-lock-file .#default \
+    --command echo <agent> <prompt>
+  ```
+
+  Workspace bootstrap has already proved that the default devshell can be
+  entered; these flags keep the final stub invocation in the same correctness
+  envelope. With lesser warm modes the stub runs directly after the requested
+  bootstrap;
+- because this stage passes the prompt as guest process argv, the prompt is
+  also present in the daemon-managed lifecycle state record until the session
+  is stopped and the record is removed. A later real-agent slice should decide
+  whether prompts belong in argv, a transient guest file, or a brokered
+  runtime input channel before treating prompts as potentially sensitive.
+
 ## Tests and proof spikes
 
 First pure slice implemented in `src/core/agent_vm.rs`:

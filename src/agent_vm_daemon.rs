@@ -678,20 +678,19 @@ impl AgentVmDaemon {
 
         let running = prepared.spawn();
         self.running.lock().await.insert(session_id, running);
-        if workspace.is_some() {
-            if let Err(err) = self
+        if workspace.is_some()
+            && let Err(err) = self
                 .release_and_wait_for_workspace_bootstrap(plan.names().vm())
                 .await
-            {
-                let bootstrap = err.to_string();
-                if let Err(cleanup) = self.cleanup_failed_started_session(session_id).await {
-                    return Err(AgentVmDaemonError::WorkspaceBootstrapCleanupFailed {
-                        bootstrap,
-                        cleanup: cleanup.to_string(),
-                    });
-                }
-                return Err(err);
+        {
+            let bootstrap = err.to_string();
+            if let Err(cleanup) = self.cleanup_failed_started_session(session_id).await {
+                return Err(AgentVmDaemonError::WorkspaceBootstrapCleanupFailed {
+                    bootstrap,
+                    cleanup: cleanup.to_string(),
+                });
             }
+            return Err(err);
         }
         Ok(AgentVmStarted {
             session_id,

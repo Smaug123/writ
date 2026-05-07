@@ -19,6 +19,25 @@ pub const VM_GIT_CLONE_PATH: &str = "/v1/git/clone";
 pub const GIT_BUNDLE_CONTENT_TYPE: &str = "application/x-git-bundle";
 pub const DEFAULT_WORKSPACE_ROOT: &str = "/workspace";
 pub const DEFAULT_WORKSPACE_BRANCH: &str = "main";
+pub const DEFAULT_DEVSHELL_ATTR: &str = ".#default";
+
+pub fn nix_develop_command_args(attr: &str) -> Vec<String> {
+    vec![
+        "--option".to_string(),
+        "builders".to_string(),
+        String::new(),
+        "--option".to_string(),
+        "max-jobs".to_string(),
+        "0".to_string(),
+        "--option".to_string(),
+        "fallback".to_string(),
+        "false".to_string(),
+        "develop".to_string(),
+        "--no-write-lock-file".to_string(),
+        attr.to_string(),
+        "--command".to_string(),
+    ]
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct VmGitCloneRequest {
@@ -478,5 +497,27 @@ mod tests {
     fn clone_route_and_bundle_content_type_are_pinned() {
         assert_eq!(VM_GIT_CLONE_PATH, "/v1/git/clone");
         assert_eq!(GIT_BUNDLE_CONTENT_TYPE, "application/x-git-bundle");
+    }
+
+    #[test]
+    fn nix_develop_command_args_pin_no_build_no_lockfile_envelope() {
+        assert_eq!(
+            nix_develop_command_args(DEFAULT_DEVSHELL_ATTR),
+            vec![
+                "--option",
+                "builders",
+                "",
+                "--option",
+                "max-jobs",
+                "0",
+                "--option",
+                "fallback",
+                "false",
+                "develop",
+                "--no-write-lock-file",
+                ".#default",
+                "--command",
+            ]
+        );
     }
 }
