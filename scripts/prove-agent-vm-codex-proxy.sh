@@ -15,19 +15,22 @@ Requires:
   - python3, curl, git, sqlite3, sudo, cargo or the Nix dev shell, and either
     Nix substitutes/builders for the guest image closure or a preloaded image
     containing sh, ip, git, nix, writ-vm, and codex
-  - one of WRIT_PROVE_OPENAI_API_KEY or OPENAI_API_KEY in the host environment
+  - a `codex login` auth.json bundle on the host (default ~/.codex/auth.json,
+    override with WRIT_PROVE_CODEX_AUTH_JSON). The host broker reads, refreshes,
+    and re-uses this bundle on each proxied request.
 
 What it proves:
   - writd starts a daemon-managed agent VM through `writ agent run`
   - the VM fetches its prompt through the authenticated broker route
   - `writ-vm` invokes:
-      codex exec --model gpt-5
+      codex exec --model gpt-5.4-mini
                  --config model_reasoning_effort=minimal
                  --config web_search=disabled
                  --config tools.view_image=false
                  --json -
   - the VM points Codex at the broker, not directly at OpenAI
-  - the broker strips guest auth, injects the host-side OpenAI credential,
+  - the broker strips guest auth, refreshes the host ChatGPT-OAuth bundle when
+    needed, injects Authorization / ChatGPT-Account-ID / X-OpenAI-Fedramp,
     proxies `/v1/responses`, and records OpenAI proxy audit rows
   - the VM uploads retained stdout/stderr outcome artifacts to the broker
   - the retained stdout artifact contains a Codex `agent_message` event whose
@@ -35,13 +38,14 @@ What it proves:
   - daemon stop removes the VM, network, PF anchor, and state record
 
 The GitHub API and Git origin are local fakes. The OpenAI call is real by
-default; the key is written only to the temporary host secret store and is
-unset before writd or the CLI are started.
+default; the ChatGPT-login auth.json bundle is copied into the temporary host
+secret store. The original on-disk auth.json is left untouched, but the
+`refresh_token` it contains is used by the broker to refresh the access token
+against `https://auth.openai.com/oauth/token` when stale.
 
 Environment overrides:
-  WRIT_PROVE_OPENAI_API_KEY  Host OpenAI API key, preferred over OPENAI_API_KEY
-  OPENAI_API_KEY  Host OpenAI API key, used if no
-                  WRIT_PROVE_OPENAI_API_KEY is set
+  WRIT_PROVE_CODEX_AUTH_JSON  Host path to a `codex login` auth.json bundle,
+                              default \$HOME/.codex/auth.json
   WRIT_PROVE_IMAGE       OCI image to run, default writ-agent-vm-guest:latest
   WRIT_PROVE_BUILD_GUEST_IMAGE  build/load the Nix guest image, default auto
                                 (auto builds unless WRIT_PROVE_IMAGE is set)
@@ -54,7 +58,7 @@ Environment overrides:
   WRIT_PROVE_BROKER_PORT_MIN  minimum allowed broker port, default 49152
   WRIT_PROVE_BROKER_PORT_MAX  maximum allowed broker port, default 65535
   WRIT_PROVE_OPENAI_UPSTREAM  OpenAI upstream base URL, default
-                              https://api.openai.com
+                              https://chatgpt.com/backend-api/codex/
   WRIT_PROVE_WARM        agent workspace warm mode, default none
   WRIT_PROVE_TIMEOUT_SECS  outcome polling timeout, default 600
 EOF
@@ -90,7 +94,7 @@ IPV6_POOL="${WRIT_PROVE_IPV6_POOL:-fd83:b6f2:e57::/48}"
 SUBNET_INDEX="${WRIT_PROVE_SUBNET_INDEX:-252}"
 BROKER_PORT_MIN="${WRIT_PROVE_BROKER_PORT_MIN:-49152}"
 BROKER_PORT_MAX="${WRIT_PROVE_BROKER_PORT_MAX:-65535}"
-OPENAI_UPSTREAM="${WRIT_PROVE_OPENAI_UPSTREAM:-https://api.openai.com}"
+OPENAI_UPSTREAM="${WRIT_PROVE_OPENAI_UPSTREAM:-https://chatgpt.com/backend-api/codex/}"
 WARM="${WRIT_PROVE_WARM:-none}"
 TIMEOUT_SECS="${WRIT_PROVE_TIMEOUT_SECS:-600}"
 PROMPT="Testing: please say anything starting with the word 'Hello'"
@@ -901,14 +905,32 @@ case "$TIMEOUT_SECS" in
 esac
 [[ "$TIMEOUT_SECS" -gt 0 ]] || die "WRIT_PROVE_TIMEOUT_SECS must be positive"
 
-OPENAI_API_KEY_VALUE="${WRIT_PROVE_OPENAI_API_KEY:-${OPENAI_API_KEY:-}}"
-if [[ -n "$OPENAI_API_KEY_VALUE" ]]; then
-  CRED_KIND="authorization_bearer"
-  CRED_SECRET_NAME="openai-api-key"
-  CRED_VALUE="$OPENAI_API_KEY_VALUE"
-else
-  die "set WRIT_PROVE_OPENAI_API_KEY or OPENAI_API_KEY in the host environment"
+CODEX_AUTH_JSON_PATH="${WRIT_PROVE_CODEX_AUTH_JSON:-${HOME}/.codex/auth.json}"
+[[ -f "$CODEX_AUTH_JSON_PATH" ]] || \
+  die "ChatGPT-login bundle not found at ${CODEX_AUTH_JSON_PATH}; run \`codex login\` or set WRIT_PROVE_CODEX_AUTH_JSON"
+# Validate the bundle has the fields the broker requires before we copy it
+# into the proof secret store. Keeps the failure mode local instead of a
+# 502 on the first proxied request.
+if ! python3 - "$CODEX_AUTH_JSON_PATH" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+with open(path, encoding="utf-8") as f:
+    data = json.load(f)
+tokens = data.get("tokens") or {}
+required = ["id_token", "access_token", "refresh_token"]
+missing = [name for name in required if not tokens.get(name)]
+if missing:
+    print(f"auth.json missing tokens.{missing[0]}", file=sys.stderr)
+    sys.exit(1)
+PY
+then
+  die "auth.json at ${CODEX_AUTH_JSON_PATH} is not a valid ChatGPT-login bundle"
 fi
+CRED_KIND="chatgpt_oauth"
+CRED_SECRET_NAME="openai-chatgpt-auth"
+CRED_VALUE="$(cat "$CODEX_AUTH_JSON_PATH")"
 
 IPV4_CIDR="$(cidr_alloc_subnet "$IPV4_POOL" 24 "$SUBNET_INDEX")"
 
@@ -946,7 +968,6 @@ chmod 600 "${SECRETS_DIR}/gh-app-pk"
 printf '%s' "$CRED_VALUE" >"${SECRETS_DIR}/${CRED_SECRET_NAME}"
 chmod 600 "${SECRETS_DIR}/${CRED_SECRET_NAME}"
 unset CRED_VALUE
-unset OPENAI_API_KEY_VALUE
 unset OPENAI_API_KEY || true
 unset WRIT_PROVE_OPENAI_API_KEY || true
 
@@ -963,11 +984,11 @@ env -u OPENAI_API_KEY -u WRIT_PROVE_OPENAI_API_KEY \
 WRITD_PID="$!"
 wait_for_writd_socket
 
-log "starting Codex agent run on ${IPV4_CIDR} with --model gpt-5"
+log "starting Codex agent run on ${IPV4_CIDR} with --model gpt-5.4-mini"
 if ! env -u OPENAI_API_KEY -u WRIT_PROVE_OPENAI_API_KEY \
   "$WRIT_BIN" --socket "$SOCKET_PATH" agent run \
     --label "codex proxy proof" \
-    --model "gpt-5" \
+    --model "gpt-5.4-mini" \
     --repo "$PROOF_REPO_FULL" \
     --agent codex \
     --warm "$WARM" \

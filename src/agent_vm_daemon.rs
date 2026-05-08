@@ -458,7 +458,7 @@ impl AgentVmDaemon {
         state: Arc<BrokerState<S>>,
         label: Option<String>,
         agent_kind: AgentKind,
-        agent_model: Option<String>,
+        agent_model: String,
         workspace: AgentVmWorkspaceBootstrap,
         prompt: AgentPrompt,
     ) -> Result<AgentRunStarted, AgentVmDaemonError> {
@@ -469,7 +469,7 @@ impl AgentVmDaemon {
             session_id,
             label,
             agent_kind: Some(agent_kind),
-            agent_model,
+            agent_model: Some(agent_model.clone()),
             opened_at: UnixMillis::now(),
             closed_at: None,
         })?;
@@ -488,7 +488,7 @@ impl AgentVmDaemon {
             })?;
             let agent_runs =
                 VmHttpAgentRunService::with_log_root(self.config.vm_http.agent_run_log_root());
-            agent_runs.insert_prompt(run_id, prompt.clone());
+            agent_runs.insert_run_config(run_id, prompt.clone(), agent_model.clone());
             let guest_command = build_agent_run_guest_command(agent_kind, run_id, workspace.warm);
             self.start_session_after_audit_opened(
                 Arc::clone(&state),

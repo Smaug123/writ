@@ -74,9 +74,10 @@ pub struct VmAgentRunOutcomeUpload {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct VmAgentRunPromptResponse {
+pub struct VmAgentRunConfigResponse {
     run_id: AgentRunId,
     prompt: AgentPrompt,
+    model: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
@@ -179,9 +180,13 @@ impl<'de> Deserialize<'de> for AgentPrompt {
     }
 }
 
-impl VmAgentRunPromptResponse {
-    pub fn new(run_id: AgentRunId, prompt: AgentPrompt) -> Self {
-        Self { run_id, prompt }
+impl VmAgentRunConfigResponse {
+    pub fn new(run_id: AgentRunId, prompt: AgentPrompt, model: impl Into<String>) -> Self {
+        Self {
+            run_id,
+            prompt,
+            model: model.into(),
+        }
     }
 
     pub fn run_id(&self) -> AgentRunId {
@@ -192,8 +197,12 @@ impl VmAgentRunPromptResponse {
         &self.prompt
     }
 
-    pub fn into_prompt(self) -> AgentPrompt {
-        self.prompt
+    pub fn model(&self) -> &str {
+        &self.model
+    }
+
+    pub fn into_parts(self) -> (AgentPrompt, String) {
+        (self.prompt, self.model)
     }
 }
 
@@ -206,8 +215,8 @@ impl fmt::Debug for AgentPrompt {
     }
 }
 
-pub fn vm_agent_run_prompt_path(run_id: AgentRunId) -> String {
-    format!("{VM_AGENT_RUN_PATH_PREFIX}/{run_id}/prompt")
+pub fn vm_agent_run_config_path(run_id: AgentRunId) -> String {
+    format!("{VM_AGENT_RUN_PATH_PREFIX}/{run_id}/config")
 }
 
 pub fn vm_agent_run_outcome_path(run_id: AgentRunId) -> String {
@@ -671,12 +680,12 @@ mod tests {
     }
 
     #[test]
-    fn prompt_route_contains_run_id_not_prompt() {
+    fn config_route_contains_run_id_not_prompt() {
         let run_id: AgentRunId = "00000000-0000-0000-0000-000000000001".parse().unwrap();
 
         assert_eq!(
-            vm_agent_run_prompt_path(run_id),
-            "/v1/agent-runs/00000000-0000-0000-0000-000000000001/prompt"
+            vm_agent_run_config_path(run_id),
+            "/v1/agent-runs/00000000-0000-0000-0000-000000000001/config"
         );
     }
 

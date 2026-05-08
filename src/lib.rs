@@ -22,6 +22,8 @@ pub mod github;
 #[cfg(feature = "host")]
 pub mod nix_cache;
 #[cfg(feature = "host")]
+pub mod openai_chatgpt_auth;
+#[cfg(feature = "host")]
 pub mod policy;
 #[cfg(feature = "host")]
 pub mod protocol;

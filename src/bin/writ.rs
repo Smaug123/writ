@@ -87,9 +87,10 @@ enum AgentCmd {
         /// Human-readable description stored in the audit log.
         #[arg(long)]
         label: Option<String>,
-        /// Agent model identifier stored in the audit log.
+        /// Agent model identifier passed through to the guest agent CLI
+        /// (e.g. codex's `--model`) and stored in the audit log.
         #[arg(long)]
-        model: Option<String>,
+        model: String,
         /// Destination path for the clean checkout. Defaults to /workspace/<repo-name>.
         #[arg(long)]
         workspace: Option<PathBuf>,
@@ -342,7 +343,7 @@ fn start_agent_run(
     socket_path: &Path,
     label: Option<String>,
     agent_kind: AgentKind,
-    agent_model: Option<String>,
+    agent_model: String,
     workspace: AgentVmWorkspaceBootstrap,
     prompt: AgentPrompt,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -638,6 +639,8 @@ mod tests {
             "owner/repo",
             "--agent",
             "claude",
+            "--model",
+            "claude-test",
             "--prompt",
             "fix the failing test",
             "--warm",
@@ -652,6 +655,7 @@ mod tests {
                         repo,
                         agent,
                         prompt,
+                        model,
                         warm,
                         ..
                     },
@@ -659,6 +663,7 @@ mod tests {
                 assert_eq!(repo, "owner/repo");
                 assert_eq!(agent, AgentKind::Claude);
                 assert_eq!(prompt, "fix the failing test");
+                assert_eq!(model, "claude-test");
                 assert_eq!(warm, WorkspaceWarmArg::Sources);
             }
             _ => panic!("unexpected command"),
@@ -675,6 +680,8 @@ mod tests {
             "owner/repo",
             "--agent",
             "codex",
+            "--model",
+            "gpt-5.4-mini",
             "--prompt",
             "fix it",
         ])
@@ -686,6 +693,28 @@ mod tests {
             } => assert_eq!(warm, WorkspaceWarmArg::DevShell),
             _ => panic!("unexpected command"),
         }
+    }
+
+    #[test]
+    fn agent_run_cli_rejects_missing_model() {
+        let err = match Args::try_parse_from([
+            "writ",
+            "agent",
+            "run",
+            "--repo",
+            "owner/repo",
+            "--agent",
+            "codex",
+            "--prompt",
+            "fix it",
+        ]) {
+            Ok(_) => panic!("expected clap to reject missing --model"),
+            Err(error) => error,
+        };
+        assert!(
+            err.to_string().contains("--model"),
+            "unexpected clap error: {err}"
+        );
     }
 
     #[test]
@@ -716,7 +745,7 @@ mod tests {
         let msg = ClientMessage::StartAgentRun {
             label: None,
             agent_kind: AgentKind::Claude,
-            agent_model: None,
+            agent_model: "claude-test".into(),
             workspace,
             prompt: AgentPrompt::try_new("SECRET prompt").unwrap(),
         };

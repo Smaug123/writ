@@ -88,9 +88,9 @@ pub enum ClientMessage {
         /// Trusted coarse agent identity used by the broker to choose
         /// authority-bearing backend configuration and the guest adapter.
         agent_kind: AgentKind,
-        /// Model identifier stored in the audit log.
-        #[serde(skip_serializing_if = "Option::is_none", default)]
-        agent_model: Option<String>,
+        /// Model identifier delivered to the guest agent via the brokered
+        /// run-config channel and stored in the audit log.
+        agent_model: String,
         /// Required clean repo checkout and source/substitute warmup to
         /// complete before the guest agent command starts.
         workspace: AgentVmWorkspaceBootstrap,
@@ -295,7 +295,7 @@ mod tests {
         let msg = ClientMessage::StartAgentRun {
             label: Some("agent run".into()),
             agent_kind: AgentKind::Claude,
-            agent_model: Some("claude-test".into()),
+            agent_model: "claude-test".into(),
             workspace: AgentVmWorkspaceBootstrap {
                 repo: sample_clone_repo(),
                 destination: Some(PathBuf::from("/workspace/repo")),
@@ -485,7 +485,7 @@ mod tests {
         let run: serde_json::Value = serde_json::to_value(ClientMessage::StartAgentRun {
             label: None,
             agent_kind: AgentKind::Claude,
-            agent_model: None,
+            agent_model: "claude-test".into(),
             workspace: AgentVmWorkspaceBootstrap {
                 repo: sample_clone_repo(),
                 destination: None,
@@ -562,7 +562,7 @@ mod tests {
         let msg = ClientMessage::StartAgentRun {
             label: None,
             agent_kind: AgentKind::Codex,
-            agent_model: None,
+            agent_model: "gpt-5.4-mini".into(),
             workspace: AgentVmWorkspaceBootstrap {
                 repo: sample_clone_repo(),
                 destination: None,

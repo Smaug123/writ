@@ -15,8 +15,8 @@ use reqwest::Url;
 
 use crate::agent_run::{
     AgentPrompt, AgentRunId, AgentRunOutcome, AgentRunStreamSummary, AgentRunStreamUpload,
-    VmAgentRunOutcomeUpload, VmAgentRunPromptResponse, vm_agent_run_outcome_path,
-    vm_agent_run_prompt_path,
+    VmAgentRunConfigResponse, VmAgentRunOutcomeUpload, vm_agent_run_config_path,
+    vm_agent_run_outcome_path,
 };
 use crate::bearer::is_bearer_token_byte;
 use crate::vm_git::{
@@ -317,21 +317,21 @@ pub async fn get_session_json(config: &VmClientConfig) -> Result<serde_json::Val
         .map_err(VmClientError::from)
 }
 
-pub async fn fetch_agent_run_prompt(
+pub async fn fetch_agent_run_config(
     config: &VmClientConfig,
     run_id: AgentRunId,
-) -> Result<AgentPrompt, VmClientError> {
+) -> Result<(AgentPrompt, String), VmClientError> {
     let response = reqwest::Client::new()
-        .get(config.endpoint(&vm_agent_run_prompt_path(run_id)))
+        .get(config.endpoint(&vm_agent_run_config_path(run_id)))
         .bearer_auth(config.bearer_token().as_str())
         .send()
         .await?;
     let response = require_success(response).await?;
     require_content_type(&response, "application/json")?;
     response
-        .json::<VmAgentRunPromptResponse>()
+        .json::<VmAgentRunConfigResponse>()
         .await
-        .map(VmAgentRunPromptResponse::into_prompt)
+        .map(VmAgentRunConfigResponse::into_parts)
         .map_err(VmClientError::from)
 }
 
@@ -1213,22 +1213,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fetch_agent_run_prompt_gets_one_run_prompt_with_bearer_token() {
+    async fn fetch_agent_run_config_gets_one_run_config_with_bearer_token() {
         let run_id: AgentRunId = "00000000-0000-0000-0000-000000000501".parse().unwrap();
         let prompt = AgentPrompt::new("SECRET prompt");
-        let body =
-            serde_json::to_vec(&VmAgentRunPromptResponse::new(run_id, prompt.clone())).unwrap();
+        let body = serde_json::to_vec(&VmAgentRunConfigResponse::new(
+            run_id,
+            prompt.clone(),
+            "gpt-5.4-mini",
+        ))
+        .unwrap();
         let (broker_url, captured) =
             serve_once(http_response("200 OK", "application/json", &body)).await;
         let config = VmClientConfig::new(broker_url, "writ-vm-secret").unwrap();
 
-        let fetched = fetch_agent_run_prompt(&config, run_id).await.unwrap();
+        let (fetched_prompt, fetched_model) =
+            fetch_agent_run_config(&config, run_id).await.unwrap();
 
-        assert_eq!(fetched, prompt);
+        assert_eq!(fetched_prompt, prompt);
+        assert_eq!(fetched_model, "gpt-5.4-mini");
         let request = captured.lock().unwrap().clone();
         assert!(
             request.starts_with(
-                "GET /v1/agent-runs/00000000-0000-0000-0000-000000000501/prompt HTTP/1.1"
+                "GET /v1/agent-runs/00000000-0000-0000-0000-000000000501/config HTTP/1.1"
             ),
             "{request}"
         );
@@ -1237,7 +1243,7 @@ mod tests {
                 || request.contains("Authorization: Bearer writ-vm-secret"),
             "{request}"
         );
-        assert!(!format!("{fetched:?}").contains(prompt.as_str()));
+        assert!(!format!("{fetched_prompt:?}").contains(prompt.as_str()));
     }
 
     #[tokio::test]

@@ -16,7 +16,7 @@ use writ::agent_run::{
 use writ::core::AgentKind;
 use writ::vm_client::{
     VM_BROKER_TOKEN_ENV, VM_BROKER_URL_ENV, VmClientConfig, VmClientConfigError, VmGitCloneCommand,
-    VmWorkspaceInitCommand, clone_from_broker, fetch_agent_run_prompt, get_session_json,
+    VmWorkspaceInitCommand, clone_from_broker, fetch_agent_run_config, get_session_json,
     init_workspace_from_broker, upload_agent_run_outcome,
 };
 use writ::vm_git::{GitCloneRef, GitCloneRepo, WorkspaceWarmMode};
@@ -169,8 +169,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 fake_agent,
             } => {
                 let run_id = parse_agent_run_id(&run_id)?;
-                let prompt = fetch_agent_run_prompt(&config, run_id).await?;
-                run_stage_agent(agent, run_id, &prompt, &config, fake_agent.as_deref()).await?;
+                let (prompt, model) = fetch_agent_run_config(&config, run_id).await?;
+                run_stage_agent(
+                    agent,
+                    run_id,
+                    &prompt,
+                    &model,
+                    &config,
+                    fake_agent.as_deref(),
+                )
+                .await?;
             }
         },
     }
@@ -212,12 +220,13 @@ async fn run_stage_agent(
     agent: AgentKind,
     run_id: AgentRunId,
     prompt: &AgentPrompt,
+    model: &str,
     config: &VmClientConfig,
     fake_agent: Option<&Path>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let plan = match fake_agent {
         Some(program) => fake_agent_plan(agent, run_id, program)?,
-        None => agent_process_plan(agent, run_id, config)?,
+        None => agent_process_plan(agent, run_id, model, config)?,
     };
     let log_root = std::env::temp_dir().join("writ-vm-agent-runs");
     let outcome = run_agent_process(&plan, prompt, &log_root)?;
@@ -244,16 +253,18 @@ fn fake_agent_plan(
 fn agent_process_plan(
     agent: AgentKind,
     run_id: AgentRunId,
+    model: &str,
     config: &VmClientConfig,
 ) -> Result<AgentProcessPlan, Box<dyn std::error::Error>> {
     match agent {
-        AgentKind::Claude => claude_process_plan(run_id, config),
-        AgentKind::Codex => codex_process_plan(run_id, config),
+        AgentKind::Claude => claude_process_plan(run_id, model, config),
+        AgentKind::Codex => codex_process_plan(run_id, model, config),
     }
 }
 
 fn claude_process_plan(
     run_id: AgentRunId,
+    model: &str,
     config: &VmClientConfig,
 ) -> Result<AgentProcessPlan, Box<dyn std::error::Error>> {
     let claude_config_dir = std::env::temp_dir().join("writ-vm-claude-code");
@@ -265,7 +276,7 @@ fn claude_process_plan(
             OsString::from("--bare"),
             OsString::from("--print"),
             OsString::from("--model"),
-            OsString::from("haiku"),
+            OsString::from(model),
             OsString::from("--effort"),
             OsString::from("low"),
             OsString::from("--output-format"),
@@ -293,24 +304,28 @@ fn claude_process_plan(
 
 fn codex_process_plan(
     run_id: AgentRunId,
+    model: &str,
     config: &VmClientConfig,
 ) -> Result<AgentProcessPlan, Box<dyn std::error::Error>> {
-    let codex_home = std::env::temp_dir().join("writ-vm-codex");
-    std::fs::create_dir_all(&codex_home)?;
-    // Register a custom model provider so codex reads its bearer token from
-    // OPENAI_API_KEY (which we set to the broker bearer token below) instead
-    // of trying to read ~/.codex/auth.json. The default `openai` provider
-    // hardcodes auth.json lookup and cannot be overridden.
+    // Configure codex to treat the broker as an API-key-style provider:
+    // `env_key="OPENAI_API_KEY"` makes codex read the broker bearer from
+    // the env and send it as `Authorization: Bearer …`. The broker
+    // performs the real ChatGPT-OAuth swap on the host side
+    // (`Authorization`, `ChatGPT-Account-ID`, `X-OpenAI-Fedramp` are all
+    // injected upstream by `VmHttpOpenAiProxyService`). Inside the VM
+    // codex never goes down the ChatGPT-auth path and never tries to
+    // refresh against `auth.openai.com` (which we couldn't reach
+    // anyway).
     //
-    // We set supports_websockets=false because the broker exposes HTTP only;
-    // letting codex try wss:// first just wastes ~50s on retries.
+    // We set `supports_websockets=false` because the broker exposes
+    // HTTP only; letting codex try wss:// first just wastes ~50s on
+    // retries.
     let openai_base_url = format!("{}v1", config.broker_url().as_str());
     let provider_name_arg = "model_providers.writ-broker.name=\"writ broker\"";
     let provider_base_url_arg =
         format!("model_providers.writ-broker.base_url=\"{openai_base_url}\"");
     let provider_wire_api_arg = "model_providers.writ-broker.wire_api=\"responses\"";
     let provider_env_key_arg = "model_providers.writ-broker.env_key=\"OPENAI_API_KEY\"";
-    let provider_requires_auth_arg = "model_providers.writ-broker.requires_openai_auth=false";
     let provider_supports_ws_arg = "model_providers.writ-broker.supports_websockets=false";
     let model_provider_arg = "model_provider=\"writ-broker\"";
     Ok(AgentProcessPlan::new(
@@ -319,9 +334,9 @@ fn codex_process_plan(
         [
             OsString::from("exec"),
             OsString::from("--model"),
-            OsString::from("gpt-5"),
+            OsString::from(model),
             OsString::from("--config"),
-            OsString::from("model_reasoning_effort=minimal"),
+            OsString::from("model_reasoning_effort=low"),
             OsString::from("--config"),
             OsString::from("web_search=disabled"),
             OsString::from("--config"),
@@ -335,8 +350,6 @@ fn codex_process_plan(
             OsString::from("--config"),
             OsString::from(provider_env_key_arg),
             OsString::from("--config"),
-            OsString::from(provider_requires_auth_arg),
-            OsString::from("--config"),
             OsString::from(provider_supports_ws_arg),
             OsString::from("--config"),
             OsString::from(model_provider_arg),
@@ -346,8 +359,7 @@ fn codex_process_plan(
     )?
     .with_env_remove(VM_BROKER_URL_ENV)
     .with_env_remove(VM_BROKER_TOKEN_ENV)
-    .with_env("OPENAI_API_KEY", config.bearer_token().as_str())
-    .with_env("CODEX_HOME", codex_home.as_os_str()))
+    .with_env("OPENAI_API_KEY", config.bearer_token().as_str()))
 }
 
 impl From<WorkspaceWarmArg> for WorkspaceWarmMode {
@@ -474,7 +486,7 @@ mod tests {
         let run_id: AgentRunId = "00000000-0000-0000-0000-000000000302".parse().unwrap();
         let config = VmClientConfig::new("http://192.168.252.1:49152/", "writ-vm-secret").unwrap();
 
-        let plan = claude_process_plan(run_id, &config).unwrap();
+        let plan = claude_process_plan(run_id, "haiku", &config).unwrap();
 
         assert_eq!(plan.program(), std::path::Path::new("claude"));
         assert_eq!(
@@ -542,7 +554,7 @@ mod tests {
         let run_id: AgentRunId = "00000000-0000-0000-0000-000000000303".parse().unwrap();
         let config = VmClientConfig::new("http://192.168.252.1:49152/", "writ-vm-secret").unwrap();
 
-        let plan = codex_process_plan(run_id, &config).unwrap();
+        let plan = codex_process_plan(run_id, "gpt-5.4-mini", &config).unwrap();
 
         assert_eq!(plan.program(), std::path::Path::new("codex"));
         assert_eq!(
@@ -550,9 +562,9 @@ mod tests {
             &[
                 OsString::from("exec"),
                 OsString::from("--model"),
-                OsString::from("gpt-5"),
+                OsString::from("gpt-5.4-mini"),
                 OsString::from("--config"),
-                OsString::from("model_reasoning_effort=minimal"),
+                OsString::from("model_reasoning_effort=low"),
                 OsString::from("--config"),
                 OsString::from("web_search=disabled"),
                 OsString::from("--config"),
@@ -567,8 +579,6 @@ mod tests {
                 OsString::from("model_providers.writ-broker.wire_api=\"responses\""),
                 OsString::from("--config"),
                 OsString::from("model_providers.writ-broker.env_key=\"OPENAI_API_KEY\""),
-                OsString::from("--config"),
-                OsString::from("model_providers.writ-broker.requires_openai_auth=false"),
                 OsString::from("--config"),
                 OsString::from("model_providers.writ-broker.supports_websockets=false"),
                 OsString::from("--config"),
@@ -588,8 +598,8 @@ mod tests {
             env.get(&OsString::from("OPENAI_API_KEY"))
                 .map(|v| v.to_str().unwrap()),
             Some("writ-vm-secret"),
+            "OPENAI_API_KEY carries the broker bearer; the broker swaps it for the real ChatGPT credentials upstream",
         );
-        assert!(env.contains_key(&OsString::from("CODEX_HOME")));
 
         let removed: std::collections::HashSet<&OsString> = plan.env_remove().iter().collect();
         for key in [VM_BROKER_URL_ENV, VM_BROKER_TOKEN_ENV] {
@@ -598,9 +608,5 @@ mod tests {
                 "expected {key} to be removed from the Codex child env",
             );
         }
-        assert!(
-            !removed.contains(&OsString::from("OPENAI_API_KEY")),
-            "OPENAI_API_KEY must not be in env_remove: we set it explicitly to the broker bearer, and removing it would mask the set",
-        );
     }
 }

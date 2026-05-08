@@ -19,8 +19,8 @@ use tokio::task::JoinSet;
 
 use crate::agent_run::{
     AgentPrompt, AgentRunId, AgentRunOutcome, AgentRunStreamSummary, AgentRunStreamUpload,
-    VM_AGENT_RUN_OUTCOME_PATH_SUFFIX, VM_AGENT_RUN_PATH_PREFIX, VmAgentRunOutcomeUpload,
-    VmAgentRunPromptResponse,
+    VM_AGENT_RUN_OUTCOME_PATH_SUFFIX, VM_AGENT_RUN_PATH_PREFIX, VmAgentRunConfigResponse,
+    VmAgentRunOutcomeUpload,
 };
 use crate::audit::{
     AgentRunOutcomeAuditRecord, AuditError, ClaudeProxyAuditDecision, ClaudeProxyAuditRoute,
@@ -37,6 +37,10 @@ use crate::nix_cache::{
     NixCacheNarFileName, NixNarBodyHashError, NixNarCompression, NixNarHash, NixNarInfo,
     NixNarInfoError, NixNarSize, NixStoreHashPart, NixTrustedPublicKeys,
     parse_signed_narinfo_for_store_hash,
+};
+use crate::openai_chatgpt_auth::{
+    CHATGPT_OAUTH_REFRESH_LEEWAY_SECONDS, CHATGPT_OAUTH_REFRESH_URL, ChatgptOauthAuthority,
+    ChatgptOauthAuthorityConfig, ChatgptOauthError, ChatgptUpstreamHeaders, SystemClock,
 };
 use crate::secret::{SecretKey, SecretStore};
 use crate::server::{BrokerState, CapabilityOutcome, request_capability};
@@ -132,12 +136,23 @@ pub struct VmHttpOpenAiProxyService<S: SecretStore> {
     broker_state: Arc<BrokerState<S>>,
     config: VmHttpOpenAiProxyConfig,
     client: reqwest::Client,
+    /// Refresh authority for the ChatGPT-OAuth auth kind. Kept behind
+    /// an `Arc` so cloned services share a single in-memory cache and
+    /// refresh-mutex; that turns concurrent guest requests into one
+    /// upstream refresh rather than a thundering herd.
+    chatgpt_authority: Option<Arc<ChatgptOauthAuthority>>,
 }
 
 #[derive(Clone, Debug)]
 pub struct VmHttpAgentRunService {
-    prompts: Arc<Mutex<HashMap<AgentRunId, AgentPrompt>>>,
+    run_configs: Arc<Mutex<HashMap<AgentRunId, AgentRunInflight>>>,
     log_root: PathBuf,
+}
+
+#[derive(Clone, Debug)]
+struct AgentRunInflight {
+    prompt: AgentPrompt,
+    model: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -243,6 +258,7 @@ pub struct VmHttpOpenAiProxyConfig {
     upstream_base_url: reqwest::Url,
     auth_secret: SecretKey,
     auth_kind: VmHttpOpenAiProxyAuthKind,
+    chatgpt_refresh_url: reqwest::Url,
     timeout: std::time::Duration,
     max_request_bytes: usize,
     max_response_bytes: u64,
@@ -251,10 +267,15 @@ pub struct VmHttpOpenAiProxyConfig {
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum VmHttpOpenAiProxyAuthKind {
+    /// Static bearer token; the broker reads it from the secret store
+    /// and attaches it as `Authorization: Bearer …`. Suitable for
+    /// OpenAI API keys.
     AuthorizationBearer,
-    /// ChatGPT-login OAuth (refresh-token based) is reserved for a follow-up
-    /// PR; constructing a config with this auth kind currently fails with
-    /// [`VmHttpOpenAiProxyConfigError::UnsupportedAuthKind`].
+    /// ChatGPT-login OAuth: the secret store holds a `codex login`
+    /// auth.json blob. The broker keeps the access token fresh
+    /// against `https://auth.openai.com/oauth/token` and injects the
+    /// `ChatGPT-Account-ID` and (when applicable) `X-OpenAI-Fedramp`
+    /// headers expected by the Responses API.
     ChatgptOauth,
 }
 
@@ -343,8 +364,10 @@ pub enum VmHttpOpenAiProxyConfigError {
     MaxRequestBytesTooLarge,
     #[error("OpenAI proxy max response bytes must be greater than zero")]
     EmptyMaxResponseBytes,
-    #[error("OpenAI proxy auth kind {kind:?} is not yet supported in this binary")]
-    UnsupportedAuthKind { kind: VmHttpOpenAiProxyAuthKind },
+    #[error("OpenAI proxy ChatGPT refresh URL {raw:?} is invalid: {message}")]
+    InvalidChatgptRefreshUrl { raw: String, message: String },
+    #[error("OpenAI proxy ChatGPT refresh URL {raw:?} uses unsupported scheme {scheme:?}")]
+    UnsupportedChatgptRefreshScheme { raw: String, scheme: String },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -1015,14 +1038,85 @@ impl<S: SecretStore> VmHttpOpenAiProxyService<S> {
             .connect_timeout(config.timeout)
             .read_timeout(config.timeout)
             .build()?;
+        let chatgpt_authority = match config.auth_kind() {
+            VmHttpOpenAiProxyAuthKind::AuthorizationBearer => None,
+            VmHttpOpenAiProxyAuthKind::ChatgptOauth => {
+                let refresh_client = reqwest::Client::builder()
+                    .connect_timeout(config.timeout)
+                    .read_timeout(config.timeout)
+                    .build()?;
+                let authority_config = ChatgptOauthAuthorityConfig {
+                    secret_key: config.auth_secret().clone(),
+                    refresh_url: config.chatgpt_refresh_url().clone(),
+                    http_client: refresh_client,
+                    clock: Arc::new(SystemClock),
+                    leeway_seconds: CHATGPT_OAUTH_REFRESH_LEEWAY_SECONDS,
+                };
+                Some(Arc::new(ChatgptOauthAuthority::new(authority_config)))
+            }
+        };
         Ok(Self {
             broker_state,
             config,
             client,
+            chatgpt_authority,
         })
     }
 
-    fn upstream_request_builder(
+    async fn resolve_upstream_auth(&self) -> Result<UpstreamAuth, Box<VmHttpOpenAiProxyFetch>> {
+        match self.config.auth_kind() {
+            VmHttpOpenAiProxyAuthKind::AuthorizationBearer => {
+                let secret = match self
+                    .broker_state
+                    .secret_store()
+                    .get(self.config.auth_secret())
+                {
+                    Ok(Some(secret)) if !secret.is_empty() => secret,
+                    Ok(_) => {
+                        return Err(Box::new(openai_proxy_auth_failure(
+                            "OpenAI proxy auth missing",
+                            "upstream auth missing",
+                        )));
+                    }
+                    Err(err) => {
+                        eprintln!("VM HTTP OpenAI proxy auth secret load failed: {err}");
+                        return Err(Box::new(openai_proxy_auth_failure(
+                            "OpenAI proxy auth failed",
+                            "upstream auth load failed",
+                        )));
+                    }
+                };
+                Ok(UpstreamAuth::Bearer(secret))
+            }
+            VmHttpOpenAiProxyAuthKind::ChatgptOauth => {
+                let authority = self
+                    .chatgpt_authority
+                    .as_ref()
+                    .expect("ChatGPT OAuth service constructed with authority");
+                let store = self.broker_state.secret_store();
+                match authority.current_headers(store).await {
+                    Ok(headers) => Ok(UpstreamAuth::ChatgptOauth(headers)),
+                    Err(err) => {
+                        let label = err.audit_error_label();
+                        eprintln!("VM HTTP OpenAI proxy ChatGPT auth resolution failed: {err}");
+                        let body = match err {
+                            ChatgptOauthError::LoginRequired
+                            | ChatgptOauthError::BundleMalformed(_) => {
+                                "OpenAI proxy ChatGPT login required"
+                            }
+                            ChatgptOauthError::RefreshTransient(_) => {
+                                "OpenAI proxy ChatGPT refresh failed"
+                            }
+                            ChatgptOauthError::SecretStore(_) => "OpenAI proxy auth failed",
+                        };
+                        Err(Box::new(openai_proxy_auth_failure(body, label)))
+                    }
+                }
+            }
+        }
+    }
+
+    async fn upstream_request_builder(
         &self,
         request: &VmHttpRequest,
         body: Vec<u8>,
@@ -1049,36 +1143,10 @@ impl<S: SecretStore> VmHttpOpenAiProxyService<S> {
             }));
         };
         let upstream_url = url.to_string();
-        let secret = match self
-            .broker_state
-            .secret_store()
-            .get(self.config.auth_secret())
-        {
-            Ok(Some(secret)) if !secret.is_empty() => secret,
-            Ok(_) => {
-                let response =
-                    VmHttpResponse::text(VmHttpStatus::BadGateway, "OpenAI proxy auth missing");
-                return Err(Box::new(VmHttpOpenAiProxyFetch {
-                    response_bytes: response.body.len() as u64,
-                    response,
-                    upstream_url: Some(upstream_url),
-                    upstream_status: None,
-                    error: Some("upstream auth missing"),
-                }));
-            }
-            Err(err) => {
-                eprintln!("VM HTTP OpenAI proxy auth secret load failed: {err}");
-                let response =
-                    VmHttpResponse::text(VmHttpStatus::BadGateway, "OpenAI proxy auth failed");
-                return Err(Box::new(VmHttpOpenAiProxyFetch {
-                    response_bytes: response.body.len() as u64,
-                    response,
-                    upstream_url: Some(upstream_url),
-                    upstream_status: None,
-                    error: Some("upstream auth load failed"),
-                }));
-            }
-        };
+        let upstream_auth = self.resolve_upstream_auth().await.map_err(|mut fetch| {
+            fetch.upstream_url = Some(upstream_url.clone());
+            fetch
+        })?;
 
         let mut builder = self.client.request(openai_proxy_route_method(route), url);
         if !body.is_empty() {
@@ -1087,14 +1155,7 @@ impl<S: SecretStore> VmHttpOpenAiProxyService<S> {
         for header in headers {
             builder = builder.header(header.name, header.value);
         }
-        builder = match self.config.auth_kind() {
-            VmHttpOpenAiProxyAuthKind::AuthorizationBearer => builder.bearer_auth(secret),
-            VmHttpOpenAiProxyAuthKind::ChatgptOauth => {
-                unreachable!(
-                    "ChatgptOauth auth kind is rejected at config construction in this build"
-                )
-            }
-        };
+        builder = upstream_auth.apply_to(builder);
         Ok((upstream_url, builder))
     }
 
@@ -1104,10 +1165,11 @@ impl<S: SecretStore> VmHttpOpenAiProxyService<S> {
         body: Vec<u8>,
         headers: Vec<OpenAiProxyForwardHeader>,
     ) -> VmHttpOpenAiProxyFetch {
-        let (upstream_url, builder) = match self.upstream_request_builder(request, body, headers) {
-            Ok(parts) => parts,
-            Err(fetch) => return *fetch,
-        };
+        let (upstream_url, builder) =
+            match self.upstream_request_builder(request, body, headers).await {
+                Ok(parts) => parts,
+                Err(fetch) => return *fetch,
+            };
 
         let response = match builder.send().await {
             Ok(response) => response,
@@ -1171,6 +1233,7 @@ impl<S: SecretStore> VmHttpOpenAiProxyService<S> {
     ) -> Result<VmHttpOpenAiProxyStream<S>, VmHttpOpenAiProxyFetch> {
         let (upstream_url, builder) = self
             .upstream_request_builder(request, body, headers)
+            .await
             .map_err(|fetch| *fetch)?;
         let response = match builder.send().await {
             Ok(response) => response,
@@ -1204,14 +1267,25 @@ impl<S: SecretStore> VmHttpOpenAiProxyService<S> {
 
     fn upstream_url(&self, target: &str) -> Option<reqwest::Url> {
         let path = openai_proxy_target_path(target);
+        // ChatGPT-OAuth requests target `https://chatgpt.com/backend-api/codex/`
+        // which exposes endpoints as bare names (e.g. `/codex/responses`),
+        // whereas `https://api.openai.com/` exposes them under the `v1/`
+        // prefix. The broker's `upstream_base_url` already encodes the
+        // path-prefix portion (`/codex/` or `/v1/`); the per-route relative
+        // joined here must match the wire shape codex itself uses for that
+        // auth mode (see `model-provider-info`'s `to_api_provider`).
+        let prefix = match self.config.auth_kind() {
+            VmHttpOpenAiProxyAuthKind::AuthorizationBearer => "v1/",
+            VmHttpOpenAiProxyAuthKind::ChatgptOauth => "",
+        };
         let relative: Cow<'static, str> = if path == VM_OPENAI_RESPONSES_PATH {
-            "v1/responses".into()
+            format!("{prefix}responses").into()
         } else if path == VM_OPENAI_MODELS_PATH {
-            "v1/models".into()
+            format!("{prefix}models").into()
         } else if let Some(id) = openai_proxy_response_cancel_id(path) {
-            format!("v1/responses/{id}/cancel").into()
+            format!("{prefix}responses/{id}/cancel").into()
         } else if let Some(id) = openai_proxy_model_id(path) {
-            format!("v1/models/{id}").into()
+            format!("{prefix}models/{id}").into()
         } else {
             return None;
         };
@@ -1242,7 +1316,49 @@ impl<S: SecretStore> Clone for VmHttpOpenAiProxyService<S> {
             broker_state: Arc::clone(&self.broker_state),
             config: self.config.clone(),
             client: self.client.clone(),
+            chatgpt_authority: self.chatgpt_authority.as_ref().map(Arc::clone),
         }
+    }
+}
+
+/// Resolved upstream authentication for a single OpenAI proxy request.
+///
+/// We resolve into a small enum so the request builder applies the
+/// scheme-specific headers in one place. The `Bearer` variant matches a
+/// static API key; the `ChatgptOauth` variant carries the freshly
+/// rotated access token plus the ChatGPT-specific response headers
+/// (`ChatGPT-Account-ID`, optional `X-OpenAI-Fedramp`).
+enum UpstreamAuth {
+    Bearer(String),
+    ChatgptOauth(ChatgptUpstreamHeaders),
+}
+
+impl UpstreamAuth {
+    fn apply_to(self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match self {
+            UpstreamAuth::Bearer(secret) => builder.bearer_auth(secret),
+            UpstreamAuth::ChatgptOauth(headers) => {
+                let mut builder = builder.bearer_auth(headers.access_token);
+                if let Some(account_id) = headers.account_id {
+                    builder = builder.header("ChatGPT-Account-ID", account_id);
+                }
+                if headers.is_fedramp_account {
+                    builder = builder.header("X-OpenAI-Fedramp", "true");
+                }
+                builder
+            }
+        }
+    }
+}
+
+fn openai_proxy_auth_failure(body: &'static str, label: &'static str) -> VmHttpOpenAiProxyFetch {
+    let response = VmHttpResponse::text(VmHttpStatus::BadGateway, body);
+    VmHttpOpenAiProxyFetch {
+        response_bytes: response.body.len() as u64,
+        response,
+        upstream_url: None,
+        upstream_status: None,
+        error: Some(label),
     }
 }
 
@@ -1314,22 +1430,33 @@ impl<S: SecretStore> VmHttpOpenAiProxyStream<S> {
 impl VmHttpAgentRunService {
     pub fn with_log_root(log_root: impl Into<PathBuf>) -> Self {
         Self {
-            prompts: Arc::new(Mutex::new(HashMap::new())),
+            run_configs: Arc::new(Mutex::new(HashMap::new())),
             log_root: log_root.into(),
         }
     }
 
-    pub fn insert_prompt(&self, run_id: AgentRunId, prompt: AgentPrompt) {
-        self.prompts
+    pub fn insert_run_config(
+        &self,
+        run_id: AgentRunId,
+        prompt: AgentPrompt,
+        model: impl Into<String>,
+    ) {
+        self.run_configs
             .lock()
-            .expect("agent run prompt lock should not be poisoned")
-            .insert(run_id, prompt);
+            .expect("agent run config lock should not be poisoned")
+            .insert(
+                run_id,
+                AgentRunInflight {
+                    prompt,
+                    model: model.into(),
+                },
+            );
     }
 
-    fn take_prompt(&self, run_id: AgentRunId) -> Option<AgentPrompt> {
-        self.prompts
+    fn take_run_config(&self, run_id: AgentRunId) -> Option<AgentRunInflight> {
+        self.run_configs
             .lock()
-            .expect("agent run prompt lock should not be poisoned")
+            .expect("agent run config lock should not be poisoned")
             .remove(&run_id)
     }
 
@@ -1751,9 +1878,6 @@ impl VmHttpOpenAiProxyConfig {
         max_request_bytes: u64,
         max_response_bytes: u64,
     ) -> Result<Self, VmHttpOpenAiProxyConfigError> {
-        if matches!(auth_kind, VmHttpOpenAiProxyAuthKind::ChatgptOauth) {
-            return Err(VmHttpOpenAiProxyConfigError::UnsupportedAuthKind { kind: auth_kind });
-        }
         let raw = upstream_base_url.as_ref();
         if raw.is_empty() {
             return Err(VmHttpOpenAiProxyConfigError::EmptyUpstreamUrl);
@@ -1795,14 +1919,42 @@ impl VmHttpOpenAiProxyConfig {
             let path = format!("{}/", url.path());
             url.set_path(&path);
         }
+        let chatgpt_refresh_url = reqwest::Url::parse(CHATGPT_OAUTH_REFRESH_URL)
+            .expect("CHATGPT_OAUTH_REFRESH_URL is a static, well-formed absolute URL");
         Ok(Self {
             upstream_base_url: url,
             auth_secret,
             auth_kind,
+            chatgpt_refresh_url,
             timeout,
             max_request_bytes,
             max_response_bytes,
         })
+    }
+
+    /// Override the ChatGPT-OAuth refresh endpoint. Tests use this to
+    /// point at a `wiremock` server; production keeps the default.
+    pub fn with_chatgpt_refresh_url(
+        mut self,
+        raw: impl AsRef<str>,
+    ) -> Result<Self, VmHttpOpenAiProxyConfigError> {
+        let raw = raw.as_ref();
+        let url = reqwest::Url::parse(raw).map_err(|err| {
+            VmHttpOpenAiProxyConfigError::InvalidChatgptRefreshUrl {
+                raw: raw.to_string(),
+                message: err.to_string(),
+            }
+        })?;
+        if !matches!(url.scheme(), "http" | "https") {
+            return Err(
+                VmHttpOpenAiProxyConfigError::UnsupportedChatgptRefreshScheme {
+                    raw: raw.to_string(),
+                    scheme: url.scheme().to_string(),
+                },
+            );
+        }
+        self.chatgpt_refresh_url = url;
+        Ok(self)
     }
 
     pub fn upstream_base_url(&self) -> &reqwest::Url {
@@ -1815,6 +1967,10 @@ impl VmHttpOpenAiProxyConfig {
 
     pub fn auth_kind(&self) -> VmHttpOpenAiProxyAuthKind {
         self.auth_kind
+    }
+
+    pub fn chatgpt_refresh_url(&self) -> &reqwest::Url {
+        &self.chatgpt_refresh_url
     }
 
     pub fn max_request_bytes(&self) -> usize {
@@ -2428,7 +2584,7 @@ where
             .into();
     }
 
-    if let Some(run_id) = parse_agent_run_prompt_target(&request.target) {
+    if let Some(run_id) = parse_agent_run_config_target(&request.target) {
         let Some(service) = services.agent_runs else {
             return VmHttpResponse::text(VmHttpStatus::NotFound, "not found").into();
         };
@@ -2436,7 +2592,7 @@ where
             return VmHttpResponse::text(VmHttpStatus::MethodNotAllowed, "method not allowed")
                 .into();
         }
-        return route_agent_run_prompt_request(run_id, &service).into();
+        return route_agent_run_config_request(run_id, &service).into();
     }
 
     if let Some(run_id) = parse_agent_run_outcome_target(&request.target) {
@@ -4128,11 +4284,11 @@ fn route_session_endpoint(session: &VmHttpSession, request: &VmHttpRequest) -> V
     }
 }
 
-fn parse_agent_run_prompt_target(target: &str) -> Option<AgentRunId> {
+fn parse_agent_run_config_target(target: &str) -> Option<AgentRunId> {
     let suffix = target
         .strip_prefix(VM_AGENT_RUN_PATH_PREFIX)?
         .strip_prefix('/')?;
-    let raw_id = suffix.strip_suffix("/prompt")?;
+    let raw_id = suffix.strip_suffix("/config")?;
     if raw_id.contains('/') {
         return None;
     }
@@ -4150,16 +4306,16 @@ fn parse_agent_run_outcome_target(target: &str) -> Option<AgentRunId> {
     raw_id.parse().ok()
 }
 
-fn route_agent_run_prompt_request(
+fn route_agent_run_config_request(
     run_id: AgentRunId,
     service: &VmHttpAgentRunService,
 ) -> VmHttpResponse {
-    let Some(prompt) = service.take_prompt(run_id) else {
+    let Some(inflight) = service.take_run_config(run_id) else {
         return VmHttpResponse::text(VmHttpStatus::NotFound, "not found");
     };
     VmHttpResponse::json(
         VmHttpStatus::Ok,
-        &VmAgentRunPromptResponse::new(run_id, prompt),
+        &VmAgentRunConfigResponse::new(run_id, inflight.prompt, inflight.model),
     )
 }
 
@@ -6072,8 +6228,46 @@ esac
     }
 
     #[test]
-    fn openai_proxy_config_rejects_chatgpt_oauth_in_this_build() {
-        let secret = SecretKey::new("openai-api-key").unwrap();
+    fn openai_proxy_config_accepts_chatgpt_oauth_and_defaults_refresh_url() {
+        let secret = SecretKey::new("openai-chatgpt-auth").unwrap();
+        let config = VmHttpOpenAiProxyConfig::new(
+            "https://api.openai.com/v1/",
+            secret,
+            VmHttpOpenAiProxyAuthKind::ChatgptOauth,
+            std::time::Duration::from_secs(5),
+            1024,
+            1024,
+        )
+        .unwrap();
+        assert_eq!(
+            config.chatgpt_refresh_url().as_str(),
+            CHATGPT_OAUTH_REFRESH_URL,
+        );
+    }
+
+    #[test]
+    fn openai_proxy_config_with_chatgpt_refresh_url_overrides_default() {
+        let secret = SecretKey::new("openai-chatgpt-auth").unwrap();
+        let config = VmHttpOpenAiProxyConfig::new(
+            "https://api.openai.com/v1/",
+            secret,
+            VmHttpOpenAiProxyAuthKind::ChatgptOauth,
+            std::time::Duration::from_secs(5),
+            1024,
+            1024,
+        )
+        .unwrap()
+        .with_chatgpt_refresh_url("https://example.test/refresh")
+        .unwrap();
+        assert_eq!(
+            config.chatgpt_refresh_url().as_str(),
+            "https://example.test/refresh",
+        );
+    }
+
+    #[test]
+    fn openai_proxy_config_with_chatgpt_refresh_url_rejects_invalid_url() {
+        let secret = SecretKey::new("openai-chatgpt-auth").unwrap();
         let err = VmHttpOpenAiProxyConfig::new(
             "https://api.openai.com/v1/",
             secret,
@@ -6082,12 +6276,32 @@ esac
             1024,
             1024,
         )
+        .unwrap()
+        .with_chatgpt_refresh_url("not-a-url")
         .unwrap_err();
         assert!(matches!(
             err,
-            VmHttpOpenAiProxyConfigError::UnsupportedAuthKind {
-                kind: VmHttpOpenAiProxyAuthKind::ChatgptOauth,
-            }
+            VmHttpOpenAiProxyConfigError::InvalidChatgptRefreshUrl { .. }
+        ));
+    }
+
+    #[test]
+    fn openai_proxy_config_with_chatgpt_refresh_url_rejects_unsupported_scheme() {
+        let secret = SecretKey::new("openai-chatgpt-auth").unwrap();
+        let err = VmHttpOpenAiProxyConfig::new(
+            "https://api.openai.com/v1/",
+            secret,
+            VmHttpOpenAiProxyAuthKind::ChatgptOauth,
+            std::time::Duration::from_secs(5),
+            1024,
+            1024,
+        )
+        .unwrap()
+        .with_chatgpt_refresh_url("ftp://example.test/refresh")
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            VmHttpOpenAiProxyConfigError::UnsupportedChatgptRefreshScheme { .. }
         ));
     }
 
@@ -6430,23 +6644,24 @@ esac
     }
 
     #[test]
-    fn agent_run_prompt_route_returns_prompt_once() {
+    fn agent_run_config_route_returns_prompt_and_model_once() {
         let temp = tempfile::tempdir().unwrap();
         let service = VmHttpAgentRunService::with_log_root(temp.path().join("agent-runs"));
         let run_id: AgentRunId = "00000000-0000-0000-0000-000000000401".parse().unwrap();
         let prompt = AgentPrompt::new("SECRET prompt");
-        service.insert_prompt(run_id, prompt.clone());
+        service.insert_run_config(run_id, prompt.clone(), "gpt-5.4-mini");
 
-        let response = route_agent_run_prompt_request(run_id, &service);
+        let response = route_agent_run_config_request(run_id, &service);
 
         assert_eq!(response.status, VmHttpStatus::Ok);
-        let body: VmAgentRunPromptResponse = serde_json::from_slice(&response.body).unwrap();
+        let body: VmAgentRunConfigResponse = serde_json::from_slice(&response.body).unwrap();
         assert_eq!(body.run_id(), run_id);
         assert_eq!(body.prompt(), &prompt);
+        assert_eq!(body.model(), "gpt-5.4-mini");
         let debug = format!("{body:?}");
         assert!(!debug.contains(prompt.as_str()), "{debug}");
 
-        let second = route_agent_run_prompt_request(run_id, &service);
+        let second = route_agent_run_config_request(run_id, &service);
         assert_eq!(second.status, VmHttpStatus::NotFound);
     }
 
@@ -7617,6 +7832,276 @@ esac
         assert_eq!(entries[0].2, Some(404));
     }
 
+    fn b64url_for_test(bytes: &[u8]) -> String {
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+    }
+
+    fn jwt_for_test(payload: &serde_json::Value) -> String {
+        let header = b64url_for_test(br#"{"alg":"HS256","typ":"JWT"}"#);
+        let body = b64url_for_test(serde_json::to_vec(payload).unwrap().as_slice());
+        let sig = b64url_for_test(b"sig");
+        format!("{header}.{body}.{sig}")
+    }
+
+    fn chatgpt_auth_bundle_json(
+        access_exp_unix: i64,
+        account_id: &str,
+        fedramp: bool,
+        refresh_token: &str,
+    ) -> String {
+        let access_token = jwt_for_test(&serde_json::json!({"exp": access_exp_unix}));
+        let id_token = jwt_for_test(&serde_json::json!({
+            "exp": access_exp_unix + 86400,
+            "https://api.openai.com/auth": {
+                "chatgpt_account_id": account_id,
+                "chatgpt_account_is_fedramp": fedramp,
+            }
+        }));
+        serde_json::to_string(&serde_json::json!({
+            "auth_mode": "chatgpt",
+            "OPENAI_API_KEY": serde_json::Value::Null,
+            "tokens": {
+                "id_token": id_token,
+                "access_token": access_token,
+                "refresh_token": refresh_token,
+                "account_id": account_id,
+            },
+            "last_refresh": "2026-01-01T00:00:00Z",
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn openai_proxy_chatgpt_oauth_injects_bearer_account_and_fedramp_headers() {
+        let upstream_body = br#"{"id":"resp_xyz","output":[]}"#;
+        let (upstream_url, captured) = serve_raw_http_once(raw_http_response_with_headers(
+            "200 OK",
+            "application/json",
+            &[("x-request-id", "req_123")],
+            upstream_body,
+        ))
+        .await;
+        let github = MockServer::start().await;
+        let secret_key = SecretKey::new("openai-chatgpt-auth").unwrap();
+        let far_future = time::OffsetDateTime::now_utc().unix_timestamp() + 3600;
+        let bundle =
+            chatgpt_auth_bundle_json(far_future, "acct-rotated-7", true, "refresh-token-123");
+        let state =
+            make_broker_state_with_extra_secret(&github, Some((secret_key.clone(), &bundle)));
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::LOCALHOST, 32).unwrap());
+        open_audit_session(&state, session.session_id());
+        let service = VmHttpOpenAiProxyService::new(
+            Arc::clone(&state),
+            VmHttpOpenAiProxyConfig::new(
+                upstream_url,
+                secret_key,
+                VmHttpOpenAiProxyAuthKind::ChatgptOauth,
+                std::time::Duration::from_secs(5),
+                1024,
+                1024,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let request = VmHttpRequest::new(
+            "POST",
+            VM_OPENAI_RESPONSES_PATH,
+            Some(bearer(token().as_str())),
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 34570)),
+        );
+
+        let response = route_openai_proxy_request(
+            &session,
+            &request,
+            br#"{"model":"gpt-5"}"#.to_vec(),
+            &service,
+        )
+        .await
+        .into_buffered();
+
+        assert_eq!(response.status, VmHttpStatus::Upstream(200));
+        let upstream_request = captured.lock().unwrap().clone();
+        let lower = upstream_request.to_ascii_lowercase();
+        // ChatGPT-OAuth upstreams expose bare paths under
+        // `/backend-api/codex/`; the broker joins `responses` to
+        // `upstream_base_url`, which here resolves to `/responses`.
+        assert!(
+            upstream_request.starts_with("POST /responses HTTP/1.1"),
+            "{upstream_request}"
+        );
+        // Authorization carries the JWT access_token from the bundle, not a static API key.
+        assert!(
+            lower.contains("authorization: bearer "),
+            "{upstream_request}"
+        );
+        assert!(
+            !lower.contains("authorization: bearer host-openai-key"),
+            "{upstream_request}"
+        );
+        assert!(
+            lower.contains("chatgpt-account-id: acct-rotated-7"),
+            "{upstream_request}"
+        );
+        assert!(
+            lower.contains("x-openai-fedramp: true"),
+            "{upstream_request}"
+        );
+        // The dummy guest bearer must not leak upstream.
+        assert!(
+            !upstream_request.contains(token().as_str()),
+            "{upstream_request}"
+        );
+    }
+
+    #[tokio::test]
+    async fn openai_proxy_chatgpt_oauth_refreshes_stale_token_against_override_url() {
+        let upstream_body = br#"{"id":"resp_xyz","output":[]}"#;
+        let (upstream_url, captured) = serve_raw_http_once(raw_http_response_with_headers(
+            "200 OK",
+            "application/json",
+            &[],
+            upstream_body,
+        ))
+        .await;
+        let refresh_server = MockServer::start().await;
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let stale_exp = now - 60;
+        let fresh_access_token = jwt_for_test(&serde_json::json!({"exp": now + 3600}));
+        let fresh_id_token = jwt_for_test(&serde_json::json!({
+            "exp": now + 86400,
+            "https://api.openai.com/auth": {
+                "chatgpt_account_id": "acct-after-refresh",
+                "chatgpt_account_is_fedramp": false,
+            }
+        }));
+        Mock::given(method("POST"))
+            .and(path("/oauth/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id_token": fresh_id_token,
+                "access_token": fresh_access_token,
+                "refresh_token": "refresh-rotated",
+            })))
+            .expect(1)
+            .mount(&refresh_server)
+            .await;
+
+        let github = MockServer::start().await;
+        let secret_key = SecretKey::new("openai-chatgpt-auth").unwrap();
+        let bundle = chatgpt_auth_bundle_json(stale_exp, "acct-before", false, "refresh-stale");
+        let state =
+            make_broker_state_with_extra_secret(&github, Some((secret_key.clone(), &bundle)));
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::LOCALHOST, 32).unwrap());
+        open_audit_session(&state, session.session_id());
+        let service = VmHttpOpenAiProxyService::new(
+            Arc::clone(&state),
+            VmHttpOpenAiProxyConfig::new(
+                upstream_url,
+                secret_key.clone(),
+                VmHttpOpenAiProxyAuthKind::ChatgptOauth,
+                std::time::Duration::from_secs(5),
+                1024,
+                1024,
+            )
+            .unwrap()
+            .with_chatgpt_refresh_url(format!("{}/oauth/token", refresh_server.uri()))
+            .unwrap(),
+        )
+        .unwrap();
+        let request = VmHttpRequest::new(
+            "POST",
+            VM_OPENAI_RESPONSES_PATH,
+            Some(bearer(token().as_str())),
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 34571)),
+        );
+
+        let response = route_openai_proxy_request(
+            &session,
+            &request,
+            br#"{"model":"gpt-5"}"#.to_vec(),
+            &service,
+        )
+        .await
+        .into_buffered();
+
+        assert_eq!(response.status, VmHttpStatus::Upstream(200));
+        let upstream_request = captured.lock().unwrap().clone();
+        let lower = upstream_request.to_ascii_lowercase();
+        assert!(
+            lower.contains(
+                &format!("authorization: bearer {fresh_access_token}").to_ascii_lowercase()
+            ),
+            "{upstream_request}"
+        );
+        // The id_token's account_id rotated on refresh; we must use the new one.
+        assert!(
+            lower.contains("chatgpt-account-id: acct-after-refresh"),
+            "{upstream_request}"
+        );
+        assert!(!lower.contains("acct-before"), "{upstream_request}");
+        // Stored bundle should now carry the rotated tokens.
+        let raw = state
+            .secret_store()
+            .get(&secret_key)
+            .unwrap()
+            .expect("secret persisted");
+        let stored: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(
+            stored["tokens"]["access_token"].as_str().unwrap(),
+            fresh_access_token,
+        );
+        assert_eq!(
+            stored["tokens"]["refresh_token"].as_str().unwrap(),
+            "refresh-rotated",
+        );
+    }
+
+    #[tokio::test]
+    async fn openai_proxy_chatgpt_oauth_returns_502_with_login_required_when_secret_missing() {
+        let github = MockServer::start().await;
+        let secret_key = SecretKey::new("openai-chatgpt-auth").unwrap();
+        let state = make_broker_state(&github);
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::LOCALHOST, 32).unwrap());
+        open_audit_session(&state, session.session_id());
+        let service = VmHttpOpenAiProxyService::new(
+            Arc::clone(&state),
+            VmHttpOpenAiProxyConfig::new(
+                "http://127.0.0.1:9/",
+                secret_key,
+                VmHttpOpenAiProxyAuthKind::ChatgptOauth,
+                std::time::Duration::from_millis(50),
+                1024,
+                1024,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let request = VmHttpRequest::new(
+            "POST",
+            VM_OPENAI_RESPONSES_PATH,
+            Some(bearer(token().as_str())),
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 34572)),
+        );
+
+        let response = route_openai_proxy_request(
+            &session,
+            &request,
+            br#"{"model":"gpt-5"}"#.to_vec(),
+            &service,
+        )
+        .await
+        .into_buffered();
+
+        assert_eq!(response.status, VmHttpStatus::BadGateway);
+        let entries = state
+            .audit
+            .list_openai_proxy_requests_for_session_for_test(session.session_id())
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, OpenAiProxyAuditRoute::Responses);
+        assert_eq!(entries[0].1, OpenAiProxyAuditDecision::Allow);
+        assert_eq!(entries[0].2, Some(502));
+    }
+
     async fn route_nix_cache_with_service(
         session: &VmHttpSession,
         method: &str,
@@ -8733,10 +9218,10 @@ esac
     }
 
     #[tokio::test]
-    async fn disabled_agent_run_prompt_route_is_not_found() {
+    async fn disabled_agent_run_config_route_is_not_found() {
         let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(10, 1, 2, 0), 24).unwrap());
         let run_id: AgentRunId = "00000000-0000-0000-0000-000000000402".parse().unwrap();
-        let target = crate::agent_run::vm_agent_run_prompt_path(run_id);
+        let target = crate::agent_run::vm_agent_run_config_path(run_id);
         let request = VmHttpRequest::new(
             "GET",
             &target,
