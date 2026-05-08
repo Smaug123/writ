@@ -3783,10 +3783,6 @@ fn openai_proxy_forward_headers(
     let mut saw_content_type = false;
     let mut saw_accept = false;
     let mut saw_user_agent = false;
-    let mut saw_openai_organization = false;
-    let mut saw_openai_project = false;
-    let openai_organization_name = reqwest::header::HeaderName::from_static("openai-organization");
-    let openai_project_name = reqwest::header::HeaderName::from_static("openai-project");
 
     for header in headers {
         let Some(name) = openai_proxy_forward_header_name(&header.name, auth_kind) else {
@@ -3798,10 +3794,6 @@ fn openai_proxy_forward_headers(
             std::mem::replace(&mut saw_accept, true)
         } else if name == reqwest::header::USER_AGENT {
             std::mem::replace(&mut saw_user_agent, true)
-        } else if name == openai_organization_name {
-            std::mem::replace(&mut saw_openai_organization, true)
-        } else if name == openai_project_name {
-            std::mem::replace(&mut saw_openai_project, true)
         } else {
             unreachable!("OpenAI proxy forward header classifier returned an unknown header")
         };
@@ -3819,11 +3811,12 @@ fn openai_proxy_forward_header_name(
     raw: &str,
     _auth_kind: VmHttpOpenAiProxyAuthKind,
 ) -> Option<reqwest::header::HeaderName> {
-    // Allowlist only. The broker decides which routing/observability headers
-    // (`openai-organization`, `openai-project`) to forward; everything else
-    // is dropped so the guest can't smuggle authentication or feature flags
-    // through. The Authorization header is injected by the broker itself
-    // and is never forwarded from the guest.
+    // Allowlist only. Anything that influences upstream auth, billing scope,
+    // or feature flags is dropped: `Authorization` is injected by the broker,
+    // and `OpenAI-Organization`/`OpenAI-Project` are dropped because a host
+    // secret with multi-org/-project access would otherwise let the guest
+    // pick the upstream scope. If the broker ever needs to pin one, it must
+    // come from host config and be injected host-side.
     if raw.eq_ignore_ascii_case("content-type") {
         return Some(reqwest::header::CONTENT_TYPE);
     }
@@ -3832,14 +3825,6 @@ fn openai_proxy_forward_header_name(
     }
     if raw.eq_ignore_ascii_case("user-agent") {
         return Some(reqwest::header::USER_AGENT);
-    }
-    if raw.eq_ignore_ascii_case("openai-organization") {
-        return Some(reqwest::header::HeaderName::from_static(
-            "openai-organization",
-        ));
-    }
-    if raw.eq_ignore_ascii_case("openai-project") {
-        return Some(reqwest::header::HeaderName::from_static("openai-project"));
     }
     None
 }
@@ -6173,10 +6158,60 @@ esac
         assert!(names.iter().any(|n| n == "content-type"));
         assert!(names.iter().any(|n| n == "accept"));
         assert!(names.iter().any(|n| n == "user-agent"));
-        assert!(names.iter().any(|n| n == "openai-organization"));
-        assert!(names.iter().any(|n| n == "openai-project"));
+        assert!(!names.iter().any(|n| n == "openai-organization"));
+        assert!(!names.iter().any(|n| n == "openai-project"));
         assert!(!names.iter().any(|n| n == "authorization"));
         assert!(!names.iter().any(|n| n == "cookie"));
+    }
+
+    #[test]
+    fn openai_proxy_forward_headers_drops_guest_org_and_project_for_all_auth_kinds() {
+        // Threat: the host secret may have access to multiple OpenAI
+        // organizations or projects. If we forwarded guest-supplied
+        // `OpenAI-Organization`/`OpenAI-Project` headers we'd let the guest
+        // pick the upstream auth/billing scope. These must be dropped — like
+        // `Authorization` — and any host-side scoping has to be injected by
+        // the broker, never trusted from the guest.
+        let headers = vec![
+            VmHttpHeader {
+                name: "Content-Type".into(),
+                value: "application/json".into(),
+            },
+            VmHttpHeader {
+                name: "OpenAI-Organization".into(),
+                value: "org-attacker".into(),
+            },
+            VmHttpHeader {
+                name: "OpenAI-Project".into(),
+                value: "proj-attacker".into(),
+            },
+        ];
+        for auth_kind in [
+            VmHttpOpenAiProxyAuthKind::AuthorizationBearer,
+            VmHttpOpenAiProxyAuthKind::ChatgptOauth,
+        ] {
+            let forwarded = openai_proxy_forward_headers(&headers, auth_kind).unwrap();
+            let names: Vec<_> = forwarded
+                .iter()
+                .map(|h| h.name.as_str().to_owned())
+                .collect();
+            assert!(
+                !names
+                    .iter()
+                    .any(|n| n.eq_ignore_ascii_case("openai-organization")),
+                "{auth_kind:?}: guest-supplied OpenAI-Organization must not be forwarded",
+            );
+            assert!(
+                !names
+                    .iter()
+                    .any(|n| n.eq_ignore_ascii_case("openai-project")),
+                "{auth_kind:?}: guest-supplied OpenAI-Project must not be forwarded",
+            );
+            assert!(
+                names.iter().any(|n| n.eq_ignore_ascii_case("content-type")),
+                "{auth_kind:?}: Content-Type should still pass through",
+            );
+        }
     }
 
     #[test]
@@ -7703,8 +7738,11 @@ esac
             lower.contains("authorization: bearer host-openai-key"),
             "{upstream_request}"
         );
+        // Guest-supplied OpenAI-Organization must never reach upstream: a
+        // multi-org host secret would otherwise let the guest pick the
+        // billing/auth scope.
         assert!(
-            lower.contains("openai-organization: org-guest"),
+            !lower.contains("openai-organization:"),
             "{upstream_request}"
         );
         assert!(
