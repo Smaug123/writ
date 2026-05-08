@@ -371,10 +371,10 @@ mod process_runner {
             if let Some(cwd) = &plan.cwd {
                 command.current_dir(cwd);
             }
-            command.envs(plan.env.iter().map(|(key, value)| (key, value)));
             for key in &plan.env_remove {
                 command.env_remove(key);
             }
+            command.envs(plan.env.iter().map(|(key, value)| (key, value)));
             command.spawn().map_err(AgentProcessRunError::Spawn)?
         };
 
@@ -788,6 +788,45 @@ mod tests {
         assert!(outcome.stderr.truncated);
         assert_eq!(fs::metadata(&outcome.stdout.path).unwrap().len(), 128);
         assert_eq!(fs::metadata(&outcome.stderr.path).unwrap().len(), 128);
+    }
+
+    #[cfg(feature = "host")]
+    #[test]
+    fn agent_process_plan_env_overrides_env_remove_for_same_key() {
+        // Regression: when a key appears in both `with_env_remove` and `with_env`,
+        // the `with_env` value must reach the child. The first writ-vm codex run
+        // failed with `Missing environment variable: OPENAI_API_KEY` because the
+        // remove was applied after the set, wiping it.
+        let dir = tempfile::tempdir().unwrap();
+        let fake = write_env_dump_fake_agent(dir.path(), "WRIT_TEST_ENV_KEY");
+        let run_id: AgentRunId = "00000000-0000-0000-0000-000000000104".parse().unwrap();
+        let prompt = AgentPrompt::new("env override probe");
+        let plan = AgentProcessPlan::new(run_id, fake, [] as [OsString; 0])
+            .unwrap()
+            .with_env_remove("WRIT_TEST_ENV_KEY")
+            .with_env("WRIT_TEST_ENV_KEY", "set-by-with-env");
+
+        let outcome = run_agent_process(&plan, &prompt, &dir.path().join("logs")).unwrap();
+
+        assert_eq!(outcome.status, AgentRunTerminalStatus::Succeeded);
+        assert_eq!(
+            fs::read_to_string(&outcome.stdout.path).unwrap(),
+            "set-by-with-env\n"
+        );
+    }
+
+    #[cfg(feature = "host")]
+    fn write_env_dump_fake_agent(dir: &Path, env_key: &str) -> std::path::PathBuf {
+        let path = dir.join("env-dump-agent.sh");
+        let env_key = shell_single_quote(env_key);
+        let script = format!(
+            "#!/bin/sh\n\
+             cat > /dev/null\n\
+             printf '%s\\n' \"${{{env_key}-<unset>}}\"\n",
+        );
+        fs::write(&path, script).unwrap();
+        make_executable(&path);
+        path
     }
 
     #[cfg(feature = "host")]

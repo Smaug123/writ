@@ -29,7 +29,8 @@ use crate::vm_git_bundle::{
 use crate::vm_http::{
     DEFAULT_CLAUDE_ANTHROPIC_VERSION, VmHttpClaudeProxyAuthKind, VmHttpClaudeProxyConfig,
     VmHttpClaudeProxyConfigError, VmHttpGitCloneConfig, VmHttpGitRuntimeConfig,
-    VmHttpNixCacheConfig, VmHttpNixCacheConfigError,
+    VmHttpNixCacheConfig, VmHttpNixCacheConfigError, VmHttpOpenAiProxyAuthKind,
+    VmHttpOpenAiProxyConfig, VmHttpOpenAiProxyConfigError,
 };
 
 /// Top-level daemon configuration. Loaded from a JSON file at startup;
@@ -134,6 +135,8 @@ pub struct AgentVmHttpConfig {
     #[serde(default)]
     pub claude_proxy: Option<AgentVmHttpClaudeProxyConfig>,
     #[serde(default)]
+    pub openai_proxy: Option<AgentVmHttpOpenAiProxyConfig>,
+    #[serde(default)]
     pub agent_run_log_root: Option<PathBuf>,
 }
 
@@ -145,6 +148,17 @@ pub struct AgentVmHttpClaudeProxyConfig {
     pub auth_kind: VmHttpClaudeProxyAuthKind,
     #[serde(default = "default_claude_anthropic_version")]
     pub anthropic_version: String,
+    pub timeout_secs: u64,
+    pub max_request_bytes: u64,
+    pub max_response_bytes: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentVmHttpOpenAiProxyConfig {
+    pub upstream_base_url: String,
+    pub auth_secret: SecretKey,
+    pub auth_kind: VmHttpOpenAiProxyAuthKind,
     pub timeout_secs: u64,
     pub max_request_bytes: u64,
     pub max_response_bytes: u64,
@@ -179,6 +193,8 @@ pub enum AgentVmHttpConfigError {
     NixTrustedPublicKeys(#[from] NixTrustedPublicKeysError),
     #[error(transparent)]
     ClaudeProxy(#[from] VmHttpClaudeProxyConfigError),
+    #[error(transparent)]
+    OpenAiProxy(#[from] VmHttpOpenAiProxyConfigError),
     #[error("agent run log root path must not be empty")]
     EmptyAgentRunLogRoot,
     #[error("agent run log root path must be absolute: {0:?}")]
@@ -283,17 +299,23 @@ impl AgentVmHttpConfig {
             .as_ref()
             .map(AgentVmHttpClaudeProxyConfig::to_runtime_config)
             .transpose()?;
+        let openai_proxy = self
+            .openai_proxy
+            .as_ref()
+            .map(AgentVmHttpOpenAiProxyConfig::to_runtime_config)
+            .transpose()?;
         let agent_run_log_root = match &self.agent_run_log_root {
             Some(path) => path.clone(),
             None => self.work_root.join("agent-runs"),
         };
         let agent_run_log_root = validate_agent_run_log_root(agent_run_log_root)?;
-        Ok(VmHttpGitRuntimeConfig::new_with_claude_proxy(
+        Ok(VmHttpGitRuntimeConfig::new_with_proxies(
             self.bind_addr,
             broker_port_range,
             git_clone,
             nix_cache,
             claude_proxy,
+            openai_proxy,
             agent_run_log_root,
         ))
     }
@@ -306,6 +328,19 @@ impl AgentVmHttpClaudeProxyConfig {
             self.auth_secret.clone(),
             self.auth_kind,
             &self.anthropic_version,
+            Duration::from_secs(self.timeout_secs),
+            self.max_request_bytes,
+            self.max_response_bytes,
+        )?)
+    }
+}
+
+impl AgentVmHttpOpenAiProxyConfig {
+    fn to_runtime_config(&self) -> Result<VmHttpOpenAiProxyConfig, AgentVmHttpConfigError> {
+        Ok(VmHttpOpenAiProxyConfig::new(
+            &self.upstream_base_url,
+            self.auth_secret.clone(),
+            self.auth_kind,
             Duration::from_secs(self.timeout_secs),
             self.max_request_bytes,
             self.max_response_bytes,
@@ -816,6 +851,7 @@ mod tests {
             nix_cache_max_metadata_bytes: 1_048_576,
             nix_cache_max_nar_bytes: 67_108_864,
             claude_proxy: None,
+            openai_proxy: None,
             agent_run_log_root: None,
         }
     }

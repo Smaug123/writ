@@ -166,6 +166,7 @@
             else "Darwin-buildable OCI archive for daemon-managed writ agent VMs";
           guestRequiredBins = [
             "claude"
+            "codex"
             "git"
             "ip"
             "nix"
@@ -228,6 +229,7 @@
               claudeCode
               guestPkgs.bash
               guestPkgs.cacert
+              guestPkgs.codex
               guestPkgs.coreutils
               guestPkgs.gitMinimal
               guestPkgs.iproute2

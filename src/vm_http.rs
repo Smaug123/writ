@@ -25,7 +25,8 @@ use crate::agent_run::{
 use crate::audit::{
     AgentRunOutcomeAuditRecord, AuditError, ClaudeProxyAuditDecision, ClaudeProxyAuditRoute,
     ClaudeProxyOutcomeRecord, ClaudeProxyRequestRecord, NixCacheAuditDecision, NixCacheAuditRoute,
-    NixCacheOutcomeRecord, NixCacheRequestRecord,
+    NixCacheOutcomeRecord, NixCacheRequestRecord, OpenAiProxyAuditDecision, OpenAiProxyAuditRoute,
+    OpenAiProxyOutcomeRecord, OpenAiProxyRequestRecord,
 };
 use crate::bearer::is_bearer_token_byte;
 use crate::core::{
@@ -67,6 +68,11 @@ const VM_CLAUDE_MESSAGES_PATH: &str = "/v1/messages";
 const VM_CLAUDE_COUNT_TOKENS_PATH: &str = "/v1/messages/count_tokens";
 const VM_CLAUDE_MODELS_PREFIX: &str = "/v1/models/";
 pub const DEFAULT_CLAUDE_ANTHROPIC_VERSION: &str = "2023-06-01";
+const VM_OPENAI_RESPONSES_PATH: &str = "/v1/responses";
+const VM_OPENAI_RESPONSES_PREFIX: &str = "/v1/responses/";
+const VM_OPENAI_RESPONSE_CANCEL_SUFFIX: &str = "/cancel";
+const VM_OPENAI_MODELS_PATH: &str = "/v1/models";
+const VM_OPENAI_MODELS_PREFIX: &str = "/v1/models/";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VmHttpSession {
@@ -122,6 +128,12 @@ pub struct VmHttpClaudeProxyService<S: SecretStore> {
     client: reqwest::Client,
 }
 
+pub struct VmHttpOpenAiProxyService<S: SecretStore> {
+    broker_state: Arc<BrokerState<S>>,
+    config: VmHttpOpenAiProxyConfig,
+    client: reqwest::Client,
+}
+
 #[derive(Clone, Debug)]
 pub struct VmHttpAgentRunService {
     prompts: Arc<Mutex<HashMap<AgentRunId, AgentPrompt>>>,
@@ -135,6 +147,7 @@ pub struct VmHttpGitRuntimeConfig {
     git_clone: VmHttpGitCloneConfig,
     nix_cache: VmHttpNixCacheConfig,
     claude_proxy: Option<VmHttpClaudeProxyConfig>,
+    openai_proxy: Option<VmHttpOpenAiProxyConfig>,
     agent_run_log_root: PathBuf,
 }
 
@@ -143,14 +156,38 @@ pub struct PreparedVmHttpGitSession<S: SecretStore + Send + Sync + 'static> {
     session: VmHttpSession,
     git_clone: VmHttpGitCloneService<S>,
     nix_cache: VmHttpNixCacheService<S>,
-    claude_proxy: Option<VmHttpClaudeProxyService<S>>,
+    proxies: VmHttpProxies<S>,
     agent_runs: Option<VmHttpAgentRunService>,
+}
+
+pub struct VmHttpProxies<S: SecretStore> {
+    pub claude: Option<VmHttpClaudeProxyService<S>>,
+    pub openai: Option<VmHttpOpenAiProxyService<S>>,
+}
+
+impl<S: SecretStore> VmHttpProxies<S> {
+    pub fn none() -> Self {
+        Self {
+            claude: None,
+            openai: None,
+        }
+    }
+}
+
+impl<S: SecretStore> Clone for VmHttpProxies<S> {
+    fn clone(&self) -> Self {
+        Self {
+            claude: self.claude.clone(),
+            openai: self.openai.clone(),
+        }
+    }
 }
 
 struct VmHttpServices<S: SecretStore> {
     git_clone: Option<VmHttpGitCloneService<S>>,
     nix_cache: Option<VmHttpNixCacheService<S>>,
     claude_proxy: Option<VmHttpClaudeProxyService<S>>,
+    openai_proxy: Option<VmHttpOpenAiProxyService<S>>,
     agent_runs: Option<VmHttpAgentRunService>,
 }
 
@@ -200,6 +237,26 @@ pub enum VmHttpClaudeProxyAuthKind {
 }
 
 const ANTHROPIC_OAUTH_BETA_HEADER_VALUE: &str = "oauth-2025-04-20";
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VmHttpOpenAiProxyConfig {
+    upstream_base_url: reqwest::Url,
+    auth_secret: SecretKey,
+    auth_kind: VmHttpOpenAiProxyAuthKind,
+    timeout: std::time::Duration,
+    max_request_bytes: usize,
+    max_response_bytes: u64,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VmHttpOpenAiProxyAuthKind {
+    AuthorizationBearer,
+    /// ChatGPT-login OAuth (refresh-token based) is reserved for a follow-up
+    /// PR; constructing a config with this auth kind currently fails with
+    /// [`VmHttpOpenAiProxyConfigError::UnsupportedAuthKind`].
+    ChatgptOauth,
+}
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum VmHttpAuthorization {
@@ -266,6 +323,30 @@ pub enum VmHttpClaudeProxyConfigError {
     InvalidAnthropicVersion { message: String },
 }
 
+#[derive(Debug, thiserror::Error, Eq, PartialEq)]
+pub enum VmHttpOpenAiProxyConfigError {
+    #[error("OpenAI proxy upstream URL must not be empty")]
+    EmptyUpstreamUrl,
+    #[error("OpenAI proxy upstream URL {raw:?} is invalid: {message}")]
+    InvalidUpstreamUrl { raw: String, message: String },
+    #[error("OpenAI proxy upstream URL {raw:?} uses unsupported scheme {scheme:?}")]
+    UnsupportedUpstreamScheme { raw: String, scheme: String },
+    #[error("OpenAI proxy upstream URL must not contain embedded credentials: {0:?}")]
+    UpstreamUrlHasCredentials(String),
+    #[error("OpenAI proxy upstream URL must not contain a query or fragment: {0:?}")]
+    UpstreamUrlHasQueryOrFragment(String),
+    #[error("OpenAI proxy request timeout must be greater than zero")]
+    EmptyTimeout,
+    #[error("OpenAI proxy max request bytes must be greater than zero")]
+    EmptyMaxRequestBytes,
+    #[error("OpenAI proxy max request bytes exceeds this platform's usize range")]
+    MaxRequestBytesTooLarge,
+    #[error("OpenAI proxy max response bytes must be greater than zero")]
+    EmptyMaxResponseBytes,
+    #[error("OpenAI proxy auth kind {kind:?} is not yet supported in this binary")]
+    UnsupportedAuthKind { kind: VmHttpOpenAiProxyAuthKind },
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum VmHttpBindError {
     #[error("cannot bind VM HTTP listener: {0}")]
@@ -279,7 +360,9 @@ pub enum VmHttpGitRuntimeError {
     #[error(transparent)]
     Bind(#[from] VmHttpBindError),
     #[error("cannot construct Claude proxy HTTP client: {0}")]
-    ClaudeProxyClient(#[from] reqwest::Error),
+    ClaudeProxyClient(reqwest::Error),
+    #[error("cannot construct OpenAI proxy HTTP client: {0}")]
+    OpenAiProxyClient(reqwest::Error),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -395,6 +478,26 @@ struct VmHttpClaudeProxyStream<S: SecretStore> {
     max_response_bytes: u64,
 }
 
+#[derive(Debug)]
+struct VmHttpOpenAiProxyFetch {
+    response: VmHttpResponse,
+    upstream_url: Option<String>,
+    upstream_status: Option<u16>,
+    response_bytes: u64,
+    error: Option<&'static str>,
+}
+
+struct VmHttpOpenAiProxyStream<S: SecretStore> {
+    broker_state: Arc<BrokerState<S>>,
+    request_id: RequestId,
+    response: reqwest::Response,
+    upstream_url: String,
+    upstream_status: u16,
+    content_type: &'static str,
+    headers: Vec<VmHttpResponseHeader>,
+    max_response_bytes: u64,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct VmHttpNixCacheAdmittedNar {
     file: NixCacheNarFileName,
@@ -406,6 +509,7 @@ struct VmHttpNixCacheAdmittedNar {
 enum VmHttpDispatch<S: SecretStore> {
     Buffered(VmHttpResponse),
     ClaudeProxyStream(VmHttpClaudeProxyStream<S>),
+    OpenAiProxyStream(VmHttpOpenAiProxyStream<S>),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -424,6 +528,17 @@ enum VmHttpClaudeProxyBodyReadError {
         bytes_read: u64,
     },
     #[error("Claude proxy upstream response exceeds {max} bytes after {bytes_read} bytes")]
+    ResponseTooLarge { max: u64, bytes_read: u64 },
+}
+
+#[derive(Debug, thiserror::Error)]
+enum VmHttpOpenAiProxyBodyReadError {
+    #[error("OpenAI proxy upstream response body read failed after {bytes_read} bytes: {source}")]
+    Request {
+        source: reqwest::Error,
+        bytes_read: u64,
+    },
+    #[error("OpenAI proxy upstream response exceeds {max} bytes after {bytes_read} bytes")]
     ResponseTooLarge { max: u64, bytes_read: u64 },
 }
 
@@ -891,6 +1006,311 @@ impl<S: SecretStore> VmHttpClaudeProxyStream<S> {
     }
 }
 
+impl<S: SecretStore> VmHttpOpenAiProxyService<S> {
+    pub fn new(
+        broker_state: Arc<BrokerState<S>>,
+        config: VmHttpOpenAiProxyConfig,
+    ) -> Result<Self, reqwest::Error> {
+        let client = reqwest::Client::builder()
+            .connect_timeout(config.timeout)
+            .read_timeout(config.timeout)
+            .build()?;
+        Ok(Self {
+            broker_state,
+            config,
+            client,
+        })
+    }
+
+    fn upstream_request_builder(
+        &self,
+        request: &VmHttpRequest,
+        body: Vec<u8>,
+        headers: Vec<OpenAiProxyForwardHeader>,
+    ) -> Result<(String, reqwest::RequestBuilder), Box<VmHttpOpenAiProxyFetch>> {
+        let Some(route) = classify_openai_proxy_target(&request.target) else {
+            let response = VmHttpResponse::text(VmHttpStatus::NotFound, "not found");
+            return Err(Box::new(VmHttpOpenAiProxyFetch {
+                response_bytes: response.body.len() as u64,
+                response,
+                upstream_url: None,
+                upstream_status: None,
+                error: None,
+            }));
+        };
+        let Some(url) = self.upstream_url(&request.target) else {
+            let response = VmHttpResponse::text(VmHttpStatus::NotFound, "not found");
+            return Err(Box::new(VmHttpOpenAiProxyFetch {
+                response_bytes: response.body.len() as u64,
+                response,
+                upstream_url: None,
+                upstream_status: None,
+                error: None,
+            }));
+        };
+        let upstream_url = url.to_string();
+        let secret = match self
+            .broker_state
+            .secret_store()
+            .get(self.config.auth_secret())
+        {
+            Ok(Some(secret)) if !secret.is_empty() => secret,
+            Ok(_) => {
+                let response =
+                    VmHttpResponse::text(VmHttpStatus::BadGateway, "OpenAI proxy auth missing");
+                return Err(Box::new(VmHttpOpenAiProxyFetch {
+                    response_bytes: response.body.len() as u64,
+                    response,
+                    upstream_url: Some(upstream_url),
+                    upstream_status: None,
+                    error: Some("upstream auth missing"),
+                }));
+            }
+            Err(err) => {
+                eprintln!("VM HTTP OpenAI proxy auth secret load failed: {err}");
+                let response =
+                    VmHttpResponse::text(VmHttpStatus::BadGateway, "OpenAI proxy auth failed");
+                return Err(Box::new(VmHttpOpenAiProxyFetch {
+                    response_bytes: response.body.len() as u64,
+                    response,
+                    upstream_url: Some(upstream_url),
+                    upstream_status: None,
+                    error: Some("upstream auth load failed"),
+                }));
+            }
+        };
+
+        let mut builder = self.client.request(openai_proxy_route_method(route), url);
+        if !body.is_empty() {
+            builder = builder.body(body);
+        }
+        for header in headers {
+            builder = builder.header(header.name, header.value);
+        }
+        builder = match self.config.auth_kind() {
+            VmHttpOpenAiProxyAuthKind::AuthorizationBearer => builder.bearer_auth(secret),
+            VmHttpOpenAiProxyAuthKind::ChatgptOauth => {
+                unreachable!(
+                    "ChatgptOauth auth kind is rejected at config construction in this build"
+                )
+            }
+        };
+        Ok((upstream_url, builder))
+    }
+
+    async fn fetch(
+        &self,
+        request: &VmHttpRequest,
+        body: Vec<u8>,
+        headers: Vec<OpenAiProxyForwardHeader>,
+    ) -> VmHttpOpenAiProxyFetch {
+        let (upstream_url, builder) = match self.upstream_request_builder(request, body, headers) {
+            Ok(parts) => parts,
+            Err(fetch) => return *fetch,
+        };
+
+        let response = match builder.send().await {
+            Ok(response) => response,
+            Err(err) => {
+                eprintln!("VM HTTP OpenAI proxy upstream request failed: {err}");
+                let response =
+                    VmHttpResponse::text(VmHttpStatus::BadGateway, "OpenAI proxy upstream failed");
+                return VmHttpOpenAiProxyFetch {
+                    response_bytes: response.body.len() as u64,
+                    response,
+                    upstream_url: Some(upstream_url),
+                    upstream_status: None,
+                    error: Some("upstream request failed"),
+                };
+            }
+        };
+
+        let upstream_status = response.status();
+        let content_type = openai_proxy_response_content_type(&response);
+        let response_headers = openai_proxy_response_headers(response.headers());
+        let body = match read_openai_upstream_body_bounded(response, self.config.max_response_bytes)
+            .await
+        {
+            Ok(body) => body,
+            Err(err) => {
+                eprintln!("VM HTTP OpenAI proxy upstream body read failed: {err}");
+                let response =
+                    VmHttpResponse::text(VmHttpStatus::BadGateway, "OpenAI proxy upstream failed");
+                return VmHttpOpenAiProxyFetch {
+                    response_bytes: err.bytes_read(),
+                    response,
+                    upstream_url: Some(upstream_url),
+                    upstream_status: Some(upstream_status.as_u16()),
+                    error: Some(err.audit_error_label()),
+                };
+            }
+        };
+        let response_bytes = body.len() as u64;
+        VmHttpOpenAiProxyFetch {
+            response: VmHttpResponse {
+                status: VmHttpStatus::Upstream(upstream_status.as_u16()),
+                content_type,
+                body,
+                content_length: None,
+                www_authenticate: None,
+                headers: response_headers,
+            },
+            upstream_url: Some(upstream_url),
+            upstream_status: Some(upstream_status.as_u16()),
+            response_bytes,
+            error: None,
+        }
+    }
+
+    async fn fetch_stream(
+        &self,
+        request_id: RequestId,
+        request: &VmHttpRequest,
+        body: Vec<u8>,
+        headers: Vec<OpenAiProxyForwardHeader>,
+    ) -> Result<VmHttpOpenAiProxyStream<S>, VmHttpOpenAiProxyFetch> {
+        let (upstream_url, builder) = self
+            .upstream_request_builder(request, body, headers)
+            .map_err(|fetch| *fetch)?;
+        let response = match builder.send().await {
+            Ok(response) => response,
+            Err(err) => {
+                eprintln!("VM HTTP OpenAI proxy upstream request failed: {err}");
+                let response =
+                    VmHttpResponse::text(VmHttpStatus::BadGateway, "OpenAI proxy upstream failed");
+                return Err(VmHttpOpenAiProxyFetch {
+                    response_bytes: response.body.len() as u64,
+                    response,
+                    upstream_url: Some(upstream_url),
+                    upstream_status: None,
+                    error: Some("upstream request failed"),
+                });
+            }
+        };
+        let upstream_status = response.status().as_u16();
+        let content_type = openai_proxy_response_content_type(&response);
+        let headers = openai_proxy_response_headers(response.headers());
+        Ok(VmHttpOpenAiProxyStream {
+            broker_state: Arc::clone(&self.broker_state),
+            request_id,
+            response,
+            upstream_url,
+            upstream_status,
+            content_type,
+            headers,
+            max_response_bytes: self.config.max_response_bytes,
+        })
+    }
+
+    fn upstream_url(&self, target: &str) -> Option<reqwest::Url> {
+        let path = openai_proxy_target_path(target);
+        let relative: Cow<'static, str> = if path == VM_OPENAI_RESPONSES_PATH {
+            "v1/responses".into()
+        } else if path == VM_OPENAI_MODELS_PATH {
+            "v1/models".into()
+        } else if let Some(id) = openai_proxy_response_cancel_id(path) {
+            format!("v1/responses/{id}/cancel").into()
+        } else if let Some(id) = openai_proxy_model_id(path) {
+            format!("v1/models/{id}").into()
+        } else {
+            return None;
+        };
+        Some(
+            self.config
+                .upstream_base_url
+                .join(&relative)
+                .expect("OpenAI proxy route paths are URL-safe relative paths"),
+        )
+    }
+}
+
+fn openai_proxy_route_method(route: OpenAiProxyAuditRoute) -> reqwest::Method {
+    match route {
+        OpenAiProxyAuditRoute::Responses | OpenAiProxyAuditRoute::ResponseCancel => {
+            reqwest::Method::POST
+        }
+        OpenAiProxyAuditRoute::Models => reqwest::Method::GET,
+        OpenAiProxyAuditRoute::Unsupported => {
+            unreachable!("Unsupported routes are rejected before method selection")
+        }
+    }
+}
+
+impl<S: SecretStore> Clone for VmHttpOpenAiProxyService<S> {
+    fn clone(&self) -> Self {
+        Self {
+            broker_state: Arc::clone(&self.broker_state),
+            config: self.config.clone(),
+            client: self.client.clone(),
+        }
+    }
+}
+
+impl<S: SecretStore> VmHttpOpenAiProxyStream<S> {
+    async fn write_to<W: AsyncWrite + Unpin>(mut self, out: &mut W) -> std::io::Result<()> {
+        write_http_response_head(
+            out,
+            VmHttpStatus::Upstream(self.upstream_status),
+            self.content_type,
+            None,
+            None,
+            &self.headers,
+        )
+        .await?;
+
+        let mut response_bytes = 0u64;
+        let mut error = None;
+        let mut write_error = None;
+        loop {
+            let chunk = match self.response.chunk().await {
+                Ok(Some(chunk)) => chunk,
+                Ok(None) => break,
+                Err(err) => {
+                    eprintln!("VM HTTP OpenAI proxy streaming body read failed: {err}");
+                    error = Some("upstream body read failed");
+                    break;
+                }
+            };
+            let chunk_len = u64::try_from(chunk.len()).expect("HTTP chunk length fits in u64");
+            let new_len = response_bytes
+                .checked_add(chunk_len)
+                .expect("HTTP response byte count overflowed before configured bound check");
+            if new_len > self.max_response_bytes {
+                error = Some("upstream response too large");
+                response_bytes = new_len;
+                break;
+            }
+            if let Err(err) = out.write_all(&chunk).await {
+                error = Some("guest response write failed");
+                write_error = Some(err);
+                break;
+            }
+            response_bytes = new_len;
+        }
+
+        if let Err(err) =
+            self.broker_state
+                .audit
+                .record_openai_proxy_outcome(&OpenAiProxyOutcomeRecord {
+                    request_id: self.request_id,
+                    completed_at: UnixMillis::now(),
+                    http_status: self.upstream_status,
+                    upstream_url: Some(self.upstream_url.as_str()),
+                    upstream_status: Some(self.upstream_status),
+                    response_bytes,
+                    error,
+                })
+        {
+            eprintln!("VM HTTP OpenAI proxy streaming audit outcome write failed: {err}");
+        }
+
+        match write_error {
+            Some(err) => Err(err),
+            None => Ok(()),
+        }
+    }
+}
+
 impl VmHttpAgentRunService {
     pub fn with_log_root(log_root: impl Into<PathBuf>) -> Self {
         Self {
@@ -924,6 +1344,7 @@ impl<S: SecretStore> VmHttpServices<S> {
             git_clone: None,
             nix_cache: None,
             claude_proxy: None,
+            openai_proxy: None,
             agent_runs: None,
         }
     }
@@ -931,13 +1352,14 @@ impl<S: SecretStore> VmHttpServices<S> {
     fn with_git(
         git_clone: VmHttpGitCloneService<S>,
         nix_cache: VmHttpNixCacheService<S>,
-        claude_proxy: Option<VmHttpClaudeProxyService<S>>,
+        proxies: VmHttpProxies<S>,
         agent_runs: Option<VmHttpAgentRunService>,
     ) -> Self {
         Self {
             git_clone: Some(git_clone),
             nix_cache: Some(nix_cache),
-            claude_proxy,
+            claude_proxy: proxies.claude,
+            openai_proxy: proxies.openai,
             agent_runs,
         }
     }
@@ -949,6 +1371,7 @@ impl<S: SecretStore> Clone for VmHttpServices<S> {
             git_clone: self.git_clone.clone(),
             nix_cache: self.nix_cache.clone(),
             claude_proxy: self.claude_proxy.clone(),
+            openai_proxy: self.openai_proxy.clone(),
             agent_runs: self.agent_runs.clone(),
         }
     }
@@ -980,12 +1403,33 @@ impl VmHttpGitRuntimeConfig {
         claude_proxy: Option<VmHttpClaudeProxyConfig>,
         agent_run_log_root: impl Into<PathBuf>,
     ) -> Self {
+        Self::new_with_proxies(
+            bind_addr,
+            broker_port_range,
+            git_clone,
+            nix_cache,
+            claude_proxy,
+            None,
+            agent_run_log_root,
+        )
+    }
+
+    pub fn new_with_proxies(
+        bind_addr: Ipv4Addr,
+        broker_port_range: BrokerPortRange,
+        git_clone: VmHttpGitCloneConfig,
+        nix_cache: VmHttpNixCacheConfig,
+        claude_proxy: Option<VmHttpClaudeProxyConfig>,
+        openai_proxy: Option<VmHttpOpenAiProxyConfig>,
+        agent_run_log_root: impl Into<PathBuf>,
+    ) -> Self {
         Self {
             bind_addr,
             broker_port_range,
             git_clone,
             nix_cache,
             claude_proxy,
+            openai_proxy,
             agent_run_log_root: agent_run_log_root.into(),
         }
     }
@@ -1008,6 +1452,10 @@ impl VmHttpGitRuntimeConfig {
 
     pub fn claude_proxy(&self) -> Option<&VmHttpClaudeProxyConfig> {
         self.claude_proxy.as_ref()
+    }
+
+    pub fn openai_proxy(&self) -> Option<&VmHttpOpenAiProxyConfig> {
+        self.openai_proxy.as_ref()
     }
 
     pub fn agent_run_log_root(&self) -> &Path {
@@ -1294,6 +1742,90 @@ impl VmHttpClaudeProxyConfig {
     }
 }
 
+impl VmHttpOpenAiProxyConfig {
+    pub fn new(
+        upstream_base_url: impl AsRef<str>,
+        auth_secret: SecretKey,
+        auth_kind: VmHttpOpenAiProxyAuthKind,
+        timeout: std::time::Duration,
+        max_request_bytes: u64,
+        max_response_bytes: u64,
+    ) -> Result<Self, VmHttpOpenAiProxyConfigError> {
+        if matches!(auth_kind, VmHttpOpenAiProxyAuthKind::ChatgptOauth) {
+            return Err(VmHttpOpenAiProxyConfigError::UnsupportedAuthKind { kind: auth_kind });
+        }
+        let raw = upstream_base_url.as_ref();
+        if raw.is_empty() {
+            return Err(VmHttpOpenAiProxyConfigError::EmptyUpstreamUrl);
+        }
+        if timeout.is_zero() {
+            return Err(VmHttpOpenAiProxyConfigError::EmptyTimeout);
+        }
+        if max_request_bytes == 0 {
+            return Err(VmHttpOpenAiProxyConfigError::EmptyMaxRequestBytes);
+        }
+        let max_request_bytes = usize::try_from(max_request_bytes)
+            .map_err(|_| VmHttpOpenAiProxyConfigError::MaxRequestBytesTooLarge)?;
+        if max_response_bytes == 0 {
+            return Err(VmHttpOpenAiProxyConfigError::EmptyMaxResponseBytes);
+        }
+        let mut url = reqwest::Url::parse(raw).map_err(|err| {
+            VmHttpOpenAiProxyConfigError::InvalidUpstreamUrl {
+                raw: raw.to_string(),
+                message: err.to_string(),
+            }
+        })?;
+        if !matches!(url.scheme(), "http" | "https") {
+            return Err(VmHttpOpenAiProxyConfigError::UnsupportedUpstreamScheme {
+                raw: raw.to_string(),
+                scheme: url.scheme().to_string(),
+            });
+        }
+        if !url.username().is_empty() || url.password().is_some() {
+            return Err(VmHttpOpenAiProxyConfigError::UpstreamUrlHasCredentials(
+                raw.to_string(),
+            ));
+        }
+        if url.query().is_some() || url.fragment().is_some() {
+            return Err(VmHttpOpenAiProxyConfigError::UpstreamUrlHasQueryOrFragment(
+                raw.to_string(),
+            ));
+        }
+        if !url.path().ends_with('/') {
+            let path = format!("{}/", url.path());
+            url.set_path(&path);
+        }
+        Ok(Self {
+            upstream_base_url: url,
+            auth_secret,
+            auth_kind,
+            timeout,
+            max_request_bytes,
+            max_response_bytes,
+        })
+    }
+
+    pub fn upstream_base_url(&self) -> &reqwest::Url {
+        &self.upstream_base_url
+    }
+
+    pub fn auth_secret(&self) -> &SecretKey {
+        &self.auth_secret
+    }
+
+    pub fn auth_kind(&self) -> VmHttpOpenAiProxyAuthKind {
+        self.auth_kind
+    }
+
+    pub fn max_request_bytes(&self) -> usize {
+        self.max_request_bytes
+    }
+
+    pub fn max_response_bytes(&self) -> u64 {
+        self.max_response_bytes
+    }
+}
+
 impl<S: SecretStore + Send + Sync + 'static> PreparedVmHttpGitSession<S> {
     pub fn broker_port(&self) -> BrokerPort {
         self.listener.broker_port()
@@ -1326,7 +1858,7 @@ impl<S: SecretStore + Send + Sync + 'static> PreparedVmHttpGitSession<S> {
             self.session,
             self.git_clone,
             self.nix_cache,
-            self.claude_proxy,
+            self.proxies,
             self.agent_runs,
             shutdown_rx,
         ));
@@ -1447,13 +1979,23 @@ pub async fn prepare_vm_http_git_session_with_agent_runs<S: SecretStore + Send +
         .claude_proxy
         .clone()
         .map(|config| VmHttpClaudeProxyService::new(Arc::clone(&state), config))
-        .transpose()?;
+        .transpose()
+        .map_err(VmHttpGitRuntimeError::ClaudeProxyClient)?;
+    let openai_proxy = config
+        .openai_proxy
+        .clone()
+        .map(|config| VmHttpOpenAiProxyService::new(Arc::clone(&state), config))
+        .transpose()
+        .map_err(VmHttpGitRuntimeError::OpenAiProxyClient)?;
     Ok(PreparedVmHttpGitSession {
         listener,
         session,
         git_clone,
         nix_cache,
-        claude_proxy,
+        proxies: VmHttpProxies {
+            claude: claude_proxy,
+            openai: openai_proxy,
+        },
         agent_runs,
     })
 }
@@ -1484,14 +2026,14 @@ pub async fn run_vm_http_with_git_until_shutdown<S: SecretStore + Send + Sync + 
     session: VmHttpSession,
     git_clone: VmHttpGitCloneService<S>,
     nix_cache: VmHttpNixCacheService<S>,
-    claude_proxy: Option<VmHttpClaudeProxyService<S>>,
+    proxies: VmHttpProxies<S>,
     agent_runs: Option<VmHttpAgentRunService>,
     shutdown: watch::Receiver<bool>,
 ) -> std::io::Result<()> {
     run_vm_http_runtime_until_shutdown(
         listener,
         session,
-        VmHttpServices::with_git(git_clone, nix_cache, claude_proxy, agent_runs),
+        VmHttpServices::with_git(git_clone, nix_cache, proxies, agent_runs),
         shutdown,
     )
     .await
@@ -1744,6 +2286,21 @@ where
                         None,
                     )
                     .into()
+                } else if let Some(route) = classify_openai_proxy_target(&request.target)
+                    && let Some(service) = services.openai_proxy.as_ref()
+                {
+                    record_openai_proxy_local_response(
+                        service,
+                        session,
+                        &request,
+                        route,
+                        OpenAiProxyAuditDecision::Deny {
+                            reason: vm_http_auth_error_reason(err).to_string(),
+                        },
+                        response,
+                        None,
+                    )
+                    .into()
                 } else {
                     response.into()
                 }
@@ -1827,6 +2384,25 @@ where
             Err(response) => return response.into(),
         };
         return route_claude_proxy_request(session, request, body, &service).await;
+    }
+
+    if is_openai_proxy_target(&request.target) {
+        let Some(service) = services.openai_proxy else {
+            return VmHttpResponse::text(VmHttpStatus::NotFound, "not found").into();
+        };
+        let body = match read_http_body_for_openai_proxy_route(
+            stream,
+            request.content_length.unwrap_or(0),
+            buffered_body,
+            read_timeout,
+            service.config.max_request_bytes(),
+        )
+        .await
+        {
+            Ok(body) => body,
+            Err(response) => return response.into(),
+        };
+        return route_openai_proxy_request(session, request, body, &service).await;
     }
 
     if request.target == VM_GIT_CLONE_PATH {
@@ -2934,6 +3510,452 @@ fn record_claude_proxy_local_response<S: SecretStore>(
     response
 }
 
+async fn read_openai_upstream_body_bounded(
+    mut response: reqwest::Response,
+    max: u64,
+) -> Result<Vec<u8>, VmHttpOpenAiProxyBodyReadError> {
+    let mut body = Vec::new();
+    loop {
+        let chunk = match response.chunk().await {
+            Ok(Some(chunk)) => chunk,
+            Ok(None) => break,
+            Err(source) => {
+                return Err(VmHttpOpenAiProxyBodyReadError::Request {
+                    source,
+                    bytes_read: body.len() as u64,
+                });
+            }
+        };
+        let chunk_len = u64::try_from(chunk.len()).expect("HTTP chunk length fits in u64");
+        let new_len = (body.len() as u64)
+            .checked_add(chunk_len)
+            .expect("HTTP response byte count overflowed before configured bound check");
+        if new_len > max {
+            return Err(VmHttpOpenAiProxyBodyReadError::ResponseTooLarge {
+                max,
+                bytes_read: new_len,
+            });
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+impl VmHttpOpenAiProxyBodyReadError {
+    fn audit_error_label(&self) -> &'static str {
+        match self {
+            Self::Request { .. } => "upstream body read failed",
+            Self::ResponseTooLarge { .. } => "upstream response too large",
+        }
+    }
+
+    fn bytes_read(&self) -> u64 {
+        match self {
+            Self::Request { bytes_read, .. } | Self::ResponseTooLarge { bytes_read, .. } => {
+                *bytes_read
+            }
+        }
+    }
+}
+
+fn is_openai_proxy_target(target: &str) -> bool {
+    classify_openai_proxy_target(target).is_some()
+}
+
+fn classify_openai_proxy_target(target: &str) -> Option<OpenAiProxyAuditRoute> {
+    // Match on the path only. The OpenAI clients pass through query params
+    // such as `?include[]=...` on Responses; the broker drops them and
+    // forwards a path-only request upstream so the guest can't expand the
+    // surface area beyond what the broker has explicitly classified.
+    let path = openai_proxy_target_path(target);
+    if path == VM_OPENAI_RESPONSES_PATH {
+        return Some(OpenAiProxyAuditRoute::Responses);
+    }
+    if path == VM_OPENAI_MODELS_PATH {
+        return Some(OpenAiProxyAuditRoute::Models);
+    }
+    if openai_proxy_response_cancel_id(path).is_some() {
+        return Some(OpenAiProxyAuditRoute::ResponseCancel);
+    }
+    if openai_proxy_model_id(path).is_some() {
+        return Some(OpenAiProxyAuditRoute::Models);
+    }
+    if path.starts_with(VM_OPENAI_RESPONSES_PREFIX) || path.starts_with(VM_OPENAI_MODELS_PREFIX) {
+        return Some(OpenAiProxyAuditRoute::Unsupported);
+    }
+    None
+}
+
+fn openai_proxy_target_path(target: &str) -> &str {
+    target
+        .split_once('?')
+        .map(|(path, _)| path)
+        .unwrap_or(target)
+}
+
+fn openai_proxy_model_id(path: &str) -> Option<&str> {
+    let suffix = path.strip_prefix(VM_OPENAI_MODELS_PREFIX)?;
+    if suffix.is_empty() || !suffix.bytes().all(is_openai_id_byte) {
+        return None;
+    }
+    Some(suffix)
+}
+
+fn openai_proxy_response_cancel_id(path: &str) -> Option<&str> {
+    let suffix = path.strip_prefix(VM_OPENAI_RESPONSES_PREFIX)?;
+    let id = suffix.strip_suffix(VM_OPENAI_RESPONSE_CANCEL_SUFFIX)?;
+    if id.is_empty() || !id.bytes().all(is_openai_id_byte) {
+        return None;
+    }
+    Some(id)
+}
+
+fn is_openai_id_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')
+}
+
+struct OpenAiProxyForwardHeader {
+    name: reqwest::header::HeaderName,
+    value: reqwest::header::HeaderValue,
+}
+
+fn openai_proxy_forward_headers(
+    headers: &[VmHttpHeader],
+    auth_kind: VmHttpOpenAiProxyAuthKind,
+) -> Result<Vec<OpenAiProxyForwardHeader>, &'static str> {
+    let mut forwarded = Vec::new();
+    let mut saw_content_type = false;
+    let mut saw_accept = false;
+    let mut saw_user_agent = false;
+    let mut saw_openai_organization = false;
+    let mut saw_openai_project = false;
+    let openai_organization_name = reqwest::header::HeaderName::from_static("openai-organization");
+    let openai_project_name = reqwest::header::HeaderName::from_static("openai-project");
+
+    for header in headers {
+        let Some(name) = openai_proxy_forward_header_name(&header.name, auth_kind) else {
+            continue;
+        };
+        let duplicate = if name == reqwest::header::CONTENT_TYPE {
+            std::mem::replace(&mut saw_content_type, true)
+        } else if name == reqwest::header::ACCEPT {
+            std::mem::replace(&mut saw_accept, true)
+        } else if name == reqwest::header::USER_AGENT {
+            std::mem::replace(&mut saw_user_agent, true)
+        } else if name == openai_organization_name {
+            std::mem::replace(&mut saw_openai_organization, true)
+        } else if name == openai_project_name {
+            std::mem::replace(&mut saw_openai_project, true)
+        } else {
+            unreachable!("OpenAI proxy forward header classifier returned an unknown header")
+        };
+        if duplicate {
+            return Err("duplicate forwarded OpenAI header");
+        }
+        let value = reqwest::header::HeaderValue::from_str(&header.value)
+            .map_err(|_| "invalid forwarded OpenAI header value")?;
+        forwarded.push(OpenAiProxyForwardHeader { name, value });
+    }
+    Ok(forwarded)
+}
+
+fn openai_proxy_forward_header_name(
+    raw: &str,
+    _auth_kind: VmHttpOpenAiProxyAuthKind,
+) -> Option<reqwest::header::HeaderName> {
+    // Allowlist only. The broker decides which routing/observability headers
+    // (`openai-organization`, `openai-project`) to forward; everything else
+    // is dropped so the guest can't smuggle authentication or feature flags
+    // through. The Authorization header is injected by the broker itself
+    // and is never forwarded from the guest.
+    if raw.eq_ignore_ascii_case("content-type") {
+        return Some(reqwest::header::CONTENT_TYPE);
+    }
+    if raw.eq_ignore_ascii_case("accept") {
+        return Some(reqwest::header::ACCEPT);
+    }
+    if raw.eq_ignore_ascii_case("user-agent") {
+        return Some(reqwest::header::USER_AGENT);
+    }
+    if raw.eq_ignore_ascii_case("openai-organization") {
+        return Some(reqwest::header::HeaderName::from_static(
+            "openai-organization",
+        ));
+    }
+    if raw.eq_ignore_ascii_case("openai-project") {
+        return Some(reqwest::header::HeaderName::from_static("openai-project"));
+    }
+    None
+}
+
+fn openai_proxy_response_content_type(response: &reqwest::Response) -> &'static str {
+    let Some(content_type) = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return "application/json";
+    };
+    match content_type.split(';').next().map(str::trim) {
+        Some(media_type) if media_type.eq_ignore_ascii_case("application/json") => {
+            "application/json"
+        }
+        Some(media_type) if media_type.eq_ignore_ascii_case("application/problem+json") => {
+            "application/problem+json"
+        }
+        Some(media_type) if media_type.eq_ignore_ascii_case("text/event-stream") => {
+            "text/event-stream"
+        }
+        Some(media_type) if media_type.eq_ignore_ascii_case("text/plain") => {
+            "text/plain; charset=utf-8"
+        }
+        Some(media_type) if media_type.eq_ignore_ascii_case("application/octet-stream") => {
+            "application/octet-stream"
+        }
+        _ => "application/json",
+    }
+}
+
+fn openai_proxy_response_headers(
+    headers: &reqwest::header::HeaderMap,
+) -> Vec<VmHttpResponseHeader> {
+    let mut out = Vec::new();
+    for (name, value) in headers {
+        let Some(forward_name) = openai_proxy_response_header_name(name.as_str()) else {
+            continue;
+        };
+        let Ok(value) = value.to_str() else {
+            continue;
+        };
+        out.push(VmHttpResponseHeader {
+            name: forward_name,
+            value: value.to_string(),
+        });
+    }
+    out
+}
+
+fn openai_proxy_response_header_name(raw: &str) -> Option<&'static str> {
+    if raw.eq_ignore_ascii_case("openai-version") {
+        return Some("Openai-Version");
+    }
+    if raw.eq_ignore_ascii_case("openai-organization") {
+        return Some("Openai-Organization");
+    }
+    if raw.eq_ignore_ascii_case("openai-processing-ms") {
+        return Some("Openai-Processing-Ms");
+    }
+    if raw.eq_ignore_ascii_case("x-request-id") {
+        return Some("X-Request-Id");
+    }
+    if raw.eq_ignore_ascii_case("retry-after") {
+        return Some("Retry-After");
+    }
+    if raw.eq_ignore_ascii_case("x-ratelimit-limit-requests") {
+        return Some("X-Ratelimit-Limit-Requests");
+    }
+    if raw.eq_ignore_ascii_case("x-ratelimit-limit-tokens") {
+        return Some("X-Ratelimit-Limit-Tokens");
+    }
+    if raw.eq_ignore_ascii_case("x-ratelimit-remaining-requests") {
+        return Some("X-Ratelimit-Remaining-Requests");
+    }
+    if raw.eq_ignore_ascii_case("x-ratelimit-remaining-tokens") {
+        return Some("X-Ratelimit-Remaining-Tokens");
+    }
+    if raw.eq_ignore_ascii_case("x-ratelimit-reset-requests") {
+        return Some("X-Ratelimit-Reset-Requests");
+    }
+    if raw.eq_ignore_ascii_case("x-ratelimit-reset-tokens") {
+        return Some("X-Ratelimit-Reset-Tokens");
+    }
+    None
+}
+
+fn openai_proxy_request_wants_streaming(body: &[u8]) -> bool {
+    serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| value.get("stream").and_then(serde_json::Value::as_bool))
+        .unwrap_or(false)
+}
+
+async fn route_openai_proxy_request<S: SecretStore>(
+    session: &VmHttpSession,
+    request: &VmHttpRequest,
+    body: Vec<u8>,
+    service: &VmHttpOpenAiProxyService<S>,
+) -> VmHttpDispatch<S> {
+    let route = classify_openai_proxy_target(&request.target)
+        .expect("caller only routes classified OpenAI proxy targets");
+    if route == OpenAiProxyAuditRoute::Unsupported {
+        let response = VmHttpResponse::text(VmHttpStatus::NotFound, "not found");
+        return record_openai_proxy_local_response(
+            service,
+            session,
+            request,
+            route,
+            OpenAiProxyAuditDecision::Deny {
+                reason: "unsupported OpenAI proxy route".into(),
+            },
+            response,
+            None,
+        )
+        .into();
+    }
+    if request.method != openai_proxy_route_method(route).as_str() {
+        let response = VmHttpResponse::text(VmHttpStatus::MethodNotAllowed, "method not allowed");
+        return record_openai_proxy_local_response(
+            service,
+            session,
+            request,
+            route,
+            OpenAiProxyAuditDecision::Deny {
+                reason: "method not allowed".into(),
+            },
+            response,
+            None,
+        )
+        .into();
+    }
+
+    let headers = match openai_proxy_forward_headers(&request.headers, service.config.auth_kind()) {
+        Ok(headers) => headers,
+        Err(reason) => {
+            let response = VmHttpResponse::text(VmHttpStatus::BadRequest, reason);
+            return record_openai_proxy_local_response(
+                service,
+                session,
+                request,
+                route,
+                OpenAiProxyAuditDecision::Deny {
+                    reason: reason.into(),
+                },
+                response,
+                Some(reason),
+            )
+            .into();
+        }
+    };
+
+    let request_id = RequestId::new();
+    if let Err(err) =
+        service
+            .broker_state
+            .audit
+            .record_openai_proxy_request(&OpenAiProxyRequestRecord {
+                request_id,
+                session_id: session.session_id,
+                received_at: UnixMillis::now(),
+                method: &request.method,
+                target: &request.target,
+                route,
+                decision: &OpenAiProxyAuditDecision::Allow,
+            })
+    {
+        eprintln!("VM HTTP OpenAI proxy audit request write failed: {err}");
+        return VmHttpResponse::text(VmHttpStatus::InternalServerError, "audit write failed")
+            .into();
+    }
+
+    if openai_proxy_request_wants_streaming(&body) {
+        match service
+            .fetch_stream(request_id, request, body, headers)
+            .await
+        {
+            Ok(stream) => return VmHttpDispatch::OpenAiProxyStream(stream),
+            Err(fetch) => {
+                if let Err(err) = service.broker_state.audit.record_openai_proxy_outcome(
+                    &OpenAiProxyOutcomeRecord {
+                        request_id,
+                        completed_at: UnixMillis::now(),
+                        http_status: fetch.response.status.code(),
+                        upstream_url: fetch.upstream_url.as_deref(),
+                        upstream_status: fetch.upstream_status,
+                        response_bytes: fetch.response_bytes,
+                        error: fetch.error,
+                    },
+                ) {
+                    eprintln!("VM HTTP OpenAI proxy audit outcome write failed: {err}");
+                    return VmHttpResponse::text(
+                        VmHttpStatus::InternalServerError,
+                        "audit write failed",
+                    )
+                    .into();
+                }
+                return fetch.response.into();
+            }
+        }
+    }
+
+    let fetch = service.fetch(request, body, headers).await;
+    if let Err(err) =
+        service
+            .broker_state
+            .audit
+            .record_openai_proxy_outcome(&OpenAiProxyOutcomeRecord {
+                request_id,
+                completed_at: UnixMillis::now(),
+                http_status: fetch.response.status.code(),
+                upstream_url: fetch.upstream_url.as_deref(),
+                upstream_status: fetch.upstream_status,
+                response_bytes: fetch.response_bytes,
+                error: fetch.error,
+            })
+    {
+        eprintln!("VM HTTP OpenAI proxy audit outcome write failed: {err}");
+        return VmHttpResponse::text(VmHttpStatus::InternalServerError, "audit write failed")
+            .into();
+    }
+    fetch.response.into()
+}
+
+fn record_openai_proxy_local_response<S: SecretStore>(
+    service: &VmHttpOpenAiProxyService<S>,
+    session: &VmHttpSession,
+    request: &VmHttpRequest,
+    route: OpenAiProxyAuditRoute,
+    decision: OpenAiProxyAuditDecision,
+    response: VmHttpResponse,
+    error: Option<&'static str>,
+) -> VmHttpResponse {
+    let request_id = RequestId::new();
+    if let Err(err) =
+        service
+            .broker_state
+            .audit
+            .record_openai_proxy_request(&OpenAiProxyRequestRecord {
+                request_id,
+                session_id: session.session_id,
+                received_at: UnixMillis::now(),
+                method: &request.method,
+                target: &request.target,
+                route,
+                decision: &decision,
+            })
+    {
+        eprintln!("VM HTTP OpenAI proxy audit request write failed: {err}");
+        return VmHttpResponse::text(VmHttpStatus::InternalServerError, "audit write failed");
+    }
+    if let Err(err) =
+        service
+            .broker_state
+            .audit
+            .record_openai_proxy_outcome(&OpenAiProxyOutcomeRecord {
+                request_id,
+                completed_at: UnixMillis::now(),
+                http_status: response.status.code(),
+                upstream_url: None,
+                upstream_status: None,
+                response_bytes: response.body.len() as u64,
+                error,
+            })
+    {
+        eprintln!("VM HTTP OpenAI proxy audit outcome write failed: {err}");
+        return VmHttpResponse::text(VmHttpStatus::InternalServerError, "audit write failed");
+    }
+    response
+}
+
 impl VmHttpNixCacheNarLengthError {
     fn audit_error_label(self) -> &'static str {
         match self {
@@ -3435,6 +4457,16 @@ async fn read_http_body_for_git_clone_route<R: AsyncRead + Unpin>(
 }
 
 async fn read_http_body_for_claude_proxy_route<R: AsyncRead + Unpin>(
+    stream: &mut R,
+    content_length: usize,
+    buffered_body: Vec<u8>,
+    read_timeout: std::time::Duration,
+    max: usize,
+) -> Result<Vec<u8>, VmHttpResponse> {
+    read_http_body_for_route(stream, content_length, buffered_body, read_timeout, max).await
+}
+
+async fn read_http_body_for_openai_proxy_route<R: AsyncRead + Unpin>(
     stream: &mut R,
     content_length: usize,
     buffered_body: Vec<u8>,
@@ -3947,6 +4979,7 @@ impl<S: SecretStore> VmHttpDispatch<S> {
         match self {
             Self::Buffered(response) => out.write_all(&response.to_bytes()).await,
             Self::ClaudeProxyStream(response) => response.write_to(out).await,
+            Self::OpenAiProxyStream(response) => response.write_to(out).await,
         }
     }
 
@@ -3954,6 +4987,7 @@ impl<S: SecretStore> VmHttpDispatch<S> {
         match self {
             Self::Buffered(response) => response.status.code(),
             Self::ClaudeProxyStream(response) => response.upstream_status,
+            Self::OpenAiProxyStream(response) => response.upstream_status,
         }
     }
 
@@ -3961,7 +4995,9 @@ impl<S: SecretStore> VmHttpDispatch<S> {
     fn into_buffered(self) -> VmHttpResponse {
         match self {
             Self::Buffered(response) => response,
-            Self::ClaudeProxyStream(_) => panic!("expected buffered VM HTTP response"),
+            Self::ClaudeProxyStream(_) | Self::OpenAiProxyStream(_) => {
+                panic!("expected buffered VM HTTP response")
+            }
         }
     }
 }
@@ -4095,6 +5131,7 @@ mod tests {
             git_clone: Some(git_clone),
             nix_cache: None,
             claude_proxy: None,
+            openai_proxy: None,
             agent_runs: None,
         }
     }
@@ -4106,6 +5143,7 @@ mod tests {
             git_clone: None,
             nix_cache: Some(nix_cache),
             claude_proxy: None,
+            openai_proxy: None,
             agent_runs: None,
         }
     }
@@ -4117,6 +5155,19 @@ mod tests {
             git_clone: None,
             nix_cache: None,
             claude_proxy: Some(claude_proxy),
+            openai_proxy: None,
+            agent_runs: None,
+        }
+    }
+
+    fn services_with_openai_proxy(
+        openai_proxy: VmHttpOpenAiProxyService<Box<dyn SecretStore>>,
+    ) -> TestVmHttpServices {
+        VmHttpServices {
+            git_clone: None,
+            nix_cache: None,
+            claude_proxy: None,
+            openai_proxy: Some(openai_proxy),
             agent_runs: None,
         }
     }
@@ -4849,6 +5900,195 @@ esac
             classify_claude_proxy_target("/v1/models/claude-haiku-4-5-20251001?beta=true"),
             Some(ClaudeProxyAuditRoute::Models),
         );
+    }
+
+    #[test]
+    fn classify_openai_proxy_target_recognizes_supported_routes() {
+        assert_eq!(
+            classify_openai_proxy_target("/v1/responses"),
+            Some(OpenAiProxyAuditRoute::Responses),
+        );
+        assert_eq!(
+            classify_openai_proxy_target("/v1/responses/resp_abc123/cancel"),
+            Some(OpenAiProxyAuditRoute::ResponseCancel),
+        );
+        assert_eq!(
+            classify_openai_proxy_target("/v1/models"),
+            Some(OpenAiProxyAuditRoute::Models),
+        );
+        assert_eq!(
+            classify_openai_proxy_target("/v1/models/gpt-5"),
+            Some(OpenAiProxyAuditRoute::Models),
+        );
+    }
+
+    #[test]
+    fn classify_openai_proxy_target_treats_unsupported_subpaths_as_unsupported() {
+        assert_eq!(
+            classify_openai_proxy_target("/v1/responses/resp_abc123"),
+            Some(OpenAiProxyAuditRoute::Unsupported),
+        );
+        assert_eq!(
+            classify_openai_proxy_target("/v1/responses/"),
+            Some(OpenAiProxyAuditRoute::Unsupported),
+        );
+        assert_eq!(
+            classify_openai_proxy_target("/v1/responses/resp_abc/cancel/extra"),
+            Some(OpenAiProxyAuditRoute::Unsupported),
+        );
+        assert_eq!(
+            classify_openai_proxy_target("/v1/models/"),
+            Some(OpenAiProxyAuditRoute::Unsupported),
+        );
+        assert_eq!(
+            classify_openai_proxy_target("/v1/models/foo/bar"),
+            Some(OpenAiProxyAuditRoute::Unsupported),
+        );
+    }
+
+    #[test]
+    fn classify_openai_proxy_target_rejects_unrelated_paths() {
+        assert_eq!(classify_openai_proxy_target("/v1/chat/completions"), None);
+        assert_eq!(classify_openai_proxy_target("/v2/responses"), None);
+        assert_eq!(classify_openai_proxy_target("/health"), None);
+        assert_eq!(classify_openai_proxy_target(""), None);
+    }
+
+    #[test]
+    fn classify_openai_proxy_target_strips_query_string() {
+        assert_eq!(
+            classify_openai_proxy_target("/v1/responses?include%5B%5D=foo"),
+            Some(OpenAiProxyAuditRoute::Responses),
+        );
+        assert_eq!(
+            classify_openai_proxy_target("/v1/responses/resp_abc/cancel?x=1"),
+            Some(OpenAiProxyAuditRoute::ResponseCancel),
+        );
+        assert_eq!(
+            classify_openai_proxy_target("/v1/models?x=1"),
+            Some(OpenAiProxyAuditRoute::Models),
+        );
+        assert_eq!(
+            classify_openai_proxy_target("/v1/models/gpt-5?x=1"),
+            Some(OpenAiProxyAuditRoute::Models),
+        );
+    }
+
+    #[test]
+    fn openai_proxy_forward_headers_drops_authorization_and_unrelated_headers() {
+        let headers = vec![
+            VmHttpHeader {
+                name: "Authorization".into(),
+                value: "Bearer guest-token".into(),
+            },
+            VmHttpHeader {
+                name: "Cookie".into(),
+                value: "session=guest".into(),
+            },
+            VmHttpHeader {
+                name: "Content-Type".into(),
+                value: "application/json".into(),
+            },
+            VmHttpHeader {
+                name: "Accept".into(),
+                value: "text/event-stream".into(),
+            },
+            VmHttpHeader {
+                name: "User-Agent".into(),
+                value: "codex-cli/1.0".into(),
+            },
+            VmHttpHeader {
+                name: "OpenAI-Organization".into(),
+                value: "org_test".into(),
+            },
+            VmHttpHeader {
+                name: "OpenAI-Project".into(),
+                value: "proj_test".into(),
+            },
+        ];
+
+        let forwarded =
+            openai_proxy_forward_headers(&headers, VmHttpOpenAiProxyAuthKind::AuthorizationBearer)
+                .unwrap();
+        let names: Vec<_> = forwarded
+            .iter()
+            .map(|h| h.name.as_str().to_owned())
+            .collect();
+        assert!(names.iter().any(|n| n == "content-type"));
+        assert!(names.iter().any(|n| n == "accept"));
+        assert!(names.iter().any(|n| n == "user-agent"));
+        assert!(names.iter().any(|n| n == "openai-organization"));
+        assert!(names.iter().any(|n| n == "openai-project"));
+        assert!(!names.iter().any(|n| n == "authorization"));
+        assert!(!names.iter().any(|n| n == "cookie"));
+    }
+
+    #[test]
+    fn openai_proxy_forward_headers_rejects_duplicate_allowed_header() {
+        let headers = vec![
+            VmHttpHeader {
+                name: "Content-Type".into(),
+                value: "application/json".into(),
+            },
+            VmHttpHeader {
+                name: "content-type".into(),
+                value: "application/json".into(),
+            },
+        ];
+        let result =
+            openai_proxy_forward_headers(&headers, VmHttpOpenAiProxyAuthKind::AuthorizationBearer);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn openai_proxy_response_header_name_allowlists_observability_headers() {
+        assert_eq!(
+            openai_proxy_response_header_name("X-Request-Id"),
+            Some("X-Request-Id"),
+        );
+        assert_eq!(
+            openai_proxy_response_header_name("retry-after"),
+            Some("Retry-After"),
+        );
+        assert_eq!(
+            openai_proxy_response_header_name("x-ratelimit-remaining-tokens"),
+            Some("X-Ratelimit-Remaining-Tokens"),
+        );
+        assert_eq!(openai_proxy_response_header_name("set-cookie"), None);
+    }
+
+    #[test]
+    fn openai_proxy_request_wants_streaming_reads_top_level_stream_field() {
+        assert!(openai_proxy_request_wants_streaming(
+            br#"{"model":"gpt-5","stream":true}"#
+        ));
+        assert!(!openai_proxy_request_wants_streaming(
+            br#"{"model":"gpt-5","stream":false}"#
+        ));
+        assert!(!openai_proxy_request_wants_streaming(
+            br#"{"model":"gpt-5"}"#
+        ));
+        assert!(!openai_proxy_request_wants_streaming(b"not-json"));
+    }
+
+    #[test]
+    fn openai_proxy_config_rejects_chatgpt_oauth_in_this_build() {
+        let secret = SecretKey::new("openai-api-key").unwrap();
+        let err = VmHttpOpenAiProxyConfig::new(
+            "https://api.openai.com/v1/",
+            secret,
+            VmHttpOpenAiProxyAuthKind::ChatgptOauth,
+            std::time::Duration::from_secs(5),
+            1024,
+            1024,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            VmHttpOpenAiProxyConfigError::UnsupportedAuthKind {
+                kind: VmHttpOpenAiProxyAuthKind::ChatgptOauth,
+            }
+        ));
     }
 
     proptest! {
@@ -5973,6 +7213,9 @@ esac
             VmHttpDispatch::Buffered(response) => {
                 panic!("expected streaming response, got {response:?}")
             }
+            VmHttpDispatch::OpenAiProxyStream(_) => {
+                panic!("expected Claude streaming response, got OpenAI streaming response")
+            }
         };
         assert!(
             state
@@ -6061,6 +7304,9 @@ esac
             VmHttpDispatch::Buffered(response) => {
                 panic!("expected streaming response, got {response:?}")
             }
+            VmHttpDispatch::OpenAiProxyStream(_) => {
+                panic!("expected Claude streaming response, got OpenAI streaming response")
+            }
         };
         let (mut client, mut server) = tokio::io::duplex(4096);
 
@@ -6148,6 +7394,227 @@ esac
             }
         );
         assert_eq!(entries[0].2, Some(401));
+    }
+
+    #[tokio::test]
+    async fn openai_proxy_strips_guest_auth_and_injects_host_bearer() {
+        let upstream_body = br#"{"id":"resp_xyz","output":[]}"#;
+        let (upstream_url, captured) = serve_raw_http_once(raw_http_response_with_headers(
+            "200 OK",
+            "application/json",
+            &[
+                ("x-request-id", "req_123"),
+                ("openai-organization", "org-test"),
+                ("x-ratelimit-remaining-requests", "99"),
+                ("set-cookie", "session=should-be-dropped"),
+            ],
+            upstream_body,
+        ))
+        .await;
+        let github = MockServer::start().await;
+        let secret_key = SecretKey::new("openai-api-key").unwrap();
+        let state = make_broker_state_with_extra_secret(
+            &github,
+            Some((secret_key.clone(), "host-openai-key")),
+        );
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::LOCALHOST, 32).unwrap());
+        open_audit_session(&state, session.session_id());
+        let service = VmHttpOpenAiProxyService::new(
+            Arc::clone(&state),
+            VmHttpOpenAiProxyConfig::new(
+                upstream_url,
+                secret_key,
+                VmHttpOpenAiProxyAuthKind::AuthorizationBearer,
+                std::time::Duration::from_secs(5),
+                1024,
+                1024,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let mut request = VmHttpRequest::new(
+            "POST",
+            VM_OPENAI_RESPONSES_PATH,
+            Some(bearer(token().as_str())),
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 34568)),
+        );
+        request.headers = vec![
+            VmHttpHeader {
+                name: "Authorization".into(),
+                value: bearer(token().as_str()),
+            },
+            VmHttpHeader {
+                name: "Cookie".into(),
+                value: "session=guest".into(),
+            },
+            VmHttpHeader {
+                name: "Content-Type".into(),
+                value: "application/json".into(),
+            },
+            VmHttpHeader {
+                name: "OpenAI-Organization".into(),
+                value: "org-guest".into(),
+            },
+        ];
+
+        let response = route_openai_proxy_request(
+            &session,
+            &request,
+            br#"{"model":"gpt-5"}"#.to_vec(),
+            &service,
+        )
+        .await
+        .into_buffered();
+
+        assert_eq!(response.status, VmHttpStatus::Upstream(200));
+        assert_eq!(response.content_type, "application/json");
+        assert_eq!(response.body, upstream_body);
+        let header_names: Vec<_> = response.headers.iter().map(|h| h.name).collect();
+        assert!(header_names.contains(&"X-Request-Id"));
+        assert!(header_names.contains(&"Openai-Organization"));
+        assert!(header_names.contains(&"X-Ratelimit-Remaining-Requests"));
+        assert!(
+            !header_names
+                .iter()
+                .any(|n| n.eq_ignore_ascii_case("set-cookie"))
+        );
+        let upstream_request = captured.lock().unwrap().clone();
+        let lower = upstream_request.to_ascii_lowercase();
+        assert!(
+            upstream_request.starts_with("POST /v1/responses HTTP/1.1"),
+            "{upstream_request}"
+        );
+        assert!(
+            lower.contains("authorization: bearer host-openai-key"),
+            "{upstream_request}"
+        );
+        assert!(
+            lower.contains("openai-organization: org-guest"),
+            "{upstream_request}"
+        );
+        assert!(
+            lower.contains("content-type: application/json"),
+            "{upstream_request}"
+        );
+        assert!(
+            !upstream_request.contains(token().as_str()),
+            "{upstream_request}"
+        );
+        assert!(!lower.contains("cookie:"), "{upstream_request}");
+        assert!(
+            upstream_request.ends_with(r#"{"model":"gpt-5"}"#),
+            "{upstream_request}"
+        );
+        let entries = state
+            .audit
+            .list_openai_proxy_requests_for_session_for_test(session.session_id())
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, OpenAiProxyAuditRoute::Responses);
+        assert_eq!(entries[0].1, OpenAiProxyAuditDecision::Allow);
+        assert_eq!(entries[0].2, Some(200));
+    }
+
+    #[tokio::test]
+    async fn openai_proxy_auth_denial_is_audited_without_contacting_upstream() {
+        let github = MockServer::start().await;
+        let secret_key = SecretKey::new("openai-api-key").unwrap();
+        let state = make_broker_state_with_extra_secret(
+            &github,
+            Some((secret_key.clone(), "host-openai-key")),
+        );
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+        open_audit_session(&state, session.session_id());
+        let service = VmHttpOpenAiProxyService::new(
+            Arc::clone(&state),
+            VmHttpOpenAiProxyConfig::new(
+                "http://127.0.0.1:9/",
+                secret_key,
+                VmHttpOpenAiProxyAuthKind::AuthorizationBearer,
+                std::time::Duration::from_millis(10),
+                1024,
+                1024,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let raw_head = format!("POST {VM_OPENAI_RESPONSES_PATH} HTTP/1.1\r\n\r\n").into_bytes();
+        let mut stream = tokio::io::empty();
+
+        let response = dispatch_vm_http_head_and_body(
+            &session,
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 12345)),
+            VmHttpHeadRead {
+                raw_head,
+                buffered_body: Vec::new(),
+            },
+            &mut stream,
+            services_with_openai_proxy(service),
+            VM_HTTP_READ_TIMEOUT,
+        )
+        .await
+        .into_buffered();
+
+        assert_eq!(response.status, VmHttpStatus::Unauthorized);
+        let entries = state
+            .audit
+            .list_openai_proxy_requests_for_session_for_test(session.session_id())
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, OpenAiProxyAuditRoute::Responses);
+        assert_eq!(
+            entries[0].1,
+            OpenAiProxyAuditDecision::Deny {
+                reason: "missing credentials".into()
+            }
+        );
+        assert_eq!(entries[0].2, Some(401));
+    }
+
+    #[tokio::test]
+    async fn openai_proxy_unsupported_route_is_audited_with_404() {
+        let github = MockServer::start().await;
+        let secret_key = SecretKey::new("openai-api-key").unwrap();
+        let state = make_broker_state_with_extra_secret(
+            &github,
+            Some((secret_key.clone(), "host-openai-key")),
+        );
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::LOCALHOST, 32).unwrap());
+        open_audit_session(&state, session.session_id());
+        let service = VmHttpOpenAiProxyService::new(
+            Arc::clone(&state),
+            VmHttpOpenAiProxyConfig::new(
+                "http://127.0.0.1:9/",
+                secret_key,
+                VmHttpOpenAiProxyAuthKind::AuthorizationBearer,
+                std::time::Duration::from_millis(10),
+                1024,
+                1024,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let request = VmHttpRequest::new(
+            "POST",
+            "/v1/responses/resp_abc/extra",
+            Some(bearer(token().as_str())),
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 34569)),
+        );
+        let response = route_openai_proxy_request(&session, &request, Vec::new(), &service)
+            .await
+            .into_buffered();
+        assert_eq!(response.status, VmHttpStatus::NotFound);
+        let entries = state
+            .audit
+            .list_openai_proxy_requests_for_session_for_test(session.session_id())
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, OpenAiProxyAuditRoute::Unsupported);
+        assert!(matches!(
+            entries[0].1,
+            OpenAiProxyAuditDecision::Deny { .. }
+        ));
+        assert_eq!(entries[0].2, Some(404));
     }
 
     async fn route_nix_cache_with_service(
@@ -8066,7 +9533,7 @@ work_root=${{work_dir%/*}}
             session.clone(),
             service,
             VmHttpNixCacheService::new(Arc::clone(&state), nix_cache_config_for_test()),
-            None,
+            VmHttpProxies::none(),
             None,
             shutdown_rx,
         ));

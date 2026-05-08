@@ -248,7 +248,7 @@ fn agent_process_plan(
 ) -> Result<AgentProcessPlan, Box<dyn std::error::Error>> {
     match agent {
         AgentKind::Claude => claude_process_plan(run_id, config),
-        AgentKind::Codex => Err("managed VM agent run only supports Claude in this stage".into()),
+        AgentKind::Codex => codex_process_plan(run_id, config),
     }
 }
 
@@ -289,6 +289,65 @@ fn claude_process_plan(
     // wastes time blocking on a connection it cannot make.
     .with_env("DISABLE_AUTOUPDATER", "1")
     .with_env("DISABLE_INSTALLATION_CHECKS", "1"))
+}
+
+fn codex_process_plan(
+    run_id: AgentRunId,
+    config: &VmClientConfig,
+) -> Result<AgentProcessPlan, Box<dyn std::error::Error>> {
+    let codex_home = std::env::temp_dir().join("writ-vm-codex");
+    std::fs::create_dir_all(&codex_home)?;
+    // Register a custom model provider so codex reads its bearer token from
+    // OPENAI_API_KEY (which we set to the broker bearer token below) instead
+    // of trying to read ~/.codex/auth.json. The default `openai` provider
+    // hardcodes auth.json lookup and cannot be overridden.
+    //
+    // We set supports_websockets=false because the broker exposes HTTP only;
+    // letting codex try wss:// first just wastes ~50s on retries.
+    let openai_base_url = format!("{}v1", config.broker_url().as_str());
+    let provider_name_arg = "model_providers.writ-broker.name=\"writ broker\"";
+    let provider_base_url_arg =
+        format!("model_providers.writ-broker.base_url=\"{openai_base_url}\"");
+    let provider_wire_api_arg = "model_providers.writ-broker.wire_api=\"responses\"";
+    let provider_env_key_arg = "model_providers.writ-broker.env_key=\"OPENAI_API_KEY\"";
+    let provider_requires_auth_arg = "model_providers.writ-broker.requires_openai_auth=false";
+    let provider_supports_ws_arg = "model_providers.writ-broker.supports_websockets=false";
+    let model_provider_arg = "model_provider=\"writ-broker\"";
+    Ok(AgentProcessPlan::new(
+        run_id,
+        "codex",
+        [
+            OsString::from("exec"),
+            OsString::from("--model"),
+            OsString::from("gpt-5"),
+            OsString::from("--config"),
+            OsString::from("model_reasoning_effort=minimal"),
+            OsString::from("--config"),
+            OsString::from("web_search=disabled"),
+            OsString::from("--config"),
+            OsString::from("tools.view_image=false"),
+            OsString::from("--config"),
+            OsString::from(provider_name_arg),
+            OsString::from("--config"),
+            OsString::from(provider_base_url_arg),
+            OsString::from("--config"),
+            OsString::from(provider_wire_api_arg),
+            OsString::from("--config"),
+            OsString::from(provider_env_key_arg),
+            OsString::from("--config"),
+            OsString::from(provider_requires_auth_arg),
+            OsString::from("--config"),
+            OsString::from(provider_supports_ws_arg),
+            OsString::from("--config"),
+            OsString::from(model_provider_arg),
+            OsString::from("--json"),
+            OsString::from("-"),
+        ],
+    )?
+    .with_env_remove(VM_BROKER_URL_ENV)
+    .with_env_remove(VM_BROKER_TOKEN_ENV)
+    .with_env("OPENAI_API_KEY", config.bearer_token().as_str())
+    .with_env("CODEX_HOME", codex_home.as_os_str()))
 }
 
 impl From<WorkspaceWarmArg> for WorkspaceWarmMode {
@@ -476,5 +535,72 @@ mod tests {
                 "expected {key} to be removed from the Claude child env",
             );
         }
+    }
+
+    #[test]
+    fn codex_agent_plan_uses_low_cost_health_check_settings() {
+        let run_id: AgentRunId = "00000000-0000-0000-0000-000000000303".parse().unwrap();
+        let config = VmClientConfig::new("http://192.168.252.1:49152/", "writ-vm-secret").unwrap();
+
+        let plan = codex_process_plan(run_id, &config).unwrap();
+
+        assert_eq!(plan.program(), std::path::Path::new("codex"));
+        assert_eq!(
+            plan.args(),
+            &[
+                OsString::from("exec"),
+                OsString::from("--model"),
+                OsString::from("gpt-5"),
+                OsString::from("--config"),
+                OsString::from("model_reasoning_effort=minimal"),
+                OsString::from("--config"),
+                OsString::from("web_search=disabled"),
+                OsString::from("--config"),
+                OsString::from("tools.view_image=false"),
+                OsString::from("--config"),
+                OsString::from("model_providers.writ-broker.name=\"writ broker\""),
+                OsString::from("--config"),
+                OsString::from(
+                    "model_providers.writ-broker.base_url=\"http://192.168.252.1:49152/v1\""
+                ),
+                OsString::from("--config"),
+                OsString::from("model_providers.writ-broker.wire_api=\"responses\""),
+                OsString::from("--config"),
+                OsString::from("model_providers.writ-broker.env_key=\"OPENAI_API_KEY\""),
+                OsString::from("--config"),
+                OsString::from("model_providers.writ-broker.requires_openai_auth=false"),
+                OsString::from("--config"),
+                OsString::from("model_providers.writ-broker.supports_websockets=false"),
+                OsString::from("--config"),
+                OsString::from("model_provider=\"writ-broker\""),
+                OsString::from("--json"),
+                OsString::from("-"),
+            ]
+        );
+
+        let env: std::collections::HashMap<&OsString, &OsString> =
+            plan.env().iter().map(|(key, value)| (key, value)).collect();
+        assert!(
+            !env.contains_key(&OsString::from("OPENAI_BASE_URL")),
+            "OPENAI_BASE_URL is ignored by codex; the broker URL is passed via --config openai_base_url",
+        );
+        assert_eq!(
+            env.get(&OsString::from("OPENAI_API_KEY"))
+                .map(|v| v.to_str().unwrap()),
+            Some("writ-vm-secret"),
+        );
+        assert!(env.contains_key(&OsString::from("CODEX_HOME")));
+
+        let removed: std::collections::HashSet<&OsString> = plan.env_remove().iter().collect();
+        for key in [VM_BROKER_URL_ENV, VM_BROKER_TOKEN_ENV] {
+            assert!(
+                removed.contains(&OsString::from(key)),
+                "expected {key} to be removed from the Codex child env",
+            );
+        }
+        assert!(
+            !removed.contains(&OsString::from("OPENAI_API_KEY")),
+            "OPENAI_API_KEY must not be in env_remove: we set it explicitly to the broker bearer, and removing it would mask the set",
+        );
     }
 }
