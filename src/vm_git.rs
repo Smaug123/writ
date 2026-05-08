@@ -13,7 +13,7 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
-use crate::core::{CapabilityRequest, GitHubAccess, GitHubRequest, RepoRef};
+use crate::core::{CapabilityRequest, GitHubAccess, GitHubRequest, RepoRef, RequestId};
 
 pub const VM_GIT_CLONE_PATH: &str = "/v1/git/clone";
 pub const VM_GIT_PUSH_PATH: &str = "/v1/git/push";
@@ -101,7 +101,7 @@ pub struct VmGitPushReceipt {
     branch: GitBranchName,
     old_head: GitObjectId,
     new_head: GitObjectId,
-    push_request_id: String,
+    push_request_id: RequestId,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -594,14 +594,14 @@ impl VmGitPushReceipt {
         branch: GitBranchName,
         old_head: GitObjectId,
         new_head: GitObjectId,
-        push_request_id: impl Into<String>,
+        push_request_id: RequestId,
     ) -> Self {
         Self {
             repo,
             branch,
             old_head,
             new_head,
-            push_request_id: push_request_id.into(),
+            push_request_id,
         }
     }
 
@@ -621,8 +621,8 @@ impl VmGitPushReceipt {
         &self.new_head
     }
 
-    pub fn push_request_id(&self) -> &str {
-        &self.push_request_id
+    pub fn push_request_id(&self) -> RequestId {
+        self.push_request_id
     }
 }
 
@@ -671,9 +671,6 @@ pub fn parse_vm_git_push_request_body(
     )
     .map_err(|err| VmGitPushBodyError::InvalidMetadata(err.to_string()))?;
     let bundle = body[metadata_end..].to_vec();
-    if bundle.is_empty() {
-        return Err(VmGitPushBodyError::EmptyBundle);
-    }
     if bundle.len() > limits.max_bundle_bytes() {
         return Err(VmGitPushBodyError::BundleTooLarge {
             bytes: bundle.len(),
@@ -762,7 +759,7 @@ fn validate_git_ref(raw: &str) -> Result<(), GitCloneRefError> {
         }
     }
     for component in raw.split('/') {
-        if component.starts_with('.') || component.ends_with('.') {
+        if component.starts_with('.') {
             return Err(GitCloneRefError::ForbiddenSequence("."));
         }
         if component.ends_with(".lock") {
@@ -945,7 +942,6 @@ mod tests {
             "[A-Za-z0-9._-]{0,20}".prop_map(|prefix| format!("{prefix}/.hidden")),
             "[A-Za-z0-9._-]{0,20}".prop_map(|prefix| format!("{prefix}.lock/x")),
             "[A-Za-z0-9_-]{0,20}".prop_map(|prefix| format!("{prefix}.")),
-            "[A-Za-z0-9_-]{1,20}".prop_map(|component| format!("feature/{component}./y")),
             Just("@".to_string()),
             "[A-Za-z0-9._/-]{0,20}".prop_map(|prefix| format!("{prefix}:x")),
             "[A-Za-z0-9._/-]{0,20}".prop_map(|prefix| format!("{prefix} x")),
@@ -955,6 +951,7 @@ mod tests {
     fn invalid_git_branch_strategy() -> impl Strategy<Value = String> {
         prop_oneof![
             invalid_git_ref_strategy(),
+            "[A-Za-z0-9_-]{1,20}".prop_map(|component| format!("feature/{component}./y")),
             Just("HEAD".to_string()),
             git_ref_strategy().prop_map(|branch| format!("refs/heads/{branch}")),
         ]
@@ -1334,13 +1331,15 @@ mod tests {
 
     #[test]
     fn push_receipt_wire_shape_is_stable() {
+        let push_request_id = RequestId::new();
         let receipt = VmGitPushReceipt::new(
             repo("owner", "repo"),
             "main".parse().unwrap(),
             sample_object_id('a'),
             sample_object_id('b'),
-            "push-request-1",
+            push_request_id,
         );
+        assert_eq!(receipt.push_request_id(), push_request_id);
         let value = serde_json::to_value(&receipt).unwrap();
         assert_eq!(value["repo"], "owner/repo");
         assert_eq!(value["branch"], "main");
@@ -1352,7 +1351,10 @@ mod tests {
             value["new_head"],
             "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
         );
-        assert_eq!(value["push_request_id"], "push-request-1");
+        assert_eq!(
+            value["push_request_id"],
+            serde_json::json!(push_request_id.to_string())
+        );
         assert_eq!(
             serde_json::from_value::<VmGitPushReceipt>(value).unwrap(),
             receipt
