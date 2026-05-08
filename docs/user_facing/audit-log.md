@@ -72,6 +72,27 @@ CREATE TABLE nix_cache_outcome (
   error           TEXT CHECK (error IS NULL OR error != '')
 );
 
+CREATE TABLE claude_proxy_request (
+  request_id  TEXT PRIMARY KEY,
+  session_id  TEXT NOT NULL REFERENCES session(session_id),
+  received_at INTEGER NOT NULL,
+  method      TEXT NOT NULL CHECK (method != ''),
+  target      TEXT NOT NULL CHECK (target != ''),
+  route       TEXT NOT NULL CHECK (route IN ('messages', 'count_tokens', 'unsupported')),
+  decision    TEXT NOT NULL CHECK (decision IN ('allow', 'deny')),
+  deny_reason TEXT
+);
+
+CREATE TABLE claude_proxy_outcome (
+  request_id      TEXT PRIMARY KEY REFERENCES claude_proxy_request(request_id),
+  completed_at    INTEGER NOT NULL,
+  http_status     INTEGER NOT NULL CHECK (http_status BETWEEN 100 AND 599),
+  upstream_url    TEXT,
+  upstream_status INTEGER CHECK (upstream_status BETWEEN 100 AND 599),
+  response_bytes  INTEGER NOT NULL CHECK (response_bytes >= 0),
+  error           TEXT CHECK (error IS NULL OR error != '')
+);
+
 CREATE TABLE agent_run (
   run_id                  TEXT PRIMARY KEY,
   session_id              TEXT NOT NULL REFERENCES session(session_id),
@@ -120,6 +141,13 @@ A few invariants worth knowing:
   They appear as `decision = 'deny'` with a `deny_reason`, no
   upstream URL/status, and the HTTP status returned to the VM in
   `nix_cache_outcome`.
+- **Claude proxy requests use host-side credentials only.**
+  `claude_proxy_request` records the sandbox-visible broker request. The
+  matching outcome records the broker HTTP status, optional upstream
+  URL/status, response byte count, and bounded error label. Guest auth denials
+  are recorded with `decision = 'deny'`; successful upstream requests are made
+  by the broker after it strips sandbox auth and injects the configured
+  host-side Anthropic credential.
 - **Agent prompts are not stored raw.** `agent_run` stores the prompt byte
   length, SHA-256, and a redacted preview marker. The prompt itself is carried
   over the host protocol and the authenticated one-shot VM prompt route, capped
@@ -127,9 +155,9 @@ A few invariants worth knowing:
 - **Agent stream bodies are not stored in SQLite.** `agent_run_outcome` stores
   private stdout/stderr file paths, byte counts, SHA-256 values, truncation
   flags, terminal status, and exit code. The stream files are separate
-  artifacts owned by the runtime. This stage defines their privacy and audit
-  shape; a retention, quota, and cleanup policy is still required before real
-  Claude/Codex runs use this path.
+  artifacts owned by the runtime. For truncated VM uploads, the broker records
+  the retained artifact's byte count and SHA-256 rather than trusting an
+  unverified guest-reported full-stream count/hash.
 - **Agent run outcome can arrive after session close.** Starting an agent run
   requires an open session, but recording the terminal outcome is allowed after
   advisory close so teardown can still capture failure state.

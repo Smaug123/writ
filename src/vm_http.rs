@@ -4,24 +4,28 @@
 //! endpoint authenticates one managed agent VM session with a bearer secret and
 //! a source-subnet check, then exposes only VM-safe broker operations.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io::Read as _;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 use tokio::task::JoinSet;
 
 use crate::agent_run::{
-    AgentPrompt, AgentRunId, VM_AGENT_RUN_PATH_PREFIX, VmAgentRunPromptResponse,
+    AgentPrompt, AgentRunId, AgentRunOutcome, AgentRunStreamSummary, AgentRunStreamUpload,
+    VM_AGENT_RUN_OUTCOME_PATH_SUFFIX, VM_AGENT_RUN_PATH_PREFIX, VmAgentRunOutcomeUpload,
+    VmAgentRunPromptResponse,
 };
 use crate::audit::{
-    AuditError, NixCacheAuditDecision, NixCacheAuditRoute, NixCacheOutcomeRecord,
-    NixCacheRequestRecord,
+    AgentRunOutcomeAuditRecord, AuditError, ClaudeProxyAuditDecision, ClaudeProxyAuditRoute,
+    ClaudeProxyOutcomeRecord, ClaudeProxyRequestRecord, NixCacheAuditDecision, NixCacheAuditRoute,
+    NixCacheOutcomeRecord, NixCacheRequestRecord,
 };
 use crate::bearer::is_bearer_token_byte;
 use crate::core::{
@@ -33,7 +37,7 @@ use crate::nix_cache::{
     NixNarInfoError, NixNarSize, NixStoreHashPart, NixTrustedPublicKeys,
     parse_signed_narinfo_for_store_hash,
 };
-use crate::secret::SecretStore;
+use crate::secret::{SecretKey, SecretStore};
 use crate::server::{BrokerState, CapabilityOutcome, request_capability};
 use crate::vm_git::{
     GIT_BUNDLE_CONTENT_TYPE, VM_GIT_CLONE_PATH, VmGitCloneErrorCode, VmGitCloneErrorResponse,
@@ -47,6 +51,11 @@ use crate::vm_git_bundle::{
 
 const MAX_VM_HTTP_HEAD_BYTES: usize = 16 * 1024;
 const MAX_VM_HTTP_BODY_BYTES: usize = 64 * 1024;
+const MAX_VM_HTTP_AGENT_RUN_OUTCOME_BODY_BYTES: usize = 4 * 1024 * 1024;
+// The JSON upload cap bounds retained bytes on the wire. This larger cap is a
+// defense-in-depth bound on the guest-reported full stream length, which is
+// intentionally not trusted for truncated-stream audit rows.
+const MAX_AGENT_RUN_STREAM_AUDIT_BYTES: u64 = 1024 * 1024 * 1024;
 const VM_HTTP_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const EPHEMERAL_BIND_ATTEMPTS: usize = 32;
 const MAX_VM_HTTP_CONNECTIONS: usize = 256;
@@ -54,6 +63,10 @@ pub const VM_NIX_CACHE_PATH_PREFIX: &str = "/v1/nix/cache";
 const VM_NIX_CACHE_INFO_PATH: &str = "/v1/nix/cache/nix-cache-info";
 pub const VM_NIX_BASIC_LOGIN: &str = "writ-vm";
 const XZ_DECODER_MEMLIMIT_OVERHEAD: u64 = 16 * 1024 * 1024;
+const VM_CLAUDE_MESSAGES_PATH: &str = "/v1/messages";
+const VM_CLAUDE_COUNT_TOKENS_PATH: &str = "/v1/messages/count_tokens";
+const VM_CLAUDE_MODELS_PREFIX: &str = "/v1/models/";
+pub const DEFAULT_CLAUDE_ANTHROPIC_VERSION: &str = "2023-06-01";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VmHttpSession {
@@ -77,7 +90,14 @@ pub struct VmHttpRequest {
     target: String,
     authorization: Option<String>,
     content_length: Option<usize>,
+    headers: Vec<VmHttpHeader>,
     peer_addr: SocketAddr,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct VmHttpHeader {
+    name: String,
+    value: String,
 }
 
 pub struct VmHttpGitCloneService<S: SecretStore> {
@@ -96,9 +116,16 @@ pub struct VmHttpNixCacheService<S: SecretStore> {
     admitted_nars: Arc<Mutex<HashMap<NixCacheNarFileName, VmHttpNixCacheAdmittedNar>>>,
 }
 
-#[derive(Clone, Debug, Default)]
+pub struct VmHttpClaudeProxyService<S: SecretStore> {
+    broker_state: Arc<BrokerState<S>>,
+    config: VmHttpClaudeProxyConfig,
+    client: reqwest::Client,
+}
+
+#[derive(Clone, Debug)]
 pub struct VmHttpAgentRunService {
     prompts: Arc<Mutex<HashMap<AgentRunId, AgentPrompt>>>,
+    log_root: PathBuf,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -107,6 +134,8 @@ pub struct VmHttpGitRuntimeConfig {
     broker_port_range: BrokerPortRange,
     git_clone: VmHttpGitCloneConfig,
     nix_cache: VmHttpNixCacheConfig,
+    claude_proxy: Option<VmHttpClaudeProxyConfig>,
+    agent_run_log_root: PathBuf,
 }
 
 pub struct PreparedVmHttpGitSession<S: SecretStore + Send + Sync + 'static> {
@@ -114,12 +143,14 @@ pub struct PreparedVmHttpGitSession<S: SecretStore + Send + Sync + 'static> {
     session: VmHttpSession,
     git_clone: VmHttpGitCloneService<S>,
     nix_cache: VmHttpNixCacheService<S>,
+    claude_proxy: Option<VmHttpClaudeProxyService<S>>,
     agent_runs: Option<VmHttpAgentRunService>,
 }
 
 struct VmHttpServices<S: SecretStore> {
     git_clone: Option<VmHttpGitCloneService<S>>,
     nix_cache: Option<VmHttpNixCacheService<S>>,
+    claude_proxy: Option<VmHttpClaudeProxyService<S>>,
     agent_runs: Option<VmHttpAgentRunService>,
 }
 
@@ -146,6 +177,24 @@ pub struct VmHttpNixCacheConfig {
     max_metadata_bytes: u64,
     max_nar_bytes: u64,
     trusted_public_keys: NixTrustedPublicKeys,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VmHttpClaudeProxyConfig {
+    upstream_base_url: reqwest::Url,
+    auth_secret: SecretKey,
+    auth_kind: VmHttpClaudeProxyAuthKind,
+    anthropic_version: reqwest::header::HeaderValue,
+    timeout: std::time::Duration,
+    max_request_bytes: usize,
+    max_response_bytes: u64,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VmHttpClaudeProxyAuthKind {
+    XApiKey,
+    AuthorizationBearer,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -187,6 +236,32 @@ pub enum VmHttpNixCacheConfigError {
     EmptyMaxNarBytes,
 }
 
+#[derive(Debug, thiserror::Error, Eq, PartialEq)]
+pub enum VmHttpClaudeProxyConfigError {
+    #[error("Claude proxy upstream URL must not be empty")]
+    EmptyUpstreamUrl,
+    #[error("Claude proxy upstream URL {raw:?} is invalid: {message}")]
+    InvalidUpstreamUrl { raw: String, message: String },
+    #[error("Claude proxy upstream URL {raw:?} uses unsupported scheme {scheme:?}")]
+    UnsupportedUpstreamScheme { raw: String, scheme: String },
+    #[error("Claude proxy upstream URL must not contain embedded credentials: {0:?}")]
+    UpstreamUrlHasCredentials(String),
+    #[error("Claude proxy upstream URL must not contain a query or fragment: {0:?}")]
+    UpstreamUrlHasQueryOrFragment(String),
+    #[error("Claude proxy request timeout must be greater than zero")]
+    EmptyTimeout,
+    #[error("Claude proxy max request bytes must be greater than zero")]
+    EmptyMaxRequestBytes,
+    #[error("Claude proxy max request bytes exceeds this platform's usize range")]
+    MaxRequestBytesTooLarge,
+    #[error("Claude proxy max response bytes must be greater than zero")]
+    EmptyMaxResponseBytes,
+    #[error("Claude proxy Anthropic version must not be empty")]
+    EmptyAnthropicVersion,
+    #[error("Claude proxy Anthropic version is not a valid HTTP header value: {message}")]
+    InvalidAnthropicVersion { message: String },
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum VmHttpBindError {
     #[error("cannot bind VM HTTP listener: {0}")]
@@ -199,6 +274,8 @@ pub enum VmHttpBindError {
 pub enum VmHttpGitRuntimeError {
     #[error(transparent)]
     Bind(#[from] VmHttpBindError),
+    #[error("cannot construct Claude proxy HTTP client: {0}")]
+    ClaudeProxyClient(#[from] reqwest::Error),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -240,6 +317,7 @@ enum VmHttpStatus {
     Gone,
     BadGateway,
     InternalServerError,
+    Upstream(u16),
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -249,6 +327,13 @@ struct VmHttpResponse {
     body: Vec<u8>,
     content_length: Option<u64>,
     www_authenticate: Option<&'static str>,
+    headers: Vec<VmHttpResponseHeader>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct VmHttpResponseHeader {
+    name: &'static str,
+    value: String,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -286,6 +371,26 @@ struct VmHttpNixCacheProxyFetch {
     error: Option<&'static str>,
 }
 
+#[derive(Debug)]
+struct VmHttpClaudeProxyFetch {
+    response: VmHttpResponse,
+    upstream_url: Option<String>,
+    upstream_status: Option<u16>,
+    response_bytes: u64,
+    error: Option<&'static str>,
+}
+
+struct VmHttpClaudeProxyStream<S: SecretStore> {
+    broker_state: Arc<BrokerState<S>>,
+    request_id: RequestId,
+    response: reqwest::Response,
+    upstream_url: String,
+    upstream_status: u16,
+    content_type: &'static str,
+    headers: Vec<VmHttpResponseHeader>,
+    max_response_bytes: u64,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct VmHttpNixCacheAdmittedNar {
     file: NixCacheNarFileName,
@@ -294,8 +399,9 @@ struct VmHttpNixCacheAdmittedNar {
     nar_size: NixNarSize,
 }
 
-enum VmHttpDispatch {
+enum VmHttpDispatch<S: SecretStore> {
     Buffered(VmHttpResponse),
+    ClaudeProxyStream(VmHttpClaudeProxyStream<S>),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -304,6 +410,17 @@ enum VmHttpNixCacheBodyReadError {
     Request(#[from] reqwest::Error),
     #[error("Nix cache upstream response exceeds {max} bytes")]
     ResponseTooLarge { max: u64 },
+}
+
+#[derive(Debug, thiserror::Error)]
+enum VmHttpClaudeProxyBodyReadError {
+    #[error("Claude proxy upstream response body read failed after {bytes_read} bytes: {source}")]
+    Request {
+        source: reqwest::Error,
+        bytes_read: u64,
+    },
+    #[error("Claude proxy upstream response exceeds {max} bytes after {bytes_read} bytes")]
+    ResponseTooLarge { max: u64, bytes_read: u64 },
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -422,6 +539,7 @@ impl VmHttpRequest {
             target: target.into(),
             authorization,
             content_length: None,
+            headers: Vec::new(),
             peer_addr,
         }
     }
@@ -471,9 +589,305 @@ impl<S: SecretStore> Clone for VmHttpNixCacheService<S> {
     }
 }
 
+impl<S: SecretStore> VmHttpClaudeProxyService<S> {
+    pub fn new(
+        broker_state: Arc<BrokerState<S>>,
+        config: VmHttpClaudeProxyConfig,
+    ) -> Result<Self, reqwest::Error> {
+        let client = reqwest::Client::builder()
+            .connect_timeout(config.timeout)
+            .read_timeout(config.timeout)
+            .build()?;
+        Ok(Self {
+            broker_state,
+            config,
+            client,
+        })
+    }
+
+    fn upstream_request_builder(
+        &self,
+        request: &VmHttpRequest,
+        body: Vec<u8>,
+        headers: Vec<ClaudeProxyForwardHeader>,
+    ) -> Result<(String, reqwest::RequestBuilder), VmHttpClaudeProxyFetch> {
+        let Some(route) = classify_claude_proxy_target(&request.target) else {
+            let response = VmHttpResponse::text(VmHttpStatus::NotFound, "not found");
+            return Err(VmHttpClaudeProxyFetch {
+                response_bytes: response.body.len() as u64,
+                response,
+                upstream_url: None,
+                upstream_status: None,
+                error: None,
+            });
+        };
+        let Some(url) = self.upstream_url(&request.target) else {
+            let response = VmHttpResponse::text(VmHttpStatus::NotFound, "not found");
+            return Err(VmHttpClaudeProxyFetch {
+                response_bytes: response.body.len() as u64,
+                response,
+                upstream_url: None,
+                upstream_status: None,
+                error: None,
+            });
+        };
+        let upstream_url = url.to_string();
+        let secret = match self
+            .broker_state
+            .secret_store()
+            .get(self.config.auth_secret())
+        {
+            Ok(Some(secret)) if !secret.is_empty() => secret,
+            Ok(_) => {
+                let response =
+                    VmHttpResponse::text(VmHttpStatus::BadGateway, "Claude proxy auth missing");
+                return Err(VmHttpClaudeProxyFetch {
+                    response_bytes: response.body.len() as u64,
+                    response,
+                    upstream_url: Some(upstream_url),
+                    upstream_status: None,
+                    error: Some("upstream auth missing"),
+                });
+            }
+            Err(err) => {
+                eprintln!("VM HTTP Claude proxy auth secret load failed: {err}");
+                let response =
+                    VmHttpResponse::text(VmHttpStatus::BadGateway, "Claude proxy auth failed");
+                return Err(VmHttpClaudeProxyFetch {
+                    response_bytes: response.body.len() as u64,
+                    response,
+                    upstream_url: Some(upstream_url),
+                    upstream_status: None,
+                    error: Some("upstream auth load failed"),
+                });
+            }
+        };
+
+        let mut builder = self.client.request(claude_proxy_route_method(route), url);
+        if !body.is_empty() {
+            builder = builder.body(body);
+        }
+        for header in headers {
+            builder = builder.header(header.name, header.value);
+        }
+        builder = match self.config.auth_kind() {
+            VmHttpClaudeProxyAuthKind::XApiKey => builder.header("x-api-key", secret),
+            VmHttpClaudeProxyAuthKind::AuthorizationBearer => builder.bearer_auth(secret),
+        };
+        Ok((upstream_url, builder))
+    }
+
+    async fn fetch(
+        &self,
+        request: &VmHttpRequest,
+        body: Vec<u8>,
+        headers: Vec<ClaudeProxyForwardHeader>,
+    ) -> VmHttpClaudeProxyFetch {
+        let (upstream_url, builder) = match self.upstream_request_builder(request, body, headers) {
+            Ok(parts) => parts,
+            Err(fetch) => return fetch,
+        };
+
+        let response = match builder.send().await {
+            Ok(response) => response,
+            Err(err) => {
+                eprintln!("VM HTTP Claude proxy upstream request failed: {err}");
+                let response =
+                    VmHttpResponse::text(VmHttpStatus::BadGateway, "Claude proxy upstream failed");
+                return VmHttpClaudeProxyFetch {
+                    response_bytes: response.body.len() as u64,
+                    response,
+                    upstream_url: Some(upstream_url),
+                    upstream_status: None,
+                    error: Some("upstream request failed"),
+                };
+            }
+        };
+
+        let upstream_status = response.status();
+        let content_type = claude_proxy_response_content_type(&response);
+        let response_headers = claude_proxy_response_headers(response.headers());
+        let body = match read_claude_upstream_body_bounded(response, self.config.max_response_bytes)
+            .await
+        {
+            Ok(body) => body,
+            Err(err) => {
+                eprintln!("VM HTTP Claude proxy upstream body read failed: {err}");
+                let response =
+                    VmHttpResponse::text(VmHttpStatus::BadGateway, "Claude proxy upstream failed");
+                return VmHttpClaudeProxyFetch {
+                    response_bytes: err.bytes_read(),
+                    response,
+                    upstream_url: Some(upstream_url),
+                    upstream_status: Some(upstream_status.as_u16()),
+                    error: Some(err.audit_error_label()),
+                };
+            }
+        };
+        let response_bytes = body.len() as u64;
+        VmHttpClaudeProxyFetch {
+            response: VmHttpResponse {
+                status: VmHttpStatus::Upstream(upstream_status.as_u16()),
+                content_type,
+                body,
+                content_length: None,
+                www_authenticate: None,
+                headers: response_headers,
+            },
+            upstream_url: Some(upstream_url),
+            upstream_status: Some(upstream_status.as_u16()),
+            response_bytes,
+            error: None,
+        }
+    }
+
+    async fn fetch_stream(
+        &self,
+        request_id: RequestId,
+        request: &VmHttpRequest,
+        body: Vec<u8>,
+        headers: Vec<ClaudeProxyForwardHeader>,
+    ) -> Result<VmHttpClaudeProxyStream<S>, VmHttpClaudeProxyFetch> {
+        let (upstream_url, builder) = self.upstream_request_builder(request, body, headers)?;
+        let response = match builder.send().await {
+            Ok(response) => response,
+            Err(err) => {
+                eprintln!("VM HTTP Claude proxy upstream request failed: {err}");
+                let response =
+                    VmHttpResponse::text(VmHttpStatus::BadGateway, "Claude proxy upstream failed");
+                return Err(VmHttpClaudeProxyFetch {
+                    response_bytes: response.body.len() as u64,
+                    response,
+                    upstream_url: Some(upstream_url),
+                    upstream_status: None,
+                    error: Some("upstream request failed"),
+                });
+            }
+        };
+        let upstream_status = response.status().as_u16();
+        let content_type = claude_proxy_response_content_type(&response);
+        let headers = claude_proxy_response_headers(response.headers());
+        Ok(VmHttpClaudeProxyStream {
+            broker_state: Arc::clone(&self.broker_state),
+            request_id,
+            response,
+            upstream_url,
+            upstream_status,
+            content_type,
+            headers,
+            max_response_bytes: self.config.max_response_bytes,
+        })
+    }
+
+    fn upstream_url(&self, target: &str) -> Option<reqwest::Url> {
+        let path = claude_proxy_target_path(target);
+        let relative: Cow<'static, str> = match path {
+            VM_CLAUDE_MESSAGES_PATH => "v1/messages".into(),
+            VM_CLAUDE_COUNT_TOKENS_PATH => "v1/messages/count_tokens".into(),
+            _ => format!("v1/models/{}", claude_proxy_model_id(path)?).into(),
+        };
+        Some(
+            self.config
+                .upstream_base_url
+                .join(&relative)
+                .expect("Claude proxy route paths are URL-safe relative paths"),
+        )
+    }
+}
+
+fn claude_proxy_route_method(route: ClaudeProxyAuditRoute) -> reqwest::Method {
+    match route {
+        ClaudeProxyAuditRoute::Messages | ClaudeProxyAuditRoute::CountTokens => {
+            reqwest::Method::POST
+        }
+        ClaudeProxyAuditRoute::Models => reqwest::Method::GET,
+        ClaudeProxyAuditRoute::Unsupported => {
+            unreachable!("Unsupported routes are rejected before method selection")
+        }
+    }
+}
+
+impl<S: SecretStore> Clone for VmHttpClaudeProxyService<S> {
+    fn clone(&self) -> Self {
+        Self {
+            broker_state: Arc::clone(&self.broker_state),
+            config: self.config.clone(),
+            client: self.client.clone(),
+        }
+    }
+}
+
+impl<S: SecretStore> VmHttpClaudeProxyStream<S> {
+    async fn write_to<W: AsyncWrite + Unpin>(mut self, out: &mut W) -> std::io::Result<()> {
+        write_http_response_head(
+            out,
+            VmHttpStatus::Upstream(self.upstream_status),
+            self.content_type,
+            None,
+            None,
+            &self.headers,
+        )
+        .await?;
+
+        let mut response_bytes = 0u64;
+        let mut error = None;
+        let mut write_error = None;
+        loop {
+            let chunk = match self.response.chunk().await {
+                Ok(Some(chunk)) => chunk,
+                Ok(None) => break,
+                Err(err) => {
+                    eprintln!("VM HTTP Claude proxy streaming body read failed: {err}");
+                    error = Some("upstream body read failed");
+                    break;
+                }
+            };
+            let chunk_len = u64::try_from(chunk.len()).expect("HTTP chunk length fits in u64");
+            let new_len = response_bytes
+                .checked_add(chunk_len)
+                .expect("HTTP response byte count overflowed before configured bound check");
+            if new_len > self.max_response_bytes {
+                error = Some("upstream response too large");
+                response_bytes = new_len;
+                break;
+            }
+            if let Err(err) = out.write_all(&chunk).await {
+                error = Some("guest response write failed");
+                write_error = Some(err);
+                break;
+            }
+            response_bytes = new_len;
+        }
+
+        if let Err(err) =
+            self.broker_state
+                .audit
+                .record_claude_proxy_outcome(&ClaudeProxyOutcomeRecord {
+                    request_id: self.request_id,
+                    completed_at: UnixMillis::now(),
+                    http_status: self.upstream_status,
+                    upstream_url: Some(self.upstream_url.as_str()),
+                    upstream_status: Some(self.upstream_status),
+                    response_bytes,
+                    error,
+                })
+        {
+            eprintln!("VM HTTP Claude proxy streaming audit outcome write failed: {err}");
+        }
+
+        match write_error {
+            Some(err) => Err(err),
+            None => Ok(()),
+        }
+    }
+}
+
 impl VmHttpAgentRunService {
-    pub fn new() -> Self {
-        Self::default()
+    pub fn with_log_root(log_root: impl Into<PathBuf>) -> Self {
+        Self {
+            prompts: Arc::new(Mutex::new(HashMap::new())),
+            log_root: log_root.into(),
+        }
     }
 
     pub fn insert_prompt(&self, run_id: AgentRunId, prompt: AgentPrompt) {
@@ -489,6 +903,10 @@ impl VmHttpAgentRunService {
             .expect("agent run prompt lock should not be poisoned")
             .remove(&run_id)
     }
+
+    fn log_root(&self) -> &Path {
+        &self.log_root
+    }
 }
 
 impl<S: SecretStore> VmHttpServices<S> {
@@ -496,6 +914,7 @@ impl<S: SecretStore> VmHttpServices<S> {
         Self {
             git_clone: None,
             nix_cache: None,
+            claude_proxy: None,
             agent_runs: None,
         }
     }
@@ -503,11 +922,13 @@ impl<S: SecretStore> VmHttpServices<S> {
     fn with_git(
         git_clone: VmHttpGitCloneService<S>,
         nix_cache: VmHttpNixCacheService<S>,
+        claude_proxy: Option<VmHttpClaudeProxyService<S>>,
         agent_runs: Option<VmHttpAgentRunService>,
     ) -> Self {
         Self {
             git_clone: Some(git_clone),
             nix_cache: Some(nix_cache),
+            claude_proxy,
             agent_runs,
         }
     }
@@ -518,6 +939,7 @@ impl<S: SecretStore> Clone for VmHttpServices<S> {
         Self {
             git_clone: self.git_clone.clone(),
             nix_cache: self.nix_cache.clone(),
+            claude_proxy: self.claude_proxy.clone(),
             agent_runs: self.agent_runs.clone(),
         }
     }
@@ -529,12 +951,33 @@ impl VmHttpGitRuntimeConfig {
         broker_port_range: BrokerPortRange,
         git_clone: VmHttpGitCloneConfig,
         nix_cache: VmHttpNixCacheConfig,
+        agent_run_log_root: impl Into<PathBuf>,
+    ) -> Self {
+        Self::new_with_claude_proxy(
+            bind_addr,
+            broker_port_range,
+            git_clone,
+            nix_cache,
+            None,
+            agent_run_log_root,
+        )
+    }
+
+    pub fn new_with_claude_proxy(
+        bind_addr: Ipv4Addr,
+        broker_port_range: BrokerPortRange,
+        git_clone: VmHttpGitCloneConfig,
+        nix_cache: VmHttpNixCacheConfig,
+        claude_proxy: Option<VmHttpClaudeProxyConfig>,
+        agent_run_log_root: impl Into<PathBuf>,
     ) -> Self {
         Self {
             bind_addr,
             broker_port_range,
             git_clone,
             nix_cache,
+            claude_proxy,
+            agent_run_log_root: agent_run_log_root.into(),
         }
     }
 
@@ -552,6 +995,14 @@ impl VmHttpGitRuntimeConfig {
 
     pub fn nix_cache(&self) -> &VmHttpNixCacheConfig {
         &self.nix_cache
+    }
+
+    pub fn claude_proxy(&self) -> Option<&VmHttpClaudeProxyConfig> {
+        self.claude_proxy.as_ref()
+    }
+
+    pub fn agent_run_log_root(&self) -> &Path {
+        &self.agent_run_log_root
     }
 }
 
@@ -718,6 +1169,122 @@ impl VmHttpNixCacheConfig {
     }
 }
 
+impl VmHttpClaudeProxyConfig {
+    pub fn new(
+        upstream_base_url: impl AsRef<str>,
+        auth_secret: SecretKey,
+        auth_kind: VmHttpClaudeProxyAuthKind,
+        timeout: std::time::Duration,
+        max_request_bytes: u64,
+        max_response_bytes: u64,
+    ) -> Result<Self, VmHttpClaudeProxyConfigError> {
+        Self::new_with_anthropic_version(
+            upstream_base_url,
+            auth_secret,
+            auth_kind,
+            DEFAULT_CLAUDE_ANTHROPIC_VERSION,
+            timeout,
+            max_request_bytes,
+            max_response_bytes,
+        )
+    }
+
+    pub fn new_with_anthropic_version(
+        upstream_base_url: impl AsRef<str>,
+        auth_secret: SecretKey,
+        auth_kind: VmHttpClaudeProxyAuthKind,
+        anthropic_version: impl AsRef<str>,
+        timeout: std::time::Duration,
+        max_request_bytes: u64,
+        max_response_bytes: u64,
+    ) -> Result<Self, VmHttpClaudeProxyConfigError> {
+        let raw = upstream_base_url.as_ref();
+        let raw_anthropic_version = anthropic_version.as_ref();
+        if raw.is_empty() {
+            return Err(VmHttpClaudeProxyConfigError::EmptyUpstreamUrl);
+        }
+        if raw_anthropic_version.is_empty() {
+            return Err(VmHttpClaudeProxyConfigError::EmptyAnthropicVersion);
+        }
+        let anthropic_version = reqwest::header::HeaderValue::from_str(raw_anthropic_version)
+            .map_err(
+                |err| VmHttpClaudeProxyConfigError::InvalidAnthropicVersion {
+                    message: err.to_string(),
+                },
+            )?;
+        if timeout.is_zero() {
+            return Err(VmHttpClaudeProxyConfigError::EmptyTimeout);
+        }
+        if max_request_bytes == 0 {
+            return Err(VmHttpClaudeProxyConfigError::EmptyMaxRequestBytes);
+        }
+        let max_request_bytes = usize::try_from(max_request_bytes)
+            .map_err(|_| VmHttpClaudeProxyConfigError::MaxRequestBytesTooLarge)?;
+        if max_response_bytes == 0 {
+            return Err(VmHttpClaudeProxyConfigError::EmptyMaxResponseBytes);
+        }
+        let mut url = reqwest::Url::parse(raw).map_err(|err| {
+            VmHttpClaudeProxyConfigError::InvalidUpstreamUrl {
+                raw: raw.to_string(),
+                message: err.to_string(),
+            }
+        })?;
+        if !matches!(url.scheme(), "http" | "https") {
+            return Err(VmHttpClaudeProxyConfigError::UnsupportedUpstreamScheme {
+                raw: raw.to_string(),
+                scheme: url.scheme().to_string(),
+            });
+        }
+        if !url.username().is_empty() || url.password().is_some() {
+            return Err(VmHttpClaudeProxyConfigError::UpstreamUrlHasCredentials(
+                raw.to_string(),
+            ));
+        }
+        if url.query().is_some() || url.fragment().is_some() {
+            return Err(VmHttpClaudeProxyConfigError::UpstreamUrlHasQueryOrFragment(
+                raw.to_string(),
+            ));
+        }
+        if !url.path().ends_with('/') {
+            let path = format!("{}/", url.path());
+            url.set_path(&path);
+        }
+        Ok(Self {
+            upstream_base_url: url,
+            auth_secret,
+            auth_kind,
+            anthropic_version,
+            timeout,
+            max_request_bytes,
+            max_response_bytes,
+        })
+    }
+
+    pub fn upstream_base_url(&self) -> &reqwest::Url {
+        &self.upstream_base_url
+    }
+
+    pub fn auth_secret(&self) -> &SecretKey {
+        &self.auth_secret
+    }
+
+    pub fn auth_kind(&self) -> VmHttpClaudeProxyAuthKind {
+        self.auth_kind
+    }
+
+    pub fn anthropic_version(&self) -> &reqwest::header::HeaderValue {
+        &self.anthropic_version
+    }
+
+    pub fn max_request_bytes(&self) -> usize {
+        self.max_request_bytes
+    }
+
+    pub fn max_response_bytes(&self) -> u64 {
+        self.max_response_bytes
+    }
+}
+
 impl<S: SecretStore + Send + Sync + 'static> PreparedVmHttpGitSession<S> {
     pub fn broker_port(&self) -> BrokerPort {
         self.listener.broker_port()
@@ -750,6 +1317,7 @@ impl<S: SecretStore + Send + Sync + 'static> PreparedVmHttpGitSession<S> {
             self.session,
             self.git_clone,
             self.nix_cache,
+            self.claude_proxy,
             self.agent_runs,
             shutdown_rx,
         ));
@@ -865,12 +1433,18 @@ pub async fn prepare_vm_http_git_session_with_agent_runs<S: SecretStore + Send +
         bind_ephemeral_vm_http_listener(config.bind_addr, config.broker_port_range).await?;
     let session = VmHttpSession::new(session_id, source_ipv4, VmHttpBearerToken::generate());
     let git_clone = VmHttpGitCloneService::new(Arc::clone(&state), config.git_clone.clone());
-    let nix_cache = VmHttpNixCacheService::new(state, config.nix_cache.clone());
+    let nix_cache = VmHttpNixCacheService::new(Arc::clone(&state), config.nix_cache.clone());
+    let claude_proxy = config
+        .claude_proxy
+        .clone()
+        .map(|config| VmHttpClaudeProxyService::new(Arc::clone(&state), config))
+        .transpose()?;
     Ok(PreparedVmHttpGitSession {
         listener,
         session,
         git_clone,
         nix_cache,
+        claude_proxy,
         agent_runs,
     })
 }
@@ -901,13 +1475,14 @@ pub async fn run_vm_http_with_git_until_shutdown<S: SecretStore + Send + Sync + 
     session: VmHttpSession,
     git_clone: VmHttpGitCloneService<S>,
     nix_cache: VmHttpNixCacheService<S>,
+    claude_proxy: Option<VmHttpClaudeProxyService<S>>,
     agent_runs: Option<VmHttpAgentRunService>,
     shutdown: watch::Receiver<bool>,
 ) -> std::io::Result<()> {
     run_vm_http_runtime_until_shutdown(
         listener,
         session,
-        VmHttpServices::with_git(git_clone, nix_cache, agent_runs),
+        VmHttpServices::with_git(git_clone, nix_cache, claude_proxy, agent_runs),
         shutdown,
     )
     .await
@@ -1103,7 +1678,7 @@ async fn dispatch_vm_http_head_and_body<S, R>(
     stream: &mut R,
     services: VmHttpServices<S>,
     read_timeout: std::time::Duration,
-) -> VmHttpDispatch
+) -> VmHttpDispatch<S>
 where
     S: SecretStore + Send + Sync,
     R: AsyncRead + Unpin,
@@ -1111,11 +1686,18 @@ where
     let request = match parse_http_head(&head.raw_head, peer_addr) {
         Ok(request) => request,
         Err(err) => {
-            return VmHttpResponse::text(VmHttpStatus::BadRequest, err.to_string()).into();
+            let dispatch: VmHttpDispatch<S> =
+                VmHttpResponse::text(VmHttpStatus::BadRequest, err.to_string()).into();
+            log_vm_http_request(session, "?", "?", dispatch.status_code());
+            return dispatch;
         }
     };
     let auth_scheme = auth_scheme_for_target(&request.target);
-    match authorize_vm_http_request_with_scheme(session, &request, auth_scheme) {
+    let dispatch: VmHttpDispatch<S> = match authorize_vm_http_request_with_scheme(
+        session,
+        &request,
+        auth_scheme,
+    ) {
         VmHttpAuthorization::Allow => {
             route_authenticated_vm_http_request(
                 session,
@@ -1130,21 +1712,49 @@ where
         VmHttpAuthorization::Deny(err) => {
             let response = auth_error_response(auth_scheme, err);
             if is_nix_cache_target(&request.target) {
-                return record_nix_cache_local_response(
+                record_nix_cache_local_response(
                     services.nix_cache.as_ref(),
                     session,
                     &request,
                     NixCacheAuditDecision::Deny {
-                        reason: nix_cache_auth_error_reason(err).to_string(),
+                        reason: vm_http_auth_error_reason(err).to_string(),
                     },
                     response,
                     None,
                 )
-                .into();
+                .into()
+            } else if let Some(route) = classify_claude_proxy_target(&request.target)
+                && let Some(service) = services.claude_proxy.as_ref()
+            {
+                record_claude_proxy_local_response(
+                    service,
+                    session,
+                    &request,
+                    route,
+                    ClaudeProxyAuditDecision::Deny {
+                        reason: vm_http_auth_error_reason(err).to_string(),
+                    },
+                    response,
+                    None,
+                )
+                .into()
+            } else {
+                response.into()
             }
-            response.into()
         }
-    }
+    };
+    log_vm_http_request(session, &request.method, &request.target, dispatch.status_code());
+    dispatch
+}
+
+fn log_vm_http_request(session: &VmHttpSession, method: &str, target: &str, status: u16) {
+    eprintln!(
+        "writd: vm http session={} {} {} -> {}",
+        session.session_id(),
+        method,
+        target,
+        status,
+    );
 }
 
 fn auth_error_response(scheme: VmHttpAuthScheme, err: VmHttpAuthError) -> VmHttpResponse {
@@ -1180,13 +1790,32 @@ async fn route_authenticated_vm_http_request<S, R>(
     stream: &mut R,
     services: VmHttpServices<S>,
     read_timeout: std::time::Duration,
-) -> VmHttpDispatch
+) -> VmHttpDispatch<S>
 where
     S: SecretStore + Send + Sync,
     R: AsyncRead + Unpin,
 {
     if is_nix_cache_target(&request.target) {
         return route_nix_cache_request(session, request, services.nix_cache).await;
+    }
+
+    if is_claude_proxy_target(&request.target) {
+        let Some(service) = services.claude_proxy else {
+            return VmHttpResponse::text(VmHttpStatus::NotFound, "not found").into();
+        };
+        let body = match read_http_body_for_claude_proxy_route(
+            stream,
+            request.content_length.unwrap_or(0),
+            buffered_body,
+            read_timeout,
+            service.config.max_request_bytes(),
+        )
+        .await
+        {
+            Ok(body) => body,
+            Err(response) => return response.into(),
+        };
+        return route_claude_proxy_request(session, request, body, &service).await;
     }
 
     if request.target == VM_GIT_CLONE_PATH {
@@ -1223,6 +1852,35 @@ where
         return route_agent_run_prompt_request(run_id, &service).into();
     }
 
+    if let Some(run_id) = parse_agent_run_outcome_target(&request.target) {
+        let Some(broker_state) = services
+            .git_clone
+            .as_ref()
+            .map(|service| Arc::clone(&service.broker_state))
+        else {
+            return VmHttpResponse::text(VmHttpStatus::NotFound, "not found").into();
+        };
+        let Some(service) = services.agent_runs else {
+            return VmHttpResponse::text(VmHttpStatus::NotFound, "not found").into();
+        };
+        if request.method != "POST" {
+            return VmHttpResponse::text(VmHttpStatus::MethodNotAllowed, "method not allowed")
+                .into();
+        }
+        let body = match read_http_body_for_agent_run_outcome_route(
+            stream,
+            request.content_length.unwrap_or(0),
+            buffered_body,
+            read_timeout,
+        )
+        .await
+        {
+            Ok(body) => body,
+            Err(response) => return response.into(),
+        };
+        return route_agent_run_outcome_request(run_id, &body, &service, &broker_state).into();
+    }
+
     route_session_endpoint(session, request).into()
 }
 
@@ -1230,7 +1888,7 @@ async fn route_nix_cache_request<S: SecretStore>(
     session: &VmHttpSession,
     request: &VmHttpRequest,
     service: Option<VmHttpNixCacheService<S>>,
-) -> VmHttpDispatch {
+) -> VmHttpDispatch<S> {
     let Some(service) = service else {
         return route_nix_cache_request_without_upstream(request).into();
     };
@@ -1258,7 +1916,7 @@ async fn route_nix_cache_request<S: SecretStore>(
             Some(&route),
         )
         .into();
-    }
+    };
 
     let request_id = RequestId::new();
     if let Err(err) = record_nix_cache_request(
@@ -1376,7 +2034,7 @@ fn nix_cache_audit_route(
     }
 }
 
-fn nix_cache_auth_error_reason(err: VmHttpAuthError) -> &'static str {
+fn vm_http_auth_error_reason(err: VmHttpAuthError) -> &'static str {
     match err {
         VmHttpAuthError::MissingCredentials => "missing credentials",
         VmHttpAuthError::WrongCredentials => "wrong credentials",
@@ -1555,6 +2213,7 @@ impl<S: SecretStore> VmHttpNixCacheService<S> {
                 body,
                 content_length: None,
                 www_authenticate: None,
+                headers: Vec::new(),
             },
         }
     }
@@ -1648,6 +2307,7 @@ impl<S: SecretStore> VmHttpNixCacheService<S> {
                 body: Vec::new(),
                 content_length: Some(content_length),
                 www_authenticate: None,
+                headers: Vec::new(),
             };
             return VmHttpNixCacheProxyFetch {
                 upstream_url,
@@ -1717,6 +2377,7 @@ impl<S: SecretStore> VmHttpNixCacheService<S> {
                 body,
                 content_length: Some(content_length),
                 www_authenticate: None,
+                headers: Vec::new(),
             },
         }
     }
@@ -1797,11 +2458,59 @@ async fn read_upstream_body_bounded(
     Ok(body)
 }
 
+async fn read_claude_upstream_body_bounded(
+    mut response: reqwest::Response,
+    max: u64,
+) -> Result<Vec<u8>, VmHttpClaudeProxyBodyReadError> {
+    let mut body = Vec::new();
+    loop {
+        let chunk = match response.chunk().await {
+            Ok(Some(chunk)) => chunk,
+            Ok(None) => break,
+            Err(source) => {
+                return Err(VmHttpClaudeProxyBodyReadError::Request {
+                    source,
+                    bytes_read: body.len() as u64,
+                });
+            }
+        };
+        let chunk_len = u64::try_from(chunk.len()).expect("HTTP chunk length fits in u64");
+        let new_len = (body.len() as u64)
+            .checked_add(chunk_len)
+            .expect("HTTP response byte count overflowed before configured bound check");
+        if new_len > max {
+            return Err(VmHttpClaudeProxyBodyReadError::ResponseTooLarge {
+                max,
+                bytes_read: new_len,
+            });
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
 impl VmHttpNixCacheBodyReadError {
     fn audit_error_label(&self) -> &'static str {
         match self {
             Self::Request(_) => "upstream body read failed",
             Self::ResponseTooLarge { .. } => "upstream response too large",
+        }
+    }
+}
+
+impl VmHttpClaudeProxyBodyReadError {
+    fn audit_error_label(&self) -> &'static str {
+        match self {
+            Self::Request { .. } => "upstream body read failed",
+            Self::ResponseTooLarge { .. } => "upstream response too large",
+        }
+    }
+
+    fn bytes_read(&self) -> u64 {
+        match self {
+            Self::Request { bytes_read, .. } | Self::ResponseTooLarge { bytes_read, .. } => {
+                *bytes_read
+            }
         }
     }
 }
@@ -1831,6 +2540,369 @@ fn validate_nar_body_length(
     } else {
         Err(VmHttpNixCacheNarBodyLengthError::Mismatch { expected, actual })
     }
+}
+
+fn is_claude_proxy_target(target: &str) -> bool {
+    classify_claude_proxy_target(target).is_some()
+}
+
+fn classify_claude_proxy_target(target: &str) -> Option<ClaudeProxyAuditRoute> {
+    // Match on the path only. Anthropic's clients pass through query params
+    // such as `?beta=true` that select endpoint variants; the broker's policy
+    // is to drop those (similar to the `anthropic-beta` header allowlist) and
+    // forward a path-only request upstream.
+    let path = claude_proxy_target_path(target);
+    match path {
+        VM_CLAUDE_MESSAGES_PATH => Some(ClaudeProxyAuditRoute::Messages),
+        VM_CLAUDE_COUNT_TOKENS_PATH => Some(ClaudeProxyAuditRoute::CountTokens),
+        _ if claude_proxy_model_id(path).is_some() => Some(ClaudeProxyAuditRoute::Models),
+        _ if path.starts_with("/v1/messages/")
+            || path.starts_with("/v1/messages/count_tokens/")
+            || path.starts_with(VM_CLAUDE_MODELS_PREFIX)
+            || path == "/v1/models" =>
+        {
+            Some(ClaudeProxyAuditRoute::Unsupported)
+        }
+        _ => None,
+    }
+}
+
+fn claude_proxy_target_path(target: &str) -> &str {
+    target
+        .split_once('?')
+        .map(|(path, _)| path)
+        .unwrap_or(target)
+}
+
+fn claude_proxy_model_id(path: &str) -> Option<&str> {
+    let suffix = path.strip_prefix(VM_CLAUDE_MODELS_PREFIX)?;
+    if suffix.is_empty() || !suffix.bytes().all(is_claude_model_id_byte) {
+        return None;
+    }
+    Some(suffix)
+}
+
+fn is_claude_model_id_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')
+}
+
+struct ClaudeProxyForwardHeader {
+    name: reqwest::header::HeaderName,
+    value: reqwest::header::HeaderValue,
+}
+
+fn claude_proxy_forward_headers(
+    headers: &[VmHttpHeader],
+    anthropic_version: &reqwest::header::HeaderValue,
+) -> Result<Vec<ClaudeProxyForwardHeader>, &'static str> {
+    let mut forwarded = Vec::new();
+    let mut saw_content_type = false;
+    let mut saw_accept = false;
+    let mut saw_user_agent = false;
+
+    for header in headers {
+        let Some(name) = claude_proxy_forward_header_name(&header.name) else {
+            continue;
+        };
+        let duplicate = if name == reqwest::header::CONTENT_TYPE {
+            std::mem::replace(&mut saw_content_type, true)
+        } else if name == reqwest::header::ACCEPT {
+            std::mem::replace(&mut saw_accept, true)
+        } else if name == reqwest::header::USER_AGENT {
+            std::mem::replace(&mut saw_user_agent, true)
+        } else {
+            unreachable!("Claude proxy forward header classifier returned an unknown header")
+        };
+        if duplicate {
+            return Err("duplicate forwarded Claude header");
+        }
+        let value = reqwest::header::HeaderValue::from_str(&header.value)
+            .map_err(|_| "invalid forwarded Claude header value")?;
+        forwarded.push(ClaudeProxyForwardHeader { name, value });
+    }
+    forwarded.push(ClaudeProxyForwardHeader {
+        name: reqwest::header::HeaderName::from_static("anthropic-version"),
+        value: anthropic_version.clone(),
+    });
+    Ok(forwarded)
+}
+
+fn claude_proxy_forward_header_name(raw: &str) -> Option<reqwest::header::HeaderName> {
+    // Allowlist only. Notably absent: anthropic-beta. Beta features can opt
+    // into capabilities the operator has not authorized (e.g. extended file
+    // retention, computer-use tool surfaces), so the broker — not the guest
+    // — decides which betas to enable. Anthropic-Version is added separately
+    // by the broker and is not forwarded from the guest.
+    if raw.eq_ignore_ascii_case("content-type") {
+        return Some(reqwest::header::CONTENT_TYPE);
+    }
+    if raw.eq_ignore_ascii_case("accept") {
+        return Some(reqwest::header::ACCEPT);
+    }
+    if raw.eq_ignore_ascii_case("user-agent") {
+        return Some(reqwest::header::USER_AGENT);
+    }
+    None
+}
+
+fn claude_proxy_response_content_type(response: &reqwest::Response) -> &'static str {
+    let Some(content_type) = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return "application/json";
+    };
+    match content_type.split(';').next().map(str::trim) {
+        Some(media_type) if media_type.eq_ignore_ascii_case("application/json") => {
+            "application/json"
+        }
+        Some(media_type) if media_type.eq_ignore_ascii_case("application/problem+json") => {
+            "application/problem+json"
+        }
+        Some(media_type) if media_type.eq_ignore_ascii_case("text/event-stream") => {
+            "text/event-stream"
+        }
+        Some(media_type) if media_type.eq_ignore_ascii_case("text/plain") => {
+            "text/plain; charset=utf-8"
+        }
+        Some(media_type) if media_type.eq_ignore_ascii_case("application/octet-stream") => {
+            "application/octet-stream"
+        }
+        _ => "application/json",
+    }
+}
+
+fn claude_proxy_response_headers(
+    headers: &reqwest::header::HeaderMap,
+) -> Vec<VmHttpResponseHeader> {
+    let mut out = Vec::new();
+    for (name, value) in headers {
+        let Some(forward_name) = claude_proxy_response_header_name(name.as_str()) else {
+            continue;
+        };
+        let Ok(value) = value.to_str() else {
+            continue;
+        };
+        out.push(VmHttpResponseHeader {
+            name: forward_name,
+            value: value.to_string(),
+        });
+    }
+    out
+}
+
+fn claude_proxy_response_header_name(raw: &str) -> Option<&'static str> {
+    if raw.eq_ignore_ascii_case("request-id") {
+        return Some("Request-Id");
+    }
+    if raw.eq_ignore_ascii_case("retry-after") {
+        return Some("Retry-After");
+    }
+    if raw.eq_ignore_ascii_case("anthropic-ratelimit-requests-limit") {
+        return Some("Anthropic-Ratelimit-Requests-Limit");
+    }
+    if raw.eq_ignore_ascii_case("anthropic-ratelimit-requests-remaining") {
+        return Some("Anthropic-Ratelimit-Requests-Remaining");
+    }
+    if raw.eq_ignore_ascii_case("anthropic-ratelimit-requests-reset") {
+        return Some("Anthropic-Ratelimit-Requests-Reset");
+    }
+    if raw.eq_ignore_ascii_case("anthropic-ratelimit-tokens-limit") {
+        return Some("Anthropic-Ratelimit-Tokens-Limit");
+    }
+    if raw.eq_ignore_ascii_case("anthropic-ratelimit-tokens-remaining") {
+        return Some("Anthropic-Ratelimit-Tokens-Remaining");
+    }
+    if raw.eq_ignore_ascii_case("anthropic-ratelimit-tokens-reset") {
+        return Some("Anthropic-Ratelimit-Tokens-Reset");
+    }
+    None
+}
+
+fn claude_proxy_request_wants_streaming(body: &[u8]) -> bool {
+    serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| value.get("stream").and_then(serde_json::Value::as_bool))
+        .unwrap_or(false)
+}
+
+async fn route_claude_proxy_request<S: SecretStore>(
+    session: &VmHttpSession,
+    request: &VmHttpRequest,
+    body: Vec<u8>,
+    service: &VmHttpClaudeProxyService<S>,
+) -> VmHttpDispatch<S> {
+    let route = classify_claude_proxy_target(&request.target)
+        .expect("caller only routes classified Claude proxy targets");
+    if route == ClaudeProxyAuditRoute::Unsupported {
+        let response = VmHttpResponse::text(VmHttpStatus::NotFound, "not found");
+        return record_claude_proxy_local_response(
+            service,
+            session,
+            request,
+            route,
+            ClaudeProxyAuditDecision::Deny {
+                reason: "unsupported Claude proxy route".into(),
+            },
+            response,
+            None,
+        )
+        .into();
+    }
+    if request.method != claude_proxy_route_method(route).as_str() {
+        let response = VmHttpResponse::text(VmHttpStatus::MethodNotAllowed, "method not allowed");
+        return record_claude_proxy_local_response(
+            service,
+            session,
+            request,
+            route,
+            ClaudeProxyAuditDecision::Deny {
+                reason: "method not allowed".into(),
+            },
+            response,
+            None,
+        )
+        .into();
+    }
+
+    let headers =
+        match claude_proxy_forward_headers(&request.headers, service.config.anthropic_version()) {
+            Ok(headers) => headers,
+            Err(reason) => {
+                let response = VmHttpResponse::text(VmHttpStatus::BadRequest, reason);
+                return record_claude_proxy_local_response(
+                    service,
+                    session,
+                    request,
+                    route,
+                    ClaudeProxyAuditDecision::Deny {
+                        reason: reason.into(),
+                    },
+                    response,
+                    Some(reason),
+                )
+                .into();
+            }
+        };
+
+    let request_id = RequestId::new();
+    if let Err(err) =
+        service
+            .broker_state
+            .audit
+            .record_claude_proxy_request(&ClaudeProxyRequestRecord {
+                request_id,
+                session_id: session.session_id,
+                received_at: UnixMillis::now(),
+                method: &request.method,
+                target: &request.target,
+                route,
+                decision: &ClaudeProxyAuditDecision::Allow,
+            })
+    {
+        eprintln!("VM HTTP Claude proxy audit request write failed: {err}");
+        return VmHttpResponse::text(VmHttpStatus::InternalServerError, "audit write failed")
+            .into();
+    }
+
+    if claude_proxy_request_wants_streaming(&body) {
+        match service
+            .fetch_stream(request_id, request, body, headers)
+            .await
+        {
+            Ok(stream) => return VmHttpDispatch::ClaudeProxyStream(stream),
+            Err(fetch) => {
+                if let Err(err) = service.broker_state.audit.record_claude_proxy_outcome(
+                    &ClaudeProxyOutcomeRecord {
+                        request_id,
+                        completed_at: UnixMillis::now(),
+                        http_status: fetch.response.status.code(),
+                        upstream_url: fetch.upstream_url.as_deref(),
+                        upstream_status: fetch.upstream_status,
+                        response_bytes: fetch.response_bytes,
+                        error: fetch.error,
+                    },
+                ) {
+                    eprintln!("VM HTTP Claude proxy audit outcome write failed: {err}");
+                    return VmHttpResponse::text(
+                        VmHttpStatus::InternalServerError,
+                        "audit write failed",
+                    )
+                    .into();
+                }
+                return fetch.response.into();
+            }
+        }
+    }
+
+    let fetch = service.fetch(request, body, headers).await;
+    if let Err(err) =
+        service
+            .broker_state
+            .audit
+            .record_claude_proxy_outcome(&ClaudeProxyOutcomeRecord {
+                request_id,
+                completed_at: UnixMillis::now(),
+                http_status: fetch.response.status.code(),
+                upstream_url: fetch.upstream_url.as_deref(),
+                upstream_status: fetch.upstream_status,
+                response_bytes: fetch.response_bytes,
+                error: fetch.error,
+            })
+    {
+        eprintln!("VM HTTP Claude proxy audit outcome write failed: {err}");
+        return VmHttpResponse::text(VmHttpStatus::InternalServerError, "audit write failed")
+            .into();
+    }
+    fetch.response.into()
+}
+
+fn record_claude_proxy_local_response<S: SecretStore>(
+    service: &VmHttpClaudeProxyService<S>,
+    session: &VmHttpSession,
+    request: &VmHttpRequest,
+    route: ClaudeProxyAuditRoute,
+    decision: ClaudeProxyAuditDecision,
+    response: VmHttpResponse,
+    error: Option<&'static str>,
+) -> VmHttpResponse {
+    let request_id = RequestId::new();
+    if let Err(err) =
+        service
+            .broker_state
+            .audit
+            .record_claude_proxy_request(&ClaudeProxyRequestRecord {
+                request_id,
+                session_id: session.session_id,
+                received_at: UnixMillis::now(),
+                method: &request.method,
+                target: &request.target,
+                route,
+                decision: &decision,
+            })
+    {
+        eprintln!("VM HTTP Claude proxy audit request write failed: {err}");
+        return VmHttpResponse::text(VmHttpStatus::InternalServerError, "audit write failed");
+    }
+    if let Err(err) =
+        service
+            .broker_state
+            .audit
+            .record_claude_proxy_outcome(&ClaudeProxyOutcomeRecord {
+                request_id,
+                completed_at: UnixMillis::now(),
+                http_status: response.status.code(),
+                upstream_url: None,
+                upstream_status: None,
+                response_bytes: response.body.len() as u64,
+                error,
+            })
+    {
+        eprintln!("VM HTTP Claude proxy audit outcome write failed: {err}");
+        return VmHttpResponse::text(VmHttpStatus::InternalServerError, "audit write failed");
+    }
+    response
 }
 
 impl VmHttpNixCacheNarLengthError {
@@ -2016,6 +3088,17 @@ fn parse_agent_run_prompt_target(target: &str) -> Option<AgentRunId> {
     raw_id.parse().ok()
 }
 
+fn parse_agent_run_outcome_target(target: &str) -> Option<AgentRunId> {
+    let suffix = target
+        .strip_prefix(VM_AGENT_RUN_PATH_PREFIX)?
+        .strip_prefix('/')?;
+    let raw_id = suffix.strip_suffix(&format!("/{VM_AGENT_RUN_OUTCOME_PATH_SUFFIX}"))?;
+    if raw_id.contains('/') {
+        return None;
+    }
+    raw_id.parse().ok()
+}
+
 fn route_agent_run_prompt_request(
     run_id: AgentRunId,
     service: &VmHttpAgentRunService,
@@ -2027,6 +3110,202 @@ fn route_agent_run_prompt_request(
         VmHttpStatus::Ok,
         &VmAgentRunPromptResponse::new(run_id, prompt),
     )
+}
+
+fn route_agent_run_outcome_request(
+    run_id: AgentRunId,
+    body: &[u8],
+    service: &VmHttpAgentRunService,
+    broker_state: &BrokerState<impl SecretStore>,
+) -> VmHttpResponse {
+    match broker_state.audit.get_agent_run_outcome(run_id) {
+        Ok(Some(_)) => return VmHttpResponse::text(VmHttpStatus::Ok, "ok"),
+        Ok(None) => {}
+        Err(err) => {
+            eprintln!("VM HTTP agent run outcome audit lookup failed: {err}");
+            return VmHttpResponse::text(VmHttpStatus::InternalServerError, "audit read failed");
+        }
+    }
+    let upload = match serde_json::from_slice::<VmAgentRunOutcomeUpload>(body) {
+        Ok(upload) => upload,
+        Err(_) => return VmHttpResponse::text(VmHttpStatus::BadRequest, "invalid outcome JSON"),
+    };
+    if upload.run_id != run_id {
+        return VmHttpResponse::text(VmHttpStatus::BadRequest, "outcome run ID mismatch");
+    }
+
+    let outcome = match materialize_agent_run_outcome_upload(upload, service.log_root()) {
+        Ok(outcome) => outcome,
+        Err(response) => return response,
+    };
+    if let Err(err) = broker_state
+        .audit
+        .record_agent_run_outcome(&AgentRunOutcomeAuditRecord {
+            completed_at: UnixMillis::now(),
+            outcome,
+        })
+    {
+        eprintln!("VM HTTP agent run outcome audit write failed: {err}");
+        return VmHttpResponse::text(VmHttpStatus::InternalServerError, "audit write failed");
+    }
+    VmHttpResponse::text(VmHttpStatus::Ok, "ok")
+}
+
+fn materialize_agent_run_outcome_upload(
+    upload: VmAgentRunOutcomeUpload,
+    log_root: &Path,
+) -> Result<AgentRunOutcome, VmHttpResponse> {
+    if !log_root.is_absolute() {
+        return Err(VmHttpResponse::text(
+            VmHttpStatus::InternalServerError,
+            "agent run log root is invalid",
+        ));
+    }
+    let run_dir = log_root.join(upload.run_id.to_string());
+    create_private_dir(&run_dir).map_err(|err| {
+        eprintln!("VM HTTP agent run outcome log directory write failed: {err}");
+        VmHttpResponse::text(
+            VmHttpStatus::InternalServerError,
+            "agent run log write failed",
+        )
+    })?;
+    let stdout_path = run_dir.join("stdout.log");
+    let stderr_path = run_dir.join("stderr.log");
+    let stdout = materialize_agent_run_stream(upload.stdout, &stdout_path)?;
+    let stderr = materialize_agent_run_stream(upload.stderr, &stderr_path)?;
+    Ok(AgentRunOutcome {
+        run_id: upload.run_id,
+        status: upload.status,
+        exit_code: upload.exit_code,
+        stdout,
+        stderr,
+    })
+}
+
+fn materialize_agent_run_stream(
+    upload: AgentRunStreamUpload,
+    path: &Path,
+) -> Result<AgentRunStreamSummary, VmHttpResponse> {
+    let retained = decode_base64_standard(&upload.retained_base64).map_err(|_| {
+        VmHttpResponse::text(VmHttpStatus::BadRequest, "invalid outcome stream base64")
+    })?;
+    let retained_len = retained.len() as u64;
+    if upload.byte_len > MAX_AGENT_RUN_STREAM_AUDIT_BYTES {
+        return Err(VmHttpResponse::text(
+            VmHttpStatus::BadRequest,
+            "outcome stream byte count exceeds audit limit",
+        ));
+    }
+    if !is_sha256_hex(&upload.sha256_hex) || !is_sha256_hex(&upload.retained_sha256_hex) {
+        return Err(VmHttpResponse::text(
+            VmHttpStatus::BadRequest,
+            "invalid outcome stream hash",
+        ));
+    }
+    if crate::agent_run::sha256_hex(&retained) != upload.retained_sha256_hex {
+        return Err(VmHttpResponse::text(
+            VmHttpStatus::BadRequest,
+            "outcome stream retained hash mismatch",
+        ));
+    }
+    if retained_len > upload.byte_len {
+        return Err(VmHttpResponse::text(
+            VmHttpStatus::BadRequest,
+            "outcome stream retained bytes exceed total byte count",
+        ));
+    }
+    if upload.truncated {
+        if retained_len >= upload.byte_len {
+            return Err(VmHttpResponse::text(
+                VmHttpStatus::BadRequest,
+                "truncated outcome stream must have uncaptured bytes",
+            ));
+        }
+    } else if retained_len != upload.byte_len {
+        return Err(VmHttpResponse::text(
+            VmHttpStatus::BadRequest,
+            "untruncated outcome stream retained bytes must match total byte count",
+        ));
+    } else if crate::agent_run::sha256_hex(&retained) != upload.sha256_hex {
+        return Err(VmHttpResponse::text(
+            VmHttpStatus::BadRequest,
+            "untruncated outcome stream hash mismatch",
+        ));
+    }
+
+    let (audited_byte_len, audited_sha256_hex) = if upload.truncated {
+        (retained_len, upload.retained_sha256_hex)
+    } else {
+        (upload.byte_len, upload.sha256_hex)
+    };
+
+    write_private_file(path, &retained).map_err(|err| {
+        eprintln!("VM HTTP agent run outcome stream write failed: {err}");
+        VmHttpResponse::text(
+            VmHttpStatus::InternalServerError,
+            "agent run log write failed",
+        )
+    })?;
+    Ok(AgentRunStreamSummary {
+        path: path.to_path_buf(),
+        byte_len: audited_byte_len,
+        sha256_hex: audited_sha256_hex,
+        truncated: upload.truncated,
+    })
+}
+
+fn is_sha256_hex(raw: &str) -> bool {
+    // Lowercase-only: agent_run::sha256_hex emits lowercase, and the
+    // downstream byte-string comparison is case-sensitive. Accepting
+    // uppercase here would only let it fail later with a misleading hash
+    // mismatch error.
+    raw.len() == 64
+        && raw
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+fn create_private_dir(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true).mode(0o700);
+        builder.create(path)?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(path)
+    }
+}
+
+fn write_private_file(path: &Path, body: &[u8]) -> std::io::Result<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = match options.open(path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            let existing = std::fs::read(path)?;
+            if existing == body {
+                return Ok(());
+            }
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!("{} already exists with different contents", path.display()),
+            ));
+        }
+        Err(err) => return Err(err),
+    };
+    use std::io::Write as _;
+    file.write_all(body)?;
+    file.sync_all()
 }
 
 fn is_nix_cache_target(target: &str) -> bool {
@@ -2126,6 +3405,61 @@ async fn read_http_body_for_git_clone_route<R: AsyncRead + Unpin>(
     }
 }
 
+async fn read_http_body_for_claude_proxy_route<R: AsyncRead + Unpin>(
+    stream: &mut R,
+    content_length: usize,
+    buffered_body: Vec<u8>,
+    read_timeout: std::time::Duration,
+    max: usize,
+) -> Result<Vec<u8>, VmHttpResponse> {
+    read_http_body_for_route(stream, content_length, buffered_body, read_timeout, max).await
+}
+
+async fn read_http_body_for_agent_run_outcome_route<R: AsyncRead + Unpin>(
+    stream: &mut R,
+    content_length: usize,
+    buffered_body: Vec<u8>,
+    read_timeout: std::time::Duration,
+) -> Result<Vec<u8>, VmHttpResponse> {
+    read_http_body_for_route(
+        stream,
+        content_length,
+        buffered_body,
+        read_timeout,
+        MAX_VM_HTTP_AGENT_RUN_OUTCOME_BODY_BYTES,
+    )
+    .await
+}
+
+async fn read_http_body_for_route<R: AsyncRead + Unpin>(
+    stream: &mut R,
+    content_length: usize,
+    buffered_body: Vec<u8>,
+    read_timeout: std::time::Duration,
+    max: usize,
+) -> Result<Vec<u8>, VmHttpResponse> {
+    match tokio::time::timeout(
+        read_timeout,
+        read_http_body_bounded(stream, content_length, buffered_body, max),
+    )
+    .await
+    {
+        Err(_) => Err(VmHttpResponse::text(
+            VmHttpStatus::BadRequest,
+            "incomplete request body",
+        )),
+        Ok(Ok(body)) => Ok(body),
+        Ok(Err(err)) if err.kind() == std::io::ErrorKind::InvalidData => Err(VmHttpResponse::text(
+            VmHttpStatus::BadRequest,
+            err.to_string(),
+        )),
+        Ok(Err(_)) => Err(VmHttpResponse::text(
+            VmHttpStatus::BadRequest,
+            "incomplete request body",
+        )),
+    }
+}
+
 async fn handle_git_clone_request<S: SecretStore + Send + Sync>(
     session: &VmHttpSession,
     body: &[u8],
@@ -2176,6 +3510,7 @@ async fn handle_git_clone_request<S: SecretStore + Send + Sync>(
             body: bundle,
             content_length: None,
             www_authenticate: None,
+            headers: Vec::new(),
         },
         Err(message) => git_error_response(
             VmHttpStatus::InternalServerError,
@@ -2442,21 +3777,26 @@ fn parse_http_head(raw: &[u8], peer_addr: SocketAddr) -> Result<VmHttpRequest, V
 
     let mut authorization = None;
     let mut content_length = None;
+    let mut headers = Vec::new();
     for line in lines {
         let Some((name, value)) = line.split_once(':') else {
             return Err(VmHttpParseError::MalformedHeader);
         };
+        let value = value.trim().to_string();
+        headers.push(VmHttpHeader {
+            name: name.to_string(),
+            value: value.clone(),
+        });
         if name.eq_ignore_ascii_case("authorization") {
             if authorization.is_some() {
                 return Err(VmHttpParseError::DuplicateAuthorization);
             }
-            authorization = Some(value.trim().to_string());
+            authorization = Some(value.clone());
         }
         if name.eq_ignore_ascii_case("content-length") {
             if content_length.is_some() {
                 return Err(VmHttpParseError::DuplicateContentLength);
             }
-            let value = value.trim();
             if value.is_empty() || value.starts_with('+') || value.starts_with('-') {
                 return Err(VmHttpParseError::InvalidContentLength);
             }
@@ -2476,6 +3816,7 @@ fn parse_http_head(raw: &[u8], peer_addr: SocketAddr) -> Result<VmHttpRequest, V
         target: target.to_string(),
         authorization,
         content_length,
+        headers,
         peer_addr,
     })
 }
@@ -2488,6 +3829,7 @@ impl VmHttpResponse {
             body: serde_json::to_vec(value).expect("VM HTTP response always serializes"),
             content_length: None,
             www_authenticate: None,
+            headers: Vec::new(),
         }
     }
 
@@ -2498,6 +3840,7 @@ impl VmHttpResponse {
             body: body.into().into_bytes(),
             content_length: None,
             www_authenticate: None,
+            headers: Vec::new(),
         }
     }
 
@@ -2508,6 +3851,7 @@ impl VmHttpResponse {
             body: body.into().into_bytes(),
             content_length: None,
             www_authenticate: Some(challenge),
+            headers: Vec::new(),
         }
     }
 
@@ -2528,22 +3872,59 @@ impl VmHttpResponse {
         if let Some(challenge) = self.www_authenticate {
             out.extend_from_slice(format!("WWW-Authenticate: {challenge}\r\n").as_bytes());
         }
+        for header in &self.headers {
+            out.extend_from_slice(format!("{}: {}\r\n", header.name, header.value).as_bytes());
+        }
         out.extend_from_slice(b"\r\n");
         out.extend_from_slice(&self.body);
         out
     }
 }
 
-impl From<VmHttpResponse> for VmHttpDispatch {
+async fn write_http_response_head<W: AsyncWrite + Unpin>(
+    out: &mut W,
+    status: VmHttpStatus,
+    content_type: &'static str,
+    content_length: Option<u64>,
+    www_authenticate: Option<&'static str>,
+    headers: &[VmHttpResponseHeader],
+) -> std::io::Result<()> {
+    let mut head = format!(
+        "HTTP/1.1 {}\r\nContent-Type: {}\r\nConnection: close\r\n",
+        status.status_line(),
+        content_type,
+    );
+    if let Some(content_length) = content_length {
+        head.push_str(&format!("Content-Length: {content_length}\r\n"));
+    }
+    if let Some(challenge) = www_authenticate {
+        head.push_str(&format!("WWW-Authenticate: {challenge}\r\n"));
+    }
+    for header in headers {
+        head.push_str(&format!("{}: {}\r\n", header.name, header.value));
+    }
+    head.push_str("\r\n");
+    out.write_all(head.as_bytes()).await
+}
+
+impl<S: SecretStore> From<VmHttpResponse> for VmHttpDispatch<S> {
     fn from(response: VmHttpResponse) -> Self {
         Self::Buffered(response)
     }
 }
 
-impl VmHttpDispatch {
+impl<S: SecretStore> VmHttpDispatch<S> {
     async fn write_to<W: AsyncWrite + Unpin>(self, out: &mut W) -> std::io::Result<()> {
         match self {
             Self::Buffered(response) => out.write_all(&response.to_bytes()).await,
+            Self::ClaudeProxyStream(response) => response.write_to(out).await,
+        }
+    }
+
+    fn status_code(&self) -> u16 {
+        match self {
+            Self::Buffered(response) => response.status.code(),
+            Self::ClaudeProxyStream(response) => response.upstream_status,
         }
     }
 
@@ -2551,22 +3932,32 @@ impl VmHttpDispatch {
     fn into_buffered(self) -> VmHttpResponse {
         match self {
             Self::Buffered(response) => response,
+            Self::ClaudeProxyStream(_) => panic!("expected buffered VM HTTP response"),
         }
     }
 }
 
 impl VmHttpStatus {
-    fn status_line(self) -> &'static str {
+    fn status_line(self) -> Cow<'static, str> {
         match self {
-            Self::Ok => "200 OK",
-            Self::BadRequest => "400 Bad Request",
-            Self::Unauthorized => "401 Unauthorized",
-            Self::Forbidden => "403 Forbidden",
-            Self::NotFound => "404 Not Found",
-            Self::MethodNotAllowed => "405 Method Not Allowed",
-            Self::Gone => "410 Gone",
-            Self::BadGateway => "502 Bad Gateway",
-            Self::InternalServerError => "500 Internal Server Error",
+            Self::Ok => "200 OK".into(),
+            Self::BadRequest => "400 Bad Request".into(),
+            Self::Unauthorized => "401 Unauthorized".into(),
+            Self::Forbidden => "403 Forbidden".into(),
+            Self::NotFound => "404 Not Found".into(),
+            Self::MethodNotAllowed => "405 Method Not Allowed".into(),
+            Self::Gone => "410 Gone".into(),
+            Self::BadGateway => "502 Bad Gateway".into(),
+            Self::InternalServerError => "500 Internal Server Error".into(),
+            Self::Upstream(200) => "200 OK".into(),
+            Self::Upstream(400) => "400 Bad Request".into(),
+            Self::Upstream(401) => "401 Unauthorized".into(),
+            Self::Upstream(403) => "403 Forbidden".into(),
+            Self::Upstream(404) => "404 Not Found".into(),
+            Self::Upstream(429) => "429 Too Many Requests".into(),
+            Self::Upstream(500) => "500 Internal Server Error".into(),
+            Self::Upstream(529) => "529 Overloaded".into(),
+            Self::Upstream(code) => format!("{code} Upstream").into(),
         }
     }
 
@@ -2581,6 +3972,7 @@ impl VmHttpStatus {
             Self::Gone => 410,
             Self::BadGateway => 502,
             Self::InternalServerError => 500,
+            Self::Upstream(code) => code,
         }
     }
 }
@@ -2618,6 +4010,11 @@ fn base64_standard(input: &[u8]) -> String {
         }
     }
     out
+}
+
+fn decode_base64_standard(input: &str) -> Result<Vec<u8>, base64::DecodeError> {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.decode(input)
 }
 
 fn report_vm_http_handler_result(result: Result<std::io::Result<()>, tokio::task::JoinError>) {
@@ -2668,6 +4065,7 @@ mod tests {
         VmHttpServices {
             git_clone: Some(git_clone),
             nix_cache: None,
+            claude_proxy: None,
             agent_runs: None,
         }
     }
@@ -2678,6 +4076,18 @@ mod tests {
         VmHttpServices {
             git_clone: None,
             nix_cache: Some(nix_cache),
+            claude_proxy: None,
+            agent_runs: None,
+        }
+    }
+
+    fn services_with_claude_proxy(
+        claude_proxy: VmHttpClaudeProxyService<Box<dyn SecretStore>>,
+    ) -> TestVmHttpServices {
+        VmHttpServices {
+            git_clone: None,
+            nix_cache: None,
+            claude_proxy: Some(claude_proxy),
             agent_runs: None,
         }
     }
@@ -2745,9 +4155,19 @@ mod tests {
     }
 
     fn make_broker_state(server: &MockServer) -> Arc<BrokerState<Box<dyn SecretStore>>> {
+        make_broker_state_with_extra_secret(server, None)
+    }
+
+    fn make_broker_state_with_extra_secret(
+        server: &MockServer,
+        extra_secret: Option<(SecretKey, &str)>,
+    ) -> Arc<BrokerState<Box<dyn SecretStore>>> {
         let pk = SecretKey::new("gh-app-pk").unwrap();
         let store = InMemStore::default();
         store.put(&pk, TEST_PRIV).unwrap();
+        if let Some((key, value)) = extra_secret {
+            store.put(&key, value).unwrap();
+        }
         Arc::new(BrokerState {
             audit: AuditLog::open_in_memory().unwrap(),
             minter: GitHubMinter::new(
@@ -3088,6 +4508,76 @@ esac
         )
     }
 
+    async fn serve_raw_http_once(response: String) -> (String, Arc<Mutex<String>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let captured = Arc::new(Mutex::new(String::new()));
+        let captured_for_task = Arc::clone(&captured);
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buf = [0u8; 512];
+            loop {
+                let read = stream.read(&mut buf).await.unwrap();
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buf[..read]);
+                if let Some(head_end) = request.windows(4).position(|window| window == b"\r\n\r\n")
+                {
+                    let head_end = head_end + 4;
+                    let head = String::from_utf8_lossy(&request[..head_end]);
+                    let content_length = head
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().ok())
+                                .flatten()
+                        })
+                        .unwrap_or(0);
+                    while request.len() < head_end + content_length {
+                        let read = stream.read(&mut buf).await.unwrap();
+                        if read == 0 {
+                            break;
+                        }
+                        request.extend_from_slice(&buf[..read]);
+                    }
+                    break;
+                }
+            }
+            *captured_for_task.lock().unwrap() = String::from_utf8_lossy(&request).into_owned();
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+        (format!("http://{addr}/"), captured)
+    }
+
+    fn raw_http_response(status: &str, content_type: &str, body: &[u8]) -> String {
+        format!(
+            "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            String::from_utf8_lossy(body)
+        )
+    }
+
+    fn raw_http_response_with_headers(
+        status: &str,
+        content_type: &str,
+        headers: &[(&str, &str)],
+        body: &[u8],
+    ) -> String {
+        let mut response = format!(
+            "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n",
+            body.len(),
+        );
+        for (name, value) in headers {
+            response.push_str(&format!("{name}: {value}\r\n"));
+        }
+        response.push_str("\r\n");
+        response.push_str(&String::from_utf8_lossy(body));
+        response
+    }
+
     fn nix_cache_request(
         method: impl Into<String>,
         target: impl Into<String>,
@@ -3275,6 +4765,61 @@ esac
         assert!(constant_time_eq(expected, expected));
         assert!(!constant_time_eq(b"test", expected));
         assert!(!constant_time_eq(b"test-token-extra", expected));
+    }
+
+    #[test]
+    fn classify_claude_proxy_target_recognizes_supported_routes() {
+        assert_eq!(
+            classify_claude_proxy_target("/v1/messages"),
+            Some(ClaudeProxyAuditRoute::Messages),
+        );
+        assert_eq!(
+            classify_claude_proxy_target("/v1/messages/count_tokens"),
+            Some(ClaudeProxyAuditRoute::CountTokens),
+        );
+        assert_eq!(
+            classify_claude_proxy_target("/v1/models/claude-haiku-4-5-20251001"),
+            Some(ClaudeProxyAuditRoute::Models),
+        );
+    }
+
+    #[test]
+    fn classify_claude_proxy_target_treats_models_listing_and_empty_id_as_unsupported() {
+        assert_eq!(
+            classify_claude_proxy_target("/v1/models"),
+            Some(ClaudeProxyAuditRoute::Unsupported),
+        );
+        assert_eq!(
+            classify_claude_proxy_target("/v1/models/"),
+            Some(ClaudeProxyAuditRoute::Unsupported),
+        );
+        assert_eq!(
+            classify_claude_proxy_target("/v1/models/foo/bar"),
+            Some(ClaudeProxyAuditRoute::Unsupported),
+        );
+    }
+
+    #[test]
+    fn classify_claude_proxy_target_rejects_unrelated_paths() {
+        assert_eq!(classify_claude_proxy_target("/v2/models/foo"), None);
+        assert_eq!(classify_claude_proxy_target("/health"), None);
+        assert_eq!(classify_claude_proxy_target(""), None);
+    }
+
+    #[test]
+    fn classify_claude_proxy_target_strips_query_string() {
+        assert_eq!(
+            classify_claude_proxy_target("/v1/messages?beta=true"),
+            Some(ClaudeProxyAuditRoute::Messages),
+        );
+        assert_eq!(
+            classify_claude_proxy_target("/v1/messages/count_tokens?beta=true"),
+            Some(ClaudeProxyAuditRoute::CountTokens),
+        );
+        assert_eq!(
+            classify_claude_proxy_target("/v1/models/claude-haiku-4-5-20251001?beta=true"),
+            Some(ClaudeProxyAuditRoute::Models),
+        );
     }
 
     proptest! {
@@ -3541,6 +5086,40 @@ esac
     }
 
     #[test]
+    fn claude_proxy_upstream_join_preserves_non_root_base_path() {
+        let config = VmHttpClaudeProxyConfig::new(
+            "https://proxy.example.test/anthropic",
+            SecretKey::new("anthropic-api-key").unwrap(),
+            VmHttpClaudeProxyAuthKind::XApiKey,
+            std::time::Duration::from_secs(5),
+            1024,
+            1024,
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.upstream_base_url().as_str(),
+            "https://proxy.example.test/anthropic/"
+        );
+        assert_eq!(
+            config
+                .upstream_base_url()
+                .join("v1/messages")
+                .unwrap()
+                .as_str(),
+            "https://proxy.example.test/anthropic/v1/messages"
+        );
+        assert_eq!(
+            config
+                .upstream_base_url()
+                .join("v1/messages/count_tokens")
+                .unwrap()
+                .as_str(),
+            "https://proxy.example.test/anthropic/v1/messages/count_tokens"
+        );
+    }
+
+    #[test]
     fn nix_cache_nar_length_must_be_declared_and_bounded() {
         assert_eq!(validate_nar_content_length(Some(42), 42), Ok(42));
         assert_eq!(
@@ -3583,7 +5162,8 @@ esac
 
     #[test]
     fn agent_run_prompt_route_returns_prompt_once() {
-        let service = VmHttpAgentRunService::new();
+        let temp = tempfile::tempdir().unwrap();
+        let service = VmHttpAgentRunService::with_log_root(temp.path().join("agent-runs"));
         let run_id: AgentRunId = "00000000-0000-0000-0000-000000000401".parse().unwrap();
         let prompt = AgentPrompt::new("SECRET prompt");
         service.insert_prompt(run_id, prompt.clone());
@@ -3599,6 +5179,853 @@ esac
 
         let second = route_agent_run_prompt_request(run_id, &service);
         assert_eq!(second.status, VmHttpStatus::NotFound);
+    }
+
+    #[tokio::test]
+    async fn agent_run_outcome_route_records_audit_and_materializes_retained_streams() {
+        let github = MockServer::start().await;
+        let state = make_broker_state(&github);
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::LOCALHOST, 32).unwrap());
+        open_audit_session(&state, session.session_id());
+        let run_id: AgentRunId = "00000000-0000-0000-0000-000000000402".parse().unwrap();
+        state
+            .audit
+            .record_agent_run(&crate::audit::AgentRunAuditRecord {
+                run_id,
+                session_id: session.session_id(),
+                requested_at: UnixMillis::now(),
+                agent_kind: crate::core::AgentKind::Claude,
+                prompt: AgentPrompt::new("prompt").summary(),
+            })
+            .unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let service = VmHttpAgentRunService::with_log_root(temp.path().join("agent-runs"));
+        let upload = VmAgentRunOutcomeUpload {
+            run_id,
+            status: crate::agent_run::AgentRunTerminalStatus::Succeeded,
+            exit_code: 0,
+            stdout: AgentRunStreamUpload {
+                byte_len: 6,
+                sha256_hex: crate::agent_run::sha256_hex(b"Hello\n"),
+                truncated: false,
+                retained_sha256_hex: crate::agent_run::sha256_hex(b"Hello\n"),
+                retained_base64: base64_standard(b"Hello\n"),
+            },
+            stderr: AgentRunStreamUpload {
+                byte_len: 0,
+                sha256_hex: crate::agent_run::sha256_hex(b""),
+                truncated: false,
+                retained_sha256_hex: crate::agent_run::sha256_hex(b""),
+                retained_base64: base64_standard(b""),
+            },
+        };
+        let body = serde_json::to_vec(&upload).unwrap();
+        let prewritten =
+            materialize_agent_run_outcome_upload(upload.clone(), service.log_root()).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&prewritten.stdout.path).unwrap(),
+            "Hello\n"
+        );
+
+        let response = route_agent_run_outcome_request(run_id, &body, &service, &state);
+
+        assert_eq!(response.status, VmHttpStatus::Ok);
+        let outcome = state.audit.get_agent_run_outcome(run_id).unwrap().unwrap();
+        assert_eq!(
+            outcome.outcome.status,
+            crate::agent_run::AgentRunTerminalStatus::Succeeded
+        );
+        assert_eq!(
+            std::fs::read_to_string(&outcome.outcome.stdout.path).unwrap(),
+            "Hello\n"
+        );
+        assert!(outcome.outcome.stdout.path.starts_with(temp.path()));
+
+        let retried = route_agent_run_outcome_request(run_id, &body, &service, &state);
+        assert_eq!(retried.status, VmHttpStatus::Ok);
+    }
+
+    #[tokio::test]
+    async fn agent_run_outcome_rejects_unbounded_or_mismatched_truncated_streams() {
+        let github = MockServer::start().await;
+        let state = make_broker_state(&github);
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::LOCALHOST, 32).unwrap());
+        open_audit_session(&state, session.session_id());
+        let run_id: AgentRunId = "00000000-0000-0000-0000-000000000403".parse().unwrap();
+        state
+            .audit
+            .record_agent_run(&crate::audit::AgentRunAuditRecord {
+                run_id,
+                session_id: session.session_id(),
+                requested_at: UnixMillis::now(),
+                agent_kind: crate::core::AgentKind::Claude,
+                prompt: AgentPrompt::new("prompt").summary(),
+            })
+            .unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let service = VmHttpAgentRunService::with_log_root(temp.path().join("agent-runs"));
+        let valid_stderr = AgentRunStreamUpload {
+            byte_len: 0,
+            sha256_hex: crate::agent_run::sha256_hex(b""),
+            truncated: false,
+            retained_sha256_hex: crate::agent_run::sha256_hex(b""),
+            retained_base64: base64_standard(b""),
+        };
+        let upload = VmAgentRunOutcomeUpload {
+            run_id,
+            status: crate::agent_run::AgentRunTerminalStatus::Succeeded,
+            exit_code: 0,
+            stdout: AgentRunStreamUpload {
+                byte_len: u64::MAX,
+                sha256_hex: crate::agent_run::sha256_hex(b"untrusted full stream"),
+                truncated: true,
+                retained_sha256_hex: crate::agent_run::sha256_hex(b"H"),
+                retained_base64: base64_standard(b"H"),
+            },
+            stderr: valid_stderr.clone(),
+        };
+
+        let response = route_agent_run_outcome_request(
+            run_id,
+            &serde_json::to_vec(&upload).unwrap(),
+            &service,
+            &state,
+        );
+
+        assert_eq!(response.status, VmHttpStatus::BadRequest);
+        let upload = VmAgentRunOutcomeUpload {
+            stdout: AgentRunStreamUpload {
+                byte_len: 2,
+                sha256_hex: crate::agent_run::sha256_hex(b"Hi"),
+                truncated: true,
+                retained_sha256_hex: crate::agent_run::sha256_hex(b"not-H"),
+                retained_base64: base64_standard(b"H"),
+            },
+            stderr: valid_stderr.clone(),
+            ..upload
+        };
+        let response = route_agent_run_outcome_request(
+            run_id,
+            &serde_json::to_vec(&upload).unwrap(),
+            &service,
+            &state,
+        );
+        assert_eq!(response.status, VmHttpStatus::BadRequest);
+
+        let upload = VmAgentRunOutcomeUpload {
+            stdout: AgentRunStreamUpload {
+                byte_len: 2,
+                sha256_hex: crate::agent_run::sha256_hex(b"unverified full stream"),
+                truncated: true,
+                retained_sha256_hex: crate::agent_run::sha256_hex(b"H"),
+                retained_base64: base64_standard(b"H"),
+            },
+            stderr: valid_stderr,
+            ..upload
+        };
+        let response = route_agent_run_outcome_request(
+            run_id,
+            &serde_json::to_vec(&upload).unwrap(),
+            &service,
+            &state,
+        );
+        assert_eq!(response.status, VmHttpStatus::Ok);
+        let outcome = state.audit.get_agent_run_outcome(run_id).unwrap().unwrap();
+        assert_eq!(outcome.outcome.stdout.byte_len, 1);
+        assert_eq!(
+            outcome.outcome.stdout.sha256_hex,
+            crate::agent_run::sha256_hex(b"H")
+        );
+    }
+
+    #[tokio::test]
+    async fn claude_proxy_strips_guest_auth_and_injects_host_auth() {
+        let upstream_body = br#"{"content":[{"type":"text","text":"Hello from upstream"}]}"#;
+        let (upstream_url, captured) = serve_raw_http_once(raw_http_response_with_headers(
+            "200 OK",
+            "application/json",
+            &[
+                ("request-id", "req-test-123"),
+                ("anthropic-ratelimit-requests-remaining", "42"),
+            ],
+            upstream_body,
+        ))
+        .await;
+        let github = MockServer::start().await;
+        let secret_key = SecretKey::new("anthropic-api-key").unwrap();
+        let state = make_broker_state_with_extra_secret(
+            &github,
+            Some((secret_key.clone(), "host-anthropic-key")),
+        );
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::LOCALHOST, 32).unwrap());
+        open_audit_session(&state, session.session_id());
+        let service = VmHttpClaudeProxyService::new(
+            Arc::clone(&state),
+            VmHttpClaudeProxyConfig::new_with_anthropic_version(
+                upstream_url,
+                secret_key,
+                VmHttpClaudeProxyAuthKind::XApiKey,
+                "2024-10-22",
+                std::time::Duration::from_secs(5),
+                1024,
+                1024,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let mut request = VmHttpRequest::new(
+            "POST",
+            VM_CLAUDE_MESSAGES_PATH,
+            Some(bearer(token().as_str())),
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 34567)),
+        );
+        request.headers = vec![
+            VmHttpHeader {
+                name: "Authorization".into(),
+                value: bearer(token().as_str()),
+            },
+            VmHttpHeader {
+                name: "X-Api-Key".into(),
+                value: "guest-x-api-key".into(),
+            },
+            VmHttpHeader {
+                name: "Cookie".into(),
+                value: "session=guest".into(),
+            },
+            VmHttpHeader {
+                name: "Anthropic-Version".into(),
+                value: "2023-06-01".into(),
+            },
+            VmHttpHeader {
+                name: "Anthropic-Beta".into(),
+                value: "guest-beta".into(),
+            },
+            VmHttpHeader {
+                name: "Content-Type".into(),
+                value: "application/json".into(),
+            },
+        ];
+
+        let response = route_claude_proxy_request(
+            &session,
+            &request,
+            br#"{"model":"test"}"#.to_vec(),
+            &service,
+        )
+        .await
+        .into_buffered();
+
+        assert_eq!(response.status, VmHttpStatus::Upstream(200));
+        assert_eq!(response.content_type, "application/json");
+        assert_eq!(response.body, upstream_body);
+        assert_eq!(
+            response.headers,
+            vec![
+                VmHttpResponseHeader {
+                    name: "Request-Id",
+                    value: "req-test-123".into(),
+                },
+                VmHttpResponseHeader {
+                    name: "Anthropic-Ratelimit-Requests-Remaining",
+                    value: "42".into(),
+                },
+            ]
+        );
+        let upstream_request = captured.lock().unwrap().clone();
+        let lower = upstream_request.to_ascii_lowercase();
+        assert!(
+            upstream_request.starts_with("POST /v1/messages HTTP/1.1"),
+            "{upstream_request}"
+        );
+        assert!(
+            lower.contains("x-api-key: host-anthropic-key"),
+            "{upstream_request}"
+        );
+        assert!(
+            lower.contains("anthropic-version: 2024-10-22"),
+            "{upstream_request}"
+        );
+        assert!(!lower.contains("anthropic-beta:"), "{upstream_request}");
+        assert!(
+            lower.contains("content-type: application/json"),
+            "{upstream_request}"
+        );
+        assert!(
+            !upstream_request.contains(token().as_str()),
+            "{upstream_request}"
+        );
+        assert!(
+            !upstream_request.contains("guest-x-api-key"),
+            "{upstream_request}"
+        );
+        assert!(!lower.contains("cookie:"), "{upstream_request}");
+        assert!(
+            upstream_request.ends_with(r#"{"model":"test"}"#),
+            "{upstream_request}"
+        );
+    }
+
+    #[tokio::test]
+    async fn claude_proxy_messages_with_beta_query_strips_to_upstream_path() {
+        let upstream_body = br#"{"content":[]}"#;
+        let (upstream_url, captured) = serve_raw_http_once(raw_http_response(
+            "200 OK",
+            "application/json",
+            upstream_body,
+        ))
+        .await;
+        let github = MockServer::start().await;
+        let secret_key = SecretKey::new("anthropic-api-key").unwrap();
+        let state = make_broker_state_with_extra_secret(
+            &github,
+            Some((secret_key.clone(), "host-anthropic-key")),
+        );
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::LOCALHOST, 32).unwrap());
+        open_audit_session(&state, session.session_id());
+        let service = VmHttpClaudeProxyService::new(
+            Arc::clone(&state),
+            VmHttpClaudeProxyConfig::new(
+                upstream_url,
+                secret_key,
+                VmHttpClaudeProxyAuthKind::XApiKey,
+                std::time::Duration::from_secs(5),
+                1024,
+                1024,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let request = VmHttpRequest::new(
+            "POST",
+            "/v1/messages?beta=true",
+            Some(bearer(token().as_str())),
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 34567)),
+        );
+
+        let response = route_claude_proxy_request(
+            &session,
+            &request,
+            br#"{"model":"test"}"#.to_vec(),
+            &service,
+        )
+        .await
+        .into_buffered();
+
+        assert_eq!(response.status, VmHttpStatus::Upstream(200));
+        let upstream_request = captured.lock().unwrap().clone();
+        assert!(
+            upstream_request.starts_with("POST /v1/messages HTTP/1.1"),
+            "{upstream_request}"
+        );
+        assert!(!upstream_request.contains("?beta="), "{upstream_request}");
+        let entries = state
+            .audit
+            .list_claude_proxy_requests_for_session_for_test(session.session_id())
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, ClaudeProxyAuditRoute::Messages);
+        assert_eq!(entries[0].1, ClaudeProxyAuditDecision::Allow);
+        assert_eq!(entries[0].2, Some(200));
+    }
+
+    #[tokio::test]
+    async fn claude_proxy_models_route_proxies_get_to_upstream() {
+        let upstream_body = br#"{"id":"claude-haiku-4-5-20251001","type":"model"}"#;
+        let (upstream_url, captured) = serve_raw_http_once(raw_http_response(
+            "200 OK",
+            "application/json",
+            upstream_body,
+        ))
+        .await;
+        let github = MockServer::start().await;
+        let secret_key = SecretKey::new("anthropic-api-key").unwrap();
+        let state = make_broker_state_with_extra_secret(
+            &github,
+            Some((secret_key.clone(), "host-anthropic-key")),
+        );
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::LOCALHOST, 32).unwrap());
+        open_audit_session(&state, session.session_id());
+        let service = VmHttpClaudeProxyService::new(
+            Arc::clone(&state),
+            VmHttpClaudeProxyConfig::new(
+                upstream_url,
+                secret_key,
+                VmHttpClaudeProxyAuthKind::XApiKey,
+                std::time::Duration::from_secs(5),
+                1024,
+                1024,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let request = VmHttpRequest::new(
+            "GET",
+            "/v1/models/claude-haiku-4-5-20251001",
+            Some(bearer(token().as_str())),
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 34567)),
+        );
+
+        let response = route_claude_proxy_request(&session, &request, Vec::new(), &service)
+            .await
+            .into_buffered();
+
+        assert_eq!(response.status, VmHttpStatus::Upstream(200));
+        assert_eq!(response.body, upstream_body);
+        let upstream_request = captured.lock().unwrap().clone();
+        assert!(
+            upstream_request
+                .starts_with("GET /v1/models/claude-haiku-4-5-20251001 HTTP/1.1"),
+            "{upstream_request}"
+        );
+        assert!(
+            upstream_request
+                .to_ascii_lowercase()
+                .contains("x-api-key: host-anthropic-key"),
+            "{upstream_request}"
+        );
+        let entries = state
+            .audit
+            .list_claude_proxy_requests_for_session_for_test(session.session_id())
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, ClaudeProxyAuditRoute::Models);
+        assert_eq!(entries[0].1, ClaudeProxyAuditDecision::Allow);
+        assert_eq!(entries[0].2, Some(200));
+    }
+
+    #[tokio::test]
+    async fn claude_proxy_models_route_rejects_post_with_method_not_allowed() {
+        let github = MockServer::start().await;
+        let secret_key = SecretKey::new("anthropic-api-key").unwrap();
+        let state = make_broker_state(&github);
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::LOCALHOST, 32).unwrap());
+        open_audit_session(&state, session.session_id());
+        let service = VmHttpClaudeProxyService::new(
+            Arc::clone(&state),
+            VmHttpClaudeProxyConfig::new(
+                "http://127.0.0.1:9/",
+                secret_key,
+                VmHttpClaudeProxyAuthKind::XApiKey,
+                std::time::Duration::from_millis(10),
+                1024,
+                1024,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let request = VmHttpRequest::new(
+            "POST",
+            "/v1/models/claude-haiku-4-5-20251001",
+            Some(bearer(token().as_str())),
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 34567)),
+        );
+
+        let response = route_claude_proxy_request(&session, &request, Vec::new(), &service)
+            .await
+            .into_buffered();
+
+        assert_eq!(response.status, VmHttpStatus::MethodNotAllowed);
+        let entries = state
+            .audit
+            .list_claude_proxy_requests_for_session_for_test(session.session_id())
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, ClaudeProxyAuditRoute::Models);
+        assert_eq!(
+            entries[0].1,
+            ClaudeProxyAuditDecision::Deny {
+                reason: "method not allowed".into()
+            }
+        );
+        assert_eq!(entries[0].2, Some(405));
+    }
+
+    #[tokio::test]
+    async fn claude_proxy_missing_host_secret_is_bad_gateway_without_upstream_call() {
+        let github = MockServer::start().await;
+        let secret_key = SecretKey::new("anthropic-api-key").unwrap();
+        let state = make_broker_state(&github);
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::LOCALHOST, 32).unwrap());
+        open_audit_session(&state, session.session_id());
+        let service = VmHttpClaudeProxyService::new(
+            Arc::clone(&state),
+            VmHttpClaudeProxyConfig::new(
+                "http://127.0.0.1:9/",
+                secret_key,
+                VmHttpClaudeProxyAuthKind::XApiKey,
+                std::time::Duration::from_millis(10),
+                1024,
+                1024,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let request = VmHttpRequest::new(
+            "POST",
+            VM_CLAUDE_MESSAGES_PATH,
+            Some(bearer(token().as_str())),
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 34567)),
+        );
+
+        let response = route_claude_proxy_request(
+            &session,
+            &request,
+            br#"{"model":"test"}"#.to_vec(),
+            &service,
+        )
+        .await
+        .into_buffered();
+
+        assert_eq!(response.status, VmHttpStatus::BadGateway);
+        assert_eq!(
+            String::from_utf8(response.body).unwrap(),
+            "Claude proxy auth missing"
+        );
+    }
+
+    #[tokio::test]
+    async fn claude_proxy_bearer_auth_overrides_guest_authorization() {
+        let upstream_body = br#"{"content":[]}"#;
+        let (upstream_url, captured) = serve_raw_http_once(raw_http_response(
+            "200 OK",
+            "application/json",
+            upstream_body,
+        ))
+        .await;
+        let github = MockServer::start().await;
+        let secret_key = SecretKey::new("anthropic-bearer-token").unwrap();
+        let state = make_broker_state_with_extra_secret(
+            &github,
+            Some((secret_key.clone(), "host-bearer-token")),
+        );
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::LOCALHOST, 32).unwrap());
+        open_audit_session(&state, session.session_id());
+        let service = VmHttpClaudeProxyService::new(
+            Arc::clone(&state),
+            VmHttpClaudeProxyConfig::new(
+                upstream_url,
+                secret_key,
+                VmHttpClaudeProxyAuthKind::AuthorizationBearer,
+                std::time::Duration::from_secs(5),
+                1024,
+                1024,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let mut request = VmHttpRequest::new(
+            "POST",
+            VM_CLAUDE_MESSAGES_PATH,
+            Some(bearer(token().as_str())),
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 34567)),
+        );
+        request.headers = vec![VmHttpHeader {
+            name: "Authorization".into(),
+            value: "Bearer guest-evil".into(),
+        }];
+
+        let response = route_claude_proxy_request(
+            &session,
+            &request,
+            br#"{"model":"test"}"#.to_vec(),
+            &service,
+        )
+        .await
+        .into_buffered();
+
+        assert_eq!(response.status, VmHttpStatus::Upstream(200));
+        let upstream_request = captured.lock().unwrap().clone();
+        let lower = upstream_request.to_ascii_lowercase();
+        assert!(
+            lower.contains("authorization: bearer host-bearer-token"),
+            "{upstream_request}"
+        );
+        assert!(
+            !upstream_request.contains("guest-evil"),
+            "{upstream_request}"
+        );
+        assert!(
+            !upstream_request.contains(token().as_str()),
+            "{upstream_request}"
+        );
+    }
+
+    #[tokio::test]
+    async fn claude_proxy_rejects_duplicate_forwarded_headers() {
+        let github = MockServer::start().await;
+        let secret_key = SecretKey::new("anthropic-api-key").unwrap();
+        let state = make_broker_state_with_extra_secret(
+            &github,
+            Some((secret_key.clone(), "host-anthropic-key")),
+        );
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::LOCALHOST, 32).unwrap());
+        open_audit_session(&state, session.session_id());
+        let service = VmHttpClaudeProxyService::new(
+            Arc::clone(&state),
+            VmHttpClaudeProxyConfig::new(
+                "http://127.0.0.1:9/",
+                secret_key,
+                VmHttpClaudeProxyAuthKind::XApiKey,
+                std::time::Duration::from_millis(10),
+                1024,
+                1024,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let mut request = VmHttpRequest::new(
+            "POST",
+            VM_CLAUDE_MESSAGES_PATH,
+            Some(bearer(token().as_str())),
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 34567)),
+        );
+        request.headers = vec![
+            VmHttpHeader {
+                name: "Content-Type".into(),
+                value: "application/json".into(),
+            },
+            VmHttpHeader {
+                name: "content-type".into(),
+                value: "text/plain".into(),
+            },
+        ];
+
+        let response = route_claude_proxy_request(
+            &session,
+            &request,
+            br#"{"model":"test"}"#.to_vec(),
+            &service,
+        )
+        .await
+        .into_buffered();
+
+        assert_eq!(response.status, VmHttpStatus::BadRequest);
+    }
+
+    #[tokio::test]
+    async fn claude_proxy_streams_sse_and_records_outcome_after_write() {
+        let upstream_body = b"event: message_start\n\ndata: {\"type\":\"done\"}\n\n";
+        let (upstream_url, _captured) = serve_raw_http_once(raw_http_response_with_headers(
+            "200 OK",
+            "text/event-stream",
+            &[("request-id", "req-stream-123")],
+            upstream_body,
+        ))
+        .await;
+        let github = MockServer::start().await;
+        let secret_key = SecretKey::new("anthropic-api-key").unwrap();
+        let state = make_broker_state_with_extra_secret(
+            &github,
+            Some((secret_key.clone(), "host-anthropic-key")),
+        );
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::LOCALHOST, 32).unwrap());
+        open_audit_session(&state, session.session_id());
+        let service = VmHttpClaudeProxyService::new(
+            Arc::clone(&state),
+            VmHttpClaudeProxyConfig::new(
+                upstream_url,
+                secret_key,
+                VmHttpClaudeProxyAuthKind::XApiKey,
+                std::time::Duration::from_secs(5),
+                1024,
+                1024,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let request = VmHttpRequest::new(
+            "POST",
+            VM_CLAUDE_MESSAGES_PATH,
+            Some(bearer(token().as_str())),
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 34567)),
+        );
+        let dispatch = route_claude_proxy_request(
+            &session,
+            &request,
+            br#"{"model":"test","stream":true}"#.to_vec(),
+            &service,
+        )
+        .await;
+        let request_id = match &dispatch {
+            VmHttpDispatch::ClaudeProxyStream(stream) => stream.request_id,
+            VmHttpDispatch::Buffered(response) => {
+                panic!("expected streaming response, got {response:?}")
+            }
+        };
+        assert!(
+            state
+                .audit
+                .claude_proxy_outcome_for_test(request_id)
+                .unwrap()
+                .is_none(),
+            "streaming outcome must not be recorded before the response is written"
+        );
+        let (mut client, mut server) = tokio::io::duplex(4096);
+
+        let writer = tokio::spawn(async move { dispatch.write_to(&mut server).await.unwrap() });
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        writer.await.unwrap();
+        let response = String::from_utf8(response).unwrap();
+
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response}");
+        assert!(
+            response.contains("Content-Type: text/event-stream\r\n"),
+            "{response}"
+        );
+        assert!(!response.contains("Content-Length:"), "{response}");
+        assert!(
+            response.contains("Request-Id: req-stream-123\r\n"),
+            "{response}"
+        );
+        assert!(
+            response.ends_with(std::str::from_utf8(upstream_body).unwrap()),
+            "{response}"
+        );
+        let outcome = state
+            .audit
+            .claude_proxy_outcome_for_test(request_id)
+            .unwrap()
+            .expect("streaming outcome should be recorded after write_to");
+        assert_eq!(outcome, (200, upstream_body.len() as u64, None));
+    }
+
+    #[tokio::test]
+    async fn claude_proxy_streaming_records_response_too_large() {
+        let upstream_body = b"0123456789";
+        let (upstream_url, _captured) = serve_raw_http_once(raw_http_response_with_headers(
+            "200 OK",
+            "text/event-stream",
+            &[],
+            upstream_body,
+        ))
+        .await;
+        let github = MockServer::start().await;
+        let secret_key = SecretKey::new("anthropic-api-key").unwrap();
+        let state = make_broker_state_with_extra_secret(
+            &github,
+            Some((secret_key.clone(), "host-anthropic-key")),
+        );
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::LOCALHOST, 32).unwrap());
+        open_audit_session(&state, session.session_id());
+        let service = VmHttpClaudeProxyService::new(
+            Arc::clone(&state),
+            VmHttpClaudeProxyConfig::new(
+                upstream_url,
+                secret_key,
+                VmHttpClaudeProxyAuthKind::XApiKey,
+                std::time::Duration::from_secs(5),
+                1024,
+                5,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let request = VmHttpRequest::new(
+            "POST",
+            VM_CLAUDE_MESSAGES_PATH,
+            Some(bearer(token().as_str())),
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 34567)),
+        );
+        let dispatch = route_claude_proxy_request(
+            &session,
+            &request,
+            br#"{"model":"test","stream":true}"#.to_vec(),
+            &service,
+        )
+        .await;
+        let request_id = match &dispatch {
+            VmHttpDispatch::ClaudeProxyStream(stream) => stream.request_id,
+            VmHttpDispatch::Buffered(response) => {
+                panic!("expected streaming response, got {response:?}")
+            }
+        };
+        let (mut client, mut server) = tokio::io::duplex(4096);
+
+        let writer = tokio::spawn(async move { dispatch.write_to(&mut server).await.unwrap() });
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        writer.await.unwrap();
+        let response = String::from_utf8(response).unwrap();
+
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response}");
+        assert!(
+            response.contains("Content-Type: text/event-stream\r\n"),
+            "{response}"
+        );
+        assert!(
+            !response.ends_with(std::str::from_utf8(upstream_body).unwrap()),
+            "{response}"
+        );
+        let outcome = state
+            .audit
+            .claude_proxy_outcome_for_test(request_id)
+            .unwrap()
+            .expect("streaming outcome should be recorded after write_to");
+        assert_eq!(
+            outcome,
+            (
+                200,
+                upstream_body.len() as u64,
+                Some("upstream response too large".to_string())
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn claude_proxy_auth_denial_is_audited_without_contacting_upstream() {
+        let github = MockServer::start().await;
+        let secret_key = SecretKey::new("anthropic-api-key").unwrap();
+        let state = make_broker_state_with_extra_secret(
+            &github,
+            Some((secret_key.clone(), "host-anthropic-key")),
+        );
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+        open_audit_session(&state, session.session_id());
+        let service = VmHttpClaudeProxyService::new(
+            Arc::clone(&state),
+            VmHttpClaudeProxyConfig::new(
+                "http://127.0.0.1:9/",
+                secret_key,
+                VmHttpClaudeProxyAuthKind::XApiKey,
+                std::time::Duration::from_millis(10),
+                1024,
+                1024,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let raw_head = format!("POST {VM_CLAUDE_MESSAGES_PATH} HTTP/1.1\r\n\r\n").into_bytes();
+        let mut stream = tokio::io::empty();
+
+        let response = dispatch_vm_http_head_and_body(
+            &session,
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 12345)),
+            VmHttpHeadRead {
+                raw_head,
+                buffered_body: Vec::new(),
+            },
+            &mut stream,
+            services_with_claude_proxy(service),
+            VM_HTTP_READ_TIMEOUT,
+        )
+        .await
+        .into_buffered();
+
+        assert_eq!(response.status, VmHttpStatus::Unauthorized);
+        let entries = state
+            .audit
+            .list_claude_proxy_requests_for_session_for_test(session.session_id())
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, ClaudeProxyAuditRoute::Messages);
+        assert_eq!(
+            entries[0].1,
+            ClaudeProxyAuditDecision::Deny {
+                reason: "missing credentials".into()
+            }
+        );
+        assert_eq!(entries[0].2, Some(401));
     }
 
     async fn route_nix_cache_with_service(
@@ -5025,6 +7452,7 @@ esac
             range,
             git_clone_config_for_test(&temp, write_fake_git(temp.path())),
             nix_cache_config_for_test(),
+            temp.path().join("agent-runs"),
         );
         let session_id = "51b8fd0f-6c10-454c-b0e6-7df1d60e2e6d".parse().unwrap();
         let source_ipv4 = Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap();
@@ -5052,6 +7480,7 @@ esac
             BrokerPortRange::new(1024, 65535).unwrap(),
             git_clone_config_for_test(&temp, write_fake_git(temp.path())),
             nix_cache_config_for_test(),
+            temp.path().join("agent-runs"),
         );
         let session_id = "51b8fd0f-6c10-454c-b0e6-7df1d60e2e6d".parse().unwrap();
         let source_ipv4 = Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap();
@@ -5515,6 +7944,7 @@ work_root=${{work_dir%/*}}
             session.clone(),
             service,
             VmHttpNixCacheService::new(Arc::clone(&state), nix_cache_config_for_test()),
+            None,
             None,
             shutdown_rx,
         ));

@@ -261,6 +261,10 @@ impl<S: SecretStore> GitHubMinter<S> {
         self.config.requires_agent_kind()
     }
 
+    pub(crate) fn secret_store(&self) -> &S {
+        &self.secrets
+    }
+
     /// Mint using the GitHub App selected by the session-level agent kind.
     ///
     /// In legacy single-App mode the one configured App is used for all

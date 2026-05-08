@@ -93,6 +93,61 @@
           };
         });
 
+      # claude-code in nixpkgs is a thin wrapper around a prebuilt Linux
+      # binary downloaded from upstream. The wrapper derivation refuses to
+      # build on Darwin (it uses makeBinaryWrapper and autoPatchelfHook), and
+      # no public substituter currently caches the aarch64-linux output. Since
+      # the upstream artifact is already a self-contained binary, fetch it
+      # directly on the build host and lay it out as /bin/claude. The
+      # derivation runs on `buildPkgs.system` (e.g. aarch64-darwin) but the
+      # file it emits is a Linux executable that the guest VM can run.
+      mkGuestClaudeCode = buildPkgs: guestSystem:
+        let
+          manifest = lib.importJSON
+            "${nixpkgs}/pkgs/by-name/cl/claude-code/manifest.json";
+          platformKey = {
+            aarch64-linux = "linux-arm64-musl";
+            x86_64-linux = "linux-x64-musl";
+          }.${guestSystem} or (throw
+            "unsupported guest system for claude-code: ${guestSystem}");
+          platformEntry = manifest.platforms.${platformKey};
+          baseUrl = "https://storage.googleapis.com/claude-code-dist-86c565f3-f756-42ad-8dfa-d59b1c096819/claude-code-releases";
+          binary = buildPkgs.fetchurl {
+            url = "${baseUrl}/${manifest.version}/${platformKey}/claude";
+            sha256 = platformEntry.checksum;
+          };
+          cross = guestCross guestSystem;
+          crossPkgs = buildPkgs.pkgsCross.${cross.pkgsCross};
+          muslLoaderName = {
+            aarch64-linux = "ld-musl-aarch64.so.1";
+            x86_64-linux = "ld-musl-x86_64.so.1";
+          }.${guestSystem} or (throw
+            "unsupported guest system for musl loader: ${guestSystem}");
+          muslLoader = "${crossPkgs.musl}/lib/${muslLoaderName}";
+        in
+        buildPkgs.runCommand "claude-code-${manifest.version}-${guestSystem}"
+          {
+            nativeBuildInputs = [ buildPkgs.patchelf ];
+            passthru = {
+              inherit (manifest) version;
+              guestSystem = guestSystem;
+              platformKey = platformKey;
+              muslLoader = muslLoader;
+            };
+            meta = {
+              description =
+                "Prebuilt claude-code ${manifest.version} ${platformKey} binary for agent VM guest images";
+            };
+          }
+          ''
+            install -Dm0755 ${binary} $out/bin/claude
+            # The upstream binary's ELF interpreter is /lib/ld-musl-<arch>.so.1,
+            # but the Nix-style guest rootfs has no /lib. Point it at a real
+            # store path; nix2container will pull the musl closure into the
+            # image automatically.
+            patchelf --set-interpreter ${muslLoader} $out/bin/claude
+          '';
+
       mkAgentVmGuestImage = buildPkgs: nix2containerPkgs: {
         guestSystem,
         includeProofTools ? false
@@ -100,6 +155,7 @@
         let
           guestPkgs = mkPkgs guestSystem;
           writVm = mkCrossWritVm buildPkgs guestSystem;
+          claudeCode = mkGuestClaudeCode buildPkgs guestSystem;
           imageName =
             if includeProofTools
             then "writ-agent-vm-guest-proof"
@@ -109,6 +165,7 @@
             then "Darwin-buildable OCI archive for agent VM proof harnesses"
             else "Darwin-buildable OCI archive for daemon-managed writ agent VMs";
           guestRequiredBins = [
+            "claude"
             "git"
             "ip"
             "nix"
@@ -168,6 +225,7 @@
             name = "writ-agent-vm-guest-root";
             paths = [
               writVm
+              claudeCode
               guestPkgs.bash
               guestPkgs.cacert
               guestPkgs.coreutils

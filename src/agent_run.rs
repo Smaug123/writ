@@ -15,6 +15,7 @@ use uuid::Uuid;
 pub const VM_AGENT_RUN_PATH_PREFIX: &str = "/v1/agent-runs";
 pub const MAX_AGENT_PROMPT_BYTES: usize = 1024 * 1024;
 pub const DEFAULT_AGENT_RUN_STREAM_CAPTURE_BYTES: u64 = 1024 * 1024;
+pub const VM_AGENT_RUN_OUTCOME_PATH_SUFFIX: &str = "outcome";
 
 #[derive(Copy, Clone, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -52,6 +53,24 @@ pub struct AgentRunOutcome {
     pub exit_code: i32,
     pub stdout: AgentRunStreamSummary,
     pub stderr: AgentRunStreamSummary,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AgentRunStreamUpload {
+    pub byte_len: u64,
+    pub sha256_hex: String,
+    pub truncated: bool,
+    pub retained_sha256_hex: String,
+    pub retained_base64: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct VmAgentRunOutcomeUpload {
+    pub run_id: AgentRunId,
+    pub status: AgentRunTerminalStatus,
+    pub exit_code: i32,
+    pub stdout: AgentRunStreamUpload,
+    pub stderr: AgentRunStreamUpload,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -191,6 +210,10 @@ pub fn vm_agent_run_prompt_path(run_id: AgentRunId) -> String {
     format!("{VM_AGENT_RUN_PATH_PREFIX}/{run_id}/prompt")
 }
 
+pub fn vm_agent_run_outcome_path(run_id: AgentRunId) -> String {
+    format!("{VM_AGENT_RUN_PATH_PREFIX}/{run_id}/{VM_AGENT_RUN_OUTCOME_PATH_SUFFIX}")
+}
+
 #[cfg(any(feature = "host", feature = "vm-client"))]
 pub fn sha256_hex(bytes: &[u8]) -> String {
     let digest = ring::digest::digest(&ring::digest::SHA256, bytes);
@@ -228,6 +251,8 @@ mod process_runner {
         program: PathBuf,
         args: Vec<OsString>,
         cwd: Option<PathBuf>,
+        env: Vec<(OsString, OsString)>,
+        env_remove: Vec<OsString>,
         max_stream_capture_bytes: u64,
     }
 
@@ -276,6 +301,8 @@ mod process_runner {
                 program,
                 args: args.into_iter().collect(),
                 cwd: None,
+                env: Vec::new(),
+                env_remove: Vec::new(),
                 max_stream_capture_bytes: DEFAULT_AGENT_RUN_STREAM_CAPTURE_BYTES,
             })
         }
@@ -292,8 +319,26 @@ mod process_runner {
             &self.args
         }
 
+        pub fn env(&self) -> &[(OsString, OsString)] {
+            &self.env
+        }
+
+        pub fn env_remove(&self) -> &[OsString] {
+            &self.env_remove
+        }
+
         pub fn with_cwd(mut self, cwd: impl Into<PathBuf>) -> Self {
             self.cwd = Some(cwd.into());
+            self
+        }
+
+        pub fn with_env(mut self, key: impl Into<OsString>, value: impl Into<OsString>) -> Self {
+            self.env.push((key.into(), value.into()));
+            self
+        }
+
+        pub fn with_env_remove(mut self, key: impl Into<OsString>) -> Self {
+            self.env_remove.push(key.into());
             self
         }
 
@@ -309,8 +354,7 @@ mod process_runner {
         log_root: &Path,
     ) -> Result<AgentRunOutcome, AgentProcessRunError> {
         // Stream files are durable audit artifacts. The lifecycle owner must
-        // define retention and quota policy before this runner is used for
-        // real Claude/Codex traffic.
+        // define retention and quota policy for this log root.
         ensure_private_dir(log_root)?;
         let run_dir = log_root.join(plan.run_id.to_string());
         create_private_dir(&run_dir)?;
@@ -326,6 +370,10 @@ mod process_runner {
                 .stderr(Stdio::piped());
             if let Some(cwd) = &plan.cwd {
                 command.current_dir(cwd);
+            }
+            command.envs(plan.env.iter().map(|(key, value)| (key, value)));
+            for key in &plan.env_remove {
+                command.env_remove(key);
             }
             command.spawn().map_err(AgentProcessRunError::Spawn)?
         };

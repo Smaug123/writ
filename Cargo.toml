@@ -14,7 +14,7 @@ host = [
     "dep:rusqlite",
     "dep:xz2",
 ]
-vm-client = ["dep:reqwest", "dep:ring"]
+vm-client = ["dep:base64", "dep:reqwest", "dep:ring"]
 
 [[bin]]
 name = "writ"

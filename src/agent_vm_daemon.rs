@@ -190,7 +190,17 @@ if ! cd "$destination"; then
   while :; do sleep 3600; done
 fi
 touch /run/writ-agent-vm/bootstrap-ok
-exec "$@"
+# Run the agent as a child rather than exec-ing it, so the container outlives
+# the agent. Otherwise an agent that finishes (or crashes) within the
+# daemon's poll interval can race the bootstrap-ok signal: the next poll
+# would see a dying container instead of the ok file. The daemon owns
+# teardown via the stop API.
+set +e
+"$@" > /run/writ-agent-vm/agent.stdout 2> /run/writ-agent-vm/agent.stderr
+agent_code=$?
+set -e
+printf '%s\n' "$agent_code" > /run/writ-agent-vm/agent.exit
+while :; do sleep 3600; done
 "#;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -476,7 +486,8 @@ impl AgentVmDaemon {
                 agent_kind,
                 prompt: prompt.summary(),
             })?;
-            let agent_runs = VmHttpAgentRunService::new();
+            let agent_runs =
+                VmHttpAgentRunService::with_log_root(self.config.vm_http.agent_run_log_root());
             agent_runs.insert_prompt(run_id, prompt.clone());
             let guest_command = build_agent_run_guest_command(agent_kind, run_id, workspace.warm);
             self.start_session_after_audit_opened(
@@ -1260,6 +1271,7 @@ mod tests {
                         NixTrustedPublicKeys::from_strings([TEST_NIX_CACHE_PUBLIC_KEY]).unwrap(),
                     )
                     .unwrap(),
+                    dir.join("agent-runs"),
                 ),
             )
             .unwrap(),

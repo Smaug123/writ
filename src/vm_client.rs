@@ -14,7 +14,9 @@ use std::process::{Command, ExitStatus, Stdio};
 use reqwest::Url;
 
 use crate::agent_run::{
-    AgentPrompt, AgentRunId, VmAgentRunPromptResponse, vm_agent_run_prompt_path,
+    AgentPrompt, AgentRunId, AgentRunOutcome, AgentRunStreamSummary, AgentRunStreamUpload,
+    VmAgentRunOutcomeUpload, VmAgentRunPromptResponse, vm_agent_run_outcome_path,
+    vm_agent_run_prompt_path,
 };
 use crate::bearer::is_bearer_token_byte;
 use crate::vm_git::{
@@ -333,6 +335,27 @@ pub async fn fetch_agent_run_prompt(
         .map_err(VmClientError::from)
 }
 
+pub async fn upload_agent_run_outcome(
+    config: &VmClientConfig,
+    outcome: &AgentRunOutcome,
+) -> Result<(), VmClientError> {
+    let upload = VmAgentRunOutcomeUpload {
+        run_id: outcome.run_id,
+        status: outcome.status.clone(),
+        exit_code: outcome.exit_code,
+        stdout: agent_run_stream_upload(&outcome.stdout)?,
+        stderr: agent_run_stream_upload(&outcome.stderr)?,
+    };
+    let response = reqwest::Client::new()
+        .post(config.endpoint(&vm_agent_run_outcome_path(outcome.run_id)))
+        .bearer_auth(config.bearer_token().as_str())
+        .json(&upload)
+        .send()
+        .await?;
+    require_success(response).await?;
+    Ok(())
+}
+
 pub async fn clone_from_broker(
     config: &VmClientConfig,
     command: &VmGitCloneCommand,
@@ -382,6 +405,28 @@ async fn fetch_git_clone_bundle(
     let response = require_success(response).await?;
     require_content_type(&response, GIT_BUNDLE_CONTENT_TYPE)?;
     read_bounded_bundle_body(response, config.max_bundle_bytes()).await
+}
+
+fn agent_run_stream_upload(
+    summary: &AgentRunStreamSummary,
+) -> Result<AgentRunStreamUpload, VmClientError> {
+    let retained = fs::read(&summary.path).map_err(|source| VmClientError::Io {
+        operation: "read agent run stream",
+        path: summary.path.clone(),
+        source,
+    })?;
+    Ok(AgentRunStreamUpload {
+        byte_len: summary.byte_len,
+        sha256_hex: summary.sha256_hex.clone(),
+        truncated: summary.truncated,
+        retained_sha256_hex: crate::agent_run::sha256_hex(&retained),
+        retained_base64: base64_standard(&retained),
+    })
+}
+
+fn base64_standard(input: &[u8]) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.encode(input)
 }
 
 fn clone_bundle_with_git(
@@ -1193,6 +1238,56 @@ mod tests {
             "{request}"
         );
         assert!(!format!("{fetched:?}").contains(prompt.as_str()));
+    }
+
+    #[tokio::test]
+    async fn upload_agent_run_outcome_posts_stream_metadata_and_retained_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let run_id: AgentRunId = "00000000-0000-0000-0000-000000000502".parse().unwrap();
+        let stdout_path = dir.path().join("stdout.log");
+        let stderr_path = dir.path().join("stderr.log");
+        fs::write(&stdout_path, b"Hello from Claude\n").unwrap();
+        fs::write(&stderr_path, b"").unwrap();
+        let outcome = AgentRunOutcome {
+            run_id,
+            status: crate::agent_run::AgentRunTerminalStatus::Succeeded,
+            exit_code: 0,
+            stdout: AgentRunStreamSummary {
+                path: stdout_path,
+                byte_len: 18,
+                sha256_hex: crate::agent_run::sha256_hex(b"Hello from Claude\n"),
+                truncated: false,
+            },
+            stderr: AgentRunStreamSummary {
+                path: stderr_path,
+                byte_len: 0,
+                sha256_hex: crate::agent_run::sha256_hex(b""),
+                truncated: false,
+            },
+        };
+        let (broker_url, captured) = serve_once(http_response("200 OK", "text/plain", b"ok")).await;
+        let config = VmClientConfig::new(broker_url, "writ-vm-secret").unwrap();
+
+        upload_agent_run_outcome(&config, &outcome).await.unwrap();
+
+        let request = captured.lock().unwrap().clone();
+        assert!(
+            request.starts_with(
+                "POST /v1/agent-runs/00000000-0000-0000-0000-000000000502/outcome HTTP/1.1"
+            ),
+            "{request}"
+        );
+        assert!(
+            request.contains("authorization: Bearer writ-vm-secret")
+                || request.contains("Authorization: Bearer writ-vm-secret"),
+            "{request}"
+        );
+        assert!(request.contains(r#""exit_code":0"#), "{request}");
+        assert!(
+            request.contains(r#""retained_base64":"SGVsbG8gZnJvbSBDbGF1ZGUK""#),
+            "{request}"
+        );
+        assert!(!request.contains("Hello from Claude"), "{request}");
     }
 
     #[tokio::test]

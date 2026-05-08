@@ -38,6 +38,17 @@ pub struct BrokerState<S: SecretStore> {
     pub policy: PolicyConfig,
 }
 
+impl<S: SecretStore> BrokerState<S> {
+    /// Broker-wide secret access for services that are not GitHub minters.
+    ///
+    /// The minter owns the concrete store because older construction paths
+    /// build it that way, but callers should depend on the broker boundary
+    /// rather than reaching through the GitHub-specific facade.
+    pub(crate) fn secret_store(&self) -> &S {
+        self.minter.secret_store()
+    }
+}
+
 #[derive(Clone, Eq, PartialEq)]
 pub(crate) enum CapabilityOutcome {
     Granted {

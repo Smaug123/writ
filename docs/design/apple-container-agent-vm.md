@@ -616,11 +616,14 @@ First daemon-owned VM HTTP runtime slice implemented in `src/vm_http.rs`,
 - `DaemonConfig` now accepts an optional `agent_vm.vm_http` block containing
   the wildcard/listen address, broker port range, Git binary, askpass program,
   token environment variable name, Git clone base URL, Git work root, clone
-  timeout, and maximum returned bundle size. `writd` parses that block at
-  startup into the typed `VmHttpGitRuntimeConfig`, so bad port ranges, unsafe
-  clone base URLs, relative askpass/work-root paths, invalid token environment
-  names, zero timeouts, and zero bundle-size limits fail before the daemon
-  starts serving requests;
+  timeout, maximum returned bundle size, Nix cache proxy settings, optional
+  Claude proxy settings including the Anthropic API version, and optional
+  agent-run log root. `writd` parses that
+  block at startup into the typed `VmHttpGitRuntimeConfig`, so bad port ranges,
+  unsafe clone base URLs, relative askpass/work-root/log-root paths, invalid
+  token environment names, unsafe upstream URLs, zero timeouts, zero byte
+  limits, and unwritable agent-run log roots fail before the daemon starts
+  serving requests;
 - `prepare_vm_http_git_session()` is the per-session ownership primitive for
   the later lifecycle/protocol slice. Given broker state, the daemon's static
   runtime config, a session ID, and the session IPv4 subnet, it binds and keeps
@@ -1164,9 +1167,14 @@ First agent-runner UX slice implemented in `src/bin/writ.rs`:
   so the local shell boundary can expose it before `writ` sends the request.
   `AgentPrompt` rejects values above 1 MiB before they can enter the daemon or
   VM prompt route;
-- for this stage the selected agent runtime is a fake/stage adapter. The
-  guest command is `writ-vm agent run --run-id <run-id> --agent <agent>`. With
-  the default `--warm devshell`, the command is executed through the same
+- for Claude, the selected agent runtime is now a brokered Claude Code adapter.
+  The guest command is `writ-vm agent run --run-id <run-id> --agent claude`.
+  `writ-vm` fetches the one-shot prompt from the VM HTTP broker, invokes
+  `claude --bare --print --model haiku --effort low --output-format text
+  --no-session-persistence --tools ""` with that prompt on stdin,
+  captures stdout/stderr into private per-run files, and uploads the run
+  outcome metadata plus retained stream bytes back to the broker. With the
+  default `--warm devshell`, the command is executed through the same
   no-build/no-lockfile envelope as workspace devshell warmup:
 
   ```text
@@ -1181,24 +1189,37 @@ First agent-runner UX slice implemented in `src/bin/writ.rs`:
   entered; these flags keep the final adapter invocation in the same
   correctness envelope. With lesser warm modes the adapter runs directly after
   the requested bootstrap;
-- `src/agent_run.rs` defines the fake-agent prompt/log contract before real
-  Claude/Codex integration: the prompt is written to the agent process on
-  stdin, stdout and stderr are drained concurrently into private per-run
-  `<log-root>/<run-id>/stdout.log` and `stderr.log` files, retained bytes are
-  bounded, the full streams are hashed and counted, and the outcome exposes
-  terminal status plus exit code. The stream files intentionally outlive the VM
-  session because audit rows point at them, but real Claude/Codex wiring must
-  first add a retention, quota, and GC policy for `<log-root>`. Tests exercise
-  fake agents that succeed, fail, write both streams, receive quoted prompt
-  text on stdin, and emit large streams that must be drained without retaining
+- the Claude Code process never receives the host Anthropic credential.
+  `writ-vm` sets `ANTHROPIC_BASE_URL` to the broker URL and
+  `ANTHROPIC_AUTH_TOKEN` to the VM bearer token, while removing common
+  Anthropic credential environment variables from the child process. The
+  broker handles `/v1/messages` and `/v1/messages/count_tokens`, audits each
+  request/outcome, strips sandbox auth headers, forwards only Claude-safe
+  metadata headers, injects the configured host-side Anthropic credential, and
+  sends the configured Anthropic API version on the upstream request;
+- `src/agent_run.rs` defines the prompt/log contract used by the real Claude
+  adapter and by hidden fake-adapter tests: the prompt is written to the agent
+  process on stdin, stdout and stderr are drained concurrently into private
+  per-run `<log-root>/<run-id>/stdout.log` and `stderr.log` files, retained
+  bytes are bounded, the full streams are hashed and counted, and the outcome
+  exposes terminal status plus exit code. The stream files intentionally outlive
+  the VM session because audit rows point at them, but the runtime still needs
+  a retention, quota, and GC policy for `<log-root>`. Tests exercise fake
+  agents that succeed, fail, write both streams, receive quoted prompt text on
+  stdin, and emit large streams that must be drained without retaining
   unbounded log bodies;
 - the audit schema has `agent_run` and `agent_run_outcome` rows. `agent_run`
   stores run/session identity, selected agent kind, prompt byte length, prompt
   SHA-256, and a redacted preview marker. `agent_run_outcome` stores status,
   exit code, stream paths, stream byte counts, stream hashes, and truncation
-  flags. Wiring VM-side outcome upload/recording into the managed lifecycle is
-  the next integration step before a real Claude/Codex adapter replaces the
-  fake stage adapter.
+  flags. For truncated VM uploads, the broker audits the retained artifact
+  count/hash instead of an unverifiable guest-reported full-stream count/hash.
+  VM-side outcome upload is wired into the managed lifecycle for Claude; Codex
+  remains a later adapter. The host CLI's optional `--model` value is still
+  audit metadata in this slice: it does not propagate to the VM adapter. A
+  later slice should replace the hardcoded Claude health-check model/effort
+  with an explicit host-to-guest runtime selection contract before this command
+  becomes a general-purpose Claude runner.
 
 ## Tests and proof spikes
 

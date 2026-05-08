@@ -21,12 +21,15 @@ use crate::core::{
 use crate::github::GitHubAppConfig;
 use crate::nix_cache::{NixTrustedPublicKeys, NixTrustedPublicKeysError};
 use crate::policy::PolicyConfig;
+use crate::secret::SecretKey;
 use crate::vm_git_bundle::{
     DEFAULT_GIT_CLONE_BASE_URL, GitCloneBaseUrl, GitCloneBundlePlanError, GitCredentialBoundary,
     GitSecretEnvVar, GitSecretEnvVarError,
 };
 use crate::vm_http::{
-    VmHttpGitCloneConfig, VmHttpGitRuntimeConfig, VmHttpNixCacheConfig, VmHttpNixCacheConfigError,
+    DEFAULT_CLAUDE_ANTHROPIC_VERSION, VmHttpClaudeProxyAuthKind, VmHttpClaudeProxyConfig,
+    VmHttpClaudeProxyConfigError, VmHttpGitCloneConfig, VmHttpGitRuntimeConfig,
+    VmHttpNixCacheConfig, VmHttpNixCacheConfigError,
 };
 
 /// Top-level daemon configuration. Loaded from a JSON file at startup;
@@ -128,6 +131,23 @@ pub struct AgentVmHttpConfig {
     pub nix_cache_trusted_public_keys: Vec<String>,
     pub nix_cache_max_metadata_bytes: u64,
     pub nix_cache_max_nar_bytes: u64,
+    #[serde(default)]
+    pub claude_proxy: Option<AgentVmHttpClaudeProxyConfig>,
+    #[serde(default)]
+    pub agent_run_log_root: Option<PathBuf>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentVmHttpClaudeProxyConfig {
+    pub upstream_base_url: String,
+    pub auth_secret: SecretKey,
+    pub auth_kind: VmHttpClaudeProxyAuthKind,
+    #[serde(default = "default_claude_anthropic_version")]
+    pub anthropic_version: String,
+    pub timeout_secs: u64,
+    pub max_request_bytes: u64,
+    pub max_response_bytes: u64,
 }
 
 /// Which secret backend to use. The file backend is recommended for
@@ -157,6 +177,22 @@ pub enum AgentVmHttpConfigError {
     NixCache(#[from] VmHttpNixCacheConfigError),
     #[error(transparent)]
     NixTrustedPublicKeys(#[from] NixTrustedPublicKeysError),
+    #[error(transparent)]
+    ClaudeProxy(#[from] VmHttpClaudeProxyConfigError),
+    #[error("agent run log root path must not be empty")]
+    EmptyAgentRunLogRoot,
+    #[error("agent run log root path must be absolute: {0:?}")]
+    RelativeAgentRunLogRoot(PathBuf),
+    #[error("agent run log root {path:?} could not be created: {source}")]
+    AgentRunLogRootCreate {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    #[error("agent run log root {path:?} is not writable: {source}")]
+    AgentRunLogRootProbe {
+        path: PathBuf,
+        source: std::io::Error,
+    },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -242,13 +278,86 @@ impl AgentVmHttpConfig {
             self.nix_cache_max_nar_bytes,
             trusted_public_keys,
         )?;
-        Ok(VmHttpGitRuntimeConfig::new(
+        let claude_proxy = self
+            .claude_proxy
+            .as_ref()
+            .map(AgentVmHttpClaudeProxyConfig::to_runtime_config)
+            .transpose()?;
+        let agent_run_log_root = match &self.agent_run_log_root {
+            Some(path) => path.clone(),
+            None => self.work_root.join("agent-runs"),
+        };
+        let agent_run_log_root = validate_agent_run_log_root(agent_run_log_root)?;
+        Ok(VmHttpGitRuntimeConfig::new_with_claude_proxy(
             self.bind_addr,
             broker_port_range,
             git_clone,
             nix_cache,
+            claude_proxy,
+            agent_run_log_root,
         ))
     }
+}
+
+impl AgentVmHttpClaudeProxyConfig {
+    fn to_runtime_config(&self) -> Result<VmHttpClaudeProxyConfig, AgentVmHttpConfigError> {
+        Ok(VmHttpClaudeProxyConfig::new_with_anthropic_version(
+            &self.upstream_base_url,
+            self.auth_secret.clone(),
+            self.auth_kind,
+            &self.anthropic_version,
+            Duration::from_secs(self.timeout_secs),
+            self.max_request_bytes,
+            self.max_response_bytes,
+        )?)
+    }
+}
+
+fn validate_agent_run_log_root(path: PathBuf) -> Result<PathBuf, AgentVmHttpConfigError> {
+    if path.as_os_str().is_empty() {
+        return Err(AgentVmHttpConfigError::EmptyAgentRunLogRoot);
+    }
+    if !path.is_absolute() {
+        return Err(AgentVmHttpConfigError::RelativeAgentRunLogRoot(path));
+    }
+    std::fs::create_dir_all(&path).map_err(|source| {
+        AgentVmHttpConfigError::AgentRunLogRootCreate {
+            path: path.clone(),
+            source,
+        }
+    })?;
+    let probe = path.join(format!(
+        ".writ-agent-run-log-probe-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+        .and_then(|mut file| {
+            use std::io::Write as _;
+            file.write_all(b"probe")?;
+            file.sync_all()
+        })
+        .map_err(|source| AgentVmHttpConfigError::AgentRunLogRootProbe {
+            path: path.clone(),
+            source,
+        })?;
+    std::fs::remove_file(&probe).map_err(|source| {
+        AgentVmHttpConfigError::AgentRunLogRootProbe {
+            path: path.clone(),
+            source,
+        }
+    })?;
+    Ok(path)
+}
+
+fn default_claude_anthropic_version() -> String {
+    DEFAULT_CLAUDE_ANTHROPIC_VERSION.into()
 }
 
 fn default_keyring_service() -> String {
@@ -507,7 +616,10 @@ mod tests {
 
     #[test]
     fn parses_agent_vm_config_and_converts_to_runtime_config() {
-        let json = r#"{
+        let work_root = unique_config_test_path("work-root");
+        let agent_run_log_root = unique_config_test_path("agent-runs");
+        let mut json: serde_json::Value = serde_json::from_str(
+            r#"{
             "github": {
                 "app_id": 1,
                 "installation_id": 2,
@@ -543,11 +655,27 @@ mod tests {
                         "cache.example-1:IsGkyTbr2sed7tWowgiPcI0ZHhBAHoGQ7TyYRweyzwE="
                     ],
                     "nix_cache_max_metadata_bytes": 1048576,
-                    "nix_cache_max_nar_bytes": 67108864
+                    "nix_cache_max_nar_bytes": 67108864,
+                    "claude_proxy": {
+                        "upstream_base_url": "https://api.anthropic.com",
+                        "auth_secret": "anthropic-api-key",
+                        "auth_kind": "x_api_key",
+                        "anthropic_version": "2023-06-01",
+                        "timeout_secs": 60,
+                        "max_request_bytes": 2097152,
+                        "max_response_bytes": 8388608
+                    },
+                    "agent_run_log_root": "/var/folders/writ/agent-runs"
                 }
             }
-        }"#;
-        let c: DaemonConfig = serde_json::from_str(json).unwrap();
+        }"#,
+        )
+        .unwrap();
+        json["agent_vm"]["vm_http"]["work_root"] =
+            serde_json::Value::String(work_root.to_string_lossy().into_owned());
+        json["agent_vm"]["vm_http"]["agent_run_log_root"] =
+            serde_json::Value::String(agent_run_log_root.to_string_lossy().into_owned());
+        let c: DaemonConfig = serde_json::from_value(json).unwrap();
         let agent_vm = c.agent_vm.unwrap();
 
         let runtime = agent_vm.to_runtime_config().unwrap();
@@ -555,10 +683,7 @@ mod tests {
         assert_eq!(runtime.vm_http().bind_addr(), Ipv4Addr::UNSPECIFIED);
         assert_eq!(runtime.vm_http().broker_port_range().min().get(), 18080);
         assert_eq!(runtime.vm_http().broker_port_range().max().get(), 18081);
-        assert_eq!(
-            runtime.vm_http().git_clone().work_root(),
-            PathBuf::from("/var/folders/writ/git-work")
-        );
+        assert_eq!(runtime.vm_http().git_clone().work_root(), work_root);
         assert_eq!(
             runtime.vm_http().nix_cache().upstream_base_url().as_str(),
             "https://cache.nixos.org/"
@@ -576,11 +701,37 @@ mod tests {
                 .nix_conf_value(),
             TEST_NIX_CACHE_PUBLIC_KEY
         );
+        let claude_proxy = runtime.vm_http().claude_proxy().unwrap();
+        assert_eq!(
+            claude_proxy.upstream_base_url().as_str(),
+            "https://api.anthropic.com/"
+        );
+        assert_eq!(claude_proxy.auth_secret().as_str(), "anthropic-api-key");
+        assert_eq!(claude_proxy.auth_kind(), VmHttpClaudeProxyAuthKind::XApiKey);
+        assert_eq!(
+            claude_proxy.anthropic_version().to_str().unwrap(),
+            "2023-06-01"
+        );
+        assert_eq!(claude_proxy.max_request_bytes(), 2_097_152);
+        assert_eq!(claude_proxy.max_response_bytes(), 8_388_608);
+        assert_eq!(runtime.vm_http().agent_run_log_root(), agent_run_log_root);
         assert_eq!(runtime.lifecycle().subnet_index_min(), 252);
         assert_eq!(runtime.lifecycle().subnet_index_max(), 253);
     }
 
+    fn unique_config_test_path(label: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!(
+            "writ-config-{label}-{}-{nanos}",
+            std::process::id()
+        ))
+    }
+
     fn valid_agent_vm_http_config() -> AgentVmHttpConfig {
+        let work_root = unique_config_test_path("work-root");
         AgentVmHttpConfig {
             bind_addr: Ipv4Addr::UNSPECIFIED,
             broker_port_min: 18080,
@@ -589,13 +740,15 @@ mod tests {
             git_clone_base_url: DEFAULT_GIT_CLONE_BASE_URL.into(),
             askpass_program: PathBuf::from("/usr/local/libexec/writ-git-askpass"),
             token_env: "WRIT_GIT_TOKEN".into(),
-            work_root: PathBuf::from("/var/folders/writ/git-work"),
+            work_root,
             clone_timeout_secs: 30,
             max_bundle_bytes: 1_048_576,
             nix_cache_url: "https://cache.nixos.org".into(),
             nix_cache_trusted_public_keys: Vec::new(),
             nix_cache_max_metadata_bytes: 1_048_576,
             nix_cache_max_nar_bytes: 67_108_864,
+            claude_proxy: None,
+            agent_run_log_root: None,
         }
     }
 
@@ -821,6 +974,77 @@ mod tests {
             c.to_runtime_config(),
             Err(AgentVmHttpConfigError::NixTrustedPublicKeys(err))
                 if err.index() == 0 && err.raw().starts_with("cache key:")
+        ));
+    }
+
+    #[test]
+    fn agent_vm_http_config_rejects_invalid_claude_proxy_url() {
+        let mut c = valid_agent_vm_http_config();
+        c.claude_proxy = Some(AgentVmHttpClaudeProxyConfig {
+            upstream_base_url: "file:///api".into(),
+            auth_secret: SecretKey::new("anthropic-api-key").unwrap(),
+            auth_kind: VmHttpClaudeProxyAuthKind::XApiKey,
+            anthropic_version: DEFAULT_CLAUDE_ANTHROPIC_VERSION.into(),
+            timeout_secs: 60,
+            max_request_bytes: 1_048_576,
+            max_response_bytes: 8_388_608,
+        });
+
+        assert!(matches!(
+            c.to_runtime_config(),
+            Err(AgentVmHttpConfigError::ClaudeProxy(
+                VmHttpClaudeProxyConfigError::UnsupportedUpstreamScheme { .. }
+            ))
+        ));
+    }
+
+    #[test]
+    fn agent_vm_http_config_rejects_zero_claude_proxy_request_limit() {
+        let mut c = valid_agent_vm_http_config();
+        c.claude_proxy = Some(AgentVmHttpClaudeProxyConfig {
+            upstream_base_url: "https://api.anthropic.com".into(),
+            auth_secret: SecretKey::new("anthropic-api-key").unwrap(),
+            auth_kind: VmHttpClaudeProxyAuthKind::XApiKey,
+            anthropic_version: DEFAULT_CLAUDE_ANTHROPIC_VERSION.into(),
+            timeout_secs: 60,
+            max_request_bytes: 0,
+            max_response_bytes: 8_388_608,
+        });
+
+        assert!(matches!(
+            c.to_runtime_config(),
+            Err(AgentVmHttpConfigError::ClaudeProxy(
+                VmHttpClaudeProxyConfigError::EmptyMaxRequestBytes
+            ))
+        ));
+    }
+
+    #[test]
+    fn agent_vm_http_config_rejects_relative_agent_run_log_root() {
+        let mut c = valid_agent_vm_http_config();
+        c.agent_run_log_root = Some(PathBuf::from("agent-runs"));
+
+        assert!(matches!(
+            c.to_runtime_config(),
+            Err(AgentVmHttpConfigError::RelativeAgentRunLogRoot(path))
+                if path.as_os_str() == "agent-runs"
+        ));
+    }
+
+    #[test]
+    fn agent_vm_http_config_rejects_unwritable_agent_run_log_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("not-a-directory");
+        std::fs::write(&path, b"file").unwrap();
+        let mut c = valid_agent_vm_http_config();
+        c.agent_run_log_root = Some(path.clone());
+
+        assert!(matches!(
+            c.to_runtime_config(),
+            Err(AgentVmHttpConfigError::AgentRunLogRootCreate {
+                path: failed,
+                ..
+            }) if failed == path
         ));
     }
 
