@@ -435,11 +435,8 @@ mod tests {
             ]
         );
 
-        let env: std::collections::HashMap<&OsString, &OsString> = plan
-            .env()
-            .iter()
-            .map(|(key, value)| (key, value))
-            .collect();
+        let env: std::collections::HashMap<&OsString, &OsString> =
+            plan.env().iter().map(|(key, value)| (key, value)).collect();
         assert_eq!(
             env.get(&OsString::from("ANTHROPIC_BASE_URL"))
                 .map(|v| v.to_str().unwrap()),

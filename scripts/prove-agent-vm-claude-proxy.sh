@@ -15,7 +15,8 @@ Requires:
   - python3, curl, git, sqlite3, sudo, cargo or the Nix dev shell, and either
     Nix substitutes/builders for the guest image closure or a preloaded image
     containing sh, ip, git, nix, writ-vm, and claude
-  - WRIT_PROVE_ANTHROPIC_API_KEY or ANTHROPIC_API_KEY in the host environment
+  - one of WRIT_PROVE_CLAUDE_CODE_OAUTH_TOKEN, CLAUDE_CODE_OAUTH_TOKEN,
+    WRIT_PROVE_ANTHROPIC_API_KEY, or ANTHROPIC_API_KEY in the host environment
 
 What it proves:
   - writd starts a daemon-managed agent VM through `writ agent run`
@@ -34,7 +35,12 @@ default; the key is written only to the temporary host secret store and is
 unset before writd or the CLI are started.
 
 Environment overrides:
-  WRIT_PROVE_ANTHROPIC_API_KEY  Host Anthropic API key, preferred over
+  WRIT_PROVE_CLAUDE_CODE_OAUTH_TOKEN  Host Anthropic OAuth token, preferred over
+                                      every other credential source
+  CLAUDE_CODE_OAUTH_TOKEN  Host Anthropic OAuth token, used if no
+                           WRIT_PROVE_CLAUDE_CODE_OAUTH_TOKEN is set
+  WRIT_PROVE_ANTHROPIC_API_KEY  Host Anthropic API key, used if no OAuth
+                                token is provided; preferred over
                                 ANTHROPIC_API_KEY
   WRIT_PROVE_IMAGE       OCI image to run, default writ-agent-vm-guest:latest
   WRIT_PROVE_BUILD_GUEST_IMAGE  build/load the Nix guest image, default auto
@@ -563,7 +569,9 @@ write_config() {
     "$FAKE_GITHUB_PORT" \
     "$PROOF_OWNER" \
     "$CLAUDE_UPSTREAM" \
-    "$AGENT_RUN_LOG_ROOT" <<'PY'
+    "$AGENT_RUN_LOG_ROOT" \
+    "$CRED_SECRET_NAME" \
+    "$CRED_KIND" <<'PY'
 import json
 import sys
 
@@ -588,6 +596,8 @@ import sys
     owner,
     claude_upstream,
     agent_run_log_root,
+    cred_secret_name,
+    cred_kind,
 ) = sys.argv[1:]
 
 config = {
@@ -634,8 +644,8 @@ config = {
             "nix_cache_max_nar_bytes": 67108864,
             "claude_proxy": {
                 "upstream_base_url": claude_upstream,
-                "auth_secret": "anthropic-api-key",
-                "auth_kind": "x_api_key",
+                "auth_secret": cred_secret_name,
+                "auth_kind": cred_kind,
                 "anthropic_version": "2023-06-01",
                 "timeout_secs": 60,
                 "max_request_bytes": 2097152,
@@ -840,9 +850,19 @@ case "$TIMEOUT_SECS" in
 esac
 [[ "$TIMEOUT_SECS" -gt 0 ]] || die "WRIT_PROVE_TIMEOUT_SECS must be positive"
 
+CLAUDE_OAUTH_TOKEN_VALUE="${WRIT_PROVE_CLAUDE_CODE_OAUTH_TOKEN:-${CLAUDE_CODE_OAUTH_TOKEN:-}}"
 ANTHROPIC_API_KEY_VALUE="${WRIT_PROVE_ANTHROPIC_API_KEY:-${ANTHROPIC_API_KEY:-}}"
-[[ -n "$ANTHROPIC_API_KEY_VALUE" ]] || \
-  die "set WRIT_PROVE_ANTHROPIC_API_KEY or ANTHROPIC_API_KEY in the host environment"
+if [[ -n "$CLAUDE_OAUTH_TOKEN_VALUE" ]]; then
+  CRED_KIND="oauth"
+  CRED_SECRET_NAME="anthropic-oauth-token"
+  CRED_VALUE="$CLAUDE_OAUTH_TOKEN_VALUE"
+elif [[ -n "$ANTHROPIC_API_KEY_VALUE" ]]; then
+  CRED_KIND="x_api_key"
+  CRED_SECRET_NAME="anthropic-api-key"
+  CRED_VALUE="$ANTHROPIC_API_KEY_VALUE"
+else
+  die "set WRIT_PROVE_CLAUDE_CODE_OAUTH_TOKEN, CLAUDE_CODE_OAUTH_TOKEN, WRIT_PROVE_ANTHROPIC_API_KEY, or ANTHROPIC_API_KEY in the host environment"
+fi
 
 IPV4_CIDR="$(cidr_alloc_subnet "$IPV4_POOL" 24 "$SUBNET_INDEX")"
 
@@ -877,12 +897,15 @@ mkdir -p "$SECRETS_DIR"
 chmod 700 "$SECRETS_DIR"
 cp "${ROOT_DIR}/tests/fixtures/rsa_test_1.pem" "${SECRETS_DIR}/gh-app-pk"
 chmod 600 "${SECRETS_DIR}/gh-app-pk"
-printf '%s' "$ANTHROPIC_API_KEY_VALUE" >"${SECRETS_DIR}/anthropic-api-key"
-chmod 600 "${SECRETS_DIR}/anthropic-api-key"
+printf '%s' "$CRED_VALUE" >"${SECRETS_DIR}/${CRED_SECRET_NAME}"
+chmod 600 "${SECRETS_DIR}/${CRED_SECRET_NAME}"
+unset CRED_VALUE
+unset CLAUDE_OAUTH_TOKEN_VALUE
 unset ANTHROPIC_API_KEY_VALUE
 unset ANTHROPIC_API_KEY || true
 unset WRIT_PROVE_ANTHROPIC_API_KEY || true
 unset CLAUDE_CODE_OAUTH_TOKEN || true
+unset WRIT_PROVE_CLAUDE_CODE_OAUTH_TOKEN || true
 
 write_fake_askpass
 prepare_fake_git_origin
@@ -891,14 +914,16 @@ start_fake_git_origin
 write_config
 
 log "starting writd with fake GitHub API on port ${FAKE_GITHUB_PORT}, fake Git origin on port ${FAKE_GIT_ORIGIN_PORT}, and Claude upstream ${CLAUDE_UPSTREAM}"
-env -u ANTHROPIC_API_KEY -u WRIT_PROVE_ANTHROPIC_API_KEY -u CLAUDE_CODE_OAUTH_TOKEN \
+env -u ANTHROPIC_API_KEY -u WRIT_PROVE_ANTHROPIC_API_KEY \
+  -u CLAUDE_CODE_OAUTH_TOKEN -u WRIT_PROVE_CLAUDE_CODE_OAUTH_TOKEN \
   "$WRITD_BIN" --config "$CONFIG_FILE" --socket "$SOCKET_PATH" --audit-db "$AUDIT_DB" \
   >"$WRITD_LOG" 2>&1 &
 WRITD_PID="$!"
 wait_for_writd_socket
 
 log "starting Claude agent run on ${IPV4_CIDR} with --model haiku and --effort low"
-if ! env -u ANTHROPIC_API_KEY -u WRIT_PROVE_ANTHROPIC_API_KEY -u CLAUDE_CODE_OAUTH_TOKEN \
+if ! env -u ANTHROPIC_API_KEY -u WRIT_PROVE_ANTHROPIC_API_KEY \
+  -u CLAUDE_CODE_OAUTH_TOKEN -u WRIT_PROVE_CLAUDE_CODE_OAUTH_TOKEN \
   "$WRIT_BIN" --socket "$SOCKET_PATH" agent run \
     --label "claude proxy proof" \
     --model "haiku" \

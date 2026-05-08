@@ -195,7 +195,11 @@ pub struct VmHttpClaudeProxyConfig {
 pub enum VmHttpClaudeProxyAuthKind {
     XApiKey,
     AuthorizationBearer,
+    #[serde(rename = "oauth")]
+    OAuth,
 }
+
+const ANTHROPIC_OAUTH_BETA_HEADER_VALUE: &str = "oauth-2025-04-20";
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum VmHttpAuthorization {
@@ -610,26 +614,26 @@ impl<S: SecretStore> VmHttpClaudeProxyService<S> {
         request: &VmHttpRequest,
         body: Vec<u8>,
         headers: Vec<ClaudeProxyForwardHeader>,
-    ) -> Result<(String, reqwest::RequestBuilder), VmHttpClaudeProxyFetch> {
+    ) -> Result<(String, reqwest::RequestBuilder), Box<VmHttpClaudeProxyFetch>> {
         let Some(route) = classify_claude_proxy_target(&request.target) else {
             let response = VmHttpResponse::text(VmHttpStatus::NotFound, "not found");
-            return Err(VmHttpClaudeProxyFetch {
+            return Err(Box::new(VmHttpClaudeProxyFetch {
                 response_bytes: response.body.len() as u64,
                 response,
                 upstream_url: None,
                 upstream_status: None,
                 error: None,
-            });
+            }));
         };
         let Some(url) = self.upstream_url(&request.target) else {
             let response = VmHttpResponse::text(VmHttpStatus::NotFound, "not found");
-            return Err(VmHttpClaudeProxyFetch {
+            return Err(Box::new(VmHttpClaudeProxyFetch {
                 response_bytes: response.body.len() as u64,
                 response,
                 upstream_url: None,
                 upstream_status: None,
                 error: None,
-            });
+            }));
         };
         let upstream_url = url.to_string();
         let secret = match self
@@ -641,25 +645,25 @@ impl<S: SecretStore> VmHttpClaudeProxyService<S> {
             Ok(_) => {
                 let response =
                     VmHttpResponse::text(VmHttpStatus::BadGateway, "Claude proxy auth missing");
-                return Err(VmHttpClaudeProxyFetch {
+                return Err(Box::new(VmHttpClaudeProxyFetch {
                     response_bytes: response.body.len() as u64,
                     response,
                     upstream_url: Some(upstream_url),
                     upstream_status: None,
                     error: Some("upstream auth missing"),
-                });
+                }));
             }
             Err(err) => {
                 eprintln!("VM HTTP Claude proxy auth secret load failed: {err}");
                 let response =
                     VmHttpResponse::text(VmHttpStatus::BadGateway, "Claude proxy auth failed");
-                return Err(VmHttpClaudeProxyFetch {
+                return Err(Box::new(VmHttpClaudeProxyFetch {
                     response_bytes: response.body.len() as u64,
                     response,
                     upstream_url: Some(upstream_url),
                     upstream_status: None,
                     error: Some("upstream auth load failed"),
-                });
+                }));
             }
         };
 
@@ -673,6 +677,9 @@ impl<S: SecretStore> VmHttpClaudeProxyService<S> {
         builder = match self.config.auth_kind() {
             VmHttpClaudeProxyAuthKind::XApiKey => builder.header("x-api-key", secret),
             VmHttpClaudeProxyAuthKind::AuthorizationBearer => builder.bearer_auth(secret),
+            VmHttpClaudeProxyAuthKind::OAuth => builder
+                .bearer_auth(secret)
+                .header("anthropic-beta", ANTHROPIC_OAUTH_BETA_HEADER_VALUE),
         };
         Ok((upstream_url, builder))
     }
@@ -685,7 +692,7 @@ impl<S: SecretStore> VmHttpClaudeProxyService<S> {
     ) -> VmHttpClaudeProxyFetch {
         let (upstream_url, builder) = match self.upstream_request_builder(request, body, headers) {
             Ok(parts) => parts,
-            Err(fetch) => return fetch,
+            Err(fetch) => return *fetch,
         };
 
         let response = match builder.send().await {
@@ -748,7 +755,9 @@ impl<S: SecretStore> VmHttpClaudeProxyService<S> {
         body: Vec<u8>,
         headers: Vec<ClaudeProxyForwardHeader>,
     ) -> Result<VmHttpClaudeProxyStream<S>, VmHttpClaudeProxyFetch> {
-        let (upstream_url, builder) = self.upstream_request_builder(request, body, headers)?;
+        let (upstream_url, builder) = self
+            .upstream_request_builder(request, body, headers)
+            .map_err(|fetch| *fetch)?;
         let response = match builder.send().await {
             Ok(response) => response,
             Err(err) => {
@@ -1693,57 +1702,59 @@ where
         }
     };
     let auth_scheme = auth_scheme_for_target(&request.target);
-    let dispatch: VmHttpDispatch<S> = match authorize_vm_http_request_with_scheme(
-        session,
-        &request,
-        auth_scheme,
-    ) {
-        VmHttpAuthorization::Allow => {
-            route_authenticated_vm_http_request(
-                session,
-                &request,
-                head.buffered_body,
-                stream,
-                services,
-                read_timeout,
-            )
-            .await
-        }
-        VmHttpAuthorization::Deny(err) => {
-            let response = auth_error_response(auth_scheme, err);
-            if is_nix_cache_target(&request.target) {
-                record_nix_cache_local_response(
-                    services.nix_cache.as_ref(),
+    let dispatch: VmHttpDispatch<S> =
+        match authorize_vm_http_request_with_scheme(session, &request, auth_scheme) {
+            VmHttpAuthorization::Allow => {
+                route_authenticated_vm_http_request(
                     session,
                     &request,
-                    NixCacheAuditDecision::Deny {
-                        reason: vm_http_auth_error_reason(err).to_string(),
-                    },
-                    response,
-                    None,
+                    head.buffered_body,
+                    stream,
+                    services,
+                    read_timeout,
                 )
-                .into()
-            } else if let Some(route) = classify_claude_proxy_target(&request.target)
-                && let Some(service) = services.claude_proxy.as_ref()
-            {
-                record_claude_proxy_local_response(
-                    service,
-                    session,
-                    &request,
-                    route,
-                    ClaudeProxyAuditDecision::Deny {
-                        reason: vm_http_auth_error_reason(err).to_string(),
-                    },
-                    response,
-                    None,
-                )
-                .into()
-            } else {
-                response.into()
+                .await
             }
-        }
-    };
-    log_vm_http_request(session, &request.method, &request.target, dispatch.status_code());
+            VmHttpAuthorization::Deny(err) => {
+                let response = auth_error_response(auth_scheme, err);
+                if is_nix_cache_target(&request.target) {
+                    record_nix_cache_local_response(
+                        services.nix_cache.as_ref(),
+                        session,
+                        &request,
+                        NixCacheAuditDecision::Deny {
+                            reason: vm_http_auth_error_reason(err).to_string(),
+                        },
+                        response,
+                        None,
+                    )
+                    .into()
+                } else if let Some(route) = classify_claude_proxy_target(&request.target)
+                    && let Some(service) = services.claude_proxy.as_ref()
+                {
+                    record_claude_proxy_local_response(
+                        service,
+                        session,
+                        &request,
+                        route,
+                        ClaudeProxyAuditDecision::Deny {
+                            reason: vm_http_auth_error_reason(err).to_string(),
+                        },
+                        response,
+                        None,
+                    )
+                    .into()
+                } else {
+                    response.into()
+                }
+            }
+        };
+    log_vm_http_request(
+        session,
+        &request.method,
+        &request.target,
+        dispatch.status_code(),
+    );
     dispatch
 }
 
@@ -2594,14 +2605,17 @@ struct ClaudeProxyForwardHeader {
 fn claude_proxy_forward_headers(
     headers: &[VmHttpHeader],
     anthropic_version: &reqwest::header::HeaderValue,
+    auth_kind: VmHttpClaudeProxyAuthKind,
 ) -> Result<Vec<ClaudeProxyForwardHeader>, &'static str> {
     let mut forwarded = Vec::new();
     let mut saw_content_type = false;
     let mut saw_accept = false;
     let mut saw_user_agent = false;
+    let mut saw_anthropic_beta = false;
+    let anthropic_beta_name = reqwest::header::HeaderName::from_static("anthropic-beta");
 
     for header in headers {
-        let Some(name) = claude_proxy_forward_header_name(&header.name) else {
+        let Some(name) = claude_proxy_forward_header_name(&header.name, auth_kind) else {
             continue;
         };
         let duplicate = if name == reqwest::header::CONTENT_TYPE {
@@ -2610,6 +2624,8 @@ fn claude_proxy_forward_headers(
             std::mem::replace(&mut saw_accept, true)
         } else if name == reqwest::header::USER_AGENT {
             std::mem::replace(&mut saw_user_agent, true)
+        } else if name == anthropic_beta_name {
+            std::mem::replace(&mut saw_anthropic_beta, true)
         } else {
             unreachable!("Claude proxy forward header classifier returned an unknown header")
         };
@@ -2627,12 +2643,19 @@ fn claude_proxy_forward_headers(
     Ok(forwarded)
 }
 
-fn claude_proxy_forward_header_name(raw: &str) -> Option<reqwest::header::HeaderName> {
-    // Allowlist only. Notably absent: anthropic-beta. Beta features can opt
-    // into capabilities the operator has not authorized (e.g. extended file
-    // retention, computer-use tool surfaces), so the broker — not the guest
-    // — decides which betas to enable. Anthropic-Version is added separately
-    // by the broker and is not forwarded from the guest.
+fn claude_proxy_forward_header_name(
+    raw: &str,
+    auth_kind: VmHttpClaudeProxyAuthKind,
+) -> Option<reqwest::header::HeaderName> {
+    // Allowlist only. The default policy drops anthropic-beta because beta
+    // features can opt into capabilities the operator has not authorized
+    // (e.g. extended file retention, computer-use tool surfaces), so the
+    // broker — not the guest — decides which betas to enable. The OAuth
+    // auth path is the exception: it exists to host Claude Code, whose
+    // request shape includes betas the CLI emits itself, so the broker
+    // forwards anthropic-beta from the guest while still injecting its own
+    // oauth-2025-04-20 alongside. Anthropic-Version is added separately
+    // by the broker and is never forwarded from the guest.
     if raw.eq_ignore_ascii_case("content-type") {
         return Some(reqwest::header::CONTENT_TYPE);
     }
@@ -2641,6 +2664,9 @@ fn claude_proxy_forward_header_name(raw: &str) -> Option<reqwest::header::Header
     }
     if raw.eq_ignore_ascii_case("user-agent") {
         return Some(reqwest::header::USER_AGENT);
+    }
+    if auth_kind == VmHttpClaudeProxyAuthKind::OAuth && raw.eq_ignore_ascii_case("anthropic-beta") {
+        return Some(reqwest::header::HeaderName::from_static("anthropic-beta"));
     }
     None
 }
@@ -2766,25 +2792,28 @@ async fn route_claude_proxy_request<S: SecretStore>(
         .into();
     }
 
-    let headers =
-        match claude_proxy_forward_headers(&request.headers, service.config.anthropic_version()) {
-            Ok(headers) => headers,
-            Err(reason) => {
-                let response = VmHttpResponse::text(VmHttpStatus::BadRequest, reason);
-                return record_claude_proxy_local_response(
-                    service,
-                    session,
-                    request,
-                    route,
-                    ClaudeProxyAuditDecision::Deny {
-                        reason: reason.into(),
-                    },
-                    response,
-                    Some(reason),
-                )
-                .into();
-            }
-        };
+    let headers = match claude_proxy_forward_headers(
+        &request.headers,
+        service.config.anthropic_version(),
+        service.config.auth_kind(),
+    ) {
+        Ok(headers) => headers,
+        Err(reason) => {
+            let response = VmHttpResponse::text(VmHttpStatus::BadRequest, reason);
+            return record_claude_proxy_local_response(
+                service,
+                session,
+                request,
+                route,
+                ClaudeProxyAuditDecision::Deny {
+                    reason: reason.into(),
+                },
+                response,
+                Some(reason),
+            )
+            .into();
+        }
+    };
 
     let request_id = RequestId::new();
     if let Err(err) =
@@ -5573,8 +5602,7 @@ esac
         assert_eq!(response.body, upstream_body);
         let upstream_request = captured.lock().unwrap().clone();
         assert!(
-            upstream_request
-                .starts_with("GET /v1/models/claude-haiku-4-5-20251001 HTTP/1.1"),
+            upstream_request.starts_with("GET /v1/models/claude-haiku-4-5-20251001 HTTP/1.1"),
             "{upstream_request}"
         );
         assert!(
@@ -5742,6 +5770,100 @@ esac
         );
         assert!(
             !upstream_request.contains("guest-evil"),
+            "{upstream_request}"
+        );
+        assert!(
+            !upstream_request.contains(token().as_str()),
+            "{upstream_request}"
+        );
+    }
+
+    #[tokio::test]
+    async fn claude_proxy_oauth_injects_bearer_and_oauth_beta_header() {
+        let upstream_body = br#"{"content":[]}"#;
+        let (upstream_url, captured) = serve_raw_http_once(raw_http_response(
+            "200 OK",
+            "application/json",
+            upstream_body,
+        ))
+        .await;
+        let github = MockServer::start().await;
+        let secret_key = SecretKey::new("anthropic-oauth-token").unwrap();
+        let state = make_broker_state_with_extra_secret(
+            &github,
+            Some((secret_key.clone(), "host-oauth-token")),
+        );
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::LOCALHOST, 32).unwrap());
+        open_audit_session(&state, session.session_id());
+        let service = VmHttpClaudeProxyService::new(
+            Arc::clone(&state),
+            VmHttpClaudeProxyConfig::new(
+                upstream_url,
+                secret_key,
+                VmHttpClaudeProxyAuthKind::OAuth,
+                std::time::Duration::from_secs(5),
+                1024,
+                1024,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let mut request = VmHttpRequest::new(
+            "POST",
+            VM_CLAUDE_MESSAGES_PATH,
+            Some(bearer(token().as_str())),
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 34567)),
+        );
+        request.headers = vec![
+            VmHttpHeader {
+                name: "Authorization".into(),
+                value: "Bearer guest-evil".into(),
+            },
+            VmHttpHeader {
+                name: "X-Api-Key".into(),
+                value: "guest-x-api-key".into(),
+            },
+            VmHttpHeader {
+                name: "Anthropic-Beta".into(),
+                value: "context-management-2025-06-27".into(),
+            },
+            VmHttpHeader {
+                name: "Content-Type".into(),
+                value: "application/json".into(),
+            },
+        ];
+
+        let response = route_claude_proxy_request(
+            &session,
+            &request,
+            br#"{"model":"test"}"#.to_vec(),
+            &service,
+        )
+        .await
+        .into_buffered();
+
+        assert_eq!(response.status, VmHttpStatus::Upstream(200));
+        let upstream_request = captured.lock().unwrap().clone();
+        let lower = upstream_request.to_ascii_lowercase();
+        assert!(
+            lower.contains("authorization: bearer host-oauth-token"),
+            "{upstream_request}"
+        );
+        assert!(
+            lower.contains("anthropic-beta: oauth-2025-04-20"),
+            "{upstream_request}"
+        );
+        assert!(
+            lower.contains("anthropic-beta: context-management-2025-06-27"),
+            "{upstream_request}"
+        );
+        assert!(!lower.contains("x-api-key:"), "{upstream_request}");
+        assert!(
+            !upstream_request.contains("guest-evil"),
+            "{upstream_request}"
+        );
+        assert!(
+            !upstream_request.contains("guest-x-api-key"),
             "{upstream_request}"
         );
         assert!(

@@ -719,6 +719,74 @@ mod tests {
         assert_eq!(runtime.lifecycle().subnet_index_max(), 253);
     }
 
+    #[test]
+    fn parses_agent_vm_config_with_oauth_claude_proxy_auth_kind() {
+        let work_root = unique_config_test_path("work-root");
+        let agent_run_log_root = unique_config_test_path("agent-runs");
+        let mut json: serde_json::Value = serde_json::from_str(
+            r#"{
+            "github": {
+                "app_id": 1,
+                "installation_id": 2,
+                "installation_owner": "o",
+                "private_key_secret": "pk"
+            },
+            "policy": { "default_ttl": 600, "writable_repos": [] },
+            "agent_vm": {
+                "lifecycle": {
+                    "ipv4_pool": "192.168.0.0/16",
+                    "ipv6_pool": "fd83:b6f2:e57::/48",
+                    "subnet_index_min": 252,
+                    "subnet_index_max": 253,
+                    "pf_helper": "/usr/local/libexec/writ-agent-vm-pf-helper",
+                    "state_dir": "/var/folders/writ/agent-vm-state",
+                    "ipv6_mode": "ipv4_only_no_guest_ipv6",
+                    "image": "alpine:latest",
+                    "cpus": 1,
+                    "memory_mib": 512
+                },
+                "vm_http": {
+                    "bind_addr": "0.0.0.0",
+                    "broker_port_min": 18080,
+                    "broker_port_max": 18081,
+                    "git_program": "/usr/bin/git",
+                    "git_clone_base_url": "https://github.com",
+                    "askpass_program": "/usr/local/libexec/writ-git-askpass",
+                    "work_root": "/var/folders/writ/git-work",
+                    "clone_timeout_secs": 30,
+                    "max_bundle_bytes": 1048576,
+                    "nix_cache_url": "https://cache.nixos.org",
+                    "nix_cache_trusted_public_keys": [],
+                    "nix_cache_max_metadata_bytes": 1048576,
+                    "nix_cache_max_nar_bytes": 67108864,
+                    "claude_proxy": {
+                        "upstream_base_url": "https://api.anthropic.com",
+                        "auth_secret": "anthropic-oauth-token",
+                        "auth_kind": "oauth",
+                        "anthropic_version": "2023-06-01",
+                        "timeout_secs": 60,
+                        "max_request_bytes": 2097152,
+                        "max_response_bytes": 8388608
+                    },
+                    "agent_run_log_root": "/var/folders/writ/agent-runs"
+                }
+            }
+        }"#,
+        )
+        .unwrap();
+        json["agent_vm"]["vm_http"]["work_root"] =
+            serde_json::Value::String(work_root.to_string_lossy().into_owned());
+        json["agent_vm"]["vm_http"]["agent_run_log_root"] =
+            serde_json::Value::String(agent_run_log_root.to_string_lossy().into_owned());
+        let c: DaemonConfig = serde_json::from_value(json).unwrap();
+        let agent_vm = c.agent_vm.unwrap();
+
+        let runtime = agent_vm.to_runtime_config().unwrap();
+        let claude_proxy = runtime.vm_http().claude_proxy().unwrap();
+        assert_eq!(claude_proxy.auth_secret().as_str(), "anthropic-oauth-token");
+        assert_eq!(claude_proxy.auth_kind(), VmHttpClaudeProxyAuthKind::OAuth);
+    }
+
     fn unique_config_test_path(label: &str) -> PathBuf {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
