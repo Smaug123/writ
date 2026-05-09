@@ -8,6 +8,13 @@ default = ["host"]
 host = [
     "vm-client",
     "dep:base64",
+    "dep:bytes",
+    "dep:futures-util",
+    "dep:http",
+    "dep:http-body",
+    "dep:http-body-util",
+    "dep:hyper",
+    "dep:hyper-util",
     "dep:jsonwebtoken",
     "dep:keyring",
     "dep:ring",
@@ -52,11 +59,18 @@ thiserror = "2"
 keyring = { version = "3", features = ["apple-native", "linux-native"], optional = true }
 rusqlite = { version = "0.38", features = ["bundled"], optional = true }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "fs", "time", "sync", "io-util", "process"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots", "http2"], optional = true }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots", "http2", "stream"], optional = true }
 jsonwebtoken = { version = "9", optional = true }
 base64 = { version = "0.22", optional = true }
 ring = { version = "0.17", optional = true }
 subtle = { version = "2", optional = true }
+hyper = { version = "1", features = ["server", "http1"], optional = true }
+hyper-util = { version = "0.1", features = ["tokio"], optional = true }
+http = { version = "1", optional = true }
+http-body = { version = "1", optional = true }
+http-body-util = { version = "0.1", optional = true }
+bytes = { version = "1", optional = true }
+futures-util = { version = "0.3", default-features = false, optional = true }
 xz2 = { version = "0.1", features = ["static"], optional = true }
 libc = "0.2"
 

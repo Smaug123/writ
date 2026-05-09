@@ -9,10 +9,19 @@ use std::collections::HashMap;
 use std::io::Read as _;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 
+use bytes::Bytes;
+use futures_util::Stream;
+use http_body_util::{BodyExt, Empty, Full, Limited, combinators::UnsyncBoxBody};
+use hyper::body::{Body as HyperBody, Frame, Incoming};
+use hyper::server::conn::http1;
+use hyper::service::service_fn;
+use hyper_util::rt::{TokioIo, TokioTimer};
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 use tokio::task::JoinSet;
@@ -54,7 +63,6 @@ use crate::vm_git_bundle::{
     run_git_clone_bundle,
 };
 
-const MAX_VM_HTTP_HEAD_BYTES: usize = 16 * 1024;
 const MAX_VM_HTTP_BODY_BYTES: usize = 64 * 1024;
 const MAX_VM_HTTP_AGENT_RUN_OUTCOME_BODY_BYTES: usize = 4 * 1024 * 1024;
 // The JSON upload cap bounds retained bytes on the wire. This larger cap is a
@@ -398,22 +406,12 @@ pub enum VmHttpGitRuntimeShutdownError {
 
 #[derive(Debug, thiserror::Error, Eq, PartialEq)]
 enum VmHttpParseError {
-    #[error("HTTP request line is missing")]
-    MissingRequestLine,
-    #[error("HTTP request line must be METHOD TARGET VERSION")]
-    MalformedRequestLine,
-    #[error("unsupported HTTP version {0}")]
-    UnsupportedVersion(String),
-    #[error("malformed HTTP header")]
-    MalformedHeader,
     #[error("duplicate Authorization header")]
     DuplicateAuthorization,
     #[error("duplicate Content-Length header")]
     DuplicateContentLength,
     #[error("invalid Content-Length header")]
     InvalidContentLength,
-    #[error("Transfer-Encoding is not supported")]
-    UnsupportedTransferEncoding,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -444,12 +442,6 @@ struct VmHttpResponse {
 struct VmHttpResponseHeader {
     name: &'static str,
     value: String,
-}
-
-#[derive(Debug, Eq, PartialEq)]
-struct VmHttpHeadRead {
-    raw_head: Vec<u8>,
-    buffered_body: Vec<u8>,
 }
 
 #[derive(Serialize)]
@@ -964,68 +956,31 @@ impl<S: SecretStore> Clone for VmHttpClaudeProxyService<S> {
     }
 }
 
-impl<S: SecretStore> VmHttpClaudeProxyStream<S> {
-    async fn write_to<W: AsyncWrite + Unpin>(mut self, out: &mut W) -> std::io::Result<()> {
-        write_http_response_head(
-            out,
-            VmHttpStatus::Upstream(self.upstream_status),
-            self.content_type,
-            None,
-            None,
-            &self.headers,
-        )
-        .await?;
-
-        let mut response_bytes = 0u64;
-        let mut error = None;
-        let mut write_error = None;
-        loop {
-            let chunk = match self.response.chunk().await {
-                Ok(Some(chunk)) => chunk,
-                Ok(None) => break,
-                Err(err) => {
-                    eprintln!("VM HTTP Claude proxy streaming body read failed: {err}");
-                    error = Some("upstream body read failed");
-                    break;
-                }
-            };
-            let chunk_len = u64::try_from(chunk.len()).expect("HTTP chunk length fits in u64");
-            let new_len = response_bytes
-                .checked_add(chunk_len)
-                .expect("HTTP response byte count overflowed before configured bound check");
-            if new_len > self.max_response_bytes {
-                error = Some("upstream response too large");
-                response_bytes = new_len;
-                break;
-            }
-            if let Err(err) = out.write_all(&chunk).await {
-                error = Some("guest response write failed");
-                write_error = Some(err);
-                break;
-            }
-            response_bytes = new_len;
+impl<S: SecretStore + Send + Sync + 'static> VmHttpClaudeProxyStream<S> {
+    fn into_hyper_response(self) -> http::Response<UnsyncBoxBody<Bytes, std::io::Error>> {
+        let body = ProxyStreamBody {
+            inner: Box::pin(self.response.bytes_stream()),
+            audit: Some(ProxyStreamAudit {
+                broker_state: self.broker_state,
+                kind: ProxyAuditKind::Claude,
+                request_id: self.request_id,
+                upstream_url: self.upstream_url,
+                upstream_status: self.upstream_status,
+            }),
+            max_response_bytes: self.max_response_bytes,
+            response_bytes: 0,
+            state: ProxyStreamState::Streaming,
+        };
+        let mut builder = http::Response::builder()
+            .status(self.upstream_status)
+            .header(http::header::CONTENT_TYPE, self.content_type)
+            .header(http::header::CONNECTION, "close");
+        for header in self.headers {
+            builder = builder.header(header.name, header.value);
         }
-
-        if let Err(err) =
-            self.broker_state
-                .audit
-                .record_claude_proxy_outcome(&ClaudeProxyOutcomeRecord {
-                    request_id: self.request_id,
-                    completed_at: UnixMillis::now(),
-                    http_status: self.upstream_status,
-                    upstream_url: Some(self.upstream_url.as_str()),
-                    upstream_status: Some(self.upstream_status),
-                    response_bytes,
-                    error,
-                })
-        {
-            eprintln!("VM HTTP Claude proxy streaming audit outcome write failed: {err}");
-        }
-
-        match write_error {
-            Some(err) => Err(err),
-            None => Ok(()),
-        }
+        builder
+            .body(body.boxed_unsync())
+            .expect("VmHttpClaudeProxyStream always builds a valid hyper response")
     }
 }
 
@@ -1362,68 +1317,169 @@ fn openai_proxy_auth_failure(body: &'static str, label: &'static str) -> VmHttpO
     }
 }
 
-impl<S: SecretStore> VmHttpOpenAiProxyStream<S> {
-    async fn write_to<W: AsyncWrite + Unpin>(mut self, out: &mut W) -> std::io::Result<()> {
-        write_http_response_head(
-            out,
-            VmHttpStatus::Upstream(self.upstream_status),
-            self.content_type,
-            None,
-            None,
-            &self.headers,
-        )
-        .await?;
+impl<S: SecretStore + Send + Sync + 'static> VmHttpOpenAiProxyStream<S> {
+    fn into_hyper_response(self) -> http::Response<UnsyncBoxBody<Bytes, std::io::Error>> {
+        let body = ProxyStreamBody {
+            inner: Box::pin(self.response.bytes_stream()),
+            audit: Some(ProxyStreamAudit {
+                broker_state: self.broker_state,
+                kind: ProxyAuditKind::OpenAi,
+                request_id: self.request_id,
+                upstream_url: self.upstream_url,
+                upstream_status: self.upstream_status,
+            }),
+            max_response_bytes: self.max_response_bytes,
+            response_bytes: 0,
+            state: ProxyStreamState::Streaming,
+        };
+        let mut builder = http::Response::builder()
+            .status(self.upstream_status)
+            .header(http::header::CONTENT_TYPE, self.content_type)
+            .header(http::header::CONNECTION, "close");
+        for header in self.headers {
+            builder = builder.header(header.name, header.value);
+        }
+        builder
+            .body(body.boxed_unsync())
+            .expect("VmHttpOpenAiProxyStream always builds a valid hyper response")
+    }
+}
 
-        let mut response_bytes = 0u64;
-        let mut error = None;
-        let mut write_error = None;
-        loop {
-            let chunk = match self.response.chunk().await {
-                Ok(Some(chunk)) => chunk,
-                Ok(None) => break,
-                Err(err) => {
-                    eprintln!("VM HTTP OpenAI proxy streaming body read failed: {err}");
-                    error = Some("upstream body read failed");
-                    break;
+#[derive(Copy, Clone, Debug)]
+enum ProxyAuditKind {
+    Claude,
+    OpenAi,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum ProxyStreamState {
+    Streaming,
+    UpstreamEnded,
+    UpstreamError,
+    OverMax,
+}
+
+struct ProxyStreamAudit<S: SecretStore> {
+    broker_state: Arc<BrokerState<S>>,
+    kind: ProxyAuditKind,
+    request_id: RequestId,
+    upstream_url: String,
+    upstream_status: u16,
+}
+
+struct ProxyStreamBody<S: SecretStore> {
+    inner: Pin<Box<dyn Stream<Item = reqwest::Result<Bytes>> + Send>>,
+    audit: Option<ProxyStreamAudit<S>>,
+    max_response_bytes: u64,
+    response_bytes: u64,
+    state: ProxyStreamState,
+}
+
+impl<S: SecretStore> HyperBody for ProxyStreamBody<S> {
+    type Data = Bytes;
+    type Error = std::io::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, std::io::Error>>> {
+        let me = self.get_mut();
+        if me.state != ProxyStreamState::Streaming {
+            return Poll::Ready(None);
+        }
+        match me.inner.as_mut().poll_next(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(None) => {
+                me.state = ProxyStreamState::UpstreamEnded;
+                Poll::Ready(None)
+            }
+            Poll::Ready(Some(Err(err))) => {
+                eprintln!(
+                    "VM HTTP {} proxy streaming body read failed: {err}",
+                    proxy_audit_label(me.audit.as_ref().map(|a| a.kind)),
+                );
+                me.state = ProxyStreamState::UpstreamError;
+                Poll::Ready(None)
+            }
+            Poll::Ready(Some(Ok(chunk))) => {
+                let chunk_len =
+                    u64::try_from(chunk.len()).expect("HTTP chunk length fits in u64");
+                let new_len = me
+                    .response_bytes
+                    .checked_add(chunk_len)
+                    .expect("HTTP response byte count overflowed before configured bound check");
+                if new_len > me.max_response_bytes {
+                    me.response_bytes = new_len;
+                    me.state = ProxyStreamState::OverMax;
+                    return Poll::Ready(None);
                 }
-            };
-            let chunk_len = u64::try_from(chunk.len()).expect("HTTP chunk length fits in u64");
-            let new_len = response_bytes
-                .checked_add(chunk_len)
-                .expect("HTTP response byte count overflowed before configured bound check");
-            if new_len > self.max_response_bytes {
-                error = Some("upstream response too large");
-                response_bytes = new_len;
-                break;
+                me.response_bytes = new_len;
+                Poll::Ready(Some(Ok(Frame::data(chunk))))
             }
-            if let Err(err) = out.write_all(&chunk).await {
-                error = Some("guest response write failed");
-                write_error = Some(err);
-                break;
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.state != ProxyStreamState::Streaming
+    }
+}
+
+impl<S: SecretStore> Drop for ProxyStreamBody<S> {
+    fn drop(&mut self) {
+        let Some(audit) = self.audit.take() else {
+            return;
+        };
+        let error = match self.state {
+            ProxyStreamState::Streaming => Some("guest response write failed"),
+            ProxyStreamState::UpstreamEnded => None,
+            ProxyStreamState::UpstreamError => Some("upstream body read failed"),
+            ProxyStreamState::OverMax => Some("upstream response too large"),
+        };
+        let response_bytes = self.response_bytes;
+        match audit.kind {
+            ProxyAuditKind::Claude => {
+                if let Err(err) = audit.broker_state.audit.record_claude_proxy_outcome(
+                    &ClaudeProxyOutcomeRecord {
+                        request_id: audit.request_id,
+                        completed_at: UnixMillis::now(),
+                        http_status: audit.upstream_status,
+                        upstream_url: Some(audit.upstream_url.as_str()),
+                        upstream_status: Some(audit.upstream_status),
+                        response_bytes,
+                        error,
+                    },
+                ) {
+                    eprintln!(
+                        "VM HTTP Claude proxy streaming audit outcome write failed: {err}"
+                    );
+                }
             }
-            response_bytes = new_len;
+            ProxyAuditKind::OpenAi => {
+                if let Err(err) = audit.broker_state.audit.record_openai_proxy_outcome(
+                    &OpenAiProxyOutcomeRecord {
+                        request_id: audit.request_id,
+                        completed_at: UnixMillis::now(),
+                        http_status: audit.upstream_status,
+                        upstream_url: Some(audit.upstream_url.as_str()),
+                        upstream_status: Some(audit.upstream_status),
+                        response_bytes,
+                        error,
+                    },
+                ) {
+                    eprintln!(
+                        "VM HTTP OpenAI proxy streaming audit outcome write failed: {err}"
+                    );
+                }
+            }
         }
+    }
+}
 
-        if let Err(err) =
-            self.broker_state
-                .audit
-                .record_openai_proxy_outcome(&OpenAiProxyOutcomeRecord {
-                    request_id: self.request_id,
-                    completed_at: UnixMillis::now(),
-                    http_status: self.upstream_status,
-                    upstream_url: Some(self.upstream_url.as_str()),
-                    upstream_status: Some(self.upstream_status),
-                    response_bytes,
-                    error,
-                })
-        {
-            eprintln!("VM HTTP OpenAI proxy streaming audit outcome write failed: {err}");
-        }
-
-        match write_error {
-            Some(err) => Err(err),
-            None => Ok(()),
-        }
+fn proxy_audit_label(kind: Option<ProxyAuditKind>) -> &'static str {
+    match kind {
+        Some(ProxyAuditKind::Claude) => "Claude",
+        Some(ProxyAuditKind::OpenAi) => "OpenAI",
+        None => "?",
     }
 }
 
@@ -2328,7 +2384,7 @@ async fn handle_vm_http_connection<S: SecretStore + Send + Sync + 'static>(
 }
 
 async fn handle_vm_http_connection_with_read_timeout<S, T>(
-    mut stream: T,
+    stream: T,
     peer_addr: SocketAddr,
     session: VmHttpSession,
     services: VmHttpServices<S>,
@@ -2336,45 +2392,57 @@ async fn handle_vm_http_connection_with_read_timeout<S, T>(
 ) -> std::io::Result<()>
 where
     S: SecretStore + Send + Sync + 'static,
-    T: AsyncRead + AsyncWrite + Unpin,
+    T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let head = match tokio::time::timeout(
-        read_timeout,
-        read_http_head_bounded(&mut stream, MAX_VM_HTTP_HEAD_BYTES),
-    )
-    .await
-    {
-        Err(_) => return Ok(()),
-        Ok(Err(err)) if err.kind() == std::io::ErrorKind::InvalidData => {
-            let response = VmHttpResponse::text(VmHttpStatus::BadRequest, err.to_string());
-            return stream.write_all(&response.to_bytes()).await;
-        }
-        Ok(Err(err)) => return Err(err),
-        Ok(Ok(head)) => head,
-    };
-
-    let dispatch = dispatch_vm_http_head_and_body(
-        &session,
-        peer_addr,
-        head,
-        &mut stream,
-        services,
-        read_timeout,
-    )
-    .await;
-    dispatch.write_to(&mut stream).await
+    let session = Arc::new(session);
+    let services = Arc::new(services);
+    let result = http1::Builder::new()
+        .keep_alive(false)
+        .timer(TokioTimer::new())
+        .header_read_timeout(read_timeout)
+        .serve_connection(
+            TokioIo::new(stream),
+            service_fn(move |req: http::Request<Incoming>| {
+                let session = Arc::clone(&session);
+                let services = (*services).clone();
+                async move {
+                    Ok::<_, std::convert::Infallible>(
+                        serve_vm_http_request(&session, peer_addr, req, services, read_timeout)
+                            .await,
+                    )
+                }
+            }),
+        )
+        .await;
+    if let Err(err) = result {
+        // Hyper's connection-level errors (peer closed, parse failure,
+        // header-read timeout) match the previous behaviour of swallowing
+        // bad-input from the peer rather than surfacing them as I/O errors.
+        eprintln!("VM HTTP connection: {err}");
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 fn dispatch_vm_http_head(
     session: &VmHttpSession,
     peer_addr: SocketAddr,
-    raw: &[u8],
+    method: &str,
+    target: &str,
+    authorization: Option<&str>,
 ) -> VmHttpResponse {
-    let request = match parse_http_head(raw, peer_addr) {
-        Ok(request) => request,
-        Err(err) => return VmHttpResponse::text(VmHttpStatus::BadRequest, err.to_string()),
-    };
+    let mut request = VmHttpRequest::new(
+        method,
+        target,
+        authorization.map(|s| s.to_string()),
+        peer_addr,
+    );
+    if let Some(value) = authorization {
+        request.headers.push(VmHttpHeader {
+            name: "Authorization".into(),
+            value: value.to_string(),
+        });
+    }
     let auth_scheme = auth_scheme_for_target(&request.target);
     match authorize_vm_http_request_with_scheme(session, &request, auth_scheme) {
         VmHttpAuthorization::Allow if is_nix_cache_target(&request.target) => {
@@ -2385,56 +2453,111 @@ fn dispatch_vm_http_head(
     }
 }
 
-async fn dispatch_vm_http_head_and_body<S, R>(
+#[cfg(test)]
+struct DispatchedTestResponse {
+    status: VmHttpStatus,
+    content_type: String,
+    body: Vec<u8>,
+    headers: http::HeaderMap,
+}
+
+#[cfg(test)]
+impl DispatchedTestResponse {
+    async fn from_hyper_response(
+        response: http::Response<UnsyncBoxBody<Bytes, std::io::Error>>,
+    ) -> Self {
+        let (parts, body) = response.into_parts();
+        let body = body
+            .collect()
+            .await
+            .expect("test response body collects without I/O error")
+            .to_bytes()
+            .to_vec();
+        let content_type = parts
+            .headers
+            .get(http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        Self {
+            status: VmHttpStatus::from_code(parts.status.as_u16()),
+            content_type,
+            body,
+            headers: parts.headers,
+        }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_vm_http_head_and_body<S>(
     session: &VmHttpSession,
     peer_addr: SocketAddr,
-    head: VmHttpHeadRead,
-    stream: &mut R,
+    method: &str,
+    target: &str,
+    headers: &[(&str, &str)],
+    body: Vec<u8>,
     services: VmHttpServices<S>,
     read_timeout: std::time::Duration,
-) -> VmHttpDispatch<S>
+) -> DispatchedTestResponse
 where
-    S: SecretStore + Send + Sync,
-    R: AsyncRead + Unpin,
+    S: SecretStore + Send + Sync + 'static,
 {
-    let request = match parse_http_head(&head.raw_head, peer_addr) {
+    let mut builder = http::Request::builder().method(method).uri(target);
+    for (name, value) in headers {
+        builder = builder.header(*name, *value);
+    }
+    let request = builder
+        .body(http_body_util::Full::new(Bytes::from(body)))
+        .expect("test request builds with valid method/uri/headers");
+    let response =
+        serve_vm_http_request(session, peer_addr, request, services, read_timeout).await;
+    DispatchedTestResponse::from_hyper_response(response).await
+}
+
+async fn serve_vm_http_request<S, B>(
+    session: &VmHttpSession,
+    peer_addr: SocketAddr,
+    request: http::Request<B>,
+    services: VmHttpServices<S>,
+    read_timeout: std::time::Duration,
+) -> http::Response<UnsyncBoxBody<Bytes, std::io::Error>>
+where
+    S: SecretStore + Send + Sync + 'static,
+    B: HyperBody<Data = Bytes> + Send + 'static,
+    B::Error: std::error::Error + Send + Sync + 'static,
+{
+    let (parts, body) = request.into_parts();
+    let request = match VmHttpRequest::from_hyper_parts(&parts, peer_addr) {
         Ok(request) => request,
         Err(err) => {
-            let dispatch: VmHttpDispatch<S> =
-                VmHttpResponse::text(VmHttpStatus::BadRequest, err.to_string()).into();
-            log_vm_http_request(session, "?", "?", dispatch.status_code());
-            return dispatch;
+            let response = VmHttpResponse::text(VmHttpStatus::BadRequest, err.to_string());
+            log_vm_http_request(session, "?", "?", response.status.code());
+            return response.into_hyper_response();
         }
     };
     let auth_scheme = auth_scheme_for_target(&request.target);
     let dispatch: VmHttpDispatch<S> =
         match authorize_vm_http_request_with_scheme(session, &request, auth_scheme) {
             VmHttpAuthorization::Allow => {
-                let body = match route_request_body_limit(&request, &services) {
+                let body_bytes = match route_request_body_limit(&request, &services) {
                     None => Vec::new(),
-                    Some(max) => match read_http_body_for_route(
-                        stream,
-                        request.content_length.unwrap_or(0),
-                        head.buffered_body,
-                        read_timeout,
-                        max,
-                    )
-                    .await
-                    {
-                        Ok(body) => body,
-                        Err(response) => {
-                            let dispatch: VmHttpDispatch<S> = response.into();
-                            log_vm_http_request(
-                                session,
-                                &request.method,
-                                &request.target,
-                                dispatch.status_code(),
-                            );
-                            return dispatch;
+                    Some(max) => {
+                        match read_request_body_with_limit(body, max, read_timeout).await {
+                            Ok(bytes) => bytes,
+                            Err(response) => {
+                                log_vm_http_request(
+                                    session,
+                                    &request.method,
+                                    &request.target,
+                                    response.status.code(),
+                                );
+                                return response.into_hyper_response();
+                            }
                         }
-                    },
+                    }
                 };
-                route_authenticated_vm_http_request(session, &request, body, services).await
+                route_authenticated_vm_http_request(session, &request, body_bytes, services).await
             }
             VmHttpAuthorization::Deny(err) => {
                 let response = auth_error_response(auth_scheme, err);
@@ -2491,7 +2614,42 @@ where
         &request.target,
         dispatch.status_code(),
     );
-    dispatch
+    dispatch.into_hyper_response()
+}
+
+async fn read_request_body_with_limit<B>(
+    body: B,
+    max: usize,
+    read_timeout: std::time::Duration,
+) -> Result<Vec<u8>, VmHttpResponse>
+where
+    B: HyperBody<Data = Bytes> + Send + 'static,
+    B::Error: std::error::Error + Send + Sync + 'static,
+{
+    let limited = Limited::new(body, max);
+    match tokio::time::timeout(read_timeout, limited.collect()).await {
+        Err(_) => Err(VmHttpResponse::text(
+            VmHttpStatus::BadRequest,
+            "incomplete request body",
+        )),
+        Ok(Ok(collected)) => Ok(collected.to_bytes().to_vec()),
+        Ok(Err(err)) => {
+            // `Limited::collect` returns boxed errors; the downcast lets us
+            // distinguish between a max-byte cap from the inner body's I/O
+            // failure so the response can carry an accurate diagnostic.
+            if err.is::<http_body_util::LengthLimitError>() {
+                Err(VmHttpResponse::text(
+                    VmHttpStatus::BadRequest,
+                    format!("HTTP request body exceeds {max}-byte limit"),
+                ))
+            } else {
+                Err(VmHttpResponse::text(
+                    VmHttpStatus::BadRequest,
+                    "incomplete request body",
+                ))
+            }
+        }
+    }
 }
 
 fn log_vm_http_request(session: &VmHttpSession, method: &str, target: &str, status: u16) {
@@ -4581,35 +4739,6 @@ fn narinfo_audit_error_label(err: &NixNarInfoError) -> &'static str {
     }
 }
 
-async fn read_http_body_for_route<R: AsyncRead + Unpin>(
-    stream: &mut R,
-    content_length: usize,
-    buffered_body: Vec<u8>,
-    read_timeout: std::time::Duration,
-    max: usize,
-) -> Result<Vec<u8>, VmHttpResponse> {
-    match tokio::time::timeout(
-        read_timeout,
-        read_http_body_bounded(stream, content_length, buffered_body, max),
-    )
-    .await
-    {
-        Err(_) => Err(VmHttpResponse::text(
-            VmHttpStatus::BadRequest,
-            "incomplete request body",
-        )),
-        Ok(Ok(body)) => Ok(body),
-        Ok(Err(err)) if err.kind() == std::io::ErrorKind::InvalidData => Err(VmHttpResponse::text(
-            VmHttpStatus::BadRequest,
-            err.to_string(),
-        )),
-        Ok(Err(_)) => Err(VmHttpResponse::text(
-            VmHttpStatus::BadRequest,
-            "incomplete request body",
-        )),
-    }
-}
-
 async fn handle_git_clone_request<S: SecretStore + Send + Sync>(
     session: &VmHttpSession,
     body: &[u8],
@@ -4837,138 +4966,62 @@ fn git_clone_run_error_message(err: GitCloneBundleRunError) -> String {
     format!("Git clone failed: {err}")
 }
 
-async fn read_http_head_bounded<R: AsyncRead + Unpin>(
-    stream: &mut R,
-    max: usize,
-) -> std::io::Result<VmHttpHeadRead> {
-    let mut buf = Vec::new();
-    let mut chunk = [0u8; 1024];
-    loop {
-        let read = stream.read(&mut chunk).await?;
-        if read == 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "connection closed before complete HTTP header",
-            ));
-        }
+impl VmHttpRequest {
+    fn from_hyper_parts(
+        parts: &http::request::Parts,
+        peer_addr: SocketAddr,
+    ) -> Result<Self, VmHttpParseError> {
+        let method = parts.method.as_str().to_string();
+        let target = parts
+            .uri
+            .path_and_query()
+            .map(|pq| pq.as_str().to_string())
+            .unwrap_or_else(|| "/".to_string());
 
-        buf.extend_from_slice(&chunk[..read]);
-        if let Some(index) = buf.windows(4).position(|window| window == b"\r\n\r\n") {
-            let head_end = index + 4;
-            if head_end > max {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("HTTP request header exceeds {max}-byte limit"),
-                ));
-            }
-            let buffered_body = buf.split_off(head_end);
-            return Ok(VmHttpHeadRead {
-                raw_head: buf,
-                buffered_body,
+        let mut authorization: Option<String> = None;
+        let mut content_length: Option<usize> = None;
+        let mut headers = Vec::new();
+        for (name, value) in parts.headers.iter() {
+            let Ok(value_str) = std::str::from_utf8(value.as_bytes()) else {
+                continue;
+            };
+            let value_str = value_str.to_string();
+            headers.push(VmHttpHeader {
+                name: name.as_str().to_string(),
+                value: value_str.clone(),
             });
-        }
-        if buf.len() > max {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("HTTP request header exceeds {max}-byte limit"),
-            ));
-        }
-    }
-}
-
-async fn read_http_body_bounded<R: AsyncRead + Unpin>(
-    stream: &mut R,
-    content_length: usize,
-    mut buffered_body: Vec<u8>,
-    max: usize,
-) -> std::io::Result<Vec<u8>> {
-    if content_length > max {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("HTTP request body exceeds {max}-byte limit"),
-        ));
-    }
-    if buffered_body.len() >= content_length {
-        buffered_body.truncate(content_length);
-        return Ok(buffered_body);
-    }
-
-    let mut body = buffered_body;
-    let already_buffered = body.len();
-    body.resize(content_length, 0);
-    stream.read_exact(&mut body[already_buffered..]).await?;
-    Ok(body)
-}
-
-fn parse_http_head(raw: &[u8], peer_addr: SocketAddr) -> Result<VmHttpRequest, VmHttpParseError> {
-    let head = std::str::from_utf8(raw).map_err(|_| VmHttpParseError::MalformedHeader)?;
-    let head = head
-        .split_once("\r\n\r\n")
-        .map(|(head, _)| head)
-        .ok_or(VmHttpParseError::MalformedHeader)?;
-    let mut lines = head.split("\r\n");
-    let request_line = lines.next().ok_or(VmHttpParseError::MissingRequestLine)?;
-    let mut request_parts = request_line.split_whitespace();
-    let method = request_parts
-        .next()
-        .ok_or(VmHttpParseError::MalformedRequestLine)?;
-    let target = request_parts
-        .next()
-        .ok_or(VmHttpParseError::MalformedRequestLine)?;
-    let version = request_parts
-        .next()
-        .ok_or(VmHttpParseError::MalformedRequestLine)?;
-    if request_parts.next().is_some() {
-        return Err(VmHttpParseError::MalformedRequestLine);
-    }
-    if !matches!(version, "HTTP/1.0" | "HTTP/1.1") {
-        return Err(VmHttpParseError::UnsupportedVersion(version.to_string()));
-    }
-
-    let mut authorization = None;
-    let mut content_length = None;
-    let mut headers = Vec::new();
-    for line in lines {
-        let Some((name, value)) = line.split_once(':') else {
-            return Err(VmHttpParseError::MalformedHeader);
-        };
-        let value = value.trim().to_string();
-        headers.push(VmHttpHeader {
-            name: name.to_string(),
-            value: value.clone(),
-        });
-        if name.eq_ignore_ascii_case("authorization") {
-            if authorization.is_some() {
-                return Err(VmHttpParseError::DuplicateAuthorization);
+            if name.as_str().eq_ignore_ascii_case("authorization") {
+                if authorization.is_some() {
+                    return Err(VmHttpParseError::DuplicateAuthorization);
+                }
+                authorization = Some(value_str);
+                continue;
             }
-            authorization = Some(value.clone());
-        }
-        if name.eq_ignore_ascii_case("content-length") {
-            if content_length.is_some() {
-                return Err(VmHttpParseError::DuplicateContentLength);
+            if name.as_str().eq_ignore_ascii_case("content-length") {
+                if content_length.is_some() {
+                    return Err(VmHttpParseError::DuplicateContentLength);
+                }
+                if value_str.is_empty() || value_str.starts_with('+') || value_str.starts_with('-')
+                {
+                    return Err(VmHttpParseError::InvalidContentLength);
+                }
+                content_length = Some(
+                    value_str
+                        .parse::<usize>()
+                        .map_err(|_| VmHttpParseError::InvalidContentLength)?,
+                );
             }
-            if value.is_empty() || value.starts_with('+') || value.starts_with('-') {
-                return Err(VmHttpParseError::InvalidContentLength);
-            }
-            content_length = Some(
-                value
-                    .parse::<usize>()
-                    .map_err(|_| VmHttpParseError::InvalidContentLength)?,
-            );
         }
-        if name.eq_ignore_ascii_case("transfer-encoding") {
-            return Err(VmHttpParseError::UnsupportedTransferEncoding);
-        }
-    }
 
-    Ok(VmHttpRequest {
-        method: method.to_string(),
-        target: target.to_string(),
-        authorization,
-        content_length,
-        headers,
-        peer_addr,
-    })
+        Ok(VmHttpRequest {
+            method,
+            target,
+            authorization,
+            content_length,
+            headers,
+            peer_addr,
+        })
+    }
 }
 
 impl VmHttpResponse {
@@ -5010,51 +5063,33 @@ impl VmHttpResponse {
         self
     }
 
-    fn to_bytes(&self) -> Vec<u8> {
-        let content_length = self.content_length.unwrap_or(self.body.len() as u64);
-        let mut out = format!(
-            "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n",
-            self.status.status_line(),
-            self.content_type,
-            content_length
-        )
-        .into_bytes();
+    fn into_hyper_response(self) -> http::Response<UnsyncBoxBody<Bytes, std::io::Error>> {
+        let mut builder = http::Response::builder()
+            .status(self.status.code())
+            .header(http::header::CONTENT_TYPE, self.content_type)
+            .header(http::header::CONNECTION, "close");
+        if let Some(content_length) = self.content_length {
+            builder = builder.header(http::header::CONTENT_LENGTH, content_length);
+        }
         if let Some(challenge) = self.www_authenticate {
-            out.extend_from_slice(format!("WWW-Authenticate: {challenge}\r\n").as_bytes());
+            builder = builder.header(http::header::WWW_AUTHENTICATE, challenge);
         }
-        for header in &self.headers {
-            out.extend_from_slice(format!("{}: {}\r\n", header.name, header.value).as_bytes());
+        for header in self.headers {
+            builder = builder.header(header.name, header.value);
         }
-        out.extend_from_slice(b"\r\n");
-        out.extend_from_slice(&self.body);
-        out
+        let body: UnsyncBoxBody<Bytes, std::io::Error> = if self.body.is_empty() {
+            Empty::<Bytes>::new()
+                .map_err(|never| match never {})
+                .boxed_unsync()
+        } else {
+            Full::new(Bytes::from(self.body))
+                .map_err(|never| match never {})
+                .boxed_unsync()
+        };
+        builder
+            .body(body)
+            .expect("VmHttpResponse always builds a valid hyper response")
     }
-}
-
-async fn write_http_response_head<W: AsyncWrite + Unpin>(
-    out: &mut W,
-    status: VmHttpStatus,
-    content_type: &'static str,
-    content_length: Option<u64>,
-    www_authenticate: Option<&'static str>,
-    headers: &[VmHttpResponseHeader],
-) -> std::io::Result<()> {
-    let mut head = format!(
-        "HTTP/1.1 {}\r\nContent-Type: {}\r\nConnection: close\r\n",
-        status.status_line(),
-        content_type,
-    );
-    if let Some(content_length) = content_length {
-        head.push_str(&format!("Content-Length: {content_length}\r\n"));
-    }
-    if let Some(challenge) = www_authenticate {
-        head.push_str(&format!("WWW-Authenticate: {challenge}\r\n"));
-    }
-    for header in headers {
-        head.push_str(&format!("{}: {}\r\n", header.name, header.value));
-    }
-    head.push_str("\r\n");
-    out.write_all(head.as_bytes()).await
 }
 
 impl<S: SecretStore> From<VmHttpResponse> for VmHttpDispatch<S> {
@@ -5063,15 +5098,17 @@ impl<S: SecretStore> From<VmHttpResponse> for VmHttpDispatch<S> {
     }
 }
 
-impl<S: SecretStore> VmHttpDispatch<S> {
-    async fn write_to<W: AsyncWrite + Unpin>(self, out: &mut W) -> std::io::Result<()> {
+impl<S: SecretStore + Send + Sync + 'static> VmHttpDispatch<S> {
+    fn into_hyper_response(self) -> http::Response<UnsyncBoxBody<Bytes, std::io::Error>> {
         match self {
-            Self::Buffered(response) => out.write_all(&response.to_bytes()).await,
-            Self::ClaudeProxyStream(response) => response.write_to(out).await,
-            Self::OpenAiProxyStream(response) => response.write_to(out).await,
+            Self::Buffered(response) => response.into_hyper_response(),
+            Self::ClaudeProxyStream(stream) => stream.into_hyper_response(),
+            Self::OpenAiProxyStream(stream) => stream.into_hyper_response(),
         }
     }
+}
 
+impl<S: SecretStore> VmHttpDispatch<S> {
     fn status_code(&self) -> u16 {
         match self {
             Self::Buffered(response) => response.status.code(),
@@ -5092,29 +5129,6 @@ impl<S: SecretStore> VmHttpDispatch<S> {
 }
 
 impl VmHttpStatus {
-    fn status_line(self) -> Cow<'static, str> {
-        match self {
-            Self::Ok => "200 OK".into(),
-            Self::BadRequest => "400 Bad Request".into(),
-            Self::Unauthorized => "401 Unauthorized".into(),
-            Self::Forbidden => "403 Forbidden".into(),
-            Self::NotFound => "404 Not Found".into(),
-            Self::MethodNotAllowed => "405 Method Not Allowed".into(),
-            Self::Gone => "410 Gone".into(),
-            Self::BadGateway => "502 Bad Gateway".into(),
-            Self::InternalServerError => "500 Internal Server Error".into(),
-            Self::Upstream(200) => "200 OK".into(),
-            Self::Upstream(400) => "400 Bad Request".into(),
-            Self::Upstream(401) => "401 Unauthorized".into(),
-            Self::Upstream(403) => "403 Forbidden".into(),
-            Self::Upstream(404) => "404 Not Found".into(),
-            Self::Upstream(429) => "429 Too Many Requests".into(),
-            Self::Upstream(500) => "500 Internal Server Error".into(),
-            Self::Upstream(529) => "529 Overloaded".into(),
-            Self::Upstream(code) => format!("{code} Upstream").into(),
-        }
-    }
-
     fn code(self) -> u16 {
         match self {
             Self::Ok => 200,
@@ -5127,6 +5141,22 @@ impl VmHttpStatus {
             Self::BadGateway => 502,
             Self::InternalServerError => 500,
             Self::Upstream(code) => code,
+        }
+    }
+
+    #[cfg(test)]
+    fn from_code(code: u16) -> Self {
+        match code {
+            200 => Self::Ok,
+            400 => Self::BadRequest,
+            401 => Self::Unauthorized,
+            403 => Self::Forbidden,
+            404 => Self::NotFound,
+            405 => Self::MethodNotAllowed,
+            410 => Self::Gone,
+            500 => Self::InternalServerError,
+            502 => Self::BadGateway,
+            other => Self::Upstream(other),
         }
     }
 }
@@ -6278,14 +6308,6 @@ esac
         }
 
         #[test]
-        fn parse_http_head_is_total_for_bounded_bytes(
-            raw in prop::collection::vec(any::<u8>(), 0..MAX_VM_HTTP_HEAD_BYTES + 1),
-        ) {
-            let peer_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(10, 1, 2, 3), 12345));
-            let _ = parse_http_head(&raw, peer_addr);
-        }
-
-        #[test]
         fn authorization_is_total_for_any_peer_and_header(
             second in any::<u8>(),
             third in any::<u8>(),
@@ -6424,29 +6446,32 @@ esac
         let response = dispatch_vm_http_head(
             &session,
             SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(10, 1, 2, 3), 12345)),
-            format!("GET {VM_NIX_CACHE_INFO_PATH} HTTP/1.1\r\n\r\n").as_bytes(),
+            "GET",
+            VM_NIX_CACHE_INFO_PATH,
+            None,
         );
 
         assert_eq!(response.status, VmHttpStatus::Unauthorized);
-        let wire = String::from_utf8(response.to_bytes()).unwrap();
+        let challenge = response
+            .www_authenticate
+            .expect("nix cache must issue a Basic challenge");
         assert!(
-            wire.contains("WWW-Authenticate: Basic realm=\"writ-nix-cache\""),
-            "{wire}"
+            challenge.starts_with("Basic realm=\"writ-nix-cache\""),
+            "{challenge}"
         );
-        assert!(!wire.contains("WWW-Authenticate: Bearer"), "{wire}");
+        assert!(!challenge.contains("Bearer"), "{challenge}");
     }
 
     #[test]
     fn nix_cache_info_route_returns_binary_cache_metadata() {
         let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(10, 1, 2, 0), 24).unwrap());
+        let basic_auth = basic(token().as_str());
         let response = dispatch_vm_http_head(
             &session,
             SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(10, 1, 2, 3), 12345)),
-            format!(
-                "GET {VM_NIX_CACHE_INFO_PATH} HTTP/1.1\r\nAuthorization: {}\r\n\r\n",
-                basic(token().as_str())
-            )
-            .as_bytes(),
+            "GET",
+            VM_NIX_CACHE_INFO_PATH,
+            Some(basic_auth.as_str()),
         );
 
         assert_eq!(response.status, VmHttpStatus::Ok);
@@ -6460,14 +6485,13 @@ esac
     fn nix_cache_narinfo_route_returns_controlled_miss() {
         let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(10, 1, 2, 0), 24).unwrap());
         let target = format!("{VM_NIX_CACHE_PATH_PREFIX}/00000000000000000000000000000000.narinfo");
+        let basic_auth = basic(token().as_str());
         let response = dispatch_vm_http_head(
             &session,
             SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(10, 1, 2, 3), 12345)),
-            format!(
-                "GET {target} HTTP/1.1\r\nAuthorization: {}\r\n\r\n",
-                basic(token().as_str())
-            )
-            .as_bytes(),
+            "GET",
+            &target,
+            Some(basic_auth.as_str()),
         );
 
         assert_eq!(response.status, VmHttpStatus::NotFound);
@@ -7380,33 +7404,29 @@ esac
                 .is_none(),
             "streaming outcome must not be recorded before the response is written"
         );
-        let (mut client, mut server) = tokio::io::duplex(4096);
+        let response =
+            DispatchedTestResponse::from_hyper_response(dispatch.into_hyper_response()).await;
 
-        let writer = tokio::spawn(async move { dispatch.write_to(&mut server).await.unwrap() });
-        let mut response = Vec::new();
-        client.read_to_end(&mut response).await.unwrap();
-        writer.await.unwrap();
-        let response = String::from_utf8(response).unwrap();
-
-        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response}");
+        assert_eq!(response.status, VmHttpStatus::Ok);
+        assert_eq!(response.content_type, "text/event-stream");
         assert!(
-            response.contains("Content-Type: text/event-stream\r\n"),
-            "{response}"
+            !response.headers.contains_key(http::header::CONTENT_LENGTH),
+            "{:?}",
+            response.headers
         );
-        assert!(!response.contains("Content-Length:"), "{response}");
-        assert!(
-            response.contains("Request-Id: req-stream-123\r\n"),
-            "{response}"
+        assert_eq!(
+            response
+                .headers
+                .get("request-id")
+                .and_then(|v| v.to_str().ok()),
+            Some("req-stream-123")
         );
-        assert!(
-            response.ends_with(std::str::from_utf8(upstream_body).unwrap()),
-            "{response}"
-        );
+        assert_eq!(response.body, upstream_body);
         let outcome = state
             .audit
             .claude_proxy_outcome_for_test(request_id)
             .unwrap()
-            .expect("streaming outcome should be recorded after write_to");
+            .expect("streaming outcome should be recorded after the body is collected");
         assert_eq!(outcome, (200, upstream_body.len() as u64, None));
     }
 
@@ -7463,28 +7483,17 @@ esac
                 panic!("expected Claude streaming response, got OpenAI streaming response")
             }
         };
-        let (mut client, mut server) = tokio::io::duplex(4096);
+        let response =
+            DispatchedTestResponse::from_hyper_response(dispatch.into_hyper_response()).await;
 
-        let writer = tokio::spawn(async move { dispatch.write_to(&mut server).await.unwrap() });
-        let mut response = Vec::new();
-        client.read_to_end(&mut response).await.unwrap();
-        writer.await.unwrap();
-        let response = String::from_utf8(response).unwrap();
-
-        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response}");
-        assert!(
-            response.contains("Content-Type: text/event-stream\r\n"),
-            "{response}"
-        );
-        assert!(
-            !response.ends_with(std::str::from_utf8(upstream_body).unwrap()),
-            "{response}"
-        );
+        assert_eq!(response.status, VmHttpStatus::Ok);
+        assert_eq!(response.content_type, "text/event-stream");
+        assert_ne!(response.body, upstream_body);
         let outcome = state
             .audit
             .claude_proxy_outcome_for_test(request_id)
             .unwrap()
-            .expect("streaming outcome should be recorded after write_to");
+            .expect("streaming outcome should be recorded after the body is collected");
         assert_eq!(
             outcome,
             (
@@ -7518,22 +7527,17 @@ esac
             .unwrap(),
         )
         .unwrap();
-        let raw_head = format!("POST {VM_CLAUDE_MESSAGES_PATH} HTTP/1.1\r\n\r\n").into_bytes();
-        let mut stream = tokio::io::empty();
-
         let response = dispatch_vm_http_head_and_body(
             &session,
             SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 12345)),
-            VmHttpHeadRead {
-                raw_head,
-                buffered_body: Vec::new(),
-            },
-            &mut stream,
+            "POST",
+            VM_CLAUDE_MESSAGES_PATH,
+            &[],
+            Vec::new(),
             services_with_claude_proxy(service),
             VM_HTTP_READ_TIMEOUT,
         )
-        .await
-        .into_buffered();
+        .await;
 
         assert_eq!(response.status, VmHttpStatus::Unauthorized);
         let entries = state
@@ -7696,22 +7700,17 @@ esac
             .unwrap(),
         )
         .unwrap();
-        let raw_head = format!("POST {VM_OPENAI_RESPONSES_PATH} HTTP/1.1\r\n\r\n").into_bytes();
-        let mut stream = tokio::io::empty();
-
         let response = dispatch_vm_http_head_and_body(
             &session,
             SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 12345)),
-            VmHttpHeadRead {
-                raw_head,
-                buffered_body: Vec::new(),
-            },
-            &mut stream,
+            "POST",
+            VM_OPENAI_RESPONSES_PATH,
+            &[],
+            Vec::new(),
             services_with_openai_proxy(service),
             VM_HTTP_READ_TIMEOUT,
         )
-        .await
-        .into_buffered();
+        .await;
 
         assert_eq!(response.status, VmHttpStatus::Unauthorized);
         let entries = state
@@ -8791,8 +8790,7 @@ esac
         assert_eq!(response.status, VmHttpStatus::Ok);
         assert_eq!(response.content_type, "application/x-nix-nar");
         assert!(response.body.is_empty());
-        let wire = String::from_utf8(response.to_bytes()).unwrap();
-        assert!(wire.contains("Content-Length: 123\r\n"), "{wire}");
+        assert_eq!(response.content_length, Some(123));
         let entries = state
             .audit
             .list_nix_cache_requests_for_session(session.session_id())
@@ -8971,22 +8969,18 @@ esac
         let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
         open_audit_session(&state, session.session_id());
         let service = nix_cache_service_for_test(&state, &upstream, 1024);
-        let raw_head = format!("GET {VM_NIX_CACHE_INFO_PATH} HTTP/1.1\r\n\r\n").into_bytes();
-        let mut stream = tokio::io::empty();
 
         let response = dispatch_vm_http_head_and_body(
             &session,
             SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 12345)),
-            VmHttpHeadRead {
-                raw_head,
-                buffered_body: Vec::new(),
-            },
-            &mut stream,
+            "GET",
+            VM_NIX_CACHE_INFO_PATH,
+            &[],
+            Vec::new(),
             services_with_nix_cache(service),
             VM_HTTP_READ_TIMEOUT,
         )
-        .await
-        .into_buffered();
+        .await;
 
         assert_eq!(response.status, VmHttpStatus::Unauthorized);
         upstream.verify().await;
@@ -9052,9 +9046,16 @@ esac
 
     #[test]
     fn parser_rejects_duplicate_authorization_header() {
-        let raw = b"GET /v1/session HTTP/1.1\r\nAuthorization: Bearer a\r\nauthorization: Bearer b\r\n\r\n";
-        let err = parse_http_head(
-            raw,
+        let request = http::Request::builder()
+            .method("GET")
+            .uri("/v1/session")
+            .header("authorization", "Bearer a")
+            .header("authorization", "Bearer b")
+            .body(())
+            .unwrap();
+        let (parts, _) = request.into_parts();
+        let err = VmHttpRequest::from_hyper_parts(
+            &parts,
             SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(10, 1, 2, 3), 12345)),
         )
         .unwrap_err();
@@ -9063,10 +9064,16 @@ esac
 
     #[test]
     fn parser_rejects_duplicate_content_length_header() {
-        let raw =
-            b"POST /v1/git/clone HTTP/1.1\r\nContent-Length: 2\r\ncontent-length: 2\r\n\r\n{}";
-        let err = parse_http_head(
-            raw,
+        let request = http::Request::builder()
+            .method("POST")
+            .uri("/v1/git/clone")
+            .header("content-length", "2")
+            .header("content-length", "2")
+            .body(())
+            .unwrap();
+        let (parts, _) = request.into_parts();
+        let err = VmHttpRequest::from_hyper_parts(
+            &parts,
             SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(10, 1, 2, 3), 12345)),
         )
         .unwrap_err();
@@ -9074,27 +9081,15 @@ esac
     }
 
     #[test]
-    fn parser_rejects_transfer_encoding_header() {
-        let raw = b"POST /v1/git/clone HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n";
-        let err = parse_http_head(
-            raw,
-            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(10, 1, 2, 3), 12345)),
-        )
-        .unwrap_err();
-        assert_eq!(err, VmHttpParseError::UnsupportedTransferEncoding);
-    }
-
-    #[test]
     fn authenticated_session_route_returns_session_identity() {
         let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(10, 1, 2, 0), 24).unwrap());
+        let bearer_auth = bearer(token().as_str());
         let response = dispatch_vm_http_head(
             &session,
             SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(10, 1, 2, 3), 12345)),
-            format!(
-                "GET /v1/session HTTP/1.1\r\nAuthorization: {}\r\n\r\n",
-                bearer(token().as_str())
-            )
-            .as_bytes(),
+            "GET",
+            "/v1/session",
+            Some(bearer_auth.as_str()),
         );
         assert_eq!(response.status, VmHttpStatus::Ok);
         let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
@@ -9109,7 +9104,9 @@ esac
         let response = dispatch_vm_http_head(
             &session,
             SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(10, 1, 2, 3), 12345)),
-            b"POST /not-real HTTP/1.1\r\n\r\n",
+            "POST",
+            "/not-real",
+            None,
         );
         assert_eq!(response.status, VmHttpStatus::Unauthorized);
     }
@@ -9117,14 +9114,13 @@ esac
     #[test]
     fn authenticated_unknown_route_is_not_found() {
         let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(10, 1, 2, 0), 24).unwrap());
+        let bearer_auth = bearer(token().as_str());
         let response = dispatch_vm_http_head(
             &session,
             SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(10, 1, 2, 3), 12345)),
-            format!(
-                "GET /unknown HTTP/1.1\r\nAuthorization: {}\r\n\r\n",
-                bearer(token().as_str())
-            )
-            .as_bytes(),
+            "GET",
+            "/unknown",
+            Some(bearer_auth.as_str()),
         );
         assert_eq!(response.status, VmHttpStatus::NotFound);
     }
@@ -9232,104 +9228,45 @@ esac
     }
 
     #[tokio::test]
-    async fn bounded_reader_accepts_terminator_at_limit_before_body_bytes() {
-        let head = b"GET /v1/session HTTP/1.1\r\n\r\n";
-        let mut input = head.to_vec();
-        input.extend_from_slice(b"body ignored after header");
-        let (mut client, mut server) = tokio::io::duplex(input.len() + 1);
-
-        client.write_all(&input).await.unwrap();
-        drop(client);
-
-        let got = read_http_head_bounded(&mut server, head.len())
-            .await
-            .unwrap();
-        assert_eq!(got.raw_head, head);
-        assert_eq!(got.buffered_body, b"body ignored after header");
-    }
-
-    #[tokio::test]
-    async fn body_reader_preserves_body_bytes_buffered_with_header() {
-        let head = b"POST /v1/git/clone HTTP/1.1\r\nContent-Length: 14\r\n\r\n";
-        let mut input = head.to_vec();
-        input.extend_from_slice(br#"{"repo":"o/n"}extra pipelined bytes"#);
-        let (mut client, mut server) = tokio::io::duplex(input.len() + 1);
-
-        client.write_all(&input).await.unwrap();
-        drop(client);
-
-        let got_head = read_http_head_bounded(&mut server, MAX_VM_HTTP_HEAD_BYTES)
-            .await
-            .unwrap();
-        let request = parse_http_head(
-            &got_head.raw_head,
-            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(10, 1, 2, 3), 12345)),
-        )
-        .unwrap();
-        let body = read_http_body_bounded(
-            &mut server,
-            request.content_length.unwrap(),
-            got_head.buffered_body,
-            MAX_VM_HTTP_BODY_BYTES,
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(body, br#"{"repo":"o/n"}"#);
-    }
-
-    #[tokio::test]
     async fn authorization_runs_before_body_limit_enforcement() {
         let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(10, 1, 2, 0), 24).unwrap());
-        let raw_head = format!(
-            "POST {VM_GIT_CLONE_PATH} HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
-            MAX_VM_HTTP_BODY_BYTES + 1
-        )
-        .into_bytes();
-        let mut stream = tokio::io::empty();
+        let oversized = (MAX_VM_HTTP_BODY_BYTES + 1).to_string();
         let response = dispatch_vm_http_head_and_body(
             &session,
             SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(10, 1, 2, 3), 12345)),
-            VmHttpHeadRead {
-                raw_head,
-                buffered_body: Vec::new(),
-            },
-            &mut stream,
+            "POST",
+            VM_GIT_CLONE_PATH,
+            &[("content-length", oversized.as_str())],
+            Vec::new(),
             no_services(),
             VM_HTTP_READ_TIMEOUT,
         )
-        .await
-        .into_buffered();
+        .await;
         assert_eq!(response.status, VmHttpStatus::Unauthorized);
     }
 
     #[tokio::test]
     async fn session_route_does_not_read_declared_body() {
         let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(10, 1, 2, 0), 24).unwrap());
-        let raw_head = format!(
-            "GET /v1/session HTTP/1.1\r\nAuthorization: {}\r\nContent-Length: 1\r\n\r\n",
-            bearer(token().as_str())
-        )
-        .into_bytes();
-        let (_client, mut stream) = tokio::io::duplex(1);
-
+        let bearer_auth = bearer(token().as_str());
         let response = tokio::time::timeout(
             std::time::Duration::from_millis(100),
             dispatch_vm_http_head_and_body(
                 &session,
                 SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(10, 1, 2, 3), 12345)),
-                VmHttpHeadRead {
-                    raw_head,
-                    buffered_body: Vec::new(),
-                },
-                &mut stream,
+                "GET",
+                "/v1/session",
+                &[
+                    ("authorization", bearer_auth.as_str()),
+                    ("content-length", "1"),
+                ],
+                Vec::new(),
                 no_services(),
                 VM_HTTP_READ_TIMEOUT,
             ),
         )
         .await
-        .expect("session route must not wait for a declared body")
-        .into_buffered();
+        .expect("session route must not wait for a declared body");
 
         assert_eq!(response.status, VmHttpStatus::Ok);
     }
@@ -9337,30 +9274,25 @@ esac
     #[tokio::test]
     async fn disabled_git_clone_route_does_not_read_declared_body() {
         let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(10, 1, 2, 0), 24).unwrap());
-        let raw_head = format!(
-            "POST {VM_GIT_CLONE_PATH} HTTP/1.1\r\nAuthorization: {}\r\nContent-Length: 1\r\n\r\n",
-            bearer(token().as_str())
-        )
-        .into_bytes();
-        let (_client, mut stream) = tokio::io::duplex(1);
-
+        let bearer_auth = bearer(token().as_str());
         let response = tokio::time::timeout(
             std::time::Duration::from_millis(100),
             dispatch_vm_http_head_and_body(
                 &session,
                 SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(10, 1, 2, 3), 12345)),
-                VmHttpHeadRead {
-                    raw_head,
-                    buffered_body: Vec::new(),
-                },
-                &mut stream,
+                "POST",
+                VM_GIT_CLONE_PATH,
+                &[
+                    ("authorization", bearer_auth.as_str()),
+                    ("content-length", "1"),
+                ],
+                Vec::new(),
                 no_services(),
                 VM_HTTP_READ_TIMEOUT,
             ),
         )
         .await
-        .expect("disabled Git clone route must not wait for a declared body")
-        .into_buffered();
+        .expect("disabled Git clone route must not wait for a declared body");
 
         assert_eq!(response.status, VmHttpStatus::NotFound);
     }
@@ -9372,30 +9304,25 @@ esac
         let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
         let temp = tempfile::tempdir().unwrap();
         let service = git_clone_service_for_test(&state, &temp, write_fake_git(temp.path()));
-        let raw_head = format!(
-            "GET {VM_GIT_CLONE_PATH} HTTP/1.1\r\nAuthorization: {}\r\nContent-Length: 1\r\n\r\n",
-            bearer(token().as_str())
-        )
-        .into_bytes();
-        let (_client, mut stream) = tokio::io::duplex(1);
-
+        let bearer_auth = bearer(token().as_str());
         let response = tokio::time::timeout(
             std::time::Duration::from_millis(100),
             dispatch_vm_http_head_and_body(
                 &session,
                 SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 12345)),
-                VmHttpHeadRead {
-                    raw_head,
-                    buffered_body: Vec::new(),
-                },
-                &mut stream,
+                "GET",
+                VM_GIT_CLONE_PATH,
+                &[
+                    ("authorization", bearer_auth.as_str()),
+                    ("content-length", "1"),
+                ],
+                Vec::new(),
                 services_with_git(service),
                 VM_HTTP_READ_TIMEOUT,
             ),
         )
         .await
-        .expect("non-POST Git clone route must not wait for a declared body")
-        .into_buffered();
+        .expect("non-POST Git clone route must not wait for a declared body");
 
         assert_eq!(response.status, VmHttpStatus::NotFound);
     }
@@ -9403,30 +9330,25 @@ esac
     #[tokio::test]
     async fn nix_cache_route_does_not_read_declared_body() {
         let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(10, 1, 2, 0), 24).unwrap());
-        let raw_head = format!(
-            "GET {VM_NIX_CACHE_INFO_PATH} HTTP/1.1\r\nAuthorization: {}\r\nContent-Length: 1\r\n\r\n",
-            basic(token().as_str())
-        )
-        .into_bytes();
-        let (_client, mut stream) = tokio::io::duplex(1);
-
+        let basic_auth = basic(token().as_str());
         let response = tokio::time::timeout(
             std::time::Duration::from_millis(100),
             dispatch_vm_http_head_and_body(
                 &session,
                 SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(10, 1, 2, 3), 12345)),
-                VmHttpHeadRead {
-                    raw_head,
-                    buffered_body: Vec::new(),
-                },
-                &mut stream,
+                "GET",
+                VM_NIX_CACHE_INFO_PATH,
+                &[
+                    ("authorization", basic_auth.as_str()),
+                    ("content-length", "1"),
+                ],
+                Vec::new(),
                 no_services(),
                 VM_HTTP_READ_TIMEOUT,
             ),
         )
         .await
-        .expect("Nix cache route must not wait for a declared body")
-        .into_buffered();
+        .expect("Nix cache route must not wait for a declared body");
 
         assert_eq!(response.status, VmHttpStatus::Ok);
     }
@@ -9771,7 +9693,7 @@ work_root=${{work_dir%/*}}
             response.starts_with("HTTP/1.1 401 Unauthorized\r\n"),
             "{response}"
         );
-        assert!(response.contains("WWW-Authenticate: Bearer"), "{response}");
+        assert!(response.contains("www-authenticate: Bearer"), "{response}");
     }
 
     #[tokio::test]
@@ -9976,7 +9898,7 @@ work_root=${{work_dir%/*}}
 
         assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response}");
         assert!(
-            response.contains(&format!("Content-Type: {GIT_BUNDLE_CONTENT_TYPE}\r\n")),
+            response.contains(&format!("content-type: {GIT_BUNDLE_CONTENT_TYPE}\r\n")),
             "{response}"
         );
         assert!(response.ends_with("bundle-from-fake-git\n"), "{response}");
