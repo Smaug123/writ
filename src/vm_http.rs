@@ -2410,15 +2410,31 @@ where
     let dispatch: VmHttpDispatch<S> =
         match authorize_vm_http_request_with_scheme(session, &request, auth_scheme) {
             VmHttpAuthorization::Allow => {
-                route_authenticated_vm_http_request(
-                    session,
-                    &request,
-                    head.buffered_body,
-                    stream,
-                    services,
-                    read_timeout,
-                )
-                .await
+                let body = match route_request_body_limit(&request, &services) {
+                    None => Vec::new(),
+                    Some(max) => match read_http_body_for_route(
+                        stream,
+                        request.content_length.unwrap_or(0),
+                        head.buffered_body,
+                        read_timeout,
+                        max,
+                    )
+                    .await
+                    {
+                        Ok(body) => body,
+                        Err(response) => {
+                            let dispatch: VmHttpDispatch<S> = response.into();
+                            log_vm_http_request(
+                                session,
+                                &request.method,
+                                &request.target,
+                                dispatch.status_code(),
+                            );
+                            return dispatch;
+                        }
+                    },
+                };
+                route_authenticated_vm_http_request(session, &request, body, services).await
             }
             VmHttpAuthorization::Deny(err) => {
                 let response = auth_error_response(auth_scheme, err);
@@ -2514,17 +2530,52 @@ fn auth_error_response(scheme: VmHttpAuthScheme, err: VmHttpAuthError) -> VmHttp
     }
 }
 
-async fn route_authenticated_vm_http_request<S, R>(
+/// The maximum request body bytes a route is prepared to consume; `None`
+/// means the route does not read its body, and any declared body should be
+/// left in the connection.
+fn route_request_body_limit<S: SecretStore>(
+    request: &VmHttpRequest,
+    services: &VmHttpServices<S>,
+) -> Option<usize> {
+    if is_nix_cache_target(&request.target) {
+        return None;
+    }
+    if is_claude_proxy_target(&request.target) {
+        return services
+            .claude_proxy
+            .as_ref()
+            .map(|service| service.config.max_request_bytes());
+    }
+    if is_openai_proxy_target(&request.target) {
+        return services
+            .openai_proxy
+            .as_ref()
+            .map(|service| service.config.max_request_bytes());
+    }
+    if request.target == VM_GIT_CLONE_PATH
+        && request.method == "POST"
+        && services.git_clone.is_some()
+    {
+        return Some(MAX_VM_HTTP_BODY_BYTES);
+    }
+    if parse_agent_run_outcome_target(&request.target).is_some()
+        && request.method == "POST"
+        && services.agent_runs.is_some()
+        && services.git_clone.is_some()
+    {
+        return Some(MAX_VM_HTTP_AGENT_RUN_OUTCOME_BODY_BYTES);
+    }
+    None
+}
+
+async fn route_authenticated_vm_http_request<S>(
     session: &VmHttpSession,
     request: &VmHttpRequest,
-    buffered_body: Vec<u8>,
-    stream: &mut R,
+    body: Vec<u8>,
     services: VmHttpServices<S>,
-    read_timeout: std::time::Duration,
 ) -> VmHttpDispatch<S>
 where
     S: SecretStore + Send + Sync,
-    R: AsyncRead + Unpin,
 {
     if is_nix_cache_target(&request.target) {
         return route_nix_cache_request(session, request, services.nix_cache).await;
@@ -2534,36 +2585,12 @@ where
         let Some(service) = services.claude_proxy else {
             return VmHttpResponse::text(VmHttpStatus::NotFound, "not found").into();
         };
-        let body = match read_http_body_for_claude_proxy_route(
-            stream,
-            request.content_length.unwrap_or(0),
-            buffered_body,
-            read_timeout,
-            service.config.max_request_bytes(),
-        )
-        .await
-        {
-            Ok(body) => body,
-            Err(response) => return response.into(),
-        };
         return route_claude_proxy_request(session, request, body, &service).await;
     }
 
     if is_openai_proxy_target(&request.target) {
         let Some(service) = services.openai_proxy else {
             return VmHttpResponse::text(VmHttpStatus::NotFound, "not found").into();
-        };
-        let body = match read_http_body_for_openai_proxy_route(
-            stream,
-            request.content_length.unwrap_or(0),
-            buffered_body,
-            read_timeout,
-            service.config.max_request_bytes(),
-        )
-        .await
-        {
-            Ok(body) => body,
-            Err(response) => return response.into(),
         };
         return route_openai_proxy_request(session, request, body, &service).await;
     }
@@ -2575,17 +2602,6 @@ where
         if request.method != "POST" {
             return VmHttpResponse::text(VmHttpStatus::NotFound, "not found").into();
         }
-        let body = match read_http_body_for_git_clone_route(
-            stream,
-            request.content_length.unwrap_or(0),
-            buffered_body,
-            read_timeout,
-        )
-        .await
-        {
-            Ok(body) => body,
-            Err(response) => return response.into(),
-        };
         return handle_git_clone_request(session, &body, service)
             .await
             .into();
@@ -2617,17 +2633,6 @@ where
             return VmHttpResponse::text(VmHttpStatus::MethodNotAllowed, "method not allowed")
                 .into();
         }
-        let body = match read_http_body_for_agent_run_outcome_route(
-            stream,
-            request.content_length.unwrap_or(0),
-            buffered_body,
-            read_timeout,
-        )
-        .await
-        {
-            Ok(body) => body,
-            Err(response) => return response.into(),
-        };
         return route_agent_run_outcome_request(run_id, &body, &service, &broker_state).into();
     }
 
@@ -4574,75 +4579,6 @@ fn narinfo_audit_error_label(err: &NixNarInfoError) -> &'static str {
             "mismatched upstream narinfo StorePath hash"
         }
     }
-}
-
-async fn read_http_body_for_git_clone_route<R: AsyncRead + Unpin>(
-    stream: &mut R,
-    content_length: usize,
-    buffered_body: Vec<u8>,
-    read_timeout: std::time::Duration,
-) -> Result<Vec<u8>, VmHttpResponse> {
-    match tokio::time::timeout(
-        read_timeout,
-        read_http_body_bounded(
-            stream,
-            content_length,
-            buffered_body,
-            MAX_VM_HTTP_BODY_BYTES,
-        ),
-    )
-    .await
-    {
-        Err(_) => Err(VmHttpResponse::text(
-            VmHttpStatus::BadRequest,
-            "incomplete request body",
-        )),
-        Ok(Ok(body)) => Ok(body),
-        Ok(Err(err)) if err.kind() == std::io::ErrorKind::InvalidData => Err(VmHttpResponse::text(
-            VmHttpStatus::BadRequest,
-            err.to_string(),
-        )),
-        Ok(Err(_)) => Err(VmHttpResponse::text(
-            VmHttpStatus::BadRequest,
-            "incomplete request body",
-        )),
-    }
-}
-
-async fn read_http_body_for_claude_proxy_route<R: AsyncRead + Unpin>(
-    stream: &mut R,
-    content_length: usize,
-    buffered_body: Vec<u8>,
-    read_timeout: std::time::Duration,
-    max: usize,
-) -> Result<Vec<u8>, VmHttpResponse> {
-    read_http_body_for_route(stream, content_length, buffered_body, read_timeout, max).await
-}
-
-async fn read_http_body_for_openai_proxy_route<R: AsyncRead + Unpin>(
-    stream: &mut R,
-    content_length: usize,
-    buffered_body: Vec<u8>,
-    read_timeout: std::time::Duration,
-    max: usize,
-) -> Result<Vec<u8>, VmHttpResponse> {
-    read_http_body_for_route(stream, content_length, buffered_body, read_timeout, max).await
-}
-
-async fn read_http_body_for_agent_run_outcome_route<R: AsyncRead + Unpin>(
-    stream: &mut R,
-    content_length: usize,
-    buffered_body: Vec<u8>,
-    read_timeout: std::time::Duration,
-) -> Result<Vec<u8>, VmHttpResponse> {
-    read_http_body_for_route(
-        stream,
-        content_length,
-        buffered_body,
-        read_timeout,
-        MAX_VM_HTTP_AGENT_RUN_OUTCOME_BODY_BYTES,
-    )
-    .await
 }
 
 async fn read_http_body_for_route<R: AsyncRead + Unpin>(
@@ -8121,14 +8057,11 @@ esac
             Ipv4Addr::LOCALHOST,
             Some(basic(token().as_str())),
         );
-        let mut stream = tokio::io::empty();
         route_authenticated_vm_http_request(
             session,
             &request,
             Vec::new(),
-            &mut stream,
             services_with_nix_cache(service),
-            VM_HTTP_READ_TIMEOUT,
         )
         .await
         .into_buffered()
@@ -9208,14 +9141,11 @@ esac
                 Some(bearer(token().as_str())),
                 peer,
             );
-            let mut stream = tokio::io::empty();
             let response = route_authenticated_vm_http_request(
                 &session,
                 &request,
                 Vec::new(),
-                &mut stream,
                 no_services(),
-                VM_HTTP_READ_TIMEOUT,
             )
             .await
             .into_buffered();
@@ -9236,14 +9166,11 @@ esac
             SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(10, 1, 2, 3), 12345)),
         );
 
-        let mut stream = tokio::io::empty();
         let response = route_authenticated_vm_http_request(
             &session,
             &request,
             Vec::new(),
-            &mut stream,
             no_services(),
-            VM_HTTP_READ_TIMEOUT,
         )
         .await
         .into_buffered();
@@ -9265,14 +9192,11 @@ esac
             SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 12345)),
         );
 
-        let mut stream = tokio::io::empty();
         let response = route_authenticated_vm_http_request(
             &session,
             &request,
             Vec::new(),
-            &mut stream,
             services_with_git(service),
-            VM_HTTP_READ_TIMEOUT,
         )
         .await
         .into_buffered();
