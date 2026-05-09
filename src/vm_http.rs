@@ -2272,7 +2272,12 @@ fn authorize_bearer_header(session: &VmHttpSession, header: &str) -> VmHttpAutho
     let Some(token) = header.strip_prefix("Bearer ") else {
         return VmHttpAuthorization::Deny(VmHttpAuthError::WrongCredentials);
     };
-    if constant_time_eq(token.as_bytes(), session.bearer_token.as_str().as_bytes()) {
+    use subtle::ConstantTimeEq as _;
+    if token
+        .as_bytes()
+        .ct_eq(session.bearer_token.as_str().as_bytes())
+        .into()
+    {
         VmHttpAuthorization::Allow
     } else {
         VmHttpAuthorization::Deny(VmHttpAuthError::WrongCredentials)
@@ -2280,11 +2285,12 @@ fn authorize_bearer_header(session: &VmHttpSession, header: &str) -> VmHttpAutho
 }
 
 fn authorize_basic_header(session: &VmHttpSession, header: &str) -> VmHttpAuthorization {
+    use subtle::ConstantTimeEq as _;
     let Some(encoded) = header.strip_prefix("Basic ") else {
         return VmHttpAuthorization::Deny(VmHttpAuthError::WrongCredentials);
     };
     let expected = basic_authorization_value(session);
-    if constant_time_eq(encoded.as_bytes(), expected.as_bytes()) {
+    if encoded.as_bytes().ct_eq(expected.as_bytes()).into() {
         VmHttpAuthorization::Allow
     } else {
         VmHttpAuthorization::Deny(VmHttpAuthError::WrongCredentials)
@@ -2292,8 +2298,9 @@ fn authorize_basic_header(session: &VmHttpSession, header: &str) -> VmHttpAuthor
 }
 
 fn basic_authorization_value(session: &VmHttpSession) -> String {
+    use base64::Engine as _;
     let credentials = format!("{VM_NIX_BASIC_LOGIN}:{}", session.bearer_token.as_str());
-    base64_standard(credentials.as_bytes())
+    base64::engine::general_purpose::STANDARD.encode(credentials.as_bytes())
 }
 
 fn auth_scheme_for_target(target: &str) -> VmHttpAuthScheme {
@@ -4378,9 +4385,14 @@ fn materialize_agent_run_stream(
     upload: AgentRunStreamUpload,
     path: &Path,
 ) -> Result<AgentRunStreamSummary, VmHttpResponse> {
-    let retained = decode_base64_standard(&upload.retained_base64).map_err(|_| {
-        VmHttpResponse::text(VmHttpStatus::BadRequest, "invalid outcome stream base64")
-    })?;
+    let retained = {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD
+            .decode(&upload.retained_base64)
+            .map_err(|_| {
+                VmHttpResponse::text(VmHttpStatus::BadRequest, "invalid outcome stream base64")
+            })?
+    };
     let retained_len = retained.len() as u64;
     if upload.byte_len > MAX_AGENT_RUN_STREAM_AUDIT_BYTES {
         return Err(VmHttpResponse::text(
@@ -5183,46 +5195,6 @@ impl VmHttpStatus {
     }
 }
 
-fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
-    let mut diff = left.len() ^ right.len();
-    // The loop count depends only on the expected session secret length, not
-    // on the attacker-supplied candidate token length.
-    for (index, right_byte) in right.iter().copied().enumerate() {
-        let left_byte = left.get(index).copied().unwrap_or(0);
-        diff |= usize::from(left_byte ^ right_byte);
-    }
-    diff == 0
-}
-
-fn base64_standard(input: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
-    for chunk in input.chunks(3) {
-        let first = chunk[0];
-        let second = chunk.get(1).copied().unwrap_or(0);
-        let third = chunk.get(2).copied().unwrap_or(0);
-
-        out.push(ALPHABET[usize::from(first >> 2)] as char);
-        out.push(ALPHABET[usize::from(((first & 0b0000_0011) << 4) | (second >> 4))] as char);
-        if chunk.len() > 1 {
-            out.push(ALPHABET[usize::from(((second & 0b0000_1111) << 2) | (third >> 6))] as char);
-        } else {
-            out.push('=');
-        }
-        if chunk.len() > 2 {
-            out.push(ALPHABET[usize::from(third & 0b0011_1111)] as char);
-        } else {
-            out.push('=');
-        }
-    }
-    out
-}
-
-fn decode_base64_standard(input: &str) -> Result<Vec<u8>, base64::DecodeError> {
-    use base64::Engine as _;
-    base64::engine::general_purpose::STANDARD.decode(input)
-}
-
 fn report_vm_http_handler_result(result: Result<std::io::Result<()>, tokio::task::JoinError>) {
     match result {
         Ok(Ok(())) => {}
@@ -5624,7 +5596,10 @@ esac
         name: &str,
         key_pair: &ring::signature::Ed25519KeyPair,
     ) -> String {
-        format!("{name}:{}", base64_standard(key_pair.public_key().as_ref()))
+        format!(
+            "{name}:{}",
+            base64::engine::general_purpose::STANDARD.encode(key_pair.public_key().as_ref())
+        )
     }
 
     fn nar_hash_for_body(body: &[u8]) -> String {
@@ -5650,7 +5625,8 @@ esac
     ) -> String {
         let store_path = format!("/nix/store/{store_hash}-{store_name}");
         let fingerprint = format!("1;{store_path};{nar_hash};{nar_size};");
-        let signature = base64_standard(key_pair.sign(fingerprint.as_bytes()).as_ref());
+        let signature = base64::engine::general_purpose::STANDARD
+            .encode(key_pair.sign(fingerprint.as_bytes()).as_ref());
         format!(
             "StorePath: {store_path}\n\
              URL: nar/{nar_file}\n\
@@ -5725,7 +5701,8 @@ esac
     fn basic(value: &str) -> String {
         format!(
             "Basic {}",
-            base64_standard(format!("{VM_NIX_BASIC_LOGIN}:{value}").as_bytes())
+            base64::engine::general_purpose::STANDARD
+                .encode(format!("{VM_NIX_BASIC_LOGIN}:{value}").as_bytes())
         )
     }
 
@@ -5978,14 +5955,6 @@ esac
         let second = VmHttpBearerToken::generate();
         assert_ne!(first, second);
         assert!(first.as_str().bytes().all(is_bearer_token_byte));
-    }
-
-    #[test]
-    fn bearer_token_comparison_rejects_prefixes_and_suffixes() {
-        let expected = b"test-token";
-        assert!(constant_time_eq(expected, expected));
-        assert!(!constant_time_eq(b"test", expected));
-        assert!(!constant_time_eq(b"test-token-extra", expected));
     }
 
     #[test]
@@ -6728,14 +6697,14 @@ esac
                 sha256_hex: crate::agent_run::sha256_hex(b"Hello\n"),
                 truncated: false,
                 retained_sha256_hex: crate::agent_run::sha256_hex(b"Hello\n"),
-                retained_base64: base64_standard(b"Hello\n"),
+                retained_base64: base64::engine::general_purpose::STANDARD.encode(b"Hello\n"),
             },
             stderr: AgentRunStreamUpload {
                 byte_len: 0,
                 sha256_hex: crate::agent_run::sha256_hex(b""),
                 truncated: false,
                 retained_sha256_hex: crate::agent_run::sha256_hex(b""),
-                retained_base64: base64_standard(b""),
+                retained_base64: base64::engine::general_purpose::STANDARD.encode(b""),
             },
         };
         let body = serde_json::to_vec(&upload).unwrap();
@@ -6788,7 +6757,7 @@ esac
             sha256_hex: crate::agent_run::sha256_hex(b""),
             truncated: false,
             retained_sha256_hex: crate::agent_run::sha256_hex(b""),
-            retained_base64: base64_standard(b""),
+            retained_base64: base64::engine::general_purpose::STANDARD.encode(b""),
         };
         let upload = VmAgentRunOutcomeUpload {
             run_id,
@@ -6799,7 +6768,7 @@ esac
                 sha256_hex: crate::agent_run::sha256_hex(b"untrusted full stream"),
                 truncated: true,
                 retained_sha256_hex: crate::agent_run::sha256_hex(b"H"),
-                retained_base64: base64_standard(b"H"),
+                retained_base64: base64::engine::general_purpose::STANDARD.encode(b"H"),
             },
             stderr: valid_stderr.clone(),
         };
@@ -6818,7 +6787,7 @@ esac
                 sha256_hex: crate::agent_run::sha256_hex(b"Hi"),
                 truncated: true,
                 retained_sha256_hex: crate::agent_run::sha256_hex(b"not-H"),
-                retained_base64: base64_standard(b"H"),
+                retained_base64: base64::engine::general_purpose::STANDARD.encode(b"H"),
             },
             stderr: valid_stderr.clone(),
             ..upload
@@ -6837,7 +6806,7 @@ esac
                 sha256_hex: crate::agent_run::sha256_hex(b"unverified full stream"),
                 truncated: true,
                 retained_sha256_hex: crate::agent_run::sha256_hex(b"H"),
-                retained_base64: base64_standard(b"H"),
+                retained_base64: base64::engine::general_purpose::STANDARD.encode(b"H"),
             },
             stderr: valid_stderr,
             ..upload
