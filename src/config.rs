@@ -52,6 +52,7 @@ use crate::vm_http::{
 /// }
 /// ```
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DaemonConfig {
     /// Legacy single GitHub App configuration. Mutually exclusive with
     /// `github_apps`.
@@ -1150,6 +1151,29 @@ mod tests {
                 ..
             }) if failed == path
         ));
+    }
+
+    /// A typo on a top-level field (e.g. `agentVm` instead of `agent_vm`)
+    /// would otherwise be silently ignored — `agent_vm` then falls back to
+    /// its `Option<…>` default and the daemon starts without VM HTTP setup.
+    /// `deny_unknown_fields` forces a hard failure at config load time.
+    #[test]
+    fn daemon_config_rejects_unknown_top_level_field() {
+        let json = r#"{
+            "github": {
+                "app_id": 1,
+                "installation_id": 2,
+                "installation_owner": "o",
+                "private_key_secret": "pk"
+            },
+            "policy": { "default_ttl": 600, "writable_repos": [] },
+            "agentVm": { "lifecycle": {}, "vm_http": {} }
+        }"#;
+        let err = serde_json::from_str::<DaemonConfig>(json).unwrap_err();
+        assert!(
+            err.to_string().contains("agentVm"),
+            "error should mention the unknown field, got: {err}"
+        );
     }
 
     #[test]
