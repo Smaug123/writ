@@ -235,6 +235,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             match call(&socket_path, &msg)? {
                 ServerMessage::TokenGranted { token, .. } => println!("{token}"),
                 ServerMessage::Denied { reason } => return Err(format!("denied: {reason}").into()),
+                ServerMessage::UnknownSession { session_id } => {
+                    return Err(format!("unknown session {session_id}").into());
+                }
+                ServerMessage::ClosedSession { session_id } => {
+                    return Err(format!("session {session_id} is closed").into());
+                }
                 ServerMessage::Error { message } => return Err(message.into()),
                 other => return Err(format!("unexpected response: {other:?}").into()),
             }

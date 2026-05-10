@@ -271,17 +271,21 @@ async fn dispatch_capability<S: SecretStore + Send + Sync>(
     capability: CapabilityRequest,
     state: &Arc<BrokerState<S>>,
 ) -> ServerMessage {
+    // The five `CapabilityOutcome` variants map 1:1 to wire variants;
+    // we deliberately do *not* collapse `UnknownSession`/`ClosedSession`
+    // into `Error` so clients can distinguish them by type tag rather
+    // than by string-matching a free-form message.
     match request_capability(session_id, capability, state).await {
         CapabilityOutcome::Granted { token, expires_at } => {
             ServerMessage::TokenGranted { token, expires_at }
         }
         CapabilityOutcome::Denied { reason } => ServerMessage::Denied { reason },
-        CapabilityOutcome::UnknownSession { session_id } => ServerMessage::Error {
-            message: format!("unknown session {session_id}"),
-        },
-        CapabilityOutcome::ClosedSession { session_id } => ServerMessage::Error {
-            message: format!("session {session_id} is closed"),
-        },
+        CapabilityOutcome::UnknownSession { session_id } => {
+            ServerMessage::UnknownSession { session_id }
+        }
+        CapabilityOutcome::ClosedSession { session_id } => {
+            ServerMessage::ClosedSession { session_id }
+        }
         CapabilityOutcome::Error { message } => ServerMessage::Error { message },
     }
 }
@@ -931,7 +935,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn request_on_closed_session_returns_error_without_minting() {
+    async fn request_on_closed_session_returns_closed_session_variant_without_minting() {
         // If a client closes the session and then tries to mint, the
         // broker must reject rather than issue a credential and audit
         // it against a session that is already "quiet" on paper. This
@@ -968,12 +972,7 @@ mod tests {
         )
         .await;
 
-        match resp {
-            ServerMessage::Error { message } => {
-                assert!(message.contains("closed"), "got: {message}");
-            }
-            other => panic!("expected Error, got {other:?}"),
-        }
+        assert_eq!(resp, ServerMessage::ClosedSession { session_id });
 
         // No audit row should have been recorded for the post-close
         // request attempt.
@@ -987,7 +986,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn request_for_unknown_session_returns_error() {
+    async fn request_for_unknown_session_returns_unknown_session_variant() {
         let server = MockServer::start().await;
         let state = make_state(&server, vec![repo("o", "n")], "o");
         let unknown: SessionId = "00000000-0000-0000-0000-deadbeef0002".parse().unwrap();
@@ -1004,12 +1003,12 @@ mod tests {
         )
         .await;
 
-        match resp {
-            ServerMessage::Error { message } => {
-                assert!(message.contains("unknown session"), "got: {message}");
-            }
-            other => panic!("expected Error, got {other:?}"),
-        }
+        assert_eq!(
+            resp,
+            ServerMessage::UnknownSession {
+                session_id: unknown,
+            },
+        );
     }
 
     #[tokio::test]
