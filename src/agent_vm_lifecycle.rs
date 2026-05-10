@@ -1860,6 +1860,7 @@ impl ProcessInvocation {
         let mut command = Command::new(&self.program);
         command
             .args(&self.args)
+            .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
         process_spawn::output(&mut command).map_err(|source| ProcessInvocationError::Run {

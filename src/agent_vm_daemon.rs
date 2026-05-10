@@ -636,6 +636,7 @@ impl AgentVmDaemon {
             let mut command = Command::new(container);
             command
                 .args(["exec", &vm_name, "sh", "-c", &script])
+                .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped());
             process_spawn::output(&mut command)

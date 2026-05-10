@@ -51,8 +51,10 @@ pub fn spawn(command: &mut std::process::Command) -> io::Result<std::process::Ch
 /// Run a command to completion, retrying briefly on `ETXTBSY` from the
 /// initial spawn. Equivalent to `Command::output` for the wait-and-collect
 /// behaviour, but applies the retry to the spawn step. The caller must
-/// configure stdio explicitly: unlike `Command::output`, this does not
-/// override stdout/stderr.
+/// configure stdio explicitly: unlike `Command::output`, this inherits
+/// the parent's stdin/stdout/stderr by default rather than defaulting
+/// stdin to null and stdout/stderr to piped. Pass `Stdio::null()` for
+/// stdin if the child should see EOF.
 pub fn output(command: &mut std::process::Command) -> io::Result<std::process::Output> {
     spawn(command)?.wait_with_output()
 }
