@@ -151,9 +151,25 @@ pub enum ServerMessage {
     AgentVmStopped,
     /// Reports persisted daemon-managed agent VM sessions.
     AgentVmSessions { sessions: Vec<AgentVmSessionInfo> },
-    /// Something went wrong (mint error, unknown session, audit write
-    /// failure, …). The agent should surface `message` to the user and
-    /// not retry automatically.
+    /// The session referenced by [`ClientMessage::Request`] is not present
+    /// in the audit store. Distinct from [`ServerMessage::ClosedSession`]
+    /// (a known session whose lifetime ended) and from
+    /// [`ServerMessage::Error`] (an internal failure). Carrying the kind
+    /// as a tag means clients react to "session unknown" without
+    /// string-matching a free-form error message.
+    UnknownSession { session_id: SessionId },
+    /// The session referenced by [`ClientMessage::Request`] exists but is
+    /// already closed; no further requests will be granted under it.
+    /// Distinct from [`ServerMessage::UnknownSession`] and
+    /// [`ServerMessage::Error`] for the same reason: clients should be
+    /// able to react without parsing prose.
+    ClosedSession { session_id: SessionId },
+    /// An internal failure (mint error, audit write failure, agent VM
+    /// runtime not configured, …). The agent should surface `message` to
+    /// the user and not retry automatically. Outcomes a client may want
+    /// to handle differently — `UnknownSession`, `ClosedSession`,
+    /// `Denied` — have their own variants and never collapse into this
+    /// one.
     Error { message: String },
 }
 
@@ -195,6 +211,14 @@ impl std::fmt::Debug for ServerMessage {
             Self::AgentVmSessions { sessions } => f
                 .debug_struct("AgentVmSessions")
                 .field("sessions", sessions)
+                .finish(),
+            Self::UnknownSession { session_id } => f
+                .debug_struct("UnknownSession")
+                .field("session_id", session_id)
+                .finish(),
+            Self::ClosedSession { session_id } => f
+                .debug_struct("ClosedSession")
+                .field("session_id", session_id)
                 .finish(),
             Self::Error { message } => f.debug_struct("Error").field("message", message).finish(),
         }
@@ -427,6 +451,48 @@ mod tests {
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert_eq!(serde_json::from_str::<ServerMessage>(&json).unwrap(), msg);
+    }
+
+    #[test]
+    fn unknown_session_roundtrips() {
+        let msg = ServerMessage::UnknownSession {
+            session_id: fixed_session_id(),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert_eq!(serde_json::from_str::<ServerMessage>(&json).unwrap(), msg);
+    }
+
+    #[test]
+    fn closed_session_roundtrips() {
+        let msg = ServerMessage::ClosedSession {
+            session_id: fixed_session_id(),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert_eq!(serde_json::from_str::<ServerMessage>(&json).unwrap(), msg);
+    }
+
+    /// Session-state outcomes carry their own type tag so a client
+    /// dispatching on `type` can distinguish them from a generic
+    /// internal-failure `Error` without parsing the message string.
+    #[test]
+    fn session_state_outcomes_have_distinct_tags() {
+        let unknown: serde_json::Value = serde_json::to_value(ServerMessage::UnknownSession {
+            session_id: fixed_session_id(),
+        })
+        .unwrap();
+        assert_eq!(unknown["type"], "unknown_session");
+
+        let closed: serde_json::Value = serde_json::to_value(ServerMessage::ClosedSession {
+            session_id: fixed_session_id(),
+        })
+        .unwrap();
+        assert_eq!(closed["type"], "closed_session");
+
+        let error: serde_json::Value = serde_json::to_value(ServerMessage::Error {
+            message: "mint failed".into(),
+        })
+        .unwrap();
+        assert_eq!(error["type"], "error");
     }
 
     // --- Wire format pins -------------------------------------------------
