@@ -30,7 +30,7 @@ pub(super) struct Migration {
 /// a version higher than this is rejected with [`AuditError::SchemaTooNew`]
 /// rather than opened — we'd rather fail to start than silently drop data
 /// into a schema a newer broker wrote.
-pub(super) const SCHEMA_VERSION: i32 = 11;
+pub(super) const SCHEMA_VERSION: i32 = 12;
 
 /// The full migration history. Each entry documents exactly one state
 /// transition; the sequence of entries is the schema's lineage. Order
@@ -584,6 +584,185 @@ WHEN EXISTS (
 )
 BEGIN
     SELECT RAISE(ABORT, 'session is closed');
+END;
+"#,
+    },
+    // The host-staging push model never contacts GitHub during the agent
+    // request. It needs three things the v8 schema can't express:
+    //   - `staged` as a terminal unattempted outcome (the bundle has been
+    //     parked for human review; no attempt was ever planned),
+    //   - `git_push_request.expected_remote_head` nullable, so the agent
+    //     can declare "I'm creating this branch; there is no upstream
+    //     head to compare against" without lying via a sentinel,
+    //   - `git_push_attempt.old_head` nullable, so the eventual promote
+    //     path can plan a branch-creation push and the audit row faithfully
+    //     records "no `--force-with-lease` target".
+    // SQLite can't ALTER COLUMN to drop NOT NULL, so the three git_push_*
+    // tables are rebuilt as `_v8` shadows, the data is copied in, and the
+    // shadows are dropped — same shape as migration 10.
+    Migration {
+        version: 12,
+        sql: r#"
+DROP TRIGGER git_push_request_requires_open_session;
+DROP TRIGGER git_push_attempt_requires_matching_grant;
+DROP TRIGGER git_push_outcome_attempt_matches_request;
+DROP INDEX idx_git_push_request_session;
+
+ALTER TABLE git_push_outcome RENAME TO git_push_outcome_v8;
+ALTER TABLE git_push_attempt RENAME TO git_push_attempt_v8;
+ALTER TABLE git_push_request RENAME TO git_push_request_v8;
+
+CREATE TABLE git_push_request (
+    push_request_id      TEXT PRIMARY KEY,
+    session_id           TEXT NOT NULL REFERENCES session(session_id),
+    received_at          INTEGER NOT NULL,
+    repo                 TEXT NOT NULL CHECK (repo != ''),
+    branch               TEXT NOT NULL CHECK (branch != ''),
+    expected_remote_head TEXT CHECK (expected_remote_head IS NULL OR length(expected_remote_head) = 40),
+    new_head             TEXT NOT NULL CHECK (length(new_head) = 40)
+);
+
+INSERT INTO git_push_request (
+    push_request_id,
+    session_id,
+    received_at,
+    repo,
+    branch,
+    expected_remote_head,
+    new_head
+)
+SELECT
+    push_request_id,
+    session_id,
+    received_at,
+    repo,
+    branch,
+    expected_remote_head,
+    new_head
+FROM git_push_request_v8;
+
+CREATE INDEX idx_git_push_request_session
+    ON git_push_request(session_id, received_at);
+
+CREATE TABLE git_push_attempt (
+    push_attempt_id       TEXT PRIMARY KEY,
+    push_request_id       TEXT NOT NULL UNIQUE REFERENCES git_push_request(push_request_id),
+    capability_request_id TEXT NOT NULL REFERENCES request(request_id),
+    grant_jti             TEXT NOT NULL REFERENCES grant_log(jti),
+    planned_at            INTEGER NOT NULL,
+    repo                  TEXT NOT NULL CHECK (repo != ''),
+    branch                TEXT NOT NULL CHECK (branch != ''),
+    old_head              TEXT CHECK (old_head IS NULL OR length(old_head) = 40),
+    new_head              TEXT NOT NULL CHECK (length(new_head) = 40)
+);
+
+INSERT INTO git_push_attempt (
+    push_attempt_id,
+    push_request_id,
+    capability_request_id,
+    grant_jti,
+    planned_at,
+    repo,
+    branch,
+    old_head,
+    new_head
+)
+SELECT
+    push_attempt_id,
+    push_request_id,
+    capability_request_id,
+    grant_jti,
+    planned_at,
+    repo,
+    branch,
+    old_head,
+    new_head
+FROM git_push_attempt_v8;
+
+CREATE TABLE git_push_outcome (
+    push_request_id TEXT PRIMARY KEY REFERENCES git_push_request(push_request_id),
+    push_attempt_id TEXT REFERENCES git_push_attempt(push_attempt_id),
+    completed_at    INTEGER NOT NULL,
+    result          TEXT NOT NULL CHECK (
+        result IN (
+            'denied',
+            'validation_failed',
+            'staged',
+            'pushed',
+            'lease_rejected',
+            'push_rejected',
+            'push_failed',
+            'audit_failed_after_push'
+        )
+    ),
+    github_status   INTEGER CHECK (github_status BETWEEN 100 AND 599),
+    message         TEXT NOT NULL CHECK (message != ''),
+    CHECK (
+        (result IN ('denied', 'validation_failed', 'staged') AND push_attempt_id IS NULL)
+        OR (
+            result IN (
+                'pushed',
+                'lease_rejected',
+                'push_rejected',
+                'push_failed',
+                'audit_failed_after_push'
+            )
+            AND push_attempt_id IS NOT NULL
+        )
+    )
+);
+
+INSERT INTO git_push_outcome (
+    push_request_id,
+    push_attempt_id,
+    completed_at,
+    result,
+    github_status,
+    message
+)
+SELECT
+    push_request_id,
+    push_attempt_id,
+    completed_at,
+    result,
+    github_status,
+    message
+FROM git_push_outcome_v8;
+
+DROP TABLE git_push_outcome_v8;
+DROP TABLE git_push_attempt_v8;
+DROP TABLE git_push_request_v8;
+
+CREATE TRIGGER git_push_request_requires_open_session
+BEFORE INSERT ON git_push_request
+WHEN EXISTS (
+    SELECT 1 FROM session
+    WHERE session_id = NEW.session_id AND closed_at IS NOT NULL
+)
+BEGIN
+    SELECT RAISE(ABORT, 'session is closed');
+END;
+
+CREATE TRIGGER git_push_attempt_requires_matching_grant
+BEFORE INSERT ON git_push_attempt
+WHEN NOT EXISTS (
+    SELECT 1 FROM grant_log
+    WHERE jti = NEW.grant_jti AND request_id = NEW.capability_request_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'git push grant does not match capability request');
+END;
+
+CREATE TRIGGER git_push_outcome_attempt_matches_request
+BEFORE INSERT ON git_push_outcome
+WHEN NEW.push_attempt_id IS NOT NULL
+ AND NOT EXISTS (
+    SELECT 1 FROM git_push_attempt
+    WHERE push_attempt_id = NEW.push_attempt_id
+      AND push_request_id = NEW.push_request_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'git push attempt belongs to a different request');
 END;
 "#,
     },
@@ -1208,6 +1387,166 @@ mod tests {
             &log,
             "openai_proxy_request_requires_open_session"
         ));
+    }
+
+    /// Migration 12 rebuilds the three `git_push_*` tables to relax
+    /// `NOT NULL` on `expected_remote_head` / `old_head` and to admit
+    /// the `'staged'` outcome. Verify pre-existing v11 rows survive
+    /// the rebuild and that the new permissions take effect.
+    #[test]
+    fn open_migrates_v11_database_to_relaxed_git_push_heads_schema() {
+        let db = NamedTempFile::new().unwrap();
+        let session_id = SessionId::new();
+        let capability_request_id = RequestId::new();
+        let grant_jti = Jti::new();
+        let pre_existing_push_request_id = RequestId::new();
+        let pre_existing_push_attempt_id = RequestId::new();
+        let oid_a = "a".repeat(40);
+        let oid_b = "b".repeat(40);
+
+        {
+            let mut conn = Connection::open(db.path()).unwrap();
+            let tx = conn.transaction().unwrap();
+            for migration in MIGRATIONS.iter().take(11) {
+                tx.execute_batch(migration.sql).unwrap();
+            }
+            tx.pragma_update(None, "user_version", 11).unwrap();
+
+            tx.execute(
+                "INSERT INTO session (session_id, label, agent_kind, agent_model, opened_at, closed_at) \
+                 VALUES (?1, NULL, 'claude', NULL, 1, NULL)",
+                params![session_id.as_uuid().to_string()],
+            )
+            .unwrap();
+            tx.execute(
+                "INSERT INTO request (request_id, session_id, received_at, request_json, decision_json) \
+                 VALUES (?1, ?2, 2, '{}', '{}')",
+                params![
+                    capability_request_id.as_uuid().to_string(),
+                    session_id.as_uuid().to_string(),
+                ],
+            )
+            .unwrap();
+            tx.execute(
+                "INSERT INTO grant_log \
+                 (jti, request_id, session_id, scope_json, issued_at, expires_at, github_app_id) \
+                 VALUES (?1, ?2, ?3, ?4, 3, 4, 42)",
+                params![
+                    grant_jti.as_uuid().to_string(),
+                    capability_request_id.as_uuid().to_string(),
+                    session_id.as_uuid().to_string(),
+                    serde_json::to_string(&sample_scope()).unwrap(),
+                ],
+            )
+            .unwrap();
+
+            tx.execute(
+                "INSERT INTO git_push_request \
+                 (push_request_id, session_id, received_at, repo, branch, expected_remote_head, new_head) \
+                 VALUES (?1, ?2, ?3, 'o/n', 'main', ?4, ?5)",
+                params![
+                    pre_existing_push_request_id.as_uuid().to_string(),
+                    session_id.as_uuid().to_string(),
+                    1_700_000_100_i64,
+                    oid_a,
+                    oid_b,
+                ],
+            )
+            .unwrap();
+            tx.execute(
+                "INSERT INTO git_push_attempt \
+                 (push_attempt_id, push_request_id, capability_request_id, grant_jti, planned_at, repo, branch, old_head, new_head) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'o/n', 'main', ?6, ?7)",
+                params![
+                    pre_existing_push_attempt_id.as_uuid().to_string(),
+                    pre_existing_push_request_id.as_uuid().to_string(),
+                    capability_request_id.as_uuid().to_string(),
+                    grant_jti.as_uuid().to_string(),
+                    1_700_000_120_i64,
+                    oid_a,
+                    oid_b,
+                ],
+            )
+            .unwrap();
+            tx.execute(
+                "INSERT INTO git_push_outcome \
+                 (push_request_id, push_attempt_id, completed_at, result, github_status, message) \
+                 VALUES (?1, ?2, ?3, 'pushed', 200, 'ok')",
+                params![
+                    pre_existing_push_request_id.as_uuid().to_string(),
+                    pre_existing_push_attempt_id.as_uuid().to_string(),
+                    1_700_000_130_i64,
+                ],
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+
+        let log = AuditLog::open(db.path()).unwrap();
+        assert_eq!(read_user_version(&log), SCHEMA_VERSION);
+
+        let preserved: (String, String, String) = log
+            .with_conn(|c| {
+                let row = c.query_row(
+                    "SELECT r.expected_remote_head, a.old_head, o.result \
+                     FROM git_push_request r \
+                     JOIN git_push_attempt a USING (push_request_id) \
+                     JOIN git_push_outcome o USING (push_request_id) \
+                     WHERE r.push_request_id = ?1",
+                    params![pre_existing_push_request_id.as_uuid().to_string()],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    },
+                )?;
+                Ok(row)
+            })
+            .unwrap();
+        assert_eq!(preserved.0, "a".repeat(40));
+        assert_eq!(preserved.1, "a".repeat(40));
+        assert_eq!(preserved.2, "pushed");
+
+        assert!(trigger_exists(
+            &log,
+            "git_push_request_requires_open_session"
+        ));
+        assert!(trigger_exists(
+            &log,
+            "git_push_attempt_requires_matching_grant"
+        ));
+        assert!(trigger_exists(
+            &log,
+            "git_push_outcome_attempt_matches_request"
+        ));
+
+        let new_request_id = RequestId::new();
+        log.with_conn(|c| {
+            c.execute(
+                "INSERT INTO git_push_request \
+                 (push_request_id, session_id, received_at, repo, branch, expected_remote_head, new_head) \
+                 VALUES (?1, ?2, ?3, 'o/n', 'feat', NULL, ?4)",
+                params![
+                    new_request_id.as_uuid().to_string(),
+                    session_id.as_uuid().to_string(),
+                    1_700_000_140_i64,
+                    "c".repeat(40),
+                ],
+            )?;
+            c.execute(
+                "INSERT INTO git_push_outcome \
+                 (push_request_id, push_attempt_id, completed_at, result, github_status, message) \
+                 VALUES (?1, NULL, ?2, 'staged', NULL, 'queued for review')",
+                params![
+                    new_request_id.as_uuid().to_string(),
+                    1_700_000_141_i64,
+                ],
+            )?;
+            Ok(())
+        })
+        .unwrap();
     }
 
     /// A DB written by a future broker will carry a user_version beyond

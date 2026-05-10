@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 261f51a4ba55862052e6b0464076e66a81b127284d47d574d4edfb12e5b83db8 # shrinks to script = ValidUnattempted { result: Staged, close_before_outcome: false }
