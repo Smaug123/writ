@@ -32,6 +32,7 @@ mod git_push;
 mod grant;
 mod nix_cache;
 mod openai_proxy;
+mod proxy_table;
 mod schema;
 mod session;
 #[cfg(test)]
@@ -58,6 +59,7 @@ pub use openai_proxy::{
     OpenAiProxyAuditDecision, OpenAiProxyAuditRoute, OpenAiProxyOutcomeRecord,
     OpenAiProxyRequestRecord,
 };
+pub use proxy_table::ProxyAuditDecision;
 
 /// `tracing` target stamped on every event emitted when an audit
 /// append, read, or referenced-artifact write fails. The audit log is

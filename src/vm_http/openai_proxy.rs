@@ -8,8 +8,7 @@ use std::sync::Arc;
 use serde::Deserialize;
 
 use crate::audit::{
-    AuditError, AuditLog, OpenAiProxyAuditDecision, OpenAiProxyAuditRoute,
-    OpenAiProxyOutcomeRecord, OpenAiProxyRequestRecord,
+    AuditError, AuditLog, OpenAiProxyAuditRoute, OpenAiProxyOutcomeRecord, OpenAiProxyRequestRecord,
 };
 use crate::openai_chatgpt_auth::{
     CHATGPT_OAUTH_REFRESH_LEEWAY_SECONDS, CHATGPT_OAUTH_REFRESH_URL, ChatgptOauthAuthority,
@@ -18,9 +17,9 @@ use crate::openai_chatgpt_auth::{
 use crate::secret::{SecretKey, SecretStore};
 
 use super::proxy_common::{
-    OpenAiBackend, ProxyAuditDecision, ProxyBackend, ProxyBackendConfig, ProxyFetch,
-    ProxyForwardHeader, ProxyOutcomeFields, ProxyRequestFields, ProxyStream, UpstreamAuth,
-    VmHttpProxyService, is_proxy_id_byte, proxy_target_path,
+    OpenAiBackend, ProxyBackend, ProxyBackendConfig, ProxyFetch, ProxyForwardHeader,
+    ProxyOutcomeFields, ProxyRequestFields, ProxyStream, UpstreamAuth, VmHttpProxyService,
+    is_proxy_id_byte, proxy_decision_to_owned, proxy_target_path,
 };
 use super::{VmHttpDispatch, VmHttpHeader, VmHttpResponse, VmHttpStatus};
 
@@ -398,7 +397,7 @@ impl ProxyBackend for OpenAiBackend {
         audit_log: &AuditLog,
         fields: ProxyRequestFields<'_, OpenAiProxyAuditRoute>,
     ) -> Result<(), AuditError> {
-        let decision = decision_to_openai(fields.decision);
+        let decision = proxy_decision_to_owned(fields.decision);
         audit_log.record_openai_proxy_request(&OpenAiProxyRequestRecord {
             request_id: fields.request_id,
             session_id: fields.session_id,
@@ -537,15 +536,6 @@ fn openai_proxy_forward_headers(
         forwarded.push(ProxyForwardHeader { name, value });
     }
     Ok(forwarded)
-}
-
-fn decision_to_openai(decision: &ProxyAuditDecision<'_>) -> OpenAiProxyAuditDecision {
-    match decision {
-        ProxyAuditDecision::Allow => OpenAiProxyAuditDecision::Allow,
-        ProxyAuditDecision::Deny { reason } => OpenAiProxyAuditDecision::Deny {
-            reason: reason.clone().into_owned(),
-        },
-    }
 }
 
 #[cfg(test)]

@@ -231,15 +231,32 @@ pub(super) trait ProxyAudit: 'static {
     fn record_outcome(audit_log: &AuditLog, fields: ProxyOutcomeFields<'_>);
 }
 
-/// Audit decision attached to a recorded proxy request. The two
-/// per-backend audit decision enums (`ClaudeProxyAuditDecision` /
-/// `OpenAiProxyAuditDecision`) are structurally identical; this
-/// borrow-friendly mirror lets the generic orchestration code build a
-/// decision once and the per-backend trait impl translate it.
+/// Audit decision attached to a recorded proxy request.
+/// Borrow-friendly mirror of [`crate::audit::ProxyAuditDecision`]: the
+/// orchestration code often holds a `&'static str` for the deny
+/// reason, so accepting a `Cow` here avoids forcing the call site to
+/// allocate. The conversion to the owned audit-record shape happens
+/// in [`proxy_decision_to_owned`] just before the audit write.
 #[derive(Debug)]
 pub(super) enum ProxyAuditDecision<'a> {
     Allow,
     Deny { reason: Cow<'a, str> },
+}
+
+/// Translate the borrow-friendly orchestration decision into the
+/// owned shape every per-backend audit-record write expects. Single
+/// implementation because the per-backend
+/// `*ProxyAuditDecision` types are all aliases of the same
+/// `crate::audit::ProxyAuditDecision`.
+pub(super) fn proxy_decision_to_owned(
+    decision: &ProxyAuditDecision<'_>,
+) -> crate::audit::ProxyAuditDecision {
+    match decision {
+        ProxyAuditDecision::Allow => crate::audit::ProxyAuditDecision::Allow,
+        ProxyAuditDecision::Deny { reason } => crate::audit::ProxyAuditDecision::Deny {
+            reason: reason.clone().into_owned(),
+        },
+    }
 }
 
 /// Fields handed to a `ProxyBackend::record_request_audit` call, mirroring
