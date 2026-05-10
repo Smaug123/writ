@@ -149,6 +149,22 @@ pub enum AgentVmStartInvocation {
     },
 }
 
+/// One step in the start sequence. [`start_agent_vm_session`] interprets these
+/// in order; [`AgentVmSessionPlan::start_invocations`] projects them for
+/// dry-run display. Each variant's type fixes which [`StartOutcome`] variants
+/// its internal failures can produce; `step_failure_outcomes` and
+/// `step_cleanup_phase` make that mapping explicit, and a property test pins
+/// it to [`cleanup_step_after_start_outcome`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AgentVmStartStep {
+    CreateNetwork(ProcessInvocation),
+    InspectAndValidateNetwork(ProcessInvocation),
+    InstallFirewall(ProcessInvocation),
+    StartVm(AgentVmStartInvocation),
+    ProbeAndValidateGuestIpv6 { probe_invocation: ProcessInvocation },
+    ReleaseGuestCommand(ProcessInvocation),
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ResourcePresenceProbe {
     invocation: ProcessInvocation,
@@ -618,27 +634,35 @@ impl AgentVmSessionPlan {
             .collect()
     }
 
-    /// Describes the start command sequence. When guest environment variables
-    /// are configured, the VM-start step is represented as
-    /// [`AgentVmStartInvocation::RuntimeGuestEnvFile`] rather than as a
-    /// runnable [`ProcessInvocation`]; [`start_agent_vm_session`] writes the
-    /// real 0600 env file immediately before invoking `container run`.
-    pub fn start_invocations(&self) -> Vec<AgentVmStartInvocation> {
-        let mut invocations = vec![
-            AgentVmStartInvocation::Static(self.create_network_invocation()),
-            AgentVmStartInvocation::Static(self.inspect_network_invocation()),
-            AgentVmStartInvocation::Static(self.install_firewall_invocation()),
-            self.start_vm_invocation(),
+    /// Describes the start sequence as a vector of steps. When guest
+    /// environment variables are configured, the VM-start step's
+    /// [`AgentVmStartInvocation`] is the
+    /// [`AgentVmStartInvocation::RuntimeGuestEnvFile`] form;
+    /// [`start_agent_vm_session`] writes the real 0600 env file immediately
+    /// before invoking `container run`.
+    pub fn start_steps(&self) -> Vec<AgentVmStartStep> {
+        let mut steps = vec![
+            AgentVmStartStep::CreateNetwork(self.create_network_invocation()),
+            AgentVmStartStep::InspectAndValidateNetwork(self.inspect_network_invocation()),
+            AgentVmStartStep::InstallFirewall(self.install_firewall_invocation()),
+            AgentVmStartStep::StartVm(self.start_vm_invocation()),
         ];
         if self.ipv6_mode == Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6 {
-            invocations.push(AgentVmStartInvocation::Static(
-                self.probe_guest_ipv6_invocation(),
-            ));
-            invocations.push(AgentVmStartInvocation::Static(
+            steps.push(AgentVmStartStep::ProbeAndValidateGuestIpv6 {
+                probe_invocation: self.probe_guest_ipv6_invocation(),
+            });
+            steps.push(AgentVmStartStep::ReleaseGuestCommand(
                 self.release_guest_command_invocation(),
             ));
         }
-        invocations
+        steps
+    }
+
+    pub fn start_invocations(&self) -> Vec<AgentVmStartInvocation> {
+        self.start_steps()
+            .into_iter()
+            .map(AgentVmStartStep::into_display_invocation)
+            .collect()
     }
 
     pub fn stop_invocations(&self) -> Vec<ProcessInvocation> {
@@ -743,8 +767,7 @@ impl AgentVmSessionPlan {
                         actual: ipv6_subnet,
                     });
                 }
-                let expected_gateway =
-                    Ipv6Addr::from(u128::from(expected_ipv6.network()) + 1);
+                let expected_gateway = Ipv6Addr::from(u128::from(expected_ipv6.network()) + 1);
                 if ipv6_gateway != expected_gateway {
                     return Err(NetworkInspectionError::Ipv6GatewayMismatch {
                         expected: expected_gateway,
@@ -1913,6 +1936,58 @@ impl AgentVmStartInvocation {
     }
 }
 
+impl AgentVmStartStep {
+    pub fn into_display_invocation(self) -> AgentVmStartInvocation {
+        match self {
+            Self::CreateNetwork(inv)
+            | Self::InspectAndValidateNetwork(inv)
+            | Self::InstallFirewall(inv)
+            | Self::ReleaseGuestCommand(inv) => AgentVmStartInvocation::Static(inv),
+            Self::StartVm(inv) => inv,
+            Self::ProbeAndValidateGuestIpv6 { probe_invocation } => {
+                AgentVmStartInvocation::Static(probe_invocation)
+            }
+        }
+    }
+}
+
+/// Cleanup phase active *during* `step`: the resources that need tearing down
+/// if `step` fails. The property test
+/// `step_cleanup_phase_agrees_with_outcome_oracle` pins this to
+/// [`cleanup_step_after_start_outcome`] for every outcome the step can
+/// produce.
+pub fn step_cleanup_phase(step: &AgentVmStartStep) -> CompletedStartStep {
+    match step {
+        AgentVmStartStep::CreateNetwork(_) => CompletedStartStep::None,
+        AgentVmStartStep::InspectAndValidateNetwork(_) | AgentVmStartStep::InstallFirewall(_) => {
+            CompletedStartStep::NetworkCreated
+        }
+        AgentVmStartStep::StartVm(_)
+        | AgentVmStartStep::ProbeAndValidateGuestIpv6 { .. }
+        | AgentVmStartStep::ReleaseGuestCommand(_) => CompletedStartStep::FirewallInstalled,
+    }
+}
+
+/// Every [`StartOutcome`] (other than `Started`) the step can produce on
+/// failure. The runner is required to use only these outcomes for the step.
+pub fn step_failure_outcomes(step: &AgentVmStartStep) -> Vec<StartOutcome> {
+    match step {
+        AgentVmStartStep::CreateNetwork(_) => vec![StartOutcome::CreateNetworkFailed],
+        AgentVmStartStep::InspectAndValidateNetwork(_) => vec![
+            StartOutcome::InspectNetworkFailed,
+            StartOutcome::ParseNetworkInspectionFailed,
+            StartOutcome::ValidateNetworkInspectionFailed,
+        ],
+        AgentVmStartStep::InstallFirewall(_) => vec![StartOutcome::InstallFirewallFailed],
+        AgentVmStartStep::StartVm(_) => vec![StartOutcome::StartVmFailed],
+        AgentVmStartStep::ProbeAndValidateGuestIpv6 { .. } => vec![
+            StartOutcome::ProbeGuestIpv6Failed,
+            StartOutcome::ValidateGuestIpv6Failed,
+        ],
+        AgentVmStartStep::ReleaseGuestCommand(_) => vec![StartOutcome::ReleaseGuestCommandFailed],
+    }
+}
+
 impl ResourcePresenceProbe {
     fn new(invocation: ProcessInvocation, name: String) -> Self {
         Self { invocation, name }
@@ -2037,60 +2112,60 @@ impl BrokerUrl {
 }
 
 pub fn start_agent_vm_session(plan: &AgentVmSessionPlan) -> Result<(), AgentVmLifecycleRunError> {
-    if let Err(err) = plan.create_network_invocation().run() {
-        return Err(StartFailure::from(err).into());
-    }
-
-    let inspect_invocation = plan.inspect_network_invocation();
-    let inspection_output = match inspect_invocation.output() {
-        Ok(output) if output.status.success() => output,
-        Ok(output) => {
-            let err = inspect_invocation.failed_from_output(output);
-            return fail_after_cleanup(err.into(), plan, StartOutcome::InspectNetworkFailed);
-        }
-        Err(err) => {
-            return fail_after_cleanup(err.into(), plan, StartOutcome::InspectNetworkFailed);
-        }
-    };
-    let inspection =
-        match AppleNetworkInspection::parse(&String::from_utf8_lossy(&inspection_output.stdout)) {
-            Ok(inspection) => inspection,
-            Err(err) => {
-                return fail_after_cleanup(
-                    err.into(),
-                    plan,
-                    StartOutcome::ParseNetworkInspectionFailed,
-                );
-            }
-        };
-    if let Err(err) = plan.validate_network_inspection(&inspection) {
-        return fail_after_cleanup(
-            err.into(),
-            plan,
-            StartOutcome::ValidateNetworkInspectionFailed,
-        );
-    }
-    if let Err(err) = plan.install_firewall_invocation().run() {
-        return fail_after_cleanup(err.into(), plan, StartOutcome::InstallFirewallFailed);
-    }
-    if let Err(err) = plan.run_start_vm_invocation() {
-        return fail_after_cleanup(err, plan, StartOutcome::StartVmFailed);
-    }
-    if plan.ipv6_mode == Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6 {
-        let guest_ipv6 = match wait_for_guest_ipv6_inspection(plan) {
-            Ok(inspection) => inspection,
-            Err(err) => {
-                return fail_after_cleanup(err, plan, StartOutcome::ProbeGuestIpv6Failed);
-            }
-        };
-        if let Err(err) = guest_ipv6.require_no_routable_ipv6() {
-            return fail_after_cleanup(err.into(), plan, StartOutcome::ValidateGuestIpv6Failed);
-        }
-        if let Err(err) = plan.release_guest_command_invocation().run() {
-            return fail_after_cleanup(err.into(), plan, StartOutcome::ReleaseGuestCommandFailed);
+    for step in plan.start_steps() {
+        if let Err((failure, outcome)) = run_start_step(plan, &step) {
+            return fail_after_cleanup(failure, plan, outcome);
         }
     }
     Ok(())
+}
+
+/// Execute a single start step. Errors carry the [`StartOutcome`] the runner
+/// reports to [`fail_after_cleanup`]; the property test
+/// `step_cleanup_phase_agrees_with_outcome_oracle` pins the outcome set per
+/// step type to [`cleanup_step_after_start_outcome`].
+fn run_start_step(
+    plan: &AgentVmSessionPlan,
+    step: &AgentVmStartStep,
+) -> Result<(), (StartFailure, StartOutcome)> {
+    match step {
+        AgentVmStartStep::CreateNetwork(invocation) => invocation
+            .run()
+            .map_err(|err| (err.into(), StartOutcome::CreateNetworkFailed)),
+        AgentVmStartStep::InspectAndValidateNetwork(invocation) => {
+            let output = match invocation.output() {
+                Ok(out) if out.status.success() => out,
+                Ok(out) => {
+                    return Err((
+                        invocation.failed_from_output(out).into(),
+                        StartOutcome::InspectNetworkFailed,
+                    ));
+                }
+                Err(err) => return Err((err.into(), StartOutcome::InspectNetworkFailed)),
+            };
+            let inspection =
+                AppleNetworkInspection::parse(&String::from_utf8_lossy(&output.stdout))
+                    .map_err(|err| (err.into(), StartOutcome::ParseNetworkInspectionFailed))?;
+            plan.validate_network_inspection(&inspection)
+                .map_err(|err| (err.into(), StartOutcome::ValidateNetworkInspectionFailed))
+        }
+        AgentVmStartStep::InstallFirewall(invocation) => invocation
+            .run()
+            .map_err(|err| (err.into(), StartOutcome::InstallFirewallFailed)),
+        AgentVmStartStep::StartVm(_) => plan
+            .run_start_vm_invocation()
+            .map_err(|err| (err, StartOutcome::StartVmFailed)),
+        AgentVmStartStep::ProbeAndValidateGuestIpv6 { probe_invocation } => {
+            let inspection = wait_for_guest_ipv6_inspection(probe_invocation)
+                .map_err(|err| (err, StartOutcome::ProbeGuestIpv6Failed))?;
+            inspection
+                .require_no_routable_ipv6()
+                .map_err(|err| (err.into(), StartOutcome::ValidateGuestIpv6Failed))
+        }
+        AgentVmStartStep::ReleaseGuestCommand(invocation) => invocation
+            .run()
+            .map_err(|err| (err.into(), StartOutcome::ReleaseGuestCommandFailed)),
+    }
 }
 
 pub fn stop_agent_vm_session(plan: &AgentVmSessionStopPlan) -> Result<(), CleanupErrors> {
@@ -2504,9 +2579,8 @@ fn state_mismatch(session_id: SessionId, message: impl Into<String>) -> AgentVmS
 }
 
 fn wait_for_guest_ipv6_inspection(
-    plan: &AgentVmSessionPlan,
+    invocation: &ProcessInvocation,
 ) -> Result<GuestIpv6Inspection, StartFailure> {
-    let invocation = plan.probe_guest_ipv6_invocation();
     for attempt in 0..GUEST_IPV6_PROBE_ATTEMPTS {
         let err = match invocation.output() {
             Ok(output) if output.status.success() => {
@@ -3619,6 +3693,63 @@ mod tests {
             });
             prop_assert!(only_removes);
         }
+
+        /// The runner reports a step's failure as one of `step_failure_outcomes(step)`,
+        /// and `fail_after_cleanup` then asks the oracle which cleanup phase to run.
+        /// For the runner to agree with `step_cleanup_phase` by construction, every
+        /// outcome the step can produce must map to that step's cleanup phase.
+        #[test]
+        fn step_cleanup_phase_agrees_with_outcome_oracle(plan in arb_plan()) {
+            for step in plan.start_steps() {
+                let phase = step_cleanup_phase(&step);
+                for outcome in step_failure_outcomes(&step) {
+                    prop_assert_eq!(
+                        cleanup_step_after_start_outcome(outcome),
+                        Some(phase),
+                        "step {:?} outcome {:?} disagrees with oracle",
+                        step,
+                        outcome,
+                    );
+                }
+            }
+        }
+    }
+
+    /// Catches drift if a new `StartOutcome` is added but no step variant
+    /// produces it: the runner would silently never report the new outcome.
+    #[test]
+    fn every_failure_outcome_is_producible_by_some_step() {
+        let mut produced: Vec<StartOutcome> = Vec::new();
+        for mode in [
+            Ipv6IsolationMode::DualStackRequired,
+            Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6,
+        ] {
+            for step in plan_with_ipv6_mode(7, mode).start_steps() {
+                for outcome in step_failure_outcomes(&step) {
+                    if !produced.contains(&outcome) {
+                        produced.push(outcome);
+                    }
+                }
+            }
+        }
+
+        for outcome in [
+            StartOutcome::CreateNetworkFailed,
+            StartOutcome::InspectNetworkFailed,
+            StartOutcome::ParseNetworkInspectionFailed,
+            StartOutcome::ValidateNetworkInspectionFailed,
+            StartOutcome::InstallFirewallFailed,
+            StartOutcome::StartVmFailed,
+            StartOutcome::ProbeGuestIpv6Failed,
+            StartOutcome::ValidateGuestIpv6Failed,
+            StartOutcome::ReleaseGuestCommandFailed,
+        ] {
+            assert!(produced.contains(&outcome), "no step produces {outcome:?}",);
+        }
+        assert_eq!(produced.len(), 9, "produced = {produced:?}");
+    }
+
+    proptest! {
 
         #[test]
         fn network_inspection_accepts_exact_match_and_rejects_each_mutated_field(index in any::<u8>()) {
