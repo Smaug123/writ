@@ -135,11 +135,46 @@ impl RepoRef {
     /// semantics for owner and repository names. Use this anywhere a
     /// comparison crosses the GitHub boundary (policy allowlists,
     /// response verification) so operator-typed casing doesn't cause
-    /// spurious mismatches. `PartialEq` is left exact so collections
-    /// keyed on `RepoRef` behave predictably; the broker only treats
-    /// case as irrelevant when *comparing against GitHub-sourced names*.
+    /// spurious mismatches. `PartialEq` is left exact so callers that
+    /// want byte-identical equality (e.g. asserting the request's
+    /// original casing flows through unchanged) keep that affordance;
+    /// the broker only treats case as irrelevant when *comparing
+    /// against GitHub-sourced names*.
     pub fn matches(&self, other: &Self) -> bool {
-        self.owner.eq_ignore_ascii_case(&other.owner) && self.name.eq_ignore_ascii_case(&other.name)
+        self.canonicalise() == other.canonicalise()
+    }
+
+    /// Project into the case-folded canonical form GitHub uses to
+    /// resolve owner and repository names. Cross-boundary comparisons
+    /// should canonicalise both sides and compare with `==`; that way
+    /// the comparison is type-checked rather than relying on the
+    /// caller to pick the right method.
+    pub fn canonicalise(&self) -> CanonicalRepoRef {
+        CanonicalRepoRef {
+            owner: self.owner.to_ascii_lowercase(),
+            name: self.name.to_ascii_lowercase(),
+        }
+    }
+}
+
+/// A `RepoRef` projected into GitHub's case-folded form. Equality on
+/// this type *is* GitHub-equivalent identity, so a comparison crossing
+/// the GitHub boundary (mint-response verification, policy allowlist
+/// checks) is correct by construction.
+///
+/// Constructed only via [`RepoRef::canonicalise`]; there is no public
+/// constructor and no `Deserialize` impl because this type never
+/// crosses the wire — it exists purely to type-check intent at the
+/// point of comparison.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct CanonicalRepoRef {
+    owner: String,
+    name: String,
+}
+
+impl std::fmt::Display for CanonicalRepoRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}/{}", self.owner, self.name)
     }
 }
 
@@ -241,7 +276,15 @@ mod tests {
         };
         assert!(a.matches(&b));
         assert!(b.matches(&a));
-        assert_ne!(a, b, "PartialEq must stay exact so Hash/collections behave");
+        assert_ne!(
+            a, b,
+            "PartialEq must stay exact so callers asserting exact preservation still work"
+        );
+        assert_eq!(
+            a.canonicalise(),
+            b.canonicalise(),
+            "canonical projections must collapse case"
+        );
     }
 
     #[test]
@@ -258,6 +301,39 @@ mod tests {
             owner: "p".into(),
             name: "n".into(),
         }));
+    }
+
+    #[test]
+    fn canonical_repo_ref_lowercases_and_displays() {
+        let r = RepoRef {
+            owner: "Smaug123".into(),
+            name: "Writ".into(),
+        };
+        let c = r.canonicalise();
+        assert_eq!(c.to_string(), "smaug123/writ");
+    }
+
+    #[test]
+    fn canonical_repo_ref_hash_is_case_insensitive() {
+        use std::collections::HashSet;
+        let mut set = HashSet::new();
+        set.insert(
+            RepoRef {
+                owner: "Smaug123".into(),
+                name: "Writ".into(),
+            }
+            .canonicalise(),
+        );
+        // A differently-cased `RepoRef` must canonicalise to the same key.
+        assert!(
+            set.contains(
+                &RepoRef {
+                    owner: "smaug123".into(),
+                    name: "writ".into(),
+                }
+                .canonicalise()
+            )
+        );
     }
 
     #[test]
