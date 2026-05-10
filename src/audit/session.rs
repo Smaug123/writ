@@ -86,3 +86,50 @@ impl rusqlite::types::FromSql for SqlAgentKind {
             .map_err(|err| rusqlite::types::FromSqlError::Other(Box::new(err)))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::audit::test_support::sample_session;
+
+    #[test]
+    fn session_roundtrips() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+        let back = log.get_session(s.session_id).unwrap().unwrap();
+        assert_eq!(back, s);
+    }
+
+    #[test]
+    fn missing_session_returns_none() {
+        let log = AuditLog::open_in_memory().unwrap();
+        assert!(log.get_session(SessionId::new()).unwrap().is_none());
+    }
+
+    #[test]
+    fn close_session_sets_closed_at() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+        log.close_session(s.session_id, UnixMillis::from_millis(1_700_000_500))
+            .unwrap();
+        let back = log.get_session(s.session_id).unwrap().unwrap();
+        assert_eq!(back.closed_at, Some(UnixMillis::from_millis(1_700_000_500)));
+    }
+
+    #[test]
+    fn close_session_is_idempotent_on_already_closed() {
+        // Our UPDATE only matches rows where closed_at IS NULL, so
+        // a second close is a silent no-op.
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+        log.close_session(s.session_id, UnixMillis::from_millis(100))
+            .unwrap();
+        log.close_session(s.session_id, UnixMillis::from_millis(200))
+            .unwrap();
+        let back = log.get_session(s.session_id).unwrap().unwrap();
+        assert_eq!(back.closed_at, Some(UnixMillis::from_millis(100)));
+    }
+}

@@ -251,3 +251,76 @@ impl ClaudeProxyAuditRoute {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::audit::test_support::sample_session;
+
+    #[test]
+    fn claude_proxy_request_then_outcome_roundtrips() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+        let request_id = RequestId::new();
+
+        log.record_claude_proxy_request(&ClaudeProxyRequestRecord {
+            request_id,
+            session_id: s.session_id,
+            received_at: UnixMillis::from_millis(1_700_000_200),
+            method: "POST",
+            target: "/v1/messages",
+            route: ClaudeProxyAuditRoute::Messages,
+            decision: &ClaudeProxyAuditDecision::Allow,
+        })
+        .unwrap();
+        log.record_claude_proxy_outcome(&ClaudeProxyOutcomeRecord {
+            request_id,
+            completed_at: UnixMillis::from_millis(1_700_000_240),
+            http_status: 200,
+            upstream_url: Some("https://api.anthropic.com/v1/messages"),
+            upstream_status: Some(200),
+            response_bytes: 128,
+            error: None,
+        })
+        .unwrap();
+
+        let entry = log
+            .with_conn(|c| {
+                Ok(c.query_row(
+                    "SELECT r.method, r.target, r.route, r.decision,
+                            o.http_status, o.upstream_url, o.upstream_status, o.response_bytes
+                     FROM claude_proxy_request r
+                     JOIN claude_proxy_outcome o USING (request_id)
+                     WHERE r.request_id = ?1",
+                    params![request_id.as_uuid().to_string()],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, i64>(4)?,
+                            row.get::<_, String>(5)?,
+                            row.get::<_, i64>(6)?,
+                            row.get::<_, i64>(7)?,
+                        ))
+                    },
+                )?)
+            })
+            .unwrap();
+        assert_eq!(
+            entry,
+            (
+                "POST".into(),
+                "/v1/messages".into(),
+                "messages".into(),
+                "allow".into(),
+                200,
+                "https://api.anthropic.com/v1/messages".into(),
+                200,
+                128,
+            )
+        );
+    }
+}

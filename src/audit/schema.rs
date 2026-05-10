@@ -639,3 +639,623 @@ pub(super) fn migrate(conn: &mut Connection) -> Result<(), AuditError> {
 pub(super) fn user_version(conn: &Connection) -> Result<i32, AuditError> {
     Ok(conn.query_row("PRAGMA user_version", [], |row| row.get(0))?)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::audit::AuditLog;
+    use crate::audit::nix_cache::{
+        NixCacheAuditDecision, NixCacheAuditRoute, NixCacheRequestRecord,
+    };
+    use crate::audit::test_support::{pre_mint, sample_request, sample_scope, sample_session};
+    use crate::core::{Jti, PolicyDecision, RequestId, SessionId, UnixMillis};
+    use rusqlite::params;
+    use tempfile::NamedTempFile;
+
+    fn read_user_version(log: &AuditLog) -> i32 {
+        log.with_conn(user_version).unwrap()
+    }
+
+    fn column_exists(log: &AuditLog, table: &str, column: &str) -> bool {
+        log.with_conn(|c| {
+            let mut stmt = c.prepare(&format!("PRAGMA table_info({table})"))?;
+            let mut rows = stmt.query([])?;
+            while let Some(row) = rows.next()? {
+                let name: String = row.get(1)?;
+                if name == column {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        })
+        .unwrap()
+    }
+
+    fn trigger_exists(log: &AuditLog, name: &str) -> bool {
+        log.with_conn(|c| {
+            let count: i64 = c.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' AND name = ?1",
+                params![name],
+                |row| row.get(0),
+            )?;
+            Ok(count > 0)
+        })
+        .unwrap()
+    }
+
+    fn record_nix_cache_request(
+        log: &AuditLog,
+        request_id: RequestId,
+        session_id: SessionId,
+        decision: &NixCacheAuditDecision,
+        route: NixCacheAuditRoute,
+    ) -> Result<(), AuditError> {
+        log.record_nix_cache_request(&NixCacheRequestRecord {
+            request_id,
+            session_id,
+            received_at: UnixMillis::from_millis(1_700_000_100),
+            method: "GET",
+            target: "/v1/nix/cache/nix-cache-info",
+            route,
+            decision,
+        })
+    }
+
+    #[test]
+    fn foreign_key_enforcement_rejects_orphan_grant_row() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+
+        // Bypass `record` (which would block this at the application layer)
+        // and write directly. The FK to `request(request_id)` must bite.
+        let err = log
+            .with_conn(|c| {
+                c.execute(
+                    "INSERT INTO grant_log (jti, request_id, session_id, scope_json, issued_at, expires_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![
+                        Jti::new().as_uuid().to_string(),
+                        RequestId::new().as_uuid().to_string(), // no matching request row
+                        s.session_id.as_uuid().to_string(),
+                        "{}",
+                        1_i64,
+                        2_i64,
+                    ],
+                )?;
+                Ok(())
+            })
+            .unwrap_err();
+        let AuditError::Sqlite(e) = err else {
+            panic!("expected sqlite FK error, got: {err:?}");
+        };
+        let msg = e.to_string().to_lowercase();
+        assert!(
+            msg.contains("foreign key"),
+            "expected FK violation, got: {e}"
+        );
+    }
+
+    /// Same as above but for the `session_id` FK from `request`. Belt and
+    /// braces — both FK paths matter.
+    #[test]
+    fn foreign_key_enforcement_rejects_orphan_request_row() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let err = log
+            .with_conn(|c| {
+                c.execute(
+                    "INSERT INTO request (request_id, session_id, received_at, request_json, decision_json) \
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        RequestId::new().as_uuid().to_string(),
+                        SessionId::new().as_uuid().to_string(), // no matching session row
+                        1_i64,
+                        "{}",
+                        "{}",
+                    ],
+                )?;
+                Ok(())
+            })
+            .unwrap_err();
+        let AuditError::Sqlite(e) = err else {
+            panic!("expected sqlite FK error, got: {err:?}");
+        };
+        assert!(
+            e.to_string().to_lowercase().contains("foreign key"),
+            "expected FK violation, got: {e}"
+        );
+    }
+
+    /// `closed_at IS NULL` on the session row is the only audit-time
+    /// guarantee that a session is open. The trigger refuses to add
+    /// an audit row against a closed session even if the caller forgot
+    /// to check.
+    #[test]
+    fn trigger_rejects_direct_insert_against_closed_session() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+        log.close_session(s.session_id, UnixMillis::from_millis(1_700_000_050))
+            .unwrap();
+
+        let err = log
+            .with_conn(|c| {
+                c.execute(
+                    "INSERT INTO request (request_id, session_id, received_at, request_json, decision_json) \
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        RequestId::new().as_uuid().to_string(),
+                        s.session_id.as_uuid().to_string(),
+                        1_700_000_100_i64,
+                        "{}",
+                        "{}",
+                    ],
+                )?;
+                Ok(())
+            })
+            .unwrap_err();
+        let AuditError::Sqlite(e) = err else {
+            panic!("expected sqlite trigger error, got: {err:?}");
+        };
+        assert!(
+            e.to_string().to_lowercase().contains("session is closed"),
+            "expected trigger message, got: {e}"
+        );
+    }
+
+    /// An open session is still writable — a narrow regression test
+    /// that the new trigger's `WHEN` clause doesn't accidentally fire
+    /// when `closed_at IS NULL`.
+    #[test]
+    fn trigger_allows_insert_against_open_session() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+
+        log.with_conn(|c| {
+            c.execute(
+                "INSERT INTO request (request_id, session_id, received_at, request_json, decision_json) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    RequestId::new().as_uuid().to_string(),
+                    s.session_id.as_uuid().to_string(),
+                    1_700_000_100_i64,
+                    "{}",
+                    "{}",
+                ],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn fresh_install_is_at_current_schema_version() {
+        let log = AuditLog::open_in_memory().unwrap();
+        assert_eq!(read_user_version(&log), SCHEMA_VERSION);
+        assert!(column_exists(&log, "mint_failure", "request_id"));
+        assert!(column_exists(&log, "session", "agent_kind"));
+        assert!(column_exists(&log, "grant_log", "github_app_id"));
+        assert!(trigger_exists(&log, "request_requires_open_session"));
+        assert!(trigger_exists(&log, "mint_failure_excludes_grant"));
+        assert!(trigger_exists(&log, "grant_excludes_mint_failure"));
+        assert!(column_exists(&log, "nix_cache_request", "route"));
+        assert!(column_exists(&log, "nix_cache_outcome", "upstream_status"));
+        assert!(column_exists(
+            &log,
+            "agent_vm_workspace_bootstrap",
+            "session_id"
+        ));
+        assert!(trigger_exists(
+            &log,
+            "nix_cache_request_requires_open_session"
+        ));
+        assert!(trigger_exists(
+            &log,
+            "agent_vm_workspace_bootstrap_requires_open_session"
+        ));
+        assert!(column_exists(&log, "agent_run", "prompt_sha256"));
+        assert!(column_exists(&log, "agent_run_outcome", "stdout_path"));
+        assert!(trigger_exists(&log, "agent_run_requires_open_session"));
+        assert!(column_exists(
+            &log,
+            "git_push_request",
+            "expected_remote_head"
+        ));
+        assert!(column_exists(&log, "git_push_attempt", "grant_jti"));
+        assert!(column_exists(&log, "git_push_outcome", "result"));
+        assert!(trigger_exists(
+            &log,
+            "git_push_request_requires_open_session"
+        ));
+        assert!(trigger_exists(
+            &log,
+            "git_push_attempt_requires_matching_grant"
+        ));
+        assert!(trigger_exists(
+            &log,
+            "git_push_outcome_attempt_matches_request"
+        ));
+        assert!(column_exists(&log, "claude_proxy_request", "route"));
+        assert!(column_exists(
+            &log,
+            "claude_proxy_outcome",
+            "upstream_status"
+        ));
+        assert!(trigger_exists(
+            &log,
+            "claude_proxy_request_requires_open_session"
+        ));
+        assert!(column_exists(&log, "openai_proxy_request", "route"));
+        assert!(column_exists(
+            &log,
+            "openai_proxy_outcome",
+            "upstream_status"
+        ));
+        assert!(trigger_exists(
+            &log,
+            "openai_proxy_request_requires_open_session"
+        ));
+    }
+
+    #[test]
+    fn open_initialises_empty_file_db_at_current_schema_version() {
+        let db = NamedTempFile::new().unwrap();
+        let log = AuditLog::open(db.path()).unwrap();
+        assert_eq!(read_user_version(&log), SCHEMA_VERSION);
+        assert!(column_exists(&log, "session", "session_id"));
+        assert!(column_exists(&log, "session", "agent_kind"));
+        assert!(column_exists(&log, "request", "decision_json"));
+        assert!(column_exists(&log, "grant_log", "jti"));
+        assert!(column_exists(&log, "grant_log", "github_app_id"));
+        assert!(column_exists(&log, "mint_failure", "failure_json"));
+        assert!(column_exists(&log, "nix_cache_request", "request_id"));
+        assert!(column_exists(&log, "nix_cache_outcome", "request_id"));
+        assert!(column_exists(&log, "agent_vm_workspace_bootstrap", "warm"));
+        assert!(column_exists(&log, "agent_run", "prompt_redacted_preview"));
+        assert!(column_exists(&log, "agent_run_outcome", "stderr_sha256"));
+        assert!(column_exists(&log, "git_push_request", "new_head"));
+        assert!(column_exists(&log, "git_push_attempt", "old_head"));
+        assert!(column_exists(&log, "git_push_outcome", "message"));
+        assert!(column_exists(&log, "claude_proxy_request", "request_id"));
+        assert!(column_exists(
+            &log,
+            "claude_proxy_outcome",
+            "response_bytes"
+        ));
+        assert!(column_exists(&log, "openai_proxy_request", "request_id"));
+        assert!(column_exists(
+            &log,
+            "openai_proxy_outcome",
+            "response_bytes"
+        ));
+        assert!(trigger_exists(&log, "request_requires_open_session"));
+        assert!(trigger_exists(
+            &log,
+            "nix_cache_request_requires_open_session"
+        ));
+        assert!(trigger_exists(
+            &log,
+            "agent_vm_workspace_bootstrap_requires_open_session"
+        ));
+        assert!(trigger_exists(&log, "agent_run_requires_open_session"));
+        assert!(trigger_exists(
+            &log,
+            "git_push_request_requires_open_session"
+        ));
+        assert!(trigger_exists(
+            &log,
+            "claude_proxy_request_requires_open_session"
+        ));
+        assert!(trigger_exists(
+            &log,
+            "openai_proxy_request_requires_open_session"
+        ));
+    }
+
+    #[test]
+    fn reopen_at_current_version_is_a_noop() {
+        // The pragma check is what makes this cheap on startup; verify
+        // re-running migrate on an already-current DB doesn't error and
+        // doesn't bump the version past the supported max.
+        let db = NamedTempFile::new().unwrap();
+        {
+            let log = AuditLog::open(db.path()).unwrap();
+            assert_eq!(read_user_version(&log), SCHEMA_VERSION);
+        }
+        let log = AuditLog::open(db.path()).unwrap();
+        assert_eq!(read_user_version(&log), SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn open_migrates_v1_database_to_nix_cache_audit_schema() {
+        let db = NamedTempFile::new().unwrap();
+        {
+            let mut conn = Connection::open(db.path()).unwrap();
+            let tx = conn.transaction().unwrap();
+            tx.execute_batch(MIGRATIONS[0].sql).unwrap();
+            tx.pragma_update(None, "user_version", 1).unwrap();
+            tx.commit().unwrap();
+        }
+
+        let log = AuditLog::open(db.path()).unwrap();
+
+        assert_eq!(read_user_version(&log), SCHEMA_VERSION);
+        assert!(column_exists(&log, "nix_cache_request", "decision"));
+        assert!(column_exists(&log, "nix_cache_outcome", "response_bytes"));
+        assert!(column_exists(&log, "session", "agent_kind"));
+        assert!(column_exists(&log, "grant_log", "github_app_id"));
+        assert!(column_exists(&log, "agent_vm_workspace_bootstrap", "repo"));
+        assert!(column_exists(&log, "agent_run", "run_id"));
+        assert!(column_exists(&log, "agent_run_outcome", "run_id"));
+        assert!(trigger_exists(
+            &log,
+            "nix_cache_request_requires_open_session"
+        ));
+    }
+
+    #[test]
+    fn open_migrates_v2_database_to_nar_cache_audit_schema() {
+        let db = NamedTempFile::new().unwrap();
+        {
+            let mut conn = Connection::open(db.path()).unwrap();
+            let tx = conn.transaction().unwrap();
+            tx.execute_batch(MIGRATIONS[0].sql).unwrap();
+            tx.execute_batch(MIGRATIONS[1].sql).unwrap();
+            tx.pragma_update(None, "user_version", 2).unwrap();
+            tx.commit().unwrap();
+        }
+
+        let log = AuditLog::open(db.path()).unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+        let request_id = RequestId::new();
+        record_nix_cache_request(
+            &log,
+            request_id,
+            s.session_id,
+            &NixCacheAuditDecision::Allow,
+            NixCacheAuditRoute::Nar,
+        )
+        .unwrap();
+
+        let entries = log
+            .list_nix_cache_requests_for_session(s.session_id)
+            .unwrap();
+        assert_eq!(read_user_version(&log), SCHEMA_VERSION);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].route, NixCacheAuditRoute::Nar);
+    }
+
+    #[test]
+    fn open_migrates_v4_grant_rows_without_github_app_id() {
+        let db = NamedTempFile::new().unwrap();
+        let session_id = SessionId::new();
+        let request_id = RequestId::new();
+        let jti = Jti::new();
+        {
+            let mut conn = Connection::open(db.path()).unwrap();
+            let tx = conn.transaction().unwrap();
+            for migration in MIGRATIONS.iter().take(4) {
+                tx.execute_batch(migration.sql).unwrap();
+            }
+            tx.pragma_update(None, "user_version", 4).unwrap();
+            tx.execute(
+                "INSERT INTO session (session_id, label, agent_kind, agent_model, opened_at, closed_at) \
+                 VALUES (?1, NULL, 'claude', NULL, 1, NULL)",
+                params![session_id.as_uuid().to_string()],
+            )
+            .unwrap();
+            tx.execute(
+                "INSERT INTO request (request_id, session_id, received_at, request_json, decision_json) \
+                 VALUES (?1, ?2, 2, '{}', '{}')",
+                params![
+                    request_id.as_uuid().to_string(),
+                    session_id.as_uuid().to_string(),
+                ],
+            )
+            .unwrap();
+            tx.execute(
+                "INSERT INTO grant_log (jti, request_id, session_id, scope_json, issued_at, expires_at) \
+                 VALUES (?1, ?2, ?3, ?4, 3, 4)",
+                params![
+                    jti.as_uuid().to_string(),
+                    request_id.as_uuid().to_string(),
+                    session_id.as_uuid().to_string(),
+                    serde_json::to_string(&sample_scope()).unwrap(),
+                ],
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+
+        let log = AuditLog::open(db.path()).unwrap();
+
+        assert_eq!(read_user_version(&log), SCHEMA_VERSION);
+        assert!(column_exists(&log, "grant_log", "github_app_id"));
+        let grant = log.get_grant(jti).unwrap().unwrap();
+        assert_eq!(grant.github_app_id, None);
+    }
+
+    #[test]
+    fn open_migrates_v5_database_to_agent_vm_workspace_bootstrap_schema() {
+        let db = NamedTempFile::new().unwrap();
+        {
+            let mut conn = Connection::open(db.path()).unwrap();
+            let tx = conn.transaction().unwrap();
+            for migration in MIGRATIONS.iter().take(5) {
+                tx.execute_batch(migration.sql).unwrap();
+            }
+            tx.pragma_update(None, "user_version", 5).unwrap();
+            tx.commit().unwrap();
+        }
+
+        let log = AuditLog::open(db.path()).unwrap();
+
+        assert_eq!(read_user_version(&log), SCHEMA_VERSION);
+        assert!(column_exists(
+            &log,
+            "agent_vm_workspace_bootstrap",
+            "destination"
+        ));
+        assert!(trigger_exists(
+            &log,
+            "agent_vm_workspace_bootstrap_requires_open_session"
+        ));
+    }
+
+    #[test]
+    fn open_migrates_v6_database_to_agent_run_schema() {
+        let db = NamedTempFile::new().unwrap();
+        {
+            let mut conn = Connection::open(db.path()).unwrap();
+            let tx = conn.transaction().unwrap();
+            for migration in MIGRATIONS.iter().take(6) {
+                tx.execute_batch(migration.sql).unwrap();
+            }
+            tx.pragma_update(None, "user_version", 6).unwrap();
+            tx.commit().unwrap();
+        }
+
+        let log = AuditLog::open(db.path()).unwrap();
+
+        assert_eq!(read_user_version(&log), SCHEMA_VERSION);
+        assert!(column_exists(&log, "agent_run", "prompt_sha256"));
+        assert!(column_exists(&log, "agent_run_outcome", "stdout_path"));
+        assert!(trigger_exists(&log, "agent_run_requires_open_session"));
+    }
+
+    #[test]
+    fn open_migrates_v7_database_to_git_push_audit_schema() {
+        let db = NamedTempFile::new().unwrap();
+        {
+            let mut conn = Connection::open(db.path()).unwrap();
+            let tx = conn.transaction().unwrap();
+            for migration in MIGRATIONS.iter().take(7) {
+                tx.execute_batch(migration.sql).unwrap();
+            }
+            tx.pragma_update(None, "user_version", 7).unwrap();
+            tx.commit().unwrap();
+        }
+
+        let log = AuditLog::open(db.path()).unwrap();
+
+        assert_eq!(read_user_version(&log), SCHEMA_VERSION);
+        assert!(column_exists(&log, "git_push_request", "repo"));
+        assert!(column_exists(
+            &log,
+            "git_push_attempt",
+            "capability_request_id"
+        ));
+        assert!(column_exists(&log, "git_push_outcome", "github_status"));
+        assert!(trigger_exists(
+            &log,
+            "git_push_request_requires_open_session"
+        ));
+        assert!(trigger_exists(
+            &log,
+            "git_push_attempt_requires_matching_grant"
+        ));
+        assert!(trigger_exists(
+            &log,
+            "git_push_outcome_attempt_matches_request"
+        ));
+    }
+
+    #[test]
+    fn open_migrates_v8_database_to_claude_proxy_audit_schema() {
+        let db = NamedTempFile::new().unwrap();
+        {
+            let mut conn = Connection::open(db.path()).unwrap();
+            let tx = conn.transaction().unwrap();
+            for migration in MIGRATIONS.iter().take(8) {
+                tx.execute_batch(migration.sql).unwrap();
+            }
+            tx.pragma_update(None, "user_version", 8).unwrap();
+            tx.commit().unwrap();
+        }
+
+        let log = AuditLog::open(db.path()).unwrap();
+
+        assert_eq!(read_user_version(&log), SCHEMA_VERSION);
+        assert!(column_exists(&log, "claude_proxy_request", "target"));
+        assert!(column_exists(&log, "claude_proxy_outcome", "http_status"));
+        assert!(trigger_exists(
+            &log,
+            "claude_proxy_request_requires_open_session"
+        ));
+    }
+
+    #[test]
+    fn open_migrates_v10_database_to_openai_proxy_audit_schema() {
+        let db = NamedTempFile::new().unwrap();
+        {
+            let mut conn = Connection::open(db.path()).unwrap();
+            let tx = conn.transaction().unwrap();
+            for migration in MIGRATIONS.iter().take(10) {
+                tx.execute_batch(migration.sql).unwrap();
+            }
+            tx.pragma_update(None, "user_version", 10).unwrap();
+            tx.commit().unwrap();
+        }
+
+        let log = AuditLog::open(db.path()).unwrap();
+
+        assert_eq!(read_user_version(&log), SCHEMA_VERSION);
+        assert!(column_exists(&log, "openai_proxy_request", "target"));
+        assert!(column_exists(&log, "openai_proxy_outcome", "http_status"));
+        assert!(trigger_exists(
+            &log,
+            "openai_proxy_request_requires_open_session"
+        ));
+    }
+
+    /// A DB written by a future broker will carry a user_version beyond
+    /// what this binary knows. Refuse to open rather than risk silently
+    /// ignoring columns the newer schema relies on.
+    #[test]
+    fn open_rejects_schema_newer_than_supported() {
+        let db = NamedTempFile::new().unwrap();
+        {
+            // Build at current version, then tell the DB it's from the future.
+            let _ = AuditLog::open(db.path()).unwrap();
+            let c = Connection::open(db.path()).unwrap();
+            c.pragma_update(None, "user_version", SCHEMA_VERSION + 1)
+                .unwrap();
+        }
+        let err = AuditLog::open(db.path()).unwrap_err();
+        match err {
+            AuditError::SchemaTooNew { found, supported } => {
+                assert_eq!(found, SCHEMA_VERSION + 1);
+                assert_eq!(supported, SCHEMA_VERSION);
+            }
+            other => panic!("expected SchemaTooNew, got {other:?}"),
+        }
+    }
+
+    /// A recorded audit row for an unknown session was previously
+    /// caught only by the FK; `record_pre_mint` reports it explicitly so
+    /// the error is readable rather than leaking SQLite's message.
+    #[test]
+    fn record_pre_mint_rejects_write_against_nonexistent_session() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let phantom = SessionId::new();
+        let req = sample_request();
+        let decision = PolicyDecision::Deny {
+            reason: "any".into(),
+        };
+        let err = pre_mint(
+            &log,
+            RequestId::new(),
+            phantom,
+            &req,
+            &decision,
+            UnixMillis::from_millis(1),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, AuditError::Invariant("session does not exist")),
+            "got: {err:?}"
+        );
+    }
+}

@@ -398,3 +398,235 @@ fn agent_run_status_from_str(raw: &str) -> Result<AgentRunTerminalStatus, AuditE
         _ => Err(AuditError::Invariant("agent run status is invalid")),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::audit::test_support::sample_session;
+    use crate::core::AgentKind;
+
+    #[test]
+    fn agent_vm_workspace_bootstrap_roundtrips() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+        let record = AgentVmWorkspaceBootstrapAuditRecord {
+            session_id: s.session_id,
+            requested_at: UnixMillis::from_millis(1_700_000_100),
+            repo: "owner/repo".into(),
+            destination: "/workspace/repo".into(),
+            branch: "main".into(),
+            warm: "devshell".into(),
+        };
+
+        log.record_agent_vm_workspace_bootstrap(&record).unwrap();
+
+        assert_eq!(
+            log.get_agent_vm_workspace_bootstrap(s.session_id)
+                .unwrap()
+                .unwrap(),
+            record
+        );
+    }
+
+    #[test]
+    fn agent_vm_workspace_bootstrap_requires_open_session() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        let record = AgentVmWorkspaceBootstrapAuditRecord {
+            session_id: s.session_id,
+            requested_at: UnixMillis::from_millis(1_700_000_100),
+            repo: "owner/repo".into(),
+            destination: "/workspace/repo".into(),
+            branch: "main".into(),
+            warm: "none".into(),
+        };
+
+        let err = log
+            .record_agent_vm_workspace_bootstrap(&record)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            AuditError::Invariant("session does not exist")
+        ));
+
+        log.open_session(&s).unwrap();
+        log.close_session(s.session_id, UnixMillis::from_millis(1_700_000_200))
+            .unwrap();
+        let err = log
+            .record_agent_vm_workspace_bootstrap(&record)
+            .unwrap_err();
+        assert!(matches!(err, AuditError::Invariant("session is closed")));
+    }
+
+    #[test]
+    fn agent_run_and_outcome_roundtrip_without_raw_prompt_or_streams_in_audit() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+        let prompt = crate::agent_run::AgentPrompt::new("SECRET prompt body");
+        let run_id = AgentRunId::new();
+        let record = AgentRunAuditRecord {
+            run_id,
+            session_id: s.session_id,
+            requested_at: UnixMillis::from_millis(1_700_000_100),
+            agent_kind: AgentKind::Claude,
+            prompt: prompt.summary(),
+        };
+
+        log.record_agent_run(&record).unwrap();
+
+        let entry = log.get_agent_run(run_id).unwrap().unwrap();
+        assert_eq!(entry.run_id, run_id);
+        assert_eq!(entry.session_id, s.session_id);
+        assert_eq!(entry.agent_kind, AgentKind::Claude);
+        assert_eq!(entry.prompt.byte_len, prompt.byte_len());
+        assert_eq!(entry.prompt.redacted_preview, "<redacted>");
+        let debug = format!("{entry:?}");
+        assert!(!debug.contains(prompt.as_str()), "{debug}");
+
+        let outcome = AgentRunOutcome {
+            run_id,
+            status: AgentRunTerminalStatus::Failed,
+            exit_code: 7,
+            stdout: AgentRunStreamSummary {
+                path: "/private/writ/runs/stdout.log".into(),
+                byte_len: 12,
+                sha256_hex: crate::agent_run::sha256_hex(b"stdout bytes"),
+                truncated: false,
+            },
+            stderr: AgentRunStreamSummary {
+                path: "/private/writ/runs/stderr.log".into(),
+                byte_len: 4096,
+                sha256_hex: crate::agent_run::sha256_hex(b"stderr bytes"),
+                truncated: true,
+            },
+        };
+        let outcome_record = AgentRunOutcomeAuditRecord {
+            completed_at: UnixMillis::from_millis(1_700_000_200),
+            outcome: outcome.clone(),
+        };
+
+        log.record_agent_run_outcome(&outcome_record).unwrap();
+
+        let entry = log.get_agent_run_outcome(run_id).unwrap().unwrap();
+        assert_eq!(entry.outcome.run_id, run_id);
+        assert_eq!(entry.outcome, outcome);
+    }
+
+    #[test]
+    fn agent_run_requires_open_session_but_outcome_can_land_after_close() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        let run_id = AgentRunId::new();
+        let record = AgentRunAuditRecord {
+            run_id,
+            session_id: s.session_id,
+            requested_at: UnixMillis::from_millis(1_700_000_100),
+            agent_kind: AgentKind::Codex,
+            prompt: crate::agent_run::AgentPrompt::new("prompt").summary(),
+        };
+
+        let err = log.record_agent_run(&record).unwrap_err();
+        assert!(matches!(
+            err,
+            AuditError::Invariant("session does not exist")
+        ));
+
+        log.open_session(&s).unwrap();
+        log.record_agent_run(&record).unwrap();
+        log.close_session(s.session_id, UnixMillis::from_millis(1_700_000_150))
+            .unwrap();
+
+        let outcome = AgentRunOutcome {
+            run_id,
+            status: AgentRunTerminalStatus::Succeeded,
+            exit_code: 0,
+            stdout: AgentRunStreamSummary {
+                path: "/private/writ/runs/stdout.log".into(),
+                byte_len: 0,
+                sha256_hex: crate::agent_run::sha256_hex(b""),
+                truncated: false,
+            },
+            stderr: AgentRunStreamSummary {
+                path: "/private/writ/runs/stderr.log".into(),
+                byte_len: 0,
+                sha256_hex: crate::agent_run::sha256_hex(b""),
+                truncated: false,
+            },
+        };
+
+        log.record_agent_run_outcome(&AgentRunOutcomeAuditRecord {
+            completed_at: UnixMillis::from_millis(1_700_000_200),
+            outcome,
+        })
+        .unwrap();
+
+        let closed_run = AgentRunAuditRecord {
+            run_id: AgentRunId::new(),
+            ..record
+        };
+        let err = log.record_agent_run(&closed_run).unwrap_err();
+        assert!(matches!(err, AuditError::Invariant("session is closed")));
+    }
+
+    #[test]
+    fn agent_run_validation_errors_name_the_failed_field() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+
+        let err = log
+            .record_agent_run(&AgentRunAuditRecord {
+                run_id: AgentRunId::new(),
+                session_id: s.session_id,
+                requested_at: UnixMillis::from_millis(1_700_000_100),
+                agent_kind: AgentKind::Claude,
+                prompt: AgentPromptSummary {
+                    byte_len: 1,
+                    sha256_hex: "not sha256".to_string(),
+                    redacted_preview: "<redacted>".to_string(),
+                },
+            })
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            AuditError::LabeledInvariant {
+                label: "agent run prompt sha256",
+                message: "sha256 hex digest is invalid",
+            }
+        ));
+
+        let err = log
+            .record_agent_run_outcome(&AgentRunOutcomeAuditRecord {
+                completed_at: UnixMillis::from_millis(1_700_000_200),
+                outcome: AgentRunOutcome {
+                    run_id: AgentRunId::new(),
+                    status: AgentRunTerminalStatus::Succeeded,
+                    exit_code: 0,
+                    stdout: AgentRunStreamSummary {
+                        path: "relative/stdout.log".into(),
+                        byte_len: 0,
+                        sha256_hex: crate::agent_run::sha256_hex(b""),
+                        truncated: false,
+                    },
+                    stderr: AgentRunStreamSummary {
+                        path: "/private/writ/runs/stderr.log".into(),
+                        byte_len: 0,
+                        sha256_hex: crate::agent_run::sha256_hex(b""),
+                        truncated: false,
+                    },
+                },
+            })
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            AuditError::LabeledInvariant {
+                label: "stdout",
+                message: "agent run stream path must be absolute",
+            }
+        ));
+    }
+}

@@ -251,3 +251,95 @@ impl OpenAiProxyAuditRoute {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::audit::test_support::sample_session;
+
+    #[test]
+    fn openai_proxy_request_then_outcome_roundtrips() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+        let request_id = RequestId::new();
+
+        log.record_openai_proxy_request(&OpenAiProxyRequestRecord {
+            request_id,
+            session_id: s.session_id,
+            received_at: UnixMillis::from_millis(1_700_000_300),
+            method: "POST",
+            target: "/v1/responses",
+            route: OpenAiProxyAuditRoute::Responses,
+            decision: &OpenAiProxyAuditDecision::Allow,
+        })
+        .unwrap();
+        log.record_openai_proxy_outcome(&OpenAiProxyOutcomeRecord {
+            request_id,
+            completed_at: UnixMillis::from_millis(1_700_000_340),
+            http_status: 200,
+            upstream_url: Some("https://api.openai.com/v1/responses"),
+            upstream_status: Some(200),
+            response_bytes: 256,
+            error: None,
+        })
+        .unwrap();
+
+        let entries = log
+            .list_openai_proxy_requests_for_session_for_test(s.session_id)
+            .unwrap();
+        assert_eq!(
+            entries,
+            vec![(
+                OpenAiProxyAuditRoute::Responses,
+                OpenAiProxyAuditDecision::Allow,
+                Some(200),
+            )]
+        );
+        assert_eq!(
+            log.openai_proxy_outcome_for_test(request_id).unwrap(),
+            Some((200, 256, None))
+        );
+    }
+
+    #[test]
+    fn openai_proxy_request_rejects_closed_or_missing_session() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+        log.close_session(s.session_id, UnixMillis::from_millis(1_700_000_050))
+            .unwrap();
+
+        let closed = log
+            .record_openai_proxy_request(&OpenAiProxyRequestRecord {
+                request_id: RequestId::new(),
+                session_id: s.session_id,
+                received_at: UnixMillis::from_millis(1_700_000_100),
+                method: "POST",
+                target: "/v1/responses",
+                route: OpenAiProxyAuditRoute::Responses,
+                decision: &OpenAiProxyAuditDecision::Allow,
+            })
+            .unwrap_err();
+        assert!(
+            matches!(closed, AuditError::Invariant("session is closed")),
+            "got: {closed:?}"
+        );
+
+        let missing = log
+            .record_openai_proxy_request(&OpenAiProxyRequestRecord {
+                request_id: RequestId::new(),
+                session_id: SessionId::new(),
+                received_at: UnixMillis::from_millis(1_700_000_100),
+                method: "POST",
+                target: "/v1/responses",
+                route: OpenAiProxyAuditRoute::Responses,
+                decision: &OpenAiProxyAuditDecision::Allow,
+            })
+            .unwrap_err();
+        assert!(
+            matches!(missing, AuditError::Invariant("session does not exist")),
+            "got: {missing:?}"
+        );
+    }
+}
