@@ -315,3 +315,210 @@ fn nix_cache_audit_entry_from_row(
     };
     Ok(parse())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::audit::test_support::sample_session;
+
+    fn record_nix_cache_request(
+        log: &AuditLog,
+        request_id: RequestId,
+        session_id: SessionId,
+        decision: &NixCacheAuditDecision,
+        route: NixCacheAuditRoute,
+    ) -> Result<(), AuditError> {
+        log.record_nix_cache_request(&NixCacheRequestRecord {
+            request_id,
+            session_id,
+            received_at: UnixMillis::from_millis(1_700_000_100),
+            method: "GET",
+            target: "/v1/nix/cache/nix-cache-info",
+            route,
+            decision,
+        })
+    }
+
+    #[test]
+    fn nix_cache_request_then_outcome_roundtrips() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+        let request_id = RequestId::new();
+
+        record_nix_cache_request(
+            &log,
+            request_id,
+            s.session_id,
+            &NixCacheAuditDecision::Allow,
+            NixCacheAuditRoute::CacheInfo,
+        )
+        .unwrap();
+        log.record_nix_cache_outcome(&NixCacheOutcomeRecord {
+            request_id,
+            completed_at: UnixMillis::from_millis(1_700_000_120),
+            http_status: 200,
+            upstream_url: Some("https://cache.example.test/nix-cache-info"),
+            upstream_status: Some(200),
+            response_bytes: 48,
+            error: None,
+        })
+        .unwrap();
+
+        let entries = log
+            .list_nix_cache_requests_for_session(s.session_id)
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].request_id, request_id);
+        assert_eq!(entries[0].session_id, s.session_id);
+        assert_eq!(entries[0].method, "GET");
+        assert_eq!(entries[0].target, "/v1/nix/cache/nix-cache-info");
+        assert_eq!(entries[0].route, NixCacheAuditRoute::CacheInfo);
+        assert_eq!(entries[0].decision, NixCacheAuditDecision::Allow);
+        assert_eq!(
+            entries[0].completed_at,
+            Some(UnixMillis::from_millis(1_700_000_120))
+        );
+        assert_eq!(entries[0].http_status, Some(200));
+        assert_eq!(
+            entries[0].upstream_url.as_deref(),
+            Some("https://cache.example.test/nix-cache-info")
+        );
+        assert_eq!(entries[0].upstream_status, Some(200));
+        assert_eq!(entries[0].response_bytes, Some(48));
+        assert_eq!(entries[0].error, None);
+    }
+
+    #[test]
+    fn nix_cache_deny_request_roundtrips_without_upstream() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+        let request_id = RequestId::new();
+        let decision = NixCacheAuditDecision::Deny {
+            reason: "missing credentials".into(),
+        };
+
+        record_nix_cache_request(
+            &log,
+            request_id,
+            s.session_id,
+            &decision,
+            NixCacheAuditRoute::Unsupported,
+        )
+        .unwrap();
+        log.record_nix_cache_outcome(&NixCacheOutcomeRecord {
+            request_id,
+            completed_at: UnixMillis::from_millis(1_700_000_101),
+            http_status: 401,
+            upstream_url: None,
+            upstream_status: None,
+            response_bytes: 25,
+            error: None,
+        })
+        .unwrap();
+
+        let entries = log
+            .list_nix_cache_requests_for_session(s.session_id)
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].decision, decision);
+        assert_eq!(entries[0].route, NixCacheAuditRoute::Unsupported);
+        assert_eq!(entries[0].http_status, Some(401));
+        assert_eq!(entries[0].upstream_url, None);
+        assert_eq!(entries[0].upstream_status, None);
+    }
+
+    #[test]
+    fn nix_cache_nar_request_route_roundtrips() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+        let request_id = RequestId::new();
+
+        record_nix_cache_request(
+            &log,
+            request_id,
+            s.session_id,
+            &NixCacheAuditDecision::Allow,
+            NixCacheAuditRoute::Nar,
+        )
+        .unwrap();
+        log.record_nix_cache_outcome(&NixCacheOutcomeRecord {
+            request_id,
+            completed_at: UnixMillis::from_millis(1_700_000_130),
+            http_status: 200,
+            upstream_url: Some("https://cache.example.test/nar/proof.nar.xz"),
+            upstream_status: Some(200),
+            response_bytes: 8192,
+            error: None,
+        })
+        .unwrap();
+
+        let entries = log
+            .list_nix_cache_requests_for_session(s.session_id)
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].route, NixCacheAuditRoute::Nar);
+        assert_eq!(entries[0].http_status, Some(200));
+        assert_eq!(entries[0].response_bytes, Some(8192));
+    }
+
+    #[test]
+    fn nix_cache_request_rejects_closed_or_missing_session() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+        log.close_session(s.session_id, UnixMillis::from_millis(1_700_000_050))
+            .unwrap();
+
+        let closed = record_nix_cache_request(
+            &log,
+            RequestId::new(),
+            s.session_id,
+            &NixCacheAuditDecision::Allow,
+            NixCacheAuditRoute::CacheInfo,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(closed, AuditError::Invariant("session is closed")),
+            "got: {closed:?}"
+        );
+
+        let missing = record_nix_cache_request(
+            &log,
+            RequestId::new(),
+            SessionId::new(),
+            &NixCacheAuditDecision::Allow,
+            NixCacheAuditRoute::CacheInfo,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(missing, AuditError::Invariant("session does not exist")),
+            "got: {missing:?}"
+        );
+    }
+
+    #[test]
+    fn nix_cache_outcome_without_request_is_rejected() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let err = log
+            .record_nix_cache_outcome(&NixCacheOutcomeRecord {
+                request_id: RequestId::new(),
+                completed_at: UnixMillis::from_millis(1),
+                http_status: 502,
+                upstream_url: Some("https://cache.example.test/nix-cache-info"),
+                upstream_status: None,
+                response_bytes: 0,
+                error: Some("upstream request failed"),
+            })
+            .unwrap_err();
+        let AuditError::Sqlite(e) = err else {
+            panic!("expected sqlite FK error, got: {err:?}");
+        };
+        assert!(
+            e.to_string().to_lowercase().contains("foreign key"),
+            "expected FK violation, got: {e}"
+        );
+    }
+}
