@@ -20,10 +20,7 @@ pub use claude_proxy::{
     DEFAULT_CLAUDE_ANTHROPIC_VERSION, VmHttpClaudeProxyAuthKind, VmHttpClaudeProxyConfig,
     VmHttpClaudeProxyConfigError, VmHttpClaudeProxyService,
 };
-use claude_proxy::{
-    classify_claude_proxy_target, is_claude_proxy_target, record_claude_proxy_local_response,
-    route_claude_proxy_request,
-};
+use claude_proxy::{record_claude_proxy_local_response, route_claude_proxy_request};
 pub use git_clone::{VmHttpGitCloneConfig, VmHttpGitCloneService};
 use git_clone::{is_git_clone_target, route_git_clone_request};
 #[cfg(test)]
@@ -37,11 +34,8 @@ pub use openai_proxy::{
     VmHttpOpenAiProxyAuthKind, VmHttpOpenAiProxyConfig, VmHttpOpenAiProxyConfigError,
     VmHttpOpenAiProxyService,
 };
-use openai_proxy::{
-    classify_openai_proxy_target, is_openai_proxy_target, record_openai_proxy_local_response,
-    route_openai_proxy_request,
-};
-use proxy_common::{ClaudeAudit, OpenAiAudit, ProxyStream};
+use openai_proxy::{record_openai_proxy_local_response, route_openai_proxy_request};
+use proxy_common::{ClaudeBackend, OpenAiBackend, ProxyBackend, ProxyStream};
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -264,8 +258,8 @@ enum VmHttpAuthScheme {
 
 enum VmHttpDispatch {
     Buffered(VmHttpResponse),
-    ClaudeProxyStream(ProxyStream<ClaudeAudit>),
-    OpenAiProxyStream(ProxyStream<OpenAiAudit>),
+    ClaudeProxyStream(ProxyStream<ClaudeBackend>),
+    OpenAiProxyStream(ProxyStream<OpenAiBackend>),
 }
 
 impl VmHttpSession {
@@ -1026,7 +1020,7 @@ where
                         None,
                     )
                     .into()
-                } else if let Some(route) = classify_claude_proxy_target(&request.target)
+                } else if let Some(route) = ClaudeBackend::classify_proxy_target(&request.target)
                     && let Some(service) = services.claude_proxy.as_ref()
                 {
                     record_claude_proxy_local_response(
@@ -1041,7 +1035,7 @@ where
                         None,
                     )
                     .into()
-                } else if let Some(route) = classify_openai_proxy_target(&request.target)
+                } else if let Some(route) = OpenAiBackend::classify_proxy_target(&request.target)
                     && let Some(service) = services.openai_proxy.as_ref()
                 {
                     record_openai_proxy_local_response(
@@ -1151,13 +1145,13 @@ fn route_request_body_limit<S: SecretStore>(
     if is_nix_cache_target(&request.target) {
         return None;
     }
-    if is_claude_proxy_target(&request.target) {
+    if ClaudeBackend::is_proxy_target(&request.target) {
         return services
             .claude_proxy
             .as_ref()
             .map(|service| service.config.max_request_bytes());
     }
-    if is_openai_proxy_target(&request.target) {
+    if OpenAiBackend::is_proxy_target(&request.target) {
         return services
             .openai_proxy
             .as_ref()
@@ -1191,14 +1185,14 @@ where
         return route_nix_cache_request(session, request, services.nix_cache).await;
     }
 
-    if is_claude_proxy_target(&request.target) {
+    if ClaudeBackend::is_proxy_target(&request.target) {
         let Some(service) = services.claude_proxy else {
             return VmHttpResponse::text(VmHttpStatus::NotFound, "not found").into();
         };
         return route_claude_proxy_request(session, request, body, &service).await;
     }
 
-    if is_openai_proxy_target(&request.target) {
+    if OpenAiBackend::is_proxy_target(&request.target) {
         let Some(service) = services.openai_proxy else {
             return VmHttpResponse::text(VmHttpStatus::NotFound, "not found").into();
         };

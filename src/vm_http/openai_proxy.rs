@@ -21,9 +21,9 @@ use crate::secret::{SecretKey, SecretStore};
 use crate::server::BrokerState;
 
 use super::proxy_common::{
-    OpenAiAudit, ProxyFetch, ProxyForwardHeader, ProxyStream, UpstreamAuth, is_proxy_id_byte,
-    proxy_request_wants_streaming, proxy_response_content_type, proxy_target_path,
-    read_upstream_body_bounded,
+    OpenAiBackend, ProxyBackend, ProxyFetch, ProxyForwardHeader, ProxyStream, UpstreamAuth,
+    is_proxy_id_byte, proxy_request_wants_streaming, proxy_response_content_type,
+    proxy_target_path, read_upstream_body_bounded,
 };
 use super::{
     VmHttpDispatch, VmHttpHeader, VmHttpRequest, VmHttpResponse, VmHttpResponseHeader,
@@ -192,7 +192,7 @@ impl<S: SecretStore> VmHttpOpenAiProxyService<S> {
         body: Vec<u8>,
         headers: Vec<ProxyForwardHeader>,
     ) -> Result<(String, reqwest::RequestBuilder), Box<ProxyFetch>> {
-        let Some(route) = classify_openai_proxy_target(&request.target) else {
+        let Some(route) = OpenAiBackend::classify_proxy_target(&request.target) else {
             let response = VmHttpResponse::text(VmHttpStatus::NotFound, "not found");
             return Err(Box::new(ProxyFetch {
                 response_bytes: response.body.len() as u64,
@@ -299,7 +299,7 @@ impl<S: SecretStore> VmHttpOpenAiProxyService<S> {
         request: &VmHttpRequest,
         body: Vec<u8>,
         headers: Vec<ProxyForwardHeader>,
-    ) -> Result<ProxyStream<OpenAiAudit>, ProxyFetch> {
+    ) -> Result<ProxyStream<OpenAiBackend>, ProxyFetch> {
         let (upstream_url, builder) = self
             .upstream_request_builder(request, body, headers)
             .await
@@ -515,32 +515,95 @@ impl VmHttpOpenAiProxyConfig {
     }
 }
 
-pub(super) fn is_openai_proxy_target(target: &str) -> bool {
-    classify_openai_proxy_target(target).is_some()
-}
+impl ProxyBackend for OpenAiBackend {
+    type Route = OpenAiProxyAuditRoute;
+    type AuthKind = VmHttpOpenAiProxyAuthKind;
 
-pub(super) fn classify_openai_proxy_target(target: &str) -> Option<OpenAiProxyAuditRoute> {
-    // Match on the path only. The OpenAI clients pass through query params
-    // such as `?include[]=...` on Responses; the broker drops them and
-    // forwards a path-only request upstream so the guest can't expand the
-    // surface area beyond what the broker has explicitly classified.
-    let path = proxy_target_path(target);
-    if path == VM_OPENAI_RESPONSES_PATH {
-        return Some(OpenAiProxyAuditRoute::Responses);
+    fn classify_proxy_target(target: &str) -> Option<OpenAiProxyAuditRoute> {
+        // Match on the path only. The OpenAI clients pass through query
+        // params such as `?include[]=...` on Responses; the broker drops
+        // them and forwards a path-only request upstream so the guest
+        // can't expand the surface area beyond what the broker has
+        // explicitly classified.
+        let path = proxy_target_path(target);
+        if path == VM_OPENAI_RESPONSES_PATH {
+            return Some(OpenAiProxyAuditRoute::Responses);
+        }
+        if path == VM_OPENAI_MODELS_PATH {
+            return Some(OpenAiProxyAuditRoute::Models);
+        }
+        if openai_proxy_response_cancel_id(path).is_some() {
+            return Some(OpenAiProxyAuditRoute::ResponseCancel);
+        }
+        if openai_proxy_model_id(path).is_some() {
+            return Some(OpenAiProxyAuditRoute::Models);
+        }
+        if path.starts_with(VM_OPENAI_RESPONSES_PREFIX) || path.starts_with(VM_OPENAI_MODELS_PREFIX)
+        {
+            return Some(OpenAiProxyAuditRoute::Unsupported);
+        }
+        None
     }
-    if path == VM_OPENAI_MODELS_PATH {
-        return Some(OpenAiProxyAuditRoute::Models);
+
+    fn forward_header_name(
+        raw: &str,
+        _auth_kind: VmHttpOpenAiProxyAuthKind,
+    ) -> Option<reqwest::header::HeaderName> {
+        // Allowlist only. Anything that influences upstream auth, billing
+        // scope, or feature flags is dropped: `Authorization` is injected
+        // by the broker, and `OpenAI-Organization`/`OpenAI-Project` are
+        // dropped because a host secret with multi-org/-project access
+        // would otherwise let the guest pick the upstream scope. If the
+        // broker ever needs to pin one, it must come from host config and
+        // be injected host-side.
+        if raw.eq_ignore_ascii_case("content-type") {
+            return Some(reqwest::header::CONTENT_TYPE);
+        }
+        if raw.eq_ignore_ascii_case("accept") {
+            return Some(reqwest::header::ACCEPT);
+        }
+        if raw.eq_ignore_ascii_case("user-agent") {
+            return Some(reqwest::header::USER_AGENT);
+        }
+        None
     }
-    if openai_proxy_response_cancel_id(path).is_some() {
-        return Some(OpenAiProxyAuditRoute::ResponseCancel);
+
+    fn response_header_name(raw: &str) -> Option<&'static str> {
+        if raw.eq_ignore_ascii_case("openai-version") {
+            return Some("Openai-Version");
+        }
+        if raw.eq_ignore_ascii_case("openai-organization") {
+            return Some("Openai-Organization");
+        }
+        if raw.eq_ignore_ascii_case("openai-processing-ms") {
+            return Some("Openai-Processing-Ms");
+        }
+        if raw.eq_ignore_ascii_case("x-request-id") {
+            return Some("X-Request-Id");
+        }
+        if raw.eq_ignore_ascii_case("retry-after") {
+            return Some("Retry-After");
+        }
+        if raw.eq_ignore_ascii_case("x-ratelimit-limit-requests") {
+            return Some("X-Ratelimit-Limit-Requests");
+        }
+        if raw.eq_ignore_ascii_case("x-ratelimit-limit-tokens") {
+            return Some("X-Ratelimit-Limit-Tokens");
+        }
+        if raw.eq_ignore_ascii_case("x-ratelimit-remaining-requests") {
+            return Some("X-Ratelimit-Remaining-Requests");
+        }
+        if raw.eq_ignore_ascii_case("x-ratelimit-remaining-tokens") {
+            return Some("X-Ratelimit-Remaining-Tokens");
+        }
+        if raw.eq_ignore_ascii_case("x-ratelimit-reset-requests") {
+            return Some("X-Ratelimit-Reset-Requests");
+        }
+        if raw.eq_ignore_ascii_case("x-ratelimit-reset-tokens") {
+            return Some("X-Ratelimit-Reset-Tokens");
+        }
+        None
     }
-    if openai_proxy_model_id(path).is_some() {
-        return Some(OpenAiProxyAuditRoute::Models);
-    }
-    if path.starts_with(VM_OPENAI_RESPONSES_PREFIX) || path.starts_with(VM_OPENAI_MODELS_PREFIX) {
-        return Some(OpenAiProxyAuditRoute::Unsupported);
-    }
-    None
 }
 
 fn openai_proxy_model_id(path: &str) -> Option<&str> {
@@ -570,7 +633,7 @@ fn openai_proxy_forward_headers(
     let mut saw_user_agent = false;
 
     for header in headers {
-        let Some(name) = openai_proxy_forward_header_name(&header.name, auth_kind) else {
+        let Some(name) = OpenAiBackend::forward_header_name(&header.name, auth_kind) else {
             continue;
         };
         let duplicate = if name == reqwest::header::CONTENT_TYPE {
@@ -592,34 +655,12 @@ fn openai_proxy_forward_headers(
     Ok(forwarded)
 }
 
-fn openai_proxy_forward_header_name(
-    raw: &str,
-    _auth_kind: VmHttpOpenAiProxyAuthKind,
-) -> Option<reqwest::header::HeaderName> {
-    // Allowlist only. Anything that influences upstream auth, billing scope,
-    // or feature flags is dropped: `Authorization` is injected by the broker,
-    // and `OpenAI-Organization`/`OpenAI-Project` are dropped because a host
-    // secret with multi-org/-project access would otherwise let the guest
-    // pick the upstream scope. If the broker ever needs to pin one, it must
-    // come from host config and be injected host-side.
-    if raw.eq_ignore_ascii_case("content-type") {
-        return Some(reqwest::header::CONTENT_TYPE);
-    }
-    if raw.eq_ignore_ascii_case("accept") {
-        return Some(reqwest::header::ACCEPT);
-    }
-    if raw.eq_ignore_ascii_case("user-agent") {
-        return Some(reqwest::header::USER_AGENT);
-    }
-    None
-}
-
 fn openai_proxy_response_headers(
     headers: &reqwest::header::HeaderMap,
 ) -> Vec<VmHttpResponseHeader> {
     let mut out = Vec::new();
     for (name, value) in headers {
-        let Some(forward_name) = openai_proxy_response_header_name(name.as_str()) else {
+        let Some(forward_name) = OpenAiBackend::response_header_name(name.as_str()) else {
             continue;
         };
         let Ok(value) = value.to_str() else {
@@ -633,50 +674,13 @@ fn openai_proxy_response_headers(
     out
 }
 
-fn openai_proxy_response_header_name(raw: &str) -> Option<&'static str> {
-    if raw.eq_ignore_ascii_case("openai-version") {
-        return Some("Openai-Version");
-    }
-    if raw.eq_ignore_ascii_case("openai-organization") {
-        return Some("Openai-Organization");
-    }
-    if raw.eq_ignore_ascii_case("openai-processing-ms") {
-        return Some("Openai-Processing-Ms");
-    }
-    if raw.eq_ignore_ascii_case("x-request-id") {
-        return Some("X-Request-Id");
-    }
-    if raw.eq_ignore_ascii_case("retry-after") {
-        return Some("Retry-After");
-    }
-    if raw.eq_ignore_ascii_case("x-ratelimit-limit-requests") {
-        return Some("X-Ratelimit-Limit-Requests");
-    }
-    if raw.eq_ignore_ascii_case("x-ratelimit-limit-tokens") {
-        return Some("X-Ratelimit-Limit-Tokens");
-    }
-    if raw.eq_ignore_ascii_case("x-ratelimit-remaining-requests") {
-        return Some("X-Ratelimit-Remaining-Requests");
-    }
-    if raw.eq_ignore_ascii_case("x-ratelimit-remaining-tokens") {
-        return Some("X-Ratelimit-Remaining-Tokens");
-    }
-    if raw.eq_ignore_ascii_case("x-ratelimit-reset-requests") {
-        return Some("X-Ratelimit-Reset-Requests");
-    }
-    if raw.eq_ignore_ascii_case("x-ratelimit-reset-tokens") {
-        return Some("X-Ratelimit-Reset-Tokens");
-    }
-    None
-}
-
 pub(super) async fn route_openai_proxy_request<S: SecretStore>(
     session: &VmHttpSession,
     request: &VmHttpRequest,
     body: Vec<u8>,
     service: &VmHttpOpenAiProxyService<S>,
 ) -> VmHttpDispatch {
-    let route = classify_openai_proxy_target(&request.target)
+    let route = OpenAiBackend::classify_proxy_target(&request.target)
         .expect("caller only routes classified OpenAI proxy targets");
     if route == OpenAiProxyAuditRoute::Unsupported {
         let response = VmHttpResponse::text(VmHttpStatus::NotFound, "not found");
@@ -884,19 +888,19 @@ mod tests {
     #[test]
     fn classify_openai_proxy_target_recognizes_supported_routes() {
         assert_eq!(
-            classify_openai_proxy_target("/v1/responses"),
+            OpenAiBackend::classify_proxy_target("/v1/responses"),
             Some(OpenAiProxyAuditRoute::Responses),
         );
         assert_eq!(
-            classify_openai_proxy_target("/v1/responses/resp_abc123/cancel"),
+            OpenAiBackend::classify_proxy_target("/v1/responses/resp_abc123/cancel"),
             Some(OpenAiProxyAuditRoute::ResponseCancel),
         );
         assert_eq!(
-            classify_openai_proxy_target("/v1/models"),
+            OpenAiBackend::classify_proxy_target("/v1/models"),
             Some(OpenAiProxyAuditRoute::Models),
         );
         assert_eq!(
-            classify_openai_proxy_target("/v1/models/gpt-5"),
+            OpenAiBackend::classify_proxy_target("/v1/models/gpt-5"),
             Some(OpenAiProxyAuditRoute::Models),
         );
     }
@@ -904,51 +908,54 @@ mod tests {
     #[test]
     fn classify_openai_proxy_target_treats_unsupported_subpaths_as_unsupported() {
         assert_eq!(
-            classify_openai_proxy_target("/v1/responses/resp_abc123"),
+            OpenAiBackend::classify_proxy_target("/v1/responses/resp_abc123"),
             Some(OpenAiProxyAuditRoute::Unsupported),
         );
         assert_eq!(
-            classify_openai_proxy_target("/v1/responses/"),
+            OpenAiBackend::classify_proxy_target("/v1/responses/"),
             Some(OpenAiProxyAuditRoute::Unsupported),
         );
         assert_eq!(
-            classify_openai_proxy_target("/v1/responses/resp_abc/cancel/extra"),
+            OpenAiBackend::classify_proxy_target("/v1/responses/resp_abc/cancel/extra"),
             Some(OpenAiProxyAuditRoute::Unsupported),
         );
         assert_eq!(
-            classify_openai_proxy_target("/v1/models/"),
+            OpenAiBackend::classify_proxy_target("/v1/models/"),
             Some(OpenAiProxyAuditRoute::Unsupported),
         );
         assert_eq!(
-            classify_openai_proxy_target("/v1/models/foo/bar"),
+            OpenAiBackend::classify_proxy_target("/v1/models/foo/bar"),
             Some(OpenAiProxyAuditRoute::Unsupported),
         );
     }
 
     #[test]
     fn classify_openai_proxy_target_rejects_unrelated_paths() {
-        assert_eq!(classify_openai_proxy_target("/v1/chat/completions"), None);
-        assert_eq!(classify_openai_proxy_target("/v2/responses"), None);
-        assert_eq!(classify_openai_proxy_target("/health"), None);
-        assert_eq!(classify_openai_proxy_target(""), None);
+        assert_eq!(
+            OpenAiBackend::classify_proxy_target("/v1/chat/completions"),
+            None
+        );
+        assert_eq!(OpenAiBackend::classify_proxy_target("/v2/responses"), None);
+        assert_eq!(OpenAiBackend::classify_proxy_target("/health"), None);
+        assert_eq!(OpenAiBackend::classify_proxy_target(""), None);
     }
 
     #[test]
     fn classify_openai_proxy_target_strips_query_string() {
         assert_eq!(
-            classify_openai_proxy_target("/v1/responses?include%5B%5D=foo"),
+            OpenAiBackend::classify_proxy_target("/v1/responses?include%5B%5D=foo"),
             Some(OpenAiProxyAuditRoute::Responses),
         );
         assert_eq!(
-            classify_openai_proxy_target("/v1/responses/resp_abc/cancel?x=1"),
+            OpenAiBackend::classify_proxy_target("/v1/responses/resp_abc/cancel?x=1"),
             Some(OpenAiProxyAuditRoute::ResponseCancel),
         );
         assert_eq!(
-            classify_openai_proxy_target("/v1/models?x=1"),
+            OpenAiBackend::classify_proxy_target("/v1/models?x=1"),
             Some(OpenAiProxyAuditRoute::Models),
         );
         assert_eq!(
-            classify_openai_proxy_target("/v1/models/gpt-5?x=1"),
+            OpenAiBackend::classify_proxy_target("/v1/models/gpt-5?x=1"),
             Some(OpenAiProxyAuditRoute::Models),
         );
     }
@@ -1072,18 +1079,18 @@ mod tests {
     #[test]
     fn openai_proxy_response_header_name_allowlists_observability_headers() {
         assert_eq!(
-            openai_proxy_response_header_name("X-Request-Id"),
+            OpenAiBackend::response_header_name("X-Request-Id"),
             Some("X-Request-Id"),
         );
         assert_eq!(
-            openai_proxy_response_header_name("retry-after"),
+            OpenAiBackend::response_header_name("retry-after"),
             Some("Retry-After"),
         );
         assert_eq!(
-            openai_proxy_response_header_name("x-ratelimit-remaining-tokens"),
+            OpenAiBackend::response_header_name("x-ratelimit-remaining-tokens"),
             Some("X-Ratelimit-Remaining-Tokens"),
         );
-        assert_eq!(openai_proxy_response_header_name("set-cookie"), None);
+        assert_eq!(OpenAiBackend::response_header_name("set-cookie"), None);
     }
 
     #[test]
