@@ -2176,13 +2176,39 @@ pub fn start_managed_agent_vm_session(
     store: &AgentVmSessionStateStore,
     plan: &AgentVmSessionPlan,
 ) -> Result<AgentVmSessionState, AgentVmSessionManagerError> {
-    let _lock = store.lock_store()?;
-    let starting = store.create_starting_unlocked(plan)?;
+    let starting = claim_agent_vm_session_subnet(store, plan)?;
+    complete_agent_vm_session_start(store, plan, starting)
+}
+
+/// Reserve the subnet for a new session by writing a `Starting` state record.
+///
+/// Holds the state-store file lock only for the create step, so callers can
+/// serialise just the load+pick+commit window for subnet uniqueness without
+/// blocking the slow VM boot in [`complete_agent_vm_session_start`].
+pub fn claim_agent_vm_session_subnet(
+    store: &AgentVmSessionStateStore,
+    plan: &AgentVmSessionPlan,
+) -> Result<AgentVmSessionState, AgentVmSessionManagerError> {
+    Ok(store.create_starting(plan)?)
+}
+
+/// Boot the VM for a session whose subnet has already been claimed via
+/// [`claim_agent_vm_session_subnet`], then promote the state record to
+/// `Running`.
+///
+/// Runs the slow VM boot without holding the state-store file lock; only
+/// `mark_running` (or rollback `remove`) re-takes the lock for the brief
+/// status transition.
+pub fn complete_agent_vm_session_start(
+    store: &AgentVmSessionStateStore,
+    plan: &AgentVmSessionPlan,
+    starting: AgentVmSessionState,
+) -> Result<AgentVmSessionState, AgentVmSessionManagerError> {
     if let Err(start) = start_agent_vm_session(plan) {
         if start_failure_left_dirty_infrastructure(&start) {
             return Err(start.into());
         }
-        return match store.remove_unlocked(plan.session_id()) {
+        return match store.remove(plan.session_id()) {
             Ok(()) => Err(start.into()),
             Err(state) => Err(AgentVmSessionManagerError::StartStateCleanup {
                 start: Box::new(start),
@@ -2190,7 +2216,7 @@ pub fn start_managed_agent_vm_session(
             }),
         };
     }
-    store.mark_running_unlocked(&starting).map_err(|state| {
+    store.mark_running(&starting).map_err(|state| {
         AgentVmSessionManagerError::RunningStateUpdateAfterStart {
             state: Box::new(state),
         }
@@ -2206,22 +2232,23 @@ pub fn stop_managed_agent_vm_session(
     session_id: SessionId,
     tools: AgentVmToolPaths,
 ) -> Result<(), AgentVmSessionManagerError> {
-    let _lock = store.lock_store()?;
-    let state = store.load_unlocked(session_id)?;
+    let state = store.load(session_id)?;
     cleanup_managed_agent_vm_session_unlocked(&state, tools)?;
-    remove_managed_agent_vm_session_state_unlocked(store, session_id)
+    remove_managed_agent_vm_session_state(store, session_id)
 }
 
 /// Run VM, firewall, and network cleanup while preserving the persisted state
 /// record. The daemon uses this split form so audit close and VM HTTP shutdown
 /// can fail without losing the cleanup facts needed for a retry.
+///
+/// The state-store file lock is taken only for the brief `load`; the slow VM
+/// teardown runs unlocked so unrelated session lifecycles can proceed.
 pub fn cleanup_managed_agent_vm_session(
     store: &AgentVmSessionStateStore,
     session_id: SessionId,
     tools: AgentVmToolPaths,
 ) -> Result<(), AgentVmSessionManagerError> {
-    let _lock = store.lock_store()?;
-    let state = store.load_unlocked(session_id)?;
+    let state = store.load(session_id)?;
     cleanup_managed_agent_vm_session_unlocked(&state, tools)
 }
 
@@ -2231,8 +2258,11 @@ pub fn remove_managed_agent_vm_session_state(
     store: &AgentVmSessionStateStore,
     session_id: SessionId,
 ) -> Result<(), AgentVmSessionManagerError> {
-    let _lock = store.lock_store()?;
-    remove_managed_agent_vm_session_state_unlocked(store, session_id)
+    store.remove(session_id).map_err(|state| {
+        AgentVmSessionManagerError::StateRemoveAfterStop {
+            state: Box::new(state),
+        }
+    })
 }
 
 fn cleanup_managed_agent_vm_session_unlocked(
@@ -2249,17 +2279,6 @@ fn cleanup_managed_agent_vm_session_unlocked(
     }
     stop_agent_vm_session(&state.to_stop_plan(tools))?;
     Ok(())
-}
-
-fn remove_managed_agent_vm_session_state_unlocked(
-    store: &AgentVmSessionStateStore,
-    session_id: SessionId,
-) -> Result<(), AgentVmSessionManagerError> {
-    store.remove_unlocked(session_id).map_err(|state| {
-        AgentVmSessionManagerError::StateRemoveAfterStop {
-            state: Box::new(state),
-        }
-    })
 }
 
 pub fn default_agent_vm_state_dir() -> Result<PathBuf, AgentVmStateDirError> {
