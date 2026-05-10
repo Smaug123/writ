@@ -16,7 +16,7 @@ use crate::secret::{SecretKey, SecretStore};
 use crate::server::BrokerState;
 
 use super::proxy_common::{
-    ProxyAuditKind, ProxyFetch, ProxyForwardHeader, ProxyStream, is_proxy_id_byte,
+    ProxyAuditKind, ProxyFetch, ProxyForwardHeader, ProxyStream, UpstreamAuth, is_proxy_id_byte,
     proxy_request_wants_streaming, proxy_response_content_type, proxy_target_path,
     read_upstream_body_bounded,
 };
@@ -29,7 +29,6 @@ pub(super) const VM_CLAUDE_MESSAGES_PATH: &str = "/v1/messages";
 pub(super) const VM_CLAUDE_COUNT_TOKENS_PATH: &str = "/v1/messages/count_tokens";
 pub(super) const VM_CLAUDE_MODELS_PREFIX: &str = "/v1/models/";
 pub const DEFAULT_CLAUDE_ANTHROPIC_VERSION: &str = "2023-06-01";
-const ANTHROPIC_OAUTH_BETA_HEADER_VALUE: &str = "oauth-2025-04-20";
 
 pub struct VmHttpClaudeProxyService<S: SecretStore> {
     broker_state: Arc<BrokerState<S>>,
@@ -126,36 +125,10 @@ impl<S: SecretStore> VmHttpClaudeProxyService<S> {
             }));
         };
         let upstream_url = url.to_string();
-        let secret = match self
-            .broker_state
-            .secret_store()
-            .get(self.config.auth_secret())
-        {
-            Ok(Some(secret)) if !secret.is_empty() => secret,
-            Ok(_) => {
-                let response =
-                    VmHttpResponse::text(VmHttpStatus::BadGateway, "Claude proxy auth missing");
-                return Err(Box::new(ProxyFetch {
-                    response_bytes: response.body.len() as u64,
-                    response,
-                    upstream_url: Some(upstream_url),
-                    upstream_status: None,
-                    error: Some("upstream auth missing"),
-                }));
-            }
-            Err(err) => {
-                eprintln!("VM HTTP Claude proxy auth secret load failed: {err}");
-                let response =
-                    VmHttpResponse::text(VmHttpStatus::BadGateway, "Claude proxy auth failed");
-                return Err(Box::new(ProxyFetch {
-                    response_bytes: response.body.len() as u64,
-                    response,
-                    upstream_url: Some(upstream_url),
-                    upstream_status: None,
-                    error: Some("upstream auth load failed"),
-                }));
-            }
-        };
+        let upstream_auth = self.resolve_upstream_auth().map_err(|mut fetch| {
+            fetch.upstream_url = Some(upstream_url.clone());
+            fetch
+        })?;
 
         let mut builder = self.client.request(claude_proxy_route_method(route), url);
         if !body.is_empty() {
@@ -164,14 +137,36 @@ impl<S: SecretStore> VmHttpClaudeProxyService<S> {
         for header in headers {
             builder = builder.header(header.name, header.value);
         }
-        builder = match self.config.auth_kind() {
-            VmHttpClaudeProxyAuthKind::XApiKey => builder.header("x-api-key", secret),
-            VmHttpClaudeProxyAuthKind::AuthorizationBearer => builder.bearer_auth(secret),
-            VmHttpClaudeProxyAuthKind::OAuth => builder
-                .bearer_auth(secret)
-                .header("anthropic-beta", ANTHROPIC_OAUTH_BETA_HEADER_VALUE),
-        };
+        builder = upstream_auth.apply_to(builder);
         Ok((upstream_url, builder))
+    }
+
+    fn resolve_upstream_auth(&self) -> Result<UpstreamAuth, Box<ProxyFetch>> {
+        let secret = match self
+            .broker_state
+            .secret_store()
+            .get(self.config.auth_secret())
+        {
+            Ok(Some(secret)) if !secret.is_empty() => secret,
+            Ok(_) => {
+                return Err(Box::new(claude_proxy_auth_failure(
+                    "Claude proxy auth missing",
+                    "upstream auth missing",
+                )));
+            }
+            Err(err) => {
+                eprintln!("VM HTTP Claude proxy auth secret load failed: {err}");
+                return Err(Box::new(claude_proxy_auth_failure(
+                    "Claude proxy auth failed",
+                    "upstream auth load failed",
+                )));
+            }
+        };
+        Ok(match self.config.auth_kind() {
+            VmHttpClaudeProxyAuthKind::XApiKey => UpstreamAuth::XApiKey(secret),
+            VmHttpClaudeProxyAuthKind::AuthorizationBearer => UpstreamAuth::Bearer(secret),
+            VmHttpClaudeProxyAuthKind::OAuth => UpstreamAuth::AnthropicOauth(secret),
+        })
     }
 
     async fn fetch(
@@ -313,6 +308,17 @@ impl<S: SecretStore> Clone for VmHttpClaudeProxyService<S> {
             config: self.config.clone(),
             client: self.client.clone(),
         }
+    }
+}
+
+fn claude_proxy_auth_failure(body: &'static str, label: &'static str) -> ProxyFetch {
+    let response = VmHttpResponse::text(VmHttpStatus::BadGateway, body);
+    ProxyFetch {
+        response_bytes: response.body.len() as u64,
+        response,
+        upstream_url: None,
+        upstream_status: None,
+        error: Some(label),
     }
 }
 

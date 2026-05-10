@@ -14,13 +14,13 @@ use crate::audit::{
 use crate::core::{RequestId, UnixMillis};
 use crate::openai_chatgpt_auth::{
     CHATGPT_OAUTH_REFRESH_LEEWAY_SECONDS, CHATGPT_OAUTH_REFRESH_URL, ChatgptOauthAuthority,
-    ChatgptOauthAuthorityConfig, ChatgptOauthError, ChatgptUpstreamHeaders, SystemClock,
+    ChatgptOauthAuthorityConfig, ChatgptOauthError, SystemClock,
 };
 use crate::secret::{SecretKey, SecretStore};
 use crate::server::BrokerState;
 
 use super::proxy_common::{
-    ProxyAuditKind, ProxyFetch, ProxyForwardHeader, ProxyStream, is_proxy_id_byte,
+    ProxyAuditKind, ProxyFetch, ProxyForwardHeader, ProxyStream, UpstreamAuth, is_proxy_id_byte,
     proxy_request_wants_streaming, proxy_response_content_type, proxy_target_path,
     read_upstream_body_bounded,
 };
@@ -96,36 +96,6 @@ pub enum VmHttpOpenAiProxyConfigError {
     InvalidChatgptRefreshUrl { raw: String, message: String },
     #[error("OpenAI proxy ChatGPT refresh URL {raw:?} uses unsupported scheme {scheme:?}")]
     UnsupportedChatgptRefreshScheme { raw: String, scheme: String },
-}
-
-/// Resolved upstream authentication for a single OpenAI proxy request.
-///
-/// We resolve into a small enum so the request builder applies the
-/// scheme-specific headers in one place. The `Bearer` variant matches a
-/// static API key; the `ChatgptOauth` variant carries the freshly
-/// rotated access token plus the ChatGPT-specific response headers
-/// (`ChatGPT-Account-ID`, optional `X-OpenAI-Fedramp`).
-enum UpstreamAuth {
-    Bearer(String),
-    ChatgptOauth(ChatgptUpstreamHeaders),
-}
-
-impl UpstreamAuth {
-    fn apply_to(self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        match self {
-            UpstreamAuth::Bearer(secret) => builder.bearer_auth(secret),
-            UpstreamAuth::ChatgptOauth(headers) => {
-                let mut builder = builder.bearer_auth(headers.access_token);
-                if let Some(account_id) = headers.account_id {
-                    builder = builder.header("ChatGPT-Account-ID", account_id);
-                }
-                if headers.is_fedramp_account {
-                    builder = builder.header("X-OpenAI-Fedramp", "true");
-                }
-                builder
-            }
-        }
-    }
 }
 
 impl<S: SecretStore> VmHttpOpenAiProxyService<S> {
