@@ -22,6 +22,7 @@ use crate::github::GitHubAppConfig;
 use crate::nix_cache::{NixTrustedPublicKeys, NixTrustedPublicKeysError};
 use crate::policy::PolicyConfig;
 use crate::secret::SecretKey;
+use crate::vm_git::{VmGitPushBodyLimits, VmGitPushBodyLimitsError};
 use crate::vm_git_bundle::{
     DEFAULT_GIT_CLONE_BASE_URL, GitCloneBaseUrl, GitCloneBundlePlanError, GitCredentialBoundary,
     GitSecretEnvVar, GitSecretEnvVarError,
@@ -138,6 +139,14 @@ pub struct AgentVmHttpConfig {
     pub openai_proxy: Option<AgentVmHttpOpenAiProxyConfig>,
     #[serde(default)]
     pub agent_run_log_root: Option<PathBuf>,
+    #[serde(default)]
+    pub git_push_staging_root: Option<PathBuf>,
+    #[serde(default = "default_git_push_max_body_bytes")]
+    pub git_push_max_body_bytes: usize,
+    #[serde(default = "default_git_push_max_metadata_bytes")]
+    pub git_push_max_metadata_bytes: usize,
+    #[serde(default = "default_git_push_max_bundle_bytes")]
+    pub git_push_max_bundle_bytes: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -206,6 +215,22 @@ pub enum AgentVmHttpConfigError {
     },
     #[error("agent run log root {path:?} is not writable: {source}")]
     AgentRunLogRootProbe {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    #[error(transparent)]
+    GitPushBodyLimits(#[from] VmGitPushBodyLimitsError),
+    #[error("git push staging root path must not be empty")]
+    EmptyGitPushStagingRoot,
+    #[error("git push staging root path must be absolute: {0:?}")]
+    RelativeGitPushStagingRoot(PathBuf),
+    #[error("git push staging root {path:?} could not be created: {source}")]
+    GitPushStagingRootCreate {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    #[error("git push staging root {path:?} is not writable: {source}")]
+    GitPushStagingRootProbe {
         path: PathBuf,
         source: std::io::Error,
     },
@@ -309,6 +334,16 @@ impl AgentVmHttpConfig {
             None => self.work_root.join("agent-runs"),
         };
         let agent_run_log_root = validate_agent_run_log_root(agent_run_log_root)?;
+        let git_push_staging_root = match &self.git_push_staging_root {
+            Some(path) => path.clone(),
+            None => self.work_root.join("git-push-staging"),
+        };
+        let git_push_staging_root = validate_git_push_staging_root(git_push_staging_root)?;
+        let git_push_body_limits = VmGitPushBodyLimits::new(
+            self.git_push_max_body_bytes,
+            self.git_push_max_metadata_bytes,
+            self.git_push_max_bundle_bytes,
+        )?;
         Ok(VmHttpRuntimeConfig::new_with_proxies(
             self.bind_addr,
             broker_port_range,
@@ -317,6 +352,8 @@ impl AgentVmHttpConfig {
             claude_proxy,
             openai_proxy,
             agent_run_log_root,
+            git_push_staging_root,
+            git_push_body_limits,
         ))
     }
 }
@@ -389,6 +426,62 @@ fn validate_agent_run_log_root(path: PathBuf) -> Result<PathBuf, AgentVmHttpConf
         }
     })?;
     Ok(path)
+}
+
+fn validate_git_push_staging_root(path: PathBuf) -> Result<PathBuf, AgentVmHttpConfigError> {
+    if path.as_os_str().is_empty() {
+        return Err(AgentVmHttpConfigError::EmptyGitPushStagingRoot);
+    }
+    if !path.is_absolute() {
+        return Err(AgentVmHttpConfigError::RelativeGitPushStagingRoot(path));
+    }
+    std::fs::create_dir_all(&path).map_err(|source| {
+        AgentVmHttpConfigError::GitPushStagingRootCreate {
+            path: path.clone(),
+            source,
+        }
+    })?;
+    let probe = path.join(format!(
+        ".writ-git-push-staging-probe-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+        .and_then(|mut file| {
+            use std::io::Write as _;
+            file.write_all(b"probe")?;
+            file.sync_all()
+        })
+        .map_err(|source| AgentVmHttpConfigError::GitPushStagingRootProbe {
+            path: path.clone(),
+            source,
+        })?;
+    std::fs::remove_file(&probe).map_err(|source| {
+        AgentVmHttpConfigError::GitPushStagingRootProbe {
+            path: path.clone(),
+            source,
+        }
+    })?;
+    Ok(path)
+}
+
+fn default_git_push_max_body_bytes() -> usize {
+    // 65 MiB: headroom over the bundle limit for metadata + framing overhead.
+    65 * 1024 * 1024
+}
+
+fn default_git_push_max_metadata_bytes() -> usize {
+    16 * 1024
+}
+
+fn default_git_push_max_bundle_bytes() -> usize {
+    64 * 1024 * 1024
 }
 
 fn default_claude_anthropic_version() -> String {
@@ -653,6 +746,7 @@ mod tests {
     fn parses_agent_vm_config_and_converts_to_runtime_config() {
         let work_root = unique_config_test_path("work-root");
         let agent_run_log_root = unique_config_test_path("agent-runs");
+        let git_push_staging_root = unique_config_test_path("git-push-staging");
         let mut json: serde_json::Value = serde_json::from_str(
             r#"{
             "github": {
@@ -710,6 +804,8 @@ mod tests {
             serde_json::Value::String(work_root.to_string_lossy().into_owned());
         json["agent_vm"]["vm_http"]["agent_run_log_root"] =
             serde_json::Value::String(agent_run_log_root.to_string_lossy().into_owned());
+        json["agent_vm"]["vm_http"]["git_push_staging_root"] =
+            serde_json::Value::String(git_push_staging_root.to_string_lossy().into_owned());
         let c: DaemonConfig = serde_json::from_value(json).unwrap();
         let agent_vm = c.agent_vm.unwrap();
 
@@ -750,6 +846,19 @@ mod tests {
         assert_eq!(claude_proxy.max_request_bytes(), 2_097_152);
         assert_eq!(claude_proxy.max_response_bytes(), 8_388_608);
         assert_eq!(runtime.vm_http().agent_run_log_root(), agent_run_log_root);
+        assert_eq!(
+            runtime.vm_http().git_push_staging_root(),
+            git_push_staging_root
+        );
+        assert_eq!(
+            runtime.vm_http().git_push_body_limits(),
+            VmGitPushBodyLimits::new(
+                default_git_push_max_body_bytes(),
+                default_git_push_max_metadata_bytes(),
+                default_git_push_max_bundle_bytes(),
+            )
+            .unwrap()
+        );
         assert_eq!(runtime.lifecycle().subnet_index_min(), 252);
         assert_eq!(runtime.lifecycle().subnet_index_max(), 253);
     }
@@ -853,6 +962,10 @@ mod tests {
             claude_proxy: None,
             openai_proxy: None,
             agent_run_log_root: None,
+            git_push_staging_root: None,
+            git_push_max_body_bytes: default_git_push_max_body_bytes(),
+            git_push_max_metadata_bytes: default_git_push_max_metadata_bytes(),
+            git_push_max_bundle_bytes: default_git_push_max_bundle_bytes(),
         }
     }
 
@@ -1150,6 +1263,63 @@ mod tests {
                 ..
             }) if failed == path
         ));
+    }
+
+    #[test]
+    fn agent_vm_http_config_rejects_relative_git_push_staging_root() {
+        let mut c = valid_agent_vm_http_config();
+        c.git_push_staging_root = Some(PathBuf::from("git-push-staging"));
+
+        assert!(matches!(
+            c.to_runtime_config(),
+            Err(AgentVmHttpConfigError::RelativeGitPushStagingRoot(path))
+                if path.as_os_str() == "git-push-staging"
+        ));
+    }
+
+    #[test]
+    fn agent_vm_http_config_rejects_unwritable_git_push_staging_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("not-a-directory");
+        std::fs::write(&path, b"file").unwrap();
+        let mut c = valid_agent_vm_http_config();
+        c.git_push_staging_root = Some(path.clone());
+
+        assert!(matches!(
+            c.to_runtime_config(),
+            Err(AgentVmHttpConfigError::GitPushStagingRootCreate {
+                path: failed,
+                ..
+            }) if failed == path
+        ));
+    }
+
+    #[test]
+    fn agent_vm_http_config_rejects_zero_git_push_body_limit() {
+        let mut c = valid_agent_vm_http_config();
+        c.git_push_max_metadata_bytes = 0;
+
+        assert!(matches!(
+            c.to_runtime_config(),
+            Err(AgentVmHttpConfigError::GitPushBodyLimits(
+                VmGitPushBodyLimitsError::EmptyMaxMetadataBytes
+            ))
+        ));
+    }
+
+    #[test]
+    fn agent_vm_http_config_defaults_git_push_staging_root_to_work_root_subdir() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut c = valid_agent_vm_http_config();
+        c.work_root = temp.path().to_path_buf();
+        c.git_push_staging_root = None;
+
+        let runtime = c.to_runtime_config().unwrap();
+
+        assert_eq!(
+            runtime.git_push_staging_root(),
+            temp.path().join("git-push-staging")
+        );
     }
 
     #[test]

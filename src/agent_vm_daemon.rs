@@ -27,6 +27,7 @@ use crate::core::{
     AgentKind, AgentNetwork, AgentNetworkPool, AgentVmConfigError, BrokerPorts, SessionId,
     SessionRecord, UnixMillis,
 };
+use crate::git_push_staging::GitPushStagingStore;
 use crate::process_spawn;
 use crate::protocol::AgentVmSessionInfo;
 use crate::secret::SecretStore;
@@ -37,7 +38,7 @@ use crate::vm_git::{
 };
 use crate::vm_http::{
     RunningVmHttpSession, VM_NIX_BASIC_LOGIN, VM_NIX_CACHE_PATH_PREFIX, VmHttpAgentRunService,
-    VmHttpRuntimeConfig, VmHttpRuntimeError, VmHttpRuntimeShutdownError,
+    VmHttpGitPushService, VmHttpRuntimeConfig, VmHttpRuntimeError, VmHttpRuntimeShutdownError,
     prepare_vm_http_session_with_agent_runs,
 };
 
@@ -312,6 +313,11 @@ pub enum AgentVmDaemonError {
     StopBothFailed {
         audit: Box<AuditError>,
         http: Box<VmHttpRuntimeShutdownError>,
+    },
+    #[error("could not open git push staging store at {path:?}: {source}")]
+    GitPushStagingOpen {
+        path: PathBuf,
+        source: std::io::Error,
     },
 }
 
@@ -717,13 +723,28 @@ impl AgentVmDaemon {
         let lifecycle = self.config.lifecycle.clone();
         let (subnet_index, network) =
             tokio::task::spawn_blocking(move || choose_subnet_index(&lifecycle)).await??;
+        let staging_root = self.config.vm_http.git_push_staging_root().to_path_buf();
+        let staging_store = {
+            let path = staging_root.clone();
+            tokio::task::spawn_blocking(move || GitPushStagingStore::open(path))
+                .await?
+                .map_err(|source| AgentVmDaemonError::GitPushStagingOpen {
+                    path: staging_root,
+                    source,
+                })?
+        };
+        let git_push = VmHttpGitPushService::new(
+            Arc::clone(&state),
+            Arc::new(staging_store),
+            self.config.vm_http.git_push_body_limits(),
+        );
         let prepared = prepare_vm_http_session_with_agent_runs(
             Arc::clone(&state),
             &self.config.vm_http,
             session_id,
             network.ipv4(),
             agent_runs,
-            None,
+            Some(git_push),
         )
         .await?;
         let broker_port = prepared.broker_port();
@@ -1036,6 +1057,7 @@ mod tests {
     use crate::nix_cache::NixTrustedPublicKeys;
     use crate::policy::PolicyConfig;
     use crate::secret::{SecretError, SecretKey};
+    use crate::vm_git::VmGitPushBodyLimits;
     use crate::vm_git_bundle::{GitCredentialBoundary, GitSecretEnvVar};
     use crate::vm_http::{VmHttpGitCloneConfig, VmHttpNixCacheConfig};
 
@@ -1284,6 +1306,9 @@ mod tests {
                     )
                     .unwrap(),
                     dir.join("agent-runs"),
+                    dir.join("git-push-staging"),
+                    VmGitPushBodyLimits::new(65 * 1024 * 1024, 16 * 1024, 64 * 1024 * 1024)
+                        .unwrap(),
                 ),
             )
             .unwrap(),
