@@ -13,7 +13,7 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
-use crate::core::{CapabilityRequest, GitHubAccess, GitHubRequest, RepoRef, RequestId};
+use crate::core::{CapabilityRequest, GitHubAccess, GitHubRequest, RepoRef, RequestId, UnixMillis};
 
 pub const VM_GIT_CLONE_PATH: &str = "/v1/git/clone";
 pub const VM_GIT_PUSH_PATH: &str = "/v1/git/push";
@@ -50,11 +50,19 @@ pub struct VmGitCloneRequest {
     git_ref: Option<GitCloneRef>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// Wire-validated push metadata. `expected_remote_head` is required to be
+/// present on the wire — see the manual `Deserialize` impl below — so that
+/// a stale or buggy client cannot drop the key and silently mean "branch
+/// creation". `None` is the honest representation of "the guest is
+/// creating a new branch": there is no upstream head to fast-forward
+/// from, and persisting that distinction is what lets the staging area
+/// separate genuine no-op pushes from branch-creation pushes during
+/// human review.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct VmGitPushMetadata {
     repo: GitCloneRepo,
     branch: GitBranchName,
-    expected_remote_head: GitObjectId,
+    expected_remote_head: Option<GitObjectId>,
     new_head: GitObjectId,
 }
 
@@ -95,13 +103,21 @@ pub struct VmGitPushErrorResponse {
     message: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct VmGitPushReceipt {
+/// Receipt returned to the guest after a push has been written to the host
+/// staging area. The broker does not contact GitHub during a VM-initiated
+/// push: the bundle and metadata sit on the host, awaiting human-driven
+/// promotion. The receipt therefore carries `staged_at` (the wall-clock
+/// time at which the staging entry was durable) rather than any GitHub-
+/// observed result; `expected_remote_head` is `None` exactly when the push
+/// is creating the branch.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct VmGitPushStagedReceipt {
     repo: GitCloneRepo,
     branch: GitBranchName,
-    old_head: GitObjectId,
+    expected_remote_head: Option<GitObjectId>,
     new_head: GitObjectId,
     push_request_id: RequestId,
+    staged_at: UnixMillis,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -264,7 +280,7 @@ impl VmGitPushMetadata {
     pub fn new(
         repo: GitCloneRepo,
         branch: GitBranchName,
-        expected_remote_head: GitObjectId,
+        expected_remote_head: Option<GitObjectId>,
         new_head: GitObjectId,
     ) -> Self {
         Self {
@@ -283,8 +299,8 @@ impl VmGitPushMetadata {
         &self.branch
     }
 
-    pub fn expected_remote_head(&self) -> &GitObjectId {
-        &self.expected_remote_head
+    pub fn expected_remote_head(&self) -> Option<&GitObjectId> {
+        self.expected_remote_head.as_ref()
     }
 
     pub fn new_head(&self) -> &GitObjectId {
@@ -295,6 +311,86 @@ impl VmGitPushMetadata {
         CapabilityRequest::GitHub(GitHubRequest::Contents {
             access: GitHubAccess::Write,
             repo: self.repo.as_repo_ref().clone(),
+        })
+    }
+}
+
+// Hand-rolled because serde's derive treats `Option<T>` fields as having
+// an implicit `None` default on missing keys, which would let a stale or
+// buggy client drop `expected_remote_head` and have it silently mean
+// "branch creation". Tracking key presence at the map level is the only
+// way to distinguish a present-and-null value from an absent key.
+impl<'de> Deserialize<'de> for VmGitPushMetadata {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_struct(
+            "VmGitPushMetadata",
+            VM_GIT_PUSH_METADATA_FIELDS,
+            VmGitPushMetadataVisitor,
+        )
+    }
+}
+
+const VM_GIT_PUSH_METADATA_FIELDS: &[&str] =
+    &["repo", "branch", "expected_remote_head", "new_head"];
+
+#[derive(Deserialize)]
+#[serde(field_identifier, rename_all = "snake_case")]
+enum VmGitPushMetadataField {
+    Repo,
+    Branch,
+    ExpectedRemoteHead,
+    NewHead,
+}
+
+struct VmGitPushMetadataVisitor;
+
+impl<'de> serde::de::Visitor<'de> for VmGitPushMetadataVisitor {
+    type Value = VmGitPushMetadata;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("struct VmGitPushMetadata")
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+        use serde::de::Error;
+        let mut repo: Option<GitCloneRepo> = None;
+        let mut branch: Option<GitBranchName> = None;
+        let mut expected_remote_head: Option<Option<GitObjectId>> = None;
+        let mut new_head: Option<GitObjectId> = None;
+        while let Some(key) = map.next_key::<VmGitPushMetadataField>()? {
+            match key {
+                VmGitPushMetadataField::Repo => {
+                    if repo.is_some() {
+                        return Err(A::Error::duplicate_field("repo"));
+                    }
+                    repo = Some(map.next_value()?);
+                }
+                VmGitPushMetadataField::Branch => {
+                    if branch.is_some() {
+                        return Err(A::Error::duplicate_field("branch"));
+                    }
+                    branch = Some(map.next_value()?);
+                }
+                VmGitPushMetadataField::ExpectedRemoteHead => {
+                    if expected_remote_head.is_some() {
+                        return Err(A::Error::duplicate_field("expected_remote_head"));
+                    }
+                    expected_remote_head = Some(map.next_value::<Option<GitObjectId>>()?);
+                }
+                VmGitPushMetadataField::NewHead => {
+                    if new_head.is_some() {
+                        return Err(A::Error::duplicate_field("new_head"));
+                    }
+                    new_head = Some(map.next_value()?);
+                }
+            }
+        }
+        Ok(VmGitPushMetadata {
+            repo: repo.ok_or_else(|| A::Error::missing_field("repo"))?,
+            branch: branch.ok_or_else(|| A::Error::missing_field("branch"))?,
+            expected_remote_head: expected_remote_head
+                .ok_or_else(|| A::Error::missing_field("expected_remote_head"))?,
+            new_head: new_head.ok_or_else(|| A::Error::missing_field("new_head"))?,
         })
     }
 }
@@ -588,20 +684,22 @@ impl VmGitPushErrorResponse {
     }
 }
 
-impl VmGitPushReceipt {
+impl VmGitPushStagedReceipt {
     pub fn new(
         repo: GitCloneRepo,
         branch: GitBranchName,
-        old_head: GitObjectId,
+        expected_remote_head: Option<GitObjectId>,
         new_head: GitObjectId,
         push_request_id: RequestId,
+        staged_at: UnixMillis,
     ) -> Self {
         Self {
             repo,
             branch,
-            old_head,
+            expected_remote_head,
             new_head,
             push_request_id,
+            staged_at,
         }
     }
 
@@ -613,8 +711,8 @@ impl VmGitPushReceipt {
         &self.branch
     }
 
-    pub fn old_head(&self) -> &GitObjectId {
-        &self.old_head
+    pub fn expected_remote_head(&self) -> Option<&GitObjectId> {
+        self.expected_remote_head.as_ref()
     }
 
     pub fn new_head(&self) -> &GitObjectId {
@@ -623,6 +721,113 @@ impl VmGitPushReceipt {
 
     pub fn push_request_id(&self) -> RequestId {
         self.push_request_id
+    }
+
+    pub fn staged_at(&self) -> UnixMillis {
+        self.staged_at
+    }
+}
+
+// See `VmGitPushMetadata` above: hand-rolled to require explicit
+// `expected_remote_head` presence on the wire rather than letting serde's
+// implicit Option default mean "branch creation".
+impl<'de> Deserialize<'de> for VmGitPushStagedReceipt {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_struct(
+            "VmGitPushStagedReceipt",
+            VM_GIT_PUSH_STAGED_RECEIPT_FIELDS,
+            VmGitPushStagedReceiptVisitor,
+        )
+    }
+}
+
+const VM_GIT_PUSH_STAGED_RECEIPT_FIELDS: &[&str] = &[
+    "repo",
+    "branch",
+    "expected_remote_head",
+    "new_head",
+    "push_request_id",
+    "staged_at",
+];
+
+#[derive(Deserialize)]
+#[serde(field_identifier, rename_all = "snake_case")]
+enum VmGitPushStagedReceiptField {
+    Repo,
+    Branch,
+    ExpectedRemoteHead,
+    NewHead,
+    PushRequestId,
+    StagedAt,
+}
+
+struct VmGitPushStagedReceiptVisitor;
+
+impl<'de> serde::de::Visitor<'de> for VmGitPushStagedReceiptVisitor {
+    type Value = VmGitPushStagedReceipt;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("struct VmGitPushStagedReceipt")
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+        use serde::de::Error;
+        let mut repo: Option<GitCloneRepo> = None;
+        let mut branch: Option<GitBranchName> = None;
+        let mut expected_remote_head: Option<Option<GitObjectId>> = None;
+        let mut new_head: Option<GitObjectId> = None;
+        let mut push_request_id: Option<RequestId> = None;
+        let mut staged_at: Option<UnixMillis> = None;
+        while let Some(key) = map.next_key::<VmGitPushStagedReceiptField>()? {
+            match key {
+                VmGitPushStagedReceiptField::Repo => {
+                    if repo.is_some() {
+                        return Err(A::Error::duplicate_field("repo"));
+                    }
+                    repo = Some(map.next_value()?);
+                }
+                VmGitPushStagedReceiptField::Branch => {
+                    if branch.is_some() {
+                        return Err(A::Error::duplicate_field("branch"));
+                    }
+                    branch = Some(map.next_value()?);
+                }
+                VmGitPushStagedReceiptField::ExpectedRemoteHead => {
+                    if expected_remote_head.is_some() {
+                        return Err(A::Error::duplicate_field("expected_remote_head"));
+                    }
+                    expected_remote_head = Some(map.next_value::<Option<GitObjectId>>()?);
+                }
+                VmGitPushStagedReceiptField::NewHead => {
+                    if new_head.is_some() {
+                        return Err(A::Error::duplicate_field("new_head"));
+                    }
+                    new_head = Some(map.next_value()?);
+                }
+                VmGitPushStagedReceiptField::PushRequestId => {
+                    if push_request_id.is_some() {
+                        return Err(A::Error::duplicate_field("push_request_id"));
+                    }
+                    push_request_id = Some(map.next_value()?);
+                }
+                VmGitPushStagedReceiptField::StagedAt => {
+                    if staged_at.is_some() {
+                        return Err(A::Error::duplicate_field("staged_at"));
+                    }
+                    staged_at = Some(map.next_value()?);
+                }
+            }
+        }
+        Ok(VmGitPushStagedReceipt {
+            repo: repo.ok_or_else(|| A::Error::missing_field("repo"))?,
+            branch: branch.ok_or_else(|| A::Error::missing_field("branch"))?,
+            expected_remote_head: expected_remote_head
+                .ok_or_else(|| A::Error::missing_field("expected_remote_head"))?,
+            new_head: new_head.ok_or_else(|| A::Error::missing_field("new_head"))?,
+            push_request_id: push_request_id
+                .ok_or_else(|| A::Error::missing_field("push_request_id"))?,
+            staged_at: staged_at.ok_or_else(|| A::Error::missing_field("staged_at"))?,
+        })
     }
 }
 
@@ -968,7 +1173,7 @@ mod tests {
         VmGitPushMetadata::new(
             repo("owner", "repo"),
             "feature/x".parse().unwrap(),
-            sample_object_id('1'),
+            Some(sample_object_id('1')),
             sample_object_id('2'),
         )
     }
@@ -1090,14 +1295,14 @@ mod tests {
             owner in owner_strategy(),
             name in repo_name_strategy(),
             branch in git_branch_strategy(),
-            expected in object_id_strategy(),
+            expected in proptest::option::of(object_id_strategy()),
             new_head in object_id_strategy(),
         ) {
             let repo_ref: RepoRef = format!("{owner}/{name}").parse().unwrap();
             let metadata = VmGitPushMetadata::new(
                 GitCloneRepo::new(repo_ref.clone()).unwrap(),
                 branch.parse().unwrap(),
-                expected.parse().unwrap(),
+                expected.map(|raw| raw.parse().unwrap()),
                 new_head.parse().unwrap(),
             );
 
@@ -1106,6 +1311,32 @@ mod tests {
 
             prop_assert_eq!(roundtrip.repo().as_repo_ref(), &repo_ref);
             prop_assert_eq!(roundtrip, metadata);
+        }
+
+        #[test]
+        fn vm_push_staged_receipt_roundtrips_any_valid_generated_fields(
+            owner in owner_strategy(),
+            name in repo_name_strategy(),
+            branch in git_branch_strategy(),
+            expected in proptest::option::of(object_id_strategy()),
+            new_head in object_id_strategy(),
+            staged_at in any::<i64>(),
+        ) {
+            let repo_ref: RepoRef = format!("{owner}/{name}").parse().unwrap();
+            let receipt = VmGitPushStagedReceipt::new(
+                GitCloneRepo::new(repo_ref.clone()).unwrap(),
+                branch.parse().unwrap(),
+                expected.map(|raw| raw.parse().unwrap()),
+                new_head.parse().unwrap(),
+                RequestId::new(),
+                UnixMillis::from_millis(staged_at),
+            );
+
+            let json = serde_json::to_string(&receipt).unwrap();
+            let roundtrip: VmGitPushStagedReceipt = serde_json::from_str(&json).unwrap();
+
+            prop_assert_eq!(roundtrip.repo().as_repo_ref(), &repo_ref);
+            prop_assert_eq!(roundtrip, receipt);
         }
     }
 
@@ -1262,6 +1493,37 @@ mod tests {
     }
 
     #[test]
+    fn push_metadata_branch_creation_serialises_expected_head_as_null() {
+        let metadata = VmGitPushMetadata::new(
+            repo("owner", "repo"),
+            "feature/x".parse().unwrap(),
+            None,
+            sample_object_id('2'),
+        );
+        let value = serde_json::to_value(&metadata).unwrap();
+        assert_eq!(value["expected_remote_head"], serde_json::Value::Null);
+        assert_eq!(
+            serde_json::from_value::<VmGitPushMetadata>(value).unwrap(),
+            metadata
+        );
+    }
+
+    #[test]
+    fn push_metadata_rejects_missing_expected_remote_head_key() {
+        let json = serde_json::json!({
+            "repo": "owner/repo",
+            "branch": "feature/x",
+            "new_head": "2222222222222222222222222222222222222222",
+        });
+        let result = serde_json::from_value::<VmGitPushMetadata>(json);
+        assert!(
+            result.is_err(),
+            "missing expected_remote_head key should be rejected (got {:?})",
+            result.ok()
+        );
+    }
+
+    #[test]
     fn push_request_body_parser_splits_metadata_and_bundle() {
         let request = push_request();
         let body = encode_vm_git_push_request_body(&request).unwrap();
@@ -1330,21 +1592,24 @@ mod tests {
     }
 
     #[test]
-    fn push_receipt_wire_shape_is_stable() {
+    fn push_staged_receipt_wire_shape_is_stable() {
         let push_request_id = RequestId::new();
-        let receipt = VmGitPushReceipt::new(
+        let staged_at = UnixMillis::from_millis(1_700_000_000_123);
+        let receipt = VmGitPushStagedReceipt::new(
             repo("owner", "repo"),
             "main".parse().unwrap(),
-            sample_object_id('a'),
+            Some(sample_object_id('a')),
             sample_object_id('b'),
             push_request_id,
+            staged_at,
         );
         assert_eq!(receipt.push_request_id(), push_request_id);
+        assert_eq!(receipt.staged_at(), staged_at);
         let value = serde_json::to_value(&receipt).unwrap();
         assert_eq!(value["repo"], "owner/repo");
         assert_eq!(value["branch"], "main");
         assert_eq!(
-            value["old_head"],
+            value["expected_remote_head"],
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         );
         assert_eq!(
@@ -1355,9 +1620,45 @@ mod tests {
             value["push_request_id"],
             serde_json::json!(push_request_id.to_string())
         );
+        assert_eq!(value["staged_at"], staged_at.as_millis());
         assert_eq!(
-            serde_json::from_value::<VmGitPushReceipt>(value).unwrap(),
+            serde_json::from_value::<VmGitPushStagedReceipt>(value).unwrap(),
             receipt
+        );
+    }
+
+    #[test]
+    fn push_staged_receipt_serialises_branch_creation_expected_head_as_null() {
+        let receipt = VmGitPushStagedReceipt::new(
+            repo("owner", "repo"),
+            "feature/x".parse().unwrap(),
+            None,
+            sample_object_id('b'),
+            RequestId::new(),
+            UnixMillis::from_millis(1_700_000_000_123),
+        );
+        let value = serde_json::to_value(&receipt).unwrap();
+        assert_eq!(value["expected_remote_head"], serde_json::Value::Null);
+        assert_eq!(
+            serde_json::from_value::<VmGitPushStagedReceipt>(value).unwrap(),
+            receipt
+        );
+    }
+
+    #[test]
+    fn push_staged_receipt_rejects_missing_expected_remote_head_key() {
+        let json = serde_json::json!({
+            "repo": "owner/repo",
+            "branch": "feature/x",
+            "new_head": "2222222222222222222222222222222222222222",
+            "push_request_id": RequestId::new().to_string(),
+            "staged_at": 1_700_000_000_123_i64,
+        });
+        let result = serde_json::from_value::<VmGitPushStagedReceipt>(json);
+        assert!(
+            result.is_err(),
+            "missing expected_remote_head key should be rejected (got {:?})",
+            result.ok()
         );
     }
 
