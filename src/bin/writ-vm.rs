@@ -125,6 +125,7 @@ async fn main() {
 }
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
+    writ::telemetry::init("warn")?;
     let args = Args::parse();
     let config = config_from_args(&args)?;
 

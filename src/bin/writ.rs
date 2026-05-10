@@ -184,6 +184,7 @@ fn main() {
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
+    writ::telemetry::init("warn")?;
     let args = Args::parse();
     let socket_path = args.socket.unwrap_or_else(default_socket_path);
 
