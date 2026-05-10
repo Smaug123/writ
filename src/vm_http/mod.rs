@@ -1407,40 +1407,30 @@ impl VmHttpRequest {
             .map(|pq| pq.as_str().to_string())
             .unwrap_or_else(|| "/".to_string());
 
-        let mut authorization: Option<String> = None;
-        let mut content_length: Option<usize> = None;
-        let mut headers = Vec::new();
-        for (name, value) in parts.headers.iter() {
-            let Ok(value_str) = std::str::from_utf8(value.as_bytes()) else {
-                continue;
-            };
-            let value_str = value_str.to_string();
-            headers.push(VmHttpHeader {
-                name: name.as_str().to_string(),
-                value: value_str.clone(),
-            });
-            if name.as_str().eq_ignore_ascii_case("authorization") {
-                if authorization.is_some() {
-                    return Err(VmHttpParseError::DuplicateAuthorization);
-                }
-                authorization = Some(value_str);
-                continue;
-            }
-            if name.as_str().eq_ignore_ascii_case("content-length") {
-                if content_length.is_some() {
-                    return Err(VmHttpParseError::DuplicateContentLength);
-                }
-                if value_str.is_empty() || value_str.starts_with('+') || value_str.starts_with('-')
-                {
-                    return Err(VmHttpParseError::InvalidContentLength);
-                }
-                content_length = Some(
-                    value_str
-                        .parse::<usize>()
-                        .map_err(|_| VmHttpParseError::InvalidContentLength)?,
-                );
-            }
-        }
+        let authorization = single_header_value(
+            &parts.headers,
+            http::header::AUTHORIZATION,
+            VmHttpParseError::DuplicateAuthorization,
+        )?;
+        let content_length = single_header_value(
+            &parts.headers,
+            http::header::CONTENT_LENGTH,
+            VmHttpParseError::DuplicateContentLength,
+        )?
+        .map(|s| parse_content_length(&s))
+        .transpose()?;
+
+        let headers = parts
+            .headers
+            .iter()
+            .filter_map(|(name, value)| {
+                let value = std::str::from_utf8(value.as_bytes()).ok()?.to_string();
+                Some(VmHttpHeader {
+                    name: name.as_str().to_string(),
+                    value,
+                })
+            })
+            .collect();
 
         Ok(VmHttpRequest {
             method,
@@ -1451,6 +1441,30 @@ impl VmHttpRequest {
             peer_addr,
         })
     }
+}
+
+fn single_header_value(
+    headers: &http::HeaderMap,
+    name: http::header::HeaderName,
+    duplicate_err: VmHttpParseError,
+) -> Result<Option<String>, VmHttpParseError> {
+    let mut iter = headers.get_all(name).into_iter();
+    let first = iter.next();
+    if iter.next().is_some() {
+        return Err(duplicate_err);
+    }
+    Ok(first.and_then(|v| std::str::from_utf8(v.as_bytes()).ok().map(str::to_string)))
+}
+
+fn parse_content_length(value: &str) -> Result<usize, VmHttpParseError> {
+    // RFC 7230 §3.3.2 requires `1*DIGIT`, so reject empty values and any sign
+    // prefix that `usize::from_str` would otherwise accept (e.g. "+5").
+    if value.is_empty() || value.starts_with('+') || value.starts_with('-') {
+        return Err(VmHttpParseError::InvalidContentLength);
+    }
+    value
+        .parse::<usize>()
+        .map_err(|_| VmHttpParseError::InvalidContentLength)
 }
 
 impl VmHttpResponse {
@@ -2119,6 +2133,44 @@ esac
             .uri("/v1/git/clone")
             .header("content-length", "2")
             .header("content-length", "2")
+            .body(())
+            .unwrap();
+        let (parts, _) = request.into_parts();
+        let err = VmHttpRequest::from_hyper_parts(
+            &parts,
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(10, 1, 2, 3), 12345)),
+        )
+        .unwrap_err();
+        assert_eq!(err, VmHttpParseError::DuplicateContentLength);
+    }
+
+    #[test]
+    fn parser_rejects_duplicate_authorization_when_one_value_is_non_utf8() {
+        let invalid = http::HeaderValue::from_bytes(&[0xff, 0xfe]).unwrap();
+        let request = http::Request::builder()
+            .method("GET")
+            .uri("/v1/session")
+            .header("authorization", "Bearer a")
+            .header("authorization", invalid)
+            .body(())
+            .unwrap();
+        let (parts, _) = request.into_parts();
+        let err = VmHttpRequest::from_hyper_parts(
+            &parts,
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(10, 1, 2, 3), 12345)),
+        )
+        .unwrap_err();
+        assert_eq!(err, VmHttpParseError::DuplicateAuthorization);
+    }
+
+    #[test]
+    fn parser_rejects_duplicate_content_length_when_one_value_is_non_utf8() {
+        let invalid = http::HeaderValue::from_bytes(&[0xff, 0xfe]).unwrap();
+        let request = http::Request::builder()
+            .method("POST")
+            .uri("/v1/git/clone")
+            .header("content-length", "5")
+            .header("content-length", invalid)
             .body(())
             .unwrap();
         let (parts, _) = request.into_parts();
