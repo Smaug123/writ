@@ -265,7 +265,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             AgentVmCmd::List => {
-                let msg = ClientMessage::ListAgentVms;
+                let msg = ClientMessage::ListAgentVms {};
                 match call_with_timeout(&socket_path, &msg, AGENT_VM_CALL_TIMEOUT)? {
                     ServerMessage::AgentVmSessions { sessions } => {
                         let mut out = std::io::stdout().lock();

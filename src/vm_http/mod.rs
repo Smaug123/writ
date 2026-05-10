@@ -64,6 +64,7 @@ use crate::bearer::is_bearer_token_byte;
 use crate::core::{BrokerPort, BrokerPortRange, Ipv4Cidr, SessionId};
 use crate::secret::SecretStore;
 use crate::server::BrokerState;
+use crate::vm_git::VmGitPushBodyLimits;
 
 const MAX_VM_HTTP_BODY_BYTES: usize = 64 * 1024;
 const MAX_VM_HTTP_AGENT_RUN_OUTCOME_BODY_BYTES: usize = 4 * 1024 * 1024;
@@ -112,6 +113,8 @@ pub struct VmHttpRuntimeConfig {
     claude_proxy: Option<VmHttpClaudeProxyConfig>,
     openai_proxy: Option<VmHttpOpenAiProxyConfig>,
     agent_run_log_root: PathBuf,
+    git_push_staging_root: PathBuf,
+    git_push_body_limits: VmGitPushBodyLimits,
 }
 
 pub struct PreparedVmHttpSession<S: SecretStore + Send + Sync + 'static> {
@@ -404,6 +407,8 @@ impl VmHttpRuntimeConfig {
         git_clone: VmHttpGitCloneConfig,
         nix_cache: VmHttpNixCacheConfig,
         agent_run_log_root: impl Into<PathBuf>,
+        git_push_staging_root: impl Into<PathBuf>,
+        git_push_body_limits: VmGitPushBodyLimits,
     ) -> Self {
         Self::new_with_claude_proxy(
             bind_addr,
@@ -412,9 +417,12 @@ impl VmHttpRuntimeConfig {
             nix_cache,
             None,
             agent_run_log_root,
+            git_push_staging_root,
+            git_push_body_limits,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn new_with_claude_proxy(
         bind_addr: Ipv4Addr,
         broker_port_range: BrokerPortRange,
@@ -422,6 +430,8 @@ impl VmHttpRuntimeConfig {
         nix_cache: VmHttpNixCacheConfig,
         claude_proxy: Option<VmHttpClaudeProxyConfig>,
         agent_run_log_root: impl Into<PathBuf>,
+        git_push_staging_root: impl Into<PathBuf>,
+        git_push_body_limits: VmGitPushBodyLimits,
     ) -> Self {
         Self::new_with_proxies(
             bind_addr,
@@ -431,9 +441,12 @@ impl VmHttpRuntimeConfig {
             claude_proxy,
             None,
             agent_run_log_root,
+            git_push_staging_root,
+            git_push_body_limits,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn new_with_proxies(
         bind_addr: Ipv4Addr,
         broker_port_range: BrokerPortRange,
@@ -442,6 +455,8 @@ impl VmHttpRuntimeConfig {
         claude_proxy: Option<VmHttpClaudeProxyConfig>,
         openai_proxy: Option<VmHttpOpenAiProxyConfig>,
         agent_run_log_root: impl Into<PathBuf>,
+        git_push_staging_root: impl Into<PathBuf>,
+        git_push_body_limits: VmGitPushBodyLimits,
     ) -> Self {
         Self {
             bind_addr,
@@ -451,6 +466,8 @@ impl VmHttpRuntimeConfig {
             claude_proxy,
             openai_proxy,
             agent_run_log_root: agent_run_log_root.into(),
+            git_push_staging_root: git_push_staging_root.into(),
+            git_push_body_limits,
         }
     }
 
@@ -480,6 +497,14 @@ impl VmHttpRuntimeConfig {
 
     pub fn agent_run_log_root(&self) -> &Path {
         &self.agent_run_log_root
+    }
+
+    pub fn git_push_staging_root(&self) -> &Path {
+        &self.git_push_staging_root
+    }
+
+    pub fn git_push_body_limits(&self) -> VmGitPushBodyLimits {
+        self.git_push_body_limits
     }
 }
 
@@ -2194,6 +2219,8 @@ esac
             git_clone_config_for_test(&temp, write_fake_git(temp.path())),
             nix_cache_config_for_test(),
             temp.path().join("agent-runs"),
+            temp.path().join("git-push-staging"),
+            VmGitPushBodyLimits::new(65 * 1024 * 1024, 16 * 1024, 64 * 1024 * 1024).unwrap(),
         );
         let session_id = "51b8fd0f-6c10-454c-b0e6-7df1d60e2e6d".parse().unwrap();
         let source_ipv4 = Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap();
@@ -2222,6 +2249,8 @@ esac
             git_clone_config_for_test(&temp, write_fake_git(temp.path())),
             nix_cache_config_for_test(),
             temp.path().join("agent-runs"),
+            temp.path().join("git-push-staging"),
+            VmGitPushBodyLimits::new(65 * 1024 * 1024, 16 * 1024, 64 * 1024 * 1024).unwrap(),
         );
         let session_id = "51b8fd0f-6c10-454c-b0e6-7df1d60e2e6d".parse().unwrap();
         let source_ipv4 = Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap();

@@ -31,8 +31,14 @@ pub struct AgentVmSessionInfo {
 }
 
 /// A message from the agent to the broker.
+///
+/// `#[serde(deny_unknown_fields)]` at the enum level catches typos at the
+/// wire (e.g. `agentkind` instead of `agent_kind`) instead of silently
+/// dropping the field and proceeding with a default. The `proptest`
+/// `client_message_rejects_unknown_top_level_fields` pins this behaviour
+/// for every variant.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ClientMessage {
     /// Begin a new session. The broker assigns a session ID, records it
     /// in the audit log, and returns [`ServerMessage::SessionOpened`].
@@ -102,7 +108,11 @@ pub enum ClientMessage {
     StopAgentVm { session_id: SessionId },
     /// List persisted daemon-managed agent VM sessions. Records without an
     /// attached in-memory runtime are cleanup obligations after daemon restart.
-    ListAgentVms,
+    ///
+    /// Written as an empty struct variant rather than a unit variant so that
+    /// `deny_unknown_fields` at the enum level applies — serde's unit-variant
+    /// deserialization path silently accepts trailing keys.
+    ListAgentVms {},
 }
 
 /// A message from the broker to the agent.
@@ -319,7 +329,7 @@ mod tests {
 
     #[test]
     fn list_agent_vms_roundtrips() {
-        let msg = ClientMessage::ListAgentVms;
+        let msg = ClientMessage::ListAgentVms {};
         let json = serde_json::to_string(&msg).unwrap();
         assert_eq!(serde_json::from_str::<ClientMessage>(&json).unwrap(), msg);
     }
@@ -504,7 +514,7 @@ mod tests {
         .unwrap();
         assert_eq!(run_started["type"], "agent_run_started");
 
-        let list: serde_json::Value = serde_json::to_value(ClientMessage::ListAgentVms).unwrap();
+        let list: serde_json::Value = serde_json::to_value(ClientMessage::ListAgentVms {}).unwrap();
         assert_eq!(list["type"], "list_agent_vms");
 
         let sessions: serde_json::Value = serde_json::to_value(ServerMessage::AgentVmSessions {
@@ -605,6 +615,82 @@ mod tests {
             let json = serde_json::to_string(&msg).unwrap();
             let back: ServerMessage = serde_json::from_str(&json).unwrap();
             prop_assert_eq!(msg, back);
+        }
+
+        /// A typo at the wire (e.g. `agentkind` instead of `agent_kind`) must
+        /// be a parse error, not a silently-dropped field that defaults the
+        /// real one. This pins `deny_unknown_fields` for every variant: pick
+        /// any sample message, inject an arbitrary key not used by any
+        /// variant, and assert the result fails to parse.
+        #[test]
+        fn client_message_rejects_unknown_top_level_fields(
+            variant_index in 0usize..7,
+            // ASCII-letters-only key, excluded against the union of every
+            // variant's known field names below.
+            unknown_key in "[a-z]{1,16}",
+        ) {
+            const KNOWN_FIELDS: &[&str] = &[
+                "type", "label", "agent_kind", "agent_model", "workspace",
+                "guest_command", "session_id", "capability", "prompt",
+            ];
+            prop_assume!(!KNOWN_FIELDS.contains(&unknown_key.as_str()));
+
+            let msg = sample_client_message(variant_index);
+            let mut value = serde_json::to_value(&msg).unwrap();
+            value.as_object_mut().unwrap().insert(
+                unknown_key.clone(),
+                serde_json::Value::String("x".into()),
+            );
+
+            let result = serde_json::from_value::<ClientMessage>(value.clone());
+            prop_assert!(
+                result.is_err(),
+                "variant {variant_index} accepted unknown key {unknown_key:?}: {value}",
+            );
+        }
+    }
+
+    /// One sample per `ClientMessage` variant. The order is fixed so the
+    /// proptest's variant index is stable across runs.
+    fn sample_client_message(index: usize) -> ClientMessage {
+        match index {
+            0 => ClientMessage::OpenSession {
+                label: Some("fix bug".into()),
+                agent_kind: Some(AgentKind::Claude),
+                agent_model: Some("claude-test".into()),
+            },
+            1 => ClientMessage::CloseSession {
+                session_id: fixed_session_id(),
+            },
+            2 => ClientMessage::Request {
+                session_id: fixed_session_id(),
+                capability: CapabilityRequest::GitHub(GitHubRequest::Metadata {
+                    repo: sample_repo(),
+                }),
+            },
+            3 => ClientMessage::StartAgentVm {
+                label: None,
+                agent_kind: None,
+                agent_model: None,
+                workspace: None,
+                guest_command: vec!["true".into()],
+            },
+            4 => ClientMessage::StartAgentRun {
+                label: None,
+                agent_kind: AgentKind::Claude,
+                agent_model: "claude-test".into(),
+                workspace: AgentVmWorkspaceBootstrap {
+                    repo: sample_clone_repo(),
+                    destination: None,
+                    warm: WorkspaceWarmMode::None,
+                },
+                prompt: AgentPrompt::new("p"),
+            },
+            5 => ClientMessage::StopAgentVm {
+                session_id: fixed_session_id(),
+            },
+            6 => ClientMessage::ListAgentVms {},
+            other => unreachable!("variant index out of range: {other}"),
         }
     }
 }
