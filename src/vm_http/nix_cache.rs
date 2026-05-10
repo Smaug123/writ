@@ -430,7 +430,11 @@ impl<S: SecretStore> VmHttpNixCacheService<S> {
         let response = match self.client.request(method, url).send().await {
             Ok(response) => response,
             Err(err) => {
-                eprintln!("VM HTTP Nix cache upstream request failed: {err}");
+                tracing::warn!(
+                    upstream_url = %upstream_url,
+                    error = %err,
+                    "vm http nix cache upstream request failed",
+                );
                 let response =
                     VmHttpResponse::text(VmHttpStatus::BadGateway, "nix cache upstream failed");
                 return VmHttpNixCacheProxyFetch {
@@ -455,7 +459,11 @@ impl<S: SecretStore> VmHttpNixCacheService<S> {
         }
         if response.status() != reqwest::StatusCode::OK {
             let status = response.status();
-            eprintln!("VM HTTP Nix cache upstream returned status {status}");
+            tracing::warn!(
+                upstream_url = %upstream_url,
+                upstream_status = status.as_u16(),
+                "vm http nix cache upstream returned unsupported status",
+            );
             let response = VmHttpResponse::text(
                 VmHttpStatus::BadGateway,
                 "nix cache upstream returned unsupported status",
@@ -495,7 +503,11 @@ impl<S: SecretStore> VmHttpNixCacheService<S> {
         {
             Ok(body) => body,
             Err(err) => {
-                eprintln!("VM HTTP Nix cache upstream body read failed: {err}");
+                tracing::warn!(
+                    upstream_url = %upstream_url,
+                    error = %err,
+                    "vm http nix cache upstream body read failed",
+                );
                 let response =
                     VmHttpResponse::text(VmHttpStatus::BadGateway, "nix cache upstream failed");
                 return VmHttpNixCacheProxyFetch {
@@ -515,7 +527,11 @@ impl<S: SecretStore> VmHttpNixCacheService<S> {
             ) {
                 Ok(narinfo) => narinfo,
                 Err(err) => {
-                    eprintln!("VM HTTP Nix cache upstream narinfo was rejected: {err}");
+                    tracing::warn!(
+                        upstream_url = %upstream_url,
+                        error = %err,
+                        "vm http nix cache upstream narinfo was rejected",
+                    );
                     let error = narinfo_audit_error_label(&err);
                     let response =
                         VmHttpResponse::text(VmHttpStatus::BadGateway, "nix cache upstream failed");
@@ -529,7 +545,11 @@ impl<S: SecretStore> VmHttpNixCacheService<S> {
                 }
             };
             if let Err(err) = self.admit_narinfo(&narinfo) {
-                eprintln!("VM HTTP Nix cache upstream narinfo admission failed: {err}");
+                tracing::warn!(
+                    upstream_url = %upstream_url,
+                    error = %err,
+                    "vm http nix cache upstream narinfo admission failed",
+                );
                 let response =
                     VmHttpResponse::text(VmHttpStatus::BadGateway, "nix cache upstream failed");
                 return VmHttpNixCacheProxyFetch {
@@ -584,7 +604,11 @@ impl<S: SecretStore> VmHttpNixCacheService<S> {
         let response = match self.client.request(method, url).send().await {
             Ok(response) => response,
             Err(err) => {
-                eprintln!("VM HTTP Nix cache NAR upstream request failed: {err}");
+                tracing::warn!(
+                    upstream_url = %upstream_url,
+                    error = %err,
+                    "vm http nix cache NAR upstream request failed",
+                );
                 let response =
                     VmHttpResponse::text(VmHttpStatus::BadGateway, "nix cache upstream failed");
                 return VmHttpNixCacheProxyFetch {
@@ -608,7 +632,11 @@ impl<S: SecretStore> VmHttpNixCacheService<S> {
             };
         }
         if upstream_status != reqwest::StatusCode::OK {
-            eprintln!("VM HTTP Nix cache NAR upstream returned status {upstream_status}");
+            tracing::warn!(
+                upstream_url = %upstream_url,
+                upstream_status = upstream_status.as_u16(),
+                "vm http nix cache NAR upstream returned unsupported status",
+            );
             let response = VmHttpResponse::text(
                 VmHttpStatus::BadGateway,
                 "nix cache upstream returned unsupported status",
@@ -661,7 +689,11 @@ impl<S: SecretStore> VmHttpNixCacheService<S> {
         let body = match read_upstream_body_bounded(response, self.config.max_nar_bytes).await {
             Ok(body) => body,
             Err(err) => {
-                eprintln!("VM HTTP Nix cache NAR upstream body read failed: {err}");
+                tracing::warn!(
+                    upstream_url = %upstream_url,
+                    error = %err,
+                    "vm http nix cache NAR upstream body read failed",
+                );
                 let response =
                     VmHttpResponse::text(VmHttpStatus::BadGateway, "nix cache upstream failed");
                 return VmHttpNixCacheProxyFetch {
@@ -691,7 +723,11 @@ impl<S: SecretStore> VmHttpNixCacheService<S> {
             {
                 Ok(body) => body,
                 Err(err) => {
-                    eprintln!("VM HTTP Nix cache NAR body was rejected: {err}");
+                    tracing::warn!(
+                        upstream_url = %upstream_url,
+                        error = %err,
+                        "vm http nix cache NAR body was rejected",
+                    );
                     let response =
                         VmHttpResponse::text(VmHttpStatus::BadGateway, "nix cache upstream failed");
                     return VmHttpNixCacheProxyFetch {
