@@ -1165,6 +1165,7 @@ mod tests {
             claude_proxy: None,
             openai_proxy: None,
             agent_runs: None,
+            git_push: None,
         }
     }
 
