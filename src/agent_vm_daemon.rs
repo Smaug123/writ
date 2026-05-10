@@ -486,8 +486,10 @@ impl AgentVmDaemon {
                 agent_kind,
                 prompt: prompt.summary(),
             })?;
-            let agent_runs =
-                VmHttpAgentRunService::with_log_root(self.config.vm_http.agent_run_log_root());
+            let agent_runs = VmHttpAgentRunService::new(
+                Arc::clone(&state),
+                self.config.vm_http.agent_run_log_root(),
+            );
             agent_runs.insert_run_config(run_id, prompt.clone(), agent_model.clone());
             let guest_command = build_agent_run_guest_command(agent_kind, run_id, workspace.warm);
             self.start_session_after_audit_opened(
@@ -705,7 +707,7 @@ impl AgentVmDaemon {
         session_id: SessionId,
         workspace: Option<AgentVmWorkspaceBootstrap>,
         guest_command: Vec<String>,
-        agent_runs: Option<VmHttpAgentRunService>,
+        agent_runs: Option<VmHttpAgentRunService<S>>,
     ) -> Result<AgentVmStarted, AgentVmDaemonError> {
         let lifecycle = self.config.lifecycle.clone();
         let (subnet_index, network) =

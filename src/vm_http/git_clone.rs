@@ -43,10 +43,6 @@ impl<S: SecretStore> VmHttpGitCloneService<S> {
             config,
         }
     }
-
-    pub(super) fn broker_state(&self) -> &Arc<BrokerState<S>> {
-        &self.broker_state
-    }
 }
 
 impl<S: SecretStore> Clone for VmHttpGitCloneService<S> {

@@ -25,10 +25,28 @@ use super::{VmHttpResponse, VmHttpStatus};
 // intentionally not trusted for truncated-stream audit rows.
 const MAX_AGENT_RUN_STREAM_AUDIT_BYTES: u64 = 1024 * 1024 * 1024;
 
-#[derive(Clone, Debug)]
-pub struct VmHttpAgentRunService {
+pub struct VmHttpAgentRunService<S: SecretStore> {
+    broker_state: Arc<BrokerState<S>>,
     run_configs: Arc<Mutex<HashMap<AgentRunId, AgentRunInflight>>>,
     log_root: PathBuf,
+}
+
+impl<S: SecretStore> std::fmt::Debug for VmHttpAgentRunService<S> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VmHttpAgentRunService")
+            .field("log_root", &self.log_root)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<S: SecretStore> Clone for VmHttpAgentRunService<S> {
+    fn clone(&self) -> Self {
+        Self {
+            broker_state: Arc::clone(&self.broker_state),
+            run_configs: Arc::clone(&self.run_configs),
+            log_root: self.log_root.clone(),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -37,9 +55,10 @@ struct AgentRunInflight {
     model: String,
 }
 
-impl VmHttpAgentRunService {
-    pub fn with_log_root(log_root: impl Into<PathBuf>) -> Self {
+impl<S: SecretStore> VmHttpAgentRunService<S> {
+    pub fn new(broker_state: Arc<BrokerState<S>>, log_root: impl Into<PathBuf>) -> Self {
         Self {
+            broker_state,
             run_configs: Arc::new(Mutex::new(HashMap::new())),
             log_root: log_root.into(),
         }
@@ -73,6 +92,10 @@ impl VmHttpAgentRunService {
     fn log_root(&self) -> &Path {
         &self.log_root
     }
+
+    fn broker_state(&self) -> &BrokerState<S> {
+        &self.broker_state
+    }
 }
 
 pub(super) fn parse_agent_run_config_target(target: &str) -> Option<AgentRunId> {
@@ -97,9 +120,9 @@ pub(super) fn parse_agent_run_outcome_target(target: &str) -> Option<AgentRunId>
     raw_id.parse().ok()
 }
 
-pub(super) fn route_agent_run_config_request(
+pub(super) fn route_agent_run_config_request<S: SecretStore>(
     run_id: AgentRunId,
-    service: &VmHttpAgentRunService,
+    service: &VmHttpAgentRunService<S>,
 ) -> VmHttpResponse {
     let Some(inflight) = service.take_run_config(run_id) else {
         return VmHttpResponse::text(VmHttpStatus::NotFound, "not found");
@@ -110,12 +133,12 @@ pub(super) fn route_agent_run_config_request(
     )
 }
 
-pub(super) fn route_agent_run_outcome_request(
+pub(super) fn route_agent_run_outcome_request<S: SecretStore>(
     run_id: AgentRunId,
     body: &[u8],
-    service: &VmHttpAgentRunService,
-    broker_state: &BrokerState<impl SecretStore>,
+    service: &VmHttpAgentRunService<S>,
 ) -> VmHttpResponse {
+    let broker_state = service.broker_state();
     match broker_state.audit.get_agent_run_outcome(run_id) {
         Ok(Some(_)) => return VmHttpResponse::text(VmHttpStatus::Ok, "ok"),
         Ok(None) => {}
@@ -322,10 +345,12 @@ mod tests {
     use super::*;
     use crate::core::{Ipv4Cidr, UnixMillis};
 
-    #[test]
-    fn agent_run_config_route_returns_prompt_and_model_once() {
+    #[tokio::test]
+    async fn agent_run_config_route_returns_prompt_and_model_once() {
+        let github = MockServer::start().await;
+        let state = make_broker_state(&github);
         let temp = tempfile::tempdir().unwrap();
-        let service = VmHttpAgentRunService::with_log_root(temp.path().join("agent-runs"));
+        let service = VmHttpAgentRunService::new(state, temp.path().join("agent-runs"));
         let run_id: AgentRunId = "00000000-0000-0000-0000-000000000401".parse().unwrap();
         let prompt = AgentPrompt::new("SECRET prompt");
         service.insert_run_config(run_id, prompt.clone(), "gpt-5.4-mini");
@@ -362,7 +387,8 @@ mod tests {
             })
             .unwrap();
         let temp = tempfile::tempdir().unwrap();
-        let service = VmHttpAgentRunService::with_log_root(temp.path().join("agent-runs"));
+        let service =
+            VmHttpAgentRunService::new(Arc::clone(&state), temp.path().join("agent-runs"));
         let upload = VmAgentRunOutcomeUpload {
             run_id,
             status: crate::agent_run::AgentRunTerminalStatus::Succeeded,
@@ -390,7 +416,7 @@ mod tests {
             "Hello\n"
         );
 
-        let response = route_agent_run_outcome_request(run_id, &body, &service, &state);
+        let response = route_agent_run_outcome_request(run_id, &body, &service);
 
         assert_eq!(response.status, VmHttpStatus::Ok);
         let outcome = state.audit.get_agent_run_outcome(run_id).unwrap().unwrap();
@@ -404,7 +430,7 @@ mod tests {
         );
         assert!(outcome.outcome.stdout.path.starts_with(temp.path()));
 
-        let retried = route_agent_run_outcome_request(run_id, &body, &service, &state);
+        let retried = route_agent_run_outcome_request(run_id, &body, &service);
         assert_eq!(retried.status, VmHttpStatus::Ok);
     }
 
@@ -426,7 +452,8 @@ mod tests {
             })
             .unwrap();
         let temp = tempfile::tempdir().unwrap();
-        let service = VmHttpAgentRunService::with_log_root(temp.path().join("agent-runs"));
+        let service =
+            VmHttpAgentRunService::new(Arc::clone(&state), temp.path().join("agent-runs"));
         let valid_stderr = AgentRunStreamUpload {
             byte_len: 0,
             sha256_hex: crate::agent_run::sha256_hex(b""),
@@ -452,7 +479,6 @@ mod tests {
             run_id,
             &serde_json::to_vec(&upload).unwrap(),
             &service,
-            &state,
         );
 
         assert_eq!(response.status, VmHttpStatus::BadRequest);
@@ -471,7 +497,6 @@ mod tests {
             run_id,
             &serde_json::to_vec(&upload).unwrap(),
             &service,
-            &state,
         );
         assert_eq!(response.status, VmHttpStatus::BadRequest);
 
@@ -490,7 +515,6 @@ mod tests {
             run_id,
             &serde_json::to_vec(&upload).unwrap(),
             &service,
-            &state,
         );
         assert_eq!(response.status, VmHttpStatus::Ok);
         let outcome = state.audit.get_agent_run_outcome(run_id).unwrap().unwrap();

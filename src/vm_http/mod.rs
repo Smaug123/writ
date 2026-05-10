@@ -124,7 +124,7 @@ pub struct PreparedVmHttpGitSession<S: SecretStore + Send + Sync + 'static> {
     git_clone: VmHttpGitCloneService<S>,
     nix_cache: VmHttpNixCacheService<S>,
     proxies: VmHttpProxies<S>,
-    agent_runs: Option<VmHttpAgentRunService>,
+    agent_runs: Option<VmHttpAgentRunService<S>>,
 }
 
 pub struct VmHttpProxies<S: SecretStore> {
@@ -155,7 +155,7 @@ struct VmHttpServices<S: SecretStore> {
     nix_cache: Option<VmHttpNixCacheService<S>>,
     claude_proxy: Option<VmHttpClaudeProxyService<S>>,
     openai_proxy: Option<VmHttpOpenAiProxyService<S>>,
-    agent_runs: Option<VmHttpAgentRunService>,
+    agent_runs: Option<VmHttpAgentRunService<S>>,
 }
 
 pub struct RunningVmHttpGitSession {
@@ -517,7 +517,7 @@ impl<S: SecretStore> VmHttpServices<S> {
         git_clone: VmHttpGitCloneService<S>,
         nix_cache: VmHttpNixCacheService<S>,
         proxies: VmHttpProxies<S>,
-        agent_runs: Option<VmHttpAgentRunService>,
+        agent_runs: Option<VmHttpAgentRunService<S>>,
     ) -> Self {
         Self {
             git_clone: Some(git_clone),
@@ -769,7 +769,7 @@ pub async fn prepare_vm_http_git_session_with_agent_runs<S: SecretStore + Send +
     config: &VmHttpGitRuntimeConfig,
     session_id: SessionId,
     source_ipv4: Ipv4Cidr,
-    agent_runs: Option<VmHttpAgentRunService>,
+    agent_runs: Option<VmHttpAgentRunService<S>>,
 ) -> Result<PreparedVmHttpGitSession<S>, VmHttpGitRuntimeError> {
     let listener =
         bind_ephemeral_vm_http_listener(config.bind_addr, config.broker_port_range).await?;
@@ -828,7 +828,7 @@ pub async fn run_vm_http_with_git_until_shutdown<S: SecretStore + Send + Sync + 
     git_clone: VmHttpGitCloneService<S>,
     nix_cache: VmHttpNixCacheService<S>,
     proxies: VmHttpProxies<S>,
-    agent_runs: Option<VmHttpAgentRunService>,
+    agent_runs: Option<VmHttpAgentRunService<S>>,
     shutdown: watch::Receiver<bool>,
 ) -> std::io::Result<()> {
     run_vm_http_runtime_until_shutdown(
@@ -1308,7 +1308,6 @@ fn route_request_body_limit<S: SecretStore>(
     if parse_agent_run_outcome_target(&request.target).is_some()
         && request.method == "POST"
         && services.agent_runs.is_some()
-        && services.git_clone.is_some()
     {
         return Some(MAX_VM_HTTP_AGENT_RUN_OUTCOME_BODY_BYTES);
     }
@@ -1363,13 +1362,6 @@ where
     }
 
     if let Some(run_id) = parse_agent_run_outcome_target(&request.target) {
-        let Some(broker_state) = services
-            .git_clone
-            .as_ref()
-            .map(|service| Arc::clone(service.broker_state()))
-        else {
-            return VmHttpResponse::text(VmHttpStatus::NotFound, "not found").into();
-        };
         let Some(service) = services.agent_runs else {
             return VmHttpResponse::text(VmHttpStatus::NotFound, "not found").into();
         };
@@ -1377,7 +1369,7 @@ where
             return VmHttpResponse::text(VmHttpStatus::MethodNotAllowed, "method not allowed")
                 .into();
         }
-        return route_agent_run_outcome_request(run_id, &body, &service, &broker_state).into();
+        return route_agent_run_outcome_request(run_id, &body, &service).into();
     }
 
     route_session_endpoint(session, request).into()
