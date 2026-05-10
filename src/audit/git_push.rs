@@ -14,7 +14,10 @@ pub struct GitPushRequestRecord {
     pub received_at: UnixMillis,
     pub repo: GitCloneRepo,
     pub branch: GitBranchName,
-    pub expected_remote_head: GitObjectId,
+    /// `None` records "the agent expects this push to create the branch":
+    /// the staging path can preserve that distinction and the promotion
+    /// path will fail-closed if a remote branch later appears.
+    pub expected_remote_head: Option<GitObjectId>,
     pub new_head: GitObjectId,
 }
 
@@ -27,7 +30,10 @@ pub struct GitPushAttemptRecord {
     pub planned_at: UnixMillis,
     pub repo: GitCloneRepo,
     pub branch: GitBranchName,
-    pub old_head: GitObjectId,
+    /// `None` records a planned branch-creation push (no `--force-with-lease`
+    /// target). Must agree with the originating request's
+    /// `expected_remote_head`.
+    pub old_head: Option<GitObjectId>,
     pub new_head: GitObjectId,
 }
 
@@ -35,6 +41,7 @@ pub struct GitPushAttemptRecord {
 pub enum GitPushOutcomeResult {
     Denied,
     ValidationFailed,
+    Staged,
     Pushed,
     LeaseRejected,
     PushRejected,
@@ -59,12 +66,14 @@ pub struct GitPushAuditEntry {
     pub received_at: UnixMillis,
     pub repo: GitCloneRepo,
     pub branch: GitBranchName,
-    pub expected_remote_head: GitObjectId,
+    pub expected_remote_head: Option<GitObjectId>,
     pub new_head: GitObjectId,
     pub push_attempt_id: Option<RequestId>,
     pub capability_request_id: Option<RequestId>,
     pub grant_jti: Option<Jti>,
     pub planned_at: Option<UnixMillis>,
+    /// `None` if no attempt has been recorded *or* the attempt was a planned
+    /// branch-creation push. `push_attempt_id` is the discriminant.
     pub old_head: Option<GitObjectId>,
     pub attempted_new_head: Option<GitObjectId>,
     pub completed_at: Option<UnixMillis>,
@@ -108,7 +117,7 @@ impl AuditLog {
                     r.received_at.as_millis(),
                     r.repo.to_string(),
                     r.branch.as_str(),
-                    r.expected_remote_head.as_str(),
+                    r.expected_remote_head.as_ref().map(GitObjectId::as_str),
                     r.new_head.as_str(),
                 ],
             )?;
@@ -122,7 +131,7 @@ impl AuditLog {
     pub fn record_git_push_attempt(&self, r: &GitPushAttemptRecord) -> Result<(), AuditError> {
         self.with_conn_mut(|c| {
             let tx = c.transaction()?;
-            let push_request: Option<(String, String, String, String, String)> = tx
+            let push_request: Option<(String, String, String, Option<String>, String)> = tx
                 .query_row(
                     "SELECT session_id, repo, branch, expected_remote_head, new_head
                      FROM git_push_request
@@ -165,7 +174,8 @@ impl AuditLog {
                     "git push attempt branch differs from request",
                 ));
             }
-            if request_old_head != r.old_head.as_str() {
+            let attempt_old_head = r.old_head.as_ref().map(GitObjectId::as_str);
+            if request_old_head.as_deref() != attempt_old_head {
                 return Err(AuditError::Invariant(
                     "git push attempt old head differs from request",
                 ));
@@ -230,7 +240,7 @@ impl AuditLog {
                     r.planned_at.as_millis(),
                     r.repo.to_string(),
                     r.branch.as_str(),
-                    r.old_head.as_str(),
+                    r.old_head.as_ref().map(GitObjectId::as_str),
                     r.new_head.as_str(),
                 ],
             )?;
@@ -358,6 +368,7 @@ impl GitPushOutcomeResult {
         match self {
             Self::Denied => "denied",
             Self::ValidationFailed => "validation_failed",
+            Self::Staged => "staged",
             Self::Pushed => "pushed",
             Self::LeaseRejected => "lease_rejected",
             Self::PushRejected => "push_rejected",
@@ -370,6 +381,7 @@ impl GitPushOutcomeResult {
         match raw {
             "denied" => Ok(Self::Denied),
             "validation_failed" => Ok(Self::ValidationFailed),
+            "staged" => Ok(Self::Staged),
             "pushed" => Ok(Self::Pushed),
             "lease_rejected" => Ok(Self::LeaseRejected),
             "push_rejected" => Ok(Self::PushRejected),
@@ -401,7 +413,7 @@ fn git_push_audit_entry_from_row(
     let received_at: i64 = row.get("received_at")?;
     let repo_str: String = row.get("repo")?;
     let branch_str: String = row.get("branch")?;
-    let expected_remote_head_str: String = row.get("expected_remote_head")?;
+    let expected_remote_head_str: Option<String> = row.get("expected_remote_head")?;
     let new_head_str: String = row.get("request_new_head")?;
     let push_attempt_id_str: Option<String> = row.get("push_attempt_id")?;
     let capability_request_id_str: Option<String> = row.get("capability_request_id")?;
@@ -425,22 +437,20 @@ fn git_push_audit_entry_from_row(
         let branch = branch_str
             .parse::<GitBranchName>()
             .map_err(|_| AuditError::Invariant("Git push audit row: branch is invalid"))?;
-        let expected_remote_head =
-            expected_remote_head_str
-                .parse::<GitObjectId>()
-                .map_err(|_| {
-                    AuditError::Invariant("Git push audit row: expected remote head is invalid")
-                })?;
+        let expected_remote_head = expected_remote_head_str
+            .map(|s| s.parse::<GitObjectId>())
+            .transpose()
+            .map_err(|_| {
+                AuditError::Invariant("Git push audit row: expected remote head is invalid")
+            })?;
         let new_head = new_head_str
             .parse::<GitObjectId>()
             .map_err(|_| AuditError::Invariant("Git push audit row: new head is invalid"))?;
 
-        let has_attempt = push_attempt_id_str.is_some()
-            || capability_request_id_str.is_some()
-            || grant_jti_str.is_some()
-            || planned_at.is_some()
-            || old_head_str.is_some()
-            || attempted_new_head_str.is_some();
+        // `push_attempt_id` is the attempt table's primary key, so its
+        // presence is the authoritative discriminant for whether an attempt
+        // row joined. The other attempt columns are NOT NULL except for
+        // `old_head`, which now represents "branch creation" when null.
         let (
             push_attempt_id,
             capability_request_id,
@@ -448,7 +458,7 @@ fn git_push_audit_entry_from_row(
             planned_at,
             old_head,
             attempted_new_head,
-        ) = if has_attempt {
+        ) = if push_attempt_id_str.is_some() {
             let push_attempt_id = parse_required_request_id(
                 push_attempt_id_str,
                 "Git push audit row: attempt id missing or invalid",
@@ -465,10 +475,8 @@ fn git_push_audit_entry_from_row(
                 "Git push audit row: planned_at missing",
             ))?;
             let old_head = old_head_str
-                .ok_or(AuditError::Invariant(
-                    "Git push audit row: old head missing",
-                ))?
-                .parse::<GitObjectId>()
+                .map(|s| s.parse::<GitObjectId>())
+                .transpose()
                 .map_err(|_| AuditError::Invariant("Git push audit row: old head invalid"))?;
             let attempted_new_head = attempted_new_head_str
                 .ok_or(AuditError::Invariant(
@@ -483,7 +491,7 @@ fn git_push_audit_entry_from_row(
                 Some(capability_request_id),
                 Some(grant_jti),
                 Some(UnixMillis::from_millis(planned_at)),
-                Some(old_head),
+                old_head,
                 Some(attempted_new_head),
             )
         } else {
@@ -583,7 +591,7 @@ mod tests {
             received_at: UnixMillis::from_millis(1_700_000_100),
             repo: sample_git_repo(),
             branch: "main".parse().unwrap(),
-            expected_remote_head: git_oid('1'),
+            expected_remote_head: Some(git_oid('1')),
             new_head: git_oid('2'),
         }
     }
@@ -604,7 +612,7 @@ mod tests {
             planned_at: UnixMillis::from_millis(1_700_000_120),
             repo,
             branch,
-            old_head: git_oid('1'),
+            old_head: Some(git_oid('1')),
             new_head: git_oid('2'),
         }
     }
@@ -616,16 +624,26 @@ mod tests {
             github_status: Option<u16>,
             close_before_outcome: bool,
             attempt_repo_case_differs: bool,
+            /// `true` exercises the branch-creation path: request and
+            /// attempt both record `None` for their respective heads.
+            branch_creation: bool,
         },
         ValidUnattempted {
             result: GitPushOutcomeResult,
             close_before_outcome: bool,
+            branch_creation: bool,
         },
         RequestAfterClose,
         AttemptBeforeRequest,
         AttemptMissingGrant,
         AttemptMismatchedRepo,
         AttemptMismatchedBranch,
+        /// `request_has_head = true`: request records `Some`, attempt
+        /// records `None`. `false`: request `None`, attempt `Some`.
+        /// Either way the attempt must be rejected.
+        AttemptHeadPresenceMismatch {
+            request_has_head: bool,
+        },
         OutcomeWithoutRequest,
         OutcomeRequiresAttemptWithoutAttempt {
             result: GitPushOutcomeResult,
@@ -652,6 +670,7 @@ mod tests {
         prop_oneof![
             Just(GitPushOutcomeResult::Denied),
             Just(GitPushOutcomeResult::ValidationFailed),
+            Just(GitPushOutcomeResult::Staged),
         ]
     }
 
@@ -666,28 +685,45 @@ mod tests {
                 github_status_strategy(),
                 any::<bool>(),
                 any::<bool>(),
+                any::<bool>(),
             )
                 .prop_map(
-                    |(result, github_status, close_before_outcome, attempt_repo_case_differs)| {
+                    |(
+                        result,
+                        github_status,
+                        close_before_outcome,
+                        attempt_repo_case_differs,
+                        branch_creation,
+                    )| {
                         GitPushAuditScript::ValidAttempted {
                             result,
                             github_status,
                             close_before_outcome,
                             attempt_repo_case_differs,
+                            branch_creation,
                         }
                     },
                 ),
-            (unattempted_git_push_result_strategy(), any::<bool>()).prop_map(
-                |(result, close_before_outcome)| GitPushAuditScript::ValidUnattempted {
-                    result,
-                    close_before_outcome,
-                },
-            ),
+            (
+                unattempted_git_push_result_strategy(),
+                any::<bool>(),
+                any::<bool>(),
+            )
+                .prop_map(|(result, close_before_outcome, branch_creation)| {
+                    GitPushAuditScript::ValidUnattempted {
+                        result,
+                        close_before_outcome,
+                        branch_creation,
+                    }
+                }),
             Just(GitPushAuditScript::RequestAfterClose),
             Just(GitPushAuditScript::AttemptBeforeRequest),
             Just(GitPushAuditScript::AttemptMissingGrant),
             Just(GitPushAuditScript::AttemptMismatchedRepo),
             Just(GitPushAuditScript::AttemptMismatchedBranch),
+            any::<bool>().prop_map(|request_has_head| {
+                GitPushAuditScript::AttemptHeadPresenceMismatch { request_has_head }
+            }),
             Just(GitPushAuditScript::OutcomeWithoutRequest),
             attempted_git_push_result_strategy().prop_map(|result| {
                 GitPushAuditScript::OutcomeRequiresAttemptWithoutAttempt { result }
@@ -719,7 +755,7 @@ mod tests {
             planned_at: UnixMillis::from_millis(1_700_000_120),
             repo: sample_git_repo(),
             branch: "main".parse().unwrap(),
-            old_head: git_oid('1'),
+            old_head: Some(git_oid('1')),
             new_head: git_oid('2'),
         })
         .unwrap();
@@ -740,7 +776,7 @@ mod tests {
         assert_eq!(entry.session_id, s.session_id);
         assert_eq!(entry.repo, sample_git_repo());
         assert_eq!(entry.branch, "main".parse::<GitBranchName>().unwrap());
-        assert_eq!(entry.expected_remote_head, git_oid('1'));
+        assert_eq!(entry.expected_remote_head, Some(git_oid('1')));
         assert_eq!(entry.new_head, git_oid('2'));
         assert_eq!(entry.push_attempt_id, Some(push_attempt_id));
         assert_eq!(entry.capability_request_id, Some(capability_request_id));
@@ -780,7 +816,12 @@ mod tests {
                     github_status,
                     close_before_outcome,
                     attempt_repo_case_differs,
+                    branch_creation,
                 } => {
+                    let push_request = GitPushRequestRecord {
+                        expected_remote_head: if branch_creation { None } else { Some(git_oid('1')) },
+                        ..sample_git_push_request_record(push_request_id, s.session_id)
+                    };
                     log.record_git_push_request(&push_request).unwrap();
                     let grant = record_sample_write_grant(&log, s.session_id, capability_request_id);
                     let attempt_repo = if attempt_repo_case_differs {
@@ -788,15 +829,18 @@ mod tests {
                     } else {
                         sample_git_repo()
                     };
-                    log.record_git_push_attempt(&git_push_attempt_record(
-                        push_attempt_id,
-                        push_request_id,
-                        capability_request_id,
-                        grant.jti,
-                        attempt_repo,
-                        "main".parse().unwrap(),
-                    ))
-                    .unwrap();
+                    let attempt = GitPushAttemptRecord {
+                        old_head: if branch_creation { None } else { Some(git_oid('1')) },
+                        ..git_push_attempt_record(
+                            push_attempt_id,
+                            push_request_id,
+                            capability_request_id,
+                            grant.jti,
+                            attempt_repo,
+                            "main".parse().unwrap(),
+                        )
+                    };
+                    log.record_git_push_attempt(&attempt).unwrap();
                     if close_before_outcome {
                         log.close_session(s.session_id, UnixMillis::from_millis(1_700_000_125))
                             .unwrap();
@@ -826,7 +870,7 @@ mod tests {
                             capability_request_id: Some(capability_request_id),
                             grant_jti: Some(grant.jti),
                             planned_at: Some(UnixMillis::from_millis(1_700_000_120)),
-                            old_head: Some(git_oid('1')),
+                            old_head: if branch_creation { None } else { Some(git_oid('1')) },
                             attempted_new_head: Some(git_oid('2')),
                             completed_at: Some(UnixMillis::from_millis(1_700_000_130)),
                             result: Some(result),
@@ -838,7 +882,12 @@ mod tests {
                 GitPushAuditScript::ValidUnattempted {
                     result,
                     close_before_outcome,
+                    branch_creation,
                 } => {
+                    let push_request = GitPushRequestRecord {
+                        expected_remote_head: if branch_creation { None } else { Some(git_oid('1')) },
+                        ..sample_git_push_request_record(push_request_id, s.session_id)
+                    };
                     log.record_git_push_request(&push_request).unwrap();
                     if close_before_outcome {
                         log.close_session(s.session_id, UnixMillis::from_millis(1_700_000_125))
@@ -955,6 +1004,33 @@ mod tests {
                         matches!(
                             err,
                             AuditError::Invariant("git push attempt branch differs from request")
+                        ),
+                        "got: {err:?}"
+                    );
+                }
+                GitPushAuditScript::AttemptHeadPresenceMismatch { request_has_head } => {
+                    let push_request = GitPushRequestRecord {
+                        expected_remote_head: if request_has_head { Some(git_oid('1')) } else { None },
+                        ..sample_git_push_request_record(push_request_id, s.session_id)
+                    };
+                    log.record_git_push_request(&push_request).unwrap();
+                    let grant = record_sample_write_grant(&log, s.session_id, capability_request_id);
+                    let attempt = GitPushAttemptRecord {
+                        old_head: if request_has_head { None } else { Some(git_oid('1')) },
+                        ..git_push_attempt_record(
+                            push_attempt_id,
+                            push_request_id,
+                            capability_request_id,
+                            grant.jti,
+                            sample_git_repo(),
+                            "main".parse().unwrap(),
+                        )
+                    };
+                    let err = log.record_git_push_attempt(&attempt).unwrap_err();
+                    assert!(
+                        matches!(
+                            err,
+                            AuditError::Invariant("git push attempt old head differs from request")
                         ),
                         "got: {err:?}"
                     );
@@ -1123,7 +1199,7 @@ mod tests {
                 planned_at: UnixMillis::from_millis(1_700_000_120),
                 repo: sample_git_repo(),
                 branch: "main".parse().unwrap(),
-                old_head: git_oid('1'),
+                old_head: Some(git_oid('1')),
                 new_head: git_oid('2'),
             })
             .unwrap_err();
@@ -1184,7 +1260,7 @@ mod tests {
                 planned_at: UnixMillis::from_millis(1_700_000_120),
                 repo: sample_git_repo(),
                 branch: "main".parse().unwrap(),
-                old_head: git_oid('1'),
+                old_head: Some(git_oid('1')),
                 new_head: git_oid('2'),
             })
             .unwrap_err();
@@ -1240,7 +1316,7 @@ mod tests {
             planned_at: UnixMillis::from_millis(1_700_000_120),
             repo: sample_git_repo(),
             branch: "main".parse().unwrap(),
-            old_head: git_oid('1'),
+            old_head: Some(git_oid('1')),
             new_head: git_oid('2'),
         })
         .unwrap();
