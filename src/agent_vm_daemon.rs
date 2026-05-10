@@ -27,6 +27,7 @@ use crate::core::{
     AgentKind, AgentNetwork, AgentNetworkPool, AgentVmConfigError, BrokerPorts, SessionId,
     SessionRecord, UnixMillis,
 };
+use crate::process_spawn;
 use crate::protocol::AgentVmSessionInfo;
 use crate::secret::SecretStore;
 use crate::server::BrokerState;
@@ -632,9 +633,13 @@ impl AgentVmDaemon {
         let vm_name = vm_name.to_string();
         let script = script.to_string();
         let output = tokio::task::spawn_blocking(move || {
-            Command::new(container)
+            let mut command = Command::new(container);
+            command
                 .args(["exec", &vm_name, "sh", "-c", &script])
-                .output()
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped());
+            process_spawn::output(&mut command)
         })
         .await?
         .map_err(|source| AgentVmDaemonError::WorkspaceBootstrapSpawn { step, source })?;
