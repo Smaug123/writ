@@ -49,7 +49,12 @@ pub const CHATGPT_OAUTH_REFRESH_LEEWAY_SECONDS: i64 = 60;
 
 /// Mirror of codex's `AuthDotJson`. Field names match the on-disk JSON
 /// codex itself produces so that the same blob round-trips cleanly.
-#[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
+///
+/// `Debug` is hand-rolled to redact `openai_api_key` and to delegate to
+/// `ChatgptTokens`'s own redacting `Debug`: a stray `{bundle:?}` (or a
+/// debug print of the enclosing `ChatgptOauthState::Loaded`) would
+/// otherwise spray live credentials into logs.
+#[derive(Clone, Default, Eq, PartialEq, Deserialize, Serialize)]
 pub struct ChatgptAuthBundle {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_mode: Option<String>,
@@ -67,8 +72,26 @@ pub struct ChatgptAuthBundle {
     pub agent_identity: Option<String>,
 }
 
+impl std::fmt::Debug for ChatgptAuthBundle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChatgptAuthBundle")
+            .field("auth_mode", &self.auth_mode)
+            .field(
+                "openai_api_key",
+                &self.openai_api_key.as_ref().map(|_| "<redacted>"),
+            )
+            .field("tokens", &self.tokens)
+            .field("last_refresh", &self.last_refresh)
+            .field("agent_identity", &self.agent_identity)
+            .finish()
+    }
+}
+
 /// Mirror of codex's `TokenData`.
-#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+///
+/// `Debug` is hand-rolled to redact the three credential strings: a
+/// stray `{tokens:?}` would otherwise dump live tokens.
+#[derive(Clone, Eq, PartialEq, Deserialize, Serialize)]
 pub struct ChatgptTokens {
     /// Raw JWT string. Codex parses claims out of this; we only need
     /// `chatgpt_account_id` / `chatgpt_account_is_fedramp`, plus `exp`
@@ -78,6 +101,17 @@ pub struct ChatgptTokens {
     pub refresh_token: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account_id: Option<String>,
+}
+
+impl std::fmt::Debug for ChatgptTokens {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChatgptTokens")
+            .field("id_token", &"<redacted>")
+            .field("access_token", &"<redacted>")
+            .field("refresh_token", &"<redacted>")
+            .field("account_id", &self.account_id)
+            .finish()
+    }
 }
 
 /// Parsed claims from a ChatGPT id_token. We only decode the fields we
