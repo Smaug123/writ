@@ -57,6 +57,7 @@ const TTL_SKEW_TOLERANCE_SECONDS: i64 = 60;
 
 /// Static configuration for one GitHub App installation.
 #[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GitHubAppConfig {
     pub app_id: u64,
     pub installation_id: u64,
@@ -395,15 +396,20 @@ impl<S: SecretStore> GitHubMinter<S> {
         // missing one.
         //
         // GitHub returns `full_name` in the repo's canonical casing, which
-        // need not match the casing the caller supplied. Compare
-        // case-insensitively to match GitHub's own resolution semantics.
-        let expected = scope.repository.to_string();
+        // need not match the casing the caller supplied. Compare via the
+        // `CanonicalRepoRef` projection so the comparison is type-checked —
+        // a bare `==` between two `RepoRef`s would be exact and silently
+        // reject a correct response that differed only in casing.
+        let expected_canonical = scope.repository.canonicalise();
         match parsed.repository_selection {
             RepositorySelection::Selected => {
+                let returned_canonical = parsed
+                    .repositories
+                    .first()
+                    .and_then(|r| r.full_name.parse::<RepoRef>().ok())
+                    .map(|r| r.canonicalise());
                 let matches_expected = parsed.repositories.len() == 1
-                    && parsed.repositories[0]
-                        .full_name
-                        .eq_ignore_ascii_case(&expected);
+                    && returned_canonical.as_ref() == Some(&expected_canonical);
                 if !matches_expected {
                     return Err(MintError::UnexpectedRepositories {
                         requested: scope.repository.clone(),
@@ -1692,6 +1698,26 @@ mod tests {
         assert_eq!(
             url,
             "https://example.com/api/v3/app/installations/7/access_tokens"
+        );
+    }
+
+    /// A typo on `api_base` (e.g. `apiBase`) used to be silently ignored,
+    /// causing a GHE-Server-targeted deployment to mint installation tokens
+    /// against public GitHub instead. `deny_unknown_fields` forces a hard
+    /// failure at config load time.
+    #[test]
+    fn github_app_config_rejects_unknown_field() {
+        let json = r#"{
+            "app_id": 1,
+            "installation_id": 2,
+            "installation_owner": "o",
+            "private_key_secret": "pk",
+            "apiBase": "https://github.example.com/api/v3"
+        }"#;
+        let err = serde_json::from_str::<GitHubAppConfig>(json).unwrap_err();
+        assert!(
+            err.to_string().contains("apiBase"),
+            "error should mention the unknown field, got: {err}"
         );
     }
 }

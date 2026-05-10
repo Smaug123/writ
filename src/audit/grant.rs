@@ -327,6 +327,11 @@ fn scope_authorised_by_request(request: &CapabilityRequest, scope: &GrantedScope
 }
 
 fn github_scope_authorised_by_request(r: &GitHubRequest, s: &GitHubGrantedScope) -> bool {
+    // Exact `!=` is intentional: `s.repository` was cloned from
+    // `r.repo()` by `policy::decide_github`, so a byte-identical match
+    // is what proves the scope was minted from this request. A
+    // case-insensitive `matches` here would let a row with
+    // operator-edited casing pass the structural check.
     if &s.repository != r.repo() {
         return false;
     }
