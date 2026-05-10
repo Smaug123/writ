@@ -24,8 +24,7 @@ use crate::server::BrokerState;
 
 use super::{
     ProxyAuditKind, ProxyStreamAudit, ProxyStreamBody, ProxyStreamState, VmHttpDispatch,
-    VmHttpHeader, VmHttpRequest, VmHttpResponse, VmHttpResponseHeader, VmHttpSession,
-    VmHttpStatus,
+    VmHttpHeader, VmHttpRequest, VmHttpResponse, VmHttpResponseHeader, VmHttpSession, VmHttpStatus,
 };
 
 pub(super) const VM_OPENAI_RESPONSES_PATH: &str = "/v1/responses";
@@ -467,8 +466,9 @@ fn openai_proxy_auth_failure(body: &'static str, label: &'static str) -> VmHttpO
 }
 
 impl<S: SecretStore + Send + Sync + 'static> VmHttpOpenAiProxyStream<S> {
-    pub(super) fn into_hyper_response(self) -> http::Response<UnsyncBoxBody<Bytes, std::io::Error>>
-    {
+    pub(super) fn into_hyper_response(
+        self,
+    ) -> http::Response<UnsyncBoxBody<Bytes, std::io::Error>> {
         let body = ProxyStreamBody {
             inner: Box::pin(self.response.bytes_stream()),
             audit: Some(ProxyStreamAudit {

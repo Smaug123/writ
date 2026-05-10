@@ -20,9 +20,7 @@ use crate::nix_cache::{
 use crate::secret::SecretStore;
 use crate::server::BrokerState;
 
-use super::{
-    VmHttpDispatch, VmHttpRequest, VmHttpResponse, VmHttpSession, VmHttpStatus,
-};
+use super::{VmHttpDispatch, VmHttpRequest, VmHttpResponse, VmHttpSession, VmHttpStatus};
 
 pub const VM_NIX_CACHE_PATH_PREFIX: &str = "/v1/nix/cache";
 pub(super) const VM_NIX_CACHE_INFO_PATH: &str = "/v1/nix/cache/nix-cache-info";
@@ -1070,9 +1068,8 @@ mod tests {
         basic, bearer, make_broker_state, open_audit_session, session_for_subnet, token,
     };
     use super::super::{
-        VM_HTTP_READ_TIMEOUT, VmHttpRequest, VmHttpServices, VmHttpStatus,
-        dispatch_vm_http_head, dispatch_vm_http_head_and_body,
-        route_authenticated_vm_http_request,
+        VM_HTTP_READ_TIMEOUT, VmHttpRequest, VmHttpServices, VmHttpStatus, dispatch_vm_http_head,
+        dispatch_vm_http_head_and_body, route_authenticated_vm_http_request,
     };
     use super::*;
     use crate::core::Ipv4Cidr;

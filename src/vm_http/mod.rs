@@ -11,31 +11,31 @@ mod nix_cache;
 mod openai_proxy;
 
 pub use agent_runs::VmHttpAgentRunService;
-pub use claude_proxy::{
-    DEFAULT_CLAUDE_ANTHROPIC_VERSION, VmHttpClaudeProxyAuthKind, VmHttpClaudeProxyConfig,
-    VmHttpClaudeProxyConfigError, VmHttpClaudeProxyService,
-};
-pub use git_clone::{VmHttpGitCloneConfig, VmHttpGitCloneService};
-pub use nix_cache::{
-    VM_NIX_BASIC_LOGIN, VM_NIX_CACHE_PATH_PREFIX, VmHttpNixCacheConfig,
-    VmHttpNixCacheConfigError, VmHttpNixCacheService,
-};
-pub use openai_proxy::{
-    VmHttpOpenAiProxyAuthKind, VmHttpOpenAiProxyConfig, VmHttpOpenAiProxyConfigError,
-    VmHttpOpenAiProxyService,
-};
 use agent_runs::{
     parse_agent_run_config_target, parse_agent_run_outcome_target, route_agent_run_config_request,
     route_agent_run_outcome_request,
+};
+pub use claude_proxy::{
+    DEFAULT_CLAUDE_ANTHROPIC_VERSION, VmHttpClaudeProxyAuthKind, VmHttpClaudeProxyConfig,
+    VmHttpClaudeProxyConfigError, VmHttpClaudeProxyService,
 };
 use claude_proxy::{
     VmHttpClaudeProxyStream, classify_claude_proxy_target, is_claude_proxy_target,
     record_claude_proxy_local_response, route_claude_proxy_request,
 };
+pub use git_clone::{VmHttpGitCloneConfig, VmHttpGitCloneService};
 use git_clone::{is_git_clone_target, route_git_clone_request};
-use nix_cache::{is_nix_cache_target, record_nix_cache_local_response, route_nix_cache_request};
 #[cfg(test)]
 use nix_cache::route_nix_cache_request_without_upstream;
+pub use nix_cache::{
+    VM_NIX_BASIC_LOGIN, VM_NIX_CACHE_PATH_PREFIX, VmHttpNixCacheConfig, VmHttpNixCacheConfigError,
+    VmHttpNixCacheService,
+};
+use nix_cache::{is_nix_cache_target, record_nix_cache_local_response, route_nix_cache_request};
+pub use openai_proxy::{
+    VmHttpOpenAiProxyAuthKind, VmHttpOpenAiProxyConfig, VmHttpOpenAiProxyConfigError,
+    VmHttpOpenAiProxyService,
+};
 use openai_proxy::{
     VmHttpOpenAiProxyStream, classify_openai_proxy_target, is_openai_proxy_target,
     record_openai_proxy_local_response, route_openai_proxy_request,
@@ -421,8 +421,7 @@ impl<S: SecretStore> HyperBody for ProxyStreamBody<S> {
                 Poll::Ready(None)
             }
             Poll::Ready(Some(Ok(chunk))) => {
-                let chunk_len =
-                    u64::try_from(chunk.len()).expect("HTTP chunk length fits in u64");
+                let chunk_len = u64::try_from(chunk.len()).expect("HTTP chunk length fits in u64");
                 let new_len = me
                     .response_bytes
                     .checked_add(chunk_len)
@@ -468,9 +467,7 @@ impl<S: SecretStore> Drop for ProxyStreamBody<S> {
                         error,
                     },
                 ) {
-                    eprintln!(
-                        "VM HTTP Claude proxy streaming audit outcome write failed: {err}"
-                    );
+                    eprintln!("VM HTTP Claude proxy streaming audit outcome write failed: {err}");
                 }
             }
             ProxyAuditKind::OpenAi => {
@@ -485,9 +482,7 @@ impl<S: SecretStore> Drop for ProxyStreamBody<S> {
                         error,
                     },
                 ) {
-                    eprintln!(
-                        "VM HTTP OpenAI proxy streaming audit outcome write failed: {err}"
-                    );
+                    eprintln!("VM HTTP OpenAI proxy streaming audit outcome write failed: {err}");
                 }
             }
         }
@@ -1099,8 +1094,7 @@ where
     let request = builder
         .body(http_body_util::Full::new(Bytes::from(body)))
         .expect("test request builds with valid method/uri/headers");
-    let response =
-        serve_vm_http_request(session, peer_addr, request, services, read_timeout).await;
+    let response = serve_vm_http_request(session, peer_addr, request, services, read_timeout).await;
     DispatchedTestResponse::from_hyper_response(response).await
 }
 
@@ -2193,14 +2187,10 @@ esac
             SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(10, 1, 2, 3), 12345)),
         );
 
-        let response = route_authenticated_vm_http_request(
-            &session,
-            &request,
-            Vec::new(),
-            no_services(),
-        )
-        .await
-        .into_buffered();
+        let response =
+            route_authenticated_vm_http_request(&session, &request, Vec::new(), no_services())
+                .await
+                .into_buffered();
 
         assert_eq!(response.status, VmHttpStatus::NotFound);
     }

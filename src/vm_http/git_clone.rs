@@ -460,14 +460,10 @@ mod tests {
                 Some(bearer(token().as_str())),
                 peer,
             );
-            let response = route_authenticated_vm_http_request(
-                &session,
-                &request,
-                Vec::new(),
-                no_services(),
-            )
-            .await
-            .into_buffered();
+            let response =
+                route_authenticated_vm_http_request(&session, &request, Vec::new(), no_services())
+                    .await
+                    .into_buffered();
 
             assert_eq!(response.status, VmHttpStatus::NotFound);
         }

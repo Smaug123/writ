@@ -28,9 +28,9 @@ use crate::vm_git_bundle::{
 };
 use crate::vm_http::{
     DEFAULT_CLAUDE_ANTHROPIC_VERSION, VmHttpClaudeProxyAuthKind, VmHttpClaudeProxyConfig,
-    VmHttpClaudeProxyConfigError, VmHttpGitCloneConfig, VmHttpRuntimeConfig,
-    VmHttpNixCacheConfig, VmHttpNixCacheConfigError, VmHttpOpenAiProxyAuthKind,
-    VmHttpOpenAiProxyConfig, VmHttpOpenAiProxyConfigError,
+    VmHttpClaudeProxyConfigError, VmHttpGitCloneConfig, VmHttpNixCacheConfig,
+    VmHttpNixCacheConfigError, VmHttpOpenAiProxyAuthKind, VmHttpOpenAiProxyConfig,
+    VmHttpOpenAiProxyConfigError, VmHttpRuntimeConfig,
 };
 
 /// Top-level daemon configuration. Loaded from a JSON file at startup;
