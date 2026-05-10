@@ -8,8 +8,8 @@ use std::io::Read as _;
 use std::sync::{Arc, Mutex};
 
 use crate::audit::{
-    AuditError, NixCacheAuditDecision, NixCacheAuditRoute, NixCacheOutcomeRecord,
-    NixCacheRequestRecord,
+    AUDIT_WRITE_FAILURE_TARGET, AuditError, NixCacheAuditDecision, NixCacheAuditRoute,
+    NixCacheOutcomeRecord, NixCacheRequestRecord,
 };
 use crate::core::{RequestId, UnixMillis};
 use crate::nix_cache::{
@@ -275,14 +275,26 @@ pub(super) async fn route_nix_cache_request<S: SecretStore>(
         NixCacheAuditDecision::Allow,
         Some(&route),
     ) {
-        eprintln!("VM HTTP Nix cache audit request write failed: {err}");
+        tracing::error!(
+            target: AUDIT_WRITE_FAILURE_TARGET,
+            kind = "nix_cache_request",
+            request_id = %request_id,
+            error = %err,
+            "audit write failed",
+        );
         return VmHttpResponse::text(VmHttpStatus::InternalServerError, "audit write failed")
             .into();
     }
 
     let fetch = service.fetch_route(request.method.as_str(), &route).await;
     if let Err(err) = record_nix_cache_outcome(&service, request_id, &fetch) {
-        eprintln!("VM HTTP Nix cache audit outcome write failed: {err}");
+        tracing::error!(
+            target: AUDIT_WRITE_FAILURE_TARGET,
+            kind = "nix_cache_outcome",
+            request_id = %request_id,
+            error = %err,
+            "audit write failed",
+        );
         return VmHttpResponse::text(VmHttpStatus::InternalServerError, "audit write failed")
             .into();
     }
@@ -304,7 +316,13 @@ pub(super) fn record_nix_cache_local_response<S: SecretStore>(
     if let Err(err) =
         record_nix_cache_request(service, request_id, session, request, decision, route)
     {
-        eprintln!("VM HTTP Nix cache audit request write failed: {err}");
+        tracing::error!(
+            target: AUDIT_WRITE_FAILURE_TARGET,
+            kind = "nix_cache_request",
+            request_id = %request_id,
+            error = %err,
+            "audit write failed",
+        );
         return VmHttpResponse::text(VmHttpStatus::InternalServerError, "audit write failed");
     }
     let fetch = VmHttpNixCacheProxyFetch {
@@ -315,7 +333,13 @@ pub(super) fn record_nix_cache_local_response<S: SecretStore>(
         response,
     };
     if let Err(err) = record_nix_cache_outcome(service, request_id, &fetch) {
-        eprintln!("VM HTTP Nix cache audit outcome write failed: {err}");
+        tracing::error!(
+            target: AUDIT_WRITE_FAILURE_TARGET,
+            kind = "nix_cache_outcome",
+            request_id = %request_id,
+            error = %err,
+            "audit write failed",
+        );
         return VmHttpResponse::text(VmHttpStatus::InternalServerError, "audit write failed");
     }
     fetch.response

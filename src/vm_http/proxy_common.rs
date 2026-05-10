@@ -18,7 +18,9 @@ use http_body_util::BodyExt as _;
 use http_body_util::combinators::UnsyncBoxBody;
 use hyper::body::{Body as HyperBody, Frame};
 
-use crate::audit::{AuditLog, ClaudeProxyOutcomeRecord, OpenAiProxyOutcomeRecord};
+use crate::audit::{
+    AUDIT_WRITE_FAILURE_TARGET, AuditLog, ClaudeProxyOutcomeRecord, OpenAiProxyOutcomeRecord,
+};
 use crate::core::{RequestId, UnixMillis};
 use crate::openai_chatgpt_auth::ChatgptUpstreamHeaders;
 
@@ -265,7 +267,13 @@ impl ProxyAudit for ClaudeBackend {
             response_bytes: fields.response_bytes,
             error: fields.error,
         }) {
-            eprintln!("VM HTTP Claude proxy streaming audit outcome write failed: {err}");
+            tracing::error!(
+                target: AUDIT_WRITE_FAILURE_TARGET,
+                kind = "claude_proxy_streaming_outcome",
+                request_id = %fields.request_id,
+                error = %err,
+                "audit write failed",
+            );
         }
     }
 }
@@ -287,7 +295,13 @@ impl ProxyAudit for OpenAiBackend {
             response_bytes: fields.response_bytes,
             error: fields.error,
         }) {
-            eprintln!("VM HTTP OpenAI proxy streaming audit outcome write failed: {err}");
+            tracing::error!(
+                target: AUDIT_WRITE_FAILURE_TARGET,
+                kind = "openai_proxy_streaming_outcome",
+                request_id = %fields.request_id,
+                error = %err,
+                "audit write failed",
+            );
         }
     }
 }
