@@ -9,6 +9,7 @@ mod claude_proxy;
 mod git_clone;
 mod nix_cache;
 mod openai_proxy;
+mod proxy_common;
 
 pub use agent_runs::VmHttpAgentRunService;
 use agent_runs::{

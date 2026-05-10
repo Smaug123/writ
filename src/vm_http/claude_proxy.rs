@@ -18,6 +18,10 @@ use crate::core::{RequestId, UnixMillis};
 use crate::secret::{SecretKey, SecretStore};
 use crate::server::BrokerState;
 
+use super::proxy_common::{
+    is_proxy_id_byte, proxy_request_wants_streaming, proxy_response_content_type,
+    proxy_target_path, read_upstream_body_bounded,
+};
 use super::{
     ProxyAuditKind, ProxyStreamAudit, ProxyStreamBody, ProxyStreamState, VmHttpDispatch,
     VmHttpHeader, VmHttpRequest, VmHttpResponse, VmHttpResponseHeader, VmHttpSession, VmHttpStatus,
@@ -99,17 +103,6 @@ pub(crate) struct VmHttpClaudeProxyStream<S: SecretStore> {
     content_type: &'static str,
     headers: Vec<VmHttpResponseHeader>,
     max_response_bytes: u64,
-}
-
-#[derive(Debug, thiserror::Error)]
-enum VmHttpClaudeProxyBodyReadError {
-    #[error("Claude proxy upstream response body read failed after {bytes_read} bytes: {source}")]
-    Request {
-        source: reqwest::Error,
-        bytes_read: u64,
-    },
-    #[error("Claude proxy upstream response exceeds {max} bytes after {bytes_read} bytes")]
-    ResponseTooLarge { max: u64, bytes_read: u64 },
 }
 
 struct ClaudeProxyForwardHeader {
@@ -236,10 +229,9 @@ impl<S: SecretStore> VmHttpClaudeProxyService<S> {
         };
 
         let upstream_status = response.status();
-        let content_type = claude_proxy_response_content_type(&response);
+        let content_type = proxy_response_content_type(&response);
         let response_headers = claude_proxy_response_headers(response.headers());
-        let body = match read_claude_upstream_body_bounded(response, self.config.max_response_bytes)
-            .await
+        let body = match read_upstream_body_bounded(response, self.config.max_response_bytes).await
         {
             Ok(body) => body,
             Err(err) => {
@@ -298,7 +290,7 @@ impl<S: SecretStore> VmHttpClaudeProxyService<S> {
             }
         };
         let upstream_status = response.status().as_u16();
-        let content_type = claude_proxy_response_content_type(&response);
+        let content_type = proxy_response_content_type(&response);
         let headers = claude_proxy_response_headers(response.headers());
         Ok(VmHttpClaudeProxyStream {
             broker_state: Arc::clone(&self.broker_state),
@@ -313,7 +305,7 @@ impl<S: SecretStore> VmHttpClaudeProxyService<S> {
     }
 
     fn upstream_url(&self, target: &str) -> Option<reqwest::Url> {
-        let path = claude_proxy_target_path(target);
+        let path = proxy_target_path(target);
         let relative: Cow<'static, str> = match path {
             VM_CLAUDE_MESSAGES_PATH => "v1/messages".into(),
             VM_CLAUDE_COUNT_TOKENS_PATH => "v1/messages/count_tokens".into(),
@@ -496,54 +488,6 @@ impl VmHttpClaudeProxyConfig {
     }
 }
 
-async fn read_claude_upstream_body_bounded(
-    mut response: reqwest::Response,
-    max: u64,
-) -> Result<Vec<u8>, VmHttpClaudeProxyBodyReadError> {
-    let mut body = Vec::new();
-    loop {
-        let chunk = match response.chunk().await {
-            Ok(Some(chunk)) => chunk,
-            Ok(None) => break,
-            Err(source) => {
-                return Err(VmHttpClaudeProxyBodyReadError::Request {
-                    source,
-                    bytes_read: body.len() as u64,
-                });
-            }
-        };
-        let chunk_len = u64::try_from(chunk.len()).expect("HTTP chunk length fits in u64");
-        let new_len = (body.len() as u64)
-            .checked_add(chunk_len)
-            .expect("HTTP response byte count overflowed before configured bound check");
-        if new_len > max {
-            return Err(VmHttpClaudeProxyBodyReadError::ResponseTooLarge {
-                max,
-                bytes_read: new_len,
-            });
-        }
-        body.extend_from_slice(&chunk);
-    }
-    Ok(body)
-}
-
-impl VmHttpClaudeProxyBodyReadError {
-    fn audit_error_label(&self) -> &'static str {
-        match self {
-            Self::Request { .. } => "upstream body read failed",
-            Self::ResponseTooLarge { .. } => "upstream response too large",
-        }
-    }
-
-    fn bytes_read(&self) -> u64 {
-        match self {
-            Self::Request { bytes_read, .. } | Self::ResponseTooLarge { bytes_read, .. } => {
-                *bytes_read
-            }
-        }
-    }
-}
-
 pub(super) fn is_claude_proxy_target(target: &str) -> bool {
     classify_claude_proxy_target(target).is_some()
 }
@@ -553,7 +497,7 @@ pub(super) fn classify_claude_proxy_target(target: &str) -> Option<ClaudeProxyAu
     // such as `?beta=true` that select endpoint variants; the broker's policy
     // is to drop those (similar to the `anthropic-beta` header allowlist) and
     // forward a path-only request upstream.
-    let path = claude_proxy_target_path(target);
+    let path = proxy_target_path(target);
     match path {
         VM_CLAUDE_MESSAGES_PATH => Some(ClaudeProxyAuditRoute::Messages),
         VM_CLAUDE_COUNT_TOKENS_PATH => Some(ClaudeProxyAuditRoute::CountTokens),
@@ -569,23 +513,12 @@ pub(super) fn classify_claude_proxy_target(target: &str) -> Option<ClaudeProxyAu
     }
 }
 
-fn claude_proxy_target_path(target: &str) -> &str {
-    target
-        .split_once('?')
-        .map(|(path, _)| path)
-        .unwrap_or(target)
-}
-
 fn claude_proxy_model_id(path: &str) -> Option<&str> {
     let suffix = path.strip_prefix(VM_CLAUDE_MODELS_PREFIX)?;
-    if suffix.is_empty() || !suffix.bytes().all(is_claude_model_id_byte) {
+    if suffix.is_empty() || !suffix.bytes().all(is_proxy_id_byte) {
         return None;
     }
     Some(suffix)
-}
-
-fn is_claude_model_id_byte(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')
 }
 
 fn claude_proxy_forward_headers(
@@ -657,34 +590,6 @@ fn claude_proxy_forward_header_name(
     None
 }
 
-fn claude_proxy_response_content_type(response: &reqwest::Response) -> &'static str {
-    let Some(content_type) = response
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-    else {
-        return "application/json";
-    };
-    match content_type.split(';').next().map(str::trim) {
-        Some(media_type) if media_type.eq_ignore_ascii_case("application/json") => {
-            "application/json"
-        }
-        Some(media_type) if media_type.eq_ignore_ascii_case("application/problem+json") => {
-            "application/problem+json"
-        }
-        Some(media_type) if media_type.eq_ignore_ascii_case("text/event-stream") => {
-            "text/event-stream"
-        }
-        Some(media_type) if media_type.eq_ignore_ascii_case("text/plain") => {
-            "text/plain; charset=utf-8"
-        }
-        Some(media_type) if media_type.eq_ignore_ascii_case("application/octet-stream") => {
-            "application/octet-stream"
-        }
-        _ => "application/json",
-    }
-}
-
 fn claude_proxy_response_headers(
     headers: &reqwest::header::HeaderMap,
 ) -> Vec<VmHttpResponseHeader> {
@@ -730,13 +635,6 @@ fn claude_proxy_response_header_name(raw: &str) -> Option<&'static str> {
         return Some("Anthropic-Ratelimit-Tokens-Reset");
     }
     None
-}
-
-fn claude_proxy_request_wants_streaming(body: &[u8]) -> bool {
-    serde_json::from_slice::<serde_json::Value>(body)
-        .ok()
-        .and_then(|value| value.get("stream").and_then(serde_json::Value::as_bool))
-        .unwrap_or(false)
 }
 
 pub(super) async fn route_claude_proxy_request<S: SecretStore>(
@@ -821,7 +719,7 @@ pub(super) async fn route_claude_proxy_request<S: SecretStore>(
             .into();
     }
 
-    if claude_proxy_request_wants_streaming(&body) {
+    if proxy_request_wants_streaming(&body) {
         match service
             .fetch_stream(request_id, request, body, headers)
             .await
