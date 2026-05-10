@@ -23,7 +23,9 @@ use crate::agent_vm_lifecycle::{
     cleanup_managed_agent_vm_session, complete_agent_vm_session_start,
     remove_managed_agent_vm_session_state,
 };
-use crate::audit::{AgentRunAuditRecord, AgentVmWorkspaceBootstrapAuditRecord, AuditError};
+use crate::audit::{
+    AgentRunAuditRecord, AgentVmWorkspaceBootstrapAuditRecord, AuditError, AuditLog,
+};
 use crate::core::{
     AgentKind, AgentNetwork, AgentNetworkPool, AgentVmConfigError, BrokerPorts, SessionId,
     SessionRecord, UnixMillis,
@@ -331,6 +333,63 @@ pub enum AgentVmDaemonError {
     },
 }
 
+/// Report from [`AgentVmDaemon::reconcile_persisted_sessions`].
+///
+/// On boot, every persisted session is a cleanup obligation: the previous
+/// `writd` process owned the broker bearer token, the VM HTTP listener
+/// socket, and the runtime handle, none of which survive a crash. The guest
+/// inside such a VM cannot authenticate against the new broker, so we tear
+/// down the VM, firewall, and network and close out the audit row rather
+/// than try to resume the session.
+#[derive(Debug, Default, Eq, PartialEq)]
+pub struct AgentVmReconcileReport {
+    cleaned: Vec<SessionId>,
+    failed: Vec<AgentVmReconcileFailure>,
+}
+
+#[derive(Debug)]
+pub struct AgentVmReconcileFailure {
+    session_id: SessionId,
+    stage: AgentVmReconcileStage,
+    error: AgentVmReconcileStageError,
+}
+
+/// Which step of the per-session reconcile sequence reported the failure.
+///
+/// Ordering is `Cleanup` → `AuditClose` → `StateRemove`. A failure short-
+/// circuits the remaining stages so the state record is preserved for retry
+/// on the next boot.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum AgentVmReconcileStage {
+    /// Tear down the VM, firewall anchors, and network via the persisted
+    /// state record. Idempotent against partially-cleaned infrastructure.
+    Cleanup,
+    /// Close the audit-DB session row. Idempotent against already-closed
+    /// rows: the `UPDATE` only matches `closed_at IS NULL`.
+    AuditClose,
+    /// Remove the persisted state record so the subnet index and per-session
+    /// names are released for reuse.
+    StateRemove,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum AgentVmReconcileStageError {
+    #[error(transparent)]
+    Manager(#[from] AgentVmSessionManagerError),
+    #[error(transparent)]
+    Audit(#[from] AuditError),
+    #[error("reconcile worker task failed: {0}")]
+    Join(#[from] tokio::task::JoinError),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum AgentVmReconcileError {
+    #[error("could not load persisted agent VM session records: {0}")]
+    LoadAll(#[source] AgentVmSessionStateError),
+    #[error("reconcile load-all worker task failed: {0}")]
+    Join(#[from] tokio::task::JoinError),
+}
+
 impl AgentVmDaemonRuntimeConfig {
     pub fn new(
         lifecycle: AgentVmLifecycleRuntimeConfig,
@@ -401,6 +460,54 @@ impl AgentVmLifecycleRuntimeConfig {
         &self.state_store
     }
 }
+
+impl AgentVmReconcileReport {
+    pub fn cleaned(&self) -> &[SessionId] {
+        &self.cleaned
+    }
+
+    pub fn failed(&self) -> &[AgentVmReconcileFailure] {
+        &self.failed
+    }
+
+    pub fn is_clean(&self) -> bool {
+        self.failed.is_empty()
+    }
+}
+
+impl AgentVmReconcileFailure {
+    pub fn session_id(&self) -> SessionId {
+        self.session_id
+    }
+
+    pub fn stage(&self) -> AgentVmReconcileStage {
+        self.stage
+    }
+
+    pub fn error(&self) -> &AgentVmReconcileStageError {
+        &self.error
+    }
+}
+
+impl AgentVmReconcileStage {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Cleanup => "cleanup",
+            Self::AuditClose => "audit_close",
+            Self::StateRemove => "state_remove",
+        }
+    }
+}
+
+impl PartialEq for AgentVmReconcileFailure {
+    fn eq(&self, other: &Self) -> bool {
+        self.session_id == other.session_id
+            && self.stage == other.stage
+            && self.error.to_string() == other.error.to_string()
+    }
+}
+
+impl Eq for AgentVmReconcileFailure {}
 
 impl AgentVmDaemon {
     pub fn new(config: AgentVmDaemonRuntimeConfig) -> Self {
@@ -742,6 +849,81 @@ impl AgentVmDaemon {
             remove_managed_agent_vm_session_state(&store, session_id)
         })
         .await??;
+        Ok(())
+    }
+
+    /// Treat every persisted session as a cleanup obligation and drive it to
+    /// completion: tear down the VM/firewall/network via the persisted facts,
+    /// close the audit row, then remove the state record.
+    ///
+    /// MUST be called before [`crate::server::run_with_agent_vm`] begins
+    /// accepting connections. Subnet selection in `start_session` is driven
+    /// by `state_store.load_all()`; accepting new starts before reconcile
+    /// completes would race the new session against the persisted one that
+    /// is about to be freed, either colliding on the subnet index (rejected,
+    /// noisy) or — worse — letting the new session win and leaking the old
+    /// VM's network.
+    ///
+    /// Per-session failures are collected into the report; the sweep keeps
+    /// going. A failed session keeps its state record so the next boot
+    /// retries. `LoadAll` failure aborts before any session is touched and
+    /// is surfaced as the outer `Err`.
+    pub async fn reconcile_persisted_sessions(
+        &self,
+        audit: &Arc<AuditLog>,
+    ) -> Result<AgentVmReconcileReport, AgentVmReconcileError> {
+        let store = self.config.lifecycle.state_store.clone();
+        let states = tokio::task::spawn_blocking(move || store.load_all())
+            .await?
+            .map_err(AgentVmReconcileError::LoadAll)?;
+
+        let mut report = AgentVmReconcileReport::default();
+        for state in states {
+            let session_id = state.session_id();
+            match self.reconcile_one_session(audit, session_id).await {
+                Ok(()) => report.cleaned.push(session_id),
+                Err((stage, error)) => report.failed.push(AgentVmReconcileFailure {
+                    session_id,
+                    stage,
+                    error,
+                }),
+            }
+        }
+        Ok(report)
+    }
+
+    async fn reconcile_one_session(
+        &self,
+        audit: &Arc<AuditLog>,
+        session_id: SessionId,
+    ) -> Result<(), (AgentVmReconcileStage, AgentVmReconcileStageError)> {
+        let store = self.config.lifecycle.state_store.clone();
+        let tools = self.config.lifecycle.tools.clone();
+        match tokio::task::spawn_blocking(move || {
+            cleanup_managed_agent_vm_session(&store, session_id, tools)
+        })
+        .await
+        {
+            Err(join) => return Err((AgentVmReconcileStage::Cleanup, join.into())),
+            Ok(Err(err)) => return Err((AgentVmReconcileStage::Cleanup, err.into())),
+            Ok(Ok(())) => {}
+        }
+
+        if let Err(err) = audit.close_session(session_id, UnixMillis::now()) {
+            return Err((AgentVmReconcileStage::AuditClose, err.into()));
+        }
+
+        let store = self.config.lifecycle.state_store.clone();
+        match tokio::task::spawn_blocking(move || {
+            remove_managed_agent_vm_session_state(&store, session_id)
+        })
+        .await
+        {
+            Err(join) => return Err((AgentVmReconcileStage::StateRemove, join.into())),
+            Ok(Err(err)) => return Err((AgentVmReconcileStage::StateRemove, err.into())),
+            Ok(Ok(())) => {}
+        }
+
         Ok(())
     }
 
@@ -1235,6 +1417,30 @@ mod tests {
              printf '%s\\n' \"$*\" >> {args_log}\n\
              if [ \"$1\" = \"network\" ] && [ \"$2\" = \"create\" ]; then\n\
              exit 42\n\
+             fi\n\
+             exit 0\n",
+            args_log = shell_quote(args_log),
+        );
+        fs::write(&path, script).unwrap();
+        let mut permissions = fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&path, permissions).unwrap();
+        path
+    }
+
+    /// Fail only when invoked as the `pf-helper remove ...` step of a stop plan.
+    ///
+    /// All non-pf-helper invocations (`container list/rm/stop/delete`,
+    /// `container network ...`) take `rm`/`stop`/`delete`/`list` as `$2`, so
+    /// matching on `$2 = "remove"` isolates the firewall-removal failure from
+    /// the VM and network teardown probes.
+    fn write_fake_pf_remove_failure_tool(dir: &Path, args_log: &Path) -> PathBuf {
+        let path = dir.join("fake-pf-remove-failure-tool");
+        let script = format!(
+            "#!/bin/sh\n\
+             printf '%s\\n' \"$*\" >> {args_log}\n\
+             if [ \"$2\" = \"remove\" ]; then\n\
+             exit 7\n\
              fi\n\
              exit 0\n",
             args_log = shell_quote(args_log),
@@ -1755,6 +1961,141 @@ mod tests {
             &["http://192.168.252.1:51375/".to_string()]
         );
         assert!(!sessions[0].runtime_attached);
+    }
+
+    #[tokio::test]
+    async fn daemon_reconcile_on_empty_store_is_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let args_log = dir.path().join("args.log");
+        let env_path_log = dir.path().join("env-path.log");
+        let env_log = dir.path().join("env.log");
+        let fake_tool = write_fake_tool(dir.path(), &args_log, &env_path_log, &env_log);
+        let (config, _state_store) = daemon_config(dir.path(), &fake_tool);
+        let daemon = AgentVmDaemon::new(config);
+        let audit = Arc::new(AuditLog::open_in_memory().unwrap());
+
+        let report = daemon.reconcile_persisted_sessions(&audit).await.unwrap();
+
+        assert!(report.cleaned().is_empty());
+        assert!(report.failed().is_empty());
+        assert!(report.is_clean());
+    }
+
+    #[tokio::test]
+    async fn daemon_reconcile_cleans_persisted_state_and_closes_audit() {
+        let dir = tempfile::tempdir().unwrap();
+        let args_log = dir.path().join("args.log");
+        let env_path_log = dir.path().join("env-path.log");
+        let env_log = dir.path().join("env.log");
+        let fake_tool = write_fake_tool(dir.path(), &args_log, &env_path_log, &env_log);
+        let (config, state_store) = daemon_config(dir.path(), &fake_tool);
+        occupy_subnet(&state_store, 252);
+        let session_id = state_store.load_all().unwrap().pop().unwrap().session_id();
+        let audit = Arc::new(AuditLog::open_in_memory().unwrap());
+        audit
+            .open_session(&SessionRecord {
+                session_id,
+                label: None,
+                agent_kind: Some(AgentKind::Claude),
+                agent_model: None,
+                opened_at: UnixMillis::from_millis(1_700_000_000),
+                closed_at: None,
+            })
+            .unwrap();
+        let daemon = AgentVmDaemon::new(config);
+
+        let report = daemon.reconcile_persisted_sessions(&audit).await.unwrap();
+
+        assert_eq!(report.cleaned(), &[session_id]);
+        assert!(report.failed().is_empty());
+        assert!(state_store.load_all().unwrap().is_empty());
+        let recorded = audit.get_session(session_id).unwrap().unwrap();
+        assert!(recorded.closed_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn daemon_reconcile_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let args_log = dir.path().join("args.log");
+        let env_path_log = dir.path().join("env-path.log");
+        let env_log = dir.path().join("env.log");
+        let fake_tool = write_fake_tool(dir.path(), &args_log, &env_path_log, &env_log);
+        let (config, state_store) = daemon_config(dir.path(), &fake_tool);
+        occupy_subnet(&state_store, 252);
+        let audit = Arc::new(AuditLog::open_in_memory().unwrap());
+        let daemon = AgentVmDaemon::new(config);
+
+        let first = daemon.reconcile_persisted_sessions(&audit).await.unwrap();
+        assert_eq!(first.cleaned().len(), 1);
+        assert!(first.failed().is_empty());
+
+        let second = daemon.reconcile_persisted_sessions(&audit).await.unwrap();
+        assert!(second.cleaned().is_empty());
+        assert!(second.failed().is_empty());
+    }
+
+    #[tokio::test]
+    async fn daemon_reconcile_handles_multiple_sessions() {
+        let dir = tempfile::tempdir().unwrap();
+        let args_log = dir.path().join("args.log");
+        let env_path_log = dir.path().join("env-path.log");
+        let env_log = dir.path().join("env.log");
+        let fake_tool = write_fake_tool(dir.path(), &args_log, &env_path_log, &env_log);
+        let (config, state_store) = daemon_config(dir.path(), &fake_tool);
+        occupy_subnet(&state_store, 252);
+        occupy_subnet(&state_store, 253);
+        let mut expected: Vec<SessionId> = state_store
+            .load_all()
+            .unwrap()
+            .into_iter()
+            .map(|state| state.session_id())
+            .collect();
+        expected.sort();
+        let audit = Arc::new(AuditLog::open_in_memory().unwrap());
+        let daemon = AgentVmDaemon::new(config);
+
+        let report = daemon.reconcile_persisted_sessions(&audit).await.unwrap();
+
+        let mut cleaned: Vec<SessionId> = report.cleaned().to_vec();
+        cleaned.sort();
+        assert_eq!(cleaned, expected);
+        assert!(report.failed().is_empty());
+        assert!(state_store.load_all().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn daemon_reconcile_preserves_state_record_when_cleanup_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let args_log = dir.path().join("args.log");
+        let fake_tool = write_fake_pf_remove_failure_tool(dir.path(), &args_log);
+        let (config, state_store) = daemon_config(dir.path(), &fake_tool);
+        occupy_subnet(&state_store, 252);
+        let session_id = state_store.load_all().unwrap().pop().unwrap().session_id();
+        let audit = Arc::new(AuditLog::open_in_memory().unwrap());
+        audit
+            .open_session(&SessionRecord {
+                session_id,
+                label: None,
+                agent_kind: Some(AgentKind::Claude),
+                agent_model: None,
+                opened_at: UnixMillis::from_millis(1_700_000_000),
+                closed_at: None,
+            })
+            .unwrap();
+        let daemon = AgentVmDaemon::new(config);
+
+        let report = daemon.reconcile_persisted_sessions(&audit).await.unwrap();
+
+        assert!(report.cleaned().is_empty());
+        assert_eq!(report.failed().len(), 1);
+        let failure = &report.failed()[0];
+        assert_eq!(failure.session_id(), session_id);
+        assert_eq!(failure.stage(), AgentVmReconcileStage::Cleanup);
+        let remaining = state_store.load_all().unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].session_id(), session_id);
+        let recorded = audit.get_session(session_id).unwrap().unwrap();
+        assert!(recorded.closed_at.is_none());
     }
 
     #[test]
