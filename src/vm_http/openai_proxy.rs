@@ -5,9 +5,6 @@
 use std::borrow::Cow;
 use std::sync::Arc;
 
-use bytes::Bytes;
-use http_body_util::BodyExt as _;
-use http_body_util::combinators::UnsyncBoxBody;
 use serde::Deserialize;
 
 use crate::audit::{
@@ -22,9 +19,14 @@ use crate::openai_chatgpt_auth::{
 use crate::secret::{SecretKey, SecretStore};
 use crate::server::BrokerState;
 
+use super::proxy_common::{
+    ProxyAuditKind, ProxyFetch, ProxyForwardHeader, ProxyStream, is_proxy_id_byte,
+    proxy_request_wants_streaming, proxy_response_content_type, proxy_target_path,
+    read_upstream_body_bounded,
+};
 use super::{
-    ProxyAuditKind, ProxyStreamAudit, ProxyStreamBody, ProxyStreamState, VmHttpDispatch,
-    VmHttpHeader, VmHttpRequest, VmHttpResponse, VmHttpResponseHeader, VmHttpSession, VmHttpStatus,
+    VmHttpDispatch, VmHttpHeader, VmHttpRequest, VmHttpResponse, VmHttpResponseHeader,
+    VmHttpSession, VmHttpStatus,
 };
 
 pub(super) const VM_OPENAI_RESPONSES_PATH: &str = "/v1/responses";
@@ -96,42 +98,6 @@ pub enum VmHttpOpenAiProxyConfigError {
     UnsupportedChatgptRefreshScheme { raw: String, scheme: String },
 }
 
-#[derive(Debug)]
-struct VmHttpOpenAiProxyFetch {
-    response: VmHttpResponse,
-    upstream_url: Option<String>,
-    upstream_status: Option<u16>,
-    response_bytes: u64,
-    error: Option<&'static str>,
-}
-
-pub(crate) struct VmHttpOpenAiProxyStream<S: SecretStore> {
-    broker_state: Arc<BrokerState<S>>,
-    pub(super) request_id: RequestId,
-    response: reqwest::Response,
-    upstream_url: String,
-    pub(super) upstream_status: u16,
-    content_type: &'static str,
-    headers: Vec<VmHttpResponseHeader>,
-    max_response_bytes: u64,
-}
-
-#[derive(Debug, thiserror::Error)]
-enum VmHttpOpenAiProxyBodyReadError {
-    #[error("OpenAI proxy upstream response body read failed after {bytes_read} bytes: {source}")]
-    Request {
-        source: reqwest::Error,
-        bytes_read: u64,
-    },
-    #[error("OpenAI proxy upstream response exceeds {max} bytes after {bytes_read} bytes")]
-    ResponseTooLarge { max: u64, bytes_read: u64 },
-}
-
-struct OpenAiProxyForwardHeader {
-    name: reqwest::header::HeaderName,
-    value: reqwest::header::HeaderValue,
-}
-
 /// Resolved upstream authentication for a single OpenAI proxy request.
 ///
 /// We resolve into a small enum so the request builder applies the
@@ -196,7 +162,7 @@ impl<S: SecretStore> VmHttpOpenAiProxyService<S> {
         })
     }
 
-    async fn resolve_upstream_auth(&self) -> Result<UpstreamAuth, Box<VmHttpOpenAiProxyFetch>> {
+    async fn resolve_upstream_auth(&self) -> Result<UpstreamAuth, Box<ProxyFetch>> {
         match self.config.auth_kind() {
             VmHttpOpenAiProxyAuthKind::AuthorizationBearer => {
                 let secret = match self
@@ -253,11 +219,11 @@ impl<S: SecretStore> VmHttpOpenAiProxyService<S> {
         &self,
         request: &VmHttpRequest,
         body: Vec<u8>,
-        headers: Vec<OpenAiProxyForwardHeader>,
-    ) -> Result<(String, reqwest::RequestBuilder), Box<VmHttpOpenAiProxyFetch>> {
+        headers: Vec<ProxyForwardHeader>,
+    ) -> Result<(String, reqwest::RequestBuilder), Box<ProxyFetch>> {
         let Some(route) = classify_openai_proxy_target(&request.target) else {
             let response = VmHttpResponse::text(VmHttpStatus::NotFound, "not found");
-            return Err(Box::new(VmHttpOpenAiProxyFetch {
+            return Err(Box::new(ProxyFetch {
                 response_bytes: response.body.len() as u64,
                 response,
                 upstream_url: None,
@@ -267,7 +233,7 @@ impl<S: SecretStore> VmHttpOpenAiProxyService<S> {
         };
         let Some(url) = self.upstream_url(&request.target) else {
             let response = VmHttpResponse::text(VmHttpStatus::NotFound, "not found");
-            return Err(Box::new(VmHttpOpenAiProxyFetch {
+            return Err(Box::new(ProxyFetch {
                 response_bytes: response.body.len() as u64,
                 response,
                 upstream_url: None,
@@ -296,8 +262,8 @@ impl<S: SecretStore> VmHttpOpenAiProxyService<S> {
         &self,
         request: &VmHttpRequest,
         body: Vec<u8>,
-        headers: Vec<OpenAiProxyForwardHeader>,
-    ) -> VmHttpOpenAiProxyFetch {
+        headers: Vec<ProxyForwardHeader>,
+    ) -> ProxyFetch {
         let (upstream_url, builder) =
             match self.upstream_request_builder(request, body, headers).await {
                 Ok(parts) => parts,
@@ -310,7 +276,7 @@ impl<S: SecretStore> VmHttpOpenAiProxyService<S> {
                 eprintln!("VM HTTP OpenAI proxy upstream request failed: {err}");
                 let response =
                     VmHttpResponse::text(VmHttpStatus::BadGateway, "OpenAI proxy upstream failed");
-                return VmHttpOpenAiProxyFetch {
+                return ProxyFetch {
                     response_bytes: response.body.len() as u64,
                     response,
                     upstream_url: Some(upstream_url),
@@ -321,17 +287,16 @@ impl<S: SecretStore> VmHttpOpenAiProxyService<S> {
         };
 
         let upstream_status = response.status();
-        let content_type = openai_proxy_response_content_type(&response);
+        let content_type = proxy_response_content_type(&response);
         let response_headers = openai_proxy_response_headers(response.headers());
-        let body = match read_openai_upstream_body_bounded(response, self.config.max_response_bytes)
-            .await
+        let body = match read_upstream_body_bounded(response, self.config.max_response_bytes).await
         {
             Ok(body) => body,
             Err(err) => {
                 eprintln!("VM HTTP OpenAI proxy upstream body read failed: {err}");
                 let response =
                     VmHttpResponse::text(VmHttpStatus::BadGateway, "OpenAI proxy upstream failed");
-                return VmHttpOpenAiProxyFetch {
+                return ProxyFetch {
                     response_bytes: err.bytes_read(),
                     response,
                     upstream_url: Some(upstream_url),
@@ -341,7 +306,7 @@ impl<S: SecretStore> VmHttpOpenAiProxyService<S> {
             }
         };
         let response_bytes = body.len() as u64;
-        VmHttpOpenAiProxyFetch {
+        ProxyFetch {
             response: VmHttpResponse {
                 status: VmHttpStatus::Upstream(upstream_status.as_u16()),
                 content_type,
@@ -362,8 +327,8 @@ impl<S: SecretStore> VmHttpOpenAiProxyService<S> {
         request_id: RequestId,
         request: &VmHttpRequest,
         body: Vec<u8>,
-        headers: Vec<OpenAiProxyForwardHeader>,
-    ) -> Result<VmHttpOpenAiProxyStream<S>, VmHttpOpenAiProxyFetch> {
+        headers: Vec<ProxyForwardHeader>,
+    ) -> Result<ProxyStream<S>, ProxyFetch> {
         let (upstream_url, builder) = self
             .upstream_request_builder(request, body, headers)
             .await
@@ -374,7 +339,7 @@ impl<S: SecretStore> VmHttpOpenAiProxyService<S> {
                 eprintln!("VM HTTP OpenAI proxy upstream request failed: {err}");
                 let response =
                     VmHttpResponse::text(VmHttpStatus::BadGateway, "OpenAI proxy upstream failed");
-                return Err(VmHttpOpenAiProxyFetch {
+                return Err(ProxyFetch {
                     response_bytes: response.body.len() as u64,
                     response,
                     upstream_url: Some(upstream_url),
@@ -384,9 +349,9 @@ impl<S: SecretStore> VmHttpOpenAiProxyService<S> {
             }
         };
         let upstream_status = response.status().as_u16();
-        let content_type = openai_proxy_response_content_type(&response);
+        let content_type = proxy_response_content_type(&response);
         let headers = openai_proxy_response_headers(response.headers());
-        Ok(VmHttpOpenAiProxyStream {
+        Ok(ProxyStream {
             broker_state: Arc::clone(&self.broker_state),
             request_id,
             response,
@@ -395,11 +360,12 @@ impl<S: SecretStore> VmHttpOpenAiProxyService<S> {
             content_type,
             headers,
             max_response_bytes: self.config.max_response_bytes,
+            kind: ProxyAuditKind::OpenAi,
         })
     }
 
     fn upstream_url(&self, target: &str) -> Option<reqwest::Url> {
-        let path = openai_proxy_target_path(target);
+        let path = proxy_target_path(target);
         // ChatGPT-OAuth requests target `https://chatgpt.com/backend-api/codex/`
         // which exposes endpoints as bare names (e.g. `/codex/responses`),
         // whereas `https://api.openai.com/` exposes them under the `v1/`
@@ -454,44 +420,14 @@ impl<S: SecretStore> Clone for VmHttpOpenAiProxyService<S> {
     }
 }
 
-fn openai_proxy_auth_failure(body: &'static str, label: &'static str) -> VmHttpOpenAiProxyFetch {
+fn openai_proxy_auth_failure(body: &'static str, label: &'static str) -> ProxyFetch {
     let response = VmHttpResponse::text(VmHttpStatus::BadGateway, body);
-    VmHttpOpenAiProxyFetch {
+    ProxyFetch {
         response_bytes: response.body.len() as u64,
         response,
         upstream_url: None,
         upstream_status: None,
         error: Some(label),
-    }
-}
-
-impl<S: SecretStore + Send + Sync + 'static> VmHttpOpenAiProxyStream<S> {
-    pub(super) fn into_hyper_response(
-        self,
-    ) -> http::Response<UnsyncBoxBody<Bytes, std::io::Error>> {
-        let body = ProxyStreamBody {
-            inner: Box::pin(self.response.bytes_stream()),
-            audit: Some(ProxyStreamAudit {
-                broker_state: self.broker_state,
-                kind: ProxyAuditKind::OpenAi,
-                request_id: self.request_id,
-                upstream_url: self.upstream_url,
-                upstream_status: self.upstream_status,
-            }),
-            max_response_bytes: self.max_response_bytes,
-            response_bytes: 0,
-            state: ProxyStreamState::Streaming,
-        };
-        let mut builder = http::Response::builder()
-            .status(self.upstream_status)
-            .header(http::header::CONTENT_TYPE, self.content_type)
-            .header(http::header::CONNECTION, "close");
-        for header in self.headers {
-            builder = builder.header(header.name, header.value);
-        }
-        builder
-            .body(body.boxed_unsync())
-            .expect("VmHttpOpenAiProxyStream always builds a valid hyper response")
     }
 }
 
@@ -608,54 +544,6 @@ impl VmHttpOpenAiProxyConfig {
     }
 }
 
-async fn read_openai_upstream_body_bounded(
-    mut response: reqwest::Response,
-    max: u64,
-) -> Result<Vec<u8>, VmHttpOpenAiProxyBodyReadError> {
-    let mut body = Vec::new();
-    loop {
-        let chunk = match response.chunk().await {
-            Ok(Some(chunk)) => chunk,
-            Ok(None) => break,
-            Err(source) => {
-                return Err(VmHttpOpenAiProxyBodyReadError::Request {
-                    source,
-                    bytes_read: body.len() as u64,
-                });
-            }
-        };
-        let chunk_len = u64::try_from(chunk.len()).expect("HTTP chunk length fits in u64");
-        let new_len = (body.len() as u64)
-            .checked_add(chunk_len)
-            .expect("HTTP response byte count overflowed before configured bound check");
-        if new_len > max {
-            return Err(VmHttpOpenAiProxyBodyReadError::ResponseTooLarge {
-                max,
-                bytes_read: new_len,
-            });
-        }
-        body.extend_from_slice(&chunk);
-    }
-    Ok(body)
-}
-
-impl VmHttpOpenAiProxyBodyReadError {
-    fn audit_error_label(&self) -> &'static str {
-        match self {
-            Self::Request { .. } => "upstream body read failed",
-            Self::ResponseTooLarge { .. } => "upstream response too large",
-        }
-    }
-
-    fn bytes_read(&self) -> u64 {
-        match self {
-            Self::Request { bytes_read, .. } | Self::ResponseTooLarge { bytes_read, .. } => {
-                *bytes_read
-            }
-        }
-    }
-}
-
 pub(super) fn is_openai_proxy_target(target: &str) -> bool {
     classify_openai_proxy_target(target).is_some()
 }
@@ -665,7 +553,7 @@ pub(super) fn classify_openai_proxy_target(target: &str) -> Option<OpenAiProxyAu
     // such as `?include[]=...` on Responses; the broker drops them and
     // forwards a path-only request upstream so the guest can't expand the
     // surface area beyond what the broker has explicitly classified.
-    let path = openai_proxy_target_path(target);
+    let path = proxy_target_path(target);
     if path == VM_OPENAI_RESPONSES_PATH {
         return Some(OpenAiProxyAuditRoute::Responses);
     }
@@ -684,16 +572,9 @@ pub(super) fn classify_openai_proxy_target(target: &str) -> Option<OpenAiProxyAu
     None
 }
 
-fn openai_proxy_target_path(target: &str) -> &str {
-    target
-        .split_once('?')
-        .map(|(path, _)| path)
-        .unwrap_or(target)
-}
-
 fn openai_proxy_model_id(path: &str) -> Option<&str> {
     let suffix = path.strip_prefix(VM_OPENAI_MODELS_PREFIX)?;
-    if suffix.is_empty() || !suffix.bytes().all(is_openai_id_byte) {
+    if suffix.is_empty() || !suffix.bytes().all(is_proxy_id_byte) {
         return None;
     }
     Some(suffix)
@@ -702,20 +583,16 @@ fn openai_proxy_model_id(path: &str) -> Option<&str> {
 fn openai_proxy_response_cancel_id(path: &str) -> Option<&str> {
     let suffix = path.strip_prefix(VM_OPENAI_RESPONSES_PREFIX)?;
     let id = suffix.strip_suffix(VM_OPENAI_RESPONSE_CANCEL_SUFFIX)?;
-    if id.is_empty() || !id.bytes().all(is_openai_id_byte) {
+    if id.is_empty() || !id.bytes().all(is_proxy_id_byte) {
         return None;
     }
     Some(id)
 }
 
-fn is_openai_id_byte(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')
-}
-
 fn openai_proxy_forward_headers(
     headers: &[VmHttpHeader],
     auth_kind: VmHttpOpenAiProxyAuthKind,
-) -> Result<Vec<OpenAiProxyForwardHeader>, &'static str> {
+) -> Result<Vec<ProxyForwardHeader>, &'static str> {
     let mut forwarded = Vec::new();
     let mut saw_content_type = false;
     let mut saw_accept = false;
@@ -739,7 +616,7 @@ fn openai_proxy_forward_headers(
         }
         let value = reqwest::header::HeaderValue::from_str(&header.value)
             .map_err(|_| "invalid forwarded OpenAI header value")?;
-        forwarded.push(OpenAiProxyForwardHeader { name, value });
+        forwarded.push(ProxyForwardHeader { name, value });
     }
     Ok(forwarded)
 }
@@ -764,34 +641,6 @@ fn openai_proxy_forward_header_name(
         return Some(reqwest::header::USER_AGENT);
     }
     None
-}
-
-fn openai_proxy_response_content_type(response: &reqwest::Response) -> &'static str {
-    let Some(content_type) = response
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-    else {
-        return "application/json";
-    };
-    match content_type.split(';').next().map(str::trim) {
-        Some(media_type) if media_type.eq_ignore_ascii_case("application/json") => {
-            "application/json"
-        }
-        Some(media_type) if media_type.eq_ignore_ascii_case("application/problem+json") => {
-            "application/problem+json"
-        }
-        Some(media_type) if media_type.eq_ignore_ascii_case("text/event-stream") => {
-            "text/event-stream"
-        }
-        Some(media_type) if media_type.eq_ignore_ascii_case("text/plain") => {
-            "text/plain; charset=utf-8"
-        }
-        Some(media_type) if media_type.eq_ignore_ascii_case("application/octet-stream") => {
-            "application/octet-stream"
-        }
-        _ => "application/json",
-    }
 }
 
 fn openai_proxy_response_headers(
@@ -848,13 +697,6 @@ fn openai_proxy_response_header_name(raw: &str) -> Option<&'static str> {
         return Some("X-Ratelimit-Reset-Tokens");
     }
     None
-}
-
-fn openai_proxy_request_wants_streaming(body: &[u8]) -> bool {
-    serde_json::from_slice::<serde_json::Value>(body)
-        .ok()
-        .and_then(|value| value.get("stream").and_then(serde_json::Value::as_bool))
-        .unwrap_or(false)
 }
 
 pub(super) async fn route_openai_proxy_request<S: SecretStore>(
@@ -935,12 +777,12 @@ pub(super) async fn route_openai_proxy_request<S: SecretStore>(
             .into();
     }
 
-    if openai_proxy_request_wants_streaming(&body) {
+    if proxy_request_wants_streaming(&body) {
         match service
             .fetch_stream(request_id, request, body, headers)
             .await
         {
-            Ok(stream) => return VmHttpDispatch::OpenAiProxyStream(stream),
+            Ok(stream) => return VmHttpDispatch::ProxyStream(stream),
             Err(fetch) => {
                 if let Err(err) = service.broker_state.audit.record_openai_proxy_outcome(
                     &OpenAiProxyOutcomeRecord {
@@ -1275,16 +1117,14 @@ mod tests {
 
     #[test]
     fn openai_proxy_request_wants_streaming_reads_top_level_stream_field() {
-        assert!(openai_proxy_request_wants_streaming(
+        assert!(proxy_request_wants_streaming(
             br#"{"model":"gpt-5","stream":true}"#
         ));
-        assert!(!openai_proxy_request_wants_streaming(
+        assert!(!proxy_request_wants_streaming(
             br#"{"model":"gpt-5","stream":false}"#
         ));
-        assert!(!openai_proxy_request_wants_streaming(
-            br#"{"model":"gpt-5"}"#
-        ));
-        assert!(!openai_proxy_request_wants_streaming(b"not-json"));
+        assert!(!proxy_request_wants_streaming(br#"{"model":"gpt-5"}"#));
+        assert!(!proxy_request_wants_streaming(b"not-json"));
     }
 
     #[test]
