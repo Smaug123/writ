@@ -16,11 +16,11 @@ use agent_runs::{
     parse_agent_run_config_target, parse_agent_run_outcome_target, route_agent_run_config_request,
     route_agent_run_outcome_request,
 };
+use claude_proxy::VmHttpClaudeProxyService;
 pub use claude_proxy::{
     DEFAULT_CLAUDE_ANTHROPIC_VERSION, VmHttpClaudeProxyAuthKind, VmHttpClaudeProxyConfig,
-    VmHttpClaudeProxyConfigError, VmHttpClaudeProxyService,
+    VmHttpClaudeProxyConfigError,
 };
-use claude_proxy::{record_claude_proxy_local_response, route_claude_proxy_request};
 pub use git_clone::{VmHttpGitCloneConfig, VmHttpGitCloneService};
 use git_clone::{is_git_clone_target, route_git_clone_request};
 #[cfg(test)]
@@ -30,12 +30,14 @@ pub use nix_cache::{
     VmHttpNixCacheService,
 };
 use nix_cache::{is_nix_cache_target, record_nix_cache_local_response, route_nix_cache_request};
+use openai_proxy::VmHttpOpenAiProxyService;
 pub use openai_proxy::{
     VmHttpOpenAiProxyAuthKind, VmHttpOpenAiProxyConfig, VmHttpOpenAiProxyConfigError,
-    VmHttpOpenAiProxyService,
 };
-use openai_proxy::{record_openai_proxy_local_response, route_openai_proxy_request};
-use proxy_common::{ClaudeBackend, OpenAiBackend, ProxyBackend, ProxyStream};
+use proxy_common::{
+    ClaudeBackend, OpenAiBackend, ProxyAuditDecision, ProxyBackend, ProxyStream,
+    record_proxy_local_response, route_proxy_request,
+};
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -54,7 +56,7 @@ use tokio::sync::watch;
 use tokio::task::JoinSet;
 use tracing::Instrument;
 
-use crate::audit::{ClaudeProxyAuditDecision, NixCacheAuditDecision, OpenAiProxyAuditDecision};
+use crate::audit::NixCacheAuditDecision;
 use crate::bearer::is_bearer_token_byte;
 use crate::core::{BrokerPort, BrokerPortRange, Ipv4Cidr, SessionId};
 use crate::secret::SecretStore;
@@ -118,21 +120,12 @@ pub struct PreparedVmHttpSession<S: SecretStore + Send + Sync + 'static> {
     agent_runs: Option<VmHttpAgentRunService<S>>,
 }
 
-pub struct VmHttpProxies<S: SecretStore> {
-    pub claude: Option<VmHttpClaudeProxyService<S>>,
-    pub openai: Option<VmHttpOpenAiProxyService<S>>,
+pub(in crate::vm_http) struct VmHttpProxies<S: SecretStore + Send + Sync + 'static> {
+    pub(in crate::vm_http) claude: Option<VmHttpClaudeProxyService<S>>,
+    pub(in crate::vm_http) openai: Option<VmHttpOpenAiProxyService<S>>,
 }
 
-impl<S: SecretStore> VmHttpProxies<S> {
-    pub fn none() -> Self {
-        Self {
-            claude: None,
-            openai: None,
-        }
-    }
-}
-
-impl<S: SecretStore> Clone for VmHttpProxies<S> {
+impl<S: SecretStore + Send + Sync + 'static> Clone for VmHttpProxies<S> {
     fn clone(&self) -> Self {
         Self {
             claude: self.claude.clone(),
@@ -141,7 +134,7 @@ impl<S: SecretStore> Clone for VmHttpProxies<S> {
     }
 }
 
-struct VmHttpServices<S: SecretStore> {
+struct VmHttpServices<S: SecretStore + Send + Sync + 'static> {
     git_clone: Option<VmHttpGitCloneService<S>>,
     nix_cache: Option<VmHttpNixCacheService<S>>,
     claude_proxy: Option<VmHttpClaudeProxyService<S>>,
@@ -355,7 +348,7 @@ impl VmHttpRequest {
     }
 }
 
-impl<S: SecretStore> VmHttpServices<S> {
+impl<S: SecretStore + Send + Sync + 'static> VmHttpServices<S> {
     fn none() -> Self {
         Self {
             git_clone: None,
@@ -382,7 +375,7 @@ impl<S: SecretStore> VmHttpServices<S> {
     }
 }
 
-impl<S: SecretStore> Clone for VmHttpServices<S> {
+impl<S: SecretStore + Send + Sync + 'static> Clone for VmHttpServices<S> {
     fn clone(&self) -> Self {
         Self {
             git_clone: self.git_clone.clone(),
@@ -675,7 +668,9 @@ pub async fn run_vm_http_until_shutdown(
     .await
 }
 
-pub async fn run_vm_http_with_services_until_shutdown<S: SecretStore + Send + Sync + 'static>(
+pub(in crate::vm_http) async fn run_vm_http_with_services_until_shutdown<
+    S: SecretStore + Send + Sync + 'static,
+>(
     listener: TcpListener,
     session: VmHttpSession,
     git_clone: VmHttpGitCloneService<S>,
@@ -1023,13 +1018,13 @@ where
                 } else if let Some(route) = ClaudeBackend::classify_proxy_target(&request.target)
                     && let Some(service) = services.claude_proxy.as_ref()
                 {
-                    record_claude_proxy_local_response(
+                    record_proxy_local_response::<ClaudeBackend, _>(
                         service,
                         session,
                         &request,
                         route,
-                        ClaudeProxyAuditDecision::Deny {
-                            reason: vm_http_auth_error_reason(err).to_string(),
+                        ProxyAuditDecision::Deny {
+                            reason: vm_http_auth_error_reason(err).to_string().into(),
                         },
                         response,
                         None,
@@ -1038,13 +1033,13 @@ where
                 } else if let Some(route) = OpenAiBackend::classify_proxy_target(&request.target)
                     && let Some(service) = services.openai_proxy.as_ref()
                 {
-                    record_openai_proxy_local_response(
+                    record_proxy_local_response::<OpenAiBackend, _>(
                         service,
                         session,
                         &request,
                         route,
-                        OpenAiProxyAuditDecision::Deny {
-                            reason: vm_http_auth_error_reason(err).to_string(),
+                        ProxyAuditDecision::Deny {
+                            reason: vm_http_auth_error_reason(err).to_string().into(),
                         },
                         response,
                         None,
@@ -1138,7 +1133,7 @@ fn auth_error_response(scheme: VmHttpAuthScheme, err: VmHttpAuthError) -> VmHttp
 /// The maximum request body bytes a route is prepared to consume; `None`
 /// means the route does not read its body, and any declared body should be
 /// left in the connection.
-fn route_request_body_limit<S: SecretStore>(
+fn route_request_body_limit<S: SecretStore + Send + Sync + 'static>(
     request: &VmHttpRequest,
     services: &VmHttpServices<S>,
 ) -> Option<usize> {
@@ -1179,7 +1174,7 @@ async fn route_authenticated_vm_http_request<S>(
     services: VmHttpServices<S>,
 ) -> VmHttpDispatch
 where
-    S: SecretStore + Send + Sync,
+    S: SecretStore + Send + Sync + 'static,
 {
     if is_nix_cache_target(&request.target) {
         return route_nix_cache_request(session, request, services.nix_cache).await;
@@ -1189,14 +1184,14 @@ where
         let Some(service) = services.claude_proxy else {
             return VmHttpResponse::text(VmHttpStatus::NotFound, "not found").into();
         };
-        return route_claude_proxy_request(session, request, body, &service).await;
+        return route_proxy_request::<ClaudeBackend, _>(session, request, body, &service).await;
     }
 
     if OpenAiBackend::is_proxy_target(&request.target) {
         let Some(service) = services.openai_proxy else {
             return VmHttpResponse::text(VmHttpStatus::NotFound, "not found").into();
         };
-        return route_openai_proxy_request(session, request, body, &service).await;
+        return route_proxy_request::<OpenAiBackend, _>(session, request, body, &service).await;
     }
 
     if is_git_clone_target(&request.target) {

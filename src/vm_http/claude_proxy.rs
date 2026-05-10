@@ -3,39 +3,28 @@
 //! configured upstream), injecting host-side auth and stripping guest auth.
 
 use std::borrow::Cow;
-use std::marker::PhantomData;
-use std::sync::Arc;
 
 use serde::Deserialize;
 
 use crate::audit::{
-    AUDIT_WRITE_FAILURE_TARGET, ClaudeProxyAuditDecision, ClaudeProxyAuditRoute,
+    AuditError, AuditLog, ClaudeProxyAuditDecision, ClaudeProxyAuditRoute,
     ClaudeProxyOutcomeRecord, ClaudeProxyRequestRecord,
 };
-use crate::core::{RequestId, UnixMillis};
 use crate::secret::{SecretKey, SecretStore};
-use crate::server::BrokerState;
 
 use super::proxy_common::{
-    ClaudeBackend, ProxyBackend, ProxyFetch, ProxyForwardHeader, ProxyStream, UpstreamAuth,
-    is_proxy_id_byte, proxy_request_wants_streaming, proxy_response_content_type,
-    proxy_target_path, read_upstream_body_bounded,
+    ClaudeBackend, ProxyAuditDecision, ProxyBackend, ProxyBackendConfig, ProxyFetch,
+    ProxyForwardHeader, ProxyOutcomeFields, ProxyRequestFields, ProxyStream, UpstreamAuth,
+    VmHttpProxyService, is_proxy_id_byte, proxy_target_path,
 };
-use super::{
-    VmHttpDispatch, VmHttpHeader, VmHttpRequest, VmHttpResponse, VmHttpResponseHeader,
-    VmHttpSession, VmHttpStatus,
-};
+use super::{VmHttpDispatch, VmHttpHeader, VmHttpResponse, VmHttpStatus};
 
 pub(super) const VM_CLAUDE_MESSAGES_PATH: &str = "/v1/messages";
 pub(super) const VM_CLAUDE_COUNT_TOKENS_PATH: &str = "/v1/messages/count_tokens";
 pub(super) const VM_CLAUDE_MODELS_PREFIX: &str = "/v1/models/";
 pub const DEFAULT_CLAUDE_ANTHROPIC_VERSION: &str = "2023-06-01";
 
-pub struct VmHttpClaudeProxyService<S: SecretStore> {
-    broker_state: Arc<BrokerState<S>>,
-    pub(super) config: VmHttpClaudeProxyConfig,
-    client: reqwest::Client,
-}
+pub(super) type VmHttpClaudeProxyService<S> = VmHttpProxyService<ClaudeBackend, S>;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VmHttpClaudeProxyConfig {
@@ -81,252 +70,6 @@ pub enum VmHttpClaudeProxyConfigError {
     EmptyAnthropicVersion,
     #[error("Claude proxy Anthropic version is not a valid HTTP header value: {message}")]
     InvalidAnthropicVersion { message: String },
-}
-
-impl<S: SecretStore> VmHttpClaudeProxyService<S> {
-    pub fn new(
-        broker_state: Arc<BrokerState<S>>,
-        config: VmHttpClaudeProxyConfig,
-    ) -> Result<Self, reqwest::Error> {
-        let client = reqwest::Client::builder()
-            .connect_timeout(config.timeout)
-            .read_timeout(config.timeout)
-            .build()?;
-        Ok(Self {
-            broker_state,
-            config,
-            client,
-        })
-    }
-
-    fn upstream_request_builder(
-        &self,
-        request: &VmHttpRequest,
-        body: Vec<u8>,
-        headers: Vec<ProxyForwardHeader>,
-    ) -> Result<(String, reqwest::RequestBuilder), Box<ProxyFetch>> {
-        let Some(route) = ClaudeBackend::classify_proxy_target(&request.target) else {
-            let response = VmHttpResponse::text(VmHttpStatus::NotFound, "not found");
-            return Err(Box::new(ProxyFetch {
-                response_bytes: response.body.len() as u64,
-                response,
-                upstream_url: None,
-                upstream_status: None,
-                error: None,
-            }));
-        };
-        let Some(url) = self.upstream_url(&request.target) else {
-            let response = VmHttpResponse::text(VmHttpStatus::NotFound, "not found");
-            return Err(Box::new(ProxyFetch {
-                response_bytes: response.body.len() as u64,
-                response,
-                upstream_url: None,
-                upstream_status: None,
-                error: None,
-            }));
-        };
-        let upstream_url = url.to_string();
-        let upstream_auth = self.resolve_upstream_auth().map_err(|mut fetch| {
-            fetch.upstream_url = Some(upstream_url.clone());
-            fetch
-        })?;
-
-        let mut builder = self.client.request(claude_proxy_route_method(route), url);
-        if !body.is_empty() {
-            builder = builder.body(body);
-        }
-        for header in headers {
-            builder = builder.header(header.name, header.value);
-        }
-        builder = upstream_auth.apply_to(builder);
-        Ok((upstream_url, builder))
-    }
-
-    fn resolve_upstream_auth(&self) -> Result<UpstreamAuth, Box<ProxyFetch>> {
-        let secret = match self
-            .broker_state
-            .secret_store()
-            .get(self.config.auth_secret())
-        {
-            Ok(Some(secret)) if !secret.is_empty() => secret,
-            Ok(_) => {
-                return Err(Box::new(claude_proxy_auth_failure(
-                    "Claude proxy auth missing",
-                    "upstream auth missing",
-                )));
-            }
-            Err(err) => {
-                tracing::warn!(
-                    error = %err,
-                    "vm http claude proxy auth secret load failed",
-                );
-                return Err(Box::new(claude_proxy_auth_failure(
-                    "Claude proxy auth failed",
-                    "upstream auth load failed",
-                )));
-            }
-        };
-        Ok(match self.config.auth_kind() {
-            VmHttpClaudeProxyAuthKind::XApiKey => UpstreamAuth::XApiKey(secret),
-            VmHttpClaudeProxyAuthKind::AuthorizationBearer => UpstreamAuth::Bearer(secret),
-            VmHttpClaudeProxyAuthKind::OAuth => UpstreamAuth::AnthropicOauth(secret),
-        })
-    }
-
-    async fn fetch(
-        &self,
-        request: &VmHttpRequest,
-        body: Vec<u8>,
-        headers: Vec<ProxyForwardHeader>,
-    ) -> ProxyFetch {
-        let (upstream_url, builder) = match self.upstream_request_builder(request, body, headers) {
-            Ok(parts) => parts,
-            Err(fetch) => return *fetch,
-        };
-
-        let response = match builder.send().await {
-            Ok(response) => response,
-            Err(err) => {
-                tracing::warn!(
-                    upstream_url = %upstream_url,
-                    error = %err,
-                    "vm http claude proxy upstream request failed",
-                );
-                let response =
-                    VmHttpResponse::text(VmHttpStatus::BadGateway, "Claude proxy upstream failed");
-                return ProxyFetch {
-                    response_bytes: response.body.len() as u64,
-                    response,
-                    upstream_url: Some(upstream_url),
-                    upstream_status: None,
-                    error: Some("upstream request failed"),
-                };
-            }
-        };
-
-        let upstream_status = response.status();
-        let content_type = proxy_response_content_type(&response);
-        let response_headers = claude_proxy_response_headers(response.headers());
-        let body = match read_upstream_body_bounded(response, self.config.max_response_bytes).await
-        {
-            Ok(body) => body,
-            Err(err) => {
-                tracing::warn!(
-                    upstream_url = %upstream_url,
-                    upstream_status = upstream_status.as_u16(),
-                    error = %err,
-                    "vm http claude proxy upstream body read failed",
-                );
-                let response =
-                    VmHttpResponse::text(VmHttpStatus::BadGateway, "Claude proxy upstream failed");
-                return ProxyFetch {
-                    response_bytes: err.bytes_read(),
-                    response,
-                    upstream_url: Some(upstream_url),
-                    upstream_status: Some(upstream_status.as_u16()),
-                    error: Some(err.audit_error_label()),
-                };
-            }
-        };
-        let response_bytes = body.len() as u64;
-        ProxyFetch {
-            response: VmHttpResponse {
-                status: VmHttpStatus::Upstream(upstream_status.as_u16()),
-                content_type,
-                body,
-                content_length: None,
-                www_authenticate: None,
-                headers: response_headers,
-            },
-            upstream_url: Some(upstream_url),
-            upstream_status: Some(upstream_status.as_u16()),
-            response_bytes,
-            error: None,
-        }
-    }
-
-    async fn fetch_stream(
-        &self,
-        request_id: RequestId,
-        request: &VmHttpRequest,
-        body: Vec<u8>,
-        headers: Vec<ProxyForwardHeader>,
-    ) -> Result<ProxyStream<ClaudeBackend>, ProxyFetch> {
-        let (upstream_url, builder) = self
-            .upstream_request_builder(request, body, headers)
-            .map_err(|fetch| *fetch)?;
-        let response = match builder.send().await {
-            Ok(response) => response,
-            Err(err) => {
-                tracing::warn!(
-                    request_id = %request_id,
-                    upstream_url = %upstream_url,
-                    error = %err,
-                    "vm http claude proxy upstream request failed",
-                );
-                let response =
-                    VmHttpResponse::text(VmHttpStatus::BadGateway, "Claude proxy upstream failed");
-                return Err(ProxyFetch {
-                    response_bytes: response.body.len() as u64,
-                    response,
-                    upstream_url: Some(upstream_url),
-                    upstream_status: None,
-                    error: Some("upstream request failed"),
-                });
-            }
-        };
-        let upstream_status = response.status().as_u16();
-        let content_type = proxy_response_content_type(&response);
-        let headers = claude_proxy_response_headers(response.headers());
-        Ok(ProxyStream {
-            audit_log: Arc::clone(&self.broker_state.audit),
-            request_id,
-            response,
-            upstream_url,
-            upstream_status,
-            content_type,
-            headers,
-            max_response_bytes: self.config.max_response_bytes,
-            _audit_kind: PhantomData,
-        })
-    }
-
-    fn upstream_url(&self, target: &str) -> Option<reqwest::Url> {
-        let path = proxy_target_path(target);
-        let relative: Cow<'static, str> = match path {
-            VM_CLAUDE_MESSAGES_PATH => "v1/messages".into(),
-            VM_CLAUDE_COUNT_TOKENS_PATH => "v1/messages/count_tokens".into(),
-            _ => format!("v1/models/{}", claude_proxy_model_id(path)?).into(),
-        };
-        Some(
-            self.config
-                .upstream_base_url
-                .join(&relative)
-                .expect("Claude proxy route paths are URL-safe relative paths"),
-        )
-    }
-}
-
-fn claude_proxy_route_method(route: ClaudeProxyAuditRoute) -> reqwest::Method {
-    match route {
-        ClaudeProxyAuditRoute::Messages | ClaudeProxyAuditRoute::CountTokens => {
-            reqwest::Method::POST
-        }
-        ClaudeProxyAuditRoute::Models => reqwest::Method::GET,
-        ClaudeProxyAuditRoute::Unsupported => {
-            unreachable!("Unsupported routes are rejected before method selection")
-        }
-    }
-}
-
-impl<S: SecretStore> Clone for VmHttpClaudeProxyService<S> {
-    fn clone(&self) -> Self {
-        Self {
-            broker_state: Arc::clone(&self.broker_state),
-            config: self.config.clone(),
-            client: self.client.clone(),
-        }
-    }
 }
 
 fn claude_proxy_auth_failure(body: &'static str, label: &'static str) -> ProxyFetch {
@@ -456,9 +199,30 @@ impl VmHttpClaudeProxyConfig {
     }
 }
 
+impl ProxyBackendConfig for VmHttpClaudeProxyConfig {
+    fn upstream_base_url(&self) -> &reqwest::Url {
+        &self.upstream_base_url
+    }
+
+    fn timeout(&self) -> std::time::Duration {
+        self.timeout
+    }
+
+    fn max_response_bytes(&self) -> u64 {
+        self.max_response_bytes
+    }
+}
+
 impl ProxyBackend for ClaudeBackend {
     type Route = ClaudeProxyAuditRoute;
     type AuthKind = VmHttpClaudeProxyAuthKind;
+    type Config = VmHttpClaudeProxyConfig;
+    type Extras = ();
+
+    const UPSTREAM_FAIL_BODY: &'static str = "Claude proxy upstream failed";
+    const UNSUPPORTED_ROUTE_REASON: &'static str = "unsupported Claude proxy route";
+    const REQUEST_AUDIT_KIND: &'static str = "claude_proxy_request";
+    const OUTCOME_AUDIT_KIND: &'static str = "claude_proxy_outcome";
 
     fn classify_proxy_target(target: &str) -> Option<ClaudeProxyAuditRoute> {
         // Match on the path only. Anthropic's clients pass through query
@@ -479,6 +243,118 @@ impl ProxyBackend for ClaudeBackend {
             }
             _ => None,
         }
+    }
+
+    fn route_is_unsupported(route: ClaudeProxyAuditRoute) -> bool {
+        matches!(route, ClaudeProxyAuditRoute::Unsupported)
+    }
+
+    fn route_method(route: ClaudeProxyAuditRoute) -> reqwest::Method {
+        match route {
+            ClaudeProxyAuditRoute::Messages | ClaudeProxyAuditRoute::CountTokens => {
+                reqwest::Method::POST
+            }
+            ClaudeProxyAuditRoute::Models => reqwest::Method::GET,
+            ClaudeProxyAuditRoute::Unsupported => {
+                unreachable!("Unsupported routes are rejected before method selection")
+            }
+        }
+    }
+
+    fn relative_upstream_path(
+        target: &str,
+        _config: &VmHttpClaudeProxyConfig,
+    ) -> Option<Cow<'static, str>> {
+        let path = proxy_target_path(target);
+        Some(match path {
+            VM_CLAUDE_MESSAGES_PATH => "v1/messages".into(),
+            VM_CLAUDE_COUNT_TOKENS_PATH => "v1/messages/count_tokens".into(),
+            _ => format!("v1/models/{}", claude_proxy_model_id(path)?).into(),
+        })
+    }
+
+    fn forward_headers(
+        request_headers: &[VmHttpHeader],
+        config: &VmHttpClaudeProxyConfig,
+    ) -> Result<Vec<ProxyForwardHeader>, &'static str> {
+        claude_proxy_forward_headers(
+            request_headers,
+            config.anthropic_version(),
+            config.auth_kind(),
+        )
+    }
+
+    fn build_extras(_config: &VmHttpClaudeProxyConfig) -> Result<(), reqwest::Error> {
+        Ok(())
+    }
+
+    async fn resolve_upstream_auth<S>(
+        config: &VmHttpClaudeProxyConfig,
+        _extras: &(),
+        secret_store: &S,
+    ) -> Result<UpstreamAuth, Box<ProxyFetch>>
+    where
+        S: SecretStore + Send + Sync + ?Sized,
+    {
+        let secret = match secret_store.get(config.auth_secret()) {
+            Ok(Some(secret)) if !secret.is_empty() => secret,
+            Ok(_) => {
+                return Err(Box::new(claude_proxy_auth_failure(
+                    "Claude proxy auth missing",
+                    "upstream auth missing",
+                )));
+            }
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "vm http claude proxy auth secret load failed",
+                );
+                return Err(Box::new(claude_proxy_auth_failure(
+                    "Claude proxy auth failed",
+                    "upstream auth load failed",
+                )));
+            }
+        };
+        Ok(match config.auth_kind() {
+            VmHttpClaudeProxyAuthKind::XApiKey => UpstreamAuth::XApiKey(secret),
+            VmHttpClaudeProxyAuthKind::AuthorizationBearer => UpstreamAuth::Bearer(secret),
+            VmHttpClaudeProxyAuthKind::OAuth => UpstreamAuth::AnthropicOauth(secret),
+        })
+    }
+
+    fn record_request_audit(
+        audit_log: &AuditLog,
+        fields: ProxyRequestFields<'_, ClaudeProxyAuditRoute>,
+    ) -> Result<(), AuditError> {
+        let decision = decision_to_claude(fields.decision);
+        audit_log.record_claude_proxy_request(&ClaudeProxyRequestRecord {
+            request_id: fields.request_id,
+            session_id: fields.session_id,
+            received_at: fields.received_at,
+            method: fields.method,
+            target: fields.target,
+            route: fields.route,
+            decision: &decision,
+        })
+    }
+
+    fn record_outcome_audit(
+        audit_log: &AuditLog,
+        fields: ProxyOutcomeFields<'_>,
+    ) -> Result<(), AuditError> {
+        audit_log.record_claude_proxy_outcome(&ClaudeProxyOutcomeRecord {
+            request_id: fields.request_id,
+            completed_at: fields.completed_at,
+            http_status: fields.http_status,
+            upstream_url: fields.upstream_url,
+            upstream_status: fields.upstream_status,
+            response_bytes: fields.response_bytes,
+            error: fields.error,
+        })
+    }
+
+    fn into_vm_http_dispatch(stream: ProxyStream<Self>) -> VmHttpDispatch {
+        VmHttpDispatch::ClaudeProxyStream(stream)
     }
 
     fn forward_header_name(
@@ -590,234 +466,13 @@ fn claude_proxy_forward_headers(
     Ok(forwarded)
 }
 
-fn claude_proxy_response_headers(
-    headers: &reqwest::header::HeaderMap,
-) -> Vec<VmHttpResponseHeader> {
-    let mut out = Vec::new();
-    for (name, value) in headers {
-        let Some(forward_name) = ClaudeBackend::response_header_name(name.as_str()) else {
-            continue;
-        };
-        let Ok(value) = value.to_str() else {
-            continue;
-        };
-        out.push(VmHttpResponseHeader {
-            name: forward_name,
-            value: value.to_string(),
-        });
+fn decision_to_claude(decision: &ProxyAuditDecision<'_>) -> ClaudeProxyAuditDecision {
+    match decision {
+        ProxyAuditDecision::Allow => ClaudeProxyAuditDecision::Allow,
+        ProxyAuditDecision::Deny { reason } => ClaudeProxyAuditDecision::Deny {
+            reason: reason.clone().into_owned(),
+        },
     }
-    out
-}
-
-pub(super) async fn route_claude_proxy_request<S: SecretStore>(
-    session: &VmHttpSession,
-    request: &VmHttpRequest,
-    body: Vec<u8>,
-    service: &VmHttpClaudeProxyService<S>,
-) -> VmHttpDispatch {
-    let route = ClaudeBackend::classify_proxy_target(&request.target)
-        .expect("caller only routes classified Claude proxy targets");
-    if route == ClaudeProxyAuditRoute::Unsupported {
-        let response = VmHttpResponse::text(VmHttpStatus::NotFound, "not found");
-        return record_claude_proxy_local_response(
-            service,
-            session,
-            request,
-            route,
-            ClaudeProxyAuditDecision::Deny {
-                reason: "unsupported Claude proxy route".into(),
-            },
-            response,
-            None,
-        )
-        .into();
-    }
-    if request.method != claude_proxy_route_method(route).as_str() {
-        let response = VmHttpResponse::text(VmHttpStatus::MethodNotAllowed, "method not allowed");
-        return record_claude_proxy_local_response(
-            service,
-            session,
-            request,
-            route,
-            ClaudeProxyAuditDecision::Deny {
-                reason: "method not allowed".into(),
-            },
-            response,
-            None,
-        )
-        .into();
-    }
-
-    let headers = match claude_proxy_forward_headers(
-        &request.headers,
-        service.config.anthropic_version(),
-        service.config.auth_kind(),
-    ) {
-        Ok(headers) => headers,
-        Err(reason) => {
-            let response = VmHttpResponse::text(VmHttpStatus::BadRequest, reason);
-            return record_claude_proxy_local_response(
-                service,
-                session,
-                request,
-                route,
-                ClaudeProxyAuditDecision::Deny {
-                    reason: reason.into(),
-                },
-                response,
-                Some(reason),
-            )
-            .into();
-        }
-    };
-
-    let request_id = RequestId::new();
-    if let Err(err) =
-        service
-            .broker_state
-            .audit
-            .record_claude_proxy_request(&ClaudeProxyRequestRecord {
-                request_id,
-                session_id: session.session_id(),
-                received_at: UnixMillis::now(),
-                method: &request.method,
-                target: &request.target,
-                route,
-                decision: &ClaudeProxyAuditDecision::Allow,
-            })
-    {
-        tracing::error!(
-            target: AUDIT_WRITE_FAILURE_TARGET,
-            kind = "claude_proxy_request",
-            request_id = %request_id,
-            error = %err,
-            "audit write failed",
-        );
-        return VmHttpResponse::text(VmHttpStatus::InternalServerError, "audit write failed")
-            .into();
-    }
-
-    if proxy_request_wants_streaming(&body) {
-        match service
-            .fetch_stream(request_id, request, body, headers)
-            .await
-        {
-            Ok(stream) => return VmHttpDispatch::ClaudeProxyStream(stream),
-            Err(fetch) => {
-                if let Err(err) = service.broker_state.audit.record_claude_proxy_outcome(
-                    &ClaudeProxyOutcomeRecord {
-                        request_id,
-                        completed_at: UnixMillis::now(),
-                        http_status: fetch.response.status.code(),
-                        upstream_url: fetch.upstream_url.as_deref(),
-                        upstream_status: fetch.upstream_status,
-                        response_bytes: fetch.response_bytes,
-                        error: fetch.error,
-                    },
-                ) {
-                    tracing::error!(
-                        target: AUDIT_WRITE_FAILURE_TARGET,
-                        kind = "claude_proxy_outcome",
-                        request_id = %request_id,
-                        error = %err,
-                        "audit write failed",
-                    );
-                    return VmHttpResponse::text(
-                        VmHttpStatus::InternalServerError,
-                        "audit write failed",
-                    )
-                    .into();
-                }
-                return fetch.response.into();
-            }
-        }
-    }
-
-    let fetch = service.fetch(request, body, headers).await;
-    if let Err(err) =
-        service
-            .broker_state
-            .audit
-            .record_claude_proxy_outcome(&ClaudeProxyOutcomeRecord {
-                request_id,
-                completed_at: UnixMillis::now(),
-                http_status: fetch.response.status.code(),
-                upstream_url: fetch.upstream_url.as_deref(),
-                upstream_status: fetch.upstream_status,
-                response_bytes: fetch.response_bytes,
-                error: fetch.error,
-            })
-    {
-        tracing::error!(
-            target: AUDIT_WRITE_FAILURE_TARGET,
-            kind = "claude_proxy_outcome",
-            request_id = %request_id,
-            error = %err,
-            "audit write failed",
-        );
-        return VmHttpResponse::text(VmHttpStatus::InternalServerError, "audit write failed")
-            .into();
-    }
-    fetch.response.into()
-}
-
-pub(super) fn record_claude_proxy_local_response<S: SecretStore>(
-    service: &VmHttpClaudeProxyService<S>,
-    session: &VmHttpSession,
-    request: &VmHttpRequest,
-    route: ClaudeProxyAuditRoute,
-    decision: ClaudeProxyAuditDecision,
-    response: VmHttpResponse,
-    error: Option<&'static str>,
-) -> VmHttpResponse {
-    let request_id = RequestId::new();
-    if let Err(err) =
-        service
-            .broker_state
-            .audit
-            .record_claude_proxy_request(&ClaudeProxyRequestRecord {
-                request_id,
-                session_id: session.session_id(),
-                received_at: UnixMillis::now(),
-                method: &request.method,
-                target: &request.target,
-                route,
-                decision: &decision,
-            })
-    {
-        tracing::error!(
-            target: AUDIT_WRITE_FAILURE_TARGET,
-            kind = "claude_proxy_request",
-            request_id = %request_id,
-            error = %err,
-            "audit write failed",
-        );
-        return VmHttpResponse::text(VmHttpStatus::InternalServerError, "audit write failed");
-    }
-    if let Err(err) =
-        service
-            .broker_state
-            .audit
-            .record_claude_proxy_outcome(&ClaudeProxyOutcomeRecord {
-                request_id,
-                completed_at: UnixMillis::now(),
-                http_status: response.status.code(),
-                upstream_url: None,
-                upstream_status: None,
-                response_bytes: response.body.len() as u64,
-                error,
-            })
-    {
-        tracing::error!(
-            target: AUDIT_WRITE_FAILURE_TARGET,
-            kind = "claude_proxy_outcome",
-            request_id = %request_id,
-            error = %err,
-            "audit write failed",
-        );
-        return VmHttpResponse::text(VmHttpStatus::InternalServerError, "audit write failed");
-    }
-    response
 }
 
 #[cfg(test)]
@@ -826,6 +481,8 @@ mod tests {
 
     use wiremock::MockServer;
 
+    use super::super::VmHttpSession;
+    use super::super::proxy_common::route_proxy_request;
     use super::super::tests::{
         bearer, make_broker_state, make_broker_state_with_extra_secret, open_audit_session,
         raw_http_response, raw_http_response_with_headers, serve_raw_http_once,
@@ -839,6 +496,16 @@ mod tests {
     use crate::audit::{ClaudeProxyAuditDecision, ClaudeProxyAuditRoute};
     use crate::core::Ipv4Cidr;
     use crate::secret::SecretKey;
+    use std::sync::Arc;
+
+    async fn route_claude_proxy_request<S: SecretStore + Send + Sync + 'static>(
+        session: &VmHttpSession,
+        request: &VmHttpRequest,
+        body: Vec<u8>,
+        service: &VmHttpClaudeProxyService<S>,
+    ) -> VmHttpDispatch {
+        route_proxy_request::<ClaudeBackend, _>(session, request, body, service).await
+    }
 
     #[test]
     fn classify_claude_proxy_target_recognizes_supported_routes() {
