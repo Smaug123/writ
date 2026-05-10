@@ -208,9 +208,26 @@ pub(super) async fn read_upstream_body_bounded(
 /// Selector for the audit log a streaming proxy response writes its
 /// outcome record to. Implementations are zero-sized markers; the
 /// trait is implemented at the type level so dispatch is static.
+///
+/// Outcome recording on this trait is best-effort and asymmetric with
+/// the buffered path's `ProxyBackend::record_outcome_audit`; see
+/// `record_outcome` for why.
 pub(super) trait ProxyAudit: 'static {
     /// Human-readable backend label for diagnostic logging.
     const DISPLAY_NAME: &'static str;
+    /// Persist a streaming-proxy outcome record. Infallible by design:
+    /// this is called from `ProxyStreamBody::drop` after the response
+    /// body has already started flowing to the guest, so there is no
+    /// HTTP status left to fail with. Audit-write failures are emitted
+    /// to tracing under `AUDIT_WRITE_FAILURE_TARGET` and swallowed; the
+    /// guest's response is unaffected and the request row remains in
+    /// the audit log without a paired outcome row.
+    ///
+    /// Deliberately asymmetric with the buffered path
+    /// (`ProxyBackend::record_outcome_audit`), which is fallible and
+    /// 500s the guest on audit-write failure because the response has
+    /// not yet been sent there. Reconciliation of orphaned request
+    /// rows is an audit-log concern, not a transport concern.
     fn record_outcome(audit_log: &AuditLog, fields: ProxyOutcomeFields<'_>);
 }
 

@@ -111,6 +111,31 @@ fn make_bundle(access_exp: i64, refresh_token: &str, fedramp: bool) -> ChatgptAu
 }
 
 #[test]
+fn debug_redacts_tokens_and_api_key() {
+    let bundle = make_bundle(/*exp=*/ 4_000, "very-secret-refresh", false);
+    // Drop in an API key so we can confirm it doesn't appear in the Debug
+    // output.
+    let bundle = ChatgptAuthBundle {
+        openai_api_key: Some("sk-very-secret-api-key".into()),
+        ..bundle
+    };
+    let rendered = format!("{bundle:?}");
+
+    assert!(!rendered.contains("very-secret-refresh"), "{rendered}");
+    assert!(!rendered.contains("sk-very-secret-api-key"), "{rendered}");
+    let tokens = bundle.tokens.as_ref().unwrap();
+    assert!(
+        !rendered.contains(tokens.access_token.as_str()),
+        "{rendered}"
+    );
+    assert!(!rendered.contains(tokens.id_token.as_str()), "{rendered}");
+    assert!(rendered.contains("<redacted>"), "{rendered}");
+    // Non-secret fields are still visible so debug output stays useful.
+    assert!(rendered.contains("acct-123"), "{rendered}");
+    assert!(rendered.contains("2026-01-01T00:00:00Z"), "{rendered}");
+}
+
+#[test]
 fn parse_jwt_expiration_reads_exp_claim() {
     let jwt = jwt_with_payload(&json!({"exp": 1735689600_i64}));
     assert_eq!(parse_jwt_expiration(&jwt).unwrap(), Some(1735689600));

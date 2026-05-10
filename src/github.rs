@@ -34,12 +34,18 @@ fn default_api_base() -> String {
     "https://api.github.com".into()
 }
 
-/// How long we ask the JWT to live. GitHub rejects anything over 10 minutes;
-/// leave a minute of headroom.
-const JWT_LIFETIME_SECONDS: i64 = 9 * 60;
-
-/// How far we backdate `iat` to tolerate a minute of clock skew against GitHub.
+/// How far we backdate `iat` to tolerate a broker clock running behind
+/// GitHub's. 60 s is the most we can spend here without forcing the
+/// lifetime tight enough that immediate-use JWTs become risky.
 const JWT_BACKDATE_SECONDS: i64 = 60;
+
+/// How long we ask the JWT to live. GitHub rejects anything over 10
+/// minutes (600 s) measured from `iat` to `exp`; with a 60 s backdate
+/// the budget is `600 - JWT_BACKDATE_SECONDS = 540 s`. Asking for 540
+/// would put us exactly on the ceiling, so a broker clock as little as
+/// one second ahead of GitHub's would push the span over and trip the
+/// reject. Leave 60 s of explicit headroom for that case.
+const JWT_LIFETIME_SECONDS: i64 = 8 * 60;
 
 /// Tolerance added to the TTL ceiling check when comparing the broker's
 /// `now` against GitHub's `expires_at`. GitHub computes `expires_at` from
@@ -533,6 +539,63 @@ pub enum MintError {
         requested: GitHubPermissions,
         returned: GitHubPermissions,
     },
+}
+
+impl MintError {
+    /// Bounded, label-form rendering of a mint failure for the agent-facing
+    /// protocol surface (`CapabilityOutcome::Error.message` →
+    /// `ServerMessage::Error.message`). The full `Display` is retained for
+    /// the audit log, where operators want everything; the agent only ever
+    /// sees this label, so the protocol never carries unbounded payloads
+    /// (HTTP error bodies, GitHub-returned repository lists, wrapped
+    /// `reqwest`/`SecretError` chains) and never echoes potentially
+    /// sensitive content from a backend response.
+    ///
+    /// Variants whose `Display` is intrinsically bounded *and* useful for
+    /// diagnosing the failure (for example, `MissingAgentKind`'s
+    /// instructive remediation text) are passed through verbatim.
+    pub fn agent_message(&self) -> String {
+        match self {
+            // Pass-through arms: every payload field on these variants is
+            // *intrinsically* bounded — fixed strings, primitive numbers,
+            // closed-set enums (`AgentKind`, `GitHubPermissions`). Any new
+            // variant whose payload could carry client-supplied,
+            // operator-supplied, or backend-supplied strings of unknown
+            // length must NOT join this list; route it through a label
+            // arm below instead.
+            Self::MissingAgentKind
+            | Self::NoGitHubAppForAgent { .. }
+            | Self::EmptyToken
+            | Self::TtlExceeded { .. }
+            | Self::ExpiryNotInFuture { .. } => self.to_string(),
+
+            // Label arms: drop the unbounded payload before exposing to
+            // the agent. Audit row still keeps the full `Display`.
+            Self::PrivateKeyMissing(_) => {
+                "GitHub App private key not found in secret store".to_string()
+            }
+            Self::Secret(_) => "secret store error reading GitHub App private key".to_string(),
+            Self::Jwt(_) => "failed to construct GitHub App JWT".to_string(),
+            Self::Http(_) => "HTTP error contacting GitHub".to_string(),
+            Self::ApiError { status, .. } => format!("GitHub API returned {status}"),
+            Self::BadExpiry(_) => "GitHub returned a malformed expiry timestamp".to_string(),
+            Self::RepoNotInInstallation { .. } => {
+                "requested repository is not owned by the configured installation".to_string()
+            }
+            Self::UnexpectedRepositories { .. } => {
+                "GitHub minted a token covering unexpected repositories".to_string()
+            }
+            Self::UnexpectedRepositorySelection { .. } => {
+                "GitHub minted a token with unexpected repository_selection".to_string()
+            }
+            Self::UnexpectedPermissions { .. } => {
+                // The default `Debug` rendering of two `GitHubPermissions`
+                // structs alone exceeds 250 chars, so passing this through
+                // would defeat the cap. Keep the diff in the audit row.
+                "GitHub minted a token with permissions that differ from the request".to_string()
+            }
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -1375,6 +1438,229 @@ mod tests {
             shown.contains("jti"),
             "other fields should still render: {shown}"
         );
+    }
+
+    /// Cap we hold `agent_message` to across every variant — both the
+    /// fixed labels we hand-pick and the full `Display` we pass through
+    /// for variants whose payload is intrinsically bounded. Tight enough
+    /// that an unbounded payload (HTTP body, repo vec, or — the case
+    /// codex review flagged — a 64 KiB client-supplied repo owner)
+    /// sneaking in would trip the test.
+    const AGENT_MESSAGE_CAP: usize = 256;
+
+    /// One representative of every `MintError` variant. Each carries a
+    /// payload large enough that, if it leaked into `agent_message`, the
+    /// length cap would catch it. Update this list when a new variant is
+    /// added so the bounding test continues to cover the full enum — the
+    /// match in `agent_message_covers_every_variant_and_stays_bounded`
+    /// is what enforces "every variant is exercised here".
+    fn mint_error_fixtures() -> Vec<MintError> {
+        let huge = "x".repeat(64 * 1024);
+        let many_repos: Vec<String> = (0..2048).map(|i| format!("o/repo-{i}")).collect();
+        vec![
+            MintError::MissingAgentKind,
+            MintError::NoGitHubAppForAgent {
+                agent_kind: AgentKind::Codex,
+            },
+            // SecretKey forbids '/', NUL and a leading '.', so a 64-KiB
+            // single-token name is still constructible — the secret-key
+            // validator does not impose a length cap, so the agent
+            // message cannot rely on one either.
+            MintError::PrivateKeyMissing(SecretKey::new(huge.clone()).unwrap()),
+            MintError::Secret(SecretError::Keyring(huge.clone())),
+            MintError::Jwt(jsonwebtoken::errors::Error::from(
+                jsonwebtoken::errors::ErrorKind::InvalidKeyFormat,
+            )),
+            // `reqwest::Error` cannot be constructed directly; provoke one
+            // by parsing a deliberately malformed URL with the public API.
+            MintError::Http(
+                reqwest::Client::new()
+                    .get("http://[::invalid")
+                    .build()
+                    .expect_err("malformed URL must fail to build"),
+            ),
+            MintError::ApiError {
+                status: 422,
+                body: huge.clone(),
+            },
+            MintError::BadExpiry(huge.clone()),
+            MintError::TtlExceeded {
+                ttl_seconds: 3600,
+                issued_at: 1_700_000_000,
+                actual_expires_at: 1_700_010_000,
+            },
+            MintError::ExpiryNotInFuture {
+                issued_at: 1_700_000_000,
+                actual_expires_at: 1_699_999_999,
+            },
+            MintError::EmptyToken,
+            MintError::RepoNotInInstallation {
+                requested: RepoRef {
+                    owner: huge.clone(),
+                    name: huge.clone(),
+                },
+                installation_owner: huge.clone(),
+            },
+            MintError::UnexpectedRepositories {
+                requested: RepoRef {
+                    owner: huge.clone(),
+                    name: huge.clone(),
+                },
+                returned: many_repos,
+            },
+            MintError::UnexpectedRepositorySelection {
+                requested: RepoRef {
+                    owner: huge.clone(),
+                    name: huge.clone(),
+                },
+                returned: "all",
+            },
+            MintError::UnexpectedPermissions {
+                requested: GitHubPermissions::default(),
+                returned: GitHubPermissions::default(),
+            },
+        ]
+    }
+
+    #[test]
+    fn agent_message_covers_every_variant_and_stays_bounded() {
+        // Compile-time exhaustiveness guard: if a new variant is added we
+        // want the test suite to fail until `mint_error_fixtures` covers
+        // it. A `match` over a borrow forces the maintainer to extend
+        // both this arm and the fixture vec.
+        for err in mint_error_fixtures() {
+            match &err {
+                MintError::MissingAgentKind
+                | MintError::NoGitHubAppForAgent { .. }
+                | MintError::PrivateKeyMissing(_)
+                | MintError::Secret(_)
+                | MintError::Jwt(_)
+                | MintError::Http(_)
+                | MintError::ApiError { .. }
+                | MintError::BadExpiry(_)
+                | MintError::TtlExceeded { .. }
+                | MintError::ExpiryNotInFuture { .. }
+                | MintError::EmptyToken
+                | MintError::RepoNotInInstallation { .. }
+                | MintError::UnexpectedRepositories { .. }
+                | MintError::UnexpectedRepositorySelection { .. }
+                | MintError::UnexpectedPermissions { .. } => {}
+            }
+            let msg = err.agent_message();
+            assert!(!msg.is_empty(), "agent_message empty for {err:?}");
+            assert!(
+                msg.len() <= AGENT_MESSAGE_CAP,
+                "agent_message for {err:?} exceeds cap: {} bytes",
+                msg.len()
+            );
+        }
+    }
+
+    #[test]
+    fn agent_message_does_not_echo_api_body() {
+        // Lightly defensive: the API body could carry a sensitive echo
+        // (a leaked key fragment, a stray PII field). The agent surface
+        // must not reproduce any of it; only the bounded discriminants
+        // (here, the status code) are safe to expose.
+        let needle = "secret-fragment-XYZ-do-not-leak";
+        let err = MintError::ApiError {
+            status: 401,
+            body: format!("{{\"message\":\"{needle}\"}}"),
+        };
+        let msg = err.agent_message();
+        assert!(
+            !msg.contains(needle),
+            "agent_message must not echo API body: {msg}"
+        );
+        assert!(msg.contains("401"), "expected status in label: {msg}");
+    }
+
+    #[test]
+    fn agent_message_drops_client_supplied_repo_for_repo_not_in_installation() {
+        // Regression for codex review finding: a Read/Metadata request
+        // is granted by policy without consulting the writable allowlist,
+        // so a client can submit an arbitrary `RepoRef` whose
+        // owner/name strings are bounded only by `MAX_LINE_BYTES`
+        // (64 KiB). When that owner does not match the configured
+        // installation, minting fails with `RepoNotInInstallation` —
+        // the agent surface must not carry the client-controlled
+        // string back out.
+        let huge_owner = "z".repeat(64 * 1024);
+        let err = MintError::RepoNotInInstallation {
+            requested: RepoRef {
+                owner: huge_owner.clone(),
+                name: "n".into(),
+            },
+            installation_owner: "configured-owner".into(),
+        };
+        let msg = err.agent_message();
+        assert!(
+            msg.len() <= AGENT_MESSAGE_CAP,
+            "agent_message must be bounded even with adversarial repo owner: {} bytes",
+            msg.len()
+        );
+        assert!(
+            !msg.contains(&huge_owner),
+            "agent_message must not echo the client-supplied repo owner: {msg}"
+        );
+        assert!(
+            !msg.contains("configured-owner"),
+            "agent_message must not echo the operator's installation owner: {msg}"
+        );
+    }
+
+    #[test]
+    fn agent_message_does_not_echo_unexpected_repositories() {
+        // The repo list can be very large and is GitHub-controlled; a
+        // future protocol consumer could log it unbounded. Drop it from
+        // the agent surface.
+        let err = MintError::UnexpectedRepositories {
+            requested: RepoRef {
+                owner: "o".into(),
+                name: "n".into(),
+            },
+            returned: vec!["o/leaked-private-repo".into(), "o/another-private".into()],
+        };
+        let msg = err.agent_message();
+        assert!(
+            !msg.contains("leaked-private-repo"),
+            "agent_message must not echo returned repo list: {msg}"
+        );
+    }
+
+    #[test]
+    fn agent_message_and_full_display_are_distinct_for_api_error() {
+        // The audit row writes `e.to_string()` (which keeps the
+        // 256-char-truncated body for `ApiError`) while the agent gets
+        // `agent_message()`. This test pins the asymmetry: the body
+        // fragment must reach the audit shape but never the agent shape.
+        let body_marker = "audit-only-marker-zzzz";
+        let err = MintError::ApiError {
+            status: 500,
+            body: format!("internal failure: {body_marker}"),
+        };
+        let audit = err.to_string();
+        let agent = err.agent_message();
+        assert!(
+            audit.contains(body_marker),
+            "audit-shape must keep the body: {audit}"
+        );
+        assert!(
+            !agent.contains(body_marker),
+            "agent-shape must drop the body: {agent}"
+        );
+        assert_ne!(audit, agent);
+    }
+
+    #[test]
+    fn agent_message_passes_through_useful_bounded_variants() {
+        // For variants whose `Display` is bounded *and* contains
+        // remediation text the user needs ("open the session with
+        // --agent claude or --agent codex"), `agent_message` should hand
+        // the full `Display` through unchanged.
+        let err = MintError::MissingAgentKind;
+        assert_eq!(err.agent_message(), err.to_string());
+        assert!(err.agent_message().contains("--agent claude"));
     }
 
     #[test]
