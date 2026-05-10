@@ -788,7 +788,10 @@ work_root=${{work_dir%/*}}
             session.clone(),
             service,
             VmHttpNixCacheService::new(Arc::clone(&state), nix_cache_config_for_test()),
-            VmHttpProxies::none(),
+            VmHttpProxies {
+                claude: None,
+                openai: None,
+            },
             None,
             shutdown_rx,
         ));
