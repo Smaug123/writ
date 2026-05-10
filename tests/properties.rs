@@ -4,6 +4,7 @@
 //! mistakes (typos in `rename_all`, adjacent-tag clashes, etc.).
 
 use proptest::prelude::*;
+use writ::audit::{AuditLog, PreMintRecord};
 use writ::core::{
     AgentKind, CapabilityRequest, CredentialGrant, GitHubAccess, GitHubGrantedScope,
     GitHubPermissions, GitHubRequest, GrantedScope, Jti, MetadataAccess, PolicyDecision, RepoRef,
@@ -196,6 +197,181 @@ proptest! {
                 prop_assert_eq!(s.permissions.metadata, Some(MetadataAccess::Read));
             }
             PolicyDecision::Deny { reason } => prop_assert!(false, "unexpectedly denied: {reason}"),
+        }
+    }
+
+    /// `record_grant ∘ record_pre_mint ∘ decide` accepts iff `decide`
+    /// returned `Grant`. The property exercises the full audit chain at
+    /// once: `record_pre_mint` is expected to accept any decision `decide`
+    /// produces (its output is structurally valid by construction), and
+    /// the trailing `record_grant` must succeed for `Grant` decisions and
+    /// fail for `Deny` ones.
+    #[test]
+    fn audit_chain_accepts_grant_iff_decide_grants(
+        req in arb_github_request(),
+        writable in prop::collection::vec(arb_repo(), 0..5),
+        ttl in arb_ttl(),
+        github_app_id in 0u64..1_000_000,
+    ) {
+        let policy = PolicyConfig {
+            writable_repos: writable,
+            default_ttl: ttl,
+        };
+        let cap_req = CapabilityRequest::GitHub(req.clone());
+        let decision = decide(&cap_req, &policy);
+
+        let log = AuditLog::open_in_memory().unwrap();
+        let session = SessionRecord {
+            session_id: SessionId::new(),
+            label: None,
+            agent_kind: None,
+            agent_model: None,
+            opened_at: UnixMillis::from_millis(0),
+            closed_at: None,
+        };
+        log.open_session(&session).unwrap();
+
+        let request_id = RequestId::new();
+        let pre_mint = log.record_pre_mint(&PreMintRecord {
+            request_id,
+            session_id: session.session_id,
+            received_at: UnixMillis::from_millis(0),
+            request: &cap_req,
+            decision: &decision,
+        });
+        prop_assert!(
+            pre_mint.is_ok(),
+            "decide produced a decision record_pre_mint rejected: req={req:?} decision={decision:?} err={pre_mint:?}",
+        );
+
+        match &decision {
+            PolicyDecision::Grant { scope, ttl: granted_ttl } => {
+                let lifetime_ms = granted_ttl.as_i64().saturating_mul(1000);
+                let grant = CredentialGrant {
+                    jti: Jti::new(),
+                    request_id,
+                    session_id: session.session_id,
+                    github_app_id: Some(github_app_id),
+                    scope: scope.clone(),
+                    issued_at: UnixMillis::from_millis(0),
+                    expires_at: UnixMillis::from_millis(lifetime_ms),
+                };
+                let result = log.record_grant(&grant);
+                prop_assert!(
+                    result.is_ok(),
+                    "Grant decision but record_grant failed: req={req:?} scope={scope:?} err={result:?}",
+                );
+            }
+            PolicyDecision::Deny { .. } => {
+                // Any grant attempt against a Deny pre-mint row must fail.
+                // Scope is irrelevant: record_grant rejects on the recorded
+                // decision before checking the scope.
+                let bogus = CredentialGrant {
+                    jti: Jti::new(),
+                    request_id,
+                    session_id: session.session_id,
+                    github_app_id: Some(github_app_id),
+                    scope: GrantedScope::GitHub(GitHubGrantedScope {
+                        repository: req.repo().clone(),
+                        permissions: GitHubPermissions::default(),
+                    }),
+                    issued_at: UnixMillis::from_millis(0),
+                    expires_at: UnixMillis::from_millis(1_000),
+                };
+                let result = log.record_grant(&bogus);
+                prop_assert!(
+                    result.is_err(),
+                    "Deny decision but record_grant accepted: req={req:?} grant={bogus:?}",
+                );
+            }
+        }
+    }
+
+    /// `record_pre_mint` rejects any Grant decision whose scope isn't
+    /// structurally compatible with the request, regardless of which
+    /// `GitHubRequest` variant is involved. The DAO previously had a
+    /// single hand-rolled unit test for this; the property pins it for
+    /// every variant against an oracle re-implementation of the rules.
+    #[test]
+    fn record_pre_mint_agrees_with_scope_authorisation_oracle(
+        req in arb_github_request(),
+        // Bias scope.repository to the request's repo half the time, so
+        // the `repo matches` branch gets exercised — random unrelated
+        // repos almost never collide.
+        copy_repo in any::<bool>(),
+        scope_repo in arb_repo(),
+        permissions in arb_permissions(),
+    ) {
+        let log = AuditLog::open_in_memory().unwrap();
+        let session = SessionRecord {
+            session_id: SessionId::new(),
+            label: None,
+            agent_kind: None,
+            agent_model: None,
+            opened_at: UnixMillis::from_millis(0),
+            closed_at: None,
+        };
+        log.open_session(&session).unwrap();
+
+        let scope_repo = if copy_repo { req.repo().clone() } else { scope_repo };
+        let github_scope = GitHubGrantedScope { repository: scope_repo, permissions };
+        let cap_req = CapabilityRequest::GitHub(req.clone());
+        let decision = PolicyDecision::Grant {
+            scope: GrantedScope::GitHub(github_scope.clone()),
+            ttl: TtlSeconds::new(300).unwrap(),
+        };
+        let result = log.record_pre_mint(&PreMintRecord {
+            request_id: RequestId::new(),
+            session_id: session.session_id,
+            received_at: UnixMillis::from_millis(0),
+            request: &cap_req,
+            decision: &decision,
+        });
+
+        let expected = oracle_scope_authorises_request(&req, &github_scope);
+        prop_assert_eq!(
+            result.is_ok(),
+            expected,
+            "req={:?} scope={:?} actual={:?}",
+            req,
+            github_scope,
+            result,
+        );
+    }
+}
+
+/// Mirror of `audit::grant::scope_authorised_by_request` (private to that
+/// module). The audit-layer rule is structural: matching repo, every
+/// permission slot the request didn't ask for must be `None`, and the slot
+/// it did ask for must equal the requested access. Metadata is allowed to
+/// be either `None` or `Some(Read)` independent of the request.
+fn oracle_scope_authorises_request(req: &GitHubRequest, scope: &GitHubGrantedScope) -> bool {
+    if &scope.repository != req.repo() {
+        return false;
+    }
+    match scope.permissions.metadata {
+        None | Some(MetadataAccess::Read) => {}
+    }
+    match req {
+        GitHubRequest::Metadata { .. } => {
+            scope.permissions.contents.is_none()
+                && scope.permissions.issues.is_none()
+                && scope.permissions.pull_requests.is_none()
+        }
+        GitHubRequest::Contents { access, .. } => {
+            scope.permissions.contents == Some(*access)
+                && scope.permissions.issues.is_none()
+                && scope.permissions.pull_requests.is_none()
+        }
+        GitHubRequest::Issues { access, .. } => {
+            scope.permissions.issues == Some(*access)
+                && scope.permissions.contents.is_none()
+                && scope.permissions.pull_requests.is_none()
+        }
+        GitHubRequest::PullRequests { access, .. } => {
+            scope.permissions.pull_requests == Some(*access)
+                && scope.permissions.contents.is_none()
+                && scope.permissions.issues.is_none()
         }
     }
 }
