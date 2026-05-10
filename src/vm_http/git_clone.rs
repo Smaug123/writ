@@ -397,7 +397,7 @@ mod tests {
         VM_HTTP_READ_TIMEOUT, VmHttpProxies, VmHttpRequest, VmHttpServices, VmHttpSession,
         VmHttpStatus, bind_ephemeral_vm_http_listener, dispatch_vm_http_head_and_body,
         handle_vm_http_connection_with_read_timeout, route_authenticated_vm_http_request,
-        run_vm_http_with_git_until_shutdown,
+        run_vm_http_with_services_until_shutdown,
     };
     use super::*;
     use crate::core::{BrokerPortRange, CapabilityRequest, GitHubAccess, GitHubRequest, Ipv4Cidr};
@@ -784,7 +784,7 @@ work_root=${{work_dir%/*}}
             .unwrap();
         let addr = bound.local_addr().unwrap();
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let server = tokio::spawn(run_vm_http_with_git_until_shutdown(
+        let server = tokio::spawn(run_vm_http_with_services_until_shutdown(
             bound.into_listener(),
             session.clone(),
             service,

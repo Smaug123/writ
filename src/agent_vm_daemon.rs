@@ -35,9 +35,9 @@ use crate::vm_git::{
     default_workspace_destination, nix_develop_command_args,
 };
 use crate::vm_http::{
-    RunningVmHttpGitSession, VM_NIX_BASIC_LOGIN, VM_NIX_CACHE_PATH_PREFIX, VmHttpAgentRunService,
-    VmHttpGitRuntimeConfig, VmHttpGitRuntimeError, VmHttpGitRuntimeShutdownError,
-    prepare_vm_http_git_session_with_agent_runs,
+    RunningVmHttpSession, VM_NIX_BASIC_LOGIN, VM_NIX_CACHE_PATH_PREFIX, VmHttpAgentRunService,
+    VmHttpRuntimeConfig, VmHttpRuntimeError, VmHttpRuntimeShutdownError,
+    prepare_vm_http_session_with_agent_runs,
 };
 
 pub use crate::vm_client::{
@@ -206,7 +206,7 @@ while :; do sleep 3600; done
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AgentVmDaemonRuntimeConfig {
     lifecycle: AgentVmLifecycleRuntimeConfig,
-    vm_http: VmHttpGitRuntimeConfig,
+    vm_http: VmHttpRuntimeConfig,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -223,7 +223,7 @@ pub struct AgentVmLifecycleRuntimeConfig {
 
 pub struct AgentVmDaemon {
     config: AgentVmDaemonRuntimeConfig,
-    running: Mutex<HashMap<SessionId, RunningVmHttpGitSession>>,
+    running: Mutex<HashMap<SessionId, RunningVmHttpSession>>,
     lifecycle_lock: Mutex<()>,
 }
 
@@ -277,7 +277,7 @@ pub enum AgentVmDaemonError {
     #[error(transparent)]
     State(#[from] AgentVmSessionStateError),
     #[error(transparent)]
-    VmHttp(#[from] VmHttpGitRuntimeError),
+    VmHttp(#[from] VmHttpRuntimeError),
     #[error(transparent)]
     Manager(#[from] AgentVmSessionManagerError),
     #[error("agent VM lifecycle task failed: {0}")]
@@ -304,20 +304,20 @@ pub enum AgentVmDaemonError {
     #[error("agent VM audit operation failed: {0}")]
     Audit(#[from] AuditError),
     #[error(transparent)]
-    HttpShutdown(#[from] VmHttpGitRuntimeShutdownError),
+    HttpShutdown(#[from] VmHttpRuntimeShutdownError),
     #[error(
         "agent VM stop failed to close audit session and shut down VM HTTP task: audit: {audit}; http: {http}"
     )]
     StopBothFailed {
         audit: Box<AuditError>,
-        http: Box<VmHttpGitRuntimeShutdownError>,
+        http: Box<VmHttpRuntimeShutdownError>,
     },
 }
 
 impl AgentVmDaemonRuntimeConfig {
     pub fn new(
         lifecycle: AgentVmLifecycleRuntimeConfig,
-        vm_http: VmHttpGitRuntimeConfig,
+        vm_http: VmHttpRuntimeConfig,
     ) -> Result<Self, AgentVmDaemonRuntimeConfigError> {
         if !vm_http.bind_addr().is_unspecified() {
             return Err(AgentVmDaemonRuntimeConfigError::NonWildcardVmHttpBindAddr(
@@ -331,7 +331,7 @@ impl AgentVmDaemonRuntimeConfig {
         &self.lifecycle
     }
 
-    pub fn vm_http(&self) -> &VmHttpGitRuntimeConfig {
+    pub fn vm_http(&self) -> &VmHttpRuntimeConfig {
         &self.vm_http
     }
 }
@@ -712,7 +712,7 @@ impl AgentVmDaemon {
         let lifecycle = self.config.lifecycle.clone();
         let (subnet_index, network) =
             tokio::task::spawn_blocking(move || choose_subnet_index(&lifecycle)).await??;
-        let prepared = prepare_vm_http_git_session_with_agent_runs(
+        let prepared = prepare_vm_http_session_with_agent_runs(
             Arc::clone(&state),
             &self.config.vm_http,
             session_id,
@@ -1262,7 +1262,7 @@ mod tests {
         (
             AgentVmDaemonRuntimeConfig::new(
                 lifecycle,
-                VmHttpGitRuntimeConfig::new(
+                VmHttpRuntimeConfig::new(
                     "0.0.0.0".parse().unwrap(),
                     BrokerPortRange::new(1024, 65535).unwrap(),
                     git_clone,

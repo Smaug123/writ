@@ -28,7 +28,7 @@ use crate::vm_git_bundle::{
 };
 use crate::vm_http::{
     DEFAULT_CLAUDE_ANTHROPIC_VERSION, VmHttpClaudeProxyAuthKind, VmHttpClaudeProxyConfig,
-    VmHttpClaudeProxyConfigError, VmHttpGitCloneConfig, VmHttpGitRuntimeConfig,
+    VmHttpClaudeProxyConfigError, VmHttpGitCloneConfig, VmHttpRuntimeConfig,
     VmHttpNixCacheConfig, VmHttpNixCacheConfigError, VmHttpOpenAiProxyAuthKind,
     VmHttpOpenAiProxyConfig, VmHttpOpenAiProxyConfigError,
 };
@@ -273,7 +273,7 @@ impl AgentVmLifecycleConfig {
 }
 
 impl AgentVmHttpConfig {
-    pub fn to_runtime_config(&self) -> Result<VmHttpGitRuntimeConfig, AgentVmHttpConfigError> {
+    pub fn to_runtime_config(&self) -> Result<VmHttpRuntimeConfig, AgentVmHttpConfigError> {
         let broker_port_range = BrokerPortRange::new(self.broker_port_min, self.broker_port_max)?;
         let token_env = GitSecretEnvVar::new(self.token_env.clone())?;
         let credential = GitCredentialBoundary::new(self.askpass_program.clone(), token_env)?;
@@ -309,7 +309,7 @@ impl AgentVmHttpConfig {
             None => self.work_root.join("agent-runs"),
         };
         let agent_run_log_root = validate_agent_run_log_root(agent_run_log_root)?;
-        Ok(VmHttpGitRuntimeConfig::new_with_proxies(
+        Ok(VmHttpRuntimeConfig::new_with_proxies(
             self.bind_addr,
             broker_port_range,
             git_clone,
