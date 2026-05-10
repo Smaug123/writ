@@ -18,9 +18,10 @@ use tokio::sync::Mutex;
 use crate::agent_run::{AgentPrompt, AgentRunId};
 use crate::agent_vm_lifecycle::{
     AgentVmGuestEnvVar, AgentVmLifecycleConfigError, AgentVmResources, AgentVmSessionManagerError,
-    AgentVmSessionPlan, AgentVmSessionStateError, AgentVmSessionStateStore, AgentVmToolPaths,
-    ContainerImage, Ipv6IsolationMode, cleanup_managed_agent_vm_session,
-    remove_managed_agent_vm_session_state, start_managed_agent_vm_session,
+    AgentVmSessionPlan, AgentVmSessionState, AgentVmSessionStateError, AgentVmSessionStateStore,
+    AgentVmToolPaths, ContainerImage, Ipv6IsolationMode, claim_agent_vm_session_subnet,
+    cleanup_managed_agent_vm_session, complete_agent_vm_session_start,
+    remove_managed_agent_vm_session_state,
 };
 use crate::audit::{AgentRunAuditRecord, AgentVmWorkspaceBootstrapAuditRecord, AuditError};
 use crate::core::{
@@ -226,7 +227,16 @@ pub struct AgentVmLifecycleRuntimeConfig {
 pub struct AgentVmDaemon {
     config: AgentVmDaemonRuntimeConfig,
     running: Mutex<HashMap<SessionId, RunningVmHttpSession>>,
-    lifecycle_lock: Mutex<()>,
+    /// Serialises the load-state → choose-subnet → write-`Starting`-record
+    /// window so concurrent starts cannot pick the same subnet index. Held
+    /// only across that fast window; the slow VM boot in
+    /// [`complete_agent_vm_session_start`] runs unlocked so unrelated sessions
+    /// can boot in parallel.
+    subnet_allocation_lock: Mutex<()>,
+    /// Per-session lifecycle locks keyed by [`SessionId`]. Start and stop of
+    /// the *same* session serialise here; unrelated sessions don't. Entries
+    /// are evicted once no other task holds a handle.
+    session_locks: Mutex<HashMap<SessionId, Arc<Mutex<()>>>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -397,7 +407,29 @@ impl AgentVmDaemon {
         Self {
             config,
             running: Mutex::new(HashMap::new()),
-            lifecycle_lock: Mutex::new(()),
+            subnet_allocation_lock: Mutex::new(()),
+            session_locks: Mutex::new(HashMap::new()),
+        }
+    }
+
+    async fn session_lock_handle(&self, session_id: SessionId) -> Arc<Mutex<()>> {
+        let mut locks = self.session_locks.lock().await;
+        Arc::clone(
+            locks
+                .entry(session_id)
+                .or_insert_with(|| Arc::new(Mutex::new(()))),
+        )
+    }
+
+    /// Drops the per-session lock map entry if no task is holding or waiting
+    /// for it. Caller must have already dropped its own [`Arc`] handle so the
+    /// strong count reflects only the map's own reference.
+    async fn drop_idle_session_lock(&self, session_id: SessionId) {
+        let mut locks = self.session_locks.lock().await;
+        if let Some(lock) = locks.get(&session_id)
+            && Arc::strong_count(lock) == 1
+        {
+            locks.remove(&session_id);
         }
     }
 
@@ -421,43 +453,48 @@ impl AgentVmDaemon {
             return Err(AgentVmDaemonError::EmptyGuestCommand);
         }
 
-        let _guard = self.lifecycle_lock.lock().await;
         let session_id = SessionId::new();
-        state.audit.open_session(&SessionRecord {
-            session_id,
-            label,
-            agent_kind,
-            agent_model,
-            opened_at: UnixMillis::now(),
-            closed_at: None,
-        })?;
-
-        let start_result = async {
-            if let Some(workspace) = workspace.as_ref() {
-                let record = workspace_bootstrap_audit_record(session_id, workspace)?;
-                state.audit.record_agent_vm_workspace_bootstrap(&record)?;
-            }
-            self.start_session_after_audit_opened(
-                Arc::clone(&state),
+        let session_lock = self.session_lock_handle(session_id).await;
+        let outcome = async {
+            let _session_guard = session_lock.lock().await;
+            state.audit.open_session(&SessionRecord {
                 session_id,
-                workspace,
-                guest_command,
-                None,
-            )
-            .await
+                label,
+                agent_kind,
+                agent_model,
+                opened_at: UnixMillis::now(),
+                closed_at: None,
+            })?;
+
+            let start_result = async {
+                if let Some(workspace) = workspace.as_ref() {
+                    let record = workspace_bootstrap_audit_record(session_id, workspace)?;
+                    state.audit.record_agent_vm_workspace_bootstrap(&record)?;
+                }
+                self.start_session_after_audit_opened(
+                    Arc::clone(&state),
+                    session_id,
+                    workspace,
+                    guest_command,
+                    None,
+                )
+                .await
+            }
+            .await;
+
+            start_result.map_err(|err| {
+                close_audit_session_best_effort(&state, session_id);
+                AgentVmDaemonError::StartFailed {
+                    session_id,
+                    source: Box::new(err),
+                }
+            })
         }
         .await;
 
-        match start_result {
-            Ok(started) => Ok(started),
-            Err(err) => {
-                close_audit_session_best_effort(&state, session_id);
-                Err(AgentVmDaemonError::StartFailed {
-                    session_id,
-                    source: Box::new(err),
-                })
-            }
-        }
+        drop(session_lock);
+        self.drop_idle_session_lock(session_id).await;
+        outcome
     }
 
     pub async fn start_agent_run_session<S: SecretStore + Send + Sync + 'static>(
@@ -469,61 +506,69 @@ impl AgentVmDaemon {
         workspace: AgentVmWorkspaceBootstrap,
         prompt: AgentPrompt,
     ) -> Result<AgentRunStarted, AgentVmDaemonError> {
-        let _guard = self.lifecycle_lock.lock().await;
         let session_id = SessionId::new();
         let run_id = AgentRunId::new();
-        state.audit.open_session(&SessionRecord {
-            session_id,
-            label,
-            agent_kind: Some(agent_kind),
-            agent_model: Some(agent_model.clone()),
-            opened_at: UnixMillis::now(),
-            closed_at: None,
-        })?;
-
-        let start_result = async {
-            let workspace_record = workspace_bootstrap_audit_record(session_id, &workspace)?;
-            state
-                .audit
-                .record_agent_vm_workspace_bootstrap(&workspace_record)?;
-            state.audit.record_agent_run(&AgentRunAuditRecord {
-                run_id,
+        let session_lock = self.session_lock_handle(session_id).await;
+        let outcome = async {
+            let _session_guard = session_lock.lock().await;
+            state.audit.open_session(&SessionRecord {
                 session_id,
-                requested_at: UnixMillis::now(),
-                agent_kind,
-                prompt: prompt.summary(),
+                label,
+                agent_kind: Some(agent_kind),
+                agent_model: Some(agent_model.clone()),
+                opened_at: UnixMillis::now(),
+                closed_at: None,
             })?;
-            let agent_runs = VmHttpAgentRunService::new(
-                Arc::clone(&state),
-                self.config.vm_http.agent_run_log_root(),
-            );
-            agent_runs.insert_run_config(run_id, prompt.clone(), agent_model.clone());
-            let guest_command = build_agent_run_guest_command(agent_kind, run_id, workspace.warm);
-            self.start_session_after_audit_opened(
-                Arc::clone(&state),
-                session_id,
-                Some(workspace),
-                guest_command,
-                Some(agent_runs),
-            )
-            .await
+
+            let start_result = async {
+                let workspace_record = workspace_bootstrap_audit_record(session_id, &workspace)?;
+                state
+                    .audit
+                    .record_agent_vm_workspace_bootstrap(&workspace_record)?;
+                state.audit.record_agent_run(&AgentRunAuditRecord {
+                    run_id,
+                    session_id,
+                    requested_at: UnixMillis::now(),
+                    agent_kind,
+                    prompt: prompt.summary(),
+                })?;
+                let agent_runs = VmHttpAgentRunService::new(
+                    Arc::clone(&state),
+                    self.config.vm_http.agent_run_log_root(),
+                );
+                agent_runs.insert_run_config(run_id, prompt.clone(), agent_model.clone());
+                let guest_command =
+                    build_agent_run_guest_command(agent_kind, run_id, workspace.warm);
+                self.start_session_after_audit_opened(
+                    Arc::clone(&state),
+                    session_id,
+                    Some(workspace),
+                    guest_command,
+                    Some(agent_runs),
+                )
+                .await
+            }
+            .await;
+
+            start_result
+                .map(|started| AgentRunStarted {
+                    session_id: started.session_id(),
+                    run_id,
+                    broker_url: started.broker_url().to_string(),
+                })
+                .map_err(|err| {
+                    close_audit_session_best_effort(&state, session_id);
+                    AgentVmDaemonError::StartFailed {
+                        session_id,
+                        source: Box::new(err),
+                    }
+                })
         }
         .await;
 
-        match start_result {
-            Ok(started) => Ok(AgentRunStarted {
-                session_id: started.session_id(),
-                run_id,
-                broker_url: started.broker_url().to_string(),
-            }),
-            Err(err) => {
-                close_audit_session_best_effort(&state, session_id);
-                Err(AgentVmDaemonError::StartFailed {
-                    session_id,
-                    source: Box::new(err),
-                })
-            }
-        }
+        drop(session_lock);
+        self.drop_idle_session_lock(session_id).await;
+        outcome
     }
 
     pub async fn stop_session<S: SecretStore + Send + Sync + 'static>(
@@ -531,8 +576,22 @@ impl AgentVmDaemon {
         state: &Arc<BrokerState<S>>,
         session_id: SessionId,
     ) -> Result<(), AgentVmDaemonError> {
-        let _guard = self.lifecycle_lock.lock().await;
+        let session_lock = self.session_lock_handle(session_id).await;
+        let _session_guard = session_lock.lock().await;
 
+        let result = self.stop_session_locked(state, session_id).await;
+
+        drop(_session_guard);
+        drop(session_lock);
+        self.drop_idle_session_lock(session_id).await;
+        result
+    }
+
+    async fn stop_session_locked<S: SecretStore + Send + Sync + 'static>(
+        &self,
+        state: &Arc<BrokerState<S>>,
+        session_id: SessionId,
+    ) -> Result<(), AgentVmDaemonError> {
         let store = self.config.lifecycle.state_store.clone();
         let tools = self.config.lifecycle.tools.clone();
         tokio::task::spawn_blocking(move || {
@@ -720,74 +779,88 @@ impl AgentVmDaemon {
         guest_command: Vec<String>,
         agent_runs: Option<VmHttpAgentRunService<S>>,
     ) -> Result<AgentVmStarted, AgentVmDaemonError> {
-        let lifecycle = self.config.lifecycle.clone();
-        let (subnet_index, network) =
-            tokio::task::spawn_blocking(move || choose_subnet_index(&lifecycle)).await??;
-        let staging_root = self.config.vm_http.git_push_staging_root().to_path_buf();
-        let staging_store = {
-            let path = staging_root.clone();
-            tokio::task::spawn_blocking(move || GitPushStagingStore::open(path))
-                .await?
-                .map_err(|source| AgentVmDaemonError::GitPushStagingOpen {
-                    path: staging_root,
-                    source,
-                })?
+        // Hold subnet_allocation_lock from `choose_subnet_index` through the
+        // `claim_agent_vm_session_subnet` write, so the load+pick+commit
+        // window is atomic across concurrent starts. The slow VM boot in
+        // `complete_agent_vm_session_start` runs after the lock is released.
+        let (prepared, plan, starting, broker_url) = {
+            let _subnet_guard = self.subnet_allocation_lock.lock().await;
+            let lifecycle = self.config.lifecycle.clone();
+            let (subnet_index, network) =
+                tokio::task::spawn_blocking(move || choose_subnet_index(&lifecycle)).await??;
+            let staging_root = self.config.vm_http.git_push_staging_root().to_path_buf();
+            let staging_store = {
+                let path = staging_root.clone();
+                tokio::task::spawn_blocking(move || GitPushStagingStore::open(path))
+                    .await?
+                    .map_err(|source| AgentVmDaemonError::GitPushStagingOpen {
+                        path: staging_root,
+                        source,
+                    })?
+            };
+            let git_push = VmHttpGitPushService::new(
+                Arc::clone(&state),
+                Arc::new(staging_store),
+                self.config.vm_http.git_push_body_limits(),
+            );
+            let prepared = prepare_vm_http_session_with_agent_runs(
+                Arc::clone(&state),
+                &self.config.vm_http,
+                session_id,
+                network.ipv4(),
+                agent_runs,
+                Some(git_push),
+            )
+            .await?;
+            let broker_port = prepared.broker_port();
+            let broker_url = format!("http://{}:{}/", network.ipv4_gateway(), broker_port.get());
+            let nix_cache_url = nix_cache_url_for_broker_url(&broker_url);
+            let trusted_public_keys = self
+                .config
+                .vm_http
+                .nix_cache()
+                .trusted_public_keys()
+                .nix_conf_value();
+            let broker_ports = BrokerPorts::new([broker_port])?;
+            let guest_env = vec![
+                AgentVmGuestEnvVar::new(AGENT_VM_BROKER_URL_ENV, broker_url.clone())?,
+                AgentVmGuestEnvVar::new(
+                    AGENT_VM_BROKER_TOKEN_ENV,
+                    prepared.bearer_token().as_str().to_string(),
+                )?,
+                AgentVmGuestEnvVar::new(AGENT_VM_NIX_CACHE_URL_ENV, nix_cache_url)?,
+                AgentVmGuestEnvVar::new(AGENT_VM_NIX_BASIC_LOGIN_ENV, VM_NIX_BASIC_LOGIN)?,
+                AgentVmGuestEnvVar::new(AGENT_VM_NIX_NETRC_ENV, AGENT_VM_NIX_NETRC_PATH)?,
+                AgentVmGuestEnvVar::new(AGENT_VM_NIX_TRUSTED_PUBLIC_KEYS_ENV, trusted_public_keys)?,
+                AgentVmGuestEnvVar::new(AGENT_VM_NIX_CONF_DIR_ENV, AGENT_VM_NIX_CONF_DIR)?,
+            ];
+            let guest_command = wrap_guest_command(workspace.as_ref(), guest_command)?;
+            let plan = AgentVmSessionPlan::new_with_guest_env(
+                session_id,
+                self.config.lifecycle.pool,
+                subnet_index,
+                broker_ports,
+                self.config.vm_http.broker_port_range(),
+                self.config.lifecycle.ipv6_mode,
+                self.config.lifecycle.image.clone(),
+                guest_env,
+                guest_command,
+                self.config.lifecycle.resources,
+                self.config.lifecycle.tools.clone(),
+            )?;
+            let store = self.config.lifecycle.state_store.clone();
+            let plan_for_claim = plan.clone();
+            let starting: AgentVmSessionState = tokio::task::spawn_blocking(move || {
+                claim_agent_vm_session_subnet(&store, &plan_for_claim)
+            })
+            .await??;
+            (prepared, plan, starting, broker_url)
         };
-        let git_push = VmHttpGitPushService::new(
-            Arc::clone(&state),
-            Arc::new(staging_store),
-            self.config.vm_http.git_push_body_limits(),
-        );
-        let prepared = prepare_vm_http_session_with_agent_runs(
-            Arc::clone(&state),
-            &self.config.vm_http,
-            session_id,
-            network.ipv4(),
-            agent_runs,
-            Some(git_push),
-        )
-        .await?;
-        let broker_port = prepared.broker_port();
-        let broker_url = format!("http://{}:{}/", network.ipv4_gateway(), broker_port.get());
-        let nix_cache_url = nix_cache_url_for_broker_url(&broker_url);
-        let trusted_public_keys = self
-            .config
-            .vm_http
-            .nix_cache()
-            .trusted_public_keys()
-            .nix_conf_value();
-        let broker_ports = BrokerPorts::new([broker_port])?;
-        let guest_env = vec![
-            AgentVmGuestEnvVar::new(AGENT_VM_BROKER_URL_ENV, broker_url.clone())?,
-            AgentVmGuestEnvVar::new(
-                AGENT_VM_BROKER_TOKEN_ENV,
-                prepared.bearer_token().as_str().to_string(),
-            )?,
-            AgentVmGuestEnvVar::new(AGENT_VM_NIX_CACHE_URL_ENV, nix_cache_url)?,
-            AgentVmGuestEnvVar::new(AGENT_VM_NIX_BASIC_LOGIN_ENV, VM_NIX_BASIC_LOGIN)?,
-            AgentVmGuestEnvVar::new(AGENT_VM_NIX_NETRC_ENV, AGENT_VM_NIX_NETRC_PATH)?,
-            AgentVmGuestEnvVar::new(AGENT_VM_NIX_TRUSTED_PUBLIC_KEYS_ENV, trusted_public_keys)?,
-            AgentVmGuestEnvVar::new(AGENT_VM_NIX_CONF_DIR_ENV, AGENT_VM_NIX_CONF_DIR)?,
-        ];
-        let guest_command = wrap_guest_command(workspace.as_ref(), guest_command)?;
-        let plan = AgentVmSessionPlan::new_with_guest_env(
-            session_id,
-            self.config.lifecycle.pool,
-            subnet_index,
-            broker_ports,
-            self.config.vm_http.broker_port_range(),
-            self.config.lifecycle.ipv6_mode,
-            self.config.lifecycle.image.clone(),
-            guest_env,
-            guest_command,
-            self.config.lifecycle.resources,
-            self.config.lifecycle.tools.clone(),
-        )?;
 
         let store = self.config.lifecycle.state_store.clone();
         let plan_for_start = plan.clone();
         tokio::task::spawn_blocking(move || {
-            start_managed_agent_vm_session(&store, &plan_for_start)
+            complete_agent_vm_session_start(&store, &plan_for_start, starting)
         })
         .await??;
 
