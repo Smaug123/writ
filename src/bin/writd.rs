@@ -107,6 +107,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             subnet_index_max = lifecycle.subnet_index_max(),
             "agent VM subnet range",
         );
+        let report = agent_vm.reconcile_persisted_sessions(&state.audit).await?;
+        if !report.cleaned().is_empty() {
+            tracing::warn!(
+                count = report.cleaned().len(),
+                "reconciled orphaned agent VM sessions on boot",
+            );
+            for session_id in report.cleaned() {
+                tracing::warn!(session_id = %session_id, "reconciled agent VM session");
+            }
+        }
+        if !report.is_clean() {
+            for failure in report.failed() {
+                tracing::error!(
+                    session_id = %failure.session_id(),
+                    stage = failure.stage().as_str(),
+                    error = %failure.error(),
+                    "agent VM reconcile failure",
+                );
+            }
+            return Err(format!(
+                "agent VM reconciliation left {} session(s) uncleaned; refusing to start",
+                report.failed().len()
+            )
+            .into());
+        }
     }
     run_with_agent_vm(&socket_path, state, agent_vm).await?;
     Ok(())
