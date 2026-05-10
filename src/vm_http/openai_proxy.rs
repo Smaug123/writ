@@ -355,7 +355,10 @@ impl ProxyBackend for OpenAiBackend {
                         )));
                     }
                     Err(err) => {
-                        eprintln!("VM HTTP OpenAI proxy auth secret load failed: {err}");
+                        tracing::warn!(
+                            error = %err,
+                            "vm http openai proxy auth secret load failed",
+                        );
                         return Err(Box::new(openai_proxy_auth_failure(
                             "OpenAI proxy auth failed",
                             "upstream auth load failed",
@@ -372,7 +375,11 @@ impl ProxyBackend for OpenAiBackend {
                     Ok(headers) => Ok(UpstreamAuth::ChatgptOauth(headers)),
                     Err(err) => {
                         let label = err.audit_error_label();
-                        eprintln!("VM HTTP OpenAI proxy ChatGPT auth resolution failed: {err}");
+                        tracing::warn!(
+                            error_label = label,
+                            error = %err,
+                            "vm http openai proxy chatgpt auth resolution failed",
+                        );
                         let body = match err {
                             ChatgptOauthError::LoginRequired
                             | ChatgptOauthError::BundleMalformed(_) => {

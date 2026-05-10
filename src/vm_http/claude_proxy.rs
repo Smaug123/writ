@@ -308,7 +308,10 @@ impl ProxyBackend for ClaudeBackend {
                 )));
             }
             Err(err) => {
-                eprintln!("VM HTTP Claude proxy auth secret load failed: {err}");
+                tracing::warn!(
+                    error = %err,
+                    "vm http claude proxy auth secret load failed",
+                );
                 return Err(Box::new(claude_proxy_auth_failure(
                     "Claude proxy auth failed",
                     "upstream auth load failed",

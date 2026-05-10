@@ -724,9 +724,11 @@ impl<B: ProxyBackend, S: SecretStore + Send + Sync + 'static> VmHttpProxyService
         let response = match builder.send().await {
             Ok(response) => response,
             Err(err) => {
-                eprintln!(
-                    "VM HTTP {} proxy upstream request failed: {err}",
-                    B::DISPLAY_NAME
+                tracing::warn!(
+                    proxy = B::DISPLAY_NAME,
+                    upstream_url = %upstream_url,
+                    error = %err,
+                    "vm http proxy upstream request failed",
                 );
                 let response =
                     VmHttpResponse::text(VmHttpStatus::BadGateway, B::UPSTREAM_FAIL_BODY);
@@ -747,9 +749,12 @@ impl<B: ProxyBackend, S: SecretStore + Send + Sync + 'static> VmHttpProxyService
             match read_upstream_body_bounded(response, self.config.max_response_bytes()).await {
                 Ok(body) => body,
                 Err(err) => {
-                    eprintln!(
-                        "VM HTTP {} proxy upstream body read failed: {err}",
-                        B::DISPLAY_NAME
+                    tracing::warn!(
+                        proxy = B::DISPLAY_NAME,
+                        upstream_url = %upstream_url,
+                        upstream_status = upstream_status.as_u16(),
+                        error = %err,
+                        "vm http proxy upstream body read failed",
                     );
                     let response =
                         VmHttpResponse::text(VmHttpStatus::BadGateway, B::UPSTREAM_FAIL_BODY);
@@ -793,9 +798,12 @@ impl<B: ProxyBackend, S: SecretStore + Send + Sync + 'static> VmHttpProxyService
         let response = match builder.send().await {
             Ok(response) => response,
             Err(err) => {
-                eprintln!(
-                    "VM HTTP {} proxy upstream request failed: {err}",
-                    B::DISPLAY_NAME
+                tracing::warn!(
+                    proxy = B::DISPLAY_NAME,
+                    request_id = %request_id,
+                    upstream_url = %upstream_url,
+                    error = %err,
+                    "vm http proxy upstream request failed",
                 );
                 let response =
                     VmHttpResponse::text(VmHttpStatus::BadGateway, B::UPSTREAM_FAIL_BODY);
