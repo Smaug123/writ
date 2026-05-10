@@ -589,6 +589,7 @@ mod tests {
             claude_proxy: None,
             openai_proxy: Some(openai_proxy),
             agent_runs: None,
+            git_push: None,
         }
     }
 

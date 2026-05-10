@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc d7e4be03629178923cdef323a41dd7872c29fda7902fad236229137102166f85 # shrinks to request_id = RequestId(00000000-0000-0000-0000-000000000000), staged_at = UnixMillis(0), expected = None, new_head = GitObjectId("aa00aa0aaaa00a0aaaa0aaaaaaaaaa00aaaa00aa"), bundle = []

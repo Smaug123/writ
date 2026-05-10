@@ -7,6 +7,7 @@
 mod agent_runs;
 mod claude_proxy;
 mod git_clone;
+mod git_push;
 mod nix_cache;
 mod openai_proxy;
 mod proxy_common;
@@ -23,6 +24,8 @@ pub use claude_proxy::{
 };
 pub use git_clone::{VmHttpGitCloneConfig, VmHttpGitCloneService};
 use git_clone::{is_git_clone_target, route_git_clone_request};
+pub use git_push::VmHttpGitPushService;
+use git_push::{is_git_push_target, route_git_push_request};
 #[cfg(test)]
 use nix_cache::route_nix_cache_request_without_upstream;
 pub use nix_cache::{
@@ -118,6 +121,7 @@ pub struct PreparedVmHttpSession<S: SecretStore + Send + Sync + 'static> {
     nix_cache: VmHttpNixCacheService<S>,
     proxies: VmHttpProxies<S>,
     agent_runs: Option<VmHttpAgentRunService<S>>,
+    git_push: Option<VmHttpGitPushService<S>>,
 }
 
 pub(in crate::vm_http) struct VmHttpProxies<S: SecretStore + Send + Sync + 'static> {
@@ -140,6 +144,7 @@ struct VmHttpServices<S: SecretStore + Send + Sync + 'static> {
     claude_proxy: Option<VmHttpClaudeProxyService<S>>,
     openai_proxy: Option<VmHttpOpenAiProxyService<S>>,
     agent_runs: Option<VmHttpAgentRunService<S>>,
+    git_push: Option<VmHttpGitPushService<S>>,
 }
 
 pub struct RunningVmHttpSession {
@@ -214,6 +219,7 @@ pub(super) enum VmHttpStatus {
     Forbidden,
     NotFound,
     MethodNotAllowed,
+    Conflict,
     Gone,
     BadGateway,
     InternalServerError,
@@ -356,6 +362,7 @@ impl<S: SecretStore + Send + Sync + 'static> VmHttpServices<S> {
             claude_proxy: None,
             openai_proxy: None,
             agent_runs: None,
+            git_push: None,
         }
     }
 
@@ -364,6 +371,7 @@ impl<S: SecretStore + Send + Sync + 'static> VmHttpServices<S> {
         nix_cache: VmHttpNixCacheService<S>,
         proxies: VmHttpProxies<S>,
         agent_runs: Option<VmHttpAgentRunService<S>>,
+        git_push: Option<VmHttpGitPushService<S>>,
     ) -> Self {
         Self {
             git_clone: Some(git_clone),
@@ -371,6 +379,7 @@ impl<S: SecretStore + Send + Sync + 'static> VmHttpServices<S> {
             claude_proxy: proxies.claude,
             openai_proxy: proxies.openai,
             agent_runs,
+            git_push,
         }
     }
 }
@@ -383,6 +392,7 @@ impl<S: SecretStore + Send + Sync + 'static> Clone for VmHttpServices<S> {
             claude_proxy: self.claude_proxy.clone(),
             openai_proxy: self.openai_proxy.clone(),
             agent_runs: self.agent_runs.clone(),
+            git_push: self.git_push.clone(),
         }
     }
 }
@@ -507,6 +517,7 @@ impl<S: SecretStore + Send + Sync + 'static> PreparedVmHttpSession<S> {
             self.nix_cache,
             self.proxies,
             self.agent_runs,
+            self.git_push,
             shutdown_rx,
         ));
         RunningVmHttpSession {
@@ -607,7 +618,8 @@ pub async fn prepare_vm_http_session<S: SecretStore + Send + Sync + 'static>(
     session_id: SessionId,
     source_ipv4: Ipv4Cidr,
 ) -> Result<PreparedVmHttpSession<S>, VmHttpRuntimeError> {
-    prepare_vm_http_session_with_agent_runs(state, config, session_id, source_ipv4, None).await
+    prepare_vm_http_session_with_agent_runs(state, config, session_id, source_ipv4, None, None)
+        .await
 }
 
 pub async fn prepare_vm_http_session_with_agent_runs<S: SecretStore + Send + Sync + 'static>(
@@ -616,6 +628,7 @@ pub async fn prepare_vm_http_session_with_agent_runs<S: SecretStore + Send + Syn
     session_id: SessionId,
     source_ipv4: Ipv4Cidr,
     agent_runs: Option<VmHttpAgentRunService<S>>,
+    git_push: Option<VmHttpGitPushService<S>>,
 ) -> Result<PreparedVmHttpSession<S>, VmHttpRuntimeError> {
     let listener =
         bind_ephemeral_vm_http_listener(config.bind_addr, config.broker_port_range).await?;
@@ -644,6 +657,7 @@ pub async fn prepare_vm_http_session_with_agent_runs<S: SecretStore + Send + Syn
             openai: openai_proxy,
         },
         agent_runs,
+        git_push,
     })
 }
 
@@ -668,6 +682,7 @@ pub async fn run_vm_http_until_shutdown(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(in crate::vm_http) async fn run_vm_http_with_services_until_shutdown<
     S: SecretStore + Send + Sync + 'static,
 >(
@@ -677,12 +692,13 @@ pub(in crate::vm_http) async fn run_vm_http_with_services_until_shutdown<
     nix_cache: VmHttpNixCacheService<S>,
     proxies: VmHttpProxies<S>,
     agent_runs: Option<VmHttpAgentRunService<S>>,
+    git_push: Option<VmHttpGitPushService<S>>,
     shutdown: watch::Receiver<bool>,
 ) -> std::io::Result<()> {
     run_vm_http_runtime_until_shutdown(
         listener,
         session,
-        VmHttpServices::with_git(git_clone, nix_cache, proxies, agent_runs),
+        VmHttpServices::with_git(git_clone, nix_cache, proxies, agent_runs, git_push),
         shutdown,
     )
     .await
@@ -1158,6 +1174,12 @@ fn route_request_body_limit<S: SecretStore + Send + Sync + 'static>(
     {
         return Some(MAX_VM_HTTP_BODY_BYTES);
     }
+    if is_git_push_target(&request.target) && request.method == "POST" {
+        return services
+            .git_push
+            .as_ref()
+            .map(|service| service.body_limits().max_body_bytes());
+    }
     if parse_agent_run_outcome_target(&request.target).is_some()
         && request.method == "POST"
         && services.agent_runs.is_some()
@@ -1199,6 +1221,15 @@ where
             return VmHttpResponse::text(VmHttpStatus::NotFound, "not found").into();
         };
         return route_git_clone_request(session, request, body, service)
+            .await
+            .into();
+    }
+
+    if is_git_push_target(&request.target) {
+        let Some(service) = services.git_push else {
+            return VmHttpResponse::text(VmHttpStatus::NotFound, "not found").into();
+        };
+        return route_git_push_request(session, request, body, service)
             .await
             .into();
     }
@@ -1437,6 +1468,7 @@ impl VmHttpStatus {
             Self::Forbidden => 403,
             Self::NotFound => 404,
             Self::MethodNotAllowed => 405,
+            Self::Conflict => 409,
             Self::Gone => 410,
             Self::BadGateway => 502,
             Self::InternalServerError => 500,
@@ -1453,6 +1485,7 @@ impl VmHttpStatus {
             403 => Self::Forbidden,
             404 => Self::NotFound,
             405 => Self::MethodNotAllowed,
+            409 => Self::Conflict,
             410 => Self::Gone,
             500 => Self::InternalServerError,
             502 => Self::BadGateway,
@@ -1508,6 +1541,7 @@ mod tests {
             claude_proxy: Some(claude_proxy),
             openai_proxy: None,
             agent_runs: None,
+            git_push: None,
         }
     }
 

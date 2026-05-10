@@ -723,6 +723,7 @@ impl AgentVmDaemon {
             session_id,
             network.ipv4(),
             agent_runs,
+            None,
         )
         .await?;
         let broker_port = prepared.broker_port();
