@@ -325,13 +325,15 @@ mod tests {
             .canonicalise(),
         );
         // A differently-cased `RepoRef` must canonicalise to the same key.
-        assert!(set.contains(
-            &RepoRef {
-                owner: "smaug123".into(),
-                name: "writ".into(),
-            }
-            .canonicalise()
-        ));
+        assert!(
+            set.contains(
+                &RepoRef {
+                    owner: "smaug123".into(),
+                    name: "writ".into(),
+                }
+                .canonicalise()
+            )
+        );
     }
 
     #[test]
