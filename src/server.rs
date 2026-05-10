@@ -391,20 +391,28 @@ pub(crate) async fn request_capability<S: SecretStore + Send + Sync>(
         }
 
         Err(e) => {
-            let error_str = e.to_string();
+            // The audit row is the system of record and keeps the full
+            // `Display` (which itself caps `ApiError.body` to 256 chars in
+            // `MintError`'s impl). The agent only ever sees the bounded
+            // label form so the protocol surface can't carry unbounded or
+            // sensitive backend payloads — see `MintError::agent_message`.
+            let audit_message = e.to_string();
+            let agent_message = e.agent_message();
             if let Err(ae) =
                 state
                     .audit
-                    .record_mint_failure(request_id, UnixMillis::now(), &error_str)
+                    .record_mint_failure(request_id, UnixMillis::now(), &audit_message)
             {
                 return CapabilityOutcome::Error {
                     message: format!(
                         "mint failed and the failure could not be recorded: {ae} \
-                         (original mint error: {error_str})"
+                         (original mint error: {agent_message})"
                     ),
                 };
             }
-            CapabilityOutcome::Error { message: error_str }
+            CapabilityOutcome::Error {
+                message: agent_message,
+            }
         }
     }
 }
@@ -1240,6 +1248,56 @@ mod tests {
                     message.contains("no GitHub App is configured for agent kind codex"),
                     "got: {message}"
                 );
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn mint_failure_returns_bounded_label_to_agent_without_echoing_body() {
+        // GitHub returns a 401 with a body the broker must not forward
+        // verbatim to the agent: it could be very long, and might echo a
+        // sensitive fragment (e.g. an internal identifier in an error
+        // message). The protocol surface must carry only the bounded
+        // label produced by `MintError::agent_message`.
+        let server = MockServer::start().await;
+        let state = make_state(&server, vec![repo("o", "n")], "o");
+        let session_id = open_session(&state).await;
+
+        let body_marker = "do-not-leak-this-fragment-XYZ";
+        Mock::given(method("POST"))
+            .and(path("/app/installations/999/access_tokens"))
+            .respond_with(ResponseTemplate::new(401).set_body_json(serde_json::json!({
+                "message": format!("bad credentials: {body_marker}"),
+            })))
+            .mount(&server)
+            .await;
+
+        let resp = dispatch_message(
+            ClientMessage::Request {
+                session_id,
+                capability: CapabilityRequest::GitHub(crate::core::GitHubRequest::Contents {
+                    access: GitHubAccess::Read,
+                    repo: repo("o", "n"),
+                }),
+            },
+            &state,
+        )
+        .await;
+
+        match resp {
+            ServerMessage::Error { message } => {
+                assert!(
+                    !message.contains(body_marker),
+                    "agent surface must not echo API body: {message}"
+                );
+                assert!(
+                    message.contains("401"),
+                    "agent surface should carry the status discriminant: {message}"
+                );
+                // Sanity-cap on the protocol message itself, mirroring
+                // the in-module assertion in `agent_message_…_bounded`.
+                assert!(message.len() <= 256, "message too long: {message}");
             }
             other => panic!("expected Error, got {other:?}"),
         }
