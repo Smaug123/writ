@@ -3,6 +3,7 @@
 //! configured upstream), injecting host-side auth and stripping guest auth.
 
 use std::borrow::Cow;
+use std::marker::PhantomData;
 use std::sync::Arc;
 
 use serde::Deserialize;
@@ -16,7 +17,7 @@ use crate::secret::{SecretKey, SecretStore};
 use crate::server::BrokerState;
 
 use super::proxy_common::{
-    ProxyAuditKind, ProxyFetch, ProxyForwardHeader, ProxyStream, UpstreamAuth, is_proxy_id_byte,
+    ClaudeAudit, ProxyFetch, ProxyForwardHeader, ProxyStream, UpstreamAuth, is_proxy_id_byte,
     proxy_request_wants_streaming, proxy_response_content_type, proxy_target_path,
     read_upstream_body_bounded,
 };
@@ -238,7 +239,7 @@ impl<S: SecretStore> VmHttpClaudeProxyService<S> {
         request: &VmHttpRequest,
         body: Vec<u8>,
         headers: Vec<ProxyForwardHeader>,
-    ) -> Result<ProxyStream<S>, ProxyFetch> {
+    ) -> Result<ProxyStream<S, ClaudeAudit>, ProxyFetch> {
         let (upstream_url, builder) = self
             .upstream_request_builder(request, body, headers)
             .map_err(|fetch| *fetch)?;
@@ -269,7 +270,7 @@ impl<S: SecretStore> VmHttpClaudeProxyService<S> {
             content_type,
             headers,
             max_response_bytes: self.config.max_response_bytes,
-            kind: ProxyAuditKind::Claude,
+            _audit_kind: PhantomData,
         })
     }
 
@@ -674,7 +675,7 @@ pub(super) async fn route_claude_proxy_request<S: SecretStore>(
             .fetch_stream(request_id, request, body, headers)
             .await
         {
-            Ok(stream) => return VmHttpDispatch::ProxyStream(stream),
+            Ok(stream) => return VmHttpDispatch::ClaudeProxyStream(stream),
             Err(fetch) => {
                 if let Err(err) = service.broker_state.audit.record_claude_proxy_outcome(
                     &ClaudeProxyOutcomeRecord {
@@ -1479,12 +1480,12 @@ mod tests {
         )
         .await;
         let request_id = match &dispatch {
-            VmHttpDispatch::ProxyStream(stream) => {
-                assert_eq!(stream.kind, ProxyAuditKind::Claude);
-                stream.request_id
-            }
+            VmHttpDispatch::ClaudeProxyStream(stream) => stream.request_id,
             VmHttpDispatch::Buffered(response) => {
                 panic!("expected streaming response, got {response:?}")
+            }
+            VmHttpDispatch::OpenAiProxyStream(_) => {
+                panic!("Claude route produced an OpenAI stream")
             }
         };
         assert!(
@@ -1566,12 +1567,12 @@ mod tests {
         )
         .await;
         let request_id = match &dispatch {
-            VmHttpDispatch::ProxyStream(stream) => {
-                assert_eq!(stream.kind, ProxyAuditKind::Claude);
-                stream.request_id
-            }
+            VmHttpDispatch::ClaudeProxyStream(stream) => stream.request_id,
             VmHttpDispatch::Buffered(response) => {
                 panic!("expected streaming response, got {response:?}")
+            }
+            VmHttpDispatch::OpenAiProxyStream(_) => {
+                panic!("Claude route produced an OpenAI stream")
             }
         };
         let response =
