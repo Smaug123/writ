@@ -7,15 +7,14 @@ use std::borrow::Cow;
 use serde::Deserialize;
 
 use crate::audit::{
-    AuditError, AuditLog, ClaudeProxyAuditDecision, ClaudeProxyAuditRoute,
-    ClaudeProxyOutcomeRecord, ClaudeProxyRequestRecord,
+    AuditError, AuditLog, ClaudeProxyAuditRoute, ClaudeProxyOutcomeRecord, ClaudeProxyRequestRecord,
 };
 use crate::secret::{SecretKey, SecretStore};
 
 use super::proxy_common::{
-    ClaudeBackend, ProxyAuditDecision, ProxyBackend, ProxyBackendConfig, ProxyFetch,
-    ProxyForwardHeader, ProxyOutcomeFields, ProxyRequestFields, ProxyStream, UpstreamAuth,
-    VmHttpProxyService, is_proxy_id_byte, proxy_target_path,
+    ClaudeBackend, ProxyBackend, ProxyBackendConfig, ProxyFetch, ProxyForwardHeader,
+    ProxyOutcomeFields, ProxyRequestFields, ProxyStream, UpstreamAuth, VmHttpProxyService,
+    is_proxy_id_byte, proxy_decision_to_owned, proxy_target_path,
 };
 use super::{VmHttpDispatch, VmHttpHeader, VmHttpResponse, VmHttpStatus};
 
@@ -326,7 +325,7 @@ impl ProxyBackend for ClaudeBackend {
         audit_log: &AuditLog,
         fields: ProxyRequestFields<'_, ClaudeProxyAuditRoute>,
     ) -> Result<(), AuditError> {
-        let decision = decision_to_claude(fields.decision);
+        let decision = proxy_decision_to_owned(fields.decision);
         audit_log.record_claude_proxy_request(&ClaudeProxyRequestRecord {
             request_id: fields.request_id,
             session_id: fields.session_id,
@@ -464,15 +463,6 @@ fn claude_proxy_forward_headers(
         value: anthropic_version.clone(),
     });
     Ok(forwarded)
-}
-
-fn decision_to_claude(decision: &ProxyAuditDecision<'_>) -> ClaudeProxyAuditDecision {
-    match decision {
-        ProxyAuditDecision::Allow => ClaudeProxyAuditDecision::Allow,
-        ProxyAuditDecision::Deny { reason } => ClaudeProxyAuditDecision::Deny {
-            reason: reason.clone().into_owned(),
-        },
-    }
 }
 
 #[cfg(test)]
