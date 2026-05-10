@@ -101,15 +101,13 @@ pub struct AgentVmSessionState {
 /// **Single-owner invariant:** a state directory has exactly one owner. Either
 /// a single `writd` runs against it, or ad-hoc CLI invocations
 /// (`writ-agent-vm-runner managed-start` / `managed-stop`) act on it — never
-/// both, and never two daemons. The store's [`lock_store`] file lock
-/// serialises individual operations, but the daemon's split start/stop forms
-/// release that lock between sub-steps for parallelism, so an external
-/// process touching the same `SessionId` mid-flight could remove a `Starting`
-/// record before the daemon's boot creates infrastructure to clean up,
-/// orphaning that infrastructure. We do not defend against this in code: the
-/// invariant is documented and operational.
-///
-/// [`lock_store`]: AgentVmSessionStateStore::lock_store
+/// both, and never two daemons. The store's internal file lock serialises
+/// individual operations, but the daemon's split start/stop forms release
+/// that lock between sub-steps for parallelism, so an external process
+/// touching the same `SessionId` mid-flight could remove a `Starting` record
+/// before the daemon's boot creates infrastructure to clean up, orphaning
+/// that infrastructure. We do not defend against this in code: the invariant
+/// is documented and operational.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AgentVmSessionStateStore {
     dir: PathBuf,
