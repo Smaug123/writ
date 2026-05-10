@@ -132,19 +132,22 @@ impl GitPushStagingStore {
         let entry_bytes = serde_json::to_vec(&receipt)
             .expect("VmGitPushStagedReceipt serialises without IO; struct fields are infallible");
 
+        // No fast-path existence check: that would only catch the
+        // non-racy case and would still leave a TOCTOU gap before the
+        // rename. The rename itself is the single source of truth — its
+        // failure mode tells us whether we lost an idempotent race.
         let final_dir = self.staged_path(request_id);
-        if final_dir.exists() {
-            return self.reconcile_existing(request_id, &entry_bytes, &bundle);
-        }
-
         let scratch = self.scratch_path();
         create_private_dir(&scratch)?;
         let outcome = self.populate_and_commit(&scratch, &final_dir, &entry_bytes, &bundle);
         match outcome {
             Ok(()) => Ok(receipt),
-            Err(StagingError::Io(err)) if err.kind() == io::ErrorKind::AlreadyExists => {
-                // Lost a race against a concurrent stage() for the same
-                // request_id. Fall through to the reconciliation path.
+            Err(StagingError::Io(err)) if is_rename_target_occupied(&err) => {
+                // Either the final dir was already populated when stage()
+                // started, or a concurrent stage() for the same
+                // request_id beat us to the rename. Either way, the
+                // contents on disk are the canonical truth; reconcile
+                // against them.
                 let _ = fs::remove_dir_all(&scratch);
                 self.reconcile_existing(request_id, &entry_bytes, &bundle)
             }
@@ -269,6 +272,20 @@ impl GitPushStagingStore {
         fsync_dir(&self.root.join(STAGED_DIR))?;
         Ok(())
     }
+}
+
+/// Discriminate the rename error that means "the target path is already
+/// populated, reconcile against it" from a true IO failure.
+///
+/// On Linux and macOS, `rename(scratch_dir, populated_dir)` returns
+/// `ENOTEMPTY` (mapped to `ErrorKind::DirectoryNotEmpty`). The
+/// `AlreadyExists` arm is kept defensively for edge cases such as a
+/// final path occupied by a non-directory file.
+fn is_rename_target_occupied(err: &io::Error) -> bool {
+    matches!(
+        err.kind(),
+        io::ErrorKind::DirectoryNotEmpty | io::ErrorKind::AlreadyExists
+    )
 }
 
 fn parse_request_id_from_dirname(name: &OsStr) -> Result<RequestId, StagingError> {
@@ -599,6 +616,40 @@ mod tests {
         assert!(receipt.expected_remote_head().is_none());
         let loaded = store.load(request_id).unwrap();
         assert!(loaded.receipt().expected_remote_head().is_none());
+    }
+
+    /// Regression test for the rename-error discrimination logic. On
+    /// Unix-like systems renaming a populated scratch directory onto a
+    /// populated target returns `ENOTEMPTY` (`ErrorKind::DirectoryNotEmpty`),
+    /// not `AlreadyExists`. A previous version of `stage()` matched only
+    /// the latter and surfaced the rename error to callers instead of
+    /// reconciling, breaking idempotent replay.
+    #[test]
+    fn stage_reconciles_when_final_dir_is_already_populated() {
+        let (store, _tmp) = open_store();
+        let request_id: RequestId = "bbbbbbbb-0000-0000-0000-000000000000".parse().unwrap();
+        let staged_at = UnixMillis::from_millis(2024);
+        let metadata = sample_metadata();
+        let bundle = b"identical bundle bytes".to_vec();
+
+        let expected_receipt = VmGitPushStagedReceipt::new(
+            metadata.repo().clone(),
+            metadata.branch().clone(),
+            metadata.expected_remote_head().cloned(),
+            metadata.new_head().clone(),
+            request_id,
+            staged_at,
+        );
+        let entry_bytes = serde_json::to_vec(&expected_receipt).unwrap();
+        let final_dir = store.root().join(STAGED_DIR).join(request_id.to_string());
+        create_private_dir(&final_dir).unwrap();
+        write_private_file(&final_dir.join(ENTRY_FILE), &entry_bytes).unwrap();
+        write_private_file(&final_dir.join(BUNDLE_FILE), &bundle).unwrap();
+
+        let receipt = store
+            .stage(request_id, staged_at, metadata, bundle)
+            .unwrap();
+        assert_eq!(receipt, expected_receipt);
     }
 
     #[cfg(unix)]
