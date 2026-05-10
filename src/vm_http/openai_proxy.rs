@@ -3,6 +3,7 @@
 //! configured upstream), injecting host-side auth and stripping guest auth.
 
 use std::borrow::Cow;
+use std::marker::PhantomData;
 use std::sync::Arc;
 
 use serde::Deserialize;
@@ -20,7 +21,7 @@ use crate::secret::{SecretKey, SecretStore};
 use crate::server::BrokerState;
 
 use super::proxy_common::{
-    ProxyAuditKind, ProxyFetch, ProxyForwardHeader, ProxyStream, UpstreamAuth, is_proxy_id_byte,
+    OpenAiAudit, ProxyFetch, ProxyForwardHeader, ProxyStream, UpstreamAuth, is_proxy_id_byte,
     proxy_request_wants_streaming, proxy_response_content_type, proxy_target_path,
     read_upstream_body_bounded,
 };
@@ -298,7 +299,7 @@ impl<S: SecretStore> VmHttpOpenAiProxyService<S> {
         request: &VmHttpRequest,
         body: Vec<u8>,
         headers: Vec<ProxyForwardHeader>,
-    ) -> Result<ProxyStream<S>, ProxyFetch> {
+    ) -> Result<ProxyStream<S, OpenAiAudit>, ProxyFetch> {
         let (upstream_url, builder) = self
             .upstream_request_builder(request, body, headers)
             .await
@@ -330,7 +331,7 @@ impl<S: SecretStore> VmHttpOpenAiProxyService<S> {
             content_type,
             headers,
             max_response_bytes: self.config.max_response_bytes,
-            kind: ProxyAuditKind::OpenAi,
+            _audit_kind: PhantomData,
         })
     }
 
@@ -752,7 +753,7 @@ pub(super) async fn route_openai_proxy_request<S: SecretStore>(
             .fetch_stream(request_id, request, body, headers)
             .await
         {
-            Ok(stream) => return VmHttpDispatch::ProxyStream(stream),
+            Ok(stream) => return VmHttpDispatch::OpenAiProxyStream(stream),
             Err(fetch) => {
                 if let Err(err) = service.broker_state.audit.record_openai_proxy_outcome(
                     &OpenAiProxyOutcomeRecord {

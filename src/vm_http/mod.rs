@@ -41,7 +41,7 @@ use openai_proxy::{
     classify_openai_proxy_target, is_openai_proxy_target, record_openai_proxy_local_response,
     route_openai_proxy_request,
 };
-use proxy_common::ProxyStream;
+use proxy_common::{ClaudeAudit, OpenAiAudit, ProxyStream};
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -264,7 +264,8 @@ enum VmHttpAuthScheme {
 
 enum VmHttpDispatch<S: SecretStore> {
     Buffered(VmHttpResponse),
-    ProxyStream(ProxyStream<S>),
+    ClaudeProxyStream(ProxyStream<S, ClaudeAudit>),
+    OpenAiProxyStream(ProxyStream<S, OpenAiAudit>),
 }
 
 impl VmHttpSession {
@@ -1400,7 +1401,8 @@ impl<S: SecretStore + Send + Sync + 'static> VmHttpDispatch<S> {
     fn into_hyper_response(self) -> http::Response<UnsyncBoxBody<Bytes, std::io::Error>> {
         match self {
             Self::Buffered(response) => response.into_hyper_response(),
-            Self::ProxyStream(stream) => stream.into_hyper_response(),
+            Self::ClaudeProxyStream(stream) => stream.into_hyper_response(),
+            Self::OpenAiProxyStream(stream) => stream.into_hyper_response(),
         }
     }
 }
@@ -1409,7 +1411,8 @@ impl<S: SecretStore> VmHttpDispatch<S> {
     fn status_code(&self) -> u16 {
         match self {
             Self::Buffered(response) => response.status.code(),
-            Self::ProxyStream(stream) => stream.upstream_status,
+            Self::ClaudeProxyStream(stream) => stream.upstream_status,
+            Self::OpenAiProxyStream(stream) => stream.upstream_status,
         }
     }
 
@@ -1417,7 +1420,9 @@ impl<S: SecretStore> VmHttpDispatch<S> {
     fn into_buffered(self) -> VmHttpResponse {
         match self {
             Self::Buffered(response) => response,
-            Self::ProxyStream(_) => panic!("expected buffered VM HTTP response"),
+            Self::ClaudeProxyStream(_) | Self::OpenAiProxyStream(_) => {
+                panic!("expected buffered VM HTTP response")
+            }
         }
     }
 }
