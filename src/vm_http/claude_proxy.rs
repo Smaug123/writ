@@ -156,7 +156,10 @@ impl<S: SecretStore> VmHttpClaudeProxyService<S> {
                 )));
             }
             Err(err) => {
-                eprintln!("VM HTTP Claude proxy auth secret load failed: {err}");
+                tracing::warn!(
+                    error = %err,
+                    "vm http claude proxy auth secret load failed",
+                );
                 return Err(Box::new(claude_proxy_auth_failure(
                     "Claude proxy auth failed",
                     "upstream auth load failed",
@@ -184,7 +187,11 @@ impl<S: SecretStore> VmHttpClaudeProxyService<S> {
         let response = match builder.send().await {
             Ok(response) => response,
             Err(err) => {
-                eprintln!("VM HTTP Claude proxy upstream request failed: {err}");
+                tracing::warn!(
+                    upstream_url = %upstream_url,
+                    error = %err,
+                    "vm http claude proxy upstream request failed",
+                );
                 let response =
                     VmHttpResponse::text(VmHttpStatus::BadGateway, "Claude proxy upstream failed");
                 return ProxyFetch {
@@ -204,7 +211,12 @@ impl<S: SecretStore> VmHttpClaudeProxyService<S> {
         {
             Ok(body) => body,
             Err(err) => {
-                eprintln!("VM HTTP Claude proxy upstream body read failed: {err}");
+                tracing::warn!(
+                    upstream_url = %upstream_url,
+                    upstream_status = upstream_status.as_u16(),
+                    error = %err,
+                    "vm http claude proxy upstream body read failed",
+                );
                 let response =
                     VmHttpResponse::text(VmHttpStatus::BadGateway, "Claude proxy upstream failed");
                 return ProxyFetch {
@@ -246,7 +258,12 @@ impl<S: SecretStore> VmHttpClaudeProxyService<S> {
         let response = match builder.send().await {
             Ok(response) => response,
             Err(err) => {
-                eprintln!("VM HTTP Claude proxy upstream request failed: {err}");
+                tracing::warn!(
+                    request_id = %request_id,
+                    upstream_url = %upstream_url,
+                    error = %err,
+                    "vm http claude proxy upstream request failed",
+                );
                 let response =
                     VmHttpResponse::text(VmHttpStatus::BadGateway, "Claude proxy upstream failed");
                 return Err(ProxyFetch {

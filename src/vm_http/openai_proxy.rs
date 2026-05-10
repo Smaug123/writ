@@ -149,7 +149,10 @@ impl<S: SecretStore> VmHttpOpenAiProxyService<S> {
                         )));
                     }
                     Err(err) => {
-                        eprintln!("VM HTTP OpenAI proxy auth secret load failed: {err}");
+                        tracing::warn!(
+                            error = %err,
+                            "vm http openai proxy auth secret load failed",
+                        );
                         return Err(Box::new(openai_proxy_auth_failure(
                             "OpenAI proxy auth failed",
                             "upstream auth load failed",
@@ -168,7 +171,11 @@ impl<S: SecretStore> VmHttpOpenAiProxyService<S> {
                     Ok(headers) => Ok(UpstreamAuth::ChatgptOauth(headers)),
                     Err(err) => {
                         let label = err.audit_error_label();
-                        eprintln!("VM HTTP OpenAI proxy ChatGPT auth resolution failed: {err}");
+                        tracing::warn!(
+                            error_label = label,
+                            error = %err,
+                            "vm http openai proxy chatgpt auth resolution failed",
+                        );
                         let body = match err {
                             ChatgptOauthError::LoginRequired
                             | ChatgptOauthError::BundleMalformed(_) => {
@@ -244,7 +251,11 @@ impl<S: SecretStore> VmHttpOpenAiProxyService<S> {
         let response = match builder.send().await {
             Ok(response) => response,
             Err(err) => {
-                eprintln!("VM HTTP OpenAI proxy upstream request failed: {err}");
+                tracing::warn!(
+                    upstream_url = %upstream_url,
+                    error = %err,
+                    "vm http openai proxy upstream request failed",
+                );
                 let response =
                     VmHttpResponse::text(VmHttpStatus::BadGateway, "OpenAI proxy upstream failed");
                 return ProxyFetch {
@@ -264,7 +275,12 @@ impl<S: SecretStore> VmHttpOpenAiProxyService<S> {
         {
             Ok(body) => body,
             Err(err) => {
-                eprintln!("VM HTTP OpenAI proxy upstream body read failed: {err}");
+                tracing::warn!(
+                    upstream_url = %upstream_url,
+                    upstream_status = upstream_status.as_u16(),
+                    error = %err,
+                    "vm http openai proxy upstream body read failed",
+                );
                 let response =
                     VmHttpResponse::text(VmHttpStatus::BadGateway, "OpenAI proxy upstream failed");
                 return ProxyFetch {
@@ -307,7 +323,12 @@ impl<S: SecretStore> VmHttpOpenAiProxyService<S> {
         let response = match builder.send().await {
             Ok(response) => response,
             Err(err) => {
-                eprintln!("VM HTTP OpenAI proxy upstream request failed: {err}");
+                tracing::warn!(
+                    request_id = %request_id,
+                    upstream_url = %upstream_url,
+                    error = %err,
+                    "vm http openai proxy upstream request failed",
+                );
                 let response =
                     VmHttpResponse::text(VmHttpStatus::BadGateway, "OpenAI proxy upstream failed");
                 return Err(ProxyFetch {
