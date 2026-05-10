@@ -239,7 +239,7 @@ impl<S: SecretStore> VmHttpClaudeProxyService<S> {
         request: &VmHttpRequest,
         body: Vec<u8>,
         headers: Vec<ProxyForwardHeader>,
-    ) -> Result<ProxyStream<S, ClaudeBackend>, ProxyFetch> {
+    ) -> Result<ProxyStream<ClaudeBackend>, ProxyFetch> {
         let (upstream_url, builder) = self
             .upstream_request_builder(request, body, headers)
             .map_err(|fetch| *fetch)?;
@@ -262,7 +262,7 @@ impl<S: SecretStore> VmHttpClaudeProxyService<S> {
         let content_type = proxy_response_content_type(&response);
         let headers = claude_proxy_response_headers(response.headers());
         Ok(ProxyStream {
-            broker_state: Arc::clone(&self.broker_state),
+            audit_log: Arc::clone(&self.broker_state.audit),
             request_id,
             response,
             upstream_url,
@@ -597,7 +597,7 @@ pub(super) async fn route_claude_proxy_request<S: SecretStore>(
     request: &VmHttpRequest,
     body: Vec<u8>,
     service: &VmHttpClaudeProxyService<S>,
-) -> VmHttpDispatch<S> {
+) -> VmHttpDispatch {
     let route = ClaudeBackend::classify_proxy_target(&request.target)
         .expect("caller only routes classified Claude proxy targets");
     if route == ClaudeProxyAuditRoute::Unsupported {

@@ -256,10 +256,10 @@ enum VmHttpAuthScheme {
     Basic,
 }
 
-enum VmHttpDispatch<S: SecretStore> {
+enum VmHttpDispatch {
     Buffered(VmHttpResponse),
-    ClaudeProxyStream(ProxyStream<S, ClaudeBackend>),
-    OpenAiProxyStream(ProxyStream<S, OpenAiBackend>),
+    ClaudeProxyStream(ProxyStream<ClaudeBackend>),
+    OpenAiProxyStream(ProxyStream<OpenAiBackend>),
 }
 
 impl VmHttpSession {
@@ -984,7 +984,7 @@ where
         }
     };
     let auth_scheme = auth_scheme_for_target(&request.target);
-    let dispatch: VmHttpDispatch<S> =
+    let dispatch: VmHttpDispatch =
         match authorize_vm_http_request_with_scheme(session, &request, auth_scheme) {
             VmHttpAuthorization::Allow => {
                 let body_bytes = match route_request_body_limit(&request, &services) {
@@ -1177,7 +1177,7 @@ async fn route_authenticated_vm_http_request<S>(
     request: &VmHttpRequest,
     body: Vec<u8>,
     services: VmHttpServices<S>,
-) -> VmHttpDispatch<S>
+) -> VmHttpDispatch
 where
     S: SecretStore + Send + Sync,
 {
@@ -1385,13 +1385,13 @@ impl VmHttpResponse {
     }
 }
 
-impl<S: SecretStore> From<VmHttpResponse> for VmHttpDispatch<S> {
+impl From<VmHttpResponse> for VmHttpDispatch {
     fn from(response: VmHttpResponse) -> Self {
         Self::Buffered(response)
     }
 }
 
-impl<S: SecretStore + Send + Sync + 'static> VmHttpDispatch<S> {
+impl VmHttpDispatch {
     fn into_hyper_response(self) -> http::Response<UnsyncBoxBody<Bytes, std::io::Error>> {
         match self {
             Self::Buffered(response) => response.into_hyper_response(),
@@ -1399,9 +1399,7 @@ impl<S: SecretStore + Send + Sync + 'static> VmHttpDispatch<S> {
             Self::OpenAiProxyStream(stream) => stream.into_hyper_response(),
         }
     }
-}
 
-impl<S: SecretStore> VmHttpDispatch<S> {
     fn status_code(&self) -> u16 {
         match self {
             Self::Buffered(response) => response.status.code(),
@@ -1555,7 +1553,7 @@ mod tests {
             store.put(&key, value).unwrap();
         }
         Arc::new(BrokerState {
-            audit: AuditLog::open_in_memory().unwrap(),
+            audit: Arc::new(AuditLog::open_in_memory().unwrap()),
             minter: GitHubMinter::new(
                 GitHubAppConfig {
                     app_id: 42,

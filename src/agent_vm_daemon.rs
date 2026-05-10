@@ -1072,7 +1072,7 @@ mod tests {
     fn make_state_with_audit(audit: AuditLog) -> Arc<BrokerState<InMemStore>> {
         let key = SecretKey::new("gh-app-pk").unwrap();
         Arc::new(BrokerState {
-            audit,
+            audit: Arc::new(audit),
             minter: GitHubMinter::new(
                 GitHubAppConfig {
                     app_id: 42,

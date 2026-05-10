@@ -81,7 +81,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let state = Arc::new(BrokerState {
-        audit,
+        audit: Arc::new(audit),
         minter: GitHubMinter::new_registry(github, store),
         policy,
     });

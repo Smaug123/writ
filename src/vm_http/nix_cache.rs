@@ -236,7 +236,7 @@ pub(super) async fn route_nix_cache_request<S: SecretStore>(
     session: &VmHttpSession,
     request: &VmHttpRequest,
     service: Option<VmHttpNixCacheService<S>>,
-) -> VmHttpDispatch<S> {
+) -> VmHttpDispatch {
     let Some(service) = service else {
         return route_nix_cache_request_without_upstream(request).into();
     };

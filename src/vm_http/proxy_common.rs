@@ -18,11 +18,9 @@ use http_body_util::BodyExt as _;
 use http_body_util::combinators::UnsyncBoxBody;
 use hyper::body::{Body as HyperBody, Frame};
 
-use crate::audit::{ClaudeProxyOutcomeRecord, OpenAiProxyOutcomeRecord};
+use crate::audit::{AuditLog, ClaudeProxyOutcomeRecord, OpenAiProxyOutcomeRecord};
 use crate::core::{RequestId, UnixMillis};
 use crate::openai_chatgpt_auth::ChatgptUpstreamHeaders;
-use crate::secret::SecretStore;
-use crate::server::BrokerState;
 
 use super::{VmHttpResponse, VmHttpResponseHeader};
 
@@ -202,10 +200,7 @@ pub(super) async fn read_upstream_body_bounded(
 pub(super) trait ProxyAudit: 'static {
     /// Human-readable backend label for diagnostic logging.
     const DISPLAY_NAME: &'static str;
-    fn record_outcome<S: SecretStore>(
-        broker_state: &BrokerState<S>,
-        fields: ProxyOutcomeFields<'_>,
-    );
+    fn record_outcome(audit_log: &AuditLog, fields: ProxyOutcomeFields<'_>);
 }
 
 /// Per-backend behaviour the VM HTTP proxy dispatcher relies on.
@@ -260,23 +255,16 @@ pub(super) struct ClaudeBackend;
 impl ProxyAudit for ClaudeBackend {
     const DISPLAY_NAME: &'static str = "Claude";
 
-    fn record_outcome<S: SecretStore>(
-        broker_state: &BrokerState<S>,
-        fields: ProxyOutcomeFields<'_>,
-    ) {
-        if let Err(err) =
-            broker_state
-                .audit
-                .record_claude_proxy_outcome(&ClaudeProxyOutcomeRecord {
-                    request_id: fields.request_id,
-                    completed_at: fields.completed_at,
-                    http_status: fields.http_status,
-                    upstream_url: fields.upstream_url,
-                    upstream_status: fields.upstream_status,
-                    response_bytes: fields.response_bytes,
-                    error: fields.error,
-                })
-        {
+    fn record_outcome(audit_log: &AuditLog, fields: ProxyOutcomeFields<'_>) {
+        if let Err(err) = audit_log.record_claude_proxy_outcome(&ClaudeProxyOutcomeRecord {
+            request_id: fields.request_id,
+            completed_at: fields.completed_at,
+            http_status: fields.http_status,
+            upstream_url: fields.upstream_url,
+            upstream_status: fields.upstream_status,
+            response_bytes: fields.response_bytes,
+            error: fields.error,
+        }) {
             eprintln!("VM HTTP Claude proxy streaming audit outcome write failed: {err}");
         }
     }
@@ -289,23 +277,16 @@ pub(super) struct OpenAiBackend;
 impl ProxyAudit for OpenAiBackend {
     const DISPLAY_NAME: &'static str = "OpenAI";
 
-    fn record_outcome<S: SecretStore>(
-        broker_state: &BrokerState<S>,
-        fields: ProxyOutcomeFields<'_>,
-    ) {
-        if let Err(err) =
-            broker_state
-                .audit
-                .record_openai_proxy_outcome(&OpenAiProxyOutcomeRecord {
-                    request_id: fields.request_id,
-                    completed_at: fields.completed_at,
-                    http_status: fields.http_status,
-                    upstream_url: fields.upstream_url,
-                    upstream_status: fields.upstream_status,
-                    response_bytes: fields.response_bytes,
-                    error: fields.error,
-                })
-        {
+    fn record_outcome(audit_log: &AuditLog, fields: ProxyOutcomeFields<'_>) {
+        if let Err(err) = audit_log.record_openai_proxy_outcome(&OpenAiProxyOutcomeRecord {
+            request_id: fields.request_id,
+            completed_at: fields.completed_at,
+            http_status: fields.http_status,
+            upstream_url: fields.upstream_url,
+            upstream_status: fields.upstream_status,
+            response_bytes: fields.response_bytes,
+            error: fields.error,
+        }) {
             eprintln!("VM HTTP OpenAI proxy streaming audit outcome write failed: {err}");
         }
     }
@@ -335,23 +316,23 @@ pub(super) enum ProxyStreamState {
     OverMax,
 }
 
-pub(super) struct ProxyStreamAudit<S: SecretStore> {
-    pub(super) broker_state: Arc<BrokerState<S>>,
+pub(super) struct ProxyStreamAudit {
+    pub(super) audit_log: Arc<AuditLog>,
     pub(super) request_id: RequestId,
     pub(super) upstream_url: String,
     pub(super) upstream_status: u16,
 }
 
-pub(super) struct ProxyStreamBody<S: SecretStore, A: ProxyAudit> {
+pub(super) struct ProxyStreamBody<A: ProxyAudit> {
     pub(super) inner: Pin<Box<dyn Stream<Item = reqwest::Result<Bytes>> + Send>>,
-    pub(super) audit: Option<ProxyStreamAudit<S>>,
+    pub(super) audit: Option<ProxyStreamAudit>,
     pub(super) max_response_bytes: u64,
     pub(super) response_bytes: u64,
     pub(super) state: ProxyStreamState,
     pub(super) _audit_kind: PhantomData<fn() -> A>,
 }
 
-impl<S: SecretStore, A: ProxyAudit> HyperBody for ProxyStreamBody<S, A> {
+impl<A: ProxyAudit> HyperBody for ProxyStreamBody<A> {
     type Data = Bytes;
     type Error = std::io::Error;
 
@@ -400,7 +381,7 @@ impl<S: SecretStore, A: ProxyAudit> HyperBody for ProxyStreamBody<S, A> {
     }
 }
 
-impl<S: SecretStore, A: ProxyAudit> Drop for ProxyStreamBody<S, A> {
+impl<A: ProxyAudit> Drop for ProxyStreamBody<A> {
     fn drop(&mut self) {
         let Some(audit) = self.audit.take() else {
             return;
@@ -412,7 +393,7 @@ impl<S: SecretStore, A: ProxyAudit> Drop for ProxyStreamBody<S, A> {
             ProxyStreamState::OverMax => Some("upstream response too large"),
         };
         A::record_outcome(
-            &audit.broker_state,
+            &audit.audit_log,
             ProxyOutcomeFields {
                 request_id: audit.request_id,
                 completed_at: UnixMillis::now(),
@@ -452,8 +433,8 @@ pub(super) struct ProxyFetch {
 /// has not yet been forwarded to the guest. The audit-log selector
 /// `A` is a type parameter so completion-record routing is statically
 /// dispatched.
-pub(crate) struct ProxyStream<S: SecretStore, A: ProxyAudit> {
-    pub(super) broker_state: Arc<BrokerState<S>>,
+pub(crate) struct ProxyStream<A: ProxyAudit> {
+    pub(super) audit_log: Arc<AuditLog>,
     pub(super) request_id: RequestId,
     pub(super) response: reqwest::Response,
     pub(super) upstream_url: String,
@@ -464,14 +445,14 @@ pub(crate) struct ProxyStream<S: SecretStore, A: ProxyAudit> {
     pub(super) _audit_kind: PhantomData<fn() -> A>,
 }
 
-impl<S: SecretStore + Send + Sync + 'static, A: ProxyAudit> ProxyStream<S, A> {
+impl<A: ProxyAudit> ProxyStream<A> {
     pub(super) fn into_hyper_response(
         self,
     ) -> http::Response<UnsyncBoxBody<Bytes, std::io::Error>> {
-        let body = ProxyStreamBody::<S, A> {
+        let body = ProxyStreamBody::<A> {
             inner: Box::pin(self.response.bytes_stream()),
             audit: Some(ProxyStreamAudit {
-                broker_state: self.broker_state,
+                audit_log: self.audit_log,
                 request_id: self.request_id,
                 upstream_url: self.upstream_url,
                 upstream_status: self.upstream_status,

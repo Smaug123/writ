@@ -299,7 +299,7 @@ impl<S: SecretStore> VmHttpOpenAiProxyService<S> {
         request: &VmHttpRequest,
         body: Vec<u8>,
         headers: Vec<ProxyForwardHeader>,
-    ) -> Result<ProxyStream<S, OpenAiBackend>, ProxyFetch> {
+    ) -> Result<ProxyStream<OpenAiBackend>, ProxyFetch> {
         let (upstream_url, builder) = self
             .upstream_request_builder(request, body, headers)
             .await
@@ -323,7 +323,7 @@ impl<S: SecretStore> VmHttpOpenAiProxyService<S> {
         let content_type = proxy_response_content_type(&response);
         let headers = openai_proxy_response_headers(response.headers());
         Ok(ProxyStream {
-            broker_state: Arc::clone(&self.broker_state),
+            audit_log: Arc::clone(&self.broker_state.audit),
             request_id,
             response,
             upstream_url,
@@ -679,7 +679,7 @@ pub(super) async fn route_openai_proxy_request<S: SecretStore>(
     request: &VmHttpRequest,
     body: Vec<u8>,
     service: &VmHttpOpenAiProxyService<S>,
-) -> VmHttpDispatch<S> {
+) -> VmHttpDispatch {
     let route = OpenAiBackend::classify_proxy_target(&request.target)
         .expect("caller only routes classified OpenAI proxy targets");
     if route == OpenAiProxyAuditRoute::Unsupported {
