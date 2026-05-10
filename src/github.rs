@@ -34,12 +34,18 @@ fn default_api_base() -> String {
     "https://api.github.com".into()
 }
 
-/// How long we ask the JWT to live. GitHub rejects anything over 10 minutes;
-/// leave a minute of headroom.
-const JWT_LIFETIME_SECONDS: i64 = 9 * 60;
-
-/// How far we backdate `iat` to tolerate a minute of clock skew against GitHub.
+/// How far we backdate `iat` to tolerate a broker clock running behind
+/// GitHub's. 60 s is the most we can spend here without forcing the
+/// lifetime tight enough that immediate-use JWTs become risky.
 const JWT_BACKDATE_SECONDS: i64 = 60;
+
+/// How long we ask the JWT to live. GitHub rejects anything over 10
+/// minutes (600 s) measured from `iat` to `exp`; with a 60 s backdate
+/// the budget is `600 - JWT_BACKDATE_SECONDS = 540 s`. Asking for 540
+/// would put us exactly on the ceiling, so a broker clock as little as
+/// one second ahead of GitHub's would push the span over and trip the
+/// reject. Leave 60 s of explicit headroom for that case.
+const JWT_LIFETIME_SECONDS: i64 = 8 * 60;
 
 /// Tolerance added to the TTL ceiling check when comparing the broker's
 /// `now` against GitHub's `expires_at`. GitHub computes `expires_at` from
