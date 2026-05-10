@@ -19,7 +19,7 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
 use crate::agent_vm_daemon::AgentVmDaemon;
-use crate::audit::{AuditLog, PreMintRecord};
+use crate::audit::{AUDIT_WRITE_FAILURE_TARGET, AuditLog, PreMintRecord};
 use crate::core::{
     CapabilityRequest, GrantedScope, PolicyDecision, RequestId, SessionId, SessionRecord,
     TtlSeconds, UnixMillis,
@@ -374,7 +374,13 @@ pub(crate) async fn request_capability<S: SecretStore + Send + Sync>(
                 // wasted; it expires on its own without ever being used.
                 // A transient disk issue will resolve on retry; a permanent
                 // one (full disk, corrupt DB) must be fixed by the operator.
-                eprintln!("AUDIT WRITE FAILED for jti={}: {e}", grant.jti);
+                tracing::error!(
+                    target: AUDIT_WRITE_FAILURE_TARGET,
+                    kind = "broker_grant",
+                    jti = %grant.jti,
+                    error = %e,
+                    "audit write failed: minted credential not delivered",
+                );
                 return CapabilityOutcome::Error {
                     message: format!(
                         "credential was minted but could not be recorded; not delivering: {e}"

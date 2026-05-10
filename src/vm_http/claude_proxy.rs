@@ -9,8 +9,8 @@ use std::sync::Arc;
 use serde::Deserialize;
 
 use crate::audit::{
-    ClaudeProxyAuditDecision, ClaudeProxyAuditRoute, ClaudeProxyOutcomeRecord,
-    ClaudeProxyRequestRecord,
+    AUDIT_WRITE_FAILURE_TARGET, ClaudeProxyAuditDecision, ClaudeProxyAuditRoute,
+    ClaudeProxyOutcomeRecord, ClaudeProxyRequestRecord,
 };
 use crate::core::{RequestId, UnixMillis};
 use crate::secret::{SecretKey, SecretStore};
@@ -669,7 +669,13 @@ pub(super) async fn route_claude_proxy_request<S: SecretStore>(
                 decision: &ClaudeProxyAuditDecision::Allow,
             })
     {
-        eprintln!("VM HTTP Claude proxy audit request write failed: {err}");
+        tracing::error!(
+            target: AUDIT_WRITE_FAILURE_TARGET,
+            kind = "claude_proxy_request",
+            request_id = %request_id,
+            error = %err,
+            "audit write failed",
+        );
         return VmHttpResponse::text(VmHttpStatus::InternalServerError, "audit write failed")
             .into();
     }
@@ -692,7 +698,13 @@ pub(super) async fn route_claude_proxy_request<S: SecretStore>(
                         error: fetch.error,
                     },
                 ) {
-                    eprintln!("VM HTTP Claude proxy audit outcome write failed: {err}");
+                    tracing::error!(
+                        target: AUDIT_WRITE_FAILURE_TARGET,
+                        kind = "claude_proxy_outcome",
+                        request_id = %request_id,
+                        error = %err,
+                        "audit write failed",
+                    );
                     return VmHttpResponse::text(
                         VmHttpStatus::InternalServerError,
                         "audit write failed",
@@ -719,7 +731,13 @@ pub(super) async fn route_claude_proxy_request<S: SecretStore>(
                 error: fetch.error,
             })
     {
-        eprintln!("VM HTTP Claude proxy audit outcome write failed: {err}");
+        tracing::error!(
+            target: AUDIT_WRITE_FAILURE_TARGET,
+            kind = "claude_proxy_outcome",
+            request_id = %request_id,
+            error = %err,
+            "audit write failed",
+        );
         return VmHttpResponse::text(VmHttpStatus::InternalServerError, "audit write failed")
             .into();
     }
@@ -750,7 +768,13 @@ pub(super) fn record_claude_proxy_local_response<S: SecretStore>(
                 decision: &decision,
             })
     {
-        eprintln!("VM HTTP Claude proxy audit request write failed: {err}");
+        tracing::error!(
+            target: AUDIT_WRITE_FAILURE_TARGET,
+            kind = "claude_proxy_request",
+            request_id = %request_id,
+            error = %err,
+            "audit write failed",
+        );
         return VmHttpResponse::text(VmHttpStatus::InternalServerError, "audit write failed");
     }
     if let Err(err) =
@@ -767,7 +791,13 @@ pub(super) fn record_claude_proxy_local_response<S: SecretStore>(
                 error,
             })
     {
-        eprintln!("VM HTTP Claude proxy audit outcome write failed: {err}");
+        tracing::error!(
+            target: AUDIT_WRITE_FAILURE_TARGET,
+            kind = "claude_proxy_outcome",
+            request_id = %request_id,
+            error = %err,
+            "audit write failed",
+        );
         return VmHttpResponse::text(VmHttpStatus::InternalServerError, "audit write failed");
     }
     response

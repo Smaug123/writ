@@ -59,6 +59,20 @@ pub use openai_proxy::{
     OpenAiProxyRequestRecord,
 };
 
+/// `tracing` target stamped on every event emitted when an audit
+/// append, read, or referenced-artifact write fails. The audit log is
+/// the system-of-record for broker activity, so any failure to persist
+/// or look up audit data is correctness-significant; operators should
+/// alert on this target. Filter with
+/// `RUST_LOG=writ.audit_write_failure=error`.
+///
+/// Each event carries a `kind` field naming the specific operation
+/// that failed (e.g. `broker_grant`, `claude_proxy_outcome`,
+/// `nix_cache_request`, `agent_run_log_directory`), plus an `error`
+/// field with the underlying message and any per-site identifiers
+/// (`jti`, `request_id`, `session_id`, `run_id`) that are in scope.
+pub const AUDIT_WRITE_FAILURE_TARGET: &str = "writ.audit_write_failure";
+
 #[derive(Debug, Error)]
 pub enum AuditError {
     #[error("sqlite error: {0}")]

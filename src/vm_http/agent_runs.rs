@@ -13,7 +13,7 @@ use crate::agent_run::{
     VM_AGENT_RUN_OUTCOME_PATH_SUFFIX, VM_AGENT_RUN_PATH_PREFIX, VmAgentRunConfigResponse,
     VmAgentRunOutcomeUpload,
 };
-use crate::audit::AgentRunOutcomeAuditRecord;
+use crate::audit::{AUDIT_WRITE_FAILURE_TARGET, AgentRunOutcomeAuditRecord};
 use crate::core::UnixMillis;
 use crate::secret::SecretStore;
 use crate::server::BrokerState;
@@ -143,7 +143,13 @@ pub(super) fn route_agent_run_outcome_request<S: SecretStore>(
         Ok(Some(_)) => return VmHttpResponse::text(VmHttpStatus::Ok, "ok"),
         Ok(None) => {}
         Err(err) => {
-            eprintln!("VM HTTP agent run outcome audit lookup failed: {err}");
+            tracing::error!(
+                target: AUDIT_WRITE_FAILURE_TARGET,
+                kind = "agent_run_outcome_lookup",
+                run_id = %run_id,
+                error = %err,
+                "audit read failed",
+            );
             return VmHttpResponse::text(VmHttpStatus::InternalServerError, "audit read failed");
         }
     }
@@ -166,7 +172,13 @@ pub(super) fn route_agent_run_outcome_request<S: SecretStore>(
             outcome,
         })
     {
-        eprintln!("VM HTTP agent run outcome audit write failed: {err}");
+        tracing::error!(
+            target: AUDIT_WRITE_FAILURE_TARGET,
+            kind = "agent_run_outcome",
+            run_id = %run_id,
+            error = %err,
+            "audit write failed",
+        );
         return VmHttpResponse::text(VmHttpStatus::InternalServerError, "audit write failed");
     }
     VmHttpResponse::text(VmHttpStatus::Ok, "ok")
@@ -184,7 +196,14 @@ fn materialize_agent_run_outcome_upload(
     }
     let run_dir = log_root.join(upload.run_id.to_string());
     create_private_dir(&run_dir).map_err(|err| {
-        eprintln!("VM HTTP agent run outcome log directory write failed: {err}");
+        tracing::error!(
+            target: AUDIT_WRITE_FAILURE_TARGET,
+            kind = "agent_run_log_directory",
+            run_id = %upload.run_id,
+            run_dir = %run_dir.display(),
+            error = %err,
+            "agent run log directory write failed",
+        );
         VmHttpResponse::text(
             VmHttpStatus::InternalServerError,
             "agent run log write failed",
@@ -266,7 +285,13 @@ fn materialize_agent_run_stream(
     };
 
     write_private_file(path, &retained).map_err(|err| {
-        eprintln!("VM HTTP agent run outcome stream write failed: {err}");
+        tracing::error!(
+            target: AUDIT_WRITE_FAILURE_TARGET,
+            kind = "agent_run_log_stream",
+            path = %path.display(),
+            error = %err,
+            "agent run log stream write failed",
+        );
         VmHttpResponse::text(
             VmHttpStatus::InternalServerError,
             "agent run log write failed",
