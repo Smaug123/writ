@@ -1308,7 +1308,7 @@ mod tests {
         assert!(!lower.contains("acct-before"), "{upstream_request}");
         // Stored bundle should now carry the rotated tokens.
         let raw = state
-            .secret_store()
+            .secrets
             .get(&secret_key)
             .unwrap()
             .expect("secret persisted");

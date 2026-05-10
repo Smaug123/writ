@@ -725,7 +725,7 @@ impl<B: ProxyBackend, S: SecretStore + Send + Sync + 'static> VmHttpProxyService
         };
         let upstream_url = url.to_string();
         let upstream_auth =
-            B::resolve_upstream_auth(&self.config, &self.extras, self.broker_state.secret_store())
+            B::resolve_upstream_auth(&self.config, &self.extras, &self.broker_state.secrets)
                 .await
                 .map_err(|mut fetch| {
                     fetch.upstream_url = Some(upstream_url.clone());

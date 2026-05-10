@@ -1542,12 +1542,13 @@ mod tests {
     use super::*;
     use crate::agent_run::AgentRunId;
     use crate::audit::AuditLog;
-    use crate::core::{Ipv6Cidr, SessionRecord, TtlSeconds, UnixMillis};
-    use crate::github::{GitHubAppConfig, GitHubMinter};
+    use crate::core::{AgentKind, Ipv6Cidr, SessionRecord, TtlSeconds, UnixMillis};
+    use crate::github::{GitHubAppConfig, GitHubAppRegistryConfig, GitHubMinter};
     use crate::policy::PolicyConfig;
     use crate::secret::{SecretError, SecretKey};
     use crate::vm_git::VM_GIT_CLONE_PATH;
     use crate::vm_git_bundle::{GitCredentialBoundary, GitSecretEnvVar};
+    use std::collections::BTreeMap;
 
     const TEST_GIT_CLONE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
@@ -1620,18 +1621,21 @@ mod tests {
         if let Some((key, value)) = extra_secret {
             store.put(&key, value).unwrap();
         }
+        let mut apps = BTreeMap::new();
+        apps.insert(
+            AgentKind::Claude,
+            GitHubAppConfig {
+                app_id: 42,
+                installation_id: 999,
+                installation_owner: "o".into(),
+                private_key_secret: pk,
+                api_base: server.uri(),
+            },
+        );
         Arc::new(BrokerState {
             audit: Arc::new(AuditLog::open_in_memory().unwrap()),
-            minter: GitHubMinter::new(
-                GitHubAppConfig {
-                    app_id: 42,
-                    installation_id: 999,
-                    installation_owner: "o".into(),
-                    private_key_secret: pk,
-                    api_base: server.uri(),
-                },
-                Box::new(store) as Box<dyn SecretStore>,
-            ),
+            minter: GitHubMinter::new_registry(GitHubAppRegistryConfig::new(apps).unwrap()),
+            secrets: Box::new(store) as Box<dyn SecretStore>,
             policy: PolicyConfig {
                 writable_repos: vec![],
                 default_ttl: TtlSeconds::new(3600).unwrap(),
@@ -1648,7 +1652,7 @@ mod tests {
             .open_session(&SessionRecord {
                 session_id,
                 label: Some("vm-http-test".into()),
-                agent_kind: None,
+                agent_kind: Some(AgentKind::Claude),
                 agent_model: None,
                 opened_at: UnixMillis::now(),
                 closed_at: None,

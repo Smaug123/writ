@@ -12,7 +12,7 @@ use clap::Parser;
 use writ::agent_vm_daemon::AgentVmDaemon;
 use writ::audit::AuditLog;
 use writ::config::{DaemonConfig, SecretStoreConfig, default_audit_db_path, default_config_path};
-use writ::github::{GitHubAppRegistryConfig, GitHubMinter};
+use writ::github::GitHubMinter;
 use writ::secret::{FileSecretStore, KeyringSecretStore, SecretStore};
 use writ::server::{BrokerState, default_socket_path, run_with_agent_vm};
 
@@ -43,7 +43,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config: DaemonConfig = serde_json::from_str(&json)
         .map_err(|e| format!("invalid config {}: {e}", config_path.display()))?;
     let DaemonConfig {
-        github,
         github_apps,
         policy,
         agent_vm,
@@ -51,7 +50,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         socket_path,
         audit_db,
     } = config;
-    let github = GitHubAppRegistryConfig::from_parts(github, github_apps)?;
 
     let socket_path = args
         .socket
@@ -82,7 +80,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let state = Arc::new(BrokerState {
         audit: Arc::new(audit),
-        minter: GitHubMinter::new_registry(github, store),
+        minter: GitHubMinter::new_registry(github_apps),
+        secrets: store,
         policy,
     });
 

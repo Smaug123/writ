@@ -1,6 +1,5 @@
 //! Daemon configuration loaded from a JSON file at startup.
 
-use std::collections::BTreeMap;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -15,10 +14,8 @@ use crate::agent_vm_lifecycle::{
     AgentVmLifecycleConfigError, AgentVmResources, AgentVmSessionStateStore, AgentVmStateDirError,
     AgentVmToolPaths, ContainerImage, Ipv6IsolationMode, default_agent_vm_state_dir,
 };
-use crate::core::{
-    AgentKind, AgentNetworkPool, AgentVmConfigError, BrokerPortRange, Ipv4Cidr, Ipv6Cidr,
-};
-use crate::github::GitHubAppConfig;
+use crate::core::{AgentNetworkPool, AgentVmConfigError, BrokerPortRange, Ipv4Cidr, Ipv6Cidr};
+use crate::github::GitHubAppRegistryConfig;
 use crate::nix_cache::{NixTrustedPublicKeys, NixTrustedPublicKeysError};
 use crate::policy::PolicyConfig;
 use crate::secret::SecretKey;
@@ -40,11 +37,13 @@ use crate::vm_http::{
 /// Example config:
 /// ```json
 /// {
-///   "github": {
-///     "app_id": 12345,
-///     "installation_id": 67890,
-///     "installation_owner": "smaug123",
-///     "private_key_secret": "gh-app-pk"
+///   "github_apps": {
+///     "claude": {
+///       "app_id": 12345,
+///       "installation_id": 67890,
+///       "installation_owner": "smaug123",
+///       "private_key_secret": "claude-gh-app-pk"
+///     }
 ///   },
 ///   "policy": {
 ///     "default_ttl": 3600,
@@ -55,14 +54,11 @@ use crate::vm_http::{
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DaemonConfig {
-    /// Legacy single GitHub App configuration. Mutually exclusive with
-    /// `github_apps`.
-    #[serde(default)]
-    pub github: Option<GitHubAppConfig>,
-    /// Agent-keyed GitHub Apps. Use this when Claude and Codex should push
-    /// under different GitHub App identities.
-    #[serde(default)]
-    pub github_apps: BTreeMap<AgentKind, GitHubAppConfig>,
+    /// Agent-keyed GitHub Apps. The session's [`AgentKind`] selects which App
+    /// mints tokens. Must contain at least one entry; sessions whose
+    /// `agent_kind` is absent or has no entry here are refused at request
+    /// time.
+    pub github_apps: GitHubAppRegistryConfig,
     pub policy: PolicyConfig,
     /// Optional static configuration for agent-VM HTTP sessions. It does not
     /// start a VM by itself; per-session lifecycle code supplies the session
@@ -605,7 +601,8 @@ pub fn default_audit_db_path() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::github::{GitHubAppRegistryConfig, GitHubAppRegistryConfigError};
+    use crate::core::AgentKind;
+    use crate::github::GitHubAppRegistryConfigError;
 
     const TEST_NIX_CACHE_PUBLIC_KEY: &str =
         "cache.example-1:IsGkyTbr2sed7tWowgiPcI0ZHhBAHoGQ7TyYRweyzwE=";
@@ -615,11 +612,13 @@ mod tests {
         // No `secret_store` key — the file backend at
         // `default_secret_store_path()` is the documented default.
         let json = r#"{
-            "github": {
-                "app_id": 42,
-                "installation_id": 999,
-                "installation_owner": "smaug123",
-                "private_key_secret": "gh-app-pk"
+            "github_apps": {
+                "claude": {
+                    "app_id": 42,
+                    "installation_id": 999,
+                    "installation_owner": "smaug123",
+                    "private_key_secret": "gh-app-pk"
+                }
             },
             "policy": {
                 "default_ttl": 3600,
@@ -627,33 +626,28 @@ mod tests {
             }
         }"#;
         let c: DaemonConfig = serde_json::from_str(json).unwrap();
-        let github = c.github.as_ref().unwrap();
-        assert_eq!(github.app_id, 42);
-        assert_eq!(github.api_base, "https://api.github.com");
-        assert!(c.github_apps.is_empty());
+        let claude = &c.github_apps.agent_apps()[&AgentKind::Claude];
+        assert_eq!(claude.app_id, 42);
+        assert_eq!(claude.api_base, "https://api.github.com");
         assert_eq!(c.policy.default_ttl.as_i64(), 3600);
         assert!(c.agent_vm.is_none());
         assert!(c.socket_path.is_none());
         assert!(
             matches!(&c.secret_store, SecretStoreConfig::File { path } if *path == default_secret_store_path())
         );
-        let DaemonConfig {
-            github,
-            github_apps,
-            ..
-        } = c;
-        assert!(GitHubAppRegistryConfig::from_parts(github, github_apps).is_ok());
     }
 
     #[test]
     fn parses_config_with_overrides() {
         let json = r#"{
-            "github": {
-                "app_id": 1,
-                "installation_id": 2,
-                "installation_owner": "o",
-                "private_key_secret": "pk",
-                "api_base": "https://github.example.com/api/v3"
+            "github_apps": {
+                "claude": {
+                    "app_id": 1,
+                    "installation_id": 2,
+                    "installation_owner": "o",
+                    "private_key_secret": "pk",
+                    "api_base": "https://github.example.com/api/v3"
+                }
             },
             "policy": { "default_ttl": 600, "writable_repos": ["o/n"] },
             "secret_store": { "type": "keyring" },
@@ -662,7 +656,7 @@ mod tests {
         }"#;
         let c: DaemonConfig = serde_json::from_str(json).unwrap();
         assert_eq!(
-            c.github.as_ref().unwrap().api_base,
+            c.github_apps.agent_apps()[&AgentKind::Claude].api_base,
             "https://github.example.com/api/v3"
         );
         assert_eq!(
@@ -694,22 +688,15 @@ mod tests {
             "policy": { "default_ttl": 600, "writable_repos": [] }
         }"#;
         let c: DaemonConfig = serde_json::from_str(json).unwrap();
-        let DaemonConfig {
-            github,
-            github_apps,
-            ..
-        } = c;
-        let registry = GitHubAppRegistryConfig::from_parts(github, github_apps).unwrap();
 
-        assert!(registry.legacy_app().is_none());
         assert_eq!(
-            registry.agent_apps()[&AgentKind::Claude]
+            c.github_apps.agent_apps()[&AgentKind::Claude]
                 .private_key_secret
                 .as_str(),
             "claude-pk"
         );
         assert_eq!(
-            registry.agent_apps()[&AgentKind::Codex]
+            c.github_apps.agent_apps()[&AgentKind::Codex]
                 .private_key_secret
                 .as_str(),
             "codex-pk"
@@ -717,30 +704,45 @@ mod tests {
     }
 
     #[test]
-    fn rejects_ambiguous_github_app_config_shapes() {
+    fn rejects_empty_github_apps_map() {
+        let json = r#"{
+            "github_apps": {},
+            "policy": { "default_ttl": 600, "writable_repos": [] }
+        }"#;
+
+        let err = serde_json::from_str::<DaemonConfig>(json).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains(&GitHubAppRegistryConfigError::Empty.to_string()),
+            "expected Empty error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_legacy_github_field() {
         let json = r#"{
             "github": {
                 "app_id": 1,
                 "installation_id": 2,
                 "installation_owner": "o",
-                "private_key_secret": "legacy-pk"
+                "private_key_secret": "pk"
             },
             "github_apps": {
-                "codex": {
+                "claude": {
                     "app_id": 3,
                     "installation_id": 4,
                     "installation_owner": "o",
-                    "private_key_secret": "codex-pk"
+                    "private_key_secret": "claude-pk"
                 }
             },
             "policy": { "default_ttl": 600, "writable_repos": [] }
         }"#;
-        let c: DaemonConfig = serde_json::from_str(json).unwrap();
 
-        assert!(matches!(
-            GitHubAppRegistryConfig::from_parts(c.github, c.github_apps),
-            Err(GitHubAppRegistryConfigError::Ambiguous)
-        ));
+        let err = serde_json::from_str::<DaemonConfig>(json).unwrap_err();
+        assert!(
+            err.to_string().contains("github"),
+            "expected unknown-field error mentioning `github`, got: {err}"
+        );
     }
 
     #[test]
@@ -750,11 +752,13 @@ mod tests {
         let git_push_staging_root = unique_config_test_path("git-push-staging");
         let mut json: serde_json::Value = serde_json::from_str(
             r#"{
-            "github": {
-                "app_id": 1,
-                "installation_id": 2,
-                "installation_owner": "o",
-                "private_key_secret": "pk"
+            "github_apps": {
+                "claude": {
+                    "app_id": 1,
+                    "installation_id": 2,
+                    "installation_owner": "o",
+                    "private_key_secret": "pk"
+                }
             },
             "policy": { "default_ttl": 600, "writable_repos": [] },
             "agent_vm": {
@@ -870,11 +874,13 @@ mod tests {
         let agent_run_log_root = unique_config_test_path("agent-runs");
         let mut json: serde_json::Value = serde_json::from_str(
             r#"{
-            "github": {
-                "app_id": 1,
-                "installation_id": 2,
-                "installation_owner": "o",
-                "private_key_secret": "pk"
+            "github_apps": {
+                "claude": {
+                    "app_id": 1,
+                    "installation_id": 2,
+                    "installation_owner": "o",
+                    "private_key_secret": "pk"
+                }
             },
             "policy": { "default_ttl": 600, "writable_repos": [] },
             "agent_vm": {
@@ -1273,11 +1279,13 @@ mod tests {
     #[test]
     fn daemon_config_rejects_unknown_top_level_field() {
         let json = r#"{
-            "github": {
-                "app_id": 1,
-                "installation_id": 2,
-                "installation_owner": "o",
-                "private_key_secret": "pk"
+            "github_apps": {
+                "claude": {
+                    "app_id": 1,
+                    "installation_id": 2,
+                    "installation_owner": "o",
+                    "private_key_secret": "pk"
+                }
             },
             "policy": { "default_ttl": 600, "writable_repos": [] },
             "agentVm": { "lifecycle": {}, "vm_http": {} }
@@ -1349,11 +1357,13 @@ mod tests {
     #[test]
     fn rejects_invalid_secret_key_name_in_config() {
         let json = r#"{
-            "github": {
-                "app_id": 1,
-                "installation_id": 2,
-                "installation_owner": "o",
-                "private_key_secret": "bad/key"
+            "github_apps": {
+                "claude": {
+                    "app_id": 1,
+                    "installation_id": 2,
+                    "installation_owner": "o",
+                    "private_key_secret": "bad/key"
+                }
             },
             "policy": { "default_ttl": 300 },
             "secret_store": { "type": "file", "path": "/tmp" }

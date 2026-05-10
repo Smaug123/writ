@@ -67,11 +67,13 @@ Default location is `$XDG_CONFIG_HOME/writ/config.json` (typically
 
 ```json
 {
-  "github": {
-    "app_id": 12345,
-    "installation_id": 67890,
-    "installation_owner": "smaug123",
-    "private_key_secret": "gh-app-pk"
+  "github_apps": {
+    "claude": {
+      "app_id": 12345,
+      "installation_id": 67890,
+      "installation_owner": "smaug123",
+      "private_key_secret": "gh-app-pk"
+    }
   },
   "policy": {
     "default_ttl": 3600,
@@ -79,6 +81,12 @@ Default location is `$XDG_CONFIG_HOME/writ/config.json` (typically
   }
 }
 ```
+
+`github_apps` is keyed by agent kind (`claude` or `codex`). At least one
+entry is required; sessions must be opened with `--agent claude` or
+`--agent codex` so the broker knows which App to mint with. If you run
+both Claude and Codex with separate GitHub Apps, list both keys; see
+[Configuration](configuration.md#github_apps).
 
 `installation_owner` is the user or org that the installation belongs to.
 The broker rejects requests for repos owned by anybody else before
@@ -88,9 +96,6 @@ talking to GitHub at all — that's how it stops a typo'd request like
 `writable_repos` is the allowlist for *write* requests. Read requests are
 permitted on any repo the installation can see, since the GitHub App
 itself enforces the installation boundary.
-
-If you have separate Claude and Codex GitHub Apps, use `github_apps`
-instead of `github`; see [Configuration](configuration.md#github--github_apps).
 
 ## 5. Run the daemon
 
@@ -109,7 +114,7 @@ audit DB.
 In another shell:
 
 ```bash
-SESSION=$(writ open-session --label "first run")
+SESSION=$(writ open-session --label "first run" --agent claude)
 echo "session: $SESSION"
 
 # Read access — granted on any repo the installation can see.

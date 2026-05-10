@@ -1126,13 +1126,14 @@ mod tests {
     use crate::core::{
         BrokerPort, BrokerPortRange, BrokerPorts, Ipv4Cidr, Ipv6Cidr, RepoRef, TtlSeconds,
     };
-    use crate::github::{GitHubAppConfig, GitHubMinter};
+    use crate::github::{GitHubAppConfig, GitHubAppRegistryConfig, GitHubMinter};
     use crate::nix_cache::NixTrustedPublicKeys;
     use crate::policy::PolicyConfig;
     use crate::secret::{SecretError, SecretKey};
     use crate::vm_git::VmGitPushBodyLimits;
     use crate::vm_git_bundle::{GitCredentialBoundary, GitSecretEnvVar};
     use crate::vm_http::{VmHttpGitCloneConfig, VmHttpNixCacheConfig};
+    use std::collections::BTreeMap;
 
     const TEST_NIX_CACHE_PUBLIC_KEY: &str =
         "cache.example-1:IsGkyTbr2sed7tWowgiPcI0ZHhBAHoGQ7TyYRweyzwE=";
@@ -1167,18 +1168,21 @@ mod tests {
 
     fn make_state_with_audit(audit: AuditLog) -> Arc<BrokerState<InMemStore>> {
         let key = SecretKey::new("gh-app-pk").unwrap();
+        let mut apps = BTreeMap::new();
+        apps.insert(
+            AgentKind::Claude,
+            GitHubAppConfig {
+                app_id: 42,
+                installation_id: 999,
+                installation_owner: "o".into(),
+                private_key_secret: key,
+                api_base: "http://127.0.0.1".into(),
+            },
+        );
         Arc::new(BrokerState {
             audit: Arc::new(audit),
-            minter: GitHubMinter::new(
-                GitHubAppConfig {
-                    app_id: 42,
-                    installation_id: 999,
-                    installation_owner: "o".into(),
-                    private_key_secret: key,
-                    api_base: "http://127.0.0.1".into(),
-                },
-                InMemStore::default(),
-            ),
+            minter: GitHubMinter::new_registry(GitHubAppRegistryConfig::new(apps).unwrap()),
+            secrets: InMemStore::default(),
             policy: PolicyConfig {
                 writable_repos: Vec::<RepoRef>::new(),
                 default_ttl: TtlSeconds::new(3600).unwrap(),

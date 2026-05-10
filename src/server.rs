@@ -30,23 +30,13 @@ use crate::protocol::{ClientMessage, ServerMessage};
 use crate::secret::SecretStore;
 
 /// Shared state for the broker. Wrapped in `Arc` so connections spawned
-/// onto different tokio tasks can all reference the same audit log and
-/// minter config.
+/// onto different tokio tasks can all reference the same audit log,
+/// minter config, and secret store.
 pub struct BrokerState<S: SecretStore> {
     pub audit: Arc<AuditLog>,
-    pub minter: GitHubMinter<S>,
+    pub minter: GitHubMinter,
+    pub secrets: S,
     pub policy: PolicyConfig,
-}
-
-impl<S: SecretStore> BrokerState<S> {
-    /// Broker-wide secret access for services that are not GitHub minters.
-    ///
-    /// The minter owns the concrete store because older construction paths
-    /// build it that way, but callers should depend on the broker boundary
-    /// rather than reaching through the GitHub-specific facade.
-    pub(crate) fn secret_store(&self) -> &S {
-        self.minter.secret_store()
-    }
 }
 
 #[derive(Clone, Eq, PartialEq)]
@@ -126,7 +116,7 @@ pub async fn dispatch_message_with_agent_vm<S: SecretStore + Send + Sync + 'stat
             agent_kind,
             agent_model,
         } => {
-            if state.minter.requires_agent_kind() && agent_kind.is_none() {
+            if agent_kind.is_none() {
                 return missing_agent_kind_for_registry_response();
             }
             let session_id = SessionId::new();
@@ -168,7 +158,7 @@ pub async fn dispatch_message_with_agent_vm<S: SecretStore + Send + Sync + 'stat
             workspace,
             guest_command,
         } => {
-            if state.minter.requires_agent_kind() && agent_kind.is_none() {
+            if agent_kind.is_none() {
                 return missing_agent_kind_for_registry_response();
             }
             match agent_vm {
@@ -262,7 +252,8 @@ pub async fn dispatch_message_with_agent_vm<S: SecretStore + Send + Sync + 'stat
 
 fn missing_agent_kind_for_registry_response() -> ServerMessage {
     ServerMessage::Error {
-        message: "agent kind is required when github_apps is configured; open the session with --agent claude or --agent codex".into(),
+        message: "agent kind is required; open the session with --agent claude or --agent codex"
+            .into(),
     }
 }
 
@@ -364,7 +355,7 @@ pub(crate) async fn request_capability<S: SecretStore + Send + Sync>(
 
     let mint_result = state
         .minter
-        .mint_for_agent(session.agent_kind, github_scope, ttl)
+        .mint_for_agent(&state.secrets, session.agent_kind, github_scope, ttl)
         .await;
 
     match mint_result {
@@ -697,7 +688,9 @@ mod tests {
         let pk = SecretKey::new("gh-app-pk").unwrap();
         let store = InMemStore::default();
         store.put(&pk, TEST_PRIV).unwrap();
-        let minter = GitHubMinter::new(
+        let mut apps = BTreeMap::new();
+        apps.insert(
+            AgentKind::Claude,
             GitHubAppConfig {
                 app_id: 42,
                 installation_id: 999,
@@ -705,11 +698,12 @@ mod tests {
                 private_key_secret: pk,
                 api_base: server.uri(),
             },
-            store,
         );
+        let minter = GitHubMinter::new_registry(GitHubAppRegistryConfig::new(apps).unwrap());
         Arc::new(BrokerState {
             audit: Arc::new(AuditLog::open_in_memory().unwrap()),
             minter,
+            secrets: store,
             policy: PolicyConfig {
                 writable_repos: writable,
                 default_ttl: crate::core::TtlSeconds::new(3600).unwrap(),
@@ -750,13 +744,11 @@ mod tests {
             };
             apps.insert(*agent, config);
         }
-        let minter = GitHubMinter::new_registry(
-            GitHubAppRegistryConfig::for_agent_apps(apps).unwrap(),
-            store,
-        );
+        let minter = GitHubMinter::new_registry(GitHubAppRegistryConfig::new(apps).unwrap());
         Arc::new(BrokerState {
             audit: Arc::new(AuditLog::open_in_memory().unwrap()),
             minter,
+            secrets: store,
             policy: PolicyConfig {
                 writable_repos: Vec::new(),
                 default_ttl: crate::core::TtlSeconds::new(3600).unwrap(),
@@ -787,7 +779,7 @@ mod tests {
         let resp = dispatch_message(
             ClientMessage::OpenSession {
                 label: Some("test".into()),
-                agent_kind: None,
+                agent_kind: Some(AgentKind::Claude),
                 agent_model: None,
             },
             &state,
@@ -813,7 +805,7 @@ mod tests {
         let session_id = match dispatch_message(
             ClientMessage::OpenSession {
                 label: None,
-                agent_kind: None,
+                agent_kind: Some(AgentKind::Claude),
                 agent_model: None,
             },
             &state,
@@ -855,7 +847,7 @@ mod tests {
         let start = dispatch_message(
             ClientMessage::StartAgentVm {
                 label: None,
-                agent_kind: None,
+                agent_kind: Some(AgentKind::Claude),
                 agent_model: None,
                 workspace: None,
                 guest_command: vec!["true".into()],
@@ -1113,49 +1105,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_github_config_uses_legacy_app_even_when_agent_kind_is_set() {
-        let server = MockServer::start().await;
-        let state = make_state(&server, vec![repo("o", "n")], "o");
-        let session_id = open_session_with_agent_kind(&state, Some(AgentKind::Codex)).await;
-
-        Mock::given(method("POST"))
-            .and(path("/app/installations/999/access_tokens"))
-            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
-                "token": "ghs_legacy_token",
-                "expires_at": expiry_str_from_now(3600),
-                "permissions": {"contents": "read", "metadata": "read"},
-                "repository_selection": "selected",
-                "repositories": [{"full_name": "o/n"}]
-            })))
-            .expect(1)
-            .mount(&server)
-            .await;
-
-        let resp = dispatch_message(
-            ClientMessage::Request {
-                session_id,
-                capability: CapabilityRequest::GitHub(crate::core::GitHubRequest::Contents {
-                    access: GitHubAccess::Read,
-                    repo: repo("o", "n"),
-                }),
-            },
-            &state,
-        )
-        .await;
-
-        match resp {
-            ServerMessage::TokenGranted { token, .. } => {
-                assert_eq!(token, "ghs_legacy_token");
-            }
-            other => panic!("expected TokenGranted, got {other:?}"),
-        }
-
-        let grants = state.audit.list_grants_for_session(session_id).unwrap();
-        assert_eq!(grants.len(), 1);
-        assert_eq!(grants[0].github_app_id, Some(42));
-    }
-
-    #[tokio::test]
     async fn agent_registry_rejects_session_open_without_agent_kind() {
         let server = MockServer::start().await;
         let state = make_agent_registry_state(&server);
@@ -1210,7 +1159,7 @@ mod tests {
 
         match resp {
             ServerMessage::Error { message } => {
-                assert!(message.contains("github_apps"), "got: {message}");
+                assert!(message.contains("--agent claude"), "got: {message}");
             }
             other => panic!("expected Error, got {other:?}"),
         }
@@ -1329,7 +1278,7 @@ mod tests {
         // Open session
         let open_msg = serde_json::to_string(&ClientMessage::OpenSession {
             label: Some("integration".into()),
-            agent_kind: None,
+            agent_kind: Some(AgentKind::Claude),
             agent_model: None,
         })
         .unwrap()
@@ -1360,7 +1309,7 @@ mod tests {
     async fn open_session<S: SecretStore + Send + Sync + 'static>(
         state: &Arc<BrokerState<S>>,
     ) -> SessionId {
-        open_session_with_agent_kind(state, None).await
+        open_session_with_agent_kind(state, Some(AgentKind::Claude)).await
     }
 
     async fn open_session_with_agent_kind<S: SecretStore + Send + Sync + 'static>(
