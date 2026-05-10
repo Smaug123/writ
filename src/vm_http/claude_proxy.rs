@@ -11,7 +11,7 @@ use http_body_util::combinators::UnsyncBoxBody;
 use serde::Deserialize;
 
 use crate::audit::{
-    ClaudeProxyAuditDecision, ClaudeProxyAuditRoute, ClaudeProxyOutcomeRecord,
+    AuditLog, ClaudeProxyAuditDecision, ClaudeProxyAuditRoute, ClaudeProxyOutcomeRecord,
     ClaudeProxyRequestRecord,
 };
 use crate::core::{RequestId, UnixMillis};
@@ -90,8 +90,8 @@ struct VmHttpClaudeProxyFetch {
     error: Option<&'static str>,
 }
 
-pub(crate) struct VmHttpClaudeProxyStream<S: SecretStore> {
-    broker_state: Arc<BrokerState<S>>,
+pub(crate) struct VmHttpClaudeProxyStream {
+    audit_log: Arc<AuditLog>,
     pub(super) request_id: RequestId,
     response: reqwest::Response,
     upstream_url: String,
@@ -278,7 +278,7 @@ impl<S: SecretStore> VmHttpClaudeProxyService<S> {
         request: &VmHttpRequest,
         body: Vec<u8>,
         headers: Vec<ClaudeProxyForwardHeader>,
-    ) -> Result<VmHttpClaudeProxyStream<S>, VmHttpClaudeProxyFetch> {
+    ) -> Result<VmHttpClaudeProxyStream, VmHttpClaudeProxyFetch> {
         let (upstream_url, builder) = self
             .upstream_request_builder(request, body, headers)
             .map_err(|fetch| *fetch)?;
@@ -301,7 +301,7 @@ impl<S: SecretStore> VmHttpClaudeProxyService<S> {
         let content_type = claude_proxy_response_content_type(&response);
         let headers = claude_proxy_response_headers(response.headers());
         Ok(VmHttpClaudeProxyStream {
-            broker_state: Arc::clone(&self.broker_state),
+            audit_log: Arc::clone(&self.broker_state.audit),
             request_id,
             response,
             upstream_url,
@@ -350,14 +350,14 @@ impl<S: SecretStore> Clone for VmHttpClaudeProxyService<S> {
     }
 }
 
-impl<S: SecretStore + Send + Sync + 'static> VmHttpClaudeProxyStream<S> {
+impl VmHttpClaudeProxyStream {
     pub(super) fn into_hyper_response(
         self,
     ) -> http::Response<UnsyncBoxBody<Bytes, std::io::Error>> {
         let body = ProxyStreamBody {
             inner: Box::pin(self.response.bytes_stream()),
             audit: Some(ProxyStreamAudit {
-                broker_state: self.broker_state,
+                audit_log: self.audit_log,
                 kind: ProxyAuditKind::Claude,
                 request_id: self.request_id,
                 upstream_url: self.upstream_url,
@@ -744,7 +744,7 @@ pub(super) async fn route_claude_proxy_request<S: SecretStore>(
     request: &VmHttpRequest,
     body: Vec<u8>,
     service: &VmHttpClaudeProxyService<S>,
-) -> VmHttpDispatch<S> {
+) -> VmHttpDispatch {
     let route = classify_claude_proxy_target(&request.target)
         .expect("caller only routes classified Claude proxy targets");
     if route == ClaudeProxyAuditRoute::Unsupported {

@@ -61,7 +61,7 @@ use tokio::sync::watch;
 use tokio::task::JoinSet;
 
 use crate::audit::{
-    ClaudeProxyAuditDecision, ClaudeProxyOutcomeRecord, NixCacheAuditDecision,
+    AuditLog, ClaudeProxyAuditDecision, ClaudeProxyOutcomeRecord, NixCacheAuditDecision,
     OpenAiProxyAuditDecision, OpenAiProxyOutcomeRecord,
 };
 use crate::bearer::is_bearer_token_byte;
@@ -265,10 +265,10 @@ enum VmHttpAuthScheme {
     Basic,
 }
 
-enum VmHttpDispatch<S: SecretStore> {
+enum VmHttpDispatch {
     Buffered(VmHttpResponse),
-    ClaudeProxyStream(VmHttpClaudeProxyStream<S>),
-    OpenAiProxyStream(VmHttpOpenAiProxyStream<S>),
+    ClaudeProxyStream(VmHttpClaudeProxyStream),
+    OpenAiProxyStream(VmHttpOpenAiProxyStream),
 }
 
 impl VmHttpSession {
@@ -378,23 +378,23 @@ enum ProxyStreamState {
     OverMax,
 }
 
-struct ProxyStreamAudit<S: SecretStore> {
-    broker_state: Arc<BrokerState<S>>,
+struct ProxyStreamAudit {
+    audit_log: Arc<AuditLog>,
     kind: ProxyAuditKind,
     request_id: RequestId,
     upstream_url: String,
     upstream_status: u16,
 }
 
-struct ProxyStreamBody<S: SecretStore> {
+struct ProxyStreamBody {
     inner: Pin<Box<dyn Stream<Item = reqwest::Result<Bytes>> + Send>>,
-    audit: Option<ProxyStreamAudit<S>>,
+    audit: Option<ProxyStreamAudit>,
     max_response_bytes: u64,
     response_bytes: u64,
     state: ProxyStreamState,
 }
 
-impl<S: SecretStore> HyperBody for ProxyStreamBody<S> {
+impl HyperBody for ProxyStreamBody {
     type Data = Bytes;
     type Error = std::io::Error;
 
@@ -442,7 +442,7 @@ impl<S: SecretStore> HyperBody for ProxyStreamBody<S> {
     }
 }
 
-impl<S: SecretStore> Drop for ProxyStreamBody<S> {
+impl Drop for ProxyStreamBody {
     fn drop(&mut self) {
         let Some(audit) = self.audit.take() else {
             return;
@@ -456,32 +456,36 @@ impl<S: SecretStore> Drop for ProxyStreamBody<S> {
         let response_bytes = self.response_bytes;
         match audit.kind {
             ProxyAuditKind::Claude => {
-                if let Err(err) = audit.broker_state.audit.record_claude_proxy_outcome(
-                    &ClaudeProxyOutcomeRecord {
-                        request_id: audit.request_id,
-                        completed_at: UnixMillis::now(),
-                        http_status: audit.upstream_status,
-                        upstream_url: Some(audit.upstream_url.as_str()),
-                        upstream_status: Some(audit.upstream_status),
-                        response_bytes,
-                        error,
-                    },
-                ) {
+                if let Err(err) =
+                    audit
+                        .audit_log
+                        .record_claude_proxy_outcome(&ClaudeProxyOutcomeRecord {
+                            request_id: audit.request_id,
+                            completed_at: UnixMillis::now(),
+                            http_status: audit.upstream_status,
+                            upstream_url: Some(audit.upstream_url.as_str()),
+                            upstream_status: Some(audit.upstream_status),
+                            response_bytes,
+                            error,
+                        })
+                {
                     eprintln!("VM HTTP Claude proxy streaming audit outcome write failed: {err}");
                 }
             }
             ProxyAuditKind::OpenAi => {
-                if let Err(err) = audit.broker_state.audit.record_openai_proxy_outcome(
-                    &OpenAiProxyOutcomeRecord {
-                        request_id: audit.request_id,
-                        completed_at: UnixMillis::now(),
-                        http_status: audit.upstream_status,
-                        upstream_url: Some(audit.upstream_url.as_str()),
-                        upstream_status: Some(audit.upstream_status),
-                        response_bytes,
-                        error,
-                    },
-                ) {
+                if let Err(err) =
+                    audit
+                        .audit_log
+                        .record_openai_proxy_outcome(&OpenAiProxyOutcomeRecord {
+                            request_id: audit.request_id,
+                            completed_at: UnixMillis::now(),
+                            http_status: audit.upstream_status,
+                            upstream_url: Some(audit.upstream_url.as_str()),
+                            upstream_status: Some(audit.upstream_status),
+                            response_bytes,
+                            error,
+                        })
+                {
                     eprintln!("VM HTTP OpenAI proxy streaming audit outcome write failed: {err}");
                 }
             }
@@ -1120,7 +1124,7 @@ where
         }
     };
     let auth_scheme = auth_scheme_for_target(&request.target);
-    let dispatch: VmHttpDispatch<S> =
+    let dispatch: VmHttpDispatch =
         match authorize_vm_http_request_with_scheme(session, &request, auth_scheme) {
             VmHttpAuthorization::Allow => {
                 let body_bytes = match route_request_body_limit(&request, &services) {
@@ -1313,7 +1317,7 @@ async fn route_authenticated_vm_http_request<S>(
     request: &VmHttpRequest,
     body: Vec<u8>,
     services: VmHttpServices<S>,
-) -> VmHttpDispatch<S>
+) -> VmHttpDispatch
 where
     S: SecretStore + Send + Sync,
 {
@@ -1521,13 +1525,13 @@ impl VmHttpResponse {
     }
 }
 
-impl<S: SecretStore> From<VmHttpResponse> for VmHttpDispatch<S> {
+impl From<VmHttpResponse> for VmHttpDispatch {
     fn from(response: VmHttpResponse) -> Self {
         Self::Buffered(response)
     }
 }
 
-impl<S: SecretStore + Send + Sync + 'static> VmHttpDispatch<S> {
+impl VmHttpDispatch {
     fn into_hyper_response(self) -> http::Response<UnsyncBoxBody<Bytes, std::io::Error>> {
         match self {
             Self::Buffered(response) => response.into_hyper_response(),
@@ -1535,9 +1539,7 @@ impl<S: SecretStore + Send + Sync + 'static> VmHttpDispatch<S> {
             Self::OpenAiProxyStream(stream) => stream.into_hyper_response(),
         }
     }
-}
 
-impl<S: SecretStore> VmHttpDispatch<S> {
     fn status_code(&self) -> u16 {
         match self {
             Self::Buffered(response) => response.status.code(),
@@ -1691,7 +1693,7 @@ mod tests {
             store.put(&key, value).unwrap();
         }
         Arc::new(BrokerState {
-            audit: AuditLog::open_in_memory().unwrap(),
+            audit: Arc::new(AuditLog::open_in_memory().unwrap()),
             minter: GitHubMinter::new(
                 GitHubAppConfig {
                     app_id: 42,

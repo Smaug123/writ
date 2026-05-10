@@ -11,7 +11,7 @@ use http_body_util::combinators::UnsyncBoxBody;
 use serde::Deserialize;
 
 use crate::audit::{
-    OpenAiProxyAuditDecision, OpenAiProxyAuditRoute, OpenAiProxyOutcomeRecord,
+    AuditLog, OpenAiProxyAuditDecision, OpenAiProxyAuditRoute, OpenAiProxyOutcomeRecord,
     OpenAiProxyRequestRecord,
 };
 use crate::core::{RequestId, UnixMillis};
@@ -105,8 +105,8 @@ struct VmHttpOpenAiProxyFetch {
     error: Option<&'static str>,
 }
 
-pub(crate) struct VmHttpOpenAiProxyStream<S: SecretStore> {
-    broker_state: Arc<BrokerState<S>>,
+pub(crate) struct VmHttpOpenAiProxyStream {
+    audit_log: Arc<AuditLog>,
     pub(super) request_id: RequestId,
     response: reqwest::Response,
     upstream_url: String,
@@ -363,7 +363,7 @@ impl<S: SecretStore> VmHttpOpenAiProxyService<S> {
         request: &VmHttpRequest,
         body: Vec<u8>,
         headers: Vec<OpenAiProxyForwardHeader>,
-    ) -> Result<VmHttpOpenAiProxyStream<S>, VmHttpOpenAiProxyFetch> {
+    ) -> Result<VmHttpOpenAiProxyStream, VmHttpOpenAiProxyFetch> {
         let (upstream_url, builder) = self
             .upstream_request_builder(request, body, headers)
             .await
@@ -387,7 +387,7 @@ impl<S: SecretStore> VmHttpOpenAiProxyService<S> {
         let content_type = openai_proxy_response_content_type(&response);
         let headers = openai_proxy_response_headers(response.headers());
         Ok(VmHttpOpenAiProxyStream {
-            broker_state: Arc::clone(&self.broker_state),
+            audit_log: Arc::clone(&self.broker_state.audit),
             request_id,
             response,
             upstream_url,
@@ -465,14 +465,14 @@ fn openai_proxy_auth_failure(body: &'static str, label: &'static str) -> VmHttpO
     }
 }
 
-impl<S: SecretStore + Send + Sync + 'static> VmHttpOpenAiProxyStream<S> {
+impl VmHttpOpenAiProxyStream {
     pub(super) fn into_hyper_response(
         self,
     ) -> http::Response<UnsyncBoxBody<Bytes, std::io::Error>> {
         let body = ProxyStreamBody {
             inner: Box::pin(self.response.bytes_stream()),
             audit: Some(ProxyStreamAudit {
-                broker_state: self.broker_state,
+                audit_log: self.audit_log,
                 kind: ProxyAuditKind::OpenAi,
                 request_id: self.request_id,
                 upstream_url: self.upstream_url,
@@ -862,7 +862,7 @@ pub(super) async fn route_openai_proxy_request<S: SecretStore>(
     request: &VmHttpRequest,
     body: Vec<u8>,
     service: &VmHttpOpenAiProxyService<S>,
-) -> VmHttpDispatch<S> {
+) -> VmHttpDispatch {
     let route = classify_openai_proxy_target(&request.target)
         .expect("caller only routes classified OpenAI proxy targets");
     if route == OpenAiProxyAuditRoute::Unsupported {
