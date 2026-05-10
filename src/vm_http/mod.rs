@@ -9,6 +9,7 @@ mod claude_proxy;
 mod git_clone;
 mod nix_cache;
 mod openai_proxy;
+mod proxy_common;
 
 pub use agent_runs::VmHttpAgentRunService;
 use agent_runs::{
@@ -19,10 +20,7 @@ pub use claude_proxy::{
     DEFAULT_CLAUDE_ANTHROPIC_VERSION, VmHttpClaudeProxyAuthKind, VmHttpClaudeProxyConfig,
     VmHttpClaudeProxyConfigError, VmHttpClaudeProxyService,
 };
-use claude_proxy::{
-    VmHttpClaudeProxyStream, classify_claude_proxy_target, is_claude_proxy_target,
-    record_claude_proxy_local_response, route_claude_proxy_request,
-};
+use claude_proxy::{record_claude_proxy_local_response, route_claude_proxy_request};
 pub use git_clone::{VmHttpGitCloneConfig, VmHttpGitCloneService};
 use git_clone::{is_git_clone_target, route_git_clone_request};
 #[cfg(test)]
@@ -36,21 +34,16 @@ pub use openai_proxy::{
     VmHttpOpenAiProxyAuthKind, VmHttpOpenAiProxyConfig, VmHttpOpenAiProxyConfigError,
     VmHttpOpenAiProxyService,
 };
-use openai_proxy::{
-    VmHttpOpenAiProxyStream, classify_openai_proxy_target, is_openai_proxy_target,
-    record_openai_proxy_local_response, route_openai_proxy_request,
-};
+use openai_proxy::{record_openai_proxy_local_response, route_openai_proxy_request};
+use proxy_common::{ClaudeBackend, OpenAiBackend, ProxyBackend, ProxyStream};
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
-use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context, Poll};
 
 use bytes::Bytes;
-use futures_util::Stream;
 use http_body_util::{BodyExt, Empty, Full, Limited, combinators::UnsyncBoxBody};
-use hyper::body::{Body as HyperBody, Frame, Incoming};
+use hyper::body::{Body as HyperBody, Incoming};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioIo, TokioTimer};
@@ -59,13 +52,11 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 use tokio::task::JoinSet;
+use tracing::Instrument;
 
-use crate::audit::{
-    ClaudeProxyAuditDecision, ClaudeProxyOutcomeRecord, NixCacheAuditDecision,
-    OpenAiProxyAuditDecision, OpenAiProxyOutcomeRecord,
-};
+use crate::audit::{ClaudeProxyAuditDecision, NixCacheAuditDecision, OpenAiProxyAuditDecision};
 use crate::bearer::is_bearer_token_byte;
-use crate::core::{BrokerPort, BrokerPortRange, Ipv4Cidr, RequestId, SessionId, UnixMillis};
+use crate::core::{BrokerPort, BrokerPortRange, Ipv4Cidr, SessionId};
 use crate::secret::SecretStore;
 use crate::server::BrokerState;
 
@@ -265,10 +256,10 @@ enum VmHttpAuthScheme {
     Basic,
 }
 
-enum VmHttpDispatch<S: SecretStore> {
+enum VmHttpDispatch {
     Buffered(VmHttpResponse),
-    ClaudeProxyStream(VmHttpClaudeProxyStream<S>),
-    OpenAiProxyStream(VmHttpOpenAiProxyStream<S>),
+    ClaudeProxyStream(ProxyStream<ClaudeBackend>),
+    OpenAiProxyStream(ProxyStream<OpenAiBackend>),
 }
 
 impl VmHttpSession {
@@ -361,139 +352,6 @@ impl VmHttpRequest {
 
     pub fn peer_addr(&self) -> SocketAddr {
         self.peer_addr
-    }
-}
-
-#[derive(Copy, Clone, Debug)]
-enum ProxyAuditKind {
-    Claude,
-    OpenAi,
-}
-
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-enum ProxyStreamState {
-    Streaming,
-    UpstreamEnded,
-    UpstreamError,
-    OverMax,
-}
-
-struct ProxyStreamAudit<S: SecretStore> {
-    broker_state: Arc<BrokerState<S>>,
-    kind: ProxyAuditKind,
-    request_id: RequestId,
-    upstream_url: String,
-    upstream_status: u16,
-}
-
-struct ProxyStreamBody<S: SecretStore> {
-    inner: Pin<Box<dyn Stream<Item = reqwest::Result<Bytes>> + Send>>,
-    audit: Option<ProxyStreamAudit<S>>,
-    max_response_bytes: u64,
-    response_bytes: u64,
-    state: ProxyStreamState,
-}
-
-impl<S: SecretStore> HyperBody for ProxyStreamBody<S> {
-    type Data = Bytes;
-    type Error = std::io::Error;
-
-    fn poll_frame(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<Frame<Bytes>, std::io::Error>>> {
-        let me = self.get_mut();
-        if me.state != ProxyStreamState::Streaming {
-            return Poll::Ready(None);
-        }
-        match me.inner.as_mut().poll_next(cx) {
-            Poll::Pending => Poll::Pending,
-            Poll::Ready(None) => {
-                me.state = ProxyStreamState::UpstreamEnded;
-                Poll::Ready(None)
-            }
-            Poll::Ready(Some(Err(err))) => {
-                eprintln!(
-                    "VM HTTP {} proxy streaming body read failed: {err}",
-                    proxy_audit_label(me.audit.as_ref().map(|a| a.kind)),
-                );
-                me.state = ProxyStreamState::UpstreamError;
-                Poll::Ready(None)
-            }
-            Poll::Ready(Some(Ok(chunk))) => {
-                let chunk_len = u64::try_from(chunk.len()).expect("HTTP chunk length fits in u64");
-                let new_len = me
-                    .response_bytes
-                    .checked_add(chunk_len)
-                    .expect("HTTP response byte count overflowed before configured bound check");
-                if new_len > me.max_response_bytes {
-                    me.response_bytes = new_len;
-                    me.state = ProxyStreamState::OverMax;
-                    return Poll::Ready(None);
-                }
-                me.response_bytes = new_len;
-                Poll::Ready(Some(Ok(Frame::data(chunk))))
-            }
-        }
-    }
-
-    fn is_end_stream(&self) -> bool {
-        self.state != ProxyStreamState::Streaming
-    }
-}
-
-impl<S: SecretStore> Drop for ProxyStreamBody<S> {
-    fn drop(&mut self) {
-        let Some(audit) = self.audit.take() else {
-            return;
-        };
-        let error = match self.state {
-            ProxyStreamState::Streaming => Some("guest response write failed"),
-            ProxyStreamState::UpstreamEnded => None,
-            ProxyStreamState::UpstreamError => Some("upstream body read failed"),
-            ProxyStreamState::OverMax => Some("upstream response too large"),
-        };
-        let response_bytes = self.response_bytes;
-        match audit.kind {
-            ProxyAuditKind::Claude => {
-                if let Err(err) = audit.broker_state.audit.record_claude_proxy_outcome(
-                    &ClaudeProxyOutcomeRecord {
-                        request_id: audit.request_id,
-                        completed_at: UnixMillis::now(),
-                        http_status: audit.upstream_status,
-                        upstream_url: Some(audit.upstream_url.as_str()),
-                        upstream_status: Some(audit.upstream_status),
-                        response_bytes,
-                        error,
-                    },
-                ) {
-                    eprintln!("VM HTTP Claude proxy streaming audit outcome write failed: {err}");
-                }
-            }
-            ProxyAuditKind::OpenAi => {
-                if let Err(err) = audit.broker_state.audit.record_openai_proxy_outcome(
-                    &OpenAiProxyOutcomeRecord {
-                        request_id: audit.request_id,
-                        completed_at: UnixMillis::now(),
-                        http_status: audit.upstream_status,
-                        upstream_url: Some(audit.upstream_url.as_str()),
-                        upstream_status: Some(audit.upstream_status),
-                        response_bytes,
-                        error,
-                    },
-                ) {
-                    eprintln!("VM HTTP OpenAI proxy streaming audit outcome write failed: {err}");
-                }
-            }
-        }
-    }
-}
-
-fn proxy_audit_label(kind: Option<ProxyAuditKind>) -> &'static str {
-    match kind {
-        Some(ProxyAuditKind::Claude) => "Claude",
-        Some(ProxyAuditKind::OpenAi) => "OpenAI",
-        None => "?",
     }
 }
 
@@ -957,6 +815,11 @@ async fn handle_vm_http_connection<S: SecretStore + Send + Sync + 'static>(
     session: VmHttpSession,
     services: VmHttpServices<S>,
 ) -> std::io::Result<()> {
+    let span = tracing::info_span!(
+        "vm_http.connection",
+        session_id = %session.session_id(),
+        peer = %peer_addr,
+    );
     handle_vm_http_connection_with_read_timeout(
         stream,
         peer_addr,
@@ -964,6 +827,7 @@ async fn handle_vm_http_connection<S: SecretStore + Send + Sync + 'static>(
         services,
         VM_HTTP_READ_TIMEOUT,
     )
+    .instrument(span)
     .await
 }
 
@@ -1002,7 +866,7 @@ where
         // Hyper's connection-level errors (peer closed, parse failure,
         // header-read timeout) match the previous behaviour of swallowing
         // bad-input from the peer rather than surfacing them as I/O errors.
-        eprintln!("VM HTTP connection: {err}");
+        tracing::warn!(error = %err, "vm http connection ended with hyper error");
     }
     Ok(())
 }
@@ -1120,7 +984,7 @@ where
         }
     };
     let auth_scheme = auth_scheme_for_target(&request.target);
-    let dispatch: VmHttpDispatch<S> =
+    let dispatch: VmHttpDispatch =
         match authorize_vm_http_request_with_scheme(session, &request, auth_scheme) {
             VmHttpAuthorization::Allow => {
                 let body_bytes = match route_request_body_limit(&request, &services) {
@@ -1156,7 +1020,7 @@ where
                         None,
                     )
                     .into()
-                } else if let Some(route) = classify_claude_proxy_target(&request.target)
+                } else if let Some(route) = ClaudeBackend::classify_proxy_target(&request.target)
                     && let Some(service) = services.claude_proxy.as_ref()
                 {
                     record_claude_proxy_local_response(
@@ -1171,7 +1035,7 @@ where
                         None,
                     )
                     .into()
-                } else if let Some(route) = classify_openai_proxy_target(&request.target)
+                } else if let Some(route) = OpenAiBackend::classify_proxy_target(&request.target)
                     && let Some(service) = services.openai_proxy.as_ref()
                 {
                     record_openai_proxy_local_response(
@@ -1236,12 +1100,12 @@ where
 }
 
 fn log_vm_http_request(session: &VmHttpSession, method: &str, target: &str, status: u16) {
-    eprintln!(
-        "writd: vm http session={} {} {} -> {}",
-        session.session_id(),
+    tracing::info!(
+        session_id = %session.session_id(),
         method,
         target,
         status,
+        "vm http request",
     );
 }
 
@@ -1281,13 +1145,13 @@ fn route_request_body_limit<S: SecretStore>(
     if is_nix_cache_target(&request.target) {
         return None;
     }
-    if is_claude_proxy_target(&request.target) {
+    if ClaudeBackend::is_proxy_target(&request.target) {
         return services
             .claude_proxy
             .as_ref()
             .map(|service| service.config.max_request_bytes());
     }
-    if is_openai_proxy_target(&request.target) {
+    if OpenAiBackend::is_proxy_target(&request.target) {
         return services
             .openai_proxy
             .as_ref()
@@ -1313,7 +1177,7 @@ async fn route_authenticated_vm_http_request<S>(
     request: &VmHttpRequest,
     body: Vec<u8>,
     services: VmHttpServices<S>,
-) -> VmHttpDispatch<S>
+) -> VmHttpDispatch
 where
     S: SecretStore + Send + Sync,
 {
@@ -1321,14 +1185,14 @@ where
         return route_nix_cache_request(session, request, services.nix_cache).await;
     }
 
-    if is_claude_proxy_target(&request.target) {
+    if ClaudeBackend::is_proxy_target(&request.target) {
         let Some(service) = services.claude_proxy else {
             return VmHttpResponse::text(VmHttpStatus::NotFound, "not found").into();
         };
         return route_claude_proxy_request(session, request, body, &service).await;
     }
 
-    if is_openai_proxy_target(&request.target) {
+    if OpenAiBackend::is_proxy_target(&request.target) {
         let Some(service) = services.openai_proxy else {
             return VmHttpResponse::text(VmHttpStatus::NotFound, "not found").into();
         };
@@ -1535,13 +1399,13 @@ impl VmHttpResponse {
     }
 }
 
-impl<S: SecretStore> From<VmHttpResponse> for VmHttpDispatch<S> {
+impl From<VmHttpResponse> for VmHttpDispatch {
     fn from(response: VmHttpResponse) -> Self {
         Self::Buffered(response)
     }
 }
 
-impl<S: SecretStore + Send + Sync + 'static> VmHttpDispatch<S> {
+impl VmHttpDispatch {
     fn into_hyper_response(self) -> http::Response<UnsyncBoxBody<Bytes, std::io::Error>> {
         match self {
             Self::Buffered(response) => response.into_hyper_response(),
@@ -1549,14 +1413,12 @@ impl<S: SecretStore + Send + Sync + 'static> VmHttpDispatch<S> {
             Self::OpenAiProxyStream(stream) => stream.into_hyper_response(),
         }
     }
-}
 
-impl<S: SecretStore> VmHttpDispatch<S> {
     fn status_code(&self) -> u16 {
         match self {
             Self::Buffered(response) => response.status.code(),
-            Self::ClaudeProxyStream(response) => response.upstream_status,
-            Self::OpenAiProxyStream(response) => response.upstream_status,
+            Self::ClaudeProxyStream(stream) => stream.upstream_status,
+            Self::OpenAiProxyStream(stream) => stream.upstream_status,
         }
     }
 
@@ -1607,8 +1469,8 @@ impl VmHttpStatus {
 fn report_vm_http_handler_result(result: Result<std::io::Result<()>, tokio::task::JoinError>) {
     match result {
         Ok(Ok(())) => {}
-        Ok(Err(err)) => eprintln!("VM HTTP connection error: {err}"),
-        Err(err) => eprintln!("VM HTTP connection task failed: {err}"),
+        Ok(Err(err)) => tracing::warn!(error = %err, "vm http connection error"),
+        Err(err) => tracing::error!(error = %err, "vm http connection task failed"),
     }
 }
 
@@ -1705,7 +1567,7 @@ mod tests {
             store.put(&key, value).unwrap();
         }
         Arc::new(BrokerState {
-            audit: AuditLog::open_in_memory().unwrap(),
+            audit: Arc::new(AuditLog::open_in_memory().unwrap()),
             minter: GitHubMinter::new(
                 GitHubAppConfig {
                     app_id: 42,

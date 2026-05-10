@@ -1,0 +1,152 @@
+//! Audit log backed by SQLite.
+//!
+//! The log is the system-of-record for broker activity: every session,
+//! every capability request, every credential grant, and every post-policy
+//! mint failure lands here. The raw JSON for requests, decisions, scopes,
+//! and mint failures is stored verbatim, so the log can be replayed to
+//! reconstruct history without depending on the broker binary staying
+//! source-compatible.
+//!
+//! The `request` and `grant_log` tables are strictly append-only: once a
+//! row lands it is never mutated or deleted. This is the part that
+//! matters for audit-integrity claims.
+//!
+//! The `session` table carries open/close timestamps and is updated by
+//! `close_session`; `closed_at` moves from NULL to a fixed timestamp
+//! exactly once, and a `request` row can only be written while the
+//! referenced session is open. That constraint is what makes
+//! `closed_at` a meaningful upper bound on the session's activity
+//! window during post-hoc review — the per-grant rows in `grant_log`
+//! are what get reconciled against observed side-effects, and those
+//! never move.
+
+use std::path::Path;
+use std::sync::Mutex;
+
+use rusqlite::Connection;
+use thiserror::Error;
+
+mod agent_run;
+mod claude_proxy;
+mod git_push;
+mod grant;
+mod nix_cache;
+mod openai_proxy;
+mod schema;
+mod session;
+#[cfg(test)]
+mod test_support;
+mod validation;
+
+pub use agent_run::{
+    AgentRunAuditRecord, AgentRunOutcomeAuditRecord, AgentVmWorkspaceBootstrapAuditRecord,
+};
+pub use claude_proxy::{
+    ClaudeProxyAuditDecision, ClaudeProxyAuditRoute, ClaudeProxyOutcomeRecord,
+    ClaudeProxyRequestRecord,
+};
+pub use git_push::{
+    GitPushAttemptRecord, GitPushAuditEntry, GitPushOutcomeRecord, GitPushOutcomeResult,
+    GitPushRequestRecord,
+};
+pub use grant::{MintFailureRecord, PreMintRecord};
+pub use nix_cache::{
+    NixCacheAuditDecision, NixCacheAuditEntry, NixCacheAuditRoute, NixCacheOutcomeRecord,
+    NixCacheRequestRecord,
+};
+pub use openai_proxy::{
+    OpenAiProxyAuditDecision, OpenAiProxyAuditRoute, OpenAiProxyOutcomeRecord,
+    OpenAiProxyRequestRecord,
+};
+
+#[derive(Debug, Error)]
+pub enum AuditError {
+    #[error("sqlite error: {0}")]
+    Sqlite(#[from] rusqlite::Error),
+
+    #[error("json error: {0}")]
+    Json(#[from] serde_json::Error),
+
+    #[error("internal lock poisoned")]
+    Poisoned,
+
+    /// Structural or cross-row audit invariant where the message names the
+    /// failed relationship directly.
+    #[error("invariant violated: {0}")]
+    Invariant(&'static str),
+
+    /// Field validation invariant where callers need the column or stream
+    /// label alongside the reusable validation failure.
+    #[error("invariant violated: {label}: {message}")]
+    LabeledInvariant {
+        label: &'static str,
+        message: &'static str,
+    },
+
+    /// The on-disk schema was written by a newer broker than this binary
+    /// knows how to read. Refusing to open is the correctness-over-
+    /// availability call: a down-rev binary silently ignoring columns it
+    /// doesn't understand is how audit logs lose data.
+    #[error(
+        "audit DB schema version {found} is newer than this binary supports (max {supported}); \
+         upgrade the broker"
+    )]
+    SchemaTooNew { found: i32, supported: i32 },
+}
+
+pub struct AuditLog {
+    conn: Mutex<Connection>,
+}
+
+impl std::fmt::Debug for AuditLog {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuditLog").finish_non_exhaustive()
+    }
+}
+
+impl AuditLog {
+    /// Open (or create) an on-disk audit log. The schema is brought up to
+    /// the highest version this binary supports by running any missing
+    /// migrations in order.
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, AuditError> {
+        let mut conn = Connection::open(path)?;
+        Self::init(&mut conn)?;
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
+    }
+
+    /// In-memory audit log, for tests.
+    pub fn open_in_memory() -> Result<Self, AuditError> {
+        let mut conn = Connection::open_in_memory()?;
+        Self::init(&mut conn)?;
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
+    }
+
+    fn init(conn: &mut Connection) -> Result<(), AuditError> {
+        // SQLite foreign_keys is per-connection and defaults to OFF, so the
+        // REFERENCES clauses in the schema would otherwise be
+        // parsed-and-ignored and orphan `request`/`grant_log` rows could
+        // slip in. Must be set outside a transaction.
+        conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+        schema::migrate(conn)
+    }
+
+    pub(super) fn with_conn<R>(
+        &self,
+        f: impl FnOnce(&Connection) -> Result<R, AuditError>,
+    ) -> Result<R, AuditError> {
+        let guard = self.conn.lock().map_err(|_| AuditError::Poisoned)?;
+        f(&guard)
+    }
+
+    pub(super) fn with_conn_mut<R>(
+        &self,
+        f: impl FnOnce(&mut Connection) -> Result<R, AuditError>,
+    ) -> Result<R, AuditError> {
+        let mut guard = self.conn.lock().map_err(|_| AuditError::Poisoned)?;
+        f(&mut guard)
+    }
+}

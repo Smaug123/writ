@@ -19,6 +19,7 @@ use crate::agent_run::{
     vm_agent_run_outcome_path,
 };
 use crate::bearer::is_bearer_token_byte;
+use crate::process_spawn;
 use crate::vm_git::{
     DEFAULT_DEVSHELL_ATTR, DEFAULT_WORKSPACE_BRANCH, GIT_BUNDLE_CONTENT_TYPE, GitCloneRef,
     GitCloneRepo, VM_GIT_CLONE_PATH, VmGitCloneErrorResponse, VmGitCloneRequest, WorkspaceWarmMode,
@@ -614,7 +615,8 @@ fn run_git_command(
     args: Vec<OsString>,
     cwd: &Path,
 ) -> Result<(), VmClientError> {
-    let output = Command::new(git_program)
+    let mut command = Command::new(git_program);
+    command
         .args(args)
         .current_dir(cwd)
         .stdin(Stdio::null())
@@ -622,8 +624,8 @@ fn run_git_command(
         .stderr(Stdio::piped())
         .env_remove(VM_BROKER_URL_ENV)
         .env_remove(VM_BROKER_TOKEN_ENV)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .output()
+        .env("GIT_TERMINAL_PROMPT", "0");
+    let output = process_spawn::output(&mut command)
         .map_err(|source| VmClientError::GitSpawn { step, source })?;
     if output.status.success() {
         return Ok(());
@@ -641,7 +643,8 @@ fn run_git_command_output(
     args: Vec<OsString>,
     cwd: &Path,
 ) -> Result<std::process::Output, VmClientError> {
-    let output = Command::new(git_program)
+    let mut command = Command::new(git_program);
+    command
         .args(args)
         .current_dir(cwd)
         .stdin(Stdio::null())
@@ -649,8 +652,8 @@ fn run_git_command_output(
         .stderr(Stdio::piped())
         .env_remove(VM_BROKER_URL_ENV)
         .env_remove(VM_BROKER_TOKEN_ENV)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .output()
+        .env("GIT_TERMINAL_PROMPT", "0");
+    let output = process_spawn::output(&mut command)
         .map_err(|source| VmClientError::GitSpawn { step, source })?;
     if output.status.success() {
         return Ok(output);
@@ -931,15 +934,16 @@ fn run_nix_command(
     args: Vec<OsString>,
     cwd: &Path,
 ) -> Result<(), VmClientError> {
-    let output = Command::new(nix_program)
+    let mut command = Command::new(nix_program);
+    command
         .args(args)
         .current_dir(cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .env_remove(VM_BROKER_URL_ENV)
-        .env_remove(VM_BROKER_TOKEN_ENV)
-        .output()
+        .env_remove(VM_BROKER_TOKEN_ENV);
+    let output = process_spawn::output(&mut command)
         .map_err(|source| VmClientError::NixSpawn { step, source })?;
     if output.status.success() {
         return Ok(());

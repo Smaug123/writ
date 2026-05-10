@@ -3,11 +3,9 @@
 //! configured upstream), injecting host-side auth and stripping guest auth.
 
 use std::borrow::Cow;
+use std::marker::PhantomData;
 use std::sync::Arc;
 
-use bytes::Bytes;
-use http_body_util::BodyExt as _;
-use http_body_util::combinators::UnsyncBoxBody;
 use serde::Deserialize;
 
 use crate::audit::{
@@ -18,16 +16,20 @@ use crate::core::{RequestId, UnixMillis};
 use crate::secret::{SecretKey, SecretStore};
 use crate::server::BrokerState;
 
+use super::proxy_common::{
+    ClaudeBackend, ProxyBackend, ProxyFetch, ProxyForwardHeader, ProxyStream, UpstreamAuth,
+    is_proxy_id_byte, proxy_request_wants_streaming, proxy_response_content_type,
+    proxy_target_path, read_upstream_body_bounded,
+};
 use super::{
-    ProxyAuditKind, ProxyStreamAudit, ProxyStreamBody, ProxyStreamState, VmHttpDispatch,
-    VmHttpHeader, VmHttpRequest, VmHttpResponse, VmHttpResponseHeader, VmHttpSession, VmHttpStatus,
+    VmHttpDispatch, VmHttpHeader, VmHttpRequest, VmHttpResponse, VmHttpResponseHeader,
+    VmHttpSession, VmHttpStatus,
 };
 
 pub(super) const VM_CLAUDE_MESSAGES_PATH: &str = "/v1/messages";
 pub(super) const VM_CLAUDE_COUNT_TOKENS_PATH: &str = "/v1/messages/count_tokens";
 pub(super) const VM_CLAUDE_MODELS_PREFIX: &str = "/v1/models/";
 pub const DEFAULT_CLAUDE_ANTHROPIC_VERSION: &str = "2023-06-01";
-const ANTHROPIC_OAUTH_BETA_HEADER_VALUE: &str = "oauth-2025-04-20";
 
 pub struct VmHttpClaudeProxyService<S: SecretStore> {
     broker_state: Arc<BrokerState<S>>,
@@ -81,42 +83,6 @@ pub enum VmHttpClaudeProxyConfigError {
     InvalidAnthropicVersion { message: String },
 }
 
-#[derive(Debug)]
-struct VmHttpClaudeProxyFetch {
-    response: VmHttpResponse,
-    upstream_url: Option<String>,
-    upstream_status: Option<u16>,
-    response_bytes: u64,
-    error: Option<&'static str>,
-}
-
-pub(crate) struct VmHttpClaudeProxyStream<S: SecretStore> {
-    broker_state: Arc<BrokerState<S>>,
-    pub(super) request_id: RequestId,
-    response: reqwest::Response,
-    upstream_url: String,
-    pub(super) upstream_status: u16,
-    content_type: &'static str,
-    headers: Vec<VmHttpResponseHeader>,
-    max_response_bytes: u64,
-}
-
-#[derive(Debug, thiserror::Error)]
-enum VmHttpClaudeProxyBodyReadError {
-    #[error("Claude proxy upstream response body read failed after {bytes_read} bytes: {source}")]
-    Request {
-        source: reqwest::Error,
-        bytes_read: u64,
-    },
-    #[error("Claude proxy upstream response exceeds {max} bytes after {bytes_read} bytes")]
-    ResponseTooLarge { max: u64, bytes_read: u64 },
-}
-
-struct ClaudeProxyForwardHeader {
-    name: reqwest::header::HeaderName,
-    value: reqwest::header::HeaderValue,
-}
-
 impl<S: SecretStore> VmHttpClaudeProxyService<S> {
     pub fn new(
         broker_state: Arc<BrokerState<S>>,
@@ -137,11 +103,11 @@ impl<S: SecretStore> VmHttpClaudeProxyService<S> {
         &self,
         request: &VmHttpRequest,
         body: Vec<u8>,
-        headers: Vec<ClaudeProxyForwardHeader>,
-    ) -> Result<(String, reqwest::RequestBuilder), Box<VmHttpClaudeProxyFetch>> {
-        let Some(route) = classify_claude_proxy_target(&request.target) else {
+        headers: Vec<ProxyForwardHeader>,
+    ) -> Result<(String, reqwest::RequestBuilder), Box<ProxyFetch>> {
+        let Some(route) = ClaudeBackend::classify_proxy_target(&request.target) else {
             let response = VmHttpResponse::text(VmHttpStatus::NotFound, "not found");
-            return Err(Box::new(VmHttpClaudeProxyFetch {
+            return Err(Box::new(ProxyFetch {
                 response_bytes: response.body.len() as u64,
                 response,
                 upstream_url: None,
@@ -151,7 +117,7 @@ impl<S: SecretStore> VmHttpClaudeProxyService<S> {
         };
         let Some(url) = self.upstream_url(&request.target) else {
             let response = VmHttpResponse::text(VmHttpStatus::NotFound, "not found");
-            return Err(Box::new(VmHttpClaudeProxyFetch {
+            return Err(Box::new(ProxyFetch {
                 response_bytes: response.body.len() as u64,
                 response,
                 upstream_url: None,
@@ -160,36 +126,10 @@ impl<S: SecretStore> VmHttpClaudeProxyService<S> {
             }));
         };
         let upstream_url = url.to_string();
-        let secret = match self
-            .broker_state
-            .secret_store()
-            .get(self.config.auth_secret())
-        {
-            Ok(Some(secret)) if !secret.is_empty() => secret,
-            Ok(_) => {
-                let response =
-                    VmHttpResponse::text(VmHttpStatus::BadGateway, "Claude proxy auth missing");
-                return Err(Box::new(VmHttpClaudeProxyFetch {
-                    response_bytes: response.body.len() as u64,
-                    response,
-                    upstream_url: Some(upstream_url),
-                    upstream_status: None,
-                    error: Some("upstream auth missing"),
-                }));
-            }
-            Err(err) => {
-                eprintln!("VM HTTP Claude proxy auth secret load failed: {err}");
-                let response =
-                    VmHttpResponse::text(VmHttpStatus::BadGateway, "Claude proxy auth failed");
-                return Err(Box::new(VmHttpClaudeProxyFetch {
-                    response_bytes: response.body.len() as u64,
-                    response,
-                    upstream_url: Some(upstream_url),
-                    upstream_status: None,
-                    error: Some("upstream auth load failed"),
-                }));
-            }
-        };
+        let upstream_auth = self.resolve_upstream_auth().map_err(|mut fetch| {
+            fetch.upstream_url = Some(upstream_url.clone());
+            fetch
+        })?;
 
         let mut builder = self.client.request(claude_proxy_route_method(route), url);
         if !body.is_empty() {
@@ -198,22 +138,44 @@ impl<S: SecretStore> VmHttpClaudeProxyService<S> {
         for header in headers {
             builder = builder.header(header.name, header.value);
         }
-        builder = match self.config.auth_kind() {
-            VmHttpClaudeProxyAuthKind::XApiKey => builder.header("x-api-key", secret),
-            VmHttpClaudeProxyAuthKind::AuthorizationBearer => builder.bearer_auth(secret),
-            VmHttpClaudeProxyAuthKind::OAuth => builder
-                .bearer_auth(secret)
-                .header("anthropic-beta", ANTHROPIC_OAUTH_BETA_HEADER_VALUE),
-        };
+        builder = upstream_auth.apply_to(builder);
         Ok((upstream_url, builder))
+    }
+
+    fn resolve_upstream_auth(&self) -> Result<UpstreamAuth, Box<ProxyFetch>> {
+        let secret = match self
+            .broker_state
+            .secret_store()
+            .get(self.config.auth_secret())
+        {
+            Ok(Some(secret)) if !secret.is_empty() => secret,
+            Ok(_) => {
+                return Err(Box::new(claude_proxy_auth_failure(
+                    "Claude proxy auth missing",
+                    "upstream auth missing",
+                )));
+            }
+            Err(err) => {
+                eprintln!("VM HTTP Claude proxy auth secret load failed: {err}");
+                return Err(Box::new(claude_proxy_auth_failure(
+                    "Claude proxy auth failed",
+                    "upstream auth load failed",
+                )));
+            }
+        };
+        Ok(match self.config.auth_kind() {
+            VmHttpClaudeProxyAuthKind::XApiKey => UpstreamAuth::XApiKey(secret),
+            VmHttpClaudeProxyAuthKind::AuthorizationBearer => UpstreamAuth::Bearer(secret),
+            VmHttpClaudeProxyAuthKind::OAuth => UpstreamAuth::AnthropicOauth(secret),
+        })
     }
 
     async fn fetch(
         &self,
         request: &VmHttpRequest,
         body: Vec<u8>,
-        headers: Vec<ClaudeProxyForwardHeader>,
-    ) -> VmHttpClaudeProxyFetch {
+        headers: Vec<ProxyForwardHeader>,
+    ) -> ProxyFetch {
         let (upstream_url, builder) = match self.upstream_request_builder(request, body, headers) {
             Ok(parts) => parts,
             Err(fetch) => return *fetch,
@@ -225,7 +187,7 @@ impl<S: SecretStore> VmHttpClaudeProxyService<S> {
                 eprintln!("VM HTTP Claude proxy upstream request failed: {err}");
                 let response =
                     VmHttpResponse::text(VmHttpStatus::BadGateway, "Claude proxy upstream failed");
-                return VmHttpClaudeProxyFetch {
+                return ProxyFetch {
                     response_bytes: response.body.len() as u64,
                     response,
                     upstream_url: Some(upstream_url),
@@ -236,17 +198,16 @@ impl<S: SecretStore> VmHttpClaudeProxyService<S> {
         };
 
         let upstream_status = response.status();
-        let content_type = claude_proxy_response_content_type(&response);
+        let content_type = proxy_response_content_type(&response);
         let response_headers = claude_proxy_response_headers(response.headers());
-        let body = match read_claude_upstream_body_bounded(response, self.config.max_response_bytes)
-            .await
+        let body = match read_upstream_body_bounded(response, self.config.max_response_bytes).await
         {
             Ok(body) => body,
             Err(err) => {
                 eprintln!("VM HTTP Claude proxy upstream body read failed: {err}");
                 let response =
                     VmHttpResponse::text(VmHttpStatus::BadGateway, "Claude proxy upstream failed");
-                return VmHttpClaudeProxyFetch {
+                return ProxyFetch {
                     response_bytes: err.bytes_read(),
                     response,
                     upstream_url: Some(upstream_url),
@@ -256,7 +217,7 @@ impl<S: SecretStore> VmHttpClaudeProxyService<S> {
             }
         };
         let response_bytes = body.len() as u64;
-        VmHttpClaudeProxyFetch {
+        ProxyFetch {
             response: VmHttpResponse {
                 status: VmHttpStatus::Upstream(upstream_status.as_u16()),
                 content_type,
@@ -277,8 +238,8 @@ impl<S: SecretStore> VmHttpClaudeProxyService<S> {
         request_id: RequestId,
         request: &VmHttpRequest,
         body: Vec<u8>,
-        headers: Vec<ClaudeProxyForwardHeader>,
-    ) -> Result<VmHttpClaudeProxyStream<S>, VmHttpClaudeProxyFetch> {
+        headers: Vec<ProxyForwardHeader>,
+    ) -> Result<ProxyStream<ClaudeBackend>, ProxyFetch> {
         let (upstream_url, builder) = self
             .upstream_request_builder(request, body, headers)
             .map_err(|fetch| *fetch)?;
@@ -288,7 +249,7 @@ impl<S: SecretStore> VmHttpClaudeProxyService<S> {
                 eprintln!("VM HTTP Claude proxy upstream request failed: {err}");
                 let response =
                     VmHttpResponse::text(VmHttpStatus::BadGateway, "Claude proxy upstream failed");
-                return Err(VmHttpClaudeProxyFetch {
+                return Err(ProxyFetch {
                     response_bytes: response.body.len() as u64,
                     response,
                     upstream_url: Some(upstream_url),
@@ -298,10 +259,10 @@ impl<S: SecretStore> VmHttpClaudeProxyService<S> {
             }
         };
         let upstream_status = response.status().as_u16();
-        let content_type = claude_proxy_response_content_type(&response);
+        let content_type = proxy_response_content_type(&response);
         let headers = claude_proxy_response_headers(response.headers());
-        Ok(VmHttpClaudeProxyStream {
-            broker_state: Arc::clone(&self.broker_state),
+        Ok(ProxyStream {
+            audit_log: Arc::clone(&self.broker_state.audit),
             request_id,
             response,
             upstream_url,
@@ -309,11 +270,12 @@ impl<S: SecretStore> VmHttpClaudeProxyService<S> {
             content_type,
             headers,
             max_response_bytes: self.config.max_response_bytes,
+            _audit_kind: PhantomData,
         })
     }
 
     fn upstream_url(&self, target: &str) -> Option<reqwest::Url> {
-        let path = claude_proxy_target_path(target);
+        let path = proxy_target_path(target);
         let relative: Cow<'static, str> = match path {
             VM_CLAUDE_MESSAGES_PATH => "v1/messages".into(),
             VM_CLAUDE_COUNT_TOKENS_PATH => "v1/messages/count_tokens".into(),
@@ -350,33 +312,14 @@ impl<S: SecretStore> Clone for VmHttpClaudeProxyService<S> {
     }
 }
 
-impl<S: SecretStore + Send + Sync + 'static> VmHttpClaudeProxyStream<S> {
-    pub(super) fn into_hyper_response(
-        self,
-    ) -> http::Response<UnsyncBoxBody<Bytes, std::io::Error>> {
-        let body = ProxyStreamBody {
-            inner: Box::pin(self.response.bytes_stream()),
-            audit: Some(ProxyStreamAudit {
-                broker_state: self.broker_state,
-                kind: ProxyAuditKind::Claude,
-                request_id: self.request_id,
-                upstream_url: self.upstream_url,
-                upstream_status: self.upstream_status,
-            }),
-            max_response_bytes: self.max_response_bytes,
-            response_bytes: 0,
-            state: ProxyStreamState::Streaming,
-        };
-        let mut builder = http::Response::builder()
-            .status(self.upstream_status)
-            .header(http::header::CONTENT_TYPE, self.content_type)
-            .header(http::header::CONNECTION, "close");
-        for header in self.headers {
-            builder = builder.header(header.name, header.value);
-        }
-        builder
-            .body(body.boxed_unsync())
-            .expect("VmHttpClaudeProxyStream always builds a valid hyper response")
+fn claude_proxy_auth_failure(body: &'static str, label: &'static str) -> ProxyFetch {
+    let response = VmHttpResponse::text(VmHttpStatus::BadGateway, body);
+    ProxyFetch {
+        response_bytes: response.body.len() as u64,
+        response,
+        upstream_url: None,
+        upstream_status: None,
+        error: Some(label),
     }
 }
 
@@ -496,103 +439,104 @@ impl VmHttpClaudeProxyConfig {
     }
 }
 
-async fn read_claude_upstream_body_bounded(
-    mut response: reqwest::Response,
-    max: u64,
-) -> Result<Vec<u8>, VmHttpClaudeProxyBodyReadError> {
-    let mut body = Vec::new();
-    loop {
-        let chunk = match response.chunk().await {
-            Ok(Some(chunk)) => chunk,
-            Ok(None) => break,
-            Err(source) => {
-                return Err(VmHttpClaudeProxyBodyReadError::Request {
-                    source,
-                    bytes_read: body.len() as u64,
-                });
+impl ProxyBackend for ClaudeBackend {
+    type Route = ClaudeProxyAuditRoute;
+    type AuthKind = VmHttpClaudeProxyAuthKind;
+
+    fn classify_proxy_target(target: &str) -> Option<ClaudeProxyAuditRoute> {
+        // Match on the path only. Anthropic's clients pass through query
+        // params such as `?beta=true` that select endpoint variants; the
+        // broker's policy is to drop those (similar to the `anthropic-beta`
+        // header allowlist) and forward a path-only request upstream.
+        let path = proxy_target_path(target);
+        match path {
+            VM_CLAUDE_MESSAGES_PATH => Some(ClaudeProxyAuditRoute::Messages),
+            VM_CLAUDE_COUNT_TOKENS_PATH => Some(ClaudeProxyAuditRoute::CountTokens),
+            _ if claude_proxy_model_id(path).is_some() => Some(ClaudeProxyAuditRoute::Models),
+            _ if path.starts_with("/v1/messages/")
+                || path.starts_with("/v1/messages/count_tokens/")
+                || path.starts_with(VM_CLAUDE_MODELS_PREFIX)
+                || path == "/v1/models" =>
+            {
+                Some(ClaudeProxyAuditRoute::Unsupported)
             }
-        };
-        let chunk_len = u64::try_from(chunk.len()).expect("HTTP chunk length fits in u64");
-        let new_len = (body.len() as u64)
-            .checked_add(chunk_len)
-            .expect("HTTP response byte count overflowed before configured bound check");
-        if new_len > max {
-            return Err(VmHttpClaudeProxyBodyReadError::ResponseTooLarge {
-                max,
-                bytes_read: new_len,
-            });
-        }
-        body.extend_from_slice(&chunk);
-    }
-    Ok(body)
-}
-
-impl VmHttpClaudeProxyBodyReadError {
-    fn audit_error_label(&self) -> &'static str {
-        match self {
-            Self::Request { .. } => "upstream body read failed",
-            Self::ResponseTooLarge { .. } => "upstream response too large",
+            _ => None,
         }
     }
 
-    fn bytes_read(&self) -> u64 {
-        match self {
-            Self::Request { bytes_read, .. } | Self::ResponseTooLarge { bytes_read, .. } => {
-                *bytes_read
-            }
+    fn forward_header_name(
+        raw: &str,
+        auth_kind: VmHttpClaudeProxyAuthKind,
+    ) -> Option<reqwest::header::HeaderName> {
+        // Allowlist only. The default policy drops anthropic-beta because
+        // beta features can opt into capabilities the operator has not
+        // authorized (e.g. extended file retention, computer-use tool
+        // surfaces), so the broker — not the guest — decides which betas
+        // to enable. The OAuth auth path is the exception: it exists to
+        // host Claude Code, whose request shape includes betas the CLI
+        // emits itself, so the broker forwards anthropic-beta from the
+        // guest while still injecting its own oauth-2025-04-20 alongside.
+        // Anthropic-Version is added separately by the broker and is
+        // never forwarded from the guest.
+        if raw.eq_ignore_ascii_case("content-type") {
+            return Some(reqwest::header::CONTENT_TYPE);
         }
-    }
-}
-
-pub(super) fn is_claude_proxy_target(target: &str) -> bool {
-    classify_claude_proxy_target(target).is_some()
-}
-
-pub(super) fn classify_claude_proxy_target(target: &str) -> Option<ClaudeProxyAuditRoute> {
-    // Match on the path only. Anthropic's clients pass through query params
-    // such as `?beta=true` that select endpoint variants; the broker's policy
-    // is to drop those (similar to the `anthropic-beta` header allowlist) and
-    // forward a path-only request upstream.
-    let path = claude_proxy_target_path(target);
-    match path {
-        VM_CLAUDE_MESSAGES_PATH => Some(ClaudeProxyAuditRoute::Messages),
-        VM_CLAUDE_COUNT_TOKENS_PATH => Some(ClaudeProxyAuditRoute::CountTokens),
-        _ if claude_proxy_model_id(path).is_some() => Some(ClaudeProxyAuditRoute::Models),
-        _ if path.starts_with("/v1/messages/")
-            || path.starts_with("/v1/messages/count_tokens/")
-            || path.starts_with(VM_CLAUDE_MODELS_PREFIX)
-            || path == "/v1/models" =>
+        if raw.eq_ignore_ascii_case("accept") {
+            return Some(reqwest::header::ACCEPT);
+        }
+        if raw.eq_ignore_ascii_case("user-agent") {
+            return Some(reqwest::header::USER_AGENT);
+        }
+        if auth_kind == VmHttpClaudeProxyAuthKind::OAuth
+            && raw.eq_ignore_ascii_case("anthropic-beta")
         {
-            Some(ClaudeProxyAuditRoute::Unsupported)
+            return Some(reqwest::header::HeaderName::from_static("anthropic-beta"));
         }
-        _ => None,
+        None
     }
-}
 
-fn claude_proxy_target_path(target: &str) -> &str {
-    target
-        .split_once('?')
-        .map(|(path, _)| path)
-        .unwrap_or(target)
+    fn response_header_name(raw: &str) -> Option<&'static str> {
+        if raw.eq_ignore_ascii_case("request-id") {
+            return Some("Request-Id");
+        }
+        if raw.eq_ignore_ascii_case("retry-after") {
+            return Some("Retry-After");
+        }
+        if raw.eq_ignore_ascii_case("anthropic-ratelimit-requests-limit") {
+            return Some("Anthropic-Ratelimit-Requests-Limit");
+        }
+        if raw.eq_ignore_ascii_case("anthropic-ratelimit-requests-remaining") {
+            return Some("Anthropic-Ratelimit-Requests-Remaining");
+        }
+        if raw.eq_ignore_ascii_case("anthropic-ratelimit-requests-reset") {
+            return Some("Anthropic-Ratelimit-Requests-Reset");
+        }
+        if raw.eq_ignore_ascii_case("anthropic-ratelimit-tokens-limit") {
+            return Some("Anthropic-Ratelimit-Tokens-Limit");
+        }
+        if raw.eq_ignore_ascii_case("anthropic-ratelimit-tokens-remaining") {
+            return Some("Anthropic-Ratelimit-Tokens-Remaining");
+        }
+        if raw.eq_ignore_ascii_case("anthropic-ratelimit-tokens-reset") {
+            return Some("Anthropic-Ratelimit-Tokens-Reset");
+        }
+        None
+    }
 }
 
 fn claude_proxy_model_id(path: &str) -> Option<&str> {
     let suffix = path.strip_prefix(VM_CLAUDE_MODELS_PREFIX)?;
-    if suffix.is_empty() || !suffix.bytes().all(is_claude_model_id_byte) {
+    if suffix.is_empty() || !suffix.bytes().all(is_proxy_id_byte) {
         return None;
     }
     Some(suffix)
-}
-
-fn is_claude_model_id_byte(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')
 }
 
 fn claude_proxy_forward_headers(
     headers: &[VmHttpHeader],
     anthropic_version: &reqwest::header::HeaderValue,
     auth_kind: VmHttpClaudeProxyAuthKind,
-) -> Result<Vec<ClaudeProxyForwardHeader>, &'static str> {
+) -> Result<Vec<ProxyForwardHeader>, &'static str> {
     let mut forwarded = Vec::new();
     let mut saw_content_type = false;
     let mut saw_accept = false;
@@ -601,7 +545,7 @@ fn claude_proxy_forward_headers(
     let anthropic_beta_name = reqwest::header::HeaderName::from_static("anthropic-beta");
 
     for header in headers {
-        let Some(name) = claude_proxy_forward_header_name(&header.name, auth_kind) else {
+        let Some(name) = ClaudeBackend::forward_header_name(&header.name, auth_kind) else {
             continue;
         };
         let duplicate = if name == reqwest::header::CONTENT_TYPE {
@@ -620,69 +564,13 @@ fn claude_proxy_forward_headers(
         }
         let value = reqwest::header::HeaderValue::from_str(&header.value)
             .map_err(|_| "invalid forwarded Claude header value")?;
-        forwarded.push(ClaudeProxyForwardHeader { name, value });
+        forwarded.push(ProxyForwardHeader { name, value });
     }
-    forwarded.push(ClaudeProxyForwardHeader {
+    forwarded.push(ProxyForwardHeader {
         name: reqwest::header::HeaderName::from_static("anthropic-version"),
         value: anthropic_version.clone(),
     });
     Ok(forwarded)
-}
-
-fn claude_proxy_forward_header_name(
-    raw: &str,
-    auth_kind: VmHttpClaudeProxyAuthKind,
-) -> Option<reqwest::header::HeaderName> {
-    // Allowlist only. The default policy drops anthropic-beta because beta
-    // features can opt into capabilities the operator has not authorized
-    // (e.g. extended file retention, computer-use tool surfaces), so the
-    // broker — not the guest — decides which betas to enable. The OAuth
-    // auth path is the exception: it exists to host Claude Code, whose
-    // request shape includes betas the CLI emits itself, so the broker
-    // forwards anthropic-beta from the guest while still injecting its own
-    // oauth-2025-04-20 alongside. Anthropic-Version is added separately
-    // by the broker and is never forwarded from the guest.
-    if raw.eq_ignore_ascii_case("content-type") {
-        return Some(reqwest::header::CONTENT_TYPE);
-    }
-    if raw.eq_ignore_ascii_case("accept") {
-        return Some(reqwest::header::ACCEPT);
-    }
-    if raw.eq_ignore_ascii_case("user-agent") {
-        return Some(reqwest::header::USER_AGENT);
-    }
-    if auth_kind == VmHttpClaudeProxyAuthKind::OAuth && raw.eq_ignore_ascii_case("anthropic-beta") {
-        return Some(reqwest::header::HeaderName::from_static("anthropic-beta"));
-    }
-    None
-}
-
-fn claude_proxy_response_content_type(response: &reqwest::Response) -> &'static str {
-    let Some(content_type) = response
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-    else {
-        return "application/json";
-    };
-    match content_type.split(';').next().map(str::trim) {
-        Some(media_type) if media_type.eq_ignore_ascii_case("application/json") => {
-            "application/json"
-        }
-        Some(media_type) if media_type.eq_ignore_ascii_case("application/problem+json") => {
-            "application/problem+json"
-        }
-        Some(media_type) if media_type.eq_ignore_ascii_case("text/event-stream") => {
-            "text/event-stream"
-        }
-        Some(media_type) if media_type.eq_ignore_ascii_case("text/plain") => {
-            "text/plain; charset=utf-8"
-        }
-        Some(media_type) if media_type.eq_ignore_ascii_case("application/octet-stream") => {
-            "application/octet-stream"
-        }
-        _ => "application/json",
-    }
 }
 
 fn claude_proxy_response_headers(
@@ -690,7 +578,7 @@ fn claude_proxy_response_headers(
 ) -> Vec<VmHttpResponseHeader> {
     let mut out = Vec::new();
     for (name, value) in headers {
-        let Some(forward_name) = claude_proxy_response_header_name(name.as_str()) else {
+        let Some(forward_name) = ClaudeBackend::response_header_name(name.as_str()) else {
             continue;
         };
         let Ok(value) = value.to_str() else {
@@ -704,48 +592,13 @@ fn claude_proxy_response_headers(
     out
 }
 
-fn claude_proxy_response_header_name(raw: &str) -> Option<&'static str> {
-    if raw.eq_ignore_ascii_case("request-id") {
-        return Some("Request-Id");
-    }
-    if raw.eq_ignore_ascii_case("retry-after") {
-        return Some("Retry-After");
-    }
-    if raw.eq_ignore_ascii_case("anthropic-ratelimit-requests-limit") {
-        return Some("Anthropic-Ratelimit-Requests-Limit");
-    }
-    if raw.eq_ignore_ascii_case("anthropic-ratelimit-requests-remaining") {
-        return Some("Anthropic-Ratelimit-Requests-Remaining");
-    }
-    if raw.eq_ignore_ascii_case("anthropic-ratelimit-requests-reset") {
-        return Some("Anthropic-Ratelimit-Requests-Reset");
-    }
-    if raw.eq_ignore_ascii_case("anthropic-ratelimit-tokens-limit") {
-        return Some("Anthropic-Ratelimit-Tokens-Limit");
-    }
-    if raw.eq_ignore_ascii_case("anthropic-ratelimit-tokens-remaining") {
-        return Some("Anthropic-Ratelimit-Tokens-Remaining");
-    }
-    if raw.eq_ignore_ascii_case("anthropic-ratelimit-tokens-reset") {
-        return Some("Anthropic-Ratelimit-Tokens-Reset");
-    }
-    None
-}
-
-fn claude_proxy_request_wants_streaming(body: &[u8]) -> bool {
-    serde_json::from_slice::<serde_json::Value>(body)
-        .ok()
-        .and_then(|value| value.get("stream").and_then(serde_json::Value::as_bool))
-        .unwrap_or(false)
-}
-
 pub(super) async fn route_claude_proxy_request<S: SecretStore>(
     session: &VmHttpSession,
     request: &VmHttpRequest,
     body: Vec<u8>,
     service: &VmHttpClaudeProxyService<S>,
-) -> VmHttpDispatch<S> {
-    let route = classify_claude_proxy_target(&request.target)
+) -> VmHttpDispatch {
+    let route = ClaudeBackend::classify_proxy_target(&request.target)
         .expect("caller only routes classified Claude proxy targets");
     if route == ClaudeProxyAuditRoute::Unsupported {
         let response = VmHttpResponse::text(VmHttpStatus::NotFound, "not found");
@@ -821,7 +674,7 @@ pub(super) async fn route_claude_proxy_request<S: SecretStore>(
             .into();
     }
 
-    if claude_proxy_request_wants_streaming(&body) {
+    if proxy_request_wants_streaming(&body) {
         match service
             .fetch_stream(request_id, request, body, headers)
             .await
@@ -943,15 +796,15 @@ mod tests {
     #[test]
     fn classify_claude_proxy_target_recognizes_supported_routes() {
         assert_eq!(
-            classify_claude_proxy_target("/v1/messages"),
+            ClaudeBackend::classify_proxy_target("/v1/messages"),
             Some(ClaudeProxyAuditRoute::Messages),
         );
         assert_eq!(
-            classify_claude_proxy_target("/v1/messages/count_tokens"),
+            ClaudeBackend::classify_proxy_target("/v1/messages/count_tokens"),
             Some(ClaudeProxyAuditRoute::CountTokens),
         );
         assert_eq!(
-            classify_claude_proxy_target("/v1/models/claude-haiku-4-5-20251001"),
+            ClaudeBackend::classify_proxy_target("/v1/models/claude-haiku-4-5-20251001"),
             Some(ClaudeProxyAuditRoute::Models),
         );
     }
@@ -959,38 +812,38 @@ mod tests {
     #[test]
     fn classify_claude_proxy_target_treats_models_listing_and_empty_id_as_unsupported() {
         assert_eq!(
-            classify_claude_proxy_target("/v1/models"),
+            ClaudeBackend::classify_proxy_target("/v1/models"),
             Some(ClaudeProxyAuditRoute::Unsupported),
         );
         assert_eq!(
-            classify_claude_proxy_target("/v1/models/"),
+            ClaudeBackend::classify_proxy_target("/v1/models/"),
             Some(ClaudeProxyAuditRoute::Unsupported),
         );
         assert_eq!(
-            classify_claude_proxy_target("/v1/models/foo/bar"),
+            ClaudeBackend::classify_proxy_target("/v1/models/foo/bar"),
             Some(ClaudeProxyAuditRoute::Unsupported),
         );
     }
 
     #[test]
     fn classify_claude_proxy_target_rejects_unrelated_paths() {
-        assert_eq!(classify_claude_proxy_target("/v2/models/foo"), None);
-        assert_eq!(classify_claude_proxy_target("/health"), None);
-        assert_eq!(classify_claude_proxy_target(""), None);
+        assert_eq!(ClaudeBackend::classify_proxy_target("/v2/models/foo"), None);
+        assert_eq!(ClaudeBackend::classify_proxy_target("/health"), None);
+        assert_eq!(ClaudeBackend::classify_proxy_target(""), None);
     }
 
     #[test]
     fn classify_claude_proxy_target_strips_query_string() {
         assert_eq!(
-            classify_claude_proxy_target("/v1/messages?beta=true"),
+            ClaudeBackend::classify_proxy_target("/v1/messages?beta=true"),
             Some(ClaudeProxyAuditRoute::Messages),
         );
         assert_eq!(
-            classify_claude_proxy_target("/v1/messages/count_tokens?beta=true"),
+            ClaudeBackend::classify_proxy_target("/v1/messages/count_tokens?beta=true"),
             Some(ClaudeProxyAuditRoute::CountTokens),
         );
         assert_eq!(
-            classify_claude_proxy_target("/v1/models/claude-haiku-4-5-20251001?beta=true"),
+            ClaudeBackend::classify_proxy_target("/v1/models/claude-haiku-4-5-20251001?beta=true"),
             Some(ClaudeProxyAuditRoute::Models),
         );
     }
@@ -1636,7 +1489,7 @@ mod tests {
                 panic!("expected streaming response, got {response:?}")
             }
             VmHttpDispatch::OpenAiProxyStream(_) => {
-                panic!("expected Claude streaming response, got OpenAI streaming response")
+                panic!("Claude route produced an OpenAI stream")
             }
         };
         assert!(
@@ -1723,7 +1576,7 @@ mod tests {
                 panic!("expected streaming response, got {response:?}")
             }
             VmHttpDispatch::OpenAiProxyStream(_) => {
-                panic!("expected Claude streaming response, got OpenAI streaming response")
+                panic!("Claude route produced an OpenAI stream")
             }
         };
         let response =

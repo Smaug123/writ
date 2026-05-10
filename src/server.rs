@@ -33,7 +33,7 @@ use crate::secret::SecretStore;
 /// onto different tokio tasks can all reference the same audit log and
 /// minter config.
 pub struct BrokerState<S: SecretStore> {
-    pub audit: AuditLog,
+    pub audit: Arc<AuditLog>,
     pub minter: GitHubMinter<S>,
     pub policy: PolicyConfig,
 }
@@ -624,7 +624,7 @@ pub async fn run_with_agent_vm<S: SecretStore + Send + Sync + 'static>(
         let agent_vm = agent_vm.clone();
         tokio::spawn(async move {
             if let Err(e) = handle_connection(stream, state, agent_vm).await {
-                eprintln!("connection error: {e}");
+                tracing::warn!(error = %e, "broker connection handler error");
             }
         });
     }
@@ -690,7 +690,7 @@ mod tests {
             store,
         );
         Arc::new(BrokerState {
-            audit: AuditLog::open_in_memory().unwrap(),
+            audit: Arc::new(AuditLog::open_in_memory().unwrap()),
             minter,
             policy: PolicyConfig {
                 writable_repos: writable,
@@ -737,7 +737,7 @@ mod tests {
             store,
         );
         Arc::new(BrokerState {
-            audit: AuditLog::open_in_memory().unwrap(),
+            audit: Arc::new(AuditLog::open_in_memory().unwrap()),
             minter,
             policy: PolicyConfig {
                 writable_repos: Vec::new(),

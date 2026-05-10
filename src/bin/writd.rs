@@ -34,6 +34,7 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    writ::telemetry::init("info")?;
     let args = Args::parse();
 
     let config_path = args.config.unwrap_or_else(default_config_path);
@@ -80,27 +81,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let state = Arc::new(BrokerState {
-        audit,
+        audit: Arc::new(audit),
         minter: GitHubMinter::new_registry(github, store),
         policy,
     });
 
-    eprintln!("writd: listening on {}", socket_path.display());
+    tracing::info!(
+        socket_path = %socket_path.display(),
+        "broker listening",
+    );
     let agent_vm = agent_vm.map(|config| {
         let runtime = Arc::new(AgentVmDaemon::new(config));
-        eprintln!(
-            "writd: agent VM runtime configured for {} ports {}-{}",
-            runtime.config().vm_http().bind_addr(),
-            runtime.config().vm_http().broker_port_range().min().get(),
-            runtime.config().vm_http().broker_port_range().max().get()
+        let vm_http = runtime.config().vm_http();
+        tracing::info!(
+            bind_addr = %vm_http.bind_addr(),
+            broker_port_min = vm_http.broker_port_range().min().get(),
+            broker_port_max = vm_http.broker_port_range().max().get(),
+            "agent VM runtime configured",
         );
         runtime
     });
     if let Some(agent_vm) = &agent_vm {
-        eprintln!(
-            "writd: agent VM subnet indexes {}-{}",
-            agent_vm.config().lifecycle().subnet_index_min(),
-            agent_vm.config().lifecycle().subnet_index_max()
+        let lifecycle = agent_vm.config().lifecycle();
+        tracing::info!(
+            subnet_index_min = lifecycle.subnet_index_min(),
+            subnet_index_max = lifecycle.subnet_index_max(),
+            "agent VM subnet range",
         );
     }
     run_with_agent_vm(&socket_path, state, agent_vm).await?;
