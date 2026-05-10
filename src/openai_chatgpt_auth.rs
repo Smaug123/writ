@@ -504,8 +504,9 @@ impl ChatgptOauthAuthority {
         let now = self.config.clock.now_rfc3339();
         apply_refresh_response(bundle, &parsed, now)
             .map_err(|err| ChatgptOauthError::BundleMalformed(err.to_string()))?;
-        let serialized = serde_json::to_string(&*bundle)
-            .map_err(|err| ChatgptOauthError::BundleMalformed(err.to_string()))?;
+        let serialized = serde_json::to_string(&*bundle).map_err(|_| {
+            ChatgptOauthError::BundleMalformed("failed to serialize refreshed bundle".into())
+        })?;
         secret_store.put(&self.config.secret_key, &serialized)?;
         Ok(())
     }
@@ -544,8 +545,16 @@ fn load_bundle_from_secret_store<S: SecretStore + ?Sized>(
     let raw = secret_store
         .get(secret_key)?
         .ok_or(ChatgptOauthError::LoginRequired)?;
-    let bundle: ChatgptAuthBundle = serde_json::from_str(&raw)
-        .map_err(|err| ChatgptOauthError::BundleMalformed(err.to_string()))?;
+    let bundle: ChatgptAuthBundle = serde_json::from_str(&raw).map_err(|err| {
+        // serde_json's Display includes the offending input fragment for some
+        // failures (e.g. "unknown variant `<value>`"), and the bundle holds
+        // tokens — surface only the position so logs cannot leak fragments.
+        ChatgptOauthError::BundleMalformed(format!(
+            "invalid JSON at line {} column {}",
+            err.line(),
+            err.column()
+        ))
+    })?;
     if bundle.tokens.is_none() {
         return Err(ChatgptOauthError::BundleMalformed("missing tokens".into()));
     }

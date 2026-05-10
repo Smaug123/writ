@@ -124,7 +124,10 @@ fn debug_redacts_tokens_and_api_key() {
     assert!(!rendered.contains("very-secret-refresh"), "{rendered}");
     assert!(!rendered.contains("sk-very-secret-api-key"), "{rendered}");
     let tokens = bundle.tokens.as_ref().unwrap();
-    assert!(!rendered.contains(tokens.access_token.as_str()), "{rendered}");
+    assert!(
+        !rendered.contains(tokens.access_token.as_str()),
+        "{rendered}"
+    );
     assert!(!rendered.contains(tokens.id_token.as_str()), "{rendered}");
     assert!(rendered.contains("<redacted>"), "{rendered}");
     // Non-secret fields are still visible so debug output stays useful.
