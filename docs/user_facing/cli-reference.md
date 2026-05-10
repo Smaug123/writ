@@ -43,7 +43,7 @@ Opens a session and prints its UUID to stdout.
 | Flag      | Description                                                                                       |
 | --------- | ------------------------------------------------------------------------------------------------- |
 | `--label` | Free-form description shown in the audit log. Use it: `--label "fixing bug 42"`. Optional.        |
-| `--agent` | Selects which configured GitHub App is used when `github_apps` is configured. Optional for legacy `github` config. |
+| `--agent` | Selects which configured GitHub App is used. Required: must be `claude` or `codex`, and the value must match a key in `github_apps`. |
 | `--model` | Agent/model identifier shown in the audit log, e.g. `claude-opus-4-7`. Optional.                  |
 
 `--label` and `--model` are stored verbatim and ignored by policy.

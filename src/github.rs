@@ -80,67 +80,41 @@ pub struct GitHubAppConfig {
     pub api_base: String,
 }
 
-/// GitHub App configuration available to a broker.
-///
-/// `legacy_app` preserves the original single-App deployment model. When
-/// `agent_apps` is populated, the broker selects the App by the session-level
-/// [`AgentKind`] instead.
-#[derive(Clone, Debug)]
+/// GitHub App configuration available to a broker. The map is non-empty by
+/// construction — every session must select an App keyed by its
+/// [`AgentKind`].
+#[derive(Clone, Debug, Deserialize)]
+#[serde(try_from = "BTreeMap<AgentKind, GitHubAppConfig>")]
 pub struct GitHubAppRegistryConfig {
-    legacy_app: Option<GitHubAppConfig>,
     agent_apps: BTreeMap<AgentKind, GitHubAppConfig>,
+}
+
+impl TryFrom<BTreeMap<AgentKind, GitHubAppConfig>> for GitHubAppRegistryConfig {
+    type Error = GitHubAppRegistryConfigError;
+
+    fn try_from(agent_apps: BTreeMap<AgentKind, GitHubAppConfig>) -> Result<Self, Self::Error> {
+        Self::new(agent_apps)
+    }
 }
 
 #[derive(Debug, Error, Eq, PartialEq)]
 pub enum GitHubAppRegistryConfigError {
-    #[error("configure either legacy github or github_apps, not both")]
-    Ambiguous,
     #[error("at least one GitHub App must be configured")]
     Empty,
 }
 
 impl GitHubAppRegistryConfig {
-    pub fn legacy(config: GitHubAppConfig) -> Self {
-        Self {
-            legacy_app: Some(config),
-            agent_apps: BTreeMap::new(),
-        }
-    }
-
-    pub fn for_agent_apps(
+    pub fn new(
         agent_apps: BTreeMap<AgentKind, GitHubAppConfig>,
     ) -> Result<Self, GitHubAppRegistryConfigError> {
         if agent_apps.is_empty() {
             return Err(GitHubAppRegistryConfigError::Empty);
         }
-        Ok(Self {
-            legacy_app: None,
-            agent_apps,
-        })
-    }
-
-    pub fn from_parts(
-        legacy_app: Option<GitHubAppConfig>,
-        agent_apps: BTreeMap<AgentKind, GitHubAppConfig>,
-    ) -> Result<Self, GitHubAppRegistryConfigError> {
-        match (legacy_app, agent_apps.is_empty()) {
-            (Some(_), false) => Err(GitHubAppRegistryConfigError::Ambiguous),
-            (None, true) => Err(GitHubAppRegistryConfigError::Empty),
-            (Some(legacy_app), true) => Ok(Self::legacy(legacy_app)),
-            (None, false) => Self::for_agent_apps(agent_apps),
-        }
-    }
-
-    pub fn legacy_app(&self) -> Option<&GitHubAppConfig> {
-        self.legacy_app.as_ref()
+        Ok(Self { agent_apps })
     }
 
     pub fn agent_apps(&self) -> &BTreeMap<AgentKind, GitHubAppConfig> {
         &self.agent_apps
-    }
-
-    pub fn requires_agent_kind(&self) -> bool {
-        self.legacy_app.is_none()
     }
 }
 
@@ -228,11 +202,12 @@ impl MintedToken {
     }
 }
 
-/// Mints installation tokens for one `GitHubAppConfig` using long-lived
-/// private-key material loaded lazily from a `SecretStore` on each mint.
-pub struct GitHubMinter<S: SecretStore> {
+/// Mints installation tokens for the configured GitHub Apps. The
+/// long-lived private-key material is held by the broker's secret
+/// store and passed in on each mint, so the minter itself is
+/// stateless apart from the App registry and the HTTP client.
+pub struct GitHubMinter {
     config: GitHubAppRegistryConfig,
-    secrets: S,
     http: reqwest::Client,
 }
 
@@ -245,55 +220,34 @@ const GITHUB_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 /// can't eat the full per-request budget before the body even starts.
 const GITHUB_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-impl<S: SecretStore> GitHubMinter<S> {
-    pub fn new(config: GitHubAppConfig, secrets: S) -> Self {
-        Self::new_registry(GitHubAppRegistryConfig::legacy(config), secrets)
-    }
-
-    pub fn new_registry(config: GitHubAppRegistryConfig, secrets: S) -> Self {
+impl GitHubMinter {
+    pub fn new_registry(config: GitHubAppRegistryConfig) -> Self {
         let http = reqwest::Client::builder()
             .user_agent("writ/0.1")
             .timeout(GITHUB_REQUEST_TIMEOUT)
             .connect_timeout(GITHUB_CONNECT_TIMEOUT)
             .build()
             .expect("reqwest client constructs with default config");
-        Self {
-            config,
-            secrets,
-            http,
-        }
-    }
-
-    pub fn requires_agent_kind(&self) -> bool {
-        self.config.requires_agent_kind()
-    }
-
-    pub(crate) fn secret_store(&self) -> &S {
-        &self.secrets
+        Self { config, http }
     }
 
     /// Mint using the GitHub App selected by the session-level agent kind.
-    ///
-    /// In legacy single-App mode the one configured App is used for all
-    /// sessions. In agent-registry mode, `agent_kind` must be present and must
-    /// have a matching configured App.
+    /// `agent_kind` must be present and must have a matching configured App.
     pub async fn mint_for_agent(
         &self,
+        secrets: &dyn SecretStore,
         agent_kind: Option<AgentKind>,
         scope: GitHubGrantedScope,
         ttl: TtlSeconds,
     ) -> Result<MintedToken, MintError> {
         let config = self.config_for_agent(agent_kind)?;
-        self.mint_with_config(config, scope, ttl).await
+        self.mint_with_config(secrets, config, scope, ttl).await
     }
 
     fn config_for_agent(
         &self,
         agent_kind: Option<AgentKind>,
     ) -> Result<&GitHubAppConfig, MintError> {
-        if let Some(legacy) = self.config.legacy_app() {
-            return Ok(legacy);
-        }
         let kind = agent_kind.ok_or(MintError::MissingAgentKind)?;
         self.config
             .agent_apps()
@@ -303,6 +257,7 @@ impl<S: SecretStore> GitHubMinter<S> {
 
     async fn mint_with_config(
         &self,
+        secrets: &dyn SecretStore,
         config: &GitHubAppConfig,
         scope: GitHubGrantedScope,
         ttl: TtlSeconds,
@@ -329,8 +284,7 @@ impl<S: SecretStore> GitHubMinter<S> {
             });
         }
 
-        let pem = self
-            .secrets
+        let pem = secrets
             .get(&config.private_key_secret)?
             .ok_or_else(|| MintError::PrivateKeyMissing(config.private_key_secret.clone()))?;
 
@@ -731,18 +685,20 @@ mod tests {
         }
     }
 
-    fn minter_with_key(server: &MockServer) -> GitHubMinter<InMemStore> {
+    fn minter_with_key(server: &MockServer) -> (GitHubMinter, InMemStore) {
         minter_with_owner(server, "o")
     }
 
     fn minter_with_owner(
         server: &MockServer,
         installation_owner: &str,
-    ) -> GitHubMinter<InMemStore> {
+    ) -> (GitHubMinter, InMemStore) {
         let pk = SecretKey::new("gh-app-pk").unwrap();
         let store = InMemStore::default();
         store.put(&pk, TEST_PRIV_1).unwrap();
-        GitHubMinter::new(
+        let mut apps = BTreeMap::new();
+        apps.insert(
+            AgentKind::Claude,
             GitHubAppConfig {
                 app_id: 42,
                 installation_id: 999,
@@ -750,8 +706,9 @@ mod tests {
                 private_key_secret: pk,
                 api_base: server.uri(),
             },
-            store,
-        )
+        );
+        let minter = GitHubMinter::new_registry(GitHubAppRegistryConfig::new(apps).unwrap());
+        (minter, store)
     }
 
     #[test]
@@ -815,9 +772,14 @@ mod tests {
             .mount(&server)
             .await;
 
-        let minter = minter_with_key(&server);
+        let (minter, store) = minter_with_key(&server);
         let minted = minter
-            .mint_for_agent(None, write_scope("o", "n"), TtlSeconds::new(3600).unwrap())
+            .mint_for_agent(
+                &store,
+                Some(AgentKind::Claude),
+                write_scope("o", "n"),
+                TtlSeconds::new(3600).unwrap(),
+            )
             .await
             .expect("mint ok");
 
@@ -839,10 +801,11 @@ mod tests {
             .mount(&server)
             .await;
 
-        let minter = minter_with_key(&server);
+        let (minter, store) = minter_with_key(&server);
         match minter
             .mint_for_agent(
-                None,
+                &store,
+                Some(AgentKind::Claude),
                 write_scope("o", "nope"),
                 TtlSeconds::new(3600).unwrap(),
             )
@@ -862,7 +825,9 @@ mod tests {
     #[tokio::test]
     async fn mint_fails_cleanly_when_private_key_missing() {
         let server = MockServer::start().await;
-        let minter = GitHubMinter::new(
+        let mut apps = BTreeMap::new();
+        apps.insert(
+            AgentKind::Claude,
             GitHubAppConfig {
                 app_id: 1,
                 installation_id: 1,
@@ -870,10 +835,16 @@ mod tests {
                 private_key_secret: SecretKey::new("absent").unwrap(),
                 api_base: server.uri(),
             },
-            InMemStore::default(),
         );
+        let minter = GitHubMinter::new_registry(GitHubAppRegistryConfig::new(apps).unwrap());
+        let store = InMemStore::default();
         match minter
-            .mint_for_agent(None, write_scope("o", "n"), TtlSeconds::new(3600).unwrap())
+            .mint_for_agent(
+                &store,
+                Some(AgentKind::Claude),
+                write_scope("o", "n"),
+                TtlSeconds::new(3600).unwrap(),
+            )
             .await
         {
             Err(MintError::PrivateKeyMissing(k)) => assert_eq!(k.as_str(), "absent"),
@@ -916,9 +887,14 @@ mod tests {
             .mount(&server)
             .await;
 
-        let minter = minter_with_key(&server);
+        let (minter, store) = minter_with_key(&server);
         let err = minter
-            .mint_for_agent(None, write_scope("o", "n"), TtlSeconds::new(3600).unwrap())
+            .mint_for_agent(
+                &store,
+                Some(AgentKind::Claude),
+                write_scope("o", "n"),
+                TtlSeconds::new(3600).unwrap(),
+            )
             .await
             .expect_err("should reject past expiry");
         assert!(
@@ -939,9 +915,14 @@ mod tests {
             .mount(&server)
             .await;
 
-        let minter = minter_with_key(&server);
+        let (minter, store) = minter_with_key(&server);
         match minter
-            .mint_for_agent(None, write_scope("o", "n"), TtlSeconds::new(300).unwrap())
+            .mint_for_agent(
+                &store,
+                Some(AgentKind::Claude),
+                write_scope("o", "n"),
+                TtlSeconds::new(300).unwrap(),
+            )
             .await
         {
             Err(MintError::TtlExceeded {
@@ -968,9 +949,14 @@ mod tests {
             .mount(&server)
             .await;
 
-        let minter = minter_with_key(&server);
+        let (minter, store) = minter_with_key(&server);
         let minted = minter
-            .mint_for_agent(None, write_scope("o", "n"), TtlSeconds::new(3600).unwrap())
+            .mint_for_agent(
+                &store,
+                Some(AgentKind::Claude),
+                write_scope("o", "n"),
+                TtlSeconds::new(3600).unwrap(),
+            )
             .await
             .expect("mint within skew tolerance should succeed");
         assert!(minted.expires_at().as_millis() > minted.issued_at().as_millis());
@@ -988,9 +974,14 @@ mod tests {
             .mount(&server)
             .await;
 
-        let minter = minter_with_key(&server);
+        let (minter, store) = minter_with_key(&server);
         let err = minter
-            .mint_for_agent(None, write_scope("o", "n"), TtlSeconds::new(3600).unwrap())
+            .mint_for_agent(
+                &store,
+                Some(AgentKind::Claude),
+                write_scope("o", "n"),
+                TtlSeconds::new(3600).unwrap(),
+            )
             .await
             .expect_err("should reject past-skew expiry");
         assert!(matches!(err, MintError::TtlExceeded { .. }), "got: {err:?}");
@@ -1009,10 +1000,15 @@ mod tests {
             .mount(&server)
             .await;
 
-        let minter = minter_with_key(&server);
+        let (minter, store) = minter_with_key(&server);
         let before = UnixMillis::now().as_millis();
         let minted = minter
-            .mint_for_agent(None, write_scope("o", "n"), TtlSeconds::new(3600).unwrap())
+            .mint_for_agent(
+                &store,
+                Some(AgentKind::Claude),
+                write_scope("o", "n"),
+                TtlSeconds::new(3600).unwrap(),
+            )
             .await
             .unwrap();
         let after = UnixMillis::now().as_millis();
@@ -1039,11 +1035,12 @@ mod tests {
             .mount(&server)
             .await;
 
-        let minter = minter_with_key(&server);
+        let (minter, store) = minter_with_key(&server);
         let requested_scope = write_scope("o", "n");
         let minted = minter
             .mint_for_agent(
-                None,
+                &store,
+                Some(AgentKind::Claude),
                 requested_scope.clone(),
                 TtlSeconds::new(3600).unwrap(),
             )
@@ -1130,9 +1127,14 @@ mod tests {
             .mount(&server)
             .await;
 
-        let minter = minter_with_key(&server);
+        let (minter, store) = minter_with_key(&server);
         let err = minter
-            .mint_for_agent(None, write_scope("o", "n"), TtlSeconds::new(3600).unwrap())
+            .mint_for_agent(
+                &store,
+                Some(AgentKind::Claude),
+                write_scope("o", "n"),
+                TtlSeconds::new(3600).unwrap(),
+            )
             .await
             .expect_err("empty token should be rejected");
         assert!(matches!(err, MintError::EmptyToken), "got: {err:?}");
@@ -1148,10 +1150,11 @@ mod tests {
         // Do not mount the mint endpoint: if the minter ever reaches it,
         // wiremock returns 404 and the test will fail loudly on the wrong
         // error variant.
-        let minter = minter_with_owner(&server, "o");
+        let (minter, store) = minter_with_owner(&server, "o");
         let err = minter
             .mint_for_agent(
-                None,
+                &store,
+                Some(AgentKind::Claude),
                 write_scope("someone-else", "n"),
                 TtlSeconds::new(3600).unwrap(),
             )
@@ -1188,9 +1191,14 @@ mod tests {
             .mount(&server)
             .await;
 
-        let minter = minter_with_key(&server);
+        let (minter, store) = minter_with_key(&server);
         let err = minter
-            .mint_for_agent(None, write_scope("o", "n"), TtlSeconds::new(3600).unwrap())
+            .mint_for_agent(
+                &store,
+                Some(AgentKind::Claude),
+                write_scope("o", "n"),
+                TtlSeconds::new(3600).unwrap(),
+            )
             .await
             .expect_err("divergent repositories must be rejected");
         match err {
@@ -1227,9 +1235,14 @@ mod tests {
             .mount(&server)
             .await;
 
-        let minter = minter_with_key(&server);
+        let (minter, store) = minter_with_key(&server);
         let err = minter
-            .mint_for_agent(None, write_scope("o", "n"), TtlSeconds::new(3600).unwrap())
+            .mint_for_agent(
+                &store,
+                Some(AgentKind::Claude),
+                write_scope("o", "n"),
+                TtlSeconds::new(3600).unwrap(),
+            )
             .await
             .expect_err("superset of requested repos must be rejected");
         match err {
@@ -1265,9 +1278,14 @@ mod tests {
             .mount(&server)
             .await;
 
-        let minter = minter_with_key(&server);
+        let (minter, store) = minter_with_key(&server);
         let err = minter
-            .mint_for_agent(None, write_scope("o", "n"), TtlSeconds::new(3600).unwrap())
+            .mint_for_agent(
+                &store,
+                Some(AgentKind::Claude),
+                write_scope("o", "n"),
+                TtlSeconds::new(3600).unwrap(),
+            )
             .await
             .expect_err("narrowed permissions must be rejected");
         assert!(
@@ -1295,10 +1313,11 @@ mod tests {
             .mount(&server)
             .await;
 
-        let minter = minter_with_owner(&server, "smaug123");
+        let (minter, store) = minter_with_owner(&server, "smaug123");
         minter
             .mint_for_agent(
-                None,
+                &store,
+                Some(AgentKind::Claude),
                 write_scope("Smaug123", "n"),
                 TtlSeconds::new(3600).unwrap(),
             )
@@ -1326,10 +1345,11 @@ mod tests {
             .mount(&server)
             .await;
 
-        let minter = minter_with_owner(&server, "smaug123");
+        let (minter, store) = minter_with_owner(&server, "smaug123");
         minter
             .mint_for_agent(
-                None,
+                &store,
+                Some(AgentKind::Claude),
                 write_scope("smaug123", "writ"),
                 TtlSeconds::new(3600).unwrap(),
             )
@@ -1364,9 +1384,14 @@ mod tests {
             .mount(&server)
             .await;
 
-        let minter = minter_with_key(&server);
+        let (minter, store) = minter_with_key(&server);
         let err = minter
-            .mint_for_agent(None, write_scope("o", "n"), TtlSeconds::new(3600).unwrap())
+            .mint_for_agent(
+                &store,
+                Some(AgentKind::Claude),
+                write_scope("o", "n"),
+                TtlSeconds::new(3600).unwrap(),
+            )
             .await
             .expect_err("unknown permission in response must not be silently accepted");
         // reqwest wraps serde_json failures as a generic Http error.
@@ -1395,9 +1420,14 @@ mod tests {
             .mount(&server)
             .await;
 
-        let minter = minter_with_key(&server);
+        let (minter, store) = minter_with_key(&server);
         let err = minter
-            .mint_for_agent(None, write_scope("o", "n"), TtlSeconds::new(3600).unwrap())
+            .mint_for_agent(
+                &store,
+                Some(AgentKind::Claude),
+                write_scope("o", "n"),
+                TtlSeconds::new(3600).unwrap(),
+            )
             .await
             .expect_err("all-repos token must be rejected");
         match err {
@@ -1425,9 +1455,14 @@ mod tests {
             .mount(&server)
             .await;
 
-        let minter = minter_with_key(&server);
+        let (minter, store) = minter_with_key(&server);
         let minted = minter
-            .mint_for_agent(None, write_scope("o", "n"), TtlSeconds::new(3600).unwrap())
+            .mint_for_agent(
+                &store,
+                Some(AgentKind::Claude),
+                write_scope("o", "n"),
+                TtlSeconds::new(3600).unwrap(),
+            )
             .await
             .unwrap();
 
