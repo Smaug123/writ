@@ -37,6 +37,10 @@ ip -6 route show default 2>&1"#;
 
 const GUEST_IPV6_PROBE_UNAVAILABLE_MARKER: &str = "writ-ip-command-missing";
 const GUEST_IPV6_PROBE_ATTEMPTS: usize = 40;
+const _: () = assert!(
+    GUEST_IPV6_PROBE_ATTEMPTS > 0,
+    "wait_for_guest_ipv6_inspection requires at least one attempt"
+);
 const GUEST_IPV6_PROBE_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
 // Apple Container removals can lag command return briefly. Keep the
 // postcondition wait bounded: after three seconds, report that cleanup could
@@ -2496,9 +2500,8 @@ fn wait_for_guest_ipv6_inspection(
     plan: &AgentVmSessionPlan,
 ) -> Result<GuestIpv6Inspection, StartFailure> {
     let invocation = plan.probe_guest_ipv6_invocation();
-    let mut last_error = None;
     for attempt in 0..GUEST_IPV6_PROBE_ATTEMPTS {
-        match invocation.output() {
+        let err = match invocation.output() {
             Ok(output) if output.status.success() => {
                 return Ok(GuestIpv6Inspection::parse(&String::from_utf8_lossy(
                     &output.stdout,
@@ -2511,16 +2514,15 @@ fn wait_for_guest_ipv6_inspection(
             {
                 return Err(GuestIpv6InspectionError::ProbeToolUnavailable.into());
             }
-            Ok(output) => last_error = Some(invocation.failed_from_output(output)),
-            Err(err) => last_error = Some(err),
+            Ok(output) => invocation.failed_from_output(output),
+            Err(err) => err,
+        };
+        if attempt + 1 == GUEST_IPV6_PROBE_ATTEMPTS {
+            return Err(err.into());
         }
-        if attempt + 1 < GUEST_IPV6_PROBE_ATTEMPTS {
-            std::thread::sleep(GUEST_IPV6_PROBE_DELAY);
-        }
+        std::thread::sleep(GUEST_IPV6_PROBE_DELAY);
     }
-    Err(last_error
-        .expect("guest IPv6 probe attempts must record their last error")
-        .into())
+    unreachable!("GUEST_IPV6_PROBE_ATTEMPTS > 0 ensures the loop body always returns")
 }
 
 fn require_field(raw: &str, key: &'static str) -> Result<String, NetworkInspectionError> {
