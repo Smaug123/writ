@@ -1640,6 +1640,7 @@ mod tests {
                 writable_repos: vec![],
                 default_ttl: TtlSeconds::new(3600).unwrap(),
             },
+            staging_store: None,
         })
     }
 

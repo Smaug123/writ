@@ -21,8 +21,12 @@ use std::path::{Path, PathBuf};
 use clap::{Parser, Subcommand, ValueEnum};
 
 use writ::agent_run::AgentPrompt;
-use writ::core::{AgentKind, CapabilityRequest, GitHubAccess, GitHubRequest, RepoRef, SessionId};
-use writ::protocol::{AgentVmSessionInfo, ClientMessage, ServerMessage};
+use writ::core::{
+    AgentKind, CapabilityRequest, GitHubAccess, GitHubRequest, RepoRef, RequestId, SessionId,
+};
+use writ::protocol::{
+    AgentVmSessionInfo, ClientMessage, ServerMessage, StagedPushDetail, StagedPushSummary,
+};
 use writ::server::default_socket_path;
 use writ::vm_git::{AgentVmWorkspaceBootstrap, GitCloneRepo, WorkspaceWarmMode};
 
@@ -69,6 +73,19 @@ enum Cmd {
         #[command(subcommand)]
         action: AgentCmd,
     },
+    /// Inspect VM-staged git pushes awaiting promotion review.
+    Promote {
+        #[command(subcommand)]
+        action: PromoteCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum PromoteCmd {
+    /// List every staged push the broker is holding for review.
+    List,
+    /// Show the full detail of one staged push, including its audit context.
+    Show { request_id: String },
 }
 
 #[derive(Subcommand)]
@@ -304,6 +321,39 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 )?;
             }
         },
+        Cmd::Promote { action } => match action {
+            PromoteCmd::List => {
+                let msg = ClientMessage::ListStagedPushes {};
+                match call(&socket_path, &msg)? {
+                    ServerMessage::StagedPushes { mut pushes } => {
+                        // Disk iteration order is unspecified; sort here so the
+                        // CLI output is deterministic and oldest-first.
+                        pushes.sort_by_key(|p| p.staged_at);
+                        let mut out = std::io::stdout().lock();
+                        write_staged_push_summaries(&mut out, &pushes)?;
+                    }
+                    ServerMessage::Error { message } => return Err(message.into()),
+                    other => return Err(format!("unexpected response: {other:?}").into()),
+                }
+            }
+            PromoteCmd::Show { request_id } => {
+                let id: RequestId = request_id
+                    .parse()
+                    .map_err(|e| format!("invalid request ID: {e}"))?;
+                let msg = ClientMessage::ShowStagedPush { request_id: id };
+                match call(&socket_path, &msg)? {
+                    ServerMessage::StagedPush { push } => {
+                        let mut out = std::io::stdout().lock();
+                        write_staged_push_detail(&mut out, &push)?;
+                    }
+                    ServerMessage::UnknownStagedPush { request_id } => {
+                        return Err(format!("no staged push with id {request_id}").into());
+                    }
+                    ServerMessage::Error { message } => return Err(message.into()),
+                    other => return Err(format!("unexpected response: {other:?}").into()),
+                }
+            }
+        },
     }
     Ok(())
 }
@@ -457,6 +507,44 @@ fn build_capability(backend: BackendCmd) -> Result<CapabilityRequest, Box<dyn st
         GithubCmd::Metadata { .. } => GitHubRequest::Metadata { repo },
     };
     Ok(CapabilityRequest::GitHub(github_req))
+}
+
+fn write_staged_push_summaries(
+    out: &mut dyn Write,
+    pushes: &[StagedPushSummary],
+) -> std::io::Result<()> {
+    for (index, push) in pushes.iter().enumerate() {
+        if index > 0 {
+            writeln!(out)?;
+        }
+        writeln!(out, "push_request_id={}", push.push_request_id)?;
+        writeln!(out, "repo={}", push.repo)?;
+        writeln!(out, "branch={}", push.branch.as_str())?;
+        // `expected_remote_head` absent is the "branch creation" signal —
+        // surface it explicitly rather than silently omitting the line so
+        // operators don't mistake a missing field for a missing OID.
+        match &push.expected_remote_head {
+            Some(oid) => writeln!(out, "expected_remote_head={}", oid.as_str())?,
+            None => writeln!(out, "expected_remote_head=<branch_creation>")?,
+        }
+        writeln!(out, "new_head={}", push.new_head.as_str())?;
+        writeln!(out, "staged_at={}", push.staged_at.as_millis())?;
+    }
+    Ok(())
+}
+
+fn write_staged_push_detail(out: &mut dyn Write, push: &StagedPushDetail) -> std::io::Result<()> {
+    write_staged_push_summaries(out, std::slice::from_ref(&push.summary))?;
+    writeln!(out, "bundle_bytes={}", push.bundle_bytes)?;
+    writeln!(out, "session_id={}", push.audit.session_id)?;
+    writeln!(out, "received_at={}", push.audit.received_at.as_millis())?;
+    match push.audit.result {
+        Some(result) => writeln!(out, "audit_result={}", result.as_str())?,
+        // `<none>` matches the staged-vs-unknown distinction in the wire
+        // protocol: an audit row exists but no outcome has been recorded.
+        None => writeln!(out, "audit_result=<none>")?,
+    }
+    Ok(())
 }
 
 fn write_agent_vm_sessions(
@@ -761,5 +849,141 @@ mod tests {
 
         assert!(!debug.contains("SECRET prompt"), "{debug}");
         assert!(debug.contains("<redacted>"), "{debug}");
+    }
+
+    fn staged_summary_fixture(
+        request_id: RequestId,
+        branch: &str,
+        expected_remote_head: Option<&str>,
+        new_head: &str,
+        staged_at_ms: i64,
+    ) -> StagedPushSummary {
+        StagedPushSummary {
+            push_request_id: request_id,
+            repo: "owner/repo".parse().unwrap(),
+            branch: branch.parse().unwrap(),
+            expected_remote_head: expected_remote_head.map(|s| s.parse().unwrap()),
+            new_head: new_head.parse().unwrap(),
+            staged_at: writ::core::UnixMillis::from_millis(staged_at_ms),
+        }
+    }
+
+    #[test]
+    fn staged_push_list_output_is_key_value_separated_by_blank_lines() {
+        let id_a: RequestId = "11111111-1111-1111-1111-111111111111".parse().unwrap();
+        let id_b: RequestId = "22222222-2222-2222-2222-222222222222".parse().unwrap();
+        let pushes = vec![
+            staged_summary_fixture(
+                id_a,
+                "feature/x",
+                Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                1_700_000_001_000,
+            ),
+            staged_summary_fixture(
+                id_b,
+                "feature/y",
+                None,
+                "cccccccccccccccccccccccccccccccccccccccc",
+                1_700_000_002_000,
+            ),
+        ];
+        let mut out = Vec::new();
+
+        write_staged_push_summaries(&mut out, &pushes).unwrap();
+
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            concat!(
+                "push_request_id=11111111-1111-1111-1111-111111111111\n",
+                "repo=owner/repo\n",
+                "branch=feature/x\n",
+                "expected_remote_head=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
+                "new_head=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n",
+                "staged_at=1700000001000\n",
+                "\n",
+                "push_request_id=22222222-2222-2222-2222-222222222222\n",
+                "repo=owner/repo\n",
+                "branch=feature/y\n",
+                "expected_remote_head=<branch_creation>\n",
+                "new_head=cccccccccccccccccccccccccccccccccccccccc\n",
+                "staged_at=1700000002000\n",
+            )
+        );
+    }
+
+    #[test]
+    fn staged_push_detail_output_appends_bundle_and_audit_fields() {
+        let request_id: RequestId = "33333333-3333-3333-3333-333333333333".parse().unwrap();
+        let session_id: SessionId = "44444444-4444-4444-4444-444444444444".parse().unwrap();
+        let summary = staged_summary_fixture(
+            request_id,
+            "main",
+            Some("dddddddddddddddddddddddddddddddddddddddd"),
+            "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            1_700_000_500_000,
+        );
+        let detail = StagedPushDetail {
+            summary,
+            bundle_bytes: 4096,
+            audit: writ::protocol::StagedPushAuditView {
+                session_id,
+                received_at: writ::core::UnixMillis::from_millis(1_700_000_500_250),
+                result: Some(writ::audit::GitPushOutcomeResult::Staged),
+            },
+        };
+        let mut out = Vec::new();
+
+        write_staged_push_detail(&mut out, &detail).unwrap();
+
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            concat!(
+                "push_request_id=33333333-3333-3333-3333-333333333333\n",
+                "repo=owner/repo\n",
+                "branch=main\n",
+                "expected_remote_head=dddddddddddddddddddddddddddddddddddddddd\n",
+                "new_head=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\n",
+                "staged_at=1700000500000\n",
+                "bundle_bytes=4096\n",
+                "session_id=44444444-4444-4444-4444-444444444444\n",
+                "received_at=1700000500250\n",
+                "audit_result=staged\n",
+            )
+        );
+    }
+
+    /// An audit row that exists without an outcome row prints as
+    /// `<none>` rather than being suppressed: an operator triaging a
+    /// stuck staged push wants to see the missing outcome explicitly.
+    #[test]
+    fn staged_push_detail_output_renders_missing_audit_outcome_as_none() {
+        let request_id: RequestId = "55555555-5555-5555-5555-555555555555".parse().unwrap();
+        let session_id: SessionId = "66666666-6666-6666-6666-666666666666".parse().unwrap();
+        let detail = StagedPushDetail {
+            summary: staged_summary_fixture(
+                request_id,
+                "main",
+                None,
+                "ffffffffffffffffffffffffffffffffffffffff",
+                1,
+            ),
+            bundle_bytes: 0,
+            audit: writ::protocol::StagedPushAuditView {
+                session_id,
+                received_at: writ::core::UnixMillis::from_millis(2),
+                result: None,
+            },
+        };
+        let mut out = Vec::new();
+
+        write_staged_push_detail(&mut out, &detail).unwrap();
+
+        let rendered = String::from_utf8(out).unwrap();
+        assert!(rendered.contains("audit_result=<none>\n"), "{rendered}");
+        assert!(
+            rendered.contains("expected_remote_head=<branch_creation>\n"),
+            "{rendered}",
+        );
     }
 }

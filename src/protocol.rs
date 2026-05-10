@@ -14,8 +14,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::agent_run::{AgentPrompt, AgentRunId};
 use crate::agent_vm_lifecycle::AgentVmSessionStateStatus;
-use crate::core::{AgentKind, CapabilityRequest, SessionId, UnixMillis};
-use crate::vm_git::AgentVmWorkspaceBootstrap;
+use crate::audit::GitPushOutcomeResult;
+use crate::core::{AgentKind, CapabilityRequest, RequestId, SessionId, UnixMillis};
+use crate::vm_git::{
+    AgentVmWorkspaceBootstrap, GitBranchName, GitCloneRepo, GitObjectId, VmGitPushStagedReceipt,
+};
 
 /// A persisted daemon-managed agent VM session as reported by
 /// [`ServerMessage::AgentVmSessions`].
@@ -28,6 +31,59 @@ pub struct AgentVmSessionInfo {
     pub network_name: String,
     pub broker_urls: Vec<String>,
     pub runtime_attached: bool,
+}
+
+/// One row of [`ServerMessage::StagedPushes`]: the metadata an operator
+/// needs to triage staged pushes without loading bundle bytes.
+///
+/// Fields mirror [`VmGitPushStagedReceipt`] one-for-one; no audit data is
+/// joined here so that listing remains a single staging-store read. Use
+/// [`ClientMessage::ShowStagedPush`] for the joined view.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct StagedPushSummary {
+    pub push_request_id: RequestId,
+    pub repo: GitCloneRepo,
+    pub branch: GitBranchName,
+    pub expected_remote_head: Option<GitObjectId>,
+    pub new_head: GitObjectId,
+    pub staged_at: UnixMillis,
+}
+
+impl StagedPushSummary {
+    pub fn from_receipt(receipt: &VmGitPushStagedReceipt) -> Self {
+        Self {
+            push_request_id: receipt.push_request_id(),
+            repo: receipt.repo().clone(),
+            branch: receipt.branch().clone(),
+            expected_remote_head: receipt.expected_remote_head().cloned(),
+            new_head: receipt.new_head().clone(),
+            staged_at: receipt.staged_at(),
+        }
+    }
+}
+
+/// Audit fragment attached to a staged-push detail view: the session the
+/// push was issued from and the latest recorded outcome, if any.
+///
+/// `result` is `None` when the audit log has a request row but no outcome
+/// row yet (e.g. the broker crashed between staging and recording the
+/// outcome). The promote tool surfaces this state rather than silently
+/// presenting an incomplete history.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct StagedPushAuditView {
+    pub session_id: SessionId,
+    pub received_at: UnixMillis,
+    pub result: Option<GitPushOutcomeResult>,
+}
+
+/// Full detail returned by [`ServerMessage::StagedPush`]: the staging
+/// summary, the bundle byte length, and the audit-derived session/outcome
+/// view.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct StagedPushDetail {
+    pub summary: StagedPushSummary,
+    pub bundle_bytes: u64,
+    pub audit: StagedPushAuditView,
 }
 
 /// A message from the agent to the broker.
@@ -113,6 +169,16 @@ pub enum ClientMessage {
     /// `deny_unknown_fields` at the enum level applies — serde's unit-variant
     /// deserialization path silently accepts trailing keys.
     ListAgentVms {},
+    /// List every VM-staged push currently waiting for promotion review.
+    /// Replies with [`ServerMessage::StagedPushes`].
+    ///
+    /// Empty struct rather than unit variant so the enum-level
+    /// `deny_unknown_fields` applies. See [`ListAgentVms`].
+    ListStagedPushes {},
+    /// Look up one VM-staged push by request id. Replies with
+    /// [`ServerMessage::StagedPush`] on hit and
+    /// [`ServerMessage::UnknownStagedPush`] on miss.
+    ShowStagedPush { request_id: RequestId },
 }
 
 /// A message from the broker to the agent.
@@ -164,6 +230,17 @@ pub enum ServerMessage {
     /// [`ServerMessage::Error`] for the same reason: clients should be
     /// able to react without parsing prose.
     ClosedSession { session_id: SessionId },
+    /// Listing of VM-staged pushes awaiting promotion review. Order
+    /// follows the staging store's on-disk iteration; clients that care
+    /// should sort by `staged_at` themselves.
+    StagedPushes { pushes: Vec<StagedPushSummary> },
+    /// One staged push with its bundle size and audit-derived context.
+    StagedPush { push: StagedPushDetail },
+    /// The `push_request_id` referenced by [`ClientMessage::ShowStagedPush`]
+    /// has no on-disk staging entry. Distinct from
+    /// [`ServerMessage::Error`] so clients can distinguish "no such
+    /// staged push" from a corrupt store or IO failure.
+    UnknownStagedPush { request_id: RequestId },
     /// An internal failure (mint error, audit write failure, agent VM
     /// runtime not configured, …). The agent should surface `message` to
     /// the user and not retry automatically. Outcomes a client may want
@@ -219,6 +296,15 @@ impl std::fmt::Debug for ServerMessage {
             Self::ClosedSession { session_id } => f
                 .debug_struct("ClosedSession")
                 .field("session_id", session_id)
+                .finish(),
+            Self::StagedPushes { pushes } => f
+                .debug_struct("StagedPushes")
+                .field("pushes", pushes)
+                .finish(),
+            Self::StagedPush { push } => f.debug_struct("StagedPush").field("push", push).finish(),
+            Self::UnknownStagedPush { request_id } => f
+                .debug_struct("UnknownStagedPush")
+                .field("request_id", request_id)
                 .finish(),
             Self::Error { message } => f.debug_struct("Error").field("message", message).finish(),
         }
@@ -358,6 +444,22 @@ mod tests {
         assert_eq!(serde_json::from_str::<ClientMessage>(&json).unwrap(), msg);
     }
 
+    #[test]
+    fn list_staged_pushes_roundtrips() {
+        let msg = ClientMessage::ListStagedPushes {};
+        let json = serde_json::to_string(&msg).unwrap();
+        assert_eq!(serde_json::from_str::<ClientMessage>(&json).unwrap(), msg);
+    }
+
+    #[test]
+    fn show_staged_push_roundtrips() {
+        let msg = ClientMessage::ShowStagedPush {
+            request_id: sample_request_id(),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert_eq!(serde_json::from_str::<ClientMessage>(&json).unwrap(), msg);
+    }
+
     // --- ServerMessage roundtrips -----------------------------------------
 
     #[test]
@@ -425,6 +527,137 @@ mod tests {
             serde_json::from_str::<ServerMessage>(&json).unwrap(),
             ServerMessage::AgentVmStopped,
         );
+    }
+
+    fn sample_request_id() -> RequestId {
+        "f0f0f0f0-0000-0000-0000-000000000001".parse().unwrap()
+    }
+
+    fn sample_object_id(nibble: char) -> GitObjectId {
+        std::iter::repeat_n(nibble, 40)
+            .collect::<String>()
+            .parse()
+            .unwrap()
+    }
+
+    fn sample_staged_summary() -> StagedPushSummary {
+        StagedPushSummary {
+            push_request_id: sample_request_id(),
+            repo: sample_clone_repo(),
+            branch: "feature/x".parse().unwrap(),
+            expected_remote_head: Some(sample_object_id('a')),
+            new_head: sample_object_id('b'),
+            staged_at: UnixMillis::from_millis(1_700_000_000_000),
+        }
+    }
+
+    fn sample_staged_detail() -> StagedPushDetail {
+        StagedPushDetail {
+            summary: sample_staged_summary(),
+            bundle_bytes: 4096,
+            audit: StagedPushAuditView {
+                session_id: fixed_session_id(),
+                received_at: UnixMillis::from_millis(1_700_000_000_500),
+                result: Some(GitPushOutcomeResult::Staged),
+            },
+        }
+    }
+
+    #[test]
+    fn staged_pushes_roundtrips() {
+        let msg = ServerMessage::StagedPushes {
+            pushes: vec![sample_staged_summary()],
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert_eq!(serde_json::from_str::<ServerMessage>(&json).unwrap(), msg);
+    }
+
+    #[test]
+    fn staged_pushes_empty_roundtrips() {
+        let msg = ServerMessage::StagedPushes { pushes: vec![] };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert_eq!(serde_json::from_str::<ServerMessage>(&json).unwrap(), msg);
+    }
+
+    #[test]
+    fn staged_push_roundtrips() {
+        let msg = ServerMessage::StagedPush {
+            push: sample_staged_detail(),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert_eq!(serde_json::from_str::<ServerMessage>(&json).unwrap(), msg);
+    }
+
+    #[test]
+    fn staged_push_with_no_audit_outcome_roundtrips() {
+        let mut detail = sample_staged_detail();
+        detail.audit.result = None;
+        let msg = ServerMessage::StagedPush { push: detail };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert_eq!(serde_json::from_str::<ServerMessage>(&json).unwrap(), msg);
+    }
+
+    #[test]
+    fn staged_push_with_branch_creation_roundtrips() {
+        let mut detail = sample_staged_detail();
+        detail.summary.expected_remote_head = None;
+        let msg = ServerMessage::StagedPush { push: detail };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert_eq!(serde_json::from_str::<ServerMessage>(&json).unwrap(), msg);
+    }
+
+    #[test]
+    fn unknown_staged_push_roundtrips() {
+        let msg = ServerMessage::UnknownStagedPush {
+            request_id: sample_request_id(),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert_eq!(serde_json::from_str::<ServerMessage>(&json).unwrap(), msg);
+    }
+
+    #[test]
+    fn staged_push_type_tags() {
+        let list: serde_json::Value =
+            serde_json::to_value(ClientMessage::ListStagedPushes {}).unwrap();
+        assert_eq!(list["type"], "list_staged_pushes");
+
+        let show: serde_json::Value = serde_json::to_value(ClientMessage::ShowStagedPush {
+            request_id: sample_request_id(),
+        })
+        .unwrap();
+        assert_eq!(show["type"], "show_staged_push");
+
+        let listing: serde_json::Value =
+            serde_json::to_value(ServerMessage::StagedPushes { pushes: vec![] }).unwrap();
+        assert_eq!(listing["type"], "staged_pushes");
+
+        let detail: serde_json::Value = serde_json::to_value(ServerMessage::StagedPush {
+            push: sample_staged_detail(),
+        })
+        .unwrap();
+        assert_eq!(detail["type"], "staged_push");
+
+        let unknown: serde_json::Value = serde_json::to_value(ServerMessage::UnknownStagedPush {
+            request_id: sample_request_id(),
+        })
+        .unwrap();
+        assert_eq!(unknown["type"], "unknown_staged_push");
+    }
+
+    /// `unknown_staged_push` carries its own type tag so a client
+    /// dispatching on `type` can distinguish it from a generic
+    /// internal-failure `Error` without parsing the message string.
+    #[test]
+    fn unknown_staged_push_distinct_from_error() {
+        let unknown: serde_json::Value = serde_json::to_value(ServerMessage::UnknownStagedPush {
+            request_id: sample_request_id(),
+        })
+        .unwrap();
+        let error: serde_json::Value = serde_json::to_value(ServerMessage::Error {
+            message: "internal".into(),
+        })
+        .unwrap();
+        assert_ne!(unknown["type"], error["type"]);
     }
 
     #[test]
@@ -690,7 +923,7 @@ mod tests {
         /// variant, and assert the result fails to parse.
         #[test]
         fn client_message_rejects_unknown_top_level_fields(
-            variant_index in 0usize..7,
+            variant_index in 0usize..9,
             // ASCII-letters-only key, excluded against the union of every
             // variant's known field names below.
             unknown_key in "[a-z]{1,16}",
@@ -698,6 +931,7 @@ mod tests {
             const KNOWN_FIELDS: &[&str] = &[
                 "type", "label", "agent_kind", "agent_model", "workspace",
                 "guest_command", "session_id", "capability", "prompt",
+                "request_id",
             ];
             prop_assume!(!KNOWN_FIELDS.contains(&unknown_key.as_str()));
 
@@ -756,6 +990,10 @@ mod tests {
                 session_id: fixed_session_id(),
             },
             6 => ClientMessage::ListAgentVms {},
+            7 => ClientMessage::ListStagedPushes {},
+            8 => ClientMessage::ShowStagedPush {
+                request_id: "12345678-1234-1234-1234-123456789012".parse().unwrap(),
+            },
             other => unreachable!("variant index out of range: {other}"),
         }
     }
