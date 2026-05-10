@@ -96,6 +96,20 @@ pub struct AgentVmSessionState {
     resources: AgentVmResources,
 }
 
+/// Persistent record of which sessions exist and their lifecycle state.
+///
+/// **Single-owner invariant:** a state directory has exactly one owner. Either
+/// a single `writd` runs against it, or ad-hoc CLI invocations
+/// (`writ-agent-vm-runner managed-start` / `managed-stop`) act on it — never
+/// both, and never two daemons. The store's [`lock_store`] file lock
+/// serialises individual operations, but the daemon's split start/stop forms
+/// release that lock between sub-steps for parallelism, so an external
+/// process touching the same `SessionId` mid-flight could remove a `Starting`
+/// record before the daemon's boot creates infrastructure to clean up,
+/// orphaning that infrastructure. We do not defend against this in code: the
+/// invariant is documented and operational.
+///
+/// [`lock_store`]: AgentVmSessionStateStore::lock_store
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AgentVmSessionStateStore {
     dir: PathBuf,
@@ -2212,8 +2226,13 @@ pub fn start_managed_agent_vm_session(
 /// serialise this and the matching [`complete_agent_vm_session_start`] (and
 /// any concurrent stop on the same session) externally — the file lock is
 /// released between them, and a concurrent stop on the same `SessionId` would
-/// orphan the infrastructure that boot is about to start. The daemon
-/// satisfies this contract via per-`SessionId` in-process mutexes.
+/// orphan the infrastructure that boot is about to start.
+///
+/// In-process: the daemon satisfies this contract via per-`SessionId`
+/// mutexes. Cross-process: the
+/// [single-owner invariant on `AgentVmSessionStateStore`][AgentVmSessionStateStore]
+/// rules out a second process touching the same state directory, so no
+/// interprocess lock is needed.
 pub fn claim_agent_vm_session_subnet(
     store: &AgentVmSessionStateStore,
     plan: &AgentVmSessionPlan,
