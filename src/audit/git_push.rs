@@ -447,10 +447,15 @@ fn git_push_audit_entry_from_row(
             .parse::<GitObjectId>()
             .map_err(|_| AuditError::Invariant("Git push audit row: new head is invalid"))?;
 
-        // `push_attempt_id` is the attempt table's primary key, so its
-        // presence is the authoritative discriminant for whether an attempt
-        // row joined. The other attempt columns are NOT NULL except for
-        // `old_head`, which now represents "branch creation" when null.
+        // SQLite's `TEXT PRIMARY KEY` does not imply NOT NULL, so a
+        // corrupt row could carry a NULL `push_attempt_id` alongside
+        // populated attempt columns and the LEFT JOIN would still hit.
+        // `capability_request_id` is `NOT NULL REFERENCES request(...)`,
+        // so it is a sound presence signal; if the row really is joined,
+        // the in-branch `parse_required_*` calls surface a specific
+        // invariant error for any per-column NULL surprise (including a
+        // NULL primary key). `old_head` is no longer a discriminator
+        // because it represents "branch creation" when null.
         let (
             push_attempt_id,
             capability_request_id,
@@ -458,7 +463,7 @@ fn git_push_audit_entry_from_row(
             planned_at,
             old_head,
             attempted_new_head,
-        ) = if push_attempt_id_str.is_some() {
+        ) = if capability_request_id_str.is_some() {
             let push_attempt_id = parse_required_request_id(
                 push_attempt_id_str,
                 "Git push audit row: attempt id missing or invalid",
@@ -1359,6 +1364,54 @@ mod tests {
         assert!(
             e.to_string().to_lowercase().contains("foreign key"),
             "expected FK violation, got: {e}"
+        );
+    }
+
+    /// SQLite's `TEXT PRIMARY KEY` columns are nullable, so a corrupt
+    /// row could land with `push_attempt_id = NULL` while the other
+    /// (`NOT NULL`) attempt columns are populated. The LEFT JOIN would
+    /// still hit. The row parser must surface that as a specific
+    /// invariant error rather than silently report "no attempt" by
+    /// using the nullable PK as its presence discriminator.
+    #[test]
+    fn list_surfaces_attempt_row_with_null_primary_key_as_invariant_error() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+        let push_request_id = RequestId::new();
+        log.record_git_push_request(&sample_git_push_request_record(
+            push_request_id,
+            s.session_id,
+        ))
+        .unwrap();
+        let capability_request_id = RequestId::new();
+        let grant = record_sample_write_grant(&log, s.session_id, capability_request_id);
+
+        log.with_conn_mut(|c| {
+            c.execute(
+                "INSERT INTO git_push_attempt \
+                 (push_attempt_id, push_request_id, capability_request_id, grant_jti, planned_at, repo, branch, old_head, new_head) \
+                 VALUES (NULL, ?1, ?2, ?3, ?4, 'o/n', 'main', ?5, ?6)",
+                rusqlite::params![
+                    push_request_id.as_uuid().to_string(),
+                    capability_request_id.as_uuid().to_string(),
+                    grant.jti.as_uuid().to_string(),
+                    1_700_000_120_i64,
+                    git_oid('1').as_str(),
+                    git_oid('2').as_str(),
+                ],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        let err = log.list_git_pushes_for_session(s.session_id).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                AuditError::Invariant("Git push audit row: attempt id missing or invalid")
+            ),
+            "got: {err:?}"
         );
     }
 }
