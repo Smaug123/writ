@@ -21,8 +21,8 @@ pub use claude_proxy::{
     VmHttpClaudeProxyConfigError, VmHttpClaudeProxyService,
 };
 use claude_proxy::{
-    VmHttpClaudeProxyStream, classify_claude_proxy_target, is_claude_proxy_target,
-    record_claude_proxy_local_response, route_claude_proxy_request,
+    classify_claude_proxy_target, is_claude_proxy_target, record_claude_proxy_local_response,
+    route_claude_proxy_request,
 };
 pub use git_clone::{VmHttpGitCloneConfig, VmHttpGitCloneService};
 use git_clone::{is_git_clone_target, route_git_clone_request};
@@ -38,20 +38,18 @@ pub use openai_proxy::{
     VmHttpOpenAiProxyService,
 };
 use openai_proxy::{
-    VmHttpOpenAiProxyStream, classify_openai_proxy_target, is_openai_proxy_target,
-    record_openai_proxy_local_response, route_openai_proxy_request,
+    classify_openai_proxy_target, is_openai_proxy_target, record_openai_proxy_local_response,
+    route_openai_proxy_request,
 };
+use proxy_common::ProxyStream;
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
-use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context, Poll};
 
 use bytes::Bytes;
-use futures_util::Stream;
 use http_body_util::{BodyExt, Empty, Full, Limited, combinators::UnsyncBoxBody};
-use hyper::body::{Body as HyperBody, Frame, Incoming};
+use hyper::body::{Body as HyperBody, Incoming};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioIo, TokioTimer};
@@ -61,12 +59,9 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 use tokio::task::JoinSet;
 
-use crate::audit::{
-    ClaudeProxyAuditDecision, ClaudeProxyOutcomeRecord, NixCacheAuditDecision,
-    OpenAiProxyAuditDecision, OpenAiProxyOutcomeRecord,
-};
+use crate::audit::{ClaudeProxyAuditDecision, NixCacheAuditDecision, OpenAiProxyAuditDecision};
 use crate::bearer::is_bearer_token_byte;
-use crate::core::{BrokerPort, BrokerPortRange, Ipv4Cidr, RequestId, SessionId, UnixMillis};
+use crate::core::{BrokerPort, BrokerPortRange, Ipv4Cidr, SessionId};
 use crate::secret::SecretStore;
 use crate::server::BrokerState;
 
@@ -268,8 +263,7 @@ enum VmHttpAuthScheme {
 
 enum VmHttpDispatch<S: SecretStore> {
     Buffered(VmHttpResponse),
-    ClaudeProxyStream(VmHttpClaudeProxyStream<S>),
-    OpenAiProxyStream(VmHttpOpenAiProxyStream<S>),
+    ProxyStream(ProxyStream<S>),
 }
 
 impl VmHttpSession {
@@ -362,139 +356,6 @@ impl VmHttpRequest {
 
     pub fn peer_addr(&self) -> SocketAddr {
         self.peer_addr
-    }
-}
-
-#[derive(Copy, Clone, Debug)]
-enum ProxyAuditKind {
-    Claude,
-    OpenAi,
-}
-
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-enum ProxyStreamState {
-    Streaming,
-    UpstreamEnded,
-    UpstreamError,
-    OverMax,
-}
-
-struct ProxyStreamAudit<S: SecretStore> {
-    broker_state: Arc<BrokerState<S>>,
-    kind: ProxyAuditKind,
-    request_id: RequestId,
-    upstream_url: String,
-    upstream_status: u16,
-}
-
-struct ProxyStreamBody<S: SecretStore> {
-    inner: Pin<Box<dyn Stream<Item = reqwest::Result<Bytes>> + Send>>,
-    audit: Option<ProxyStreamAudit<S>>,
-    max_response_bytes: u64,
-    response_bytes: u64,
-    state: ProxyStreamState,
-}
-
-impl<S: SecretStore> HyperBody for ProxyStreamBody<S> {
-    type Data = Bytes;
-    type Error = std::io::Error;
-
-    fn poll_frame(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<Frame<Bytes>, std::io::Error>>> {
-        let me = self.get_mut();
-        if me.state != ProxyStreamState::Streaming {
-            return Poll::Ready(None);
-        }
-        match me.inner.as_mut().poll_next(cx) {
-            Poll::Pending => Poll::Pending,
-            Poll::Ready(None) => {
-                me.state = ProxyStreamState::UpstreamEnded;
-                Poll::Ready(None)
-            }
-            Poll::Ready(Some(Err(err))) => {
-                eprintln!(
-                    "VM HTTP {} proxy streaming body read failed: {err}",
-                    proxy_audit_label(me.audit.as_ref().map(|a| a.kind)),
-                );
-                me.state = ProxyStreamState::UpstreamError;
-                Poll::Ready(None)
-            }
-            Poll::Ready(Some(Ok(chunk))) => {
-                let chunk_len = u64::try_from(chunk.len()).expect("HTTP chunk length fits in u64");
-                let new_len = me
-                    .response_bytes
-                    .checked_add(chunk_len)
-                    .expect("HTTP response byte count overflowed before configured bound check");
-                if new_len > me.max_response_bytes {
-                    me.response_bytes = new_len;
-                    me.state = ProxyStreamState::OverMax;
-                    return Poll::Ready(None);
-                }
-                me.response_bytes = new_len;
-                Poll::Ready(Some(Ok(Frame::data(chunk))))
-            }
-        }
-    }
-
-    fn is_end_stream(&self) -> bool {
-        self.state != ProxyStreamState::Streaming
-    }
-}
-
-impl<S: SecretStore> Drop for ProxyStreamBody<S> {
-    fn drop(&mut self) {
-        let Some(audit) = self.audit.take() else {
-            return;
-        };
-        let error = match self.state {
-            ProxyStreamState::Streaming => Some("guest response write failed"),
-            ProxyStreamState::UpstreamEnded => None,
-            ProxyStreamState::UpstreamError => Some("upstream body read failed"),
-            ProxyStreamState::OverMax => Some("upstream response too large"),
-        };
-        let response_bytes = self.response_bytes;
-        match audit.kind {
-            ProxyAuditKind::Claude => {
-                if let Err(err) = audit.broker_state.audit.record_claude_proxy_outcome(
-                    &ClaudeProxyOutcomeRecord {
-                        request_id: audit.request_id,
-                        completed_at: UnixMillis::now(),
-                        http_status: audit.upstream_status,
-                        upstream_url: Some(audit.upstream_url.as_str()),
-                        upstream_status: Some(audit.upstream_status),
-                        response_bytes,
-                        error,
-                    },
-                ) {
-                    eprintln!("VM HTTP Claude proxy streaming audit outcome write failed: {err}");
-                }
-            }
-            ProxyAuditKind::OpenAi => {
-                if let Err(err) = audit.broker_state.audit.record_openai_proxy_outcome(
-                    &OpenAiProxyOutcomeRecord {
-                        request_id: audit.request_id,
-                        completed_at: UnixMillis::now(),
-                        http_status: audit.upstream_status,
-                        upstream_url: Some(audit.upstream_url.as_str()),
-                        upstream_status: Some(audit.upstream_status),
-                        response_bytes,
-                        error,
-                    },
-                ) {
-                    eprintln!("VM HTTP OpenAI proxy streaming audit outcome write failed: {err}");
-                }
-            }
-        }
-    }
-}
-
-fn proxy_audit_label(kind: Option<ProxyAuditKind>) -> &'static str {
-    match kind {
-        Some(ProxyAuditKind::Claude) => "Claude",
-        Some(ProxyAuditKind::OpenAi) => "OpenAI",
-        None => "?",
     }
 }
 
@@ -1532,8 +1393,7 @@ impl<S: SecretStore + Send + Sync + 'static> VmHttpDispatch<S> {
     fn into_hyper_response(self) -> http::Response<UnsyncBoxBody<Bytes, std::io::Error>> {
         match self {
             Self::Buffered(response) => response.into_hyper_response(),
-            Self::ClaudeProxyStream(stream) => stream.into_hyper_response(),
-            Self::OpenAiProxyStream(stream) => stream.into_hyper_response(),
+            Self::ProxyStream(stream) => stream.into_hyper_response(),
         }
     }
 }
@@ -1542,8 +1402,7 @@ impl<S: SecretStore> VmHttpDispatch<S> {
     fn status_code(&self) -> u16 {
         match self {
             Self::Buffered(response) => response.status.code(),
-            Self::ClaudeProxyStream(response) => response.upstream_status,
-            Self::OpenAiProxyStream(response) => response.upstream_status,
+            Self::ProxyStream(stream) => stream.upstream_status,
         }
     }
 
@@ -1551,9 +1410,7 @@ impl<S: SecretStore> VmHttpDispatch<S> {
     fn into_buffered(self) -> VmHttpResponse {
         match self {
             Self::Buffered(response) => response,
-            Self::ClaudeProxyStream(_) | Self::OpenAiProxyStream(_) => {
-                panic!("expected buffered VM HTTP response")
-            }
+            Self::ProxyStream(_) => panic!("expected buffered VM HTTP response"),
         }
     }
 }

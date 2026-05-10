@@ -5,9 +5,6 @@
 use std::borrow::Cow;
 use std::sync::Arc;
 
-use bytes::Bytes;
-use http_body_util::BodyExt as _;
-use http_body_util::combinators::UnsyncBoxBody;
 use serde::Deserialize;
 
 use crate::audit::{
@@ -19,12 +16,13 @@ use crate::secret::{SecretKey, SecretStore};
 use crate::server::BrokerState;
 
 use super::proxy_common::{
-    is_proxy_id_byte, proxy_request_wants_streaming, proxy_response_content_type,
-    proxy_target_path, read_upstream_body_bounded,
+    ProxyAuditKind, ProxyFetch, ProxyForwardHeader, ProxyStream, is_proxy_id_byte,
+    proxy_request_wants_streaming, proxy_response_content_type, proxy_target_path,
+    read_upstream_body_bounded,
 };
 use super::{
-    ProxyAuditKind, ProxyStreamAudit, ProxyStreamBody, ProxyStreamState, VmHttpDispatch,
-    VmHttpHeader, VmHttpRequest, VmHttpResponse, VmHttpResponseHeader, VmHttpSession, VmHttpStatus,
+    VmHttpDispatch, VmHttpHeader, VmHttpRequest, VmHttpResponse, VmHttpResponseHeader,
+    VmHttpSession, VmHttpStatus,
 };
 
 pub(super) const VM_CLAUDE_MESSAGES_PATH: &str = "/v1/messages";
@@ -85,31 +83,6 @@ pub enum VmHttpClaudeProxyConfigError {
     InvalidAnthropicVersion { message: String },
 }
 
-#[derive(Debug)]
-struct VmHttpClaudeProxyFetch {
-    response: VmHttpResponse,
-    upstream_url: Option<String>,
-    upstream_status: Option<u16>,
-    response_bytes: u64,
-    error: Option<&'static str>,
-}
-
-pub(crate) struct VmHttpClaudeProxyStream<S: SecretStore> {
-    broker_state: Arc<BrokerState<S>>,
-    pub(super) request_id: RequestId,
-    response: reqwest::Response,
-    upstream_url: String,
-    pub(super) upstream_status: u16,
-    content_type: &'static str,
-    headers: Vec<VmHttpResponseHeader>,
-    max_response_bytes: u64,
-}
-
-struct ClaudeProxyForwardHeader {
-    name: reqwest::header::HeaderName,
-    value: reqwest::header::HeaderValue,
-}
-
 impl<S: SecretStore> VmHttpClaudeProxyService<S> {
     pub fn new(
         broker_state: Arc<BrokerState<S>>,
@@ -130,11 +103,11 @@ impl<S: SecretStore> VmHttpClaudeProxyService<S> {
         &self,
         request: &VmHttpRequest,
         body: Vec<u8>,
-        headers: Vec<ClaudeProxyForwardHeader>,
-    ) -> Result<(String, reqwest::RequestBuilder), Box<VmHttpClaudeProxyFetch>> {
+        headers: Vec<ProxyForwardHeader>,
+    ) -> Result<(String, reqwest::RequestBuilder), Box<ProxyFetch>> {
         let Some(route) = classify_claude_proxy_target(&request.target) else {
             let response = VmHttpResponse::text(VmHttpStatus::NotFound, "not found");
-            return Err(Box::new(VmHttpClaudeProxyFetch {
+            return Err(Box::new(ProxyFetch {
                 response_bytes: response.body.len() as u64,
                 response,
                 upstream_url: None,
@@ -144,7 +117,7 @@ impl<S: SecretStore> VmHttpClaudeProxyService<S> {
         };
         let Some(url) = self.upstream_url(&request.target) else {
             let response = VmHttpResponse::text(VmHttpStatus::NotFound, "not found");
-            return Err(Box::new(VmHttpClaudeProxyFetch {
+            return Err(Box::new(ProxyFetch {
                 response_bytes: response.body.len() as u64,
                 response,
                 upstream_url: None,
@@ -162,7 +135,7 @@ impl<S: SecretStore> VmHttpClaudeProxyService<S> {
             Ok(_) => {
                 let response =
                     VmHttpResponse::text(VmHttpStatus::BadGateway, "Claude proxy auth missing");
-                return Err(Box::new(VmHttpClaudeProxyFetch {
+                return Err(Box::new(ProxyFetch {
                     response_bytes: response.body.len() as u64,
                     response,
                     upstream_url: Some(upstream_url),
@@ -174,7 +147,7 @@ impl<S: SecretStore> VmHttpClaudeProxyService<S> {
                 eprintln!("VM HTTP Claude proxy auth secret load failed: {err}");
                 let response =
                     VmHttpResponse::text(VmHttpStatus::BadGateway, "Claude proxy auth failed");
-                return Err(Box::new(VmHttpClaudeProxyFetch {
+                return Err(Box::new(ProxyFetch {
                     response_bytes: response.body.len() as u64,
                     response,
                     upstream_url: Some(upstream_url),
@@ -205,8 +178,8 @@ impl<S: SecretStore> VmHttpClaudeProxyService<S> {
         &self,
         request: &VmHttpRequest,
         body: Vec<u8>,
-        headers: Vec<ClaudeProxyForwardHeader>,
-    ) -> VmHttpClaudeProxyFetch {
+        headers: Vec<ProxyForwardHeader>,
+    ) -> ProxyFetch {
         let (upstream_url, builder) = match self.upstream_request_builder(request, body, headers) {
             Ok(parts) => parts,
             Err(fetch) => return *fetch,
@@ -218,7 +191,7 @@ impl<S: SecretStore> VmHttpClaudeProxyService<S> {
                 eprintln!("VM HTTP Claude proxy upstream request failed: {err}");
                 let response =
                     VmHttpResponse::text(VmHttpStatus::BadGateway, "Claude proxy upstream failed");
-                return VmHttpClaudeProxyFetch {
+                return ProxyFetch {
                     response_bytes: response.body.len() as u64,
                     response,
                     upstream_url: Some(upstream_url),
@@ -238,7 +211,7 @@ impl<S: SecretStore> VmHttpClaudeProxyService<S> {
                 eprintln!("VM HTTP Claude proxy upstream body read failed: {err}");
                 let response =
                     VmHttpResponse::text(VmHttpStatus::BadGateway, "Claude proxy upstream failed");
-                return VmHttpClaudeProxyFetch {
+                return ProxyFetch {
                     response_bytes: err.bytes_read(),
                     response,
                     upstream_url: Some(upstream_url),
@@ -248,7 +221,7 @@ impl<S: SecretStore> VmHttpClaudeProxyService<S> {
             }
         };
         let response_bytes = body.len() as u64;
-        VmHttpClaudeProxyFetch {
+        ProxyFetch {
             response: VmHttpResponse {
                 status: VmHttpStatus::Upstream(upstream_status.as_u16()),
                 content_type,
@@ -269,8 +242,8 @@ impl<S: SecretStore> VmHttpClaudeProxyService<S> {
         request_id: RequestId,
         request: &VmHttpRequest,
         body: Vec<u8>,
-        headers: Vec<ClaudeProxyForwardHeader>,
-    ) -> Result<VmHttpClaudeProxyStream<S>, VmHttpClaudeProxyFetch> {
+        headers: Vec<ProxyForwardHeader>,
+    ) -> Result<ProxyStream<S>, ProxyFetch> {
         let (upstream_url, builder) = self
             .upstream_request_builder(request, body, headers)
             .map_err(|fetch| *fetch)?;
@@ -280,7 +253,7 @@ impl<S: SecretStore> VmHttpClaudeProxyService<S> {
                 eprintln!("VM HTTP Claude proxy upstream request failed: {err}");
                 let response =
                     VmHttpResponse::text(VmHttpStatus::BadGateway, "Claude proxy upstream failed");
-                return Err(VmHttpClaudeProxyFetch {
+                return Err(ProxyFetch {
                     response_bytes: response.body.len() as u64,
                     response,
                     upstream_url: Some(upstream_url),
@@ -292,7 +265,7 @@ impl<S: SecretStore> VmHttpClaudeProxyService<S> {
         let upstream_status = response.status().as_u16();
         let content_type = proxy_response_content_type(&response);
         let headers = claude_proxy_response_headers(response.headers());
-        Ok(VmHttpClaudeProxyStream {
+        Ok(ProxyStream {
             broker_state: Arc::clone(&self.broker_state),
             request_id,
             response,
@@ -301,6 +274,7 @@ impl<S: SecretStore> VmHttpClaudeProxyService<S> {
             content_type,
             headers,
             max_response_bytes: self.config.max_response_bytes,
+            kind: ProxyAuditKind::Claude,
         })
     }
 
@@ -339,36 +313,6 @@ impl<S: SecretStore> Clone for VmHttpClaudeProxyService<S> {
             config: self.config.clone(),
             client: self.client.clone(),
         }
-    }
-}
-
-impl<S: SecretStore + Send + Sync + 'static> VmHttpClaudeProxyStream<S> {
-    pub(super) fn into_hyper_response(
-        self,
-    ) -> http::Response<UnsyncBoxBody<Bytes, std::io::Error>> {
-        let body = ProxyStreamBody {
-            inner: Box::pin(self.response.bytes_stream()),
-            audit: Some(ProxyStreamAudit {
-                broker_state: self.broker_state,
-                kind: ProxyAuditKind::Claude,
-                request_id: self.request_id,
-                upstream_url: self.upstream_url,
-                upstream_status: self.upstream_status,
-            }),
-            max_response_bytes: self.max_response_bytes,
-            response_bytes: 0,
-            state: ProxyStreamState::Streaming,
-        };
-        let mut builder = http::Response::builder()
-            .status(self.upstream_status)
-            .header(http::header::CONTENT_TYPE, self.content_type)
-            .header(http::header::CONNECTION, "close");
-        for header in self.headers {
-            builder = builder.header(header.name, header.value);
-        }
-        builder
-            .body(body.boxed_unsync())
-            .expect("VmHttpClaudeProxyStream always builds a valid hyper response")
     }
 }
 
@@ -525,7 +469,7 @@ fn claude_proxy_forward_headers(
     headers: &[VmHttpHeader],
     anthropic_version: &reqwest::header::HeaderValue,
     auth_kind: VmHttpClaudeProxyAuthKind,
-) -> Result<Vec<ClaudeProxyForwardHeader>, &'static str> {
+) -> Result<Vec<ProxyForwardHeader>, &'static str> {
     let mut forwarded = Vec::new();
     let mut saw_content_type = false;
     let mut saw_accept = false;
@@ -553,9 +497,9 @@ fn claude_proxy_forward_headers(
         }
         let value = reqwest::header::HeaderValue::from_str(&header.value)
             .map_err(|_| "invalid forwarded Claude header value")?;
-        forwarded.push(ClaudeProxyForwardHeader { name, value });
+        forwarded.push(ProxyForwardHeader { name, value });
     }
-    forwarded.push(ClaudeProxyForwardHeader {
+    forwarded.push(ProxyForwardHeader {
         name: reqwest::header::HeaderName::from_static("anthropic-version"),
         value: anthropic_version.clone(),
     });
@@ -724,7 +668,7 @@ pub(super) async fn route_claude_proxy_request<S: SecretStore>(
             .fetch_stream(request_id, request, body, headers)
             .await
         {
-            Ok(stream) => return VmHttpDispatch::ClaudeProxyStream(stream),
+            Ok(stream) => return VmHttpDispatch::ProxyStream(stream),
             Err(fetch) => {
                 if let Err(err) = service.broker_state.audit.record_claude_proxy_outcome(
                     &ClaudeProxyOutcomeRecord {
@@ -1529,12 +1473,12 @@ mod tests {
         )
         .await;
         let request_id = match &dispatch {
-            VmHttpDispatch::ClaudeProxyStream(stream) => stream.request_id,
+            VmHttpDispatch::ProxyStream(stream) => {
+                assert_eq!(stream.kind, ProxyAuditKind::Claude);
+                stream.request_id
+            }
             VmHttpDispatch::Buffered(response) => {
                 panic!("expected streaming response, got {response:?}")
-            }
-            VmHttpDispatch::OpenAiProxyStream(_) => {
-                panic!("expected Claude streaming response, got OpenAI streaming response")
             }
         };
         assert!(
@@ -1616,12 +1560,12 @@ mod tests {
         )
         .await;
         let request_id = match &dispatch {
-            VmHttpDispatch::ClaudeProxyStream(stream) => stream.request_id,
+            VmHttpDispatch::ProxyStream(stream) => {
+                assert_eq!(stream.kind, ProxyAuditKind::Claude);
+                stream.request_id
+            }
             VmHttpDispatch::Buffered(response) => {
                 panic!("expected streaming response, got {response:?}")
-            }
-            VmHttpDispatch::OpenAiProxyStream(_) => {
-                panic!("expected Claude streaming response, got OpenAI streaming response")
             }
         };
         let response =
