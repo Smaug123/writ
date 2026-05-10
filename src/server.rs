@@ -246,7 +246,7 @@ pub async fn dispatch_message_with_agent_vm<S: SecretStore + Send + Sync + 'stat
                 message: "agent VM runtime is not configured".into(),
             },
         },
-        ClientMessage::ListAgentVms => match agent_vm {
+        ClientMessage::ListAgentVms {} => match agent_vm {
             Some(agent_vm) => match agent_vm.list_sessions().await {
                 Ok(sessions) => ServerMessage::AgentVmSessions { sessions },
                 Err(err) => ServerMessage::Error {
@@ -880,7 +880,7 @@ mod tests {
             }
         );
 
-        let list = dispatch_message(ClientMessage::ListAgentVms, &state).await;
+        let list = dispatch_message(ClientMessage::ListAgentVms {}, &state).await;
         assert_eq!(
             list,
             ServerMessage::Error {
