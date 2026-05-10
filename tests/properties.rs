@@ -147,6 +147,15 @@ proptest! {
         prop_assert_eq!(parsed, repo);
     }
 
+    /// Oracle: `matches` is exactly equality on the canonical projection.
+    /// Anyone touching the GitHub boundary can substitute one for the
+    /// other; the only reason to keep `matches` around is readability at
+    /// the call site.
+    #[test]
+    fn matches_iff_canonical_eq(a in arb_repo(), b in arb_repo()) {
+        prop_assert_eq!(a.matches(&b), a.canonicalise() == b.canonicalise());
+    }
+
     /// Any write request whose repo is on the allowlist is granted; any
     /// write whose repo is not is denied. This is the whole v1 policy.
     #[test]

@@ -395,15 +395,20 @@ impl<S: SecretStore> GitHubMinter<S> {
         // missing one.
         //
         // GitHub returns `full_name` in the repo's canonical casing, which
-        // need not match the casing the caller supplied. Compare
-        // case-insensitively to match GitHub's own resolution semantics.
-        let expected = scope.repository.to_string();
+        // need not match the casing the caller supplied. Compare via the
+        // `CanonicalRepoRef` projection so the comparison is type-checked —
+        // a bare `==` between two `RepoRef`s would be exact and silently
+        // reject a correct response that differed only in casing.
+        let expected_canonical = scope.repository.canonicalise();
         match parsed.repository_selection {
             RepositorySelection::Selected => {
+                let returned_canonical = parsed
+                    .repositories
+                    .first()
+                    .and_then(|r| r.full_name.parse::<RepoRef>().ok())
+                    .map(|r| r.canonicalise());
                 let matches_expected = parsed.repositories.len() == 1
-                    && parsed.repositories[0]
-                        .full_name
-                        .eq_ignore_ascii_case(&expected);
+                    && returned_canonical.as_ref() == Some(&expected_canonical);
                 if !matches_expected {
                     return Err(MintError::UnexpectedRepositories {
                         requested: scope.repository.clone(),
