@@ -18,6 +18,8 @@ pub(crate) mod bearer;
 pub mod config;
 pub mod core;
 #[cfg(feature = "host")]
+pub mod git_push_staging;
+#[cfg(feature = "host")]
 pub mod github;
 #[cfg(feature = "host")]
 pub mod nix_cache;
