@@ -25,12 +25,14 @@ pub mod nix_cache;
 pub mod openai_chatgpt_auth;
 #[cfg(feature = "host")]
 pub mod policy;
+pub mod process_spawn;
 #[cfg(feature = "host")]
 pub mod protocol;
 #[cfg(feature = "host")]
 pub mod secret;
 #[cfg(feature = "host")]
 pub mod server;
+pub mod telemetry;
 #[cfg(feature = "vm-client")]
 pub mod vm_client;
 #[cfg(feature = "vm-client")]

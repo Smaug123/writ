@@ -624,7 +624,7 @@ pub async fn run_with_agent_vm<S: SecretStore + Send + Sync + 'static>(
         let agent_vm = agent_vm.clone();
         tokio::spawn(async move {
             if let Err(e) = handle_connection(stream, state, agent_vm).await {
-                eprintln!("connection error: {e}");
+                tracing::warn!(error = %e, "broker connection handler error");
             }
         });
     }

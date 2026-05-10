@@ -240,7 +240,10 @@ fn git_clone_token_from_capability_outcome(
             "session is closed",
         )),
         CapabilityOutcome::Error { message } => {
-            eprintln!("VM HTTP Git clone credential request failed: {message}");
+            tracing::warn!(
+                error = %message,
+                "vm http git clone credential request failed",
+            );
             Err(git_error_response(
                 VmHttpStatus::InternalServerError,
                 VmGitCloneErrorCode::CloneFailed,

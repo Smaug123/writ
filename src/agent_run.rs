@@ -249,6 +249,8 @@ mod process_runner {
     use std::process::{Command, Stdio};
     use std::thread;
 
+    use crate::process_spawn;
+
     use super::{
         AgentPrompt, AgentRunId, AgentRunOutcome, AgentRunStreamSummary, AgentRunTerminalStatus,
         DEFAULT_AGENT_RUN_STREAM_CAPTURE_BYTES,
@@ -384,7 +386,7 @@ mod process_runner {
                 command.env_remove(key);
             }
             command.envs(plan.env.iter().map(|(key, value)| (key, value)));
-            command.spawn().map_err(AgentProcessRunError::Spawn)?
+            process_spawn::spawn(&mut command).map_err(AgentProcessRunError::Spawn)?
         };
 
         let stdout = child

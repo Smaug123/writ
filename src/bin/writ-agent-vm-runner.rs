@@ -176,6 +176,7 @@ fn main() {
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
+    writ::telemetry::init("warn")?;
     let cli = Cli::parse();
     let tools = AgentVmToolPaths::new(
         cli.container,
