@@ -21,6 +21,7 @@ use crate::core::{
     AgentNetwork, AgentNetworkPool, AgentVmConfigError, BrokerPortRange, BrokerPorts, Ipv4Cidr,
     Ipv6Cidr, SessionId,
 };
+use crate::process_spawn;
 
 const IPV4_ONLY_PRELAUNCH_SCRIPT: &str = concat!(
     "set -eu\n",
@@ -1856,14 +1857,16 @@ impl ProcessInvocation {
     }
 
     fn output(&self) -> Result<std::process::Output, ProcessInvocationError> {
-        Command::new(&self.program)
+        let mut command = Command::new(&self.program);
+        command
             .args(&self.args)
-            .output()
-            .map_err(|source| ProcessInvocationError::Run {
-                program: self.program.display().to_string(),
-                args: self.args_display(),
-                source,
-            })
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        process_spawn::output(&mut command).map_err(|source| ProcessInvocationError::Run {
+            program: self.program.display().to_string(),
+            args: self.args_display(),
+            source,
+        })
     }
 
     fn args_display(&self) -> String {

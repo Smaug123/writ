@@ -13,6 +13,7 @@ use std::time::Duration;
 
 use tokio::process::Command;
 
+use crate::process_spawn;
 use crate::vm_git::{GitCloneRepo, VmGitCloneRequest};
 
 const DEFAULT_MIRROR_DIR_NAME: &str = "mirror.git";
@@ -713,8 +714,8 @@ async fn run_git_invocation(
         command.env(secret_env.as_str(), secret.as_str());
     }
 
-    let mut child = command
-        .spawn()
+    let mut child = process_spawn::spawn_async(&mut command)
+        .await
         .map_err(|source| GitCloneBundleRunError::Spawn { step, source })?;
     let pid = child
         .id()
