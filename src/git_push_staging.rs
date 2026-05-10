@@ -289,10 +289,12 @@ fn is_rename_target_occupied(err: &io::Error) -> bool {
 }
 
 fn parse_request_id_from_dirname(name: &OsStr) -> Result<RequestId, StagingError> {
-    let as_str = name.to_str().ok_or_else(|| StagingError::UnrecognisedStagedDir {
-        name: name.to_string_lossy().into_owned(),
-        message: "directory name is not UTF-8".to_string(),
-    })?;
+    let as_str = name
+        .to_str()
+        .ok_or_else(|| StagingError::UnrecognisedStagedDir {
+            name: name.to_string_lossy().into_owned(),
+            message: "directory name is not UTF-8".to_string(),
+        })?;
     as_str
         .parse::<RequestId>()
         .map_err(|err| StagingError::UnrecognisedStagedDir {
@@ -571,7 +573,11 @@ mod tests {
                 b"ok".to_vec(),
             )
             .unwrap();
-        let entry = store.root().join("staged").join(request_id.to_string()).join("entry.json");
+        let entry = store
+            .root()
+            .join("staged")
+            .join(request_id.to_string())
+            .join("entry.json");
         fs::write(&entry, b"{not json").unwrap();
         let err = store.load(request_id).unwrap_err();
         assert!(matches!(err, StagingError::Corrupt { request_id: id, .. } if id == request_id));
@@ -589,7 +595,11 @@ mod tests {
                 b"ok".to_vec(),
             )
             .unwrap();
-        let bundle = store.root().join("staged").join(request_id.to_string()).join("bundle");
+        let bundle = store
+            .root()
+            .join("staged")
+            .join(request_id.to_string())
+            .join("bundle");
         fs::remove_file(&bundle).unwrap();
         let err = store.load(request_id).unwrap_err();
         assert!(matches!(err, StagingError::Corrupt { request_id: id, .. } if id == request_id));
@@ -599,12 +609,8 @@ mod tests {
     fn branch_creation_roundtrips_with_null_expected_head() {
         let (store, _tmp) = open_store();
         let request_id: RequestId = "99999999-9999-9999-9999-999999999999".parse().unwrap();
-        let metadata = VmGitPushMetadata::new(
-            sample_repo(),
-            sample_branch(),
-            None,
-            sample_object_id('d'),
-        );
+        let metadata =
+            VmGitPushMetadata::new(sample_repo(), sample_branch(), None, sample_object_id('d'));
         let receipt = store
             .stage(
                 request_id,
