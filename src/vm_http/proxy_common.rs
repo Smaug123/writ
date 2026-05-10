@@ -247,9 +247,10 @@ impl<S: SecretStore> HyperBody for ProxyStreamBody<S> {
                 Poll::Ready(None)
             }
             Poll::Ready(Some(Err(err))) => {
-                eprintln!(
-                    "VM HTTP {} proxy streaming body read failed: {err}",
-                    proxy_audit_label(me.audit.as_ref().map(|a| a.kind)),
+                tracing::warn!(
+                    proxy = proxy_audit_label(me.audit.as_ref().map(|a| a.kind)),
+                    error = %err,
+                    "vm http proxy streaming body read failed",
                 );
                 me.state = ProxyStreamState::UpstreamError;
                 Poll::Ready(None)

@@ -58,6 +58,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 use tokio::task::JoinSet;
+use tracing::Instrument;
 
 use crate::audit::{ClaudeProxyAuditDecision, NixCacheAuditDecision, OpenAiProxyAuditDecision};
 use crate::bearer::is_bearer_token_byte;
@@ -819,6 +820,11 @@ async fn handle_vm_http_connection<S: SecretStore + Send + Sync + 'static>(
     session: VmHttpSession,
     services: VmHttpServices<S>,
 ) -> std::io::Result<()> {
+    let span = tracing::info_span!(
+        "vm_http.connection",
+        session_id = %session.session_id(),
+        peer = %peer_addr,
+    );
     handle_vm_http_connection_with_read_timeout(
         stream,
         peer_addr,
@@ -826,6 +832,7 @@ async fn handle_vm_http_connection<S: SecretStore + Send + Sync + 'static>(
         services,
         VM_HTTP_READ_TIMEOUT,
     )
+    .instrument(span)
     .await
 }
 
@@ -864,7 +871,7 @@ where
         // Hyper's connection-level errors (peer closed, parse failure,
         // header-read timeout) match the previous behaviour of swallowing
         // bad-input from the peer rather than surfacing them as I/O errors.
-        eprintln!("VM HTTP connection: {err}");
+        tracing::warn!(error = %err, "vm http connection ended with hyper error");
     }
     Ok(())
 }
@@ -1098,12 +1105,12 @@ where
 }
 
 fn log_vm_http_request(session: &VmHttpSession, method: &str, target: &str, status: u16) {
-    eprintln!(
-        "writd: vm http session={} {} {} -> {}",
-        session.session_id(),
+    tracing::info!(
+        session_id = %session.session_id(),
         method,
         target,
         status,
+        "vm http request",
     );
 }
 
@@ -1451,8 +1458,8 @@ impl VmHttpStatus {
 fn report_vm_http_handler_result(result: Result<std::io::Result<()>, tokio::task::JoinError>) {
     match result {
         Ok(Ok(())) => {}
-        Ok(Err(err)) => eprintln!("VM HTTP connection error: {err}"),
-        Err(err) => eprintln!("VM HTTP connection task failed: {err}"),
+        Ok(Err(err)) => tracing::warn!(error = %err, "vm http connection error"),
+        Err(err) => tracing::error!(error = %err, "vm http connection task failed"),
     }
 }
 

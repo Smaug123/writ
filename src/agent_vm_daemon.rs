@@ -1002,7 +1002,11 @@ fn close_audit_session_best_effort<S: SecretStore + Send + Sync>(
     session_id: SessionId,
 ) {
     if let Err(err) = state.audit.close_session(session_id, UnixMillis::now()) {
-        eprintln!("agent VM start cleanup could not close audit session {session_id}: {err}");
+        tracing::warn!(
+            session_id = %session_id,
+            error = %err,
+            "agent VM start cleanup could not close audit session",
+        );
     }
 }
 
