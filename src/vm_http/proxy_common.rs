@@ -19,10 +19,56 @@ use hyper::body::{Body as HyperBody, Frame};
 
 use crate::audit::{ClaudeProxyOutcomeRecord, OpenAiProxyOutcomeRecord};
 use crate::core::{RequestId, UnixMillis};
+use crate::openai_chatgpt_auth::ChatgptUpstreamHeaders;
 use crate::secret::SecretStore;
 use crate::server::BrokerState;
 
 use super::{VmHttpResponse, VmHttpResponseHeader};
+
+const ANTHROPIC_OAUTH_BETA_HEADER_VALUE: &str = "oauth-2025-04-20";
+
+/// Resolved upstream authentication for a single proxy request.
+///
+/// Each backend resolves its scheme-specific config (a static API key,
+/// a refreshed OAuth bundle) into one of these variants, and the
+/// request builder applies the wire-level headers in one place. New
+/// auth shapes are added here, not in the per-backend builder paths.
+pub(super) enum UpstreamAuth {
+    /// `x-api-key: <secret>`. Used by Claude with a static Anthropic API key.
+    XApiKey(String),
+    /// `Authorization: Bearer <secret>`. Used for OpenAI API keys and for
+    /// Claude's plain-bearer auth shape.
+    Bearer(String),
+    /// `Authorization: Bearer <secret>` plus `anthropic-beta: oauth-…`.
+    /// Used by Claude's OAuth (Claude-Code-style) auth shape.
+    AnthropicOauth(String),
+    /// ChatGPT-login OAuth: bearer access token plus the
+    /// `ChatGPT-Account-ID` and (when applicable) `X-OpenAI-Fedramp`
+    /// headers expected by the Responses API.
+    ChatgptOauth(ChatgptUpstreamHeaders),
+}
+
+impl UpstreamAuth {
+    pub(super) fn apply_to(self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match self {
+            UpstreamAuth::XApiKey(secret) => builder.header("x-api-key", secret),
+            UpstreamAuth::Bearer(secret) => builder.bearer_auth(secret),
+            UpstreamAuth::AnthropicOauth(secret) => builder
+                .bearer_auth(secret)
+                .header("anthropic-beta", ANTHROPIC_OAUTH_BETA_HEADER_VALUE),
+            UpstreamAuth::ChatgptOauth(headers) => {
+                let mut builder = builder.bearer_auth(headers.access_token);
+                if let Some(account_id) = headers.account_id {
+                    builder = builder.header("ChatGPT-Account-ID", account_id);
+                }
+                if headers.is_fedramp_account {
+                    builder = builder.header("X-OpenAI-Fedramp", "true");
+                }
+                builder
+            }
+        }
+    }
+}
 
 /// Strip the query string from a request target.
 ///
