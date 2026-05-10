@@ -31,6 +31,7 @@ pub mod protocol;
 pub mod secret;
 #[cfg(feature = "host")]
 pub mod server;
+pub mod telemetry;
 #[cfg(feature = "vm-client")]
 pub mod vm_client;
 #[cfg(feature = "vm-client")]

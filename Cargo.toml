@@ -73,6 +73,8 @@ bytes = { version = "1", optional = true }
 futures-util = { version = "0.3", default-features = false, optional = true }
 xz2 = { version = "0.1", features = ["static"], optional = true }
 libc = "0.2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt", "json", "std"] }
 
 [dev-dependencies]
 proptest = "1"
