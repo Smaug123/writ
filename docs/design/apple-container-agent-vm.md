@@ -401,14 +401,22 @@ Sketch:
 ```pf
 agent4 = "192.168.126.0/24"
 agent6 = "fd83:b6f2:e57:f536::/64"
+gw4 = "192.168.126.1"
+gw6 = "fd83:b6f2:e57:f536::1"
 broker_ports = "{ 18080, 18081 }"
 
-pass in quick inet proto tcp from $agent4 to any port $broker_ports keep state
-pass in quick inet6 proto tcp from $agent6 to any port $broker_ports keep state
+pass in quick inet proto tcp from $agent4 to $gw4 port $broker_ports keep state
+pass in quick inet6 proto tcp from $agent6 to $gw6 port $broker_ports keep state
 
 block return in quick inet from $agent4 to any label "writ deny agent v4"
 block return in quick inet6 from $agent6 to any label "writ deny agent v6"
 ```
+
+The allow rules pin the destination to the gateway address rather than the
+wildcard `any`, so PF mechanically enforces "agent talks to broker only" even
+if Apple's `--internal` is dropped or a routable interface is later attached
+to the bridge — defence in depth that does not rely on the surrounding network
+configuration.
 
 #### Variant B: PF redirects gateway traffic to localhost
 

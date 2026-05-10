@@ -10,7 +10,7 @@ mod session;
 pub use agent_vm::{
     AgentFirewallNetwork, AgentNetwork, AgentNetworkPool, AgentVmConfigError, BrokerPort,
     BrokerPortRange, BrokerPorts, IpFamily, Ipv4Cidr, Ipv6Cidr, PfAllowRule, PfAnchorName, PfCidr,
-    PfDenyRule, PfRuleset, render_pf, session_firewall_pf_ruleset, session_pf_ruleset,
+    PfDenyRule, PfHost, PfRuleset, render_pf, session_firewall_pf_ruleset, session_pf_ruleset,
 };
 pub use decision::{
     GitHubGrantedScope, GitHubPermissions, GrantedScope, MetadataAccess, PolicyDecision, TtlError,

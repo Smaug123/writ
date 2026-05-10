@@ -319,6 +319,11 @@ pub enum NetworkInspectionError {
     },
     #[error("inspected IPv6 gateway {gateway} is outside planned subnet {subnet}")]
     Ipv6GatewayOutsideSubnet { subnet: Ipv6Cidr, gateway: Ipv6Addr },
+    #[error("inspected IPv6 gateway {actual} does not match planned gateway {expected}")]
+    Ipv6GatewayMismatch {
+        expected: Ipv6Addr,
+        actual: Ipv6Addr,
+    },
 }
 
 #[derive(Debug, thiserror::Error, Eq, PartialEq)]
@@ -738,10 +743,12 @@ impl AgentVmSessionPlan {
                         actual: ipv6_subnet,
                     });
                 }
-                if !expected_ipv6.contains_addr(ipv6_gateway) {
-                    return Err(NetworkInspectionError::Ipv6GatewayOutsideSubnet {
-                        subnet: expected_ipv6,
-                        gateway: ipv6_gateway,
+                let expected_gateway =
+                    Ipv6Addr::from(u128::from(expected_ipv6.network()) + 1);
+                if ipv6_gateway != expected_gateway {
+                    return Err(NetworkInspectionError::Ipv6GatewayMismatch {
+                        expected: expected_gateway,
+                        actual: ipv6_gateway,
                     });
                 }
                 Ok(())
@@ -3655,13 +3662,25 @@ mod tests {
 
             let wrong_v6_gateway = AppleNetworkInspection {
                 ipv6_gateway: Some(Ipv6Addr::from(u128::from(alternate.ipv6().network()) + 1)),
-                ..matching
+                ..matching.clone()
             };
             let got_v6_gateway_mismatch = matches!(
                 plan.validate_network_inspection(&wrong_v6_gateway),
-                Err(NetworkInspectionError::Ipv6GatewayOutsideSubnet { .. })
+                Err(NetworkInspectionError::Ipv6GatewayMismatch { .. })
             );
             prop_assert!(got_v6_gateway_mismatch);
+
+            // Gateway in subnet but not the canonical first host address: PF
+            // pins to network+1, so anything else must be rejected up-front.
+            let in_subnet_wrong_v6_gateway = AppleNetworkInspection {
+                ipv6_gateway: Some(Ipv6Addr::from(u128::from(plan.network().ipv6().network()) + 2)),
+                ..matching
+            };
+            let got_in_subnet_mismatch = matches!(
+                plan.validate_network_inspection(&in_subnet_wrong_v6_gateway),
+                Err(NetworkInspectionError::Ipv6GatewayMismatch { .. })
+            );
+            prop_assert!(got_in_subnet_mismatch);
         }
 
         #[test]

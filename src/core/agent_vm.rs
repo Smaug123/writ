@@ -86,12 +86,24 @@ pub enum PfCidr {
     Inet6(Ipv6Cidr),
 }
 
+/// A single-host PF address used as the destination of an allow rule.
+///
+/// Distinct from [`PfCidr`] so the type carries the proof that the rule pins
+/// to one host (the broker) rather than a subnet — defence in depth that does
+/// not depend on the surrounding network being `--internal`.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum PfHost {
+    Inet(Ipv4Addr),
+    Inet6(Ipv6Addr),
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PfAnchorName(String);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PfAllowRule {
     source: PfCidr,
+    destination: PfHost,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -347,6 +359,15 @@ impl AgentFirewallNetwork {
     pub fn ipv6(self) -> Option<Ipv6Cidr> {
         self.ipv6
     }
+
+    pub fn ipv4_gateway(self) -> Ipv4Addr {
+        Ipv4Addr::from(u32::from(self.ipv4.network()) + 1)
+    }
+
+    pub fn ipv6_gateway(self) -> Option<Ipv6Addr> {
+        self.ipv6
+            .map(|cidr| Ipv6Addr::from(u128::from(cidr.network()) + 1))
+    }
 }
 
 impl From<AgentNetwork> for AgentFirewallNetwork {
@@ -458,6 +479,24 @@ impl std::fmt::Display for PfCidr {
     }
 }
 
+impl PfHost {
+    pub fn family(self) -> IpFamily {
+        match self {
+            Self::Inet(_) => IpFamily::Inet,
+            Self::Inet6(_) => IpFamily::Inet6,
+        }
+    }
+}
+
+impl std::fmt::Display for PfHost {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Inet(addr) => addr.fmt(f),
+            Self::Inet6(addr) => addr.fmt(f),
+        }
+    }
+}
+
 impl PfAnchorName {
     pub fn for_session(session_id: SessionId) -> Self {
         let session_id = session_id.to_string();
@@ -477,8 +516,16 @@ impl PfAnchorName {
 }
 
 impl PfAllowRule {
-    fn new(source: PfCidr) -> Self {
-        Self { source }
+    fn new(source: PfCidr, destination: PfHost) -> Self {
+        debug_assert_eq!(
+            source.family(),
+            destination.family(),
+            "allow rule source and destination must share an IP family",
+        );
+        Self {
+            source,
+            destination,
+        }
     }
 
     pub fn family(&self) -> IpFamily {
@@ -487,6 +534,10 @@ impl PfAllowRule {
 
     pub fn source(&self) -> PfCidr {
         self.source
+    }
+
+    pub fn destination(&self) -> PfHost {
+        self.destination
     }
 }
 
@@ -556,13 +607,20 @@ pub fn session_firewall_pf_ruleset(
     network: AgentFirewallNetwork,
     broker_ports: &BrokerPorts,
 ) -> PfRuleset {
-    let mut allow = vec![PfAllowRule::new(PfCidr::Inet(network.ipv4()))];
+    let mut allow = vec![PfAllowRule::new(
+        PfCidr::Inet(network.ipv4()),
+        PfHost::Inet(network.ipv4_gateway()),
+    )];
     let mut deny = vec![PfDenyRule::new(
         PfCidr::Inet(network.ipv4()),
         "writ deny agent v4",
     )];
     if let Some(ipv6) = network.ipv6() {
-        allow.push(PfAllowRule::new(PfCidr::Inet6(ipv6)));
+        let ipv6_gateway = Ipv6Addr::from(u128::from(ipv6.network()) + 1);
+        allow.push(PfAllowRule::new(
+            PfCidr::Inet6(ipv6),
+            PfHost::Inet6(ipv6_gateway),
+        ));
         deny.push(PfDenyRule::new(PfCidr::Inet6(ipv6), "writ deny agent v6"));
     }
     PfRuleset::new(
@@ -581,9 +639,10 @@ pub fn render_pf(ruleset: &PfRuleset) -> String {
     ));
     for rule in ruleset.allow() {
         out.push_str(&format!(
-            "pass in quick {} proto tcp from {} to any port $broker_ports keep state\n",
+            "pass in quick {} proto tcp from {} to {} port $broker_ports keep state\n",
             rule.family().pf_name(),
             rule.source(),
+            rule.destination(),
         ));
     }
     out.push('\n');
@@ -1022,7 +1081,15 @@ mod tests {
         assert_eq!(ruleset.allow().len(), 2);
         assert_eq!(ruleset.deny().len(), 2);
         assert_eq!(ruleset.allow()[0].source(), PfCidr::Inet(network.ipv4()));
+        assert_eq!(
+            ruleset.allow()[0].destination(),
+            PfHost::Inet(network.ipv4_gateway()),
+        );
         assert_eq!(ruleset.allow()[1].source(), PfCidr::Inet6(network.ipv6()));
+        assert_eq!(
+            ruleset.allow()[1].destination(),
+            PfHost::Inet6(Ipv6Addr::from(u128::from(network.ipv6().network()) + 1)),
+        );
         assert_eq!(ruleset.deny()[0].label(), "writ deny agent v4");
         assert_eq!(ruleset.deny()[1].label(), "writ deny agent v6");
     }
@@ -1036,8 +1103,8 @@ mod tests {
             concat!(
                 "broker_ports = \"{ 18080, 18081 }\"\n",
                 "\n",
-                "pass in quick inet proto tcp from 192.168.126.0/24 to any port $broker_ports keep state\n",
-                "pass in quick inet6 proto tcp from fd83:b6f2:e57:f536::/64 to any port $broker_ports keep state\n",
+                "pass in quick inet proto tcp from 192.168.126.0/24 to 192.168.126.1 port $broker_ports keep state\n",
+                "pass in quick inet6 proto tcp from fd83:b6f2:e57:f536::/64 to fd83:b6f2:e57:f536::1 port $broker_ports keep state\n",
                 "\n",
                 "block return in quick inet from 192.168.126.0/24 to any label \"writ deny agent v4\"\n",
                 "block return in quick inet6 from fd83:b6f2:e57:f536::/64 to any label \"writ deny agent v6\"\n",
@@ -1057,7 +1124,7 @@ mod tests {
             concat!(
                 "broker_ports = \"{ 18080, 18081 }\"\n",
                 "\n",
-                "pass in quick inet proto tcp from 192.168.126.0/24 to any port $broker_ports keep state\n",
+                "pass in quick inet proto tcp from 192.168.126.0/24 to 192.168.126.1 port $broker_ports keep state\n",
                 "\n",
                 "block return in quick inet from 192.168.126.0/24 to any label \"writ deny agent v4\"\n",
             ),
@@ -1122,6 +1189,44 @@ mod tests {
             prop_assert_eq!(rendered_broker_ports(&rendered), expected_ports);
             prop_assert_eq!(rendered.lines().filter(|line| line.starts_with("broker_ports = ")).count(), 1);
             prop_assert!(rendered.contains("port $broker_ports"));
+        }
+
+        #[test]
+        fn rendered_allow_rules_pin_destination_to_subnet_gateway(
+            (pool, index) in arb_pool_and_index(),
+        ) {
+            let network = pool.allocate(index).unwrap();
+            let ruleset = session_pf_ruleset(session_id(), network, &sample_ports());
+            let rendered = render_pf(&ruleset);
+            let v6_gateway = Ipv6Addr::from(u128::from(network.ipv6().network()) + 1);
+            let v4_clause = format!(
+                "from {} to {} port $broker_ports",
+                network.ipv4(),
+                network.ipv4_gateway(),
+            );
+            let v6_clause = format!(
+                "from {} to {} port $broker_ports",
+                network.ipv6(),
+                v6_gateway,
+            );
+
+            for line in rendered.lines() {
+                if line.starts_with("pass in quick") {
+                    prop_assert!(
+                        !line.contains(" to any "),
+                        "allow rule must pin destination, got: {line}",
+                    );
+                }
+            }
+
+            prop_assert!(
+                rendered.contains(&v4_clause),
+                "expected rendered rules to contain {v4_clause:?}",
+            );
+            prop_assert!(
+                rendered.contains(&v6_clause),
+                "expected rendered rules to contain {v6_clause:?}",
+            );
         }
 
         #[test]
