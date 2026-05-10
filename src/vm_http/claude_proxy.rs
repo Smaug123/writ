@@ -17,9 +17,9 @@ use crate::secret::{SecretKey, SecretStore};
 use crate::server::BrokerState;
 
 use super::proxy_common::{
-    ClaudeAudit, ProxyFetch, ProxyForwardHeader, ProxyStream, UpstreamAuth, is_proxy_id_byte,
-    proxy_request_wants_streaming, proxy_response_content_type, proxy_target_path,
-    read_upstream_body_bounded,
+    ClaudeBackend, ProxyBackend, ProxyFetch, ProxyForwardHeader, ProxyStream, UpstreamAuth,
+    is_proxy_id_byte, proxy_request_wants_streaming, proxy_response_content_type,
+    proxy_target_path, read_upstream_body_bounded,
 };
 use super::{
     VmHttpDispatch, VmHttpHeader, VmHttpRequest, VmHttpResponse, VmHttpResponseHeader,
@@ -105,7 +105,7 @@ impl<S: SecretStore> VmHttpClaudeProxyService<S> {
         body: Vec<u8>,
         headers: Vec<ProxyForwardHeader>,
     ) -> Result<(String, reqwest::RequestBuilder), Box<ProxyFetch>> {
-        let Some(route) = classify_claude_proxy_target(&request.target) else {
+        let Some(route) = ClaudeBackend::classify_proxy_target(&request.target) else {
             let response = VmHttpResponse::text(VmHttpStatus::NotFound, "not found");
             return Err(Box::new(ProxyFetch {
                 response_bytes: response.body.len() as u64,
@@ -239,7 +239,7 @@ impl<S: SecretStore> VmHttpClaudeProxyService<S> {
         request: &VmHttpRequest,
         body: Vec<u8>,
         headers: Vec<ProxyForwardHeader>,
-    ) -> Result<ProxyStream<S, ClaudeAudit>, ProxyFetch> {
+    ) -> Result<ProxyStream<S, ClaudeBackend>, ProxyFetch> {
         let (upstream_url, builder) = self
             .upstream_request_builder(request, body, headers)
             .map_err(|fetch| *fetch)?;
@@ -439,28 +439,88 @@ impl VmHttpClaudeProxyConfig {
     }
 }
 
-pub(super) fn is_claude_proxy_target(target: &str) -> bool {
-    classify_claude_proxy_target(target).is_some()
-}
+impl ProxyBackend for ClaudeBackend {
+    type Route = ClaudeProxyAuditRoute;
+    type AuthKind = VmHttpClaudeProxyAuthKind;
 
-pub(super) fn classify_claude_proxy_target(target: &str) -> Option<ClaudeProxyAuditRoute> {
-    // Match on the path only. Anthropic's clients pass through query params
-    // such as `?beta=true` that select endpoint variants; the broker's policy
-    // is to drop those (similar to the `anthropic-beta` header allowlist) and
-    // forward a path-only request upstream.
-    let path = proxy_target_path(target);
-    match path {
-        VM_CLAUDE_MESSAGES_PATH => Some(ClaudeProxyAuditRoute::Messages),
-        VM_CLAUDE_COUNT_TOKENS_PATH => Some(ClaudeProxyAuditRoute::CountTokens),
-        _ if claude_proxy_model_id(path).is_some() => Some(ClaudeProxyAuditRoute::Models),
-        _ if path.starts_with("/v1/messages/")
-            || path.starts_with("/v1/messages/count_tokens/")
-            || path.starts_with(VM_CLAUDE_MODELS_PREFIX)
-            || path == "/v1/models" =>
-        {
-            Some(ClaudeProxyAuditRoute::Unsupported)
+    fn classify_proxy_target(target: &str) -> Option<ClaudeProxyAuditRoute> {
+        // Match on the path only. Anthropic's clients pass through query
+        // params such as `?beta=true` that select endpoint variants; the
+        // broker's policy is to drop those (similar to the `anthropic-beta`
+        // header allowlist) and forward a path-only request upstream.
+        let path = proxy_target_path(target);
+        match path {
+            VM_CLAUDE_MESSAGES_PATH => Some(ClaudeProxyAuditRoute::Messages),
+            VM_CLAUDE_COUNT_TOKENS_PATH => Some(ClaudeProxyAuditRoute::CountTokens),
+            _ if claude_proxy_model_id(path).is_some() => Some(ClaudeProxyAuditRoute::Models),
+            _ if path.starts_with("/v1/messages/")
+                || path.starts_with("/v1/messages/count_tokens/")
+                || path.starts_with(VM_CLAUDE_MODELS_PREFIX)
+                || path == "/v1/models" =>
+            {
+                Some(ClaudeProxyAuditRoute::Unsupported)
+            }
+            _ => None,
         }
-        _ => None,
+    }
+
+    fn forward_header_name(
+        raw: &str,
+        auth_kind: VmHttpClaudeProxyAuthKind,
+    ) -> Option<reqwest::header::HeaderName> {
+        // Allowlist only. The default policy drops anthropic-beta because
+        // beta features can opt into capabilities the operator has not
+        // authorized (e.g. extended file retention, computer-use tool
+        // surfaces), so the broker — not the guest — decides which betas
+        // to enable. The OAuth auth path is the exception: it exists to
+        // host Claude Code, whose request shape includes betas the CLI
+        // emits itself, so the broker forwards anthropic-beta from the
+        // guest while still injecting its own oauth-2025-04-20 alongside.
+        // Anthropic-Version is added separately by the broker and is
+        // never forwarded from the guest.
+        if raw.eq_ignore_ascii_case("content-type") {
+            return Some(reqwest::header::CONTENT_TYPE);
+        }
+        if raw.eq_ignore_ascii_case("accept") {
+            return Some(reqwest::header::ACCEPT);
+        }
+        if raw.eq_ignore_ascii_case("user-agent") {
+            return Some(reqwest::header::USER_AGENT);
+        }
+        if auth_kind == VmHttpClaudeProxyAuthKind::OAuth
+            && raw.eq_ignore_ascii_case("anthropic-beta")
+        {
+            return Some(reqwest::header::HeaderName::from_static("anthropic-beta"));
+        }
+        None
+    }
+
+    fn response_header_name(raw: &str) -> Option<&'static str> {
+        if raw.eq_ignore_ascii_case("request-id") {
+            return Some("Request-Id");
+        }
+        if raw.eq_ignore_ascii_case("retry-after") {
+            return Some("Retry-After");
+        }
+        if raw.eq_ignore_ascii_case("anthropic-ratelimit-requests-limit") {
+            return Some("Anthropic-Ratelimit-Requests-Limit");
+        }
+        if raw.eq_ignore_ascii_case("anthropic-ratelimit-requests-remaining") {
+            return Some("Anthropic-Ratelimit-Requests-Remaining");
+        }
+        if raw.eq_ignore_ascii_case("anthropic-ratelimit-requests-reset") {
+            return Some("Anthropic-Ratelimit-Requests-Reset");
+        }
+        if raw.eq_ignore_ascii_case("anthropic-ratelimit-tokens-limit") {
+            return Some("Anthropic-Ratelimit-Tokens-Limit");
+        }
+        if raw.eq_ignore_ascii_case("anthropic-ratelimit-tokens-remaining") {
+            return Some("Anthropic-Ratelimit-Tokens-Remaining");
+        }
+        if raw.eq_ignore_ascii_case("anthropic-ratelimit-tokens-reset") {
+            return Some("Anthropic-Ratelimit-Tokens-Reset");
+        }
+        None
     }
 }
 
@@ -485,7 +545,7 @@ fn claude_proxy_forward_headers(
     let anthropic_beta_name = reqwest::header::HeaderName::from_static("anthropic-beta");
 
     for header in headers {
-        let Some(name) = claude_proxy_forward_header_name(&header.name, auth_kind) else {
+        let Some(name) = ClaudeBackend::forward_header_name(&header.name, auth_kind) else {
             continue;
         };
         let duplicate = if name == reqwest::header::CONTENT_TYPE {
@@ -513,40 +573,12 @@ fn claude_proxy_forward_headers(
     Ok(forwarded)
 }
 
-fn claude_proxy_forward_header_name(
-    raw: &str,
-    auth_kind: VmHttpClaudeProxyAuthKind,
-) -> Option<reqwest::header::HeaderName> {
-    // Allowlist only. The default policy drops anthropic-beta because beta
-    // features can opt into capabilities the operator has not authorized
-    // (e.g. extended file retention, computer-use tool surfaces), so the
-    // broker — not the guest — decides which betas to enable. The OAuth
-    // auth path is the exception: it exists to host Claude Code, whose
-    // request shape includes betas the CLI emits itself, so the broker
-    // forwards anthropic-beta from the guest while still injecting its own
-    // oauth-2025-04-20 alongside. Anthropic-Version is added separately
-    // by the broker and is never forwarded from the guest.
-    if raw.eq_ignore_ascii_case("content-type") {
-        return Some(reqwest::header::CONTENT_TYPE);
-    }
-    if raw.eq_ignore_ascii_case("accept") {
-        return Some(reqwest::header::ACCEPT);
-    }
-    if raw.eq_ignore_ascii_case("user-agent") {
-        return Some(reqwest::header::USER_AGENT);
-    }
-    if auth_kind == VmHttpClaudeProxyAuthKind::OAuth && raw.eq_ignore_ascii_case("anthropic-beta") {
-        return Some(reqwest::header::HeaderName::from_static("anthropic-beta"));
-    }
-    None
-}
-
 fn claude_proxy_response_headers(
     headers: &reqwest::header::HeaderMap,
 ) -> Vec<VmHttpResponseHeader> {
     let mut out = Vec::new();
     for (name, value) in headers {
-        let Some(forward_name) = claude_proxy_response_header_name(name.as_str()) else {
+        let Some(forward_name) = ClaudeBackend::response_header_name(name.as_str()) else {
             continue;
         };
         let Ok(value) = value.to_str() else {
@@ -560,41 +592,13 @@ fn claude_proxy_response_headers(
     out
 }
 
-fn claude_proxy_response_header_name(raw: &str) -> Option<&'static str> {
-    if raw.eq_ignore_ascii_case("request-id") {
-        return Some("Request-Id");
-    }
-    if raw.eq_ignore_ascii_case("retry-after") {
-        return Some("Retry-After");
-    }
-    if raw.eq_ignore_ascii_case("anthropic-ratelimit-requests-limit") {
-        return Some("Anthropic-Ratelimit-Requests-Limit");
-    }
-    if raw.eq_ignore_ascii_case("anthropic-ratelimit-requests-remaining") {
-        return Some("Anthropic-Ratelimit-Requests-Remaining");
-    }
-    if raw.eq_ignore_ascii_case("anthropic-ratelimit-requests-reset") {
-        return Some("Anthropic-Ratelimit-Requests-Reset");
-    }
-    if raw.eq_ignore_ascii_case("anthropic-ratelimit-tokens-limit") {
-        return Some("Anthropic-Ratelimit-Tokens-Limit");
-    }
-    if raw.eq_ignore_ascii_case("anthropic-ratelimit-tokens-remaining") {
-        return Some("Anthropic-Ratelimit-Tokens-Remaining");
-    }
-    if raw.eq_ignore_ascii_case("anthropic-ratelimit-tokens-reset") {
-        return Some("Anthropic-Ratelimit-Tokens-Reset");
-    }
-    None
-}
-
 pub(super) async fn route_claude_proxy_request<S: SecretStore>(
     session: &VmHttpSession,
     request: &VmHttpRequest,
     body: Vec<u8>,
     service: &VmHttpClaudeProxyService<S>,
 ) -> VmHttpDispatch<S> {
-    let route = classify_claude_proxy_target(&request.target)
+    let route = ClaudeBackend::classify_proxy_target(&request.target)
         .expect("caller only routes classified Claude proxy targets");
     if route == ClaudeProxyAuditRoute::Unsupported {
         let response = VmHttpResponse::text(VmHttpStatus::NotFound, "not found");
@@ -792,15 +796,15 @@ mod tests {
     #[test]
     fn classify_claude_proxy_target_recognizes_supported_routes() {
         assert_eq!(
-            classify_claude_proxy_target("/v1/messages"),
+            ClaudeBackend::classify_proxy_target("/v1/messages"),
             Some(ClaudeProxyAuditRoute::Messages),
         );
         assert_eq!(
-            classify_claude_proxy_target("/v1/messages/count_tokens"),
+            ClaudeBackend::classify_proxy_target("/v1/messages/count_tokens"),
             Some(ClaudeProxyAuditRoute::CountTokens),
         );
         assert_eq!(
-            classify_claude_proxy_target("/v1/models/claude-haiku-4-5-20251001"),
+            ClaudeBackend::classify_proxy_target("/v1/models/claude-haiku-4-5-20251001"),
             Some(ClaudeProxyAuditRoute::Models),
         );
     }
@@ -808,38 +812,38 @@ mod tests {
     #[test]
     fn classify_claude_proxy_target_treats_models_listing_and_empty_id_as_unsupported() {
         assert_eq!(
-            classify_claude_proxy_target("/v1/models"),
+            ClaudeBackend::classify_proxy_target("/v1/models"),
             Some(ClaudeProxyAuditRoute::Unsupported),
         );
         assert_eq!(
-            classify_claude_proxy_target("/v1/models/"),
+            ClaudeBackend::classify_proxy_target("/v1/models/"),
             Some(ClaudeProxyAuditRoute::Unsupported),
         );
         assert_eq!(
-            classify_claude_proxy_target("/v1/models/foo/bar"),
+            ClaudeBackend::classify_proxy_target("/v1/models/foo/bar"),
             Some(ClaudeProxyAuditRoute::Unsupported),
         );
     }
 
     #[test]
     fn classify_claude_proxy_target_rejects_unrelated_paths() {
-        assert_eq!(classify_claude_proxy_target("/v2/models/foo"), None);
-        assert_eq!(classify_claude_proxy_target("/health"), None);
-        assert_eq!(classify_claude_proxy_target(""), None);
+        assert_eq!(ClaudeBackend::classify_proxy_target("/v2/models/foo"), None);
+        assert_eq!(ClaudeBackend::classify_proxy_target("/health"), None);
+        assert_eq!(ClaudeBackend::classify_proxy_target(""), None);
     }
 
     #[test]
     fn classify_claude_proxy_target_strips_query_string() {
         assert_eq!(
-            classify_claude_proxy_target("/v1/messages?beta=true"),
+            ClaudeBackend::classify_proxy_target("/v1/messages?beta=true"),
             Some(ClaudeProxyAuditRoute::Messages),
         );
         assert_eq!(
-            classify_claude_proxy_target("/v1/messages/count_tokens?beta=true"),
+            ClaudeBackend::classify_proxy_target("/v1/messages/count_tokens?beta=true"),
             Some(ClaudeProxyAuditRoute::CountTokens),
         );
         assert_eq!(
-            classify_claude_proxy_target("/v1/models/claude-haiku-4-5-20251001?beta=true"),
+            ClaudeBackend::classify_proxy_target("/v1/models/claude-haiku-4-5-20251001?beta=true"),
             Some(ClaudeProxyAuditRoute::Models),
         );
     }
