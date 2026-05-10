@@ -449,45 +449,46 @@ impl AgentVmDaemon {
 
         let session_id = SessionId::new();
         let session_lock = self.session_lock_handle(session_id).await;
-        let _session_guard = session_lock.lock().await;
-        state.audit.open_session(&SessionRecord {
-            session_id,
-            label,
-            agent_kind,
-            agent_model,
-            opened_at: UnixMillis::now(),
-            closed_at: None,
-        })?;
-
-        let start_result = async {
-            if let Some(workspace) = workspace.as_ref() {
-                let record = workspace_bootstrap_audit_record(session_id, workspace)?;
-                state.audit.record_agent_vm_workspace_bootstrap(&record)?;
-            }
-            self.start_session_after_audit_opened(
-                Arc::clone(&state),
+        let outcome = async {
+            let _session_guard = session_lock.lock().await;
+            state.audit.open_session(&SessionRecord {
                 session_id,
-                workspace,
-                guest_command,
-                None,
-            )
-            .await
+                label,
+                agent_kind,
+                agent_model,
+                opened_at: UnixMillis::now(),
+                closed_at: None,
+            })?;
+
+            let start_result = async {
+                if let Some(workspace) = workspace.as_ref() {
+                    let record = workspace_bootstrap_audit_record(session_id, workspace)?;
+                    state.audit.record_agent_vm_workspace_bootstrap(&record)?;
+                }
+                self.start_session_after_audit_opened(
+                    Arc::clone(&state),
+                    session_id,
+                    workspace,
+                    guest_command,
+                    None,
+                )
+                .await
+            }
+            .await;
+
+            start_result.map_err(|err| {
+                close_audit_session_best_effort(&state, session_id);
+                AgentVmDaemonError::StartFailed {
+                    session_id,
+                    source: Box::new(err),
+                }
+            })
         }
         .await;
 
-        match start_result {
-            Ok(started) => Ok(started),
-            Err(err) => {
-                close_audit_session_best_effort(&state, session_id);
-                drop(_session_guard);
-                drop(session_lock);
-                self.drop_idle_session_lock(session_id).await;
-                Err(AgentVmDaemonError::StartFailed {
-                    session_id,
-                    source: Box::new(err),
-                })
-            }
-        }
+        drop(session_lock);
+        self.drop_idle_session_lock(session_id).await;
+        outcome
     }
 
     pub async fn start_agent_run_session<S: SecretStore + Send + Sync + 'static>(
@@ -500,64 +501,68 @@ impl AgentVmDaemon {
         prompt: AgentPrompt,
     ) -> Result<AgentRunStarted, AgentVmDaemonError> {
         let session_id = SessionId::new();
-        let session_lock = self.session_lock_handle(session_id).await;
-        let _session_guard = session_lock.lock().await;
         let run_id = AgentRunId::new();
-        state.audit.open_session(&SessionRecord {
-            session_id,
-            label,
-            agent_kind: Some(agent_kind),
-            agent_model: Some(agent_model.clone()),
-            opened_at: UnixMillis::now(),
-            closed_at: None,
-        })?;
-
-        let start_result = async {
-            let workspace_record = workspace_bootstrap_audit_record(session_id, &workspace)?;
-            state
-                .audit
-                .record_agent_vm_workspace_bootstrap(&workspace_record)?;
-            state.audit.record_agent_run(&AgentRunAuditRecord {
-                run_id,
+        let session_lock = self.session_lock_handle(session_id).await;
+        let outcome = async {
+            let _session_guard = session_lock.lock().await;
+            state.audit.open_session(&SessionRecord {
                 session_id,
-                requested_at: UnixMillis::now(),
-                agent_kind,
-                prompt: prompt.summary(),
+                label,
+                agent_kind: Some(agent_kind),
+                agent_model: Some(agent_model.clone()),
+                opened_at: UnixMillis::now(),
+                closed_at: None,
             })?;
-            let agent_runs = VmHttpAgentRunService::new(
-                Arc::clone(&state),
-                self.config.vm_http.agent_run_log_root(),
-            );
-            agent_runs.insert_run_config(run_id, prompt.clone(), agent_model.clone());
-            let guest_command = build_agent_run_guest_command(agent_kind, run_id, workspace.warm);
-            self.start_session_after_audit_opened(
-                Arc::clone(&state),
-                session_id,
-                Some(workspace),
-                guest_command,
-                Some(agent_runs),
-            )
-            .await
+
+            let start_result = async {
+                let workspace_record = workspace_bootstrap_audit_record(session_id, &workspace)?;
+                state
+                    .audit
+                    .record_agent_vm_workspace_bootstrap(&workspace_record)?;
+                state.audit.record_agent_run(&AgentRunAuditRecord {
+                    run_id,
+                    session_id,
+                    requested_at: UnixMillis::now(),
+                    agent_kind,
+                    prompt: prompt.summary(),
+                })?;
+                let agent_runs = VmHttpAgentRunService::new(
+                    Arc::clone(&state),
+                    self.config.vm_http.agent_run_log_root(),
+                );
+                agent_runs.insert_run_config(run_id, prompt.clone(), agent_model.clone());
+                let guest_command =
+                    build_agent_run_guest_command(agent_kind, run_id, workspace.warm);
+                self.start_session_after_audit_opened(
+                    Arc::clone(&state),
+                    session_id,
+                    Some(workspace),
+                    guest_command,
+                    Some(agent_runs),
+                )
+                .await
+            }
+            .await;
+
+            start_result
+                .map(|started| AgentRunStarted {
+                    session_id: started.session_id(),
+                    run_id,
+                    broker_url: started.broker_url().to_string(),
+                })
+                .map_err(|err| {
+                    close_audit_session_best_effort(&state, session_id);
+                    AgentVmDaemonError::StartFailed {
+                        session_id,
+                        source: Box::new(err),
+                    }
+                })
         }
         .await;
 
-        match start_result {
-            Ok(started) => Ok(AgentRunStarted {
-                session_id: started.session_id(),
-                run_id,
-                broker_url: started.broker_url().to_string(),
-            }),
-            Err(err) => {
-                close_audit_session_best_effort(&state, session_id);
-                drop(_session_guard);
-                drop(session_lock);
-                self.drop_idle_session_lock(session_id).await;
-                Err(AgentVmDaemonError::StartFailed {
-                    session_id,
-                    source: Box::new(err),
-                })
-            }
-        }
+        drop(session_lock);
+        self.drop_idle_session_lock(session_id).await;
+        outcome
     }
 
     pub async fn stop_session<S: SecretStore + Send + Sync + 'static>(

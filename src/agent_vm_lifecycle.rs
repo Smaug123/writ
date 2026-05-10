@@ -2172,19 +2172,48 @@ pub fn stop_agent_vm_session(plan: &AgentVmSessionStopPlan) -> Result<(), Cleanu
     run_stop_plan_cleanup(plan)
 }
 
+/// Atomic managed start for callers without external per-session locking.
+/// Holds the state-store file lock for the entire start (subnet claim, VM
+/// boot, status promotion) so a concurrent same-session stop cannot interleave
+/// and orphan started infrastructure. Used by the CLI runner.
+///
+/// The daemon does not call this; instead it uses the split forms
+/// [`claim_agent_vm_session_subnet`] + [`complete_agent_vm_session_start`]
+/// (and per-session in-process locks) so unrelated sessions can boot in
+/// parallel.
 pub fn start_managed_agent_vm_session(
     store: &AgentVmSessionStateStore,
     plan: &AgentVmSessionPlan,
 ) -> Result<AgentVmSessionState, AgentVmSessionManagerError> {
-    let starting = claim_agent_vm_session_subnet(store, plan)?;
-    complete_agent_vm_session_start(store, plan, starting)
+    let _lock = store.lock_store()?;
+    let starting = store.create_starting_unlocked(plan)?;
+    if let Err(start) = start_agent_vm_session(plan) {
+        if start_failure_left_dirty_infrastructure(&start) {
+            return Err(start.into());
+        }
+        return match store.remove_unlocked(plan.session_id()) {
+            Ok(()) => Err(start.into()),
+            Err(state) => Err(AgentVmSessionManagerError::StartStateCleanup {
+                start: Box::new(start),
+                state: Box::new(state),
+            }),
+        };
+    }
+    store.mark_running_unlocked(&starting).map_err(|state| {
+        AgentVmSessionManagerError::RunningStateUpdateAfterStart {
+            state: Box::new(state),
+        }
+    })
 }
 
 /// Reserve the subnet for a new session by writing a `Starting` state record.
 ///
-/// Holds the state-store file lock only for the create step, so callers can
-/// serialise just the load+pick+commit window for subnet uniqueness without
-/// blocking the slow VM boot in [`complete_agent_vm_session_start`].
+/// Holds the state-store file lock only for the create step. Callers MUST
+/// serialise this and the matching [`complete_agent_vm_session_start`] (and
+/// any concurrent stop on the same session) externally — the file lock is
+/// released between them, and a concurrent stop on the same `SessionId` would
+/// orphan the infrastructure that boot is about to start. The daemon
+/// satisfies this contract via per-`SessionId` in-process mutexes.
 pub fn claim_agent_vm_session_subnet(
     store: &AgentVmSessionStateStore,
     plan: &AgentVmSessionPlan,
@@ -2198,7 +2227,8 @@ pub fn claim_agent_vm_session_subnet(
 ///
 /// Runs the slow VM boot without holding the state-store file lock; only
 /// `mark_running` (or rollback `remove`) re-takes the lock for the brief
-/// status transition.
+/// status transition. See [`claim_agent_vm_session_subnet`] for the caller
+/// serialisation contract.
 pub fn complete_agent_vm_session_start(
     store: &AgentVmSessionStateStore,
     plan: &AgentVmSessionPlan,
@@ -2227,14 +2257,19 @@ fn start_failure_left_dirty_infrastructure(error: &AgentVmLifecycleRunError) -> 
     matches!(error, AgentVmLifecycleRunError::CleanupAfterFailure { .. })
 }
 
+/// Atomic managed stop for callers without external per-session locking.
+/// Holds the state-store file lock across load, infra teardown, and state
+/// removal so a concurrent same-session start cannot interleave. Used by the
+/// CLI runner; the daemon uses the split forms below under per-session locks.
 pub fn stop_managed_agent_vm_session(
     store: &AgentVmSessionStateStore,
     session_id: SessionId,
     tools: AgentVmToolPaths,
 ) -> Result<(), AgentVmSessionManagerError> {
-    let state = store.load(session_id)?;
+    let _lock = store.lock_store()?;
+    let state = store.load_unlocked(session_id)?;
     cleanup_managed_agent_vm_session_unlocked(&state, tools)?;
-    remove_managed_agent_vm_session_state(store, session_id)
+    remove_managed_agent_vm_session_state_unlocked(store, session_id)
 }
 
 /// Run VM, firewall, and network cleanup while preserving the persisted state
@@ -2242,7 +2277,11 @@ pub fn stop_managed_agent_vm_session(
 /// can fail without losing the cleanup facts needed for a retry.
 ///
 /// The state-store file lock is taken only for the brief `load`; the slow VM
-/// teardown runs unlocked so unrelated session lifecycles can proceed.
+/// teardown runs unlocked. Callers MUST serialise this and the matching
+/// [`remove_managed_agent_vm_session_state`] against any concurrent operation
+/// on the same `SessionId` externally — see [`claim_agent_vm_session_subnet`]
+/// for the same caveat. The daemon satisfies this contract via per-session
+/// in-process mutexes.
 pub fn cleanup_managed_agent_vm_session(
     store: &AgentVmSessionStateStore,
     session_id: SessionId,
@@ -2253,12 +2292,24 @@ pub fn cleanup_managed_agent_vm_session(
 }
 
 /// Remove a managed session state record after all daemon-side stop effects
-/// have completed successfully.
+/// have completed successfully. Pairs with [`cleanup_managed_agent_vm_session`]
+/// under the same external-serialisation contract.
 pub fn remove_managed_agent_vm_session_state(
     store: &AgentVmSessionStateStore,
     session_id: SessionId,
 ) -> Result<(), AgentVmSessionManagerError> {
     store.remove(session_id).map_err(|state| {
+        AgentVmSessionManagerError::StateRemoveAfterStop {
+            state: Box::new(state),
+        }
+    })
+}
+
+fn remove_managed_agent_vm_session_state_unlocked(
+    store: &AgentVmSessionStateStore,
+    session_id: SessionId,
+) -> Result<(), AgentVmSessionManagerError> {
+    store.remove_unlocked(session_id).map_err(|state| {
         AgentVmSessionManagerError::StateRemoveAfterStop {
             state: Box::new(state),
         }
