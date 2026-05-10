@@ -16,10 +16,10 @@ use writ::agent_run::{
 use writ::core::AgentKind;
 use writ::vm_client::{
     VM_BROKER_TOKEN_ENV, VM_BROKER_URL_ENV, VmClientConfig, VmClientConfigError, VmGitCloneCommand,
-    VmWorkspaceInitCommand, clone_from_broker, fetch_agent_run_config, get_session_json,
-    init_workspace_from_broker, upload_agent_run_outcome,
+    VmGitPushCommand, VmWorkspaceInitCommand, clone_from_broker, fetch_agent_run_config,
+    get_session_json, init_workspace_from_broker, push_to_broker, upload_agent_run_outcome,
 };
-use writ::vm_git::{GitCloneRef, GitCloneRepo, WorkspaceWarmMode};
+use writ::vm_git::{GitBranchName, GitCloneRef, GitCloneRepo, GitObjectId, WorkspaceWarmMode};
 
 #[derive(Parser)]
 #[command(name = "writ-vm", about = "guest-side writ VM broker client")]
@@ -66,6 +66,40 @@ enum GitCmd {
         /// Optional branch, tag, or ref to clone.
         #[arg(long = "ref")]
         git_ref: Option<String>,
+        /// Git executable inside the guest.
+        #[arg(long, default_value = "git")]
+        git: PathBuf,
+    },
+    /// Stage a Git push through the host broker for human review.
+    ///
+    /// All refs are explicit: `--branch`, `--new-head`, and either
+    /// `--expected-remote-head <oid>` for a fast-forward update or
+    /// `--create-branch` for a new branch with no upstream history.
+    Push {
+        /// Repository in owner/name form.
+        repo: String,
+        /// Branch name to push (without the `refs/heads/` prefix).
+        #[arg(long)]
+        branch: String,
+        /// New commit object ID that the local branch must currently resolve to.
+        #[arg(long = "new-head")]
+        new_head: String,
+        /// Object ID the upstream branch must currently point at, asserted by
+        /// the human reviewer at promotion time. Mutually exclusive with
+        /// `--create-branch`.
+        #[arg(long = "expected-remote-head", conflicts_with = "create_branch")]
+        expected_remote_head: Option<String>,
+        /// Push creates the branch upstream — the bundle must contain its
+        /// full history with no `--not` exclusion. Mutually exclusive with
+        /// `--expected-remote-head`.
+        #[arg(
+            long = "create-branch",
+            required_unless_present = "expected_remote_head"
+        )]
+        create_branch: bool,
+        /// Local repository working directory containing the branch to push.
+        #[arg(long)]
+        workdir: PathBuf,
         /// Git executable inside the guest.
         #[arg(long, default_value = "git")]
         git: PathBuf,
@@ -147,6 +181,37 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 let destination = clone_from_broker(&config, &command).await?;
                 println!("{}", destination.display());
             }
+            GitCmd::Push {
+                repo,
+                branch,
+                new_head,
+                expected_remote_head,
+                create_branch,
+                workdir,
+                git,
+            } => {
+                let repo = parse_repo(&repo)?;
+                let branch = parse_branch(&branch)?;
+                let new_head = parse_object_id(&new_head)?;
+                let expected_remote_head = match (expected_remote_head, create_branch) {
+                    (Some(_), true) => unreachable!("clap conflicts_with rules out this case"),
+                    (Some(oid), false) => Some(parse_object_id(&oid)?),
+                    (None, true) => None,
+                    (None, false) => unreachable!(
+                        "clap required_unless_present rules out --expected-remote-head absent without --create-branch"
+                    ),
+                };
+                let command = VmGitPushCommand::new(
+                    repo,
+                    branch,
+                    new_head,
+                    expected_remote_head,
+                    workdir,
+                    git,
+                )?;
+                let receipt = push_to_broker(&config, &command).await?;
+                println!("{}", serde_json::to_string_pretty(&receipt)?);
+            }
         },
         Cmd::Workspace { action } => match action {
             WorkspaceCmd::Init {
@@ -206,6 +271,16 @@ fn parse_repo(raw: &str) -> Result<GitCloneRepo, Box<dyn std::error::Error>> {
 fn parse_git_ref(raw: &str) -> Result<GitCloneRef, Box<dyn std::error::Error>> {
     raw.parse()
         .map_err(|error| format!("invalid Git ref {raw:?}: {error}").into())
+}
+
+fn parse_branch(raw: &str) -> Result<GitBranchName, Box<dyn std::error::Error>> {
+    raw.parse()
+        .map_err(|error| format!("invalid Git branch name {raw:?}: {error}").into())
+}
+
+fn parse_object_id(raw: &str) -> Result<GitObjectId, Box<dyn std::error::Error>> {
+    raw.parse()
+        .map_err(|error| format!("invalid Git object id {raw:?}: {error}").into())
 }
 
 fn parse_agent_kind(raw: &str) -> Result<AgentKind, String> {
@@ -420,6 +495,146 @@ mod tests {
         let help = String::from_utf8(help).unwrap();
         assert!(help.contains(VM_BROKER_TOKEN_ENV), "{help}");
         assert!(!help.contains("writ-vm-secret"), "{help}");
+    }
+
+    #[test]
+    fn git_push_requires_either_create_branch_or_expected_remote_head() {
+        let oid = "a".repeat(40);
+        let result = Args::try_parse_from([
+            "writ-vm",
+            "git",
+            "push",
+            "owner/repo",
+            "--branch",
+            "feature/x",
+            "--new-head",
+            oid.as_str(),
+            "--workdir",
+            "/tmp/repo",
+        ]);
+        let err = match result {
+            Ok(_) => panic!(
+                "clap should reject the command without --create-branch or --expected-remote-head"
+            ),
+            Err(err) => err,
+        };
+        let message = err.to_string();
+        assert!(
+            message.contains("--create-branch")
+                || message.contains("create-branch")
+                || message.contains("expected-remote-head"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn git_push_rejects_create_branch_combined_with_expected_remote_head() {
+        let oid = "a".repeat(40);
+        let other = "b".repeat(40);
+        let result = Args::try_parse_from([
+            "writ-vm",
+            "git",
+            "push",
+            "owner/repo",
+            "--branch",
+            "feature/x",
+            "--new-head",
+            oid.as_str(),
+            "--expected-remote-head",
+            other.as_str(),
+            "--create-branch",
+            "--workdir",
+            "/tmp/repo",
+        ]);
+        let err = match result {
+            Ok(_) => {
+                panic!("clap should reject --create-branch combined with --expected-remote-head")
+            }
+            Err(err) => err,
+        };
+        let message = err.to_string();
+        assert!(
+            message.contains("cannot be used") || message.contains("conflicts"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn git_push_accepts_explicit_expected_remote_head_form() {
+        let new_head = "a".repeat(40);
+        let expected = "b".repeat(40);
+        let args = Args::try_parse_from([
+            "writ-vm",
+            "git",
+            "push",
+            "owner/repo",
+            "--branch",
+            "feature/x",
+            "--new-head",
+            new_head.as_str(),
+            "--expected-remote-head",
+            expected.as_str(),
+            "--workdir",
+            "/tmp/repo",
+        ])
+        .unwrap();
+
+        match args.cmd {
+            Cmd::Git {
+                action:
+                    GitCmd::Push {
+                        repo,
+                        branch,
+                        new_head: nh,
+                        expected_remote_head,
+                        create_branch,
+                        workdir,
+                        ..
+                    },
+            } => {
+                assert_eq!(repo, "owner/repo");
+                assert_eq!(branch, "feature/x");
+                assert_eq!(nh, new_head);
+                assert_eq!(expected_remote_head.as_deref(), Some(expected.as_str()));
+                assert!(!create_branch);
+                assert_eq!(workdir, PathBuf::from("/tmp/repo"));
+            }
+            _ => panic!("unexpected command"),
+        }
+    }
+
+    #[test]
+    fn git_push_accepts_create_branch_form() {
+        let new_head = "a".repeat(40);
+        let args = Args::try_parse_from([
+            "writ-vm",
+            "git",
+            "push",
+            "owner/repo",
+            "--branch",
+            "feature/new",
+            "--new-head",
+            new_head.as_str(),
+            "--create-branch",
+            "--workdir",
+            "/tmp/repo",
+        ])
+        .unwrap();
+
+        match args.cmd {
+            Cmd::Git {
+                action:
+                    GitCmd::Push {
+                        expected_remote_head,
+                        create_branch,
+                        ..
+                    },
+            } => {
+                assert!(expected_remote_head.is_none());
+                assert!(create_branch);
+            }
+            _ => panic!("unexpected command"),
+        }
     }
 
     #[test]
