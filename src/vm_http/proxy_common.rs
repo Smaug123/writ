@@ -208,10 +208,56 @@ pub(super) trait ProxyAudit: 'static {
     );
 }
 
-/// Marker selecting the Claude proxy audit log.
-pub(super) struct ClaudeAudit;
+/// Per-backend behaviour the VM HTTP proxy dispatcher relies on.
+///
+/// Implementations are zero-sized types (one per upstream provider)
+/// that select a target/route classification, an auth-shape selector,
+/// and a header allowlist. Audit-log selection is inherited via the
+/// `ProxyAudit` supertrait, so a single backend marker carries every
+/// per-provider decision the dispatcher needs to make. Routing and
+/// request execution still live in the per-backend modules pending
+/// the unified service struct.
+pub(super) trait ProxyBackend: ProxyAudit {
+    /// The audit-log route enum the backend classifies a target into
+    /// (e.g., `ClaudeProxyAuditRoute`).
+    type Route: Copy + Send + 'static;
+    /// The auth-shape selector this backend supports (e.g.,
+    /// `VmHttpClaudeProxyAuthKind`).
+    type AuthKind: Copy;
 
-impl ProxyAudit for ClaudeAudit {
+    /// Classify a guest-facing request target into one of this
+    /// backend's audit routes, or `None` if the target is not a proxy
+    /// request for this backend.
+    fn classify_proxy_target(target: &str) -> Option<Self::Route>;
+
+    /// Whether the target belongs to this backend at all. Defaulted
+    /// via `classify_proxy_target` so backend impls only state the
+    /// classification once.
+    fn is_proxy_target(target: &str) -> bool {
+        Self::classify_proxy_target(target).is_some()
+    }
+
+    /// Map a guest-supplied request header name into the canonical
+    /// header name to forward upstream. Returning `None` drops the
+    /// header. The `auth_kind` argument is used because some headers
+    /// (e.g., `anthropic-beta`) are only forwarded for specific auth
+    /// shapes.
+    fn forward_header_name(
+        raw: &str,
+        auth_kind: Self::AuthKind,
+    ) -> Option<reqwest::header::HeaderName>;
+
+    /// Map an upstream response header name into the canonical header
+    /// name to forward back to the guest. Returning `None` drops the
+    /// header.
+    fn response_header_name(raw: &str) -> Option<&'static str>;
+}
+
+/// Backend marker selecting the Claude proxy: its routing/header
+/// allowlist (via `ProxyBackend`) and its audit log (via `ProxyAudit`).
+pub(super) struct ClaudeBackend;
+
+impl ProxyAudit for ClaudeBackend {
     const DISPLAY_NAME: &'static str = "Claude";
 
     fn record_outcome<S: SecretStore>(
@@ -236,10 +282,11 @@ impl ProxyAudit for ClaudeAudit {
     }
 }
 
-/// Marker selecting the OpenAI proxy audit log.
-pub(super) struct OpenAiAudit;
+/// Backend marker selecting the OpenAI proxy: its routing/header
+/// allowlist (via `ProxyBackend`) and its audit log (via `ProxyAudit`).
+pub(super) struct OpenAiBackend;
 
-impl ProxyAudit for OpenAiAudit {
+impl ProxyAudit for OpenAiBackend {
     const DISPLAY_NAME: &'static str = "OpenAI";
 
     fn record_outcome<S: SecretStore>(
