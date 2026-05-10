@@ -57,6 +57,7 @@ const TTL_SKEW_TOLERANCE_SECONDS: i64 = 60;
 
 /// Static configuration for one GitHub App installation.
 #[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GitHubAppConfig {
     pub app_id: u64,
     pub installation_id: u64,
@@ -1697,6 +1698,26 @@ mod tests {
         assert_eq!(
             url,
             "https://example.com/api/v3/app/installations/7/access_tokens"
+        );
+    }
+
+    /// A typo on `api_base` (e.g. `apiBase`) used to be silently ignored,
+    /// causing a GHE-Server-targeted deployment to mint installation tokens
+    /// against public GitHub instead. `deny_unknown_fields` forces a hard
+    /// failure at config load time.
+    #[test]
+    fn github_app_config_rejects_unknown_field() {
+        let json = r#"{
+            "app_id": 1,
+            "installation_id": 2,
+            "installation_owner": "o",
+            "private_key_secret": "pk",
+            "apiBase": "https://github.example.com/api/v3"
+        }"#;
+        let err = serde_json::from_str::<GitHubAppConfig>(json).unwrap_err();
+        assert!(
+            err.to_string().contains("apiBase"),
+            "error should mention the unknown field, got: {err}"
         );
     }
 }

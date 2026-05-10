@@ -20,6 +20,7 @@ use crate::core::{
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PolicyConfig {
     /// Repos on which write access is permitted. Read access is permitted
     /// on any repo that the GitHub App installation itself can see.
@@ -277,6 +278,22 @@ mod tests {
     fn policy_config_rejects_out_of_range_ttl() {
         let json = r#"{"default_ttl": 99999, "writable_repos": []}"#;
         assert!(serde_json::from_str::<PolicyConfig>(json).is_err());
+    }
+
+    /// A typo on `writable_repos` (e.g. `writableRepos`) would otherwise
+    /// silently default the allowlist to empty — fail-closed in this case,
+    /// but still wrong-by-stealth. Reject at load time instead.
+    #[test]
+    fn policy_config_rejects_unknown_field() {
+        let json = r#"{
+            "default_ttl": 300,
+            "writableRepos": ["smaug123/writ"]
+        }"#;
+        let err = serde_json::from_str::<PolicyConfig>(json).unwrap_err();
+        assert!(
+            err.to_string().contains("writableRepos"),
+            "error should mention the unknown field, got: {err}"
+        );
     }
 
     // --- Property-based ---------------------------------------------------
