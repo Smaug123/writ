@@ -624,8 +624,8 @@ impl<A: ProxyAudit> ProxyStream<A> {
 /// auth-resolution strategy, and the audit-record shape; everything
 /// else (the reqwest client, the request-buffering and streaming code
 /// paths, the upstream body cap) is identical across providers and
-/// lives here. Per-backend type aliases (`VmHttpClaudeProxyService`
-/// and `VmHttpOpenAiProxyService`) preserve the original surface.
+/// lives here. Per-backend callers reach this type through the
+/// `VmHttpClaudeProxyService` / `VmHttpOpenAiProxyService` aliases.
 pub(super) struct VmHttpProxyService<B: ProxyBackend, S: SecretStore + Send + Sync + 'static> {
     pub(super) broker_state: Arc<BrokerState<S>>,
     pub(super) config: B::Config,

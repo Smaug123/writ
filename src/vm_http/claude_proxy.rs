@@ -24,9 +24,6 @@ pub(super) const VM_CLAUDE_COUNT_TOKENS_PATH: &str = "/v1/messages/count_tokens"
 pub(super) const VM_CLAUDE_MODELS_PREFIX: &str = "/v1/models/";
 pub const DEFAULT_CLAUDE_ANTHROPIC_VERSION: &str = "2023-06-01";
 
-/// Type alias preserving the original Claude proxy service surface
-/// (`VmHttpClaudeProxyService<S>`). The behaviour is provided generically by
-/// `VmHttpProxyService<ClaudeBackend, S>`.
 pub(super) type VmHttpClaudeProxyService<S> = VmHttpProxyService<ClaudeBackend, S>;
 
 #[derive(Clone, Debug, Eq, PartialEq)]

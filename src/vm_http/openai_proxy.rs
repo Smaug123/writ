@@ -30,9 +30,6 @@ pub(super) const VM_OPENAI_RESPONSE_CANCEL_SUFFIX: &str = "/cancel";
 pub(super) const VM_OPENAI_MODELS_PATH: &str = "/v1/models";
 pub(super) const VM_OPENAI_MODELS_PREFIX: &str = "/v1/models/";
 
-/// Type alias preserving the original OpenAI proxy service surface
-/// (`VmHttpOpenAiProxyService<S>`). The behaviour is provided generically by
-/// `VmHttpProxyService<OpenAiBackend, S>`.
 pub(super) type VmHttpOpenAiProxyService<S> = VmHttpProxyService<OpenAiBackend, S>;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
