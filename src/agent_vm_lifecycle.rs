@@ -2315,11 +2315,11 @@ pub fn remove_managed_agent_vm_session_state(
     store: &AgentVmSessionStateStore,
     session_id: SessionId,
 ) -> Result<(), AgentVmSessionManagerError> {
-    store.remove(session_id).map_err(|state| {
-        AgentVmSessionManagerError::StateRemoveAfterStop {
+    store
+        .remove(session_id)
+        .map_err(|state| AgentVmSessionManagerError::StateRemoveAfterStop {
             state: Box::new(state),
-        }
-    })
+        })
 }
 
 fn remove_managed_agent_vm_session_state_unlocked(
