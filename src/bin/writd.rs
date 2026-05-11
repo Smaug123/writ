@@ -12,6 +12,7 @@ use clap::Parser;
 use writ::agent_vm_daemon::AgentVmDaemon;
 use writ::audit::AuditLog;
 use writ::config::{DaemonConfig, SecretStoreConfig, default_audit_db_path, default_config_path};
+use writ::git_push_staging::GitPushStagingStore;
 use writ::github::GitHubMinter;
 use writ::secret::{FileSecretStore, KeyringSecretStore, SecretStore};
 use writ::server::{BrokerState, default_socket_path, run_with_agent_vm};
@@ -78,11 +79,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         SecretStoreConfig::Keyring { service } => Box::new(KeyringSecretStore::new(service)),
     };
 
+    // The staging store and the agent-VM daemon both read the same root
+    // out of vm_http. Open it once here so the broker can serve promote
+    // queries even when the in-memory agent-VM runtime is not attached.
+    let staging_store = agent_vm
+        .as_ref()
+        .map(|cfg| {
+            let path = cfg.vm_http().git_push_staging_root().to_path_buf();
+            GitPushStagingStore::open(path.clone())
+                .map(Arc::new)
+                .map_err(|e| format!("cannot open git push staging store at {path:?}: {e}"))
+        })
+        .transpose()?;
+
     let state = Arc::new(BrokerState {
         audit: Arc::new(audit),
         minter: GitHubMinter::new_registry(github_apps),
         secrets: store,
         policy,
+        staging_store,
     });
 
     tracing::info!(

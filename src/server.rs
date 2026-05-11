@@ -24,19 +24,27 @@ use crate::core::{
     CapabilityRequest, GrantedScope, PolicyDecision, RequestId, SessionId, SessionRecord,
     TtlSeconds, UnixMillis,
 };
+use crate::git_push_staging::{GitPushStagingStore, StagedEntry, StagingError};
 use crate::github::GitHubMinter;
 use crate::policy::{self, PolicyConfig};
-use crate::protocol::{ClientMessage, ServerMessage};
+use crate::protocol::{
+    ClientMessage, ServerMessage, StagedPushAuditView, StagedPushDetail, StagedPushSummary,
+};
 use crate::secret::SecretStore;
 
 /// Shared state for the broker. Wrapped in `Arc` so connections spawned
 /// onto different tokio tasks can all reference the same audit log,
 /// minter config, and secret store.
+///
+/// `staging_store` is `Some` exactly when the daemon was configured with
+/// agent-VM HTTP support (the staging root lives under `vm_http`).
+/// Promote operations fail with a configuration error when it is `None`.
 pub struct BrokerState<S: SecretStore> {
     pub audit: Arc<AuditLog>,
     pub minter: GitHubMinter,
     pub secrets: S,
     pub policy: PolicyConfig,
+    pub staging_store: Option<Arc<GitPushStagingStore>>,
 }
 
 #[derive(Clone, Eq, PartialEq)]
@@ -247,6 +255,116 @@ pub async fn dispatch_message_with_agent_vm<S: SecretStore + Send + Sync + 'stat
                 message: "agent VM runtime is not configured".into(),
             },
         },
+        ClientMessage::ListStagedPushes {} => list_staged_pushes(state).await,
+        ClientMessage::ShowStagedPush { request_id } => show_staged_push(state, request_id).await,
+    }
+}
+
+async fn list_staged_pushes<S: SecretStore + Send + Sync + 'static>(
+    state: &Arc<BrokerState<S>>,
+) -> ServerMessage {
+    let Some(staging_store) = state.staging_store.clone() else {
+        return staging_not_configured();
+    };
+    // The staging store is sync; hop it off the async runtime so a
+    // directory-walk on a slow filesystem doesn't block other connections.
+    let result = tokio::task::spawn_blocking(move || staging_store.list()).await;
+    match result {
+        Ok(Ok(receipts)) => {
+            let pushes = receipts
+                .iter()
+                .map(StagedPushSummary::from_receipt)
+                .collect();
+            ServerMessage::StagedPushes { pushes }
+        }
+        Ok(Err(err)) => ServerMessage::Error {
+            message: err.to_string(),
+        },
+        Err(err) => ServerMessage::Error {
+            message: format!("staging list task failed: {err}"),
+        },
+    }
+}
+
+async fn show_staged_push<S: SecretStore + Send + Sync + 'static>(
+    state: &Arc<BrokerState<S>>,
+    request_id: RequestId,
+) -> ServerMessage {
+    let Some(staging_store) = state.staging_store.clone() else {
+        return staging_not_configured();
+    };
+    let entry: StagedEntry = match tokio::task::spawn_blocking({
+        let staging_store = Arc::clone(&staging_store);
+        move || staging_store.load(request_id)
+    })
+    .await
+    {
+        Ok(Ok(entry)) => entry,
+        Ok(Err(StagingError::NotFound { request_id })) => {
+            return ServerMessage::UnknownStagedPush { request_id };
+        }
+        Ok(Err(err)) => {
+            return ServerMessage::Error {
+                message: err.to_string(),
+            };
+        }
+        Err(err) => {
+            return ServerMessage::Error {
+                message: format!("staging load task failed: {err}"),
+            };
+        }
+    };
+
+    let audit_lookup = {
+        let audit = Arc::clone(&state.audit);
+        tokio::task::spawn_blocking(move || audit.get_git_push(request_id)).await
+    };
+    let audit_entry = match audit_lookup {
+        Ok(Ok(Some(entry))) => entry,
+        Ok(Ok(None)) => {
+            // Staged on disk but no audit row — broker invariant violation.
+            // Surface explicitly rather than fabricating a `received_at`.
+            return ServerMessage::Error {
+                message: format!(
+                    "staged push {request_id} has no audit record; \
+                     promotion cannot proceed until the broker state is repaired",
+                ),
+            };
+        }
+        Ok(Err(err)) => {
+            return ServerMessage::Error {
+                message: err.to_string(),
+            };
+        }
+        Err(err) => {
+            return ServerMessage::Error {
+                message: format!("audit lookup task failed: {err}"),
+            };
+        }
+    };
+
+    let (receipt, bundle) = entry.into_parts();
+    let bundle_bytes = bundle.len() as u64;
+    let summary = StagedPushSummary::from_receipt(&receipt);
+    let audit = StagedPushAuditView {
+        session_id: audit_entry.session_id,
+        received_at: audit_entry.received_at,
+        result: audit_entry.result,
+    };
+    ServerMessage::StagedPush {
+        push: StagedPushDetail {
+            summary,
+            bundle_bytes,
+            audit,
+        },
+    }
+}
+
+fn staging_not_configured() -> ServerMessage {
+    ServerMessage::Error {
+        message: "git push staging is not configured; \
+                  the broker config needs an agent_vm.vm_http section"
+            .into(),
     }
 }
 
@@ -708,6 +826,7 @@ mod tests {
                 writable_repos: writable,
                 default_ttl: crate::core::TtlSeconds::new(3600).unwrap(),
             },
+            staging_store: None,
         })
     }
 
@@ -753,6 +872,7 @@ mod tests {
                 writable_repos: Vec::new(),
                 default_ttl: crate::core::TtlSeconds::new(3600).unwrap(),
             },
+            staging_store: None,
         })
     }
 
@@ -883,6 +1003,231 @@ mod tests {
                 message: "agent VM runtime is not configured".into()
             }
         );
+    }
+
+    // --- Staged-push listing / show -------------------------------------
+
+    /// Build a `BrokerState` whose `staging_store` points at a fresh temp
+    /// directory. Returned alongside the `TempDir` so the caller keeps the
+    /// staging root alive for the duration of the test.
+    fn make_state_with_staging(
+        server: &MockServer,
+    ) -> (Arc<BrokerState<InMemStore>>, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = GitPushStagingStore::open(tmp.path().join("staging")).unwrap();
+        let mut state = make_state(server, vec![], "o");
+        let inner = Arc::get_mut(&mut state).expect("fresh Arc has no other handles");
+        inner.staging_store = Some(Arc::new(store));
+        (state, tmp)
+    }
+
+    fn sample_clone_repo() -> crate::vm_git::GitCloneRepo {
+        "owner/repo".parse().unwrap()
+    }
+
+    fn sample_branch() -> crate::vm_git::GitBranchName {
+        "feature/x".parse().unwrap()
+    }
+
+    fn sample_object_id(nibble: char) -> crate::vm_git::GitObjectId {
+        std::iter::repeat_n(nibble, 40)
+            .collect::<String>()
+            .parse()
+            .unwrap()
+    }
+
+    /// Stage a push on disk *and* record the matching audit row so the
+    /// joined Show view has both halves available. Returns the request id.
+    async fn stage_with_audit(
+        state: &Arc<BrokerState<InMemStore>>,
+        session_id: SessionId,
+        bundle: Vec<u8>,
+        staged_at: UnixMillis,
+        received_at: UnixMillis,
+    ) -> RequestId {
+        let request_id = RequestId::new();
+        let metadata = crate::vm_git::VmGitPushMetadata::new(
+            sample_clone_repo(),
+            sample_branch(),
+            Some(sample_object_id('a')),
+            sample_object_id('b'),
+        );
+        let staging = state
+            .staging_store
+            .as_ref()
+            .expect("staging configured")
+            .clone();
+        let bundle_for_stage = bundle.clone();
+        tokio::task::spawn_blocking(move || {
+            staging
+                .stage(request_id, staged_at, metadata, bundle_for_stage)
+                .unwrap();
+        })
+        .await
+        .unwrap();
+        state
+            .audit
+            .record_git_push_request(&crate::audit::GitPushRequestRecord {
+                push_request_id: request_id,
+                session_id,
+                received_at,
+                repo: sample_clone_repo(),
+                branch: sample_branch(),
+                expected_remote_head: Some(sample_object_id('a')),
+                new_head: sample_object_id('b'),
+            })
+            .unwrap();
+        request_id
+    }
+
+    #[tokio::test]
+    async fn list_staged_pushes_without_staging_configured_returns_error() {
+        let server = MockServer::start().await;
+        let state = make_state(&server, vec![], "o");
+        let resp = dispatch_message(ClientMessage::ListStagedPushes {}, &state).await;
+        match resp {
+            ServerMessage::Error { message } => {
+                assert!(message.contains("staging"), "got: {message}");
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn list_staged_pushes_with_empty_store_returns_empty_list() {
+        let server = MockServer::start().await;
+        let (state, _tmp) = make_state_with_staging(&server);
+        let resp = dispatch_message(ClientMessage::ListStagedPushes {}, &state).await;
+        assert_eq!(resp, ServerMessage::StagedPushes { pushes: vec![] });
+    }
+
+    #[tokio::test]
+    async fn list_staged_pushes_returns_summary_for_each_staged_entry() {
+        let server = MockServer::start().await;
+        let (state, _tmp) = make_state_with_staging(&server);
+        let session_id = open_session(&state).await;
+
+        let id_a = stage_with_audit(
+            &state,
+            session_id,
+            b"bundle-a".to_vec(),
+            UnixMillis::from_millis(1_700_000_001_000),
+            UnixMillis::from_millis(1_700_000_001_500),
+        )
+        .await;
+        let id_b = stage_with_audit(
+            &state,
+            session_id,
+            b"bundle-b".to_vec(),
+            UnixMillis::from_millis(1_700_000_002_000),
+            UnixMillis::from_millis(1_700_000_002_500),
+        )
+        .await;
+
+        let resp = dispatch_message(ClientMessage::ListStagedPushes {}, &state).await;
+        let mut pushes = match resp {
+            ServerMessage::StagedPushes { pushes } => pushes,
+            other => panic!("expected StagedPushes, got {other:?}"),
+        };
+        pushes.sort_by_key(|p| p.staged_at);
+        assert_eq!(pushes.len(), 2);
+        assert_eq!(pushes[0].push_request_id, id_a);
+        assert_eq!(pushes[0].staged_at.as_millis(), 1_700_000_001_000);
+        assert_eq!(pushes[1].push_request_id, id_b);
+        assert_eq!(pushes[1].staged_at.as_millis(), 1_700_000_002_000);
+    }
+
+    #[tokio::test]
+    async fn show_staged_push_without_staging_configured_returns_error() {
+        let server = MockServer::start().await;
+        let state = make_state(&server, vec![], "o");
+        let resp = dispatch_message(
+            ClientMessage::ShowStagedPush {
+                request_id: RequestId::new(),
+            },
+            &state,
+        )
+        .await;
+        match resp {
+            ServerMessage::Error { message } => {
+                assert!(message.contains("staging"), "got: {message}");
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn show_staged_push_for_unknown_request_id_returns_unknown_staged_push() {
+        let server = MockServer::start().await;
+        let (state, _tmp) = make_state_with_staging(&server);
+        let request_id = RequestId::new();
+        let resp = dispatch_message(ClientMessage::ShowStagedPush { request_id }, &state).await;
+        assert_eq!(resp, ServerMessage::UnknownStagedPush { request_id });
+    }
+
+    #[tokio::test]
+    async fn show_staged_push_returns_detail_joining_staging_and_audit() {
+        let server = MockServer::start().await;
+        let (state, _tmp) = make_state_with_staging(&server);
+        let session_id = open_session(&state).await;
+
+        let staged_at = UnixMillis::from_millis(1_700_000_500_000);
+        let received_at = UnixMillis::from_millis(1_700_000_500_250);
+        let bundle = b"PACK bundle payload".to_vec();
+        let request_id =
+            stage_with_audit(&state, session_id, bundle.clone(), staged_at, received_at).await;
+
+        let resp = dispatch_message(ClientMessage::ShowStagedPush { request_id }, &state).await;
+        let push = match resp {
+            ServerMessage::StagedPush { push } => push,
+            other => panic!("expected StagedPush, got {other:?}"),
+        };
+        assert_eq!(push.summary.push_request_id, request_id);
+        assert_eq!(push.summary.staged_at, staged_at);
+        assert_eq!(push.bundle_bytes, bundle.len() as u64);
+        assert_eq!(push.audit.session_id, session_id);
+        assert_eq!(push.audit.received_at, received_at);
+        // No outcome row recorded → audit.result stays None.
+        assert_eq!(push.audit.result, None);
+    }
+
+    /// If the on-disk staging entry has no matching audit row, the
+    /// broker must surface that as an Error rather than fabricating a
+    /// `received_at`. This protects the audit-chain invariant that
+    /// every staged push has a request row.
+    #[tokio::test]
+    async fn show_staged_push_with_orphan_staging_returns_error() {
+        let server = MockServer::start().await;
+        let (state, _tmp) = make_state_with_staging(&server);
+
+        let request_id = RequestId::new();
+        let metadata = crate::vm_git::VmGitPushMetadata::new(
+            sample_clone_repo(),
+            sample_branch(),
+            None,
+            sample_object_id('c'),
+        );
+        let staging = state.staging_store.as_ref().unwrap().clone();
+        tokio::task::spawn_blocking(move || {
+            staging
+                .stage(
+                    request_id,
+                    UnixMillis::from_millis(1),
+                    metadata,
+                    b"orphan".to_vec(),
+                )
+                .unwrap();
+        })
+        .await
+        .unwrap();
+
+        let resp = dispatch_message(ClientMessage::ShowStagedPush { request_id }, &state).await;
+        match resp {
+            ServerMessage::Error { message } => {
+                assert!(message.contains("no audit record"), "got: {message}");
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
     }
 
     // --- Policy decisions ------------------------------------------------

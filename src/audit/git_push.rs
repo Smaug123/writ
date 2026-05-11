@@ -37,7 +37,8 @@ pub struct GitPushAttemptRecord {
     pub new_head: GitObjectId,
 }
 
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum GitPushOutcomeResult {
     Denied,
     ValidationFailed,
@@ -322,6 +323,49 @@ impl AuditLog {
         })
     }
 
+    /// Fetch the joined audit view for one VM Git push by request id, or
+    /// `None` if no request row has been recorded. Promote tooling uses
+    /// this to attach session and outcome context to a staged push that
+    /// the operator looked up by id.
+    pub fn get_git_push(
+        &self,
+        push_request_id: RequestId,
+    ) -> Result<Option<GitPushAuditEntry>, AuditError> {
+        self.with_conn(|c| {
+            let mut stmt = c.prepare(
+                "SELECT
+                     r.push_request_id,
+                     r.session_id,
+                     r.received_at,
+                     r.repo,
+                     r.branch,
+                     r.expected_remote_head,
+                     r.new_head AS request_new_head,
+                     a.push_attempt_id,
+                     a.capability_request_id,
+                     a.grant_jti,
+                     a.planned_at,
+                     a.old_head,
+                     a.new_head AS attempted_new_head,
+                     o.completed_at,
+                     o.result,
+                     o.github_status,
+                     o.message
+                 FROM git_push_request r
+                 LEFT JOIN git_push_attempt a ON a.push_request_id = r.push_request_id
+                 LEFT JOIN git_push_outcome o ON o.push_request_id = r.push_request_id
+                 WHERE r.push_request_id = ?1",
+            )?;
+            let row = stmt
+                .query_row(
+                    params![push_request_id.as_uuid().to_string()],
+                    git_push_audit_entry_from_row,
+                )
+                .optional()?;
+            row.transpose()
+        })
+    }
+
     pub fn list_git_pushes_for_session(
         &self,
         id: SessionId,
@@ -364,7 +408,7 @@ impl AuditLog {
 }
 
 impl GitPushOutcomeResult {
-    fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Denied => "denied",
             Self::ValidationFailed => "validation_failed",
@@ -1144,6 +1188,85 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn get_git_push_returns_none_when_request_missing() {
+        let log = AuditLog::open_in_memory().unwrap();
+        assert!(log.get_git_push(RequestId::new()).unwrap().is_none());
+    }
+
+    #[test]
+    fn get_git_push_returns_request_only_view_before_attempt() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+        let push_request_id = RequestId::new();
+        log.record_git_push_request(&sample_git_push_request_record(
+            push_request_id,
+            s.session_id,
+        ))
+        .unwrap();
+
+        let entry = log.get_git_push(push_request_id).unwrap().unwrap();
+        assert_eq!(entry.push_request_id, push_request_id);
+        assert_eq!(entry.session_id, s.session_id);
+        assert_eq!(entry.push_attempt_id, None);
+        assert_eq!(entry.result, None);
+        assert_eq!(entry.completed_at, None);
+    }
+
+    #[test]
+    fn get_git_push_returns_full_view_after_outcome() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+        let push_request_id = RequestId::new();
+        log.record_git_push_request(&sample_git_push_request_record(
+            push_request_id,
+            s.session_id,
+        ))
+        .unwrap();
+        log.record_git_push_outcome(&GitPushOutcomeRecord {
+            push_request_id,
+            push_attempt_id: None,
+            completed_at: UnixMillis::from_millis(1_700_000_130),
+            result: GitPushOutcomeResult::Staged,
+            github_status: None,
+            message: "queued for review",
+        })
+        .unwrap();
+
+        let entry = log.get_git_push(push_request_id).unwrap().unwrap();
+        assert_eq!(entry.result, Some(GitPushOutcomeResult::Staged));
+        assert_eq!(
+            entry.completed_at,
+            Some(UnixMillis::from_millis(1_700_000_130))
+        );
+        assert_eq!(entry.message.as_deref(), Some("queued for review"));
+    }
+
+    /// The SQL `result` column stores the same strings produced by the
+    /// `Serialize` impl. Pin them so a future serde rename can't silently
+    /// orphan existing audit rows.
+    #[test]
+    fn outcome_result_sql_strings_match_serde_form() {
+        let variants = [
+            GitPushOutcomeResult::Denied,
+            GitPushOutcomeResult::ValidationFailed,
+            GitPushOutcomeResult::Staged,
+            GitPushOutcomeResult::Pushed,
+            GitPushOutcomeResult::LeaseRejected,
+            GitPushOutcomeResult::PushRejected,
+            GitPushOutcomeResult::PushFailed,
+            GitPushOutcomeResult::AuditFailedAfterPush,
+        ];
+        for v in variants {
+            let json = serde_json::to_value(v).unwrap();
+            assert_eq!(json, serde_json::Value::String(v.as_str().to_string()));
+            let back: GitPushOutcomeResult = serde_json::from_value(json).unwrap();
+            assert_eq!(back, v);
         }
     }
 

@@ -1369,6 +1369,7 @@ mod tests {
                 writable_repos: Vec::<RepoRef>::new(),
                 default_ttl: TtlSeconds::new(3600).unwrap(),
             },
+            staging_store: None,
         })
     }
 
