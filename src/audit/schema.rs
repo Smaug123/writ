@@ -30,7 +30,7 @@ pub(super) struct Migration {
 /// a version higher than this is rejected with [`AuditError::SchemaTooNew`]
 /// rather than opened — we'd rather fail to start than silently drop data
 /// into a schema a newer broker wrote.
-pub(super) const SCHEMA_VERSION: i32 = 14;
+pub(super) const SCHEMA_VERSION: i32 = 15;
 
 /// The full migration history. Each entry documents exactly one state
 /// transition; the sequence of entries is the schema's lineage. Order
@@ -836,6 +836,51 @@ ALTER TABLE git_push_request ADD COLUMN correlation_id TEXT
         length(correlation_id) BETWEEN 1 AND 64
         AND correlation_id NOT GLOB '*[^A-Za-z0-9_-]*'
     ));
+"#,
+    },
+    // Plan submissions: per `docs/plans/2026-05-11-agent-plans.md`,
+    // a planner agent_run records exactly one plan body for downstream
+    // reviewers and implementers. The UNIQUE(agent_run_id) constraint
+    // enforces the one-plan-per-run invariant at the database level so
+    // a future code path that bypasses the DAO still cannot land a
+    // duplicate.
+    //
+    // The body column stores the raw textual plan; body_sha256 is a
+    // hex digest computed by the broker before insertion so consumers
+    // can reference plans by content without rehashing. CHECK
+    // constraints mirror `PlanBody`'s "non-empty" and the digest's
+    // "64 hex chars" invariants from the Rust newtypes.
+    //
+    // The session-gating trigger mirrors the pattern already used for
+    // agent_run and git_push_request: a plan can only be inserted
+    // while its planner run's session is still open. The stage='plan'
+    // gate (planner runs only) is intentionally deferred to a later
+    // slice — adding it here would require coordinating with the
+    // agent_run stage column and the broker's run-staging logic.
+    Migration {
+        version: 15,
+        sql: r#"
+CREATE TABLE plan (
+    plan_id       TEXT PRIMARY KEY,
+    agent_run_id  TEXT NOT NULL REFERENCES agent_run(run_id),
+    submitted_at  INTEGER NOT NULL,
+    body          TEXT NOT NULL CHECK (body != ''),
+    body_sha256   TEXT NOT NULL CHECK (length(body_sha256) = 64),
+    UNIQUE (agent_run_id)
+);
+
+CREATE INDEX idx_plan_agent_run ON plan(agent_run_id);
+
+CREATE TRIGGER plan_requires_open_session
+BEFORE INSERT ON plan
+WHEN EXISTS (
+    SELECT 1 FROM agent_run ar
+    JOIN session s ON s.session_id = ar.session_id
+    WHERE ar.run_id = NEW.agent_run_id AND s.closed_at IS NOT NULL
+)
+BEGIN
+    SELECT RAISE(ABORT, 'session is closed');
+END;
 "#,
     },
 ];
@@ -2026,6 +2071,112 @@ mod tests {
             .unwrap()
             .unwrap_err();
         assert!(bad_char.to_string().contains("CHECK"), "got: {bad_char}");
+    }
+
+    /// Migration 15 adds the `plan` table. Verify a v14 DB with a
+    /// populated agent_run survives the migration, that the table and
+    /// its constraints are in place, and that the session-gating
+    /// trigger is wired up.
+    #[test]
+    fn open_migrates_v14_database_to_plan_schema() {
+        let db = NamedTempFile::new().unwrap();
+        let session_id = SessionId::new();
+        let run_id = uuid::Uuid::new_v4();
+
+        {
+            let mut conn = Connection::open(db.path()).unwrap();
+            let tx = conn.transaction().unwrap();
+            for migration in MIGRATIONS.iter().take(14) {
+                tx.execute_batch(migration.sql).unwrap();
+            }
+            tx.pragma_update(None, "user_version", 14).unwrap();
+
+            tx.execute(
+                "INSERT INTO session (session_id, label, agent_kind, agent_model, opened_at, closed_at) \
+                 VALUES (?1, NULL, 'claude', NULL, 1, NULL)",
+                params![session_id.as_uuid().to_string()],
+            )
+            .unwrap();
+
+            tx.execute(
+                "INSERT INTO agent_run (
+                     run_id, session_id, requested_at, agent_kind,
+                     prompt_bytes, prompt_sha256, prompt_redacted_preview,
+                     correlation_id
+                 ) VALUES (?1, ?2, 2, 'claude', 1, ?3, '<redacted>', NULL)",
+                params![
+                    run_id.to_string(),
+                    session_id.as_uuid().to_string(),
+                    "a".repeat(64),
+                ],
+            )
+            .unwrap();
+
+            tx.commit().unwrap();
+        }
+
+        let log = AuditLog::open(db.path()).unwrap();
+        assert_eq!(read_user_version(&log), SCHEMA_VERSION);
+        assert!(column_exists(&log, "plan", "plan_id"));
+        assert!(column_exists(&log, "plan", "agent_run_id"));
+        assert!(column_exists(&log, "plan", "body_sha256"));
+        assert!(trigger_exists(&log, "plan_requires_open_session"));
+
+        let body_sha = crate::agent_run::sha256_hex(b"# Plan");
+        let plan_id_a = uuid::Uuid::new_v4();
+        log.with_conn(|c| {
+            c.execute(
+                "INSERT INTO plan
+                 (plan_id, agent_run_id, submitted_at, body, body_sha256)
+                 VALUES (?1, ?2, 3, '# Plan', ?3)",
+                params![
+                    plan_id_a.to_string(),
+                    run_id.to_string(),
+                    &body_sha,
+                ],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        // UNIQUE(agent_run_id) gates a second plan for the same run.
+        let dup_err = log
+            .with_conn(|c| {
+                Ok(c.execute(
+                    "INSERT INTO plan
+                     (plan_id, agent_run_id, submitted_at, body, body_sha256)
+                     VALUES (?1, ?2, 4, '# Plan v2', ?3)",
+                    params![
+                        uuid::Uuid::new_v4().to_string(),
+                        run_id.to_string(),
+                        &body_sha,
+                    ],
+                ))
+            })
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            dup_err.to_string().to_uppercase().contains("UNIQUE"),
+            "got: {dup_err}",
+        );
+
+        // CHECK rejects an empty body.
+        let empty_err = log
+            .with_conn(|c| {
+                Ok(c.execute(
+                    "INSERT INTO plan
+                     (plan_id, agent_run_id, submitted_at, body, body_sha256)
+                     VALUES (?1, ?2, 5, '', ?3)",
+                    params![
+                        uuid::Uuid::new_v4().to_string(),
+                        uuid::Uuid::new_v4().to_string(),
+                        crate::agent_run::sha256_hex(b""),
+                    ],
+                ))
+            })
+            .unwrap()
+            .unwrap_err();
+        assert!(empty_err.to_string().contains("CHECK"), "got: {empty_err}");
     }
 
     /// A DB written by a future broker will carry a user_version beyond
