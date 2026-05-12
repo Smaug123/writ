@@ -132,8 +132,8 @@ pub fn write_bearer_file(
     use std::io::Write as _;
     use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _, PermissionsExt as _};
 
-    if let Some(parent) = path.parent() {
-        if !parent.exists() {
+    if let Some(parent) = path.parent()
+        && !parent.exists() {
             std::fs::DirBuilder::new()
                 .recursive(true)
                 .mode(0o700)
@@ -143,7 +143,6 @@ pub fn write_bearer_file(
                     source,
                 })?;
         }
-    }
     let mut tmp = path.as_os_str().to_owned();
     tmp.push(".tmp");
     let tmp = PathBuf::from(tmp);
