@@ -111,20 +111,38 @@ pub enum UiHttpBearerWriteError {
 /// Write `token` to `path` (0600), replacing any prior contents. The
 /// write goes via a sibling temp file followed by `rename`, so a
 /// reader either sees the previous bearer or the new one — never a
-/// half-written body. Permissions on the destination come from the
-/// temp file (rename preserves them on POSIX).
+/// half-written body.
+///
+/// If the parent directory does not exist it is created with mode
+/// `0700`: this directory holds runtime secrets and shares the same
+/// invariant as the socket parent (writ's other startup code refuses
+/// to bind a socket inside a parent with group/world bits). An
+/// existing parent is not chmod'd — we don't silently loosen or
+/// tighten a directory the operator already created.
+///
+/// `OpenOptions::mode` is only honoured when the file is *created*,
+/// so a stale `.tmp` left behind by a crash might be opened with
+/// looser permissions and then renamed into place. The explicit
+/// `set_permissions` after `open` makes the destination mode
+/// independent of the temp file's prior state.
 pub fn write_bearer_file(
     path: &Path,
     token: &UiHttpBearerToken,
 ) -> Result<(), UiHttpBearerWriteError> {
     use std::io::Write as _;
-    use std::os::unix::fs::OpenOptionsExt as _;
+    use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _, PermissionsExt as _};
 
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|source| UiHttpBearerWriteError::ParentDir {
-            path: parent.to_path_buf(),
-            source,
-        })?;
+        if !parent.exists() {
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(parent)
+                .map_err(|source| UiHttpBearerWriteError::ParentDir {
+                    path: parent.to_path_buf(),
+                    source,
+                })?;
+        }
     }
     let mut tmp = path.as_os_str().to_owned();
     tmp.push(".tmp");
@@ -136,6 +154,11 @@ pub fn write_bearer_file(
             .truncate(true)
             .mode(0o600)
             .open(&tmp)
+            .map_err(|source| UiHttpBearerWriteError::Write {
+                path: tmp.clone(),
+                source,
+            })?;
+        f.set_permissions(std::fs::Permissions::from_mode(0o600))
             .map_err(|source| UiHttpBearerWriteError::Write {
                 path: tmp.clone(),
                 source,
@@ -711,6 +734,46 @@ mod tests {
         assert_eq!(read, token.as_str());
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600, "expected 0600, got {:o}", mode & 0o777);
+    }
+
+    #[test]
+    fn write_bearer_file_creates_parent_with_0700() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let parent = tmp.path().join("fresh-parent");
+        let path = parent.join("ui-bearer");
+        let token = UiHttpBearerToken::generate();
+        write_bearer_file(&path, &token).unwrap();
+        let mode = std::fs::metadata(&parent).unwrap().permissions().mode();
+        assert_eq!(
+            mode & 0o777,
+            0o700,
+            "expected 0700, got {:o}",
+            mode & 0o777
+        );
+    }
+
+    #[test]
+    fn write_bearer_file_forces_0600_when_temp_exists_with_loose_perms() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("ui-bearer");
+        let stale_tmp = tmp.path().join("ui-bearer.tmp");
+        std::fs::write(&stale_tmp, "stale").unwrap();
+        std::fs::set_permissions(&stale_tmp, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let token = UiHttpBearerToken::generate();
+        write_bearer_file(&path, &token).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "expected 0600 even when stale temp existed, got {:o}",
+            mode & 0o777
+        );
+        let read = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(read, token.as_str());
     }
 
     #[test]
