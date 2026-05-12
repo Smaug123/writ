@@ -27,6 +27,8 @@ pub mod git_push_staging;
 #[cfg(feature = "host")]
 pub mod github;
 #[cfg(feature = "host")]
+pub mod github_git_db;
+#[cfg(feature = "host")]
 pub mod nix_cache;
 #[cfg(feature = "host")]
 pub mod openai_chatgpt_auth;
