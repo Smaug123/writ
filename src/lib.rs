@@ -21,6 +21,8 @@ pub(crate) mod clean_git;
 pub mod config;
 pub mod core;
 #[cfg(feature = "host")]
+pub mod git_push_replay;
+#[cfg(feature = "host")]
 pub mod git_push_staging;
 #[cfg(feature = "host")]
 pub mod github;
