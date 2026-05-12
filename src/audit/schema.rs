@@ -30,7 +30,7 @@ pub(super) struct Migration {
 /// a version higher than this is rejected with [`AuditError::SchemaTooNew`]
 /// rather than opened — we'd rather fail to start than silently drop data
 /// into a schema a newer broker wrote.
-pub(super) const SCHEMA_VERSION: i32 = 12;
+pub(super) const SCHEMA_VERSION: i32 = 13;
 
 /// The full migration history. Each entry documents exactly one state
 /// transition; the sequence of entries is the schema's lineage. Order
@@ -763,6 +763,49 @@ WHEN NEW.push_attempt_id IS NOT NULL
 )
 BEGIN
     SELECT RAISE(ABORT, 'git push attempt belongs to a different request');
+END;
+"#,
+    },
+    // Stage B: operator resolutions of staged pushes.
+    //
+    // `git_push_outcome` is `PRIMARY KEY (push_request_id)` — exactly
+    // one row per push, written by the broker when it decides whether
+    // a push got denied / validation-failed / staged / pushed. That
+    // leaves no room for a second row recording "the operator later
+    // rejected or approved this staged push" without violating the PK
+    // or mutating audit rows in place.
+    //
+    // The fix is a parallel table keyed by the same `push_request_id`
+    // that records *operator* decisions. The append-only property is
+    // preserved at every layer: outcomes are one-shot, resolutions are
+    // one-shot, neither is updated. A trigger enforces that resolutions
+    // can only be inserted on pushes whose outcome is `'staged'`, so a
+    // `'denied'` or `'pushed'` push can never accumulate a contradictory
+    // operator resolution and the state machine stays explicit.
+    //
+    // `decision` carries both `'rejected'` (Stage B) and `'approved'`
+    // (Stage D) from day one so the eventual approve path doesn't need
+    // another migration.
+    Migration {
+        version: 13,
+        sql: r#"
+CREATE TABLE git_push_resolution (
+    push_request_id TEXT PRIMARY KEY REFERENCES git_push_request(push_request_id),
+    decided_at      INTEGER NOT NULL,
+    decision        TEXT NOT NULL CHECK (decision IN ('rejected', 'approved')),
+    operator        TEXT NOT NULL CHECK (operator != ''),
+    reason          TEXT NOT NULL CHECK (reason != '')
+);
+
+CREATE TRIGGER git_push_resolution_requires_staged
+BEFORE INSERT ON git_push_resolution
+WHEN NOT EXISTS (
+    SELECT 1 FROM git_push_outcome
+    WHERE push_request_id = NEW.push_request_id
+      AND result = 'staged'
+)
+BEGIN
+    SELECT RAISE(ABORT, 'git push must be staged to be resolved');
 END;
 "#,
     },
@@ -1543,6 +1586,266 @@ mod tests {
                     new_request_id.as_uuid().to_string(),
                     1_700_000_141_i64,
                 ],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    /// Migration 13 adds the `git_push_resolution` table and its
+    /// staged-only trigger. Verify pre-existing v12 rows survive, the
+    /// trigger refuses resolutions on non-staged pushes, and a
+    /// resolution on a staged push commits cleanly.
+    #[test]
+    fn open_migrates_v12_database_to_resolution_schema() {
+        let db = NamedTempFile::new().unwrap();
+        let session_id = SessionId::new();
+        let pushed_request_id = RequestId::new();
+        let pushed_attempt_id = RequestId::new();
+        let staged_request_id = RequestId::new();
+        let capability_request_id = RequestId::new();
+        let grant_jti = Jti::new();
+        let oid_a = "a".repeat(40);
+        let oid_b = "b".repeat(40);
+        let oid_c = "c".repeat(40);
+
+        {
+            let mut conn = Connection::open(db.path()).unwrap();
+            let tx = conn.transaction().unwrap();
+            for migration in MIGRATIONS.iter().take(12) {
+                tx.execute_batch(migration.sql).unwrap();
+            }
+            tx.pragma_update(None, "user_version", 12).unwrap();
+
+            tx.execute(
+                "INSERT INTO session (session_id, label, agent_kind, agent_model, opened_at, closed_at) \
+                 VALUES (?1, NULL, 'claude', NULL, 1, NULL)",
+                params![session_id.as_uuid().to_string()],
+            )
+            .unwrap();
+            tx.execute(
+                "INSERT INTO request (request_id, session_id, received_at, request_json, decision_json) \
+                 VALUES (?1, ?2, 2, '{}', '{}')",
+                params![
+                    capability_request_id.as_uuid().to_string(),
+                    session_id.as_uuid().to_string(),
+                ],
+            )
+            .unwrap();
+            tx.execute(
+                "INSERT INTO grant_log \
+                 (jti, request_id, session_id, scope_json, issued_at, expires_at, github_app_id) \
+                 VALUES (?1, ?2, ?3, ?4, 3, 4, 42)",
+                params![
+                    grant_jti.as_uuid().to_string(),
+                    capability_request_id.as_uuid().to_string(),
+                    session_id.as_uuid().to_string(),
+                    serde_json::to_string(&sample_scope()).unwrap(),
+                ],
+            )
+            .unwrap();
+
+            // A terminally `pushed` push: must remain ineligible for
+            // resolution after the migration.
+            tx.execute(
+                "INSERT INTO git_push_request \
+                 (push_request_id, session_id, received_at, repo, branch, expected_remote_head, new_head) \
+                 VALUES (?1, ?2, 10, 'o/n', 'main', ?3, ?4)",
+                params![
+                    pushed_request_id.as_uuid().to_string(),
+                    session_id.as_uuid().to_string(),
+                    oid_a,
+                    oid_b,
+                ],
+            )
+            .unwrap();
+            tx.execute(
+                "INSERT INTO git_push_attempt \
+                 (push_attempt_id, push_request_id, capability_request_id, grant_jti, planned_at, repo, branch, old_head, new_head) \
+                 VALUES (?1, ?2, ?3, ?4, 20, 'o/n', 'main', ?5, ?6)",
+                params![
+                    pushed_attempt_id.as_uuid().to_string(),
+                    pushed_request_id.as_uuid().to_string(),
+                    capability_request_id.as_uuid().to_string(),
+                    grant_jti.as_uuid().to_string(),
+                    oid_a,
+                    oid_b,
+                ],
+            )
+            .unwrap();
+            tx.execute(
+                "INSERT INTO git_push_outcome \
+                 (push_request_id, push_attempt_id, completed_at, result, github_status, message) \
+                 VALUES (?1, ?2, 30, 'pushed', 200, 'ok')",
+                params![
+                    pushed_request_id.as_uuid().to_string(),
+                    pushed_attempt_id.as_uuid().to_string(),
+                ],
+            )
+            .unwrap();
+
+            // A `staged` push: the migration must leave it resolvable.
+            tx.execute(
+                "INSERT INTO git_push_request \
+                 (push_request_id, session_id, received_at, repo, branch, expected_remote_head, new_head) \
+                 VALUES (?1, ?2, 40, 'o/n', 'feat', NULL, ?3)",
+                params![
+                    staged_request_id.as_uuid().to_string(),
+                    session_id.as_uuid().to_string(),
+                    oid_c,
+                ],
+            )
+            .unwrap();
+            tx.execute(
+                "INSERT INTO git_push_outcome \
+                 (push_request_id, push_attempt_id, completed_at, result, github_status, message) \
+                 VALUES (?1, NULL, 50, 'staged', NULL, 'queued for review')",
+                params![staged_request_id.as_uuid().to_string()],
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+
+        let log = AuditLog::open(db.path()).unwrap();
+        assert_eq!(read_user_version(&log), SCHEMA_VERSION);
+
+        // Pre-existing rows survived the migration intact.
+        let preserved: String = log
+            .with_conn(|c| {
+                Ok(c.query_row(
+                    "SELECT result FROM git_push_outcome WHERE push_request_id = ?1",
+                    params![pushed_request_id.as_uuid().to_string()],
+                    |row| row.get(0),
+                )?)
+            })
+            .unwrap();
+        assert_eq!(preserved, "pushed");
+
+        // Trigger rejects resolutions on non-staged pushes.
+        let blocked = log
+            .with_conn(|c| {
+                let err = c.execute(
+                    "INSERT INTO git_push_resolution \
+                     (push_request_id, decided_at, decision, operator, reason) \
+                     VALUES (?1, 60, 'rejected', 'patrick', 'no')",
+                    params![pushed_request_id.as_uuid().to_string()],
+                );
+                Ok(err)
+            })
+            .unwrap()
+            .unwrap_err();
+        let message = blocked.to_string();
+        assert!(
+            message.contains("git push must be staged to be resolved"),
+            "got: {message}"
+        );
+
+        // Trigger rejects resolutions on requests with no outcome row.
+        let no_outcome_request_id = RequestId::new();
+        log.with_conn(|c| {
+            c.execute(
+                "INSERT INTO git_push_request \
+                 (push_request_id, session_id, received_at, repo, branch, expected_remote_head, new_head) \
+                 VALUES (?1, ?2, 70, 'o/n', 'orphan', NULL, ?3)",
+                params![
+                    no_outcome_request_id.as_uuid().to_string(),
+                    session_id.as_uuid().to_string(),
+                    "d".repeat(40),
+                ],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        let blocked_no_outcome = log
+            .with_conn(|c| {
+                Ok(c.execute(
+                    "INSERT INTO git_push_resolution \
+                     (push_request_id, decided_at, decision, operator, reason) \
+                     VALUES (?1, 71, 'rejected', 'patrick', 'no')",
+                    params![no_outcome_request_id.as_uuid().to_string()],
+                ))
+            })
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            blocked_no_outcome
+                .to_string()
+                .contains("git push must be staged to be resolved"),
+            "got: {blocked_no_outcome}",
+        );
+
+        // Resolution on a staged push commits cleanly.
+        log.with_conn(|c| {
+            c.execute(
+                "INSERT INTO git_push_resolution \
+                 (push_request_id, decided_at, decision, operator, reason) \
+                 VALUES (?1, 80, 'rejected', 'patrick', 'looks malicious')",
+                params![staged_request_id.as_uuid().to_string()],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        // Double-resolution violates the PK.
+        let dup = log
+            .with_conn(|c| {
+                Ok(c.execute(
+                    "INSERT INTO git_push_resolution \
+                     (push_request_id, decided_at, decision, operator, reason) \
+                     VALUES (?1, 81, 'approved', 'patrick', 'changed mind')",
+                    params![staged_request_id.as_uuid().to_string()],
+                ))
+            })
+            .unwrap()
+            .unwrap_err();
+        assert!(dup.to_string().contains("UNIQUE"), "got: {dup}");
+
+        // CHECK rejects unknown decisions.
+        let other_staged_request_id = RequestId::new();
+        log.with_conn(|c| {
+            c.execute(
+                "INSERT INTO git_push_request \
+                 (push_request_id, session_id, received_at, repo, branch, expected_remote_head, new_head) \
+                 VALUES (?1, ?2, 90, 'o/n', 'feat2', NULL, ?3)",
+                params![
+                    other_staged_request_id.as_uuid().to_string(),
+                    session_id.as_uuid().to_string(),
+                    "e".repeat(40),
+                ],
+            )?;
+            c.execute(
+                "INSERT INTO git_push_outcome \
+                 (push_request_id, push_attempt_id, completed_at, result, github_status, message) \
+                 VALUES (?1, NULL, 91, 'staged', NULL, 'queued for review')",
+                params![other_staged_request_id.as_uuid().to_string()],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        let bad_decision = log
+            .with_conn(|c| {
+                Ok(c.execute(
+                    "INSERT INTO git_push_resolution \
+                     (push_request_id, decided_at, decision, operator, reason) \
+                     VALUES (?1, 92, 'maybe', 'patrick', 'unsure')",
+                    params![other_staged_request_id.as_uuid().to_string()],
+                ))
+            })
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            bad_decision.to_string().contains("CHECK"),
+            "got: {bad_decision}"
+        );
+
+        // Approved decision is admitted on a freshly staged push (Stage D
+        // piggybacks on the v13 CHECK).
+        log.with_conn(|c| {
+            c.execute(
+                "INSERT INTO git_push_resolution \
+                 (push_request_id, decided_at, decision, operator, reason) \
+                 VALUES (?1, 93, 'approved', 'patrick', 'lgtm')",
+                params![other_staged_request_id.as_uuid().to_string()],
             )?;
             Ok(())
         })
