@@ -280,6 +280,7 @@ fn plan_list_entry_from_row(row: &Row<'_>) -> rusqlite::Result<Result<PlanListEn
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent_plan::Stage;
     use crate::agent_run::AgentPrompt;
     use crate::audit::test_support::sample_session;
     use crate::audit::{AgentRunAuditRecord, AuditError};
@@ -295,6 +296,7 @@ mod tests {
             agent_kind: AgentKind::Claude,
             prompt: AgentPrompt::new("plan this").summary(),
             correlation_id: None,
+            stage: Stage::Plan,
         })
         .unwrap();
         run_id
