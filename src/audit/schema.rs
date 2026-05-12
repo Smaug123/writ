@@ -820,6 +820,19 @@ END;
     // matches any string containing at least one byte outside the
     // allowed class; `NOT GLOB` rejects it.
     //
+    // The leading `typeof(correlation_id) = 'text'` and BLOB-length
+    // parity clauses together form a NUL guard. SQLite's declared
+    // column types are advisory: a TEXT column will happily store a
+    // value with storage class BLOB if a raw writer binds bytes that
+    // way, and `length()`/`GLOB` on TEXT stop at the first NUL byte.
+    // Without these guards, a raw insert binding e.g. `b"abc\0/"`
+    // (whether the binding is TEXT or BLOB) would pass a check that
+    // only inspected the `abc` prefix — and then later reads would
+    // fail when `CorrelationId::try_new` saw the full byte string.
+    // `typeof = 'text'` forces TEXT storage class, and the BLOB-cast
+    // length parity then forces the absence of embedded NULs, so the
+    // GLOB and length bounds see the same bytes the newtype would.
+    //
     // Existing rows are filled with NULL (the column accepts NULL
     // because the value is optional per the design).
     Migration {
@@ -827,13 +840,17 @@ END;
         sql: r#"
 ALTER TABLE agent_run ADD COLUMN correlation_id TEXT
     CHECK (correlation_id IS NULL OR (
-        length(correlation_id) BETWEEN 1 AND 64
+        typeof(correlation_id) = 'text'
+        AND length(correlation_id) = length(cast(correlation_id AS BLOB))
+        AND length(correlation_id) BETWEEN 1 AND 64
         AND correlation_id NOT GLOB '*[^A-Za-z0-9_-]*'
     ));
 
 ALTER TABLE git_push_request ADD COLUMN correlation_id TEXT
     CHECK (correlation_id IS NULL OR (
-        length(correlation_id) BETWEEN 1 AND 64
+        typeof(correlation_id) = 'text'
+        AND length(correlation_id) = length(cast(correlation_id AS BLOB))
+        AND length(correlation_id) BETWEEN 1 AND 64
         AND correlation_id NOT GLOB '*[^A-Za-z0-9_-]*'
     ));
 "#,
@@ -2026,6 +2043,79 @@ mod tests {
             .unwrap()
             .unwrap_err();
         assert!(bad_char.to_string().contains("CHECK"), "got: {bad_char}");
+    }
+
+    /// Regression guard for the NUL-injection case in two flavours:
+    ///
+    /// 1. A TEXT-bound `"abc\0/"`. SQLite's `length()` and `GLOB` walk
+    ///    TEXT as a C-string and stop at the first NUL, so without the
+    ///    BLOB-length parity clause a CHECK that only inspected the
+    ///    `abc` prefix would let this through.
+    /// 2. A BLOB-bound `b"abc\0/"`. SQLite columns declared TEXT still
+    ///    accept BLOB storage class, and on BLOBs `length()` returns
+    ///    the byte count so the parity clause is vacuously true; only
+    ///    the `typeof = 'text'` clause catches this path.
+    ///
+    /// In both cases the prefix `abc` is valid but the trailing `/`
+    /// is not in `[A-Za-z0-9_-]`, exactly the shape the newtype
+    /// rejects and the DAO read path would later trip on. Both tables
+    /// share the expression, so verify both.
+    #[test]
+    fn correlation_id_check_rejects_embedded_nul() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+
+        let smuggled_text: &str = "abc\0/";
+        let smuggled_blob: &[u8] = b"abc\0/";
+
+        let agent_run_with_correlation = |raw_corr: rusqlite::types::Value| {
+            log.with_conn(|c| {
+                Ok(c.execute(
+                    "INSERT INTO agent_run (
+                         run_id, session_id, requested_at, agent_kind,
+                         prompt_bytes, prompt_sha256, prompt_redacted_preview,
+                         correlation_id
+                     ) VALUES (?1, ?2, 10, 'claude', 1, ?3, '<redacted>', ?4)",
+                    params![
+                        uuid::Uuid::new_v4().to_string(),
+                        s.session_id.as_uuid().to_string(),
+                        "a".repeat(64),
+                        raw_corr,
+                    ],
+                ))
+            })
+            .unwrap()
+            .unwrap_err()
+        };
+
+        let push_with_correlation = |raw_corr: rusqlite::types::Value| {
+            log.with_conn(|c| {
+                Ok(c.execute(
+                    "INSERT INTO git_push_request \
+                     (push_request_id, session_id, received_at, repo, branch, expected_remote_head, new_head, correlation_id) \
+                     VALUES (?1, ?2, 11, 'o/n', 'main', NULL, ?3, ?4)",
+                    params![
+                        RequestId::new().as_uuid().to_string(),
+                        s.session_id.as_uuid().to_string(),
+                        "b".repeat(40),
+                        raw_corr,
+                    ],
+                ))
+            })
+            .unwrap()
+            .unwrap_err()
+        };
+
+        for binding in [
+            rusqlite::types::Value::Text(smuggled_text.to_owned()),
+            rusqlite::types::Value::Blob(smuggled_blob.to_owned()),
+        ] {
+            let err = agent_run_with_correlation(binding.clone());
+            assert!(err.to_string().contains("CHECK"), "got: {err}");
+            let err = push_with_correlation(binding);
+            assert!(err.to_string().contains("CHECK"), "got: {err}");
+        }
     }
 
     /// A DB written by a future broker will carry a user_version beyond
