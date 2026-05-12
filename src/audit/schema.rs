@@ -30,7 +30,7 @@ pub(super) struct Migration {
 /// a version higher than this is rejected with [`AuditError::SchemaTooNew`]
 /// rather than opened — we'd rather fail to start than silently drop data
 /// into a schema a newer broker wrote.
-pub(super) const SCHEMA_VERSION: i32 = 17;
+pub(super) const SCHEMA_VERSION: i32 = 18;
 
 /// The full migration history. Each entry documents exactly one state
 /// transition; the sequence of entries is the schema's lineage. Order
@@ -1040,6 +1040,47 @@ ALTER TABLE agent_run ADD COLUMN stage TEXT NOT NULL DEFAULT 'execute'
 UPDATE agent_run
 SET stage = 'plan'
 WHERE run_id IN (SELECT agent_run_id FROM plan);
+"#,
+    },
+    // Slice 6 (operator decision path). Adds the `plan_decision` table:
+    // exactly one terminal decision row per plan. PRIMARY KEY on
+    // `plan_id` enforces the uniqueness; the foreign key onto `plan`
+    // means a decision can only be written for a plan that exists.
+    //
+    // Unlike `plan` itself, the decision is *not* gated by the planner
+    // run's session being open. Operator decisions are deliberately
+    // cross-session — by design the host CLI today (and a future
+    // orchestrator agent tomorrow) may decide on a plan whose planner
+    // VM and session are long gone. The plan FK is the only invariant
+    // worth enforcing in the schema.
+    //
+    // `outcome` is the closed enum from `agent_plan::DecisionOutcome`;
+    // its CHECK enumerates exactly the wire strings the newtype
+    // produces. `decider` is a free-form attribution string bounded by
+    // the same defence-in-depth pattern as the v16 `plan.body` CHECK
+    // (TEXT storage class, no embedded NUL, byte-bounded by
+    // `length(cast(... AS BLOB))`). The byte cap mirrors the
+    // `MAX_DECIDER_BYTES` newtype bound; a raw INSERT that bypasses
+    // the typed layer still cannot smuggle a giant or NUL-bearing
+    // attribution into the audit log.
+    Migration {
+        version: 18,
+        sql: r#"
+CREATE TABLE plan_decision (
+    -- TEXT PRIMARY KEY in a rowid table is a long-standing SQLite quirk:
+    -- it does *not* imply NOT NULL (preserved for v1/v2 compat). NULL
+    -- child keys also bypass the FK reference rule. Without an explicit
+    -- NOT NULL, a raw INSERT with `plan_id = NULL` would slip past both
+    -- guards and break the "exactly one decision per plan" invariant.
+    plan_id     TEXT PRIMARY KEY NOT NULL REFERENCES plan(plan_id),
+    decided_at  INTEGER NOT NULL,
+    outcome     TEXT NOT NULL CHECK (outcome IN ('accepted', 'rejected_restart')),
+    decider     TEXT NOT NULL CHECK (
+        typeof(decider) = 'text'
+        AND length(cast(decider AS BLOB)) BETWEEN 1 AND 256
+        AND instr(cast(decider AS BLOB), x'00') = 0
+    )
+);
 "#,
     },
 ];
