@@ -126,6 +126,11 @@ pub enum GitPushReplayRunError {
         path: PathBuf,
         source: std::io::Error,
     },
+    #[error("cannot set staging repository permissions for {path}: {source}")]
+    SetStagingRepoPermissions {
+        path: PathBuf,
+        source: std::io::Error,
+    },
     #[error(
         "git program must be absolute or discoverable on PATH before clearing the child environment: {0}"
     )]
@@ -370,15 +375,25 @@ pub async fn prepare_staging_repo(
     Ok(plan.staging_repo().to_path_buf())
 }
 
-/// Create the staging repo atomically with mode `0o700`.
+/// Create the staging repo with mode `0o700`.
 ///
-/// `DirBuilder::mode(0o700)` passes the mode straight to `mkdir(2)`, which
-/// the kernel masks with the process umask before applying — so the final
-/// permission set is a subset of `0o700` and can never grant group or
-/// other access regardless of the broker's umask. Using a non-recursive
-/// `create` makes the `AlreadyExists` reply the authoritative "this path
-/// was not fresh" signal: no separate stat preflight is needed (and so
-/// no TOCTOU window between the check and the create).
+/// Two-step on purpose:
+///
+/// 1. `DirBuilder::mode(0o700).create(path)` (non-recursive) — passes the
+///    mode straight to `mkdir(2)`, so the kernel applies it atomically.
+///    Umask can only further restrict the bits, never widen them, so
+///    the directory is never momentarily group- or other-readable. The
+///    non-recursive `create` makes `AlreadyExists` the authoritative
+///    "this path was not fresh" signal, with no TOCTOU window between a
+///    stat preflight and the create.
+/// 2. `set_permissions(0o700)` on the directory we just created. Step 1
+///    can produce *narrower* permissions than `0o700` if the broker's
+///    umask masks owner bits (e.g. an unusual `umask 0777`), which would
+///    stop the next `git init --bare` from writing into the directory.
+///    Step 2 makes the postcondition exact. Because the directory is
+///    brand new and the path is only known to this process, broadening
+///    permissions from "narrower than 0o700" back up to "exactly 0o700"
+///    has no security window: nothing else can be holding the path open.
 async fn create_private_staging_repo(
     plan: &GitPushReplayPlan,
 ) -> Result<(), GitPushReplayRunError> {
@@ -386,11 +401,16 @@ async fn create_private_staging_repo(
     let result = tokio::task::spawn_blocking({
         let path = path.clone();
         move || {
-            use std::os::unix::fs::DirBuilderExt;
+            use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
             std::fs::DirBuilder::new()
                 .recursive(false)
                 .mode(REPLAY_BARE_REPO_MODE)
-                .create(&path)
+                .create(&path)?;
+            std::fs::set_permissions(
+                &path,
+                std::fs::Permissions::from_mode(REPLAY_BARE_REPO_MODE),
+            )
+            .map_err(CreateOrChmodError::Chmod)
         }
     })
     .await
@@ -400,10 +420,30 @@ async fn create_private_staging_repo(
     })?;
     match result {
         Ok(()) => Ok(()),
-        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+        Err(CreateOrChmodError::Create(err)) if err.kind() == std::io::ErrorKind::AlreadyExists => {
             Err(GitPushReplayRunError::StagingRepoAlreadyExists(path))
         }
-        Err(source) => Err(GitPushReplayRunError::CreateStagingRepo { path, source }),
+        Err(CreateOrChmodError::Create(source)) => {
+            Err(GitPushReplayRunError::CreateStagingRepo { path, source })
+        }
+        Err(CreateOrChmodError::Chmod(source)) => {
+            Err(GitPushReplayRunError::SetStagingRepoPermissions { path, source })
+        }
+    }
+}
+
+/// Internal two-state result of [`create_private_staging_repo`]'s
+/// blocking body so the caller can distinguish "the `mkdir` failed"
+/// from "the follow-up `chmod` failed" when mapping to the public
+/// `GitPushReplayRunError` variants.
+enum CreateOrChmodError {
+    Create(std::io::Error),
+    Chmod(std::io::Error),
+}
+
+impl From<std::io::Error> for CreateOrChmodError {
+    fn from(err: std::io::Error) -> Self {
+        CreateOrChmodError::Create(err)
     }
 }
 
