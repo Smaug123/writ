@@ -316,21 +316,26 @@ impl GitDataClient {
     /// back a SHA that the walker would plug into a commit's
     /// `parents` slot.
     ///
-    /// The branch name is interpolated into the URL path without
-    /// percent-encoding: [`GitBranchName`] is validated at
-    /// construction against git's branch-naming rules, which already
-    /// exclude URL-unsafe bytes.
+    /// The branch name is percent-encoded for the URL path before
+    /// interpolation. Git's branch-naming rules permit several
+    /// URL-reserved bytes ([`#`], [`%`], [`(`], …) that
+    /// [`GitBranchName`] also accepts, so a name like `release#1` or
+    /// `100%` would otherwise turn into a URL fragment or a half-built
+    /// percent-escape and 404 against GitHub. The hierarchical
+    /// separator [`/`] is preserved so `feature/foo` produces the
+    /// expected nested ref path.
     pub async fn get_branch_head(
         &self,
         repo: &RepoRef,
         branch: &GitBranchName,
     ) -> Result<GitObjectId, GitDataError> {
+        let encoded_branch = percent_encode_ref_segment(branch.as_str());
         let url = format!(
             "{}/repos/{}/{}/git/ref/heads/{}",
             self.api_base.trim_end_matches('/'),
             repo.owner,
             repo.name,
-            branch.as_str(),
+            encoded_branch,
         );
         let response = self
             .http
@@ -478,6 +483,37 @@ pub struct CommitRequest<'a> {
     pub author: &'a CommitIdentity,
     pub committer: &'a CommitIdentity,
     pub signature: Option<&'a str>,
+}
+
+/// Percent-encode a ref-path segment for inclusion in a URL.
+///
+/// Preserves the unreserved set (RFC 3986 §2.3: ALPHA / DIGIT /
+/// `-` / `.` / `_` / `~`) and `/` (so the caller can pass a
+/// hierarchical ref like `feature/foo` as a single string), and
+/// percent-encodes every other byte. Operates on the byte
+/// representation so UTF-8 multi-byte sequences are encoded one
+/// byte at a time, which is how RFC 3986 specifies the transform
+/// for non-ASCII octets.
+///
+/// Git's branch-naming rules permit several URL-reserved bytes
+/// (`#`, `%`, `(`, `)`, `+`, `=`, etc.); without encoding, a name
+/// like `release#1` would silently turn into `release` plus a
+/// fragment, and `100%` would either be rejected as a malformed
+/// escape or turn into mojibake.
+fn percent_encode_ref_segment(input: &str) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(input.len());
+    for byte in input.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' => {
+                out.push(byte as char);
+            }
+            _ => {
+                write!(out, "%{byte:02X}").expect("write into String never fails");
+            }
+        }
+    }
+    out
 }
 
 fn identity_wire(identity: &CommitIdentity) -> CommitIdentityWire<'_> {
@@ -1437,6 +1473,55 @@ mod tests {
             .get_branch_head(&sample_repo(), &branch)
             .await
             .expect("branch head lookup ok");
+        assert_eq!(sha, returned);
+    }
+
+    #[test]
+    fn percent_encode_ref_segment_preserves_unreserved_and_slash_and_encodes_others() {
+        // Unreserved set per RFC 3986 §2.3 plus '/' for ref hierarchy:
+        // pass through unchanged.
+        assert_eq!(
+            percent_encode_ref_segment("AZaz09-._~/main"),
+            "AZaz09-._~/main",
+        );
+        // URL-reserved bytes that git nonetheless accepts in branch
+        // names: encode as %HH (uppercase, RFC 3986 §2.1).
+        assert_eq!(percent_encode_ref_segment("release#1"), "release%231");
+        assert_eq!(percent_encode_ref_segment("100%"), "100%25");
+        assert_eq!(
+            percent_encode_ref_segment("feat(area)+v2"),
+            "feat%28area%29%2Bv2",
+        );
+        // UTF-8 multi-byte sequence encoded byte-by-byte (RFC 3986
+        // §2.5): the 'é' in 'café' is 0xC3 0xA9.
+        assert_eq!(percent_encode_ref_segment("café"), "caf%C3%A9");
+    }
+
+    /// Regression test for the URL-reserved-bytes issue: a branch
+    /// name git considers valid but which contains `#` or `%` must
+    /// reach GitHub at the correctly-encoded path. Without
+    /// percent-encoding, `release#1` would 404 against GitHub
+    /// because the `#` turns into a URL fragment.
+    #[tokio::test]
+    async fn get_branch_head_percent_encodes_url_reserved_bytes_in_branch_name() {
+        let server = MockServer::start().await;
+        let returned = sample_object_id('d');
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/name/git/ref/heads/release%231"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ref": "refs/heads/release#1",
+                "object": { "sha": returned.as_str(), "type": "commit" },
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = client_against(&server, "ghs_fake_token");
+        let branch = GitBranchName::new("release#1").unwrap();
+        let sha = client
+            .get_branch_head(&sample_repo(), &branch)
+            .await
+            .expect("URL-reserved bytes must be percent-encoded");
         assert_eq!(sha, returned);
     }
 
