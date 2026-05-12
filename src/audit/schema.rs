@@ -1067,7 +1067,12 @@ WHERE run_id IN (SELECT agent_run_id FROM plan);
         version: 18,
         sql: r#"
 CREATE TABLE plan_decision (
-    plan_id     TEXT PRIMARY KEY REFERENCES plan(plan_id),
+    -- TEXT PRIMARY KEY in a rowid table is a long-standing SQLite quirk:
+    -- it does *not* imply NOT NULL (preserved for v1/v2 compat). NULL
+    -- child keys also bypass the FK reference rule. Without an explicit
+    -- NOT NULL, a raw INSERT with `plan_id = NULL` would slip past both
+    -- guards and break the "exactly one decision per plan" invariant.
+    plan_id     TEXT PRIMARY KEY NOT NULL REFERENCES plan(plan_id),
     decided_at  INTEGER NOT NULL,
     outcome     TEXT NOT NULL CHECK (outcome IN ('accepted', 'rejected_restart')),
     decider     TEXT NOT NULL CHECK (

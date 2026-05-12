@@ -1088,6 +1088,33 @@ mod tests {
         );
     }
 
+    /// Belt-and-braces: SQLite's well-known v1/v2 compat quirk allows
+    /// NULL in a `TEXT PRIMARY KEY` column unless the column is
+    /// explicitly marked `NOT NULL`, and the foreign key is satisfied
+    /// by a NULL child (the reference rule treats NULL as "unmatched").
+    /// Together these would let a raw INSERT smuggle a decision row
+    /// referencing no plan and bypass the per-plan PK uniqueness. The
+    /// schema declares `plan_id ... NOT NULL` precisely so this raw
+    /// path is refused.
+    #[test]
+    fn plan_decision_rejects_null_plan_id_at_schema_boundary() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let err = log
+            .with_conn(|c| {
+                Ok(c.execute(
+                    "INSERT INTO plan_decision (plan_id, decided_at, outcome, decider)
+                     VALUES (NULL, ?1, ?2, ?3)",
+                    params![1_700_000_500_i64, "accepted", "cli:alice"],
+                )?)
+            })
+            .unwrap_err();
+        let rendered = err.to_string().to_lowercase();
+        assert!(
+            rendered.contains("not null"),
+            "expected NOT NULL violation on plan_id, got {err}",
+        );
+    }
+
     /// Decisions are deliberately cross-session: an operator may decide
     /// on a plan whose planner session is long since closed. Recording
     /// a decision after `close_session` must succeed.
