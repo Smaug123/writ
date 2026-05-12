@@ -30,7 +30,7 @@ pub(super) struct Migration {
 /// a version higher than this is rejected with [`AuditError::SchemaTooNew`]
 /// rather than opened — we'd rather fail to start than silently drop data
 /// into a schema a newer broker wrote.
-pub(super) const SCHEMA_VERSION: i32 = 18;
+pub(super) const SCHEMA_VERSION: i32 = 19;
 
 /// The full migration history. Each entry documents exactly one state
 /// transition; the sequence of entries is the schema's lineage. Order
@@ -1081,6 +1081,34 @@ CREATE TABLE plan_decision (
         AND instr(cast(decider AS BLOB), x'00') = 0
     )
 );
+"#,
+    },
+    // Implementer/reviewer plan-binding: per
+    // `docs/plans/2026-05-11-agent-plans.md`, a `review`- or
+    // `execute`-stage run that is meant to read a specific plan carries
+    // the target `plan_id` on its `agent_run` row. The VM HTTP plan-read
+    // route (slice 4c) consults this column to authorise
+    // `GET /v1/plans/<plan_id>`; persisting it on the audit row means a
+    // future code path that bypasses the route still cannot retroactively
+    // claim a different plan than the broker recorded at run start.
+    //
+    // Nullable: planner runs do not read a plan (they create one), and
+    // pre-migration rows have no plan binding to recover. Backfill is
+    // therefore implicit-NULL; no UPDATE pass is needed.
+    //
+    // FK to `plan(plan_id)` is enforced because `AuditLog::init` sets
+    // `PRAGMA foreign_keys = ON` per-connection. The `typeof = 'text'`
+    // guard prevents a raw caller from smuggling BLOB-storage-class
+    // bytes past the FK (SQLite compares storage classes when matching
+    // FKs, so a BLOB-bound UUID would never match the TEXT-typed
+    // `plan.plan_id`, but the guard is explicit defence in depth and
+    // matches the migration-14 / migration-17 pattern).
+    Migration {
+        version: 19,
+        sql: r#"
+ALTER TABLE agent_run ADD COLUMN read_plan_id TEXT NULL
+    REFERENCES plan(plan_id)
+    CHECK (read_plan_id IS NULL OR typeof(read_plan_id) = 'text');
 "#,
     },
 ];
@@ -2913,6 +2941,185 @@ mod tests {
                 .unwrap();
             assert_eq!(got, stage);
         }
+    }
+
+    /// Migration 19 adds `agent_run.read_plan_id TEXT NULL REFERENCES
+    /// plan(plan_id)`. A v18 DB carrying both an executor run and a
+    /// planner run (with its plan row) must survive the migration with
+    /// `read_plan_id` NULL on every pre-existing row (no historical
+    /// signal lets us recover a binding). After the migration:
+    ///
+    ///   - a fresh insert naming an existing `plan.plan_id` is accepted;
+    ///   - a fresh insert naming a non-existent UUID is rejected by the
+    ///     foreign-key enforcement (proves `PRAGMA foreign_keys = ON`
+    ///     reaches this column);
+    ///   - a BLOB-bound value is rejected by the `typeof = 'text'`
+    ///     guard, matching the migration-14/17 threat model.
+    #[test]
+    fn open_migrates_v18_database_to_read_plan_id_schema() {
+        let db = NamedTempFile::new().unwrap();
+        let session_id = SessionId::new();
+        let executor_run_id = uuid::Uuid::new_v4();
+        let planner_run_id = uuid::Uuid::new_v4();
+        let plan_id = uuid::Uuid::new_v4();
+
+        {
+            let mut conn = Connection::open(db.path()).unwrap();
+            let tx = conn.transaction().unwrap();
+            for migration in MIGRATIONS.iter().take(18) {
+                tx.execute_batch(migration.sql).unwrap();
+            }
+            tx.pragma_update(None, "user_version", 18).unwrap();
+
+            tx.execute(
+                "INSERT INTO session (session_id, label, agent_kind, agent_model, opened_at, closed_at) \
+                 VALUES (?1, NULL, 'claude', NULL, 1, NULL)",
+                params![session_id.as_uuid().to_string()],
+            )
+            .unwrap();
+
+            tx.execute(
+                "INSERT INTO agent_run (
+                     run_id, session_id, requested_at, agent_kind,
+                     prompt_bytes, prompt_sha256, prompt_redacted_preview,
+                     correlation_id, stage
+                 ) VALUES (?1, ?2, 2, 'claude', 1, ?3, '<redacted>', NULL, 'execute')",
+                params![
+                    executor_run_id.to_string(),
+                    session_id.as_uuid().to_string(),
+                    "a".repeat(64),
+                ],
+            )
+            .unwrap();
+
+            tx.execute(
+                "INSERT INTO agent_run (
+                     run_id, session_id, requested_at, agent_kind,
+                     prompt_bytes, prompt_sha256, prompt_redacted_preview,
+                     correlation_id, stage
+                 ) VALUES (?1, ?2, 2, 'claude', 1, ?3, '<redacted>', NULL, 'plan')",
+                params![
+                    planner_run_id.to_string(),
+                    session_id.as_uuid().to_string(),
+                    "a".repeat(64),
+                ],
+            )
+            .unwrap();
+
+            tx.execute(
+                "INSERT INTO plan (plan_id, agent_run_id, submitted_at, body, body_sha256) \
+                 VALUES (?1, ?2, 3, '# Plan', ?3)",
+                params![
+                    plan_id.to_string(),
+                    planner_run_id.to_string(),
+                    crate::agent_run::sha256_hex(b"# Plan"),
+                ],
+            )
+            .unwrap();
+
+            tx.commit().unwrap();
+        }
+
+        let log = AuditLog::open(db.path()).unwrap();
+        assert_eq!(read_user_version(&log), SCHEMA_VERSION);
+        assert!(column_exists(&log, "agent_run", "read_plan_id"));
+
+        // Pre-existing rows survive with read_plan_id NULL.
+        for run_id in [executor_run_id, planner_run_id] {
+            let read_plan: Option<String> = log
+                .with_conn(|c| {
+                    Ok(c.query_row(
+                        "SELECT read_plan_id FROM agent_run WHERE run_id = ?1",
+                        params![run_id.to_string()],
+                        |r| r.get(0),
+                    )?)
+                })
+                .unwrap();
+            assert!(
+                read_plan.is_none(),
+                "pre-existing run {run_id} should have NULL read_plan_id"
+            );
+        }
+
+        // A fresh insert with an existing plan_id is accepted.
+        let bound_run_id = uuid::Uuid::new_v4();
+        log.with_conn(|c| {
+            c.execute(
+                "INSERT INTO agent_run (
+                     run_id, session_id, requested_at, agent_kind,
+                     prompt_bytes, prompt_sha256, prompt_redacted_preview,
+                     correlation_id, stage, read_plan_id
+                 ) VALUES (?1, ?2, 4, 'claude', 1, ?3, '<redacted>', NULL, 'execute', ?4)",
+                params![
+                    bound_run_id.to_string(),
+                    session_id.as_uuid().to_string(),
+                    "a".repeat(64),
+                    plan_id.to_string(),
+                ],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        let bound_value: Option<String> = log
+            .with_conn(|c| {
+                Ok(c.query_row(
+                    "SELECT read_plan_id FROM agent_run WHERE run_id = ?1",
+                    params![bound_run_id.to_string()],
+                    |r| r.get(0),
+                )?)
+            })
+            .unwrap();
+        assert_eq!(bound_value.as_deref(), Some(plan_id.to_string().as_str()));
+
+        // A fresh insert naming a non-existent plan_id is rejected by
+        // the FK constraint. This proves `PRAGMA foreign_keys = ON`
+        // reaches this column (REFERENCES alone is parsed-and-ignored
+        // without the pragma).
+        let bogus_plan = uuid::Uuid::new_v4();
+        let fk_err = log
+            .with_conn(|c| {
+                Ok(c.execute(
+                    "INSERT INTO agent_run (
+                         run_id, session_id, requested_at, agent_kind,
+                         prompt_bytes, prompt_sha256, prompt_redacted_preview,
+                         correlation_id, stage, read_plan_id
+                     ) VALUES (?1, ?2, 5, 'claude', 1, ?3, '<redacted>', NULL, 'review', ?4)",
+                    params![
+                        uuid::Uuid::new_v4().to_string(),
+                        session_id.as_uuid().to_string(),
+                        "a".repeat(64),
+                        bogus_plan.to_string(),
+                    ],
+                ))
+            })
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            fk_err.to_string().to_uppercase().contains("FOREIGN KEY"),
+            "got: {fk_err}"
+        );
+
+        // CHECK refuses a BLOB-bound value even when the bytes spell a
+        // valid UUID — `typeof = 'text'` is the smuggle stopper.
+        let blob_err = log
+            .with_conn(|c| {
+                Ok(c.execute(
+                    "INSERT INTO agent_run (
+                         run_id, session_id, requested_at, agent_kind,
+                         prompt_bytes, prompt_sha256, prompt_redacted_preview,
+                         correlation_id, stage, read_plan_id
+                     ) VALUES (?1, ?2, 6, 'claude', 1, ?3, '<redacted>', NULL, 'execute', ?4)",
+                    params![
+                        uuid::Uuid::new_v4().to_string(),
+                        session_id.as_uuid().to_string(),
+                        "a".repeat(64),
+                        rusqlite::types::Value::Blob(plan_id.to_string().into_bytes()),
+                    ],
+                ))
+            })
+            .unwrap()
+            .unwrap_err();
+        assert!(blob_err.to_string().contains("CHECK"), "got: {blob_err}");
     }
 
     /// Regression guard for the NUL-injection case in two flavours:

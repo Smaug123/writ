@@ -411,6 +411,7 @@ mod tests {
                 prompt: AgentPrompt::new("prompt").summary(),
                 correlation_id: None,
                 stage: crate::agent_plan::Stage::Execute,
+                read_plan_id: None,
             })
             .unwrap();
         let temp = tempfile::tempdir().unwrap();
@@ -478,6 +479,7 @@ mod tests {
                 prompt: AgentPrompt::new("prompt").summary(),
                 correlation_id: None,
                 stage: crate::agent_plan::Stage::Execute,
+                read_plan_id: None,
             })
             .unwrap();
         let temp = tempfile::tempdir().unwrap();

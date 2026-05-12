@@ -12,7 +12,7 @@ use super::validation::{
     validate_agent_run_stream_path_text, validate_sha256_hex, validate_stream_summary,
 };
 use super::{AuditError, AuditLog};
-use crate::agent_plan::{CorrelationId, Stage};
+use crate::agent_plan::{CorrelationId, PlanId, Stage};
 use crate::agent_run::{
     AgentPromptSummary, AgentRunId, AgentRunOutcome, AgentRunStreamSummary, AgentRunTerminalStatus,
 };
@@ -46,6 +46,18 @@ pub struct AgentRunAuditRecord {
     /// this column lands later in slice 3; persisting the value first
     /// lets the protocol/CLI change and the gate land independently.
     pub stage: Stage,
+    /// Plan this run is bound to read (and act on). `Some` when the
+    /// run is a reviewer or implementer pointed at a specific plan;
+    /// `None` for planner runs (which create rather than read a plan)
+    /// and for one-shot `execute`-stage runs that operate without a
+    /// plan-binding. Drives `GET /v1/plans/<id>` authorisation: a run
+    /// can only read the plan it was bound to at start time, so a
+    /// later code path cannot retroactively widen the run's reach.
+    /// See `docs/plans/2026-05-11-agent-plans.md` (§"Protocol
+    /// additions"). The route-level enforcement lands in a later
+    /// slice; persisting the value first lets the protocol/CLI change
+    /// and the gate land independently.
+    pub read_plan_id: Option<PlanId>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -168,8 +180,9 @@ impl AuditLog {
                      prompt_sha256,
                      prompt_redacted_preview,
                      correlation_id,
-                     stage
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                     stage,
+                     read_plan_id
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 params![
                     r.run_id.as_uuid().to_string(),
                     r.session_id.as_uuid().to_string(),
@@ -180,6 +193,7 @@ impl AuditLog {
                     &r.prompt.redacted_preview,
                     r.correlation_id.as_ref().map(CorrelationId::as_str),
                     r.stage.as_str(),
+                    r.read_plan_id.map(|id| id.as_uuid().to_string()),
                 ],
             )?;
             tx.commit()?;
@@ -237,7 +251,8 @@ impl AuditLog {
             let row = c
                 .query_row(
                     "SELECT run_id, session_id, requested_at, agent_kind, prompt_bytes,
-                            prompt_sha256, prompt_redacted_preview, correlation_id, stage
+                            prompt_sha256, prompt_redacted_preview, correlation_id, stage,
+                            read_plan_id
                      FROM agent_run
                      WHERE run_id = ?1",
                     params![run_id.as_uuid().to_string()],
@@ -332,6 +347,7 @@ fn agent_run_from_row(row: &Row<'_>) -> rusqlite::Result<Result<AgentRunAuditRec
     let prompt_redacted_preview: String = row.get(6)?;
     let correlation_id_raw: Option<String> = row.get(7)?;
     let stage_raw: String = row.get(8)?;
+    let read_plan_id_raw: Option<String> = row.get(9)?;
 
     let parse = || -> Result<AgentRunAuditRecord, AuditError> {
         let run_id = uuid::Uuid::parse_str(&run_id_str)
@@ -353,6 +369,10 @@ fn agent_run_from_row(row: &Row<'_>) -> rusqlite::Result<Result<AgentRunAuditRec
         let stage = stage_raw
             .parse::<Stage>()
             .map_err(|_| AuditError::Invariant("agent run row: stage is invalid"))?;
+        let read_plan_id = read_plan_id_raw
+            .map(|s| s.parse::<PlanId>())
+            .transpose()
+            .map_err(|_| AuditError::Invariant("agent run row: read_plan_id is invalid"))?;
         Ok(AgentRunAuditRecord {
             run_id: AgentRunId::from_uuid(run_id),
             session_id: SessionId::from_uuid(session_id),
@@ -365,6 +385,7 @@ fn agent_run_from_row(row: &Row<'_>) -> rusqlite::Result<Result<AgentRunAuditRec
             },
             correlation_id,
             stage,
+            read_plan_id,
         })
     };
     Ok(parse())
@@ -540,6 +561,7 @@ mod tests {
             prompt: prompt.summary(),
             correlation_id: None,
             stage: Stage::Execute,
+            read_plan_id: None,
         };
 
         log.record_agent_run(&record).unwrap();
@@ -552,6 +574,7 @@ mod tests {
         assert_eq!(entry.prompt.redacted_preview, "<redacted>");
         assert!(entry.correlation_id.is_none());
         assert_eq!(entry.stage, Stage::Execute);
+        assert!(entry.read_plan_id.is_none());
         let debug = format!("{entry:?}");
         assert!(!debug.contains(prompt.as_str()), "{debug}");
 
@@ -597,6 +620,7 @@ mod tests {
             prompt: crate::agent_run::AgentPrompt::new("prompt").summary(),
             correlation_id: None,
             stage: Stage::Execute,
+            read_plan_id: None,
         };
 
         let err = log.record_agent_run(&record).unwrap_err();
@@ -661,6 +685,7 @@ mod tests {
                 },
                 correlation_id: None,
                 stage: Stage::Execute,
+                read_plan_id: None,
             })
             .unwrap_err();
 
@@ -719,6 +744,7 @@ mod tests {
             prompt: crate::agent_run::AgentPrompt::new("prompt").summary(),
             correlation_id: Some(correlation.clone()),
             stage: Stage::Execute,
+            read_plan_id: None,
         };
 
         log.record_agent_run(&record).unwrap();
@@ -742,6 +768,7 @@ mod tests {
             prompt: crate::agent_run::AgentPrompt::new("prompt").summary(),
             correlation_id: None,
             stage: Stage::Execute,
+            read_plan_id: None,
         })
         .unwrap();
         let entry = log.get_agent_run(run_id).unwrap().unwrap();
@@ -841,6 +868,7 @@ mod tests {
             prompt: crate::agent_run::AgentPrompt::new("prompt").summary(),
             correlation_id: None,
             stage: Stage::Execute,
+            read_plan_id: None,
         })
         .unwrap();
         assert!(
@@ -864,11 +892,93 @@ mod tests {
             prompt: crate::agent_run::AgentPrompt::new("prompt").summary(),
             correlation_id: Some(correlation.clone()),
             stage: Stage::Execute,
+            read_plan_id: None,
         })
         .unwrap();
         assert_eq!(
             log.correlation_id_for_session(tagged.session_id).unwrap(),
             Some(correlation)
         );
+    }
+
+    /// A run bound to an existing plan via `read_plan_id` round-trips
+    /// through the DAO. The plan must exist first: the FK enforcement
+    /// (enabled by `PRAGMA foreign_keys = ON` in `AuditLog::open`)
+    /// would otherwise reject the insert.
+    #[test]
+    fn agent_run_roundtrips_with_read_plan_id() {
+        use crate::agent_plan::{PlanBody, PlanId};
+        use crate::audit::PlanSubmissionRecord;
+
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+
+        // First, write a planner run plus its plan so the FK target
+        // exists for the implementer row we want to round-trip.
+        let planner_run_id = AgentRunId::new();
+        log.record_agent_run(&AgentRunAuditRecord {
+            run_id: planner_run_id,
+            session_id: s.session_id,
+            requested_at: UnixMillis::from_millis(1_700_000_100),
+            agent_kind: AgentKind::Claude,
+            prompt: crate::agent_run::AgentPrompt::new("plan this").summary(),
+            correlation_id: None,
+            stage: Stage::Plan,
+            read_plan_id: None,
+        })
+        .unwrap();
+        let plan_id = PlanId::new();
+        log.record_plan_submission(&PlanSubmissionRecord {
+            plan_id,
+            agent_run_id: planner_run_id,
+            submitted_at: UnixMillis::from_millis(1_700_000_150),
+            body: PlanBody::try_new("# Plan body").unwrap(),
+        })
+        .unwrap();
+
+        let implementer_run_id = AgentRunId::new();
+        log.record_agent_run(&AgentRunAuditRecord {
+            run_id: implementer_run_id,
+            session_id: s.session_id,
+            requested_at: UnixMillis::from_millis(1_700_000_200),
+            agent_kind: AgentKind::Claude,
+            prompt: crate::agent_run::AgentPrompt::new("execute against the plan").summary(),
+            correlation_id: None,
+            stage: Stage::Execute,
+            read_plan_id: Some(plan_id),
+        })
+        .unwrap();
+
+        let entry = log.get_agent_run(implementer_run_id).unwrap().unwrap();
+        assert_eq!(entry.read_plan_id, Some(plan_id));
+    }
+
+    /// A run with `read_plan_id` naming a non-existent plan is rejected
+    /// by the FK at INSERT time. Belt-and-braces: even if a future code
+    /// path constructs a bogus `AgentRunAuditRecord`, the DB refuses to
+    /// land a dangling reference.
+    #[test]
+    fn agent_run_read_plan_id_fk_rejects_unknown_plan() {
+        use crate::agent_plan::PlanId;
+
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+        let bogus_plan = PlanId::new();
+        let err = log
+            .record_agent_run(&AgentRunAuditRecord {
+                run_id: AgentRunId::new(),
+                session_id: s.session_id,
+                requested_at: UnixMillis::from_millis(1_700_000_100),
+                agent_kind: AgentKind::Claude,
+                prompt: crate::agent_run::AgentPrompt::new("p").summary(),
+                correlation_id: None,
+                stage: Stage::Execute,
+                read_plan_id: Some(bogus_plan),
+            })
+            .unwrap_err();
+        let msg = err.to_string().to_uppercase();
+        assert!(msg.contains("FOREIGN KEY"), "got: {err}");
     }
 }

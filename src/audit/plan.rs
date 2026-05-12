@@ -404,6 +404,7 @@ mod tests {
             prompt: AgentPrompt::new("plan this").summary(),
             correlation_id: None,
             stage: Stage::Plan,
+            read_plan_id: None,
         })
         .unwrap();
         run_id
@@ -668,6 +669,7 @@ mod tests {
             prompt: AgentPrompt::new("plan this").summary(),
             correlation_id,
             stage: Stage::Plan,
+            read_plan_id: None,
         })
         .unwrap();
         run_id
