@@ -980,8 +980,12 @@ CREATE TABLE plan (
     UNIQUE (agent_run_id)
 );
 
-INSERT INTO plan (plan_id, agent_run_id, submitted_at, body, body_sha256)
-SELECT plan_id, agent_run_id, submitted_at, body, body_sha256
+-- Preserve `rowid` from the v15 table so `list_plans_for_session`'s
+-- `ORDER BY submitted_at, rowid` tie-break stays stable across the
+-- recreate. Without this, SQLite is free to assign fresh rowids and
+-- ties in the same `submitted_at` would reorder after upgrade.
+INSERT INTO plan (rowid, plan_id, agent_run_id, submitted_at, body, body_sha256)
+SELECT rowid, plan_id, agent_run_id, submitted_at, body, body_sha256
 FROM plan_v15;
 
 DROP TABLE plan_v15;
@@ -2482,6 +2486,99 @@ mod tests {
         let huge = "x".repeat(262_145);
         let err = insert_plan(run_id_big, rusqlite::types::Value::Text(huge));
         assert!(err.to_string().contains("CHECK"), "got: {err}");
+    }
+
+    /// `list_plans_for_session` orders by `(submitted_at, rowid)` so
+    /// rows sharing a timestamp keep their insertion order. The v15
+    /// to v16 recreate would otherwise be free to assign fresh
+    /// rowids in a different order; the migration explicitly carries
+    /// the old `rowid` across to keep that tie-break stable.
+    #[test]
+    fn migration_16_preserves_plan_rowid_ordering() {
+        let db = NamedTempFile::new().unwrap();
+        let session_id = SessionId::new();
+        let run_ids: [uuid::Uuid; 3] = std::array::from_fn(|_| uuid::Uuid::new_v4());
+        let plan_ids: [uuid::Uuid; 3] = std::array::from_fn(|_| uuid::Uuid::new_v4());
+
+        {
+            let mut conn = Connection::open(db.path()).unwrap();
+            let tx = conn.transaction().unwrap();
+            for migration in MIGRATIONS.iter().take(15) {
+                tx.execute_batch(migration.sql).unwrap();
+            }
+            tx.pragma_update(None, "user_version", 15).unwrap();
+
+            tx.execute(
+                "INSERT INTO session (session_id, label, agent_kind, agent_model, opened_at, closed_at) \
+                 VALUES (?1, NULL, 'claude', NULL, 1, NULL)",
+                params![session_id.as_uuid().to_string()],
+            )
+            .unwrap();
+
+            // Three runs and three plans with the SAME submitted_at, so
+            // the only stable tie-break is rowid.
+            for (run, plan) in run_ids.iter().zip(plan_ids.iter()) {
+                tx.execute(
+                    "INSERT INTO agent_run (
+                         run_id, session_id, requested_at, agent_kind,
+                         prompt_bytes, prompt_sha256, prompt_redacted_preview,
+                         correlation_id
+                     ) VALUES (?1, ?2, 2, 'claude', 1, ?3, '<redacted>', NULL)",
+                    params![
+                        run.to_string(),
+                        session_id.as_uuid().to_string(),
+                        "a".repeat(64),
+                    ],
+                )
+                .unwrap();
+                tx.execute(
+                    "INSERT INTO plan (plan_id, agent_run_id, submitted_at, body, body_sha256) \
+                     VALUES (?1, ?2, 100, 'body', ?3)",
+                    params![
+                        plan.to_string(),
+                        run.to_string(),
+                        crate::agent_run::sha256_hex(b"body"),
+                    ],
+                )
+                .unwrap();
+            }
+            tx.commit().unwrap();
+        }
+
+        // Snapshot v15 ordering before migration.
+        let pre_order: Vec<(i64, String)> = {
+            let c = Connection::open(db.path()).unwrap();
+            let mut stmt = c
+                .prepare("SELECT rowid, plan_id FROM plan ORDER BY submitted_at, rowid")
+                .unwrap();
+            stmt.query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+        };
+
+        let log = AuditLog::open(db.path()).unwrap();
+        assert_eq!(read_user_version(&log), SCHEMA_VERSION);
+
+        let post_order: Vec<(i64, String)> = log
+            .with_conn(|c| {
+                let mut stmt =
+                    c.prepare("SELECT rowid, plan_id FROM plan ORDER BY submitted_at, rowid")?;
+                let rows: Vec<(i64, String)> = stmt
+                    .query_map([], |row| {
+                        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows)
+            })
+            .unwrap();
+
+        assert_eq!(
+            pre_order, post_order,
+            "rowid order must survive the v15 to v16 recreate",
+        );
     }
 
     /// A v15 DB could contain plan rows that violate the new
