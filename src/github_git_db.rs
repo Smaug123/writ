@@ -8,9 +8,9 @@
 //! per-commit walker that orchestrates them lives in
 //! [`crate::git_push_replay`].
 //!
-//! [`GitDataClient::create_blob`] and [`GitDataClient::create_tree`]
-//! are implemented; commit creation and the walker land in later
-//! slices and reuse the auth/URL/error scaffolding established here.
+//! Blob, tree, and commit creation are implemented; the walker that
+//! drives them per commit lands in a later slice and reuses the
+//! auth/URL/error scaffolding established here.
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
@@ -178,6 +178,62 @@ impl GitDataClient {
         let parsed: TreeCreateResponse = response.json().await?;
         Ok(parsed.sha)
     }
+
+    /// `POST /repos/{owner}/{repo}/git/commits` — create a commit
+    /// pointing at the given `tree`, with the given `parents`, and
+    /// return the SHA GitHub assigned.
+    ///
+    /// `parents` may be empty for an initial commit, or hold several
+    /// entries for an octopus merge. `author` typically preserves
+    /// the bundle commit's authorship; `committer` is the App
+    /// identity, which is what causes GitHub to mark the published
+    /// commit as Verified. The endpoint signs under the App's GPG
+    /// key automatically when the committer matches the App, so the
+    /// `signature` field is not sent.
+    ///
+    /// `message` is forwarded verbatim — the replay layer is
+    /// responsible for appending its provenance trailer before this
+    /// is called.
+    pub async fn create_commit(
+        &self,
+        repo: &RepoRef,
+        tree: &GitObjectId,
+        parents: &[GitObjectId],
+        message: &str,
+        author: &CommitIdentity,
+        committer: &CommitIdentity,
+    ) -> Result<GitObjectId, GitDataError> {
+        let url = format!(
+            "{}/repos/{}/{}/git/commits",
+            self.api_base.trim_end_matches('/'),
+            repo.owner,
+            repo.name,
+        );
+        let body = CommitCreateBody {
+            message,
+            tree,
+            parents,
+            author: identity_wire(author),
+            committer: identity_wire(committer),
+        };
+        let response = self
+            .http
+            .post(&url)
+            .bearer_auth(&self.token)
+            .header("Accept", ACCEPT_HEADER)
+            .header("X-GitHub-Api-Version", API_VERSION_HEADER)
+            .header("User-Agent", USER_AGENT_HEADER)
+            .json(&body)
+            .send()
+            .await?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(GitDataError::ApiError { status, body });
+        }
+        let parsed: CommitCreateResponse = response.json().await?;
+        Ok(parsed.sha)
+    }
 }
 
 /// One row in a tree being uploaded to GitHub. The kind constrains
@@ -229,6 +285,41 @@ impl TreeEntryKind {
     }
 }
 
+/// Name, email, and authoring time of a Git author or committer.
+///
+/// `date` is whatever the bundle carried for that commit, including
+/// its timezone offset. Sub-second precision (if the caller somehow
+/// constructed one) is dropped when sent to GitHub since the API
+/// documents seconds-precision ISO-8601.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CommitIdentity {
+    pub name: String,
+    pub email: String,
+    pub date: time::OffsetDateTime,
+}
+
+/// Format an `OffsetDateTime` as RFC 3339 truncated to whole seconds.
+///
+/// GitHub documents `author.date`/`committer.date` as
+/// `YYYY-MM-DDTHH:MM:SSZ` (or with an explicit offset); the `time`
+/// crate's default RFC 3339 emits sub-second digits when present,
+/// which is technically out of spec for the API. Truncating here
+/// avoids the question entirely.
+fn rfc3339_seconds(date: time::OffsetDateTime) -> String {
+    date.replace_nanosecond(0)
+        .expect("zero is a valid nanosecond for OffsetDateTime")
+        .format(&time::format_description::well_known::Rfc3339)
+        .expect("OffsetDateTime always formats as RFC 3339")
+}
+
+fn identity_wire(identity: &CommitIdentity) -> CommitIdentityWire<'_> {
+    CommitIdentityWire {
+        name: &identity.name,
+        email: &identity.email,
+        date: rfc3339_seconds(identity.date),
+    }
+}
+
 #[derive(serde::Serialize)]
 struct BlobCreateBody {
     content: String,
@@ -256,6 +347,27 @@ struct TreeEntryWire<'a> {
 
 #[derive(serde::Deserialize)]
 struct TreeCreateResponse {
+    sha: GitObjectId,
+}
+
+#[derive(serde::Serialize)]
+struct CommitCreateBody<'a> {
+    message: &'a str,
+    tree: &'a GitObjectId,
+    parents: &'a [GitObjectId],
+    author: CommitIdentityWire<'a>,
+    committer: CommitIdentityWire<'a>,
+}
+
+#[derive(serde::Serialize)]
+struct CommitIdentityWire<'a> {
+    name: &'a str,
+    email: &'a str,
+    date: String,
+}
+
+#[derive(serde::Deserialize)]
+struct CommitCreateResponse {
     sha: GitObjectId,
 }
 
@@ -560,6 +672,254 @@ mod tests {
         let client = client_against(&server, "ghs_fake_token");
         let err = client
             .create_tree(&sample_repo(), &entries)
+            .await
+            .expect_err("malformed sha must not be returned silently");
+        assert!(
+            matches!(err, GitDataError::Http(_)),
+            "GitObjectId rejection surfaces as a transport error: {err:?}",
+        );
+    }
+
+    fn sample_identity(name: &str, date: time::OffsetDateTime) -> CommitIdentity {
+        CommitIdentity {
+            name: name.to_string(),
+            email: format!("{name}@example.invalid"),
+            date,
+        }
+    }
+
+    #[test]
+    fn rfc3339_seconds_drops_subsecond_precision() {
+        // The wire format GitHub documents is YYYY-MM-DDTHH:MM:SSZ;
+        // emitting sub-second digits is technically out of spec and
+        // would let a caller-constructed sub-second `OffsetDateTime`
+        // surface a deviation. Truncating here keeps the wire shape
+        // stable.
+        use time::macros::datetime;
+        let with_nanos = datetime!(2024-01-15 10:30:45.123456789 UTC);
+        assert_eq!(rfc3339_seconds(with_nanos), "2024-01-15T10:30:45Z");
+    }
+
+    #[test]
+    fn rfc3339_seconds_preserves_non_utc_offset() {
+        // Git commits carry the original author/committer offset
+        // (e.g. `+0530`); we forward it verbatim so the replayed
+        // commit's timestamp is faithful to the bundle.
+        use time::macros::datetime;
+        let with_offset = datetime!(2024-01-15 10:30:45 +05:30);
+        assert_eq!(rfc3339_seconds(with_offset), "2024-01-15T10:30:45+05:30");
+    }
+
+    #[tokio::test]
+    async fn create_commit_sends_message_tree_parents_and_identities() {
+        // Standard non-initial commit with one parent. Asserts that
+        // every documented field is on the wire and that the
+        // returned sha is propagated up.
+        use time::macros::datetime;
+        let server = MockServer::start().await;
+        let tree_sha = sample_object_id('a');
+        let parent_sha = sample_object_id('b');
+        let returned = sample_object_id('c');
+        let author = sample_identity("Alice", datetime!(2024-01-15 10:30:45 UTC));
+        let committer = sample_identity("WritApp", datetime!(2024-01-15 10:31:00 UTC));
+
+        Mock::given(method("POST"))
+            .and(path("/repos/owner/name/git/commits"))
+            .and(header("Accept", ACCEPT_HEADER))
+            .and(header("X-GitHub-Api-Version", API_VERSION_HEADER))
+            .and(header("User-Agent", USER_AGENT_HEADER))
+            .and(header("Authorization", "Bearer ghs_fake_token"))
+            .and(body_json(json!({
+                "message": "Fix the thing",
+                "tree": tree_sha.as_str(),
+                "parents": [parent_sha.as_str()],
+                "author": {
+                    "name": "Alice",
+                    "email": "Alice@example.invalid",
+                    "date": "2024-01-15T10:30:45Z",
+                },
+                "committer": {
+                    "name": "WritApp",
+                    "email": "WritApp@example.invalid",
+                    "date": "2024-01-15T10:31:00Z",
+                },
+            })))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+                "sha": returned.as_str(),
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = client_against(&server, "ghs_fake_token");
+        let got = client
+            .create_commit(
+                &sample_repo(),
+                &tree_sha,
+                std::slice::from_ref(&parent_sha),
+                "Fix the thing",
+                &author,
+                &committer,
+            )
+            .await
+            .expect("commit create ok");
+        assert_eq!(got, returned);
+    }
+
+    #[tokio::test]
+    async fn create_commit_sends_empty_parents_for_initial_commit() {
+        // Initial commits have no parents; the walker relies on
+        // sending `[]` and the API accepting it.
+        use time::macros::datetime;
+        let server = MockServer::start().await;
+        let tree_sha = sample_object_id('a');
+        let returned = sample_object_id('c');
+        let ident = sample_identity("Alice", datetime!(2024-01-15 10:30:45 UTC));
+
+        Mock::given(method("POST"))
+            .and(path("/repos/owner/name/git/commits"))
+            .and(body_json(json!({
+                "message": "Initial",
+                "tree": tree_sha.as_str(),
+                "parents": [],
+                "author": {
+                    "name": "Alice",
+                    "email": "Alice@example.invalid",
+                    "date": "2024-01-15T10:30:45Z",
+                },
+                "committer": {
+                    "name": "Alice",
+                    "email": "Alice@example.invalid",
+                    "date": "2024-01-15T10:30:45Z",
+                },
+            })))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+                "sha": returned.as_str(),
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = client_against(&server, "ghs_fake_token");
+        let got = client
+            .create_commit(&sample_repo(), &tree_sha, &[], "Initial", &ident, &ident)
+            .await
+            .expect("initial commit ok");
+        assert_eq!(got, returned);
+    }
+
+    #[tokio::test]
+    async fn create_commit_sends_all_parents_for_merge_commit() {
+        // Octopus merges have several parents; both must appear in
+        // order so GitHub records the merge topology correctly.
+        use time::macros::datetime;
+        let server = MockServer::start().await;
+        let tree_sha = sample_object_id('a');
+        let parent_a = sample_object_id('b');
+        let parent_b = sample_object_id('c');
+        let returned = sample_object_id('d');
+        let ident = sample_identity("Alice", datetime!(2024-01-15 10:30:45 UTC));
+
+        Mock::given(method("POST"))
+            .and(path("/repos/owner/name/git/commits"))
+            .and(body_json(json!({
+                "message": "Merge branch",
+                "tree": tree_sha.as_str(),
+                "parents": [parent_a.as_str(), parent_b.as_str()],
+                "author": {
+                    "name": "Alice",
+                    "email": "Alice@example.invalid",
+                    "date": "2024-01-15T10:30:45Z",
+                },
+                "committer": {
+                    "name": "Alice",
+                    "email": "Alice@example.invalid",
+                    "date": "2024-01-15T10:30:45Z",
+                },
+            })))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+                "sha": returned.as_str(),
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = client_against(&server, "ghs_fake_token");
+        let got = client
+            .create_commit(
+                &sample_repo(),
+                &tree_sha,
+                &[parent_a, parent_b],
+                "Merge branch",
+                &ident,
+                &ident,
+            )
+            .await
+            .expect("merge commit ok");
+        assert_eq!(got, returned);
+    }
+
+    #[tokio::test]
+    async fn create_commit_surfaces_api_error_body_on_4xx() {
+        use time::macros::datetime;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/repos/owner/name/git/commits"))
+            .respond_with(
+                ResponseTemplate::new(422)
+                    .set_body_json(json!({"message": "tree sha does not exist"})),
+            )
+            .mount(&server)
+            .await;
+
+        let ident = sample_identity("Alice", datetime!(2024-01-15 10:30:45 UTC));
+        let client = client_against(&server, "ghs_fake_token");
+        let err = client
+            .create_commit(
+                &sample_repo(),
+                &sample_object_id('a'),
+                &[],
+                "msg",
+                &ident,
+                &ident,
+            )
+            .await
+            .expect_err("4xx must surface as ApiError");
+        match err {
+            GitDataError::ApiError { status, body } => {
+                assert_eq!(status.as_u16(), 422);
+                assert!(
+                    body.contains("tree sha does not exist"),
+                    "ApiError body must echo the response payload: {body:?}",
+                );
+            }
+            other => panic!("expected ApiError, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn create_commit_returns_http_error_when_response_sha_is_invalid() {
+        use time::macros::datetime;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/repos/owner/name/git/commits"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+                "sha": "not a valid sha",
+            })))
+            .mount(&server)
+            .await;
+
+        let ident = sample_identity("Alice", datetime!(2024-01-15 10:30:45 UTC));
+        let client = client_against(&server, "ghs_fake_token");
+        let err = client
+            .create_commit(
+                &sample_repo(),
+                &sample_object_id('a'),
+                &[],
+                "msg",
+                &ident,
+                &ident,
+            )
             .await
             .expect_err("malformed sha must not be returned silently");
         assert!(
