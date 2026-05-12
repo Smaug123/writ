@@ -7,7 +7,7 @@ use rusqlite::{OptionalExtension, Row, params};
 
 use super::validation::validate_sha256_hex;
 use super::{AuditError, AuditLog};
-use crate::agent_plan::{CorrelationId, PlanBody, PlanBodyError, PlanId};
+use crate::agent_plan::{CorrelationId, Decider, DecisionOutcome, PlanBody, PlanBodyError, PlanId};
 use crate::agent_run::AgentRunId;
 use crate::core::{SessionId, UnixMillis};
 
@@ -17,6 +17,20 @@ pub struct PlanSubmissionRecord {
     pub agent_run_id: AgentRunId,
     pub submitted_at: UnixMillis,
     pub body: PlanBody,
+}
+
+/// One terminal `plan_decision` row. Per §"Plan lifecycle" exactly one
+/// of these exists per plan: `Accepted` unlocks the implementer and
+/// `RejectedRestart` closes the plan. The PRIMARY KEY on `plan_id`
+/// enforces the at-most-one invariant at the DB level — a second
+/// `record_plan_decision` against the same plan surfaces as a UNIQUE
+/// constraint violation rather than silently overwriting.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PlanDecisionRecord {
+    pub plan_id: PlanId,
+    pub decided_at: UnixMillis,
+    pub outcome: DecisionOutcome,
+    pub decider: Decider,
 }
 
 /// Body-less summary returned by [`AuditLog::list_plans`]. The listing
@@ -204,6 +218,73 @@ impl AuditLog {
             }
         })
     }
+
+    /// Record one terminal `plan_decision` row. The plan must exist;
+    /// pre-check it in the same transaction so a missing plan surfaces
+    /// as a clean `AuditError::Invariant("plan does not exist")` rather
+    /// than a raw "FOREIGN KEY constraint failed" message.
+    ///
+    /// A second decision against the same plan returns the underlying
+    /// SQLite UNIQUE constraint error (the PRIMARY KEY on `plan_id`);
+    /// the server layer maps that to `PlanAlreadyDecided` on the wire
+    /// via `is_unique_constraint_violation`.
+    ///
+    /// Unlike plan submission, the decision is *not* gated by the
+    /// planner's session being open: operator decisions are
+    /// deliberately cross-session. See migration 17's commentary.
+    pub fn record_plan_decision(&self, r: &PlanDecisionRecord) -> Result<(), AuditError> {
+        self.with_conn_mut(|c| {
+            let tx = c.transaction()?;
+            let plan_exists: Option<i64> = tx
+                .query_row(
+                    "SELECT 1 FROM plan WHERE plan_id = ?1",
+                    params![r.plan_id.as_uuid().to_string()],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if plan_exists.is_none() {
+                return Err(AuditError::Invariant("plan does not exist"));
+            }
+            tx.execute(
+                "INSERT INTO plan_decision (
+                     plan_id,
+                     decided_at,
+                     outcome,
+                     decider
+                 ) VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    r.plan_id.as_uuid().to_string(),
+                    r.decided_at.as_millis(),
+                    r.outcome.as_str(),
+                    r.decider.as_str(),
+                ],
+            )?;
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
+    /// Look up the decision for one plan, if any. Returns `Ok(None)`
+    /// for "plan exists but is not yet decided" (the planner ran and
+    /// the operator hasn't acted) and for "plan does not exist"
+    /// — callers distinguish those via `get_plan` if they need to.
+    pub fn get_plan_decision(
+        &self,
+        plan_id: PlanId,
+    ) -> Result<Option<PlanDecisionRecord>, AuditError> {
+        self.with_conn(|c| {
+            let row = c
+                .query_row(
+                    "SELECT plan_id, decided_at, outcome, decider
+                     FROM plan_decision
+                     WHERE plan_id = ?1",
+                    params![plan_id.as_uuid().to_string()],
+                    plan_decision_from_row,
+                )
+                .optional()?;
+            row.transpose()
+        })
+    }
 }
 
 fn plan_from_row(row: &Row<'_>) -> rusqlite::Result<Result<PlanSubmissionRecord, AuditError>> {
@@ -240,6 +321,32 @@ fn plan_from_row(row: &Row<'_>) -> rusqlite::Result<Result<PlanSubmissionRecord,
             agent_run_id: AgentRunId::from_uuid(agent_run_id),
             submitted_at: UnixMillis::from_millis(submitted_at),
             body,
+        })
+    };
+    Ok(parse())
+}
+
+fn plan_decision_from_row(
+    row: &Row<'_>,
+) -> rusqlite::Result<Result<PlanDecisionRecord, AuditError>> {
+    let plan_id_str: String = row.get(0)?;
+    let decided_at: i64 = row.get(1)?;
+    let outcome_str: String = row.get(2)?;
+    let decider_str: String = row.get(3)?;
+
+    let parse = || -> Result<PlanDecisionRecord, AuditError> {
+        let plan_id = uuid::Uuid::parse_str(&plan_id_str)
+            .map_err(|_| AuditError::Invariant("plan_decision row: plan_id not a uuid"))?;
+        let outcome = outcome_str.parse::<DecisionOutcome>().map_err(|_| {
+            AuditError::Invariant("plan_decision row: outcome is not a known wire string")
+        })?;
+        let decider = Decider::try_new(decider_str)
+            .map_err(|_| AuditError::Invariant("plan_decision row: decider violates invariants"))?;
+        Ok(PlanDecisionRecord {
+            plan_id: PlanId::from_uuid(plan_id),
+            decided_at: UnixMillis::from_millis(decided_at),
+            outcome,
+            decider,
         })
     };
     Ok(parse())
@@ -756,5 +863,252 @@ mod tests {
             Some(None)
         );
         assert_eq!(log.correlation_id_for_run(stray_run_id).unwrap(), None);
+    }
+
+    // --- plan_decision DAO --------------------------------------------
+
+    fn submitted_plan(log: &AuditLog, session_id: SessionId) -> PlanId {
+        let run_id = sample_planner_run(log, session_id);
+        let plan_id = PlanId::new();
+        log.record_plan_submission(&PlanSubmissionRecord {
+            plan_id,
+            agent_run_id: run_id,
+            submitted_at: UnixMillis::from_millis(1_700_000_200),
+            body: PlanBody::try_new("# Plan").unwrap(),
+        })
+        .unwrap();
+        plan_id
+    }
+
+    /// Happy path: a decision against a known plan persists and reads
+    /// back with every field intact.
+    #[test]
+    fn plan_decision_roundtrips() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+        let plan_id = submitted_plan(&log, s.session_id);
+
+        let record = PlanDecisionRecord {
+            plan_id,
+            decided_at: UnixMillis::from_millis(1_700_000_500),
+            outcome: DecisionOutcome::Accepted,
+            decider: Decider::try_new("cli:alice").unwrap(),
+        };
+        log.record_plan_decision(&record).unwrap();
+
+        let read = log.get_plan_decision(plan_id).unwrap().unwrap();
+        assert_eq!(read, record);
+    }
+
+    /// `get_plan_decision` returns `None` both for a plan that exists
+    /// but has not been decided yet and for a plan that does not exist
+    /// at all. Callers distinguish via `get_plan` if they need to.
+    #[test]
+    fn get_plan_decision_returns_none_for_undecided_and_missing_plans() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+        let undecided = submitted_plan(&log, s.session_id);
+        let stray = PlanId::new();
+        assert!(log.get_plan_decision(undecided).unwrap().is_none());
+        assert!(log.get_plan_decision(stray).unwrap().is_none());
+    }
+
+    /// A decision against a plan that doesn't exist surfaces as a clean
+    /// invariant error rather than a raw "FOREIGN KEY constraint
+    /// failed" string.
+    #[test]
+    fn plan_decision_rejects_missing_plan() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+        let err = log
+            .record_plan_decision(&PlanDecisionRecord {
+                plan_id: PlanId::new(),
+                decided_at: UnixMillis::from_millis(1_700_000_500),
+                outcome: DecisionOutcome::Accepted,
+                decider: Decider::try_new("cli:alice").unwrap(),
+            })
+            .unwrap_err();
+        assert!(matches!(err, AuditError::Invariant("plan does not exist")));
+    }
+
+    /// A second decision against the same plan surfaces as a UNIQUE
+    /// constraint violation — the wire layer maps that to
+    /// `PlanAlreadyDecided` so a replay doesn't silently overwrite the
+    /// original decision.
+    #[test]
+    fn plan_decision_rejects_second_decision_for_same_plan() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+        let plan_id = submitted_plan(&log, s.session_id);
+
+        log.record_plan_decision(&PlanDecisionRecord {
+            plan_id,
+            decided_at: UnixMillis::from_millis(1_700_000_500),
+            outcome: DecisionOutcome::Accepted,
+            decider: Decider::try_new("cli:alice").unwrap(),
+        })
+        .unwrap();
+
+        let err = log
+            .record_plan_decision(&PlanDecisionRecord {
+                plan_id,
+                decided_at: UnixMillis::from_millis(1_700_000_600),
+                outcome: DecisionOutcome::RejectedRestart,
+                decider: Decider::try_new("cli:bob").unwrap(),
+            })
+            .unwrap_err();
+        assert!(
+            matches!(err, AuditError::Sqlite(_)),
+            "expected SQLite UNIQUE violation, got {err:?}",
+        );
+        // The first decision must survive — a failed second write must
+        // not roll back or replace the first.
+        let read = log.get_plan_decision(plan_id).unwrap().unwrap();
+        assert_eq!(read.outcome, DecisionOutcome::Accepted);
+        assert_eq!(read.decider.as_str(), "cli:alice");
+    }
+
+    /// Both terminal outcomes round-trip; the CHECK constraint accepts
+    /// each wire string.
+    #[test]
+    fn plan_decision_persists_both_outcomes() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+
+        for outcome in [DecisionOutcome::Accepted, DecisionOutcome::RejectedRestart] {
+            let plan_id = submitted_plan(&log, s.session_id);
+            log.record_plan_decision(&PlanDecisionRecord {
+                plan_id,
+                decided_at: UnixMillis::from_millis(1_700_000_500),
+                outcome,
+                decider: Decider::try_new("cli:alice").unwrap(),
+            })
+            .unwrap();
+            assert_eq!(
+                log.get_plan_decision(plan_id).unwrap().unwrap().outcome,
+                outcome,
+            );
+        }
+    }
+
+    /// Belt-and-braces: a raw INSERT that bypasses the DAO must still
+    /// be rejected by the schema CHECK if it tries to write an outcome
+    /// outside the closed set.
+    #[test]
+    fn plan_decision_check_rejects_unknown_outcome() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+        let plan_id = submitted_plan(&log, s.session_id);
+
+        let err = log
+            .with_conn(|c| {
+                Ok(c.execute(
+                    "INSERT INTO plan_decision (plan_id, decided_at, outcome, decider)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![
+                        plan_id.as_uuid().to_string(),
+                        1_700_000_500_i64,
+                        "approved",
+                        "cli:alice",
+                    ],
+                )?)
+            })
+            .unwrap_err();
+        let rendered = err.to_string().to_lowercase();
+        assert!(
+            rendered.contains("check"),
+            "expected CHECK violation, got {err}",
+        );
+    }
+
+    /// Belt-and-braces: a raw INSERT with an empty decider must still
+    /// be refused — the typed layer guarantees non-empty, the audit
+    /// CHECK is the defence-in-depth.
+    #[test]
+    fn plan_decision_check_rejects_empty_decider() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+        let plan_id = submitted_plan(&log, s.session_id);
+
+        let err = log
+            .with_conn(|c| {
+                Ok(c.execute(
+                    "INSERT INTO plan_decision (plan_id, decided_at, outcome, decider)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![
+                        plan_id.as_uuid().to_string(),
+                        1_700_000_500_i64,
+                        "accepted",
+                        "",
+                    ],
+                )?)
+            })
+            .unwrap_err();
+        let rendered = err.to_string().to_lowercase();
+        assert!(
+            rendered.contains("check"),
+            "expected CHECK violation, got {err}",
+        );
+    }
+
+    /// Belt-and-braces: a raw INSERT with an embedded NUL in `decider`
+    /// must still be refused by the audit CHECK.
+    #[test]
+    fn plan_decision_check_rejects_embedded_nul_in_decider() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+        let plan_id = submitted_plan(&log, s.session_id);
+
+        let err = log
+            .with_conn(|c| {
+                Ok(c.execute(
+                    "INSERT INTO plan_decision (plan_id, decided_at, outcome, decider)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![
+                        plan_id.as_uuid().to_string(),
+                        1_700_000_500_i64,
+                        "accepted",
+                        "cli:al\0ce",
+                    ],
+                )?)
+            })
+            .unwrap_err();
+        let rendered = err.to_string().to_lowercase();
+        assert!(
+            rendered.contains("check"),
+            "expected CHECK violation, got {err}",
+        );
+    }
+
+    /// Decisions are deliberately cross-session: an operator may decide
+    /// on a plan whose planner session is long since closed. Recording
+    /// a decision after `close_session` must succeed.
+    #[test]
+    fn plan_decision_succeeds_after_planner_session_closes() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+        let plan_id = submitted_plan(&log, s.session_id);
+        log.close_session(s.session_id, UnixMillis::from_millis(1_700_000_300))
+            .unwrap();
+
+        log.record_plan_decision(&PlanDecisionRecord {
+            plan_id,
+            decided_at: UnixMillis::from_millis(1_700_000_500),
+            outcome: DecisionOutcome::Accepted,
+            decider: Decider::try_new("cli:alice").unwrap(),
+        })
+        .unwrap();
+
+        let read = log.get_plan_decision(plan_id).unwrap().unwrap();
+        assert_eq!(read.outcome, DecisionOutcome::Accepted);
     }
 }

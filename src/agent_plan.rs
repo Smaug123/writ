@@ -34,6 +34,13 @@ pub const MAX_PLAN_FEEDBACK_BYTES: usize = 64 * 1024;
 /// not transcripts.
 pub const MAX_PLAN_ABORT_REASON_BYTES: usize = 4 * 1024;
 
+/// Largest [`Decider`] attribution string. Bounds the audit-row size for
+/// the `decider` column. Deciders are short labels (e.g. `cli:alice` or
+/// future `agent:<run_id>`), not prose; matches `MAX_OPERATOR_BYTES`
+/// elsewhere so an operator capture of `$USER` and a `cli:` prefix
+/// comfortably fit.
+pub const MAX_DECIDER_BYTES: usize = 256;
+
 /// Inclusive bounds on a [`CorrelationId`]. The lower bound rejects
 /// the empty string at parse time so the audit column never has to
 /// distinguish "absent" from "zero-length present".
@@ -561,6 +568,75 @@ impl FromStr for DecisionOutcome {
             "rejected_restart" => Ok(Self::RejectedRestart),
             _ => Err(DecisionOutcomeParseError(raw.to_string())),
         }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum DeciderError {
+    #[error("decider must not be empty")]
+    Empty,
+    #[error("decider is {byte_len} bytes, exceeding the {max_bytes}-byte limit")]
+    TooLong { byte_len: usize, max_bytes: usize },
+    #[error("decider contains an embedded NUL byte")]
+    EmbeddedNul,
+}
+
+/// Free-form attribution recorded against a [`PlanDecision`]: who (or
+/// what) the operator surface says made the call. Per §"Plan lifecycle",
+/// today the host CLI writes `cli:<user>`; a future orchestrator agent
+/// will write `agent:<run_id>`. The broker treats the string as opaque
+/// and stores it verbatim, but parses at the wire boundary so the audit
+/// row's CHECK constraint can never see an invalid value.
+///
+/// Invariants:
+/// - non-empty
+/// - byte length ≤ [`MAX_DECIDER_BYTES`]
+/// - no embedded NUL (`length()` on a SQLite TEXT walks bytes as a C
+///   string and would silently truncate at the first NUL, so the audit
+///   CHECK rejects them — the newtype rejects them up-front for a
+///   typed error).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Decider(String);
+
+impl Decider {
+    pub fn try_new(decider: impl Into<String>) -> Result<Self, DeciderError> {
+        let decider = decider.into();
+        if decider.is_empty() {
+            return Err(DeciderError::Empty);
+        }
+        if decider.len() > MAX_DECIDER_BYTES {
+            return Err(DeciderError::TooLong {
+                byte_len: decider.len(),
+                max_bytes: MAX_DECIDER_BYTES,
+            });
+        }
+        if decider.as_bytes().contains(&0) {
+            return Err(DeciderError::EmbeddedNul);
+        }
+        Ok(Self(decider))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for Decider {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl Serialize for Decider {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for Decider {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(deserializer)?;
+        Self::try_new(raw).map_err(serde::de::Error::custom)
     }
 }
 
@@ -1127,6 +1203,57 @@ mod tests {
             );
         }
         assert!("rejected".parse::<DecisionOutcome>().is_err());
+    }
+
+    // --- Decider newtype ----------------------------------------------------
+
+    #[test]
+    fn decider_accepts_typical_attribution_strings() {
+        for ok in [
+            "cli:alice",
+            "cli:unknown",
+            "agent:6f7c3e1f-1c5e-4b1d-9b6c-1f1c2b3d4e5f",
+            "a",
+            &"x".repeat(MAX_DECIDER_BYTES),
+        ] {
+            let parsed = Decider::try_new(ok)
+                .unwrap_or_else(|e| panic!("expected {ok:?} to parse, got {e}"));
+            assert_eq!(parsed.as_str(), ok);
+        }
+    }
+
+    #[test]
+    fn decider_rejects_empty_too_long_and_embedded_nul() {
+        assert!(matches!(Decider::try_new(""), Err(DeciderError::Empty)));
+        let oversize = "x".repeat(MAX_DECIDER_BYTES + 1);
+        assert!(matches!(
+            Decider::try_new(&oversize),
+            Err(DeciderError::TooLong { .. })
+        ));
+        assert!(matches!(
+            Decider::try_new("cli:al\0ce"),
+            Err(DeciderError::EmbeddedNul)
+        ));
+    }
+
+    #[test]
+    fn decider_serializes_as_plain_string() {
+        let d = Decider::try_new("cli:alice").unwrap();
+        let json = serde_json::to_string(&d).unwrap();
+        assert_eq!(json, "\"cli:alice\"");
+        let back: Decider = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, d);
+    }
+
+    /// Deserialising the wire form runs through `try_new`, so a JSON
+    /// string that violates the invariants is rejected at the wire
+    /// boundary rather than reaching the audit row.
+    #[test]
+    fn decider_deserialization_runs_validation() {
+        assert!(serde_json::from_str::<Decider>("\"\"").is_err());
+        let oversize = format!("\"{}\"", "x".repeat(MAX_DECIDER_BYTES + 1));
+        assert!(serde_json::from_str::<Decider>(&oversize).is_err());
+        assert!(serde_json::from_str::<Decider>("\"cli:al\\u0000ce\"").is_err());
     }
 
     // --- Prompt composition --------------------------------------------------
