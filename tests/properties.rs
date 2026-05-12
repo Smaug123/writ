@@ -12,7 +12,9 @@ use writ::agent_plan::{
     route_permitted_by_stage_and_decision,
 };
 use writ::agent_run::{AgentPrompt, AgentRunId};
-use writ::audit::{AgentRunAuditRecord, AuditLog, GitPushRequestRecord, PreMintRecord};
+use writ::audit::{
+    AgentRunAuditRecord, AuditLog, GitPushRequestRecord, PlanSubmissionRecord, PreMintRecord,
+};
 use writ::core::{
     AgentKind, CapabilityRequest, CredentialGrant, GitHubAccess, GitHubGrantedScope,
     GitHubPermissions, GitHubRequest, GrantedScope, Jti, MetadataAccess, PolicyDecision, RepoRef,
@@ -769,6 +771,46 @@ proptest! {
         .unwrap();
         let entry = log.get_agent_run(run_id).unwrap().unwrap();
         prop_assert_eq!(entry.correlation_id, Some(c));
+    }
+
+    /// Any valid `PlanBody` round-trips through the plan audit DAO. The
+    /// DAO computes `body_sha256` on insert, so this also exercises the
+    /// `sha256_hex` projection — a body that survives a roundtrip is
+    /// one whose stored digest agrees with a fresh recompute (see the
+    /// belt-and-braces check in `plan_from_row`).
+    #[test]
+    fn plan_body_roundtrips_through_audit_log(body in arb_plan_body()) {
+        let log = AuditLog::open_in_memory().unwrap();
+        let session = SessionRecord {
+            session_id: SessionId::new(),
+            label: None,
+            agent_kind: None,
+            agent_model: None,
+            opened_at: UnixMillis::from_millis(0),
+            closed_at: None,
+        };
+        log.open_session(&session).unwrap();
+        let run_id = AgentRunId::new();
+        log.record_agent_run(&AgentRunAuditRecord {
+            run_id,
+            session_id: session.session_id,
+            requested_at: UnixMillis::from_millis(1),
+            agent_kind: AgentKind::Claude,
+            prompt: AgentPrompt::try_new("p").unwrap().summary(),
+            correlation_id: None,
+        })
+        .unwrap();
+
+        let plan_id = PlanId::new();
+        let record = PlanSubmissionRecord {
+            plan_id,
+            agent_run_id: run_id,
+            submitted_at: UnixMillis::from_millis(2),
+            body,
+        };
+        log.record_plan_submission(&record).unwrap();
+        let entry = log.get_plan(plan_id).unwrap().unwrap();
+        prop_assert_eq!(entry, record);
     }
 
     /// Same invariant for the git push request DAO.
