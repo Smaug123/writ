@@ -190,10 +190,15 @@ impl GitPushStagingStore {
     pub fn delete(&self, request_id: RequestId) -> Result<(), StagingError> {
         let dir = self.staged_path(request_id);
         match fs::remove_dir_all(&dir) {
-            Ok(()) => Ok(()),
-            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(err) => Err(StagingError::Io(err)),
+            Ok(()) => {}
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(err) => return Err(StagingError::Io(err)),
         }
+        // Durably commit the unlink so a crash here doesn't resurrect a
+        // staged push whose terminal resolution is already in the audit
+        // log. Matches the fsync on populate_and_commit's rename path.
+        fsync_dir(&self.root.join(STAGED_DIR))?;
+        Ok(())
     }
 
     /// Load one staged push by `request_id`, including its bundle bytes.

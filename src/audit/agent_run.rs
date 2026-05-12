@@ -259,6 +259,43 @@ impl AuditLog {
             row.transpose()
         })
     }
+
+    /// Lookup of the `correlation_id` belonging to an agent run on the
+    /// given session. Returns `None` for sessions with no agent run
+    /// (e.g. raw `start_agent_vm_session` flows) or with an untagged
+    /// run. The VM HTTP git-push handler uses this to inherit the
+    /// correlation id from the run onto the push it stages, so a
+    /// `--correlation-id`'d run's pushes share the same join key.
+    ///
+    /// Today's product flow creates one run per session. The
+    /// `ORDER BY requested_at DESC LIMIT 1` is defensive against a
+    /// future N>1 case so the answer stays deterministic; if the
+    /// invariant is ever loosened, the policy "most recent run wins"
+    /// is the obvious one and the audit row stores everything needed
+    /// to revisit it.
+    pub fn correlation_id_for_session(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Option<CorrelationId>, AuditError> {
+        self.with_conn(|c| {
+            let raw: Option<Option<String>> = c
+                .query_row(
+                    "SELECT correlation_id FROM agent_run
+                     WHERE session_id = ?1
+                     ORDER BY requested_at DESC
+                     LIMIT 1",
+                    params![session_id.as_uuid().to_string()],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            match raw.flatten() {
+                None => Ok(None),
+                Some(value) => CorrelationId::try_new(value)
+                    .map(Some)
+                    .map_err(|_| AuditError::Invariant("agent run row: correlation_id is invalid")),
+            }
+        })
+    }
 }
 
 fn agent_vm_workspace_bootstrap_from_row(
@@ -418,7 +455,7 @@ mod tests {
     use super::*;
     use crate::agent_plan::CorrelationId;
     use crate::audit::test_support::sample_session;
-    use crate::core::AgentKind;
+    use crate::core::{AgentKind, SessionRecord};
     use rusqlite::params;
 
     #[test]
@@ -747,5 +784,70 @@ mod tests {
             .unwrap_err();
         let msg_len = err_len.to_string();
         assert!(msg_len.contains("CHECK"), "got: {msg_len}");
+    }
+
+    /// `correlation_id_for_session` returns:
+    ///   - `Some(id)` when the session's run was tagged,
+    ///   - `None` when the run is untagged, and
+    ///   - `None` when no run exists for the session at all (this is
+    ///     the raw-VM-session case — `start_agent_vm_session` opens a
+    ///     session without recording an `agent_run`).
+    ///
+    /// The VM git-push handler relies on the third case to leave the
+    /// push correlation NULL for non-run flows.
+    #[test]
+    fn correlation_id_for_session_returns_run_value_or_none() {
+        let log = AuditLog::open_in_memory().unwrap();
+
+        // Session with no run — used by `start_agent_vm_session`.
+        let no_run = sample_session();
+        log.open_session(&no_run).unwrap();
+        assert!(
+            log.correlation_id_for_session(no_run.session_id)
+                .unwrap()
+                .is_none()
+        );
+
+        // Session whose run is untagged.
+        let untagged = SessionRecord {
+            session_id: SessionId::new(),
+            ..sample_session()
+        };
+        log.open_session(&untagged).unwrap();
+        log.record_agent_run(&AgentRunAuditRecord {
+            run_id: AgentRunId::new(),
+            session_id: untagged.session_id,
+            requested_at: UnixMillis::from_millis(1_700_000_100),
+            agent_kind: AgentKind::Claude,
+            prompt: crate::agent_run::AgentPrompt::new("prompt").summary(),
+            correlation_id: None,
+        })
+        .unwrap();
+        assert!(
+            log.correlation_id_for_session(untagged.session_id)
+                .unwrap()
+                .is_none()
+        );
+
+        // Session whose run carries a correlation id.
+        let tagged = SessionRecord {
+            session_id: SessionId::new(),
+            ..sample_session()
+        };
+        log.open_session(&tagged).unwrap();
+        let correlation = CorrelationId::try_new("feat-42_xyz").unwrap();
+        log.record_agent_run(&AgentRunAuditRecord {
+            run_id: AgentRunId::new(),
+            session_id: tagged.session_id,
+            requested_at: UnixMillis::from_millis(1_700_000_200),
+            agent_kind: AgentKind::Claude,
+            prompt: crate::agent_run::AgentPrompt::new("prompt").summary(),
+            correlation_id: Some(correlation.clone()),
+        })
+        .unwrap();
+        assert_eq!(
+            log.correlation_id_for_session(tagged.session_id).unwrap(),
+            Some(correlation)
+        );
     }
 }
