@@ -27,8 +27,6 @@ pub use git_clone::{VmHttpGitCloneConfig, VmHttpGitCloneService};
 use git_clone::{is_git_clone_target, route_git_clone_request};
 pub use git_push::VmHttpGitPushService;
 use git_push::{is_git_push_target, route_git_push_request};
-pub use plan::VmHttpPlanService;
-use plan::{is_plans_collection_target, route_plans_collection_request};
 #[cfg(test)]
 use nix_cache::route_nix_cache_request_without_upstream;
 pub use nix_cache::{
@@ -40,6 +38,8 @@ use openai_proxy::VmHttpOpenAiProxyService;
 pub use openai_proxy::{
     VmHttpOpenAiProxyAuthKind, VmHttpOpenAiProxyConfig, VmHttpOpenAiProxyConfigError,
 };
+pub use plan::VmHttpPlanService;
+use plan::{is_plans_collection_target, route_plans_collection_request};
 use proxy_common::{
     ClaudeBackend, OpenAiBackend, ProxyAuditDecision, ProxyBackend, ProxyStream,
     record_proxy_local_response, route_proxy_request,

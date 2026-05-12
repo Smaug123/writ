@@ -122,9 +122,7 @@ async fn handle_plan_submission<S: SecretStore + Send + Sync + 'static>(
         Err(AuditError::Invariant("session is closed")) => {
             VmHttpResponse::text(VmHttpStatus::Gone, "session is closed")
         }
-        Err(AuditError::Sqlite(err))
-            if err.to_string().to_uppercase().contains("UNIQUE") =>
-        {
+        Err(AuditError::Sqlite(err)) if err.to_string().to_uppercase().contains("UNIQUE") => {
             // The `UNIQUE(agent_run_id)` invariant in the plan table:
             // one plan per planner run.
             VmHttpResponse::text(
@@ -324,8 +322,7 @@ mod tests {
         let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
         open_audit_session(&state, session.session_id());
         // A second session that owns the run; the calling session does not.
-        let other_session_id: SessionId =
-            "82ab0bb1-7c12-4a4e-9f51-6d3d77011111".parse().unwrap();
+        let other_session_id: SessionId = "82ab0bb1-7c12-4a4e-9f51-6d3d77011111".parse().unwrap();
         open_session_for(&state, other_session_id);
         let stranger_run = record_planner_run(&state, other_session_id);
         let service = plan_service_for_test(&state);
@@ -388,9 +385,12 @@ mod tests {
         open_audit_session(&state, session.session_id());
         let run_id = record_planner_run(&state, session.session_id());
 
-        let first =
-            handle_plan_submission(&session, submission_body(run_id, "# First"), plan_service_for_test(&state))
-                .await;
+        let first = handle_plan_submission(
+            &session,
+            submission_body(run_id, "# First"),
+            plan_service_for_test(&state),
+        )
+        .await;
         assert_eq!(first.status, VmHttpStatus::Ok);
 
         let second = handle_plan_submission(
@@ -513,5 +513,4 @@ mod tests {
         let stored = state.audit.get_plan(created.plan_id).unwrap().unwrap();
         assert_eq!(stored.body.as_str(), "# Plan via dispatch");
     }
-
 }
