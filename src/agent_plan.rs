@@ -800,20 +800,110 @@ pub struct AbortRecorded {
 /// 5 of the implementation plan settles where the broker keeps the
 /// prompt before serving it back here.
 ///
-/// `decision` is always serialised — explicitly `null` while the plan
-/// is still under review, an object once the operator has decided.
-/// The spec (§"Protocol additions") declares the field as
-/// `decision: { outcome, decided_at } | null`, i.e. always present:
-/// `skip_serializing_if` would omit the key entirely and break
-/// clients written against the documented shape.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+/// `decision` is always present on the wire — explicitly `null` while
+/// the plan is still under review, an object once the operator has
+/// decided. The spec (§"Protocol additions") declares the field as
+/// `decision: { outcome, decided_at } | null`, i.e. always present;
+/// see the manual `Deserialize` impl below for the matching wire-side
+/// enforcement (a missing key is a wire-contract violation, not an
+/// implicit `None`).
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct PlanView {
     pub plan_id: PlanId,
     pub body: PlanBody,
     pub originating_run_id: crate::agent_run::AgentRunId,
     pub originating_prompt: AgentPrompt,
     pub decision: Option<DecisionView>,
+}
+
+const PLAN_VIEW_FIELDS: &[&str] = &[
+    "plan_id",
+    "body",
+    "originating_run_id",
+    "originating_prompt",
+    "decision",
+];
+
+#[derive(Deserialize)]
+#[serde(field_identifier, rename_all = "snake_case")]
+enum PlanViewField {
+    PlanId,
+    Body,
+    OriginatingRunId,
+    OriginatingPrompt,
+    Decision,
+}
+
+struct PlanViewVisitor;
+
+impl<'de> serde::de::Visitor<'de> for PlanViewVisitor {
+    type Value = PlanView;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("struct PlanView")
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+        use serde::de::Error;
+        let mut plan_id: Option<PlanId> = None;
+        let mut body: Option<PlanBody> = None;
+        let mut originating_run_id: Option<crate::agent_run::AgentRunId> = None;
+        let mut originating_prompt: Option<AgentPrompt> = None;
+        // Outer `Option` tracks key presence; inner `Option` is the
+        // semantic "no decision yet". They are kept distinct so a
+        // missing key is reported as a wire-contract violation rather
+        // than silently coerced to `None`.
+        let mut decision: Option<Option<DecisionView>> = None;
+        while let Some(key) = map.next_key::<PlanViewField>()? {
+            match key {
+                PlanViewField::PlanId => {
+                    if plan_id.is_some() {
+                        return Err(A::Error::duplicate_field("plan_id"));
+                    }
+                    plan_id = Some(map.next_value()?);
+                }
+                PlanViewField::Body => {
+                    if body.is_some() {
+                        return Err(A::Error::duplicate_field("body"));
+                    }
+                    body = Some(map.next_value()?);
+                }
+                PlanViewField::OriginatingRunId => {
+                    if originating_run_id.is_some() {
+                        return Err(A::Error::duplicate_field("originating_run_id"));
+                    }
+                    originating_run_id = Some(map.next_value()?);
+                }
+                PlanViewField::OriginatingPrompt => {
+                    if originating_prompt.is_some() {
+                        return Err(A::Error::duplicate_field("originating_prompt"));
+                    }
+                    originating_prompt = Some(map.next_value()?);
+                }
+                PlanViewField::Decision => {
+                    if decision.is_some() {
+                        return Err(A::Error::duplicate_field("decision"));
+                    }
+                    decision = Some(map.next_value::<Option<DecisionView>>()?);
+                }
+            }
+        }
+        Ok(PlanView {
+            plan_id: plan_id.ok_or_else(|| A::Error::missing_field("plan_id"))?,
+            body: body.ok_or_else(|| A::Error::missing_field("body"))?,
+            originating_run_id: originating_run_id
+                .ok_or_else(|| A::Error::missing_field("originating_run_id"))?,
+            originating_prompt: originating_prompt
+                .ok_or_else(|| A::Error::missing_field("originating_prompt"))?,
+            decision: decision.ok_or_else(|| A::Error::missing_field("decision"))?,
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for PlanView {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_struct("PlanView", PLAN_VIEW_FIELDS, PlanViewVisitor)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1236,6 +1326,53 @@ mod tests {
             value.get("decision"),
             Some(&serde_json::Value::Null),
             "decision must be present and explicitly null: {value}",
+        );
+    }
+
+    /// A `PlanView` payload missing the `decision` key entirely is a
+    /// wire-contract violation, not a "no decision" signal. The custom
+    /// `Deserialize` impl rejects it with serde's `missing_field`
+    /// error so a stale or buggy VM HTTP implementation that drops the
+    /// key can't be silently misread.
+    #[test]
+    fn plan_view_rejects_absent_decision_key() {
+        let plan_id = PlanId::new();
+        let run_id = crate::agent_run::AgentRunId::new();
+        // A valid `PlanView` minus the `decision` key.
+        let payload = serde_json::json!({
+            "plan_id": plan_id,
+            "body": "# Plan",
+            "originating_run_id": run_id,
+            "originating_prompt": "Original feature ask.",
+        });
+        let err = serde_json::from_value::<PlanView>(payload).unwrap_err();
+        assert!(
+            err.to_string().contains("missing field `decision`"),
+            "expected missing-field error, got {err}",
+        );
+    }
+
+    /// Belt-and-braces: an unknown field is also rejected. The custom
+    /// `Deserialize` relies on the derived `field_identifier` enum to
+    /// reject unknown keys, so this pins that the manual rewrite did
+    /// not regress the prior `deny_unknown_fields` guarantee.
+    #[test]
+    fn plan_view_rejects_unknown_field() {
+        let plan_id = PlanId::new();
+        let run_id = crate::agent_run::AgentRunId::new();
+        let payload = serde_json::json!({
+            "plan_id": plan_id,
+            "body": "# Plan",
+            "originating_run_id": run_id,
+            "originating_prompt": "Original feature ask.",
+            "decision": null,
+            "extra": 42,
+        });
+        let err = serde_json::from_value::<PlanView>(payload).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unknown") || msg.contains("extra"),
+            "expected unknown-field rejection, got {msg}",
         );
     }
 
