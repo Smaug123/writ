@@ -16,8 +16,8 @@
 use std::sync::Arc;
 
 use crate::agent_plan::{
-    PlanCreated, PlanId, PlanRouteAction, PlanRouteAuthError, PlanSubmission,
-    VM_PLANS_PATH_PREFIX, route_permitted_by_stage_and_decision,
+    PlanCreated, PlanId, PlanRouteAction, PlanRouteAuthError, PlanSubmission, VM_PLANS_PATH_PREFIX,
+    route_permitted_by_stage_and_decision,
 };
 use crate::audit::{AUDIT_WRITE_FAILURE_TARGET, AuditError, PlanSubmissionRecord};
 use crate::core::UnixMillis;
@@ -442,12 +442,9 @@ mod tests {
         let stranger_run = record_planner_run(&state, other_session_id);
         let service = plan_service_for_test(&state);
 
-        let response = handle_plan_submission(
-            &session,
-            submission_body(stranger_run, "# Plan"),
-            service,
-        )
-        .await;
+        let response =
+            handle_plan_submission(&session, submission_body(stranger_run, "# Plan"), service)
+                .await;
 
         assert_eq!(response.status, VmHttpStatus::Unauthorized);
     }
@@ -470,8 +467,7 @@ mod tests {
         let service = plan_service_for_test(&state);
 
         let response =
-            handle_plan_submission(&session, submission_body(run_id, "# Plan body"), service)
-                .await;
+            handle_plan_submission(&session, submission_body(run_id, "# Plan body"), service).await;
 
         assert_eq!(response.status, VmHttpStatus::Forbidden);
         let message = std::str::from_utf8(&response.body).unwrap();
@@ -506,8 +502,7 @@ mod tests {
         let service = plan_service_for_test(&state);
 
         let response =
-            handle_plan_submission(&session, submission_body(run_id, "# Plan body"), service)
-                .await;
+            handle_plan_submission(&session, submission_body(run_id, "# Plan body"), service).await;
 
         assert_eq!(response.status, VmHttpStatus::Forbidden);
         let message = std::str::from_utf8(&response.body).unwrap();
