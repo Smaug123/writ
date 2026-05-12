@@ -747,9 +747,20 @@ pub fn vm_plan_abort_path(plan_id: PlanId) -> String {
 // silently dropping fields — matches the rest of the protocol.
 
 /// `POST /v1/plans` request body.
+///
+/// `agent_run_id` names the originating planner run. The VM-side CLI
+/// already knows its run id from the
+/// `/v1/agent-runs/{id}/config` handshake that started it, so passing it
+/// back is a natural extension of the existing in-VM identifier flow.
+/// The broker verifies the run belongs to the calling session before
+/// persisting the plan: that closes the cross-session window where one
+/// VM's bearer could otherwise attach a plan to another VM's run. The
+/// stage-level check (`run.stage = 'plan'`) lands in slice 3 once the
+/// `agent_run.stage` column exists.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PlanSubmission {
+    pub agent_run_id: crate::agent_run::AgentRunId,
     pub body: PlanBody,
 }
 
@@ -1277,14 +1288,20 @@ mod tests {
     #[test]
     fn plan_submission_roundtrips_through_json() {
         let m = PlanSubmission {
+            agent_run_id: crate::agent_run::AgentRunId::new(),
             body: PlanBody::try_new("# Plan").unwrap(),
         };
         let json = serde_json::to_string(&m).unwrap();
         let back: PlanSubmission = serde_json::from_str(&json).unwrap();
         assert_eq!(back, m);
         // Extra fields are rejected — deny_unknown_fields.
-        let with_typo = "{\"body\":\"# Plan\",\"bodyy\":\"oops\"}";
-        assert!(serde_json::from_str::<PlanSubmission>(with_typo).is_err());
+        let run_id_json = serde_json::to_string(&m.agent_run_id).unwrap();
+        let with_typo =
+            format!("{{\"agent_run_id\":{run_id_json},\"body\":\"# Plan\",\"bodyy\":\"oops\"}}");
+        assert!(serde_json::from_str::<PlanSubmission>(&with_typo).is_err());
+        // Missing agent_run_id is rejected.
+        let missing_run = "{\"body\":\"# Plan\"}";
+        assert!(serde_json::from_str::<PlanSubmission>(missing_run).is_err());
     }
 
     #[test]

@@ -646,8 +646,11 @@ proptest! {
 
     /// Wire-format: `PlanSubmission` round-trips through JSON.
     #[test]
-    fn plan_submission_roundtrips(body in arb_plan_body()) {
-        let m = PlanSubmission { body };
+    fn plan_submission_roundtrips(
+        agent_run_id in arb_agent_run_id(),
+        body in arb_plan_body(),
+    ) {
+        let m = PlanSubmission { agent_run_id, body };
         let j = serde_json::to_string(&m).unwrap();
         let back: PlanSubmission = serde_json::from_str(&j).unwrap();
         prop_assert_eq!(back, m);
