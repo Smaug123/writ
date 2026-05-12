@@ -30,7 +30,7 @@ pub(super) struct Migration {
 /// a version higher than this is rejected with [`AuditError::SchemaTooNew`]
 /// rather than opened — we'd rather fail to start than silently drop data
 /// into a schema a newer broker wrote.
-pub(super) const SCHEMA_VERSION: i32 = 13;
+pub(super) const SCHEMA_VERSION: i32 = 14;
 
 /// The full migration history. Each entry documents exactly one state
 /// transition; the sequence of entries is the schema's lineage. Order
@@ -807,6 +807,52 @@ WHEN NOT EXISTS (
 BEGIN
     SELECT RAISE(ABORT, 'git push must be staged to be resolved');
 END;
+"#,
+    },
+    // Correlation id metadata: an opaque caller-supplied identifier
+    // that ties related agent runs and git pushes together. Per
+    // `docs/plans/2026-05-11-agent-plans.md`, the broker validates as a
+    // safe id (bounded length, restricted character class) and never
+    // interprets the contents. The CHECK constraint mirrors the
+    // `CorrelationId` newtype's invariants so a future code path that
+    // skips the DAO's parse-don't-validate boundary still cannot land
+    // a malformed id in the audit log. The GLOB pattern `*[^A-Za-z0-9_-]*`
+    // matches any string containing at least one byte outside the
+    // allowed class; `NOT GLOB` rejects it.
+    //
+    // The leading `typeof(correlation_id) = 'text'` and BLOB-length
+    // parity clauses together form a NUL guard. SQLite's declared
+    // column types are advisory: a TEXT column will happily store a
+    // value with storage class BLOB if a raw writer binds bytes that
+    // way, and `length()`/`GLOB` on TEXT stop at the first NUL byte.
+    // Without these guards, a raw insert binding e.g. `b"abc\0/"`
+    // (whether the binding is TEXT or BLOB) would pass a check that
+    // only inspected the `abc` prefix — and then later reads would
+    // fail when `CorrelationId::try_new` saw the full byte string.
+    // `typeof = 'text'` forces TEXT storage class, and the BLOB-cast
+    // length parity then forces the absence of embedded NULs, so the
+    // GLOB and length bounds see the same bytes the newtype would.
+    //
+    // Existing rows are filled with NULL (the column accepts NULL
+    // because the value is optional per the design).
+    Migration {
+        version: 14,
+        sql: r#"
+ALTER TABLE agent_run ADD COLUMN correlation_id TEXT
+    CHECK (correlation_id IS NULL OR (
+        typeof(correlation_id) = 'text'
+        AND length(correlation_id) = length(cast(correlation_id AS BLOB))
+        AND length(correlation_id) BETWEEN 1 AND 64
+        AND correlation_id NOT GLOB '*[^A-Za-z0-9_-]*'
+    ));
+
+ALTER TABLE git_push_request ADD COLUMN correlation_id TEXT
+    CHECK (correlation_id IS NULL OR (
+        typeof(correlation_id) = 'text'
+        AND length(correlation_id) = length(cast(correlation_id AS BLOB))
+        AND length(correlation_id) BETWEEN 1 AND 64
+        AND correlation_id NOT GLOB '*[^A-Za-z0-9_-]*'
+    ));
 "#,
     },
 ];
@@ -1850,6 +1896,226 @@ mod tests {
             Ok(())
         })
         .unwrap();
+    }
+
+    /// Migration 14 adds `correlation_id` to `agent_run` and
+    /// `git_push_request`. Verify the new columns exist with NULL for
+    /// pre-existing rows (no rewrite), that valid values can be
+    /// written, and that the CHECK constraint rejects malformed bytes.
+    #[test]
+    fn open_migrates_v13_database_to_correlation_id_schema() {
+        let db = NamedTempFile::new().unwrap();
+        let session_id = SessionId::new();
+        let run_id = uuid::Uuid::new_v4();
+        let push_request_id = RequestId::new();
+        let oid_a = "a".repeat(40);
+
+        {
+            let mut conn = Connection::open(db.path()).unwrap();
+            let tx = conn.transaction().unwrap();
+            for migration in MIGRATIONS.iter().take(13) {
+                tx.execute_batch(migration.sql).unwrap();
+            }
+            tx.pragma_update(None, "user_version", 13).unwrap();
+
+            tx.execute(
+                "INSERT INTO session (session_id, label, agent_kind, agent_model, opened_at, closed_at) \
+                 VALUES (?1, NULL, 'claude', NULL, 1, NULL)",
+                params![session_id.as_uuid().to_string()],
+            )
+            .unwrap();
+
+            // Pre-migration agent_run row: must survive with a NULL
+            // correlation_id once the column is added.
+            tx.execute(
+                "INSERT INTO agent_run (
+                     run_id, session_id, requested_at, agent_kind,
+                     prompt_bytes, prompt_sha256, prompt_redacted_preview
+                 ) VALUES (?1, ?2, 2, 'claude', 1, ?3, '<redacted>')",
+                params![
+                    run_id.to_string(),
+                    session_id.as_uuid().to_string(),
+                    "a".repeat(64),
+                ],
+            )
+            .unwrap();
+
+            // Pre-migration git_push_request row: same expectation.
+            tx.execute(
+                "INSERT INTO git_push_request \
+                 (push_request_id, session_id, received_at, repo, branch, expected_remote_head, new_head) \
+                 VALUES (?1, ?2, 3, 'o/n', 'main', NULL, ?3)",
+                params![
+                    push_request_id.as_uuid().to_string(),
+                    session_id.as_uuid().to_string(),
+                    oid_a,
+                ],
+            )
+            .unwrap();
+
+            tx.commit().unwrap();
+        }
+
+        let log = AuditLog::open(db.path()).unwrap();
+        assert_eq!(read_user_version(&log), SCHEMA_VERSION);
+
+        assert!(column_exists(&log, "agent_run", "correlation_id"));
+        assert!(column_exists(&log, "git_push_request", "correlation_id"));
+
+        let agent_run_value: Option<String> = log
+            .with_conn(|c| {
+                Ok(c.query_row(
+                    "SELECT correlation_id FROM agent_run WHERE run_id = ?1",
+                    params![run_id.to_string()],
+                    |row| row.get(0),
+                )?)
+            })
+            .unwrap();
+        assert!(agent_run_value.is_none());
+
+        let push_request_value: Option<String> = log
+            .with_conn(|c| {
+                Ok(c.query_row(
+                    "SELECT correlation_id FROM git_push_request WHERE push_request_id = ?1",
+                    params![push_request_id.as_uuid().to_string()],
+                    |row| row.get(0),
+                )?)
+            })
+            .unwrap();
+        assert!(push_request_value.is_none());
+
+        // A subsequent write with a well-formed correlation id is
+        // accepted.
+        let tagged_run_id = uuid::Uuid::new_v4();
+        log.with_conn(|c| {
+            c.execute(
+                "INSERT INTO agent_run (
+                     run_id, session_id, requested_at, agent_kind,
+                     prompt_bytes, prompt_sha256, prompt_redacted_preview,
+                     correlation_id
+                 ) VALUES (?1, ?2, 4, 'claude', 1, ?3, '<redacted>', ?4)",
+                params![
+                    tagged_run_id.to_string(),
+                    session_id.as_uuid().to_string(),
+                    "b".repeat(64),
+                    "good-id_42",
+                ],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        // CHECK rejects an empty string (length must be ≥ 1).
+        let bad_empty = log
+            .with_conn(|c| {
+                Ok(c.execute(
+                    "INSERT INTO agent_run (
+                         run_id, session_id, requested_at, agent_kind,
+                         prompt_bytes, prompt_sha256, prompt_redacted_preview,
+                         correlation_id
+                     ) VALUES (?1, ?2, 5, 'claude', 1, ?3, '<redacted>', '')",
+                    params![
+                        uuid::Uuid::new_v4().to_string(),
+                        session_id.as_uuid().to_string(),
+                        "c".repeat(64),
+                    ],
+                ))
+            })
+            .unwrap()
+            .unwrap_err();
+        assert!(bad_empty.to_string().contains("CHECK"), "got: {bad_empty}");
+
+        // CHECK rejects bytes outside the allowed `[A-Za-z0-9_-]` class.
+        let bad_char = log
+            .with_conn(|c| {
+                Ok(c.execute(
+                    "INSERT INTO git_push_request \
+                     (push_request_id, session_id, received_at, repo, branch, expected_remote_head, new_head, correlation_id) \
+                     VALUES (?1, ?2, 6, 'o/n', 'main', NULL, ?3, ?4)",
+                    params![
+                        RequestId::new().as_uuid().to_string(),
+                        session_id.as_uuid().to_string(),
+                        "b".repeat(40),
+                        "bad space",
+                    ],
+                ))
+            })
+            .unwrap()
+            .unwrap_err();
+        assert!(bad_char.to_string().contains("CHECK"), "got: {bad_char}");
+    }
+
+    /// Regression guard for the NUL-injection case in two flavours:
+    ///
+    /// 1. A TEXT-bound `"abc\0/"`. SQLite's `length()` and `GLOB` walk
+    ///    TEXT as a C-string and stop at the first NUL, so without the
+    ///    BLOB-length parity clause a CHECK that only inspected the
+    ///    `abc` prefix would let this through.
+    /// 2. A BLOB-bound `b"abc\0/"`. SQLite columns declared TEXT still
+    ///    accept BLOB storage class, and on BLOBs `length()` returns
+    ///    the byte count so the parity clause is vacuously true; only
+    ///    the `typeof = 'text'` clause catches this path.
+    ///
+    /// In both cases the prefix `abc` is valid but the trailing `/`
+    /// is not in `[A-Za-z0-9_-]`, exactly the shape the newtype
+    /// rejects and the DAO read path would later trip on. Both tables
+    /// share the expression, so verify both.
+    #[test]
+    fn correlation_id_check_rejects_embedded_nul() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+
+        let smuggled_text: &str = "abc\0/";
+        let smuggled_blob: &[u8] = b"abc\0/";
+
+        let agent_run_with_correlation = |raw_corr: rusqlite::types::Value| {
+            log.with_conn(|c| {
+                Ok(c.execute(
+                    "INSERT INTO agent_run (
+                         run_id, session_id, requested_at, agent_kind,
+                         prompt_bytes, prompt_sha256, prompt_redacted_preview,
+                         correlation_id
+                     ) VALUES (?1, ?2, 10, 'claude', 1, ?3, '<redacted>', ?4)",
+                    params![
+                        uuid::Uuid::new_v4().to_string(),
+                        s.session_id.as_uuid().to_string(),
+                        "a".repeat(64),
+                        raw_corr,
+                    ],
+                ))
+            })
+            .unwrap()
+            .unwrap_err()
+        };
+
+        let push_with_correlation = |raw_corr: rusqlite::types::Value| {
+            log.with_conn(|c| {
+                Ok(c.execute(
+                    "INSERT INTO git_push_request \
+                     (push_request_id, session_id, received_at, repo, branch, expected_remote_head, new_head, correlation_id) \
+                     VALUES (?1, ?2, 11, 'o/n', 'main', NULL, ?3, ?4)",
+                    params![
+                        RequestId::new().as_uuid().to_string(),
+                        s.session_id.as_uuid().to_string(),
+                        "b".repeat(40),
+                        raw_corr,
+                    ],
+                ))
+            })
+            .unwrap()
+            .unwrap_err()
+        };
+
+        for binding in [
+            rusqlite::types::Value::Text(smuggled_text.to_owned()),
+            rusqlite::types::Value::Blob(smuggled_blob.to_owned()),
+        ] {
+            let err = agent_run_with_correlation(binding.clone());
+            assert!(err.to_string().contains("CHECK"), "got: {err}");
+            let err = push_with_correlation(binding);
+            assert!(err.to_string().contains("CHECK"), "got: {err}");
+        }
     }
 
     /// A DB written by a future broker will carry a user_version beyond

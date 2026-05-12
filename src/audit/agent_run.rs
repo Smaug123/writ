@@ -12,6 +12,7 @@ use super::validation::{
     validate_agent_run_stream_path_text, validate_sha256_hex, validate_stream_summary,
 };
 use super::{AuditError, AuditLog};
+use crate::agent_plan::CorrelationId;
 use crate::agent_run::{
     AgentPromptSummary, AgentRunId, AgentRunOutcome, AgentRunStreamSummary, AgentRunTerminalStatus,
 };
@@ -34,6 +35,11 @@ pub struct AgentRunAuditRecord {
     pub requested_at: UnixMillis,
     pub agent_kind: AgentKind,
     pub prompt: AgentPromptSummary,
+    /// Opaque caller-supplied correlation id. `None` for runs that
+    /// were not tagged at request time. See
+    /// `docs/plans/2026-05-11-agent-plans.md` ("Correlation ID") for
+    /// the semantics.
+    pub correlation_id: Option<CorrelationId>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -154,8 +160,9 @@ impl AuditLog {
                      agent_kind,
                      prompt_bytes,
                      prompt_sha256,
-                     prompt_redacted_preview
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                     prompt_redacted_preview,
+                     correlation_id
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params![
                     r.run_id.as_uuid().to_string(),
                     r.session_id.as_uuid().to_string(),
@@ -164,6 +171,7 @@ impl AuditLog {
                     u64_to_sql_i64(r.prompt.byte_len, "agent run prompt bytes")?,
                     &r.prompt.sha256_hex,
                     &r.prompt.redacted_preview,
+                    r.correlation_id.as_ref().map(CorrelationId::as_str),
                 ],
             )?;
             tx.commit()?;
@@ -221,7 +229,7 @@ impl AuditLog {
             let row = c
                 .query_row(
                     "SELECT run_id, session_id, requested_at, agent_kind, prompt_bytes,
-                            prompt_sha256, prompt_redacted_preview
+                            prompt_sha256, prompt_redacted_preview, correlation_id
                      FROM agent_run
                      WHERE run_id = ?1",
                     params![run_id.as_uuid().to_string()],
@@ -277,6 +285,7 @@ fn agent_run_from_row(row: &Row<'_>) -> rusqlite::Result<Result<AgentRunAuditRec
     let prompt_bytes: i64 = row.get(4)?;
     let prompt_sha256: String = row.get(5)?;
     let prompt_redacted_preview: String = row.get(6)?;
+    let correlation_id_raw: Option<String> = row.get(7)?;
 
     let parse = || -> Result<AgentRunAuditRecord, AuditError> {
         let run_id = uuid::Uuid::parse_str(&run_id_str)
@@ -291,6 +300,10 @@ fn agent_run_from_row(row: &Row<'_>) -> rusqlite::Result<Result<AgentRunAuditRec
                 "agent run prompt redacted preview is empty",
             ));
         }
+        let correlation_id = correlation_id_raw
+            .map(CorrelationId::try_new)
+            .transpose()
+            .map_err(|_| AuditError::Invariant("agent run row: correlation_id is invalid"))?;
         Ok(AgentRunAuditRecord {
             run_id: AgentRunId::from_uuid(run_id),
             session_id: SessionId::from_uuid(session_id),
@@ -301,6 +314,7 @@ fn agent_run_from_row(row: &Row<'_>) -> rusqlite::Result<Result<AgentRunAuditRec
                 sha256_hex: prompt_sha256,
                 redacted_preview: prompt_redacted_preview,
             },
+            correlation_id,
         })
     };
     Ok(parse())
@@ -402,8 +416,10 @@ fn agent_run_status_from_str(raw: &str) -> Result<AgentRunTerminalStatus, AuditE
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent_plan::CorrelationId;
     use crate::audit::test_support::sample_session;
     use crate::core::AgentKind;
+    use rusqlite::params;
 
     #[test]
     fn agent_vm_workspace_bootstrap_roundtrips() {
@@ -472,6 +488,7 @@ mod tests {
             requested_at: UnixMillis::from_millis(1_700_000_100),
             agent_kind: AgentKind::Claude,
             prompt: prompt.summary(),
+            correlation_id: None,
         };
 
         log.record_agent_run(&record).unwrap();
@@ -482,6 +499,7 @@ mod tests {
         assert_eq!(entry.agent_kind, AgentKind::Claude);
         assert_eq!(entry.prompt.byte_len, prompt.byte_len());
         assert_eq!(entry.prompt.redacted_preview, "<redacted>");
+        assert!(entry.correlation_id.is_none());
         let debug = format!("{entry:?}");
         assert!(!debug.contains(prompt.as_str()), "{debug}");
 
@@ -525,6 +543,7 @@ mod tests {
             requested_at: UnixMillis::from_millis(1_700_000_100),
             agent_kind: AgentKind::Codex,
             prompt: crate::agent_run::AgentPrompt::new("prompt").summary(),
+            correlation_id: None,
         };
 
         let err = log.record_agent_run(&record).unwrap_err();
@@ -587,6 +606,7 @@ mod tests {
                     sha256_hex: "not sha256".to_string(),
                     redacted_preview: "<redacted>".to_string(),
                 },
+                correlation_id: None,
             })
             .unwrap_err();
 
@@ -628,5 +648,104 @@ mod tests {
                 message: "agent run stream path must be absolute",
             }
         ));
+    }
+
+    #[test]
+    fn agent_run_roundtrips_with_correlation_id() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+        let run_id = AgentRunId::new();
+        let correlation = CorrelationId::try_new("feature-42_xyz").unwrap();
+        let record = AgentRunAuditRecord {
+            run_id,
+            session_id: s.session_id,
+            requested_at: UnixMillis::from_millis(1_700_000_100),
+            agent_kind: AgentKind::Claude,
+            prompt: crate::agent_run::AgentPrompt::new("prompt").summary(),
+            correlation_id: Some(correlation.clone()),
+        };
+
+        log.record_agent_run(&record).unwrap();
+        let entry = log.get_agent_run(run_id).unwrap().unwrap();
+        assert_eq!(entry.correlation_id, Some(correlation));
+    }
+
+    /// A pre-migration-14 row (NULL correlation_id) round-trips as
+    /// `None`; reading back an old row must not surface a parse error.
+    #[test]
+    fn agent_run_correlation_id_null_surfaces_as_none() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+        let run_id = AgentRunId::new();
+        log.record_agent_run(&AgentRunAuditRecord {
+            run_id,
+            session_id: s.session_id,
+            requested_at: UnixMillis::from_millis(1_700_000_100),
+            agent_kind: AgentKind::Claude,
+            prompt: crate::agent_run::AgentPrompt::new("prompt").summary(),
+            correlation_id: None,
+        })
+        .unwrap();
+        let entry = log.get_agent_run(run_id).unwrap().unwrap();
+        assert!(entry.correlation_id.is_none());
+    }
+
+    /// The DB's CHECK constraint is the belt-and-braces line of
+    /// defence: even if a future code path bypasses
+    /// `CorrelationId::try_new`, raw bytes outside the allowed class
+    /// cannot land. We exercise the constraint directly via a raw
+    /// INSERT to keep the test honest about which layer is rejecting.
+    #[test]
+    fn agent_run_correlation_id_check_constraint_rejects_invalid_bytes() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+        let run_id = AgentRunId::new();
+        let err = log
+            .with_conn_mut(|c| {
+                c.execute(
+                    "INSERT INTO agent_run (
+                         run_id, session_id, requested_at, agent_kind,
+                         prompt_bytes, prompt_sha256, prompt_redacted_preview,
+                         correlation_id
+                     ) VALUES (?1, ?2, ?3, 'claude', 1, ?4, '<redacted>', ?5)",
+                    params![
+                        run_id.as_uuid().to_string(),
+                        s.session_id.as_uuid().to_string(),
+                        1_700_000_100i64,
+                        crate::agent_run::sha256_hex(b"x"),
+                        "bad space",
+                    ],
+                )
+                .map_err(AuditError::from)
+            })
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("CHECK"), "got: {msg}");
+
+        let too_long = "a".repeat(65);
+        let err_len = log
+            .with_conn_mut(|c| {
+                c.execute(
+                    "INSERT INTO agent_run (
+                         run_id, session_id, requested_at, agent_kind,
+                         prompt_bytes, prompt_sha256, prompt_redacted_preview,
+                         correlation_id
+                     ) VALUES (?1, ?2, ?3, 'claude', 1, ?4, '<redacted>', ?5)",
+                    params![
+                        AgentRunId::new().as_uuid().to_string(),
+                        s.session_id.as_uuid().to_string(),
+                        1_700_000_101i64,
+                        crate::agent_run::sha256_hex(b"y"),
+                        too_long,
+                    ],
+                )
+                .map_err(AuditError::from)
+            })
+            .unwrap_err();
+        let msg_len = err_len.to_string();
+        assert!(msg_len.contains("CHECK"), "got: {msg_len}");
     }
 }

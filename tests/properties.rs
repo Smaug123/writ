@@ -12,13 +12,14 @@ use writ::agent_plan::{
     route_permitted_by_stage_and_decision,
 };
 use writ::agent_run::{AgentPrompt, AgentRunId};
-use writ::audit::{AuditLog, PreMintRecord};
+use writ::audit::{AgentRunAuditRecord, AuditLog, GitPushRequestRecord, PreMintRecord};
 use writ::core::{
     AgentKind, CapabilityRequest, CredentialGrant, GitHubAccess, GitHubGrantedScope,
     GitHubPermissions, GitHubRequest, GrantedScope, Jti, MetadataAccess, PolicyDecision, RepoRef,
     RequestId, SessionId, SessionRecord, TtlSeconds, UnixMillis,
 };
 use writ::policy::{PolicyConfig, decide};
+use writ::vm_git::{GitBranchName, GitCloneRepo, GitObjectId};
 
 fn arb_repo() -> impl Strategy<Value = RepoRef> {
     ("[a-zA-Z0-9_-]{1,32}", "[a-zA-Z0-9_.-]{1,32}")
@@ -736,5 +737,75 @@ proptest! {
                 j,
             );
         }
+    }
+
+    /// Any valid `CorrelationId` round-trips through the `agent_run`
+    /// audit DAO. The DAO's CHECK constraint and the `CorrelationId`
+    /// newtype agree on the allowed character class, so writes through
+    /// the parse-don't-validate boundary must not be rejected at the DB.
+    #[test]
+    fn agent_run_correlation_id_roundtrips_through_audit_log(
+        c in arb_correlation_id(),
+    ) {
+        let log = AuditLog::open_in_memory().unwrap();
+        let session = SessionRecord {
+            session_id: SessionId::new(),
+            label: None,
+            agent_kind: None,
+            agent_model: None,
+            opened_at: UnixMillis::from_millis(0),
+            closed_at: None,
+        };
+        log.open_session(&session).unwrap();
+        let run_id = AgentRunId::new();
+        log.record_agent_run(&AgentRunAuditRecord {
+            run_id,
+            session_id: session.session_id,
+            requested_at: UnixMillis::from_millis(1),
+            agent_kind: AgentKind::Claude,
+            prompt: AgentPrompt::try_new("p").unwrap().summary(),
+            correlation_id: Some(c.clone()),
+        })
+        .unwrap();
+        let entry = log.get_agent_run(run_id).unwrap().unwrap();
+        prop_assert_eq!(entry.correlation_id, Some(c));
+    }
+
+    /// Same invariant for the git push request DAO.
+    #[test]
+    fn git_push_request_correlation_id_roundtrips_through_audit_log(
+        c in arb_correlation_id(),
+    ) {
+        let log = AuditLog::open_in_memory().unwrap();
+        let session = SessionRecord {
+            session_id: SessionId::new(),
+            label: None,
+            agent_kind: None,
+            agent_model: None,
+            opened_at: UnixMillis::from_millis(0),
+            closed_at: None,
+        };
+        log.open_session(&session).unwrap();
+        let push_request_id = RequestId::new();
+        let repo = GitCloneRepo::new(RepoRef {
+            owner: "o".into(),
+            name: "n".into(),
+        })
+        .unwrap();
+        let branch: GitBranchName = "main".parse().unwrap();
+        let new_head: GitObjectId = "a".repeat(40).parse().unwrap();
+        log.record_git_push_request(&GitPushRequestRecord {
+            push_request_id,
+            session_id: session.session_id,
+            received_at: UnixMillis::from_millis(1),
+            repo,
+            branch,
+            expected_remote_head: None,
+            new_head,
+            correlation_id: Some(c.clone()),
+        })
+        .unwrap();
+        let entry = log.get_git_push(push_request_id).unwrap().unwrap();
+        prop_assert_eq!(entry.correlation_id, Some(c));
     }
 }
