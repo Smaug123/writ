@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand, ValueEnum};
 
-use writ::agent_plan::{CorrelationId, PlanId};
+use writ::agent_plan::{CorrelationId, PlanId, Stage};
 use writ::agent_run::AgentPrompt;
 use writ::core::{
     AgentKind, CapabilityRequest, GitHubAccess, GitHubRequest, RepoRef, RequestId, SessionId,
@@ -146,6 +146,12 @@ enum AgentCmd {
         /// Workspace warmup level to complete before starting the agent.
         #[arg(long, value_enum, default_value = "devshell")]
         warm: WorkspaceWarmArg,
+        /// Role of this run in the plan/review/execute pipeline. The
+        /// broker stamps it on the `agent_run.stage` audit column and
+        /// the VM HTTP plan routes use it for per-stage authorisation.
+        /// Defaults to `execute`, the historical (pre-pipeline) shape.
+        #[arg(long, value_parser = parse_stage, default_value = "execute")]
+        stage: Stage,
         /// Opaque caller-supplied id that ties this run to a wider
         /// task. Validated only as a safe id (`[A-Za-z0-9_-]`, 1..=64
         /// bytes); the broker never interprets the contents.
@@ -345,6 +351,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 model,
                 workspace,
                 warm,
+                stage,
                 correlation_id,
             } => {
                 let warm_mode = warm.into();
@@ -356,6 +363,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     model,
                     workspace,
                     AgentPrompt::try_new(prompt)?,
+                    stage,
                     correlation_id,
                 )?;
             }
@@ -463,6 +471,10 @@ fn parse_correlation_id(raw: &str) -> Result<CorrelationId, String> {
     CorrelationId::try_new(raw).map_err(|err| err.to_string())
 }
 
+fn parse_stage(raw: &str) -> Result<Stage, String> {
+    raw.parse::<Stage>().map_err(|err| err.to_string())
+}
+
 /// Read the operator identity the CLI will assert to the broker.
 ///
 /// The local socket is the trust boundary, so this only needs to be a
@@ -519,6 +531,7 @@ fn start_agent_vm(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn start_agent_run(
     socket_path: &Path,
     label: Option<String>,
@@ -526,6 +539,7 @@ fn start_agent_run(
     agent_model: String,
     workspace: AgentVmWorkspaceBootstrap,
     prompt: AgentPrompt,
+    stage: Stage,
     correlation_id: Option<CorrelationId>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let msg = ClientMessage::StartAgentRun {
@@ -534,6 +548,7 @@ fn start_agent_run(
         agent_model,
         workspace,
         prompt,
+        stage,
         correlation_id,
     };
     match call_with_timeout(socket_path, &msg, AGENT_VM_WORKSPACE_CALL_TIMEOUT)? {
@@ -911,6 +926,7 @@ mod tests {
                         prompt,
                         model,
                         warm,
+                        stage,
                         correlation_id,
                         ..
                     },
@@ -920,10 +936,98 @@ mod tests {
                 assert_eq!(prompt, "fix the failing test");
                 assert_eq!(model, "claude-test");
                 assert_eq!(warm, WorkspaceWarmArg::Sources);
+                assert_eq!(stage, Stage::Execute);
                 assert!(correlation_id.is_none());
             }
             _ => panic!("unexpected command"),
         }
+    }
+
+    #[test]
+    fn agent_run_cli_defaults_stage_to_execute() {
+        let args = Args::try_parse_from([
+            "writ",
+            "agent",
+            "run",
+            "--repo",
+            "owner/repo",
+            "--agent",
+            "claude",
+            "--model",
+            "claude-test",
+            "--prompt",
+            "p",
+        ])
+        .unwrap();
+        match args.cmd {
+            Cmd::Agent {
+                action: AgentCmd::Run { stage, .. },
+            } => assert_eq!(stage, Stage::Execute),
+            _ => panic!("unexpected command"),
+        }
+    }
+
+    #[test]
+    fn agent_run_cli_accepts_stage_flag_for_every_stage() {
+        for (raw, expected) in [
+            ("plan", Stage::Plan),
+            ("review", Stage::Review),
+            ("execute", Stage::Execute),
+        ] {
+            let args = Args::try_parse_from([
+                "writ",
+                "agent",
+                "run",
+                "--repo",
+                "owner/repo",
+                "--agent",
+                "claude",
+                "--model",
+                "claude-test",
+                "--prompt",
+                "p",
+                "--stage",
+                raw,
+            ])
+            .unwrap();
+            match args.cmd {
+                Cmd::Agent {
+                    action: AgentCmd::Run { stage, .. },
+                } => assert_eq!(stage, expected, "raw {raw}"),
+                _ => panic!("unexpected command"),
+            }
+        }
+    }
+
+    /// Malformed stages must fail at clap rather than reach the broker,
+    /// so the audit-log CHECK is never the line of defence. The
+    /// `Stage::from_str` test in `agent_plan` already covers the
+    /// character class; here we only verify the CLI surfaces the
+    /// rejection on the `--stage` flag.
+    #[test]
+    fn agent_run_cli_rejects_unknown_stage() {
+        let err = match Args::try_parse_from([
+            "writ",
+            "agent",
+            "run",
+            "--repo",
+            "owner/repo",
+            "--agent",
+            "claude",
+            "--model",
+            "claude-test",
+            "--prompt",
+            "p",
+            "--stage",
+            "planner",
+        ]) {
+            Ok(_) => panic!("expected clap to reject malformed --stage"),
+            Err(error) => error,
+        };
+        assert!(
+            err.to_string().contains("--stage"),
+            "unexpected clap error: {err}",
+        );
     }
 
     #[test]
@@ -1065,6 +1169,7 @@ mod tests {
             agent_model: "claude-test".into(),
             workspace,
             prompt: AgentPrompt::try_new("SECRET prompt").unwrap(),
+            stage: Stage::Execute,
             correlation_id: None,
         };
 

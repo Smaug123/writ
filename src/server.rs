@@ -204,6 +204,7 @@ pub async fn dispatch_message_with_agent_vm<S: SecretStore + Send + Sync + 'stat
             agent_model,
             workspace,
             prompt,
+            stage,
             correlation_id,
         } => match agent_vm {
             Some(agent_vm) => {
@@ -221,6 +222,7 @@ pub async fn dispatch_message_with_agent_vm<S: SecretStore + Send + Sync + 'stat
                         agent_model,
                         workspace,
                         prompt,
+                        stage,
                         correlation_id,
                     )
                     .await
@@ -1829,6 +1831,7 @@ mod tests {
                 agent_kind: AgentKind::Claude,
                 prompt,
                 correlation_id,
+                stage: crate::agent_plan::Stage::Plan,
             })
             .unwrap();
         state
