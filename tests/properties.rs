@@ -406,9 +406,8 @@ fn oracle_scope_authorises_request(req: &GitHubRequest, scope: &GitHubGrantedSco
 // ---------------------------------------------------------------------------
 
 fn arb_correlation_id() -> impl Strategy<Value = CorrelationId> {
-    "[A-Za-z0-9_-]{1,64}".prop_map(|s| {
-        CorrelationId::try_new(s).expect("regex produces only valid correlation ids")
-    })
+    "[A-Za-z0-9_-]{1,64}"
+        .prop_map(|s| CorrelationId::try_new(s).expect("regex produces only valid correlation ids"))
 }
 
 fn arb_plan_body() -> impl Strategy<Value = PlanBody> {
@@ -418,7 +417,8 @@ fn arb_plan_body() -> impl Strategy<Value = PlanBody> {
 }
 
 fn arb_plan_feedback() -> impl Strategy<Value = PlanFeedback> {
-    ".{1,128}".prop_map(|s| PlanFeedback::try_new(s).expect("regex produces non-empty bounded body"))
+    ".{1,128}"
+        .prop_map(|s| PlanFeedback::try_new(s).expect("regex produces non-empty bounded body"))
 }
 
 fn arb_plan_abort_reason() -> impl Strategy<Value = PlanAbortReason> {
@@ -700,7 +700,10 @@ proptest! {
 
     /// Wire-format: `PlanView` round-trips with and without a decision,
     /// across freshly-generated `PlanId` / `AgentRunId` / prompt
-    /// content. Catches both rename slips and unintended field reorders.
+    /// content. The `decision` key is always present per the spec
+    /// (§"Protocol additions": `decision: { ... } | null`) — when the
+    /// plan is still under review it serialises as explicit `null`,
+    /// never an absent key.
     #[test]
     fn plan_view_roundtrips(
         plan_id in arb_plan_id(),
@@ -718,6 +721,20 @@ proptest! {
         };
         let j = serde_json::to_string(&view).unwrap();
         let back: PlanView = serde_json::from_str(&j).unwrap();
-        prop_assert_eq!(back, view);
+        prop_assert_eq!(&back, &view);
+
+        // The `decision` key is always present; if `None`, it must be
+        // explicit `null` rather than an absent key.
+        let value: serde_json::Value = serde_json::from_str(&j).unwrap();
+        let decision_value = value.get("decision");
+        prop_assert!(decision_value.is_some(), "decision key absent: {j}");
+        if view.decision.is_none() {
+            prop_assert_eq!(
+                decision_value,
+                Some(&serde_json::Value::Null),
+                "decision must be explicit null when absent: {}",
+                j,
+            );
+        }
     }
 }

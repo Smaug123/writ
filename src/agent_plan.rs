@@ -145,9 +145,7 @@ pub enum CorrelationIdError {
         max = MAX_CORRELATION_ID_BYTES,
     )]
     InvalidLength { got: usize },
-    #[error(
-        "correlation id byte at offset {at} is {byte:?}; expected [A-Za-z0-9_-]"
-    )]
+    #[error("correlation id byte at offset {at} is {byte:?}; expected [A-Za-z0-9_-]")]
     InvalidByte { at: usize, byte: u8 },
 }
 
@@ -218,9 +216,7 @@ pub struct PlanBody(String);
 pub enum PlanBodyError {
     #[error("plan body must not be empty")]
     Empty,
-    #[error(
-        "plan body is {byte_len} bytes, exceeding the {max_bytes}-byte limit"
-    )]
+    #[error("plan body is {byte_len} bytes, exceeding the {max_bytes}-byte limit")]
     TooLarge { byte_len: usize, max_bytes: usize },
 }
 
@@ -296,9 +292,7 @@ pub struct PlanFeedback(String);
 pub enum PlanFeedbackError {
     #[error("plan feedback must not be empty")]
     Empty,
-    #[error(
-        "plan feedback is {byte_len} bytes, exceeding the {max_bytes}-byte limit"
-    )]
+    #[error("plan feedback is {byte_len} bytes, exceeding the {max_bytes}-byte limit")]
     TooLarge { byte_len: usize, max_bytes: usize },
 }
 
@@ -367,9 +361,7 @@ pub struct PlanAbortReason(String);
 pub enum PlanAbortReasonError {
     #[error("plan abort reason must not be empty")]
     Empty,
-    #[error(
-        "plan abort reason is {byte_len} bytes, exceeding the {max_bytes}-byte limit"
-    )]
+    #[error("plan abort reason is {byte_len} bytes, exceeding the {max_bytes}-byte limit")]
     TooLarge { byte_len: usize, max_bytes: usize },
 }
 
@@ -578,8 +570,9 @@ pub fn compose_implementer_prompt(
     feature_prompt: &AgentPrompt,
     plan_body: &PlanBody,
 ) -> Result<AgentPrompt, AgentPromptError> {
-    let mut combined =
-        String::with_capacity(feature_prompt.as_str().len() + PLAN_PROMPT_SEPARATOR.len() + plan_body.as_str().len());
+    let mut combined = String::with_capacity(
+        feature_prompt.as_str().len() + PLAN_PROMPT_SEPARATOR.len() + plan_body.as_str().len(),
+    );
     combined.push_str(feature_prompt.as_str());
     combined.push_str(PLAN_PROMPT_SEPARATOR);
     combined.push_str(plan_body.as_str());
@@ -704,7 +697,8 @@ pub fn route_permitted_by_stage_and_decision(
     //     all, and the spec deliberately omits the check there).
     let requires_acceptance = matches!(
         (action, stage),
-        (PlanRouteAction::ReadPlan, Stage::Execute) | (PlanRouteAction::SubmitAddendum, Stage::Execute),
+        (PlanRouteAction::ReadPlan, Stage::Execute)
+            | (PlanRouteAction::SubmitAddendum, Stage::Execute),
     );
     if requires_acceptance && decision != Some(DecisionOutcome::Accepted) {
         return Err(PlanRouteAuthError::DecisionNotAccepted { action, decision });
@@ -804,8 +798,14 @@ pub struct AbortRecorded {
 /// `originating_prompt` field carries the feature-request prompt that
 /// produced the plan (per §"Implementer prompt construction"); slice
 /// 5 of the implementation plan settles where the broker keeps the
-/// prompt before serving it back here. `decision` is `None` while
-/// the plan is still under review.
+/// prompt before serving it back here.
+///
+/// `decision` is always serialised — explicitly `null` while the plan
+/// is still under review, an object once the operator has decided.
+/// The spec (§"Protocol additions") declares the field as
+/// `decision: { outcome, decided_at } | null`, i.e. always present:
+/// `skip_serializing_if` would omit the key entirely and break
+/// clients written against the documented shape.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PlanView {
@@ -813,7 +813,6 @@ pub struct PlanView {
     pub body: PlanBody,
     pub originating_run_id: crate::agent_run::AgentRunId,
     pub originating_prompt: AgentPrompt,
-    #[serde(skip_serializing_if = "Option::is_none", default)]
     pub decision: Option<DecisionView>,
 }
 
@@ -841,9 +840,8 @@ mod tests {
             // exactly max length
             &"a".repeat(MAX_CORRELATION_ID_BYTES),
         ] {
-            let parsed = CorrelationId::try_new(ok).unwrap_or_else(|e| {
-                panic!("expected {ok:?} to parse, got {e}")
-            });
+            let parsed = CorrelationId::try_new(ok)
+                .unwrap_or_else(|e| panic!("expected {ok:?} to parse, got {e}"));
             assert_eq!(parsed.as_str(), ok);
         }
     }
@@ -862,7 +860,9 @@ mod tests {
             Err(CorrelationIdError::InvalidLength { .. })
         ));
         // forbidden bytes — path/scheme-style separators
-        for bad in ["foo.bar", "foo/bar", "foo:bar", "foo bar", "foo\nbar", "foo!"] {
+        for bad in [
+            "foo.bar", "foo/bar", "foo:bar", "foo bar", "foo\nbar", "foo!",
+        ] {
             let err = CorrelationId::try_new(bad).unwrap_err();
             assert!(
                 matches!(err, CorrelationIdError::InvalidByte { .. }),
@@ -1010,9 +1010,8 @@ mod tests {
         let feature = AgentPrompt::new("Fix the foo widget.");
         let plan = PlanBody::try_new("# Plan\n\nReplace bar with baz.").unwrap();
         let combined = compose_implementer_prompt(&feature, &plan).unwrap();
-        let expected = format!(
-            "Fix the foo widget.{PLAN_PROMPT_SEPARATOR}# Plan\n\nReplace bar with baz.",
-        );
+        let expected =
+            format!("Fix the foo widget.{PLAN_PROMPT_SEPARATOR}# Plan\n\nReplace bar with baz.",);
         assert_eq!(combined.as_str(), expected);
         // Both inputs survive as substrings, separated by the marker.
         assert!(combined.as_str().contains(feature.as_str()));
@@ -1024,9 +1023,7 @@ mod tests {
     fn compose_implementer_prompt_errors_when_combined_exceeds_agent_prompt_limit() {
         // Feature prompt at the AgentPrompt limit, plus a non-empty plan
         // body and the separator, must overflow.
-        let feature = AgentPrompt::new(
-            "x".repeat(crate::agent_run::MAX_AGENT_PROMPT_BYTES),
-        );
+        let feature = AgentPrompt::new("x".repeat(crate::agent_run::MAX_AGENT_PROMPT_BYTES));
         let plan = PlanBody::try_new("p").unwrap();
         let err = compose_implementer_prompt(&feature, &plan).unwrap_err();
         // AgentPromptError formats as "agent prompt is N bytes, ...".
@@ -1061,8 +1058,7 @@ mod tests {
             for stage in stages {
                 for &decision in &decisions {
                     let allowed = expected_allow(action, stage, decision);
-                    let actual =
-                        route_permitted_by_stage_and_decision(action, stage, decision);
+                    let actual = route_permitted_by_stage_and_decision(action, stage, decision);
                     if allowed {
                         assert!(
                             actual.is_ok(),
@@ -1111,18 +1107,12 @@ mod tests {
             Some(DecisionOutcome::Accepted),
         )
         .unwrap_err();
-        assert!(matches!(
-            err,
-            PlanRouteAuthError::StageNotPermitted { .. }
-        ));
+        assert!(matches!(err, PlanRouteAuthError::StageNotPermitted { .. }));
 
         // Right stage, missing acceptance -> DecisionNotAccepted.
-        let err = route_permitted_by_stage_and_decision(
-            PlanRouteAction::ReadPlan,
-            Stage::Execute,
-            None,
-        )
-        .unwrap_err();
+        let err =
+            route_permitted_by_stage_and_decision(PlanRouteAction::ReadPlan, Stage::Execute, None)
+                .unwrap_err();
         assert!(matches!(
             err,
             PlanRouteAuthError::DecisionNotAccepted { .. }
@@ -1147,9 +1137,7 @@ mod tests {
 
     #[test]
     fn vm_plan_paths_have_expected_shape() {
-        let plan_id = PlanId::from_uuid(
-            "550e8400-e29b-41d4-a716-446655440000".parse().unwrap(),
-        );
+        let plan_id = PlanId::from_uuid("550e8400-e29b-41d4-a716-446655440000".parse().unwrap());
         assert_eq!(vm_plans_collection_path(), "/v1/plans");
         assert_eq!(
             vm_plan_path(plan_id),
@@ -1225,6 +1213,30 @@ mod tests {
             let back: PlanView = serde_json::from_str(&json).unwrap();
             assert_eq!(back, view);
         }
+    }
+
+    /// The spec (§"Protocol additions") shapes `decision` as
+    /// `{ outcome, decided_at } | null` — always present, never
+    /// omitted. A previous version of this struct skipped the key when
+    /// `decision == None`, which clients written against the
+    /// documented contract would reject. Pin the on-wire shape here
+    /// directly so an accidental `skip_serializing_if` regression
+    /// fails this test.
+    #[test]
+    fn plan_view_no_decision_serialises_as_explicit_null() {
+        let view = PlanView {
+            plan_id: PlanId::new(),
+            body: PlanBody::try_new("# Plan").unwrap(),
+            originating_run_id: crate::agent_run::AgentRunId::new(),
+            originating_prompt: AgentPrompt::new("Original feature ask."),
+            decision: None,
+        };
+        let value: serde_json::Value = serde_json::to_value(&view).unwrap();
+        assert_eq!(
+            value.get("decision"),
+            Some(&serde_json::Value::Null),
+            "decision must be present and explicitly null: {value}",
+        );
     }
 
     #[test]
