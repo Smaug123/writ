@@ -157,6 +157,12 @@ enum AgentCmd {
         /// bytes); the broker never interprets the contents.
         #[arg(long, value_parser = parse_correlation_id)]
         correlation_id: Option<CorrelationId>,
+        /// Plan this run is bound to read. Required for `--stage
+        /// review` and for `--stage execute` runs that implement an
+        /// accepted plan. Stamped on the `agent_run.read_plan_id`
+        /// audit column and enforced by the VM HTTP plan-read route.
+        #[arg(long, value_parser = parse_plan_id)]
+        read_plan: Option<PlanId>,
     },
 }
 
@@ -353,6 +359,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 warm,
                 stage,
                 correlation_id,
+                read_plan,
             } => {
                 let warm_mode = warm.into();
                 let workspace = build_workspace_bootstrap_from_repo(repo, workspace, warm_mode)?;
@@ -365,6 +372,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     AgentPrompt::try_new(prompt)?,
                     stage,
                     correlation_id,
+                    read_plan,
                 )?;
             }
         },
@@ -475,6 +483,10 @@ fn parse_stage(raw: &str) -> Result<Stage, String> {
     raw.parse::<Stage>().map_err(|err| err.to_string())
 }
 
+fn parse_plan_id(raw: &str) -> Result<PlanId, String> {
+    raw.parse::<PlanId>().map_err(|err| err.to_string())
+}
+
 /// Read the operator identity the CLI will assert to the broker.
 ///
 /// The local socket is the trust boundary, so this only needs to be a
@@ -541,6 +553,7 @@ fn start_agent_run(
     prompt: AgentPrompt,
     stage: Stage,
     correlation_id: Option<CorrelationId>,
+    read_plan_id: Option<PlanId>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let msg = ClientMessage::StartAgentRun {
         label,
@@ -550,6 +563,7 @@ fn start_agent_run(
         prompt,
         stage,
         correlation_id,
+        read_plan_id,
     };
     match call_with_timeout(socket_path, &msg, AGENT_VM_WORKSPACE_CALL_TIMEOUT)? {
         ServerMessage::AgentRunStarted {
@@ -928,6 +942,7 @@ mod tests {
                         warm,
                         stage,
                         correlation_id,
+                        read_plan,
                         ..
                     },
             } => {
@@ -938,6 +953,7 @@ mod tests {
                 assert_eq!(warm, WorkspaceWarmArg::Sources);
                 assert_eq!(stage, Stage::Execute);
                 assert!(correlation_id.is_none());
+                assert!(read_plan.is_none());
             }
             _ => panic!("unexpected command"),
         }
@@ -1091,6 +1107,74 @@ mod tests {
         );
     }
 
+    /// `--read-plan` is the CLI surface for the
+    /// `agent_run.read_plan_id` audit column and the VM HTTP
+    /// plan-read authorisation gate; the parser must accept a
+    /// well-formed UUID and surface it as `Some` on the parsed
+    /// command.
+    #[test]
+    fn agent_run_cli_accepts_read_plan_flag() {
+        let plan_uuid = "f1f1f1f1-0000-0000-0000-000000000001";
+        let args = Args::try_parse_from([
+            "writ",
+            "agent",
+            "run",
+            "--repo",
+            "owner/repo",
+            "--agent",
+            "claude",
+            "--model",
+            "claude-test",
+            "--prompt",
+            "implement plan",
+            "--stage",
+            "execute",
+            "--read-plan",
+            plan_uuid,
+        ])
+        .unwrap();
+
+        match args.cmd {
+            Cmd::Agent {
+                action: AgentCmd::Run { read_plan, .. },
+            } => {
+                let id = read_plan.expect("--read-plan should parse");
+                assert_eq!(id.as_uuid().to_string(), plan_uuid);
+            }
+            _ => panic!("unexpected command"),
+        }
+    }
+
+    /// `parse_plan_id` runs the same `PlanId::from_str` (UUID parse)
+    /// that the audit DAO uses, so any non-UUID payload is a clap
+    /// error rather than a broker rejection — the parse-don't-
+    /// validate boundary lives at the CLI.
+    #[test]
+    fn agent_run_cli_rejects_malformed_read_plan() {
+        let err = match Args::try_parse_from([
+            "writ",
+            "agent",
+            "run",
+            "--repo",
+            "owner/repo",
+            "--agent",
+            "claude",
+            "--model",
+            "claude-test",
+            "--prompt",
+            "p",
+            "--read-plan",
+            "not-a-uuid",
+        ]) {
+            Ok(_) => panic!("expected clap to reject malformed --read-plan"),
+            Err(error) => error,
+        };
+        assert!(
+            err.to_string().contains("--read-plan"),
+            "unexpected clap error: {err}",
+        );
+    }
+
     #[test]
     fn agent_run_cli_defaults_to_devshell_warmup() {
         let args = Args::try_parse_from([
@@ -1171,6 +1255,7 @@ mod tests {
             prompt: AgentPrompt::try_new("SECRET prompt").unwrap(),
             stage: Stage::Execute,
             correlation_id: None,
+            read_plan_id: None,
         };
 
         let debug = format!("{msg:?}");
