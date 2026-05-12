@@ -7,7 +7,7 @@ use rusqlite::{OptionalExtension, Row, params};
 
 use super::validation::validate_sha256_hex;
 use super::{AuditError, AuditLog};
-use crate::agent_plan::{PlanBody, PlanBodyError, PlanId};
+use crate::agent_plan::{CorrelationId, PlanBody, PlanBodyError, PlanId};
 use crate::agent_run::AgentRunId;
 use crate::core::{SessionId, UnixMillis};
 
@@ -17,6 +17,24 @@ pub struct PlanSubmissionRecord {
     pub agent_run_id: AgentRunId,
     pub submitted_at: UnixMillis,
     pub body: PlanBody,
+}
+
+/// Body-less summary returned by [`AuditLog::list_plans`]. The listing
+/// is intended for triage — operators want to see what plans exist and
+/// which task they belong to without paying to load up to 256 KiB of
+/// markdown for each row.
+///
+/// `correlation_id` is the value carried on the planner's `agent_run`
+/// row (joined here so the summary is self-contained). Plans whose
+/// planner run was not tagged surface `None`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PlanListEntry {
+    pub plan_id: PlanId,
+    pub agent_run_id: AgentRunId,
+    pub correlation_id: Option<CorrelationId>,
+    pub submitted_at: UnixMillis,
+    pub body_sha256: String,
+    pub body_bytes: u64,
 }
 
 impl AuditLog {
@@ -105,6 +123,87 @@ impl AuditLog {
             rows.into_iter().collect::<Result<Vec<_>, _>>()
         })
     }
+
+    /// Triage view across every plan in the log, joined with
+    /// `agent_run.correlation_id`. When `filter` is `Some`, only plans
+    /// whose planner run carries the same correlation id are returned;
+    /// when `None`, every plan is returned. Order is `(submitted_at,
+    /// rowid)` so ties within a millisecond stay stable.
+    ///
+    /// Body bytes are taken from `length(cast(body AS BLOB))` so the
+    /// count matches the v16 byte-length CHECK rather than the
+    /// character count `length(body)` would return for non-ASCII text.
+    /// The body itself is never loaded; the listing stays cheap even
+    /// for a 256 KiB body.
+    pub fn list_plans(
+        &self,
+        filter: Option<&CorrelationId>,
+    ) -> Result<Vec<PlanListEntry>, AuditError> {
+        // Two SQL strings rather than one with an OR over filter
+        // because `?1 IS NULL OR correlation_id = ?1` makes the
+        // optimiser scan the join unnecessarily. The split is also
+        // easier to read.
+        self.with_conn(|c| {
+            let rows: Vec<rusqlite::Result<Result<PlanListEntry, AuditError>>> = match filter {
+                None => {
+                    let mut stmt = c.prepare(
+                        "SELECT p.plan_id, p.agent_run_id, ar.correlation_id,
+                                p.submitted_at, p.body_sha256,
+                                length(cast(p.body AS BLOB))
+                         FROM plan p
+                         JOIN agent_run ar ON ar.run_id = p.agent_run_id
+                         ORDER BY p.submitted_at ASC, p.rowid ASC",
+                    )?;
+                    stmt.query_map([], plan_list_entry_from_row)?.collect()
+                }
+                Some(correlation_id) => {
+                    let mut stmt = c.prepare(
+                        "SELECT p.plan_id, p.agent_run_id, ar.correlation_id,
+                                p.submitted_at, p.body_sha256,
+                                length(cast(p.body AS BLOB))
+                         FROM plan p
+                         JOIN agent_run ar ON ar.run_id = p.agent_run_id
+                         WHERE ar.correlation_id = ?1
+                         ORDER BY p.submitted_at ASC, p.rowid ASC",
+                    )?;
+                    stmt.query_map(params![correlation_id.as_str()], plan_list_entry_from_row)?
+                        .collect()
+                }
+            };
+            rows.into_iter()
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .collect::<Result<Vec<_>, _>>()
+        })
+    }
+
+    /// Look up the `correlation_id` of the `agent_run` that submitted
+    /// the plan. Returns `Ok(None)` when no `agent_run` row exists with
+    /// this id — callers must distinguish "the plan exists but has no
+    /// such run" (an invariant violation, since plan rows have a FK
+    /// onto `agent_run`) from "the run exists but is untagged" (the
+    /// inner `Option<CorrelationId>` being `None`).
+    pub fn correlation_id_for_run(
+        &self,
+        run_id: AgentRunId,
+    ) -> Result<Option<Option<CorrelationId>>, AuditError> {
+        self.with_conn(|c| {
+            let raw: Option<Option<String>> = c
+                .query_row(
+                    "SELECT correlation_id FROM agent_run WHERE run_id = ?1",
+                    params![run_id.as_uuid().to_string()],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            match raw {
+                None => Ok(None),
+                Some(None) => Ok(Some(None)),
+                Some(Some(value)) => CorrelationId::try_new(value)
+                    .map(|c| Some(Some(c)))
+                    .map_err(|_| AuditError::Invariant("agent run row: correlation_id is invalid")),
+            }
+        })
+    }
 }
 
 fn plan_from_row(row: &Row<'_>) -> rusqlite::Result<Result<PlanSubmissionRecord, AuditError>> {
@@ -141,6 +240,38 @@ fn plan_from_row(row: &Row<'_>) -> rusqlite::Result<Result<PlanSubmissionRecord,
             agent_run_id: AgentRunId::from_uuid(agent_run_id),
             submitted_at: UnixMillis::from_millis(submitted_at),
             body,
+        })
+    };
+    Ok(parse())
+}
+
+fn plan_list_entry_from_row(row: &Row<'_>) -> rusqlite::Result<Result<PlanListEntry, AuditError>> {
+    let plan_id_str: String = row.get(0)?;
+    let agent_run_id_str: String = row.get(1)?;
+    let correlation_id_raw: Option<String> = row.get(2)?;
+    let submitted_at: i64 = row.get(3)?;
+    let body_sha256: String = row.get(4)?;
+    let body_bytes_signed: i64 = row.get(5)?;
+
+    let parse = || -> Result<PlanListEntry, AuditError> {
+        let plan_id = uuid::Uuid::parse_str(&plan_id_str)
+            .map_err(|_| AuditError::Invariant("plan row: plan_id not a uuid"))?;
+        let agent_run_id = uuid::Uuid::parse_str(&agent_run_id_str)
+            .map_err(|_| AuditError::Invariant("plan row: agent_run_id not a uuid"))?;
+        validate_sha256_hex(&body_sha256, "plan body sha256")?;
+        let body_bytes = u64::try_from(body_bytes_signed)
+            .map_err(|_| AuditError::Invariant("plan row: body byte count is negative"))?;
+        let correlation_id = correlation_id_raw
+            .map(CorrelationId::try_new)
+            .transpose()
+            .map_err(|_| AuditError::Invariant("plan row: agent_run.correlation_id is invalid"))?;
+        Ok(PlanListEntry {
+            plan_id: PlanId::from_uuid(plan_id),
+            agent_run_id: AgentRunId::from_uuid(agent_run_id),
+            correlation_id,
+            submitted_at: UnixMillis::from_millis(submitted_at),
+            body_sha256,
+            body_bytes,
         })
     };
     Ok(parse())
@@ -412,5 +543,215 @@ mod tests {
         // The other session sees only its own plan.
         let other_plans = log.list_plans_for_session(other_session).unwrap();
         assert_eq!(other_plans, vec![plan_c]);
+    }
+
+    fn sample_planner_run_with_correlation(
+        log: &AuditLog,
+        session_id: SessionId,
+        correlation_id: Option<CorrelationId>,
+    ) -> AgentRunId {
+        let run_id = AgentRunId::new();
+        log.record_agent_run(&AgentRunAuditRecord {
+            run_id,
+            session_id,
+            requested_at: UnixMillis::from_millis(1_700_000_100),
+            agent_kind: AgentKind::Claude,
+            prompt: AgentPrompt::new("plan this").summary(),
+            correlation_id,
+        })
+        .unwrap();
+        run_id
+    }
+
+    /// `list_plans` with no filter returns every plan across every
+    /// session, ordered by `(submitted_at, rowid)`. The body itself is
+    /// not loaded — only the digest and byte count are returned — but
+    /// both must match the original [`PlanBody`].
+    #[test]
+    fn list_plans_returns_every_plan_ordered_by_submitted_at_and_rowid() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s1 = sample_session();
+        log.open_session(&s1).unwrap();
+        let s2 = {
+            let mut s = sample_session();
+            s.label = Some("other".into());
+            log.open_session(&s).unwrap();
+            s.session_id
+        };
+        let run_1 = sample_planner_run(&log, s1.session_id);
+        let run_2 = sample_planner_run(&log, s1.session_id);
+        let run_3 = sample_planner_run(&log, s2);
+
+        let body_1 = PlanBody::try_new("# Plan one").unwrap();
+        let body_2 = PlanBody::try_new("# Plan two").unwrap();
+        let body_3 = PlanBody::try_new("# Plan three with a longer body").unwrap();
+
+        log.record_plan_submission(&PlanSubmissionRecord {
+            plan_id: PlanId::new(),
+            agent_run_id: run_1,
+            submitted_at: UnixMillis::from_millis(1_700_000_300),
+            body: body_1.clone(),
+        })
+        .unwrap();
+        log.record_plan_submission(&PlanSubmissionRecord {
+            plan_id: PlanId::new(),
+            agent_run_id: run_2,
+            submitted_at: UnixMillis::from_millis(1_700_000_200),
+            body: body_2.clone(),
+        })
+        .unwrap();
+        log.record_plan_submission(&PlanSubmissionRecord {
+            plan_id: PlanId::new(),
+            agent_run_id: run_3,
+            submitted_at: UnixMillis::from_millis(1_700_000_400),
+            body: body_3.clone(),
+        })
+        .unwrap();
+
+        let plans = log.list_plans(None).unwrap();
+        assert_eq!(plans.len(), 3);
+        // Ordered ascending by submitted_at: body_2 (200), body_1 (300), body_3 (400).
+        assert_eq!(plans[0].submitted_at.as_millis(), 1_700_000_200);
+        assert_eq!(plans[0].body_sha256, body_2.sha256_hex());
+        assert_eq!(plans[0].body_bytes, body_2.as_str().len() as u64);
+        assert_eq!(plans[1].submitted_at.as_millis(), 1_700_000_300);
+        assert_eq!(plans[1].body_sha256, body_1.sha256_hex());
+        assert_eq!(plans[2].submitted_at.as_millis(), 1_700_000_400);
+        assert_eq!(plans[2].body_sha256, body_3.sha256_hex());
+    }
+
+    /// `list_plans(Some(c))` returns only plans whose planner-run row
+    /// carries the same correlation id. Untagged runs and runs with a
+    /// different correlation id are filtered out.
+    #[test]
+    fn list_plans_filters_by_correlation_id() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+
+        let target = CorrelationId::try_new("feat-42_xyz").unwrap();
+        let other = CorrelationId::try_new("feat-7_abc").unwrap();
+
+        let tagged_target =
+            sample_planner_run_with_correlation(&log, s.session_id, Some(target.clone()));
+        let tagged_other =
+            sample_planner_run_with_correlation(&log, s.session_id, Some(other.clone()));
+        let untagged = sample_planner_run_with_correlation(&log, s.session_id, None);
+
+        let body_target = PlanBody::try_new("# Plan T").unwrap();
+        let body_other = PlanBody::try_new("# Plan O").unwrap();
+        let body_untagged = PlanBody::try_new("# Plan U").unwrap();
+
+        let plan_target = PlanId::new();
+        log.record_plan_submission(&PlanSubmissionRecord {
+            plan_id: plan_target,
+            agent_run_id: tagged_target,
+            submitted_at: UnixMillis::from_millis(1_700_000_200),
+            body: body_target.clone(),
+        })
+        .unwrap();
+        log.record_plan_submission(&PlanSubmissionRecord {
+            plan_id: PlanId::new(),
+            agent_run_id: tagged_other,
+            submitted_at: UnixMillis::from_millis(1_700_000_300),
+            body: body_other.clone(),
+        })
+        .unwrap();
+        log.record_plan_submission(&PlanSubmissionRecord {
+            plan_id: PlanId::new(),
+            agent_run_id: untagged,
+            submitted_at: UnixMillis::from_millis(1_700_000_400),
+            body: body_untagged.clone(),
+        })
+        .unwrap();
+
+        let plans = log.list_plans(Some(&target)).unwrap();
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].plan_id, plan_target);
+        assert_eq!(plans[0].correlation_id.as_ref(), Some(&target));
+        assert_eq!(plans[0].body_sha256, body_target.sha256_hex());
+
+        // `None` filter still returns all three.
+        let all_plans = log.list_plans(None).unwrap();
+        assert_eq!(all_plans.len(), 3);
+    }
+
+    /// A correlation id with no matching plans returns an empty vec,
+    /// not an error.
+    #[test]
+    fn list_plans_with_unknown_correlation_id_returns_empty() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+        let run = sample_planner_run(&log, s.session_id);
+        log.record_plan_submission(&PlanSubmissionRecord {
+            plan_id: PlanId::new(),
+            agent_run_id: run,
+            submitted_at: UnixMillis::from_millis(1_700_000_200),
+            body: PlanBody::try_new("# Plan").unwrap(),
+        })
+        .unwrap();
+
+        let stranger = CorrelationId::try_new("nope-1").unwrap();
+        let plans = log.list_plans(Some(&stranger)).unwrap();
+        assert!(plans.is_empty());
+    }
+
+    /// Two plans submitted in the same millisecond order by `rowid`,
+    /// matching insert order. The list endpoint must agree with
+    /// [`AuditLog::list_plans_for_session`] on this tie-break so the
+    /// `writ plan list` view doesn't reshuffle on identical timestamps.
+    #[test]
+    fn list_plans_breaks_submitted_at_ties_by_rowid() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+        let run_a = sample_planner_run(&log, s.session_id);
+        let run_b = sample_planner_run(&log, s.session_id);
+
+        let first = PlanSubmissionRecord {
+            plan_id: PlanId::new(),
+            agent_run_id: run_a,
+            submitted_at: UnixMillis::from_millis(1_700_000_200),
+            body: PlanBody::try_new("# Plan first").unwrap(),
+        };
+        let second = PlanSubmissionRecord {
+            plan_id: PlanId::new(),
+            agent_run_id: run_b,
+            submitted_at: UnixMillis::from_millis(1_700_000_200),
+            body: PlanBody::try_new("# Plan second").unwrap(),
+        };
+        log.record_plan_submission(&first).unwrap();
+        log.record_plan_submission(&second).unwrap();
+
+        let plans = log.list_plans(None).unwrap();
+        assert_eq!(plans.len(), 2);
+        assert_eq!(plans[0].plan_id, first.plan_id);
+        assert_eq!(plans[1].plan_id, second.plan_id);
+    }
+
+    /// `correlation_id_for_run` returns three distinct states.
+    /// `Ok(None)` for an unknown run, `Ok(Some(None))` for a known but
+    /// untagged run, `Ok(Some(Some(c)))` for a tagged run.
+    #[test]
+    fn correlation_id_for_run_distinguishes_unknown_untagged_and_tagged() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+        let tagged_id = CorrelationId::try_new("feat-1").unwrap();
+        let tagged_run =
+            sample_planner_run_with_correlation(&log, s.session_id, Some(tagged_id.clone()));
+        let untagged_run = sample_planner_run_with_correlation(&log, s.session_id, None);
+        let stray_run_id = AgentRunId::new();
+
+        assert_eq!(
+            log.correlation_id_for_run(tagged_run).unwrap(),
+            Some(Some(tagged_id))
+        );
+        assert_eq!(
+            log.correlation_id_for_run(untagged_run).unwrap(),
+            Some(None)
+        );
+        assert_eq!(log.correlation_id_for_run(stray_run_id).unwrap(), None);
     }
 }
