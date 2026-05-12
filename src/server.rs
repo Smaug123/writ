@@ -1094,6 +1094,23 @@ pub async fn run_with_agent_vm<S: SecretStore + Send + Sync + 'static>(
     state: Arc<BrokerState<S>>,
     agent_vm: Option<Arc<AgentVmDaemon>>,
 ) -> io::Result<()> {
+    let listener = prepare_broker_listener(socket_path).await?;
+    serve_broker_with_agent_vm(listener, state, agent_vm).await
+}
+
+/// Validate the socket parent and bind the Unix socket, returning the
+/// bound listener. Use this when the caller needs to prove singleton
+/// daemon ownership *before* doing other side-effecting setup (e.g.
+/// rotating the UI HTTP bearer). [`serve_broker_with_agent_vm`] is the
+/// matching consumer.
+///
+/// The parent directory is created with mode 0700 if missing. If the
+/// parent already exists with group or world access bits set the
+/// function returns `ErrorKind::PermissionDenied` without binding. A
+/// stale socket file is removed only after confirming nothing is
+/// listening on it; if a live daemon is already serving the path this
+/// returns `ErrorKind::AddrInUse`.
+pub async fn prepare_broker_listener(socket_path: &Path) -> io::Result<UnixListener> {
     if let Some(parent) = socket_path.parent() {
         if !parent.exists() {
             std::fs::create_dir_all(parent)?;
@@ -1120,7 +1137,16 @@ pub async fn run_with_agent_vm<S: SecretStore + Send + Sync + 'static>(
         }
     }
 
-    let listener = bind_socket(socket_path).await?;
+    bind_socket(socket_path).await
+}
+
+/// Accept connections on `listener` until a fatal listener error.
+/// Pair with [`prepare_broker_listener`].
+pub async fn serve_broker_with_agent_vm<S: SecretStore + Send + Sync + 'static>(
+    listener: UnixListener,
+    state: Arc<BrokerState<S>>,
+    agent_vm: Option<Arc<AgentVmDaemon>>,
+) -> io::Result<()> {
     loop {
         let (stream, _) = listener.accept().await?;
         let state = Arc::clone(&state);

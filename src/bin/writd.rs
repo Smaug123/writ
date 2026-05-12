@@ -15,7 +15,9 @@ use writ::config::{DaemonConfig, SecretStoreConfig, default_audit_db_path, defau
 use writ::git_push_staging::GitPushStagingStore;
 use writ::github::GitHubMinter;
 use writ::secret::{FileSecretStore, KeyringSecretStore, SecretStore};
-use writ::server::{BrokerState, default_socket_path, run_with_agent_vm};
+use writ::server::{
+    BrokerState, default_socket_path, prepare_broker_listener, serve_broker_with_agent_vm,
+};
 use writ::ui_http::{
     UiHttpBearerToken, UiHttpService, bind_ui_http_listener, run_ui_http_until_shutdown,
     write_bearer_file,
@@ -153,13 +155,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .into());
         }
     }
+    // Bind the broker Unix socket *before* the UI HTTP block. Binding
+    // is the singleton-ownership claim for this daemon installation:
+    // if another writd is already serving the socket, this fails with
+    // `AddrInUse` and we exit before touching the shared UI bearer
+    // file. Without this ordering, a doomed second start could rotate
+    // the bearer that the surviving daemon's clients still depend on.
+    let broker_listener = prepare_broker_listener(&socket_path).await?;
+
     if let Some(ui_http) = ui_http {
         ui_http.validate()?;
-        // Bind before touching the bearer file. If a stale daemon is
-        // still listening on this port, `bind` returns `AddrInUse` and
-        // we exit before overwriting the live daemon's bearer; clients
-        // that re-read the file then continue authenticating against
-        // the surviving daemon.
+        // Inside this block we also bind the UI listener before
+        // touching the bearer, so a stale UI-port collision doesn't
+        // overwrite the live daemon's bearer either.
         let listener = bind_ui_http_listener(ui_http.bind).await?;
         let bound = listener.local_addr()?;
         let bearer = UiHttpBearerToken::generate();
@@ -186,6 +194,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::mem::forget(_shutdown_tx);
     }
 
-    run_with_agent_vm(&socket_path, state, agent_vm).await?;
+    serve_broker_with_agent_vm(broker_listener, state, agent_vm).await?;
     Ok(())
 }
