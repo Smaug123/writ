@@ -8,9 +8,9 @@
 //! per-commit walker that orchestrates them lives in
 //! [`crate::git_push_replay`].
 //!
-//! Only [`GitDataClient::create_blob`] is implemented in this commit;
-//! tree and commit creation, plus the walker, land in later slices and
-//! reuse the auth/URL/error scaffolding established here.
+//! [`GitDataClient::create_blob`] and [`GitDataClient::create_tree`]
+//! are implemented; commit creation and the walker land in later
+//! slices and reuse the auth/URL/error scaffolding established here.
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
@@ -124,6 +124,109 @@ impl GitDataClient {
         let parsed: BlobCreateResponse = response.json().await?;
         Ok(parsed.sha)
     }
+
+    /// `POST /repos/{owner}/{repo}/git/trees` — create a tree from a
+    /// list of entries and return the SHA GitHub assigned.
+    ///
+    /// The body lists each entry's `path`, `mode`, `type`, and the
+    /// SHA of the object it references (a blob, an already-created
+    /// subtree, or a submodule commit). We do not use the API's
+    /// `base_tree` parameter: the replay walker recursively creates
+    /// the trees it needs and points unchanged subtrees at their
+    /// existing SHAs, which is unambiguous without a base.
+    ///
+    /// An empty `entries` slice produces git's well-known empty
+    /// tree; the API accepts this and the walker depends on it for
+    /// initial commits whose root is empty.
+    pub async fn create_tree(
+        &self,
+        repo: &RepoRef,
+        entries: &[TreeEntry],
+    ) -> Result<GitObjectId, GitDataError> {
+        let url = format!(
+            "{}/repos/{}/{}/git/trees",
+            self.api_base.trim_end_matches('/'),
+            repo.owner,
+            repo.name,
+        );
+        let body = TreeCreateBody {
+            tree: entries
+                .iter()
+                .map(|entry| TreeEntryWire {
+                    path: &entry.path,
+                    mode: entry.kind.mode(),
+                    object_type: entry.kind.object_type(),
+                    sha: &entry.sha,
+                })
+                .collect(),
+        };
+        let response = self
+            .http
+            .post(&url)
+            .bearer_auth(&self.token)
+            .header("Accept", ACCEPT_HEADER)
+            .header("X-GitHub-Api-Version", API_VERSION_HEADER)
+            .header("User-Agent", USER_AGENT_HEADER)
+            .json(&body)
+            .send()
+            .await?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(GitDataError::ApiError { status, body });
+        }
+        let parsed: TreeCreateResponse = response.json().await?;
+        Ok(parsed.sha)
+    }
+}
+
+/// One row in a tree being uploaded to GitHub. The kind constrains
+/// `mode` and `type` jointly so a caller can't write a (mode, type)
+/// pair the API would reject — e.g. `040000` paired with `blob`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TreeEntry {
+    pub path: String,
+    pub kind: TreeEntryKind,
+    pub sha: GitObjectId,
+}
+
+/// What a tree entry points at. Each variant fixes both the file
+/// `mode` and the object `type` GitHub expects, so the on-wire pair
+/// is always valid by construction.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TreeEntryKind {
+    /// Regular file: mode `100644`, type `blob`.
+    Blob,
+    /// Executable file: mode `100755`, type `blob`.
+    Executable,
+    /// Symbolic link: mode `120000`, type `blob`. The referenced
+    /// blob's content is the link target.
+    Symlink,
+    /// Subtree: mode `040000`, type `tree`.
+    Subtree,
+    /// Submodule pointer: mode `160000`, type `commit`. The SHA
+    /// names a commit in another repository.
+    Submodule,
+}
+
+impl TreeEntryKind {
+    const fn mode(self) -> &'static str {
+        match self {
+            Self::Blob => "100644",
+            Self::Executable => "100755",
+            Self::Symlink => "120000",
+            Self::Subtree => "040000",
+            Self::Submodule => "160000",
+        }
+    }
+
+    const fn object_type(self) -> &'static str {
+        match self {
+            Self::Blob | Self::Executable | Self::Symlink => "blob",
+            Self::Subtree => "tree",
+            Self::Submodule => "commit",
+        }
+    }
 }
 
 #[derive(serde::Serialize)]
@@ -134,6 +237,25 @@ struct BlobCreateBody {
 
 #[derive(serde::Deserialize)]
 struct BlobCreateResponse {
+    sha: GitObjectId,
+}
+
+#[derive(serde::Serialize)]
+struct TreeCreateBody<'a> {
+    tree: Vec<TreeEntryWire<'a>>,
+}
+
+#[derive(serde::Serialize)]
+struct TreeEntryWire<'a> {
+    path: &'a str,
+    mode: &'static str,
+    #[serde(rename = "type")]
+    object_type: &'static str,
+    sha: &'a GitObjectId,
+}
+
+#[derive(serde::Deserialize)]
+struct TreeCreateResponse {
     sha: GitObjectId,
 }
 
@@ -291,6 +413,158 @@ mod tests {
         assert!(
             matches!(err, GitDataError::Http(_)),
             "GitObjectId rejection during deserialisation surfaces as a transport error: {err:?}",
+        );
+    }
+
+    fn entry(path: &str, kind: TreeEntryKind, sha: GitObjectId) -> TreeEntry {
+        TreeEntry {
+            path: path.to_string(),
+            kind,
+            sha,
+        }
+    }
+
+    #[test]
+    fn tree_entry_kind_mode_and_type_match_github_wire_format() {
+        // Lock the (mode, type) pairs so a typo in the const tables
+        // would fail loudly. These are the values GitHub's API
+        // documents and the only ones it accepts.
+        let cases = [
+            (TreeEntryKind::Blob, "100644", "blob"),
+            (TreeEntryKind::Executable, "100755", "blob"),
+            (TreeEntryKind::Symlink, "120000", "blob"),
+            (TreeEntryKind::Subtree, "040000", "tree"),
+            (TreeEntryKind::Submodule, "160000", "commit"),
+        ];
+        for (kind, mode, object_type) in cases {
+            assert_eq!(kind.mode(), mode, "wrong mode for {kind:?}");
+            assert_eq!(kind.object_type(), object_type, "wrong type for {kind:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn create_tree_sends_each_kind_with_correct_mode_and_type() {
+        // One entry of every kind, so a regression in any (mode,
+        // type) pair would mismatch the body matcher.
+        let server = MockServer::start().await;
+        let blob_sha = sample_object_id('a');
+        let exec_sha = sample_object_id('b');
+        let symlink_sha = sample_object_id('c');
+        let subtree_sha = sample_object_id('d');
+        let submodule_sha = sample_object_id('e');
+        let returned = sample_object_id('f');
+        Mock::given(method("POST"))
+            .and(path("/repos/owner/name/git/trees"))
+            .and(header("Accept", ACCEPT_HEADER))
+            .and(header("X-GitHub-Api-Version", API_VERSION_HEADER))
+            .and(header("User-Agent", USER_AGENT_HEADER))
+            .and(header("Authorization", "Bearer ghs_fake_token"))
+            .and(body_json(json!({
+                "tree": [
+                    { "path": "README", "mode": "100644", "type": "blob", "sha": blob_sha.as_str() },
+                    { "path": "scripts/run", "mode": "100755", "type": "blob", "sha": exec_sha.as_str() },
+                    { "path": "link", "mode": "120000", "type": "blob", "sha": symlink_sha.as_str() },
+                    { "path": "vendor", "mode": "040000", "type": "tree", "sha": subtree_sha.as_str() },
+                    { "path": "submod", "mode": "160000", "type": "commit", "sha": submodule_sha.as_str() },
+                ],
+            })))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+                "sha": returned.as_str(),
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let entries = vec![
+            entry("README", TreeEntryKind::Blob, blob_sha),
+            entry("scripts/run", TreeEntryKind::Executable, exec_sha),
+            entry("link", TreeEntryKind::Symlink, symlink_sha),
+            entry("vendor", TreeEntryKind::Subtree, subtree_sha),
+            entry("submod", TreeEntryKind::Submodule, submodule_sha),
+        ];
+        let client = client_against(&server, "ghs_fake_token");
+        let got = client
+            .create_tree(&sample_repo(), &entries)
+            .await
+            .expect("tree create ok");
+        assert_eq!(got, returned);
+    }
+
+    #[tokio::test]
+    async fn create_tree_with_no_entries_posts_empty_tree_array() {
+        // Initial commits may have an empty root tree; the walker
+        // relies on this call succeeding and getting the empty-tree
+        // SHA back.
+        let server = MockServer::start().await;
+        let returned = sample_object_id('0');
+        Mock::given(method("POST"))
+            .and(path("/repos/owner/name/git/trees"))
+            .and(body_json(json!({ "tree": [] })))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+                "sha": returned.as_str(),
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = client_against(&server, "ghs_fake_token");
+        let got = client
+            .create_tree(&sample_repo(), &[])
+            .await
+            .expect("empty tree create ok");
+        assert_eq!(got, returned);
+    }
+
+    #[tokio::test]
+    async fn create_tree_surfaces_api_error_body_on_4xx() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/repos/owner/name/git/trees"))
+            .respond_with(
+                ResponseTemplate::new(422)
+                    .set_body_json(json!({"message": "path 'foo' is invalid"})),
+            )
+            .mount(&server)
+            .await;
+
+        let entries = vec![entry("foo", TreeEntryKind::Blob, sample_object_id('a'))];
+        let client = client_against(&server, "ghs_fake_token");
+        let err = client
+            .create_tree(&sample_repo(), &entries)
+            .await
+            .expect_err("4xx must surface as ApiError");
+        match err {
+            GitDataError::ApiError { status, body } => {
+                assert_eq!(status.as_u16(), 422);
+                assert!(
+                    body.contains("path 'foo' is invalid"),
+                    "ApiError body must echo the response payload: {body:?}",
+                );
+            }
+            other => panic!("expected ApiError, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn create_tree_returns_http_error_when_response_sha_is_invalid() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/repos/owner/name/git/trees"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+                "sha": "not a valid sha",
+            })))
+            .mount(&server)
+            .await;
+
+        let entries = vec![entry("foo", TreeEntryKind::Blob, sample_object_id('a'))];
+        let client = client_against(&server, "ghs_fake_token");
+        let err = client
+            .create_tree(&sample_repo(), &entries)
+            .await
+            .expect_err("malformed sha must not be returned silently");
+        assert!(
+            matches!(err, GitDataError::Http(_)),
+            "GitObjectId rejection surfaces as a transport error: {err:?}",
         );
     }
 
