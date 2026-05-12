@@ -436,11 +436,14 @@ mod tests {
     }
 
     /// Regression for the body-limit budget: a maximum-size body packed
-    /// with bytes that JSON expands maximally (`\0` → `\u0000`, 6× per
-    /// byte) must still be admitted. The route's `Limited::collect` cap
-    /// gates on *encoded* bytes, so a tight `MAX_PLAN_BODY_BYTES + small
-    /// envelope` budget would reject this even though `PlanBody::try_new`
-    /// is happy to accept the decoded value.
+    /// with bytes that JSON expands maximally (any control byte
+    /// 0x01..=0x1f to `\u00XX`, 6x per byte) must still be admitted.
+    /// The route's `Limited::collect` cap gates on *encoded* bytes,
+    /// so a tight `MAX_PLAN_BODY_BYTES + small envelope` budget would
+    /// reject this even though `PlanBody::try_new` is happy to accept
+    /// the decoded value. NUL (0x00) would expand identically but is
+    /// rejected by `PlanBody::try_new` at the parse boundary, so the
+    /// next worst-case byte (SOH, 0x01) carries the same property.
     #[tokio::test]
     async fn plan_submission_admits_max_body_with_worst_case_json_expansion() {
         use crate::agent_plan::MAX_PLAN_BODY_BYTES;
@@ -452,7 +455,7 @@ mod tests {
         let run_id = record_planner_run(&state, session.session_id());
         let service = plan_service_for_test(&state);
 
-        let raw_body = "\0".repeat(MAX_PLAN_BODY_BYTES);
+        let raw_body = "\u{0001}".repeat(MAX_PLAN_BODY_BYTES);
         let body = submission_body(run_id, &raw_body);
         assert!(
             body.len() > MAX_PLAN_BODY_BYTES,

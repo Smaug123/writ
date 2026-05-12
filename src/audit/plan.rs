@@ -125,6 +125,9 @@ fn plan_from_row(row: &Row<'_>) -> rusqlite::Result<Result<PlanSubmissionRecord,
             PlanBodyError::TooLarge { .. } => {
                 AuditError::Invariant("plan row: body exceeds size limit")
             }
+            PlanBodyError::EmbeddedNul => {
+                AuditError::Invariant("plan row: body contains embedded NUL")
+            }
         })?;
         // belt-and-braces: the stored sha must match a fresh recompute
         // of the body bytes. If they disagree the row was tampered with.
