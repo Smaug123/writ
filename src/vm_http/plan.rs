@@ -435,6 +435,52 @@ mod tests {
         );
     }
 
+    /// Regression for the body-limit budget: a maximum-size body packed
+    /// with bytes that JSON expands maximally (`\0` → ` `, 6× per
+    /// byte) must still be admitted. The route's `Limited::collect` cap
+    /// gates on *encoded* bytes, so a tight `MAX_PLAN_BODY_BYTES + small
+    /// envelope` budget would reject this even though `PlanBody::try_new`
+    /// is happy to accept the decoded value.
+    #[tokio::test]
+    async fn plan_submission_admits_max_body_with_worst_case_json_expansion() {
+        use crate::agent_plan::MAX_PLAN_BODY_BYTES;
+
+        let github = MockServer::start().await;
+        let state = make_broker_state(&github);
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+        open_audit_session(&state, session.session_id());
+        let run_id = record_planner_run(&state, session.session_id());
+        let service = plan_service_for_test(&state);
+
+        let raw_body = "\0".repeat(MAX_PLAN_BODY_BYTES);
+        let body = submission_body(run_id, &raw_body);
+        assert!(
+            body.len() > MAX_PLAN_BODY_BYTES,
+            "test premise: encoded body must exceed the decoded length",
+        );
+        let bearer_auth = bearer(token().as_str());
+        let content_length = body.len().to_string();
+        let response = dispatch_vm_http_head_and_body(
+            &session,
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 12345)),
+            "POST",
+            VM_PLANS_PATH_PREFIX,
+            &[
+                ("authorization", bearer_auth.as_str()),
+                ("content-length", content_length.as_str()),
+            ],
+            body,
+            services_with_plans(service),
+            VM_HTTP_READ_TIMEOUT,
+        )
+        .await;
+
+        assert_eq!(response.status, VmHttpStatus::Ok);
+        let created: PlanCreated = serde_json::from_slice(&response.body).unwrap();
+        let stored = state.audit.get_plan(created.plan_id).unwrap().unwrap();
+        assert_eq!(stored.body.byte_len() as usize, MAX_PLAN_BODY_BYTES);
+    }
+
     #[tokio::test]
     async fn plan_submission_full_dispatch_records_audit() {
         let github = MockServer::start().await;

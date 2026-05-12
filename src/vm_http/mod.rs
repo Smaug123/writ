@@ -1237,10 +1237,14 @@ fn route_request_body_limit<S: SecretStore + Send + Sync + 'static>(
         && request.method == "POST"
         && services.plans.is_some()
     {
-        // Plan bodies are bounded by `PlanBody::try_new`
-        // (MAX_PLAN_BODY_BYTES = 256 KiB) plus the JSON envelope. Allow
-        // a small overhead for `agent_run_id` and the field names.
-        return Some(crate::agent_plan::MAX_PLAN_BODY_BYTES + 4 * 1024);
+        // The cap must admit every body `PlanBody::try_new` would
+        // accept (any non-empty UTF-8 ≤ `MAX_PLAN_BODY_BYTES`). The
+        // hard limit is `Limited::collect`'s view of *encoded* bytes,
+        // so the cap has to cover worst-case JSON expansion: an ASCII
+        // control byte serialises as `\u00XX` — 6 bytes for 1. The
+        // envelope (`{"agent_run_id":"<uuid>","body":""}`) is well
+        // under 100 bytes; 1 KiB is generous headroom.
+        return Some(6 * crate::agent_plan::MAX_PLAN_BODY_BYTES + 1024);
     }
     None
 }
