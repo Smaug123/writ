@@ -587,6 +587,7 @@ mod tests {
                 prompt: AgentPrompt::new("prompt").summary(),
                 correlation_id: Some(correlation.clone()),
                 stage: Stage::Execute,
+                read_plan_id: None,
             })
             .unwrap();
         let (staging, _tmp) = open_test_staging_store();
@@ -662,6 +663,7 @@ mod tests {
                 prompt: AgentPrompt::new("prompt").summary(),
                 correlation_id: None,
                 stage: Stage::Execute,
+                read_plan_id: None,
             })
             .unwrap();
         let (staging, _tmp) = open_test_staging_store();

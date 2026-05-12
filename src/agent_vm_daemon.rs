@@ -644,6 +644,7 @@ impl AgentVmDaemon {
                     prompt: prompt.summary(),
                     correlation_id: correlation_id.clone(),
                     stage,
+                    read_plan_id: None,
                 })?;
                 let agent_runs = VmHttpAgentRunService::new(
                     Arc::clone(&state),

@@ -1911,6 +1911,7 @@ mod tests {
                 prompt,
                 correlation_id,
                 stage: crate::agent_plan::Stage::Plan,
+                read_plan_id: None,
             })
             .unwrap();
         state

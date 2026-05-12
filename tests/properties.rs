@@ -771,6 +771,7 @@ proptest! {
             prompt: AgentPrompt::try_new("p").unwrap().summary(),
             correlation_id: None,
             stage,
+            read_plan_id: None,
         })
         .unwrap();
         let entry = log.get_agent_run(run_id).unwrap().unwrap();
@@ -804,6 +805,7 @@ proptest! {
             prompt: AgentPrompt::try_new("p").unwrap().summary(),
             correlation_id: Some(c.clone()),
             stage: Stage::Execute,
+            read_plan_id: None,
         })
         .unwrap();
         let entry = log.get_agent_run(run_id).unwrap().unwrap();
@@ -836,6 +838,7 @@ proptest! {
             prompt: AgentPrompt::try_new("p").unwrap().summary(),
             correlation_id: None,
             stage: Stage::Plan,
+            read_plan_id: None,
         })
         .unwrap();
 
