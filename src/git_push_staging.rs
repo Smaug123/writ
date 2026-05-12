@@ -182,6 +182,20 @@ impl GitPushStagingStore {
         Ok(entries)
     }
 
+    /// Remove the on-disk staging directory for `request_id`. Idempotent:
+    /// calling twice, or calling against an id that was never staged,
+    /// returns `Ok(())`. Used by the broker after recording a terminal
+    /// operator decision (reject or, later, promote) so the staging tree
+    /// reflects the resolution recorded in the audit log.
+    pub fn delete(&self, request_id: RequestId) -> Result<(), StagingError> {
+        let dir = self.staged_path(request_id);
+        match fs::remove_dir_all(&dir) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(StagingError::Io(err)),
+        }
+    }
+
     /// Load one staged push by `request_id`, including its bundle bytes.
     pub fn load(&self, request_id: RequestId) -> Result<StagedEntry, StagingError> {
         let dir = self.staged_path(request_id);
@@ -677,6 +691,58 @@ mod tests {
             let mode = fs::metadata(dir.join(file)).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600, "{file} mode was {mode:o}");
         }
+    }
+
+    #[test]
+    fn delete_removes_staged_entry_and_load_then_returns_not_found() {
+        let (store, _tmp) = open_store();
+        let request_id: RequestId = "cccccccc-0000-0000-0000-000000000000".parse().unwrap();
+        store
+            .stage(
+                request_id,
+                UnixMillis::from_millis(1),
+                sample_metadata(),
+                b"to be deleted".to_vec(),
+            )
+            .unwrap();
+        let dir = store.root().join("staged").join(request_id.to_string());
+        assert!(dir.exists(), "staged dir must exist before delete");
+
+        store.delete(request_id).unwrap();
+
+        assert!(!dir.exists(), "staged dir must be gone after delete");
+        let err = store.load(request_id).unwrap_err();
+        assert!(matches!(err, StagingError::NotFound { request_id: id } if id == request_id));
+        let listed: Vec<RequestId> = store
+            .list()
+            .unwrap()
+            .into_iter()
+            .map(|r| r.push_request_id())
+            .collect();
+        assert!(listed.is_empty(), "list must not show the deleted entry");
+    }
+
+    #[test]
+    fn delete_is_idempotent_when_called_twice() {
+        let (store, _tmp) = open_store();
+        let request_id: RequestId = "dddddddd-0000-0000-0000-000000000000".parse().unwrap();
+        store
+            .stage(
+                request_id,
+                UnixMillis::from_millis(1),
+                sample_metadata(),
+                b"twice".to_vec(),
+            )
+            .unwrap();
+        store.delete(request_id).unwrap();
+        store.delete(request_id).unwrap();
+    }
+
+    #[test]
+    fn delete_unknown_request_is_ok() {
+        let (store, _tmp) = open_store();
+        let request_id: RequestId = "eeeeeeee-0000-0000-0000-000000000000".parse().unwrap();
+        store.delete(request_id).unwrap();
     }
 
     // ---- proptest strategies ------------------------------------------

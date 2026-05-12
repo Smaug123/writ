@@ -60,6 +60,33 @@ pub struct GitPushOutcomeRecord<'a> {
     pub message: &'a str,
 }
 
+/// Operator decision on a staged push. `Approved` is reserved for a
+/// later promotion stage but is admitted by the v13 schema so future
+/// migrations are not needed when wiring up that flow.
+#[derive(Copy, Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GitPushResolution {
+    Rejected,
+    Approved,
+}
+
+#[derive(Debug)]
+pub struct GitPushResolutionRecord<'a> {
+    pub push_request_id: RequestId,
+    pub decided_at: UnixMillis,
+    pub decision: GitPushResolution,
+    pub operator: &'a str,
+    pub reason: &'a str,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GitPushResolutionEntry {
+    pub decided_at: UnixMillis,
+    pub decision: GitPushResolution,
+    pub operator: String,
+    pub reason: String,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GitPushAuditEntry {
     pub push_request_id: RequestId,
@@ -81,6 +108,10 @@ pub struct GitPushAuditEntry {
     pub result: Option<GitPushOutcomeResult>,
     pub github_status: Option<u16>,
     pub message: Option<String>,
+    /// `Some` once an operator has recorded a decision against the
+    /// staged push. The v13 schema's `BEFORE INSERT` trigger makes this
+    /// field reachable only when `result == Some(GitPushOutcomeResult::Staged)`.
+    pub resolution: Option<GitPushResolutionEntry>,
 }
 
 impl AuditLog {
@@ -323,6 +354,49 @@ impl AuditLog {
         })
     }
 
+    /// Persist an operator decision on a staged push. The v13 schema's
+    /// `BEFORE INSERT` trigger requires `git_push_outcome.result = 'staged'`
+    /// for this request id, and the table's primary key prevents a
+    /// second decision being recorded — both constraints surface as
+    /// `AuditError::Sqlite`. The caller is responsible for empty-string
+    /// rejection so callers see a clean `Invariant` message instead of
+    /// a raw SQL CHECK violation.
+    pub fn record_git_push_resolution(
+        &self,
+        r: &GitPushResolutionRecord<'_>,
+    ) -> Result<(), AuditError> {
+        if r.operator.is_empty() {
+            return Err(AuditError::Invariant(
+                "git push resolution operator must not be empty",
+            ));
+        }
+        if r.reason.is_empty() {
+            return Err(AuditError::Invariant(
+                "git push resolution reason must not be empty",
+            ));
+        }
+
+        self.with_conn_mut(|c| {
+            c.execute(
+                "INSERT INTO git_push_resolution (
+                     push_request_id,
+                     decided_at,
+                     decision,
+                     operator,
+                     reason
+                 ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    r.push_request_id.as_uuid().to_string(),
+                    r.decided_at.as_millis(),
+                    r.decision.as_str(),
+                    r.operator,
+                    r.reason,
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
     /// Fetch the joined audit view for one VM Git push by request id, or
     /// `None` if no request row has been recorded. Promote tooling uses
     /// this to attach session and outcome context to a staged push that
@@ -350,10 +424,15 @@ impl AuditLog {
                      o.completed_at,
                      o.result,
                      o.github_status,
-                     o.message
+                     o.message,
+                     res.decided_at,
+                     res.decision,
+                     res.operator,
+                     res.reason
                  FROM git_push_request r
                  LEFT JOIN git_push_attempt a ON a.push_request_id = r.push_request_id
                  LEFT JOIN git_push_outcome o ON o.push_request_id = r.push_request_id
+                 LEFT JOIN git_push_resolution res ON res.push_request_id = r.push_request_id
                  WHERE r.push_request_id = ?1",
             )?;
             let row = stmt
@@ -389,10 +468,15 @@ impl AuditLog {
                      o.completed_at,
                      o.result,
                      o.github_status,
-                     o.message
+                     o.message,
+                     res.decided_at,
+                     res.decision,
+                     res.operator,
+                     res.reason
                  FROM git_push_request r
                  LEFT JOIN git_push_attempt a ON a.push_request_id = r.push_request_id
                  LEFT JOIN git_push_outcome o ON o.push_request_id = r.push_request_id
+                 LEFT JOIN git_push_resolution res ON res.push_request_id = r.push_request_id
                  WHERE r.session_id = ?1
                  ORDER BY r.received_at ASC, r.rowid ASC",
             )?;
@@ -438,6 +522,25 @@ impl GitPushOutcomeResult {
     }
 }
 
+impl GitPushResolution {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Rejected => "rejected",
+            Self::Approved => "approved",
+        }
+    }
+
+    fn from_str(raw: &str) -> Result<Self, AuditError> {
+        match raw {
+            "rejected" => Ok(Self::Rejected),
+            "approved" => Ok(Self::Approved),
+            _ => Err(AuditError::Invariant(
+                "Git push audit resolution decision is invalid",
+            )),
+        }
+    }
+}
+
 fn git_push_result_requires_attempt(result: GitPushOutcomeResult) -> bool {
     matches!(
         result,
@@ -469,6 +572,10 @@ fn git_push_audit_entry_from_row(
     let result_str: Option<String> = row.get("result")?;
     let github_status: Option<i64> = row.get("github_status")?;
     let message: Option<String> = row.get("message")?;
+    let resolution_decided_at: Option<i64> = row.get("decided_at")?;
+    let resolution_decision: Option<String> = row.get("decision")?;
+    let resolution_operator: Option<String> = row.get("operator")?;
+    let resolution_reason: Option<String> = row.get("reason")?;
 
     let parse = || -> Result<GitPushAuditEntry, AuditError> {
         let push_request_id = uuid::Uuid::parse_str(&push_request_id_str)
@@ -574,6 +681,31 @@ fn git_push_audit_entry_from_row(
             })
             .transpose()?;
 
+        // All four resolution columns are `NOT NULL`, so they are
+        // either all present (joined row matched) or all absent (no
+        // resolution recorded). Any partial state is corruption.
+        let resolution = match (
+            resolution_decided_at,
+            resolution_decision,
+            resolution_operator,
+            resolution_reason,
+        ) {
+            (None, None, None, None) => None,
+            (Some(decided_at), Some(decision), Some(operator), Some(reason)) => {
+                Some(GitPushResolutionEntry {
+                    decided_at: UnixMillis::from_millis(decided_at),
+                    decision: GitPushResolution::from_str(&decision)?,
+                    operator,
+                    reason,
+                })
+            }
+            _ => {
+                return Err(AuditError::Invariant(
+                    "Git push audit row: incomplete resolution",
+                ));
+            }
+        };
+
         Ok(GitPushAuditEntry {
             push_request_id: RequestId::from_uuid(push_request_id),
             session_id: SessionId::from_uuid(session_id),
@@ -592,6 +724,7 @@ fn git_push_audit_entry_from_row(
             result,
             github_status,
             message,
+            resolution,
         })
     };
     Ok(parse())
@@ -925,6 +1058,7 @@ mod tests {
                             result: Some(result),
                             github_status,
                             message: Some("state-machine outcome".into()),
+                            resolution: None,
                         }]
                     );
                 }
@@ -973,6 +1107,7 @@ mod tests {
                             result: Some(result),
                             github_status: None,
                             message: Some("state-machine outcome".into()),
+                            resolution: None,
                         }]
                     );
                 }
@@ -1536,5 +1671,251 @@ mod tests {
             ),
             "got: {err:?}"
         );
+    }
+
+    fn record_staged_request(log: &AuditLog, push_request_id: RequestId, session_id: SessionId) {
+        log.record_git_push_request(&sample_git_push_request_record(push_request_id, session_id))
+            .unwrap();
+        log.record_git_push_outcome(&GitPushOutcomeRecord {
+            push_request_id,
+            push_attempt_id: None,
+            completed_at: UnixMillis::from_millis(1_700_000_130),
+            result: GitPushOutcomeResult::Staged,
+            github_status: None,
+            message: "queued for review",
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn record_resolution_roundtrips_via_get_git_push() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+        let push_request_id = RequestId::new();
+        record_staged_request(&log, push_request_id, s.session_id);
+
+        log.record_git_push_resolution(&GitPushResolutionRecord {
+            push_request_id,
+            decided_at: UnixMillis::from_millis(1_700_000_200),
+            decision: GitPushResolution::Rejected,
+            operator: "alice",
+            reason: "leaks credentials",
+        })
+        .unwrap();
+
+        let entry = log.get_git_push(push_request_id).unwrap().unwrap();
+        assert_eq!(
+            entry.resolution,
+            Some(GitPushResolutionEntry {
+                decided_at: UnixMillis::from_millis(1_700_000_200),
+                decision: GitPushResolution::Rejected,
+                operator: "alice".into(),
+                reason: "leaks credentials".into(),
+            })
+        );
+
+        let entries = log.list_git_pushes_for_session(s.session_id).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].resolution, entry.resolution);
+    }
+
+    /// `Approved` is admitted by the v13 CHECK on `decision`, even
+    /// though Stage B only writes `Rejected`. Stage D will write
+    /// `Approved` and must not require a fresh migration.
+    #[test]
+    fn record_resolution_accepts_approved_decision() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+        let push_request_id = RequestId::new();
+        record_staged_request(&log, push_request_id, s.session_id);
+
+        log.record_git_push_resolution(&GitPushResolutionRecord {
+            push_request_id,
+            decided_at: UnixMillis::from_millis(1_700_000_200),
+            decision: GitPushResolution::Approved,
+            operator: "alice",
+            reason: "looks good",
+        })
+        .unwrap();
+
+        let entry = log.get_git_push(push_request_id).unwrap().unwrap();
+        assert_eq!(
+            entry.resolution.unwrap().decision,
+            GitPushResolution::Approved
+        );
+    }
+
+    #[test]
+    fn record_resolution_rejects_when_outcome_not_staged() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+        let push_request_id = RequestId::new();
+        log.record_git_push_request(&sample_git_push_request_record(
+            push_request_id,
+            s.session_id,
+        ))
+        .unwrap();
+        log.record_git_push_outcome(&GitPushOutcomeRecord {
+            push_request_id,
+            push_attempt_id: None,
+            completed_at: UnixMillis::from_millis(1_700_000_130),
+            result: GitPushOutcomeResult::Denied,
+            github_status: None,
+            message: "policy denied",
+        })
+        .unwrap();
+
+        let err = log
+            .record_git_push_resolution(&GitPushResolutionRecord {
+                push_request_id,
+                decided_at: UnixMillis::from_millis(1_700_000_200),
+                decision: GitPushResolution::Rejected,
+                operator: "alice",
+                reason: "too late",
+            })
+            .unwrap_err();
+        let AuditError::Sqlite(e) = err else {
+            panic!("expected sqlite trigger error, got: {err:?}");
+        };
+        assert!(
+            e.to_string()
+                .contains("git push must be staged to be resolved"),
+            "unexpected error: {e}"
+        );
+    }
+
+    #[test]
+    fn record_resolution_rejects_when_no_outcome() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+        let push_request_id = RequestId::new();
+        log.record_git_push_request(&sample_git_push_request_record(
+            push_request_id,
+            s.session_id,
+        ))
+        .unwrap();
+
+        let err = log
+            .record_git_push_resolution(&GitPushResolutionRecord {
+                push_request_id,
+                decided_at: UnixMillis::from_millis(1_700_000_200),
+                decision: GitPushResolution::Rejected,
+                operator: "alice",
+                reason: "no outcome yet",
+            })
+            .unwrap_err();
+        let AuditError::Sqlite(e) = err else {
+            panic!("expected sqlite trigger error, got: {err:?}");
+        };
+        assert!(
+            e.to_string()
+                .contains("git push must be staged to be resolved"),
+            "unexpected error: {e}"
+        );
+    }
+
+    #[test]
+    fn record_resolution_rejects_double_resolution() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+        let push_request_id = RequestId::new();
+        record_staged_request(&log, push_request_id, s.session_id);
+
+        log.record_git_push_resolution(&GitPushResolutionRecord {
+            push_request_id,
+            decided_at: UnixMillis::from_millis(1_700_000_200),
+            decision: GitPushResolution::Rejected,
+            operator: "alice",
+            reason: "first time",
+        })
+        .unwrap();
+
+        let err = log
+            .record_git_push_resolution(&GitPushResolutionRecord {
+                push_request_id,
+                decided_at: UnixMillis::from_millis(1_700_000_210),
+                decision: GitPushResolution::Rejected,
+                operator: "bob",
+                reason: "second time",
+            })
+            .unwrap_err();
+        let AuditError::Sqlite(e) = err else {
+            panic!("expected sqlite PK error, got: {err:?}");
+        };
+        assert!(
+            e.to_string().to_lowercase().contains("unique")
+                || e.to_string().to_lowercase().contains("primary key"),
+            "expected PK violation, got: {e}"
+        );
+    }
+
+    #[test]
+    fn record_resolution_rejects_empty_operator() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+        let push_request_id = RequestId::new();
+        record_staged_request(&log, push_request_id, s.session_id);
+
+        let err = log
+            .record_git_push_resolution(&GitPushResolutionRecord {
+                push_request_id,
+                decided_at: UnixMillis::from_millis(1_700_000_200),
+                decision: GitPushResolution::Rejected,
+                operator: "",
+                reason: "needs operator",
+            })
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                AuditError::Invariant("git push resolution operator must not be empty")
+            ),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn record_resolution_rejects_empty_reason() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+        let push_request_id = RequestId::new();
+        record_staged_request(&log, push_request_id, s.session_id);
+
+        let err = log
+            .record_git_push_resolution(&GitPushResolutionRecord {
+                push_request_id,
+                decided_at: UnixMillis::from_millis(1_700_000_200),
+                decision: GitPushResolution::Rejected,
+                operator: "alice",
+                reason: "",
+            })
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                AuditError::Invariant("git push resolution reason must not be empty")
+            ),
+            "got: {err:?}"
+        );
+    }
+
+    /// Mirror the existing `outcome_result_sql_strings_match_serde_form`
+    /// pin so a future serde rename cannot orphan resolution rows.
+    #[test]
+    fn resolution_decision_sql_strings_match_serde_form() {
+        let variants = [GitPushResolution::Rejected, GitPushResolution::Approved];
+        for v in variants {
+            let json = serde_json::to_value(v).unwrap();
+            assert_eq!(json, serde_json::Value::String(v.as_str().to_string()));
+            let back: GitPushResolution = serde_json::from_value(json).unwrap();
+            assert_eq!(back, v);
+        }
     }
 }

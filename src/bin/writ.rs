@@ -25,7 +25,8 @@ use writ::core::{
     AgentKind, CapabilityRequest, GitHubAccess, GitHubRequest, RepoRef, RequestId, SessionId,
 };
 use writ::protocol::{
-    AgentVmSessionInfo, ClientMessage, ServerMessage, StagedPushDetail, StagedPushSummary,
+    AgentVmSessionInfo, ClientMessage, RejectionReason, ServerMessage, StagedPushDetail,
+    StagedPushSummary,
 };
 use writ::server::default_socket_path;
 use writ::vm_git::{AgentVmWorkspaceBootstrap, GitCloneRepo, WorkspaceWarmMode};
@@ -86,6 +87,16 @@ enum PromoteCmd {
     List,
     /// Show the full detail of one staged push, including its audit context.
     Show { request_id: String },
+    /// Reject a staged push: records the operator decision in the audit
+    /// log and removes the staging directory. The operator identity is
+    /// taken from `$USER` (or `unknown` if unset); the host is trusted to
+    /// assert its own identity over the local broker socket.
+    Reject {
+        request_id: String,
+        /// Human-readable justification recorded verbatim in the audit row.
+        #[arg(long)]
+        reason: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -353,6 +364,34 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     other => return Err(format!("unexpected response: {other:?}").into()),
                 }
             }
+            PromoteCmd::Reject { request_id, reason } => {
+                let id: RequestId = request_id
+                    .parse()
+                    .map_err(|e| format!("invalid request ID: {e}"))?;
+                let reason = RejectionReason::try_new(reason).map_err(|e| e.to_string())?;
+                let operator = capture_operator_identity();
+                let msg = ClientMessage::RejectStagedPush {
+                    request_id: id,
+                    operator,
+                    reason,
+                };
+                match call(&socket_path, &msg)? {
+                    ServerMessage::StagedPushRejected { request_id } => {
+                        println!("rejected push_request_id={request_id}");
+                    }
+                    ServerMessage::UnknownStagedPush { request_id } => {
+                        return Err(format!("no staged push with id {request_id}").into());
+                    }
+                    ServerMessage::StagedPushAlreadyResolved { request_id } => {
+                        return Err(format!(
+                            "staged push {request_id} already has an operator decision recorded",
+                        )
+                        .into());
+                    }
+                    ServerMessage::Error { message } => return Err(message.into()),
+                    other => return Err(format!("unexpected response: {other:?}").into()),
+                }
+            }
         },
     }
     Ok(())
@@ -360,6 +399,28 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
 fn parse_agent_kind(raw: &str) -> Result<AgentKind, String> {
     raw.parse::<AgentKind>().map_err(|err| err.to_string())
+}
+
+/// Read the operator identity the CLI will assert to the broker.
+///
+/// The local socket is the trust boundary, so this only needs to be a
+/// stable, human-readable label. The pure mapping lives in
+/// [`classify_operator_identity`] so it can be exercised in tests
+/// without mutating the process environment — `std::env::set_var` is
+/// unsafe under Rust 2024 and would race with Clap's env-aware
+/// argument parsing in other unit tests.
+fn capture_operator_identity() -> String {
+    classify_operator_identity(std::env::var("USER").ok())
+}
+
+/// `$USER` is what every interactive shell sets; if it is missing or
+/// empty (some CI containers drop it), record `"unknown"` rather than
+/// failing the reject — the audit row should always land.
+fn classify_operator_identity(user: Option<String>) -> String {
+    match user {
+        Some(value) if !value.is_empty() => value,
+        _ => "unknown".to_string(),
+    }
 }
 
 fn start_agent_vm(
@@ -951,6 +1012,57 @@ mod tests {
                 "audit_result=staged\n",
             )
         );
+    }
+
+    #[test]
+    fn promote_reject_cli_requires_reason_flag() {
+        let err = match Args::try_parse_from([
+            "writ",
+            "promote",
+            "reject",
+            "11111111-1111-1111-1111-111111111111",
+        ]) {
+            Ok(_) => panic!("expected clap to reject missing --reason"),
+            Err(error) => error,
+        };
+        assert!(
+            err.to_string().contains("--reason"),
+            "unexpected clap error: {err}"
+        );
+    }
+
+    #[test]
+    fn promote_reject_cli_parses_request_id_and_reason() {
+        let args = Args::try_parse_from([
+            "writ",
+            "promote",
+            "reject",
+            "11111111-1111-1111-1111-111111111111",
+            "--reason",
+            "contains a secret",
+        ])
+        .unwrap();
+        match args.cmd {
+            Cmd::Promote {
+                action: PromoteCmd::Reject { request_id, reason },
+            } => {
+                assert_eq!(request_id, "11111111-1111-1111-1111-111111111111");
+                assert_eq!(reason, "contains a secret");
+            }
+            _ => panic!("unexpected command"),
+        }
+    }
+
+    /// Pins the operator-identity mapping: a set value flows through
+    /// verbatim; missing or empty falls back to `"unknown"` so the
+    /// audit row always lands. Tested on the pure helper so the suite
+    /// never mutates `USER` at runtime — `set_var` would race with
+    /// Clap's env-aware parsers in other parallel tests.
+    #[test]
+    fn classify_operator_identity_maps_user_env_with_unknown_fallback() {
+        assert_eq!(classify_operator_identity(Some("alice".into())), "alice");
+        assert_eq!(classify_operator_identity(Some(String::new())), "unknown");
+        assert_eq!(classify_operator_identity(None), "unknown");
     }
 
     /// An audit row that exists without an outcome row prints as

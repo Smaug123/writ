@@ -19,7 +19,9 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
 use crate::agent_vm_daemon::AgentVmDaemon;
-use crate::audit::{AUDIT_WRITE_FAILURE_TARGET, AuditLog, PreMintRecord};
+use crate::audit::{
+    AUDIT_WRITE_FAILURE_TARGET, AuditLog, GitPushResolution, GitPushResolutionRecord, PreMintRecord,
+};
 use crate::core::{
     CapabilityRequest, GrantedScope, PolicyDecision, RequestId, SessionId, SessionRecord,
     TtlSeconds, UnixMillis,
@@ -28,7 +30,8 @@ use crate::git_push_staging::{GitPushStagingStore, StagedEntry, StagingError};
 use crate::github::GitHubMinter;
 use crate::policy::{self, PolicyConfig};
 use crate::protocol::{
-    ClientMessage, ServerMessage, StagedPushAuditView, StagedPushDetail, StagedPushSummary,
+    ClientMessage, RejectionReason, ServerMessage, StagedPushAuditView, StagedPushDetail,
+    StagedPushSummary,
 };
 use crate::secret::SecretStore;
 
@@ -257,6 +260,11 @@ pub async fn dispatch_message_with_agent_vm<S: SecretStore + Send + Sync + 'stat
         },
         ClientMessage::ListStagedPushes {} => list_staged_pushes(state).await,
         ClientMessage::ShowStagedPush { request_id } => show_staged_push(state, request_id).await,
+        ClientMessage::RejectStagedPush {
+            request_id,
+            operator,
+            reason,
+        } => reject_staged_push(state, request_id, operator, reason).await,
     }
 }
 
@@ -358,6 +366,188 @@ async fn show_staged_push<S: SecretStore + Send + Sync + 'static>(
             audit,
         },
     }
+}
+
+/// Cap on the operator string the broker will accept. The audit row's
+/// `operator` column is unbounded text, so the broker enforces a sane
+/// upper bound at the wire boundary to keep a malformed CLI from
+/// bloating the audit DB. The local socket is the trust boundary; the
+/// operator field is informational only.
+pub(crate) const MAX_OPERATOR_BYTES: usize = 256;
+
+async fn reject_staged_push<S: SecretStore + Send + Sync + 'static>(
+    state: &Arc<BrokerState<S>>,
+    request_id: RequestId,
+    operator: String,
+    reason: RejectionReason,
+) -> ServerMessage {
+    let Some(staging_store) = state.staging_store.clone() else {
+        return staging_not_configured();
+    };
+
+    if operator.is_empty() {
+        return ServerMessage::Error {
+            message: "operator identity must not be empty".into(),
+        };
+    }
+    if operator.len() > MAX_OPERATOR_BYTES {
+        return ServerMessage::Error {
+            message: format!(
+                "operator identity is {} bytes, exceeding the {MAX_OPERATOR_BYTES}-byte limit",
+                operator.len(),
+            ),
+        };
+    }
+
+    // Verify the staging directory exists before touching the audit
+    // log. Matching `show_staged_push`'s ordering lets the two endpoints
+    // agree on what "the staging is gone" means and gives the operator
+    // a clean `UnknownStagedPush` instead of a trigger-violation error
+    // when the dir was already deleted by a prior reject.
+    let load_check = {
+        let staging_store = Arc::clone(&staging_store);
+        tokio::task::spawn_blocking(move || staging_store.load(request_id)).await
+    };
+    match load_check {
+        Ok(Ok(_)) => {}
+        Ok(Err(StagingError::NotFound { request_id })) => {
+            return ServerMessage::UnknownStagedPush { request_id };
+        }
+        Ok(Err(err)) => {
+            return ServerMessage::Error {
+                message: err.to_string(),
+            };
+        }
+        Err(err) => {
+            return ServerMessage::Error {
+                message: format!("staging load task failed: {err}"),
+            };
+        }
+    }
+
+    let decided_at = UnixMillis::now();
+    let reason_owned = reason.as_str().to_string();
+    let operator_owned = operator.clone();
+    let audit = Arc::clone(&state.audit);
+    let resolution_result = tokio::task::spawn_blocking(move || {
+        audit.record_git_push_resolution(&GitPushResolutionRecord {
+            push_request_id: request_id,
+            decided_at,
+            decision: GitPushResolution::Rejected,
+            operator: &operator_owned,
+            reason: &reason_owned,
+        })
+    })
+    .await;
+    match resolution_result {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => {
+            // The PK on `git_push_resolution.push_request_id` surfaces
+            // as a SQLite "UNIQUE constraint" error when a previous
+            // decision is already recorded. The trigger that requires a
+            // `staged` outcome row surfaces with the literal message
+            // pinned in the migration. Other SQL errors are broker
+            // invariant violations.
+            if is_unique_constraint_violation(&err) {
+                // A prior `Rejected` decision means the staging dir
+                // should already be gone. If we still saw it on disk
+                // above, the previous reject's cleanup failed mid-way:
+                // retry the delete here so the operator has a recovery
+                // path instead of the dir staying stuck in
+                // `promote list`. `Approved` is left alone because Stage
+                // D's promotion flow owns that directory's lifecycle.
+                retry_cleanup_for_rejected(state, &staging_store, request_id).await;
+                return ServerMessage::StagedPushAlreadyResolved { request_id };
+            }
+            tracing::error!(
+                target: AUDIT_WRITE_FAILURE_TARGET,
+                kind = "git_push_resolution",
+                request_id = %request_id,
+                error = %err,
+                "audit write failed: staged push reject not recorded",
+            );
+            return ServerMessage::Error {
+                message: err.to_string(),
+            };
+        }
+        Err(err) => {
+            return ServerMessage::Error {
+                message: format!("audit write task failed: {err}"),
+            };
+        }
+    }
+
+    // Audit row committed. Delete the staging dir last so that if the
+    // delete fails, the next call sees both the audit row and the dir
+    // and returns `StagedPushAlreadyResolved` rather than silently
+    // reporting success without removing the on-disk artifact.
+    let delete_result = {
+        let staging_store = Arc::clone(&staging_store);
+        tokio::task::spawn_blocking(move || staging_store.delete(request_id)).await
+    };
+    match delete_result {
+        Ok(Ok(())) => ServerMessage::StagedPushRejected { request_id },
+        Ok(Err(err)) => ServerMessage::Error {
+            message: format!(
+                "staged push {request_id} was recorded as rejected but the staging \
+                 directory could not be removed: {err}"
+            ),
+        },
+        Err(err) => ServerMessage::Error {
+            message: format!("staging delete task failed: {err}"),
+        },
+    }
+}
+
+/// Best-effort retry of the staging-dir delete on a duplicate-resolution
+/// path: a prior `Rejected` row commits the decision, but if its
+/// follow-up `delete` failed (transient filesystem error, perm flip,
+/// crash) the dir lingers and the operator has no way to clear it.
+/// Try again here and swallow any error — the caller still returns
+/// `StagedPushAlreadyResolved`, and if the dir remains it will surface
+/// in the next `promote list` for the operator to act on.
+async fn retry_cleanup_for_rejected<S: SecretStore + Send + Sync + 'static>(
+    state: &Arc<BrokerState<S>>,
+    staging_store: &Arc<GitPushStagingStore>,
+    request_id: RequestId,
+) {
+    let audit = Arc::clone(&state.audit);
+    let lookup = tokio::task::spawn_blocking(move || audit.get_git_push(request_id)).await;
+    let prior_decision = match lookup {
+        Ok(Ok(Some(entry))) => entry.resolution.map(|r| r.decision),
+        _ => None,
+    };
+    if prior_decision != Some(GitPushResolution::Rejected) {
+        return;
+    }
+    let staging_store = Arc::clone(staging_store);
+    let delete_outcome =
+        tokio::task::spawn_blocking(move || staging_store.delete(request_id)).await;
+    if let Ok(Err(err)) = delete_outcome {
+        tracing::warn!(
+            request_id = %request_id,
+            error = %err,
+            "duplicate-reject cleanup retry failed; staging dir may still be present",
+        );
+    }
+}
+
+/// Recognise the "row already exists" failure shape for the
+/// `git_push_resolution` PK insert. Rusqlite surfaces both
+/// `SQLITE_CONSTRAINT_PRIMARYKEY` (1555) and `SQLITE_CONSTRAINT_UNIQUE`
+/// (2067) via `ConstraintViolation`; the message text disambiguates.
+fn is_unique_constraint_violation(err: &crate::audit::AuditError) -> bool {
+    let crate::audit::AuditError::Sqlite(sql_err) = err else {
+        return false;
+    };
+    let rusqlite::Error::SqliteFailure(code, _) = sql_err else {
+        return false;
+    };
+    if !matches!(code.code, rusqlite::ErrorCode::ConstraintViolation) {
+        return false;
+    }
+    let message = sql_err.to_string().to_lowercase();
+    message.contains("unique") || message.contains("primary key")
 }
 
 fn staging_not_configured() -> ServerMessage {
@@ -1036,6 +1226,31 @@ mod tests {
             .unwrap()
     }
 
+    /// Stage a push on disk *and* record the matching audit row plus a
+    /// `Staged` outcome row so the resolution trigger admits operator
+    /// decisions against the resulting request id. Returns the request id.
+    async fn stage_with_staged_outcome(
+        state: &Arc<BrokerState<InMemStore>>,
+        session_id: SessionId,
+        bundle: Vec<u8>,
+        staged_at: UnixMillis,
+        received_at: UnixMillis,
+    ) -> RequestId {
+        let request_id = stage_with_audit(state, session_id, bundle, staged_at, received_at).await;
+        state
+            .audit
+            .record_git_push_outcome(&crate::audit::GitPushOutcomeRecord {
+                push_request_id: request_id,
+                push_attempt_id: None,
+                completed_at: received_at,
+                result: crate::audit::GitPushOutcomeResult::Staged,
+                github_status: None,
+                message: "staged for operator review",
+            })
+            .unwrap();
+        request_id
+    }
+
     /// Stage a push on disk *and* record the matching audit row so the
     /// joined Show view has both halves available. Returns the request id.
     async fn stage_with_audit(
@@ -1228,6 +1443,259 @@ mod tests {
             }
             other => panic!("expected Error, got {other:?}"),
         }
+    }
+
+    // --- Staged-push reject ---------------------------------------------
+
+    fn reason(text: &str) -> RejectionReason {
+        RejectionReason::try_new(text).expect("test reason fits the bound")
+    }
+
+    #[tokio::test]
+    async fn reject_staged_push_without_staging_configured_returns_error() {
+        let server = MockServer::start().await;
+        let state = make_state(&server, vec![], "o");
+        let resp = dispatch_message(
+            ClientMessage::RejectStagedPush {
+                request_id: RequestId::new(),
+                operator: "alice".into(),
+                reason: reason("nope"),
+            },
+            &state,
+        )
+        .await;
+        match resp {
+            ServerMessage::Error { message } => {
+                assert!(message.contains("staging"), "got: {message}");
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn reject_staged_push_with_unknown_request_returns_unknown_staged_push() {
+        let server = MockServer::start().await;
+        let (state, _tmp) = make_state_with_staging(&server);
+        let request_id = RequestId::new();
+        let resp = dispatch_message(
+            ClientMessage::RejectStagedPush {
+                request_id,
+                operator: "alice".into(),
+                reason: reason("not staged"),
+            },
+            &state,
+        )
+        .await;
+        assert_eq!(resp, ServerMessage::UnknownStagedPush { request_id });
+    }
+
+    #[tokio::test]
+    async fn reject_staged_push_happy_path_records_audit_and_deletes_staging() {
+        let server = MockServer::start().await;
+        let (state, _tmp) = make_state_with_staging(&server);
+        let session_id = open_session(&state).await;
+        let request_id = stage_with_staged_outcome(
+            &state,
+            session_id,
+            b"bundle".to_vec(),
+            UnixMillis::from_millis(1_700_000_010_000),
+            UnixMillis::from_millis(1_700_000_010_500),
+        )
+        .await;
+
+        let resp = dispatch_message(
+            ClientMessage::RejectStagedPush {
+                request_id,
+                operator: "alice".into(),
+                reason: reason("contains a secret"),
+            },
+            &state,
+        )
+        .await;
+
+        assert_eq!(resp, ServerMessage::StagedPushRejected { request_id });
+
+        // Audit row is present with the right shape.
+        let audit_entry = state.audit.get_git_push(request_id).unwrap().unwrap();
+        let resolution = audit_entry
+            .resolution
+            .expect("resolution row recorded after reject");
+        assert_eq!(resolution.decision, GitPushResolution::Rejected);
+        assert_eq!(resolution.operator, "alice");
+        assert_eq!(resolution.reason, "contains a secret");
+
+        // Staging directory is gone; a follow-up reject sees UnknownStagedPush.
+        let follow_up = dispatch_message(
+            ClientMessage::RejectStagedPush {
+                request_id,
+                operator: "alice".into(),
+                reason: reason("retry"),
+            },
+            &state,
+        )
+        .await;
+        assert_eq!(follow_up, ServerMessage::UnknownStagedPush { request_id });
+    }
+
+    /// A second reject after an existing `Rejected` row returns
+    /// `AlreadyResolved` (the audit row was not authored by this call),
+    /// and — critically — opportunistically cleans up the staging dir
+    /// so a failed first-cleanup doesn't leave the entry stuck. The
+    /// original audit row is not overwritten.
+    #[tokio::test]
+    async fn reject_staged_push_already_resolved_path_retries_cleanup() {
+        let server = MockServer::start().await;
+        let (state, _tmp) = make_state_with_staging(&server);
+        let session_id = open_session(&state).await;
+        let request_id = stage_with_staged_outcome(
+            &state,
+            session_id,
+            b"bundle".to_vec(),
+            UnixMillis::from_millis(1_700_000_020_000),
+            UnixMillis::from_millis(1_700_000_020_500),
+        )
+        .await;
+
+        // Record the operator decision out-of-band so the staging dir is
+        // still on disk when dispatch sees the PK violation — the exact
+        // shape of "first reject's cleanup failed".
+        state
+            .audit
+            .record_git_push_resolution(&GitPushResolutionRecord {
+                push_request_id: request_id,
+                decided_at: UnixMillis::from_millis(1_700_000_021_000),
+                decision: GitPushResolution::Rejected,
+                operator: "alice",
+                reason: "first decision",
+            })
+            .unwrap();
+        assert!(
+            state
+                .staging_store
+                .as_ref()
+                .unwrap()
+                .load(request_id)
+                .is_ok()
+        );
+
+        let resp = dispatch_message(
+            ClientMessage::RejectStagedPush {
+                request_id,
+                operator: "bob".into(),
+                reason: reason("second decision"),
+            },
+            &state,
+        )
+        .await;
+
+        assert_eq!(
+            resp,
+            ServerMessage::StagedPushAlreadyResolved { request_id }
+        );
+
+        // Original audit row must be untouched.
+        let audit_entry = state.audit.get_git_push(request_id).unwrap().unwrap();
+        let resolution = audit_entry.resolution.expect("first decision still there");
+        assert_eq!(resolution.operator, "alice");
+        assert_eq!(resolution.reason, "first decision");
+
+        // Staging dir was cleaned up on the retry path so the entry no
+        // longer shows in `promote list`.
+        match state.staging_store.as_ref().unwrap().load(request_id) {
+            Err(StagingError::NotFound { .. }) => {}
+            other => panic!("expected staging cleanup, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn reject_staged_push_with_empty_operator_returns_error() {
+        let server = MockServer::start().await;
+        let (state, _tmp) = make_state_with_staging(&server);
+        let resp = dispatch_message(
+            ClientMessage::RejectStagedPush {
+                request_id: RequestId::new(),
+                operator: String::new(),
+                reason: reason("nope"),
+            },
+            &state,
+        )
+        .await;
+        match resp {
+            ServerMessage::Error { message } => {
+                assert!(message.contains("operator"), "got: {message}");
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn reject_staged_push_with_oversize_operator_returns_error() {
+        let server = MockServer::start().await;
+        let (state, _tmp) = make_state_with_staging(&server);
+        let oversized = "a".repeat(MAX_OPERATOR_BYTES + 1);
+        let resp = dispatch_message(
+            ClientMessage::RejectStagedPush {
+                request_id: RequestId::new(),
+                operator: oversized,
+                reason: reason("nope"),
+            },
+            &state,
+        )
+        .await;
+        match resp {
+            ServerMessage::Error { message } => {
+                assert!(message.contains("operator"), "got: {message}");
+                assert!(message.contains("byte"), "got: {message}");
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    /// If somehow the audit log has a request row but no `Staged` outcome
+    /// (e.g. broker crashed mid-stage and resumed without re-recording),
+    /// the v13 trigger keeps the resolution table consistent by refusing
+    /// the insert. The broker surfaces this as a plain Error rather than
+    /// `StagedPushAlreadyResolved`, since no prior decision exists.
+    #[tokio::test]
+    async fn reject_staged_push_without_staged_outcome_returns_error() {
+        let server = MockServer::start().await;
+        let (state, _tmp) = make_state_with_staging(&server);
+        let session_id = open_session(&state).await;
+        // Note: stage_with_audit records the request row but no outcome row.
+        let request_id = stage_with_audit(
+            &state,
+            session_id,
+            b"bundle".to_vec(),
+            UnixMillis::from_millis(1_700_000_030_000),
+            UnixMillis::from_millis(1_700_000_030_500),
+        )
+        .await;
+
+        let resp = dispatch_message(
+            ClientMessage::RejectStagedPush {
+                request_id,
+                operator: "alice".into(),
+                reason: reason("trigger should refuse"),
+            },
+            &state,
+        )
+        .await;
+
+        match resp {
+            ServerMessage::Error { .. } => {}
+            other => panic!("expected Error, got {other:?}"),
+        }
+
+        // Staging directory must still be present: the audit insert failed
+        // before commit-then-delete could touch the filesystem.
+        assert!(
+            state
+                .staging_store
+                .as_ref()
+                .unwrap()
+                .load(request_id)
+                .is_ok()
+        );
     }
 
     // --- Policy decisions ------------------------------------------------

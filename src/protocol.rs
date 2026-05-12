@@ -10,7 +10,7 @@
 //! policy engine consumes, and [`SessionId`]/[`UnixMillis`] are the
 //! same values that land in the audit log. No translation layer.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::agent_run::{AgentPrompt, AgentRunId};
 use crate::agent_vm_lifecycle::AgentVmSessionStateStatus;
@@ -84,6 +84,58 @@ pub struct StagedPushDetail {
     pub summary: StagedPushSummary,
     pub bundle_bytes: u64,
     pub audit: StagedPushAuditView,
+}
+
+/// Maximum byte length of a [`RejectionReason`]. Sized to comfortably
+/// hold the kind of one-paragraph explanation a human will type into
+/// `--reason` while still bounding broker memory and audit-row size.
+pub const MAX_REJECTION_REASON_BYTES: usize = 4096;
+
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum RejectionReasonError {
+    #[error("rejection reason must not be empty")]
+    Empty,
+    #[error("rejection reason is {byte_len} bytes, exceeding the {max_bytes}-byte limit")]
+    TooLong { byte_len: usize, max_bytes: usize },
+}
+
+/// Operator-supplied justification for rejecting a staged push. The
+/// broker records the reason verbatim in the audit log, so the type is
+/// parsed at the wire boundary: non-empty and bounded length.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RejectionReason(String);
+
+impl RejectionReason {
+    pub fn try_new(reason: impl Into<String>) -> Result<Self, RejectionReasonError> {
+        let reason = reason.into();
+        if reason.is_empty() {
+            return Err(RejectionReasonError::Empty);
+        }
+        if reason.len() > MAX_REJECTION_REASON_BYTES {
+            return Err(RejectionReasonError::TooLong {
+                byte_len: reason.len(),
+                max_bytes: MAX_REJECTION_REASON_BYTES,
+            });
+        }
+        Ok(Self(reason))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Serialize for RejectionReason {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for RejectionReason {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(deserializer)?;
+        Self::try_new(raw).map_err(serde::de::Error::custom)
+    }
 }
 
 /// A message from the agent to the broker.
@@ -179,6 +231,24 @@ pub enum ClientMessage {
     /// [`ServerMessage::StagedPush`] on hit and
     /// [`ServerMessage::UnknownStagedPush`] on miss.
     ShowStagedPush { request_id: RequestId },
+    /// Record an operator decision to reject a VM-staged push. The
+    /// broker writes a `git_push_resolution` audit row, removes the
+    /// staging directory, and replies with
+    /// [`ServerMessage::StagedPushRejected`] on success,
+    /// [`ServerMessage::UnknownStagedPush`] if the staging directory
+    /// is gone, or [`ServerMessage::StagedPushAlreadyResolved`] if a
+    /// prior decision is already recorded against this request id.
+    ///
+    /// `operator` is the human identity the broker records in the
+    /// audit row. The host CLI captures `$USER` and sends it; the
+    /// broker is not the source of authentication and trusts whatever
+    /// the local-socket peer asserts (the socket itself is the trust
+    /// boundary).
+    RejectStagedPush {
+        request_id: RequestId,
+        operator: String,
+        reason: RejectionReason,
+    },
 }
 
 /// A message from the broker to the agent.
@@ -241,6 +311,17 @@ pub enum ServerMessage {
     /// [`ServerMessage::Error`] so clients can distinguish "no such
     /// staged push" from a corrupt store or IO failure.
     UnknownStagedPush { request_id: RequestId },
+    /// Acknowledges [`ClientMessage::RejectStagedPush`]: the audit
+    /// resolution row was written and the staging directory was
+    /// removed. Carrying `request_id` lets the CLI confirm the exact
+    /// push it asked to reject when scripting against the daemon.
+    StagedPushRejected { request_id: RequestId },
+    /// The staged push referenced by [`ClientMessage::RejectStagedPush`]
+    /// already has a recorded operator decision. Distinct from
+    /// [`ServerMessage::UnknownStagedPush`] and [`ServerMessage::Error`]
+    /// so a replay surfaces as an explicit "already decided" outcome
+    /// rather than a prose error string.
+    StagedPushAlreadyResolved { request_id: RequestId },
     /// An internal failure (mint error, audit write failure, agent VM
     /// runtime not configured, …). The agent should surface `message` to
     /// the user and not retry automatically. Outcomes a client may want
@@ -304,6 +385,14 @@ impl std::fmt::Debug for ServerMessage {
             Self::StagedPush { push } => f.debug_struct("StagedPush").field("push", push).finish(),
             Self::UnknownStagedPush { request_id } => f
                 .debug_struct("UnknownStagedPush")
+                .field("request_id", request_id)
+                .finish(),
+            Self::StagedPushRejected { request_id } => f
+                .debug_struct("StagedPushRejected")
+                .field("request_id", request_id)
+                .finish(),
+            Self::StagedPushAlreadyResolved { request_id } => f
+                .debug_struct("StagedPushAlreadyResolved")
                 .field("request_id", request_id)
                 .finish(),
             Self::Error { message } => f.debug_struct("Error").field("message", message).finish(),
@@ -458,6 +547,75 @@ mod tests {
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert_eq!(serde_json::from_str::<ClientMessage>(&json).unwrap(), msg);
+    }
+
+    #[test]
+    fn reject_staged_push_roundtrips() {
+        let msg = ClientMessage::RejectStagedPush {
+            request_id: sample_request_id(),
+            operator: "alice".into(),
+            reason: RejectionReason::try_new("contains stray binary").unwrap(),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert_eq!(serde_json::from_str::<ClientMessage>(&json).unwrap(), msg);
+    }
+
+    #[test]
+    fn rejection_reason_empty_is_rejected() {
+        let err = RejectionReason::try_new("").unwrap_err();
+        assert!(matches!(err, RejectionReasonError::Empty));
+    }
+
+    #[test]
+    fn rejection_reason_at_limit_is_accepted() {
+        let body = "a".repeat(MAX_REJECTION_REASON_BYTES);
+        let reason = RejectionReason::try_new(body.clone()).unwrap();
+        assert_eq!(reason.as_str().len(), MAX_REJECTION_REASON_BYTES);
+        // serde roundtrip preserves the body verbatim.
+        let json = serde_json::to_string(&reason).unwrap();
+        let back: RejectionReason = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.as_str(), body);
+    }
+
+    #[test]
+    fn rejection_reason_above_limit_is_rejected() {
+        let body = "a".repeat(MAX_REJECTION_REASON_BYTES + 1);
+        let err = RejectionReason::try_new(body).unwrap_err();
+        let RejectionReasonError::TooLong {
+            byte_len,
+            max_bytes,
+        } = err
+        else {
+            panic!("expected TooLong, got {err:?}");
+        };
+        assert_eq!(byte_len, MAX_REJECTION_REASON_BYTES + 1);
+        assert_eq!(max_bytes, MAX_REJECTION_REASON_BYTES);
+    }
+
+    /// Deserializing a too-long reason must surface as a serde error so
+    /// the broker rejects oversize payloads at the wire boundary rather
+    /// than past it.
+    #[test]
+    fn rejection_reason_above_limit_fails_to_deserialize() {
+        let body = "a".repeat(MAX_REJECTION_REASON_BYTES + 1);
+        let json = serde_json::to_string(&body).unwrap();
+        let err = serde_json::from_str::<RejectionReason>(&json).unwrap_err();
+        assert!(
+            err.to_string().contains("exceeding"),
+            "expected length error message, got: {err}"
+        );
+    }
+
+    /// And an empty string must fail at the wire too — guest UI may
+    /// allow blanks but the broker rejects them so the audit row's
+    /// `reason != ''` CHECK is never the line of defence.
+    #[test]
+    fn rejection_reason_empty_fails_to_deserialize() {
+        let err = serde_json::from_str::<RejectionReason>("\"\"").unwrap_err();
+        assert!(
+            err.to_string().contains("must not be empty"),
+            "expected empty-string error message, got: {err}"
+        );
     }
 
     // --- ServerMessage roundtrips -----------------------------------------
@@ -616,6 +774,24 @@ mod tests {
     }
 
     #[test]
+    fn staged_push_rejected_roundtrips() {
+        let msg = ServerMessage::StagedPushRejected {
+            request_id: sample_request_id(),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert_eq!(serde_json::from_str::<ServerMessage>(&json).unwrap(), msg);
+    }
+
+    #[test]
+    fn staged_push_already_resolved_roundtrips() {
+        let msg = ServerMessage::StagedPushAlreadyResolved {
+            request_id: sample_request_id(),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert_eq!(serde_json::from_str::<ServerMessage>(&json).unwrap(), msg);
+    }
+
+    #[test]
     fn staged_push_type_tags() {
         let list: serde_json::Value =
             serde_json::to_value(ClientMessage::ListStagedPushes {}).unwrap();
@@ -642,6 +818,29 @@ mod tests {
         })
         .unwrap();
         assert_eq!(unknown["type"], "unknown_staged_push");
+
+        let reject: serde_json::Value = serde_json::to_value(ClientMessage::RejectStagedPush {
+            request_id: sample_request_id(),
+            operator: "alice".into(),
+            reason: RejectionReason::try_new("nope").unwrap(),
+        })
+        .unwrap();
+        assert_eq!(reject["type"], "reject_staged_push");
+        assert_eq!(reject["operator"], "alice");
+        assert_eq!(reject["reason"], "nope");
+
+        let rejected: serde_json::Value = serde_json::to_value(ServerMessage::StagedPushRejected {
+            request_id: sample_request_id(),
+        })
+        .unwrap();
+        assert_eq!(rejected["type"], "staged_push_rejected");
+
+        let resolved: serde_json::Value =
+            serde_json::to_value(ServerMessage::StagedPushAlreadyResolved {
+                request_id: sample_request_id(),
+            })
+            .unwrap();
+        assert_eq!(resolved["type"], "staged_push_already_resolved");
     }
 
     /// `unknown_staged_push` carries its own type tag so a client
@@ -923,7 +1122,7 @@ mod tests {
         /// variant, and assert the result fails to parse.
         #[test]
         fn client_message_rejects_unknown_top_level_fields(
-            variant_index in 0usize..9,
+            variant_index in 0usize..10,
             // ASCII-letters-only key, excluded against the union of every
             // variant's known field names below.
             unknown_key in "[a-z]{1,16}",
@@ -931,7 +1130,7 @@ mod tests {
             const KNOWN_FIELDS: &[&str] = &[
                 "type", "label", "agent_kind", "agent_model", "workspace",
                 "guest_command", "session_id", "capability", "prompt",
-                "request_id",
+                "request_id", "reason", "operator",
             ];
             prop_assume!(!KNOWN_FIELDS.contains(&unknown_key.as_str()));
 
@@ -993,6 +1192,11 @@ mod tests {
             7 => ClientMessage::ListStagedPushes {},
             8 => ClientMessage::ShowStagedPush {
                 request_id: "12345678-1234-1234-1234-123456789012".parse().unwrap(),
+            },
+            9 => ClientMessage::RejectStagedPush {
+                request_id: "12345678-1234-1234-1234-123456789012".parse().unwrap(),
+                operator: "alice".into(),
+                reason: RejectionReason::try_new("leaks credentials").unwrap(),
             },
             other => unreachable!("variant index out of range: {other}"),
         }
