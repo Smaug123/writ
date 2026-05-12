@@ -20,14 +20,14 @@ use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand, ValueEnum};
 
-use writ::agent_plan::CorrelationId;
+use writ::agent_plan::{CorrelationId, PlanId};
 use writ::agent_run::AgentPrompt;
 use writ::core::{
     AgentKind, CapabilityRequest, GitHubAccess, GitHubRequest, RepoRef, RequestId, SessionId,
 };
 use writ::protocol::{
-    AgentVmSessionInfo, ClientMessage, RejectionReason, ServerMessage, StagedPushDetail,
-    StagedPushSummary,
+    AgentVmSessionInfo, ClientMessage, PlanDetail, PlanSummary, RejectionReason, ServerMessage,
+    StagedPushDetail, StagedPushSummary,
 };
 use writ::server::default_socket_path;
 use writ::vm_git::{AgentVmWorkspaceBootstrap, GitCloneRepo, WorkspaceWarmMode};
@@ -80,6 +80,26 @@ enum Cmd {
         #[command(subcommand)]
         action: PromoteCmd,
     },
+    /// Inspect plans recorded by planner-stage agent runs.
+    Plan {
+        #[command(subcommand)]
+        action: PlanCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum PlanCmd {
+    /// List every plan the broker holds, optionally filtered by the
+    /// planner run's correlation id. Bodies are not loaded — use
+    /// `writ plan show <id>` for the body.
+    List {
+        /// Restrict the listing to plans whose planner run was tagged
+        /// with this correlation id.
+        #[arg(long, value_parser = parse_correlation_id)]
+        correlation_id: Option<CorrelationId>,
+    },
+    /// Show one plan: metadata followed by the verbatim body.
+    Show { plan_id: String },
 }
 
 #[derive(Subcommand)]
@@ -401,6 +421,36 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         },
+        Cmd::Plan { action } => match action {
+            PlanCmd::List { correlation_id } => {
+                let msg = ClientMessage::ListPlans { correlation_id };
+                match call(&socket_path, &msg)? {
+                    ServerMessage::Plans { plans } => {
+                        let mut out = std::io::stdout().lock();
+                        write_plan_summaries(&mut out, &plans)?;
+                    }
+                    ServerMessage::Error { message } => return Err(message.into()),
+                    other => return Err(format!("unexpected response: {other:?}").into()),
+                }
+            }
+            PlanCmd::Show { plan_id } => {
+                let id: PlanId = plan_id
+                    .parse()
+                    .map_err(|e| format!("invalid plan ID: {e}"))?;
+                let msg = ClientMessage::ShowPlan { plan_id: id };
+                match call(&socket_path, &msg)? {
+                    ServerMessage::Plan { plan } => {
+                        let mut out = std::io::stdout().lock();
+                        write_plan_detail(&mut out, &plan)?;
+                    }
+                    ServerMessage::UnknownPlan { plan_id } => {
+                        return Err(format!("no plan with id {plan_id}").into());
+                    }
+                    ServerMessage::Error { message } => return Err(message.into()),
+                    other => return Err(format!("unexpected response: {other:?}").into()),
+                }
+            }
+        },
     }
     Ok(())
 }
@@ -618,6 +668,40 @@ fn write_staged_push_detail(out: &mut dyn Write, push: &StagedPushDetail) -> std
         // `<none>` matches the staged-vs-unknown distinction in the wire
         // protocol: an audit row exists but no outcome has been recorded.
         None => writeln!(out, "audit_result=<none>")?,
+    }
+    Ok(())
+}
+
+fn write_plan_summaries(out: &mut dyn Write, plans: &[PlanSummary]) -> std::io::Result<()> {
+    for (index, plan) in plans.iter().enumerate() {
+        if index > 0 {
+            writeln!(out)?;
+        }
+        writeln!(out, "plan_id={}", plan.plan_id)?;
+        writeln!(out, "agent_run_id={}", plan.agent_run_id)?;
+        // Surface `<none>` rather than omitting the line so a missing
+        // correlation_id is obvious in the listing.
+        match &plan.correlation_id {
+            Some(c) => writeln!(out, "correlation_id={}", c.as_str())?,
+            None => writeln!(out, "correlation_id=<none>")?,
+        }
+        writeln!(out, "submitted_at={}", plan.submitted_at.as_millis())?;
+        writeln!(out, "body_bytes={}", plan.body_bytes)?;
+        writeln!(out, "body_sha256={}", plan.body_sha256)?;
+    }
+    Ok(())
+}
+
+fn write_plan_detail(out: &mut dyn Write, plan: &PlanDetail) -> std::io::Result<()> {
+    write_plan_summaries(out, std::slice::from_ref(&plan.summary))?;
+    // Body is a separate block so its newlines don't collide with the
+    // key=value header. The blank line is the delimiter.
+    writeln!(out)?;
+    out.write_all(plan.body.as_bytes())?;
+    // Ensure the body block is terminated even if the body itself
+    // doesn't end with a newline (markdown often doesn't).
+    if !plan.body.as_bytes().ends_with(b"\n") {
+        writeln!(out)?;
     }
     Ok(())
 }
@@ -1175,5 +1259,132 @@ mod tests {
             rendered.contains("expected_remote_head=<branch_creation>\n"),
             "{rendered}",
         );
+    }
+
+    #[test]
+    fn plan_list_cli_accepts_correlation_id_filter() {
+        let args =
+            Args::try_parse_from(["writ", "plan", "list", "--correlation-id", "feat-42_xyz"])
+                .unwrap();
+        match args.cmd {
+            Cmd::Plan {
+                action: PlanCmd::List { correlation_id },
+            } => {
+                let id = correlation_id.expect("--correlation-id should parse");
+                assert_eq!(id.as_str(), "feat-42_xyz");
+            }
+            _ => panic!("unexpected command"),
+        }
+    }
+
+    #[test]
+    fn plan_list_cli_without_correlation_id_filter_is_none() {
+        let args = Args::try_parse_from(["writ", "plan", "list"]).unwrap();
+        match args.cmd {
+            Cmd::Plan {
+                action: PlanCmd::List { correlation_id },
+            } => {
+                assert!(correlation_id.is_none());
+            }
+            _ => panic!("unexpected command"),
+        }
+    }
+
+    #[test]
+    fn plan_list_cli_rejects_invalid_correlation_id() {
+        let err =
+            match Args::try_parse_from(["writ", "plan", "list", "--correlation-id", "bad space"]) {
+                Ok(_) => panic!("expected clap to reject malformed --correlation-id"),
+                Err(error) => error,
+            };
+        let rendered = err.to_string();
+        assert!(rendered.contains("correlation id"), "{rendered}");
+    }
+
+    #[test]
+    fn plan_show_cli_accepts_plan_id() {
+        let id = "f1f1f1f1-0000-0000-0000-000000000001";
+        let args = Args::try_parse_from(["writ", "plan", "show", id]).unwrap();
+        match args.cmd {
+            Cmd::Plan {
+                action: PlanCmd::Show { plan_id },
+            } => assert_eq!(plan_id, id),
+            _ => panic!("unexpected command"),
+        }
+    }
+
+    fn sample_plan_summary_for_cli(with_correlation: bool) -> PlanSummary {
+        PlanSummary {
+            plan_id: "f1f1f1f1-0000-0000-0000-000000000001".parse().unwrap(),
+            agent_run_id: "f2f2f2f2-0000-0000-0000-000000000001".parse().unwrap(),
+            correlation_id: if with_correlation {
+                Some(CorrelationId::try_new("feat-42_xyz").unwrap())
+            } else {
+                None
+            },
+            submitted_at: writ::core::UnixMillis::from_millis(1_700_000_000_000),
+            body_sha256: "a".repeat(64),
+            body_bytes: 42,
+        }
+    }
+
+    #[test]
+    fn plan_summaries_render_key_value_lines_with_blank_lines_between_records() {
+        let plans = vec![
+            sample_plan_summary_for_cli(true),
+            sample_plan_summary_for_cli(false),
+        ];
+        let mut out = Vec::new();
+        write_plan_summaries(&mut out, &plans).unwrap();
+        let rendered = String::from_utf8(out).unwrap();
+        assert_eq!(
+            rendered,
+            concat!(
+                "plan_id=f1f1f1f1-0000-0000-0000-000000000001\n",
+                "agent_run_id=f2f2f2f2-0000-0000-0000-000000000001\n",
+                "correlation_id=feat-42_xyz\n",
+                "submitted_at=1700000000000\n",
+                "body_bytes=42\n",
+                "body_sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
+                "\n",
+                "plan_id=f1f1f1f1-0000-0000-0000-000000000001\n",
+                "agent_run_id=f2f2f2f2-0000-0000-0000-000000000001\n",
+                "correlation_id=<none>\n",
+                "submitted_at=1700000000000\n",
+                "body_bytes=42\n",
+                "body_sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
+            )
+        );
+    }
+
+    #[test]
+    fn plan_detail_renders_summary_then_body_separated_by_blank_line() {
+        let body = writ::agent_plan::PlanBody::try_new("# Plan\n\nStep 1.\n").unwrap();
+        let detail = PlanDetail {
+            summary: sample_plan_summary_for_cli(true),
+            body,
+        };
+        let mut out = Vec::new();
+        write_plan_detail(&mut out, &detail).unwrap();
+        let rendered = String::from_utf8(out).unwrap();
+        // The summary block, a blank line, then the body verbatim.
+        let body_offset = rendered.find("# Plan").expect("body present");
+        assert!(rendered[..body_offset].ends_with("\n\n"), "{rendered}");
+        assert_eq!(&rendered[body_offset..], "# Plan\n\nStep 1.\n");
+    }
+
+    /// A body that doesn't terminate in a newline still ends with one
+    /// when written so shells don't merge it with the next prompt.
+    #[test]
+    fn plan_detail_terminates_unterminated_body_with_newline() {
+        let body = writ::agent_plan::PlanBody::try_new("trailing").unwrap();
+        let detail = PlanDetail {
+            summary: sample_plan_summary_for_cli(true),
+            body,
+        };
+        let mut out = Vec::new();
+        write_plan_detail(&mut out, &detail).unwrap();
+        let rendered = String::from_utf8(out).unwrap();
+        assert!(rendered.ends_with("trailing\n"), "{rendered}");
     }
 }
