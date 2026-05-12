@@ -96,6 +96,12 @@ pub enum UiHttpBearerWriteError {
         path: PathBuf,
         source: std::io::Error,
     },
+    #[error(
+        "UI HTTP bearer parent {path:?} has group/world access bits (mode {mode:04o}); \
+         refusing to write the bearer file: any local user could observe or substitute the token. \
+         Fix with: chmod 700 {path:?}"
+    )]
+    NonPrivateParent { path: PathBuf, mode: u32 },
     #[error("cannot write UI HTTP bearer file {path:?}: {source}")]
     Write {
         path: PathBuf,
@@ -118,22 +124,42 @@ pub enum UiHttpBearerWriteError {
 /// invariant as the socket parent (writ's other startup code refuses
 /// to bind a socket inside a parent with group/world bits). An
 /// existing parent is not chmod'd — we don't silently loosen or
-/// tighten a directory the operator already created.
+/// tighten a directory the operator already created — but if it
+/// has any group/world access bits we refuse to write, because a
+/// shared-writable parent lets a local attacker pre-create the
+/// `.tmp` file as a symlink and observe or substitute the token
+/// before `rename` lands.
 ///
-/// `OpenOptions::mode` is only honoured when the file is *created*,
-/// so a stale `.tmp` left behind by a crash might be opened with
-/// looser permissions and then renamed into place. The explicit
-/// `set_permissions` after `open` makes the destination mode
-/// independent of the temp file's prior state.
+/// We unlink any pre-existing `.tmp` (left behind by a previous
+/// crash, or planted by an attacker if the parent's privacy
+/// invariant ever lapses) before opening with `O_CREAT | O_EXCL`,
+/// which refuses to follow symlinks. Combined with the parent
+/// privacy check, this means a successful open returns a fresh
+/// file in our trusted directory.
 pub fn write_bearer_file(
     path: &Path,
     token: &UiHttpBearerToken,
 ) -> Result<(), UiHttpBearerWriteError> {
     use std::io::Write as _;
-    use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _, PermissionsExt as _};
+    use std::os::unix::fs::{
+        DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _,
+    };
 
-    if let Some(parent) = path.parent()
-        && !parent.exists() {
+    if let Some(parent) = path.parent() {
+        if parent.exists() {
+            let meta =
+                std::fs::metadata(parent).map_err(|source| UiHttpBearerWriteError::ParentDir {
+                    path: parent.to_path_buf(),
+                    source,
+                })?;
+            let mode = meta.mode() & 0o777;
+            if mode & 0o077 != 0 {
+                return Err(UiHttpBearerWriteError::NonPrivateParent {
+                    path: parent.to_path_buf(),
+                    mode,
+                });
+            }
+        } else {
             std::fs::DirBuilder::new()
                 .recursive(true)
                 .mode(0o700)
@@ -143,14 +169,24 @@ pub fn write_bearer_file(
                     source,
                 })?;
         }
+    }
     let mut tmp = path.as_os_str().to_owned();
     tmp.push(".tmp");
     let tmp = PathBuf::from(tmp);
+    match std::fs::remove_file(&tmp) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(source) => {
+            return Err(UiHttpBearerWriteError::Write {
+                path: tmp.clone(),
+                source,
+            });
+        }
+    }
     {
         let mut f = std::fs::OpenOptions::new()
             .write(true)
-            .create(true)
-            .truncate(true)
+            .create_new(true)
             .mode(0o600)
             .open(&tmp)
             .map_err(|source| UiHttpBearerWriteError::Write {
@@ -762,11 +798,23 @@ mod tests {
         assert_eq!(mode & 0o777, 0o700, "expected 0700, got {:o}", mode & 0o777);
     }
 
+    /// `tempfile::tempdir()` honours the process umask, so on a
+    /// typical macOS dev box the tempdir comes back as `0o755`. The
+    /// production-side parent-privacy check correctly rejects that,
+    /// so tests that exercise `write_bearer_file` against an existing
+    /// parent must pin the parent to `0o700` themselves.
+    fn private_tempdir() -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        tmp
+    }
+
     #[test]
     fn write_bearer_file_forces_0600_when_temp_exists_with_loose_perms() {
         use std::os::unix::fs::PermissionsExt as _;
 
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = private_tempdir();
         let path = tmp.path().join("ui-bearer");
         let stale_tmp = tmp.path().join("ui-bearer.tmp");
         std::fs::write(&stale_tmp, "stale").unwrap();
@@ -785,8 +833,59 @@ mod tests {
     }
 
     #[test]
-    fn write_bearer_file_replaces_existing() {
+    fn write_bearer_file_rejects_non_private_parent() {
+        use std::os::unix::fs::PermissionsExt as _;
+
         let tmp = tempfile::tempdir().unwrap();
+        let parent = tmp.path().join("public-parent");
+        std::fs::create_dir(&parent).unwrap();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = parent.join("ui-bearer");
+        let token = UiHttpBearerToken::generate();
+        let err = write_bearer_file(&path, &token).expect_err("non-private parent rejected");
+        match err {
+            UiHttpBearerWriteError::NonPrivateParent {
+                path: rejected,
+                mode,
+            } => {
+                assert_eq!(rejected, parent);
+                assert_eq!(mode, 0o755);
+            }
+            other => panic!("expected NonPrivateParent, got {other:?}"),
+        }
+        assert!(!path.exists(), "bearer must not be written");
+    }
+
+    /// If a local attacker plants `ui-bearer.tmp` as a symlink to a
+    /// world-readable victim file, the trusted-parent invariant
+    /// ensures the symlink can't appear there in the first place;
+    /// but in case the invariant is ever bypassed (e.g. a future
+    /// caller skipped the parent check), `create_new` would refuse
+    /// to follow the symlink. This test demonstrates that the
+    /// stale-temp cleanup path replaces the symlink rather than
+    /// writing through it.
+    #[test]
+    fn write_bearer_file_unlinks_stale_temp_symlink() {
+        let tmp = private_tempdir();
+        let path = tmp.path().join("ui-bearer");
+        let victim = tmp.path().join("victim");
+        std::fs::write(&victim, "original-contents").unwrap();
+        let stale_tmp = tmp.path().join("ui-bearer.tmp");
+        std::os::unix::fs::symlink(&victim, &stale_tmp).unwrap();
+        let token = UiHttpBearerToken::generate();
+        write_bearer_file(&path, &token).unwrap();
+        let victim_contents = std::fs::read_to_string(&victim).unwrap();
+        assert_eq!(
+            victim_contents, "original-contents",
+            "symlink target must not be overwritten"
+        );
+        let bearer_contents = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(bearer_contents, token.as_str());
+    }
+
+    #[test]
+    fn write_bearer_file_replaces_existing() {
+        let tmp = private_tempdir();
         let path = tmp.path().join("ui-bearer");
         let t1 = UiHttpBearerToken::new("first-token-xyz").unwrap();
         let t2 = UiHttpBearerToken::new("second-token-xyz").unwrap();
@@ -815,12 +914,10 @@ mod tests {
         let handle = tokio::spawn(run_ui_http_until_shutdown(listener, service, shutdown_rx));
 
         let mut stream = tokio::net::TcpStream::connect(local).await.unwrap();
-        let request = format!(
-            "GET /v1/health HTTP/1.1\r\n\
+        let request = "GET /v1/health HTTP/1.1\r\n\
              Host: 127.0.0.1\r\n\
              Authorization: Bearer ui-test-bearer-tcp\r\n\
-             Connection: close\r\n\r\n",
-        );
+             Connection: close\r\n\r\n";
         stream.write_all(request.as_bytes()).await.unwrap();
         let mut buf = Vec::new();
         stream.read_to_end(&mut buf).await.unwrap();

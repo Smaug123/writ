@@ -105,16 +105,26 @@ pub struct UiHttpConfig {
 pub enum UiHttpConfigError {
     #[error("ui_http.bind must be a loopback address (got {0})")]
     NonLoopbackBind(SocketAddr),
+    #[error(
+        "ui_http.bind must specify a fixed non-zero port (got {0}); \
+         the documented API requires a stable port for clients to connect to"
+    )]
+    EphemeralPortBind(SocketAddr),
 }
 
 impl UiHttpConfig {
-    /// Reject bind addresses that are not loopback. Called at daemon
-    /// startup before the listener is bound so the operator sees the
-    /// error immediately rather than discovering a public-facing
-    /// listener by accident.
+    /// Reject bind addresses that are not loopback or that request
+    /// an ephemeral port. Called at daemon startup before the
+    /// listener is bound so the operator sees the error immediately
+    /// rather than discovering a public-facing listener — or a
+    /// daemon that picks a different port on every restart — by
+    /// accident.
     pub fn validate(&self) -> Result<(), UiHttpConfigError> {
         if !self.bind.ip().is_loopback() {
             return Err(UiHttpConfigError::NonLoopbackBind(self.bind));
+        }
+        if self.bind.port() == 0 {
+            return Err(UiHttpConfigError::EphemeralPortBind(self.bind));
         }
         Ok(())
     }
@@ -752,6 +762,19 @@ mod tests {
         };
         let err = cfg.validate().expect_err("non-loopback rejected");
         assert!(matches!(err, UiHttpConfigError::NonLoopbackBind(_)));
+    }
+
+    #[test]
+    fn ui_http_validate_rejects_ephemeral_port() {
+        let cfg = UiHttpConfig {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            bearer_path: None,
+        };
+        let err = cfg.validate().expect_err("port 0 rejected");
+        assert!(
+            matches!(err, UiHttpConfigError::EphemeralPortBind(addr) if addr.port() == 0),
+            "got: {err:?}"
+        );
     }
 
     #[test]
