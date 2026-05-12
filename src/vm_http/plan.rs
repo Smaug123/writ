@@ -2,16 +2,23 @@
 //! `POST /v1/plans` endpoint by parsing one [`PlanSubmission`], binding
 //! it to the requesting agent run, and writing it to the audit log.
 //!
-//! The route does not yet enforce `agent_run.stage = 'plan'`; that
-//! check lands in slice 3 once the `agent_run.stage` column exists.
-//! What this slice *does* enforce is cross-session authorisation: the
-//! `agent_run_id` named in the request body must belong to the bearer
-//! session calling the route, so one VM cannot attach a plan to a run
-//! it does not own.
+//! Two authorisation gates run before the audit write:
+//!
+//! 1. **Cross-session:** the `agent_run_id` named in the request body
+//!    must belong to the bearer session calling the route, so one VM
+//!    cannot attach a plan to a run it does not own.
+//! 2. **Per-stage:** the named run must be at `stage = 'plan'`. The
+//!    pure stage→action gate is
+//!    [`route_permitted_by_stage_and_decision`]; this route invokes it
+//!    with [`PlanRouteAction::SubmitPlan`] so a review- or execute-
+//!    stage run cannot smuggle a plan submission past the audit log.
 
 use std::sync::Arc;
 
-use crate::agent_plan::{PlanCreated, PlanId, PlanSubmission, VM_PLANS_PATH_PREFIX};
+use crate::agent_plan::{
+    PlanCreated, PlanId, PlanRouteAction, PlanRouteAuthError, PlanSubmission, VM_PLANS_PATH_PREFIX,
+    route_permitted_by_stage_and_decision,
+};
 use crate::audit::{AUDIT_WRITE_FAILURE_TARGET, AuditError, PlanSubmissionRecord};
 use crate::core::UnixMillis;
 use crate::secret::SecretStore;
@@ -77,8 +84,8 @@ async fn handle_plan_submission<S: SecretStore + Send + Sync + 'static>(
 
     let audit = &service.broker_state.audit;
     let calling_session = session.session_id();
-    match audit.get_agent_run(submission.agent_run_id) {
-        Ok(Some(run)) if run.session_id == calling_session => {}
+    let run = match audit.get_agent_run(submission.agent_run_id) {
+        Ok(Some(run)) if run.session_id == calling_session => run,
         Ok(Some(_)) => {
             // The run exists but belongs to a different session. Treat
             // this as unauthorised rather than not-found: the caller
@@ -100,6 +107,37 @@ async fn handle_plan_submission<S: SecretStore + Send + Sync + 'static>(
                 "audit read failed",
             );
             return VmHttpResponse::text(VmHttpStatus::InternalServerError, "audit read failed");
+        }
+    };
+
+    // Per-stage gate. `SubmitPlan` does not consult any plan-level
+    // decision (planners submit before any decision exists), so the
+    // decision argument is `None`.
+    if let Err(err) =
+        route_permitted_by_stage_and_decision(PlanRouteAction::SubmitPlan, run.stage, None)
+    {
+        match err {
+            PlanRouteAuthError::StageNotPermitted { .. } => {
+                return VmHttpResponse::text(VmHttpStatus::Forbidden, err.to_string());
+            }
+            // SubmitPlan never consults the decision gate, so the
+            // pure function cannot return DecisionNotAccepted here.
+            // Surface as 500 rather than crash so a future change to
+            // the gate cannot silently smuggle a plan in via the
+            // wrong branch.
+            PlanRouteAuthError::DecisionNotAccepted { .. } => {
+                tracing::error!(
+                    target: AUDIT_WRITE_FAILURE_TARGET,
+                    kind = "plan_submission_gate_decision_branch_taken",
+                    run_id = %submission.agent_run_id,
+                    error = %err,
+                    "stage gate returned unexpected decision branch",
+                );
+                return VmHttpResponse::text(
+                    VmHttpStatus::InternalServerError,
+                    "stage gate returned unexpected decision branch",
+                );
+            }
         }
     }
 
@@ -190,6 +228,14 @@ mod tests {
         state: &BrokerState<Box<dyn SecretStore>>,
         session_id: SessionId,
     ) -> AgentRunId {
+        record_run_at_stage(state, session_id, crate::agent_plan::Stage::Plan)
+    }
+
+    fn record_run_at_stage(
+        state: &BrokerState<Box<dyn SecretStore>>,
+        session_id: SessionId,
+        stage: crate::agent_plan::Stage,
+    ) -> AgentRunId {
         let run_id = AgentRunId::new();
         state
             .audit
@@ -200,7 +246,7 @@ mod tests {
                 agent_kind: AgentKind::Claude,
                 prompt: AgentPrompt::new("plan this").summary(),
                 correlation_id: None,
-                stage: crate::agent_plan::Stage::Plan,
+                stage,
             })
             .unwrap();
         run_id
@@ -376,6 +422,101 @@ mod tests {
             .unwrap();
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].plan_id, created.plan_id);
+    }
+
+    /// The cross-session gate runs *before* the stage gate, so a
+    /// stranger session that names a run owned by another session sees
+    /// `Unauthorized` regardless of that run's stage. We pin this
+    /// ordering so a future change can't accidentally leak the
+    /// presence-of-a-non-plan-run via 403 vs 401.
+    #[tokio::test]
+    async fn plan_submission_session_gate_runs_before_stage_gate() {
+        let github = MockServer::start().await;
+        let state = make_broker_state(&github);
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+        open_audit_session(&state, session.session_id());
+        let other_session_id: SessionId = "82ab0bb1-7c12-4a4e-9f51-6d3d77011222".parse().unwrap();
+        open_session_for(&state, other_session_id);
+        // The stranger's run is at the *correct* stage; only the
+        // session ownership should make us reject.
+        let stranger_run = record_planner_run(&state, other_session_id);
+        let service = plan_service_for_test(&state);
+
+        let response =
+            handle_plan_submission(&session, submission_body(stranger_run, "# Plan"), service)
+                .await;
+
+        assert_eq!(response.status, VmHttpStatus::Unauthorized);
+    }
+
+    /// Submission from a `review`-stage run is forbidden: a reviewer
+    /// cannot smuggle in a plan via this route. The 403 (not 401)
+    /// distinguishes "authenticated but role doesn't permit" from
+    /// "not the run owner."
+    #[tokio::test]
+    async fn plan_submission_rejects_review_stage_run() {
+        let github = MockServer::start().await;
+        let state = make_broker_state(&github);
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+        open_audit_session(&state, session.session_id());
+        let run_id = record_run_at_stage(
+            &state,
+            session.session_id(),
+            crate::agent_plan::Stage::Review,
+        );
+        let service = plan_service_for_test(&state);
+
+        let response =
+            handle_plan_submission(&session, submission_body(run_id, "# Plan body"), service).await;
+
+        assert_eq!(response.status, VmHttpStatus::Forbidden);
+        let message = std::str::from_utf8(&response.body).unwrap();
+        assert!(
+            message.contains("review") && message.contains("submit_plan"),
+            "unexpected body: {message}",
+        );
+        // Nothing landed in the audit log.
+        assert!(
+            state
+                .audit
+                .list_plans_for_session(session.session_id())
+                .unwrap()
+                .is_empty(),
+        );
+    }
+
+    /// Same gate applies to the default `execute` stage — the
+    /// historical pre-pipeline shape. A run that does not opt into
+    /// `--stage plan` cannot submit a plan.
+    #[tokio::test]
+    async fn plan_submission_rejects_execute_stage_run() {
+        let github = MockServer::start().await;
+        let state = make_broker_state(&github);
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+        open_audit_session(&state, session.session_id());
+        let run_id = record_run_at_stage(
+            &state,
+            session.session_id(),
+            crate::agent_plan::Stage::Execute,
+        );
+        let service = plan_service_for_test(&state);
+
+        let response =
+            handle_plan_submission(&session, submission_body(run_id, "# Plan body"), service).await;
+
+        assert_eq!(response.status, VmHttpStatus::Forbidden);
+        let message = std::str::from_utf8(&response.body).unwrap();
+        assert!(
+            message.contains("execute") && message.contains("submit_plan"),
+            "unexpected body: {message}",
+        );
+        assert!(
+            state
+                .audit
+                .list_plans_for_session(session.session_id())
+                .unwrap()
+                .is_empty(),
+        );
     }
 
     #[tokio::test]
