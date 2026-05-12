@@ -436,7 +436,7 @@ mod tests {
     }
 
     /// Regression for the body-limit budget: a maximum-size body packed
-    /// with bytes that JSON expands maximally (`\0` → ` `, 6× per
+    /// with bytes that JSON expands maximally (`\0` → `\u0000`, 6× per
     /// byte) must still be admitted. The route's `Limited::collect` cap
     /// gates on *encoded* bytes, so a tight `MAX_PLAN_BODY_BYTES + small
     /// envelope` budget would reject this even though `PlanBody::try_new`
