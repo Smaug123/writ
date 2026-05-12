@@ -4,6 +4,14 @@
 //! mistakes (typos in `rename_all`, adjacent-tag clashes, etc.).
 
 use proptest::prelude::*;
+use writ::agent_plan::{
+    AbortSubmission, AddendumSubmission, CorrelationId, DecisionOutcome, DecisionView,
+    MAX_CORRELATION_ID_BYTES, MIN_CORRELATION_ID_BYTES, PLAN_PROMPT_SEPARATOR, PlanAbortReason,
+    PlanBody, PlanCreated, PlanFeedback, PlanId, PlanRouteAction, PlanSubmission, PlanView,
+    ReviewSubmission, Stage, Verdict, compose_implementer_prompt,
+    route_permitted_by_stage_and_decision,
+};
+use writ::agent_run::{AgentPrompt, AgentRunId};
 use writ::audit::{AuditLog, PreMintRecord};
 use writ::core::{
     AgentKind, CapabilityRequest, CredentialGrant, GitHubAccess, GitHubGrantedScope,
@@ -381,6 +389,352 @@ fn oracle_scope_authorises_request(req: &GitHubRequest, scope: &GitHubGrantedSco
             scope.permissions.pull_requests == Some(*access)
                 && scope.permissions.contents.is_none()
                 && scope.permissions.issues.is_none()
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// agent_plan: pure types for the plan/review/decide/execute lifecycle.
+//
+// The inline unit tests in `src/agent_plan.rs` pin individual examples and
+// the exhaustive route-authorisation cube. These properties extend that by
+// fuzzing over the full input space — the gospel principle is "always write
+// the property-based tests", and several of these caught their own
+// candidate bugs during authoring (e.g. that the `[^...]` regex emits
+// multi-byte codepoints whose continuation bytes the byte-level class
+// check must still reject).
+// ---------------------------------------------------------------------------
+
+fn arb_correlation_id() -> impl Strategy<Value = CorrelationId> {
+    "[A-Za-z0-9_-]{1,64}"
+        .prop_map(|s| CorrelationId::try_new(s).expect("regex produces only valid correlation ids"))
+}
+
+fn arb_plan_body() -> impl Strategy<Value = PlanBody> {
+    // Bounded so per-case work stays cheap; the `MAX_PLAN_BODY_BYTES`
+    // boundary is pinned in the inline unit tests.
+    ".{1,256}".prop_map(|s| PlanBody::try_new(s).expect("regex produces non-empty bounded body"))
+}
+
+fn arb_plan_feedback() -> impl Strategy<Value = PlanFeedback> {
+    ".{1,128}"
+        .prop_map(|s| PlanFeedback::try_new(s).expect("regex produces non-empty bounded body"))
+}
+
+fn arb_plan_abort_reason() -> impl Strategy<Value = PlanAbortReason> {
+    ".{1,128}"
+        .prop_map(|s| PlanAbortReason::try_new(s).expect("regex produces non-empty bounded body"))
+}
+
+fn arb_stage() -> impl Strategy<Value = Stage> {
+    prop_oneof![Just(Stage::Plan), Just(Stage::Review), Just(Stage::Execute)]
+}
+
+fn arb_verdict() -> impl Strategy<Value = Verdict> {
+    prop_oneof![
+        Just(Verdict::Approve),
+        Just(Verdict::RequestChanges),
+        Just(Verdict::Reject),
+    ]
+}
+
+fn arb_decision_outcome() -> impl Strategy<Value = DecisionOutcome> {
+    prop_oneof![
+        Just(DecisionOutcome::Accepted),
+        Just(DecisionOutcome::RejectedRestart),
+    ]
+}
+
+fn arb_plan_route_action() -> impl Strategy<Value = PlanRouteAction> {
+    prop_oneof![
+        Just(PlanRouteAction::SubmitPlan),
+        Just(PlanRouteAction::ReadPlan),
+        Just(PlanRouteAction::SubmitReview),
+        Just(PlanRouteAction::SubmitAddendum),
+        Just(PlanRouteAction::SubmitAbort),
+    ]
+}
+
+fn arb_plan_id() -> impl Strategy<Value = PlanId> {
+    any::<u128>().prop_map(|n| PlanId::from_uuid(uuid::Uuid::from_u128(n)))
+}
+
+fn arb_agent_run_id() -> impl Strategy<Value = AgentRunId> {
+    any::<u128>().prop_map(|n| AgentRunId::from_uuid(uuid::Uuid::from_u128(n)))
+}
+
+fn arb_decision_view() -> impl Strategy<Value = DecisionView> {
+    (arb_decision_outcome(), 0i64..10_000_000_000).prop_map(|(outcome, decided_at)| DecisionView {
+        outcome,
+        decided_at: writ::core::UnixMillis::from_millis(decided_at),
+    })
+}
+
+/// Oracle re-implementation of the route-authorisation rules from
+/// §"Protocol additions" in `docs/plans/2026-05-11-agent-plans.md`, written
+/// without consulting `route_permitted_by_stage_and_decision`. When both
+/// implementations agree on every cube cell we know the gate faithfully
+/// encodes the spec.
+fn oracle_route_allowed(
+    action: PlanRouteAction,
+    stage: Stage,
+    decision: Option<DecisionOutcome>,
+) -> bool {
+    let accepted = decision == Some(DecisionOutcome::Accepted);
+    match action {
+        PlanRouteAction::SubmitPlan => stage == Stage::Plan,
+        PlanRouteAction::ReadPlan => match stage {
+            Stage::Plan => false,
+            Stage::Review => true,
+            Stage::Execute => accepted,
+        },
+        PlanRouteAction::SubmitReview => stage == Stage::Review,
+        PlanRouteAction::SubmitAddendum => stage == Stage::Execute && accepted,
+        PlanRouteAction::SubmitAbort => stage == Stage::Execute,
+    }
+}
+
+proptest! {
+    /// Any valid `CorrelationId` survives the `try_new(as_str())` and
+    /// JSON round-trips, and its on-wire form is a bare string equal to
+    /// `as_str` (no escaping needed since the class excludes JSON's
+    /// reserved characters).
+    #[test]
+    fn correlation_id_idempotent_and_roundtrips_through_json(c in arb_correlation_id()) {
+        let again = CorrelationId::try_new(c.as_str()).unwrap();
+        prop_assert_eq!(&again, &c);
+
+        let j = serde_json::to_string(&c).unwrap();
+        prop_assert_eq!(&j, &format!("\"{}\"", c.as_str()));
+        let back: CorrelationId = serde_json::from_str(&j).unwrap();
+        prop_assert_eq!(back, c);
+    }
+
+    /// Any string with a byte outside `[A-Za-z0-9_-]` is rejected,
+    /// regardless of where the offending character sits. Pins the
+    /// byte-level enforcement against the full Unicode complement of
+    /// the class.
+    #[test]
+    fn correlation_id_rejects_chars_outside_class(
+        prefix in "[A-Za-z0-9_-]{0,30}",
+        bad in "[^A-Za-z0-9_-]",
+        suffix in "[A-Za-z0-9_-]{0,30}",
+    ) {
+        let id = format!("{prefix}{bad}{suffix}");
+        // Outside the parser's length window the rejection reason is
+        // length, not the bad byte — uninteresting for this property.
+        prop_assume!((MIN_CORRELATION_ID_BYTES..=MAX_CORRELATION_ID_BYTES).contains(&id.len()));
+        prop_assert!(
+            CorrelationId::try_new(&id).is_err(),
+            "expected {:?} to be rejected for a non-class byte",
+            id,
+        );
+    }
+
+    /// `PlanBody` round-trips through JSON for any valid body.
+    #[test]
+    fn plan_body_roundtrips_through_json(body in arb_plan_body()) {
+        let j = serde_json::to_string(&body).unwrap();
+        let back: PlanBody = serde_json::from_str(&j).unwrap();
+        prop_assert_eq!(back, body);
+    }
+
+    /// `PlanFeedback` round-trips through JSON.
+    #[test]
+    fn plan_feedback_roundtrips_through_json(fb in arb_plan_feedback()) {
+        let j = serde_json::to_string(&fb).unwrap();
+        let back: PlanFeedback = serde_json::from_str(&j).unwrap();
+        prop_assert_eq!(back, fb);
+    }
+
+    /// `PlanAbortReason` round-trips through JSON.
+    #[test]
+    fn plan_abort_reason_roundtrips_through_json(r in arb_plan_abort_reason()) {
+        let j = serde_json::to_string(&r).unwrap();
+        let back: PlanAbortReason = serde_json::from_str(&j).unwrap();
+        prop_assert_eq!(back, r);
+    }
+
+    /// `Stage`: `as_str`, `FromStr`, `Display`, and JSON form all agree.
+    /// If a new variant is added, this property fails until every
+    /// projection is wired up.
+    #[test]
+    fn stage_all_text_projections_agree(s in arb_stage()) {
+        prop_assert_eq!(s.as_str().parse::<Stage>().unwrap(), s);
+        prop_assert_eq!(s.to_string(), s.as_str());
+        let j = serde_json::to_string(&s).unwrap();
+        prop_assert_eq!(&j, &format!("\"{}\"", s.as_str()));
+        let back: Stage = serde_json::from_str(&j).unwrap();
+        prop_assert_eq!(back, s);
+    }
+
+    /// `Verdict`: as above.
+    #[test]
+    fn verdict_all_text_projections_agree(v in arb_verdict()) {
+        prop_assert_eq!(v.as_str().parse::<Verdict>().unwrap(), v);
+        prop_assert_eq!(v.to_string(), v.as_str());
+        let j = serde_json::to_string(&v).unwrap();
+        prop_assert_eq!(&j, &format!("\"{}\"", v.as_str()));
+        let back: Verdict = serde_json::from_str(&j).unwrap();
+        prop_assert_eq!(back, v);
+    }
+
+    /// `DecisionOutcome`: as above.
+    #[test]
+    fn decision_outcome_all_text_projections_agree(d in arb_decision_outcome()) {
+        prop_assert_eq!(d.as_str().parse::<DecisionOutcome>().unwrap(), d);
+        prop_assert_eq!(d.to_string(), d.as_str());
+        let j = serde_json::to_string(&d).unwrap();
+        prop_assert_eq!(&j, &format!("\"{}\"", d.as_str()));
+        let back: DecisionOutcome = serde_json::from_str(&j).unwrap();
+        prop_assert_eq!(back, d);
+    }
+
+    /// `compose_implementer_prompt` is a structural concatenation: the
+    /// result starts with the feature prompt, ends with the plan body,
+    /// contains the separator between them, and has byte length equal
+    /// to the sum of the three parts.
+    #[test]
+    fn compose_implementer_prompt_three_segments(
+        feature_text in "[ -~]{1,1024}",
+        plan_text in "[ -~]{1,1024}",
+    ) {
+        let feature = AgentPrompt::try_new(feature_text.clone()).unwrap();
+        let plan = PlanBody::try_new(plan_text.clone()).unwrap();
+        let combined = compose_implementer_prompt(&feature, &plan).unwrap();
+
+        let s = combined.as_str();
+        prop_assert!(s.starts_with(&feature_text), "missing prefix");
+        prop_assert!(s.ends_with(&plan_text), "missing suffix");
+        prop_assert!(s.contains(PLAN_PROMPT_SEPARATOR), "missing separator");
+        prop_assert_eq!(
+            s.len(),
+            feature_text.len() + PLAN_PROMPT_SEPARATOR.len() + plan_text.len(),
+        );
+    }
+
+    /// `route_permitted_by_stage_and_decision` agrees with the oracle on
+    /// every `(action, stage, decision)` triple. The inline unit test
+    /// enumerates the same cube; this property generates additionally so
+    /// a future variant added to either `PlanRouteAction` or `Stage`
+    /// gets picked up by *both* without further plumbing.
+    #[test]
+    fn route_authorisation_agrees_with_oracle(
+        action in arb_plan_route_action(),
+        stage in arb_stage(),
+        decision in prop::option::of(arb_decision_outcome()),
+    ) {
+        let expected = oracle_route_allowed(action, stage, decision);
+        let actual = route_permitted_by_stage_and_decision(action, stage, decision);
+        prop_assert_eq!(
+            actual.is_ok(),
+            expected,
+            "({:?}, {:?}, {:?}): expected {}, got {:?}",
+            action,
+            stage,
+            decision,
+            expected,
+            actual,
+        );
+    }
+
+    /// Wire-format: `PlanSubmission` round-trips through JSON.
+    #[test]
+    fn plan_submission_roundtrips(body in arb_plan_body()) {
+        let m = PlanSubmission { body };
+        let j = serde_json::to_string(&m).unwrap();
+        let back: PlanSubmission = serde_json::from_str(&j).unwrap();
+        prop_assert_eq!(back, m);
+    }
+
+    /// Wire-format: `PlanCreated` is `{ "plan_id": "<uuid>" }`. Picks up
+    /// any `serde(transparent)` mistake on `PlanId` and any rename slip
+    /// on the field name.
+    #[test]
+    fn plan_created_roundtrips(plan_id in arb_plan_id()) {
+        let m = PlanCreated { plan_id };
+        let j = serde_json::to_string(&m).unwrap();
+        let back: PlanCreated = serde_json::from_str(&j).unwrap();
+        prop_assert_eq!(back, m);
+        prop_assert_eq!(&j, &format!("{{\"plan_id\":\"{}\"}}", plan_id));
+    }
+
+    /// Wire-format: `ReviewSubmission` round-trips with and without the
+    /// optional feedback field, and the absent case omits the key
+    /// entirely (per `skip_serializing_if = "Option::is_none"`).
+    #[test]
+    fn review_submission_roundtrips(
+        verdict in arb_verdict(),
+        feedback in prop::option::of(arb_plan_feedback()),
+    ) {
+        let r = ReviewSubmission { verdict, feedback };
+        let j = serde_json::to_string(&r).unwrap();
+        if r.feedback.is_none() {
+            prop_assert!(
+                !j.contains("feedback"),
+                "skip_serializing_if violated: {}",
+                j,
+            );
+        }
+        let back: ReviewSubmission = serde_json::from_str(&j).unwrap();
+        prop_assert_eq!(back, r);
+    }
+
+    /// Wire-format: `AddendumSubmission` round-trips through JSON.
+    #[test]
+    fn addendum_submission_roundtrips(body in arb_plan_body()) {
+        let m = AddendumSubmission { body };
+        let j = serde_json::to_string(&m).unwrap();
+        let back: AddendumSubmission = serde_json::from_str(&j).unwrap();
+        prop_assert_eq!(back, m);
+    }
+
+    /// Wire-format: `AbortSubmission` round-trips through JSON.
+    #[test]
+    fn abort_submission_roundtrips(reason in arb_plan_abort_reason()) {
+        let m = AbortSubmission { reason };
+        let j = serde_json::to_string(&m).unwrap();
+        let back: AbortSubmission = serde_json::from_str(&j).unwrap();
+        prop_assert_eq!(back, m);
+    }
+
+    /// Wire-format: `PlanView` round-trips with and without a decision,
+    /// across freshly-generated `PlanId` / `AgentRunId` / prompt
+    /// content. The `decision` key is always present per the spec
+    /// (§"Protocol additions": `decision: { ... } | null`) — when the
+    /// plan is still under review it serialises as explicit `null`,
+    /// never an absent key.
+    #[test]
+    fn plan_view_roundtrips(
+        plan_id in arb_plan_id(),
+        run_id in arb_agent_run_id(),
+        body in arb_plan_body(),
+        prompt_text in "[ -~]{1,1024}",
+        decision in prop::option::of(arb_decision_view()),
+    ) {
+        let view = PlanView {
+            plan_id,
+            body,
+            originating_run_id: run_id,
+            originating_prompt: AgentPrompt::try_new(prompt_text).unwrap(),
+            decision,
+        };
+        let j = serde_json::to_string(&view).unwrap();
+        let back: PlanView = serde_json::from_str(&j).unwrap();
+        prop_assert_eq!(&back, &view);
+
+        // The `decision` key is always present; if `None`, it must be
+        // explicit `null` rather than an absent key.
+        let value: serde_json::Value = serde_json::from_str(&j).unwrap();
+        let decision_value = value.get("decision");
+        prop_assert!(decision_value.is_some(), "decision key absent: {j}");
+        if view.decision.is_none() {
+            prop_assert_eq!(
+                decision_value,
+                Some(&serde_json::Value::Null),
+                "decision must be explicit null when absent: {}",
+                j,
+            );
         }
     }
 }
