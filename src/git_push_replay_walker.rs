@@ -449,16 +449,32 @@ fn render_trailer_line(source: &TrailerSource, bundle_commit_sha: &GitObjectId) 
 }
 
 /// Does this message end with a paragraph whose every line is a
-/// well-formed trailer? Matches `git interpret-trailers`' "75%
-/// trailer-shaped lines" rule loosely: we require *every* line in
-/// the final paragraph to match, which is stricter, but strict
-/// matches better with the principle that we want to *append* to a
-/// trailer block only when we're certain the last paragraph is one.
+/// well-formed trailer, *separated from earlier content by a blank
+/// line*?
+///
+/// The blank-line separation matters: `git interpret-trailers` only
+/// recognises a trailer block when it is the final paragraph of a
+/// message that has more than one paragraph. A single-paragraph
+/// message — even one whose subject line happens to match trailer
+/// syntax (`Fix: bug`, conventional-commits subjects like
+/// `feat: …`) — is treated as the subject only, with no trailer
+/// block. If we joined the appended trailer to that subject with a
+/// single newline we would produce `Fix: bug\nReplay-from: …` and
+/// `git interpret-trailers --parse` would silently drop the
+/// provenance trailer, defeating the replay traceability contract.
+///
+/// We use stricter "every line must match" matching rather than git's
+/// 75% heuristic so that a near-trailer block (one prose line
+/// followed by trailers) is treated as prose and gets its own
+/// blank-line-separated trailer block on output.
 fn ends_with_trailer_block(message: &str) -> bool {
     let trimmed = message.trim_end_matches('\n');
-    let last_paragraph = match trimmed.rsplit_once("\n\n") {
-        Some((_, last)) => last,
-        None => trimmed,
+    let Some((_, last_paragraph)) = trimmed.rsplit_once("\n\n") else {
+        // No blank-line separator: the whole message is one
+        // paragraph, which `git interpret-trailers` treats as the
+        // subject. Force a new trailer block via the `\n\n` joiner
+        // in the caller.
+        return false;
     };
     if last_paragraph.is_empty() {
         return false;
@@ -704,6 +720,36 @@ mod tests {
             "subject\n\nbody\n\nCo-authored-by: Alice <alice@example.invalid>\n\
              Replay-source: writ-broker\n",
         );
+    }
+
+    /// Regression test: a single-line subject that happens to match
+    /// trailer syntax (e.g. a conventional-commits subject like
+    /// `feat: foo`) is the subject, not a trailer block. The new
+    /// trailer must be separated by a blank line so
+    /// `git interpret-trailers --parse` recognises it.
+    #[test]
+    fn render_message_treats_trailer_shaped_subject_as_subject_not_trailer_block() {
+        let bundle = sample_object_id('a');
+        let trailer = TrailerSource::OriginalCommitSha {
+            key: TrailerKey::new("Replay-from").unwrap(),
+        };
+        let out = render_replay_message("Fix: bug\n", &[trailer], &bundle);
+        // Blank line between subject and the appended trailer block:
+        // git's parser requires this separation, and our walker has
+        // to honour it or replayed commits lose their provenance
+        // trailer to the parser.
+        assert_eq!(
+            out,
+            format!("Fix: bug\n\nReplay-from: {}\n", bundle.as_str())
+        );
+    }
+
+    #[test]
+    fn trailer_block_detection_rejects_single_paragraph_message() {
+        // Even though the line itself matches trailer syntax, with
+        // no blank-line separation there is no trailer block to
+        // append to — git treats this as a subject.
+        assert!(!message_ends_with_trailer_block("Fix: bug\n"));
     }
 
     #[test]
