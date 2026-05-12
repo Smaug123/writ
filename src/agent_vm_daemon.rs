@@ -614,6 +614,7 @@ impl AgentVmDaemon {
         agent_model: String,
         workspace: AgentVmWorkspaceBootstrap,
         prompt: AgentPrompt,
+        stage: Stage,
         correlation_id: Option<CorrelationId>,
     ) -> Result<AgentRunStarted, AgentVmDaemonError> {
         let session_id = SessionId::new();
@@ -642,7 +643,7 @@ impl AgentVmDaemon {
                     agent_kind,
                     prompt: prompt.summary(),
                     correlation_id: correlation_id.clone(),
-                    stage: Stage::Execute,
+                    stage,
                 })?;
                 let agent_runs = VmHttpAgentRunService::new(
                     Arc::clone(&state),
