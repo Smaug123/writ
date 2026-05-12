@@ -12,7 +12,7 @@
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::agent_plan::{CorrelationId, PlanBody, PlanId, Stage};
+use crate::agent_plan::{CorrelationId, Decider, DecisionOutcome, PlanBody, PlanId, Stage};
 use crate::agent_run::{AgentPrompt, AgentRunId};
 use crate::agent_vm_lifecycle::AgentVmSessionStateStatus;
 use crate::audit::GitPushOutcomeResult;
@@ -298,6 +298,25 @@ pub enum ClientMessage {
     /// with [`ServerMessage::Plan`] on hit and
     /// [`ServerMessage::UnknownPlan`] on miss.
     ShowPlan { plan_id: PlanId },
+    /// Record an operator decision against a plan. The broker writes a
+    /// `plan_decision` audit row and replies with
+    /// [`ServerMessage::PlanDecided`] on success,
+    /// [`ServerMessage::UnknownPlan`] if no such plan exists, or
+    /// [`ServerMessage::PlanAlreadyDecided`] if a prior decision is
+    /// already recorded against this plan id.
+    ///
+    /// `decider` is the human attribution the broker records verbatim
+    /// in the audit row. Today the host CLI sends `cli:$USER`; a future
+    /// orchestrator agent may send its own label. The local socket is
+    /// the trust boundary; the broker doesn't authenticate the value.
+    ///
+    /// Decisions are deliberately cross-session: the planner's session
+    /// may be long since closed when the operator decides.
+    DecidePlan {
+        plan_id: PlanId,
+        outcome: DecisionOutcome,
+        decider: Decider,
+    },
 }
 
 /// A message from the broker to the agent.
@@ -377,11 +396,21 @@ pub enum ServerMessage {
     Plans { plans: Vec<PlanSummary> },
     /// One plan with its verbatim body and joined correlation id.
     Plan { plan: PlanDetail },
-    /// The `plan_id` referenced by [`ClientMessage::ShowPlan`] has no
-    /// row in the audit log. Distinct from [`ServerMessage::Error`] so
-    /// clients can distinguish "no such plan" from a corrupt store or
-    /// IO failure.
+    /// The `plan_id` referenced by [`ClientMessage::ShowPlan`] or
+    /// [`ClientMessage::DecidePlan`] has no row in the audit log.
+    /// Distinct from [`ServerMessage::Error`] so clients can
+    /// distinguish "no such plan" from a corrupt store or IO failure.
     UnknownPlan { plan_id: PlanId },
+    /// Acknowledges [`ClientMessage::DecidePlan`]: the audit row was
+    /// written. Carrying `plan_id` lets the CLI confirm the exact
+    /// plan it asked to decide when scripting against the daemon.
+    PlanDecided { plan_id: PlanId },
+    /// The plan referenced by [`ClientMessage::DecidePlan`] already
+    /// has a recorded operator decision. Distinct from
+    /// [`ServerMessage::UnknownPlan`] and [`ServerMessage::Error`]
+    /// so a replay surfaces as an explicit "already decided" outcome
+    /// rather than a prose error string.
+    PlanAlreadyDecided { plan_id: PlanId },
     /// An internal failure (mint error, audit write failure, agent VM
     /// runtime not configured, …). The agent should surface `message` to
     /// the user and not retry automatically. Outcomes a client may want
@@ -459,6 +488,14 @@ impl std::fmt::Debug for ServerMessage {
             Self::Plan { plan } => f.debug_struct("Plan").field("plan", plan).finish(),
             Self::UnknownPlan { plan_id } => f
                 .debug_struct("UnknownPlan")
+                .field("plan_id", plan_id)
+                .finish(),
+            Self::PlanDecided { plan_id } => f
+                .debug_struct("PlanDecided")
+                .field("plan_id", plan_id)
+                .finish(),
+            Self::PlanAlreadyDecided { plan_id } => f
+                .debug_struct("PlanAlreadyDecided")
                 .field("plan_id", plan_id)
                 .finish(),
             Self::Error { message } => f.debug_struct("Error").field("message", message).finish(),
@@ -1068,6 +1105,42 @@ mod tests {
     }
 
     #[test]
+    fn decide_plan_roundtrips_for_every_outcome() {
+        for outcome in [DecisionOutcome::Accepted, DecisionOutcome::RejectedRestart] {
+            let msg = ClientMessage::DecidePlan {
+                plan_id: sample_plan_id(),
+                outcome,
+                decider: Decider::try_new("cli:alice").unwrap(),
+            };
+            let json = serde_json::to_string(&msg).unwrap();
+            let back: ClientMessage = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, msg);
+            // The decider is on the wire verbatim — no escaping or
+            // type-wrapping in the JSON shape.
+            let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+            assert_eq!(value["decider"], "cli:alice");
+        }
+    }
+
+    #[test]
+    fn plan_decided_roundtrips() {
+        let msg = ServerMessage::PlanDecided {
+            plan_id: sample_plan_id(),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert_eq!(serde_json::from_str::<ServerMessage>(&json).unwrap(), msg);
+    }
+
+    #[test]
+    fn plan_already_decided_roundtrips() {
+        let msg = ServerMessage::PlanAlreadyDecided {
+            plan_id: sample_plan_id(),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert_eq!(serde_json::from_str::<ServerMessage>(&json).unwrap(), msg);
+    }
+
+    #[test]
     fn plan_type_tags() {
         let list: serde_json::Value = serde_json::to_value(ClientMessage::ListPlans {
             correlation_id: None,
@@ -1096,6 +1169,62 @@ mod tests {
         })
         .unwrap();
         assert_eq!(unknown["type"], "unknown_plan");
+
+        let decide: serde_json::Value = serde_json::to_value(ClientMessage::DecidePlan {
+            plan_id: sample_plan_id(),
+            outcome: DecisionOutcome::Accepted,
+            decider: Decider::try_new("cli:alice").unwrap(),
+        })
+        .unwrap();
+        assert_eq!(decide["type"], "decide_plan");
+        assert_eq!(decide["outcome"], "accepted");
+        assert_eq!(decide["decider"], "cli:alice");
+
+        let decided: serde_json::Value = serde_json::to_value(ServerMessage::PlanDecided {
+            plan_id: sample_plan_id(),
+        })
+        .unwrap();
+        assert_eq!(decided["type"], "plan_decided");
+
+        let already: serde_json::Value = serde_json::to_value(ServerMessage::PlanAlreadyDecided {
+            plan_id: sample_plan_id(),
+        })
+        .unwrap();
+        assert_eq!(already["type"], "plan_already_decided");
+    }
+
+    /// `plan_decided` and `plan_already_decided` carry their own type
+    /// tags so a client dispatching on `type` can distinguish a fresh
+    /// decision from a replay without parsing a prose message.
+    #[test]
+    fn plan_decision_outcomes_have_distinct_tags() {
+        let decided: serde_json::Value = serde_json::to_value(ServerMessage::PlanDecided {
+            plan_id: sample_plan_id(),
+        })
+        .unwrap();
+        let already: serde_json::Value = serde_json::to_value(ServerMessage::PlanAlreadyDecided {
+            plan_id: sample_plan_id(),
+        })
+        .unwrap();
+        let unknown: serde_json::Value = serde_json::to_value(ServerMessage::UnknownPlan {
+            plan_id: sample_plan_id(),
+        })
+        .unwrap();
+        let error: serde_json::Value = serde_json::to_value(ServerMessage::Error {
+            message: "internal".into(),
+        })
+        .unwrap();
+        let tags = [
+            decided["type"].clone(),
+            already["type"].clone(),
+            unknown["type"].clone(),
+            error["type"].clone(),
+        ];
+        for (i, a) in tags.iter().enumerate() {
+            for b in tags.iter().skip(i + 1) {
+                assert_ne!(a, b, "expected distinct type tags, got {a} == {b}");
+            }
+        }
     }
 
     /// `unknown_plan` carries its own type tag so a client dispatching
@@ -1450,7 +1579,7 @@ mod tests {
         /// variant, and assert the result fails to parse.
         #[test]
         fn client_message_rejects_unknown_top_level_fields(
-            variant_index in 0usize..12,
+            variant_index in 0usize..13,
             // ASCII-letters-only key, excluded against the union of every
             // variant's known field names below.
             unknown_key in "[a-z]{1,16}",
@@ -1460,6 +1589,7 @@ mod tests {
                 "guest_command", "session_id", "capability", "prompt",
                 "stage", "correlation_id", "plan_id",
                 "request_id", "reason", "operator",
+                "outcome", "decider",
             ];
             prop_assume!(!KNOWN_FIELDS.contains(&unknown_key.as_str()));
 
@@ -1534,6 +1664,11 @@ mod tests {
             },
             11 => ClientMessage::ShowPlan {
                 plan_id: sample_plan_id(),
+            },
+            12 => ClientMessage::DecidePlan {
+                plan_id: sample_plan_id(),
+                outcome: DecisionOutcome::Accepted,
+                decider: Decider::try_new("cli:alice").unwrap(),
             },
             other => unreachable!("variant index out of range: {other}"),
         }
