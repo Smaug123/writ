@@ -20,6 +20,12 @@ use crate::vm_git::GitObjectId;
 
 const ACCEPT_HEADER: &str = "application/vnd.github+json";
 const API_VERSION_HEADER: &str = "2022-11-28";
+/// GitHub's REST API rejects requests without a `User-Agent`. We set
+/// it per-request rather than via `reqwest::ClientBuilder::user_agent`
+/// so a caller that passes in a default-constructed `reqwest::Client`
+/// still produces a working request — this is a protocol requirement,
+/// not a client preference.
+const USER_AGENT_HEADER: &str = "writ/0.1";
 
 /// Authenticated client for one installation's Git Database namespace.
 ///
@@ -106,6 +112,7 @@ impl GitDataClient {
             .bearer_auth(&self.token)
             .header("Accept", ACCEPT_HEADER)
             .header("X-GitHub-Api-Version", API_VERSION_HEADER)
+            .header("User-Agent", USER_AGENT_HEADER)
             .json(&body)
             .send()
             .await?;
@@ -162,6 +169,7 @@ mod tests {
             .and(path("/repos/owner/name/git/blobs"))
             .and(header("Accept", ACCEPT_HEADER))
             .and(header("X-GitHub-Api-Version", API_VERSION_HEADER))
+            .and(header("User-Agent", USER_AGENT_HEADER))
             .and(header("Authorization", "Bearer ghs_fake_token"))
             .and(body_json(json!({
                 "content": encoded,
