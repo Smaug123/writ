@@ -186,10 +186,17 @@ impl GitDataClient {
     /// `parents` may be empty for an initial commit, or hold several
     /// entries for an octopus merge. `author` typically preserves
     /// the bundle commit's authorship; `committer` is the App
-    /// identity, which is what causes GitHub to mark the published
-    /// commit as Verified. The endpoint signs under the App's GPG
-    /// key automatically when the committer matches the App, so the
-    /// `signature` field is not sent.
+    /// identity.
+    ///
+    /// **GitHub does not auto-sign commits created via the Git
+    /// Database API**, even when the committer matches the App
+    /// identity — that auto-signing only applies to the higher-level
+    /// Contents API. If `signature` is `None`, the resulting commit
+    /// publishes with `verification.reason = "unsigned"` and no
+    /// Verified badge. To get Verified, the caller must supply a
+    /// detached PGP/SSH signature over the canonical commit object
+    /// here; producing that signature is the replay walker's
+    /// responsibility, not this client's.
     ///
     /// `message` is forwarded verbatim — the replay layer is
     /// responsible for appending its provenance trailer before this
@@ -197,11 +204,7 @@ impl GitDataClient {
     pub async fn create_commit(
         &self,
         repo: &RepoRef,
-        tree: &GitObjectId,
-        parents: &[GitObjectId],
-        message: &str,
-        author: &CommitIdentity,
-        committer: &CommitIdentity,
+        request: &CommitRequest<'_>,
     ) -> Result<GitObjectId, GitDataError> {
         let url = format!(
             "{}/repos/{}/{}/git/commits",
@@ -210,11 +213,12 @@ impl GitDataClient {
             repo.name,
         );
         let body = CommitCreateBody {
-            message,
-            tree,
-            parents,
-            author: identity_wire(author),
-            committer: identity_wire(committer),
+            message: request.message,
+            tree: request.tree,
+            parents: request.parents,
+            author: identity_wire(request.author),
+            committer: identity_wire(request.committer),
+            signature: request.signature,
         };
         let response = self
             .http
@@ -298,6 +302,28 @@ pub struct CommitIdentity {
     pub date: time::OffsetDateTime,
 }
 
+/// Inputs to [`GitDataClient::create_commit`].
+///
+/// Bundled as a struct so the call site is readable and so adding
+/// optional fields (notably `signature`) does not blow past
+/// clippy's argument-count threshold.
+///
+/// `signature`, when `Some`, must be a detached PGP or SSH
+/// signature over the canonical commit object the API would
+/// construct from the other fields. GitHub validates the signature
+/// against the supplied identities; if it does not match the
+/// commit GitHub assembles, the published commit's
+/// `verification.reason` reflects that mismatch.
+#[derive(Clone, Debug)]
+pub struct CommitRequest<'a> {
+    pub tree: &'a GitObjectId,
+    pub parents: &'a [GitObjectId],
+    pub message: &'a str,
+    pub author: &'a CommitIdentity,
+    pub committer: &'a CommitIdentity,
+    pub signature: Option<&'a str>,
+}
+
 /// Format an `OffsetDateTime` as RFC 3339 truncated to whole seconds.
 ///
 /// GitHub documents `author.date`/`committer.date` as
@@ -357,6 +383,8 @@ struct CommitCreateBody<'a> {
     parents: &'a [GitObjectId],
     author: CommitIdentityWire<'a>,
     committer: CommitIdentityWire<'a>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    signature: Option<&'a str>,
 }
 
 #[derive(serde::Serialize)]
@@ -688,6 +716,23 @@ mod tests {
         }
     }
 
+    fn unsigned_request<'a>(
+        tree: &'a GitObjectId,
+        parents: &'a [GitObjectId],
+        message: &'a str,
+        author: &'a CommitIdentity,
+        committer: &'a CommitIdentity,
+    ) -> CommitRequest<'a> {
+        CommitRequest {
+            tree,
+            parents,
+            message,
+            author,
+            committer,
+            signature: None,
+        }
+    }
+
     #[test]
     fn rfc3339_seconds_drops_subsecond_precision() {
         // The wire format GitHub documents is YYYY-MM-DDTHH:MM:SSZ;
@@ -752,14 +797,11 @@ mod tests {
             .await;
 
         let client = client_against(&server, "ghs_fake_token");
+        let parents = std::slice::from_ref(&parent_sha);
         let got = client
             .create_commit(
                 &sample_repo(),
-                &tree_sha,
-                std::slice::from_ref(&parent_sha),
-                "Fix the thing",
-                &author,
-                &committer,
+                &unsigned_request(&tree_sha, parents, "Fix the thing", &author, &committer),
             )
             .await
             .expect("commit create ok");
@@ -802,7 +844,10 @@ mod tests {
 
         let client = client_against(&server, "ghs_fake_token");
         let got = client
-            .create_commit(&sample_repo(), &tree_sha, &[], "Initial", &ident, &ident)
+            .create_commit(
+                &sample_repo(),
+                &unsigned_request(&tree_sha, &[], "Initial", &ident, &ident),
+            )
             .await
             .expect("initial commit ok");
         assert_eq!(got, returned);
@@ -845,14 +890,11 @@ mod tests {
             .await;
 
         let client = client_against(&server, "ghs_fake_token");
+        let parents = [parent_a, parent_b];
         let got = client
             .create_commit(
                 &sample_repo(),
-                &tree_sha,
-                &[parent_a, parent_b],
-                "Merge branch",
-                &ident,
-                &ident,
+                &unsigned_request(&tree_sha, &parents, "Merge branch", &ident, &ident),
             )
             .await
             .expect("merge commit ok");
@@ -873,15 +915,12 @@ mod tests {
             .await;
 
         let ident = sample_identity("Alice", datetime!(2024-01-15 10:30:45 UTC));
+        let tree = sample_object_id('a');
         let client = client_against(&server, "ghs_fake_token");
         let err = client
             .create_commit(
                 &sample_repo(),
-                &sample_object_id('a'),
-                &[],
-                "msg",
-                &ident,
-                &ident,
+                &unsigned_request(&tree, &[], "msg", &ident, &ident),
             )
             .await
             .expect_err("4xx must surface as ApiError");
@@ -910,15 +949,12 @@ mod tests {
             .await;
 
         let ident = sample_identity("Alice", datetime!(2024-01-15 10:30:45 UTC));
+        let tree = sample_object_id('a');
         let client = client_against(&server, "ghs_fake_token");
         let err = client
             .create_commit(
                 &sample_repo(),
-                &sample_object_id('a'),
-                &[],
-                "msg",
-                &ident,
-                &ident,
+                &unsigned_request(&tree, &[], "msg", &ident, &ident),
             )
             .await
             .expect_err("malformed sha must not be returned silently");
@@ -926,6 +962,106 @@ mod tests {
             matches!(err, GitDataError::Http(_)),
             "GitObjectId rejection surfaces as a transport error: {err:?}",
         );
+    }
+
+    #[tokio::test]
+    async fn create_commit_omits_signature_field_when_none() {
+        // With no signature, the field must be absent from the JSON
+        // body — not present-with-null — so GitHub doesn't reject the
+        // request and the absence is unambiguous on the wire.
+        use time::macros::datetime;
+        let server = MockServer::start().await;
+        let tree_sha = sample_object_id('a');
+        let returned = sample_object_id('b');
+        let ident = sample_identity("Alice", datetime!(2024-01-15 10:30:45 UTC));
+
+        // Strict matcher: the absence of `signature` from this JSON
+        // object means the wire body must not include the key at all.
+        Mock::given(method("POST"))
+            .and(path("/repos/owner/name/git/commits"))
+            .and(body_json(json!({
+                "message": "msg",
+                "tree": tree_sha.as_str(),
+                "parents": [],
+                "author": {
+                    "name": "Alice",
+                    "email": "Alice@example.invalid",
+                    "date": "2024-01-15T10:30:45Z",
+                },
+                "committer": {
+                    "name": "Alice",
+                    "email": "Alice@example.invalid",
+                    "date": "2024-01-15T10:30:45Z",
+                },
+            })))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+                "sha": returned.as_str(),
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = client_against(&server, "ghs_fake_token");
+        client
+            .create_commit(
+                &sample_repo(),
+                &unsigned_request(&tree_sha, &[], "msg", &ident, &ident),
+            )
+            .await
+            .expect("unsigned commit create ok");
+    }
+
+    #[tokio::test]
+    async fn create_commit_forwards_signature_field_when_some() {
+        // Verified commits require a detached signature on the
+        // wire. The wrapper must pass it through verbatim; producing
+        // and validating it is the replay walker's responsibility.
+        use time::macros::datetime;
+        let server = MockServer::start().await;
+        let tree_sha = sample_object_id('a');
+        let returned = sample_object_id('b');
+        let ident = sample_identity("Alice", datetime!(2024-01-15 10:30:45 UTC));
+        let signature = "-----BEGIN PGP SIGNATURE-----\n\nfakeArmoredSignaturePayload\n-----END PGP SIGNATURE-----\n";
+
+        Mock::given(method("POST"))
+            .and(path("/repos/owner/name/git/commits"))
+            .and(body_json(json!({
+                "message": "Signed commit",
+                "tree": tree_sha.as_str(),
+                "parents": [],
+                "author": {
+                    "name": "Alice",
+                    "email": "Alice@example.invalid",
+                    "date": "2024-01-15T10:30:45Z",
+                },
+                "committer": {
+                    "name": "Alice",
+                    "email": "Alice@example.invalid",
+                    "date": "2024-01-15T10:30:45Z",
+                },
+                "signature": signature,
+            })))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+                "sha": returned.as_str(),
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let request = CommitRequest {
+            tree: &tree_sha,
+            parents: &[],
+            message: "Signed commit",
+            author: &ident,
+            committer: &ident,
+            signature: Some(signature),
+        };
+        let client = client_against(&server, "ghs_fake_token");
+        let got = client
+            .create_commit(&sample_repo(), &request)
+            .await
+            .expect("signed commit create ok");
+        assert_eq!(got, returned);
     }
 
     #[test]
