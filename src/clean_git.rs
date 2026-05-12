@@ -152,7 +152,7 @@ pub(crate) fn clean_git_config_env() -> Vec<CleanGitEnv> {
         .collect()
 }
 
-/// Run a Git invocation under the clean environment.
+/// Run a Git invocation under the clean environment, discarding stdout.
 ///
 /// `secret` is the value to bind to each name in `invocation.required_secret_env()`.
 /// It is an invariant violation if the invocation declares secret env vars but
@@ -164,6 +164,38 @@ pub(crate) async fn run_clean_git(
     timeout: Duration,
     secret: Option<&str>,
 ) -> Result<(), CleanGitError> {
+    run_clean_git_inner(invocation, timeout, secret, StdoutMode::Discard)
+        .await
+        .map(|_| ())
+}
+
+/// Run a Git invocation under the clean environment and return the bytes
+/// the child wrote to stdout.
+///
+/// Same hardening as [`run_clean_git`]; the only difference is the stdout
+/// disposition. Use this when the result of the command is encoded in the
+/// child's stdout (e.g. `cat-file -t` returns the object's type), not just
+/// in the exit code.
+pub(crate) async fn run_clean_git_capture_stdout(
+    invocation: &CleanGitInvocation,
+    timeout: Duration,
+    secret: Option<&str>,
+) -> Result<Vec<u8>, CleanGitError> {
+    run_clean_git_inner(invocation, timeout, secret, StdoutMode::Capture).await
+}
+
+#[derive(Copy, Clone)]
+enum StdoutMode {
+    Discard,
+    Capture,
+}
+
+async fn run_clean_git_inner(
+    invocation: &CleanGitInvocation,
+    timeout: Duration,
+    secret: Option<&str>,
+    stdout_mode: StdoutMode,
+) -> Result<Vec<u8>, CleanGitError> {
     debug_assert!(
         invocation.required_secret_env().is_empty() || secret.is_some(),
         "invocation declared required_secret_env but no secret was supplied"
@@ -174,7 +206,10 @@ pub(crate) async fn run_clean_git(
     command.env_clear();
     command.args(invocation.args());
     command.stdin(Stdio::null());
-    command.stdout(Stdio::null());
+    command.stdout(match stdout_mode {
+        StdoutMode::Discard => Stdio::null(),
+        StdoutMode::Capture => Stdio::piped(),
+    });
     command.stderr(Stdio::null());
     command.current_dir(CLEAN_GIT_CURRENT_DIR);
     command.process_group(0);
@@ -192,6 +227,28 @@ pub(crate) async fn run_clean_git(
         .map_err(CleanGitError::Spawn)?;
     let pid = child.id().ok_or(CleanGitError::MissingProcessId)?;
     let pgid = process_group_id(pid)?;
+    // Drain stdout concurrently with the child's lifetime so a child that
+    // writes more than one pipe buffer's worth before we reach `wait()`
+    // cannot stall on a full pipe. The drain task only reaches EOF once
+    // every fd pointing at the write end is closed — that includes any
+    // helper Git forked into the same process group, so we rely on the
+    // group SIGKILL further down to close inherited stdouts when the
+    // leader has exited.
+    let stdout_drain = match stdout_mode {
+        StdoutMode::Discard => None,
+        StdoutMode::Capture => {
+            let mut stdout = child
+                .stdout
+                .take()
+                .expect("stdout was configured as Stdio::piped()");
+            Some(tokio::spawn(async move {
+                use tokio::io::AsyncReadExt;
+                let mut buf = Vec::new();
+                let _ = stdout.read_to_end(&mut buf).await;
+                buf
+            }))
+        }
+    };
     let mut cleanup_guard = ProcessGroupCleanupGuard::new(pgid);
     match wait_for_child_exit_before_reap(pgid, timeout).await? {
         ChildExitObservation::Exited => {
@@ -200,8 +257,12 @@ pub(crate) async fn run_clean_git(
             let status = child.wait().await;
             cleanup_guard.disarm();
             let status = status.map_err(CleanGitError::Wait)?;
+            let stdout_bytes = match stdout_drain {
+                Some(handle) => handle.await.unwrap_or_default(),
+                None => Vec::new(),
+            };
             if status.success() {
-                Ok(())
+                Ok(stdout_bytes)
             } else {
                 Err(CleanGitError::Failed(status))
             }
@@ -210,6 +271,9 @@ pub(crate) async fn run_clean_git(
             cleanup_guard.kill_now()?;
             let _ = child.wait().await;
             cleanup_guard.disarm();
+            if let Some(handle) = stdout_drain {
+                let _ = handle.await;
+            }
             Err(CleanGitError::TimedOut(timeout))
         }
     }

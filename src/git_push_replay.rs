@@ -228,6 +228,8 @@ pub enum GitPushReplayRunError {
         "ingest_bundle was called for a fast-forward replay without the matching GitHub credential secret"
     )]
     MissingSecretForFastForward,
+    #[error("new head object {sha} is type {actual_type:?} in the staging repo, expected commit")]
+    NewHeadNotACommit { sha: String, actual_type: String },
 }
 
 impl GitPushReplayPlan {
@@ -439,25 +441,34 @@ impl GitPushReplayPlan {
         )
     }
 
-    /// The `git rev-parse --verify` invocation that asserts the bundle's
-    /// claimed new tip ended up in the staging repo as a commit object.
+    /// The `git cat-file -t` invocation that asserts the bundle's
+    /// claimed new tip ended up in the staging repo *as a commit
+    /// object*, not as a tag, tree, or blob.
     ///
-    /// The `^{commit}` peel forces the resolution to fail (non-zero
-    /// exit) if the SHA names a tag, tree, or blob rather than a
-    /// commit. Combined with the unbundle step preceding it, this gives
-    /// the postcondition: "[`Self::new_head`] is present in
-    /// `staging.git` and is a commit object," which is the contract the
-    /// per-commit upload stage expects when it starts walking from the
-    /// new tip.
+    /// `cat-file -t <sha>` prints the type of the literal object named
+    /// by `<sha>` ("commit" / "tag" / "tree" / "blob") and does *not*
+    /// peel. The earlier candidate, `rev-parse --verify <sha>^{commit}`,
+    /// would silently accept a tag SHA because `^{commit}` peels the
+    /// annotated tag to its target commit, which would let a bundle
+    /// whose advertised new tip is a tag pass through this gate. The
+    /// per-commit upload stage would then walk from the peeled commit
+    /// while the bundle's metadata SHA stayed pointed at the tag, so
+    /// callers that record `new_head` for replay accounting would have
+    /// a SHA that disagrees with what we actually replayed.
+    ///
+    /// The executor pairs this command with a stdout capture and
+    /// rejects anything other than `"commit"`; missing objects surface
+    /// as a non-zero exit via [`GitPushReplayCommandStep::ResolveNewHead`]
+    /// rather than as a stdout mismatch.
     pub(crate) fn resolve_new_head_command(&self) -> CleanGitInvocation {
         CleanGitInvocation::new(
             self.git_program.clone(),
             [
                 OsString::from("-C"),
                 self.staging_repo.as_os_str().to_os_string(),
-                OsString::from("rev-parse"),
-                OsString::from("--verify"),
-                OsString::from(format!("{}^{{commit}}", self.new_head.as_str())),
+                OsString::from("cat-file"),
+                OsString::from("-t"),
+                OsString::from(self.new_head.as_str()),
             ],
             clean_git_config_env(),
             Vec::new(),
@@ -655,9 +666,12 @@ impl From<std::io::Error> for CreateOrChmodError {
 /// 2. `git bundle unbundle <bundle>` indexes the bundle's pack into the
 ///    staging repo's object database. Refs from the bundle are *not*
 ///    created locally — only the objects.
-/// 3. `git rev-parse --verify <new_head>^{commit}` verifies that the
-///    bundle's advertised new tip is now present in `staging.git` and
-///    is a commit object (not a tag, tree, or blob). This is the
+/// 3. `git cat-file -t <new_head>` verifies that the bundle's
+///    advertised new tip is now present in `staging.git` and is a
+///    commit object (not a tag, tree, or blob). `cat-file -t` does
+///    not peel, so an annotated tag SHA shows up as `"tag"` rather
+///    than passing through silently as `"commit"` like
+///    `rev-parse --verify <sha>^{commit}` would. This is the
 ///    handoff invariant the per-commit upload stage relies on.
 ///
 /// The `secret` argument carries the credential the prereq fetch will
@@ -689,13 +703,36 @@ pub async fn ingest_bundle(
         plan.step_timeout(),
     )
     .await?;
-    run_replay_invocation(
+    let resolve_stdout = run_replay_invocation_capture_stdout(
         GitPushReplayCommandStep::ResolveNewHead,
         &plan.resolve_new_head_command(),
         plan.step_timeout(),
     )
     .await?;
+    verify_new_head_is_commit(plan.new_head(), &resolve_stdout)?;
     Ok(())
+}
+
+/// Decide whether the `cat-file -t <new_head>` stdout names a commit.
+///
+/// `cat-file -t` emits the type followed by a trailing newline; we
+/// trim trailing whitespace before comparing so a future Git change to
+/// the line terminator (e.g. `\r\n` on a Windows build) does not
+/// silently regress to accepting non-commit objects.
+fn verify_new_head_is_commit(
+    new_head: &GitObjectId,
+    stdout: &[u8],
+) -> Result<(), GitPushReplayRunError> {
+    let text = std::str::from_utf8(stdout).unwrap_or("<non-utf8>");
+    let actual = text.trim_end();
+    if actual == "commit" {
+        Ok(())
+    } else {
+        Err(GitPushReplayRunError::NewHeadNotACommit {
+            sha: new_head.as_str().to_string(),
+            actual_type: actual.to_string(),
+        })
+    }
 }
 
 async fn run_replay_invocation(
@@ -715,6 +752,16 @@ async fn run_replay_invocation_with_secret(
     secret: &GitSecretValue,
 ) -> Result<(), GitPushReplayRunError> {
     clean_git::run_clean_git(invocation, timeout, Some(secret.as_str()))
+        .await
+        .map_err(|err| translate_clean_git_error(step, err))
+}
+
+async fn run_replay_invocation_capture_stdout(
+    step: GitPushReplayCommandStep,
+    invocation: &CleanGitInvocation,
+    timeout: Duration,
+) -> Result<Vec<u8>, GitPushReplayRunError> {
+    clean_git::run_clean_git_capture_stdout(invocation, timeout, None)
         .await
         .map_err(|err| translate_clean_git_error(step, err))
 }
@@ -1116,12 +1163,50 @@ mod tests {
             vec![
                 "-C",
                 "/work/staging.git",
-                "rev-parse",
-                "--verify",
-                "cccccccccccccccccccccccccccccccccccccccc^{commit}",
-            ]
+                "cat-file",
+                "-t",
+                "cccccccccccccccccccccccccccccccccccccccc",
+            ],
+            "cat-file -t must be used over rev-parse --verify ^{{commit}} so the resolve step \
+             cannot accept a tag SHA peeled to its target commit",
         );
         assert!(resolve.required_secret_env().is_empty());
+    }
+
+    #[test]
+    fn verify_new_head_is_commit_accepts_commit_with_trailing_newline() {
+        let sha = sample_object_id('a');
+        verify_new_head_is_commit(&sha, b"commit\n").expect("commit\\n must be accepted");
+    }
+
+    #[test]
+    fn verify_new_head_is_commit_rejects_tag() {
+        let sha = sample_object_id('a');
+        let err = verify_new_head_is_commit(&sha, b"tag\n").expect_err(
+            "tag must be rejected so the per-commit upload stage cannot inherit a tag SHA",
+        );
+        match err {
+            GitPushReplayRunError::NewHeadNotACommit {
+                sha: got_sha,
+                actual_type,
+            } => {
+                assert_eq!(got_sha, sample_object_id('a').as_str());
+                assert_eq!(actual_type, "tag");
+            }
+            other => panic!("expected NewHeadNotACommit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn verify_new_head_is_commit_rejects_unexpected_output() {
+        let sha = sample_object_id('a');
+        for raw in [&b""[..], b"blob\n", b"tree\n", b"commit extra\n"] {
+            let err = verify_new_head_is_commit(&sha, raw).expect_err("non-commit output rejected");
+            assert!(matches!(
+                err,
+                GitPushReplayRunError::NewHeadNotACommit { .. }
+            ));
+        }
     }
 
     #[test]
@@ -1284,16 +1369,21 @@ mod tests {
         quoted
     }
 
-    /// Per-subcommand exit codes for [`fake_git_for_replay`]. Each test
-    /// constructs one of these in the shape it needs; defaults keep
-    /// every subcommand happy so flipping one to non-zero is the way
-    /// failure-path tests pin which step the executor reaches.
+    /// Per-subcommand exit codes and stdout shape for
+    /// [`fake_git_for_replay`]. Each test constructs one of these in
+    /// the shape it needs; defaults keep every subcommand happy so
+    /// flipping one to non-zero is the way failure-path tests pin
+    /// which step the executor reaches. `cat_file_type` is the bytes
+    /// fake-git prints for the `cat-file -t <sha>` invocation, so
+    /// tests can drive the executor's "is new_head a commit?" gate
+    /// without rebuilding a real Git object database.
     #[derive(Clone, Copy)]
     struct FakeGitExitCodes {
         init: u8,
         fetch: u8,
         unbundle: u8,
-        rev_parse: u8,
+        cat_file: u8,
+        cat_file_type: &'static str,
     }
 
     impl FakeGitExitCodes {
@@ -1301,7 +1391,8 @@ mod tests {
             init: 0,
             fetch: 0,
             unbundle: 0,
-            rev_parse: 0,
+            cat_file: 0,
+            cat_file_type: "commit",
         };
     }
 
@@ -1315,8 +1406,10 @@ mod tests {
     ///   plus the `GIT_ASKPASS` / token env vars so the credential
     ///   wiring can be asserted.
     /// * `-C <staging> bundle unbundle <bundle>` — records the argv.
-    /// * `-C <staging> rev-parse --verify <sha>^{commit}` — records
-    ///   the argv.
+    /// * `-C <staging> cat-file -t <sha>` — records the argv and
+    ///   prints `exits.cat_file_type` on stdout so the executor's
+    ///   commit-type gate can be exercised without a real object
+    ///   database.
     ///
     /// Each subcommand exits with the corresponding `exits.<step>`,
     /// which lets the same script back both happy-path and per-step
@@ -1364,10 +1457,11 @@ case "$1" in
                 [ "$4" = "unbundle" ]
                 exit {unbundle}
                 ;;
-            rev-parse)
-                log_line "rev-parse $*"
-                [ "$4" = "--verify" ]
-                exit {rev_parse}
+            cat-file)
+                log_line "cat-file $*"
+                [ "$4" = "-t" ]
+                printf '%s\n' '{cat_file_type}'
+                exit {cat_file}
                 ;;
             *)
                 printf 'fake-git: unexpected -C subcommand: %s\n' "$3" >&2
@@ -1388,7 +1482,8 @@ esac
             init = exits.init,
             fetch = exits.fetch,
             unbundle = exits.unbundle,
-            rev_parse = exits.rev_parse,
+            cat_file = exits.cat_file,
+            cat_file_type = exits.cat_file_type,
         );
         std::fs::write(&git, script).unwrap();
         std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -1526,13 +1621,13 @@ esac
         let lines: Vec<&str> = body.lines().collect();
         let staging_display = plan.staging_repo().display().to_string();
         let bundle_display = plan.bundle_path().display().to_string();
-        let resolve_arg = format!("{}^{{commit}}", plan.new_head().as_str());
+        let resolve_arg = plan.new_head().as_str().to_string();
         assert_eq!(
             lines,
             vec![
                 format!("init init --bare --quiet -- {staging_display}"),
                 format!("bundle -C {staging_display} bundle unbundle {bundle_display}"),
-                format!("rev-parse -C {staging_display} rev-parse --verify {resolve_arg}"),
+                format!("cat-file -C {staging_display} cat-file -t {resolve_arg}"),
             ],
             "branch-creation must skip the fetch step: log={body:?}",
         );
@@ -1551,7 +1646,7 @@ esac
         let body = std::fs::read_to_string(&log).unwrap();
         let staging_display = plan.staging_repo().display().to_string();
         let bundle_display = plan.bundle_path().display().to_string();
-        let resolve_arg = format!("{}^{{commit}}", plan.new_head().as_str());
+        let resolve_arg = plan.new_head().as_str().to_string();
         let refspec = format!("+aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:{REPLAY_PREREQ_REF}");
         // The fetch step logs two lines (argv + env), so we filter to
         // just the argv lines for ordering, then check env presence
@@ -1570,7 +1665,7 @@ esac
                      --depth=1 -- https://github.com/owner/name.git {refspec}"
                 ),
                 format!("bundle -C {staging_display} bundle unbundle {bundle_display}"),
-                format!("rev-parse -C {staging_display} rev-parse --verify {resolve_arg}"),
+                format!("cat-file -C {staging_display} cat-file -t {resolve_arg}"),
             ],
             "fast-forward sequence (init+fetch+unbundle+resolve) must match: log={body:?}",
         );
@@ -1649,7 +1744,7 @@ esac
         let (_log, result, _plan) = prepare_then_ingest(
             &dir,
             FakeGitExitCodes {
-                rev_parse: 5,
+                cat_file: 5,
                 ..FakeGitExitCodes::ALL_SUCCESS
             },
             ReplayTarget::BranchCreation,
@@ -1661,6 +1756,32 @@ esac
                 assert_eq!(step, GitPushReplayCommandStep::ResolveNewHead);
             }
             other => panic!("expected Failed at ResolveNewHead, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn ingest_bundle_rejects_new_head_that_is_a_tag_object() {
+        // Regression for the rev-parse-with-^{commit}-peeling gap: if
+        // the bundle's advertised new tip names an annotated tag, the
+        // executor must surface that as a typed error rather than let
+        // the per-commit upload stage walk from the peeled commit.
+        let dir = TempDir::new().unwrap();
+        let (_log, result, plan) = prepare_then_ingest(
+            &dir,
+            FakeGitExitCodes {
+                cat_file_type: "tag",
+                ..FakeGitExitCodes::ALL_SUCCESS
+            },
+            ReplayTarget::BranchCreation,
+            None,
+        )
+        .await;
+        match result.expect_err("tag new_head must be rejected") {
+            GitPushReplayRunError::NewHeadNotACommit { sha, actual_type } => {
+                assert_eq!(sha, plan.new_head().as_str());
+                assert_eq!(actual_type, "tag");
+            }
+            other => panic!("expected NewHeadNotACommit, got {other:?}"),
         }
     }
 }
