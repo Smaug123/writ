@@ -1,4 +1,4 @@
-//! Staged-push replay: planning and staging-repo preparation.
+//! Staged-push replay: planning and staging-repo bring-up.
 //!
 //! Replay re-creates every commit between an upstream branch tip and a
 //! VM-supplied bundle tip via the GitHub `blobs`/`trees`/`commits` REST
@@ -6,22 +6,39 @@
 //! the Verified badge while preserving provenance back to the bundle.
 //!
 //! This module owns the inert plan description ([`GitPushReplayPlan`],
-//! [`TrailerSource`]) plus the first executor slice: [`prepare_staging_repo`]
-//! creates a fresh bare repository with mode `0o700` ownership, ready to
-//! receive the bundle objects. Bundle ingestion itself (which must first
-//! seed any prerequisite commit referenced via `--not <expected>` from
-//! origin) lives in a follow-up commit, as do the per-commit GitHub
-//! upload, the merge-base walk, and the ref update.
+//! [`ReplayTarget`], [`TrailerSource`]) and the staging-repo bring-up
+//! executors:
+//!
+//! * [`prepare_staging_repo`] creates a fresh bare repository with mode
+//!   `0o700` ownership, ready to receive the bundle objects.
+//! * [`ingest_bundle`] seeds any prerequisite commit referenced by the
+//!   bundle (when the agent's bundle was created with
+//!   `--not <expected_remote_head>`), runs `git bundle unbundle`, and
+//!   then verifies that the bundle's claimed new tip is present in the
+//!   staging repo as a commit object.
+//!
+//! Per-commit GitHub upload, the merge-base walk, and the final ref
+//! update live in later commits.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 use std::time::Duration;
 
-use crate::clean_git::{self, CleanGitError, CleanGitInvocation, clean_git_config_env};
+use crate::clean_git::{
+    self, CleanGitEnv, CleanGitError, CleanGitInvocation, clean_git_config_env,
+};
 use crate::vm_git::{GitBranchName, GitCloneRepo, GitObjectId};
+use crate::vm_git_bundle::{GitCloneBaseUrl, GitCredentialBoundary, GitSecretValue};
 
 const REPLAY_BARE_REPO_MODE: u32 = 0o700;
+
+/// Local ref under which the bundle's prerequisite commit is parked after
+/// the prereq fetch. Naming is namespaced to `refs/replay/` so it cannot
+/// collide with anything the bundle itself defines, and anchoring the
+/// prereq as a ref prevents accidental GC of the just-fetched object
+/// before [`ingest_bundle`] finishes the unbundle step.
+const REPLAY_PREREQ_REF: &str = "refs/replay/prereq";
 
 /// A complete description of one replay operation: where the bundle lives
 /// on disk, the bare repository the bundle will be ingested into, the
@@ -35,10 +52,40 @@ pub struct GitPushReplayPlan {
     staging_repo: PathBuf,
     repo: GitCloneRepo,
     branch: GitBranchName,
-    expected_remote_head: Option<GitObjectId>,
+    target: ReplayTarget,
     new_head: GitObjectId,
     trailers: Vec<TrailerSource>,
     step_timeout: Duration,
+}
+
+/// What kind of replay this is.
+///
+/// `BranchCreation` means the branch does not yet exist on GitHub: the
+/// agent's bundle was built without `--not <tip>` and therefore has no
+/// prerequisite commit. Ingestion just unbundles into the empty staging
+/// repo; no fetch is needed and no credential material is required for
+/// this stage.
+///
+/// `FastForward` means the branch already exists at
+/// `expected_remote_head`: the agent's bundle was built with
+/// `--not <expected_remote_head>`, so the bundle declares that SHA as a
+/// prerequisite and `git bundle unbundle` will refuse to operate until
+/// the commit is present in the staging repo. Ingestion first fetches
+/// the prereq from origin under the supplied credential boundary, parks
+/// it under [`REPLAY_PREREQ_REF`], then unbundles.
+///
+/// The pairing of "expected_remote_head implies fetch credentials" is
+/// encoded structurally so the executor cannot be handed a fast-forward
+/// plan that is missing credentials, and a branch-creation plan cannot
+/// carry credentials it would never use.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ReplayTarget {
+    BranchCreation,
+    FastForward {
+        expected_remote_head: GitObjectId,
+        credential: GitCredentialBoundary,
+        clone_base_url: GitCloneBaseUrl,
+    },
 }
 
 /// One trailer to append to every replayed commit. Two shapes:
@@ -81,6 +128,9 @@ pub struct TrailerValue(String);
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum GitPushReplayCommandStep {
     InitBareRepo,
+    FetchPrereq,
+    UnbundleObjects,
+    ResolveNewHead,
 }
 
 #[derive(Debug, thiserror::Error, Eq, PartialEq)]
@@ -174,6 +224,10 @@ pub enum GitPushReplayRunError {
         pgid: libc::pid_t,
         source: std::io::Error,
     },
+    #[error(
+        "ingest_bundle was called for a fast-forward replay without the matching GitHub credential secret"
+    )]
+    MissingSecretForFastForward,
 }
 
 impl GitPushReplayPlan {
@@ -184,7 +238,7 @@ impl GitPushReplayPlan {
         staging_repo: impl Into<PathBuf>,
         repo: GitCloneRepo,
         branch: GitBranchName,
-        expected_remote_head: Option<GitObjectId>,
+        target: ReplayTarget,
         new_head: GitObjectId,
         trailers: Vec<TrailerSource>,
         step_timeout: Duration,
@@ -209,7 +263,7 @@ impl GitPushReplayPlan {
             staging_repo,
             repo,
             branch,
-            expected_remote_head,
+            target,
             new_head,
             trailers,
             step_timeout,
@@ -236,11 +290,21 @@ impl GitPushReplayPlan {
         &self.branch
     }
 
+    pub fn target(&self) -> &ReplayTarget {
+        &self.target
+    }
+
     /// `None` means the replay is *creating* the branch on GitHub rather
     /// than fast-forwarding it. Walks from the merge-base with the
     /// repository's default branch instead of from a known parent tip.
     pub fn expected_remote_head(&self) -> Option<&GitObjectId> {
-        self.expected_remote_head.as_ref()
+        match &self.target {
+            ReplayTarget::BranchCreation => None,
+            ReplayTarget::FastForward {
+                expected_remote_head,
+                ..
+            } => Some(expected_remote_head),
+        }
     }
 
     pub fn new_head(&self) -> &GitObjectId {
@@ -267,6 +331,133 @@ impl GitPushReplayPlan {
                 OsString::from("--quiet"),
                 OsString::from("--"),
                 self.staging_repo.as_os_str().to_os_string(),
+            ],
+            clean_git_config_env(),
+            Vec::new(),
+        )
+    }
+
+    /// The `git fetch` invocation that seeds the bundle's prerequisite
+    /// commit from origin.
+    ///
+    /// Returns `None` in branch-creation mode: the bundle then has no
+    /// declared prereqs and `git bundle unbundle` will succeed against
+    /// the empty staging repo without a network round trip.
+    ///
+    /// In fast-forward mode the argv is:
+    ///
+    /// ```text
+    /// git -c credential.helper= -c credential.useHttpPath=true \
+    ///     -C <staging> \
+    ///     fetch --no-tags --no-write-fetch-head --quiet --depth=1 \
+    ///     -- <https-url> +<expected-sha>:refs/replay/prereq
+    /// ```
+    ///
+    /// * `credential.helper=` first clears the global helper chain so a
+    ///   pre-existing system or user helper cannot inject creds. The
+    ///   process env is already stripped, but Git's config search
+    ///   includes the repo we just `git init`-ed and any per-repo
+    ///   `.git/config` it shipped with (which the prepare step did not
+    ///   write, but defending here is cheap).
+    /// * `credential.useHttpPath=true` scopes any helper the env *does*
+    ///   provide to the exact repo URL rather than the bare host.
+    /// * `--depth=1` keeps the fetch to exactly the prereq commit — the
+    ///   bundle's prereq check only needs that one object present.
+    /// * `--no-write-fetch-head` avoids dropping a `FETCH_HEAD` file in
+    ///   the staging repo, which would surface a phantom ref to the
+    ///   later steps.
+    /// * `+<sha>:refs/replay/prereq` parks the commit under a namespaced
+    ///   ref so it cannot be GC'd before `bundle unbundle` runs and
+    ///   cannot collide with any ref the bundle defines.
+    ///
+    /// The credential token is declared via [`CleanGitInvocation`]'s
+    /// `required_secret_env`; [`ingest_bundle`] supplies the value at
+    /// run time via [`clean_git::run_clean_git`]'s secret slot, and the
+    /// `GIT_ASKPASS` env entry points Git at the broker's askpass
+    /// sidecar which echoes that value to Git on demand.
+    pub(crate) fn fetch_prereq_command(&self) -> Option<CleanGitInvocation> {
+        let ReplayTarget::FastForward {
+            expected_remote_head,
+            credential,
+            clone_base_url,
+        } = &self.target
+        else {
+            return None;
+        };
+        let url = clone_base_url.repo_url(&self.repo);
+        let refspec = format!("+{}:{}", expected_remote_head.as_str(), REPLAY_PREREQ_REF,);
+        let mut env = clean_git_config_env();
+        env.push(CleanGitEnv::new("GIT_TERMINAL_PROMPT", "0"));
+        env.push(CleanGitEnv::new(
+            "GIT_ASKPASS",
+            credential.askpass_program().display().to_string(),
+        ));
+        Some(CleanGitInvocation::new(
+            self.git_program.clone(),
+            [
+                OsString::from("-c"),
+                OsString::from("credential.helper="),
+                OsString::from("-c"),
+                OsString::from("credential.useHttpPath=true"),
+                OsString::from("-C"),
+                self.staging_repo.as_os_str().to_os_string(),
+                OsString::from("fetch"),
+                OsString::from("--no-tags"),
+                OsString::from("--no-write-fetch-head"),
+                OsString::from("--quiet"),
+                OsString::from("--depth=1"),
+                OsString::from("--"),
+                OsString::from(url),
+                OsString::from(refspec),
+            ],
+            env,
+            vec![credential.token_env().as_str().to_string()],
+        ))
+    }
+
+    /// The `git bundle unbundle` invocation that drops the bundle's
+    /// pack into the staging repo's object database.
+    ///
+    /// `bundle unbundle` does not create local refs from the bundle's
+    /// advertised refs — it just indexes the pack and prints them. That
+    /// is exactly what we want: replay walks objects by SHA from
+    /// [`Self::new_head`] downward, and the lack of bundle-derived refs
+    /// in the staging repo means the later GitHub-side ref update
+    /// cannot accidentally use the bundle's exact tip as a ref source.
+    pub(crate) fn unbundle_command(&self) -> CleanGitInvocation {
+        CleanGitInvocation::new(
+            self.git_program.clone(),
+            [
+                OsString::from("-C"),
+                self.staging_repo.as_os_str().to_os_string(),
+                OsString::from("bundle"),
+                OsString::from("unbundle"),
+                self.bundle_path.as_os_str().to_os_string(),
+            ],
+            clean_git_config_env(),
+            Vec::new(),
+        )
+    }
+
+    /// The `git rev-parse --verify` invocation that asserts the bundle's
+    /// claimed new tip ended up in the staging repo as a commit object.
+    ///
+    /// The `^{commit}` peel forces the resolution to fail (non-zero
+    /// exit) if the SHA names a tag, tree, or blob rather than a
+    /// commit. Combined with the unbundle step preceding it, this gives
+    /// the postcondition: "[`Self::new_head`] is present in
+    /// `staging.git` and is a commit object," which is the contract the
+    /// per-commit upload stage expects when it starts walking from the
+    /// new tip.
+    pub(crate) fn resolve_new_head_command(&self) -> CleanGitInvocation {
+        CleanGitInvocation::new(
+            self.git_program.clone(),
+            [
+                OsString::from("-C"),
+                self.staging_repo.as_os_str().to_os_string(),
+                OsString::from("rev-parse"),
+                OsString::from("--verify"),
+                OsString::from(format!("{}^{{commit}}", self.new_head.as_str())),
             ],
             clean_git_config_env(),
             Vec::new(),
@@ -341,6 +532,9 @@ impl std::fmt::Display for GitPushReplayCommandStep {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             GitPushReplayCommandStep::InitBareRepo => f.write_str("init bare repo"),
+            GitPushReplayCommandStep::FetchPrereq => f.write_str("fetch bundle prereq"),
+            GitPushReplayCommandStep::UnbundleObjects => f.write_str("unbundle objects"),
+            GitPushReplayCommandStep::ResolveNewHead => f.write_str("resolve new head"),
         }
     }
 }
@@ -447,12 +641,80 @@ impl From<std::io::Error> for CreateOrChmodError {
     }
 }
 
+/// Drop the bundle's pack into the staging repo's object database and
+/// assert the bundle's claimed new tip lands as a commit object.
+///
+/// Three steps, ordered:
+///
+/// 1. Fetch the bundle's prerequisite commit from origin if the plan is
+///    a fast-forward (`ReplayTarget::FastForward`). `git bundle unbundle`
+///    refuses to operate when a prereq is missing, and the bundle's
+///    prereq is the `--not <expected_remote_head>` SHA the agent's VM
+///    passed to `git bundle create`. Skipped in branch-creation mode,
+///    where the bundle has no prereqs.
+/// 2. `git bundle unbundle <bundle>` indexes the bundle's pack into the
+///    staging repo's object database. Refs from the bundle are *not*
+///    created locally — only the objects.
+/// 3. `git rev-parse --verify <new_head>^{commit}` verifies that the
+///    bundle's advertised new tip is now present in `staging.git` and
+///    is a commit object (not a tag, tree, or blob). This is the
+///    handoff invariant the per-commit upload stage relies on.
+///
+/// The `secret` argument carries the credential the prereq fetch will
+/// send to GitHub. It is required iff `plan.target()` is
+/// [`ReplayTarget::FastForward`]; supplying a secret in branch-creation
+/// mode is ignored. The plan's structural pairing of expected_remote_head
+/// with credentials means there is exactly one shape that admits a secret
+/// and exactly one that does not, so call sites that respect the type
+/// contract cannot get this wrong; if they do anyway, the executor
+/// surfaces it as [`GitPushReplayRunError::MissingSecretForFastForward`]
+/// rather than panicking.
+pub async fn ingest_bundle(
+    plan: &GitPushReplayPlan,
+    secret: Option<&GitSecretValue>,
+) -> Result<(), GitPushReplayRunError> {
+    if let Some(fetch) = plan.fetch_prereq_command() {
+        let secret = secret.ok_or(GitPushReplayRunError::MissingSecretForFastForward)?;
+        run_replay_invocation_with_secret(
+            GitPushReplayCommandStep::FetchPrereq,
+            &fetch,
+            plan.step_timeout(),
+            secret,
+        )
+        .await?;
+    }
+    run_replay_invocation(
+        GitPushReplayCommandStep::UnbundleObjects,
+        &plan.unbundle_command(),
+        plan.step_timeout(),
+    )
+    .await?;
+    run_replay_invocation(
+        GitPushReplayCommandStep::ResolveNewHead,
+        &plan.resolve_new_head_command(),
+        plan.step_timeout(),
+    )
+    .await?;
+    Ok(())
+}
+
 async fn run_replay_invocation(
     step: GitPushReplayCommandStep,
     invocation: &CleanGitInvocation,
     timeout: Duration,
 ) -> Result<(), GitPushReplayRunError> {
     clean_git::run_clean_git(invocation, timeout, None)
+        .await
+        .map_err(|err| translate_clean_git_error(step, err))
+}
+
+async fn run_replay_invocation_with_secret(
+    step: GitPushReplayCommandStep,
+    invocation: &CleanGitInvocation,
+    timeout: Duration,
+    secret: &GitSecretValue,
+) -> Result<(), GitPushReplayRunError> {
+    clean_git::run_clean_git(invocation, timeout, Some(secret.as_str()))
         .await
         .map_err(|err| translate_clean_git_error(step, err))
 }
@@ -534,10 +796,49 @@ mod tests {
         }
     }
 
+    const SAMPLE_TOKEN_ENV: &str = "WRIT_GITHUB_TOKEN";
+    const SAMPLE_TOKEN: &str = "super-secret-token";
+
+    fn sample_credential() -> GitCredentialBoundary {
+        GitCredentialBoundary::new(
+            "/usr/local/libexec/writ-git-askpass",
+            crate::vm_git_bundle::GitSecretEnvVar::new(SAMPLE_TOKEN_ENV).unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn sample_secret() -> GitSecretValue {
+        GitSecretValue::new(SAMPLE_TOKEN).unwrap()
+    }
+
+    fn sample_fast_forward(expected: GitObjectId) -> ReplayTarget {
+        ReplayTarget::FastForward {
+            expected_remote_head: expected,
+            credential: sample_credential(),
+            clone_base_url: GitCloneBaseUrl::github(),
+        }
+    }
+
     fn sample_plan(
         git_program: impl Into<PathBuf>,
         bundle_path: impl Into<PathBuf>,
         staging_repo: impl Into<PathBuf>,
+        new_head: GitObjectId,
+    ) -> GitPushReplayPlan {
+        sample_plan_with_target(
+            git_program,
+            bundle_path,
+            staging_repo,
+            ReplayTarget::BranchCreation,
+            new_head,
+        )
+    }
+
+    fn sample_plan_with_target(
+        git_program: impl Into<PathBuf>,
+        bundle_path: impl Into<PathBuf>,
+        staging_repo: impl Into<PathBuf>,
+        target: ReplayTarget,
         new_head: GitObjectId,
     ) -> GitPushReplayPlan {
         GitPushReplayPlan::new(
@@ -546,7 +847,7 @@ mod tests {
             staging_repo,
             sample_repo(),
             sample_branch(),
-            None,
+            target,
             new_head,
             Vec::new(),
             TEST_STEP_TIMEOUT,
@@ -562,7 +863,7 @@ mod tests {
             "/var/lib/writ/replay/staging.git",
             sample_repo(),
             sample_branch(),
-            Some(sample_object_id('a')),
+            sample_fast_forward(sample_object_id('a')),
             sample_object_id('b'),
             vec![sample_trailer()],
             TEST_STEP_TIMEOUT,
@@ -580,6 +881,7 @@ mod tests {
         assert_eq!(plan.repo(), &sample_repo());
         assert_eq!(plan.branch(), &sample_branch());
         assert_eq!(plan.expected_remote_head(), Some(&sample_object_id('a')));
+        assert!(matches!(plan.target(), ReplayTarget::FastForward { .. }));
         assert_eq!(plan.new_head(), &sample_object_id('b'));
         assert_eq!(plan.trailers().len(), 1);
         assert_eq!(plan.step_timeout(), TEST_STEP_TIMEOUT);
@@ -593,7 +895,7 @@ mod tests {
             "/abs/staging.git",
             sample_repo(),
             sample_branch(),
-            None,
+            ReplayTarget::BranchCreation,
             sample_object_id('e'),
             Vec::new(),
             TEST_STEP_TIMEOUT,
@@ -610,7 +912,7 @@ mod tests {
             "/var/lib/writ/replay/staging.git",
             sample_repo(),
             sample_branch(),
-            None,
+            ReplayTarget::BranchCreation,
             sample_object_id('b'),
             Vec::new(),
             TEST_STEP_TIMEOUT,
@@ -632,7 +934,7 @@ mod tests {
             "relative/staging.git",
             sample_repo(),
             sample_branch(),
-            None,
+            ReplayTarget::BranchCreation,
             sample_object_id('c'),
             Vec::new(),
             TEST_STEP_TIMEOUT,
@@ -655,7 +957,7 @@ mod tests {
             "/var/lib/writ/replay/same",
             sample_repo(),
             sample_branch(),
-            None,
+            ReplayTarget::BranchCreation,
             sample_object_id('d'),
             Vec::new(),
             TEST_STEP_TIMEOUT,
@@ -675,7 +977,7 @@ mod tests {
             "/abs/staging.git",
             sample_repo(),
             sample_branch(),
-            None,
+            ReplayTarget::BranchCreation,
             sample_object_id('e'),
             Vec::new(),
             Duration::ZERO,
@@ -693,6 +995,7 @@ mod tests {
             sample_object_id('e'),
         );
         assert!(plan.expected_remote_head().is_none());
+        assert!(matches!(plan.target(), ReplayTarget::BranchCreation));
     }
 
     #[test]
@@ -710,6 +1013,115 @@ mod tests {
             vec!["init", "--bare", "--quiet", "--", "/work/staging.git"]
         );
         assert!(init.required_secret_env().is_empty());
+    }
+
+    #[test]
+    fn fetch_prereq_command_is_absent_for_branch_creation() {
+        let plan = sample_plan(
+            "/usr/local/bin/git",
+            "/work/bundle.pack",
+            "/work/staging.git",
+            sample_object_id('a'),
+        );
+        assert!(plan.fetch_prereq_command().is_none());
+    }
+
+    #[test]
+    fn fetch_prereq_command_carries_expected_argv_shape_for_fast_forward() {
+        let plan = sample_plan_with_target(
+            "/usr/local/bin/git",
+            "/work/bundle.pack",
+            "/work/staging.git",
+            sample_fast_forward(sample_object_id('a')),
+            sample_object_id('b'),
+        );
+        let fetch = plan
+            .fetch_prereq_command()
+            .expect("fast-forward plans produce a fetch command");
+        let args = fetch.display_args_lossy();
+        assert_eq!(
+            args,
+            vec![
+                "-c",
+                "credential.helper=",
+                "-c",
+                "credential.useHttpPath=true",
+                "-C",
+                "/work/staging.git",
+                "fetch",
+                "--no-tags",
+                "--no-write-fetch-head",
+                "--quiet",
+                "--depth=1",
+                "--",
+                "https://github.com/owner/name.git",
+                "+aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:refs/replay/prereq",
+            ]
+        );
+        assert_eq!(
+            fetch.required_secret_env(),
+            &[SAMPLE_TOKEN_ENV.to_string()],
+            "the credential token env var must be declared so run_clean_git binds the secret to it",
+        );
+        let env_pairs: Vec<(&str, &str)> = fetch
+            .env()
+            .iter()
+            .map(|entry| (entry.name(), entry.value()))
+            .collect();
+        assert!(
+            env_pairs.contains(&("GIT_TERMINAL_PROMPT", "0")),
+            "GIT_TERMINAL_PROMPT=0 must be set so Git never prompts on a TTY-less broker: env={env_pairs:?}",
+        );
+        assert!(
+            env_pairs.contains(&("GIT_ASKPASS", "/usr/local/libexec/writ-git-askpass")),
+            "GIT_ASKPASS must point at the broker askpass sidecar: env={env_pairs:?}",
+        );
+    }
+
+    #[test]
+    fn unbundle_command_carries_expected_argv_shape() {
+        let plan = sample_plan(
+            "/usr/local/bin/git",
+            "/work/bundle.pack",
+            "/work/staging.git",
+            sample_object_id('a'),
+        );
+        let unbundle = plan.unbundle_command();
+        let args = unbundle.display_args_lossy();
+        assert_eq!(
+            args,
+            vec![
+                "-C",
+                "/work/staging.git",
+                "bundle",
+                "unbundle",
+                "/work/bundle.pack",
+            ]
+        );
+        assert!(unbundle.required_secret_env().is_empty());
+    }
+
+    #[test]
+    fn resolve_new_head_command_carries_expected_argv_shape() {
+        let plan = sample_plan(
+            "/usr/local/bin/git",
+            "/work/bundle.pack",
+            "/work/staging.git",
+            sample_object_id('c'),
+        );
+        let resolve = plan.resolve_new_head_command();
+        let args = resolve.display_args_lossy();
+        assert_eq!(
+            args,
+            vec![
+                "-C",
+                "/work/staging.git",
+                "rev-parse",
+                "--verify",
+                "cccccccccccccccccccccccccccccccccccccccc^{commit}",
+            ]
+        );
+        assert!(resolve.required_secret_env().is_empty());
     }
 
     #[test]
@@ -872,34 +1284,111 @@ mod tests {
         quoted
     }
 
-    /// Fake-git stand-in: records every invocation to a log file and
-    /// emulates `git init --bare --quiet -- <path>`. `exit_status` is
-    /// substituted into the init branch so tests can force a non-zero
-    /// exit without changing the rest of the script. Returns `(git_path,
-    /// log_path)`.
-    fn fake_git_for_init(dir: &TempDir, exit_status: u8) -> (PathBuf, PathBuf) {
+    /// Per-subcommand exit codes for [`fake_git_for_replay`]. Each test
+    /// constructs one of these in the shape it needs; defaults keep
+    /// every subcommand happy so flipping one to non-zero is the way
+    /// failure-path tests pin which step the executor reaches.
+    #[derive(Clone, Copy)]
+    struct FakeGitExitCodes {
+        init: u8,
+        fetch: u8,
+        unbundle: u8,
+        rev_parse: u8,
+    }
+
+    impl FakeGitExitCodes {
+        const ALL_SUCCESS: Self = Self {
+            init: 0,
+            fetch: 0,
+            unbundle: 0,
+            rev_parse: 0,
+        };
+    }
+
+    /// Fake-git stand-in covering every subcommand the replay
+    /// bring-up dispatches:
+    ///
+    /// * `init --bare --quiet -- <path>` — creates `<path>` so the
+    ///   `prepare_staging_repo` permissions postcondition can be
+    ///   inspected.
+    /// * `-c ... -c ... -C <staging> fetch ...` — records the full argv
+    ///   plus the `GIT_ASKPASS` / token env vars so the credential
+    ///   wiring can be asserted.
+    /// * `-C <staging> bundle unbundle <bundle>` — records the argv.
+    /// * `-C <staging> rev-parse --verify <sha>^{commit}` — records
+    ///   the argv.
+    ///
+    /// Each subcommand exits with the corresponding `exits.<step>`,
+    /// which lets the same script back both happy-path and per-step
+    /// failure tests without churn. Returns `(git_path, log_path)`.
+    fn fake_git_for_replay(dir: &TempDir, exits: FakeGitExitCodes) -> (PathBuf, PathBuf) {
         let git = dir.path().join("fake-git");
         let log = dir.path().join("fake-git.log");
         let shell = required_test_tool("sh");
-        let mkdir = required_test_tool("mkdir");
+        let mkdir = shell_quote(&required_test_tool("mkdir"));
         let script = format!(
             r#"#!{shell}
 set -eu
 log={log}
-printf '%s' "$*" >> "$log"
-printf '\n' >> "$log"
-if [ "$1" = "init" ]; then
-    [ "$2" = "--bare" ]
-    [ "$3" = "--quiet" ]
-    [ "$4" = "--" ]
-    {mkdir} -p "$5"
-    exit {exit_status}
-fi
-exit 42
+log_line() {{
+    printf '%s\n' "$1" >> "$log"
+}}
+log_env() {{
+    printf 'env GIT_ASKPASS=%s GIT_TERMINAL_PROMPT=%s {token_env}=%s\n' \
+        "${{GIT_ASKPASS-<unset>}}" "${{GIT_TERMINAL_PROMPT-<unset>}}" "${{{token_env}-<unset>}}" \
+        >> "$log"
+}}
+case "$1" in
+    init)
+        log_line "init $*"
+        [ "$2" = "--bare" ]
+        [ "$3" = "--quiet" ]
+        [ "$4" = "--" ]
+        {mkdir} -p "$5"
+        exit {init}
+        ;;
+    -c)
+        log_line "fetch $*"
+        log_env
+        [ "$2" = "credential.helper=" ]
+        [ "$3" = "-c" ]
+        [ "$4" = "credential.useHttpPath=true" ]
+        [ "$5" = "-C" ]
+        [ "$7" = "fetch" ]
+        exit {fetch}
+        ;;
+    -C)
+        case "$3" in
+            bundle)
+                log_line "bundle $*"
+                [ "$4" = "unbundle" ]
+                exit {unbundle}
+                ;;
+            rev-parse)
+                log_line "rev-parse $*"
+                [ "$4" = "--verify" ]
+                exit {rev_parse}
+                ;;
+            *)
+                printf 'fake-git: unexpected -C subcommand: %s\n' "$3" >&2
+                exit 90
+                ;;
+        esac
+        ;;
+    *)
+        printf 'fake-git: unexpected argv head: %s\n' "$1" >&2
+        exit 91
+        ;;
+esac
 "#,
             shell = shell.display(),
             log = shell_quote(&log),
-            mkdir = shell_quote(&mkdir),
+            mkdir = mkdir,
+            token_env = SAMPLE_TOKEN_ENV,
+            init = exits.init,
+            fetch = exits.fetch,
+            unbundle = exits.unbundle,
+            rev_parse = exits.rev_parse,
         );
         std::fs::write(&git, script).unwrap();
         std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -912,7 +1401,7 @@ exit 42
         let bundle = dir.path().join("bundle.pack");
         std::fs::write(&bundle, b"bundle bytes").unwrap();
         let staging = dir.path().join("staging.git");
-        let (git, log) = fake_git_for_init(&dir, 0);
+        let (git, log) = fake_git_for_replay(&dir, FakeGitExitCodes::ALL_SUCCESS);
 
         let plan = sample_plan(git, bundle, staging.clone(), sample_object_id('a'));
         let returned = prepare_staging_repo(&plan).await.expect("prepare succeeds");
@@ -927,7 +1416,7 @@ exit 42
         );
         assert_eq!(
             lines[0],
-            format!("init --bare --quiet -- {}", staging.display()),
+            format!("init init --bare --quiet -- {}", staging.display()),
         );
     }
 
@@ -938,7 +1427,7 @@ exit 42
         std::fs::write(&bundle, b"bundle bytes").unwrap();
         let staging = dir.path().join("staging.git");
         std::fs::create_dir_all(&staging).unwrap();
-        let (git, _) = fake_git_for_init(&dir, 0);
+        let (git, _) = fake_git_for_replay(&dir, FakeGitExitCodes::ALL_SUCCESS);
 
         let plan = sample_plan(git, bundle, staging.clone(), sample_object_id('b'));
         let err = prepare_staging_repo(&plan).await.unwrap_err();
@@ -954,7 +1443,7 @@ exit 42
         let bundle = dir.path().join("bundle.pack");
         std::fs::write(&bundle, b"bundle bytes").unwrap();
         let staging = dir.path().join("staging.git");
-        let (git, _) = fake_git_for_init(&dir, 0);
+        let (git, _) = fake_git_for_replay(&dir, FakeGitExitCodes::ALL_SUCCESS);
 
         let plan = sample_plan(git, bundle, staging.clone(), sample_object_id('c'));
         prepare_staging_repo(&plan).await.unwrap();
@@ -976,7 +1465,13 @@ exit 42
         std::fs::write(&bundle, b"bundle bytes").unwrap();
         let staging = dir.path().join("staging.git");
         // Force `git init --bare` to exit non-zero.
-        let (git, _) = fake_git_for_init(&dir, 7);
+        let (git, _) = fake_git_for_replay(
+            &dir,
+            FakeGitExitCodes {
+                init: 7,
+                ..FakeGitExitCodes::ALL_SUCCESS
+            },
+        );
 
         let plan = sample_plan(git, bundle, staging, sample_object_id('d'));
         let err = prepare_staging_repo(&plan).await.unwrap_err();
@@ -985,6 +1480,187 @@ exit 42
                 assert_eq!(step, GitPushReplayCommandStep::InitBareRepo);
             }
             other => panic!("expected Failed at InitBareRepo, got {other:?}"),
+        }
+    }
+
+    // ---------- ingest_bundle executor tests --------------------------
+
+    /// Prepare-then-ingest pipeline: prepares the bare staging repo
+    /// (this is what the broker would have done in the preceding stage),
+    /// then runs `ingest_bundle`. The fake-git's `init` step doubles as
+    /// the prerequisite, and the same log captures every later
+    /// invocation in order so tests can pin the command sequence.
+    async fn prepare_then_ingest(
+        dir: &TempDir,
+        exits: FakeGitExitCodes,
+        target: ReplayTarget,
+        secret: Option<&GitSecretValue>,
+    ) -> (
+        PathBuf,
+        Result<(), GitPushReplayRunError>,
+        GitPushReplayPlan,
+    ) {
+        let bundle = dir.path().join("bundle.pack");
+        std::fs::write(&bundle, b"bundle bytes").unwrap();
+        let staging = dir.path().join("staging.git");
+        let (git, log) = fake_git_for_replay(dir, exits);
+        let plan = sample_plan_with_target(git, bundle, staging, target, sample_object_id('a'));
+        prepare_staging_repo(&plan).await.expect("prepare succeeds");
+        let result = ingest_bundle(&plan, secret).await;
+        (log, result, plan)
+    }
+
+    #[tokio::test]
+    async fn ingest_bundle_skips_fetch_for_branch_creation() {
+        let dir = TempDir::new().unwrap();
+        let (log, result, plan) = prepare_then_ingest(
+            &dir,
+            FakeGitExitCodes::ALL_SUCCESS,
+            ReplayTarget::BranchCreation,
+            None,
+        )
+        .await;
+        result.expect("ingest succeeds in branch-creation mode");
+
+        let body = std::fs::read_to_string(&log).unwrap();
+        let lines: Vec<&str> = body.lines().collect();
+        let staging_display = plan.staging_repo().display().to_string();
+        let bundle_display = plan.bundle_path().display().to_string();
+        let resolve_arg = format!("{}^{{commit}}", plan.new_head().as_str());
+        assert_eq!(
+            lines,
+            vec![
+                format!("init init --bare --quiet -- {staging_display}"),
+                format!("bundle -C {staging_display} bundle unbundle {bundle_display}"),
+                format!("rev-parse -C {staging_display} rev-parse --verify {resolve_arg}"),
+            ],
+            "branch-creation must skip the fetch step: log={body:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn ingest_bundle_runs_fetch_unbundle_and_resolve_for_fast_forward() {
+        let dir = TempDir::new().unwrap();
+        let expected = sample_object_id('a');
+        let target = sample_fast_forward(expected);
+        let secret = sample_secret();
+        let (log, result, plan) =
+            prepare_then_ingest(&dir, FakeGitExitCodes::ALL_SUCCESS, target, Some(&secret)).await;
+        result.expect("ingest succeeds in fast-forward mode");
+
+        let body = std::fs::read_to_string(&log).unwrap();
+        let staging_display = plan.staging_repo().display().to_string();
+        let bundle_display = plan.bundle_path().display().to_string();
+        let resolve_arg = format!("{}^{{commit}}", plan.new_head().as_str());
+        let refspec = format!("+aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:{REPLAY_PREREQ_REF}");
+        // The fetch step logs two lines (argv + env), so we filter to
+        // just the argv lines for ordering, then check env presence
+        // separately.
+        let argv_lines: Vec<&str> = body
+            .lines()
+            .filter(|line| !line.starts_with("env "))
+            .collect();
+        assert_eq!(
+            argv_lines,
+            vec![
+                format!("init init --bare --quiet -- {staging_display}"),
+                format!(
+                    "fetch -c credential.helper= -c credential.useHttpPath=true -C \
+                     {staging_display} fetch --no-tags --no-write-fetch-head --quiet \
+                     --depth=1 -- https://github.com/owner/name.git {refspec}"
+                ),
+                format!("bundle -C {staging_display} bundle unbundle {bundle_display}"),
+                format!("rev-parse -C {staging_display} rev-parse --verify {resolve_arg}"),
+            ],
+            "fast-forward sequence (init+fetch+unbundle+resolve) must match: log={body:?}",
+        );
+        assert!(
+            body.contains(&format!(
+                "env GIT_ASKPASS=/usr/local/libexec/writ-git-askpass \
+                 GIT_TERMINAL_PROMPT=0 {SAMPLE_TOKEN_ENV}={SAMPLE_TOKEN}"
+            )),
+            "fetch step must receive GIT_ASKPASS, GIT_TERMINAL_PROMPT, and the secret env: log={body:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn ingest_bundle_reports_missing_secret_for_fast_forward() {
+        let dir = TempDir::new().unwrap();
+        let (_log, result, _plan) = prepare_then_ingest(
+            &dir,
+            FakeGitExitCodes::ALL_SUCCESS,
+            sample_fast_forward(sample_object_id('a')),
+            None,
+        )
+        .await;
+        let err = result.expect_err("must refuse fast-forward without a secret");
+        assert!(
+            matches!(err, GitPushReplayRunError::MissingSecretForFastForward),
+            "expected MissingSecretForFastForward, got {err:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn ingest_bundle_surfaces_fetch_failure_with_correct_step() {
+        let dir = TempDir::new().unwrap();
+        let secret = sample_secret();
+        let (_log, result, _plan) = prepare_then_ingest(
+            &dir,
+            FakeGitExitCodes {
+                fetch: 5,
+                ..FakeGitExitCodes::ALL_SUCCESS
+            },
+            sample_fast_forward(sample_object_id('a')),
+            Some(&secret),
+        )
+        .await;
+        match result.expect_err("fetch must fail") {
+            GitPushReplayRunError::Failed { step, .. } => {
+                assert_eq!(step, GitPushReplayCommandStep::FetchPrereq);
+            }
+            other => panic!("expected Failed at FetchPrereq, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn ingest_bundle_surfaces_unbundle_failure_with_correct_step() {
+        let dir = TempDir::new().unwrap();
+        let (_log, result, _plan) = prepare_then_ingest(
+            &dir,
+            FakeGitExitCodes {
+                unbundle: 5,
+                ..FakeGitExitCodes::ALL_SUCCESS
+            },
+            ReplayTarget::BranchCreation,
+            None,
+        )
+        .await;
+        match result.expect_err("unbundle must fail") {
+            GitPushReplayRunError::Failed { step, .. } => {
+                assert_eq!(step, GitPushReplayCommandStep::UnbundleObjects);
+            }
+            other => panic!("expected Failed at UnbundleObjects, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn ingest_bundle_surfaces_resolve_failure_with_correct_step() {
+        let dir = TempDir::new().unwrap();
+        let (_log, result, _plan) = prepare_then_ingest(
+            &dir,
+            FakeGitExitCodes {
+                rev_parse: 5,
+                ..FakeGitExitCodes::ALL_SUCCESS
+            },
+            ReplayTarget::BranchCreation,
+            None,
+        )
+        .await;
+        match result.expect_err("resolve must fail") {
+            GitPushReplayRunError::Failed { step, .. } => {
+                assert_eq!(step, GitPushReplayCommandStep::ResolveNewHead);
+            }
+            other => panic!("expected Failed at ResolveNewHead, got {other:?}"),
         }
     }
 }
