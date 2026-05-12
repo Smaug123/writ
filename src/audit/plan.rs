@@ -560,6 +560,7 @@ mod tests {
             agent_kind: AgentKind::Claude,
             prompt: AgentPrompt::new("plan this").summary(),
             correlation_id,
+            stage: Stage::Plan,
         })
         .unwrap();
         run_id

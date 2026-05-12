@@ -1829,6 +1829,7 @@ mod tests {
                 agent_kind: AgentKind::Claude,
                 prompt,
                 correlation_id,
+                stage: crate::agent_plan::Stage::Plan,
             })
             .unwrap();
         state
