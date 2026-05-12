@@ -30,7 +30,7 @@ pub(super) struct Migration {
 /// a version higher than this is rejected with [`AuditError::SchemaTooNew`]
 /// rather than opened — we'd rather fail to start than silently drop data
 /// into a schema a newer broker wrote.
-pub(super) const SCHEMA_VERSION: i32 = 15;
+pub(super) const SCHEMA_VERSION: i32 = 16;
 
 /// The full migration history. Each entry documents exactly one state
 /// transition; the sequence of entries is the schema's lineage. Order
@@ -885,6 +885,71 @@ CREATE TABLE plan (
     body_sha256   TEXT NOT NULL CHECK (length(body_sha256) = 64),
     UNIQUE (agent_run_id)
 );
+
+CREATE INDEX idx_plan_agent_run ON plan(agent_run_id);
+
+CREATE TRIGGER plan_requires_open_session
+BEFORE INSERT ON plan
+WHEN EXISTS (
+    SELECT 1 FROM agent_run ar
+    JOIN session s ON s.session_id = ar.session_id
+    WHERE ar.run_id = NEW.agent_run_id AND s.closed_at IS NOT NULL
+)
+BEGIN
+    SELECT RAISE(ABORT, 'session is closed');
+END;
+"#,
+    },
+    // Harden the `plan.body` CHECK. v15 only required `body != ''`,
+    // which is weaker than `PlanBody`'s invariant in two ways:
+    //
+    //   1. SQLite's declared column type is advisory — a raw writer
+    //      that binds bytes with storage class BLOB will satisfy `body
+    //      != ''` even though `PlanBody::try_new` later refuses to
+    //      parse the value. Without `typeof(body) = 'text'` the column
+    //      can hold values the typed layer cannot read back.
+    //   2. `length()` on a TEXT value walks the bytes as a C string and
+    //      stops at the first NUL, so `length(body) BETWEEN 1 AND N`
+    //      would happily admit `"a\0" || huge_blob`. Casting to BLOB
+    //      and using `length(cast(body AS BLOB))` measures the full
+    //      byte count, and `instr(cast(body AS BLOB), x'00') = 0`
+    //      proves there is no embedded NUL anywhere in the payload.
+    //
+    // The upper bound mirrors `MAX_PLAN_BODY_BYTES` in `agent_plan.rs`
+    // (256 KiB). It is intentionally redundant with `PlanBody::try_new`
+    // — defence in depth so a future raw insert path cannot smuggle
+    // megabyte-sized plans into the audit log.
+    //
+    // Nothing references `plan` via foreign key (the design has plan
+    // as a leaf), so the standard SQLite table-recreation pattern
+    // simplifies to: drop trigger/index, rename, create, copy, drop
+    // old, restore index/trigger.
+    Migration {
+        version: 16,
+        sql: r#"
+DROP TRIGGER plan_requires_open_session;
+DROP INDEX idx_plan_agent_run;
+
+ALTER TABLE plan RENAME TO plan_v15;
+
+CREATE TABLE plan (
+    plan_id       TEXT PRIMARY KEY,
+    agent_run_id  TEXT NOT NULL REFERENCES agent_run(run_id),
+    submitted_at  INTEGER NOT NULL,
+    body          TEXT NOT NULL CHECK (
+        typeof(body) = 'text'
+        AND length(cast(body AS BLOB)) BETWEEN 1 AND 262144
+        AND instr(cast(body AS BLOB), x'00') = 0
+    ),
+    body_sha256   TEXT NOT NULL CHECK (length(body_sha256) = 64),
+    UNIQUE (agent_run_id)
+);
+
+INSERT INTO plan (plan_id, agent_run_id, submitted_at, body, body_sha256)
+SELECT plan_id, agent_run_id, submitted_at, body, body_sha256
+FROM plan_v15;
+
+DROP TABLE plan_v15;
 
 CREATE INDEX idx_plan_agent_run ON plan(agent_run_id);
 
@@ -2190,6 +2255,198 @@ mod tests {
             .unwrap()
             .unwrap_err();
         assert!(empty_err.to_string().contains("CHECK"), "got: {empty_err}");
+    }
+
+    /// Migration 16 hardens the `plan.body` CHECK from `body != ''` to
+    /// the same `typeof = 'text' AND byte-bounded AND no embedded NUL`
+    /// shape used for `correlation_id`. Existing rows must survive the
+    /// table recreate, and the new CHECK must reject the three vectors
+    /// the old one missed: BLOB-typed payloads, embedded NULs, and
+    /// oversized bodies.
+    #[test]
+    fn open_migrates_v15_database_to_hardened_plan_body_check() {
+        let db = NamedTempFile::new().unwrap();
+        let session_id = SessionId::new();
+        let run_id = uuid::Uuid::new_v4();
+        let plan_id = uuid::Uuid::new_v4();
+        let body = "# Plan\n\nBody text.";
+        let body_sha = crate::agent_run::sha256_hex(body.as_bytes());
+
+        {
+            let mut conn = Connection::open(db.path()).unwrap();
+            let tx = conn.transaction().unwrap();
+            for migration in MIGRATIONS.iter().take(15) {
+                tx.execute_batch(migration.sql).unwrap();
+            }
+            tx.pragma_update(None, "user_version", 15).unwrap();
+
+            tx.execute(
+                "INSERT INTO session (session_id, label, agent_kind, agent_model, opened_at, closed_at) \
+                 VALUES (?1, NULL, 'claude', NULL, 1, NULL)",
+                params![session_id.as_uuid().to_string()],
+            )
+            .unwrap();
+
+            tx.execute(
+                "INSERT INTO agent_run (
+                     run_id, session_id, requested_at, agent_kind,
+                     prompt_bytes, prompt_sha256, prompt_redacted_preview,
+                     correlation_id
+                 ) VALUES (?1, ?2, 2, 'claude', 1, ?3, '<redacted>', NULL)",
+                params![
+                    run_id.to_string(),
+                    session_id.as_uuid().to_string(),
+                    "a".repeat(64),
+                ],
+            )
+            .unwrap();
+
+            tx.execute(
+                "INSERT INTO plan (plan_id, agent_run_id, submitted_at, body, body_sha256) \
+                 VALUES (?1, ?2, 3, ?3, ?4)",
+                params![plan_id.to_string(), run_id.to_string(), body, &body_sha],
+            )
+            .unwrap();
+
+            tx.commit().unwrap();
+        }
+
+        let log = AuditLog::open(db.path()).unwrap();
+        assert_eq!(read_user_version(&log), SCHEMA_VERSION);
+        assert!(column_exists(&log, "plan", "plan_id"));
+        assert!(trigger_exists(&log, "plan_requires_open_session"));
+
+        // The pre-existing row survives the table recreate verbatim.
+        let (got_body, got_sha): (String, String) = log
+            .with_conn(|c| {
+                Ok(c.query_row(
+                    "SELECT body, body_sha256 FROM plan WHERE plan_id = ?1",
+                    params![plan_id.to_string()],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )?)
+            })
+            .unwrap();
+        assert_eq!(got_body, body);
+        assert_eq!(got_sha, body_sha);
+
+        // A fresh valid plan still inserts after the migration.
+        let run_id_b = uuid::Uuid::new_v4();
+        let plan_id_b = uuid::Uuid::new_v4();
+        log.with_conn(|c| {
+            c.execute(
+                "INSERT INTO agent_run (
+                     run_id, session_id, requested_at, agent_kind,
+                     prompt_bytes, prompt_sha256, prompt_redacted_preview,
+                     correlation_id
+                 ) VALUES (?1, ?2, 4, 'claude', 1, ?3, '<redacted>', NULL)",
+                params![
+                    run_id_b.to_string(),
+                    session_id.as_uuid().to_string(),
+                    "a".repeat(64),
+                ],
+            )?;
+            c.execute(
+                "INSERT INTO plan (plan_id, agent_run_id, submitted_at, body, body_sha256) \
+                 VALUES (?1, ?2, 5, ?3, ?4)",
+                params![
+                    plan_id_b.to_string(),
+                    run_id_b.to_string(),
+                    "ok body",
+                    crate::agent_run::sha256_hex(b"ok body"),
+                ],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        // Three new vectors the v15 CHECK admitted are now rejected.
+        let insert_plan = |run: uuid::Uuid, body: rusqlite::types::Value| {
+            log.with_conn(|c| {
+                Ok(c.execute(
+                    "INSERT INTO plan (plan_id, agent_run_id, submitted_at, body, body_sha256) \
+                     VALUES (?1, ?2, 6, ?3, ?4)",
+                    params![
+                        uuid::Uuid::new_v4().to_string(),
+                        run.to_string(),
+                        body,
+                        "a".repeat(64),
+                    ],
+                ))
+            })
+            .unwrap()
+            .unwrap_err()
+        };
+
+        // (a) TEXT-bound embedded NUL — `length()` on TEXT would have
+        // stopped at the NUL and reported a length-1 string, passing
+        // v15. The `instr(..., x'00')` clause inspects all bytes.
+        let run_id_nul = uuid::Uuid::new_v4();
+        log.with_conn(|c| {
+            c.execute(
+                "INSERT INTO agent_run (
+                     run_id, session_id, requested_at, agent_kind,
+                     prompt_bytes, prompt_sha256, prompt_redacted_preview,
+                     correlation_id
+                 ) VALUES (?1, ?2, 7, 'claude', 1, ?3, '<redacted>', NULL)",
+                params![
+                    run_id_nul.to_string(),
+                    session_id.as_uuid().to_string(),
+                    "a".repeat(64),
+                ],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        let err = insert_plan(
+            run_id_nul,
+            rusqlite::types::Value::Text("hi\0there".to_owned()),
+        );
+        assert!(err.to_string().contains("CHECK"), "got: {err}");
+
+        // (b) BLOB-bound payload — the column is declared TEXT but
+        // SQLite would still store a BLOB-classed value; only
+        // `typeof = 'text'` catches this path.
+        let run_id_blob = uuid::Uuid::new_v4();
+        log.with_conn(|c| {
+            c.execute(
+                "INSERT INTO agent_run (
+                     run_id, session_id, requested_at, agent_kind,
+                     prompt_bytes, prompt_sha256, prompt_redacted_preview,
+                     correlation_id
+                 ) VALUES (?1, ?2, 8, 'claude', 1, ?3, '<redacted>', NULL)",
+                params![
+                    run_id_blob.to_string(),
+                    session_id.as_uuid().to_string(),
+                    "a".repeat(64),
+                ],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        let err = insert_plan(run_id_blob, rusqlite::types::Value::Blob(b"hello".to_vec()));
+        assert!(err.to_string().contains("CHECK"), "got: {err}");
+
+        // (c) Oversized body — v15 had no upper bound at all.
+        let run_id_big = uuid::Uuid::new_v4();
+        log.with_conn(|c| {
+            c.execute(
+                "INSERT INTO agent_run (
+                     run_id, session_id, requested_at, agent_kind,
+                     prompt_bytes, prompt_sha256, prompt_redacted_preview,
+                     correlation_id
+                 ) VALUES (?1, ?2, 9, 'claude', 1, ?3, '<redacted>', NULL)",
+                params![
+                    run_id_big.to_string(),
+                    session_id.as_uuid().to_string(),
+                    "a".repeat(64),
+                ],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        let huge = "x".repeat(262_145);
+        let err = insert_plan(run_id_big, rusqlite::types::Value::Text(huge));
+        assert!(err.to_string().contains("CHECK"), "got: {err}");
     }
 
     /// Regression guard for the NUL-injection case in two flavours:
