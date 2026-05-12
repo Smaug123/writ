@@ -6,27 +6,17 @@
 //! credentials.
 
 use std::ffi::OsString;
-use std::mem::MaybeUninit;
 use std::path::{Path, PathBuf};
-use std::process::{ExitStatus, Stdio};
+use std::process::ExitStatus;
 use std::time::Duration;
 
-use tokio::process::Command;
-
-use crate::process_spawn;
+use crate::clean_git::{
+    self, CleanGitEnv, CleanGitError, CleanGitInvocation, clean_git_config_env,
+};
 use crate::vm_git::{GitCloneRepo, VmGitCloneRequest};
 
 const DEFAULT_MIRROR_DIR_NAME: &str = "mirror.git";
 pub const DEFAULT_GIT_CLONE_BASE_URL: &str = "https://github.com";
-const CLEAN_GIT_CONFIG_ENV: [(&str, &str); 3] = [
-    ("GIT_CONFIG_NOSYSTEM", "1"),
-    ("GIT_CONFIG_GLOBAL", "/dev/null"),
-    ("GIT_CONFIG_COUNT", "0"),
-];
-// Git discovers repository-local config by walking up from cwd. Running from
-// root prevents broker-local `.git/config` from rewriting the pinned HTTPS URL.
-const CLEAN_GIT_CURRENT_DIR: &str = "/";
-const CHILD_EXIT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GitCredentialBoundary {
@@ -77,22 +67,8 @@ pub struct GitCloneBundleRunOutput {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GitCloneBundleCommands {
-    clone_mirror: GitCommandInvocation,
-    create_bundle: GitCommandInvocation,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct GitCommandInvocation {
-    program: PathBuf,
-    args: Vec<OsString>,
-    env: Vec<GitCommandEnv>,
-    required_secret_env: Vec<GitSecretEnvVar>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct GitCommandEnv {
-    name: String,
-    value: String,
+    clone_mirror: CleanGitInvocation,
+    create_bundle: CleanGitInvocation,
 }
 
 #[derive(Debug, thiserror::Error, Eq, PartialEq)]
@@ -497,8 +473,8 @@ impl GitCloneBundlePlan {
         }
     }
 
-    fn clone_mirror_command(&self) -> GitCommandInvocation {
-        GitCommandInvocation::new(
+    fn clone_mirror_command(&self) -> CleanGitInvocation {
+        CleanGitInvocation::new(
             self.git_program.clone(),
             [
                 OsString::from("-c"),
@@ -512,11 +488,11 @@ impl GitCloneBundlePlan {
                 self.mirror_dir.as_os_str().to_os_string(),
             ],
             self.clone_mirror_env(),
-            vec![self.credential.token_env.clone()],
+            vec![self.credential.token_env.as_str().to_string()],
         )
     }
 
-    fn create_bundle_command(&self) -> GitCommandInvocation {
+    fn create_bundle_command(&self) -> CleanGitInvocation {
         let mut args = vec![
             OsString::from("-C"),
             self.mirror_dir.as_os_str().to_os_string(),
@@ -529,7 +505,7 @@ impl GitCloneBundlePlan {
             Some(git_ref) => args.push(OsString::from(git_ref.as_str())),
             None => args.push(OsString::from("--all")),
         }
-        GitCommandInvocation::new(
+        CleanGitInvocation::new(
             self.git_program.clone(),
             args,
             clean_git_config_env(),
@@ -537,10 +513,10 @@ impl GitCloneBundlePlan {
         )
     }
 
-    fn clone_mirror_env(&self) -> Vec<GitCommandEnv> {
+    fn clone_mirror_env(&self) -> Vec<CleanGitEnv> {
         let mut env = clean_git_config_env();
-        env.push(GitCommandEnv::new("GIT_TERMINAL_PROMPT", "0"));
-        env.push(GitCommandEnv::new(
+        env.push(CleanGitEnv::new("GIT_TERMINAL_PROMPT", "0"));
+        env.push(CleanGitEnv::new(
             "GIT_ASKPASS",
             self.credential.askpass_program.display().to_string(),
         ));
@@ -562,7 +538,7 @@ pub async fn run_git_clone_bundle(
     reject_existing_bundle(plan).await?;
 
     let commands = plan.commands();
-    run_git_invocation(
+    run_clone_invocation(
         GitCloneCommandStep::CloneMirror,
         commands.clone_mirror(),
         plan.timeout(),
@@ -570,7 +546,7 @@ pub async fn run_git_clone_bundle(
     )
     .await?;
     reject_bundle_inside_canonical_mirror(plan).await?;
-    run_git_invocation(
+    run_clone_invocation(
         GitCloneCommandStep::CreateBundle,
         commands.create_bundle(),
         plan.timeout(),
@@ -581,72 +557,17 @@ pub async fn run_git_clone_bundle(
 }
 
 impl GitCloneBundleCommands {
-    pub fn clone_mirror(&self) -> &GitCommandInvocation {
+    pub(crate) fn clone_mirror(&self) -> &CleanGitInvocation {
         &self.clone_mirror
     }
 
-    pub fn create_bundle(&self) -> &GitCommandInvocation {
+    pub(crate) fn create_bundle(&self) -> &CleanGitInvocation {
         &self.create_bundle
     }
 
-    pub fn all(&self) -> [&GitCommandInvocation; 2] {
+    #[cfg(test)]
+    pub(crate) fn all(&self) -> [&CleanGitInvocation; 2] {
         [&self.clone_mirror, &self.create_bundle]
-    }
-}
-
-impl GitCommandInvocation {
-    fn new(
-        program: PathBuf,
-        args: impl IntoIterator<Item = impl Into<OsString>>,
-        env: Vec<GitCommandEnv>,
-        required_secret_env: Vec<GitSecretEnvVar>,
-    ) -> Self {
-        Self {
-            program,
-            args: args.into_iter().map(Into::into).collect(),
-            env,
-            required_secret_env,
-        }
-    }
-
-    pub fn program(&self) -> &Path {
-        &self.program
-    }
-
-    pub fn args(&self) -> &[OsString] {
-        &self.args
-    }
-
-    pub fn env(&self) -> &[GitCommandEnv] {
-        &self.env
-    }
-
-    pub fn required_secret_env(&self) -> &[GitSecretEnvVar] {
-        &self.required_secret_env
-    }
-
-    pub fn display_args_lossy(&self) -> Vec<String> {
-        self.args
-            .iter()
-            .map(|arg| arg.to_string_lossy().into_owned())
-            .collect()
-    }
-}
-
-impl GitCommandEnv {
-    fn new(name: impl Into<String>, value: impl Into<String>) -> Self {
-        Self {
-            name: name.into(),
-            value: value.into(),
-        }
-    }
-
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-
-    pub fn value(&self) -> &str {
-        &self.value
     }
 }
 
@@ -692,262 +613,44 @@ async fn create_private_work_dir(plan: &GitCloneBundlePlan) -> Result<(), GitClo
     )
 }
 
-async fn run_git_invocation(
+async fn run_clone_invocation(
     step: GitCloneCommandStep,
-    invocation: &GitCommandInvocation,
+    invocation: &CleanGitInvocation,
     timeout: Duration,
     secret: &GitSecretValue,
 ) -> Result<(), GitCloneBundleRunError> {
-    let program = resolve_program_for_clean_env(invocation.program()).await?;
-    let mut command = Command::new(program);
-    command.env_clear();
-    command.args(invocation.args());
-    command.stdin(Stdio::null());
-    command.stdout(Stdio::null());
-    command.stderr(Stdio::null());
-    command.current_dir(CLEAN_GIT_CURRENT_DIR);
-    command.process_group(0);
-    for env in invocation.env() {
-        command.env(env.name(), env.value());
-    }
-    for secret_env in invocation.required_secret_env() {
-        command.env(secret_env.as_str(), secret.as_str());
-    }
-
-    let mut child = process_spawn::spawn_async(&mut command)
+    clean_git::run_clean_git(invocation, timeout, Some(secret.as_str()))
         .await
-        .map_err(|source| GitCloneBundleRunError::Spawn { step, source })?;
-    let pid = child
-        .id()
-        .ok_or(GitCloneBundleRunError::MissingProcessId { step })?;
-    let pgid = process_group_id(step, pid)?;
-    let mut cleanup_guard = ProcessGroupCleanupGuard::new(step, pgid);
-    match wait_for_child_exit_before_reap(step, pgid, timeout).await? {
-        ChildExitObservation::Exited => {
-            cleanup_guard.mark_child_exit_observed();
-            cleanup_guard.kill_now()?;
-            let status = child.wait().await;
-            cleanup_guard.disarm();
-            let status = status.map_err(|source| GitCloneBundleRunError::Wait { step, source })?;
-            if status.success() {
-                Ok(())
-            } else {
-                Err(GitCloneBundleRunError::Failed { step, status })
-            }
-        }
-        ChildExitObservation::TimedOut => {
-            cleanup_guard.kill_now()?;
-            let _ = child.wait().await;
-            cleanup_guard.disarm();
-            Err(GitCloneBundleRunError::TimedOut { step, timeout })
-        }
-    }
+        .map_err(|err| translate_clean_git_error(step, err))
 }
 
-async fn resolve_program_for_clean_env(program: &Path) -> Result<PathBuf, GitCloneBundleRunError> {
-    if program.is_absolute() {
-        return match tokio::fs::metadata(program).await {
-            Ok(metadata) if is_executable_file(&metadata) => {
-                canonicalize_path("git_program", program).await
-            }
-            Ok(_) => Err(GitCloneBundleRunError::GitProgramNotFound(
-                program.to_path_buf(),
-            )),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Err(
-                GitCloneBundleRunError::GitProgramNotFound(program.to_path_buf()),
-            ),
-            Err(source) => Err(GitCloneBundleRunError::Canonicalize {
-                field: "git_program",
-                path: program.to_path_buf(),
-                source,
-            }),
-        };
-    }
-    if program.components().count() != 1 {
-        return Err(GitCloneBundleRunError::GitProgramNotFound(
-            program.to_path_buf(),
-        ));
-    }
-
-    let Some(path) = std::env::var_os("PATH") else {
-        return Err(GitCloneBundleRunError::GitProgramNotFound(
-            program.to_path_buf(),
-        ));
-    };
-    for dir in std::env::split_paths(&path) {
-        let candidate = dir.join(program);
-        match tokio::fs::metadata(&candidate).await {
-            Ok(metadata) if is_executable_file(&metadata) => {
-                return canonicalize_path("git_program", &candidate).await;
-            }
-            Ok(_) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(source) => {
-                return Err(GitCloneBundleRunError::Canonicalize {
-                    field: "git_program",
-                    path: candidate,
-                    source,
-                });
-            }
-        }
-    }
-    Err(GitCloneBundleRunError::GitProgramNotFound(
-        program.to_path_buf(),
-    ))
-}
-
-enum ChildExitObservation {
-    Exited,
-    TimedOut,
-}
-
-async fn wait_for_child_exit_before_reap(
+fn translate_clean_git_error(
     step: GitCloneCommandStep,
-    pid: libc::pid_t,
-    timeout: Duration,
-) -> Result<ChildExitObservation, GitCloneBundleRunError> {
-    let deadline = tokio::time::Instant::now() + timeout;
-    loop {
-        if child_has_exited_without_reaping(step, pid)? {
-            return Ok(ChildExitObservation::Exited);
+    err: CleanGitError,
+) -> GitCloneBundleRunError {
+    match err {
+        CleanGitError::GitProgramNotFound(p) => GitCloneBundleRunError::GitProgramNotFound(p),
+        CleanGitError::Canonicalize {
+            field,
+            path,
+            source,
+        } => GitCloneBundleRunError::Canonicalize {
+            field,
+            path,
+            source,
+        },
+        CleanGitError::Spawn(source) => GitCloneBundleRunError::Spawn { step, source },
+        CleanGitError::Wait(source) => GitCloneBundleRunError::Wait { step, source },
+        CleanGitError::TimedOut(timeout) => GitCloneBundleRunError::TimedOut { step, timeout },
+        CleanGitError::Failed(status) => GitCloneBundleRunError::Failed { step, status },
+        CleanGitError::MissingProcessId => GitCloneBundleRunError::MissingProcessId { step },
+        CleanGitError::InvalidProcessId(pid) => {
+            GitCloneBundleRunError::InvalidProcessId { step, pid }
         }
-
-        let now = tokio::time::Instant::now();
-        if now >= deadline {
-            return Ok(ChildExitObservation::TimedOut);
-        }
-        tokio::time::sleep(std::cmp::min(CHILD_EXIT_POLL_INTERVAL, deadline - now)).await;
-    }
-}
-
-fn child_has_exited_without_reaping(
-    step: GitCloneCommandStep,
-    pid: libc::pid_t,
-) -> Result<bool, GitCloneBundleRunError> {
-    let mut status = MaybeUninit::<libc::siginfo_t>::zeroed();
-    let result = unsafe {
-        libc::waitid(
-            libc::P_PID,
-            pid as libc::id_t,
-            status.as_mut_ptr(),
-            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
-        )
-    };
-    if result == -1 {
-        return Err(GitCloneBundleRunError::Wait {
-            step,
-            source: std::io::Error::last_os_error(),
-        });
-    }
-
-    let status = unsafe { status.assume_init() };
-    let observed_pid = unsafe { status.si_pid() };
-    Ok(observed_pid != 0)
-}
-
-fn is_executable_file(metadata: &std::fs::Metadata) -> bool {
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
-
-    if !metadata.is_file() {
-        return false;
-    }
-    let mode = metadata.permissions().mode();
-    let euid = unsafe { libc::geteuid() };
-    if euid == 0 {
-        return mode & 0o111 != 0;
-    }
-    if metadata.uid() == euid {
-        return mode & 0o100 != 0;
-    }
-    if metadata.gid() == unsafe { libc::getegid() }
-        || current_supplementary_groups().contains(&metadata.gid())
-    {
-        return mode & 0o010 != 0;
-    }
-    mode & 0o001 != 0
-}
-
-fn process_group_id(
-    step: GitCloneCommandStep,
-    pid: u32,
-) -> Result<libc::pid_t, GitCloneBundleRunError> {
-    pid.try_into()
-        .map_err(|_| GitCloneBundleRunError::InvalidProcessId { step, pid })
-}
-
-struct ProcessGroupCleanupGuard {
-    step: GitCloneCommandStep,
-    pgid: libc::pid_t,
-    child_exit_observed: bool,
-    armed: bool,
-}
-
-impl ProcessGroupCleanupGuard {
-    fn new(step: GitCloneCommandStep, pgid: libc::pid_t) -> Self {
-        Self {
-            step,
-            pgid,
-            child_exit_observed: false,
-            armed: true,
+        CleanGitError::KillProcessGroup { pgid, source } => {
+            GitCloneBundleRunError::KillProcessGroup { step, pgid, source }
         }
     }
-
-    fn mark_child_exit_observed(&mut self) {
-        self.child_exit_observed = true;
-    }
-
-    fn kill_now(&self) -> Result<(), GitCloneBundleRunError> {
-        kill_process_group_inner(self.step, self.pgid, self.child_exit_observed)
-    }
-
-    fn disarm(&mut self) {
-        self.armed = false;
-    }
-}
-
-impl Drop for ProcessGroupCleanupGuard {
-    fn drop(&mut self) {
-        if self.armed {
-            let _ = kill_process_group_inner(self.step, self.pgid, self.child_exit_observed);
-        }
-    }
-}
-
-fn current_supplementary_groups() -> Vec<libc::gid_t> {
-    let count = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
-    if count <= 0 {
-        return Vec::new();
-    }
-    let mut groups = vec![0 as libc::gid_t; count as usize];
-    let actual = unsafe { libc::getgroups(count, groups.as_mut_ptr()) };
-    if actual <= 0 {
-        return Vec::new();
-    }
-    groups.truncate(actual as usize);
-    groups
-}
-
-fn kill_process_group_inner(
-    step: GitCloneCommandStep,
-    pgid: libc::pid_t,
-    child_exit_observed: bool,
-) -> Result<(), GitCloneBundleRunError> {
-    // The child was spawned with process_group(0), making its pid the process
-    // group id inherited by any ordinary Git helpers it starts.
-    let killed = unsafe { libc::killpg(pgid, libc::SIGKILL) };
-    if killed == 0 {
-        return Ok(());
-    }
-    let source = std::io::Error::last_os_error();
-    if source.raw_os_error() == Some(libc::ESRCH) {
-        return Ok(());
-    }
-    // On macOS, killpg can report EPERM after waitid(WNOWAIT) observes that
-    // the leader has exited and there are no signalable live members left.
-    if child_exit_observed && source.raw_os_error() == Some(libc::EPERM) {
-        return Ok(());
-    }
-    Err(GitCloneBundleRunError::KillProcessGroup { step, pgid, source })
 }
 
 async fn reject_bundle_inside_canonical_mirror(
@@ -1053,13 +756,6 @@ fn normalize_absolute_path_lexically(path: PathBuf) -> PathBuf {
     normalized
 }
 
-fn clean_git_config_env() -> Vec<GitCommandEnv> {
-    CLEAN_GIT_CONFIG_ENV
-        .into_iter()
-        .map(|(name, value)| GitCommandEnv::new(name, value))
-        .collect()
-}
-
 fn validate_secret_env_var(raw: &str) -> Result<(), GitSecretEnvVarError> {
     let Some(first) = raw.bytes().next() else {
         return Err(GitSecretEnvVarError::Empty);
@@ -1102,6 +798,7 @@ fn github_https_url(repo: &GitCloneRepo) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::clean_git::{is_executable_file, resolve_program_for_clean_env};
     use crate::core::RepoRef;
     use crate::vm_git::GitCloneRef;
     use proptest::prelude::*;
@@ -1203,7 +900,7 @@ mod tests {
 set -eu
 log={log}
 cwd=$(pwd)
-printf '%s|%s|%s|%s|%s|%s|%s\n' "$cwd" "${{GIT_CONFIG_NOSYSTEM-unset}}" "${{GIT_CONFIG_GLOBAL-unset}}" "${{GIT_CONFIG_COUNT-unset}}" "${{WRIT_GITHUB_TOKEN-unset}}" "${{HOME+set}}" "${{PATH+set}}" >> "$log"
+printf '%s|%s|%s|%s|%s|%s|%s\n' "$cwd" "${{GIT_CONFIG_NOSYSTEM-unset}}" "${{GIT_CONFIG_GLOBAL-unset}}" "${{GIT_CONFIG_COUNT-unset}}" "${{WRIT_GITHUB_TOKEN-unset}}" "${{HOME-unset}}" "${{PATH+set}}" >> "$log"
 if [ "$1" = "-c" ]; then
     [ "$2" = "credential.helper=" ]
     [ "$3" = "-c" ]
@@ -1646,7 +1343,7 @@ exit 42
                 .clone_mirror()
                 .required_secret_env()
                 .iter()
-                .map(GitSecretEnvVar::as_str)
+                .map(String::as_str)
                 .collect::<Vec<_>>(),
             vec!["WRIT_GITHUB_TOKEN"]
         );
@@ -1661,6 +1358,7 @@ exit 42
             assert_eq!(env_value(command, "GIT_CONFIG_NOSYSTEM"), Some("1"));
             assert_eq!(env_value(command, "GIT_CONFIG_GLOBAL"), Some("/dev/null"));
             assert_eq!(env_value(command, "GIT_CONFIG_COUNT"), Some("0"));
+            assert_eq!(env_value(command, "HOME"), Some("/dev/null"));
         }
 
         for command in commands.all() {
@@ -1675,12 +1373,12 @@ exit 42
         assert!(!format!("{plan:?}").contains(token));
     }
 
-    fn env_value<'a>(command: &'a GitCommandInvocation, name: &str) -> Option<&'a str> {
+    fn env_value<'a>(command: &'a CleanGitInvocation, name: &str) -> Option<&'a str> {
         command
             .env()
             .iter()
             .find(|env| env.name() == name)
-            .map(GitCommandEnv::value)
+            .map(CleanGitEnv::value)
     }
 
     #[tokio::test]
@@ -1705,8 +1403,8 @@ exit 42
         assert_eq!(
             lines,
             vec![
-                "/|1|/dev/null|0|super-secret-token||set",
-                "/|1|/dev/null|0|unset||set",
+                "/|1|/dev/null|0|super-secret-token|/dev/null|set",
+                "/|1|/dev/null|0|unset|/dev/null|set",
             ]
         );
     }
