@@ -100,10 +100,7 @@ impl AuditLog {
                  ORDER BY p.submitted_at ASC, p.rowid ASC",
             )?;
             let rows = stmt
-                .query_map(
-                    params![session_id.as_uuid().to_string()],
-                    plan_from_row,
-                )?
+                .query_map(params![session_id.as_uuid().to_string()], plan_from_row)?
                 .collect::<Result<Vec<_>, _>>()?;
             rows.into_iter().collect::<Result<Vec<_>, _>>()
         })
@@ -307,10 +304,7 @@ mod tests {
         let AuditError::Sqlite(e) = err else {
             panic!("expected sqlite UNIQUE error, got {err:?}");
         };
-        assert!(
-            e.to_string().to_uppercase().contains("UNIQUE"),
-            "got: {e}"
-        );
+        assert!(e.to_string().to_uppercase().contains("UNIQUE"), "got: {e}");
     }
 
     /// The Rust [`PlanBody`] newtype rejects an empty string at parse

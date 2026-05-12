@@ -2146,11 +2146,7 @@ mod tests {
                 "INSERT INTO plan
                  (plan_id, agent_run_id, submitted_at, body, body_sha256)
                  VALUES (?1, ?2, 3, '# Plan', ?3)",
-                params![
-                    plan_id_a.to_string(),
-                    run_id.to_string(),
-                    &body_sha,
-                ],
+                params![plan_id_a.to_string(), run_id.to_string(), &body_sha,],
             )?;
             Ok(())
         })
