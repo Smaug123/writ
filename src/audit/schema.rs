@@ -924,9 +924,44 @@ END;
     // as a leaf), so the standard SQLite table-recreation pattern
     // simplifies to: drop trigger/index, rename, create, copy, drop
     // old, restore index/trigger.
+    //
+    // The migration begins with a pre-flight guard. A v15 DB could
+    // legitimately contain plan rows that violate the new invariants
+    // (because the v15 CHECK was only `body != ''` and the old
+    // `PlanBody::try_new` did not reject embedded NULs), and the
+    // copy step would otherwise abort with a generic "CHECK
+    // constraint failed" message. A temp trigger that RAISEs gives
+    // the operator a targeted, actionable error and leaves the v15
+    // schema untouched (the transaction rolls back).
     Migration {
         version: 16,
         sql: r#"
+-- Pre-flight: a v15 DB could legitimately contain plan rows that
+-- violate the new invariants (the v15 CHECK was only `body != ''`,
+-- and `PlanBody::try_new` did not reject embedded NULs). If we just
+-- ran the copy, SQLite would abort with a generic "CHECK constraint
+-- failed: plan" message that does not say which invariant or which
+-- row. A trigger that RAISEs explicitly gives the operator a
+-- targeted message before the destructive recreate begins.
+CREATE TEMP TABLE _plan_v16_preflight (sentinel INTEGER);
+CREATE TEMP TRIGGER _plan_v16_preflight_guard
+BEFORE INSERT ON _plan_v16_preflight
+WHEN EXISTS (
+    SELECT 1 FROM plan
+    WHERE typeof(body) != 'text'
+       OR length(cast(body AS BLOB)) > 262144
+       OR instr(cast(body AS BLOB), x'00') != 0
+)
+BEGIN
+    SELECT RAISE(
+        ABORT,
+        'migration 16: existing plan rows violate the hardened body invariants (BLOB storage class, embedded NUL byte, or body size > 262144 bytes); inspect and clean these rows before upgrading'
+    );
+END;
+INSERT INTO _plan_v16_preflight VALUES (0);
+DROP TRIGGER _plan_v16_preflight_guard;
+DROP TABLE _plan_v16_preflight;
+
 DROP TRIGGER plan_requires_open_session;
 DROP INDEX idx_plan_agent_run;
 
@@ -2447,6 +2482,88 @@ mod tests {
         let huge = "x".repeat(262_145);
         let err = insert_plan(run_id_big, rusqlite::types::Value::Text(huge));
         assert!(err.to_string().contains("CHECK"), "got: {err}");
+    }
+
+    /// A v15 DB could contain plan rows that violate the new
+    /// invariants (the v15 CHECK was only `body != ''` and the old
+    /// `PlanBody::try_new` did not reject embedded NULs). Migration
+    /// 16 must refuse such a DB with a targeted, actionable error
+    /// rather than a generic "CHECK constraint failed" surfaced from
+    /// the copy step.
+    #[test]
+    fn migration_16_refuses_v15_db_with_nul_plan_body() {
+        let db = NamedTempFile::new().unwrap();
+        let session_id = SessionId::new();
+        let run_id = uuid::Uuid::new_v4();
+        let plan_id = uuid::Uuid::new_v4();
+        let dirty_body = "before\0after";
+        let body_sha = crate::agent_run::sha256_hex(dirty_body.as_bytes());
+
+        {
+            let mut conn = Connection::open(db.path()).unwrap();
+            let tx = conn.transaction().unwrap();
+            for migration in MIGRATIONS.iter().take(15) {
+                tx.execute_batch(migration.sql).unwrap();
+            }
+            tx.pragma_update(None, "user_version", 15).unwrap();
+
+            tx.execute(
+                "INSERT INTO session (session_id, label, agent_kind, agent_model, opened_at, closed_at) \
+                 VALUES (?1, NULL, 'claude', NULL, 1, NULL)",
+                params![session_id.as_uuid().to_string()],
+            )
+            .unwrap();
+            tx.execute(
+                "INSERT INTO agent_run (
+                     run_id, session_id, requested_at, agent_kind,
+                     prompt_bytes, prompt_sha256, prompt_redacted_preview,
+                     correlation_id
+                 ) VALUES (?1, ?2, 2, 'claude', 1, ?3, '<redacted>', NULL)",
+                params![
+                    run_id.to_string(),
+                    session_id.as_uuid().to_string(),
+                    "a".repeat(64),
+                ],
+            )
+            .unwrap();
+            tx.execute(
+                "INSERT INTO plan (plan_id, agent_run_id, submitted_at, body, body_sha256) \
+                 VALUES (?1, ?2, 3, ?3, ?4)",
+                params![
+                    plan_id.to_string(),
+                    run_id.to_string(),
+                    dirty_body,
+                    &body_sha,
+                ],
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+
+        // The open should fail; the rolled-back transaction must leave
+        // the v15 schema intact so the operator can inspect the bad
+        // row and decide what to do.
+        let err = AuditLog::open(db.path()).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("migration 16") && msg.contains("plan rows violate"),
+            "expected targeted migration-16 message, got: {msg}",
+        );
+
+        // The v15 row is still there and the schema is still v15.
+        let conn = Connection::open(db.path()).unwrap();
+        let user_version: i32 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(user_version, 15);
+        let recovered_body: String = conn
+            .query_row(
+                "SELECT body FROM plan WHERE plan_id = ?1",
+                params![plan_id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(recovered_body, dirty_body);
     }
 
     /// Regression guard for the NUL-injection case in two flavours:
