@@ -4,6 +4,7 @@ use rusqlite::{OptionalExtension, Row, params};
 
 use super::validation::{parse_required_jti, parse_required_request_id};
 use super::{AuditError, AuditLog};
+use crate::agent_plan::CorrelationId;
 use crate::core::{GitHubAccess, GrantedScope, Jti, RequestId, SessionId, UnixMillis};
 use crate::vm_git::{GitBranchName, GitCloneRepo, GitObjectId};
 
@@ -19,6 +20,11 @@ pub struct GitPushRequestRecord {
     /// path will fail-closed if a remote branch later appears.
     pub expected_remote_head: Option<GitObjectId>,
     pub new_head: GitObjectId,
+    /// Opaque caller-supplied correlation id, threaded from the
+    /// originating agent run when the push was authorised. `None` for
+    /// pushes that were not tagged. See
+    /// `docs/plans/2026-05-11-agent-plans.md` ("Correlation ID").
+    pub correlation_id: Option<CorrelationId>,
 }
 
 #[derive(Debug)]
@@ -96,6 +102,9 @@ pub struct GitPushAuditEntry {
     pub branch: GitBranchName,
     pub expected_remote_head: Option<GitObjectId>,
     pub new_head: GitObjectId,
+    /// Correlation id recorded against the originating push request.
+    /// `None` when the request was untagged.
+    pub correlation_id: Option<CorrelationId>,
     pub push_attempt_id: Option<RequestId>,
     pub capability_request_id: Option<RequestId>,
     pub grant_jti: Option<Jti>,
@@ -141,8 +150,9 @@ impl AuditLog {
                      repo,
                      branch,
                      expected_remote_head,
-                     new_head
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                     new_head,
+                     correlation_id
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params![
                     r.push_request_id.as_uuid().to_string(),
                     r.session_id.as_uuid().to_string(),
@@ -151,6 +161,7 @@ impl AuditLog {
                     r.branch.as_str(),
                     r.expected_remote_head.as_ref().map(GitObjectId::as_str),
                     r.new_head.as_str(),
+                    r.correlation_id.as_ref().map(CorrelationId::as_str),
                 ],
             )?;
             tx.commit()?;
@@ -415,6 +426,7 @@ impl AuditLog {
                      r.branch,
                      r.expected_remote_head,
                      r.new_head AS request_new_head,
+                     r.correlation_id,
                      a.push_attempt_id,
                      a.capability_request_id,
                      a.grant_jti,
@@ -459,6 +471,7 @@ impl AuditLog {
                      r.branch,
                      r.expected_remote_head,
                      r.new_head AS request_new_head,
+                     r.correlation_id,
                      a.push_attempt_id,
                      a.capability_request_id,
                      a.grant_jti,
@@ -562,6 +575,7 @@ fn git_push_audit_entry_from_row(
     let branch_str: String = row.get("branch")?;
     let expected_remote_head_str: Option<String> = row.get("expected_remote_head")?;
     let new_head_str: String = row.get("request_new_head")?;
+    let correlation_id_raw: Option<String> = row.get("correlation_id")?;
     let push_attempt_id_str: Option<String> = row.get("push_attempt_id")?;
     let capability_request_id_str: Option<String> = row.get("capability_request_id")?;
     let grant_jti_str: Option<String> = row.get("grant_jti")?;
@@ -597,6 +611,10 @@ fn git_push_audit_entry_from_row(
         let new_head = new_head_str
             .parse::<GitObjectId>()
             .map_err(|_| AuditError::Invariant("Git push audit row: new head is invalid"))?;
+        let correlation_id = correlation_id_raw
+            .map(CorrelationId::try_new)
+            .transpose()
+            .map_err(|_| AuditError::Invariant("Git push audit row: correlation_id is invalid"))?;
 
         // SQLite's `TEXT PRIMARY KEY` does not imply NOT NULL, so a
         // corrupt row could carry a NULL `push_attempt_id` alongside
@@ -714,6 +732,7 @@ fn git_push_audit_entry_from_row(
             branch,
             expected_remote_head,
             new_head,
+            correlation_id,
             push_attempt_id,
             capability_request_id,
             grant_jti,
@@ -775,6 +794,7 @@ mod tests {
             branch: "main".parse().unwrap(),
             expected_remote_head: Some(git_oid('1')),
             new_head: git_oid('2'),
+            correlation_id: None,
         }
     }
 
@@ -1048,6 +1068,7 @@ mod tests {
                             branch: push_request.branch,
                             expected_remote_head: push_request.expected_remote_head,
                             new_head: push_request.new_head,
+                            correlation_id: push_request.correlation_id,
                             push_attempt_id: Some(push_attempt_id),
                             capability_request_id: Some(capability_request_id),
                             grant_jti: Some(grant.jti),
@@ -1097,6 +1118,7 @@ mod tests {
                             branch: push_request.branch,
                             expected_remote_head: push_request.expected_remote_head,
                             new_head: push_request.new_head,
+                            correlation_id: push_request.correlation_id,
                             push_attempt_id: None,
                             capability_request_id: None,
                             grant_jti: None,
@@ -1917,5 +1939,53 @@ mod tests {
             let back: GitPushResolution = serde_json::from_value(json).unwrap();
             assert_eq!(back, v);
         }
+    }
+
+    #[test]
+    fn git_push_request_roundtrips_with_correlation_id() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+        let push_request_id = RequestId::new();
+        let correlation = CorrelationId::try_new("feat-abc_123").unwrap();
+        let record = GitPushRequestRecord {
+            correlation_id: Some(correlation.clone()),
+            ..sample_git_push_request_record(push_request_id, s.session_id)
+        };
+        log.record_git_push_request(&record).unwrap();
+
+        let entry = log.get_git_push(push_request_id).unwrap().unwrap();
+        assert_eq!(entry.correlation_id, Some(correlation));
+    }
+
+    /// The CHECK constraint on `git_push_request.correlation_id` is the
+    /// belt-and-braces line of defence. The DAO is the parse-don't-
+    /// validate boundary today, but a future code path that writes the
+    /// row directly must not be able to land bytes outside the allowed
+    /// class.
+    #[test]
+    fn git_push_request_correlation_id_check_constraint_rejects_invalid_bytes() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+        let push_request_id = RequestId::new();
+        let err = log
+            .with_conn_mut(|c| {
+                c.execute(
+                    "INSERT INTO git_push_request (
+                         push_request_id, session_id, received_at, repo,
+                         branch, expected_remote_head, new_head, correlation_id
+                     ) VALUES (?1, ?2, 1, 'o/n', 'main', NULL, ?3, ?4)",
+                    params![
+                        push_request_id.as_uuid().to_string(),
+                        s.session_id.as_uuid().to_string(),
+                        "a".repeat(40),
+                        "bad/slash",
+                    ],
+                )
+                .map_err(AuditError::from)
+            })
+            .unwrap_err();
+        assert!(err.to_string().contains("CHECK"), "got: {err:?}");
     }
 }

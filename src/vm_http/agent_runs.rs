@@ -409,6 +409,7 @@ mod tests {
                 requested_at: UnixMillis::now(),
                 agent_kind: crate::core::AgentKind::Claude,
                 prompt: AgentPrompt::new("prompt").summary(),
+                correlation_id: None,
             })
             .unwrap();
         let temp = tempfile::tempdir().unwrap();
@@ -474,6 +475,7 @@ mod tests {
                 requested_at: UnixMillis::now(),
                 agent_kind: crate::core::AgentKind::Claude,
                 prompt: AgentPrompt::new("prompt").summary(),
+                correlation_id: None,
             })
             .unwrap();
         let temp = tempfile::tempdir().unwrap();

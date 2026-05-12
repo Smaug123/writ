@@ -108,6 +108,7 @@ async fn handle_git_push_request<S: SecretStore + Send + Sync + 'static>(
         branch: metadata.branch().clone(),
         expected_remote_head: metadata.expected_remote_head().cloned(),
         new_head: metadata.new_head().clone(),
+        correlation_id: None,
     };
     match service.broker_state.audit.record_git_push_request(&record) {
         Ok(()) => {}

@@ -1290,6 +1290,7 @@ mod tests {
                 branch: sample_branch(),
                 expected_remote_head: Some(sample_object_id('a')),
                 new_head: sample_object_id('b'),
+                correlation_id: None,
             })
             .unwrap();
         request_id

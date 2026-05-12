@@ -638,6 +638,7 @@ impl AgentVmDaemon {
                     requested_at: UnixMillis::now(),
                     agent_kind,
                     prompt: prompt.summary(),
+                    correlation_id: None,
                 })?;
                 let agent_runs = VmHttpAgentRunService::new(
                     Arc::clone(&state),
