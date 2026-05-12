@@ -289,17 +289,56 @@ impl TreeEntryKind {
     }
 }
 
-/// Name, email, and authoring time of a Git author or committer.
+/// Name, email, and pre-formatted authoring timestamp of a Git
+/// author or committer.
 ///
-/// `date` is whatever the bundle carried for that commit, including
-/// its timezone offset. Sub-second precision (if the caller somehow
-/// constructed one) is dropped when sent to GitHub since the API
-/// documents seconds-precision ISO-8601.
+/// Construct via [`CommitIdentity::new`], which validates the
+/// supplied `OffsetDateTime` by formatting it as RFC 3339 once and
+/// caching the string. From that point the value is known-good for
+/// the wire, so [`GitDataClient::create_commit`] cannot fail at
+/// send time on a malformed date — the failure surfaces at the
+/// boundary where it can be reported back to whichever bundle
+/// commit produced the bad metadata.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CommitIdentity {
-    pub name: String,
-    pub email: String,
-    pub date: time::OffsetDateTime,
+    name: String,
+    email: String,
+    /// Pre-formatted RFC 3339 timestamp with sub-second precision
+    /// truncated. Preserves the original timezone offset.
+    date_rfc3339: String,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum CommitIdentityError {
+    /// The supplied `OffsetDateTime` is outside what RFC 3339 can
+    /// represent (e.g. a sub-minute UTC offset, or a year outside
+    /// `0000..=9999`). Git commit dates Git itself emits are
+    /// always within range, so this typically indicates corrupted
+    /// or hand-crafted bundle metadata.
+    #[error("commit identity date cannot be formatted as RFC 3339: {0}")]
+    Rfc3339Format(#[from] time::error::Format),
+}
+
+impl CommitIdentity {
+    /// Validate the date by formatting it as RFC 3339 (seconds
+    /// precision, original offset preserved) and store the result
+    /// alongside the name/email. The whole struct is known
+    /// wire-ready after this returns `Ok`.
+    pub fn new(
+        name: impl Into<String>,
+        email: impl Into<String>,
+        date: time::OffsetDateTime,
+    ) -> Result<Self, CommitIdentityError> {
+        let date = date
+            .replace_nanosecond(0)
+            .expect("zero is always a valid nanosecond for OffsetDateTime");
+        let date_rfc3339 = date.format(&time::format_description::well_known::Rfc3339)?;
+        Ok(Self {
+            name: name.into(),
+            email: email.into(),
+            date_rfc3339,
+        })
+    }
 }
 
 /// Inputs to [`GitDataClient::create_commit`].
@@ -324,25 +363,11 @@ pub struct CommitRequest<'a> {
     pub signature: Option<&'a str>,
 }
 
-/// Format an `OffsetDateTime` as RFC 3339 truncated to whole seconds.
-///
-/// GitHub documents `author.date`/`committer.date` as
-/// `YYYY-MM-DDTHH:MM:SSZ` (or with an explicit offset); the `time`
-/// crate's default RFC 3339 emits sub-second digits when present,
-/// which is technically out of spec for the API. Truncating here
-/// avoids the question entirely.
-fn rfc3339_seconds(date: time::OffsetDateTime) -> String {
-    date.replace_nanosecond(0)
-        .expect("zero is a valid nanosecond for OffsetDateTime")
-        .format(&time::format_description::well_known::Rfc3339)
-        .expect("OffsetDateTime always formats as RFC 3339")
-}
-
 fn identity_wire(identity: &CommitIdentity) -> CommitIdentityWire<'_> {
     CommitIdentityWire {
         name: &identity.name,
         email: &identity.email,
-        date: rfc3339_seconds(identity.date),
+        date: &identity.date_rfc3339,
     }
 }
 
@@ -391,7 +416,7 @@ struct CommitCreateBody<'a> {
 struct CommitIdentityWire<'a> {
     name: &'a str,
     email: &'a str,
-    date: String,
+    date: &'a str,
 }
 
 #[derive(serde::Deserialize)]
@@ -709,11 +734,8 @@ mod tests {
     }
 
     fn sample_identity(name: &str, date: time::OffsetDateTime) -> CommitIdentity {
-        CommitIdentity {
-            name: name.to_string(),
-            email: format!("{name}@example.invalid"),
-            date,
-        }
+        CommitIdentity::new(name, format!("{name}@example.invalid"), date)
+            .expect("test datetime is RFC 3339 representable")
     }
 
     fn unsigned_request<'a>(
@@ -734,25 +756,54 @@ mod tests {
     }
 
     #[test]
-    fn rfc3339_seconds_drops_subsecond_precision() {
+    fn commit_identity_drops_subsecond_precision_on_date() {
         // The wire format GitHub documents is YYYY-MM-DDTHH:MM:SSZ;
         // emitting sub-second digits is technically out of spec and
         // would let a caller-constructed sub-second `OffsetDateTime`
-        // surface a deviation. Truncating here keeps the wire shape
-        // stable.
+        // surface a deviation. Truncating at construction keeps the
+        // wire shape stable.
         use time::macros::datetime;
-        let with_nanos = datetime!(2024-01-15 10:30:45.123456789 UTC);
-        assert_eq!(rfc3339_seconds(with_nanos), "2024-01-15T10:30:45Z");
+        let identity = CommitIdentity::new(
+            "Alice",
+            "alice@example.invalid",
+            datetime!(2024-01-15 10:30:45.123456789 UTC),
+        )
+        .expect("UTC date is RFC 3339 representable");
+        assert_eq!(identity.date_rfc3339, "2024-01-15T10:30:45Z");
     }
 
     #[test]
-    fn rfc3339_seconds_preserves_non_utc_offset() {
+    fn commit_identity_preserves_non_utc_offset() {
         // Git commits carry the original author/committer offset
         // (e.g. `+0530`); we forward it verbatim so the replayed
         // commit's timestamp is faithful to the bundle.
         use time::macros::datetime;
-        let with_offset = datetime!(2024-01-15 10:30:45 +05:30);
-        assert_eq!(rfc3339_seconds(with_offset), "2024-01-15T10:30:45+05:30");
+        let identity = CommitIdentity::new(
+            "Alice",
+            "alice@example.invalid",
+            datetime!(2024-01-15 10:30:45 +05:30),
+        )
+        .expect("+05:30 offset is RFC 3339 representable");
+        assert_eq!(identity.date_rfc3339, "2024-01-15T10:30:45+05:30");
+    }
+
+    #[test]
+    fn commit_identity_rejects_subminute_offset() {
+        // RFC 3339 only allows offsets in whole minutes. `time` lets
+        // you build a sub-minute offset with `UtcOffset::from_hms`,
+        // and the RFC 3339 formatter rejects it. The validated
+        // constructor must surface that as an error rather than
+        // panicking inside `create_commit` later.
+        use time::macros::datetime;
+        let subminute_offset =
+            time::UtcOffset::from_hms(0, 0, 30).expect("seconds-precision offset constructs");
+        let weird_date = datetime!(2024-01-15 10:30:45 UTC).replace_offset(subminute_offset);
+        let err = CommitIdentity::new("Alice", "alice@example.invalid", weird_date)
+            .expect_err("sub-minute offset must not be accepted");
+        assert!(
+            matches!(err, CommitIdentityError::Rfc3339Format(_)),
+            "expected an Rfc3339Format error, got {err:?}",
+        );
     }
 
     #[tokio::test]
