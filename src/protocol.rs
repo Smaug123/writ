@@ -12,7 +12,7 @@
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::agent_plan::CorrelationId;
+use crate::agent_plan::{CorrelationId, PlanBody, PlanId};
 use crate::agent_run::{AgentPrompt, AgentRunId};
 use crate::agent_vm_lifecycle::AgentVmSessionStateStatus;
 use crate::audit::GitPushOutcomeResult;
@@ -85,6 +85,33 @@ pub struct StagedPushDetail {
     pub summary: StagedPushSummary,
     pub bundle_bytes: u64,
     pub audit: StagedPushAuditView,
+}
+
+/// One row of [`ServerMessage::Plans`]: enough plan metadata to triage
+/// without loading the body. `body_bytes` and `body_sha256` are taken
+/// from the audit row directly so the listing is one query; the body
+/// is fetched via [`ClientMessage::ShowPlan`] when wanted.
+///
+/// `correlation_id` is joined from the planner's `agent_run` row.
+/// Plans whose planner run was untagged surface `None`.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PlanSummary {
+    pub plan_id: PlanId,
+    pub agent_run_id: AgentRunId,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub correlation_id: Option<CorrelationId>,
+    pub submitted_at: UnixMillis,
+    pub body_sha256: String,
+    pub body_bytes: u64,
+}
+
+/// Full plan view returned by [`ServerMessage::Plan`]: the summary plus
+/// the verbatim body. Splitting body out keeps the list path cheap and
+/// the show path explicit about loading up to 256 KiB of markdown.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PlanDetail {
+    pub summary: PlanSummary,
+    pub body: PlanBody,
 }
 
 /// Maximum byte length of a [`RejectionReason`]. Sized to comfortably
@@ -256,6 +283,17 @@ pub enum ClientMessage {
         operator: String,
         reason: RejectionReason,
     },
+    /// List every plan recorded in the audit log, optionally filtered
+    /// to those whose planner run carries `correlation_id`. Replies
+    /// with [`ServerMessage::Plans`].
+    ListPlans {
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        correlation_id: Option<CorrelationId>,
+    },
+    /// Fetch one plan by id, including the verbatim body. Replies
+    /// with [`ServerMessage::Plan`] on hit and
+    /// [`ServerMessage::UnknownPlan`] on miss.
+    ShowPlan { plan_id: PlanId },
 }
 
 /// A message from the broker to the agent.
@@ -329,6 +367,17 @@ pub enum ServerMessage {
     /// so a replay surfaces as an explicit "already decided" outcome
     /// rather than a prose error string.
     StagedPushAlreadyResolved { request_id: RequestId },
+    /// Listing of plans returned by [`ClientMessage::ListPlans`].
+    /// Ordered ascending by `submitted_at` with rowid as the
+    /// tie-break, matching the DAO query.
+    Plans { plans: Vec<PlanSummary> },
+    /// One plan with its verbatim body and joined correlation id.
+    Plan { plan: PlanDetail },
+    /// The `plan_id` referenced by [`ClientMessage::ShowPlan`] has no
+    /// row in the audit log. Distinct from [`ServerMessage::Error`] so
+    /// clients can distinguish "no such plan" from a corrupt store or
+    /// IO failure.
+    UnknownPlan { plan_id: PlanId },
     /// An internal failure (mint error, audit write failure, agent VM
     /// runtime not configured, …). The agent should surface `message` to
     /// the user and not retry automatically. Outcomes a client may want
@@ -401,6 +450,12 @@ impl std::fmt::Debug for ServerMessage {
             Self::StagedPushAlreadyResolved { request_id } => f
                 .debug_struct("StagedPushAlreadyResolved")
                 .field("request_id", request_id)
+                .finish(),
+            Self::Plans { plans } => f.debug_struct("Plans").field("plans", plans).finish(),
+            Self::Plan { plan } => f.debug_struct("Plan").field("plan", plan).finish(),
+            Self::UnknownPlan { plan_id } => f
+                .debug_struct("UnknownPlan")
+                .field("plan_id", plan_id)
                 .finish(),
             Self::Error { message } => f.debug_struct("Error").field("message", message).finish(),
         }
@@ -721,6 +776,37 @@ mod tests {
         "f0f0f0f0-0000-0000-0000-000000000001".parse().unwrap()
     }
 
+    fn sample_plan_id() -> PlanId {
+        "f1f1f1f1-0000-0000-0000-000000000001".parse().unwrap()
+    }
+
+    fn sample_agent_run_id() -> AgentRunId {
+        "f2f2f2f2-0000-0000-0000-000000000001".parse().unwrap()
+    }
+
+    fn sample_plan_body() -> PlanBody {
+        PlanBody::try_new("# Plan\n\nStep 1: do the thing.").unwrap()
+    }
+
+    fn sample_plan_summary() -> PlanSummary {
+        let body = sample_plan_body();
+        PlanSummary {
+            plan_id: sample_plan_id(),
+            agent_run_id: sample_agent_run_id(),
+            correlation_id: Some(CorrelationId::try_new("feat-42_xyz").unwrap()),
+            submitted_at: UnixMillis::from_millis(1_700_000_000_000),
+            body_sha256: body.sha256_hex(),
+            body_bytes: body.byte_len(),
+        }
+    }
+
+    fn sample_plan_detail() -> PlanDetail {
+        PlanDetail {
+            summary: sample_plan_summary(),
+            body: sample_plan_body(),
+        }
+    }
+
     fn sample_object_id(nibble: char) -> GitObjectId {
         std::iter::repeat_n(nibble, 40)
             .collect::<String>()
@@ -819,6 +905,135 @@ mod tests {
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert_eq!(serde_json::from_str::<ServerMessage>(&json).unwrap(), msg);
+    }
+
+    #[test]
+    fn list_plans_with_correlation_id_roundtrips() {
+        let msg = ClientMessage::ListPlans {
+            correlation_id: Some(CorrelationId::try_new("feat-42_xyz").unwrap()),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert_eq!(serde_json::from_str::<ClientMessage>(&json).unwrap(), msg);
+        assert!(json.contains("feat-42_xyz"));
+    }
+
+    /// `correlation_id` is `skip_serializing_if = Option::is_none` so a
+    /// `None`-filter listing serialises without the field; a client
+    /// that omits it must still deserialise to the same variant.
+    #[test]
+    fn list_plans_without_correlation_id_roundtrips_and_omits_field() {
+        let msg = ClientMessage::ListPlans {
+            correlation_id: None,
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert_eq!(serde_json::from_str::<ClientMessage>(&json).unwrap(), msg);
+        assert!(!json.contains("correlation_id"));
+    }
+
+    #[test]
+    fn show_plan_roundtrips() {
+        let msg = ClientMessage::ShowPlan {
+            plan_id: sample_plan_id(),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert_eq!(serde_json::from_str::<ClientMessage>(&json).unwrap(), msg);
+    }
+
+    #[test]
+    fn plans_listing_roundtrips() {
+        let msg = ServerMessage::Plans {
+            plans: vec![sample_plan_summary()],
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert_eq!(serde_json::from_str::<ServerMessage>(&json).unwrap(), msg);
+    }
+
+    #[test]
+    fn plans_listing_empty_roundtrips() {
+        let msg = ServerMessage::Plans { plans: vec![] };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert_eq!(serde_json::from_str::<ServerMessage>(&json).unwrap(), msg);
+    }
+
+    /// A plan whose planner run was untagged drops the correlation_id
+    /// key on the wire entirely — older clients that predate the
+    /// field stay compatible.
+    #[test]
+    fn plan_summary_without_correlation_id_omits_field_on_wire() {
+        let summary = PlanSummary {
+            correlation_id: None,
+            ..sample_plan_summary()
+        };
+        let value: serde_json::Value = serde_json::to_value(&summary).unwrap();
+        assert!(value.get("correlation_id").is_none());
+        // And it parses back.
+        let back: PlanSummary = serde_json::from_value(value).unwrap();
+        assert_eq!(back, summary);
+    }
+
+    #[test]
+    fn plan_detail_roundtrips() {
+        let msg = ServerMessage::Plan {
+            plan: sample_plan_detail(),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert_eq!(serde_json::from_str::<ServerMessage>(&json).unwrap(), msg);
+    }
+
+    #[test]
+    fn unknown_plan_roundtrips() {
+        let msg = ServerMessage::UnknownPlan {
+            plan_id: sample_plan_id(),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert_eq!(serde_json::from_str::<ServerMessage>(&json).unwrap(), msg);
+    }
+
+    #[test]
+    fn plan_type_tags() {
+        let list: serde_json::Value = serde_json::to_value(ClientMessage::ListPlans {
+            correlation_id: None,
+        })
+        .unwrap();
+        assert_eq!(list["type"], "list_plans");
+
+        let show: serde_json::Value = serde_json::to_value(ClientMessage::ShowPlan {
+            plan_id: sample_plan_id(),
+        })
+        .unwrap();
+        assert_eq!(show["type"], "show_plan");
+
+        let plans: serde_json::Value =
+            serde_json::to_value(ServerMessage::Plans { plans: vec![] }).unwrap();
+        assert_eq!(plans["type"], "plans");
+
+        let plan: serde_json::Value = serde_json::to_value(ServerMessage::Plan {
+            plan: sample_plan_detail(),
+        })
+        .unwrap();
+        assert_eq!(plan["type"], "plan");
+
+        let unknown: serde_json::Value = serde_json::to_value(ServerMessage::UnknownPlan {
+            plan_id: sample_plan_id(),
+        })
+        .unwrap();
+        assert_eq!(unknown["type"], "unknown_plan");
+    }
+
+    /// `unknown_plan` carries its own type tag so a client dispatching
+    /// on `type` can distinguish it from a generic internal-failure
+    /// `Error` without parsing the message string.
+    #[test]
+    fn unknown_plan_distinct_from_error() {
+        let unknown: serde_json::Value = serde_json::to_value(ServerMessage::UnknownPlan {
+            plan_id: sample_plan_id(),
+        })
+        .unwrap();
+        let error: serde_json::Value = serde_json::to_value(ServerMessage::Error {
+            message: "internal".into(),
+        })
+        .unwrap();
+        assert_ne!(unknown["type"], error["type"]);
     }
 
     #[test]
@@ -1154,7 +1369,7 @@ mod tests {
         /// variant, and assert the result fails to parse.
         #[test]
         fn client_message_rejects_unknown_top_level_fields(
-            variant_index in 0usize..10,
+            variant_index in 0usize..12,
             // ASCII-letters-only key, excluded against the union of every
             // variant's known field names below.
             unknown_key in "[a-z]{1,16}",
@@ -1163,6 +1378,7 @@ mod tests {
                 "type", "label", "agent_kind", "agent_model", "workspace",
                 "guest_command", "session_id", "capability", "prompt",
                 "request_id", "reason", "operator",
+                "correlation_id", "plan_id",
             ];
             prop_assume!(!KNOWN_FIELDS.contains(&unknown_key.as_str()));
 
@@ -1230,6 +1446,12 @@ mod tests {
                 request_id: "12345678-1234-1234-1234-123456789012".parse().unwrap(),
                 operator: "alice".into(),
                 reason: RejectionReason::try_new("leaks credentials").unwrap(),
+            },
+            10 => ClientMessage::ListPlans {
+                correlation_id: Some(CorrelationId::try_new("feat-42_xyz").unwrap()),
+            },
+            11 => ClientMessage::ShowPlan {
+                plan_id: sample_plan_id(),
             },
             other => unreachable!("variant index out of range: {other}"),
         }

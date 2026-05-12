@@ -18,6 +18,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
+use crate::agent_plan::{CorrelationId, PlanId};
 use crate::agent_vm_daemon::AgentVmDaemon;
 use crate::audit::{
     AUDIT_WRITE_FAILURE_TARGET, AuditLog, GitPushResolution, GitPushResolutionRecord, PreMintRecord,
@@ -30,8 +31,8 @@ use crate::git_push_staging::{GitPushStagingStore, StagedEntry, StagingError};
 use crate::github::GitHubMinter;
 use crate::policy::{self, PolicyConfig};
 use crate::protocol::{
-    ClientMessage, RejectionReason, ServerMessage, StagedPushAuditView, StagedPushDetail,
-    StagedPushSummary,
+    ClientMessage, PlanDetail, PlanSummary, RejectionReason, ServerMessage, StagedPushAuditView,
+    StagedPushDetail, StagedPushSummary,
 };
 use crate::secret::SecretStore;
 
@@ -267,6 +268,8 @@ pub async fn dispatch_message_with_agent_vm<S: SecretStore + Send + Sync + 'stat
             operator,
             reason,
         } => reject_staged_push(state, request_id, operator, reason).await,
+        ClientMessage::ListPlans { correlation_id } => list_plans(state, correlation_id).await,
+        ClientMessage::ShowPlan { plan_id } => show_plan(state, plan_id).await,
     }
 }
 
@@ -366,6 +369,106 @@ async fn show_staged_push<S: SecretStore + Send + Sync + 'static>(
             summary,
             bundle_bytes,
             audit,
+        },
+    }
+}
+
+async fn list_plans<S: SecretStore + Send + Sync + 'static>(
+    state: &Arc<BrokerState<S>>,
+    correlation_id: Option<CorrelationId>,
+) -> ServerMessage {
+    let audit = Arc::clone(&state.audit);
+    let result =
+        tokio::task::spawn_blocking(move || audit.list_plans(correlation_id.as_ref())).await;
+    match result {
+        Ok(Ok(entries)) => {
+            let plans = entries
+                .into_iter()
+                .map(|e| PlanSummary {
+                    plan_id: e.plan_id,
+                    agent_run_id: e.agent_run_id,
+                    correlation_id: e.correlation_id,
+                    submitted_at: e.submitted_at,
+                    body_sha256: e.body_sha256,
+                    body_bytes: e.body_bytes,
+                })
+                .collect();
+            ServerMessage::Plans { plans }
+        }
+        Ok(Err(err)) => ServerMessage::Error {
+            message: err.to_string(),
+        },
+        Err(err) => ServerMessage::Error {
+            message: format!("plan list task failed: {err}"),
+        },
+    }
+}
+
+async fn show_plan<S: SecretStore + Send + Sync + 'static>(
+    state: &Arc<BrokerState<S>>,
+    plan_id: PlanId,
+) -> ServerMessage {
+    let audit = Arc::clone(&state.audit);
+    let plan_lookup = tokio::task::spawn_blocking(move || audit.get_plan(plan_id)).await;
+    let plan = match plan_lookup {
+        Ok(Ok(Some(plan))) => plan,
+        Ok(Ok(None)) => return ServerMessage::UnknownPlan { plan_id },
+        Ok(Err(err)) => {
+            return ServerMessage::Error {
+                message: err.to_string(),
+            };
+        }
+        Err(err) => {
+            return ServerMessage::Error {
+                message: format!("plan lookup task failed: {err}"),
+            };
+        }
+    };
+
+    // Join correlation_id from the planner's agent_run. The plan row has
+    // a foreign-key onto agent_run so `Ok(None)` would be an invariant
+    // violation; surface it explicitly rather than fabricating a value.
+    let run_id = plan.agent_run_id;
+    let correlation_lookup = {
+        let audit = Arc::clone(&state.audit);
+        tokio::task::spawn_blocking(move || audit.correlation_id_for_run(run_id)).await
+    };
+    let correlation_id = match correlation_lookup {
+        Ok(Ok(Some(value))) => value,
+        Ok(Ok(None)) => {
+            return ServerMessage::Error {
+                message: format!(
+                    "plan {plan_id} references agent_run {run_id} which has no audit row; \
+                     broker state is corrupt",
+                ),
+            };
+        }
+        Ok(Err(err)) => {
+            return ServerMessage::Error {
+                message: err.to_string(),
+            };
+        }
+        Err(err) => {
+            return ServerMessage::Error {
+                message: format!("correlation_id lookup task failed: {err}"),
+            };
+        }
+    };
+
+    let body_sha256 = plan.body.sha256_hex();
+    let body_bytes = plan.body.byte_len();
+    let summary = PlanSummary {
+        plan_id: plan.plan_id,
+        agent_run_id: plan.agent_run_id,
+        correlation_id,
+        submitted_at: plan.submitted_at,
+        body_sha256,
+        body_bytes,
+    };
+    ServerMessage::Plan {
+        plan: PlanDetail {
+            summary,
+            body: plan.body,
         },
     }
 }
@@ -1699,6 +1802,202 @@ mod tests {
                 .load(request_id)
                 .is_ok()
         );
+    }
+
+    // --- Plan listing / show -------------------------------------------
+
+    /// Record a planner `agent_run` + a plan submission against the
+    /// given session, returning `(run_id, plan_id, body)`. Mirrors the
+    /// vm_http flow without going through the HTTP layer.
+    async fn record_planner_run_and_plan(
+        state: &Arc<BrokerState<InMemStore>>,
+        session_id: SessionId,
+        correlation_id: Option<crate::agent_plan::CorrelationId>,
+        body_text: &str,
+        submitted_at: UnixMillis,
+    ) -> (crate::agent_run::AgentRunId, crate::agent_plan::PlanId) {
+        let run_id = crate::agent_run::AgentRunId::new();
+        let plan_id = crate::agent_plan::PlanId::new();
+        let body = crate::agent_plan::PlanBody::try_new(body_text).unwrap();
+        let prompt = crate::agent_run::AgentPrompt::new("plan this").summary();
+        state
+            .audit
+            .record_agent_run(&crate::audit::AgentRunAuditRecord {
+                run_id,
+                session_id,
+                requested_at: UnixMillis::from_millis(1_700_000_000),
+                agent_kind: AgentKind::Claude,
+                prompt,
+                correlation_id,
+            })
+            .unwrap();
+        state
+            .audit
+            .record_plan_submission(&crate::audit::PlanSubmissionRecord {
+                plan_id,
+                agent_run_id: run_id,
+                submitted_at,
+                body,
+            })
+            .unwrap();
+        (run_id, plan_id)
+    }
+
+    #[tokio::test]
+    async fn list_plans_with_no_plans_returns_empty_listing() {
+        let server = MockServer::start().await;
+        let state = make_state(&server, vec![], "o");
+        let resp = dispatch_message(
+            ClientMessage::ListPlans {
+                correlation_id: None,
+            },
+            &state,
+        )
+        .await;
+        assert_eq!(resp, ServerMessage::Plans { plans: vec![] });
+    }
+
+    #[tokio::test]
+    async fn list_plans_returns_summaries_ordered_by_submitted_at() {
+        let server = MockServer::start().await;
+        let state = make_state(&server, vec![], "o");
+        let session_id = open_session(&state).await;
+        let (_, plan_old) = record_planner_run_and_plan(
+            &state,
+            session_id,
+            None,
+            "# old",
+            UnixMillis::from_millis(1_700_000_300),
+        )
+        .await;
+        let (_, plan_new) = record_planner_run_and_plan(
+            &state,
+            session_id,
+            None,
+            "# even newer plan",
+            UnixMillis::from_millis(1_700_000_400),
+        )
+        .await;
+        let resp = dispatch_message(
+            ClientMessage::ListPlans {
+                correlation_id: None,
+            },
+            &state,
+        )
+        .await;
+        let plans = match resp {
+            ServerMessage::Plans { plans } => plans,
+            other => panic!("expected Plans, got {other:?}"),
+        };
+        assert_eq!(plans.len(), 2);
+        assert_eq!(plans[0].plan_id, plan_old);
+        assert_eq!(plans[0].submitted_at.as_millis(), 1_700_000_300);
+        assert_eq!(plans[1].plan_id, plan_new);
+        assert_eq!(plans[1].submitted_at.as_millis(), 1_700_000_400);
+        // Body bytes is the verbatim source length.
+        assert_eq!(plans[0].body_bytes, "# old".len() as u64);
+        assert_eq!(plans[1].body_bytes, "# even newer plan".len() as u64);
+    }
+
+    #[tokio::test]
+    async fn list_plans_filters_by_correlation_id() {
+        let server = MockServer::start().await;
+        let state = make_state(&server, vec![], "o");
+        let session_id = open_session(&state).await;
+        let target = crate::agent_plan::CorrelationId::try_new("feat-42_xyz").unwrap();
+        let (_, plan_target) = record_planner_run_and_plan(
+            &state,
+            session_id,
+            Some(target.clone()),
+            "# target",
+            UnixMillis::from_millis(1_700_000_200),
+        )
+        .await;
+        record_planner_run_and_plan(
+            &state,
+            session_id,
+            None,
+            "# unrelated",
+            UnixMillis::from_millis(1_700_000_300),
+        )
+        .await;
+
+        let resp = dispatch_message(
+            ClientMessage::ListPlans {
+                correlation_id: Some(target.clone()),
+            },
+            &state,
+        )
+        .await;
+        let plans = match resp {
+            ServerMessage::Plans { plans } => plans,
+            other => panic!("expected Plans, got {other:?}"),
+        };
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].plan_id, plan_target);
+        assert_eq!(plans[0].correlation_id.as_ref(), Some(&target));
+    }
+
+    #[tokio::test]
+    async fn show_plan_for_unknown_plan_id_returns_unknown_plan() {
+        let server = MockServer::start().await;
+        let state = make_state(&server, vec![], "o");
+        let plan_id = crate::agent_plan::PlanId::new();
+        let resp = dispatch_message(ClientMessage::ShowPlan { plan_id }, &state).await;
+        assert_eq!(resp, ServerMessage::UnknownPlan { plan_id });
+    }
+
+    #[tokio::test]
+    async fn show_plan_returns_detail_with_body_and_joined_correlation_id() {
+        let server = MockServer::start().await;
+        let state = make_state(&server, vec![], "o");
+        let session_id = open_session(&state).await;
+        let target = crate::agent_plan::CorrelationId::try_new("feat-7_abc").unwrap();
+        let body_text = "# Plan\n\nDo the thing.";
+        let (run_id, plan_id) = record_planner_run_and_plan(
+            &state,
+            session_id,
+            Some(target.clone()),
+            body_text,
+            UnixMillis::from_millis(1_700_000_200),
+        )
+        .await;
+
+        let resp = dispatch_message(ClientMessage::ShowPlan { plan_id }, &state).await;
+        let detail = match resp {
+            ServerMessage::Plan { plan } => plan,
+            other => panic!("expected Plan, got {other:?}"),
+        };
+        assert_eq!(detail.summary.plan_id, plan_id);
+        assert_eq!(detail.summary.agent_run_id, run_id);
+        assert_eq!(detail.summary.correlation_id.as_ref(), Some(&target));
+        assert_eq!(detail.summary.body_bytes, body_text.len() as u64);
+        assert_eq!(detail.body.as_str(), body_text);
+    }
+
+    /// A plan submitted under a run with no correlation id surfaces
+    /// `Some(None)` from `correlation_id_for_run`, which the handler
+    /// flattens to `None` on the wire.
+    #[tokio::test]
+    async fn show_plan_for_untagged_run_returns_none_correlation_id() {
+        let server = MockServer::start().await;
+        let state = make_state(&server, vec![], "o");
+        let session_id = open_session(&state).await;
+        let (_, plan_id) = record_planner_run_and_plan(
+            &state,
+            session_id,
+            None,
+            "# untagged",
+            UnixMillis::from_millis(1_700_000_200),
+        )
+        .await;
+
+        let resp = dispatch_message(ClientMessage::ShowPlan { plan_id }, &state).await;
+        let detail = match resp {
+            ServerMessage::Plan { plan } => plan,
+            other => panic!("expected Plan, got {other:?}"),
+        };
+        assert!(detail.summary.correlation_id.is_none());
     }
 
     // --- Policy decisions ------------------------------------------------
