@@ -203,6 +203,7 @@ pub async fn dispatch_message_with_agent_vm<S: SecretStore + Send + Sync + 'stat
             agent_model,
             workspace,
             prompt,
+            correlation_id,
         } => match agent_vm {
             Some(agent_vm) => {
                 debug_assert!(
@@ -219,6 +220,7 @@ pub async fn dispatch_message_with_agent_vm<S: SecretStore + Send + Sync + 'stat
                         agent_model,
                         workspace,
                         prompt,
+                        correlation_id,
                     )
                     .await
                 {

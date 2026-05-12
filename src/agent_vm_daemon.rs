@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::Mutex;
 
+use crate::agent_plan::CorrelationId;
 use crate::agent_run::{AgentPrompt, AgentRunId};
 use crate::agent_vm_lifecycle::{
     AgentVmGuestEnvVar, AgentVmLifecycleConfigError, AgentVmResources, AgentVmSessionManagerError,
@@ -604,6 +605,7 @@ impl AgentVmDaemon {
         outcome
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn start_agent_run_session<S: SecretStore + Send + Sync + 'static>(
         &self,
         state: Arc<BrokerState<S>>,
@@ -612,6 +614,7 @@ impl AgentVmDaemon {
         agent_model: String,
         workspace: AgentVmWorkspaceBootstrap,
         prompt: AgentPrompt,
+        correlation_id: Option<CorrelationId>,
     ) -> Result<AgentRunStarted, AgentVmDaemonError> {
         let session_id = SessionId::new();
         let run_id = AgentRunId::new();
@@ -638,7 +641,7 @@ impl AgentVmDaemon {
                     requested_at: UnixMillis::now(),
                     agent_kind,
                     prompt: prompt.summary(),
-                    correlation_id: None,
+                    correlation_id: correlation_id.clone(),
                 })?;
                 let agent_runs = VmHttpAgentRunService::new(
                     Arc::clone(&state),

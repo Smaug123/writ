@@ -20,6 +20,7 @@ use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand, ValueEnum};
 
+use writ::agent_plan::CorrelationId;
 use writ::agent_run::AgentPrompt;
 use writ::core::{
     AgentKind, CapabilityRequest, GitHubAccess, GitHubRequest, RepoRef, RequestId, SessionId,
@@ -125,6 +126,11 @@ enum AgentCmd {
         /// Workspace warmup level to complete before starting the agent.
         #[arg(long, value_enum, default_value = "devshell")]
         warm: WorkspaceWarmArg,
+        /// Opaque caller-supplied id that ties this run to a wider
+        /// task. Validated only as a safe id (`[A-Za-z0-9_-]`, 1..=64
+        /// bytes); the broker never interprets the contents.
+        #[arg(long, value_parser = parse_correlation_id)]
+        correlation_id: Option<CorrelationId>,
     },
 }
 
@@ -319,6 +325,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 model,
                 workspace,
                 warm,
+                correlation_id,
             } => {
                 let warm_mode = warm.into();
                 let workspace = build_workspace_bootstrap_from_repo(repo, workspace, warm_mode)?;
@@ -329,6 +336,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     model,
                     workspace,
                     AgentPrompt::try_new(prompt)?,
+                    correlation_id,
                 )?;
             }
         },
@@ -401,6 +409,10 @@ fn parse_agent_kind(raw: &str) -> Result<AgentKind, String> {
     raw.parse::<AgentKind>().map_err(|err| err.to_string())
 }
 
+fn parse_correlation_id(raw: &str) -> Result<CorrelationId, String> {
+    CorrelationId::try_new(raw).map_err(|err| err.to_string())
+}
+
 /// Read the operator identity the CLI will assert to the broker.
 ///
 /// The local socket is the trust boundary, so this only needs to be a
@@ -464,6 +476,7 @@ fn start_agent_run(
     agent_model: String,
     workspace: AgentVmWorkspaceBootstrap,
     prompt: AgentPrompt,
+    correlation_id: Option<CorrelationId>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let msg = ClientMessage::StartAgentRun {
         label,
@@ -471,6 +484,7 @@ fn start_agent_run(
         agent_model,
         workspace,
         prompt,
+        correlation_id,
     };
     match call_with_timeout(socket_path, &msg, AGENT_VM_WORKSPACE_CALL_TIMEOUT)? {
         ServerMessage::AgentRunStarted {
@@ -813,6 +827,7 @@ mod tests {
                         prompt,
                         model,
                         warm,
+                        correlation_id,
                         ..
                     },
             } => {
@@ -821,9 +836,71 @@ mod tests {
                 assert_eq!(prompt, "fix the failing test");
                 assert_eq!(model, "claude-test");
                 assert_eq!(warm, WorkspaceWarmArg::Sources);
+                assert!(correlation_id.is_none());
             }
             _ => panic!("unexpected command"),
         }
+    }
+
+    #[test]
+    fn agent_run_cli_accepts_correlation_id_flag() {
+        let args = Args::try_parse_from([
+            "writ",
+            "agent",
+            "run",
+            "--repo",
+            "owner/repo",
+            "--agent",
+            "codex",
+            "--model",
+            "gpt-5.4-mini",
+            "--prompt",
+            "fix it",
+            "--correlation-id",
+            "feat-42_xyz",
+        ])
+        .unwrap();
+
+        match args.cmd {
+            Cmd::Agent {
+                action: AgentCmd::Run { correlation_id, .. },
+            } => {
+                let id = correlation_id.expect("--correlation-id should parse");
+                assert_eq!(id.as_str(), "feat-42_xyz");
+            }
+            _ => panic!("unexpected command"),
+        }
+    }
+
+    /// `parse_correlation_id` runs `CorrelationId::try_new`, so the
+    /// same character-class and length rules that gate the audit
+    /// column also gate the CLI flag — no malformed value ever leaves
+    /// the parser. A single representative bad byte is enough; the
+    /// newtype's own tests exhaustively cover the class.
+    #[test]
+    fn agent_run_cli_rejects_invalid_correlation_id() {
+        let err = match Args::try_parse_from([
+            "writ",
+            "agent",
+            "run",
+            "--repo",
+            "owner/repo",
+            "--agent",
+            "codex",
+            "--model",
+            "gpt-5.4-mini",
+            "--prompt",
+            "fix it",
+            "--correlation-id",
+            "bad space",
+        ]) {
+            Ok(_) => panic!("expected clap to reject malformed --correlation-id"),
+            Err(error) => error,
+        };
+        assert!(
+            err.to_string().contains("--correlation-id"),
+            "unexpected clap error: {err}"
+        );
     }
 
     #[test]
@@ -904,6 +981,7 @@ mod tests {
             agent_model: "claude-test".into(),
             workspace,
             prompt: AgentPrompt::try_new("SECRET prompt").unwrap(),
+            correlation_id: None,
         };
 
         let debug = format!("{msg:?}");
