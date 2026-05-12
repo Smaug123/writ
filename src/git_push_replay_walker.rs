@@ -12,8 +12,16 @@
 //! The walker is parameterised over a [`GitObjectSource`] so its core
 //! orchestration can be exercised against an in-memory fixture without
 //! shelling out to git. A real implementation backed by
-//! `git cat-file --batch` lands in a later commit, alongside the
-//! topology-discovery step that produces the caller's commit list.
+//! `git cat-file --batch` lands in a later commit.
+//!
+//! [`plan_branch_creation_walk`] handles topology discovery for the
+//! branch-creation case: it queries GitHub for the App-side default
+//! branch tip, walks the staging repo back from the bundle tip until
+//! it reaches that SHA, and produces the topo-sorted commit list +
+//! seed [`ShaMap`] that [`replay_commits`] expects. The fast-forward
+//! case still requires the caller to topo-sort using `git rev-list`
+//! against the known `expected_remote_head`; that integration lands
+//! alongside the cat-file source.
 //!
 //! Signing (producing the detached PGP/SSH signature that drives
 //! GitHub's Verified badge) is also deferred: this walker always passes
@@ -38,7 +46,7 @@ use crate::git_push_replay::TrailerSource;
 use crate::github_git_db::{
     CommitIdentity, CommitRequest, GitDataClient, GitDataError, TreeEntry, TreeEntryKind,
 };
-use crate::vm_git::GitObjectId;
+use crate::vm_git::{GitBranchName, GitObjectId};
 
 /// One commit, as the walker needs to see it after parsing out of the
 /// staging repository's object database.
@@ -376,6 +384,196 @@ async fn ensure_blob_uploaded<S: GitObjectSource>(
     let new_sha = client.create_blob(repo, &content).await?;
     map.blobs.insert(bundle_sha.clone(), new_sha.clone());
     Ok(new_sha)
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum BranchCreationPlanError {
+    #[error("GitHub Git Data request failed: {0}")]
+    GitDb(#[from] GitDataError),
+    #[error("read from staging repo failed: {0}")]
+    Source(#[from] GitObjectSourceError),
+    /// The bundle tip's ancestry, as visible in the staging repo,
+    /// does not include the App-side default branch head. Either the
+    /// agent created an orphan branch with no shared history, or the
+    /// bundle was constructed from a different upstream than the one
+    /// we're replaying against.
+    ///
+    /// Detected after the walk completes: every parent edge has been
+    /// followed and `default_head` was never seen as a parent (or as
+    /// the bundle tip itself). The walker would otherwise upload an
+    /// orphan history under the App identity, which the replay
+    /// contract explicitly forbids.
+    #[error(
+        "bundle history is disjoint from the default branch head {default_head}: \
+         walked every ancestor of {bundle_tip} without reaching it"
+    )]
+    DisjointHistory {
+        default_head: String,
+        bundle_tip: String,
+    },
+    /// The bundle tip equals the App-side default branch head, so
+    /// there is nothing for the walker to upload. A push that
+    /// reaches replay in this state is either a no-op or indicates
+    /// the staging pipeline accepted a bundle it should have
+    /// rejected upstream. Surface it as an explicit error rather
+    /// than silently producing an empty walk that would violate
+    /// [`replay_commits`]'s non-empty pre-condition.
+    #[error("bundle tip {bundle_tip} equals the default branch head; nothing to replay")]
+    BundleTipEqualsDefaultHead { bundle_tip: String },
+}
+
+/// Result of [`plan_branch_creation_walk`]: the topo-sorted list of
+/// commits to upload and the seed [`ShaMap`] pre-populated with the
+/// default branch head's identity mapping.
+///
+/// Bundled together because callers always pass *both* to
+/// [`replay_commits`] — separating them would let a caller pass a
+/// commit list against a stale or wrong seed map. The pair is
+/// returned in the exact shape `replay_commits` consumes.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BranchCreationPlan {
+    /// Topologically sorted bundle SHAs (parents before children),
+    /// suitable as the `commits` argument to [`replay_commits`].
+    pub commits: Vec<GitObjectId>,
+    /// Pre-seeded sha map: maps `default_head_sha → default_head_sha`
+    /// so [`replay_commits`] recognises the boundary commit when it
+    /// shows up as a parent of the first walked commit.
+    pub seed: ShaMap,
+    /// The default branch name returned by GitHub. Surfaced so the
+    /// caller can record it in audit trails or use it for the
+    /// follow-up `create_ref`/`update_ref` call.
+    pub default_branch: GitBranchName,
+    /// The App-side commit SHA the default branch currently points
+    /// at. Same purpose as `default_branch`: kept so the caller does
+    /// not need to re-query GitHub.
+    pub default_head: GitObjectId,
+}
+
+/// Plan the per-commit walk for a branch creation: resolve the App's
+/// default branch tip via GitHub, then walk the staging repo back
+/// from `bundle_tip` to that tip and return the commits to upload
+/// (parents-before-children) together with a pre-seeded [`ShaMap`].
+///
+/// The walk performs two GitHub round-trips before reading any
+/// staging objects:
+///
+/// * `GET /repos/{owner}/{repo}` resolves the operator-configured
+///   default branch name (`main`, `trunk`, `master`, …).
+/// * `GET /repos/{owner}/{repo}/git/ref/heads/{default}` returns the
+///   App-side commit SHA that branch currently points at.
+///
+/// The walker then DFS-traverses parent pointers from `bundle_tip`
+/// in the staging repo, stopping whenever it encounters the
+/// `default_head` SHA. Every commit reachable from `bundle_tip` and
+/// not equal to `default_head` is emitted into the returned list in
+/// post-order, which is exactly topological order
+/// (parents-before-children) for a DAG.
+///
+/// Failure modes the caller has to distinguish:
+///
+/// * [`BranchCreationPlanError::DisjointHistory`] — `default_head`
+///   never appeared as a parent during the walk. The agent's
+///   `bundle_tip` does not share history with the App-side default
+///   branch.
+/// * [`BranchCreationPlanError::BundleTipEqualsDefaultHead`] —
+///   `bundle_tip == default_head`. Nothing to walk; degenerate input.
+pub async fn plan_branch_creation_walk<S: GitObjectSource>(
+    client: &GitDataClient,
+    repo: &RepoRef,
+    source: &S,
+    bundle_tip: &GitObjectId,
+) -> Result<BranchCreationPlan, BranchCreationPlanError> {
+    let default_branch = client.get_default_branch(repo).await?;
+    let default_head = client.get_branch_head(repo, &default_branch).await?;
+
+    if bundle_tip == &default_head {
+        return Err(BranchCreationPlanError::BundleTipEqualsDefaultHead {
+            bundle_tip: bundle_tip.as_str().to_string(),
+        });
+    }
+
+    let commits = walk_to_default_head(source, bundle_tip, &default_head).await?;
+
+    let mut seed = ShaMap::new();
+    seed.seed_commit_identity(default_head.clone());
+
+    Ok(BranchCreationPlan {
+        commits,
+        seed,
+        default_branch,
+        default_head,
+    })
+}
+
+/// DFS the staging repo from `bundle_tip` along parent pointers,
+/// stopping at any commit whose SHA equals `default_head`, and
+/// return the visited commits in topological order (parents before
+/// children).
+///
+/// Iterative Enter/Exit pattern, same shape as
+/// [`upload_tree_closure`]: each commit gets one `Enter` (read +
+/// push children) and one `Exit` (emit). Post-order Exit emission
+/// is topo order on a DAG, because no commit's Exit fires until all
+/// its parents have been visited and their own Exit phases have run
+/// (or been skipped at the `default_head` boundary).
+///
+/// Returns [`BranchCreationPlanError::DisjointHistory`] if
+/// `default_head` is never reached. Bundle reads that fail surface
+/// as [`BranchCreationPlanError::Source`].
+async fn walk_to_default_head<S: GitObjectSource>(
+    source: &S,
+    bundle_tip: &GitObjectId,
+    default_head: &GitObjectId,
+) -> Result<Vec<GitObjectId>, BranchCreationPlanError> {
+    enum Phase {
+        Enter,
+        Exit,
+    }
+
+    let mut stack: Vec<(GitObjectId, Phase)> = vec![(bundle_tip.clone(), Phase::Enter)];
+    let mut visited: std::collections::HashSet<GitObjectId> = std::collections::HashSet::new();
+    let mut output: Vec<GitObjectId> = Vec::new();
+    let mut hit_default_head = false;
+
+    while let Some((sha, phase)) = stack.pop() {
+        match phase {
+            Phase::Enter => {
+                if sha == *default_head {
+                    // Boundary: don't read, don't recurse, don't
+                    // emit. The hit flag turns off the disjoint
+                    // check at the end of the walk.
+                    hit_default_head = true;
+                    continue;
+                }
+                if !visited.insert(sha.clone()) {
+                    // Already visited via another path (shared
+                    // ancestor through a merge). The earlier Enter
+                    // pushed its Exit; nothing more to do.
+                    continue;
+                }
+                let commit = source.read_commit(&sha).await?;
+                // Exit must run after every parent has been
+                // processed. Push Exit first so the parents popped
+                // (and processed) afterwards run before Exit fires.
+                stack.push((sha, Phase::Exit));
+                for parent in &commit.parents {
+                    stack.push((parent.clone(), Phase::Enter));
+                }
+            }
+            Phase::Exit => {
+                output.push(sha);
+            }
+        }
+    }
+
+    if !hit_default_head {
+        return Err(BranchCreationPlanError::DisjointHistory {
+            default_head: default_head.as_str().to_string(),
+            bundle_tip: bundle_tip.as_str().to_string(),
+        });
+    }
+
+    Ok(output)
 }
 
 /// Render the replayed commit message: the original body plus
@@ -1644,5 +1842,404 @@ mod tests {
         // The submodule SHA does not appear in the commit map either
         // — we don't claim to have replayed it on this repo.
         assert_eq!(map.commit(&submodule_sha), None);
+    }
+
+    // ----- plan_branch_creation_walk tests --------------------
+
+    async fn mount_default_branch(server: &MockServer, default_branch: &str) {
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/name"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "default_branch": default_branch,
+            })))
+            .expect(1)
+            .mount(server)
+            .await;
+    }
+
+    async fn mount_branch_head(server: &MockServer, branch: &str, head_sha: &GitObjectId) {
+        Mock::given(method("GET"))
+            .and(path(format!("/repos/owner/name/git/ref/heads/{branch}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ref": format!("refs/heads/{branch}"),
+                "object": { "sha": head_sha.as_str(), "type": "commit" },
+            })))
+            .expect(1)
+            .mount(server)
+            .await;
+    }
+
+    /// Insert a synthetic commit whose tree is the empty tree (also
+    /// inserted) and whose parents are exactly `parents`. The
+    /// walker treats these as bundle commits; everything we need
+    /// for the planning step is reachable through them.
+    fn insert_synthetic_commit(
+        source: &mut InMemoryGitObjectSource,
+        sha: &GitObjectId,
+        parents: Vec<GitObjectId>,
+    ) {
+        let tree_sha = sample_object_id('0');
+        source.insert_tree(tree_sha.clone(), StagingTree { entries: vec![] });
+        source.insert_commit(
+            sha.clone(),
+            StagingCommit {
+                tree: tree_sha,
+                parents,
+                author: sample_identity("author"),
+                committer: sample_identity("author"),
+                message: format!("commit {}\n", sha.as_str()),
+            },
+        );
+    }
+
+    #[tokio::test]
+    async fn plan_branch_creation_walk_returns_single_commit_when_tip_is_child_of_default_head() {
+        // Minimal happy path: bundle tip points directly at the
+        // default branch head. The walker emits a one-element list
+        // and the seed map is keyed on the boundary commit.
+        let server = MockServer::start().await;
+        let default_head = sample_object_id('a');
+        let bundle_tip = sample_object_id('b');
+        mount_default_branch(&server, "main").await;
+        mount_branch_head(&server, "main", &default_head).await;
+
+        let mut source = InMemoryGitObjectSource::new();
+        insert_synthetic_commit(&mut source, &bundle_tip, vec![default_head.clone()]);
+
+        let client = client_against(&server, "ghs_fake_token");
+        let plan = plan_branch_creation_walk(&client, &sample_repo(), &source, &bundle_tip)
+            .await
+            .expect("plan ok");
+
+        assert_eq!(plan.commits, vec![bundle_tip]);
+        assert_eq!(plan.default_branch.as_str(), "main");
+        assert_eq!(plan.default_head, default_head);
+        assert_eq!(plan.seed.commit(&default_head), Some(&default_head));
+        assert_eq!(plan.seed.commit_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn plan_branch_creation_walk_topologically_sorts_linear_chain() {
+        // Default-head <- c1 <- c2 <- c3 (=bundle tip). The walker
+        // must emit [c1, c2, c3]: each commit's parents already
+        // appear earlier in the list (or are default_head, which is
+        // in the seed map).
+        let server = MockServer::start().await;
+        let default_head = sample_object_id('a');
+        let c1 = sample_object_id('1');
+        let c2 = sample_object_id('2');
+        let c3 = sample_object_id('3');
+        mount_default_branch(&server, "main").await;
+        mount_branch_head(&server, "main", &default_head).await;
+
+        let mut source = InMemoryGitObjectSource::new();
+        insert_synthetic_commit(&mut source, &c1, vec![default_head.clone()]);
+        insert_synthetic_commit(&mut source, &c2, vec![c1.clone()]);
+        insert_synthetic_commit(&mut source, &c3, vec![c2.clone()]);
+
+        let client = client_against(&server, "ghs_fake_token");
+        let plan = plan_branch_creation_walk(&client, &sample_repo(), &source, &c3)
+            .await
+            .expect("plan ok");
+
+        assert_eq!(plan.commits, vec![c1, c2, c3]);
+    }
+
+    #[tokio::test]
+    async fn plan_branch_creation_walk_topologically_sorts_merge_commit() {
+        // Diamond: both sides of the merge terminate at
+        // default_head. Walker must put both intermediate commits
+        // before the merge commit.
+        //
+        //   default_head -+- l1 -+
+        //                 |      |
+        //                 +- r1 -+- merge (= bundle tip)
+        let server = MockServer::start().await;
+        let default_head = sample_object_id('a');
+        let l1 = sample_object_id('1');
+        let r1 = sample_object_id('2');
+        let merge = sample_object_id('3');
+        mount_default_branch(&server, "main").await;
+        mount_branch_head(&server, "main", &default_head).await;
+
+        let mut source = InMemoryGitObjectSource::new();
+        insert_synthetic_commit(&mut source, &l1, vec![default_head.clone()]);
+        insert_synthetic_commit(&mut source, &r1, vec![default_head.clone()]);
+        insert_synthetic_commit(&mut source, &merge, vec![l1.clone(), r1.clone()]);
+
+        let client = client_against(&server, "ghs_fake_token");
+        let plan = plan_branch_creation_walk(&client, &sample_repo(), &source, &merge)
+            .await
+            .expect("plan ok");
+
+        // l1 and r1 may appear in either order, but both must
+        // precede `merge`. Assert that contract directly.
+        let merge_idx = plan
+            .commits
+            .iter()
+            .position(|s| s == &merge)
+            .expect("merge in output");
+        let l1_idx = plan
+            .commits
+            .iter()
+            .position(|s| s == &l1)
+            .expect("l1 in output");
+        let r1_idx = plan
+            .commits
+            .iter()
+            .position(|s| s == &r1)
+            .expect("r1 in output");
+        assert!(l1_idx < merge_idx, "l1 must precede merge");
+        assert!(r1_idx < merge_idx, "r1 must precede merge");
+        assert_eq!(plan.commits.len(), 3, "no extra commits emitted");
+    }
+
+    #[tokio::test]
+    async fn plan_branch_creation_walk_does_not_read_default_head_commit_object() {
+        // The boundary commit lives on GitHub; we don't have it (or
+        // need it) in the staging repo. Verified by leaving it
+        // un-inserted in the in-memory source: a `read_commit`
+        // attempt against it would surface as NotFound.
+        let server = MockServer::start().await;
+        let default_head = sample_object_id('a');
+        let bundle_tip = sample_object_id('b');
+        mount_default_branch(&server, "main").await;
+        mount_branch_head(&server, "main", &default_head).await;
+
+        let mut source = InMemoryGitObjectSource::new();
+        // Intentionally do NOT call insert_synthetic_commit for
+        // default_head; only the bundle tip exists in the source.
+        insert_synthetic_commit(&mut source, &bundle_tip, vec![default_head.clone()]);
+
+        let client = client_against(&server, "ghs_fake_token");
+        plan_branch_creation_walk(&client, &sample_repo(), &source, &bundle_tip)
+            .await
+            .expect("walker must not read the boundary commit");
+    }
+
+    #[tokio::test]
+    async fn plan_branch_creation_walk_rejects_disjoint_history() {
+        // bundle_tip's only ancestor is a different root, never
+        // default_head. Walker walks both back to a root commit, and
+        // since default_head was never encountered, surface
+        // DisjointHistory rather than uploading an orphan branch.
+        let server = MockServer::start().await;
+        let default_head = sample_object_id('a');
+        let orphan_root = sample_object_id('1');
+        let bundle_tip = sample_object_id('2');
+        mount_default_branch(&server, "main").await;
+        mount_branch_head(&server, "main", &default_head).await;
+
+        let mut source = InMemoryGitObjectSource::new();
+        insert_synthetic_commit(&mut source, &orphan_root, vec![]);
+        insert_synthetic_commit(&mut source, &bundle_tip, vec![orphan_root.clone()]);
+
+        let client = client_against(&server, "ghs_fake_token");
+        let err = plan_branch_creation_walk(&client, &sample_repo(), &source, &bundle_tip)
+            .await
+            .expect_err("disjoint history must be rejected");
+        match err {
+            BranchCreationPlanError::DisjointHistory {
+                default_head: dh,
+                bundle_tip: bt,
+            } => {
+                assert_eq!(dh, default_head.as_str());
+                assert_eq!(bt, bundle_tip.as_str());
+            }
+            other => panic!("expected DisjointHistory, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn plan_branch_creation_walk_rejects_when_bundle_tip_equals_default_head() {
+        // Degenerate input: nothing to walk. Refuse before issuing
+        // any staging-source reads.
+        let server = MockServer::start().await;
+        let default_head = sample_object_id('a');
+        mount_default_branch(&server, "main").await;
+        mount_branch_head(&server, "main", &default_head).await;
+
+        // Empty source: if the walker tried to read anything we'd
+        // see a NotFound rather than the expected
+        // BundleTipEqualsDefaultHead.
+        let source = InMemoryGitObjectSource::new();
+
+        let client = client_against(&server, "ghs_fake_token");
+        let err = plan_branch_creation_walk(&client, &sample_repo(), &source, &default_head)
+            .await
+            .expect_err("bundle_tip == default_head must be rejected");
+        assert!(
+            matches!(
+                err,
+                BranchCreationPlanError::BundleTipEqualsDefaultHead { .. }
+            ),
+            "expected BundleTipEqualsDefaultHead, got {err:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn plan_branch_creation_walk_surfaces_source_error_when_commit_missing() {
+        // Bundle tip points at a SHA that the source has no commit
+        // for (malformed bundle, ingest bug). Surface the underlying
+        // NotFound rather than silently emitting empty output.
+        let server = MockServer::start().await;
+        let default_head = sample_object_id('a');
+        let bundle_tip = sample_object_id('b');
+        mount_default_branch(&server, "main").await;
+        mount_branch_head(&server, "main", &default_head).await;
+
+        // Empty source — read_commit(bundle_tip) will return
+        // NotFound.
+        let source = InMemoryGitObjectSource::new();
+
+        let client = client_against(&server, "ghs_fake_token");
+        let err = plan_branch_creation_walk(&client, &sample_repo(), &source, &bundle_tip)
+            .await
+            .expect_err("missing bundle tip must surface as source error");
+        match err {
+            BranchCreationPlanError::Source(GitObjectSourceError::NotFound { sha }) => {
+                assert_eq!(sha, bundle_tip.as_str());
+            }
+            other => panic!("expected Source(NotFound), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn plan_branch_creation_walk_surfaces_github_error_on_default_branch_lookup() {
+        // First GitHub call fails: caller learns that, doesn't walk
+        // anything, and the staging source is never touched.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/name"))
+            .respond_with(ResponseTemplate::new(404).set_body_json(json!({"message": "Not Found"})))
+            .mount(&server)
+            .await;
+
+        let source = InMemoryGitObjectSource::new();
+        let bundle_tip = sample_object_id('b');
+
+        let client = client_against(&server, "ghs_fake_token");
+        let err = plan_branch_creation_walk(&client, &sample_repo(), &source, &bundle_tip)
+            .await
+            .expect_err("GitHub 404 must propagate");
+        assert!(
+            matches!(
+                err,
+                BranchCreationPlanError::GitDb(GitDataError::ApiError { .. })
+            ),
+            "expected GitDb(ApiError), got {err:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn plan_branch_creation_walk_surfaces_github_error_on_branch_head_lookup() {
+        // The repo lookup succeeds but the ref lookup fails: the
+        // resulting error still maps to GitDb without touching the
+        // staging source.
+        let server = MockServer::start().await;
+        mount_default_branch(&server, "main").await;
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/name/git/ref/heads/main"))
+            .respond_with(
+                ResponseTemplate::new(404).set_body_json(json!({"message": "Branch not found"})),
+            )
+            .mount(&server)
+            .await;
+
+        let source = InMemoryGitObjectSource::new();
+        let bundle_tip = sample_object_id('b');
+
+        let client = client_against(&server, "ghs_fake_token");
+        let err = plan_branch_creation_walk(&client, &sample_repo(), &source, &bundle_tip)
+            .await
+            .expect_err("ref-lookup 404 must propagate");
+        assert!(
+            matches!(
+                err,
+                BranchCreationPlanError::GitDb(GitDataError::ApiError { .. })
+            ),
+            "expected GitDb(ApiError), got {err:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn plan_branch_creation_walk_output_seeds_replay_commits_end_to_end() {
+        // End-to-end integration: plan a two-commit branch creation,
+        // then feed the plan straight into replay_commits and
+        // observe the full upload sequence go through. This is the
+        // contract the broker will rely on — plan, then walk,
+        // without any glue translation between them.
+        let server = MockServer::start().await;
+        let default_head = sample_object_id('a');
+        let c1_bundle = sample_object_id('1');
+        let c2_bundle = sample_object_id('2');
+        let c1_app = sample_object_id('e');
+        let c2_app = sample_object_id('f');
+        let empty_tree_app = sample_object_id('d');
+        mount_default_branch(&server, "main").await;
+        mount_branch_head(&server, "main", &default_head).await;
+
+        let mut source = InMemoryGitObjectSource::new();
+        insert_synthetic_commit(&mut source, &c1_bundle, vec![default_head.clone()]);
+        insert_synthetic_commit(&mut source, &c2_bundle, vec![c1_bundle.clone()]);
+
+        // Both commits share the same empty tree (because
+        // insert_synthetic_commit always inserts that tree under
+        // sample_object_id('0')). Tree upload happens once and is
+        // reused; assert both create calls happen exactly the right
+        // number of times.
+        Mock::given(method("POST"))
+            .and(path("/repos/owner/name/git/trees"))
+            .and(body_json(json!({ "tree": [] })))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+                "sha": empty_tree_app.as_str(),
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/repos/owner/name/git/commits"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+                "sha": c1_app.as_str(),
+            })))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/repos/owner/name/git/commits"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+                "sha": c2_app.as_str(),
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = client_against(&server, "ghs_fake_token");
+        let plan = plan_branch_creation_walk(&client, &sample_repo(), &source, &c2_bundle)
+            .await
+            .expect("plan ok");
+        // Sanity: the plan's seed map contains the default head
+        // so the first commit's `parents: [default_head]` resolves
+        // to itself during upload.
+        assert_eq!(plan.seed.commit(&default_head), Some(&default_head));
+
+        let (final_sha, map) = replay_commits(
+            &client,
+            &sample_repo(),
+            &source,
+            &plan.commits,
+            plan.seed,
+            &[],
+        )
+        .await
+        .expect("replay ok");
+
+        assert_eq!(final_sha, c2_app);
+        // Both bundle commits now appear in the map, plus the
+        // seeded default head.
+        assert_eq!(map.commit(&c1_bundle), Some(&c1_app));
+        assert_eq!(map.commit(&c2_bundle), Some(&c2_app));
+        assert_eq!(map.commit(&default_head), Some(&default_head));
     }
 }
