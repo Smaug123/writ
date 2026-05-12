@@ -100,6 +100,33 @@ async fn handle_git_push_request<S: SecretStore + Send + Sync + 'static>(
     let received_at = UnixMillis::now();
     let (metadata, bundle) = parsed.into_parts();
 
+    // Inherit the run's correlation id (if any) so a push staged by a
+    // `--correlation-id`'d agent run carries the same join key. The
+    // correlation belongs to the run; the push merely participates.
+    // Untagged sessions and non-run sessions return `None` and the
+    // column stays NULL.
+    let correlation_id = match service
+        .broker_state
+        .audit
+        .correlation_id_for_session(session.session_id())
+    {
+        Ok(value) => value,
+        Err(err) => {
+            tracing::error!(
+                target: AUDIT_WRITE_FAILURE_TARGET,
+                kind = "git_push_request_correlation_lookup",
+                push_request_id = %push_request_id,
+                error = %err,
+                "audit read failed",
+            );
+            return git_push_error_response(
+                VmHttpStatus::InternalServerError,
+                VmGitPushErrorCode::PushFailed,
+                "audit read failed",
+            );
+        }
+    };
+
     let record = GitPushRequestRecord {
         push_request_id,
         session_id: session.session_id(),
@@ -108,7 +135,7 @@ async fn handle_git_push_request<S: SecretStore + Send + Sync + 'static>(
         branch: metadata.branch().clone(),
         expected_remote_head: metadata.expected_remote_head().cloned(),
         new_head: metadata.new_head().clone(),
-        correlation_id: None,
+        correlation_id,
     };
     match service.broker_state.audit.record_git_push_request(&record) {
         Ok(()) => {}
@@ -531,6 +558,126 @@ mod tests {
         assert_eq!(entry.result, Some(GitPushOutcomeResult::Staged));
         assert_eq!(entry.message.as_deref(), Some("staged for review"));
         assert!(entry.push_attempt_id.is_none());
+    }
+
+    /// A push from a `--correlation-id`'d agent run inherits the run's
+    /// correlation id onto the `git_push_request` audit row, so a
+    /// downstream join on `correlation_id` stitches the run and its
+    /// pushes together.
+    #[tokio::test]
+    async fn git_push_inherits_correlation_id_from_tagged_agent_run() {
+        use crate::agent_plan::CorrelationId;
+        use crate::agent_run::{AgentPrompt, AgentRunId};
+        use crate::audit::AgentRunAuditRecord;
+        use crate::core::AgentKind;
+
+        let github = wiremock::MockServer::start().await;
+        let state = make_broker_state(&github);
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+        open_audit_session(&state, session.session_id());
+        let correlation = CorrelationId::try_new("feat-42_xyz").unwrap();
+        state
+            .audit
+            .record_agent_run(&AgentRunAuditRecord {
+                run_id: AgentRunId::new(),
+                session_id: session.session_id(),
+                requested_at: UnixMillis::now(),
+                agent_kind: AgentKind::Claude,
+                prompt: AgentPrompt::new("prompt").summary(),
+                correlation_id: Some(correlation.clone()),
+            })
+            .unwrap();
+        let (staging, _tmp) = open_test_staging_store();
+
+        let body = encoded_body(sample_metadata(), b"tagged bundle".to_vec());
+        let response = handle_git_push_request(
+            &session,
+            body,
+            git_push_service_for_test(&state, Arc::clone(&staging)),
+        )
+        .await;
+
+        assert_eq!(response.status, VmHttpStatus::Ok);
+        let receipt: VmGitPushStagedReceipt = serde_json::from_slice(&response.body).unwrap();
+        let entry = state
+            .audit
+            .get_git_push(receipt.push_request_id())
+            .unwrap()
+            .expect("push row exists");
+        assert_eq!(entry.correlation_id, Some(correlation));
+    }
+
+    /// A session with no `agent_run` row — the raw-VM-session path —
+    /// has nothing to inherit from, so the push's `correlation_id`
+    /// stays NULL.
+    #[tokio::test]
+    async fn git_push_without_agent_run_leaves_correlation_id_null() {
+        let github = wiremock::MockServer::start().await;
+        let state = make_broker_state(&github);
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+        open_audit_session(&state, session.session_id());
+        let (staging, _tmp) = open_test_staging_store();
+
+        let body = encoded_body(sample_metadata(), b"untagged bundle".to_vec());
+        let response = handle_git_push_request(
+            &session,
+            body,
+            git_push_service_for_test(&state, Arc::clone(&staging)),
+        )
+        .await;
+
+        assert_eq!(response.status, VmHttpStatus::Ok);
+        let receipt: VmGitPushStagedReceipt = serde_json::from_slice(&response.body).unwrap();
+        let entry = state
+            .audit
+            .get_git_push(receipt.push_request_id())
+            .unwrap()
+            .expect("push row exists");
+        assert!(entry.correlation_id.is_none());
+    }
+
+    /// An agent run with no correlation id (the un-`--correlation-id`'d
+    /// case) gives the push nothing to inherit, so the column stays
+    /// NULL even though the run exists.
+    #[tokio::test]
+    async fn git_push_with_untagged_agent_run_leaves_correlation_id_null() {
+        use crate::agent_run::{AgentPrompt, AgentRunId};
+        use crate::audit::AgentRunAuditRecord;
+        use crate::core::AgentKind;
+
+        let github = wiremock::MockServer::start().await;
+        let state = make_broker_state(&github);
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+        open_audit_session(&state, session.session_id());
+        state
+            .audit
+            .record_agent_run(&AgentRunAuditRecord {
+                run_id: AgentRunId::new(),
+                session_id: session.session_id(),
+                requested_at: UnixMillis::now(),
+                agent_kind: AgentKind::Claude,
+                prompt: AgentPrompt::new("prompt").summary(),
+                correlation_id: None,
+            })
+            .unwrap();
+        let (staging, _tmp) = open_test_staging_store();
+
+        let body = encoded_body(sample_metadata(), b"untagged-run bundle".to_vec());
+        let response = handle_git_push_request(
+            &session,
+            body,
+            git_push_service_for_test(&state, Arc::clone(&staging)),
+        )
+        .await;
+
+        assert_eq!(response.status, VmHttpStatus::Ok);
+        let receipt: VmGitPushStagedReceipt = serde_json::from_slice(&response.body).unwrap();
+        let entry = state
+            .audit
+            .get_git_push(receipt.push_request_id())
+            .unwrap()
+            .expect("push row exists");
+        assert!(entry.correlation_id.is_none());
     }
 
     #[tokio::test]

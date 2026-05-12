@@ -16,8 +16,12 @@ pub mod agent_vm_lifecycle;
 pub mod audit;
 pub(crate) mod bearer;
 #[cfg(feature = "host")]
+pub(crate) mod clean_git;
+#[cfg(feature = "host")]
 pub mod config;
 pub mod core;
+#[cfg(feature = "host")]
+pub mod git_push_replay;
 #[cfg(feature = "host")]
 pub mod git_push_staging;
 #[cfg(feature = "host")]

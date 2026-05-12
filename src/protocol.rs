@@ -12,6 +12,7 @@
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+use crate::agent_plan::CorrelationId;
 use crate::agent_run::{AgentPrompt, AgentRunId};
 use crate::agent_vm_lifecycle::AgentVmSessionStateStatus;
 use crate::audit::GitPushOutcomeResult;
@@ -211,6 +212,12 @@ pub enum ClientMessage {
         /// Prompt to deliver to the guest agent over the brokered prompt
         /// channel. Debug output redacts this value.
         prompt: AgentPrompt,
+        /// Opaque caller-supplied identifier joining this run to a
+        /// wider task (per `docs/plans/2026-05-11-agent-plans.md`).
+        /// Stored verbatim on the `agent_run` audit row; the broker
+        /// never interprets it.
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        correlation_id: Option<CorrelationId>,
     },
     /// Stop a daemon-managed agent VM session and close its audit session.
     StopAgentVm { session_id: SessionId },
@@ -511,10 +518,33 @@ mod tests {
                 warm: WorkspaceWarmMode::Sources,
             },
             prompt: AgentPrompt::new("fix the failing test"),
+            correlation_id: None,
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert_eq!(serde_json::from_str::<ClientMessage>(&json).unwrap(), msg);
         assert!(json.contains("fix the failing test"));
+        // The optional field is elided when None so older clients/servers
+        // that predate the field can still parse the message.
+        assert!(!json.contains("correlation_id"));
+    }
+
+    #[test]
+    fn start_agent_run_roundtrips_with_correlation_id() {
+        let msg = ClientMessage::StartAgentRun {
+            label: None,
+            agent_kind: AgentKind::Claude,
+            agent_model: "claude-test".into(),
+            workspace: AgentVmWorkspaceBootstrap {
+                repo: sample_clone_repo(),
+                destination: None,
+                warm: WorkspaceWarmMode::None,
+            },
+            prompt: AgentPrompt::new("p"),
+            correlation_id: Some(CorrelationId::try_new("feat-42_xyz").unwrap()),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert_eq!(serde_json::from_str::<ClientMessage>(&json).unwrap(), msg);
+        assert!(json.contains("feat-42_xyz"));
     }
 
     #[test]
@@ -1000,6 +1030,7 @@ mod tests {
                 warm: WorkspaceWarmMode::None,
             },
             prompt: AgentPrompt::new("secret prompt"),
+            correlation_id: None,
         })
         .unwrap();
         assert_eq!(run["type"], "start_agent_run");
@@ -1077,6 +1108,7 @@ mod tests {
                 warm: WorkspaceWarmMode::None,
             },
             prompt: AgentPrompt::new("SECRET prompt"),
+            correlation_id: None,
         };
 
         let debug = format!("{msg:?}");
@@ -1184,6 +1216,7 @@ mod tests {
                     warm: WorkspaceWarmMode::None,
                 },
                 prompt: AgentPrompt::new("p"),
+                correlation_id: None,
             },
             5 => ClientMessage::StopAgentVm {
                 session_id: fixed_session_id(),
