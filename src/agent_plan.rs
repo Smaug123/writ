@@ -218,6 +218,8 @@ pub enum PlanBodyError {
     Empty,
     #[error("plan body is {byte_len} bytes, exceeding the {max_bytes}-byte limit")]
     TooLarge { byte_len: usize, max_bytes: usize },
+    #[error("plan body contains an embedded NUL byte")]
+    EmbeddedNul,
 }
 
 impl PlanBody {
@@ -231,6 +233,15 @@ impl PlanBody {
                 byte_len: body.len(),
                 max_bytes: MAX_PLAN_BODY_BYTES,
             });
+        }
+        // Mirror the audit-schema CHECK on `plan.body`: an embedded NUL
+        // is a parse error at the boundary, not a SQLite CHECK failure
+        // surfaced from inside the DAO. Plan bodies are Markdown prose,
+        // so a NUL is never anyone's intent; rejecting at the typed
+        // boundary means downstream code can rely on the invariant
+        // without re-checking.
+        if body.as_bytes().contains(&0) {
+            return Err(PlanBodyError::EmbeddedNul);
         }
         Ok(Self(body))
     }
@@ -984,6 +995,20 @@ mod tests {
         // exactly at the limit is accepted
         let just_right = "x".repeat(MAX_PLAN_BODY_BYTES);
         assert!(PlanBody::try_new(just_right).is_ok());
+    }
+
+    /// The audit schema rejects NULs in `plan.body`; the newtype must
+    /// match so callers get a typed boundary error rather than a raw
+    /// SQLite CHECK violation surfaced from inside the DAO.
+    #[test]
+    fn plan_body_rejects_embedded_nul() {
+        assert!(matches!(
+            PlanBody::try_new("hi\0world"),
+            Err(PlanBodyError::EmbeddedNul)
+        ));
+        // A wire payload with `\u0000` must also fail at the parse
+        // boundary, not slip through to the DB layer.
+        assert!(serde_json::from_str::<PlanBody>("\"hi\\u0000world\"").is_err());
     }
 
     #[test]

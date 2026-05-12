@@ -415,8 +415,11 @@ fn arb_correlation_id() -> impl Strategy<Value = CorrelationId> {
 
 fn arb_plan_body() -> impl Strategy<Value = PlanBody> {
     // Bounded so per-case work stays cheap; the `MAX_PLAN_BODY_BYTES`
-    // boundary is pinned in the inline unit tests.
-    ".{1,256}".prop_map(|s| PlanBody::try_new(s).expect("regex produces non-empty bounded body"))
+    // boundary is pinned in the inline unit tests. NULs are excluded
+    // because the newtype rejects them at the parse boundary to match
+    // the audit-schema CHECK on `plan.body`.
+    "[^\\x00]{1,256}"
+        .prop_map(|s| PlanBody::try_new(s).expect("regex produces non-empty NUL-free bounded body"))
 }
 
 fn arb_plan_feedback() -> impl Strategy<Value = PlanFeedback> {
