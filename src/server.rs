@@ -18,10 +18,11 @@ use std::sync::Arc;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
-use crate::agent_plan::{CorrelationId, PlanId};
+use crate::agent_plan::{CorrelationId, Decider, DecisionOutcome, PlanId};
 use crate::agent_vm_daemon::AgentVmDaemon;
 use crate::audit::{
-    AUDIT_WRITE_FAILURE_TARGET, AuditLog, GitPushResolution, GitPushResolutionRecord, PreMintRecord,
+    AUDIT_WRITE_FAILURE_TARGET, AuditLog, GitPushResolution, GitPushResolutionRecord,
+    PlanDecisionRecord, PreMintRecord,
 };
 use crate::core::{
     CapabilityRequest, GrantedScope, PolicyDecision, RequestId, SessionId, SessionRecord,
@@ -272,6 +273,11 @@ pub async fn dispatch_message_with_agent_vm<S: SecretStore + Send + Sync + 'stat
         } => reject_staged_push(state, request_id, operator, reason).await,
         ClientMessage::ListPlans { correlation_id } => list_plans(state, correlation_id).await,
         ClientMessage::ShowPlan { plan_id } => show_plan(state, plan_id).await,
+        ClientMessage::DecidePlan {
+            plan_id,
+            outcome,
+            decider,
+        } => decide_plan(state, plan_id, outcome, decider).await,
     }
 }
 
@@ -471,6 +477,79 @@ async fn show_plan<S: SecretStore + Send + Sync + 'static>(
         plan: PlanDetail {
             summary,
             body: plan.body,
+        },
+    }
+}
+
+/// Record an operator decision against a plan.
+///
+/// Look up the plan first so the "no such plan" case surfaces as a
+/// dedicated [`ServerMessage::UnknownPlan`] reply rather than collapsing
+/// into a generic error. The lookup is race-free against the second
+/// write: plans are append-only in the schema (no `DELETE` path), so a
+/// plan that exists now will still exist when the decision insert runs.
+///
+/// A second decision against the same plan trips the PRIMARY KEY on
+/// `plan_decision.plan_id`; that surfaces as
+/// [`ServerMessage::PlanAlreadyDecided`] via the same
+/// [`is_unique_constraint_violation`] helper the staged-push reject path
+/// uses, so a replay is a clean wire-level outcome instead of a prose
+/// error string.
+async fn decide_plan<S: SecretStore + Send + Sync + 'static>(
+    state: &Arc<BrokerState<S>>,
+    plan_id: PlanId,
+    outcome: DecisionOutcome,
+    decider: Decider,
+) -> ServerMessage {
+    let plan_lookup = {
+        let audit = Arc::clone(&state.audit);
+        tokio::task::spawn_blocking(move || audit.get_plan(plan_id)).await
+    };
+    match plan_lookup {
+        Ok(Ok(Some(_))) => {}
+        Ok(Ok(None)) => return ServerMessage::UnknownPlan { plan_id },
+        Ok(Err(err)) => {
+            return ServerMessage::Error {
+                message: err.to_string(),
+            };
+        }
+        Err(err) => {
+            return ServerMessage::Error {
+                message: format!("plan lookup task failed: {err}"),
+            };
+        }
+    }
+
+    let decided_at = UnixMillis::now();
+    let audit = Arc::clone(&state.audit);
+    let result = tokio::task::spawn_blocking(move || {
+        audit.record_plan_decision(&PlanDecisionRecord {
+            plan_id,
+            decided_at,
+            outcome,
+            decider,
+        })
+    })
+    .await;
+    match result {
+        Ok(Ok(())) => ServerMessage::PlanDecided { plan_id },
+        Ok(Err(err)) => {
+            if is_unique_constraint_violation(&err) {
+                return ServerMessage::PlanAlreadyDecided { plan_id };
+            }
+            tracing::error!(
+                target: AUDIT_WRITE_FAILURE_TARGET,
+                kind = "plan_decision",
+                plan_id = %plan_id,
+                error = %err,
+                "audit write failed: plan decision not recorded",
+            );
+            ServerMessage::Error {
+                message: err.to_string(),
+            }
+        }
+        Err(err) => ServerMessage::Error {
+            message: format!("audit write task failed: {err}"),
         },
     }
 }
@@ -2001,6 +2080,152 @@ mod tests {
             other => panic!("expected Plan, got {other:?}"),
         };
         assert!(detail.summary.correlation_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn decide_plan_for_unknown_plan_id_returns_unknown_plan() {
+        let server = MockServer::start().await;
+        let state = make_state(&server, vec![], "o");
+        let plan_id = crate::agent_plan::PlanId::new();
+        let resp = dispatch_message(
+            ClientMessage::DecidePlan {
+                plan_id,
+                outcome: DecisionOutcome::Accepted,
+                decider: Decider::try_new("cli:alice").unwrap(),
+            },
+            &state,
+        )
+        .await;
+        assert_eq!(resp, ServerMessage::UnknownPlan { plan_id });
+        // The audit log gained no row from the rejected call.
+        let stored = state.audit.get_plan_decision(plan_id).unwrap();
+        assert!(
+            stored.is_none(),
+            "unknown-plan dispatch must not persist a row, got {stored:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn decide_plan_records_audit_row_for_every_outcome() {
+        for outcome in [DecisionOutcome::Accepted, DecisionOutcome::RejectedRestart] {
+            let server = MockServer::start().await;
+            let state = make_state(&server, vec![], "o");
+            let session_id = open_session(&state).await;
+            let (_, plan_id) = record_planner_run_and_plan(
+                &state,
+                session_id,
+                None,
+                "# plan",
+                UnixMillis::from_millis(1_700_000_200),
+            )
+            .await;
+
+            let resp = dispatch_message(
+                ClientMessage::DecidePlan {
+                    plan_id,
+                    outcome,
+                    decider: Decider::try_new("cli:alice").unwrap(),
+                },
+                &state,
+            )
+            .await;
+            assert_eq!(resp, ServerMessage::PlanDecided { plan_id });
+
+            // The audit row landed with exactly the wire-supplied outcome
+            // and decider.
+            let stored = state
+                .audit
+                .get_plan_decision(plan_id)
+                .unwrap()
+                .expect("decision row should exist");
+            assert_eq!(stored.plan_id, plan_id);
+            assert_eq!(stored.outcome, outcome);
+            assert_eq!(stored.decider.as_str(), "cli:alice");
+        }
+    }
+
+    /// A second `DecidePlan` for the same plan must surface as
+    /// `PlanAlreadyDecided` — the PK collision on `plan_decision.plan_id`
+    /// is what makes the broker idempotent for replays. The audit row's
+    /// original outcome and decider stay unchanged.
+    #[tokio::test]
+    async fn decide_plan_second_call_for_same_plan_returns_plan_already_decided() {
+        let server = MockServer::start().await;
+        let state = make_state(&server, vec![], "o");
+        let session_id = open_session(&state).await;
+        let (_, plan_id) = record_planner_run_and_plan(
+            &state,
+            session_id,
+            None,
+            "# plan",
+            UnixMillis::from_millis(1_700_000_200),
+        )
+        .await;
+
+        let first = dispatch_message(
+            ClientMessage::DecidePlan {
+                plan_id,
+                outcome: DecisionOutcome::Accepted,
+                decider: Decider::try_new("cli:alice").unwrap(),
+            },
+            &state,
+        )
+        .await;
+        assert_eq!(first, ServerMessage::PlanDecided { plan_id });
+
+        let second = dispatch_message(
+            ClientMessage::DecidePlan {
+                plan_id,
+                outcome: DecisionOutcome::RejectedRestart,
+                decider: Decider::try_new("cli:bob").unwrap(),
+            },
+            &state,
+        )
+        .await;
+        assert_eq!(second, ServerMessage::PlanAlreadyDecided { plan_id });
+
+        // The original decision stands; the replay did not overwrite it.
+        let stored = state
+            .audit
+            .get_plan_decision(plan_id)
+            .unwrap()
+            .expect("decision row should exist");
+        assert_eq!(stored.outcome, DecisionOutcome::Accepted);
+        assert_eq!(stored.decider.as_str(), "cli:alice");
+    }
+
+    /// Operator decisions are deliberately cross-session: an operator
+    /// may decide on a plan whose planner session is long since closed.
+    /// The dispatch handler must accept the call without resurrecting
+    /// the session.
+    #[tokio::test]
+    async fn decide_plan_succeeds_after_planner_session_closes() {
+        let server = MockServer::start().await;
+        let state = make_state(&server, vec![], "o");
+        let session_id = open_session(&state).await;
+        let (_, plan_id) = record_planner_run_and_plan(
+            &state,
+            session_id,
+            None,
+            "# plan",
+            UnixMillis::from_millis(1_700_000_200),
+        )
+        .await;
+        state
+            .audit
+            .close_session(session_id, UnixMillis::from_millis(1_700_000_300))
+            .unwrap();
+
+        let resp = dispatch_message(
+            ClientMessage::DecidePlan {
+                plan_id,
+                outcome: DecisionOutcome::Accepted,
+                decider: Decider::try_new("cli:alice").unwrap(),
+            },
+            &state,
+        )
+        .await;
+        assert_eq!(resp, ServerMessage::PlanDecided { plan_id });
     }
 
     // --- Policy decisions ------------------------------------------------
