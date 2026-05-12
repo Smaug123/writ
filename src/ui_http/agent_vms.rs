@@ -111,7 +111,10 @@ pub(super) async fn detail(service: &UiHttpService, session_id_str: &str) -> UiH
     }
 }
 
-fn build_row(service: &UiHttpService, info: AgentVmSessionInfo) -> Result<AgentVmRow, UiHttpResponse> {
+fn build_row(
+    service: &UiHttpService,
+    info: AgentVmSessionInfo,
+) -> Result<AgentVmRow, UiHttpResponse> {
     let session = service
         .audit()
         .get_session(info.session_id)
@@ -121,7 +124,13 @@ fn build_row(service: &UiHttpService, info: AgentVmSessionInfo) -> Result<AgentV
         .latest_agent_run_id_for_session(info.session_id)
         .map_err(|err| UiHttpResponse::error_internal(err.to_string()))?;
     let (label, agent_kind, agent_model, opened_at, closed_at) = match session {
-        Some(s) => (s.label, s.agent_kind, s.agent_model, Some(s.opened_at), s.closed_at),
+        Some(s) => (
+            s.label,
+            s.agent_kind,
+            s.agent_model,
+            Some(s.opened_at),
+            s.closed_at,
+        ),
         None => (None, None, None, None, None),
     };
     Ok(AgentVmRow {

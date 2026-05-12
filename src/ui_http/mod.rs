@@ -18,8 +18,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use bytes::Bytes;
-use http_body_util::{Empty, Full, combinators::UnsyncBoxBody};
 use http_body_util::BodyExt;
+use http_body_util::{Empty, Full, combinators::UnsyncBoxBody};
 use hyper::body::Incoming;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
@@ -273,9 +273,7 @@ pub async fn run_ui_http_until_shutdown(
     Ok(())
 }
 
-fn report_ui_http_handler_result(
-    result: Result<std::io::Result<()>, tokio::task::JoinError>,
-) {
+fn report_ui_http_handler_result(result: Result<std::io::Result<()>, tokio::task::JoinError>) {
     match result {
         Ok(Ok(())) => {}
         Ok(Err(err)) => tracing::warn!(error = %err, "ui http connection error"),
@@ -308,9 +306,7 @@ async fn handle_ui_http_connection_inner(
             service_fn(move |req: http::Request<Incoming>| {
                 let service = Arc::clone(&service);
                 async move {
-                    Ok::<_, std::convert::Infallible>(
-                        serve_ui_http_request(&service, req).await,
-                    )
+                    Ok::<_, std::convert::Infallible>(serve_ui_http_request(&service, req).await)
                 }
             }),
         )
@@ -415,7 +411,10 @@ impl UiHttpResponse {
     fn into_hyper_response(self) -> http::Response<UnsyncBoxBody<Bytes, std::io::Error>> {
         let mut builder = http::Response::builder()
             .status(self.status)
-            .header(http::header::CONTENT_TYPE, "application/json; charset=utf-8")
+            .header(
+                http::header::CONTENT_TYPE,
+                "application/json; charset=utf-8",
+            )
             .header(http::header::CONNECTION, "close");
         if self.status == 401 {
             builder = builder.header(http::header::WWW_AUTHENTICATE, "Bearer");
@@ -499,11 +498,7 @@ fn authorize(
     let Some(token) = header.strip_prefix("Bearer ") else {
         return Err(UiHttpResponse::error(UiHttpErrorTag::InvalidBearer));
     };
-    if token
-        .as_bytes()
-        .ct_eq(expected.as_str().as_bytes())
-        .into()
-    {
+    if token.as_bytes().ct_eq(expected.as_str().as_bytes()).into() {
         Ok(())
     } else {
         Err(UiHttpResponse::error(UiHttpErrorTag::InvalidBearer))
@@ -559,7 +554,11 @@ mod tests {
         String::from_utf8(bytes.to_vec()).unwrap()
     }
 
-    fn empty_request(method: &str, target: &str, bearer: Option<&str>) -> http::Request<Full<Bytes>> {
+    fn empty_request(
+        method: &str,
+        target: &str,
+        bearer: Option<&str>,
+    ) -> http::Request<Full<Bytes>> {
         let mut builder = http::Request::builder().method(method).uri(target);
         if let Some(b) = bearer {
             builder = builder.header(http::header::AUTHORIZATION, format!("Bearer {b}"));
@@ -583,8 +582,7 @@ mod tests {
     #[tokio::test]
     async fn missing_bearer_returns_401_with_tag() {
         let service = make_service("ui-test-bearer-123");
-        let resp =
-            serve_ui_http_request(&service, empty_request("GET", "/v1/health", None)).await;
+        let resp = serve_ui_http_request(&service, empty_request("GET", "/v1/health", None)).await;
         assert_eq!(resp.status(), 401);
         let www = resp
             .headers()
@@ -592,20 +590,24 @@ mod tests {
             .map(|v| v.to_str().unwrap().to_string());
         assert_eq!(www.as_deref(), Some("Bearer"));
         let body = body_string(resp).await;
-        assert!(body.contains("\"error\":\"missing_bearer\""), "body: {body}");
+        assert!(
+            body.contains("\"error\":\"missing_bearer\""),
+            "body: {body}"
+        );
     }
 
     #[tokio::test]
     async fn wrong_bearer_returns_401_invalid() {
         let service = make_service("ui-test-bearer-123");
-        let resp = serve_ui_http_request(
-            &service,
-            empty_request("GET", "/v1/health", Some("wrong")),
-        )
-        .await;
+        let resp =
+            serve_ui_http_request(&service, empty_request("GET", "/v1/health", Some("wrong")))
+                .await;
         assert_eq!(resp.status(), 401);
         let body = body_string(resp).await;
-        assert!(body.contains("\"error\":\"invalid_bearer\""), "body: {body}");
+        assert!(
+            body.contains("\"error\":\"invalid_bearer\""),
+            "body: {body}"
+        );
     }
 
     #[tokio::test]
@@ -642,7 +644,10 @@ mod tests {
         .await;
         assert_eq!(resp.status(), 405);
         let body = body_string(resp).await;
-        assert!(body.contains("\"error\":\"method_not_allowed\""), "body: {body}");
+        assert!(
+            body.contains("\"error\":\"method_not_allowed\""),
+            "body: {body}"
+        );
         assert!(body.contains("\"GET\""), "body: {body}");
     }
 
@@ -682,7 +687,10 @@ mod tests {
         .await;
         assert_eq!(resp.status(), 404);
         let body = body_string(resp).await;
-        assert!(body.contains("\"error\":\"unknown_session\""), "body: {body}");
+        assert!(
+            body.contains("\"error\":\"unknown_session\""),
+            "body: {body}"
+        );
     }
 
     #[tokio::test]
@@ -699,14 +707,20 @@ mod tests {
         .await;
         assert_eq!(resp.status(), 404);
         let body = body_string(resp).await;
-        assert!(body.contains("\"error\":\"malformed_session_id\""), "body: {body}");
+        assert!(
+            body.contains("\"error\":\"malformed_session_id\""),
+            "body: {body}"
+        );
     }
 
     #[tokio::test]
     async fn bearer_token_redacts_in_debug() {
         let token = UiHttpBearerToken::new("ui-test-secret-abc").unwrap();
         let debug = format!("{:?}", token);
-        assert!(!debug.contains("ui-test-secret-abc"), "debug leaked: {debug}");
+        assert!(
+            !debug.contains("ui-test-secret-abc"),
+            "debug leaked: {debug}"
+        );
         assert!(debug.contains("redacted"), "debug: {debug}");
     }
 
@@ -746,12 +760,7 @@ mod tests {
         let token = UiHttpBearerToken::generate();
         write_bearer_file(&path, &token).unwrap();
         let mode = std::fs::metadata(&parent).unwrap().permissions().mode();
-        assert_eq!(
-            mode & 0o777,
-            0o700,
-            "expected 0700, got {:o}",
-            mode & 0o777
-        );
+        assert_eq!(mode & 0o777, 0o700, "expected 0700, got {:o}", mode & 0o777);
     }
 
     #[test]
