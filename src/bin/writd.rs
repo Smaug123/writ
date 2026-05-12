@@ -16,6 +16,10 @@ use writ::git_push_staging::GitPushStagingStore;
 use writ::github::GitHubMinter;
 use writ::secret::{FileSecretStore, KeyringSecretStore, SecretStore};
 use writ::server::{BrokerState, default_socket_path, run_with_agent_vm};
+use writ::ui_http::{
+    UiHttpBearerToken, UiHttpService, bind_ui_http_listener, run_ui_http_until_shutdown,
+    write_bearer_file,
+};
 
 #[derive(Parser)]
 #[command(name = "writd", about = "writ broker daemon")]
@@ -50,6 +54,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         secret_store,
         socket_path,
         audit_db,
+        ui_http,
     } = config;
 
     let socket_path = args
@@ -148,6 +153,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .into());
         }
     }
+    if let Some(ui_http) = ui_http {
+        ui_http.validate()?;
+        // Bind before touching the bearer file. If a stale daemon is
+        // still listening on this port, `bind` returns `AddrInUse` and
+        // we exit before overwriting the live daemon's bearer; clients
+        // that re-read the file then continue authenticating against
+        // the surviving daemon.
+        let listener = bind_ui_http_listener(ui_http.bind).await?;
+        let bound = listener.local_addr()?;
+        let bearer = UiHttpBearerToken::generate();
+        let bearer_path = ui_http.bearer_path_or_default();
+        write_bearer_file(&bearer_path, &bearer)?;
+        let service = UiHttpService::new(Arc::clone(&state.audit), agent_vm.clone(), bearer);
+        // The broker's main accept loop has no shutdown signal today,
+        // so the UI HTTP runner pairs with a never-fires watch and is
+        // torn down by process exit; once the broker grows a real
+        // shutdown signal this receiver can hang off it.
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        tracing::info!(
+            bind = %bound,
+            bearer_path = %bearer_path.display(),
+            "ui http listening",
+        );
+        tokio::spawn(async move {
+            if let Err(err) = run_ui_http_until_shutdown(listener, service, shutdown_rx).await {
+                tracing::error!(error = %err, "ui http listener exited with error");
+            }
+        });
+        // Keep the sender alive for the daemon lifetime so the receiver
+        // does not observe `Err` on `changed()` and exit early.
+        std::mem::forget(_shutdown_tx);
+    }
+
     run_with_agent_vm(&socket_path, state, agent_vm).await?;
     Ok(())
 }

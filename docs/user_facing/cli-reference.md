@@ -197,3 +197,83 @@ curl -H "Authorization: Bearer $TOKEN" \
 
 The token expires within ~1 hour. For a longer-running task, request a
 fresh token per action rather than storing it.
+
+## UI HTTP — read-only data API
+
+When `ui_http` is configured (see [Configuration](configuration.md#ui_http)),
+`writd` exposes a small JSON HTTP API on loopback for consumption by a
+web UI, TUI, MCP wrapper, or ad-hoc `curl`. The API is read-only: only
+`GET` is accepted, and every request must carry the bearer token written
+to the `ui_http` bearer path.
+
+```bash
+TOKEN=$(cat "${XDG_RUNTIME_DIR:-$HOME/.local/run}/writ/ui-bearer")
+curl -sS -H "Authorization: Bearer $TOKEN" \
+  http://127.0.0.1:7717/v1/agent-vms
+```
+
+### Error shape
+
+Non-2xx responses always have the body `{"error": "<tag>", …}` and the
+appropriate HTTP status. The current tags:
+
+| Tag                     | Status | Meaning                                                       |
+| ----------------------- | ------ | ------------------------------------------------------------- |
+| `missing_bearer`        | 401    | No `Authorization` header.                                    |
+| `invalid_bearer`        | 401    | Wrong, malformed, or duplicate `Authorization` header.        |
+| `method_not_allowed`    | 405    | Unsupported method; body includes `allowed: [...]`.           |
+| `not_found`             | 404    | Unknown path.                                                 |
+| `malformed_session_id`  | 404    | Path segment is not a UUID; body includes `session_id`.       |
+| `unknown_session`       | 404    | No such VM session is known to the broker.                    |
+| `internal`              | 503    | Daemon-side failure; body includes a human-readable message.  |
+
+Branch on the tag, not on the prose.
+
+### `GET /v1/health`
+
+Liveness check. `200 OK` with `{"ok": true}` when the listener is up
+and the bearer matches. Useful for confirming the bearer round-trip
+before reaching for the real endpoints.
+
+### `GET /v1/agent-vms`
+
+Lists every persisted daemon-managed agent VM, newest `opened_at`
+first. Sessions with no audit row sink to the bottom of the list.
+
+Response:
+
+```json
+{
+  "agent_vms": [
+    {
+      "session_id": "…",
+      "status": "running",
+      "vm_name": "…",
+      "network_name": "…",
+      "subnet_index": 17,
+      "broker_urls": ["http://…:…/"],
+      "runtime_attached": true,
+      "label": "fixing bug 42",
+      "agent_kind": "claude",
+      "agent_model": "claude-opus-4-7",
+      "opened_at": 1715500000000,
+      "closed_at": null,
+      "current_run_id": "…"
+    }
+  ]
+}
+```
+
+`agent_vms` is always present, even when empty. `current_run_id` is the
+most recent `agent_run.run_id` on the session (by `requested_at`), or
+`null` if no run has been recorded. The run itself is not inlined; future
+versions will expose it through its own resource.
+
+When `writd` is configured without `agent_vm`, the list is always empty —
+there are no managed VMs to expose.
+
+### `GET /v1/agent-vms/{session_id}`
+
+Returns the same row shape as the list endpoint, unwrapped. `404
+malformed_session_id` if `session_id` is not a UUID; `404
+unknown_session` if no VM matches.

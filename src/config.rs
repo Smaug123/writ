@@ -1,6 +1,6 @@
 //! Daemon configuration loaded from a JSON file at startup.
 
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -78,6 +78,65 @@ pub struct DaemonConfig {
     /// `$XDG_DATA_HOME/writ/audit.db` (see [`default_audit_db_path`]).
     #[serde(default)]
     pub audit_db: Option<PathBuf>,
+    /// Optional read-only JSON HTTP listener for external UIs (web,
+    /// TUI, MCP, `curl`). Absent by default — when absent, no
+    /// listener is started and no bearer file is written. See
+    /// `docs/plans/2026-05-12-ui-data-api.md`.
+    #[serde(default)]
+    pub ui_http: Option<UiHttpConfig>,
+}
+
+/// Configuration for the read-only UI HTTP transport. Distinct from
+/// the host Unix socket and the per-VM HTTP listener.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UiHttpConfig {
+    /// Bind address. Must be loopback in v1: the bearer file is the
+    /// access boundary, and a non-loopback bind would need TLS and a
+    /// reworked threat model.
+    pub bind: SocketAddr,
+    /// Override the path the daemon writes the bearer file to.
+    /// Defaults to [`default_ui_http_bearer_path`].
+    #[serde(default)]
+    pub bearer_path: Option<PathBuf>,
+}
+
+#[derive(Debug, thiserror::Error, Eq, PartialEq)]
+pub enum UiHttpConfigError {
+    #[error("ui_http.bind must be a loopback address (got {0})")]
+    NonLoopbackBind(SocketAddr),
+}
+
+impl UiHttpConfig {
+    /// Reject bind addresses that are not loopback. Called at daemon
+    /// startup before the listener is bound so the operator sees the
+    /// error immediately rather than discovering a public-facing
+    /// listener by accident.
+    pub fn validate(&self) -> Result<(), UiHttpConfigError> {
+        if !self.bind.ip().is_loopback() {
+            return Err(UiHttpConfigError::NonLoopbackBind(self.bind));
+        }
+        Ok(())
+    }
+
+    pub fn bearer_path_or_default(&self) -> PathBuf {
+        self.bearer_path
+            .clone()
+            .unwrap_or_else(default_ui_http_bearer_path)
+    }
+}
+
+/// Default location for the UI HTTP bearer file. Lives next to the
+/// Unix socket so the same `$XDG_RUNTIME_DIR/writ/` directory holds
+/// the runtime-secret material that consumers need to talk to the
+/// daemon.
+pub fn default_ui_http_bearer_path() -> PathBuf {
+    if let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR") {
+        PathBuf::from(dir).join("writ/ui-bearer")
+    } else {
+        let home = std::env::var_os("HOME").unwrap_or_else(|| "/tmp".into());
+        PathBuf::from(home).join(".local/run/writ/ui-bearer")
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -632,8 +691,99 @@ mod tests {
         assert_eq!(c.policy.default_ttl.as_i64(), 3600);
         assert!(c.agent_vm.is_none());
         assert!(c.socket_path.is_none());
+        assert!(c.ui_http.is_none());
         assert!(
             matches!(&c.secret_store, SecretStoreConfig::File { path } if *path == default_secret_store_path())
+        );
+    }
+
+    #[test]
+    fn parses_ui_http_config() {
+        let json = r#"{
+            "github_apps": {
+                "claude": {
+                    "app_id": 1,
+                    "installation_id": 2,
+                    "installation_owner": "o",
+                    "private_key_secret": "pk"
+                }
+            },
+            "policy": { "default_ttl": 600, "writable_repos": [] },
+            "ui_http": { "bind": "127.0.0.1:7378" }
+        }"#;
+        let c: DaemonConfig = serde_json::from_str(json).unwrap();
+        let ui = c.ui_http.as_ref().expect("ui_http parsed");
+        assert_eq!(ui.bind.to_string(), "127.0.0.1:7378");
+        assert!(ui.bearer_path.is_none());
+        assert_eq!(ui.bearer_path_or_default(), default_ui_http_bearer_path());
+        ui.validate().expect("loopback bind validates");
+    }
+
+    #[test]
+    fn parses_ui_http_config_with_bearer_path() {
+        let json = r#"{
+            "github_apps": {
+                "claude": {
+                    "app_id": 1,
+                    "installation_id": 2,
+                    "installation_owner": "o",
+                    "private_key_secret": "pk"
+                }
+            },
+            "policy": { "default_ttl": 600, "writable_repos": [] },
+            "ui_http": {
+                "bind": "127.0.0.1:7378",
+                "bearer_path": "/tmp/writ/ui-bearer"
+            }
+        }"#;
+        let c: DaemonConfig = serde_json::from_str(json).unwrap();
+        let ui = c.ui_http.as_ref().expect("ui_http parsed");
+        assert_eq!(
+            ui.bearer_path_or_default(),
+            std::path::PathBuf::from("/tmp/writ/ui-bearer")
+        );
+    }
+
+    #[test]
+    fn ui_http_validate_rejects_non_loopback_bind() {
+        let cfg = UiHttpConfig {
+            bind: "0.0.0.0:7378".parse().unwrap(),
+            bearer_path: None,
+        };
+        let err = cfg.validate().expect_err("non-loopback rejected");
+        assert!(matches!(err, UiHttpConfigError::NonLoopbackBind(_)));
+    }
+
+    #[test]
+    fn ui_http_validate_accepts_ipv6_loopback() {
+        let cfg = UiHttpConfig {
+            bind: "[::1]:7378".parse().unwrap(),
+            bearer_path: None,
+        };
+        cfg.validate().expect("::1 is loopback");
+    }
+
+    #[test]
+    fn ui_http_config_rejects_unknown_fields() {
+        let json = r#"{
+            "github_apps": {
+                "claude": {
+                    "app_id": 1,
+                    "installation_id": 2,
+                    "installation_owner": "o",
+                    "private_key_secret": "pk"
+                }
+            },
+            "policy": { "default_ttl": 600, "writable_repos": [] },
+            "ui_http": {
+                "bind": "127.0.0.1:7378",
+                "unknown_key": true
+            }
+        }"#;
+        let err = serde_json::from_str::<DaemonConfig>(json).unwrap_err();
+        assert!(
+            err.to_string().contains("unknown_key"),
+            "expected unknown-field error mentioning unknown_key, got: {err}"
         );
     }
 
