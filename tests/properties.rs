@@ -747,6 +747,36 @@ proptest! {
         }
     }
 
+    /// Any `Stage` round-trips through the `agent_run` audit DAO. The
+    /// migration-16 CHECK lists exactly the three variants the Rust enum
+    /// names, so a write of any variant must read back unchanged.
+    #[test]
+    fn agent_run_stage_roundtrips_through_audit_log(stage in arb_stage()) {
+        let log = AuditLog::open_in_memory().unwrap();
+        let session = SessionRecord {
+            session_id: SessionId::new(),
+            label: None,
+            agent_kind: None,
+            agent_model: None,
+            opened_at: UnixMillis::from_millis(0),
+            closed_at: None,
+        };
+        log.open_session(&session).unwrap();
+        let run_id = AgentRunId::new();
+        log.record_agent_run(&AgentRunAuditRecord {
+            run_id,
+            session_id: session.session_id,
+            requested_at: UnixMillis::from_millis(1),
+            agent_kind: AgentKind::Claude,
+            prompt: AgentPrompt::try_new("p").unwrap().summary(),
+            correlation_id: None,
+            stage,
+        })
+        .unwrap();
+        let entry = log.get_agent_run(run_id).unwrap().unwrap();
+        prop_assert_eq!(entry.stage, stage);
+    }
+
     /// Any valid `CorrelationId` round-trips through the `agent_run`
     /// audit DAO. The DAO's CHECK constraint and the `CorrelationId`
     /// newtype agree on the allowed character class, so writes through
@@ -773,6 +803,7 @@ proptest! {
             agent_kind: AgentKind::Claude,
             prompt: AgentPrompt::try_new("p").unwrap().summary(),
             correlation_id: Some(c.clone()),
+            stage: Stage::Execute,
         })
         .unwrap();
         let entry = log.get_agent_run(run_id).unwrap().unwrap();
@@ -804,6 +835,7 @@ proptest! {
             agent_kind: AgentKind::Claude,
             prompt: AgentPrompt::try_new("p").unwrap().summary(),
             correlation_id: None,
+            stage: Stage::Plan,
         })
         .unwrap();
 

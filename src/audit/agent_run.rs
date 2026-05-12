@@ -12,7 +12,7 @@ use super::validation::{
     validate_agent_run_stream_path_text, validate_sha256_hex, validate_stream_summary,
 };
 use super::{AuditError, AuditLog};
-use crate::agent_plan::CorrelationId;
+use crate::agent_plan::{CorrelationId, Stage};
 use crate::agent_run::{
     AgentPromptSummary, AgentRunId, AgentRunOutcome, AgentRunStreamSummary, AgentRunTerminalStatus,
 };
@@ -40,6 +40,12 @@ pub struct AgentRunAuditRecord {
     /// `docs/plans/2026-05-11-agent-plans.md` ("Correlation ID") for
     /// the semantics.
     pub correlation_id: Option<CorrelationId>,
+    /// Role of this run in the plan/review/decide/execute pipeline.
+    /// See `docs/plans/2026-05-11-agent-plans.md` (§"Stages") for the
+    /// gate this drives. The route-level enforcement that consults
+    /// this column lands later in slice 3; persisting the value first
+    /// lets the protocol/CLI change and the gate land independently.
+    pub stage: Stage,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -161,8 +167,9 @@ impl AuditLog {
                      prompt_bytes,
                      prompt_sha256,
                      prompt_redacted_preview,
-                     correlation_id
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                     correlation_id,
+                     stage
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 params![
                     r.run_id.as_uuid().to_string(),
                     r.session_id.as_uuid().to_string(),
@@ -172,6 +179,7 @@ impl AuditLog {
                     &r.prompt.sha256_hex,
                     &r.prompt.redacted_preview,
                     r.correlation_id.as_ref().map(CorrelationId::as_str),
+                    r.stage.as_str(),
                 ],
             )?;
             tx.commit()?;
@@ -229,7 +237,7 @@ impl AuditLog {
             let row = c
                 .query_row(
                     "SELECT run_id, session_id, requested_at, agent_kind, prompt_bytes,
-                            prompt_sha256, prompt_redacted_preview, correlation_id
+                            prompt_sha256, prompt_redacted_preview, correlation_id, stage
                      FROM agent_run
                      WHERE run_id = ?1",
                     params![run_id.as_uuid().to_string()],
@@ -323,6 +331,7 @@ fn agent_run_from_row(row: &Row<'_>) -> rusqlite::Result<Result<AgentRunAuditRec
     let prompt_sha256: String = row.get(5)?;
     let prompt_redacted_preview: String = row.get(6)?;
     let correlation_id_raw: Option<String> = row.get(7)?;
+    let stage_raw: String = row.get(8)?;
 
     let parse = || -> Result<AgentRunAuditRecord, AuditError> {
         let run_id = uuid::Uuid::parse_str(&run_id_str)
@@ -341,6 +350,9 @@ fn agent_run_from_row(row: &Row<'_>) -> rusqlite::Result<Result<AgentRunAuditRec
             .map(CorrelationId::try_new)
             .transpose()
             .map_err(|_| AuditError::Invariant("agent run row: correlation_id is invalid"))?;
+        let stage = stage_raw
+            .parse::<Stage>()
+            .map_err(|_| AuditError::Invariant("agent run row: stage is invalid"))?;
         Ok(AgentRunAuditRecord {
             run_id: AgentRunId::from_uuid(run_id),
             session_id: SessionId::from_uuid(session_id),
@@ -352,6 +364,7 @@ fn agent_run_from_row(row: &Row<'_>) -> rusqlite::Result<Result<AgentRunAuditRec
                 redacted_preview: prompt_redacted_preview,
             },
             correlation_id,
+            stage,
         })
     };
     Ok(parse())
@@ -526,6 +539,7 @@ mod tests {
             agent_kind: AgentKind::Claude,
             prompt: prompt.summary(),
             correlation_id: None,
+            stage: Stage::Execute,
         };
 
         log.record_agent_run(&record).unwrap();
@@ -537,6 +551,7 @@ mod tests {
         assert_eq!(entry.prompt.byte_len, prompt.byte_len());
         assert_eq!(entry.prompt.redacted_preview, "<redacted>");
         assert!(entry.correlation_id.is_none());
+        assert_eq!(entry.stage, Stage::Execute);
         let debug = format!("{entry:?}");
         assert!(!debug.contains(prompt.as_str()), "{debug}");
 
@@ -581,6 +596,7 @@ mod tests {
             agent_kind: AgentKind::Codex,
             prompt: crate::agent_run::AgentPrompt::new("prompt").summary(),
             correlation_id: None,
+            stage: Stage::Execute,
         };
 
         let err = log.record_agent_run(&record).unwrap_err();
@@ -644,6 +660,7 @@ mod tests {
                     redacted_preview: "<redacted>".to_string(),
                 },
                 correlation_id: None,
+                stage: Stage::Execute,
             })
             .unwrap_err();
 
@@ -701,6 +718,7 @@ mod tests {
             agent_kind: AgentKind::Claude,
             prompt: crate::agent_run::AgentPrompt::new("prompt").summary(),
             correlation_id: Some(correlation.clone()),
+            stage: Stage::Execute,
         };
 
         log.record_agent_run(&record).unwrap();
@@ -723,6 +741,7 @@ mod tests {
             agent_kind: AgentKind::Claude,
             prompt: crate::agent_run::AgentPrompt::new("prompt").summary(),
             correlation_id: None,
+            stage: Stage::Execute,
         })
         .unwrap();
         let entry = log.get_agent_run(run_id).unwrap().unwrap();
@@ -821,6 +840,7 @@ mod tests {
             agent_kind: AgentKind::Claude,
             prompt: crate::agent_run::AgentPrompt::new("prompt").summary(),
             correlation_id: None,
+            stage: Stage::Execute,
         })
         .unwrap();
         assert!(
@@ -843,6 +863,7 @@ mod tests {
             agent_kind: AgentKind::Claude,
             prompt: crate::agent_run::AgentPrompt::new("prompt").summary(),
             correlation_id: Some(correlation.clone()),
+            stage: Stage::Execute,
         })
         .unwrap();
         assert_eq!(

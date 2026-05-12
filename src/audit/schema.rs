@@ -30,7 +30,7 @@ pub(super) struct Migration {
 /// a version higher than this is rejected with [`AuditError::SchemaTooNew`]
 /// rather than opened — we'd rather fail to start than silently drop data
 /// into a schema a newer broker wrote.
-pub(super) const SCHEMA_VERSION: i32 = 16;
+pub(super) const SCHEMA_VERSION: i32 = 17;
 
 /// The full migration history. Each entry documents exactly one state
 /// transition; the sequence of entries is the schema's lineage. Order
@@ -1002,6 +1002,44 @@ WHEN EXISTS (
 BEGIN
     SELECT RAISE(ABORT, 'session is closed');
 END;
+"#,
+    },
+    // Agent-run stage: per `docs/plans/2026-05-11-agent-plans.md`, every
+    // agent run carries one of three roles in the plan/review/decide/
+    // execute pipeline. The column is NOT NULL — every run has exactly
+    // one role — and the CHECK mirrors the closed `Stage` enum on the
+    // Rust side so a future code path that bypasses the DAO still cannot
+    // land a malformed value.
+    //
+    // Pre-existing rows are backfilled in two passes. The ALTER fills
+    // every row with `'execute'` (today's one-shot implementer flow,
+    // which is exactly what `execute` will denote once the gate lands).
+    // The follow-up UPDATE rewrites any run referenced by
+    // `plan.agent_run_id` to `'plan'`: v16 (and v15 before it) already
+    // accepted plan submissions and `plan` is the only ground-truth
+    // signal that an existing run was a planner, so without this pass
+    // the gate would later treat those runs as implementers and the
+    // audit log would misclassify them. The DEFAULT serves only the
+    // backfill; the DAO supplies the stage explicitly on every insert
+    // so no in-app write relies on it.
+    //
+    // The `typeof(stage) = 'text'` guard prevents a raw caller from
+    // smuggling a BLOB-bound value of the same byte content past the
+    // `IN (...)` literal-text check. SQLite's affinity rules will not
+    // coerce a BLOB to TEXT for the equality, but the guard makes the
+    // intent explicit and matches the migration-14 pattern for safety.
+    Migration {
+        version: 17,
+        sql: r#"
+ALTER TABLE agent_run ADD COLUMN stage TEXT NOT NULL DEFAULT 'execute'
+    CHECK (
+        typeof(stage) = 'text'
+        AND stage IN ('plan','review','execute')
+    );
+
+UPDATE agent_run
+SET stage = 'plan'
+WHERE run_id IN (SELECT agent_run_id FROM plan);
 "#,
     },
 ];
@@ -2661,6 +2699,179 @@ mod tests {
             )
             .unwrap();
         assert_eq!(recovered_body, dirty_body);
+    }
+
+    /// A v16 DB carries `agent_run` rows without a `stage` column; the
+    /// migration adds the column with `DEFAULT 'execute'` so historical
+    /// rows acquire a meaningful role rather than NULL (which the
+    /// NOT NULL clause would refuse anyway). v16 (and v15 before it)
+    /// already accepted plan submissions, so any run referenced by
+    /// `plan.agent_run_id` is a planner and the follow-up UPDATE must
+    /// rewrite it to `'plan'`; runs with no `plan` row stay at
+    /// `'execute'`. After migration the CHECK must reject both an
+    /// out-of-set value and a BLOB-bound smuggle of a valid-looking
+    /// byte string — the two cases the migration-14 regression test
+    /// established as the threat model for TEXT affinity columns.
+    #[test]
+    fn open_migrates_v16_database_to_agent_run_stage_schema() {
+        let db = NamedTempFile::new().unwrap();
+        let session_id = SessionId::new();
+        let executor_run_id = uuid::Uuid::new_v4();
+        let planner_run_id = uuid::Uuid::new_v4();
+        let plan_id = uuid::Uuid::new_v4();
+
+        {
+            let mut conn = Connection::open(db.path()).unwrap();
+            let tx = conn.transaction().unwrap();
+            for migration in MIGRATIONS.iter().take(16) {
+                tx.execute_batch(migration.sql).unwrap();
+            }
+            tx.pragma_update(None, "user_version", 16).unwrap();
+
+            tx.execute(
+                "INSERT INTO session (session_id, label, agent_kind, agent_model, opened_at, closed_at) \
+                 VALUES (?1, NULL, 'claude', NULL, 1, NULL)",
+                params![session_id.as_uuid().to_string()],
+            )
+            .unwrap();
+
+            for run_id in [executor_run_id, planner_run_id] {
+                tx.execute(
+                    "INSERT INTO agent_run (
+                         run_id, session_id, requested_at, agent_kind,
+                         prompt_bytes, prompt_sha256, prompt_redacted_preview,
+                         correlation_id
+                     ) VALUES (?1, ?2, 2, 'claude', 1, ?3, '<redacted>', NULL)",
+                    params![
+                        run_id.to_string(),
+                        session_id.as_uuid().to_string(),
+                        "a".repeat(64),
+                    ],
+                )
+                .unwrap();
+            }
+
+            // The planner run produced a v15 plan row; the migration must
+            // notice this and lift the run's stage from the 'execute'
+            // default to 'plan'.
+            tx.execute(
+                "INSERT INTO plan (plan_id, agent_run_id, submitted_at, body, body_sha256) \
+                 VALUES (?1, ?2, 3, '# Plan', ?3)",
+                params![
+                    plan_id.to_string(),
+                    planner_run_id.to_string(),
+                    crate::agent_run::sha256_hex(b"# Plan"),
+                ],
+            )
+            .unwrap();
+
+            tx.commit().unwrap();
+        }
+
+        let log = AuditLog::open(db.path()).unwrap();
+        assert_eq!(read_user_version(&log), SCHEMA_VERSION);
+        assert!(column_exists(&log, "agent_run", "stage"));
+
+        // A run with no plan row stays at the 'execute' default.
+        let executor_stage: String = log
+            .with_conn(|c| {
+                Ok(c.query_row(
+                    "SELECT stage FROM agent_run WHERE run_id = ?1",
+                    params![executor_run_id.to_string()],
+                    |r| r.get::<_, String>(0),
+                )?)
+            })
+            .unwrap();
+        assert_eq!(executor_stage, "execute");
+
+        // A run referenced by plan.agent_run_id is rewritten to 'plan'.
+        let planner_stage: String = log
+            .with_conn(|c| {
+                Ok(c.query_row(
+                    "SELECT stage FROM agent_run WHERE run_id = ?1",
+                    params![planner_run_id.to_string()],
+                    |r| r.get::<_, String>(0),
+                )?)
+            })
+            .unwrap();
+        assert_eq!(planner_stage, "plan");
+
+        // CHECK refuses an out-of-set TEXT value.
+        let unknown_err = log
+            .with_conn(|c| {
+                Ok(c.execute(
+                    "INSERT INTO agent_run (
+                         run_id, session_id, requested_at, agent_kind,
+                         prompt_bytes, prompt_sha256, prompt_redacted_preview,
+                         correlation_id, stage
+                     ) VALUES (?1, ?2, 3, 'claude', 1, ?3, '<redacted>', NULL, 'decide')",
+                    params![
+                        uuid::Uuid::new_v4().to_string(),
+                        session_id.as_uuid().to_string(),
+                        "a".repeat(64),
+                    ],
+                ))
+            })
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            unknown_err.to_string().contains("CHECK"),
+            "got: {unknown_err}"
+        );
+
+        // CHECK refuses a BLOB-bound value even when the bytes spell a
+        // valid variant — `typeof = 'text'` is what stops the smuggle.
+        let blob_err = log
+            .with_conn(|c| {
+                Ok(c.execute(
+                    "INSERT INTO agent_run (
+                         run_id, session_id, requested_at, agent_kind,
+                         prompt_bytes, prompt_sha256, prompt_redacted_preview,
+                         correlation_id, stage
+                     ) VALUES (?1, ?2, 4, 'claude', 1, ?3, '<redacted>', NULL, ?4)",
+                    params![
+                        uuid::Uuid::new_v4().to_string(),
+                        session_id.as_uuid().to_string(),
+                        "a".repeat(64),
+                        rusqlite::types::Value::Blob(b"plan".to_vec()),
+                    ],
+                ))
+            })
+            .unwrap()
+            .unwrap_err();
+        assert!(blob_err.to_string().contains("CHECK"), "got: {blob_err}");
+
+        // A fresh insert with each valid stage round-trips.
+        for stage in ["plan", "review", "execute"] {
+            let id = uuid::Uuid::new_v4();
+            log.with_conn(|c| {
+                c.execute(
+                    "INSERT INTO agent_run (
+                         run_id, session_id, requested_at, agent_kind,
+                         prompt_bytes, prompt_sha256, prompt_redacted_preview,
+                         correlation_id, stage
+                     ) VALUES (?1, ?2, 5, 'claude', 1, ?3, '<redacted>', NULL, ?4)",
+                    params![
+                        id.to_string(),
+                        session_id.as_uuid().to_string(),
+                        "a".repeat(64),
+                        stage,
+                    ],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+            let got: String = log
+                .with_conn(|c| {
+                    Ok(c.query_row(
+                        "SELECT stage FROM agent_run WHERE run_id = ?1",
+                        params![id.to_string()],
+                        |r| r.get::<_, String>(0),
+                    )?)
+                })
+                .unwrap();
+            assert_eq!(got, stage);
+        }
     }
 
     /// Regression guard for the NUL-injection case in two flavours:
