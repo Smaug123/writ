@@ -339,6 +339,18 @@ pub(crate) fn parse_tree_object(bytes: &[u8]) -> Result<StagingTree, ParseObject
             .map_err(ParseObjectError::NonUtf8TreePath)?
             .to_string();
         validate_tree_entry_name(&path)?;
+        // `.gitmodules` is parsed by git as a submodule manifest;
+        // `git fsck --strict` requires it to be a regular file. A
+        // symlink/subtree/submodule entry by that name (case
+        // insensitive) would silently subvert that interpretation
+        // downstream, so reject the non-blob shapes here.
+        if path.eq_ignore_ascii_case(".gitmodules")
+            && !matches!(kind, TreeEntryKind::Blob | TreeEntryKind::Executable)
+        {
+            return Err(ParseObjectError::MalformedTreeEntry(format!(
+                "`.gitmodules` must be a regular file blob, not {kind:?}: {path:?}"
+            )));
+        }
         if !seen_paths.insert(path.clone()) {
             return Err(ParseObjectError::MalformedTreeEntry(format!(
                 "duplicate tree entry name: {path:?}"
@@ -579,6 +591,22 @@ fn parse_name_email(s: &str) -> Result<(&str, &str), ParseObjectError> {
     }
     let name = &inner[..lt - 1];
     let email = &inner[lt + 1..];
+    // `rfind('<')` + `ends_with('>')` accepts inputs like
+    // `A > B <a@e>` (name carries `>`) or `Alice <a<b@e>` (email
+    // carries `<`). `git fsck --strict` rejects these as
+    // `badName`/`badEmail`; allowing them lets a crafted staging
+    // commit reach `create_commit` carrying garbage characters
+    // GitHub would otherwise refuse.
+    if name.contains('<') || name.contains('>') {
+        return Err(ParseObjectError::MalformedIdentity(format!(
+            "identity name {name:?} contains `<` or `>`"
+        )));
+    }
+    if email.contains('<') || email.contains('>') {
+        return Err(ParseObjectError::MalformedIdentity(format!(
+            "identity email {email:?} contains `<` or `>`"
+        )));
+    }
     Ok((name, email))
 }
 
@@ -889,6 +917,66 @@ mod tests {
             matches!(err, ParseObjectError::NulInMessage),
             "got: {err:?}"
         );
+    }
+
+    #[test]
+    fn parse_identity_rejects_angle_brackets_inside_name_or_email() {
+        // `rfind('<')` plus `ends_with('>')` happily accepts
+        // identities whose name or email field contains an
+        // angle-bracket of its own — e.g. `A > B <a@e> 0 +0000`
+        // (name carries `>`) or `Alice <a<b@e> 0 +0000` (email
+        // carries a stray `<`). `git fsck --strict` rejects these
+        // as `badName`/`badEmail`; allowing them lets a crafted
+        // staging commit reach `create_commit` carrying garbage
+        // characters GitHub would otherwise refuse.
+        let cases: &[&[u8]] = &[
+            b"A > B <a@e> 0 +0000",
+            b"Alice <a<b@e> 0 +0000",
+            b"Alice <a>b@e> 0 +0000",
+        ];
+        for bad in cases {
+            let err = parse_identity(bad).expect_err("delimiter-in-field must reject");
+            assert!(
+                matches!(err, ParseObjectError::MalformedIdentity(_)),
+                "got for {bad:?}: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_tree_object_rejects_non_blob_dot_gitmodules() {
+        // `.gitmodules` is parsed by git as a submodule manifest,
+        // and `git fsck --strict` requires it to be a regular blob.
+        // A symlink/subtree/submodule entry by that name would
+        // silently subvert that interpretation when the walker
+        // pushes the tree downstream. Reject those kinds at the
+        // parser boundary; blob and executable remain valid file
+        // shapes.
+        for (mode_bytes, label) in [
+            (&b"120000"[..], "symlink"),
+            (&b"40000"[..], "subtree"),
+            (&b"160000"[..], "submodule"),
+        ] {
+            for name in [".gitmodules", ".GitModules", ".GITMODULES"] {
+                let mut bytes = Vec::new();
+                bytes.extend_from_slice(mode_bytes);
+                bytes.extend_from_slice(b" ");
+                bytes.extend_from_slice(name.as_bytes());
+                bytes.push(0);
+                bytes.extend_from_slice(&hex_decode(sample_object_id('a').as_str()));
+                let err =
+                    parse_tree_object(&bytes).expect_err("non-blob `.gitmodules` must reject");
+                assert!(
+                    matches!(err, ParseObjectError::MalformedTreeEntry(ref msg) if msg.contains(".gitmodules")),
+                    "got for {label} {name:?}: {err:?}"
+                );
+            }
+        }
+        // Boundary: a regular-file `.gitmodules` still parses.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"100644 .gitmodules\0");
+        bytes.extend_from_slice(&hex_decode(sample_object_id('a').as_str()));
+        parse_tree_object(&bytes).expect("blob `.gitmodules` must parse");
     }
 
     #[test]
@@ -1591,7 +1679,15 @@ mod tests {
         )
         .prop_filter_map("non-reserved name", |chars| {
             let s: String = chars.into_iter().collect();
-            if s == "." || s == ".." || s.eq_ignore_ascii_case(".git") {
+            if s == "."
+                || s == ".."
+                || s.eq_ignore_ascii_case(".git")
+                || s.eq_ignore_ascii_case(".gitmodules")
+            {
+                // `.gitmodules` is excluded outright so the random
+                // kind in `arb_staging_tree_entry` cannot pair the
+                // name with a non-blob mode and trip the parser's
+                // kind-aware rejection.
                 None
             } else {
                 Some(s)
