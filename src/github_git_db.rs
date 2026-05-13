@@ -13,10 +13,11 @@
 //! * POST `git/blobs`, `git/trees`, `git/commits` — the create-side
 //!   primitives the walker uses to upload bundle objects one at a time.
 //! * GET `repos/{o}/{r}` and `repos/{o}/{r}/git/ref/heads/{branch}` —
-//!   the lookup primitives used by
-//!   [`crate::git_push_replay_walker::plan_branch_creation_walk`] to
-//!   resolve the default branch tip when an agent's push creates a new
-//!   branch with no prior `expected_remote_head`.
+//!   the lookup primitives the replay orchestrator uses to resolve
+//!   the App-side default branch tip when an agent's push creates a
+//!   new branch with no prior `expected_remote_head`. The tip is then
+//!   fetched into the staging repo and passed by SHA to
+//!   [`crate::git_push_replay_walker::plan_branch_creation_via_rev_list`].
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
