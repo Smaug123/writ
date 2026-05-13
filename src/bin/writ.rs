@@ -216,6 +216,26 @@ enum AgentVmCmd {
     Stop { session_id: String },
     /// List daemon-managed agent VM state records.
     List,
+    /// Build the agent VM guest OCI image from the repo's Nix flake and
+    /// load it into the local Apple container image store. Mirrors what
+    /// the `scripts/prove-agent-vm-*.sh` proof harnesses do before they
+    /// boot a guest. macOS-only — the `container` CLI is Apple's.
+    BuildImage {
+        /// Build the proof variant (`agent-vm-guest-proof-image-*`,
+        /// which bundles `ip`, `wget`, and `nslookup`) instead of the
+        /// default production guest image.
+        #[arg(long)]
+        proof: bool,
+        /// Guest system to target. Defaults to mapping the host CPU
+        /// architecture to `aarch64-linux` or `x86_64-linux`, matching
+        /// the proof harness's `default_guest_system` helper.
+        #[arg(long, value_enum)]
+        guest_system: Option<GuestSystemArg>,
+        /// Flake reference passed to `nix build`. Defaults to `.` so
+        /// the command works when invoked from the repo root.
+        #[arg(long, default_value = ".")]
+        flake: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -251,6 +271,28 @@ enum WorkspaceWarmArg {
     Sources,
     #[value(name = "devshell", alias = "dev-shell")]
     DevShell,
+}
+
+/// Guest OCI image target system, mirroring the flake's
+/// `agent-vm-guest-image-<system>` attribute suffixes. The proof
+/// harnesses derive this from `uname -m`; we mirror the same mapping
+/// against `std::env::consts::ARCH` so the CLI default lines up with
+/// the script behaviour.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum GuestSystemArg {
+    #[value(name = "aarch64-linux")]
+    Aarch64Linux,
+    #[value(name = "x86_64-linux")]
+    X86_64Linux,
+}
+
+impl GuestSystemArg {
+    fn as_str(self) -> &'static str {
+        match self {
+            GuestSystemArg::Aarch64Linux => "aarch64-linux",
+            GuestSystemArg::X86_64Linux => "x86_64-linux",
+        }
+    }
 }
 
 impl From<Access> for GitHubAccess {
@@ -366,6 +408,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     ServerMessage::Error { message } => return Err(message.into()),
                     other => return Err(format!("unexpected response: {other:?}").into()),
                 }
+            }
+            AgentVmCmd::BuildImage {
+                proof,
+                guest_system,
+                flake,
+            } => {
+                build_agent_vm_guest_image(proof, guest_system, &flake)?;
             }
         },
         Cmd::Agent { action } => match action {
@@ -653,6 +702,97 @@ fn start_agent_run(
         ServerMessage::Error { message } => Err(message.into()),
         other => Err(format!("unexpected response: {other:?}").into()),
     }
+}
+
+/// Build the agent VM guest OCI image with Nix and load it into the
+/// local Apple container store. Mirrors the `load_guest_image` shell
+/// helper used by the proof harnesses in `scripts/`.
+///
+/// The `nix build` step is run with stderr inherited so the user sees
+/// substituter progress; stdout is captured because that's where
+/// `--print-out-paths` writes the store path. The `container image
+/// load` step inherits both so any tag/manifest output reaches the
+/// terminal.
+fn build_agent_vm_guest_image(
+    proof: bool,
+    guest_system: Option<GuestSystemArg>,
+    flake: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if std::env::consts::OS != "macos" {
+        return Err(format!(
+            "writ agent-vm build-image is macOS-only (Apple container CLI required); host OS is {}",
+            std::env::consts::OS,
+        )
+        .into());
+    }
+    let guest_system = match guest_system {
+        Some(g) => g,
+        None => default_guest_system(std::env::consts::ARCH)?,
+    };
+    let attr = guest_image_attr(proof, guest_system);
+    let flake_ref = format!("{flake}#{attr}");
+
+    eprintln!("building {flake_ref}");
+    let nix_output = std::process::Command::new("nix")
+        .args([
+            "build",
+            "--no-link",
+            "--print-out-paths",
+            flake_ref.as_str(),
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::inherit())
+        .output()
+        .map_err(|e| format!("failed to spawn nix: {e}"))?;
+    if !nix_output.status.success() {
+        return Err(format!("nix build {flake_ref} failed with status {}", nix_output.status).into());
+    }
+    let archive = String::from_utf8(nix_output.stdout)
+        .map_err(|e| format!("nix build stdout was not valid UTF-8: {e}"))?
+        .trim()
+        .to_string();
+    if archive.is_empty() {
+        return Err("nix build printed no store path".into());
+    }
+    eprintln!("loading {archive} into Apple container store");
+    let load_status = std::process::Command::new("container")
+        .args(["image", "load", "--input", archive.as_str()])
+        .status()
+        .map_err(|e| format!("failed to spawn `container`: {e}"))?;
+    if !load_status.success() {
+        return Err(format!("container image load failed with status {load_status}").into());
+    }
+    println!("{archive}");
+    Ok(())
+}
+
+/// Pure mapping from `std::env::consts::ARCH` (or equivalent string)
+/// to the flake's guest system suffix. Mirrors the proof harness's
+/// `default_guest_system` shell helper.
+fn default_guest_system(arch: &str) -> Result<GuestSystemArg, Box<dyn std::error::Error>> {
+    match arch {
+        "aarch64" | "arm64" => Ok(GuestSystemArg::Aarch64Linux),
+        "x86_64" | "amd64" => Ok(GuestSystemArg::X86_64Linux),
+        other => Err(format!(
+            "unsupported host architecture for default guest image: {other}; \
+             pass --guest-system aarch64-linux|x86_64-linux to override",
+        )
+        .into()),
+    }
+}
+
+/// Pure helper picking the flake attribute name for a given variant
+/// and guest system. The flake exposes
+/// `agent-vm-guest-image-<system>` and
+/// `agent-vm-guest-proof-image-<system>`; keeping this in one place
+/// means the CLI can never drift from the flake's naming scheme.
+fn guest_image_attr(proof: bool, guest_system: GuestSystemArg) -> String {
+    let prefix = if proof {
+        "agent-vm-guest-proof-image"
+    } else {
+        "agent-vm-guest-image"
+    };
+    format!("{prefix}-{}", guest_system.as_str())
 }
 
 fn build_workspace_bootstrap(
@@ -2312,6 +2452,135 @@ mod tests {
         assert!(
             !rendered.contains("feedback_escaped"),
             "no notice line should be emitted for benign feedback, got {rendered}",
+        );
+    }
+
+    /// The CLI must accept exactly the four host-arch spellings the
+    /// proof harness's `default_guest_system` shell helper accepts
+    /// (`arm64`/`aarch64`, `x86_64`/`amd64`) and surface a clear error
+    /// for anything else. This is the only place the `writ` CLI maps
+    /// host arch onto the flake's `agent-vm-guest-image-<system>`
+    /// suffix, so it doubles as a regression test for the suffix
+    /// names.
+    #[test]
+    fn default_guest_system_maps_arm_and_x86_aliases() {
+        for raw in ["aarch64", "arm64"] {
+            assert_eq!(
+                default_guest_system(raw).unwrap(),
+                GuestSystemArg::Aarch64Linux,
+                "{raw} should map to aarch64-linux",
+            );
+        }
+        for raw in ["x86_64", "amd64"] {
+            assert_eq!(
+                default_guest_system(raw).unwrap(),
+                GuestSystemArg::X86_64Linux,
+                "{raw} should map to x86_64-linux",
+            );
+        }
+    }
+
+    #[test]
+    fn default_guest_system_rejects_unknown_arch_with_actionable_message() {
+        let err = default_guest_system("riscv64")
+            .expect_err("riscv64 has no flake guest image target")
+            .to_string();
+        assert!(err.contains("riscv64"), "error should name the bad arch: {err}");
+        assert!(
+            err.contains("--guest-system"),
+            "error should point at the override flag: {err}",
+        );
+    }
+
+    /// The attribute name is the contract between the CLI and the
+    /// flake's `packages` set; if either side renames an attr without
+    /// the other, the CLI starts asking for a target that doesn't
+    /// exist. Lock the four spellings down.
+    #[test]
+    fn guest_image_attr_matches_flake_attribute_names() {
+        assert_eq!(
+            guest_image_attr(false, GuestSystemArg::Aarch64Linux),
+            "agent-vm-guest-image-aarch64-linux",
+        );
+        assert_eq!(
+            guest_image_attr(false, GuestSystemArg::X86_64Linux),
+            "agent-vm-guest-image-x86_64-linux",
+        );
+        assert_eq!(
+            guest_image_attr(true, GuestSystemArg::Aarch64Linux),
+            "agent-vm-guest-proof-image-aarch64-linux",
+        );
+        assert_eq!(
+            guest_image_attr(true, GuestSystemArg::X86_64Linux),
+            "agent-vm-guest-proof-image-x86_64-linux",
+        );
+    }
+
+    #[test]
+    fn agent_vm_build_image_cli_defaults_flake_to_dot_and_proof_to_false() {
+        let args = Args::try_parse_from(["writ", "agent-vm", "build-image"]).unwrap();
+        match args.cmd {
+            Cmd::AgentVm {
+                action:
+                    AgentVmCmd::BuildImage {
+                        proof,
+                        guest_system,
+                        flake,
+                    },
+            } => {
+                assert!(!proof);
+                assert_eq!(guest_system, None);
+                assert_eq!(flake, ".");
+            }
+            _ => panic!("unexpected command"),
+        }
+    }
+
+    #[test]
+    fn agent_vm_build_image_cli_accepts_proof_guest_system_and_flake() {
+        let args = Args::try_parse_from([
+            "writ",
+            "agent-vm",
+            "build-image",
+            "--proof",
+            "--guest-system",
+            "x86_64-linux",
+            "--flake",
+            "/path/to/repo",
+        ])
+        .unwrap();
+        match args.cmd {
+            Cmd::AgentVm {
+                action:
+                    AgentVmCmd::BuildImage {
+                        proof,
+                        guest_system,
+                        flake,
+                    },
+            } => {
+                assert!(proof);
+                assert_eq!(guest_system, Some(GuestSystemArg::X86_64Linux));
+                assert_eq!(flake, "/path/to/repo");
+            }
+            _ => panic!("unexpected command"),
+        }
+    }
+
+    #[test]
+    fn agent_vm_build_image_cli_rejects_unknown_guest_system() {
+        let err = match Args::try_parse_from([
+            "writ",
+            "agent-vm",
+            "build-image",
+            "--guest-system",
+            "riscv64-linux",
+        ]) {
+            Ok(_) => panic!("clap should reject unknown guest-system values"),
+            Err(error) => error,
+        };
+        assert!(
+            err.to_string().contains("--guest-system"),
+            "unexpected clap error: {err}",
         );
     }
 }
