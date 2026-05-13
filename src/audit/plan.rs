@@ -1939,6 +1939,69 @@ mod tests {
         );
     }
 
+    /// Belt-and-braces: the `feedback_sha256` CHECK enforces lowercase
+    /// hex in TEXT storage class — a 64-character non-hex string and a
+    /// 64-byte BLOB binding both fail. Otherwise a raw INSERT could
+    /// land a digest the typed read path (`validate_sha256_hex`)
+    /// cannot deserialise, making the row unreachable by
+    /// `get_plan_review` / `list_plan_reviews_for_plan`.
+    #[test]
+    fn plan_review_check_rejects_malformed_feedback_sha256() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+        let plan_id = submitted_plan(&log, s.session_id);
+        let reviewer = sample_review_run(&log, s.session_id, plan_id);
+
+        // 64 chars, but contains 'g' — not a hex digit.
+        let non_hex = "g".repeat(64);
+        let err = log
+            .with_conn(|c| {
+                Ok(c.execute(
+                    "INSERT INTO plan_review
+                     (review_id, plan_id, agent_run_id, submitted_at, verdict, feedback, feedback_sha256)
+                     VALUES (?1, ?2, ?3, ?4, 'approve', 'lgtm', ?5)",
+                    params![
+                        ReviewId::new().as_uuid().to_string(),
+                        plan_id.as_uuid().to_string(),
+                        reviewer.as_uuid().to_string(),
+                        1_700_000_400_i64,
+                        non_hex,
+                    ],
+                )?)
+            })
+            .unwrap_err();
+        assert!(
+            err.to_string().to_lowercase().contains("check"),
+            "expected CHECK violation, got {err}"
+        );
+
+        // 64 bytes bound as a BLOB. Without `typeof = 'text'` the
+        // CHECK would silently accept this since `length()` on a 64-
+        // byte BLOB also returns 64.
+        let blob_digest: Vec<u8> = vec![b'a'; 64];
+        let err = log
+            .with_conn(|c| {
+                Ok(c.execute(
+                    "INSERT INTO plan_review
+                     (review_id, plan_id, agent_run_id, submitted_at, verdict, feedback, feedback_sha256)
+                     VALUES (?1, ?2, ?3, ?4, 'approve', 'lgtm', ?5)",
+                    params![
+                        ReviewId::new().as_uuid().to_string(),
+                        plan_id.as_uuid().to_string(),
+                        reviewer.as_uuid().to_string(),
+                        1_700_000_400_i64,
+                        blob_digest,
+                    ],
+                )?)
+            })
+            .unwrap_err();
+        assert!(
+            err.to_string().to_lowercase().contains("check"),
+            "expected CHECK violation, got {err}"
+        );
+    }
+
     /// Belt-and-braces: an oversize raw feedback body is refused by
     /// the column CHECK before the row lands.
     #[test]

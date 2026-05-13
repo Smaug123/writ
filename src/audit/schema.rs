@@ -1172,8 +1172,22 @@ CREATE TABLE plan_review (
             AND instr(cast(feedback AS BLOB), x'00') = 0
         )
     ),
+    -- The digest must be 64 lowercase hex chars in TEXT storage class;
+    -- a BLOB binding or a 64-character non-hex value would otherwise be
+    -- silently accepted here and then fail later inside the DAO read
+    -- path (`plan_review_from_row` runs `validate_sha256_hex`). The
+    -- `typeof = 'text'` + `NOT GLOB '*[^0-9a-f]*'` pair restates the
+    -- newtype invariant at the schema boundary so raw INSERT paths
+    -- cannot persist a row the typed reader cannot deserialise. The
+    -- same hex shape is enforced for `body_sha256` via the broker; this
+    -- column gets the stricter guard from day one because the raw-
+    -- INSERT review path was the motivating case for these triggers.
     feedback_sha256  TEXT NULL CHECK (
-        feedback_sha256 IS NULL OR length(feedback_sha256) = 64
+        feedback_sha256 IS NULL OR (
+            typeof(feedback_sha256) = 'text'
+            AND length(feedback_sha256) = 64
+            AND feedback_sha256 NOT GLOB '*[^0-9a-f]*'
+        )
     ),
     UNIQUE (agent_run_id),
     CHECK (
