@@ -12,7 +12,10 @@
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::agent_plan::{CorrelationId, Decider, DecisionOutcome, PlanBody, PlanId, Stage};
+use crate::agent_plan::{
+    CorrelationId, Decider, DecisionOutcome, DecisionView, PlanBody, PlanFeedback, PlanId,
+    ReviewId, Stage, Verdict,
+};
 use crate::agent_run::{AgentPrompt, AgentRunId};
 use crate::agent_vm_lifecycle::AgentVmSessionStateStatus;
 use crate::audit::GitPushOutcomeResult;
@@ -105,13 +108,52 @@ pub struct PlanSummary {
     pub body_bytes: u64,
 }
 
-/// Full plan view returned by [`ServerMessage::Plan`]: the summary plus
-/// the verbatim body. Splitting body out keeps the list path cheap and
-/// the show path explicit about loading up to 256 KiB of markdown.
+/// Full plan view returned by [`ServerMessage::Plan`]: the summary, the
+/// verbatim body, every recorded review, and the operator decision (if
+/// any). Splitting body out keeps the list path cheap and the show path
+/// explicit about loading up to 256 KiB of markdown plus the joined
+/// review rows.
+///
+/// `reviews` is ordered oldest-first to match the DAO's
+/// `submitted_at` ascending order, so the operator reading top-to-bottom
+/// sees how reviewer opinion evolved. `decision` is `None` until an
+/// operator runs `writ plan decide`. Both fields use `#[serde(default)]`
+/// so an older daemon's response (one that predates the field) still
+/// parses on a newer CLI — the older payload is treated as "no reviews,
+/// no decision," which matches its semantics.
+///
+/// Slices 7/8 of the agent-plans roadmap will extend this struct with
+/// `addenda` and `abort` fields the same way — append-only, with
+/// `#[serde(default)]` for the same forward-compat reason.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PlanDetail {
     pub summary: PlanSummary,
     pub body: PlanBody,
+    #[serde(default)]
+    pub reviews: Vec<PlanReviewView>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision: Option<DecisionView>,
+}
+
+/// One review row as exposed on the broker socket. Mirrors
+/// [`crate::audit::PlanReviewRecord`] minus the audit-only
+/// `feedback_sha256` (the body is on the wire verbatim, so the digest
+/// is recomputable) and `plan_id` (redundant on the parent `PlanDetail`
+/// that carries this view).
+///
+/// `reviewer_run_id` is renamed from the schema column `agent_run_id`
+/// so it doesn't collide with `PlanSummary.agent_run_id` (the
+/// *planner's* run) inside the same `PlanDetail`. Confusing the two is
+/// a real footgun in operator-facing output.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlanReviewView {
+    pub review_id: ReviewId,
+    pub reviewer_run_id: AgentRunId,
+    pub submitted_at: UnixMillis,
+    pub verdict: Verdict,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub feedback: Option<PlanFeedback>,
 }
 
 /// Maximum byte length of a [`RejectionReason`]. Sized to comfortably
@@ -986,6 +1028,22 @@ mod tests {
         PlanDetail {
             summary: sample_plan_summary(),
             body: sample_plan_body(),
+            reviews: Vec::new(),
+            decision: None,
+        }
+    }
+
+    fn sample_review_id() -> ReviewId {
+        "f3f3f3f3-0000-0000-0000-000000000001".parse().unwrap()
+    }
+
+    fn sample_review_view() -> PlanReviewView {
+        PlanReviewView {
+            review_id: sample_review_id(),
+            reviewer_run_id: "f4f4f4f4-0000-0000-0000-000000000001".parse().unwrap(),
+            submitted_at: UnixMillis::from_millis(1_700_000_100_000),
+            verdict: Verdict::RequestChanges,
+            feedback: Some(PlanFeedback::try_new("Please tighten the migration step.").unwrap()),
         }
     }
 
@@ -1160,6 +1218,101 @@ mod tests {
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert_eq!(serde_json::from_str::<ServerMessage>(&json).unwrap(), msg);
+    }
+
+    /// `reviews` always serialises (even when empty) so an operator
+    /// reading the JSON can distinguish "no reviews" from "the daemon
+    /// is silently dropping the field." The empty-Vec choice (rather
+    /// than `skip_serializing_if`) is documented on `PlanDetail`.
+    #[test]
+    fn plan_detail_empty_reviews_serialises_as_empty_array() {
+        let value: serde_json::Value = serde_json::to_value(sample_plan_detail()).unwrap();
+        assert_eq!(value["reviews"], serde_json::json!([]));
+    }
+
+    /// A `None` decision drops the key on the wire (matches the
+    /// `correlation_id` convention on `PlanSummary`). An older daemon
+    /// that predates the field stays compatible because `#[serde(
+    /// default)]` accepts the missing key.
+    #[test]
+    fn plan_detail_without_decision_omits_field_on_wire() {
+        let value: serde_json::Value = serde_json::to_value(sample_plan_detail()).unwrap();
+        assert!(value.get("decision").is_none());
+        let back: PlanDetail = serde_json::from_value(value).unwrap();
+        assert!(back.decision.is_none());
+    }
+
+    /// A populated `PlanDetail` carrying mixed-verdict reviews and an
+    /// `Accepted` decision roundtrips byte-for-byte. Pins the wire
+    /// shape against the renderer and the audit-record-to-view
+    /// mapping in `show_plan`.
+    #[test]
+    fn plan_detail_with_reviews_and_accepted_decision_roundtrips() {
+        let mut detail = sample_plan_detail();
+        detail.reviews = vec![
+            PlanReviewView {
+                verdict: Verdict::RequestChanges,
+                ..sample_review_view()
+            },
+            PlanReviewView {
+                review_id: "f3f3f3f3-0000-0000-0000-000000000002".parse().unwrap(),
+                reviewer_run_id: "f4f4f4f4-0000-0000-0000-000000000002".parse().unwrap(),
+                submitted_at: UnixMillis::from_millis(1_700_000_200_000),
+                verdict: Verdict::Approve,
+                feedback: None,
+            },
+        ];
+        detail.decision = Some(DecisionView {
+            outcome: DecisionOutcome::Accepted,
+            decided_at: UnixMillis::from_millis(1_700_000_300_000),
+        });
+        let msg = ServerMessage::Plan { plan: detail };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert_eq!(serde_json::from_str::<ServerMessage>(&json).unwrap(), msg);
+    }
+
+    /// A `RejectedRestart` decision roundtrips on the same shape — pin
+    /// both outcomes since the renderer formats them differently.
+    #[test]
+    fn plan_detail_with_rejected_restart_decision_roundtrips() {
+        let mut detail = sample_plan_detail();
+        detail.decision = Some(DecisionView {
+            outcome: DecisionOutcome::RejectedRestart,
+            decided_at: UnixMillis::from_millis(1_700_000_400_000),
+        });
+        let msg = ServerMessage::Plan { plan: detail };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert_eq!(serde_json::from_str::<ServerMessage>(&json).unwrap(), msg);
+    }
+
+    /// `feedback` drops on the wire when absent. Matches the
+    /// `PlanSummary.correlation_id` convention so callers and
+    /// scripted consumers can distinguish "no feedback" from "the
+    /// daemon forgot to send it."
+    #[test]
+    fn plan_review_view_without_feedback_omits_field_on_wire() {
+        let review = PlanReviewView {
+            feedback: None,
+            ..sample_review_view()
+        };
+        let value: serde_json::Value = serde_json::to_value(&review).unwrap();
+        assert!(value.get("feedback").is_none());
+        let back: PlanReviewView = serde_json::from_value(value).unwrap();
+        assert_eq!(back, review);
+    }
+
+    /// An older daemon's payload (no `reviews`, no `decision`) parses
+    /// on the newer CLI as "no reviews, no decision." This is the
+    /// reason `#[serde(default)]` is on both fields.
+    #[test]
+    fn plan_detail_accepts_payload_without_reviews_or_decision() {
+        let value = serde_json::json!({
+            "summary": sample_plan_summary(),
+            "body": sample_plan_body(),
+        });
+        let parsed: PlanDetail = serde_json::from_value(value).unwrap();
+        assert!(parsed.reviews.is_empty());
+        assert!(parsed.decision.is_none());
     }
 
     #[test]

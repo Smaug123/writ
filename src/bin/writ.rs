@@ -806,6 +806,44 @@ fn write_plan_detail(out: &mut dyn Write, plan: &PlanDetail) -> std::io::Result<
     if !plan.body.as_bytes().ends_with(b"\n") {
         writeln!(out)?;
     }
+    // Reviews section: always emitted, even when empty, so the
+    // section header doubles as a "no reviews yet" signal. The count
+    // in the header mirrors the wire array length.
+    writeln!(out)?;
+    writeln!(out, "-- reviews ({}) --", plan.reviews.len())?;
+    for review in &plan.reviews {
+        writeln!(out)?;
+        writeln!(out, "review_id={}", review.review_id)?;
+        writeln!(out, "reviewer_run_id={}", review.reviewer_run_id)?;
+        writeln!(out, "submitted_at={}", review.submitted_at.as_millis())?;
+        writeln!(out, "verdict={}", review.verdict)?;
+        // XML-style framing for multi-line feedback; an LLM consuming
+        // the rendered output can locate the prose block by its
+        // <feedback> tags rather than guessing where free-text ends.
+        match &review.feedback {
+            None => writeln!(out, "feedback=<none>")?,
+            Some(feedback) => {
+                writeln!(out, "<feedback>")?;
+                out.write_all(feedback.as_bytes())?;
+                if !feedback.as_bytes().ends_with(b"\n") {
+                    writeln!(out)?;
+                }
+                writeln!(out, "</feedback>")?;
+            }
+        }
+    }
+    // Decision section: always emitted, surfacing `<none>` for a
+    // plan that has not yet been decided so the section header stays
+    // parallel with `reviews`.
+    writeln!(out)?;
+    writeln!(out, "-- decision --")?;
+    match &plan.decision {
+        None => writeln!(out, "outcome=<none>")?,
+        Some(d) => {
+            writeln!(out, "outcome={}", d.outcome)?;
+            writeln!(out, "decided_at={}", d.decided_at.as_millis())?;
+        }
+    }
     Ok(())
 }
 
@@ -1723,28 +1761,225 @@ mod tests {
         let detail = PlanDetail {
             summary: sample_plan_summary_for_cli(true),
             body,
+            reviews: vec![],
+            decision: None,
         };
         let mut out = Vec::new();
         write_plan_detail(&mut out, &detail).unwrap();
         let rendered = String::from_utf8(out).unwrap();
-        // The summary block, a blank line, then the body verbatim.
+        // The summary block, a blank line, then the body verbatim,
+        // then a blank line before the reviews section.
         let body_offset = rendered.find("# Plan").expect("body present");
         assert!(rendered[..body_offset].ends_with("\n\n"), "{rendered}");
-        assert_eq!(&rendered[body_offset..], "# Plan\n\nStep 1.\n");
+        assert!(
+            rendered[body_offset..].starts_with("# Plan\n\nStep 1.\n\n-- reviews"),
+            "{rendered}",
+        );
     }
 
     /// A body that doesn't terminate in a newline still ends with one
-    /// when written so shells don't merge it with the next prompt.
+    /// when written so the reviews section header lands on its own line.
     #[test]
     fn plan_detail_terminates_unterminated_body_with_newline() {
         let body = writ::agent_plan::PlanBody::try_new("trailing").unwrap();
         let detail = PlanDetail {
             summary: sample_plan_summary_for_cli(true),
             body,
+            reviews: vec![],
+            decision: None,
         };
         let mut out = Vec::new();
         write_plan_detail(&mut out, &detail).unwrap();
         let rendered = String::from_utf8(out).unwrap();
-        assert!(rendered.ends_with("trailing\n"), "{rendered}");
+        assert!(rendered.contains("trailing\n\n-- reviews"), "{rendered}");
+    }
+
+    fn sample_review_view_for_cli(
+        review_id_hex: &str,
+        reviewer_run_hex: &str,
+        submitted_at_ms: i64,
+        verdict: writ::agent_plan::Verdict,
+        feedback: Option<writ::agent_plan::PlanFeedback>,
+    ) -> writ::protocol::PlanReviewView {
+        writ::protocol::PlanReviewView {
+            review_id: review_id_hex.parse().unwrap(),
+            reviewer_run_id: reviewer_run_hex.parse().unwrap(),
+            submitted_at: writ::core::UnixMillis::from_millis(submitted_at_ms),
+            verdict,
+            feedback,
+        }
+    }
+
+    /// An empty reviews vec still emits the section header — the
+    /// rendered output is a discoverable surface for operators, and
+    /// the empty header doubles as a "no reviews yet" signal that
+    /// matches the wire (always-emit-[]) shape.
+    #[test]
+    fn plan_detail_renders_empty_reviews_block_with_zero_count() {
+        let body = writ::agent_plan::PlanBody::try_new("# Plan\n").unwrap();
+        let detail = PlanDetail {
+            summary: sample_plan_summary_for_cli(false),
+            body,
+            reviews: vec![],
+            decision: None,
+        };
+        let mut out = Vec::new();
+        write_plan_detail(&mut out, &detail).unwrap();
+        let rendered = String::from_utf8(out).unwrap();
+        assert!(
+            rendered.contains("-- reviews (0) --\n"),
+            "expected zero-review header, got {rendered}",
+        );
+        // No review records leak through.
+        assert!(!rendered.contains("review_id="), "{rendered}");
+        assert!(!rendered.contains("reviewer_run_id="), "{rendered}");
+    }
+
+    /// Reviews render in input order with key=value lines for the
+    /// scalar fields and an XML-framed prose block for multi-line
+    /// feedback. The framing lets an LLM consuming the output
+    /// locate the prose block by the `<feedback>` tags rather than
+    /// guessing where free-text ends.
+    #[test]
+    fn plan_detail_renders_reviews_in_order_with_xml_framed_feedback() {
+        let body = writ::agent_plan::PlanBody::try_new("# Plan\n").unwrap();
+        let feedback =
+            writ::agent_plan::PlanFeedback::try_new("Two concerns:\n1. naming\n2. ordering")
+                .unwrap();
+        let first = sample_review_view_for_cli(
+            "f3f3f3f3-0000-0000-0000-000000000001",
+            "f4f4f4f4-0000-0000-0000-000000000001",
+            1_700_000_300_000,
+            writ::agent_plan::Verdict::RequestChanges,
+            Some(feedback),
+        );
+        let second = sample_review_view_for_cli(
+            "f3f3f3f3-0000-0000-0000-000000000002",
+            "f4f4f4f4-0000-0000-0000-000000000002",
+            1_700_000_400_000,
+            writ::agent_plan::Verdict::Approve,
+            None,
+        );
+        let detail = PlanDetail {
+            summary: sample_plan_summary_for_cli(false),
+            body,
+            reviews: vec![first, second],
+            decision: None,
+        };
+        let mut out = Vec::new();
+        write_plan_detail(&mut out, &detail).unwrap();
+        let rendered = String::from_utf8(out).unwrap();
+        assert!(rendered.contains("-- reviews (2) --\n"), "{rendered}");
+        let first_block = concat!(
+            "review_id=f3f3f3f3-0000-0000-0000-000000000001\n",
+            "reviewer_run_id=f4f4f4f4-0000-0000-0000-000000000001\n",
+            "submitted_at=1700000300000\n",
+            "verdict=request_changes\n",
+            "<feedback>\n",
+            "Two concerns:\n1. naming\n2. ordering\n",
+            "</feedback>\n",
+        );
+        let second_block = concat!(
+            "review_id=f3f3f3f3-0000-0000-0000-000000000002\n",
+            "reviewer_run_id=f4f4f4f4-0000-0000-0000-000000000002\n",
+            "submitted_at=1700000400000\n",
+            "verdict=approve\n",
+            "feedback=<none>\n",
+        );
+        let first_pos = rendered
+            .find(first_block)
+            .unwrap_or_else(|| panic!("first review block missing in {rendered}"));
+        let second_pos = rendered
+            .find(second_block)
+            .unwrap_or_else(|| panic!("second review block missing in {rendered}"));
+        assert!(
+            first_pos < second_pos,
+            "reviews must render in input order, got {rendered}",
+        );
+    }
+
+    /// Feedback that already ends in a newline must not gain a second
+    /// one before the closing tag — the renderer's terminator logic
+    /// is conditional on the body's existing tail.
+    #[test]
+    fn plan_detail_does_not_double_terminate_feedback_that_ends_with_newline() {
+        let body = writ::agent_plan::PlanBody::try_new("# Plan\n").unwrap();
+        let feedback = writ::agent_plan::PlanFeedback::try_new("Done.\n").unwrap();
+        let review = sample_review_view_for_cli(
+            "f3f3f3f3-0000-0000-0000-000000000001",
+            "f4f4f4f4-0000-0000-0000-000000000001",
+            1_700_000_300_000,
+            writ::agent_plan::Verdict::Approve,
+            Some(feedback),
+        );
+        let detail = PlanDetail {
+            summary: sample_plan_summary_for_cli(false),
+            body,
+            reviews: vec![review],
+            decision: None,
+        };
+        let mut out = Vec::new();
+        write_plan_detail(&mut out, &detail).unwrap();
+        let rendered = String::from_utf8(out).unwrap();
+        assert!(
+            rendered.contains("<feedback>\nDone.\n</feedback>\n"),
+            "feedback framing must not introduce a blank line, got {rendered}",
+        );
+    }
+
+    /// A plan with no decision still emits the `-- decision --`
+    /// header so the section is visible to operators; the body shows
+    /// `outcome=<none>` parallel with how `correlation_id=<none>`
+    /// surfaces a missing summary field.
+    #[test]
+    fn plan_detail_renders_decision_none_as_placeholder() {
+        let body = writ::agent_plan::PlanBody::try_new("# Plan\n").unwrap();
+        let detail = PlanDetail {
+            summary: sample_plan_summary_for_cli(false),
+            body,
+            reviews: vec![],
+            decision: None,
+        };
+        let mut out = Vec::new();
+        write_plan_detail(&mut out, &detail).unwrap();
+        let rendered = String::from_utf8(out).unwrap();
+        assert!(
+            rendered.contains("-- decision --\noutcome=<none>\n"),
+            "{rendered}",
+        );
+        assert!(!rendered.contains("decided_at="), "{rendered}");
+    }
+
+    /// Both outcomes render the same shape — outcome and decided_at
+    /// key=value lines — so operators can rely on the section's
+    /// structure regardless of the verdict.
+    #[test]
+    fn plan_detail_renders_decision_block_with_outcome_and_decided_at() {
+        for (outcome, expected) in [
+            (DecisionOutcome::Accepted, "outcome=accepted\n"),
+            (
+                DecisionOutcome::RejectedRestart,
+                "outcome=rejected_restart\n",
+            ),
+        ] {
+            let body = writ::agent_plan::PlanBody::try_new("# Plan\n").unwrap();
+            let detail = PlanDetail {
+                summary: sample_plan_summary_for_cli(false),
+                body,
+                reviews: vec![],
+                decision: Some(writ::agent_plan::DecisionView {
+                    outcome,
+                    decided_at: writ::core::UnixMillis::from_millis(1_700_000_500_000),
+                }),
+            };
+            let mut out = Vec::new();
+            write_plan_detail(&mut out, &detail).unwrap();
+            let rendered = String::from_utf8(out).unwrap();
+            let expected_block = format!("-- decision --\n{expected}decided_at=1700000500000\n",);
+            assert!(
+                rendered.contains(&expected_block),
+                "expected decision block {expected_block:?} in {rendered}",
+            );
+        }
     }
 }
