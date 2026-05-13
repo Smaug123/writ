@@ -498,11 +498,19 @@ fn is_dot_gitmodules_protected_alias(name: &str) -> bool {
 }
 
 fn is_protected_alias_for(name: &str, literal: &str, short_prefix: &str) -> bool {
-    // NTFS and FAT silently drop trailing `.` and ` ` when
-    // resolving a path component, so `.git.` and `.git ` both
-    // resolve to `.git` on Windows. Strip those before the
-    // case-insensitive literal compare.
-    let core = name.trim_end_matches(['.', ' ']);
+    // NTFS treats `:` as an alternate-data-stream separator and
+    // `\` as a path separator: `.git:foo` resolves to `.git` (its
+    // unnamed default stream) and `.git\foo` resolves to `foo`
+    // inside the `.git` directory. `/` is rejected earlier in
+    // `validate_tree_entry_name` and so cannot reach here, but a
+    // crafted staging tree can carry `\` or `:` and bypass an
+    // exact-match check.  Match git's own `is_ntfs_dotgit`:
+    // examine the prefix up to the first `\` or `:`, then strip
+    // trailing `.` / ` ` (NTFS and FAT silently drop those at the
+    // end of a component) and compare case-insensitively.
+    let prefix_end = name.find(['\\', ':']).unwrap_or(name.len());
+    let head = &name[..prefix_end];
+    let core = head.trim_end_matches(['.', ' ']);
     if core.eq_ignore_ascii_case(literal) {
         return true;
     }
@@ -1089,6 +1097,75 @@ mod tests {
             parse_tree_object(&bytes).unwrap_or_else(|err| {
                 panic!("non-alias {ok:?} must parse: {err:?}");
             });
+        }
+    }
+
+    #[test]
+    fn parse_tree_object_rejects_ntfs_separator_dot_git_aliases() {
+        // NTFS treats `:` as an alternate-data-stream separator and
+        // `\` as a path separator: `.git:foo` resolves to `.git`
+        // (its default unnamed stream when `foo` does not exist),
+        // and `.git\foo` resolves to `foo` inside the `.git`
+        // directory. Git's `is_ntfs_dotgit` examines the prefix up
+        // to the first such separator and reports `hasDotgit` if
+        // that prefix is an alias for `.git`. The earlier predicate
+        // stripped only trailing dots/spaces, so a crafted staging
+        // tree carrying `.git:foo` slipped past validation.
+        for bad in [
+            ".git:foo",
+            ".GIT:foo",
+            ".git\\foo",
+            ".git.:foo",
+            "git~1:foo",
+            "git~1\\foo",
+        ] {
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(b"100644 ");
+            bytes.extend_from_slice(bad.as_bytes());
+            bytes.push(0);
+            bytes.extend_from_slice(&hex_decode(sample_object_id('a').as_str()));
+            let err = parse_tree_object(&bytes).expect_err("NTFS alias prefix must reject");
+            assert!(
+                matches!(err, ParseObjectError::MalformedTreeEntry(_)),
+                "got for {bad:?}: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_tree_object_rejects_non_blob_dot_gitmodules_ntfs_aliases() {
+        // A symlink/subtree/submodule named `.gitmodules:foo` is
+        // resolved by NTFS as `.gitmodules` (default ADS), which
+        // `git fsck --strict` reports as `gitmodulesSymlink`. The
+        // earlier predicate missed every `:` / `\` separator
+        // variant. Apply the same NTFS-aware predicate here too.
+        let alias_names = [
+            ".gitmodules:foo",
+            ".GITMODULES:foo",
+            ".gitmodules\\foo",
+            ".gitmodules.:foo",
+            "gitmod~1:foo",
+            "gitmod~1\\foo",
+        ];
+        for (mode_bytes, label) in [
+            (&b"120000"[..], "symlink"),
+            (&b"40000"[..], "subtree"),
+            (&b"160000"[..], "submodule"),
+        ] {
+            for name in alias_names {
+                let mut bytes = Vec::new();
+                bytes.extend_from_slice(mode_bytes);
+                bytes.extend_from_slice(b" ");
+                bytes.extend_from_slice(name.as_bytes());
+                bytes.push(0);
+                bytes.extend_from_slice(&hex_decode(sample_object_id('a').as_str()));
+                let err =
+                    parse_tree_object(&bytes).expect_err("NTFS `.gitmodules` alias must reject");
+                assert!(
+                    matches!(err, ParseObjectError::MalformedTreeEntry(_)),
+                    "got for {label} {name:?}: {err:?}"
+                );
+            }
         }
     }
 
