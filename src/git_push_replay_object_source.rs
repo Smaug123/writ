@@ -64,7 +64,19 @@ use crate::vm_git::{GitObjectId, GitObjectIdError};
 
 /// `git cat-file --batch` instance bound to a staging repository.
 pub struct CatFileObjectSource {
-    inner: Mutex<CatFileChild>,
+    /// Process group id of the cat-file leader. The child is spawned
+    /// with `process_group(0)`, so this equals the leader's pid and is
+    /// inherited by any helper the leader forks (or by anything inside
+    /// the configured `git_program` if it is a wrapper script). Stored
+    /// at the top level so [`Drop`] can `killpg` the whole group
+    /// without needing access to the child through the mutex.
+    pgid: libc::pid_t,
+    /// `None` once [`close`](Self::close) has consumed the child. Drop
+    /// uses this discriminator to decide whether to send SIGKILL: a
+    /// clean close should not kill, because the leader has already
+    /// exited and its pid may have been recycled by an unrelated
+    /// process by the time the source falls out of scope.
+    inner: Option<Mutex<CatFileChild>>,
 }
 
 struct CatFileChild {
@@ -83,6 +95,10 @@ pub enum OpenError {
     GitProgram(String),
     #[error("could not spawn `git cat-file --batch`: {0}")]
     Spawn(#[source] io::Error),
+    #[error("`git cat-file --batch` child did not expose a pid")]
+    MissingProcessId,
+    #[error("`git cat-file --batch` child pid {0} does not fit in pid_t")]
+    InvalidProcessId(u32),
     #[error("`git cat-file --batch` child did not expose stdin")]
     MissingStdin,
     #[error("`git cat-file --batch` child did not expose stdout")]
@@ -102,9 +118,12 @@ impl CatFileObjectSource {
     /// The child runs from `/`, has its environment cleared down to
     /// the four [`CLEAN_GIT_CONFIG_ENV`] entries, and is placed in a
     /// fresh process group so a runaway helper cannot outlive its
-    /// leader. `kill_on_drop(true)` tells tokio to SIGKILL and reap
-    /// the leader when the [`CatFileObjectSource`] is dropped; the
-    /// kernel propagates the kill to any group members.
+    /// leader. The source's [`Drop`] impl sends SIGKILL to the
+    /// *process group* (`killpg`), not just the leader pid; this is
+    /// the only thing that catches a helper Git forks (or anything a
+    /// wrapper script behind `git_program` spawns) before the source
+    /// is dropped. `kill_on_drop(true)` is left on so tokio reaps the
+    /// leader after our `killpg` runs and avoids a zombie.
     pub async fn open(staging_repo: &Path, git_program: &Path) -> Result<Self, OpenError> {
         let program = clean_git::resolve_program_for_clean_env(git_program).await?;
         let mut command = Command::new(&program);
@@ -123,37 +142,46 @@ impl CatFileObjectSource {
         command.stderr(Stdio::null());
         command.current_dir(CLEAN_GIT_CURRENT_DIR);
         command.process_group(0);
-        // tokio sends SIGKILL and reaps the child when the
-        // tokio::process::Child is dropped, so a forgotten
-        // `close()` cannot leak a zombie cat-file.
+        // Reap the leader after our `killpg` runs in Drop, so a
+        // forgotten `close()` cannot leak a zombie cat-file.
         command.kill_on_drop(true);
 
         let mut child = process_spawn::spawn_async(&mut command)
             .await
             .map_err(OpenError::Spawn)?;
+        let pid = child.id().ok_or(OpenError::MissingProcessId)?;
+        let pgid: libc::pid_t = pid
+            .try_into()
+            .map_err(|_| OpenError::InvalidProcessId(pid))?;
         let stdin = child.stdin.take().ok_or(OpenError::MissingStdin)?;
         let stdout = child.stdout.take().ok_or(OpenError::MissingStdout)?;
         Ok(Self {
-            inner: Mutex::new(CatFileChild {
+            pgid,
+            inner: Some(Mutex::new(CatFileChild {
                 child,
                 stdin,
                 stdout: BufReader::new(stdout),
-            }),
+            })),
         })
     }
 
     /// Close the child gracefully: drop stdin to signal EOF, then
     /// `wait()` the cat-file process to completion. Returns the
-    /// exit status as an error if the child exited non-zero;
-    /// callers who only want to reap without checking status can
-    /// just drop the source (the `Drop` path SIGKILLs via
-    /// `kill_on_drop`).
-    pub async fn close(self) -> io::Result<()> {
+    /// exit status as an error if the child exited non-zero. After
+    /// a successful close the source's [`Drop`] impl skips the
+    /// `killpg` (the pid has been waited on and may have been
+    /// recycled). Callers who don't care about the exit status can
+    /// just drop the source, which SIGKILLs the whole process group.
+    pub async fn close(mut self) -> io::Result<()> {
+        let mutex = self
+            .inner
+            .take()
+            .expect("CatFileObjectSource::inner is always Some until close consumes it");
         let CatFileChild {
             mut child,
             stdin,
             stdout,
-        } = self.inner.into_inner();
+        } = mutex.into_inner();
         drop(stdin);
         drop(stdout);
         let status = child.wait().await?;
@@ -166,9 +194,33 @@ impl CatFileObjectSource {
     }
 }
 
+impl Drop for CatFileObjectSource {
+    fn drop(&mut self) {
+        // `close()` clears `inner` on its successful path. Anything
+        // else — Drop without `close()`, a cancelled future, or a
+        // panic — means the leader is still alive (or at least has
+        // not been waited on yet), and any helper it forked is also
+        // still in the group. SIGKILL the group so nothing outlives
+        // the source. Errors are intentionally swallowed: there is
+        // nothing useful to do with them from Drop, and ESRCH (the
+        // group is already gone) is a normal race.
+        if self.inner.is_some() {
+            unsafe { libc::killpg(self.pgid, libc::SIGKILL) };
+        }
+    }
+}
+
+impl CatFileObjectSource {
+    fn child_mutex(&self) -> &Mutex<CatFileChild> {
+        self.inner
+            .as_ref()
+            .expect("inner is always Some between open and close")
+    }
+}
+
 impl GitObjectSource for CatFileObjectSource {
     async fn read_commit(&self, sha: &GitObjectId) -> Result<StagingCommit, GitObjectSourceError> {
-        let raw = read_object_raw(&self.inner, sha, "commit").await?;
+        let raw = read_object_raw(self.child_mutex(), sha, "commit").await?;
         parse_commit_object(&raw).map_err(|reason| GitObjectSourceError::Malformed {
             sha: sha.as_str().to_string(),
             reason: reason.to_string(),
@@ -176,7 +228,7 @@ impl GitObjectSource for CatFileObjectSource {
     }
 
     async fn read_tree(&self, sha: &GitObjectId) -> Result<StagingTree, GitObjectSourceError> {
-        let raw = read_object_raw(&self.inner, sha, "tree").await?;
+        let raw = read_object_raw(self.child_mutex(), sha, "tree").await?;
         parse_tree_object(&raw).map_err(|reason| GitObjectSourceError::Malformed {
             sha: sha.as_str().to_string(),
             reason: reason.to_string(),
@@ -184,7 +236,7 @@ impl GitObjectSource for CatFileObjectSource {
     }
 
     async fn read_blob(&self, sha: &GitObjectId) -> Result<Vec<u8>, GitObjectSourceError> {
-        read_object_raw(&self.inner, sha, "blob").await
+        read_object_raw(self.child_mutex(), sha, "blob").await
     }
 }
 
@@ -623,12 +675,18 @@ fn parse_name_email(s: &str) -> Result<(&str, &str), ParseObjectError> {
 }
 
 fn parse_tz_offset(s: &str) -> Result<time::UtcOffset, ParseObjectError> {
-    if s.len() != 5 {
+    // The staging repo is untrusted, so a commit object can carry
+    // arbitrary UTF-8 in the timezone slot. `s.len()` counts bytes,
+    // but `s[1..3]` on a string with a multibyte character (e.g.
+    // `+1é2` — 5 bytes, 4 chars) would slice across a UTF-8
+    // boundary and panic. Operate on the byte array and verify
+    // each digit position is ASCII before any numeric parse.
+    let bytes = s.as_bytes();
+    if bytes.len() != 5 {
         return Err(ParseObjectError::MalformedIdentity(format!(
             "timezone field {s:?} must be ±HHMM"
         )));
     }
-    let bytes = s.as_bytes();
     let sign: i32 = match bytes[0] {
         b'+' => 1,
         b'-' => -1,
@@ -638,24 +696,29 @@ fn parse_tz_offset(s: &str) -> Result<time::UtcOffset, ParseObjectError> {
             )));
         }
     };
-    let hours: i32 = s[1..3].parse().map_err(|_| {
+    let hours = parse_two_ascii_digits(&bytes[1..3]).ok_or_else(|| {
         ParseObjectError::MalformedIdentity(format!(
-            "timezone hours field {:?} is not 2 digits",
-            &s[1..3]
+            "timezone hours field in {s:?} is not 2 ASCII digits"
         ))
     })?;
-    let minutes: i32 = s[3..5].parse().map_err(|_| {
+    let minutes = parse_two_ascii_digits(&bytes[3..5]).ok_or_else(|| {
         ParseObjectError::MalformedIdentity(format!(
-            "timezone minutes field {:?} is not 2 digits",
-            &s[3..5]
+            "timezone minutes field in {s:?} is not 2 ASCII digits"
         ))
     })?;
-    let total = sign * (hours * 3600 + minutes * 60);
+    let total = sign * (i32::from(hours) * 3600 + i32::from(minutes) * 60);
     time::UtcOffset::from_whole_seconds(total).map_err(|err| {
         ParseObjectError::MalformedIdentity(format!(
             "timezone field {s:?} resolves to invalid offset: {err}"
         ))
     })
+}
+
+fn parse_two_ascii_digits(bytes: &[u8]) -> Option<u8> {
+    if bytes.len() != 2 || !bytes[0].is_ascii_digit() || !bytes[1].is_ascii_digit() {
+        return None;
+    }
+    Some((bytes[0] - b'0') * 10 + (bytes[1] - b'0'))
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -920,6 +983,29 @@ mod tests {
         let identity = parse_identity(bytes).expect("empty-name identity parses");
         assert_eq!(identity.name(), "");
         assert_eq!(identity.email(), "only-email@example.invalid");
+    }
+
+    #[test]
+    fn parse_tz_offset_rejects_multibyte_chars_without_panic() {
+        // Regression for codex review P2: `+1é2` is 5 bytes but the
+        // 2nd char `é` straddles bytes 1..3, so a `&str`-based slice
+        // would panic on a non-char boundary. The parser must
+        // surface this as a Malformed error instead.
+        let err = parse_tz_offset("+1é2").expect_err("multibyte tz must fail cleanly");
+        assert!(
+            matches!(err, ParseObjectError::MalformedIdentity(ref msg) if msg.contains("ASCII digits")),
+            "got: {err:?}"
+        );
+
+        // Sanity: a 5-byte string whose last byte is a UTF-8
+        // continuation should also fail cleanly, not panic.
+        let err = parse_tz_offset("+0é0").err();
+        assert!(err.is_some(), "expected Err, got Ok");
+
+        // And a fully-multibyte 5-byte string ("é" + "é" = 4 bytes,
+        // pad to 5 with "X").
+        let err = parse_tz_offset("ééX").err();
+        assert!(err.is_some(), "expected Err, got Ok");
     }
 
     #[test]
@@ -1287,6 +1373,82 @@ mod tests {
         assert!(
             msg.contains("non-zero status"),
             "expected non-zero-status diagnostic, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cat_file_source_drop_kills_process_group() {
+        // Regression for codex review P2: dropping the source must
+        // SIGKILL the *whole* process group, not just the leader pid.
+        // A wrapper script forks a long-lived sibling into the
+        // shared pgid, records its pid, then sleeps so the leader
+        // stays alive until Drop runs. If Drop only killed the
+        // leader (the buggy behaviour), the sibling would survive.
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let wrapper = tmp.path().join("wrap.sh");
+        let helper_pid_file = tmp.path().join("helper.pid");
+        let script = format!(
+            "#!/bin/sh\n\
+             sleep 600 &\n\
+             echo $! > {helper}\n\
+             exec sleep 600\n",
+            helper = helper_pid_file.display(),
+        );
+        std::fs::write(&wrapper, script).expect("write wrapper");
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod wrapper");
+
+        let helper_pid = {
+            let _source = CatFileObjectSource::open(tmp.path(), &wrapper)
+                .await
+                .expect("open wrapper");
+            // Wait for the wrapper to fork the helper and write its
+            // pid. Generous deadline to keep CI happy.
+            let mut helper_pid: Option<libc::pid_t> = None;
+            for _ in 0..200 {
+                if let Ok(raw) = std::fs::read_to_string(&helper_pid_file) {
+                    let trimmed = raw.trim();
+                    if !trimmed.is_empty() {
+                        helper_pid = Some(trimmed.parse().expect("helper pid is integer"));
+                        break;
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+            let pid = helper_pid.expect("wrapper recorded helper pid before timeout");
+            // Confirm the helper is alive while the source still
+            // exists; otherwise the test is meaningless.
+            let alive = unsafe { libc::kill(pid, 0) };
+            assert_eq!(
+                alive,
+                0,
+                "helper {pid} should be alive before source drop (errno={})",
+                std::io::Error::last_os_error()
+            );
+            pid
+            // `source` goes out of scope here → Drop runs → killpg
+        };
+
+        // After Drop, the helper must die. SIGKILL is synchronous
+        // at the kernel level, but the process state visible via
+        // kill(0) can take a tick. Poll briefly.
+        let mut gone = false;
+        for _ in 0..200 {
+            let r = unsafe { libc::kill(helper_pid, 0) };
+            if r == -1 {
+                let errno = std::io::Error::last_os_error().raw_os_error();
+                if errno == Some(libc::ESRCH) {
+                    gone = true;
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(
+            gone,
+            "helper pid {helper_pid} survived source Drop — process group was not killed"
         );
     }
 }
