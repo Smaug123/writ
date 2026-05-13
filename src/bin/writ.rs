@@ -745,7 +745,11 @@ fn build_agent_vm_guest_image(
         .output()
         .map_err(|e| format!("failed to spawn nix: {e}"))?;
     if !nix_output.status.success() {
-        return Err(format!("nix build {flake_ref} failed with status {}", nix_output.status).into());
+        return Err(format!(
+            "nix build {flake_ref} failed with status {}",
+            nix_output.status
+        )
+        .into());
     }
     let archive = String::from_utf8(nix_output.stdout)
         .map_err(|e| format!("nix build stdout was not valid UTF-8: {e}"))?
@@ -2485,7 +2489,10 @@ mod tests {
         let err = default_guest_system("riscv64")
             .expect_err("riscv64 has no flake guest image target")
             .to_string();
-        assert!(err.contains("riscv64"), "error should name the bad arch: {err}");
+        assert!(
+            err.contains("riscv64"),
+            "error should name the bad arch: {err}"
+        );
         assert!(
             err.contains("--guest-system"),
             "error should point at the override flag: {err}",
