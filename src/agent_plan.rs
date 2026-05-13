@@ -899,9 +899,21 @@ pub struct PlanCreated {
 }
 
 /// `POST /v1/plans/<plan_id>/reviews` request body.
+///
+/// `agent_run_id` names the reviewer run posting the verdict.
+/// Mirrors the explicit-identification pattern from
+/// [`PlanSubmission`]: the VM-side CLI already knows its run id from
+/// the `/v1/agent-runs/{id}/config` handshake that started it, so
+/// passing it back is a natural extension of the existing in-VM
+/// identifier flow. The broker verifies the run belongs to the
+/// calling session and is bound to the plan named in the URL path
+/// before persisting the review, closing the cross-session window
+/// where one VM's bearer could otherwise attach a verdict to another
+/// VM's reviewer run.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReviewSubmission {
+    pub agent_run_id: crate::agent_run::AgentRunId,
     pub verdict: Verdict,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub feedback: Option<PlanFeedback>,
@@ -1518,11 +1530,14 @@ mod tests {
 
     #[test]
     fn review_submission_roundtrips_with_and_without_feedback() {
+        let run_id = crate::agent_run::AgentRunId::new();
         let with = ReviewSubmission {
+            agent_run_id: run_id,
             verdict: Verdict::RequestChanges,
             feedback: Some(PlanFeedback::try_new("re-scope step 3").unwrap()),
         };
         let without = ReviewSubmission {
+            agent_run_id: run_id,
             verdict: Verdict::Approve,
             feedback: None,
         };
@@ -1531,6 +1546,18 @@ mod tests {
             let back: ReviewSubmission = serde_json::from_str(&json).unwrap();
             assert_eq!(back, r);
         }
+    }
+
+    /// `deny_unknown_fields` and the new `agent_run_id` requirement are
+    /// load-bearing for the route. Pin both: a typoed field name fails
+    /// to parse, and a body without `agent_run_id` is rejected before
+    /// the route's session-ownership check would even fire.
+    #[test]
+    fn review_submission_rejects_unknown_field_and_missing_run_id() {
+        let with_typo = r#"{"agent_run_id":"550e8400-e29b-41d4-a716-446655440000","verdict":"approve","feedbck":"oops"}"#;
+        assert!(serde_json::from_str::<ReviewSubmission>(with_typo).is_err());
+        let missing_run = r#"{"verdict":"approve"}"#;
+        assert!(serde_json::from_str::<ReviewSubmission>(missing_run).is_err());
     }
 
     #[test]

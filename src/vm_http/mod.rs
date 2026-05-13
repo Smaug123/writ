@@ -40,8 +40,8 @@ pub use openai_proxy::{
 };
 pub use plan::VmHttpPlanService;
 use plan::{
-    is_plans_collection_target, parse_plan_id_target, route_plan_id_request,
-    route_plans_collection_request,
+    is_plans_collection_target, parse_plan_id_target, parse_plan_reviews_target,
+    route_plan_id_request, route_plan_reviews_request, route_plans_collection_request,
 };
 use proxy_common::{
     ClaudeBackend, OpenAiBackend, ProxyAuditDecision, ProxyBackend, ProxyStream,
@@ -1249,6 +1249,19 @@ fn route_request_body_limit<S: SecretStore + Send + Sync + 'static>(
         // under 100 bytes; 1 KiB is generous headroom.
         return Some(6 * crate::agent_plan::MAX_PLAN_BODY_BYTES + 1024);
     }
+    if parse_plan_reviews_target(&request.target).is_some()
+        && request.method == "POST"
+        && services.plans.is_some()
+    {
+        // Same worst-case-expansion logic as the plans collection
+        // route: `PlanFeedback::try_new` admits any non-empty UTF-8
+        // ≤ `MAX_PLAN_FEEDBACK_BYTES`, and an ASCII control byte
+        // expands 6:1 in JSON (`\u00XX`). The envelope
+        // (`{"agent_run_id":"<uuid>","verdict":"request_changes",
+        // "feedback":""}`) stays comfortably under 200 bytes; 1 KiB is
+        // generous headroom.
+        return Some(6 * crate::agent_plan::MAX_PLAN_FEEDBACK_BYTES + 1024);
+    }
     None
 }
 
@@ -1302,6 +1315,19 @@ where
             return VmHttpResponse::text(VmHttpStatus::NotFound, "not found").into();
         };
         return route_plans_collection_request(session, request, body, service)
+            .await
+            .into();
+    }
+
+    // `parse_plan_reviews_target` runs before `parse_plan_id_target`
+    // for readability — the two parsers are disjoint (the id-only
+    // parser rejects any suffix containing a `/`), so ordering here
+    // does not affect correctness.
+    if let Some(plan_id) = parse_plan_reviews_target(&request.target) {
+        let Some(service) = services.plans else {
+            return VmHttpResponse::text(VmHttpStatus::NotFound, "not found").into();
+        };
+        return route_plan_reviews_request(session, request, body, plan_id, service)
             .await
             .into();
     }

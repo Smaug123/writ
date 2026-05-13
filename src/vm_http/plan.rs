@@ -38,9 +38,12 @@ use std::sync::Arc;
 
 use crate::agent_plan::{
     DecisionOutcome, DecisionView, PlanCreated, PlanId, PlanRouteAction, PlanRouteAuthError,
-    PlanSubmission, PlanView, VM_PLANS_PATH_PREFIX, route_permitted_by_stage_and_decision,
+    PlanSubmission, PlanView, ReviewCreated, ReviewId, ReviewSubmission, VM_PLANS_PATH_PREFIX,
+    route_permitted_by_stage_and_decision,
 };
-use crate::audit::{AUDIT_WRITE_FAILURE_TARGET, AuditError, PlanSubmissionRecord};
+use crate::audit::{
+    AUDIT_WRITE_FAILURE_TARGET, AuditError, PlanReviewRecord, PlanSubmissionRecord,
+};
 use crate::core::UnixMillis;
 use crate::secret::SecretStore;
 use crate::server::BrokerState;
@@ -77,9 +80,8 @@ pub(super) fn is_plans_collection_target(target: &str) -> bool {
 
 /// Recognises a per-plan target shaped exactly `/v1/plans/<plan_id>`
 /// (no trailing slash, no further path components, no query string).
-/// Sub-routes like `/v1/plans/<plan_id>/reviews` belong to later
-/// slices and are deliberately *not* matched here; this keeps the
-/// dispatcher's match ordering simple.
+/// Sub-routes like `/v1/plans/<plan_id>/reviews` have their own
+/// parser ([`parse_plan_reviews_target`]) and are not matched here.
 pub(super) fn parse_plan_id_target(target: &str) -> Option<PlanId> {
     let suffix = target
         .strip_prefix(VM_PLANS_PATH_PREFIX)?
@@ -88,6 +90,21 @@ pub(super) fn parse_plan_id_target(target: &str) -> Option<PlanId> {
         return None;
     }
     suffix.parse().ok()
+}
+
+/// `/v1/plans/<plan_id>/reviews`. Returns the parsed `plan_id` when
+/// the target names the reviews sub-collection of exactly one plan.
+/// Rejects extra trailing path segments so a reviewer cannot reach
+/// past the route (e.g. `.../reviews/../foo`).
+pub(super) fn parse_plan_reviews_target(target: &str) -> Option<PlanId> {
+    let suffix = target
+        .strip_prefix(VM_PLANS_PATH_PREFIX)?
+        .strip_prefix('/')?;
+    let raw_id = suffix.strip_suffix("/reviews")?;
+    if raw_id.contains('/') {
+        return None;
+    }
+    raw_id.parse().ok()
 }
 
 pub(super) async fn route_plans_collection_request<S: SecretStore + Send + Sync + 'static>(
@@ -242,6 +259,19 @@ async fn handle_plan_read<S: SecretStore + Send + Sync + 'static>(
     VmHttpResponse::json(VmHttpStatus::Ok, &view)
 }
 
+pub(super) async fn route_plan_reviews_request<S: SecretStore + Send + Sync + 'static>(
+    session: &VmHttpSession,
+    request: &VmHttpRequest,
+    body: Vec<u8>,
+    plan_id: PlanId,
+    service: VmHttpPlanService<S>,
+) -> VmHttpResponse {
+    if request.method != "POST" {
+        return VmHttpResponse::text(VmHttpStatus::MethodNotAllowed, "method not allowed");
+    }
+    handle_plan_review_submission(session, body, plan_id, service).await
+}
+
 async fn handle_plan_submission<S: SecretStore + Send + Sync + 'static>(
     session: &VmHttpSession,
     body: Vec<u8>,
@@ -358,6 +388,147 @@ async fn handle_plan_submission<S: SecretStore + Send + Sync + 'static>(
     }
 }
 
+async fn handle_plan_review_submission<S: SecretStore + Send + Sync + 'static>(
+    session: &VmHttpSession,
+    body: Vec<u8>,
+    plan_id: PlanId,
+    service: VmHttpPlanService<S>,
+) -> VmHttpResponse {
+    let submission = match serde_json::from_slice::<ReviewSubmission>(&body) {
+        Ok(submission) => submission,
+        Err(err) => {
+            return VmHttpResponse::text(
+                VmHttpStatus::BadRequest,
+                format!("invalid review submission: {err}"),
+            );
+        }
+    };
+    drop(body);
+
+    let audit = &service.broker_state.audit;
+    let calling_session = session.session_id();
+    let run = match audit.get_agent_run(submission.agent_run_id) {
+        Ok(Some(run)) if run.session_id == calling_session => run,
+        Ok(Some(_)) => {
+            // Same ordering as `handle_plan_submission`: the
+            // cross-session gate runs first so a stranger naming a real
+            // run sees 401 rather than leaking presence-of-run via 403.
+            return VmHttpResponse::text(
+                VmHttpStatus::Unauthorized,
+                "agent run does not belong to this session",
+            );
+        }
+        Ok(None) => {
+            return VmHttpResponse::text(VmHttpStatus::NotFound, "agent run does not exist");
+        }
+        Err(err) => {
+            tracing::error!(
+                target: AUDIT_WRITE_FAILURE_TARGET,
+                kind = "plan_review_run_lookup",
+                run_id = %submission.agent_run_id,
+                plan_id = %plan_id,
+                error = %err,
+                "audit read failed",
+            );
+            return VmHttpResponse::text(VmHttpStatus::InternalServerError, "audit read failed");
+        }
+    };
+
+    // Per-stage gate. `SubmitReview` is admitted only when
+    // `run.stage = 'review'`; no decision consultation.
+    if let Err(err) =
+        route_permitted_by_stage_and_decision(PlanRouteAction::SubmitReview, run.stage, None)
+    {
+        match err {
+            PlanRouteAuthError::StageNotPermitted { .. } => {
+                return VmHttpResponse::text(VmHttpStatus::Forbidden, err.to_string());
+            }
+            // `SubmitReview` never consults the decision branch; if the
+            // pure gate ever returns it for this action, surface as 500
+            // so a future refactor cannot silently re-route a verdict
+            // through the wrong branch.
+            PlanRouteAuthError::DecisionNotAccepted { .. } => {
+                tracing::error!(
+                    target: AUDIT_WRITE_FAILURE_TARGET,
+                    kind = "plan_review_gate_decision_branch_taken",
+                    run_id = %submission.agent_run_id,
+                    plan_id = %plan_id,
+                    error = %err,
+                    "stage gate returned unexpected decision branch",
+                );
+                return VmHttpResponse::text(
+                    VmHttpStatus::InternalServerError,
+                    "stage gate returned unexpected decision branch",
+                );
+            }
+        }
+    }
+
+    // Cross-binding gate: a reviewer can only post a verdict against
+    // the plan it was started against. The matching DAO check and the
+    // `plan_review_requires_reviewer_run` trigger are the audit-side
+    // defences; this pre-check turns the wire-side failure into a
+    // typed 403 rather than a 500 from the audit invariant.
+    if run.read_plan_id != Some(plan_id) {
+        return VmHttpResponse::text(
+            VmHttpStatus::Forbidden,
+            "agent run is not bound to this plan",
+        );
+    }
+
+    let review_id = ReviewId::new();
+    let record = PlanReviewRecord {
+        review_id,
+        plan_id,
+        agent_run_id: submission.agent_run_id,
+        submitted_at: UnixMillis::now(),
+        verdict: submission.verdict,
+        feedback: submission.feedback,
+    };
+    match audit.record_plan_review(&record) {
+        Ok(()) => VmHttpResponse::json(VmHttpStatus::Ok, &ReviewCreated { review_id }),
+        Err(AuditError::Invariant("agent run does not exist")) => {
+            // Run vanished between our lookup and the write — a race
+            // with session close or audit-side deletion. 410 Gone
+            // mirrors `handle_plan_submission`.
+            VmHttpResponse::text(VmHttpStatus::Gone, "agent run no longer exists")
+        }
+        Err(AuditError::Invariant("session is closed")) => {
+            VmHttpResponse::text(VmHttpStatus::Gone, "session is closed")
+        }
+        Err(AuditError::Invariant("plan does not exist")) => {
+            // The plan named in the URL is gone (or never existed).
+            // The cross-binding gate above requires
+            // `run.read_plan_id = Some(plan_id)` which is FK-checked
+            // against `plan`, so reaching here means the plan was
+            // deleted in the race window. 410 Gone matches the
+            // disappearing-run case above: this URL was valid once and
+            // no longer is.
+            VmHttpResponse::text(VmHttpStatus::Gone, "plan no longer exists")
+        }
+        Err(AuditError::Sqlite(err)) if err.to_string().to_uppercase().contains("UNIQUE") => {
+            // `UNIQUE(agent_run_id)` on `plan_review`: one verdict per
+            // reviewer run, no overwrites.
+            VmHttpResponse::text(
+                VmHttpStatus::Conflict,
+                "review already recorded for this run",
+            )
+        }
+        Err(err) => {
+            tracing::error!(
+                target: AUDIT_WRITE_FAILURE_TARGET,
+                kind = "plan_review",
+                run_id = %submission.agent_run_id,
+                plan_id = %plan_id,
+                review_id = %review_id,
+                error = %err,
+                "audit write failed",
+            );
+            VmHttpResponse::text(VmHttpStatus::InternalServerError, "audit write failed")
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
@@ -412,6 +583,15 @@ mod tests {
         session_id: SessionId,
         stage: crate::agent_plan::Stage,
     ) -> AgentRunId {
+        record_run_at_stage_with_read_plan(state, session_id, stage, None)
+    }
+
+    fn record_run_at_stage_with_read_plan(
+        state: &BrokerState<Box<dyn SecretStore>>,
+        session_id: SessionId,
+        stage: crate::agent_plan::Stage,
+        read_plan_id: Option<PlanId>,
+    ) -> AgentRunId {
         let run_id = AgentRunId::new();
         state
             .audit
@@ -423,10 +603,47 @@ mod tests {
                 prompt: AgentPrompt::new("plan this").summary(),
                 correlation_id: None,
                 stage,
-                read_plan_id: None,
+                read_plan_id,
             })
             .unwrap();
         run_id
+    }
+
+    /// Fixture: submit a plan owned by `planner_run`, then return its
+    /// `PlanId`. Tests of the review route need a real plan in the DB
+    /// (FK target for `read_plan_id` and the URL path segment).
+    fn submit_plan_for_run(
+        state: &BrokerState<Box<dyn SecretStore>>,
+        planner_run: AgentRunId,
+        body: &str,
+    ) -> PlanId {
+        let plan_id = PlanId::new();
+        state
+            .audit
+            .record_plan_submission(&PlanSubmissionRecord {
+                plan_id,
+                agent_run_id: planner_run,
+                submitted_at: UnixMillis::now(),
+                body: PlanBody::try_new(body).unwrap(),
+            })
+            .unwrap();
+        plan_id
+    }
+
+    /// Fixture: create a reviewer run on `session_id` bound to
+    /// `plan_id` via `read_plan_id`. Mirrors the start-time binding
+    /// the route enforces.
+    fn record_reviewer_run(
+        state: &BrokerState<Box<dyn SecretStore>>,
+        session_id: SessionId,
+        plan_id: PlanId,
+    ) -> AgentRunId {
+        record_run_at_stage_with_read_plan(
+            state,
+            session_id,
+            crate::agent_plan::Stage::Review,
+            Some(plan_id),
+        )
     }
 
     fn open_session_for(state: &BrokerState<Box<dyn SecretStore>>, session_id: SessionId) {
@@ -447,6 +664,19 @@ mod tests {
         serde_json::to_vec(&PlanSubmission {
             agent_run_id: run_id,
             body: PlanBody::try_new(body).unwrap(),
+        })
+        .unwrap()
+    }
+
+    fn review_submission_body(
+        run_id: AgentRunId,
+        verdict: crate::agent_plan::Verdict,
+        feedback: Option<&str>,
+    ) -> Vec<u8> {
+        serde_json::to_vec(&ReviewSubmission {
+            agent_run_id: run_id,
+            verdict,
+            feedback: feedback.map(|f| crate::agent_plan::PlanFeedback::try_new(f).unwrap()),
         })
         .unwrap()
     }
@@ -907,7 +1137,8 @@ mod tests {
         assert_eq!(parse_plan_id_target(VM_PLANS_PATH_PREFIX), None);
         // Trailing slash is not a valid id.
         assert_eq!(parse_plan_id_target(&format!("/v1/plans/{plan_id}/")), None);
-        // Suffix paths belong to later slices, not this matcher.
+        // Suffix paths are matched by a sibling parser
+        // (`parse_plan_reviews_target`), not this one.
         assert_eq!(
             parse_plan_id_target(&format!("/v1/plans/{plan_id}/reviews")),
             None
@@ -1303,5 +1534,538 @@ mod tests {
         assert_eq!(view.plan_id, plan_id);
         assert_eq!(view.body.as_str(), "# Dispatch body");
         assert_eq!(view.originating_run_id, planner_run);
+    }
+
+    // --- POST /v1/plans/<plan_id>/reviews ---------------------------
+
+    /// Reference: `parse_plan_reviews_target` is the URL-shape gate. A
+    /// well-formed `/v1/plans/<uuid>/reviews` resolves; anything that
+    /// would let a caller reach past the route (extra segments,
+    /// missing `/reviews` suffix, malformed UUID) returns `None`.
+    #[test]
+    fn parse_plan_reviews_target_accepts_well_formed_and_rejects_others() {
+        let plan_id = PlanId::new();
+        let ok = format!("/v1/plans/{plan_id}/reviews");
+        assert_eq!(parse_plan_reviews_target(&ok), Some(plan_id));
+
+        // Missing `/reviews` suffix.
+        let bare = format!("/v1/plans/{plan_id}");
+        assert_eq!(parse_plan_reviews_target(&bare), None);
+
+        // Extra segment after `/reviews`.
+        let deeper = format!("/v1/plans/{plan_id}/reviews/extra");
+        assert_eq!(parse_plan_reviews_target(&deeper), None);
+
+        // Slash inside the id segment.
+        let with_slash = format!("/v1/plans/a/{plan_id}/reviews");
+        assert_eq!(parse_plan_reviews_target(&with_slash), None);
+
+        // Not a UUID.
+        assert_eq!(
+            parse_plan_reviews_target("/v1/plans/not-a-uuid/reviews"),
+            None
+        );
+
+        // Wrong prefix.
+        assert_eq!(parse_plan_reviews_target("/plans/x/reviews"), None);
+
+        // Just the collection — must not match the reviews parser.
+        assert_eq!(parse_plan_reviews_target("/v1/plans"), None);
+    }
+
+    /// With `services.plans = None`, the reviews route is dark: all
+    /// methods return 404 (and we never reach the per-method 405
+    /// branch). Mirrors `disabled_plans_route_is_not_found_for_all_methods`.
+    #[tokio::test]
+    async fn disabled_plan_reviews_route_is_not_found_for_all_methods() {
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(10, 1, 2, 0), 24).unwrap());
+        let peer = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(10, 1, 2, 3), 12345));
+        let target = crate::agent_plan::vm_plan_reviews_path(PlanId::new());
+
+        for method in ["GET", "POST", "PUT", "DELETE"] {
+            let request = VmHttpRequest::new(method, &target, Some(bearer(token().as_str())), peer);
+            let response =
+                route_authenticated_vm_http_request(&session, &request, Vec::new(), no_services())
+                    .await
+                    .into_buffered();
+
+            assert_eq!(response.status, VmHttpStatus::NotFound);
+        }
+    }
+
+    #[tokio::test]
+    async fn enabled_plan_reviews_route_rejects_non_post_methods() {
+        let github = MockServer::start().await;
+        let state = make_broker_state(&github);
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+        let service = plan_service_for_test(&state);
+        let target = crate::agent_plan::vm_plan_reviews_path(PlanId::new());
+        let request = VmHttpRequest::new(
+            "GET",
+            &target,
+            Some(bearer(token().as_str())),
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 12345)),
+        );
+
+        let response = route_authenticated_vm_http_request(
+            &session,
+            &request,
+            Vec::new(),
+            services_with_plans(service),
+        )
+        .await
+        .into_buffered();
+
+        assert_eq!(response.status, VmHttpStatus::MethodNotAllowed);
+    }
+
+    #[tokio::test]
+    async fn plan_review_rejects_malformed_body_without_audit() {
+        let github = MockServer::start().await;
+        let state = make_broker_state(&github);
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+        open_audit_session(&state, session.session_id());
+        let planner_run = record_planner_run(&state, session.session_id());
+        let plan_id = submit_plan_for_run(&state, planner_run, "# Plan");
+        let service = plan_service_for_test(&state);
+
+        let response =
+            handle_plan_review_submission(&session, b"not json".to_vec(), plan_id, service).await;
+
+        assert_eq!(response.status, VmHttpStatus::BadRequest);
+        assert!(
+            state
+                .audit
+                .list_plan_reviews_for_plan(plan_id)
+                .unwrap()
+                .is_empty(),
+        );
+    }
+
+    #[tokio::test]
+    async fn plan_review_rejects_unknown_run() {
+        let github = MockServer::start().await;
+        let state = make_broker_state(&github);
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+        open_audit_session(&state, session.session_id());
+        let planner_run = record_planner_run(&state, session.session_id());
+        let plan_id = submit_plan_for_run(&state, planner_run, "# Plan");
+        let service = plan_service_for_test(&state);
+
+        let body =
+            review_submission_body(AgentRunId::new(), crate::agent_plan::Verdict::Approve, None);
+        let response = handle_plan_review_submission(&session, body, plan_id, service).await;
+
+        assert_eq!(response.status, VmHttpStatus::NotFound);
+        assert!(
+            state
+                .audit
+                .list_plan_reviews_for_plan(plan_id)
+                .unwrap()
+                .is_empty(),
+        );
+    }
+
+    /// A second session that owns the reviewer run; the calling
+    /// session does not. Same shape as
+    /// `plan_submission_rejects_run_owned_by_other_session`: 401, no
+    /// audit row.
+    #[tokio::test]
+    async fn plan_review_rejects_run_owned_by_other_session() {
+        let github = MockServer::start().await;
+        let state = make_broker_state(&github);
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+        open_audit_session(&state, session.session_id());
+        let other_session_id: SessionId = "82ab0bb1-7c12-4a4e-9f51-6d3d77011333".parse().unwrap();
+        open_session_for(&state, other_session_id);
+        let planner_run = record_planner_run(&state, other_session_id);
+        let plan_id = submit_plan_for_run(&state, planner_run, "# Plan");
+        let stranger_reviewer = record_reviewer_run(&state, other_session_id, plan_id);
+        let service = plan_service_for_test(&state);
+
+        let body =
+            review_submission_body(stranger_reviewer, crate::agent_plan::Verdict::Approve, None);
+        let response = handle_plan_review_submission(&session, body, plan_id, service).await;
+
+        assert_eq!(response.status, VmHttpStatus::Unauthorized);
+        assert!(
+            state
+                .audit
+                .list_plan_reviews_for_plan(plan_id)
+                .unwrap()
+                .is_empty(),
+        );
+    }
+
+    /// A planner-stage run cannot post a review verdict, even one
+    /// bound (via a hypothetical future flow) to a plan. 403, not 401.
+    #[tokio::test]
+    async fn plan_review_rejects_non_review_stage_run() {
+        let github = MockServer::start().await;
+        let state = make_broker_state(&github);
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+        open_audit_session(&state, session.session_id());
+        let planner_run = record_planner_run(&state, session.session_id());
+        let plan_id = submit_plan_for_run(&state, planner_run, "# Plan");
+        let service = plan_service_for_test(&state);
+
+        // Use the planner run (`stage = 'plan'`) as the reviewer; the
+        // stage gate must reject before the cross-binding gate.
+        let body = review_submission_body(planner_run, crate::agent_plan::Verdict::Approve, None);
+        let response = handle_plan_review_submission(&session, body, plan_id, service).await;
+
+        assert_eq!(response.status, VmHttpStatus::Forbidden);
+        let message = std::str::from_utf8(&response.body).unwrap();
+        assert!(
+            message.contains("plan") && message.contains("submit_review"),
+            "unexpected body: {message}",
+        );
+        assert!(
+            state
+                .audit
+                .list_plan_reviews_for_plan(plan_id)
+                .unwrap()
+                .is_empty(),
+        );
+    }
+
+    /// A reviewer run bound to plan A cannot post a verdict against
+    /// plan B. The pre-check turns the audit invariant into a typed
+    /// 403; the DAO and trigger remain as defences but the route must
+    /// not let the request reach them.
+    #[tokio::test]
+    async fn plan_review_rejects_reviewer_bound_to_different_plan() {
+        let github = MockServer::start().await;
+        let state = make_broker_state(&github);
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+        open_audit_session(&state, session.session_id());
+        let planner_run = record_planner_run(&state, session.session_id());
+        let plan_a = submit_plan_for_run(&state, planner_run, "# Plan A");
+        // A second planner run for plan B (plan submission requires a
+        // distinct `agent_run_id` per the `UNIQUE(agent_run_id)` clause
+        // on `plan`).
+        let other_planner = record_planner_run(&state, session.session_id());
+        let plan_b = submit_plan_for_run(&state, other_planner, "# Plan B");
+        let reviewer_of_a = record_reviewer_run(&state, session.session_id(), plan_a);
+        let service = plan_service_for_test(&state);
+
+        let body = review_submission_body(reviewer_of_a, crate::agent_plan::Verdict::Approve, None);
+        let response = handle_plan_review_submission(&session, body, plan_b, service).await;
+
+        assert_eq!(response.status, VmHttpStatus::Forbidden);
+        let message = std::str::from_utf8(&response.body).unwrap();
+        assert!(message.contains("not bound"), "unexpected body: {message}",);
+        // Nothing landed against either plan.
+        assert!(
+            state
+                .audit
+                .list_plan_reviews_for_plan(plan_a)
+                .unwrap()
+                .is_empty(),
+        );
+        assert!(
+            state
+                .audit
+                .list_plan_reviews_for_plan(plan_b)
+                .unwrap()
+                .is_empty(),
+        );
+    }
+
+    /// A reviewer run with `read_plan_id = NULL` cannot smuggle a
+    /// verdict in — the cross-binding gate requires
+    /// `read_plan_id = Some(<url-plan>)`. The migration enforces the
+    /// invariant at start-time, but the route must not assume it.
+    #[tokio::test]
+    async fn plan_review_rejects_reviewer_without_read_plan_id() {
+        let github = MockServer::start().await;
+        let state = make_broker_state(&github);
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+        open_audit_session(&state, session.session_id());
+        let planner_run = record_planner_run(&state, session.session_id());
+        let plan_id = submit_plan_for_run(&state, planner_run, "# Plan");
+        // Reviewer stage but no `read_plan_id`.
+        let unbound_reviewer = record_run_at_stage(
+            &state,
+            session.session_id(),
+            crate::agent_plan::Stage::Review,
+        );
+        let service = plan_service_for_test(&state);
+
+        let body =
+            review_submission_body(unbound_reviewer, crate::agent_plan::Verdict::Approve, None);
+        let response = handle_plan_review_submission(&session, body, plan_id, service).await;
+
+        assert_eq!(response.status, VmHttpStatus::Forbidden);
+        assert!(
+            state
+                .audit
+                .list_plan_reviews_for_plan(plan_id)
+                .unwrap()
+                .is_empty(),
+        );
+    }
+
+    /// Cross-session gate runs before stage gate (mirrors
+    /// `plan_submission_session_gate_runs_before_stage_gate`). The
+    /// stranger run is at the *correct* stage and bound to the
+    /// *correct* plan; only session ownership rejects.
+    #[tokio::test]
+    async fn plan_review_session_gate_runs_before_stage_gate() {
+        let github = MockServer::start().await;
+        let state = make_broker_state(&github);
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+        open_audit_session(&state, session.session_id());
+        let other_session_id: SessionId = "82ab0bb1-7c12-4a4e-9f51-6d3d77011444".parse().unwrap();
+        open_session_for(&state, other_session_id);
+        let planner_run = record_planner_run(&state, other_session_id);
+        let plan_id = submit_plan_for_run(&state, planner_run, "# Plan");
+        let stranger_reviewer = record_reviewer_run(&state, other_session_id, plan_id);
+        let service = plan_service_for_test(&state);
+
+        let body =
+            review_submission_body(stranger_reviewer, crate::agent_plan::Verdict::Approve, None);
+        let response = handle_plan_review_submission(&session, body, plan_id, service).await;
+
+        assert_eq!(response.status, VmHttpStatus::Unauthorized);
+    }
+
+    /// Happy path: a reviewer bound to the URL plan posts an approval
+    /// with feedback. Response is 200 with `ReviewCreated`; the audit
+    /// row reflects the verdict, the feedback body, and the same
+    /// `review_id`.
+    #[tokio::test]
+    async fn plan_review_records_audit_row_and_returns_review_id() {
+        let github = MockServer::start().await;
+        let state = make_broker_state(&github);
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+        open_audit_session(&state, session.session_id());
+        let planner_run = record_planner_run(&state, session.session_id());
+        let plan_id = submit_plan_for_run(&state, planner_run, "# Plan");
+        let reviewer = record_reviewer_run(&state, session.session_id(), plan_id);
+        let service = plan_service_for_test(&state);
+
+        let body = review_submission_body(
+            reviewer,
+            crate::agent_plan::Verdict::RequestChanges,
+            Some("re-scope step 3"),
+        );
+        let response = handle_plan_review_submission(&session, body, plan_id, service).await;
+
+        assert_eq!(response.status, VmHttpStatus::Ok);
+        let created: ReviewCreated = serde_json::from_slice(&response.body).unwrap();
+        let stored = state
+            .audit
+            .get_plan_review(created.review_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.review_id, created.review_id);
+        assert_eq!(stored.plan_id, plan_id);
+        assert_eq!(stored.agent_run_id, reviewer);
+        assert_eq!(stored.verdict, crate::agent_plan::Verdict::RequestChanges);
+        assert_eq!(
+            stored.feedback.as_ref().map(|f| f.as_str()),
+            Some("re-scope step 3"),
+        );
+    }
+
+    /// A reviewer that opts to skip feedback (approve-without-comment)
+    /// is admitted; the audit row carries `feedback = None`.
+    #[tokio::test]
+    async fn plan_review_admits_approval_without_feedback() {
+        let github = MockServer::start().await;
+        let state = make_broker_state(&github);
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+        open_audit_session(&state, session.session_id());
+        let planner_run = record_planner_run(&state, session.session_id());
+        let plan_id = submit_plan_for_run(&state, planner_run, "# Plan");
+        let reviewer = record_reviewer_run(&state, session.session_id(), plan_id);
+        let service = plan_service_for_test(&state);
+
+        let body = review_submission_body(reviewer, crate::agent_plan::Verdict::Approve, None);
+        let response = handle_plan_review_submission(&session, body, plan_id, service).await;
+
+        assert_eq!(response.status, VmHttpStatus::Ok);
+        let created: ReviewCreated = serde_json::from_slice(&response.body).unwrap();
+        let stored = state
+            .audit
+            .get_plan_review(created.review_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.verdict, crate::agent_plan::Verdict::Approve);
+        assert!(stored.feedback.is_none());
+    }
+
+    #[tokio::test]
+    async fn plan_review_rejects_second_review_for_same_run() {
+        let github = MockServer::start().await;
+        let state = make_broker_state(&github);
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+        open_audit_session(&state, session.session_id());
+        let planner_run = record_planner_run(&state, session.session_id());
+        let plan_id = submit_plan_for_run(&state, planner_run, "# Plan");
+        let reviewer = record_reviewer_run(&state, session.session_id(), plan_id);
+
+        let first = handle_plan_review_submission(
+            &session,
+            review_submission_body(reviewer, crate::agent_plan::Verdict::Approve, None),
+            plan_id,
+            plan_service_for_test(&state),
+        )
+        .await;
+        assert_eq!(first.status, VmHttpStatus::Ok);
+
+        let second = handle_plan_review_submission(
+            &session,
+            review_submission_body(
+                reviewer,
+                crate::agent_plan::Verdict::RequestChanges,
+                Some("changed my mind"),
+            ),
+            plan_id,
+            plan_service_for_test(&state),
+        )
+        .await;
+        assert_eq!(second.status, VmHttpStatus::Conflict);
+
+        // Only the first verdict landed.
+        let rows = state.audit.list_plan_reviews_for_plan(plan_id).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].verdict, crate::agent_plan::Verdict::Approve);
+    }
+
+    #[tokio::test]
+    async fn plan_review_closed_session_returns_gone() {
+        let github = MockServer::start().await;
+        let state = make_broker_state(&github);
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+        open_audit_session(&state, session.session_id());
+        let planner_run = record_planner_run(&state, session.session_id());
+        let plan_id = submit_plan_for_run(&state, planner_run, "# Plan");
+        let reviewer = record_reviewer_run(&state, session.session_id(), plan_id);
+        state
+            .audit
+            .close_session(session.session_id(), UnixMillis::now())
+            .unwrap();
+        let service = plan_service_for_test(&state);
+
+        let body = review_submission_body(reviewer, crate::agent_plan::Verdict::Approve, None);
+        let response = handle_plan_review_submission(&session, body, plan_id, service).await;
+
+        assert_eq!(response.status, VmHttpStatus::Gone);
+        assert!(
+            state
+                .audit
+                .list_plan_reviews_for_plan(plan_id)
+                .unwrap()
+                .is_empty(),
+        );
+    }
+
+    /// End-to-end through `dispatch_vm_http_head_and_body`: the
+    /// `parse_plan_reviews_target` wire-up in `mod.rs` is exercised
+    /// (URL → handler → audit row), and the per-route body cap admits
+    /// a normally-sized request.
+    #[tokio::test]
+    async fn plan_review_full_dispatch_records_audit() {
+        let github = MockServer::start().await;
+        let state = make_broker_state(&github);
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+        open_audit_session(&state, session.session_id());
+        let planner_run = record_planner_run(&state, session.session_id());
+        let plan_id = submit_plan_for_run(&state, planner_run, "# Plan via dispatch");
+        let reviewer = record_reviewer_run(&state, session.session_id(), plan_id);
+        let service = plan_service_for_test(&state);
+
+        let bearer_auth = bearer(token().as_str());
+        let body =
+            review_submission_body(reviewer, crate::agent_plan::Verdict::Approve, Some("LGTM"));
+        let content_length = body.len().to_string();
+        let target = crate::agent_plan::vm_plan_reviews_path(plan_id);
+        let response = dispatch_vm_http_head_and_body(
+            &session,
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 12345)),
+            "POST",
+            &target,
+            &[
+                ("authorization", bearer_auth.as_str()),
+                ("content-length", content_length.as_str()),
+            ],
+            body,
+            services_with_plans(service),
+            VM_HTTP_READ_TIMEOUT,
+        )
+        .await;
+
+        assert_eq!(response.status, VmHttpStatus::Ok);
+        let created: ReviewCreated = serde_json::from_slice(&response.body).unwrap();
+        let stored = state
+            .audit
+            .get_plan_review(created.review_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.plan_id, plan_id);
+        assert_eq!(stored.agent_run_id, reviewer);
+        assert_eq!(stored.verdict, crate::agent_plan::Verdict::Approve);
+        assert_eq!(stored.feedback.as_ref().map(|f| f.as_str()), Some("LGTM"));
+    }
+
+    /// Regression for the body-limit budget: a maximum-size feedback
+    /// body packed with worst-case JSON-expanding bytes (any control
+    /// byte 0x01..=0x1f expands 6:1 as `\u00XX`) must still be
+    /// admitted. NUL (0x00) is rejected by `PlanFeedback::try_new` at
+    /// the parse boundary, so SOH (0x01) carries the same property.
+    #[tokio::test]
+    async fn plan_review_admits_max_feedback_with_worst_case_json_expansion() {
+        use crate::agent_plan::MAX_PLAN_FEEDBACK_BYTES;
+
+        let github = MockServer::start().await;
+        let state = make_broker_state(&github);
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+        open_audit_session(&state, session.session_id());
+        let planner_run = record_planner_run(&state, session.session_id());
+        let plan_id = submit_plan_for_run(&state, planner_run, "# Plan");
+        let reviewer = record_reviewer_run(&state, session.session_id(), plan_id);
+        let service = plan_service_for_test(&state);
+
+        let raw_feedback = "\u{0001}".repeat(MAX_PLAN_FEEDBACK_BYTES);
+        let body = review_submission_body(
+            reviewer,
+            crate::agent_plan::Verdict::RequestChanges,
+            Some(&raw_feedback),
+        );
+        assert!(
+            body.len() > MAX_PLAN_FEEDBACK_BYTES,
+            "test premise: encoded body must exceed the decoded length",
+        );
+        let bearer_auth = bearer(token().as_str());
+        let content_length = body.len().to_string();
+        let target = crate::agent_plan::vm_plan_reviews_path(plan_id);
+        let response = dispatch_vm_http_head_and_body(
+            &session,
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 12345)),
+            "POST",
+            &target,
+            &[
+                ("authorization", bearer_auth.as_str()),
+                ("content-length", content_length.as_str()),
+            ],
+            body,
+            services_with_plans(service),
+            VM_HTTP_READ_TIMEOUT,
+        )
+        .await;
+
+        assert_eq!(response.status, VmHttpStatus::Ok);
+        let created: ReviewCreated = serde_json::from_slice(&response.body).unwrap();
+        let stored = state
+            .audit
+            .get_plan_review(created.review_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored.feedback.as_ref().map(|f| f.as_str().len()),
+            Some(MAX_PLAN_FEEDBACK_BYTES),
+        );
     }
 }
