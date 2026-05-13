@@ -165,18 +165,23 @@ impl CatFileObjectSource {
         })
     }
 
-    /// Close the child gracefully: drop stdin to signal EOF, then
-    /// `wait()` the cat-file process to completion. Returns the
-    /// exit status as an error if the child exited non-zero.
+    /// Close the child gracefully: drop stdin to signal EOF, wait
+    /// for the leader to exit without reaping, SIGKILL anything
+    /// else in the process group, then reap the leader. Returns
+    /// the exit status as an error if the child exited non-zero.
+    ///
+    /// The waitid-then-killpg-then-wait ordering keeps the leader's
+    /// pid claimed by the leader (un-reaped) while we send
+    /// `killpg`, which is the only way to avoid a pid-recycle race
+    /// where the kernel could reuse the leader's pid for an
+    /// unrelated process group between `wait()` and `killpg`. The
+    /// same pattern is in `clean_git::execute_clean_git`.
     ///
     /// Cancellation safety: from the moment we take ownership of
     /// the child the source's outer [`Drop`] is disarmed (`inner`
     /// is `None`), so a local [`PgidCleanupGuard`] takes over and
     /// SIGKILLs the process group if anything between here and the
-    /// final `disarm()` panics or has its await cancelled. After
-    /// the leader is reaped we then `killpg` to mop up any helper
-    /// that was sharing the group (a wrapper script's children,
-    /// say) before disarming the guard.
+    /// final `disarm()` panics or has its await cancelled.
     pub async fn close(mut self) -> io::Result<()> {
         let pgid = self.pgid;
         let mutex = self
@@ -191,15 +196,17 @@ impl CatFileObjectSource {
         } = mutex.into_inner();
         drop(stdin);
         drop(stdout);
-        let wait_result = child.wait().await;
-        // wait() reaped the leader (or failed). Either way, kill
-        // any helpers still in the group before the guard would
-        // otherwise have to do it. We tolerate ESRCH (group is
-        // already gone) and EPERM (macOS race after the leader is
-        // reaped): both mean there is nothing left to signal.
-        kill_process_group_best_effort(pgid)?;
+
+        // Observe the leader's exit without reaping. While its pid
+        // remains claimed, the pgid is stable, so the subsequent
+        // killpg cannot hit an unrelated recycled group.
+        let observed_exit = wait_for_pid_exit_no_reap(pgid).await?;
+        // Send SIGKILL to the whole group: helpers (if any) die,
+        // and the leader (already exited) is a no-op.
+        kill_process_group_best_effort(pgid, observed_exit)?;
+        // Now it is safe to reap the leader and free its pid.
+        let status = child.wait().await?;
         guard.disarm();
-        let status = wait_result?;
         if !status.success() {
             return Err(io::Error::other(format!(
                 "`git cat-file --batch` exited with non-zero status: {status}"
@@ -252,7 +259,7 @@ impl Drop for PgidCleanupGuard {
     }
 }
 
-fn kill_process_group_best_effort(pgid: libc::pid_t) -> io::Result<()> {
+fn kill_process_group_best_effort(pgid: libc::pid_t, leader_exit_observed: bool) -> io::Result<()> {
     if unsafe { libc::killpg(pgid, libc::SIGKILL) } == 0 {
         return Ok(());
     }
@@ -260,11 +267,49 @@ fn kill_process_group_best_effort(pgid: libc::pid_t) -> io::Result<()> {
     match err.raw_os_error() {
         // No such process group: somebody already cleaned up.
         Some(libc::ESRCH) => Ok(()),
-        // macOS reports EPERM once the leader has been reaped and
-        // no signalable members remain; treat as success.
-        Some(libc::EPERM) => Ok(()),
+        // macOS can report EPERM once the leader has exited and no
+        // signalable members remain. We only accept EPERM if we
+        // have just observed the leader exit via waitid(WNOWAIT) —
+        // otherwise EPERM means something else and we should not
+        // silently swallow it.
+        Some(libc::EPERM) if leader_exit_observed => Ok(()),
         _ => Err(err),
     }
+}
+
+const PID_EXIT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// Poll `waitid(WNOWAIT)` until the given pid is observed in the
+/// exited state without being reaped. Returns once exit is
+/// observed. The caller must keep the [`tokio::process::Child`]
+/// alive (un-`wait`-ed) until this returns so the pid still
+/// belongs to the leader.
+async fn wait_for_pid_exit_no_reap(pid: libc::pid_t) -> io::Result<bool> {
+    loop {
+        if pid_has_exited_without_reaping(pid)? {
+            return Ok(true);
+        }
+        tokio::time::sleep(PID_EXIT_POLL_INTERVAL).await;
+    }
+}
+
+fn pid_has_exited_without_reaping(pid: libc::pid_t) -> io::Result<bool> {
+    use std::mem::MaybeUninit;
+    let mut status = MaybeUninit::<libc::siginfo_t>::zeroed();
+    let result = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            pid as libc::id_t,
+            status.as_mut_ptr(),
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    if result == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    let status = unsafe { status.assume_init() };
+    let observed_pid = unsafe { status.si_pid() };
+    Ok(observed_pid != 0)
 }
 
 impl CatFileObjectSource {
@@ -763,6 +808,16 @@ fn parse_tz_offset(s: &str) -> Result<time::UtcOffset, ParseObjectError> {
             "timezone minutes field in {s:?} is not 2 ASCII digits"
         ))
     })?;
+    // The MM half is a base-60 field; values >= 60 would normalize
+    // into the hours half and silently shift the commit timestamp.
+    // Reject them up front: the staging repo is untrusted, so an
+    // attacker that can choose the timezone string could otherwise
+    // launder a different timestamp through the parser.
+    if minutes >= 60 {
+        return Err(ParseObjectError::MalformedIdentity(format!(
+            "timezone minutes field in {s:?} is not in 00..=59: {minutes}"
+        )));
+    }
     let total = sign * (i32::from(hours) * 3600 + i32::from(minutes) * 60);
     time::UtcOffset::from_whole_seconds(total).map_err(|err| {
         ParseObjectError::MalformedIdentity(format!(
@@ -1040,6 +1095,28 @@ mod tests {
         let identity = parse_identity(bytes).expect("empty-name identity parses");
         assert_eq!(identity.name(), "");
         assert_eq!(identity.email(), "only-email@example.invalid");
+    }
+
+    #[test]
+    fn parse_tz_offset_rejects_minutes_at_or_above_sixty() {
+        // Regression for codex review P2: an attacker-controlled
+        // staging-repo commit could carry e.g. `+1260`, which used
+        // to be silently normalized to 13:00 — laundering a
+        // different commit timestamp through the parser. Now the
+        // MM field is rejected unless it lies in 00..=59.
+        let err = parse_tz_offset("+1260").expect_err("MM=60 must fail");
+        assert!(
+            matches!(err, ParseObjectError::MalformedIdentity(ref msg) if msg.contains("00..=59")),
+            "got: {err:?}"
+        );
+        // Boundary: 59 is still accepted.
+        parse_tz_offset("+1259").expect("MM=59 is valid");
+        // Boundary: 99 is rejected for the same reason.
+        let err = parse_tz_offset("-0099").expect_err("MM=99 must fail");
+        assert!(
+            matches!(err, ParseObjectError::MalformedIdentity(_)),
+            "got: {err:?}"
+        );
     }
 
     #[test]
@@ -1433,6 +1510,66 @@ mod tests {
         );
     }
 
+    /// True iff `pid` has had a fatal signal delivered: either the
+    /// process is fully gone from the process table, or it is a
+    /// zombie awaiting reap.
+    ///
+    /// We can't use `kill(pid, 0) == ESRCH` here: a zombie still has
+    /// a pid-table entry, so `kill(pid, 0)` returns 0 for zombies
+    /// and only flips to ESRCH after the zombie is reaped. In these
+    /// tests the helper is re-parented to init/launchd after the
+    /// wrapper dies, and under heavy parallel test load init/launchd
+    /// can take many seconds to reap — long enough to blow past any
+    /// reasonable polling deadline. What we actually want to assert
+    /// is that the helper received SIGKILL; both "gone" and "zombie"
+    /// satisfy that, so we ask `ps` for the process state directly.
+    fn helper_has_been_killed(pid: libc::pid_t) -> bool {
+        let output = std::process::Command::new("ps")
+            .args(["-p", &pid.to_string(), "-o", "stat="])
+            .output();
+        match output {
+            Ok(o) => {
+                let stat = String::from_utf8_lossy(&o.stdout);
+                let stat = stat.trim();
+                stat.is_empty() || stat.starts_with('Z')
+            }
+            Err(_) => false,
+        }
+    }
+
+    async fn wait_until_helper_killed(pid: libc::pid_t) -> bool {
+        // 30s wall-clock budget: comfortably longer than any plausible
+        // signal-delivery delay even under crushing parallel test
+        // load, but short enough that a genuine bug (kill never
+        // delivered) fails the test promptly.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while std::time::Instant::now() < deadline {
+            if helper_has_been_killed(pid) {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        false
+    }
+
+    /// Poll `helper_pid_file` until the wrapper script has written
+    /// its background-child's pid. Under crushing parallel test load
+    /// on macOS the wrapper's fork/exec can stall for several seconds
+    /// before it gets scheduled, so we use a 30s wall-clock deadline.
+    async fn wait_for_helper_pid(helper_pid_file: &std::path::Path) -> Option<libc::pid_t> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while std::time::Instant::now() < deadline {
+            if let Ok(raw) = std::fs::read_to_string(helper_pid_file) {
+                let trimmed = raw.trim();
+                if !trimmed.is_empty() {
+                    return Some(trimmed.parse().expect("helper pid is integer"));
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        None
+    }
+
     #[tokio::test]
     async fn cat_file_source_drop_kills_process_group() {
         // Regression for codex review P2: dropping the source must
@@ -1461,20 +1598,9 @@ mod tests {
             let _source = CatFileObjectSource::open(tmp.path(), &wrapper)
                 .await
                 .expect("open wrapper");
-            // Wait for the wrapper to fork the helper and write its
-            // pid. Generous deadline to keep CI happy.
-            let mut helper_pid: Option<libc::pid_t> = None;
-            for _ in 0..200 {
-                if let Ok(raw) = std::fs::read_to_string(&helper_pid_file) {
-                    let trimmed = raw.trim();
-                    if !trimmed.is_empty() {
-                        helper_pid = Some(trimmed.parse().expect("helper pid is integer"));
-                        break;
-                    }
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-            }
-            let pid = helper_pid.expect("wrapper recorded helper pid before timeout");
+            let pid = wait_for_helper_pid(&helper_pid_file)
+                .await
+                .expect("wrapper recorded helper pid before timeout");
             // Confirm the helper is alive while the source still
             // exists; otherwise the test is meaningless.
             let alive = unsafe { libc::kill(pid, 0) };
@@ -1488,23 +1614,11 @@ mod tests {
             // `source` goes out of scope here → Drop runs → killpg
         };
 
-        // After Drop, the helper must die. SIGKILL is synchronous
-        // at the kernel level, but the process state visible via
-        // kill(0) can take a tick. Poll briefly.
-        let mut gone = false;
-        for _ in 0..200 {
-            let r = unsafe { libc::kill(helper_pid, 0) };
-            if r == -1 {
-                let errno = std::io::Error::last_os_error().raw_os_error();
-                if errno == Some(libc::ESRCH) {
-                    gone = true;
-                    break;
-                }
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-        }
+        // After Drop, the helper must die. SIGKILL is synchronous at
+        // the kernel level; the helper transitions to zombie state
+        // immediately, and `helper_has_been_killed` accepts that.
         assert!(
-            gone,
+            wait_until_helper_killed(helper_pid).await,
             "helper pid {helper_pid} survived source Drop — process group was not killed"
         );
     }
@@ -1539,18 +1653,9 @@ mod tests {
             .await
             .expect("open wrapper");
 
-        let mut helper_pid: Option<libc::pid_t> = None;
-        for _ in 0..200 {
-            if let Ok(raw) = std::fs::read_to_string(&helper_pid_file) {
-                let trimmed = raw.trim();
-                if !trimmed.is_empty() {
-                    helper_pid = Some(trimmed.parse().expect("integer pid"));
-                    break;
-                }
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-        }
-        let helper_pid = helper_pid.expect("helper pid recorded before timeout");
+        let helper_pid = wait_for_helper_pid(&helper_pid_file)
+            .await
+            .expect("helper pid recorded before timeout");
 
         // `close()` hangs at `child.wait()` because the wrapper
         // ignores stdin EOF. tokio::time::timeout drops the inner
@@ -1564,18 +1669,10 @@ mod tests {
         );
 
         // The local cleanup guard inside close() must have killpg'd
-        // when the future was dropped, so the helper should be gone.
-        let mut gone = false;
-        for _ in 0..200 {
-            let r = unsafe { libc::kill(helper_pid, 0) };
-            if r == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
-                gone = true;
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-        }
+        // when the future was dropped, so the helper should now be
+        // dead (zombie or fully gone — see `helper_has_been_killed`).
         assert!(
-            gone,
+            wait_until_helper_killed(helper_pid).await,
             "helper pid {helper_pid} survived close() cancellation — group cleanup did not run"
         );
     }
