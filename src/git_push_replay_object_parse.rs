@@ -341,10 +341,14 @@ pub(crate) fn parse_tree_object(bytes: &[u8]) -> Result<StagingTree, ParseObject
         validate_tree_entry_name(&path)?;
         // `.gitmodules` is parsed by git as a submodule manifest;
         // `git fsck --strict` requires it to be a regular file. A
-        // symlink/subtree/submodule entry by that name (case
-        // insensitive) would silently subvert that interpretation
-        // downstream, so reject the non-blob shapes here.
-        if path.eq_ignore_ascii_case(".gitmodules")
+        // symlink/subtree/submodule entry by that name — or any of
+        // the protected-name aliases that resolve to `.gitmodules`
+        // on NTFS/HFS (`.GITMODULES.`, `gitmod~1`, …) — would
+        // silently subvert that interpretation when the walker
+        // forwards the entry to GitHub. Reject the non-blob shapes
+        // here using the same alias predicate that
+        // `validate_tree_entry_name` uses for `.git`.
+        if is_dot_gitmodules_protected_alias(&path)
             && !matches!(kind, TreeEntryKind::Blob | TreeEntryKind::Executable)
         {
             return Err(ParseObjectError::MalformedTreeEntry(format!(
@@ -454,7 +458,7 @@ fn validate_tree_entry_name(name: &str) -> Result<(), ParseObjectError> {
             "tree entry name is reserved: {name:?}"
         )));
     }
-    if name.eq_ignore_ascii_case(".git") {
+    if is_dot_git_protected_alias(name) {
         return Err(ParseObjectError::MalformedTreeEntry(format!(
             "tree entry name is reserved (git fsck hasDotgit): {name:?}"
         )));
@@ -465,6 +469,63 @@ fn validate_tree_entry_name(name: &str) -> Result<(), ParseObjectError> {
         )));
     }
     Ok(())
+}
+
+/// True when `name` matches the protected-name family git's
+/// `is_ntfs_dotgit` / HFS check flags as an alias for `.git` on a
+/// case-folding or 8.3-short-name filesystem. We cover the two
+/// shapes `git fsck --strict` actually reports as `hasDotgit`:
+///
+///   1. case-insensitive `.git` followed by zero or more ASCII `.`
+///      / SP characters (trailing dots and spaces are invisible to
+///      NTFS path resolution), and
+///   2. case-insensitive `git~<digits>` — the 8.3 short-name form
+///      auto-generated for `.git` on a Windows filesystem.
+///
+/// Catching only the literal `.git` would let a crafted staging
+/// tree carrying e.g. `.git.` or `git~1` pass through to GitHub and
+/// then collide with `.git` on a Windows checkout.
+fn is_dot_git_protected_alias(name: &str) -> bool {
+    is_protected_alias_for(name, ".git", "git")
+}
+
+/// True when `name` matches the protected-name family git's
+/// `is_ntfs_dotgitmodules` flags as an alias for `.gitmodules`: the
+/// case-insensitive literal with optional trailing dots/spaces, or
+/// the 8.3 short-name form `gitmod~<digits>` (case insensitive).
+fn is_dot_gitmodules_protected_alias(name: &str) -> bool {
+    is_protected_alias_for(name, ".gitmodules", "gitmod")
+}
+
+fn is_protected_alias_for(name: &str, literal: &str, short_prefix: &str) -> bool {
+    // NTFS and FAT silently drop trailing `.` and ` ` when
+    // resolving a path component, so `.git.` and `.git ` both
+    // resolve to `.git` on Windows. Strip those before the
+    // case-insensitive literal compare.
+    let core = name.trim_end_matches(['.', ' ']);
+    if core.eq_ignore_ascii_case(literal) {
+        return true;
+    }
+    // 8.3 short-name shape: <short_prefix><~><digits...>. We do
+    // not require the digit run to be exactly one digit: `~1`
+    // through `~99` are all valid generated short names, and
+    // collisions push the suffix into multi-digit territory.
+    let core_bytes = core.as_bytes();
+    let prefix_bytes = short_prefix.as_bytes();
+    if core_bytes.len() < prefix_bytes.len() + 2 {
+        return false;
+    }
+    for (a, b) in core_bytes[..prefix_bytes.len()].iter().zip(prefix_bytes) {
+        if !a.eq_ignore_ascii_case(b) {
+            return false;
+        }
+    }
+    let rest = &core_bytes[prefix_bytes.len()..];
+    if rest.first() != Some(&b'~') {
+        return false;
+    }
+    let digits = &rest[1..];
+    !digits.is_empty() && digits.iter().all(|b| b.is_ascii_digit())
 }
 
 /// Reverse of [`parse_tree_object`]. Emits each entry in the order
@@ -520,6 +581,19 @@ fn parse_sha(value: &[u8], key: &'static str) -> Result<GitObjectId, ParseObject
     let text = std::str::from_utf8(value).map_err(|_| {
         ParseObjectError::MalformedHeader(format!("`{key}` header value is not ASCII: {value:?}"))
     })?;
+    // Git emits SHAs in commit `tree`/`parent` headers as
+    // lowercase hex. `GitObjectId::new` accepts both cases and
+    // stores the value lowercased; if the parser took that path,
+    // `serialize_commit_object` would re-emit a different commit
+    // object than the staging bytes (uppercase → lowercase in the
+    // header), which is a normalization path that violates the
+    // parser's no-normalization trust boundary. Require lowercase
+    // here so the bytes round-trip exactly.
+    if text.bytes().any(|b| b.is_ascii_uppercase()) {
+        return Err(ParseObjectError::MalformedHeader(format!(
+            "`{key}` header SHA contains uppercase hex (non-canonical): {text:?}"
+        )));
+    }
     GitObjectId::new(text).map_err(|source| ParseObjectError::InvalidHeaderSha { key, source })
 }
 
@@ -977,6 +1051,123 @@ mod tests {
         bytes.extend_from_slice(b"100644 .gitmodules\0");
         bytes.extend_from_slice(&hex_decode(sample_object_id('a').as_str()));
         parse_tree_object(&bytes).expect("blob `.gitmodules` must parse");
+    }
+
+    #[test]
+    fn parse_tree_object_rejects_dot_git_protected_aliases() {
+        // `git fsck --strict` reports `hasDotgit` not just for the
+        // literal `.git` but for every name that resolves to it on
+        // NTFS/HFS: trailing-dot/space forms like `.git.` and `.git `,
+        // and the 8.3 short-name alias `git~<digits>`. A crafted
+        // staging tree carrying such a name passes through to GitHub
+        // and then collides with the working-tree metadata on a
+        // Windows checkout. Reject the full protected-name family at
+        // the parser boundary, not just the exact `.git` literal.
+        for bad in [
+            ".git.", ".GIT.", ".git ", ".git . ", "git~1", "GIT~1", "git~12", "Git~1",
+        ] {
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(b"100644 ");
+            bytes.extend_from_slice(bad.as_bytes());
+            bytes.push(0);
+            bytes.extend_from_slice(&hex_decode(sample_object_id('a').as_str()));
+            let err = parse_tree_object(&bytes).expect_err("protected `.git` alias must reject");
+            assert!(
+                matches!(err, ParseObjectError::MalformedTreeEntry(_)),
+                "got for {bad:?}: {err:?}"
+            );
+        }
+        // Boundary: names that merely *start* with `git` but are not
+        // protected aliases must still parse. `git`, `gitignore`,
+        // `git~`, `git~abc` are not 8.3 short-name forms.
+        for ok in ["git", "gitignore", "git~", "git~abc", "git1"] {
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(b"100644 ");
+            bytes.extend_from_slice(ok.as_bytes());
+            bytes.push(0);
+            bytes.extend_from_slice(&hex_decode(sample_object_id('a').as_str()));
+            parse_tree_object(&bytes).unwrap_or_else(|err| {
+                panic!("non-alias {ok:?} must parse: {err:?}");
+            });
+        }
+    }
+
+    #[test]
+    fn parse_tree_object_rejects_non_blob_dot_gitmodules_aliases() {
+        // The same protected-name family that aliases to `.git`
+        // applies to `.gitmodules` (8.3 short name `gitmod~<digits>`,
+        // trailing-dot/space variants, case insensitive). A
+        // symlink/subtree/submodule entry by any of those names is
+        // rejected by git as a malformed submodule manifest. The
+        // earlier exact-match check missed every alias.
+        let alias_names = [
+            ".gitmodules.",
+            ".GITMODULES.",
+            ".Gitmodules.",
+            ".gitmodules ",
+            "gitmod~1",
+            "GITMOD~1",
+            "gitmod~12",
+        ];
+        for (mode_bytes, label) in [
+            (&b"120000"[..], "symlink"),
+            (&b"40000"[..], "subtree"),
+            (&b"160000"[..], "submodule"),
+        ] {
+            for name in alias_names {
+                let mut bytes = Vec::new();
+                bytes.extend_from_slice(mode_bytes);
+                bytes.extend_from_slice(b" ");
+                bytes.extend_from_slice(name.as_bytes());
+                bytes.push(0);
+                bytes.extend_from_slice(&hex_decode(sample_object_id('a').as_str()));
+                let err = parse_tree_object(&bytes)
+                    .expect_err("non-blob `.gitmodules` alias must reject");
+                assert!(
+                    matches!(err, ParseObjectError::MalformedTreeEntry(_)),
+                    "got for {label} {name:?}: {err:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn parse_commit_object_rejects_uppercase_header_sha() {
+        // `GitObjectId::new` accepts both lowercase and uppercase hex
+        // and stores the value lowercased. That is harmless inside the
+        // VM, but at the parser boundary it is a normalization path:
+        // a crafted commit whose `tree`/`parent` header carries
+        // uppercase hex round-trips through the parser as a *different*
+        // commit (with lowercase hex) and therefore a different SHA.
+        // The walker forwards this different commit to GitHub's
+        // create-commit API. `git fsck` does not directly flag
+        // uppercase SHAs but the no-normalization trust boundary
+        // requires bit-for-bit round-trip, so reject them here.
+        for header in ["tree", "parent"] {
+            let mut header_bytes = Vec::new();
+            header_bytes.extend_from_slice(header.as_bytes());
+            header_bytes.push(b' ');
+            // Uppercase hex with 'A' to ensure the upper-case branch
+            // triggers regardless of `GitObjectId`'s tolerance.
+            header_bytes.extend_from_slice(b"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n");
+            let mut bytes = Vec::new();
+            if header == "tree" {
+                bytes.extend_from_slice(&header_bytes);
+            } else {
+                bytes.extend_from_slice(b"tree aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n");
+                bytes.extend_from_slice(&header_bytes);
+            }
+            bytes.extend_from_slice(b"author Alice <a@x> 0 +0000\n");
+            bytes.extend_from_slice(b"committer Alice <a@x> 0 +0000\n");
+            bytes.push(b'\n');
+            bytes.extend_from_slice(b"msg\n");
+            let err =
+                parse_commit_object(&bytes).expect_err("uppercase header SHA must be rejected");
+            assert!(
+                matches!(err, ParseObjectError::MalformedHeader(_)),
+                "got for {header:?}: {err:?}"
+            );
+        }
     }
 
     #[test]
@@ -1681,13 +1872,15 @@ mod tests {
             let s: String = chars.into_iter().collect();
             if s == "."
                 || s == ".."
-                || s.eq_ignore_ascii_case(".git")
-                || s.eq_ignore_ascii_case(".gitmodules")
+                || is_dot_git_protected_alias(&s)
+                || is_dot_gitmodules_protected_alias(&s)
             {
                 // `.gitmodules` is excluded outright so the random
                 // kind in `arb_staging_tree_entry` cannot pair the
                 // name with a non-blob mode and trip the parser's
-                // kind-aware rejection.
+                // kind-aware rejection. Same predicates the parser
+                // itself uses so the generator never produces an
+                // input the parser rejects.
                 None
             } else {
                 Some(s)
