@@ -73,11 +73,116 @@ pub struct VmAgentRunOutcomeUpload {
     pub stderr: AgentRunStreamUpload,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// Wire shape for `GET /v1/agent-runs/<id>/config`. `read_plan_id` is
+/// always present on the wire — explicitly `null` when the run has no
+/// plan binding, a UUID once bound. A missing key is a wire-contract
+/// violation, not an implicit `None`: a hand-rolled `Deserialize`
+/// (below) enforces this so a broker schema regression or mixed-version
+/// response fails fast instead of silently degrading a plan-bound
+/// execute run into an unplanned one.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct VmAgentRunConfigResponse {
     run_id: AgentRunId,
     prompt: AgentPrompt,
     model: String,
+    /// Stage the broker recorded for this run. The VM-side wrapper
+    /// uses it to decide whether to compose the plan body into the
+    /// prompt before launching the LLM (see
+    /// [`crate::agent_plan::compose_effective_prompt`]).
+    stage: crate::agent_plan::Stage,
+    /// Plan this run is bound to read. Always present on the wire
+    /// (explicitly `null` when the run has no binding). Used together
+    /// with `stage` by the VM-side wrapper to fetch the plan body and
+    /// compose it into the prompt for execute-stage runs.
+    read_plan_id: Option<crate::agent_plan::PlanId>,
+}
+
+const VM_AGENT_RUN_CONFIG_RESPONSE_FIELDS: &[&str] =
+    &["run_id", "prompt", "model", "stage", "read_plan_id"];
+
+#[derive(Deserialize)]
+#[serde(field_identifier, rename_all = "snake_case")]
+enum VmAgentRunConfigResponseField {
+    RunId,
+    Prompt,
+    Model,
+    Stage,
+    ReadPlanId,
+}
+
+struct VmAgentRunConfigResponseVisitor;
+
+impl<'de> serde::de::Visitor<'de> for VmAgentRunConfigResponseVisitor {
+    type Value = VmAgentRunConfigResponse;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("struct VmAgentRunConfigResponse")
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+        use serde::de::Error;
+        let mut run_id: Option<AgentRunId> = None;
+        let mut prompt: Option<AgentPrompt> = None;
+        let mut model: Option<String> = None;
+        let mut stage: Option<crate::agent_plan::Stage> = None;
+        // Outer `Option` tracks key presence; inner `Option` is the
+        // semantic "no plan binding". Kept distinct so a missing key
+        // is reported as a wire-contract violation rather than silently
+        // coerced to `None` (which would let a plan-bound execute run
+        // run unplanned after a broker schema regression).
+        let mut read_plan_id: Option<Option<crate::agent_plan::PlanId>> = None;
+        while let Some(key) = map.next_key::<VmAgentRunConfigResponseField>()? {
+            match key {
+                VmAgentRunConfigResponseField::RunId => {
+                    if run_id.is_some() {
+                        return Err(A::Error::duplicate_field("run_id"));
+                    }
+                    run_id = Some(map.next_value()?);
+                }
+                VmAgentRunConfigResponseField::Prompt => {
+                    if prompt.is_some() {
+                        return Err(A::Error::duplicate_field("prompt"));
+                    }
+                    prompt = Some(map.next_value()?);
+                }
+                VmAgentRunConfigResponseField::Model => {
+                    if model.is_some() {
+                        return Err(A::Error::duplicate_field("model"));
+                    }
+                    model = Some(map.next_value()?);
+                }
+                VmAgentRunConfigResponseField::Stage => {
+                    if stage.is_some() {
+                        return Err(A::Error::duplicate_field("stage"));
+                    }
+                    stage = Some(map.next_value()?);
+                }
+                VmAgentRunConfigResponseField::ReadPlanId => {
+                    if read_plan_id.is_some() {
+                        return Err(A::Error::duplicate_field("read_plan_id"));
+                    }
+                    read_plan_id = Some(map.next_value::<Option<crate::agent_plan::PlanId>>()?);
+                }
+            }
+        }
+        Ok(VmAgentRunConfigResponse {
+            run_id: run_id.ok_or_else(|| A::Error::missing_field("run_id"))?,
+            prompt: prompt.ok_or_else(|| A::Error::missing_field("prompt"))?,
+            model: model.ok_or_else(|| A::Error::missing_field("model"))?,
+            stage: stage.ok_or_else(|| A::Error::missing_field("stage"))?,
+            read_plan_id: read_plan_id.ok_or_else(|| A::Error::missing_field("read_plan_id"))?,
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for VmAgentRunConfigResponse {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_struct(
+            "VmAgentRunConfigResponse",
+            VM_AGENT_RUN_CONFIG_RESPONSE_FIELDS,
+            VmAgentRunConfigResponseVisitor,
+        )
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
@@ -181,11 +286,19 @@ impl<'de> Deserialize<'de> for AgentPrompt {
 }
 
 impl VmAgentRunConfigResponse {
-    pub fn new(run_id: AgentRunId, prompt: AgentPrompt, model: impl Into<String>) -> Self {
+    pub fn new(
+        run_id: AgentRunId,
+        prompt: AgentPrompt,
+        model: impl Into<String>,
+        stage: crate::agent_plan::Stage,
+        read_plan_id: Option<crate::agent_plan::PlanId>,
+    ) -> Self {
         Self {
             run_id,
             prompt,
             model: model.into(),
+            stage,
+            read_plan_id,
         }
     }
 
@@ -201,8 +314,23 @@ impl VmAgentRunConfigResponse {
         &self.model
     }
 
-    pub fn into_parts(self) -> (AgentPrompt, String) {
-        (self.prompt, self.model)
+    pub fn stage(&self) -> crate::agent_plan::Stage {
+        self.stage
+    }
+
+    pub fn read_plan_id(&self) -> Option<crate::agent_plan::PlanId> {
+        self.read_plan_id
+    }
+
+    pub fn into_parts(
+        self,
+    ) -> (
+        AgentPrompt,
+        String,
+        crate::agent_plan::Stage,
+        Option<crate::agent_plan::PlanId>,
+    ) {
+        (self.prompt, self.model, self.stage, self.read_plan_id)
     }
 }
 
@@ -689,6 +817,75 @@ mod tests {
             vm_agent_run_config_path(run_id),
             "/v1/agent-runs/00000000-0000-0000-0000-000000000001/config"
         );
+    }
+
+    #[test]
+    fn vm_agent_run_config_response_rejects_missing_read_plan_id_key() {
+        // A broker schema regression that drops `read_plan_id` from the
+        // wire must fail fast, not silently degrade an execute-stage
+        // run from plan-bound to unplanned. The other required keys
+        // (run_id, prompt, model, stage) get the same treatment so the
+        // contract is symmetric.
+        let json = r#"{
+            "run_id": "00000000-0000-0000-0000-000000000201",
+            "prompt": "hello",
+            "model": "gpt-5.4-mini",
+            "stage": "execute"
+        }"#;
+        let err = serde_json::from_str::<VmAgentRunConfigResponse>(json).unwrap_err();
+        assert!(err.to_string().contains("read_plan_id"), "{err}");
+    }
+
+    #[test]
+    fn vm_agent_run_config_response_accepts_explicit_null_read_plan_id() {
+        // The "no binding" wire value is `null`, distinguishable from
+        // a missing key by the manual Deserialize impl above.
+        let json = r#"{
+            "run_id": "00000000-0000-0000-0000-000000000202",
+            "prompt": "hello",
+            "model": "gpt-5.4-mini",
+            "stage": "execute",
+            "read_plan_id": null
+        }"#;
+        let parsed: VmAgentRunConfigResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.read_plan_id(), None);
+        assert_eq!(parsed.stage(), crate::agent_plan::Stage::Execute);
+    }
+
+    #[test]
+    fn vm_agent_run_config_response_round_trips_with_plan_binding() {
+        let run_id: AgentRunId = "00000000-0000-0000-0000-000000000203".parse().unwrap();
+        let plan_id: crate::agent_plan::PlanId =
+            "00000000-0000-0000-0000-000000000d03".parse().unwrap();
+        let original = VmAgentRunConfigResponse::new(
+            run_id,
+            AgentPrompt::new("feature prompt"),
+            "gpt-5.4-mini",
+            crate::agent_plan::Stage::Execute,
+            Some(plan_id),
+        );
+
+        let wire = serde_json::to_string(&original).unwrap();
+        let roundtripped: VmAgentRunConfigResponse = serde_json::from_str(&wire).unwrap();
+        assert_eq!(roundtripped, original);
+    }
+
+    #[test]
+    fn vm_agent_run_config_response_rejects_duplicate_field() {
+        // The visitor is symmetric: duplicate keys are rejected on
+        // every field, not just `read_plan_id`. This pins the visitor's
+        // contract so a future field addition that forgets the
+        // duplicate-check on its key trips a test.
+        let json = r#"{
+            "run_id": "00000000-0000-0000-0000-000000000204",
+            "prompt": "hello",
+            "model": "gpt-5.4-mini",
+            "stage": "execute",
+            "read_plan_id": null,
+            "read_plan_id": null
+        }"#;
+        let err = serde_json::from_str::<VmAgentRunConfigResponse>(json).unwrap_err();
+        assert!(err.to_string().contains("read_plan_id"), "{err}");
     }
 
     #[cfg(feature = "host")]

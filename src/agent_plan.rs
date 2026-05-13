@@ -677,6 +677,32 @@ pub fn compose_implementer_prompt(
     AgentPrompt::try_new(combined)
 }
 
+/// Returns the prompt the VM-side wrapper should feed the LLM, given
+/// the run's stage and the plan body (when one was fetched). Today
+/// only `(Stage::Execute, Some(body))` is composed via
+/// [`compose_implementer_prompt`]; every other combination passes the
+/// caller's prompt through unchanged. Reviewer composition is
+/// deliberately deferred to slice 6 of
+/// `docs/plans/2026-05-11-agent-plans.md` because the
+/// `# Approved plan` separator does not fit the reviewer's reading.
+///
+/// A run can reach this function with `Stage::Plan` (planner — never
+/// reads a plan) or `Stage::Review` (reviewer — passthrough until
+/// slice 6) or `Stage::Execute` (implementer — composes when bound).
+/// `plan_body` is `Some` exactly when the broker handed back a
+/// `read_plan_id` *and* the writ-vm wrapper successfully fetched the
+/// plan body for it.
+pub fn compose_effective_prompt(
+    feature_prompt: &AgentPrompt,
+    stage: Stage,
+    plan_body: Option<&PlanBody>,
+) -> Result<AgentPrompt, AgentPromptError> {
+    match (stage, plan_body) {
+        (Stage::Execute, Some(body)) => compose_implementer_prompt(feature_prompt, body),
+        _ => Ok(feature_prompt.clone()),
+    }
+}
+
 // --- Route authorisation matrix --------------------------------------
 
 /// One protected route in the plan-related VM HTTP surface (see
@@ -1345,6 +1371,45 @@ mod tests {
         // AgentPromptError formats as "agent prompt is N bytes, ...".
         let msg = err.to_string();
         assert!(msg.contains("exceeding"), "{msg}");
+    }
+
+    #[test]
+    fn compose_effective_prompt_only_composes_for_execute_with_plan_body() {
+        let feature = AgentPrompt::new("Fix the foo widget.");
+        let plan = PlanBody::try_new("# Plan\n\nReplace bar with baz.").unwrap();
+        let composed_expected = compose_implementer_prompt(&feature, &plan).unwrap();
+
+        // Execute + Some(plan) — composes.
+        let composed = compose_effective_prompt(&feature, Stage::Execute, Some(&plan)).unwrap();
+        assert_eq!(composed.as_str(), composed_expected.as_str());
+        assert!(composed.as_str().contains(PLAN_PROMPT_SEPARATOR));
+
+        // Every other (stage, plan_body) pair must pass the prompt
+        // through unchanged. Reviewer-stage composition is slice 6's
+        // problem; planner-stage never carries a plan body.
+        for (stage, body) in [
+            (Stage::Plan, None),
+            (Stage::Plan, Some(&plan)),
+            (Stage::Review, None),
+            (Stage::Review, Some(&plan)),
+            (Stage::Execute, None),
+        ] {
+            let result = compose_effective_prompt(&feature, stage, body).unwrap();
+            assert_eq!(
+                result.as_str(),
+                feature.as_str(),
+                "stage={stage:?} body_is_some={}: expected passthrough",
+                body.is_some(),
+            );
+        }
+    }
+
+    #[test]
+    fn compose_effective_prompt_errors_when_execute_composition_exceeds_limit() {
+        let feature = AgentPrompt::new("x".repeat(crate::agent_run::MAX_AGENT_PROMPT_BYTES));
+        let plan = PlanBody::try_new("p").unwrap();
+        let err = compose_effective_prompt(&feature, Stage::Execute, Some(&plan)).unwrap_err();
+        assert!(err.to_string().contains("exceeding"), "{err}");
     }
 
     // --- Route authorisation matrix -----------------------------------------
