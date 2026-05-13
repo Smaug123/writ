@@ -23,7 +23,11 @@ use crate::core::{
 };
 use crate::process_spawn;
 
-const IPV4_ONLY_PRELAUNCH_SCRIPT: &str = concat!(
+/// Wraps the guest command so the daemon can hold it on the
+/// `/run/writ-agent-vm/start` sentinel while it runs the sandbox probe (and,
+/// for IPv4-only sessions, the guest-IPv6 absence check). Applied whenever a
+/// guest command is configured, regardless of IPv6 isolation mode.
+const GUEST_COMMAND_PRELAUNCH_SCRIPT: &str = concat!(
     "set -eu\n",
     "mkdir -p /run/writ-agent-vm\n",
     "while [ ! -f /run/writ-agent-vm/start ]; do sleep 0.2; done\n",
@@ -670,6 +674,8 @@ impl AgentVmSessionPlan {
             steps.push(AgentVmStartStep::ProbeAndValidateGuestIpv6 {
                 probe_invocation: self.probe_guest_ipv6_invocation(),
             });
+        }
+        if !self.guest_command.is_empty() {
             steps.push(AgentVmStartStep::ProbeAndValidateSandbox {
                 probe_invocation: self.probe_sandbox_invocation(),
             });
@@ -868,11 +874,11 @@ impl AgentVmSessionPlan {
             args.extend(["--env-file".to_string(), env_file.display().to_string()]);
         }
         args.push(self.image.as_str().to_string());
-        if self.ipv6_mode == Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6 {
+        if !self.guest_command.is_empty() {
             args.extend([
                 "sh".to_string(),
                 "-c".to_string(),
-                IPV4_ONLY_PRELAUNCH_SCRIPT.to_string(),
+                GUEST_COMMAND_PRELAUNCH_SCRIPT.to_string(),
                 "writ-agent-vm-prelaunch".to_string(),
             ]);
         }
@@ -3179,7 +3185,7 @@ mod tests {
     #[test]
     fn start_invocations_create_network_then_inspect_then_firewall_then_vm() {
         let invocations = plan(252).start_invocations();
-        assert_eq!(invocations.len(), 4);
+        assert_eq!(invocations.len(), 6);
         assert_eq!(
             invocations[0].args_lossy(),
             [
@@ -3209,6 +3215,80 @@ mod tests {
             vm_args.contains(&"writ-agent-vm-51b8fd0f-6c10-454c-b0e6-7df1d60e2e6d".to_string())
         );
         assert_tmpfs_mounts_present(&vm_args);
+    }
+
+    #[test]
+    fn dual_stack_start_invocations_wrap_guest_command_and_probe_sandbox() {
+        let invocations =
+            plan_with_ipv6_mode(252, Ipv6IsolationMode::DualStackRequired).start_invocations();
+        assert_eq!(invocations.len(), 6);
+
+        let firewall_args = invocations[2].args_lossy();
+        assert_eq!(&firewall_args[0..2], ["writ-agent-vm-pf-helper", "install"]);
+        assert!(firewall_args.contains(&"--ipv6-cidr".to_string()));
+
+        let start_vm_args = invocations[3].args_lossy();
+        assert_eq!(&start_vm_args[0..2], ["run", "--name"]);
+        assert_tmpfs_mounts_present(&start_vm_args);
+        assert!(start_vm_args.contains(&"sh".to_string()));
+        assert!(start_vm_args.contains(&"-c".to_string()));
+        assert!(
+            start_vm_args
+                .iter()
+                .any(|arg| arg.contains("/run/writ-agent-vm/start") && arg.contains("exec \"$@\""))
+        );
+        assert!(start_vm_args.ends_with(&[
+            "writ-agent-vm-prelaunch".into(),
+            "sleep".into(),
+            "600".into()
+        ]));
+
+        assert_eq!(
+            invocations[4].args_lossy(),
+            [
+                "exec",
+                "writ-agent-vm-51b8fd0f-6c10-454c-b0e6-7df1d60e2e6d",
+                "writ-vm",
+                "sandbox",
+                "check",
+            ]
+        );
+        assert_eq!(
+            invocations[5].args_lossy(),
+            [
+                "exec",
+                "writ-agent-vm-51b8fd0f-6c10-454c-b0e6-7df1d60e2e6d",
+                "sh",
+                "-c",
+                "mkdir -p /run/writ-agent-vm && touch /run/writ-agent-vm/start",
+            ]
+        );
+    }
+
+    #[test]
+    fn dual_stack_start_invocations_without_guest_command_skip_prelaunch_and_probes() {
+        let plan = AgentVmSessionPlan::new(
+            session_id(),
+            pool(),
+            252,
+            ports(),
+            BrokerPortRange::new(49152, 65535).unwrap(),
+            Ipv6IsolationMode::DualStackRequired,
+            ContainerImage::new("alpine:latest").unwrap(),
+            Vec::new(),
+            AgentVmResources::new(1, 512).unwrap(),
+            AgentVmToolPaths::new("container", "writ-agent-vm-pf-helper", "sudo"),
+        )
+        .unwrap();
+        let invocations = plan.start_invocations();
+        assert_eq!(invocations.len(), 4);
+        let vm_args = invocations[3].args_lossy();
+        assert!(!vm_args.contains(&"writ-agent-vm-prelaunch".to_string()));
+        assert!(
+            !vm_args
+                .iter()
+                .any(|arg| arg.contains("/run/writ-agent-vm/start"))
+        );
     }
 
     #[test]
