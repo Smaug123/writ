@@ -1,9 +1,11 @@
-//! Plan VM HTTP routes. Two endpoints today, both served from this
+//! Plan VM HTTP routes. Three endpoints today, all served from this
 //! module:
 //!
 //! - `POST /v1/plans` — a planner submits a plan body.
 //! - `GET  /v1/plans/<plan_id>` — a reviewer or implementer reads the
 //!   plan body, decision (when set), and originating-run id.
+//! - `POST /v1/plans/<plan_id>/addenda` — an executor posts a
+//!   follow-up addendum body against an already-accepted plan.
 //!
 //! Submission runs two gates before the audit write:
 //!
@@ -33,16 +35,27 @@
 //!    implicit acceptance, so an implementer cannot pull the plan
 //!    body until an operator has signed off via `writ plan decide
 //!    --accept`.
+//!
+//! The addendum route mirrors the read route's session-based shape —
+//! the request body carries no `agent_run_id`, so the run is looked
+//! up via `agent_run_for_session(calling_session)`. After that the
+//! gates are the same set as `ReadPlan` (session→run, binding,
+//! stage+decision via [`route_permitted_by_stage_and_decision`] with
+//! [`PlanRouteAction::SubmitAddendum`]), and unlike `SubmitReview`
+//! both `StageNotPermitted` *and* `DecisionNotAccepted` are
+//! meaningful 403 outcomes from the pure gate: addenda are
+//! execute-stage only and only against an Accepted plan.
 
 use std::sync::Arc;
 
 use crate::agent_plan::{
-    DecisionView, PlanCreated, PlanId, PlanRouteAction, PlanRouteAuthError, PlanSubmission,
-    PlanView, ReviewCreated, ReviewId, ReviewSubmission, VM_PLANS_PATH_PREFIX,
-    route_permitted_by_stage_and_decision,
+    AddendumCreated, AddendumId, AddendumSubmission, DecisionView, PlanCreated, PlanId,
+    PlanRouteAction, PlanRouteAuthError, PlanSubmission, PlanView, ReviewCreated, ReviewId,
+    ReviewSubmission, VM_PLANS_PATH_PREFIX, route_permitted_by_stage_and_decision,
 };
 use crate::audit::{
-    AUDIT_WRITE_FAILURE_TARGET, AuditError, PlanReviewRecord, PlanSubmissionRecord,
+    AUDIT_WRITE_FAILURE_TARGET, AuditError, PlanAddendumRecord, PlanReviewRecord,
+    PlanSubmissionRecord,
 };
 use crate::core::UnixMillis;
 use crate::secret::SecretStore;
@@ -101,6 +114,21 @@ pub(super) fn parse_plan_reviews_target(target: &str) -> Option<PlanId> {
         .strip_prefix(VM_PLANS_PATH_PREFIX)?
         .strip_prefix('/')?;
     let raw_id = suffix.strip_suffix("/reviews")?;
+    if raw_id.contains('/') {
+        return None;
+    }
+    raw_id.parse().ok()
+}
+
+/// `/v1/plans/<plan_id>/addenda`. Returns the parsed `plan_id` when
+/// the target names the addenda sub-collection of exactly one plan.
+/// Same shape as [`parse_plan_reviews_target`]: trailing path segments
+/// are rejected so callers cannot walk past the route.
+pub(super) fn parse_plan_addenda_target(target: &str) -> Option<PlanId> {
+    let suffix = target
+        .strip_prefix(VM_PLANS_PATH_PREFIX)?
+        .strip_prefix('/')?;
+    let raw_id = suffix.strip_suffix("/addenda")?;
     if raw_id.contains('/') {
         return None;
     }
@@ -263,6 +291,19 @@ pub(super) async fn route_plan_reviews_request<S: SecretStore + Send + Sync + 's
         return VmHttpResponse::text(VmHttpStatus::MethodNotAllowed, "method not allowed");
     }
     handle_plan_review_submission(session, body, plan_id, service).await
+}
+
+pub(super) async fn route_plan_addenda_request<S: SecretStore + Send + Sync + 'static>(
+    session: &VmHttpSession,
+    request: &VmHttpRequest,
+    body: Vec<u8>,
+    plan_id: PlanId,
+    service: VmHttpPlanService<S>,
+) -> VmHttpResponse {
+    if request.method != "POST" {
+        return VmHttpResponse::text(VmHttpStatus::MethodNotAllowed, "method not allowed");
+    }
+    handle_plan_addendum_submission(session, body, plan_id, service).await
 }
 
 async fn handle_plan_submission<S: SecretStore + Send + Sync + 'static>(
@@ -514,6 +555,142 @@ async fn handle_plan_review_submission<S: SecretStore + Send + Sync + 'static>(
                 run_id = %submission.agent_run_id,
                 plan_id = %plan_id,
                 review_id = %review_id,
+                error = %err,
+                "audit write failed",
+            );
+            VmHttpResponse::text(VmHttpStatus::InternalServerError, "audit write failed")
+        }
+    }
+}
+
+async fn handle_plan_addendum_submission<S: SecretStore + Send + Sync + 'static>(
+    session: &VmHttpSession,
+    body: Vec<u8>,
+    plan_id: PlanId,
+    service: VmHttpPlanService<S>,
+) -> VmHttpResponse {
+    let submission = match serde_json::from_slice::<AddendumSubmission>(&body) {
+        Ok(submission) => submission,
+        Err(err) => {
+            return VmHttpResponse::text(
+                VmHttpStatus::BadRequest,
+                format!("invalid addendum submission: {err}"),
+            );
+        }
+    };
+    drop(body);
+
+    let audit = &service.broker_state.audit;
+    let calling_session = session.session_id();
+
+    // The request body carries no `agent_run_id`, so the run is
+    // looked up from the bearer's session. This matches the read
+    // route's shape.
+    let run = match audit.agent_run_for_session(calling_session) {
+        Ok(Some(run)) => run,
+        Ok(None) => {
+            return VmHttpResponse::text(
+                VmHttpStatus::Unauthorized,
+                "no agent run on this session",
+            );
+        }
+        Err(err) => {
+            tracing::error!(
+                target: AUDIT_WRITE_FAILURE_TARGET,
+                kind = "plan_addendum_run_lookup",
+                plan_id = %plan_id,
+                session_id = %calling_session,
+                error = %err,
+                "audit read failed",
+            );
+            return VmHttpResponse::text(VmHttpStatus::InternalServerError, "audit read failed");
+        }
+    };
+
+    // Binding gate before the stage gate, mirroring the read route:
+    // do not leak which stages may post addenda to a caller whose run
+    // is not bound to this plan. The 401 (not 403) matches the read
+    // route's "authenticated but not the run bound to this plan."
+    if run.read_plan_id != Some(plan_id) {
+        return VmHttpResponse::text(
+            VmHttpStatus::Unauthorized,
+            "agent run is not bound to this plan",
+        );
+    }
+
+    // Fetch the decision so the pure stage+decision gate can return
+    // `DecisionNotAccepted` cleanly for an execute-stage run whose
+    // plan has not been accepted.
+    let decision_record = match audit.get_plan_decision(plan_id) {
+        Ok(opt) => opt,
+        Err(err) => {
+            tracing::error!(
+                target: AUDIT_WRITE_FAILURE_TARGET,
+                kind = "plan_addendum_decision_lookup",
+                plan_id = %plan_id,
+                error = %err,
+                "audit read failed",
+            );
+            return VmHttpResponse::text(VmHttpStatus::InternalServerError, "audit read failed");
+        }
+    };
+    let decision_for_gate = decision_record.as_ref().map(|r| r.outcome);
+
+    // Unlike `SubmitPlan`/`SubmitReview`, `SubmitAddendum` legitimately
+    // consults both gate branches: `Execute` is the only admitted
+    // stage, and a non-Accepted decision is a real 403 outcome.
+    if let Err(err) = route_permitted_by_stage_and_decision(
+        PlanRouteAction::SubmitAddendum,
+        run.stage,
+        decision_for_gate,
+    ) {
+        match err {
+            PlanRouteAuthError::StageNotPermitted { .. }
+            | PlanRouteAuthError::DecisionNotAccepted { .. } => {
+                return VmHttpResponse::text(VmHttpStatus::Forbidden, err.to_string());
+            }
+        }
+    }
+
+    let addendum_id = AddendumId::new();
+    let record = PlanAddendumRecord {
+        addendum_id,
+        plan_id,
+        agent_run_id: run.run_id,
+        submitted_at: UnixMillis::now(),
+        body: submission.body,
+    };
+    match audit.record_plan_addendum(&record) {
+        Ok(()) => VmHttpResponse::json(VmHttpStatus::Ok, &AddendumCreated { addendum_id }),
+        Err(AuditError::Invariant("agent run does not exist")) => {
+            // Run vanished between session→run lookup and the write.
+            VmHttpResponse::text(VmHttpStatus::Gone, "agent run no longer exists")
+        }
+        Err(AuditError::Invariant("session is closed")) => {
+            VmHttpResponse::text(VmHttpStatus::Gone, "session is closed")
+        }
+        Err(AuditError::Invariant("plan does not exist")) => {
+            // The binding gate above requires
+            // `run.read_plan_id = Some(plan_id)` which is FK-checked
+            // against `plan`, so reaching here means the plan row
+            // was deleted in the race window.
+            VmHttpResponse::text(VmHttpStatus::Gone, "plan no longer exists")
+        }
+        Err(AuditError::Sqlite(err)) if err.to_string().to_uppercase().contains("UNIQUE") => {
+            // `UNIQUE(agent_run_id)` on `plan_addendum`: one addendum
+            // per executor run.
+            VmHttpResponse::text(
+                VmHttpStatus::Conflict,
+                "addendum already recorded for this run",
+            )
+        }
+        Err(err) => {
+            tracing::error!(
+                target: AUDIT_WRITE_FAILURE_TARGET,
+                kind = "plan_addendum",
+                run_id = %run.run_id,
+                plan_id = %plan_id,
+                addendum_id = %addendum_id,
                 error = %err,
                 "audit write failed",
             );
@@ -1998,6 +2175,595 @@ mod tests {
         assert_eq!(stored.agent_run_id, reviewer);
         assert_eq!(stored.verdict, crate::agent_plan::Verdict::Approve);
         assert_eq!(stored.feedback.as_ref().map(|f| f.as_str()), Some("LGTM"));
+    }
+
+    // --- POST /v1/plans/<plan_id>/addenda ---------------------------
+
+    /// Fixture: land an `Accepted` decision on `plan_id` from `decider`.
+    /// Addendum tests need this because the route's stage+decision gate
+    /// only admits execute-stage runs against accepted plans.
+    fn record_accepted_decision(
+        state: &BrokerState<Box<dyn SecretStore>>,
+        plan_id: PlanId,
+        decider: &str,
+    ) {
+        use crate::agent_plan::{Decider, DecisionOutcome};
+        use crate::audit::PlanDecisionRecord;
+        state
+            .audit
+            .record_plan_decision(&PlanDecisionRecord {
+                plan_id,
+                decided_at: UnixMillis::now(),
+                outcome: DecisionOutcome::Accepted,
+                decider: Decider::try_new(decider).unwrap(),
+            })
+            .unwrap();
+    }
+
+    /// Fixture: create an executor (execute-stage) run on `session_id`
+    /// bound to `plan_id` via `read_plan_id`.
+    fn record_executor_run(
+        state: &BrokerState<Box<dyn SecretStore>>,
+        session_id: SessionId,
+        plan_id: PlanId,
+    ) -> AgentRunId {
+        record_run_at_stage_with_read_plan(
+            state,
+            session_id,
+            crate::agent_plan::Stage::Execute,
+            Some(plan_id),
+        )
+    }
+
+    fn addendum_submission_body(body: &str) -> Vec<u8> {
+        serde_json::to_vec(&crate::agent_plan::AddendumSubmission {
+            body: PlanBody::try_new(body).unwrap(),
+        })
+        .unwrap()
+    }
+
+    /// Fixture: set up an Accepted plan on a *separate* planner
+    /// session, so the calling session can be reserved for the run
+    /// under test. `agent_run_for_session` returns the most-recent
+    /// run on a session, so addendum tests that put the planner and
+    /// the executor on the same session can race when the two
+    /// `requested_at` timestamps land in the same millisecond. The
+    /// separate-session pattern is the same one used by the read-route
+    /// tests via `record_plan_via_separate_planner`.
+    fn setup_accepted_plan_on_separate_session(
+        state: &BrokerState<Box<dyn SecretStore>>,
+        planner_session_id: SessionId,
+        plan_body: &str,
+    ) -> PlanId {
+        open_session_for(state, planner_session_id);
+        let planner_run = record_planner_run(state, planner_session_id);
+        let plan_id = submit_plan_for_run(state, planner_run, plan_body);
+        record_accepted_decision(state, plan_id, "operator-1");
+        plan_id
+    }
+
+    /// `parse_plan_addenda_target` is the URL-shape gate for the
+    /// addenda route. Mirrors `parse_plan_reviews_target_*`.
+    #[test]
+    fn parse_plan_addenda_target_accepts_well_formed_and_rejects_others() {
+        let plan_id = PlanId::new();
+        let ok = format!("/v1/plans/{plan_id}/addenda");
+        assert_eq!(parse_plan_addenda_target(&ok), Some(plan_id));
+
+        // Missing `/addenda` suffix.
+        let bare = format!("/v1/plans/{plan_id}");
+        assert_eq!(parse_plan_addenda_target(&bare), None);
+
+        // Extra segment after `/addenda`.
+        let deeper = format!("/v1/plans/{plan_id}/addenda/extra");
+        assert_eq!(parse_plan_addenda_target(&deeper), None);
+
+        // Slash inside the id segment.
+        let with_slash = format!("/v1/plans/a/{plan_id}/addenda");
+        assert_eq!(parse_plan_addenda_target(&with_slash), None);
+
+        // Not a UUID.
+        assert_eq!(
+            parse_plan_addenda_target("/v1/plans/not-a-uuid/addenda"),
+            None
+        );
+
+        // Wrong prefix.
+        assert_eq!(parse_plan_addenda_target("/plans/x/addenda"), None);
+
+        // Just the collection — must not match the addenda parser.
+        assert_eq!(parse_plan_addenda_target("/v1/plans"), None);
+
+        // The reviews sub-route is not the addenda sub-route.
+        let reviews = format!("/v1/plans/{plan_id}/reviews");
+        assert_eq!(parse_plan_addenda_target(&reviews), None);
+    }
+
+    /// With `services.plans = None`, the addenda route is dark: all
+    /// methods return 404. Mirrors
+    /// `disabled_plan_reviews_route_is_not_found_for_all_methods`.
+    #[tokio::test]
+    async fn disabled_plan_addenda_route_is_not_found_for_all_methods() {
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(10, 1, 2, 0), 24).unwrap());
+        let peer = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(10, 1, 2, 3), 12345));
+        let target = crate::agent_plan::vm_plan_addenda_path(PlanId::new());
+
+        for method in ["GET", "POST", "PUT", "DELETE"] {
+            let request = VmHttpRequest::new(method, &target, Some(bearer(token().as_str())), peer);
+            let response =
+                route_authenticated_vm_http_request(&session, &request, Vec::new(), no_services())
+                    .await
+                    .into_buffered();
+
+            assert_eq!(response.status, VmHttpStatus::NotFound);
+        }
+    }
+
+    #[tokio::test]
+    async fn enabled_plan_addenda_route_rejects_non_post_methods() {
+        let github = MockServer::start().await;
+        let state = make_broker_state(&github);
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+        let service = plan_service_for_test(&state);
+        let target = crate::agent_plan::vm_plan_addenda_path(PlanId::new());
+        let request = VmHttpRequest::new(
+            "GET",
+            &target,
+            Some(bearer(token().as_str())),
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 12345)),
+        );
+
+        let response = route_authenticated_vm_http_request(
+            &session,
+            &request,
+            Vec::new(),
+            services_with_plans(service),
+        )
+        .await
+        .into_buffered();
+
+        assert_eq!(response.status, VmHttpStatus::MethodNotAllowed);
+    }
+
+    #[tokio::test]
+    async fn plan_addendum_rejects_malformed_body_without_audit() {
+        let github = MockServer::start().await;
+        let state = make_broker_state(&github);
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+        open_audit_session(&state, session.session_id());
+        let planner_session_id: SessionId = "82ab0bb1-7c12-4a4e-9f51-6d3d7702bbb1".parse().unwrap();
+        let plan_id = setup_accepted_plan_on_separate_session(&state, planner_session_id, "# Plan");
+        let _executor = record_executor_run(&state, session.session_id(), plan_id);
+        let service = plan_service_for_test(&state);
+
+        let response =
+            handle_plan_addendum_submission(&session, b"not json".to_vec(), plan_id, service).await;
+
+        assert_eq!(response.status, VmHttpStatus::BadRequest);
+        assert!(
+            state
+                .audit
+                .list_plan_addenda_for_plan(plan_id)
+                .unwrap()
+                .is_empty(),
+        );
+    }
+
+    /// A bearer session with no `agent_run` row cannot post an
+    /// addendum. 401 mirrors the read-route shape (no body-named run
+    /// to disambiguate against).
+    #[tokio::test]
+    async fn plan_addendum_session_with_no_run_is_unauthorized() {
+        let github = MockServer::start().await;
+        let state = make_broker_state(&github);
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+        open_audit_session(&state, session.session_id());
+        // Set up a plan on a separate planner session so the URL is
+        // shaped correctly but the calling session has no run.
+        let other_session_id: SessionId = "82ab0bb1-7c12-4a4e-9f51-6d3d7702aaaa".parse().unwrap();
+        open_session_for(&state, other_session_id);
+        let planner_run = record_planner_run(&state, other_session_id);
+        let plan_id = submit_plan_for_run(&state, planner_run, "# Plan");
+        record_accepted_decision(&state, plan_id, "operator-1");
+        let service = plan_service_for_test(&state);
+
+        let body = addendum_submission_body("# Addendum");
+        let response = handle_plan_addendum_submission(&session, body, plan_id, service).await;
+
+        assert_eq!(response.status, VmHttpStatus::Unauthorized);
+        assert!(
+            state
+                .audit
+                .list_plan_addenda_for_plan(plan_id)
+                .unwrap()
+                .is_empty(),
+        );
+    }
+
+    /// An execute-stage run bound to plan A cannot post an addendum
+    /// against plan B. Binding gate returns 401 (matching the read
+    /// route's choice for the same gate).
+    #[tokio::test]
+    async fn plan_addendum_rejects_run_bound_to_different_plan() {
+        let github = MockServer::start().await;
+        let state = make_broker_state(&github);
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+        open_audit_session(&state, session.session_id());
+        let planner_session_a: SessionId = "82ab0bb1-7c12-4a4e-9f51-6d3d7702bbb2".parse().unwrap();
+        let planner_session_b: SessionId = "82ab0bb1-7c12-4a4e-9f51-6d3d7702bbb3".parse().unwrap();
+        let plan_a = setup_accepted_plan_on_separate_session(&state, planner_session_a, "# Plan A");
+        let plan_b = setup_accepted_plan_on_separate_session(&state, planner_session_b, "# Plan B");
+        let _executor_of_a = record_executor_run(&state, session.session_id(), plan_a);
+        let service = plan_service_for_test(&state);
+
+        let body = addendum_submission_body("# Addendum");
+        let response = handle_plan_addendum_submission(&session, body, plan_b, service).await;
+
+        assert_eq!(response.status, VmHttpStatus::Unauthorized);
+        let message = std::str::from_utf8(&response.body).unwrap();
+        assert!(message.contains("not bound"), "unexpected body: {message}",);
+        assert!(
+            state
+                .audit
+                .list_plan_addenda_for_plan(plan_a)
+                .unwrap()
+                .is_empty(),
+        );
+        assert!(
+            state
+                .audit
+                .list_plan_addenda_for_plan(plan_b)
+                .unwrap()
+                .is_empty(),
+        );
+    }
+
+    /// A run at the right stage but with `read_plan_id = NULL` cannot
+    /// post an addendum — the binding gate requires a Some match.
+    #[tokio::test]
+    async fn plan_addendum_rejects_executor_without_read_plan_id() {
+        let github = MockServer::start().await;
+        let state = make_broker_state(&github);
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+        open_audit_session(&state, session.session_id());
+        let planner_session_id: SessionId = "82ab0bb1-7c12-4a4e-9f51-6d3d7702bbb4".parse().unwrap();
+        let plan_id = setup_accepted_plan_on_separate_session(&state, planner_session_id, "# Plan");
+        let _unbound_executor = record_run_at_stage(
+            &state,
+            session.session_id(),
+            crate::agent_plan::Stage::Execute,
+        );
+        let service = plan_service_for_test(&state);
+
+        let body = addendum_submission_body("# Addendum");
+        let response = handle_plan_addendum_submission(&session, body, plan_id, service).await;
+
+        assert_eq!(response.status, VmHttpStatus::Unauthorized);
+        assert!(
+            state
+                .audit
+                .list_plan_addenda_for_plan(plan_id)
+                .unwrap()
+                .is_empty(),
+        );
+    }
+
+    /// A reviewer-stage run bound to the right plan is rejected by the
+    /// stage gate with 403. Distinguishes the "wrong stage" outcome
+    /// from the 401 binding-mismatch path.
+    #[tokio::test]
+    async fn plan_addendum_rejects_non_execute_stage_run() {
+        let github = MockServer::start().await;
+        let state = make_broker_state(&github);
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+        open_audit_session(&state, session.session_id());
+        let planner_session_id: SessionId = "82ab0bb1-7c12-4a4e-9f51-6d3d7702bbb5".parse().unwrap();
+        let plan_id = setup_accepted_plan_on_separate_session(&state, planner_session_id, "# Plan");
+        // A reviewer bound to the plan — stage gate must reject before
+        // the audit write.
+        let _reviewer = record_reviewer_run(&state, session.session_id(), plan_id);
+        let service = plan_service_for_test(&state);
+
+        let body = addendum_submission_body("# Addendum");
+        let response = handle_plan_addendum_submission(&session, body, plan_id, service).await;
+
+        assert_eq!(response.status, VmHttpStatus::Forbidden);
+        let message = std::str::from_utf8(&response.body).unwrap();
+        assert!(
+            message.contains("submit_addendum"),
+            "unexpected body: {message}",
+        );
+        assert!(
+            state
+                .audit
+                .list_plan_addenda_for_plan(plan_id)
+                .unwrap()
+                .is_empty(),
+        );
+    }
+
+    /// An execute-stage run bound to the right plan but with no
+    /// `plan_decision` row is rejected by the stage+decision gate. 403
+    /// `DecisionNotAccepted`, not 401.
+    #[tokio::test]
+    async fn plan_addendum_rejects_when_decision_missing() {
+        let github = MockServer::start().await;
+        let state = make_broker_state(&github);
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+        open_audit_session(&state, session.session_id());
+        // Plan submitted on a separate session, but deliberately no
+        // Accepted decision recorded — gate must reject.
+        let planner_session_id: SessionId = "82ab0bb1-7c12-4a4e-9f51-6d3d7702bbb6".parse().unwrap();
+        open_session_for(&state, planner_session_id);
+        let planner_run = record_planner_run(&state, planner_session_id);
+        let plan_id = submit_plan_for_run(&state, planner_run, "# Plan");
+        let _executor = record_executor_run(&state, session.session_id(), plan_id);
+        let service = plan_service_for_test(&state);
+
+        let body = addendum_submission_body("# Addendum");
+        let response = handle_plan_addendum_submission(&session, body, plan_id, service).await;
+
+        assert_eq!(response.status, VmHttpStatus::Forbidden);
+        let message = std::str::from_utf8(&response.body).unwrap();
+        assert!(
+            message.contains("decision") && message.contains("no decision recorded"),
+            "unexpected body: {message}",
+        );
+        assert!(
+            state
+                .audit
+                .list_plan_addenda_for_plan(plan_id)
+                .unwrap()
+                .is_empty(),
+        );
+    }
+
+    /// An execute-stage run against a plan with a `RejectedRestart`
+    /// decision is rejected by the stage+decision gate. 403 with the
+    /// decision name in the message — same shape as the read route.
+    #[tokio::test]
+    async fn plan_addendum_rejects_when_decision_not_accepted() {
+        use crate::agent_plan::{Decider, DecisionOutcome};
+        use crate::audit::PlanDecisionRecord;
+
+        let github = MockServer::start().await;
+        let state = make_broker_state(&github);
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+        open_audit_session(&state, session.session_id());
+        let planner_session_id: SessionId = "82ab0bb1-7c12-4a4e-9f51-6d3d7702bbb7".parse().unwrap();
+        open_session_for(&state, planner_session_id);
+        let planner_run = record_planner_run(&state, planner_session_id);
+        let plan_id = submit_plan_for_run(&state, planner_run, "# Plan");
+        state
+            .audit
+            .record_plan_decision(&PlanDecisionRecord {
+                plan_id,
+                decided_at: UnixMillis::now(),
+                outcome: DecisionOutcome::RejectedRestart,
+                decider: Decider::try_new("operator-1").unwrap(),
+            })
+            .unwrap();
+        let _executor = record_executor_run(&state, session.session_id(), plan_id);
+        let service = plan_service_for_test(&state);
+
+        let body = addendum_submission_body("# Addendum");
+        let response = handle_plan_addendum_submission(&session, body, plan_id, service).await;
+
+        assert_eq!(response.status, VmHttpStatus::Forbidden);
+        let message = std::str::from_utf8(&response.body).unwrap();
+        assert!(
+            message.contains("decision") && message.contains("rejected_restart"),
+            "unexpected body: {message}",
+        );
+        assert!(
+            state
+                .audit
+                .list_plan_addenda_for_plan(plan_id)
+                .unwrap()
+                .is_empty(),
+        );
+    }
+
+    /// Happy path: an execute-stage run bound to an accepted plan
+    /// posts an addendum. 200 with `AddendumCreated`; the audit row
+    /// reflects the run/plan binding and the same `addendum_id`.
+    #[tokio::test]
+    async fn plan_addendum_records_audit_row_and_returns_addendum_id() {
+        let github = MockServer::start().await;
+        let state = make_broker_state(&github);
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+        open_audit_session(&state, session.session_id());
+        let planner_session_id: SessionId = "82ab0bb1-7c12-4a4e-9f51-6d3d7702bbb8".parse().unwrap();
+        let plan_id = setup_accepted_plan_on_separate_session(&state, planner_session_id, "# Plan");
+        let executor = record_executor_run(&state, session.session_id(), plan_id);
+        let service = plan_service_for_test(&state);
+
+        let body = addendum_submission_body("# First addendum body");
+        let response = handle_plan_addendum_submission(&session, body, plan_id, service).await;
+
+        assert_eq!(response.status, VmHttpStatus::Ok);
+        let created: AddendumCreated = serde_json::from_slice(&response.body).unwrap();
+        let stored = state
+            .audit
+            .get_plan_addendum(created.addendum_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.addendum_id, created.addendum_id);
+        assert_eq!(stored.plan_id, plan_id);
+        assert_eq!(stored.agent_run_id, executor);
+        assert_eq!(stored.body.as_str(), "# First addendum body");
+    }
+
+    /// Two addenda from the same executor run are forbidden by
+    /// `UNIQUE(agent_run_id)` on `plan_addendum`. The second attempt
+    /// returns 409 and leaves only the first row in place.
+    #[tokio::test]
+    async fn plan_addendum_rejects_second_addendum_for_same_run() {
+        let github = MockServer::start().await;
+        let state = make_broker_state(&github);
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+        open_audit_session(&state, session.session_id());
+        let planner_session_id: SessionId = "82ab0bb1-7c12-4a4e-9f51-6d3d7702bbb9".parse().unwrap();
+        let plan_id = setup_accepted_plan_on_separate_session(&state, planner_session_id, "# Plan");
+        let _executor = record_executor_run(&state, session.session_id(), plan_id);
+
+        let first = handle_plan_addendum_submission(
+            &session,
+            addendum_submission_body("# First"),
+            plan_id,
+            plan_service_for_test(&state),
+        )
+        .await;
+        assert_eq!(first.status, VmHttpStatus::Ok);
+
+        let second = handle_plan_addendum_submission(
+            &session,
+            addendum_submission_body("# Second"),
+            plan_id,
+            plan_service_for_test(&state),
+        )
+        .await;
+        assert_eq!(second.status, VmHttpStatus::Conflict);
+
+        let rows = state.audit.list_plan_addenda_for_plan(plan_id).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].body.as_str(), "# First");
+    }
+
+    /// Closing the session between setup and the addendum write
+    /// surfaces as 410 Gone (matching the review/submission shape for
+    /// the same audit invariant).
+    #[tokio::test]
+    async fn plan_addendum_closed_session_returns_gone() {
+        let github = MockServer::start().await;
+        let state = make_broker_state(&github);
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+        open_audit_session(&state, session.session_id());
+        let planner_session_id: SessionId = "82ab0bb1-7c12-4a4e-9f51-6d3d7702bbba".parse().unwrap();
+        let plan_id = setup_accepted_plan_on_separate_session(&state, planner_session_id, "# Plan");
+        let _executor = record_executor_run(&state, session.session_id(), plan_id);
+        state
+            .audit
+            .close_session(session.session_id(), UnixMillis::now())
+            .unwrap();
+        let service = plan_service_for_test(&state);
+
+        let body = addendum_submission_body("# Addendum");
+        let response = handle_plan_addendum_submission(&session, body, plan_id, service).await;
+
+        // The route's session→run lookup happens before the write,
+        // and `agent_run_for_session` returns the run regardless of
+        // the session's closed state — the DAO's "session is closed"
+        // invariant is what we expect to surface here.
+        assert_eq!(response.status, VmHttpStatus::Gone);
+        assert!(
+            state
+                .audit
+                .list_plan_addenda_for_plan(plan_id)
+                .unwrap()
+                .is_empty(),
+        );
+    }
+
+    /// End-to-end through `dispatch_vm_http_head_and_body`: exercises
+    /// the `parse_plan_addenda_target` wire-up and the per-route body
+    /// cap from `mod.rs`. Regression for the URL → handler →
+    /// audit-row path.
+    #[tokio::test]
+    async fn plan_addendum_full_dispatch_records_audit() {
+        let github = MockServer::start().await;
+        let state = make_broker_state(&github);
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+        open_audit_session(&state, session.session_id());
+        let planner_session_id: SessionId = "82ab0bb1-7c12-4a4e-9f51-6d3d7702bbbb".parse().unwrap();
+        let plan_id = setup_accepted_plan_on_separate_session(
+            &state,
+            planner_session_id,
+            "# Plan via dispatch",
+        );
+        let executor = record_executor_run(&state, session.session_id(), plan_id);
+        let service = plan_service_for_test(&state);
+
+        let bearer_auth = bearer(token().as_str());
+        let body = addendum_submission_body("# Dispatch addendum");
+        let content_length = body.len().to_string();
+        let target = crate::agent_plan::vm_plan_addenda_path(plan_id);
+        let response = dispatch_vm_http_head_and_body(
+            &session,
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 12345)),
+            "POST",
+            &target,
+            &[
+                ("authorization", bearer_auth.as_str()),
+                ("content-length", content_length.as_str()),
+            ],
+            body,
+            services_with_plans(service),
+            VM_HTTP_READ_TIMEOUT,
+        )
+        .await;
+
+        assert_eq!(response.status, VmHttpStatus::Ok);
+        let created: AddendumCreated = serde_json::from_slice(&response.body).unwrap();
+        let stored = state
+            .audit
+            .get_plan_addendum(created.addendum_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.plan_id, plan_id);
+        assert_eq!(stored.agent_run_id, executor);
+        assert_eq!(stored.body.as_str(), "# Dispatch addendum");
+    }
+
+    /// Body-limit budget regression for the addenda route: a
+    /// maximum-size addendum body packed with worst-case
+    /// JSON-expanding bytes (any control byte 0x01..=0x1f expands 6:1
+    /// as `\u00XX`) must still be admitted.
+    #[tokio::test]
+    async fn plan_addendum_admits_max_body_with_worst_case_json_expansion() {
+        use crate::agent_plan::MAX_PLAN_BODY_BYTES;
+
+        let github = MockServer::start().await;
+        let state = make_broker_state(&github);
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+        open_audit_session(&state, session.session_id());
+        let planner_session_id: SessionId = "82ab0bb1-7c12-4a4e-9f51-6d3d7702bbbc".parse().unwrap();
+        let plan_id = setup_accepted_plan_on_separate_session(&state, planner_session_id, "# Plan");
+        let _executor = record_executor_run(&state, session.session_id(), plan_id);
+        let service = plan_service_for_test(&state);
+
+        let raw_body = "\u{0001}".repeat(MAX_PLAN_BODY_BYTES);
+        let body = addendum_submission_body(&raw_body);
+        assert!(
+            body.len() > MAX_PLAN_BODY_BYTES,
+            "test premise: encoded body must exceed the decoded length",
+        );
+        let bearer_auth = bearer(token().as_str());
+        let content_length = body.len().to_string();
+        let target = crate::agent_plan::vm_plan_addenda_path(plan_id);
+        let response = dispatch_vm_http_head_and_body(
+            &session,
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 12345)),
+            "POST",
+            &target,
+            &[
+                ("authorization", bearer_auth.as_str()),
+                ("content-length", content_length.as_str()),
+            ],
+            body,
+            services_with_plans(service),
+            VM_HTTP_READ_TIMEOUT,
+        )
+        .await;
+
+        assert_eq!(response.status, VmHttpStatus::Ok);
+        let created: AddendumCreated = serde_json::from_slice(&response.body).unwrap();
+        let stored = state
+            .audit
+            .get_plan_addendum(created.addendum_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.body.as_str().len(), MAX_PLAN_BODY_BYTES);
     }
 
     /// Regression for the body-limit budget: a maximum-size feedback
