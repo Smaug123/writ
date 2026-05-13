@@ -18,7 +18,9 @@ use std::sync::Arc;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
-use crate::agent_plan::{CorrelationId, Decider, DecisionOutcome, PlanId};
+use crate::agent_plan::{
+    CorrelationId, Decider, DecisionOutcome, PlanId, check_start_agent_run_binding,
+};
 use crate::agent_vm_daemon::AgentVmDaemon;
 use crate::audit::{
     AUDIT_WRITE_FAILURE_TARGET, AuditLog, GitPushResolution, GitPushResolutionRecord,
@@ -208,42 +210,49 @@ pub async fn dispatch_message_with_agent_vm<S: SecretStore + Send + Sync + 'stat
             stage,
             correlation_id,
             read_plan_id,
-        } => match agent_vm {
-            Some(agent_vm) => {
-                debug_assert!(
-                    prompt.byte_len()
-                        <= u64::try_from(crate::agent_run::MAX_AGENT_PROMPT_BYTES)
-                            .expect("agent prompt byte limit fits in u64"),
-                    "AgentPrompt validates prompt size before dispatch"
-                );
-                match agent_vm
-                    .start_agent_run_session(
-                        Arc::clone(state),
-                        label,
-                        agent_kind,
-                        agent_model,
-                        workspace,
-                        prompt,
-                        stage,
-                        correlation_id,
-                        read_plan_id,
-                    )
-                    .await
-                {
-                    Ok(started) => ServerMessage::AgentRunStarted {
-                        session_id: started.session_id(),
-                        run_id: started.run_id(),
-                        broker_url: started.broker_url().to_string(),
-                    },
-                    Err(err) => ServerMessage::Error {
-                        message: err.to_string(),
-                    },
-                }
+        } => {
+            if let Err(err) = check_start_agent_run_binding(stage, read_plan_id.is_some()) {
+                return ServerMessage::Error {
+                    message: err.to_string(),
+                };
             }
-            None => ServerMessage::Error {
-                message: "agent VM runtime is not configured".into(),
-            },
-        },
+            match agent_vm {
+                Some(agent_vm) => {
+                    debug_assert!(
+                        prompt.byte_len()
+                            <= u64::try_from(crate::agent_run::MAX_AGENT_PROMPT_BYTES)
+                                .expect("agent prompt byte limit fits in u64"),
+                        "AgentPrompt validates prompt size before dispatch"
+                    );
+                    match agent_vm
+                        .start_agent_run_session(
+                            Arc::clone(state),
+                            label,
+                            agent_kind,
+                            agent_model,
+                            workspace,
+                            prompt,
+                            stage,
+                            correlation_id,
+                            read_plan_id,
+                        )
+                        .await
+                    {
+                        Ok(started) => ServerMessage::AgentRunStarted {
+                            session_id: started.session_id(),
+                            run_id: started.run_id(),
+                            broker_url: started.broker_url().to_string(),
+                        },
+                        Err(err) => ServerMessage::Error {
+                            message: err.to_string(),
+                        },
+                    }
+                }
+                None => ServerMessage::Error {
+                    message: "agent VM runtime is not configured".into(),
+                },
+            }
+        }
         ClientMessage::StopAgentVm { session_id } => match agent_vm {
             Some(agent_vm) => match agent_vm.stop_session(state, session_id).await {
                 Ok(()) => ServerMessage::AgentVmStopped,
@@ -1381,6 +1390,90 @@ mod tests {
                 message: "agent VM runtime is not configured".into()
             }
         );
+    }
+
+    /// A `review`-stage `StartAgentRun` with no `read_plan_id` is
+    /// incoherent: every plan route a reviewer needs gates on
+    /// `agent_run.read_plan_id = <plan_id>`, so binding to NULL
+    /// produces a VM that can never satisfy authorisation. The
+    /// broker must refuse before opening any session or audit row.
+    /// The check sits in front of the agent-VM-runtime branch so
+    /// the error surfaces even when no daemon is configured —
+    /// callers learn what is wrong with the request, not what is
+    /// wrong with the broker.
+    #[tokio::test]
+    async fn start_agent_run_review_without_read_plan_id_is_rejected() {
+        let server = MockServer::start().await;
+        let state = make_state(&server, vec![], "o");
+
+        let resp = dispatch_message(
+            ClientMessage::StartAgentRun {
+                label: None,
+                agent_kind: AgentKind::Claude,
+                agent_model: "claude-test".into(),
+                workspace: crate::vm_git::AgentVmWorkspaceBootstrap {
+                    repo: sample_clone_repo(),
+                    destination: None,
+                    warm: crate::vm_git::WorkspaceWarmMode::None,
+                },
+                prompt: crate::agent_run::AgentPrompt::new("p"),
+                stage: crate::agent_plan::Stage::Review,
+                correlation_id: None,
+                read_plan_id: None,
+            },
+            &state,
+        )
+        .await;
+
+        match resp {
+            ServerMessage::Error { message } => {
+                assert!(
+                    message.contains("review") && message.contains("read_plan_id"),
+                    "got: {message}",
+                );
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    /// Symmetric to the review case: a `plan`-stage run that
+    /// carries `read_plan_id` is incoherent (planner runs create
+    /// plans, they do not read one), and is rejected for the same
+    /// reason — the broker has no route that honours such a row,
+    /// so persisting it would be silent rot.
+    #[tokio::test]
+    async fn start_agent_run_plan_with_read_plan_id_is_rejected() {
+        let server = MockServer::start().await;
+        let state = make_state(&server, vec![], "o");
+
+        let resp = dispatch_message(
+            ClientMessage::StartAgentRun {
+                label: None,
+                agent_kind: AgentKind::Claude,
+                agent_model: "claude-test".into(),
+                workspace: crate::vm_git::AgentVmWorkspaceBootstrap {
+                    repo: sample_clone_repo(),
+                    destination: None,
+                    warm: crate::vm_git::WorkspaceWarmMode::None,
+                },
+                prompt: crate::agent_run::AgentPrompt::new("p"),
+                stage: crate::agent_plan::Stage::Plan,
+                correlation_id: None,
+                read_plan_id: Some(PlanId::new()),
+            },
+            &state,
+        )
+        .await;
+
+        match resp {
+            ServerMessage::Error { message } => {
+                assert!(
+                    message.contains("plan") && message.contains("read_plan_id"),
+                    "got: {message}",
+                );
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
     }
 
     // --- Staged-push listing / show -------------------------------------
