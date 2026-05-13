@@ -1298,7 +1298,7 @@ mod tests {
             PlanAbortReason::try_new("ok\0nit"),
             Err(PlanAbortReasonError::EmbeddedNul)
         ));
-        // Also reject NULs that arrive via JSON ` `: the parser
+        // Also reject NULs that arrive via JSON `\u0000`: the parser
         // should refuse at the typed boundary, not slip through to the
         // DB CHECK.
         assert!(serde_json::from_str::<PlanAbortReason>("\"ok\\u0000nit\"").is_err());
