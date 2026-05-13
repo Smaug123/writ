@@ -430,22 +430,6 @@ pub enum BranchCreationPlanError {
          {line:?} ({reason})"
     )]
     InvalidRevListOutput { line: String, reason: String },
-    /// The bundle tip's ancestry, as visible in the staging repo, is
-    /// either equal to or fully reachable from the App-side default
-    /// branch head. There are no new commits for the walker to
-    /// upload, so a push that reaches replay in this state is either
-    /// a no-op or indicates the staging pipeline accepted a bundle
-    /// it should have rejected upstream. Surface it as an explicit
-    /// error rather than silently producing an empty walk that would
-    /// violate [`replay_commits`]'s non-empty pre-condition.
-    #[error(
-        "bundle tip {bundle_tip} has no commits beyond the default branch head {default_head}: \
-         either equal or an ancestor; nothing to replay"
-    )]
-    NothingToReplay {
-        bundle_tip: String,
-        default_head: String,
-    },
     /// The bundle's history shares no commits with the App-side
     /// default branch. Either the agent submitted an orphan branch
     /// or the bundle was constructed from a different upstream than
@@ -495,24 +479,46 @@ impl From<CleanGitError> for BranchCreationPlanError {
     }
 }
 
-/// Result of [`plan_branch_creation_via_rev_list`]: the topo-sorted
-/// list of commits to upload and the seed [`ShaMap`] pre-populated
-/// with the boundary commits' identity mappings.
+/// Result of [`plan_branch_creation_via_rev_list`].
 ///
-/// Bundled together because callers always pass *both* to
-/// [`replay_commits`] — separating them would let a caller pass a
-/// commit list against a stale or wrong seed map. The pair is
-/// returned in the exact shape `replay_commits` consumes.
+/// Two shapes, distinguished by whether the bundle introduces any
+/// commits the App side doesn't already have:
+///
+/// * [`Replay`](BranchCreationPlan::Replay) — the bundle contains
+///   genuinely new commits. The orchestrator must run them through
+///   [`replay_commits`] before creating the ref on the App side.
+/// * [`AlreadyOnDefault`](BranchCreationPlan::AlreadyOnDefault) — the
+///   bundle's tip is already reachable from the default branch head
+///   (it *is* the default head, or an ancestor of it). The
+///   orchestrator can skip replay entirely and create the ref pointing
+///   at the existing App-side SHA. This is the "create a branch at
+///   `main`" / "create a branch at an older release tag" case: a
+///   legitimate push the agent might make even though no objects need
+///   uploading.
+///
+/// Encoding the two shapes as an enum makes the "no replay needed but
+/// still publish the ref" case unmissable for the caller; a struct
+/// with an `Option<commits>` would let the orchestrator silently
+/// forget to create the ref when commits were absent.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct BranchCreationPlan {
-    /// Topologically sorted bundle SHAs (parents before children),
-    /// suitable as the `commits` argument to [`replay_commits`].
-    pub commits: Vec<GitObjectId>,
-    /// Pre-seeded sha map: each boundary commit (a parent of some
-    /// walked commit that is itself already on the App-side default
-    /// branch) maps to itself, so [`replay_commits`] recognises those
-    /// SHAs as already-published when they show up in parent slots.
-    pub seed: ShaMap,
+pub enum BranchCreationPlan {
+    /// The bundle introduces new commits. `commits` is topologically
+    /// sorted (parents before children), suitable as the `commits`
+    /// argument to [`replay_commits`]. `seed` is pre-populated with
+    /// the boundary commits' identity mappings: each default-side
+    /// ancestor that appears as a parent slot of a walked commit maps
+    /// to itself, so [`replay_commits`] recognises it as already
+    /// published.
+    Replay {
+        commits: Vec<GitObjectId>,
+        seed: ShaMap,
+    },
+    /// The bundle tip is already reachable from the default branch
+    /// head — either equal to it or one of its ancestors. There are
+    /// no new commits to upload; the orchestrator only needs to
+    /// publish the new ref at `tip` (which is the same SHA on the App
+    /// side, since it's already on the default branch).
+    AlreadyOnDefault { tip: GitObjectId },
 }
 
 /// Plan the per-commit walk for a branch creation by shelling out
@@ -534,8 +540,14 @@ pub struct BranchCreationPlan {
 ///   maps lets `replay_commits` resolve the boundary parents
 ///   without an upload.
 ///
-/// Failure modes the caller has to distinguish:
+/// The success / failure cases the caller has to distinguish:
 ///
+/// * `Ok(`[`BranchCreationPlan::Replay`]`)` — `rev-list` emitted both
+///   interesting commits and boundary commits; normal replay.
+/// * `Ok(`[`BranchCreationPlan::AlreadyOnDefault`]`)` — `rev-list`
+///   emitted nothing, meaning the bundle tip is reachable from the
+///   default branch head. Legitimate "create a branch at this
+///   existing commit" push; no upload needed.
 /// * [`BranchCreationPlanError::ShallowStagingRepo`] — the staging
 ///   repo's `.git/shallow` file exists, so rev-list cannot see
 ///   ancestors older than the shallow depth. The orchestrator must
@@ -545,9 +557,6 @@ pub struct BranchCreationPlan {
 ///   emitted interesting commits but no boundary commits. The
 ///   bundle's history has no ancestor reachable from the default
 ///   branch.
-/// * [`BranchCreationPlanError::NothingToReplay`] — `rev-list`
-///   emitted no interesting commits. The bundle tip is the default
-///   head or one of its ancestors; replay is a no-op.
 /// * [`BranchCreationPlanError::Git`] — the `rev-list` invocation
 ///   itself failed (unknown SHA, missing staging repo, IO error).
 ///
@@ -587,9 +596,16 @@ pub async fn plan_branch_creation_via_rev_list(
     let (commits, boundaries) = parse_rev_list_boundary_output(&stdout)?;
 
     if commits.is_empty() {
-        return Err(BranchCreationPlanError::NothingToReplay {
-            bundle_tip: bundle_tip.as_str().to_string(),
-            default_head: default_head.as_str().to_string(),
+        // `rev-list ^default_head bundle_tip` with no output means
+        // `bundle_tip` is reachable from `default_head` — either equal
+        // or an ancestor. The orchestrator should publish the ref at
+        // the existing App-side SHA without running replay.
+        //
+        // No boundary commits accompany this case: `--boundary` only
+        // emits parents of interesting commits, and there are no
+        // interesting commits here.
+        return Ok(BranchCreationPlan::AlreadyOnDefault {
+            tip: bundle_tip.clone(),
         });
     }
     if boundaries.is_empty() {
@@ -604,7 +620,7 @@ pub async fn plan_branch_creation_via_rev_list(
         seed.seed_commit_identity(boundary);
     }
 
-    Ok(BranchCreationPlan { commits, seed })
+    Ok(BranchCreationPlan::Replay { commits, seed })
 }
 
 /// Build the `git -C <staging> rev-parse --is-shallow-repository`
@@ -2001,6 +2017,18 @@ mod tests {
     /// letting a wedged child hang the suite indefinitely.
     const TEST_GIT_TIMEOUT: Duration = Duration::from_secs(10);
 
+    /// Assert a planner result is `Replay` and return the inner
+    /// `(commits, seed)`. Keeps real-git tests legible without
+    /// repeating the `match` boilerplate at every call site.
+    fn expect_replay(plan: BranchCreationPlan) -> (Vec<GitObjectId>, ShaMap) {
+        match plan {
+            BranchCreationPlan::Replay { commits, seed } => (commits, seed),
+            BranchCreationPlan::AlreadyOnDefault { tip } => {
+                panic!("expected Replay, got AlreadyOnDefault {{ tip: {tip:?} }}")
+            }
+        }
+    }
+
     fn required_git() -> PathBuf {
         let path = std::env::var_os("PATH")
             .unwrap_or_else(|| panic!("PATH must contain `git` for walker tests"));
@@ -2298,9 +2326,10 @@ mod tests {
         let plan = plan_branch_creation_via_rev_list(&c1, &c0, &repo, &git, TEST_GIT_TIMEOUT)
             .await
             .expect("plan ok");
-        assert_eq!(plan.commits, vec![c1]);
-        assert_eq!(plan.seed.commit(&c0), Some(&c0));
-        assert_eq!(plan.seed.commit_count(), 1);
+        let (commits, seed) = expect_replay(plan);
+        assert_eq!(commits, vec![c1]);
+        assert_eq!(seed.commit(&c0), Some(&c0));
+        assert_eq!(seed.commit_count(), 1);
     }
 
     #[tokio::test]
@@ -2314,12 +2343,13 @@ mod tests {
         let plan = plan_branch_creation_via_rev_list(&c3, &c0, &repo, &git, TEST_GIT_TIMEOUT)
             .await
             .expect("plan ok");
-        assert_eq!(plan.commits, vec![c1.clone(), c2, c3]);
+        let (commits, seed) = expect_replay(plan);
+        assert_eq!(commits, vec![c1.clone(), c2, c3]);
         // `--boundary` reports the merge-base; for a linear chain
         // that's the commit we passed as default_head. The boundary
         // is not c1.
-        assert_eq!(plan.seed.commit(&c0), Some(&c0));
-        assert!(plan.seed.commit(&c1).is_none());
+        assert_eq!(seed.commit(&c0), Some(&c0));
+        assert!(seed.commit(&c1).is_none());
     }
 
     #[tokio::test]
@@ -2349,22 +2379,21 @@ mod tests {
         let plan = plan_branch_creation_via_rev_list(&merge, &c_old, &repo, &git, TEST_GIT_TIMEOUT)
             .await
             .expect("plan ok");
-        assert_eq!(plan.commits.len(), 2, "got {:?}", plan.commits);
+        let (commits, seed) = expect_replay(plan);
+        assert_eq!(commits.len(), 2, "got {commits:?}");
         assert!(
-            !plan.commits.contains(&c0),
+            !commits.contains(&c0),
             "c0 must not be uploaded — already on default"
         );
         assert!(
-            !plan.commits.contains(&c_old),
+            !commits.contains(&c_old),
             "c_old is default head — must not appear"
         );
-        let new1_idx = plan
-            .commits
+        let new1_idx = commits
             .iter()
             .position(|s| s == &new1)
             .expect("new1 emitted");
-        let merge_idx = plan
-            .commits
+        let merge_idx = commits
             .iter()
             .position(|s| s == &merge)
             .expect("merge emitted");
@@ -2373,9 +2402,8 @@ mod tests {
         // default branch and is also a direct parent of merge, so
         // rev-list reports both as boundaries.
         assert!(
-            plan.seed.commit(&c0).is_some() || plan.seed.commit(&c_old).is_some(),
-            "expected some default-side ancestor in the seed map, got {:?}",
-            plan.seed,
+            seed.commit(&c0).is_some() || seed.commit(&c_old).is_some(),
+            "expected some default-side ancestor in the seed map, got {seed:?}",
         );
     }
 
@@ -2402,9 +2430,10 @@ mod tests {
         let plan = plan_branch_creation_via_rev_list(&new, &c2, &repo, &git, TEST_GIT_TIMEOUT)
             .await
             .expect("plan ok");
-        assert_eq!(plan.commits, vec![new]);
+        let (commits, seed) = expect_replay(plan);
+        assert_eq!(commits, vec![new]);
         // Merge-base is c1, which is the boundary rev-list reports.
-        assert_eq!(plan.seed.commit(&c1), Some(&c1));
+        assert_eq!(seed.commit(&c1), Some(&c1));
     }
 
     #[tokio::test]
@@ -2470,37 +2499,43 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rev_list_plan_rejects_when_bundle_tip_equals_default_head() {
+    async fn rev_list_plan_returns_already_on_default_when_bundle_tip_equals_default_head() {
+        // Agent creates a new branch pointing at the current default
+        // head (e.g. `git branch feature/foo main && git push origin
+        // feature/foo`). No commits to upload — the orchestrator just
+        // needs to publish the ref at the existing SHA.
         let (_dir, repo, git) = init_test_repo();
         let head = commit_empty(&git, &repo, "only commit");
-        let err = plan_branch_creation_via_rev_list(&head, &head, &repo, &git, TEST_GIT_TIMEOUT)
+        let plan = plan_branch_creation_via_rev_list(&head, &head, &repo, &git, TEST_GIT_TIMEOUT)
             .await
-            .expect_err("bundle_tip == default_head must be rejected");
-        match err {
-            BranchCreationPlanError::NothingToReplay {
-                bundle_tip,
-                default_head,
-            } => {
-                assert_eq!(bundle_tip, head.as_str());
-                assert_eq!(default_head, head.as_str());
+            .expect("bundle_tip == default_head must succeed as AlreadyOnDefault");
+        match plan {
+            BranchCreationPlan::AlreadyOnDefault { tip } => {
+                assert_eq!(tip, head);
             }
-            other => panic!("expected NothingToReplay, got {other:?}"),
+            other => panic!("expected AlreadyOnDefault, got {other:?}"),
         }
     }
 
     #[tokio::test]
-    async fn rev_list_plan_rejects_when_bundle_tip_is_ancestor_of_default_head() {
+    async fn rev_list_plan_returns_already_on_default_when_bundle_tip_is_ancestor_of_default_head()
+    {
+        // Agent creates a new branch pointing at an older commit on
+        // the default branch (e.g. tagging a past release). No upload
+        // needed; the ref publication is still valid.
         let (_dir, repo, git) = init_test_repo();
         let c0 = commit_empty(&git, &repo, "c0");
         let c1 = commit_empty(&git, &repo, "c1 (default head)");
 
-        let err = plan_branch_creation_via_rev_list(&c0, &c1, &repo, &git, TEST_GIT_TIMEOUT)
+        let plan = plan_branch_creation_via_rev_list(&c0, &c1, &repo, &git, TEST_GIT_TIMEOUT)
             .await
-            .expect_err("ancestor bundle_tip must be rejected");
-        assert!(
-            matches!(err, BranchCreationPlanError::NothingToReplay { .. }),
-            "expected NothingToReplay, got {err:?}",
-        );
+            .expect("ancestor bundle_tip must succeed as AlreadyOnDefault");
+        match plan {
+            BranchCreationPlan::AlreadyOnDefault { tip } => {
+                assert_eq!(tip, c0);
+            }
+            other => panic!("expected AlreadyOnDefault, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -2534,8 +2569,9 @@ mod tests {
             plan_branch_creation_via_rev_list(&c2, &default_head, &repo, &git, TEST_GIT_TIMEOUT)
                 .await
                 .expect("plan ok");
-        assert_eq!(plan.commits, vec![c1.clone(), c2.clone()]);
-        assert_eq!(plan.seed.commit(&default_head), Some(&default_head));
+        let (plan_commits, plan_seed) = expect_replay(plan);
+        assert_eq!(plan_commits, vec![c1.clone(), c2.clone()]);
+        assert_eq!(plan_seed.commit(&default_head), Some(&default_head));
 
         // Stub out blob/tree/commit creation so the replay walker
         // can run without a real GitHub. The bundle commits all
@@ -2606,8 +2642,8 @@ mod tests {
             &client,
             &sample_repo(),
             &source,
-            &plan.commits,
-            plan.seed,
+            &plan_commits,
+            plan_seed,
             &[],
         )
         .await
