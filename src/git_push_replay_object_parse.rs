@@ -84,6 +84,10 @@ pub(crate) enum ParseObjectError {
     InvalidTreeSha(#[source] GitObjectIdError),
     #[error("tree entry SHA is all zeros (git fsck: nullSha1)")]
     NullSha,
+    #[error(
+        "commit declares unsupported `encoding {0:?}` — only UTF-8 (the canonical, header-absent default) is accepted at this trust boundary"
+    )]
+    UnsupportedEncoding(String),
 }
 
 /// Parse the raw bytes of a git commit object into a [`StagingCommit`].
@@ -185,6 +189,24 @@ pub(crate) fn parse_commit_object(bytes: &[u8]) -> Result<StagingCommit, ParseOb
                         "unexpected header {:?} before committer",
                         String::from_utf8_lossy(other)
                     )));
+                }
+                // The `encoding` header tells git that the message
+                // body is in a non-default encoding. Silently
+                // dropping it and then UTF-8-decoding the body would
+                // either re-emit a different commit (if the bytes
+                // happened to be valid UTF-8) or fail later with a
+                // confusing `NonUtf8Message`. The trust boundary
+                // here is UTF-8-only; accept only an explicit
+                // `encoding utf-8` (the canonical default).
+                if other == b"encoding" {
+                    let value_str = std::str::from_utf8(value).map_err(|_| {
+                        ParseObjectError::UnsupportedEncoding(
+                            String::from_utf8_lossy(value).into_owned(),
+                        )
+                    })?;
+                    if !value_str.eq_ignore_ascii_case("utf-8") {
+                        return Err(ParseObjectError::UnsupportedEncoding(value_str.to_string()));
+                    }
                 }
                 true
             }
@@ -572,6 +594,16 @@ fn parse_tz_offset(s: &str) -> Result<time::UtcOffset, ParseObjectError> {
         return Err(ParseObjectError::MalformedIdentity(format!(
             "timezone field {s:?} must be ±HHMM"
         )));
+    }
+    // `-0000` is fsck-clean but loses its sign when collapsed into
+    // `time::UtcOffset::from_whole_seconds(0)`; `serialize_identity`
+    // would later re-emit `+0000` and produce a different commit
+    // byte form. The parser is a no-normalization boundary, so
+    // reject the sole offset whose sign would be silently dropped.
+    if s == "-0000" {
+        return Err(ParseObjectError::MalformedIdentity(
+            "timezone field `-0000` loses its sign on round-trip (use `+0000`)".to_string(),
+        ));
     }
     let sign: i32 = match bytes[0] {
         b'+' => 1,
@@ -1245,6 +1277,74 @@ mod tests {
                 matches!(err, ParseObjectError::MalformedIdentity(ref msg) if msg.contains("seconds")),
                 "got for {bad:?}: {err:?}"
             );
+        }
+    }
+
+    #[test]
+    fn parse_identity_rejects_negative_zero_offset() {
+        // `-0000` is fsck-clean: `git hash-object -t commit`
+        // accepts it. But `time::UtcOffset::from_whole_seconds(0)`
+        // collapses the sign, and `serialize_identity` then re-emits
+        // `+0000`, changing the commit's byte form. The parser is
+        // explicitly a no-normalization boundary, so reject `-0000`
+        // here and let the caller treat it as malformed at the
+        // staging boundary.
+        let err = parse_identity(b"Alice <a@example.invalid> 1700000000 -0000")
+            .expect_err("`-0000` offset must reject");
+        assert!(
+            matches!(err, ParseObjectError::MalformedIdentity(ref msg) if msg.contains("-0000")),
+            "got: {err:?}"
+        );
+        // Boundary: a non-zero negative offset still parses (it
+        // carries information `+0000` would not).
+        parse_identity(b"Alice <a@example.invalid> 1700000000 -0330")
+            .expect("`-0330` is still valid");
+    }
+
+    #[test]
+    fn parse_commit_object_rejects_explicit_non_utf8_encoding() {
+        // Git emits an `encoding` extension header when
+        // `i18n.commitEncoding` is non-UTF-8. The body is then
+        // expected to be bytes in that encoding (e.g. ISO-8859-1).
+        // The parser is a UTF-8-only trust boundary: silently
+        // dropping the `encoding` header and then UTF-8-decoding the
+        // body would either succeed for a UTF-8-shaped Latin-1
+        // string and re-emit a different commit, or fail with a
+        // confusing `NonUtf8Message`. Reject explicitly so the
+        // failure shape is informative.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"tree aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n");
+        bytes.extend_from_slice(b"author Alice <a@x> 0 +0000\n");
+        bytes.extend_from_slice(b"committer Alice <a@x> 0 +0000\n");
+        bytes.extend_from_slice(b"encoding ISO-8859-1\n");
+        bytes.push(b'\n');
+        bytes.extend_from_slice(b"msg\n");
+        let err = parse_commit_object(&bytes).expect_err("non-UTF-8 commit encoding must reject");
+        assert!(
+            matches!(err, ParseObjectError::UnsupportedEncoding(ref enc) if enc == "ISO-8859-1"),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn parse_commit_object_accepts_explicit_utf8_encoding_header() {
+        // Some emitters spell out the default — `encoding UTF-8` is
+        // a no-op extension header. The parser must accept it (case
+        // insensitive) so legitimate commits that happen to carry
+        // it parse without error. The header is dropped from the
+        // structured form (the walker has no field to carry it on
+        // re-emit), which is acceptable because the canonical form
+        // git itself emits omits it.
+        for spelling in ["UTF-8", "utf-8", "Utf-8"] {
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(b"tree aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n");
+            bytes.extend_from_slice(b"author Alice <a@x> 0 +0000\n");
+            bytes.extend_from_slice(b"committer Alice <a@x> 0 +0000\n");
+            bytes.extend_from_slice(format!("encoding {spelling}\n").as_bytes());
+            bytes.push(b'\n');
+            bytes.extend_from_slice(b"msg\n");
+            parse_commit_object(&bytes)
+                .unwrap_or_else(|err| panic!("{spelling:?} must parse: {err:?}"));
         }
     }
 
