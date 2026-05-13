@@ -25,9 +25,14 @@
 //!    `<plan_id>` (else 401 — the run is not the one bound to this
 //!    plan).
 //! 3. **Per-stage:** the run's stage must permit `ReadPlan`. Slice 4
-//!    short-circuits the decision-gate branch to "always-accepted";
-//!    slice 6 will land the real `plan_decision.outcome = 'accepted'`
-//!    check.
+//!    short-circuits the decision-gate branch *only when no
+//!    `plan_decision` row exists*: a missing row is treated as
+//!    accepted so a slice-4 implementer can pull the plan body before
+//!    slice 6 lands the operator-decision step. A *recorded*
+//!    `RejectedRestart` is honoured even now, so the operator can
+//!    close a plan before slice 6 by writing the decision row
+//!    directly. Slice 6 will drop the default and require an explicit
+//!    accepted row.
 
 use std::sync::Arc;
 
@@ -155,37 +160,41 @@ async fn handle_plan_read<S: SecretStore + Send + Sync + 'static>(
         );
     }
 
-    // Per-stage gate. Slice 4 short-circuits the decision branch by
-    // claiming "always accepted" so an execute-stage implementer can
-    // pull the plan body before slice 6 lands the real
-    // `plan_decision.outcome = 'accepted'` check. Review-stage runs
-    // already pass the gate regardless of decision, so the
-    // short-circuit only affects the execute path.
-    let decision_for_gate = Some(DecisionOutcome::Accepted);
+    // Fetch the decision *before* the stage gate so a recorded
+    // `RejectedRestart` can deny an execute-stage read even in slice 4.
+    // The slice-4 short-circuit only applies when no decision row
+    // exists at all: a missing row is treated as accepted so a slice-4
+    // implementer can pull the plan body before slice 6 lands the
+    // operator-decision step. A row that's been written stands, which
+    // means an operator can close a plan today by recording
+    // `RejectedRestart` even though the broker doesn't yet have a
+    // write route for it.
+    let decision_record = match audit.get_plan_decision(plan_id) {
+        Ok(opt) => opt,
+        Err(err) => {
+            tracing::error!(
+                target: AUDIT_WRITE_FAILURE_TARGET,
+                kind = "plan_read_decision_lookup",
+                plan_id = %plan_id,
+                error = %err,
+                "audit read failed",
+            );
+            return VmHttpResponse::text(VmHttpStatus::InternalServerError, "audit read failed");
+        }
+    };
+    let decision_for_gate = decision_record
+        .as_ref()
+        .map(|r| r.outcome)
+        .or(Some(DecisionOutcome::Accepted));
     if let Err(err) = route_permitted_by_stage_and_decision(
         PlanRouteAction::ReadPlan,
         run.stage,
         decision_for_gate,
     ) {
         match err {
-            PlanRouteAuthError::StageNotPermitted { .. } => {
+            PlanRouteAuthError::StageNotPermitted { .. }
+            | PlanRouteAuthError::DecisionNotAccepted { .. } => {
                 return VmHttpResponse::text(VmHttpStatus::Forbidden, err.to_string());
-            }
-            // Unreachable under the slice-4 short-circuit, but kept
-            // for forward-compatibility with slice 6. A defensive 500
-            // here makes the mismatch loud rather than silent.
-            PlanRouteAuthError::DecisionNotAccepted { .. } => {
-                tracing::error!(
-                    target: AUDIT_WRITE_FAILURE_TARGET,
-                    kind = "plan_read_gate_decision_branch_taken",
-                    plan_id = %plan_id,
-                    error = %err,
-                    "stage gate returned unexpected decision branch",
-                );
-                return VmHttpResponse::text(
-                    VmHttpStatus::InternalServerError,
-                    "stage gate returned unexpected decision branch",
-                );
             }
         }
     }
@@ -219,26 +228,10 @@ async fn handle_plan_read<S: SecretStore + Send + Sync + 'static>(
         }
     };
 
-    // The decision is looked up for the *response body*; the stage
-    // gate above used the slice-4 short-circuit, not this value.
-    // Slice 6 will replace `decision_for_gate` with `decision_from_db`
-    // and these become a single lookup.
-    let decision = match audit.get_plan_decision(plan_id) {
-        Ok(opt) => opt.map(|r| DecisionView {
-            outcome: r.outcome,
-            decided_at: r.decided_at,
-        }),
-        Err(err) => {
-            tracing::error!(
-                target: AUDIT_WRITE_FAILURE_TARGET,
-                kind = "plan_read_decision_lookup",
-                plan_id = %plan_id,
-                error = %err,
-                "audit read failed",
-            );
-            return VmHttpResponse::text(VmHttpStatus::InternalServerError, "audit read failed");
-        }
-    };
+    let decision = decision_record.map(|r| DecisionView {
+        outcome: r.outcome,
+        decided_at: r.decided_at,
+    });
 
     let view = PlanView {
         plan_id: plan.plan_id,
@@ -1170,6 +1163,102 @@ mod tests {
         let decision = view.decision.expect("decision should be present");
         assert_eq!(decision.outcome, DecisionOutcome::Accepted);
         assert_eq!(decision.decided_at, decided_at);
+    }
+
+    /// A recorded `RejectedRestart` decision must deny an execute-
+    /// stage read even before slice 6 lands the operator-decision
+    /// write path. The slice-4 short-circuit only defaults *missing*
+    /// decisions to accepted; a row written by an operator (or a
+    /// future broker route) stands. The 403 distinguishes this from
+    /// the 401 binding-mismatch path: the run *is* bound to this
+    /// plan, but the plan has been closed.
+    #[tokio::test]
+    async fn plan_read_execute_stage_rejected_decision_is_forbidden() {
+        use crate::agent_plan::{Decider, DecisionOutcome};
+        use crate::audit::PlanDecisionRecord;
+
+        let github = MockServer::start().await;
+        let state = make_broker_state(&github);
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+        open_audit_session(&state, session.session_id());
+
+        let planner_session: SessionId = "82ab0bb1-7c12-4a4e-9f51-6d3d7701aaaa".parse().unwrap();
+        open_session_for(&state, planner_session);
+        let planner_run = record_planner_run(&state, planner_session);
+        let plan_id = record_plan(&state, planner_run, "# Rejected body");
+
+        state
+            .audit
+            .record_plan_decision(&PlanDecisionRecord {
+                plan_id,
+                decided_at: UnixMillis::from_millis(1_700_000_600_000),
+                outcome: DecisionOutcome::RejectedRestart,
+                decider: Decider::try_new("operator-1").unwrap(),
+            })
+            .unwrap();
+
+        let _implementer_run = record_run_bound(
+            &state,
+            session.session_id(),
+            crate::agent_plan::Stage::Execute,
+            plan_id,
+        );
+
+        let service = plan_service_for_test(&state);
+        let response = handle_plan_read(&session, plan_id, service).await;
+
+        assert_eq!(response.status, VmHttpStatus::Forbidden);
+        let msg = std::str::from_utf8(&response.body).unwrap();
+        assert!(
+            msg.contains("decision") && msg.contains("rejected_restart"),
+            "unexpected body: {msg}",
+        );
+    }
+
+    /// A reviewer's read is not gated on the decision (the spec
+    /// admits review-stage reads regardless of decision so reviewers
+    /// can re-read the plan they're deciding on). Pin this so a
+    /// future tightening of the gate doesn't accidentally lock
+    /// reviewers out of plans an operator has rejected.
+    #[tokio::test]
+    async fn plan_read_review_stage_is_allowed_even_with_rejected_decision() {
+        use crate::agent_plan::{Decider, DecisionOutcome};
+        use crate::audit::PlanDecisionRecord;
+
+        let github = MockServer::start().await;
+        let state = make_broker_state(&github);
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+        open_audit_session(&state, session.session_id());
+
+        let planner_session: SessionId = "82ab0bb1-7c12-4a4e-9f51-6d3d7701bbbb".parse().unwrap();
+        open_session_for(&state, planner_session);
+        let planner_run = record_planner_run(&state, planner_session);
+        let plan_id = record_plan(&state, planner_run, "# Reviewer body");
+
+        state
+            .audit
+            .record_plan_decision(&PlanDecisionRecord {
+                plan_id,
+                decided_at: UnixMillis::from_millis(1_700_000_700_000),
+                outcome: DecisionOutcome::RejectedRestart,
+                decider: Decider::try_new("operator-1").unwrap(),
+            })
+            .unwrap();
+
+        let _reviewer_run = record_run_bound(
+            &state,
+            session.session_id(),
+            crate::agent_plan::Stage::Review,
+            plan_id,
+        );
+
+        let service = plan_service_for_test(&state);
+        let response = handle_plan_read(&session, plan_id, service).await;
+
+        assert_eq!(response.status, VmHttpStatus::Ok);
+        let view: PlanView = serde_json::from_slice(&response.body).unwrap();
+        let decision = view.decision.expect("decision should be present");
+        assert_eq!(decision.outcome, DecisionOutcome::RejectedRestart);
     }
 
     /// End-to-end through the full HTTP dispatcher: bearer auth,
