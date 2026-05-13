@@ -20,12 +20,6 @@
 //! therefore validate aggressively at the boundary — see
 //! [`validate_tree_entry_name`] and [`parse_tz_offset`] for two
 //! concrete examples — and reject anything `git fsck` would.
-//!
-//! Until the production `git cat-file` source lands in a follow-up
-//! change, the only callers of these parsers are this file's own
-//! tests, so the public-but-unused items would otherwise generate
-//! `dead_code` warnings.
-#![cfg_attr(not(test), allow(dead_code))]
 
 use std::num::ParseIntError;
 
