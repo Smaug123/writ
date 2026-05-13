@@ -283,6 +283,35 @@ impl AuditLog {
         })
     }
 
+    /// Most-recent `agent_run.run_id` for a session, by `requested_at`.
+    /// `None` if no run row exists. Used by the UI HTTP join to give
+    /// the operator a stable handle to follow from a VM into a run
+    /// view; the run itself is exposed through its own resource and
+    /// not inlined here.
+    pub fn latest_agent_run_id_for_session(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Option<AgentRunId>, AuditError> {
+        self.with_conn(|c| {
+            let raw: Option<String> = c
+                .query_row(
+                    "SELECT run_id FROM agent_run
+                     WHERE session_id = ?1
+                     ORDER BY requested_at DESC
+                     LIMIT 1",
+                    params![session_id.as_uuid().to_string()],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            raw.map(|s| {
+                uuid::Uuid::parse_str(&s)
+                    .map(AgentRunId::from_uuid)
+                    .map_err(|_| AuditError::Invariant("agent run row: run_id not a uuid"))
+            })
+            .transpose()
+        })
+    }
+
     /// Lookup of the `correlation_id` belonging to an agent run on the
     /// given session. Returns `None` for sessions with no agent run
     /// (e.g. raw `start_agent_vm_session` flows) or with an untagged
@@ -980,5 +1009,55 @@ mod tests {
             .unwrap_err();
         let msg = err.to_string().to_uppercase();
         assert!(msg.contains("FOREIGN KEY"), "got: {err}");
+    }
+
+    #[test]
+    fn latest_agent_run_id_returns_most_recent_or_none() {
+        let log = AuditLog::open_in_memory().unwrap();
+
+        // No run on the session.
+        let bare = sample_session();
+        log.open_session(&bare).unwrap();
+        assert!(
+            log.latest_agent_run_id_for_session(bare.session_id)
+                .unwrap()
+                .is_none()
+        );
+
+        // Two runs; the later requested_at wins regardless of insertion order.
+        let session = SessionRecord {
+            session_id: SessionId::new(),
+            ..sample_session()
+        };
+        log.open_session(&session).unwrap();
+        let earlier = AgentRunId::new();
+        let later = AgentRunId::new();
+        log.record_agent_run(&AgentRunAuditRecord {
+            run_id: later,
+            session_id: session.session_id,
+            requested_at: UnixMillis::from_millis(1_700_000_500),
+            agent_kind: AgentKind::Claude,
+            prompt: crate::agent_run::AgentPrompt::new("p").summary(),
+            correlation_id: None,
+            stage: Stage::Execute,
+            read_plan_id: None,
+        })
+        .unwrap();
+        log.record_agent_run(&AgentRunAuditRecord {
+            run_id: earlier,
+            session_id: session.session_id,
+            requested_at: UnixMillis::from_millis(1_700_000_100),
+            agent_kind: AgentKind::Claude,
+            prompt: crate::agent_run::AgentPrompt::new("p").summary(),
+            correlation_id: None,
+            stage: Stage::Execute,
+            read_plan_id: None,
+        })
+        .unwrap();
+        assert_eq!(
+            log.latest_agent_run_id_for_session(session.session_id)
+                .unwrap(),
+            Some(later)
+        );
     }
 }

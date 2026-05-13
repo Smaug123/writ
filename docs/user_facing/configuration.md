@@ -12,6 +12,7 @@ cheap; no in-memory state is lost.
 | Audit database  | `$XDG_DATA_HOME/writ/audit.db`                  | `writd --audit-db <path>` or `audit_db` in config |
 | Unix socket     | `$XDG_RUNTIME_DIR/writ/writd.sock`              | `writd --socket <path>` or `socket_path` in config |
 | File secret store base | `$XDG_DATA_HOME/writ/secrets/`           | `secret_store.path` in config |
+| UI HTTP bearer  | `$XDG_RUNTIME_DIR/writ/ui-bearer`               | `ui_http.bearer_path` in config (only present when `ui_http` is set) |
 
 If `XDG_CONFIG_HOME` / `XDG_DATA_HOME` / `XDG_RUNTIME_DIR` are unset, the
 daemon falls back to `~/.config`, `~/.local/share`, and
@@ -45,7 +46,10 @@ The CLI client (`writ`) finds the socket via `--socket`, the
   },
   "secret_store": { "type": "file", "path": "/home/me/.local/share/writ/secrets" },
   "socket_path": "/run/user/1000/writ/writd.sock",
-  "audit_db": "/home/me/.local/share/writ/audit.db"
+  "audit_db": "/home/me/.local/share/writ/audit.db",
+  "ui_http": {
+    "bind": "127.0.0.1:7717"
+  }
 }
 ```
 
@@ -99,6 +103,41 @@ path.
 Optional path overrides. The CLI flags `--socket` and `--audit-db` take
 precedence over the config; the config takes precedence over the XDG
 defaults.
+
+### `ui_http`
+
+Optional. When present, `writd` opens a read-only JSON HTTP listener
+suitable for a web UI, TUI, MCP wrapper, or `curl`. The listener is
+separate from the Unix socket (the primary control plane) and from the
+per-VM HTTP listener (guest-to-host).
+
+```json
+"ui_http": {
+  "bind": "127.0.0.1:7717"
+}
+```
+
+| Field          | Required | Description |
+| -------------- | -------- | ----------- |
+| `bind`         | yes      | `host:port` for the listener. Must be a loopback address; binding to a routable interface is refused at startup. Pick a stable port your clients can hard-code. |
+| `bearer_path`  | no       | Override where the daemon writes the bearer token file (`0600`). Defaults to `$XDG_RUNTIME_DIR/writ/ui-bearer`. |
+
+On startup the daemon generates a fresh random bearer, writes it to
+`bearer_path` atomically (`0600`), then binds the listener. Every
+request must carry an `Authorization: Bearer <token>` header. There is
+no other auth: file permissions on the bearer path are the boundary, so
+keep the path inside a directory only your user can read.
+
+Example client use:
+
+```bash
+TOKEN=$(cat "${XDG_RUNTIME_DIR:-$HOME/.local/run}/writ/ui-bearer")
+curl -sS -H "Authorization: Bearer $TOKEN" \
+  http://127.0.0.1:7717/v1/agent-vms
+```
+
+The listener is read-only: only `GET` is accepted. See
+[CLI reference](cli-reference.md) for the available routes.
 
 ## Secret stores
 
@@ -154,6 +193,10 @@ file backend with strict permissions is usually the right default.
    crashed previous run), it's removed first. The parent directory is
    created with `0700` if missing.
 5. Logs `writd: listening on …` to stderr and starts the dispatch loop.
+6. If `ui_http` is configured, generates a fresh bearer, writes it to
+   `bearer_path` (atomic `0600`), validates that `bind` is loopback,
+   and starts the read-only HTTP listener. Failure on any of these is
+   fatal.
 
 The daemon exits non-zero on fatal errors (config, DB, socket bind).
 Per-connection errors are logged and don't bring the daemon down.
