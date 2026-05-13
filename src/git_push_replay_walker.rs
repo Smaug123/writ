@@ -958,6 +958,7 @@ pub(crate) mod test_fixture {
 mod tests {
     use std::str::FromStr;
 
+    use proptest::prelude::*;
     use serde_json::json;
     use wiremock::matchers::{body_json, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -2653,5 +2654,202 @@ mod tests {
         assert_eq!(map.commit(&c1), Some(&c1_app));
         assert_eq!(map.commit(&c2), Some(&c2_app));
         assert_eq!(map.commit(&default_head), Some(&default_head));
+    }
+
+    // ----- property tests ------------------------------------------
+
+    /// Strategy for one well-formed [`TrailerSource`]. Keys and
+    /// values follow the validation rules in [`TrailerKey::new`] and
+    /// [`TrailerValue::new`]; the `prop_oneof` covers both shapes the
+    /// production type admits.
+    fn arb_trailer_source() -> impl Strategy<Value = TrailerSource> {
+        let key = "[A-Za-z][A-Za-z0-9-]{0,15}"
+            .prop_map(|raw| TrailerKey::new(raw).expect("strategy produces valid keys"));
+        let value = ".{1,32}".prop_filter_map("contains control bytes", |s| {
+            if s.bytes().any(|b| matches!(b, b'\n' | b'\r' | b'\0')) {
+                None
+            } else {
+                Some(TrailerValue::new(s).expect("strategy produces valid values"))
+            }
+        });
+        prop_oneof![
+            (key.clone(), value).prop_map(|(key, value)| TrailerSource::Fixed { key, value }),
+            key.prop_map(|key| TrailerSource::OriginalCommitSha { key }),
+        ]
+    }
+
+    /// Strategy for an arbitrary commit message. `(?s)` makes `.`
+    /// match newlines so the generator can reach the multi-paragraph
+    /// cases the trailer-block detection depends on.
+    fn arb_message() -> impl Strategy<Value = String> {
+        "(?s).{0,200}"
+    }
+
+    /// Create an executable file at `dir/name` containing `body`,
+    /// chmod 0o755. Returns the absolute path. Used to inject a
+    /// shell-script stand-in for `git` into the planner so we can
+    /// exercise failure paths (timeout) without a real git
+    /// subprocess.
+    fn write_executable_probe(dir: &Path, name: &str, body: &str) -> PathBuf {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join(name);
+        let mut file = std::fs::File::create(&path).expect("probe file create");
+        file.write_all(body.as_bytes()).expect("probe body write");
+        drop(file);
+        let mut perms = std::fs::metadata(&path).expect("probe stat").permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).expect("probe chmod");
+        path
+    }
+
+    proptest! {
+        /// Without any trailers, [`render_message`] is the identity
+        /// on its input. The walker must never mutate a commit
+        /// message that it has nothing to append to it.
+        #[test]
+        fn render_message_with_no_trailers_returns_original(original in arb_message()) {
+            let sha = sample_object_id('a');
+            prop_assert_eq!(render_replay_message(&original, &[], &sha), original);
+        }
+
+        /// When at least one trailer is appended, the rendered
+        /// trailer lines appear at the tail of the output in the
+        /// same order they were supplied — and the output always
+        /// ends with exactly one newline.
+        #[test]
+        fn render_message_emits_trailers_in_order_at_the_tail(
+            original in arb_message(),
+            trailers in proptest::collection::vec(arb_trailer_source(), 1..=5),
+        ) {
+            let sha = sample_object_id('b');
+            let out = render_replay_message(&original, &trailers, &sha);
+            let trimmed = out.trim_end_matches('\n');
+            let lines: Vec<&str> = trimmed.lines().collect();
+            let n = trailers.len();
+            prop_assert!(lines.len() >= n, "rendered {out:?} too short for {n} trailers");
+            let tail = &lines[lines.len() - n..];
+            for (idx, source) in trailers.iter().enumerate() {
+                let expected = match source {
+                    TrailerSource::Fixed { key, value } => {
+                        format!("{}: {}", key.as_str(), value.as_str())
+                    }
+                    TrailerSource::OriginalCommitSha { key } => {
+                        format!("{}: {}", key.as_str(), sha.as_str())
+                    }
+                };
+                prop_assert_eq!(tail[idx], &expected, "tail line {} mismatch", idx);
+            }
+            prop_assert!(out.ends_with('\n'), "rendered {out:?} must end with one newline");
+            prop_assert!(
+                !out.ends_with("\n\n"),
+                "rendered {out:?} must not end with multiple newlines",
+            );
+        }
+
+        /// When the original message has any non-newline content and
+        /// we appended at least one trailer, the rendered output is
+        /// recognised by [`ends_with_trailer_block`]. That is the
+        /// precondition `git interpret-trailers --parse` needs in
+        /// order to pick the appended trailers up at all — failing
+        /// it would silently strip the replay provenance trailer.
+        #[test]
+        fn render_message_output_ends_with_trailer_block_when_original_nonempty(
+            original in arb_message().prop_filter(
+                "non-newline content required",
+                |s| !s.trim_end_matches('\n').is_empty(),
+            ),
+            trailers in proptest::collection::vec(arb_trailer_source(), 1..=5),
+        ) {
+            let sha = sample_object_id('c');
+            let out = render_replay_message(&original, &trailers, &sha);
+            prop_assert!(
+                message_ends_with_trailer_block(&out),
+                "rendered {out:?} must end with a trailer block",
+            );
+        }
+    }
+
+    proptest! {
+        // Real-git tests are slow (subprocess per commit); a small
+        // case count covers the chain-length combinatorics without
+        // blowing out CI wall time.
+        #![proptest_config(ProptestConfig::with_cases(6))]
+
+        /// Any two arbitrary chains with no shared ancestor produce
+        /// [`BranchCreationPlanError::DisjointHistory`]; the planner
+        /// never silently accepts a bundle whose history shares
+        /// nothing with the default branch, regardless of either
+        /// chain's depth.
+        #[test]
+        fn rev_list_plan_rejects_any_disjoint_history(
+            default_chain_len in 1u32..=4,
+            bundle_chain_len in 1u32..=4,
+        ) {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let (_dir, repo, git) = init_test_repo();
+            let mut default_tip = commit_empty(&git, &repo, "default 0");
+            for i in 1..default_chain_len {
+                default_tip = commit_empty(&git, &repo, &format!("default {i}"));
+            }
+            run_git(&git, &repo, &["checkout", "--quiet", "--orphan", "orphan"]);
+            let mut bundle_tip = commit_empty(&git, &repo, "orphan 0");
+            for i in 1..bundle_chain_len {
+                bundle_tip = commit_empty(&git, &repo, &format!("orphan {i}"));
+            }
+            let result = rt.block_on(plan_branch_creation_via_rev_list(
+                &bundle_tip,
+                &default_tip,
+                &repo,
+                &git,
+                TEST_GIT_TIMEOUT,
+            ));
+            match result {
+                Err(BranchCreationPlanError::DisjointHistory {
+                    default_head,
+                    bundle_tip: bt,
+                }) => {
+                    prop_assert_eq!(default_head, default_tip.as_str());
+                    prop_assert_eq!(bt, bundle_tip.as_str());
+                }
+                other => prop_assert!(false, "expected DisjointHistory, got {:?}", other),
+            }
+        }
+    }
+
+    /// When the rev-list subprocess does not exit before the
+    /// configured timeout, the planner surfaces it as
+    /// `Git("...timed out...")` rather than blocking the orchestrator
+    /// thread. The probe is a shell script that sleeps for longer
+    /// than the timeout, run in place of git.
+    #[tokio::test]
+    async fn plan_branch_creation_surfaces_timeout_when_subprocess_stalls() {
+        let dir = tempfile::tempdir().unwrap();
+        let staging = dir.path().to_path_buf();
+        let probe = write_executable_probe(dir.path(), "git-sleep", "#!/bin/sh\nsleep 5\n");
+        let bundle_tip = sample_object_id('a');
+        let default_head = sample_object_id('b');
+        let short_timeout = Duration::from_millis(150);
+        let err = plan_branch_creation_via_rev_list(
+            &bundle_tip,
+            &default_head,
+            &staging,
+            &probe,
+            short_timeout,
+        )
+        .await
+        .expect_err("sleeping probe must time out");
+        match err {
+            BranchCreationPlanError::Git(msg) => {
+                assert!(
+                    msg.contains("timed out"),
+                    "expected timeout indication in error, got: {msg}",
+                );
+            }
+            other => panic!("expected Git, got {other:?}"),
+        }
     }
 }

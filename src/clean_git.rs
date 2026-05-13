@@ -505,4 +505,40 @@ mod tests {
         }
         assert_eq!(CLEAN_GIT_CONFIG_ENV.len(), helper.len());
     }
+
+    /// Runtime probe: spawn a subprocess via the clean-git harness
+    /// and confirm it sees only the hardened env entries — no PATH,
+    /// no parent-process leakage. Uses `/usr/bin/env` (no args)
+    /// rather than a shell wrapper so we get a literal dump of the
+    /// subprocess environment with no shell-startup pollution.
+    #[tokio::test]
+    async fn run_clean_git_subprocess_sees_only_hardened_env_vars() {
+        let env_bin = PathBuf::from("/usr/bin/env");
+        assert!(
+            env_bin.is_file(),
+            "/usr/bin/env required for env-cleanliness probe",
+        );
+        let invocation = CleanGitInvocation::new(
+            env_bin,
+            std::iter::empty::<OsString>(),
+            clean_git_config_env(),
+            Vec::new(),
+        );
+        let stdout = run_clean_git_capture_stdout(&invocation, Duration::from_secs(10), None)
+            .await
+            .expect("env probe must succeed");
+        let text = std::str::from_utf8(&stdout).expect("env output is UTF-8");
+        let mut lines: Vec<&str> = text.lines().collect();
+        lines.sort();
+        assert_eq!(
+            lines,
+            vec![
+                "GIT_CONFIG_COUNT=0",
+                "GIT_CONFIG_GLOBAL=/dev/null",
+                "GIT_CONFIG_NOSYSTEM=1",
+                "HOME=/dev/null",
+            ],
+            "subprocess env must contain exactly the four hardened entries",
+        );
+    }
 }
