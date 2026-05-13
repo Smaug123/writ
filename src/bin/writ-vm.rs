@@ -7,6 +7,7 @@
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 
@@ -20,7 +21,9 @@ use writ::vm_client::{
     get_session_json, init_workspace_from_broker, push_to_broker, upload_agent_run_outcome,
 };
 use writ::vm_git::{GitBranchName, GitCloneRef, GitCloneRepo, GitObjectId, WorkspaceWarmMode};
-use writ::vm_sandbox::{DEFAULT_PROBE_TIMEOUT, default_leak_probes, run_sandbox_leak_probes};
+use writ::vm_sandbox::{
+    DEFAULT_PROBE_TIMEOUT, SandboxLeakProbe, default_leak_probes, run_sandbox_leak_probes,
+};
 
 #[derive(Parser)]
 #[command(name = "writ-vm", about = "guest-side writ VM broker client")]
@@ -188,7 +191,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
     if let Cmd::Sandbox { action } = &args.cmd {
-        return run_sandbox(action).await;
+        return run_sandbox(action, &default_leak_probes(), DEFAULT_PROBE_TIMEOUT).await;
     }
 
     let config = config_from_args(&args)?;
@@ -282,18 +285,19 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-async fn run_sandbox(action: &SandboxCmd) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_sandbox(
+    action: &SandboxCmd,
+    probes: &[SandboxLeakProbe],
+    timeout: Duration,
+) -> Result<(), Box<dyn std::error::Error>> {
     match action {
-        SandboxCmd::Check => {
-            let probes = default_leak_probes();
-            match run_sandbox_leak_probes(&probes, DEFAULT_PROBE_TIMEOUT).await {
-                Ok(()) => {
-                    println!("sandbox check ok");
-                    Ok(())
-                }
-                Err(leak) => Err(format!("sandbox leak: {leak}").into()),
+        SandboxCmd::Check => match run_sandbox_leak_probes(probes, timeout).await {
+            Ok(()) => {
+                println!("sandbox check ok");
+                Ok(())
             }
-        }
+            Err(leak) => Err(format!("sandbox leak: {leak}").into()),
+        },
     }
 }
 
@@ -695,23 +699,16 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn sandbox_run_does_not_require_broker_config() {
-        // The sandbox check runs before broker traffic is possible. The
-        // dispatch must not call `config_from_args`, so missing broker env
-        // vars must not block the probe from running. We don't care whether
-        // the actual probes pass or fail in the host test environment — only
-        // that we reach them without a config error.
-        let result = run_sandbox(&SandboxCmd::Check).await;
-        // Either Ok (host actually blocks the probes — unlikely) or a leak
-        // error containing the "sandbox leak:" prefix. A `MissingEnv` error
-        // would indicate the refactor regressed.
-        if let Err(error) = &result {
-            let message = error.to_string();
-            assert!(
-                message.starts_with("sandbox leak:"),
-                "expected sandbox leak prefix, got: {message}"
-            );
-        }
+    async fn sandbox_run_with_empty_probe_set_returns_ok() {
+        // Run the sandbox dispatch with an injected empty probe set so the
+        // test does not depend on host DNS, network egress, or
+        // `lookup_host`'s blocking `getaddrinfo` task surviving timeout.
+        // Empty probes mean `run_sandbox_leak_probes` finds no breach and
+        // returns Ok, which lets us pin the dispatch signature without
+        // taking a config or talking to the network.
+        let result =
+            run_sandbox(&SandboxCmd::Check, &[], Duration::from_millis(10)).await;
+        assert!(result.is_ok(), "expected Ok, got {result:?}");
     }
 
     #[test]
