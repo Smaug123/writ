@@ -1154,7 +1154,7 @@ mod tests {
             PlanFeedback::try_new("ok\0nit"),
             Err(PlanFeedbackError::EmbeddedNul)
         ));
-        // A wire payload with ` ` must also fail at the parse
+        // A wire payload with `\u0000` must also fail at the parse
         // boundary, not slip through to the DB layer.
         assert!(serde_json::from_str::<PlanFeedback>("\"ok\\u0000nit\"").is_err());
     }
