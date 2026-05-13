@@ -13,8 +13,8 @@
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::agent_plan::{
-    CorrelationId, Decider, DecisionOutcome, DecisionView, PlanBody, PlanFeedback, PlanId,
-    ReviewId, Stage, Verdict,
+    AddendumId, CorrelationId, Decider, DecisionOutcome, DecisionView, PlanBody, PlanFeedback,
+    PlanId, ReviewId, Stage, Verdict,
 };
 use crate::agent_run::{AgentPrompt, AgentRunId};
 use crate::agent_vm_lifecycle::AgentVmSessionStateStatus;
@@ -114,17 +114,18 @@ pub struct PlanSummary {
 /// explicit about loading up to 256 KiB of markdown plus the joined
 /// review rows.
 ///
-/// `reviews` is ordered oldest-first to match the DAO's
-/// `submitted_at` ascending order, so the operator reading top-to-bottom
-/// sees how reviewer opinion evolved. `decision` is `None` until an
-/// operator runs `writ plan decide`. Both fields use `#[serde(default)]`
-/// so an older daemon's response (one that predates the field) still
-/// parses on a newer CLI — the older payload is treated as "no reviews,
-/// no decision," which matches its semantics.
+/// `reviews` and `addenda` are both ordered oldest-first to match the
+/// DAO's `submitted_at` ascending order, so the operator reading
+/// top-to-bottom sees how reviewer opinion evolved and how executor
+/// addenda were posted in turn. `decision` is `None` until an operator
+/// runs `writ plan decide`. All three fields use `#[serde(default)]` so
+/// an older daemon's response (one that predates the field) still parses
+/// on a newer CLI — the older payload is treated as "no reviews, no
+/// addenda, no decision," which matches its semantics.
 ///
-/// Slices 7/8 of the agent-plans roadmap will extend this struct with
-/// `addenda` and `abort` fields the same way — append-only, with
-/// `#[serde(default)]` for the same forward-compat reason.
+/// Slice 8 of the agent-plans roadmap will extend this struct with an
+/// `abort` field the same way — append-only, with `#[serde(default)]`
+/// for the same forward-compat reason.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PlanDetail {
     pub summary: PlanSummary,
@@ -133,6 +134,8 @@ pub struct PlanDetail {
     pub reviews: Vec<PlanReviewView>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decision: Option<DecisionView>,
+    #[serde(default)]
+    pub addenda: Vec<PlanAddendumView>,
 }
 
 /// One review row as exposed on the broker socket. Mirrors
@@ -154,6 +157,26 @@ pub struct PlanReviewView {
     pub verdict: Verdict,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub feedback: Option<PlanFeedback>,
+}
+
+/// One addendum row as exposed on the broker socket. Mirrors
+/// [`crate::audit::PlanAddendumRecord`] minus `plan_id` (redundant on
+/// the parent `PlanDetail` that carries this view); the digest is
+/// recomputable from the verbatim `body` and is not on the wire for
+/// the same reason as on [`PlanReviewView`].
+///
+/// `executor_run_id` is renamed from the schema column `agent_run_id`
+/// so it doesn't collide with `PlanSummary.agent_run_id` (the
+/// *planner's* run) inside the same `PlanDetail`. Confusing the
+/// addendum's author with the planner is the same footgun the
+/// reviewer-side rename guards against.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlanAddendumView {
+    pub addendum_id: AddendumId,
+    pub executor_run_id: AgentRunId,
+    pub submitted_at: UnixMillis,
+    pub body: PlanBody,
 }
 
 /// Maximum byte length of a [`RejectionReason`]. Sized to comfortably
@@ -1030,6 +1053,20 @@ mod tests {
             body: sample_plan_body(),
             reviews: Vec::new(),
             decision: None,
+            addenda: Vec::new(),
+        }
+    }
+
+    fn sample_addendum_id() -> AddendumId {
+        "f5f5f5f5-0000-0000-0000-000000000001".parse().unwrap()
+    }
+
+    fn sample_addendum_view() -> PlanAddendumView {
+        PlanAddendumView {
+            addendum_id: sample_addendum_id(),
+            executor_run_id: "f6f6f6f6-0000-0000-0000-000000000001".parse().unwrap(),
+            submitted_at: UnixMillis::from_millis(1_700_000_500_000),
+            body: PlanBody::try_new("# Addendum\n\nFollow-up notes.").unwrap(),
         }
     }
 
@@ -1230,6 +1267,15 @@ mod tests {
         assert_eq!(value["reviews"], serde_json::json!([]));
     }
 
+    /// `addenda` follows the same always-emit-[] convention as
+    /// `reviews`, so an operator reading the JSON can tell the absence
+    /// of executor addenda from a silent dropped field.
+    #[test]
+    fn plan_detail_empty_addenda_serialises_as_empty_array() {
+        let value: serde_json::Value = serde_json::to_value(sample_plan_detail()).unwrap();
+        assert_eq!(value["addenda"], serde_json::json!([]));
+    }
+
     /// A `None` decision drops the key on the wire (matches the
     /// `correlation_id` convention on `PlanSummary`). An older daemon
     /// that predates the field stays compatible because `#[serde(
@@ -1301,9 +1347,10 @@ mod tests {
         assert_eq!(back, review);
     }
 
-    /// An older daemon's payload (no `reviews`, no `decision`) parses
-    /// on the newer CLI as "no reviews, no decision." This is the
-    /// reason `#[serde(default)]` is on both fields.
+    /// An older daemon's payload (no `reviews`, no `decision`, no
+    /// `addenda`) parses on the newer CLI as "no reviews, no decision,
+    /// no addenda." This is the reason `#[serde(default)]` is on all
+    /// three fields.
     #[test]
     fn plan_detail_accepts_payload_without_reviews_or_decision() {
         let value = serde_json::json!({
@@ -1313,6 +1360,42 @@ mod tests {
         let parsed: PlanDetail = serde_json::from_value(value).unwrap();
         assert!(parsed.reviews.is_empty());
         assert!(parsed.decision.is_none());
+        assert!(parsed.addenda.is_empty());
+    }
+
+    /// A `PlanDetail` carrying executor addenda roundtrips byte-for-
+    /// byte. Pins the wire shape for the `executor_run_id` rename
+    /// against the audit-record-to-view mapping in `show_plan`, and
+    /// confirms the verbatim body survives the round trip.
+    #[test]
+    fn plan_detail_with_addenda_roundtrips() {
+        let mut detail = sample_plan_detail();
+        detail.addenda = vec![
+            sample_addendum_view(),
+            PlanAddendumView {
+                addendum_id: "f5f5f5f5-0000-0000-0000-000000000002".parse().unwrap(),
+                executor_run_id: "f6f6f6f6-0000-0000-0000-000000000002".parse().unwrap(),
+                submitted_at: UnixMillis::from_millis(1_700_000_600_000),
+                body: PlanBody::try_new("# Second addendum\n").unwrap(),
+            },
+        ];
+        let msg = ServerMessage::Plan { plan: detail };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert_eq!(serde_json::from_str::<ServerMessage>(&json).unwrap(), msg);
+    }
+
+    /// `PlanAddendumView` uses `deny_unknown_fields`, so a stray key on
+    /// the wire is rejected at parse time rather than silently dropped.
+    /// Matches the `PlanReviewView` convention.
+    #[test]
+    fn plan_addendum_view_rejects_unknown_fields() {
+        let mut value: serde_json::Value = serde_json::to_value(sample_addendum_view()).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .insert("bogus".into(), serde_json::json!("nope"));
+        let result: Result<PlanAddendumView, _> = serde_json::from_value(value);
+        assert!(result.is_err());
     }
 
     #[test]
