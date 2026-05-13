@@ -1776,10 +1776,7 @@ mod tests {
 
         let err = fetch_plan(&config, plan_id).await.unwrap_err();
 
-        assert!(matches!(
-            err,
-            VmClientError::BrokerHttp { status: 403, .. }
-        ));
+        assert!(matches!(err, VmClientError::BrokerHttp { status: 403, .. }));
     }
 
     #[tokio::test]

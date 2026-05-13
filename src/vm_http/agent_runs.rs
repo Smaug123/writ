@@ -424,13 +424,7 @@ mod tests {
         let service = VmHttpAgentRunService::new(state, temp.path().join("agent-runs"));
         let run_id: AgentRunId = "00000000-0000-0000-0000-000000000404".parse().unwrap();
         let prompt = AgentPrompt::new("plain prompt");
-        service.insert_run_config(
-            run_id,
-            prompt.clone(),
-            "gpt-5.4-mini",
-            Stage::Execute,
-            None,
-        );
+        service.insert_run_config(run_id, prompt.clone(), "gpt-5.4-mini", Stage::Execute, None);
 
         let response = route_agent_run_config_request(run_id, &service);
 
