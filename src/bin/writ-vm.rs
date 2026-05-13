@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
 
+use writ::agent_plan::{PlanId, Stage, compose_effective_prompt};
 use writ::agent_run::{
     AgentProcessPlan, AgentPrompt, AgentRunId, AgentRunTerminalStatus, run_agent_process,
 };
@@ -17,7 +18,8 @@ use writ::core::AgentKind;
 use writ::vm_client::{
     VM_BROKER_TOKEN_ENV, VM_BROKER_URL_ENV, VmClientConfig, VmClientConfigError, VmGitCloneCommand,
     VmGitPushCommand, VmWorkspaceInitCommand, clone_from_broker, fetch_agent_run_config,
-    get_session_json, init_workspace_from_broker, push_to_broker, upload_agent_run_outcome,
+    fetch_plan, get_session_json, init_workspace_from_broker, push_to_broker,
+    upload_agent_run_outcome,
 };
 use writ::vm_git::{GitBranchName, GitCloneRef, GitCloneRepo, GitObjectId, WorkspaceWarmMode};
 
@@ -235,11 +237,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 fake_agent,
             } => {
                 let run_id = parse_agent_run_id(&run_id)?;
-                let (prompt, model) = fetch_agent_run_config(&config, run_id).await?;
+                let (prompt, model, stage, read_plan_id) =
+                    fetch_agent_run_config(&config, run_id).await?;
+                let effective_prompt =
+                    fetch_and_compose_effective_prompt(&config, &prompt, stage, read_plan_id)
+                        .await?;
                 run_stage_agent(
                     agent,
                     run_id,
-                    &prompt,
+                    &effective_prompt,
                     &model,
                     &config,
                     fake_agent.as_deref(),
@@ -290,6 +296,26 @@ fn parse_agent_kind(raw: &str) -> Result<AgentKind, String> {
 fn parse_agent_run_id(raw: &str) -> Result<AgentRunId, Box<dyn std::error::Error>> {
     raw.parse()
         .map_err(|error| format!("invalid agent run ID {raw:?}: {error}").into())
+}
+
+async fn fetch_and_compose_effective_prompt(
+    config: &VmClientConfig,
+    prompt: &AgentPrompt,
+    stage: Stage,
+    read_plan_id: Option<PlanId>,
+) -> Result<AgentPrompt, Box<dyn std::error::Error>> {
+    // Slice 5 only composes for `(Stage::Execute, Some(plan_id))`. Other
+    // (stage, binding) combinations pass the prompt through unchanged
+    // (see `compose_effective_prompt`); the fetch is therefore skipped
+    // unless we know we'll consume the result. Reviewer composition is
+    // slice 6's problem — the `# Approved plan` separator does not
+    // fit a reviewer's reading.
+    let plan_view = match (stage, read_plan_id) {
+        (Stage::Execute, Some(plan_id)) => Some(fetch_plan(config, plan_id).await?),
+        _ => None,
+    };
+    let effective = compose_effective_prompt(prompt, stage, plan_view.as_ref().map(|p| &p.body))?;
+    Ok(effective)
 }
 
 async fn run_stage_agent(

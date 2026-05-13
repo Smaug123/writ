@@ -78,6 +78,16 @@ pub struct VmAgentRunConfigResponse {
     run_id: AgentRunId,
     prompt: AgentPrompt,
     model: String,
+    /// Stage the broker recorded for this run. The VM-side wrapper
+    /// uses it to decide whether to compose the plan body into the
+    /// prompt before launching the LLM (see
+    /// [`crate::agent_plan::compose_effective_prompt`]).
+    stage: crate::agent_plan::Stage,
+    /// Plan this run is bound to read. Always present on the wire
+    /// (explicitly `null` when the run has no binding). Used together
+    /// with `stage` by the VM-side wrapper to fetch the plan body and
+    /// compose it into the prompt for execute-stage runs.
+    read_plan_id: Option<crate::agent_plan::PlanId>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
@@ -181,11 +191,19 @@ impl<'de> Deserialize<'de> for AgentPrompt {
 }
 
 impl VmAgentRunConfigResponse {
-    pub fn new(run_id: AgentRunId, prompt: AgentPrompt, model: impl Into<String>) -> Self {
+    pub fn new(
+        run_id: AgentRunId,
+        prompt: AgentPrompt,
+        model: impl Into<String>,
+        stage: crate::agent_plan::Stage,
+        read_plan_id: Option<crate::agent_plan::PlanId>,
+    ) -> Self {
         Self {
             run_id,
             prompt,
             model: model.into(),
+            stage,
+            read_plan_id,
         }
     }
 
@@ -201,8 +219,23 @@ impl VmAgentRunConfigResponse {
         &self.model
     }
 
-    pub fn into_parts(self) -> (AgentPrompt, String) {
-        (self.prompt, self.model)
+    pub fn stage(&self) -> crate::agent_plan::Stage {
+        self.stage
+    }
+
+    pub fn read_plan_id(&self) -> Option<crate::agent_plan::PlanId> {
+        self.read_plan_id
+    }
+
+    pub fn into_parts(
+        self,
+    ) -> (
+        AgentPrompt,
+        String,
+        crate::agent_plan::Stage,
+        Option<crate::agent_plan::PlanId>,
+    ) {
+        (self.prompt, self.model, self.stage, self.read_plan_id)
     }
 }
 

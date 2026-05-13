@@ -13,6 +13,7 @@ use std::process::{Command, ExitStatus, Stdio};
 
 use reqwest::Url;
 
+use crate::agent_plan::{PlanId, PlanView, Stage, vm_plan_path};
 use crate::agent_run::{
     AgentPrompt, AgentRunId, AgentRunOutcome, AgentRunStreamSummary, AgentRunStreamUpload,
     VmAgentRunConfigResponse, VmAgentRunOutcomeUpload, vm_agent_run_config_path,
@@ -427,7 +428,7 @@ pub async fn get_session_json(config: &VmClientConfig) -> Result<serde_json::Val
 pub async fn fetch_agent_run_config(
     config: &VmClientConfig,
     run_id: AgentRunId,
-) -> Result<(AgentPrompt, String), VmClientError> {
+) -> Result<(AgentPrompt, String, Stage, Option<PlanId>), VmClientError> {
     let response = reqwest::Client::new()
         .get(config.endpoint(&vm_agent_run_config_path(run_id)))
         .bearer_auth(config.bearer_token().as_str())
@@ -439,6 +440,33 @@ pub async fn fetch_agent_run_config(
         .json::<VmAgentRunConfigResponse>()
         .await
         .map(VmAgentRunConfigResponse::into_parts)
+        .map_err(VmClientError::from)
+}
+
+/// Fetch a plan view from the host broker. Used by the implementer
+/// VM wrapper to compose the originating prompt with the approved
+/// plan body before invoking the LLM (see
+/// [`crate::agent_plan::compose_effective_prompt`]).
+///
+/// Authorisation happens host-side: the broker checks that the
+/// calling session's agent_run has `read_plan_id = <plan_id>` and
+/// that the stage gate is satisfied. If the wrapper's run was not
+/// bound to this plan, the broker returns 401/403 and this function
+/// surfaces a `VmClientError::BrokerHttp`.
+pub async fn fetch_plan(
+    config: &VmClientConfig,
+    plan_id: PlanId,
+) -> Result<PlanView, VmClientError> {
+    let response = reqwest::Client::new()
+        .get(config.endpoint(&vm_plan_path(plan_id)))
+        .bearer_auth(config.bearer_token().as_str())
+        .send()
+        .await?;
+    let response = require_success(response).await?;
+    require_content_type(&response, "application/json")?;
+    response
+        .json::<PlanView>()
+        .await
         .map_err(VmClientError::from)
 }
 
@@ -1664,21 +1692,26 @@ mod tests {
     async fn fetch_agent_run_config_gets_one_run_config_with_bearer_token() {
         let run_id: AgentRunId = "00000000-0000-0000-0000-000000000501".parse().unwrap();
         let prompt = AgentPrompt::new("SECRET prompt");
+        let plan_id: PlanId = "00000000-0000-0000-0000-000000000b01".parse().unwrap();
         let body = serde_json::to_vec(&VmAgentRunConfigResponse::new(
             run_id,
             prompt.clone(),
             "gpt-5.4-mini",
+            Stage::Execute,
+            Some(plan_id),
         ))
         .unwrap();
         let (broker_url, captured) =
             serve_once(http_response("200 OK", "application/json", &body)).await;
         let config = VmClientConfig::new(broker_url, "writ-vm-secret").unwrap();
 
-        let (fetched_prompt, fetched_model) =
+        let (fetched_prompt, fetched_model, fetched_stage, fetched_plan_id) =
             fetch_agent_run_config(&config, run_id).await.unwrap();
 
         assert_eq!(fetched_prompt, prompt);
         assert_eq!(fetched_model, "gpt-5.4-mini");
+        assert_eq!(fetched_stage, Stage::Execute);
+        assert_eq!(fetched_plan_id, Some(plan_id));
         let request = captured.lock().unwrap().clone();
         assert!(
             request.starts_with(
@@ -1692,6 +1725,61 @@ mod tests {
             "{request}"
         );
         assert!(!format!("{fetched_prompt:?}").contains(prompt.as_str()));
+    }
+
+    #[tokio::test]
+    async fn fetch_plan_gets_plan_view_with_bearer_token() {
+        use crate::agent_plan::{PlanBody, PlanView};
+        let plan_id: PlanId = "00000000-0000-0000-0000-000000000b02".parse().unwrap();
+        let originating_run_id: AgentRunId =
+            "00000000-0000-0000-0000-000000000c02".parse().unwrap();
+        let body = PlanBody::try_new("# Plan\n\nDo a thing.").unwrap();
+        let view = PlanView {
+            plan_id,
+            body: body.clone(),
+            originating_run_id,
+            decision: None,
+        };
+        let payload = serde_json::to_vec(&view).unwrap();
+        let (broker_url, captured) =
+            serve_once(http_response("200 OK", "application/json", &payload)).await;
+        let config = VmClientConfig::new(broker_url, "writ-vm-secret").unwrap();
+
+        let fetched = fetch_plan(&config, plan_id).await.unwrap();
+
+        assert_eq!(fetched.plan_id, plan_id);
+        assert_eq!(fetched.body, body);
+        assert_eq!(fetched.originating_run_id, originating_run_id);
+        assert_eq!(fetched.decision, None);
+        let request = captured.lock().unwrap().clone();
+        assert!(
+            request.starts_with(&format!("GET /v1/plans/{plan_id} HTTP/1.1")),
+            "{request}"
+        );
+        assert!(
+            request.contains("authorization: Bearer writ-vm-secret")
+                || request.contains("Authorization: Bearer writ-vm-secret"),
+            "{request}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_plan_surfaces_broker_http_errors() {
+        let plan_id: PlanId = "00000000-0000-0000-0000-000000000b03".parse().unwrap();
+        let (broker_url, _captured) = serve_once(http_response(
+            "403 Forbidden",
+            "text/plain",
+            b"stage plan is not permitted to read_plan",
+        ))
+        .await;
+        let config = VmClientConfig::new(broker_url, "writ-vm-secret").unwrap();
+
+        let err = fetch_plan(&config, plan_id).await.unwrap_err();
+
+        assert!(matches!(
+            err,
+            VmClientError::BrokerHttp { status: 403, .. }
+        ));
     }
 
     #[tokio::test]

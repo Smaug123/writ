@@ -651,7 +651,13 @@ impl AgentVmDaemon {
                     Arc::clone(&state),
                     self.config.vm_http.agent_run_log_root(),
                 );
-                agent_runs.insert_run_config(run_id, prompt.clone(), agent_model.clone());
+                agent_runs.insert_run_config(
+                    run_id,
+                    prompt.clone(),
+                    agent_model.clone(),
+                    stage,
+                    read_plan_id,
+                );
                 let guest_command =
                     build_agent_run_guest_command(agent_kind, run_id, workspace.warm);
                 self.start_session_after_audit_opened(
