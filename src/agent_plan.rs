@@ -312,6 +312,8 @@ pub enum PlanFeedbackError {
     Empty,
     #[error("plan feedback is {byte_len} bytes, exceeding the {max_bytes}-byte limit")]
     TooLarge { byte_len: usize, max_bytes: usize },
+    #[error("plan feedback contains an embedded NUL byte")]
+    EmbeddedNul,
 }
 
 impl PlanFeedback {
@@ -325,6 +327,15 @@ impl PlanFeedback {
                 byte_len: body.len(),
                 max_bytes: MAX_PLAN_FEEDBACK_BYTES,
             });
+        }
+        // Mirror the audit-schema CHECK on `plan_review.feedback`: an
+        // embedded NUL is a parse error at the boundary, not a SQLite
+        // CHECK error surfaced from inside the DAO. Reviewer prose is
+        // free-text Markdown, so a NUL is never anyone's intent;
+        // rejecting at the typed boundary lets the DAO assume the
+        // invariant.
+        if body.as_bytes().contains(&0) {
+            return Err(PlanFeedbackError::EmbeddedNul);
         }
         Ok(Self(body))
     }
@@ -1171,6 +1182,21 @@ mod tests {
             PlanFeedback::try_new(too_big),
             Err(PlanFeedbackError::TooLarge { .. })
         ));
+    }
+
+    /// The audit schema rejects NULs in `plan_review.feedback`; the
+    /// newtype must match so a typed payload that the parse boundary
+    /// would accept can never fail later with a raw SQLite CHECK error
+    /// inside the DAO.
+    #[test]
+    fn plan_feedback_rejects_embedded_nul() {
+        assert!(matches!(
+            PlanFeedback::try_new("ok\0nit"),
+            Err(PlanFeedbackError::EmbeddedNul)
+        ));
+        // A wire payload with `\u0000` must also fail at the parse
+        // boundary, not slip through to the DB layer.
+        assert!(serde_json::from_str::<PlanFeedback>("\"ok\\u0000nit\"").is_err());
     }
 
     #[test]

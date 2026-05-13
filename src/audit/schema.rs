@@ -30,7 +30,7 @@ pub(super) struct Migration {
 /// a version higher than this is rejected with [`AuditError::SchemaTooNew`]
 /// rather than opened — we'd rather fail to start than silently drop data
 /// into a schema a newer broker wrote.
-pub(super) const SCHEMA_VERSION: i32 = 19;
+pub(super) const SCHEMA_VERSION: i32 = 20;
 
 /// The full migration history. Each entry documents exactly one state
 /// transition; the sequence of entries is the schema's lineage. Order
@@ -1109,6 +1109,131 @@ CREATE TABLE plan_decision (
 ALTER TABLE agent_run ADD COLUMN read_plan_id TEXT NULL
     REFERENCES plan(plan_id)
     CHECK (read_plan_id IS NULL OR typeof(read_plan_id) = 'text');
+"#,
+    },
+    // Slice 6 (reviewer verdicts). Adds the `plan_review` table:
+    // zero-or-more reviewer rows per plan, each verdict attached to one
+    // reviewer agent run. There can be many reviews per plan (different
+    // reviewers, different rounds) but at most one review per reviewer
+    // run — enforced by `UNIQUE(agent_run_id)` so a future code path
+    // that bypasses the DAO cannot stuff a single reviewer with two
+    // verdicts.
+    //
+    // Two triggers gate inserts:
+    //
+    //   * `plan_review_requires_open_session` — mirrors the
+    //     `plan_requires_open_session` pattern. A review can only land
+    //     while the reviewer's session is still open; once an operator
+    //     closes the session no further verdicts can attach. Pairs with
+    //     the existing session-window invariant.
+    //
+    //   * `plan_review_requires_reviewer_run` — verdicts belong to
+    //     `review`-stage runs that explicitly read this plan: both
+    //     `agent_run.stage = 'review'` and `agent_run.read_plan_id =
+    //     NEW.plan_id` must hold. The route contract requires the same
+    //     pair (`docs/plans/2026-05-11-agent-plans.md`, "POST
+    //     /v1/plans/<plan_id>/reviews" → `run.stage = 'review' and
+    //     run.read_plan_id = <plan_id>`); restating both in the trigger
+    //     means even a raw INSERT cannot smuggle in a planner/executor
+    //     row, a verdict against a different plan than the reviewer
+    //     read, or a reviewer with no `read_plan_id` binding at all.
+    //
+    // `verdict` is the closed enum from `agent_plan::Verdict`; its CHECK
+    // enumerates exactly the wire strings the newtype produces.
+    // `feedback` is optional prose bounded by the same defence-in-depth
+    // pattern as `plan.body` (TEXT storage class, no embedded NUL,
+    // byte-bounded). The byte cap mirrors `MAX_PLAN_FEEDBACK_BYTES`
+    // (64 KiB); a raw INSERT that bypasses the typed layer still cannot
+    // smuggle an oversized or NUL-bearing feedback row into the audit
+    // log. `feedback` and `feedback_sha256` always travel together — a
+    // dedicated table-level CHECK enforces "both or neither" so a
+    // future code path cannot persist a digest with no body or vice
+    // versa.
+    Migration {
+        version: 20,
+        sql: r#"
+CREATE TABLE plan_review (
+    -- TEXT PRIMARY KEY in a rowid table does not imply NOT NULL (the
+    -- v1/v2 compat quirk also exploited by the plan_decision migration);
+    -- mark explicitly so a raw INSERT with `review_id = NULL` cannot
+    -- bypass the per-row uniqueness.
+    review_id        TEXT PRIMARY KEY NOT NULL,
+    plan_id          TEXT NOT NULL REFERENCES plan(plan_id),
+    agent_run_id     TEXT NOT NULL REFERENCES agent_run(run_id),
+    submitted_at     INTEGER NOT NULL,
+    verdict          TEXT NOT NULL CHECK (
+        typeof(verdict) = 'text'
+        AND verdict IN ('approve', 'request_changes', 'reject')
+    ),
+    feedback         TEXT NULL CHECK (
+        feedback IS NULL OR (
+            typeof(feedback) = 'text'
+            AND length(cast(feedback AS BLOB)) BETWEEN 1 AND 65536
+            AND instr(cast(feedback AS BLOB), x'00') = 0
+        )
+    ),
+    -- The digest must be exactly 64 lowercase hex chars in TEXT storage
+    -- class; a BLOB binding, a 64-character non-hex value, or a value
+    -- like `<64 hex chars>\0junk` would otherwise be silently accepted
+    -- and then fail later inside the DAO read path
+    -- (`plan_review_from_row` runs `validate_sha256_hex`).
+    --
+    -- The four clauses combine to make every byte of the stored value
+    -- pass the hex test:
+    --
+    --   * `typeof = 'text'` rejects a BLOB binding (SQLite's declared
+    --     column types are advisory — TEXT NULL accepts a BLOB unless
+    --     this guard is present).
+    --   * `length(cast AS BLOB) = length(...)` rejects any embedded
+    --     NUL, because `length()` on TEXT stops at the first NUL while
+    --     the BLOB length walks every byte.
+    --   * `length(...) = 64` pins the size.
+    --   * `NOT GLOB '*[^0-9a-f]*'` rejects any non-hex character.
+    --
+    -- Without the NUL parity guard, `length()` and `GLOB` only see the
+    -- prefix before a NUL, so a value such as `'aa..aa\0junk'` would
+    -- slip past the size and class checks and then be unreadable by
+    -- the typed reader.
+    feedback_sha256  TEXT NULL CHECK (
+        feedback_sha256 IS NULL OR (
+            typeof(feedback_sha256) = 'text'
+            AND length(feedback_sha256) = length(cast(feedback_sha256 AS BLOB))
+            AND length(feedback_sha256) = 64
+            AND feedback_sha256 NOT GLOB '*[^0-9a-f]*'
+        )
+    ),
+    UNIQUE (agent_run_id),
+    CHECK (
+        (feedback IS NULL AND feedback_sha256 IS NULL)
+        OR (feedback IS NOT NULL AND feedback_sha256 IS NOT NULL)
+    )
+);
+
+CREATE INDEX idx_plan_review_plan ON plan_review(plan_id);
+
+CREATE TRIGGER plan_review_requires_open_session
+BEFORE INSERT ON plan_review
+WHEN EXISTS (
+    SELECT 1 FROM agent_run ar
+    JOIN session s ON s.session_id = ar.session_id
+    WHERE ar.run_id = NEW.agent_run_id AND s.closed_at IS NOT NULL
+)
+BEGIN
+    SELECT RAISE(ABORT, 'session is closed');
+END;
+
+CREATE TRIGGER plan_review_requires_reviewer_run
+BEFORE INSERT ON plan_review
+WHEN NOT EXISTS (
+    SELECT 1 FROM agent_run ar
+    WHERE ar.run_id = NEW.agent_run_id
+      AND ar.stage = 'review'
+      AND ar.read_plan_id = NEW.plan_id
+)
+BEGIN
+    SELECT RAISE(ABORT,
+        'plan_review requires agent_run.stage = ''review'' AND agent_run.read_plan_id = plan_id');
+END;
 "#,
     },
 ];
