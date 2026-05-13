@@ -166,6 +166,29 @@ while [ ! -f /run/writ-agent-vm/broker-ready ]; do
   sleep 0.2
 done
 
+# Smoke-test the sandbox before any broker traffic. `writ-vm sandbox check`
+# attempts known-external TCP connects (and a DNS resolve) that the
+# PF/host-only-network sandbox should refuse. If any succeed, fail closed.
+set +e
+writ-vm sandbox check \
+  > /run/writ-agent-vm/sandbox-check.stdout \
+  2> /run/writ-agent-vm/sandbox-check.stderr
+sandbox_code=$?
+set -e
+if [ "$sandbox_code" -ne 0 ]; then
+  set +e
+  {
+    printf 'writ-vm sandbox check failed with exit %s\n' "$sandbox_code"
+    if [ -s /run/writ-agent-vm/sandbox-check.stderr ]; then
+      printf '%s\n' 'stderr:'
+      cat /run/writ-agent-vm/sandbox-check.stderr
+    fi
+  } > /run/writ-agent-vm/bootstrap-failed
+  set -e
+  while :; do sleep 3600; done
+fi
+rm -f /run/writ-agent-vm/sandbox-check.stdout /run/writ-agent-vm/sandbox-check.stderr
+
 set +e
 writ-vm workspace init "$repo" "$destination" --warm "$warm" \
   > /run/writ-agent-vm/bootstrap.stdout \
@@ -2225,6 +2248,50 @@ mod tests {
         assert!(
             AGENT_VM_GUEST_WORKSPACE_BOOTSTRAP_SCRIPT
                 .contains(AGENT_VM_WORKSPACE_BOOTSTRAP_FAILED_PATH)
+        );
+    }
+
+    #[test]
+    fn workspace_bootstrap_script_runs_sandbox_check_before_workspace_init() {
+        let script = AGENT_VM_GUEST_WORKSPACE_BOOTSTRAP_SCRIPT;
+        let sandbox_idx = script
+            .find("writ-vm sandbox check")
+            .expect("script should invoke writ-vm sandbox check");
+        let workspace_init_idx = script
+            .find("writ-vm workspace init")
+            .expect("script should invoke writ-vm workspace init");
+        assert!(
+            sandbox_idx < workspace_init_idx,
+            "sandbox check ({sandbox_idx}) must precede workspace init ({workspace_init_idx})"
+        );
+        let broker_ready_idx = script
+            .find(AGENT_VM_WORKSPACE_BROKER_READY_PATH)
+            .expect("script should reference broker-ready");
+        assert!(
+            broker_ready_idx < sandbox_idx,
+            "sandbox check must wait for broker-ready first"
+        );
+    }
+
+    #[test]
+    fn workspace_bootstrap_script_routes_sandbox_failure_to_bootstrap_failed() {
+        let script = AGENT_VM_GUEST_WORKSPACE_BOOTSTRAP_SCRIPT;
+        let sandbox_idx = script.find("writ-vm sandbox check").expect("sandbox check");
+        // Everything from the sandbox-check invocation up to the next workspace
+        // init invocation is the "sandbox failed" branch. Assert that branch
+        // writes the captured stderr through to bootstrap-failed.
+        let workspace_init_idx = script
+            .find("writ-vm workspace init")
+            .expect("workspace init");
+        let sandbox_failure_block = &script[sandbox_idx..workspace_init_idx];
+        assert!(
+            sandbox_failure_block.contains(AGENT_VM_WORKSPACE_BOOTSTRAP_FAILED_PATH),
+            "sandbox failure branch must write to {}",
+            AGENT_VM_WORKSPACE_BOOTSTRAP_FAILED_PATH
+        );
+        assert!(
+            sandbox_failure_block.contains("sandbox-check.stderr"),
+            "sandbox failure branch must include the captured stderr"
         );
     }
 

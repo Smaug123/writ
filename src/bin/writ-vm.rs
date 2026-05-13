@@ -20,6 +20,7 @@ use writ::vm_client::{
     get_session_json, init_workspace_from_broker, push_to_broker, upload_agent_run_outcome,
 };
 use writ::vm_git::{GitBranchName, GitCloneRef, GitCloneRepo, GitObjectId, WorkspaceWarmMode};
+use writ::vm_sandbox::{DEFAULT_PROBE_TIMEOUT, default_leak_probes, run_sandbox_leak_probes};
 
 #[derive(Parser)]
 #[command(name = "writ-vm", about = "guest-side writ VM broker client")]
@@ -52,6 +53,11 @@ enum Cmd {
     Agent {
         #[command(subcommand)]
         action: AgentCmd,
+    },
+    /// Sandbox self-tests run inside the VM before any broker traffic.
+    Sandbox {
+        #[command(subcommand)]
+        action: SandboxCmd,
     },
 }
 
@@ -127,6 +133,15 @@ enum WorkspaceCmd {
 }
 
 #[derive(Subcommand)]
+enum SandboxCmd {
+    /// Probe that the guest sandbox refuses external egress. Exits 0 on an
+    /// intact sandbox; on a detected leak, prints the breach to stderr and
+    /// exits non-zero. The guest bootstrap runs this before any broker
+    /// traffic, so a sandbox break fails the session closed.
+    Check,
+}
+
+#[derive(Subcommand)]
 enum AgentCmd {
     /// Fetch the brokered prompt and run the configured stage adapter.
     Run {
@@ -152,18 +167,34 @@ enum WorkspaceWarmArg {
 
 #[tokio::main]
 async fn main() {
-    if let Err(error) = run().await {
-        eprintln!("error: {error}");
-        std::process::exit(1);
-    }
+    // Exit unconditionally rather than falling off the end of main so the
+    // tokio runtime does not block shutdown on detached `spawn_blocking`
+    // work — notably the `getaddrinfo` thread that backs
+    // `tokio::net::lookup_host`. If the sandbox DNS probe times out, that
+    // thread keeps running until libc returns; `std::process::exit` lets
+    // the process exit and the OS reaps it.
+    let code = match run().await {
+        Ok(()) => 0,
+        Err(error) => {
+            eprintln!("error: {error}");
+            1
+        }
+    };
+    std::process::exit(code);
 }
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     writ::telemetry::init("warn")?;
     let args = Args::parse();
+
+    if let Cmd::Sandbox { action } = &args.cmd {
+        return run_sandbox(action).await;
+    }
+
     let config = config_from_args(&args)?;
 
     match args.cmd {
+        Cmd::Sandbox { .. } => unreachable!("Sandbox dispatched above"),
         Cmd::Session => {
             let session = get_session_json(&config).await?;
             println!("{}", serde_json::to_string_pretty(&session)?);
@@ -249,6 +280,21 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         },
     }
     Ok(())
+}
+
+async fn run_sandbox(action: &SandboxCmd) -> Result<(), Box<dyn std::error::Error>> {
+    match action {
+        SandboxCmd::Check => {
+            let probes = default_leak_probes();
+            match run_sandbox_leak_probes(&probes, DEFAULT_PROBE_TIMEOUT).await {
+                Ok(()) => {
+                    println!("sandbox check ok");
+                    Ok(())
+                }
+                Err(leak) => Err(format!("sandbox leak: {leak}").into()),
+            }
+        }
+    }
 }
 
 fn config_from_args(args: &Args) -> Result<VmClientConfig, VmClientConfigError> {
@@ -634,6 +680,37 @@ mod tests {
                 assert!(create_branch);
             }
             _ => panic!("unexpected command"),
+        }
+    }
+
+    #[test]
+    fn sandbox_check_parses_to_check_action() {
+        let args = Args::try_parse_from(["writ-vm", "sandbox", "check"]).unwrap();
+        assert!(matches!(
+            args.cmd,
+            Cmd::Sandbox {
+                action: SandboxCmd::Check,
+            }
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn sandbox_run_does_not_require_broker_config() {
+        // The sandbox check runs before broker traffic is possible. The
+        // dispatch must not call `config_from_args`, so missing broker env
+        // vars must not block the probe from running. We don't care whether
+        // the actual probes pass or fail in the host test environment — only
+        // that we reach them without a config error.
+        let result = run_sandbox(&SandboxCmd::Check).await;
+        // Either Ok (host actually blocks the probes — unlikely) or a leak
+        // error containing the "sandbox leak:" prefix. A `MissingEnv` error
+        // would indicate the refactor regressed.
+        if let Err(error) = &result {
+            let message = error.to_string();
+            assert!(
+                message.starts_with("sandbox leak:"),
+                "expected sandbox leak prefix, got: {message}"
+            );
         }
     }
 

@@ -50,6 +50,8 @@ pub mod ui_http;
 pub mod vm_client;
 #[cfg(feature = "vm-client")]
 pub mod vm_git;
+#[cfg(feature = "vm-client")]
+pub mod vm_sandbox;
 #[cfg(feature = "host")]
 pub mod vm_git_bundle;
 #[cfg(feature = "host")]
