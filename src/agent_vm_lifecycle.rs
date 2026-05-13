@@ -174,6 +174,11 @@ pub enum AgentVmStartStep {
     InstallFirewall(ProcessInvocation),
     StartVm(AgentVmStartInvocation),
     ProbeAndValidateGuestIpv6 { probe_invocation: ProcessInvocation },
+    /// Host-observed sandbox smoke test executed in the running container's
+    /// network namespace via `container exec`. Must run before
+    /// [`AgentVmStartStep::ReleaseGuestCommand`] so a failed sandbox check
+    /// surfaces as a [`StartFailure`] before the guest command is unblocked.
+    ProbeAndValidateSandbox { probe_invocation: ProcessInvocation },
     ReleaseGuestCommand(ProcessInvocation),
 }
 
@@ -241,6 +246,7 @@ pub enum StartOutcome {
     StartVmFailed,
     ProbeGuestIpv6Failed,
     ValidateGuestIpv6Failed,
+    ProbeSandboxFailed,
     ReleaseGuestCommandFailed,
 }
 
@@ -543,6 +549,7 @@ pub fn cleanup_step_after_start_outcome(outcome: StartOutcome) -> Option<Complet
         StartOutcome::StartVmFailed
         | StartOutcome::ProbeGuestIpv6Failed
         | StartOutcome::ValidateGuestIpv6Failed
+        | StartOutcome::ProbeSandboxFailed
         | StartOutcome::ReleaseGuestCommandFailed => Some(CompletedStartStep::FirewallInstalled),
     }
 }
@@ -662,6 +669,9 @@ impl AgentVmSessionPlan {
         if self.ipv6_mode == Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6 {
             steps.push(AgentVmStartStep::ProbeAndValidateGuestIpv6 {
                 probe_invocation: self.probe_guest_ipv6_invocation(),
+            });
+            steps.push(AgentVmStartStep::ProbeAndValidateSandbox {
+                probe_invocation: self.probe_sandbox_invocation(),
             });
             steps.push(AgentVmStartStep::ReleaseGuestCommand(
                 self.release_guest_command_invocation(),
@@ -895,6 +905,19 @@ impl AgentVmSessionPlan {
                 "sh".to_string(),
                 "-c".to_string(),
                 GUEST_IPV6_PROBE_SCRIPT.to_string(),
+            ],
+        )
+    }
+
+    fn probe_sandbox_invocation(&self) -> ProcessInvocation {
+        ProcessInvocation::new(
+            self.tools.container.clone(),
+            [
+                "exec".to_string(),
+                self.names.vm.clone(),
+                "writ-vm".to_string(),
+                "sandbox".to_string(),
+                "check".to_string(),
             ],
         )
     }
@@ -1956,7 +1979,8 @@ impl AgentVmStartStep {
             | Self::InstallFirewall(inv)
             | Self::ReleaseGuestCommand(inv) => AgentVmStartInvocation::Static(inv),
             Self::StartVm(inv) => inv,
-            Self::ProbeAndValidateGuestIpv6 { probe_invocation } => {
+            Self::ProbeAndValidateGuestIpv6 { probe_invocation }
+            | Self::ProbeAndValidateSandbox { probe_invocation } => {
                 AgentVmStartInvocation::Static(probe_invocation)
             }
         }
@@ -1976,6 +2000,7 @@ pub fn step_cleanup_phase(step: &AgentVmStartStep) -> CompletedStartStep {
         }
         AgentVmStartStep::StartVm(_)
         | AgentVmStartStep::ProbeAndValidateGuestIpv6 { .. }
+        | AgentVmStartStep::ProbeAndValidateSandbox { .. }
         | AgentVmStartStep::ReleaseGuestCommand(_) => CompletedStartStep::FirewallInstalled,
     }
 }
@@ -1996,6 +2021,7 @@ pub fn step_failure_outcomes(step: &AgentVmStartStep) -> Vec<StartOutcome> {
             StartOutcome::ProbeGuestIpv6Failed,
             StartOutcome::ValidateGuestIpv6Failed,
         ],
+        AgentVmStartStep::ProbeAndValidateSandbox { .. } => vec![StartOutcome::ProbeSandboxFailed],
         AgentVmStartStep::ReleaseGuestCommand(_) => vec![StartOutcome::ReleaseGuestCommandFailed],
     }
 }
@@ -2174,6 +2200,9 @@ fn run_start_step(
                 .require_no_routable_ipv6()
                 .map_err(|err| (err.into(), StartOutcome::ValidateGuestIpv6Failed))
         }
+        AgentVmStartStep::ProbeAndValidateSandbox { probe_invocation } => probe_invocation
+            .run()
+            .map_err(|err| (err.into(), StartOutcome::ProbeSandboxFailed)),
         AgentVmStartStep::ReleaseGuestCommand(invocation) => invocation
             .run()
             .map_err(|err| (err.into(), StartOutcome::ReleaseGuestCommandFailed)),
@@ -2951,6 +2980,7 @@ mod tests {
             Just(StartOutcome::StartVmFailed),
             Just(StartOutcome::ProbeGuestIpv6Failed),
             Just(StartOutcome::ValidateGuestIpv6Failed),
+            Just(StartOutcome::ProbeSandboxFailed),
             Just(StartOutcome::ReleaseGuestCommandFailed),
         ]
     }
@@ -3185,7 +3215,7 @@ mod tests {
     fn ipv4_only_start_invocations_probe_before_releasing_guest_command() {
         let invocations =
             plan_with_ipv6_mode(252, Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6).start_invocations();
-        assert_eq!(invocations.len(), 6);
+        assert_eq!(invocations.len(), 7);
         let firewall_args = invocations[2].args_lossy();
         assert_eq!(&firewall_args[0..2], ["writ-agent-vm-pf-helper", "install"]);
         assert!(!firewall_args.contains(&"--ipv6-cidr".to_string()));
@@ -3218,6 +3248,16 @@ mod tests {
         );
         assert_eq!(
             invocations[5].args_lossy(),
+            [
+                "exec",
+                "writ-agent-vm-51b8fd0f-6c10-454c-b0e6-7df1d60e2e6d",
+                "writ-vm",
+                "sandbox",
+                "check",
+            ]
+        );
+        assert_eq!(
+            invocations[6].args_lossy(),
             [
                 "exec",
                 "writ-agent-vm-51b8fd0f-6c10-454c-b0e6-7df1d60e2e6d",
@@ -3771,6 +3811,7 @@ mod tests {
                 StartOutcome::StartVmFailed
                 | StartOutcome::ProbeGuestIpv6Failed
                 | StartOutcome::ValidateGuestIpv6Failed
+                | StartOutcome::ProbeSandboxFailed
                 | StartOutcome::ReleaseGuestCommandFailed => 7,
             };
             prop_assert_eq!(cleanup.len(), expected_len);
@@ -3829,11 +3870,12 @@ mod tests {
             StartOutcome::StartVmFailed,
             StartOutcome::ProbeGuestIpv6Failed,
             StartOutcome::ValidateGuestIpv6Failed,
+            StartOutcome::ProbeSandboxFailed,
             StartOutcome::ReleaseGuestCommandFailed,
         ] {
             assert!(produced.contains(&outcome), "no step produces {outcome:?}",);
         }
-        assert_eq!(produced.len(), 9, "produced = {produced:?}");
+        assert_eq!(produced.len(), 10, "produced = {produced:?}");
     }
 
     proptest! {
