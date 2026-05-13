@@ -1038,10 +1038,16 @@ exit 42
         let script = dir.path().join("descendant-survivor");
         let shell = required_test_tool("sh");
         let sleep = shell_quote(&required_test_tool("sleep"));
+        // `$1.started` is touched before the sleep so a caller can wait
+        // for the descendant to actually exist (and thus be in the
+        // parent's process group) before triggering cleanup, instead of
+        // relying on a fixed-duration sleep that races on contended
+        // hosts. `$1` ("survived") is written only if the sleep
+        // completes without being killed.
         std::fs::write(
             &script,
             format!(
-                "#!{}\n# Ignore HUP so only process-group SIGKILL can satisfy the cleanup test.\ntrap '' HUP\n{} 1\nprintf survived > \"$1\"\n",
+                "#!{}\n# Ignore HUP so only process-group SIGKILL can satisfy the cleanup test.\ntrap '' HUP\nprintf started > \"$1.started\"\n{} 1\nprintf survived > \"$1\"\n",
                 shell.display(),
                 sleep,
             ),
@@ -1574,12 +1580,13 @@ exit 42
         let dir = tempfile::tempdir().unwrap();
         let survivor = descendant_survivor_script(&dir);
         let survivor_marker = dir.path().join("descendant-survived");
+        let survivor_started_marker = dir.path().join("descendant-survived.started");
         let clone_extra = format!(
             "{} {} &\nwait\n",
             shell_quote(&survivor),
             shell_quote(&survivor_marker)
         );
-        let (git, log) = fake_git_program(&dir, &clone_extra, "");
+        let (git, _log) = fake_git_program(&dir, &clone_extra, "");
         let work = dir.path().join("work");
         let plan = plan_with_paths(
             git,
@@ -1591,8 +1598,13 @@ exit 42
         let secret = git_secret();
 
         let handle = tokio::spawn(async move { run_git_clone_bundle(&plan, &secret).await });
-        wait_for_path_or_finished(&log, &handle).await;
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        // Wait for the descendant to *actually* exist (and inherit the
+        // child's process group) before triggering cleanup. The
+        // previous fixed-duration sleep raced on contended hosts: if
+        // the shell hadn't reached `${survivor} &` by the time the
+        // abort fired, the descendant was forked *after* the
+        // process-group SIGKILL and survived.
+        wait_for_path_or_finished(&survivor_started_marker, &handle).await;
         handle.abort();
         assert!(handle.await.unwrap_err().is_cancelled());
 

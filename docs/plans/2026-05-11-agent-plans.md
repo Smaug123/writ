@@ -359,13 +359,17 @@ In order. Each slice is independently testable and lands real value.
    composes it with the plan body before invoking the LLM. The broker
    threads `stage` and `read_plan_id` into `VmAgentRunConfigResponse`
    so the wrapper knows when to fetch `GET /v1/plans/<id>` and call
-   [`compose_effective_prompt`]. Reviewer composition is deferred to
-   slice 6 because the `# Approved plan` separator does not fit a
-   reviewer's reading. Open question 1 is closed by this slice.
+   [`compose_effective_prompt`]. Open question 1 is closed by this
+   slice. Reviewer composition follows the same shape in slice 6 with
+   a distinct `# Proposed plan` separator so an LLM cannot mistake an
+   under-review plan for an approved one.
 
 6. **Reviews + decision (`plan_review`, `plan_decision`, `writ plan
-   decide`, route enforcement).** Adds the gate. After this slice the
-   full plan → review → decide → execute cycle works.
+   decide`, route enforcement, reviewer prompt composition).** Adds
+   the gate and extends [`compose_effective_prompt`] to compose the
+   reviewer's operator-supplied prompt with the plan body via
+   [`REVIEWER_PROMPT_SEPARATOR`]. After this slice the full plan →
+   review → decide → execute cycle works.
 
 7. **Addenda.** `plan_addendum`, `POST /v1/plans/<id>/addenda`,
    surfaced in `writ plan show`.
