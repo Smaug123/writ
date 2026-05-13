@@ -196,7 +196,10 @@ mod tests {
             })
             .unwrap();
         assert_eq!(name, "0001_initial");
-        assert!(applied_at_ms > 0, "applied_at_ms should be a real timestamp");
+        assert!(
+            applied_at_ms > 0,
+            "applied_at_ms should be a real timestamp"
+        );
     }
 
     #[test]
