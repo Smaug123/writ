@@ -18,9 +18,9 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{ArgGroup, Parser, Subcommand, ValueEnum};
 
-use writ::agent_plan::{CorrelationId, PlanId, Stage};
+use writ::agent_plan::{CorrelationId, Decider, DecisionOutcome, PlanId, Stage};
 use writ::agent_run::AgentPrompt;
 use writ::core::{
     AgentKind, CapabilityRequest, GitHubAccess, GitHubRequest, RepoRef, RequestId, SessionId,
@@ -100,6 +100,26 @@ enum PlanCmd {
     },
     /// Show one plan: metadata followed by the verbatim body.
     Show { plan_id: String },
+    /// Record an operator decision on a plan. Exactly one of
+    /// `--accept` or `--reject-restart` is required. The operator
+    /// identity defaults to `cli:$USER` (or `cli:unknown` if unset);
+    /// pass `--decider` to override the attribution stored in the
+    /// audit row.
+    #[command(group(ArgGroup::new("outcome").required(true).args(["accept", "reject_restart"])))]
+    Decide {
+        plan_id: String,
+        /// Record the plan as accepted (review approves it).
+        #[arg(long)]
+        accept: bool,
+        /// Record the plan as rejected for restart (review rejects
+        /// the plan and the planner must run again).
+        #[arg(long = "reject-restart")]
+        reject_restart: bool,
+        /// Override the decider attribution stored in the audit row.
+        /// Defaults to `cli:$USER`.
+        #[arg(long)]
+        decider: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -458,6 +478,46 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     other => return Err(format!("unexpected response: {other:?}").into()),
                 }
             }
+            PlanCmd::Decide {
+                plan_id,
+                accept,
+                reject_restart,
+                decider,
+            } => {
+                let id: PlanId = plan_id
+                    .parse()
+                    .map_err(|e| format!("invalid plan ID: {e}"))?;
+                let outcome = resolve_decision_outcome(accept, reject_restart);
+                let decider = match decider {
+                    Some(raw) => Decider::try_new(raw).map_err(|e| e.to_string())?,
+                    None => {
+                        let identity = capture_operator_identity();
+                        Decider::try_new(format!("cli:{identity}"))
+                            .map_err(|e| format!("invalid default decider: {e}"))?
+                    }
+                };
+                let msg = ClientMessage::DecidePlan {
+                    plan_id: id,
+                    outcome,
+                    decider,
+                };
+                match call(&socket_path, &msg)? {
+                    ServerMessage::PlanDecided { plan_id } => {
+                        println!("decided plan_id={plan_id} outcome={outcome}");
+                    }
+                    ServerMessage::UnknownPlan { plan_id } => {
+                        return Err(format!("no plan with id {plan_id}").into());
+                    }
+                    ServerMessage::PlanAlreadyDecided { plan_id } => {
+                        return Err(format!(
+                            "plan {plan_id} already has an operator decision recorded",
+                        )
+                        .into());
+                    }
+                    ServerMessage::Error { message } => return Err(message.into()),
+                    other => return Err(format!("unexpected response: {other:?}").into()),
+                }
+            }
         },
     }
     Ok(())
@@ -494,6 +554,20 @@ fn classify_operator_identity(user: Option<String>) -> String {
     match user {
         Some(value) if !value.is_empty() => value,
         _ => "unknown".to_string(),
+    }
+}
+
+/// Map the parsed `--accept` / `--reject-restart` flags to a
+/// [`DecisionOutcome`]. Clap's `ArgGroup` enforces exactly-one before
+/// we get here, so the `(false, false)` and `(true, true)` cases are
+/// unreachable in practice — they panic loudly rather than guess.
+fn resolve_decision_outcome(accept: bool, reject_restart: bool) -> DecisionOutcome {
+    match (accept, reject_restart) {
+        (true, false) => DecisionOutcome::Accepted,
+        (false, true) => DecisionOutcome::RejectedRestart,
+        (false, false) | (true, true) => {
+            unreachable!("clap ArgGroup enforces exactly one of --accept / --reject-restart")
+        }
     }
 }
 
@@ -1416,6 +1490,102 @@ mod tests {
             } => assert_eq!(plan_id, id),
             _ => panic!("unexpected command"),
         }
+    }
+
+    #[test]
+    fn plan_decide_cli_accepts_accept_flag() {
+        let id = "f1f1f1f1-0000-0000-0000-000000000001";
+        let args = Args::try_parse_from(["writ", "plan", "decide", id, "--accept"]).unwrap();
+        match args.cmd {
+            Cmd::Plan {
+                action:
+                    PlanCmd::Decide {
+                        plan_id,
+                        accept,
+                        reject_restart,
+                        decider,
+                    },
+            } => {
+                assert_eq!(plan_id, id);
+                assert!(accept);
+                assert!(!reject_restart);
+                assert!(decider.is_none());
+            }
+            _ => panic!("unexpected command"),
+        }
+    }
+
+    #[test]
+    fn plan_decide_cli_accepts_reject_restart_flag() {
+        let id = "f1f1f1f1-0000-0000-0000-000000000001";
+        let args =
+            Args::try_parse_from(["writ", "plan", "decide", id, "--reject-restart"]).unwrap();
+        match args.cmd {
+            Cmd::Plan {
+                action:
+                    PlanCmd::Decide {
+                        plan_id,
+                        accept,
+                        reject_restart,
+                        decider,
+                    },
+            } => {
+                assert_eq!(plan_id, id);
+                assert!(!accept);
+                assert!(reject_restart);
+                assert!(decider.is_none());
+            }
+            _ => panic!("unexpected command"),
+        }
+    }
+
+    #[test]
+    fn plan_decide_cli_accepts_decider_override() {
+        let id = "f1f1f1f1-0000-0000-0000-000000000001";
+        let args = Args::try_parse_from([
+            "writ",
+            "plan",
+            "decide",
+            id,
+            "--accept",
+            "--decider",
+            "agent:run-42",
+        ])
+        .unwrap();
+        match args.cmd {
+            Cmd::Plan {
+                action: PlanCmd::Decide { decider, .. },
+            } => assert_eq!(decider.as_deref(), Some("agent:run-42")),
+            _ => panic!("unexpected command"),
+        }
+    }
+
+    /// Clap's `ArgGroup` on the outcome flags must reject both
+    /// invocations that omit the outcome and invocations that pass
+    /// both — neither is meaningful and silently picking one would
+    /// hide an operator typo.
+    #[test]
+    fn plan_decide_cli_requires_exactly_one_outcome_flag() {
+        let id = "f1f1f1f1-0000-0000-0000-000000000001";
+
+        let missing = Args::try_parse_from(["writ", "plan", "decide", id]);
+        assert!(missing.is_err(), "expected clap to reject missing outcome");
+
+        let both =
+            Args::try_parse_from(["writ", "plan", "decide", id, "--accept", "--reject-restart"]);
+        assert!(both.is_err(), "expected clap to reject both outcomes");
+    }
+
+    #[test]
+    fn resolve_decision_outcome_maps_each_flag() {
+        assert_eq!(
+            resolve_decision_outcome(true, false),
+            DecisionOutcome::Accepted,
+        );
+        assert_eq!(
+            resolve_decision_outcome(false, true),
+            DecisionOutcome::RejectedRestart,
+        );
     }
 
     fn sample_plan_summary_for_cli(with_correlation: bool) -> PlanSummary {
