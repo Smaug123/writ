@@ -7,7 +7,10 @@ use rusqlite::{OptionalExtension, Row, params};
 
 use super::validation::validate_sha256_hex;
 use super::{AuditError, AuditLog};
-use crate::agent_plan::{CorrelationId, Decider, DecisionOutcome, PlanBody, PlanBodyError, PlanId};
+use crate::agent_plan::{
+    CorrelationId, Decider, DecisionOutcome, PlanBody, PlanBodyError, PlanFeedback,
+    PlanFeedbackError, PlanId, ReviewId, Verdict,
+};
 use crate::agent_run::AgentRunId;
 use crate::core::{SessionId, UnixMillis};
 
@@ -31,6 +34,23 @@ pub struct PlanDecisionRecord {
     pub decided_at: UnixMillis,
     pub outcome: DecisionOutcome,
     pub decider: Decider,
+}
+
+/// One `plan_review` row: a reviewer agent run posting a verdict (and
+/// optionally feedback) against a plan. Per §"Plan lifecycle" a plan
+/// may carry zero or more reviews; each reviewer run is responsible for
+/// at most one row, enforced by `UNIQUE(agent_run_id)` at the schema
+/// level. The DAO stores the `feedback_sha256` derived from the
+/// [`PlanFeedback`] body so consumers cannot disagree with the DB about
+/// the digest of what was recorded.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PlanReviewRecord {
+    pub review_id: ReviewId,
+    pub plan_id: PlanId,
+    pub agent_run_id: AgentRunId,
+    pub submitted_at: UnixMillis,
+    pub verdict: Verdict,
+    pub feedback: Option<PlanFeedback>,
 }
 
 /// Body-less summary returned by [`AuditLog::list_plans`]. The listing
@@ -285,6 +305,137 @@ impl AuditLog {
             row.transpose()
         })
     }
+
+    /// Record one `plan_review` row. The plan and reviewer run are
+    /// pre-checked in the same transaction so callers get a clean
+    /// `AuditError::Invariant` for either missing referent rather than
+    /// a raw "FOREIGN KEY constraint failed" string.
+    ///
+    /// Stage and session gating are belt-and-braces: the broker route
+    /// enforces them up front, this pre-check restates them for a
+    /// readable error, and the v20 triggers
+    /// (`plan_review_requires_reviewer_stage`,
+    /// `plan_review_requires_open_session`) catch any raw INSERT that
+    /// bypasses both layers.
+    ///
+    /// A second review from the same reviewer run surfaces as the
+    /// underlying SQLite UNIQUE constraint error (the
+    /// `UNIQUE(agent_run_id)` clause); callers map that to a wire-side
+    /// `PlanReviewAlreadyRecorded` (or equivalent) outcome.
+    ///
+    /// The `feedback_sha256` column is computed here from the
+    /// [`PlanFeedback`] body so storage and digest cannot disagree;
+    /// `feedback` and `feedback_sha256` go in together or stay
+    /// `NULL` together, mirroring the table-level CHECK.
+    pub fn record_plan_review(&self, r: &PlanReviewRecord) -> Result<(), AuditError> {
+        let feedback_sha256 = r.feedback.as_ref().map(|f| f.sha256_hex());
+
+        self.with_conn_mut(|c| {
+            let tx = c.transaction()?;
+
+            let plan_exists: Option<i64> = tx
+                .query_row(
+                    "SELECT 1 FROM plan WHERE plan_id = ?1",
+                    params![r.plan_id.as_uuid().to_string()],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if plan_exists.is_none() {
+                return Err(AuditError::Invariant("plan does not exist"));
+            }
+
+            let agent_run: Option<(String, Option<i64>, String)> = tx
+                .query_row(
+                    "SELECT ar.session_id, s.closed_at, ar.stage
+                     FROM agent_run ar
+                     JOIN session s ON s.session_id = ar.session_id
+                     WHERE ar.run_id = ?1",
+                    params![r.agent_run_id.as_uuid().to_string()],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()?;
+            match agent_run {
+                None => return Err(AuditError::Invariant("agent run does not exist")),
+                Some((_, Some(_), _)) => return Err(AuditError::Invariant("session is closed")),
+                Some((_, None, ref stage)) if stage != "review" => {
+                    return Err(AuditError::Invariant(
+                        "plan_review requires agent_run.stage = 'review'",
+                    ));
+                }
+                Some(_) => {}
+            }
+
+            tx.execute(
+                "INSERT INTO plan_review (
+                     review_id,
+                     plan_id,
+                     agent_run_id,
+                     submitted_at,
+                     verdict,
+                     feedback,
+                     feedback_sha256
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    r.review_id.as_uuid().to_string(),
+                    r.plan_id.as_uuid().to_string(),
+                    r.agent_run_id.as_uuid().to_string(),
+                    r.submitted_at.as_millis(),
+                    r.verdict.as_str(),
+                    r.feedback.as_ref().map(|f| f.as_str()),
+                    feedback_sha256.as_deref(),
+                ],
+            )?;
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
+    /// Look up one review by `review_id`. Returns `Ok(None)` if no row
+    /// with that id exists.
+    pub fn get_plan_review(
+        &self,
+        review_id: ReviewId,
+    ) -> Result<Option<PlanReviewRecord>, AuditError> {
+        self.with_conn(|c| {
+            let row = c
+                .query_row(
+                    "SELECT review_id, plan_id, agent_run_id, submitted_at,
+                            verdict, feedback, feedback_sha256
+                     FROM plan_review
+                     WHERE review_id = ?1",
+                    params![review_id.as_uuid().to_string()],
+                    plan_review_from_row,
+                )
+                .optional()?;
+            row.transpose()
+        })
+    }
+
+    /// List every review attached to one plan, oldest first. `rowid`
+    /// breaks ties on `submitted_at` so the order is stable across
+    /// repeated reads even when two reviewers post in the same
+    /// millisecond.
+    pub fn list_plan_reviews_for_plan(
+        &self,
+        plan_id: PlanId,
+    ) -> Result<Vec<PlanReviewRecord>, AuditError> {
+        self.with_conn(|c| {
+            let mut stmt = c.prepare(
+                "SELECT review_id, plan_id, agent_run_id, submitted_at,
+                        verdict, feedback, feedback_sha256
+                 FROM plan_review
+                 WHERE plan_id = ?1
+                 ORDER BY submitted_at, rowid",
+            )?;
+            let rows =
+                stmt.query_map(params![plan_id.as_uuid().to_string()], plan_review_from_row)?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row??);
+            }
+            Ok(out)
+        })
+    }
 }
 
 fn plan_from_row(row: &Row<'_>) -> rusqlite::Result<Result<PlanSubmissionRecord, AuditError>> {
@@ -347,6 +498,65 @@ fn plan_decision_from_row(
             decided_at: UnixMillis::from_millis(decided_at),
             outcome,
             decider,
+        })
+    };
+    Ok(parse())
+}
+
+fn plan_review_from_row(row: &Row<'_>) -> rusqlite::Result<Result<PlanReviewRecord, AuditError>> {
+    let review_id_str: String = row.get(0)?;
+    let plan_id_str: String = row.get(1)?;
+    let agent_run_id_str: String = row.get(2)?;
+    let submitted_at: i64 = row.get(3)?;
+    let verdict_str: String = row.get(4)?;
+    let feedback_str: Option<String> = row.get(5)?;
+    let feedback_sha256: Option<String> = row.get(6)?;
+
+    let parse = || -> Result<PlanReviewRecord, AuditError> {
+        let review_id = uuid::Uuid::parse_str(&review_id_str)
+            .map_err(|_| AuditError::Invariant("plan_review row: review_id not a uuid"))?;
+        let plan_id = uuid::Uuid::parse_str(&plan_id_str)
+            .map_err(|_| AuditError::Invariant("plan_review row: plan_id not a uuid"))?;
+        let agent_run_id = uuid::Uuid::parse_str(&agent_run_id_str)
+            .map_err(|_| AuditError::Invariant("plan_review row: agent_run_id not a uuid"))?;
+        let verdict = verdict_str.parse::<Verdict>().map_err(|_| {
+            AuditError::Invariant("plan_review row: verdict is not a known wire string")
+        })?;
+        let feedback = match (feedback_str, feedback_sha256.as_deref()) {
+            (None, None) => None,
+            (Some(body), Some(stored_sha)) => {
+                validate_sha256_hex(stored_sha, "plan_review feedback sha256")?;
+                let parsed = PlanFeedback::try_new(body).map_err(|e| match e {
+                    PlanFeedbackError::Empty => {
+                        AuditError::Invariant("plan_review row: feedback is empty")
+                    }
+                    PlanFeedbackError::TooLarge { .. } => {
+                        AuditError::Invariant("plan_review row: feedback exceeds size limit")
+                    }
+                })?;
+                // Belt-and-braces: the stored digest must agree with a
+                // fresh recompute over the feedback bytes. A disagreement
+                // means the row was tampered with after insertion.
+                if parsed.sha256_hex() != stored_sha {
+                    return Err(AuditError::Invariant(
+                        "plan_review row: feedback_sha256 does not match feedback",
+                    ));
+                }
+                Some(parsed)
+            }
+            _ => {
+                return Err(AuditError::Invariant(
+                    "plan_review row: feedback and feedback_sha256 must both be NULL or both be non-NULL",
+                ));
+            }
+        };
+        Ok(PlanReviewRecord {
+            review_id: ReviewId::from_uuid(review_id),
+            plan_id: PlanId::from_uuid(plan_id),
+            agent_run_id: AgentRunId::from_uuid(agent_run_id),
+            submitted_at: UnixMillis::from_millis(submitted_at),
+            verdict,
+            feedback,
         })
     };
     Ok(parse())
@@ -1139,5 +1349,576 @@ mod tests {
 
         let read = log.get_plan_decision(plan_id).unwrap().unwrap();
         assert_eq!(read.outcome, DecisionOutcome::Accepted);
+    }
+
+    // --- plan_review DAO ----------------------------------------------
+
+    fn sample_review_run(log: &AuditLog, session_id: SessionId, plan_id: PlanId) -> AgentRunId {
+        let run_id = AgentRunId::new();
+        log.record_agent_run(&AgentRunAuditRecord {
+            run_id,
+            session_id,
+            requested_at: UnixMillis::from_millis(1_700_000_300),
+            agent_kind: AgentKind::Claude,
+            prompt: AgentPrompt::new("review this plan").summary(),
+            correlation_id: None,
+            stage: Stage::Review,
+            read_plan_id: Some(plan_id),
+        })
+        .unwrap();
+        run_id
+    }
+
+    fn sample_review_record(
+        log: &AuditLog,
+        session_id: SessionId,
+        plan_id: PlanId,
+        verdict: Verdict,
+        feedback: Option<PlanFeedback>,
+    ) -> PlanReviewRecord {
+        let reviewer = sample_review_run(log, session_id, plan_id);
+        PlanReviewRecord {
+            review_id: ReviewId::new(),
+            plan_id,
+            agent_run_id: reviewer,
+            submitted_at: UnixMillis::from_millis(1_700_000_400),
+            verdict,
+            feedback,
+        }
+    }
+
+    /// Happy path: a review against an open reviewer run round-trips
+    /// (verdict and feedback intact) and the stored `feedback_sha256`
+    /// agrees with a fresh recompute over the feedback bytes.
+    #[test]
+    fn plan_review_roundtrips_with_feedback() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+        let plan_id = submitted_plan(&log, s.session_id);
+        let feedback = PlanFeedback::try_new("Approve, with two nits inline.").unwrap();
+        let record = sample_review_record(
+            &log,
+            s.session_id,
+            plan_id,
+            Verdict::Approve,
+            Some(feedback.clone()),
+        );
+
+        log.record_plan_review(&record).unwrap();
+
+        let read = log.get_plan_review(record.review_id).unwrap().unwrap();
+        assert_eq!(read, record);
+
+        let stored_sha: Option<String> = log
+            .with_conn(|c| {
+                Ok(c.query_row(
+                    "SELECT feedback_sha256 FROM plan_review WHERE review_id = ?1",
+                    params![record.review_id.as_uuid().to_string()],
+                    |r| r.get(0),
+                )?)
+            })
+            .unwrap();
+        assert_eq!(stored_sha, Some(feedback.sha256_hex()));
+    }
+
+    /// A review with no feedback persists `feedback` and
+    /// `feedback_sha256` as `NULL`. The paired-NULLs CHECK allows this
+    /// and the read path returns `None`.
+    #[test]
+    fn plan_review_roundtrips_without_feedback() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+        let plan_id = submitted_plan(&log, s.session_id);
+        let record =
+            sample_review_record(&log, s.session_id, plan_id, Verdict::RequestChanges, None);
+
+        log.record_plan_review(&record).unwrap();
+
+        let read = log.get_plan_review(record.review_id).unwrap().unwrap();
+        assert_eq!(read, record);
+        assert!(read.feedback.is_none());
+    }
+
+    /// `get_plan_review` returns `None` for an id that has no row.
+    #[test]
+    fn get_plan_review_returns_none_for_missing_review() {
+        let log = AuditLog::open_in_memory().unwrap();
+        assert!(log.get_plan_review(ReviewId::new()).unwrap().is_none());
+    }
+
+    /// A plan may carry many reviews; the listing orders by
+    /// `submitted_at` (and `rowid` as tie-break) and includes every row.
+    #[test]
+    fn list_plan_reviews_for_plan_returns_each_review_in_submission_order() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+        let plan_id = submitted_plan(&log, s.session_id);
+
+        let first = {
+            let mut r =
+                sample_review_record(&log, s.session_id, plan_id, Verdict::RequestChanges, None);
+            r.submitted_at = UnixMillis::from_millis(1_700_000_400);
+            r
+        };
+        let second = {
+            let mut r = sample_review_record(
+                &log,
+                s.session_id,
+                plan_id,
+                Verdict::Approve,
+                Some(PlanFeedback::try_new("LGTM after the changes.").unwrap()),
+            );
+            r.submitted_at = UnixMillis::from_millis(1_700_000_500);
+            r
+        };
+        log.record_plan_review(&first).unwrap();
+        log.record_plan_review(&second).unwrap();
+
+        let listed = log.list_plan_reviews_for_plan(plan_id).unwrap();
+        assert_eq!(listed, vec![first, second]);
+    }
+
+    /// Reviews belong only to their plan: a query for one plan must
+    /// not surface a review attached to a different plan.
+    #[test]
+    fn list_plan_reviews_for_plan_excludes_other_plans_reviews() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+        let plan_a = submitted_plan(&log, s.session_id);
+        let plan_b = submitted_plan(&log, s.session_id);
+
+        let review_a = sample_review_record(&log, s.session_id, plan_a, Verdict::Approve, None);
+        let review_b = sample_review_record(&log, s.session_id, plan_b, Verdict::Reject, None);
+        log.record_plan_review(&review_a).unwrap();
+        log.record_plan_review(&review_b).unwrap();
+
+        assert_eq!(
+            log.list_plan_reviews_for_plan(plan_a).unwrap(),
+            vec![review_a]
+        );
+        assert_eq!(
+            log.list_plan_reviews_for_plan(plan_b).unwrap(),
+            vec![review_b]
+        );
+    }
+
+    /// A review against a plan that doesn't exist surfaces as a clean
+    /// invariant error rather than a raw foreign-key string.
+    #[test]
+    fn plan_review_rejects_missing_plan() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+        // Spin up a reviewer run that names a non-existent plan via
+        // read_plan_id — but the run itself is registered, so the
+        // pre-check finds it. The plan itself, however, is missing.
+        let reviewer = AgentRunId::new();
+        log.record_agent_run(&AgentRunAuditRecord {
+            run_id: reviewer,
+            session_id: s.session_id,
+            requested_at: UnixMillis::from_millis(1_700_000_300),
+            agent_kind: AgentKind::Claude,
+            prompt: AgentPrompt::new("review this plan").summary(),
+            correlation_id: None,
+            stage: Stage::Review,
+            read_plan_id: None,
+        })
+        .unwrap();
+
+        let err = log
+            .record_plan_review(&PlanReviewRecord {
+                review_id: ReviewId::new(),
+                plan_id: PlanId::new(),
+                agent_run_id: reviewer,
+                submitted_at: UnixMillis::from_millis(1_700_000_400),
+                verdict: Verdict::Approve,
+                feedback: None,
+            })
+            .unwrap_err();
+        assert!(matches!(err, AuditError::Invariant("plan does not exist")));
+    }
+
+    /// A review whose `agent_run_id` is unknown must surface as an
+    /// invariant error — the typed layer caller has handed in a stale
+    /// or fabricated run id.
+    #[test]
+    fn plan_review_rejects_missing_agent_run() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+        let plan_id = submitted_plan(&log, s.session_id);
+
+        let err = log
+            .record_plan_review(&PlanReviewRecord {
+                review_id: ReviewId::new(),
+                plan_id,
+                agent_run_id: AgentRunId::new(),
+                submitted_at: UnixMillis::from_millis(1_700_000_400),
+                verdict: Verdict::Approve,
+                feedback: None,
+            })
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            AuditError::Invariant("agent run does not exist")
+        ));
+    }
+
+    /// A reviewer whose session has been closed cannot land a verdict.
+    /// The pre-check returns `Invariant("session is closed")`; the
+    /// follow-up `plan_review_db_trigger_rejects_direct_insert_against_closed_session`
+    /// test exercises the trigger directly to prove the belt-and-braces
+    /// gate fires even on a raw INSERT.
+    #[test]
+    fn plan_review_rejects_closed_reviewer_session() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+        let plan_id = submitted_plan(&log, s.session_id);
+        let reviewer = sample_review_run(&log, s.session_id, plan_id);
+        log.close_session(s.session_id, UnixMillis::from_millis(1_700_000_350))
+            .unwrap();
+
+        let err = log
+            .record_plan_review(&PlanReviewRecord {
+                review_id: ReviewId::new(),
+                plan_id,
+                agent_run_id: reviewer,
+                submitted_at: UnixMillis::from_millis(1_700_000_400),
+                verdict: Verdict::Approve,
+                feedback: None,
+            })
+            .unwrap_err();
+        assert!(matches!(err, AuditError::Invariant("session is closed")));
+    }
+
+    /// Belt-and-braces: the session trigger must fire on a raw INSERT
+    /// that bypasses the DAO's pre-check, mirroring the
+    /// `plan_db_trigger_rejects_direct_insert_against_closed_session`
+    /// shape used for `plan`.
+    #[test]
+    fn plan_review_db_trigger_rejects_direct_insert_against_closed_session() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+        let plan_id = submitted_plan(&log, s.session_id);
+        let reviewer = sample_review_run(&log, s.session_id, plan_id);
+        log.close_session(s.session_id, UnixMillis::from_millis(1_700_000_350))
+            .unwrap();
+
+        let err = log
+            .with_conn(|c| {
+                c.execute(
+                    "INSERT INTO plan_review
+                     (review_id, plan_id, agent_run_id, submitted_at, verdict, feedback, feedback_sha256)
+                     VALUES (?1, ?2, ?3, ?4, 'approve', NULL, NULL)",
+                    params![
+                        ReviewId::new().as_uuid().to_string(),
+                        plan_id.as_uuid().to_string(),
+                        reviewer.as_uuid().to_string(),
+                        1_700_000_400_i64,
+                    ],
+                )?;
+                Ok(())
+            })
+            .unwrap_err();
+        let AuditError::Sqlite(e) = err else {
+            panic!("expected sqlite trigger error, got {err:?}");
+        };
+        assert!(
+            e.to_string().to_lowercase().contains("session is closed"),
+            "got: {e}"
+        );
+    }
+
+    /// A planner-stage run cannot post a review: the DAO pre-check
+    /// surfaces a typed invariant error.
+    #[test]
+    fn plan_review_rejects_non_review_stage_run() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+        let planner = sample_planner_run(&log, s.session_id);
+        let plan_id = PlanId::new();
+        // Submit a plan against the planner so the FK is satisfied.
+        log.record_plan_submission(&PlanSubmissionRecord {
+            plan_id,
+            agent_run_id: planner,
+            submitted_at: UnixMillis::from_millis(1_700_000_200),
+            body: PlanBody::try_new("# Plan").unwrap(),
+        })
+        .unwrap();
+
+        let err = log
+            .record_plan_review(&PlanReviewRecord {
+                review_id: ReviewId::new(),
+                plan_id,
+                agent_run_id: planner,
+                submitted_at: UnixMillis::from_millis(1_700_000_400),
+                verdict: Verdict::Approve,
+                feedback: None,
+            })
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            AuditError::Invariant("plan_review requires agent_run.stage = 'review'")
+        ));
+    }
+
+    /// Belt-and-braces: the stage trigger fires on a raw INSERT that
+    /// bypasses the DAO pre-check.
+    #[test]
+    fn plan_review_db_trigger_rejects_non_review_stage_run() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+        let planner = sample_planner_run(&log, s.session_id);
+        let plan_id = PlanId::new();
+        log.record_plan_submission(&PlanSubmissionRecord {
+            plan_id,
+            agent_run_id: planner,
+            submitted_at: UnixMillis::from_millis(1_700_000_200),
+            body: PlanBody::try_new("# Plan").unwrap(),
+        })
+        .unwrap();
+
+        let err = log
+            .with_conn(|c| {
+                c.execute(
+                    "INSERT INTO plan_review
+                     (review_id, plan_id, agent_run_id, submitted_at, verdict, feedback, feedback_sha256)
+                     VALUES (?1, ?2, ?3, ?4, 'approve', NULL, NULL)",
+                    params![
+                        ReviewId::new().as_uuid().to_string(),
+                        plan_id.as_uuid().to_string(),
+                        planner.as_uuid().to_string(),
+                        1_700_000_400_i64,
+                    ],
+                )?;
+                Ok(())
+            })
+            .unwrap_err();
+        let AuditError::Sqlite(e) = err else {
+            panic!("expected sqlite trigger error, got {err:?}");
+        };
+        let rendered = e.to_string();
+        assert!(
+            rendered.contains("plan_review requires agent_run.stage"),
+            "got: {rendered}"
+        );
+    }
+
+    /// A second review from the same reviewer run surfaces as the
+    /// `UNIQUE(agent_run_id)` violation. The wire layer maps this to a
+    /// "review already recorded" outcome; the audit-side raw error must
+    /// be a SQLite UNIQUE so the mapping has something to match on.
+    #[test]
+    fn plan_review_rejects_second_review_for_same_run() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+        let plan_id = submitted_plan(&log, s.session_id);
+        let reviewer = sample_review_run(&log, s.session_id, plan_id);
+
+        log.record_plan_review(&PlanReviewRecord {
+            review_id: ReviewId::new(),
+            plan_id,
+            agent_run_id: reviewer,
+            submitted_at: UnixMillis::from_millis(1_700_000_400),
+            verdict: Verdict::Approve,
+            feedback: None,
+        })
+        .unwrap();
+
+        let err = log
+            .record_plan_review(&PlanReviewRecord {
+                review_id: ReviewId::new(),
+                plan_id,
+                agent_run_id: reviewer,
+                submitted_at: UnixMillis::from_millis(1_700_000_500),
+                verdict: Verdict::Reject,
+                feedback: None,
+            })
+            .unwrap_err();
+        let AuditError::Sqlite(e) = err else {
+            panic!("expected sqlite UNIQUE error, got {err:?}");
+        };
+        assert!(e.to_string().to_uppercase().contains("UNIQUE"), "got: {e}");
+    }
+
+    /// Every closed-set wire value of [`Verdict`] persists and reads
+    /// back; the CHECK on `verdict` accepts each.
+    #[test]
+    fn plan_review_persists_every_verdict() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+        let plan_id = submitted_plan(&log, s.session_id);
+
+        for verdict in [Verdict::Approve, Verdict::RequestChanges, Verdict::Reject] {
+            let record = sample_review_record(&log, s.session_id, plan_id, verdict, None);
+            log.record_plan_review(&record).unwrap();
+            let read = log.get_plan_review(record.review_id).unwrap().unwrap();
+            assert_eq!(read.verdict, verdict);
+        }
+    }
+
+    /// Belt-and-braces: a raw INSERT with an unknown verdict must be
+    /// refused by the CHECK constraint.
+    #[test]
+    fn plan_review_check_rejects_unknown_verdict() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+        let plan_id = submitted_plan(&log, s.session_id);
+        let reviewer = sample_review_run(&log, s.session_id, plan_id);
+
+        let err = log
+            .with_conn(|c| {
+                Ok(c.execute(
+                    "INSERT INTO plan_review
+                     (review_id, plan_id, agent_run_id, submitted_at, verdict, feedback, feedback_sha256)
+                     VALUES (?1, ?2, ?3, ?4, 'approved', NULL, NULL)",
+                    params![
+                        ReviewId::new().as_uuid().to_string(),
+                        plan_id.as_uuid().to_string(),
+                        reviewer.as_uuid().to_string(),
+                        1_700_000_400_i64,
+                    ],
+                )?)
+            })
+            .unwrap_err();
+        let rendered = err.to_string().to_lowercase();
+        assert!(
+            rendered.contains("check"),
+            "expected CHECK violation, got {err}"
+        );
+    }
+
+    /// Belt-and-braces: the table-level paired-NULL CHECK refuses a
+    /// row that has `feedback` set but no digest (and vice versa).
+    #[test]
+    fn plan_review_check_rejects_feedback_digest_pair_mismatch() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+        let plan_id = submitted_plan(&log, s.session_id);
+        let reviewer = sample_review_run(&log, s.session_id, plan_id);
+
+        // feedback present, digest NULL — must be refused.
+        let err = log
+            .with_conn(|c| {
+                Ok(c.execute(
+                    "INSERT INTO plan_review
+                     (review_id, plan_id, agent_run_id, submitted_at, verdict, feedback, feedback_sha256)
+                     VALUES (?1, ?2, ?3, ?4, 'approve', 'lgtm', NULL)",
+                    params![
+                        ReviewId::new().as_uuid().to_string(),
+                        plan_id.as_uuid().to_string(),
+                        reviewer.as_uuid().to_string(),
+                        1_700_000_400_i64,
+                    ],
+                )?)
+            })
+            .unwrap_err();
+        assert!(
+            err.to_string().to_lowercase().contains("check"),
+            "expected CHECK violation, got {err}"
+        );
+
+        // digest present, feedback NULL — must also be refused.
+        let err = log
+            .with_conn(|c| {
+                Ok(c.execute(
+                    "INSERT INTO plan_review
+                     (review_id, plan_id, agent_run_id, submitted_at, verdict, feedback, feedback_sha256)
+                     VALUES (?1, ?2, ?3, ?4, 'approve', NULL, ?5)",
+                    params![
+                        ReviewId::new().as_uuid().to_string(),
+                        plan_id.as_uuid().to_string(),
+                        reviewer.as_uuid().to_string(),
+                        1_700_000_400_i64,
+                        "a".repeat(64),
+                    ],
+                )?)
+            })
+            .unwrap_err();
+        assert!(
+            err.to_string().to_lowercase().contains("check"),
+            "expected CHECK violation, got {err}"
+        );
+    }
+
+    /// Belt-and-braces: an oversize raw feedback body is refused by
+    /// the column CHECK before the row lands.
+    #[test]
+    fn plan_review_check_rejects_oversize_feedback() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+        let plan_id = submitted_plan(&log, s.session_id);
+        let reviewer = sample_review_run(&log, s.session_id, plan_id);
+
+        let oversize = "x".repeat(65537);
+        let oversize_sha = crate::agent_run::sha256_hex(oversize.as_bytes());
+
+        let err = log
+            .with_conn(|c| {
+                Ok(c.execute(
+                    "INSERT INTO plan_review
+                     (review_id, plan_id, agent_run_id, submitted_at, verdict, feedback, feedback_sha256)
+                     VALUES (?1, ?2, ?3, ?4, 'approve', ?5, ?6)",
+                    params![
+                        ReviewId::new().as_uuid().to_string(),
+                        plan_id.as_uuid().to_string(),
+                        reviewer.as_uuid().to_string(),
+                        1_700_000_400_i64,
+                        oversize,
+                        oversize_sha,
+                    ],
+                )?)
+            })
+            .unwrap_err();
+        assert!(
+            err.to_string().to_lowercase().contains("check"),
+            "expected CHECK violation, got {err}"
+        );
+    }
+
+    /// Belt-and-braces: SQLite's well-known v1/v2 compat quirk allows
+    /// NULL in a `TEXT PRIMARY KEY` column unless explicitly marked
+    /// `NOT NULL`. The schema declares `review_id ... NOT NULL` so a
+    /// raw INSERT with `review_id = NULL` is refused.
+    #[test]
+    fn plan_review_rejects_null_review_id_at_schema_boundary() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+        let plan_id = submitted_plan(&log, s.session_id);
+        let reviewer = sample_review_run(&log, s.session_id, plan_id);
+
+        let err = log
+            .with_conn(|c| {
+                Ok(c.execute(
+                    "INSERT INTO plan_review
+                     (review_id, plan_id, agent_run_id, submitted_at, verdict, feedback, feedback_sha256)
+                     VALUES (NULL, ?1, ?2, ?3, 'approve', NULL, NULL)",
+                    params![
+                        plan_id.as_uuid().to_string(),
+                        reviewer.as_uuid().to_string(),
+                        1_700_000_400_i64,
+                    ],
+                )?)
+            })
+            .unwrap_err();
+        let rendered = err.to_string().to_lowercase();
+        assert!(
+            rendered.contains("not null"),
+            "expected NOT NULL violation on review_id, got {err}"
+        );
     }
 }

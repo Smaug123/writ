@@ -30,7 +30,7 @@ pub(super) struct Migration {
 /// a version higher than this is rejected with [`AuditError::SchemaTooNew`]
 /// rather than opened — we'd rather fail to start than silently drop data
 /// into a schema a newer broker wrote.
-pub(super) const SCHEMA_VERSION: i32 = 19;
+pub(super) const SCHEMA_VERSION: i32 = 20;
 
 /// The full migration history. Each entry documents exactly one state
 /// transition; the sequence of entries is the schema's lineage. Order
@@ -1109,6 +1109,99 @@ CREATE TABLE plan_decision (
 ALTER TABLE agent_run ADD COLUMN read_plan_id TEXT NULL
     REFERENCES plan(plan_id)
     CHECK (read_plan_id IS NULL OR typeof(read_plan_id) = 'text');
+"#,
+    },
+    // Slice 6 (reviewer verdicts). Adds the `plan_review` table:
+    // zero-or-more reviewer rows per plan, each verdict attached to one
+    // reviewer agent run. There can be many reviews per plan (different
+    // reviewers, different rounds) but at most one review per reviewer
+    // run — enforced by `UNIQUE(agent_run_id)` so a future code path
+    // that bypasses the DAO cannot stuff a single reviewer with two
+    // verdicts.
+    //
+    // Two triggers gate inserts:
+    //
+    //   * `plan_review_requires_open_session` — mirrors the
+    //     `plan_requires_open_session` pattern. A review can only land
+    //     while the reviewer's session is still open; once an operator
+    //     closes the session no further verdicts can attach. Pairs with
+    //     the existing session-window invariant.
+    //
+    //   * `plan_review_requires_reviewer_stage` — verdicts belong to
+    //     `review`-stage runs and only those. Slice 3 made
+    //     `agent_run.stage` NOT NULL with a closed enum, so this trigger
+    //     can rely on the column being present and well-formed. The
+    //     trigger is the belt-and-braces line of defence behind the
+    //     route-level stage check (`route_authorisation`) and a DAO
+    //     pre-check: even a raw INSERT cannot smuggle a planner or
+    //     executor row into the reviewer table.
+    //
+    // `verdict` is the closed enum from `agent_plan::Verdict`; its CHECK
+    // enumerates exactly the wire strings the newtype produces.
+    // `feedback` is optional prose bounded by the same defence-in-depth
+    // pattern as `plan.body` (TEXT storage class, no embedded NUL,
+    // byte-bounded). The byte cap mirrors `MAX_PLAN_FEEDBACK_BYTES`
+    // (64 KiB); a raw INSERT that bypasses the typed layer still cannot
+    // smuggle an oversized or NUL-bearing feedback row into the audit
+    // log. `feedback` and `feedback_sha256` always travel together — a
+    // dedicated table-level CHECK enforces "both or neither" so a
+    // future code path cannot persist a digest with no body or vice
+    // versa.
+    Migration {
+        version: 20,
+        sql: r#"
+CREATE TABLE plan_review (
+    -- TEXT PRIMARY KEY in a rowid table does not imply NOT NULL (the
+    -- v1/v2 compat quirk also exploited by the plan_decision migration);
+    -- mark explicitly so a raw INSERT with `review_id = NULL` cannot
+    -- bypass the per-row uniqueness.
+    review_id        TEXT PRIMARY KEY NOT NULL,
+    plan_id          TEXT NOT NULL REFERENCES plan(plan_id),
+    agent_run_id     TEXT NOT NULL REFERENCES agent_run(run_id),
+    submitted_at     INTEGER NOT NULL,
+    verdict          TEXT NOT NULL CHECK (
+        typeof(verdict) = 'text'
+        AND verdict IN ('approve', 'request_changes', 'reject')
+    ),
+    feedback         TEXT NULL CHECK (
+        feedback IS NULL OR (
+            typeof(feedback) = 'text'
+            AND length(cast(feedback AS BLOB)) BETWEEN 1 AND 65536
+            AND instr(cast(feedback AS BLOB), x'00') = 0
+        )
+    ),
+    feedback_sha256  TEXT NULL CHECK (
+        feedback_sha256 IS NULL OR length(feedback_sha256) = 64
+    ),
+    UNIQUE (agent_run_id),
+    CHECK (
+        (feedback IS NULL AND feedback_sha256 IS NULL)
+        OR (feedback IS NOT NULL AND feedback_sha256 IS NOT NULL)
+    )
+);
+
+CREATE INDEX idx_plan_review_plan ON plan_review(plan_id);
+
+CREATE TRIGGER plan_review_requires_open_session
+BEFORE INSERT ON plan_review
+WHEN EXISTS (
+    SELECT 1 FROM agent_run ar
+    JOIN session s ON s.session_id = ar.session_id
+    WHERE ar.run_id = NEW.agent_run_id AND s.closed_at IS NOT NULL
+)
+BEGIN
+    SELECT RAISE(ABORT, 'session is closed');
+END;
+
+CREATE TRIGGER plan_review_requires_reviewer_stage
+BEFORE INSERT ON plan_review
+WHEN NOT EXISTS (
+    SELECT 1 FROM agent_run ar
+    WHERE ar.run_id = NEW.agent_run_id AND ar.stage = 'review'
+)
+BEGIN
+    SELECT RAISE(ABORT, 'plan_review requires agent_run.stage = ''review''');
+END;
 "#,
     },
 ];
