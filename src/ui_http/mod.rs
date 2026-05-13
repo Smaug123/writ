@@ -122,13 +122,17 @@ pub enum UiHttpBearerWriteError {
 /// If the parent directory does not exist it is created with mode
 /// `0700`: this directory holds runtime secrets and shares the same
 /// invariant as the socket parent (writ's other startup code refuses
-/// to bind a socket inside a parent with group/world bits). An
-/// existing parent is not chmod'd — we don't silently loosen or
-/// tighten a directory the operator already created — but if it
-/// has any group/world access bits we refuse to write, because a
+/// to bind a socket inside a parent with group/world bits). The
+/// parent is then re-stat'd regardless of which branch ran and
+/// rejected if it carries any group/world access bits, because a
 /// shared-writable parent lets a local attacker pre-create the
 /// `.tmp` file as a symlink and observe or substitute the token
-/// before `rename` lands.
+/// before `rename` lands. The post-create re-check closes a TOCTOU
+/// in which a peer races us to `mkdir(parent, 0o777)` between our
+/// `exists()` probe and `DirBuilder::create()` (with `recursive`
+/// set, `create` no-ops on an existing dir without chmod'ing it).
+/// An existing parent is not chmod'd — we don't silently loosen or
+/// tighten a directory the operator already created.
 ///
 /// We unlink any pre-existing `.tmp` (left behind by a previous
 /// crash, or planted by an attacker if the parent's privacy
@@ -146,20 +150,7 @@ pub fn write_bearer_file(
     };
 
     if let Some(parent) = path.parent() {
-        if parent.exists() {
-            let meta =
-                std::fs::metadata(parent).map_err(|source| UiHttpBearerWriteError::ParentDir {
-                    path: parent.to_path_buf(),
-                    source,
-                })?;
-            let mode = meta.mode() & 0o777;
-            if mode & 0o077 != 0 {
-                return Err(UiHttpBearerWriteError::NonPrivateParent {
-                    path: parent.to_path_buf(),
-                    mode,
-                });
-            }
-        } else {
+        if !parent.exists() {
             std::fs::DirBuilder::new()
                 .recursive(true)
                 .mode(0o700)
@@ -168,6 +159,18 @@ pub fn write_bearer_file(
                     path: parent.to_path_buf(),
                     source,
                 })?;
+        }
+        let meta =
+            std::fs::metadata(parent).map_err(|source| UiHttpBearerWriteError::ParentDir {
+                path: parent.to_path_buf(),
+                source,
+            })?;
+        let mode = meta.mode() & 0o777;
+        if mode & 0o077 != 0 {
+            return Err(UiHttpBearerWriteError::NonPrivateParent {
+                path: parent.to_path_buf(),
+                mode,
+            });
         }
     }
     let mut tmp = path.as_os_str().to_owned();
