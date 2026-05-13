@@ -677,10 +677,11 @@ proptest! {
     /// entirely (per `skip_serializing_if = "Option::is_none"`).
     #[test]
     fn review_submission_roundtrips(
+        agent_run_id in arb_agent_run_id(),
         verdict in arb_verdict(),
         feedback in prop::option::of(arb_plan_feedback()),
     ) {
-        let r = ReviewSubmission { verdict, feedback };
+        let r = ReviewSubmission { agent_run_id, verdict, feedback };
         let j = serde_json::to_string(&r).unwrap();
         if r.feedback.is_none() {
             prop_assert!(

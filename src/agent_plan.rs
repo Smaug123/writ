@@ -677,6 +677,32 @@ pub fn compose_implementer_prompt(
     AgentPrompt::try_new(combined)
 }
 
+/// Returns the prompt the VM-side wrapper should feed the LLM, given
+/// the run's stage and the plan body (when one was fetched). Today
+/// only `(Stage::Execute, Some(body))` is composed via
+/// [`compose_implementer_prompt`]; every other combination passes the
+/// caller's prompt through unchanged. Reviewer composition is
+/// deliberately deferred to slice 6 of
+/// `docs/plans/2026-05-11-agent-plans.md` because the
+/// `# Approved plan` separator does not fit the reviewer's reading.
+///
+/// A run can reach this function with `Stage::Plan` (planner — never
+/// reads a plan) or `Stage::Review` (reviewer — passthrough until
+/// slice 6) or `Stage::Execute` (implementer — composes when bound).
+/// `plan_body` is `Some` exactly when the broker handed back a
+/// `read_plan_id` *and* the writ-vm wrapper successfully fetched the
+/// plan body for it.
+pub fn compose_effective_prompt(
+    feature_prompt: &AgentPrompt,
+    stage: Stage,
+    plan_body: Option<&PlanBody>,
+) -> Result<AgentPrompt, AgentPromptError> {
+    match (stage, plan_body) {
+        (Stage::Execute, Some(body)) => compose_implementer_prompt(feature_prompt, body),
+        _ => Ok(feature_prompt.clone()),
+    }
+}
+
 // --- Route authorisation matrix --------------------------------------
 
 /// One protected route in the plan-related VM HTTP surface (see
@@ -899,9 +925,21 @@ pub struct PlanCreated {
 }
 
 /// `POST /v1/plans/<plan_id>/reviews` request body.
+///
+/// `agent_run_id` names the reviewer run posting the verdict.
+/// Mirrors the explicit-identification pattern from
+/// [`PlanSubmission`]: the VM-side CLI already knows its run id from
+/// the `/v1/agent-runs/{id}/config` handshake that started it, so
+/// passing it back is a natural extension of the existing in-VM
+/// identifier flow. The broker verifies the run belongs to the
+/// calling session and is bound to the plan named in the URL path
+/// before persisting the review, closing the cross-session window
+/// where one VM's bearer could otherwise attach a verdict to another
+/// VM's reviewer run.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReviewSubmission {
+    pub agent_run_id: crate::agent_run::AgentRunId,
     pub verdict: Verdict,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub feedback: Option<PlanFeedback>,
@@ -1335,6 +1373,45 @@ mod tests {
         assert!(msg.contains("exceeding"), "{msg}");
     }
 
+    #[test]
+    fn compose_effective_prompt_only_composes_for_execute_with_plan_body() {
+        let feature = AgentPrompt::new("Fix the foo widget.");
+        let plan = PlanBody::try_new("# Plan\n\nReplace bar with baz.").unwrap();
+        let composed_expected = compose_implementer_prompt(&feature, &plan).unwrap();
+
+        // Execute + Some(plan) — composes.
+        let composed = compose_effective_prompt(&feature, Stage::Execute, Some(&plan)).unwrap();
+        assert_eq!(composed.as_str(), composed_expected.as_str());
+        assert!(composed.as_str().contains(PLAN_PROMPT_SEPARATOR));
+
+        // Every other (stage, plan_body) pair must pass the prompt
+        // through unchanged. Reviewer-stage composition is slice 6's
+        // problem; planner-stage never carries a plan body.
+        for (stage, body) in [
+            (Stage::Plan, None),
+            (Stage::Plan, Some(&plan)),
+            (Stage::Review, None),
+            (Stage::Review, Some(&plan)),
+            (Stage::Execute, None),
+        ] {
+            let result = compose_effective_prompt(&feature, stage, body).unwrap();
+            assert_eq!(
+                result.as_str(),
+                feature.as_str(),
+                "stage={stage:?} body_is_some={}: expected passthrough",
+                body.is_some(),
+            );
+        }
+    }
+
+    #[test]
+    fn compose_effective_prompt_errors_when_execute_composition_exceeds_limit() {
+        let feature = AgentPrompt::new("x".repeat(crate::agent_run::MAX_AGENT_PROMPT_BYTES));
+        let plan = PlanBody::try_new("p").unwrap();
+        let err = compose_effective_prompt(&feature, Stage::Execute, Some(&plan)).unwrap_err();
+        assert!(err.to_string().contains("exceeding"), "{err}");
+    }
+
     // --- Route authorisation matrix -----------------------------------------
 
     /// Exhaustive enumeration of the (action, stage, decision) cube
@@ -1518,11 +1595,14 @@ mod tests {
 
     #[test]
     fn review_submission_roundtrips_with_and_without_feedback() {
+        let run_id = crate::agent_run::AgentRunId::new();
         let with = ReviewSubmission {
+            agent_run_id: run_id,
             verdict: Verdict::RequestChanges,
             feedback: Some(PlanFeedback::try_new("re-scope step 3").unwrap()),
         };
         let without = ReviewSubmission {
+            agent_run_id: run_id,
             verdict: Verdict::Approve,
             feedback: None,
         };
@@ -1531,6 +1611,18 @@ mod tests {
             let back: ReviewSubmission = serde_json::from_str(&json).unwrap();
             assert_eq!(back, r);
         }
+    }
+
+    /// `deny_unknown_fields` and the new `agent_run_id` requirement are
+    /// load-bearing for the route. Pin both: a typoed field name fails
+    /// to parse, and a body without `agent_run_id` is rejected before
+    /// the route's session-ownership check would even fire.
+    #[test]
+    fn review_submission_rejects_unknown_field_and_missing_run_id() {
+        let with_typo = r#"{"agent_run_id":"550e8400-e29b-41d4-a716-446655440000","verdict":"approve","feedbck":"oops"}"#;
+        assert!(serde_json::from_str::<ReviewSubmission>(with_typo).is_err());
+        let missing_run = r#"{"verdict":"approve"}"#;
+        assert!(serde_json::from_str::<ReviewSubmission>(missing_run).is_err());
     }
 
     #[test]

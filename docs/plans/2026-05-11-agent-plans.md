@@ -353,12 +353,15 @@ In order. Each slice is independently testable and lands real value.
    end-to-end usable for one-off testing without yet requiring the
    review cycle.
 
-5. **Originating-prompt persistence on `plan`.** Decide and implement
-   whether the originating feature-request prompt is stored on the
-   `plan` row (reversing the current "prompts not in SQLite"
-   convention for plan-bound prompts only), or whether the implementer
-   re-receives it via the CLI starting it. This is an open question
-   below; slice 4 may stub it with the latter, and slice 5 finalises.
+5. **VM-side implementer prompt composition.** Decided: the host CLI
+   re-supplies the originating feature-request prompt at implementer
+   launch (no new SQLite column on `plan`), and the in-VM wrapper
+   composes it with the plan body before invoking the LLM. The broker
+   threads `stage` and `read_plan_id` into `VmAgentRunConfigResponse`
+   so the wrapper knows when to fetch `GET /v1/plans/<id>` and call
+   [`compose_effective_prompt`]. Reviewer composition is deferred to
+   slice 6 because the `# Approved plan` separator does not fit a
+   reviewer's reading. Open question 1 is closed by this slice.
 
 6. **Reviews + decision (`plan_review`, `plan_decision`, `writ plan
    decide`, route enforcement).** Adds the gate. After this slice the
@@ -412,18 +415,17 @@ cycle.
 
 ## Open implementation questions
 
-1. **Originating-prompt persistence.** The current `apple-container-
-   agent-vm.md` design states prompts are not copied into SQLite
-   audit rows. Storing the originating feature-request prompt on
-   `plan` (so the implementer can fetch it via VM HTTP) is a partial
-   reversal of that policy. Alternatives: the host CLI re-supplies
-   the original prompt when starting the implementer; the broker
-   keeps the prompt in memory across plan→decide→execute (fragile
-   over daemon restarts). Slice 5 above carries this decision; the
-   underlying question is whether plan-bound prompts are in the same
-   sensitivity class as everything else we already persist (plan
-   body, reviewer feedback). I lean "yes, persist them on `plan`,"
-   but it's a policy call.
+1. **Originating-prompt persistence.** *Resolved in slice 5:* the
+   host CLI re-supplies the originating feature-request prompt at
+   implementer launch — no new SQLite column on `plan`. The in-VM
+   wrapper fetches the plan body separately and composes the two
+   before invoking the LLM. The "prompts not in SQLite" convention
+   from `apple-container-agent-vm.md` is therefore preserved. The
+   wrapper-state-vs-LLM-state distinction is intentional: the LLM
+   already has the feature-request prompt as its input and could
+   already hit `GET /v1/plans/<id>` from inside the VM with the same
+   bearer, so the wrapper concatenating before invocation does not
+   expand the attack surface.
 
 2. **Reviewer feedback to the implementer.** Default is "no, feedback
    is for the decision, not for execution." If we discover that

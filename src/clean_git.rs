@@ -505,4 +505,113 @@ mod tests {
         }
         assert_eq!(CLEAN_GIT_CONFIG_ENV.len(), helper.len());
     }
+
+    /// Locate an executable on `PATH` without resolving symlinks.
+    /// Mirrors `resolve_program_for_clean_env` but preserves the
+    /// caller-visible path so the basename survives into `argv[0]`
+    /// after `execve` — critical on Nix where coreutils is a
+    /// multi-call binary dispatched by `basename(argv[0])`.
+    fn locate_on_path(name: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = std::env::var_os("PATH").expect("PATH must be set in tests");
+        for dir in std::env::split_paths(&path) {
+            let candidate = dir.join(name);
+            match std::fs::metadata(&candidate) {
+                Ok(meta) if meta.is_file() && (meta.permissions().mode() & 0o111) != 0 => {
+                    return candidate;
+                }
+                _ => {}
+            }
+        }
+        panic!("required test tool {name} not found on PATH");
+    }
+
+    /// Runtime probe: spawn a subprocess via the clean-git harness and
+    /// confirm only the four hardened env entries (plus a small allowlist
+    /// of shell-startup names) reach the child.
+    ///
+    /// We wrap `env` in a `sh` script rather than invoking `env` directly
+    /// because:
+    ///   * `resolve_program_for_clean_env` canonicalises symlinks, and
+    ///   * on Nix, the `env` on `PATH` is a symlink into a multi-call
+    ///     coreutils binary that dispatches by `basename(argv[0])`.
+    ///
+    /// Exec'ing the canonical store path would set `argv[0]` to the
+    /// coreutils target, and coreutils would fail with a help message.
+    /// Routing through `sh -c 'exec <path-with-name-env>'` keeps the
+    /// `env` basename in `argv[0]` so coreutils dispatches correctly.
+    /// The cost is that `sh` adds a few startup variables (PWD, SHLVL,
+    /// `_`, OLDPWD); we allowlist those and assert that anything else
+    /// observed must be one of the four hardened entries with the
+    /// expected value.
+    #[tokio::test]
+    async fn run_clean_git_subprocess_sees_only_hardened_env_vars() {
+        use std::collections::BTreeMap;
+        use std::os::unix::fs::PermissionsExt;
+
+        let sh = locate_on_path("sh");
+        let env_bin = locate_on_path("env");
+        let tempdir = tempfile::tempdir().expect("tempdir for env probe");
+        let probe = tempdir.path().join("env-probe");
+        let script = format!("#!{}\nexec {}\n", sh.display(), env_bin.display());
+        std::fs::write(&probe, script).expect("write env probe");
+        let mut perms = std::fs::metadata(&probe).expect("probe meta").permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&probe, perms).expect("chmod env probe");
+
+        let invocation = CleanGitInvocation::new(
+            probe,
+            std::iter::empty::<OsString>(),
+            clean_git_config_env(),
+            Vec::new(),
+        );
+        let stdout = run_clean_git_capture_stdout(&invocation, Duration::from_secs(10), None)
+            .await
+            .expect("env probe must succeed");
+        let text = std::str::from_utf8(&stdout).expect("env output is UTF-8");
+
+        let hardened: BTreeMap<&str, &str> = [
+            ("GIT_CONFIG_NOSYSTEM", "1"),
+            ("GIT_CONFIG_GLOBAL", "/dev/null"),
+            ("GIT_CONFIG_COUNT", "0"),
+            ("HOME", "/dev/null"),
+        ]
+        .into_iter()
+        .collect();
+        // sh implicitly exports a handful of names on startup. They are not
+        // parent-process leakage: PWD/OLDPWD reflect the cwd we passed in,
+        // SHLVL/`_` are sh internals. We tolerate them rather than assert
+        // their absence so the test stays portable across sh variants.
+        const SH_STARTUP: &[&str] = &["PWD", "OLDPWD", "SHLVL", "_"];
+
+        let mut observed: BTreeMap<String, String> = BTreeMap::new();
+        for line in text.lines() {
+            let Some((name, value)) = line.split_once('=') else {
+                panic!("env probe output has malformed line {line:?}");
+            };
+            observed.insert(name.to_string(), value.to_string());
+        }
+        for (name, value) in &observed {
+            if let Some(&expected) = hardened.get(name.as_str()) {
+                assert_eq!(
+                    value, expected,
+                    "hardened env {name} reached the subprocess with the wrong value"
+                );
+                continue;
+            }
+            if SH_STARTUP.contains(&name.as_str()) {
+                continue;
+            }
+            panic!(
+                "subprocess saw unexpected env {name}={value:?}; \
+                 env_clear/hardened-env wiring leaked"
+            );
+        }
+        for want in hardened.keys() {
+            assert!(
+                observed.contains_key(*want),
+                "subprocess missing hardened env var {want}; observed output: {text:?}"
+            );
+        }
+    }
 }
