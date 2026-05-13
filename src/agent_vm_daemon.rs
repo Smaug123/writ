@@ -110,6 +110,20 @@ printf 'machine %s login %s password %s\n' \
   fi
 } > "$NIX_CONF_DIR/nix.conf"
 
+# Smoke-test the sandbox before handing control to the guest command. The
+# workspace path has a richer sentinel-and-stay-alive failure mode because the
+# daemon polls bootstrap-failed; here there is no such gate, so a non-zero
+# exit kills the container and the daemon's lifecycle handles it as a start
+# failure.
+set +e
+writ-vm sandbox check 1>&2
+sandbox_code=$?
+set -e
+if [ "$sandbox_code" -ne 0 ]; then
+  echo "writ-vm sandbox check failed with exit $sandbox_code" >&2
+  exit "$sandbox_code"
+fi
+
 exec "$@"
 "#;
 
@@ -2151,12 +2165,31 @@ mod tests {
         let nix_conf_dir = dir.path().join("nix-conf");
         let trusted_public_keys =
             format!("{TEST_NIX_CACHE_PUBLIC_KEY} {SECOND_TEST_NIX_CACHE_PUBLIC_KEY}");
+        // The script invokes `writ-vm sandbox check` before exec. Provide a
+        // stub on PATH so that step succeeds in the unit-test environment;
+        // the in-VM image is what supplies the real binary.
+        let bin_dir = dir.path().join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let stub = bin_dir.join("writ-vm");
+        std::fs::write(&stub, "#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&stub).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&stub, perms).unwrap();
+        }
+        let path_with_stub = match std::env::var("PATH") {
+            Ok(p) => format!("{}:{}", bin_dir.display(), p),
+            Err(_) => bin_dir.display().to_string(),
+        };
 
         let status = Command::new("sh")
             .arg("-c")
             .arg(AGENT_VM_GUEST_NIX_SETUP_SCRIPT)
             .arg("writ-agent-vm-nix-setup")
             .arg("true")
+            .env("PATH", &path_with_stub)
             .env("WRIT_BROKER_TOKEN", "writ-vm-token")
             .env(
                 "WRIT_NIX_CACHE_URL",
@@ -2233,6 +2266,35 @@ mod tests {
             "codex".to_string(),
         ]));
         assert!(!format!("{command:?}").contains(prompt.as_str()));
+    }
+
+    #[test]
+    fn non_workspace_nix_setup_script_runs_sandbox_check_before_exec() {
+        let script = AGENT_VM_GUEST_NIX_SETUP_SCRIPT;
+        let sandbox_idx = script
+            .find("writ-vm sandbox check")
+            .expect("nix setup script should invoke writ-vm sandbox check");
+        let exec_idx = script
+            .rfind("exec \"$@\"")
+            .expect("nix setup script should exec the guest command");
+        assert!(
+            sandbox_idx < exec_idx,
+            "sandbox check ({sandbox_idx}) must precede exec (({exec_idx}))"
+        );
+    }
+
+    #[test]
+    fn non_workspace_nix_setup_script_fails_closed_on_sandbox_failure() {
+        // The no-workspace path has no /run/writ-agent-vm sentinel
+        // infrastructure: a non-zero sandbox exit must surface as a non-zero
+        // wrapper exit so the daemon sees the container die.
+        let script = AGENT_VM_GUEST_NIX_SETUP_SCRIPT;
+        let sandbox_idx = script.find("writ-vm sandbox check").expect("sandbox check");
+        let tail = &script[sandbox_idx..];
+        assert!(
+            tail.contains("exit \"$sandbox_code\""),
+            "no-workspace wrapper must propagate sandbox failure as its own exit code"
+        );
     }
 
     #[test]
