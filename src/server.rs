@@ -34,8 +34,8 @@ use crate::git_push_staging::{GitPushStagingStore, StagedEntry, StagingError};
 use crate::github::GitHubMinter;
 use crate::policy::{self, PolicyConfig};
 use crate::protocol::{
-    ClientMessage, PlanDetail, PlanReviewView, PlanSummary, RejectionReason, ServerMessage,
-    StagedPushAuditView, StagedPushDetail, StagedPushSummary,
+    ClientMessage, PlanAddendumView, PlanDetail, PlanReviewView, PlanSummary, RejectionReason,
+    ServerMessage, StagedPushAuditView, StagedPushDetail, StagedPushSummary,
 };
 use crate::secret::SecretStore;
 
@@ -446,21 +446,24 @@ async fn show_plan<S: SecretStore + Send + Sync + 'static>(
         };
         let reviews = audit.list_plan_reviews_for_plan(plan_id)?;
         let decision = audit.get_plan_decision(plan_id)?;
+        let addenda = audit.list_plan_addenda_for_plan(plan_id)?;
         Ok(ShowPlanLookup::Found {
             plan,
             correlation_id,
             reviews,
             decision,
+            addenda,
         })
     })
     .await;
-    let (plan, correlation_id, reviews, decision) = match joined {
+    let (plan, correlation_id, reviews, decision, addenda) = match joined {
         Ok(Ok(ShowPlanLookup::Found {
             plan,
             correlation_id,
             reviews,
             decision,
-        })) => (plan, correlation_id, reviews, decision),
+            addenda,
+        })) => (plan, correlation_id, reviews, decision, addenda),
         Ok(Ok(ShowPlanLookup::Unknown)) => return ServerMessage::UnknownPlan { plan_id },
         Ok(Ok(ShowPlanLookup::MissingCorrelation { run_id })) => {
             return ServerMessage::Error {
@@ -502,6 +505,15 @@ async fn show_plan<S: SecretStore + Send + Sync + 'static>(
             feedback: r.feedback,
         })
         .collect();
+    let addenda: Vec<PlanAddendumView> = addenda
+        .into_iter()
+        .map(|r| PlanAddendumView {
+            addendum_id: r.addendum_id,
+            executor_run_id: r.agent_run_id,
+            submitted_at: r.submitted_at,
+            body: r.body,
+        })
+        .collect();
     let decision = decision.map(|r| DecisionView {
         outcome: r.outcome,
         decided_at: r.decided_at,
@@ -512,6 +524,7 @@ async fn show_plan<S: SecretStore + Send + Sync + 'static>(
             body: plan.body,
             reviews,
             decision,
+            addenda,
         },
     }
 }
@@ -530,6 +543,7 @@ enum ShowPlanLookup {
         correlation_id: Option<CorrelationId>,
         reviews: Vec<crate::audit::PlanReviewRecord>,
         decision: Option<PlanDecisionRecord>,
+        addenda: Vec<crate::audit::PlanAddendumRecord>,
     },
 }
 
@@ -2088,6 +2102,68 @@ mod tests {
         (run_id, plan_id)
     }
 
+    /// Record an `Accepted` decision against `plan_id`. Addenda are
+    /// schema-gated on an accepted decision, so the surfacing tests
+    /// land this row before each addendum.
+    async fn accept_plan(
+        state: &Arc<BrokerState<InMemStore>>,
+        plan_id: crate::agent_plan::PlanId,
+        decided_at: UnixMillis,
+    ) {
+        state
+            .audit
+            .record_plan_decision(&crate::audit::PlanDecisionRecord {
+                plan_id,
+                decided_at,
+                outcome: DecisionOutcome::Accepted,
+                decider: Decider::try_new("cli:test").unwrap(),
+            })
+            .unwrap();
+    }
+
+    /// Record an executor `agent_run` and the matching `plan_addendum`
+    /// row, returning the new `AddendumId`. The executor run is bound
+    /// to `plan_id` via `read_plan_id` and tagged `stage = Execute` so
+    /// the schema-side addendum precondition trigger is satisfied.
+    /// `plan_id` must already carry an `Accepted` decision (see
+    /// [`accept_plan`]) — the addendum trigger refuses the insert
+    /// otherwise.
+    async fn record_executor_run_and_addendum(
+        state: &Arc<BrokerState<InMemStore>>,
+        session_id: SessionId,
+        plan_id: crate::agent_plan::PlanId,
+        submitted_at: UnixMillis,
+        body_text: &str,
+    ) -> crate::agent_plan::AddendumId {
+        let executor_run = crate::agent_run::AgentRunId::new();
+        let addendum_id = crate::agent_plan::AddendumId::new();
+        let body = crate::agent_plan::PlanBody::try_new(body_text).unwrap();
+        state
+            .audit
+            .record_agent_run(&crate::audit::AgentRunAuditRecord {
+                run_id: executor_run,
+                session_id,
+                requested_at: UnixMillis::from_millis(1_700_000_000),
+                agent_kind: AgentKind::Claude,
+                prompt: crate::agent_run::AgentPrompt::new("execute this plan").summary(),
+                correlation_id: None,
+                stage: crate::agent_plan::Stage::Execute,
+                read_plan_id: Some(plan_id),
+            })
+            .unwrap();
+        state
+            .audit
+            .record_plan_addendum(&crate::audit::PlanAddendumRecord {
+                addendum_id,
+                plan_id,
+                agent_run_id: executor_run,
+                submitted_at,
+                body,
+            })
+            .unwrap();
+        addendum_id
+    }
+
     /// Record a reviewer `agent_run` and the matching `plan_review`
     /// row, returning the new `ReviewId`. The reviewer run is bound to
     /// `plan_id` via `read_plan_id`, mirroring the broker invariant
@@ -2286,9 +2362,10 @@ mod tests {
         assert!(detail.summary.correlation_id.is_none());
     }
 
-    /// A plan with no reviews and no decision surfaces `reviews: []`
-    /// and `decision: None` in the wire detail. The empty-reviews
-    /// invariant matches the protocol-level "always emit []" decision.
+    /// A plan with no reviews, no addenda, and no decision surfaces
+    /// `reviews: []`, `addenda: []`, and `decision: None` in the wire
+    /// detail. The empty-Vec invariant matches the protocol-level
+    /// "always emit []" decision.
     #[tokio::test]
     async fn show_plan_with_no_reviews_or_decision_returns_empty_reviews_and_none_decision() {
         let server = MockServer::start().await;
@@ -2310,6 +2387,7 @@ mod tests {
         };
         assert!(detail.reviews.is_empty());
         assert!(detail.decision.is_none());
+        assert!(detail.addenda.is_empty());
     }
 
     /// A plan with reviews and an `Accepted` decision surfaces both on
@@ -2461,6 +2539,112 @@ mod tests {
         assert_eq!(detail.reviews.len(), 2);
         assert_eq!(detail.reviews[0].review_id, first);
         assert_eq!(detail.reviews[1].review_id, second);
+    }
+
+    /// A plan with addenda surfaces them on the wire alongside the
+    /// other fields. Each `PlanAddendumRecord` is mapped to a
+    /// `PlanAddendumView` — body, addendum_id, and the executor's run
+    /// id (under the `executor_run_id` rename) round-trip.
+    #[tokio::test]
+    async fn show_plan_with_addenda_returns_full_detail() {
+        let server = MockServer::start().await;
+        let state = make_state(&server, vec![], "o");
+        let session_id = open_session(&state).await;
+        let (_, plan_id) = record_planner_run_and_plan(
+            &state,
+            session_id,
+            None,
+            "# plan",
+            UnixMillis::from_millis(1_700_000_200),
+        )
+        .await;
+        accept_plan(&state, plan_id, UnixMillis::from_millis(1_700_000_250)).await;
+        let addendum_id = record_executor_run_and_addendum(
+            &state,
+            session_id,
+            plan_id,
+            UnixMillis::from_millis(1_700_000_500),
+            "# Addendum\n\nMid-execution note.",
+        )
+        .await;
+
+        let resp = dispatch_message(ClientMessage::ShowPlan { plan_id }, &state).await;
+        let detail = match resp {
+            ServerMessage::Plan { plan } => plan,
+            other => panic!("expected Plan, got {other:?}"),
+        };
+        assert_eq!(detail.addenda.len(), 1);
+        let addendum = &detail.addenda[0];
+        assert_eq!(addendum.addendum_id, addendum_id);
+        assert_eq!(addendum.submitted_at.as_millis(), 1_700_000_500);
+        assert_eq!(addendum.body.as_str(), "# Addendum\n\nMid-execution note.");
+    }
+
+    /// Addenda are surfaced in submission order (oldest first), and
+    /// addenda against *other* plans are excluded by the per-plan
+    /// filter in `list_plan_addenda_for_plan`.
+    #[tokio::test]
+    async fn show_plan_orders_addenda_oldest_first_and_excludes_other_plans() {
+        let server = MockServer::start().await;
+        let state = make_state(&server, vec![], "o");
+        let session_id = open_session(&state).await;
+        let (_, plan_id) = record_planner_run_and_plan(
+            &state,
+            session_id,
+            None,
+            "# plan",
+            UnixMillis::from_millis(1_700_000_200),
+        )
+        .await;
+        let (_, other_plan_id) = record_planner_run_and_plan(
+            &state,
+            session_id,
+            None,
+            "# other plan",
+            UnixMillis::from_millis(1_700_000_201),
+        )
+        .await;
+        accept_plan(&state, plan_id, UnixMillis::from_millis(1_700_000_250)).await;
+        accept_plan(
+            &state,
+            other_plan_id,
+            UnixMillis::from_millis(1_700_000_251),
+        )
+        .await;
+        let first = record_executor_run_and_addendum(
+            &state,
+            session_id,
+            plan_id,
+            UnixMillis::from_millis(1_700_000_500),
+            "# first",
+        )
+        .await;
+        let second = record_executor_run_and_addendum(
+            &state,
+            session_id,
+            plan_id,
+            UnixMillis::from_millis(1_700_000_600),
+            "# second",
+        )
+        .await;
+        // An addendum on a different plan must not leak into this listing.
+        record_executor_run_and_addendum(
+            &state,
+            session_id,
+            other_plan_id,
+            UnixMillis::from_millis(1_700_000_550),
+            "# unrelated",
+        )
+        .await;
+
+        let resp = dispatch_message(ClientMessage::ShowPlan { plan_id }, &state).await;
+        let detail = match resp {
+            ServerMessage::Plan { plan } => plan,
+            other => panic!("expected Plan, got {other:?}"),
+        };
+        assert_eq!(detail.addenda.len(), 2);
+        assert_eq!(detail.addenda[0].addendum_id, first);
+        assert_eq!(detail.addenda[1].addendum_id, second);
     }
 
     #[tokio::test]
