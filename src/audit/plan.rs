@@ -8,7 +8,7 @@ use rusqlite::{OptionalExtension, Row, params};
 use super::validation::validate_sha256_hex;
 use super::{AuditError, AuditLog};
 use crate::agent_plan::{
-    CorrelationId, Decider, DecisionOutcome, PlanBody, PlanBodyError, PlanFeedback,
+    AddendumId, CorrelationId, Decider, DecisionOutcome, PlanBody, PlanBodyError, PlanFeedback,
     PlanFeedbackError, PlanId, ReviewId, Verdict,
 };
 use crate::agent_run::AgentRunId;
@@ -51,6 +51,22 @@ pub struct PlanReviewRecord {
     pub submitted_at: UnixMillis,
     pub verdict: Verdict,
     pub feedback: Option<PlanFeedback>,
+}
+
+/// One `plan_addendum` row: an executor agent run posting a follow-up
+/// addendum against an accepted plan. Per §"Plan lifecycle" a plan may
+/// carry zero or more addenda after acceptance; each executor run is
+/// responsible for at most one row, enforced by `UNIQUE(agent_run_id)`
+/// at the schema level. The DAO stores `body_sha256` derived from the
+/// [`PlanBody`] so consumers cannot disagree with the DB about the
+/// digest of what was recorded.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PlanAddendumRecord {
+    pub addendum_id: AddendumId,
+    pub plan_id: PlanId,
+    pub agent_run_id: AgentRunId,
+    pub submitted_at: UnixMillis,
+    pub body: PlanBody,
 }
 
 /// Body-less summary returned by [`AuditLog::list_plans`]. The listing
@@ -453,6 +469,170 @@ impl AuditLog {
             Ok(out)
         })
     }
+
+    /// Record one `plan_addendum` row. The plan, the executor agent run,
+    /// and the accepted-decision precondition are pre-checked in the
+    /// same transaction so callers see a typed `AuditError::Invariant`
+    /// for each failure mode rather than a raw "FOREIGN KEY constraint
+    /// failed" or trigger-message string.
+    ///
+    /// Stage, session, read-plan binding, and the "decision must be
+    /// accepted" rule are belt-and-braces: the broker route enforces
+    /// them up front, this pre-check restates them for readable errors,
+    /// and the v2 triggers (`plan_addendum_requires_open_session`,
+    /// `plan_addendum_requires_executor_run`,
+    /// `plan_addendum_requires_accepted_decision`) catch any raw INSERT
+    /// that bypasses both layers.
+    ///
+    /// A second addendum from the same executor run surfaces as the
+    /// underlying SQLite UNIQUE constraint error (the
+    /// `UNIQUE(agent_run_id)` clause); callers may map that to a
+    /// wire-side "addendum already recorded" outcome.
+    ///
+    /// The `body_sha256` column is computed here from the [`PlanBody`]
+    /// so storage and digest cannot disagree.
+    pub fn record_plan_addendum(&self, r: &PlanAddendumRecord) -> Result<(), AuditError> {
+        let body_sha256 = r.body.sha256_hex();
+
+        self.with_conn_mut(|c| {
+            let tx = c.transaction()?;
+
+            let plan_exists: Option<i64> = tx
+                .query_row(
+                    "SELECT 1 FROM plan WHERE plan_id = ?1",
+                    params![r.plan_id.as_uuid().to_string()],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if plan_exists.is_none() {
+                return Err(AuditError::Invariant("plan does not exist"));
+            }
+
+            // Addenda only apply to accepted plans. The route gate
+            // enforces this for clean errors; restate it here so a
+            // direct DAO caller (e.g. a backfill) gets a typed
+            // invariant rather than the trigger's raw message.
+            let accepted: Option<i64> = tx
+                .query_row(
+                    "SELECT 1 FROM plan_decision
+                     WHERE plan_id = ?1 AND outcome = 'accepted'",
+                    params![r.plan_id.as_uuid().to_string()],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if accepted.is_none() {
+                return Err(AuditError::Invariant(
+                    "plan_addendum requires plan_decision.outcome = 'accepted'",
+                ));
+            }
+
+            let agent_run: Option<(String, Option<i64>, String, Option<String>)> = tx
+                .query_row(
+                    "SELECT ar.session_id, s.closed_at, ar.stage, ar.read_plan_id
+                     FROM agent_run ar
+                     JOIN session s ON s.session_id = ar.session_id
+                     WHERE ar.run_id = ?1",
+                    params![r.agent_run_id.as_uuid().to_string()],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .optional()?;
+            let plan_id_str = r.plan_id.as_uuid().to_string();
+            match agent_run {
+                None => return Err(AuditError::Invariant("agent run does not exist")),
+                Some((_, Some(_), _, _)) => {
+                    return Err(AuditError::Invariant("session is closed"));
+                }
+                Some((_, None, ref stage, _)) if stage != "execute" => {
+                    return Err(AuditError::Invariant(
+                        "plan_addendum requires agent_run.stage = 'execute'",
+                    ));
+                }
+                // The route contract requires `run.read_plan_id =
+                // <plan_id>`; restate it here so an executor that read
+                // plan A cannot attach an addendum to plan B. The
+                // matching trigger is the last line of defence against
+                // a raw INSERT.
+                Some((_, None, _, ref read_plan_id))
+                    if read_plan_id.as_deref() != Some(&plan_id_str) =>
+                {
+                    return Err(AuditError::Invariant(
+                        "plan_addendum requires agent_run.read_plan_id = plan_id",
+                    ));
+                }
+                Some(_) => {}
+            }
+
+            tx.execute(
+                "INSERT INTO plan_addendum (
+                     addendum_id,
+                     plan_id,
+                     agent_run_id,
+                     submitted_at,
+                     body,
+                     body_sha256
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    r.addendum_id.as_uuid().to_string(),
+                    r.plan_id.as_uuid().to_string(),
+                    r.agent_run_id.as_uuid().to_string(),
+                    r.submitted_at.as_millis(),
+                    r.body.as_str(),
+                    &body_sha256,
+                ],
+            )?;
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
+    /// Look up one addendum by `addendum_id`. Returns `Ok(None)` if no
+    /// row with that id exists.
+    pub fn get_plan_addendum(
+        &self,
+        addendum_id: AddendumId,
+    ) -> Result<Option<PlanAddendumRecord>, AuditError> {
+        self.with_conn(|c| {
+            let row = c
+                .query_row(
+                    "SELECT addendum_id, plan_id, agent_run_id, submitted_at,
+                            body, body_sha256
+                     FROM plan_addendum
+                     WHERE addendum_id = ?1",
+                    params![addendum_id.as_uuid().to_string()],
+                    plan_addendum_from_row,
+                )
+                .optional()?;
+            row.transpose()
+        })
+    }
+
+    /// List every addendum attached to one plan, oldest first. `rowid`
+    /// breaks ties on `submitted_at` so the order is stable across
+    /// repeated reads even when two addenda land in the same
+    /// millisecond.
+    pub fn list_plan_addenda_for_plan(
+        &self,
+        plan_id: PlanId,
+    ) -> Result<Vec<PlanAddendumRecord>, AuditError> {
+        self.with_conn(|c| {
+            let mut stmt = c.prepare(
+                "SELECT addendum_id, plan_id, agent_run_id, submitted_at,
+                        body, body_sha256
+                 FROM plan_addendum
+                 WHERE plan_id = ?1
+                 ORDER BY submitted_at, rowid",
+            )?;
+            let rows = stmt.query_map(
+                params![plan_id.as_uuid().to_string()],
+                plan_addendum_from_row,
+            )?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row??);
+            }
+            Ok(out)
+        })
+    }
 }
 
 fn plan_from_row(row: &Row<'_>) -> rusqlite::Result<Result<PlanSubmissionRecord, AuditError>> {
@@ -577,6 +757,52 @@ fn plan_review_from_row(row: &Row<'_>) -> rusqlite::Result<Result<PlanReviewReco
             submitted_at: UnixMillis::from_millis(submitted_at),
             verdict,
             feedback,
+        })
+    };
+    Ok(parse())
+}
+
+fn plan_addendum_from_row(
+    row: &Row<'_>,
+) -> rusqlite::Result<Result<PlanAddendumRecord, AuditError>> {
+    let addendum_id_str: String = row.get(0)?;
+    let plan_id_str: String = row.get(1)?;
+    let agent_run_id_str: String = row.get(2)?;
+    let submitted_at: i64 = row.get(3)?;
+    let body_text: String = row.get(4)?;
+    let body_sha256: String = row.get(5)?;
+
+    let parse = || -> Result<PlanAddendumRecord, AuditError> {
+        let addendum_id = uuid::Uuid::parse_str(&addendum_id_str)
+            .map_err(|_| AuditError::Invariant("plan_addendum row: addendum_id not a uuid"))?;
+        let plan_id = uuid::Uuid::parse_str(&plan_id_str)
+            .map_err(|_| AuditError::Invariant("plan_addendum row: plan_id not a uuid"))?;
+        let agent_run_id = uuid::Uuid::parse_str(&agent_run_id_str)
+            .map_err(|_| AuditError::Invariant("plan_addendum row: agent_run_id not a uuid"))?;
+        validate_sha256_hex(&body_sha256, "plan_addendum body sha256")?;
+        let body = PlanBody::try_new(body_text).map_err(|e| match e {
+            PlanBodyError::Empty => AuditError::Invariant("plan_addendum row: body is empty"),
+            PlanBodyError::TooLarge { .. } => {
+                AuditError::Invariant("plan_addendum row: body exceeds size limit")
+            }
+            PlanBodyError::EmbeddedNul => {
+                AuditError::Invariant("plan_addendum row: body contains embedded NUL")
+            }
+        })?;
+        // Belt-and-braces: the stored digest must agree with a fresh
+        // recompute over the body bytes. A disagreement means the row
+        // was tampered with after insertion.
+        if body.sha256_hex() != body_sha256 {
+            return Err(AuditError::Invariant(
+                "plan_addendum row: body_sha256 does not match body",
+            ));
+        }
+        Ok(PlanAddendumRecord {
+            addendum_id: AddendumId::from_uuid(addendum_id),
+            plan_id: PlanId::from_uuid(plan_id),
+            agent_run_id: AgentRunId::from_uuid(agent_run_id),
+            submitted_at: UnixMillis::from_millis(submitted_at),
+            body,
         })
     };
     Ok(parse())
@@ -2097,6 +2323,714 @@ mod tests {
         assert!(
             rendered.contains("not null"),
             "expected NOT NULL violation on review_id, got {err}"
+        );
+    }
+
+    // --- plan_addendum DAO ---------------------------------------------
+
+    /// Submit a plan and accept it, returning the plan id. Addenda
+    /// require both — a plan row to FK against and an `accepted`
+    /// decision row for the trigger / pre-check. Tests that exercise
+    /// the missing-decision and rejected-decision paths build the
+    /// preconditions themselves.
+    fn accepted_plan(log: &AuditLog, session_id: SessionId) -> PlanId {
+        let plan_id = submitted_plan(log, session_id);
+        log.record_plan_decision(&PlanDecisionRecord {
+            plan_id,
+            decided_at: UnixMillis::from_millis(1_700_000_350),
+            outcome: DecisionOutcome::Accepted,
+            decider: Decider::try_new("cli:alice").unwrap(),
+        })
+        .unwrap();
+        plan_id
+    }
+
+    fn sample_executor_run(log: &AuditLog, session_id: SessionId, plan_id: PlanId) -> AgentRunId {
+        let run_id = AgentRunId::new();
+        log.record_agent_run(&AgentRunAuditRecord {
+            run_id,
+            session_id,
+            requested_at: UnixMillis::from_millis(1_700_000_360),
+            agent_kind: AgentKind::Claude,
+            prompt: AgentPrompt::new("execute this plan").summary(),
+            correlation_id: None,
+            stage: Stage::Execute,
+            read_plan_id: Some(plan_id),
+        })
+        .unwrap();
+        run_id
+    }
+
+    fn sample_addendum_record(
+        log: &AuditLog,
+        session_id: SessionId,
+        plan_id: PlanId,
+        body: PlanBody,
+    ) -> PlanAddendumRecord {
+        let executor = sample_executor_run(log, session_id, plan_id);
+        PlanAddendumRecord {
+            addendum_id: AddendumId::new(),
+            plan_id,
+            agent_run_id: executor,
+            submitted_at: UnixMillis::from_millis(1_700_000_400),
+            body,
+        }
+    }
+
+    /// Happy path: an addendum against an executor run for an accepted
+    /// plan round-trips (body intact) and the stored `body_sha256`
+    /// agrees with a fresh recompute over the body bytes.
+    #[test]
+    fn plan_addendum_roundtrips() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+        let plan_id = accepted_plan(&log, s.session_id);
+        let body = PlanBody::try_new("# Addendum\n\nAlso: tidy up bar.").unwrap();
+        let record = sample_addendum_record(&log, s.session_id, plan_id, body.clone());
+
+        log.record_plan_addendum(&record).unwrap();
+
+        let read = log.get_plan_addendum(record.addendum_id).unwrap().unwrap();
+        assert_eq!(read, record);
+
+        let stored_sha: String = log
+            .with_conn(|c| {
+                Ok(c.query_row(
+                    "SELECT body_sha256 FROM plan_addendum WHERE addendum_id = ?1",
+                    params![record.addendum_id.as_uuid().to_string()],
+                    |r| r.get(0),
+                )?)
+            })
+            .unwrap();
+        assert_eq!(stored_sha, body.sha256_hex());
+    }
+
+    /// `get_plan_addendum` returns `None` for an id that has no row.
+    #[test]
+    fn get_plan_addendum_returns_none_for_missing_addendum() {
+        let log = AuditLog::open_in_memory().unwrap();
+        assert!(log.get_plan_addendum(AddendumId::new()).unwrap().is_none());
+    }
+
+    /// A plan may carry many addenda; the listing orders by
+    /// `submitted_at` (and `rowid` as tie-break) and includes every
+    /// row.
+    #[test]
+    fn list_plan_addenda_for_plan_returns_each_addendum_in_submission_order() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+        let plan_id = accepted_plan(&log, s.session_id);
+
+        let first = {
+            let mut r = sample_addendum_record(
+                &log,
+                s.session_id,
+                plan_id,
+                PlanBody::try_new("# First addendum").unwrap(),
+            );
+            r.submitted_at = UnixMillis::from_millis(1_700_000_400);
+            r
+        };
+        let second = {
+            let mut r = sample_addendum_record(
+                &log,
+                s.session_id,
+                plan_id,
+                PlanBody::try_new("# Second addendum").unwrap(),
+            );
+            r.submitted_at = UnixMillis::from_millis(1_700_000_500);
+            r
+        };
+        log.record_plan_addendum(&first).unwrap();
+        log.record_plan_addendum(&second).unwrap();
+
+        let listed = log.list_plan_addenda_for_plan(plan_id).unwrap();
+        assert_eq!(listed, vec![first, second]);
+    }
+
+    /// Ties on `submitted_at` are broken by `rowid` so the order is
+    /// stable across repeated reads. Insert two addenda at the same
+    /// millisecond and confirm `rowid` order is preserved.
+    #[test]
+    fn list_plan_addenda_for_plan_breaks_submitted_at_ties_by_rowid() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+        let plan_id = accepted_plan(&log, s.session_id);
+
+        let first = sample_addendum_record(
+            &log,
+            s.session_id,
+            plan_id,
+            PlanBody::try_new("# First").unwrap(),
+        );
+        let second = sample_addendum_record(
+            &log,
+            s.session_id,
+            plan_id,
+            PlanBody::try_new("# Second").unwrap(),
+        );
+        log.record_plan_addendum(&first).unwrap();
+        log.record_plan_addendum(&second).unwrap();
+
+        let listed = log.list_plan_addenda_for_plan(plan_id).unwrap();
+        assert_eq!(listed, vec![first, second]);
+    }
+
+    /// Addenda belong only to their plan: a query for one plan must
+    /// not surface an addendum attached to a different plan.
+    #[test]
+    fn list_plan_addenda_for_plan_excludes_other_plans_addenda() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+        let plan_a = accepted_plan(&log, s.session_id);
+        let plan_b = accepted_plan(&log, s.session_id);
+
+        let addendum_a = sample_addendum_record(
+            &log,
+            s.session_id,
+            plan_a,
+            PlanBody::try_new("# A").unwrap(),
+        );
+        let addendum_b = sample_addendum_record(
+            &log,
+            s.session_id,
+            plan_b,
+            PlanBody::try_new("# B").unwrap(),
+        );
+        log.record_plan_addendum(&addendum_a).unwrap();
+        log.record_plan_addendum(&addendum_b).unwrap();
+
+        assert_eq!(
+            log.list_plan_addenda_for_plan(plan_a).unwrap(),
+            vec![addendum_a]
+        );
+        assert_eq!(
+            log.list_plan_addenda_for_plan(plan_b).unwrap(),
+            vec![addendum_b]
+        );
+    }
+
+    /// An addendum against a plan that doesn't exist surfaces as a
+    /// clean invariant error rather than a raw foreign-key string.
+    #[test]
+    fn plan_addendum_rejects_missing_plan() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+
+        // Build an executor run that names a non-existent plan via
+        // read_plan_id; the run itself is registered, but the plan
+        // never was, so the pre-check trips on plan-missing before
+        // it reaches the run lookup.
+        let executor = AgentRunId::new();
+        log.record_agent_run(&AgentRunAuditRecord {
+            run_id: executor,
+            session_id: s.session_id,
+            requested_at: UnixMillis::from_millis(1_700_000_360),
+            agent_kind: AgentKind::Claude,
+            prompt: AgentPrompt::new("execute this plan").summary(),
+            correlation_id: None,
+            stage: Stage::Execute,
+            read_plan_id: None,
+        })
+        .unwrap();
+
+        let err = log
+            .record_plan_addendum(&PlanAddendumRecord {
+                addendum_id: AddendumId::new(),
+                plan_id: PlanId::new(),
+                agent_run_id: executor,
+                submitted_at: UnixMillis::from_millis(1_700_000_400),
+                body: PlanBody::try_new("# Addendum").unwrap(),
+            })
+            .unwrap_err();
+        assert!(matches!(err, AuditError::Invariant("plan does not exist")));
+    }
+
+    /// An addendum against an `agent_run_id` that has no row surfaces
+    /// as an invariant error — the caller has handed in a stale or
+    /// fabricated run id.
+    #[test]
+    fn plan_addendum_rejects_missing_agent_run() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+        let plan_id = accepted_plan(&log, s.session_id);
+
+        let err = log
+            .record_plan_addendum(&PlanAddendumRecord {
+                addendum_id: AddendumId::new(),
+                plan_id,
+                agent_run_id: AgentRunId::new(),
+                submitted_at: UnixMillis::from_millis(1_700_000_400),
+                body: PlanBody::try_new("# Addendum").unwrap(),
+            })
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            AuditError::Invariant("agent run does not exist")
+        ));
+    }
+
+    /// An addendum against a plan whose decision has not yet been
+    /// recorded is refused. The DAO surfaces a typed invariant rather
+    /// than the trigger's raw message.
+    #[test]
+    fn plan_addendum_rejects_undecided_plan() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+        // submitted_plan creates a plan with no decision.
+        let plan_id = submitted_plan(&log, s.session_id);
+        // The pre-check fires on the plan-not-accepted clause before
+        // the agent run is even validated; build an executor run so
+        // the test pinpoints the right invariant.
+        let executor = sample_executor_run(&log, s.session_id, plan_id);
+
+        let err = log
+            .record_plan_addendum(&PlanAddendumRecord {
+                addendum_id: AddendumId::new(),
+                plan_id,
+                agent_run_id: executor,
+                submitted_at: UnixMillis::from_millis(1_700_000_400),
+                body: PlanBody::try_new("# Addendum").unwrap(),
+            })
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            AuditError::Invariant("plan_addendum requires plan_decision.outcome = 'accepted'")
+        ));
+    }
+
+    /// An addendum against a plan whose decision is `rejected_restart`
+    /// is refused. Mirrors the undecided-plan test for the other
+    /// outcome.
+    #[test]
+    fn plan_addendum_rejects_rejected_plan() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+        let plan_id = submitted_plan(&log, s.session_id);
+        log.record_plan_decision(&PlanDecisionRecord {
+            plan_id,
+            decided_at: UnixMillis::from_millis(1_700_000_350),
+            outcome: DecisionOutcome::RejectedRestart,
+            decider: Decider::try_new("cli:alice").unwrap(),
+        })
+        .unwrap();
+        let executor = sample_executor_run(&log, s.session_id, plan_id);
+
+        let err = log
+            .record_plan_addendum(&PlanAddendumRecord {
+                addendum_id: AddendumId::new(),
+                plan_id,
+                agent_run_id: executor,
+                submitted_at: UnixMillis::from_millis(1_700_000_400),
+                body: PlanBody::try_new("# Addendum").unwrap(),
+            })
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            AuditError::Invariant("plan_addendum requires plan_decision.outcome = 'accepted'")
+        ));
+    }
+
+    /// Belt-and-braces: the accepted-decision trigger fires on a raw
+    /// INSERT that bypasses the DAO pre-check. An undecided plan must
+    /// have no addenda even from a raw write path.
+    #[test]
+    fn plan_addendum_db_trigger_rejects_undecided_plan() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+        let plan_id = submitted_plan(&log, s.session_id);
+        let executor = sample_executor_run(&log, s.session_id, plan_id);
+
+        let body = "# Addendum";
+        let body_sha = crate::agent_run::sha256_hex(body.as_bytes());
+        let err = log
+            .with_conn(|c| {
+                c.execute(
+                    "INSERT INTO plan_addendum
+                     (addendum_id, plan_id, agent_run_id, submitted_at, body, body_sha256)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![
+                        AddendumId::new().as_uuid().to_string(),
+                        plan_id.as_uuid().to_string(),
+                        executor.as_uuid().to_string(),
+                        1_700_000_400_i64,
+                        body,
+                        body_sha,
+                    ],
+                )?;
+                Ok(())
+            })
+            .unwrap_err();
+        let AuditError::Sqlite(e) = err else {
+            panic!("expected sqlite trigger error, got {err:?}");
+        };
+        assert!(e.to_string().contains("plan_decision.outcome"), "got: {e}");
+    }
+
+    /// An executor whose session has been closed cannot land an
+    /// addendum. The DAO pre-check returns
+    /// `Invariant("session is closed")`.
+    #[test]
+    fn plan_addendum_rejects_closed_executor_session() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+        let plan_id = accepted_plan(&log, s.session_id);
+        let executor = sample_executor_run(&log, s.session_id, plan_id);
+        log.close_session(s.session_id, UnixMillis::from_millis(1_700_000_390))
+            .unwrap();
+
+        let err = log
+            .record_plan_addendum(&PlanAddendumRecord {
+                addendum_id: AddendumId::new(),
+                plan_id,
+                agent_run_id: executor,
+                submitted_at: UnixMillis::from_millis(1_700_000_400),
+                body: PlanBody::try_new("# Addendum").unwrap(),
+            })
+            .unwrap_err();
+        assert!(matches!(err, AuditError::Invariant("session is closed")));
+    }
+
+    /// Belt-and-braces: the session trigger fires on a raw INSERT
+    /// that bypasses the DAO pre-check.
+    #[test]
+    fn plan_addendum_db_trigger_rejects_direct_insert_against_closed_session() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+        let plan_id = accepted_plan(&log, s.session_id);
+        let executor = sample_executor_run(&log, s.session_id, plan_id);
+        log.close_session(s.session_id, UnixMillis::from_millis(1_700_000_390))
+            .unwrap();
+
+        let body = "# Addendum";
+        let body_sha = crate::agent_run::sha256_hex(body.as_bytes());
+        let err = log
+            .with_conn(|c| {
+                c.execute(
+                    "INSERT INTO plan_addendum
+                     (addendum_id, plan_id, agent_run_id, submitted_at, body, body_sha256)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![
+                        AddendumId::new().as_uuid().to_string(),
+                        plan_id.as_uuid().to_string(),
+                        executor.as_uuid().to_string(),
+                        1_700_000_400_i64,
+                        body,
+                        body_sha,
+                    ],
+                )?;
+                Ok(())
+            })
+            .unwrap_err();
+        let AuditError::Sqlite(e) = err else {
+            panic!("expected sqlite trigger error, got {err:?}");
+        };
+        assert!(
+            e.to_string().to_lowercase().contains("session is closed"),
+            "got: {e}"
+        );
+    }
+
+    /// A planner-stage run cannot post an addendum: the DAO pre-check
+    /// surfaces a typed invariant error.
+    #[test]
+    fn plan_addendum_rejects_non_execute_stage_run() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+        let plan_id = accepted_plan(&log, s.session_id);
+        // Use the planner run that created the plan — it has stage='plan'.
+        let planner: AgentRunId = log
+            .with_conn(|c| {
+                Ok(c.query_row(
+                    "SELECT agent_run_id FROM plan WHERE plan_id = ?1",
+                    params![plan_id.as_uuid().to_string()],
+                    |r| {
+                        let s: String = r.get(0)?;
+                        Ok(AgentRunId::from_uuid(uuid::Uuid::parse_str(&s).unwrap()))
+                    },
+                )?)
+            })
+            .unwrap();
+
+        let err = log
+            .record_plan_addendum(&PlanAddendumRecord {
+                addendum_id: AddendumId::new(),
+                plan_id,
+                agent_run_id: planner,
+                submitted_at: UnixMillis::from_millis(1_700_000_400),
+                body: PlanBody::try_new("# Addendum").unwrap(),
+            })
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            AuditError::Invariant("plan_addendum requires agent_run.stage = 'execute'")
+        ));
+    }
+
+    /// Belt-and-braces: the stage trigger fires on a raw INSERT.
+    #[test]
+    fn plan_addendum_db_trigger_rejects_non_execute_stage_run() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+        let plan_id = accepted_plan(&log, s.session_id);
+        let planner: AgentRunId = log
+            .with_conn(|c| {
+                Ok(c.query_row(
+                    "SELECT agent_run_id FROM plan WHERE plan_id = ?1",
+                    params![plan_id.as_uuid().to_string()],
+                    |r| {
+                        let s: String = r.get(0)?;
+                        Ok(AgentRunId::from_uuid(uuid::Uuid::parse_str(&s).unwrap()))
+                    },
+                )?)
+            })
+            .unwrap();
+
+        let body = "# Addendum";
+        let body_sha = crate::agent_run::sha256_hex(body.as_bytes());
+        let err = log
+            .with_conn(|c| {
+                c.execute(
+                    "INSERT INTO plan_addendum
+                     (addendum_id, plan_id, agent_run_id, submitted_at, body, body_sha256)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![
+                        AddendumId::new().as_uuid().to_string(),
+                        plan_id.as_uuid().to_string(),
+                        planner.as_uuid().to_string(),
+                        1_700_000_400_i64,
+                        body,
+                        body_sha,
+                    ],
+                )?;
+                Ok(())
+            })
+            .unwrap_err();
+        let AuditError::Sqlite(e) = err else {
+            panic!("expected sqlite trigger error, got {err:?}");
+        };
+        assert!(
+            e.to_string()
+                .contains("plan_addendum requires agent_run.stage"),
+            "got: {e}"
+        );
+    }
+
+    /// The executor run's `read_plan_id` binds the addendum to a
+    /// single plan: an executor that read plan A cannot attach an
+    /// addendum to plan B. Pre-check surfaces this as a clean typed
+    /// invariant.
+    #[test]
+    fn plan_addendum_rejects_run_bound_to_a_different_plan() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+        let plan_a = accepted_plan(&log, s.session_id);
+        let plan_b = accepted_plan(&log, s.session_id);
+        // Executor reads plan A but attempts to addend plan B.
+        let executor = sample_executor_run(&log, s.session_id, plan_a);
+
+        let err = log
+            .record_plan_addendum(&PlanAddendumRecord {
+                addendum_id: AddendumId::new(),
+                plan_id: plan_b,
+                agent_run_id: executor,
+                submitted_at: UnixMillis::from_millis(1_700_000_400),
+                body: PlanBody::try_new("# Addendum").unwrap(),
+            })
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            AuditError::Invariant("plan_addendum requires agent_run.read_plan_id = plan_id")
+        ));
+    }
+
+    /// Belt-and-braces: the trigger refuses the same cross-plan
+    /// binding on a raw INSERT.
+    #[test]
+    fn plan_addendum_db_trigger_rejects_run_bound_to_a_different_plan() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+        let plan_a = accepted_plan(&log, s.session_id);
+        let plan_b = accepted_plan(&log, s.session_id);
+        let executor = sample_executor_run(&log, s.session_id, plan_a);
+
+        let body = "# Addendum";
+        let body_sha = crate::agent_run::sha256_hex(body.as_bytes());
+        let err = log
+            .with_conn(|c| {
+                c.execute(
+                    "INSERT INTO plan_addendum
+                     (addendum_id, plan_id, agent_run_id, submitted_at, body, body_sha256)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![
+                        AddendumId::new().as_uuid().to_string(),
+                        plan_b.as_uuid().to_string(),
+                        executor.as_uuid().to_string(),
+                        1_700_000_400_i64,
+                        body,
+                        body_sha,
+                    ],
+                )?;
+                Ok(())
+            })
+            .unwrap_err();
+        let AuditError::Sqlite(e) = err else {
+            panic!("expected sqlite trigger error, got {err:?}");
+        };
+        assert!(e.to_string().contains("read_plan_id"), "got: {e}");
+    }
+
+    /// A second addendum from the same executor run surfaces as the
+    /// `UNIQUE(agent_run_id)` violation. Callers may map that
+    /// wire-side to "addendum already recorded"; the audit-side raw
+    /// error must be a SQLite UNIQUE so the mapping has something to
+    /// match on.
+    #[test]
+    fn plan_addendum_rejects_second_addendum_for_same_run() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+        let plan_id = accepted_plan(&log, s.session_id);
+        let executor = sample_executor_run(&log, s.session_id, plan_id);
+
+        log.record_plan_addendum(&PlanAddendumRecord {
+            addendum_id: AddendumId::new(),
+            plan_id,
+            agent_run_id: executor,
+            submitted_at: UnixMillis::from_millis(1_700_000_400),
+            body: PlanBody::try_new("# First").unwrap(),
+        })
+        .unwrap();
+
+        let err = log
+            .record_plan_addendum(&PlanAddendumRecord {
+                addendum_id: AddendumId::new(),
+                plan_id,
+                agent_run_id: executor,
+                submitted_at: UnixMillis::from_millis(1_700_000_500),
+                body: PlanBody::try_new("# Second").unwrap(),
+            })
+            .unwrap_err();
+        let AuditError::Sqlite(e) = err else {
+            panic!("expected sqlite UNIQUE error, got {err:?}");
+        };
+        assert!(e.to_string().to_uppercase().contains("UNIQUE"), "got: {e}");
+    }
+
+    /// Belt-and-braces: a raw INSERT with an empty body is refused by
+    /// the column CHECK before the row lands.
+    #[test]
+    fn plan_addendum_check_rejects_empty_body() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+        let plan_id = accepted_plan(&log, s.session_id);
+        let executor = sample_executor_run(&log, s.session_id, plan_id);
+
+        let err = log
+            .with_conn(|c| {
+                Ok(c.execute(
+                    "INSERT INTO plan_addendum
+                     (addendum_id, plan_id, agent_run_id, submitted_at, body, body_sha256)
+                     VALUES (?1, ?2, ?3, ?4, '', ?5)",
+                    params![
+                        AddendumId::new().as_uuid().to_string(),
+                        plan_id.as_uuid().to_string(),
+                        executor.as_uuid().to_string(),
+                        1_700_000_400_i64,
+                        crate::agent_run::sha256_hex(b""),
+                    ],
+                )?)
+            })
+            .unwrap_err();
+        let rendered = err.to_string().to_lowercase();
+        assert!(
+            rendered.contains("check"),
+            "expected CHECK violation, got {err}"
+        );
+    }
+
+    /// Belt-and-braces: a malformed (short / non-hex) `body_sha256`
+    /// is refused by the column CHECK.
+    #[test]
+    fn plan_addendum_check_rejects_malformed_body_sha256() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+        let plan_id = accepted_plan(&log, s.session_id);
+        let executor = sample_executor_run(&log, s.session_id, plan_id);
+
+        let err = log
+            .with_conn(|c| {
+                Ok(c.execute(
+                    "INSERT INTO plan_addendum
+                     (addendum_id, plan_id, agent_run_id, submitted_at, body, body_sha256)
+                     VALUES (?1, ?2, ?3, ?4, '# Addendum', 'too short')",
+                    params![
+                        AddendumId::new().as_uuid().to_string(),
+                        plan_id.as_uuid().to_string(),
+                        executor.as_uuid().to_string(),
+                        1_700_000_400_i64,
+                    ],
+                )?)
+            })
+            .unwrap_err();
+        let rendered = err.to_string().to_lowercase();
+        assert!(
+            rendered.contains("check"),
+            "expected CHECK violation, got {err}"
+        );
+    }
+
+    /// Belt-and-braces: SQLite's well-known v1/v2 compat quirk allows
+    /// NULL in a `TEXT PRIMARY KEY` column unless explicitly marked
+    /// `NOT NULL`. The schema declares `addendum_id ... NOT NULL` so
+    /// a raw INSERT with `addendum_id = NULL` is refused.
+    #[test]
+    fn plan_addendum_rejects_null_addendum_id_at_schema_boundary() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+        let plan_id = accepted_plan(&log, s.session_id);
+        let executor = sample_executor_run(&log, s.session_id, plan_id);
+
+        let body = "# Addendum";
+        let body_sha = crate::agent_run::sha256_hex(body.as_bytes());
+        let err = log
+            .with_conn(|c| {
+                Ok(c.execute(
+                    "INSERT INTO plan_addendum
+                     (addendum_id, plan_id, agent_run_id, submitted_at, body, body_sha256)
+                     VALUES (NULL, ?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        plan_id.as_uuid().to_string(),
+                        executor.as_uuid().to_string(),
+                        1_700_000_400_i64,
+                        body,
+                        body_sha,
+                    ],
+                )?)
+            })
+            .unwrap_err();
+        let rendered = err.to_string().to_lowercase();
+        assert!(
+            rendered.contains("not null"),
+            "expected NOT NULL violation on addendum_id, got {err}"
         );
     }
 }

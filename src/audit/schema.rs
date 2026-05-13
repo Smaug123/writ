@@ -49,16 +49,23 @@ pub(super) struct Migration {
 /// a version higher than this is rejected with [`AuditError::SchemaTooNew`]
 /// rather than opened — we'd rather fail to start than silently drop data
 /// into a schema a newer broker wrote.
-pub(super) const SCHEMA_VERSION: i32 = 1;
+pub(super) const SCHEMA_VERSION: i32 = 2;
 
 /// The full migration history. Each entry documents exactly one state
 /// transition; the sequence of entries is the schema's lineage. Order
 /// must be strictly ascending and contiguous from 1 to [`SCHEMA_VERSION`].
-pub(super) const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    name: "0001_initial",
-    sql: include_str!("migrations/0001_initial.sql"),
-}];
+pub(super) const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        name: "0001_initial",
+        sql: include_str!("migrations/0001_initial.sql"),
+    },
+    Migration {
+        version: 2,
+        name: "0002_plan_addendum",
+        sql: include_str!("migrations/0002_plan_addendum.sql"),
+    },
+];
 
 // Belt-and-braces: the compile-time shape of MIGRATIONS is the source
 // of truth, so verify it matches SCHEMA_VERSION at compile time rather
@@ -177,29 +184,36 @@ mod tests {
     use tempfile::NamedTempFile;
 
     #[test]
-    fn fresh_open_is_at_schema_version_1() {
+    fn fresh_open_is_at_current_schema_version() {
         let log = AuditLog::open_in_memory().unwrap();
         let v = log.with_conn(current_version).unwrap();
         assert_eq!(v, SCHEMA_VERSION);
     }
 
+    /// Every entry in `MIGRATIONS` must record its `name` row in the
+    /// `schema_version` registry after a fresh open. Walking the table
+    /// rather than asserting against a single hardcoded version means
+    /// future migrations don't need to revisit this test.
     #[test]
     fn fresh_open_records_migration_metadata() {
         let log = AuditLog::open_in_memory().unwrap();
-        let (name, applied_at_ms): (String, i64) = log
-            .with_conn(|c| {
-                Ok(c.query_row(
-                    "SELECT name, applied_at_ms FROM schema_version WHERE version = ?1",
-                    params![SCHEMA_VERSION],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )?)
-            })
-            .unwrap();
-        assert_eq!(name, "0001_initial");
-        assert!(
-            applied_at_ms > 0,
-            "applied_at_ms should be a real timestamp"
-        );
+        for migration in MIGRATIONS {
+            let (name, applied_at_ms): (String, i64) = log
+                .with_conn(|c| {
+                    Ok(c.query_row(
+                        "SELECT name, applied_at_ms FROM schema_version WHERE version = ?1",
+                        params![migration.version],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )?)
+                })
+                .unwrap();
+            assert_eq!(name, migration.name);
+            assert!(
+                applied_at_ms > 0,
+                "applied_at_ms should be a real timestamp for {}",
+                migration.name
+            );
+        }
     }
 
     #[test]
@@ -217,7 +231,7 @@ mod tests {
             .unwrap()
         };
 
-        // Reopen — should observe a single row, unchanged.
+        // Reopen — should observe one row per migration, unchanged.
         let log = AuditLog::open(db.path()).unwrap();
         let (count, applied_at_ms): (i64, i64) = log
             .with_conn(|c| {
@@ -228,7 +242,11 @@ mod tests {
                 )?)
             })
             .unwrap();
-        assert_eq!(count, 1, "no duplicate INSERT on reopen");
+        assert_eq!(
+            count,
+            MIGRATIONS.len() as i64,
+            "no duplicate INSERT on reopen"
+        );
         assert_eq!(
             applied_at_ms, first_applied_at_ms,
             "applied_at_ms is from the first apply, not a reapply"
@@ -281,6 +299,7 @@ mod tests {
             "plan",
             "plan_decision",
             "plan_review",
+            "plan_addendum",
         ] {
             assert!(tables.contains(expected), "missing table: {expected}");
         }
@@ -302,6 +321,9 @@ mod tests {
             "plan_requires_open_session",
             "plan_review_requires_open_session",
             "plan_review_requires_reviewer_run",
+            "plan_addendum_requires_open_session",
+            "plan_addendum_requires_executor_run",
+            "plan_addendum_requires_accepted_decision",
         ] {
             assert!(triggers.contains(expected), "missing trigger: {expected}");
         }
