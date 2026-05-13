@@ -39,7 +39,10 @@ pub use openai_proxy::{
     VmHttpOpenAiProxyAuthKind, VmHttpOpenAiProxyConfig, VmHttpOpenAiProxyConfigError,
 };
 pub use plan::VmHttpPlanService;
-use plan::{is_plans_collection_target, route_plans_collection_request};
+use plan::{
+    is_plans_collection_target, parse_plan_id_target, route_plan_id_request,
+    route_plans_collection_request,
+};
 use proxy_common::{
     ClaudeBackend, OpenAiBackend, ProxyAuditDecision, ProxyBackend, ProxyStream,
     record_proxy_local_response, route_proxy_request,
@@ -1299,6 +1302,15 @@ where
             return VmHttpResponse::text(VmHttpStatus::NotFound, "not found").into();
         };
         return route_plans_collection_request(session, request, body, service)
+            .await
+            .into();
+    }
+
+    if let Some(plan_id) = parse_plan_id_target(&request.target) {
+        let Some(service) = services.plans else {
+            return VmHttpResponse::text(VmHttpStatus::NotFound, "not found").into();
+        };
+        return route_plan_id_request(session, request, plan_id, service)
             .await
             .into();
     }

@@ -722,14 +722,12 @@ proptest! {
         plan_id in arb_plan_id(),
         run_id in arb_agent_run_id(),
         body in arb_plan_body(),
-        prompt_text in "[ -~]{1,1024}",
         decision in prop::option::of(arb_decision_view()),
     ) {
         let view = PlanView {
             plan_id,
             body,
             originating_run_id: run_id,
-            originating_prompt: AgentPrompt::try_new(prompt_text).unwrap(),
             decision,
         };
         let j = serde_json::to_string(&view).unwrap();
