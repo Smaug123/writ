@@ -44,8 +44,6 @@ pub(crate) enum ParseObjectError {
     Truncated,
     #[error("commit header line {0:?} is malformed (no SP separator)")]
     MalformedHeader(String),
-    #[error("commit has duplicate `{0}` header")]
-    DuplicateHeader(&'static str),
     #[error("commit is missing required `{0}` header")]
     MissingHeader(&'static str),
     #[error("commit header SHA in `{key}` line is not a valid object id: {source}")]
@@ -62,6 +60,20 @@ pub(crate) enum ParseObjectError {
     NonUtf8Message(#[source] std::str::Utf8Error),
     #[error("commit message contains a NUL byte (git fsck: nulInCommit)")]
     NulInMessage,
+    #[error("commit header line contains a NUL byte (git fsck: nulInHeader)")]
+    NulInHeader,
+    #[error(
+        "commit header {0:?} appears out of the required `tree → parent* → author → committer` order"
+    )]
+    OutOfOrderHeader(String),
+    #[error(
+        "required commit header has a folded continuation line (only post-committer extension headers may fold)"
+    )]
+    UnexpectedContinuation,
+    #[error(
+        "tree entries are not in git's tree-comparison order (git fsck: treeNotSorted): {prev:?} >= {curr:?}"
+    )]
+    TreeNotSorted { prev: String, curr: String },
     #[error("tree entry header is malformed: {0}")]
     MalformedTreeEntry(String),
     #[error("tree entry mode {0:?} is not recognized")]
@@ -80,6 +92,20 @@ pub(crate) enum ParseObjectError {
 /// continuation lines — are skipped, since the walker re-signs (or
 /// leaves unsigned) commits on the App side.
 pub(crate) fn parse_commit_object(bytes: &[u8]) -> Result<StagingCommit, ParseObjectError> {
+    // Header order is a strict prefix
+    //   tree → parent* → author → committer
+    // followed by an optional section of extension headers (gpgsig,
+    // mergetag, encoding, ...). Track the current phase explicitly
+    // so the parser does not silently re-shape malformed input that
+    // git itself rejects.
+    #[derive(Copy, Clone, PartialEq, Eq)]
+    enum Phase {
+        ExpectTree,
+        ExpectParentOrAuthor,
+        ExpectCommitter,
+        Extensions,
+    }
+    let mut phase = Phase::ExpectTree;
     let mut tree: Option<GitObjectId> = None;
     let mut parents: Vec<GitObjectId> = Vec::new();
     let mut author: Option<CommitIdentity> = None;
@@ -97,68 +123,85 @@ pub(crate) fn parse_commit_object(bytes: &[u8]) -> Result<StagingCommit, ParseOb
         let header_start = cursor;
         let header_end =
             find_byte(bytes, b'\n', header_start).ok_or(ParseObjectError::UnterminatedHeader)?;
-        cursor = header_end + 1;
-        // Absorb continuation lines (a leading SP marks a folded
-        // continuation; we discard the value since we never use
-        // multi-line headers).
-        while cursor < bytes.len() && bytes[cursor] == b' ' {
-            let next_lf =
-                find_byte(bytes, b'\n', cursor).ok_or(ParseObjectError::UnterminatedHeader)?;
-            cursor = next_lf + 1;
-        }
-
         let header_line = &bytes[header_start..header_end];
+        // `git fsck --strict` flags NUL in the header section as
+        // `nulInHeader`. NUL is valid UTF-8, so without an explicit
+        // check it would pass through to identity strings, extension
+        // headers, etc.
+        if header_line.contains(&0) {
+            return Err(ParseObjectError::NulInHeader);
+        }
+        cursor = header_end + 1;
+
         let sp = header_line.iter().position(|b| *b == b' ').ok_or_else(|| {
             ParseObjectError::MalformedHeader(String::from_utf8_lossy(header_line).into_owned())
         })?;
         let key = &header_line[..sp];
         let value = &header_line[sp + 1..];
-        match key {
+
+        // Decide whether continuations are allowed for this header.
+        // Only post-committer extension headers (gpgsig, mergetag,
+        // ...) may fold; a continuation on tree/parent/author/
+        // committer means a malformed header value that git does not
+        // produce, and consuming it silently would launder the
+        // commit's byte form into a different valid one.
+        let allow_continuation = match key {
             b"tree" => {
-                if tree.is_some() {
-                    return Err(ParseObjectError::DuplicateHeader("tree"));
+                if phase != Phase::ExpectTree {
+                    return Err(ParseObjectError::OutOfOrderHeader("tree".to_string()));
                 }
                 tree = Some(parse_sha(value, "tree")?);
+                phase = Phase::ExpectParentOrAuthor;
+                false
             }
             b"parent" => {
-                // Git's commit format places `parent` headers in the
-                // block before `author`; `rev-list --parents` ignores
-                // any that appear later. Mirror that here so a
-                // crafted staging commit cannot launder an extra
-                // ancestor through the parser by tacking a `parent`
-                // line on after `committer`.
-                if author.is_none() {
-                    parents.push(parse_sha(value, "parent")?);
+                if phase != Phase::ExpectParentOrAuthor {
+                    return Err(ParseObjectError::OutOfOrderHeader("parent".to_string()));
                 }
+                parents.push(parse_sha(value, "parent")?);
+                false
             }
             b"author" => {
-                if author.is_some() {
-                    return Err(ParseObjectError::DuplicateHeader("author"));
+                if phase != Phase::ExpectParentOrAuthor {
+                    return Err(ParseObjectError::OutOfOrderHeader("author".to_string()));
                 }
                 author = Some(parse_identity(value)?);
+                phase = Phase::ExpectCommitter;
+                false
             }
             b"committer" => {
-                if committer.is_some() {
-                    return Err(ParseObjectError::DuplicateHeader("committer"));
+                if phase != Phase::ExpectCommitter {
+                    return Err(ParseObjectError::OutOfOrderHeader("committer".to_string()));
                 }
                 committer = Some(parse_identity(value)?);
+                phase = Phase::Extensions;
+                false
             }
             other => {
-                // Git's commit format is a strict prefix
-                //   tree → parent* → author → committer
-                // followed by an optional section of extension
-                // headers (gpgsig, mergetag, encoding, ...). Anything
-                // unrecognised before `committer` is rejected by
-                // `git fsck`; only post-committer extension headers
-                // are skipped, since the walker re-signs / re-emits
-                // commits and never preserves them.
-                if committer.is_none() {
+                if phase != Phase::Extensions {
                     return Err(ParseObjectError::MalformedHeader(format!(
                         "unexpected header {:?} before committer",
                         String::from_utf8_lossy(other)
                     )));
                 }
+                true
             }
+        };
+
+        // Now examine any continuation lines belonging to this
+        // header. Reject early for required headers; absorb (after
+        // NUL-checking) for extensions.
+        if cursor < bytes.len() && bytes[cursor] == b' ' && !allow_continuation {
+            return Err(ParseObjectError::UnexpectedContinuation);
+        }
+        while cursor < bytes.len() && bytes[cursor] == b' ' {
+            let next_lf =
+                find_byte(bytes, b'\n', cursor).ok_or(ParseObjectError::UnterminatedHeader)?;
+            let cont_line = &bytes[cursor..next_lf];
+            if cont_line.contains(&0) {
+                return Err(ParseObjectError::NulInHeader);
+            }
+            cursor = next_lf + 1;
         }
     }
 
@@ -235,6 +278,15 @@ pub(crate) fn parse_tree_object(bytes: &[u8]) -> Result<StagingTree, ParseObject
     // crafted staging tree silently choose which object a path
     // resolves to on the published side.
     let mut seen_paths: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Tracks the previous entry's name and "is-directory" flag so the
+    // parser can enforce git's tree-comparison order (`git fsck`'s
+    // `treeNotSorted` rule). Names are compared byte-by-byte, but a
+    // subdirectory's name is treated as if it had a trailing `/`,
+    // i.e. the byte immediately after the name is `/` (0x2F) for
+    // directories and `\0` (0x00) for files. Without this check, a
+    // crafted staging tree whose entries are out of order would be
+    // hashed differently from what git would have produced.
+    let mut prev_entry: Option<(String, bool)> = None;
     let mut cursor = 0;
     while cursor < bytes.len() {
         let sp = bytes[cursor..]
@@ -268,6 +320,17 @@ pub(crate) fn parse_tree_object(bytes: &[u8]) -> Result<StagingTree, ParseObject
                 "duplicate tree entry name: {path:?}"
             )));
         }
+        let curr_is_dir = matches!(kind, TreeEntryKind::Subtree);
+        if let Some((prev_name, prev_is_dir)) = prev_entry.as_ref()
+            && tree_entry_cmp(prev_name, *prev_is_dir, &path, curr_is_dir)
+                != std::cmp::Ordering::Less
+        {
+            return Err(ParseObjectError::TreeNotSorted {
+                prev: prev_name.clone(),
+                curr: path.clone(),
+            });
+        }
+        prev_entry = Some((path.clone(), curr_is_dir));
         cursor += nul + 1;
 
         if cursor + 20 > bytes.len() {
@@ -283,6 +346,41 @@ pub(crate) fn parse_tree_object(bytes: &[u8]) -> Result<StagingTree, ParseObject
         entries.push(StagingTreeEntry { path, kind, sha });
     }
     Ok(StagingTree { entries })
+}
+
+/// Git's tree-comparison ordering, returning `Less` if entry `a`
+/// must sort before entry `b`.
+///
+/// Names are compared byte-by-byte over their common prefix; once
+/// one name is exhausted, the comparison continues against a
+/// "virtual" trailing byte that is `/` (0x2F) if that entry is a
+/// subdirectory and `\0` (0x00) otherwise. This is the same
+/// `base_name_compare` rule git uses to order tree entries on disk;
+/// `git fsck --strict` reports `treeNotSorted` for any tree whose
+/// entries are not strictly increasing under this order.
+fn tree_entry_cmp(a: &str, a_is_dir: bool, b: &str, b_is_dir: bool) -> std::cmp::Ordering {
+    let ab = a.as_bytes();
+    let bb = b.as_bytes();
+    let common = ab.len().min(bb.len());
+    match ab[..common].cmp(&bb[..common]) {
+        std::cmp::Ordering::Equal => {}
+        other => return other,
+    }
+    let a_next = if ab.len() > common {
+        ab[common]
+    } else if a_is_dir {
+        b'/'
+    } else {
+        0
+    };
+    let b_next = if bb.len() > common {
+        bb[common]
+    } else if b_is_dir {
+        b'/'
+    } else {
+        0
+    };
+    a_next.cmp(&b_next)
 }
 
 /// Returns `Err` if `name` is not a legal tree entry name per git's
@@ -620,6 +718,12 @@ mod tests {
 
     #[test]
     fn parse_commit_object_rejects_duplicate_tree() {
+        // A second `tree` line is now caught by the strict
+        // header-order state machine — once `tree` has been consumed
+        // the parser is in `ExpectParentOrAuthor` and any later
+        // `tree` fails as out-of-order. The duplicate-tree shape is
+        // a subset of that condition, so the test's expectation
+        // shifted from `DuplicateHeader` to `OutOfOrderHeader`.
         let mut commit = StagingCommit {
             tree: sample_object_id('a'),
             parents: vec![],
@@ -633,17 +737,38 @@ mod tests {
         bytes.splice(0..0, dup.bytes());
         let err = parse_commit_object(&bytes).unwrap_err();
         assert!(
-            matches!(err, ParseObjectError::DuplicateHeader("tree")),
+            matches!(err, ParseObjectError::OutOfOrderHeader(ref k) if k == "tree"),
             "got: {err:?}"
         );
     }
 
     #[test]
     fn parse_commit_object_rejects_missing_tree() {
-        let bytes = b"author Alice <a@x> 0 +0000\ncommitter Alice <a@x> 0 +0000\n\nmsg";
+        // A truly empty header section (blank line immediately) is
+        // the only path through the parser that surfaces a
+        // `MissingHeader("tree")`: a commit that has *some* headers
+        // but no tree is now rejected earlier by the state machine
+        // as `OutOfOrderHeader`. Exercise the missing-everything
+        // shape here and the missing-via-disorder shape in
+        // `parse_commit_object_rejects_disordered_missing_tree`.
+        let bytes = b"\nmsg";
         let err = parse_commit_object(bytes).unwrap_err();
         assert!(
             matches!(err, ParseObjectError::MissingHeader("tree")),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn parse_commit_object_rejects_disordered_missing_tree() {
+        // When a commit has author/committer but no tree, the state
+        // machine catches the disorder before the
+        // `MissingHeader("tree")` fallback runs. Either error variant
+        // is correct; pin down the current behaviour.
+        let bytes = b"author Alice <a@x> 0 +0000\ncommitter Alice <a@x> 0 +0000\n\nmsg";
+        let err = parse_commit_object(bytes).unwrap_err();
+        assert!(
+            matches!(err, ParseObjectError::OutOfOrderHeader(ref k) if k == "author"),
             "got: {err:?}"
         );
     }
@@ -729,17 +854,19 @@ mod tests {
     }
 
     #[test]
-    fn parse_commit_object_ignores_parent_after_author() {
-        // Per the git object format, `parent` headers belong before
-        // `author`; git's `rev-list --parents` ignores any that appear
-        // later. A crafted staging commit could carry such a stray
-        // `parent` line to launder ancestry through the replay walker
-        // — either onto a SHA the walker has already replayed (giving
-        // a published commit ancestry the source bundle did not have)
-        // or onto a SHA it hasn't, breaking replay loudly with
-        // `UnmappedParent`. Mirror git: only collect parents that
-        // precede the author header; later `parent` lines are
-        // discarded like any other unknown header.
+    fn parse_commit_object_rejects_parent_after_author() {
+        // Per the git object format, `parent` headers belong in the
+        // strict prefix `tree → parent* → author → committer`, before
+        // `author`. A crafted staging commit could carry a stray
+        // `parent` line later to launder ancestry through the replay
+        // walker — either onto a SHA the walker has already replayed
+        // (giving a published commit ancestry the source bundle did
+        // not have) or onto a SHA it hasn't, breaking replay loudly
+        // with `UnmappedParent`. Silently dropping the stray line is
+        // its own kind of laundering: a crafted commit whose parents
+        // do not match the bytes the walker pushes downstream is
+        // accepted as a different valid commit. Reject the malformed
+        // shape outright.
         let commit = StagingCommit {
             tree: sample_object_id('a'),
             parents: vec![sample_object_id('b')],
@@ -748,8 +875,6 @@ mod tests {
             message: "msg\n".to_string(),
         };
         let mut bytes = serialize_commit_object(&commit);
-        // Inject a stray `parent` line between committer and the
-        // blank line.
         let blank_pos = bytes
             .windows(2)
             .position(|w| w == b"\n\n")
@@ -757,10 +882,181 @@ mod tests {
         let stray = format!("parent {}\n", sample_object_id('f').as_str());
         bytes.splice(blank_pos + 1..blank_pos + 1, stray.bytes());
 
-        let parsed =
-            parse_commit_object(&bytes).expect("parser should silently drop post-author parent");
-        // The injected SHA must NOT appear in the parents list.
-        assert_eq!(parsed.parents, vec![sample_object_id('b')]);
+        let err = parse_commit_object(&bytes).expect_err("parent after committer must be rejected");
+        assert!(
+            matches!(err, ParseObjectError::OutOfOrderHeader(_)),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn parse_commit_object_rejects_committer_before_author() {
+        // Git's commit format pins the order
+        //   tree → parent* → author → committer
+        // `git fsck` rejects a commit whose `committer` precedes its
+        // `author` (it flags `missingAuthor`/`missingCommitter` for
+        // the resulting malformed prefix); without an explicit state
+        // machine the parser would collect both fields into their
+        // option slots and re-emit them in canonical order on
+        // serialize, laundering a malformed commit into a valid one.
+        let bytes = b"tree aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n\
+                      committer Alice <a@x> 0 +0000\n\
+                      author Alice <a@x> 0 +0000\n\
+                      \n\
+                      msg\n";
+        let err = parse_commit_object(bytes).expect_err("must reject committer before author");
+        assert!(
+            matches!(err, ParseObjectError::OutOfOrderHeader(_)),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn parse_commit_object_rejects_parent_after_committer_state_check() {
+        // Belt-and-braces variant of the parent-after-author test:
+        // even after `committer` (i.e. in the extensions phase), a
+        // `parent` line is not a valid extension header — it is a
+        // member of the strict prefix that must not reappear.
+        let bytes = b"tree aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n\
+                      author Alice <a@x> 0 +0000\n\
+                      committer Alice <a@x> 0 +0000\n\
+                      parent bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n\
+                      \n\
+                      msg\n";
+        let err =
+            parse_commit_object(bytes).expect_err("parent in extension phase must be rejected");
+        assert!(
+            matches!(err, ParseObjectError::OutOfOrderHeader(_)),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn parse_commit_object_rejects_continuation_on_required_header() {
+        // Folded continuation lines (a leading SP marks a continuation
+        // of the previous header value) are only legal in the optional
+        // extension-header section after `committer` — `gpgsig` is the
+        // motivating example. A continuation on `tree`/`parent`/
+        // `author`/`committer` is a malformed header value that git
+        // does not produce; accepting it (by swallowing the
+        // continuation) lets a crafted commit launder its byte form
+        // through the parser while presenting a canonical re-emit.
+        // Build the bytes by concatenation so the leading SP on the
+        // continuation line is not consumed by Rust's `\<newline>`
+        // string escape.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"tree aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n");
+        bytes.extend_from_slice(b"author Alice <a@x> 0 +0000\n");
+        bytes.extend_from_slice(b" sneaky continuation\n");
+        bytes.extend_from_slice(b"committer Alice <a@x> 0 +0000\n");
+        bytes.push(b'\n');
+        bytes.extend_from_slice(b"msg\n");
+        let err =
+            parse_commit_object(&bytes).expect_err("continuation on required header must reject");
+        assert!(
+            matches!(err, ParseObjectError::UnexpectedContinuation),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn parse_commit_object_rejects_nul_in_identity_header() {
+        // `git fsck --strict` rejects NUL bytes anywhere inside a
+        // commit's header section as `nulInHeader`. The existing
+        // NUL-in-body check only fires after the blank line, so a
+        // crafted staging commit can hide a NUL in the author/
+        // committer line (or any extension header) and still parse.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"tree aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n");
+        bytes.extend_from_slice(b"author Al");
+        bytes.push(0);
+        bytes.extend_from_slice(b"ice <a@x> 0 +0000\n");
+        bytes.extend_from_slice(b"committer Alice <a@x> 0 +0000\n");
+        bytes.push(b'\n');
+        bytes.extend_from_slice(b"msg\n");
+        let err = parse_commit_object(&bytes).expect_err("NUL in author must be rejected");
+        assert!(matches!(err, ParseObjectError::NulInHeader), "got: {err:?}");
+    }
+
+    #[test]
+    fn parse_commit_object_rejects_nul_in_extension_header() {
+        // The extensions phase still must reject NUL: `git fsck`
+        // treats any NUL in the header section as `nulInHeader`
+        // regardless of which header it lives in, so a NUL hidden in
+        // a `gpgsig` continuation would otherwise pass straight
+        // through the parser into wherever the walker re-emits it.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"tree aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n");
+        bytes.extend_from_slice(b"author Alice <a@x> 0 +0000\n");
+        bytes.extend_from_slice(b"committer Alice <a@x> 0 +0000\n");
+        bytes.extend_from_slice(b"gpgsig BEGIN\n");
+        bytes.extend_from_slice(b" cont");
+        bytes.push(0);
+        bytes.extend_from_slice(b"inuation\n");
+        bytes.push(b'\n');
+        bytes.extend_from_slice(b"msg\n");
+        let err = parse_commit_object(&bytes).expect_err("NUL in continuation must be rejected");
+        assert!(matches!(err, ParseObjectError::NulInHeader), "got: {err:?}");
+    }
+
+    #[test]
+    fn parse_tree_object_rejects_unsorted_entries() {
+        // `git fsck --strict` reports `treeNotSorted` for trees whose
+        // entries are not in git's required tree-comparison order
+        // (byte-wise on the name, with subdirectories sorting as if
+        // they had a trailing `/`). Without enforcement, a crafted
+        // staging tree carrying entries in arbitrary order is
+        // accepted, hashed differently from what git would have
+        // produced, and replayed onto GitHub's create-tree API as if
+        // well-formed.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"100644 b");
+        bytes.push(0);
+        bytes.extend_from_slice(&hex_decode(sample_object_id('a').as_str()));
+        bytes.extend_from_slice(b"100644 a");
+        bytes.push(0);
+        bytes.extend_from_slice(&hex_decode(sample_object_id('b').as_str()));
+        let err = parse_tree_object(&bytes).expect_err("unsorted entries must be rejected");
+        assert!(
+            matches!(err, ParseObjectError::TreeNotSorted { .. }),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn parse_tree_object_enforces_directory_trailing_slash_in_sort() {
+        // Git's tree comparison treats directories as if they had a
+        // trailing `/`. So file `a` (terminator `\0` = 0x00) < file
+        // `a-` (next byte `-` = 0x2D) < dir `a` (virtual `/` = 0x2F)
+        // < file `a0` (next byte `0` = 0x30). A naive byte-compare of
+        // the stored names would place dir `a` next to file `a`,
+        // missing the sort violation when dir `a` immediately follows
+        // a name like `a-` whose bytes sort *before* `a/` but *after*
+        // a plain `a`. Pin this down: emit file `a-` then dir `a`,
+        // which is correctly sorted under git's rules (`a-` < `a/`).
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"100644 a-");
+        bytes.push(0);
+        bytes.extend_from_slice(&hex_decode(sample_object_id('a').as_str()));
+        bytes.extend_from_slice(b"40000 a");
+        bytes.push(0);
+        bytes.extend_from_slice(&hex_decode(sample_object_id('b').as_str()));
+        parse_tree_object(&bytes).expect("a- < a/ is correctly sorted");
+
+        // Now reverse: dir `a` (sorts as `a/`) followed by file `a-`
+        // (sorts as `a-`) violates ordering since `a/` > `a-`.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"40000 a");
+        bytes.push(0);
+        bytes.extend_from_slice(&hex_decode(sample_object_id('a').as_str()));
+        bytes.extend_from_slice(b"100644 a-");
+        bytes.push(0);
+        bytes.extend_from_slice(&hex_decode(sample_object_id('b').as_str()));
+        let err = parse_tree_object(&bytes).expect_err("dir `a` then file `a-` violates tree sort");
+        assert!(
+            matches!(err, ParseObjectError::TreeNotSorted { .. }),
+            "got: {err:?}"
+        );
     }
 
     #[test]
@@ -806,6 +1102,11 @@ mod tests {
 
     #[test]
     fn parse_tree_object_round_trip_mixed_kinds() {
+        // Entries are listed in git's required tree-comparison order
+        // (`treeNotSorted` enforcement runs in `parse_tree_object`):
+        // submodules sort as files (\0 terminator), only subtrees
+        // sort as `name/`. So under byte ordering:
+        //   README < link < run.sh < src < vendor.
         let tree = StagingTree {
             entries: vec![
                 StagingTreeEntry {
@@ -814,14 +1115,14 @@ mod tests {
                     sha: sample_object_id('1'),
                 },
                 StagingTreeEntry {
-                    path: "run.sh".to_string(),
-                    kind: TreeEntryKind::Executable,
-                    sha: sample_object_id('2'),
-                },
-                StagingTreeEntry {
                     path: "link".to_string(),
                     kind: TreeEntryKind::Symlink,
                     sha: sample_object_id('3'),
+                },
+                StagingTreeEntry {
+                    path: "run.sh".to_string(),
+                    kind: TreeEntryKind::Executable,
+                    sha: sample_object_id('2'),
                 },
                 StagingTreeEntry {
                     path: "src".to_string(),
@@ -1105,14 +1406,25 @@ mod tests {
 
     fn arb_staging_tree() -> impl Strategy<Value = StagingTree> {
         // Dedupe by path so the generator cannot violate the parser's
-        // no-duplicate-entries rule by chance. Generation order is
-        // preserved: the first occurrence of each path wins.
+        // no-duplicate-entries rule by chance, then sort by git's
+        // tree-comparison order so the parser's `treeNotSorted` check
+        // never fires on a legitimately well-formed StagingTree.
+        // Without sorting the round-trip property would observe a
+        // parse error that is not actually a round-trip bug.
         prop_vec(arb_staging_tree_entry(), 0..16).prop_map(|entries| {
             let mut seen = std::collections::HashSet::new();
-            let entries = entries
+            let mut entries: Vec<_> = entries
                 .into_iter()
                 .filter(|e| seen.insert(e.path.clone()))
                 .collect();
+            entries.sort_by(|a, b| {
+                tree_entry_cmp(
+                    &a.path,
+                    matches!(a.kind, TreeEntryKind::Subtree),
+                    &b.path,
+                    matches!(b.kind, TreeEntryKind::Subtree),
+                )
+            });
             StagingTree { entries }
         })
     }
