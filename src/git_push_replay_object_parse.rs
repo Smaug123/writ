@@ -60,6 +60,8 @@ pub(crate) enum ParseObjectError {
     MalformedIdentity(String),
     #[error("commit message is not valid UTF-8: {0}")]
     NonUtf8Message(#[source] std::str::Utf8Error),
+    #[error("commit message contains a NUL byte (git fsck: nulInCommit)")]
+    NulInMessage,
     #[error("tree entry header is malformed: {0}")]
     MalformedTreeEntry(String),
     #[error("tree entry mode {0:?} is not recognized")]
@@ -141,9 +143,21 @@ pub(crate) fn parse_commit_object(bytes: &[u8]) -> Result<StagingCommit, ParseOb
                 }
                 committer = Some(parse_identity(value)?);
             }
-            _ => {
-                // Unknown header (gpgsig, mergetag, encoding, etc.).
-                // Skip it: replay never preserves arbitrary headers.
+            other => {
+                // Git's commit format is a strict prefix
+                //   tree → parent* → author → committer
+                // followed by an optional section of extension
+                // headers (gpgsig, mergetag, encoding, ...). Anything
+                // unrecognised before `committer` is rejected by
+                // `git fsck`; only post-committer extension headers
+                // are skipped, since the walker re-signs / re-emits
+                // commits and never preserves them.
+                if committer.is_none() {
+                    return Err(ParseObjectError::MalformedHeader(format!(
+                        "unexpected header {:?} before committer",
+                        String::from_utf8_lossy(other)
+                    )));
+                }
             }
         }
     }
@@ -152,6 +166,14 @@ pub(crate) fn parse_commit_object(bytes: &[u8]) -> Result<StagingCommit, ParseOb
     let author = author.ok_or(ParseObjectError::MissingHeader("author"))?;
     let committer = committer.ok_or(ParseObjectError::MissingHeader("committer"))?;
     let message_bytes = &bytes[cursor..];
+    // `git fsck --strict` flags NUL bytes in a commit body as
+    // `nulInCommit`. NUL is a valid UTF-8 code point, so without an
+    // explicit check the byte would pass straight through into the
+    // `String` and on to anything downstream that treats the message
+    // as a NUL-terminated value.
+    if message_bytes.contains(&0) {
+        return Err(ParseObjectError::NulInMessage);
+    }
     let message = std::str::from_utf8(message_bytes)
         .map_err(ParseObjectError::NonUtf8Message)?
         .to_string();
@@ -393,12 +415,18 @@ fn parse_name_email(s: &str) -> Result<(&str, &str), ParseObjectError> {
     let lt = inner.rfind('<').ok_or_else(|| {
         ParseObjectError::MalformedIdentity(format!("identity name<email> is missing `<`: {s:?}"))
     })?;
-    let name_end = if lt > 0 && inner.as_bytes()[lt - 1] == b' ' {
-        lt - 1
-    } else {
-        lt
-    };
-    let name = &inner[..name_end];
+    // Require a literal space immediately before `<` so the parser
+    // does not silently re-shape `Alice<a@x>` (which git fsck flags
+    // as `missingSpaceBeforeEmail`) or `<a@x>` (`missingNameBeforeEmail`)
+    // into the canonical `Alice <a@x>` form on serialize. The
+    // empty-name form is still accepted: `" <a@x>"` has `lt == 1`
+    // and the byte before `<` is a space.
+    if lt == 0 || inner.as_bytes()[lt - 1] != b' ' {
+        return Err(ParseObjectError::MalformedIdentity(format!(
+            "identity {s:?} is missing the space before `<`"
+        )));
+    }
+    let name = &inner[..lt - 1];
     let email = &inner[lt + 1..];
     Ok((name, email))
 }
@@ -625,6 +653,79 @@ mod tests {
         let bytes = b"tree aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n";
         let err = parse_commit_object(bytes).unwrap_err();
         assert!(matches!(err, ParseObjectError::Truncated), "got: {err:?}");
+    }
+
+    #[test]
+    fn parse_commit_object_rejects_extension_header_before_author() {
+        // Git's commit format prescribes a strict prefix:
+        //   tree → parent* → author → committer
+        // Extension/unknown headers (encoding, gpgsig, mergetag,
+        // ...) are only legal in the optional section *after*
+        // committer. A staging commit that places an extension
+        // header earlier — e.g. between `tree` and `author` — is
+        // rejected by Git, but a permissive parser would silently
+        // drop the header and accept the commit, laundering a
+        // different commit object into the walker's input. Reject
+        // unknown headers that appear before `committer`.
+        let bytes = b"tree aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n\
+                      encoding UTF-8\n\
+                      author Alice <a@x> 0 +0000\n\
+                      committer Alice <a@x> 0 +0000\n\
+                      \n\
+                      msg\n";
+        let err = parse_commit_object(bytes).expect_err("must reject early extension header");
+        assert!(
+            matches!(err, ParseObjectError::MalformedHeader(_)),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn parse_commit_object_rejects_nul_in_message() {
+        // `git fsck --strict` rejects NUL bytes in a commit's body
+        // as `nulInCommit`. The parser is the trust boundary for
+        // untrusted staging objects; without an explicit reject,
+        // `from_utf8` succeeds (NUL is a valid UTF-8 code point) and
+        // the NUL passes through to anything downstream that uses
+        // the message as a delimiter.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"tree aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n");
+        bytes.extend_from_slice(b"author Alice <a@x> 0 +0000\n");
+        bytes.extend_from_slice(b"committer Alice <a@x> 0 +0000\n");
+        bytes.push(b'\n');
+        bytes.extend_from_slice(b"before");
+        bytes.push(0);
+        bytes.extend_from_slice(b"after\n");
+        let err = parse_commit_object(&bytes).expect_err("must reject NUL in body");
+        assert!(
+            matches!(err, ParseObjectError::NulInMessage),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn parse_identity_rejects_missing_space_before_email() {
+        // `git fsck` rejects identity lines like `Alice<a@e> ...`
+        // (`missingSpaceBeforeEmail`) and `<a@e> ...`
+        // (`missingNameBeforeEmail`). Without the space the parser
+        // currently treats `Alice` as the name and silently
+        // re-emits `Alice <a@e>` on serialize, laundering a
+        // different valid identity. The leading-space empty-name
+        // form `" <a@e>"` remains accepted.
+        let err = parse_identity(b"Alice<a@example.invalid> 0 +0000")
+            .expect_err("missing space before `<` must be rejected");
+        assert!(
+            matches!(err, ParseObjectError::MalformedIdentity(_)),
+            "got: {err:?}"
+        );
+        let err = parse_identity(b"<a@example.invalid> 0 +0000")
+            .expect_err("absent space before `<` must be rejected");
+        assert!(
+            matches!(err, ParseObjectError::MalformedIdentity(_)),
+            "got: {err:?}"
+        );
+        // Boundary: the canonical empty-name form still parses.
+        parse_identity(b" <a@example.invalid> 0 +0000").expect("empty-name form must still parse");
     }
 
     #[test]
@@ -937,8 +1038,12 @@ mod tests {
     }
 
     fn arb_message() -> impl Strategy<Value = String> {
-        // Body bytes are unconstrained UTF-8.
-        ".*".prop_map(|s: String| s)
+        // Body bytes are unconstrained UTF-8 *except* NUL, which the
+        // parser rejects to match `git fsck`'s `nulInCommit` rule.
+        // Generating NUL here would make the round-trip property
+        // observe a parse error that is not actually a round-trip
+        // bug, so strip it at the source.
+        ".*".prop_map(|s: String| s.replace('\0', ""))
     }
 
     fn arb_staging_commit() -> impl Strategy<Value = StagingCommit> {
