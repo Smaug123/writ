@@ -143,10 +143,11 @@ impl CatFileObjectSource {
     }
 
     /// Close the child gracefully: drop stdin to signal EOF, then
-    /// `wait()` the cat-file process to completion. Prefer this
-    /// when the caller wants to surface a non-zero exit status from
-    /// the child (the natural `Drop` path sends SIGKILL via
-    /// `kill_on_drop`, which makes the exit status uninformative).
+    /// `wait()` the cat-file process to completion. Returns the
+    /// exit status as an error if the child exited non-zero;
+    /// callers who only want to reap without checking status can
+    /// just drop the source (the `Drop` path SIGKILLs via
+    /// `kill_on_drop`).
     pub async fn close(self) -> io::Result<()> {
         let CatFileChild {
             mut child,
@@ -155,7 +156,12 @@ impl CatFileObjectSource {
         } = self.inner.into_inner();
         drop(stdin);
         drop(stdout);
-        child.wait().await?;
+        let status = child.wait().await?;
+        if !status.success() {
+            return Err(io::Error::other(format!(
+                "`git cat-file --batch` exited with non-zero status: {status}"
+            )));
+        }
         Ok(())
     }
 }
@@ -239,6 +245,8 @@ async fn read_object_raw(
             sha: sha.as_str().to_string(),
             reason: format!("cat-file response missing type field: {header:?}"),
         })?;
+    // `missing` and `ambiguous` carry no payload, so we can return
+    // immediately without disturbing the pipe framing.
     match kind_field {
         "missing" => {
             return Err(GitObjectSourceError::NotFound {
@@ -251,13 +259,7 @@ async fn read_object_raw(
                 reason: "cat-file reported the SHA as ambiguous".to_string(),
             });
         }
-        kind if kind == expected_type => {}
-        kind => {
-            return Err(GitObjectSourceError::Malformed {
-                sha: sha.as_str().to_string(),
-                reason: format!("expected `{expected_type}`, got `{kind}`"),
-            });
-        }
+        _ => {}
     }
     let size_field = fields
         .next()
@@ -279,6 +281,11 @@ async fn read_object_raw(
                 reason: format!("cat-file size field {size_field:?} is not a usize: {err}"),
             })?;
 
+    // Drain the full payload (size bytes + trailing LF) before
+    // applying the type check. Returning early on a type mismatch
+    // without consuming the body would leave the next caller's
+    // read_* framed against the tail of this object's bytes,
+    // silently corrupting every subsequent read.
     let mut payload = vec![0u8; size];
     child
         .stdout
@@ -298,6 +305,12 @@ async fn read_object_raw(
                 "cat-file payload not LF-terminated: trailing byte 0x{:02x}",
                 trailing[0]
             ),
+        });
+    }
+    if kind_field != expected_type {
+        return Err(GitObjectSourceError::Malformed {
+            sha: sha.as_str().to_string(),
+            reason: format!("expected `{expected_type}`, got `{kind_field}`"),
         });
     }
     Ok(payload)
@@ -1207,8 +1220,20 @@ mod tests {
         let repo = tmp.path();
         run_git(repo, &["init", "--bare"]);
 
-        let blob_sha = run_git_stdin(repo, &["hash-object", "-w", "--stdin"], b"x\n");
+        // Use a blob body whose length is large enough that, if the
+        // implementation forgets to drain the response on a type
+        // mismatch, the leftover bytes are guaranteed to corrupt the
+        // next reply's header. A short body could coincidentally
+        // happen to round-trip.
+        let blob_body = b"x".repeat(64);
+        let blob_sha = run_git_stdin(repo, &["hash-object", "-w", "--stdin"], &blob_body);
         let blob_id = GitObjectId::new(blob_sha).expect("valid sha");
+
+        // Second blob with distinct contents so the post-mismatch
+        // read has to return *its* bytes, not the first blob's.
+        let other_body = b"second blob\n";
+        let other_sha = run_git_stdin(repo, &["hash-object", "-w", "--stdin"], other_body);
+        let other_id = GitObjectId::new(other_sha).expect("valid sha");
 
         let git = locate_git();
         let source = CatFileObjectSource::open(repo, &git)
@@ -1225,6 +1250,43 @@ mod tests {
             "got: {err:?}"
         );
 
+        // Regression for codex review P2: a type mismatch must
+        // drain the response payload so the next request is framed
+        // against fresh bytes. Without the fix this read either
+        // hangs, errors on a malformed header, or returns wrong
+        // data.
+        let recovered = source
+            .read_blob(&other_id)
+            .await
+            .expect("read after mismatch");
+        assert_eq!(recovered, other_body);
+
         source.close().await.expect("close cleanly");
+    }
+
+    #[tokio::test]
+    async fn cat_file_source_close_reports_non_zero_exit() {
+        // Point `git -C` at a path that does not exist. The cat-file
+        // child exits with a non-zero status long before we call
+        // close(), so wait() will see the failure and close() must
+        // surface it instead of silently returning Ok.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let nonexistent = tmp.path().join("does-not-exist");
+        assert!(!nonexistent.exists());
+
+        let git = locate_git();
+        let source = CatFileObjectSource::open(&nonexistent, &git)
+            .await
+            .expect("open succeeds (spawn does not wait)");
+
+        let err = source
+            .close()
+            .await
+            .expect_err("close must surface non-zero exit");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("non-zero status"),
+            "expected non-zero-status diagnostic, got: {msg}"
+        );
     }
 }
