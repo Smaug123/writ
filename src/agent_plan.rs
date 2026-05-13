@@ -709,6 +709,20 @@ pub fn compose_reviewer_prompt(
     AgentPrompt::try_new(combined)
 }
 
+/// Returns `true` iff [`compose_effective_prompt`] would consume a
+/// plan body for runs in this `stage`. The VM-side wrapper consults
+/// this to decide whether to call `GET /v1/plans/<id>` before
+/// composing the prompt: fetching only when the dispatcher will use
+/// the result keeps the two in sync (a previous regression — caught
+/// by codex on PR #80 — let the wrapper skip the fetch for review
+/// runs and silently bypass the reviewer composition arm).
+pub fn stage_consumes_plan_body(stage: Stage) -> bool {
+    match stage {
+        Stage::Plan => false,
+        Stage::Review | Stage::Execute => true,
+    }
+}
+
 /// Returns the prompt the VM-side wrapper should feed the LLM, given
 /// the run's stage and the plan body (when one was fetched).
 /// `(Stage::Execute, Some(body))` composes via
@@ -721,7 +735,8 @@ pub fn compose_reviewer_prompt(
 ///
 /// `plan_body` is `Some` exactly when the broker handed back a
 /// `read_plan_id` *and* the writ-vm wrapper successfully fetched the
-/// plan body for it.
+/// plan body for it. The wrapper decides whether to fetch via
+/// [`stage_consumes_plan_body`] — keep the two in step.
 pub fn compose_effective_prompt(
     feature_prompt: &AgentPrompt,
     stage: Stage,
@@ -1491,6 +1506,25 @@ mod tests {
                 err.to_string().contains("exceeding"),
                 "stage={stage:?}: {err}"
             );
+        }
+    }
+
+    /// The wrapper-side fetch predicate
+    /// ([`stage_consumes_plan_body`]) must agree with the
+    /// dispatcher's match in [`compose_effective_prompt`]: a stage
+    /// consumes a plan body iff handing the dispatcher a body for
+    /// that stage produces a different prompt than passthrough.
+    /// Pins them together so the regression caught on PR #80 — where
+    /// the wrapper skipped the fetch for review-stage and the
+    /// dispatcher's new arm was unreachable — cannot recur.
+    #[test]
+    fn stage_consumes_plan_body_agrees_with_compose_effective_prompt() {
+        let feature = AgentPrompt::new("feature prompt");
+        let plan = PlanBody::try_new("plan body").unwrap();
+        for stage in [Stage::Plan, Stage::Review, Stage::Execute] {
+            let composed = compose_effective_prompt(&feature, stage, Some(&plan)).unwrap();
+            let consumed = composed.as_str() != feature.as_str();
+            assert_eq!(consumed, stage_consumes_plan_body(stage), "stage={stage:?}",);
         }
     }
 

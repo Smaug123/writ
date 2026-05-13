@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
 
-use writ::agent_plan::{PlanId, Stage, compose_effective_prompt};
+use writ::agent_plan::{PlanId, Stage, compose_effective_prompt, stage_consumes_plan_body};
 use writ::agent_run::{
     AgentProcessPlan, AgentPrompt, AgentRunId, AgentRunTerminalStatus, run_agent_process,
 };
@@ -304,14 +304,14 @@ async fn fetch_and_compose_effective_prompt(
     stage: Stage,
     read_plan_id: Option<PlanId>,
 ) -> Result<AgentPrompt, Box<dyn std::error::Error>> {
-    // Slice 5 only composes for `(Stage::Execute, Some(plan_id))`. Other
-    // (stage, binding) combinations pass the prompt through unchanged
-    // (see `compose_effective_prompt`); the fetch is therefore skipped
-    // unless we know we'll consume the result. Reviewer composition is
-    // slice 6's problem — the `# Approved plan` separator does not
-    // fit a reviewer's reading.
-    let plan_view = match (stage, read_plan_id) {
-        (Stage::Execute, Some(plan_id)) => Some(fetch_plan(config, plan_id).await?),
+    // Fetch the plan iff `compose_effective_prompt` will consume it.
+    // The predicate lives next to the dispatcher so the two cannot
+    // drift (`stage_consumes_plan_body_agrees_with_compose_effective_prompt`
+    // pins them together).
+    let plan_view = match read_plan_id {
+        Some(plan_id) if stage_consumes_plan_body(stage) => {
+            Some(fetch_plan(config, plan_id).await?)
+        }
         _ => None,
     };
     let effective = compose_effective_prompt(prompt, stage, plan_view.as_ref().map(|p| &p.body))?;
