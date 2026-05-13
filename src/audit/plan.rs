@@ -344,22 +344,39 @@ impl AuditLog {
                 return Err(AuditError::Invariant("plan does not exist"));
             }
 
-            let agent_run: Option<(String, Option<i64>, String)> = tx
+            let agent_run: Option<(String, Option<i64>, String, Option<String>)> = tx
                 .query_row(
-                    "SELECT ar.session_id, s.closed_at, ar.stage
+                    "SELECT ar.session_id, s.closed_at, ar.stage, ar.read_plan_id
                      FROM agent_run ar
                      JOIN session s ON s.session_id = ar.session_id
                      WHERE ar.run_id = ?1",
                     params![r.agent_run_id.as_uuid().to_string()],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
                 )
                 .optional()?;
+            let plan_id_str = r.plan_id.as_uuid().to_string();
             match agent_run {
                 None => return Err(AuditError::Invariant("agent run does not exist")),
-                Some((_, Some(_), _)) => return Err(AuditError::Invariant("session is closed")),
-                Some((_, None, ref stage)) if stage != "review" => {
+                Some((_, Some(_), _, _)) => {
+                    return Err(AuditError::Invariant("session is closed"));
+                }
+                Some((_, None, ref stage, _)) if stage != "review" => {
                     return Err(AuditError::Invariant(
                         "plan_review requires agent_run.stage = 'review'",
+                    ));
+                }
+                // The route contract (`docs/plans/2026-05-11-agent-plans.md`)
+                // requires `run.read_plan_id = <plan_id>`; restate it here
+                // so a reviewer that read plan A cannot attach a verdict
+                // to plan B (and so the failure mode is a typed audit
+                // error rather than a corrupt cross-plan row reaching
+                // the table). The matching trigger is the last line of
+                // defence against a raw INSERT.
+                Some((_, None, _, ref read_plan_id))
+                    if read_plan_id.as_deref() != Some(&plan_id_str) =>
+                {
+                    return Err(AuditError::Invariant(
+                        "plan_review requires agent_run.read_plan_id = plan_id",
                     ));
                 }
                 Some(_) => {}
@@ -532,6 +549,9 @@ fn plan_review_from_row(row: &Row<'_>) -> rusqlite::Result<Result<PlanReviewReco
                     }
                     PlanFeedbackError::TooLarge { .. } => {
                         AuditError::Invariant("plan_review row: feedback exceeds size limit")
+                    }
+                    PlanFeedbackError::EmbeddedNul => {
+                        AuditError::Invariant("plan_review row: feedback contains an embedded NUL")
                     }
                 })?;
                 // Belt-and-braces: the stored digest must agree with a
@@ -1710,6 +1730,72 @@ mod tests {
             rendered.contains("plan_review requires agent_run.stage"),
             "got: {rendered}"
         );
+    }
+
+    /// The reviewer run's `read_plan_id` binds the verdict to a single
+    /// plan: a review-stage reviewer that read plan A cannot attach a
+    /// verdict to plan B. The pre-check surfaces this as a clean typed
+    /// invariant; the matching trigger covers the raw-INSERT path.
+    #[test]
+    fn plan_review_rejects_run_bound_to_a_different_plan() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+        let plan_a = submitted_plan(&log, s.session_id);
+        let plan_b = submitted_plan(&log, s.session_id);
+        // Reviewer reads plan A but attempts to verdict plan B.
+        let reviewer = sample_review_run(&log, s.session_id, plan_a);
+
+        let err = log
+            .record_plan_review(&PlanReviewRecord {
+                review_id: ReviewId::new(),
+                plan_id: plan_b,
+                agent_run_id: reviewer,
+                submitted_at: UnixMillis::from_millis(1_700_000_400),
+                verdict: Verdict::Approve,
+                feedback: None,
+            })
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            AuditError::Invariant("plan_review requires agent_run.read_plan_id = plan_id")
+        ));
+    }
+
+    /// Belt-and-braces: a reviewer agent_run with no `read_plan_id`
+    /// binding at all (raw INSERT bypasses the route, which would
+    /// always set it) still cannot smuggle a verdict in. The trigger
+    /// rejects every NULL/mismatched binding equally.
+    #[test]
+    fn plan_review_db_trigger_rejects_run_bound_to_a_different_plan() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+        let plan_a = submitted_plan(&log, s.session_id);
+        let plan_b = submitted_plan(&log, s.session_id);
+        let reviewer = sample_review_run(&log, s.session_id, plan_a);
+
+        let err = log
+            .with_conn(|c| {
+                c.execute(
+                    "INSERT INTO plan_review
+                     (review_id, plan_id, agent_run_id, submitted_at, verdict, feedback, feedback_sha256)
+                     VALUES (?1, ?2, ?3, ?4, 'approve', NULL, NULL)",
+                    params![
+                        ReviewId::new().as_uuid().to_string(),
+                        plan_b.as_uuid().to_string(),
+                        reviewer.as_uuid().to_string(),
+                        1_700_000_400_i64,
+                    ],
+                )?;
+                Ok(())
+            })
+            .unwrap_err();
+        let AuditError::Sqlite(e) = err else {
+            panic!("expected sqlite trigger error, got {err:?}");
+        };
+        let rendered = e.to_string();
+        assert!(rendered.contains("read_plan_id"), "got: {rendered}");
     }
 
     /// A second review from the same reviewer run surfaces as the

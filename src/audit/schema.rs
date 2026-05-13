@@ -1127,14 +1127,16 @@ ALTER TABLE agent_run ADD COLUMN read_plan_id TEXT NULL
     //     closes the session no further verdicts can attach. Pairs with
     //     the existing session-window invariant.
     //
-    //   * `plan_review_requires_reviewer_stage` — verdicts belong to
-    //     `review`-stage runs and only those. Slice 3 made
-    //     `agent_run.stage` NOT NULL with a closed enum, so this trigger
-    //     can rely on the column being present and well-formed. The
-    //     trigger is the belt-and-braces line of defence behind the
-    //     route-level stage check (`route_authorisation`) and a DAO
-    //     pre-check: even a raw INSERT cannot smuggle a planner or
-    //     executor row into the reviewer table.
+    //   * `plan_review_requires_reviewer_run` — verdicts belong to
+    //     `review`-stage runs that explicitly read this plan: both
+    //     `agent_run.stage = 'review'` and `agent_run.read_plan_id =
+    //     NEW.plan_id` must hold. The route contract requires the same
+    //     pair (`docs/plans/2026-05-11-agent-plans.md`, "POST
+    //     /v1/plans/<plan_id>/reviews" → `run.stage = 'review' and
+    //     run.read_plan_id = <plan_id>`); restating both in the trigger
+    //     means even a raw INSERT cannot smuggle in a planner/executor
+    //     row, a verdict against a different plan than the reviewer
+    //     read, or a reviewer with no `read_plan_id` binding at all.
     //
     // `verdict` is the closed enum from `agent_plan::Verdict`; its CHECK
     // enumerates exactly the wire strings the newtype produces.
@@ -1193,14 +1195,17 @@ BEGIN
     SELECT RAISE(ABORT, 'session is closed');
 END;
 
-CREATE TRIGGER plan_review_requires_reviewer_stage
+CREATE TRIGGER plan_review_requires_reviewer_run
 BEFORE INSERT ON plan_review
 WHEN NOT EXISTS (
     SELECT 1 FROM agent_run ar
-    WHERE ar.run_id = NEW.agent_run_id AND ar.stage = 'review'
+    WHERE ar.run_id = NEW.agent_run_id
+      AND ar.stage = 'review'
+      AND ar.read_plan_id = NEW.plan_id
 )
 BEGIN
-    SELECT RAISE(ABORT, 'plan_review requires agent_run.stage = ''review''');
+    SELECT RAISE(ABORT,
+        'plan_review requires agent_run.stage = ''review'' AND agent_run.read_plan_id = plan_id');
 END;
 "#,
     },
