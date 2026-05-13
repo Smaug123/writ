@@ -4,19 +4,26 @@
 //! VM-supplied bundle tip via the GitHub `git/blobs`, `git/trees`, and
 //! `git/commits` endpoints under the host App's identity, so the published
 //! commits land with the Verified badge while preserving provenance back
-//! to the bundle. This module exposes typed wrappers for those POSTs; the
-//! per-commit walker that orchestrates them lives in
-//! [`crate::git_push_replay`].
+//! to the bundle. This module exposes typed wrappers for those endpoints;
+//! the per-commit walker that orchestrates them lives in
+//! [`crate::git_push_replay_walker`].
 //!
-//! Blob, tree, and commit creation are implemented; the walker that
-//! drives them per commit lands in a later slice and reuses the
-//! auth/URL/error scaffolding established here.
+//! Two endpoint families are wrapped:
+//!
+//! * POST `git/blobs`, `git/trees`, `git/commits` — the create-side
+//!   primitives the walker uses to upload bundle objects one at a time.
+//! * GET `repos/{o}/{r}` and `repos/{o}/{r}/git/ref/heads/{branch}` —
+//!   the lookup primitives the replay orchestrator uses to resolve
+//!   the App-side default branch tip when an agent's push creates a
+//!   new branch with no prior `expected_remote_head`. The tip is then
+//!   fetched into the staging repo and passed by SHA to
+//!   [`crate::git_push_replay_walker::plan_branch_creation_via_rev_list`].
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 
 use crate::core::RepoRef;
-use crate::vm_git::GitObjectId;
+use crate::vm_git::{GitBranchName, GitBranchNameError, GitObjectId};
 
 const ACCEPT_HEADER: &str = "application/vnd.github+json";
 const API_VERSION_HEADER: &str = "2022-11-28";
@@ -58,6 +65,27 @@ pub enum GitDataError {
     ApiError {
         status: reqwest::StatusCode,
         body: String,
+    },
+    /// GitHub returned a repo whose `default_branch` field is not a
+    /// valid git branch name. The field is operator-set on GitHub,
+    /// so a bad value is server-side data corruption rather than a
+    /// transport issue — we surface it separately so the caller can
+    /// distinguish "bad input from GitHub" from "transport error".
+    #[error("GitHub returned an invalid default_branch name: {source}")]
+    InvalidDefaultBranch {
+        #[source]
+        source: GitBranchNameError,
+    },
+    /// `GET /repos/{o}/{r}/git/ref/heads/{branch}` returned an
+    /// object whose `type` is not `commit`. Branches in GitHub
+    /// always point at commits; a non-commit object indicates either
+    /// a misuse (caller passed a tag ref to a branch API) or a
+    /// server-side anomaly. Either way the SHA can't be plugged into
+    /// the per-commit walker's parent slot.
+    #[error("ref {ref_name} resolved to object type {object_type:?} (expected 'commit')")]
+    UnexpectedRefObjectType {
+        ref_name: String,
+        object_type: String,
     },
 }
 
@@ -238,6 +266,101 @@ impl GitDataClient {
         let parsed: CommitCreateResponse = response.json().await?;
         Ok(parsed.sha)
     }
+
+    /// `GET /repos/{owner}/{repo}` — fetch repository metadata and
+    /// return the App-side default branch name.
+    ///
+    /// The replay walker needs this for the branch-creation case: when
+    /// the agent's bundle does not name an `expected_remote_head` (the
+    /// branch does not yet exist on GitHub), the walker still has to
+    /// find a boundary commit that delimits which bundle commits are
+    /// new. The default branch's tip is that boundary, and this method
+    /// is the first hop in resolving it.
+    ///
+    /// The repo metadata response carries many fields; only
+    /// `default_branch` is exposed. Validation happens at the
+    /// boundary: a name GitHub returns that fails [`GitBranchName::new`]
+    /// surfaces as [`GitDataError::InvalidDefaultBranch`] rather than
+    /// being silently coerced.
+    pub async fn get_default_branch(&self, repo: &RepoRef) -> Result<GitBranchName, GitDataError> {
+        let url = format!(
+            "{}/repos/{}/{}",
+            self.api_base.trim_end_matches('/'),
+            repo.owner,
+            repo.name,
+        );
+        let response = self
+            .http
+            .get(&url)
+            .bearer_auth(&self.token)
+            .header("Accept", ACCEPT_HEADER)
+            .header("X-GitHub-Api-Version", API_VERSION_HEADER)
+            .header("User-Agent", USER_AGENT_HEADER)
+            .send()
+            .await?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(GitDataError::ApiError { status, body });
+        }
+        let parsed: RepoMetadataResponse = response.json().await?;
+        GitBranchName::new(parsed.default_branch)
+            .map_err(|source| GitDataError::InvalidDefaultBranch { source })
+    }
+
+    /// `GET /repos/{owner}/{repo}/git/ref/heads/{branch}` — return
+    /// the App-side commit SHA the named branch currently points at.
+    ///
+    /// Branches in GitHub always point at commits; if the response
+    /// indicates a non-commit object the call returns
+    /// [`GitDataError::UnexpectedRefObjectType`] rather than handing
+    /// back a SHA that the walker would plug into a commit's
+    /// `parents` slot.
+    ///
+    /// The branch name is percent-encoded for the URL path before
+    /// interpolation. Git's branch-naming rules permit several
+    /// URL-reserved bytes ([`#`], [`%`], [`(`], …) that
+    /// [`GitBranchName`] also accepts, so a name like `release#1` or
+    /// `100%` would otherwise turn into a URL fragment or a half-built
+    /// percent-escape and 404 against GitHub. The hierarchical
+    /// separator [`/`] is preserved so `feature/foo` produces the
+    /// expected nested ref path.
+    pub async fn get_branch_head(
+        &self,
+        repo: &RepoRef,
+        branch: &GitBranchName,
+    ) -> Result<GitObjectId, GitDataError> {
+        let encoded_branch = percent_encode_ref_segment(branch.as_str());
+        let url = format!(
+            "{}/repos/{}/{}/git/ref/heads/{}",
+            self.api_base.trim_end_matches('/'),
+            repo.owner,
+            repo.name,
+            encoded_branch,
+        );
+        let response = self
+            .http
+            .get(&url)
+            .bearer_auth(&self.token)
+            .header("Accept", ACCEPT_HEADER)
+            .header("X-GitHub-Api-Version", API_VERSION_HEADER)
+            .header("User-Agent", USER_AGENT_HEADER)
+            .send()
+            .await?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(GitDataError::ApiError { status, body });
+        }
+        let parsed: GetRefResponse = response.json().await?;
+        if parsed.object.object_type != "commit" {
+            return Err(GitDataError::UnexpectedRefObjectType {
+                ref_name: format!("refs/heads/{}", branch.as_str()),
+                object_type: parsed.object.object_type,
+            });
+        }
+        Ok(parsed.object.sha)
+    }
 }
 
 /// One row in a tree being uploaded to GitHub. The kind constrains
@@ -363,6 +486,37 @@ pub struct CommitRequest<'a> {
     pub signature: Option<&'a str>,
 }
 
+/// Percent-encode a ref-path segment for inclusion in a URL.
+///
+/// Preserves the unreserved set (RFC 3986 §2.3: ALPHA / DIGIT /
+/// `-` / `.` / `_` / `~`) and `/` (so the caller can pass a
+/// hierarchical ref like `feature/foo` as a single string), and
+/// percent-encodes every other byte. Operates on the byte
+/// representation so UTF-8 multi-byte sequences are encoded one
+/// byte at a time, which is how RFC 3986 specifies the transform
+/// for non-ASCII octets.
+///
+/// Git's branch-naming rules permit several URL-reserved bytes
+/// (`#`, `%`, `(`, `)`, `+`, `=`, etc.); without encoding, a name
+/// like `release#1` would silently turn into `release` plus a
+/// fragment, and `100%` would either be rejected as a malformed
+/// escape or turn into mojibake.
+fn percent_encode_ref_segment(input: &str) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(input.len());
+    for byte in input.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' => {
+                out.push(byte as char);
+            }
+            _ => {
+                write!(out, "%{byte:02X}").expect("write into String never fails");
+            }
+        }
+    }
+    out
+}
+
 fn identity_wire(identity: &CommitIdentity) -> CommitIdentityWire<'_> {
     CommitIdentityWire {
         name: &identity.name,
@@ -422,6 +576,33 @@ struct CommitIdentityWire<'a> {
 #[derive(serde::Deserialize)]
 struct CommitCreateResponse {
     sha: GitObjectId,
+}
+
+/// Subset of `GET /repos/{owner}/{repo}` we care about. The
+/// response carries many other fields (description, language stats,
+/// permissions, etc.) — serde with `deny_unknown_fields` would force
+/// us to track every one of GitHub's schema additions, so we
+/// deliberately accept extras and pull only the field we need.
+#[derive(serde::Deserialize)]
+struct RepoMetadataResponse {
+    default_branch: String,
+}
+
+/// `GET /repos/{owner}/{repo}/git/ref/{ref}` response. The wire
+/// shape names the inner object via the JSON key `object`, with the
+/// JSON key `type` distinguishing commit / tag / etc. — `object_type`
+/// is the Rust field name (Rust forbids `type` as an identifier here)
+/// and serde renames it on deserialise.
+#[derive(serde::Deserialize)]
+struct GetRefResponse {
+    object: GetRefObject,
+}
+
+#[derive(serde::Deserialize)]
+struct GetRefObject {
+    sha: GitObjectId,
+    #[serde(rename = "type")]
+    object_type: String,
 }
 
 #[cfg(test)]
@@ -1127,6 +1308,338 @@ mod tests {
         assert!(
             rendered.contains("<redacted>"),
             "Debug should label the redacted slot: {rendered}",
+        );
+    }
+
+    // ----- get_default_branch tests ---------------------------------
+
+    #[tokio::test]
+    async fn get_default_branch_sends_authed_get_and_parses_default_branch_field() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/name"))
+            .and(header("Accept", ACCEPT_HEADER))
+            .and(header("X-GitHub-Api-Version", API_VERSION_HEADER))
+            .and(header("User-Agent", USER_AGENT_HEADER))
+            .and(header("Authorization", "Bearer ghs_fake_token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": 42,
+                "name": "name",
+                "full_name": "owner/name",
+                "default_branch": "main",
+                "private": false,
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = client_against(&server, "ghs_fake_token");
+        let branch = client
+            .get_default_branch(&sample_repo())
+            .await
+            .expect("default branch lookup ok");
+        assert_eq!(branch.as_str(), "main");
+    }
+
+    #[tokio::test]
+    async fn get_default_branch_accepts_non_main_default_branch_name() {
+        // Older or operator-customised repos use `master`, `trunk`,
+        // etc. The walker has no opinion on what the operator chose;
+        // any valid branch name flows through.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/name"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "default_branch": "trunk",
+            })))
+            .mount(&server)
+            .await;
+
+        let client = client_against(&server, "ghs_fake_token");
+        let branch = client
+            .get_default_branch(&sample_repo())
+            .await
+            .expect("default branch lookup ok");
+        assert_eq!(branch.as_str(), "trunk");
+    }
+
+    #[tokio::test]
+    async fn get_default_branch_surfaces_api_error_body_on_404() {
+        // Repo doesn't exist (or the App doesn't have access).
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/name"))
+            .respond_with(ResponseTemplate::new(404).set_body_json(json!({"message": "Not Found"})))
+            .mount(&server)
+            .await;
+
+        let client = client_against(&server, "ghs_fake_token");
+        let err = client
+            .get_default_branch(&sample_repo())
+            .await
+            .expect_err("404 must surface as ApiError");
+        match err {
+            GitDataError::ApiError { status, body } => {
+                assert_eq!(status.as_u16(), 404);
+                assert!(body.contains("Not Found"), "echo body: {body:?}");
+            }
+            other => panic!("expected ApiError, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn get_default_branch_rejects_invalid_branch_name_from_github() {
+        // Defensive parsing: a default_branch value that fails
+        // GitBranchName validation surfaces as a typed error rather
+        // than a panic or a silent coerce. GitHub should never emit
+        // this, but if it does, we want the failure mode to be
+        // diagnosable rather than mysterious.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/name"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "default_branch": "..",
+            })))
+            .mount(&server)
+            .await;
+
+        let client = client_against(&server, "ghs_fake_token");
+        let err = client
+            .get_default_branch(&sample_repo())
+            .await
+            .expect_err("malformed branch name must not return silently");
+        assert!(
+            matches!(err, GitDataError::InvalidDefaultBranch { .. }),
+            "expected InvalidDefaultBranch, got {err:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn get_default_branch_returns_http_error_when_default_branch_missing() {
+        // Response missing the `default_branch` field is a transport
+        // / schema issue and surfaces as a transport error via serde.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/name"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": 42,
+                "name": "name",
+            })))
+            .mount(&server)
+            .await;
+
+        let client = client_against(&server, "ghs_fake_token");
+        let err = client
+            .get_default_branch(&sample_repo())
+            .await
+            .expect_err("missing default_branch must not succeed");
+        assert!(
+            matches!(err, GitDataError::Http(_)),
+            "expected Http error on missing field, got {err:?}",
+        );
+    }
+
+    // ----- get_branch_head tests ------------------------------------
+
+    #[tokio::test]
+    async fn get_branch_head_sends_authed_get_and_returns_commit_sha() {
+        let server = MockServer::start().await;
+        let returned = sample_object_id('a');
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/name/git/ref/heads/main"))
+            .and(header("Accept", ACCEPT_HEADER))
+            .and(header("X-GitHub-Api-Version", API_VERSION_HEADER))
+            .and(header("User-Agent", USER_AGENT_HEADER))
+            .and(header("Authorization", "Bearer ghs_fake_token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ref": "refs/heads/main",
+                "node_id": "ignored",
+                "url": "https://api.github.com/repos/owner/name/git/refs/heads/main",
+                "object": {
+                    "sha": returned.as_str(),
+                    "type": "commit",
+                    "url": format!(
+                        "https://api.github.com/repos/owner/name/git/commits/{}",
+                        returned.as_str(),
+                    ),
+                },
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = client_against(&server, "ghs_fake_token");
+        let branch = GitBranchName::new("main").unwrap();
+        let sha = client
+            .get_branch_head(&sample_repo(), &branch)
+            .await
+            .expect("branch head lookup ok");
+        assert_eq!(sha, returned);
+    }
+
+    #[test]
+    fn percent_encode_ref_segment_preserves_unreserved_and_slash_and_encodes_others() {
+        // Unreserved set per RFC 3986 §2.3 plus '/' for ref hierarchy:
+        // pass through unchanged.
+        assert_eq!(
+            percent_encode_ref_segment("AZaz09-._~/main"),
+            "AZaz09-._~/main",
+        );
+        // URL-reserved bytes that git nonetheless accepts in branch
+        // names: encode as %HH (uppercase, RFC 3986 §2.1).
+        assert_eq!(percent_encode_ref_segment("release#1"), "release%231");
+        assert_eq!(percent_encode_ref_segment("100%"), "100%25");
+        assert_eq!(
+            percent_encode_ref_segment("feat(area)+v2"),
+            "feat%28area%29%2Bv2",
+        );
+        // UTF-8 multi-byte sequence encoded byte-by-byte (RFC 3986
+        // §2.5): the 'é' in 'café' is 0xC3 0xA9.
+        assert_eq!(percent_encode_ref_segment("café"), "caf%C3%A9");
+    }
+
+    /// Regression test for the URL-reserved-bytes issue: a branch
+    /// name git considers valid but which contains `#` or `%` must
+    /// reach GitHub at the correctly-encoded path. Without
+    /// percent-encoding, `release#1` would 404 against GitHub
+    /// because the `#` turns into a URL fragment.
+    #[tokio::test]
+    async fn get_branch_head_percent_encodes_url_reserved_bytes_in_branch_name() {
+        let server = MockServer::start().await;
+        let returned = sample_object_id('d');
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/name/git/ref/heads/release%231"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ref": "refs/heads/release#1",
+                "object": { "sha": returned.as_str(), "type": "commit" },
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = client_against(&server, "ghs_fake_token");
+        let branch = GitBranchName::new("release#1").unwrap();
+        let sha = client
+            .get_branch_head(&sample_repo(), &branch)
+            .await
+            .expect("URL-reserved bytes must be percent-encoded");
+        assert_eq!(sha, returned);
+    }
+
+    #[tokio::test]
+    async fn get_branch_head_passes_slashes_in_branch_name_through_url_path() {
+        // `feature/foo` is a valid git branch name. The Git Database
+        // API treats the ref path as hierarchical, so slashes belong
+        // in the path literally — not percent-encoded.
+        let server = MockServer::start().await;
+        let returned = sample_object_id('b');
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/name/git/ref/heads/feature/foo"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ref": "refs/heads/feature/foo",
+                "object": {
+                    "sha": returned.as_str(),
+                    "type": "commit",
+                },
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = client_against(&server, "ghs_fake_token");
+        let branch = GitBranchName::new("feature/foo").unwrap();
+        let sha = client
+            .get_branch_head(&sample_repo(), &branch)
+            .await
+            .expect("nested branch head lookup ok");
+        assert_eq!(sha, returned);
+    }
+
+    #[tokio::test]
+    async fn get_branch_head_surfaces_api_error_body_on_404() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/name/git/ref/heads/main"))
+            .respond_with(
+                ResponseTemplate::new(404).set_body_json(json!({"message": "Branch not found"})),
+            )
+            .mount(&server)
+            .await;
+
+        let client = client_against(&server, "ghs_fake_token");
+        let branch = GitBranchName::new("main").unwrap();
+        let err = client
+            .get_branch_head(&sample_repo(), &branch)
+            .await
+            .expect_err("404 must surface as ApiError");
+        match err {
+            GitDataError::ApiError { status, body } => {
+                assert_eq!(status.as_u16(), 404);
+                assert!(body.contains("Branch not found"), "echo body: {body:?}");
+            }
+            other => panic!("expected ApiError, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn get_branch_head_rejects_response_pointing_at_non_commit() {
+        // Defensive: branches always point at commits, so a `tag`
+        // (or anything else) means we'd hand back a SHA the walker
+        // would plug into a parent slot where only commit SHAs are
+        // valid. Refuse at the boundary.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/name/git/ref/heads/main"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "object": {
+                    "sha": sample_object_id('c').as_str(),
+                    "type": "tag",
+                },
+            })))
+            .mount(&server)
+            .await;
+
+        let client = client_against(&server, "ghs_fake_token");
+        let branch = GitBranchName::new("main").unwrap();
+        let err = client
+            .get_branch_head(&sample_repo(), &branch)
+            .await
+            .expect_err("non-commit ref target must be rejected");
+        match err {
+            GitDataError::UnexpectedRefObjectType {
+                ref_name,
+                object_type,
+            } => {
+                assert_eq!(ref_name, "refs/heads/main");
+                assert_eq!(object_type, "tag");
+            }
+            other => panic!("expected UnexpectedRefObjectType, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn get_branch_head_returns_http_error_when_response_sha_is_invalid() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/name/git/ref/heads/main"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "object": {
+                    "sha": "not a valid sha",
+                    "type": "commit",
+                },
+            })))
+            .mount(&server)
+            .await;
+
+        let client = client_against(&server, "ghs_fake_token");
+        let branch = GitBranchName::new("main").unwrap();
+        let err = client
+            .get_branch_head(&sample_repo(), &branch)
+            .await
+            .expect_err("malformed sha must not be returned silently");
+        assert!(
+            matches!(err, GitDataError::Http(_)),
+            "GitObjectId rejection surfaces as transport error: {err:?}",
         );
     }
 }
