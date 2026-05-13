@@ -24,21 +24,21 @@
 //! 2. **Binding:** that run's `read_plan_id` must equal the requested
 //!    `<plan_id>` (else 401 — the run is not the one bound to this
 //!    plan).
-//! 3. **Per-stage:** the run's stage must permit `ReadPlan`. Slice 4
-//!    short-circuits the decision-gate branch *only when no
-//!    `plan_decision` row exists*: a missing row is treated as
-//!    accepted so a slice-4 implementer can pull the plan body before
-//!    slice 6 lands the operator-decision step. A *recorded*
-//!    `RejectedRestart` is honoured even now, so the operator can
-//!    close a plan before slice 6 by writing the decision row
-//!    directly. Slice 6 will drop the default and require an explicit
-//!    accepted row.
+//! 3. **Per-stage:** the run's stage must permit `ReadPlan`. The pure
+//!    stage→action gate is [`route_permitted_by_stage_and_decision`].
+//!    A review-stage read passes regardless of decision (reviewers
+//!    must be able to re-read the plan they're voting on, even after
+//!    rejection). An execute-stage read requires a recorded
+//!    `Accepted` row: a missing decision is no longer treated as
+//!    implicit acceptance, so an implementer cannot pull the plan
+//!    body until an operator has signed off via `writ plan decide
+//!    --accept`.
 
 use std::sync::Arc;
 
 use crate::agent_plan::{
-    DecisionOutcome, DecisionView, PlanCreated, PlanId, PlanRouteAction, PlanRouteAuthError,
-    PlanSubmission, PlanView, ReviewCreated, ReviewId, ReviewSubmission, VM_PLANS_PATH_PREFIX,
+    DecisionView, PlanCreated, PlanId, PlanRouteAction, PlanRouteAuthError, PlanSubmission,
+    PlanView, ReviewCreated, ReviewId, ReviewSubmission, VM_PLANS_PATH_PREFIX,
     route_permitted_by_stage_and_decision,
 };
 use crate::audit::{
@@ -177,15 +177,11 @@ async fn handle_plan_read<S: SecretStore + Send + Sync + 'static>(
         );
     }
 
-    // Fetch the decision *before* the stage gate so a recorded
-    // `RejectedRestart` can deny an execute-stage read even in slice 4.
-    // The slice-4 short-circuit only applies when no decision row
-    // exists at all: a missing row is treated as accepted so a slice-4
-    // implementer can pull the plan body before slice 6 lands the
-    // operator-decision step. A row that's been written stands, which
-    // means an operator can close a plan today by recording
-    // `RejectedRestart` even though the broker doesn't yet have a
-    // write route for it.
+    // Fetch the decision before the stage gate so an execute-stage
+    // read can be denied unless an `Accepted` row exists. The pure
+    // gate consults the decision only for stages that require
+    // acceptance (Execute today; SubmitAddendum tomorrow), so a
+    // review-stage read with no decision still passes through.
     let decision_record = match audit.get_plan_decision(plan_id) {
         Ok(opt) => opt,
         Err(err) => {
@@ -199,10 +195,7 @@ async fn handle_plan_read<S: SecretStore + Send + Sync + 'static>(
             return VmHttpResponse::text(VmHttpStatus::InternalServerError, "audit read failed");
         }
     };
-    let decision_for_gate = decision_record
-        .as_ref()
-        .map(|r| r.outcome)
-        .or(Some(DecisionOutcome::Accepted));
+    let decision_for_gate = decision_record.as_ref().map(|r| r.outcome);
     if let Err(err) = route_permitted_by_stage_and_decision(
         PlanRouteAction::ReadPlan,
         run.stage,
@@ -1315,14 +1308,13 @@ mod tests {
         assert!(view.decision.is_none());
     }
 
-    /// Slice 4 short-circuits the decision branch: an `execute`-stage
-    /// run can fetch a plan even if no `plan_decision` row exists.
-    /// Slice 6 will tighten this to "must be accepted." Pin the current
-    /// behaviour so the slice-6 patch fails this test (its replacement
-    /// makes the absent-decision case 403) — that failure is the
-    /// signal that the short-circuit has been removed.
+    /// An execute-stage run cannot fetch the plan body until an
+    /// operator has recorded an `Accepted` decision. With no
+    /// `plan_decision` row the read is 403 — the slice-6 acceptance
+    /// gate has replaced the slice-4 short-circuit that defaulted a
+    /// missing row to accepted.
     #[tokio::test]
-    async fn plan_read_execute_stage_succeeds_without_decision_in_slice_4() {
+    async fn plan_read_execute_stage_without_decision_is_forbidden() {
         let github = MockServer::start().await;
         let state = make_broker_state(&github);
         let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
@@ -1343,16 +1335,17 @@ mod tests {
         let service = plan_service_for_test(&state);
         let response = handle_plan_read(&session, plan_id, service).await;
 
-        assert_eq!(response.status, VmHttpStatus::Ok);
-        let view: PlanView = serde_json::from_slice(&response.body).unwrap();
-        assert_eq!(view.body.as_str(), "# Execute body");
-        assert!(view.decision.is_none());
+        assert_eq!(response.status, VmHttpStatus::Forbidden);
+        let msg = std::str::from_utf8(&response.body).unwrap();
+        assert!(
+            msg.contains("decision") && msg.contains("no decision recorded"),
+            "unexpected body: {msg}",
+        );
     }
 
-    /// When a `plan_decision` row exists, the read returns it verbatim
-    /// in `decision`. Belt-and-braces against the slice-4 short-circuit
-    /// silently dropping the field: the gate uses `Some(Accepted)`, but
-    /// the response must reflect what's actually in the DB.
+    /// An execute-stage read with a recorded `Accepted` decision is
+    /// the happy path the slice-6 gate is built to admit, and the
+    /// response surfaces the decision verbatim (outcome + timestamp).
     #[tokio::test]
     async fn plan_read_returns_real_decision_when_recorded() {
         use crate::agent_plan::{Decider, DecisionOutcome};
@@ -1396,13 +1389,10 @@ mod tests {
         assert_eq!(decision.decided_at, decided_at);
     }
 
-    /// A recorded `RejectedRestart` decision must deny an execute-
-    /// stage read even before slice 6 lands the operator-decision
-    /// write path. The slice-4 short-circuit only defaults *missing*
-    /// decisions to accepted; a row written by an operator (or a
-    /// future broker route) stands. The 403 distinguishes this from
-    /// the 401 binding-mismatch path: the run *is* bound to this
-    /// plan, but the plan has been closed.
+    /// A recorded `RejectedRestart` decision denies an execute-stage
+    /// read. The 403 distinguishes this from the 401 binding-mismatch
+    /// path: the run *is* bound to this plan, but the operator has
+    /// closed it.
     #[tokio::test]
     async fn plan_read_execute_stage_rejected_decision_is_forbidden() {
         use crate::agent_plan::{Decider, DecisionOutcome};
