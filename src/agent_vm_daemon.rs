@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::Mutex;
 
-use crate::agent_plan::{CorrelationId, Stage};
+use crate::agent_plan::{CorrelationId, PlanId, Stage};
 use crate::agent_run::{AgentPrompt, AgentRunId};
 use crate::agent_vm_lifecycle::{
     AgentVmGuestEnvVar, AgentVmLifecycleConfigError, AgentVmResources, AgentVmSessionManagerError,
@@ -616,6 +616,7 @@ impl AgentVmDaemon {
         prompt: AgentPrompt,
         stage: Stage,
         correlation_id: Option<CorrelationId>,
+        read_plan_id: Option<PlanId>,
     ) -> Result<AgentRunStarted, AgentVmDaemonError> {
         let session_id = SessionId::new();
         let run_id = AgentRunId::new();
@@ -644,7 +645,7 @@ impl AgentVmDaemon {
                     prompt: prompt.summary(),
                     correlation_id: correlation_id.clone(),
                     stage,
-                    read_plan_id: None,
+                    read_plan_id,
                 })?;
                 let agent_runs = VmHttpAgentRunService::new(
                     Arc::clone(&state),
