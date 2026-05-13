@@ -82,6 +82,8 @@ pub(crate) enum ParseObjectError {
     NonUtf8TreePath(#[source] std::str::Utf8Error),
     #[error("tree entry SHA is invalid: {0}")]
     InvalidTreeSha(#[source] GitObjectIdError),
+    #[error("tree entry SHA is all zeros (git fsck: nullSha1)")]
+    NullSha,
 }
 
 /// Parse the raw bytes of a git commit object into a [`StagingCommit`].
@@ -339,6 +341,14 @@ pub(crate) fn parse_tree_object(bytes: &[u8]) -> Result<StagingTree, ParseObject
             ));
         }
         let sha_bytes = &bytes[cursor..cursor + 20];
+        // `git fsck --strict` rejects the all-zero SHA as `nullSha1`:
+        // it never references a real object. Submodule entries
+        // carrying the null SHA would otherwise pass straight through
+        // to GitHub's create-tree API; reject at the parser boundary
+        // so the failure shape is uniform across kinds.
+        if sha_bytes.iter().all(|b| *b == 0) {
+            return Err(ParseObjectError::NullSha);
+        }
         let sha =
             GitObjectId::new(hex_encode(sha_bytes)).map_err(ParseObjectError::InvalidTreeSha)?;
         cursor += 20;
@@ -456,14 +466,17 @@ fn canonical_tree_mode(kind: TreeEntryKind) -> &'static str {
 }
 
 fn parse_tree_entry_kind(mode: &str) -> Result<TreeEntryKind, ParseObjectError> {
+    // Each mode is the canonical, leading-zero-stripped form git
+    // itself emits when writing a tree. The padded form `040000`
+    // for subtrees is rejected by `git fsck --strict` as
+    // `zeroPaddedFilemode`; accepting it here would normalise the
+    // entry on serialize back to `40000`, laundering a different
+    // valid tree out of an invalid one.
     match mode {
         "100644" => Ok(TreeEntryKind::Blob),
         "100755" => Ok(TreeEntryKind::Executable),
         "120000" => Ok(TreeEntryKind::Symlink),
-        // Accept both shapes for subtrees: on-disk the leading zero
-        // is stripped, but some tools (and historical bundles) emit
-        // the padded form.
-        "40000" | "040000" => Ok(TreeEntryKind::Subtree),
+        "40000" => Ok(TreeEntryKind::Subtree),
         "160000" => Ok(TreeEntryKind::Submodule),
         other => Err(ParseObjectError::UnknownTreeMode(other.to_string())),
     }
@@ -485,6 +498,24 @@ fn parse_identity(value: &[u8]) -> Result<CommitIdentity, ParseObjectError> {
         ParseObjectError::MalformedIdentity(format!("identity {text:?} has no seconds field"))
     })?;
     let (name, email) = parse_name_email(name_email)?;
+    // `git fsck --strict` reports `zeroPaddedDate` for a seconds
+    // field with a leading zero (e.g. `01`) and `badDate` for a
+    // leading `+` or `-`. `i64::parse` accepts both, and
+    // `serialize_identity` would then emit the canonical form,
+    // letting a malformed staging commit cross the parser as a
+    // different valid commit. Validate the shape — `0` or
+    // `[1-9][0-9]*` — before the numeric parse.
+    let seconds_bytes = seconds_str.as_bytes();
+    let valid_seconds_shape = matches!(seconds_bytes, [b'0'])
+        || (seconds_bytes
+            .first()
+            .is_some_and(|b| (b'1'..=b'9').contains(b))
+            && seconds_bytes.iter().all(|b| b.is_ascii_digit()));
+    if !valid_seconds_shape {
+        return Err(ParseObjectError::MalformedIdentity(format!(
+            "identity seconds field {seconds_str:?} must be `0` or unsigned decimal with no leading zero (git fsck: zeroPaddedDate/badDate)"
+        )));
+    }
     let seconds: i64 = seconds_str.parse().map_err(|err: ParseIntError| {
         ParseObjectError::MalformedIdentity(format!(
             "identity seconds field {seconds_str:?} is not an i64: {err}"
@@ -1142,19 +1173,79 @@ mod tests {
     }
 
     #[test]
-    fn parse_tree_object_accepts_padded_subtree_mode() {
-        let canonical = StagingTree {
-            entries: vec![StagingTreeEntry {
-                path: "src".to_string(),
-                kind: TreeEntryKind::Subtree,
-                sha: sample_object_id('a'),
-            }],
-        };
+    fn parse_tree_object_rejects_zero_padded_subtree_mode() {
+        // `git fsck --strict` reports `zeroPaddedFilemode` for a tree
+        // entry whose subtree mode is stored as the zero-padded
+        // `040000` instead of the canonical `40000`. Accepting it
+        // here would normalise the entry on serialize (`40000`),
+        // letting a crafted staging tree launder a different valid
+        // tree out of an invalid one.
         let mut padded = Vec::new();
         padded.extend_from_slice(b"040000 src\0");
-        padded.extend_from_slice(&hex_decode(canonical.entries[0].sha.as_str()));
-        let parsed = parse_tree_object(&padded).expect("padded subtree mode accepted");
-        assert_eq!(parsed, canonical);
+        padded.extend_from_slice(&hex_decode(sample_object_id('a').as_str()));
+        let err = parse_tree_object(&padded).expect_err("padded subtree mode must reject");
+        assert!(
+            matches!(err, ParseObjectError::UnknownTreeMode(ref m) if m == "040000"),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn parse_tree_object_rejects_null_sha() {
+        // A tree entry whose 20-byte SHA is all zeros is
+        // syntactically a 40-hex-zero object id, which our
+        // `GitObjectId` constructor happily accepts. `git fsck
+        // --strict` flags this as `nullSha1`: it never references a
+        // real object, and a submodule entry carrying the null SHA
+        // would otherwise pass straight through to GitHub's
+        // create-tree API as a literal commit reference. Other kinds
+        // would fail later as missing-object lookups; reject at the
+        // parser boundary so the failure shape is uniform.
+        for kind_mode in ["100644", "100755", "120000", "40000", "160000"] {
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(kind_mode.as_bytes());
+            bytes.extend_from_slice(b" name\0");
+            bytes.extend_from_slice(&[0u8; 20]);
+            let err = parse_tree_object(&bytes).expect_err("null SHA must reject");
+            assert!(
+                matches!(err, ParseObjectError::NullSha),
+                "got for mode {kind_mode}: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_identity_rejects_zero_padded_seconds() {
+        // `git fsck --strict` reports `zeroPaddedDate` for an
+        // author/committer line whose seconds field has a leading
+        // zero (e.g. `01`). Without an explicit check, `i64::parse`
+        // accepts the digits and `serialize_identity` re-emits the
+        // canonical `1`, turning a malformed commit into a different
+        // valid one. `0` itself is the only legal leading-zero form.
+        let err = parse_identity(b"Alice <a@example.invalid> 01 +0000")
+            .expect_err("seconds=01 must reject");
+        assert!(
+            matches!(err, ParseObjectError::MalformedIdentity(ref msg) if msg.contains("seconds")),
+            "got: {err:?}"
+        );
+        // Boundary: 0 is the legal zero form.
+        parse_identity(b"Alice <a@example.invalid> 0 +0000").expect("seconds=0 must parse");
+    }
+
+    #[test]
+    fn parse_identity_rejects_signed_seconds() {
+        // `git fsck --strict` reports `badDate` for seconds fields
+        // that carry a leading `+` or `-`. `i64::parse` accepts both
+        // and `serialize_identity` strips the sign on a positive
+        // value, again laundering a malformed commit into a valid
+        // one.
+        for bad in [&b"Alice <a@e> +1 +0000"[..], &b"Alice <a@e> -1 +0000"[..]] {
+            let err = parse_identity(bad).expect_err("signed seconds must reject");
+            assert!(
+                matches!(err, ParseObjectError::MalformedIdentity(ref msg) if msg.contains("seconds")),
+                "got for {bad:?}: {err:?}"
+            );
+        }
     }
 
     #[test]
@@ -1292,7 +1383,14 @@ mod tests {
     // ============== Property tests ==============
 
     fn arb_object_id() -> impl Strategy<Value = GitObjectId> {
+        // Exclude the all-zero SHA so a tree-entry round-trip cannot
+        // hit `NullSha` by chance. In practice 1-in-2^160 means this
+        // filter never fires, but generating by construction is the
+        // robust default.
         prop::collection::vec(any::<u8>(), 20)
+            .prop_filter("not all zero (git fsck: nullSha1)", |bytes| {
+                bytes.iter().any(|b| *b != 0)
+            })
             .prop_map(|bytes| GitObjectId::new(hex_encode(&bytes)).unwrap())
     }
 
@@ -1322,9 +1420,11 @@ mod tests {
         (
             arb_name(),
             arb_email(),
-            // Bound the timestamp to a range comfortably inside
-            // OffsetDateTime's representable window.
-            -2_000_000_000_i64..2_000_000_000_i64,
+            // Seconds field is non-negative: the parser rejects
+            // leading `+`/`-` (git fsck: `badDate`) and leading zeros
+            // (git fsck: `zeroPaddedDate`). Bound the upper end well
+            // inside OffsetDateTime's representable window.
+            0_i64..2_000_000_000_i64,
             // Whole-minute offset between -14:00 and +14:00 (the
             // wider range OffsetDateTime accepts).
             -14_i32 * 60..=14_i32 * 60,
