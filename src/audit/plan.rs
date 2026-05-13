@@ -958,6 +958,9 @@ fn plan_abort_from_row(row: &Row<'_>) -> rusqlite::Result<Result<PlanAbortRecord
             PlanAbortReasonError::TooLarge { .. } => {
                 AuditError::Invariant("plan_abort row: reason exceeds size limit")
             }
+            PlanAbortReasonError::EmbeddedNul => {
+                AuditError::Invariant("plan_abort row: reason contains embedded NUL")
+            }
         })?;
         Ok(PlanAbortRecord {
             plan_id: PlanId::from_uuid(plan_id),
@@ -3633,6 +3636,43 @@ mod tests {
                         executor.as_uuid().to_string(),
                         1_700_000_400_i64,
                         oversize,
+                    ],
+                )?)
+            })
+            .unwrap_err();
+        let rendered = err.to_string().to_lowercase();
+        assert!(
+            rendered.contains("check"),
+            "expected CHECK violation, got {err}"
+        );
+    }
+
+    /// Belt-and-braces: a raw INSERT with an embedded NUL byte in
+    /// `reason` is refused by the column CHECK. The typed
+    /// [`PlanAbortReason`] also rejects NULs at the boundary; this
+    /// asserts the schema is the second line of defence.
+    #[test]
+    fn plan_abort_check_rejects_embedded_nul_reason() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+        let plan_id = accepted_plan(&log, s.session_id);
+        let executor = sample_executor_run(&log, s.session_id, plan_id);
+
+        let err = log
+            .with_conn(|c| {
+                Ok(c.execute(
+                    "INSERT INTO plan_abort
+                     (plan_id, agent_run_id, aborted_at, reason)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![
+                        plan_id.as_uuid().to_string(),
+                        executor.as_uuid().to_string(),
+                        1_700_000_400_i64,
+                        // Bind a TEXT value with an embedded NUL — the
+                        // CHECK's `instr(... x'00') = 0` clause refuses
+                        // it before the row lands.
+                        rusqlite::types::Value::Text("ok\0nit".to_owned()),
                     ],
                 )?)
             })

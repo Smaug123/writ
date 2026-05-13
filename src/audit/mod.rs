@@ -60,7 +60,9 @@ pub use openai_proxy::{
     OpenAiProxyAuditDecision, OpenAiProxyAuditRoute, OpenAiProxyOutcomeRecord,
     OpenAiProxyRequestRecord,
 };
-pub use plan::{PlanAddendumRecord, PlanDecisionRecord, PlanReviewRecord, PlanSubmissionRecord};
+pub use plan::{
+    PlanAbortRecord, PlanAddendumRecord, PlanDecisionRecord, PlanReviewRecord, PlanSubmissionRecord,
+};
 pub use proxy_table::ProxyAuditDecision;
 
 /// `tracing` target stamped on every event emitted when an audit

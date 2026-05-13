@@ -34,13 +34,17 @@ CREATE TABLE plan_abort (
     aborted_at       INTEGER NOT NULL,
     -- Bounded short text. The byte count matches
     -- `MAX_PLAN_ABORT_REASON_BYTES`; the `typeof` + BLOB-length parity
-    -- shape mirrors plan_addendum.body for the same reasons (TEXT
-    -- columns silently accept BLOB storage class; `length` walks TEXT
-    -- as a C-string and stops at the first NUL, so a BLOB-length parity
-    -- check is the only reliable byte-count gate).
+    -- and embedded-NUL clauses mirror plan_addendum.body for the same
+    -- reasons (TEXT columns silently accept BLOB storage class;
+    -- `length` walks TEXT as a C-string and stops at the first NUL, so
+    -- a BLOB-length parity check is the only reliable byte-count gate;
+    -- and embedded NULs would let downstream C-string-based tooling
+    -- read a truncated visible value that disagrees with the stored
+    -- bytes).
     reason           TEXT NOT NULL CHECK (
         typeof(reason) = 'text'
         AND length(cast(reason AS BLOB)) BETWEEN 1 AND 4096
+        AND instr(cast(reason AS BLOB), x'00') = 0
     )
 );
 
