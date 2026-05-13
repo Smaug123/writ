@@ -19,11 +19,11 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
 use crate::agent_plan::{
-    CorrelationId, Decider, DecisionOutcome, PlanId, check_start_agent_run_binding,
+    CorrelationId, Decider, DecisionOutcome, DecisionView, PlanId, check_start_agent_run_binding,
 };
 use crate::agent_vm_daemon::AgentVmDaemon;
 use crate::audit::{
-    AUDIT_WRITE_FAILURE_TARGET, AuditLog, GitPushResolution, GitPushResolutionRecord,
+    AUDIT_WRITE_FAILURE_TARGET, AuditError, AuditLog, GitPushResolution, GitPushResolutionRecord,
     PlanDecisionRecord, PreMintRecord,
 };
 use crate::core::{
@@ -34,8 +34,8 @@ use crate::git_push_staging::{GitPushStagingStore, StagedEntry, StagingError};
 use crate::github::GitHubMinter;
 use crate::policy::{self, PolicyConfig};
 use crate::protocol::{
-    ClientMessage, PlanDetail, PlanSummary, RejectionReason, ServerMessage, StagedPushAuditView,
-    StagedPushDetail, StagedPushSummary,
+    ClientMessage, PlanDetail, PlanReviewView, PlanSummary, RejectionReason, ServerMessage,
+    StagedPushAuditView, StagedPushDetail, StagedPushSummary,
 };
 use crate::secret::SecretStore;
 
@@ -427,34 +427,42 @@ async fn show_plan<S: SecretStore + Send + Sync + 'static>(
     state: &Arc<BrokerState<S>>,
     plan_id: PlanId,
 ) -> ServerMessage {
+    // All four audit lookups land in one blocking task. SQLite serialises
+    // on the connection anyway, so fanning them out would not parallelise;
+    // a single task is simpler (one error ladder, one `JoinError`).
     let audit = Arc::clone(&state.audit);
-    let plan_lookup = tokio::task::spawn_blocking(move || audit.get_plan(plan_id)).await;
-    let plan = match plan_lookup {
-        Ok(Ok(Some(plan))) => plan,
-        Ok(Ok(None)) => return ServerMessage::UnknownPlan { plan_id },
-        Ok(Err(err)) => {
-            return ServerMessage::Error {
-                message: err.to_string(),
-            };
-        }
-        Err(err) => {
-            return ServerMessage::Error {
-                message: format!("plan lookup task failed: {err}"),
-            };
-        }
-    };
-
-    // Join correlation_id from the planner's agent_run. The plan row has
-    // a foreign-key onto agent_run so `Ok(None)` would be an invariant
-    // violation; surface it explicitly rather than fabricating a value.
-    let run_id = plan.agent_run_id;
-    let correlation_lookup = {
-        let audit = Arc::clone(&state.audit);
-        tokio::task::spawn_blocking(move || audit.correlation_id_for_run(run_id)).await
-    };
-    let correlation_id = match correlation_lookup {
-        Ok(Ok(Some(value))) => value,
-        Ok(Ok(None)) => {
+    let joined = tokio::task::spawn_blocking(move || -> Result<ShowPlanLookup, AuditError> {
+        let Some(plan) = audit.get_plan(plan_id)? else {
+            return Ok(ShowPlanLookup::Unknown);
+        };
+        let run_id = plan.agent_run_id;
+        // The plan row has a FOREIGN KEY onto agent_run, so the *outer*
+        // `Option::None` here would be an invariant violation (no such
+        // agent_run row). The *inner* `Option::None` means the planner
+        // run exists but is untagged, which is a normal "no
+        // correlation" outcome and passes through to the summary.
+        let Some(correlation_id) = audit.correlation_id_for_run(run_id)? else {
+            return Ok(ShowPlanLookup::MissingCorrelation { run_id });
+        };
+        let reviews = audit.list_plan_reviews_for_plan(plan_id)?;
+        let decision = audit.get_plan_decision(plan_id)?;
+        Ok(ShowPlanLookup::Found {
+            plan,
+            correlation_id,
+            reviews,
+            decision,
+        })
+    })
+    .await;
+    let (plan, correlation_id, reviews, decision) = match joined {
+        Ok(Ok(ShowPlanLookup::Found {
+            plan,
+            correlation_id,
+            reviews,
+            decision,
+        })) => (plan, correlation_id, reviews, decision),
+        Ok(Ok(ShowPlanLookup::Unknown)) => return ServerMessage::UnknownPlan { plan_id },
+        Ok(Ok(ShowPlanLookup::MissingCorrelation { run_id })) => {
             return ServerMessage::Error {
                 message: format!(
                     "plan {plan_id} references agent_run {run_id} which has no audit row; \
@@ -469,7 +477,7 @@ async fn show_plan<S: SecretStore + Send + Sync + 'static>(
         }
         Err(err) => {
             return ServerMessage::Error {
-                message: format!("correlation_id lookup task failed: {err}"),
+                message: format!("plan lookup task failed: {err}"),
             };
         }
     };
@@ -484,12 +492,45 @@ async fn show_plan<S: SecretStore + Send + Sync + 'static>(
         body_sha256,
         body_bytes,
     };
+    let reviews: Vec<PlanReviewView> = reviews
+        .into_iter()
+        .map(|r| PlanReviewView {
+            review_id: r.review_id,
+            reviewer_run_id: r.agent_run_id,
+            submitted_at: r.submitted_at,
+            verdict: r.verdict,
+            feedback: r.feedback,
+        })
+        .collect();
+    let decision = decision.map(|r| DecisionView {
+        outcome: r.outcome,
+        decided_at: r.decided_at,
+    });
     ServerMessage::Plan {
         plan: PlanDetail {
             summary,
             body: plan.body,
+            reviews,
+            decision,
         },
     }
+}
+
+/// Outcome of the combined `show_plan` audit task. Separating the three
+/// "look-up succeeded" shapes from the `AuditError`/`JoinError` paths
+/// keeps the outer match small and lets the blocking closure use
+/// `?` for IO failures.
+enum ShowPlanLookup {
+    Unknown,
+    MissingCorrelation {
+        run_id: crate::agent_run::AgentRunId,
+    },
+    Found {
+        plan: crate::audit::PlanSubmissionRecord,
+        correlation_id: Option<CorrelationId>,
+        reviews: Vec<crate::audit::PlanReviewRecord>,
+        decision: Option<PlanDecisionRecord>,
+    },
 }
 
 /// Record an operator decision against a plan.
@@ -2047,6 +2088,47 @@ mod tests {
         (run_id, plan_id)
     }
 
+    /// Record a reviewer `agent_run` and the matching `plan_review`
+    /// row, returning the new `ReviewId`. The reviewer run is bound to
+    /// `plan_id` via `read_plan_id`, mirroring the broker invariant
+    /// that review-stage runs always cite the plan they review.
+    async fn record_review_run_and_review(
+        state: &Arc<BrokerState<InMemStore>>,
+        session_id: SessionId,
+        plan_id: crate::agent_plan::PlanId,
+        submitted_at: UnixMillis,
+        verdict: crate::agent_plan::Verdict,
+        feedback: Option<crate::agent_plan::PlanFeedback>,
+    ) -> crate::agent_plan::ReviewId {
+        let reviewer_run = crate::agent_run::AgentRunId::new();
+        let review_id = crate::agent_plan::ReviewId::new();
+        state
+            .audit
+            .record_agent_run(&crate::audit::AgentRunAuditRecord {
+                run_id: reviewer_run,
+                session_id,
+                requested_at: UnixMillis::from_millis(1_700_000_000),
+                agent_kind: AgentKind::Claude,
+                prompt: crate::agent_run::AgentPrompt::new("review this plan").summary(),
+                correlation_id: None,
+                stage: crate::agent_plan::Stage::Review,
+                read_plan_id: Some(plan_id),
+            })
+            .unwrap();
+        state
+            .audit
+            .record_plan_review(&crate::audit::PlanReviewRecord {
+                review_id,
+                plan_id,
+                agent_run_id: reviewer_run,
+                submitted_at,
+                verdict,
+                feedback,
+            })
+            .unwrap();
+        review_id
+    }
+
     #[tokio::test]
     async fn list_plans_with_no_plans_returns_empty_listing() {
         let server = MockServer::start().await;
@@ -2202,6 +2284,183 @@ mod tests {
             other => panic!("expected Plan, got {other:?}"),
         };
         assert!(detail.summary.correlation_id.is_none());
+    }
+
+    /// A plan with no reviews and no decision surfaces `reviews: []`
+    /// and `decision: None` in the wire detail. The empty-reviews
+    /// invariant matches the protocol-level "always emit []" decision.
+    #[tokio::test]
+    async fn show_plan_with_no_reviews_or_decision_returns_empty_reviews_and_none_decision() {
+        let server = MockServer::start().await;
+        let state = make_state(&server, vec![], "o");
+        let session_id = open_session(&state).await;
+        let (_, plan_id) = record_planner_run_and_plan(
+            &state,
+            session_id,
+            None,
+            "# plan",
+            UnixMillis::from_millis(1_700_000_200),
+        )
+        .await;
+
+        let resp = dispatch_message(ClientMessage::ShowPlan { plan_id }, &state).await;
+        let detail = match resp {
+            ServerMessage::Plan { plan } => plan,
+            other => panic!("expected Plan, got {other:?}"),
+        };
+        assert!(detail.reviews.is_empty());
+        assert!(detail.decision.is_none());
+    }
+
+    /// A plan with reviews and an `Accepted` decision surfaces both on
+    /// the wire. Each `PlanReviewRecord` is mapped to a `PlanReviewView`
+    /// — verdict, feedback, and the reviewer's run id (under the
+    /// `reviewer_run_id` rename) all round-trip.
+    #[tokio::test]
+    async fn show_plan_with_reviews_and_accepted_decision_returns_full_detail() {
+        let server = MockServer::start().await;
+        let state = make_state(&server, vec![], "o");
+        let session_id = open_session(&state).await;
+        let (_, plan_id) = record_planner_run_and_plan(
+            &state,
+            session_id,
+            None,
+            "# plan",
+            UnixMillis::from_millis(1_700_000_200),
+        )
+        .await;
+        let feedback = crate::agent_plan::PlanFeedback::try_new("Looks good.").unwrap();
+        let review_id = record_review_run_and_review(
+            &state,
+            session_id,
+            plan_id,
+            UnixMillis::from_millis(1_700_000_300),
+            crate::agent_plan::Verdict::Approve,
+            Some(feedback.clone()),
+        )
+        .await;
+        let decided_at = UnixMillis::from_millis(1_700_000_400);
+        state
+            .audit
+            .record_plan_decision(&crate::audit::PlanDecisionRecord {
+                plan_id,
+                decided_at,
+                outcome: DecisionOutcome::Accepted,
+                decider: Decider::try_new("cli:alice").unwrap(),
+            })
+            .unwrap();
+
+        let resp = dispatch_message(ClientMessage::ShowPlan { plan_id }, &state).await;
+        let detail = match resp {
+            ServerMessage::Plan { plan } => plan,
+            other => panic!("expected Plan, got {other:?}"),
+        };
+        assert_eq!(detail.reviews.len(), 1);
+        let review = &detail.reviews[0];
+        assert_eq!(review.review_id, review_id);
+        assert_eq!(review.verdict, crate::agent_plan::Verdict::Approve);
+        assert_eq!(review.feedback.as_ref(), Some(&feedback));
+        assert_eq!(review.submitted_at.as_millis(), 1_700_000_300);
+        let decision = detail.decision.expect("decision should be present");
+        assert_eq!(decision.outcome, DecisionOutcome::Accepted);
+        assert_eq!(decision.decided_at, decided_at);
+    }
+
+    /// A `RejectedRestart` decision surfaces the same way as `Accepted`
+    /// — the handler does not filter on outcome.
+    #[tokio::test]
+    async fn show_plan_with_rejected_restart_decision_surfaces_outcome() {
+        let server = MockServer::start().await;
+        let state = make_state(&server, vec![], "o");
+        let session_id = open_session(&state).await;
+        let (_, plan_id) = record_planner_run_and_plan(
+            &state,
+            session_id,
+            None,
+            "# plan",
+            UnixMillis::from_millis(1_700_000_200),
+        )
+        .await;
+        state
+            .audit
+            .record_plan_decision(&crate::audit::PlanDecisionRecord {
+                plan_id,
+                decided_at: UnixMillis::from_millis(1_700_000_500),
+                outcome: DecisionOutcome::RejectedRestart,
+                decider: Decider::try_new("cli:alice").unwrap(),
+            })
+            .unwrap();
+
+        let resp = dispatch_message(ClientMessage::ShowPlan { plan_id }, &state).await;
+        let detail = match resp {
+            ServerMessage::Plan { plan } => plan,
+            other => panic!("expected Plan, got {other:?}"),
+        };
+        let decision = detail.decision.expect("decision should be present");
+        assert_eq!(decision.outcome, DecisionOutcome::RejectedRestart);
+    }
+
+    /// Reviews are surfaced in submission order (oldest first), and
+    /// reviews against *other* plans are excluded by the per-plan
+    /// filter in `list_plan_reviews_for_plan`.
+    #[tokio::test]
+    async fn show_plan_orders_reviews_oldest_first_and_excludes_other_plans() {
+        let server = MockServer::start().await;
+        let state = make_state(&server, vec![], "o");
+        let session_id = open_session(&state).await;
+        let (_, plan_id) = record_planner_run_and_plan(
+            &state,
+            session_id,
+            None,
+            "# plan",
+            UnixMillis::from_millis(1_700_000_200),
+        )
+        .await;
+        let (_, other_plan_id) = record_planner_run_and_plan(
+            &state,
+            session_id,
+            None,
+            "# other plan",
+            UnixMillis::from_millis(1_700_000_201),
+        )
+        .await;
+        let first = record_review_run_and_review(
+            &state,
+            session_id,
+            plan_id,
+            UnixMillis::from_millis(1_700_000_300),
+            crate::agent_plan::Verdict::RequestChanges,
+            None,
+        )
+        .await;
+        let second = record_review_run_and_review(
+            &state,
+            session_id,
+            plan_id,
+            UnixMillis::from_millis(1_700_000_400),
+            crate::agent_plan::Verdict::Approve,
+            None,
+        )
+        .await;
+        // A review on a different plan must not leak into this listing.
+        record_review_run_and_review(
+            &state,
+            session_id,
+            other_plan_id,
+            UnixMillis::from_millis(1_700_000_350),
+            crate::agent_plan::Verdict::Approve,
+            None,
+        )
+        .await;
+
+        let resp = dispatch_message(ClientMessage::ShowPlan { plan_id }, &state).await;
+        let detail = match resp {
+            ServerMessage::Plan { plan } => plan,
+            other => panic!("expected Plan, got {other:?}"),
+        };
+        assert_eq!(detail.reviews.len(), 2);
+        assert_eq!(detail.reviews[0].review_id, first);
+        assert_eq!(detail.reviews[1].review_id, second);
     }
 
     #[tokio::test]
