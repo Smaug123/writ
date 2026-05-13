@@ -49,7 +49,7 @@ pub(super) struct Migration {
 /// a version higher than this is rejected with [`AuditError::SchemaTooNew`]
 /// rather than opened — we'd rather fail to start than silently drop data
 /// into a schema a newer broker wrote.
-pub(super) const SCHEMA_VERSION: i32 = 2;
+pub(super) const SCHEMA_VERSION: i32 = 3;
 
 /// The full migration history. Each entry documents exactly one state
 /// transition; the sequence of entries is the schema's lineage. Order
@@ -64,6 +64,11 @@ pub(super) const MIGRATIONS: &[Migration] = &[
         version: 2,
         name: "0002_plan_addendum",
         sql: include_str!("migrations/0002_plan_addendum.sql"),
+    },
+    Migration {
+        version: 3,
+        name: "0003_plan_abort",
+        sql: include_str!("migrations/0003_plan_abort.sql"),
     },
 ];
 
@@ -300,6 +305,7 @@ mod tests {
             "plan_decision",
             "plan_review",
             "plan_addendum",
+            "plan_abort",
         ] {
             assert!(tables.contains(expected), "missing table: {expected}");
         }
@@ -324,6 +330,8 @@ mod tests {
             "plan_addendum_requires_open_session",
             "plan_addendum_requires_executor_run",
             "plan_addendum_requires_accepted_decision",
+            "plan_abort_requires_open_session",
+            "plan_abort_requires_executor_run",
         ] {
             assert!(triggers.contains(expected), "missing trigger: {expected}");
         }
