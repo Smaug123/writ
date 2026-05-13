@@ -57,8 +57,57 @@ install -m 0600 ~/Downloads/writ-bot-yourname.*.private-key.pem \
 The filename (`gh-app-pk` here) is the **secret key name** you'll
 reference in `config.json` as `private_key_secret`.
 
-If you'd rather use the OS keychain (macOS Keychain or freedesktop
-Secret Service), see [Configuration → Secret stores](configuration.md#secret-stores).
+### Alternative: macOS Keychain
+
+If you'd rather have macOS unlock the secret for you at login, store the
+PEM in the login keychain as a generic password. `security` is the
+built-in CLI; no extra install needed.
+
+```bash
+security add-generic-password \
+  -s writ \
+  -a gh-app-pk \
+  -w "$(cat ~/Downloads/writ-bot-yourname.*.private-key.pem)"
+```
+
+- `-s writ` is the **service**. It has to match `secret_store.service`
+  in `config.json` below.
+- `-a gh-app-pk` is the **account**, which is the secret key name
+  referenced from `private_key_secret` in `config.json`.
+- `-w "$(...)"` passes the PEM as the password. It appears briefly in
+  `ps`-visible argv; if that matters on a shared machine, drop the
+  trailing argument (`-w` with no value makes `security` prompt
+  interactively) and paste the PEM at the prompt.
+
+To replace an existing entry in place, add `-U`:
+
+```bash
+security add-generic-password -U \
+  -s writ -a gh-app-pk \
+  -w "$(cat ~/Downloads/writ-bot-yourname.*.private-key.pem)"
+```
+
+Sanity-check by reading it back:
+
+```bash
+security find-generic-password -s writ -a gh-app-pk -w
+```
+
+That should print the PEM verbatim. To remove the entry later:
+
+```bash
+security delete-generic-password -s writ -a gh-app-pk
+```
+
+When you use the keychain, point `config.json` at the keyring backend
+(otherwise the daemon still looks in the file store):
+
+```json
+"secret_store": { "type": "keyring", "service": "writ" }
+```
+
+For the freedesktop Secret Service equivalent on Linux, see
+[Configuration → Secret stores](configuration.md#secret-stores).
 
 ## 4. Write `config.json`
 
@@ -96,6 +145,104 @@ talking to GitHub at all — that's how it stops a typo'd request like
 `writable_repos` is the allowlist for *write* requests. Read requests are
 permitted on any repo the installation can see, since the GitHub App
 itself enforces the installation boundary.
+
+### Optional: `agent_vm` block
+
+`writ agent` boots a per-session VM that the agent runs inside. To
+enable it, add an `agent_vm` block alongside the others. Both inner
+structs (`lifecycle` and `vm_http`) are `deny_unknown_fields`, so don't
+sneak in keys outside the documented schema — the daemon refuses to
+start.
+
+```json
+"agent_vm": {
+  "lifecycle": {
+    "ipv4_pool": "192.168.0.0/16",
+    "ipv6_pool": "fd83:b6f2:e57::/48",
+    "subnet_index_min": 252,
+    "subnet_index_max": 252,
+    "container": "container",
+    "sudo": "sudo",
+    "pf_helper": "/abs/path/to/writ-agent-vm-pf-helper",
+    "state_dir": "/abs/path/to/writ/agent-vm-state",
+    "ipv6_mode": "ipv4_only_no_guest_ipv6",
+    "image": "writ-agent-vm-guest:latest",
+    "cpus": 1,
+    "memory_mib": 512
+  },
+  "vm_http": {
+    "bind_addr": "0.0.0.0",
+    "broker_port_min": 49152,
+    "broker_port_max": 65535,
+    "git_program": "/abs/path/to/git",
+    "askpass_program": "/abs/path/to/git-askpass.sh",
+    "token_env": "WRIT_GIT_TOKEN",
+    "work_root": "/abs/path/to/writ/git-work",
+    "clone_timeout_secs": 30,
+    "max_bundle_bytes": 1048576,
+    "nix_cache_url": "https://cache.nixos.org",
+    "nix_cache_trusted_public_keys": [
+      "cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY="
+    ],
+    "nix_cache_max_metadata_bytes": 1048576,
+    "nix_cache_max_nar_bytes": 67108864,
+    "agent_run_log_root": "/abs/path/to/writ/agent-run-logs",
+    "git_push_staging_root": "/abs/path/to/writ/git-push-staging"
+  }
+}
+```
+
+Before that block does anything useful you need four things on disk:
+
+1. **`pf_helper`** — `writ-agent-vm-pf-helper` from `agent-infra`. The
+   daemon shells out to it via `sudo` to bring up PF anchors, so make
+   sure you have a sudoers entry (or are happy to type your password
+   each session).
+2. **`image`** — `writ-agent-vm-guest:latest` is just a tag. Apple's
+   `container` won't find it until you build the guest image (e.g.
+   `nix build .#agent-vm-guest-image-aarch64-linux`) and load the
+   resulting archive via `container image load --input <archive>`.
+3. **`askpass_program`** — there's no shipped binary; drop a small
+   script wherever the config points and `chmod +x` it. The two
+   prompts Git sends during HTTPS auth need to be answered like so:
+   ```sh
+   #!/usr/bin/env sh
+   case "$1" in
+     *Username*) printf 'x-access-token\n' ;;
+     *Password*) printf '%s\n' "${WRIT_GIT_TOKEN:?missing WRIT_GIT_TOKEN for git askpass}" ;;
+     *) printf 'unexpected askpass prompt: %s\n' "$1" >&2; exit 1 ;;
+   esac
+   ```
+   The env var name must match `token_env` above.
+4. **`git_program`** — absolute path to the git binary you want the
+   broker to shell out to. Don't rely on `$PATH`.
+
+`agent_run_log_root` and `git_push_staging_root` are optional; if
+omitted they default to subdirectories of `work_root`.
+
+### Optional: `claude_proxy` block
+
+`writ agent run --model …` only reaches Anthropic via a broker-side
+proxy. Without it, the run fails with a proxy-not-configured error
+rather than the actual upstream call. Add a `claude_proxy` block under
+`vm_http`:
+
+```json
+"claude_proxy": {
+  "upstream_base_url": "https://api.anthropic.com",
+  "auth_secret": "anthropic-key",
+  "auth_kind": "x_api_key",
+  "anthropic_version": "2023-06-01",
+  "timeout_secs": 60,
+  "max_request_bytes": 2097152,
+  "max_response_bytes": 8388608
+}
+```
+
+`auth_secret` is the secret-store key (same store as
+`private_key_secret`) holding the API key or OAuth token.
+`auth_kind` is one of `x_api_key`, `authorization_bearer`, or `oauth`
+— the broker picks the matching header per variant.
 
 ## 5. Run the daemon
 
