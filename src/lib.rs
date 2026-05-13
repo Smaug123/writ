@@ -23,6 +23,8 @@ pub mod core;
 #[cfg(feature = "host")]
 pub mod git_push_replay;
 #[cfg(feature = "host")]
+pub mod git_push_replay_object_source;
+#[cfg(feature = "host")]
 pub mod git_push_replay_walker;
 #[cfg(feature = "host")]
 pub mod git_push_staging;
