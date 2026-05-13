@@ -933,10 +933,12 @@ pub struct AbortRecorded {
 
 /// `GET /v1/plans/<plan_id>` response body — everything an authorised
 /// reviewer or implementer needs to read about a plan. The
-/// `originating_prompt` field carries the feature-request prompt that
-/// produced the plan (per §"Implementer prompt construction"); slice
-/// 5 of the implementation plan settles where the broker keeps the
-/// prompt before serving it back here.
+/// originating feature-request prompt is *not* on this struct yet:
+/// slice 5 of the implementation plan settles whether the broker
+/// persists it on the `plan` row or has the implementer re-receive it
+/// via the CLI starting the run. Until then the wire shape is
+/// minimal so clients can't depend on a value the broker can't
+/// actually serve.
 ///
 /// `decision` is always present on the wire — explicitly `null` while
 /// the plan is still under review, an object once the operator has
@@ -950,17 +952,10 @@ pub struct PlanView {
     pub plan_id: PlanId,
     pub body: PlanBody,
     pub originating_run_id: crate::agent_run::AgentRunId,
-    pub originating_prompt: AgentPrompt,
     pub decision: Option<DecisionView>,
 }
 
-const PLAN_VIEW_FIELDS: &[&str] = &[
-    "plan_id",
-    "body",
-    "originating_run_id",
-    "originating_prompt",
-    "decision",
-];
+const PLAN_VIEW_FIELDS: &[&str] = &["plan_id", "body", "originating_run_id", "decision"];
 
 #[derive(Deserialize)]
 #[serde(field_identifier, rename_all = "snake_case")]
@@ -968,7 +963,6 @@ enum PlanViewField {
     PlanId,
     Body,
     OriginatingRunId,
-    OriginatingPrompt,
     Decision,
 }
 
@@ -986,7 +980,6 @@ impl<'de> serde::de::Visitor<'de> for PlanViewVisitor {
         let mut plan_id: Option<PlanId> = None;
         let mut body: Option<PlanBody> = None;
         let mut originating_run_id: Option<crate::agent_run::AgentRunId> = None;
-        let mut originating_prompt: Option<AgentPrompt> = None;
         // Outer `Option` tracks key presence; inner `Option` is the
         // semantic "no decision yet". They are kept distinct so a
         // missing key is reported as a wire-contract violation rather
@@ -1012,12 +1005,6 @@ impl<'de> serde::de::Visitor<'de> for PlanViewVisitor {
                     }
                     originating_run_id = Some(map.next_value()?);
                 }
-                PlanViewField::OriginatingPrompt => {
-                    if originating_prompt.is_some() {
-                        return Err(A::Error::duplicate_field("originating_prompt"));
-                    }
-                    originating_prompt = Some(map.next_value()?);
-                }
                 PlanViewField::Decision => {
                     if decision.is_some() {
                         return Err(A::Error::duplicate_field("decision"));
@@ -1031,8 +1018,6 @@ impl<'de> serde::de::Visitor<'de> for PlanViewVisitor {
             body: body.ok_or_else(|| A::Error::missing_field("body"))?,
             originating_run_id: originating_run_id
                 .ok_or_else(|| A::Error::missing_field("originating_run_id"))?,
-            originating_prompt: originating_prompt
-                .ok_or_else(|| A::Error::missing_field("originating_prompt"))?,
             decision: decision.ok_or_else(|| A::Error::missing_field("decision"))?,
         })
     }
@@ -1526,7 +1511,6 @@ mod tests {
     fn plan_view_roundtrips_with_and_without_decision() {
         let plan_id = PlanId::new();
         let run_id = crate::agent_run::AgentRunId::new();
-        let prompt = AgentPrompt::new("Original feature ask.");
         let body = PlanBody::try_new("# Plan").unwrap();
         for decision in [
             None,
@@ -1539,7 +1523,6 @@ mod tests {
                 plan_id,
                 body: body.clone(),
                 originating_run_id: run_id,
-                originating_prompt: prompt.clone(),
                 decision,
             };
             let json = serde_json::to_string(&view).unwrap();
@@ -1561,7 +1544,6 @@ mod tests {
             plan_id: PlanId::new(),
             body: PlanBody::try_new("# Plan").unwrap(),
             originating_run_id: crate::agent_run::AgentRunId::new(),
-            originating_prompt: AgentPrompt::new("Original feature ask."),
             decision: None,
         };
         let value: serde_json::Value = serde_json::to_value(&view).unwrap();
@@ -1569,6 +1551,27 @@ mod tests {
             value.get("decision"),
             Some(&serde_json::Value::Null),
             "decision must be present and explicitly null: {value}",
+        );
+    }
+
+    /// Slice 4c stubs originating-prompt persistence by *omitting* the
+    /// field rather than persisting an empty string. Slice 5 finalises
+    /// the storage strategy and re-adds the field — but until then the
+    /// wire shape must not declare a field the broker can't honestly
+    /// populate. Pin the omission directly so an accidental slice-5
+    /// preview that adds `originating_prompt` to the struct fails here.
+    #[test]
+    fn plan_view_omits_originating_prompt_in_slice_4() {
+        let view = PlanView {
+            plan_id: PlanId::new(),
+            body: PlanBody::try_new("# Plan").unwrap(),
+            originating_run_id: crate::agent_run::AgentRunId::new(),
+            decision: None,
+        };
+        let value: serde_json::Value = serde_json::to_value(&view).unwrap();
+        assert!(
+            value.get("originating_prompt").is_none(),
+            "originating_prompt must be absent in slice 4c: {value}",
         );
     }
 
@@ -1586,7 +1589,6 @@ mod tests {
             "plan_id": plan_id,
             "body": "# Plan",
             "originating_run_id": run_id,
-            "originating_prompt": "Original feature ask.",
         });
         let err = serde_json::from_value::<PlanView>(payload).unwrap_err();
         assert!(
@@ -1598,7 +1600,10 @@ mod tests {
     /// Belt-and-braces: an unknown field is also rejected. The custom
     /// `Deserialize` relies on the derived `field_identifier` enum to
     /// reject unknown keys, so this pins that the manual rewrite did
-    /// not regress the prior `deny_unknown_fields` guarantee.
+    /// not regress the prior `deny_unknown_fields` guarantee. The
+    /// dropped slice-5 field `originating_prompt` doubles as today's
+    /// unknown-key witness: a client that round-trips against an
+    /// older mock must be rejected, not silently accepted.
     #[test]
     fn plan_view_rejects_unknown_field() {
         let plan_id = PlanId::new();
@@ -1607,14 +1612,13 @@ mod tests {
             "plan_id": plan_id,
             "body": "# Plan",
             "originating_run_id": run_id,
-            "originating_prompt": "Original feature ask.",
             "decision": null,
-            "extra": 42,
+            "originating_prompt": "Original feature ask.",
         });
         let err = serde_json::from_value::<PlanView>(payload).unwrap_err();
         let msg = err.to_string();
         assert!(
-            msg.contains("unknown") || msg.contains("extra"),
+            msg.contains("unknown") || msg.contains("originating_prompt"),
             "expected unknown-field rejection, got {msg}",
         );
     }

@@ -319,6 +319,39 @@ impl AuditLog {
             }
         })
     }
+
+    /// The most-recently-requested `agent_run` belonging to a session,
+    /// or `None` if the session has no run. The VM HTTP plan-read
+    /// routes use this to identify the calling run from a bearer
+    /// (which only names the session) before checking the run's
+    /// `stage` and `read_plan_id`.
+    ///
+    /// Today the product invariant is one run per session; the
+    /// `ORDER BY requested_at DESC LIMIT 1` is defensive against a
+    /// future N>1 case so the answer stays deterministic. "Most recent
+    /// run wins" matches the corresponding choice in
+    /// [`Self::correlation_id_for_session`].
+    pub fn agent_run_for_session(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Option<AgentRunAuditRecord>, AuditError> {
+        self.with_conn(|c| {
+            let row = c
+                .query_row(
+                    "SELECT run_id, session_id, requested_at, agent_kind, prompt_bytes,
+                            prompt_sha256, prompt_redacted_preview, correlation_id, stage,
+                            read_plan_id
+                     FROM agent_run
+                     WHERE session_id = ?1
+                     ORDER BY requested_at DESC
+                     LIMIT 1",
+                    params![session_id.as_uuid().to_string()],
+                    agent_run_from_row,
+                )
+                .optional()?;
+            row.transpose()
+        })
+    }
 }
 
 fn agent_vm_workspace_bootstrap_from_row(
@@ -952,6 +985,63 @@ mod tests {
 
         let entry = log.get_agent_run(implementer_run_id).unwrap().unwrap();
         assert_eq!(entry.read_plan_id, Some(plan_id));
+    }
+
+    /// `agent_run_for_session` returns the latest run on a session and
+    /// `None` when the session has no run. The VM HTTP plan-read route
+    /// uses this to identify the calling run from the bearer's session
+    /// id (the only handle a per-id GET carries) before checking the
+    /// run's `stage` and `read_plan_id`.
+    #[test]
+    fn agent_run_for_session_returns_latest_run_or_none() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let session = sample_session();
+        log.open_session(&session).unwrap();
+
+        // No run yet — returns None.
+        assert!(
+            log.agent_run_for_session(session.session_id)
+                .unwrap()
+                .is_none(),
+        );
+
+        // After recording two runs on the same session, the later one
+        // wins (defensive against a future N>1 case).
+        let earlier_run_id = AgentRunId::new();
+        log.record_agent_run(&AgentRunAuditRecord {
+            run_id: earlier_run_id,
+            session_id: session.session_id,
+            requested_at: UnixMillis::from_millis(1_700_000_100),
+            agent_kind: AgentKind::Claude,
+            prompt: crate::agent_run::AgentPrompt::new("plan this").summary(),
+            correlation_id: None,
+            stage: Stage::Plan,
+            read_plan_id: None,
+        })
+        .unwrap();
+        let later_run_id = AgentRunId::new();
+        log.record_agent_run(&AgentRunAuditRecord {
+            run_id: later_run_id,
+            session_id: session.session_id,
+            requested_at: UnixMillis::from_millis(1_700_000_200),
+            agent_kind: AgentKind::Claude,
+            prompt: crate::agent_run::AgentPrompt::new("review the plan").summary(),
+            correlation_id: None,
+            stage: Stage::Review,
+            read_plan_id: None,
+        })
+        .unwrap();
+
+        let resolved = log
+            .agent_run_for_session(session.session_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(resolved.run_id, later_run_id);
+        assert_eq!(resolved.stage, Stage::Review);
+
+        // A session that is unknown to the audit log resolves to None.
+        let other = SessionId::new();
+        assert!(log.agent_run_for_session(other).unwrap().is_none());
     }
 
     /// A run with `read_plan_id` naming a non-existent plan is rejected
