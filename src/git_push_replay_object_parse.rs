@@ -118,7 +118,17 @@ pub(crate) fn parse_commit_object(bytes: &[u8]) -> Result<StagingCommit, ParseOb
                 }
                 tree = Some(parse_sha(value, "tree")?);
             }
-            b"parent" => parents.push(parse_sha(value, "parent")?),
+            b"parent" => {
+                // Git's commit format places `parent` headers in the
+                // block before `author`; `rev-list --parents` ignores
+                // any that appear later. Mirror that here so a
+                // crafted staging commit cannot launder an extra
+                // ancestor through the parser by tacking a `parent`
+                // line on after `committer`.
+                if author.is_none() {
+                    parents.push(parse_sha(value, "parent")?);
+                }
+            }
             b"author" => {
                 if author.is_some() {
                     return Err(ParseObjectError::DuplicateHeader("author"));
@@ -196,6 +206,13 @@ pub(crate) fn serialize_commit_object(commit: &StagingCommit) -> Vec<u8> {
 /// separator between entries.
 pub(crate) fn parse_tree_object(bytes: &[u8]) -> Result<StagingTree, ParseObjectError> {
     let mut entries = Vec::new();
+    // Tracks paths already emitted in this tree so duplicates can be
+    // rejected. `git fsck --strict` flags duplicate entries as
+    // `duplicateEntries`; GitHub's create-tree API resolves them with
+    // last-write-wins, so accepting duplicates here would let a
+    // crafted staging tree silently choose which object a path
+    // resolves to on the published side.
+    let mut seen_paths: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut cursor = 0;
     while cursor < bytes.len() {
         let sp = bytes[cursor..]
@@ -224,6 +241,11 @@ pub(crate) fn parse_tree_object(bytes: &[u8]) -> Result<StagingTree, ParseObject
             .map_err(ParseObjectError::NonUtf8TreePath)?
             .to_string();
         validate_tree_entry_name(&path)?;
+        if !seen_paths.insert(path.clone()) {
+            return Err(ParseObjectError::MalformedTreeEntry(format!(
+                "duplicate tree entry name: {path:?}"
+            )));
+        }
         cursor += nul + 1;
 
         if cursor + 20 > bytes.len() {
@@ -242,7 +264,8 @@ pub(crate) fn parse_tree_object(bytes: &[u8]) -> Result<StagingTree, ParseObject
 }
 
 /// Returns `Err` if `name` is not a legal tree entry name per git's
-/// own rules: empty, `.`, `..`, or containing `/`.
+/// own rules: empty, `.`, `..`, `.git` (case-insensitive), or
+/// containing `/`.
 ///
 /// The staging repo is untrusted, and `git bundle unbundle` together
 /// with `git cat-file --batch` happily ferry malformed tree entries
@@ -251,7 +274,9 @@ pub(crate) fn parse_tree_object(bytes: &[u8]) -> Result<StagingTree, ParseObject
 /// is treated by GitHub as a literal path component. An entry like
 /// `a/b` would silently re-interpret as a nested subtree, laundering
 /// a different valid tree out of an invalid one; `"."` / `".."` /
-/// the empty string would similarly re-shape as directory navigation.
+/// the empty string would similarly re-shape as directory navigation;
+/// `.git` (and case variants) is what `git fsck` flags as `hasDotgit`
+/// and would, on a checkout, collide with the working-tree metadata.
 /// Reject them at the parser boundary so the rest of the pipeline
 /// only ever sees well-formed path components.
 fn validate_tree_entry_name(name: &str) -> Result<(), ParseObjectError> {
@@ -263,6 +288,11 @@ fn validate_tree_entry_name(name: &str) -> Result<(), ParseObjectError> {
     if name == "." || name == ".." {
         return Err(ParseObjectError::MalformedTreeEntry(format!(
             "tree entry name is reserved: {name:?}"
+        )));
+    }
+    if name.eq_ignore_ascii_case(".git") {
+        return Err(ParseObjectError::MalformedTreeEntry(format!(
+            "tree entry name is reserved (git fsck hasDotgit): {name:?}"
         )));
     }
     if name.contains('/') {
@@ -598,6 +628,82 @@ mod tests {
     }
 
     #[test]
+    fn parse_commit_object_ignores_parent_after_author() {
+        // Per the git object format, `parent` headers belong before
+        // `author`; git's `rev-list --parents` ignores any that appear
+        // later. A crafted staging commit could carry such a stray
+        // `parent` line to launder ancestry through the replay walker
+        // — either onto a SHA the walker has already replayed (giving
+        // a published commit ancestry the source bundle did not have)
+        // or onto a SHA it hasn't, breaking replay loudly with
+        // `UnmappedParent`. Mirror git: only collect parents that
+        // precede the author header; later `parent` lines are
+        // discarded like any other unknown header.
+        let commit = StagingCommit {
+            tree: sample_object_id('a'),
+            parents: vec![sample_object_id('b')],
+            author: sample_identity("Alice"),
+            committer: sample_identity("Bob"),
+            message: "msg\n".to_string(),
+        };
+        let mut bytes = serialize_commit_object(&commit);
+        // Inject a stray `parent` line between committer and the
+        // blank line.
+        let blank_pos = bytes
+            .windows(2)
+            .position(|w| w == b"\n\n")
+            .expect("commit always has a blank line before the body");
+        let stray = format!("parent {}\n", sample_object_id('f').as_str());
+        bytes.splice(blank_pos + 1..blank_pos + 1, stray.bytes());
+
+        let parsed =
+            parse_commit_object(&bytes).expect("parser should silently drop post-author parent");
+        // The injected SHA must NOT appear in the parents list.
+        assert_eq!(parsed.parents, vec![sample_object_id('b')]);
+    }
+
+    #[test]
+    fn parse_tree_object_rejects_dot_git_case_insensitive() {
+        // `git fsck --strict` rejects tree entries named `.git` (and
+        // case variants like `.GIT`, `.Git`) as `hasDotgit`. A
+        // crafted staging tree carrying such an entry would otherwise
+        // pass through to GitHub's create-tree API; reject at the
+        // parser boundary.
+        for bad in [".git", ".GIT", ".Git", ".gIt"] {
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(b"100644 ");
+            bytes.extend_from_slice(bad.as_bytes());
+            bytes.push(0);
+            bytes.extend_from_slice(&hex_decode(sample_object_id('a').as_str()));
+            let err = parse_tree_object(&bytes).expect_err("must reject");
+            assert!(
+                matches!(err, ParseObjectError::MalformedTreeEntry(_)),
+                "got for {bad:?}: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_tree_object_rejects_duplicate_entry_names() {
+        // `git fsck --strict` reports `duplicateEntries` for trees
+        // that carry the same path twice. The GitHub create-tree API
+        // applies last-write-wins, so accepting duplicates here would
+        // let a crafted staging tree silently choose which object a
+        // path resolves to on the published side. Reject during
+        // parsing.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"100644 README\0");
+        bytes.extend_from_slice(&hex_decode(sample_object_id('1').as_str()));
+        bytes.extend_from_slice(b"100644 README\0");
+        bytes.extend_from_slice(&hex_decode(sample_object_id('2').as_str()));
+        let err = parse_tree_object(&bytes).expect_err("must reject duplicate path");
+        assert!(
+            matches!(err, ParseObjectError::MalformedTreeEntry(ref msg) if msg.contains("duplicate")),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
     fn parse_tree_object_round_trip_mixed_kinds() {
         let tree = StagingTree {
             entries: vec![
@@ -868,8 +974,10 @@ mod tests {
         // Path bytes exclude '\0' (entry terminator), SP (mode/path
         // separator), and '/' (rejected by the parser because the
         // walker forwards entry names verbatim to GitHub's
-        // create-tree API). We also exclude the reserved names "."
-        // and ".." at the post-collection stage.
+        // create-tree API). We also exclude the reserved names ".",
+        // "..", and case variants of ".git" at the post-collection
+        // stage so the round-trip property is not at the mercy of
+        // chance.
         prop::collection::vec(
             prop::char::any()
                 .prop_filter("no framing chars", |c| *c != '\0' && *c != ' ' && *c != '/'),
@@ -877,7 +985,11 @@ mod tests {
         )
         .prop_filter_map("non-reserved name", |chars| {
             let s: String = chars.into_iter().collect();
-            if s == "." || s == ".." { None } else { Some(s) }
+            if s == "." || s == ".." || s.eq_ignore_ascii_case(".git") {
+                None
+            } else {
+                Some(s)
+            }
         })
     }
 
@@ -887,7 +999,17 @@ mod tests {
     }
 
     fn arb_staging_tree() -> impl Strategy<Value = StagingTree> {
-        prop_vec(arb_staging_tree_entry(), 0..16).prop_map(|entries| StagingTree { entries })
+        // Dedupe by path so the generator cannot violate the parser's
+        // no-duplicate-entries rule by chance. Generation order is
+        // preserved: the first occurrence of each path wins.
+        prop_vec(arb_staging_tree_entry(), 0..16).prop_map(|entries| {
+            let mut seen = std::collections::HashSet::new();
+            let entries = entries
+                .into_iter()
+                .filter(|e| seen.insert(e.path.clone()))
+                .collect();
+            StagingTree { entries }
+        })
     }
 
     proptest! {
