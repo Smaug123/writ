@@ -167,16 +167,23 @@ impl CatFileObjectSource {
 
     /// Close the child gracefully: drop stdin to signal EOF, then
     /// `wait()` the cat-file process to completion. Returns the
-    /// exit status as an error if the child exited non-zero. After
-    /// a successful close the source's [`Drop`] impl skips the
-    /// `killpg` (the pid has been waited on and may have been
-    /// recycled). Callers who don't care about the exit status can
-    /// just drop the source, which SIGKILLs the whole process group.
+    /// exit status as an error if the child exited non-zero.
+    ///
+    /// Cancellation safety: from the moment we take ownership of
+    /// the child the source's outer [`Drop`] is disarmed (`inner`
+    /// is `None`), so a local [`PgidCleanupGuard`] takes over and
+    /// SIGKILLs the process group if anything between here and the
+    /// final `disarm()` panics or has its await cancelled. After
+    /// the leader is reaped we then `killpg` to mop up any helper
+    /// that was sharing the group (a wrapper script's children,
+    /// say) before disarming the guard.
     pub async fn close(mut self) -> io::Result<()> {
+        let pgid = self.pgid;
         let mutex = self
             .inner
             .take()
             .expect("CatFileObjectSource::inner is always Some until close consumes it");
+        let mut guard = PgidCleanupGuard::new(pgid);
         let CatFileChild {
             mut child,
             stdin,
@@ -184,7 +191,15 @@ impl CatFileObjectSource {
         } = mutex.into_inner();
         drop(stdin);
         drop(stdout);
-        let status = child.wait().await?;
+        let wait_result = child.wait().await;
+        // wait() reaped the leader (or failed). Either way, kill
+        // any helpers still in the group before the guard would
+        // otherwise have to do it. We tolerate ESRCH (group is
+        // already gone) and EPERM (macOS race after the leader is
+        // reaped): both mean there is nothing left to signal.
+        kill_process_group_best_effort(pgid)?;
+        guard.disarm();
+        let status = wait_result?;
         if !status.success() {
             return Err(io::Error::other(format!(
                 "`git cat-file --batch` exited with non-zero status: {status}"
@@ -197,16 +212,58 @@ impl CatFileObjectSource {
 impl Drop for CatFileObjectSource {
     fn drop(&mut self) {
         // `close()` clears `inner` on its successful path. Anything
-        // else — Drop without `close()`, a cancelled future, or a
-        // panic — means the leader is still alive (or at least has
-        // not been waited on yet), and any helper it forked is also
-        // still in the group. SIGKILL the group so nothing outlives
-        // the source. Errors are intentionally swallowed: there is
+        // else — Drop without `close()`, a cancelled future before
+        // `close()` even started, or a panic — means the source
+        // still owns the child and the process group might contain
+        // live helpers. SIGKILL the group so nothing outlives the
+        // source. Errors are intentionally swallowed: there is
         // nothing useful to do with them from Drop, and ESRCH (the
         // group is already gone) is a normal race.
         if self.inner.is_some() {
             unsafe { libc::killpg(self.pgid, libc::SIGKILL) };
         }
+    }
+}
+
+/// RAII guard that SIGKILLs a process group on drop unless
+/// explicitly disarmed. Used inside [`CatFileObjectSource::close`]
+/// to keep the kill scheduled across `await` points so a future
+/// cancellation or panic still cleans the group up.
+struct PgidCleanupGuard {
+    pgid: libc::pid_t,
+    armed: bool,
+}
+
+impl PgidCleanupGuard {
+    fn new(pgid: libc::pid_t) -> Self {
+        Self { pgid, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PgidCleanupGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            unsafe { libc::killpg(self.pgid, libc::SIGKILL) };
+        }
+    }
+}
+
+fn kill_process_group_best_effort(pgid: libc::pid_t) -> io::Result<()> {
+    if unsafe { libc::killpg(pgid, libc::SIGKILL) } == 0 {
+        return Ok(());
+    }
+    let err = io::Error::last_os_error();
+    match err.raw_os_error() {
+        // No such process group: somebody already cleaned up.
+        Some(libc::ESRCH) => Ok(()),
+        // macOS reports EPERM once the leader has been reaped and
+        // no signalable members remain; treat as success.
+        Some(libc::EPERM) => Ok(()),
+        _ => Err(err),
     }
 }
 
@@ -1449,6 +1506,77 @@ mod tests {
         assert!(
             gone,
             "helper pid {helper_pid} survived source Drop — process group was not killed"
+        );
+    }
+
+    #[tokio::test]
+    async fn cat_file_source_close_cancellation_kills_process_group() {
+        // Regression for codex review P2: cancelling `close()` at
+        // its `child.wait().await` must still SIGKILL the whole
+        // process group. The wrapper `exec sleep`s, so it never
+        // observes the EOF that `close()` writes to its stdin —
+        // the only way to cancel cleanup is to drop the future.
+        // Without the local PgidCleanupGuard inside `close()` the
+        // outer Drop sees `inner == None` and skips `killpg`,
+        // leaking the helper.
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let wrapper = tmp.path().join("wrap.sh");
+        let helper_pid_file = tmp.path().join("helper.pid");
+        let script = format!(
+            "#!/bin/sh\n\
+             sleep 600 &\n\
+             echo $! > {helper}\n\
+             exec sleep 600\n",
+            helper = helper_pid_file.display(),
+        );
+        std::fs::write(&wrapper, script).expect("write wrapper");
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod wrapper");
+
+        let source = CatFileObjectSource::open(tmp.path(), &wrapper)
+            .await
+            .expect("open wrapper");
+
+        let mut helper_pid: Option<libc::pid_t> = None;
+        for _ in 0..200 {
+            if let Ok(raw) = std::fs::read_to_string(&helper_pid_file) {
+                let trimmed = raw.trim();
+                if !trimmed.is_empty() {
+                    helper_pid = Some(trimmed.parse().expect("integer pid"));
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let helper_pid = helper_pid.expect("helper pid recorded before timeout");
+
+        // `close()` hangs at `child.wait()` because the wrapper
+        // ignores stdin EOF. tokio::time::timeout drops the inner
+        // future on elapsed, which is the cancellation path under
+        // test.
+        let timeout_result =
+            tokio::time::timeout(std::time::Duration::from_millis(200), source.close()).await;
+        assert!(
+            timeout_result.is_err(),
+            "close should have been cancelled by timeout, got {timeout_result:?}",
+        );
+
+        // The local cleanup guard inside close() must have killpg'd
+        // when the future was dropped, so the helper should be gone.
+        let mut gone = false;
+        for _ in 0..200 {
+            let r = unsafe { libc::kill(helper_pid, 0) };
+            if r == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+                gone = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(
+            gone,
+            "helper pid {helper_pid} survived close() cancellation — group cleanup did not run"
         );
     }
 }
