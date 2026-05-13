@@ -40,8 +40,9 @@ pub use openai_proxy::{
 };
 pub use plan::VmHttpPlanService;
 use plan::{
-    is_plans_collection_target, parse_plan_id_target, parse_plan_reviews_target,
-    route_plan_id_request, route_plan_reviews_request, route_plans_collection_request,
+    is_plans_collection_target, parse_plan_addenda_target, parse_plan_id_target,
+    parse_plan_reviews_target, route_plan_addenda_request, route_plan_id_request,
+    route_plan_reviews_request, route_plans_collection_request,
 };
 use proxy_common::{
     ClaudeBackend, OpenAiBackend, ProxyAuditDecision, ProxyBackend, ProxyStream,
@@ -1262,6 +1263,17 @@ fn route_request_body_limit<S: SecretStore + Send + Sync + 'static>(
         // generous headroom.
         return Some(6 * crate::agent_plan::MAX_PLAN_FEEDBACK_BYTES + 1024);
     }
+    if parse_plan_addenda_target(&request.target).is_some()
+        && request.method == "POST"
+        && services.plans.is_some()
+    {
+        // `AddendumSubmission.body` reuses the `PlanBody` newtype, so
+        // the cap mirrors the plans collection route: any non-empty
+        // UTF-8 ≤ `MAX_PLAN_BODY_BYTES` with 6:1 worst-case JSON
+        // expansion for ASCII control bytes. The envelope
+        // (`{"body":""}`) is trivial; 1 KiB headroom is plenty.
+        return Some(6 * crate::agent_plan::MAX_PLAN_BODY_BYTES + 1024);
+    }
     None
 }
 
@@ -1319,15 +1331,25 @@ where
             .into();
     }
 
-    // `parse_plan_reviews_target` runs before `parse_plan_id_target`
-    // for readability — the two parsers are disjoint (the id-only
-    // parser rejects any suffix containing a `/`), so ordering here
-    // does not affect correctness.
+    // `parse_plan_reviews_target` and `parse_plan_addenda_target`
+    // run before `parse_plan_id_target` for readability — the
+    // sub-route parsers and the id-only parser are disjoint (the
+    // id-only parser rejects any suffix containing a `/`), so
+    // ordering here does not affect correctness.
     if let Some(plan_id) = parse_plan_reviews_target(&request.target) {
         let Some(service) = services.plans else {
             return VmHttpResponse::text(VmHttpStatus::NotFound, "not found").into();
         };
         return route_plan_reviews_request(session, request, body, plan_id, service)
+            .await
+            .into();
+    }
+
+    if let Some(plan_id) = parse_plan_addenda_target(&request.target) {
+        let Some(service) = services.plans else {
+            return VmHttpResponse::text(VmHttpStatus::NotFound, "not found").into();
+        };
+        return route_plan_addenda_request(session, request, body, plan_id, service)
             .await
             .into();
     }
