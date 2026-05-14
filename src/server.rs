@@ -7,7 +7,7 @@
 //!
 //! The testable core is [`dispatch_message`]: it takes a [`ClientMessage`]
 //! and shared broker state, and returns a [`ServerMessage`]. Socket I/O
-//! lives in [`handle_connection`] and only calls [`dispatch_message`].
+//! lives in `handle_connection` and only calls [`dispatch_message`].
 //! All tests exercise [`dispatch_message`] directly.
 
 use std::io;

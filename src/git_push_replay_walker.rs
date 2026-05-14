@@ -422,7 +422,7 @@ pub enum BranchCreationPlanError {
     /// The `git rev-list` subprocess itself failed (unknown SHA,
     /// missing staging repo, IO error, exit-status non-zero).
     ///
-    /// We stringify the underlying [`CleanGitError`] rather than
+    /// We stringify the underlying `CleanGitError` rather than
     /// re-exporting it: the clean-git module is `pub(crate)` and
     /// publishing one of its variants here would force the entire
     /// hardening helper out into the public surface. Callers in

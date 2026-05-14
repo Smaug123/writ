@@ -10,17 +10,15 @@ use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
 
-use writ::agent_plan::{PlanId, Stage};
 use writ::agent_run::{
     AgentProcessPlan, AgentPrompt, AgentRunId, AgentRunTerminalStatus, run_agent_process,
 };
-use writ::bailiff::{compose_effective_prompt, stage_consumes_plan_body};
+use writ::bailiff::fetch_effective_prompt;
 use writ::core::AgentKind;
 use writ::vm_client::{
     VM_BROKER_TOKEN_ENV, VM_BROKER_URL_ENV, VmClientConfig, VmClientConfigError, VmGitCloneCommand,
     VmGitPushCommand, VmWorkspaceInitCommand, clone_from_broker, fetch_agent_run_config,
-    fetch_plan, get_session_json, init_workspace_from_broker, push_to_broker,
-    upload_agent_run_outcome,
+    get_session_json, init_workspace_from_broker, push_to_broker, upload_agent_run_outcome,
 };
 use writ::vm_git::{GitBranchName, GitCloneRef, GitCloneRepo, GitObjectId, WorkspaceWarmMode};
 
@@ -115,7 +113,7 @@ enum WorkspaceCmd {
     Init {
         /// Repository in owner/name form.
         repo: String,
-        /// Destination checkout path. Defaults to /workspace/<repo-name>.
+        /// Destination checkout path. Defaults to `/workspace/<repo-name>`.
         destination: Option<PathBuf>,
         /// Warmup level to complete before returning.
         #[arg(long, default_value = "devshell")]
@@ -241,8 +239,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 let (prompt, model, stage, read_plan_id) =
                     fetch_agent_run_config(&config, run_id).await?;
                 let effective_prompt =
-                    fetch_and_compose_effective_prompt(&config, &prompt, stage, read_plan_id)
-                        .await?;
+                    fetch_effective_prompt(&config, &prompt, stage, read_plan_id).await?;
                 run_stage_agent(
                     agent,
                     run_id,
@@ -297,26 +294,6 @@ fn parse_agent_kind(raw: &str) -> Result<AgentKind, String> {
 fn parse_agent_run_id(raw: &str) -> Result<AgentRunId, Box<dyn std::error::Error>> {
     raw.parse()
         .map_err(|error| format!("invalid agent run ID {raw:?}: {error}").into())
-}
-
-async fn fetch_and_compose_effective_prompt(
-    config: &VmClientConfig,
-    prompt: &AgentPrompt,
-    stage: Stage,
-    read_plan_id: Option<PlanId>,
-) -> Result<AgentPrompt, Box<dyn std::error::Error>> {
-    // Fetch the plan iff `compose_effective_prompt` will consume it.
-    // The predicate lives next to the dispatcher so the two cannot
-    // drift (`stage_consumes_plan_body_agrees_with_compose_effective_prompt`
-    // pins them together).
-    let plan_view = match read_plan_id {
-        Some(plan_id) if stage_consumes_plan_body(stage) => {
-            Some(fetch_plan(config, plan_id).await?)
-        }
-        _ => None,
-    };
-    let effective = compose_effective_prompt(prompt, stage, plan_view.as_ref().map(|p| &p.body))?;
-    Ok(effective)
 }
 
 async fn run_stage_agent(

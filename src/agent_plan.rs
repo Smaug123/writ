@@ -596,7 +596,7 @@ pub enum DeciderError {
     EmbeddedNul,
 }
 
-/// Free-form attribution recorded against a [`PlanDecision`]: who (or
+/// Free-form attribution recorded against a [`DecisionView`]: who (or
 /// what) the operator surface says made the call. Per §"Plan lifecycle",
 /// today the host CLI writes `cli:<user>`; a future orchestrator agent
 /// will write `agent:<run_id>`. The broker treats the string as opaque

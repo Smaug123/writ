@@ -351,7 +351,7 @@ pub enum ClientMessage {
     /// Replies with [`ServerMessage::StagedPushes`].
     ///
     /// Empty struct rather than unit variant so the enum-level
-    /// `deny_unknown_fields` applies. See [`ListAgentVms`].
+    /// `deny_unknown_fields` applies. See [`ClientMessage::ListAgentVms`].
     ListStagedPushes {},
     /// Look up one VM-staged push by request id. Replies with
     /// [`ServerMessage::StagedPush`] on hit and

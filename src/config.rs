@@ -54,7 +54,7 @@ use crate::vm_http::{
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DaemonConfig {
-    /// Agent-keyed GitHub Apps. The session's [`AgentKind`] selects which App
+    /// Agent-keyed GitHub Apps. The session's [`crate::core::AgentKind`] selects which App
     /// mints tokens. Must contain at least one entry; sessions whose
     /// `agent_kind` is absent or has no entry here are refused at request
     /// time.
@@ -71,7 +71,7 @@ pub struct DaemonConfig {
     #[serde(default = "default_secret_store_config")]
     pub secret_store: SecretStoreConfig,
     /// Override the default Unix socket path. If absent, uses
-    /// `$XDG_RUNTIME_DIR/writ/writd.sock` (see [`server::default_socket_path`]).
+    /// `$XDG_RUNTIME_DIR/writ/writd.sock` (see [`crate::server::default_socket_path`]).
     #[serde(default)]
     pub socket_path: Option<PathBuf>,
     /// Override the default audit DB path. If absent, uses

@@ -11,7 +11,7 @@
 //! ## Functional core
 //!
 //! The bytes-to-objects translation lives in
-//! [`crate::git_push_replay_object_parse`] — pure functions over
+//! `crate::git_push_replay_object_parse` — pure functions over
 //! `&[u8]` so property tests can drive them without any I/O. This
 //! module is purely the imperative shell that hands them the bytes a
 //! `git cat-file --batch` reply produced.
@@ -100,7 +100,7 @@ struct CatFileChild {
 pub enum OpenError {
     /// The `git` program could not be located or canonicalized under
     /// the same rules the rest of the replay pipeline uses. The
-    /// underlying [`CleanGitError`] is stringified to keep the
+    /// underlying `CleanGitError` is stringified to keep the
     /// hardening module's variants out of the public surface.
     #[error("could not resolve git program: {0}")]
     GitProgram(String),
@@ -127,7 +127,7 @@ impl CatFileObjectSource {
     /// hardened clean-Git environment.
     ///
     /// The child runs from `/`, has its environment cleared down to
-    /// the four [`CLEAN_GIT_CONFIG_ENV`] entries, and is placed in a
+    /// the four `CLEAN_GIT_CONFIG_ENV` entries, and is placed in a
     /// fresh process group so a runaway helper cannot outlive its
     /// leader. The source's [`Drop`] impl sends SIGKILL to the
     /// *process group* (`killpg`), not just the leader pid; this is
@@ -196,7 +196,7 @@ impl CatFileObjectSource {
     ///
     /// Cancellation safety: from the moment we take ownership of
     /// the child the source's outer [`Drop`] is disarmed (`inner`
-    /// is `None`), so a local [`PgidCleanupGuard`] takes over and
+    /// is `None`), so a local `PgidCleanupGuard` takes over and
     /// SIGKILLs the process group if anything between here and the
     /// final `disarm()` panics or has its await cancelled.
     pub async fn close(mut self) -> io::Result<()> {
