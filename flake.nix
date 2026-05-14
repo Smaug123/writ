@@ -45,7 +45,7 @@
           version = "0.1.0";
           src = mkRustSource pkgs;
           cargoLock.lockFile = ./Cargo.lock;
-          nativeCheckInputs = [ pkgs.git ];
+          nativeCheckInputs = [ pkgs.git pkgs.procps ];
           inherit cargoBuildFeatures cargoBuildFlags cargoBuildNoDefaultFeatures doCheck;
         };
 

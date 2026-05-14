@@ -888,17 +888,18 @@ mod tests {
     /// is that the helper received SIGKILL; both "gone" and "zombie"
     /// satisfy that, so we ask `ps` for the process state directly.
     fn helper_has_been_killed(pid: libc::pid_t) -> bool {
+        // `ps` is a hard test dependency (provided by `procps` on Linux,
+        // shipped with the OS on macOS). If we can't spawn it, the test
+        // result would be meaningless — silently treating that as "still
+        // alive" once produced a misleading "helper survived" failure on
+        // NixOS when procps wasn't in nativeCheckInputs. Fail loudly.
         let output = std::process::Command::new("ps")
             .args(["-p", &pid.to_string(), "-o", "stat="])
-            .output();
-        match output {
-            Ok(o) => {
-                let stat = String::from_utf8_lossy(&o.stdout);
-                let stat = stat.trim();
-                stat.is_empty() || stat.starts_with('Z')
-            }
-            Err(_) => false,
-        }
+            .output()
+            .expect("spawn `ps` to inspect helper state");
+        let stat = String::from_utf8_lossy(&output.stdout);
+        let stat = stat.trim();
+        stat.is_empty() || stat.starts_with('Z')
     }
 
     async fn wait_until_helper_killed(pid: libc::pid_t) -> bool {
