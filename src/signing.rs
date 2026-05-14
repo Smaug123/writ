@@ -64,11 +64,20 @@ impl WritSigningKey {
     /// PRIVATE KEY-----`…). The key must be unencrypted — writ does
     /// not currently prompt for passphrases — and must use an
     /// algorithm enabled in the `ssh-key` Cargo feature set
-    /// (Ed25519 today).
+    /// (Ed25519 today). RSA, ECDSA, DSA keys parse on the wire but
+    /// cannot sign without their respective `ssh-key` features
+    /// turned on; we reject them here so the misconfiguration shows
+    /// up at boot rather than on the first run-agent call.
     pub fn from_openssh_pem(pem: &str) -> Result<Self, WritSigningKeyError> {
         let inner = PrivateKey::from_openssh(pem).map_err(WritSigningKeyError::ParseOpenSsh)?;
         if inner.is_encrypted() {
             return Err(WritSigningKeyError::Encrypted);
+        }
+        let alg = inner.algorithm();
+        if !matches!(alg, ssh_key::Algorithm::Ed25519) {
+            return Err(WritSigningKeyError::UnsupportedAlgorithm {
+                algorithm: alg.as_str().to_string(),
+            });
         }
         Ok(Self { inner })
     }
@@ -150,6 +159,11 @@ pub enum WritSigningKeyError {
     ParseOpenSsh(ssh_key::Error),
     #[error("private key is passphrase-encrypted; writ does not support encrypted keys")]
     Encrypted,
+    #[error(
+        "private key uses algorithm {algorithm:?}, which is not enabled in this build of writ \
+         (only Ed25519 is supported today)"
+    )]
+    UnsupportedAlgorithm { algorithm: String },
     #[error("SSHSIG sign failed: {0}")]
     Sign(ssh_key::Error),
     #[error("SSHSIG PEM encoding failed: {0}")]
@@ -183,6 +197,12 @@ mod tests {
     /// branch in `from_openssh_pem`; never used for any signing.
     const ENCRYPTED_PRIVATE_PEM: &str =
         include_str!("../tests/fixtures/ed25519_test_encrypted.key");
+    /// Real OpenSSH-format RSA private key, used solely to exercise the
+    /// unsupported-algorithm branch in `from_openssh_pem`. Until the
+    /// `rsa` Cargo feature is enabled on `ssh-key`, this key cannot
+    /// produce signatures — so loading it must fail at construction
+    /// rather than only when `sign()` is first called.
+    const RSA_PRIVATE_PEM: &str = include_str!("../tests/fixtures/rsa_test_load_only.key");
 
     /// SHA-256 fingerprint produced by `ssh-keygen -lf` on the fixture
     /// public key. Pinning this in a test catches accidental
@@ -326,6 +346,25 @@ mod tests {
             matches!(err, WritSigningKeyError::ParseOpenSsh(_)),
             "got: {err:?}"
         );
+    }
+
+    /// An OpenSSH-format key whose algorithm is not enabled in the
+    /// `ssh-key` Cargo feature set (today: anything other than
+    /// Ed25519, e.g. RSA) parses on the wire but cannot sign. Reject
+    /// at load time so a misconfigured key surfaces at boot, not on
+    /// the first run-agent call.
+    #[test]
+    fn rsa_private_key_is_rejected_at_load_time() {
+        let err = WritSigningKey::from_openssh_pem(RSA_PRIVATE_PEM).unwrap_err();
+        match err {
+            WritSigningKeyError::UnsupportedAlgorithm { ref algorithm } => {
+                assert!(
+                    algorithm.contains("rsa") || algorithm.contains("RSA"),
+                    "algorithm label should mention RSA, got {algorithm:?}"
+                );
+            }
+            other => panic!("expected UnsupportedAlgorithm, got {other:?}"),
+        }
     }
 
     /// Distinct messages must yield distinct signatures (Ed25519 is
