@@ -48,6 +48,8 @@ pub mod protocol;
 pub mod secret;
 #[cfg(feature = "host")]
 pub mod server;
+#[cfg(feature = "host")]
+pub mod signing;
 pub mod telemetry;
 #[cfg(feature = "host")]
 pub mod ui_http;
