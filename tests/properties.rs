@@ -432,8 +432,11 @@ fn arb_plan_feedback() -> impl Strategy<Value = PlanFeedback> {
 }
 
 fn arb_plan_abort_reason() -> impl Strategy<Value = PlanAbortReason> {
-    ".{1,128}"
-        .prop_map(|s| PlanAbortReason::try_new(s).expect("regex produces non-empty bounded body"))
+    // NULs are excluded because the newtype rejects them at the parse
+    // boundary to match the audit-schema CHECK on `plan_abort.reason`.
+    "[^\\x00]{1,128}".prop_map(|s| {
+        PlanAbortReason::try_new(s).expect("regex produces non-empty NUL-free bounded body")
+    })
 }
 
 fn arb_stage() -> impl Strategy<Value = Stage> {

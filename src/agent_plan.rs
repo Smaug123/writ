@@ -401,6 +401,8 @@ pub enum PlanAbortReasonError {
     Empty,
     #[error("plan abort reason is {byte_len} bytes, exceeding the {max_bytes}-byte limit")]
     TooLarge { byte_len: usize, max_bytes: usize },
+    #[error("plan abort reason contains an embedded NUL byte")]
+    EmbeddedNul,
 }
 
 impl PlanAbortReason {
@@ -414,6 +416,15 @@ impl PlanAbortReason {
                 byte_len: reason.len(),
                 max_bytes: MAX_PLAN_ABORT_REASON_BYTES,
             });
+        }
+        // Mirror the audit-schema CHECK on `plan_abort.reason`: an
+        // embedded NUL is a parse error at the boundary, not a SQLite
+        // CHECK failure surfaced from inside the DAO. Aborts are
+        // free-text prose, so a NUL is never anyone's intent;
+        // rejecting at the typed boundary lets the DAO assume the
+        // invariant.
+        if reason.as_bytes().contains(&0) {
+            return Err(PlanAbortReasonError::EmbeddedNul);
         }
         Ok(Self(reason))
     }
@@ -1279,6 +1290,18 @@ mod tests {
             PlanAbortReason::try_new(too_big),
             Err(PlanAbortReasonError::TooLarge { .. })
         ));
+    }
+
+    #[test]
+    fn plan_abort_reason_rejects_embedded_nul() {
+        assert!(matches!(
+            PlanAbortReason::try_new("ok\0nit"),
+            Err(PlanAbortReasonError::EmbeddedNul)
+        ));
+        // Also reject NULs that arrive via JSON `\u0000`: the parser
+        // should refuse at the typed boundary, not slip through to the
+        // DB CHECK.
+        assert!(serde_json::from_str::<PlanAbortReason>("\"ok\\u0000nit\"").is_err());
     }
 
     // --- Closed enums --------------------------------------------------------

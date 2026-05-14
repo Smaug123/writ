@@ -1,15 +1,18 @@
-//! Plan submission audit DAO. One row per planner-run plan body, per
-//! `docs/plans/2026-05-11-agent-plans.md`. Reviews, decisions, addenda,
-//! and aborts are deferred to later slices; this module persists only
-//! the plan itself.
+//! Plan-lifecycle audit DAO. One row per planner-run plan body plus the
+//! attached review/decision/addendum/abort stream, per
+//! `docs/plans/2026-05-11-agent-plans.md`. Each event type has its own
+//! record/get/list (or get-only, where the PRIMARY KEY enforces
+//! at-most-one) shape; the table definitions live in the v1/v2/v3
+//! migrations and the triggers reassert the route preconditions on raw
+//! INSERT.
 
 use rusqlite::{OptionalExtension, Row, params};
 
 use super::validation::validate_sha256_hex;
 use super::{AuditError, AuditLog};
 use crate::agent_plan::{
-    AddendumId, CorrelationId, Decider, DecisionOutcome, PlanBody, PlanBodyError, PlanFeedback,
-    PlanFeedbackError, PlanId, ReviewId, Verdict,
+    AddendumId, CorrelationId, Decider, DecisionOutcome, PlanAbortReason, PlanAbortReasonError,
+    PlanBody, PlanBodyError, PlanFeedback, PlanFeedbackError, PlanId, ReviewId, Verdict,
 };
 use crate::agent_run::AgentRunId;
 use crate::core::{SessionId, UnixMillis};
@@ -67,6 +70,23 @@ pub struct PlanAddendumRecord {
     pub agent_run_id: AgentRunId,
     pub submitted_at: UnixMillis,
     pub body: PlanBody,
+}
+
+/// One terminal `plan_abort` row: an execute-stage agent run signalling
+/// that the accepted plan is fundamentally unworkable mid-execution.
+/// Per §"Plan lifecycle" exactly one of these may exist per plan; the
+/// PRIMARY KEY on `plan_id` enforces the at-most-one invariant at the
+/// DB level — a second `record_plan_abort` against the same plan
+/// surfaces as a UNIQUE constraint violation rather than silently
+/// overwriting the original signal. The row exists to give the operator
+/// a queryable durable signal; it does not by itself mutate the plan
+/// decision.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PlanAbortRecord {
+    pub plan_id: PlanId,
+    pub agent_run_id: AgentRunId,
+    pub aborted_at: UnixMillis,
+    pub reason: PlanAbortReason,
 }
 
 /// Body-less summary returned by [`AuditLog::list_plans`]. The listing
@@ -633,6 +653,120 @@ impl AuditLog {
             Ok(out)
         })
     }
+
+    /// Record one `plan_abort` row. The plan and executor agent run are
+    /// pre-checked in the same transaction so callers see a typed
+    /// `AuditError::Invariant` for each failure mode rather than a raw
+    /// "FOREIGN KEY constraint failed" or trigger-message string.
+    ///
+    /// Session, stage, and read-plan binding are belt-and-braces: the
+    /// broker route enforces them up front, this pre-check restates
+    /// them for readable errors, and the v3 triggers
+    /// (`plan_abort_requires_open_session`,
+    /// `plan_abort_requires_executor_run`) catch any raw INSERT that
+    /// bypasses both layers.
+    ///
+    /// Unlike `plan_addendum`, an accepted decision is *not* a
+    /// precondition. Per `docs/plans/2026-05-11-agent-plans.md`
+    /// §"Protocol additions" the abort route auth is just
+    /// `run.stage = 'execute' AND run.read_plan_id = <plan_id>`; the
+    /// matching pure gate in
+    /// [`crate::agent_plan::route_permitted_by_stage_and_decision`]
+    /// documents the same choice. (An execute-stage run could only
+    /// have launched against an accepted plan in the first place, so
+    /// duplicating the check here would only fire on a forged raw
+    /// INSERT path.)
+    ///
+    /// A second abort against the same plan surfaces as a SQLite
+    /// UNIQUE / PRIMARY KEY constraint violation; callers may map that
+    /// wire-side to "plan already aborted" rather than silently
+    /// overwriting the original signal.
+    pub fn record_plan_abort(&self, r: &PlanAbortRecord) -> Result<(), AuditError> {
+        self.with_conn_mut(|c| {
+            let tx = c.transaction()?;
+
+            let plan_exists: Option<i64> = tx
+                .query_row(
+                    "SELECT 1 FROM plan WHERE plan_id = ?1",
+                    params![r.plan_id.as_uuid().to_string()],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if plan_exists.is_none() {
+                return Err(AuditError::Invariant("plan does not exist"));
+            }
+
+            let agent_run: Option<(String, Option<i64>, String, Option<String>)> = tx
+                .query_row(
+                    "SELECT ar.session_id, s.closed_at, ar.stage, ar.read_plan_id
+                     FROM agent_run ar
+                     JOIN session s ON s.session_id = ar.session_id
+                     WHERE ar.run_id = ?1",
+                    params![r.agent_run_id.as_uuid().to_string()],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .optional()?;
+            let plan_id_str = r.plan_id.as_uuid().to_string();
+            match agent_run {
+                None => return Err(AuditError::Invariant("agent run does not exist")),
+                Some((_, Some(_), _, _)) => {
+                    return Err(AuditError::Invariant("session is closed"));
+                }
+                Some((_, None, ref stage, _)) if stage != "execute" => {
+                    return Err(AuditError::Invariant(
+                        "plan_abort requires agent_run.stage = 'execute'",
+                    ));
+                }
+                // The route contract requires `run.read_plan_id =
+                // <plan_id>`; restate it here so an executor that read
+                // plan A cannot abort plan B. The matching trigger is
+                // the last line of defence against a raw INSERT.
+                Some((_, None, _, ref read_plan_id))
+                    if read_plan_id.as_deref() != Some(&plan_id_str) =>
+                {
+                    return Err(AuditError::Invariant(
+                        "plan_abort requires agent_run.read_plan_id = plan_id",
+                    ));
+                }
+                Some(_) => {}
+            }
+
+            tx.execute(
+                "INSERT INTO plan_abort (
+                     plan_id,
+                     agent_run_id,
+                     aborted_at,
+                     reason
+                 ) VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    r.plan_id.as_uuid().to_string(),
+                    r.agent_run_id.as_uuid().to_string(),
+                    r.aborted_at.as_millis(),
+                    r.reason.as_str(),
+                ],
+            )?;
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
+    /// Look up the hard-abort for one plan, if any. Returns `Ok(None)`
+    /// for "plan exists but has not been aborted" and for "plan does
+    /// not exist" — callers distinguish via `get_plan` if they need to.
+    pub fn get_plan_abort(&self, plan_id: PlanId) -> Result<Option<PlanAbortRecord>, AuditError> {
+        self.with_conn(|c| {
+            let row = c
+                .query_row(
+                    "SELECT plan_id, agent_run_id, aborted_at, reason
+                     FROM plan_abort
+                     WHERE plan_id = ?1",
+                    params![plan_id.as_uuid().to_string()],
+                    plan_abort_from_row,
+                )
+                .optional()?;
+            row.transpose()
+        })
+    }
 }
 
 fn plan_from_row(row: &Row<'_>) -> rusqlite::Result<Result<PlanSubmissionRecord, AuditError>> {
@@ -803,6 +937,36 @@ fn plan_addendum_from_row(
             agent_run_id: AgentRunId::from_uuid(agent_run_id),
             submitted_at: UnixMillis::from_millis(submitted_at),
             body,
+        })
+    };
+    Ok(parse())
+}
+
+fn plan_abort_from_row(row: &Row<'_>) -> rusqlite::Result<Result<PlanAbortRecord, AuditError>> {
+    let plan_id_str: String = row.get(0)?;
+    let agent_run_id_str: String = row.get(1)?;
+    let aborted_at: i64 = row.get(2)?;
+    let reason_text: String = row.get(3)?;
+
+    let parse = || -> Result<PlanAbortRecord, AuditError> {
+        let plan_id = uuid::Uuid::parse_str(&plan_id_str)
+            .map_err(|_| AuditError::Invariant("plan_abort row: plan_id not a uuid"))?;
+        let agent_run_id = uuid::Uuid::parse_str(&agent_run_id_str)
+            .map_err(|_| AuditError::Invariant("plan_abort row: agent_run_id not a uuid"))?;
+        let reason = PlanAbortReason::try_new(reason_text).map_err(|e| match e {
+            PlanAbortReasonError::Empty => AuditError::Invariant("plan_abort row: reason is empty"),
+            PlanAbortReasonError::TooLarge { .. } => {
+                AuditError::Invariant("plan_abort row: reason exceeds size limit")
+            }
+            PlanAbortReasonError::EmbeddedNul => {
+                AuditError::Invariant("plan_abort row: reason contains embedded NUL")
+            }
+        })?;
+        Ok(PlanAbortRecord {
+            plan_id: PlanId::from_uuid(plan_id),
+            agent_run_id: AgentRunId::from_uuid(agent_run_id),
+            aborted_at: UnixMillis::from_millis(aborted_at),
+            reason,
         })
     };
     Ok(parse())
@@ -3031,6 +3195,523 @@ mod tests {
         assert!(
             rendered.contains("not null"),
             "expected NOT NULL violation on addendum_id, got {err}"
+        );
+    }
+
+    // --- plan_abort DAO ------------------------------------------------
+
+    fn sample_abort_record(
+        log: &AuditLog,
+        session_id: SessionId,
+        plan_id: PlanId,
+        reason: PlanAbortReason,
+    ) -> PlanAbortRecord {
+        let executor = sample_executor_run(log, session_id, plan_id);
+        PlanAbortRecord {
+            plan_id,
+            agent_run_id: executor,
+            aborted_at: UnixMillis::from_millis(1_700_000_400),
+            reason,
+        }
+    }
+
+    /// Happy path: an abort against an executor run for an accepted
+    /// plan round-trips with the reason intact.
+    #[test]
+    fn plan_abort_roundtrips() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+        let plan_id = accepted_plan(&log, s.session_id);
+        let reason =
+            PlanAbortReason::try_new("plan assumes a library version we don't ship").unwrap();
+        let record = sample_abort_record(&log, s.session_id, plan_id, reason);
+
+        log.record_plan_abort(&record).unwrap();
+
+        let read = log.get_plan_abort(record.plan_id).unwrap().unwrap();
+        assert_eq!(read, record);
+    }
+
+    /// An abort against a plan whose decision is still pending is
+    /// permitted by the DAO: the spec (§"Protocol additions") explicitly
+    /// drops the acceptance check from the abort route's auth, and the
+    /// matching pure gate
+    /// (`agent_plan::route_permitted_by_stage_and_decision`) documents
+    /// the same choice. The audit layer must agree.
+    #[test]
+    fn plan_abort_accepts_undecided_plan() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+        // No decision yet.
+        let plan_id = submitted_plan(&log, s.session_id);
+        let record = sample_abort_record(
+            &log,
+            s.session_id,
+            plan_id,
+            PlanAbortReason::try_new("bail").unwrap(),
+        );
+
+        log.record_plan_abort(&record).unwrap();
+        assert_eq!(log.get_plan_abort(plan_id).unwrap().unwrap(), record);
+    }
+
+    /// Mirror of the undecided case: an abort against a plan that was
+    /// rejected_restart is also permitted. (In practice no executor
+    /// would ever launch against a rejected plan, but the audit layer
+    /// must not gate on acceptance per the spec.)
+    #[test]
+    fn plan_abort_accepts_rejected_plan() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+        let plan_id = submitted_plan(&log, s.session_id);
+        log.record_plan_decision(&PlanDecisionRecord {
+            plan_id,
+            decided_at: UnixMillis::from_millis(1_700_000_350),
+            outcome: DecisionOutcome::RejectedRestart,
+            decider: Decider::try_new("cli:alice").unwrap(),
+        })
+        .unwrap();
+        let record = sample_abort_record(
+            &log,
+            s.session_id,
+            plan_id,
+            PlanAbortReason::try_new("bail").unwrap(),
+        );
+
+        log.record_plan_abort(&record).unwrap();
+        assert_eq!(log.get_plan_abort(plan_id).unwrap().unwrap(), record);
+    }
+
+    /// `get_plan_abort` returns `None` for plans that exist but have
+    /// not been aborted, and for plans that don't exist at all.
+    #[test]
+    fn get_plan_abort_returns_none_for_unaborted_and_missing_plans() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+        let unaborted = accepted_plan(&log, s.session_id);
+        assert!(log.get_plan_abort(unaborted).unwrap().is_none());
+        assert!(log.get_plan_abort(PlanId::new()).unwrap().is_none());
+    }
+
+    /// An abort against a plan that doesn't exist surfaces as a clean
+    /// invariant error rather than a raw foreign-key string.
+    #[test]
+    fn plan_abort_rejects_missing_plan() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+
+        let executor = AgentRunId::new();
+        log.record_agent_run(&AgentRunAuditRecord {
+            run_id: executor,
+            session_id: s.session_id,
+            requested_at: UnixMillis::from_millis(1_700_000_360),
+            agent_kind: AgentKind::Claude,
+            prompt: AgentPrompt::new("execute this plan").summary(),
+            correlation_id: None,
+            stage: Stage::Execute,
+            read_plan_id: None,
+        })
+        .unwrap();
+
+        let err = log
+            .record_plan_abort(&PlanAbortRecord {
+                plan_id: PlanId::new(),
+                agent_run_id: executor,
+                aborted_at: UnixMillis::from_millis(1_700_000_400),
+                reason: PlanAbortReason::try_new("bail").unwrap(),
+            })
+            .unwrap_err();
+        assert!(matches!(err, AuditError::Invariant("plan does not exist")));
+    }
+
+    /// An abort referencing a non-existent `agent_run_id` is a clean
+    /// invariant rather than a raw FK string.
+    #[test]
+    fn plan_abort_rejects_missing_agent_run() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+        let plan_id = accepted_plan(&log, s.session_id);
+
+        let err = log
+            .record_plan_abort(&PlanAbortRecord {
+                plan_id,
+                agent_run_id: AgentRunId::new(),
+                aborted_at: UnixMillis::from_millis(1_700_000_400),
+                reason: PlanAbortReason::try_new("bail").unwrap(),
+            })
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            AuditError::Invariant("agent run does not exist")
+        ));
+    }
+
+    /// An executor whose session has been closed cannot land an abort.
+    /// The DAO pre-check surfaces a typed invariant rather than the
+    /// trigger's raw message.
+    #[test]
+    fn plan_abort_rejects_closed_executor_session() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+        let plan_id = accepted_plan(&log, s.session_id);
+        let executor = sample_executor_run(&log, s.session_id, plan_id);
+        log.close_session(s.session_id, UnixMillis::from_millis(1_700_000_390))
+            .unwrap();
+
+        let err = log
+            .record_plan_abort(&PlanAbortRecord {
+                plan_id,
+                agent_run_id: executor,
+                aborted_at: UnixMillis::from_millis(1_700_000_400),
+                reason: PlanAbortReason::try_new("bail").unwrap(),
+            })
+            .unwrap_err();
+        assert!(matches!(err, AuditError::Invariant("session is closed")));
+    }
+
+    /// Belt-and-braces: the session trigger fires on a raw INSERT that
+    /// bypasses the DAO pre-check.
+    #[test]
+    fn plan_abort_db_trigger_rejects_direct_insert_against_closed_session() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+        let plan_id = accepted_plan(&log, s.session_id);
+        let executor = sample_executor_run(&log, s.session_id, plan_id);
+        log.close_session(s.session_id, UnixMillis::from_millis(1_700_000_390))
+            .unwrap();
+
+        let err = log
+            .with_conn(|c| {
+                c.execute(
+                    "INSERT INTO plan_abort
+                     (plan_id, agent_run_id, aborted_at, reason)
+                     VALUES (?1, ?2, ?3, 'bail')",
+                    params![
+                        plan_id.as_uuid().to_string(),
+                        executor.as_uuid().to_string(),
+                        1_700_000_400_i64,
+                    ],
+                )?;
+                Ok(())
+            })
+            .unwrap_err();
+        let AuditError::Sqlite(e) = err else {
+            panic!("expected sqlite trigger error, got {err:?}");
+        };
+        assert!(
+            e.to_string().to_lowercase().contains("session is closed"),
+            "got: {e}"
+        );
+    }
+
+    /// A planner-stage run cannot post an abort: the DAO pre-check
+    /// surfaces a typed invariant.
+    #[test]
+    fn plan_abort_rejects_non_execute_stage_run() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+        let plan_id = accepted_plan(&log, s.session_id);
+        let planner: AgentRunId = log
+            .with_conn(|c| {
+                Ok(c.query_row(
+                    "SELECT agent_run_id FROM plan WHERE plan_id = ?1",
+                    params![plan_id.as_uuid().to_string()],
+                    |r| {
+                        let s: String = r.get(0)?;
+                        Ok(AgentRunId::from_uuid(uuid::Uuid::parse_str(&s).unwrap()))
+                    },
+                )?)
+            })
+            .unwrap();
+
+        let err = log
+            .record_plan_abort(&PlanAbortRecord {
+                plan_id,
+                agent_run_id: planner,
+                aborted_at: UnixMillis::from_millis(1_700_000_400),
+                reason: PlanAbortReason::try_new("bail").unwrap(),
+            })
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            AuditError::Invariant("plan_abort requires agent_run.stage = 'execute'")
+        ));
+    }
+
+    /// Belt-and-braces: the stage trigger fires on a raw INSERT.
+    #[test]
+    fn plan_abort_db_trigger_rejects_non_execute_stage_run() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+        let plan_id = accepted_plan(&log, s.session_id);
+        let planner: AgentRunId = log
+            .with_conn(|c| {
+                Ok(c.query_row(
+                    "SELECT agent_run_id FROM plan WHERE plan_id = ?1",
+                    params![plan_id.as_uuid().to_string()],
+                    |r| {
+                        let s: String = r.get(0)?;
+                        Ok(AgentRunId::from_uuid(uuid::Uuid::parse_str(&s).unwrap()))
+                    },
+                )?)
+            })
+            .unwrap();
+
+        let err = log
+            .with_conn(|c| {
+                c.execute(
+                    "INSERT INTO plan_abort
+                     (plan_id, agent_run_id, aborted_at, reason)
+                     VALUES (?1, ?2, ?3, 'bail')",
+                    params![
+                        plan_id.as_uuid().to_string(),
+                        planner.as_uuid().to_string(),
+                        1_700_000_400_i64,
+                    ],
+                )?;
+                Ok(())
+            })
+            .unwrap_err();
+        let AuditError::Sqlite(e) = err else {
+            panic!("expected sqlite trigger error, got {err:?}");
+        };
+        assert!(
+            e.to_string()
+                .contains("plan_abort requires agent_run.stage"),
+            "got: {e}"
+        );
+    }
+
+    /// The executor run's `read_plan_id` binds the abort to a single
+    /// plan: an executor that read plan A cannot abort plan B. Pre-check
+    /// surfaces this as a clean typed invariant.
+    #[test]
+    fn plan_abort_rejects_run_bound_to_a_different_plan() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+        let plan_a = accepted_plan(&log, s.session_id);
+        let plan_b = accepted_plan(&log, s.session_id);
+        let executor = sample_executor_run(&log, s.session_id, plan_a);
+
+        let err = log
+            .record_plan_abort(&PlanAbortRecord {
+                plan_id: plan_b,
+                agent_run_id: executor,
+                aborted_at: UnixMillis::from_millis(1_700_000_400),
+                reason: PlanAbortReason::try_new("bail").unwrap(),
+            })
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            AuditError::Invariant("plan_abort requires agent_run.read_plan_id = plan_id")
+        ));
+    }
+
+    /// Belt-and-braces: the trigger refuses the same cross-plan binding
+    /// on a raw INSERT.
+    #[test]
+    fn plan_abort_db_trigger_rejects_run_bound_to_a_different_plan() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+        let plan_a = accepted_plan(&log, s.session_id);
+        let plan_b = accepted_plan(&log, s.session_id);
+        let executor = sample_executor_run(&log, s.session_id, plan_a);
+
+        let err = log
+            .with_conn(|c| {
+                c.execute(
+                    "INSERT INTO plan_abort
+                     (plan_id, agent_run_id, aborted_at, reason)
+                     VALUES (?1, ?2, ?3, 'bail')",
+                    params![
+                        plan_b.as_uuid().to_string(),
+                        executor.as_uuid().to_string(),
+                        1_700_000_400_i64,
+                    ],
+                )?;
+                Ok(())
+            })
+            .unwrap_err();
+        let AuditError::Sqlite(e) = err else {
+            panic!("expected sqlite trigger error, got {err:?}");
+        };
+        assert!(e.to_string().contains("read_plan_id"), "got: {e}");
+    }
+
+    /// A second abort against the same plan surfaces as the PRIMARY KEY
+    /// UNIQUE violation. The wire layer can map that to "plan already
+    /// aborted" without silently overwriting the original signal.
+    #[test]
+    fn plan_abort_rejects_second_abort_for_same_plan() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+        let plan_id = accepted_plan(&log, s.session_id);
+
+        let first = sample_abort_record(
+            &log,
+            s.session_id,
+            plan_id,
+            PlanAbortReason::try_new("first").unwrap(),
+        );
+        log.record_plan_abort(&first).unwrap();
+
+        let second_executor = sample_executor_run(&log, s.session_id, plan_id);
+        let err = log
+            .record_plan_abort(&PlanAbortRecord {
+                plan_id,
+                agent_run_id: second_executor,
+                aborted_at: UnixMillis::from_millis(1_700_000_500),
+                reason: PlanAbortReason::try_new("second").unwrap(),
+            })
+            .unwrap_err();
+        let AuditError::Sqlite(e) = err else {
+            panic!("expected sqlite UNIQUE error, got {err:?}");
+        };
+        assert!(e.to_string().to_uppercase().contains("UNIQUE"), "got: {e}");
+    }
+
+    /// Belt-and-braces: a raw INSERT with an empty reason is refused by
+    /// the column CHECK before the row lands.
+    #[test]
+    fn plan_abort_check_rejects_empty_reason() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+        let plan_id = accepted_plan(&log, s.session_id);
+        let executor = sample_executor_run(&log, s.session_id, plan_id);
+
+        let err = log
+            .with_conn(|c| {
+                Ok(c.execute(
+                    "INSERT INTO plan_abort
+                     (plan_id, agent_run_id, aborted_at, reason)
+                     VALUES (?1, ?2, ?3, '')",
+                    params![
+                        plan_id.as_uuid().to_string(),
+                        executor.as_uuid().to_string(),
+                        1_700_000_400_i64,
+                    ],
+                )?)
+            })
+            .unwrap_err();
+        let rendered = err.to_string().to_lowercase();
+        assert!(
+            rendered.contains("check"),
+            "expected CHECK violation, got {err}"
+        );
+    }
+
+    /// Belt-and-braces: a raw INSERT exceeding the 4 KiB cap on
+    /// `reason` is refused by the column CHECK.
+    #[test]
+    fn plan_abort_check_rejects_oversize_reason() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+        let plan_id = accepted_plan(&log, s.session_id);
+        let executor = sample_executor_run(&log, s.session_id, plan_id);
+
+        let oversize = "x".repeat(crate::agent_plan::MAX_PLAN_ABORT_REASON_BYTES + 1);
+        let err = log
+            .with_conn(|c| {
+                Ok(c.execute(
+                    "INSERT INTO plan_abort
+                     (plan_id, agent_run_id, aborted_at, reason)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![
+                        plan_id.as_uuid().to_string(),
+                        executor.as_uuid().to_string(),
+                        1_700_000_400_i64,
+                        oversize,
+                    ],
+                )?)
+            })
+            .unwrap_err();
+        let rendered = err.to_string().to_lowercase();
+        assert!(
+            rendered.contains("check"),
+            "expected CHECK violation, got {err}"
+        );
+    }
+
+    /// Belt-and-braces: a raw INSERT with an embedded NUL byte in
+    /// `reason` is refused by the column CHECK. The typed
+    /// [`PlanAbortReason`] also rejects NULs at the boundary; this
+    /// asserts the schema is the second line of defence.
+    #[test]
+    fn plan_abort_check_rejects_embedded_nul_reason() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+        let plan_id = accepted_plan(&log, s.session_id);
+        let executor = sample_executor_run(&log, s.session_id, plan_id);
+
+        let err = log
+            .with_conn(|c| {
+                Ok(c.execute(
+                    "INSERT INTO plan_abort
+                     (plan_id, agent_run_id, aborted_at, reason)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![
+                        plan_id.as_uuid().to_string(),
+                        executor.as_uuid().to_string(),
+                        1_700_000_400_i64,
+                        // Bind a TEXT value with an embedded NUL — the
+                        // CHECK's `instr(... x'00') = 0` clause refuses
+                        // it before the row lands.
+                        rusqlite::types::Value::Text("ok\0nit".to_owned()),
+                    ],
+                )?)
+            })
+            .unwrap_err();
+        let rendered = err.to_string().to_lowercase();
+        assert!(
+            rendered.contains("check"),
+            "expected CHECK violation, got {err}"
+        );
+    }
+
+    /// Belt-and-braces: SQLite's v1/v2 compat quirk allows NULL in a
+    /// `TEXT PRIMARY KEY` column unless explicitly marked `NOT NULL`.
+    /// `plan_abort.plan_id` is declared `NOT NULL` for that reason; in
+    /// practice the executor-run trigger fires first (its `WHEN NOT
+    /// EXISTS` clause is `UNKNOWN` once `NEW.plan_id` is NULL), so this
+    /// test only asserts refusal — either layer is a correct refusal,
+    /// and dropping both would regress the schema's intent.
+    #[test]
+    fn plan_abort_rejects_null_plan_id_at_schema_boundary() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+        let plan_id = accepted_plan(&log, s.session_id);
+        let executor = sample_executor_run(&log, s.session_id, plan_id);
+
+        let err = log
+            .with_conn(|c| {
+                Ok(c.execute(
+                    "INSERT INTO plan_abort
+                     (plan_id, agent_run_id, aborted_at, reason)
+                     VALUES (NULL, ?1, ?2, 'bail')",
+                    params![executor.as_uuid().to_string(), 1_700_000_400_i64,],
+                )?)
+            })
+            .unwrap_err();
+        assert!(
+            matches!(err, AuditError::Sqlite(_)),
+            "expected schema refusal of NULL plan_id, got {err:?}"
         );
     }
 }
