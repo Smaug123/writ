@@ -1,7 +1,7 @@
 //! Daemon configuration loaded from a JSON file at startup.
 
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -182,22 +182,30 @@ pub struct AgentVmLifecycleConfig {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentVmHttpConfig {
+    #[serde(default = "default_vm_http_bind_addr")]
     pub bind_addr: Ipv4Addr,
     pub broker_port_min: u16,
     pub broker_port_max: u16,
+    #[serde(default = "default_vm_http_git_program")]
     pub git_program: PathBuf,
     #[serde(default = "default_git_clone_base_url")]
     pub git_clone_base_url: String,
     pub askpass_program: PathBuf,
     #[serde(default = "default_vm_git_token_env")]
     pub token_env: String,
+    #[serde(default = "default_vm_http_work_root")]
     pub work_root: PathBuf,
+    #[serde(default = "default_clone_timeout_secs")]
     pub clone_timeout_secs: u64,
+    #[serde(default = "default_max_bundle_bytes")]
     pub max_bundle_bytes: u64,
+    #[serde(default = "default_nix_cache_url")]
     pub nix_cache_url: String,
-    #[serde(default)]
+    #[serde(default = "default_nix_cache_trusted_public_keys")]
     pub nix_cache_trusted_public_keys: Vec<String>,
+    #[serde(default = "default_nix_cache_max_metadata_bytes")]
     pub nix_cache_max_metadata_bytes: u64,
+    #[serde(default = "default_nix_cache_max_nar_bytes")]
     pub nix_cache_max_nar_bytes: u64,
     #[serde(default)]
     pub claude_proxy: Option<AgentVmHttpClaudeProxyConfig>,
@@ -300,6 +308,18 @@ pub enum AgentVmHttpConfigError {
         path: PathBuf,
         source: std::io::Error,
     },
+    #[error("vm_http work root {path:?} could not be created at mode 0700: {source}")]
+    WorkRootCreate {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    #[error("vm_http work root {path:?} is not a directory")]
+    WorkRootNotDirectory { path: PathBuf },
+    #[error(
+        "vm_http work root {path:?} has group/world access bits (mode {mode:04o}); \
+         use a dedicated 0700 directory"
+    )]
+    WorkRootInsecure { path: PathBuf, mode: u32 },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -377,6 +397,14 @@ impl AgentVmHttpConfig {
             Duration::from_secs(self.clone_timeout_secs),
             self.max_bundle_bytes,
         )?;
+        // `prepare_git_work_root` refuses to clone into a work root whose mode
+        // has group/world bits set, but `validate_*_root` below creates the
+        // staging/log subdirs with `create_dir_all`, which propagates the
+        // process umask to the freshly-created `work_root` parent (typically
+        // 0755). Ensure work_root itself is 0700 before that runs so the
+        // out-of-the-box defaults — where the user never names `work_root`
+        // explicitly — survive the first clone request.
+        ensure_vm_http_work_root_private(&self.work_root)?;
         let trusted_public_keys =
             NixTrustedPublicKeys::from_strings(self.nix_cache_trusted_public_keys.clone())?;
         let nix_cache = VmHttpNixCacheConfig::new_with_trusted_public_keys(
@@ -449,6 +477,87 @@ impl AgentVmHttpOpenAiProxyConfig {
             self.max_response_bytes,
         )?)
     }
+}
+
+fn ensure_vm_http_work_root_private(path: &Path) -> Result<(), AgentVmHttpConfigError> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => return validate_existing_work_root(path, &metadata),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(source) => {
+            return Err(AgentVmHttpConfigError::WorkRootCreate {
+                path: path.to_path_buf(),
+                source,
+            });
+        }
+    }
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent).map_err(|source| {
+            AgentVmHttpConfigError::WorkRootCreate {
+                path: parent.to_path_buf(),
+                source,
+            }
+        })?;
+    }
+    let mut builder = std::fs::DirBuilder::new();
+    builder.mode(0o700);
+    match builder.create(path) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            // TOCTOU: the directory appeared between our existence check and
+            // the create. Validate it the same way as any pre-existing dir
+            // rather than fail; the alternative invents a phantom startup
+            // error whenever two daemons race on the default path.
+            let metadata = std::fs::symlink_metadata(path).map_err(|source| {
+                AgentVmHttpConfigError::WorkRootCreate {
+                    path: path.to_path_buf(),
+                    source,
+                }
+            })?;
+            return validate_existing_work_root(path, &metadata);
+        }
+        Err(source) => {
+            return Err(AgentVmHttpConfigError::WorkRootCreate {
+                path: path.to_path_buf(),
+                source,
+            });
+        }
+    }
+    // mode(0o700) is the requested mode; the process umask still applies, so
+    // set the final mode explicitly to keep the result reliably private.
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).map_err(|source| {
+        AgentVmHttpConfigError::WorkRootCreate {
+            path: path.to_path_buf(),
+            source,
+        }
+    })
+}
+
+fn validate_existing_work_root(
+    path: &Path,
+    metadata: &std::fs::Metadata,
+) -> Result<(), AgentVmHttpConfigError> {
+    use std::os::unix::fs::PermissionsExt;
+
+    // Mirror `prepare_git_work_root` so an existing dir with loose permissions
+    // fails fast at startup rather than letting the daemon boot and then
+    // rejecting every clone request at runtime.
+    if !metadata.is_dir() {
+        return Err(AgentVmHttpConfigError::WorkRootNotDirectory {
+            path: path.to_path_buf(),
+        });
+    }
+    let mode = metadata.permissions().mode();
+    if mode & 0o077 != 0 {
+        return Err(AgentVmHttpConfigError::WorkRootInsecure {
+            path: path.to_path_buf(),
+            mode: mode & 0o777,
+        });
+    }
+    Ok(())
 }
 
 fn validate_agent_run_log_root(path: PathBuf) -> Result<PathBuf, AgentVmHttpConfigError> {
@@ -572,6 +681,65 @@ fn default_vm_git_token_env() -> String {
 
 fn default_git_clone_base_url() -> String {
     DEFAULT_GIT_CLONE_BASE_URL.into()
+}
+
+fn default_vm_http_bind_addr() -> Ipv4Addr {
+    // The runtime config rejects any non-wildcard bind, so this is the only
+    // value that survives validation; expressing it as a default lets callers
+    // omit the field entirely instead of repeating the lone valid choice.
+    Ipv4Addr::UNSPECIFIED
+}
+
+fn default_vm_http_git_program() -> PathBuf {
+    PathBuf::from("git")
+}
+
+fn default_clone_timeout_secs() -> u64 {
+    300
+}
+
+fn default_max_bundle_bytes() -> u64 {
+    64 * 1024 * 1024
+}
+
+fn default_nix_cache_url() -> String {
+    "https://cache.nixos.org".into()
+}
+
+/// Default trusted public keys for the Nix substituter. Matches the
+/// `cache.nixos.org-1` key Nix itself ships, so a config that takes the default
+/// [`default_nix_cache_url`] can still verify the signed narinfos served from
+/// it. The guest wrapper writes this list verbatim into `trusted-public-keys`,
+/// which overrides Nix's built-in list — so an empty default would silently
+/// reject every signed path from the public cache.
+fn default_nix_cache_trusted_public_keys() -> Vec<String> {
+    vec!["cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=".into()]
+}
+
+fn default_nix_cache_max_metadata_bytes() -> u64 {
+    1024 * 1024
+}
+
+fn default_nix_cache_max_nar_bytes() -> u64 {
+    512 * 1024 * 1024
+}
+
+/// Default agent-VM working directory. Sits under `$XDG_STATE_HOME/writ/`
+/// alongside `agent-vm-sessions`, falling back to `~/.local/state/writ/` when
+/// XDG is unset — matching [`default_agent_vm_state_dir`].
+pub fn default_vm_http_work_root() -> PathBuf {
+    // Treat an empty `XDG_STATE_HOME` as unset (matches
+    // `default_agent_vm_state_dir`). Without this filter, an environment that
+    // exports `XDG_STATE_HOME=` would yield the relative path `writ/vm-work`
+    // and the absolute-path check downstream would refuse the daemon config —
+    // even though the `HOME` fallback would have worked.
+    if let Some(dir) = std::env::var_os("XDG_STATE_HOME").filter(|dir| !dir.as_os_str().is_empty())
+    {
+        PathBuf::from(dir).join("writ/vm-work")
+    } else {
+        let home = std::env::var_os("HOME").unwrap_or_else(|| "/tmp".into());
+        PathBuf::from(home).join(".local/state/writ/vm-work")
+    }
 }
 
 fn parse_ipv4_cidr_config(
@@ -1416,6 +1584,38 @@ mod tests {
         ));
     }
 
+    /// Every field that has a `serde(default = ...)` should produce its
+    /// documented value when omitted from the JSON. The minimal config below
+    /// supplies only the three fields without defaults (`broker_port_*`,
+    /// `askpass_program`); everything else must come from the default fns.
+    #[test]
+    fn agent_vm_http_config_applies_defaults_for_omitted_fields() {
+        let json = r#"{
+            "broker_port_min": 18080,
+            "broker_port_max": 18081,
+            "askpass_program": "/usr/local/libexec/writ-git-askpass"
+        }"#;
+        let c: AgentVmHttpConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(c.bind_addr, Ipv4Addr::UNSPECIFIED);
+        assert_eq!(c.git_program, PathBuf::from("git"));
+        assert_eq!(c.git_clone_base_url, DEFAULT_GIT_CLONE_BASE_URL);
+        assert_eq!(c.token_env, "WRIT_GIT_TOKEN");
+        assert_eq!(c.work_root, default_vm_http_work_root());
+        assert_eq!(c.clone_timeout_secs, 300);
+        assert_eq!(c.max_bundle_bytes, 64 * 1024 * 1024);
+        assert_eq!(c.nix_cache_url, "https://cache.nixos.org");
+        assert_eq!(
+            c.nix_cache_trusted_public_keys,
+            vec!["cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=".to_string()]
+        );
+        assert_eq!(c.nix_cache_max_metadata_bytes, 1024 * 1024);
+        assert_eq!(c.nix_cache_max_nar_bytes, 512 * 1024 * 1024);
+        assert!(c.claude_proxy.is_none());
+        assert!(c.openai_proxy.is_none());
+        assert!(c.agent_run_log_root.is_none());
+        assert!(c.git_push_staging_root.is_none());
+    }
+
     #[test]
     fn agent_vm_http_config_rejects_relative_agent_run_log_root() {
         let mut c = valid_agent_vm_http_config();
@@ -1512,18 +1712,113 @@ mod tests {
         ));
     }
 
+    /// `to_runtime_config` must leave the work root at 0700, because the
+    /// guest-side `prepare_git_work_root` rejects any group/world bits and a
+    /// fresh install relies on the daemon — not the user — to create the
+    /// default work root.
+    #[test]
+    fn agent_vm_http_config_creates_work_root_at_mode_0700() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        // Pick a path that does not yet exist so `to_runtime_config` is the
+        // one that creates the directory.
+        let work_root = temp.path().join("fresh-vm-work");
+        let mut c = valid_agent_vm_http_config();
+        c.work_root = work_root.clone();
+
+        c.to_runtime_config().expect("runtime config builds");
+
+        let mode = std::fs::symlink_metadata(&work_root)
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o777,
+            0o700,
+            "work_root {} should be private (0700), got {:04o}",
+            work_root.display(),
+            mode & 0o777
+        );
+    }
+
+    /// A pre-existing work_root with group/world bits must fail startup, not
+    /// silently boot a daemon whose clone route is unusable.
+    #[test]
+    fn agent_vm_http_config_rejects_existing_work_root_with_loose_perms() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let work_root = temp.path().join("loose-vm-work");
+        std::fs::create_dir(&work_root).unwrap();
+        std::fs::set_permissions(&work_root, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut c = valid_agent_vm_http_config();
+        c.work_root = work_root.clone();
+
+        let err = c.to_runtime_config().expect_err("loose perms rejected");
+        assert!(
+            matches!(
+                err,
+                AgentVmHttpConfigError::WorkRootInsecure { ref path, mode }
+                    if *path == work_root && mode == 0o755
+            ),
+            "expected WorkRootInsecure, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn agent_vm_http_config_accepts_existing_work_root_at_mode_0700() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let work_root = temp.path().join("strict-vm-work");
+        std::fs::create_dir(&work_root).unwrap();
+        std::fs::set_permissions(&work_root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut c = valid_agent_vm_http_config();
+        c.work_root = work_root.clone();
+
+        c.to_runtime_config()
+            .expect("pre-existing 0700 work_root accepted");
+
+        let mode = std::fs::symlink_metadata(&work_root)
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o700);
+    }
+
+    #[test]
+    fn agent_vm_http_config_rejects_work_root_that_is_a_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let work_root = temp.path().join("not-a-dir");
+        std::fs::write(&work_root, b"file").unwrap();
+        let mut c = valid_agent_vm_http_config();
+        c.work_root = work_root.clone();
+
+        let err = c.to_runtime_config().expect_err("non-directory rejected");
+        assert!(
+            matches!(
+                err,
+                AgentVmHttpConfigError::WorkRootNotDirectory { ref path } if *path == work_root
+            ),
+            "expected WorkRootNotDirectory, got {err:?}"
+        );
+    }
+
     #[test]
     fn agent_vm_http_config_defaults_git_push_staging_root_to_work_root_subdir() {
+        // Use a non-existent subpath so `ensure_vm_http_work_root_private`
+        // creates the work root at 0700 (the failure mode it exists to
+        // prevent). Passing `temp.path()` directly would hand the validator a
+        // 0755 dir on systems where `tempfile` honours the default umask.
         let temp = tempfile::tempdir().unwrap();
+        let work_root = temp.path().join("vm-work");
         let mut c = valid_agent_vm_http_config();
-        c.work_root = temp.path().to_path_buf();
+        c.work_root = work_root.clone();
         c.git_push_staging_root = None;
 
         let runtime = c.to_runtime_config().unwrap();
 
         assert_eq!(
             runtime.git_push_staging_root(),
-            temp.path().join("git-push-staging")
+            work_root.join("git-push-staging")
         );
     }
 
