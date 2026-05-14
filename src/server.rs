@@ -289,6 +289,16 @@ pub async fn dispatch_message_with_agent_vm<S: SecretStore + Send + Sync + 'stat
             outcome,
             decider,
         } => decide_plan(state, plan_id, outcome, decider).await,
+        // Slice A1 of `docs/plans/2026-05-14-bailiff-split.md`: the
+        // request shape is on the wire, but the spawner + signer that
+        // produce a `RunAgentCompleted` response are slice B work.
+        // Replying with `Error` (rather than panicking or accepting
+        // the request and dropping it) keeps the protocol honest: a
+        // client that sends `RunAgent` today learns immediately that
+        // the broker can't satisfy it yet.
+        ClientMessage::RunAgent { .. } => ServerMessage::Error {
+            message: "RunAgent dispatch is not yet wired up (bailiff-split slice B)".into(),
+        },
     }
 }
 
@@ -1443,6 +1453,43 @@ mod tests {
         )
         .await;
         assert_eq!(resp, ServerMessage::SessionClosed);
+    }
+
+    /// Slice A1 of the bailiff split: the request type is on the wire
+    /// but the spawner/signer are slice B work. Until that lands,
+    /// dispatch must return a clear `Error` rather than panicking or
+    /// silently accepting the request. The error message names the
+    /// slice so an operator (or a future reviewer wondering why the
+    /// branch landed an inert path) can find the plan doc.
+    #[tokio::test]
+    async fn run_agent_dispatch_returns_error_pending_slice_b() {
+        let server = MockServer::start().await;
+        let state = make_state(&server, vec![], "o");
+
+        let resp = dispatch_message(
+            ClientMessage::RunAgent {
+                prompt: crate::agent_run::AgentPrompt::new("hello"),
+                capabilities: vec![crate::core::CapabilitySet::WorkspaceRead {
+                    repo: RepoRef {
+                        owner: "smaug123".into(),
+                        name: "writ".into(),
+                    },
+                }],
+                purpose: "test".into(),
+                output_ref: crate::core::NotesRef::try_new("refs/notes/writ/agent-outputs")
+                    .unwrap(),
+            },
+            &state,
+        )
+        .await;
+
+        let ServerMessage::Error { message } = resp else {
+            panic!("expected ServerMessage::Error, got {resp:?}");
+        };
+        assert!(
+            message.contains("slice B") || message.contains("not yet wired up"),
+            "expected message naming slice B / not-yet-implemented, got: {message}",
+        );
     }
 
     #[tokio::test]
