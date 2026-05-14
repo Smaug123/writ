@@ -7,6 +7,7 @@
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 
@@ -22,6 +23,9 @@ use writ::vm_client::{
     upload_agent_run_outcome,
 };
 use writ::vm_git::{GitBranchName, GitCloneRef, GitCloneRepo, GitObjectId, WorkspaceWarmMode};
+use writ::vm_sandbox::{
+    DEFAULT_PROBE_TIMEOUT, SandboxLeakProbe, default_leak_probes, run_sandbox_leak_probes,
+};
 
 #[derive(Parser)]
 #[command(name = "writ-vm", about = "guest-side writ VM broker client")]
@@ -54,6 +58,11 @@ enum Cmd {
     Agent {
         #[command(subcommand)]
         action: AgentCmd,
+    },
+    /// Sandbox self-tests run inside the VM before any broker traffic.
+    Sandbox {
+        #[command(subcommand)]
+        action: SandboxCmd,
     },
 }
 
@@ -129,6 +138,15 @@ enum WorkspaceCmd {
 }
 
 #[derive(Subcommand)]
+enum SandboxCmd {
+    /// Probe that the guest sandbox refuses external egress. Exits 0 on an
+    /// intact sandbox; on a detected leak, prints the breach to stderr and
+    /// exits non-zero. The guest bootstrap runs this before any broker
+    /// traffic, so a sandbox break fails the session closed.
+    Check,
+}
+
+#[derive(Subcommand)]
 enum AgentCmd {
     /// Fetch the brokered prompt and run the configured stage adapter.
     Run {
@@ -154,18 +172,34 @@ enum WorkspaceWarmArg {
 
 #[tokio::main]
 async fn main() {
-    if let Err(error) = run().await {
-        eprintln!("error: {error}");
-        std::process::exit(1);
-    }
+    // Exit unconditionally rather than falling off the end of main so the
+    // tokio runtime does not block shutdown on detached `spawn_blocking`
+    // work — notably the `getaddrinfo` thread that backs
+    // `tokio::net::lookup_host`. If the sandbox DNS probe times out, that
+    // thread keeps running until libc returns; `std::process::exit` lets
+    // the process exit and the OS reaps it.
+    let code = match run().await {
+        Ok(()) => 0,
+        Err(error) => {
+            eprintln!("error: {error}");
+            1
+        }
+    };
+    std::process::exit(code);
 }
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     writ::telemetry::init("warn")?;
     let args = Args::parse();
+
+    if let Cmd::Sandbox { action } = &args.cmd {
+        return run_sandbox(action, &default_leak_probes(), DEFAULT_PROBE_TIMEOUT).await;
+    }
+
     let config = config_from_args(&args)?;
 
     match args.cmd {
+        Cmd::Sandbox { .. } => unreachable!("Sandbox dispatched above"),
         Cmd::Session => {
             let session = get_session_json(&config).await?;
             println!("{}", serde_json::to_string_pretty(&session)?);
@@ -255,6 +289,22 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         },
     }
     Ok(())
+}
+
+async fn run_sandbox(
+    action: &SandboxCmd,
+    probes: &[SandboxLeakProbe],
+    timeout: Duration,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match action {
+        SandboxCmd::Check => match run_sandbox_leak_probes(probes, timeout).await {
+            Ok(()) => {
+                println!("sandbox check ok");
+                Ok(())
+            }
+            Err(leak) => Err(format!("sandbox leak: {leak}").into()),
+        },
+    }
 }
 
 fn config_from_args(args: &Args) -> Result<VmClientConfig, VmClientConfigError> {
@@ -661,6 +711,30 @@ mod tests {
             }
             _ => panic!("unexpected command"),
         }
+    }
+
+    #[test]
+    fn sandbox_check_parses_to_check_action() {
+        let args = Args::try_parse_from(["writ-vm", "sandbox", "check"]).unwrap();
+        assert!(matches!(
+            args.cmd,
+            Cmd::Sandbox {
+                action: SandboxCmd::Check,
+            }
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn sandbox_run_with_empty_probe_set_returns_ok() {
+        // Run the sandbox dispatch with an injected empty probe set so the
+        // test does not depend on host DNS, network egress, or
+        // `lookup_host`'s blocking `getaddrinfo` task surviving timeout.
+        // Empty probes mean `run_sandbox_leak_probes` finds no breach and
+        // returns Ok, which lets us pin the dispatch signature without
+        // taking a config or talking to the network.
+        let result =
+            run_sandbox(&SandboxCmd::Check, &[], Duration::from_millis(10)).await;
+        assert!(result.is_ok(), "expected Ok, got {result:?}");
     }
 
     #[test]

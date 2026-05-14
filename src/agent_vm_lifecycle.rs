@@ -23,7 +23,11 @@ use crate::core::{
 };
 use crate::process_spawn;
 
-const IPV4_ONLY_PRELAUNCH_SCRIPT: &str = concat!(
+/// Wraps the guest command so the daemon can hold it on the
+/// `/run/writ-agent-vm/start` sentinel while it runs the sandbox probe (and,
+/// for IPv4-only sessions, the guest-IPv6 absence check). Applied whenever a
+/// guest command is configured, regardless of IPv6 isolation mode.
+const GUEST_COMMAND_PRELAUNCH_SCRIPT: &str = concat!(
     "set -eu\n",
     "mkdir -p /run/writ-agent-vm\n",
     "while [ ! -f /run/writ-agent-vm/start ]; do sleep 0.2; done\n",
@@ -174,6 +178,11 @@ pub enum AgentVmStartStep {
     InstallFirewall(ProcessInvocation),
     StartVm(AgentVmStartInvocation),
     ProbeAndValidateGuestIpv6 { probe_invocation: ProcessInvocation },
+    /// Host-observed sandbox smoke test executed in the running container's
+    /// network namespace via `container exec`. Must run before
+    /// [`AgentVmStartStep::ReleaseGuestCommand`] so a failed sandbox check
+    /// surfaces as a [`StartFailure`] before the guest command is unblocked.
+    ProbeAndValidateSandbox { probe_invocation: ProcessInvocation },
     ReleaseGuestCommand(ProcessInvocation),
 }
 
@@ -241,6 +250,7 @@ pub enum StartOutcome {
     StartVmFailed,
     ProbeGuestIpv6Failed,
     ValidateGuestIpv6Failed,
+    ProbeSandboxFailed,
     ReleaseGuestCommandFailed,
 }
 
@@ -543,6 +553,7 @@ pub fn cleanup_step_after_start_outcome(outcome: StartOutcome) -> Option<Complet
         StartOutcome::StartVmFailed
         | StartOutcome::ProbeGuestIpv6Failed
         | StartOutcome::ValidateGuestIpv6Failed
+        | StartOutcome::ProbeSandboxFailed
         | StartOutcome::ReleaseGuestCommandFailed => Some(CompletedStartStep::FirewallInstalled),
     }
 }
@@ -662,6 +673,11 @@ impl AgentVmSessionPlan {
         if self.ipv6_mode == Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6 {
             steps.push(AgentVmStartStep::ProbeAndValidateGuestIpv6 {
                 probe_invocation: self.probe_guest_ipv6_invocation(),
+            });
+        }
+        if !self.guest_command.is_empty() {
+            steps.push(AgentVmStartStep::ProbeAndValidateSandbox {
+                probe_invocation: self.probe_sandbox_invocation(),
             });
             steps.push(AgentVmStartStep::ReleaseGuestCommand(
                 self.release_guest_command_invocation(),
@@ -858,11 +874,11 @@ impl AgentVmSessionPlan {
             args.extend(["--env-file".to_string(), env_file.display().to_string()]);
         }
         args.push(self.image.as_str().to_string());
-        if self.ipv6_mode == Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6 {
+        if !self.guest_command.is_empty() {
             args.extend([
                 "sh".to_string(),
                 "-c".to_string(),
-                IPV4_ONLY_PRELAUNCH_SCRIPT.to_string(),
+                GUEST_COMMAND_PRELAUNCH_SCRIPT.to_string(),
                 "writ-agent-vm-prelaunch".to_string(),
             ]);
         }
@@ -895,6 +911,19 @@ impl AgentVmSessionPlan {
                 "sh".to_string(),
                 "-c".to_string(),
                 GUEST_IPV6_PROBE_SCRIPT.to_string(),
+            ],
+        )
+    }
+
+    fn probe_sandbox_invocation(&self) -> ProcessInvocation {
+        ProcessInvocation::new(
+            self.tools.container.clone(),
+            [
+                "exec".to_string(),
+                self.names.vm.clone(),
+                "writ-vm".to_string(),
+                "sandbox".to_string(),
+                "check".to_string(),
             ],
         )
     }
@@ -1956,7 +1985,8 @@ impl AgentVmStartStep {
             | Self::InstallFirewall(inv)
             | Self::ReleaseGuestCommand(inv) => AgentVmStartInvocation::Static(inv),
             Self::StartVm(inv) => inv,
-            Self::ProbeAndValidateGuestIpv6 { probe_invocation } => {
+            Self::ProbeAndValidateGuestIpv6 { probe_invocation }
+            | Self::ProbeAndValidateSandbox { probe_invocation } => {
                 AgentVmStartInvocation::Static(probe_invocation)
             }
         }
@@ -1976,6 +2006,7 @@ pub fn step_cleanup_phase(step: &AgentVmStartStep) -> CompletedStartStep {
         }
         AgentVmStartStep::StartVm(_)
         | AgentVmStartStep::ProbeAndValidateGuestIpv6 { .. }
+        | AgentVmStartStep::ProbeAndValidateSandbox { .. }
         | AgentVmStartStep::ReleaseGuestCommand(_) => CompletedStartStep::FirewallInstalled,
     }
 }
@@ -1996,6 +2027,7 @@ pub fn step_failure_outcomes(step: &AgentVmStartStep) -> Vec<StartOutcome> {
             StartOutcome::ProbeGuestIpv6Failed,
             StartOutcome::ValidateGuestIpv6Failed,
         ],
+        AgentVmStartStep::ProbeAndValidateSandbox { .. } => vec![StartOutcome::ProbeSandboxFailed],
         AgentVmStartStep::ReleaseGuestCommand(_) => vec![StartOutcome::ReleaseGuestCommandFailed],
     }
 }
@@ -2174,6 +2206,9 @@ fn run_start_step(
                 .require_no_routable_ipv6()
                 .map_err(|err| (err.into(), StartOutcome::ValidateGuestIpv6Failed))
         }
+        AgentVmStartStep::ProbeAndValidateSandbox { probe_invocation } => probe_invocation
+            .run()
+            .map_err(|err| (err.into(), StartOutcome::ProbeSandboxFailed)),
         AgentVmStartStep::ReleaseGuestCommand(invocation) => invocation
             .run()
             .map_err(|err| (err.into(), StartOutcome::ReleaseGuestCommandFailed)),
@@ -2951,6 +2986,7 @@ mod tests {
             Just(StartOutcome::StartVmFailed),
             Just(StartOutcome::ProbeGuestIpv6Failed),
             Just(StartOutcome::ValidateGuestIpv6Failed),
+            Just(StartOutcome::ProbeSandboxFailed),
             Just(StartOutcome::ReleaseGuestCommandFailed),
         ]
     }
@@ -3149,7 +3185,7 @@ mod tests {
     #[test]
     fn start_invocations_create_network_then_inspect_then_firewall_then_vm() {
         let invocations = plan(252).start_invocations();
-        assert_eq!(invocations.len(), 4);
+        assert_eq!(invocations.len(), 6);
         assert_eq!(
             invocations[0].args_lossy(),
             [
@@ -3182,10 +3218,84 @@ mod tests {
     }
 
     #[test]
+    fn dual_stack_start_invocations_wrap_guest_command_and_probe_sandbox() {
+        let invocations =
+            plan_with_ipv6_mode(252, Ipv6IsolationMode::DualStackRequired).start_invocations();
+        assert_eq!(invocations.len(), 6);
+
+        let firewall_args = invocations[2].args_lossy();
+        assert_eq!(&firewall_args[0..2], ["writ-agent-vm-pf-helper", "install"]);
+        assert!(firewall_args.contains(&"--ipv6-cidr".to_string()));
+
+        let start_vm_args = invocations[3].args_lossy();
+        assert_eq!(&start_vm_args[0..2], ["run", "--name"]);
+        assert_tmpfs_mounts_present(&start_vm_args);
+        assert!(start_vm_args.contains(&"sh".to_string()));
+        assert!(start_vm_args.contains(&"-c".to_string()));
+        assert!(
+            start_vm_args
+                .iter()
+                .any(|arg| arg.contains("/run/writ-agent-vm/start") && arg.contains("exec \"$@\""))
+        );
+        assert!(start_vm_args.ends_with(&[
+            "writ-agent-vm-prelaunch".into(),
+            "sleep".into(),
+            "600".into()
+        ]));
+
+        assert_eq!(
+            invocations[4].args_lossy(),
+            [
+                "exec",
+                "writ-agent-vm-51b8fd0f-6c10-454c-b0e6-7df1d60e2e6d",
+                "writ-vm",
+                "sandbox",
+                "check",
+            ]
+        );
+        assert_eq!(
+            invocations[5].args_lossy(),
+            [
+                "exec",
+                "writ-agent-vm-51b8fd0f-6c10-454c-b0e6-7df1d60e2e6d",
+                "sh",
+                "-c",
+                "mkdir -p /run/writ-agent-vm && touch /run/writ-agent-vm/start",
+            ]
+        );
+    }
+
+    #[test]
+    fn dual_stack_start_invocations_without_guest_command_skip_prelaunch_and_probes() {
+        let plan = AgentVmSessionPlan::new(
+            session_id(),
+            pool(),
+            252,
+            ports(),
+            BrokerPortRange::new(49152, 65535).unwrap(),
+            Ipv6IsolationMode::DualStackRequired,
+            ContainerImage::new("alpine:latest").unwrap(),
+            Vec::new(),
+            AgentVmResources::new(1, 512).unwrap(),
+            AgentVmToolPaths::new("container", "writ-agent-vm-pf-helper", "sudo"),
+        )
+        .unwrap();
+        let invocations = plan.start_invocations();
+        assert_eq!(invocations.len(), 4);
+        let vm_args = invocations[3].args_lossy();
+        assert!(!vm_args.contains(&"writ-agent-vm-prelaunch".to_string()));
+        assert!(
+            !vm_args
+                .iter()
+                .any(|arg| arg.contains("/run/writ-agent-vm/start"))
+        );
+    }
+
+    #[test]
     fn ipv4_only_start_invocations_probe_before_releasing_guest_command() {
         let invocations =
             plan_with_ipv6_mode(252, Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6).start_invocations();
-        assert_eq!(invocations.len(), 6);
+        assert_eq!(invocations.len(), 7);
         let firewall_args = invocations[2].args_lossy();
         assert_eq!(&firewall_args[0..2], ["writ-agent-vm-pf-helper", "install"]);
         assert!(!firewall_args.contains(&"--ipv6-cidr".to_string()));
@@ -3218,6 +3328,16 @@ mod tests {
         );
         assert_eq!(
             invocations[5].args_lossy(),
+            [
+                "exec",
+                "writ-agent-vm-51b8fd0f-6c10-454c-b0e6-7df1d60e2e6d",
+                "writ-vm",
+                "sandbox",
+                "check",
+            ]
+        );
+        assert_eq!(
+            invocations[6].args_lossy(),
             [
                 "exec",
                 "writ-agent-vm-51b8fd0f-6c10-454c-b0e6-7df1d60e2e6d",
@@ -3771,6 +3891,7 @@ mod tests {
                 StartOutcome::StartVmFailed
                 | StartOutcome::ProbeGuestIpv6Failed
                 | StartOutcome::ValidateGuestIpv6Failed
+                | StartOutcome::ProbeSandboxFailed
                 | StartOutcome::ReleaseGuestCommandFailed => 7,
             };
             prop_assert_eq!(cleanup.len(), expected_len);
@@ -3829,11 +3950,12 @@ mod tests {
             StartOutcome::StartVmFailed,
             StartOutcome::ProbeGuestIpv6Failed,
             StartOutcome::ValidateGuestIpv6Failed,
+            StartOutcome::ProbeSandboxFailed,
             StartOutcome::ReleaseGuestCommandFailed,
         ] {
             assert!(produced.contains(&outcome), "no step produces {outcome:?}",);
         }
-        assert_eq!(produced.len(), 9, "produced = {produced:?}");
+        assert_eq!(produced.len(), 10, "produced = {produced:?}");
     }
 
     proptest! {
