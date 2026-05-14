@@ -4,7 +4,7 @@
 //!
 //! See `docs/plans/2026-05-14-bailiff-split.md` for the broader split;
 //! the pure-composition core is the slice-1 lift from `agent_plan.rs`,
-//! and [`fetch_effective_prompt`] is the slice-2 lift of the VM-side
+//! and `fetch_effective_prompt` is the slice-2 lift of the VM-side
 //! dispatch wrapper from `writ-vm.rs`. The broker still persists
 //! [`PlanBody`] and [`Stage`]; only the *interpretation* (decide
 //! whether to fetch the plan, then splice it into the agent's
