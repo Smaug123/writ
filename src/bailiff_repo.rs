@@ -43,6 +43,7 @@
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
+use std::sync::Arc;
 
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
@@ -55,11 +56,26 @@ use crate::core::NotesRef;
 ///
 /// Construct via [`BailiffRepo::open`] (validates an existing bare
 /// repo) or [`BailiffRepo::init_or_open`] (creates one on first run
-/// then opens it). Cloning is cheap — the type is just a `PathBuf`
-/// alongside a "this passed validation" marker.
+/// then opens it). Cloning is cheap and all clones share the same
+/// notes write lock — so multiple concurrent `write_note` callers
+/// against the same repo serialize correctly even when they hold
+/// different `BailiffRepo` clones.
 #[derive(Clone, Debug)]
 pub struct BailiffRepo {
     path: PathBuf,
+    /// Serialises `write_note` invocations against this repo.
+    ///
+    /// `git notes add` does not perform a compare-and-swap on the
+    /// notes ref: it reads the current tip, builds a notes tree on
+    /// top, then updates the ref. Two writers starting from the
+    /// same tip would each build a tree containing only their own
+    /// note, and the second ref update would silently overwrite
+    /// the first — losing notes. An in-process mutex covers the
+    /// existence check, `git notes add` invocation, and ref update
+    /// as one critical section. Multi-process writers are not in
+    /// scope: bailiff is a single daemon, and external git tooling
+    /// touching the repo concurrently would be operator error.
+    notes_write_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl BailiffRepo {
@@ -87,7 +103,10 @@ impl BailiffRepo {
     pub async fn open(path: impl Into<PathBuf>) -> Result<Self, BailiffRepoError> {
         let path = absolutize(path.into())?;
         validate_bare_repo(&path).await?;
-        Ok(Self { path })
+        Ok(Self {
+            path,
+            notes_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+        })
     }
 
     /// Open an existing bare repo at `path`, or create one there if
@@ -173,6 +192,13 @@ impl BailiffRepo {
         target: &GitObjectId,
         body: &[u8],
     ) -> Result<(), BailiffRepoError> {
+        // Hold the per-repo notes lock for the entire critical
+        // section: the existence check + `git notes add`. Without
+        // it, two concurrent writers starting from the same notes
+        // tip would each build a tree containing only their own
+        // note, and the second ref update would silently overwrite
+        // the first.
+        let _guard = self.notes_write_lock.lock().await;
         // Detect existing note up-front so we can return the typed
         // `NoteAlreadyExists` rather than the generic GitFailed that
         // `git notes add` (without `-f`) produces. The two-step shape
@@ -316,6 +342,25 @@ async fn validate_bare_repo(path: &Path) -> Result<(), BailiffRepoError> {
             path: path.display().to_string(),
             reason: "core.bare is not true".to_string(),
         });
+    }
+    // Reject `commondir`: a gitdir containing this file delegates
+    // its shared state (objects, refs, etc.) to the path named in
+    // it. Subsequent `--git-dir <path>` writes would then land
+    // outside the bare repo we validated. `git init --bare` does
+    // not produce this file; its presence means the directory is
+    // a linked-worktree gitdir or was hand-crafted to redirect
+    // writes — neither of which we accept.
+    match tokio::fs::metadata(path.join("commondir")).await {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(source) => return Err(BailiffRepoError::Io(source)),
+        Ok(_) => {
+            return Err(BailiffRepoError::NotABareRepo {
+                path: path.display().to_string(),
+                reason:
+                    "gitdir contains `commondir`; bare repos must not redirect their common dir"
+                        .to_string(),
+            });
+        }
     }
     Ok(())
 }
@@ -968,6 +1013,82 @@ mod tests {
             !decoy_object.exists(),
             "blob leaked into the inner .git: {decoy_object:?}"
         );
+    }
+
+    /// Concurrent `write_note` calls to the same notes ref must
+    /// both end up retrievable. Without the per-repo lock, each
+    /// `git notes add` would start from the empty ref tip and the
+    /// second ref update would overwrite the first, silently
+    /// losing one of the two notes.
+    #[tokio::test]
+    async fn write_note_serializes_concurrent_writes_to_same_ref() {
+        let dir = TempDir::new().unwrap();
+        let repo = BailiffRepo::init_or_open(dir.path().join("repo"))
+            .await
+            .unwrap();
+        let r = notes_ref();
+        let target_a = repo.write_blob(b"payload-a").await.unwrap();
+        let target_b = repo.write_blob(b"payload-b").await.unwrap();
+
+        // Two concurrent write_note futures, same ref, distinct
+        // targets. Both must succeed; both notes must be present
+        // afterwards.
+        let repo_a = repo.clone();
+        let repo_b = repo.clone();
+        let r_a = r.clone();
+        let r_b = r.clone();
+        let ta = target_a.clone();
+        let tb = target_b.clone();
+        let (res_a, res_b) = tokio::join!(
+            tokio::spawn(async move { repo_a.write_note(&r_a, &ta, b"note-a").await }),
+            tokio::spawn(async move { repo_b.write_note(&r_b, &tb, b"note-b").await }),
+        );
+        res_a.unwrap().unwrap();
+        res_b.unwrap().unwrap();
+
+        // Both notes must be retrievable through the bare repo's
+        // notes ref — proving the second writer rebased onto the
+        // first instead of clobbering it.
+        for (target, expected) in [(&target_a, b"note-a"), (&target_b, b"note-b")] {
+            let ref_arg = format!("--ref={}", r.as_str());
+            let stdout = run_git_capture_stdout(
+                &[
+                    OsStr::new("--git-dir"),
+                    repo.path().as_os_str(),
+                    OsStr::new("notes"),
+                    OsStr::new(&ref_arg),
+                    OsStr::new("show"),
+                    OsStr::new(target.as_str()),
+                ],
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(stdout.as_slice(), expected.as_slice());
+        }
+    }
+
+    /// A gitdir with a `commondir` file points objects and refs
+    /// elsewhere. If validation accepts such a directory, writes
+    /// would land outside the bailiff repo. Refuse it.
+    #[tokio::test]
+    async fn open_rejects_a_gitdir_with_commondir() {
+        let dir = TempDir::new().unwrap();
+        let repo_path = dir.path().join("redirected");
+        // First seed a real bare repo so HEAD and config(bare=true)
+        // pass, then plant a `commondir` file alongside them.
+        let _ = BailiffRepo::init_or_open(&repo_path).await.unwrap();
+        std::fs::write(repo_path.join("commondir"), "/some/other/path\n").unwrap();
+        let err = BailiffRepo::open(&repo_path).await.unwrap_err();
+        match err {
+            BailiffRepoError::NotABareRepo { reason, .. } => {
+                assert!(
+                    reason.contains("commondir"),
+                    "reason should mention commondir, got: {reason}"
+                );
+            }
+            other => panic!("expected NotABareRepo, got {other:?}"),
+        }
     }
 
     /// `absolutize` must turn a relative path into an absolute one
