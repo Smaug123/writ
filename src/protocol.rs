@@ -20,7 +20,8 @@ use crate::agent_run::{AgentPrompt, AgentRunId};
 use crate::agent_vm_lifecycle::AgentVmSessionStateStatus;
 use crate::audit::GitPushOutcomeResult;
 use crate::core::{
-    AgentKind, CapabilityRequest, CapabilitySet, NotesRef, RequestId, SessionId, UnixMillis,
+    AgentKind, CapabilityRequest, CapabilitySet, NotesRef, RequestId, SessionId, Sha256Hex,
+    SshKeyFingerprint, SshSignature, UnixMillis,
 };
 use crate::vm_git::{
     AgentVmWorkspaceBootstrap, GitBranchName, GitCloneRepo, GitObjectId, VmGitPushStagedReceipt,
@@ -248,6 +249,52 @@ impl<'de> Deserialize<'de> for RejectionReason {
         let raw = String::deserialize(deserializer)?;
         Self::try_new(raw).map_err(serde::de::Error::custom)
     }
+}
+
+/// The canonical metadata writ hashes and signs at the end of a
+/// [`ClientMessage::RunAgent`] invocation. Returned verbatim in
+/// [`ServerMessage::RunAgentCompleted`] alongside the detached
+/// signature so bailiff (or any third-party verifier) can
+/// re-canonicalise the bytes and confirm the signature without
+/// having to guess at field order or serialisation choices.
+///
+/// `prompt_sha256` binds the signed output to its originating prompt:
+/// a verifier re-hashes bailiff's plan note (or whichever artefact
+/// carried the prompt) and confirms it matches the hash writ saw,
+/// ruling out "valid signature + swapped prompt" forgeries.
+///
+/// `signing_key_fingerprint` identifies which writ-side key produced
+/// the signature; bailiff's allowed-signers file resolves it to the
+/// public key used to verify `signature`. Bailiff refuses to ingest
+/// a note whose fingerprint isn't in its keyring.
+///
+/// `capabilities` is the full canonical collection writ accepted on
+/// the wire — every granted variant, not a single composite — so
+/// provenance checks on a multi-capability run see every authority
+/// that produced the signed output.
+///
+/// `session_id` is the open question pinned for slice C of the
+/// bailiff-split plan: bailiff opens one writ session per workflow
+/// and every run for that workflow happens inside it. Field shape
+/// frozen here so slice B can wire the signing path without
+/// reshaping the response; the question of "who allocates the
+/// session id" is resolved by slice C without changing this struct.
+///
+/// `deny_unknown_fields` catches an unexpected key at parse time
+/// rather than silently dropping it; the canonical bytes are
+/// reconstructed from this exact field set and any divergence would
+/// break verification.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SignedRunMetadata {
+    pub run_id: AgentRunId,
+    pub session_id: SessionId,
+    pub prompt_sha256: Sha256Hex,
+    pub output_envelope_sha256: Sha256Hex,
+    pub capabilities: Vec<CapabilitySet>,
+    pub exit_code: i32,
+    pub completed_at: UnixMillis,
+    pub signing_key_fingerprint: SshKeyFingerprint,
 }
 
 /// A message from the agent to the broker.
@@ -531,6 +578,26 @@ pub enum ServerMessage {
     /// so a replay surfaces as an explicit "already decided" outcome
     /// rather than a prose error string.
     PlanAlreadyDecided { plan_id: PlanId },
+    /// Synchronous reply to [`ClientMessage::RunAgent`]. The agent has
+    /// run to completion (or to a non-zero terminal exit), writ has
+    /// written the output envelope as a Git blob in the caller's repo,
+    /// and `signed_metadata` carries the canonical bytes covered by
+    /// `signature`. A verifier reconstructs the canonical bytes from
+    /// `signed_metadata` and validates `signature` against the public
+    /// key keyed by `signed_metadata.signing_key_fingerprint`.
+    ///
+    /// `output_oid` is the OID of the envelope blob writ wrote, so
+    /// bailiff can attach the signed note at the requested ref
+    /// without re-resolving the object.
+    ///
+    /// Slice A2 lands the wire shape; the dispatch path still
+    /// short-circuits to [`ServerMessage::Error`] until slice B
+    /// implements the spawner + signer.
+    RunAgentCompleted {
+        output_oid: GitObjectId,
+        signed_metadata: SignedRunMetadata,
+        signature: SshSignature,
+    },
     /// An internal failure (mint error, audit write failure, agent VM
     /// runtime not configured, …). The agent should surface `message` to
     /// the user and not retry automatically. Outcomes a client may want
@@ -617,6 +684,16 @@ impl std::fmt::Debug for ServerMessage {
             Self::PlanAlreadyDecided { plan_id } => f
                 .debug_struct("PlanAlreadyDecided")
                 .field("plan_id", plan_id)
+                .finish(),
+            Self::RunAgentCompleted {
+                output_oid,
+                signed_metadata,
+                signature,
+            } => f
+                .debug_struct("RunAgentCompleted")
+                .field("output_oid", output_oid)
+                .field("signed_metadata", signed_metadata)
+                .field("signature", signature)
                 .finish(),
             Self::Error { message } => f.debug_struct("Error").field("message", message).finish(),
         }
@@ -1833,6 +1910,169 @@ mod tests {
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert_eq!(serde_json::from_str::<ServerMessage>(&json).unwrap(), msg);
+    }
+
+    fn sample_sha256_hex(nibble: char) -> Sha256Hex {
+        Sha256Hex::try_new(std::iter::repeat_n(nibble, 64).collect::<String>()).unwrap()
+    }
+
+    fn sample_ssh_fingerprint() -> SshKeyFingerprint {
+        SshKeyFingerprint::try_new("SHA256:Wn0p0WC9F8bJ35rwTRsLP6w8b9ZsZh4HX0FYpC0Zg").unwrap()
+    }
+
+    fn sample_ssh_signature() -> SshSignature {
+        SshSignature::try_new(
+            "-----BEGIN SSH SIGNATURE-----\nU1NIU0lHAAAAAQ...\n-----END SSH SIGNATURE-----",
+        )
+        .unwrap()
+    }
+
+    fn sample_signed_run_metadata() -> SignedRunMetadata {
+        SignedRunMetadata {
+            run_id: sample_agent_run_id(),
+            session_id: fixed_session_id(),
+            prompt_sha256: sample_sha256_hex('a'),
+            output_envelope_sha256: sample_sha256_hex('b'),
+            capabilities: vec![CapabilitySet::WorkspaceRead {
+                repo: sample_repo(),
+            }],
+            exit_code: 0,
+            completed_at: UnixMillis::from_millis(1_700_000_000_000),
+            signing_key_fingerprint: sample_ssh_fingerprint(),
+        }
+    }
+
+    #[test]
+    fn run_agent_completed_roundtrips() {
+        let msg = ServerMessage::RunAgentCompleted {
+            output_oid: sample_object_id('c'),
+            signed_metadata: sample_signed_run_metadata(),
+            signature: sample_ssh_signature(),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let back: ServerMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, msg);
+    }
+
+    /// Pin the wire type tag and the public field names. A regression
+    /// in any of these would silently break bailiff at parse time once
+    /// slice B starts emitting real responses.
+    #[test]
+    fn run_agent_completed_pins_wire_shape() {
+        let msg = ServerMessage::RunAgentCompleted {
+            output_oid: sample_object_id('c'),
+            signed_metadata: sample_signed_run_metadata(),
+            signature: sample_ssh_signature(),
+        };
+        let value: serde_json::Value = serde_json::to_value(&msg).unwrap();
+        assert_eq!(value["type"], "run_agent_completed");
+        assert!(value.get("output_oid").is_some(), "wire: {value}");
+        assert!(value.get("signed_metadata").is_some(), "wire: {value}");
+        assert!(value.get("signature").is_some(), "wire: {value}");
+        let meta = &value["signed_metadata"];
+        for field in [
+            "run_id",
+            "session_id",
+            "prompt_sha256",
+            "output_envelope_sha256",
+            "capabilities",
+            "exit_code",
+            "completed_at",
+            "signing_key_fingerprint",
+        ] {
+            assert!(
+                meta.get(field).is_some(),
+                "signed_metadata missing field {field}: {meta}",
+            );
+        }
+    }
+
+    /// `deny_unknown_fields` on `SignedRunMetadata` catches an
+    /// unexpected key at parse time. The canonical bytes that
+    /// `signature` covers are reconstructed from exactly this field
+    /// set; a silently-dropped extra field would make verification
+    /// inconsistent across versions.
+    #[test]
+    fn signed_run_metadata_rejects_unknown_fields() {
+        let mut value: serde_json::Value =
+            serde_json::to_value(sample_signed_run_metadata()).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .insert("extra".into(), serde_json::Value::String("nope".into()));
+        let err = serde_json::from_value::<SignedRunMetadata>(value).unwrap_err();
+        assert!(
+            err.to_string().contains("extra") || err.to_string().contains("unknown field"),
+            "expected unknown-field error, got: {err}",
+        );
+    }
+
+    /// A malformed digest on the wire must be rejected at parse time
+    /// rather than reaching the verifier. The error message must point
+    /// the operator at the malformed value.
+    #[test]
+    fn signed_run_metadata_rejects_malformed_prompt_sha256() {
+        let mut value: serde_json::Value =
+            serde_json::to_value(sample_signed_run_metadata()).unwrap();
+        value["prompt_sha256"] = serde_json::Value::String("not-a-hash".into());
+        let err = serde_json::from_value::<SignedRunMetadata>(value).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("64") || msg.contains("hex"),
+            "expected digest error, got: {msg}",
+        );
+    }
+
+    /// Likewise for the fingerprint: the trust anchor is keyed by the
+    /// `SHA256:` prefix shape, so a missing prefix is a wire-level
+    /// rejection.
+    #[test]
+    fn signed_run_metadata_rejects_malformed_fingerprint() {
+        let mut value: serde_json::Value =
+            serde_json::to_value(sample_signed_run_metadata()).unwrap();
+        value["signing_key_fingerprint"] = serde_json::Value::String("MD5:abc".into());
+        let err = serde_json::from_value::<SignedRunMetadata>(value).unwrap_err();
+        assert!(
+            err.to_string().contains("SHA256:"),
+            "expected fingerprint error, got: {err}",
+        );
+    }
+
+    /// And likewise for the signature: a missing PEM framing marker
+    /// is a wire-level rejection.
+    #[test]
+    fn run_agent_completed_rejects_malformed_signature() {
+        let mut value: serde_json::Value = serde_json::to_value(ServerMessage::RunAgentCompleted {
+            output_oid: sample_object_id('c'),
+            signed_metadata: sample_signed_run_metadata(),
+            signature: sample_ssh_signature(),
+        })
+        .unwrap();
+        value["signature"] = serde_json::Value::String("not a pem block".into());
+        let err = serde_json::from_value::<ServerMessage>(value).unwrap_err();
+        assert!(
+            err.to_string().contains("BEGIN SSH SIGNATURE")
+                || err.to_string().contains("END SSH SIGNATURE"),
+            "expected signature error, got: {err}",
+        );
+    }
+
+    /// `run_agent_completed` must carry its own type tag so a client
+    /// dispatching on `type` distinguishes it from a generic
+    /// internal-failure `Error` without parsing the message string.
+    #[test]
+    fn run_agent_completed_distinct_from_error() {
+        let completed: serde_json::Value = serde_json::to_value(ServerMessage::RunAgentCompleted {
+            output_oid: sample_object_id('c'),
+            signed_metadata: sample_signed_run_metadata(),
+            signature: sample_ssh_signature(),
+        })
+        .unwrap();
+        let error: serde_json::Value = serde_json::to_value(ServerMessage::Error {
+            message: "internal".into(),
+        })
+        .unwrap();
+        assert_ne!(completed["type"], error["type"]);
     }
 
     /// Session-state outcomes carry their own type tag so a client
