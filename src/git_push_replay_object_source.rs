@@ -65,6 +65,18 @@ pub struct CatFileObjectSource {
     /// at the top level so [`Drop`] can `killpg` the whole group
     /// without needing access to the child through the mutex.
     pgid: libc::pid_t,
+    /// Hard cap on the declared (uncompressed) size of any single
+    /// `cat-file` response payload. The staging repo is built from
+    /// an untrusted bundle, so the size field in a cat-file header
+    /// is attacker-controlled; without this cap a small compressed
+    /// pack could declare a multi-gigabyte object and OOM the
+    /// broker on the pre-allocation in `read_object_raw`. The first
+    /// header that exceeds this cap poisons the source: subsequent
+    /// reads return [`GitObjectSourceError::Poisoned`] and the
+    /// cat-file process group is killed, because the wire framing
+    /// is no longer recoverable (the declared payload bytes never
+    /// came out of stdout).
+    max_object_bytes: u64,
     /// `None` once [`close`](Self::close) has consumed the child. Drop
     /// uses this discriminator to decide whether to send SIGKILL: a
     /// clean close should not kill, because the leader has already
@@ -77,6 +89,11 @@ struct CatFileChild {
     child: Child,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
+    /// Set when an over-limit response (or any other unrecoverable
+    /// framing error) leaves the wire out of sync. Once true,
+    /// `read_object_raw` returns `Poisoned` without touching stdin
+    /// or stdout.
+    poisoned: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -118,7 +135,11 @@ impl CatFileObjectSource {
     /// wrapper script behind `git_program` spawns) before the source
     /// is dropped. `kill_on_drop(true)` is left on so tokio reaps the
     /// leader after our `killpg` runs and avoids a zombie.
-    pub async fn open(staging_repo: &Path, git_program: &Path) -> Result<Self, OpenError> {
+    pub async fn open(
+        staging_repo: &Path,
+        git_program: &Path,
+        max_object_bytes: u64,
+    ) -> Result<Self, OpenError> {
         let program = clean_git::resolve_program_for_clean_env(git_program).await?;
         let mut command = Command::new(&program);
         command.env_clear();
@@ -151,10 +172,12 @@ impl CatFileObjectSource {
         let stdout = child.stdout.take().ok_or(OpenError::MissingStdout)?;
         Ok(Self {
             pgid,
+            max_object_bytes,
             inner: Some(Mutex::new(CatFileChild {
                 child,
                 stdin,
                 stdout: BufReader::new(stdout),
+                poisoned: false,
             })),
         })
     }
@@ -187,6 +210,7 @@ impl CatFileObjectSource {
             mut child,
             stdin,
             stdout,
+            poisoned: _,
         } = mutex.into_inner();
         drop(stdin);
         drop(stdout);
@@ -316,7 +340,7 @@ impl CatFileObjectSource {
 
 impl GitObjectSource for CatFileObjectSource {
     async fn read_commit(&self, sha: &GitObjectId) -> Result<StagingCommit, GitObjectSourceError> {
-        let raw = read_object_raw(self.child_mutex(), sha, "commit").await?;
+        let raw = self.read_object_raw(sha, "commit").await?;
         parse_commit_object(&raw).map_err(|reason| GitObjectSourceError::Malformed {
             sha: sha.as_str().to_string(),
             reason: reason.to_string(),
@@ -324,7 +348,7 @@ impl GitObjectSource for CatFileObjectSource {
     }
 
     async fn read_tree(&self, sha: &GitObjectId) -> Result<StagingTree, GitObjectSourceError> {
-        let raw = read_object_raw(self.child_mutex(), sha, "tree").await?;
+        let raw = self.read_object_raw(sha, "tree").await?;
         parse_tree_object(&raw).map_err(|reason| GitObjectSourceError::Malformed {
             sha: sha.as_str().to_string(),
             reason: reason.to_string(),
@@ -332,136 +356,174 @@ impl GitObjectSource for CatFileObjectSource {
     }
 
     async fn read_blob(&self, sha: &GitObjectId) -> Result<Vec<u8>, GitObjectSourceError> {
-        read_object_raw(self.child_mutex(), sha, "blob").await
+        self.read_object_raw(sha, "blob").await
     }
 }
 
-async fn read_object_raw(
-    inner: &Mutex<CatFileChild>,
-    sha: &GitObjectId,
-    expected_type: &str,
-) -> Result<Vec<u8>, GitObjectSourceError> {
-    let mut guard = inner.lock().await;
-    let child = &mut *guard;
+impl CatFileObjectSource {
+    async fn read_object_raw(
+        &self,
+        sha: &GitObjectId,
+        expected_type: &str,
+    ) -> Result<Vec<u8>, GitObjectSourceError> {
+        let mut guard = self.child_mutex().lock().await;
+        let child = &mut *guard;
+        if child.poisoned {
+            return Err(GitObjectSourceError::Poisoned);
+        }
 
-    let request = format!("{}\n", sha.as_str());
-    child
-        .stdin
-        .write_all(request.as_bytes())
-        .await
-        .map_err(|source| GitObjectSourceError::Io { source })?;
-    child
-        .stdin
-        .flush()
-        .await
-        .map_err(|source| GitObjectSourceError::Io { source })?;
+        let request = format!("{}\n", sha.as_str());
+        child
+            .stdin
+            .write_all(request.as_bytes())
+            .await
+            .map_err(|source| GitObjectSourceError::Io { source })?;
+        child
+            .stdin
+            .flush()
+            .await
+            .map_err(|source| GitObjectSourceError::Io { source })?;
 
-    let mut header = String::new();
-    let read = child
-        .stdout
-        .read_line(&mut header)
-        .await
-        .map_err(|source| GitObjectSourceError::Io { source })?;
-    if read == 0 {
-        return Err(GitObjectSourceError::Io {
-            source: io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "`git cat-file --batch` closed stdout before responding",
-            ),
-        });
-    }
-    if !header.ends_with('\n') {
-        return Err(GitObjectSourceError::Io {
-            source: io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "`git cat-file --batch` response header is not LF-terminated",
-            ),
-        });
-    }
-    header.pop();
-
-    let mut fields = header.split(' ');
-    let _echoed_sha = fields
-        .next()
-        .ok_or_else(|| GitObjectSourceError::Malformed {
-            sha: sha.as_str().to_string(),
-            reason: format!("empty cat-file response: {header:?}"),
-        })?;
-    let kind_field = fields
-        .next()
-        .ok_or_else(|| GitObjectSourceError::Malformed {
-            sha: sha.as_str().to_string(),
-            reason: format!("cat-file response missing type field: {header:?}"),
-        })?;
-    // `missing` and `ambiguous` carry no payload, so we can return
-    // immediately without disturbing the pipe framing.
-    match kind_field {
-        "missing" => {
-            return Err(GitObjectSourceError::NotFound {
-                sha: sha.as_str().to_string(),
+        let mut header = String::new();
+        let read = child
+            .stdout
+            .read_line(&mut header)
+            .await
+            .map_err(|source| GitObjectSourceError::Io { source })?;
+        if read == 0 {
+            return Err(GitObjectSourceError::Io {
+                source: io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "`git cat-file --batch` closed stdout before responding",
+                ),
             });
         }
-        "ambiguous" => {
+        if !header.ends_with('\n') {
+            return Err(GitObjectSourceError::Io {
+                source: io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "`git cat-file --batch` response header is not LF-terminated",
+                ),
+            });
+        }
+        header.pop();
+
+        let mut fields = header.split(' ');
+        let _echoed_sha = fields
+            .next()
+            .ok_or_else(|| GitObjectSourceError::Malformed {
+                sha: sha.as_str().to_string(),
+                reason: format!("empty cat-file response: {header:?}"),
+            })?;
+        let kind_field = fields
+            .next()
+            .ok_or_else(|| GitObjectSourceError::Malformed {
+                sha: sha.as_str().to_string(),
+                reason: format!("cat-file response missing type field: {header:?}"),
+            })?;
+        // `missing` and `ambiguous` carry no payload, so we can
+        // return immediately without disturbing the pipe framing.
+        match kind_field {
+            "missing" => {
+                return Err(GitObjectSourceError::NotFound {
+                    sha: sha.as_str().to_string(),
+                });
+            }
+            "ambiguous" => {
+                return Err(GitObjectSourceError::Malformed {
+                    sha: sha.as_str().to_string(),
+                    reason: "cat-file reported the SHA as ambiguous".to_string(),
+                });
+            }
+            _ => {}
+        }
+        let size_field = fields
+            .next()
+            .ok_or_else(|| GitObjectSourceError::Malformed {
+                sha: sha.as_str().to_string(),
+                reason: format!("cat-file response missing size field: {header:?}"),
+            })?;
+        if fields.next().is_some() {
             return Err(GitObjectSourceError::Malformed {
                 sha: sha.as_str().to_string(),
-                reason: "cat-file reported the SHA as ambiguous".to_string(),
+                reason: format!("cat-file response has trailing junk: {header:?}"),
             });
         }
-        _ => {}
-    }
-    let size_field = fields
-        .next()
-        .ok_or_else(|| GitObjectSourceError::Malformed {
-            sha: sha.as_str().to_string(),
-            reason: format!("cat-file response missing size field: {header:?}"),
-        })?;
-    if fields.next().is_some() {
-        return Err(GitObjectSourceError::Malformed {
-            sha: sha.as_str().to_string(),
-            reason: format!("cat-file response has trailing junk: {header:?}"),
-        });
-    }
-    let size: usize =
-        size_field
-            .parse()
-            .map_err(|err: ParseIntError| GitObjectSourceError::Malformed {
+        // Parse the declared size as u64 before comparing to the
+        // configured cap, so an attacker-controlled bundle cannot
+        // overflow usize on a 32-bit target into a small allocation.
+        let declared_size: u64 =
+            size_field
+                .parse()
+                .map_err(|err: ParseIntError| GitObjectSourceError::Malformed {
+                    sha: sha.as_str().to_string(),
+                    reason: format!("cat-file size field {size_field:?} is not a u64: {err}"),
+                })?;
+        if declared_size > self.max_object_bytes {
+            // The wire framing is now permanently out of sync: we
+            // signalled to cat-file that we would read `declared_size`
+            // payload bytes, and we are about to refuse them. The
+            // next request's response would land partway through this
+            // object's body. Mark the source poisoned, kill the
+            // process group so the leader stops emitting bytes we
+            // would never drain, and return.
+            child.poisoned = true;
+            kill_process_group_best_effort(self.pgid, false)
+                .map_err(|source| GitObjectSourceError::Io { source })?;
+            return Err(GitObjectSourceError::ObjectTooLarge {
                 sha: sha.as_str().to_string(),
-                reason: format!("cat-file size field {size_field:?} is not a usize: {err}"),
-            })?;
+                size: declared_size,
+                max: self.max_object_bytes,
+            });
+        }
+        // Safe: declared_size <= max_object_bytes <= u64, and the
+        // production cap will be set well below usize::MAX. On a
+        // 32-bit host the cap must be < 4 GiB; we rely on the
+        // operator setting it appropriately.
+        let size: usize =
+            declared_size
+                .try_into()
+                .map_err(|_| GitObjectSourceError::Malformed {
+                    sha: sha.as_str().to_string(),
+                    reason: format!(
+                        "cat-file size {declared_size} fits within the cap but not in usize on this host"
+                    ),
+                })?;
 
-    // Drain the full payload (size bytes + trailing LF) before
-    // applying the type check. Returning early on a type mismatch
-    // without consuming the body would leave the next caller's
-    // read_* framed against the tail of this object's bytes,
-    // silently corrupting every subsequent read.
-    let mut payload = vec![0u8; size];
-    child
-        .stdout
-        .read_exact(&mut payload)
-        .await
-        .map_err(|source| GitObjectSourceError::Io { source })?;
-    let mut trailing = [0u8; 1];
-    child
-        .stdout
-        .read_exact(&mut trailing)
-        .await
-        .map_err(|source| GitObjectSourceError::Io { source })?;
-    if trailing[0] != b'\n' {
-        return Err(GitObjectSourceError::Malformed {
-            sha: sha.as_str().to_string(),
-            reason: format!(
-                "cat-file payload not LF-terminated: trailing byte 0x{:02x}",
-                trailing[0]
-            ),
-        });
+        // Drain the full payload (size bytes + trailing LF) before
+        // applying the type check. Returning early on a type
+        // mismatch without consuming the body would leave the next
+        // caller's read_* framed against the tail of this object's
+        // bytes, silently corrupting every subsequent read.
+        let mut payload = vec![0u8; size];
+        child
+            .stdout
+            .read_exact(&mut payload)
+            .await
+            .map_err(|source| GitObjectSourceError::Io { source })?;
+        let mut trailing = [0u8; 1];
+        child
+            .stdout
+            .read_exact(&mut trailing)
+            .await
+            .map_err(|source| GitObjectSourceError::Io { source })?;
+        if trailing[0] != b'\n' {
+            return Err(GitObjectSourceError::Malformed {
+                sha: sha.as_str().to_string(),
+                reason: format!(
+                    "cat-file payload not LF-terminated: trailing byte 0x{:02x}",
+                    trailing[0]
+                ),
+            });
+        }
+        if kind_field != expected_type {
+            return Err(GitObjectSourceError::Malformed {
+                sha: sha.as_str().to_string(),
+                reason: format!("expected `{expected_type}`, got `{kind_field}`"),
+            });
+        }
+        Ok(payload)
     }
-    if kind_field != expected_type {
-        return Err(GitObjectSourceError::Malformed {
-            sha: sha.as_str().to_string(),
-            reason: format!("expected `{expected_type}`, got `{kind_field}`"),
-        });
-    }
-    Ok(payload)
 }
 
 #[cfg(test)]
@@ -588,7 +650,7 @@ mod tests {
         };
 
         let git = locate_git();
-        let source = CatFileObjectSource::open(repo, &git)
+        let source = CatFileObjectSource::open(repo, &git, 256 << 20)
             .await
             .expect("open cat-file");
 
@@ -619,7 +681,7 @@ mod tests {
         run_git(repo, &["init", "--bare"]);
 
         let git = locate_git();
-        let source = CatFileObjectSource::open(repo, &git)
+        let source = CatFileObjectSource::open(repo, &git, 256 << 20)
             .await
             .expect("open cat-file");
 
@@ -658,7 +720,7 @@ mod tests {
         let other_id = GitObjectId::new(other_sha).expect("valid sha");
 
         let git = locate_git();
-        let source = CatFileObjectSource::open(repo, &git)
+        let source = CatFileObjectSource::open(repo, &git, 256 << 20)
             .await
             .expect("open cat-file");
 
@@ -697,7 +759,7 @@ mod tests {
         assert!(!nonexistent.exists());
 
         let git = locate_git();
-        let source = CatFileObjectSource::open(&nonexistent, &git)
+        let source = CatFileObjectSource::open(&nonexistent, &git, 256 << 20)
             .await
             .expect("open succeeds (spawn does not wait)");
 
@@ -710,6 +772,70 @@ mod tests {
             msg.contains("non-zero status"),
             "expected non-zero-status diagnostic, got: {msg}"
         );
+    }
+
+    #[tokio::test]
+    async fn cat_file_source_rejects_oversized_payload_and_poisons_source() {
+        // Regression for codex round-1 P1: when the staging repo is
+        // an untrusted bundle, the size field in a cat-file header
+        // is attacker-controlled. Allocating `Vec::with_capacity`
+        // for that size lets a small, valid-looking bundle declare
+        // a multi-gigabyte object and OOM the broker. The
+        // `read_object_raw` path must compare the declared size to
+        // the configured cap *before* allocating, abort the source
+        // on over-limit, and refuse all subsequent reads (the wire
+        // framing is now hosed because we never consumed the
+        // declared payload bytes).
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let wrapper = tmp.path().join("wrap.sh");
+        // The wrapper reads one SHA, claims it is a 10 GiB blob,
+        // and then sleeps so the test still controls process
+        // lifetime. We never actually emit the payload bytes.
+        let script = "#!/bin/sh\n\
+                      read -r sha\n\
+                      printf '%s blob 10737418240\\n' \"$sha\"\n\
+                      exec sleep 600\n";
+        std::fs::write(&wrapper, script).expect("write wrapper");
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod wrapper");
+
+        // 1 MiB cap — well below the declared 10 GiB.
+        let source = CatFileObjectSource::open(tmp.path(), &wrapper, 1 << 20)
+            .await
+            .expect("open wrapper");
+
+        let target = sample_object_id('a');
+        let err = source
+            .read_blob(&target)
+            .await
+            .expect_err("oversized declared size must be rejected pre-allocation");
+        match err {
+            GitObjectSourceError::ObjectTooLarge { ref sha, size, max } => {
+                assert_eq!(sha, target.as_str());
+                assert_eq!(size, 10_737_418_240);
+                assert_eq!(max, 1 << 20);
+            }
+            other => panic!("expected ObjectTooLarge, got: {other:?}"),
+        }
+
+        // Subsequent reads must fail fast — the source has been
+        // poisoned and the wire framing is no longer recoverable.
+        let err = source
+            .read_blob(&target)
+            .await
+            .expect_err("source must be poisoned after over-limit");
+        assert!(
+            matches!(err, GitObjectSourceError::Poisoned),
+            "got: {err:?}"
+        );
+
+        // We deliberately do not `close()` here: aborting on
+        // over-limit kills the process group, so any close() call
+        // would race against the SIGKILL'd child. Dropping the
+        // source is the documented post-poison cleanup path.
+        drop(source);
     }
 
     /// True iff `pid` has had a fatal signal delivered: either the
@@ -797,7 +923,7 @@ mod tests {
             .expect("chmod wrapper");
 
         let helper_pid = {
-            let _source = CatFileObjectSource::open(tmp.path(), &wrapper)
+            let _source = CatFileObjectSource::open(tmp.path(), &wrapper, 256 << 20)
                 .await
                 .expect("open wrapper");
             let pid = wait_for_helper_pid(&helper_pid_file)
@@ -851,7 +977,7 @@ mod tests {
         std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755))
             .expect("chmod wrapper");
 
-        let source = CatFileObjectSource::open(tmp.path(), &wrapper)
+        let source = CatFileObjectSource::open(tmp.path(), &wrapper, 256 << 20)
             .await
             .expect("open wrapper");
 
