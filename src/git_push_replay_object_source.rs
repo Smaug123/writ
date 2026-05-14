@@ -617,6 +617,24 @@ mod tests {
         panic!("git not found on PATH");
     }
 
+    /// Resolve an absolute path to `sleep` from the host's PATH. The
+    /// wrapper-script-based tests spawn `/bin/sh` under
+    /// `env_clear()`, so the wrapper inherits no `PATH`. POSIX gives
+    /// the shell a default search path, but it omits Nix store
+    /// directories on NixOS — `sleep` then isn't found and the
+    /// wrapper exits 127 before the test can observe it. Embedding
+    /// the absolute path bypasses the PATH lookup entirely.
+    fn locate_sleep() -> std::path::PathBuf {
+        let path = std::env::var_os("PATH").expect("PATH set in tests");
+        for dir in std::env::split_paths(&path) {
+            let candidate = dir.join("sleep");
+            if candidate.is_file() {
+                return candidate;
+            }
+        }
+        panic!("sleep not found on PATH");
+    }
+
     #[tokio::test]
     async fn cat_file_source_reads_blob_tree_and_commit() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -805,10 +823,16 @@ mod tests {
         // The wrapper reads one SHA, claims it is a 10 GiB blob,
         // and then sleeps so the test still controls process
         // lifetime. We never actually emit the payload bytes.
-        let script = "#!/bin/sh\n\
-                      read -r sha\n\
-                      printf '%s blob 10737418240\\n' \"$sha\"\n\
-                      exec sleep 600\n";
+        // Absolute sleep path: the wrapper runs with env_clear()'d
+        // PATH, so we can't rely on `sleep` resolving via PATH.
+        let sleep = locate_sleep();
+        let script = format!(
+            "#!/bin/sh\n\
+             read -r sha\n\
+             printf '%s blob 10737418240\\n' \"$sha\"\n\
+             exec {sleep} 600\n",
+            sleep = sleep.display(),
+        );
         std::fs::write(&wrapper, script).expect("write wrapper");
         std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755))
             .expect("chmod wrapper");
@@ -923,11 +947,15 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let wrapper = tmp.path().join("wrap.sh");
         let helper_pid_file = tmp.path().join("helper.pid");
+        // Absolute sleep path: the wrapper runs with env_clear()'d
+        // PATH, so we can't rely on `sleep` resolving via PATH.
+        let sleep = locate_sleep();
         let script = format!(
             "#!/bin/sh\n\
-             sleep 600 &\n\
+             {sleep} 600 &\n\
              echo $! > {helper}\n\
-             exec sleep 600\n",
+             exec {sleep} 600\n",
+            sleep = sleep.display(),
             helper = helper_pid_file.display(),
         );
         std::fs::write(&wrapper, script).expect("write wrapper");
@@ -978,11 +1006,15 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let wrapper = tmp.path().join("wrap.sh");
         let helper_pid_file = tmp.path().join("helper.pid");
+        // Absolute sleep path: the wrapper runs with env_clear()'d
+        // PATH, so we can't rely on `sleep` resolving via PATH.
+        let sleep = locate_sleep();
         let script = format!(
             "#!/bin/sh\n\
-             sleep 600 &\n\
+             {sleep} 600 &\n\
              echo $! > {helper}\n\
-             exec sleep 600\n",
+             exec {sleep} 600\n",
+            sleep = sleep.display(),
             helper = helper_pid_file.display(),
         );
         std::fs::write(&wrapper, script).expect("write wrapper");
