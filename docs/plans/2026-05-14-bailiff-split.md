@@ -108,13 +108,12 @@ RPC, shape sketched (final field set decided in implementation):
 ```
 ClientMessage::RunAgent {
     prompt: AgentPrompt,
-    capability_set: CapabilitySet,
+    capabilities: Vec<CapabilitySet>,
     purpose: String,        // opaque to writ; recorded as-is in audit
     output_ref: GitRef,     // where in bailiff's repo to write the
                             // signed output note
 }
 
-ServerMessage::RunAgentStarted { run_id }
 ServerMessage::RunAgentCompleted {
     run_id,
     output_oid,             // OID of the blob writ wrote into bailiff's
@@ -124,16 +123,25 @@ ServerMessage::RunAgentCompleted {
 }
 ```
 
-On `RunAgent`, writ spawns the agent, captures stdout, hashes it,
-signs the metadata, writes the bytes as a blob and the signature as
-a note in bailiff's repo at the requested ref. Audit row records the
-hash + signature. `RunAgentStarted` returns immediately; the
-`RunAgentCompleted` notification arrives when the run terminates
-(success or failure).
+`RunAgent` is request/response over the existing one-shot dispatch
+path: writ spawns the agent, waits for it to terminate, hashes the
+captured stdout, signs the metadata, writes the bytes as a blob and
+the signature as a note in bailiff's repo at the requested ref, and
+returns a single `RunAgentCompleted`. The audit row records the hash
++ signature. No separate "started" frame: there is nothing for
+bailiff to do mid-run on the writ wire (mid-run agent coordination
+goes through bailiff's own channels — see below).
 
 Pre-v1: whole-artefact-at-end. No streaming. If the agent crashes
 with partial output, writ still writes whatever was captured and
 signs the partial; the audit row records the non-zero exit code.
+
+Keeping `RunAgent` synchronous on the wire keeps slice A small: the
+existing `dispatch_message` loop in `src/server.rs` returns one
+`ServerMessage` per request, and slice B fits that shape without
+having to refactor the connection handler. A future "started + later
+completed" split (needed for cancellation while a run is in flight,
+or for streaming) is an explicit non-goal here.
 
 ### Capability sets
 
@@ -154,11 +162,14 @@ enum CapabilitySet {
 }
 ```
 
-A run may be granted a set of these. Writ enforces each through the
-existing `policy::*` matrix — `policy` stays inside writ as the
-authorisation oracle, just keyed on capability-set variants instead
-of stage. Bailiff decides which set is appropriate for each workflow
-position.
+A run may be granted a set of these — hence the `Vec<CapabilitySet>`
+in the request — so that, e.g., an implementer can hold both
+`WorkspaceWrite` and `GithubScoped` simultaneously without bailiff
+having to pick a single composite variant. Writ enforces each
+granted capability through the existing `policy::*` matrix —
+`policy` stays inside writ as the authorisation oracle, just keyed
+on capability-set variants instead of stage. Bailiff decides which
+set is appropriate for each workflow position.
 
 ### What stays in writ but changes shape
 
@@ -219,8 +230,13 @@ new path is exercised end-to-end alongside it.
 `bailiff plan decide accept|reject` writes a decision note. `bailiff
 plan review` spawns a reviewer agent through `RunAgent` with a
 review-stage capability set and the plan body composed into the
-prompt (composition is bailiff-internal now; writ never sees the
-plan body in this slice).
+prompt. Composition is bailiff-internal: writ still receives the
+composed prompt bytes (it has to, in order to forward them to the
+agent's stdin) but writ does not store, persist, or interpret them.
+The boundary writ enforces is "bytes in transit, not artefacts": the
+plan body never lands in writ's audit DB, never appears in writ's
+storage, never gates writ's behaviour. That's the same shape writ
+already gives `agent_run` prompts today.
 
 ### Slice E — implementer through new shape
 
