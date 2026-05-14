@@ -153,13 +153,26 @@ pub fn load_signing_key(
 }
 
 /// Load the writ signing key from `store` at `key`, generating and
-/// persisting a fresh Ed25519 keypair if none is present. Idempotent:
-/// after the first call the key is in the store and every subsequent
-/// call returns [`EnsureOutcome::Loaded`] with the same key material.
+/// persisting a fresh Ed25519 keypair if none is present. Idempotent
+/// across serial boots: once the first call has populated the store,
+/// every subsequent call returns [`EnsureOutcome::Loaded`] with the
+/// same key material.
 ///
 /// The caller can branch on the returned outcome — e.g. to print the
 /// freshly-generated fingerprint at boot so the operator knows what to
 /// add to bailiff's allowed-signers file.
+///
+/// Concurrency: this function is **not race-safe against concurrent
+/// first boots**. Two callers that both observe an empty store will
+/// each generate a fresh keypair and call `put`; the second `put`
+/// wins, so the first caller returns a signer whose fingerprint is
+/// no longer in the store. This is acceptable under the v1 deployment
+/// shape — one writ daemon per host, one boot at a time, and the
+/// race window is just the first boot — but does not extend to a
+/// shared-`SecretStore` multi-daemon setup. Hardening that case
+/// requires an atomic create-if-absent operation on the `SecretStore`
+/// trait (`O_CREAT|O_EXCL` on the file backend) and is tracked in
+/// <https://github.com/Smaug123/writ/issues/101>.
 pub fn ensure_signing_key(
     store: &dyn SecretStore,
     key: &SecretKey,
