@@ -1,0 +1,1 @@
+Once you've committed and raised a PR, please execute `codex review --base main` (for example, assuming the PR is against `main`) to obtain a review from Codex. This outputs a great deal of text to stdout before finally giving freeform review text.
