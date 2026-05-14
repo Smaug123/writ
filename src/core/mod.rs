@@ -8,6 +8,8 @@ mod grant;
 mod notes_ref;
 mod request;
 mod session;
+mod sha256_hex;
+mod signing;
 
 pub use agent_vm::{
     AgentFirewallNetwork, AgentNetwork, AgentNetworkPool, AgentVmConfigError, BrokerPort,
@@ -23,6 +25,8 @@ pub use grant::CredentialGrant;
 pub use notes_ref::{NotesRef, NotesRefError};
 pub use request::{CapabilityRequest, GitHubRequest};
 pub use session::{AgentKind, SessionRecord};
+pub use sha256_hex::{Sha256Hex, Sha256HexError};
+pub use signing::{SshKeyFingerprint, SshKeyFingerprintError, SshSignature, SshSignatureError};
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;

@@ -49,6 +49,11 @@ name = "writd"
 path = "src/bin/writd.rs"
 required-features = ["host"]
 
+[[bin]]
+name = "bailiff"
+path = "src/bin/bailiff.rs"
+required-features = ["host"]
+
 [dependencies]
 clap = { version = "4", features = ["derive", "env"] }
 serde = { version = "1", features = ["derive"] }
