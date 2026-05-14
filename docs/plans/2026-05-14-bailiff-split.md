@@ -63,23 +63,25 @@ notes), workflow vocabulary leaves writ entirely.
 - **Sessions and credential grants.** Existing. Per-session per-route
   minting, audited.
 - **Agent runs.** Spawn an agent with a prompt and a set of
-  capabilities, capture stdout/stderr, sign the terminal artefact,
-  write the signed artefact as a Git object into bailiff's repo.
-  Audit (run_id, prompt_sha256, capabilities, output_sha256,
-  signature, exit_code) — `capabilities` is the same canonical
-  collection writ accepted on the wire, so a multi-capability run
-  records every granted variant, not a single composite.
+  capabilities, capture stdout/stderr into a canonical envelope
+  blob, sign the envelope hash + metadata, write the envelope as a
+  Git object into bailiff's repo. Audit (run_id, prompt_sha256,
+  capabilities, output_envelope_sha256, signature, exit_code) —
+  `capabilities` is the same canonical collection writ accepted on
+  the wire, so a multi-capability run records every granted variant,
+  not a single composite.
 - **Signing.** Writ holds an SSH signing key. Every terminal output
   gets a detached signature over the canonical bytes of
-  `SignedRunMetadata { run_id, prompt_sha256, output_sha256,
-  capabilities, exit_code, completed_at, session_id }` — exactly the
-  things writ observed first-hand. Including `prompt_sha256` is what
-  binds the signed output to its originating prompt: a third party
-  verifying the note can re-hash bailiff's plan note and confirm it
-  matches the prompt writ saw, ruling out "valid signature + swapped
-  prompt" forgeries. The signature is what bailiff (and any third
-  party) uses to attest "writ confirms this output came from run R
-  driven by prompt P under capabilities C at time T."
+  `SignedRunMetadata { run_id, prompt_sha256, output_envelope_sha256,
+  capabilities, exit_code, completed_at, session_id,
+  signing_key_fingerprint }` — exactly the things writ observed
+  first-hand, plus its own key identity. Including `prompt_sha256`
+  is what binds the signed output to its originating prompt: a third
+  party verifying the note can re-hash bailiff's plan note and
+  confirm it matches the prompt writ saw, ruling out "valid signature
+  + swapped prompt" forgeries. The signature is what bailiff (and any
+  third party) uses to attest "writ confirms this output came from
+  run R driven by prompt P under capabilities C at time T."
 
 Writ knows nothing about the words "plan", "review", "decide",
 "execute". The `Stage` enum and `read_plan_id` column are gone.
@@ -124,39 +126,55 @@ ClientMessage::RunAgent {
 
 ServerMessage::RunAgentCompleted {
     run_id,
-    output_oid,                 // OID of the blob writ wrote into
-                                // bailiff's repo
+    output_oid,                 // OID of the output envelope blob writ
+                                // wrote into bailiff's repo
     signed_metadata: SignedRunMetadata {
         run_id,
         prompt_sha256,
-        output_sha256,          // matches the blob at `output_oid`
+        output_envelope_sha256, // matches the blob at `output_oid`
         capabilities,           // canonical serialisation of the granted Vec
         exit_code,
         completed_at,
         session_id,
+        signing_key_fingerprint, // SSH key fingerprint identifying writ's
+                                 // signer; bailiff's keyring resolves it
     },
-    signature,                  // detached signature over the canonical
-                                // bytes of signed_metadata
+    signature,                  // detached SSH signature over the
+                                // canonical bytes of signed_metadata
 }
 ```
+
+The output envelope is a single blob covering both streams (one
+canonical container framing `{stdout_bytes, stderr_bytes,
+stdout_truncated_at, stderr_truncated_at}`). Signing the envelope
+hash rather than stdout alone means stderr — which carries
+meaningful diagnostics, especially for non-zero exit codes — can't
+be silently lost or altered after the fact. The blob writ writes
+into bailiff's repo *is* the envelope; bailiff's reader splits it
+back into per-stream bytes for display.
 
 The `SignedRunMetadata` payload is exactly what writ hashed and
 signed; returning it in full (rather than just the signature) is
 what lets bailiff or any third-party reader re-canonicalise the
-bytes and verify the signature without consulting writ. The note
-stored in bailiff's repo contains the same `(signed_metadata,
-signature)` pair alongside the output blob, so verification is
-self-contained from a clone of bailiff's repo.
+bytes and verify the signature. The note stored in bailiff's repo
+contains the same `(signed_metadata, signature)` pair alongside the
+output blob, so verification is self-contained from a clone of
+bailiff's repo *plus* its keyring: `signing_key_fingerprint`
+identifies which writ-side key produced the signature, and bailiff
+resolves the fingerprint to a public key via a config-driven SSH
+allowed-signers file (the same trust-anchor shape Git itself uses
+for commit-signature verification). Bailiff refuses to ingest a
+note whose fingerprint isn't in the keyring.
 
 `RunAgent` is request/response over the existing one-shot dispatch
-path: writ spawns the agent, waits for it to terminate, hashes the
-captured stdout, signs the metadata, writes the bytes as a blob and
-the signed metadata + signature as a note in bailiff's repo at the
-requested ref, and returns a single `RunAgentCompleted`. The audit
-row records the same canonical metadata + signature. No separate
-"started" frame: there is nothing for bailiff to do mid-run on the
-writ wire (mid-run agent coordination goes through bailiff's own
-channels — see below).
+path: writ spawns the agent, waits for it to terminate, builds the
+output envelope from stdout + stderr, hashes it, signs the metadata,
+writes the envelope as a blob and the signed metadata + signature
+as a note in bailiff's repo at the requested ref, and returns a
+single `RunAgentCompleted`. The audit row records the same canonical
+metadata + signature. No separate "started" frame: there is nothing
+for bailiff to do mid-run on the writ wire (mid-run agent
+coordination goes through bailiff's own channels — see below).
 
 Pre-v1: whole-artefact-at-end. No streaming. If the agent crashes
 with partial output, writ still writes whatever was captured and
@@ -320,6 +338,11 @@ CLI reference.
 - **Signing key management.** Writ now holds a long-lived signing key
   alongside short-lived credentials. Same `SecretStore` abstraction
   the GitHub App key uses applies.
+- **Trust-anchor distribution.** Bailiff verifying a signed note
+  requires knowing which SSH public key(s) are allowed to sign on
+  writ's behalf. Bootstrap is "writ prints its key fingerprint on
+  first run; operator adds it to bailiff's allowed-signers file."
+  Single-host pre-v1; documenting a key-rotation flow is deferred.
 - **Bailiff's repo accumulates plan refs.** Same problem any
   append-only Git data store has. GC/rotation deferred.
 - **In-flight slice 3 (originating_prompt on `PlanView`) is dropped.**
