@@ -25,14 +25,20 @@
 //!
 //! **Subprocess hardening.** Every git invocation runs under the
 //! same hardened environment `clean_git` uses for outgoing pushes:
-//! `env_clear`, only the four `CLEAN_GIT_CONFIG_*` / `HOME=/dev/null`
+//! `env_clear`, only the `CLEAN_GIT_CONFIG_*` / `HOME=/dev/null`
 //! variables set, `cwd=/` so a stray config in the broker's working
-//! directory cannot override anything. Operations on bailiff's repo
-//! are local, sub-second, and trusted, so we don't replicate
-//! `clean_git`'s timeout + process-group SIGKILL machinery — git
-//! exiting cleanly is the supervisor here, and any hang would itself
-//! be a higher-priority bug than the things that harness is built to
-//! contain.
+//! directory cannot override anything. Identity (`GIT_AUTHOR_*` /
+//! `GIT_COMMITTER_*`) is pinned to a synthetic `writ` user so
+//! `git notes add` can create its notes-ref commit on hosts where
+//! Git would otherwise refuse for lack of an auto-detected user.
+//! Repo selection uses `--git-dir=<path>` rather than `-C <path>`:
+//! that way even an existing `.git/` directory inside the bare
+//! repo cannot redirect writes via Git's auto-discovery. Operations
+//! on bailiff's repo are local, sub-second, and trusted, so we
+//! don't replicate `clean_git`'s timeout + process-group SIGKILL
+//! machinery — git exiting cleanly is the supervisor here, and any
+//! hang would itself be a higher-priority bug than the things that
+//! harness is built to contain.
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -124,14 +130,19 @@ impl BailiffRepo {
     }
 
     /// Write `bytes` as a loose Git blob into this repo and return
-    /// the resulting object id. Wraps `git -C <path> hash-object -w
-    /// --stdin`: identical bytes always produce the same OID (Git's
-    /// content-addressing), so calling this twice for the same
-    /// payload is harmless and returns the same value.
+    /// the resulting object id. Wraps `git --git-dir=<path>
+    /// hash-object -w --stdin`: identical bytes always produce the
+    /// same OID (Git's content-addressing), so calling this twice
+    /// for the same payload is harmless and returns the same value.
+    ///
+    /// `--git-dir` is preferred over `-C` so git operates on
+    /// exactly the directory we hand it, even if that directory
+    /// happens to contain a `.git/` subdirectory git would
+    /// otherwise auto-discover.
     pub async fn write_blob(&self, bytes: &[u8]) -> Result<GitObjectId, BailiffRepoError> {
         let stdout = run_git_capture_stdout(
             &[
-                OsStr::new("-C"),
+                OsStr::new("--git-dir"),
                 self.path.as_os_str(),
                 OsStr::new("hash-object"),
                 OsStr::new("-w"),
@@ -185,7 +196,7 @@ impl BailiffRepo {
         // note. `write_note` claims a body was attached; honour that.
         run_git_status(
             &[
-                OsStr::new("-C"),
+                OsStr::new("--git-dir"),
                 self.path.as_os_str(),
                 OsStr::new("notes"),
                 OsStr::new(&ref_arg),
@@ -251,7 +262,7 @@ async fn note_exists(
     let ref_arg = format!("--ref={}", notes_ref.as_str());
     let outcome = run_git(
         &[
-            OsStr::new("-C"),
+            OsStr::new("--git-dir"),
             repo.as_os_str(),
             OsStr::new("notes"),
             OsStr::new(&ref_arg),
@@ -462,11 +473,24 @@ fn describe_args(args: &[&OsStr]) -> &'static str {
 /// `pub(crate)` and tied to a different timeout/process-group
 /// regime that this module's short-lived local invocations don't
 /// need.
-const CLEAN_GIT_CONFIG_ENV: [(&str, &str); 4] = [
+///
+/// The `GIT_AUTHOR_*` / `GIT_COMMITTER_*` slots are pinned to a
+/// fixed `writ` identity because `git notes add` creates a commit
+/// on the notes ref, and a commit needs an author/committer. With
+/// system and global config disabled, hosts that can't auto-detect
+/// a user identity (containers, CI machines) would otherwise see
+/// every `write_note` fail. Bailiff's notes commits are internal
+/// machinery, never published as user-attributed history, so a
+/// stable synthetic identity is what we want.
+const CLEAN_GIT_CONFIG_ENV: [(&str, &str); 8] = [
     ("GIT_CONFIG_NOSYSTEM", "1"),
     ("GIT_CONFIG_GLOBAL", "/dev/null"),
     ("GIT_CONFIG_COUNT", "0"),
     ("HOME", "/dev/null"),
+    ("GIT_AUTHOR_NAME", "writ"),
+    ("GIT_AUTHOR_EMAIL", "writ@invalid"),
+    ("GIT_COMMITTER_NAME", "writ"),
+    ("GIT_COMMITTER_EMAIL", "writ@invalid"),
 ];
 
 /// Run git from `/` so a stray `.git/config` in whatever directory
@@ -897,6 +921,52 @@ mod tests {
         assert!(
             stdout.is_empty(),
             "expected empty note body, got {stdout:?}"
+        );
+    }
+
+    /// Even if a `.git/` directory sneaks into the bare repo
+    /// somehow, `write_blob` and `write_note` must still write to
+    /// the bare repo (objects under `<path>/objects/...`), not to
+    /// the inner repo Git would auto-discover. This is why the
+    /// production helpers use `--git-dir=<path>` rather than
+    /// `-C <path>`: the latter would let Git's repo discovery
+    /// pick the inner `.git/` instead of the directory we handed
+    /// it.
+    #[tokio::test]
+    async fn write_uses_explicit_git_dir_even_when_dot_git_exists() {
+        let dir = TempDir::new().unwrap();
+        let repo_path = dir.path().join("bare");
+        let repo = BailiffRepo::init_or_open(&repo_path).await.unwrap();
+        // Plant a real working repo inside the bare repo. Without
+        // `--git-dir`, `git -C <repo_path>` would pick this up.
+        let decoy = repo_path.join(".git");
+        run_git_status(
+            &[
+                OsStr::new("init"),
+                OsStr::new("--initial-branch=main"),
+                decoy.as_os_str(),
+            ],
+            None,
+        )
+        .await
+        .unwrap();
+        // After this, `repo_path/.git/` is a worktree-style repo.
+
+        let oid = repo.write_blob(b"bailiff-only").await.unwrap();
+
+        // The object must land under the bare repo's objects/ tree.
+        let prefix = &oid.as_str()[..2];
+        let rest = &oid.as_str()[2..];
+        let bare_object = repo_path.join("objects").join(prefix).join(rest);
+        assert!(
+            bare_object.exists(),
+            "blob should live in the bare repo, expected at {bare_object:?}"
+        );
+        // And not in the decoy worktree's objects.
+        let decoy_object = decoy.join("objects").join(prefix).join(rest);
+        assert!(
+            !decoy_object.exists(),
+            "blob leaked into the inner .git: {decoy_object:?}"
         );
     }
 
