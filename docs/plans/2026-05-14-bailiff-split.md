@@ -67,11 +67,15 @@ notes), workflow vocabulary leaves writ entirely.
   artefact as a Git object into bailiff's repo. Audit (run_id,
   prompt_hash, capability_set, output_hash, signature, exit_code).
 - **Signing.** Writ holds an SSH signing key. Every terminal output
-  gets a detached signature over `(run_id, output_hash, capability_set,
-  exit_code, completed_at, session_id)` — exactly the things writ
-  observed first-hand. The signature is what bailiff (and any third
+  gets a detached signature over `(run_id, prompt_sha256, output_hash,
+  capability_set, exit_code, completed_at, session_id)` — exactly the
+  things writ observed first-hand. Including `prompt_sha256` is what
+  binds the signed output to its originating prompt: a third party
+  verifying the note can re-hash bailiff's plan note and confirm it
+  matches the prompt writ saw, ruling out "valid signature + swapped
+  prompt" forgeries. The signature is what bailiff (and any third
   party) uses to attest "writ confirms this output came from run R
-  under capability set C at time T."
+  driven by prompt P under capability set C at time T."
 
 Writ knows nothing about the words "plan", "review", "decide",
 "execute". The `Stage` enum and `read_plan_id` column are gone.
@@ -201,11 +205,12 @@ meaningful rewrite of several files. Pre-v1, the destructive slice
 
 ### Slice A — wire protocol skeleton
 
-Define `RunAgent` / `RunAgentStarted` / `RunAgentCompleted` in
-`protocol.rs`. Stub `CapabilitySet` sum type with one or two
-variants. Add a bailiff binary skeleton (`src/bin/bailiff.rs`) that
-connects to writ over the Unix socket and exposes no commands yet.
-No behaviour change to existing flows.
+Define `RunAgent` / `RunAgentCompleted` in `protocol.rs` (single
+synchronous request/response — no `RunAgentStarted` frame, see the
+wire-interface section above). Stub `CapabilitySet` sum type with
+one or two variants. Add a bailiff binary skeleton
+(`src/bin/bailiff.rs`) that connects to writ over the Unix socket
+and exposes no commands yet. No behaviour change to existing flows.
 
 ### Slice B — bailiff repo, writ signing
 
