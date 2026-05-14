@@ -1,5 +1,15 @@
 # Agent plans — design
 
+> **Historical / point-in-time.** This doc captures the design as
+> originally landed. Subsequent work in
+> [`2026-05-14-bailiff-split.md`](./2026-05-14-bailiff-split.md) splits
+> the workflow-orchestration parts described here (prompt composition,
+> the `plan decide` verb) out of `writ` into a separate `bailiff`
+> component. The schema and gate described below remain in `writ`; the
+> opinionated workflow vocabulary moves. Read this doc for the
+> motivating shape, then the bailiff-split doc for where the boundary
+> now runs.
+
 Plan for adding "the agent proposes a plan" as a first-class concept in writ,
 covering plan submission, plan review by other agents, a decision gate, and
 execution against an accepted plan. Companion to

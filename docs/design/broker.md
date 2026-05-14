@@ -2,6 +2,18 @@
 
 A capability broker for local agents.
 
+> **Scope note.** Agent-plan workflow (plan submission, reviewer
+> verdicts, the decision gate, prompt composition for executor runs)
+> originally landed alongside the broker; see
+> [`../plans/2026-05-11-agent-plans.md`](../plans/2026-05-11-agent-plans.md).
+> The orchestration-shaped pieces of that — prompt composition and the
+> `plan decide` CLI verb — are being lifted out into a separate
+> component called **bailiff**; see
+> [`../plans/2026-05-14-bailiff-split.md`](../plans/2026-05-14-bailiff-split.md).
+> What stays in the broker: the plan/review/decision audit tables and
+> the per-stage HTTP gate. What moves to bailiff: the workflow
+> vocabulary (prompt format, decision verb).
+
 ## One-line summary
 
 A local daemon that mints short-lived, per-request-scoped credentials for agents
