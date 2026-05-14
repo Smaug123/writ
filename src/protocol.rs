@@ -19,7 +19,9 @@ use crate::agent_plan::{
 use crate::agent_run::{AgentPrompt, AgentRunId};
 use crate::agent_vm_lifecycle::AgentVmSessionStateStatus;
 use crate::audit::GitPushOutcomeResult;
-use crate::core::{AgentKind, CapabilityRequest, RequestId, SessionId, UnixMillis};
+use crate::core::{
+    AgentKind, CapabilityRequest, CapabilitySet, NotesRef, RequestId, SessionId, UnixMillis,
+};
 use crate::vm_git::{
     AgentVmWorkspaceBootstrap, GitBranchName, GitCloneRepo, GitObjectId, VmGitPushStagedReceipt,
 };
@@ -404,6 +406,36 @@ pub enum ClientMessage {
         plan_id: PlanId,
         outcome: DecisionOutcome,
         decider: Decider,
+    },
+    /// Ask writ to spawn an agent with the given prompt and capability
+    /// set, then write the signed terminal output as a note into the
+    /// caller's Git repo at `output_ref`. Carries no session: writ's
+    /// audit row records the run identity directly from the request.
+    /// Bailiff is the intended (sole) client of this RPC; see
+    /// `docs/plans/2026-05-14-bailiff-split.md`.
+    ///
+    /// Slice A1 lands the request type only. Dispatch returns
+    /// [`ServerMessage::Error`] until slice B wires up the real spawner
+    /// and signing path; the response variant
+    /// (`ServerMessage::RunAgentCompleted`) arrives alongside its
+    /// first consumer (the bailiff binary skeleton) in slice A2.
+    RunAgent {
+        /// Prompt delivered verbatim to the spawned agent's stdin.
+        /// Writ forwards the bytes but does not store, persist, or
+        /// interpret them — the audit row records only the hash.
+        prompt: AgentPrompt,
+        /// Authority granted to this run. Each variant maps to a
+        /// `policy::*` oracle check at request time. Stored as a
+        /// canonical collection on the audit row.
+        capabilities: Vec<CapabilitySet>,
+        /// Caller-supplied opaque tag recorded verbatim in audit.
+        /// Writ never interprets the contents; bailiff uses it to
+        /// reconcile the writ-side run with its own workflow vocabulary
+        /// (e.g. `"plan-stage"`, `"review:plan-abc"`).
+        purpose: String,
+        /// Notes ref in the caller's Git repo where writ should
+        /// attach the signed output note once the run completes.
+        output_ref: NotesRef,
     },
 }
 
@@ -873,6 +905,84 @@ mod tests {
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert_eq!(serde_json::from_str::<ClientMessage>(&json).unwrap(), msg);
+    }
+
+    #[test]
+    fn run_agent_roundtrips() {
+        let msg = ClientMessage::RunAgent {
+            prompt: AgentPrompt::new("plan the change"),
+            capabilities: vec![
+                CapabilitySet::WorkspaceRead {
+                    repo: sample_repo(),
+                },
+                CapabilitySet::WorkspaceWrite {
+                    repo: sample_repo(),
+                },
+            ],
+            purpose: "plan-stage".into(),
+            output_ref: NotesRef::try_new("refs/notes/writ/agent-outputs").unwrap(),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let back: ClientMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, msg);
+    }
+
+    /// `capabilities` is the new wire field — pin its on-the-wire name
+    /// (vs. an accidental `capability` / `capability_set` typo that
+    /// future refactoring might introduce) and confirm the empty-vec
+    /// case roundtrips, which lets bailiff express "no extra
+    /// capabilities beyond what the session already grants" without
+    /// special-casing the absent-field path.
+    #[test]
+    fn run_agent_pins_field_names_and_accepts_empty_capabilities() {
+        let msg = ClientMessage::RunAgent {
+            prompt: AgentPrompt::new("p"),
+            capabilities: vec![],
+            purpose: "reviewer".into(),
+            output_ref: NotesRef::try_new("refs/notes/writ/agent-outputs").unwrap(),
+        };
+        let value: serde_json::Value = serde_json::to_value(&msg).unwrap();
+        assert_eq!(value["type"], "run_agent");
+        assert!(value.get("capabilities").is_some(), "wire: {value}");
+        assert!(value.get("purpose").is_some(), "wire: {value}");
+        assert!(value.get("output_ref").is_some(), "wire: {value}");
+        let back: ClientMessage = serde_json::from_value(value).unwrap();
+        assert_eq!(back, msg);
+    }
+
+    /// `deny_unknown_fields` at the enum level catches a typo'd inner
+    /// field name (e.g. `capability_set` from an earlier draft of the
+    /// design doc) before it silently turns into "no capabilities".
+    #[test]
+    fn run_agent_rejects_legacy_capability_set_field() {
+        let value = serde_json::json!({
+            "type": "run_agent",
+            "prompt": "p",
+            "capability_set": {"kind": "workspace_read", "repo": "smaug123/writ"},
+            "purpose": "x",
+            "output_ref": "refs/notes/writ/agent-outputs",
+        });
+        let err = serde_json::from_value::<ClientMessage>(value).unwrap_err();
+        assert!(
+            err.to_string().contains("capability_set") || err.to_string().contains("unknown field"),
+            "expected unknown-field error, got: {err}",
+        );
+    }
+
+    #[test]
+    fn run_agent_rejects_invalid_notes_ref() {
+        let value = serde_json::json!({
+            "type": "run_agent",
+            "prompt": "p",
+            "capabilities": [],
+            "purpose": "x",
+            "output_ref": "not-under-refs/",
+        });
+        let err = serde_json::from_value::<ClientMessage>(value).unwrap_err();
+        assert!(
+            err.to_string().contains("refs/"),
+            "expected refs-prefix error, got: {err}",
+        );
     }
 
     #[test]
@@ -1951,7 +2061,7 @@ mod tests {
         /// variant, and assert the result fails to parse.
         #[test]
         fn client_message_rejects_unknown_top_level_fields(
-            variant_index in 0usize..13,
+            variant_index in 0usize..14,
             // ASCII-letters-only key, excluded against the union of every
             // variant's known field names below.
             unknown_key in "[a-z]{1,16}",
@@ -1962,6 +2072,7 @@ mod tests {
                 "stage", "correlation_id", "plan_id",
                 "request_id", "reason", "operator",
                 "outcome", "decider",
+                "capabilities", "purpose", "output_ref",
             ];
             prop_assume!(!KNOWN_FIELDS.contains(&unknown_key.as_str()));
 
@@ -2042,6 +2153,14 @@ mod tests {
                 plan_id: sample_plan_id(),
                 outcome: DecisionOutcome::Accepted,
                 decider: Decider::try_new("cli:alice").unwrap(),
+            },
+            13 => ClientMessage::RunAgent {
+                prompt: AgentPrompt::new("hello"),
+                capabilities: vec![CapabilitySet::WorkspaceRead {
+                    repo: sample_repo(),
+                }],
+                purpose: "plan-stage".into(),
+                output_ref: NotesRef::try_new("refs/notes/writ/agent-outputs").unwrap(),
             },
             other => unreachable!("variant index out of range: {other}"),
         }

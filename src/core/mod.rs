@@ -5,6 +5,7 @@ mod agent_vm;
 mod capability_set;
 mod decision;
 mod grant;
+mod notes_ref;
 mod request;
 mod session;
 
@@ -19,6 +20,7 @@ pub use decision::{
     TtlSeconds,
 };
 pub use grant::CredentialGrant;
+pub use notes_ref::{NotesRef, NotesRefError};
 pub use request::{CapabilityRequest, GitHubRequest};
 pub use session::{AgentKind, SessionRecord};
 
