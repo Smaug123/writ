@@ -67,12 +67,19 @@ impl BailiffRepo {
     /// - `<path>/HEAD` is a regular file (every git repo has one),
     /// - `<path>/config` exists and contains `bare = true`.
     ///
+    /// The stored path is absolutized at construction. Every git
+    /// invocation in this module runs with `cwd=/` (subprocess
+    /// hardening), so a relative input would resolve differently on
+    /// the host filesystem from the validation that happened in the
+    /// daemon's working directory. Absolutizing once at the boundary
+    /// keeps validation and operation pointing at the same bytes.
+    ///
     /// Returns [`BailiffRepoError::NotABareRepo`] for any of the
     /// above failing — the operator's "I pointed writ at the wrong
     /// directory" path produces one typed error, not a grab-bag of
     /// I/O surprises.
     pub async fn open(path: impl Into<PathBuf>) -> Result<Self, BailiffRepoError> {
-        let path = path.into();
+        let path = absolutize(path.into())?;
         validate_bare_repo(&path).await?;
         Ok(Self { path })
     }
@@ -80,9 +87,17 @@ impl BailiffRepo {
     /// Open an existing bare repo at `path`, or create one there if
     /// the directory has no `HEAD` yet. Idempotent: the second call
     /// for the same path is a pure open. Equivalent to
-    /// `git init --bare <path>` followed by [`open`](Self::open).
+    /// `git init --bare <path>` followed by [`open`](Self::open),
+    /// with one safety twist: before creating a fresh repo, the
+    /// target must be either non-existent or an empty directory.
+    /// `git init --bare` will otherwise happily layer bare-repo
+    /// files on top of a worktree (whose `HEAD` lives at
+    /// `.git/HEAD`, so our top-level HEAD check sees nothing), and
+    /// subsequent `git -C <path>` calls would then prefer the inner
+    /// `.git/` directory git found — writes would silently leak into
+    /// the workspace repo. Refusing to layer fixes that.
     pub async fn init_or_open(path: impl Into<PathBuf>) -> Result<Self, BailiffRepoError> {
-        let path = path.into();
+        let path = absolutize(path.into())?;
         // `git init --bare` is itself idempotent — running it on an
         // existing bare repo is a no-op for the on-disk state — but
         // calling it unconditionally would also mean creating any
@@ -92,7 +107,9 @@ impl BailiffRepo {
         // applies the bare-repo validation.
         let head_path = path.join("HEAD");
         if !head_path.exists() {
-            if let Some(parent) = path.parent() {
+            if path.exists() {
+                ensure_empty_directory(&path).await?;
+            } else if let Some(parent) = path.parent() {
                 tokio::fs::create_dir_all(parent)
                     .await
                     .map_err(BailiffRepoError::Io)?;
@@ -156,6 +173,16 @@ impl BailiffRepo {
             });
         }
         let ref_arg = format!("--ref={}", notes_ref.as_str());
+        // `--no-stripspace`: keep the exact stdin bytes. Default
+        // `git notes add -F -` runs stripspace, which trims trailing
+        // whitespace, collapses runs of blank lines, and adds a
+        // single trailing newline. Bailiff stores signed payloads in
+        // these notes; rewriting the bytes would corrupt any later
+        // hash or signature check.
+        //
+        // `--allow-empty`: keep zero-byte bodies. Without it, an
+        // empty stdin under `--no-stripspace` exits 0 but writes no
+        // note. `write_note` claims a body was attached; honour that.
         run_git_status(
             &[
                 OsStr::new("-C"),
@@ -163,6 +190,8 @@ impl BailiffRepo {
                 OsStr::new("notes"),
                 OsStr::new(&ref_arg),
                 OsStr::new("add"),
+                OsStr::new("--no-stripspace"),
+                OsStr::new("--allow-empty"),
                 OsStr::new("-F"),
                 OsStr::new("-"),
                 OsStr::new(target.as_str()),
@@ -171,6 +200,42 @@ impl BailiffRepo {
         )
         .await
     }
+}
+
+/// Resolve `path` lexically against the current working directory if
+/// it is relative. No symlink resolution and no filesystem touch —
+/// `std::path::absolute` does the minimum needed to make the result
+/// independent of the subprocess `cwd` we later run git under.
+fn absolutize(path: PathBuf) -> Result<PathBuf, BailiffRepoError> {
+    std::path::absolute(&path).map_err(BailiffRepoError::Io)
+}
+
+/// Refuse to initialise a bare repo into a directory that already
+/// contains anything. See [`BailiffRepo::init_or_open`] for the
+/// rationale.
+async fn ensure_empty_directory(path: &Path) -> Result<(), BailiffRepoError> {
+    let meta = tokio::fs::metadata(path)
+        .await
+        .map_err(BailiffRepoError::Io)?;
+    if !meta.is_dir() {
+        return Err(BailiffRepoError::NotABareRepo {
+            path: path.display().to_string(),
+            reason: "path exists but is not a directory".to_string(),
+        });
+    }
+    let mut entries = tokio::fs::read_dir(path)
+        .await
+        .map_err(BailiffRepoError::Io)?;
+    if let Some(entry) = entries.next_entry().await.map_err(BailiffRepoError::Io)? {
+        return Err(BailiffRepoError::NotABareRepo {
+            path: path.display().to_string(),
+            reason: format!(
+                "directory is non-empty (contains {:?}); refusing to layer a bare repo on top",
+                entry.file_name()
+            ),
+        });
+    }
+    Ok(())
 }
 
 /// Check whether a note currently exists at `(notes_ref, target)`.
@@ -440,13 +505,19 @@ mod tests {
     }
 
     /// `init_or_open` on a fresh empty directory must produce a
-    /// bare repo: HEAD + `core.bare = true`.
+    /// bare repo: HEAD + `core.bare = true`. The stored path must
+    /// also come back absolute, since downstream git invocations
+    /// run with `cwd=/`.
     #[tokio::test]
     async fn init_or_open_creates_a_bare_repo() {
         let dir = TempDir::new().unwrap();
         let repo_path = dir.path().join("bailiff-repo");
         let repo = BailiffRepo::init_or_open(&repo_path).await.unwrap();
-        assert_eq!(repo.path(), repo_path);
+        assert!(
+            repo.path().is_absolute(),
+            "stored path should be absolute, got {:?}",
+            repo.path()
+        );
         assert!(repo_path.join("HEAD").is_file());
         let config = std::fs::read_to_string(repo_path.join("config")).unwrap();
         assert!(
@@ -619,10 +690,9 @@ mod tests {
         )
         .await
         .unwrap();
-        // `git notes show` emits the note body followed by a single
-        // trailing newline.
-        let trimmed = stdout.strip_suffix(b"\n").unwrap_or(&stdout);
-        assert_eq!(trimmed, b"note body for that payload");
+        // With `--no-stripspace` the stored bytes equal the input
+        // bytes; `git notes show` writes them verbatim.
+        assert_eq!(stdout.as_slice(), b"note body for that payload");
     }
 
     /// A second `write_note` to the same (ref, target) must surface
@@ -658,8 +728,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let trimmed = stdout.strip_suffix(b"\n").unwrap_or(&stdout);
-        assert_eq!(trimmed, b"first");
+        assert_eq!(stdout.as_slice(), b"first");
     }
 
     /// Distinct notes refs are independent: writing a note to one
@@ -691,8 +760,163 @@ mod tests {
             )
             .await
             .unwrap();
-            assert_eq!(stdout.strip_suffix(b"\n").unwrap_or(&stdout), body);
+            assert_eq!(stdout.as_slice(), body);
         }
+    }
+
+    /// `init_or_open` must refuse to layer a bare repo onto an
+    /// existing worktree. The worktree carries its `HEAD` under
+    /// `.git/HEAD`, so the top-level HEAD check would otherwise
+    /// see nothing and proceed with `git init --bare`, after which
+    /// `git -C <path>` would prefer the inner `.git/` and writes
+    /// would leak into the workspace repo.
+    #[tokio::test]
+    async fn init_or_open_refuses_to_init_into_existing_worktree() {
+        let dir = TempDir::new().unwrap();
+        let worktree = dir.path().join("worktree");
+        // Plain (non-bare) init plants a `.git/` directory under
+        // `worktree/`, marking it as a worktree.
+        run_git_status(
+            &[
+                OsStr::new("init"),
+                OsStr::new("--initial-branch=main"),
+                worktree.as_os_str(),
+            ],
+            None,
+        )
+        .await
+        .unwrap();
+        let err = BailiffRepo::init_or_open(&worktree).await.unwrap_err();
+        assert!(
+            matches!(err, BailiffRepoError::NotABareRepo { .. }),
+            "got: {err:?}"
+        );
+        // The worktree's `.git/` must still be intact: we refused
+        // to touch it.
+        assert!(
+            worktree.join(".git").is_dir(),
+            "worktree .git was disturbed"
+        );
+    }
+
+    /// `init_or_open` must refuse to layer a bare repo onto a
+    /// directory that already contains unrelated files — same
+    /// rationale as the worktree case, but for the more general
+    /// "operator pointed writ at a directory with stuff in it" path.
+    #[tokio::test]
+    async fn init_or_open_refuses_to_init_into_non_empty_directory() {
+        let dir = TempDir::new().unwrap();
+        let target = dir.path().join("not-empty");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("README"), b"not for bailiff").unwrap();
+        let err = BailiffRepo::init_or_open(&target).await.unwrap_err();
+        assert!(
+            matches!(err, BailiffRepoError::NotABareRepo { .. }),
+            "got: {err:?}"
+        );
+        // The stray file is untouched.
+        assert_eq!(
+            std::fs::read(target.join("README")).unwrap(),
+            b"not for bailiff"
+        );
+    }
+
+    /// `write_note` must round-trip exact bytes, including bodies
+    /// that would be mangled by Git's default `stripspace` (trailing
+    /// whitespace trimmed, runs of blank lines collapsed, etc.). The
+    /// notes carry signed payloads downstream, so byte-for-byte
+    /// preservation is load-bearing.
+    #[tokio::test]
+    async fn write_note_preserves_exact_bytes_including_whitespace() {
+        let dir = TempDir::new().unwrap();
+        let repo = BailiffRepo::init_or_open(dir.path().join("repo"))
+            .await
+            .unwrap();
+        let cases: &[&[u8]] = &[
+            b"no trailing newline",
+            b"with trailing newline\n",
+            b"multiple trailing newlines\n\n\n",
+            b"   leading whitespace",
+            b"trailing whitespace   ",
+            b"interior\n\n\n blank lines",
+        ];
+        for (i, body) in cases.iter().enumerate() {
+            let target = repo
+                .write_blob(format!("payload-{i}").as_bytes())
+                .await
+                .unwrap();
+            let r = NotesRef::try_new(format!("refs/notes/writ/case-{i}")).unwrap();
+            repo.write_note(&r, &target, body).await.unwrap();
+            let ref_arg = format!("--ref={}", r.as_str());
+            let stdout = run_git_capture_stdout(
+                &[
+                    OsStr::new("-C"),
+                    repo.path().as_os_str(),
+                    OsStr::new("notes"),
+                    OsStr::new(&ref_arg),
+                    OsStr::new("show"),
+                    OsStr::new(target.as_str()),
+                ],
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                stdout.as_slice(),
+                *body,
+                "body {i} round-trip changed bytes"
+            );
+        }
+    }
+
+    /// An empty note body is legitimate: `write_note` should attach
+    /// a zero-byte note, and `git notes list` should report it.
+    #[tokio::test]
+    async fn write_note_accepts_empty_body() {
+        let dir = TempDir::new().unwrap();
+        let repo = BailiffRepo::init_or_open(dir.path().join("repo"))
+            .await
+            .unwrap();
+        let target = repo.write_blob(b"anchor").await.unwrap();
+        let r = notes_ref();
+        repo.write_note(&r, &target, b"").await.unwrap();
+        let ref_arg = format!("--ref={}", r.as_str());
+        let stdout = run_git_capture_stdout(
+            &[
+                OsStr::new("-C"),
+                repo.path().as_os_str(),
+                OsStr::new("notes"),
+                OsStr::new(&ref_arg),
+                OsStr::new("show"),
+                OsStr::new(target.as_str()),
+            ],
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            stdout.is_empty(),
+            "expected empty note body, got {stdout:?}"
+        );
+    }
+
+    /// `absolutize` must turn a relative path into an absolute one
+    /// without touching the filesystem. The downstream guarantee —
+    /// that the path stored in `BailiffRepo` is independent of the
+    /// subprocess `cwd=/` we later run git under — rides on this.
+    #[test]
+    fn absolutize_makes_relative_paths_absolute() {
+        let out = absolutize(PathBuf::from("some/relative/thing")).unwrap();
+        assert!(out.is_absolute(), "expected absolute, got {out:?}");
+    }
+
+    /// And an already-absolute path must come back absolute too
+    /// (i.e. `absolutize` doesn't accidentally re-relativise).
+    #[test]
+    fn absolutize_preserves_already_absolute_paths() {
+        let input = PathBuf::from("/tmp/some-bare-repo");
+        let out = absolutize(input.clone()).unwrap();
+        assert!(out.is_absolute(), "expected absolute, got {out:?}");
     }
 
     #[test]
