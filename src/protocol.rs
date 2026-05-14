@@ -13,8 +13,8 @@
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::agent_plan::{
-    AddendumId, CorrelationId, Decider, DecisionOutcome, DecisionView, PlanBody, PlanFeedback,
-    PlanId, ReviewId, Stage, Verdict,
+    AddendumId, CorrelationId, Decider, DecisionOutcome, DecisionView, PlanAbortReason, PlanBody,
+    PlanFeedback, PlanId, ReviewId, Stage, Verdict,
 };
 use crate::agent_run::{AgentPrompt, AgentRunId};
 use crate::agent_vm_lifecycle::AgentVmSessionStateStatus;
@@ -118,14 +118,12 @@ pub struct PlanSummary {
 /// DAO's `submitted_at` ascending order, so the operator reading
 /// top-to-bottom sees how reviewer opinion evolved and how executor
 /// addenda were posted in turn. `decision` is `None` until an operator
-/// runs `writ plan decide`. All three fields use `#[serde(default)]` so
-/// an older daemon's response (one that predates the field) still parses
-/// on a newer CLI — the older payload is treated as "no reviews, no
-/// addenda, no decision," which matches its semantics.
-///
-/// Slice 8 of the agent-plans roadmap will extend this struct with an
-/// `abort` field the same way — append-only, with `#[serde(default)]`
-/// for the same forward-compat reason.
+/// runs `writ plan decide`; `abort` is `None` until the executor agent
+/// posts a hard-abort via `POST /v1/plans/<id>/abort`. All four append-
+/// only fields use `#[serde(default)]` so an older daemon's response
+/// (one that predates the field) still parses on a newer CLI — the
+/// older payload is treated as "no reviews, no addenda, no decision,
+/// no abort," which matches its semantics.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PlanDetail {
     pub summary: PlanSummary,
@@ -136,6 +134,8 @@ pub struct PlanDetail {
     pub decision: Option<DecisionView>,
     #[serde(default)]
     pub addenda: Vec<PlanAddendumView>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub abort: Option<PlanAbortView>,
 }
 
 /// One review row as exposed on the broker socket. Mirrors
@@ -177,6 +177,23 @@ pub struct PlanAddendumView {
     pub executor_run_id: AgentRunId,
     pub submitted_at: UnixMillis,
     pub body: PlanBody,
+}
+
+/// One hard-abort row as exposed on the broker socket. Mirrors
+/// [`crate::audit::PlanAbortRecord`] minus `plan_id` (redundant on the
+/// parent `PlanDetail` that carries this view).
+///
+/// `executor_run_id` is renamed from the schema column `agent_run_id`
+/// for the same reason as on [`PlanAddendumView`]: to disambiguate the
+/// run that posted the abort from `PlanSummary.agent_run_id`, the
+/// planner's run, inside the same `PlanDetail`. The schema enforces one
+/// abort per plan, so `PlanDetail.abort` is at most one value.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlanAbortView {
+    pub executor_run_id: AgentRunId,
+    pub aborted_at: UnixMillis,
+    pub reason: PlanAbortReason,
 }
 
 /// Maximum byte length of a [`RejectionReason`]. Sized to comfortably
@@ -1054,6 +1071,16 @@ mod tests {
             reviews: Vec::new(),
             decision: None,
             addenda: Vec::new(),
+            abort: None,
+        }
+    }
+
+    fn sample_abort_view() -> PlanAbortView {
+        PlanAbortView {
+            executor_run_id: "f7f7f7f7-0000-0000-0000-000000000001".parse().unwrap(),
+            aborted_at: UnixMillis::from_millis(1_700_000_700_000),
+            reason: PlanAbortReason::try_new("Migration plan no longer viable: schema changed.")
+                .unwrap(),
         }
     }
 
@@ -1348,9 +1375,9 @@ mod tests {
     }
 
     /// An older daemon's payload (no `reviews`, no `decision`, no
-    /// `addenda`) parses on the newer CLI as "no reviews, no decision,
-    /// no addenda." This is the reason `#[serde(default)]` is on all
-    /// three fields.
+    /// `addenda`, no `abort`) parses on the newer CLI as "no reviews,
+    /// no decision, no addenda, no abort." This is the reason
+    /// `#[serde(default)]` is on all four append-only fields.
     #[test]
     fn plan_detail_accepts_payload_without_reviews_or_decision() {
         let value = serde_json::json!({
@@ -1361,6 +1388,7 @@ mod tests {
         assert!(parsed.reviews.is_empty());
         assert!(parsed.decision.is_none());
         assert!(parsed.addenda.is_empty());
+        assert!(parsed.abort.is_none());
     }
 
     /// A `PlanDetail` carrying executor addenda roundtrips byte-for-
@@ -1395,6 +1423,45 @@ mod tests {
             .unwrap()
             .insert("bogus".into(), serde_json::json!("nope"));
         let result: Result<PlanAddendumView, _> = serde_json::from_value(value);
+        assert!(result.is_err());
+    }
+
+    /// A `PlanDetail` carrying a hard-abort roundtrips byte-for-byte.
+    /// Pins the `executor_run_id` rename against the audit-record-to-
+    /// view mapping in `show_plan`, and confirms the verbatim reason
+    /// survives the round trip.
+    #[test]
+    fn plan_detail_with_abort_roundtrips() {
+        let mut detail = sample_plan_detail();
+        detail.abort = Some(sample_abort_view());
+        let msg = ServerMessage::Plan { plan: detail };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert_eq!(serde_json::from_str::<ServerMessage>(&json).unwrap(), msg);
+    }
+
+    /// A `None` abort drops the key on the wire (matches the
+    /// `decision` convention). An older daemon that predates the
+    /// field stays compatible because `#[serde(default)]` accepts the
+    /// missing key.
+    #[test]
+    fn plan_detail_without_abort_omits_field_on_wire() {
+        let value: serde_json::Value = serde_json::to_value(sample_plan_detail()).unwrap();
+        assert!(value.get("abort").is_none());
+        let back: PlanDetail = serde_json::from_value(value).unwrap();
+        assert!(back.abort.is_none());
+    }
+
+    /// `PlanAbortView` uses `deny_unknown_fields`, so a stray key on
+    /// the wire is rejected at parse time rather than silently dropped.
+    /// Matches the `PlanReviewView` / `PlanAddendumView` convention.
+    #[test]
+    fn plan_abort_view_rejects_unknown_fields() {
+        let mut value: serde_json::Value = serde_json::to_value(sample_abort_view()).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .insert("bogus".into(), serde_json::json!("nope"));
+        let result: Result<PlanAbortView, _> = serde_json::from_value(value);
         assert!(result.is_err());
     }
 

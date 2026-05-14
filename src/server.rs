@@ -34,8 +34,8 @@ use crate::git_push_staging::{GitPushStagingStore, StagedEntry, StagingError};
 use crate::github::GitHubMinter;
 use crate::policy::{self, PolicyConfig};
 use crate::protocol::{
-    ClientMessage, PlanAddendumView, PlanDetail, PlanReviewView, PlanSummary, RejectionReason,
-    ServerMessage, StagedPushAuditView, StagedPushDetail, StagedPushSummary,
+    ClientMessage, PlanAbortView, PlanAddendumView, PlanDetail, PlanReviewView, PlanSummary,
+    RejectionReason, ServerMessage, StagedPushAuditView, StagedPushDetail, StagedPushSummary,
 };
 use crate::secret::SecretStore;
 
@@ -427,7 +427,7 @@ async fn show_plan<S: SecretStore + Send + Sync + 'static>(
     state: &Arc<BrokerState<S>>,
     plan_id: PlanId,
 ) -> ServerMessage {
-    // All four audit lookups land in one blocking task. SQLite serialises
+    // All five audit lookups land in one blocking task. SQLite serialises
     // on the connection anyway, so fanning them out would not parallelise;
     // a single task is simpler (one error ladder, one `JoinError`).
     let audit = Arc::clone(&state.audit);
@@ -447,23 +447,26 @@ async fn show_plan<S: SecretStore + Send + Sync + 'static>(
         let reviews = audit.list_plan_reviews_for_plan(plan_id)?;
         let decision = audit.get_plan_decision(plan_id)?;
         let addenda = audit.list_plan_addenda_for_plan(plan_id)?;
+        let abort = audit.get_plan_abort(plan_id)?;
         Ok(ShowPlanLookup::Found {
             plan,
             correlation_id,
             reviews,
             decision,
             addenda,
+            abort,
         })
     })
     .await;
-    let (plan, correlation_id, reviews, decision, addenda) = match joined {
+    let (plan, correlation_id, reviews, decision, addenda, abort) = match joined {
         Ok(Ok(ShowPlanLookup::Found {
             plan,
             correlation_id,
             reviews,
             decision,
             addenda,
-        })) => (plan, correlation_id, reviews, decision, addenda),
+            abort,
+        })) => (plan, correlation_id, reviews, decision, addenda, abort),
         Ok(Ok(ShowPlanLookup::Unknown)) => return ServerMessage::UnknownPlan { plan_id },
         Ok(Ok(ShowPlanLookup::MissingCorrelation { run_id })) => {
             return ServerMessage::Error {
@@ -518,6 +521,11 @@ async fn show_plan<S: SecretStore + Send + Sync + 'static>(
         outcome: r.outcome,
         decided_at: r.decided_at,
     });
+    let abort = abort.map(|r| PlanAbortView {
+        executor_run_id: r.agent_run_id,
+        aborted_at: r.aborted_at,
+        reason: r.reason,
+    });
     ServerMessage::Plan {
         plan: PlanDetail {
             summary,
@@ -525,6 +533,7 @@ async fn show_plan<S: SecretStore + Send + Sync + 'static>(
             reviews,
             decision,
             addenda,
+            abort,
         },
     }
 }
@@ -533,6 +542,14 @@ async fn show_plan<S: SecretStore + Send + Sync + 'static>(
 /// "look-up succeeded" shapes from the `AuditError`/`JoinError` paths
 /// keeps the outer match small and lets the blocking closure use
 /// `?` for IO failures.
+///
+/// The `Found` variant carries the full joined audit state for one
+/// plan; it is several hundred bytes wide while the other variants
+/// are near-empty. The asymmetry is fine here because the value is
+/// constructed and matched once in `show_plan` and immediately
+/// destructured into named locals — there is no storage of this enum
+/// in any collection where the per-variant slack would matter.
+#[allow(clippy::large_enum_variant)]
 enum ShowPlanLookup {
     Unknown,
     MissingCorrelation {
@@ -544,6 +561,7 @@ enum ShowPlanLookup {
         reviews: Vec<crate::audit::PlanReviewRecord>,
         decision: Option<PlanDecisionRecord>,
         addenda: Vec<crate::audit::PlanAddendumRecord>,
+        abort: Option<crate::audit::PlanAbortRecord>,
     },
 }
 
@@ -2164,6 +2182,47 @@ mod tests {
         addendum_id
     }
 
+    /// Record an executor `agent_run` and the matching `plan_abort`
+    /// row, returning the abort's `agent_run_id`. The executor run is
+    /// bound to `plan_id` via `read_plan_id`, mirroring the broker
+    /// invariant that execute-stage runs cite the plan they are
+    /// executing. Unlike `record_executor_run_and_addendum`, the abort
+    /// does not require the plan to have been accepted — the abort
+    /// route deliberately bypasses the acceptance gate.
+    async fn record_executor_run_and_abort(
+        state: &Arc<BrokerState<InMemStore>>,
+        session_id: SessionId,
+        plan_id: crate::agent_plan::PlanId,
+        aborted_at: UnixMillis,
+        reason_text: &str,
+    ) -> crate::agent_run::AgentRunId {
+        let executor_run = crate::agent_run::AgentRunId::new();
+        let reason = crate::agent_plan::PlanAbortReason::try_new(reason_text).unwrap();
+        state
+            .audit
+            .record_agent_run(&crate::audit::AgentRunAuditRecord {
+                run_id: executor_run,
+                session_id,
+                requested_at: UnixMillis::from_millis(1_700_000_000),
+                agent_kind: AgentKind::Claude,
+                prompt: crate::agent_run::AgentPrompt::new("execute this plan").summary(),
+                correlation_id: None,
+                stage: crate::agent_plan::Stage::Execute,
+                read_plan_id: Some(plan_id),
+            })
+            .unwrap();
+        state
+            .audit
+            .record_plan_abort(&crate::audit::PlanAbortRecord {
+                plan_id,
+                agent_run_id: executor_run,
+                aborted_at,
+                reason,
+            })
+            .unwrap();
+        executor_run
+    }
+
     /// Record a reviewer `agent_run` and the matching `plan_review`
     /// row, returning the new `ReviewId`. The reviewer run is bound to
     /// `plan_id` via `read_plan_id`, mirroring the broker invariant
@@ -2645,6 +2704,78 @@ mod tests {
         assert_eq!(detail.addenda.len(), 2);
         assert_eq!(detail.addenda[0].addendum_id, first);
         assert_eq!(detail.addenda[1].addendum_id, second);
+    }
+
+    /// `show_plan` joins the `plan_abort` row when an executor has
+    /// hard-aborted the plan. The view's `executor_run_id` is the
+    /// run that called the abort route, distinct from the planner
+    /// run on `PlanSummary`. The abort does not require an accepted
+    /// decision — the route deliberately bypasses the gate, and the
+    /// joined view here reflects that.
+    #[tokio::test]
+    async fn show_plan_with_abort_returns_full_detail() {
+        let server = MockServer::start().await;
+        let state = make_state(&server, vec![], "o");
+        let session_id = open_session(&state).await;
+        let (planner_run_id, plan_id) = record_planner_run_and_plan(
+            &state,
+            session_id,
+            None,
+            "# plan",
+            UnixMillis::from_millis(1_700_000_200),
+        )
+        .await;
+        let executor_run = record_executor_run_and_abort(
+            &state,
+            session_id,
+            plan_id,
+            UnixMillis::from_millis(1_700_000_700),
+            "Migration plan no longer viable: schema changed.",
+        )
+        .await;
+        // Sanity: the abort's run is *not* the planner's run.
+        assert_ne!(executor_run, planner_run_id);
+
+        let resp = dispatch_message(ClientMessage::ShowPlan { plan_id }, &state).await;
+        let detail = match resp {
+            ServerMessage::Plan { plan } => plan,
+            other => panic!("expected Plan, got {other:?}"),
+        };
+        let abort = detail.abort.as_ref().expect("abort view should be Some");
+        assert_eq!(abort.executor_run_id, executor_run);
+        assert_eq!(abort.aborted_at.as_millis(), 1_700_000_700);
+        assert_eq!(
+            abort.reason.as_str(),
+            "Migration plan no longer viable: schema changed.",
+        );
+        // The abort path does not gate on the decision, so the
+        // decision field is `None` here.
+        assert!(detail.decision.is_none());
+    }
+
+    /// A plan with no abort row surfaces `abort = None`, distinct from
+    /// the populated case above. Pins the "abort optionality" wire
+    /// contract.
+    #[tokio::test]
+    async fn show_plan_without_abort_returns_none_abort() {
+        let server = MockServer::start().await;
+        let state = make_state(&server, vec![], "o");
+        let session_id = open_session(&state).await;
+        let (_, plan_id) = record_planner_run_and_plan(
+            &state,
+            session_id,
+            None,
+            "# plan",
+            UnixMillis::from_millis(1_700_000_200),
+        )
+        .await;
+
+        let resp = dispatch_message(ClientMessage::ShowPlan { plan_id }, &state).await;
+        let detail = match resp {
+            ServerMessage::Plan { plan } => plan,
+            other => panic!("expected Plan, got {other:?}"),
+        };
+        assert!(detail.abort.is_none());
     }
 
     #[tokio::test]
