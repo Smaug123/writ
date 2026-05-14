@@ -2,6 +2,7 @@
 //! serde; proof-carrying internal descriptions keep construction explicit.
 
 mod agent_vm;
+mod capability_set;
 mod decision;
 mod grant;
 mod request;
@@ -12,6 +13,7 @@ pub use agent_vm::{
     BrokerPortRange, BrokerPorts, IpFamily, Ipv4Cidr, Ipv6Cidr, PfAllowRule, PfAnchorName, PfCidr,
     PfDenyRule, PfHost, PfRuleset, render_pf, session_firewall_pf_ruleset, session_pf_ruleset,
 };
+pub use capability_set::CapabilitySet;
 pub use decision::{
     GitHubGrantedScope, GitHubPermissions, GrantedScope, MetadataAccess, PolicyDecision, TtlError,
     TtlSeconds,
