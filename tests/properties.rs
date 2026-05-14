@@ -16,7 +16,7 @@ use writ::audit::{
 };
 use writ::bailiff::{PLAN_PROMPT_SEPARATOR, compose_implementer_prompt};
 use writ::core::{
-    AgentKind, CapabilityRequest, CredentialGrant, GitHubAccess, GitHubGrantedScope,
+    AgentKind, CapabilityRequest, CapabilitySet, CredentialGrant, GitHubAccess, GitHubGrantedScope,
     GitHubPermissions, GitHubRequest, GrantedScope, Jti, MetadataAccess, PolicyDecision, RepoRef,
     RequestId, SessionId, SessionRecord, TtlSeconds, UnixMillis,
 };
@@ -46,6 +46,13 @@ fn arb_github_request() -> impl Strategy<Value = GitHubRequest> {
 
 fn arb_request() -> impl Strategy<Value = CapabilityRequest> {
     arb_github_request().prop_map(CapabilityRequest::GitHub)
+}
+
+fn arb_capability_set() -> impl Strategy<Value = CapabilitySet> {
+    prop_oneof![
+        arb_repo().prop_map(|repo| CapabilitySet::WorkspaceRead { repo }),
+        arb_repo().prop_map(|repo| CapabilitySet::WorkspaceWrite { repo }),
+    ]
 }
 
 fn arb_permissions() -> impl Strategy<Value = GitHubPermissions> {
@@ -129,6 +136,13 @@ proptest! {
         let j = serde_json::to_string(&req).unwrap();
         let back: CapabilityRequest = serde_json::from_str(&j).unwrap();
         prop_assert_eq!(back, req);
+    }
+
+    #[test]
+    fn capability_set_roundtrips_through_json(cap in arb_capability_set()) {
+        let j = serde_json::to_string(&cap).unwrap();
+        let back: CapabilitySet = serde_json::from_str(&j).unwrap();
+        prop_assert_eq!(back, cap);
     }
 
     #[test]
