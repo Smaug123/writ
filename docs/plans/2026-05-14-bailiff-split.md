@@ -62,20 +62,24 @@ notes), workflow vocabulary leaves writ entirely.
 
 - **Sessions and credential grants.** Existing. Per-session per-route
   minting, audited.
-- **Agent runs.** Spawn an agent with a prompt and a capability set,
-  capture stdout/stderr, sign the terminal artefact, write the signed
-  artefact as a Git object into bailiff's repo. Audit (run_id,
-  prompt_hash, capability_set, output_hash, signature, exit_code).
+- **Agent runs.** Spawn an agent with a prompt and a set of
+  capabilities, capture stdout/stderr, sign the terminal artefact,
+  write the signed artefact as a Git object into bailiff's repo.
+  Audit (run_id, prompt_sha256, capabilities, output_sha256,
+  signature, exit_code) — `capabilities` is the same canonical
+  collection writ accepted on the wire, so a multi-capability run
+  records every granted variant, not a single composite.
 - **Signing.** Writ holds an SSH signing key. Every terminal output
-  gets a detached signature over `(run_id, prompt_sha256, output_hash,
-  capability_set, exit_code, completed_at, session_id)` — exactly the
+  gets a detached signature over the canonical bytes of
+  `SignedRunMetadata { run_id, prompt_sha256, output_sha256,
+  capabilities, exit_code, completed_at, session_id }` — exactly the
   things writ observed first-hand. Including `prompt_sha256` is what
   binds the signed output to its originating prompt: a third party
   verifying the note can re-hash bailiff's plan note and confirm it
   matches the prompt writ saw, ruling out "valid signature + swapped
   prompt" forgeries. The signature is what bailiff (and any third
   party) uses to attest "writ confirms this output came from run R
-  driven by prompt P under capability set C at time T."
+  driven by prompt P under capabilities C at time T."
 
 Writ knows nothing about the words "plan", "review", "decide",
 "execute". The `Stage` enum and `read_plan_id` column are gone.
@@ -120,21 +124,39 @@ ClientMessage::RunAgent {
 
 ServerMessage::RunAgentCompleted {
     run_id,
-    output_oid,             // OID of the blob writ wrote into bailiff's
-                            // repo
-    signature,              // detached signature over the metadata
-    exit_code,
+    output_oid,                 // OID of the blob writ wrote into
+                                // bailiff's repo
+    signed_metadata: SignedRunMetadata {
+        run_id,
+        prompt_sha256,
+        output_sha256,          // matches the blob at `output_oid`
+        capabilities,           // canonical serialisation of the granted Vec
+        exit_code,
+        completed_at,
+        session_id,
+    },
+    signature,                  // detached signature over the canonical
+                                // bytes of signed_metadata
 }
 ```
+
+The `SignedRunMetadata` payload is exactly what writ hashed and
+signed; returning it in full (rather than just the signature) is
+what lets bailiff or any third-party reader re-canonicalise the
+bytes and verify the signature without consulting writ. The note
+stored in bailiff's repo contains the same `(signed_metadata,
+signature)` pair alongside the output blob, so verification is
+self-contained from a clone of bailiff's repo.
 
 `RunAgent` is request/response over the existing one-shot dispatch
 path: writ spawns the agent, waits for it to terminate, hashes the
 captured stdout, signs the metadata, writes the bytes as a blob and
-the signature as a note in bailiff's repo at the requested ref, and
-returns a single `RunAgentCompleted`. The audit row records the hash
-+ signature. No separate "started" frame: there is nothing for
-bailiff to do mid-run on the writ wire (mid-run agent coordination
-goes through bailiff's own channels — see below).
+the signed metadata + signature as a note in bailiff's repo at the
+requested ref, and returns a single `RunAgentCompleted`. The audit
+row records the same canonical metadata + signature. No separate
+"started" frame: there is nothing for bailiff to do mid-run on the
+writ wire (mid-run agent coordination goes through bailiff's own
+channels — see below).
 
 Pre-v1: whole-artefact-at-end. No streaming. If the agent crashes
 with partial output, writ still writes whatever was captured and
@@ -180,8 +202,11 @@ set is appropriate for each workflow position.
 - `policy::*` stays; per-stage logic becomes per-capability-variant
   logic.
 - `agent_run` audit row keeps most columns. `stage` and
-  `read_plan_id` drop. `capability_set` (serialised sum type) and
-  `signature` are added.
+  `read_plan_id` drop. `capabilities` (canonical serialisation of
+  the granted `Vec<CapabilitySet>`) and `signature` are added —
+  storing the full collection, not just one variant, so policy
+  replay and provenance checks for a multi-capability run see every
+  authority that produced the signed output.
 - VM HTTP layer (`vm_http/*`) keeps its credential-issuance and
   replay routes. Loses `/v1/plans/*`.
 
