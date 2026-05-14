@@ -462,6 +462,23 @@ impl CommitIdentity {
             date_rfc3339,
         })
     }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn email(&self) -> &str {
+        &self.email
+    }
+
+    /// The validated RFC 3339 representation of the authoring date,
+    /// with seconds precision and the original timezone offset
+    /// preserved. Round-tripping this string through
+    /// [`time::OffsetDateTime::parse`] with the `Rfc3339` format
+    /// description is guaranteed to succeed.
+    pub fn date_rfc3339(&self) -> &str {
+        &self.date_rfc3339
+    }
 }
 
 /// Inputs to [`GitDataClient::create_commit`].
