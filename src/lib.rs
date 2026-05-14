@@ -6,6 +6,7 @@
 
 pub mod agent_plan;
 pub mod agent_run;
+pub mod bailiff;
 #[cfg(feature = "host")]
 pub mod agent_vm_daemon;
 #[cfg(feature = "host")]

@@ -10,7 +10,8 @@ use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
 
-use writ::agent_plan::{PlanId, Stage, compose_effective_prompt, stage_consumes_plan_body};
+use writ::agent_plan::{PlanId, Stage};
+use writ::bailiff::{compose_effective_prompt, stage_consumes_plan_body};
 use writ::agent_run::{
     AgentProcessPlan, AgentPrompt, AgentRunId, AgentRunTerminalStatus, run_agent_process,
 };

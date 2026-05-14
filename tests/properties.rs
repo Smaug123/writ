@@ -6,11 +6,11 @@
 use proptest::prelude::*;
 use writ::agent_plan::{
     AbortSubmission, AddendumSubmission, CorrelationId, DecisionOutcome, DecisionView,
-    MAX_CORRELATION_ID_BYTES, MIN_CORRELATION_ID_BYTES, PLAN_PROMPT_SEPARATOR, PlanAbortReason,
-    PlanBody, PlanCreated, PlanFeedback, PlanId, PlanRouteAction, PlanSubmission, PlanView,
-    ReviewSubmission, Stage, Verdict, compose_implementer_prompt,
-    route_permitted_by_stage_and_decision,
+    MAX_CORRELATION_ID_BYTES, MIN_CORRELATION_ID_BYTES, PlanAbortReason, PlanBody, PlanCreated,
+    PlanFeedback, PlanId, PlanRouteAction, PlanSubmission, PlanView, ReviewSubmission, Stage,
+    Verdict, route_permitted_by_stage_and_decision,
 };
+use writ::bailiff::{PLAN_PROMPT_SEPARATOR, compose_implementer_prompt};
 use writ::agent_run::{AgentPrompt, AgentRunId};
 use writ::audit::{
     AgentRunAuditRecord, AuditLog, GitPushRequestRecord, PlanSubmissionRecord, PreMintRecord,
