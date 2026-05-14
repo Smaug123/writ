@@ -136,6 +136,12 @@ pub enum GitObjectSourceError {
     NotFound { sha: String },
     #[error("object {sha} is malformed: {reason}")]
     Malformed { sha: String, reason: String },
+    #[error(
+        "object {sha} reports size {size} bytes which exceeds the configured per-object limit of {max} bytes"
+    )]
+    ObjectTooLarge { sha: String, size: u64, max: u64 },
+    #[error("git object source has been poisoned by an earlier failure and is no longer usable")]
+    Poisoned,
     #[error("object access failed: {source}")]
     Io {
         #[source]
