@@ -34,13 +34,24 @@
 //! `from_openssh_pem` — adding e.g. RSA support is a Cargo-features
 //! change, not a code change here.
 //!
+//! Persistence: writ's signing key is held in the same `SecretStore`
+//! abstraction the GitHub App private key uses. [`load_signing_key`]
+//! fails fast if the key is missing; [`ensure_signing_key`] generates
+//! a fresh Ed25519 keypair via OS randomness on first boot and writes
+//! it back to the store, so subsequent boots are pure loads. The
+//! generation-on-first-boot path is the operator bootstrap: the
+//! fingerprint of the freshly minted key is what gets added to
+//! bailiff's allowed-signers file.
+//!
 //! Test fixtures: `tests/fixtures/ed25519_test_signing.key` (+ `.pub`)
 //! is a fixed Ed25519 keypair used by this module's tests; never
 //! reused for any real signing.
 
-use ssh_key::{HashAlg, LineEnding, PrivateKey, PublicKey, SshSig};
+use ssh_key::rand_core::OsRng;
+use ssh_key::{Algorithm, HashAlg, LineEnding, PrivateKey, PublicKey, SshSig};
 
 use crate::core::{SshKeyFingerprint, SshKeyFingerprintError, SshSignature, SshSignatureError};
+use crate::secret::{SecretError, SecretKey, SecretStore};
 
 /// SSHSIG namespace bound into every writ-produced signature. Distinct
 /// from `git` so a writ signature cannot impersonate a Git commit
@@ -112,6 +123,93 @@ impl WritSigningKey {
     }
 }
 
+/// Generate a fresh Ed25519 keypair via OS randomness and return both
+/// the in-memory signer and its OpenSSH-armored PEM serialisation. The
+/// PEM is what gets written to the `SecretStore`; it is held in
+/// `Zeroizing` storage so its bytes are scrubbed when dropped at the
+/// end of the surrounding function.
+fn generate_keypair() -> Result<(WritSigningKey, impl AsRef<str>), WritSigningKeyError> {
+    let inner = PrivateKey::random(&mut OsRng, Algorithm::Ed25519)
+        .map_err(WritSigningKeyError::Generate)?;
+    let pem = inner
+        .to_openssh(LineEnding::LF)
+        .map_err(WritSigningKeyError::Serialize)?;
+    Ok((WritSigningKey { inner }, pem))
+}
+
+/// Load the writ signing key from `store` at `key`. Fails fast if no
+/// value is present at that key — operator intent must be explicit:
+/// callers that want first-boot generation use [`ensure_signing_key`].
+pub fn load_signing_key(
+    store: &dyn SecretStore,
+    key: &SecretKey,
+) -> Result<WritSigningKey, SigningKeyStoreError> {
+    match store.get(key)? {
+        None => Err(SigningKeyStoreError::NotFound {
+            key: key.as_str().to_string(),
+        }),
+        Some(pem) => Ok(WritSigningKey::from_openssh_pem(&pem)?),
+    }
+}
+
+/// Load the writ signing key from `store` at `key`, generating and
+/// persisting a fresh Ed25519 keypair if none is present. Idempotent:
+/// after the first call the key is in the store and every subsequent
+/// call returns [`EnsureOutcome::Loaded`] with the same key material.
+///
+/// The caller can branch on the returned outcome — e.g. to print the
+/// freshly-generated fingerprint at boot so the operator knows what to
+/// add to bailiff's allowed-signers file.
+pub fn ensure_signing_key(
+    store: &dyn SecretStore,
+    key: &SecretKey,
+) -> Result<EnsureOutcome, SigningKeyStoreError> {
+    if let Some(pem) = store.get(key)? {
+        return Ok(EnsureOutcome::Loaded(WritSigningKey::from_openssh_pem(
+            &pem,
+        )?));
+    }
+    let (signer, pem) = generate_keypair()?;
+    store.put(key, pem.as_ref())?;
+    Ok(EnsureOutcome::Generated(signer))
+}
+
+/// Result of [`ensure_signing_key`]: which arm of the load-or-generate
+/// branch fired. Both variants carry the resulting signer; the
+/// distinction exists so callers can log "generated new key
+/// (fingerprint X) — add to bailiff's allowed-signers" exactly once
+/// per boot.
+#[derive(Debug)]
+pub enum EnsureOutcome {
+    /// The key was already in the store and was loaded as-is.
+    Loaded(WritSigningKey),
+    /// The store had no value at this key; a new Ed25519 keypair was
+    /// generated and written back.
+    Generated(WritSigningKey),
+}
+
+impl EnsureOutcome {
+    /// Borrow the signer regardless of which arm fired.
+    pub fn signing_key(&self) -> &WritSigningKey {
+        match self {
+            EnsureOutcome::Loaded(k) | EnsureOutcome::Generated(k) => k,
+        }
+    }
+
+    /// Consume the outcome, discarding the loaded/generated tag.
+    pub fn into_signing_key(self) -> WritSigningKey {
+        match self {
+            EnsureOutcome::Loaded(k) | EnsureOutcome::Generated(k) => k,
+        }
+    }
+
+    /// `true` if a fresh key was generated. Useful for first-boot
+    /// logging branches.
+    pub fn was_generated(&self) -> bool {
+        matches!(self, EnsureOutcome::Generated(_))
+    }
+}
+
 /// The public half of a writ signing keypair. Used to verify
 /// signatures and to publish the fingerprint a bailiff allowed-signers
 /// file must list.
@@ -164,6 +262,10 @@ pub enum WritSigningKeyError {
          (only Ed25519 is supported today)"
     )]
     UnsupportedAlgorithm { algorithm: String },
+    #[error("Ed25519 keypair generation failed: {0}")]
+    Generate(ssh_key::Error),
+    #[error("OpenSSH PEM serialisation of fresh keypair failed: {0}")]
+    Serialize(ssh_key::Error),
     #[error("SSHSIG sign failed: {0}")]
     Sign(ssh_key::Error),
     #[error("SSHSIG PEM encoding failed: {0}")]
@@ -172,6 +274,16 @@ pub enum WritSigningKeyError {
     Newtype(SshSignatureError),
     #[error("ssh-key produced a fingerprint that fails our wire validation: {0}")]
     Fingerprint(SshKeyFingerprintError),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum SigningKeyStoreError {
+    #[error("secret store error: {0}")]
+    Secret(#[from] SecretError),
+    #[error("no writ signing key stored under {key:?}")]
+    NotFound { key: String },
+    #[error(transparent)]
+    SigningKey(#[from] WritSigningKeyError),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -185,6 +297,35 @@ pub enum VerifyError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    /// Process-local `SecretStore` for tests — same shape used in
+    /// `server.rs` and `github.rs`. Holds an unordered map under a
+    /// mutex; no I/O, no persistence.
+    #[derive(Default)]
+    struct InMemStore(Mutex<HashMap<String, String>>);
+
+    impl SecretStore for InMemStore {
+        fn get(&self, key: &SecretKey) -> Result<Option<String>, SecretError> {
+            Ok(self.0.lock().unwrap().get(key.as_str()).cloned())
+        }
+        fn put(&self, key: &SecretKey, value: &str) -> Result<(), SecretError> {
+            self.0
+                .lock()
+                .unwrap()
+                .insert(key.as_str().to_string(), value.to_string());
+            Ok(())
+        }
+        fn delete(&self, key: &SecretKey) -> Result<(), SecretError> {
+            self.0.lock().unwrap().remove(key.as_str());
+            Ok(())
+        }
+    }
+
+    fn store_key() -> SecretKey {
+        SecretKey::new("writ-signing-key").unwrap()
+    }
 
     const PRIVATE_PEM: &str = include_str!("../tests/fixtures/ed25519_test_signing.key");
     const PUBLIC_OPENSSH: &str = include_str!("../tests/fixtures/ed25519_test_signing.key.pub");
@@ -377,5 +518,163 @@ mod tests {
         let a = key.sign(b"alpha").unwrap();
         let b = key.sign(b"beta").unwrap();
         assert_ne!(a.as_str(), b.as_str());
+    }
+
+    /// Generation produces a parseable Ed25519 key whose fingerprint
+    /// is the SHA-256 `SHA256:` form. Different invocations produce
+    /// different keys (OS randomness, not a constant).
+    #[test]
+    fn generate_produces_fresh_parseable_ed25519_key() {
+        let (signer_a, pem_a) = generate_keypair().unwrap();
+        let (signer_b, _pem_b) = generate_keypair().unwrap();
+
+        // Fingerprint shape: SHA256:<base64>, length 64+7+1ish, must
+        // parse via our wire newtype.
+        let fp_a = signer_a.fingerprint();
+        assert!(fp_a.as_str().starts_with("SHA256:"));
+
+        // Two generates of an Ed25519 key from OS randomness must
+        // (with overwhelming probability) produce different
+        // fingerprints.
+        assert_ne!(signer_a.fingerprint(), signer_b.fingerprint());
+
+        // PEM round-trips: re-parse should yield an Ed25519 key with
+        // the same fingerprint as the originally-generated signer.
+        let reparsed = WritSigningKey::from_openssh_pem(pem_a.as_ref()).unwrap();
+        assert_eq!(reparsed.fingerprint(), signer_a.fingerprint());
+    }
+
+    /// `load_signing_key` against a store with no value at the key
+    /// must surface `NotFound`, not e.g. a parse error on an empty
+    /// string.
+    #[test]
+    fn load_signing_key_reports_not_found_on_empty_store() {
+        let store = InMemStore::default();
+        let key = store_key();
+        match load_signing_key(&store, &key) {
+            Err(SigningKeyStoreError::NotFound { key: k }) => {
+                assert_eq!(k, "writ-signing-key");
+            }
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+    }
+
+    /// `load_signing_key` returns the signer that was previously
+    /// written under the same key, preserving its fingerprint
+    /// across the store round-trip.
+    #[test]
+    fn load_signing_key_round_trips_through_store() {
+        let store = InMemStore::default();
+        let key = store_key();
+        store.put(&key, PRIVATE_PEM).unwrap();
+
+        let loaded = load_signing_key(&store, &key).unwrap();
+        assert_eq!(loaded.fingerprint(), load().fingerprint());
+    }
+
+    /// First `ensure_signing_key` call against an empty store must
+    /// generate (operator bootstrap), write the new PEM into the
+    /// store, and return a freshly-tagged outcome.
+    #[test]
+    fn ensure_signing_key_generates_on_empty_store() {
+        let store = InMemStore::default();
+        let key = store_key();
+        let outcome = ensure_signing_key(&store, &key).unwrap();
+        assert!(
+            outcome.was_generated(),
+            "fresh store should produce Generated, got {outcome:?}"
+        );
+        // After generate, the store now has a value parseable as the
+        // same signing key.
+        let stored = store
+            .get(&key)
+            .unwrap()
+            .expect("ensure should have populated the store");
+        let reparsed = WritSigningKey::from_openssh_pem(&stored).unwrap();
+        assert_eq!(reparsed.fingerprint(), outcome.signing_key().fingerprint());
+    }
+
+    /// `ensure_signing_key` is idempotent: a second call returns the
+    /// same key material via the `Loaded` arm. Critical for the
+    /// daemon startup path, which calls ensure on every boot.
+    #[test]
+    fn ensure_signing_key_is_idempotent_across_calls() {
+        let store = InMemStore::default();
+        let key = store_key();
+
+        let first = ensure_signing_key(&store, &key).unwrap();
+        assert!(first.was_generated(), "first call should generate");
+        let first_fp = first.signing_key().fingerprint();
+
+        let second = ensure_signing_key(&store, &key).unwrap();
+        assert!(
+            !second.was_generated(),
+            "second call must load, not regenerate; got {second:?}"
+        );
+        assert_eq!(second.signing_key().fingerprint(), first_fp);
+    }
+
+    /// A signer obtained by `ensure_signing_key` is fully usable end
+    /// to end: signing under the generated key must verify against
+    /// its own `verifying_key`, just like a fixture-loaded signer.
+    #[test]
+    fn generated_signing_key_signs_and_verifies() {
+        let store = InMemStore::default();
+        let key = store_key();
+        let signer = ensure_signing_key(&store, &key).unwrap().into_signing_key();
+
+        let msg = b"signed by a freshly-generated key";
+        let sig = signer.sign(msg).unwrap();
+        signer.verifying_key().verify(msg, &sig).unwrap();
+    }
+
+    /// If the store already contains material under the signing-key
+    /// slot but it's not a supported signing key, the
+    /// load-or-generate path must surface the typed parse error
+    /// rather than silently regenerating over the operator's
+    /// material.
+    #[test]
+    fn ensure_signing_key_propagates_unsupported_stored_material() {
+        const RSA_PRIVATE_PEM: &str = include_str!("../tests/fixtures/rsa_test_load_only.key");
+        let store = InMemStore::default();
+        let key = store_key();
+        store.put(&key, RSA_PRIVATE_PEM).unwrap();
+
+        match ensure_signing_key(&store, &key) {
+            Err(SigningKeyStoreError::SigningKey(WritSigningKeyError::UnsupportedAlgorithm {
+                algorithm,
+            })) => {
+                assert!(
+                    algorithm.contains("rsa") || algorithm.contains("RSA"),
+                    "algorithm label should mention RSA, got {algorithm:?}"
+                );
+            }
+            other => panic!("expected UnsupportedAlgorithm, got {other:?}"),
+        }
+    }
+
+    /// Distinct `SecretStore` keys are independent: writing under one
+    /// must not be visible under a different key. Sanity-check the
+    /// SecretStore + ensure_signing_key composition.
+    #[test]
+    fn distinct_secret_keys_are_independent_signing_slots() {
+        let store = InMemStore::default();
+        let a = SecretKey::new("writ-signing-key-a").unwrap();
+        let b = SecretKey::new("writ-signing-key-b").unwrap();
+
+        let signer_a = ensure_signing_key(&store, &a).unwrap().into_signing_key();
+        let signer_b = ensure_signing_key(&store, &b).unwrap().into_signing_key();
+
+        assert_ne!(signer_a.fingerprint(), signer_b.fingerprint());
+        // Loading each slot back independently yields its own
+        // fingerprint, not crossed.
+        assert_eq!(
+            load_signing_key(&store, &a).unwrap().fingerprint(),
+            signer_a.fingerprint()
+        );
+        assert_eq!(
+            load_signing_key(&store, &b).unwrap().fingerprint(),
+            signer_b.fingerprint()
+        );
     }
 }
