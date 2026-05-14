@@ -205,7 +205,6 @@ impl CatFileObjectSource {
             .inner
             .take()
             .expect("CatFileObjectSource::inner is always Some until close consumes it");
-        let mut guard = PgidCleanupGuard::new(pgid);
         let CatFileChild {
             mut child,
             stdin,
@@ -214,6 +213,19 @@ impl CatFileObjectSource {
         } = mutex.into_inner();
         drop(stdin);
         drop(stdout);
+        // IMPORTANT: declare `guard` AFTER `child`. Locals drop in
+        // reverse declaration order, so this ordering ensures that
+        // on any panic or future-cancellation between here and
+        // `guard.disarm()` below, `guard` is dropped first — its
+        // `killpg(pgid, SIGKILL)` runs while the leader pid is still
+        // un-reaped (so the pgid still belongs to our group), and
+        // only afterwards does `child` drop, with tokio's
+        // `kill_on_drop(true)` reaping the leader. Reversing this
+        // order would let `child` drop first: the kernel would free
+        // the leader's pid (and therefore the pgid), and `guard`'s
+        // later `killpg` could then hit an unrelated process group
+        // that recycled the pid.
+        let mut guard = PgidCleanupGuard::new(pgid);
 
         // Observe the leader's exit without reaping. While its pid
         // remains claimed, the pgid is stable, so the subsequent
