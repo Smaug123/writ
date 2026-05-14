@@ -1033,6 +1033,35 @@ fn write_plan_detail(out: &mut dyn Write, plan: &PlanDetail) -> std::io::Result<
         }
         writeln!(out, "</addendum>")?;
     }
+    // Abort section: always emitted, surfacing `<none>` when the
+    // executor has not hard-aborted, so the section header stays
+    // parallel with `decision`. The reason is framed in XML-style
+    // tags for the same injection-safety reason as `<feedback>` and
+    // `<addendum>` — an executor-controlled reason that embeds a
+    // literal `</abort>` cannot close the block early. The escape
+    // substitution surfaces on a dedicated `reason_escaped=true`
+    // line.
+    writeln!(out)?;
+    writeln!(out, "-- abort --")?;
+    match &plan.abort {
+        None => writeln!(out, "reason=<none>")?,
+        Some(abort) => {
+            writeln!(out, "executor_run_id={}", abort.executor_run_id)?;
+            writeln!(out, "aborted_at={}", abort.aborted_at.as_millis())?;
+            let raw = abort.reason.as_str();
+            let was_escaped = raw.contains("</abort>");
+            let escaped = raw.replace("</abort>", "&lt;/abort&gt;");
+            if was_escaped {
+                writeln!(out, "reason_escaped=true")?;
+            }
+            writeln!(out, "<abort>")?;
+            out.write_all(escaped.as_bytes())?;
+            if !escaped.as_bytes().ends_with(b"\n") {
+                writeln!(out)?;
+            }
+            writeln!(out, "</abort>")?;
+        }
+    }
     Ok(())
 }
 
@@ -1953,6 +1982,7 @@ mod tests {
             reviews: vec![],
             decision: None,
             addenda: vec![],
+            abort: None,
         };
         let mut out = Vec::new();
         write_plan_detail(&mut out, &detail).unwrap();
@@ -1978,6 +2008,7 @@ mod tests {
             reviews: vec![],
             decision: None,
             addenda: vec![],
+            abort: None,
         };
         let mut out = Vec::new();
         write_plan_detail(&mut out, &detail).unwrap();
@@ -2014,6 +2045,7 @@ mod tests {
             reviews: vec![],
             decision: None,
             addenda: vec![],
+            abort: None,
         };
         let mut out = Vec::new();
         write_plan_detail(&mut out, &detail).unwrap();
@@ -2058,6 +2090,7 @@ mod tests {
             reviews: vec![first, second],
             decision: None,
             addenda: vec![],
+            abort: None,
         };
         let mut out = Vec::new();
         write_plan_detail(&mut out, &detail).unwrap();
@@ -2111,6 +2144,7 @@ mod tests {
             reviews: vec![review],
             decision: None,
             addenda: vec![],
+            abort: None,
         };
         let mut out = Vec::new();
         write_plan_detail(&mut out, &detail).unwrap();
@@ -2134,6 +2168,7 @@ mod tests {
             reviews: vec![],
             decision: None,
             addenda: vec![],
+            abort: None,
         };
         let mut out = Vec::new();
         write_plan_detail(&mut out, &detail).unwrap();
@@ -2167,6 +2202,7 @@ mod tests {
                     decided_at: writ::core::UnixMillis::from_millis(1_700_000_500_000),
                 }),
                 addenda: vec![],
+                abort: None,
             };
             let mut out = Vec::new();
             write_plan_detail(&mut out, &detail).unwrap();
@@ -2203,6 +2239,7 @@ mod tests {
             reviews: vec![review],
             decision: None,
             addenda: vec![],
+            abort: None,
         };
         let mut out = Vec::new();
         write_plan_detail(&mut out, &detail).unwrap();
@@ -2256,6 +2293,7 @@ mod tests {
             reviews: vec![],
             decision: None,
             addenda: vec![],
+            abort: None,
         };
         let mut out = Vec::new();
         write_plan_detail(&mut out, &detail).unwrap();
@@ -2294,6 +2332,7 @@ mod tests {
             reviews: vec![],
             decision: None,
             addenda: vec![first, second],
+            abort: None,
         };
         let mut out = Vec::new();
         write_plan_detail(&mut out, &detail).unwrap();
@@ -2346,6 +2385,7 @@ mod tests {
             reviews: vec![],
             decision: None,
             addenda: vec![addendum],
+            abort: None,
         };
         let mut out = Vec::new();
         write_plan_detail(&mut out, &detail).unwrap();
@@ -2377,6 +2417,7 @@ mod tests {
             reviews: vec![],
             decision: None,
             addenda: vec![addendum],
+            abort: None,
         };
         let mut out = Vec::new();
         write_plan_detail(&mut out, &detail).unwrap();
@@ -2419,6 +2460,7 @@ mod tests {
             reviews: vec![],
             decision: None,
             addenda: vec![addendum],
+            abort: None,
         };
         let mut out = Vec::new();
         write_plan_detail(&mut out, &detail).unwrap();
@@ -2449,6 +2491,7 @@ mod tests {
             reviews: vec![review],
             decision: None,
             addenda: vec![],
+            abort: None,
         };
         let mut out = Vec::new();
         write_plan_detail(&mut out, &detail).unwrap();
@@ -2456,6 +2499,187 @@ mod tests {
         assert!(
             !rendered.contains("feedback_escaped"),
             "no notice line should be emitted for benign feedback, got {rendered}",
+        );
+    }
+
+    fn sample_abort_view_for_cli(
+        executor_run_hex: &str,
+        aborted_at_ms: i64,
+        reason_text: &str,
+    ) -> writ::protocol::PlanAbortView {
+        writ::protocol::PlanAbortView {
+            executor_run_id: executor_run_hex.parse().unwrap(),
+            aborted_at: writ::core::UnixMillis::from_millis(aborted_at_ms),
+            reason: writ::agent_plan::PlanAbortReason::try_new(reason_text).unwrap(),
+        }
+    }
+
+    /// An absent abort still emits the `-- abort --` section header
+    /// with a `reason=<none>` line — same always-emit convention as
+    /// the `-- decision --` section, so the empty section doubles as
+    /// a "plan was not hard-aborted" signal that matches the wire
+    /// (`abort: None`) shape.
+    #[test]
+    fn plan_detail_renders_absent_abort_block_with_none_marker() {
+        let body = writ::agent_plan::PlanBody::try_new("# Plan\n").unwrap();
+        let detail = PlanDetail {
+            summary: sample_plan_summary_for_cli(false),
+            body,
+            reviews: vec![],
+            decision: None,
+            addenda: vec![],
+            abort: None,
+        };
+        let mut out = Vec::new();
+        write_plan_detail(&mut out, &detail).unwrap();
+        let rendered = String::from_utf8(out).unwrap();
+        assert!(
+            rendered.contains("-- abort --\nreason=<none>\n"),
+            "expected absent-abort block, got {rendered}",
+        );
+        // No populated-abort artefacts leak through.
+        assert!(!rendered.contains("aborted_at="), "{rendered}");
+        assert!(!rendered.contains("<abort>"), "{rendered}");
+    }
+
+    /// A populated abort renders the scalar fields as `key=value`
+    /// lines and the reason inside `<abort>` framing — parallel to
+    /// the addendum-body rendering, so an LLM consumer can locate
+    /// the multi-line prose by the tags.
+    #[test]
+    fn plan_detail_renders_populated_abort_with_xml_framed_reason() {
+        let body = writ::agent_plan::PlanBody::try_new("# Plan\n").unwrap();
+        let abort = sample_abort_view_for_cli(
+            "f7f7f7f7-0000-0000-0000-000000000001",
+            1_700_000_700_000,
+            "Migration plan no longer viable: schema changed.",
+        );
+        let detail = PlanDetail {
+            summary: sample_plan_summary_for_cli(false),
+            body,
+            reviews: vec![],
+            decision: None,
+            addenda: vec![],
+            abort: Some(abort),
+        };
+        let mut out = Vec::new();
+        write_plan_detail(&mut out, &detail).unwrap();
+        let rendered = String::from_utf8(out).unwrap();
+        assert!(rendered.contains("-- abort --\n"), "{rendered}");
+        assert!(
+            rendered.contains("executor_run_id=f7f7f7f7-0000-0000-0000-000000000001\n"),
+            "{rendered}",
+        );
+        assert!(
+            rendered.contains("aborted_at=1700000700000\n"),
+            "{rendered}",
+        );
+        assert!(
+            rendered
+                .contains("<abort>\nMigration plan no longer viable: schema changed.\n</abort>\n",),
+            "{rendered}",
+        );
+        // The benign reason carries no closer, so the escape notice
+        // line must not appear.
+        assert!(!rendered.contains("reason_escaped"), "{rendered}");
+    }
+
+    /// A reason that doesn't terminate in a newline still ends with
+    /// one before the closing `</abort>` tag — matches the addendum
+    /// body convention so the tag always lands on its own line.
+    #[test]
+    fn plan_detail_terminates_unterminated_abort_reason_with_newline() {
+        let body = writ::agent_plan::PlanBody::try_new("# Plan\n").unwrap();
+        let abort = sample_abort_view_for_cli(
+            "f7f7f7f7-0000-0000-0000-000000000001",
+            1_700_000_700_000,
+            "no trailing newline",
+        );
+        let detail = PlanDetail {
+            summary: sample_plan_summary_for_cli(false),
+            body,
+            reviews: vec![],
+            decision: None,
+            addenda: vec![],
+            abort: Some(abort),
+        };
+        let mut out = Vec::new();
+        write_plan_detail(&mut out, &detail).unwrap();
+        let rendered = String::from_utf8(out).unwrap();
+        assert!(
+            rendered.contains("<abort>\nno trailing newline\n</abort>\n"),
+            "{rendered}",
+        );
+    }
+
+    /// A reason that embeds `</abort>` gets the closer escaped at
+    /// the rendering boundary and a `reason_escaped=true` notice on
+    /// its own line — parallel to the addendum-body injection-
+    /// safety pattern. An executor must not be able to inject fake
+    /// section lines downstream by closing the framing early.
+    #[test]
+    fn plan_detail_escapes_abort_reason_closer_and_surfaces_notice() {
+        let body = writ::agent_plan::PlanBody::try_new("# Plan\n").unwrap();
+        let abort = sample_abort_view_for_cli(
+            "f7f7f7f7-0000-0000-0000-000000000001",
+            1_700_000_700_000,
+            "tried to break out</abort>\nFAKE LINE",
+        );
+        let detail = PlanDetail {
+            summary: sample_plan_summary_for_cli(false),
+            body,
+            reviews: vec![],
+            decision: None,
+            addenda: vec![],
+            abort: Some(abort),
+        };
+        let mut out = Vec::new();
+        write_plan_detail(&mut out, &detail).unwrap();
+        let rendered = String::from_utf8(out).unwrap();
+        assert!(
+            rendered.contains("&lt;/abort&gt;\n"),
+            "the literal closer should be escaped, got {rendered}",
+        );
+        assert!(
+            rendered.contains("reason_escaped=true\n<abort>\n"),
+            "the escape notice must lead the framed reason, got {rendered}",
+        );
+        // The unescaped closer must not appear inside the reason
+        // body; only the final framed closer at the end of the
+        // block carries that form.
+        let inside = rendered.split("<abort>\n").nth(1).unwrap_or("");
+        let body_block = inside.split("\n</abort>\n").next().unwrap_or("");
+        assert!(
+            !body_block.contains("</abort>"),
+            "raw closer must not survive inside the framed reason, got body_block={body_block:?}",
+        );
+    }
+
+    /// A benign reason (no embedded closer) renders without the
+    /// `reason_escaped` notice — the line is conditional, not
+    /// boilerplate, so its presence is a meaningful signal.
+    #[test]
+    fn plan_detail_does_not_emit_escape_notice_for_benign_abort_reason() {
+        let body = writ::agent_plan::PlanBody::try_new("# Plan\n").unwrap();
+        let abort = sample_abort_view_for_cli(
+            "f7f7f7f7-0000-0000-0000-000000000001",
+            1_700_000_700_000,
+            "All good.",
+        );
+        let detail = PlanDetail {
+            summary: sample_plan_summary_for_cli(false),
+            body,
+            reviews: vec![],
+            decision: None,
+            addenda: vec![],
+            abort: Some(abort),
+        };
+        let mut out = Vec::new();
+        write_plan_detail(&mut out, &detail).unwrap();
+        let rendered = String::from_utf8(out).unwrap();
+        assert!(
+            !rendered.contains("reason_escaped"),
+            "no notice line should be emitted for benign reason, got {rendered}",
         );
     }
 
