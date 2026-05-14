@@ -318,12 +318,18 @@ mod tests {
             tokio::spawn(async move {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 *hits_task.lock().unwrap() += 1;
+                // Accumulate across reads: the OS is free to split the
+                // request header terminator across reads, and scanning
+                // only the current chunk would deadlock with the
+                // reqwest client waiting on a response we never send.
+                let mut request = Vec::new();
                 let mut buf = [0u8; 256];
                 while let Ok(read) = stream.read(&mut buf).await {
                     if read == 0 {
                         break;
                     }
-                    if buf[..read].windows(4).any(|w| w == b"\r\n\r\n") {
+                    request.extend_from_slice(&buf[..read]);
+                    if request.windows(4).any(|w| w == b"\r\n\r\n") {
                         break;
                     }
                 }
