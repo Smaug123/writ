@@ -114,11 +114,18 @@ impl SshSignature {
             return Err(SshSignatureError::NulByte);
         }
         let trimmed = s.trim();
-        if !trimmed.starts_with(SIGNATURE_BEGIN_MARKER) {
-            return Err(SshSignatureError::MissingBeginMarker);
-        }
-        if !trimmed.ends_with(SIGNATURE_END_MARKER) {
-            return Err(SshSignatureError::MissingEndMarker);
+        let after_begin = trimmed
+            .strip_prefix(SIGNATURE_BEGIN_MARKER)
+            .ok_or(SshSignatureError::MissingBeginMarker)?;
+        let body = after_begin
+            .strip_suffix(SIGNATURE_END_MARKER)
+            .ok_or(SshSignatureError::MissingEndMarker)?;
+        // The two markers alone — with no signature bytes between them
+        // — would pass a naive `starts_with` + `ends_with` pair, then
+        // hand bailiff a payload `ssh-keygen -Y verify` is guaranteed
+        // to reject. Catch it here so slice B's verifier never sees it.
+        if body.trim().is_empty() {
+            return Err(SshSignatureError::EmptyBody);
         }
         Ok(Self(s))
     }
@@ -164,6 +171,8 @@ pub enum SshSignatureError {
     MissingBeginMarker,
     #[error("ssh signature must end with `-----END SSH SIGNATURE-----`")]
     MissingEndMarker,
+    #[error("ssh signature body between the BEGIN/END markers must not be empty")]
+    EmptyBody,
 }
 
 #[cfg(test)]
@@ -300,6 +309,26 @@ mod tests {
         assert_eq!(
             SshSignature::try_new(bad),
             Err(SshSignatureError::MissingEndMarker),
+        );
+    }
+
+    /// A payload that is only the BEGIN and END markers — with no
+    /// signature bytes between them — passes a naive starts_with /
+    /// ends_with pair but is meaningless to a verifier. Catch it here
+    /// rather than handing slice B's `ssh-keygen -Y verify` something
+    /// guaranteed to fail.
+    #[test]
+    fn signature_rejects_empty_body_between_markers() {
+        let bad = format!("{SIGNATURE_BEGIN_MARKER}{SIGNATURE_END_MARKER}");
+        assert_eq!(
+            SshSignature::try_new(bad),
+            Err(SshSignatureError::EmptyBody),
+        );
+
+        let whitespace_only = format!("{SIGNATURE_BEGIN_MARKER}\n   \n\t\n{SIGNATURE_END_MARKER}");
+        assert_eq!(
+            SshSignature::try_new(whitespace_only),
+            Err(SshSignatureError::EmptyBody),
         );
     }
 
