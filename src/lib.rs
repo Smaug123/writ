@@ -6,7 +6,6 @@
 
 pub mod agent_plan;
 pub mod agent_run;
-pub mod bailiff;
 #[cfg(feature = "host")]
 pub mod agent_vm_daemon;
 #[cfg(feature = "host")]
@@ -15,6 +14,7 @@ pub mod agent_vm_firewall;
 pub mod agent_vm_lifecycle;
 #[cfg(feature = "host")]
 pub mod audit;
+pub mod bailiff;
 pub(crate) mod bearer;
 #[cfg(feature = "host")]
 pub(crate) mod clean_git;

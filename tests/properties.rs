@@ -10,11 +10,11 @@ use writ::agent_plan::{
     PlanFeedback, PlanId, PlanRouteAction, PlanSubmission, PlanView, ReviewSubmission, Stage,
     Verdict, route_permitted_by_stage_and_decision,
 };
-use writ::bailiff::{PLAN_PROMPT_SEPARATOR, compose_implementer_prompt};
 use writ::agent_run::{AgentPrompt, AgentRunId};
 use writ::audit::{
     AgentRunAuditRecord, AuditLog, GitPushRequestRecord, PlanSubmissionRecord, PreMintRecord,
 };
+use writ::bailiff::{PLAN_PROMPT_SEPARATOR, compose_implementer_prompt};
 use writ::core::{
     AgentKind, CapabilityRequest, CredentialGrant, GitHubAccess, GitHubGrantedScope,
     GitHubPermissions, GitHubRequest, GrantedScope, Jti, MetadataAccess, PolicyDecision, RepoRef,
