@@ -72,7 +72,7 @@ pub struct GitPushReplayPlan {
 /// prerequisite and `git bundle unbundle` will refuse to operate until
 /// the commit is present in the staging repo. Ingestion first fetches
 /// the prereq from origin under the supplied credential boundary, parks
-/// it under [`REPLAY_PREREQ_REF`], then unbundles.
+/// it under `REPLAY_PREREQ_REF`, then unbundles.
 ///
 /// The pairing of "expected_remote_head implies fetch credentials" is
 /// encoded structurally so the executor cannot be handed a fast-forward
@@ -555,7 +555,7 @@ impl std::fmt::Display for GitPushReplayCommandStep {
 /// Two steps:
 ///
 /// 1. Create the directory atomically with mode `0o700` (see
-///    [`create_private_staging_repo`]) so a stale or attacker-planted
+///    `create_private_staging_repo`) so a stale or attacker-planted
 ///    directory at the same path is rejected before any git command sees
 ///    it, and so the directory's contents are never world- or
 ///    group-readable.

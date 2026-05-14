@@ -446,7 +446,7 @@ pub async fn fetch_agent_run_config(
 /// Fetch a plan view from the host broker. Used by the implementer
 /// VM wrapper to compose the originating prompt with the approved
 /// plan body before invoking the LLM (see
-/// [`crate::agent_plan::compose_effective_prompt`]).
+/// [`crate::bailiff::compose_effective_prompt`]).
 ///
 /// Authorisation happens host-side: the broker checks that the
 /// calling session's agent_run has `read_plan_id = <plan_id>` and

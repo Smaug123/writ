@@ -113,7 +113,7 @@ enum WorkspaceCmd {
     Init {
         /// Repository in owner/name form.
         repo: String,
-        /// Destination checkout path. Defaults to /workspace/<repo-name>.
+        /// Destination checkout path. Defaults to `/workspace/<repo-name>`.
         destination: Option<PathBuf>,
         /// Warmup level to complete before returning.
         #[arg(long, default_value = "devshell")]

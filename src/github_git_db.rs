@@ -319,11 +319,11 @@ impl GitDataClient {
     ///
     /// The branch name is percent-encoded for the URL path before
     /// interpolation. Git's branch-naming rules permit several
-    /// URL-reserved bytes ([`#`], [`%`], [`(`], …) that
+    /// URL-reserved bytes (`#`, `%`, `(`, …) that
     /// [`GitBranchName`] also accepts, so a name like `release#1` or
     /// `100%` would otherwise turn into a URL fragment or a half-built
     /// percent-escape and 404 against GitHub. The hierarchical
-    /// separator [`/`] is preserved so `feature/foo` produces the
+    /// separator `/` is preserved so `feature/foo` produces the
     /// expected nested ref path.
     pub async fn get_branch_head(
         &self,
