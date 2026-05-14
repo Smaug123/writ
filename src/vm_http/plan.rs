@@ -1,4 +1,4 @@
-//! Plan VM HTTP routes. Three endpoints today, all served from this
+//! Plan VM HTTP routes. Four endpoints today, all served from this
 //! module:
 //!
 //! - `POST /v1/plans` — a planner submits a plan body.
@@ -6,6 +6,9 @@
 //!   plan body, decision (when set), and originating-run id.
 //! - `POST /v1/plans/<plan_id>/addenda` — an executor posts a
 //!   follow-up addendum body against an already-accepted plan.
+//! - `POST /v1/plans/<plan_id>/abort` — an executor posts a hard-abort
+//!   against a plan it has decided is fundamentally unworkable
+//!   mid-execution.
 //!
 //! Submission runs two gates before the audit write:
 //!
@@ -45,16 +48,31 @@
 //! both `StageNotPermitted` *and* `DecisionNotAccepted` are
 //! meaningful 403 outcomes from the pure gate: addenda are
 //! execute-stage only and only against an Accepted plan.
+//!
+//! The abort route shares the addendum route's shape (session→run,
+//! binding, then stage gate) but deliberately *omits* the
+//! plan-decision check. Per spec §"Decisions taken" item 9, an
+//! execute-stage run is only running at all because acceptance has
+//! already been enforced upstream (read-plan gates that on
+//! execute-stage reads), so re-checking here would only fire on a
+//! corrupted state; it would also forbid the very case the abort
+//! signal exists for ("the accepted plan turned out to be wrong").
+//! Concretely the route passes [`PlanRouteAction::SubmitAbort`] to the
+//! pure gate, which matches only `Stage::Execute` and never returns
+//! `DecisionNotAccepted` for this action — that arm is a defensive
+//! 500 so a future change to the gate cannot silently smuggle a hard-
+//! abort through the wrong branch.
 
 use std::sync::Arc;
 
 use crate::agent_plan::{
-    AddendumCreated, AddendumId, AddendumSubmission, DecisionView, PlanCreated, PlanId,
-    PlanRouteAction, PlanRouteAuthError, PlanSubmission, PlanView, ReviewCreated, ReviewId,
-    ReviewSubmission, VM_PLANS_PATH_PREFIX, route_permitted_by_stage_and_decision,
+    AbortRecorded, AbortSubmission, AddendumCreated, AddendumId, AddendumSubmission, DecisionView,
+    PlanCreated, PlanId, PlanRouteAction, PlanRouteAuthError, PlanSubmission, PlanView,
+    ReviewCreated, ReviewId, ReviewSubmission, VM_PLANS_PATH_PREFIX,
+    route_permitted_by_stage_and_decision,
 };
 use crate::audit::{
-    AUDIT_WRITE_FAILURE_TARGET, AuditError, PlanAddendumRecord, PlanReviewRecord,
+    AUDIT_WRITE_FAILURE_TARGET, AuditError, PlanAbortRecord, PlanAddendumRecord, PlanReviewRecord,
     PlanSubmissionRecord,
 };
 use crate::core::UnixMillis;
@@ -129,6 +147,21 @@ pub(super) fn parse_plan_addenda_target(target: &str) -> Option<PlanId> {
         .strip_prefix(VM_PLANS_PATH_PREFIX)?
         .strip_prefix('/')?;
     let raw_id = suffix.strip_suffix("/addenda")?;
+    if raw_id.contains('/') {
+        return None;
+    }
+    raw_id.parse().ok()
+}
+
+/// `/v1/plans/<plan_id>/abort`. Returns the parsed `plan_id` when the
+/// target names the per-plan abort endpoint. Same shape as the reviews
+/// and addenda parsers; the `abort` suffix names a single hard-abort
+/// signal (PK on `plan_abort.plan_id`), not a sub-collection.
+pub(super) fn parse_plan_abort_target(target: &str) -> Option<PlanId> {
+    let suffix = target
+        .strip_prefix(VM_PLANS_PATH_PREFIX)?
+        .strip_prefix('/')?;
+    let raw_id = suffix.strip_suffix("/abort")?;
     if raw_id.contains('/') {
         return None;
     }
@@ -304,6 +337,19 @@ pub(super) async fn route_plan_addenda_request<S: SecretStore + Send + Sync + 's
         return VmHttpResponse::text(VmHttpStatus::MethodNotAllowed, "method not allowed");
     }
     handle_plan_addendum_submission(session, body, plan_id, service).await
+}
+
+pub(super) async fn route_plan_abort_request<S: SecretStore + Send + Sync + 'static>(
+    session: &VmHttpSession,
+    request: &VmHttpRequest,
+    body: Vec<u8>,
+    plan_id: PlanId,
+    service: VmHttpPlanService<S>,
+) -> VmHttpResponse {
+    if request.method != "POST" {
+        return VmHttpResponse::text(VmHttpStatus::MethodNotAllowed, "method not allowed");
+    }
+    handle_plan_abort_submission(session, body, plan_id, service).await
 }
 
 async fn handle_plan_submission<S: SecretStore + Send + Sync + 'static>(
@@ -691,6 +737,142 @@ async fn handle_plan_addendum_submission<S: SecretStore + Send + Sync + 'static>
                 run_id = %run.run_id,
                 plan_id = %plan_id,
                 addendum_id = %addendum_id,
+                error = %err,
+                "audit write failed",
+            );
+            VmHttpResponse::text(VmHttpStatus::InternalServerError, "audit write failed")
+        }
+    }
+}
+
+async fn handle_plan_abort_submission<S: SecretStore + Send + Sync + 'static>(
+    session: &VmHttpSession,
+    body: Vec<u8>,
+    plan_id: PlanId,
+    service: VmHttpPlanService<S>,
+) -> VmHttpResponse {
+    let submission = match serde_json::from_slice::<AbortSubmission>(&body) {
+        Ok(submission) => submission,
+        Err(err) => {
+            return VmHttpResponse::text(
+                VmHttpStatus::BadRequest,
+                format!("invalid abort submission: {err}"),
+            );
+        }
+    };
+    drop(body);
+
+    let audit = &service.broker_state.audit;
+    let calling_session = session.session_id();
+
+    // Session-based shape, like the addendum route: the URL names the
+    // plan and the request body is reason-only, so the run is looked
+    // up from the bearer's session.
+    let run = match audit.agent_run_for_session(calling_session) {
+        Ok(Some(run)) => run,
+        Ok(None) => {
+            return VmHttpResponse::text(
+                VmHttpStatus::Unauthorized,
+                "no agent run on this session",
+            );
+        }
+        Err(err) => {
+            tracing::error!(
+                target: AUDIT_WRITE_FAILURE_TARGET,
+                kind = "plan_abort_run_lookup",
+                plan_id = %plan_id,
+                session_id = %calling_session,
+                error = %err,
+                "audit read failed",
+            );
+            return VmHttpResponse::text(VmHttpStatus::InternalServerError, "audit read failed");
+        }
+    };
+
+    // Binding gate before the stage gate (same ordering as the read
+    // and addendum routes): do not leak which stages may abort to a
+    // caller whose run is not bound to this plan. 401 (not 403)
+    // matches the addendum route's "authenticated but not the run
+    // bound to this plan."
+    if run.read_plan_id != Some(plan_id) {
+        return VmHttpResponse::text(
+            VmHttpStatus::Unauthorized,
+            "agent run is not bound to this plan",
+        );
+    }
+
+    // The abort route deliberately does *not* consult the plan
+    // decision: an execute-stage run is only running because
+    // acceptance has already been enforced upstream, and the spec
+    // (§"Decisions taken" item 9) explicitly omits the check here so
+    // the implementer can still post an abort against a plan whose
+    // decision the operator might later flip. Pass `None` for the
+    // decision and treat any `DecisionNotAccepted` from the pure gate
+    // as a defensive 500: `SubmitAbort` never consults that branch,
+    // and a hit means the gate has been reshaped without updating
+    // this handler.
+    if let Err(err) =
+        route_permitted_by_stage_and_decision(PlanRouteAction::SubmitAbort, run.stage, None)
+    {
+        match err {
+            PlanRouteAuthError::StageNotPermitted { .. } => {
+                return VmHttpResponse::text(VmHttpStatus::Forbidden, err.to_string());
+            }
+            PlanRouteAuthError::DecisionNotAccepted { .. } => {
+                tracing::error!(
+                    target: AUDIT_WRITE_FAILURE_TARGET,
+                    kind = "plan_abort_gate_decision_branch_taken",
+                    run_id = %run.run_id,
+                    plan_id = %plan_id,
+                    error = %err,
+                    "stage gate returned unexpected decision branch",
+                );
+                return VmHttpResponse::text(
+                    VmHttpStatus::InternalServerError,
+                    "stage gate returned unexpected decision branch",
+                );
+            }
+        }
+    }
+
+    let aborted_at = UnixMillis::now();
+    let record = PlanAbortRecord {
+        plan_id,
+        agent_run_id: run.run_id,
+        aborted_at,
+        reason: submission.reason,
+    };
+    match audit.record_plan_abort(&record) {
+        Ok(()) => VmHttpResponse::json(VmHttpStatus::Ok, &AbortRecorded { aborted_at }),
+        Err(AuditError::Invariant("agent run does not exist")) => {
+            // Run vanished between the session→run lookup and the
+            // write — same race shape as the addendum route.
+            VmHttpResponse::text(VmHttpStatus::Gone, "agent run no longer exists")
+        }
+        Err(AuditError::Invariant("session is closed")) => {
+            VmHttpResponse::text(VmHttpStatus::Gone, "session is closed")
+        }
+        Err(AuditError::Invariant("plan does not exist")) => {
+            // The binding gate above requires
+            // `run.read_plan_id = Some(plan_id)` which is FK-checked
+            // against `plan`, so reaching here means the plan row was
+            // deleted in the race window.
+            VmHttpResponse::text(VmHttpStatus::Gone, "plan no longer exists")
+        }
+        Err(AuditError::Sqlite(err)) if err.to_string().to_uppercase().contains("UNIQUE") => {
+            // `plan_abort.plan_id` is a PRIMARY KEY, so a second abort
+            // for the same plan surfaces as a UNIQUE/PK violation.
+            // Unlike `plan_addendum` (UNIQUE on `agent_run_id`), this
+            // is one-per-plan: a different executor on a retry session
+            // would also hit this branch.
+            VmHttpResponse::text(VmHttpStatus::Conflict, "plan already aborted")
+        }
+        Err(err) => {
+            tracing::error!(
+                target: AUDIT_WRITE_FAILURE_TARGET,
+                kind = "plan_abort",
+                run_id = %run.run_id,
+                plan_id = %plan_id,
                 error = %err,
                 "audit write failed",
             );
@@ -2823,5 +3005,599 @@ mod tests {
             stored.feedback.as_ref().map(|f| f.as_str().len()),
             Some(MAX_PLAN_FEEDBACK_BYTES),
         );
+    }
+
+    // --- POST /v1/plans/<plan_id>/abort ------------------------------
+
+    fn abort_submission_body(reason: &str) -> Vec<u8> {
+        use crate::agent_plan::{AbortSubmission, PlanAbortReason};
+        serde_json::to_vec(&AbortSubmission {
+            reason: PlanAbortReason::try_new(reason).unwrap(),
+        })
+        .unwrap()
+    }
+
+    /// Fixture: set up an accepted plan on a separate planner session.
+    /// Mirrors `setup_accepted_plan_on_separate_session` — the abort
+    /// route is execute-stage only and `agent_run_for_session` returns
+    /// the latest run, so the planner and executor share a session
+    /// only when test timestamps differ.
+    fn setup_plan_on_separate_session_with_decision(
+        state: &BrokerState<Box<dyn SecretStore>>,
+        planner_session_id: SessionId,
+        plan_body: &str,
+        decision: Option<crate::agent_plan::DecisionOutcome>,
+    ) -> PlanId {
+        open_session_for(state, planner_session_id);
+        let planner_run = record_planner_run(state, planner_session_id);
+        let plan_id = submit_plan_for_run(state, planner_run, plan_body);
+        if let Some(outcome) = decision {
+            use crate::agent_plan::Decider;
+            use crate::audit::PlanDecisionRecord;
+            state
+                .audit
+                .record_plan_decision(&PlanDecisionRecord {
+                    plan_id,
+                    decided_at: UnixMillis::now(),
+                    outcome,
+                    decider: Decider::try_new("operator-1").unwrap(),
+                })
+                .unwrap();
+        }
+        plan_id
+    }
+
+    /// `parse_plan_abort_target` is the URL-shape gate for the abort
+    /// route. Same shape as the reviews and addenda parsers.
+    #[test]
+    fn parse_plan_abort_target_accepts_well_formed_and_rejects_others() {
+        let plan_id = PlanId::new();
+        let ok = format!("/v1/plans/{plan_id}/abort");
+        assert_eq!(parse_plan_abort_target(&ok), Some(plan_id));
+
+        // Missing `/abort` suffix.
+        let bare = format!("/v1/plans/{plan_id}");
+        assert_eq!(parse_plan_abort_target(&bare), None);
+
+        // Extra segment after `/abort`.
+        let deeper = format!("/v1/plans/{plan_id}/abort/extra");
+        assert_eq!(parse_plan_abort_target(&deeper), None);
+
+        // Slash inside the id segment.
+        let with_slash = format!("/v1/plans/a/{plan_id}/abort");
+        assert_eq!(parse_plan_abort_target(&with_slash), None);
+
+        // Not a UUID.
+        assert_eq!(parse_plan_abort_target("/v1/plans/not-a-uuid/abort"), None,);
+
+        // Wrong prefix.
+        assert_eq!(parse_plan_abort_target("/plans/x/abort"), None);
+
+        // Just the collection — must not match the abort parser.
+        assert_eq!(parse_plan_abort_target("/v1/plans"), None);
+
+        // The other sub-routes are not the abort sub-route.
+        let reviews = format!("/v1/plans/{plan_id}/reviews");
+        assert_eq!(parse_plan_abort_target(&reviews), None);
+        let addenda = format!("/v1/plans/{plan_id}/addenda");
+        assert_eq!(parse_plan_abort_target(&addenda), None);
+    }
+
+    /// With `services.plans = None`, the abort route is dark: all
+    /// methods return 404. Mirrors the addenda-route dark test.
+    #[tokio::test]
+    async fn disabled_plan_abort_route_is_not_found_for_all_methods() {
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(10, 1, 2, 0), 24).unwrap());
+        let peer = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(10, 1, 2, 3), 12345));
+        let target = crate::agent_plan::vm_plan_abort_path(PlanId::new());
+
+        for method in ["GET", "POST", "PUT", "DELETE"] {
+            let request = VmHttpRequest::new(method, &target, Some(bearer(token().as_str())), peer);
+            let response =
+                route_authenticated_vm_http_request(&session, &request, Vec::new(), no_services())
+                    .await
+                    .into_buffered();
+
+            assert_eq!(response.status, VmHttpStatus::NotFound);
+        }
+    }
+
+    #[tokio::test]
+    async fn enabled_plan_abort_route_rejects_non_post_methods() {
+        let github = MockServer::start().await;
+        let state = make_broker_state(&github);
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+        let service = plan_service_for_test(&state);
+        let target = crate::agent_plan::vm_plan_abort_path(PlanId::new());
+        let request = VmHttpRequest::new(
+            "GET",
+            &target,
+            Some(bearer(token().as_str())),
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 12345)),
+        );
+
+        let response = route_authenticated_vm_http_request(
+            &session,
+            &request,
+            Vec::new(),
+            services_with_plans(service),
+        )
+        .await
+        .into_buffered();
+
+        assert_eq!(response.status, VmHttpStatus::MethodNotAllowed);
+    }
+
+    #[tokio::test]
+    async fn plan_abort_rejects_malformed_body_without_audit() {
+        use crate::agent_plan::DecisionOutcome;
+
+        let github = MockServer::start().await;
+        let state = make_broker_state(&github);
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+        open_audit_session(&state, session.session_id());
+        let planner_session_id: SessionId = "82ab0bb1-7c12-4a4e-9f51-6d3d7702c001".parse().unwrap();
+        let plan_id = setup_plan_on_separate_session_with_decision(
+            &state,
+            planner_session_id,
+            "# Plan",
+            Some(DecisionOutcome::Accepted),
+        );
+        let _executor = record_run_at_stage_with_read_plan(
+            &state,
+            session.session_id(),
+            crate::agent_plan::Stage::Execute,
+            Some(plan_id),
+        );
+        let service = plan_service_for_test(&state);
+
+        let response =
+            handle_plan_abort_submission(&session, b"not json".to_vec(), plan_id, service).await;
+
+        assert_eq!(response.status, VmHttpStatus::BadRequest);
+        assert!(state.audit.get_plan_abort(plan_id).unwrap().is_none());
+    }
+
+    /// A bearer session with no `agent_run` row cannot post an abort.
+    /// 401 mirrors the addendum-route shape.
+    #[tokio::test]
+    async fn plan_abort_session_with_no_run_is_unauthorized() {
+        use crate::agent_plan::DecisionOutcome;
+
+        let github = MockServer::start().await;
+        let state = make_broker_state(&github);
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+        open_audit_session(&state, session.session_id());
+        let other_session_id: SessionId = "82ab0bb1-7c12-4a4e-9f51-6d3d7702c002".parse().unwrap();
+        let plan_id = setup_plan_on_separate_session_with_decision(
+            &state,
+            other_session_id,
+            "# Plan",
+            Some(DecisionOutcome::Accepted),
+        );
+        let service = plan_service_for_test(&state);
+
+        let body = abort_submission_body("plan turned out to be unworkable");
+        let response = handle_plan_abort_submission(&session, body, plan_id, service).await;
+
+        assert_eq!(response.status, VmHttpStatus::Unauthorized);
+        assert!(state.audit.get_plan_abort(plan_id).unwrap().is_none());
+    }
+
+    /// An execute-stage run bound to plan A cannot post an abort
+    /// against plan B. Binding gate returns 401, matching the addenda
+    /// route's choice for the same gate.
+    #[tokio::test]
+    async fn plan_abort_rejects_run_bound_to_different_plan() {
+        use crate::agent_plan::DecisionOutcome;
+
+        let github = MockServer::start().await;
+        let state = make_broker_state(&github);
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+        open_audit_session(&state, session.session_id());
+        let planner_session_a: SessionId = "82ab0bb1-7c12-4a4e-9f51-6d3d7702c003".parse().unwrap();
+        let planner_session_b: SessionId = "82ab0bb1-7c12-4a4e-9f51-6d3d7702c004".parse().unwrap();
+        let plan_a = setup_plan_on_separate_session_with_decision(
+            &state,
+            planner_session_a,
+            "# Plan A",
+            Some(DecisionOutcome::Accepted),
+        );
+        let plan_b = setup_plan_on_separate_session_with_decision(
+            &state,
+            planner_session_b,
+            "# Plan B",
+            Some(DecisionOutcome::Accepted),
+        );
+        let _executor_of_a = record_run_at_stage_with_read_plan(
+            &state,
+            session.session_id(),
+            crate::agent_plan::Stage::Execute,
+            Some(plan_a),
+        );
+        let service = plan_service_for_test(&state);
+
+        let body = abort_submission_body("unworkable");
+        let response = handle_plan_abort_submission(&session, body, plan_b, service).await;
+
+        assert_eq!(response.status, VmHttpStatus::Unauthorized);
+        let message = std::str::from_utf8(&response.body).unwrap();
+        assert!(message.contains("not bound"), "unexpected body: {message}",);
+        assert!(state.audit.get_plan_abort(plan_a).unwrap().is_none());
+        assert!(state.audit.get_plan_abort(plan_b).unwrap().is_none());
+    }
+
+    /// A run at the right stage but with `read_plan_id = NULL` cannot
+    /// post an abort — the binding gate requires a Some match.
+    #[tokio::test]
+    async fn plan_abort_rejects_executor_without_read_plan_id() {
+        use crate::agent_plan::DecisionOutcome;
+
+        let github = MockServer::start().await;
+        let state = make_broker_state(&github);
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+        open_audit_session(&state, session.session_id());
+        let planner_session_id: SessionId = "82ab0bb1-7c12-4a4e-9f51-6d3d7702c005".parse().unwrap();
+        let plan_id = setup_plan_on_separate_session_with_decision(
+            &state,
+            planner_session_id,
+            "# Plan",
+            Some(DecisionOutcome::Accepted),
+        );
+        let _unbound_executor = record_run_at_stage(
+            &state,
+            session.session_id(),
+            crate::agent_plan::Stage::Execute,
+        );
+        let service = plan_service_for_test(&state);
+
+        let body = abort_submission_body("unworkable");
+        let response = handle_plan_abort_submission(&session, body, plan_id, service).await;
+
+        assert_eq!(response.status, VmHttpStatus::Unauthorized);
+        assert!(state.audit.get_plan_abort(plan_id).unwrap().is_none());
+    }
+
+    /// A reviewer-stage run bound to the right plan is rejected by the
+    /// stage gate with 403. Distinguishes the wrong-stage outcome from
+    /// the 401 binding-mismatch path.
+    #[tokio::test]
+    async fn plan_abort_rejects_non_execute_stage_run() {
+        use crate::agent_plan::DecisionOutcome;
+
+        let github = MockServer::start().await;
+        let state = make_broker_state(&github);
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+        open_audit_session(&state, session.session_id());
+        let planner_session_id: SessionId = "82ab0bb1-7c12-4a4e-9f51-6d3d7702c006".parse().unwrap();
+        let plan_id = setup_plan_on_separate_session_with_decision(
+            &state,
+            planner_session_id,
+            "# Plan",
+            Some(DecisionOutcome::Accepted),
+        );
+        let _reviewer = record_reviewer_run(&state, session.session_id(), plan_id);
+        let service = plan_service_for_test(&state);
+
+        let body = abort_submission_body("unworkable");
+        let response = handle_plan_abort_submission(&session, body, plan_id, service).await;
+
+        assert_eq!(response.status, VmHttpStatus::Forbidden);
+        let message = std::str::from_utf8(&response.body).unwrap();
+        assert!(
+            message.contains("submit_abort"),
+            "unexpected body: {message}",
+        );
+        assert!(state.audit.get_plan_abort(plan_id).unwrap().is_none());
+    }
+
+    /// Spec-significant difference from the addendum route: a hard-
+    /// abort against a plan with **no** decision row is admitted, not
+    /// 403'd. `SubmitAbort` deliberately omits the acceptance gate.
+    #[tokio::test]
+    async fn plan_abort_admits_undecided_plan() {
+        let github = MockServer::start().await;
+        let state = make_broker_state(&github);
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+        open_audit_session(&state, session.session_id());
+        let planner_session_id: SessionId = "82ab0bb1-7c12-4a4e-9f51-6d3d7702c007".parse().unwrap();
+        let plan_id = setup_plan_on_separate_session_with_decision(
+            &state,
+            planner_session_id,
+            "# Plan",
+            None,
+        );
+        let executor = record_run_at_stage_with_read_plan(
+            &state,
+            session.session_id(),
+            crate::agent_plan::Stage::Execute,
+            Some(plan_id),
+        );
+        let service = plan_service_for_test(&state);
+
+        let body = abort_submission_body("plan turned out to be unworkable");
+        let response = handle_plan_abort_submission(&session, body, plan_id, service).await;
+
+        assert_eq!(response.status, VmHttpStatus::Ok);
+        let stored = state.audit.get_plan_abort(plan_id).unwrap().unwrap();
+        assert_eq!(stored.plan_id, plan_id);
+        assert_eq!(stored.agent_run_id, executor);
+        assert_eq!(stored.reason.as_str(), "plan turned out to be unworkable");
+    }
+
+    /// Spec-significant: a hard-abort against a `RejectedRestart`
+    /// plan is also admitted. The operator may flip the decision
+    /// later; in the meantime the executor's abort signal still lands.
+    #[tokio::test]
+    async fn plan_abort_admits_rejected_plan() {
+        use crate::agent_plan::DecisionOutcome;
+
+        let github = MockServer::start().await;
+        let state = make_broker_state(&github);
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+        open_audit_session(&state, session.session_id());
+        let planner_session_id: SessionId = "82ab0bb1-7c12-4a4e-9f51-6d3d7702c008".parse().unwrap();
+        let plan_id = setup_plan_on_separate_session_with_decision(
+            &state,
+            planner_session_id,
+            "# Plan",
+            Some(DecisionOutcome::RejectedRestart),
+        );
+        let executor = record_run_at_stage_with_read_plan(
+            &state,
+            session.session_id(),
+            crate::agent_plan::Stage::Execute,
+            Some(plan_id),
+        );
+        let service = plan_service_for_test(&state);
+
+        let body = abort_submission_body("nope");
+        let response = handle_plan_abort_submission(&session, body, plan_id, service).await;
+
+        assert_eq!(response.status, VmHttpStatus::Ok);
+        let stored = state.audit.get_plan_abort(plan_id).unwrap().unwrap();
+        assert_eq!(stored.agent_run_id, executor);
+    }
+
+    /// Happy path: an execute-stage run bound to an accepted plan
+    /// posts an abort. 200 with `AbortRecorded`; the audit row
+    /// matches the request.
+    #[tokio::test]
+    async fn plan_abort_records_audit_row_and_returns_aborted_at() {
+        use crate::agent_plan::DecisionOutcome;
+
+        let github = MockServer::start().await;
+        let state = make_broker_state(&github);
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+        open_audit_session(&state, session.session_id());
+        let planner_session_id: SessionId = "82ab0bb1-7c12-4a4e-9f51-6d3d7702c009".parse().unwrap();
+        let plan_id = setup_plan_on_separate_session_with_decision(
+            &state,
+            planner_session_id,
+            "# Plan",
+            Some(DecisionOutcome::Accepted),
+        );
+        let executor = record_run_at_stage_with_read_plan(
+            &state,
+            session.session_id(),
+            crate::agent_plan::Stage::Execute,
+            Some(plan_id),
+        );
+        let service = plan_service_for_test(&state);
+
+        let body = abort_submission_body("unworkable for these reasons");
+        let response = handle_plan_abort_submission(&session, body, plan_id, service).await;
+
+        assert_eq!(response.status, VmHttpStatus::Ok);
+        let recorded: AbortRecorded = serde_json::from_slice(&response.body).unwrap();
+        let stored = state.audit.get_plan_abort(plan_id).unwrap().unwrap();
+        assert_eq!(stored.plan_id, plan_id);
+        assert_eq!(stored.agent_run_id, executor);
+        assert_eq!(stored.reason.as_str(), "unworkable for these reasons");
+        // The wire-side `aborted_at` is the value the audit row was
+        // stamped with; the handler reads `UnixMillis::now()` once and
+        // hands the same value to both sides.
+        assert_eq!(stored.aborted_at, recorded.aborted_at);
+    }
+
+    /// A second abort against the same plan is forbidden by the
+    /// PRIMARY KEY on `plan_abort.plan_id` (one abort per plan, not
+    /// per run). Surfaces as 409 with the first row left in place.
+    #[tokio::test]
+    async fn plan_abort_rejects_second_abort_for_same_plan() {
+        use crate::agent_plan::DecisionOutcome;
+
+        let github = MockServer::start().await;
+        let state = make_broker_state(&github);
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+        open_audit_session(&state, session.session_id());
+        let planner_session_id: SessionId = "82ab0bb1-7c12-4a4e-9f51-6d3d7702c00a".parse().unwrap();
+        let plan_id = setup_plan_on_separate_session_with_decision(
+            &state,
+            planner_session_id,
+            "# Plan",
+            Some(DecisionOutcome::Accepted),
+        );
+        let _executor = record_run_at_stage_with_read_plan(
+            &state,
+            session.session_id(),
+            crate::agent_plan::Stage::Execute,
+            Some(plan_id),
+        );
+
+        let first = handle_plan_abort_submission(
+            &session,
+            abort_submission_body("first"),
+            plan_id,
+            plan_service_for_test(&state),
+        )
+        .await;
+        assert_eq!(first.status, VmHttpStatus::Ok);
+
+        let second = handle_plan_abort_submission(
+            &session,
+            abort_submission_body("second"),
+            plan_id,
+            plan_service_for_test(&state),
+        )
+        .await;
+        assert_eq!(second.status, VmHttpStatus::Conflict);
+        let message = std::str::from_utf8(&second.body).unwrap();
+        assert!(
+            message.contains("already aborted"),
+            "unexpected body: {message}",
+        );
+
+        let stored = state.audit.get_plan_abort(plan_id).unwrap().unwrap();
+        assert_eq!(stored.reason.as_str(), "first");
+    }
+
+    /// Closing the session between setup and the abort write surfaces
+    /// as 410 Gone (same as the addendum/review routes for the same
+    /// audit invariant).
+    #[tokio::test]
+    async fn plan_abort_closed_session_returns_gone() {
+        use crate::agent_plan::DecisionOutcome;
+
+        let github = MockServer::start().await;
+        let state = make_broker_state(&github);
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+        open_audit_session(&state, session.session_id());
+        let planner_session_id: SessionId = "82ab0bb1-7c12-4a4e-9f51-6d3d7702c00b".parse().unwrap();
+        let plan_id = setup_plan_on_separate_session_with_decision(
+            &state,
+            planner_session_id,
+            "# Plan",
+            Some(DecisionOutcome::Accepted),
+        );
+        let _executor = record_run_at_stage_with_read_plan(
+            &state,
+            session.session_id(),
+            crate::agent_plan::Stage::Execute,
+            Some(plan_id),
+        );
+        state
+            .audit
+            .close_session(session.session_id(), UnixMillis::now())
+            .unwrap();
+        let service = plan_service_for_test(&state);
+
+        let body = abort_submission_body("late");
+        let response = handle_plan_abort_submission(&session, body, plan_id, service).await;
+
+        assert_eq!(response.status, VmHttpStatus::Gone);
+        assert!(state.audit.get_plan_abort(plan_id).unwrap().is_none());
+    }
+
+    /// End-to-end through `dispatch_vm_http_head_and_body`: exercises
+    /// the `parse_plan_abort_target` wire-up and the per-route body
+    /// cap from `mod.rs`. Regression for URL → handler → audit-row.
+    #[tokio::test]
+    async fn plan_abort_full_dispatch_records_audit() {
+        use crate::agent_plan::DecisionOutcome;
+
+        let github = MockServer::start().await;
+        let state = make_broker_state(&github);
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+        open_audit_session(&state, session.session_id());
+        let planner_session_id: SessionId = "82ab0bb1-7c12-4a4e-9f51-6d3d7702c00c".parse().unwrap();
+        let plan_id = setup_plan_on_separate_session_with_decision(
+            &state,
+            planner_session_id,
+            "# Plan via dispatch",
+            Some(DecisionOutcome::Accepted),
+        );
+        let executor = record_run_at_stage_with_read_plan(
+            &state,
+            session.session_id(),
+            crate::agent_plan::Stage::Execute,
+            Some(plan_id),
+        );
+        let service = plan_service_for_test(&state);
+
+        let bearer_auth = bearer(token().as_str());
+        let body = abort_submission_body("dispatched abort");
+        let content_length = body.len().to_string();
+        let target = crate::agent_plan::vm_plan_abort_path(plan_id);
+        let response = dispatch_vm_http_head_and_body(
+            &session,
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 12345)),
+            "POST",
+            &target,
+            &[
+                ("authorization", bearer_auth.as_str()),
+                ("content-length", content_length.as_str()),
+            ],
+            body,
+            services_with_plans(service),
+            VM_HTTP_READ_TIMEOUT,
+        )
+        .await;
+
+        assert_eq!(response.status, VmHttpStatus::Ok);
+        let recorded: AbortRecorded = serde_json::from_slice(&response.body).unwrap();
+        let stored = state.audit.get_plan_abort(plan_id).unwrap().unwrap();
+        assert_eq!(stored.plan_id, plan_id);
+        assert_eq!(stored.agent_run_id, executor);
+        assert_eq!(stored.reason.as_str(), "dispatched abort");
+        assert_eq!(stored.aborted_at, recorded.aborted_at);
+    }
+
+    /// Body-limit budget regression for the abort route: a maximum-
+    /// size reason packed with worst-case JSON-expanding bytes (any
+    /// ASCII control byte 0x01..=0x1f expands 6:1 as `\u00XX`) must
+    /// still be admitted. NUL (0x00) is rejected by
+    /// `PlanAbortReason::try_new` at the parse boundary, so SOH (0x01)
+    /// carries the property.
+    #[tokio::test]
+    async fn plan_abort_admits_max_reason_with_worst_case_json_expansion() {
+        use crate::agent_plan::{DecisionOutcome, MAX_PLAN_ABORT_REASON_BYTES};
+
+        let github = MockServer::start().await;
+        let state = make_broker_state(&github);
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+        open_audit_session(&state, session.session_id());
+        let planner_session_id: SessionId = "82ab0bb1-7c12-4a4e-9f51-6d3d7702c00d".parse().unwrap();
+        let plan_id = setup_plan_on_separate_session_with_decision(
+            &state,
+            planner_session_id,
+            "# Plan",
+            Some(DecisionOutcome::Accepted),
+        );
+        let _executor = record_run_at_stage_with_read_plan(
+            &state,
+            session.session_id(),
+            crate::agent_plan::Stage::Execute,
+            Some(plan_id),
+        );
+        let service = plan_service_for_test(&state);
+
+        let raw_reason = "\u{0001}".repeat(MAX_PLAN_ABORT_REASON_BYTES);
+        let body = abort_submission_body(&raw_reason);
+        assert!(
+            body.len() > MAX_PLAN_ABORT_REASON_BYTES,
+            "test premise: encoded body must exceed the decoded length",
+        );
+        let bearer_auth = bearer(token().as_str());
+        let content_length = body.len().to_string();
+        let target = crate::agent_plan::vm_plan_abort_path(plan_id);
+        let response = dispatch_vm_http_head_and_body(
+            &session,
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 12345)),
+            "POST",
+            &target,
+            &[
+                ("authorization", bearer_auth.as_str()),
+                ("content-length", content_length.as_str()),
+            ],
+            body,
+            services_with_plans(service),
+            VM_HTTP_READ_TIMEOUT,
+        )
+        .await;
+
+        assert_eq!(response.status, VmHttpStatus::Ok);
+        let stored = state.audit.get_plan_abort(plan_id).unwrap().unwrap();
+        assert_eq!(stored.reason.as_str().len(), MAX_PLAN_ABORT_REASON_BYTES);
     }
 }
