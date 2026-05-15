@@ -59,6 +59,14 @@ pub struct RunAgentRequest {
     pub capabilities: Vec<CapabilitySet>,
     pub purpose: String,
     pub output_ref: NotesRef,
+    /// Optional audit session id binding the run. When `Some`, the
+    /// caller has already opened the session via
+    /// [`WritClient::open_session`] (or otherwise) and writ will stamp
+    /// the same id into the signed metadata; when `None`, writ mints a
+    /// fresh id for the signature alone. Bailiff's slice-C workflows
+    /// always supply `Some(_)` so the envelope correlates with the
+    /// workflow session row.
+    pub session_id: Option<SessionId>,
 }
 
 /// Tagged failure mode of [`WritClient::run_agent`]. The split between
@@ -148,6 +156,7 @@ impl WritClient {
                 capabilities: req.capabilities,
                 purpose: req.purpose,
                 output_ref: req.output_ref,
+                session_id: req.session_id,
             })
             .await?;
         match reply {
@@ -314,6 +323,7 @@ mod tests {
             capabilities: vec![],
             purpose: "test".to_string(),
             output_ref: NotesRef::try_new("refs/notes/writ/agent-outputs").unwrap(),
+            session_id: None,
         }
     }
 
@@ -887,6 +897,7 @@ mod end_to_end_tests {
                 }],
                 purpose: "round-trip-test".into(),
                 output_ref: output_ref.clone(),
+                session_id: None,
             }),
         )
         .await
@@ -1041,6 +1052,7 @@ mod end_to_end_tests {
                 }],
                 purpose: "large-prompt".into(),
                 output_ref,
+                session_id: None,
             }),
         )
         .await

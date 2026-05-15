@@ -672,6 +672,7 @@ mod end_to_end_tests {
                 }],
                 purpose: purpose.clone(),
                 output_ref: writ_notes_ref.clone(),
+                session_id: None,
             }),
         )
         .await

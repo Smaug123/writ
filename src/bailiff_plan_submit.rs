@@ -138,6 +138,7 @@ pub async fn submit_plan(
             capabilities: inputs.capabilities,
             purpose: inputs.purpose.clone(),
             output_ref: inputs.writ_output_ref.clone(),
+            session_id: Some(session_id),
         })
         .await;
     let completed = match run_result {
@@ -147,6 +148,20 @@ pub async fn submit_plan(
             return Err(SubmitPlanError::RunAgent { session_id, source });
         }
     };
+
+    // Cross-check the broker honoured the session binding we asked
+    // for: the signed metadata must stamp the same session id we
+    // opened. A mismatch means the broker minted its own id and the
+    // envelope can't be correlated with our audit row — refuse to
+    // persist the plan note.
+    if completed.signed_metadata.session_id != session_id {
+        let returned_session_id = completed.signed_metadata.session_id;
+        let _ = client.close_session(session_id).await;
+        return Err(SubmitPlanError::SessionIdMismatch {
+            session_id,
+            returned_session_id,
+        });
+    }
 
     // `write_plan_note` is blocking (shells out to git). Wrap in
     // `spawn_blocking` so we don't stall the tokio runtime, and lock
@@ -252,6 +267,23 @@ pub enum SubmitPlanError {
         session_id: SessionId,
         #[source]
         source: WritClientError,
+    },
+    /// The broker stamped a different session id into the signed
+    /// metadata than the one we asked it to bind. Indicates the broker
+    /// is at a wire version that ignores the `session_id` field — the
+    /// envelope is unusable because it can't be correlated to our
+    /// audit row. The session bailiff opened was closed before this
+    /// error returned; no bailiff-side plan note is written.
+    #[error(
+        "broker returned signed metadata bound to session {returned_session_id}, \
+         expected {session_id}"
+    )]
+    SessionIdMismatch {
+        /// The session id bailiff opened and passed in `RunAgent`.
+        session_id: SessionId,
+        /// The session id the broker actually stamped into the signed
+        /// metadata.
+        returned_session_id: SessionId,
     },
 }
 
@@ -436,6 +468,14 @@ mod end_to_end_tests {
 
         assert_eq!(outcome.plan_id, plan_id);
 
+        // The signed metadata writ produced stamps the same session id
+        // bailiff opened. This is the P2 invariant: a verifier can
+        // correlate the envelope back to writ's audit session row.
+        assert_eq!(
+            outcome.run.signed_metadata.session_id, outcome.session_id,
+            "signed metadata must bind the session id bailiff opened",
+        );
+
         // Plan note decodes from bailiff's repo and references the
         // writ-side OID writ returned.
         let bailiff_for_read = Arc::clone(&bailiff);
@@ -550,5 +590,228 @@ mod end_to_end_tests {
 
         broker_task.abort();
         let _ = broker_task.await;
+    }
+}
+
+#[cfg(test)]
+mod session_mismatch_tests {
+    //! Stub-broker unit test for [`SubmitPlanError::SessionIdMismatch`].
+    //!
+    //! The real broker honours the caller-supplied session id, so the
+    //! mismatch path can't be exercised against `serve_broker_with_agent_vm`.
+    //! Instead, drive a minimal Unix-socket stub that returns canned
+    //! replies in lockstep: `SessionOpened { X }`, `RunAgentCompleted`
+    //! with signed metadata stamping a *different* session id `Y`,
+    //! then `SessionClosed`. The assertion is that `submit_plan` bails
+    //! at the cross-check with both ids surfaced in the error variant,
+    //! and that the cleanup `CloseSession` still ran (the stub records
+    //! the third request it saw).
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::UnixListener;
+    use tokio::sync::Mutex as AsyncMutex;
+    use tokio::task::JoinHandle;
+
+    use super::*;
+    use crate::agent_run::AgentPrompt;
+    use crate::core::{
+        AgentKind, CapabilitySet, NotesRef, RepoRef, Sha256Hex, SshKeyFingerprint, SshSignature,
+        UnixMillis,
+    };
+    use crate::notes_repo::NotesRepo;
+    use crate::protocol::{ClientMessage, ServerMessage, SignedRunMetadata};
+    use crate::run_verify::AllowedSigners;
+    use crate::vm_git::GitObjectId;
+
+    const SIGNING_PUB: &str = include_str!("../tests/fixtures/ed25519_test_signing.key.pub");
+
+    /// One-shot stub: each accepted connection reads one
+    /// [`ClientMessage`], records it, then writes the next queued
+    /// [`ServerMessage`]. Modelled on the broker stub in
+    /// `writ_client::tests` but lives here so the test can read the
+    /// recorded sequence after `submit_plan` returns.
+    struct StubBroker {
+        socket_path: PathBuf,
+        requests: Arc<AsyncMutex<Vec<ClientMessage>>>,
+        _task: JoinHandle<()>,
+        _dir: tempfile::TempDir,
+    }
+
+    impl StubBroker {
+        async fn start(replies: Vec<ServerMessage>) -> Self {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+            let socket_path = dir.path().join("writ.sock");
+            let listener = UnixListener::bind(&socket_path).unwrap();
+            let requests = Arc::new(AsyncMutex::new(Vec::new()));
+            let req_clone = Arc::clone(&requests);
+            let mut replies = replies.into_iter();
+            let task = tokio::spawn(async move {
+                while let Ok((stream, _)) = listener.accept().await {
+                    let Some(reply) = replies.next() else {
+                        return;
+                    };
+                    let (reader, mut writer) = stream.into_split();
+                    let mut lines = BufReader::new(reader).lines();
+                    if let Ok(Some(line)) = lines.next_line().await
+                        && let Ok(msg) = serde_json::from_str::<ClientMessage>(&line)
+                    {
+                        req_clone.lock().await.push(msg);
+                    }
+                    let mut json = serde_json::to_string(&reply).unwrap();
+                    json.push('\n');
+                    let _ = writer.write_all(json.as_bytes()).await;
+                    let _ = writer.shutdown().await;
+                }
+            });
+            Self {
+                socket_path,
+                requests,
+                _task: task,
+                _dir: dir,
+            }
+        }
+
+        async fn observed(&self) -> Vec<ClientMessage> {
+            self.requests.lock().await.clone()
+        }
+    }
+
+    fn sample_oid() -> GitObjectId {
+        std::iter::repeat_n('a', 40)
+            .collect::<String>()
+            .parse()
+            .unwrap()
+    }
+
+    fn sample_signed_metadata(session_id: SessionId) -> SignedRunMetadata {
+        SignedRunMetadata {
+            run_id: "f2f2f2f2-0000-0000-0000-000000000001".parse().unwrap(),
+            session_id,
+            prompt_sha256: Sha256Hex::try_new(std::iter::repeat_n('a', 64).collect::<String>())
+                .unwrap(),
+            output_envelope_sha256: Sha256Hex::try_new(
+                std::iter::repeat_n('b', 64).collect::<String>(),
+            )
+            .unwrap(),
+            capabilities: Vec::new(),
+            exit_code: 0,
+            completed_at: UnixMillis::from_millis(1_700_000_000_000),
+            signing_key_fingerprint: SshKeyFingerprint::try_new(
+                "SHA256:Wn0p0WC9F8bJ35rwTRsLP6w8b9ZsZh4HX0FYpC0Zg",
+            )
+            .unwrap(),
+        }
+    }
+
+    fn sample_signature() -> SshSignature {
+        SshSignature::try_new(
+            "-----BEGIN SSH SIGNATURE-----\nU1NIU0lHAAAAAQ...\n-----END SSH SIGNATURE-----",
+        )
+        .unwrap()
+    }
+
+    /// When the broker stamps a different session id into the signed
+    /// metadata than the one bailiff opened, `submit_plan` bails with
+    /// [`SubmitPlanError::SessionIdMismatch`] carrying both ids, and
+    /// the cleanup `CloseSession` still runs against the original id
+    /// — the third frame the stub saw must be `CloseSession { X }`.
+    #[tokio::test]
+    async fn submit_plan_rejects_mismatched_session_id_and_still_closes_session() {
+        let opened_id = SessionId::new();
+        let mismatched_id = SessionId::new();
+        assert_ne!(opened_id, mismatched_id);
+
+        let broker = StubBroker::start(vec![
+            ServerMessage::SessionOpened {
+                session_id: opened_id,
+            },
+            ServerMessage::RunAgentCompleted {
+                output_oid: sample_oid(),
+                signed_metadata: sample_signed_metadata(mismatched_id),
+                signature: sample_signature(),
+            },
+            ServerMessage::SessionClosed,
+        ])
+        .await;
+
+        // bailiff repo / allowed_signers are not touched on the
+        // mismatch path (the bail-out is before `write_plan_note`), so
+        // an inert temp repo and a real-but-unused signer set are
+        // fine.
+        let tmp = tempfile::tempdir().unwrap();
+        let bailiff_repo = NotesRepo::init_or_open(tmp.path().join("bailiff-bare")).unwrap();
+        let bailiff = Arc::new(AsyncMutex::new(bailiff_repo));
+        let allowed = AllowedSigners::from_openssh_lines(SIGNING_PUB).unwrap();
+        let writ_repo_path = tmp.path().join("writ-bare-never-read");
+
+        let inputs = SubmitPlanInputs {
+            prompt: AgentPrompt::try_new("noop\n").unwrap(),
+            capabilities: vec![CapabilitySet::WorkspaceRead {
+                repo: RepoRef {
+                    owner: "smaug123".into(),
+                    name: "writ".into(),
+                },
+            }],
+            purpose: "plan-submit".into(),
+            writ_output_ref: NotesRef::try_new("refs/notes/writ/v1/agent-outputs").unwrap(),
+            session_label: None,
+            session_agent_kind: Some(AgentKind::Claude),
+            session_agent_model: None,
+            plan_id: PlanId::new(),
+        };
+
+        let client = WritClient::new(&broker.socket_path);
+        let err = tokio::time::timeout(
+            Duration::from_secs(5),
+            submit_plan(
+                &client,
+                Arc::clone(&bailiff),
+                &writ_repo_path,
+                allowed,
+                inputs,
+            ),
+        )
+        .await
+        .expect("submit_plan must complete within 5s")
+        .expect_err("mismatched session id must surface as SessionIdMismatch");
+
+        match err {
+            SubmitPlanError::SessionIdMismatch {
+                session_id,
+                returned_session_id,
+            } => {
+                assert_eq!(session_id, opened_id);
+                assert_eq!(returned_session_id, mismatched_id);
+            }
+            other => panic!("expected SessionIdMismatch, got {other:?}"),
+        }
+
+        // The stub records each ClientMessage it served. Sequence
+        // pinned: OpenSession, RunAgent (with the opened id), then
+        // CloseSession on the cleanup path — the workflow does not
+        // skip cleanup when bailing on the mismatch.
+        let seen = broker.observed().await;
+        assert_eq!(seen.len(), 3, "expected three RPCs, got {seen:?}");
+        assert!(
+            matches!(seen[0], ClientMessage::OpenSession { .. }),
+            "first RPC was not OpenSession: {:?}",
+            seen[0],
+        );
+        match &seen[1] {
+            ClientMessage::RunAgent { session_id, .. } => assert_eq!(
+                *session_id,
+                Some(opened_id),
+                "RunAgent must thread the opened session id",
+            ),
+            other => panic!("expected RunAgent, got {other:?}"),
+        }
+        match &seen[2] {
+            ClientMessage::CloseSession { session_id } => assert_eq!(*session_id, opened_id),
+            other => panic!("expected CloseSession, got {other:?}"),
+        }
     }
 }

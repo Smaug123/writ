@@ -327,7 +327,8 @@ pub async fn dispatch_message_with_agent_vm<S: SecretStore + Send + Sync + 'stat
             capabilities,
             purpose,
             output_ref,
-        } => run_agent(state, prompt, capabilities, purpose, output_ref).await,
+            session_id,
+        } => run_agent(state, prompt, capabilities, purpose, output_ref, session_id).await,
     }
 }
 
@@ -950,6 +951,7 @@ async fn run_agent<S: SecretStore + Send + Sync + 'static>(
     capabilities: Vec<crate::core::CapabilitySet>,
     purpose: String,
     output_ref: NotesRef,
+    request_session_id: Option<SessionId>,
 ) -> ServerMessage {
     // `purpose` is part of the wire contract and will land on the
     // audit row in the follow-up slice. Holding the name in scope (not
@@ -964,6 +966,34 @@ async fn run_agent<S: SecretStore + Send + Sync + 'static>(
     };
     let Some(spawn_config) = state.run_agent_spawn.clone() else {
         return run_agent_not_configured("run_agent_spawn");
+    };
+
+    // Bind the run to the caller's audit session when supplied: the
+    // signed metadata stamps the same id, so a verifier can correlate
+    // the envelope back to a session row. Reject unknown / already-
+    // closed sessions before we spawn — running an agent against a
+    // session that doesn't exist (or has ended) would silently produce
+    // a signed envelope claiming an unreachable session.
+    let resolved_session_id = match request_session_id {
+        Some(claimed) => match state.audit.get_session(claimed) {
+            Ok(Some(session)) if session.closed_at.is_none() => claimed,
+            Ok(Some(_)) => {
+                return ServerMessage::ClosedSession {
+                    session_id: claimed,
+                };
+            }
+            Ok(None) => {
+                return ServerMessage::UnknownSession {
+                    session_id: claimed,
+                };
+            }
+            Err(err) => {
+                return ServerMessage::Error {
+                    message: format!("RunAgent: read session {claimed}: {err}"),
+                };
+            }
+        },
+        None => SessionId::new(),
     };
 
     let mut command = tokio::process::Command::new(&spawn_config.command);
@@ -1094,10 +1124,11 @@ async fn run_agent<S: SecretStore + Send + Sync + 'static>(
 
     let metadata = SignedRunMetadata {
         run_id: AgentRunId::new(),
-        // Slice C will allocate the session id from bailiff's workflow
-        // session rather than minting one per call; the wire shape is
-        // frozen here so that refinement is a producer-side change only.
-        session_id: SessionId::new(),
+        // Resolved above: caller-supplied id when bound to an audit
+        // session, freshly-minted otherwise. A verifier sees the same
+        // id the caller asked for, so an envelope's session_id can be
+        // cross-referenced with writ's audit log.
+        session_id: resolved_session_id,
         prompt_sha256,
         output_envelope_sha256,
         capabilities,
@@ -1836,6 +1867,7 @@ mod tests {
                 purpose: "test".into(),
                 output_ref: crate::core::NotesRef::try_new("refs/notes/writ/agent-outputs")
                     .unwrap(),
+                session_id: None,
             },
             &state,
         )
@@ -1920,6 +1952,7 @@ mod tests {
                 }],
                 purpose: "round-trip-test".into(),
                 output_ref: output_ref.clone(),
+                session_id: None,
             },
             &state,
         )
@@ -2022,6 +2055,7 @@ mod tests {
                 purpose: "non-zero-exit".into(),
                 output_ref: crate::core::NotesRef::try_new("refs/notes/writ/v1/agent-outputs")
                     .unwrap(),
+                session_id: None,
             },
             &state,
         )
@@ -2093,6 +2127,7 @@ mod tests {
                 capabilities: Vec::new(),
                 purpose: "stderr-capture".into(),
                 output_ref: output_ref.clone(),
+                session_id: None,
             },
             &state,
         )
@@ -2183,6 +2218,7 @@ mod tests {
                 capabilities: Vec::new(),
                 purpose: "truncation".into(),
                 output_ref: output_ref.clone(),
+                session_id: None,
             },
             &state,
         )
@@ -2211,6 +2247,193 @@ mod tests {
         );
         assert!(output_envelope.stderr.is_empty());
         assert_eq!(output_envelope.stderr_truncated_at, None);
+    }
+
+    /// When `RunAgent` carries a `session_id` bound to an open audit
+    /// session, the signed metadata stamps the same id. This is the
+    /// producer-side half of the slice-C session model: bailiff opens
+    /// a session, threads the id into `RunAgent`, and the signed
+    /// envelope correlates with the audit row.
+    #[tokio::test]
+    async fn run_agent_stamps_caller_supplied_session_id_into_signed_metadata() {
+        use crate::core::SessionRecord;
+        use crate::signing::WritSigningKey;
+
+        const SIGNING_PEM: &str = include_str!("../tests/fixtures/ed25519_test_signing.key");
+
+        let tmp = tempfile::tempdir().unwrap();
+        let notes_repo = NotesRepo::init_or_open(tmp.path().join("repo")).unwrap();
+        let signing_key = WritSigningKey::from_openssh_pem(SIGNING_PEM).unwrap();
+        let cat = find_in_path("cat").expect("cat must be on PATH for the round-trip test");
+        let server = MockServer::start().await;
+        let base = Arc::try_unwrap(make_state(&server, vec![], "o"))
+            .unwrap_or_else(|_| panic!("make_state Arc must be uniquely held"));
+        let state = Arc::new(BrokerState {
+            audit: base.audit,
+            minter: base.minter,
+            secrets: base.secrets,
+            policy: base.policy,
+            staging_store: base.staging_store,
+            notes_repo: Some(Arc::new(notes_repo)),
+            signing_key: Some(signing_key),
+            run_agent_spawn: Some(RunAgentSpawnConfig {
+                command: cat,
+                args: Vec::new(),
+            }),
+        });
+
+        let session_id = SessionId::new();
+        state
+            .audit
+            .open_session(&SessionRecord {
+                session_id,
+                label: Some("plan-submit".into()),
+                agent_kind: Some(AgentKind::Claude),
+                agent_model: None,
+                opened_at: UnixMillis::now(),
+                closed_at: None,
+            })
+            .expect("open audit session");
+
+        let resp = dispatch_message(
+            ClientMessage::RunAgent {
+                prompt: crate::agent_run::AgentPrompt::new("hi"),
+                capabilities: Vec::new(),
+                purpose: "bound-session".into(),
+                output_ref: crate::core::NotesRef::try_new("refs/notes/writ/v1/agent-outputs")
+                    .unwrap(),
+                session_id: Some(session_id),
+            },
+            &state,
+        )
+        .await;
+        let signed_metadata = match resp {
+            ServerMessage::RunAgentCompleted {
+                signed_metadata, ..
+            } => signed_metadata,
+            other => panic!("expected RunAgentCompleted, got {other:?}"),
+        };
+        assert_eq!(
+            signed_metadata.session_id, session_id,
+            "signed metadata must stamp the caller-supplied session id",
+        );
+    }
+
+    /// `RunAgent` against an unknown `session_id` (one that's never
+    /// been opened) is rejected with `UnknownSession` before the agent
+    /// is spawned. A signed envelope claiming an unreachable session
+    /// would be worse than a clear refusal.
+    #[tokio::test]
+    async fn run_agent_rejects_unknown_session_id() {
+        use crate::signing::WritSigningKey;
+
+        const SIGNING_PEM: &str = include_str!("../tests/fixtures/ed25519_test_signing.key");
+
+        let tmp = tempfile::tempdir().unwrap();
+        let notes_repo = NotesRepo::init_or_open(tmp.path().join("repo")).unwrap();
+        let signing_key = WritSigningKey::from_openssh_pem(SIGNING_PEM).unwrap();
+        let cat = find_in_path("cat").expect("cat must be on PATH for the round-trip test");
+        let server = MockServer::start().await;
+        let base = Arc::try_unwrap(make_state(&server, vec![], "o"))
+            .unwrap_or_else(|_| panic!("make_state Arc must be uniquely held"));
+        let state = Arc::new(BrokerState {
+            audit: base.audit,
+            minter: base.minter,
+            secrets: base.secrets,
+            policy: base.policy,
+            staging_store: base.staging_store,
+            notes_repo: Some(Arc::new(notes_repo)),
+            signing_key: Some(signing_key),
+            run_agent_spawn: Some(RunAgentSpawnConfig {
+                command: cat,
+                args: Vec::new(),
+            }),
+        });
+
+        let bogus = SessionId::new();
+        let resp = dispatch_message(
+            ClientMessage::RunAgent {
+                prompt: crate::agent_run::AgentPrompt::new("hi"),
+                capabilities: Vec::new(),
+                purpose: "unknown-session".into(),
+                output_ref: crate::core::NotesRef::try_new("refs/notes/writ/v1/agent-outputs")
+                    .unwrap(),
+                session_id: Some(bogus),
+            },
+            &state,
+        )
+        .await;
+        match resp {
+            ServerMessage::UnknownSession { session_id } => assert_eq!(session_id, bogus),
+            other => panic!("expected UnknownSession, got {other:?}"),
+        }
+    }
+
+    /// `RunAgent` against a session that's already been closed is
+    /// rejected with `ClosedSession`. Reusing a workflow's session id
+    /// after the workflow ended would otherwise produce envelopes
+    /// stamped with a session the audit log says is dead.
+    #[tokio::test]
+    async fn run_agent_rejects_closed_session_id() {
+        use crate::core::SessionRecord;
+        use crate::signing::WritSigningKey;
+
+        const SIGNING_PEM: &str = include_str!("../tests/fixtures/ed25519_test_signing.key");
+
+        let tmp = tempfile::tempdir().unwrap();
+        let notes_repo = NotesRepo::init_or_open(tmp.path().join("repo")).unwrap();
+        let signing_key = WritSigningKey::from_openssh_pem(SIGNING_PEM).unwrap();
+        let cat = find_in_path("cat").expect("cat must be on PATH for the round-trip test");
+        let server = MockServer::start().await;
+        let base = Arc::try_unwrap(make_state(&server, vec![], "o"))
+            .unwrap_or_else(|_| panic!("make_state Arc must be uniquely held"));
+        let state = Arc::new(BrokerState {
+            audit: base.audit,
+            minter: base.minter,
+            secrets: base.secrets,
+            policy: base.policy,
+            staging_store: base.staging_store,
+            notes_repo: Some(Arc::new(notes_repo)),
+            signing_key: Some(signing_key),
+            run_agent_spawn: Some(RunAgentSpawnConfig {
+                command: cat,
+                args: Vec::new(),
+            }),
+        });
+
+        let session_id = SessionId::new();
+        state
+            .audit
+            .open_session(&SessionRecord {
+                session_id,
+                label: None,
+                agent_kind: Some(AgentKind::Claude),
+                agent_model: None,
+                opened_at: UnixMillis::now(),
+                closed_at: None,
+            })
+            .unwrap();
+        state
+            .audit
+            .close_session(session_id, UnixMillis::now())
+            .unwrap();
+
+        let resp = dispatch_message(
+            ClientMessage::RunAgent {
+                prompt: crate::agent_run::AgentPrompt::new("hi"),
+                capabilities: Vec::new(),
+                purpose: "closed-session".into(),
+                output_ref: crate::core::NotesRef::try_new("refs/notes/writ/v1/agent-outputs")
+                    .unwrap(),
+                session_id: Some(session_id),
+            },
+            &state,
+        )
+        .await;
+        match resp {
+            ServerMessage::ClosedSession { session_id: seen } => assert_eq!(seen, session_id),
+            other => panic!("expected ClosedSession, got {other:?}"),
+        }
     }
 
     #[tokio::test]
