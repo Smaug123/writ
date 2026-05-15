@@ -461,33 +461,98 @@ async fn validate_bare_repo(path: &Path) -> Result<(), BailiffRepoError> {
             });
         }
     }
-    // Reject storage-path symlinks. Git follows `objects/` and
-    // `refs/` symlinks transparently under `--git-dir`, so if
-    // either is replaced with a symlink to another directory,
-    // `write_blob` and `write_note` would write outside the
-    // canonical bare repo path even though `--git-dir` points at
-    // it. `git init --bare` plants both as plain directories;
-    // anything else here is a redirect attempt or a non-standard
-    // layout, and bailiff's repo doesn't accept either.
+    // Reject `objects/info/alternates`. Git resolves objects via
+    // alternates transparently under `--git-dir`, so if a payload's
+    // bytes already exist in the alternate store, `git hash-object
+    // -w` returns the OID without writing the loose object into
+    // bailiff's repo. A clone of bailiff's repo would then be
+    // missing the signed artifact that `write_blob` "succeeded" on.
+    // `git init --bare` doesn't create this file; its presence is
+    // an intentional indirection that bailiff refuses to honour.
+    match tokio::fs::symlink_metadata(path.join("objects").join("info").join("alternates")).await {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(source) => return Err(BailiffRepoError::Io(source)),
+        Ok(_) => {
+            return Err(BailiffRepoError::NotABareRepo {
+                path: path.display().to_string(),
+                reason:
+                    "`objects/info/alternates` is present; bailiff repos must store objects locally"
+                        .to_string(),
+            });
+        }
+    }
+    // Reject storage-path symlinks anywhere under `objects/` or
+    // `refs/`. Git follows symlinks transparently under
+    // `--git-dir`, so any redirect — top-level
+    // (`objects/ -> /elsewhere`) or nested
+    // (`objects/c1/ -> /elsewhere`, `refs/notes/ -> /elsewhere`) —
+    // lets `write_blob` and `write_note` land bytes outside the
+    // canonical bare repo path. `git init --bare` plants only
+    // plain directories under these trees; any symlink here is a
+    // redirect attempt that bailiff refuses to accept.
     //
-    // Use `symlink_metadata` so the link itself is examined, not
-    // the directory it resolves to. Missing storage paths are
-    // allowed: `init_or_open` may call this before the first
-    // write has materialised `refs/`, but is_symlink() returning
-    // false for a normal directory keeps the validation tight.
-    for name in ["objects", "refs"] {
-        match tokio::fs::symlink_metadata(path.join(name)).await {
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+    // Missing roots are allowed: `init_or_open` may call this
+    // before `refs/notes/` exists.
+    reject_storage_symlinks(path, "objects").await?;
+    reject_storage_symlinks(path, "refs").await?;
+    Ok(())
+}
+
+/// Walk `<repo>/<top>` recursively and reject any symlink
+/// encountered (including the root itself). Git follows
+/// intermediate symlinks under `--git-dir` without complaint, so
+/// a single nested redirect is enough to send writes outside the
+/// repo path. Missing roots are tolerated — a fresh bare repo
+/// has no `objects/pack/` subtree yet, and `refs/notes/` only
+/// materialises on the first note write.
+async fn reject_storage_symlinks(repo: &Path, top: &str) -> Result<(), BailiffRepoError> {
+    let mut stack: Vec<PathBuf> = vec![repo.join(top)];
+    while let Some(dir) = stack.pop() {
+        // Examine the directory entry itself with `symlink_metadata`
+        // so a symlink-to-dir is detected before `read_dir` would
+        // follow it transparently and yield the target's contents.
+        let meta = match tokio::fs::symlink_metadata(&dir).await {
+            Ok(meta) => meta,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(source) => return Err(BailiffRepoError::Io(source)),
-            Ok(meta) if meta.file_type().is_symlink() => {
+        };
+        let file_type = meta.file_type();
+        if file_type.is_symlink() {
+            return Err(BailiffRepoError::NotABareRepo {
+                path: repo.display().to_string(),
+                reason: format!(
+                    "`{}` is a symlink; bare repos used by bailiff must store {top} in place",
+                    dir.strip_prefix(repo).unwrap_or(&dir).display()
+                ),
+            });
+        }
+        if !file_type.is_dir() {
+            continue;
+        }
+        let mut entries = tokio::fs::read_dir(&dir)
+            .await
+            .map_err(BailiffRepoError::Io)?;
+        while let Some(entry) = entries.next_entry().await.map_err(BailiffRepoError::Io)? {
+            // `DirEntry::file_type` reports the unfollowed type on
+            // unix, so a symlink — to a directory or a file —
+            // surfaces as `is_symlink()` here without traversal.
+            let entry_type = entry.file_type().await.map_err(BailiffRepoError::Io)?;
+            if entry_type.is_symlink() {
+                let entry_path = entry.path();
                 return Err(BailiffRepoError::NotABareRepo {
-                    path: path.display().to_string(),
+                    path: repo.display().to_string(),
                     reason: format!(
-                        "`{name}/` is a symlink; bare repos used by bailiff must store {name} in place"
+                        "`{}` is a symlink; bare repos used by bailiff must store {top} in place",
+                        entry_path
+                            .strip_prefix(repo)
+                            .unwrap_or(&entry_path)
+                            .display()
                     ),
                 });
             }
-            Ok(_) => {}
+            if entry_type.is_dir() {
+                stack.push(entry.path());
+            }
         }
     }
     Ok(())
@@ -1343,6 +1408,94 @@ mod tests {
                 assert!(
                     reason.contains("refs") && reason.contains("symlink"),
                     "reason should mention symlinked refs/, got: {reason}"
+                );
+            }
+            other => panic!("expected NotABareRepo, got {other:?}"),
+        }
+    }
+
+    /// `objects/info/alternates` lets Git resolve objects from
+    /// another store. If the blob bytes already exist there,
+    /// `git hash-object -w` returns the OID without writing a
+    /// loose object into bailiff's repo — a clone would be
+    /// missing the artifact. Reject the repo on `open` instead
+    /// of letting `write_blob` silently no-op.
+    #[tokio::test]
+    async fn open_rejects_a_repo_with_object_alternates() {
+        let dir = TempDir::new().unwrap();
+        let repo_path = dir.path().join("with-alternates");
+        let _ = BailiffRepo::init_or_open(&repo_path).await.unwrap();
+        let outside = dir.path().join("other-repo-objects");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(
+            repo_path.join("objects").join("info").join("alternates"),
+            format!("{}\n", outside.display()),
+        )
+        .unwrap();
+        let err = BailiffRepo::open(&repo_path).await.unwrap_err();
+        match err {
+            BailiffRepoError::NotABareRepo { reason, .. } => {
+                assert!(
+                    reason.contains("alternates"),
+                    "reason should mention alternates, got: {reason}"
+                );
+            }
+            other => panic!("expected NotABareRepo, got {other:?}"),
+        }
+    }
+
+    /// Nested redirect under `objects/`: a single hash-prefix dir
+    /// is replaced with a symlink pointing outside the repo. Git
+    /// would follow it transparently when `hash-object -w` places
+    /// a loose object whose first byte matches that prefix, so
+    /// the bytes land in the outside directory while `--git-dir`
+    /// still names the bailiff repo. Reject this nested case the
+    /// same way we reject a symlinked `objects/` itself.
+    #[tokio::test]
+    async fn open_rejects_a_repo_with_nested_symlink_under_objects() {
+        let dir = TempDir::new().unwrap();
+        let repo_path = dir.path().join("nested-obj-symlink");
+        let _ = BailiffRepo::init_or_open(&repo_path).await.unwrap();
+        let outside = dir.path().join("outside-prefix");
+        std::fs::create_dir(&outside).unwrap();
+        // Plant a symlinked hash-prefix dir; git creates these on
+        // demand at write time, so a pre-existing symlink is
+        // followed without complaint.
+        std::os::unix::fs::symlink(&outside, repo_path.join("objects").join("c1")).unwrap();
+        let err = BailiffRepo::open(&repo_path).await.unwrap_err();
+        match err {
+            BailiffRepoError::NotABareRepo { reason, .. } => {
+                assert!(
+                    reason.contains("objects") && reason.contains("symlink"),
+                    "reason should mention nested objects symlink, got: {reason}"
+                );
+            }
+            other => panic!("expected NotABareRepo, got {other:?}"),
+        }
+    }
+
+    /// Nested redirect under `refs/`: a subdirectory like
+    /// `refs/notes/` is symlinked outside the repo. When
+    /// `write_note` updates `refs/notes/writ/agent-outputs`, git
+    /// follows the intermediate symlink and writes the ref file
+    /// in the outside directory. Reject the repo before any
+    /// notes write happens.
+    #[tokio::test]
+    async fn open_rejects_a_repo_with_nested_symlink_under_refs() {
+        let dir = TempDir::new().unwrap();
+        let repo_path = dir.path().join("nested-refs-symlink");
+        let _ = BailiffRepo::init_or_open(&repo_path).await.unwrap();
+        let outside = dir.path().join("outside-notes");
+        std::fs::create_dir(&outside).unwrap();
+        // refs/notes/ doesn't exist on a fresh bare repo, so the
+        // symlink can just be created in its place.
+        std::os::unix::fs::symlink(&outside, repo_path.join("refs").join("notes")).unwrap();
+        let err = BailiffRepo::open(&repo_path).await.unwrap_err();
+        match err {
+            BailiffRepoError::NotABareRepo { reason, .. } => {
+                assert!(
+                    reason.contains("refs") && reason.contains("symlink"),
+                    "reason should mention nested refs symlink, got: {reason}"
                 );
             }
             other => panic!("expected NotABareRepo, got {other:?}"),
