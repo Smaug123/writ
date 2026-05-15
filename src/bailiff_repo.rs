@@ -105,9 +105,17 @@ impl BailiffRepo {
             }
         };
         if needs_init {
+            // `--object-format=sha1` is load-bearing: a host with
+            // `init.defaultObjectFormat = sha256` (global config) or
+            // `GIT_DEFAULT_HASH=sha256` (env) would otherwise produce
+            // a SHA-256 repo that `open` rejects with
+            // `UnsupportedObjectFormat`, leaving an unusable
+            // directory on disk. Forcing the format keeps the wire-
+            // level 40-hex `GitObjectId` invariant intact regardless
+            // of the operator's global git setup.
             run_git(
                 path,
-                ["init", "--bare", "--quiet"],
+                ["init", "--bare", "--quiet", "--object-format=sha1"],
                 None,
                 CaptureOutput::Discard,
             )?;
@@ -880,6 +888,28 @@ mod tests {
             matches!(err, BailiffRepoError::NotBare { value: None }),
             "got: {err:?}"
         );
+    }
+
+    #[test]
+    fn init_or_open_forces_sha1_against_global_default_hash() {
+        // A host with `init.defaultObjectFormat = sha256` in global
+        // config would, without an explicit `--object-format=sha1`,
+        // produce a SHA-256 bare repo. `open` would then reject it
+        // and the first run would fail, leaving an unusable repo on
+        // disk. The fix passes the format explicitly; the test
+        // pollutes the global to confirm the override holds.
+        let tmp = TempDir::new().unwrap();
+        let global_cfg = tmp.path().join("globalcfg");
+        fs::write(&global_cfg, "[init]\n\tdefaultObjectFormat = sha256\n").unwrap();
+        let _env_guard = ENV_TEST_MUTEX.lock().unwrap();
+        unsafe {
+            std::env::set_var("GIT_CONFIG_GLOBAL", &global_cfg);
+        }
+        let result = BailiffRepo::init_or_open(tmp.path().join("r"));
+        unsafe {
+            std::env::remove_var("GIT_CONFIG_GLOBAL");
+        }
+        result.expect("init_or_open must force sha1 regardless of global default");
     }
 
     #[test]
