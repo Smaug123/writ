@@ -29,7 +29,7 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
 use crate::agent_run::AgentPrompt;
-use crate::core::{CapabilitySet, NotesRef, SshSignature};
+use crate::core::{AgentKind, CapabilitySet, NotesRef, SessionId, SshSignature};
 use crate::protocol::{ClientMessage, ServerMessage, SignedRunMetadata};
 use crate::vm_git::GitObjectId;
 
@@ -142,39 +142,14 @@ impl WritClient {
         &self,
         req: RunAgentRequest,
     ) -> Result<RunAgentCompleted, WritClientError> {
-        let stream =
-            UnixStream::connect(&self.socket_path)
-                .await
-                .map_err(|e| WritClientError::Connect {
-                    path: self.socket_path.clone(),
-                    source: e,
-                })?;
-        let (reader, mut writer) = stream.into_split();
-        let mut reader = BufReader::new(reader);
-
-        let msg = ClientMessage::RunAgent {
-            prompt: req.prompt,
-            capabilities: req.capabilities,
-            purpose: req.purpose,
-            output_ref: req.output_ref,
-        };
-        let mut json = serde_json::to_string(&msg).expect("ClientMessage always serializes");
-        json.push('\n');
-        writer
-            .write_all(json.as_bytes())
-            .await
-            .map_err(|e| WritClientError::Write { source: e })?;
-        writer
-            .flush()
-            .await
-            .map_err(|e| WritClientError::Write { source: e })?;
-
-        let bytes = read_line_bounded(&mut reader, MAX_LINE_BYTES)
-            .await
-            .map_err(|e| WritClientError::ReadFraming { source: e })?
-            .ok_or(WritClientError::ReadEof)?;
-        let reply: ServerMessage = serde_json::from_slice(&bytes)
-            .map_err(|e| WritClientError::ReadDecode { source: e })?;
+        let reply = self
+            .roundtrip(ClientMessage::RunAgent {
+                prompt: req.prompt,
+                capabilities: req.capabilities,
+                purpose: req.purpose,
+                output_ref: req.output_ref,
+            })
+            .await?;
         match reply {
             ServerMessage::RunAgentCompleted {
                 output_oid,
@@ -190,6 +165,82 @@ impl WritClient {
                 summary: format!("{other:?}"),
             }),
         }
+    }
+
+    /// Open a writ session and return its broker-assigned id. Used by
+    /// bailiff's slice-C plan workflows to wrap a `RunAgent` call
+    /// inside a session for audit purposes; later agent runs for the
+    /// same plan reuse the same id (pinned slice-C session model).
+    pub async fn open_session(
+        &self,
+        label: Option<String>,
+        agent_kind: Option<AgentKind>,
+        agent_model: Option<String>,
+    ) -> Result<SessionId, WritClientError> {
+        let reply = self
+            .roundtrip(ClientMessage::OpenSession {
+                label,
+                agent_kind,
+                agent_model,
+            })
+            .await?;
+        match reply {
+            ServerMessage::SessionOpened { session_id } => Ok(session_id),
+            ServerMessage::Error { message } => Err(WritClientError::WritError { message }),
+            other => Err(WritClientError::UnexpectedMessage {
+                summary: format!("{other:?}"),
+            }),
+        }
+    }
+
+    /// Close a previously-opened session. Returns `Ok(())` on
+    /// `SessionClosed`; surfaces broker `Error` and unexpected replies
+    /// the same way [`Self::run_agent`] does so callers can react
+    /// without parsing prose.
+    pub async fn close_session(&self, session_id: SessionId) -> Result<(), WritClientError> {
+        let reply = self
+            .roundtrip(ClientMessage::CloseSession { session_id })
+            .await?;
+        match reply {
+            ServerMessage::SessionClosed => Ok(()),
+            ServerMessage::Error { message } => Err(WritClientError::WritError { message }),
+            other => Err(WritClientError::UnexpectedMessage {
+                summary: format!("{other:?}"),
+            }),
+        }
+    }
+
+    /// Dial, write one framed [`ClientMessage`], read one framed
+    /// [`ServerMessage`]. Shared by every RPC on this client so the
+    /// framing contract (one connection per call, newline-delimited
+    /// JSON, bounded reads) lives in one place.
+    async fn roundtrip(&self, msg: ClientMessage) -> Result<ServerMessage, WritClientError> {
+        let stream =
+            UnixStream::connect(&self.socket_path)
+                .await
+                .map_err(|e| WritClientError::Connect {
+                    path: self.socket_path.clone(),
+                    source: e,
+                })?;
+        let (reader, mut writer) = stream.into_split();
+        let mut reader = BufReader::new(reader);
+
+        let mut json = serde_json::to_string(&msg).expect("ClientMessage always serializes");
+        json.push('\n');
+        writer
+            .write_all(json.as_bytes())
+            .await
+            .map_err(|e| WritClientError::Write { source: e })?;
+        writer
+            .flush()
+            .await
+            .map_err(|e| WritClientError::Write { source: e })?;
+
+        let bytes = read_line_bounded(&mut reader, MAX_LINE_BYTES)
+            .await
+            .map_err(|e| WritClientError::ReadFraming { source: e })?
+            .ok_or(WritClientError::ReadEof)?;
+        serde_json::from_slice(&bytes).map_err(|e| WritClientError::ReadDecode { source: e })
     }
 }
 
@@ -252,7 +303,7 @@ mod tests {
     use super::*;
     use crate::agent_run::AgentPrompt;
     use crate::core::{
-        NotesRef, SessionId, Sha256Hex, SshKeyFingerprint, SshSignature, UnixMillis,
+        AgentKind, NotesRef, SessionId, Sha256Hex, SshKeyFingerprint, SshSignature, UnixMillis,
     };
     use crate::protocol::{ClientMessage, SignedRunMetadata};
     use crate::vm_git::GitObjectId;
@@ -447,6 +498,106 @@ mod tests {
         assert!(
             matches!(err, WritClientError::UnexpectedMessage { .. }),
             "expected UnexpectedMessage, got {err:?}"
+        );
+    }
+
+    /// `open_session` returns the broker-minted id and frames an
+    /// `OpenSession` message verbatim (label, agent kind, model all
+    /// land in the request).
+    #[tokio::test]
+    async fn open_session_round_trips_session_opened_reply() {
+        let session_id = sample_session_id();
+        let broker = StubBroker::start(ServerMessage::SessionOpened { session_id }).await;
+        let client = WritClient::new(&broker.socket_path);
+        let got = client
+            .open_session(
+                Some("plan-submit:abc".into()),
+                Some(AgentKind::Claude),
+                Some("claude-test".into()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(got, session_id);
+
+        let seen = broker.observed_requests().await;
+        match &seen[0] {
+            ClientMessage::OpenSession {
+                label,
+                agent_kind,
+                agent_model,
+            } => {
+                assert_eq!(label.as_deref(), Some("plan-submit:abc"));
+                assert_eq!(*agent_kind, Some(AgentKind::Claude));
+                assert_eq!(agent_model.as_deref(), Some("claude-test"));
+            }
+            other => panic!("expected OpenSession, got {other:?}"),
+        }
+    }
+
+    /// A broker `Error` reply to `OpenSession` becomes `WritError`,
+    /// not a parse failure: bailiff's `submit_plan` can surface the
+    /// reason without string-matching.
+    #[tokio::test]
+    async fn open_session_surfaces_writ_error_reply() {
+        let broker = StubBroker::start(ServerMessage::Error {
+            message: "audit insert failed".into(),
+        })
+        .await;
+        let client = WritClient::new(&broker.socket_path);
+        let err = client.open_session(None, None, None).await.unwrap_err();
+        match err {
+            WritClientError::WritError { message } => assert_eq!(message, "audit insert failed"),
+            other => panic!("expected WritError, got {other:?}"),
+        }
+    }
+
+    /// Any reply that isn't `SessionOpened` (or `Error`) is a
+    /// protocol bug — distinct from `WritError` so the caller can
+    /// react without parsing prose.
+    #[tokio::test]
+    async fn open_session_rejects_unexpected_reply_variant() {
+        let broker = StubBroker::start(ServerMessage::SessionClosed).await;
+        let client = WritClient::new(&broker.socket_path);
+        let err = client.open_session(None, None, None).await.unwrap_err();
+        assert!(
+            matches!(err, WritClientError::UnexpectedMessage { .. }),
+            "expected UnexpectedMessage, got {err:?}"
+        );
+    }
+
+    /// `close_session` returns `Ok(())` on `SessionClosed` and
+    /// frames the request with the supplied id.
+    #[tokio::test]
+    async fn close_session_round_trips_session_closed_reply() {
+        let session_id = sample_session_id();
+        let broker = StubBroker::start(ServerMessage::SessionClosed).await;
+        let client = WritClient::new(&broker.socket_path);
+        client.close_session(session_id).await.unwrap();
+
+        let seen = broker.observed_requests().await;
+        match &seen[0] {
+            ClientMessage::CloseSession {
+                session_id: seen_id,
+            } => assert_eq!(*seen_id, session_id),
+            other => panic!("expected CloseSession, got {other:?}"),
+        }
+    }
+
+    /// `close_session` distinguishes a structured broker error
+    /// ("unknown session") from "writ said something else" — the
+    /// caller drives the cleanup retry off the variant, not a string
+    /// match.
+    #[tokio::test]
+    async fn close_session_surfaces_writ_error_reply() {
+        let broker = StubBroker::start(ServerMessage::Error {
+            message: "session not found".into(),
+        })
+        .await;
+        let client = WritClient::new(&broker.socket_path);
+        let err = client.close_session(sample_session_id()).await.unwrap_err();
+        assert!(
+            matches!(err, WritClientError::WritError { .. }),
+            "expected WritError, got {err:?}"
         );
     }
 
