@@ -81,11 +81,28 @@ impl AllowedSigners {
         Self { by_fingerprint }
     }
 
-    /// Parse one OpenSSH public key per line, skipping blank lines
-    /// and lines whose first non-whitespace character is `#`. This is
-    /// the minimal subset of Git's allowed-signers format that gives
-    /// us a deployable keyring without committing to the full
-    /// principal/options grammar — extending later is additive.
+    /// Parse a Git/OpenSSH allowed-signers file: one entry per line in
+    /// the form `principals [options] keytype base64-key [comment]`,
+    /// with blank lines and lines whose first non-whitespace character
+    /// is `#` skipped. The leading principals field is mandatory in
+    /// the allowed-signers format — `* ssh-ed25519 AAAA…` is the most
+    /// common shape — and options before the keytype (e.g.
+    /// `cert-authority`, `namespaces="…"`) are accepted but
+    /// **not interpreted**: v1's trust model is "fingerprint must be
+    /// in the file"; principal matching and namespace pinning are
+    /// orthogonal hardening that bailiff doesn't need yet.
+    ///
+    /// Bare OpenSSH public-key lines (`ssh-ed25519 AAAA…`, with no
+    /// principals prefix) are also accepted so an operator can paste
+    /// an `id_ed25519.pub` straight in without first wrapping it.
+    ///
+    /// The parser walks token boundaries from the left and takes the
+    /// first suffix that `WritVerifyingKey::from_openssh` accepts.
+    /// This is robust to operator-named principals that happen to
+    /// share a prefix with a keytype, and to options whose values
+    /// contain whitespace inside quotes (`namespaces="a b"`): the
+    /// parse-attempt succeeds at the first byte offset that yields a
+    /// real OpenSSH key, regardless of how earlier tokens were split.
     ///
     /// Returns a tagged error naming the line that failed.
     pub fn from_openssh_lines(s: &str) -> Result<Self, AllowedSignersParseError> {
@@ -97,7 +114,7 @@ impl AllowedSigners {
             if trimmed.is_empty() || trimmed.starts_with('#') {
                 continue;
             }
-            let key = WritVerifyingKey::from_openssh(trimmed).map_err(|source| {
+            let key = parse_allowed_signers_line(trimmed).map_err(|source| {
                 AllowedSignersParseError::InvalidKeyLine {
                     line_number,
                     source,
@@ -139,6 +156,47 @@ impl AllowedSigners {
     pub fn is_empty(&self) -> bool {
         self.by_fingerprint.is_empty()
     }
+}
+
+/// Walk `line` from the left, repeatedly trying
+/// [`WritVerifyingKey::from_openssh`] on the suffix starting at each
+/// whitespace-delimited token boundary, and return the first key that
+/// parses. This is how the principals + options prefix of a Git
+/// allowed-signers entry is stripped without committing to the full
+/// grammar: instead of *parsing* the prefix, we *skip* tokens until
+/// the remainder is recognisable as an OpenSSH public key.
+///
+/// The trim-and-retry approach handles options whose values contain
+/// quoted whitespace (e.g. `namespaces="a b" ssh-ed25519 …`): even if
+/// our tokeniser over-splits on the embedded space, the trim eventually
+/// lands at the keytype byte offset, at which point the suffix parses.
+/// It also tolerates operator-named principals that happen to start
+/// with a keytype prefix, because we don't pattern-match on keytype
+/// names — we just ask `from_openssh` whether the suffix is valid.
+///
+/// If no suffix parses, the most recently captured parse error is
+/// returned. That preserves the underlying `ssh-key` error code for
+/// the caller without inventing a new tag for "this isn't a
+/// recognisable allowed-signers line either".
+fn parse_allowed_signers_line(line: &str) -> Result<WritVerifyingKey, WritSigningKeyError> {
+    let mut suffix = line;
+    let mut last_error: Option<WritSigningKeyError> = None;
+    loop {
+        suffix = suffix.trim_start();
+        if suffix.is_empty() {
+            break;
+        }
+        match WritVerifyingKey::from_openssh(suffix) {
+            Ok(key) => return Ok(key),
+            Err(e) => last_error = Some(e),
+        }
+        let token_end = suffix.find(char::is_whitespace).unwrap_or(suffix.len());
+        suffix = &suffix[token_end..];
+    }
+    // Every non-blank line goes through at least one parse attempt
+    // before we get here (the caller filters blanks), so `last_error`
+    // is always populated.
+    Err(last_error.expect("non-blank line should yield at least one parse error"))
 }
 
 /// Anything that can go wrong parsing an allowed-signers list. Each
@@ -427,6 +485,66 @@ mod tests {
             }
             other => panic!("expected DuplicateFingerprint, got {other:?}"),
         }
+    }
+
+    /// Git's canonical allowed-signers form has the principals field
+    /// as the first whitespace-separated token: `* ssh-ed25519 …`.
+    /// This is what `ssh-keygen -Y verify` reads, so accepting it
+    /// is the load-bearing interop property.
+    #[test]
+    fn allowed_signers_parses_line_with_star_principal() {
+        let line = format!("* {}", SIGNING_PUB.trim());
+        let allowed = AllowedSigners::from_openssh_lines(&line).unwrap();
+        assert_eq!(allowed.len(), 1);
+        let signing_key = WritSigningKey::from_openssh_pem(SIGNING_PEM).unwrap();
+        let envelope = freshly_signed(&signing_key);
+        verify_run_envelope(&envelope, &allowed)
+            .expect("entry with `*` principal must produce a usable keyring");
+    }
+
+    /// A named principal (instead of the `*` wildcard) must parse the
+    /// same way: bailiff doesn't interpret principal identifiers in
+    /// v1, but the entry must still produce a usable keyring.
+    #[test]
+    fn allowed_signers_parses_line_with_named_principal() {
+        let line = format!("writ-host-1 {}", SIGNING_PUB.trim());
+        let allowed = AllowedSigners::from_openssh_lines(&line).unwrap();
+        assert_eq!(allowed.len(), 1);
+    }
+
+    /// Pre-keytype options like `cert-authority` and `namespaces="…"`
+    /// must be tolerated even though bailiff does not interpret them
+    /// in v1. The parser walks token-by-token until the keytype, so
+    /// any number of options can sit between principals and keytype.
+    #[test]
+    fn allowed_signers_parses_line_with_options() {
+        let line = format!(
+            "* cert-authority namespaces=\"writ.run-agent\" {}",
+            SIGNING_PUB.trim()
+        );
+        let allowed = AllowedSigners::from_openssh_lines(&line).unwrap();
+        assert_eq!(allowed.len(), 1);
+    }
+
+    /// A complete `ssh-keygen -Y verify`-shaped file with a header
+    /// comment, a `*`-principal entry, and a named-principal entry
+    /// parses cleanly with both keys retrievable by fingerprint. This
+    /// is the realistic deployment-config shape.
+    #[test]
+    fn allowed_signers_parses_realistic_allowed_signers_file() {
+        let source = format!(
+            "# writ allowed signers\n\
+             * {primary}\n\
+             writ-host-2 {other}\n",
+            primary = SIGNING_PUB.trim(),
+            other = OTHER_PUB.trim(),
+        );
+        let allowed = AllowedSigners::from_openssh_lines(&source).unwrap();
+        assert_eq!(allowed.len(), 2);
+        let primary = WritVerifyingKey::from_openssh(SIGNING_PUB.trim()).unwrap();
+        let other = WritVerifyingKey::from_openssh(OTHER_PUB.trim()).unwrap();
+        assert!(allowed.lookup(&primary.fingerprint()).is_some());
+        assert!(allowed.lookup(&other.fingerprint()).is_some());
     }
 
     /// A malformed key line names *which* line failed so the operator
