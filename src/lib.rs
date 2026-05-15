@@ -67,3 +67,5 @@ pub mod vm_git;
 pub mod vm_git_bundle;
 #[cfg(feature = "host")]
 pub mod vm_http;
+#[cfg(feature = "host")]
+pub mod writ_client;

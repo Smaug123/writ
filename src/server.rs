@@ -1320,13 +1320,18 @@ pub(crate) async fn request_capability<S: SecretStore + Send + Sync>(
 }
 
 /// Maximum bytes we will buffer for a single newline-terminated request.
-/// An honest ClientMessage is a few hundred bytes (a long label plus a
-/// GitHubRequest); 64 KiB is three orders of magnitude above that. The
-/// cap exists so a peer that opens a connection and writes
-/// non-newline-terminated data can't make the broker allocate without
-/// bound — without it, `read_until(b'\n')` grows the buffer until the
-/// process OOMs.
-const MAX_LINE_BYTES: usize = 64 * 1024;
+/// The largest honest [`ClientMessage`] is a `RunAgent` carrying a
+/// 1 MiB [`AgentPrompt`] (the cap pinned by
+/// [`crate::agent_run::MAX_AGENT_PROMPT_BYTES`]); other variants are at
+/// most a few KiB. `serde_json` escapes ASCII control bytes as
+/// `\u00XX`, expanding worst-case input 6:1, so the wire frame for a
+/// 1 MiB control-character prompt is up to 6 MiB before envelope
+/// overhead. Matches the `6 * MAX_X_BYTES + small` convention used by
+/// `vm_http` for the same reason. A peer that writes
+/// non-newline-terminated data still can't make the broker allocate
+/// without bound — without this cap, `read_until(b'\n')` grows the
+/// buffer until the process OOMs.
+const MAX_LINE_BYTES: usize = 6 * crate::agent_run::MAX_AGENT_PROMPT_BYTES + 64 * 1024;
 
 /// Maximum idle time between reads on a connection. The CLI sends one
 /// message and reads one reply, so a healthy peer never approaches
@@ -4204,10 +4209,16 @@ mod tests {
         let (reader, mut writer) = stream.into_split();
         let mut lines = BufReader::new(reader).lines();
 
-        // Write > MAX_LINE_BYTES non-newline bytes, then a newline.
+        // Write > MAX_LINE_BYTES non-newline bytes, then a newline. The
+        // writes may fail with BrokenPipe/ConnectionReset: the server
+        // trips the cap mid-read, sends its Error reply, and closes,
+        // which can race ahead of our later writes on Linux. Tolerating
+        // a write failure here is correct — the invariant under test is
+        // that the *read* side sees a structured Error reply, not that
+        // every byte we tried to send was acknowledged.
         let oversize = vec![b'x'; MAX_LINE_BYTES + 1];
-        writer.write_all(&oversize).await.unwrap();
-        writer.write_all(b"\n").await.unwrap();
+        let _ = writer.write_all(&oversize).await;
+        let _ = writer.write_all(b"\n").await;
 
         let reply = lines.next_line().await.unwrap().unwrap();
         let msg: ServerMessage = serde_json::from_str(&reply).unwrap();
