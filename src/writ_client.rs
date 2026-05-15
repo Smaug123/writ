@@ -464,8 +464,12 @@ mod tests {
         }
     }
 
-    /// Broker accepts the connection then closes without writing a
-    /// reply: client distinguishes this from a transport failure.
+    /// Broker accepts the connection, reads the request, then closes
+    /// without writing a reply: client distinguishes this from a
+    /// transport failure. The stub *must* drain the request line before
+    /// dropping — on Linux, dropping with unread data in the receive
+    /// queue triggers an RST instead of a clean FIN, which would surface
+    /// as `ReadFraming(ConnectionReset)` rather than `ReadEof`.
     #[tokio::test]
     async fn run_agent_reports_eof_when_broker_closes_silently() {
         let dir = tempfile::tempdir().unwrap();
@@ -473,7 +477,9 @@ mod tests {
         let listener = UnixListener::bind(&socket_path).unwrap();
         let _task = tokio::spawn(async move {
             if let Ok((stream, _)) = listener.accept().await {
-                drop(stream);
+                let (reader, _writer) = stream.into_split();
+                let mut lines = BufReader::new(reader).lines();
+                let _ = lines.next_line().await;
             }
         });
 

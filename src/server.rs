@@ -4209,10 +4209,16 @@ mod tests {
         let (reader, mut writer) = stream.into_split();
         let mut lines = BufReader::new(reader).lines();
 
-        // Write > MAX_LINE_BYTES non-newline bytes, then a newline.
+        // Write > MAX_LINE_BYTES non-newline bytes, then a newline. The
+        // writes may fail with BrokenPipe/ConnectionReset: the server
+        // trips the cap mid-read, sends its Error reply, and closes,
+        // which can race ahead of our later writes on Linux. Tolerating
+        // a write failure here is correct — the invariant under test is
+        // that the *read* side sees a structured Error reply, not that
+        // every byte we tried to send was acknowledged.
         let oversize = vec![b'x'; MAX_LINE_BYTES + 1];
-        writer.write_all(&oversize).await.unwrap();
-        writer.write_all(b"\n").await.unwrap();
+        let _ = writer.write_all(&oversize).await;
+        let _ = writer.write_all(b"\n").await;
 
         let reply = lines.next_line().await.unwrap().unwrap();
         let msg: ServerMessage = serde_json::from_str(&reply).unwrap();
