@@ -6,8 +6,10 @@
 //! review attach, …) hang off the same client.
 //!
 //! Wire framing: one [`ClientMessage`] per line, one [`ServerMessage`]
-//! per line in reply. Reads are bounded by a 64 KiB per-line cap so a
-//! malformed broker can't make bailiff allocate without bound.
+//! per line in reply. Reads are bounded by a 2 MiB per-line cap so a
+//! malformed broker can't make bailiff allocate without bound. The
+//! cap matches the broker-side `read_line_bounded` limit and leaves
+//! comfortable headroom over a 1 MiB `AgentPrompt`.
 //!
 //! Errors are tagged so callers can react without string-matching: a
 //! transport failure is distinct from a writ-side [`ServerMessage::Error`],
@@ -29,9 +31,12 @@ use crate::core::{CapabilitySet, NotesRef, SshSignature};
 use crate::protocol::{ClientMessage, ServerMessage, SignedRunMetadata};
 use crate::vm_git::GitObjectId;
 
-/// Matches the broker-side cap in `src/server.rs:1329`. A peer that
-/// frames a single reply larger than this is treated as broken.
-const MAX_LINE_BYTES: usize = 64 * 1024;
+/// Matches the broker-side cap in `src/server.rs`. The largest legal
+/// reply is a `RunAgentCompleted` whose canonical metadata plus signed
+/// envelope reference fit in a few KiB; 2 MiB is well above that and
+/// gives both ends a single shared ceiling. A peer that frames a
+/// single line larger than this is treated as broken.
+const MAX_LINE_BYTES: usize = 2 * 1024 * 1024;
 
 /// What writ returned for a `RunAgent` request that ran to completion.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -788,6 +793,97 @@ mod end_to_end_tests {
         // persisted shape agree.
         assert_eq!(envelope.metadata, completed.signed_metadata);
         assert_eq!(envelope.signature, completed.signature);
+
+        broker_task.abort();
+        let _ = broker_task.await;
+    }
+
+    /// A prompt at the high end of the `MAX_AGENT_PROMPT_BYTES`
+    /// ceiling fits through the framing layer without being clipped
+    /// by `read_line_bounded`. Pins the cross-end agreement that
+    /// `MAX_LINE_BYTES` exceeds `MAX_AGENT_PROMPT_BYTES` plus JSON
+    /// overhead, so a wire-valid `AgentPrompt` is always a
+    /// wire-valid frame.
+    #[tokio::test]
+    async fn run_agent_carries_large_prompt_through_framing() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let writ_repo = NotesRepo::init_or_open(tmp.path().join("writ-bare")).unwrap();
+        let signing_key = WritSigningKey::from_openssh_pem(SIGNING_PEM).unwrap();
+        let cat = find_in_path("cat").expect("cat must be on PATH");
+
+        let github_server = MockServer::start().await;
+        let pk = SecretKey::new("gh-app-pk").unwrap();
+        let store = InMemStore::default();
+        store.put(&pk, TEST_PRIV).unwrap();
+        let mut apps = BTreeMap::new();
+        apps.insert(
+            AgentKind::Claude,
+            GitHubAppConfig {
+                app_id: 42,
+                installation_id: 999,
+                installation_owner: "o".into(),
+                private_key_secret: pk,
+                api_base: github_server.uri(),
+            },
+        );
+        let minter = GitHubMinter::new_registry(GitHubAppRegistryConfig::new(apps).unwrap());
+        let state = Arc::new(BrokerState {
+            audit: Arc::new(AuditLog::open_in_memory().unwrap()),
+            minter,
+            secrets: store,
+            policy: PolicyConfig {
+                writable_repos: vec![],
+                default_ttl: TtlSeconds::new(3600).unwrap(),
+            },
+            staging_store: None,
+            notes_repo: Some(Arc::new(writ_repo)),
+            signing_key: Some(signing_key.clone()),
+            run_agent_spawn: Some(RunAgentSpawnConfig {
+                command: cat,
+                args: Vec::new(),
+            }),
+        });
+        let socket_dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(socket_dir.path(), std::fs::Permissions::from_mode(0o700))
+            .unwrap();
+        let socket_path = socket_dir.path().join("writ.sock");
+        let listener = prepare_broker_listener(&socket_path).await.unwrap();
+        let broker_state = Arc::clone(&state);
+        let broker_task = tokio::spawn(async move {
+            let _ = serve_broker_with_agent_vm(listener, broker_state, None).await;
+        });
+
+        // 1 MiB - 4 KiB to stay strictly under MAX_AGENT_PROMPT_BYTES
+        // even with multi-byte UTF-8 in the prompt; the framing layer
+        // must still accept it (and broker must still dispatch).
+        let big = "a".repeat(crate::agent_run::MAX_AGENT_PROMPT_BYTES - 4096);
+        let prompt = AgentPrompt::new(&big);
+        let output_ref = NotesRef::try_new("refs/notes/writ/v1/agent-outputs").unwrap();
+        let client = WritClient::new(&socket_path);
+        let completed = tokio::time::timeout(
+            Duration::from_secs(30),
+            client.run_agent(RunAgentRequest {
+                prompt,
+                capabilities: vec![CapabilitySet::WorkspaceRead {
+                    repo: RepoRef {
+                        owner: "smaug123".into(),
+                        name: "writ".into(),
+                    },
+                }],
+                purpose: "large-prompt".into(),
+                output_ref,
+            }),
+        )
+        .await
+        .expect("large-prompt round-trip must complete within 30s")
+        .expect("large-prompt RunAgent must succeed");
+        assert_eq!(completed.signed_metadata.exit_code, 0);
+        assert_eq!(
+            completed.signed_metadata.prompt_sha256.as_str(),
+            sha256_hex(big.as_bytes())
+        );
 
         broker_task.abort();
         let _ = broker_task.await;

@@ -1320,13 +1320,16 @@ pub(crate) async fn request_capability<S: SecretStore + Send + Sync>(
 }
 
 /// Maximum bytes we will buffer for a single newline-terminated request.
-/// An honest ClientMessage is a few hundred bytes (a long label plus a
-/// GitHubRequest); 64 KiB is three orders of magnitude above that. The
-/// cap exists so a peer that opens a connection and writes
-/// non-newline-terminated data can't make the broker allocate without
-/// bound — without it, `read_until(b'\n')` grows the buffer until the
-/// process OOMs.
-const MAX_LINE_BYTES: usize = 64 * 1024;
+/// The largest honest [`ClientMessage`] is a `RunAgent` carrying a
+/// 1 MiB [`AgentPrompt`] (the cap pinned by
+/// [`crate::agent_run::MAX_AGENT_PROMPT_BYTES`]) plus JSON wrapping;
+/// other variants are at most a few KiB. 2 MiB covers the prompt
+/// ceiling with comfortable JSON-overhead headroom and stays an order
+/// of magnitude below "real-process worth of memory" so a peer that
+/// opens a connection and writes non-newline-terminated data still
+/// can't make the broker allocate without bound — without this cap,
+/// `read_until(b'\n')` grows the buffer until the process OOMs.
+const MAX_LINE_BYTES: usize = 2 * 1024 * 1024;
 
 /// Maximum idle time between reads on a connection. The CLI sends one
 /// message and reads one reply, so a healthy peer never approaches
