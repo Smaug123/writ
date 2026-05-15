@@ -74,32 +74,44 @@ impl BailiffRepo {
         Ok(Self { canonical_path })
     }
 
-    /// Initialise a bare repo at `path` (via `git init --bare`) if no
-    /// repo is already present there, then call [`Self::open`].
-    /// Idempotent: a second call returns a handle to the same repo
-    /// without re-initialising. Creates the directory if it does not
-    /// already exist; will not overwrite a non-empty directory that is
-    /// not already a Git repo (`git init` accepts an existing empty
-    /// directory but rejects clutter).
+    /// Initialise a bare repo at `path` if and only if `path` is absent
+    /// or is an existing empty directory, then call [`Self::open`].
+    /// An existing non-empty path is opened (and validated) verbatim —
+    /// never touched by `git init`.
+    ///
+    /// This split matters: `git init --bare` against a worktree root or
+    /// a worktree's `.git` directory leaves bare-layout files behind
+    /// (HEAD, config, objects/, refs/) at the target and can flip
+    /// `core.bare` to `true`, silently breaking the worktree. Refusing
+    /// to mutate any non-empty existing path makes accidental misuse —
+    /// "you pointed me at your repo by mistake" — surface as an
+    /// `Open*` validation error instead of as corruption.
     pub fn init_or_open(path: impl AsRef<Path>) -> Result<Self, BailiffRepoError> {
         let path = path.as_ref();
-        if !path.exists() {
-            std::fs::create_dir_all(path).map_err(|source| BailiffRepoError::CreateDir {
-                path: path.to_path_buf(),
-                source,
-            })?;
+        let needs_init = match std::fs::read_dir(path) {
+            Ok(mut entries) => entries.next().is_none(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir_all(path).map_err(|source| BailiffRepoError::CreateDir {
+                    path: path.to_path_buf(),
+                    source,
+                })?;
+                true
+            }
+            Err(source) => {
+                return Err(BailiffRepoError::Io {
+                    path: path.to_path_buf(),
+                    source,
+                });
+            }
+        };
+        if needs_init {
+            run_git(
+                path,
+                ["init", "--bare", "--quiet"],
+                None,
+                CaptureOutput::Discard,
+            )?;
         }
-        // `git init` is idempotent — re-running it on an existing repo
-        // reinitialises (in practice, a no-op for a healthy bare
-        // repo). Driving it unconditionally keeps the first-run vs
-        // resume path identical and removes a stat race between the
-        // existence check and the init call.
-        run_git(
-            path,
-            ["init", "--bare", "--quiet"].iter().copied(),
-            None,
-            CaptureOutput::Discard,
-        )?;
         Self::open(path)
     }
 
@@ -131,6 +143,15 @@ impl BailiffRepo {
         seed: &[u8],
         body: &[u8],
     ) -> Result<GitObjectId, BailiffRepoError> {
+        // `git notes add -C <oid>` against Git's empty-blob OID
+        // (`e69de29bb2d1d6434b8b29ae775ad8c2e48c5391`) succeeds without
+        // attaching a note, so `write_note` would return a target OID
+        // that `read_note` cannot read back. Rejecting empty bodies up
+        // front turns the silent gap into a typed error at the only
+        // writer.
+        if body.is_empty() {
+            return Err(BailiffRepoError::EmptyBody);
+        }
         let _guard = lock_notes_write(&self.canonical_path);
         let target_oid = hash_object_stdin(&self.canonical_path, seed)?;
         // Write the body as a blob first and reference it via `-C
@@ -440,6 +461,8 @@ pub enum BailiffRepoError {
         path: PathBuf,
         source: std::io::Error,
     },
+    #[error("note body must be non-empty")]
+    EmptyBody,
     #[error("git command could not be spawned: {source}")]
     GitSpawn { source: std::io::Error },
     #[error("git command stdin write failed: {source}")]
@@ -697,6 +720,49 @@ mod tests {
         let body = b"body ending in a newline\n";
         let target = repo.write_note(&nref, b"seed", body).unwrap();
         assert_eq!(repo.read_note(&nref, &target).unwrap(), body);
+    }
+
+    #[test]
+    fn write_note_rejects_empty_body() {
+        // `git notes add -C <empty-blob-oid>` succeeds without
+        // attaching a note, so the helper must reject empty bodies
+        // before they reach git rather than returning a target OID
+        // that read_note cannot resolve.
+        let tmp = TempDir::new().unwrap();
+        let repo = BailiffRepo::init_or_open(tmp.path().join("r")).unwrap();
+        let nref = notes_ref();
+        let err = repo.write_note(&nref, b"seed", b"").unwrap_err();
+        assert!(matches!(err, BailiffRepoError::EmptyBody), "got: {err:?}");
+    }
+
+    #[test]
+    fn init_or_open_does_not_mutate_existing_non_bare_repo() {
+        // Pointing `init_or_open` at the `.git` directory of a real
+        // worktree must not run `git init --bare` against it: that
+        // would flip core.bare and silently break the worktree. The
+        // expected behaviour is to validate-only and surface the
+        // mismatch as an open error.
+        let tmp = TempDir::new().unwrap();
+        let worktree = tmp.path().join("wt");
+        let status = Command::new("git")
+            .arg("init")
+            .arg("--quiet")
+            .arg(&worktree)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let git_dir = worktree.join(".git");
+        // Capture HEAD + config before the call so we can confirm
+        // init was not run against the existing repo.
+        let head_before = fs::read(git_dir.join("HEAD")).unwrap();
+        let config_before = fs::read(git_dir.join("config")).unwrap();
+        let err = BailiffRepo::init_or_open(&git_dir).unwrap_err();
+        assert!(
+            matches!(err, BailiffRepoError::NotBare { value: Some(false) }),
+            "got: {err:?}"
+        );
+        assert_eq!(fs::read(git_dir.join("HEAD")).unwrap(), head_before);
+        assert_eq!(fs::read(git_dir.join("config")).unwrap(), config_before);
     }
 
     #[test]
