@@ -262,6 +262,29 @@ enum CaptureOutput {
     Capture,
 }
 
+/// Repo-selection environment variables that override `-C <path>` if
+/// inherited from the parent process. A `GIT_DIR=/elsewhere` in our
+/// parent would silently redirect every git call to `/elsewhere`,
+/// regardless of which `BailiffRepo` handle we hold — so every child
+/// command must scrub them.
+const GIT_REPO_ENV_VARS: &[&str] = &[
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_COMMON_DIR",
+    "GIT_NAMESPACE",
+    "GIT_CEILING_DIRECTORIES",
+    "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+];
+
+fn scrub_git_env(command: &mut Command) {
+    for var in GIT_REPO_ENV_VARS {
+        command.env_remove(var);
+    }
+}
+
 fn run_git<'a, I>(
     cwd: &Path,
     args: I,
@@ -273,6 +296,7 @@ where
 {
     let args: Vec<&str> = args.into_iter().collect();
     let mut command = Command::new("git");
+    scrub_git_env(&mut command);
     command.arg("-C").arg(cwd);
     command.args(&args);
     command.stdin(if stdin_input.is_some() {
@@ -326,7 +350,13 @@ where
 }
 
 fn git_config_get_bool(repo: &Path, key: &str) -> Result<Option<bool>, BailiffRepoError> {
-    let output = run_git_config(repo, ["--bool", "--get", key])?;
+    // `--local` is load-bearing: without it, `git config --get`
+    // also reads `~/.gitconfig` and the system config, so a global
+    // `core.bare = true` would let any directory with HEAD/objects/
+    // refs pass validation, and a global `extensions.objectformat =
+    // sha256` would reject a valid SHA-1 repo. The layout checks
+    // are about the on-disk repo only.
+    let output = run_git_config(repo, ["--local", "--bool", "--get", key])?;
     let Some(raw) = output else { return Ok(None) };
     let trimmed = raw.trim();
     match trimmed {
@@ -340,7 +370,7 @@ fn git_config_get_bool(repo: &Path, key: &str) -> Result<Option<bool>, BailiffRe
 }
 
 fn git_config_get(repo: &Path, key: &str) -> Result<Option<String>, BailiffRepoError> {
-    let output = run_git_config(repo, ["--get", key])?;
+    let output = run_git_config(repo, ["--local", "--get", key])?;
     Ok(output.map(|s| s.trim().to_string()))
 }
 
@@ -349,6 +379,7 @@ fn run_git_config<'a>(
     config_args: impl IntoIterator<Item = &'a str>,
 ) -> Result<Option<String>, BailiffRepoError> {
     let mut command = Command::new("git");
+    scrub_git_env(&mut command);
     command.arg("-C").arg(repo).arg("config");
     for arg in config_args {
         command.arg(arg);
@@ -489,6 +520,14 @@ mod tests {
         NotesRef::try_new("refs/notes/writ/v1/agent-outputs").unwrap()
     }
 
+    /// Serialises tests that mutate process environment variables
+    /// against tests that invoke `git` directly (without going
+    /// through `run_git`, which scrubs the repo-selection env).
+    /// Cargo runs tests in parallel by default, so without this the
+    /// env pollution window from a "GIT_DIR is ignored" test would
+    /// leak into other tests' `Command::new("git")` setups.
+    static ENV_TEST_MUTEX: Mutex<()> = Mutex::new(());
+
     #[test]
     fn init_or_open_creates_a_bare_repo() {
         let tmp = TempDir::new().unwrap();
@@ -522,6 +561,7 @@ mod tests {
 
     #[test]
     fn open_rejects_non_bare_repo() {
+        let _env_guard = ENV_TEST_MUTEX.lock().unwrap();
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("non-bare");
         // `git init` (no --bare) produces a working-directory repo
@@ -602,6 +642,7 @@ mod tests {
 
     #[test]
     fn open_rejects_repo_with_sha256_object_format() {
+        let _env_guard = ENV_TEST_MUTEX.lock().unwrap();
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("sha256-repo");
         let status = Command::new("git")
@@ -742,6 +783,7 @@ mod tests {
         // would flip core.bare and silently break the worktree. The
         // expected behaviour is to validate-only and surface the
         // mismatch as an open error.
+        let _env_guard = ENV_TEST_MUTEX.lock().unwrap();
         let tmp = TempDir::new().unwrap();
         let worktree = tmp.path().join("wt");
         let status = Command::new("git")
@@ -776,5 +818,86 @@ mod tests {
         let body: Vec<u8> = (0u8..=255).collect();
         let target = repo.write_note(&nref, b"seed", &body).unwrap();
         assert_eq!(repo.read_note(&nref, &target).unwrap(), body);
+    }
+
+    #[test]
+    fn write_note_ignores_parent_git_dir_env() {
+        // `git -C <path>` does NOT override an inherited `GIT_DIR`:
+        // the env var wins and redirects every git call. Without
+        // scrubbing, a parent that exports `GIT_DIR=/elsewhere`
+        // would steer `hash-object -w` and `notes add` into the
+        // wrong repo. Production code scrubs the repo-selection
+        // env in `run_git`; this test sets `GIT_DIR` to an absent
+        // path so the un-scrubbed code path would surface as a
+        // hash-object failure, while the scrubbed code path
+        // succeeds.
+        let tmp = TempDir::new().unwrap();
+        let repo = BailiffRepo::init_or_open(tmp.path().join("r")).unwrap();
+        let nref = notes_ref();
+        let absent_git_dir = tmp.path().join("definitely-not-a-repo");
+        let _env_guard = ENV_TEST_MUTEX.lock().unwrap();
+        // SAFETY: set_var/remove_var are unsafe in Rust 2024 because
+        // they race with concurrent getenv across threads. The mutex
+        // above serialises all tests in this module that touch the
+        // process env or invoke `git` directly.
+        unsafe {
+            std::env::set_var("GIT_DIR", &absent_git_dir);
+        }
+        let result = repo.write_note(&nref, b"seed", b"body");
+        unsafe {
+            std::env::remove_var("GIT_DIR");
+        }
+        let target = result.expect("write_note must ignore parent GIT_DIR");
+        assert_eq!(repo.read_note(&nref, &target).unwrap(), b"body");
+    }
+
+    #[test]
+    fn open_reads_local_config_only_for_core_bare() {
+        // Git's config precedence is command-line > env > local >
+        // global > system, so a global override only *wins* when
+        // local is silent. To exercise the bug, set up a bare repo
+        // whose local config is missing the key entirely (delete
+        // the file) and plant `core.bare = true` in a fake global.
+        // Without `--local`, the lookup falls through to global and
+        // returns true — letting a layout-only directory masquerade
+        // as a valid bare repo. With `--local`, the lookup returns
+        // None and validation fails as `NotBare { value: None }`.
+        let tmp = TempDir::new().unwrap();
+        let repo = BailiffRepo::init_or_open(tmp.path().join("r")).unwrap();
+        fs::remove_file(repo.path().join("config")).unwrap();
+        let global_cfg = tmp.path().join("globalcfg");
+        fs::write(&global_cfg, "[core]\n\tbare = true\n").unwrap();
+        let _env_guard = ENV_TEST_MUTEX.lock().unwrap();
+        unsafe {
+            std::env::set_var("GIT_CONFIG_GLOBAL", &global_cfg);
+        }
+        let result = BailiffRepo::open(repo.path());
+        unsafe {
+            std::env::remove_var("GIT_CONFIG_GLOBAL");
+        }
+        let err = result.expect_err("open must not honour global core.bare");
+        assert!(
+            matches!(err, BailiffRepoError::NotBare { value: None }),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn open_reads_local_config_only_for_object_format() {
+        // A global `extensions.objectformat = sha256` must not
+        // reject a valid SHA-1 repo whose local config is silent.
+        let tmp = TempDir::new().unwrap();
+        let repo = BailiffRepo::init_or_open(tmp.path().join("r")).unwrap();
+        let global_cfg = tmp.path().join("globalcfg");
+        fs::write(&global_cfg, "[extensions]\n\tobjectformat = sha256\n").unwrap();
+        let _env_guard = ENV_TEST_MUTEX.lock().unwrap();
+        unsafe {
+            std::env::set_var("GIT_CONFIG_GLOBAL", &global_cfg);
+        }
+        let result = BailiffRepo::open(repo.path());
+        unsafe {
+            std::env::remove_var("GIT_CONFIG_GLOBAL");
+        }
+        result.expect("open must read --local extensions.objectformat, not global");
     }
 }
