@@ -449,7 +449,14 @@ async fn validate_bare_repo(path: &Path) -> Result<(), BailiffRepoError> {
     // not produce this file; its presence means the directory is
     // a linked-worktree gitdir or was hand-crafted to redirect
     // writes — neither of which we accept.
-    match tokio::fs::metadata(path.join("commondir")).await {
+    //
+    // Use `symlink_metadata` rather than `metadata` so a broken
+    // `commondir` symlink (whose target doesn't exist) is still
+    // rejected. `metadata` would follow the link, return NotFound,
+    // and silently let the repo through — but Git itself fails on
+    // any `--git-dir` operation with "failed to read .../commondir",
+    // so the open() return value would be useless.
+    match tokio::fs::symlink_metadata(path.join("commondir")).await {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(source) => return Err(BailiffRepoError::Io(source)),
         Ok(_) => {
@@ -481,20 +488,67 @@ async fn validate_bare_repo(path: &Path) -> Result<(), BailiffRepoError> {
             });
         }
     }
-    // Reject storage-path symlinks anywhere under `objects/` or
-    // `refs/`. Git follows symlinks transparently under
-    // `--git-dir`, so any redirect — top-level
-    // (`objects/ -> /elsewhere`) or nested
-    // (`objects/c1/ -> /elsewhere`, `refs/notes/ -> /elsewhere`) —
-    // lets `write_blob` and `write_note` land bytes outside the
-    // canonical bare repo path. `git init --bare` plants only
-    // plain directories under these trees; any symlink here is a
-    // redirect attempt that bailiff refuses to accept.
+    // Require top-level `objects/` and `refs/` to exist as real
+    // directories. `git init --bare` always creates both; without
+    // them Git itself reports "not a git repository" on the first
+    // `--git-dir` write, which would mean `open()` returned a
+    // handle that cannot keep its `write_blob`/`write_note`
+    // promises. Catch that here rather than at first call.
     //
-    // Missing roots are allowed: `init_or_open` may call this
-    // before `refs/notes/` exists.
+    // Also reject storage-path symlinks anywhere within those
+    // trees: Git follows symlinks transparently under `--git-dir`,
+    // so any redirect — top-level (`objects/ -> /elsewhere`) or
+    // nested (`objects/c1/ -> /elsewhere`,
+    // `refs/notes/ -> /elsewhere`) — lets `write_blob` and
+    // `write_note` land bytes outside the canonical bare repo
+    // path. `git init --bare` plants only plain directories under
+    // these trees; any symlink here is a redirect attempt that
+    // bailiff refuses to accept.
+    require_storage_root(path, "objects").await?;
+    require_storage_root(path, "refs").await?;
     reject_storage_symlinks(path, "objects").await?;
     reject_storage_symlinks(path, "refs").await?;
+    Ok(())
+}
+
+/// Ensure `<repo>/<top>` exists as a real directory (not a
+/// symlink, not a regular file, not missing). The symlink walker
+/// below tolerates a missing root because nested subdirectories
+/// like `refs/notes/` only materialise on first write — but a
+/// missing top-level `objects/` or `refs/` means Git can't open
+/// the gitdir at all, so the `BailiffRepo` handle would be born
+/// broken.
+async fn require_storage_root(repo: &Path, top: &str) -> Result<(), BailiffRepoError> {
+    let target = repo.join(top);
+    let meta = tokio::fs::symlink_metadata(&target)
+        .await
+        .map_err(|source| {
+            if source.kind() == std::io::ErrorKind::NotFound {
+                BailiffRepoError::NotABareRepo {
+                    path: repo.display().to_string(),
+                    reason: format!(
+                        "missing `{top}/`; a bare repo must have it as a real directory"
+                    ),
+                }
+            } else {
+                BailiffRepoError::Io(source)
+            }
+        })?;
+    let file_type = meta.file_type();
+    if file_type.is_symlink() {
+        return Err(BailiffRepoError::NotABareRepo {
+            path: repo.display().to_string(),
+            reason: format!(
+                "`{top}/` is a symlink; bare repos used by bailiff must store {top} in place"
+            ),
+        });
+    }
+    if !file_type.is_dir() {
+        return Err(BailiffRepoError::NotABareRepo {
+            path: repo.display().to_string(),
+            reason: format!("`{top}/` is not a directory"),
+        });
+    }
     Ok(())
 }
 
@@ -1519,6 +1573,80 @@ mod tests {
                 assert!(
                     reason.contains("commondir"),
                     "reason should mention commondir, got: {reason}"
+                );
+            }
+            other => panic!("expected NotABareRepo, got {other:?}"),
+        }
+    }
+
+    /// A broken `commondir` symlink (target missing) must be
+    /// rejected just like a real commondir file. `tokio::fs::
+    /// metadata` would follow the link and report NotFound,
+    /// silently letting the repo through — but git itself fails on
+    /// every `--git-dir` operation with "failed to read commondir",
+    /// so `open()` returning success would hand the caller a
+    /// handle that cannot write. The validation switched to
+    /// `symlink_metadata` so the link itself is detected.
+    #[tokio::test]
+    async fn open_rejects_a_gitdir_with_broken_commondir_symlink() {
+        let dir = TempDir::new().unwrap();
+        let repo_path = dir.path().join("broken-commondir");
+        let _ = BailiffRepo::init_or_open(&repo_path).await.unwrap();
+        // Plant a symlink to a non-existent target.
+        std::os::unix::fs::symlink(
+            dir.path().join("does-not-exist"),
+            repo_path.join("commondir"),
+        )
+        .unwrap();
+        let err = BailiffRepo::open(&repo_path).await.unwrap_err();
+        match err {
+            BailiffRepoError::NotABareRepo { reason, .. } => {
+                assert!(
+                    reason.contains("commondir"),
+                    "reason should mention commondir, got: {reason}"
+                );
+            }
+            other => panic!("expected NotABareRepo, got {other:?}"),
+        }
+    }
+
+    /// A directory with HEAD and `core.bare=true` but no top-level
+    /// `objects/` cannot host any git write at all — `hash-object
+    /// -w` fails with "not a git repository". `open()` must reject
+    /// such a directory at validation time rather than at first
+    /// `write_blob`, so callers don't get a handle that can't keep
+    /// its promises.
+    #[tokio::test]
+    async fn open_rejects_a_repo_with_missing_objects_dir() {
+        let dir = TempDir::new().unwrap();
+        let repo_path = dir.path().join("no-objects");
+        let _ = BailiffRepo::init_or_open(&repo_path).await.unwrap();
+        std::fs::remove_dir_all(repo_path.join("objects")).unwrap();
+        let err = BailiffRepo::open(&repo_path).await.unwrap_err();
+        match err {
+            BailiffRepoError::NotABareRepo { reason, .. } => {
+                assert!(
+                    reason.contains("objects"),
+                    "reason should mention missing objects, got: {reason}"
+                );
+            }
+            other => panic!("expected NotABareRepo, got {other:?}"),
+        }
+    }
+
+    /// Same as above but for `refs/`: a bare repo must have it.
+    #[tokio::test]
+    async fn open_rejects_a_repo_with_missing_refs_dir() {
+        let dir = TempDir::new().unwrap();
+        let repo_path = dir.path().join("no-refs");
+        let _ = BailiffRepo::init_or_open(&repo_path).await.unwrap();
+        std::fs::remove_dir_all(repo_path.join("refs")).unwrap();
+        let err = BailiffRepo::open(&repo_path).await.unwrap_err();
+        match err {
+            BailiffRepoError::NotABareRepo { reason, .. } => {
+                assert!(
+                    reason.contains("refs"),
+                    "reason should mention missing refs, got: {reason}"
                 );
             }
             other => panic!("expected NotABareRepo, got {other:?}"),
