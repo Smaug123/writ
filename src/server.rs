@@ -1613,6 +1613,32 @@ mod tests {
     // can share it across modules without duplicating the bytes.
     const TEST_PRIV: &str = include_str!("../tests/fixtures/rsa_test_1.pem");
 
+    /// Walk `PATH` looking for `name`. Returns the first match.
+    /// The `run_agent` tests need real tools (`cat`, `false`,
+    /// `sh`/`bash`) and the production `RunAgentSpawnConfig` carries
+    /// an absolute path, so tests resolve one at setup. Hardcoding
+    /// `/bin/...` or `/usr/bin/...` works on macOS dev hosts but not
+    /// in Nix CI sandboxes where coreutils live under `/nix/store/`.
+    fn find_in_path(name: &str) -> Option<std::path::PathBuf> {
+        let path_var = std::env::var_os("PATH")?;
+        std::env::split_paths(&path_var)
+            .map(|dir| dir.join(name))
+            .find(|candidate| candidate.is_file())
+    }
+
+    /// Like [`find_in_path`] but tries several names in order. Used
+    /// for the shell — Nix stdenv reliably provides `bash` on PATH
+    /// but `sh` may be a symlink that isn't always in scope.
+    fn find_in_path_any(names: &[&str]) -> std::path::PathBuf {
+        for name in names {
+            if let Some(path) = find_in_path(name) {
+                return path;
+            }
+        }
+        let path_var = std::env::var_os("PATH").unwrap_or_default();
+        panic!("could not locate any of {names:?} in PATH ({path_var:?})");
+    }
+
     fn make_state(
         server: &MockServer,
         writable: Vec<RepoRef>,
@@ -1845,16 +1871,11 @@ mod tests {
         let fingerprint = signing_key.fingerprint();
 
         // `cat` is the canonical "noop" agent: it copies stdin to
-        // stdout, so the captured output is byte-equal to the prompt
-        // bytes writ writes in. That gives us a deterministic
-        // `output_envelope_sha256 == prompt_sha256` we can check from
-        // the verifier side without baking spawner internals into the
-        // test.
-        let cat = if std::path::Path::new("/bin/cat").exists() {
-            std::path::PathBuf::from("/bin/cat")
-        } else {
-            std::path::PathBuf::from("/usr/bin/cat")
-        };
+        // stdout, so the captured stdout is byte-equal to the prompt
+        // bytes writ writes in. That gives us a deterministic capture
+        // we can check from the verifier side without baking spawner
+        // internals into the test.
+        let cat = find_in_path("cat").expect("cat must be on PATH for the round-trip test");
         // `RunAgent` does not mint GitHub tokens, but `BrokerState`
         // requires a non-empty registry. Reuse the existing test
         // helper so the registry shape stays in lockstep with other
@@ -1970,11 +1991,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let notes_repo = NotesRepo::init_or_open(tmp.path().join("repo")).unwrap();
         let signing_key = WritSigningKey::from_openssh_pem(SIGNING_PEM).unwrap();
-        let false_bin = if std::path::Path::new("/bin/false").exists() {
-            std::path::PathBuf::from("/bin/false")
-        } else {
-            std::path::PathBuf::from("/usr/bin/false")
-        };
+        let false_bin = find_in_path("false").expect("false must be on PATH for the test");
 
         let server = MockServer::start().await;
         let base = Arc::try_unwrap(make_state(&server, vec![], "o"))
@@ -2044,11 +2061,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let notes_repo = NotesRepo::init_or_open(tmp.path().join("repo")).unwrap();
         let signing_key = WritSigningKey::from_openssh_pem(SIGNING_PEM).unwrap();
-        let sh = if std::path::Path::new("/bin/sh").exists() {
-            std::path::PathBuf::from("/bin/sh")
-        } else {
-            std::path::PathBuf::from("/usr/bin/sh")
-        };
+        let sh = find_in_path_any(&["sh", "bash"]);
 
         let server = MockServer::start().await;
         let base = Arc::try_unwrap(make_state(&server, vec![], "o"))
@@ -2129,11 +2142,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let notes_repo = NotesRepo::init_or_open(tmp.path().join("repo")).unwrap();
         let signing_key = WritSigningKey::from_openssh_pem(SIGNING_PEM).unwrap();
-        let sh = if std::path::Path::new("/bin/sh").exists() {
-            std::path::PathBuf::from("/bin/sh")
-        } else {
-            std::path::PathBuf::from("/usr/bin/sh")
-        };
+        let sh = find_in_path_any(&["sh", "bash"]);
 
         let server = MockServer::start().await;
         let base = Arc::try_unwrap(make_state(&server, vec![], "o"))
