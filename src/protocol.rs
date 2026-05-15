@@ -297,6 +297,33 @@ pub struct SignedRunMetadata {
     pub signing_key_fingerprint: SshKeyFingerprint,
 }
 
+impl SignedRunMetadata {
+    /// Canonical byte representation that the signature covers.
+    ///
+    /// The canonical form is `serde_json::to_vec` of this struct: a
+    /// compact (no whitespace) JSON object with keys emitted in the
+    /// declaration order pinned by the struct definition above. The
+    /// struct definition *is* the contract — `deny_unknown_fields`
+    /// plus the strict newtype validators (`Sha256Hex`,
+    /// `SshKeyFingerprint`, `AgentRunId`, `SessionId`, `UnixMillis`,
+    /// `CapabilitySet`) mean every wire payload that round-trips
+    /// through `SignedRunMetadata` and back to bytes via
+    /// `canonical_bytes` yields the same digest.
+    ///
+    /// A non-Rust verifier reproduces the canonical form by emitting
+    /// JSON with the eight keys in the order they appear in this
+    /// struct (`run_id`, `session_id`, `prompt_sha256`,
+    /// `output_envelope_sha256`, `capabilities`, `exit_code`,
+    /// `completed_at`, `signing_key_fingerprint`), each child value
+    /// in its own canonical form (numbers as bare integers, strings
+    /// in JSON-escaped UTF-8, the `capabilities` array preserving
+    /// element order verbatim) and no insignificant whitespace.
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        serde_json::to_vec(self)
+            .expect("SignedRunMetadata serialises to JSON without IO; cannot fail")
+    }
+}
+
 /// A message from the agent to the broker.
 ///
 /// `#[serde(deny_unknown_fields)]` at the enum level catches typos at the
@@ -2055,6 +2082,58 @@ mod tests {
                 || err.to_string().contains("END SSH SIGNATURE"),
             "expected signature error, got: {err}",
         );
+    }
+
+    /// `canonical_bytes` is the contract the signature covers. A
+    /// round-trip through `serde_json` (serialise → parse → serialise
+    /// again via `canonical_bytes`) must reproduce the same bytes,
+    /// otherwise a verifier deserialising the wire form and
+    /// re-canonicalising would compute a different digest and reject
+    /// a valid signature.
+    #[test]
+    fn signed_run_metadata_canonical_bytes_roundtrip_is_stable() {
+        let meta = sample_signed_run_metadata();
+        let first = meta.canonical_bytes();
+        let parsed: SignedRunMetadata = serde_json::from_slice(&first).unwrap();
+        let second = parsed.canonical_bytes();
+        assert_eq!(first, second);
+    }
+
+    /// Pin the literal canonical byte sequence: a compact JSON object
+    /// (no whitespace) with the eight keys in struct-declaration order.
+    /// A reviewer reading this string sees exactly what the verifier
+    /// must reproduce. Any reordering of fields in `SignedRunMetadata`
+    /// or any switch to a different serialiser would break this.
+    #[test]
+    fn signed_run_metadata_canonical_bytes_pin_field_order() {
+        let meta = sample_signed_run_metadata();
+        let bytes = meta.canonical_bytes();
+        let s = std::str::from_utf8(&bytes).unwrap();
+        let expected = format!(
+            "{{\"run_id\":\"{}\",\"session_id\":\"{}\",\
+             \"prompt_sha256\":\"{}\",\"output_envelope_sha256\":\"{}\",\
+             \"capabilities\":[{{\"kind\":\"workspace_read\",\"repo\":\"o/n\"}}],\
+             \"exit_code\":0,\"completed_at\":1700000000000,\
+             \"signing_key_fingerprint\":\"{}\"}}",
+            sample_agent_run_id(),
+            fixed_session_id(),
+            sample_sha256_hex('a').as_str(),
+            sample_sha256_hex('b').as_str(),
+            sample_ssh_fingerprint().as_str(),
+        );
+        assert_eq!(s, expected);
+    }
+
+    /// Different metadata produces different canonical bytes — a basic
+    /// distinctness check so a regression that collapses every payload
+    /// to the same bytes (e.g. accidentally serialising a constant)
+    /// surfaces immediately.
+    #[test]
+    fn signed_run_metadata_canonical_bytes_distinguish_distinct_payloads() {
+        let a = sample_signed_run_metadata();
+        let mut b = sample_signed_run_metadata();
+        b.exit_code = 1;
+        assert_ne!(a.canonical_bytes(), b.canonical_bytes());
     }
 
     /// `run_agent_completed` must carry its own type tag so a client

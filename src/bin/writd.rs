@@ -105,6 +105,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         secrets: store,
         policy,
         staging_store,
+        // Slice B4 lands the dispatch path; writd boot wiring for the
+        // notes-repo handle, signing-key load, and run-agent spawn
+        // command arrives in the follow-up slice that also adds the
+        // audit row. Until then the daemon serves RunAgent with an
+        // explicit "not configured" reply.
+        notes_repo: None,
+        signing_key: None,
+        run_agent_spawn: None,
     });
 
     tracing::info!(
