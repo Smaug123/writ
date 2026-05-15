@@ -499,7 +499,16 @@ fn extensions_object_format(text: &str) -> Option<String> {
 /// fail this check — at which point the operator's recourse is "use
 /// the standard layout `git init --bare` writes." That's a fair
 /// constraint for v1 since writ is the only writer here.
+///
+/// Git resolves duplicate assignments by taking the *last* value
+/// seen for a key — `bare = true` followed by `bare = false` is
+/// effectively `bare = false`, even though the first match said
+/// otherwise. Mirror that here by scanning every `bare` line in a
+/// `[core]` section and reporting the final assignment, so a
+/// hand-crafted config can't slip a non-bare repo past validation
+/// by stacking a true atop a later false.
 fn config_says_bare_true(text: &str) -> bool {
+    let mut effective = false;
     let mut in_core = false;
     for raw_line in text.lines() {
         let line = raw_line.split('#').next().unwrap_or("").trim();
@@ -513,14 +522,17 @@ fn config_says_bare_true(text: &str) -> bool {
         if !in_core {
             continue;
         }
-        if let Some(value) = line.split_once('=').map(|(k, v)| (k.trim(), v.trim())) {
-            let (key, val) = value;
-            if key.eq_ignore_ascii_case("bare") && val.eq_ignore_ascii_case("true") {
-                return true;
-            }
+        if let Some((key, val)) = line.split_once('=').map(|(k, v)| (k.trim(), v.trim()))
+            && key.eq_ignore_ascii_case("bare")
+        {
+            // Anything that isn't recognisably `true` resets the
+            // effective value to false: git's `--bool` parser is
+            // strict, and "didn't parse as true" is exactly the
+            // outcome we want a non-bare repo to produce.
+            effective = val.eq_ignore_ascii_case("true");
         }
     }
-    false
+    effective
 }
 
 /// Outcome of one local `git` invocation: exit status plus any
@@ -1324,6 +1336,82 @@ mod tests {
     fn config_parser_ignores_commented_lines() {
         let commented = "[core]\n# bare = true\n";
         assert!(!config_says_bare_true(commented));
+    }
+
+    /// Git's "last value wins" rule: `bare = true` followed by
+    /// `bare = false` in the same `[core]` section makes the
+    /// effective value false. A first-match parser would have
+    /// accepted such a config and let writ operate against a
+    /// non-bare repo — the exact scenario the bare-only guard
+    /// exists to prevent.
+    #[test]
+    fn config_parser_uses_last_bare_assignment_within_core() {
+        let trailing_false = "[core]\nbare = true\nbare = false\n";
+        assert!(
+            !config_says_bare_true(trailing_false),
+            "trailing bare = false must override an earlier bare = true"
+        );
+        let trailing_true = "[core]\nbare = false\nbare = true\n";
+        assert!(
+            config_says_bare_true(trailing_true),
+            "trailing bare = true must override an earlier bare = false"
+        );
+    }
+
+    /// Last-wins across a re-entry into `[core]`: an unrelated
+    /// section in the middle does not freeze the earlier value.
+    #[test]
+    fn config_parser_uses_last_bare_assignment_across_reentries() {
+        let text = "[core]\nbare = true\n[remote \"x\"]\nbare = true\n[core]\nbare = false\n";
+        assert!(
+            !config_says_bare_true(text),
+            "later [core] override must win, [remote] in between must not affect it"
+        );
+    }
+
+    /// A non-boolean value (e.g. `bare = yes`) cannot represent a
+    /// bare repo. Git itself rejects such configs under `--bool`;
+    /// treat them as not-bare so the directory is refused.
+    #[test]
+    fn config_parser_rejects_non_boolean_bare_values() {
+        let text = "[core]\nbare = yes\n";
+        assert!(!config_says_bare_true(text));
+    }
+
+    /// And specifically: a trailing non-boolean must override an
+    /// earlier `bare = true`. Otherwise an attacker could "lock in"
+    /// a true value by following it with junk.
+    #[test]
+    fn config_parser_non_boolean_value_overrides_prior_true() {
+        let text = "[core]\nbare = true\nbare = NotABool\n";
+        assert!(!config_says_bare_true(text));
+    }
+
+    /// `BailiffRepo::open` must consult the *effective* `core.bare`
+    /// value, not just the first match. With a `bare = true`
+    /// shadowed by a later `bare = false`, the directory is not
+    /// bare and writ must refuse to touch it.
+    #[tokio::test]
+    async fn open_rejects_config_with_trailing_bare_false_after_true() {
+        let dir = TempDir::new().unwrap();
+        let repo_path = dir.path().join("shadowed");
+        std::fs::create_dir(&repo_path).unwrap();
+        std::fs::write(repo_path.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::write(
+            repo_path.join("config"),
+            "[core]\n\trepositoryformatversion = 0\n\tbare = true\n\tbare = false\n",
+        )
+        .unwrap();
+        let err = BailiffRepo::open(&repo_path).await.unwrap_err();
+        match err {
+            BailiffRepoError::NotABareRepo { reason, .. } => {
+                assert!(
+                    reason.contains("bare"),
+                    "reason should mention bare-ness, got: {reason}"
+                );
+            }
+            other => panic!("expected NotABareRepo, got {other:?}"),
+        }
     }
 
     /// SHA-1 (default) repos have no `extensions.objectformat`
