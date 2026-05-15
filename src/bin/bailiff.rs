@@ -4,8 +4,9 @@
 //!
 //! Slice C3 introduces the first operator-facing verb,
 //! `bailiff plan submit`: open a writ session, run the planner agent,
-//! verify writ's signed envelope, and persist a [`PlanNote`] in
-//! bailiff's own bare repo. The workflow itself lives in
+//! verify writ's signed envelope, and persist a
+//! [`writ::bailiff_plan_note::PlanNote`] in bailiff's own bare repo.
+//! The workflow itself lives in
 //! [`writ::bailiff_plan_submit::submit_plan`]; this binary is the
 //! thin CLI layer that resolves paths, parses flags, and prints the
 //! plan id on success.

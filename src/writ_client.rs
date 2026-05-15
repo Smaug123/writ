@@ -104,6 +104,19 @@ pub enum WritClientError {
     /// message is whatever writ put in [`ServerMessage::Error`].
     #[error("writ refused the request: {message}")]
     WritError { message: String },
+    /// Writ rejected the request because the caller-supplied
+    /// `session_id` doesn't correspond to any session writ knows about.
+    /// Distinct from [`Self::WritError`] so callers can drive retries
+    /// (e.g. reopen the session) off the variant instead of parsing
+    /// prose.
+    #[error("writ does not know session {session_id}")]
+    UnknownSession { session_id: SessionId },
+    /// Writ rejected the request because the caller-supplied
+    /// `session_id` refers to a session that's already closed. The
+    /// caller almost certainly raced an earlier close; surface the id
+    /// so the cleanup path can react without parsing prose.
+    #[error("writ session {session_id} is already closed")]
+    ClosedSession { session_id: SessionId },
     /// Writ returned a structured reply that isn't a legal answer to
     /// `RunAgent`. The only legal answer is
     /// [`ServerMessage::RunAgentCompleted`] (success) or
@@ -170,6 +183,12 @@ impl WritClient {
                 signature,
             }),
             ServerMessage::Error { message } => Err(WritClientError::WritError { message }),
+            ServerMessage::UnknownSession { session_id } => {
+                Err(WritClientError::UnknownSession { session_id })
+            }
+            ServerMessage::ClosedSession { session_id } => {
+                Err(WritClientError::ClosedSession { session_id })
+            }
             other => Err(WritClientError::UnexpectedMessage {
                 summary: format!("{other:?}"),
             }),
@@ -509,6 +528,41 @@ mod tests {
             matches!(err, WritClientError::UnexpectedMessage { .. }),
             "expected UnexpectedMessage, got {err:?}"
         );
+    }
+
+    /// `UnknownSession` is a typed failure mode, not a protocol bug:
+    /// the broker speaks it when a caller-supplied `session_id` doesn't
+    /// match any audit row. The client surfaces the id so cleanup can
+    /// dispatch on the variant rather than parse prose.
+    #[tokio::test]
+    async fn run_agent_surfaces_unknown_session_reply() {
+        let stale = sample_session_id();
+        let broker = StubBroker::start(ServerMessage::UnknownSession { session_id: stale }).await;
+        let client = WritClient::new(&broker.socket_path);
+        let mut req = sample_request();
+        req.session_id = Some(stale);
+        let err = client.run_agent(req).await.unwrap_err();
+        match err {
+            WritClientError::UnknownSession { session_id } => assert_eq!(session_id, stale),
+            other => panic!("expected UnknownSession, got {other:?}"),
+        }
+    }
+
+    /// `ClosedSession` is the racier sibling of `UnknownSession`: a
+    /// session that existed at one point but has already been closed.
+    /// Same routing — distinct typed variant, id round-trips.
+    #[tokio::test]
+    async fn run_agent_surfaces_closed_session_reply() {
+        let stale = sample_session_id();
+        let broker = StubBroker::start(ServerMessage::ClosedSession { session_id: stale }).await;
+        let client = WritClient::new(&broker.socket_path);
+        let mut req = sample_request();
+        req.session_id = Some(stale);
+        let err = client.run_agent(req).await.unwrap_err();
+        match err {
+            WritClientError::ClosedSession { session_id } => assert_eq!(session_id, stale),
+            other => panic!("expected ClosedSession, got {other:?}"),
+        }
     }
 
     /// `open_session` returns the broker-minted id and frames an
