@@ -28,7 +28,7 @@ const SIGNATURE_END_MARKER: &str = "-----END SSH SIGNATURE-----";
 /// at v1; only the `SHA256:` prefix and "non-empty, no whitespace, no
 /// NUL" rules are enforced. Bailiff's keyring resolution is what
 /// turns the fingerprint into a public key for verification.
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct SshKeyFingerprint(String);
 
 impl SshKeyFingerprint {

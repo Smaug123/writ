@@ -254,6 +254,54 @@ impl NotesRepo {
         Ok(target_oid)
     }
 
+    /// Fetch one or more refs from a peer bare repo at `source` into
+    /// this repo. `refspecs` follow git's `<src>:<dst>` syntax (with
+    /// optional leading `+` for force); each one specifies a ref pair
+    /// to mirror locally. The peer is referenced by filesystem path —
+    /// git also accepts local paths as URLs — and never persisted
+    /// as a named remote, keeping the operation stateless.
+    ///
+    /// This is the bailiff side of the writ→bailiff handoff. Bailiff
+    /// fetches writ's `refs/notes/writ/v1/*` namespace into its own
+    /// repo under the same names; once present, the notes are
+    /// readable via [`Self::read_note`] under the same target OID
+    /// that writ wrote against.
+    ///
+    /// Holds the process-wide per-repo notes-write mutex across the
+    /// fetch. Git's index / refs / objects writes are not safe under
+    /// concurrent fetch+notes-add into the same destination, and the
+    /// mutex serialises every mutation through the one writer.
+    ///
+    /// `--no-tags` is unconditional: writ doesn't publish tags, and
+    /// fetching them would pollute bailiff's namespace with whatever
+    /// happens to be lying around in writ's repo.
+    pub fn fetch_from_remote(
+        &self,
+        source: impl AsRef<Path>,
+        refspecs: &[&str],
+    ) -> Result<(), NotesRepoError> {
+        let source = source.as_ref();
+        if refspecs.is_empty() {
+            return Err(NotesRepoError::EmptyRefspecs);
+        }
+        let source_str = source
+            .to_str()
+            .ok_or_else(|| NotesRepoError::SourcePathNonUtf8 {
+                path: source.to_path_buf(),
+            })?;
+        let _guard = lock_notes_write(&self.canonical_path);
+        let mut args: Vec<&str> = vec!["fetch", "--no-tags", source_str];
+        args.extend(refspecs.iter().copied());
+        run_git(
+            &self.canonical_path,
+            args.into_iter(),
+            None,
+            CaptureOutput::Discard,
+            &self.inherited_env,
+        )?;
+        Ok(())
+    }
+
     /// Read the body of the note attached to `target_oid` under
     /// `notes_ref`. Errors if no note is attached at that target.
     /// Does not take the notes-write mutex: reads never collide with
@@ -593,6 +641,10 @@ pub enum NotesRepoError {
     },
     #[error("note body must be non-empty")]
     EmptyBody,
+    #[error("fetch refspec list must be non-empty")]
+    EmptyRefspecs,
+    #[error("fetch source path {path:?} is not valid UTF-8")]
+    SourcePathNonUtf8 { path: PathBuf },
     #[error("git command could not be spawned: {source}")]
     GitSpawn { source: std::io::Error },
     #[error("git command stdin write failed: {source}")]
@@ -895,6 +947,154 @@ mod tests {
         );
         assert_eq!(fs::read(git_dir.join("HEAD")).unwrap(), head_before);
         assert_eq!(fs::read(git_dir.join("config")).unwrap(), config_before);
+    }
+
+    #[test]
+    fn fetch_from_remote_copies_notes_between_repos() {
+        // The writ→bailiff handoff: writ writes a note in its bare
+        // repo, bailiff fetches the notes ref from writ's repo, and
+        // the resulting target OID is readable on bailiff's side
+        // under the same notes ref. The fetched body must be
+        // byte-identical to the source body.
+        let tmp = TempDir::new().unwrap();
+        let source_repo = NotesRepo::init_or_open(tmp.path().join("writ-bare")).unwrap();
+        let dest_repo = NotesRepo::init_or_open(tmp.path().join("bailiff-bare")).unwrap();
+        let nref = notes_ref();
+        let body = b"signed envelope bytes";
+        let target = source_repo.write_note(&nref, b"run-id", body).unwrap();
+
+        dest_repo
+            .fetch_from_remote(
+                source_repo.path(),
+                &["+refs/notes/writ/v1/*:refs/notes/writ/v1/*"],
+            )
+            .unwrap();
+
+        let read_back = dest_repo.read_note(&nref, &target).unwrap();
+        assert_eq!(read_back, body);
+    }
+
+    #[test]
+    fn fetch_from_remote_round_trips_binary_body() {
+        let tmp = TempDir::new().unwrap();
+        let source_repo = NotesRepo::init_or_open(tmp.path().join("writ-bare")).unwrap();
+        let dest_repo = NotesRepo::init_or_open(tmp.path().join("bailiff-bare")).unwrap();
+        let nref = notes_ref();
+        let body: Vec<u8> = (0u8..=255).collect();
+        let target = source_repo.write_note(&nref, b"run-id", &body).unwrap();
+
+        dest_repo
+            .fetch_from_remote(
+                source_repo.path(),
+                &["+refs/notes/writ/v1/*:refs/notes/writ/v1/*"],
+            )
+            .unwrap();
+
+        assert_eq!(dest_repo.read_note(&nref, &target).unwrap(), body);
+    }
+
+    #[test]
+    fn fetch_from_remote_is_idempotent_under_repeated_calls() {
+        // A second fetch with the same refspec is a no-op because
+        // the dest refs are already current. The force flag (`+`)
+        // makes the operation safe to repeat even if the source
+        // moves; here we just confirm the second call doesn't error.
+        let tmp = TempDir::new().unwrap();
+        let source_repo = NotesRepo::init_or_open(tmp.path().join("writ-bare")).unwrap();
+        let dest_repo = NotesRepo::init_or_open(tmp.path().join("bailiff-bare")).unwrap();
+        let nref = notes_ref();
+        let body = b"envelope";
+        let target = source_repo.write_note(&nref, b"seed", body).unwrap();
+        let refspecs = &["+refs/notes/writ/v1/*:refs/notes/writ/v1/*"];
+        dest_repo
+            .fetch_from_remote(source_repo.path(), refspecs)
+            .unwrap();
+        dest_repo
+            .fetch_from_remote(source_repo.path(), refspecs)
+            .unwrap();
+        assert_eq!(dest_repo.read_note(&nref, &target).unwrap(), body);
+    }
+
+    #[test]
+    fn fetch_from_remote_picks_up_new_notes_on_subsequent_call() {
+        // Fetching only mirrors what's in the source at the time of
+        // the call; a later writ-side write must surface on bailiff's
+        // side after another fetch. This is the load-bearing
+        // operational property: bailiff polls writ.
+        let tmp = TempDir::new().unwrap();
+        let source_repo = NotesRepo::init_or_open(tmp.path().join("writ-bare")).unwrap();
+        let dest_repo = NotesRepo::init_or_open(tmp.path().join("bailiff-bare")).unwrap();
+        let nref = notes_ref();
+        let refspecs = &["+refs/notes/writ/v1/*:refs/notes/writ/v1/*"];
+
+        let first = source_repo
+            .write_note(&nref, b"run-1", b"first envelope")
+            .unwrap();
+        dest_repo
+            .fetch_from_remote(source_repo.path(), refspecs)
+            .unwrap();
+        assert_eq!(
+            dest_repo.read_note(&nref, &first).unwrap(),
+            b"first envelope"
+        );
+
+        let second = source_repo
+            .write_note(&nref, b"run-2", b"second envelope")
+            .unwrap();
+        // The second note is not yet on bailiff's side.
+        assert!(dest_repo.read_note(&nref, &second).is_err());
+        dest_repo
+            .fetch_from_remote(source_repo.path(), refspecs)
+            .unwrap();
+        assert_eq!(
+            dest_repo.read_note(&nref, &second).unwrap(),
+            b"second envelope"
+        );
+    }
+
+    #[test]
+    fn fetch_from_remote_errors_on_missing_source() {
+        // Pointing at a nonexistent path must surface as a GitFailed
+        // error, not a panic or silent success. This is the
+        // operator-misconfiguration case (wrong path in bailiff
+        // config) and it must be loud.
+        let tmp = TempDir::new().unwrap();
+        let dest_repo = NotesRepo::init_or_open(tmp.path().join("bailiff-bare")).unwrap();
+        let bogus = tmp.path().join("does-not-exist");
+        let err = dest_repo
+            .fetch_from_remote(&bogus, &["+refs/notes/*:refs/notes/*"])
+            .unwrap_err();
+        assert!(
+            matches!(err, NotesRepoError::GitFailed { .. }),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn fetch_from_remote_rejects_empty_refspecs() {
+        let tmp = TempDir::new().unwrap();
+        let source_repo = NotesRepo::init_or_open(tmp.path().join("writ-bare")).unwrap();
+        let dest_repo = NotesRepo::init_or_open(tmp.path().join("bailiff-bare")).unwrap();
+        let err = dest_repo
+            .fetch_from_remote(source_repo.path(), &[])
+            .unwrap_err();
+        assert!(matches!(err, NotesRepoError::EmptyRefspecs), "got: {err:?}");
+    }
+
+    #[test]
+    fn fetch_from_remote_with_no_matching_refs_succeeds() {
+        // The source repo is empty (no notes refs at all). A glob
+        // refspec produces no matches but git still treats that as
+        // success — we just want a green return, not a typed error.
+        let tmp = TempDir::new().unwrap();
+        let source_repo = NotesRepo::init_or_open(tmp.path().join("writ-bare")).unwrap();
+        let dest_repo = NotesRepo::init_or_open(tmp.path().join("bailiff-bare")).unwrap();
+        dest_repo
+            .fetch_from_remote(
+                source_repo.path(),
+                &["+refs/notes/writ/v1/*:refs/notes/writ/v1/*"],
+            )
+            .unwrap();
     }
 
     #[test]
