@@ -866,7 +866,7 @@ mod end_to_end_tests {
         // byte raw, but the prompt validator counts raw bytes; the
         // margin protects against any future tightening of the
         // ceiling). Every byte is `\u{0001}`, which serde_json
-        // escapes as 6-character `` — exactly the 6:1
+        // escapes as the 6-character literal \u0001 — exactly the 6:1
         // worst-case expansion the cap is sized for.
         let big = "\u{0001}".repeat(crate::agent_run::MAX_AGENT_PROMPT_BYTES - 4096);
         let prompt = AgentPrompt::new(&big);
