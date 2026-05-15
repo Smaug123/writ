@@ -35,13 +35,25 @@
 //! concurrent invocation on the same ref — colliding writes silently
 //! lose notes — and serialising at the only writer keeps that
 //! property load-bearing instead of relying on operator discipline.
+//!
+//! Host-config isolation: every child `git` runs under `env_clear`
+//! plus the `clean_git` config recipe (`HOME=/dev/null`,
+//! `GIT_CONFIG_GLOBAL=/dev/null`, `GIT_CONFIG_NOSYSTEM=1`,
+//! `GIT_CONFIG_COUNT=0`), so neither an inherited `GIT_DIR` /
+//! `GIT_DEFAULT_HASH` nor a host-wide `safe.bareRepository` /
+//! `init.defaultObjectFormat` setting can subvert bailiff's repo.
+//! We then point git at the repo via `--git-dir=<canonical_path>`
+//! instead of bare-repo discovery, which a hardened host can
+//! disable. See the `prepare_git_command` helper.
 
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
+use crate::clean_git::CLEAN_GIT_CONFIG_ENV;
 use crate::core::NotesRef;
 use crate::vm_git::{GitObjectId, GitObjectIdError};
 
@@ -170,9 +182,22 @@ impl BailiffRepo {
         // `-C <existing_blob_oid>` reuses the object verbatim and is
         // the documented escape hatch.
         let body_oid = hash_object_stdin(&self.canonical_path, body)?;
+        // `notes add` creates a commit on the notes ref, so it
+        // needs an author identity. The `clean_git` env recipe
+        // we run under (HOME=/dev/null, GIT_CONFIG_GLOBAL=/dev/null,
+        // GIT_CONFIG_NOSYSTEM=1) deliberately denies git access to
+        // every config source except the repo's local file, so we
+        // inject the identity via `-c` flags rather than rely on
+        // operator gitconfig. The values are placeholders — the
+        // commit author is not part of bailiff's audit trail; the
+        // signed envelope inside the note body is.
         run_git(
             &self.canonical_path,
             [
+                "-c",
+                "user.name=bailiff",
+                "-c",
+                "user.email=bailiff@localhost",
                 "notes",
                 &format!("--ref={}", notes_ref.as_str()),
                 "add",
@@ -270,31 +295,41 @@ enum CaptureOutput {
     Capture,
 }
 
-/// Repo-selection environment variables that override `-C <path>` if
-/// inherited from the parent process. A `GIT_DIR=/elsewhere` in our
-/// parent would silently redirect every git call to `/elsewhere`,
-/// regardless of which `BailiffRepo` handle we hold — so every child
-/// command must scrub them.
-const GIT_REPO_ENV_VARS: &[&str] = &[
-    "GIT_DIR",
-    "GIT_WORK_TREE",
-    "GIT_INDEX_FILE",
-    "GIT_OBJECT_DIRECTORY",
-    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-    "GIT_COMMON_DIR",
-    "GIT_NAMESPACE",
-    "GIT_CEILING_DIRECTORIES",
-    "GIT_DISCOVERY_ACROSS_FILESYSTEM",
-];
-
-fn scrub_git_env(command: &mut Command) {
-    for var in GIT_REPO_ENV_VARS {
-        command.env_remove(var);
+/// Build a `Command` that runs `git` against `repo` with all host
+/// configuration neutralised.
+///
+/// `env_clear` strips every inherited env var — `GIT_DIR`,
+/// `GIT_WORK_TREE`, `GIT_OBJECT_DIRECTORY`, `GIT_DEFAULT_HASH`,
+/// `GIT_CONFIG_GLOBAL`, etc. — so a hostile or just unusual parent
+/// can never redirect or reconfigure the child. We then re-add the
+/// `clean_git` hardening recipe (`HOME=/dev/null`,
+/// `GIT_CONFIG_NOSYSTEM=1`, `GIT_CONFIG_GLOBAL=/dev/null`,
+/// `GIT_CONFIG_COUNT=0`) plus `PATH` so the git binary itself
+/// remains discoverable.
+///
+/// `--git-dir=<repo>` is load-bearing alongside the env scrub:
+/// implicit `-C <bare-repo>` discovery fails on hosts hardened
+/// with `safe.bareRepository=explicit`, so we point git at the
+/// repo by absolute path and never rely on directory walking.
+/// This also makes `git init` write to exactly `<repo>` regardless
+/// of how the operator's defaults would otherwise steer it.
+fn prepare_git_command(repo: &Path) -> Command {
+    let mut command = Command::new("git");
+    command.env_clear();
+    if let Some(path) = std::env::var_os("PATH") {
+        command.env("PATH", path);
     }
+    for (key, value) in CLEAN_GIT_CONFIG_ENV {
+        command.env(key, value);
+    }
+    let mut git_dir_arg = OsString::from("--git-dir=");
+    git_dir_arg.push(repo);
+    command.arg(git_dir_arg);
+    command
 }
 
 fn run_git<'a, I>(
-    cwd: &Path,
+    repo: &Path,
     args: I,
     stdin_input: Option<&[u8]>,
     capture: CaptureOutput,
@@ -303,9 +338,7 @@ where
     I: IntoIterator<Item = &'a str>,
 {
     let args: Vec<&str> = args.into_iter().collect();
-    let mut command = Command::new("git");
-    scrub_git_env(&mut command);
-    command.arg("-C").arg(cwd);
+    let mut command = prepare_git_command(repo);
     command.args(&args);
     command.stdin(if stdin_input.is_some() {
         Stdio::piped()
@@ -386,9 +419,8 @@ fn run_git_config<'a>(
     repo: &Path,
     config_args: impl IntoIterator<Item = &'a str>,
 ) -> Result<Option<String>, BailiffRepoError> {
-    let mut command = Command::new("git");
-    scrub_git_env(&mut command);
-    command.arg("-C").arg(repo).arg("config");
+    let mut command = prepare_git_command(repo);
+    command.arg("config");
     for arg in config_args {
         command.arg(arg);
     }
@@ -910,6 +942,33 @@ mod tests {
             std::env::remove_var("GIT_CONFIG_GLOBAL");
         }
         result.expect("init_or_open must force sha1 regardless of global default");
+    }
+
+    #[test]
+    fn operations_survive_global_safe_bare_repository_explicit() {
+        // Hosts that harden Git with `safe.bareRepository = explicit`
+        // make implicit `-C <bare-repo>` discovery fail with
+        // "cannot use bare repository". The hardened env recipe
+        // (env_clear + GIT_CONFIG_GLOBAL=/dev/null) prevents the
+        // setting from reaching the child, and `--git-dir=<repo>`
+        // sidesteps discovery entirely. Together they keep every
+        // op working on a hardened host.
+        let tmp = TempDir::new().unwrap();
+        let repo = BailiffRepo::init_or_open(tmp.path().join("r")).unwrap();
+        let global_cfg = tmp.path().join("globalcfg");
+        fs::write(&global_cfg, "[safe]\n\tbareRepository = explicit\n").unwrap();
+        let _env_guard = ENV_TEST_MUTEX.lock().unwrap();
+        unsafe {
+            std::env::set_var("GIT_CONFIG_GLOBAL", &global_cfg);
+        }
+        let open_result = BailiffRepo::open(repo.path());
+        let write_result = repo.write_note(&notes_ref(), b"seed", b"body");
+        unsafe {
+            std::env::remove_var("GIT_CONFIG_GLOBAL");
+        }
+        open_result.expect("open must survive safe.bareRepository=explicit");
+        let target = write_result.expect("write_note must survive same");
+        assert_eq!(repo.read_note(&notes_ref(), &target).unwrap(), b"body");
     }
 
     #[test]
