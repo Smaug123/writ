@@ -41,7 +41,7 @@ use crate::protocol::{
     RejectionReason, ServerMessage, SignedRunMetadata, StagedPushAuditView, StagedPushDetail,
     StagedPushSummary,
 };
-use crate::run_envelope::SignedRunEnvelope;
+use crate::run_envelope::{OutputEnvelope, SignedRunEnvelope};
 use crate::secret::SecretStore;
 use crate::signing::WritSigningKey;
 
@@ -867,6 +867,57 @@ fn staging_not_configured() -> ServerMessage {
     }
 }
 
+/// Per-stream byte cap for stdout/stderr capture in [`run_agent`].
+///
+/// A signed envelope embeds the captured bytes, so an agent that
+/// emits unbounded output would otherwise let one `RunAgent` call
+/// exhaust writd's memory (the JSON+base64 wrapper makes a second
+/// in-memory copy on top of the captured buffer). Capping at 4 MiB
+/// keeps the per-call footprint bounded; the `truncated_at` marker on
+/// `OutputEnvelope` records the cap so verifiers know the capture is
+/// a prefix rather than the whole stream.
+const MAX_RUN_AGENT_STREAM_BYTES: usize = 4 * 1024 * 1024;
+
+/// Read `reader` to EOF, retaining at most `cap` bytes. After the cap
+/// is hit, further bytes are drained and discarded so the child does
+/// not block writing to a full pipe. The returned `truncated_at` is
+/// `Some(cap)` iff any bytes were dropped — `None` means the entire
+/// stream fit. The cap is byte-aligned to whatever the underlying read
+/// returned; we do not bisect a single read across the boundary.
+async fn capture_stream_capped<R>(
+    mut reader: R,
+    cap: usize,
+) -> std::io::Result<(Vec<u8>, Option<u64>)>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+    let mut buf: Vec<u8> = Vec::new();
+    let mut tmp = vec![0u8; 16 * 1024];
+    let mut truncated_at: Option<u64> = None;
+    loop {
+        let n = reader.read(&mut tmp).await?;
+        if n == 0 {
+            return Ok((buf, truncated_at));
+        }
+        if truncated_at.is_some() {
+            // Past the cap: drain to keep the child unblocked.
+            continue;
+        }
+        let room = cap.saturating_sub(buf.len());
+        if room == 0 {
+            // We previously filled exactly to the cap. Receiving more
+            // bytes proves the stream extended past it.
+            truncated_at = Some(cap as u64);
+        } else if n <= room {
+            buf.extend_from_slice(&tmp[..n]);
+        } else {
+            buf.extend_from_slice(&tmp[..room]);
+            truncated_at = Some(cap as u64);
+        }
+    }
+}
+
 fn run_agent_not_configured(component: &str) -> ServerMessage {
     ServerMessage::Error {
         message: format!(
@@ -920,7 +971,7 @@ async fn run_agent<S: SecretStore + Send + Sync + 'static>(
         .args(&spawn_config.args)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null());
+        .stderr(std::process::Stdio::piped());
     let mut child = match crate::process_spawn::spawn_async(&mut command).await {
         Ok(c) => c,
         Err(err) => {
@@ -934,9 +985,9 @@ async fn run_agent<S: SecretStore + Send + Sync + 'static>(
     };
 
     // Feed the prompt to the child on a background task so the
-    // wait-with-output below isn't deadlocked when the child reads
-    // more than the pipe buffer holds. Drop the writer half on EOF so
-    // the child sees stdin close.
+    // reader tasks below aren't deadlocked when the child reads more
+    // than the pipe buffer holds. Drop the writer half on EOF so the
+    // child sees stdin close.
     let mut stdin = child
         .stdin
         .take()
@@ -952,14 +1003,35 @@ async fn run_agent<S: SecretStore + Send + Sync + 'static>(
         res
     });
 
-    let output = match child.wait_with_output().await {
-        Ok(o) => o,
+    // Read stdout and stderr concurrently on their own tasks: a child
+    // that fills either pipe buffer would otherwise block on write,
+    // and `child.wait()` would never return. Each reader caps its
+    // retained buffer at MAX_RUN_AGENT_STREAM_BYTES and drains past
+    // that — bounding writd's memory footprint per call.
+    let stdout_pipe = child
+        .stdout
+        .take()
+        .expect("child stdout was requested via Stdio::piped");
+    let stderr_pipe = child
+        .stderr
+        .take()
+        .expect("child stderr was requested via Stdio::piped");
+    let stdout_task = tokio::spawn(async move {
+        capture_stream_capped(stdout_pipe, MAX_RUN_AGENT_STREAM_BYTES).await
+    });
+    let stderr_task = tokio::spawn(async move {
+        capture_stream_capped(stderr_pipe, MAX_RUN_AGENT_STREAM_BYTES).await
+    });
+
+    let status = match child.wait().await {
+        Ok(s) => s,
         Err(err) => {
-            // The writer task is still alive in the failure case; await
-            // it so the prompt bytes don't outlive the surrounding
-            // borrow. The result is uninteresting once wait_with_output
-            // failed.
+            // The reader/writer tasks are still alive; await them so
+            // the captured buffers don't outlive the borrow. Their
+            // results are uninteresting once wait failed.
             let _ = writer.await;
+            let _ = stdout_task.await;
+            let _ = stderr_task.await;
             return ServerMessage::Error {
                 message: format!("RunAgent: wait for child failed: {err}"),
             };
@@ -970,13 +1042,50 @@ async fn run_agent<S: SecretStore + Send + Sync + 'static>(
     // Drain it so the task doesn't leak; treat any error as informational.
     let _ = writer.await;
 
+    let (stdout_bytes, stdout_truncated_at) = match stdout_task.await {
+        Ok(Ok(v)) => v,
+        Ok(Err(err)) => {
+            return ServerMessage::Error {
+                message: format!("RunAgent: read stdout: {err}"),
+            };
+        }
+        Err(err) => {
+            return ServerMessage::Error {
+                message: format!("RunAgent: stdout reader task failed: {err}"),
+            };
+        }
+    };
+    let (stderr_bytes, stderr_truncated_at) = match stderr_task.await {
+        Ok(Ok(v)) => v,
+        Ok(Err(err)) => {
+            return ServerMessage::Error {
+                message: format!("RunAgent: read stderr: {err}"),
+            };
+        }
+        Err(err) => {
+            return ServerMessage::Error {
+                message: format!("RunAgent: stderr reader task failed: {err}"),
+            };
+        }
+    };
+
     // Signal termination: surface as a typed negative so the audit
     // row (when it lands) records "killed by signal" distinguishably
     // from an explicit non-zero exit. -1 is the placeholder pending
     // the audit-row slice that will refine this.
-    let exit_code = output.status.code().unwrap_or(-1);
-    let stdout = output.stdout;
-    let output_envelope_sha256_str = sha256_hex(&stdout);
+    let exit_code = status.code().unwrap_or(-1);
+
+    let output_envelope = OutputEnvelope {
+        stdout: stdout_bytes,
+        stderr: stderr_bytes,
+        stdout_truncated_at,
+        stderr_truncated_at,
+    };
+    // The hash binds the canonical envelope bytes — not raw stdout —
+    // so a verifier that re-encodes the envelope from its parsed form
+    // can re-derive `output_envelope_sha256` deterministically.
+    let output_envelope_bytes = output_envelope.to_bytes();
+    let output_envelope_sha256_str = sha256_hex(&output_envelope_bytes);
 
     let prompt_sha256 = Sha256Hex::try_new(prompt_sha256_str)
         .expect("sha256_hex returns canonical 64-lowercase-hex output");
@@ -1010,7 +1119,7 @@ async fn run_agent<S: SecretStore + Send + Sync + 'static>(
     let envelope = SignedRunEnvelope {
         metadata: metadata.clone(),
         signature: signature.clone(),
-        output: stdout,
+        output: output_envelope_bytes,
     };
     let envelope_bytes = envelope.to_bytes();
     // Seed the note's target OID with the run id bytes so each run gets
@@ -1723,7 +1832,7 @@ mod tests {
     /// re-derives every signed quantity from the envelope.
     #[tokio::test]
     async fn run_agent_round_trip_signs_and_writes_note() {
-        use crate::run_envelope::SignedRunEnvelope;
+        use crate::run_envelope::{OutputEnvelope, SignedRunEnvelope};
         use crate::signing::WritSigningKey;
 
         const SIGNING_PEM: &str = include_str!("../tests/fixtures/ed25519_test_signing.key");
@@ -1802,24 +1911,19 @@ mod tests {
         // 1. Signed metadata uses the keyring we configured.
         assert_eq!(signed_metadata.signing_key_fingerprint, fingerprint);
         assert_eq!(signed_metadata.exit_code, 0);
-        // `cat` echoes input verbatim, so prompt and output hash collide.
-        assert_eq!(
-            signed_metadata.prompt_sha256.as_str(),
-            signed_metadata.output_envelope_sha256.as_str(),
-        );
-        let expected_hash = crate::agent_run::sha256_hex(prompt_text.as_bytes());
-        assert_eq!(signed_metadata.prompt_sha256.as_str(), expected_hash);
+        let expected_prompt_hash = crate::agent_run::sha256_hex(prompt_text.as_bytes());
+        assert_eq!(signed_metadata.prompt_sha256.as_str(), expected_prompt_hash);
 
         // 2. Detached signature verifies against the canonical bytes.
         verifying_key
             .verify(&signed_metadata.canonical_bytes(), &signature)
             .expect("signature must verify against canonical metadata");
 
-        // 3. Note body decodes to an envelope whose pieces match the
-        // response. The note's target OID is the seed-blob OID
-        // dispatch returned; reading the note back proves both that
-        // the envelope round-trips byte-exact and that the verifier
-        // can find the artefact from just the OID + ref name.
+        // 3. Note body decodes to a `SignedRunEnvelope` whose pieces
+        // match the response. The note's target OID is the seed-blob
+        // OID dispatch returned; reading the note back proves both
+        // that the envelope round-trips byte-exact and that the
+        // verifier can find the artefact from just the OID + ref name.
         let notes_repo_handle = state.notes_repo.as_ref().unwrap().clone();
         let body = tokio::task::spawn_blocking({
             let output_ref = output_ref.clone();
@@ -1832,7 +1936,6 @@ mod tests {
         let envelope = SignedRunEnvelope::from_bytes(&body).unwrap();
         assert_eq!(envelope.metadata, signed_metadata);
         assert_eq!(envelope.signature, signature);
-        assert_eq!(envelope.output, prompt_text.as_bytes());
         // 4. The envelope's output bytes hash to the value the metadata
         // committed to — i.e. nothing in the storage path silently
         // mangled the binary payload.
@@ -1840,6 +1943,15 @@ mod tests {
             crate::agent_run::sha256_hex(&envelope.output),
             signed_metadata.output_envelope_sha256.as_str(),
         );
+        // 5. Decode the inner `OutputEnvelope` and assert the captured
+        // streams match what the child actually wrote: `cat` echoes
+        // stdin to stdout verbatim and writes nothing to stderr, with
+        // neither stream hitting the 4 MiB cap.
+        let output_envelope = OutputEnvelope::from_bytes(&envelope.output).unwrap();
+        assert_eq!(output_envelope.stdout, prompt_text.as_bytes());
+        assert!(output_envelope.stderr.is_empty());
+        assert_eq!(output_envelope.stdout_truncated_at, None);
+        assert_eq!(output_envelope.stderr_truncated_at, None);
     }
 
     /// A non-zero terminal exit must reach the signed metadata
@@ -1847,9 +1959,10 @@ mod tests {
     /// out crash semantics explicitly ("writ still writes whatever was
     /// captured and signs the partial; the audit row records the
     /// non-zero exit code"). Using `/bin/false` is the smallest
-    /// exercise of that path — no stdout, exit code 1.
+    /// exercise of that path — no stdout, no stderr, exit code 1.
     #[tokio::test]
     async fn run_agent_signs_non_zero_exit() {
+        use crate::run_envelope::OutputEnvelope;
         use crate::signing::WritSigningKey;
 
         const SIGNING_PEM: &str = include_str!("../tests/fixtures/ed25519_test_signing.key");
@@ -1899,11 +2012,191 @@ mod tests {
             other => panic!("expected RunAgentCompleted, got {other:?}"),
         };
         assert_eq!(signed_metadata.exit_code, 1);
-        // `/bin/false` writes nothing — empty-output hash, not zero.
+        // `/bin/false` writes nothing on either stream. The hash binds
+        // the canonical bytes of the *envelope wrapping* those empty
+        // streams, not the empty string — re-derive that here.
+        let empty_envelope = OutputEnvelope {
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            stdout_truncated_at: None,
+            stderr_truncated_at: None,
+        };
         assert_eq!(
             signed_metadata.output_envelope_sha256.as_str(),
-            crate::agent_run::sha256_hex(b""),
+            crate::agent_run::sha256_hex(&empty_envelope.to_bytes()),
         );
+    }
+
+    /// Stderr from the agent must reach the signed envelope verbatim.
+    /// A child whose diagnostics land on stderr (the common case for
+    /// non-zero exits) would otherwise produce a signed note that
+    /// silently elides them — exactly the issue Codex flagged in the
+    /// stderr-discard P2. We drive the path here with a one-liner
+    /// shell that writes a known string to each stream, then decode
+    /// the on-disk envelope and assert both came through.
+    #[tokio::test]
+    async fn run_agent_captures_stderr_in_envelope() {
+        use crate::run_envelope::{OutputEnvelope, SignedRunEnvelope};
+        use crate::signing::WritSigningKey;
+
+        const SIGNING_PEM: &str = include_str!("../tests/fixtures/ed25519_test_signing.key");
+
+        let tmp = tempfile::tempdir().unwrap();
+        let notes_repo = NotesRepo::init_or_open(tmp.path().join("repo")).unwrap();
+        let signing_key = WritSigningKey::from_openssh_pem(SIGNING_PEM).unwrap();
+        let sh = if std::path::Path::new("/bin/sh").exists() {
+            std::path::PathBuf::from("/bin/sh")
+        } else {
+            std::path::PathBuf::from("/usr/bin/sh")
+        };
+
+        let server = MockServer::start().await;
+        let base = Arc::try_unwrap(make_state(&server, vec![], "o"))
+            .unwrap_or_else(|_| panic!("make_state Arc must be uniquely held"));
+        let state = Arc::new(BrokerState {
+            audit: base.audit,
+            minter: base.minter,
+            secrets: base.secrets,
+            policy: base.policy,
+            staging_store: base.staging_store,
+            notes_repo: Some(Arc::new(notes_repo)),
+            signing_key: Some(signing_key),
+            run_agent_spawn: Some(RunAgentSpawnConfig {
+                command: sh,
+                args: vec!["-c".into(), "printf out; printf err 1>&2; exit 0".into()],
+            }),
+        });
+
+        let output_ref =
+            crate::core::NotesRef::try_new("refs/notes/writ/v1/agent-outputs").unwrap();
+        let resp = dispatch_message(
+            ClientMessage::RunAgent {
+                prompt: crate::agent_run::AgentPrompt::new("ignored"),
+                capabilities: Vec::new(),
+                purpose: "stderr-capture".into(),
+                output_ref: output_ref.clone(),
+            },
+            &state,
+        )
+        .await;
+
+        let (output_oid, signed_metadata) = match resp {
+            ServerMessage::RunAgentCompleted {
+                output_oid,
+                signed_metadata,
+                ..
+            } => (output_oid, signed_metadata),
+            other => panic!("expected RunAgentCompleted, got {other:?}"),
+        };
+
+        let notes_repo_handle = state.notes_repo.as_ref().unwrap().clone();
+        let body = tokio::task::spawn_blocking({
+            let output_ref = output_ref.clone();
+            let oid = output_oid.clone();
+            move || notes_repo_handle.read_note(&output_ref, &oid)
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        let envelope = SignedRunEnvelope::from_bytes(&body).unwrap();
+        let output_envelope = OutputEnvelope::from_bytes(&envelope.output).unwrap();
+        assert_eq!(output_envelope.stdout, b"out");
+        assert_eq!(output_envelope.stderr, b"err");
+        assert_eq!(output_envelope.stdout_truncated_at, None);
+        assert_eq!(output_envelope.stderr_truncated_at, None);
+        // The metadata hash must bind the actual envelope bytes — if
+        // stderr were silently dropped before hashing, this assertion
+        // would survive but a verifier re-deriving the digest would
+        // see a mismatch. Re-derive it from the encoded envelope here.
+        assert_eq!(
+            signed_metadata.output_envelope_sha256.as_str(),
+            crate::agent_run::sha256_hex(&envelope.output),
+        );
+    }
+
+    /// Capture beyond the per-stream cap must be silently dropped and
+    /// the `truncated_at` marker must record the cap offset.
+    /// Verifies the bounded-buffer fix end-to-end: a child that emits
+    /// more than the cap allows does not balloon writd's memory, and
+    /// the signed envelope honestly reports the partial capture.
+    #[tokio::test]
+    async fn run_agent_caps_stream_capture_records_truncation() {
+        use crate::run_envelope::{OutputEnvelope, SignedRunEnvelope};
+        use crate::signing::WritSigningKey;
+
+        const SIGNING_PEM: &str = include_str!("../tests/fixtures/ed25519_test_signing.key");
+
+        let tmp = tempfile::tempdir().unwrap();
+        let notes_repo = NotesRepo::init_or_open(tmp.path().join("repo")).unwrap();
+        let signing_key = WritSigningKey::from_openssh_pem(SIGNING_PEM).unwrap();
+        let sh = if std::path::Path::new("/bin/sh").exists() {
+            std::path::PathBuf::from("/bin/sh")
+        } else {
+            std::path::PathBuf::from("/usr/bin/sh")
+        };
+
+        let server = MockServer::start().await;
+        let base = Arc::try_unwrap(make_state(&server, vec![], "o"))
+            .unwrap_or_else(|_| panic!("make_state Arc must be uniquely held"));
+        let state = Arc::new(BrokerState {
+            audit: base.audit,
+            minter: base.minter,
+            secrets: base.secrets,
+            policy: base.policy,
+            staging_store: base.staging_store,
+            notes_repo: Some(Arc::new(notes_repo)),
+            signing_key: Some(signing_key),
+            run_agent_spawn: Some(RunAgentSpawnConfig {
+                command: sh,
+                // Emit MAX_RUN_AGENT_STREAM_BYTES + 1 KiB of stdout so
+                // the cap path runs without depending on shell-builtin
+                // performance for many megabytes of output. dd with a
+                // 1 MiB block size and (cap_mib + 1 / 1024) reps would
+                // be tidier, but `head -c` from /dev/zero is portable
+                // across BSD and GNU userland.
+                args: vec![
+                    "-c".into(),
+                    format!("head -c {} /dev/zero", MAX_RUN_AGENT_STREAM_BYTES + 1024),
+                ],
+            }),
+        });
+
+        let output_ref =
+            crate::core::NotesRef::try_new("refs/notes/writ/v1/agent-outputs").unwrap();
+        let resp = dispatch_message(
+            ClientMessage::RunAgent {
+                prompt: crate::agent_run::AgentPrompt::new("ignored"),
+                capabilities: Vec::new(),
+                purpose: "truncation".into(),
+                output_ref: output_ref.clone(),
+            },
+            &state,
+        )
+        .await;
+
+        let output_oid = match resp {
+            ServerMessage::RunAgentCompleted { output_oid, .. } => output_oid,
+            other => panic!("expected RunAgentCompleted, got {other:?}"),
+        };
+
+        let notes_repo_handle = state.notes_repo.as_ref().unwrap().clone();
+        let body = tokio::task::spawn_blocking({
+            let output_ref = output_ref.clone();
+            let oid = output_oid.clone();
+            move || notes_repo_handle.read_note(&output_ref, &oid)
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        let envelope = SignedRunEnvelope::from_bytes(&body).unwrap();
+        let output_envelope = OutputEnvelope::from_bytes(&envelope.output).unwrap();
+        assert_eq!(output_envelope.stdout.len(), MAX_RUN_AGENT_STREAM_BYTES);
+        assert_eq!(
+            output_envelope.stdout_truncated_at,
+            Some(MAX_RUN_AGENT_STREAM_BYTES as u64),
+        );
+        assert!(output_envelope.stderr.is_empty());
+        assert_eq!(output_envelope.stderr_truncated_at, None);
     }
 
     #[tokio::test]
