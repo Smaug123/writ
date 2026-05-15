@@ -40,10 +40,11 @@
 //! hang would itself be a higher-priority bug than the things that
 //! harness is built to contain.
 
+use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
 
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
@@ -56,10 +57,10 @@ use crate::core::NotesRef;
 ///
 /// Construct via [`BailiffRepo::open`] (validates an existing bare
 /// repo) or [`BailiffRepo::init_or_open`] (creates one on first run
-/// then opens it). Cloning is cheap and all clones share the same
-/// notes write lock — so multiple concurrent `write_note` callers
-/// against the same repo serialize correctly even when they hold
-/// different `BailiffRepo` clones.
+/// then opens it). All handles to the same on-disk repo share the
+/// same notes write lock — so concurrent `write_note` callers
+/// serialize correctly even when they were opened independently
+/// (not just cloned from one another).
 #[derive(Clone, Debug)]
 pub struct BailiffRepo {
     path: PathBuf,
@@ -79,10 +80,48 @@ pub struct BailiffRepo {
     /// note, and the second ref update would silently overwrite
     /// the first — losing notes. An in-process mutex covers the
     /// existence check, `git notes add` invocation, and ref update
-    /// as one critical section. Multi-process writers are not in
-    /// scope: bailiff is a single daemon, and external git tooling
-    /// touching the repo concurrently would be operator error.
+    /// as one critical section.
+    ///
+    /// The lock is shared across every `BailiffRepo` constructed
+    /// for the same absolutised path (see `notes_lock_for`). A
+    /// single per-handle mutex would only have serialised clones
+    /// of one handle, leaving two callers who each `open`ed the
+    /// same repo with independent locks — which is exactly the
+    /// lost-update scenario the lock is supposed to prevent.
+    ///
+    /// Multi-process writers are not in scope: bailiff is a single
+    /// daemon, and external git tooling touching the repo
+    /// concurrently would be operator error.
     notes_write_lock: Arc<tokio::sync::Mutex<()>>,
+}
+
+/// Process-wide registry mapping an absolutised repo path to the
+/// notes write lock for that path. Stored as `Weak` so the entry
+/// dies once the last `BailiffRepo` for that path drops, keeping
+/// the table from accreting forever in tests or long-running
+/// daemons that open many distinct repos.
+static NOTES_WRITE_LOCKS: OnceLock<StdMutex<HashMap<PathBuf, Weak<tokio::sync::Mutex<()>>>>> =
+    OnceLock::new();
+
+/// Look up (or create) the shared notes write lock for `path`. The
+/// std `Mutex` around the registry is only held while we clone an
+/// `Arc` or insert a new entry — no I/O happens under it — so it
+/// never contends with the async `Mutex` that callers actually
+/// take for their critical section.
+fn notes_lock_for(path: &Path) -> Arc<tokio::sync::Mutex<()>> {
+    let registry = NOTES_WRITE_LOCKS.get_or_init(|| StdMutex::new(HashMap::new()));
+    let mut guard = registry.lock().expect("notes-lock registry mutex poisoned");
+    // Drop entries whose last handle is gone before searching, so
+    // a stale `Weak` for `path` doesn't shadow a fresh insert.
+    guard.retain(|_, weak| weak.strong_count() > 0);
+    if let Some(weak) = guard.get(path)
+        && let Some(strong) = weak.upgrade()
+    {
+        return strong;
+    }
+    let arc = Arc::new(tokio::sync::Mutex::new(()));
+    guard.insert(path.to_path_buf(), Arc::downgrade(&arc));
+    arc
 }
 
 impl BailiffRepo {
@@ -111,10 +150,11 @@ impl BailiffRepo {
         let path = absolutize(path.into())?;
         let git_program = resolve_git_program().await?;
         validate_bare_repo(&path).await?;
+        let notes_write_lock = notes_lock_for(&path);
         Ok(Self {
             path,
             git_program,
-            notes_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            notes_write_lock,
         })
     }
 
@@ -157,10 +197,11 @@ impl BailiffRepo {
             .await?;
         }
         validate_bare_repo(&path).await?;
+        let notes_write_lock = notes_lock_for(&path);
         Ok(Self {
             path,
             git_program,
-            notes_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            notes_write_lock,
         })
     }
 
@@ -363,6 +404,22 @@ async fn validate_bare_repo(path: &Path) -> Result<(), BailiffRepoError> {
             reason: "core.bare is not true".to_string(),
         });
     }
+    // Reject non-SHA-1 object formats. `git init --bare
+    // --object-format=sha256` produces a config with
+    // `extensions.objectformat = sha256` and emits 64-char object
+    // ids; our `GitObjectId` wire newtype only parses 40 hex chars,
+    // so `write_blob` against a SHA-256 repo would fail on the
+    // first call. Fail the validation instead, where the operator
+    // sees one clear "not a bare repo we can use" error rather
+    // than a downstream parse error on the first write.
+    if let Some(format) = extensions_object_format(&config)
+        && !format.eq_ignore_ascii_case("sha1")
+    {
+        return Err(BailiffRepoError::NotABareRepo {
+            path: path.display().to_string(),
+            reason: format!("extensions.objectformat = {format:?}; only sha1 is supported"),
+        });
+    }
     // Reject `commondir`: a gitdir containing this file delegates
     // its shared state (objects, refs, etc.) to the path named in
     // it. Subsequent `--git-dir <path>` writes would then land
@@ -383,6 +440,33 @@ async fn validate_bare_repo(path: &Path) -> Result<(), BailiffRepoError> {
         }
     }
     Ok(())
+}
+
+/// Read `extensions.objectformat` from a Git config, if present.
+/// SHA-1 repos omit this key entirely (the default), so a `None`
+/// here means SHA-1, not "unparseable config". Anything else
+/// (notably `sha256`) is what we reject upstream.
+fn extensions_object_format(text: &str) -> Option<String> {
+    let mut in_extensions = false;
+    for raw_line in text.lines() {
+        let line = raw_line.split('#').next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(section) = line.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+            in_extensions = section.eq_ignore_ascii_case("extensions");
+            continue;
+        }
+        if !in_extensions {
+            continue;
+        }
+        if let Some((key, val)) = line.split_once('=').map(|(k, v)| (k.trim(), v.trim()))
+            && key.eq_ignore_ascii_case("objectformat")
+        {
+            return Some(val.to_string());
+        }
+    }
+    None
 }
 
 /// Minimal INI-style scan for `bare = true` under `[core]`. Git's
@@ -1218,5 +1302,187 @@ mod tests {
     fn config_parser_ignores_commented_lines() {
         let commented = "[core]\n# bare = true\n";
         assert!(!config_says_bare_true(commented));
+    }
+
+    /// SHA-1 (default) repos have no `extensions.objectformat`
+    /// entry. Treat absence as SHA-1, not as "could not parse".
+    #[test]
+    fn extensions_parser_returns_none_when_objectformat_is_unset() {
+        let sha1_repo = "[core]\n\trepositoryformatversion = 0\n\tbare = true\n";
+        assert_eq!(extensions_object_format(sha1_repo), None);
+    }
+
+    /// `git init --bare --object-format=sha256` writes a config
+    /// shaped like this — the parser must read it back as
+    /// `Some("sha256")` so validation can reject the repo.
+    #[test]
+    fn extensions_parser_finds_sha256_object_format() {
+        let sha256_repo = "[extensions]\n\tobjectformat = sha256\n[core]\n\trepositoryformatversion = 1\n\tbare = true\n";
+        assert_eq!(
+            extensions_object_format(sha256_repo)
+                .as_deref()
+                .map(str::to_ascii_lowercase),
+            Some("sha256".to_string())
+        );
+    }
+
+    /// `objectformat` in the wrong section must not satisfy the
+    /// check — the field is scoped to `[extensions]`.
+    #[test]
+    fn extensions_parser_ignores_objectformat_outside_extensions() {
+        let misplaced = "[core]\n\tobjectformat = sha256\n\tbare = true\n";
+        assert_eq!(extensions_object_format(misplaced), None);
+    }
+
+    /// `open` against a SHA-256 bare repo must reject up front:
+    /// the rest of the module assumes 40-char SHA-1 object ids,
+    /// and `GitObjectId::new` would refuse the 64-char IDs git
+    /// hands back from a SHA-256 repo on the first `write_blob`.
+    /// Fail at validation time so the operator sees one clear
+    /// "not a bare repo we can use" error rather than a downstream
+    /// parse error.
+    #[tokio::test]
+    async fn open_rejects_a_sha256_repo() {
+        let dir = TempDir::new().unwrap();
+        let repo_path = dir.path().join("sha256-repo");
+        let git = git_program().await;
+        // `git init --bare --object-format=sha256` does the
+        // honest thing for us: it writes the exact config layout
+        // we want to reject in validation.
+        let init = run_git_status(
+            &git,
+            &[
+                OsStr::new("init"),
+                OsStr::new("--bare"),
+                OsStr::new("--object-format=sha256"),
+                repo_path.as_os_str(),
+            ],
+            None,
+        )
+        .await;
+        // Some git builds disable SHA-256 support. Skip the test
+        // (cleanly) rather than fail it on those hosts — the
+        // validation logic is also exercised by the parser unit
+        // tests above and `validate_bare_repo` directly below.
+        if init.is_err() {
+            return;
+        }
+        let err = BailiffRepo::open(&repo_path).await.unwrap_err();
+        match err {
+            BailiffRepoError::NotABareRepo { reason, .. } => {
+                assert!(
+                    reason.to_ascii_lowercase().contains("sha"),
+                    "reason should mention the object format, got: {reason}"
+                );
+            }
+            other => panic!("expected NotABareRepo, got {other:?}"),
+        }
+    }
+
+    /// Hand-craft a config that satisfies every other check (bare
+    /// = true, HEAD present, no commondir) but declares
+    /// `extensions.objectformat = sha256`. This exercises the
+    /// SHA-256 rejection branch even on hosts whose `git` was
+    /// built without SHA-256 support.
+    #[tokio::test]
+    async fn open_rejects_a_directory_with_sha256_in_config() {
+        let dir = TempDir::new().unwrap();
+        let repo_path = dir.path().join("sha256-by-hand");
+        std::fs::create_dir(&repo_path).unwrap();
+        std::fs::write(repo_path.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::write(
+            repo_path.join("config"),
+            "[extensions]\n\tobjectformat = sha256\n[core]\n\trepositoryformatversion = 1\n\tbare = true\n",
+        )
+        .unwrap();
+        let err = BailiffRepo::open(&repo_path).await.unwrap_err();
+        match err {
+            BailiffRepoError::NotABareRepo { reason, .. } => {
+                assert!(
+                    reason.to_ascii_lowercase().contains("sha"),
+                    "reason should mention the object format, got: {reason}"
+                );
+            }
+            other => panic!("expected NotABareRepo, got {other:?}"),
+        }
+    }
+
+    /// Two `BailiffRepo` handles independently `open`ed against
+    /// the same path must share their `write_note` mutex — without
+    /// that, concurrent writers through different handles bypass
+    /// the lock entirely and the second `git notes add` overwrites
+    /// the first, silently losing a note.
+    #[tokio::test]
+    async fn write_note_serializes_across_distinct_handles_to_same_path() {
+        let dir = TempDir::new().unwrap();
+        let repo_path = dir.path().join("repo");
+        let first = BailiffRepo::init_or_open(&repo_path).await.unwrap();
+        let second = BailiffRepo::open(&repo_path).await.unwrap();
+        let target_a = first.write_blob(b"payload-a").await.unwrap();
+        let target_b = first.write_blob(b"payload-b").await.unwrap();
+        let r = notes_ref();
+
+        let r_a = r.clone();
+        let r_b = r.clone();
+        let ta = target_a.clone();
+        let tb = target_b.clone();
+        let (res_a, res_b) = tokio::join!(
+            tokio::spawn(async move { first.write_note(&r_a, &ta, b"note-a").await }),
+            tokio::spawn(async move { second.write_note(&r_b, &tb, b"note-b").await }),
+        );
+        res_a.unwrap().unwrap();
+        res_b.unwrap().unwrap();
+
+        let git = git_program().await;
+        for (target, expected) in [(&target_a, b"note-a"), (&target_b, b"note-b")] {
+            let ref_arg = format!("--ref={}", r.as_str());
+            let stdout = run_git_capture_stdout(
+                &git,
+                &[
+                    OsStr::new("--git-dir"),
+                    repo_path.as_os_str(),
+                    OsStr::new("notes"),
+                    OsStr::new(&ref_arg),
+                    OsStr::new("show"),
+                    OsStr::new(target.as_str()),
+                ],
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                stdout.as_slice(),
+                expected.as_slice(),
+                "note for {target:?} did not survive concurrent writes through distinct handles"
+            );
+        }
+    }
+
+    /// Two `BailiffRepo` handles against the *same* path must point
+    /// at the same `tokio::sync::Mutex` instance — i.e. the lookup
+    /// returns one underlying `Arc` for both, not two equally-shaped
+    /// but distinct ones. This is the structural invariant behind
+    /// `write_note_serializes_across_distinct_handles_to_same_path`.
+    #[tokio::test]
+    async fn notes_lock_for_returns_same_arc_per_path() {
+        let dir = TempDir::new().unwrap();
+        let repo_path = dir.path().join("repo");
+        let first = BailiffRepo::init_or_open(&repo_path).await.unwrap();
+        let second = BailiffRepo::open(&repo_path).await.unwrap();
+        assert!(
+            Arc::ptr_eq(&first.notes_write_lock, &second.notes_write_lock),
+            "handles to the same path must share one notes-write lock"
+        );
+
+        // Distinct path → distinct lock. Otherwise we'd serialise
+        // writes across unrelated repos, which would be a
+        // correctness bug in the other direction (deadlocks across
+        // independent operations).
+        let other_path = dir.path().join("repo-2");
+        let other = BailiffRepo::init_or_open(&other_path).await.unwrap();
+        assert!(
+            !Arc::ptr_eq(&first.notes_write_lock, &other.notes_write_lock),
+            "handles to distinct paths must NOT share a lock"
+        );
     }
 }
