@@ -1386,6 +1386,9 @@ mod tests {
                 default_ttl: TtlSeconds::new(3600).unwrap(),
             },
             staging_store: None,
+            notes_repo: None,
+            signing_key: None,
+            run_agent_spawn: None,
         })
     }
 
