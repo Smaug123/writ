@@ -83,11 +83,13 @@ pub struct BailiffRepo {
     /// as one critical section.
     ///
     /// The lock is shared across every `BailiffRepo` constructed
-    /// for the same absolutised path (see `notes_lock_for`). A
-    /// single per-handle mutex would only have serialised clones
-    /// of one handle, leaving two callers who each `open`ed the
-    /// same repo with independent locks — which is exactly the
-    /// lost-update scenario the lock is supposed to prevent.
+    /// for the same on-disk repo (see `notes_lock_for`); the
+    /// registry key is the *canonical* path, so a symlinked alias
+    /// and its target resolve to one entry. A single per-handle
+    /// mutex would only have serialised clones of one handle,
+    /// leaving two callers who each `open`ed the same repo with
+    /// independent locks — which is exactly the lost-update
+    /// scenario the lock is supposed to prevent.
     ///
     /// Multi-process writers are not in scope: bailiff is a single
     /// daemon, and external git tooling touching the repo
@@ -95,11 +97,13 @@ pub struct BailiffRepo {
     notes_write_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
-/// Process-wide registry mapping an absolutised repo path to the
-/// notes write lock for that path. Stored as `Weak` so the entry
-/// dies once the last `BailiffRepo` for that path drops, keeping
-/// the table from accreting forever in tests or long-running
-/// daemons that open many distinct repos.
+/// Process-wide registry mapping a *canonicalised* repo path to
+/// the notes write lock for that path. Canonicalisation collapses
+/// symlink aliases so two handles for the same on-disk repo share
+/// one entry. Stored as `Weak` so the entry dies once the last
+/// `BailiffRepo` for that path drops, keeping the table from
+/// accreting forever in tests or long-running daemons that open
+/// many distinct repos.
 static NOTES_WRITE_LOCKS: OnceLock<StdMutex<HashMap<PathBuf, Weak<tokio::sync::Mutex<()>>>>> =
     OnceLock::new();
 
@@ -150,6 +154,18 @@ impl BailiffRepo {
         let path = absolutize(path.into())?;
         let git_program = resolve_git_program().await?;
         validate_bare_repo(&path).await?;
+        // Canonicalise before storing: a symlink and its real path
+        // resolve to the same on-disk repo, but their lexical forms
+        // differ, so a per-path lock registry would otherwise hand
+        // out two separate locks for the same repo and reintroduce
+        // the lost-update race that `notes_write_lock` exists to
+        // prevent. Validation has just confirmed the directory
+        // exists, so canonicalisation is expected to succeed; any
+        // remaining I/O error (e.g. a concurrent deletion) is
+        // surfaced as a typed `Io`.
+        let path = tokio::fs::canonicalize(&path)
+            .await
+            .map_err(BailiffRepoError::Io)?;
         let notes_write_lock = notes_lock_for(&path);
         Ok(Self {
             path,
@@ -197,6 +213,12 @@ impl BailiffRepo {
             .await?;
         }
         validate_bare_repo(&path).await?;
+        // See `open` for why the stored path is canonicalised:
+        // symlink aliases would otherwise key the lock registry
+        // separately and break cross-handle serialisation.
+        let path = tokio::fs::canonicalize(&path)
+            .await
+            .map_err(BailiffRepoError::Io)?;
         let notes_write_lock = notes_lock_for(&path);
         Ok(Self {
             path,
@@ -1484,5 +1506,31 @@ mod tests {
             !Arc::ptr_eq(&first.notes_write_lock, &other.notes_write_lock),
             "handles to distinct paths must NOT share a lock"
         );
+    }
+
+    /// A symlinked alias and the underlying directory point at the
+    /// same on-disk repo, so handles opened through either must
+    /// share the notes lock. Lexical path keys would have split the
+    /// registry across the two aliases and reintroduced the
+    /// lost-update race the lock exists to prevent.
+    #[tokio::test]
+    async fn notes_lock_for_coalesces_symlink_aliases() {
+        let dir = TempDir::new().unwrap();
+        let real = dir.path().join("real");
+        let first = BailiffRepo::init_or_open(&real).await.unwrap();
+
+        let alias = dir.path().join("alias");
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        let through_symlink = BailiffRepo::open(&alias).await.unwrap();
+
+        assert!(
+            Arc::ptr_eq(&first.notes_write_lock, &through_symlink.notes_write_lock),
+            "symlinked alias must share the notes-write lock with the real path"
+        );
+        // And the stored path is the canonical (resolved) form, so
+        // downstream `--git-dir` invocations agree on which bytes
+        // they are operating against regardless of which alias the
+        // operator originally passed in.
+        assert_eq!(first.path(), through_symlink.path());
     }
 }
