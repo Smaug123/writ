@@ -1322,14 +1322,16 @@ pub(crate) async fn request_capability<S: SecretStore + Send + Sync>(
 /// Maximum bytes we will buffer for a single newline-terminated request.
 /// The largest honest [`ClientMessage`] is a `RunAgent` carrying a
 /// 1 MiB [`AgentPrompt`] (the cap pinned by
-/// [`crate::agent_run::MAX_AGENT_PROMPT_BYTES`]) plus JSON wrapping;
-/// other variants are at most a few KiB. 2 MiB covers the prompt
-/// ceiling with comfortable JSON-overhead headroom and stays an order
-/// of magnitude below "real-process worth of memory" so a peer that
-/// opens a connection and writes non-newline-terminated data still
-/// can't make the broker allocate without bound — without this cap,
-/// `read_until(b'\n')` grows the buffer until the process OOMs.
-const MAX_LINE_BYTES: usize = 2 * 1024 * 1024;
+/// [`crate::agent_run::MAX_AGENT_PROMPT_BYTES`]); other variants are at
+/// most a few KiB. `serde_json` escapes ASCII control bytes as
+/// `\u00XX`, expanding worst-case input 6:1, so the wire frame for a
+/// 1 MiB control-character prompt is up to 6 MiB before envelope
+/// overhead. Matches the `6 * MAX_X_BYTES + small` convention used by
+/// `vm_http` for the same reason. A peer that writes
+/// non-newline-terminated data still can't make the broker allocate
+/// without bound — without this cap, `read_until(b'\n')` grows the
+/// buffer until the process OOMs.
+const MAX_LINE_BYTES: usize = 6 * crate::agent_run::MAX_AGENT_PROMPT_BYTES + 64 * 1024;
 
 /// Maximum idle time between reads on a connection. The CLI sends one
 /// message and reads one reply, so a healthy peer never approaches

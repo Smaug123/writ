@@ -6,10 +6,12 @@
 //! review attach, …) hang off the same client.
 //!
 //! Wire framing: one [`ClientMessage`] per line, one [`ServerMessage`]
-//! per line in reply. Reads are bounded by a 2 MiB per-line cap so a
+//! per line in reply. Reads are bounded by a per-line cap so a
 //! malformed broker can't make bailiff allocate without bound. The
-//! cap matches the broker-side `read_line_bounded` limit and leaves
-//! comfortable headroom over a 1 MiB `AgentPrompt`.
+//! cap matches the broker-side `read_line_bounded` limit and is sized
+//! for the worst-case JSON expansion of a 1 MiB `AgentPrompt` (6:1
+//! when every byte is an ASCII control character that `serde_json`
+//! encodes as `\u00XX`).
 //!
 //! Errors are tagged so callers can react without string-matching: a
 //! transport failure is distinct from a writ-side [`ServerMessage::Error`],
@@ -32,11 +34,13 @@ use crate::protocol::{ClientMessage, ServerMessage, SignedRunMetadata};
 use crate::vm_git::GitObjectId;
 
 /// Matches the broker-side cap in `src/server.rs`. The largest legal
-/// reply is a `RunAgentCompleted` whose canonical metadata plus signed
-/// envelope reference fit in a few KiB; 2 MiB is well above that and
-/// gives both ends a single shared ceiling. A peer that frames a
-/// single line larger than this is treated as broken.
-const MAX_LINE_BYTES: usize = 2 * 1024 * 1024;
+/// reply is a `RunAgentCompleted` whose canonical metadata plus
+/// signed envelope reference fit in a few KiB, so the cap is set by
+/// the request side (the broker accepting a worst-case-escaped 1 MiB
+/// `AgentPrompt`). Both ends share a single ceiling so the framing
+/// contract stays symmetric. A peer that frames a single line larger
+/// than this is treated as broken.
+const MAX_LINE_BYTES: usize = 6 * crate::agent_run::MAX_AGENT_PROMPT_BYTES + 64 * 1024;
 
 /// What writ returned for a `RunAgent` request that ran to completion.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -799,11 +803,14 @@ mod end_to_end_tests {
     }
 
     /// A prompt at the high end of the `MAX_AGENT_PROMPT_BYTES`
-    /// ceiling fits through the framing layer without being clipped
-    /// by `read_line_bounded`. Pins the cross-end agreement that
-    /// `MAX_LINE_BYTES` exceeds `MAX_AGENT_PROMPT_BYTES` plus JSON
-    /// overhead, so a wire-valid `AgentPrompt` is always a
-    /// wire-valid frame.
+    /// ceiling — and dominated by ASCII control characters, so
+    /// `serde_json` expands every byte to a 6-character `\u00XX`
+    /// escape — fits through the framing layer without being
+    /// clipped by `read_line_bounded`. Pins the cross-end agreement
+    /// that `MAX_LINE_BYTES` accommodates the *worst-case* serialized
+    /// size of a wire-valid `AgentPrompt`, not just the raw byte
+    /// length, so a prompt that the prompt validator accepts is
+    /// always a frame the broker accepts.
     #[tokio::test]
     async fn run_agent_carries_large_prompt_through_framing() {
         use std::os::unix::fs::PermissionsExt;
@@ -855,10 +862,13 @@ mod end_to_end_tests {
             let _ = serve_broker_with_agent_vm(listener, broker_state, None).await;
         });
 
-        // 1 MiB - 4 KiB to stay strictly under MAX_AGENT_PROMPT_BYTES
-        // even with multi-byte UTF-8 in the prompt; the framing layer
-        // must still accept it (and broker must still dispatch).
-        let big = "a".repeat(crate::agent_run::MAX_AGENT_PROMPT_BYTES - 4096);
+        // 1 MiB minus a small margin (control char `\u{0001}` is one
+        // byte raw, but the prompt validator counts raw bytes; the
+        // margin protects against any future tightening of the
+        // ceiling). Every byte is `\u{0001}`, which serde_json
+        // escapes as 6-character `` — exactly the 6:1
+        // worst-case expansion the cap is sized for.
+        let big = "\u{0001}".repeat(crate::agent_run::MAX_AGENT_PROMPT_BYTES - 4096);
         let prompt = AgentPrompt::new(&big);
         let output_ref = NotesRef::try_new("refs/notes/writ/v1/agent-outputs").unwrap();
         let client = WritClient::new(&socket_path);
