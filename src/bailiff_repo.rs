@@ -63,6 +63,13 @@ use crate::core::NotesRef;
 #[derive(Clone, Debug)]
 pub struct BailiffRepo {
     path: PathBuf,
+    /// Absolute path of the `git` executable, resolved against the
+    /// daemon's `PATH` at construction time. Stored here because
+    /// every subprocess spawn `env_clear()`s the child environment
+    /// (so it cannot rely on `PATH` itself), and because resolving
+    /// against `PATH` after that point is too late: a Nix-style
+    /// host without `/bin/git` would simply fail to spawn.
+    git_program: PathBuf,
     /// Serialises `write_note` invocations against this repo.
     ///
     /// `git notes add` does not perform a compare-and-swap on the
@@ -102,9 +109,11 @@ impl BailiffRepo {
     /// I/O surprises.
     pub async fn open(path: impl Into<PathBuf>) -> Result<Self, BailiffRepoError> {
         let path = absolutize(path.into())?;
+        let git_program = resolve_git_program().await?;
         validate_bare_repo(&path).await?;
         Ok(Self {
             path,
+            git_program,
             notes_write_lock: Arc::new(tokio::sync::Mutex::new(())),
         })
     }
@@ -123,6 +132,7 @@ impl BailiffRepo {
     /// the workspace repo. Refusing to layer fixes that.
     pub async fn init_or_open(path: impl Into<PathBuf>) -> Result<Self, BailiffRepoError> {
         let path = absolutize(path.into())?;
+        let git_program = resolve_git_program().await?;
         // `git init --bare` is itself idempotent — running it on an
         // existing bare repo is a no-op for the on-disk state — but
         // calling it unconditionally would also mean creating any
@@ -140,12 +150,18 @@ impl BailiffRepo {
                     .map_err(BailiffRepoError::Io)?;
             }
             run_git_status(
+                &git_program,
                 &[OsStr::new("init"), OsStr::new("--bare"), path.as_os_str()],
                 None,
             )
             .await?;
         }
-        Self::open(path).await
+        validate_bare_repo(&path).await?;
+        Ok(Self {
+            path,
+            git_program,
+            notes_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+        })
     }
 
     /// Write `bytes` as a loose Git blob into this repo and return
@@ -160,6 +176,7 @@ impl BailiffRepo {
     /// otherwise auto-discover.
     pub async fn write_blob(&self, bytes: &[u8]) -> Result<GitObjectId, BailiffRepoError> {
         let stdout = run_git_capture_stdout(
+            &self.git_program,
             &[
                 OsStr::new("--git-dir"),
                 self.path.as_os_str(),
@@ -203,7 +220,7 @@ impl BailiffRepo {
         // `NoteAlreadyExists` rather than the generic GitFailed that
         // `git notes add` (without `-f`) produces. The two-step shape
         // is also what lets us keep the write itself force-free.
-        if note_exists(&self.path, notes_ref, target).await? {
+        if note_exists(&self.git_program, &self.path, notes_ref, target).await? {
             return Err(BailiffRepoError::NoteAlreadyExists {
                 notes_ref: notes_ref.as_str().to_string(),
                 target: target.as_str().to_string(),
@@ -221,6 +238,7 @@ impl BailiffRepo {
         // empty stdin under `--no-stripspace` exits 0 but writes no
         // note. `write_note` claims a body was attached; honour that.
         run_git_status(
+            &self.git_program,
             &[
                 OsStr::new("--git-dir"),
                 self.path.as_os_str(),
@@ -281,12 +299,14 @@ async fn ensure_empty_directory(path: &Path) -> Result<(), BailiffRepoError> {
 /// when no note exists. Treat any other non-zero exit as a real
 /// git failure rather than absence.
 async fn note_exists(
+    git_program: &Path,
     repo: &Path,
     notes_ref: &NotesRef,
     target: &GitObjectId,
 ) -> Result<bool, BailiffRepoError> {
     let ref_arg = format!("--ref={}", notes_ref.as_str());
     let outcome = run_git(
+        git_program,
         &[
             OsStr::new("--git-dir"),
             repo.as_os_str(),
@@ -411,11 +431,12 @@ struct GitOutcome {
 /// list` legitimately exits 1 for "no note here", whereas `git
 /// init` returning non-zero is always an error.
 async fn run_git(
+    git_program: &Path,
     args: &[&OsStr],
     stdin_via: Option<&[u8]>,
     capture_stdout: bool,
 ) -> Result<GitOutcome, BailiffRepoError> {
-    let mut command = Command::new("git");
+    let mut command = Command::new(git_program);
     command.env_clear();
     for (name, value) in CLEAN_GIT_CONFIG_ENV {
         command.env(name, value);
@@ -433,6 +454,14 @@ async fn run_git(
         Stdio::null()
     });
     command.stderr(Stdio::piped());
+    // If the caller's future is dropped between spawn and reap
+    // (request cancellation, daemon shutdown), tokio would by
+    // default leak the child process. That would release
+    // `notes_write_lock` while a `git notes add` is still updating
+    // the ref, so a subsequent writer could race with it and lose
+    // notes despite the mutex. `kill_on_drop` ties the child's
+    // lifetime to the future's.
+    command.kill_on_drop(true);
 
     let mut child = command.spawn().map_err(BailiffRepoError::Spawn)?;
     if let Some(bytes) = stdin_via {
@@ -458,9 +487,13 @@ async fn run_git(
 /// Run `git` once and require a successful (status-zero) exit.
 /// Used for commands that have no "expected non-zero" branch
 /// (`init`, `notes add`).
-async fn run_git_status(args: &[&OsStr], stdin_via: Option<&[u8]>) -> Result<(), BailiffRepoError> {
+async fn run_git_status(
+    git_program: &Path,
+    args: &[&OsStr],
+    stdin_via: Option<&[u8]>,
+) -> Result<(), BailiffRepoError> {
     let label = describe_args(args);
-    let outcome = run_git(args, stdin_via, false).await?;
+    let outcome = run_git(git_program, args, stdin_via, false).await?;
     if outcome.status.success() {
         Ok(())
     } else {
@@ -474,11 +507,12 @@ async fn run_git_status(args: &[&OsStr], stdin_via: Option<&[u8]>) -> Result<(),
 
 /// Run `git` once, require success, and return captured stdout.
 async fn run_git_capture_stdout(
+    git_program: &Path,
     args: &[&OsStr],
     stdin_via: Option<&[u8]>,
 ) -> Result<Vec<u8>, BailiffRepoError> {
     let label = describe_args(args);
-    let outcome = run_git(args, stdin_via, true).await?;
+    let outcome = run_git(git_program, args, stdin_via, true).await?;
     if outcome.status.success() {
         Ok(outcome.stdout)
     } else {
@@ -488,6 +522,17 @@ async fn run_git_capture_stdout(
             stderr: String::from_utf8_lossy(&outcome.stderr).into_owned(),
         })
     }
+}
+
+/// Resolve `git` against the daemon's `PATH` once, before any
+/// subprocess clears its environment. Without this, a host where
+/// `git` is supplied solely via `PATH` (Nix, custom CI toolchains)
+/// would fail at spawn time: `Command::new("git")` performs the
+/// lookup at spawn, after `env_clear()` has already wiped `PATH`.
+async fn resolve_git_program() -> Result<PathBuf, BailiffRepoError> {
+    crate::clean_git::resolve_program_for_clean_env(Path::new("git"))
+        .await
+        .map_err(|source| BailiffRepoError::ResolveGit(source.to_string()))
 }
 
 /// Pick a human-readable label for the failing command — the first
@@ -546,6 +591,8 @@ const CLEAN_GIT_CURRENT_DIR: &str = "/";
 pub enum BailiffRepoError {
     #[error("I/O error: {0}")]
     Io(std::io::Error),
+    #[error("could not resolve `git` on PATH: {0}")]
+    ResolveGit(String),
     #[error("could not spawn git: {0}")]
     Spawn(std::io::Error),
     #[error("{path:?} is not a bare git repository: {reason}")]
@@ -571,6 +618,15 @@ mod tests {
 
     fn notes_ref() -> NotesRef {
         NotesRef::try_new("refs/notes/writ/agent-outputs").unwrap()
+    }
+
+    /// Tests run git through the same wrapper helpers as production
+    /// code, which now require a resolved `git` path. Resolve once
+    /// per call rather than caching, because each test runs in its
+    /// own tokio runtime and `tokio::sync::OnceCell` would tie a
+    /// cached value to the first runtime that touched it.
+    async fn git_program() -> PathBuf {
+        resolve_git_program().await.unwrap()
     }
 
     /// `init_or_open` on a fresh empty directory must produce a
@@ -641,7 +697,9 @@ mod tests {
     async fn open_rejects_a_non_bare_worktree() {
         let dir = TempDir::new().unwrap();
         let repo_path = dir.path().join("worktree");
+        let git = git_program().await;
         run_git_status(
+            &git,
             &[
                 OsStr::new("init"),
                 OsStr::new("--initial-branch=main"),
@@ -698,7 +756,9 @@ mod tests {
         let oid = repo.write_blob(payload).await.unwrap();
         assert_eq!(oid.as_str().len(), 40);
 
+        let git = git_program().await;
         let stdout = run_git_capture_stdout(
+            &git,
             &[
                 OsStr::new("-C"),
                 repo.path().as_os_str(),
@@ -745,8 +805,10 @@ mod tests {
             .await
             .unwrap();
 
+        let git = git_program().await;
         let ref_arg = format!("--ref={}", r.as_str());
         let stdout = run_git_capture_stdout(
+            &git,
             &[
                 OsStr::new("-C"),
                 repo.path().as_os_str(),
@@ -783,8 +845,10 @@ mod tests {
         );
 
         // Sanity: the original note is still there, unmodified.
+        let git = git_program().await;
         let ref_arg = format!("--ref={}", r.as_str());
         let stdout = run_git_capture_stdout(
+            &git,
             &[
                 OsStr::new("-C"),
                 repo.path().as_os_str(),
@@ -813,10 +877,12 @@ mod tests {
         let r2 = NotesRef::try_new("refs/notes/writ/b").unwrap();
         repo.write_note(&r1, &target, b"under a").await.unwrap();
         repo.write_note(&r2, &target, b"under b").await.unwrap();
+        let git = git_program().await;
         // Both notes are independently retrievable.
         for (r, body) in [(&r1, b"under a".as_slice()), (&r2, b"under b".as_slice())] {
             let ref_arg = format!("--ref={}", r.as_str());
             let stdout = run_git_capture_stdout(
+                &git,
                 &[
                     OsStr::new("-C"),
                     repo.path().as_os_str(),
@@ -843,9 +909,11 @@ mod tests {
     async fn init_or_open_refuses_to_init_into_existing_worktree() {
         let dir = TempDir::new().unwrap();
         let worktree = dir.path().join("worktree");
+        let git = git_program().await;
         // Plain (non-bare) init plants a `.git/` directory under
         // `worktree/`, marking it as a worktree.
         run_git_status(
+            &git,
             &[
                 OsStr::new("init"),
                 OsStr::new("--initial-branch=main"),
@@ -901,6 +969,7 @@ mod tests {
         let repo = BailiffRepo::init_or_open(dir.path().join("repo"))
             .await
             .unwrap();
+        let git = git_program().await;
         let cases: &[&[u8]] = &[
             b"no trailing newline",
             b"with trailing newline\n",
@@ -918,6 +987,7 @@ mod tests {
             repo.write_note(&r, &target, body).await.unwrap();
             let ref_arg = format!("--ref={}", r.as_str());
             let stdout = run_git_capture_stdout(
+                &git,
                 &[
                     OsStr::new("-C"),
                     repo.path().as_os_str(),
@@ -949,8 +1019,10 @@ mod tests {
         let target = repo.write_blob(b"anchor").await.unwrap();
         let r = notes_ref();
         repo.write_note(&r, &target, b"").await.unwrap();
+        let git = git_program().await;
         let ref_arg = format!("--ref={}", r.as_str());
         let stdout = run_git_capture_stdout(
+            &git,
             &[
                 OsStr::new("-C"),
                 repo.path().as_os_str(),
@@ -985,7 +1057,9 @@ mod tests {
         // Plant a real working repo inside the bare repo. Without
         // `--git-dir`, `git -C <repo_path>` would pick this up.
         let decoy = repo_path.join(".git");
+        let git = git_program().await;
         run_git_status(
+            &git,
             &[
                 OsStr::new("init"),
                 OsStr::new("--initial-branch=main"),
@@ -1049,9 +1123,11 @@ mod tests {
         // Both notes must be retrievable through the bare repo's
         // notes ref — proving the second writer rebased onto the
         // first instead of clobbering it.
+        let git = git_program().await;
         for (target, expected) in [(&target_a, b"note-a"), (&target_b, b"note-b")] {
             let ref_arg = format!("--ref={}", r.as_str());
             let stdout = run_git_capture_stdout(
+                &git,
                 &[
                     OsStr::new("--git-dir"),
                     repo.path().as_os_str(),
