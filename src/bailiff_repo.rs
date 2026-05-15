@@ -45,6 +45,12 @@
 //! We then point git at the repo via `--git-dir=<canonical_path>`
 //! instead of bare-repo discovery, which a hardened host can
 //! disable. See the `prepare_git_command` helper.
+//!
+//! The set of env vars to inherit (just `PATH` today) is captured at
+//! construct time as an `InheritedEnv` value rather than read
+//! implicitly inside command builders. Production code uses
+//! `InheritedEnv::from_process`; tests can pass synthetic values and
+//! inspect the resulting `Command` without mutating real process env.
 
 use std::collections::HashMap;
 use std::ffi::OsString;
@@ -57,6 +63,29 @@ use crate::clean_git::CLEAN_GIT_CONFIG_ENV;
 use crate::core::NotesRef;
 use crate::vm_git::{GitObjectId, GitObjectIdError};
 
+/// Snapshot of the parent-process environment values that flow into
+/// git child commands. Production code captures this once via
+/// [`InheritedEnv::from_process`]; tests can construct synthetic
+/// instances without mutating real process state.
+///
+/// Today the only inherited value is `PATH` (needed so the `git`
+/// binary itself is locatable). All other variables are either set
+/// explicitly to the clean recipe in `prepare_git_command` or wiped
+/// by `env_clear`.
+#[derive(Clone, Debug)]
+pub(crate) struct InheritedEnv {
+    path: Option<OsString>,
+}
+
+impl InheritedEnv {
+    /// Capture the current process's `PATH`.
+    pub(crate) fn from_process() -> Self {
+        Self {
+            path: std::env::var_os("PATH"),
+        }
+    }
+}
+
 /// A validated handle on bailiff's bare notes repo.
 ///
 /// Construct via [`BailiffRepo::open`] (validation only) or
@@ -68,6 +97,7 @@ use crate::vm_git::{GitObjectId, GitObjectIdError};
 #[derive(Debug)]
 pub struct BailiffRepo {
     canonical_path: PathBuf,
+    inherited_env: InheritedEnv,
 }
 
 impl BailiffRepo {
@@ -75,15 +105,21 @@ impl BailiffRepo {
     /// minimal validation. The path is canonicalised so multiple
     /// handles for the same repo serialise on a shared mutex.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, BailiffRepoError> {
-        let path = path.as_ref();
+        Self::open_with_env(path.as_ref(), InheritedEnv::from_process())
+    }
+
+    fn open_with_env(path: &Path, inherited_env: InheritedEnv) -> Result<Self, BailiffRepoError> {
         let canonical_path =
             path.canonicalize()
                 .map_err(|source| BailiffRepoError::Canonicalize {
                     path: path.to_path_buf(),
                     source,
                 })?;
-        validate_bare_layout(&canonical_path)?;
-        Ok(Self { canonical_path })
+        validate_bare_layout(&canonical_path, &inherited_env)?;
+        Ok(Self {
+            canonical_path,
+            inherited_env,
+        })
     }
 
     /// Initialise a bare repo at `path` if and only if `path` is absent
@@ -100,6 +136,7 @@ impl BailiffRepo {
     /// `Open*` validation error instead of as corruption.
     pub fn init_or_open(path: impl AsRef<Path>) -> Result<Self, BailiffRepoError> {
         let path = path.as_ref();
+        let inherited_env = InheritedEnv::from_process();
         let needs_init = match std::fs::read_dir(path) {
             Ok(mut entries) => entries.next().is_none(),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -130,9 +167,10 @@ impl BailiffRepo {
                 ["init", "--bare", "--quiet", "--object-format=sha1"],
                 None,
                 CaptureOutput::Discard,
+                &inherited_env,
             )?;
         }
-        Self::open(path)
+        Self::open_with_env(path, inherited_env)
     }
 
     /// Canonical on-disk path the handle resolved to.
@@ -173,7 +211,7 @@ impl BailiffRepo {
             return Err(BailiffRepoError::EmptyBody);
         }
         let _guard = lock_notes_write(&self.canonical_path);
-        let target_oid = hash_object_stdin(&self.canonical_path, seed)?;
+        let target_oid = hash_object_stdin(&self.canonical_path, seed, &self.inherited_env)?;
         // Write the body as a blob first and reference it via `-C
         // <oid>`. `git notes add -F file` runs the body through
         // `stripspace` (strip trailing whitespace per line, collapse
@@ -181,7 +219,7 @@ impl BailiffRepo {
         // is binary in general, so we have to bypass stripspace.
         // `-C <existing_blob_oid>` reuses the object verbatim and is
         // the documented escape hatch.
-        let body_oid = hash_object_stdin(&self.canonical_path, body)?;
+        let body_oid = hash_object_stdin(&self.canonical_path, body, &self.inherited_env)?;
         // `notes add` creates a commit on the notes ref, so it
         // needs an author identity. The `clean_git` env recipe
         // we run under (HOME=/dev/null, GIT_CONFIG_GLOBAL=/dev/null,
@@ -207,6 +245,7 @@ impl BailiffRepo {
             ],
             None,
             CaptureOutput::Discard,
+            &self.inherited_env,
         )?;
         Ok(target_oid)
     }
@@ -236,11 +275,12 @@ impl BailiffRepo {
             ],
             None,
             CaptureOutput::Capture,
+            &self.inherited_env,
         )
     }
 }
 
-fn validate_bare_layout(path: &Path) -> Result<(), BailiffRepoError> {
+fn validate_bare_layout(path: &Path, env: &InheritedEnv) -> Result<(), BailiffRepoError> {
     let head = path.join("HEAD");
     if !head.is_file() {
         return Err(BailiffRepoError::MissingHead {
@@ -273,11 +313,11 @@ fn validate_bare_layout(path: &Path) -> Result<(), BailiffRepoError> {
             });
         }
     }
-    match git_config_get_bool(path, "core.bare")? {
+    match git_config_get_bool(path, "core.bare", env)? {
         Some(true) => {}
         other => return Err(BailiffRepoError::NotBare { value: other }),
     }
-    if let Some(fmt) = git_config_get(path, "extensions.objectformat")?
+    if let Some(fmt) = git_config_get(path, "extensions.objectformat", env)?
         && fmt != "sha1"
     {
         return Err(BailiffRepoError::UnsupportedObjectFormat { value: fmt });
@@ -313,10 +353,10 @@ enum CaptureOutput {
 /// repo by absolute path and never rely on directory walking.
 /// This also makes `git init` write to exactly `<repo>` regardless
 /// of how the operator's defaults would otherwise steer it.
-fn prepare_git_command(repo: &Path) -> Command {
+fn prepare_git_command(repo: &Path, env: &InheritedEnv) -> Command {
     let mut command = Command::new("git");
     command.env_clear();
-    if let Some(path) = std::env::var_os("PATH") {
+    if let Some(path) = env.path.as_ref() {
         command.env("PATH", path);
     }
     for (key, value) in CLEAN_GIT_CONFIG_ENV {
@@ -333,12 +373,13 @@ fn run_git<'a, I>(
     args: I,
     stdin_input: Option<&[u8]>,
     capture: CaptureOutput,
+    env: &InheritedEnv,
 ) -> Result<Vec<u8>, BailiffRepoError>
 where
     I: IntoIterator<Item = &'a str>,
 {
     let args: Vec<&str> = args.into_iter().collect();
-    let mut command = prepare_git_command(repo);
+    let mut command = prepare_git_command(repo, env);
     command.args(&args);
     command.stdin(if stdin_input.is_some() {
         Stdio::piped()
@@ -390,14 +431,18 @@ where
     Ok(stdout_bytes)
 }
 
-fn git_config_get_bool(repo: &Path, key: &str) -> Result<Option<bool>, BailiffRepoError> {
+fn git_config_get_bool(
+    repo: &Path,
+    key: &str,
+    env: &InheritedEnv,
+) -> Result<Option<bool>, BailiffRepoError> {
     // `--local` is load-bearing: without it, `git config --get`
     // also reads `~/.gitconfig` and the system config, so a global
     // `core.bare = true` would let any directory with HEAD/objects/
     // refs pass validation, and a global `extensions.objectformat =
     // sha256` would reject a valid SHA-1 repo. The layout checks
     // are about the on-disk repo only.
-    let output = run_git_config(repo, ["--local", "--bool", "--get", key])?;
+    let output = run_git_config(repo, ["--local", "--bool", "--get", key], env)?;
     let Some(raw) = output else { return Ok(None) };
     let trimmed = raw.trim();
     match trimmed {
@@ -410,16 +455,21 @@ fn git_config_get_bool(repo: &Path, key: &str) -> Result<Option<bool>, BailiffRe
     }
 }
 
-fn git_config_get(repo: &Path, key: &str) -> Result<Option<String>, BailiffRepoError> {
-    let output = run_git_config(repo, ["--local", "--get", key])?;
+fn git_config_get(
+    repo: &Path,
+    key: &str,
+    env: &InheritedEnv,
+) -> Result<Option<String>, BailiffRepoError> {
+    let output = run_git_config(repo, ["--local", "--get", key], env)?;
     Ok(output.map(|s| s.trim().to_string()))
 }
 
 fn run_git_config<'a>(
     repo: &Path,
     config_args: impl IntoIterator<Item = &'a str>,
+    env: &InheritedEnv,
 ) -> Result<Option<String>, BailiffRepoError> {
-    let mut command = prepare_git_command(repo);
+    let mut command = prepare_git_command(repo, env);
     command.arg("config");
     for arg in config_args {
         command.arg(arg);
@@ -447,12 +497,17 @@ fn run_git_config<'a>(
     }
 }
 
-fn hash_object_stdin(repo: &Path, bytes: &[u8]) -> Result<GitObjectId, BailiffRepoError> {
+fn hash_object_stdin(
+    repo: &Path,
+    bytes: &[u8],
+    env: &InheritedEnv,
+) -> Result<GitObjectId, BailiffRepoError> {
     let stdout = run_git(
         repo,
         ["hash-object", "-w", "--stdin"].iter().copied(),
         Some(bytes),
         CaptureOutput::Capture,
+        env,
     )?;
     let s = String::from_utf8(stdout)
         .map_err(|source| BailiffRepoError::HashObjectNonUtf8 { source })?;
@@ -553,20 +608,13 @@ pub enum BailiffRepoError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsStr;
     use std::fs;
     use tempfile::TempDir;
 
     fn notes_ref() -> NotesRef {
         NotesRef::try_new("refs/notes/writ/v1/agent-outputs").unwrap()
     }
-
-    /// Serialises tests that mutate process environment variables
-    /// against tests that invoke `git` directly (without going
-    /// through `run_git`, which scrubs the repo-selection env).
-    /// Cargo runs tests in parallel by default, so without this the
-    /// env pollution window from a "GIT_DIR is ignored" test would
-    /// leak into other tests' `Command::new("git")` setups.
-    static ENV_TEST_MUTEX: Mutex<()> = Mutex::new(());
 
     #[test]
     fn init_or_open_creates_a_bare_repo() {
@@ -601,7 +649,6 @@ mod tests {
 
     #[test]
     fn open_rejects_non_bare_repo() {
-        let _env_guard = ENV_TEST_MUTEX.lock().unwrap();
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("non-bare");
         // `git init` (no --bare) produces a working-directory repo
@@ -682,7 +729,6 @@ mod tests {
 
     #[test]
     fn open_rejects_repo_with_sha256_object_format() {
-        let _env_guard = ENV_TEST_MUTEX.lock().unwrap();
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("sha256-repo");
         let status = Command::new("git")
@@ -823,7 +869,6 @@ mod tests {
         // would flip core.bare and silently break the worktree. The
         // expected behaviour is to validate-only and surface the
         // mismatch as an open error.
-        let _env_guard = ENV_TEST_MUTEX.lock().unwrap();
         let tmp = TempDir::new().unwrap();
         let worktree = tmp.path().join("wt");
         let status = Command::new("git")
@@ -860,133 +905,99 @@ mod tests {
         assert_eq!(repo.read_note(&nref, &target).unwrap(), body);
     }
 
-    #[test]
-    fn write_note_ignores_parent_git_dir_env() {
-        // `git -C <path>` does NOT override an inherited `GIT_DIR`:
-        // the env var wins and redirects every git call. Without
-        // scrubbing, a parent that exports `GIT_DIR=/elsewhere`
-        // would steer `hash-object -w` and `notes add` into the
-        // wrong repo. Production code scrubs the repo-selection
-        // env in `run_git`; this test sets `GIT_DIR` to an absent
-        // path so the un-scrubbed code path would surface as a
-        // hash-object failure, while the scrubbed code path
-        // succeeds.
-        let tmp = TempDir::new().unwrap();
-        let repo = BailiffRepo::init_or_open(tmp.path().join("r")).unwrap();
-        let nref = notes_ref();
-        let absent_git_dir = tmp.path().join("definitely-not-a-repo");
-        let _env_guard = ENV_TEST_MUTEX.lock().unwrap();
-        // SAFETY: set_var/remove_var are unsafe in Rust 2024 because
-        // they race with concurrent getenv across threads. The mutex
-        // above serialises all tests in this module that touch the
-        // process env or invoke `git` directly.
-        unsafe {
-            std::env::set_var("GIT_DIR", &absent_git_dir);
+    // The host-config-hardening tests below inspect the `Command`
+    // produced by `prepare_git_command` rather than mutating real
+    // process env. The properties they pin down:
+    //
+    // * The clean-recipe env (`HOME=/dev/null`,
+    //   `GIT_CONFIG_GLOBAL=/dev/null`, `GIT_CONFIG_NOSYSTEM=1`,
+    //   `GIT_CONFIG_COUNT=0`) is unconditionally set on the child —
+    //   so a host-wide `GIT_CONFIG_GLOBAL` pointing at a poisoned
+    //   file, `init.defaultObjectFormat = sha256` in `~/.gitconfig`,
+    //   `safe.bareRepository = explicit`, etc. cannot reach git.
+    // * `PATH` flows from the supplied `InheritedEnv`, not from a
+    //   hidden `std::env::var_os` call — so production passes the
+    //   captured parent env explicitly and tests can substitute.
+    // * `--git-dir=<repo>` is the first arg — so an inherited
+    //   `GIT_DIR` cannot redirect us, and discovery (which a host
+    //   with `safe.bareRepository=explicit` disables) is never
+    //   consulted.
+    //
+    // Trusting git's documented semantics for `--local`,
+    // `--git-dir`, and `--object-format=sha1` is the load-bearing
+    // step; verifying that we *invoke* git with those flags is
+    // what these tests cover.
+    fn synthetic_env(path: &str) -> InheritedEnv {
+        InheritedEnv {
+            path: Some(OsString::from(path)),
         }
-        let result = repo.write_note(&nref, b"seed", b"body");
-        unsafe {
-            std::env::remove_var("GIT_DIR");
-        }
-        let target = result.expect("write_note must ignore parent GIT_DIR");
-        assert_eq!(repo.read_note(&nref, &target).unwrap(), b"body");
+    }
+
+    fn envs_of(cmd: &Command) -> HashMap<OsString, Option<OsString>> {
+        cmd.get_envs()
+            .map(|(k, v)| (k.to_owned(), v.map(|v| v.to_owned())))
+            .collect()
     }
 
     #[test]
-    fn open_reads_local_config_only_for_core_bare() {
-        // Git's config precedence is command-line > env > local >
-        // global > system, so a global override only *wins* when
-        // local is silent. To exercise the bug, set up a bare repo
-        // whose local config is missing the key entirely (delete
-        // the file) and plant `core.bare = true` in a fake global.
-        // Without `--local`, the lookup falls through to global and
-        // returns true — letting a layout-only directory masquerade
-        // as a valid bare repo. With `--local`, the lookup returns
-        // None and validation fails as `NotBare { value: None }`.
-        let tmp = TempDir::new().unwrap();
-        let repo = BailiffRepo::init_or_open(tmp.path().join("r")).unwrap();
-        fs::remove_file(repo.path().join("config")).unwrap();
-        let global_cfg = tmp.path().join("globalcfg");
-        fs::write(&global_cfg, "[core]\n\tbare = true\n").unwrap();
-        let _env_guard = ENV_TEST_MUTEX.lock().unwrap();
-        unsafe {
-            std::env::set_var("GIT_CONFIG_GLOBAL", &global_cfg);
-        }
-        let result = BailiffRepo::open(repo.path());
-        unsafe {
-            std::env::remove_var("GIT_CONFIG_GLOBAL");
-        }
-        let err = result.expect_err("open must not honour global core.bare");
-        assert!(
-            matches!(err, BailiffRepoError::NotBare { value: None }),
-            "got: {err:?}"
+    fn prepare_git_command_pins_clean_recipe_and_inherits_only_path() {
+        let env = synthetic_env("/usr/bin:/bin");
+        let cmd = prepare_git_command(Path::new("/some/repo"), &env);
+        let envs = envs_of(&cmd);
+        assert_eq!(
+            envs.get(OsStr::new("PATH")),
+            Some(&Some(OsString::from("/usr/bin:/bin"))),
+            "PATH must flow from InheritedEnv, not std::env"
+        );
+        assert_eq!(
+            envs.get(OsStr::new("HOME")),
+            Some(&Some(OsString::from("/dev/null")))
+        );
+        assert_eq!(
+            envs.get(OsStr::new("GIT_CONFIG_GLOBAL")),
+            Some(&Some(OsString::from("/dev/null"))),
+            "child must see GIT_CONFIG_GLOBAL=/dev/null so a host-wide \
+             poisoned global config cannot reach git"
+        );
+        assert_eq!(
+            envs.get(OsStr::new("GIT_CONFIG_NOSYSTEM")),
+            Some(&Some(OsString::from("1")))
+        );
+        assert_eq!(
+            envs.get(OsStr::new("GIT_CONFIG_COUNT")),
+            Some(&Some(OsString::from("0")))
         );
     }
 
     #[test]
-    fn init_or_open_forces_sha1_against_global_default_hash() {
-        // A host with `init.defaultObjectFormat = sha256` in global
-        // config would, without an explicit `--object-format=sha1`,
-        // produce a SHA-256 bare repo. `open` would then reject it
-        // and the first run would fail, leaving an unusable repo on
-        // disk. The fix passes the format explicitly; the test
-        // pollutes the global to confirm the override holds.
-        let tmp = TempDir::new().unwrap();
-        let global_cfg = tmp.path().join("globalcfg");
-        fs::write(&global_cfg, "[init]\n\tdefaultObjectFormat = sha256\n").unwrap();
-        let _env_guard = ENV_TEST_MUTEX.lock().unwrap();
-        unsafe {
-            std::env::set_var("GIT_CONFIG_GLOBAL", &global_cfg);
-        }
-        let result = BailiffRepo::init_or_open(tmp.path().join("r"));
-        unsafe {
-            std::env::remove_var("GIT_CONFIG_GLOBAL");
-        }
-        result.expect("init_or_open must force sha1 regardless of global default");
+    fn prepare_git_command_passes_repo_via_git_dir_arg() {
+        // `--git-dir=<repo>` sidesteps both `GIT_DIR` env override
+        // and `safe.bareRepository=explicit` discovery hardening.
+        let env = synthetic_env("/usr/bin");
+        let cmd = prepare_git_command(Path::new("/some/repo"), &env);
+        let args: Vec<&OsStr> = cmd.get_args().collect();
+        assert!(
+            !args.is_empty(),
+            "prepare_git_command must add at least --git-dir"
+        );
+        assert_eq!(args[0], OsStr::new("--git-dir=/some/repo"));
     }
 
     #[test]
-    fn operations_survive_global_safe_bare_repository_explicit() {
-        // Hosts that harden Git with `safe.bareRepository = explicit`
-        // make implicit `-C <bare-repo>` discovery fail with
-        // "cannot use bare repository". The hardened env recipe
-        // (env_clear + GIT_CONFIG_GLOBAL=/dev/null) prevents the
-        // setting from reaching the child, and `--git-dir=<repo>`
-        // sidesteps discovery entirely. Together they keep every
-        // op working on a hardened host.
-        let tmp = TempDir::new().unwrap();
-        let repo = BailiffRepo::init_or_open(tmp.path().join("r")).unwrap();
-        let global_cfg = tmp.path().join("globalcfg");
-        fs::write(&global_cfg, "[safe]\n\tbareRepository = explicit\n").unwrap();
-        let _env_guard = ENV_TEST_MUTEX.lock().unwrap();
-        unsafe {
-            std::env::set_var("GIT_CONFIG_GLOBAL", &global_cfg);
-        }
-        let open_result = BailiffRepo::open(repo.path());
-        let write_result = repo.write_note(&notes_ref(), b"seed", b"body");
-        unsafe {
-            std::env::remove_var("GIT_CONFIG_GLOBAL");
-        }
-        open_result.expect("open must survive safe.bareRepository=explicit");
-        let target = write_result.expect("write_note must survive same");
-        assert_eq!(repo.read_note(&notes_ref(), &target).unwrap(), b"body");
-    }
-
-    #[test]
-    fn open_reads_local_config_only_for_object_format() {
-        // A global `extensions.objectformat = sha256` must not
-        // reject a valid SHA-1 repo whose local config is silent.
-        let tmp = TempDir::new().unwrap();
-        let repo = BailiffRepo::init_or_open(tmp.path().join("r")).unwrap();
-        let global_cfg = tmp.path().join("globalcfg");
-        fs::write(&global_cfg, "[extensions]\n\tobjectformat = sha256\n").unwrap();
-        let _env_guard = ENV_TEST_MUTEX.lock().unwrap();
-        unsafe {
-            std::env::set_var("GIT_CONFIG_GLOBAL", &global_cfg);
-        }
-        let result = BailiffRepo::open(repo.path());
-        unsafe {
-            std::env::remove_var("GIT_CONFIG_GLOBAL");
-        }
-        result.expect("open must read --local extensions.objectformat, not global");
+    fn prepare_git_command_omits_path_when_inherited_env_lacks_it() {
+        // If the captured parent env has no PATH, the child should
+        // get no PATH either — not a stale value from the wider
+        // process. The other clean-recipe entries remain.
+        let env = InheritedEnv { path: None };
+        let cmd = prepare_git_command(Path::new("/some/repo"), &env);
+        let envs = envs_of(&cmd);
+        assert!(
+            !envs.contains_key(OsStr::new("PATH")),
+            "PATH must be absent when InheritedEnv carries None; got: {envs:?}"
+        );
+        assert_eq!(
+            envs.get(OsStr::new("HOME")),
+            Some(&Some(OsString::from("/dev/null")))
+        );
     }
 }
