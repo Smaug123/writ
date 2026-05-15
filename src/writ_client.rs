@@ -6,7 +6,7 @@
 //! review attach, …) hang off the same client.
 //!
 //! Wire framing: one [`ClientMessage`] per line, one [`ServerMessage`]
-//! per line in reply. Reads are bounded by [`MAX_LINE_BYTES`] so a
+//! per line in reply. Reads are bounded by a 64 KiB per-line cap so a
 //! malformed broker can't make bailiff allocate without bound.
 //!
 //! Errors are tagged so callers can react without string-matching: a
