@@ -1,21 +1,24 @@
-//! Bare-repo helpers for bailiff's note-storage backend.
+//! Bare-repo helpers shared by writ and bailiff for note storage.
 //!
-//! Bailiff persists every writ-signed run as a Git note in a host-side
-//! bare repo it owns. This module is the thin wrapper that opens the
-//! repo, validates it matches the shape bailiff expects, and attaches
-//! note bodies to per-run seed OIDs under caller-supplied notes refs.
-//! See `docs/plans/2026-05-14-bailiff-split.md` slice B for the wider
-//! context.
+//! Under the cross-daemon ownership model pinned in slice B4 of
+//! `docs/plans/2026-05-14-bailiff-split.md`, each daemon owns its own
+//! host-side bare repo: writ persists every signed run as a Git note
+//! in its repo, bailiff curates plan-shaped views in its repo, and
+//! bailiff fetches writ's notes refs as a Git remote rather than
+//! writing into a shared repo. This module is the thin wrapper both
+//! daemons use to open their repo, validate it matches the shape they
+//! expect, and attach note bodies to per-run seed OIDs under
+//! caller-supplied notes refs.
 //!
 //! ## Threat model
 //!
-//! Bailiff *owns* its bare repo and is the sole writer (via writ,
-//! through this module). The validation below defends against operator
-//! error and on-disk corruption, not against an attacker who can write
-//! to bailiff's filesystem: a host that can mutate the repo can also
-//! forge the signing key, so adversarial-config rejections buy nothing
-//! on top. The minimum check surface — pinned at the top of the slice
-//! before any code was written — is:
+//! Each daemon *owns* the bare repo it writes into and is the sole
+//! writer (via this module). The validation below defends against
+//! operator error and on-disk corruption, not against an attacker who
+//! can write to the daemon's filesystem: a host that can mutate the
+//! repo can also forge the signing key, so adversarial-config
+//! rejections buy nothing on top. The minimum check surface — pinned
+//! at the top of the slice before any code was written — is:
 //!
 //! * `HEAD` present (a directory with no HEAD is not a Git repo).
 //! * `core.bare = true` via `git config --bool --get`, which uses
@@ -23,8 +26,8 @@
 //! * `objects/` and `refs/` exist as directories (so the bare layout
 //!   is at least plausibly intact).
 //! * `commondir` is absent at the top level (a worktree of a different
-//!   repo would have this file and is not what bailiff wants to write
-//!   notes into).
+//!   repo would have this file and is not what a `NotesRepo` is meant
+//!   to write into).
 //! * `extensions.objectformat` is unset or `sha1`. Wire-level
 //!   `GitObjectId` is 40-hex, so a SHA-256 repo would surface as a
 //!   parse failure later — rejecting at open time turns that into an
@@ -41,7 +44,8 @@
 //! `GIT_CONFIG_GLOBAL=/dev/null`, `GIT_CONFIG_NOSYSTEM=1`,
 //! `GIT_CONFIG_COUNT=0`), so neither an inherited `GIT_DIR` /
 //! `GIT_DEFAULT_HASH` nor a host-wide `safe.bareRepository` /
-//! `init.defaultObjectFormat` setting can subvert bailiff's repo.
+//! `init.defaultObjectFormat` setting can subvert the owning
+//! daemon's repo.
 //! We then point git at the repo via `--git-dir=<canonical_path>`
 //! instead of bare-repo discovery, which a hardened host can
 //! disable. See the `prepare_git_command` helper.
@@ -86,32 +90,32 @@ impl InheritedEnv {
     }
 }
 
-/// A validated handle on bailiff's bare notes repo.
+/// A validated handle on a daemon-owned bare notes repo.
 ///
-/// Construct via [`BailiffRepo::open`] (validation only) or
-/// [`BailiffRepo::init_or_open`] (initialise an empty bare repo on
+/// Construct via [`NotesRepo::open`] (validation only) or
+/// [`NotesRepo::init_or_open`] (initialise an empty bare repo on
 /// first run, then validate). The wrapped path is the canonicalised
 /// filesystem location; the canonical form is what the per-repo
-/// notes-write mutex is keyed on, so two `BailiffRepo` handles for
+/// notes-write mutex is keyed on, so two `NotesRepo` handles for
 /// the same on-disk repo share the same lock.
 #[derive(Debug)]
-pub struct BailiffRepo {
+pub struct NotesRepo {
     canonical_path: PathBuf,
     inherited_env: InheritedEnv,
 }
 
-impl BailiffRepo {
+impl NotesRepo {
     /// Open an existing bare repo at `path` after running the pinned
     /// minimal validation. The path is canonicalised so multiple
     /// handles for the same repo serialise on a shared mutex.
-    pub fn open(path: impl AsRef<Path>) -> Result<Self, BailiffRepoError> {
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, NotesRepoError> {
         Self::open_with_env(path.as_ref(), InheritedEnv::from_process())
     }
 
-    fn open_with_env(path: &Path, inherited_env: InheritedEnv) -> Result<Self, BailiffRepoError> {
+    fn open_with_env(path: &Path, inherited_env: InheritedEnv) -> Result<Self, NotesRepoError> {
         let canonical_path =
             path.canonicalize()
-                .map_err(|source| BailiffRepoError::Canonicalize {
+                .map_err(|source| NotesRepoError::Canonicalize {
                     path: path.to_path_buf(),
                     source,
                 })?;
@@ -134,20 +138,20 @@ impl BailiffRepo {
     /// to mutate any non-empty existing path makes accidental misuse —
     /// "you pointed me at your repo by mistake" — surface as an
     /// `Open*` validation error instead of as corruption.
-    pub fn init_or_open(path: impl AsRef<Path>) -> Result<Self, BailiffRepoError> {
+    pub fn init_or_open(path: impl AsRef<Path>) -> Result<Self, NotesRepoError> {
         let path = path.as_ref();
         let inherited_env = InheritedEnv::from_process();
         let needs_init = match std::fs::read_dir(path) {
             Ok(mut entries) => entries.next().is_none(),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                std::fs::create_dir_all(path).map_err(|source| BailiffRepoError::CreateDir {
+                std::fs::create_dir_all(path).map_err(|source| NotesRepoError::CreateDir {
                     path: path.to_path_buf(),
                     source,
                 })?;
                 true
             }
             Err(source) => {
-                return Err(BailiffRepoError::Io {
+                return Err(NotesRepoError::Io {
                     path: path.to_path_buf(),
                     source,
                 });
@@ -200,7 +204,7 @@ impl BailiffRepo {
         notes_ref: &NotesRef,
         seed: &[u8],
         body: &[u8],
-    ) -> Result<GitObjectId, BailiffRepoError> {
+    ) -> Result<GitObjectId, NotesRepoError> {
         // `git notes add -C <oid>` against Git's empty-blob OID
         // (`e69de29bb2d1d6434b8b29ae775ad8c2e48c5391`) succeeds without
         // attaching a note, so `write_note` would return a target OID
@@ -208,7 +212,7 @@ impl BailiffRepo {
         // front turns the silent gap into a typed error at the only
         // writer.
         if body.is_empty() {
-            return Err(BailiffRepoError::EmptyBody);
+            return Err(NotesRepoError::EmptyBody);
         }
         let _guard = lock_notes_write(&self.canonical_path);
         let target_oid = hash_object_stdin(&self.canonical_path, seed, &self.inherited_env)?;
@@ -227,8 +231,8 @@ impl BailiffRepo {
         // every config source except the repo's local file, so we
         // inject the identity via `-c` flags rather than rely on
         // operator gitconfig. The values are placeholders — the
-        // commit author is not part of bailiff's audit trail; the
-        // signed envelope inside the note body is.
+        // commit author is not part of the audit trail; the signed
+        // envelope inside the note body is.
         run_git(
             &self.canonical_path,
             [
@@ -259,7 +263,7 @@ impl BailiffRepo {
         &self,
         notes_ref: &NotesRef,
         target_oid: &GitObjectId,
-    ) -> Result<Vec<u8>, BailiffRepoError> {
+    ) -> Result<Vec<u8>, NotesRepoError> {
         // `git notes show` writes the note blob verbatim
         // (`fwrite(buf, 1, size, stdout)` — no implicit trailing
         // newline), and our `write_note` references the body via
@@ -280,20 +284,20 @@ impl BailiffRepo {
     }
 }
 
-fn validate_bare_layout(path: &Path, env: &InheritedEnv) -> Result<(), BailiffRepoError> {
+fn validate_bare_layout(path: &Path, env: &InheritedEnv) -> Result<(), NotesRepoError> {
     let head = path.join("HEAD");
     if !head.is_file() {
-        return Err(BailiffRepoError::MissingHead {
+        return Err(NotesRepoError::MissingHead {
             path: path.to_path_buf(),
         });
     }
     let objects = path.join("objects");
     if !is_dir(&objects) {
-        return Err(BailiffRepoError::MissingObjectsDir { path: objects });
+        return Err(NotesRepoError::MissingObjectsDir { path: objects });
     }
     let refs = path.join("refs");
     if !is_dir(&refs) {
-        return Err(BailiffRepoError::MissingRefsDir { path: refs });
+        return Err(NotesRepoError::MissingRefsDir { path: refs });
     }
     // `commondir` at the top level of a worktree points at the shared
     // dir of the parent repo; in a healthy standalone bare repo it
@@ -303,11 +307,11 @@ fn validate_bare_layout(path: &Path, env: &InheritedEnv) -> Result<(), BailiffRe
     let commondir = path.join("commondir");
     match std::fs::symlink_metadata(&commondir) {
         Ok(_) => {
-            return Err(BailiffRepoError::Worktree { path: commondir });
+            return Err(NotesRepoError::Worktree { path: commondir });
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(source) => {
-            return Err(BailiffRepoError::Io {
+            return Err(NotesRepoError::Io {
                 path: commondir,
                 source,
             });
@@ -315,12 +319,12 @@ fn validate_bare_layout(path: &Path, env: &InheritedEnv) -> Result<(), BailiffRe
     }
     match git_config_get_bool(path, "core.bare", env)? {
         Some(true) => {}
-        other => return Err(BailiffRepoError::NotBare { value: other }),
+        other => return Err(NotesRepoError::NotBare { value: other }),
     }
     if let Some(fmt) = git_config_get(path, "extensions.objectformat", env)?
         && fmt != "sha1"
     {
-        return Err(BailiffRepoError::UnsupportedObjectFormat { value: fmt });
+        return Err(NotesRepoError::UnsupportedObjectFormat { value: fmt });
     }
     Ok(())
 }
@@ -374,7 +378,7 @@ fn run_git<'a, I>(
     stdin_input: Option<&[u8]>,
     capture: CaptureOutput,
     env: &InheritedEnv,
-) -> Result<Vec<u8>, BailiffRepoError>
+) -> Result<Vec<u8>, NotesRepoError>
 where
     I: IntoIterator<Item = &'a str>,
 {
@@ -394,7 +398,7 @@ where
 
     let mut child = command
         .spawn()
-        .map_err(|source| BailiffRepoError::GitSpawn { source })?;
+        .map_err(|source| NotesRepoError::GitSpawn { source })?;
 
     if let Some(bytes) = stdin_input {
         let mut stdin = child
@@ -403,7 +407,7 @@ where
             .expect("stdin was configured as Stdio::piped()");
         stdin
             .write_all(bytes)
-            .map_err(|source| BailiffRepoError::GitStdinWrite { source })?;
+            .map_err(|source| NotesRepoError::GitStdinWrite { source })?;
         drop(stdin);
     }
 
@@ -411,7 +415,7 @@ where
     if let Some(mut stdout) = child.stdout.take() {
         stdout
             .read_to_end(&mut stdout_bytes)
-            .map_err(|source| BailiffRepoError::GitStdoutRead { source })?;
+            .map_err(|source| NotesRepoError::GitStdoutRead { source })?;
     }
     let mut stderr_bytes = Vec::new();
     if let Some(mut stderr) = child.stderr.take() {
@@ -420,9 +424,9 @@ where
 
     let status = child
         .wait()
-        .map_err(|source| BailiffRepoError::GitWait { source })?;
+        .map_err(|source| NotesRepoError::GitWait { source })?;
     if !status.success() {
-        return Err(BailiffRepoError::GitFailed {
+        return Err(NotesRepoError::GitFailed {
             args: args.iter().map(|s| (*s).to_string()).collect(),
             status,
             stderr: String::from_utf8_lossy(&stderr_bytes).into_owned(),
@@ -435,7 +439,7 @@ fn git_config_get_bool(
     repo: &Path,
     key: &str,
     env: &InheritedEnv,
-) -> Result<Option<bool>, BailiffRepoError> {
+) -> Result<Option<bool>, NotesRepoError> {
     // `--local` is load-bearing: without it, `git config --get`
     // also reads `~/.gitconfig` and the system config, so a global
     // `core.bare = true` would let any directory with HEAD/objects/
@@ -448,7 +452,7 @@ fn git_config_get_bool(
     match trimmed {
         "true" => Ok(Some(true)),
         "false" => Ok(Some(false)),
-        other => Err(BailiffRepoError::ConfigBoolUnparseable {
+        other => Err(NotesRepoError::ConfigBoolUnparseable {
             key: key.to_string(),
             got: other.to_string(),
         }),
@@ -459,7 +463,7 @@ fn git_config_get(
     repo: &Path,
     key: &str,
     env: &InheritedEnv,
-) -> Result<Option<String>, BailiffRepoError> {
+) -> Result<Option<String>, NotesRepoError> {
     let output = run_git_config(repo, ["--local", "--get", key], env)?;
     Ok(output.map(|s| s.trim().to_string()))
 }
@@ -468,7 +472,7 @@ fn run_git_config<'a>(
     repo: &Path,
     config_args: impl IntoIterator<Item = &'a str>,
     env: &InheritedEnv,
-) -> Result<Option<String>, BailiffRepoError> {
+) -> Result<Option<String>, NotesRepoError> {
     let mut command = prepare_git_command(repo, env);
     command.arg("config");
     for arg in config_args {
@@ -479,17 +483,17 @@ fn run_git_config<'a>(
     command.stderr(Stdio::piped());
     let output = command
         .output()
-        .map_err(|source| BailiffRepoError::GitSpawn { source })?;
+        .map_err(|source| NotesRepoError::GitSpawn { source })?;
     if output.status.success() {
         let s = String::from_utf8(output.stdout)
-            .map_err(|source| BailiffRepoError::ConfigNonUtf8 { source })?;
+            .map_err(|source| NotesRepoError::ConfigNonUtf8 { source })?;
         Ok(Some(s))
     } else if output.status.code() == Some(1) {
         // Per `git config(1)`, exit code 1 means the key is not set.
         // Any other non-zero exit is an actual error.
         Ok(None)
     } else {
-        Err(BailiffRepoError::GitFailed {
+        Err(NotesRepoError::GitFailed {
             args: vec!["config".to_string()],
             status: output.status,
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
@@ -501,7 +505,7 @@ fn hash_object_stdin(
     repo: &Path,
     bytes: &[u8],
     env: &InheritedEnv,
-) -> Result<GitObjectId, BailiffRepoError> {
+) -> Result<GitObjectId, NotesRepoError> {
     let stdout = run_git(
         repo,
         ["hash-object", "-w", "--stdin"].iter().copied(),
@@ -509,10 +513,10 @@ fn hash_object_stdin(
         CaptureOutput::Capture,
         env,
     )?;
-    let s = String::from_utf8(stdout)
-        .map_err(|source| BailiffRepoError::HashObjectNonUtf8 { source })?;
+    let s =
+        String::from_utf8(stdout).map_err(|source| NotesRepoError::HashObjectNonUtf8 { source })?;
     let trimmed = s.trim();
-    GitObjectId::new(trimmed).map_err(|source| BailiffRepoError::HashObjectParse {
+    GitObjectId::new(trimmed).map_err(|source| NotesRepoError::HashObjectParse {
         raw: trimmed.to_string(),
         source,
     })
@@ -528,10 +532,10 @@ fn lock_notes_write(canonical_path: &Path) -> MutexGuard<'static, ()> {
         if let Some(m) = guard.get(canonical_path) {
             m
         } else {
-            // Leaking a `Box<Mutex<()>>` once per distinct bailiff
-            // repo gives every handle a `'static` reference to share.
+            // Leaking a `Box<Mutex<()>>` once per distinct repo
+            // gives every handle a `'static` reference to share.
             // The number of distinct repos in a single process is
-            // bounded by deployment shape (one bailiff repo today,
+            // bounded by deployment shape (one per daemon today,
             // perhaps a handful in tests) so the leak is negligible.
             let leaked: &'static Mutex<()> = Box::leak(Box::new(Mutex::new(())));
             guard.insert(canonical_path.to_path_buf(), leaked);
@@ -548,7 +552,7 @@ fn lock_notes_write(canonical_path: &Path) -> MutexGuard<'static, ()> {
 }
 
 #[derive(Debug, thiserror::Error)]
-pub enum BailiffRepoError {
+pub enum NotesRepoError {
     #[error("cannot canonicalise repo path {path:?}: {source}")]
     Canonicalize {
         path: PathBuf,
@@ -565,11 +569,11 @@ pub enum BailiffRepoError {
     MissingObjectsDir { path: PathBuf },
     #[error("repo missing refs directory at {path:?}")]
     MissingRefsDir { path: PathBuf },
-    #[error("worktree marker {path:?} present; bailiff requires a standalone bare repo")]
+    #[error("worktree marker {path:?} present; NotesRepo requires a standalone bare repo")]
     Worktree { path: PathBuf },
     #[error("repo has core.bare={value:?}, expected core.bare=true")]
     NotBare { value: Option<bool> },
-    #[error("repo has extensions.objectformat={value:?}; bailiff only supports sha1")]
+    #[error("repo has extensions.objectformat={value:?}; NotesRepo only supports sha1")]
     UnsupportedObjectFormat { value: String },
     #[error("git config --bool --get {key} returned non-bool {got:?}")]
     ConfigBoolUnparseable { key: String, got: String },
@@ -620,7 +624,7 @@ mod tests {
     fn init_or_open_creates_a_bare_repo() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("bailiff-repo");
-        let repo = BailiffRepo::init_or_open(&path).unwrap();
+        let repo = NotesRepo::init_or_open(&path).unwrap();
         assert!(path.join("HEAD").is_file(), "HEAD should exist after init");
         assert!(path.join("objects").is_dir());
         assert!(path.join("refs").is_dir());
@@ -632,17 +636,17 @@ mod tests {
     fn init_or_open_is_idempotent_across_calls() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("bailiff-repo");
-        let a = BailiffRepo::init_or_open(&path).unwrap();
-        let b = BailiffRepo::init_or_open(&path).unwrap();
+        let a = NotesRepo::init_or_open(&path).unwrap();
+        let b = NotesRepo::init_or_open(&path).unwrap();
         assert_eq!(a.path(), b.path());
     }
 
     #[test]
     fn open_rejects_a_plain_directory() {
         let tmp = TempDir::new().unwrap();
-        let err = BailiffRepo::open(tmp.path()).unwrap_err();
+        let err = NotesRepo::open(tmp.path()).unwrap_err();
         assert!(
-            matches!(err, BailiffRepoError::MissingHead { .. }),
+            matches!(err, NotesRepoError::MissingHead { .. }),
             "got: {err:?}"
         );
     }
@@ -662,16 +666,16 @@ mod tests {
             .status()
             .unwrap();
         assert!(status.success());
-        let err = BailiffRepo::open(&path).unwrap_err();
+        let err = NotesRepo::open(&path).unwrap_err();
         // Top-level: no HEAD file at the worktree root.
         assert!(
-            matches!(err, BailiffRepoError::MissingHead { .. }),
+            matches!(err, NotesRepoError::MissingHead { .. }),
             "got: {err:?}"
         );
         // Inner `.git`: HEAD exists but core.bare=false.
-        let err_inner = BailiffRepo::open(path.join(".git")).unwrap_err();
+        let err_inner = NotesRepo::open(path.join(".git")).unwrap_err();
         assert!(
-            matches!(err_inner, BailiffRepoError::NotBare { value: Some(false) }),
+            matches!(err_inner, NotesRepoError::NotBare { value: Some(false) }),
             "got: {err_inner:?}"
         );
     }
@@ -679,11 +683,11 @@ mod tests {
     #[test]
     fn open_rejects_repo_missing_head() {
         let tmp = TempDir::new().unwrap();
-        let repo = BailiffRepo::init_or_open(tmp.path().join("r")).unwrap();
+        let repo = NotesRepo::init_or_open(tmp.path().join("r")).unwrap();
         fs::remove_file(repo.path().join("HEAD")).unwrap();
-        let err = BailiffRepo::open(repo.path()).unwrap_err();
+        let err = NotesRepo::open(repo.path()).unwrap_err();
         assert!(
-            matches!(err, BailiffRepoError::MissingHead { .. }),
+            matches!(err, NotesRepoError::MissingHead { .. }),
             "got: {err:?}"
         );
     }
@@ -691,11 +695,11 @@ mod tests {
     #[test]
     fn open_rejects_repo_missing_objects() {
         let tmp = TempDir::new().unwrap();
-        let repo = BailiffRepo::init_or_open(tmp.path().join("r")).unwrap();
+        let repo = NotesRepo::init_or_open(tmp.path().join("r")).unwrap();
         fs::remove_dir_all(repo.path().join("objects")).unwrap();
-        let err = BailiffRepo::open(repo.path()).unwrap_err();
+        let err = NotesRepo::open(repo.path()).unwrap_err();
         assert!(
-            matches!(err, BailiffRepoError::MissingObjectsDir { .. }),
+            matches!(err, NotesRepoError::MissingObjectsDir { .. }),
             "got: {err:?}"
         );
     }
@@ -703,11 +707,11 @@ mod tests {
     #[test]
     fn open_rejects_repo_missing_refs() {
         let tmp = TempDir::new().unwrap();
-        let repo = BailiffRepo::init_or_open(tmp.path().join("r")).unwrap();
+        let repo = NotesRepo::init_or_open(tmp.path().join("r")).unwrap();
         fs::remove_dir_all(repo.path().join("refs")).unwrap();
-        let err = BailiffRepo::open(repo.path()).unwrap_err();
+        let err = NotesRepo::open(repo.path()).unwrap_err();
         assert!(
-            matches!(err, BailiffRepoError::MissingRefsDir { .. }),
+            matches!(err, NotesRepoError::MissingRefsDir { .. }),
             "got: {err:?}"
         );
     }
@@ -715,14 +719,15 @@ mod tests {
     #[test]
     fn open_rejects_repo_with_commondir_marker() {
         // Worktrees of another repo have a `commondir` file at their
-        // top level pointing at the parent's git dir; bailiff's bare
-        // repo never has one. Plant the marker and confirm we reject.
+        // top level pointing at the parent's git dir; a NotesRepo
+        // bare repo never has one. Plant the marker and confirm we
+        // reject.
         let tmp = TempDir::new().unwrap();
-        let repo = BailiffRepo::init_or_open(tmp.path().join("r")).unwrap();
+        let repo = NotesRepo::init_or_open(tmp.path().join("r")).unwrap();
         fs::write(repo.path().join("commondir"), "../some/other/.git\n").unwrap();
-        let err = BailiffRepo::open(repo.path()).unwrap_err();
+        let err = NotesRepo::open(repo.path()).unwrap_err();
         assert!(
-            matches!(err, BailiffRepoError::Worktree { .. }),
+            matches!(err, NotesRepoError::Worktree { .. }),
             "got: {err:?}"
         );
     }
@@ -746,11 +751,11 @@ mod tests {
             // versions that *can* produce a sha256 repo.
             _ => return,
         }
-        let err = BailiffRepo::open(&path).unwrap_err();
+        let err = NotesRepo::open(&path).unwrap_err();
         assert!(
             matches!(
                 err,
-                BailiffRepoError::UnsupportedObjectFormat { ref value } if value == "sha256"
+                NotesRepoError::UnsupportedObjectFormat { ref value } if value == "sha256"
             ),
             "got: {err:?}"
         );
@@ -759,7 +764,7 @@ mod tests {
     #[test]
     fn write_note_round_trips_through_read_note() {
         let tmp = TempDir::new().unwrap();
-        let repo = BailiffRepo::init_or_open(tmp.path().join("r")).unwrap();
+        let repo = NotesRepo::init_or_open(tmp.path().join("r")).unwrap();
         let nref = notes_ref();
         let body = b"the signed envelope bytes go here";
         let seed = b"run-id-1";
@@ -771,7 +776,7 @@ mod tests {
     #[test]
     fn write_note_keys_distinct_seeds_to_distinct_oids() {
         let tmp = TempDir::new().unwrap();
-        let repo = BailiffRepo::init_or_open(tmp.path().join("r")).unwrap();
+        let repo = NotesRepo::init_or_open(tmp.path().join("r")).unwrap();
         let nref = notes_ref();
         let a = repo.write_note(&nref, b"run-a", b"body A").unwrap();
         let b = repo.write_note(&nref, b"run-b", b"body B").unwrap();
@@ -788,12 +793,12 @@ mod tests {
         // surfaces as our `GitFailed` variant — the property that
         // makes accidental duplicate writes loud rather than silent.
         let tmp = TempDir::new().unwrap();
-        let repo = BailiffRepo::init_or_open(tmp.path().join("r")).unwrap();
+        let repo = NotesRepo::init_or_open(tmp.path().join("r")).unwrap();
         let nref = notes_ref();
         let first = repo.write_note(&nref, b"seed", b"first body").unwrap();
         let err = repo.write_note(&nref, b"seed", b"second body").unwrap_err();
         match err {
-            BailiffRepoError::GitFailed { ref args, .. } => {
+            NotesRepoError::GitFailed { ref args, .. } => {
                 assert!(
                     args.iter().any(|a| a == "notes"),
                     "expected the notes command to be the failure point, got: {args:?}"
@@ -808,7 +813,7 @@ mod tests {
     #[test]
     fn read_note_errors_on_missing_target() {
         let tmp = TempDir::new().unwrap();
-        let repo = BailiffRepo::init_or_open(tmp.path().join("r")).unwrap();
+        let repo = NotesRepo::init_or_open(tmp.path().join("r")).unwrap();
         let nref = notes_ref();
         // Write *something* under the ref so the ref exists, but ask
         // for a different target — exercises "ref present, no note
@@ -817,7 +822,7 @@ mod tests {
         let absent = GitObjectId::new("0000000000000000000000000000000000000000").unwrap();
         let err = repo.read_note(&nref, &absent).unwrap_err();
         assert!(
-            matches!(err, BailiffRepoError::GitFailed { .. }),
+            matches!(err, NotesRepoError::GitFailed { .. }),
             "got: {err:?}"
         );
     }
@@ -825,7 +830,7 @@ mod tests {
     #[test]
     fn notes_under_distinct_refs_do_not_collide() {
         let tmp = TempDir::new().unwrap();
-        let repo = BailiffRepo::init_or_open(tmp.path().join("r")).unwrap();
+        let repo = NotesRepo::init_or_open(tmp.path().join("r")).unwrap();
         let ref_a = NotesRef::try_new("refs/notes/writ/v1/agent-outputs").unwrap();
         let ref_b = NotesRef::try_new("refs/notes/bailiff/v1/plans").unwrap();
         let target_a = repo.write_note(&ref_a, b"seed", b"under A").unwrap();
@@ -842,7 +847,7 @@ mod tests {
         // read path strips exactly one. Bodies that end with one
         // newline must come back identical (not double-stripped).
         let tmp = TempDir::new().unwrap();
-        let repo = BailiffRepo::init_or_open(tmp.path().join("r")).unwrap();
+        let repo = NotesRepo::init_or_open(tmp.path().join("r")).unwrap();
         let nref = notes_ref();
         let body = b"body ending in a newline\n";
         let target = repo.write_note(&nref, b"seed", body).unwrap();
@@ -856,10 +861,10 @@ mod tests {
         // before they reach git rather than returning a target OID
         // that read_note cannot resolve.
         let tmp = TempDir::new().unwrap();
-        let repo = BailiffRepo::init_or_open(tmp.path().join("r")).unwrap();
+        let repo = NotesRepo::init_or_open(tmp.path().join("r")).unwrap();
         let nref = notes_ref();
         let err = repo.write_note(&nref, b"seed", b"").unwrap_err();
-        assert!(matches!(err, BailiffRepoError::EmptyBody), "got: {err:?}");
+        assert!(matches!(err, NotesRepoError::EmptyBody), "got: {err:?}");
     }
 
     #[test]
@@ -883,9 +888,9 @@ mod tests {
         // init was not run against the existing repo.
         let head_before = fs::read(git_dir.join("HEAD")).unwrap();
         let config_before = fs::read(git_dir.join("config")).unwrap();
-        let err = BailiffRepo::init_or_open(&git_dir).unwrap_err();
+        let err = NotesRepo::init_or_open(&git_dir).unwrap_err();
         assert!(
-            matches!(err, BailiffRepoError::NotBare { value: Some(false) }),
+            matches!(err, NotesRepoError::NotBare { value: Some(false) }),
             "got: {err:?}"
         );
         assert_eq!(fs::read(git_dir.join("HEAD")).unwrap(), head_before);
@@ -898,7 +903,7 @@ mod tests {
         // are arbitrary bytes). The pipe-to-stdin path must not
         // corrupt non-UTF-8 input.
         let tmp = TempDir::new().unwrap();
-        let repo = BailiffRepo::init_or_open(tmp.path().join("r")).unwrap();
+        let repo = NotesRepo::init_or_open(tmp.path().join("r")).unwrap();
         let nref = notes_ref();
         let body: Vec<u8> = (0u8..=255).collect();
         let target = repo.write_note(&nref, b"seed", &body).unwrap();
