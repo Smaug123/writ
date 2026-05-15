@@ -255,14 +255,17 @@ one or two variants. Add a bailiff binary skeleton
 (`src/bin/bailiff.rs`) that connects to writ over the Unix socket
 and exposes no commands yet. No behaviour change to existing flows.
 
-### Slice B — bailiff repo, writ signing
+### Slice B — bare repos, writ signing
 
-Bailiff: config path for its bare repo; init on first run; helpers to
-write notes whose body **is** the signed envelope. Writ: SSH signing
-key in `SecretStore`. A round-trip test where bailiff sends `RunAgent
-{ prompt: "noop", capability_set: minimal, purpose: "test",
-output_ref: ... }`, writ runs a no-op child, writes a signed note to
-bailiff's repo, and bailiff verifies the signature.
+Each daemon owns its own bare Git repo. Writ writes
+`refs/notes/writ/v1/agent-outputs` into writ's repo; bailiff treats
+writ's repo as a Git remote and fetches the writ-owned refs into
+bailiff's repo, then writes its own `refs/notes/bailiff/v1/plans/*`
+curation refs locally. Writ: SSH signing key in `SecretStore`. A
+round-trip test where bailiff sends `RunAgent { prompt: "noop",
+capability_set: minimal, purpose: "test", output_ref: ... }`, writ
+runs a no-op child, writes a signed note to writ's repo, bailiff
+fetches and verifies the signature.
 
 **Design decisions pinned 2026-05-15** (after PR #102 was abandoned as
 over-engineered):
@@ -280,19 +283,35 @@ over-engineered):
   owner namespace: `refs/notes/writ/v1/agent-outputs`,
   `refs/notes/bailiff/v1/plans/<plan-id>`, etc. Bumping `writ/v1` →
   `writ/v2` is independent of bumping `bailiff/v1` → `bailiff/v2`.
-- *Threat model.* Bailiff **owns** its bare repo and is the sole
-  writer (via writ through `BailiffRepo`). Validation defends against
-  operator error and corruption, not against an attacker who can write
-  to bailiff's filesystem. A compromised host can also forge the
-  signing key, so adversarial-repo validation buys nothing on top.
-  `BailiffRepo::open` therefore checks: HEAD present, `core.bare=true`
-  (via `git config --bool --get` — last-wins handling falls out for
-  free), `objects/` and `refs/` exist as directories, `commondir`
-  absent (`symlink_metadata`), `extensions.objectformat` unset or
-  `sha1` (via `git config --get`), and a process-wide notes-write
-  mutex keyed on the canonical path (the only race-correctness check
-  that's actually load-bearing — concurrent `git notes add` against
-  the same ref silently loses notes, empirically verified).
+- *Threat model.* Each daemon **owns** its own bare repo and is the
+  sole writer to it. Validation defends against operator error and
+  corruption, not against an attacker who can write to the daemon's
+  filesystem. A compromised host can also forge the signing key, so
+  adversarial-repo validation buys nothing on top. `NotesRepo::open`
+  (the helper both daemons share — formerly `BailiffRepo`, renamed in
+  slice B4 prep once cross-daemon ownership was pinned) therefore
+  checks: HEAD present, `core.bare=true` (via `git config --bool
+  --get` — last-wins handling falls out for free), `objects/` and
+  `refs/` exist as directories, `commondir` absent
+  (`symlink_metadata`), `extensions.objectformat` unset or `sha1`
+  (via `git config --get`), and a process-wide notes-write mutex
+  keyed on the canonical path (race correctness, not security:
+  concurrent `git notes add` against the same ref silently loses
+  notes, empirically verified).
+- *Cross-daemon ownership (pinned 2026-05-15, slice B4).* Writ does
+  **not** write into bailiff's repo. Each daemon writes only its own
+  repo; bailiff configures writ's repo as a Git remote and fetches
+  `refs/notes/writ/v1/*`. This keeps every cross-daemon contract on
+  the wire (or via Git's protocol), removes shared-filesystem
+  coupling, makes "one writer per repo" structural rather than
+  enforced by a per-repo mutex, and matches the namespace partition
+  the plan already has. The wire `RunAgent` request stays path-free.
+- *Path discovery (pinned 2026-05-15, slice B4).* Both daemons
+  default to well-known XDG paths (`$XDG_DATA_HOME/writ/repo`,
+  `$XDG_DATA_HOME/bailiff/repo`); config overrides for unusual
+  layouts. Bailiff resolves writ's repo location the same way writ
+  does — from its own copy of the convention — so there is no
+  duplicate-config edit when moving the path.
 
 ### Slice C — plan submission via the new shape
 

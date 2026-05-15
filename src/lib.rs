@@ -15,8 +15,6 @@ pub mod agent_vm_lifecycle;
 #[cfg(feature = "host")]
 pub mod audit;
 pub mod bailiff;
-#[cfg(feature = "host")]
-pub mod bailiff_repo;
 pub(crate) mod bearer;
 #[cfg(feature = "host")]
 pub(crate) mod clean_git;
@@ -39,6 +37,8 @@ pub mod github;
 pub mod github_git_db;
 #[cfg(feature = "host")]
 pub mod nix_cache;
+#[cfg(feature = "host")]
+pub mod notes_repo;
 #[cfg(feature = "host")]
 pub mod openai_chatgpt_auth;
 #[cfg(feature = "host")]
