@@ -408,11 +408,16 @@ CLI reference.
    workflow; every agent run for that plan happens inside that
    session. Confirm during slice C.
 
-2. **Exact ref scheme inside bailiff's repo.** Probably
-   `refs/notes/writ/agent-outputs` for writ-written notes (keyed by a
-   per-run identifier blob), with bailiff-owned curation refs
-   (`refs/notes/bailiff/plans/<plan-id>`, etc.) pointing into them.
-   Pin during slice B.
+2. **Exact ref scheme inside bailiff's repo.** *Pinned 2026-05-15
+   (slice C1):* one ref per plan at
+   `refs/notes/bailiff/v1/plans/<plan-id>`. The submission note and
+   every later per-plan artefact (decisions, reviews, aborts in
+   slices D/E) attach to OIDs *within that plan's ref*, so
+   `git notes --ref=<ref> list` is the complete history of one plan
+   and `git update-ref -d <ref>` deletes that plan's history
+   cleanly. Writ-written notes stay on writ's side at
+   `refs/notes/writ/v1/agent-outputs`; bailiff references writ's
+   blob OID from its own plan note (see `bailiff_plan_note::PlanNote`).
 
 3. **Crash semantics.** If the agent dies mid-run, writ still writes
    whatever was captured + exit code; bailiff decides whether to keep
