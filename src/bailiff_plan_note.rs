@@ -116,10 +116,16 @@ pub fn plan_seed_blob_bytes(plan_id: PlanId) -> Vec<u8> {
 /// - `plan_id`: bailiff's identifier for the workflow.
 /// - `purpose`: the opaque tag bailiff sent on `RunAgent`; recorded
 ///   verbatim for cross-correlation with writ's audit row.
-/// - `writ_output_oid`: the OID of writ's signed envelope blob in
-///   writ's `refs/notes/writ/v1/agent-outputs` ref. A reader fetches
-///   that ref into bailiff's repo (or works from a clone that
-///   already mirrors it) and reads the envelope at this OID.
+/// - `writ_output_oid`: the *notes-target* OID inside writ's
+///   `refs/notes/writ/v1/agent-outputs` ref — a per-run seed object
+///   the writ-side `RunAgent` handler hashed from the run id. The
+///   signed envelope itself lives in the *note body* attached at
+///   this target (per slice B's "envelope in note body, not a
+///   separate blob" decision), so a reader fetches
+///   `refs/notes/writ/v1/agent-outputs` into bailiff's repo and runs
+///   `git notes --ref=refs/notes/writ/v1/agent-outputs show
+///   <writ_output_oid>` to retrieve the envelope bytes. `cat-file
+///   <writ_output_oid>` returns the seed object, not the envelope.
 /// - `signed_metadata`: the full `SignedRunMetadata` writ returned.
 ///   Carries the originating prompt hash, output envelope hash,
 ///   granted capabilities, exit code, completion time, session id,
