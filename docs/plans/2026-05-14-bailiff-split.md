@@ -258,11 +258,41 @@ and exposes no commands yet. No behaviour change to existing flows.
 ### Slice B — bailiff repo, writ signing
 
 Bailiff: config path for its bare repo; init on first run; helpers to
-write a blob + attached note. Writ: SSH signing key in `SecretStore`.
-A round-trip test where bailiff sends `RunAgent { prompt: "noop",
-capability_set: minimal, purpose: "test", output_ref: ... }`, writ
-runs a no-op child, writes an empty signed note to bailiff's repo,
-and bailiff verifies the signature.
+write notes whose body **is** the signed envelope. Writ: SSH signing
+key in `SecretStore`. A round-trip test where bailiff sends `RunAgent
+{ prompt: "noop", capability_set: minimal, purpose: "test",
+output_ref: ... }`, writ runs a no-op child, writes a signed note to
+bailiff's repo, and bailiff verifies the signature.
+
+**Design decisions pinned 2026-05-15** (after PR #102 was abandoned as
+over-engineered):
+
+- *Durability — note body carries the envelope.* The envelope bytes go
+  into the note body, not into a separate `git hash-object`-written
+  blob. `git clone` and `git fetch` are reachability-based, so a loose
+  blob named only by OID inside a note body would be missing from
+  remote clones and would be eligible for `git gc --prune`. Putting the
+  envelope in the note body makes the bytes reachable via the notes
+  ref, which the verification story already requires. The notes
+  attachment object is a per-run seed blob whose only role is to be an
+  OID the note can be keyed on; it carries no payload.
+- *Namespace versioning.* Notes refs encode a version inside the
+  owner namespace: `refs/notes/writ/v1/agent-outputs`,
+  `refs/notes/bailiff/v1/plans/<plan-id>`, etc. Bumping `writ/v1` →
+  `writ/v2` is independent of bumping `bailiff/v1` → `bailiff/v2`.
+- *Threat model.* Bailiff **owns** its bare repo and is the sole
+  writer (via writ through `BailiffRepo`). Validation defends against
+  operator error and corruption, not against an attacker who can write
+  to bailiff's filesystem. A compromised host can also forge the
+  signing key, so adversarial-repo validation buys nothing on top.
+  `BailiffRepo::open` therefore checks: HEAD present, `core.bare=true`
+  (via `git config --bool --get` — last-wins handling falls out for
+  free), `objects/` and `refs/` exist as directories, `commondir`
+  absent (`symlink_metadata`), `extensions.objectformat` unset or
+  `sha1` (via `git config --get`), and a process-wide notes-write
+  mutex keyed on the canonical path (the only race-correctness check
+  that's actually load-bearing — concurrent `git notes add` against
+  the same ref silently loses notes, empirically verified).
 
 ### Slice C — plan submission via the new shape
 
