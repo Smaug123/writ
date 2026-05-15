@@ -461,6 +461,35 @@ async fn validate_bare_repo(path: &Path) -> Result<(), BailiffRepoError> {
             });
         }
     }
+    // Reject storage-path symlinks. Git follows `objects/` and
+    // `refs/` symlinks transparently under `--git-dir`, so if
+    // either is replaced with a symlink to another directory,
+    // `write_blob` and `write_note` would write outside the
+    // canonical bare repo path even though `--git-dir` points at
+    // it. `git init --bare` plants both as plain directories;
+    // anything else here is a redirect attempt or a non-standard
+    // layout, and bailiff's repo doesn't accept either.
+    //
+    // Use `symlink_metadata` so the link itself is examined, not
+    // the directory it resolves to. Missing storage paths are
+    // allowed: `init_or_open` may call this before the first
+    // write has materialised `refs/`, but is_symlink() returning
+    // false for a normal directory keeps the validation tight.
+    for name in ["objects", "refs"] {
+        match tokio::fs::symlink_metadata(path.join(name)).await {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => return Err(BailiffRepoError::Io(source)),
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(BailiffRepoError::NotABareRepo {
+                    path: path.display().to_string(),
+                    reason: format!(
+                        "`{name}/` is a symlink; bare repos used by bailiff must store {name} in place"
+                    ),
+                });
+            }
+            Ok(_) => {}
+        }
+    }
     Ok(())
 }
 
@@ -468,7 +497,13 @@ async fn validate_bare_repo(path: &Path) -> Result<(), BailiffRepoError> {
 /// SHA-1 repos omit this key entirely (the default), so a `None`
 /// here means SHA-1, not "unparseable config". Anything else
 /// (notably `sha256`) is what we reject upstream.
+///
+/// Git's "last value wins" rule applies here too: a config with
+/// `objectformat = sha1` followed by `objectformat = sha256`
+/// reads as sha256. Return the final assignment so a stacked
+/// config can't slip a SHA-256 repo past the sha1-only guard.
 fn extensions_object_format(text: &str) -> Option<String> {
+    let mut effective: Option<String> = None;
     let mut in_extensions = false;
     for raw_line in text.lines() {
         let line = raw_line.split('#').next().unwrap_or("").trim();
@@ -485,10 +520,10 @@ fn extensions_object_format(text: &str) -> Option<String> {
         if let Some((key, val)) = line.split_once('=').map(|(k, v)| (k.trim(), v.trim()))
             && key.eq_ignore_ascii_case("objectformat")
         {
-            return Some(val.to_string());
+            effective = Some(val.to_string());
         }
     }
-    None
+    effective
 }
 
 /// Minimal INI-style scan for `bare = true` under `[core]`. Git's
@@ -1262,6 +1297,58 @@ mod tests {
         }
     }
 
+    /// A bare repo whose `objects/` is a symlink would land
+    /// `write_blob` payloads in whatever directory the symlink
+    /// points at, not the canonical repo path. Reject such repos
+    /// up front. `git init --bare` never produces this layout;
+    /// it's an attacker (or operator-error) shape.
+    #[tokio::test]
+    async fn open_rejects_a_repo_with_symlinked_objects() {
+        let dir = TempDir::new().unwrap();
+        let repo_path = dir.path().join("redirected-objects");
+        let _ = BailiffRepo::init_or_open(&repo_path).await.unwrap();
+        // Replace the real objects/ with a symlink to an outside dir.
+        let outside = dir.path().join("stolen-objects");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::remove_dir_all(repo_path.join("objects")).unwrap();
+        std::os::unix::fs::symlink(&outside, repo_path.join("objects")).unwrap();
+        let err = BailiffRepo::open(&repo_path).await.unwrap_err();
+        match err {
+            BailiffRepoError::NotABareRepo { reason, .. } => {
+                assert!(
+                    reason.contains("objects") && reason.contains("symlink"),
+                    "reason should mention symlinked objects/, got: {reason}"
+                );
+            }
+            other => panic!("expected NotABareRepo, got {other:?}"),
+        }
+    }
+
+    /// Same threat model as the objects/ case, but for refs/: a
+    /// symlinked refs/ directory means `write_note` writes the
+    /// notes ref outside the canonical repo path, even though
+    /// `--git-dir` points at the bare repo.
+    #[tokio::test]
+    async fn open_rejects_a_repo_with_symlinked_refs() {
+        let dir = TempDir::new().unwrap();
+        let repo_path = dir.path().join("redirected-refs");
+        let _ = BailiffRepo::init_or_open(&repo_path).await.unwrap();
+        let outside = dir.path().join("stolen-refs");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::remove_dir_all(repo_path.join("refs")).unwrap();
+        std::os::unix::fs::symlink(&outside, repo_path.join("refs")).unwrap();
+        let err = BailiffRepo::open(&repo_path).await.unwrap_err();
+        match err {
+            BailiffRepoError::NotABareRepo { reason, .. } => {
+                assert!(
+                    reason.contains("refs") && reason.contains("symlink"),
+                    "reason should mention symlinked refs/, got: {reason}"
+                );
+            }
+            other => panic!("expected NotABareRepo, got {other:?}"),
+        }
+    }
+
     /// A gitdir with a `commondir` file points objects and refs
     /// elsewhere. If validation accepts such a directory, writes
     /// would land outside the bailiff repo. Refuse it.
@@ -1442,6 +1529,49 @@ mod tests {
     fn extensions_parser_ignores_objectformat_outside_extensions() {
         let misplaced = "[core]\n\tobjectformat = sha256\n\tbare = true\n";
         assert_eq!(extensions_object_format(misplaced), None);
+    }
+
+    /// Git's "last value wins" rule applies to `objectformat` just
+    /// as it does to `core.bare`. A config with `objectformat = sha1`
+    /// shadowed by a later `objectformat = sha256` must read back
+    /// as sha256, so validation rejects the repo. The first-match
+    /// shape would have let a SHA-256 repo through here.
+    #[test]
+    fn extensions_parser_uses_last_objectformat_assignment() {
+        let text =
+            "[extensions]\n\tobjectformat = sha1\n\tobjectformat = sha256\n[core]\n\tbare = true\n";
+        assert_eq!(
+            extensions_object_format(text)
+                .as_deref()
+                .map(str::to_ascii_lowercase),
+            Some("sha256".to_string())
+        );
+    }
+
+    /// `BailiffRepo::open` must reject a hand-crafted config where
+    /// a later `objectformat = sha256` shadows an earlier sha1: the
+    /// effective format is sha256, and we don't support those repos.
+    #[tokio::test]
+    async fn open_rejects_config_with_trailing_sha256_after_sha1() {
+        let dir = TempDir::new().unwrap();
+        let repo_path = dir.path().join("shadowed-format");
+        std::fs::create_dir(&repo_path).unwrap();
+        std::fs::write(repo_path.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::write(
+            repo_path.join("config"),
+            "[extensions]\n\tobjectformat = sha1\n\tobjectformat = sha256\n[core]\n\trepositoryformatversion = 1\n\tbare = true\n",
+        )
+        .unwrap();
+        let err = BailiffRepo::open(&repo_path).await.unwrap_err();
+        match err {
+            BailiffRepoError::NotABareRepo { reason, .. } => {
+                assert!(
+                    reason.to_ascii_lowercase().contains("sha"),
+                    "reason should mention the object format, got: {reason}"
+                );
+            }
+            other => panic!("expected NotABareRepo, got {other:?}"),
+        }
     }
 
     /// `open` against a SHA-256 bare repo must reject up front:
