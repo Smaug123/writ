@@ -57,7 +57,7 @@ use crate::writ_client::RunAgentCompleted;
 /// `agent_plan` namespace), and bailiff is the local read mirror —
 /// accepting forced updates is correct because writ is the source of
 /// truth for its own namespace.
-const WRIT_V1_NOTES_REFSPEC: &str = "+refs/notes/writ/v1/*:refs/notes/writ/v1/*";
+pub(crate) const WRIT_V1_NOTES_REFSPEC: &str = "+refs/notes/writ/v1/*:refs/notes/writ/v1/*";
 
 /// Fetch writ's signed envelope, verify it end-to-end, and attach a
 /// [`PlanNote`] for `plan_id` to bailiff's per-plan notes ref.
