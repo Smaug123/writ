@@ -100,6 +100,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         .transpose()?;
 
+    // Bind the broker Unix socket *before* anything that touches
+    // disk-shared singleton state (the signing key in the secret
+    // store, the agent-VM on-disk session ledger, the UI bearer
+    // file). Bind succeeds for exactly one process per socket path,
+    // so it is the cleanest ownership claim available; without this
+    // ordering, two concurrent first-boots could both reach
+    // `ensure_signing_key` and overwrite each other's freshly
+    // generated key, leaving the surviving daemon signing with a
+    // key that is no longer the stored trust anchor.
+    let broker_listener = prepare_broker_listener(&socket_path).await?;
+
     let (notes_repo, signing_key, run_agent_spawn) = match run_agent.as_ref() {
         Some(cfg) => {
             let boot = cfg
@@ -192,14 +203,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .into());
         }
     }
-    // Bind the broker Unix socket *before* the UI HTTP block. Binding
-    // is the singleton-ownership claim for this daemon installation:
-    // if another writd is already serving the socket, this fails with
-    // `AddrInUse` and we exit before touching the shared UI bearer
-    // file. Without this ordering, a doomed second start could rotate
-    // the bearer that the surviving daemon's clients still depend on.
-    let broker_listener = prepare_broker_listener(&socket_path).await?;
-
     if let Some(ui_http) = ui_http {
         ui_http.validate()?;
         // Inside this block we also bind the UI listener before

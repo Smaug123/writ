@@ -188,7 +188,7 @@ pub fn default_ui_http_bearer_path() -> PathBuf {
 pub struct RunAgentDaemonConfig {
     /// Absolute path to the bare git repository writ uses to store
     /// signed-run envelope notes. Defaults to
-    /// `$XDG_DATA_HOME/writ/notes-repo`. Initialised idempotently at
+    /// `$XDG_DATA_HOME/writ/repo`. Initialised idempotently at
     /// boot via [`crate::notes_repo::NotesRepo::init_or_open`], so
     /// re-running writd is safe.
     #[serde(default)]
@@ -307,12 +307,19 @@ pub enum RunAgentBootError {
 /// audit DB under `$XDG_DATA_HOME/writ/` so a single backup of that
 /// directory captures both writ's audit log and its signed-run
 /// envelopes.
+///
+/// **Must agree with `bailiff`'s `default_writ_repo_path` in
+/// `src/bin/bailiff.rs`** — bailiff fetches notes from this same
+/// location when the operator runs with stock defaults. The two are
+/// independent functions because the bailiff binary doesn't link
+/// against writd's `config` module, so the convention is duplicated.
+/// If you move the path, move it on both sides at once.
 pub fn default_notes_repo_path() -> PathBuf {
     if let Some(dir) = std::env::var_os("XDG_DATA_HOME") {
-        PathBuf::from(dir).join("writ/notes-repo")
+        PathBuf::from(dir).join("writ/repo")
     } else {
         let home = std::env::var_os("HOME").unwrap_or_else(|| "/tmp".into());
-        PathBuf::from(home).join(".local/share/writ/notes-repo")
+        PathBuf::from(home).join(".local/share/writ/repo")
     }
 }
 

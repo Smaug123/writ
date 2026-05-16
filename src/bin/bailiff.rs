@@ -277,6 +277,11 @@ fn default_bailiff_repo_path() -> PathBuf {
 /// `$XDG_DATA_HOME/writ/repo`. Bailiff resolves writ's repo
 /// location from its own copy of the convention so there is no
 /// duplicate-config edit when moving the path (slice B4 pin).
+///
+/// **Must agree with `writ::config::default_notes_repo_path`** —
+/// writd stores RunAgent envelopes at the same location bailiff
+/// fetches from. The two are independent functions because the
+/// bailiff binary doesn't depend on writd's `config` module.
 fn default_writ_repo_path() -> PathBuf {
     xdg_data_subdir("writ/repo")
 }
@@ -426,6 +431,15 @@ mod tests {
             PathBuf::from("/data/bailiff/repo")
         );
         assert_eq!(default_writ_repo_path(), PathBuf::from("/data/writ/repo"));
+        // Pin the invariant: bailiff's writ-repo default must agree
+        // with the daemon's notes-repo default, because writd writes
+        // and bailiff fetches from the same disk location when both
+        // run with stock config.
+        assert_eq!(
+            default_writ_repo_path(),
+            writ::config::default_notes_repo_path(),
+            "bailiff and writd default writ-repo path diverged — one was renamed without the other",
+        );
 
         unsafe {
             std::env::remove_var("XDG_DATA_HOME");
