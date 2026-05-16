@@ -118,12 +118,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .map_err(|e| format!("cannot materialize RunAgent state from config: {e}"))?;
             let fingerprint = boot.signing.signing_key().fingerprint();
             if boot.signing.was_generated() {
+                // Bailiff's `AllowedSigners::from_openssh_lines` parses
+                // the one-line OpenSSH public-key format, deriving the
+                // fingerprint internally. Logging the public-key line
+                // (not just the fingerprint) is what the operator
+                // actually needs to paste into the allowed-signers
+                // file.
+                let public_key_line = boot
+                    .signing
+                    .signing_key()
+                    .verifying_key()
+                    .to_openssh()
+                    .map_err(|e| {
+                        format!("cannot serialise newly-generated writ public key: {e}")
+                    })?;
                 tracing::warn!(
                     fingerprint = %fingerprint,
+                    public_key = %public_key_line,
                     secret_key = %cfg.signing_key_secret_or_default(),
                     notes_repo_path = %boot.notes_repo.path().display(),
                     "generated new writ signing key on first boot — \
-                     add the fingerprint to bailiff's allowed-signers",
+                     add the public_key line above to bailiff's \
+                     allowed-signers file",
                 );
             } else {
                 tracing::info!(
