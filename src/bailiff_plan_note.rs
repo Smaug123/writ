@@ -1,6 +1,6 @@
 //! Bailiff-owned per-plan note primitives. Defines the
 //! `refs/notes/bailiff/v1/plans/<plan-id>` ref scheme that holds every
-//! artefact bailiff records about one plan workflow, plus the three
+//! artefact bailiff records about one plan workflow, plus the four
 //! note bodies that live under it today:
 //!
 //! - [`PlanNote`] — slice C's submission attestation: "writ ran agent
@@ -12,16 +12,24 @@
 //!   reviewer agent run R against plan P and produced the signed
 //!   envelope at OID O in writ's repo." Same shape as [`PlanNote`];
 //!   the reviewer's prose lives in the envelope at `writ_output_oid`.
+//! - [`ImplementNote`] — slice E's implementer-run attestation: "writ
+//!   ran implementer agent run R against (the accepted) plan P and
+//!   produced the signed envelope at OID O in writ's repo." Same
+//!   shape as [`PlanNote`] / [`ReviewNote`]; the implementer's
+//!   workspace mutations are visible via the side-effects writ's
+//!   git-push staging pipeline records, while the signed envelope
+//!   here is the audit trail for the run itself.
 //!
-//! All three attach under the same per-plan ref but at distinct
+//! All four attach under the same per-plan ref but at distinct
 //! deterministic seed OIDs — [`plan_submission_seed_blob_bytes`],
-//! [`plan_decision_seed_blob_bytes`], and
-//! [`plan_review_seed_blob_bytes`] — so they coexist without
+//! [`plan_decision_seed_blob_bytes`], [`plan_review_seed_blob_bytes`],
+//! and [`plan_implement_seed_blob_bytes`] — so they coexist without
 //! colliding. Slice C1 of `docs/plans/2026-05-14-bailiff-split.md`
 //! introduced the submission piece; slice D1 of
 //! `docs/plans/2026-05-16-slice-d1-decide.md` added the decision
-//! piece; slice D2 of `docs/plans/2026-05-16-slice-d2-review.md` adds
-//! the review piece. Everything here is pure data with no IO and no
+//! piece; slice D2 of `docs/plans/2026-05-16-slice-d2-review.md`
+//! added the review piece; slice E1 of the parent split doc adds the
+//! implementer piece. Everything here is pure data with no IO and no
 //! CLI; the write helpers live in [`crate::bailiff_plan_write`].
 //!
 //! `PlanId` is a fresh bailiff-side type — not the `agent_plan::PlanId`
@@ -161,6 +169,27 @@ pub fn plan_decision_seed_blob_bytes(plan_id: PlanId) -> Vec<u8> {
 /// target.
 pub fn plan_review_seed_blob_bytes(plan_id: PlanId) -> Vec<u8> {
     format!("{plan_id}::review").into_bytes()
+}
+
+/// Deterministic seed-blob bytes for the **implement** note under
+/// [`plan_notes_ref`]`(plan_id)`. The `<plan_id>::implement` suffix
+/// distinguishes the implement target from all three older seeds
+/// ([`plan_submission_seed_blob_bytes`] (bare plan id),
+/// [`plan_decision_seed_blob_bytes`] (`::decision`), and
+/// [`plan_review_seed_blob_bytes`] (`::review`)) so the four notes
+/// attach to four different objects under one notes ref.
+///
+/// Same ASCII-suffix convention as its siblings: `::implement` rather
+/// than `/implement` so a reader scanning the seed bytes cannot
+/// mistake the value for a ref subpath.
+///
+/// Slice E is single-implement-per-plan and idempotent — the writer
+/// rejects a second implement for the same id rather than
+/// overwriting. Per-implement UUIDs (multi-implement history) is the
+/// same documented `v1` → `v2` ref-prefix migration the review note
+/// describes; the seed convention pinned here is the migration target.
+pub fn plan_implement_seed_blob_bytes(plan_id: PlanId) -> Vec<u8> {
+    format!("{plan_id}::implement").into_bytes()
 }
 
 /// A bailiff-owned attestation that writ ran an agent for `plan_id`
@@ -406,6 +435,89 @@ impl ReviewNote {
 #[derive(Debug, thiserror::Error)]
 pub enum ReviewNoteParseError {
     #[error("review-note body is not valid canonical JSON: {0}")]
+    Json(#[source] serde_json::Error),
+}
+
+/// A bailiff-owned attestation that writ ran an implementer agent
+/// against (the accepted) `plan_id` and produced the signed output
+/// reachable at `writ_output_oid` in writ's repo. Stored as the body
+/// of one note under [`plan_notes_ref`] at the seed OID derived from
+/// [`plan_implement_seed_blob_bytes`] — distinct from the three
+/// older targets (submission, decision, review) so all four notes
+/// coexist under one per-plan ref.
+///
+/// What this carries: same field set as [`PlanNote`] and
+/// [`ReviewNote`] — `plan_id`, `purpose`, `writ_output_oid`,
+/// `signed_metadata`, `signature`. The implementer's effect on the
+/// workspace is *not* part of this note: those mutations flow
+/// through writ's git-push staging pipeline (existing infrastructure)
+/// and are observable via the resulting branch / PR. This note is
+/// the audit trail for the agent run itself.
+///
+/// Field-for-field identical to [`PlanNote`] / [`ReviewNote`] — all
+/// three carry the same shape because all three are "writ ran an
+/// agent for this plan and signed the result" attestations. They are
+/// kept as parallel types rather than unified under a shared struct
+/// so a future schema bump on one (e.g. a structured side-effect
+/// field on `ImplementNote` recording the branch the agent pushed)
+/// does not force a parallel migration on the others. Same rationale
+/// `ReviewNote`'s docstring records, repeated here so the rule is
+/// visible at each declaration site.
+///
+/// **Slice E ships unsigned by bailiff.** Same as the older three
+/// notes: writ's submission signature on the embedded envelope is the
+/// trust anchor for the implementer run. The parent split doc defers
+/// bailiff's own signing primitives.
+///
+/// **Slice E is idempotent.** The write helper rejects a second
+/// implement for the same plan id rather than silently overwriting.
+/// Multi-implement history is the documented `v1` → `v2` ref-prefix
+/// migration; the seed-OID convention pinned by
+/// [`plan_implement_seed_blob_bytes`] is the migration target.
+///
+/// `deny_unknown_fields` catches an unexpected key at parse time
+/// rather than silently dropping it. Same defence the sibling notes
+/// use: a future field addition is a schema bump (`v1` → `v2` in the
+/// ref prefix); silently accepting extra fields would let a
+/// writer-side regression sneak past the reader.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ImplementNote {
+    pub plan_id: PlanId,
+    pub purpose: String,
+    pub writ_output_oid: GitObjectId,
+    pub signed_metadata: SignedRunMetadata,
+    pub signature: SshSignature,
+}
+
+impl ImplementNote {
+    /// Canonical byte representation of the note body. Compact JSON
+    /// (no whitespace) with keys emitted in struct-declaration order
+    /// — the same canonicalisation [`PlanNote::canonical_bytes`],
+    /// [`DecisionNote::canonical_bytes`], and
+    /// [`ReviewNote::canonical_bytes`] use, so a reader can re-compute
+    /// the canonical form locally and compare.
+    ///
+    /// The bytes returned here are what gets written as the body of
+    /// the git note. They are *not* covered by writ's signature —
+    /// writ signs only `signed_metadata`'s canonical bytes; the
+    /// note's framing (this struct) is bailiff's own.
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        serde_json::to_vec(self).expect("ImplementNote serialises to JSON without IO; cannot fail")
+    }
+
+    /// Inverse of [`Self::canonical_bytes`]. Fails on malformed JSON,
+    /// on any unknown top-level field (`deny_unknown_fields`), or on
+    /// any nested validation error from the field types ([`PlanId`],
+    /// [`GitObjectId`], [`SshSignature`], [`SignedRunMetadata`]).
+    pub fn from_canonical_bytes(bytes: &[u8]) -> Result<Self, ImplementNoteParseError> {
+        serde_json::from_slice(bytes).map_err(ImplementNoteParseError::Json)
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ImplementNoteParseError {
+    #[error("implement-note body is not valid canonical JSON: {0}")]
     Json(#[source] serde_json::Error),
 }
 
@@ -1000,5 +1112,206 @@ mod tests {
             signature,
         };
         assert_eq!(plan.canonical_bytes(), review.canonical_bytes());
+    }
+
+    // --- ImplementNote -------------------------------------------------------
+
+    fn sample_implement_note() -> ImplementNote {
+        ImplementNote {
+            plan_id: PlanId::new(),
+            purpose: "plan-implement".into(),
+            writ_output_oid: sample_output_oid(),
+            signed_metadata: sample_signed_metadata(),
+            signature: sample_signature(),
+        }
+    }
+
+    /// Submission and implement seed bytes for the same plan id MUST
+    /// differ — colliding here would make the submission and implement
+    /// notes share an attach OID under the per-plan ref, so the second
+    /// write would silently clobber the first. Same load-bearing
+    /// invariant the older pairwise tests pin; repeated for the
+    /// implement seed against each existing sibling.
+    #[test]
+    fn submission_and_implement_seed_bytes_are_distinct_for_same_plan_id() {
+        let plan_id = PlanId::new();
+        let submission = plan_submission_seed_blob_bytes(plan_id);
+        let implement = plan_implement_seed_blob_bytes(plan_id);
+        assert_ne!(
+            submission, implement,
+            "submission and implement seed bytes collided for {plan_id}",
+        );
+    }
+
+    /// Decision and implement seed bytes for the same plan id MUST
+    /// differ. Same overwrite-collision argument.
+    #[test]
+    fn decision_and_implement_seed_bytes_are_distinct_for_same_plan_id() {
+        let plan_id = PlanId::new();
+        let decision = plan_decision_seed_blob_bytes(plan_id);
+        let implement = plan_implement_seed_blob_bytes(plan_id);
+        assert_ne!(
+            decision, implement,
+            "decision and implement seed bytes collided for {plan_id}",
+        );
+    }
+
+    /// Review and implement seed bytes for the same plan id MUST
+    /// differ. Closes out the all-pairs distinctness matrix for the
+    /// four seeds.
+    #[test]
+    fn review_and_implement_seed_bytes_are_distinct_for_same_plan_id() {
+        let plan_id = PlanId::new();
+        let review = plan_review_seed_blob_bytes(plan_id);
+        let implement = plan_implement_seed_blob_bytes(plan_id);
+        assert_ne!(
+            review, implement,
+            "review and implement seed bytes collided for {plan_id}",
+        );
+    }
+
+    /// Pin the literal implement-seed shape: `<plan_id>::implement`.
+    /// A reader hashes this exact byte sequence via `git hash-object`
+    /// to recover the attach OID, so a future change to the suffix
+    /// would silently make every existing implement note unreadable.
+    #[test]
+    fn plan_implement_seed_blob_bytes_is_plan_id_with_implement_suffix() {
+        let plan_id = PlanId::new();
+        let bytes = plan_implement_seed_blob_bytes(plan_id);
+        assert_eq!(
+            std::str::from_utf8(&bytes).unwrap(),
+            format!("{plan_id}::implement"),
+        );
+    }
+
+    /// Distinct plan ids produce distinct implement seed bytes. A
+    /// regression that drops `plan_id` from the seed would silently
+    /// collapse every plan's implement into the same OID.
+    #[test]
+    fn plan_implement_seed_blob_bytes_is_unique_per_plan() {
+        let a = PlanId::new();
+        let b = PlanId::new();
+        assert_ne!(a, b, "PlanId::new must not collide");
+        assert_ne!(
+            plan_implement_seed_blob_bytes(a),
+            plan_implement_seed_blob_bytes(b),
+        );
+    }
+
+    /// Canonical bytes round-trip: serialise → parse → re-serialise
+    /// must reproduce the same bytes. Same shape pin the older note
+    /// types carry.
+    #[test]
+    fn implement_note_canonical_bytes_round_trip_is_stable() {
+        let note = sample_implement_note();
+        let first = note.canonical_bytes();
+        let parsed = ImplementNote::from_canonical_bytes(&first).unwrap();
+        let second = parsed.canonical_bytes();
+        assert_eq!(first, second);
+    }
+
+    /// Pin the canonical wire shape: a compact JSON object with the
+    /// five top-level keys in struct-declaration order, no
+    /// whitespace. Pins the *positions* of every top-level key, same
+    /// approach the sibling field-order tests use.
+    #[test]
+    fn implement_note_canonical_bytes_pin_field_order() {
+        let note = sample_implement_note();
+        let bytes = note.canonical_bytes();
+        let s = std::str::from_utf8(&bytes).unwrap();
+        let positions: Vec<usize> = [
+            "\"plan_id\":",
+            "\"purpose\":",
+            "\"writ_output_oid\":",
+            "\"signed_metadata\":",
+            "\"signature\":",
+        ]
+        .into_iter()
+        .map(|key| s.find(key).unwrap_or_else(|| panic!("missing {key}: {s}")))
+        .collect();
+        assert!(
+            positions.windows(2).all(|w| w[0] < w[1]),
+            "field order regression — positions={positions:?}, actual: {s}",
+        );
+        assert!(s.starts_with('{'), "actual: {s}");
+        assert!(s.ends_with('}'), "actual: {s}");
+    }
+
+    /// Different implement notes produce different canonical bytes.
+    /// Basic distinctness — a regression that collapses every payload
+    /// to the same bytes surfaces immediately.
+    #[test]
+    fn implement_note_canonical_bytes_distinguish_distinct_payloads() {
+        let a = sample_implement_note();
+        let mut b = sample_implement_note();
+        b.purpose = "different".into();
+        assert_ne!(a.canonical_bytes(), b.canonical_bytes());
+    }
+
+    /// `deny_unknown_fields` rejects extra top-level keys. Same
+    /// schema-bump argument the sibling notes record.
+    #[test]
+    fn implement_note_rejects_unknown_top_level_fields() {
+        let note = sample_implement_note();
+        let mut value: serde_json::Value = serde_json::to_value(&note).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .insert("extra".into(), serde_json::Value::String("nope".into()));
+        let s = serde_json::to_vec(&value).unwrap();
+        let err = ImplementNote::from_canonical_bytes(&s).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("extra") || msg.contains("unknown field"),
+            "expected unknown-field error, got: {msg}",
+        );
+    }
+
+    /// `ImplementNote` JSON round-trips. Standard pin.
+    #[test]
+    fn implement_note_json_roundtrips() {
+        let note = sample_implement_note();
+        let bytes = note.canonical_bytes();
+        let back = ImplementNote::from_canonical_bytes(&bytes).unwrap();
+        assert_eq!(back, note);
+    }
+
+    /// An `ImplementNote`, `ReviewNote`, and `PlanNote` with
+    /// identical field values produce identical canonical bytes —
+    /// they are structurally the same shape today (see the
+    /// `ImplementNote` docstring). The load-bearing disambiguation is
+    /// **not** the bytes but the seed OID they attach to under
+    /// [`plan_notes_ref`]; pinning that here catches a future refactor
+    /// that tries to merge the shapes without first migrating the
+    /// seed-OID convention.
+    #[test]
+    fn implement_note_shares_canonical_shape_with_plan_and_review() {
+        let plan_id = PlanId::new();
+        let metadata = sample_signed_metadata();
+        let signature = sample_signature();
+        let oid = sample_output_oid();
+        let plan = PlanNote {
+            plan_id,
+            purpose: "shared".into(),
+            writ_output_oid: oid.clone(),
+            signed_metadata: metadata.clone(),
+            signature: signature.clone(),
+        };
+        let review = ReviewNote {
+            plan_id,
+            purpose: "shared".into(),
+            writ_output_oid: oid.clone(),
+            signed_metadata: metadata.clone(),
+            signature: signature.clone(),
+        };
+        let implement = ImplementNote {
+            plan_id,
+            purpose: "shared".into(),
+            writ_output_oid: oid,
+            signed_metadata: metadata,
+            signature,
+        };
+        assert_eq!(plan.canonical_bytes(), implement.canonical_bytes());
+        assert_eq!(review.canonical_bytes(), implement.canonical_bytes());
     }
 }
