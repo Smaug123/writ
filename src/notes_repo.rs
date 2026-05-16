@@ -435,6 +435,28 @@ impl NotesRepo {
             Err(err) => Err(err),
         }
     }
+
+    /// Read the body of the note attached to the seed's target OID
+    /// under `notes_ref`. Bundles the seed-to-target-OID derivation
+    /// (`git hash-object`) with the absent-classifying read, so a
+    /// caller that holds the seed (and not the target OID) gets the
+    /// same `Option<Vec<u8>>` shape [`Self::read_note_if_present`]
+    /// returns without having to re-implement the hashing step.
+    ///
+    /// Sibling to [`Self::write_note_if_absent`]: the writer hashes
+    /// the same seed bytes to pick the attach OID, so a reader that
+    /// hashes those bytes again recovers the same OID and locates
+    /// the writer's note. Determinism of `git hash-object` is the
+    /// load-bearing property — content-addressed storage means
+    /// no separate registry is needed to map seeds to targets.
+    pub fn read_note_at_seed(
+        &self,
+        notes_ref: &NotesRef,
+        seed: &[u8],
+    ) -> Result<Option<Vec<u8>>, NotesRepoError> {
+        let target_oid = hash_object_stdin(&self.canonical_path, seed, &self.inherited_env)?;
+        self.read_note_if_present(notes_ref, &target_oid)
+    }
 }
 
 fn validate_bare_layout(path: &Path, env: &InheritedEnv) -> Result<(), NotesRepoError> {
@@ -1450,5 +1472,54 @@ mod tests {
             .write_note_if_absent(&nref, b"seed-A", b"")
             .unwrap_err();
         assert!(matches!(err, NotesRepoError::EmptyBody), "got: {err:?}");
+    }
+
+    /// Round-trip pin: writing under a seed and reading back via the
+    /// same seed recovers the body byte-for-byte. The writer hashes
+    /// the seed to derive the target OID; the reader hashes the same
+    /// seed and recovers the same OID, so the body comes back without
+    /// the caller ever materialising the target OID. This is the
+    /// content-addressed contract the helper exists to provide.
+    #[test]
+    fn read_note_at_seed_round_trips_through_write_note_if_absent() {
+        let tmp = TempDir::new().unwrap();
+        let repo = NotesRepo::init_or_open(tmp.path().join("r")).unwrap();
+        let nref = notes_ref();
+        let _ = repo
+            .write_note_if_absent(&nref, b"seed-A", b"body-A")
+            .unwrap();
+        let read_back = repo.read_note_at_seed(&nref, b"seed-A").unwrap();
+        assert_eq!(read_back.as_deref(), Some(b"body-A".as_slice()));
+    }
+
+    /// When no note is attached under the seed, `read_note_at_seed`
+    /// folds the absence into `Ok(None)` — same shape its underlying
+    /// `read_note_if_present` exposes. The fresh-ref case (no ref
+    /// at all) is one of the two absent branches `read_note_if_present`
+    /// already pins; pinning it again at the seed-level helper guards
+    /// against a future refactor that bypasses the absent-classifier.
+    #[test]
+    fn read_note_at_seed_returns_none_when_nothing_was_written() {
+        let tmp = TempDir::new().unwrap();
+        let repo = NotesRepo::init_or_open(tmp.path().join("r")).unwrap();
+        let nref = notes_ref();
+        let res = repo.read_note_at_seed(&nref, b"unwritten-seed").unwrap();
+        assert!(res.is_none(), "expected None, got: {res:?}");
+    }
+
+    /// When a note is attached under a *different* seed, the asked-for
+    /// seed still resolves to `None`. Exercises the "ref present, no
+    /// note at this target" branch of the absent-classifier through
+    /// the seed-level helper.
+    #[test]
+    fn read_note_at_seed_returns_none_when_other_seed_was_written() {
+        let tmp = TempDir::new().unwrap();
+        let repo = NotesRepo::init_or_open(tmp.path().join("r")).unwrap();
+        let nref = notes_ref();
+        let _ = repo
+            .write_note_if_absent(&nref, b"seed-A", b"body-A")
+            .unwrap();
+        let res = repo.read_note_at_seed(&nref, b"seed-B").unwrap();
+        assert!(res.is_none(), "expected None for seed-B, got: {res:?}");
     }
 }
