@@ -2251,9 +2251,10 @@ mod tests {
 
     /// When `RunAgent` carries a `session_id` bound to an open audit
     /// session, the signed metadata stamps the same id. This is the
-    /// producer-side half of the slice-C session model: bailiff opens
-    /// a session, threads the id into `RunAgent`, and the signed
-    /// envelope correlates with the audit row.
+    /// producer-side half of the slice-C session model (2026-05-16):
+    /// bailiff opens a per-run session, threads the id into
+    /// `RunAgent`, and the signed envelope correlates with the audit
+    /// row so verifiers can recover the run-level authority window.
     #[tokio::test]
     async fn run_agent_stamps_caller_supplied_session_id_into_signed_metadata() {
         use crate::core::SessionRecord;

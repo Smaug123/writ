@@ -196,9 +196,11 @@ impl WritClient {
     }
 
     /// Open a writ session and return its broker-assigned id. Used by
-    /// bailiff's slice-C plan workflows to wrap a `RunAgent` call
-    /// inside a session for audit purposes; later agent runs for the
-    /// same plan reuse the same id (pinned slice-C session model).
+    /// bailiff's slice-C plan workflows to wrap a single `RunAgent`
+    /// call in an authority/audit window; per the 2026-05-16 session
+    /// model each agent run opens its own session, so callers should
+    /// close this id once their `RunAgent` returns rather than
+    /// threading it into later workflow stages.
     pub async fn open_session(
         &self,
         label: Option<String>,

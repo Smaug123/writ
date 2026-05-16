@@ -273,12 +273,12 @@ impl<'de> Deserialize<'de> for RejectionReason {
 /// provenance checks on a multi-capability run see every authority
 /// that produced the signed output.
 ///
-/// `session_id` is the open question pinned for slice C of the
-/// bailiff-split plan: bailiff opens one writ session per workflow
-/// and every run for that workflow happens inside it. Field shape
-/// frozen here so slice B can wire the signing path without
-/// reshaping the response; the question of "who allocates the
-/// session id" is resolved by slice C without changing this struct.
+/// `session_id` is the authority/audit window writ minted (or that
+/// bailiff supplied on `RunAgent`) for *this run* — per the
+/// 2026-05-16 session-model pin a writ session is per-agent-run,
+/// not per workflow. Verifiers use it to correlate the signed
+/// envelope with writ's audit row; workflow identity belongs to
+/// bailiff's `PlanId` and is not carried in writ's signed bytes.
 ///
 /// `deny_unknown_fields` catches an unexpected key at parse time
 /// rather than silently dropping it; the canonical bytes are

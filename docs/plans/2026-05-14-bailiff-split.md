@@ -401,12 +401,29 @@ CLI reference.
 
 ## Open questions
 
-1. **Session model.** Today a session represents "a thing the user is
-   doing" (a panel, a feature). With bailiff orchestrating, a session
-   becomes a unit of bailiff workflow containing many writ agent
-   runs. Concretely: bailiff opens one writ session per plan
-   workflow; every agent run for that plan happens inside that
-   session. Confirm during slice C.
+1. **Session model.** *Pinned 2026-05-16 (slice C3 follow-up):* a writ
+   session is the authority/audit window for a *single agent run*, not
+   the bailiff workflow. Bailiff opens a session, issues `RunAgent`
+   under it, closes it on the happy path (or on cleanup). Each run gets
+   its own session, because a session carries a single `agent_kind`
+   (which selects the GitHub App identity used for credential minting)
+   and a single `agent_model`, so a workflow that uses different agents
+   for planner / reviewer / implementer cannot share one session by
+   construction.
+
+   Workflow identity is `PlanId`, owned by bailiff and invisible to
+   writ. Bailiff threads the same `PlanId` through every stage; each
+   stage's signed run envelope carries its own `session_id` for audit,
+   and bailiff's plan-scoped ref groups the per-stage notes under the
+   one `PlanId`. Persisted session ids in plan notes are *audit
+   references* — useful for tracing a stage back to its writ-side audit
+   row — not durable RPC handles. Reusing a closed session id is a
+   protocol error (`ServerMessage::ClosedSession`).
+
+   This supersedes the earlier "one session per plan workflow" framing
+   pinned 2026-05-15; that model was incoherent with the existing
+   `SessionRecord` shape (single `agent_kind` per session) and gave
+   `closed_at` a meaning writ couldn't validate.
 
 2. **Exact ref scheme inside bailiff's repo.** *Pinned 2026-05-15
    (slice C1):* one ref per plan at

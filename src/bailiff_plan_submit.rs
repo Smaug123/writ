@@ -10,11 +10,23 @@
 //!
 //! # Session model
 //!
-//! Pinned 2026-05-15 (open question 1 in
-//! `docs/plans/2026-05-14-bailiff-split.md`): one writ session per
-//! bailiff plan workflow. `submit_plan` opens the session up front,
-//! and any later agent runs for the same plan (review, implement in
-//! slices D/E) will reuse the same id rather than mint a new one.
+//! Pinned 2026-05-16 (open question 1 in
+//! `docs/plans/2026-05-14-bailiff-split.md`): a writ session is the
+//! authority/audit window for a *single agent run*, not the bailiff
+//! workflow. `submit_plan` opens a session for the planner run, issues
+//! `RunAgent` under it, and closes it on the happy path — the
+//! `planner_session_id` returned in [`SubmitPlanOutcome`] is an audit
+//! reference, not a handle later workflow stages reuse.
+//!
+//! Workflow identity is the bailiff-owned [`PlanId`], threaded across
+//! stages and invisible to writ. Slices D/E (review, implement) each
+//! open their own writ session per run; all stages attach their notes
+//! under the same plan-scoped ref. This supersedes the earlier
+//! "one session per plan workflow" pin: writ's
+//! [`crate::audit::SessionRecord`] carries a single `agent_kind` /
+//! `agent_model` chosen at `OpenSession`, so a workflow that uses
+//! different agents per stage cannot share one session by
+//! construction.
 //!
 //! # Error handling
 //!
@@ -97,10 +109,13 @@ pub struct SubmitPlanOutcome {
     /// hashes to; callable readers can recompute it but having it on
     /// the result avoids the recomputation.
     pub plan_note_oid: GitObjectId,
-    /// Writ's session id for this workflow. Future
-    /// review/implementer runs reuse the same id (slice-C session
-    /// model).
-    pub session_id: SessionId,
+    /// Writ's session id for the *planner run only* — the
+    /// authority/audit window writ minted for this `RunAgent` call,
+    /// closed on the happy path before this outcome is returned.
+    /// Surfaced so callers can correlate the run with writ's audit
+    /// row; it is not a handle later workflow stages reuse (each
+    /// stage opens its own session per the pinned 2026-05-16 model).
+    pub planner_session_id: SessionId,
     /// What writ returned for the planner run — the OID of the
     /// signed envelope note in writ's repo, plus the signed metadata
     /// and signature. Lets a caller verify or display the run
@@ -204,7 +219,7 @@ pub async fn submit_plan(
     Ok(SubmitPlanOutcome {
         plan_id,
         plan_note_oid,
-        session_id,
+        planner_session_id: session_id,
         run: completed,
     })
 }
@@ -472,7 +487,7 @@ mod end_to_end_tests {
         // bailiff opened. This is the P2 invariant: a verifier can
         // correlate the envelope back to writ's audit session row.
         assert_eq!(
-            outcome.run.signed_metadata.session_id, outcome.session_id,
+            outcome.run.signed_metadata.session_id, outcome.planner_session_id,
             "signed metadata must bind the session id bailiff opened",
         );
 
@@ -498,7 +513,7 @@ mod end_to_end_tests {
         // Writ's audit log recorded the session bailiff opened and
         // shows it as closed — confirms `CloseSession` ran.
         let audit = Arc::clone(&state.audit);
-        let session_id = outcome.session_id;
+        let session_id = outcome.planner_session_id;
         let session_row = tokio::task::spawn_blocking(move || audit.get_session(session_id))
             .await
             .unwrap()
