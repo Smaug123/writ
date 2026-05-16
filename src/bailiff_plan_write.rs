@@ -1,6 +1,6 @@
 //! Bailiff-side write helper that completes the slice-C handshake:
 //! fetch writ's signed envelope, verify it, and persist a [`PlanNote`]
-//! at the plan's submission ref in bailiff's own bare repo.
+//! at the plan's notes ref in bailiff's own bare repo.
 //!
 //! This is slice C2 of `docs/plans/2026-05-14-bailiff-split.md`. The
 //! data layer ([`crate::bailiff_plan_note`]) is slice C1; the CLI
@@ -29,8 +29,8 @@
 //! 5. Build a [`PlanNote`] referencing `completed.output_oid` (the
 //!    writ-side seed OID — *not* the envelope blob; see the
 //!    `writ_output_oid` docstring in [`crate::bailiff_plan_note`])
-//!    and write it to [`plan_submission_ref`]`(plan_id)` in
-//!    bailiff's repo with seed [`plan_seed_blob_bytes`]`(plan_id)`.
+//!    and write it to [`plan_notes_ref`]`(plan_id)` in
+//!    bailiff's repo with seed [`plan_submission_seed_blob_bytes`]`(plan_id)`.
 //!    Returns the bailiff-side target OID.
 //!
 //! Every failure mode is a tagged variant of [`WritePlanNoteError`]
@@ -40,7 +40,7 @@ use std::path::Path;
 
 use thiserror::Error;
 
-use crate::bailiff_plan_note::{PlanId, PlanNote, plan_seed_blob_bytes, plan_submission_ref};
+use crate::bailiff_plan_note::{PlanId, PlanNote, plan_notes_ref, plan_submission_seed_blob_bytes};
 use crate::core::NotesRef;
 use crate::notes_repo::{NotesRepo, NotesRepoError};
 use crate::run_envelope::SignedRunEnvelope;
@@ -57,10 +57,10 @@ use crate::writ_client::RunAgentCompleted;
 const WRIT_V1_NOTES_REFSPEC: &str = "+refs/notes/writ/v1/*:refs/notes/writ/v1/*";
 
 /// Fetch writ's signed envelope, verify it end-to-end, and attach a
-/// [`PlanNote`] for `plan_id` to bailiff's submission ref.
+/// [`PlanNote`] for `plan_id` to bailiff's per-plan notes ref.
 ///
 /// Returns the bailiff-side target OID — the deterministic seed-blob
-/// OID that [`plan_seed_blob_bytes`] hashes to, which a caller can
+/// OID that [`plan_submission_seed_blob_bytes`] hashes to, which a caller can
 /// hold onto for diagnostics or to read the freshly-written note back
 /// without recomputing it.
 ///
@@ -100,8 +100,8 @@ pub fn write_plan_note(
         signed_metadata: envelope.metadata,
         signature: envelope.signature,
     };
-    let plan_ref = plan_submission_ref(plan_id);
-    let seed = plan_seed_blob_bytes(plan_id);
+    let plan_ref = plan_notes_ref(plan_id);
+    let seed = plan_submission_seed_blob_bytes(plan_id);
     let bytes = note.canonical_bytes();
     bailiff_repo
         .write_note(&plan_ref, &seed, &bytes)
@@ -176,7 +176,9 @@ mod tests {
     //! the end.
     use super::*;
     use crate::agent_run::{AgentRunId, sha256_hex};
-    use crate::bailiff_plan_note::{PlanId, PlanNote, plan_seed_blob_bytes, plan_submission_ref};
+    use crate::bailiff_plan_note::{
+        PlanId, PlanNote, plan_notes_ref, plan_submission_seed_blob_bytes,
+    };
     use crate::core::{CapabilitySet, NotesRef, RepoRef, SessionId, Sha256Hex, UnixMillis};
     use crate::protocol::SignedRunMetadata;
     use crate::run_envelope::{OutputEnvelope, SignedRunEnvelope};
@@ -290,9 +292,9 @@ mod tests {
         // The returned OID is the deterministic seed-blob OID derived
         // from plan_id alone — pin that contract so a future schema
         // change can't quietly diverge the writer and reader.
-        let expected_seed_bytes = plan_seed_blob_bytes(plan_id);
+        let expected_seed_bytes = plan_submission_seed_blob_bytes(plan_id);
         let body = bailiff
-            .read_note(&plan_submission_ref(plan_id), &returned_oid)
+            .read_note(&plan_notes_ref(plan_id), &returned_oid)
             .expect("bailiff-side note must be readable at the returned OID");
 
         let note = PlanNote::from_canonical_bytes(&body).expect("body must decode");
@@ -514,8 +516,8 @@ mod tests {
         .unwrap();
         assert_ne!(oid1, oid2, "distinct plan ids must seed distinct OIDs");
 
-        let body1 = bailiff.read_note(&plan_submission_ref(p1), &oid1).unwrap();
-        let body2 = bailiff.read_note(&plan_submission_ref(p2), &oid2).unwrap();
+        let body1 = bailiff.read_note(&plan_notes_ref(p1), &oid1).unwrap();
+        let body2 = bailiff.read_note(&plan_notes_ref(p2), &oid2).unwrap();
         let note1 = PlanNote::from_canonical_bytes(&body1).unwrap();
         let note2 = PlanNote::from_canonical_bytes(&body2).unwrap();
         assert_eq!(note1.plan_id, p1);
@@ -552,7 +554,7 @@ mod end_to_end_tests {
     use super::*;
     use crate::agent_run::AgentPrompt;
     use crate::audit::AuditLog;
-    use crate::bailiff_plan_note::{PlanId, PlanNote, plan_submission_ref};
+    use crate::bailiff_plan_note::{PlanId, PlanNote, plan_notes_ref};
     use crate::core::{AgentKind, CapabilitySet, NotesRef, RepoRef, TtlSeconds};
     use crate::github::{GitHubAppConfig, GitHubAppRegistryConfig, GitHubMinter};
     use crate::notes_repo::NotesRepo;
@@ -709,7 +711,7 @@ mod end_to_end_tests {
 
         // --- Read back the plan note from bailiff's repo ------------
         let bailiff_for_read = Arc::clone(&bailiff);
-        let plan_ref = plan_submission_ref(plan_id);
+        let plan_ref = plan_notes_ref(plan_id);
         let body = tokio::task::spawn_blocking(move || {
             let bailiff = bailiff_for_read.blocking_lock();
             bailiff.read_note(&plan_ref, &returned_oid)
