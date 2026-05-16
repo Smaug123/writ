@@ -41,8 +41,8 @@ use std::path::Path;
 use thiserror::Error;
 
 use crate::bailiff_plan_note::{
-    DecisionNote, PlanId, PlanNote, plan_decision_seed_blob_bytes, plan_notes_ref,
-    plan_submission_seed_blob_bytes,
+    DecisionNote, PlanId, PlanNote, ReviewNote, plan_decision_seed_blob_bytes, plan_notes_ref,
+    plan_review_seed_blob_bytes, plan_submission_seed_blob_bytes,
 };
 use crate::core::NotesRef;
 use crate::notes_repo::{NotesRepo, NotesRepoError, WriteOutcome};
@@ -231,6 +231,154 @@ pub enum WriteDecisionNoteError {
     /// docstring for the residual race surface).
     #[error("writing the decision note to bailiff's repo failed: {0}")]
     WriteDecisionNote(#[source] NotesRepoError),
+}
+
+/// Fetch writ's signed envelope for a reviewer run, verify it
+/// end-to-end, and attach a [`ReviewNote`] for `plan_id` to bailiff's
+/// per-plan notes ref. Slice D2.2 of
+/// `docs/plans/2026-05-16-slice-d2-review.md`.
+///
+/// Same fetch-verify-attach shape as [`write_plan_note`] — the
+/// envelope-vs-reply metadata/signature parity check and the
+/// `verify_run_envelope` pass are byte-for-byte identical. The
+/// load-bearing difference is the storage primitive: review notes are
+/// **idempotent by error**. A second review for the same `plan_id`
+/// returns [`WriteReviewNoteError::ReviewAlreadyRecorded`] rather than
+/// overwriting, mirroring [`write_decision_note`]'s
+/// `DecisionAlreadyRecorded` contract. D2 ships single-review-per-plan;
+/// multi-review history is the documented `v1` → `v2` ref-prefix bump
+/// (see the slice-D2 plan doc).
+///
+/// The review note attaches under
+/// [`plan_notes_ref`]`(plan_id)` at the seed OID derived from
+/// [`plan_review_seed_blob_bytes`], distinct from the submission seed
+/// (bare plan id) and the decision seed (`::decision` suffix), so the
+/// three notes coexist under one per-plan ref.
+///
+/// **No precondition on submission presence.** Mirrors D1.3's decoupling
+/// of decide from submission: the only invariant the write helper
+/// enforces is "one review per plan." The submission-presence gate
+/// lives in the slice-D2.4 `submit_review` workflow, where the plan
+/// body is consumed for prompt composition.
+///
+/// Returns the bailiff-side target OID — the deterministic seed-blob
+/// OID [`plan_review_seed_blob_bytes`] hashes to — so a caller can
+/// hand it to [`NotesRepo::read_note`] without recomputing it.
+pub fn write_review_note(
+    bailiff_repo: &NotesRepo,
+    writ_repo_path: &Path,
+    writ_notes_ref: &NotesRef,
+    plan_id: PlanId,
+    purpose: String,
+    completed: &RunAgentCompleted,
+    allowed_signers: &AllowedSigners,
+) -> Result<GitObjectId, WriteReviewNoteError> {
+    bailiff_repo
+        .fetch_from_remote(writ_repo_path, &[WRIT_V1_NOTES_REFSPEC])
+        .map_err(WriteReviewNoteError::Fetch)?;
+    let body = bailiff_repo
+        .read_note(writ_notes_ref, &completed.output_oid)
+        .map_err(WriteReviewNoteError::ReadEnvelope)?;
+    let envelope =
+        SignedRunEnvelope::from_bytes(&body).map_err(WriteReviewNoteError::DecodeEnvelope)?;
+
+    if envelope.metadata != completed.signed_metadata {
+        return Err(WriteReviewNoteError::EnvelopeMetadataMismatch);
+    }
+    if envelope.signature != completed.signature {
+        return Err(WriteReviewNoteError::EnvelopeSignatureMismatch);
+    }
+
+    verify_run_envelope(&envelope, allowed_signers).map_err(WriteReviewNoteError::Verify)?;
+
+    let note = ReviewNote {
+        plan_id,
+        purpose,
+        writ_output_oid: completed.output_oid.clone(),
+        signed_metadata: envelope.metadata,
+        signature: envelope.signature,
+    };
+    let plan_ref = plan_notes_ref(plan_id);
+    let seed = plan_review_seed_blob_bytes(plan_id);
+    let bytes = note.canonical_bytes();
+    match bailiff_repo
+        .write_note_if_absent(&plan_ref, &seed, &bytes)
+        .map_err(WriteReviewNoteError::WriteReviewNote)?
+    {
+        WriteOutcome::Written(oid) => Ok(oid),
+        WriteOutcome::AlreadyPresent(target_oid) => {
+            Err(WriteReviewNoteError::ReviewAlreadyRecorded {
+                plan_id,
+                target_oid,
+            })
+        }
+    }
+}
+
+/// Tagged failure modes of [`write_review_note`]. The shape merges
+/// [`WritePlanNoteError`]'s pre-write-verification matrix
+/// (Fetch / ReadEnvelope / DecodeEnvelope / EnvelopeMetadataMismatch /
+/// EnvelopeSignatureMismatch / Verify) with
+/// [`WriteDecisionNoteError`]'s idempotent-by-error storage primitive
+/// (`ReviewAlreadyRecorded` distinct from a generic
+/// `WriteReviewNote`).
+#[derive(Debug, Error)]
+pub enum WriteReviewNoteError {
+    /// `git fetch` against writ's repo failed. Usually a wrong
+    /// `writ_repo_path` or filesystem permission problem.
+    #[error("fetching writ's notes ref failed: {0}")]
+    Fetch(#[source] NotesRepoError),
+    /// The fetch succeeded but no note exists at
+    /// `completed.output_oid` under `writ_notes_ref`. Either the
+    /// fetch refspec didn't cover the ref writ used, or writ's note
+    /// hasn't propagated yet (a race the synchronous-reply RPC
+    /// contract forecloses, but the variant exists so the failure is
+    /// named rather than swallowed).
+    #[error("reading the writ envelope note failed: {0}")]
+    ReadEnvelope(#[source] NotesRepoError),
+    /// The note body exists but isn't a valid [`SignedRunEnvelope`].
+    /// Indicates wire-level corruption — `deny_unknown_fields` and
+    /// the strict newtype validators on the envelope make this
+    /// near-impossible for any envelope writ itself produced.
+    #[error("decoding the writ envelope failed: {0}")]
+    DecodeEnvelope(#[source] serde_json::Error),
+    /// The envelope's `metadata` in writ's repo differs from the
+    /// `signed_metadata` writ returned in [`RunAgentCompleted`].
+    /// Writ is either equivocating or one of the two sources is
+    /// corrupt; bailiff refuses to attach a review note in either case.
+    #[error(
+        "envelope metadata fetched from writ's repo does not match the metadata writ \
+         returned in RunAgentCompleted"
+    )]
+    EnvelopeMetadataMismatch,
+    /// Same defence-in-depth check as [`Self::EnvelopeMetadataMismatch`]
+    /// but for the signature field.
+    #[error(
+        "envelope signature fetched from writ's repo does not match the signature writ \
+         returned in RunAgentCompleted"
+    )]
+    EnvelopeSignatureMismatch,
+    /// [`verify_run_envelope`] rejected the envelope. The wrapped
+    /// [`VerifyError`] names whether the failure was an output
+    /// digest mismatch, an unknown signer, or a bad signature.
+    #[error("verifying the fetched envelope failed: {0}")]
+    Verify(#[source] VerifyError),
+    /// A review note for this plan already exists under
+    /// [`plan_notes_ref`]`(plan_id)` at `target_oid`. D2 does not
+    /// overwrite; the operator's recourse is to submit a fresh plan
+    /// (multi-review history is a future `v1` → `v2` migration).
+    #[error("review already recorded for plan {plan_id} at target {target_oid}")]
+    ReviewAlreadyRecorded {
+        plan_id: PlanId,
+        target_oid: GitObjectId,
+    },
+    /// Writing the review note to bailiff's repo failed for any
+    /// reason other than the idempotency conflict. Usually a
+    /// filesystem problem or a cross-process race that slipped past
+    /// the per-repo mutex (see [`NotesRepo::write_note_if_absent`]'s
+    /// docstring for the residual race surface).
+    #[error("writing the review note to bailiff's repo failed: {0}")]
+    WriteReviewNote(#[source] NotesRepoError),
 }
 
 #[cfg(test)]
@@ -790,6 +938,495 @@ mod decision_tests {
 }
 
 #[cfg(test)]
+mod review_tests {
+    //! Tests for [`write_review_note`] — the slice D2.2 fetch-verify-
+    //! attach helper. Same harness shape as `tests` (a tempdir-backed
+    //! writ repo holding one signed envelope, a sibling bailiff repo,
+    //! and an `AllowedSigners` keyring); the round-trip is exercised
+    //! directly without standing up the broker. The full broker
+    //! handshake is covered by `end_to_end_tests` below.
+    use super::*;
+    use crate::agent_run::{AgentRunId, sha256_hex};
+    use crate::bailiff_plan_note::{
+        PlanId, ReviewNote, plan_notes_ref, plan_review_seed_blob_bytes,
+    };
+    use crate::core::{CapabilitySet, NotesRef, RepoRef, SessionId, Sha256Hex, UnixMillis};
+    use crate::protocol::SignedRunMetadata;
+    use crate::run_envelope::{OutputEnvelope, SignedRunEnvelope};
+    use crate::signing::{WritSigningKey, WritVerifyingKey};
+    use tempfile::TempDir;
+
+    const SIGNING_PEM: &str = include_str!("../tests/fixtures/ed25519_test_signing.key");
+    const SIGNING_PUB: &str = include_str!("../tests/fixtures/ed25519_test_signing.key.pub");
+    const OTHER_PUB: &str = include_str!("../tests/fixtures/ed25519_test_signing_other.key.pub");
+
+    fn writ_notes_ref() -> NotesRef {
+        NotesRef::try_new("refs/notes/writ/v1/agent-outputs").unwrap()
+    }
+
+    /// Build a freshly-signed envelope under `signing_key`. Mirrors
+    /// the same-named helper in `tests` so the envelope shape matches
+    /// what writ produces today.
+    fn freshly_signed(signing_key: &WritSigningKey) -> SignedRunEnvelope {
+        let output = OutputEnvelope {
+            stdout: b"reviewer prose".to_vec(),
+            stderr: Vec::new(),
+            stdout_truncated_at: None,
+            stderr_truncated_at: None,
+        };
+        let output_bytes = output.to_bytes();
+        let output_sha = Sha256Hex::try_new(sha256_hex(&output_bytes)).unwrap();
+        let prompt_sha = Sha256Hex::try_new(sha256_hex(b"reviewer-prompt")).unwrap();
+        let metadata = SignedRunMetadata {
+            run_id: AgentRunId::new(),
+            session_id: SessionId::new(),
+            prompt_sha256: prompt_sha,
+            output_envelope_sha256: output_sha,
+            capabilities: vec![CapabilitySet::WorkspaceRead {
+                repo: RepoRef {
+                    owner: "smaug123".into(),
+                    name: "writ".into(),
+                },
+            }],
+            exit_code: 0,
+            completed_at: UnixMillis::from_millis(1_700_000_000_000),
+            signing_key_fingerprint: signing_key.fingerprint(),
+        };
+        let signature = signing_key.sign(&metadata.canonical_bytes()).unwrap();
+        SignedRunEnvelope {
+            metadata,
+            signature,
+            output: output_bytes,
+        }
+    }
+
+    /// Prepare a writ repo containing one signed envelope keyed on the
+    /// run id, the same shape writ's `RunAgent` handler produces.
+    fn writ_repo_with_envelope(
+        tmp: &TempDir,
+        signing_key: &WritSigningKey,
+    ) -> (NotesRepo, RunAgentCompleted, SignedRunEnvelope) {
+        let writ_repo = NotesRepo::init_or_open(tmp.path().join("writ-bare")).unwrap();
+        let nref = writ_notes_ref();
+        let envelope = freshly_signed(signing_key);
+        let body = envelope.to_bytes();
+        let target = writ_repo
+            .write_note(
+                &nref,
+                envelope.metadata.run_id.to_string().as_bytes(),
+                &body,
+            )
+            .unwrap();
+        let completed = RunAgentCompleted {
+            output_oid: target,
+            signed_metadata: envelope.metadata.clone(),
+            signature: envelope.signature.clone(),
+        };
+        (writ_repo, completed, envelope)
+    }
+
+    fn bailiff_repo(tmp: &TempDir) -> NotesRepo {
+        NotesRepo::init_or_open(tmp.path().join("bailiff-bare")).unwrap()
+    }
+
+    /// Happy path: with writ's envelope in place and an allowed-signers
+    /// list that contains writ's key, `write_review_note` attaches a
+    /// review note that decodes back to a `ReviewNote` whose envelope
+    /// fields match what writ produced. Load-bearing contract D2.4's
+    /// `submit_review` relies on.
+    #[test]
+    fn write_review_note_happy_path_round_trips_through_bailiff_repo() {
+        let tmp = TempDir::new().unwrap();
+        let signing_key = WritSigningKey::from_openssh_pem(SIGNING_PEM).unwrap();
+        let (writ_repo, completed, envelope) = writ_repo_with_envelope(&tmp, &signing_key);
+        let bailiff = bailiff_repo(&tmp);
+        let allowed = AllowedSigners::from_openssh_lines(SIGNING_PUB).unwrap();
+
+        let plan_id = PlanId::new();
+        let purpose = "plan-review".to_string();
+        let returned_oid = write_review_note(
+            &bailiff,
+            writ_repo.path(),
+            &writ_notes_ref(),
+            plan_id,
+            purpose.clone(),
+            &completed,
+            &allowed,
+        )
+        .expect("happy path must succeed");
+
+        let body = bailiff
+            .read_note(&plan_notes_ref(plan_id), &returned_oid)
+            .expect("bailiff-side review note must be readable at the returned OID");
+        let note = ReviewNote::from_canonical_bytes(&body).expect("body must decode");
+        assert_eq!(note.plan_id, plan_id);
+        assert_eq!(note.purpose, purpose);
+        assert_eq!(note.writ_output_oid, completed.output_oid);
+        assert_eq!(note.signed_metadata, envelope.metadata);
+        assert_eq!(note.signature, envelope.signature);
+
+        // The seed bytes are the load-bearing input to `git hash-object`;
+        // pin them here so a future writer-side change can't silently
+        // diverge the seed from the slice-D2 plan doc.
+        let seed = plan_review_seed_blob_bytes(plan_id);
+        assert_eq!(
+            std::str::from_utf8(&seed).unwrap(),
+            format!("{plan_id}::review"),
+        );
+    }
+
+    /// Idempotent-by-error: a second review for the same plan returns
+    /// `ReviewAlreadyRecorded` rather than overwriting. The second call
+    /// carries a different `purpose` so any silent overwrite would
+    /// surface as a body mismatch on the read-back.
+    #[test]
+    fn write_review_note_returns_already_recorded_on_second_call() {
+        let tmp = TempDir::new().unwrap();
+        let signing_key = WritSigningKey::from_openssh_pem(SIGNING_PEM).unwrap();
+        let (writ_repo, completed, _envelope) = writ_repo_with_envelope(&tmp, &signing_key);
+        let bailiff = bailiff_repo(&tmp);
+        let allowed = AllowedSigners::from_openssh_lines(SIGNING_PUB).unwrap();
+
+        let plan_id = PlanId::new();
+        let first_oid = write_review_note(
+            &bailiff,
+            writ_repo.path(),
+            &writ_notes_ref(),
+            plan_id,
+            "first".into(),
+            &completed,
+            &allowed,
+        )
+        .expect("first review must succeed");
+
+        let err = write_review_note(
+            &bailiff,
+            writ_repo.path(),
+            &writ_notes_ref(),
+            plan_id,
+            "second".into(),
+            &completed,
+            &allowed,
+        )
+        .unwrap_err();
+        match err {
+            WriteReviewNoteError::ReviewAlreadyRecorded {
+                plan_id: pid,
+                target_oid,
+            } => {
+                assert_eq!(pid, plan_id);
+                assert_eq!(target_oid, first_oid);
+            }
+            other => panic!("expected ReviewAlreadyRecorded, got: {other:?}"),
+        }
+
+        // First body must survive.
+        let body = bailiff
+            .read_note(&plan_notes_ref(plan_id), &first_oid)
+            .unwrap();
+        let note = ReviewNote::from_canonical_bytes(&body).unwrap();
+        assert_eq!(note.purpose, "first");
+    }
+
+    /// Coexistence pin: a submission note and a review note for the
+    /// same plan live under the same per-plan ref at distinct seed
+    /// OIDs. The review write must not collide with a pre-existing
+    /// submission, and the submission must remain readable after the
+    /// review is attached. Property the three-seeds-per-plan design
+    /// exists to provide.
+    #[test]
+    fn write_review_note_coexists_with_existing_submission_under_same_ref() {
+        let tmp = TempDir::new().unwrap();
+        let signing_key = WritSigningKey::from_openssh_pem(SIGNING_PEM).unwrap();
+        let (writ_repo, completed, _envelope) = writ_repo_with_envelope(&tmp, &signing_key);
+        let bailiff = bailiff_repo(&tmp);
+        let allowed = AllowedSigners::from_openssh_lines(SIGNING_PUB).unwrap();
+
+        let plan_id = PlanId::new();
+        let plan_ref = plan_notes_ref(plan_id);
+
+        // Plant a submission-shaped note directly via `write_note` so
+        // we don't drag the full slice-C broker round-trip in here.
+        let submission_seed = crate::bailiff_plan_note::plan_submission_seed_blob_bytes(plan_id);
+        let submission_target = bailiff
+            .write_note(&plan_ref, &submission_seed, b"submission-body")
+            .expect("submission write must succeed");
+
+        let review_target = write_review_note(
+            &bailiff,
+            writ_repo.path(),
+            &writ_notes_ref(),
+            plan_id,
+            "plan-review".into(),
+            &completed,
+            &allowed,
+        )
+        .expect("review write must succeed alongside a submission");
+
+        assert_ne!(
+            submission_target, review_target,
+            "submission and review must attach at distinct OIDs",
+        );
+        assert_eq!(
+            bailiff.read_note(&plan_ref, &submission_target).unwrap(),
+            b"submission-body",
+            "submission body must survive the review write",
+        );
+        let review_body = bailiff.read_note(&plan_ref, &review_target).unwrap();
+        assert_eq!(
+            ReviewNote::from_canonical_bytes(&review_body)
+                .unwrap()
+                .plan_id,
+            plan_id,
+        );
+    }
+
+    /// Coexistence pin: a decision note and a review note for the same
+    /// plan live under the same per-plan ref at distinct seed OIDs.
+    /// Mirrors the submission-coexistence test for the third pairwise
+    /// combination; without this, a future suffix collision between
+    /// `::decision` and `::review` would only surface in slice F's
+    /// read paths.
+    #[test]
+    fn write_review_note_coexists_with_existing_decision_under_same_ref() {
+        let tmp = TempDir::new().unwrap();
+        let signing_key = WritSigningKey::from_openssh_pem(SIGNING_PEM).unwrap();
+        let (writ_repo, completed, _envelope) = writ_repo_with_envelope(&tmp, &signing_key);
+        let bailiff = bailiff_repo(&tmp);
+        let allowed = AllowedSigners::from_openssh_lines(SIGNING_PUB).unwrap();
+
+        let plan_id = PlanId::new();
+        let plan_ref = plan_notes_ref(plan_id);
+
+        // Plant a decision-shaped note directly via `write_note`.
+        let decision_seed = crate::bailiff_plan_note::plan_decision_seed_blob_bytes(plan_id);
+        let decision_target = bailiff
+            .write_note(&plan_ref, &decision_seed, b"decision-body")
+            .expect("decision write must succeed");
+
+        let review_target = write_review_note(
+            &bailiff,
+            writ_repo.path(),
+            &writ_notes_ref(),
+            plan_id,
+            "plan-review".into(),
+            &completed,
+            &allowed,
+        )
+        .expect("review write must succeed alongside a decision");
+
+        assert_ne!(
+            decision_target, review_target,
+            "decision and review must attach at distinct OIDs",
+        );
+        assert_eq!(
+            bailiff.read_note(&plan_ref, &decision_target).unwrap(),
+            b"decision-body",
+            "decision body must survive the review write",
+        );
+    }
+
+    /// Two distinct plan ids produce two distinct bailiff-side reviews
+    /// from the *same* writ envelope. The plan id is the only thing
+    /// that varies between the two writes; the writ-side OID stays the
+    /// same in both notes.
+    #[test]
+    fn write_review_note_supports_distinct_plans_independently() {
+        let tmp = TempDir::new().unwrap();
+        let signing_key = WritSigningKey::from_openssh_pem(SIGNING_PEM).unwrap();
+        let (writ_repo, completed, _envelope) = writ_repo_with_envelope(&tmp, &signing_key);
+        let bailiff = bailiff_repo(&tmp);
+        let allowed = AllowedSigners::from_openssh_lines(SIGNING_PUB).unwrap();
+
+        let p1 = PlanId::new();
+        let p2 = PlanId::new();
+        let oid1 = write_review_note(
+            &bailiff,
+            writ_repo.path(),
+            &writ_notes_ref(),
+            p1,
+            "first".into(),
+            &completed,
+            &allowed,
+        )
+        .unwrap();
+        let oid2 = write_review_note(
+            &bailiff,
+            writ_repo.path(),
+            &writ_notes_ref(),
+            p2,
+            "second".into(),
+            &completed,
+            &allowed,
+        )
+        .unwrap();
+        assert_ne!(oid1, oid2, "distinct plan ids must seed distinct OIDs");
+
+        let body1 = bailiff.read_note(&plan_notes_ref(p1), &oid1).unwrap();
+        let body2 = bailiff.read_note(&plan_notes_ref(p2), &oid2).unwrap();
+        let note1 = ReviewNote::from_canonical_bytes(&body1).unwrap();
+        let note2 = ReviewNote::from_canonical_bytes(&body2).unwrap();
+        assert_eq!(note1.plan_id, p1);
+        assert_eq!(note2.plan_id, p2);
+        assert_eq!(
+            note1.writ_output_oid, note2.writ_output_oid,
+            "both reviews reference the same writ envelope",
+        );
+        assert_ne!(note1.purpose, note2.purpose);
+    }
+
+    /// Defence in depth: if the envelope writ stored in its repo
+    /// disagrees with the metadata writ returned over the wire,
+    /// bailiff refuses to attach the review.
+    #[test]
+    fn write_review_note_rejects_metadata_mismatch_between_envelope_and_reply() {
+        let tmp = TempDir::new().unwrap();
+        let signing_key = WritSigningKey::from_openssh_pem(SIGNING_PEM).unwrap();
+        let (writ_repo, mut completed, _envelope) = writ_repo_with_envelope(&tmp, &signing_key);
+        let bailiff = bailiff_repo(&tmp);
+        let allowed = AllowedSigners::from_openssh_lines(SIGNING_PUB).unwrap();
+
+        completed.signed_metadata.exit_code = completed.signed_metadata.exit_code.wrapping_add(1);
+
+        let err = write_review_note(
+            &bailiff,
+            writ_repo.path(),
+            &writ_notes_ref(),
+            PlanId::new(),
+            "p".into(),
+            &completed,
+            &allowed,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, WriteReviewNoteError::EnvelopeMetadataMismatch),
+            "expected EnvelopeMetadataMismatch, got: {err:?}",
+        );
+    }
+
+    /// Defence in depth: same as the metadata case but for the
+    /// signature field.
+    #[test]
+    fn write_review_note_rejects_signature_mismatch_between_envelope_and_reply() {
+        let tmp = TempDir::new().unwrap();
+        let signing_key = WritSigningKey::from_openssh_pem(SIGNING_PEM).unwrap();
+        let (writ_repo, mut completed, _envelope) = writ_repo_with_envelope(&tmp, &signing_key);
+        let bailiff = bailiff_repo(&tmp);
+        let allowed = AllowedSigners::from_openssh_lines(SIGNING_PUB).unwrap();
+
+        completed.signature = crate::core::SshSignature::try_new(
+            "-----BEGIN SSH SIGNATURE-----\nU1NIU0lH-other-bytes\n-----END SSH SIGNATURE-----",
+        )
+        .unwrap();
+
+        let err = write_review_note(
+            &bailiff,
+            writ_repo.path(),
+            &writ_notes_ref(),
+            PlanId::new(),
+            "p".into(),
+            &completed,
+            &allowed,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, WriteReviewNoteError::EnvelopeSignatureMismatch),
+            "expected EnvelopeSignatureMismatch, got: {err:?}",
+        );
+    }
+
+    /// If bailiff's keyring doesn't contain writ's signing key, the
+    /// envelope verification step fails with `UnknownSigner`, which
+    /// surfaces as `WriteReviewNoteError::Verify`. Operator-
+    /// misconfigured-trust case.
+    #[test]
+    fn write_review_note_rejects_envelope_when_signer_not_trusted() {
+        let tmp = TempDir::new().unwrap();
+        let signing_key = WritSigningKey::from_openssh_pem(SIGNING_PEM).unwrap();
+        let (writ_repo, completed, _envelope) = writ_repo_with_envelope(&tmp, &signing_key);
+        let bailiff = bailiff_repo(&tmp);
+
+        let other = WritVerifyingKey::from_openssh(OTHER_PUB.trim()).unwrap();
+        let allowed = AllowedSigners::from_keys([other]);
+
+        let err = write_review_note(
+            &bailiff,
+            writ_repo.path(),
+            &writ_notes_ref(),
+            PlanId::new(),
+            "p".into(),
+            &completed,
+            &allowed,
+        )
+        .unwrap_err();
+        match err {
+            WriteReviewNoteError::Verify(VerifyError::UnknownSigner { .. }) => {}
+            other => panic!("expected Verify(UnknownSigner), got: {other:?}"),
+        }
+    }
+
+    /// A bad writ-repo path surfaces as `Fetch`, distinct from the
+    /// later `ReadEnvelope` variant. Operators see "your writ repo
+    /// path is wrong" instead of "no such note."
+    #[test]
+    fn write_review_note_reports_fetch_failure_for_missing_writ_repo() {
+        let tmp = TempDir::new().unwrap();
+        let signing_key = WritSigningKey::from_openssh_pem(SIGNING_PEM).unwrap();
+        let (_writ_repo, completed, _envelope) = writ_repo_with_envelope(&tmp, &signing_key);
+        let bailiff = bailiff_repo(&tmp);
+        let allowed = AllowedSigners::from_openssh_lines(SIGNING_PUB).unwrap();
+
+        let bogus = tmp.path().join("does-not-exist");
+        let err = write_review_note(
+            &bailiff,
+            &bogus,
+            &writ_notes_ref(),
+            PlanId::new(),
+            "p".into(),
+            &completed,
+            &allowed,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, WriteReviewNoteError::Fetch(_)),
+            "expected Fetch error, got: {err:?}",
+        );
+    }
+
+    /// Review can be written even when no submission note exists yet.
+    /// D2 chose not to gate the write helper on submission presence
+    /// (mirrors D1.3's decoupling); the submission-presence gate lives
+    /// in slice D2.4's `submit_review` workflow, where the body is
+    /// consumed for prompt composition. Pin that choice so a future
+    /// change that adds a precondition has to update this test.
+    #[test]
+    fn write_review_note_does_not_require_pre_existing_submission() {
+        let tmp = TempDir::new().unwrap();
+        let signing_key = WritSigningKey::from_openssh_pem(SIGNING_PEM).unwrap();
+        let (writ_repo, completed, _envelope) = writ_repo_with_envelope(&tmp, &signing_key);
+        let bailiff = bailiff_repo(&tmp);
+        let allowed = AllowedSigners::from_openssh_lines(SIGNING_PUB).unwrap();
+
+        let plan_id = PlanId::new();
+        let returned_oid = write_review_note(
+            &bailiff,
+            writ_repo.path(),
+            &writ_notes_ref(),
+            plan_id,
+            "plan-review".into(),
+            &completed,
+            &allowed,
+        )
+        .expect("review write must succeed without a prior submission note");
+        let body = bailiff
+            .read_note(&plan_notes_ref(plan_id), &returned_oid)
+            .unwrap();
+        let note = ReviewNote::from_canonical_bytes(&body).unwrap();
+        assert_eq!(note.plan_id, plan_id);
+    }
+}
+
+#[cfg(test)]
 mod end_to_end_tests {
     //! Full slice-C handshake against a real writ broker. Mirrors the
     //! slice-B5 round-trip in `writ_client.rs` and tacks
@@ -813,7 +1450,7 @@ mod end_to_end_tests {
     use super::*;
     use crate::agent_run::AgentPrompt;
     use crate::audit::AuditLog;
-    use crate::bailiff_plan_note::{PlanId, PlanNote, plan_notes_ref};
+    use crate::bailiff_plan_note::{PlanId, PlanNote, ReviewNote, plan_notes_ref};
     use crate::core::{AgentKind, CapabilitySet, NotesRef, RepoRef, TtlSeconds};
     use crate::github::{GitHubAppConfig, GitHubAppRegistryConfig, GitHubMinter};
     use crate::notes_repo::NotesRepo;
@@ -986,6 +1623,141 @@ mod end_to_end_tests {
         // and the signed metadata + signature the broker produced.
         assert_eq!(note.plan_id, plan_id);
         assert_eq!(note.purpose, "plan-submit");
+        assert_eq!(note.writ_output_oid, completed.output_oid);
+        assert_eq!(note.signed_metadata, completed.signed_metadata);
+        assert_eq!(note.signature, completed.signature);
+
+        broker_task.abort();
+        let _ = broker_task.await;
+    }
+
+    /// Full slice-D2 handshake against a real writ broker: bailiff
+    /// sends `RunAgent` for a reviewer run, writ signs and persists
+    /// the envelope, then bailiff drives `write_review_note` to fetch
+    /// the envelope, verify it, and store a `ReviewNote` keyed on the
+    /// plan id. Parallel to
+    /// [`write_plan_note_completes_after_real_broker_round_trip`];
+    /// the only material differences are the helper under test, the
+    /// purpose string, and the read-back type.
+    #[tokio::test]
+    async fn write_review_note_completes_after_real_broker_round_trip() {
+        // --- Broker bring-up (writ side) ----------------------------
+        let tmp = tempfile::tempdir().unwrap();
+        let writ_repo = NotesRepo::init_or_open(tmp.path().join("writ-bare")).unwrap();
+        let bailiff_repo_handle = NotesRepo::init_or_open(tmp.path().join("bailiff-bare")).unwrap();
+        let signing_key = WritSigningKey::from_openssh_pem(SIGNING_PEM).unwrap();
+        let cat = find_in_path("cat").expect("cat must be on PATH for the round-trip test");
+
+        let github_server = MockServer::start().await;
+        let pk = SecretKey::new("gh-app-pk").unwrap();
+        let store = InMemStore::default();
+        store.put(&pk, TEST_PRIV).unwrap();
+        let mut apps = BTreeMap::new();
+        apps.insert(
+            AgentKind::Claude,
+            GitHubAppConfig {
+                app_id: 42,
+                installation_id: 999,
+                installation_owner: "o".into(),
+                private_key_secret: pk,
+                api_base: github_server.uri(),
+            },
+        );
+        let minter = GitHubMinter::new_registry(GitHubAppRegistryConfig::new(apps).unwrap());
+
+        let state = Arc::new(BrokerState {
+            audit: Arc::new(AuditLog::open_in_memory().unwrap()),
+            minter,
+            secrets: store,
+            policy: PolicyConfig {
+                writable_repos: vec![],
+                default_ttl: TtlSeconds::new(3600).unwrap(),
+            },
+            staging_store: None,
+            notes_repo: Some(Arc::new(writ_repo)),
+            signing_key: Some(signing_key.clone()),
+            run_agent_spawn: Some(RunAgentSpawnConfig {
+                command: cat,
+                args: Vec::new(),
+            }),
+        });
+
+        let socket_dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(socket_dir.path(), std::fs::Permissions::from_mode(0o700))
+            .unwrap();
+        let socket_path = socket_dir.path().join("writ.sock");
+        let listener = prepare_broker_listener(&socket_path).await.unwrap();
+        let broker_state = Arc::clone(&state);
+        let broker_task = tokio::spawn(async move {
+            let _ = serve_broker_with_agent_vm(listener, broker_state, None).await;
+        });
+
+        // --- Client request (bailiff side) --------------------------
+        let prompt_text = "reviewer-prompt + plan body\n";
+        let writ_notes_ref = NotesRef::try_new("refs/notes/writ/v1/agent-outputs").unwrap();
+        let purpose = "plan-review".to_string();
+        let client = WritClient::new(&socket_path);
+        let completed = tokio::time::timeout(
+            Duration::from_secs(15),
+            client.run_agent(RunAgentRequest {
+                prompt: AgentPrompt::new(prompt_text),
+                capabilities: vec![CapabilitySet::WorkspaceRead {
+                    repo: RepoRef {
+                        owner: "smaug123".into(),
+                        name: "writ".into(),
+                    },
+                }],
+                purpose: purpose.clone(),
+                output_ref: writ_notes_ref.clone(),
+                session_id: None,
+            }),
+        )
+        .await
+        .expect("RunAgent must complete within 15s")
+        .expect("RunAgent must succeed");
+
+        // --- Review-note write (bailiff side) -----------------------
+        // `write_review_note` is blocking (shells out to git); wrap
+        // it in `spawn_blocking` so we don't stall the runtime. Same
+        // `AsyncMutex<NotesRepo>` shape the plan-note round-trip uses.
+        let writ_repo_path = state.notes_repo.as_ref().unwrap().path().to_path_buf();
+        let allowed = AllowedSigners::from_openssh_lines(SIGNING_PUB).unwrap();
+        let plan_id = PlanId::new();
+        let completed_clone = completed.clone();
+        let writ_notes_ref_clone = writ_notes_ref.clone();
+        let bailiff = Arc::new(AsyncMutex::new(bailiff_repo_handle));
+        let bailiff_for_block = Arc::clone(&bailiff);
+        let returned_oid = tokio::task::spawn_blocking(move || {
+            let bailiff = bailiff_for_block.blocking_lock();
+            write_review_note(
+                &bailiff,
+                &writ_repo_path,
+                &writ_notes_ref_clone,
+                plan_id,
+                purpose.clone(),
+                &completed_clone,
+                &allowed,
+            )
+        })
+        .await
+        .unwrap()
+        .expect("write_review_note must succeed under the trusted-signer keyring");
+
+        // --- Read back the review note from bailiff's repo ----------
+        let bailiff_for_read = Arc::clone(&bailiff);
+        let plan_ref = plan_notes_ref(plan_id);
+        let body = tokio::task::spawn_blocking(move || {
+            let bailiff = bailiff_for_read.blocking_lock();
+            bailiff.read_note(&plan_ref, &returned_oid)
+        })
+        .await
+        .unwrap()
+        .expect("bailiff-side review note must be readable at the returned OID");
+        let note = ReviewNote::from_canonical_bytes(&body)
+            .expect("bailiff-side body must decode as ReviewNote");
+
+        assert_eq!(note.plan_id, plan_id);
+        assert_eq!(note.purpose, "plan-review");
         assert_eq!(note.writ_output_oid, completed.output_oid);
         assert_eq!(note.signed_metadata, completed.signed_metadata);
         assert_eq!(note.signature, completed.signature);
