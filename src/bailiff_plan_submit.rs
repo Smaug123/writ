@@ -105,7 +105,7 @@ pub struct SubmitPlanOutcome {
     /// print it without juggling the input back to the call site).
     pub plan_id: PlanId,
     /// Bailiff-side OID where the plan note is attached. The
-    /// deterministic seed-blob OID `plan_seed_blob_bytes(plan_id)`
+    /// deterministic seed-blob OID `plan_submission_seed_blob_bytes(plan_id)`
     /// hashes to; callable readers can recompute it but having it on
     /// the result avoids the recomputation.
     pub plan_note_oid: GitObjectId,
@@ -328,7 +328,7 @@ mod end_to_end_tests {
 
     use super::*;
     use crate::audit::AuditLog;
-    use crate::bailiff_plan_note::{PlanNote, plan_submission_ref};
+    use crate::bailiff_plan_note::{PlanNote, plan_notes_ref};
     use crate::core::{AgentKind, CapabilitySet, NotesRef, RepoRef, TtlSeconds};
     use crate::github::{GitHubAppConfig, GitHubAppRegistryConfig, GitHubMinter};
     use crate::notes_repo::NotesRepo;
@@ -494,7 +494,7 @@ mod end_to_end_tests {
         // Plan note decodes from bailiff's repo and references the
         // writ-side OID writ returned.
         let bailiff_for_read = Arc::clone(&bailiff);
-        let plan_ref = plan_submission_ref(plan_id);
+        let plan_ref = plan_notes_ref(plan_id);
         let oid = outcome.plan_note_oid.clone();
         let body = tokio::task::spawn_blocking(move || {
             let bailiff = bailiff_for_read.blocking_lock();

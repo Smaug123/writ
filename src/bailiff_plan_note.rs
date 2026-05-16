@@ -1,12 +1,22 @@
-//! Bailiff-owned plan-submission note primitive. Defines the
-//! `PlanNote` body and the `refs/notes/bailiff/v1/plans/<plan-id>` ref
-//! scheme bailiff uses to attest "writ ran agent run R for plan P and
-//! produced the signed envelope at OID O in writ's repo".
+//! Bailiff-owned per-plan note primitives. Defines the
+//! `refs/notes/bailiff/v1/plans/<plan-id>` ref scheme that holds every
+//! artefact bailiff records about one plan workflow, plus the two
+//! note bodies that live under it today:
 //!
-//! This is slice C1 of `docs/plans/2026-05-14-bailiff-split.md`: a
-//! pure data layer with no IO and no CLI. The write helper that uses
-//! this lands in slice C2; the `bailiff plan submit` CLI verb that
-//! drives it lands in slice C3.
+//! - [`PlanNote`] — slice C's submission attestation: "writ ran agent
+//!   run R for plan P and produced the signed envelope at OID O in
+//!   writ's repo."
+//! - [`DecisionNote`] — slice D1's operator verdict: "plan P was
+//!   accepted/rejected at time T by D."
+//!
+//! Both attach under the same per-plan ref but at distinct
+//! deterministic seed OIDs — [`plan_submission_seed_blob_bytes`] and
+//! [`plan_decision_seed_blob_bytes`] — so they coexist without
+//! colliding. Slice C1 of `docs/plans/2026-05-14-bailiff-split.md`
+//! introduced the submission piece; slice D1 of
+//! `docs/plans/2026-05-16-slice-d1-decide.md` adds the decision piece.
+//! Everything here is pure data with no IO and no CLI; the write
+//! helpers live in [`crate::bailiff_plan_write`].
 //!
 //! `PlanId` is a fresh bailiff-side type — not the `agent_plan::PlanId`
 //! that's leaving writ in slice G. Keeping them distinct now means
@@ -19,12 +29,13 @@ use std::str::FromStr;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::core::{NotesRef, NotesRefError, SshSignature};
+use crate::bailiff_decision::{Decider, Decision};
+use crate::core::{NotesRef, NotesRefError, SshSignature, UnixMillis};
 use crate::protocol::SignedRunMetadata;
 use crate::vm_git::GitObjectId;
 
 /// Notes-ref prefix for every bailiff-managed plan. The `<plan-id>`
-/// segment is appended verbatim; see [`plan_submission_ref`].
+/// segment is appended verbatim; see [`plan_notes_ref`].
 ///
 /// The `v1` segment is owned by bailiff and bumps independently of
 /// writ's own `v1` namespace — per the slice-B pinned design
@@ -88,29 +99,48 @@ impl FromStr for PlanId {
 /// `refs/...` path, the UUID display form contains only hex digits
 /// and hyphens, and `NotesRef::try_new` rejects nothing under those
 /// constraints. `expect` is therefore correct, not a TODO.
-pub fn plan_submission_ref(plan_id: PlanId) -> NotesRef {
+pub fn plan_notes_ref(plan_id: PlanId) -> NotesRef {
     NotesRef::try_new(format!("{BAILIFF_PLAN_NOTES_REF_PREFIX}{plan_id}"))
         .expect("static prefix + UUID display is always a valid NotesRef")
 }
 
-/// Deterministic seed-blob bytes for `plan_id`. Whoever writes (or
-/// later reads) the submission note hashes these bytes via
-/// `git hash-object`; the resulting OID is the target the note
-/// attaches to inside [`plan_submission_ref`]. Determinism matters
-/// because reading a plan note requires recomputing the seed OID
-/// from the plan id alone — no separate registry needed.
+/// Deterministic seed-blob bytes for the **submission** note under
+/// [`plan_notes_ref`]`(plan_id)`. Whoever writes (or later reads)
+/// the submission note hashes these bytes via `git hash-object`; the
+/// resulting OID is the target the note attaches to. Determinism
+/// matters because reading a plan note requires recomputing the seed
+/// OID from the plan id alone — no separate registry needed.
 ///
 /// We use the plan id's canonical string form (lowercase hyphenated
 /// UUID) so the seed bytes are stable across endianness and have an
 /// obvious mapping to the plan id any operator sees.
-pub fn plan_seed_blob_bytes(plan_id: PlanId) -> Vec<u8> {
+///
+/// Sibling helpers under the same notes ref derive a different seed
+/// for the same plan id — see [`plan_decision_seed_blob_bytes`] for
+/// the slice-D1 decision note. Distinct seeds let the two notes
+/// coexist under one per-plan ref without colliding.
+pub fn plan_submission_seed_blob_bytes(plan_id: PlanId) -> Vec<u8> {
     plan_id.to_string().into_bytes()
+}
+
+/// Deterministic seed-blob bytes for the **decision** note under
+/// [`plan_notes_ref`]`(plan_id)`. The `<plan_id>::decision` suffix
+/// distinguishes the decision target from the submission target
+/// produced by [`plan_submission_seed_blob_bytes`] (which is the
+/// bare plan id) so the two notes attach to different objects under
+/// the same notes ref.
+///
+/// The suffix is a literal ASCII `::decision` rather than e.g.
+/// `/decision` so the seed bytes themselves never look like a path
+/// fragment a casual reader might misinterpret as a ref subpath.
+pub fn plan_decision_seed_blob_bytes(plan_id: PlanId) -> Vec<u8> {
+    format!("{plan_id}::decision").into_bytes()
 }
 
 /// A bailiff-owned attestation that writ ran an agent for `plan_id`
 /// and produced the signed output reachable at `writ_output_oid` in
 /// writ's repo. Stored as the body of one note under
-/// [`plan_submission_ref`].
+/// [`plan_notes_ref`].
 ///
 /// What this carries:
 /// - `plan_id`: bailiff's identifier for the workflow.
@@ -184,14 +214,91 @@ pub enum PlanNoteParseError {
     Json(#[source] serde_json::Error),
 }
 
-/// Reasons [`plan_submission_ref`] would fail to construct a
+/// A bailiff-owned record of one operator verdict on `plan_id`.
+/// Stored as the body of one note under [`plan_notes_ref`] at the
+/// seed OID derived from [`plan_decision_seed_blob_bytes`] — distinct
+/// from the [`PlanNote`] target so the submission and decision notes
+/// coexist under one per-plan ref.
+///
+/// What this carries:
+/// - `plan_id`: bailiff's identifier for the workflow this verdict
+///   applies to. The same id whose [`PlanNote`] lives next door under
+///   the same notes ref.
+/// - `outcome`: accept or reject. Bailiff does no auto-anything; the
+///   `Rejected` variant simply means "this plan is dead, the operator
+///   does whatever they want next." See [`Decision`] for the rename
+///   away from the legacy `RejectedRestart` naming.
+/// - `decider`: attribution string. Today the bailiff CLI writes
+///   `cli:<USER>`; a future orchestrator agent may write
+///   `agent:<run_id>`. [`Decider`] enforces the byte-length and
+///   no-NUL bounds at the wire boundary.
+/// - `decided_at`: when the verdict was recorded, in unix-epoch
+///   milliseconds. Matches `SignedRunMetadata.completed_at`'s
+///   timestamp shape so audit-log replays can interleave bailiff
+///   verdicts with writ-side run timestamps without conversion.
+///
+/// **D1 ships unsigned.** The parent split doc defers bailiff's own
+/// signing primitives; writ's submission signature on the sibling
+/// [`PlanNote`] remains the trust anchor for the plan-as-a-whole. A
+/// future schema bump can add a signature field local to this struct.
+///
+/// **D1 is idempotent.** The write helper rejects a second decision
+/// for the same plan id rather than silently overwriting — the
+/// operator workflow for "I want to change my mind" is "the plan is
+/// dead, submit a new one." A future `v2` ref-prefix bump can switch
+/// to per-decision UUIDs for an append-only history if we ever want
+/// one; the seed-OID convention pinned here is the migration target.
+///
+/// `deny_unknown_fields` catches an unexpected key at parse time
+/// rather than silently dropping it. Same defence the sibling
+/// [`PlanNote`] uses: any future field addition is a schema bump
+/// (`v1` → `v2` in the ref prefix); silently accepting extra fields
+/// would let a writer-side regression sneak past the reader.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DecisionNote {
+    pub plan_id: PlanId,
+    pub outcome: Decision,
+    pub decider: Decider,
+    pub decided_at: UnixMillis,
+}
+
+impl DecisionNote {
+    /// Canonical byte representation of the note body. Compact JSON
+    /// (no whitespace) with keys emitted in struct-declaration order
+    /// — the same canonicalisation [`PlanNote::canonical_bytes`] uses.
+    ///
+    /// The bytes returned here are what gets written as the body of
+    /// the git note. D1 does not sign decisions (see the type-level
+    /// docstring); the slice-G or successor follow-up that does will
+    /// sign exactly these bytes.
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        serde_json::to_vec(self).expect("DecisionNote serialises to JSON without IO; cannot fail")
+    }
+
+    /// Inverse of [`Self::canonical_bytes`]. Fails on malformed JSON,
+    /// on any unknown top-level field (`deny_unknown_fields`), or on
+    /// any nested validation error from the field types
+    /// ([`PlanId`], [`Decision`], [`Decider`], [`UnixMillis`]).
+    pub fn from_canonical_bytes(bytes: &[u8]) -> Result<Self, DecisionNoteParseError> {
+        serde_json::from_slice(bytes).map_err(DecisionNoteParseError::Json)
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum DecisionNoteParseError {
+    #[error("decision-note body is not valid canonical JSON: {0}")]
+    Json(#[source] serde_json::Error),
+}
+
+/// Reasons [`plan_notes_ref`] would fail to construct a
 /// `NotesRef`. None are reachable for any caller using
 /// [`PlanId::new`] / [`PlanId::from_str`] — the type means we only
 /// ever feed validated UUIDs through — but the error type exists so
 /// a future schema change (e.g. allowing operator-chosen ids) has a
 /// place to surface validation failures.
 #[derive(Debug, thiserror::Error)]
-pub enum PlanSubmissionRefError {
+pub enum PlanNotesRefError {
     #[error("invalid notes ref: {0}")]
     InvalidRef(#[from] NotesRefError),
 }
@@ -254,14 +361,14 @@ mod tests {
         }
     }
 
-    /// `plan_submission_ref` produces a ref under the documented
+    /// `plan_notes_ref` produces a ref under the documented
     /// prefix with the plan id appended verbatim. Pin both pieces so
     /// a regression that drops the `v1` segment (or appends an
     /// unexpected suffix) is caught.
     #[test]
-    fn plan_submission_ref_lives_under_bailiff_v1_plans_prefix() {
+    fn plan_notes_ref_lives_under_bailiff_v1_plans_prefix() {
         let plan_id = PlanId::new();
-        let r = plan_submission_ref(plan_id);
+        let r = plan_notes_ref(plan_id);
         assert!(
             r.as_str().starts_with(BAILIFF_PLAN_NOTES_REF_PREFIX),
             "ref `{}` does not start with `{}`",
@@ -279,20 +386,20 @@ mod tests {
     /// collapses every plan to the same ref (e.g. dropping the
     /// `plan_id` segment) would silently overwrite history.
     #[test]
-    fn plan_submission_ref_is_unique_per_plan() {
+    fn plan_notes_ref_is_unique_per_plan() {
         let a = PlanId::new();
         let b = PlanId::new();
         assert_ne!(a, b, "PlanId::new must not collide");
-        assert_ne!(plan_submission_ref(a), plan_submission_ref(b));
+        assert_ne!(plan_notes_ref(a), plan_notes_ref(b));
     }
 
     /// The seed blob bytes are the plan id's canonical string form.
     /// Determinism is the contract: any future writer must compute
     /// the same OID via `git hash-object` as any future reader.
     #[test]
-    fn plan_seed_blob_bytes_is_plan_id_string() {
+    fn plan_submission_seed_blob_bytes_is_plan_id_string() {
         let plan_id = PlanId::new();
-        let bytes = plan_seed_blob_bytes(plan_id);
+        let bytes = plan_submission_seed_blob_bytes(plan_id);
         assert_eq!(std::str::from_utf8(&bytes).unwrap(), plan_id.to_string());
     }
 
@@ -404,5 +511,191 @@ mod tests {
         let bytes = note.canonical_bytes();
         let back = PlanNote::from_canonical_bytes(&bytes).unwrap();
         assert_eq!(back, note);
+    }
+
+    // --- DecisionNote --------------------------------------------------------
+
+    fn sample_decider() -> Decider {
+        Decider::try_new("cli:alice").unwrap()
+    }
+
+    fn sample_decision_note() -> DecisionNote {
+        DecisionNote {
+            plan_id: PlanId::new(),
+            outcome: Decision::Accepted,
+            decider: sample_decider(),
+            decided_at: UnixMillis::from_millis(1_700_000_000_456),
+        }
+    }
+
+    /// Submission and decision seed bytes for the same plan id MUST
+    /// differ — colliding here would make the two notes share an
+    /// attach OID under the per-plan ref, so the second write would
+    /// silently clobber the first. This is the load-bearing invariant
+    /// of the two-seeds-per-plan design; pin it explicitly.
+    #[test]
+    fn submission_and_decision_seed_bytes_are_distinct_for_same_plan_id() {
+        let plan_id = PlanId::new();
+        let submission = plan_submission_seed_blob_bytes(plan_id);
+        let decision = plan_decision_seed_blob_bytes(plan_id);
+        assert_ne!(
+            submission, decision,
+            "submission and decision seed bytes collided for {plan_id}",
+        );
+    }
+
+    /// Pin the literal decision-seed shape: `<plan_id>::decision`. A
+    /// reader hashes this exact byte sequence via `git hash-object`
+    /// to recover the attach OID, so a future change to the suffix
+    /// would silently make every existing decision note unreadable.
+    #[test]
+    fn plan_decision_seed_blob_bytes_is_plan_id_with_decision_suffix() {
+        let plan_id = PlanId::new();
+        let bytes = plan_decision_seed_blob_bytes(plan_id);
+        assert_eq!(
+            std::str::from_utf8(&bytes).unwrap(),
+            format!("{plan_id}::decision"),
+        );
+    }
+
+    /// Distinct plan ids produce distinct decision seed bytes. A
+    /// regression that drops `plan_id` from the seed (e.g. by
+    /// hard-coding `"::decision"`) would silently collapse every
+    /// plan's decision into the same OID.
+    #[test]
+    fn plan_decision_seed_blob_bytes_is_unique_per_plan() {
+        let a = PlanId::new();
+        let b = PlanId::new();
+        assert_ne!(a, b, "PlanId::new must not collide");
+        assert_ne!(
+            plan_decision_seed_blob_bytes(a),
+            plan_decision_seed_blob_bytes(b),
+        );
+    }
+
+    /// Canonical bytes round-trip: serialise → parse → re-serialise
+    /// must reproduce the same bytes. Same shape pin as
+    /// `plan_note_canonical_bytes_round_trip_is_stable`.
+    #[test]
+    fn decision_note_canonical_bytes_round_trip_is_stable() {
+        let note = sample_decision_note();
+        let first = note.canonical_bytes();
+        let parsed = DecisionNote::from_canonical_bytes(&first).unwrap();
+        let second = parsed.canonical_bytes();
+        assert_eq!(first, second);
+    }
+
+    /// Pin the canonical wire shape: compact JSON object with the
+    /// four top-level keys in struct-declaration order, no
+    /// whitespace. A reader can re-compute these bytes locally and
+    /// compare against the note body.
+    #[test]
+    fn decision_note_canonical_bytes_pin_field_order() {
+        let note = sample_decision_note();
+        let bytes = note.canonical_bytes();
+        let s = std::str::from_utf8(&bytes).unwrap();
+        let positions: Vec<usize> = [
+            "\"plan_id\":",
+            "\"outcome\":",
+            "\"decider\":",
+            "\"decided_at\":",
+        ]
+        .into_iter()
+        .map(|key| s.find(key).unwrap_or_else(|| panic!("missing {key}: {s}")))
+        .collect();
+        assert!(
+            positions.windows(2).all(|w| w[0] < w[1]),
+            "field order regression — positions={positions:?}, actual: {s}",
+        );
+        assert!(s.starts_with('{'), "actual: {s}");
+        assert!(s.ends_with('}'), "actual: {s}");
+    }
+
+    /// `outcome` serialises as the snake_case string `Decision` uses,
+    /// not a wrapped object. A regression to `{"outcome":{"Accepted":null}}`
+    /// would break every reader.
+    #[test]
+    fn decision_note_outcome_serialises_as_snake_case_string() {
+        for d in [Decision::Accepted, Decision::Rejected] {
+            let note = DecisionNote {
+                outcome: d,
+                ..sample_decision_note()
+            };
+            let bytes = note.canonical_bytes();
+            let s = std::str::from_utf8(&bytes).unwrap();
+            let expected = format!("\"outcome\":\"{}\"", d.as_str());
+            assert!(
+                s.contains(&expected),
+                "expected wire to contain {expected:?}, got {s}",
+            );
+        }
+    }
+
+    /// `deny_unknown_fields` rejects extra top-level keys. Same
+    /// schema-bump argument as `plan_note_rejects_unknown_top_level_fields`.
+    #[test]
+    fn decision_note_rejects_unknown_top_level_fields() {
+        let note = sample_decision_note();
+        let mut value: serde_json::Value = serde_json::to_value(&note).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .insert("extra".into(), serde_json::Value::String("nope".into()));
+        let s = serde_json::to_vec(&value).unwrap();
+        let err = DecisionNote::from_canonical_bytes(&s).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("extra") || msg.contains("unknown field"),
+            "expected unknown-field error, got: {msg}",
+        );
+    }
+
+    /// Distinct payloads produce distinct canonical bytes.
+    #[test]
+    fn decision_note_canonical_bytes_distinguish_distinct_payloads() {
+        let a = sample_decision_note();
+        let b = DecisionNote {
+            outcome: Decision::Rejected,
+            ..a.clone()
+        };
+        assert_ne!(a.canonical_bytes(), b.canonical_bytes());
+    }
+
+    /// `DecisionNote` JSON round-trips. Standard pin.
+    #[test]
+    fn decision_note_json_roundtrips() {
+        let note = sample_decision_note();
+        let bytes = note.canonical_bytes();
+        let back = DecisionNote::from_canonical_bytes(&bytes).unwrap();
+        assert_eq!(back, note);
+    }
+
+    /// Decision-note parsing runs through [`Decider::try_new`] at the
+    /// wire boundary: an oversize or NUL-bearing decider in JSON is
+    /// rejected at parse rather than reaching the in-memory note.
+    /// Pinning the boundary check on `DecisionNote` (not just on
+    /// `Decider`) catches a future refactor that swaps `Decider` for
+    /// a raw `String` field and accidentally drops validation.
+    #[test]
+    fn decision_note_rejects_invalid_decider_at_wire_boundary() {
+        let plan_id = PlanId::new();
+        let oversize = "x".repeat(crate::bailiff_decision::MAX_DECIDER_BYTES + 1);
+        let body = serde_json::json!({
+            "plan_id": plan_id,
+            "outcome": "accepted",
+            "decider": oversize,
+            "decided_at": 1_700_000_000_456_i64,
+        });
+        let bytes = serde_json::to_vec(&body).unwrap();
+        assert!(DecisionNote::from_canonical_bytes(&bytes).is_err());
+
+        let empty = serde_json::json!({
+            "plan_id": plan_id,
+            "outcome": "accepted",
+            "decider": "",
+            "decided_at": 1_700_000_000_456_i64,
+        });
+        let bytes = serde_json::to_vec(&empty).unwrap();
+        assert!(DecisionNote::from_canonical_bytes(&bytes).is_err());
     }
 }

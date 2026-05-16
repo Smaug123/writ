@@ -16,6 +16,10 @@ use writ::audit::{
 };
 use writ::bailiff::{PLAN_PROMPT_SEPARATOR, compose_implementer_prompt};
 use writ::bailiff_decision::{Decider, Decision, MAX_DECIDER_BYTES};
+use writ::bailiff_plan_note::{
+    DecisionNote, PlanId as BailiffPlanId, plan_decision_seed_blob_bytes,
+    plan_submission_seed_blob_bytes,
+};
 use writ::core::{
     AgentKind, CapabilityRequest, CapabilitySet, CredentialGrant, GitHubAccess, GitHubGrantedScope,
     GitHubPermissions, GitHubRequest, GrantedScope, Jti, MetadataAccess, PolicyDecision, RepoRef,
@@ -493,6 +497,29 @@ fn arb_decider() -> impl Strategy<Value = Decider> {
         .prop_map(|s| Decider::try_new(s).expect("strategy produces only valid Decider strings"))
 }
 
+fn arb_bailiff_plan_id() -> impl Strategy<Value = BailiffPlanId> {
+    any::<u128>().prop_map(|n| BailiffPlanId::from_uuid(uuid::Uuid::from_u128(n)))
+}
+
+fn arb_unix_millis() -> impl Strategy<Value = UnixMillis> {
+    any::<i64>().prop_map(UnixMillis::from_millis)
+}
+
+fn arb_decision_note() -> impl Strategy<Value = DecisionNote> {
+    (
+        arb_bailiff_plan_id(),
+        arb_bailiff_decision(),
+        arb_decider(),
+        arb_unix_millis(),
+    )
+        .prop_map(|(plan_id, outcome, decider, decided_at)| DecisionNote {
+            plan_id,
+            outcome,
+            decider,
+            decided_at,
+        })
+}
+
 fn arb_plan_route_action() -> impl Strategy<Value = PlanRouteAction> {
     prop_oneof![
         Just(PlanRouteAction::SubmitPlan),
@@ -671,6 +698,33 @@ proptest! {
     fn bailiff_decider_try_new_is_idempotent_on_valid_input(d in arb_decider()) {
         let again = Decider::try_new(d.as_str()).unwrap();
         prop_assert_eq!(again, d);
+    }
+
+    /// `DecisionNote` round-trips through its canonical-bytes wire
+    /// form. The body of the git note bailiff writes is
+    /// `note.canonical_bytes()`; a reader hashing the seed OID and
+    /// reading the body must recover the same struct. This covers
+    /// the same invariant the unit-test sample-instance pins, but
+    /// across the full space of valid field values.
+    #[test]
+    fn bailiff_decision_note_roundtrips_through_canonical_bytes(note in arb_decision_note()) {
+        let bytes = note.canonical_bytes();
+        let back = DecisionNote::from_canonical_bytes(&bytes).unwrap();
+        prop_assert_eq!(back, note);
+    }
+
+    /// Submission and decision seed bytes never collide for the same
+    /// plan id, for any plan id we can construct. Unit test pins one
+    /// case; this confirms the invariant across the full PlanId
+    /// space, so a future suffix change can't accidentally make the
+    /// two seeds equal for some specific UUID shape.
+    #[test]
+    fn bailiff_submission_and_decision_seeds_differ_for_every_plan_id(
+        plan_id in arb_bailiff_plan_id(),
+    ) {
+        let submission = plan_submission_seed_blob_bytes(plan_id);
+        let decision = plan_decision_seed_blob_bytes(plan_id);
+        prop_assert_ne!(submission, decision);
     }
 
     /// `compose_implementer_prompt` is a structural concatenation: the
