@@ -23,7 +23,7 @@
 //! open their own writ session per run; all stages attach their notes
 //! under the same plan-scoped ref. This supersedes the earlier
 //! "one session per plan workflow" pin: writ's
-//! [`crate::audit::SessionRecord`] carries a single `agent_kind` /
+//! [`crate::core::SessionRecord`] carries a single `agent_kind` /
 //! `agent_model` chosen at `OpenSession`, so a workflow that uses
 //! different agents per stage cannot share one session by
 //! construction.
