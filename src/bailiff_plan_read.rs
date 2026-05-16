@@ -50,6 +50,12 @@ pub fn read_decision_note(
         return Ok(None);
     };
     let note = DecisionNote::from_canonical_bytes(&body).map_err(ReadDecisionError::Decode)?;
+    if note.plan_id != plan_id {
+        return Err(ReadDecisionError::PlanIdMismatch {
+            requested: plan_id,
+            found: note.plan_id,
+        });
+    }
     Ok(Some(note))
 }
 
@@ -75,6 +81,19 @@ pub enum ReadDecisionError {
     /// produced.
     #[error("decoding the decision note body failed: {0}")]
     Decode(#[source] DecisionNoteParseError),
+    /// The note parsed cleanly but its embedded `plan_id` does not
+    /// match the plan we were asked to read. Unreachable through
+    /// [`crate::bailiff_plan_write::write_decision_note`] (which always
+    /// derives the attach seed from `decision_note.plan_id`), so this
+    /// surfaces only when bytes were planted via the low-level
+    /// [`crate::notes_repo::NotesRepo::write_note`] path or pasted by
+    /// hand after manual repo repair. Treat it as semantic corruption:
+    /// a future acceptance gate must not be fooled into ruling on
+    /// plan A by reading plan B's verdict.
+    #[error(
+        "decision note at plan {requested} carries embedded plan_id {found}; refusing to surface a cross-plan verdict"
+    )]
+    PlanIdMismatch { requested: PlanId, found: PlanId },
 }
 
 #[cfg(test)]
@@ -201,6 +220,45 @@ mod tests {
         assert_eq!(r1.outcome, Decision::Accepted);
         assert_eq!(r2.plan_id, p2);
         assert_eq!(r2.outcome, Decision::Rejected);
+    }
+
+    /// A semantically-corrupt body — one that parses cleanly as a
+    /// `DecisionNote` but whose embedded `plan_id` belongs to a
+    /// different plan — surfaces as `ReadDecisionError::PlanIdMismatch`
+    /// rather than `Ok(Some(other_plans_decision))`. A future
+    /// acceptance gate must never be fooled into ruling on plan A by
+    /// reading plan B's verdict; the threat model has manual repo
+    /// repair or a buggy low-level writer producing this state, and
+    /// the read path is the right place to catch it because that's
+    /// where the requested `plan_id` is in scope.
+    #[test]
+    fn read_decision_note_returns_plan_id_mismatch_when_body_carries_other_plan_id() {
+        let tmp = TempDir::new().unwrap();
+        let bailiff = bailiff_repo(&tmp);
+        let queried = PlanId::new();
+        let other = PlanId::new();
+        assert_ne!(queried, other, "PlanId::new must not collide");
+
+        // Plant a well-formed DecisionNote for `other` under `queried`'s
+        // decision seed. The only way to reach this state is by
+        // bypassing `write_decision_note` (which derives the seed from
+        // `decision_note.plan_id`), so go through the low-level
+        // `write_note` API directly.
+        let queried_ref = plan_notes_ref(queried);
+        let queried_seed = plan_decision_seed_blob_bytes(queried);
+        let foreign_note = sample_decision_note(other, Decision::Accepted);
+        bailiff
+            .write_note(&queried_ref, &queried_seed, &foreign_note.canonical_bytes())
+            .unwrap();
+
+        let err = read_decision_note(&bailiff, queried).unwrap_err();
+        match err {
+            ReadDecisionError::PlanIdMismatch { requested, found } => {
+                assert_eq!(requested, queried);
+                assert_eq!(found, other);
+            }
+            other_err => panic!("expected PlanIdMismatch, got: {other_err:?}"),
+        }
     }
 
     /// A corrupt body at the decision seed's target surfaces as
