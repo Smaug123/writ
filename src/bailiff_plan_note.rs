@@ -1,6 +1,6 @@
 //! Bailiff-owned per-plan note primitives. Defines the
 //! `refs/notes/bailiff/v1/plans/<plan-id>` ref scheme that holds every
-//! artefact bailiff records about one plan workflow, plus the two
+//! artefact bailiff records about one plan workflow, plus the three
 //! note bodies that live under it today:
 //!
 //! - [`PlanNote`] — slice C's submission attestation: "writ ran agent
@@ -8,15 +8,21 @@
 //!   writ's repo."
 //! - [`DecisionNote`] — slice D1's operator verdict: "plan P was
 //!   accepted/rejected at time T by D."
+//! - [`ReviewNote`] — slice D2's reviewer-run attestation: "writ ran
+//!   reviewer agent run R against plan P and produced the signed
+//!   envelope at OID O in writ's repo." Same shape as [`PlanNote`];
+//!   the reviewer's prose lives in the envelope at `writ_output_oid`.
 //!
-//! Both attach under the same per-plan ref but at distinct
-//! deterministic seed OIDs — [`plan_submission_seed_blob_bytes`] and
-//! [`plan_decision_seed_blob_bytes`] — so they coexist without
+//! All three attach under the same per-plan ref but at distinct
+//! deterministic seed OIDs — [`plan_submission_seed_blob_bytes`],
+//! [`plan_decision_seed_blob_bytes`], and
+//! [`plan_review_seed_blob_bytes`] — so they coexist without
 //! colliding. Slice C1 of `docs/plans/2026-05-14-bailiff-split.md`
 //! introduced the submission piece; slice D1 of
-//! `docs/plans/2026-05-16-slice-d1-decide.md` adds the decision piece.
-//! Everything here is pure data with no IO and no CLI; the write
-//! helpers live in [`crate::bailiff_plan_write`].
+//! `docs/plans/2026-05-16-slice-d1-decide.md` added the decision
+//! piece; slice D2 of `docs/plans/2026-05-16-slice-d2-review.md` adds
+//! the review piece. Everything here is pure data with no IO and no
+//! CLI; the write helpers live in [`crate::bailiff_plan_write`].
 //!
 //! `PlanId` is a fresh bailiff-side type — not the `agent_plan::PlanId`
 //! that's leaving writ in slice G. Keeping them distinct now means
@@ -135,6 +141,26 @@ pub fn plan_submission_seed_blob_bytes(plan_id: PlanId) -> Vec<u8> {
 /// fragment a casual reader might misinterpret as a ref subpath.
 pub fn plan_decision_seed_blob_bytes(plan_id: PlanId) -> Vec<u8> {
     format!("{plan_id}::decision").into_bytes()
+}
+
+/// Deterministic seed-blob bytes for the **review** note under
+/// [`plan_notes_ref`]`(plan_id)`. The `<plan_id>::review` suffix
+/// distinguishes the review target from both
+/// [`plan_submission_seed_blob_bytes`] (bare plan id) and
+/// [`plan_decision_seed_blob_bytes`] (`::decision` suffix), so all
+/// three notes attach to different objects under one notes ref.
+///
+/// Same ASCII-suffix convention as the decision seed: the suffix is
+/// `::review` rather than `/review` so a reader scanning the seed
+/// bytes cannot mistake the value for a ref subpath.
+///
+/// D2 is single-review-per-plan and idempotent — the writer rejects
+/// a second review for the same id rather than overwriting. Switching
+/// to per-review UUIDs is the documented `v1` → `v2` ref-prefix
+/// migration; the seed convention pinned here is the migration
+/// target.
+pub fn plan_review_seed_blob_bytes(plan_id: PlanId) -> Vec<u8> {
+    format!("{plan_id}::review").into_bytes()
 }
 
 /// A bailiff-owned attestation that writ ran an agent for `plan_id`
@@ -288,6 +314,98 @@ impl DecisionNote {
 #[derive(Debug, thiserror::Error)]
 pub enum DecisionNoteParseError {
     #[error("decision-note body is not valid canonical JSON: {0}")]
+    Json(#[source] serde_json::Error),
+}
+
+/// A bailiff-owned attestation that writ ran a reviewer agent against
+/// `plan_id` and produced the signed output reachable at
+/// `writ_output_oid` in writ's repo. Stored as the body of one note
+/// under [`plan_notes_ref`] at the seed OID derived from
+/// [`plan_review_seed_blob_bytes`] — distinct from both the [`PlanNote`]
+/// (submission) and [`DecisionNote`] (verdict) targets, so all three
+/// notes coexist under one per-plan ref.
+///
+/// What this carries:
+/// - `plan_id`: bailiff's identifier for the workflow this review
+///   applies to. The same id whose [`PlanNote`] lives next door under
+///   the same notes ref.
+/// - `purpose`: the opaque tag bailiff sent on `RunAgent`. Recorded
+///   verbatim for cross-correlation with writ's audit row.
+/// - `writ_output_oid`: notes-target OID inside writ's
+///   `refs/notes/writ/v1/agent-outputs` ref — the per-run seed object
+///   writ-side `RunAgent` hashed from the reviewer run id. The signed
+///   envelope (carrying the reviewer's prose stdout) lives in the
+///   *note body* attached at this target, per slice B's "envelope in
+///   note body" decision.
+/// - `signed_metadata`: the full [`SignedRunMetadata`] writ returned
+///   for the reviewer run. Carries the prompt hash, output envelope
+///   hash, granted capabilities, exit code, completion time, session
+///   id, and the fingerprint of writ's signing key.
+/// - `signature`: detached SSH signature over `signed_metadata`'s
+///   canonical bytes. Verifies against the keyring entry resolved by
+///   `signed_metadata.signing_key_fingerprint`.
+///
+/// Field-for-field identical to [`PlanNote`] — the two carry the same
+/// shape because both are "writ ran an agent for this plan and signed
+/// the result" attestations. They are kept as parallel types rather
+/// than unified under a shared struct so a future schema bump on one
+/// (e.g. a structured verdict field on `ReviewNote`) does not force
+/// a parallel migration on the other. See
+/// `docs/plans/2026-05-16-slice-d2-review.md` §"Risks and tradeoffs."
+///
+/// **D2 ships unsigned.** Same as [`PlanNote`] and [`DecisionNote`]:
+/// the parent split doc defers bailiff's own signing primitives.
+/// Writ's submission signature on the embedded envelope remains the
+/// trust anchor for the reviewer run.
+///
+/// **D2 is idempotent.** The write helper rejects a second review for
+/// the same plan id rather than silently overwriting. Multi-review
+/// history is the documented `v1` → `v2` ref-prefix migration; the
+/// seed-OID convention pinned by [`plan_review_seed_blob_bytes`] is
+/// the migration target.
+///
+/// `deny_unknown_fields` catches an unexpected key at parse time
+/// rather than silently dropping it. Same defence the sibling notes
+/// use: a future field addition is a schema bump (`v1` → `v2` in the
+/// ref prefix); silently accepting extra fields would let a
+/// writer-side regression sneak past the reader.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewNote {
+    pub plan_id: PlanId,
+    pub purpose: String,
+    pub writ_output_oid: GitObjectId,
+    pub signed_metadata: SignedRunMetadata,
+    pub signature: SshSignature,
+}
+
+impl ReviewNote {
+    /// Canonical byte representation of the note body. Compact JSON
+    /// (no whitespace) with keys emitted in struct-declaration order
+    /// — the same canonicalisation [`PlanNote::canonical_bytes`] and
+    /// [`DecisionNote::canonical_bytes`] use, so a reader can
+    /// re-compute the canonical form locally and compare.
+    ///
+    /// The bytes returned here are what gets written as the body of
+    /// the git note. They are *not* covered by writ's signature —
+    /// writ signs only `signed_metadata`'s canonical bytes; the
+    /// note's framing (this struct) is bailiff's own.
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        serde_json::to_vec(self).expect("ReviewNote serialises to JSON without IO; cannot fail")
+    }
+
+    /// Inverse of [`Self::canonical_bytes`]. Fails on malformed JSON,
+    /// on any unknown top-level field (`deny_unknown_fields`), or on
+    /// any nested validation error from the field types ([`PlanId`],
+    /// [`GitObjectId`], [`SshSignature`], [`SignedRunMetadata`]).
+    pub fn from_canonical_bytes(bytes: &[u8]) -> Result<Self, ReviewNoteParseError> {
+        serde_json::from_slice(bytes).map_err(ReviewNoteParseError::Json)
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ReviewNoteParseError {
+    #[error("review-note body is not valid canonical JSON: {0}")]
     Json(#[source] serde_json::Error),
 }
 
@@ -697,5 +815,190 @@ mod tests {
         });
         let bytes = serde_json::to_vec(&empty).unwrap();
         assert!(DecisionNote::from_canonical_bytes(&bytes).is_err());
+    }
+
+    // --- ReviewNote ----------------------------------------------------------
+
+    fn sample_review_note() -> ReviewNote {
+        ReviewNote {
+            plan_id: PlanId::new(),
+            purpose: "plan-review".into(),
+            writ_output_oid: sample_output_oid(),
+            signed_metadata: sample_signed_metadata(),
+            signature: sample_signature(),
+        }
+    }
+
+    /// Submission and review seed bytes for the same plan id MUST
+    /// differ — colliding here would make the submission and review
+    /// notes share an attach OID under the per-plan ref, so the second
+    /// write would silently clobber the first. Same load-bearing
+    /// invariant the decision-vs-submission pair has; pin it
+    /// explicitly for the third seed too.
+    #[test]
+    fn submission_and_review_seed_bytes_are_distinct_for_same_plan_id() {
+        let plan_id = PlanId::new();
+        let submission = plan_submission_seed_blob_bytes(plan_id);
+        let review = plan_review_seed_blob_bytes(plan_id);
+        assert_ne!(
+            submission, review,
+            "submission and review seed bytes collided for {plan_id}",
+        );
+    }
+
+    /// Decision and review seed bytes for the same plan id MUST also
+    /// differ — same overwrite-collision argument as above but between
+    /// the two slice-D notes. Pinning every pairwise distinctness
+    /// guards against a future suffix choice that picks `::review` and
+    /// `::decision` somehow producing the same bytes (e.g. via a
+    /// suffix that depends on the plan id).
+    #[test]
+    fn decision_and_review_seed_bytes_are_distinct_for_same_plan_id() {
+        let plan_id = PlanId::new();
+        let decision = plan_decision_seed_blob_bytes(plan_id);
+        let review = plan_review_seed_blob_bytes(plan_id);
+        assert_ne!(
+            decision, review,
+            "decision and review seed bytes collided for {plan_id}",
+        );
+    }
+
+    /// Pin the literal review-seed shape: `<plan_id>::review`. A
+    /// reader hashes this exact byte sequence via `git hash-object` to
+    /// recover the attach OID, so a future change to the suffix would
+    /// silently make every existing review note unreadable.
+    #[test]
+    fn plan_review_seed_blob_bytes_is_plan_id_with_review_suffix() {
+        let plan_id = PlanId::new();
+        let bytes = plan_review_seed_blob_bytes(plan_id);
+        assert_eq!(
+            std::str::from_utf8(&bytes).unwrap(),
+            format!("{plan_id}::review"),
+        );
+    }
+
+    /// Distinct plan ids produce distinct review seed bytes. A
+    /// regression that drops `plan_id` from the seed (e.g. by
+    /// hard-coding `"::review"`) would silently collapse every plan's
+    /// review into the same OID.
+    #[test]
+    fn plan_review_seed_blob_bytes_is_unique_per_plan() {
+        let a = PlanId::new();
+        let b = PlanId::new();
+        assert_ne!(a, b, "PlanId::new must not collide");
+        assert_ne!(
+            plan_review_seed_blob_bytes(a),
+            plan_review_seed_blob_bytes(b),
+        );
+    }
+
+    /// Canonical bytes round-trip: serialise → parse → re-serialise
+    /// must reproduce the same bytes. Same shape pin as
+    /// `plan_note_canonical_bytes_round_trip_is_stable`.
+    #[test]
+    fn review_note_canonical_bytes_round_trip_is_stable() {
+        let note = sample_review_note();
+        let first = note.canonical_bytes();
+        let parsed = ReviewNote::from_canonical_bytes(&first).unwrap();
+        let second = parsed.canonical_bytes();
+        assert_eq!(first, second);
+    }
+
+    /// Pin the canonical wire shape: a compact JSON object with the
+    /// five top-level keys in struct-declaration order, no
+    /// whitespace. Pins the *positions* of every top-level key (same
+    /// approach the sibling `plan_note_canonical_bytes_pin_field_order`
+    /// uses); inner-value canonicalisation is covered by each field
+    /// type's own round-trip test.
+    #[test]
+    fn review_note_canonical_bytes_pin_field_order() {
+        let note = sample_review_note();
+        let bytes = note.canonical_bytes();
+        let s = std::str::from_utf8(&bytes).unwrap();
+        let positions: Vec<usize> = [
+            "\"plan_id\":",
+            "\"purpose\":",
+            "\"writ_output_oid\":",
+            "\"signed_metadata\":",
+            "\"signature\":",
+        ]
+        .into_iter()
+        .map(|key| s.find(key).unwrap_or_else(|| panic!("missing {key}: {s}")))
+        .collect();
+        assert!(
+            positions.windows(2).all(|w| w[0] < w[1]),
+            "field order regression — positions={positions:?}, actual: {s}",
+        );
+        assert!(s.starts_with('{'), "actual: {s}");
+        assert!(s.ends_with('}'), "actual: {s}");
+    }
+
+    /// Different review notes produce different canonical bytes.
+    /// Basic distinctness — a regression that collapses every payload
+    /// to the same bytes surfaces immediately.
+    #[test]
+    fn review_note_canonical_bytes_distinguish_distinct_payloads() {
+        let a = sample_review_note();
+        let mut b = sample_review_note();
+        b.purpose = "different".into();
+        assert_ne!(a.canonical_bytes(), b.canonical_bytes());
+    }
+
+    /// `deny_unknown_fields` rejects extra top-level keys. Same
+    /// schema-bump argument as `plan_note_rejects_unknown_top_level_fields`.
+    #[test]
+    fn review_note_rejects_unknown_top_level_fields() {
+        let note = sample_review_note();
+        let mut value: serde_json::Value = serde_json::to_value(&note).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .insert("extra".into(), serde_json::Value::String("nope".into()));
+        let s = serde_json::to_vec(&value).unwrap();
+        let err = ReviewNote::from_canonical_bytes(&s).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("extra") || msg.contains("unknown field"),
+            "expected unknown-field error, got: {msg}",
+        );
+    }
+
+    /// `ReviewNote` JSON round-trips. Standard pin.
+    #[test]
+    fn review_note_json_roundtrips() {
+        let note = sample_review_note();
+        let bytes = note.canonical_bytes();
+        let back = ReviewNote::from_canonical_bytes(&bytes).unwrap();
+        assert_eq!(back, note);
+    }
+
+    /// A `ReviewNote` and `PlanNote` with identical field values
+    /// produce identical canonical bytes — they are structurally the
+    /// same shape today (see the `ReviewNote` docstring). The
+    /// load-bearing disambiguation is **not** the bytes but the seed
+    /// OID they attach to under [`plan_notes_ref`]; pinning that here
+    /// catches a future refactor that tries to merge the two shapes
+    /// without first migrating the seed-OID convention.
+    #[test]
+    fn review_note_and_plan_note_share_canonical_shape() {
+        let plan_id = PlanId::new();
+        let metadata = sample_signed_metadata();
+        let signature = sample_signature();
+        let oid = sample_output_oid();
+        let plan = PlanNote {
+            plan_id,
+            purpose: "shared".into(),
+            writ_output_oid: oid.clone(),
+            signed_metadata: metadata.clone(),
+            signature: signature.clone(),
+        };
+        let review = ReviewNote {
+            plan_id,
+            purpose: "shared".into(),
+            writ_output_oid: oid,
+            signed_metadata: metadata,
+            signature,
+        };
+        assert_eq!(plan.canonical_bytes(), review.canonical_bytes());
     }
 }
