@@ -90,6 +90,23 @@ impl InheritedEnv {
     }
 }
 
+/// Result of an idempotent [`NotesRepo::write_note_if_absent`] call:
+/// either the operation attached a fresh note, or it observed an
+/// existing one at the target OID and did nothing.
+///
+/// Both variants expose the same target OID so callers can read the
+/// note body back regardless of which branch fired.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum WriteOutcome {
+    /// No note was attached at the seed's target OID; the call wrote
+    /// `body` and returns the freshly-attached target.
+    Written(GitObjectId),
+    /// A note already existed at the seed's target OID; nothing was
+    /// written. The wrapped OID matches the one a subsequent
+    /// [`NotesRepo::read_note_if_present`] would query.
+    AlreadyPresent(GitObjectId),
+}
+
 /// A validated handle on a daemon-owned bare notes repo.
 ///
 /// Construct via [`NotesRepo::open`] (validation only) or
@@ -254,6 +271,64 @@ impl NotesRepo {
         Ok(target_oid)
     }
 
+    /// Idempotent variant of [`Self::write_note`]: returns
+    /// [`WriteOutcome::AlreadyPresent`] if a note is already attached
+    /// at the seed's target OID under `notes_ref`, and only writes
+    /// (returning [`WriteOutcome::Written`]) when the target is
+    /// currently bare.
+    ///
+    /// The check-and-write is atomic in-process: both the existence
+    /// probe and the eventual write happen while holding the
+    /// per-repo notes-write mutex. A concurrent in-process caller
+    /// that arrives second observes the first write and returns
+    /// `AlreadyPresent`, not a `GitFailed` from `git notes add`.
+    /// Across processes the lock does not generalise (a separate
+    /// CLI invocation has its own mutex), so the second writer can
+    /// still see the in-process check pass and have `notes add`
+    /// reject the write; that residual race surfaces as a generic
+    /// `NotesRepoError::GitFailed` here. D1 accepts that
+    /// limitation; the typical bailiff workflow is sequential
+    /// operator commands, not concurrent CLI invocations.
+    ///
+    /// As with [`Self::write_note`], `body` must be non-empty: the
+    /// empty-blob OID corner case in `git notes add -C` would let an
+    /// empty body silently fail to attach.
+    pub fn write_note_if_absent(
+        &self,
+        notes_ref: &NotesRef,
+        seed: &[u8],
+        body: &[u8],
+    ) -> Result<WriteOutcome, NotesRepoError> {
+        if body.is_empty() {
+            return Err(NotesRepoError::EmptyBody);
+        }
+        let _guard = lock_notes_write(&self.canonical_path);
+        let target_oid = hash_object_stdin(&self.canonical_path, seed, &self.inherited_env)?;
+        if self.read_note_if_present(notes_ref, &target_oid)?.is_some() {
+            return Ok(WriteOutcome::AlreadyPresent(target_oid));
+        }
+        let body_oid = hash_object_stdin(&self.canonical_path, body, &self.inherited_env)?;
+        run_git(
+            &self.canonical_path,
+            [
+                "-c",
+                "user.name=bailiff",
+                "-c",
+                "user.email=bailiff@localhost",
+                "notes",
+                &format!("--ref={}", notes_ref.as_str()),
+                "add",
+                "-C",
+                body_oid.as_str(),
+                target_oid.as_str(),
+            ],
+            None,
+            CaptureOutput::Discard,
+            &self.inherited_env,
+        )?;
+        Ok(WriteOutcome::Written(target_oid))
+    }
+
     /// Fetch one or more refs from a peer bare repo at `source` into
     /// this repo. `refspecs` follow git's `<src>:<dst>` syntax (with
     /// optional leading `+` for force); each one specifies a ref pair
@@ -329,6 +404,36 @@ impl NotesRepo {
             CaptureOutput::Capture,
             &self.inherited_env,
         )
+    }
+
+    /// Same byte-exact recovery as [`Self::read_note`] when a note
+    /// exists, but folds the two "no note here" cases — `notes_ref`
+    /// doesn't exist yet, or it exists but has no annotation at
+    /// `target_oid` — into `Ok(None)`. Other failure modes (git not
+    /// installed, repo permission errors) still propagate as
+    /// `NotesRepoError`.
+    ///
+    /// Both absent cases share git's same stderr signature
+    /// (`error: no note found for object <oid>.`), so we match on
+    /// the substring `"no note found for object"`. The phrasing has
+    /// been stable since `git notes` shipped and is what gates the
+    /// returned `Ok(None)`; an exit-1 failure carrying a different
+    /// stderr surfaces unchanged so a genuinely broken repo doesn't
+    /// silently masquerade as "absent".
+    pub fn read_note_if_present(
+        &self,
+        notes_ref: &NotesRef,
+        target_oid: &GitObjectId,
+    ) -> Result<Option<Vec<u8>>, NotesRepoError> {
+        match self.read_note(notes_ref, target_oid) {
+            Ok(body) => Ok(Some(body)),
+            Err(NotesRepoError::GitFailed { stderr, .. })
+                if stderr.contains("no note found for object") =>
+            {
+                Ok(None)
+            }
+            Err(err) => Err(err),
+        }
     }
 }
 
@@ -1204,5 +1309,146 @@ mod tests {
             envs.get(OsStr::new("HOME")),
             Some(&Some(OsString::from("/dev/null")))
         );
+    }
+
+    // --- read_note_if_present / write_note_if_absent ----------------------
+
+    /// When the notes ref does not exist at all (fresh repo, never
+    /// written), `read_note_if_present` folds the failure into
+    /// `Ok(None)` instead of surfacing it as `NotesRepoError`.
+    #[test]
+    fn read_note_if_present_returns_none_when_ref_does_not_exist() {
+        let tmp = TempDir::new().unwrap();
+        let repo = NotesRepo::init_or_open(tmp.path().join("r")).unwrap();
+        let nref = notes_ref();
+        let absent = GitObjectId::new("0000000000000000000000000000000000000000").unwrap();
+        let res = repo.read_note_if_present(&nref, &absent).unwrap();
+        assert!(res.is_none(), "expected None on missing ref, got: {res:?}");
+    }
+
+    /// When the notes ref exists but has no annotation at the target,
+    /// the result is also `Ok(None)`. Exercises the "ref present, no
+    /// note at this oid" branch of the absent-classifier.
+    #[test]
+    fn read_note_if_present_returns_none_when_ref_has_no_note_at_target() {
+        let tmp = TempDir::new().unwrap();
+        let repo = NotesRepo::init_or_open(tmp.path().join("r")).unwrap();
+        let nref = notes_ref();
+        // Create the ref with one note keyed on a different seed.
+        let _ = repo.write_note(&nref, b"some-other-seed", b"body").unwrap();
+        let absent = GitObjectId::new("0000000000000000000000000000000000000000").unwrap();
+        let res = repo.read_note_if_present(&nref, &absent).unwrap();
+        assert!(res.is_none(), "expected None on missing note, got: {res:?}");
+    }
+
+    /// When a note is present, `read_note_if_present` returns the
+    /// same bytes [`NotesRepo::read_note`] would (i.e. `Some(body)`),
+    /// confirming the absent-classifier doesn't accidentally swallow
+    /// the present case.
+    #[test]
+    fn read_note_if_present_returns_some_body_when_note_exists() {
+        let tmp = TempDir::new().unwrap();
+        let repo = NotesRepo::init_or_open(tmp.path().join("r")).unwrap();
+        let nref = notes_ref();
+        let target = repo.write_note(&nref, b"seed-A", b"hello").unwrap();
+        let body = repo.read_note_if_present(&nref, &target).unwrap();
+        assert_eq!(body.as_deref(), Some(b"hello".as_slice()));
+    }
+
+    /// First call writes, returning `Written(target)`; the same
+    /// target is reachable via `read_note_if_present` afterwards.
+    /// Pins the success path before exercising the idempotent
+    /// branch.
+    #[test]
+    fn write_note_if_absent_writes_on_first_call() {
+        let tmp = TempDir::new().unwrap();
+        let repo = NotesRepo::init_or_open(tmp.path().join("r")).unwrap();
+        let nref = notes_ref();
+        let outcome = repo
+            .write_note_if_absent(&nref, b"seed-A", b"body-A")
+            .unwrap();
+        match outcome {
+            WriteOutcome::Written(target) => {
+                let read_back = repo.read_note_if_present(&nref, &target).unwrap();
+                assert_eq!(read_back.as_deref(), Some(b"body-A".as_slice()));
+            }
+            WriteOutcome::AlreadyPresent(target) => {
+                panic!("first call should write, got AlreadyPresent({target})");
+            }
+        }
+    }
+
+    /// Second call against the same seed returns `AlreadyPresent`
+    /// without touching the existing body. Body bytes from the
+    /// second call's `body` argument are deliberately different so
+    /// any silent overwrite would surface.
+    #[test]
+    fn write_note_if_absent_is_idempotent_on_repeat_call() {
+        let tmp = TempDir::new().unwrap();
+        let repo = NotesRepo::init_or_open(tmp.path().join("r")).unwrap();
+        let nref = notes_ref();
+        let first = repo
+            .write_note_if_absent(&nref, b"seed-A", b"first body")
+            .unwrap();
+        let target = match first {
+            WriteOutcome::Written(oid) => oid,
+            WriteOutcome::AlreadyPresent(oid) => panic!("first call should write, got {oid}"),
+        };
+        let second = repo
+            .write_note_if_absent(&nref, b"seed-A", b"second body")
+            .unwrap();
+        match second {
+            WriteOutcome::AlreadyPresent(oid) => assert_eq!(oid, target),
+            WriteOutcome::Written(oid) => panic!("second call should be no-op, got {oid}"),
+        }
+        // The first body must still be the one attached.
+        let body = repo.read_note(&nref, &target).unwrap();
+        assert_eq!(body, b"first body");
+    }
+
+    /// Different seeds under the same ref each get their own
+    /// `Written` outcome; the existence check is keyed on the target
+    /// OID, not on "is there any note under this ref?".
+    #[test]
+    fn write_note_if_absent_distinguishes_seeds() {
+        let tmp = TempDir::new().unwrap();
+        let repo = NotesRepo::init_or_open(tmp.path().join("r")).unwrap();
+        let nref = notes_ref();
+        let a = repo
+            .write_note_if_absent(&nref, b"seed-A", b"body-A")
+            .unwrap();
+        let b = repo
+            .write_note_if_absent(&nref, b"seed-B", b"body-B")
+            .unwrap();
+        let target_a = match a {
+            WriteOutcome::Written(o) => o,
+            WriteOutcome::AlreadyPresent(o) => panic!("seed-A should write, got {o}"),
+        };
+        let target_b = match b {
+            WriteOutcome::Written(o) => o,
+            WriteOutcome::AlreadyPresent(o) => panic!("seed-B should write, got {o}"),
+        };
+        assert_ne!(
+            target_a, target_b,
+            "distinct seeds must hash to distinct targets"
+        );
+        assert_eq!(repo.read_note(&nref, &target_a).unwrap(), b"body-A");
+        assert_eq!(repo.read_note(&nref, &target_b).unwrap(), b"body-B");
+    }
+
+    /// `write_note_if_absent` rejects empty bodies for the same
+    /// reason `write_note` does: `git notes add -C <empty-blob-oid>`
+    /// succeeds without attaching a note, so an empty body would
+    /// silently fail to write and the next idempotent probe would
+    /// see "no note" and write again forever.
+    #[test]
+    fn write_note_if_absent_rejects_empty_body() {
+        let tmp = TempDir::new().unwrap();
+        let repo = NotesRepo::init_or_open(tmp.path().join("r")).unwrap();
+        let nref = notes_ref();
+        let err = repo
+            .write_note_if_absent(&nref, b"seed-A", b"")
+            .unwrap_err();
+        assert!(matches!(err, NotesRepoError::EmptyBody), "got: {err:?}");
     }
 }

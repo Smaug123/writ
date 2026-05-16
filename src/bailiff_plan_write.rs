@@ -40,9 +40,12 @@ use std::path::Path;
 
 use thiserror::Error;
 
-use crate::bailiff_plan_note::{PlanId, PlanNote, plan_notes_ref, plan_submission_seed_blob_bytes};
+use crate::bailiff_plan_note::{
+    DecisionNote, PlanId, PlanNote, plan_decision_seed_blob_bytes, plan_notes_ref,
+    plan_submission_seed_blob_bytes,
+};
 use crate::core::NotesRef;
-use crate::notes_repo::{NotesRepo, NotesRepoError};
+use crate::notes_repo::{NotesRepo, NotesRepoError, WriteOutcome};
 use crate::run_envelope::SignedRunEnvelope;
 use crate::run_verify::{AllowedSigners, VerifyError, verify_run_envelope};
 use crate::vm_git::GitObjectId;
@@ -159,6 +162,75 @@ pub enum WritePlanNoteError {
     /// a filesystem problem.
     #[error("writing the plan note to bailiff's repo failed: {0}")]
     WritePlanNote(#[source] NotesRepoError),
+}
+
+/// Write `decision_note` as the **decision** note for its plan under
+/// [`plan_notes_ref`]`(plan_id)` in bailiff's repo. Slice D1.3 of
+/// `docs/plans/2026-05-16-slice-d1-decide.md`.
+///
+/// Idempotent-by-error: if a decision note already exists for the
+/// plan, returns [`WriteDecisionNoteError::DecisionAlreadyRecorded`]
+/// rather than overwriting. The operator workflow for "I want to
+/// change my mind" is "the plan is dead, submit a new one," so
+/// silently overwriting an existing verdict would destroy audit
+/// state without surfacing the conflict.
+///
+/// Sibling to [`write_plan_note`] under the same per-plan notes
+/// ref: the decision attaches at the seed OID derived from
+/// [`plan_decision_seed_blob_bytes`] so the submission and decision
+/// notes coexist without colliding. The submission's presence is
+/// **not** a precondition — D1 keeps the decide verb usable against
+/// any plan id whose write helper hasn't reached the submission step
+/// yet, on the grounds that a typed `DecisionAlreadyRecorded` is the
+/// only invariant worth enforcing at this layer.
+///
+/// Returns the bailiff-side target OID — the deterministic seed-blob
+/// OID [`plan_decision_seed_blob_bytes`] hashes to — so a caller can
+/// hand it to [`NotesRepo::read_note`] without recomputing it.
+pub fn write_decision_note(
+    bailiff_repo: &NotesRepo,
+    decision_note: &DecisionNote,
+) -> Result<GitObjectId, WriteDecisionNoteError> {
+    let plan_id = decision_note.plan_id;
+    let plan_ref = plan_notes_ref(plan_id);
+    let seed = plan_decision_seed_blob_bytes(plan_id);
+    let body = decision_note.canonical_bytes();
+    match bailiff_repo
+        .write_note_if_absent(&plan_ref, &seed, &body)
+        .map_err(WriteDecisionNoteError::WriteDecisionNote)?
+    {
+        WriteOutcome::Written(oid) => Ok(oid),
+        WriteOutcome::AlreadyPresent(target_oid) => {
+            Err(WriteDecisionNoteError::DecisionAlreadyRecorded {
+                plan_id,
+                target_oid,
+            })
+        }
+    }
+}
+
+/// Tagged failure modes of [`write_decision_note`]. The
+/// `DecisionAlreadyRecorded` variant is the load-bearing one:
+/// idempotent-by-error storage means a duplicate decide call must be
+/// distinguishable from a generic git failure so the CLI verb can
+/// emit a stable exit code for "this plan already has a verdict."
+#[derive(Debug, Error)]
+pub enum WriteDecisionNoteError {
+    /// A decision note for this plan already exists under
+    /// [`plan_notes_ref`]`(plan_id)` at `target_oid`. D1 does not
+    /// overwrite; the operator's recourse is to submit a fresh plan.
+    #[error("decision already recorded for plan {plan_id} at target {target_oid}")]
+    DecisionAlreadyRecorded {
+        plan_id: PlanId,
+        target_oid: GitObjectId,
+    },
+    /// Writing the decision note to bailiff's repo failed for any
+    /// reason other than the idempotency conflict. Usually a
+    /// filesystem problem or a cross-process race that slipped past
+    /// the per-repo mutex (see [`NotesRepo::write_note_if_absent`]'s
+    /// docstring for the residual race surface).
+    #[error("writing the decision note to bailiff's repo failed: {0}")]
+    WriteDecisionNote(#[source] NotesRepoError),
 }
 
 #[cfg(test)]
@@ -527,6 +599,193 @@ mod tests {
             "both plans reference the same writ envelope",
         );
         assert_ne!(note1.purpose, note2.purpose);
+    }
+}
+
+#[cfg(test)]
+mod decision_tests {
+    //! Tests for [`write_decision_note`] — the slice D1.3 idempotent
+    //! write helper. Each test drives the helper directly against a
+    //! tempdir-backed bare repo (no broker, no writ side).
+    use super::*;
+    use crate::bailiff_decision::{Decider, Decision};
+    use crate::bailiff_plan_note::{
+        DecisionNote, PlanId, plan_decision_seed_blob_bytes, plan_notes_ref,
+    };
+    use crate::core::UnixMillis;
+    use tempfile::TempDir;
+
+    fn bailiff_repo(tmp: &TempDir) -> NotesRepo {
+        NotesRepo::init_or_open(tmp.path().join("bailiff-bare")).unwrap()
+    }
+
+    fn sample_decider() -> Decider {
+        Decider::try_new("cli:alice").unwrap()
+    }
+
+    fn sample_decision_note(plan_id: PlanId, outcome: Decision) -> DecisionNote {
+        DecisionNote {
+            plan_id,
+            outcome,
+            decider: sample_decider(),
+            decided_at: UnixMillis::from_millis(1_700_000_000_456),
+        }
+    }
+
+    /// Happy path: first decision for a plan writes a note whose body
+    /// decodes back to the same `DecisionNote` the caller submitted,
+    /// attached at the deterministic decision-seed OID.
+    #[test]
+    fn write_decision_note_writes_then_reads_back() {
+        let tmp = TempDir::new().unwrap();
+        let bailiff = bailiff_repo(&tmp);
+        let plan_id = PlanId::new();
+        let note = sample_decision_note(plan_id, Decision::Accepted);
+
+        let returned_oid =
+            write_decision_note(&bailiff, &note).expect("first decision must succeed");
+
+        // The returned OID must be the deterministic decision-seed
+        // OID for this plan id — readers recompute it from the plan
+        // id alone, so any drift between writer and reader here is
+        // a silent break of the read path.
+        let body = bailiff
+            .read_note(&plan_notes_ref(plan_id), &returned_oid)
+            .expect("decision body must be readable at the returned OID");
+        let parsed =
+            DecisionNote::from_canonical_bytes(&body).expect("body must decode as DecisionNote");
+        assert_eq!(parsed, note);
+
+        // Sanity: the seed bytes are non-empty and have the expected
+        // `<plan_id>::decision` shape (already pinned in
+        // `bailiff_plan_note` tests, but pinning here too means a
+        // future writer-side change can't silently diverge).
+        let seed = plan_decision_seed_blob_bytes(plan_id);
+        assert_eq!(
+            std::str::from_utf8(&seed).unwrap(),
+            format!("{plan_id}::decision"),
+        );
+    }
+
+    /// Idempotent-by-error: a second decide call for the same plan
+    /// returns `DecisionAlreadyRecorded` rather than overwriting. The
+    /// second call's note carries different content (Rejected vs
+    /// Accepted, different decider) so any silent overwrite would
+    /// surface as a body mismatch on the read-back.
+    #[test]
+    fn write_decision_note_returns_already_recorded_on_second_call() {
+        let tmp = TempDir::new().unwrap();
+        let bailiff = bailiff_repo(&tmp);
+        let plan_id = PlanId::new();
+        let first = sample_decision_note(plan_id, Decision::Accepted);
+        let returned_oid = write_decision_note(&bailiff, &first).unwrap();
+
+        let mut second = sample_decision_note(plan_id, Decision::Rejected);
+        second.decider = Decider::try_new("cli:bob").unwrap();
+        let err = write_decision_note(&bailiff, &second).unwrap_err();
+        match err {
+            WriteDecisionNoteError::DecisionAlreadyRecorded {
+                plan_id: pid,
+                target_oid,
+            } => {
+                assert_eq!(pid, plan_id);
+                assert_eq!(target_oid, returned_oid);
+            }
+            other => panic!("expected DecisionAlreadyRecorded, got: {other:?}"),
+        }
+
+        // The original Accepted body must still be the one attached.
+        let body = bailiff
+            .read_note(&plan_notes_ref(plan_id), &returned_oid)
+            .unwrap();
+        let parsed = DecisionNote::from_canonical_bytes(&body).unwrap();
+        assert_eq!(parsed, first);
+    }
+
+    /// Distinct plan ids each get their own decision note under the
+    /// same notes-ref *prefix* but at different per-plan refs. A
+    /// regression that drops the plan id from the ref derivation would
+    /// silently collapse both into one ref.
+    #[test]
+    fn write_decision_note_supports_distinct_plans_independently() {
+        let tmp = TempDir::new().unwrap();
+        let bailiff = bailiff_repo(&tmp);
+        let p1 = PlanId::new();
+        let p2 = PlanId::new();
+        let note1 = sample_decision_note(p1, Decision::Accepted);
+        let note2 = sample_decision_note(p2, Decision::Rejected);
+
+        let oid1 = write_decision_note(&bailiff, &note1).unwrap();
+        let oid2 = write_decision_note(&bailiff, &note2).unwrap();
+        assert_ne!(oid1, oid2, "distinct plans must seed distinct targets");
+
+        let body1 = bailiff.read_note(&plan_notes_ref(p1), &oid1).unwrap();
+        let body2 = bailiff.read_note(&plan_notes_ref(p2), &oid2).unwrap();
+        let parsed1 = DecisionNote::from_canonical_bytes(&body1).unwrap();
+        let parsed2 = DecisionNote::from_canonical_bytes(&body2).unwrap();
+        assert_eq!(parsed1, note1);
+        assert_eq!(parsed2, note2);
+    }
+
+    /// Load-bearing coexistence pin: a submission note and a decision
+    /// note for the same plan live under the same per-plan ref at
+    /// distinct seed OIDs. The decision write must not collide with a
+    /// pre-existing submission, and the submission must remain
+    /// readable after the decision is attached. This is the property
+    /// the two-seeds-per-plan design exists to provide.
+    #[test]
+    fn write_decision_note_coexists_with_existing_submission_under_same_ref() {
+        let tmp = TempDir::new().unwrap();
+        let bailiff = bailiff_repo(&tmp);
+        let plan_id = PlanId::new();
+        let plan_ref = plan_notes_ref(plan_id);
+
+        // Plant a submission-shaped note directly via `write_note` so
+        // we don't need to drive the full slice-C broker round-trip
+        // for a coexistence pin. The exact body shape doesn't matter
+        // here; we only care that the decision write doesn't trip
+        // over an existing note under the same ref.
+        let submission_seed = crate::bailiff_plan_note::plan_submission_seed_blob_bytes(plan_id);
+        let submission_target = bailiff
+            .write_note(&plan_ref, &submission_seed, b"submission-body")
+            .expect("submission write must succeed");
+
+        let decision = sample_decision_note(plan_id, Decision::Accepted);
+        let decision_target =
+            write_decision_note(&bailiff, &decision).expect("decision write must succeed");
+
+        assert_ne!(
+            submission_target, decision_target,
+            "submission and decision must attach at distinct OIDs",
+        );
+        assert_eq!(
+            bailiff.read_note(&plan_ref, &submission_target).unwrap(),
+            b"submission-body",
+            "submission body must survive the decision write",
+        );
+        let decision_body = bailiff.read_note(&plan_ref, &decision_target).unwrap();
+        assert_eq!(
+            DecisionNote::from_canonical_bytes(&decision_body).unwrap(),
+            decision,
+        );
+    }
+
+    /// Decision can be written even when no submission note exists
+    /// yet. D1 chose not to gate the decide verb on submission
+    /// presence — the only invariant the write helper enforces is
+    /// "one decision per plan." Pin that choice so a future change
+    /// that adds a precondition has to update this test.
+    #[test]
+    fn write_decision_note_does_not_require_pre_existing_submission() {
+        let tmp = TempDir::new().unwrap();
+        let bailiff = bailiff_repo(&tmp);
+        let plan_id = PlanId::new();
+        let note = sample_decision_note(plan_id, Decision::Rejected);
+
+        let oid = write_decision_note(&bailiff, &note)
+            .expect("decision write must succeed without a prior submission note");
+        let body = bailiff.read_note(&plan_notes_ref(plan_id), &oid).unwrap();
+        assert_eq!(DecisionNote::from_canonical_bytes(&body).unwrap(), note);
     }
 }
 
