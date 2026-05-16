@@ -57,6 +57,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         socket_path,
         audit_db,
         ui_http,
+        run_agent,
     } = config;
 
     let socket_path = args
@@ -99,20 +100,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         .transpose()?;
 
+    let (notes_repo, signing_key, run_agent_spawn) = match run_agent.as_ref() {
+        Some(cfg) => {
+            let boot = cfg
+                .materialize(&*store)
+                .map_err(|e| format!("cannot materialize RunAgent state from config: {e}"))?;
+            let fingerprint = boot.signing.signing_key().fingerprint();
+            if boot.signing.was_generated() {
+                tracing::warn!(
+                    fingerprint = %fingerprint,
+                    secret_key = %cfg.signing_key_secret_or_default(),
+                    notes_repo_path = %boot.notes_repo.path().display(),
+                    "generated new writ signing key on first boot — \
+                     add the fingerprint to bailiff's allowed-signers",
+                );
+            } else {
+                tracing::info!(
+                    fingerprint = %fingerprint,
+                    notes_repo_path = %boot.notes_repo.path().display(),
+                    "loaded writ signing key from secret store",
+                );
+            }
+            (
+                Some(Arc::new(boot.notes_repo)),
+                Some(boot.signing.into_signing_key()),
+                Some(boot.spawn),
+            )
+        }
+        None => {
+            tracing::info!("RunAgent dispatch not configured; serving Error replies");
+            (None, None, None)
+        }
+    };
+
     let state = Arc::new(BrokerState {
         audit: Arc::new(audit),
         minter: GitHubMinter::new_registry(github_apps),
         secrets: store,
         policy,
         staging_store,
-        // Slice B4 lands the dispatch path; writd boot wiring for the
-        // notes-repo handle, signing-key load, and run-agent spawn
-        // command arrives in the follow-up slice that also adds the
-        // audit row. Until then the daemon serves RunAgent with an
-        // explicit "not configured" reply.
-        notes_repo: None,
-        signing_key: None,
-        run_agent_spawn: None,
+        notes_repo,
+        signing_key,
+        run_agent_spawn,
     });
 
     tracing::info!(

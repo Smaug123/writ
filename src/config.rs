@@ -17,8 +17,11 @@ use crate::agent_vm_lifecycle::{
 use crate::core::{AgentNetworkPool, AgentVmConfigError, BrokerPortRange, Ipv4Cidr, Ipv6Cidr};
 use crate::github::GitHubAppRegistryConfig;
 use crate::nix_cache::{NixTrustedPublicKeys, NixTrustedPublicKeysError};
+use crate::notes_repo::{NotesRepo, NotesRepoError};
 use crate::policy::PolicyConfig;
-use crate::secret::SecretKey;
+use crate::secret::{SecretKey, SecretStore};
+use crate::server::RunAgentSpawnConfig;
+use crate::signing::{EnsureOutcome, SigningKeyStoreError, ensure_signing_key};
 use crate::vm_git::{VmGitPushBodyLimits, VmGitPushBodyLimitsError};
 use crate::vm_git_bundle::{
     DEFAULT_GIT_CLONE_BASE_URL, GitCloneBaseUrl, GitCloneBundlePlanError, GitCredentialBoundary,
@@ -48,6 +51,10 @@ use crate::vm_http::{
 ///   "policy": {
 ///     "default_ttl": 3600,
 ///     "writable_repos": ["smaug123/writ"]
+///   },
+///   "run_agent": {
+///     "spawn_command": "/usr/local/bin/claude",
+///     "spawn_args": ["--headless"]
 ///   }
 /// }
 /// ```
@@ -84,6 +91,14 @@ pub struct DaemonConfig {
     /// `docs/plans/2026-05-12-ui-data-api.md`.
     #[serde(default)]
     pub ui_http: Option<UiHttpConfig>,
+    /// Configuration for the `RunAgent` dispatch path. Absent means
+    /// the daemon refuses `RunAgent` with an explicit "not configured"
+    /// reply; present means writd opens (or initialises) the bare
+    /// notes repo, ensures the signing key in the secret store, and
+    /// wires the spawn config into [`crate::server::BrokerState`]. See
+    /// [`RunAgentDaemonConfig`].
+    #[serde(default)]
+    pub run_agent: Option<RunAgentDaemonConfig>,
 }
 
 /// Configuration for the read-only UI HTTP transport. Distinct from
@@ -146,6 +161,158 @@ pub fn default_ui_http_bearer_path() -> PathBuf {
     } else {
         let home = std::env::var_os("HOME").unwrap_or_else(|| "/tmp".into());
         PathBuf::from(home).join(".local/run/writ/ui-bearer")
+    }
+}
+
+/// Configuration for the `RunAgent` dispatch path. Absent from
+/// [`DaemonConfig`] means the daemon refuses `RunAgent` with an
+/// explicit "not configured" reply — useful for agent-VM-only test
+/// boots and for staged rollout.
+///
+/// Present means writd:
+/// 1. opens (or initialises) the bare `NotesRepo` at
+///    [`Self::notes_repo_path_or_default`] for envelope storage,
+/// 2. loads or ensures the writ signing key under
+///    [`Self::signing_key_secret_or_default`] in the secret store,
+/// 3. uses [`Self::spawn_command`] + [`Self::spawn_args`] as the child
+///    binary every `RunAgent` invocation drives.
+///
+/// **KNOWN GAP — per-`AgentKind` spawn dispatch.** [`Self::spawn_command`]
+/// today is a *single* binary for the whole daemon. Slice C's only
+/// agent kind is the planner so this suffices, but slice D (review,
+/// likely a different agent kind) will need per-kind selection. The
+/// follow-up reshapes both this struct and
+/// [`crate::server::RunAgentSpawnConfig`].
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunAgentDaemonConfig {
+    /// Absolute path to the bare git repository writ uses to store
+    /// signed-run envelope notes. Defaults to
+    /// `$XDG_DATA_HOME/writ/notes-repo`. Initialised idempotently at
+    /// boot via [`crate::notes_repo::NotesRepo::init_or_open`], so
+    /// re-running writd is safe.
+    #[serde(default)]
+    pub notes_repo_path: Option<PathBuf>,
+    /// `SecretStore` key under which the writ signing-key PEM is
+    /// stored. Defaults to `writ-signing-key`. On first boot the
+    /// daemon generates a fresh Ed25519 keypair and persists it here;
+    /// every subsequent boot loads the same key.
+    #[serde(default)]
+    pub signing_key_secret: Option<SecretKey>,
+    /// Absolute path to the child binary writd spawns for every
+    /// `RunAgent` call. Required when the section is present.
+    pub spawn_command: PathBuf,
+    /// Extra args passed to [`Self::spawn_command`] before the prompt
+    /// arrives on the child's stdin.
+    #[serde(default)]
+    pub spawn_args: Vec<String>,
+}
+
+/// Default `SecretStore` key under which writd persists its SSH
+/// signing key. Exposed so the same string drives the operator-facing
+/// CLI (`writ key inspect`, future) and the daemon boot path.
+pub const DEFAULT_WRIT_SIGNING_KEY_SECRET: &str = "writ-signing-key";
+
+impl RunAgentDaemonConfig {
+    /// Resolve [`Self::notes_repo_path`] against the documented default
+    /// so callers don't repeat the fallback logic.
+    pub fn notes_repo_path_or_default(&self) -> PathBuf {
+        self.notes_repo_path
+            .clone()
+            .unwrap_or_else(default_notes_repo_path)
+    }
+
+    /// Resolve [`Self::signing_key_secret`] against the documented
+    /// default ([`DEFAULT_WRIT_SIGNING_KEY_SECRET`]). The default name
+    /// is a static string that satisfies [`SecretKey::new`]'s
+    /// parse-don't-validate constraint, so the `expect` is correct.
+    pub fn signing_key_secret_or_default(&self) -> SecretKey {
+        self.signing_key_secret.clone().unwrap_or_else(|| {
+            SecretKey::new(DEFAULT_WRIT_SIGNING_KEY_SECRET)
+                .expect("DEFAULT_WRIT_SIGNING_KEY_SECRET is a valid SecretKey")
+        })
+    }
+
+    /// Realise the on-disk side effects this config declares: open (or
+    /// initialise) the bare notes repo, load or generate the signing
+    /// key in the secret store, and return them together with the
+    /// spawn config. The three values feed straight into
+    /// [`crate::server::BrokerState`].
+    ///
+    /// The signing key is loaded via
+    /// [`crate::signing::ensure_signing_key`], so first boot generates
+    /// and persists a fresh Ed25519 keypair; every subsequent boot
+    /// returns the same key. The returned [`EnsureOutcome`] lets the
+    /// caller log "generated new key" once at INFO/WARN level.
+    pub fn materialize(
+        &self,
+        store: &dyn SecretStore,
+    ) -> Result<RunAgentBootState, RunAgentBootError> {
+        let notes_repo_path = self.notes_repo_path_or_default();
+        let notes_repo = NotesRepo::init_or_open(&notes_repo_path).map_err(|source| {
+            RunAgentBootError::NotesRepo {
+                path: notes_repo_path.clone(),
+                source,
+            }
+        })?;
+        let signing_key_secret = self.signing_key_secret_or_default();
+        let signing_outcome = ensure_signing_key(store, &signing_key_secret).map_err(|source| {
+            RunAgentBootError::SigningKey {
+                key: signing_key_secret.as_str().to_string(),
+                source,
+            }
+        })?;
+        Ok(RunAgentBootState {
+            notes_repo,
+            signing: signing_outcome,
+            spawn: RunAgentSpawnConfig {
+                command: self.spawn_command.clone(),
+                args: self.spawn_args.clone(),
+            },
+        })
+    }
+}
+
+/// The triple writd hands to [`crate::server::BrokerState`] when
+/// [`RunAgentDaemonConfig`] is present. Carrying [`EnsureOutcome`]
+/// (rather than a bare [`crate::signing::WritSigningKey`]) lets the
+/// boot path log first-boot generation distinctly from "loaded
+/// existing key".
+#[derive(Debug)]
+pub struct RunAgentBootState {
+    pub notes_repo: NotesRepo,
+    pub signing: EnsureOutcome,
+    pub spawn: RunAgentSpawnConfig,
+}
+
+/// Failure modes of [`RunAgentDaemonConfig::materialize`]. Each
+/// variant carries the path or key the operator needs to fix.
+#[derive(Debug, thiserror::Error)]
+pub enum RunAgentBootError {
+    #[error("opening writ notes repo at {path}: {source}", path = path.display())]
+    NotesRepo {
+        path: PathBuf,
+        #[source]
+        source: NotesRepoError,
+    },
+    #[error("ensuring writ signing key under secret {key:?}: {source}")]
+    SigningKey {
+        key: String,
+        #[source]
+        source: SigningKeyStoreError,
+    },
+}
+
+/// Default location for writ's bare notes repo. Sits alongside the
+/// audit DB under `$XDG_DATA_HOME/writ/` so a single backup of that
+/// directory captures both writ's audit log and its signed-run
+/// envelopes.
+pub fn default_notes_repo_path() -> PathBuf {
+    if let Some(dir) = std::env::var_os("XDG_DATA_HOME") {
+        PathBuf::from(dir).join("writ/notes-repo")
+    } else {
+        let home = std::env::var_os("HOME").unwrap_or_else(|| "/tmp".into());
+        PathBuf::from(home).join(".local/share/writ/notes-repo")
     }
 }
 
@@ -870,6 +1037,7 @@ mod tests {
         assert!(c.agent_vm.is_none());
         assert!(c.socket_path.is_none());
         assert!(c.ui_http.is_none());
+        assert!(c.run_agent.is_none());
         assert!(
             matches!(&c.secret_store, SecretStoreConfig::File { path } if *path == default_secret_store_path())
         );
@@ -1837,5 +2005,174 @@ mod tests {
             "secret_store": { "type": "file", "path": "/tmp" }
         }"#;
         assert!(serde_json::from_str::<DaemonConfig>(json).is_err());
+    }
+
+    /// `run_agent` is optional: an absent section parses cleanly and
+    /// the daemon will refuse RunAgent at request time.
+    #[test]
+    fn parses_config_without_run_agent_section() {
+        let json = r#"{
+            "github_apps": {
+                "claude": {
+                    "app_id": 1,
+                    "installation_id": 2,
+                    "installation_owner": "o",
+                    "private_key_secret": "pk"
+                }
+            },
+            "policy": { "default_ttl": 600, "writable_repos": [] }
+        }"#;
+        let c: DaemonConfig = serde_json::from_str(json).unwrap();
+        assert!(c.run_agent.is_none());
+    }
+
+    /// `run_agent` minimal shape: only `spawn_command` is required;
+    /// `notes_repo_path`, `signing_key_secret`, and `spawn_args`
+    /// default. The accessors return the documented defaults.
+    #[test]
+    fn parses_run_agent_section_with_defaults() {
+        let json = r#"{
+            "github_apps": {
+                "claude": {
+                    "app_id": 1,
+                    "installation_id": 2,
+                    "installation_owner": "o",
+                    "private_key_secret": "pk"
+                }
+            },
+            "policy": { "default_ttl": 600, "writable_repos": [] },
+            "run_agent": { "spawn_command": "/usr/bin/claude" }
+        }"#;
+        let c: DaemonConfig = serde_json::from_str(json).unwrap();
+        let cfg = c.run_agent.expect("run_agent parsed");
+        assert_eq!(cfg.spawn_command, PathBuf::from("/usr/bin/claude"));
+        assert!(cfg.spawn_args.is_empty());
+        assert!(cfg.notes_repo_path.is_none());
+        assert!(cfg.signing_key_secret.is_none());
+        assert_eq!(cfg.notes_repo_path_or_default(), default_notes_repo_path());
+        assert_eq!(
+            cfg.signing_key_secret_or_default().as_str(),
+            DEFAULT_WRIT_SIGNING_KEY_SECRET
+        );
+    }
+
+    /// `run_agent` with every field overridden — pins the field names
+    /// on the wire so a config-file rename is a visible breaking
+    /// change.
+    #[test]
+    fn parses_run_agent_section_with_all_fields() {
+        let json = r#"{
+            "github_apps": {
+                "claude": {
+                    "app_id": 1,
+                    "installation_id": 2,
+                    "installation_owner": "o",
+                    "private_key_secret": "pk"
+                }
+            },
+            "policy": { "default_ttl": 600, "writable_repos": [] },
+            "run_agent": {
+                "spawn_command": "/opt/agents/claude",
+                "spawn_args": ["--headless", "--no-color"],
+                "notes_repo_path": "/var/lib/writ/notes",
+                "signing_key_secret": "custom-signing"
+            }
+        }"#;
+        let c: DaemonConfig = serde_json::from_str(json).unwrap();
+        let cfg = c.run_agent.expect("run_agent parsed");
+        assert_eq!(cfg.spawn_command, PathBuf::from("/opt/agents/claude"));
+        assert_eq!(cfg.spawn_args, vec!["--headless", "--no-color"]);
+        assert_eq!(
+            cfg.notes_repo_path_or_default(),
+            PathBuf::from("/var/lib/writ/notes")
+        );
+        assert_eq!(
+            cfg.signing_key_secret_or_default().as_str(),
+            "custom-signing"
+        );
+    }
+
+    /// `deny_unknown_fields` on `RunAgentDaemonConfig` keeps the
+    /// config schema honest: a typo'd key name is rejected at parse
+    /// time, not silently dropped.
+    #[test]
+    fn run_agent_section_rejects_unknown_fields() {
+        let json = r#"{
+            "github_apps": {
+                "claude": {
+                    "app_id": 1,
+                    "installation_id": 2,
+                    "installation_owner": "o",
+                    "private_key_secret": "pk"
+                }
+            },
+            "policy": { "default_ttl": 600, "writable_repos": [] },
+            "run_agent": {
+                "spawn_command": "/bin/true",
+                "spwan_args": []
+            }
+        }"#;
+        let err = serde_json::from_str::<DaemonConfig>(json).unwrap_err();
+        assert!(err.to_string().contains("spwan_args"));
+    }
+
+    /// `materialize` is idempotent across boots: the first call
+    /// generates and persists a fresh signing key (and creates the
+    /// bare notes repo on disk); the second call loads the same key
+    /// and reuses the same repo. This is the boot-time invariant
+    /// writd relies on.
+    #[test]
+    fn materialize_persists_signing_key_and_initialises_notes_repo() {
+        use crate::secret::{SecretError, SecretStore};
+        use std::collections::HashMap;
+        use std::sync::Mutex;
+
+        #[derive(Default)]
+        struct InMem(Mutex<HashMap<String, String>>);
+        impl SecretStore for InMem {
+            fn get(&self, key: &SecretKey) -> Result<Option<String>, SecretError> {
+                Ok(self.0.lock().unwrap().get(key.as_str()).cloned())
+            }
+            fn put(&self, key: &SecretKey, value: &str) -> Result<(), SecretError> {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .insert(key.as_str().to_string(), value.to_string());
+                Ok(())
+            }
+            fn delete(&self, key: &SecretKey) -> Result<(), SecretError> {
+                self.0.lock().unwrap().remove(key.as_str());
+                Ok(())
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = RunAgentDaemonConfig {
+            notes_repo_path: Some(tmp.path().join("notes-repo")),
+            signing_key_secret: Some(SecretKey::new("writ-signing-key").unwrap()),
+            spawn_command: PathBuf::from("/bin/cat"),
+            spawn_args: vec![],
+        };
+        let store = InMem::default();
+
+        let first = cfg.materialize(&store).unwrap();
+        assert!(
+            first.signing.was_generated(),
+            "first boot generates the key"
+        );
+        let fp = first.signing.signing_key().fingerprint();
+        assert!(first.notes_repo.path().exists());
+        assert_eq!(first.spawn.command, PathBuf::from("/bin/cat"));
+
+        let second = cfg.materialize(&store).unwrap();
+        assert!(
+            !second.signing.was_generated(),
+            "second boot loads the existing key"
+        );
+        assert_eq!(
+            second.signing.signing_key().fingerprint(),
+            fp,
+            "fingerprint is stable across boots — same key material",
+        );
     }
 }
