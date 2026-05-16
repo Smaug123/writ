@@ -1,6 +1,6 @@
 //! `bailiff` — the workflow orchestrator that drives plan submission
-//! (and, in later slices, review/execute) on top of writ's `RunAgent`
-//! RPC. See `docs/plans/2026-05-14-bailiff-split.md`.
+//! (and, in later slices, execute) on top of writ's `RunAgent` RPC.
+//! See `docs/plans/2026-05-14-bailiff-split.md`.
 //!
 //! Slice C3 introduces the first operator-facing verb,
 //! `bailiff plan submit`: open a writ session, run the planner agent,
@@ -9,7 +9,10 @@
 //! The workflow itself lives in
 //! [`writ::bailiff_plan_submit::submit_plan`]; this binary is the
 //! thin CLI layer that resolves paths, parses flags, and prints the
-//! plan id on success.
+//! plan id on success. Slice D2.5 adds the parallel `bailiff plan
+//! review` verb, which reads the submission note, runs the reviewer
+//! agent through writ, and persists a
+//! [`writ::bailiff_plan_note::ReviewNote`].
 //!
 //! Paths default to the same XDG convention `docs/design/broker.md`
 //! pins for writ, mirrored under `bailiff/`:
@@ -26,8 +29,9 @@ use tokio::sync::Mutex as AsyncMutex;
 use writ::agent_run::AgentPrompt;
 use writ::bailiff_decision::{Decider, Decision};
 use writ::bailiff_plan_note::{DecisionNote, PlanId};
+use writ::bailiff_plan_review::{SubmitReviewError, SubmitReviewInputs, submit_review};
 use writ::bailiff_plan_submit::{SubmitPlanInputs, submit_plan};
-use writ::bailiff_plan_write::{WriteDecisionNoteError, write_decision_note};
+use writ::bailiff_plan_write::{WriteDecisionNoteError, WriteReviewNoteError, write_decision_note};
 use writ::core::{AgentKind, CapabilitySet, NotesRef, RepoRef, UnixMillis};
 use writ::notes_repo::NotesRepo;
 use writ::run_verify::AllowedSigners;
@@ -56,8 +60,8 @@ struct Args {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Plan workflows (submit today; review/decide/implement land in
-    /// later slices).
+    /// Plan workflows (submit/decide/review today; implement lands in
+    /// a later slice).
     Plan {
         #[command(subcommand)]
         action: PlanCmd,
@@ -169,6 +173,70 @@ enum PlanCmd {
         #[arg(long)]
         bailiff_repo: Option<PathBuf>,
     },
+    /// Run a reviewer agent against a previously-submitted plan and
+    /// persist the bailiff-side review note. The plan body is fetched
+    /// from writ's signed envelope, re-verified, and composed into
+    /// the reviewer's prompt before the agent runs. Prints the review
+    /// note's bailiff-side OID on success.
+    ///
+    /// Mirrors [`PlanCmd::Submit`] minus auto-allocation of
+    /// `--plan-id` (review needs an existing plan) and with
+    /// `--purpose` defaulting to `"plan-review"`.
+    Review {
+        /// Plan to review. Must parse as the canonical UUID form
+        /// `PlanId` prints. Unlike `plan submit`, the id is required:
+        /// there is no auto-allocation, since reviewing presupposes
+        /// an existing submission.
+        #[arg(long)]
+        plan_id: PlanId,
+        /// File containing the reviewer instructions. The bytes are
+        /// read once, validated through [`AgentPrompt::try_new`], and
+        /// passed to [`submit_review`] which composes them with the
+        /// fetched plan body before handing the result to writ.
+        #[arg(long)]
+        prompt_file: PathBuf,
+        /// Repository the reviewer agent is allowed to read, in
+        /// `owner/name` form. D2.5 grants a single `WorkspaceRead`
+        /// capability on this repo (matches `plan submit`'s shape).
+        #[arg(long)]
+        repo: String,
+        /// Path to bailiff's bare git repo. Defaults to
+        /// `$XDG_DATA_HOME/bailiff/repo` (or
+        /// `~/.local/share/bailiff/repo` if `XDG_DATA_HOME` is
+        /// unset). Created on first use via
+        /// [`NotesRepo::init_or_open`].
+        #[arg(long)]
+        bailiff_repo: Option<PathBuf>,
+        /// Path to writ's bare git repo. Defaults to
+        /// `$XDG_DATA_HOME/writ/repo`. Bailiff fetches writ's notes
+        /// namespace from this path twice during a review: once to
+        /// read the planner's envelope for plan-body extraction, once
+        /// after the reviewer run to verify the reviewer envelope.
+        #[arg(long)]
+        writ_repo: Option<PathBuf>,
+        /// OpenSSH `allowed_signers` file enumerating which writ
+        /// signing keys bailiff will accept envelopes from. Used for
+        /// both the planner re-verify (defence in depth) and the
+        /// reviewer envelope.
+        #[arg(long)]
+        writ_allowed_signers: PathBuf,
+        /// Opaque tag recorded verbatim on writ's audit row and on
+        /// the bailiff-side review note. Defaults to `"plan-review"`.
+        #[arg(long, default_value = "plan-review")]
+        purpose: String,
+        /// Human-readable session label stored in writ's audit log.
+        /// Informational only.
+        #[arg(long)]
+        label: Option<String>,
+        /// Coarse agent identity passed to writ's `OpenSession`.
+        /// Defaults to `claude`, matching `plan submit`. Required by
+        /// writ when a GitHub-app registry is configured.
+        #[arg(long, default_value = "claude", value_parser = parse_agent_kind)]
+        agent: AgentKind,
+        /// Optional model identifier stored on writ's session row.
+        #[arg(long)]
+        model: Option<String>,
+    },
 }
 
 fn parse_agent_kind(raw: &str) -> Result<AgentKind, String> {
@@ -230,6 +298,33 @@ async fn dispatch(cmd: Cmd, socket_path: PathBuf) -> Result<(), Box<dyn std::err
                 decider,
                 bailiff_repo,
             } => plan_decide(plan_id, accept, reject, decider, bailiff_repo).await,
+            PlanCmd::Review {
+                plan_id,
+                prompt_file,
+                repo,
+                bailiff_repo,
+                writ_repo,
+                writ_allowed_signers,
+                purpose,
+                label,
+                agent,
+                model,
+            } => {
+                plan_review(
+                    socket_path,
+                    plan_id,
+                    prompt_file,
+                    repo,
+                    bailiff_repo,
+                    writ_repo,
+                    writ_allowed_signers,
+                    purpose,
+                    label,
+                    agent,
+                    model,
+                )
+                .await
+            }
         },
     }
 }
@@ -318,6 +413,110 @@ async fn plan_submit(
     let outcome = submit_plan(&client, bailiff, &writ_repo_path, allowed, inputs).await?;
     println!("{}", outcome.plan_id);
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn plan_review(
+    socket_path: PathBuf,
+    plan_id: PlanId,
+    prompt_file: PathBuf,
+    repo: String,
+    bailiff_repo: Option<PathBuf>,
+    writ_repo: Option<PathBuf>,
+    writ_allowed_signers: PathBuf,
+    purpose: String,
+    label: Option<String>,
+    agent: AgentKind,
+    model: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Same pre-RPC discipline as `plan_submit`: validate every
+    // on-disk input before opening any sockets, so a typo in
+    // `--prompt-file` or `--writ-allowed-signers` fails before
+    // bailiff makes a side-effecting writ call.
+    let prompt_bytes = std::fs::read(&prompt_file)
+        .map_err(|e| format!("reading prompt file {}: {e}", prompt_file.display()))?;
+    let prompt_str = String::from_utf8(prompt_bytes).map_err(|e| {
+        format!(
+            "prompt file {} is not valid UTF-8: {e}",
+            prompt_file.display()
+        )
+    })?;
+    let reviewer_instructions = AgentPrompt::try_new(prompt_str)
+        .map_err(|e| format!("prompt from {} rejected: {e}", prompt_file.display()))?;
+
+    let repo: RepoRef = repo
+        .parse()
+        .map_err(|e| format!("--repo {repo:?} is not 'owner/name': {e}"))?;
+
+    let bailiff_repo_path = bailiff_repo.unwrap_or_else(default_bailiff_repo_path);
+    let writ_repo_path = writ_repo.unwrap_or_else(default_writ_repo_path);
+
+    let allowed_signers_text = std::fs::read_to_string(&writ_allowed_signers).map_err(|e| {
+        format!(
+            "reading writ allowed-signers file {}: {e}",
+            writ_allowed_signers.display()
+        )
+    })?;
+    let allowed = AllowedSigners::from_openssh_lines(&allowed_signers_text).map_err(|e| {
+        format!(
+            "parsing writ allowed-signers file {}: {e}",
+            writ_allowed_signers.display()
+        )
+    })?;
+
+    let bailiff_repo_path_for_init = bailiff_repo_path.clone();
+    let bailiff =
+        tokio::task::spawn_blocking(move || NotesRepo::init_or_open(bailiff_repo_path_for_init))
+            .await
+            .map_err(|e| format!("bailiff-repo init task failed: {e}"))?
+            .map_err(|e| {
+                format!(
+                    "opening bailiff repo at {}: {e}",
+                    bailiff_repo_path.display()
+                )
+            })?;
+    let bailiff = Arc::new(AsyncMutex::new(bailiff));
+
+    let writ_output_ref =
+        NotesRef::try_new(WRIT_OUTPUT_REF).expect("WRIT_OUTPUT_REF is a static well-formed ref");
+
+    let inputs = SubmitReviewInputs {
+        plan_id,
+        reviewer_instructions,
+        capabilities: vec![CapabilitySet::WorkspaceRead { repo }],
+        purpose,
+        writ_output_ref,
+        session_label: label,
+        session_agent_kind: Some(agent),
+        session_agent_model: model,
+    };
+
+    let client = WritClient::new(&socket_path);
+    match submit_review(&client, bailiff, &writ_repo_path, allowed, inputs).await {
+        Ok(outcome) => {
+            println!("{}", outcome.review_note_oid);
+            Ok(())
+        }
+        // `ReviewAlreadyRecorded` is the duplicate-review invariant.
+        // Surface it with the same actionable shape `plan decide`
+        // uses for `DecisionAlreadyRecorded`, so an operator who
+        // re-ran the verb sees what to do next rather than a generic
+        // formatted error chain.
+        Err(SubmitReviewError::WriteReviewNote {
+            session_id: _,
+            source:
+                WriteReviewNoteError::ReviewAlreadyRecorded {
+                    plan_id,
+                    target_oid,
+                },
+        }) => Err(format!(
+            "review already recorded for plan {plan_id} at target {target_oid}; bailiff does not \
+             overwrite reviews — submit a fresh plan if the operator wants a re-review (multi-review \
+             history is a future v1 → v2 migration)"
+        )
+        .into()),
+        Err(e) => Err(format!("{e}").into()),
+    }
 }
 
 /// `$XDG_DATA_HOME/bailiff/repo` (or `~/.local/share/bailiff/repo`
@@ -839,5 +1038,202 @@ mod tests {
                 None => std::env::remove_var("XDG_DATA_HOME"),
             }
         }
+    }
+
+    /// `bailiff plan review` parses the minimum required flag set
+    /// (`--plan-id`, `--prompt-file`, `--repo`, `--writ-allowed-signers`)
+    /// and threads each argument into the corresponding field of
+    /// `PlanCmd::Review`. A regression in the clap attribute set
+    /// (a renamed flag, a misspelled default, a long/short collision)
+    /// surfaces here as a parse failure or a wrong field assignment.
+    #[test]
+    fn plan_review_parses_minimum_required_flags() {
+        let plan_id_str = "1d1d1d1d-2d2d-3d3d-4d4d-5d5d5d5d5d5d";
+        let args = Args::try_parse_from([
+            "bailiff",
+            "plan",
+            "review",
+            "--plan-id",
+            plan_id_str,
+            "--prompt-file",
+            "/tmp/r.txt",
+            "--repo",
+            "smaug123/writ",
+            "--writ-allowed-signers",
+            "/etc/bailiff/allowed_signers",
+        ])
+        .unwrap();
+        let Cmd::Plan {
+            action:
+                PlanCmd::Review {
+                    plan_id,
+                    prompt_file,
+                    repo,
+                    bailiff_repo,
+                    writ_repo,
+                    writ_allowed_signers,
+                    purpose,
+                    label,
+                    agent,
+                    model,
+                },
+        } = args.cmd
+        else {
+            panic!("expected PlanCmd::Review");
+        };
+        assert_eq!(plan_id.to_string(), plan_id_str);
+        assert_eq!(prompt_file, PathBuf::from("/tmp/r.txt"));
+        assert_eq!(repo, "smaug123/writ");
+        assert!(bailiff_repo.is_none());
+        assert!(writ_repo.is_none());
+        assert_eq!(
+            writ_allowed_signers,
+            PathBuf::from("/etc/bailiff/allowed_signers")
+        );
+        assert_eq!(purpose, "plan-review");
+        assert!(label.is_none());
+        assert_eq!(agent, AgentKind::Claude);
+        assert!(model.is_none());
+    }
+
+    /// Every optional flag round-trips. Pins the full review CLI
+    /// surface so scripted callers see a stable contract.
+    #[test]
+    fn plan_review_accepts_every_optional_flag() {
+        let plan_id_str = "2d2d2d2d-3d3d-4d4d-5d5d-6d6d6d6d6d6d";
+        let args = Args::try_parse_from([
+            "bailiff",
+            "plan",
+            "review",
+            "--plan-id",
+            plan_id_str,
+            "--prompt-file",
+            "/tmp/r.txt",
+            "--repo",
+            "smaug123/writ",
+            "--bailiff-repo",
+            "/var/bailiff",
+            "--writ-repo",
+            "/var/writ",
+            "--writ-allowed-signers",
+            "/etc/bailiff/allowed_signers",
+            "--purpose",
+            "plan-review:rev-2",
+            "--label",
+            "feature 42 review",
+            "--agent",
+            "codex",
+            "--model",
+            "gpt-test",
+        ])
+        .unwrap();
+        let Cmd::Plan {
+            action:
+                PlanCmd::Review {
+                    plan_id,
+                    bailiff_repo,
+                    writ_repo,
+                    purpose,
+                    label,
+                    agent,
+                    model,
+                    ..
+                },
+        } = args.cmd
+        else {
+            panic!("expected PlanCmd::Review");
+        };
+        assert_eq!(plan_id.to_string(), plan_id_str);
+        assert_eq!(
+            bailiff_repo.as_deref(),
+            Some(std::path::Path::new("/var/bailiff"))
+        );
+        assert_eq!(
+            writ_repo.as_deref(),
+            Some(std::path::Path::new("/var/writ"))
+        );
+        assert_eq!(purpose, "plan-review:rev-2");
+        assert_eq!(label.as_deref(), Some("feature 42 review"));
+        assert_eq!(agent, AgentKind::Codex);
+        assert_eq!(model.as_deref(), Some("gpt-test"));
+    }
+
+    /// `--plan-id` is required; without it the parse fails. Pins the
+    /// divergence from `plan submit` (which auto-allocates): reviewing
+    /// presupposes an existing plan, so the id is mandatory.
+    #[test]
+    fn plan_review_rejects_missing_plan_id() {
+        let err = Args::try_parse_from([
+            "bailiff",
+            "plan",
+            "review",
+            "--prompt-file",
+            "/tmp/r.txt",
+            "--repo",
+            "smaug123/writ",
+            "--writ-allowed-signers",
+            "/etc/bailiff/allowed_signers",
+        ])
+        .err()
+        .expect("expected parse error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--plan-id") || msg.contains("required"),
+            "expected missing-plan-id failure, got: {msg}",
+        );
+    }
+
+    /// `PlanId::from_str` runs at parse, so a malformed UUID is a
+    /// parse error rather than a runtime failure inside `plan_review`.
+    /// Pins that the value_parser stays wired to the validating
+    /// constructor.
+    #[test]
+    fn plan_review_rejects_malformed_plan_id() {
+        let err = Args::try_parse_from([
+            "bailiff",
+            "plan",
+            "review",
+            "--plan-id",
+            "not-a-uuid",
+            "--prompt-file",
+            "/tmp/r.txt",
+            "--repo",
+            "smaug123/writ",
+            "--writ-allowed-signers",
+            "/etc/bailiff/allowed_signers",
+        ])
+        .err()
+        .expect("expected parse error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--plan-id") || msg.contains("uuid") || msg.contains("UUID"),
+            "expected malformed-plan-id failure, got: {msg}",
+        );
+    }
+
+    /// `--prompt-file` is required. A regression that made it optional
+    /// would let `plan_review` reach the on-disk read with a `None`
+    /// path; pin the contract here at the parser tier.
+    #[test]
+    fn plan_review_rejects_missing_prompt_file() {
+        let plan_id_str = "3d3d3d3d-4d4d-5d5d-6d6d-7d7d7d7d7d7d";
+        let err = Args::try_parse_from([
+            "bailiff",
+            "plan",
+            "review",
+            "--plan-id",
+            plan_id_str,
+            "--repo",
+            "smaug123/writ",
+            "--writ-allowed-signers",
+            "/etc/bailiff/allowed_signers",
+        ])
+        .err()
+        .expect("expected parse error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--prompt-file") || msg.contains("required"),
+            "expected missing-prompt-file failure, got: {msg}",
+        );
     }
 }
