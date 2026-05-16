@@ -232,7 +232,12 @@ impl NotesRepo {
             return Err(NotesRepoError::EmptyBody);
         }
         let _guard = lock_notes_write(&self.canonical_path);
-        let target_oid = hash_object_stdin(&self.canonical_path, seed, &self.inherited_env)?;
+        let target_oid = hash_object_stdin(
+            &self.canonical_path,
+            seed,
+            &self.inherited_env,
+            HashWrite::Persist,
+        )?;
         // Write the body as a blob first and reference it via `-C
         // <oid>`. `git notes add -F file` runs the body through
         // `stripspace` (strip trailing whitespace per line, collapse
@@ -240,7 +245,12 @@ impl NotesRepo {
         // is binary in general, so we have to bypass stripspace.
         // `-C <existing_blob_oid>` reuses the object verbatim and is
         // the documented escape hatch.
-        let body_oid = hash_object_stdin(&self.canonical_path, body, &self.inherited_env)?;
+        let body_oid = hash_object_stdin(
+            &self.canonical_path,
+            body,
+            &self.inherited_env,
+            HashWrite::Persist,
+        )?;
         // `notes add` creates a commit on the notes ref, so it
         // needs an author identity. The `clean_git` env recipe
         // we run under (HOME=/dev/null, GIT_CONFIG_GLOBAL=/dev/null,
@@ -303,11 +313,21 @@ impl NotesRepo {
             return Err(NotesRepoError::EmptyBody);
         }
         let _guard = lock_notes_write(&self.canonical_path);
-        let target_oid = hash_object_stdin(&self.canonical_path, seed, &self.inherited_env)?;
+        let target_oid = hash_object_stdin(
+            &self.canonical_path,
+            seed,
+            &self.inherited_env,
+            HashWrite::Persist,
+        )?;
         if self.read_note_if_present(notes_ref, &target_oid)?.is_some() {
             return Ok(WriteOutcome::AlreadyPresent(target_oid));
         }
-        let body_oid = hash_object_stdin(&self.canonical_path, body, &self.inherited_env)?;
+        let body_oid = hash_object_stdin(
+            &self.canonical_path,
+            body,
+            &self.inherited_env,
+            HashWrite::Persist,
+        )?;
         run_git(
             &self.canonical_path,
             [
@@ -434,6 +454,37 @@ impl NotesRepo {
             }
             Err(err) => Err(err),
         }
+    }
+
+    /// Read the body of the note attached to the seed's target OID
+    /// under `notes_ref`. Bundles the seed-to-target-OID derivation
+    /// (`git hash-object`) with the absent-classifying read, so a
+    /// caller that holds the seed (and not the target OID) gets the
+    /// same `Option<Vec<u8>>` shape [`Self::read_note_if_present`]
+    /// returns without having to re-implement the hashing step.
+    ///
+    /// Sibling to [`Self::write_note_if_absent`]: the writer hashes
+    /// the same seed bytes to pick the attach OID, so a reader that
+    /// hashes those bytes again recovers the same OID and locates
+    /// the writer's note. Determinism of `git hash-object` is the
+    /// load-bearing property — content-addressed storage means
+    /// no separate registry is needed to map seeds to targets.
+    pub fn read_note_at_seed(
+        &self,
+        notes_ref: &NotesRef,
+        seed: &[u8],
+    ) -> Result<Option<Vec<u8>>, NotesRepoError> {
+        // `HashWrite::Dry`: probing for an undecided plan must not
+        // pollute the repo with an unreachable seed blob, and must
+        // not fail if the repo is read-only. The OID is identical
+        // either way; only the persistence side effect differs.
+        let target_oid = hash_object_stdin(
+            &self.canonical_path,
+            seed,
+            &self.inherited_env,
+            HashWrite::Dry,
+        )?;
+        self.read_note_if_present(notes_ref, &target_oid)
     }
 }
 
@@ -654,14 +705,37 @@ fn run_git_config<'a>(
     }
 }
 
+/// Whether `hash_object_stdin` persists the resulting blob in the
+/// object database (`git hash-object -w`) or just returns the OID
+/// without writing it. The OID is identical either way; only the
+/// side effect of materialising the blob differs.
+///
+/// Write callers need [`Self::Persist`] because the body blob the
+/// note attaches to via `notes add -C <blob_oid>` must be
+/// resolvable at the time of the attach. Read callers — which only
+/// need the OID to look up the notes-tree entry — use [`Self::Dry`]
+/// so probing for an absent note does not pollute the repo with
+/// unreachable seed blobs, and so the operation works against a
+/// read-only mirror.
+#[derive(Copy, Clone, Eq, PartialEq)]
+enum HashWrite {
+    Persist,
+    Dry,
+}
+
 fn hash_object_stdin(
     repo: &Path,
     bytes: &[u8],
     env: &InheritedEnv,
+    write: HashWrite,
 ) -> Result<GitObjectId, NotesRepoError> {
+    let args: &[&str] = match write {
+        HashWrite::Persist => &["hash-object", "-w", "--stdin"],
+        HashWrite::Dry => &["hash-object", "--stdin"],
+    };
     let stdout = run_git(
         repo,
-        ["hash-object", "-w", "--stdin"].iter().copied(),
+        args.iter().copied(),
         Some(bytes),
         CaptureOutput::Capture,
         env,
@@ -1450,5 +1524,97 @@ mod tests {
             .write_note_if_absent(&nref, b"seed-A", b"")
             .unwrap_err();
         assert!(matches!(err, NotesRepoError::EmptyBody), "got: {err:?}");
+    }
+
+    /// Round-trip pin: writing under a seed and reading back via the
+    /// same seed recovers the body byte-for-byte. The writer hashes
+    /// the seed to derive the target OID; the reader hashes the same
+    /// seed and recovers the same OID, so the body comes back without
+    /// the caller ever materialising the target OID. This is the
+    /// content-addressed contract the helper exists to provide.
+    #[test]
+    fn read_note_at_seed_round_trips_through_write_note_if_absent() {
+        let tmp = TempDir::new().unwrap();
+        let repo = NotesRepo::init_or_open(tmp.path().join("r")).unwrap();
+        let nref = notes_ref();
+        let _ = repo
+            .write_note_if_absent(&nref, b"seed-A", b"body-A")
+            .unwrap();
+        let read_back = repo.read_note_at_seed(&nref, b"seed-A").unwrap();
+        assert_eq!(read_back.as_deref(), Some(b"body-A".as_slice()));
+    }
+
+    /// When no note is attached under the seed, `read_note_at_seed`
+    /// folds the absence into `Ok(None)` — same shape its underlying
+    /// `read_note_if_present` exposes. The fresh-ref case (no ref
+    /// at all) is one of the two absent branches `read_note_if_present`
+    /// already pins; pinning it again at the seed-level helper guards
+    /// against a future refactor that bypasses the absent-classifier.
+    #[test]
+    fn read_note_at_seed_returns_none_when_nothing_was_written() {
+        let tmp = TempDir::new().unwrap();
+        let repo = NotesRepo::init_or_open(tmp.path().join("r")).unwrap();
+        let nref = notes_ref();
+        let res = repo.read_note_at_seed(&nref, b"unwritten-seed").unwrap();
+        assert!(res.is_none(), "expected None, got: {res:?}");
+    }
+
+    /// When a note is attached under a *different* seed, the asked-for
+    /// seed still resolves to `None`. Exercises the "ref present, no
+    /// note at this target" branch of the absent-classifier through
+    /// the seed-level helper.
+    #[test]
+    fn read_note_at_seed_returns_none_when_other_seed_was_written() {
+        let tmp = TempDir::new().unwrap();
+        let repo = NotesRepo::init_or_open(tmp.path().join("r")).unwrap();
+        let nref = notes_ref();
+        let _ = repo
+            .write_note_if_absent(&nref, b"seed-A", b"body-A")
+            .unwrap();
+        let res = repo.read_note_at_seed(&nref, b"seed-B").unwrap();
+        assert!(res.is_none(), "expected None for seed-B, got: {res:?}");
+    }
+
+    /// Read-path side-effect regression: probing for an absent note
+    /// must not materialise the seed blob in the object database.
+    /// The previous implementation called `git hash-object -w`, which
+    /// silently wrote a dangling seed blob on every read — polluting
+    /// the repo and breaking the helper on read-only mirrors. Pin
+    /// the no-write property by counting loose objects across the
+    /// probe.
+    #[test]
+    fn read_note_at_seed_does_not_write_seed_blob_to_object_database() {
+        fn count_loose_objects(repo_path: &Path) -> usize {
+            let mut total = 0usize;
+            let objects = repo_path.join("objects");
+            for entry in fs::read_dir(&objects).unwrap() {
+                let entry = entry.unwrap();
+                let name = entry.file_name();
+                // Loose object subdirs are two hex chars; skip
+                // `info/` and `pack/` and anything else.
+                let name_str = name.to_string_lossy();
+                if name_str.len() != 2 || !name_str.chars().all(|c| c.is_ascii_hexdigit()) {
+                    continue;
+                }
+                for inner in fs::read_dir(entry.path()).unwrap() {
+                    let _ = inner.unwrap();
+                    total += 1;
+                }
+            }
+            total
+        }
+
+        let tmp = TempDir::new().unwrap();
+        let repo = NotesRepo::init_or_open(tmp.path().join("r")).unwrap();
+        let nref = notes_ref();
+        let before = count_loose_objects(repo.path());
+        let _ = repo
+            .read_note_at_seed(&nref, b"never-written-seed")
+            .unwrap();
+        let after = count_loose_objects(repo.path());
+        assert_eq!(
+            before, after,
+            "read_note_at_seed must not write seed blobs (before={before}, after={after})",
+        );
     }
 }
