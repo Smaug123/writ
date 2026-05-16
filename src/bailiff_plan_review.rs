@@ -322,10 +322,11 @@ fn compose_reviewer_prompt_bytes(
 /// microseconds and forecloses an entire class of "I tampered with
 /// the planner's stdout between submission and review" attacks.
 ///
-/// Empty stdout is *not* rejected: an LLM planner that produced no
-/// output is a downstream concern the reviewer can flag, and an
-/// empty `plan_body` slot in the composed prompt is observable
-/// rather than spoof-able.
+/// Empty stdout is rejected as a protocol violation: the design
+/// doc treats the planner's stdout as the plan body, and a
+/// zero-byte plan body means there is nothing for the reviewer to
+/// react to. Bailing here keeps a reviewer session from being
+/// opened against a vacuous prompt.
 fn read_plan_body_bytes(
     bailiff_repo: &NotesRepo,
     writ_repo_path: &Path,
@@ -354,6 +355,9 @@ fn read_plan_body_bytes(
         return Err(ReadPlanBodyError::OutputTruncated {
             stdout_truncated_at,
         });
+    }
+    if output.stdout.is_empty() {
+        return Err(ReadPlanBodyError::OutputEmpty);
     }
     String::from_utf8(output.stdout).map_err(ReadPlanBodyError::OutputNotUtf8)
 }
@@ -426,6 +430,15 @@ pub enum ReadPlanBodyError {
     /// narrower scope so the body fits writ's per-stream cap.
     #[error("planner stdout was truncated at byte offset {stdout_truncated_at}")]
     OutputTruncated { stdout_truncated_at: u64 },
+    /// The planner's stdout was zero bytes. The design contract
+    /// treats the planner's stdout as the plan body, so a zero-byte
+    /// stdout is a protocol violation: there is nothing for the
+    /// reviewer to react to. Pinned distinct from
+    /// [`Self::OutputNotUtf8`] because the operator's response
+    /// differs: "the planner ran but emitted nothing" vs "the
+    /// planner emitted binary garbage".
+    #[error("planner stdout is empty")]
+    OutputEmpty,
     /// The planner's stdout bytes are not valid UTF-8. The planner
     /// is contracted to emit a human-readable plan body; non-text
     /// output is a protocol violation. Surfacing the
@@ -981,6 +994,39 @@ mod read_plan_body_tests {
             } => assert_eq!(stdout_truncated_at, 11),
             other => panic!("expected OutputTruncated, got: {other:?}"),
         }
+    }
+
+    /// `OutputEmpty` when the planner's stdout is zero bytes. The
+    /// design contract treats planner stdout as the plan body, so
+    /// an empty plan body is a protocol violation that must bail
+    /// before any reviewer session opens.
+    #[test]
+    fn output_empty_when_stdout_is_zero_bytes() {
+        let tmp = TempDir::new().unwrap();
+        let signing_key = WritSigningKey::from_openssh_pem(SIGNING_PEM).unwrap();
+        let output = OutputEnvelope {
+            stdout: Vec::new(),
+            stderr: b"informational".to_vec(),
+            stdout_truncated_at: None,
+            stderr_truncated_at: None,
+        };
+        let envelope = signed_envelope_with_output(&signing_key, output);
+        let (writ_repo, plan_note) = writ_repo_and_plan_note(&tmp, &envelope);
+        let bailiff = bailiff_repo(&tmp);
+        let allowed = AllowedSigners::from_openssh_lines(SIGNING_PUB).unwrap();
+
+        let err = read_plan_body_bytes(
+            &bailiff,
+            writ_repo.path(),
+            &writ_notes_ref(),
+            &plan_note,
+            &allowed,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, ReadPlanBodyError::OutputEmpty),
+            "expected OutputEmpty, got: {err:?}",
+        );
     }
 
     /// `OutputNotUtf8` when the planner's stdout bytes aren't valid
