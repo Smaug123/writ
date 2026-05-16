@@ -273,12 +273,12 @@ impl<'de> Deserialize<'de> for RejectionReason {
 /// provenance checks on a multi-capability run see every authority
 /// that produced the signed output.
 ///
-/// `session_id` is the open question pinned for slice C of the
-/// bailiff-split plan: bailiff opens one writ session per workflow
-/// and every run for that workflow happens inside it. Field shape
-/// frozen here so slice B can wire the signing path without
-/// reshaping the response; the question of "who allocates the
-/// session id" is resolved by slice C without changing this struct.
+/// `session_id` is the authority/audit window writ minted (or that
+/// bailiff supplied on `RunAgent`) for *this run* — per the
+/// 2026-05-16 session-model pin a writ session is per-agent-run,
+/// not per workflow. Verifiers use it to correlate the signed
+/// envelope with writ's audit row; workflow identity belongs to
+/// bailiff's `PlanId` and is not carried in writ's signed bytes.
 ///
 /// `deny_unknown_fields` catches an unexpected key at parse time
 /// rather than silently dropping it; the canonical bytes are
@@ -483,10 +483,19 @@ pub enum ClientMessage {
     },
     /// Ask writ to spawn an agent with the given prompt and capability
     /// set, then write the signed terminal output as a note into the
-    /// caller's Git repo at `output_ref`. Carries no session: writ's
-    /// audit row records the run identity directly from the request.
-    /// Bailiff is the intended (sole) client of this RPC; see
+    /// caller's Git repo at `output_ref`. Bailiff is the intended
+    /// (sole) client of this RPC; see
     /// `docs/plans/2026-05-14-bailiff-split.md`.
+    ///
+    /// `session_id` binds the run to an audit session the caller
+    /// previously opened with [`ClientMessage::OpenSession`]. When
+    /// `Some`, writ validates the session exists and is still open
+    /// before spawning, and stamps the same id into the signed
+    /// metadata so a verifier can correlate the envelope back to the
+    /// workflow session. When `None` (legacy / standalone use), writ
+    /// mints a fresh id for the signed metadata alone — no audit
+    /// session row is created, and the id is unreachable except via
+    /// the signed envelope.
     ///
     /// Slice A1 lands the request type only. Dispatch returns
     /// [`ServerMessage::Error`] until slice B wires up the real spawner
@@ -510,6 +519,13 @@ pub enum ClientMessage {
         /// Notes ref in the caller's Git repo where writ should
         /// attach the signed output note once the run completes.
         output_ref: NotesRef,
+        /// Optional caller-supplied session id binding the run to an
+        /// already-opened audit session. The field is omitted on the
+        /// wire (`skip_serializing_if = "Option::is_none"`) and
+        /// defaults to `None` on decode so a legacy caller that
+        /// predates the field still parses.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<SessionId>,
     },
 }
 
@@ -1025,6 +1041,7 @@ mod tests {
             ],
             purpose: "plan-stage".into(),
             output_ref: NotesRef::try_new("refs/notes/writ/agent-outputs").unwrap(),
+            session_id: Some(fixed_session_id()),
         };
         let json = serde_json::to_string(&msg).unwrap();
         let back: ClientMessage = serde_json::from_str(&json).unwrap();
@@ -1044,14 +1061,62 @@ mod tests {
             capabilities: vec![],
             purpose: "reviewer".into(),
             output_ref: NotesRef::try_new("refs/notes/writ/agent-outputs").unwrap(),
+            session_id: None,
         };
         let value: serde_json::Value = serde_json::to_value(&msg).unwrap();
         assert_eq!(value["type"], "run_agent");
         assert!(value.get("capabilities").is_some(), "wire: {value}");
         assert!(value.get("purpose").is_some(), "wire: {value}");
         assert!(value.get("output_ref").is_some(), "wire: {value}");
+        // `session_id` is omitted when `None` so the legacy wire shape
+        // round-trips byte-for-byte. The bound test below pins the
+        // present-on-the-wire spelling.
+        assert!(value.get("session_id").is_none(), "wire: {value}");
         let back: ClientMessage = serde_json::from_value(value).unwrap();
         assert_eq!(back, msg);
+    }
+
+    /// When the caller supplies a `session_id`, it appears on the wire
+    /// under that exact field name. Pinning the spelling here means a
+    /// drift to `audit_session_id` or `session` in a future refactor
+    /// fails this test rather than silently changing the broker
+    /// contract.
+    #[test]
+    fn run_agent_session_id_is_named_session_id_on_the_wire() {
+        let session_id = fixed_session_id();
+        let msg = ClientMessage::RunAgent {
+            prompt: AgentPrompt::new("p"),
+            capabilities: vec![],
+            purpose: "plan-submit".into(),
+            output_ref: NotesRef::try_new("refs/notes/writ/agent-outputs").unwrap(),
+            session_id: Some(session_id),
+        };
+        let value: serde_json::Value = serde_json::to_value(&msg).unwrap();
+        assert_eq!(
+            value["session_id"],
+            serde_json::Value::String(session_id.as_uuid().to_string()),
+            "wire: {value}",
+        );
+        let back: ClientMessage = serde_json::from_value(value).unwrap();
+        assert_eq!(back, msg);
+    }
+
+    /// A wire payload that omits `session_id` decodes as `None` —
+    /// preserves backward compatibility with the slice-A1 wire shape.
+    #[test]
+    fn run_agent_accepts_payload_without_session_id() {
+        let value = serde_json::json!({
+            "type": "run_agent",
+            "prompt": "p",
+            "capabilities": [],
+            "purpose": "legacy",
+            "output_ref": "refs/notes/writ/agent-outputs",
+        });
+        let back: ClientMessage = serde_json::from_value(value).unwrap();
+        match back {
+            ClientMessage::RunAgent { session_id, .. } => assert_eq!(session_id, None),
+            other => panic!("expected RunAgent, got {other:?}"),
+        }
     }
 
     /// `deny_unknown_fields` at the enum level catches a typo'd inner
@@ -2480,6 +2545,7 @@ mod tests {
                 }],
                 purpose: "plan-stage".into(),
                 output_ref: NotesRef::try_new("refs/notes/writ/agent-outputs").unwrap(),
+                session_id: Some(fixed_session_id()),
             },
             other => unreachable!("variant index out of range: {other}"),
         }
