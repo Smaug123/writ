@@ -20,13 +20,15 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use clap::{Parser, Subcommand};
+use clap::{ArgGroup, Parser, Subcommand};
 use tokio::sync::Mutex as AsyncMutex;
 
 use writ::agent_run::AgentPrompt;
-use writ::bailiff_plan_note::PlanId;
+use writ::bailiff_decision::{Decider, Decision};
+use writ::bailiff_plan_note::{DecisionNote, PlanId};
 use writ::bailiff_plan_submit::{SubmitPlanInputs, submit_plan};
-use writ::core::{AgentKind, CapabilitySet, NotesRef, RepoRef};
+use writ::bailiff_plan_write::{WriteDecisionNoteError, write_decision_note};
+use writ::core::{AgentKind, CapabilitySet, NotesRef, RepoRef, UnixMillis};
 use writ::notes_repo::NotesRepo;
 use writ::run_verify::AllowedSigners;
 use writ::server::default_socket_path;
@@ -122,6 +124,51 @@ enum PlanCmd {
         #[arg(long)]
         model: Option<String>,
     },
+    /// Record an operator verdict on a previously-submitted plan.
+    /// Exactly one of `--accept` / `--reject` is required.
+    ///
+    /// D1.3 deliberately decoupled the decision write from submission
+    /// presence — the verb succeeds even when no submission note
+    /// exists yet under the plan's ref. The only typed failure is
+    /// `DecisionAlreadyRecorded` (a duplicate decide for the same
+    /// plan id); the read-side `read_decision_note` is the predicate
+    /// future acceptance gates consult.
+    #[command(group(
+        ArgGroup::new("decide_outcome")
+            .required(true)
+            .args(["accept", "reject"]),
+    ))]
+    Decide {
+        /// Plan to rule on. Must parse as the canonical UUID form
+        /// `PlanId` prints.
+        #[arg(long)]
+        plan_id: PlanId,
+        /// Record the plan as accepted. Mutually exclusive with
+        /// `--reject`; clap's `ArgGroup` enforces exactly-one.
+        #[arg(long)]
+        accept: bool,
+        /// Record the plan as rejected. The plan is dead from
+        /// bailiff's perspective; the operator decides what (if
+        /// anything) to do next. No auto-restart.
+        #[arg(long)]
+        reject: bool,
+        /// Override the decider attribution recorded on the note.
+        /// Defaults to `cli:$USER`; the verb fails if neither flag
+        /// nor `$USER` is set — unlike writ's legacy `plan decide`
+        /// (which falls back to `cli:unknown`), bailiff treats an
+        /// unattributable verdict as an operator-config bug rather
+        /// than silently degrading audit value. Slice G deletes
+        /// writ's legacy verb so the divergence is temporary.
+        #[arg(long)]
+        decider: Option<String>,
+        /// Path to bailiff's bare git repo. Defaults to
+        /// `$XDG_DATA_HOME/bailiff/repo` (or
+        /// `~/.local/share/bailiff/repo` if `XDG_DATA_HOME` is
+        /// unset). Created on first use via
+        /// [`NotesRepo::init_or_open`].
+        #[arg(long)]
+        bailiff_repo: Option<PathBuf>,
+    },
 }
 
 fn parse_agent_kind(raw: &str) -> Result<AgentKind, String> {
@@ -176,6 +223,13 @@ async fn dispatch(cmd: Cmd, socket_path: PathBuf) -> Result<(), Box<dyn std::err
                 )
                 .await
             }
+            PlanCmd::Decide {
+                plan_id,
+                accept,
+                reject,
+                decider,
+                bailiff_repo,
+            } => plan_decide(plan_id, accept, reject, decider, bailiff_repo).await,
         },
     }
 }
@@ -286,6 +340,113 @@ fn default_writ_repo_path() -> PathBuf {
     xdg_data_subdir("writ/repo")
 }
 
+async fn plan_decide(
+    plan_id: PlanId,
+    accept: bool,
+    reject: bool,
+    decider: Option<String>,
+    bailiff_repo: Option<PathBuf>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let outcome = resolve_decision_outcome(accept, reject);
+    let user_env = std::env::var("USER").ok().filter(|s| !s.is_empty());
+    let decider = resolve_decider(decider, user_env)?;
+    let bailiff_repo_path = bailiff_repo.unwrap_or_else(default_bailiff_repo_path);
+
+    let note = DecisionNote {
+        plan_id,
+        outcome,
+        decider,
+        decided_at: UnixMillis::now(),
+    };
+
+    // Both `init_or_open` and `write_decision_note` shell out to git;
+    // run them on a blocking thread so the runtime stays responsive.
+    let bailiff_repo_path_for_init = bailiff_repo_path.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let repo = NotesRepo::init_or_open(bailiff_repo_path_for_init)?;
+        write_decision_note(&repo, &note).map_err(DecideError::Write)
+    })
+    .await
+    .map_err(|e| format!("decide task failed: {e}"))?;
+
+    match result {
+        Ok(_target_oid) => Ok(()),
+        Err(DecideError::OpenRepo(e)) => Err(format!(
+            "opening bailiff repo at {}: {e}",
+            bailiff_repo_path.display()
+        )
+        .into()),
+        Err(DecideError::Write(WriteDecisionNoteError::DecisionAlreadyRecorded {
+            plan_id,
+            target_oid,
+        })) => Err(format!(
+            "decision already recorded for plan {plan_id} at target {target_oid}; bailiff does not overwrite verdicts — submit a fresh plan if the operator wants to change course"
+        )
+        .into()),
+        Err(DecideError::Write(e)) => Err(format!("recording decision: {e}").into()),
+    }
+}
+
+/// Tagged failure modes for the `spawn_blocking` decide closure.
+/// Lets the post-await arm distinguish "the repo path is bad" from
+/// "the duplicate-decide invariant fired" so the caller-facing stderr
+/// is specific. Local to this binary; not part of any wire contract.
+enum DecideError {
+    OpenRepo(writ::notes_repo::NotesRepoError),
+    Write(WriteDecisionNoteError),
+}
+
+impl From<writ::notes_repo::NotesRepoError> for DecideError {
+    fn from(e: writ::notes_repo::NotesRepoError) -> Self {
+        DecideError::OpenRepo(e)
+    }
+}
+
+/// Map the parsed `--accept` / `--reject` flags to a [`Decision`].
+/// Clap's `ArgGroup` enforces exactly-one before we get here, so the
+/// `(false, false)` and `(true, true)` cases are unreachable in
+/// practice — they panic loudly rather than guess.
+fn resolve_decision_outcome(accept: bool, reject: bool) -> Decision {
+    match (accept, reject) {
+        (true, false) => Decision::Accepted,
+        (false, true) => Decision::Rejected,
+        (false, false) | (true, true) => {
+            unreachable!("clap ArgGroup enforces exactly one of --accept / --reject")
+        }
+    }
+}
+
+/// Resolve the [`Decider`] from the `--decider` flag or fall back to
+/// `cli:<user>` where `user` is the caller-supplied `$USER` value.
+/// Fails with a user-actionable message if neither source produces a
+/// non-empty value.
+///
+/// `user_env` is injected (not read from the live process) so tests
+/// don't have to mutate the global env — concurrent test execution
+/// in this binary used to race on `$USER`. Callers in `main()` pass
+/// `std::env::var("USER").ok().filter(|s| !s.is_empty())`.
+///
+/// Diverges from writ's legacy `plan decide`, which falls back to
+/// `cli:unknown` — see `PlanCmd::Decide`'s docstring for the
+/// reasoning. The fallback gap is small (writ's verb is going away in
+/// slice G) and the strictness is the bailiff-side default we want to
+/// keep.
+fn resolve_decider(
+    flag: Option<String>,
+    user_env: Option<String>,
+) -> Result<Decider, Box<dyn std::error::Error>> {
+    let raw = match flag {
+        Some(explicit) => explicit,
+        None => match user_env {
+            Some(u) => format!("cli:{u}"),
+            None => {
+                return Err("no --decider flag and $USER is unset; pass --decider <attribution> or set $USER before running `bailiff plan decide`".into());
+            }
+        },
+    };
+    Decider::try_new(raw.clone()).map_err(|e| format!("--decider {raw:?} rejected: {e}").into())
+}
+
 fn xdg_data_subdir(suffix: &str) -> PathBuf {
     if let Some(dir) = std::env::var_os("XDG_DATA_HOME") {
         PathBuf::from(dir).join(suffix)
@@ -334,7 +495,10 @@ mod tests {
                     agent,
                     model,
                 },
-        } = args.cmd;
+        } = args.cmd
+        else {
+            panic!("expected PlanCmd::Submit");
+        };
         assert_eq!(prompt_file, PathBuf::from("/tmp/p.txt"));
         assert_eq!(repo, "smaug123/writ");
         assert!(bailiff_repo.is_none());
@@ -393,7 +557,10 @@ mod tests {
                     model,
                     ..
                 },
-        } = args.cmd;
+        } = args.cmd
+        else {
+            panic!("expected PlanCmd::Submit");
+        };
         assert_eq!(
             bailiff_repo.as_deref(),
             Some(std::path::Path::new("/var/bailiff"))
@@ -407,6 +574,218 @@ mod tests {
         assert_eq!(label.as_deref(), Some("feature 42"));
         assert_eq!(agent, AgentKind::Codex);
         assert_eq!(model.as_deref(), Some("gpt-test"));
+    }
+
+    /// `bailiff plan decide` parses the minimum required flag set
+    /// (`--plan-id` plus exactly one of `--accept` / `--reject`) and
+    /// threads each argument into the corresponding field of
+    /// `PlanCmd::Decide`. A regression in the clap attribute set
+    /// (a renamed flag, a missing `ArgGroup`, a misspelled default)
+    /// surfaces here as a parse failure or a wrong field assignment.
+    #[test]
+    fn plan_decide_parses_minimum_required_flags() {
+        let plan_id_str = "1d1d1d1d-2d2d-3d3d-4d4d-5d5d5d5d5d5d";
+        let args = Args::try_parse_from([
+            "bailiff",
+            "plan",
+            "decide",
+            "--plan-id",
+            plan_id_str,
+            "--accept",
+        ])
+        .unwrap();
+        let Cmd::Plan {
+            action:
+                PlanCmd::Decide {
+                    plan_id,
+                    accept,
+                    reject,
+                    decider,
+                    bailiff_repo,
+                },
+        } = args.cmd
+        else {
+            panic!("expected PlanCmd::Decide");
+        };
+        assert_eq!(plan_id.to_string(), plan_id_str);
+        assert!(accept);
+        assert!(!reject);
+        assert!(
+            decider.is_none(),
+            "default decider derivation belongs to plan_decide, not the parser"
+        );
+        assert!(bailiff_repo.is_none());
+    }
+
+    /// Every optional flag round-trips, and `--reject` flips the
+    /// outcome from accept to reject. Together with the
+    /// minimum-required test this pins both halves of the
+    /// accept/reject group plus the optional flag surface.
+    #[test]
+    fn plan_decide_accepts_every_optional_flag_with_reject() {
+        let plan_id_str = "2d2d2d2d-3d3d-4d4d-5d5d-6d6d6d6d6d6d";
+        let args = Args::try_parse_from([
+            "bailiff",
+            "plan",
+            "decide",
+            "--plan-id",
+            plan_id_str,
+            "--reject",
+            "--decider",
+            "cli:alice",
+            "--bailiff-repo",
+            "/var/bailiff",
+        ])
+        .unwrap();
+        let Cmd::Plan {
+            action:
+                PlanCmd::Decide {
+                    plan_id,
+                    accept,
+                    reject,
+                    decider,
+                    bailiff_repo,
+                },
+        } = args.cmd
+        else {
+            panic!("expected PlanCmd::Decide");
+        };
+        assert_eq!(plan_id.to_string(), plan_id_str);
+        assert!(!accept);
+        assert!(reject);
+        assert_eq!(decider.as_deref(), Some("cli:alice"));
+        assert_eq!(
+            bailiff_repo.as_deref(),
+            Some(std::path::Path::new("/var/bailiff")),
+        );
+    }
+
+    /// Clap's `ArgGroup` on the outcome flags must reject both
+    /// `--accept` and `--reject`. A regression that drops the group
+    /// (or that uses `multiple = true`) would silently accept this
+    /// and make `resolve_decision_outcome`'s `(true, true)` branch
+    /// reachable from the CLI.
+    #[test]
+    fn plan_decide_rejects_both_accept_and_reject() {
+        let plan_id_str = "3d3d3d3d-4d4d-5d5d-6d6d-7d7d7d7d7d7d";
+        let err = Args::try_parse_from([
+            "bailiff",
+            "plan",
+            "decide",
+            "--plan-id",
+            plan_id_str,
+            "--accept",
+            "--reject",
+        ])
+        .err()
+        .expect("expected parse error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--accept") || msg.contains("--reject") || msg.contains("decide_outcome"),
+            "expected ArgGroup conflict, got: {msg}",
+        );
+    }
+
+    /// `ArgGroup::required(true)` must reject the no-outcome case.
+    /// A regression that drops `required(true)` would silently pass
+    /// `(accept=false, reject=false)` through and trip
+    /// `resolve_decision_outcome`'s `unreachable!`.
+    #[test]
+    fn plan_decide_rejects_neither_accept_nor_reject() {
+        let plan_id_str = "4d4d4d4d-5d5d-6d6d-7d7d-8d8d8d8d8d8d";
+        let err = Args::try_parse_from(["bailiff", "plan", "decide", "--plan-id", plan_id_str])
+            .err()
+            .expect("expected parse error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--accept") || msg.contains("--reject") || msg.contains("required"),
+            "expected required-arg-group failure, got: {msg}",
+        );
+    }
+
+    /// `--plan-id` is required; without it the parse fails. Pins the
+    /// clap surface — a regression to `Option<PlanId>` (a copy-paste
+    /// of `plan submit`'s opt-in shape) would silently accept this.
+    #[test]
+    fn plan_decide_rejects_missing_plan_id() {
+        let err = Args::try_parse_from(["bailiff", "plan", "decide", "--accept"])
+            .err()
+            .expect("expected parse error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--plan-id") || msg.contains("required"),
+            "expected missing-plan-id failure, got: {msg}",
+        );
+    }
+
+    /// `PlanId::from_str` runs at parse, so a malformed UUID is a
+    /// parse error rather than a runtime failure inside
+    /// `plan_decide`. Pins that the value_parser stays wired to the
+    /// validating constructor.
+    #[test]
+    fn plan_decide_rejects_malformed_plan_id() {
+        let err = Args::try_parse_from([
+            "bailiff",
+            "plan",
+            "decide",
+            "--plan-id",
+            "not-a-uuid",
+            "--accept",
+        ])
+        .err()
+        .expect("expected parse error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--plan-id") || msg.contains("uuid") || msg.contains("UUID"),
+            "expected malformed-plan-id failure, got: {msg}",
+        );
+    }
+
+    /// `resolve_decision_outcome` is the load-bearing
+    /// flag-to-`Decision` mapping. Pin both reachable branches —
+    /// a swap (`accept` → `Rejected`) would be catastrophically wrong
+    /// but invisible to the parser-only tests above.
+    #[test]
+    fn resolve_decision_outcome_maps_accept_and_reject() {
+        assert_eq!(resolve_decision_outcome(true, false), Decision::Accepted);
+        assert_eq!(resolve_decision_outcome(false, true), Decision::Rejected);
+    }
+
+    /// `resolve_decider` honours an explicit `--decider` flag
+    /// verbatim, ignoring the supplied `user_env`. The flag is the
+    /// override path scripted callers use; it must not be silently
+    /// overridden by the env-var fallback even when one is present.
+    #[test]
+    fn resolve_decider_honours_explicit_flag() {
+        let d = resolve_decider(Some("agent:run-xyz".into()), Some("alice".into())).unwrap();
+        assert_eq!(d.as_str(), "agent:run-xyz");
+    }
+
+    /// Without `--decider`, `resolve_decider` falls back to
+    /// `cli:<user_env>`. The env value is injected (not read from the
+    /// live process), so this is a pure function and doesn't race
+    /// with other tests in the same binary.
+    #[test]
+    fn resolve_decider_defaults_to_cli_user() {
+        let d = resolve_decider(None, Some("alice".into())).unwrap();
+        assert_eq!(d.as_str(), "cli:alice");
+    }
+
+    /// Without `--decider` and with `user_env = None`,
+    /// `resolve_decider` fails with a user-actionable message
+    /// mentioning both fallback sources. Diverges from writ's legacy
+    /// `plan decide` (which falls back to `cli:unknown`); the
+    /// `PlanCmd::Decide` docstring explains why. Pin the failure
+    /// shape so the divergence is intentional rather than a silent
+    /// regression.
+    #[test]
+    fn resolve_decider_fails_when_no_flag_and_no_user_env() {
+        let err = resolve_decider(None, None).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--decider") && msg.contains("USER"),
+            "expected actionable error mentioning both --decider and USER, got: {msg}",
+        );
     }
 
     /// `default_bailiff_repo_path` honours `XDG_DATA_HOME` when
