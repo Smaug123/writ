@@ -695,7 +695,7 @@ mod tests {
         let plan_id_str = "4d4d4d4d-5d5d-6d6d-7d7d-8d8d8d8d8d8d";
         let err = Args::try_parse_from(["bailiff", "plan", "decide", "--plan-id", plan_id_str])
             .err()
-        .expect("expected parse error");
+            .expect("expected parse error");
         let msg = err.to_string();
         assert!(
             msg.contains("--accept") || msg.contains("--reject") || msg.contains("required"),
