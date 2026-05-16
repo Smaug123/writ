@@ -57,6 +57,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         socket_path,
         audit_db,
         ui_http,
+        run_agent,
     } = config;
 
     let socket_path = args
@@ -99,20 +100,75 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         .transpose()?;
 
+    // Bind the broker Unix socket *before* anything that touches
+    // disk-shared singleton state (the signing key in the secret
+    // store, the agent-VM on-disk session ledger, the UI bearer
+    // file). Bind succeeds for exactly one process per socket path,
+    // so it is the cleanest ownership claim available; without this
+    // ordering, two concurrent first-boots could both reach
+    // `ensure_signing_key` and overwrite each other's freshly
+    // generated key, leaving the surviving daemon signing with a
+    // key that is no longer the stored trust anchor.
+    let broker_listener = prepare_broker_listener(&socket_path).await?;
+
+    let (notes_repo, signing_key, run_agent_spawn) = match run_agent.as_ref() {
+        Some(cfg) => {
+            let boot = cfg
+                .materialize(&*store)
+                .map_err(|e| format!("cannot materialize RunAgent state from config: {e}"))?;
+            let fingerprint = boot.signing.signing_key().fingerprint();
+            if boot.signing.was_generated() {
+                // Bailiff's `AllowedSigners::from_openssh_lines` parses
+                // the one-line OpenSSH public-key format, deriving the
+                // fingerprint internally. Logging the public-key line
+                // (not just the fingerprint) is what the operator
+                // actually needs to paste into the allowed-signers
+                // file.
+                let public_key_line = boot
+                    .signing
+                    .signing_key()
+                    .verifying_key()
+                    .to_openssh()
+                    .map_err(|e| {
+                        format!("cannot serialise newly-generated writ public key: {e}")
+                    })?;
+                tracing::warn!(
+                    fingerprint = %fingerprint,
+                    public_key = %public_key_line,
+                    secret_key = %cfg.signing_key_secret_or_default(),
+                    notes_repo_path = %boot.notes_repo.path().display(),
+                    "generated new writ signing key on first boot — \
+                     add the public_key line above to bailiff's \
+                     allowed-signers file",
+                );
+            } else {
+                tracing::info!(
+                    fingerprint = %fingerprint,
+                    notes_repo_path = %boot.notes_repo.path().display(),
+                    "loaded writ signing key from secret store",
+                );
+            }
+            (
+                Some(Arc::new(boot.notes_repo)),
+                Some(boot.signing.into_signing_key()),
+                Some(boot.spawn),
+            )
+        }
+        None => {
+            tracing::info!("RunAgent dispatch not configured; serving Error replies");
+            (None, None, None)
+        }
+    };
+
     let state = Arc::new(BrokerState {
         audit: Arc::new(audit),
         minter: GitHubMinter::new_registry(github_apps),
         secrets: store,
         policy,
         staging_store,
-        // Slice B4 lands the dispatch path; writd boot wiring for the
-        // notes-repo handle, signing-key load, and run-agent spawn
-        // command arrives in the follow-up slice that also adds the
-        // audit row. Until then the daemon serves RunAgent with an
-        // explicit "not configured" reply.
-        notes_repo: None,
-        signing_key: None,
-        run_agent_spawn: None,
+        notes_repo,
+        signing_key,
+        run_agent_spawn,
     });
 
     tracing::info!(
@@ -163,14 +219,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .into());
         }
     }
-    // Bind the broker Unix socket *before* the UI HTTP block. Binding
-    // is the singleton-ownership claim for this daemon installation:
-    // if another writd is already serving the socket, this fails with
-    // `AddrInUse` and we exit before touching the shared UI bearer
-    // file. Without this ordering, a doomed second start could rotate
-    // the bearer that the surviving daemon's clients still depend on.
-    let broker_listener = prepare_broker_listener(&socket_path).await?;
-
     if let Some(ui_http) = ui_http {
         ui_http.validate()?;
         // Inside this block we also bind the UI listener before

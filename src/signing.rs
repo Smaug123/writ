@@ -239,6 +239,18 @@ impl WritVerifyingKey {
         Ok(Self { inner })
     }
 
+    /// Emit the one-line OpenSSH public key (`ssh-ed25519 AAAA…
+    /// comment`) — the inverse of [`Self::from_openssh`] and the
+    /// format [`crate::run_verify::AllowedSigners::from_openssh_lines`]
+    /// accepts directly. Used at boot to print the freshly-generated
+    /// key in a form the operator can paste straight into bailiff's
+    /// allowed-signers file.
+    pub fn to_openssh(&self) -> Result<String, WritSigningKeyError> {
+        self.inner
+            .to_openssh()
+            .map_err(WritSigningKeyError::Serialize)
+    }
+
     /// SHA-256 fingerprint in the canonical `SHA256:<base64>` form.
     pub fn fingerprint(&self) -> SshKeyFingerprint {
         fingerprint_of(&self.inner)
@@ -688,6 +700,50 @@ mod tests {
         assert_eq!(
             load_signing_key(&store, &b).unwrap().fingerprint(),
             signer_b.fingerprint()
+        );
+    }
+
+    /// The OpenSSH public-key line emitted by `WritVerifyingKey::to_openssh`
+    /// must round-trip through `WritVerifyingKey::from_openssh` and yield
+    /// the same fingerprint. This pins the contract writd's first-boot
+    /// warning depends on: the line it logs is exactly what an operator
+    /// can paste into the file
+    /// `AllowedSigners::from_openssh_lines` parses.
+    #[test]
+    fn verifying_key_openssh_round_trips() {
+        let key = load();
+        let openssh = key.verifying_key().to_openssh().unwrap();
+        let reparsed = WritVerifyingKey::from_openssh(&openssh).unwrap();
+        assert_eq!(reparsed.fingerprint(), key.fingerprint());
+        // The emitted line must be in the bare `ssh-ed25519 AAAA…`
+        // shape — no PEM headers, no multi-line wrapping. Anything
+        // else would fail `AllowedSigners::from_openssh_lines`.
+        assert!(openssh.starts_with("ssh-ed25519 "));
+        assert!(!openssh.contains('\n'));
+    }
+
+    /// Round-trip a *freshly generated* key (not the fixture) through
+    /// both `to_openssh` and `AllowedSigners::from_openssh_lines`,
+    /// confirming the latter accepts the line writd's first-boot
+    /// warning will print. This is the end-to-end version of the
+    /// previous test — the previous test pins the emission shape;
+    /// this one pins the contract with `run_verify`.
+    #[test]
+    fn generated_verifying_key_parses_into_allowed_signers() {
+        use crate::run_verify::AllowedSigners;
+        let store = InMemStore::default();
+        let outcome = ensure_signing_key(&store, &store_key()).unwrap();
+        assert!(outcome.was_generated(), "first call generates");
+        let signer = outcome.into_signing_key();
+        let openssh = signer.verifying_key().to_openssh().unwrap();
+        let allowed = AllowedSigners::from_openssh_lines(&openssh)
+            .expect("emitted openssh line must parse as allowed-signers content");
+        // The generated key's fingerprint must be the one bailiff
+        // would index by — otherwise the warning is misleading.
+        assert!(
+            allowed.lookup(&signer.fingerprint()).is_some(),
+            "fingerprint {} not present in parsed allowed-signers",
+            signer.fingerprint(),
         );
     }
 }
