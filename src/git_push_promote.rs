@@ -16,14 +16,13 @@
 //! steps: nothing new was pushed, so there is nothing to upload and
 //! nothing to re-point.
 //!
-//! This module is the seam slice B1d will use to inject an
-//! App-identity commit signature: signing is a property of the
-//! per-commit upload step (the GitHub Git Data API accepts a
-//! detached PGP/SSH signature in the `signature` field of the
-//! `create_commit` request), which the walker already carries via
-//! [`TrailerSource`]. B1d will add a signing-trailer variant; this
-//! orchestrator forwards `trailers` through unchanged so the
-//! wire-up is a single-call-site change once the variant lands.
+//! App-identity commit signing is plumbed straight through to the
+//! walker: when `signing_key` is `Some(&key)`, every commit
+//! [`replay_commits`] uploads is signed (the `signature` field of
+//! GitHub's `create_commit` carries the resulting SSHSIG); when it is
+//! `None`, commits go out unsigned. The orchestrator does not look at
+//! the key — it only owns the question of whether the post-walk lease
+//! still holds.
 
 use crate::core::RepoRef;
 use crate::git_push_replay::TrailerSource;
@@ -31,6 +30,7 @@ use crate::git_push_replay_walker::{
     FastForwardPlan, GitObjectSource, ReplayError, replay_commits,
 };
 use crate::github_git_db::{GitDataClient, GitDataError};
+use crate::signing::WritSigningKey;
 use crate::vm_git::{GitBranchName, GitObjectId};
 
 /// Outcome of running [`execute_fast_forward_plan`].
@@ -174,10 +174,15 @@ pub enum ExecuteError {
 /// orchestrator did (nothing), which remains correct regardless
 /// of how the branch has since moved.
 ///
-/// `trailers` is forwarded to the walker untouched. Slice B1c uses
-/// `&[]` at every call site; slice B1d will introduce a
-/// signing-related trailer variant that mints the App-identity
-/// signature on every uploaded commit.
+/// `trailers` is forwarded to the walker untouched.
+///
+/// `signing_key` is also forwarded to the walker untouched. When
+/// `Some(&key)`, every commit the walker creates is published with
+/// an App-identity SSHSIG signature; when `None`, commits go out
+/// unsigned. The orchestrator does not inspect the key — it is the
+/// walker that builds the canonical bytes and signs them. The
+/// AlreadyAtExpected arm uploads no commits, so the key is unused
+/// in that path.
 ///
 /// ## Failure modes
 ///
@@ -204,6 +209,14 @@ pub enum ExecuteError {
 ///   at them yet. Re-running the orchestrator with the same plan
 ///   is idempotent: the walker short-circuits every already-mapped
 ///   commit, and `update_ref` retries against the same target.
+// One past clippy's argument-count threshold: each arg is a distinct
+// concern (transport, repo, branch, lease tip, object source, plan,
+// trailers, signing key) and the natural caller has them as separate
+// values, so bundling them into a struct adds boilerplate without
+// adding meaning. Revisit if a future slice (e.g. B1e wiring this
+// into the broker's HTTP handler) ends up packing them in a single
+// place anyway.
+#[allow(clippy::too_many_arguments)]
 pub async fn execute_fast_forward_plan<S: GitObjectSource>(
     client: &GitDataClient,
     repo: &RepoRef,
@@ -212,6 +225,7 @@ pub async fn execute_fast_forward_plan<S: GitObjectSource>(
     source: &S,
     plan: FastForwardPlan,
     trailers: &[TrailerSource],
+    signing_key: Option<&WritSigningKey>,
 ) -> Result<ExecuteOutcome, ExecuteError> {
     match plan {
         FastForwardPlan::AlreadyAtExpected { tip } => Ok(ExecuteOutcome::Noop { tip }),
@@ -227,7 +241,7 @@ pub async fn execute_fast_forward_plan<S: GitObjectSource>(
                 });
             }
             let (new_app_tip, _final_map) =
-                replay_commits(client, repo, source, &commits, seed, trailers).await?;
+                replay_commits(client, repo, source, &commits, seed, trailers, signing_key).await?;
             let actual_head_after =
                 client
                     .get_branch_head(repo, branch)
@@ -336,6 +350,7 @@ mod tests {
             &source,
             FastForwardPlan::AlreadyAtExpected { tip: tip.clone() },
             &[],
+            None,
         )
         .await
         .expect("noop must succeed");
@@ -443,6 +458,7 @@ mod tests {
                 seed,
             },
             &[],
+            None,
         )
         .await
         .expect("replay path ok");
@@ -514,6 +530,7 @@ mod tests {
                 seed,
             },
             &[],
+            None,
         )
         .await
         .expect_err("stale lease must be rejected");
@@ -585,6 +602,7 @@ mod tests {
                 seed,
             },
             &[],
+            None,
         )
         .await
         .expect_err("lease lookup failure must surface");
@@ -680,6 +698,7 @@ mod tests {
                 seed,
             },
             &[],
+            None,
         )
         .await
         .expect_err("post-replay lease miss must be rejected");
@@ -775,6 +794,7 @@ mod tests {
                 seed,
             },
             &[],
+            None,
         )
         .await
         .expect_err("post-replay lookup failure must surface");
@@ -848,6 +868,7 @@ mod tests {
                 seed,
             },
             &[],
+            None,
         )
         .await
         .expect_err("replay must surface walker error");
@@ -933,6 +954,7 @@ mod tests {
                 seed,
             },
             &[],
+            None,
         )
         .await
         .expect_err("update_ref failure must surface");
@@ -942,5 +964,126 @@ mod tests {
             }
             other => panic!("expected UpdateRef ApiError 422, got {other:?}"),
         }
+    }
+
+    /// `signing_key: Some(&key)` reaches the walker: the recorded
+    /// create_commit body carries an SSHSIG signature that verifies
+    /// under the `"git"` namespace against canonical bytes assembled
+    /// from the same wire fields. The walker's own tests already
+    /// cover the canonical-bytes ↔ signature relationship; this test
+    /// pins the *plumbing* — that `execute_fast_forward_plan`
+    /// forwards the key through without dropping or substituting it.
+    #[tokio::test]
+    async fn execute_threads_signing_key_to_walker_and_published_commit_is_signed() {
+        use crate::git_commit_sign::{CommitSigningInput, canonical_commit_bytes};
+        use crate::signing::{GIT_SSHSIG_NAMESPACE, WritSigningKey};
+        use ssh_key::SshSig;
+
+        const PRIVATE_PEM: &str = include_str!("../tests/fixtures/ed25519_test_signing.key");
+        const PUBLIC_OPENSSH: &str = include_str!("../tests/fixtures/ed25519_test_signing.key.pub");
+
+        let server = MockServer::start().await;
+        let expected = sample_object_id('a');
+        let empty_tree_app = sample_object_id('d');
+        let c1_app = sample_object_id('e');
+
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/name/git/ref/heads/main"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(ref_response_body(&expected)))
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/repos/owner/name/git/trees"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+                "sha": empty_tree_app.as_str(),
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/repos/owner/name/git/commits"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+                "sha": c1_app.as_str(),
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path("/repos/owner/name/git/refs/heads/main"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(ref_response_body(&c1_app)))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let c1 = sample_object_id('b');
+        let empty_tree_bundle = sample_object_id('1');
+        let author = sample_identity("Alice");
+        let committer = sample_identity("Bot");
+        let message = "signed commit\n";
+
+        let mut source = InMemoryGitObjectSource::new();
+        source.insert_tree(empty_tree_bundle.clone(), StagingTree { entries: vec![] });
+        source.insert_commit(
+            c1.clone(),
+            StagingCommit {
+                tree: empty_tree_bundle,
+                parents: vec![expected.clone()],
+                author: author.clone(),
+                committer: committer.clone(),
+                message: message.to_string(),
+            },
+        );
+        let mut seed = ShaMap::new();
+        seed.seed_commit_identity(expected.clone());
+
+        let key =
+            WritSigningKey::from_openssh_pem(PRIVATE_PEM).expect("fixture private key parses");
+        let client = client_against(&server, "ghs_fake_token");
+        let branch = GitBranchName::new("main").unwrap();
+        execute_fast_forward_plan(
+            &client,
+            &sample_repo(),
+            &branch,
+            &expected,
+            &source,
+            FastForwardPlan::Replay {
+                commits: vec![c1.clone()],
+                seed,
+            },
+            &[],
+            Some(&key),
+        )
+        .await
+        .expect("replay path ok");
+
+        // Pull the commit POST out of the captured requests and pin
+        // the signature.
+        let received = server.received_requests().await.expect("recording enabled");
+        let commit_post = received
+            .iter()
+            .find(|r| {
+                r.method == reqwest::Method::POST && r.url.path() == "/repos/owner/name/git/commits"
+            })
+            .expect("create_commit was issued");
+        let body: serde_json::Value =
+            serde_json::from_slice(&commit_post.body).expect("commit body is JSON");
+        let armored = body["signature"]
+            .as_str()
+            .expect("signing key was threaded so body has a string signature field");
+        let parsed: SshSig = armored.parse().expect("SSHSIG armor parses");
+
+        let canonical = canonical_commit_bytes(&CommitSigningInput {
+            tree: &empty_tree_app,
+            parents: std::slice::from_ref(&expected),
+            author: &author,
+            committer: &committer,
+            message,
+        })
+        .expect("canonicalise");
+        let pubk =
+            ssh_key::PublicKey::from_openssh(PUBLIC_OPENSSH).expect("fixture public key parses");
+        pubk.verify(GIT_SSHSIG_NAMESPACE, &canonical, &parsed)
+            .expect("execute forwarded the signing key — signature verifies");
     }
 }
