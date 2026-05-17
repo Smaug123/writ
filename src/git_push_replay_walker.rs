@@ -44,11 +44,22 @@
 //! The fast-forward case is the same shape with the upstream tip in
 //! place of `default_head`; that integration lands in a later slice.
 //!
-//! Signing (producing the detached PGP/SSH signature that drives
-//! GitHub's Verified badge) is also deferred: this walker always passes
-//! `signature: None` to [`crate::github_git_db::GitDataClient::create_commit`].
-//! The slot for it is the `signature` field on
-//! [`crate::github_git_db::CommitRequest`].
+//! Signing (the detached SSH signature that drives GitHub's Verified
+//! badge) is produced inline when [`replay_commits`] is called with
+//! `signing_key: Some(...)`. The walker builds a
+//! [`crate::git_commit_sign::CommitSigningInput`] from the same fields
+//! it sends in [`crate::github_git_db::CommitRequest`] — same tree,
+//! same parents, same author, same committer, same rendered message —
+//! and the resulting [`crate::core::SshSignature`] goes in the
+//! request's `signature` field. Because GitHub re-canonicalises the
+//! wire fields into the same byte form
+//! [`crate::git_commit_sign::canonical_commit_bytes`] produces, the
+//! signature verifies against the commit GitHub assembles and the
+//! published commit's `verification.verified` flag is true.
+//!
+//! Callers that do not want signed commits (test fixtures, the
+//! pre-promote bring-up flows) pass `None` and the request goes out
+//! with `signature: None`, matching the pre-B1d behaviour exactly.
 //!
 //! ## Topological pre-condition
 //!
@@ -66,11 +77,13 @@ use std::path::Path;
 use std::time::Duration;
 
 use crate::clean_git::{self, CleanGitError, CleanGitInvocation, clean_git_config_env};
-use crate::core::RepoRef;
+use crate::core::{RepoRef, SshSignature};
+use crate::git_commit_sign::{CommitSignError, CommitSigningInput, sign_commit_for_github};
 use crate::git_push_replay::TrailerSource;
 use crate::github_git_db::{
     CommitIdentity, CommitRequest, GitDataClient, GitDataError, TreeEntry, TreeEntryKind,
 };
+use crate::signing::WritSigningKey;
 use crate::vm_git::{GitObjectId, GitObjectIdError};
 
 /// One commit, as the walker needs to see it after parsing out of the
@@ -225,6 +238,24 @@ pub enum ReplayError {
         bundle_sha: String,
         parent_sha: String,
     },
+    /// Signing the canonical bytes of a commit that the walker
+    /// already built failed. Surfaces only when `replay_commits` was
+    /// called with `signing_key: Some(...)`. `bundle_sha` is the
+    /// staging-repo SHA of the commit whose signature failed so the
+    /// caller can correlate the failure with the agent's bundle.
+    ///
+    /// All three [`CommitSignError`] variants indicate bugs (a
+    /// [`CommitIdentity`] that bypassed validation, an `ssh-key`
+    /// crate failure, or an SSHSIG armorer that produced output the
+    /// wire-validation regex rejects) — none should occur with input
+    /// the walker itself constructs. The variant exists so the
+    /// failure surfaces with context rather than panicking.
+    #[error("signing replayed commit {bundle_sha} failed: {source}")]
+    Sign {
+        bundle_sha: String,
+        #[source]
+        source: CommitSignError,
+    },
 }
 
 /// Walk a topo-sorted list of bundle commit SHAs and upload each
@@ -244,6 +275,14 @@ pub enum ReplayError {
 ///   appear either earlier in `commits` or as a key in `seed`.
 /// * Each commit in `commits` is reachable from the bundle tip in the
 ///   staging repo (so `source.read_commit` will find it).
+///
+/// `signing_key` controls whether each replayed commit is published
+/// with a detached SSH signature in its `signature` field. `Some(key)`
+/// signs every commit in the chain (so GitHub publishes them with
+/// `verification.verified == true`); `None` sends each commit
+/// unsigned, the original behaviour. The same key is reused for every
+/// commit in the walk — signing different commits with different keys
+/// in a single walk is not supported.
 pub async fn replay_commits<S: GitObjectSource>(
     client: &GitDataClient,
     repo: &RepoRef,
@@ -251,12 +290,21 @@ pub async fn replay_commits<S: GitObjectSource>(
     commits: &[GitObjectId],
     seed: ShaMap,
     trailers: &[TrailerSource],
+    signing_key: Option<&WritSigningKey>,
 ) -> Result<(GitObjectId, ShaMap), ReplayError> {
     let mut map = seed;
     let mut last_app_sha: Option<GitObjectId> = None;
     for bundle_sha in commits {
-        let app_sha =
-            replay_one_commit(client, repo, source, &mut map, bundle_sha, trailers).await?;
+        let app_sha = replay_one_commit(
+            client,
+            repo,
+            source,
+            &mut map,
+            bundle_sha,
+            trailers,
+            signing_key,
+        )
+        .await?;
         last_app_sha = Some(app_sha);
     }
     let final_sha = last_app_sha.expect(
@@ -269,6 +317,14 @@ pub async fn replay_commits<S: GitObjectSource>(
 /// Upload one commit and its required object closure. Idempotent
 /// per-object: if a blob, tree, or commit's App-side SHA is already
 /// in `map`, no upload is performed.
+///
+/// When `signing_key` is `Some`, the canonical bytes of the
+/// already-built `CommitRequest` are signed and the resulting
+/// `SshSignature` is attached to the same request. The
+/// [`CommitSigningInput`] is built from the exact same fields the
+/// request carries (root App-side tree, App-side parents in order,
+/// author, committer, and the trailer-rendered message), so the
+/// signature matches the commit GitHub reassembles from the wire.
 async fn replay_one_commit<S: GitObjectSource>(
     client: &GitDataClient,
     repo: &RepoRef,
@@ -276,6 +332,7 @@ async fn replay_one_commit<S: GitObjectSource>(
     map: &mut ShaMap,
     bundle_sha: &GitObjectId,
     trailers: &[TrailerSource],
+    signing_key: Option<&WritSigningKey>,
 ) -> Result<GitObjectId, ReplayError> {
     if let Some(existing) = map.commit(bundle_sha) {
         return Ok(existing.clone());
@@ -300,13 +357,31 @@ async fn replay_one_commit<S: GitObjectSource>(
     }
 
     let message = render_message(&commit.message, trailers, bundle_sha);
+    let signature: Option<SshSignature> = match signing_key {
+        Some(key) => {
+            let input = CommitSigningInput {
+                tree: &root_app_sha,
+                parents: &parents,
+                author: &commit.author,
+                committer: &commit.committer,
+                message: &message,
+            };
+            Some(
+                sign_commit_for_github(key, &input).map_err(|source| ReplayError::Sign {
+                    bundle_sha: bundle_sha.as_str().to_string(),
+                    source,
+                })?,
+            )
+        }
+        None => None,
+    };
     let request = CommitRequest {
         tree: &root_app_sha,
         parents: &parents,
         message: &message,
         author: &commit.author,
         committer: &commit.committer,
-        signature: None,
+        signature: signature.as_ref().map(SshSignature::as_str),
     };
     let new_sha = client.create_commit(repo, &request).await?;
     map.commits.insert(bundle_sha.clone(), new_sha.clone());
@@ -1484,6 +1559,7 @@ mod tests {
             std::slice::from_ref(&commit_sha),
             ShaMap::new(),
             &[],
+            None,
         )
         .await
         .expect("walker ok");
@@ -1590,10 +1666,17 @@ mod tests {
         seed.seed_commit_identity(upstream.clone());
 
         let client = client_against(&server, "ghs_fake_token");
-        let (final_sha, map) =
-            replay_commits(&client, &sample_repo(), &source, &commit_bundle, seed, &[])
-                .await
-                .expect("walker ok");
+        let (final_sha, map) = replay_commits(
+            &client,
+            &sample_repo(),
+            &source,
+            &commit_bundle,
+            seed,
+            &[],
+            None,
+        )
+        .await
+        .expect("walker ok");
 
         assert_eq!(final_sha, commit_app[1]);
         assert_eq!(map.commit_count(), 3); // upstream + 2 replayed
@@ -1805,6 +1888,7 @@ mod tests {
             ],
             seed,
             &[],
+            None,
         )
         .await
         .expect("walker ok");
@@ -1939,6 +2023,7 @@ mod tests {
             &[commit_a_bundle.clone(), commit_b_bundle.clone()],
             ShaMap::new(),
             &[],
+            None,
         )
         .await
         .expect("walker ok");
@@ -2046,6 +2131,7 @@ mod tests {
             std::slice::from_ref(&commit_bundle),
             ShaMap::new(),
             &[],
+            None,
         )
         .await
         .expect("walker ok");
@@ -2110,6 +2196,7 @@ mod tests {
             &[commit_bundle],
             ShaMap::new(),
             &trailers,
+            None,
         )
         .await
         .expect("walker ok");
@@ -2153,6 +2240,7 @@ mod tests {
             std::slice::from_ref(&commit_bundle),
             ShaMap::new(),
             &[],
+            None,
         )
         .await
         .expect_err("unmapped parent must abort the walk");
@@ -2239,6 +2327,7 @@ mod tests {
             std::slice::from_ref(&commit_bundle),
             ShaMap::new(),
             &[],
+            None,
         )
         .await
         .expect("walker handles submodule entries");
@@ -2249,6 +2338,292 @@ mod tests {
         // The submodule SHA does not appear in the commit map either
         // — we don't claim to have replayed it on this repo.
         assert_eq!(map.commit(&submodule_sha), None);
+    }
+
+    // ----- signing-key plumbing tests -----------------------------
+
+    /// Test fixture: parse the in-tree Ed25519 signing key so the
+    /// walker tests can drive the `Some(&key)` path.
+    fn load_test_signing_key() -> WritSigningKey {
+        const PRIVATE_PEM: &str = include_str!("../tests/fixtures/ed25519_test_signing.key");
+        WritSigningKey::from_openssh_pem(PRIVATE_PEM).expect("fixture key parses")
+    }
+
+    /// Test fixture: matching public key for verifying SSHSIG output
+    /// the walker generated.
+    fn load_test_public_key() -> ssh_key::PublicKey {
+        const PUBLIC_OPENSSH: &str = include_str!("../tests/fixtures/ed25519_test_signing.key.pub");
+        ssh_key::PublicKey::from_openssh(PUBLIC_OPENSSH).expect("fixture public key parses")
+    }
+
+    /// Drive `replay_commits` with `signing_key: Some(&key)` for a
+    /// single-commit chain and assert the create_commit POST body
+    /// carries an SSHSIG signature that verifies under the `"git"`
+    /// namespace against the canonical bytes
+    /// [`crate::git_commit_sign::canonical_commit_bytes`] would
+    /// produce for the same wire fields. This is the property the
+    /// promotion path leans on: GitHub verifies the signature against
+    /// the bytes it re-canonicalises from the wire body, so a
+    /// signature that round-trips under our own canonicaliser is the
+    /// same bytes GitHub will see.
+    #[tokio::test]
+    async fn replay_with_signing_key_sends_verifiable_signature_to_create_commit() {
+        use crate::git_commit_sign::{CommitSigningInput, canonical_commit_bytes};
+        use crate::signing::GIT_SSHSIG_NAMESPACE;
+        use ssh_key::SshSig;
+
+        let server = MockServer::start().await;
+        let commit_bundle = sample_object_id('1');
+        let tree_bundle = sample_object_id('2');
+        let tree_app = sample_object_id('a');
+        let commit_app = sample_object_id('b');
+
+        let author = sample_identity("Alice");
+        let committer = sample_identity("Bot");
+        let message = "subject\n\nbody\n";
+
+        let mut source = InMemoryGitObjectSource::new();
+        source.insert_tree(tree_bundle.clone(), StagingTree { entries: vec![] });
+        source.insert_commit(
+            commit_bundle.clone(),
+            StagingCommit {
+                tree: tree_bundle.clone(),
+                parents: vec![],
+                author: author.clone(),
+                committer: committer.clone(),
+                message: message.to_string(),
+            },
+        );
+        mount_tree_create(&server, json!({ "tree": [] }), &tree_app).await;
+
+        // Loose matcher (method + path only): the signature bytes are
+        // produced by ssh-key and not necessarily stable across
+        // releases of the crate, so a strict body matcher is the
+        // wrong contract. We assert the *property* (signature
+        // verifies against the canonical bytes) after the call.
+        Mock::given(method("POST"))
+            .and(path("/repos/owner/name/git/commits"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+                "sha": commit_app.as_str(),
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let key = load_test_signing_key();
+        let client = client_against(&server, "ghs_fake_token");
+        let (final_sha, _) = replay_commits(
+            &client,
+            &sample_repo(),
+            &source,
+            std::slice::from_ref(&commit_bundle),
+            ShaMap::new(),
+            &[],
+            Some(&key),
+        )
+        .await
+        .expect("walker ok");
+        assert_eq!(final_sha, commit_app);
+
+        // Pull the captured request and pin both shape and signing.
+        let received = server
+            .received_requests()
+            .await
+            .expect("wiremock recording enabled");
+        let commit_post = received
+            .iter()
+            .find(|r| r.url.path() == "/repos/owner/name/git/commits")
+            .expect("commit POST should have been issued");
+        let body: serde_json::Value =
+            serde_json::from_slice(&commit_post.body).expect("commit body is JSON");
+        assert_eq!(body["tree"], json!(tree_app.as_str()));
+        assert_eq!(body["parents"], json!([]));
+        assert_eq!(body["message"], json!(message));
+        let armored = body["signature"]
+            .as_str()
+            .expect("signing key threaded → body has a string signature field");
+        let parsed: SshSig = armored.parse().expect("SSHSIG armor parses");
+
+        let expected_canonical = canonical_commit_bytes(&CommitSigningInput {
+            tree: &tree_app,
+            parents: &[],
+            author: &author,
+            committer: &committer,
+            message,
+        })
+        .expect("canonicalise");
+        load_test_public_key()
+            .verify(GIT_SSHSIG_NAMESPACE, &expected_canonical, &parsed)
+            .expect("walker-produced signature verifies under the git namespace");
+    }
+
+    /// Every commit in a two-commit chain is independently signed,
+    /// not just the first or last. Regression pin: a refactor that
+    /// signed only the final commit (e.g. by hoisting the signing
+    /// step out of `replay_one_commit`) would let unsigned commits
+    /// land on GitHub and publish without the Verified badge.
+    #[tokio::test]
+    async fn replay_with_signing_key_signs_every_commit_in_a_chain() {
+        use crate::git_commit_sign::{CommitSigningInput, canonical_commit_bytes};
+        use crate::signing::GIT_SSHSIG_NAMESPACE;
+        use ssh_key::SshSig;
+
+        let server = MockServer::start().await;
+        let tree_bundle = sample_object_id('1');
+        let tree_app = sample_object_id('a');
+        let c0_bundle = sample_object_id('2');
+        let c1_bundle = sample_object_id('3');
+        let c0_app = sample_object_id('b');
+        let c1_app = sample_object_id('c');
+
+        let author = sample_identity("Alice");
+        let committer = sample_identity("Bot");
+
+        let mut source = InMemoryGitObjectSource::new();
+        source.insert_tree(tree_bundle.clone(), StagingTree { entries: vec![] });
+        source.insert_commit(
+            c0_bundle.clone(),
+            StagingCommit {
+                tree: tree_bundle.clone(),
+                parents: vec![],
+                author: author.clone(),
+                committer: committer.clone(),
+                message: "c0\n".to_string(),
+            },
+        );
+        source.insert_commit(
+            c1_bundle.clone(),
+            StagingCommit {
+                tree: tree_bundle.clone(),
+                parents: vec![c0_bundle.clone()],
+                author: author.clone(),
+                committer: committer.clone(),
+                message: "c1\n".to_string(),
+            },
+        );
+        mount_tree_create(&server, json!({ "tree": [] }), &tree_app).await;
+
+        // Two POSTs to /git/commits, sequenced by .up_to_n_times(1)
+        // + a second mount so each one returns its own SHA.
+        Mock::given(method("POST"))
+            .and(path("/repos/owner/name/git/commits"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+                "sha": c0_app.as_str(),
+            })))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/repos/owner/name/git/commits"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+                "sha": c1_app.as_str(),
+            })))
+            .mount(&server)
+            .await;
+
+        let key = load_test_signing_key();
+        let client = client_against(&server, "ghs_fake_token");
+        let (final_sha, _) = replay_commits(
+            &client,
+            &sample_repo(),
+            &source,
+            &[c0_bundle.clone(), c1_bundle.clone()],
+            ShaMap::new(),
+            &[],
+            Some(&key),
+        )
+        .await
+        .expect("walker ok");
+        assert_eq!(final_sha, c1_app);
+
+        let received = server.received_requests().await.expect("recording enabled");
+        let commit_posts: Vec<_> = received
+            .iter()
+            .filter(|r| r.url.path() == "/repos/owner/name/git/commits")
+            .collect();
+        assert_eq!(commit_posts.len(), 2, "one POST per commit in the chain");
+
+        let pubk = load_test_public_key();
+        for (post, (expected_parents, expected_message)) in commit_posts.iter().zip([
+            (Vec::<GitObjectId>::new(), "c0\n"),
+            (vec![c0_app.clone()], "c1\n"),
+        ]) {
+            let body: serde_json::Value =
+                serde_json::from_slice(&post.body).expect("commit body is JSON");
+            let armored = body["signature"]
+                .as_str()
+                .expect("every commit must carry a signature");
+            let parsed: SshSig = armored.parse().expect("SSHSIG armor parses");
+            let canonical = canonical_commit_bytes(&CommitSigningInput {
+                tree: &tree_app,
+                parents: &expected_parents,
+                author: &author,
+                committer: &committer,
+                message: expected_message,
+            })
+            .expect("canonicalise");
+            pubk.verify(GIT_SSHSIG_NAMESPACE, &canonical, &parsed)
+                .expect("each chain commit signs under its own canonical bytes");
+        }
+    }
+
+    /// Regression pin against an inverted-Option bug: when
+    /// `signing_key` is `None`, the request body must omit the
+    /// `signature` field entirely (not send an empty string or a
+    /// `null`). GitHub treats both as malformed.
+    #[tokio::test]
+    async fn replay_without_signing_key_omits_signature_field_from_body() {
+        let server = MockServer::start().await;
+        let commit_bundle = sample_object_id('1');
+        let tree_bundle = sample_object_id('2');
+        let tree_app = sample_object_id('a');
+        let commit_app = sample_object_id('b');
+
+        let mut source = InMemoryGitObjectSource::new();
+        source.insert_tree(tree_bundle.clone(), StagingTree { entries: vec![] });
+        source.insert_commit(
+            commit_bundle.clone(),
+            StagingCommit {
+                tree: tree_bundle.clone(),
+                parents: vec![],
+                author: sample_identity("Alice"),
+                committer: sample_identity("Bot"),
+                message: "x\n".to_string(),
+            },
+        );
+        mount_tree_create(&server, json!({ "tree": [] }), &tree_app).await;
+        Mock::given(method("POST"))
+            .and(path("/repos/owner/name/git/commits"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+                "sha": commit_app.as_str(),
+            })))
+            .mount(&server)
+            .await;
+
+        let client = client_against(&server, "ghs_fake_token");
+        replay_commits(
+            &client,
+            &sample_repo(),
+            &source,
+            std::slice::from_ref(&commit_bundle),
+            ShaMap::new(),
+            &[],
+            None,
+        )
+        .await
+        .expect("walker ok");
+
+        let received = server.received_requests().await.expect("recording enabled");
+        let commit_post = received
+            .iter()
+            .find(|r| r.url.path() == "/repos/owner/name/git/commits")
+            .expect("commit POST should have been issued");
+        let body: serde_json::Value =
+            serde_json::from_slice(&commit_post.body).expect("commit body is JSON");
+        assert!(
+            body.get("signature").is_none(),
+            "None signing key must produce a body with no signature field, got: {body}"
+        );
     }
 
     // ----- plan_branch_creation_via_rev_list tests ----------------
@@ -2889,6 +3264,7 @@ mod tests {
             &plan_commits,
             plan_seed,
             &[],
+            None,
         )
         .await
         .expect("replay ok");
@@ -3241,6 +3617,7 @@ mod tests {
             &plan_commits,
             plan_seed,
             &[],
+            None,
         )
         .await
         .expect("replay ok");
