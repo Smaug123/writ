@@ -71,6 +71,7 @@ use crate::bailiff_plan_read::{
     read_implement_note, read_plan_body_bytes, read_plan_note,
 };
 use crate::bailiff_plan_write::{WriteImplementNoteError, write_implement_note};
+use crate::bailiff_repo_guard::BailiffRepoGuard;
 use crate::core::{AgentKind, CapabilitySet, NotesRef, SessionId};
 use crate::notes_repo::NotesRepo;
 use crate::run_verify::AllowedSigners;
@@ -157,11 +158,16 @@ pub struct SubmitImplementOutcome {
 
 /// Drive the full plan-implement workflow against a live writ broker.
 ///
-/// `bailiff_repo` is taken as an [`Arc`]`<`[`AsyncMutex`]`<_>>` so
-/// the single-writer invariant on bailiff's bare repo is visible at
-/// the call site and the workflow can compose with other in-flight
-/// bailiff operations sharing the same handle (today there are none,
-/// but the lock makes the contract explicit).
+/// `bailiff_repo` is taken as an [`Arc`]`<`[`AsyncMutex`]`<_>>` so the
+/// single-writer invariant on bailiff's bare repo can be enforced for
+/// the whole workflow: [`submit_implement`] acquires the lock via
+/// [`BailiffRepoGuard`] before reading the decision and duplicate
+/// gates and releases it only on return. Holding the guard across the
+/// gate-then-write sequence is what makes the duplicate gate
+/// load-bearing for in-process callers — without it two concurrent
+/// `submit_implement` calls could both pass `read_implement_note` and
+/// then both open `WorkspaceWrite` sessions whose side effects no
+/// later `write_implement_note` rejection can undo.
 pub async fn submit_implement(
     client: &WritClient,
     bailiff_repo: Arc<AsyncMutex<NotesRepo>>,
@@ -169,60 +175,68 @@ pub async fn submit_implement(
     allowed_signers: AllowedSigners,
     inputs: SubmitImplementInputs,
 ) -> Result<SubmitImplementOutcome, SubmitImplementError> {
+    // Hold the bailiff-repo lock across the entire workflow — pre-RPC
+    // gates, opens, run, write, close — so concurrent submit_*/bailiff
+    // workflows serialise instead of racing the gate-then-write
+    // sequence. Released on function return.
+    let mut bailiff = BailiffRepoGuard::acquire(bailiff_repo).await;
+
     // Pre-RPC: read the submission note, read the decision note (and
-    // gate on it being an `accepted` verdict), fetch+verify+decode
-    // the planner envelope. Done before opening a session so any
-    // missing or unverifiable precondition never burns a writ audit
-    // row.
+    // gate on it being an `accepted` verdict), gate on the absence of
+    // an existing implement note, fetch+verify+decode the planner
+    // envelope. Done before opening a session so any missing or
+    // unverifiable precondition never burns a writ audit row.
     let plan_id = inputs.plan_id;
     let writ_repo_path_owned = writ_repo_path.to_path_buf();
     let writ_output_ref_for_read = inputs.writ_output_ref.clone();
     let allowed_for_read = allowed_signers.clone();
-    let bailiff_for_read = Arc::clone(&bailiff_repo);
-    let read_outcome = tokio::task::spawn_blocking(
-        move || -> Result<(PlanNote, String), SubmitImplementError> {
-            let bailiff = bailiff_for_read.blocking_lock();
-            let plan_note = match read_plan_note(&bailiff, plan_id)
-                .map_err(SubmitImplementError::ReadPlanNote)?
-            {
-                Some(note) => note,
-                None => return Err(SubmitImplementError::PlanSubmissionMissing { plan_id }),
-            };
-            let decision = match read_decision_note(&bailiff, plan_id)
-                .map_err(SubmitImplementError::ReadDecisionNote)?
-            {
-                Some(note) => note,
-                None => return Err(SubmitImplementError::PlanNotDecided { plan_id }),
-            };
-            if decision.outcome != Decision::Accepted {
-                return Err(SubmitImplementError::PlanRejected { plan_id });
-            }
-            // Duplicate gate: if an implement note already exists,
-            // refuse before opening a session. The implementer holds
-            // `WorkspaceWrite`, so a re-run can push a second set of
-            // changes even though `write_implement_note` would reject
-            // the bailiff-side write. The gate has to fire before
-            // `open_session`, not after, to keep the broker from
-            // running the agent at all.
-            if read_implement_note(&bailiff, plan_id)
-                .map_err(SubmitImplementError::ReadImplementNote)?
-                .is_some()
-            {
-                return Err(SubmitImplementError::AlreadyImplemented { plan_id });
-            }
-            let body = read_plan_body_bytes(
-                &bailiff,
-                &writ_repo_path_owned,
-                &writ_output_ref_for_read,
-                &plan_note,
-                &allowed_for_read,
-            )
-            .map_err(SubmitImplementError::ReadPlanEnvelope)?;
-            Ok((plan_note, body))
-        },
-    )
-    .await
-    .map_err(SubmitImplementError::ReadTaskFailed)?;
+    let read_outcome = bailiff
+        .run_blocking(
+            move |repo| -> Result<(PlanNote, String), SubmitImplementError> {
+                let plan_note = match read_plan_note(repo, plan_id)
+                    .map_err(SubmitImplementError::ReadPlanNote)?
+                {
+                    Some(note) => note,
+                    None => return Err(SubmitImplementError::PlanSubmissionMissing { plan_id }),
+                };
+                let decision = match read_decision_note(repo, plan_id)
+                    .map_err(SubmitImplementError::ReadDecisionNote)?
+                {
+                    Some(note) => note,
+                    None => return Err(SubmitImplementError::PlanNotDecided { plan_id }),
+                };
+                if decision.outcome != Decision::Accepted {
+                    return Err(SubmitImplementError::PlanRejected { plan_id });
+                }
+                // Duplicate gate: if an implement note already exists,
+                // refuse before opening a session. The implementer
+                // holds `WorkspaceWrite`, so a re-run can push a
+                // second set of changes even though
+                // `write_implement_note` would reject the bailiff-side
+                // write. The workflow-held guard makes the gate
+                // atomic against concurrent in-process callers: the
+                // second caller blocks on `acquire` until the first
+                // either writes the implement note (so this read
+                // returns `Some`) or fails and releases.
+                if read_implement_note(repo, plan_id)
+                    .map_err(SubmitImplementError::ReadImplementNote)?
+                    .is_some()
+                {
+                    return Err(SubmitImplementError::AlreadyImplemented { plan_id });
+                }
+                let body = read_plan_body_bytes(
+                    repo,
+                    &writ_repo_path_owned,
+                    &writ_output_ref_for_read,
+                    &plan_note,
+                    &allowed_for_read,
+                )
+                .map_err(SubmitImplementError::ReadPlanEnvelope)?;
+                Ok((plan_note, body))
+            },
+        )
+        .await
+        .map_err(SubmitImplementError::ReadTaskFailed)?;
     let (_plan_note, plan_body) = read_outcome?;
 
     let implementer_prompt =
@@ -270,26 +284,26 @@ pub async fn submit_implement(
         });
     }
 
-    // `write_implement_note` shells out to git; wrap in `spawn_blocking`
-    // and hold the bailiff-repo lock for the blocking section only.
+    // `write_implement_note` is blocking (shells out to git). Run
+    // under the workflow-held guard so the lock spans this section
+    // and the surrounding awaits without being re-acquired here.
     let writ_repo_path_owned = writ_repo_path.to_path_buf();
     let writ_output_ref_clone = inputs.writ_output_ref.clone();
     let purpose_clone = inputs.purpose.clone();
     let completed_clone = completed.clone();
-    let bailiff_for_write = Arc::clone(&bailiff_repo);
-    let write_outcome = tokio::task::spawn_blocking(move || {
-        let bailiff = bailiff_for_write.blocking_lock();
-        write_implement_note(
-            &bailiff,
-            &writ_repo_path_owned,
-            &writ_output_ref_clone,
-            plan_id,
-            purpose_clone,
-            &completed_clone,
-            &allowed_signers,
-        )
-    })
-    .await;
+    let write_outcome = bailiff
+        .run_blocking(move |repo| {
+            write_implement_note(
+                repo,
+                &writ_repo_path_owned,
+                &writ_output_ref_clone,
+                plan_id,
+                purpose_clone,
+                &completed_clone,
+                &allowed_signers,
+            )
+        })
+        .await;
     let implement_note_oid = match write_outcome {
         Ok(Ok(oid)) => oid,
         Ok(Err(source)) => {
@@ -1017,6 +1031,117 @@ mod end_to_end_tests {
         .expect("implement note must be readable");
         let note = ImplementNote::from_canonical_bytes(&body).unwrap();
         assert_eq!(note.writ_output_oid, first_run_output_oid);
+
+        broker_task.abort();
+        let _ = broker_task.await;
+    }
+
+    /// Concurrent `submit_implement` against the same plan: exactly
+    /// one call must succeed and every other must surface
+    /// `AlreadyImplemented` — the *pre-RPC* duplicate-gate variant,
+    /// never the post-RPC
+    /// [`WriteImplementNoteError::ImplementAlreadyRecorded`] that
+    /// `write_implement_note` would surface if two callers both
+    /// reached the write step.
+    ///
+    /// Witnesses the in-process atomicity invariant
+    /// [`BailiffRepoGuard`] is the primitive of: the
+    /// `read_implement_note` gate and the `write_implement_note` call
+    /// happen under one held lock, so a second caller blocks on
+    /// `acquire` until the first has either landed the implement note
+    /// (so the gate fires) or failed and released (so the next caller
+    /// is free to proceed). Without the workflow-spanning guard a
+    /// concurrent duplicate could pass the gate, open a
+    /// `WorkspaceWrite` session, run the agent, and only fail at the
+    /// terminal `write_implement_note` step — by which time the
+    /// implementer's side effects are already loose.
+    #[tokio::test]
+    async fn concurrent_submit_implement_serialises_on_the_duplicate_gate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let signing_key = WritSigningKey::from_openssh_pem(SIGNING_PEM).unwrap();
+        let (state, socket_path, broker_task) = spawn_broker(&tmp, signing_key.clone()).await;
+
+        let bailiff_repo = NotesRepo::init_or_open(tmp.path().join("bailiff-bare")).unwrap();
+        let bailiff = Arc::new(AsyncMutex::new(bailiff_repo));
+        let writ_repo_path = state.notes_repo.as_ref().unwrap().path().to_path_buf();
+        let allowed = AllowedSigners::from_openssh_lines(SIGNING_PUB).unwrap();
+        let client = WritClient::new(&socket_path);
+
+        let plan_body = "# Plan\n\nDo a thing.\n";
+        let plan_id =
+            record_submission(&bailiff, &client, &writ_repo_path, &allowed, plan_body).await;
+        record_decision(&bailiff, plan_id, Decision::Accepted).await;
+
+        // Three concurrent calls is enough to exercise the
+        // queue-on-`acquire` path while keeping the test runtime
+        // modest. `tokio::join!` polls the three futures on a single
+        // task, which is exactly the in-process-concurrency case the
+        // guard exists to make atomic.
+        let call = |label: &str| {
+            let label = label.to_string();
+            let client_ref = &client;
+            let bailiff = Arc::clone(&bailiff);
+            let writ_repo_path = writ_repo_path.clone();
+            let allowed = allowed.clone();
+            async move {
+                tokio::time::timeout(
+                    Duration::from_secs(30),
+                    submit_implement(
+                        client_ref,
+                        bailiff,
+                        &writ_repo_path,
+                        allowed,
+                        implement_inputs(plan_id),
+                    ),
+                )
+                .await
+                .unwrap_or_else(|_| panic!("submit_implement ({label}) must complete within 30s"))
+            }
+        };
+        let (a, b, c) = tokio::join!(call("a"), call("b"), call("c"));
+        let outcomes = [a, b, c];
+
+        let successes: Vec<_> = outcomes.iter().filter_map(|r| r.as_ref().ok()).collect();
+        let failures: Vec<_> = outcomes.iter().filter_map(|r| r.as_ref().err()).collect();
+        assert_eq!(
+            successes.len(),
+            1,
+            "exactly one concurrent submit_implement must succeed; outcomes = {outcomes:?}",
+        );
+        assert_eq!(
+            failures.len(),
+            2,
+            "the other two concurrent calls must fail; outcomes = {outcomes:?}",
+        );
+        for err in &failures {
+            match err {
+                SubmitImplementError::AlreadyImplemented { plan_id: found } => {
+                    assert_eq!(*found, plan_id);
+                }
+                SubmitImplementError::WriteImplementNote { .. } => panic!(
+                    "duplicate must trip the pre-RPC gate, not the write-side idempotency \
+                     check; got: {err:?}",
+                ),
+                other => panic!("expected AlreadyImplemented, got: {other:?}"),
+            }
+        }
+
+        // All three sessions writ recorded must be closed — both the
+        // succeeding caller and the two callers that surfaced
+        // `AlreadyImplemented` before opening any session leave a
+        // tidy audit trail. The losers never opened sessions, so
+        // only the winner's session id should appear in the log.
+        let winner_session = successes[0].implementer_session_id;
+        let audit = Arc::clone(&state.audit);
+        let row = tokio::task::spawn_blocking(move || audit.get_session(winner_session))
+            .await
+            .unwrap()
+            .expect("audit read must succeed")
+            .expect("winner session must exist in audit log");
+        assert!(
+            row.closed_at.is_some(),
+            "winner session must close after submit_implement returns",
+        );
 
         broker_task.abort();
         let _ = broker_task.await;
