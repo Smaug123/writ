@@ -221,6 +221,27 @@ impl GitPushStagingStore {
         Ok(StagedEntry { receipt, bundle })
     }
 
+    /// Look up one staged push's receipt by `request_id` without reading
+    /// the bundle bytes. Returns `Ok(None)` when no staging entry exists
+    /// (the natural state for an id that was approved/rejected and had
+    /// its directory removed), `Ok(Some)` on hit, and `Err` only on a
+    /// genuine corruption / IO problem for an entry that does exist.
+    ///
+    /// This is the "ID-driven" counterpart to [`Self::list`]: a caller
+    /// that already knows which request ids it cares about (e.g. from an
+    /// audit-side join) can avoid scanning the whole staging directory
+    /// and is therefore not exposed to malformed sibling entries that
+    /// happen to share the staging root.
+    pub fn try_load_receipt(
+        &self,
+        request_id: RequestId,
+    ) -> Result<Option<VmGitPushStagedReceipt>, StagingError> {
+        if !self.staged_path(request_id).exists() {
+            return Ok(None);
+        }
+        self.load_receipt(request_id).map(Some)
+    }
+
     fn staged_path(&self, request_id: RequestId) -> PathBuf {
         self.root.join(STAGED_DIR).join(request_id.to_string())
     }

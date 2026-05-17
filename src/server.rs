@@ -341,41 +341,13 @@ async fn list_staged_pushes<S: SecretStore + Send + Sync + 'static>(
     let Some(staging_store) = state.staging_store.clone() else {
         return staging_not_configured();
     };
-    // The staging store is sync; hop it off the async runtime so a
-    // directory-walk on a slow filesystem doesn't block other connections.
-    let receipts = match tokio::task::spawn_blocking(move || staging_store.list()).await {
-        Ok(Ok(receipts)) => receipts,
-        Ok(Err(err)) => {
-            return ServerMessage::Error {
-                message: err.to_string(),
-            };
-        }
-        Err(err) => {
-            return ServerMessage::Error {
-                message: format!("staging list task failed: {err}"),
-            };
-        }
-    };
 
-    let receipts = if let Some(session_id) = session_id {
-        // Filter against the audit-side set of request ids recorded for
-        // this session. The staging receipt on disk does not carry
-        // `session_id` (the guest VM that produced it does not see audit
-        // identifiers), so the join must go through the audit DB.
-        //
-        // A session with no staged pushes returns an empty result —
-        // distinct from "unknown session" because the audit DB has no
-        // "must-exist" check at this layer. Treating the empty answer as
-        // a non-error is the right call: `list_staged_pushes` is a
-        // listing operation, and "the result is empty" is a valid
-        // listing.
-        let audit = Arc::clone(&state.audit);
-        let allowed: std::collections::HashSet<RequestId> = match tokio::task::spawn_blocking(
-            move || audit.list_git_pushes_for_session(session_id),
-        )
-        .await
-        {
-            Ok(Ok(rows)) => rows.into_iter().map(|row| row.push_request_id).collect(),
+    let receipts = match session_id {
+        // No filter: scan the whole staging directory. Sync work hops
+        // off the async runtime so a directory-walk on a slow
+        // filesystem doesn't block other connections.
+        None => match tokio::task::spawn_blocking(move || staging_store.list()).await {
+            Ok(Ok(receipts)) => receipts,
             Ok(Err(err)) => {
                 return ServerMessage::Error {
                     message: err.to_string(),
@@ -383,16 +355,74 @@ async fn list_staged_pushes<S: SecretStore + Send + Sync + 'static>(
             }
             Err(err) => {
                 return ServerMessage::Error {
-                    message: format!("audit list task failed: {err}"),
+                    message: format!("staging list task failed: {err}"),
                 };
             }
-        };
-        receipts
-            .into_iter()
-            .filter(|r| allowed.contains(&r.push_request_id()))
-            .collect()
-    } else {
-        receipts
+        },
+        // Session filter: drive the lookup off the audit log, which is
+        // the source of truth for which request ids belong to a given
+        // session. Loading by id (rather than scanning every staging
+        // dir and then filtering) keeps the filtered path's blast
+        // radius scoped to the entries the audit log actually names:
+        // an unrelated malformed sibling directory (e.g. left by
+        // external tampering) won't surface as an error from a
+        // session-filtered call it has nothing to do with.
+        //
+        // Audit rows whose staging directory is gone (the natural state
+        // for a previously approved/rejected push) are silently skipped:
+        // the request id is part of the session's history but the
+        // staged entry is no longer waiting for review. A staging entry
+        // that is *present but corrupt* for an audit-named id is still
+        // a real broker invariant violation and surfaces as Error — the
+        // audit log promised this entry; if it doesn't parse, the
+        // operator should see that, not get an empty list.
+        Some(session_id) => {
+            let audit = Arc::clone(&state.audit);
+            let request_ids: Vec<RequestId> = match tokio::task::spawn_blocking(move || {
+                audit.list_git_pushes_for_session(session_id)
+            })
+            .await
+            {
+                Ok(Ok(rows)) => rows.into_iter().map(|row| row.push_request_id).collect(),
+                Ok(Err(err)) => {
+                    return ServerMessage::Error {
+                        message: err.to_string(),
+                    };
+                }
+                Err(err) => {
+                    return ServerMessage::Error {
+                        message: format!("audit list task failed: {err}"),
+                    };
+                }
+            };
+
+            // Per-id staging reads on one blocking task (rather than
+            // spawn_blocking per id) keeps the task-spawn overhead
+            // bounded on sessions with many pushes.
+            let load = tokio::task::spawn_blocking(move || {
+                let mut receipts = Vec::with_capacity(request_ids.len());
+                for id in request_ids {
+                    if let Some(receipt) = staging_store.try_load_receipt(id)? {
+                        receipts.push(receipt);
+                    }
+                }
+                Ok::<_, StagingError>(receipts)
+            })
+            .await;
+            match load {
+                Ok(Ok(receipts)) => receipts,
+                Ok(Err(err)) => {
+                    return ServerMessage::Error {
+                        message: err.to_string(),
+                    };
+                }
+                Err(err) => {
+                    return ServerMessage::Error {
+                        message: format!("staging load task failed: {err}"),
+                    };
+                }
+            }
+        }
     };
 
     let pushes = receipts
@@ -2973,6 +3003,53 @@ mod tests {
             other => panic!("expected StagedPushes, got {other:?}"),
         };
         assert_eq!(pushes.len(), 2);
+    }
+
+    /// Codex R4 P2: a session-filtered listing must not be broken by an
+    /// unrelated malformed staging dir. The audit log names the request
+    /// ids that belong to the session, and we load only those — so a
+    /// corrupt sibling dir (e.g. left by external tampering or an
+    /// interrupted write) is invisible to the filtered call.
+    #[tokio::test]
+    async fn list_staged_pushes_with_session_filter_ignores_unrelated_malformed_dir() {
+        let server = MockServer::start().await;
+        let (state, _tmp) = make_state_with_staging(&server);
+        let session_id = open_session(&state).await;
+
+        let real = stage_with_audit(
+            &state,
+            session_id,
+            b"real".to_vec(),
+            UnixMillis::from_millis(1_700_000_010_000),
+            UnixMillis::from_millis(1_700_000_010_500),
+        )
+        .await;
+
+        // Drop a malformed directory into the staging root that has no
+        // audit row and a name we never look up. Pre-fix this would
+        // make `staging_store.list()` fail and surface as an error from
+        // the filtered call.
+        let staging_root = state.staging_store.as_ref().unwrap().root().to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            let bogus = staging_root.join("staged").join("not-a-uuid");
+            std::fs::create_dir_all(&bogus).unwrap();
+        })
+        .await
+        .unwrap();
+
+        let resp = dispatch_message(
+            ClientMessage::ListStagedPushes {
+                session_id: Some(session_id),
+            },
+            &state,
+        )
+        .await;
+        let pushes = match resp {
+            ServerMessage::StagedPushes { pushes } => pushes,
+            other => panic!("expected StagedPushes, got {other:?}"),
+        };
+        assert_eq!(pushes.len(), 1);
+        assert_eq!(pushes[0].push_request_id, real);
     }
 
     #[tokio::test]
