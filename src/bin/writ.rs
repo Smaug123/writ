@@ -124,8 +124,16 @@ enum PlanCmd {
 
 #[derive(Subcommand)]
 enum PromoteCmd {
-    /// List every staged push the broker is holding for review.
-    List,
+    /// List every staged push the broker is holding for review, optionally
+    /// filtered to one audit session. Filtering exists so an operator (or
+    /// the bailiff promote workflow) can isolate the pushes a single run
+    /// produced without scanning every pending staged entry on disk.
+    List {
+        /// Audit session id to restrict the listing to. When omitted, the
+        /// broker returns every staged push it is holding.
+        #[arg(long)]
+        session_id: Option<String>,
+    },
     /// Show the full detail of one staged push, including its audit context.
     Show { request_id: String },
     /// Reject a staged push: records the operator decision in the audit
@@ -446,8 +454,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
         },
         Cmd::Promote { action } => match action {
-            PromoteCmd::List => {
-                let msg = ClientMessage::ListStagedPushes {};
+            PromoteCmd::List { session_id } => {
+                let session_id = session_id
+                    .map(|raw| {
+                        raw.parse::<SessionId>()
+                            .map_err(|e| format!("invalid session id: {e}"))
+                    })
+                    .transpose()?;
+                let msg = ClientMessage::ListStagedPushes { session_id };
                 match call(&socket_path, &msg)? {
                     ServerMessage::StagedPushes { mut pushes } => {
                         // Disk iteration order is unspecified; sort here so the
