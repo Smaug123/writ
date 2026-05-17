@@ -8,7 +8,7 @@
 //! the per-commit walker that orchestrates them lives in
 //! [`crate::git_push_replay_walker`].
 //!
-//! Two endpoint families are wrapped:
+//! Three endpoint families are wrapped:
 //!
 //! * POST `git/blobs`, `git/trees`, `git/commits` — the create-side
 //!   primitives the walker uses to upload bundle objects one at a time.
@@ -18,6 +18,9 @@
 //!   new branch with no prior `expected_remote_head`. The tip is then
 //!   fetched into the staging repo and passed by SHA to
 //!   [`crate::git_push_replay_walker::plan_branch_creation_via_rev_list`].
+//! * PATCH `repos/{o}/{r}/git/refs/heads/{branch}` — the publish step
+//!   the promote workflow uses to fast-forward the App-side branch
+//!   to the new commit chain the walker uploaded.
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
@@ -361,6 +364,65 @@ impl GitDataClient {
         }
         Ok(parsed.object.sha)
     }
+
+    /// `PATCH /repos/{owner}/{repo}/git/refs/heads/{branch}` —
+    /// fast-forward the named branch to `new_head`.
+    ///
+    /// `force` is hard-coded to `false` at this layer rather than
+    /// exposed as a parameter. The broker's promote workflow only
+    /// ever publishes an App-identity commit chain that the walker
+    /// built from the App-side branch tip the workflow itself looked
+    /// up, so a non-fast-forward update would mean the walker
+    /// produced a chain that does not descend from the branch tip we
+    /// started from — a broker invariant violation rather than a
+    /// thing to paper over with a force flag. A 422 from GitHub (the
+    /// "not a fast forward" status code) therefore surfaces as a
+    /// regular `ApiError` so the operator sees it.
+    ///
+    /// The endpoint path uses the plural `refs` (vs. the singular
+    /// `ref` used by `GET`). This is the actual GitHub URL grammar,
+    /// not a typo; the per-method asymmetry is documented at
+    /// <https://docs.github.com/en/rest/git/refs>.
+    ///
+    /// Returns `Ok(())` on a 2xx from GitHub. The 200 response carries
+    /// the ref object, but the SHA in it is what we just sent —
+    /// comparing it adds no information that the status code did not
+    /// already convey.
+    pub async fn update_ref(
+        &self,
+        repo: &RepoRef,
+        branch: &GitBranchName,
+        new_head: &GitObjectId,
+    ) -> Result<(), GitDataError> {
+        let encoded_branch = percent_encode_ref_segment(branch.as_str());
+        let url = format!(
+            "{}/repos/{}/{}/git/refs/heads/{}",
+            self.api_base.trim_end_matches('/'),
+            repo.owner,
+            repo.name,
+            encoded_branch,
+        );
+        let body = UpdateRefBody {
+            sha: new_head,
+            force: false,
+        };
+        let response = self
+            .http
+            .patch(&url)
+            .bearer_auth(&self.token)
+            .header("Accept", ACCEPT_HEADER)
+            .header("X-GitHub-Api-Version", API_VERSION_HEADER)
+            .header("User-Agent", USER_AGENT_HEADER)
+            .json(&body)
+            .send()
+            .await?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(GitDataError::ApiError { status, body });
+        }
+        Ok(())
+    }
 }
 
 /// One row in a tree being uploaded to GitHub. The kind constrains
@@ -593,6 +655,17 @@ struct CommitIdentityWire<'a> {
 #[derive(serde::Deserialize)]
 struct CommitCreateResponse {
     sha: GitObjectId,
+}
+
+/// `PATCH /repos/{owner}/{repo}/git/refs/heads/{branch}` body. The
+/// `force` field is always serialised (rather than relying on
+/// GitHub's documented `force=false` default) so the wire trace is
+/// self-describing: an operator inspecting a captured request sees
+/// the intent explicitly rather than having to know the default.
+#[derive(serde::Serialize)]
+struct UpdateRefBody<'a> {
+    sha: &'a GitObjectId,
+    force: bool,
 }
 
 /// Subset of `GET /repos/{owner}/{repo}` we care about. The
@@ -1658,5 +1731,175 @@ mod tests {
             matches!(err, GitDataError::Http(_)),
             "GitObjectId rejection surfaces as transport error: {err:?}",
         );
+    }
+
+    #[tokio::test]
+    async fn update_ref_sends_patch_with_sha_and_force_false_returns_ok_on_200() {
+        let server = MockServer::start().await;
+        let new_head = sample_object_id('a');
+        Mock::given(method("PATCH"))
+            .and(path("/repos/owner/name/git/refs/heads/main"))
+            .and(header("Accept", ACCEPT_HEADER))
+            .and(header("X-GitHub-Api-Version", API_VERSION_HEADER))
+            .and(header("User-Agent", USER_AGENT_HEADER))
+            .and(header("Authorization", "Bearer ghs_fake_token"))
+            .and(body_json(json!({
+                "sha": new_head.as_str(),
+                "force": false,
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ref": "refs/heads/main",
+                "object": { "sha": new_head.as_str(), "type": "commit" },
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = client_against(&server, "ghs_fake_token");
+        let branch = GitBranchName::new("main").unwrap();
+        client
+            .update_ref(&sample_repo(), &branch, &new_head)
+            .await
+            .expect("fast-forward update ok");
+    }
+
+    /// Regression: the URL-grammar asymmetry between `GET .../ref/...`
+    /// (singular) and `PATCH .../refs/...` (plural) is the actual
+    /// GitHub API. A typo here is undetectable by clippy/typechecker
+    /// and would 404 silently against the real API, so the path is
+    /// asserted explicitly.
+    #[tokio::test]
+    async fn update_ref_uses_plural_refs_path_segment() {
+        let server = MockServer::start().await;
+        let new_head = sample_object_id('b');
+        Mock::given(method("PATCH"))
+            .and(path("/repos/owner/name/git/refs/heads/main"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ref": "refs/heads/main",
+                "object": { "sha": new_head.as_str(), "type": "commit" },
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        // A separate mount that responds 404 to the singular path —
+        // if `update_ref` accidentally used `.../ref/...` this mock
+        // would match and the test would fail.
+        Mock::given(method("PATCH"))
+            .and(path("/repos/owner/name/git/ref/heads/main"))
+            .respond_with(
+                ResponseTemplate::new(404).set_body_json(json!({"message": "wrong path"})),
+            )
+            .mount(&server)
+            .await;
+
+        let client = client_against(&server, "ghs_fake_token");
+        let branch = GitBranchName::new("main").unwrap();
+        client
+            .update_ref(&sample_repo(), &branch, &new_head)
+            .await
+            .expect("plural `refs` path must reach the mock");
+    }
+
+    /// A 422 from GitHub is the documented "not a fast forward"
+    /// failure mode. The body carries the GitHub-side reason and must
+    /// reach the operator unchanged so they can distinguish "the
+    /// walker chain doesn't descend from the current tip" from other
+    /// 422 cases (e.g. malformed sha).
+    #[tokio::test]
+    async fn update_ref_surfaces_422_as_api_error_with_body() {
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path("/repos/owner/name/git/refs/heads/main"))
+            .respond_with(
+                ResponseTemplate::new(422)
+                    .set_body_json(json!({"message": "Update is not a fast forward"})),
+            )
+            .mount(&server)
+            .await;
+
+        let client = client_against(&server, "ghs_fake_token");
+        let branch = GitBranchName::new("main").unwrap();
+        let err = client
+            .update_ref(&sample_repo(), &branch, &sample_object_id('c'))
+            .await
+            .expect_err("422 must surface as ApiError");
+        match err {
+            GitDataError::ApiError { status, body } => {
+                assert_eq!(status.as_u16(), 422);
+                assert!(
+                    body.contains("not a fast forward"),
+                    "ApiError body must echo GitHub's reason: {body:?}",
+                );
+            }
+            other => panic!("expected ApiError, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn update_ref_surfaces_5xx_as_api_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path("/repos/owner/name/git/refs/heads/main"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("upstream unavailable"))
+            .mount(&server)
+            .await;
+
+        let client = client_against(&server, "ghs_fake_token");
+        let branch = GitBranchName::new("main").unwrap();
+        let err = client
+            .update_ref(&sample_repo(), &branch, &sample_object_id('d'))
+            .await
+            .expect_err("5xx must surface as ApiError");
+        match err {
+            GitDataError::ApiError { status, body } => {
+                assert_eq!(status.as_u16(), 503);
+                assert_eq!(body, "upstream unavailable");
+            }
+            other => panic!("expected ApiError, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn update_ref_percent_encodes_url_reserved_bytes_in_branch_name() {
+        let server = MockServer::start().await;
+        let new_head = sample_object_id('e');
+        Mock::given(method("PATCH"))
+            .and(path("/repos/owner/name/git/refs/heads/release%231"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ref": "refs/heads/release#1",
+                "object": { "sha": new_head.as_str(), "type": "commit" },
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = client_against(&server, "ghs_fake_token");
+        let branch = GitBranchName::new("release#1").unwrap();
+        client
+            .update_ref(&sample_repo(), &branch, &new_head)
+            .await
+            .expect("URL-reserved bytes must be percent-encoded");
+    }
+
+    #[tokio::test]
+    async fn update_ref_passes_slashes_in_branch_name_through_url_path() {
+        let server = MockServer::start().await;
+        let new_head = sample_object_id('f');
+        Mock::given(method("PATCH"))
+            .and(path("/repos/owner/name/git/refs/heads/feature/foo"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ref": "refs/heads/feature/foo",
+                "object": { "sha": new_head.as_str(), "type": "commit" },
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = client_against(&server, "ghs_fake_token");
+        let branch = GitBranchName::new("feature/foo").unwrap();
+        client
+            .update_ref(&sample_repo(), &branch, &new_head)
+            .await
+            .expect("nested branch ref must pass slashes through");
     }
 }
