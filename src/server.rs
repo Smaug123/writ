@@ -317,6 +317,10 @@ pub async fn dispatch_message_with_agent_vm<S: SecretStore + Send + Sync + 'stat
             operator,
             reason,
         } => reject_staged_push(state, request_id, operator, reason).await,
+        ClientMessage::ApproveStagedPush {
+            request_id,
+            operator,
+        } => approve_staged_push(state, request_id, operator).await,
         ClientMessage::ListPlans { correlation_id } => list_plans(state, correlation_id).await,
         ClientMessage::ShowPlan { plan_id } => show_plan(state, plan_id).await,
         ClientMessage::DecidePlan {
@@ -880,6 +884,28 @@ async fn reject_staged_push<S: SecretStore + Send + Sync + 'static>(
         Err(err) => ServerMessage::Error {
             message: format!("staging delete task failed: {err}"),
         },
+    }
+}
+
+/// Stub handler for [`ClientMessage::ApproveStagedPush`].
+///
+/// Slice B1e.1 lands the wire types and the dispatch arm so the proxy
+/// surface freezes at the boundary before the real promote pipeline
+/// lands. The actual mint + staging-repo build + ingest + plan + walk +
+/// ref-update + audit-write sequence is split into a follow-up slice
+/// (B1e.2) so each PR stays small enough for a focused review — the
+/// same wire-first split slice A1 used for [`ClientMessage::RunAgent`].
+///
+/// The returned [`ServerMessage::Error`] is self-describing so an
+/// operator (or a future reviewer) can locate the plan slice from the
+/// response alone.
+async fn approve_staged_push<S: SecretStore + Send + Sync + 'static>(
+    _state: &Arc<BrokerState<S>>,
+    _request_id: RequestId,
+    _operator: String,
+) -> ServerMessage {
+    ServerMessage::Error {
+        message: "ApproveStagedPush dispatch is not yet wired up (slice B1e.2)".into(),
     }
 }
 
@@ -3388,6 +3414,65 @@ mod tests {
 
         // Staging directory must still be present: the audit insert failed
         // before commit-then-delete could touch the filesystem.
+        assert!(
+            state
+                .staging_store
+                .as_ref()
+                .unwrap()
+                .load(request_id)
+                .is_ok()
+        );
+    }
+
+    // --- Staged-push approve (stub) -------------------------------------
+
+    /// Slice B1e.1 lands the wire types and dispatch arm only; the real
+    /// mint + replay + signing + audit pipeline lands in B1e.2. The stub
+    /// must surface as a `slice B1e.2` Error so an operator (or future
+    /// reviewer) can locate the plan from the response alone, and must
+    /// emit that Error *without* touching the audit log or staging
+    /// directory — promotion is the only client-message side-effect the
+    /// real handler will have, and a stub that wrote half of it would
+    /// be more dangerous than one that wrote none.
+    #[tokio::test]
+    async fn approve_staged_push_dispatch_returns_slice_b1e_2_error() {
+        let server = MockServer::start().await;
+        let (state, _tmp) = make_state_with_staging(&server);
+        let session_id = open_session(&state).await;
+        let request_id = stage_with_staged_outcome(
+            &state,
+            session_id,
+            b"bundle".to_vec(),
+            UnixMillis::from_millis(1_700_000_040_000),
+            UnixMillis::from_millis(1_700_000_040_500),
+        )
+        .await;
+
+        let resp = dispatch_message(
+            ClientMessage::ApproveStagedPush {
+                request_id,
+                operator: "alice".into(),
+            },
+            &state,
+        )
+        .await;
+
+        match resp {
+            ServerMessage::Error { message } => {
+                assert!(
+                    message.contains("B1e.2"),
+                    "Error must name the follow-up slice so the plan is locatable; got: {message}",
+                );
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+
+        // No audit resolution row was written: the stub must not commit
+        // half of a promotion. The follow-up slice owns this transition.
+        let audit_entry = state.audit.get_git_push(request_id).unwrap().unwrap();
+        assert!(audit_entry.resolution.is_none());
+
+        // Staging dir is still there: nothing was deleted.
         assert!(
             state
                 .staging_store

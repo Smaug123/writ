@@ -464,6 +464,31 @@ pub enum ClientMessage {
         operator: String,
         reason: RejectionReason,
     },
+    /// Record an operator decision to approve a VM-staged push: the
+    /// broker should mint an installation token, walk the staged
+    /// bundle's commits onto GitHub under the App's identity, signing
+    /// each one, point the branch at the resulting tip, write the
+    /// audit resolution row, and delete the staging directory. Replies
+    /// with [`ServerMessage::StagedPushApproved`] on success,
+    /// [`ServerMessage::UnknownStagedPush`] if the staging directory is
+    /// gone, or [`ServerMessage::StagedPushAlreadyResolved`] if a prior
+    /// decision is already recorded against this request id.
+    ///
+    /// `operator` is the human identity the broker records in the
+    /// audit row. The host CLI captures `$USER` and sends it; the
+    /// broker is not the source of authentication and trusts whatever
+    /// the local-socket peer asserts (the socket itself is the trust
+    /// boundary).
+    ///
+    /// Slice B1e.1 lands the request type only. Dispatch returns
+    /// [`ServerMessage::Error`] until slice B1e.2 wires up the real
+    /// mint + replay + signing + audit pipeline; this matches the
+    /// same wire-first / handler-second split slice A1 used for
+    /// [`ClientMessage::RunAgent`].
+    ApproveStagedPush {
+        request_id: RequestId,
+        operator: String,
+    },
     /// List every plan recorded in the audit log, optionally filtered
     /// to those whose planner run carries `correlation_id`. Replies
     /// with [`ServerMessage::Plans`].
@@ -608,11 +633,25 @@ pub enum ServerMessage {
     /// push it asked to reject when scripting against the daemon.
     StagedPushRejected { request_id: RequestId },
     /// The staged push referenced by [`ClientMessage::RejectStagedPush`]
-    /// already has a recorded operator decision. Distinct from
+    /// or [`ClientMessage::ApproveStagedPush`] already has a recorded
+    /// operator decision. Distinct from
     /// [`ServerMessage::UnknownStagedPush`] and [`ServerMessage::Error`]
     /// so a replay surfaces as an explicit "already decided" outcome
     /// rather than a prose error string.
     StagedPushAlreadyResolved { request_id: RequestId },
+    /// Acknowledges [`ClientMessage::ApproveStagedPush`]: the audit
+    /// resolution row was written, the bundle's commits were replayed
+    /// onto GitHub under the App's identity, and the branch on GitHub
+    /// has been updated to point at `new_app_tip` — the App-side
+    /// commit SHA the walker produced for the last commit in the
+    /// topo-sorted walk. Carrying both `request_id` and `new_app_tip`
+    /// lets the CLI confirm both the exact push it asked to approve
+    /// and the SHA the bailiff should attach its terminal-output note
+    /// to.
+    StagedPushApproved {
+        request_id: RequestId,
+        new_app_tip: GitObjectId,
+    },
     /// Listing of plans returned by [`ClientMessage::ListPlans`].
     /// Ordered ascending by `submitted_at` with rowid as the
     /// tie-break, matching the DAO query.
@@ -726,6 +765,14 @@ impl std::fmt::Debug for ServerMessage {
             Self::StagedPushAlreadyResolved { request_id } => f
                 .debug_struct("StagedPushAlreadyResolved")
                 .field("request_id", request_id)
+                .finish(),
+            Self::StagedPushApproved {
+                request_id,
+                new_app_tip,
+            } => f
+                .debug_struct("StagedPushApproved")
+                .field("request_id", request_id)
+                .field("new_app_tip", new_app_tip)
                 .finish(),
             Self::Plans { plans } => f.debug_struct("Plans").field("plans", plans).finish(),
             Self::Plan { plan } => f.debug_struct("Plan").field("plan", plan).finish(),
@@ -1223,6 +1270,16 @@ mod tests {
     }
 
     #[test]
+    fn approve_staged_push_roundtrips() {
+        let msg = ClientMessage::ApproveStagedPush {
+            request_id: sample_request_id(),
+            operator: "alice".into(),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert_eq!(serde_json::from_str::<ClientMessage>(&json).unwrap(), msg);
+    }
+
+    #[test]
     fn rejection_reason_empty_is_rejected() {
         let err = RejectionReason::try_new("").unwrap_err();
         assert!(matches!(err, RejectionReasonError::Empty));
@@ -1519,6 +1576,16 @@ mod tests {
     fn staged_push_already_resolved_roundtrips() {
         let msg = ServerMessage::StagedPushAlreadyResolved {
             request_id: sample_request_id(),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert_eq!(serde_json::from_str::<ServerMessage>(&json).unwrap(), msg);
+    }
+
+    #[test]
+    fn staged_push_approved_roundtrips() {
+        let msg = ServerMessage::StagedPushApproved {
+            request_id: sample_request_id(),
+            new_app_tip: sample_object_id('e'),
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert_eq!(serde_json::from_str::<ServerMessage>(&json).unwrap(), msg);
@@ -1990,6 +2057,25 @@ mod tests {
             })
             .unwrap();
         assert_eq!(resolved["type"], "staged_push_already_resolved");
+
+        let approve: serde_json::Value = serde_json::to_value(ClientMessage::ApproveStagedPush {
+            request_id: sample_request_id(),
+            operator: "alice".into(),
+        })
+        .unwrap();
+        assert_eq!(approve["type"], "approve_staged_push");
+        assert_eq!(approve["operator"], "alice");
+
+        let approved: serde_json::Value = serde_json::to_value(ServerMessage::StagedPushApproved {
+            request_id: sample_request_id(),
+            new_app_tip: sample_object_id('e'),
+        })
+        .unwrap();
+        assert_eq!(approved["type"], "staged_push_approved");
+        assert_eq!(
+            approved["new_app_tip"],
+            serde_json::Value::String(sample_object_id('e').as_str().to_string()),
+        );
     }
 
     /// `unknown_staged_push` carries its own type tag so a client
@@ -2493,7 +2579,7 @@ mod tests {
         /// variant, and assert the result fails to parse.
         #[test]
         fn client_message_rejects_unknown_top_level_fields(
-            variant_index in 0usize..14,
+            variant_index in 0usize..15,
             // ASCII-letters-only key, excluded against the union of every
             // variant's known field names below.
             unknown_key in "[a-z]{1,16}",
@@ -2594,6 +2680,10 @@ mod tests {
                 purpose: "plan-stage".into(),
                 output_ref: NotesRef::try_new("refs/notes/writ/agent-outputs").unwrap(),
                 session_id: Some(fixed_session_id()),
+            },
+            14 => ClientMessage::ApproveStagedPush {
+                request_id: "12345678-1234-1234-1234-123456789012".parse().unwrap(),
+                operator: "alice".into(),
             },
             other => unreachable!("variant index out of range: {other}"),
         }
