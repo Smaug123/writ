@@ -681,24 +681,34 @@ pub enum FastForwardPlanError {
          {line:?} ({reason})"
     )]
     InvalidRevListOutput { line: String, reason: String },
-    /// The bundle is not a fast-forward of `expected_remote_head`.
+    /// The bundle is not a fast-forward of `expected_remote_head`:
+    /// `expected_remote_head` is not an ancestor of `bundle_tip`.
     ///
-    /// Detected by inspecting the boundary commits `rev-list
-    /// --boundary` emits: `rev-list --boundary ^expected_remote_head
-    /// bundle_tip` emitted interesting commits but no boundary,
-    /// meaning no ancestor of `bundle_tip` is reachable from
-    /// `expected_remote_head`. Either the agent force-pushed, or the
-    /// bundle was constructed against a different baseline than the
-    /// `expected_remote_head` the staged receipt declares. Refusing
-    /// here keeps the broker from publishing a chain that doesn't
-    /// descend from the branch tip the agent claimed to be advancing
-    /// — which is the broker's correctness contract for fast-forward
-    /// promotion.
+    /// Three shapes collapse to this variant:
+    ///
+    /// * Orphan / disjoint: `rev-list --boundary
+    ///   ^expected_remote_head bundle_tip` emits interesting commits
+    ///   but no boundary at all — the two histories share no commits.
+    /// * Fork from older ancestor: `rev-list` emits interesting commits
+    ///   plus a boundary, but the boundary is an ancestor older than
+    ///   `expected_remote_head` (e.g. `c0 → expected` on one side,
+    ///   `c0 → bundle_tip` on the other). Detected by checking that
+    ///   `expected_remote_head` itself appears among the boundaries.
+    /// * Rewind: `bundle_tip` is a strict ancestor of
+    ///   `expected_remote_head`. `rev-list ^expected bundle_tip`
+    ///   emits nothing because `bundle_tip` is reachable from
+    ///   `expected_remote_head`. Distinguished from the noop case
+    ///   (`AlreadyAtExpected`) by SHA inequality.
+    ///
+    /// Either the agent force-pushed, or the bundle was constructed
+    /// against a different baseline than the `expected_remote_head`
+    /// the staged receipt declares. Refusing here keeps the broker
+    /// from publishing a chain that doesn't descend from the branch
+    /// tip the agent claimed to be advancing — which is the broker's
+    /// correctness contract for fast-forward promotion.
     #[error(
         "bundle history is not a fast-forward of expected_remote_head {expected_remote_head}: \
-         `git rev-list --boundary ^{expected_remote_head} {bundle_tip}` found no boundary \
-         commits, which means no ancestor of {bundle_tip} is reachable from \
-         {expected_remote_head}"
+         {expected_remote_head} is not an ancestor of {bundle_tip}"
     )]
     DivergedHistory {
         expected_remote_head: String,
@@ -735,21 +745,27 @@ impl From<CleanGitError> for FastForwardPlanError {
 ///
 /// Algorithm-identical to [`plan_branch_creation_via_rev_list`] —
 /// they share every private helper — but interprets the rev-list
-/// output through the fast-forward lens:
+/// output through the stricter fast-forward lens. A fast-forward
+/// push requires that `expected_remote_head` is an ancestor of
+/// `bundle_tip`; the planner verifies that explicitly rather than
+/// inferring it from rev-list output shape:
 ///
-/// * `rev-list` emits nothing → `bundle_tip` is reachable from
-///   `expected_remote_head`. For a fast-forward push this can only
-///   mean `bundle_tip == expected_remote_head` (the agent pushed an
-///   unchanged ref); the orchestrator skips the walker entirely.
-///   Surfaces as
-///   [`FastForwardPlan::AlreadyAtExpected`].
-/// * `rev-list` emits interesting commits but no boundary →
-///   `expected_remote_head` is not an ancestor of `bundle_tip`. Not
-///   a fast-forward; surfaces as
-///   [`FastForwardPlanError::DivergedHistory`].
-/// * `rev-list` emits both → normal replay, with the boundary
-///   commits seeding the `ShaMap` as identity maps so the walker
-///   recognises them as already-published parents.
+/// * `bundle_tip == expected_remote_head` → noop, surfaces as
+///   [`FastForwardPlan::AlreadyAtExpected`]. Detected before
+///   inspecting boundary output: the empty rev-list output also
+///   occurs on a rewind (bundle_tip is a strict ancestor of
+///   expected_remote_head), so SHA equality is the only reliable
+///   noop signal.
+/// * `rev-list` emits non-empty `commits` and lists
+///   `expected_remote_head` itself among the boundaries → normal
+///   replay. The boundary commits seed the `ShaMap` as identity
+///   maps so the walker recognises them as already-published
+///   parents.
+/// * Anything else (empty `commits` with unequal SHAs; non-empty
+///   `commits` without `expected_remote_head` among the boundaries)
+///   → [`FastForwardPlanError::DivergedHistory`]. This covers
+///   rewinds, orphan histories, and forks from an older common
+///   ancestor.
 ///
 /// Pre-conditions: same as the branch-creation variant. The staging
 /// repo must contain both `bundle_tip` (from unbundling) and
@@ -781,24 +797,32 @@ pub async fn plan_fast_forward_via_rev_list(
     let (commits, boundaries) =
         parse_rev_list_boundary_output(&stdout).map_err(branch_creation_to_fast_forward)?;
 
+    let diverged = || FastForwardPlanError::DivergedHistory {
+        expected_remote_head: expected_remote_head.as_str().to_string(),
+        bundle_tip: bundle_tip.as_str().to_string(),
+    };
+
     if commits.is_empty() {
         // `rev-list ^expected_remote_head bundle_tip` with no output
         // means `bundle_tip` is reachable from `expected_remote_head`.
-        // For a fast-forward push the only way to reach this state is
-        // `bundle_tip == expected_remote_head`: a strict ancestor
-        // would mean the agent is trying to rewind the branch, which
-        // git itself rejects on the agent side before producing a
-        // bundle. We surface the noop and let the caller decide
-        // whether to audit it.
-        return Ok(FastForwardPlan::AlreadyAtExpected {
-            tip: bundle_tip.clone(),
-        });
+        // Two cases collapse onto this: bundle_tip == expected
+        // (noop, accept) and bundle_tip is a strict ancestor (rewind,
+        // reject). SHA equality is the only reliable discriminator.
+        if bundle_tip == expected_remote_head {
+            return Ok(FastForwardPlan::AlreadyAtExpected {
+                tip: bundle_tip.clone(),
+            });
+        }
+        return Err(diverged());
     }
-    if boundaries.is_empty() {
-        return Err(FastForwardPlanError::DivergedHistory {
-            expected_remote_head: expected_remote_head.as_str().to_string(),
-            bundle_tip: bundle_tip.as_str().to_string(),
-        });
+    // For the walk to be a true fast-forward, `expected_remote_head`
+    // itself must be one of the boundaries — i.e. it's reachable
+    // from `bundle_tip`. A non-empty boundary list that does *not*
+    // contain `expected_remote_head` means the bundle forked from
+    // some older common ancestor (which rev-list reports as the
+    // boundary) and is therefore divergent.
+    if !boundaries.iter().any(|b| b == expected_remote_head) {
+        return Err(diverged());
     }
 
     let mut seed = ShaMap::new();
@@ -3022,6 +3046,77 @@ mod tests {
             } => {
                 assert_eq!(erh, expected.as_str());
                 assert_eq!(bt, orphan_tip.as_str());
+            }
+            other => panic!("expected DivergedHistory, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn fast_forward_plan_rejects_fork_from_older_ancestor() {
+        // Topology:
+        //
+        //   c0 ─ expected         (expected_remote_head)
+        //    └─ side_tip          (bundle_tip)
+        //
+        // bundle_tip and expected_remote_head share an older common
+        // ancestor `c0`, but neither is an ancestor of the other —
+        // this is *diverged*, not a fast-forward. `git rev-list
+        // --boundary ^expected side_tip` emits `side_tip` as
+        // interesting and `c0` as the boundary, so the naive
+        // "boundaries non-empty → Replay" rule wrongly accepts this.
+        // The planner must recognise that `expected_remote_head`
+        // itself is not the boundary and reject it.
+        let (_dir, repo, git) = init_test_repo();
+        let c0 = commit_empty(&git, &repo, "c0 shared ancestor");
+        let expected = commit_empty(&git, &repo, "expected on default");
+        run_git(
+            &git,
+            &repo,
+            &["checkout", "--quiet", "-b", "side", c0.as_str()],
+        );
+        let side_tip = commit_empty(&git, &repo, "side tip");
+
+        let err =
+            plan_fast_forward_via_rev_list(&side_tip, &expected, &repo, &git, TEST_GIT_TIMEOUT)
+                .await
+                .expect_err("fork from older ancestor must be rejected");
+        match err {
+            FastForwardPlanError::DivergedHistory {
+                expected_remote_head: erh,
+                bundle_tip: bt,
+            } => {
+                assert_eq!(erh, expected.as_str());
+                assert_eq!(bt, side_tip.as_str());
+            }
+            other => panic!("expected DivergedHistory, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn fast_forward_plan_rejects_rewind() {
+        // Topology: linear chain c1 ─ c2. Caller asks the planner to
+        // treat bundle_tip = c1 against expected_remote_head = c2.
+        // That's a rewind: bundle_tip is a strict ancestor of
+        // expected_remote_head, not a fast-forward. `git rev-list
+        // --boundary ^c2 c1` emits nothing (c1 is reachable from c2),
+        // so the naive "empty output → AlreadyAtExpected" rule
+        // wrongly accepts it as a noop. The planner must check
+        // SHA-equality before declaring noop and reject this as
+        // DivergedHistory.
+        let (_dir, repo, git) = init_test_repo();
+        let c1 = commit_empty(&git, &repo, "c1");
+        let c2 = commit_empty(&git, &repo, "c2");
+
+        let err = plan_fast_forward_via_rev_list(&c1, &c2, &repo, &git, TEST_GIT_TIMEOUT)
+            .await
+            .expect_err("rewind must be rejected");
+        match err {
+            FastForwardPlanError::DivergedHistory {
+                expected_remote_head: erh,
+                bundle_tip: bt,
+            } => {
+                assert_eq!(erh, c2.as_str());
+                assert_eq!(bt, c1.as_str());
             }
             other => panic!("expected DivergedHistory, got {other:?}"),
         }
