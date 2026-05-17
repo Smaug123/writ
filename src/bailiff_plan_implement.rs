@@ -10,7 +10,7 @@
 //! Sibling to [`crate::bailiff_plan_review::submit_review`]: the
 //! post-`OpenSession` contract is identical (close-on-error on every
 //! later failure) and the pre-RPC fetch-verify-decode chain is the
-//! same lifted [`read_plan_body_bytes`] helper. The two novelties of
+//! same lifted `read_plan_body_bytes` helper. The two novelties of
 //! the implement workflow are:
 //!
 //! 1. The decision-note gate. Per slice E of
