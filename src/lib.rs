@@ -27,6 +27,8 @@ pub mod bailiff_plan_review;
 pub mod bailiff_plan_submit;
 #[cfg(feature = "host")]
 pub mod bailiff_plan_write;
+#[cfg(feature = "host")]
+pub mod bailiff_repo_guard;
 pub(crate) mod bearer;
 #[cfg(feature = "host")]
 pub(crate) mod clean_git;
