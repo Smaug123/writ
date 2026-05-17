@@ -629,6 +629,219 @@ pub async fn plan_branch_creation_via_rev_list(
     Ok(BranchCreationPlan::Replay { commits, seed })
 }
 
+/// Result of [`plan_fast_forward_via_rev_list`].
+///
+/// Two shapes, distinguished by whether the bundle introduces any
+/// commits the App side doesn't already have:
+///
+/// * [`Replay`](FastForwardPlan::Replay) — the bundle contains
+///   genuinely new commits between `expected_remote_head` and
+///   `bundle_tip`. The orchestrator must run them through
+///   [`replay_commits`] and then `update_ref` the App-side branch.
+/// * [`AlreadyAtExpected`](FastForwardPlan::AlreadyAtExpected) — the
+///   bundle's tip equals `expected_remote_head`. A push of an
+///   unchanged ref is a no-op for replay; the orchestrator can skip
+///   both the walker and the ref-update entirely.
+///
+/// Encoding the two shapes as an enum makes the noop case unmissable
+/// for the caller and parallels [`BranchCreationPlan`] for symmetry.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum FastForwardPlan {
+    /// The bundle introduces new commits. `commits` is topologically
+    /// sorted (parents before children), suitable as the `commits`
+    /// argument to [`replay_commits`]. `seed` is pre-populated with
+    /// the boundary commits' identity mappings — for a strict
+    /// fast-forward the boundary is `expected_remote_head` itself
+    /// (plus any older ancestors that appear as a parent slot of a
+    /// merge commit on the new side).
+    Replay {
+        commits: Vec<GitObjectId>,
+        seed: ShaMap,
+    },
+    /// `bundle_tip` equals `expected_remote_head` — a noop push of an
+    /// unchanged ref. The orchestrator only needs to record the audit
+    /// outcome; nothing has to land on GitHub.
+    AlreadyAtExpected { tip: GitObjectId },
+}
+
+#[derive(Debug, thiserror::Error, Eq, PartialEq)]
+pub enum FastForwardPlanError {
+    /// The `git rev-list` subprocess itself failed (unknown SHA,
+    /// missing staging repo, IO error, exit-status non-zero).
+    ///
+    /// Stringified rather than carrying the underlying
+    /// `CleanGitError` for the same reason
+    /// [`BranchCreationPlanError::Git`] does: the clean-git module
+    /// is `pub(crate)` and publishing one of its variants here would
+    /// force the entire hardening helper out into the public surface.
+    #[error("`git rev-list` failed: {0}")]
+    Git(String),
+    #[error(
+        "`git rev-list --boundary` emitted a line that does not parse as a commit SHA: \
+         {line:?} ({reason})"
+    )]
+    InvalidRevListOutput { line: String, reason: String },
+    /// The bundle is not a fast-forward of `expected_remote_head`.
+    ///
+    /// Detected by inspecting the boundary commits `rev-list
+    /// --boundary` emits: `rev-list --boundary ^expected_remote_head
+    /// bundle_tip` emitted interesting commits but no boundary,
+    /// meaning no ancestor of `bundle_tip` is reachable from
+    /// `expected_remote_head`. Either the agent force-pushed, or the
+    /// bundle was constructed against a different baseline than the
+    /// `expected_remote_head` the staged receipt declares. Refusing
+    /// here keeps the broker from publishing a chain that doesn't
+    /// descend from the branch tip the agent claimed to be advancing
+    /// — which is the broker's correctness contract for fast-forward
+    /// promotion.
+    #[error(
+        "bundle history is not a fast-forward of expected_remote_head {expected_remote_head}: \
+         `git rev-list --boundary ^{expected_remote_head} {bundle_tip}` found no boundary \
+         commits, which means no ancestor of {bundle_tip} is reachable from \
+         {expected_remote_head}"
+    )]
+    DivergedHistory {
+        expected_remote_head: String,
+        bundle_tip: String,
+    },
+    /// The staging repo is shallow.
+    ///
+    /// Same failure mode as
+    /// [`BranchCreationPlanError::ShallowStagingRepo`]: `rev-list`
+    /// cannot traverse past a `.git/shallow` boundary, so the planner
+    /// would falsely report the wrong outcome (probably
+    /// `DivergedHistory`) if the bundle's fork point is older than the
+    /// shallow depth. The orchestrator must fetch
+    /// `expected_remote_head` with full ancestry before calling.
+    #[error(
+        "staging repo at {staging_repo} is shallow: `git rev-list --boundary` cannot \
+         traverse past the shallow boundary so we cannot tell which bundle commits are \
+         new versus already on expected_remote_head. Fetch `expected_remote_head` with \
+         full ancestry (no `--depth`) — or `git fetch --unshallow` — before calling \
+         the planner"
+    )]
+    ShallowStagingRepo { staging_repo: String },
+}
+
+impl From<CleanGitError> for FastForwardPlanError {
+    fn from(err: CleanGitError) -> Self {
+        FastForwardPlanError::Git(err.to_string())
+    }
+}
+
+/// Plan the per-commit walk for a fast-forward push by shelling out
+/// `git rev-list --topo-order --reverse --boundary
+/// ^<expected_remote_head> <bundle_tip>` against the staging repo.
+///
+/// Algorithm-identical to [`plan_branch_creation_via_rev_list`] —
+/// they share every private helper — but interprets the rev-list
+/// output through the fast-forward lens:
+///
+/// * `rev-list` emits nothing → `bundle_tip` is reachable from
+///   `expected_remote_head`. For a fast-forward push this can only
+///   mean `bundle_tip == expected_remote_head` (the agent pushed an
+///   unchanged ref); the orchestrator skips the walker entirely.
+///   Surfaces as
+///   [`FastForwardPlan::AlreadyAtExpected`].
+/// * `rev-list` emits interesting commits but no boundary →
+///   `expected_remote_head` is not an ancestor of `bundle_tip`. Not
+///   a fast-forward; surfaces as
+///   [`FastForwardPlanError::DivergedHistory`].
+/// * `rev-list` emits both → normal replay, with the boundary
+///   commits seeding the `ShaMap` as identity maps so the walker
+///   recognises them as already-published parents.
+///
+/// Pre-conditions: same as the branch-creation variant. The staging
+/// repo must contain both `bundle_tip` (from unbundling) and
+/// `expected_remote_head` (fetched by the orchestrator with full
+/// ancestry); the repo must not be shallow.
+pub async fn plan_fast_forward_via_rev_list(
+    bundle_tip: &GitObjectId,
+    expected_remote_head: &GitObjectId,
+    staging_repo: &Path,
+    git_program: &Path,
+    step_timeout: Duration,
+) -> Result<FastForwardPlan, FastForwardPlanError> {
+    let shallow_invocation = build_is_shallow_invocation(staging_repo, git_program);
+    let shallow_stdout =
+        clean_git::run_clean_git_capture_stdout(&shallow_invocation, step_timeout, None).await?;
+    if parse_is_shallow_output(&shallow_stdout).map_err(branch_creation_to_fast_forward)? {
+        return Err(FastForwardPlanError::ShallowStagingRepo {
+            staging_repo: staging_repo.display().to_string(),
+        });
+    }
+
+    let invocation = build_rev_list_boundary_invocation(
+        staging_repo,
+        git_program,
+        bundle_tip,
+        expected_remote_head,
+    );
+    let stdout = clean_git::run_clean_git_capture_stdout(&invocation, step_timeout, None).await?;
+    let (commits, boundaries) =
+        parse_rev_list_boundary_output(&stdout).map_err(branch_creation_to_fast_forward)?;
+
+    if commits.is_empty() {
+        // `rev-list ^expected_remote_head bundle_tip` with no output
+        // means `bundle_tip` is reachable from `expected_remote_head`.
+        // For a fast-forward push the only way to reach this state is
+        // `bundle_tip == expected_remote_head`: a strict ancestor
+        // would mean the agent is trying to rewind the branch, which
+        // git itself rejects on the agent side before producing a
+        // bundle. We surface the noop and let the caller decide
+        // whether to audit it.
+        return Ok(FastForwardPlan::AlreadyAtExpected {
+            tip: bundle_tip.clone(),
+        });
+    }
+    if boundaries.is_empty() {
+        return Err(FastForwardPlanError::DivergedHistory {
+            expected_remote_head: expected_remote_head.as_str().to_string(),
+            bundle_tip: bundle_tip.as_str().to_string(),
+        });
+    }
+
+    let mut seed = ShaMap::new();
+    for boundary in boundaries {
+        seed.seed_commit_identity(boundary);
+    }
+
+    Ok(FastForwardPlan::Replay { commits, seed })
+}
+
+/// Total adapter from the branch-creation planner's error type to the
+/// fast-forward planner's. Used at the boundary where the parse
+/// helpers return `BranchCreationPlanError` but the fast-forward
+/// orchestration needs `FastForwardPlanError`.
+///
+/// The parse helpers only ever construct `InvalidRevListOutput` at
+/// the time of writing, so the other arms are unreachable in
+/// practice. Keeping the function total (rather than
+/// `unreachable!`-panicking) means a future refactor that lets the
+/// parse helpers emit a different variant translates cleanly into
+/// the fast-forward vocabulary rather than crashing the broker.
+/// `DisjointHistory` maps to `DivergedHistory` because the two
+/// describe the same shape ("no ancestor of bundle_tip on the App
+/// side") with different baseline names.
+fn branch_creation_to_fast_forward(err: BranchCreationPlanError) -> FastForwardPlanError {
+    match err {
+        BranchCreationPlanError::Git(msg) => FastForwardPlanError::Git(msg),
+        BranchCreationPlanError::InvalidRevListOutput { line, reason } => {
+            FastForwardPlanError::InvalidRevListOutput { line, reason }
+        }
+        BranchCreationPlanError::ShallowStagingRepo { staging_repo } => {
+            FastForwardPlanError::ShallowStagingRepo { staging_repo }
+        }
+        BranchCreationPlanError::DisjointHistory {
+            default_head,
+            bundle_tip,
+        } => FastForwardPlanError::DivergedHistory {
+            expected_remote_head: default_head,
+            bundle_tip,
+        },
+    }
+}
+
 /// Build the `git -C <staging> rev-parse --is-shallow-repository`
 /// invocation: prints `true`/`false` on stdout depending on whether
 /// `.git/shallow` exists. Used as the planner's pre-flight check.
@@ -2660,6 +2873,328 @@ mod tests {
         assert_eq!(map.commit(&c1), Some(&c1_app));
         assert_eq!(map.commit(&c2), Some(&c2_app));
         assert_eq!(map.commit(&default_head), Some(&default_head));
+    }
+
+    // ----- fast-forward planner tests ------------------------------
+
+    /// Same `Replay`-extraction helper as `expect_replay`, but for
+    /// the fast-forward result enum. Keeps the per-test asserts focussed
+    /// on shape rather than match scaffolding.
+    fn expect_replay_ff(plan: FastForwardPlan) -> (Vec<GitObjectId>, ShaMap) {
+        match plan {
+            FastForwardPlan::Replay { commits, seed } => (commits, seed),
+            FastForwardPlan::AlreadyAtExpected { tip } => {
+                panic!("expected Replay, got AlreadyAtExpected {{ tip: {tip:?} }}")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn fast_forward_plan_returns_single_commit_when_tip_is_child_of_expected_remote_head() {
+        let (_dir, repo, git) = init_test_repo();
+        let expected = commit_empty(&git, &repo, "expected remote head");
+        let new1 = commit_empty(&git, &repo, "one new commit");
+
+        let plan = plan_fast_forward_via_rev_list(&new1, &expected, &repo, &git, TEST_GIT_TIMEOUT)
+            .await
+            .expect("plan ok");
+        let (commits, seed) = expect_replay_ff(plan);
+        assert_eq!(commits, vec![new1]);
+        // The boundary is `expected_remote_head` itself — strictly the
+        // parent of the only new commit.
+        assert_eq!(seed.commit(&expected), Some(&expected));
+        assert_eq!(seed.commit_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn fast_forward_plan_topologically_sorts_linear_chain() {
+        let (_dir, repo, git) = init_test_repo();
+        let expected = commit_empty(&git, &repo, "expected");
+        let c1 = commit_empty(&git, &repo, "c1");
+        let c2 = commit_empty(&git, &repo, "c2");
+        let c3 = commit_empty(&git, &repo, "c3");
+
+        let plan = plan_fast_forward_via_rev_list(&c3, &expected, &repo, &git, TEST_GIT_TIMEOUT)
+            .await
+            .expect("plan ok");
+        let (commits, seed) = expect_replay_ff(plan);
+        assert_eq!(commits, vec![c1.clone(), c2, c3]);
+        // Boundary is `expected` (the parent of the first new commit
+        // on the chain); the new chain's own intermediate commits are
+        // not boundaries.
+        assert_eq!(seed.commit(&expected), Some(&expected));
+        assert!(seed.commit(&c1).is_none());
+    }
+
+    #[tokio::test]
+    async fn fast_forward_plan_handles_merge_with_mixed_age_parents() {
+        // Topology:
+        //
+        //   c0 ─ expected ─────────╮
+        //    │                     ├─ merge  (bundle tip)
+        //    └─ side1 ──────────── ╯
+        //
+        // expected_remote_head = expected.  side1 forks at c0 (older
+        // than expected). merge's parents are (expected, side1). The
+        // walker must emit [side1, merge], with c0 and/or expected as
+        // boundaries so the merge's parent slot resolves.
+        let (_dir, repo, git) = init_test_repo();
+        let c0 = commit_empty(&git, &repo, "c0");
+        let expected = commit_empty(&git, &repo, "expected on default");
+        run_git(
+            &git,
+            &repo,
+            &["checkout", "--quiet", "-b", "side", c0.as_str()],
+        );
+        let side1 = commit_empty(&git, &repo, "side1");
+        let merge = commit_merge(&git, &repo, "merge", &[&expected, &side1]);
+
+        let plan = plan_fast_forward_via_rev_list(&merge, &expected, &repo, &git, TEST_GIT_TIMEOUT)
+            .await
+            .expect("plan ok");
+        let (commits, seed) = expect_replay_ff(plan);
+        assert_eq!(commits.len(), 2, "got {commits:?}");
+        assert!(
+            !commits.contains(&c0),
+            "c0 must not be uploaded — reachable from expected_remote_head"
+        );
+        assert!(
+            !commits.contains(&expected),
+            "expected_remote_head must not appear in the upload set"
+        );
+        let side1_idx = commits
+            .iter()
+            .position(|s| s == &side1)
+            .expect("side1 emitted");
+        let merge_idx = commits
+            .iter()
+            .position(|s| s == &merge)
+            .expect("merge emitted");
+        assert!(side1_idx < merge_idx, "side1 must precede merge");
+        // At least one of {c0, expected} must seed the walker so the
+        // merge's parent slot can be resolved.
+        assert!(
+            seed.commit(&c0).is_some() || seed.commit(&expected).is_some(),
+            "expected some ancestor in the seed map, got {seed:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn fast_forward_plan_returns_already_at_expected_when_bundle_tip_equals_expected_remote_head()
+     {
+        // Agent pushes an unchanged ref (e.g. `git push origin main`
+        // with no local commits ahead). The bundle would be empty;
+        // the planner must surface this as AlreadyAtExpected so the
+        // orchestrator skips both walker and ref-update.
+        let (_dir, repo, git) = init_test_repo();
+        let head = commit_empty(&git, &repo, "only commit");
+        let plan = plan_fast_forward_via_rev_list(&head, &head, &repo, &git, TEST_GIT_TIMEOUT)
+            .await
+            .expect("bundle_tip == expected_remote_head must succeed as AlreadyAtExpected");
+        match plan {
+            FastForwardPlan::AlreadyAtExpected { tip } => {
+                assert_eq!(tip, head);
+            }
+            other => panic!("expected AlreadyAtExpected, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn fast_forward_plan_rejects_diverged_history() {
+        // Build an orphan branch as the bundle tip — its history
+        // shares nothing with `expected_remote_head`, so `rev-list`
+        // emits all of orphan_tip's ancestry as interesting and no
+        // boundary commits. That's the "not a fast forward" shape
+        // the broker must refuse to publish.
+        let (_dir, repo, git) = init_test_repo();
+        let expected = commit_empty(&git, &repo, "expected");
+        run_git(&git, &repo, &["checkout", "--quiet", "--orphan", "orphan"]);
+        let orphan_tip = commit_empty(&git, &repo, "orphan tip");
+
+        let err =
+            plan_fast_forward_via_rev_list(&orphan_tip, &expected, &repo, &git, TEST_GIT_TIMEOUT)
+                .await
+                .expect_err("diverged history must be rejected");
+        match err {
+            FastForwardPlanError::DivergedHistory {
+                expected_remote_head: erh,
+                bundle_tip: bt,
+            } => {
+                assert_eq!(erh, expected.as_str());
+                assert_eq!(bt, orphan_tip.as_str());
+            }
+            other => panic!("expected DivergedHistory, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn fast_forward_plan_rejects_shallow_staging_repo() {
+        let (_dir, repo, git) = init_test_repo();
+        let expected = commit_empty(&git, &repo, "expected");
+        let c1 = commit_empty(&git, &repo, "new");
+
+        let shallow_marker = repo.join(".git").join("shallow");
+        std::fs::write(&shallow_marker, format!("{}\n", expected.as_str())).unwrap();
+        assert!(shallow_marker.exists(), "marker write must succeed");
+
+        let err = plan_fast_forward_via_rev_list(&c1, &expected, &repo, &git, TEST_GIT_TIMEOUT)
+            .await
+            .expect_err("shallow staging repo must be rejected");
+        match err {
+            FastForwardPlanError::ShallowStagingRepo { staging_repo } => {
+                assert_eq!(staging_repo, repo.display().to_string());
+            }
+            other => panic!("expected ShallowStagingRepo, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn fast_forward_plan_surfaces_git_error_on_unknown_sha() {
+        let (_dir, repo, git) = init_test_repo();
+        let head = commit_empty(&git, &repo, "only commit");
+        let bogus = GitObjectId::new("0".repeat(40)).unwrap();
+        let err = plan_fast_forward_via_rev_list(&bogus, &head, &repo, &git, TEST_GIT_TIMEOUT)
+            .await
+            .expect_err("unknown SHA must surface as Git error");
+        assert!(
+            matches!(err, FastForwardPlanError::Git(_)),
+            "expected Git, got {err:?}",
+        );
+    }
+
+    /// End-to-end integration: feed a real-git fast-forward plan
+    /// straight into `replay_commits` against a wiremock-backed
+    /// GitHub Git Data client. Proves the boundary
+    /// (= expected_remote_head) lands in the seed map in a shape that
+    /// satisfies the walker's `UnmappedParent` guard, identical in
+    /// structure to the branch-creation end-to-end test but with the
+    /// fast-forward planner.
+    #[tokio::test]
+    async fn fast_forward_plan_seeds_replay_commits_end_to_end() {
+        let (_dir, repo, git) = init_test_repo();
+        let expected = commit_empty(&git, &repo, "expected remote head");
+        let c1 = commit_empty(&git, &repo, "new c1");
+        let c2 = commit_empty(&git, &repo, "new c2");
+
+        let plan = plan_fast_forward_via_rev_list(&c2, &expected, &repo, &git, TEST_GIT_TIMEOUT)
+            .await
+            .expect("plan ok");
+        let (plan_commits, plan_seed) = expect_replay_ff(plan);
+        assert_eq!(plan_commits, vec![c1.clone(), c2.clone()]);
+        assert_eq!(plan_seed.commit(&expected), Some(&expected));
+
+        let server = MockServer::start().await;
+        let empty_tree_app = sample_object_id('d');
+        let c1_app = sample_object_id('e');
+        let c2_app = sample_object_id('f');
+        Mock::given(method("POST"))
+            .and(path("/repos/owner/name/git/trees"))
+            .and(body_json(json!({ "tree": [] })))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+                "sha": empty_tree_app.as_str(),
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/repos/owner/name/git/commits"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+                "sha": c1_app.as_str(),
+            })))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/repos/owner/name/git/commits"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+                "sha": c2_app.as_str(),
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut source = InMemoryGitObjectSource::new();
+        let empty_tree_bundle = rev_parse(&git, &repo, &format!("{}^{{tree}}", c1.as_str()));
+        source.insert_tree(empty_tree_bundle.clone(), StagingTree { entries: vec![] });
+        source.insert_commit(
+            c1.clone(),
+            StagingCommit {
+                tree: empty_tree_bundle.clone(),
+                parents: vec![expected.clone()],
+                author: sample_identity("Alice"),
+                committer: sample_identity("Bot"),
+                message: "new c1\n".to_string(),
+            },
+        );
+        source.insert_commit(
+            c2.clone(),
+            StagingCommit {
+                tree: empty_tree_bundle,
+                parents: vec![c1.clone()],
+                author: sample_identity("Alice"),
+                committer: sample_identity("Bot"),
+                message: "new c2\n".to_string(),
+            },
+        );
+
+        let client = client_against(&server, "ghs_fake_token");
+        let (final_sha, map) = replay_commits(
+            &client,
+            &sample_repo(),
+            &source,
+            &plan_commits,
+            plan_seed,
+            &[],
+        )
+        .await
+        .expect("replay ok");
+
+        assert_eq!(final_sha, c2_app);
+        assert_eq!(map.commit(&c1), Some(&c1_app));
+        assert_eq!(map.commit(&c2), Some(&c2_app));
+        assert_eq!(map.commit(&expected), Some(&expected));
+    }
+
+    /// `branch_creation_to_fast_forward` is total: every variant of
+    /// the source enum maps to a sensible variant of the destination.
+    /// Pin the mapping so a future refactor can't silently re-route
+    /// (e.g. by changing a variant's name) without updating the
+    /// adapter.
+    #[test]
+    fn branch_creation_to_fast_forward_is_total() {
+        assert_eq!(
+            branch_creation_to_fast_forward(BranchCreationPlanError::Git("boom".to_string())),
+            FastForwardPlanError::Git("boom".to_string()),
+        );
+        assert_eq!(
+            branch_creation_to_fast_forward(BranchCreationPlanError::InvalidRevListOutput {
+                line: "bad".to_string(),
+                reason: "reason".to_string(),
+            }),
+            FastForwardPlanError::InvalidRevListOutput {
+                line: "bad".to_string(),
+                reason: "reason".to_string(),
+            },
+        );
+        assert_eq!(
+            branch_creation_to_fast_forward(BranchCreationPlanError::ShallowStagingRepo {
+                staging_repo: "/tmp/staging".to_string(),
+            }),
+            FastForwardPlanError::ShallowStagingRepo {
+                staging_repo: "/tmp/staging".to_string(),
+            },
+        );
+        assert_eq!(
+            branch_creation_to_fast_forward(BranchCreationPlanError::DisjointHistory {
+                default_head: "aaaa".to_string(),
+                bundle_tip: "bbbb".to_string(),
+            }),
+            FastForwardPlanError::DivergedHistory {
+                expected_remote_head: "aaaa".to_string(),
+                bundle_tip: "bbbb".to_string(),
+            },
+        );
     }
 
     // ----- property tests ------------------------------------------
