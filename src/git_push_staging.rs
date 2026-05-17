@@ -222,10 +222,14 @@ impl GitPushStagingStore {
     }
 
     /// Look up one staged push's receipt by `request_id` without reading
-    /// the bundle bytes. Returns `Ok(None)` when no staging entry exists
-    /// (the natural state for an id that was approved/rejected and had
-    /// its directory removed), `Ok(Some)` on hit, and `Err` only on a
-    /// genuine corruption / IO problem for an entry that does exist.
+    /// the bundle bytes. Returns `Ok(None)` only when the staging
+    /// directory is definitively absent (the natural state for an id
+    /// that was approved/rejected and had its directory removed),
+    /// `Ok(Some)` on hit, and `Err` on a genuine corruption / IO problem
+    /// — including filesystem-level probe errors such as
+    /// `PermissionDenied` or `NotADirectory`. Surfacing those is
+    /// deliberate: a session-filtered caller relies on `Ok(None)`
+    /// meaning "really not there", not "we couldn't tell".
     ///
     /// This is the "ID-driven" counterpart to [`Self::list`]: a caller
     /// that already knows which request ids it cares about (e.g. from an
@@ -236,10 +240,17 @@ impl GitPushStagingStore {
         &self,
         request_id: RequestId,
     ) -> Result<Option<VmGitPushStagedReceipt>, StagingError> {
-        if !self.staged_path(request_id).exists() {
-            return Ok(None);
+        // `try_exists` distinguishes "confirmed absent" (Ok(false)) from
+        // "couldn't tell" (Err) — unlike `exists`, which folds every
+        // metadata error into `false`. We only want to skip the load on
+        // a real `NotFound`; permission / not-a-directory / other IO
+        // errors must surface so the operator sees the broken staging
+        // tree rather than an empty success.
+        match self.staged_path(request_id).try_exists() {
+            Ok(true) => self.load_receipt(request_id).map(Some),
+            Ok(false) => Ok(None),
+            Err(err) => Err(StagingError::Io(err)),
         }
-        self.load_receipt(request_id).map(Some)
     }
 
     fn staged_path(&self, request_id: RequestId) -> PathBuf {
@@ -643,6 +654,46 @@ mod tests {
         fs::remove_file(&bundle).unwrap();
         let err = store.load(request_id).unwrap_err();
         assert!(matches!(err, StagingError::Corrupt { request_id: id, .. } if id == request_id));
+    }
+
+    #[test]
+    fn try_load_receipt_returns_none_when_dir_absent() {
+        let (store, _tmp) = open_store();
+        let request_id: RequestId = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".parse().unwrap();
+        let receipt = store.try_load_receipt(request_id).unwrap();
+        assert!(receipt.is_none());
+    }
+
+    #[test]
+    fn try_load_receipt_returns_some_for_present_entry() {
+        let (store, _tmp) = open_store();
+        let request_id: RequestId = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb".parse().unwrap();
+        store
+            .stage(
+                request_id,
+                UnixMillis::from_millis(0),
+                sample_metadata(),
+                b"ok".to_vec(),
+            )
+            .unwrap();
+        let receipt = store.try_load_receipt(request_id).unwrap().unwrap();
+        assert_eq!(receipt.push_request_id(), request_id);
+    }
+
+    /// Replacing `staged/` with a regular file makes any
+    /// `staged/<request-id>` probe fail with `NotADirectory` rather
+    /// than `NotFound`. The pre-fix `Path::exists()` would have folded
+    /// that into `false` and made the filtered listing silently drop
+    /// audit-named pushes. With `try_exists` we surface the IO error.
+    #[test]
+    fn try_load_receipt_surfaces_io_error_when_staged_dir_is_broken() {
+        let (store, _tmp) = open_store();
+        let request_id: RequestId = "cccccccc-cccc-cccc-cccc-cccccccccccc".parse().unwrap();
+        let staged = store.root().join("staged");
+        fs::remove_dir_all(&staged).unwrap();
+        fs::write(&staged, b"").unwrap();
+        let err = store.try_load_receipt(request_id).unwrap_err();
+        assert!(matches!(err, StagingError::Io(_)), "got: {err:?}");
     }
 
     #[test]
