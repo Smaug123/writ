@@ -308,7 +308,9 @@ pub async fn dispatch_message_with_agent_vm<S: SecretStore + Send + Sync + 'stat
                 message: "agent VM runtime is not configured".into(),
             },
         },
-        ClientMessage::ListStagedPushes {} => list_staged_pushes(state).await,
+        ClientMessage::ListStagedPushes { session_id } => {
+            list_staged_pushes(state, session_id).await
+        }
         ClientMessage::ShowStagedPush { request_id } => show_staged_push(state, request_id).await,
         ClientMessage::RejectStagedPush {
             request_id,
@@ -334,28 +336,70 @@ pub async fn dispatch_message_with_agent_vm<S: SecretStore + Send + Sync + 'stat
 
 async fn list_staged_pushes<S: SecretStore + Send + Sync + 'static>(
     state: &Arc<BrokerState<S>>,
+    session_id: Option<SessionId>,
 ) -> ServerMessage {
     let Some(staging_store) = state.staging_store.clone() else {
         return staging_not_configured();
     };
     // The staging store is sync; hop it off the async runtime so a
     // directory-walk on a slow filesystem doesn't block other connections.
-    let result = tokio::task::spawn_blocking(move || staging_store.list()).await;
-    match result {
-        Ok(Ok(receipts)) => {
-            let pushes = receipts
-                .iter()
-                .map(StagedPushSummary::from_receipt)
-                .collect();
-            ServerMessage::StagedPushes { pushes }
+    let receipts = match tokio::task::spawn_blocking(move || staging_store.list()).await {
+        Ok(Ok(receipts)) => receipts,
+        Ok(Err(err)) => {
+            return ServerMessage::Error {
+                message: err.to_string(),
+            };
         }
-        Ok(Err(err)) => ServerMessage::Error {
-            message: err.to_string(),
-        },
-        Err(err) => ServerMessage::Error {
-            message: format!("staging list task failed: {err}"),
-        },
-    }
+        Err(err) => {
+            return ServerMessage::Error {
+                message: format!("staging list task failed: {err}"),
+            };
+        }
+    };
+
+    let receipts = if let Some(session_id) = session_id {
+        // Filter against the audit-side set of request ids recorded for
+        // this session. The staging receipt on disk does not carry
+        // `session_id` (the guest VM that produced it does not see audit
+        // identifiers), so the join must go through the audit DB.
+        //
+        // A session with no staged pushes returns an empty result —
+        // distinct from "unknown session" because the audit DB has no
+        // "must-exist" check at this layer. Treating the empty answer as
+        // a non-error is the right call: `list_staged_pushes` is a
+        // listing operation, and "the result is empty" is a valid
+        // listing.
+        let audit = Arc::clone(&state.audit);
+        let allowed: std::collections::HashSet<RequestId> = match tokio::task::spawn_blocking(
+            move || audit.list_git_pushes_for_session(session_id),
+        )
+        .await
+        {
+            Ok(Ok(rows)) => rows.into_iter().map(|row| row.push_request_id).collect(),
+            Ok(Err(err)) => {
+                return ServerMessage::Error {
+                    message: err.to_string(),
+                };
+            }
+            Err(err) => {
+                return ServerMessage::Error {
+                    message: format!("audit list task failed: {err}"),
+                };
+            }
+        };
+        receipts
+            .into_iter()
+            .filter(|r| allowed.contains(&r.push_request_id()))
+            .collect()
+    } else {
+        receipts
+    };
+
+    let pushes = receipts
+        .iter()
+        .map(StagedPushSummary::from_receipt)
+        .collect();
+    ServerMessage::StagedPushes { pushes }
 }
 
 async fn show_staged_push<S: SecretStore + Send + Sync + 'static>(
@@ -2672,7 +2716,30 @@ mod tests {
     async fn list_staged_pushes_without_staging_configured_returns_error() {
         let server = MockServer::start().await;
         let state = make_state(&server, vec![], "o");
-        let resp = dispatch_message(ClientMessage::ListStagedPushes {}, &state).await;
+        let resp =
+            dispatch_message(ClientMessage::ListStagedPushes { session_id: None }, &state).await;
+        match resp {
+            ServerMessage::Error { message } => {
+                assert!(message.contains("staging"), "got: {message}");
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    /// Same staging-absent error path on the filtered request: the
+    /// session_id filter must not change *which* errors the broker
+    /// returns, only which entries it keeps on the success path.
+    #[tokio::test]
+    async fn list_staged_pushes_with_session_filter_without_staging_configured_returns_error() {
+        let server = MockServer::start().await;
+        let state = make_state(&server, vec![], "o");
+        let resp = dispatch_message(
+            ClientMessage::ListStagedPushes {
+                session_id: Some(SessionId::new()),
+            },
+            &state,
+        )
+        .await;
         match resp {
             ServerMessage::Error { message } => {
                 assert!(message.contains("staging"), "got: {message}");
@@ -2685,7 +2752,8 @@ mod tests {
     async fn list_staged_pushes_with_empty_store_returns_empty_list() {
         let server = MockServer::start().await;
         let (state, _tmp) = make_state_with_staging(&server);
-        let resp = dispatch_message(ClientMessage::ListStagedPushes {}, &state).await;
+        let resp =
+            dispatch_message(ClientMessage::ListStagedPushes { session_id: None }, &state).await;
         assert_eq!(resp, ServerMessage::StagedPushes { pushes: vec![] });
     }
 
@@ -2712,7 +2780,8 @@ mod tests {
         )
         .await;
 
-        let resp = dispatch_message(ClientMessage::ListStagedPushes {}, &state).await;
+        let resp =
+            dispatch_message(ClientMessage::ListStagedPushes { session_id: None }, &state).await;
         let mut pushes = match resp {
             ServerMessage::StagedPushes { pushes } => pushes,
             other => panic!("expected StagedPushes, got {other:?}"),
@@ -2723,6 +2792,187 @@ mod tests {
         assert_eq!(pushes[0].staged_at.as_millis(), 1_700_000_001_000);
         assert_eq!(pushes[1].push_request_id, id_b);
         assert_eq!(pushes[1].staged_at.as_millis(), 1_700_000_002_000);
+    }
+
+    /// Filtering by `session_id` returns only the staged pushes recorded
+    /// under that session in the audit log. Witnesses the core join:
+    /// pushes from a sibling session never appear in the result.
+    #[tokio::test]
+    async fn list_staged_pushes_with_session_filter_returns_only_matching_pushes() {
+        let server = MockServer::start().await;
+        let (state, _tmp) = make_state_with_staging(&server);
+        let session_a = open_session(&state).await;
+        let session_b = open_session(&state).await;
+
+        let id_a1 = stage_with_audit(
+            &state,
+            session_a,
+            b"a1".to_vec(),
+            UnixMillis::from_millis(1_700_000_001_000),
+            UnixMillis::from_millis(1_700_000_001_500),
+        )
+        .await;
+        let id_a2 = stage_with_audit(
+            &state,
+            session_a,
+            b"a2".to_vec(),
+            UnixMillis::from_millis(1_700_000_002_000),
+            UnixMillis::from_millis(1_700_000_002_500),
+        )
+        .await;
+        let id_b1 = stage_with_audit(
+            &state,
+            session_b,
+            b"b1".to_vec(),
+            UnixMillis::from_millis(1_700_000_003_000),
+            UnixMillis::from_millis(1_700_000_003_500),
+        )
+        .await;
+
+        let resp = dispatch_message(
+            ClientMessage::ListStagedPushes {
+                session_id: Some(session_a),
+            },
+            &state,
+        )
+        .await;
+        let mut pushes = match resp {
+            ServerMessage::StagedPushes { pushes } => pushes,
+            other => panic!("expected StagedPushes, got {other:?}"),
+        };
+        pushes.sort_by_key(|p| p.staged_at);
+        assert_eq!(pushes.len(), 2);
+        assert_eq!(pushes[0].push_request_id, id_a1);
+        assert_eq!(pushes[1].push_request_id, id_a2);
+
+        // Sibling session sees only its own push, not session_a's two.
+        let resp = dispatch_message(
+            ClientMessage::ListStagedPushes {
+                session_id: Some(session_b),
+            },
+            &state,
+        )
+        .await;
+        let pushes = match resp {
+            ServerMessage::StagedPushes { pushes } => pushes,
+            other => panic!("expected StagedPushes, got {other:?}"),
+        };
+        assert_eq!(pushes.len(), 1);
+        assert_eq!(pushes[0].push_request_id, id_b1);
+
+        // And the unfiltered listing still returns all three: filtering
+        // is an opt-in narrowing, not a hidden default.
+        let resp =
+            dispatch_message(ClientMessage::ListStagedPushes { session_id: None }, &state).await;
+        let pushes = match resp {
+            ServerMessage::StagedPushes { pushes } => pushes,
+            other => panic!("expected StagedPushes, got {other:?}"),
+        };
+        assert_eq!(pushes.len(), 3);
+    }
+
+    /// Filter by a session that has no push rows in the audit log
+    /// (e.g. a session that was opened but never staged a push, or an
+    /// id that does not exist at all). The broker returns an empty
+    /// list rather than an error: "no rows matched the filter" is a
+    /// successful empty listing.
+    #[tokio::test]
+    async fn list_staged_pushes_with_session_filter_for_unknown_session_returns_empty() {
+        let server = MockServer::start().await;
+        let (state, _tmp) = make_state_with_staging(&server);
+
+        // Seed the staging store with one push under a different
+        // session so we can witness it is excluded by the unknown-
+        // session filter.
+        let other = open_session(&state).await;
+        stage_with_audit(
+            &state,
+            other,
+            b"other".to_vec(),
+            UnixMillis::from_millis(1_700_000_001_000),
+            UnixMillis::from_millis(1_700_000_001_500),
+        )
+        .await;
+
+        let resp = dispatch_message(
+            ClientMessage::ListStagedPushes {
+                session_id: Some(SessionId::new()),
+            },
+            &state,
+        )
+        .await;
+        assert_eq!(resp, ServerMessage::StagedPushes { pushes: vec![] });
+    }
+
+    /// Staging entries that lack a matching audit row (e.g. an orphan
+    /// directory left over from a crash between `staging_store.stage`
+    /// and `record_git_push_request`) must be excluded by the session
+    /// filter even when the operator filters by a "real" session id.
+    /// The audit log is the source of truth for the
+    /// staged-push ↔ session mapping; an orphan staging directory has no
+    /// session.
+    #[tokio::test]
+    async fn list_staged_pushes_with_session_filter_excludes_orphan_staging() {
+        let server = MockServer::start().await;
+        let (state, _tmp) = make_state_with_staging(&server);
+        let session_id = open_session(&state).await;
+
+        // One legitimate staged push under `session_id`.
+        let real = stage_with_audit(
+            &state,
+            session_id,
+            b"real".to_vec(),
+            UnixMillis::from_millis(1_700_000_001_000),
+            UnixMillis::from_millis(1_700_000_001_500),
+        )
+        .await;
+
+        // One staging-only entry with no audit row.
+        let orphan_request_id = RequestId::new();
+        let metadata = crate::vm_git::VmGitPushMetadata::new(
+            sample_clone_repo(),
+            sample_branch(),
+            None,
+            sample_object_id('c'),
+        );
+        let staging = state.staging_store.as_ref().unwrap().clone();
+        tokio::task::spawn_blocking(move || {
+            staging
+                .stage(
+                    orphan_request_id,
+                    UnixMillis::from_millis(1_700_000_002_000),
+                    metadata,
+                    b"orphan".to_vec(),
+                )
+                .unwrap();
+        })
+        .await
+        .unwrap();
+
+        let resp = dispatch_message(
+            ClientMessage::ListStagedPushes {
+                session_id: Some(session_id),
+            },
+            &state,
+        )
+        .await;
+        let pushes = match resp {
+            ServerMessage::StagedPushes { pushes } => pushes,
+            other => panic!("expected StagedPushes, got {other:?}"),
+        };
+        assert_eq!(pushes.len(), 1);
+        assert_eq!(pushes[0].push_request_id, real);
+        // Sanity: the unfiltered listing still surfaces the orphan,
+        // since unfiltered listing reflects on-disk staging only and
+        // not the audit DB. Today the `show` endpoint will surface the
+        // orphan as an error; that contract is unchanged.
+        let resp =
+            dispatch_message(ClientMessage::ListStagedPushes { session_id: None }, &state).await;
+        let pushes = match resp {
+            ServerMessage::StagedPushes { pushes } => pushes,
+            other => panic!("expected StagedPushes, got {other:?}"),
+        };
+        assert_eq!(pushes.len(), 2);
     }
 
     #[tokio::test]

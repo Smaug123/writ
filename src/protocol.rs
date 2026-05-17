@@ -423,12 +423,25 @@ pub enum ClientMessage {
     /// `deny_unknown_fields` at the enum level applies — serde's unit-variant
     /// deserialization path silently accepts trailing keys.
     ListAgentVms {},
-    /// List every VM-staged push currently waiting for promotion review.
+    /// List every VM-staged push currently waiting for promotion review,
+    /// optionally filtered to those staged under a single audit session.
     /// Replies with [`ServerMessage::StagedPushes`].
     ///
-    /// Empty struct rather than unit variant so the enum-level
+    /// `session_id` is `None` for the legacy "list everything" shape; the
+    /// broker honours the absence as an explicit "no filter" rather than
+    /// defaulting to a hidden value. When `Some`, the broker resolves the
+    /// audit-side set of `push_request_id`s recorded against that session
+    /// and returns only the staged-store entries whose request id appears
+    /// there. Sessions that have never had any push staged return an
+    /// empty list (no error), since a session with no pushes is a
+    /// well-defined input.
+    ///
+    /// Struct rather than unit variant so the enum-level
     /// `deny_unknown_fields` applies. See [`ClientMessage::ListAgentVms`].
-    ListStagedPushes {},
+    ListStagedPushes {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<SessionId>,
+    },
     /// Look up one VM-staged push by request id. Replies with
     /// [`ServerMessage::StagedPush`] on hit and
     /// [`ServerMessage::UnknownStagedPush`] on miss.
@@ -1163,9 +1176,30 @@ mod tests {
 
     #[test]
     fn list_staged_pushes_roundtrips() {
-        let msg = ClientMessage::ListStagedPushes {};
+        let msg = ClientMessage::ListStagedPushes { session_id: None };
         let json = serde_json::to_string(&msg).unwrap();
         assert_eq!(serde_json::from_str::<ClientMessage>(&json).unwrap(), msg);
+    }
+
+    #[test]
+    fn list_staged_pushes_with_session_filter_roundtrips() {
+        let msg = ClientMessage::ListStagedPushes {
+            session_id: Some(fixed_session_id()),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert_eq!(serde_json::from_str::<ClientMessage>(&json).unwrap(), msg);
+    }
+
+    /// Older callers that send `{"type": "list_staged_pushes"}` with no
+    /// `session_id` key must still parse as the no-filter variant.
+    /// `#[serde(default)]` carries this invariant; pinning it here so a
+    /// future refactor that drops the default surfaces as a test failure
+    /// rather than a silent wire-compat break.
+    #[test]
+    fn list_staged_pushes_without_session_field_parses_as_no_filter() {
+        let json = r#"{"type":"list_staged_pushes"}"#;
+        let parsed: ClientMessage = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed, ClientMessage::ListStagedPushes { session_id: None });
     }
 
     #[test]
@@ -1895,8 +1929,22 @@ mod tests {
     #[test]
     fn staged_push_type_tags() {
         let list: serde_json::Value =
-            serde_json::to_value(ClientMessage::ListStagedPushes {}).unwrap();
+            serde_json::to_value(ClientMessage::ListStagedPushes { session_id: None }).unwrap();
         assert_eq!(list["type"], "list_staged_pushes");
+        // The optional `session_id` is elided on the wire when None so
+        // a no-filter list looks byte-identical to the legacy payload.
+        assert!(list.as_object().unwrap().get("session_id").is_none());
+
+        let list_filtered: serde_json::Value =
+            serde_json::to_value(ClientMessage::ListStagedPushes {
+                session_id: Some(fixed_session_id()),
+            })
+            .unwrap();
+        assert_eq!(list_filtered["type"], "list_staged_pushes");
+        assert_eq!(
+            list_filtered["session_id"],
+            serde_json::Value::String(fixed_session_id().as_uuid().to_string()),
+        );
 
         let show: serde_json::Value = serde_json::to_value(ClientMessage::ShowStagedPush {
             request_id: sample_request_id(),
@@ -2518,7 +2566,7 @@ mod tests {
                 session_id: fixed_session_id(),
             },
             6 => ClientMessage::ListAgentVms {},
-            7 => ClientMessage::ListStagedPushes {},
+            7 => ClientMessage::ListStagedPushes { session_id: None },
             8 => ClientMessage::ShowStagedPush {
                 request_id: "12345678-1234-1234-1234-123456789012".parse().unwrap(),
             },
