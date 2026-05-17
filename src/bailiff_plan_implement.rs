@@ -67,8 +67,8 @@ use crate::bailiff::PLAN_PROMPT_SEPARATOR;
 use crate::bailiff_decision::Decision;
 use crate::bailiff_plan_note::{PlanId, PlanNote};
 use crate::bailiff_plan_read::{
-    ReadDecisionError, ReadPlanBodyError, ReadPlanError, read_decision_note, read_plan_body_bytes,
-    read_plan_note,
+    ReadDecisionError, ReadImplementError, ReadPlanBodyError, ReadPlanError, read_decision_note,
+    read_implement_note, read_plan_body_bytes, read_plan_note,
 };
 use crate::bailiff_plan_write::{WriteImplementNoteError, write_implement_note};
 use crate::core::{AgentKind, CapabilitySet, NotesRef, SessionId};
@@ -196,6 +196,19 @@ pub async fn submit_implement(
             };
             if decision.outcome != Decision::Accepted {
                 return Err(SubmitImplementError::PlanRejected { plan_id });
+            }
+            // Duplicate gate: if an implement note already exists,
+            // refuse before opening a session. The implementer holds
+            // `WorkspaceWrite`, so a re-run can push a second set of
+            // changes even though `write_implement_note` would reject
+            // the bailiff-side write. The gate has to fire before
+            // `open_session`, not after, to keep the broker from
+            // running the agent at all.
+            if read_implement_note(&bailiff, plan_id)
+                .map_err(SubmitImplementError::ReadImplementNote)?
+                .is_some()
+            {
+                return Err(SubmitImplementError::AlreadyImplemented { plan_id });
             }
             let body = read_plan_body_bytes(
                 &bailiff,
@@ -366,6 +379,19 @@ pub enum SubmitImplementError {
     /// compose an implementer prompt against it. Pre-RPC.
     #[error("plan {plan_id} was rejected; refusing to compose an implementer prompt")]
     PlanRejected { plan_id: PlanId },
+    /// [`read_implement_note`] returned an error. Distinct from
+    /// [`Self::AlreadyImplemented`] (which is the `Ok(Some(_))` case)
+    /// so the operator can tell "bailiff's repo is broken" from "this
+    /// plan has already been implemented." Pre-RPC.
+    #[error("reading the plan implement note failed: {0}")]
+    ReadImplementNote(#[source] ReadImplementError),
+    /// Bailiff was asked to implement a plan that already has an
+    /// implement note recorded. The implementer holds
+    /// `WorkspaceWrite`, so a duplicate run could push a second set
+    /// of changes; the gate fires before any session is opened.
+    /// Pre-RPC.
+    #[error("plan {plan_id} has already been implemented; refusing to re-run the implementer")]
+    AlreadyImplemented { plan_id: PlanId },
     /// The fetch / verify / decode chain that extracts the plan
     /// body from the planner envelope failed. The wrapped
     /// [`ReadPlanBodyError`] names the specific step. Pre-RPC.
@@ -889,6 +915,108 @@ mod end_to_end_tests {
             }
             other => panic!("expected PlanRejected, got: {other:?}"),
         }
+
+        broker_task.abort();
+        let _ = broker_task.await;
+    }
+
+    /// Pre-RPC: a plan that has already been implemented surfaces
+    /// `AlreadyImplemented` on a repeat call, without opening a new
+    /// session or running the implementer agent a second time. Guards
+    /// the codex-flagged footgun: the implementer holds
+    /// `WorkspaceWrite`, so an accidental double-click on
+    /// `bailiff plan implement` must not let it push twice. The
+    /// bailiff-side implement note's OID is unchanged across the
+    /// repeat — proof the duplicate path did not even reach
+    /// `write_implement_note`, which would mint a fresh signature
+    /// stamp.
+    #[tokio::test]
+    async fn submit_implement_returns_already_implemented_on_repeat_call() {
+        let tmp = tempfile::tempdir().unwrap();
+        let signing_key = WritSigningKey::from_openssh_pem(SIGNING_PEM).unwrap();
+        let (state, socket_path, broker_task) = spawn_broker(&tmp, signing_key.clone()).await;
+
+        let bailiff_repo = NotesRepo::init_or_open(tmp.path().join("bailiff-bare")).unwrap();
+        let bailiff = Arc::new(AsyncMutex::new(bailiff_repo));
+        let writ_repo_path = state.notes_repo.as_ref().unwrap().path().to_path_buf();
+        let allowed = AllowedSigners::from_openssh_lines(SIGNING_PUB).unwrap();
+        let client = WritClient::new(&socket_path);
+
+        let plan_body = "# Plan\n\nDo a thing.\n";
+        let plan_id =
+            record_submission(&bailiff, &client, &writ_repo_path, &allowed, plan_body).await;
+        record_decision(&bailiff, plan_id, Decision::Accepted).await;
+
+        // First call must succeed and stamp an implement note.
+        let first = tokio::time::timeout(
+            Duration::from_secs(15),
+            submit_implement(
+                &client,
+                Arc::clone(&bailiff),
+                &writ_repo_path,
+                allowed.clone(),
+                implement_inputs(plan_id),
+            ),
+        )
+        .await
+        .expect("first submit_implement must complete within 15s")
+        .expect("first submit_implement must succeed");
+        let first_session = first.implementer_session_id;
+        let first_run_output_oid = first.run.output_oid.clone();
+
+        let err = tokio::time::timeout(
+            Duration::from_secs(15),
+            submit_implement(
+                &client,
+                Arc::clone(&bailiff),
+                &writ_repo_path,
+                allowed,
+                implement_inputs(plan_id),
+            ),
+        )
+        .await
+        .expect("duplicate submit_implement must return within 15s")
+        .expect_err("duplicate implement must surface as AlreadyImplemented");
+
+        match err {
+            SubmitImplementError::AlreadyImplemented { plan_id: found } => {
+                assert_eq!(found, plan_id);
+            }
+            other => panic!("expected AlreadyImplemented, got: {other:?}"),
+        }
+
+        // Witness 1: the first session is still closed and untouched.
+        // If the duplicate path had opened a new session bound to the
+        // same id (impossible — session ids are fresh per
+        // `open_session`) or run any cleanup against `first_session`
+        // it would show here.
+        let audit_for_get = Arc::clone(&state.audit);
+        let row = tokio::task::spawn_blocking(move || audit_for_get.get_session(first_session))
+            .await
+            .unwrap()
+            .expect("audit read")
+            .expect("first implementer session must exist");
+        assert!(
+            row.closed_at.is_some(),
+            "first implementer session must remain closed",
+        );
+
+        // Witness 2: the bailiff-side implement note's signed envelope
+        // is exactly the first run's envelope. The duplicate path did
+        // not reach `write_implement_note`, so the recorded run is
+        // unchanged.
+        let bailiff_for_read = Arc::clone(&bailiff);
+        let plan_ref = plan_notes_ref(plan_id);
+        let oid = first.implement_note_oid.clone();
+        let body = tokio::task::spawn_blocking(move || {
+            let bailiff = bailiff_for_read.blocking_lock();
+            bailiff.read_note(&plan_ref, &oid)
+        })
+        .await
+        .unwrap()
+        .expect("implement note must be readable");
+        let note = ImplementNote::from_canonical_bytes(&body).unwrap();
+        assert_eq!(note.writ_output_oid, first_run_output_oid);
 
         broker_task.abort();
         let _ = broker_task.await;
