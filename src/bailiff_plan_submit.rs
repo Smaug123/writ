@@ -45,6 +45,7 @@ use tokio::task::JoinError;
 use crate::agent_run::AgentPrompt;
 use crate::bailiff_plan_note::PlanId;
 use crate::bailiff_plan_write::{WritePlanNoteError, write_plan_note};
+use crate::bailiff_repo_guard::BailiffRepoGuard;
 use crate::core::{AgentKind, CapabilitySet, NotesRef, SessionId};
 use crate::notes_repo::NotesRepo;
 use crate::run_verify::AllowedSigners;
@@ -126,10 +127,11 @@ pub struct SubmitPlanOutcome {
 /// Drive the full plan-submit workflow against a live writ broker.
 ///
 /// `bailiff_repo` is taken as an `Arc<AsyncMutex<_>>` so the
-/// single-writer invariant on bailiff's bare repo is visible at the
-/// call site and the workflow can compose with other in-flight
-/// bailiff operations that share the same handle (today there are
-/// none, but the lock makes the contract explicit).
+/// single-writer invariant on bailiff's bare repo can be enforced for
+/// the whole workflow: [`submit_plan`] acquires the lock via
+/// [`BailiffRepoGuard`] before opening a session and releases it
+/// only on return, so a concurrent bailiff workflow cannot interleave
+/// against the planner's `RunAgent` and `write_plan_note` sequence.
 pub async fn submit_plan(
     client: &WritClient,
     bailiff_repo: std::sync::Arc<AsyncMutex<NotesRepo>>,
@@ -137,6 +139,12 @@ pub async fn submit_plan(
     allowed_signers: AllowedSigners,
     inputs: SubmitPlanInputs,
 ) -> Result<SubmitPlanOutcome, SubmitPlanError> {
+    // Hold the bailiff-repo lock across the entire workflow — opens,
+    // run, write, close — so concurrent submit_*/`bailiff` workflows
+    // serialise instead of racing the write step. Released on
+    // function return.
+    let mut bailiff = BailiffRepoGuard::acquire(bailiff_repo).await;
+
     let session_id = client
         .open_session(
             inputs.session_label.clone(),
@@ -178,28 +186,27 @@ pub async fn submit_plan(
         });
     }
 
-    // `write_plan_note` is blocking (shells out to git). Wrap in
-    // `spawn_blocking` so we don't stall the tokio runtime, and lock
-    // the bailiff repo for the duration of the blocking section.
+    // `write_plan_note` is blocking (shells out to git). Run under
+    // the workflow-held guard so the lock spans this section and the
+    // surrounding awaits without being re-acquired here.
     let writ_repo_path_owned = writ_repo_path.to_path_buf();
     let writ_output_ref_clone = inputs.writ_output_ref.clone();
     let purpose_clone = inputs.purpose.clone();
     let plan_id = inputs.plan_id;
     let completed_clone = completed.clone();
-    let bailiff_for_block = std::sync::Arc::clone(&bailiff_repo);
-    let write_outcome = tokio::task::spawn_blocking(move || {
-        let bailiff = bailiff_for_block.blocking_lock();
-        write_plan_note(
-            &bailiff,
-            &writ_repo_path_owned,
-            &writ_output_ref_clone,
-            plan_id,
-            purpose_clone,
-            &completed_clone,
-            &allowed_signers,
-        )
-    })
-    .await;
+    let write_outcome = bailiff
+        .run_blocking(move |repo| {
+            write_plan_note(
+                repo,
+                &writ_repo_path_owned,
+                &writ_output_ref_clone,
+                plan_id,
+                purpose_clone,
+                &completed_clone,
+                &allowed_signers,
+            )
+        })
+        .await;
     let plan_note_oid = match write_outcome {
         Ok(Ok(oid)) => oid,
         Ok(Err(source)) => {

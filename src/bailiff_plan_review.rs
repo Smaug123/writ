@@ -51,6 +51,7 @@ use crate::bailiff_plan_read::{
     ReadPlanBodyError, ReadPlanError, read_plan_body_bytes, read_plan_note,
 };
 use crate::bailiff_plan_write::{WriteReviewNoteError, write_review_note};
+use crate::bailiff_repo_guard::BailiffRepoGuard;
 use crate::core::{AgentKind, CapabilitySet, NotesRef, SessionId};
 use crate::notes_repo::NotesRepo;
 use crate::run_verify::AllowedSigners;
@@ -134,11 +135,13 @@ pub struct SubmitReviewOutcome {
 
 /// Drive the full plan-review workflow against a live writ broker.
 ///
-/// `bailiff_repo` is taken as an [`Arc`]`<`[`AsyncMutex`]`<_>>` so
-/// the single-writer invariant on bailiff's bare repo is visible at
-/// the call site and the workflow can compose with other in-flight
-/// bailiff operations sharing the same handle (today there are none,
-/// but the lock makes the contract explicit).
+/// `bailiff_repo` is taken as an [`Arc`]`<`[`AsyncMutex`]`<_>>` so the
+/// single-writer invariant on bailiff's bare repo can be enforced for
+/// the whole workflow: [`submit_review`] acquires the lock via
+/// [`BailiffRepoGuard`] before reading the submission note and
+/// releases it only on return, so a concurrent bailiff workflow
+/// cannot interleave between the pre-RPC read gate and the eventual
+/// review-note write.
 pub async fn submit_review(
     client: &WritClient,
     bailiff_repo: Arc<AsyncMutex<NotesRepo>>,
@@ -146,6 +149,12 @@ pub async fn submit_review(
     allowed_signers: AllowedSigners,
     inputs: SubmitReviewInputs,
 ) -> Result<SubmitReviewOutcome, SubmitReviewError> {
+    // Hold the bailiff-repo lock across the entire workflow — pre-RPC
+    // read, opens, run, write, close — so concurrent submit_*/bailiff
+    // workflows serialise instead of racing the gate-then-write
+    // sequence. Released on function return.
+    let mut bailiff = BailiffRepoGuard::acquire(bailiff_repo).await;
+
     // Pre-RPC: read the submission note, fetch+verify+decode the
     // planner envelope, extract the plan body. Done before opening
     // a session so a missing or unverifiable submission never burns
@@ -154,25 +163,25 @@ pub async fn submit_review(
     let writ_repo_path_owned = writ_repo_path.to_path_buf();
     let writ_output_ref_for_read = inputs.writ_output_ref.clone();
     let allowed_for_read = allowed_signers.clone();
-    let bailiff_for_read = Arc::clone(&bailiff_repo);
-    let read_outcome =
-        tokio::task::spawn_blocking(move || -> Result<(PlanNote, String), SubmitReviewError> {
-            let bailiff = bailiff_for_read.blocking_lock();
-            let plan_note =
-                match read_plan_note(&bailiff, plan_id).map_err(SubmitReviewError::ReadPlanNote)? {
-                    Some(note) => note,
-                    None => return Err(SubmitReviewError::PlanSubmissionMissing { plan_id }),
-                };
-            let body = read_plan_body_bytes(
-                &bailiff,
-                &writ_repo_path_owned,
-                &writ_output_ref_for_read,
-                &plan_note,
-                &allowed_for_read,
-            )
-            .map_err(SubmitReviewError::ReadPlanEnvelope)?;
-            Ok((plan_note, body))
-        })
+    let read_outcome = bailiff
+        .run_blocking(
+            move |repo| -> Result<(PlanNote, String), SubmitReviewError> {
+                let plan_note =
+                    match read_plan_note(repo, plan_id).map_err(SubmitReviewError::ReadPlanNote)? {
+                        Some(note) => note,
+                        None => return Err(SubmitReviewError::PlanSubmissionMissing { plan_id }),
+                    };
+                let body = read_plan_body_bytes(
+                    repo,
+                    &writ_repo_path_owned,
+                    &writ_output_ref_for_read,
+                    &plan_note,
+                    &allowed_for_read,
+                )
+                .map_err(SubmitReviewError::ReadPlanEnvelope)?;
+                Ok((plan_note, body))
+            },
+        )
         .await
         .map_err(SubmitReviewError::ReadTaskFailed)?;
     let (_plan_note, plan_body) = read_outcome?;
@@ -222,26 +231,26 @@ pub async fn submit_review(
         });
     }
 
-    // `write_review_note` shells out to git; wrap in `spawn_blocking`
-    // and hold the bailiff-repo lock for the blocking section only.
+    // `write_review_note` is blocking (shells out to git). Run under
+    // the workflow-held guard so the lock spans this section and the
+    // surrounding awaits without being re-acquired here.
     let writ_repo_path_owned = writ_repo_path.to_path_buf();
     let writ_output_ref_clone = inputs.writ_output_ref.clone();
     let purpose_clone = inputs.purpose.clone();
     let completed_clone = completed.clone();
-    let bailiff_for_write = Arc::clone(&bailiff_repo);
-    let write_outcome = tokio::task::spawn_blocking(move || {
-        let bailiff = bailiff_for_write.blocking_lock();
-        write_review_note(
-            &bailiff,
-            &writ_repo_path_owned,
-            &writ_output_ref_clone,
-            plan_id,
-            purpose_clone,
-            &completed_clone,
-            &allowed_signers,
-        )
-    })
-    .await;
+    let write_outcome = bailiff
+        .run_blocking(move |repo| {
+            write_review_note(
+                repo,
+                &writ_repo_path_owned,
+                &writ_output_ref_clone,
+                plan_id,
+                purpose_clone,
+                &completed_clone,
+                &allowed_signers,
+            )
+        })
+        .await;
     let review_note_oid = match write_outcome {
         Ok(Ok(oid)) => oid,
         Ok(Err(source)) => {
