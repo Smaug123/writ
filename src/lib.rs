@@ -36,6 +36,8 @@ pub(crate) mod clean_git;
 pub mod config;
 pub mod core;
 #[cfg(feature = "host")]
+pub mod git_commit_sign;
+#[cfg(feature = "host")]
 pub mod git_push_promote;
 #[cfg(feature = "host")]
 pub mod git_push_replay;

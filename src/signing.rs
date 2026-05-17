@@ -58,6 +58,19 @@ use crate::secret::{SecretError, SecretKey, SecretStore};
 /// signature minted with the same key.
 pub const WRIT_SSHSIG_NAMESPACE: &str = "writ.run-agent";
 
+/// SSHSIG namespace used when signing Git commit objects for upload
+/// to GitHub via `POST /git/commits`'s `signature` field.
+///
+/// `"git"` is the namespace `git commit -S` (with
+/// `gpg.format=ssh`) and `git verify-commit` use; matching it is
+/// what lets a commit signature produced by
+/// [`WritSigningKey::sign_commit`] verify under the standard
+/// `ssh-keygen -Y verify` workflow and under GitHub's
+/// Verified-commit checks. SSHSIG mixes the namespace into the
+/// hashed prefix, so a `WRIT_SSHSIG_NAMESPACE`-bound signature
+/// cannot pass off as a commit signature, or vice versa.
+pub const GIT_SSHSIG_NAMESPACE: &str = "git";
+
 /// A loaded writ signing keypair, capable of producing SSHSIG-armored
 /// signatures over arbitrary canonical bytes.
 ///
@@ -112,9 +125,35 @@ impl WritSigningKey {
     /// bound to [`WRIT_SSHSIG_NAMESPACE`]. The returned
     /// [`SshSignature`] has already passed the wire-validation gate.
     pub fn sign(&self, msg: &[u8]) -> Result<SshSignature, WritSigningKeyError> {
+        self.sign_with_namespace(WRIT_SSHSIG_NAMESPACE, msg)
+    }
+
+    /// Produce an SSHSIG-armored detached signature over
+    /// `canonical_commit_bytes`, bound to [`GIT_SSHSIG_NAMESPACE`].
+    /// Intended for the staged-push promotion path: the result
+    /// goes in the `signature` field of GitHub's
+    /// `POST /git/commits`, and the same key (verified under
+    /// `"git"`) covers Git's own commit-signature verifier.
+    ///
+    /// `canonical_commit_bytes` is meant to be the output of
+    /// [`crate::git_commit_sign::canonical_commit_bytes`]; signing
+    /// arbitrary bytes is technically supported but the intended
+    /// caller is [`crate::git_commit_sign::sign_commit_for_github`].
+    pub fn sign_commit(
+        &self,
+        canonical_commit_bytes: &[u8],
+    ) -> Result<SshSignature, WritSigningKeyError> {
+        self.sign_with_namespace(GIT_SSHSIG_NAMESPACE, canonical_commit_bytes)
+    }
+
+    fn sign_with_namespace(
+        &self,
+        namespace: &str,
+        msg: &[u8],
+    ) -> Result<SshSignature, WritSigningKeyError> {
         let sig = self
             .inner
-            .sign(WRIT_SSHSIG_NAMESPACE, HashAlg::Sha256, msg)
+            .sign(namespace, HashAlg::Sha256, msg)
             .map_err(WritSigningKeyError::Sign)?;
         let pem = sig
             .to_pem(LineEnding::LF)
