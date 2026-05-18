@@ -318,29 +318,43 @@ pub async fn prepare_staging_repo(
     bundle_bytes: &[u8],
 ) -> Result<StagingRepo, PrepareStagingError> {
     let staging_dir = staging_dir_for(runtime, request_id);
-    if tokio::fs::try_exists(&staging_dir).await.unwrap_or(false) {
-        return Err(PrepareStagingError::StagingDirExists(staging_dir));
-    }
     if let Some(parent) = staging_dir.parent() {
-        // `create_private_dir` is atomic-mode + tighten-if-existing.
-        // `<work_root>` itself is owned by the broker's config layer
-        // (config.rs already creates it at 0700) so we only need to
-        // care about the single `<work_root>/approve` level. If
-        // `<work_root>` is missing we surface the NotFound up rather
-        // than silently `create_dir_all`-ing it at the default umask.
-        create_private_dir(parent).await.map_err(|source| {
+        // Parent is *shared* across approve requests so we must
+        // tolerate AlreadyExists (it persists once any first approve
+        // has run). `<work_root>` itself is owned by the broker's
+        // config layer (config.rs creates it at 0700) so we only need
+        // to materialise the single `<work_root>/approve` level here;
+        // a missing `<work_root>` is a config error and surfaces as
+        // NotFound rather than being silently filled in at the
+        // default umask.
+        ensure_private_dir(parent).await.map_err(|source| {
             PrepareStagingError::AllocateStagingDir {
                 path: parent.to_path_buf(),
                 source,
             }
         })?;
     }
-    create_private_dir(&staging_dir).await.map_err(|source| {
-        PrepareStagingError::AllocateStagingDir {
-            path: staging_dir.clone(),
-            source,
-        }
-    })?;
+    // The per-request staging dir, in contrast, MUST be allocated
+    // exclusively by this call. `create_exclusive_private_dir` does
+    // a single atomic `mkdir(path, 0700)` and returns AlreadyExists
+    // as a hard error; this collapses the prior `try_exists` +
+    // `create_private_dir` pair (which had a TOCTOU window between
+    // the existence check and the mkdir, and was vulnerable to two
+    // concurrent approves both winning the existence check and then
+    // racing on `staged.bundle` / `remove_dir_all`). The dedicated
+    // `StagingDirExists` variant lets the handler surface "duplicate
+    // concurrent approve" distinctly from generic mkdir failures.
+    create_exclusive_private_dir(&staging_dir).await.map_err(
+        |source| match source.kind() {
+            std::io::ErrorKind::AlreadyExists => {
+                PrepareStagingError::StagingDirExists(staging_dir.clone())
+            }
+            _ => PrepareStagingError::AllocateStagingDir {
+                path: staging_dir.clone(),
+                source,
+            },
+        },
+    )?;
 
     // Past this point we own `staging_dir` on disk; any failure must
     // clean it up so the next retry can re-mkdir without tripping the
@@ -411,35 +425,47 @@ pub(crate) fn staging_dir_for(runtime: &PromoteRuntimeConfig, request_id: Reques
         .join(request_id.to_string())
 }
 
-/// Create `path` as a fresh directory whose mode is 0700 *at the
-/// moment of creation* on Unix, then chmod to 0700 to cover the case
-/// where the directory pre-existed at looser permissions.
+/// Atomic-mode `mkdir(path, 0700)` that fails if `path` already
+/// exists. Use this for any directory the caller must own *exclusively*
+/// — a duplicate concurrent caller should be rejected, not silently
+/// joined onto the same path.
 ///
-/// The atomic-create-then-chmod pattern (rather than create-then-chmod
-/// alone) closes a TOCTOU race: with a permissive process umask, a
-/// plain `tokio::fs::create_dir` followed by a separate
-/// `set_permissions` would briefly leave the directory at `0o777 &
-/// ~umask` (typically 0755). A local user on the host who held an
-/// `O_PATH` / `O_DIRECTORY` fd to the parent could `openat` into the
-/// new subdir during that window, keep the fd across the chmod (POSIX
-/// permission checks fire at `open` time, not at use time), and then
-/// readdir / read the staged bundle and the bare repo's loose objects
-/// even after the directory's mode tightened to 0700.
-///
-/// `DirBuilder::mode(0o700)` resolves to a single `mkdir(path, 0700)`
-/// syscall — the kernel ANDs with the process umask, but umask only
-/// *clears* bits, so the resulting mode is `≤ 0o700` and never has
-/// group/other bits set. The follow-up `set_permissions` only matters
-/// when `path` already exists (to tighten a pre-existing
-/// loosely-moded dir). Matches `git_push_staging::create_private_dir`.
-async fn create_private_dir(path: &std::path::Path) -> std::io::Result<()> {
+/// The atomic-mode shape closes a TOCTOU race: with a permissive
+/// process umask, a plain `tokio::fs::create_dir` followed by a
+/// separate `set_permissions` would briefly leave the directory at
+/// `0o777 & ~umask` (typically 0755). A local user on the host who
+/// held an `O_PATH` / `O_DIRECTORY` fd to the parent could `openat`
+/// into the new subdir during that window, keep the fd across the
+/// chmod (POSIX permission checks fire at `open` time, not at use
+/// time), and then readdir / read the staged bundle and the bare
+/// repo's loose objects even after the directory's mode tightened
+/// to 0700. `DirBuilder::mode(0o700)` resolves to a single
+/// `mkdir(path, 0700)` syscall — the kernel ANDs with the process
+/// umask, but umask only *clears* bits, so the resulting mode is
+/// `≤ 0o700` and never has group/other bits set.
+async fn create_exclusive_private_dir(path: &std::path::Path) -> std::io::Result<()> {
     let mut builder = tokio::fs::DirBuilder::new();
     builder.recursive(false);
     #[cfg(unix)]
     {
         builder.mode(0o700);
     }
-    match builder.create(path).await {
+    builder.create(path).await
+}
+
+/// Ensure `path` exists as a 0700 directory, tolerating the case
+/// where it already exists (and tightening its mode if so). Use this
+/// for *shared* directories like `<work_root>/approve` that any
+/// approve request can lazily materialise — the first caller mints
+/// the directory, later callers just validate the mode is right.
+///
+/// Wraps [`create_exclusive_private_dir`] and absorbs AlreadyExists,
+/// then unconditionally chmods to 0700 to tighten the perms in case
+/// the directory pre-existed at a looser mode (e.g. an operator who
+/// hand-created `work_root` with default umask before pointing the
+/// daemon at it). Matches `git_push_staging::create_private_dir`.
+async fn ensure_private_dir(path: &std::path::Path) -> std::io::Result<()> {
+    match create_exclusive_private_dir(path).await {
         Ok(()) => {}
         Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
         Err(err) => return Err(err),
@@ -1365,9 +1391,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("fresh");
         let prior = unsafe { libc::umask(0o000) };
-        let result = create_private_dir(&dir).await;
+        let result = create_exclusive_private_dir(&dir).await;
         let _restore = unsafe { libc::umask(prior) };
-        result.expect("create_private_dir must succeed");
+        result.expect("create_exclusive_private_dir must succeed");
         let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
         assert_eq!(
             mode, 0o700,
@@ -1393,7 +1419,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("private-dir");
-        create_private_dir(&dir).await.unwrap();
+        create_exclusive_private_dir(&dir).await.unwrap();
         let dir_mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
         assert_eq!(
             dir_mode, 0o700,
@@ -1453,5 +1479,70 @@ mod tests {
             "staging dir {} must be cleaned up after prepare failure",
             staging_dir.display(),
         );
+    }
+
+    /// Regression test for the round-3→round-4 race. Two concurrent
+    /// approves for the *same* `request_id` both passed the
+    /// (now-removed) `try_exists` check, then both called the
+    /// AlreadyExists-tolerant `create_private_dir`, so both could
+    /// share the same staging directory; the loser would later
+    /// `remove_dir_all` it out from under the winner. The fix is
+    /// `create_exclusive_private_dir`: a single atomic
+    /// `mkdir(path, 0700)` whose AlreadyExists surfaces as
+    /// `StagingDirExists`. This test pounds the helper directly with
+    /// many concurrent tasks on the same path and asserts exactly one
+    /// wins; everyone else gets AlreadyExists. That is the property
+    /// `prepare_staging_repo`'s per-request-dir call site relies on.
+    #[tokio::test]
+    async fn create_exclusive_private_dir_serialises_concurrent_callers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("contested");
+        let mut handles = Vec::new();
+        for _ in 0..16 {
+            let p = path.clone();
+            handles.push(tokio::spawn(async move {
+                create_exclusive_private_dir(&p).await
+            }));
+        }
+        let mut wins = 0usize;
+        let mut already_exists = 0usize;
+        for h in handles {
+            match h.await.unwrap() {
+                Ok(()) => wins += 1,
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                    already_exists += 1;
+                }
+                Err(err) => panic!("unexpected error: {err:?}"),
+            }
+        }
+        assert_eq!(wins, 1, "exactly one caller must win the mkdir race");
+        assert_eq!(
+            already_exists, 15,
+            "all losers must report AlreadyExists, got {already_exists}",
+        );
+    }
+
+    /// Companion to the race test: `ensure_private_dir` is the
+    /// shared-parent variant that *absorbs* AlreadyExists and just
+    /// (re-)tightens the mode. Calling it repeatedly must succeed
+    /// every time and must always leave the dir at 0700 even if a
+    /// prior caller had left it loose.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ensure_private_dir_is_idempotent_and_tightens_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("shared");
+        std::fs::create_dir(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        ensure_private_dir(&path).await.unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "first ensure must tighten to 0700, got 0o{mode:o}");
+
+        // A second call on a dir already at 0700 must remain a no-op.
+        ensure_private_dir(&path).await.unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "second ensure must keep 0700, got 0o{mode:o}");
     }
 }
