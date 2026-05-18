@@ -72,6 +72,16 @@ impl RunApproveOutcome {
 pub enum RunApproveError {
     #[error("staging repo preparation failed: {0}")]
     Prepare(#[from] PrepareStagingError),
+    #[error("`git cat-file -t` against the staged bundle tip failed: {0}")]
+    ResolveBundleTip(String),
+    /// The bundle's advertised tip is in the staging repo but is not a
+    /// `commit` — typically an annotated tag, tree, or blob. A hostile
+    /// VM that stages a tag-SHA tip would have its tag peeled by
+    /// `rev-list` and the wrong commit would be replayed; this gate
+    /// (mirroring `git_push_replay::ingest_bundle`'s post-unbundle
+    /// `cat-file -t == commit` invariant) prevents that.
+    #[error("bundle tip {sha} is not a commit object (actual type: {actual_type})")]
+    BundleTipNotACommit { sha: String, actual_type: String },
     #[error("fast-forward planning against the staging repo failed: {0}")]
     Plan(#[from] FastForwardPlanError),
     #[error("could not open `git cat-file --batch` against the staging repo: {0}")]
@@ -205,6 +215,15 @@ pub async fn run_approve_with_staging_repo(
     signing_key: &WritSigningKey,
     trailers: &[TrailerSource],
 ) -> Result<RunApproveOutcome, RunApproveError> {
+    // Mirror `git_push_replay::ingest_bundle`'s commit-type gate. The
+    // bundle has been unbundled into the staging repo by this point;
+    // `cat-file -t <bundle_tip>` reports the object's *literal* type
+    // (`commit` / `tag` / `tree` / `blob`) without peeling, so a
+    // hostile VM that stages an annotated tag SHA as the bundle tip
+    // would be caught here instead of being silently peeled to its
+    // target commit by the later `rev-list` walk.
+    verify_bundle_tip_is_commit(runtime, staging.path(), bundle_tip).await?;
+
     let plan = plan_fast_forward_via_rev_list(
         bundle_tip,
         expected_remote_head,
@@ -309,8 +328,19 @@ pub async fn prepare_staging_repo(
                 source,
             }
         })?;
+        // `create_dir_all` honours the process umask, so an existing
+        // `<work_root>/approve` (or one created above) may be 0755.
+        // Chmod it down to 0700 unconditionally — the staged bundle
+        // and the bare repo's loose objects sit inside this tree, and
+        // the threat model considers other local users on the host.
+        set_private_dir_permissions(parent).await.map_err(|source| {
+            PrepareStagingError::AllocateStagingDir {
+                path: parent.to_path_buf(),
+                source,
+            }
+        })?;
     }
-    tokio::fs::create_dir(&staging_dir).await.map_err(|source| {
+    create_private_dir(&staging_dir).await.map_err(|source| {
         PrepareStagingError::AllocateStagingDir {
             path: staging_dir.clone(),
             source,
@@ -354,7 +384,7 @@ async fn run_prepare_steps(
     bundle_bytes: &[u8],
 ) -> Result<(), PrepareStagingError> {
     let bundle_path = staging_dir.join("staged.bundle");
-    tokio::fs::write(&bundle_path, bundle_bytes)
+    write_private_file(&bundle_path, bundle_bytes)
         .await
         .map_err(|source| PrepareStagingError::WriteBundleFile {
             path: bundle_path.clone(),
@@ -384,6 +414,47 @@ pub(crate) fn staging_dir_for(runtime: &PromoteRuntimeConfig, request_id: Reques
         .work_root()
         .join("approve")
         .join(request_id.to_string())
+}
+
+/// Create `path` as a fresh directory with mode 0700 on Unix.
+///
+/// Matches the `GitPushStagingStore::create_private_dir` pattern: the
+/// staged bundle and the bare repo's loose objects sit inside this
+/// directory, so other local users on the host must not be able to
+/// read them. On non-Unix platforms the chmod is a no-op (Windows
+/// has its own ACL model that this code does not target).
+async fn create_private_dir(path: &std::path::Path) -> std::io::Result<()> {
+    tokio::fs::create_dir(path).await?;
+    set_private_dir_permissions(path).await
+}
+
+#[cfg(unix)]
+async fn set_private_dir_permissions(path: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).await
+}
+
+#[cfg(not(unix))]
+async fn set_private_dir_permissions(_path: &std::path::Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+/// Write `body` to `path` with mode 0600 on Unix, refusing to clobber
+/// an existing file. Matches `git_push_staging::write_private_file`.
+async fn write_private_file(path: &std::path::Path, body: &[u8]) -> std::io::Result<()> {
+    // tokio's `OpenOptions::mode` is an inherent method on Unix
+    // builds (not a trait), so no `OpenOptionsExt` import is needed
+    // — on non-Unix builds the call simply isn't compiled.
+    let mut options = tokio::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        options.mode(0o600);
+    }
+    use tokio::io::AsyncWriteExt;
+    let mut file = options.open(path).await?;
+    file.write_all(body).await?;
+    file.sync_all().await
 }
 
 /// `git -C <staging_dir> init --bare --quiet`.
@@ -454,6 +525,57 @@ pub(crate) fn build_fetch_prereq_invocation(
         env,
         vec![credential.token_env().as_str().to_string()],
     )
+}
+
+/// `git -C <staging_dir> cat-file -t <bundle_tip>`.
+///
+/// Asserts that `bundle_tip` resolves to a commit object — `cat-file
+/// -t` returns the object's literal type (no peeling), so an
+/// annotated-tag SHA shows up as `"tag"` rather than passing through
+/// as `"commit"` like `rev-parse --verify <sha>^{commit}` would.
+/// Mirrors the invariant
+/// [`crate::git_push_replay::ingest_bundle`] enforces post-unbundle.
+pub(crate) fn build_resolve_bundle_tip_invocation(
+    runtime: &PromoteRuntimeConfig,
+    staging_dir: &std::path::Path,
+    bundle_tip: &GitObjectId,
+) -> CleanGitInvocation {
+    CleanGitInvocation::new(
+        runtime.git_program().to_path_buf(),
+        [
+            OsString::from("-C"),
+            staging_dir.as_os_str().to_os_string(),
+            OsString::from("cat-file"),
+            OsString::from("-t"),
+            OsString::from(bundle_tip.as_str()),
+        ],
+        clean_git_config_env(),
+        Vec::new(),
+    )
+}
+
+/// Run `cat-file -t <bundle_tip>` against the staging repo and reject
+/// anything other than a `commit` object. See
+/// [`build_resolve_bundle_tip_invocation`] for the motivation.
+async fn verify_bundle_tip_is_commit(
+    runtime: &PromoteRuntimeConfig,
+    staging_dir: &std::path::Path,
+    bundle_tip: &GitObjectId,
+) -> Result<(), RunApproveError> {
+    let invocation = build_resolve_bundle_tip_invocation(runtime, staging_dir, bundle_tip);
+    let stdout = clean_git::run_clean_git_capture_stdout(&invocation, runtime.step_timeout(), None)
+        .await
+        .map_err(|e| RunApproveError::ResolveBundleTip(e.to_string()))?;
+    let text = std::str::from_utf8(&stdout).unwrap_or("<non-utf8>");
+    let actual = text.trim_end();
+    if actual == "commit" {
+        Ok(())
+    } else {
+        Err(RunApproveError::BundleTipNotACommit {
+            sha: bundle_tip.as_str().to_string(),
+            actual_type: actual.to_string(),
+        })
+    }
 }
 
 /// `git -C <staging_dir> bundle unbundle <bundle_path>`.
@@ -1125,6 +1247,119 @@ mod tests {
             exists.success(),
             "bundled commit {head} not present in staging repo after unbundle",
             head = head.as_str(),
+        );
+    }
+
+    /// Regression test for the annotated-tag bundle-tip bypass:
+    /// `cat-file -t` reports the literal object type, so when the
+    /// bundle's advertised tip is a tag SHA we must reject it
+    /// instead of letting `rev-list` peel it to its target commit.
+    /// Stand up a real staging repo containing both a commit and an
+    /// annotated tag, pass the tag SHA as `bundle_tip`, and assert
+    /// `RunApproveError::BundleTipNotACommit`.
+    #[tokio::test]
+    async fn run_approve_rejects_non_commit_bundle_tip() {
+        let Some(git) = maybe_git() else {
+            eprintln!("skipping: `git` not on PATH");
+            return;
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let work = tmp.path().join("work");
+        let staging_path = tmp.path().join("staging.git");
+        std::fs::create_dir(&work).unwrap();
+        run_git(&git, &work, &["init", "--quiet", "--initial-branch=main"]);
+        run_git(
+            &git,
+            &work,
+            &["commit", "--allow-empty", "--quiet", "-m", "one"],
+        );
+        let commit = rev_parse(&git, &work, "HEAD");
+        run_git(&git, &work, &["tag", "-a", "v1", "-m", "tagmsg"]);
+        // `git rev-parse v1` returns the tag-object SHA (not the
+        // commit it points at), which is exactly what a hostile VM
+        // would stage if it tried to launder a tag through approve.
+        let tag_sha = rev_parse(&git, &work, "v1");
+        assert_ne!(
+            tag_sha, commit,
+            "annotated tag must be a distinct object from its target",
+        );
+
+        run_git(&git, tmp.path(), &["init", "--bare", "--quiet", "staging.git"]);
+        // Fetch the tag explicitly so the tag object lands in staging.
+        run_git(
+            &git,
+            &staging_path,
+            &[
+                "fetch",
+                "--no-tags",
+                "--quiet",
+                &work.display().to_string(),
+                "refs/tags/v1:refs/tags/v1",
+            ],
+        );
+
+        let runtime = runtime_pointed_at(tmp.path());
+        let staging = StagingRepo::from_path_for_test(staging_path);
+        let server = MockServer::start().await;
+        // Reject before any HTTP traffic is issued: no mocks needed,
+        // but assert the staging-repo type check fires first.
+        let branch = GitBranchName::new("main").unwrap();
+        let err = run_approve_with_staging_repo(
+            &staging,
+            &runtime,
+            &server.uri(),
+            &sample_token(),
+            &sample_repo().as_repo_ref().clone(),
+            &branch,
+            &commit,
+            &tag_sha,
+            &sample_signing_key(),
+            &[],
+        )
+        .await
+        .expect_err("tag-SHA bundle tip must be rejected before planning");
+
+        assert!(
+            matches!(
+                err,
+                RunApproveError::BundleTipNotACommit { ref sha, ref actual_type }
+                    if sha == tag_sha.as_str() && actual_type == "tag"
+            ),
+            "expected BundleTipNotACommit{{tag}}, got: {err:?}",
+        );
+    }
+
+    /// Regression test that prepare creates the staging dir and the
+    /// bundle file with private (0700 / 0600) permissions on Unix.
+    /// Other local users must not be able to read the staged bundle
+    /// or the loose objects in the bare repo.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn prepare_creates_staging_artifacts_with_private_permissions() {
+        // We don't need fetch to succeed for this test — just the
+        // chmod-after-create path. Run prepare against a nonexistent
+        // git binary so init fails *after* the staging dir + bundle
+        // file have been created, then inspect their modes on the
+        // returned-but-cleaned-up... wait — cleanup removes them.
+        // Instead, run prepare just up to the bundle write by
+        // exercising the helpers directly. They're the targets of
+        // the codex finding so a direct test is the right granularity.
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("private-dir");
+        create_private_dir(&dir).await.unwrap();
+        let dir_mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            dir_mode, 0o700,
+            "private staging dir must be 0700, got 0o{dir_mode:o}",
+        );
+
+        let file = dir.join("staged.bundle");
+        write_private_file(&file, b"bundle-bytes").await.unwrap();
+        let file_mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            file_mode, 0o600,
+            "private bundle file must be 0600, got 0o{file_mode:o}",
         );
     }
 
