@@ -32,6 +32,7 @@ use crate::core::{
     TtlSeconds, UnixMillis,
 };
 use crate::core::{NotesRef, Sha256Hex};
+use crate::git_push_promote::PromoteRuntimeConfig;
 use crate::git_push_staging::{GitPushStagingStore, StagedEntry, StagingError};
 use crate::github::GitHubMinter;
 use crate::notes_repo::NotesRepo;
@@ -76,6 +77,12 @@ pub struct RunAgentSpawnConfig {
 /// configurations that don't need agent-run signing (e.g. agent-VM-only
 /// tests) and a missing one should be reported as an explicit
 /// configuration error, not a generic "broker confused" failure.
+///
+/// `promote_runtime` is `Some` exactly when writd was booted with agent-VM
+/// HTTP support; it carries the git/credential/work-root/step-timeout
+/// values needed to execute an approved staged push. The handler for
+/// [`ClientMessage::ApproveStagedPush`] returns a clean configuration
+/// error when this is `None`, same as the `RunAgent` triple does.
 pub struct BrokerState<S: SecretStore> {
     pub audit: Arc<AuditLog>,
     pub minter: GitHubMinter,
@@ -85,6 +92,7 @@ pub struct BrokerState<S: SecretStore> {
     pub notes_repo: Option<Arc<NotesRepo>>,
     pub signing_key: Option<WritSigningKey>,
     pub run_agent_spawn: Option<RunAgentSpawnConfig>,
+    pub promote_runtime: Option<Arc<PromoteRuntimeConfig>>,
 }
 
 #[derive(Clone, Eq, PartialEq)]
@@ -1807,6 +1815,7 @@ mod tests {
             notes_repo: None,
             signing_key: None,
             run_agent_spawn: None,
+            promote_runtime: None,
         })
     }
 
@@ -1856,6 +1865,7 @@ mod tests {
             notes_repo: None,
             signing_key: None,
             run_agent_spawn: None,
+            promote_runtime: None,
         })
     }
 
@@ -2036,6 +2046,7 @@ mod tests {
                 command: cat,
                 args: Vec::new(),
             }),
+            promote_runtime: base.promote_runtime,
         });
 
         let prompt_text = "hello world from cat\n";
@@ -2146,6 +2157,7 @@ mod tests {
                 command: false_bin,
                 args: Vec::new(),
             }),
+            promote_runtime: base.promote_runtime,
         });
 
         let resp = dispatch_message(
@@ -2217,6 +2229,7 @@ mod tests {
                 command: sh,
                 args: vec!["-c".into(), "printf out; printf err 1>&2; exit 0".into()],
             }),
+            promote_runtime: base.promote_runtime,
         });
 
         let output_ref =
@@ -2308,6 +2321,7 @@ mod tests {
                     format!("head -c {} /dev/zero", MAX_RUN_AGENT_STREAM_BYTES + 1024),
                 ],
             }),
+            promote_runtime: base.promote_runtime,
         });
 
         let output_ref =
@@ -2381,6 +2395,7 @@ mod tests {
                 command: cat,
                 args: Vec::new(),
             }),
+            promote_runtime: base.promote_runtime,
         });
 
         let session_id = SessionId::new();
@@ -2449,6 +2464,7 @@ mod tests {
                 command: cat,
                 args: Vec::new(),
             }),
+            promote_runtime: base.promote_runtime,
         });
 
         let bogus = SessionId::new();
@@ -2500,6 +2516,7 @@ mod tests {
                 command: cat,
                 args: Vec::new(),
             }),
+            promote_runtime: base.promote_runtime,
         });
 
         let session_id = SessionId::new();

@@ -160,6 +160,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
+    let promote_runtime = agent_vm
+        .as_ref()
+        .map(|cfg| Arc::new(cfg.vm_http().git_clone().to_promote_runtime_config()));
+
     let state = Arc::new(BrokerState {
         audit: Arc::new(audit),
         minter: GitHubMinter::new_registry(github_apps),
@@ -169,6 +173,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         notes_repo,
         signing_key,
         run_agent_spawn,
+        promote_runtime,
     });
 
     tracing::info!(

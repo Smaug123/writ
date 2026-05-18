@@ -1769,6 +1769,7 @@ mod tests {
             notes_repo: None,
             signing_key: None,
             run_agent_spawn: None,
+            promote_runtime: None,
         })
     }
 
