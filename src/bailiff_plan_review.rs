@@ -535,6 +535,7 @@ mod end_to_end_tests {
                 command: cat,
                 args: Vec::new(),
             }),
+            promote_runtime: None,
         });
         let socket_dir = tempfile::tempdir().unwrap();
         std::fs::set_permissions(socket_dir.path(), std::fs::Permissions::from_mode(0o700))

@@ -116,6 +116,24 @@ impl VmHttpGitCloneConfig {
         &self.work_root
     }
 
+    /// Derive the broker-side `PromoteRuntimeConfig` from the same
+    /// validated clone-side values. The two configs share `git_program`,
+    /// `clone_base_url`, `credential`, `work_root`, and the per-step
+    /// timeout; `max_bundle_bytes` is clone-specific and is dropped.
+    /// Infallible because `VmHttpGitCloneConfig::new_with_clone_base_url`
+    /// already enforces every invariant `PromoteRuntimeConfig::new`
+    /// checks for.
+    pub fn to_promote_runtime_config(&self) -> crate::git_push_promote::PromoteRuntimeConfig {
+        crate::git_push_promote::PromoteRuntimeConfig::new(
+            self.git_program.clone(),
+            self.clone_base_url.clone(),
+            self.credential.clone(),
+            self.work_root.clone(),
+            self.timeout,
+        )
+        .expect("VmHttpGitCloneConfig invariants imply PromoteRuntimeConfig validity")
+    }
+
     fn plan_for_request(
         &self,
         request: VmGitCloneRequest,

@@ -24,6 +24,9 @@
 //! the key — it only owns the question of whether the post-walk lease
 //! still holds.
 
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
 use crate::core::RepoRef;
 use crate::git_push_replay::TrailerSource;
 use crate::git_push_replay_walker::{
@@ -32,6 +35,99 @@ use crate::git_push_replay_walker::{
 use crate::github_git_db::{GitDataClient, GitDataError};
 use crate::signing::WritSigningKey;
 use crate::vm_git::{GitBranchName, GitObjectId};
+use crate::vm_git_bundle::{GitCloneBaseUrl, GitCredentialBoundary};
+
+/// Static configuration the broker needs to drive an approved staged
+/// push end-to-end: spin up a fresh bare staging repo, fetch the
+/// prerequisite commit from origin, ingest the bundle, then plan +
+/// walk onto GitHub and update the branch ref.
+///
+/// The values mirror the subset of
+/// [`crate::vm_http::VmHttpGitCloneConfig`] that promote also needs:
+/// `git_program` to run `git init --bare`/`git fetch`/`git bundle
+/// unbundle`; `clone_base_url` and `credential` to authenticate the
+/// prereq fetch against `https://github.com/<owner>/<name>.git`;
+/// `work_root` as the parent directory under which each promote
+/// allocates a fresh per-request staging repo; and `step_timeout` as
+/// the per-step ceiling each `git` invocation runs under.
+///
+/// Carried as `Option<Arc<Self>>` on
+/// [`crate::server::BrokerState`]. `None` means writd was booted
+/// without VM-HTTP support, so `approve_staged_push` returns a clean
+/// configuration error rather than a generic "broker confused"
+/// failure — same pattern the `RunAgent` triple already follows.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PromoteRuntimeConfig {
+    git_program: PathBuf,
+    clone_base_url: GitCloneBaseUrl,
+    credential: GitCredentialBoundary,
+    work_root: PathBuf,
+    step_timeout: Duration,
+}
+
+#[derive(Debug, thiserror::Error, Eq, PartialEq)]
+pub enum PromoteRuntimeConfigError {
+    #[error("git_program path must not be empty")]
+    EmptyGitProgram,
+    #[error("work_root path must not be empty")]
+    EmptyWorkRoot,
+    #[error("work_root must be absolute: {0}")]
+    RelativeWorkRoot(PathBuf),
+    #[error("step_timeout must be nonzero")]
+    ZeroStepTimeout,
+}
+
+impl PromoteRuntimeConfig {
+    pub fn new(
+        git_program: impl Into<PathBuf>,
+        clone_base_url: GitCloneBaseUrl,
+        credential: GitCredentialBoundary,
+        work_root: impl Into<PathBuf>,
+        step_timeout: Duration,
+    ) -> Result<Self, PromoteRuntimeConfigError> {
+        let git_program = git_program.into();
+        let work_root = work_root.into();
+        if git_program.as_os_str().is_empty() {
+            return Err(PromoteRuntimeConfigError::EmptyGitProgram);
+        }
+        if work_root.as_os_str().is_empty() {
+            return Err(PromoteRuntimeConfigError::EmptyWorkRoot);
+        }
+        if !work_root.is_absolute() {
+            return Err(PromoteRuntimeConfigError::RelativeWorkRoot(work_root));
+        }
+        if step_timeout.is_zero() {
+            return Err(PromoteRuntimeConfigError::ZeroStepTimeout);
+        }
+        Ok(Self {
+            git_program,
+            clone_base_url,
+            credential,
+            work_root,
+            step_timeout,
+        })
+    }
+
+    pub fn git_program(&self) -> &Path {
+        &self.git_program
+    }
+
+    pub fn clone_base_url(&self) -> &GitCloneBaseUrl {
+        &self.clone_base_url
+    }
+
+    pub fn credential(&self) -> &GitCredentialBoundary {
+        &self.credential
+    }
+
+    pub fn work_root(&self) -> &Path {
+        &self.work_root
+    }
+
+    pub fn step_timeout(&self) -> Duration {
+        self.step_timeout
+    }
+}
 
 /// Outcome of running [`execute_fast_forward_plan`].
 ///
@@ -306,6 +402,87 @@ mod tests {
             "ref": "refs/heads/main",
             "object": { "sha": sha.as_str(), "type": "commit" },
         })
+    }
+
+    fn sample_credential() -> GitCredentialBoundary {
+        use crate::vm_git_bundle::GitSecretEnvVar;
+        GitCredentialBoundary::new(
+            PathBuf::from("/usr/local/bin/fake-askpass"),
+            GitSecretEnvVar::new("WRIT_GIT_TOKEN").unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn promote_runtime_config_rejects_empty_git_program() {
+        let err = PromoteRuntimeConfig::new(
+            PathBuf::new(),
+            GitCloneBaseUrl::github(),
+            sample_credential(),
+            PathBuf::from("/tmp/promote"),
+            Duration::from_secs(30),
+        )
+        .expect_err("empty git program must be rejected");
+        assert_eq!(err, PromoteRuntimeConfigError::EmptyGitProgram);
+    }
+
+    #[test]
+    fn promote_runtime_config_rejects_empty_work_root() {
+        let err = PromoteRuntimeConfig::new(
+            PathBuf::from("/usr/bin/git"),
+            GitCloneBaseUrl::github(),
+            sample_credential(),
+            PathBuf::new(),
+            Duration::from_secs(30),
+        )
+        .expect_err("empty work root must be rejected");
+        assert_eq!(err, PromoteRuntimeConfigError::EmptyWorkRoot);
+    }
+
+    #[test]
+    fn promote_runtime_config_rejects_relative_work_root() {
+        let err = PromoteRuntimeConfig::new(
+            PathBuf::from("/usr/bin/git"),
+            GitCloneBaseUrl::github(),
+            sample_credential(),
+            PathBuf::from("relative/promote"),
+            Duration::from_secs(30),
+        )
+        .expect_err("relative work root must be rejected");
+        assert_eq!(
+            err,
+            PromoteRuntimeConfigError::RelativeWorkRoot(PathBuf::from("relative/promote")),
+        );
+    }
+
+    #[test]
+    fn promote_runtime_config_rejects_zero_step_timeout() {
+        let err = PromoteRuntimeConfig::new(
+            PathBuf::from("/usr/bin/git"),
+            GitCloneBaseUrl::github(),
+            sample_credential(),
+            PathBuf::from("/tmp/promote"),
+            Duration::ZERO,
+        )
+        .expect_err("zero timeout must be rejected");
+        assert_eq!(err, PromoteRuntimeConfigError::ZeroStepTimeout);
+    }
+
+    #[test]
+    fn promote_runtime_config_round_trips_valid_inputs() {
+        let cfg = PromoteRuntimeConfig::new(
+            PathBuf::from("/usr/bin/git"),
+            GitCloneBaseUrl::github(),
+            sample_credential(),
+            PathBuf::from("/tmp/promote"),
+            Duration::from_secs(60),
+        )
+        .expect("valid promote runtime config");
+        assert_eq!(cfg.git_program(), Path::new("/usr/bin/git"));
+        assert_eq!(cfg.work_root(), Path::new("/tmp/promote"));
+        assert_eq!(cfg.step_timeout(), Duration::from_secs(60));
+        assert_eq!(cfg.clone_base_url(), &GitCloneBaseUrl::github());
+        let _credential: &GitCredentialBoundary = cfg.credential();
     }
 
     /// The `AlreadyAtExpected` arm must short-circuit before any

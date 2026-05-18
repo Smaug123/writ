@@ -2220,6 +2220,7 @@ mod end_to_end_tests {
                 command: cat,
                 args: Vec::new(),
             }),
+            promote_runtime: None,
         });
 
         let socket_dir = tempfile::tempdir().unwrap();
@@ -2359,6 +2360,7 @@ mod end_to_end_tests {
                 command: cat,
                 args: Vec::new(),
             }),
+            promote_runtime: None,
         });
 
         let socket_dir = tempfile::tempdir().unwrap();
@@ -2495,6 +2497,7 @@ mod end_to_end_tests {
                 command: cat,
                 args: Vec::new(),
             }),
+            promote_runtime: None,
         });
 
         let socket_dir = tempfile::tempdir().unwrap();
