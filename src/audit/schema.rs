@@ -49,7 +49,7 @@ pub(super) struct Migration {
 /// a version higher than this is rejected with [`AuditError::SchemaTooNew`]
 /// rather than opened — we'd rather fail to start than silently drop data
 /// into a schema a newer broker wrote.
-pub(super) const SCHEMA_VERSION: i32 = 3;
+pub(super) const SCHEMA_VERSION: i32 = 4;
 
 /// The full migration history. Each entry documents exactly one state
 /// transition; the sequence of entries is the schema's lineage. Order
@@ -69,6 +69,11 @@ pub(super) const MIGRATIONS: &[Migration] = &[
         version: 3,
         name: "0003_plan_abort",
         sql: include_str!("migrations/0003_plan_abort.sql"),
+    },
+    Migration {
+        version: 4,
+        name: "0004_git_push_resolution_mint",
+        sql: include_str!("migrations/0004_git_push_resolution_mint.sql"),
     },
 ];
 
@@ -324,6 +329,8 @@ mod tests {
             "git_push_attempt_requires_matching_grant",
             "git_push_outcome_attempt_matches_request",
             "git_push_resolution_requires_staged",
+            "git_push_resolution_mint_matches_decision_insert",
+            "git_push_resolution_mint_matches_decision_update",
             "plan_requires_open_session",
             "plan_review_requires_open_session",
             "plan_review_requires_reviewer_run",

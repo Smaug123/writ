@@ -66,14 +66,30 @@ pub struct GitPushOutcomeRecord<'a> {
     pub message: &'a str,
 }
 
-/// Operator decision on a staged push. `Approved` is reserved for a
-/// later promotion stage but is admitted by the v13 schema so future
-/// migrations are not needed when wiring up that flow.
-#[derive(Copy, Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
+/// Mint context captured when an approval issues a GitHub App
+/// installation token. Stored inline with the resolution row because
+/// the originating session is closed by the time the operator decides,
+/// so this mint cannot be threaded through the session-scoped
+/// `request` / `grant_log` audit chain. The four fields together
+/// answer "did this approval ever produce a credential, and which
+/// one?" without a session-graph join.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct PromoteMintAudit {
+    pub jti: Jti,
+    pub github_app_id: u64,
+    pub issued_at: UnixMillis,
+    pub expires_at: UnixMillis,
+}
+
+/// Operator decision on a staged push. `Approved` carries the mint
+/// context the broker captured while issuing the installation token
+/// used to promote the push; the schema's BEFORE-INSERT/UPDATE trigger
+/// enforces that the column-level shape (all four mint columns NOT
+/// NULL ↔ approved, all NULL ↔ rejected) matches this variant.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum GitPushResolution {
     Rejected,
-    Approved,
+    Approved(PromoteMintAudit),
 }
 
 #[derive(Debug)]
@@ -387,6 +403,23 @@ impl AuditLog {
             ));
         }
 
+        let (mint_jti, mint_github_app_id, mint_issued_at, mint_expires_at) = match r.decision {
+            GitPushResolution::Rejected => (None, None, None, None),
+            GitPushResolution::Approved(audit) => {
+                let github_app_id = i64::try_from(audit.github_app_id).map_err(|_| {
+                    AuditError::Invariant(
+                        "git push resolution mint github_app_id exceeds SQLite integer",
+                    )
+                })?;
+                (
+                    Some(audit.jti.as_uuid().to_string()),
+                    Some(github_app_id),
+                    Some(audit.issued_at.as_millis()),
+                    Some(audit.expires_at.as_millis()),
+                )
+            }
+        };
+
         self.with_conn_mut(|c| {
             c.execute(
                 "INSERT INTO git_push_resolution (
@@ -394,14 +427,22 @@ impl AuditLog {
                      decided_at,
                      decision,
                      operator,
-                     reason
-                 ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                     reason,
+                     mint_jti,
+                     mint_github_app_id,
+                     mint_issued_at,
+                     mint_expires_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 params![
                     r.push_request_id.as_uuid().to_string(),
                     r.decided_at.as_millis(),
-                    r.decision.as_str(),
+                    r.decision.kind_str(),
                     r.operator,
                     r.reason,
+                    mint_jti,
+                    mint_github_app_id,
+                    mint_issued_at,
+                    mint_expires_at,
                 ],
             )?;
             Ok(())
@@ -440,7 +481,11 @@ impl AuditLog {
                      res.decided_at,
                      res.decision,
                      res.operator,
-                     res.reason
+                     res.reason,
+                     res.mint_jti,
+                     res.mint_github_app_id,
+                     res.mint_issued_at,
+                     res.mint_expires_at
                  FROM git_push_request r
                  LEFT JOIN git_push_attempt a ON a.push_request_id = r.push_request_id
                  LEFT JOIN git_push_outcome o ON o.push_request_id = r.push_request_id
@@ -485,7 +530,11 @@ impl AuditLog {
                      res.decided_at,
                      res.decision,
                      res.operator,
-                     res.reason
+                     res.reason,
+                     res.mint_jti,
+                     res.mint_github_app_id,
+                     res.mint_issued_at,
+                     res.mint_expires_at
                  FROM git_push_request r
                  LEFT JOIN git_push_attempt a ON a.push_request_id = r.push_request_id
                  LEFT JOIN git_push_outcome o ON o.push_request_id = r.push_request_id
@@ -536,17 +585,66 @@ impl GitPushOutcomeResult {
 }
 
 impl GitPushResolution {
-    pub fn as_str(self) -> &'static str {
+    /// The decision kind as stored in `git_push_resolution.decision`.
+    /// Pairs with the four mint columns (`mint_jti`, `mint_github_app_id`,
+    /// `mint_issued_at`, `mint_expires_at`); the schema's trigger enforces
+    /// that the kind and the column-presence shape agree.
+    pub fn kind_str(self) -> &'static str {
         match self {
             Self::Rejected => "rejected",
-            Self::Approved => "approved",
+            Self::Approved(_) => "approved",
         }
     }
 
-    fn from_str(raw: &str) -> Result<Self, AuditError> {
-        match raw {
-            "rejected" => Ok(Self::Rejected),
-            "approved" => Ok(Self::Approved),
+    /// Reconstruct a resolution from a row's `decision` column and the
+    /// four mint columns. Returns an `Invariant` error if the kind /
+    /// column-presence pairing is corrupt — the SQL trigger normally
+    /// prevents that, but defence in depth at the parse boundary keeps
+    /// downstream code from observing an impossible variant.
+    fn from_row_parts(
+        decision: &str,
+        mint_jti: Option<String>,
+        mint_github_app_id: Option<i64>,
+        mint_issued_at: Option<i64>,
+        mint_expires_at: Option<i64>,
+    ) -> Result<Self, AuditError> {
+        match decision {
+            "rejected" => match (mint_jti, mint_github_app_id, mint_issued_at, mint_expires_at) {
+                (None, None, None, None) => Ok(Self::Rejected),
+                _ => Err(AuditError::Invariant(
+                    "Git push audit row: rejected resolution carries mint context",
+                )),
+            },
+            "approved" => {
+                let jti_str = mint_jti.ok_or(AuditError::Invariant(
+                    "Git push audit row: approved resolution missing mint jti",
+                ))?;
+                let jti = uuid::Uuid::parse_str(&jti_str).map(Jti::from_uuid).map_err(|_| {
+                    AuditError::Invariant("Git push audit row: mint jti is not a uuid")
+                })?;
+                let github_app_id_i64 = mint_github_app_id.ok_or(AuditError::Invariant(
+                    "Git push audit row: approved resolution missing mint github_app_id",
+                ))?;
+                let github_app_id = u64::try_from(github_app_id_i64).map_err(|_| {
+                    AuditError::Invariant("Git push audit row: mint github_app_id is negative")
+                })?;
+                let issued_at = mint_issued_at.map(UnixMillis::from_millis).ok_or(
+                    AuditError::Invariant(
+                        "Git push audit row: approved resolution missing mint issued_at",
+                    ),
+                )?;
+                let expires_at = mint_expires_at.map(UnixMillis::from_millis).ok_or(
+                    AuditError::Invariant(
+                        "Git push audit row: approved resolution missing mint expires_at",
+                    ),
+                )?;
+                Ok(Self::Approved(PromoteMintAudit {
+                    jti,
+                    github_app_id,
+                    issued_at,
+                    expires_at,
+                }))
+            }
             _ => Err(AuditError::Invariant(
                 "Git push audit resolution decision is invalid",
             )),
@@ -590,6 +688,10 @@ fn git_push_audit_entry_from_row(
     let resolution_decision: Option<String> = row.get("decision")?;
     let resolution_operator: Option<String> = row.get("operator")?;
     let resolution_reason: Option<String> = row.get("reason")?;
+    let resolution_mint_jti: Option<String> = row.get("mint_jti")?;
+    let resolution_mint_github_app_id: Option<i64> = row.get("mint_github_app_id")?;
+    let resolution_mint_issued_at: Option<i64> = row.get("mint_issued_at")?;
+    let resolution_mint_expires_at: Option<i64> = row.get("mint_expires_at")?;
 
     let parse = || -> Result<GitPushAuditEntry, AuditError> {
         let push_request_id = uuid::Uuid::parse_str(&push_request_id_str)
@@ -699,9 +801,11 @@ fn git_push_audit_entry_from_row(
             })
             .transpose()?;
 
-        // All four resolution columns are `NOT NULL`, so they are
-        // either all present (joined row matched) or all absent (no
-        // resolution recorded). Any partial state is corruption.
+        // The first four resolution columns are `NOT NULL`, so they
+        // are either all present (joined row matched) or all absent
+        // (no resolution recorded). Any partial state is corruption.
+        // The mint columns are nullable and validated against the
+        // decision kind by `GitPushResolution::from_row_parts`.
         let resolution = match (
             resolution_decided_at,
             resolution_decision,
@@ -710,9 +814,16 @@ fn git_push_audit_entry_from_row(
         ) {
             (None, None, None, None) => None,
             (Some(decided_at), Some(decision), Some(operator), Some(reason)) => {
+                let decision = GitPushResolution::from_row_parts(
+                    &decision,
+                    resolution_mint_jti,
+                    resolution_mint_github_app_id,
+                    resolution_mint_issued_at,
+                    resolution_mint_expires_at,
+                )?;
                 Some(GitPushResolutionEntry {
                     decided_at: UnixMillis::from_millis(decided_at),
-                    decision: GitPushResolution::from_str(&decision)?,
+                    decision,
                     operator,
                     reason,
                 })
@@ -1742,11 +1853,48 @@ mod tests {
         assert_eq!(entries[0].resolution, entry.resolution);
     }
 
-    /// `Approved` is admitted by the v13 CHECK on `decision`, even
-    /// though Stage B only writes `Rejected`. Stage D will write
-    /// `Approved` and must not require a fresh migration.
+    fn sample_promote_mint_audit() -> PromoteMintAudit {
+        PromoteMintAudit {
+            jti: Jti::new(),
+            github_app_id: 42,
+            issued_at: UnixMillis::from_millis(1_700_000_190),
+            expires_at: UnixMillis::from_millis(1_700_000_490),
+        }
+    }
+
+    /// `Approved` carries a `PromoteMintAudit` payload that the SQL
+    /// trigger requires to be present iff the decision is approved.
+    /// Round-trip the mint context through INSERT + LEFT JOIN read.
     #[test]
-    fn record_resolution_accepts_approved_decision() {
+    fn record_resolution_roundtrips_approved_with_mint_payload() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+        let push_request_id = RequestId::new();
+        record_staged_request(&log, push_request_id, s.session_id);
+        let mint = sample_promote_mint_audit();
+
+        log.record_git_push_resolution(&GitPushResolutionRecord {
+            push_request_id,
+            decided_at: UnixMillis::from_millis(1_700_000_200),
+            decision: GitPushResolution::Approved(mint),
+            operator: "alice",
+            reason: "looks good",
+        })
+        .unwrap();
+
+        let entry = log.get_git_push(push_request_id).unwrap().unwrap();
+        assert_eq!(
+            entry.resolution.unwrap().decision,
+            GitPushResolution::Approved(mint)
+        );
+    }
+
+    /// A `Rejected` resolution leaves all four mint columns NULL —
+    /// reading the row back observes exactly `Rejected`, not a corrupt
+    /// `Approved` with partial mint context.
+    #[test]
+    fn record_resolution_rejected_persists_null_mint_columns() {
         let log = AuditLog::open_in_memory().unwrap();
         let s = sample_session();
         log.open_session(&s).unwrap();
@@ -1756,16 +1904,101 @@ mod tests {
         log.record_git_push_resolution(&GitPushResolutionRecord {
             push_request_id,
             decided_at: UnixMillis::from_millis(1_700_000_200),
-            decision: GitPushResolution::Approved,
+            decision: GitPushResolution::Rejected,
             operator: "alice",
-            reason: "looks good",
+            reason: "leaks credentials",
         })
         .unwrap();
 
+        let (jti, app_id, issued_at, expires_at): (
+            Option<String>,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+        ) = log
+            .with_conn(|c| {
+                Ok(c.query_row(
+                    "SELECT mint_jti, mint_github_app_id, mint_issued_at, mint_expires_at \
+                     FROM git_push_resolution WHERE push_request_id = ?1",
+                    params![push_request_id.as_uuid().to_string()],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )?)
+            })
+            .unwrap();
+        assert_eq!((jti, app_id, issued_at, expires_at), (None, None, None, None));
+
         let entry = log.get_git_push(push_request_id).unwrap().unwrap();
-        assert_eq!(
-            entry.resolution.unwrap().decision,
-            GitPushResolution::Approved
+        assert_eq!(entry.resolution.unwrap().decision, GitPushResolution::Rejected);
+    }
+
+    /// Trigger defence: a direct INSERT that claims `approved` without
+    /// supplying every mint column is refused. This guards against a
+    /// caller bypassing the DAO and writing the column-form direct
+    /// without the matching mint context.
+    #[test]
+    fn direct_insert_approved_without_mint_columns_is_rejected_by_trigger() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+        let push_request_id = RequestId::new();
+        record_staged_request(&log, push_request_id, s.session_id);
+
+        let err = log
+            .with_conn_mut(|c| {
+                Ok(c.execute(
+                    "INSERT INTO git_push_resolution (
+                         push_request_id, decided_at, decision, operator, reason,
+                         mint_jti, mint_github_app_id, mint_issued_at, mint_expires_at
+                     ) VALUES (?1, ?2, 'approved', 'alice', 'looks good',
+                               NULL, NULL, NULL, NULL)",
+                    params![
+                        push_request_id.as_uuid().to_string(),
+                        1_700_000_200_i64,
+                    ],
+                ))
+            })
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("mint context must match decision"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// Mirror image of the previous trigger guard: a `rejected` row
+    /// carrying mint context is refused.
+    #[test]
+    fn direct_insert_rejected_with_mint_columns_is_rejected_by_trigger() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+        let push_request_id = RequestId::new();
+        record_staged_request(&log, push_request_id, s.session_id);
+        let mint = sample_promote_mint_audit();
+
+        let err = log
+            .with_conn_mut(|c| {
+                Ok(c.execute(
+                    "INSERT INTO git_push_resolution (
+                         push_request_id, decided_at, decision, operator, reason,
+                         mint_jti, mint_github_app_id, mint_issued_at, mint_expires_at
+                     ) VALUES (?1, ?2, 'rejected', 'alice', 'no',
+                               ?3, ?4, ?5, ?6)",
+                    params![
+                        push_request_id.as_uuid().to_string(),
+                        1_700_000_200_i64,
+                        mint.jti.as_uuid().to_string(),
+                        mint.github_app_id as i64,
+                        mint.issued_at.as_millis(),
+                        mint.expires_at.as_millis(),
+                    ],
+                ))
+            })
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("mint context must match decision"),
+            "unexpected error: {err}"
         );
     }
 
@@ -1928,17 +2161,17 @@ mod tests {
         );
     }
 
-    /// Mirror the existing `outcome_result_sql_strings_match_serde_form`
-    /// pin so a future serde rename cannot orphan resolution rows.
+    /// Pin the mapping between the in-memory variant and the SQL
+    /// `decision` string. The CHECK constraint on `git_push_resolution`
+    /// only admits `'rejected'` and `'approved'`, so an accidental
+    /// rename here would orphan existing audit rows.
     #[test]
-    fn resolution_decision_sql_strings_match_serde_form() {
-        let variants = [GitPushResolution::Rejected, GitPushResolution::Approved];
-        for v in variants {
-            let json = serde_json::to_value(v).unwrap();
-            assert_eq!(json, serde_json::Value::String(v.as_str().to_string()));
-            let back: GitPushResolution = serde_json::from_value(json).unwrap();
-            assert_eq!(back, v);
-        }
+    fn resolution_decision_sql_strings_match_variant_kind() {
+        assert_eq!(GitPushResolution::Rejected.kind_str(), "rejected");
+        assert_eq!(
+            GitPushResolution::Approved(sample_promote_mint_audit()).kind_str(),
+            "approved"
+        );
     }
 
     #[test]
