@@ -426,23 +426,35 @@ pub(crate) fn staging_dir_for(runtime: &PromoteRuntimeConfig, request_id: Reques
 }
 
 /// Atomic-mode `mkdir(path, 0700)` that fails if `path` already
-/// exists. Use this for any directory the caller must own *exclusively*
-/// — a duplicate concurrent caller should be rejected, not silently
-/// joined onto the same path.
+/// exists, then unconditionally chmods to *exactly* 0o700. Use this
+/// for any directory the caller must own *exclusively* — a duplicate
+/// concurrent caller should be rejected, not silently joined onto
+/// the same path.
 ///
-/// The atomic-mode shape closes a TOCTOU race: with a permissive
-/// process umask, a plain `tokio::fs::create_dir` followed by a
-/// separate `set_permissions` would briefly leave the directory at
-/// `0o777 & ~umask` (typically 0755). A local user on the host who
-/// held an `O_PATH` / `O_DIRECTORY` fd to the parent could `openat`
-/// into the new subdir during that window, keep the fd across the
-/// chmod (POSIX permission checks fire at `open` time, not at use
-/// time), and then readdir / read the staged bundle and the bare
-/// repo's loose objects even after the directory's mode tightened
-/// to 0700. `DirBuilder::mode(0o700)` resolves to a single
-/// `mkdir(path, 0700)` syscall — the kernel ANDs with the process
-/// umask, but umask only *clears* bits, so the resulting mode is
-/// `≤ 0o700` and never has group/other bits set.
+/// Why both an atomic-mode create *and* a follow-up chmod:
+///
+/// - `DirBuilder::mode(0o700)` resolves to a single `mkdir(path,
+///   0700)` syscall. The kernel ANDs `0700` with the inverse of the
+///   process umask, so the *creation* mode is always `≤ 0o700`. That
+///   closes a TOCTOU race a plain `create_dir` + separate
+///   `set_permissions` would open: under a permissive umask (e.g.
+///   `0o000`) the directory would briefly exist at `0o777 & ~umask =
+///   0o777` and a local user holding an `O_PATH` fd to the parent
+///   could `openat` into it during that window and keep the fd
+///   across the chmod (POSIX permission checks fire at `open` time,
+///   not at use time), reading the staged bundle and loose objects
+///   even after the mode tightened.
+/// - The follow-up `set_permissions(0o700)` is *not* a security
+///   measure; it widens the mode back from the umask-clamped result.
+///   Under a restrictive umask (e.g. `0o077`, or a paranoid
+///   `0o777`), `mkdir(path, 0700)` would land the directory at
+///   `0o600` or even `0o000`, at which point the daemon couldn't
+///   create `staged.bundle` inside it and the approve would
+///   self-DoS. The chmod restores exact 0o700 so the owner-writable
+///   bits the daemon needs are present regardless of inherited
+///   umask.
+///
+/// Matches `git_push_staging::create_private_dir`.
 async fn create_exclusive_private_dir(path: &std::path::Path) -> std::io::Result<()> {
     let mut builder = tokio::fs::DirBuilder::new();
     builder.recursive(false);
@@ -450,7 +462,8 @@ async fn create_exclusive_private_dir(path: &std::path::Path) -> std::io::Result
     {
         builder.mode(0o700);
     }
-    builder.create(path).await
+    builder.create(path).await?;
+    set_private_dir_permissions(path).await
 }
 
 /// Ensure `path` exists as a 0700 directory, tolerating the case
@@ -466,11 +479,12 @@ async fn create_exclusive_private_dir(path: &std::path::Path) -> std::io::Result
 /// daemon at it). Matches `git_push_staging::create_private_dir`.
 async fn ensure_private_dir(path: &std::path::Path) -> std::io::Result<()> {
     match create_exclusive_private_dir(path).await {
-        Ok(()) => {}
-        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(err) => return Err(err),
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            set_private_dir_permissions(path).await
+        }
+        Err(err) => Err(err),
     }
-    set_private_dir_permissions(path).await
 }
 
 #[cfg(unix)]
@@ -486,6 +500,18 @@ async fn set_private_dir_permissions(_path: &std::path::Path) -> std::io::Result
 
 /// Write `body` to `path` with mode 0600 on Unix, refusing to clobber
 /// an existing file. Matches `git_push_staging::write_private_file`.
+///
+/// The `mode(0o600)` request on `OpenOptions` resolves to a single
+/// `open(O_CREAT|O_EXCL, 0600)` syscall, which the kernel ANDs with
+/// the inverse of the process umask — so the *creation* mode is `≤
+/// 0o600`. That closes the same TOCTOU race the dir helper closes:
+/// no transient window at owner-`0o644` / group-readable. The
+/// follow-up chmod on Unix then *widens* the mode back to exactly
+/// 0o600, because under a restrictive umask (e.g. `0o077` or a
+/// paranoid `0o777`) the initial mode would have been `0o000`, and
+/// `git bundle unbundle` reopens the file *by path* after we drop the
+/// fd — losing owner-read would make approve self-DoS even though
+/// the through-fd `write_all` succeeded.
 async fn write_private_file(path: &std::path::Path, body: &[u8]) -> std::io::Result<()> {
     // tokio's `OpenOptions::mode` is an inherent method on Unix
     // builds (not a trait), so no `OpenOptionsExt` import is needed
@@ -499,7 +525,20 @@ async fn write_private_file(path: &std::path::Path, body: &[u8]) -> std::io::Res
     use tokio::io::AsyncWriteExt;
     let mut file = options.open(path).await?;
     file.write_all(body).await?;
-    file.sync_all().await
+    file.sync_all().await?;
+    drop(file);
+    set_private_file_permissions(path).await
+}
+
+#[cfg(unix)]
+async fn set_private_file_permissions(path: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).await
+}
+
+#[cfg(not(unix))]
+async fn set_private_file_permissions(_path: &std::path::Path) -> std::io::Result<()> {
+    Ok(())
 }
 
 /// `git -C <staging_dir> init --bare --quiet`.
@@ -1374,31 +1413,83 @@ mod tests {
         );
     }
 
-    /// Regression test for the TOCTOU window between `create_dir`
-    /// and `set_permissions`: a permissive process umask must not
-    /// leak the staging dir at `0o777 & ~umask` before the chmod
-    /// tightens it to 0700. `create_private_dir` issues a single
-    /// `mkdir(path, 0700)` so the directory is born at ≤ 0700 — we
-    /// verify by forcing the most permissive plausible umask (000)
-    /// and asserting the mode is 0700 *immediately* on return.
+    /// `set_private_dir_permissions` is the post-`mkdir` chmod step
+    /// that codex round 5 caught us missing. The atomic
+    /// `mkdir(path, 0700)` issued by `create_exclusive_private_dir`
+    /// is ANDed with the inverse of the process umask, so under a
+    /// restrictive umask (e.g. `0o777` — paranoid services, locked
+    /// systemd units) the dir lands at `0o000` and `run_prepare_steps`
+    /// can't create `staged.bundle` inside it. This unit test runs
+    /// the chmod step against a pre-existing 0o000 directory — the
+    /// exact post-mkdir state under that umask — and asserts the
+    /// helper raises the mode to exact 0o700. It avoids mutating the
+    /// process umask itself, which would race with parallel tests in
+    /// the same binary that depend on a sane umask for git/init/etc.
     #[cfg(unix)]
     #[tokio::test]
-    async fn private_dir_is_born_private_under_permissive_umask() {
+    async fn set_private_dir_permissions_forces_exact_0700() {
         use std::os::unix::fs::PermissionsExt;
-        // SAFETY: `umask(2)` mutates a per-process flag; this test
-        // does not run in parallel with anything that depends on
-        // the umask, and we restore it before returning.
         let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path().join("fresh");
-        let prior = unsafe { libc::umask(0o000) };
-        let result = create_exclusive_private_dir(&dir).await;
-        let _restore = unsafe { libc::umask(prior) };
-        result.expect("create_exclusive_private_dir must succeed");
-        let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        let p = tmp.path().join("dir-from-restrictive-umask");
+        std::fs::create_dir(&p).unwrap();
+        // Simulate the state `mkdir(path, 0700)` would leave under
+        // umask 0o777: every permission bit cleared.
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o000)).unwrap();
+        set_private_dir_permissions(&p).await.unwrap();
+        let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
         assert_eq!(
             mode, 0o700,
-            "dir must be born private even with umask 0o000; got 0o{mode:o}",
+            "helper must raise dir to exact 0o700 from 0o000; got 0o{mode:o}",
         );
+
+        // And from a *loose* starting state (the codex round-3
+        // scenario), the same helper must *tighten* to 0o700.
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        set_private_dir_permissions(&p).await.unwrap();
+        let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o700,
+            "helper must tighten dir from 0o755 to 0o700; got 0o{mode:o}",
+        );
+    }
+
+    /// Companion to the dir test: codex round 5 also flagged
+    /// `write_private_file`. Under a restrictive umask the through-fd
+    /// `write_all` succeeds (the fd was opened with write perms), but
+    /// the on-disk mode is `0o000`, so `git bundle unbundle` (which
+    /// reopens the file *by path*) gets EACCES. The chmod-back step
+    /// must raise the mode to exact 0o600 from whatever the umask
+    /// left behind. Tested directly against the post-create chmod
+    /// helper for the same anti-flake reason as the dir test.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn set_private_file_permissions_forces_exact_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("file-from-restrictive-umask");
+        std::fs::write(&p, b"bundle-bytes").unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o000)).unwrap();
+        set_private_file_permissions(&p).await.unwrap();
+        let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "helper must raise file to exact 0o600 from 0o000; got 0o{mode:o}",
+        );
+
+        // From a loose starting state, tighten.
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
+        set_private_file_permissions(&p).await.unwrap();
+        let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "helper must tighten file from 0o644 to 0o600; got 0o{mode:o}",
+        );
+
+        // And the post-helper file must be reopenable by path for
+        // read. This is the path `git bundle unbundle` takes after
+        // `write_private_file` drops its write fd.
+        let body = std::fs::read(&p).expect("must be able to reopen file by path");
+        assert_eq!(body, b"bundle-bytes");
     }
 
     /// Regression test that prepare creates the staging dir and the
