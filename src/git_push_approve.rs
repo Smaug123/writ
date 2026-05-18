@@ -169,9 +169,15 @@ pub async fn run_approve(
     trailers: &[TrailerSource],
     request_id: RequestId,
 ) -> Result<RunApproveOutcome, RunApproveError> {
-    let staging =
-        prepare_staging_repo(runtime, request_id, expected_remote_head, repo, token, bundle_bytes)
-            .await?;
+    let staging = prepare_staging_repo(
+        runtime,
+        request_id,
+        expected_remote_head,
+        repo,
+        token,
+        bundle_bytes,
+    )
+    .await?;
 
     let result = run_approve_with_staging_repo(
         &staging,
@@ -344,8 +350,9 @@ pub async fn prepare_staging_repo(
     // racing on `staged.bundle` / `remove_dir_all`). The dedicated
     // `StagingDirExists` variant lets the handler surface "duplicate
     // concurrent approve" distinctly from generic mkdir failures.
-    create_exclusive_private_dir(&staging_dir).await.map_err(
-        |source| match source.kind() {
+    create_exclusive_private_dir(&staging_dir)
+        .await
+        .map_err(|source| match source.kind() {
             std::io::ErrorKind::AlreadyExists => {
                 PrepareStagingError::StagingDirExists(staging_dir.clone())
             }
@@ -353,8 +360,7 @@ pub async fn prepare_staging_repo(
                 path: staging_dir.clone(),
                 source,
             },
-        },
-    )?;
+        })?;
 
     // Past this point we own `staging_dir` on disk; any failure must
     // clean it up so the next retry can re-mkdir without tripping the
@@ -463,7 +469,22 @@ async fn create_exclusive_private_dir(path: &std::path::Path) -> std::io::Result
         builder.mode(0o700);
     }
     builder.create(path).await?;
-    set_private_dir_permissions(path).await
+    // If the chmod step fails after the mkdir succeeded, unwind:
+    // remove the now-partially-initialized dir so a retry can mkdir
+    // again. Without this, a transient chmod failure would turn into
+    // `StagingDirExists` on every retry, because the helper's
+    // contract is "this call mints the dir" and the on-disk artifact
+    // from a failed call would otherwise collide with the next one.
+    if let Err(chmod_err) = set_private_dir_permissions(path).await {
+        // Best-effort cleanup: if the rmdir itself fails (e.g. we
+        // lost the ability to remove what we just created), surface
+        // the *original* chmod error rather than the cleanup error —
+        // the chmod failure is what the caller actually needs to
+        // react to.
+        let _ = tokio::fs::remove_dir(path).await;
+        return Err(chmod_err);
+    }
+    Ok(())
 }
 
 /// Ensure `path` exists as a 0700 directory, tolerating the case
@@ -712,9 +733,7 @@ mod tests {
 
     fn sample_request_id() -> RequestId {
         // Deterministic so test failure messages stay reproducible.
-        RequestId::from_uuid(
-            uuid::Uuid::parse_str("11111111-2222-3333-4444-555555555555").unwrap(),
-        )
+        RequestId::from_uuid(uuid::Uuid::parse_str("11111111-2222-3333-4444-555555555555").unwrap())
     }
 
     fn sample_object_id(nibble: char) -> GitObjectId {
@@ -808,10 +827,7 @@ mod tests {
         let env: std::collections::BTreeMap<&str, &str> =
             inv.env().iter().map(|e| (e.name(), e.value())).collect();
         assert_eq!(env.get("GIT_TERMINAL_PROMPT"), Some(&"0"));
-        assert_eq!(
-            env.get("GIT_ASKPASS"),
-            Some(&"/usr/local/bin/fake-askpass"),
-        );
+        assert_eq!(env.get("GIT_ASKPASS"), Some(&"/usr/local/bin/fake-askpass"),);
         // Hardened env must still be present alongside the fetch-specific bits.
         assert_eq!(env.get("GIT_CONFIG_NOSYSTEM"), Some(&"1"));
         assert_eq!(env.get("GIT_CONFIG_GLOBAL"), Some(&"/dev/null"));
@@ -960,7 +976,11 @@ mod tests {
         );
         let child = rev_parse(&git, &work, "HEAD");
 
-        run_git(&git, tmp.path(), &["init", "--bare", "--quiet", "staging.git"]);
+        run_git(
+            &git,
+            tmp.path(),
+            &["init", "--bare", "--quiet", "staging.git"],
+        );
         run_git(
             &git,
             &staging,
@@ -1238,9 +1258,11 @@ mod tests {
             .await;
         Mock::given(method("PATCH"))
             .and(path("/repos/owner/name/git/refs/heads/main"))
-            .respond_with(ResponseTemplate::new(422).set_body_string(
-                r#"{"message":"not a fast forward","documentation_url":"..."}"#,
-            ))
+            .respond_with(
+                ResponseTemplate::new(422).set_body_string(
+                    r#"{"message":"not a fast forward","documentation_url":"..."}"#,
+                ),
+            )
             .expect(1)
             .mount(&server)
             .await;
@@ -1306,7 +1328,11 @@ mod tests {
                 "refs/heads/main",
             ],
         );
-        run_git(&git, tmp.path(), &["init", "--bare", "--quiet", "staging.git"]);
+        run_git(
+            &git,
+            tmp.path(),
+            &["init", "--bare", "--quiet", "staging.git"],
+        );
 
         let runtime = runtime_pointed_at(tmp.path());
         let inv = build_unbundle_invocation(&runtime, &staging, &bundle_path);
@@ -1368,7 +1394,11 @@ mod tests {
             "annotated tag must be a distinct object from its target",
         );
 
-        run_git(&git, tmp.path(), &["init", "--bare", "--quiet", "staging.git"]);
+        run_git(
+            &git,
+            tmp.path(),
+            &["init", "--bare", "--quiet", "staging.git"],
+        );
         // Fetch the tag explicitly so the tag object lands in staging.
         run_git(
             &git,
@@ -1629,7 +1659,10 @@ mod tests {
 
         ensure_private_dir(&path).await.unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o700, "first ensure must tighten to 0700, got 0o{mode:o}");
+        assert_eq!(
+            mode, 0o700,
+            "first ensure must tighten to 0700, got 0o{mode:o}"
+        );
 
         // A second call on a dir already at 0700 must remain a no-op.
         ensure_private_dir(&path).await.unwrap();
