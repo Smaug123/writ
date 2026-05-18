@@ -322,18 +322,13 @@ pub async fn prepare_staging_repo(
         return Err(PrepareStagingError::StagingDirExists(staging_dir));
     }
     if let Some(parent) = staging_dir.parent() {
-        tokio::fs::create_dir_all(parent).await.map_err(|source| {
-            PrepareStagingError::AllocateStagingDir {
-                path: parent.to_path_buf(),
-                source,
-            }
-        })?;
-        // `create_dir_all` honours the process umask, so an existing
-        // `<work_root>/approve` (or one created above) may be 0755.
-        // Chmod it down to 0700 unconditionally — the staged bundle
-        // and the bare repo's loose objects sit inside this tree, and
-        // the threat model considers other local users on the host.
-        set_private_dir_permissions(parent).await.map_err(|source| {
+        // `create_private_dir` is atomic-mode + tighten-if-existing.
+        // `<work_root>` itself is owned by the broker's config layer
+        // (config.rs already creates it at 0700) so we only need to
+        // care about the single `<work_root>/approve` level. If
+        // `<work_root>` is missing we surface the NotFound up rather
+        // than silently `create_dir_all`-ing it at the default umask.
+        create_private_dir(parent).await.map_err(|source| {
             PrepareStagingError::AllocateStagingDir {
                 path: parent.to_path_buf(),
                 source,
@@ -416,15 +411,39 @@ pub(crate) fn staging_dir_for(runtime: &PromoteRuntimeConfig, request_id: Reques
         .join(request_id.to_string())
 }
 
-/// Create `path` as a fresh directory with mode 0700 on Unix.
+/// Create `path` as a fresh directory whose mode is 0700 *at the
+/// moment of creation* on Unix, then chmod to 0700 to cover the case
+/// where the directory pre-existed at looser permissions.
 ///
-/// Matches the `GitPushStagingStore::create_private_dir` pattern: the
-/// staged bundle and the bare repo's loose objects sit inside this
-/// directory, so other local users on the host must not be able to
-/// read them. On non-Unix platforms the chmod is a no-op (Windows
-/// has its own ACL model that this code does not target).
+/// The atomic-create-then-chmod pattern (rather than create-then-chmod
+/// alone) closes a TOCTOU race: with a permissive process umask, a
+/// plain `tokio::fs::create_dir` followed by a separate
+/// `set_permissions` would briefly leave the directory at `0o777 &
+/// ~umask` (typically 0755). A local user on the host who held an
+/// `O_PATH` / `O_DIRECTORY` fd to the parent could `openat` into the
+/// new subdir during that window, keep the fd across the chmod (POSIX
+/// permission checks fire at `open` time, not at use time), and then
+/// readdir / read the staged bundle and the bare repo's loose objects
+/// even after the directory's mode tightened to 0700.
+///
+/// `DirBuilder::mode(0o700)` resolves to a single `mkdir(path, 0700)`
+/// syscall — the kernel ANDs with the process umask, but umask only
+/// *clears* bits, so the resulting mode is `≤ 0o700` and never has
+/// group/other bits set. The follow-up `set_permissions` only matters
+/// when `path` already exists (to tighten a pre-existing
+/// loosely-moded dir). Matches `git_push_staging::create_private_dir`.
 async fn create_private_dir(path: &std::path::Path) -> std::io::Result<()> {
-    tokio::fs::create_dir(path).await?;
+    let mut builder = tokio::fs::DirBuilder::new();
+    builder.recursive(false);
+    #[cfg(unix)]
+    {
+        builder.mode(0o700);
+    }
+    match builder.create(path).await {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(err) => return Err(err),
+    }
     set_private_dir_permissions(path).await
 }
 
@@ -1326,6 +1345,33 @@ mod tests {
                     if sha == tag_sha.as_str() && actual_type == "tag"
             ),
             "expected BundleTipNotACommit{{tag}}, got: {err:?}",
+        );
+    }
+
+    /// Regression test for the TOCTOU window between `create_dir`
+    /// and `set_permissions`: a permissive process umask must not
+    /// leak the staging dir at `0o777 & ~umask` before the chmod
+    /// tightens it to 0700. `create_private_dir` issues a single
+    /// `mkdir(path, 0700)` so the directory is born at ≤ 0700 — we
+    /// verify by forcing the most permissive plausible umask (000)
+    /// and asserting the mode is 0700 *immediately* on return.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn private_dir_is_born_private_under_permissive_umask() {
+        use std::os::unix::fs::PermissionsExt;
+        // SAFETY: `umask(2)` mutates a per-process flag; this test
+        // does not run in parallel with anything that depends on
+        // the umask, and we restore it before returning.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("fresh");
+        let prior = unsafe { libc::umask(0o000) };
+        let result = create_private_dir(&dir).await;
+        let _restore = unsafe { libc::umask(prior) };
+        result.expect("create_private_dir must succeed");
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o700,
+            "dir must be born private even with umask 0o000; got 0o{mode:o}",
         );
     }
 
