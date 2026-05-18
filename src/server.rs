@@ -895,25 +895,97 @@ async fn reject_staged_push<S: SecretStore + Send + Sync + 'static>(
     }
 }
 
-/// Stub handler for [`ClientMessage::ApproveStagedPush`].
+/// Partial handler for [`ClientMessage::ApproveStagedPush`].
 ///
-/// Slice B1e.1 lands the wire types and the dispatch arm so the proxy
-/// surface freezes at the boundary before the real promote pipeline
-/// lands. The actual mint + staging-repo build + ingest + plan + walk +
-/// ref-update + audit-write sequence is split into a follow-up slice
-/// (B1e.2) so each PR stays small enough for a focused review — the
-/// same wire-first split slice A1 used for [`ClientMessage::RunAgent`].
+/// Slice B1e.2c lands the operator validation, the three configured-state
+/// checks (`staging_store`, `promote_runtime`, `signing_key` must all be
+/// `Some`), and the staging-entry load. The mint step lands in B1e.2d
+/// and the call into [`crate::git_push_approve::run_approve`] plus
+/// audit-write/cleanup lands in B1e.2e. On the success path of the load,
+/// this slice returns a self-describing [`ServerMessage::Error`] so an
+/// operator (or a future reviewer) can locate the next plan slice from
+/// the response alone — no audit row is written and the staging dir is
+/// left untouched, exactly as in the B1e.1 stub.
 ///
-/// The returned [`ServerMessage::Error`] is self-describing so an
-/// operator (or a future reviewer) can locate the plan slice from the
-/// response alone.
+/// Ordering: operator validation runs before the configured-state checks
+/// so a caller can never use a malformed operator to probe the broker's
+/// internal config shape. The staging load runs *after* every
+/// configured check so a bare `request_id` cannot drive any disk IO in
+/// the not-configured case; that mirrors `reject_staged_push`'s
+/// "validate-then-load" ordering for the same reason.
 async fn approve_staged_push<S: SecretStore + Send + Sync + 'static>(
-    _state: &Arc<BrokerState<S>>,
-    _request_id: RequestId,
-    _operator: String,
+    state: &Arc<BrokerState<S>>,
+    request_id: RequestId,
+    operator: String,
 ) -> ServerMessage {
+    if operator.is_empty() {
+        return ServerMessage::Error {
+            message: "operator identity must not be empty".into(),
+        };
+    }
+    if operator.len() > MAX_OPERATOR_BYTES {
+        return ServerMessage::Error {
+            message: format!(
+                "operator identity is {} bytes, exceeding the {MAX_OPERATOR_BYTES}-byte limit",
+                operator.len(),
+            ),
+        };
+    }
+
+    let Some(staging_store) = state.staging_store.clone() else {
+        return staging_not_configured();
+    };
+    if state.promote_runtime.is_none() {
+        return approve_staged_push_not_configured("promote_runtime");
+    }
+    if state.signing_key.is_none() {
+        return approve_staged_push_not_configured("signing_key");
+    }
+
+    // Load the entry up-front: this proves the staged push exists,
+    // surfaces a clean `UnknownStagedPush` if the operator's id is
+    // stale, and is the input the follow-up slices (mint in B1e.2d,
+    // run_approve in B1e.2e) consume. Reading the bundle bytes here is
+    // wasted work in the slice-B1e.2c surface — but the alternative
+    // (load receipt now, re-load bundle later) would have the follow-up
+    // slice introduce a second `spawn_blocking` for what is logically
+    // one load, and would let the receipt and bundle disagree if a
+    // concurrent `reject_staged_push` deleted the dir between the two
+    // reads. Loading both atomically here is cheaper.
+    let load_result = {
+        let staging_store = Arc::clone(&staging_store);
+        tokio::task::spawn_blocking(move || staging_store.load(request_id)).await
+    };
+    let _entry = match load_result {
+        Ok(Ok(entry)) => entry,
+        Ok(Err(StagingError::NotFound { request_id })) => {
+            return ServerMessage::UnknownStagedPush { request_id };
+        }
+        Ok(Err(err)) => {
+            return ServerMessage::Error {
+                message: err.to_string(),
+            };
+        }
+        Err(err) => {
+            return ServerMessage::Error {
+                message: format!("staging load task failed: {err}"),
+            };
+        }
+    };
+
     ServerMessage::Error {
-        message: "ApproveStagedPush dispatch is not yet wired up (slice B1e.2)".into(),
+        message: "ApproveStagedPush dispatch validated and loaded; \
+                  the mint + run_approve pipeline lands in slice B1e.2d/2e"
+            .into(),
+    }
+}
+
+fn approve_staged_push_not_configured(component: &str) -> ServerMessage {
+    ServerMessage::Error {
+        message: format!(
+            "ApproveStagedPush dispatch is not configured: {component} is unset; \
+             writd needs staging_store + promote_runtime + signing_key to serve ApproveStagedPush"
+        ),
     }
 }
 
@@ -2700,6 +2772,49 @@ mod tests {
         (state, tmp)
     }
 
+    /// `make_state_with_staging` extended with the two extra pieces an
+    /// approve handler needs to reach its load step: a
+    /// [`PromoteRuntimeConfig`] (built against a fake git binary path
+    /// and a per-test work_root under the same tempdir as staging) and
+    /// a [`WritSigningKey`] (from the shared fixture). The fake git
+    /// path is deliberately unused in slice B1e.2c — this slice never
+    /// spawns git, it only proves the configured-state guards admit a
+    /// well-formed request through to the load. B1e.2d/2e will swap in
+    /// the system git for the integration tests that actually fetch
+    /// and unbundle.
+    fn make_state_with_approve_ready(
+        server: &MockServer,
+    ) -> (Arc<BrokerState<InMemStore>>, tempfile::TempDir) {
+        use crate::git_push_promote::PromoteRuntimeConfig;
+        use crate::signing::WritSigningKey;
+        use crate::vm_git_bundle::{GitCloneBaseUrl, GitCredentialBoundary, GitSecretEnvVar};
+        const SIGNING_PEM: &str = include_str!("../tests/fixtures/ed25519_test_signing.key");
+
+        let (mut state, tmp) = make_state_with_staging(server);
+        let work_root = tmp.path().join("promote");
+        std::fs::create_dir_all(&work_root).unwrap();
+        let runtime = PromoteRuntimeConfig::new(
+            // Slice B1e.2c never spawns git; the fake path is fine
+            // and is replaced by `which git` in the follow-up slices.
+            PathBuf::from("/nonexistent/bin/git"),
+            GitCloneBaseUrl::github(),
+            GitCredentialBoundary::new(
+                PathBuf::from("/nonexistent/bin/askpass"),
+                GitSecretEnvVar::new("WRIT_GIT_TOKEN").unwrap(),
+            )
+            .unwrap(),
+            work_root,
+            std::time::Duration::from_secs(30),
+        )
+        .unwrap();
+        let signing_key = WritSigningKey::from_openssh_pem(SIGNING_PEM).unwrap();
+
+        let inner = Arc::get_mut(&mut state).expect("fresh Arc has no other handles");
+        inner.promote_runtime = Some(Arc::new(runtime));
+        inner.signing_key = Some(signing_key);
+        (state, tmp)
+    }
+
     fn sample_clone_repo() -> crate::vm_git::GitCloneRepo {
         "owner/repo".parse().unwrap()
     }
@@ -3443,18 +3558,20 @@ mod tests {
 
     // --- Staged-push approve (stub) -------------------------------------
 
-    /// Slice B1e.1 lands the wire types and dispatch arm only; the real
-    /// mint + replay + signing + audit pipeline lands in B1e.2. The stub
-    /// must surface as a `slice B1e.2` Error so an operator (or future
-    /// reviewer) can locate the plan from the response alone, and must
-    /// emit that Error *without* touching the audit log or staging
-    /// directory — promotion is the only client-message side-effect the
-    /// real handler will have, and a stub that wrote half of it would
-    /// be more dangerous than one that wrote none.
+    /// Slice B1e.2c lands operator validation, configured-state guards,
+    /// and the staging load; the mint and `run_approve` calls land in
+    /// B1e.2d/2e. On the happy path of the load, the handler must
+    /// surface a self-describing Error pointing at the follow-up slice
+    /// so an operator (or future reviewer) can locate the plan from
+    /// the response alone, and must emit that Error *without* touching
+    /// the audit log or staging directory — promotion is the only
+    /// client-message side-effect the real handler will have, and a
+    /// half-done one (e.g. audit row but no replay) would be more
+    /// dangerous than one that wrote none.
     #[tokio::test]
-    async fn approve_staged_push_dispatch_returns_slice_b1e_2_error() {
+    async fn approve_staged_push_loads_entry_and_defers_pipeline_to_b1e_2d() {
         let server = MockServer::start().await;
-        let (state, _tmp) = make_state_with_staging(&server);
+        let (state, _tmp) = make_state_with_approve_ready(&server);
         let session_id = open_session(&state).await;
         let request_id = stage_with_staged_outcome(
             &state,
@@ -3477,15 +3594,20 @@ mod tests {
         match resp {
             ServerMessage::Error { message } => {
                 assert!(
-                    message.contains("B1e.2"),
+                    message.contains("B1e.2d"),
                     "Error must name the follow-up slice so the plan is locatable; got: {message}",
+                );
+                assert!(
+                    message.contains("validated and loaded"),
+                    "Error must signal the load step succeeded, not a config error; got: {message}",
                 );
             }
             other => panic!("expected Error, got {other:?}"),
         }
 
-        // No audit resolution row was written: the stub must not commit
-        // half of a promotion. The follow-up slice owns this transition.
+        // No audit resolution row was written: a half-done approve
+        // would be worse than a deferred one. The follow-up slice owns
+        // this transition.
         let audit_entry = state.audit.get_git_push(request_id).unwrap().unwrap();
         assert!(audit_entry.resolution.is_none());
 
@@ -3498,6 +3620,211 @@ mod tests {
                 .load(request_id)
                 .is_ok()
         );
+    }
+
+    /// Operator validation runs before the configured-state checks so a
+    /// caller can never use a malformed operator field to probe the
+    /// broker's internal config shape. An empty operator is rejected
+    /// with the same message the reject path uses.
+    #[tokio::test]
+    async fn approve_staged_push_with_empty_operator_returns_error() {
+        let server = MockServer::start().await;
+        // Use the plain (un-staging) state to prove the validation
+        // short-circuits before the staging check fires.
+        let state = make_state(&server, vec![], "o");
+        let resp = dispatch_message(
+            ClientMessage::ApproveStagedPush {
+                request_id: RequestId::new(),
+                operator: String::new(),
+            },
+            &state,
+        )
+        .await;
+        match resp {
+            ServerMessage::Error { message } => {
+                assert!(
+                    message.contains("operator identity must not be empty"),
+                    "expected empty-operator error, got: {message}",
+                );
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    /// Same shape as the empty-operator test: oversize operators (over
+    /// `MAX_OPERATOR_BYTES`) are rejected before any disk IO so a
+    /// caller can't pad the audit log via the operator field. The cap
+    /// is shared with the reject path.
+    #[tokio::test]
+    async fn approve_staged_push_with_oversize_operator_returns_error() {
+        let server = MockServer::start().await;
+        let state = make_state(&server, vec![], "o");
+        let oversize = "x".repeat(MAX_OPERATOR_BYTES + 1);
+        let resp = dispatch_message(
+            ClientMessage::ApproveStagedPush {
+                request_id: RequestId::new(),
+                operator: oversize,
+            },
+            &state,
+        )
+        .await;
+        match resp {
+            ServerMessage::Error { message } => {
+                assert!(
+                    message.contains("exceeding the"),
+                    "expected oversize-operator error, got: {message}",
+                );
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    /// If `staging_store` is unset the broker can never have produced
+    /// a staged push receipt for this `request_id` in the first place,
+    /// so the right surface is "not configured" rather than
+    /// `UnknownStagedPush`. Same shape as the reject path's
+    /// `staging_not_configured` response.
+    #[tokio::test]
+    async fn approve_staged_push_without_staging_store_returns_not_configured() {
+        let server = MockServer::start().await;
+        let state = make_state(&server, vec![], "o");
+        let resp = dispatch_message(
+            ClientMessage::ApproveStagedPush {
+                request_id: RequestId::new(),
+                operator: "alice".into(),
+            },
+            &state,
+        )
+        .await;
+        match resp {
+            ServerMessage::Error { message } => {
+                assert!(
+                    message.contains("git push staging is not configured"),
+                    "expected staging-not-configured error, got: {message}",
+                );
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    /// `staging_store` is wired but `promote_runtime` is not: the load
+    /// step would technically be runnable, but kicking it off without
+    /// `promote_runtime` would just succeed and then dead-end at the
+    /// mint slice. Returning a "not configured" error here gives the
+    /// operator a precise diagnosis instead.
+    #[tokio::test]
+    async fn approve_staged_push_without_promote_runtime_returns_not_configured() {
+        let server = MockServer::start().await;
+        let (state, _tmp) = make_state_with_staging(&server);
+        let session_id = open_session(&state).await;
+        let request_id = stage_with_staged_outcome(
+            &state,
+            session_id,
+            b"bundle".to_vec(),
+            UnixMillis::from_millis(1_700_000_040_000),
+            UnixMillis::from_millis(1_700_000_040_500),
+        )
+        .await;
+        let resp = dispatch_message(
+            ClientMessage::ApproveStagedPush {
+                request_id,
+                operator: "alice".into(),
+            },
+            &state,
+        )
+        .await;
+        match resp {
+            ServerMessage::Error { message } => {
+                assert!(
+                    message.contains("promote_runtime is unset"),
+                    "expected promote_runtime-not-configured error, got: {message}",
+                );
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+        // The configured-state check must not have written an audit
+        // row or removed the staging dir.
+        let audit_entry = state.audit.get_git_push(request_id).unwrap().unwrap();
+        assert!(audit_entry.resolution.is_none());
+        assert!(
+            state
+                .staging_store
+                .as_ref()
+                .unwrap()
+                .load(request_id)
+                .is_ok()
+        );
+    }
+
+    /// `staging_store` and `promote_runtime` are both wired but
+    /// `signing_key` is not. Without the signing key, the eventual
+    /// `run_approve` call would have no app-identity to sign the
+    /// replayed commits with — same diagnosis pattern as
+    /// `promote_runtime`.
+    #[tokio::test]
+    async fn approve_staged_push_without_signing_key_returns_not_configured() {
+        use crate::git_push_promote::PromoteRuntimeConfig;
+        use crate::vm_git_bundle::{GitCloneBaseUrl, GitCredentialBoundary, GitSecretEnvVar};
+        let server = MockServer::start().await;
+        let (mut state, tmp) = make_state_with_staging(&server);
+        let runtime = PromoteRuntimeConfig::new(
+            PathBuf::from("/nonexistent/bin/git"),
+            GitCloneBaseUrl::github(),
+            GitCredentialBoundary::new(
+                PathBuf::from("/nonexistent/bin/askpass"),
+                GitSecretEnvVar::new("WRIT_GIT_TOKEN").unwrap(),
+            )
+            .unwrap(),
+            tmp.path().join("promote"),
+            std::time::Duration::from_secs(30),
+        )
+        .unwrap();
+        let inner = Arc::get_mut(&mut state).expect("fresh Arc has no other handles");
+        inner.promote_runtime = Some(Arc::new(runtime));
+        // signing_key intentionally left None.
+
+        let resp = dispatch_message(
+            ClientMessage::ApproveStagedPush {
+                request_id: RequestId::new(),
+                operator: "alice".into(),
+            },
+            &state,
+        )
+        .await;
+        match resp {
+            ServerMessage::Error { message } => {
+                assert!(
+                    message.contains("signing_key is unset"),
+                    "expected signing_key-not-configured error, got: {message}",
+                );
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    /// A request_id with no corresponding staging dir on disk must
+    /// surface as `UnknownStagedPush`, not a generic Error — the
+    /// reject path uses the same convention. This lets the CLI render
+    /// "no such staged push" cleanly instead of leaking IO error text.
+    #[tokio::test]
+    async fn approve_staged_push_with_unknown_request_returns_unknown_staged_push() {
+        let server = MockServer::start().await;
+        let (state, _tmp) = make_state_with_approve_ready(&server);
+        let unknown = RequestId::new();
+        let resp = dispatch_message(
+            ClientMessage::ApproveStagedPush {
+                request_id: unknown,
+                operator: "alice".into(),
+            },
+            &state,
+        )
+        .await;
+        match resp {
+            ServerMessage::UnknownStagedPush { request_id } => {
+                assert_eq!(request_id, unknown);
+            }
+            other => panic!("expected UnknownStagedPush, got {other:?}"),
+        }
     }
 
     // --- Plan listing / show -------------------------------------------
