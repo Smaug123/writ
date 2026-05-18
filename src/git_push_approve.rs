@@ -86,7 +86,8 @@ pub enum RunApproveError {
 /// failed (init, fetch, unbundle); the prepare layer's job is purely
 /// to assemble a staging repo whose state the planner can read, so
 /// these are reported separately even though they share a single
-/// [`CleanGitError`] cause type.
+/// `CleanGitError` cause type (kept out of the rustdoc-resolved link
+/// surface because the `clean_git` module is `pub(crate)`).
 #[derive(Debug, thiserror::Error)]
 pub enum PrepareStagingError {
     #[error("approve staging dir already exists: {0}")]
@@ -256,9 +257,10 @@ pub async fn run_approve_with_staging_repo(
 ///
 /// The `Drop` impl deliberately does *not* `rm -rf` the path: the
 /// orchestrator runs cleanup explicitly on its own (success or error)
-/// so failures can be logged. Tests construct this directly via
-/// [`StagingRepo::from_path_for_test`] against a pre-populated repo so
-/// they can drive `run_approve_with_staging_repo` without the fetch.
+/// so failures can be logged. Tests construct this directly via the
+/// `#[cfg(test)]`-only `from_path_for_test` constructor against a
+/// pre-populated repo so they can drive `run_approve_with_staging_repo`
+/// without the fetch.
 #[derive(Debug)]
 pub struct StagingRepo {
     path: PathBuf,
@@ -315,6 +317,42 @@ pub async fn prepare_staging_repo(
         }
     })?;
 
+    // Past this point we own `staging_dir` on disk; any failure must
+    // clean it up so the next retry can re-mkdir without tripping the
+    // refuse-if-exists guard at the top. `run_approve`'s own cleanup
+    // only fires when prepare *succeeds* and produces a `StagingRepo`.
+    match run_prepare_steps(
+        runtime,
+        &staging_dir,
+        expected_remote_head,
+        repo,
+        token,
+        bundle_bytes,
+    )
+    .await
+    {
+        Ok(()) => Ok(StagingRepo { path: staging_dir }),
+        Err(err) => {
+            if let Err(cleanup) = tokio::fs::remove_dir_all(&staging_dir).await {
+                tracing::warn!(
+                    error = %cleanup,
+                    staging_dir = %staging_dir.display(),
+                    "approve staging dir cleanup after prepare failure failed; leaving for boot-time reconciliation",
+                );
+            }
+            Err(err)
+        }
+    }
+}
+
+async fn run_prepare_steps(
+    runtime: &PromoteRuntimeConfig,
+    staging_dir: &std::path::Path,
+    expected_remote_head: &GitObjectId,
+    repo: &GitCloneRepo,
+    token: &GitSecretValue,
+    bundle_bytes: &[u8],
+) -> Result<(), PrepareStagingError> {
     let bundle_path = staging_dir.join("staged.bundle");
     tokio::fs::write(&bundle_path, bundle_bytes)
         .await
@@ -323,22 +361,22 @@ pub async fn prepare_staging_repo(
             source,
         })?;
 
-    let init = build_init_bare_invocation(runtime, &staging_dir);
+    let init = build_init_bare_invocation(runtime, staging_dir);
     clean_git::run_clean_git(&init, runtime.step_timeout(), None)
         .await
         .map_err(|e| PrepareStagingError::GitInit(e.to_string()))?;
 
-    let fetch = build_fetch_prereq_invocation(runtime, &staging_dir, repo, expected_remote_head);
+    let fetch = build_fetch_prereq_invocation(runtime, staging_dir, repo, expected_remote_head);
     clean_git::run_clean_git(&fetch, runtime.step_timeout(), Some(token.as_str()))
         .await
         .map_err(|e| PrepareStagingError::GitFetch(e.to_string()))?;
 
-    let unbundle = build_unbundle_invocation(runtime, &staging_dir, &bundle_path);
+    let unbundle = build_unbundle_invocation(runtime, staging_dir, &bundle_path);
     clean_git::run_clean_git(&unbundle, runtime.step_timeout(), None)
         .await
         .map_err(|e| PrepareStagingError::GitUnbundle(e.to_string()))?;
 
-    Ok(StagingRepo { path: staging_dir })
+    Ok(())
 }
 
 pub(crate) fn staging_dir_for(runtime: &PromoteRuntimeConfig, request_id: RequestId) -> PathBuf {
@@ -418,12 +456,16 @@ pub(crate) fn build_fetch_prereq_invocation(
     )
 }
 
-/// `git -C <staging_dir> bundle unbundle --quiet <bundle_path>`.
+/// `git -C <staging_dir> bundle unbundle <bundle_path>`.
 ///
 /// `unbundle` writes loose objects (or a pack, depending on version)
 /// into the bare repo's object database. No ref is created; the
 /// planner runs `rev-list` directly against the SHA the bundle named,
 /// which is reachable via the unpacked objects.
+///
+/// `git bundle unbundle` does not accept `--quiet` — its sole option
+/// is `--progress`, which we leave off so progress chatter stays off
+/// stderr by default and we still see real errors when they fire.
 pub(crate) fn build_unbundle_invocation(
     runtime: &PromoteRuntimeConfig,
     staging_dir: &std::path::Path,
@@ -436,7 +478,6 @@ pub(crate) fn build_unbundle_invocation(
             staging_dir.as_os_str().to_os_string(),
             OsString::from("bundle"),
             OsString::from("unbundle"),
-            OsString::from("--quiet"),
             bundle_path.as_os_str().to_os_string(),
         ],
         clean_git_config_env(),
@@ -584,9 +625,15 @@ mod tests {
                 staging.display().to_string(),
                 "bundle".to_string(),
                 "unbundle".to_string(),
-                "--quiet".to_string(),
                 bundle.display().to_string(),
             ],
+        );
+        // `--quiet` must not appear: `git bundle unbundle` rejects it as
+        // an unknown flag and the subprocess would exit with usage
+        // status, which would mask the real approve outcome.
+        assert!(
+            !inv.display_args_lossy().iter().any(|a| a == "--quiet"),
+            "`git bundle unbundle` does not accept --quiet",
         );
         assert!(inv.required_secret_env().is_empty());
     }
@@ -1012,5 +1059,118 @@ mod tests {
             err,
             RunApproveError::Execute(ExecuteError::UpdateRef(_))
         ));
+    }
+
+    // ---------- prepare-side real-git regression tests ----------
+
+    /// Regression test for the `git bundle unbundle --quiet` mistake:
+    /// drive `build_unbundle_invocation` through `clean_git::run_clean_git`
+    /// against a real bundle and a real bare staging repo, and verify
+    /// the bundle's commit lands as an object in the staging repo. The
+    /// pure invocation-shape test only pins argv; this one would have
+    /// caught the bad flag because real git rejects `--quiet` for
+    /// `bundle unbundle` with usage status.
+    #[tokio::test]
+    async fn unbundle_invocation_runs_against_real_git() {
+        let Some(git) = maybe_git() else {
+            eprintln!("skipping: `git` not on PATH");
+            return;
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let work = tmp.path().join("work");
+        let staging = tmp.path().join("staging.git");
+        let bundle_path = tmp.path().join("staged.bundle");
+
+        std::fs::create_dir(&work).unwrap();
+        run_git(&git, &work, &["init", "--quiet", "--initial-branch=main"]);
+        run_git(
+            &git,
+            &work,
+            &["commit", "--allow-empty", "--quiet", "-m", "one"],
+        );
+        let head = rev_parse(&git, &work, "HEAD");
+
+        run_git(
+            &git,
+            &work,
+            &[
+                "bundle",
+                "create",
+                bundle_path.to_str().unwrap(),
+                "refs/heads/main",
+            ],
+        );
+        run_git(&git, tmp.path(), &["init", "--bare", "--quiet", "staging.git"]);
+
+        let runtime = runtime_pointed_at(tmp.path());
+        let inv = build_unbundle_invocation(&runtime, &staging, &bundle_path);
+        clean_git::run_clean_git(&inv, runtime.step_timeout(), None)
+            .await
+            .expect("`git bundle unbundle` must succeed against a real staging repo");
+
+        // The bundled commit must now be present in the staging repo's
+        // object database (no ref is created — that's the planner's
+        // job — but `cat-file -e` confirms reachability).
+        let exists = Command::new(&git)
+            .arg("-C")
+            .arg(&staging)
+            .args(["cat-file", "-e", head.as_str()])
+            .env_clear()
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("HOME", "/dev/null")
+            .status()
+            .expect("spawning git cat-file failed");
+        assert!(
+            exists.success(),
+            "bundled commit {head} not present in staging repo after unbundle",
+            head = head.as_str(),
+        );
+    }
+
+    /// Regression test for the prepare-side cleanup hole: if any of
+    /// the git-subprocess steps fail after the staging dir has been
+    /// created, `prepare_staging_repo` must remove the staging dir
+    /// before returning the error. Trigger by pointing the runtime at
+    /// a nonexistent git binary so `git init --bare` fails to spawn.
+    #[tokio::test]
+    async fn prepare_cleans_staging_dir_when_step_fails() {
+        let work_root = tempfile::tempdir().unwrap();
+        // Nonexistent git binary forces the init step to fail at spawn.
+        let runtime = PromoteRuntimeConfig::new(
+            PathBuf::from("/nonexistent/bin/git-does-not-exist"),
+            GitCloneBaseUrl::github(),
+            GitCredentialBoundary::new(
+                PathBuf::from("/usr/local/bin/fake-askpass"),
+                GitSecretEnvVar::new("WRIT_GIT_TOKEN").unwrap(),
+            )
+            .unwrap(),
+            work_root.path().to_path_buf(),
+            Duration::from_secs(30),
+        )
+        .unwrap();
+        let request_id = sample_request_id();
+        let staging_dir = staging_dir_for(&runtime, request_id);
+
+        let err = prepare_staging_repo(
+            &runtime,
+            request_id,
+            &sample_object_id('a'),
+            &sample_repo(),
+            &sample_token(),
+            b"bundle-bytes-irrelevant",
+        )
+        .await
+        .expect_err("nonexistent git binary must fail prepare");
+
+        assert!(
+            matches!(err, PrepareStagingError::GitInit(_)),
+            "expected GitInit error, got: {err:?}",
+        );
+        assert!(
+            !tokio::fs::try_exists(&staging_dir).await.unwrap_or(true),
+            "staging dir {} must be cleaned up after prepare failure",
+            staging_dir.display(),
+        );
     }
 }
