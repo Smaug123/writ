@@ -146,7 +146,20 @@ CREATE TABLE git_push_approve_attempt (
     -- Mint context is all-or-nothing.
     CHECK ((mint_jti IS NULL) = (mint_github_app_id IS NULL)),
     CHECK ((mint_jti IS NULL) = (mint_issued_at IS NULL)),
-    CHECK ((mint_jti IS NULL) = (mint_expires_at IS NULL))
+    CHECK ((mint_jti IS NULL) = (mint_expires_at IS NULL)),
+    -- State / mint coupling. The `Uncertain` row's load-bearing role is
+    -- to carry the captured mint context for the in-flight PATCH; a
+    -- `Started` row by definition has no mint yet; a `Resolved` row
+    -- with outcome `succeeded` or `post_patch_failure` must carry the
+    -- mint the PATCH used. Without these constraints, manual SQL or a
+    -- future migration could land an `uncertain` row with NULL mint
+    -- that `git_push_approve_attempt_from_row` would refuse to parse,
+    -- making `reject_blocker_for_push` fail on the very state it is
+    -- meant to block.
+    CHECK (state != 'started' OR mint_jti IS NULL),
+    CHECK (state != 'uncertain' OR mint_jti IS NOT NULL),
+    CHECK (coalesce(outcome, '') != 'succeeded' OR mint_jti IS NOT NULL),
+    CHECK (coalesce(outcome, '') != 'post_patch_failure' OR mint_jti IS NOT NULL)
 );
 
 CREATE INDEX idx_git_push_approve_attempt_push_request

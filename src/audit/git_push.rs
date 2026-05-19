@@ -488,6 +488,25 @@ impl AuditLog {
                     "approve attempt requires staged outcome",
                 ));
             }
+            // A resolution row (approved *or* rejected) already exists
+            // for this push. Permitting a new attempt would let the
+            // approve path advance GitHub against a push the audit log
+            // has already declared terminal: the `complete_attempt_*`
+            // joint TX would later fail the resolution PK INSERT, but
+            // by then `update_ref` may already have run. Refuse here.
+            let resolution: Option<i64> = tx
+                .query_row(
+                    "SELECT 1 FROM git_push_resolution
+                     WHERE push_request_id = ?1",
+                    params![push_request_id.as_uuid().to_string()],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if resolution.is_some() {
+                return Err(AuditError::Invariant(
+                    "approve attempt refused: push already has a resolution",
+                ));
+            }
 
             tx.execute(
                 "INSERT INTO git_push_approve_attempt (
@@ -1879,6 +1898,43 @@ mod tests {
         assert_eq!(attempt.state, GitPushApproveAttemptState::Started);
     }
 
+    /// A push with an existing rejected resolution must not accept a
+    /// new approve attempt. If it did, the eventual joint-TX completion
+    /// would fail at the resolution PRIMARY KEY conflict, but only
+    /// after `update_ref` may have advanced GitHub — exactly the
+    /// "audit row contradicts observable state" hole the state machine
+    /// is meant to close.
+    #[test]
+    fn start_approve_attempt_refused_when_already_resolved() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let push_request_id = RequestId::new();
+        let _session = open_with_staged_request(&log, push_request_id);
+        log.record_git_push_resolution(&GitPushResolutionRecord {
+            push_request_id,
+            decided_at: UnixMillis::from_millis(1_700_000_150),
+            decision: GitPushResolution::Rejected,
+            operator: "alice",
+            reason: "not now",
+        })
+        .unwrap();
+
+        let err = log
+            .start_approve_attempt(
+                ApproveAttemptId::new(),
+                push_request_id,
+                "bob",
+                UnixMillis::from_millis(1_700_000_200),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                AuditError::Invariant("approve attempt refused: push already has a resolution")
+            ),
+            "got: {err:?}"
+        );
+    }
+
     #[test]
     fn mark_attempt_uncertain_succeeds_from_started() {
         let log = AuditLog::open_in_memory().unwrap();
@@ -2346,6 +2402,105 @@ mod tests {
                          state, failure_detail)
                      VALUES (?1, ?2, 'alice', 1700000000,
                              'started', 'nope')",
+                    params![
+                        attempt_id.as_uuid().to_string(),
+                        push_request_id.as_uuid().to_string(),
+                    ],
+                ))
+            })
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            err.to_string().to_lowercase().contains("check"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// A `started` row with mint columns set is contradictory: mint
+    /// context is captured at the `started → uncertain` transition, so
+    /// `started` must have NULL mint. The schema CHECK refuses the
+    /// shape directly so manual SQL or a future migration cannot
+    /// produce it.
+    #[test]
+    fn check_constraint_rejects_started_row_with_mint() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let push_request_id = RequestId::new();
+        let _session = open_with_staged_request(&log, push_request_id);
+        let attempt_id = ApproveAttemptId::new();
+        let err = log
+            .with_conn_mut(|c| {
+                Ok(c.execute(
+                    "INSERT INTO git_push_approve_attempt
+                        (attempt_id, push_request_id, operator, started_at,
+                         state, mint_jti, mint_github_app_id,
+                         mint_issued_at, mint_expires_at)
+                     VALUES (?1, ?2, 'alice', 1700000000,
+                             'started', ?3, 42, 1700000100, 1700003700)",
+                    params![
+                        attempt_id.as_uuid().to_string(),
+                        push_request_id.as_uuid().to_string(),
+                        Jti::new().as_uuid().to_string(),
+                    ],
+                ))
+            })
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            err.to_string().to_lowercase().contains("check"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// An `uncertain` row must carry mint context. Without this CHECK,
+    /// manual SQL could land the row that `reject_blocker_for_push` is
+    /// meant to block on, but `git_push_approve_attempt_from_row` would
+    /// then refuse to parse it as an invariant error — making the
+    /// blocker query fail on the very state it exists to detect.
+    #[test]
+    fn check_constraint_rejects_uncertain_row_without_mint() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let push_request_id = RequestId::new();
+        let _session = open_with_staged_request(&log, push_request_id);
+        let attempt_id = ApproveAttemptId::new();
+        let err = log
+            .with_conn_mut(|c| {
+                Ok(c.execute(
+                    "INSERT INTO git_push_approve_attempt
+                        (attempt_id, push_request_id, operator, started_at, state)
+                     VALUES (?1, ?2, 'alice', 1700000000, 'uncertain')",
+                    params![
+                        attempt_id.as_uuid().to_string(),
+                        push_request_id.as_uuid().to_string(),
+                    ],
+                ))
+            })
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            err.to_string().to_lowercase().contains("check"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// A `resolved(succeeded)` row also requires mint — the
+    /// `complete_attempt_succeeded` path always arrives via `uncertain`
+    /// (which itself requires mint), but the column-level invariant
+    /// must not depend on that flow.
+    #[test]
+    fn check_constraint_rejects_resolved_succeeded_without_mint() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let push_request_id = RequestId::new();
+        let _session = open_with_staged_request(&log, push_request_id);
+        let attempt_id = ApproveAttemptId::new();
+        let err = log
+            .with_conn_mut(|c| {
+                Ok(c.execute(
+                    "INSERT INTO git_push_approve_attempt
+                        (attempt_id, push_request_id, operator, started_at,
+                         state, outcome, completed_at, new_app_tip)
+                     VALUES (?1, ?2, 'alice', 1700000000,
+                             'resolved', 'succeeded', 1700000200,
+                             '0123456789abcdef0123456789abcdef01234567')",
                     params![
                         attempt_id.as_uuid().to_string(),
                         push_request_id.as_uuid().to_string(),
