@@ -167,7 +167,7 @@ pub struct GitPushApproveAttemptEntry {
 }
 
 /// Whether a staged push has any approve attempt that prevents it from
-/// being rejected. Returned by [`AuditLog::reject_blockers_for_push`];
+/// being rejected. Returned by [`AuditLog::reject_blocker_for_push`];
 /// the reject handler maps this into the reject-vs-refuse decision.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RejectBlocker {
@@ -2289,6 +2289,73 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("git_push_approve_attempt mint context is immutable once set"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// SQLite returns NULL from `outcome = 'succeeded'` when outcome is
+    /// NULL, and a CHECK that evaluates to NULL passes. Without the
+    /// `coalesce` wrapper a `started` row could be written with a
+    /// non-NULL `new_app_tip` and survive the schema, then trip the
+    /// `from_row` parser later. Direct INSERT here so we exercise the
+    /// CHECK itself rather than the DAO methods that already forbid the
+    /// shape via their query builders.
+    #[test]
+    fn check_constraint_rejects_started_row_with_new_app_tip() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let push_request_id = RequestId::new();
+        let _session = open_with_staged_request(&log, push_request_id);
+        let attempt_id = ApproveAttemptId::new();
+        let err = log
+            .with_conn_mut(|c| {
+                Ok(c.execute(
+                    "INSERT INTO git_push_approve_attempt
+                        (attempt_id, push_request_id, operator, started_at,
+                         state, new_app_tip)
+                     VALUES (?1, ?2, 'alice', 1700000000,
+                             'started', '0123456789abcdef0123456789abcdef01234567')",
+                    params![
+                        attempt_id.as_uuid().to_string(),
+                        push_request_id.as_uuid().to_string(),
+                    ],
+                ))
+            })
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            err.to_string().to_lowercase().contains("check"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// Parallel to the new_app_tip case: a non-NULL `failure_detail` on
+    /// a `started` row would slip past the schema if the cross-column
+    /// CHECK were not NULL-safe, because `outcome IN (...)` returns
+    /// NULL when outcome is NULL.
+    #[test]
+    fn check_constraint_rejects_started_row_with_failure_detail() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let push_request_id = RequestId::new();
+        let _session = open_with_staged_request(&log, push_request_id);
+        let attempt_id = ApproveAttemptId::new();
+        let err = log
+            .with_conn_mut(|c| {
+                Ok(c.execute(
+                    "INSERT INTO git_push_approve_attempt
+                        (attempt_id, push_request_id, operator, started_at,
+                         state, failure_detail)
+                     VALUES (?1, ?2, 'alice', 1700000000,
+                             'started', 'nope')",
+                    params![
+                        attempt_id.as_uuid().to_string(),
+                        push_request_id.as_uuid().to_string(),
+                    ],
+                ))
+            })
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            err.to_string().to_lowercase().contains("check"),
             "unexpected error: {err}"
         );
     }

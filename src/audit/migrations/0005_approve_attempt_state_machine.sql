@@ -131,11 +131,17 @@ CREATE TABLE git_push_approve_attempt (
     mint_issued_at      INTEGER CHECK (mint_issued_at IS NULL OR mint_issued_at > 0),
     mint_expires_at     INTEGER CHECK (mint_expires_at IS NULL OR mint_expires_at > 0),
     -- Cross-column shape invariants. CHECK fires on both INSERT and UPDATE
-    -- so these hold throughout the row's lifetime.
+    -- so these hold throughout the row's lifetime. Comparisons that include
+    -- nullable columns (`outcome`) substitute an empty-string sentinel before
+    -- comparing: SQLite's `=` and `IN` return NULL when either side is NULL,
+    -- and CHECK constraints treat NULL as pass, so a naive
+    -- `(outcome = 'succeeded') = (new_app_tip IS NOT NULL)` would silently
+    -- admit a `started` row that already carries a `new_app_tip`. Forcing
+    -- the LHS to a definite 0/1 closes that gap.
     CHECK ((state = 'resolved') = (outcome IS NOT NULL)),
     CHECK ((state = 'resolved') = (completed_at IS NOT NULL)),
-    CHECK ((outcome = 'succeeded') = (new_app_tip IS NOT NULL)),
-    CHECK ((outcome IN ('pre_patch_failure', 'post_patch_failure'))
+    CHECK ((coalesce(outcome, '') = 'succeeded') = (new_app_tip IS NOT NULL)),
+    CHECK ((coalesce(outcome, '') IN ('pre_patch_failure', 'post_patch_failure'))
         = (failure_detail IS NOT NULL)),
     -- Mint context is all-or-nothing.
     CHECK ((mint_jti IS NULL) = (mint_github_app_id IS NULL)),
