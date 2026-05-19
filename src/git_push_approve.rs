@@ -45,6 +45,25 @@ use crate::vm_git_bundle::GitSecretValue;
 /// ceiling is already what production code carries.
 const STAGING_REPO_MAX_OBJECT_BYTES: u64 = 256 << 20;
 
+/// TCP connect timeout for the GitHub Git Data client used during a
+/// promote. GitHub's API typically connects in well under a second; a
+/// 10s ceiling matches the value used by the mint-side client in
+/// `github.rs` and bounds the time the broker can sit on a
+/// half-opened TCP connection.
+const GITHUB_GIT_DATA_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Per-read inactivity timeout for the GitHub Git Data client. Reset
+/// after every successful socket read, so legitimate large object
+/// uploads (up to GitHub's per-blob 100 MiB ceiling) on slow links
+/// still progress as long as bytes keep flowing; a connection that
+/// stalls for `READ_TIMEOUT` is broken. This is deliberately *not* a
+/// total request timeout: setting a wall-clock cap that admits the
+/// worst-case slow-link 100 MiB upload would be so loose that it no
+/// longer detects stalls, while a stricter cap would reject
+/// legitimate slow uploads. The no-progress timeout is the precise
+/// primitive for what we actually want to detect.
+const GITHUB_GIT_DATA_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// Outcome of a successful approve walk.
 ///
 /// Mirrors [`ExecuteOutcome`] but collapses the `Noop`/`Advanced` split:
@@ -88,6 +107,14 @@ pub enum RunApproveError {
     OpenObjectSource(#[from] OpenError),
     #[error("execute_fast_forward_plan failed: {0}")]
     Execute(#[from] ExecuteError),
+    /// `reqwest::ClientBuilder::build` returns an error if rustls/TLS
+    /// initialisation fails (no system roots, etc.). This should never
+    /// happen on a configured production host, but the previous
+    /// `reqwest::Client::new()` call point swallowed the same error
+    /// path via panic; surfacing it lets the broker fail the approve
+    /// cleanly without bringing down the daemon.
+    #[error("constructing the GitHub Git Data HTTP client failed: {0}")]
+    HttpClientBuild(reqwest::Error),
 }
 
 /// Errors that can fall out of [`prepare_staging_repo`].
@@ -246,11 +273,22 @@ pub async fn run_approve_with_staging_repo(
     )
     .await?;
 
-    let client = GitDataClient::new(
-        reqwest::Client::new(),
-        api_base.to_string(),
-        token.as_str().to_string(),
-    );
+    // Configure the HTTP client with connect + per-read timeouts. The
+    // approve flow holds the per-request decision lock across the
+    // whole `execute_fast_forward_plan` call, so a stalled GitHub
+    // connection on the unbounded default client would pin a single
+    // staged push's lock entry indefinitely and block further
+    // approve/reject for it. The `connect_timeout` bounds the half-open
+    // case; `read_timeout` resets after every successful socket read,
+    // so legitimate slow uploads still progress, but a connection that
+    // sends nothing for `GITHUB_GIT_DATA_READ_TIMEOUT` is detected as
+    // stalled instead of being awaited forever.
+    let http = reqwest::Client::builder()
+        .connect_timeout(GITHUB_GIT_DATA_CONNECT_TIMEOUT)
+        .read_timeout(GITHUB_GIT_DATA_READ_TIMEOUT)
+        .build()
+        .map_err(RunApproveError::HttpClientBuild)?;
+    let client = GitDataClient::new(http, api_base.to_string(), token.as_str().to_string());
 
     let outcome = execute_fast_forward_plan(
         &client,

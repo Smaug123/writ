@@ -808,11 +808,55 @@ async fn decide_plan<S: SecretStore + Send + Sync + 'static>(
 /// operator field is informational only.
 pub(crate) const MAX_OPERATOR_BYTES: usize = 256;
 
+/// Confirm a staging-directory exists for `request_id` before any
+/// decision handler is allowed to allocate a per-request decision-lock
+/// entry. Without this filter, a caller that probes the broker with
+/// random `RequestId`s would grow `BrokerState::decision_locks`
+/// permanently: every probe takes the `or_insert_with` path and leaves
+/// an `Arc<Mutex<()>>` behind.
+///
+/// Gating on staging-dir existence (rather than audit-row existence)
+/// preserves the approve handler's drift detector: a request id where
+/// the staging dir exists but the audit row does not is reported as
+/// drift, not as `UnknownStagedPush`, by the inner flow.
+/// `try_load_receipt` is the cheap fs lookup — it does not read the
+/// bundle bytes — so the pre-flight cost is one stat() per decision.
+///
+/// Returns `Ok(())` if the staging dir exists, `Err(reply)` with a
+/// ready `UnknownStagedPush` (or `Error`) reply if it does not. Locks
+/// are not touched on the `Err` path.
+async fn staging_entry_exists(
+    staging_store: &Arc<GitPushStagingStore>,
+    request_id: RequestId,
+) -> Result<(), ServerMessage> {
+    let staging_store = Arc::clone(staging_store);
+    let probe =
+        tokio::task::spawn_blocking(move || staging_store.try_load_receipt(request_id)).await;
+    match probe {
+        Ok(Ok(Some(_))) => Ok(()),
+        Ok(Ok(None)) => Err(ServerMessage::UnknownStagedPush { request_id }),
+        Ok(Err(err)) => Err(ServerMessage::Error {
+            message: err.to_string(),
+        }),
+        Err(err) => Err(ServerMessage::Error {
+            message: format!("staging probe task failed: {err}"),
+        }),
+    }
+}
+
 /// Look up (or create) the per-`RequestId` decision mutex registered on
 /// `BrokerState::decision_locks`. The returned `Arc` is consumed by the
 /// caller with `.lock_owned().await`; the registry mutex is released
 /// before the await so concurrent decisions on *other* request ids
 /// never serialise on this map.
+///
+/// Callers must first prove the request id has a staging directory
+/// (see [`staging_entry_exists`]) so that bogus or stale probes do not
+/// grow the registry. Known ids that are already resolved (staging dir
+/// may have been cleaned up by a prior approve) bypass the lock via
+/// the pre-flight returning `UnknownStagedPush` — same outcome the
+/// existing lock-then-load flow already gave, but without a registry
+/// entry.
 fn acquire_decision_lock<S: SecretStore>(
     state: &BrokerState<S>,
     request_id: RequestId,
@@ -849,6 +893,14 @@ async fn reject_staged_push<S: SecretStore + Send + Sync + 'static>(
                 operator.len(),
             ),
         };
+    }
+
+    // Staging pre-check: kick out bogus / probed `RequestId`s *before*
+    // touching the decision-lock registry. See `staging_entry_exists`
+    // for why this matters — without it, a caller that hammers the
+    // broker with random ids would grow the registry without bound.
+    if let Err(reply) = staging_entry_exists(&staging_store, request_id).await {
+        return reply;
     }
 
     // Serialise against any concurrent approve for the same request: an
@@ -1055,6 +1107,14 @@ async fn approve_staged_push<S: SecretStore + Send + Sync + 'static>(
     let Some(signing_key) = state.signing_key.clone() else {
         return approve_staged_push_not_configured("signing_key");
     };
+
+    // Staging pre-check: kick out bogus / probed `RequestId`s *before*
+    // touching the decision-lock registry. See `staging_entry_exists`
+    // for why this matters — without it, a caller that hammers the
+    // broker with random ids would grow the registry without bound.
+    if let Err(reply) = staging_entry_exists(&staging_store, request_id).await {
+        return reply;
+    }
 
     // Serialise against any concurrent decision (approve or reject) for
     // the same request. Without this, a `RejectStagedPush` arriving
@@ -4558,6 +4618,61 @@ mod tests {
         let _guard_a = lock_a.try_lock().expect("a is uncontested");
         // Holding the lock for id_a must not block id_b.
         let _guard_b = lock_b.try_lock().expect("b is uncontested despite a held");
+    }
+
+    /// A decision request for a `RequestId` the broker has never staged
+    /// must return `UnknownStagedPush` without growing
+    /// `BrokerState::decision_locks`. Without this property a caller
+    /// could probe the daemon with random ids and leak an
+    /// `Arc<Mutex<()>>` per probe into the registry. The pre-flight
+    /// staging-dir check (`staging_entry_exists`) is what enforces it.
+    /// Uses `make_state_with_approve_ready` so the approve handler's
+    /// configured-state checks (promote_runtime, signing_key) admit
+    /// the request through to the staging pre-flight rather than
+    /// short-circuiting earlier.
+    #[tokio::test]
+    async fn decision_handlers_do_not_grow_lock_registry_for_unknown_request_ids() {
+        let server = MockServer::start().await;
+        let (state, _tmp) = make_state_with_approve_ready(&server);
+
+        let bogus_a = RequestId::new();
+        let bogus_b = RequestId::new();
+
+        let reject = dispatch_message(
+            ClientMessage::RejectStagedPush {
+                request_id: bogus_a,
+                operator: "alice".into(),
+                reason: RejectionReason::try_new("nope").unwrap(),
+            },
+            &state,
+        )
+        .await;
+        assert!(
+            matches!(reject, ServerMessage::UnknownStagedPush { request_id } if request_id == bogus_a),
+            "expected UnknownStagedPush, got {reject:?}",
+        );
+
+        let approve = dispatch_message(
+            ClientMessage::ApproveStagedPush {
+                request_id: bogus_b,
+                operator: "alice".into(),
+            },
+            &state,
+        )
+        .await;
+        assert!(
+            matches!(approve, ServerMessage::UnknownStagedPush { request_id } if request_id == bogus_b),
+            "expected UnknownStagedPush, got {approve:?}",
+        );
+
+        let registry = state
+            .decision_locks
+            .lock()
+            .expect("registry mutex poisoned");
+        assert!(
+            registry.is_empty(),
+            "unknown-request decisions must not grow the lock registry; registry = {registry:?}",
+        );
     }
 
     /// End-to-end coverage for the lock: a reject after a successful
