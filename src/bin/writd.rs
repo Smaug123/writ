@@ -16,7 +16,8 @@ use writ::git_push_staging::GitPushStagingStore;
 use writ::github::GitHubMinter;
 use writ::secret::{FileSecretStore, KeyringSecretStore, SecretStore};
 use writ::server::{
-    BrokerState, default_socket_path, prepare_broker_listener, serve_broker_with_agent_vm,
+    BrokerState, default_socket_path, empty_decision_locks, prepare_broker_listener,
+    serve_broker_with_agent_vm,
 };
 use writ::ui_http::{
     UiHttpBearerToken, UiHttpService, bind_ui_http_listener, run_ui_http_until_shutdown,
@@ -174,6 +175,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         signing_key,
         run_agent_spawn,
         promote_runtime,
+        decision_locks: empty_decision_locks(),
     });
 
     tracing::info!(

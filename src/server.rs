@@ -10,10 +10,11 @@
 //! lives in `handle_connection` and only calls [`dispatch_message`].
 //! All tests exercise [`dispatch_message`] directly.
 
+use std::collections::HashMap;
 use std::io;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
@@ -28,8 +29,9 @@ use crate::audit::{
     GitPushResolutionRecord, PlanDecisionRecord, PreMintRecord,
 };
 use crate::core::{
-    CapabilityRequest, GitHubAccess, GitHubGrantedScope, GitHubPermissions, GrantedScope,
-    MetadataAccess, PolicyDecision, RequestId, SessionId, SessionRecord, TtlSeconds, UnixMillis,
+    CapabilityRequest, GITHUB_INSTALLATION_TOKEN_MAX_SECONDS, GitHubAccess, GitHubGrantedScope,
+    GitHubPermissions, GrantedScope, MetadataAccess, PolicyDecision, RequestId, SessionId,
+    SessionRecord, TtlSeconds, UnixMillis,
 };
 use crate::core::{NotesRef, Sha256Hex};
 use crate::git_push_approve::{RunApproveError, run_approve};
@@ -95,6 +97,40 @@ pub struct BrokerState<S: SecretStore> {
     pub signing_key: Option<WritSigningKey>,
     pub run_agent_spawn: Option<RunAgentSpawnConfig>,
     pub promote_runtime: Option<Arc<PromoteRuntimeConfig>>,
+    /// Per-`RequestId` mutex guarding the approve/reject decision flow
+    /// for a staged push. Both `approve_staged_push` and
+    /// `reject_staged_push` acquire the lock at the top of the handler
+    /// and hold it across the audit-row write (and, for approve, across
+    /// the awaited `run_approve` call that advances the GitHub branch).
+    ///
+    /// Without this, a `RejectStagedPush` arriving while an approve was
+    /// awaiting `run_approve` could commit a `Rejected` row first,
+    /// causing the approve's INSERT to fail with UNIQUE constraint after
+    /// GitHub had already moved the branch — i.e. the durable audit log
+    /// would say rejected while the branch had been promoted. The lock
+    /// serialises every decision attempt for the same `request_id`, so
+    /// at most one handler is between "checked there's no resolution"
+    /// and "wrote the resolution" at a time.
+    ///
+    /// The registry is held under `std::sync::Mutex` because we only
+    /// hold it for the brief look-up/insert; the per-request lock is
+    /// `tokio::sync::Mutex` because it crosses awaits. Entries are
+    /// never removed — each is ~24 bytes and the rate is bounded by the
+    /// operator-paced staged-push volume.
+    pub decision_locks: DecisionLockRegistry,
+}
+
+/// Type alias for the per-`RequestId` decision-lock registry held on
+/// [`BrokerState::decision_locks`]. Exposed (with [`empty_decision_locks`])
+/// so call sites can construct fresh `BrokerState` literals without
+/// importing the `HashMap`/`Mutex` types directly.
+pub type DecisionLockRegistry = Arc<StdMutex<HashMap<RequestId, Arc<tokio::sync::Mutex<()>>>>>;
+
+/// Build a fresh, empty [`DecisionLockRegistry`]. Every `BrokerState`
+/// should own its own registry; see the field documentation on
+/// [`BrokerState::decision_locks`] for why.
+pub fn empty_decision_locks() -> DecisionLockRegistry {
+    Arc::new(StdMutex::new(HashMap::new()))
 }
 
 #[derive(Clone, Eq, PartialEq)]
@@ -773,6 +809,25 @@ async fn decide_plan<S: SecretStore + Send + Sync + 'static>(
 /// operator field is informational only.
 pub(crate) const MAX_OPERATOR_BYTES: usize = 256;
 
+/// Look up (or create) the per-`RequestId` decision mutex registered on
+/// `BrokerState::decision_locks`. The returned `Arc` is consumed by the
+/// caller with `.lock_owned().await`; the registry mutex is released
+/// before the await so concurrent decisions on *other* request ids
+/// never serialise on this map.
+fn acquire_decision_lock<S: SecretStore>(
+    state: &BrokerState<S>,
+    request_id: RequestId,
+) -> Arc<tokio::sync::Mutex<()>> {
+    let mut map = state
+        .decision_locks
+        .lock()
+        .expect("decision_locks registry mutex poisoned");
+    Arc::clone(
+        map.entry(request_id)
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+    )
+}
+
 async fn reject_staged_push<S: SecretStore + Send + Sync + 'static>(
     state: &Arc<BrokerState<S>>,
     request_id: RequestId,
@@ -796,6 +851,15 @@ async fn reject_staged_push<S: SecretStore + Send + Sync + 'static>(
             ),
         };
     }
+
+    // Serialise against any concurrent approve for the same request: an
+    // approve in flight has already short-circuited the no-resolution
+    // check and may be inside `run_approve`; if we beat it to the
+    // audit-row insert the approve would later land its row on a
+    // GitHub branch we just told the operator we rejected. Held until
+    // function exit.
+    let decision_lock = acquire_decision_lock(state, request_id);
+    let _decision_guard = decision_lock.lock_owned().await;
 
     // Verify the staging directory exists before touching the audit
     // log. Matching `show_staged_push`'s ordering lets the two endpoints
@@ -899,16 +963,21 @@ async fn reject_staged_push<S: SecretStore + Send + Sync + 'static>(
 
 /// TTL ceiling for the GitHub installation token minted by an approve
 /// decision. The token is held only for the lifetime of a single
-/// `run_approve` invocation (prepare + walk + ref-update), so anything
-/// north of a few minutes is dead weight that just expands the blast
-/// radius if the token somehow leaks. 600s gives ample headroom for
-/// large fetch/replay walks while keeping the credential's lifetime
-/// short — much shorter than the capability-grant default
-/// (`PolicyConfig::default_ttl`, typically 3600s), which is appropriate
-/// because there is no agent on the other end of this token: only the
-/// broker itself uses it, and only for the duration of this one HTTP
-/// burst.
-const APPROVE_MINT_TTL_SECONDS: i64 = 600;
+/// `run_approve` invocation (prepare + walk + ref-update), and there is
+/// no agent on the other end — only the broker itself uses it, for the
+/// duration of one HTTP burst — so a shorter ceiling would be nice for
+/// blast-radius reasons.
+///
+/// However, the GitHub `POST /app/installations/{id}/access_tokens`
+/// endpoint always returns tokens with ~1h lifetime and ignores any
+/// shorter request, and the minter rejects responses whose `expires_at`
+/// exceeds `issued_at + ttl + TTL_SKEW_TOLERANCE_SECONDS`. So any TTL
+/// shorter than [`GITHUB_INSTALLATION_TOKEN_MAX_SECONDS`] would cause
+/// every real-GitHub approve mint to fail with `TtlExceeded` before
+/// `run_approve` could run. Capping at the GitHub-imposed maximum is
+/// therefore the only correct setting: the minter's TTL is a *ceiling*
+/// on what we accept back, not a request the server honours.
+const APPROVE_MINT_TTL_SECONDS: i64 = GITHUB_INSTALLATION_TOKEN_MAX_SECONDS;
 
 /// Handler for [`ClientMessage::ApproveStagedPush`].
 ///
@@ -987,6 +1056,15 @@ async fn approve_staged_push<S: SecretStore + Send + Sync + 'static>(
     let Some(signing_key) = state.signing_key.clone() else {
         return approve_staged_push_not_configured("signing_key");
     };
+
+    // Serialise against any concurrent decision (approve or reject) for
+    // the same request. Without this, a `RejectStagedPush` arriving
+    // while we are awaiting `run_approve` could commit a `Rejected` row
+    // first; our INSERT would then fail UNIQUE while GitHub had already
+    // advanced. Held to function exit so the audit-row write happens
+    // inside the locked region.
+    let decision_lock = acquire_decision_lock(state, request_id);
+    let _decision_guard = decision_lock.lock_owned().await;
 
     // Load the entry up-front: this proves the staged push exists,
     // surfaces a clean `UnknownStagedPush` if the operator's id is
@@ -1139,11 +1217,10 @@ async fn approve_staged_push<S: SecretStore + Send + Sync + 'static>(
             ..Default::default()
         },
     };
-    // `unwrap`: the literal 600 is in-range for `TtlSeconds` by
-    // construction (the const is positive and well under the
-    // GitHub-imposed installation-token ceiling), and a `TtlSeconds`
-    // built from a literal is the canonical pattern other call sites
-    // use.
+    // `unwrap`: `APPROVE_MINT_TTL_SECONDS == GITHUB_INSTALLATION_TOKEN_MAX_SECONDS`,
+    // which is the documented upper bound `TtlSeconds::new` accepts (see
+    // `core::decision`), so this conversion is infallible by
+    // construction.
     let ttl = TtlSeconds::new(APPROVE_MINT_TTL_SECONDS)
         .expect("APPROVE_MINT_TTL_SECONDS is in TtlSeconds range");
 
@@ -2239,6 +2316,7 @@ mod tests {
             signing_key: None,
             run_agent_spawn: None,
             promote_runtime: None,
+            decision_locks: empty_decision_locks(),
         })
     }
 
@@ -2289,6 +2367,7 @@ mod tests {
             signing_key: None,
             run_agent_spawn: None,
             promote_runtime: None,
+            decision_locks: empty_decision_locks(),
         })
     }
 
@@ -2470,6 +2549,7 @@ mod tests {
                 args: Vec::new(),
             }),
             promote_runtime: base.promote_runtime,
+            decision_locks: base.decision_locks,
         });
 
         let prompt_text = "hello world from cat\n";
@@ -2581,6 +2661,7 @@ mod tests {
                 args: Vec::new(),
             }),
             promote_runtime: base.promote_runtime,
+            decision_locks: base.decision_locks,
         });
 
         let resp = dispatch_message(
@@ -2653,6 +2734,7 @@ mod tests {
                 args: vec!["-c".into(), "printf out; printf err 1>&2; exit 0".into()],
             }),
             promote_runtime: base.promote_runtime,
+            decision_locks: base.decision_locks,
         });
 
         let output_ref =
@@ -2745,6 +2827,7 @@ mod tests {
                 ],
             }),
             promote_runtime: base.promote_runtime,
+            decision_locks: base.decision_locks,
         });
 
         let output_ref =
@@ -2819,6 +2902,7 @@ mod tests {
                 args: Vec::new(),
             }),
             promote_runtime: base.promote_runtime,
+            decision_locks: base.decision_locks,
         });
 
         let session_id = SessionId::new();
@@ -2888,6 +2972,7 @@ mod tests {
                 args: Vec::new(),
             }),
             promote_runtime: base.promote_runtime,
+            decision_locks: base.decision_locks,
         });
 
         let bogus = SessionId::new();
@@ -2940,6 +3025,7 @@ mod tests {
                 args: Vec::new(),
             }),
             promote_runtime: base.promote_runtime,
+            decision_locks: base.decision_locks,
         });
 
         let session_id = SessionId::new();
@@ -4250,7 +4336,11 @@ mod tests {
             inner.signing_key = Some(signing_key);
         }
 
-        let expiry = expiry_str_from_now(600);
+        // GitHub returns ~1h tokens regardless of the TTL we request, so
+        // mirror that here. A shorter expiry on the mock response would
+        // still be accepted by the minter (the check is an upper bound),
+        // but matching production keeps this fixture honest.
+        let expiry = expiry_str_from_now(3600);
         Mock::given(method("POST"))
             .and(path("/app/installations/999/access_tokens"))
             .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
@@ -4302,6 +4392,127 @@ mod tests {
                 .load(request_id)
                 .is_ok()
         );
+    }
+
+    /// `acquire_decision_lock` returns the same `Arc<Mutex>` for repeat
+    /// look-ups of the same `RequestId`. This is the load-bearing
+    /// property: both `approve_staged_push` and `reject_staged_push`
+    /// must contend on a single mutex per request, never on independent
+    /// per-call mutexes.
+    #[tokio::test]
+    async fn acquire_decision_lock_returns_same_mutex_for_same_request() {
+        let server = MockServer::start().await;
+        let state = make_state(&server, vec![], "o");
+        let id = RequestId::new();
+
+        let first = acquire_decision_lock(&state, id);
+        let second = acquire_decision_lock(&state, id);
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "expected the registry to return the same mutex Arc for repeat lookups",
+        );
+
+        let guard = first.try_lock().expect("first acquisition is uncontested");
+        assert!(
+            second.try_lock().is_err(),
+            "second lock attempt on the same mutex must block while the first guard is held",
+        );
+        drop(guard);
+        // Now the mutex is free.
+        let _g2 = second.try_lock().expect("guard dropped, mutex is free");
+    }
+
+    /// Different request ids never serialise on each other: the lock is
+    /// per-request, not global, so two operators acting on two distinct
+    /// staged pushes never queue behind one another.
+    #[tokio::test]
+    async fn acquire_decision_lock_isolated_per_request() {
+        let server = MockServer::start().await;
+        let state = make_state(&server, vec![], "o");
+        let id_a = RequestId::new();
+        let id_b = RequestId::new();
+
+        let lock_a = acquire_decision_lock(&state, id_a);
+        let lock_b = acquire_decision_lock(&state, id_b);
+        assert!(
+            !Arc::ptr_eq(&lock_a, &lock_b),
+            "distinct request ids must map to distinct mutexes",
+        );
+
+        let _guard_a = lock_a.try_lock().expect("a is uncontested");
+        // Holding the lock for id_a must not block id_b.
+        let _guard_b = lock_b.try_lock().expect("b is uncontested despite a held");
+    }
+
+    /// End-to-end coverage for the lock: a reject after a successful
+    /// approve sees the audit row and short-circuits to
+    /// `StagedPushAlreadyResolved`, never silently overwriting the
+    /// `Approved` resolution. This is the property the per-request mutex
+    /// preserves under concurrency; the serialised form is the
+    /// minimum-viable proof that the audit-row write happens before any
+    /// subsequent reject can fire.
+    #[tokio::test]
+    async fn reject_after_approve_returns_already_resolved() {
+        // Mirror the prior-resolution short-circuit test, but with the
+        // approve-then-reject ordering. The approve path is exercised
+        // via a direct audit insert because a real `run_approve` needs a
+        // working git binary; the lock invariant is "after the
+        // resolution row exists, subsequent decisions must short-circuit"
+        // and that doesn't depend on which decision wrote the row.
+        let server = MockServer::start().await;
+        let (state, _tmp) = make_state_with_staging(&server);
+        let session_id = open_session(&state).await;
+        let request_id = stage_with_staged_outcome(
+            &state,
+            session_id,
+            b"bundle".to_vec(),
+            UnixMillis::from_millis(1_700_000_010_000),
+            UnixMillis::from_millis(1_700_000_010_500),
+        )
+        .await;
+
+        // Stand in for a successful approve by writing the Approved
+        // resolution row directly: the mint payload's shape matters for
+        // the schema-trigger but not for the lock test.
+        let mint_audit = crate::audit::PromoteMintAudit {
+            jti: crate::core::Jti::new(),
+            github_app_id: 999,
+            issued_at: UnixMillis::from_millis(1_700_000_015_000),
+            expires_at: UnixMillis::from_millis(1_700_000_015_000 + 3_600_000),
+        };
+        state
+            .audit
+            .record_git_push_resolution(&GitPushResolutionRecord {
+                push_request_id: request_id,
+                decided_at: UnixMillis::from_millis(1_700_000_020_000),
+                decision: GitPushResolution::Approved(mint_audit),
+                operator: "op-a",
+                reason: "approved by op-a",
+            })
+            .unwrap();
+
+        let resp = dispatch_message(
+            ClientMessage::RejectStagedPush {
+                request_id,
+                operator: "op-b".into(),
+                reason: RejectionReason::try_new("approve already landed").unwrap(),
+            },
+            &state,
+        )
+        .await;
+        match resp {
+            ServerMessage::StagedPushAlreadyResolved { request_id: got } => {
+                assert_eq!(got, request_id);
+            }
+            other => panic!("expected StagedPushAlreadyResolved, got {other:?}"),
+        }
+
+        // Resolution row is still the Approved one we wrote.
+        let audit_entry = state.audit.get_git_push(request_id).unwrap().unwrap();
+        match audit_entry.resolution.as_ref().expect("resolution exists") {
+            res if matches!(res.decision, GitPushResolution::Approved(_)) => {}
+            res => panic!("expected Approved decision intact, got {:?}", res.decision),
+        }
     }
 
     /// Operator validation runs before the configured-state checks so a

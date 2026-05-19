@@ -1670,6 +1670,7 @@ mod tests {
     use crate::github::{GitHubAppConfig, GitHubAppRegistryConfig, GitHubMinter};
     use crate::policy::PolicyConfig;
     use crate::secret::{SecretError, SecretKey};
+    use crate::server::empty_decision_locks;
     use crate::vm_git::VM_GIT_CLONE_PATH;
     use crate::vm_git_bundle::{GitCredentialBoundary, GitSecretEnvVar};
     use std::collections::BTreeMap;
@@ -1770,6 +1771,7 @@ mod tests {
             signing_key: None,
             run_agent_spawn: None,
             promote_runtime: None,
+            decision_locks: empty_decision_locks(),
         })
     }
 

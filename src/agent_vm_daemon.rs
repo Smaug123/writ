@@ -1328,6 +1328,7 @@ mod tests {
     use crate::nix_cache::NixTrustedPublicKeys;
     use crate::policy::PolicyConfig;
     use crate::secret::{SecretError, SecretKey};
+    use crate::server::empty_decision_locks;
     use crate::vm_git::VmGitPushBodyLimits;
     use crate::vm_git_bundle::{GitCredentialBoundary, GitSecretEnvVar};
     use crate::vm_http::{VmHttpGitCloneConfig, VmHttpNixCacheConfig};
@@ -1390,6 +1391,7 @@ mod tests {
             signing_key: None,
             run_agent_spawn: None,
             promote_runtime: None,
+            decision_locks: empty_decision_locks(),
         })
     }
 

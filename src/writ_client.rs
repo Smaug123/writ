@@ -814,7 +814,8 @@ mod end_to_end_tests {
     use crate::run_verify::{AllowedSigners, verify_run_envelope};
     use crate::secret::{SecretError, SecretKey, SecretStore};
     use crate::server::{
-        BrokerState, RunAgentSpawnConfig, prepare_broker_listener, serve_broker_with_agent_vm,
+        BrokerState, RunAgentSpawnConfig, empty_decision_locks, prepare_broker_listener,
+        serve_broker_with_agent_vm,
     };
     use crate::signing::WritSigningKey;
 
@@ -917,6 +918,7 @@ mod end_to_end_tests {
                 args: Vec::new(),
             }),
             promote_runtime: None,
+            decision_locks: empty_decision_locks(),
         });
 
         // Bind a tempsocket and spawn the broker accept loop. The
@@ -1077,6 +1079,7 @@ mod end_to_end_tests {
                 args: Vec::new(),
             }),
             promote_runtime: None,
+            decision_locks: empty_decision_locks(),
         });
         let socket_dir = tempfile::tempdir().unwrap();
         std::fs::set_permissions(socket_dir.path(), std::fs::Permissions::from_mode(0o700))
