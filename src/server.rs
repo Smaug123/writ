@@ -47,6 +47,7 @@ use crate::protocol::{
 use crate::run_envelope::{OutputEnvelope, SignedRunEnvelope};
 use crate::secret::SecretStore;
 use crate::signing::WritSigningKey;
+use crate::vm_git::GitObjectId;
 use crate::vm_git_bundle::GitSecretValue;
 
 /// Boot-time description of the child process that produces an agent
@@ -1468,8 +1469,7 @@ async fn approve_staged_push<S: SecretStore + Send + Sync + 'static>(
             // audit row failed. This is the strictly worse failure mode
             // — the branch on GitHub now points at `new_app_tip` with
             // no audit record of the approval. Log loudly and surface
-            // the error; the duplicate-approve path will not fire on
-            // retry because no row exists.
+            // the error.
             tracing::error!(
                 target: AUDIT_WRITE_FAILURE_TARGET,
                 kind = "git_push_resolution",
@@ -1479,6 +1479,19 @@ async fn approve_staged_push<S: SecretStore + Send + Sync + 'static>(
                 "audit write failed: approve resolution not recorded \
                  but branch already advanced on GitHub",
             );
+            // Critical: scrub the staging entry. Otherwise a later
+            // `RejectStagedPush` for the same request would still load
+            // it, observe no resolution row, and successfully insert a
+            // `Rejected` decision — leaving the audit log claiming the
+            // push was rejected when it actually landed on GitHub.
+            // Doing the delete here turns that follow-up into an
+            // `UnknownStagedPush`, so the contradictory outcome cannot
+            // be recorded through normal operator paths. If the delete
+            // *also* fails, we log a second AUDIT_WRITE_FAILURE_TARGET
+            // line and leave the entry on disk — the operator now sees
+            // the partial state in `promote list` and must reconcile
+            // manually using the forensic logs.
+            scrub_staging_after_failed_audit(&staging_store, request_id, new_app_tip.clone()).await;
             return ServerMessage::Error {
                 message: format!(
                     "branch was advanced on GitHub (new_app_tip = {new_app_tip}) but the \
@@ -1487,6 +1500,21 @@ async fn approve_staged_push<S: SecretStore + Send + Sync + 'static>(
             };
         }
         Err(err) => {
+            // Same hazard as the `Ok(Err)` branch above: the audit
+            // task panicked or was cancelled, so we don't know whether
+            // the row landed. Worst case is "promote happened, no
+            // audit row", which is exactly the same shape as
+            // `Ok(Err)`; scrub the staging entry on the same grounds.
+            tracing::error!(
+                target: AUDIT_WRITE_FAILURE_TARGET,
+                kind = "git_push_resolution",
+                request_id = %request_id,
+                jti = %mint_audit.jti,
+                error = %err,
+                "audit write task failed: approve resolution may not be recorded \
+                 but branch already advanced on GitHub",
+            );
+            scrub_staging_after_failed_audit(&staging_store, request_id, new_app_tip.clone()).await;
             return ServerMessage::Error {
                 message: format!("audit write task failed: {err}"),
             };
@@ -1529,6 +1557,62 @@ fn approve_staged_push_not_configured(component: &str) -> ServerMessage {
             "ApproveStagedPush dispatch is not configured: {component} is unset; \
              writd needs staging_store + promote_runtime + signing_key to serve ApproveStagedPush"
         ),
+    }
+}
+
+/// Scrub the staging entry after the rare "promote landed on GitHub
+/// but the local audit-write failed" race. Without this, a later
+/// `RejectStagedPush` for the same `request_id` would still find the
+/// staging entry, observe no resolution row, and insert a `Rejected`
+/// decision for a push that actually landed — the audit log would
+/// then permanently lie about the outcome. Deleting the staging entry
+/// here makes the follow-up reject return `UnknownStagedPush`
+/// instead, closing the contradictory-outcome window.
+///
+/// Both the delete-failure cases are themselves an
+/// `AUDIT_WRITE_FAILURE_TARGET` event because the broker is now in a
+/// partially-unrecoverable state: the operator must reconcile by
+/// reading the forensic logs.
+async fn scrub_staging_after_failed_audit(
+    staging_store: &Arc<GitPushStagingStore>,
+    request_id: RequestId,
+    new_app_tip: GitObjectId,
+) {
+    let store = Arc::clone(staging_store);
+    let outcome = tokio::task::spawn_blocking(move || store.delete(request_id)).await;
+    match outcome {
+        Ok(Ok(())) => {
+            tracing::warn!(
+                request_id = %request_id,
+                new_app_tip = %new_app_tip,
+                "scrubbed staging entry after failed audit write; \
+                 follow-up reject for this id will be rejected as unknown",
+            );
+        }
+        Ok(Err(err)) => {
+            tracing::error!(
+                target: AUDIT_WRITE_FAILURE_TARGET,
+                kind = "git_push_staging_scrub",
+                request_id = %request_id,
+                new_app_tip = %new_app_tip,
+                error = %err,
+                "staging scrub after failed audit write failed; \
+                 a later reject could still record a contradictory decision \
+                 — operator must reconcile",
+            );
+        }
+        Err(err) => {
+            tracing::error!(
+                target: AUDIT_WRITE_FAILURE_TARGET,
+                kind = "git_push_staging_scrub",
+                request_id = %request_id,
+                new_app_tip = %new_app_tip,
+                error = %err,
+                "staging scrub task failed after failed audit write; \
+                 a later reject could still record a contradictory decision \
+                 — operator must reconcile",
+            );
+        }
     }
 }
 
@@ -3980,6 +4064,79 @@ mod tests {
         )
         .await;
         assert_eq!(resp, ServerMessage::UnknownStagedPush { request_id });
+    }
+
+    /// R5 P1 regression: `scrub_staging_after_failed_audit` must
+    /// remove the staging entry on the rare "promote landed on GitHub
+    /// but audit-write failed" path, so a follow-up `RejectStagedPush`
+    /// for the same `request_id` returns `UnknownStagedPush` instead
+    /// of inserting a contradictory `Rejected` resolution row for a
+    /// push that actually landed. The helper is called directly here
+    /// because triggering a real audit-write failure mid-handler
+    /// requires injection points the handler does not expose; the
+    /// helper is the unit that owns the invariant, and any future
+    /// refactor of the audit-failure branch will surface a test break
+    /// at this call site if scrub is dropped.
+    #[tokio::test]
+    async fn scrub_staging_after_failed_audit_closes_reject_window() {
+        let server = MockServer::start().await;
+        let (state, _tmp) = make_state_with_staging(&server);
+        let session_id = open_session(&state).await;
+
+        // Stage an entry exactly as a successful first-pass would have.
+        let request_id = stage_with_audit(
+            &state,
+            session_id,
+            b"bundle".to_vec(),
+            UnixMillis::from_millis(1_700_000_080_000),
+            UnixMillis::from_millis(1_700_000_080_500),
+        )
+        .await;
+
+        // Sanity: staging entry is present before scrub.
+        let store = state.staging_store.as_ref().expect("staging configured");
+        let receipt = store
+            .try_load_receipt(request_id)
+            .expect("try_load_receipt should succeed");
+        assert!(
+            receipt.is_some(),
+            "staging entry should be present pre-scrub"
+        );
+
+        // Simulate the "promote landed, audit-write failed" branch by
+        // invoking the scrub helper directly.
+        let new_app_tip = sample_object_id('c');
+        scrub_staging_after_failed_audit(store, request_id, new_app_tip).await;
+
+        // Staging entry is gone post-scrub.
+        let receipt = store
+            .try_load_receipt(request_id)
+            .expect("try_load_receipt should succeed");
+        assert!(
+            receipt.is_none(),
+            "staging entry must be removed by scrub so a later reject \
+             cannot record a contradictory decision",
+        );
+
+        // Wire-level integration: a follow-up RejectStagedPush for
+        // the same request_id now returns UnknownStagedPush, which is
+        // exactly the property that closes the audit-lying window.
+        let resp = dispatch_message(
+            ClientMessage::RejectStagedPush {
+                request_id,
+                operator: "alice".into(),
+                reason: reason("not staged"),
+            },
+            &state,
+        )
+        .await;
+        assert_eq!(resp, ServerMessage::UnknownStagedPush { request_id });
+
+        // And no Rejected resolution row was inserted — the audit log
+        // remains silent on this request_id (correct, given the
+        // higher-level forensic record lives in the tracing target).
+        let audit_entry = state.audit.get_git_push(request_id).unwrap().unwrap();
+        assert!(audit_entry.resolution.is_none());
     }
 
     #[tokio::test]
