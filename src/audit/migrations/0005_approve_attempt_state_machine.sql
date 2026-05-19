@@ -114,7 +114,14 @@ END;
 --                                        success). Operator must
 --                                        reconcile manually.
 CREATE TABLE git_push_approve_attempt (
-    attempt_id          TEXT PRIMARY KEY,
+    -- TEXT PRIMARY KEY in a rowid table does not imply NOT NULL (the
+    -- long-standing SQLite quirk inherited from how INTEGER PRIMARY KEY
+    -- aliases rowid). Without the explicit NOT NULL, manual SQL or a
+    -- future migration could insert a row with NULL `attempt_id`, which
+    -- `git_push_approve_attempt_from_row` would surface as a SQLite
+    -- read error and `reject_blocker_for_push` would fail on the
+    -- very row it is meant to classify.
+    attempt_id          TEXT PRIMARY KEY NOT NULL,
     push_request_id     TEXT NOT NULL REFERENCES git_push_request(push_request_id),
     operator            TEXT NOT NULL CHECK (operator != ''),
     started_at          INTEGER NOT NULL CHECK (started_at > 0),

@@ -2694,6 +2694,33 @@ mod tests {
         );
     }
 
+    /// SQLite's `TEXT PRIMARY KEY` in a rowid table does not imply
+    /// NOT NULL. Without the explicit NOT NULL, a row with a NULL
+    /// `attempt_id` would be admitted; `from_row` would then surface a
+    /// SQLite read error and `reject_blocker_for_push` would fail on
+    /// the very row it is meant to classify.
+    #[test]
+    fn primary_key_constraint_rejects_null_attempt_id() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let push_request_id = RequestId::new();
+        let _session = open_with_staged_request(&log, push_request_id);
+        let err = log
+            .with_conn_mut(|c| {
+                Ok(c.execute(
+                    "INSERT INTO git_push_approve_attempt
+                        (attempt_id, push_request_id, operator, started_at, state)
+                     VALUES (NULL, ?1, 'alice', 1700000000, 'started')",
+                    params![push_request_id.as_uuid().to_string()],
+                ))
+            })
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            err.to_string().to_lowercase().contains("not null"),
+            "unexpected error: {err}"
+        );
+    }
+
     #[test]
     fn approve_attempts_for_push_returns_in_started_at_order() {
         let log = AuditLog::open_in_memory().unwrap();
