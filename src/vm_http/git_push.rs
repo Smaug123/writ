@@ -273,7 +273,6 @@ fn record_unattempted_outcome<S: SecretStore>(
         .audit
         .record_git_push_outcome(&GitPushOutcomeRecord {
             push_request_id,
-            push_attempt_id: None,
             completed_at: UnixMillis::now(),
             result,
             github_status: None,
@@ -558,7 +557,6 @@ mod tests {
         assert_eq!(entry.push_request_id, receipt.push_request_id());
         assert_eq!(entry.result, Some(GitPushOutcomeResult::Staged));
         assert_eq!(entry.message.as_deref(), Some("staged for review"));
-        assert!(entry.push_attempt_id.is_none());
     }
 
     /// A push from a `--correlation-id`'d agent run inherits the run's

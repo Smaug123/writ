@@ -4,25 +4,6 @@
 
 use super::AuditError;
 use crate::agent_run::AgentRunStreamSummary;
-use crate::core::{Jti, RequestId};
-
-pub(super) fn parse_required_request_id(
-    raw: Option<String>,
-    error: &'static str,
-) -> Result<RequestId, AuditError> {
-    let raw = raw.ok_or(AuditError::Invariant(error))?;
-    let uuid = uuid::Uuid::parse_str(&raw).map_err(|_| AuditError::Invariant(error))?;
-    Ok(RequestId::from_uuid(uuid))
-}
-
-pub(super) fn parse_required_jti(
-    raw: Option<String>,
-    error: &'static str,
-) -> Result<Jti, AuditError> {
-    let raw = raw.ok_or(AuditError::Invariant(error))?;
-    let uuid = uuid::Uuid::parse_str(&raw).map_err(|_| AuditError::Invariant(error))?;
-    Ok(Jti::from_uuid(uuid))
-}
 
 pub(super) fn u16_from_sql_status(value: i64) -> Result<u16, AuditError> {
     let status = u16::try_from(value)

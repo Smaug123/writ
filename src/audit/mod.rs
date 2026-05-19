@@ -48,9 +48,10 @@ pub use claude_proxy::{
     ClaudeProxyRequestRecord,
 };
 pub use git_push::{
-    GitPushAttemptRecord, GitPushAuditEntry, GitPushOutcomeRecord, GitPushOutcomeResult,
-    GitPushRequestRecord, GitPushResolution, GitPushResolutionEntry, GitPushResolutionRecord,
-    PromoteMintAudit,
+    GitPushApproveAttemptEntry, GitPushApproveAttemptOutcome, GitPushApproveAttemptState,
+    GitPushAuditEntry, GitPushOutcomeRecord, GitPushOutcomeResult, GitPushRequestRecord,
+    GitPushResolution, GitPushResolutionEntry, GitPushResolutionRecord, PromoteMintAudit,
+    RejectBlocker,
 };
 pub use grant::{MintFailureRecord, PreMintRecord};
 pub use nix_cache::{

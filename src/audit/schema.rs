@@ -49,7 +49,7 @@ pub(super) struct Migration {
 /// a version higher than this is rejected with [`AuditError::SchemaTooNew`]
 /// rather than opened — we'd rather fail to start than silently drop data
 /// into a schema a newer broker wrote.
-pub(super) const SCHEMA_VERSION: i32 = 4;
+pub(super) const SCHEMA_VERSION: i32 = 5;
 
 /// The full migration history. Each entry documents exactly one state
 /// transition; the sequence of entries is the schema's lineage. Order
@@ -74,6 +74,11 @@ pub(super) const MIGRATIONS: &[Migration] = &[
         version: 4,
         name: "0004_git_push_resolution_mint",
         sql: include_str!("migrations/0004_git_push_resolution_mint.sql"),
+    },
+    Migration {
+        version: 5,
+        name: "0005_approve_attempt_state_machine",
+        sql: include_str!("migrations/0005_approve_attempt_state_machine.sql"),
     },
 ];
 
@@ -303,9 +308,9 @@ mod tests {
             "nix_cache_request",
             "nix_cache_outcome",
             "git_push_request",
-            "git_push_attempt",
             "git_push_outcome",
             "git_push_resolution",
+            "git_push_approve_attempt",
             "plan",
             "plan_decision",
             "plan_review",
@@ -326,11 +331,12 @@ mod tests {
             "openai_proxy_request_requires_open_session",
             "nix_cache_request_requires_open_session",
             "git_push_request_requires_open_session",
-            "git_push_attempt_requires_matching_grant",
-            "git_push_outcome_attempt_matches_request",
             "git_push_resolution_requires_staged",
+            "git_push_resolution_refuses_active_approve",
             "git_push_resolution_mint_matches_decision_insert",
             "git_push_resolution_mint_matches_decision_update",
+            "git_push_approve_attempt_forward_only",
+            "git_push_approve_attempt_mint_immutable",
             "plan_requires_open_session",
             "plan_review_requires_open_session",
             "plan_review_requires_reviewer_run",
