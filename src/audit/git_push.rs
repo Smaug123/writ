@@ -707,6 +707,14 @@ impl AuditLog {
     /// matching state check before issuing the UPDATE so an attempt
     /// that has already resolved produces a readable invariant error
     /// instead of a silent no-op.
+    ///
+    /// Mint columns are not touched: a `Started` row stays mint-NULL
+    /// and an `Uncertain` row keeps the mint context recorded by
+    /// [`AuditLog::mark_attempt_uncertain`]. If the caller has a mint
+    /// to record (e.g. mint succeeded but the walker refused before
+    /// the PATCH boundary), use
+    /// [`AuditLog::complete_attempt_pre_patch_failure_capturing_mint`]
+    /// instead.
     pub fn complete_attempt_pre_patch_failure(
         &self,
         attempt_id: ApproveAttemptId,
@@ -720,6 +728,77 @@ impl AuditLog {
             detail,
             completed_at,
         )
+    }
+
+    /// Complete a `Started` attempt as `PrePatchFailure` while
+    /// capturing the mint context the caller already minted. This is
+    /// the path for the "mint succeeded, prepare/plan/walker failed
+    /// before TX2" case in the approve flow: GitHub was never PATCHed
+    /// (so the resolution is provably retryable, hence
+    /// `pre_patch_failure`), but the broker burned a real credential
+    /// that the audit log must record. Refused from any state other
+    /// than `Started`: an `Uncertain` row already carries its mint via
+    /// [`AuditLog::mark_attempt_uncertain`], and the column-level
+    /// immutability trigger would block writing a different one — use
+    /// [`AuditLog::complete_attempt_pre_patch_failure`] in that case.
+    pub fn complete_attempt_pre_patch_failure_capturing_mint(
+        &self,
+        attempt_id: ApproveAttemptId,
+        mint: PromoteMintAudit,
+        detail: &str,
+        completed_at: UnixMillis,
+    ) -> Result<(), AuditError> {
+        if detail.is_empty() {
+            return Err(AuditError::Invariant(
+                "approve attempt failure detail must not be empty",
+            ));
+        }
+        let github_app_id = i64::try_from(mint.github_app_id).map_err(|_| {
+            AuditError::Invariant("approve attempt mint github_app_id exceeds SQLite integer")
+        })?;
+
+        self.with_conn_mut(|c| {
+            let tx = c.transaction()?;
+            let current_state: Option<String> = tx
+                .query_row(
+                    "SELECT state FROM git_push_approve_attempt WHERE attempt_id = ?1",
+                    params![attempt_id.as_uuid().to_string()],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let Some(state) = current_state else {
+                return Err(AuditError::Invariant("approve attempt does not exist"));
+            };
+            if state != "started" {
+                return Err(AuditError::Invariant(
+                    "approve attempt: capturing-mint pre_patch_failure requires 'started' state",
+                ));
+            }
+
+            tx.execute(
+                "UPDATE git_push_approve_attempt
+                    SET state = 'resolved',
+                        outcome = 'pre_patch_failure',
+                        failure_detail = ?2,
+                        completed_at = ?3,
+                        mint_jti = ?4,
+                        mint_github_app_id = ?5,
+                        mint_issued_at = ?6,
+                        mint_expires_at = ?7
+                  WHERE attempt_id = ?1",
+                params![
+                    attempt_id.as_uuid().to_string(),
+                    detail,
+                    completed_at.as_millis(),
+                    mint.jti.as_uuid().to_string(),
+                    github_app_id,
+                    mint.issued_at.as_millis(),
+                    mint.expires_at.as_millis(),
+                ],
+            )?;
+            tx.commit()?;
+            Ok(())
+        })
     }
 
     /// Complete an `Uncertain` attempt as `PostPatchFailure`. Only
@@ -2318,6 +2397,96 @@ mod tests {
                 mint: Some(mint),
                 completed_at: UnixMillis::from_millis(1_700_000_220),
             }
+        );
+    }
+
+    /// The "mint succeeded, walker failed before TX2" path from the
+    /// design doc. State transitions started → resolved(pre_patch_failure)
+    /// in a single UPDATE that also captures the mint that was minted
+    /// but never used. The audit row records the burned credential
+    /// even though no PATCH was issued.
+    #[test]
+    fn complete_attempt_pre_patch_failure_capturing_mint_from_started() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let push_request_id = RequestId::new();
+        let _session = open_with_staged_request(&log, push_request_id);
+        let attempt_id = ApproveAttemptId::new();
+        log.start_approve_attempt(
+            attempt_id,
+            push_request_id,
+            "alice",
+            UnixMillis::from_millis(1_700_000_200),
+        )
+        .unwrap();
+        let mint = sample_promote_mint_audit();
+
+        log.complete_attempt_pre_patch_failure_capturing_mint(
+            attempt_id,
+            mint,
+            "walker refused non-fast-forward",
+            UnixMillis::from_millis(1_700_000_215),
+        )
+        .unwrap();
+
+        let attempts = log.approve_attempts_for_push(push_request_id).unwrap();
+        assert_eq!(
+            attempts[0].state,
+            GitPushApproveAttemptState::Resolved {
+                outcome: GitPushApproveAttemptOutcome::PrePatchFailure {
+                    detail: "walker refused non-fast-forward".into(),
+                },
+                mint: Some(mint),
+                completed_at: UnixMillis::from_millis(1_700_000_215),
+            }
+        );
+        // No git_push_resolution row was written — only an approved
+        // outcome writes one, and the resolution row is what reject
+        // would later contradict.
+        assert!(
+            log.get_git_push(push_request_id)
+                .unwrap()
+                .unwrap()
+                .resolution
+                .is_none()
+        );
+    }
+
+    /// Refuses from `Uncertain`: that row already carries its mint via
+    /// `mark_attempt_uncertain`, and the column-level immutability
+    /// trigger would block writing a different one. Callers in this
+    /// state must use the plain `complete_attempt_pre_patch_failure`.
+    #[test]
+    fn complete_attempt_pre_patch_failure_capturing_mint_refuses_uncertain() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let push_request_id = RequestId::new();
+        let _session = open_with_staged_request(&log, push_request_id);
+        let attempt_id = ApproveAttemptId::new();
+        log.start_approve_attempt(
+            attempt_id,
+            push_request_id,
+            "alice",
+            UnixMillis::from_millis(1_700_000_200),
+        )
+        .unwrap();
+        let mint = sample_promote_mint_audit();
+        log.mark_attempt_uncertain(attempt_id, mint).unwrap();
+
+        let err = log
+            .complete_attempt_pre_patch_failure_capturing_mint(
+                attempt_id,
+                mint,
+                "should not be admitted",
+                UnixMillis::from_millis(1_700_000_220),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                AuditError::Invariant(
+                    "approve attempt: capturing-mint pre_patch_failure requires 'started' state"
+                )
+            ),
+            "got: {err:?}"
         );
     }
 

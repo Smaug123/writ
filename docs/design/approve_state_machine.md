@@ -151,7 +151,14 @@ mint() ; on fail:
     return Error
 prepare/plan/walker  ; on fail (any non-update_ref ExecuteError, any
     non-Execute RunApproveError):
-    UPDATE state='resolved', outcome='pre_patch_failure', ...               -- TX
+    -- mint succeeded but no PATCH was issued. `pre_patch_failure`
+    -- proves GitHub is unchanged (retry is safe), but the burned
+    -- credential is recorded inline so the audit log can still answer
+    -- "which mint was used by this attempt." Mint columns set in the
+    -- same UPDATE that resolves the row.
+    UPDATE state='resolved', outcome='pre_patch_failure',
+           mint_jti=..., mint_*,
+           failure_detail=..., completed_at=now                            -- TX
     return Error
 UPDATE state='uncertain', mint_jti=..., mint_*                              -- TX2 (load-bearing)
 run_approve.execute_update_ref()
@@ -314,3 +321,12 @@ A `proptest`-driven scenario test:
    verb (`writ promote reconcile <attempt_id> --confirmed-applied`
    or `--confirmed-not-applied`). Out of scope for the current
    slices; tracked in B2.
+4. **Reconciliation transition out of `PostPatchFailure`**: the v5
+   forward-only trigger refuses any update from `resolved`, so a
+   `PostPatchFailure` row is terminal at the DAO level. The
+   reconciliation tooling (see open-question 3 above) will write a
+   *new* attempt rather than mutating the quarantined one — keeping
+   the audit log append-only and preserving the full reconciliation
+   history. `start_approve_attempt` will need a corresponding
+   relaxation (or a sibling `start_reconciliation_attempt` entry
+   point) at that time. Out of scope for B1e.3a.
