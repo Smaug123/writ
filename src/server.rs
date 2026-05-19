@@ -1424,11 +1424,21 @@ async fn approve_staged_push<S: SecretStore + Send + Sync + 'static>(
             // Discriminate the specific shape for the test harness and
             // for the operator: PrepareStagingError::StagingDirExists is
             // the duplicate-concurrent-approve case from B1e.2b.
+            //
+            // `err` can carry a `GitDataError::ApiError { body, .. }`
+            // whose body is whatever bytes a GHES install or a proxy
+            // returned. Cap the rendered form at `MAX_WIRE_ERROR_BYTES`
+            // so a hostile or misbehaving server can't blow up the
+            // wire response — the operator still gets enough context
+            // to triage, and the full string is already on its way to
+            // `tracing::error!` above without truncation for forensics.
             let message = match &err {
                 RunApproveError::Prepare(_) => format!("staging preparation failed: {err}"),
                 _ => format!("approve pipeline failed: {err}"),
             };
-            return ServerMessage::Error { message };
+            return ServerMessage::Error {
+                message: truncate_for_wire(message, MAX_WIRE_ERROR_BYTES),
+            };
         }
     };
 
@@ -1579,6 +1589,41 @@ fn staging_not_configured() -> ServerMessage {
                   the broker config needs an agent_vm.vm_http section"
             .into(),
     }
+}
+
+/// Maximum byte length of an error string echoed back on the wire in a
+/// [`ServerMessage::Error`]. The approve pipeline can wrap a
+/// [`crate::github_git_db::GitDataError::ApiError`] whose `body` is the
+/// raw bytes a GitHub Enterprise instance (or a hostile proxy in front
+/// of it) returns; that body is otherwise unbounded and would expand
+/// the broker's per-error wire footprint without limit. 4 KiB is large
+/// enough to preserve the diagnostic shape (status line, JSON error
+/// object, the first few stack-trace-ish lines) while keeping a worst-
+/// case `ServerMessage::Error` comfortably under the broker's per-
+/// message processing budget. The cap also defends the audit log: the
+/// same string is `tracing::error!`-logged a few lines above, so it
+/// otherwise feeds into log shipping unbounded too.
+const MAX_WIRE_ERROR_BYTES: usize = 4 * 1024;
+
+/// Truncate `s` to at most `cap` bytes, with a sentinel marker so the
+/// reader can tell the message is a prefix. The marker is appended
+/// after the cap (the returned string is `cap + marker.len()` bytes
+/// long when truncation happens), because the goal is to bound the
+/// *body* the broker reflects from GitHub, not to bound the total
+/// envelope to the byte. Splits on a `char` boundary so the result is
+/// valid UTF-8 even when the cap lands inside a multi-byte sequence.
+fn truncate_for_wire(s: String, cap: usize) -> String {
+    if s.len() <= cap {
+        return s;
+    }
+    let mut boundary = cap;
+    while boundary > 0 && !s.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    let mut out = s;
+    out.truncate(boundary);
+    out.push_str("... [truncated]");
+    out
 }
 
 /// Per-stream byte cap for stdout/stderr capture in [`run_agent`].
@@ -2361,6 +2406,47 @@ mod tests {
     // file so the test binary doesn't embed the PEM inline and so we
     // can share it across modules without duplicating the bytes.
     const TEST_PRIV: &str = include_str!("../tests/fixtures/rsa_test_1.pem");
+
+    #[test]
+    fn truncate_for_wire_passes_short_strings_through() {
+        let s = "approve pipeline failed: short error".to_string();
+        let out = truncate_for_wire(s.clone(), MAX_WIRE_ERROR_BYTES);
+        assert_eq!(out, s);
+    }
+
+    #[test]
+    fn truncate_for_wire_caps_at_byte_budget_with_marker() {
+        let s = "x".repeat(MAX_WIRE_ERROR_BYTES * 4);
+        let out = truncate_for_wire(s, MAX_WIRE_ERROR_BYTES);
+        assert!(out.starts_with(&"x".repeat(MAX_WIRE_ERROR_BYTES)));
+        assert!(out.ends_with("... [truncated]"));
+        assert_eq!(out.len(), MAX_WIRE_ERROR_BYTES + "... [truncated]".len());
+    }
+
+    #[test]
+    fn truncate_for_wire_at_exact_cap_is_unchanged() {
+        let s = "y".repeat(MAX_WIRE_ERROR_BYTES);
+        let out = truncate_for_wire(s.clone(), MAX_WIRE_ERROR_BYTES);
+        assert_eq!(out, s);
+    }
+
+    #[test]
+    fn truncate_for_wire_respects_char_boundaries() {
+        // The naïve `String::truncate(cap)` panics when the cap lands
+        // inside a multi-byte codepoint. Pin the property: with a cap
+        // mid-codepoint, the result must walk back to the previous
+        // char boundary rather than splitting the emoji. U+1F600 (😀)
+        // is 4 bytes in UTF-8, so "ab😀cd" is 'a','b', F0 9F 98 80,
+        // 'c','d' — total 8 bytes. cap = 4 lands inside the emoji
+        // (after 'a','b' and 2 of the 4 emoji bytes).
+        let cap = 4;
+        let s = "ab😀cd".to_string();
+        let out = truncate_for_wire(s, cap);
+        // Truncation occurred (input is 8 bytes > cap = 4), so the
+        // marker must be present and the prefix must be the largest
+        // char-aligned slice ≤ cap, i.e. "ab".
+        assert_eq!(out, "ab... [truncated]");
+    }
 
     /// Walk `PATH` looking for `name`. Returns the first match.
     /// The `run_agent` tests need real tools (`cat`, `false`,
