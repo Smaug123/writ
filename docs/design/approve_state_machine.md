@@ -129,6 +129,18 @@ CREATE INDEX idx_git_push_approve_attempt_push_request
 -- BEFORE UPDATE triggers enforce forward-only transitions:
 -- started -> uncertain or resolved; uncertain -> resolved; resolved -> resolved (no-op).
 -- They also enforce that mint context only appears once it has been acquired.
+--
+-- A sibling BEFORE INSERT trigger on `git_push_resolution`
+-- (`git_push_resolution_refuses_active_approve`) refuses any resolution
+-- row while an approve attempt for the same `push_request_id` is in
+-- one of the blocking states: `Started`, `Uncertain`, or
+-- `Resolved(PostPatchFailure)`. The approve path's own joint-TX commit
+-- flips the attempt to `Resolved(Succeeded)` *before* its resolution
+-- INSERT runs (same TX), so the trigger sees `succeeded` at INSERT
+-- time and lets it through. A reject that races the approve sees the
+-- in-flight state and is refused at the schema boundary; this is the
+-- defence-in-depth that catches future code paths which forget to
+-- consult `reject_blocker_for_push`.
 ```
 
 The same migration drops `git_push_attempt` and its trigger, and drops

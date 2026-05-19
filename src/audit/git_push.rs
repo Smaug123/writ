@@ -1889,6 +1889,196 @@ mod tests {
         );
     }
 
+    /// A `Started` approve attempt means the approve workflow is in
+    /// flight; allowing a reject row to commit would race the approve's
+    /// PATCH and leave the audit log claiming rejection of a push that
+    /// may already have been approved on GitHub.
+    #[test]
+    fn record_resolution_refused_when_attempt_started() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let push_request_id = RequestId::new();
+        let _session = open_with_staged_request(&log, push_request_id);
+        log.start_approve_attempt(
+            ApproveAttemptId::new(),
+            push_request_id,
+            "alice",
+            UnixMillis::from_millis(1_700_000_200),
+        )
+        .unwrap();
+
+        let err = log
+            .record_git_push_resolution(&GitPushResolutionRecord {
+                push_request_id,
+                decided_at: UnixMillis::from_millis(1_700_000_300),
+                decision: GitPushResolution::Rejected,
+                operator: "bob",
+                reason: "too late",
+            })
+            .unwrap_err();
+        let AuditError::Sqlite(e) = err else {
+            panic!("expected sqlite trigger error, got: {err:?}");
+        };
+        assert!(
+            e.to_string()
+                .contains("approve attempt is in-flight or quarantined"),
+            "unexpected error: {e}"
+        );
+    }
+
+    /// An `Uncertain` attempt has promised the audit log that the PATCH
+    /// may have hit GitHub; reject must be refused at the schema layer.
+    #[test]
+    fn record_resolution_refused_when_attempt_uncertain() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let push_request_id = RequestId::new();
+        let _session = open_with_staged_request(&log, push_request_id);
+        let attempt_id = ApproveAttemptId::new();
+        log.start_approve_attempt(
+            attempt_id,
+            push_request_id,
+            "alice",
+            UnixMillis::from_millis(1_700_000_200),
+        )
+        .unwrap();
+        log.mark_attempt_uncertain(attempt_id, sample_promote_mint_audit())
+            .unwrap();
+
+        let err = log
+            .record_git_push_resolution(&GitPushResolutionRecord {
+                push_request_id,
+                decided_at: UnixMillis::from_millis(1_700_000_300),
+                decision: GitPushResolution::Rejected,
+                operator: "bob",
+                reason: "too late",
+            })
+            .unwrap_err();
+        let AuditError::Sqlite(e) = err else {
+            panic!("expected sqlite trigger error, got: {err:?}");
+        };
+        assert!(
+            e.to_string()
+                .contains("approve attempt is in-flight or quarantined"),
+            "unexpected error: {e}"
+        );
+    }
+
+    /// A `Resolved(PostPatchFailure)` attempt quarantines the push:
+    /// reject must be refused until manual reconciliation completes the
+    /// attempt to either `Succeeded` or `PrePatchFailure`.
+    #[test]
+    fn record_resolution_refused_when_attempt_post_patch_failure() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let push_request_id = RequestId::new();
+        let _session = open_with_staged_request(&log, push_request_id);
+        let attempt_id = ApproveAttemptId::new();
+        log.start_approve_attempt(
+            attempt_id,
+            push_request_id,
+            "alice",
+            UnixMillis::from_millis(1_700_000_200),
+        )
+        .unwrap();
+        log.mark_attempt_uncertain(attempt_id, sample_promote_mint_audit())
+            .unwrap();
+        log.complete_attempt_post_patch_failure(
+            attempt_id,
+            "transport drop after PATCH",
+            UnixMillis::from_millis(1_700_000_250),
+        )
+        .unwrap();
+
+        let err = log
+            .record_git_push_resolution(&GitPushResolutionRecord {
+                push_request_id,
+                decided_at: UnixMillis::from_millis(1_700_000_300),
+                decision: GitPushResolution::Rejected,
+                operator: "bob",
+                reason: "give up",
+            })
+            .unwrap_err();
+        let AuditError::Sqlite(e) = err else {
+            panic!("expected sqlite trigger error, got: {err:?}");
+        };
+        assert!(
+            e.to_string()
+                .contains("approve attempt is in-flight or quarantined"),
+            "unexpected error: {e}"
+        );
+    }
+
+    /// A `Resolved(PrePatchFailure)` attempt proves the PATCH was never
+    /// issued (mint failed, walker refused before TX2, etc.); the push
+    /// remains rejectable.
+    #[test]
+    fn record_resolution_allowed_after_pre_patch_failure() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let push_request_id = RequestId::new();
+        let _session = open_with_staged_request(&log, push_request_id);
+        let attempt_id = ApproveAttemptId::new();
+        log.start_approve_attempt(
+            attempt_id,
+            push_request_id,
+            "alice",
+            UnixMillis::from_millis(1_700_000_200),
+        )
+        .unwrap();
+        log.complete_attempt_pre_patch_failure(
+            attempt_id,
+            "mint failed",
+            UnixMillis::from_millis(1_700_000_210),
+        )
+        .unwrap();
+
+        log.record_git_push_resolution(&GitPushResolutionRecord {
+            push_request_id,
+            decided_at: UnixMillis::from_millis(1_700_000_300),
+            decision: GitPushResolution::Rejected,
+            operator: "bob",
+            reason: "operator chose to abandon",
+        })
+        .unwrap();
+
+        let entry = log.get_git_push(push_request_id).unwrap().unwrap();
+        let resolution = entry.resolution.expect("resolution must be present");
+        assert_eq!(resolution.decision, GitPushResolution::Rejected);
+        assert_eq!(resolution.operator, "bob");
+    }
+
+    /// Approve's own joint-TX completion must not be blocked by its own
+    /// in-flight attempt row. `complete_attempt_succeeded` flips the
+    /// attempt to `resolved`/`succeeded` *before* the resolution INSERT
+    /// runs (same TX), so by the time the trigger fires the row is no
+    /// longer in a blocking state.
+    #[test]
+    fn record_resolution_allowed_during_complete_attempt_succeeded() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let push_request_id = RequestId::new();
+        let _session = open_with_staged_request(&log, push_request_id);
+        let attempt_id = ApproveAttemptId::new();
+        log.start_approve_attempt(
+            attempt_id,
+            push_request_id,
+            "alice",
+            UnixMillis::from_millis(1_700_000_200),
+        )
+        .unwrap();
+        let mint = sample_promote_mint_audit();
+        log.mark_attempt_uncertain(attempt_id, mint).unwrap();
+        let new_app_tip = git_oid('a');
+        log.complete_attempt_succeeded(
+            attempt_id,
+            &new_app_tip,
+            "alice",
+            "ship it",
+            UnixMillis::from_millis(1_700_000_220),
+        )
+        .unwrap();
+
+        let entry = log.get_git_push(push_request_id).unwrap().unwrap();
+        let resolution = entry.resolution.expect("resolution must be present");
+        assert_eq!(resolution.decision, GitPushResolution::Approved(mint));
+    }
+
     // ---- approve-attempt state machine --------------------------------------
 
     fn open_with_staged_request(log: &AuditLog, push_request_id: RequestId) -> SessionId {

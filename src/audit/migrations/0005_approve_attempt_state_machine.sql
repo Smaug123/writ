@@ -94,6 +94,43 @@ BEGIN
     SELECT RAISE(ABORT, 'git push must be staged to be resolved');
 END;
 
+-- A `git_push_resolution` INSERT is the audit log's terminal commit
+-- against a push. The approve path's `complete_attempt_succeeded`
+-- writes its `decision='approved'` row in the same TX that flips the
+-- attempt to `resolved`/`succeeded`, so the row landing here is fine.
+-- A reject is the dangerous case: with v5 attempts, `start_approve_attempt`
+-- → `mark_attempt_uncertain` → `update_ref` runs as three commits, and
+-- the existing `git_push_resolution_requires_staged` trigger only
+-- checks `git_push_outcome` — nothing in the schema stops a reject from
+-- landing a `decision='rejected'` row while the approve path is between
+-- `Started` and the PATCH (or while a prior attempt is quarantined as
+-- `PostPatchFailure`). The approve's subsequent joint-TX write would
+-- then fail on the resolution PK, but the PATCH may already have hit
+-- GitHub: that is exactly the "audit row contradicts observable state"
+-- failure the state machine exists to eliminate.
+--
+-- `reject_blocker_for_push` returns this same shape and the handler
+-- consults it before calling `record_git_push_resolution`; this trigger
+-- is the defence-in-depth that also catches future code paths (manual
+-- SQL, a new DAO method that forgets the blocker check) — the gospel
+-- "let the machine enforce invariants" stance, applied at the boundary
+-- where the contradiction would otherwise commit.
+--
+-- The trigger fires on INSERT only; `git_push_resolution.push_request_id`
+-- is the PRIMARY KEY, so a row, once written, can never be re-inserted
+-- under a different attempt state, and there is no UPDATE path.
+CREATE TRIGGER git_push_resolution_refuses_active_approve
+BEFORE INSERT ON git_push_resolution
+WHEN EXISTS (
+    SELECT 1 FROM git_push_approve_attempt
+    WHERE push_request_id = NEW.push_request_id
+      AND (state IN ('started', 'uncertain')
+        OR (state = 'resolved' AND outcome = 'post_patch_failure'))
+)
+BEGIN
+    SELECT RAISE(ABORT, 'git push resolution refused: approve attempt is in-flight or quarantined');
+END;
+
 -- Approve-attempt state machine. See docs/design/approve_state_machine.md.
 --
 -- Lifecycle:

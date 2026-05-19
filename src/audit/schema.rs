@@ -332,6 +332,7 @@ mod tests {
             "nix_cache_request_requires_open_session",
             "git_push_request_requires_open_session",
             "git_push_resolution_requires_staged",
+            "git_push_resolution_refuses_active_approve",
             "git_push_resolution_mint_matches_decision_insert",
             "git_push_resolution_mint_matches_decision_update",
             "git_push_approve_attempt_forward_only",
