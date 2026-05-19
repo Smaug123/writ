@@ -50,6 +50,7 @@ pub use claude_proxy::{
 pub use git_push::{
     GitPushAttemptRecord, GitPushAuditEntry, GitPushOutcomeRecord, GitPushOutcomeResult,
     GitPushRequestRecord, GitPushResolution, GitPushResolutionEntry, GitPushResolutionRecord,
+    PromoteMintAudit,
 };
 pub use grant::{MintFailureRecord, PreMintRecord};
 pub use nix_cache::{

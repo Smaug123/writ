@@ -49,7 +49,7 @@ pub(super) struct Migration {
 /// a version higher than this is rejected with [`AuditError::SchemaTooNew`]
 /// rather than opened — we'd rather fail to start than silently drop data
 /// into a schema a newer broker wrote.
-pub(super) const SCHEMA_VERSION: i32 = 3;
+pub(super) const SCHEMA_VERSION: i32 = 4;
 
 /// The full migration history. Each entry documents exactly one state
 /// transition; the sequence of entries is the schema's lineage. Order
@@ -69,6 +69,11 @@ pub(super) const MIGRATIONS: &[Migration] = &[
         version: 3,
         name: "0003_plan_abort",
         sql: include_str!("migrations/0003_plan_abort.sql"),
+    },
+    Migration {
+        version: 4,
+        name: "0004_git_push_resolution_mint",
+        sql: include_str!("migrations/0004_git_push_resolution_mint.sql"),
     },
 ];
 
@@ -324,6 +329,8 @@ mod tests {
             "git_push_attempt_requires_matching_grant",
             "git_push_outcome_attempt_matches_request",
             "git_push_resolution_requires_staged",
+            "git_push_resolution_mint_matches_decision_insert",
+            "git_push_resolution_mint_matches_decision_update",
             "plan_requires_open_session",
             "plan_review_requires_open_session",
             "plan_review_requires_reviewer_run",
@@ -335,6 +342,96 @@ mod tests {
         ] {
             assert!(triggers.contains(expected), "missing trigger: {expected}");
         }
+    }
+
+    /// A v3 DB that already carried a `decision = 'approved'` row
+    /// cannot be upgraded — the new schema needs mint context that
+    /// pre-upgrade rows lack. The v4 migration's defensive guard
+    /// refuses the upgrade so an operator deliberately resolves the
+    /// situation rather than discovering unreadable rows later. No
+    /// shipped broker actually writes legacy approved rows, but the
+    /// pre-v4 schema admitted them, so the guard is principled even
+    /// if rarely triggered.
+    #[test]
+    fn v4_migration_refuses_legacy_approved_resolution_row() {
+        let db = NamedTempFile::new().unwrap();
+        // Build a v3 DB shape by hand: apply migrations 1..=3 directly
+        // and stop. `AuditLog::open` would otherwise run v4 first.
+        {
+            let mut conn = Connection::open(db.path()).unwrap();
+            ensure_schema_version_table(&conn).unwrap();
+            for migration in MIGRATIONS.iter().take_while(|m| m.version < 4) {
+                let tx = conn
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .unwrap();
+                tx.execute_batch(migration.sql).unwrap();
+                tx.execute(
+                    "INSERT INTO schema_version (version, name, applied_at_ms) VALUES (?1, ?2, ?3)",
+                    params![migration.version, migration.name, 1_i64],
+                )
+                .unwrap();
+                tx.commit().unwrap();
+            }
+
+            // Plant a legacy 'approved' row by walking the audit chain
+            // the v3 schema requires (session → request → staged
+            // outcome → resolution) without going through the DAO,
+            // which would reject the inconsistency at the type layer.
+            let session_id = SessionId::new();
+            conn.execute(
+                "INSERT INTO session (session_id, opened_at, agent_kind) \
+                 VALUES (?1, 1, 'claude')",
+                params![session_id.as_uuid().to_string()],
+            )
+            .unwrap();
+            let push_request_id = RequestId::new();
+            conn.execute(
+                "INSERT INTO git_push_request \
+                 (push_request_id, session_id, received_at, repo, branch, \
+                  expected_remote_head, new_head) \
+                 VALUES (?1, ?2, 2, 'o/n', 'main', NULL, ?3)",
+                params![
+                    push_request_id.as_uuid().to_string(),
+                    session_id.as_uuid().to_string(),
+                    "a".repeat(40),
+                ],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO git_push_outcome \
+                 (push_request_id, push_attempt_id, completed_at, result, \
+                  github_status, message) \
+                 VALUES (?1, NULL, 3, 'staged', NULL, 'queued')",
+                params![push_request_id.as_uuid().to_string()],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO git_push_resolution \
+                 (push_request_id, decided_at, decision, operator, reason) \
+                 VALUES (?1, 4, 'approved', 'alice', 'looks good')",
+                params![push_request_id.as_uuid().to_string()],
+            )
+            .unwrap();
+        }
+
+        let err = AuditLog::open(db.path()).unwrap_err();
+        let AuditError::Sqlite(e) = err else {
+            panic!("expected sqlite CHECK error, got: {err:?}");
+        };
+        assert!(
+            e.to_string().to_lowercase().contains("check"),
+            "expected CHECK constraint failure, got: {e}"
+        );
+
+        // The v3 DB is unchanged: the migration aborted in a single
+        // transaction. Reopening still observes schema_version = 3.
+        let current = Connection::open(db.path())
+            .unwrap()
+            .query_row("SELECT MAX(version) FROM schema_version", [], |row| {
+                row.get::<_, i32>(0)
+            })
+            .unwrap();
+        assert_eq!(current, 3);
     }
 
     /// A DB written by a future broker will carry a `schema_version`
