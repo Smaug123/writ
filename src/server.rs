@@ -2845,7 +2845,6 @@ mod tests {
             .audit
             .record_git_push_outcome(&crate::audit::GitPushOutcomeRecord {
                 push_request_id: request_id,
-                push_attempt_id: None,
                 completed_at: received_at,
                 result: crate::audit::GitPushOutcomeResult::Staged,
                 github_status: None,

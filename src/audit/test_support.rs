@@ -2,9 +2,9 @@
 
 use super::{AuditError, AuditLog, PreMintRecord};
 use crate::core::{
-    AgentKind, CapabilityRequest, CredentialGrant, GitHubAccess, GitHubGrantedScope,
-    GitHubPermissions, GitHubRequest, GrantedScope, Jti, MetadataAccess, PolicyDecision, RepoRef,
-    RequestId, SessionId, SessionRecord, TtlSeconds, UnixMillis,
+    AgentKind, CapabilityRequest, GitHubAccess, GitHubGrantedScope, GitHubPermissions,
+    GitHubRequest, GrantedScope, MetadataAccess, PolicyDecision, RepoRef, RequestId, SessionId,
+    SessionRecord, UnixMillis,
 };
 
 pub(super) fn sample_session() -> SessionRecord {
@@ -60,36 +60,4 @@ pub(super) fn pre_mint(
         request,
         decision,
     })
-}
-
-pub(super) fn record_sample_write_grant(
-    log: &AuditLog,
-    session_id: SessionId,
-    capability_request_id: RequestId,
-) -> CredentialGrant {
-    let req = sample_request();
-    let scope = sample_scope();
-    pre_mint(
-        log,
-        capability_request_id,
-        session_id,
-        &req,
-        &PolicyDecision::Grant {
-            scope: scope.clone(),
-            ttl: TtlSeconds::new(300).unwrap(),
-        },
-        UnixMillis::from_millis(1_700_000_110),
-    )
-    .unwrap();
-    let grant = CredentialGrant {
-        jti: Jti::new(),
-        request_id: capability_request_id,
-        session_id,
-        github_app_id: Some(42),
-        scope,
-        issued_at: UnixMillis::from_millis(1_700_000_110),
-        expires_at: UnixMillis::from_millis(1_700_000_410),
-    };
-    log.record_grant(&grant).unwrap();
-    grant
 }

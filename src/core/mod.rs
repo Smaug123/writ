@@ -84,6 +84,13 @@ uuid_id!(
     /// matching audit records against later-observed side effects.
     Jti
 );
+uuid_id!(
+    /// Identifies one operator approve attempt against a staged push.
+    /// Independent from `RequestId` so the audit DAO and handlers can't
+    /// accidentally cross the streams: an attempt id names a row in
+    /// `git_push_approve_attempt`, not a capability request.
+    ApproveAttemptId
+);
 
 // --- Timestamp --------------------------------------------------------
 

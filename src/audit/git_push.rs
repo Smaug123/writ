@@ -2,10 +2,9 @@
 
 use rusqlite::{OptionalExtension, Row, params};
 
-use super::validation::{parse_required_jti, parse_required_request_id};
 use super::{AuditError, AuditLog};
 use crate::agent_plan::CorrelationId;
-use crate::core::{GitHubAccess, GrantedScope, Jti, RequestId, SessionId, UnixMillis};
+use crate::core::{ApproveAttemptId, Jti, RequestId, SessionId, UnixMillis};
 use crate::vm_git::{GitBranchName, GitCloneRepo, GitObjectId};
 
 #[derive(Debug)]
@@ -27,39 +26,17 @@ pub struct GitPushRequestRecord {
     pub correlation_id: Option<CorrelationId>,
 }
 
-#[derive(Debug)]
-pub struct GitPushAttemptRecord {
-    pub push_attempt_id: RequestId,
-    pub push_request_id: RequestId,
-    pub capability_request_id: RequestId,
-    pub grant_jti: Jti,
-    pub planned_at: UnixMillis,
-    pub repo: GitCloneRepo,
-    pub branch: GitBranchName,
-    /// `None` records a planned branch-creation push (no `--force-with-lease`
-    /// target). Must agree with the originating request's
-    /// `expected_remote_head`.
-    pub old_head: Option<GitObjectId>,
-    pub new_head: GitObjectId,
-}
-
 #[derive(Copy, Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GitPushOutcomeResult {
     Denied,
     ValidationFailed,
     Staged,
-    Pushed,
-    LeaseRejected,
-    PushRejected,
-    PushFailed,
-    AuditFailedAfterPush,
 }
 
 #[derive(Debug)]
 pub struct GitPushOutcomeRecord<'a> {
     pub push_request_id: RequestId,
-    pub push_attempt_id: Option<RequestId>,
     pub completed_at: UnixMillis,
     pub result: GitPushOutcomeResult,
     pub github_status: Option<u16>,
@@ -121,22 +98,169 @@ pub struct GitPushAuditEntry {
     /// Correlation id recorded against the originating push request.
     /// `None` when the request was untagged.
     pub correlation_id: Option<CorrelationId>,
-    pub push_attempt_id: Option<RequestId>,
-    pub capability_request_id: Option<RequestId>,
-    pub grant_jti: Option<Jti>,
-    pub planned_at: Option<UnixMillis>,
-    /// `None` if no attempt has been recorded *or* the attempt was a planned
-    /// branch-creation push. `push_attempt_id` is the discriminant.
-    pub old_head: Option<GitObjectId>,
-    pub attempted_new_head: Option<GitObjectId>,
     pub completed_at: Option<UnixMillis>,
     pub result: Option<GitPushOutcomeResult>,
     pub github_status: Option<u16>,
     pub message: Option<String>,
     /// `Some` once an operator has recorded a decision against the
-    /// staged push. The v13 schema's `BEFORE INSERT` trigger makes this
+    /// staged push. The schema's `BEFORE INSERT` trigger makes this
     /// field reachable only when `result == Some(GitPushOutcomeResult::Staged)`.
     pub resolution: Option<GitPushResolutionEntry>,
+}
+
+/// Terminal outcome of an operator approve attempt. Mirrors the
+/// `outcome` enum on `git_push_approve_attempt` and the CHECK
+/// constraints that govern the row's shape.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum GitPushApproveAttemptOutcome {
+    /// `update_ref` confirmed the GitHub branch was advanced to
+    /// `new_app_tip`. Paired with a `git_push_resolution(decision='approved')`
+    /// row written in the same transaction.
+    Succeeded { new_app_tip: GitObjectId },
+    /// The attempt failed before `update_ref` was issued. The GitHub
+    /// branch is provably unchanged; the push remains rejectable /
+    /// retryable. `detail` is recorded verbatim in `failure_detail`.
+    PrePatchFailure { detail: String },
+    /// `update_ref` was issued but the broker cannot prove whether
+    /// GitHub honoured it (non-2xx response, transport drop, audit-write
+    /// failure after success). The push is quarantined: reject is
+    /// refused until manual operator reconciliation completes the
+    /// attempt to `Succeeded` or `PrePatchFailure`. `detail` is recorded
+    /// verbatim in `failure_detail`.
+    PostPatchFailure { detail: String },
+}
+
+/// Lifecycle state of a `git_push_approve_attempt` row. Forward-only:
+/// `Started → Uncertain → Resolved` or `Started → Resolved` (with
+/// `PrePatchFailure`). The schema's `git_push_approve_attempt_forward_only`
+/// trigger enforces this at the DB layer.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum GitPushApproveAttemptState {
+    /// Written on entry to `approve_staged_push`, before mint or any
+    /// orchestration. Carries operator and started_at; no mint context yet.
+    Started,
+    /// Written in the same TX that completes the post-walker lease
+    /// check, immediately before `update_ref`. Carries the mint context
+    /// the broker is about to use. Once this row commits the broker has
+    /// promised "the PATCH may exist on GitHub"; reject is refused.
+    Uncertain { mint: PromoteMintAudit },
+    /// Terminal. Carries the outcome + the mint context if one was
+    /// captured (always present for `Succeeded` and `PostPatchFailure`,
+    /// always absent for `PrePatchFailure` that fell before mint, and
+    /// optionally present for a `PrePatchFailure` that happened
+    /// between mint and update_ref).
+    Resolved {
+        outcome: GitPushApproveAttemptOutcome,
+        mint: Option<PromoteMintAudit>,
+        completed_at: UnixMillis,
+    },
+}
+
+/// A `git_push_approve_attempt` row read back from the audit log.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GitPushApproveAttemptEntry {
+    pub attempt_id: ApproveAttemptId,
+    pub push_request_id: RequestId,
+    pub operator: String,
+    pub started_at: UnixMillis,
+    pub state: GitPushApproveAttemptState,
+}
+
+/// Whether a staged push has any approve attempt that prevents it from
+/// being rejected. Returned by [`AuditLog::reject_blockers_for_push`];
+/// the reject handler maps this into the reject-vs-refuse decision.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RejectBlocker {
+    /// At least one attempt is `Started` or `Uncertain` — the prior
+    /// approve has not finished. Reject must wait for it to resolve
+    /// (or for boot reconcile to drive a stale `Started` to
+    /// `PrePatchFailure`).
+    AttemptInFlight { attempt_id: ApproveAttemptId },
+    /// At least one attempt is `Resolved(Succeeded)`. The push is
+    /// already approved; reject is logically impossible.
+    AlreadyApproved { attempt_id: ApproveAttemptId },
+    /// At least one attempt is `Resolved(PostPatchFailure)`. The
+    /// GitHub state is uncertain; reject is refused until manual
+    /// reconciliation drives the attempt to a definite outcome.
+    PostPatchUncertain { attempt_id: ApproveAttemptId },
+}
+
+/// LEFT JOIN view of one staged push by `push_request_id`. Mirrors
+/// `GIT_PUSH_AUDIT_ENTRY_BY_SESSION_SQL` minus the session-wide
+/// `ORDER BY` clause. Schema v5 dropped `git_push_attempt` so this
+/// view no longer joins on it; outcome columns alone describe the
+/// broker-visible request lifecycle and `git_push_resolution` carries
+/// the operator decision.
+const GIT_PUSH_AUDIT_ENTRY_BY_REQUEST_SQL: &str = "
+    SELECT
+        r.push_request_id,
+        r.session_id,
+        r.received_at,
+        r.repo,
+        r.branch,
+        r.expected_remote_head,
+        r.new_head AS request_new_head,
+        r.correlation_id,
+        o.completed_at,
+        o.result,
+        o.github_status,
+        o.message,
+        res.decided_at,
+        res.decision,
+        res.operator,
+        res.reason,
+        res.mint_jti,
+        res.mint_github_app_id,
+        res.mint_issued_at,
+        res.mint_expires_at
+    FROM git_push_request r
+    LEFT JOIN git_push_outcome o ON o.push_request_id = r.push_request_id
+    LEFT JOIN git_push_resolution res ON res.push_request_id = r.push_request_id
+    WHERE r.push_request_id = ?1
+";
+
+/// LEFT JOIN view of every staged push in one session, ordered by
+/// arrival so callers can read the staged-push timeline.
+const GIT_PUSH_AUDIT_ENTRY_BY_SESSION_SQL: &str = "
+    SELECT
+        r.push_request_id,
+        r.session_id,
+        r.received_at,
+        r.repo,
+        r.branch,
+        r.expected_remote_head,
+        r.new_head AS request_new_head,
+        r.correlation_id,
+        o.completed_at,
+        o.result,
+        o.github_status,
+        o.message,
+        res.decided_at,
+        res.decision,
+        res.operator,
+        res.reason,
+        res.mint_jti,
+        res.mint_github_app_id,
+        res.mint_issued_at,
+        res.mint_expires_at
+    FROM git_push_request r
+    LEFT JOIN git_push_outcome o ON o.push_request_id = r.push_request_id
+    LEFT JOIN git_push_resolution res ON res.push_request_id = r.push_request_id
+    WHERE r.session_id = ?1
+    ORDER BY r.received_at ASC, r.rowid ASC
+";
+
+/// Internal projection of the columns `complete_attempt_succeeded`
+/// needs to copy from the attempt row into the resolution row. Held
+/// only inside the joint transaction, so it does not appear in the
+/// public types.
+struct ApproveAttemptMintRow {
+    state: String,
+    push_request_id: String,
+    mint_jti: Option<String>,
+    mint_app: Option<i64>,
+    mint_iat: Option<i64>,
+    mint_exp: Option<i64>,
 }
 
 impl AuditLog {
@@ -185,132 +309,12 @@ impl AuditLog {
         })
     }
 
-    /// Persist the exact push the broker is about to attempt. This must
-    /// happen after host-side validation and before the external `git push`.
-    pub fn record_git_push_attempt(&self, r: &GitPushAttemptRecord) -> Result<(), AuditError> {
-        self.with_conn_mut(|c| {
-            let tx = c.transaction()?;
-            let push_request: Option<(String, String, String, Option<String>, String)> = tx
-                .query_row(
-                    "SELECT session_id, repo, branch, expected_remote_head, new_head
-                     FROM git_push_request
-                     WHERE push_request_id = ?1",
-                    params![r.push_request_id.as_uuid().to_string()],
-                    |row| {
-                        Ok((
-                            row.get(0)?,
-                            row.get(1)?,
-                            row.get(2)?,
-                            row.get(3)?,
-                            row.get(4)?,
-                        ))
-                    },
-                )
-                .optional()?;
-            let Some((
-                push_session,
-                request_repo,
-                request_branch,
-                request_old_head,
-                request_new_head,
-            )) = push_request
-            else {
-                return Err(AuditError::Invariant("git push request does not exist"));
-            };
-
-            let request_repo = request_repo
-                .parse::<GitCloneRepo>()
-                .map_err(|_| AuditError::Invariant("git push request repo is invalid"))?;
-            if !request_repo.as_repo_ref().matches(r.repo.as_repo_ref()) {
-                return Err(AuditError::Invariant(
-                    "git push attempt repo differs from request",
-                ));
-            }
-            // Branch refnames are case-sensitive. Unlike GitHub owner/repo
-            // names, a case-only branch change can target a different ref.
-            if request_branch != r.branch.as_str() {
-                return Err(AuditError::Invariant(
-                    "git push attempt branch differs from request",
-                ));
-            }
-            let attempt_old_head = r.old_head.as_ref().map(GitObjectId::as_str);
-            if request_old_head.as_deref() != attempt_old_head {
-                return Err(AuditError::Invariant(
-                    "git push attempt old head differs from request",
-                ));
-            }
-            if request_new_head != r.new_head.as_str() {
-                return Err(AuditError::Invariant(
-                    "git push attempt new head differs from request",
-                ));
-            }
-
-            let grant: Option<(String, String, String)> = tx
-                .query_row(
-                    "SELECT request_id, session_id, scope_json
-                     FROM grant_log
-                     WHERE jti = ?1",
-                    params![r.grant_jti.as_uuid().to_string()],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-                )
-                .optional()?;
-            let Some((grant_request_id, grant_session_id, grant_scope_json)) = grant else {
-                return Err(AuditError::Invariant("git push grant does not exist"));
-            };
-            if grant_request_id != r.capability_request_id.as_uuid().to_string() {
-                return Err(AuditError::Invariant(
-                    "git push grant is not for the recorded capability request",
-                ));
-            }
-            if grant_session_id != push_session {
-                return Err(AuditError::Invariant(
-                    "git push grant session differs from push request session",
-                ));
-            }
-            let scope: GrantedScope = serde_json::from_str(&grant_scope_json)?;
-            match scope {
-                GrantedScope::GitHub(scope)
-                    if scope.repository.matches(r.repo.as_repo_ref())
-                        && scope.permissions.contents == Some(GitHubAccess::Write) => {}
-                GrantedScope::GitHub(_) => {
-                    return Err(AuditError::Invariant(
-                        "git push grant is not contents:write for the requested repo",
-                    ));
-                }
-            }
-
-            tx.execute(
-                "INSERT INTO git_push_attempt (
-                     push_attempt_id,
-                     push_request_id,
-                     capability_request_id,
-                     grant_jti,
-                     planned_at,
-                     repo,
-                     branch,
-                     old_head,
-                     new_head
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                params![
-                    r.push_attempt_id.as_uuid().to_string(),
-                    r.push_request_id.as_uuid().to_string(),
-                    r.capability_request_id.as_uuid().to_string(),
-                    r.grant_jti.as_uuid().to_string(),
-                    r.planned_at.as_millis(),
-                    r.repo.to_string(),
-                    r.branch.as_str(),
-                    r.old_head.as_ref().map(GitObjectId::as_str),
-                    r.new_head.as_str(),
-                ],
-            )?;
-            tx.commit()?;
-            Ok(())
-        })
-    }
-
     /// Append the terminal broker-visible result for a VM Git push request.
     /// This is permitted after session close because the request was accepted
-    /// while the session was open.
+    /// while the session was open. After the v5 schema, the only results
+    /// the schema admits are `denied`, `validation_failed`, and `staged`;
+    /// the post-promote terminal states are recorded against
+    /// `git_push_approve_attempt` instead.
     pub fn record_git_push_outcome(&self, r: &GitPushOutcomeRecord<'_>) -> Result<(), AuditError> {
         if r.message.is_empty() {
             return Err(AuditError::Invariant(
@@ -324,59 +328,24 @@ impl AuditLog {
                 "git push outcome GitHub status must be 100..599",
             ));
         }
-        if git_push_result_requires_attempt(r.result) && r.push_attempt_id.is_none() {
-            return Err(AuditError::Invariant(
-                "git push outcome result requires an attempt",
-            ));
-        }
-        if !git_push_result_requires_attempt(r.result) && r.push_attempt_id.is_some() {
-            return Err(AuditError::Invariant(
-                "git push outcome result must not reference an attempt",
-            ));
-        }
 
         self.with_conn_mut(|c| {
-            let tx = c.transaction()?;
-            if let Some(push_attempt_id) = r.push_attempt_id {
-                let attempt_request_id: Option<String> = tx
-                    .query_row(
-                        "SELECT push_request_id
-                         FROM git_push_attempt
-                         WHERE push_attempt_id = ?1",
-                        params![push_attempt_id.as_uuid().to_string()],
-                        |row| row.get(0),
-                    )
-                    .optional()?;
-                match attempt_request_id {
-                    Some(id) if id == r.push_request_id.as_uuid().to_string() => {}
-                    Some(_) => {
-                        return Err(AuditError::Invariant(
-                            "git push outcome attempt belongs to a different request",
-                        ));
-                    }
-                    None => return Err(AuditError::Invariant("git push attempt does not exist")),
-                }
-            }
-
-            tx.execute(
+            c.execute(
                 "INSERT INTO git_push_outcome (
                      push_request_id,
-                     push_attempt_id,
                      completed_at,
                      result,
                      github_status,
                      message
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                 ) VALUES (?1, ?2, ?3, ?4, ?5)",
                 params![
                     r.push_request_id.as_uuid().to_string(),
-                    r.push_attempt_id.map(|id| id.as_uuid().to_string()),
                     r.completed_at.as_millis(),
                     r.result.as_str(),
                     r.github_status.map(i64::from),
                     r.message,
                 ],
             )?;
-            tx.commit()?;
             Ok(())
         })
     }
@@ -458,40 +427,7 @@ impl AuditLog {
         push_request_id: RequestId,
     ) -> Result<Option<GitPushAuditEntry>, AuditError> {
         self.with_conn(|c| {
-            let mut stmt = c.prepare(
-                "SELECT
-                     r.push_request_id,
-                     r.session_id,
-                     r.received_at,
-                     r.repo,
-                     r.branch,
-                     r.expected_remote_head,
-                     r.new_head AS request_new_head,
-                     r.correlation_id,
-                     a.push_attempt_id,
-                     a.capability_request_id,
-                     a.grant_jti,
-                     a.planned_at,
-                     a.old_head,
-                     a.new_head AS attempted_new_head,
-                     o.completed_at,
-                     o.result,
-                     o.github_status,
-                     o.message,
-                     res.decided_at,
-                     res.decision,
-                     res.operator,
-                     res.reason,
-                     res.mint_jti,
-                     res.mint_github_app_id,
-                     res.mint_issued_at,
-                     res.mint_expires_at
-                 FROM git_push_request r
-                 LEFT JOIN git_push_attempt a ON a.push_request_id = r.push_request_id
-                 LEFT JOIN git_push_outcome o ON o.push_request_id = r.push_request_id
-                 LEFT JOIN git_push_resolution res ON res.push_request_id = r.push_request_id
-                 WHERE r.push_request_id = ?1",
-            )?;
+            let mut stmt = c.prepare(GIT_PUSH_AUDIT_ENTRY_BY_REQUEST_SQL)?;
             let row = stmt
                 .query_row(
                     params![push_request_id.as_uuid().to_string()],
@@ -507,41 +443,7 @@ impl AuditLog {
         id: SessionId,
     ) -> Result<Vec<GitPushAuditEntry>, AuditError> {
         self.with_conn(|c| {
-            let mut stmt = c.prepare(
-                "SELECT
-                     r.push_request_id,
-                     r.session_id,
-                     r.received_at,
-                     r.repo,
-                     r.branch,
-                     r.expected_remote_head,
-                     r.new_head AS request_new_head,
-                     r.correlation_id,
-                     a.push_attempt_id,
-                     a.capability_request_id,
-                     a.grant_jti,
-                     a.planned_at,
-                     a.old_head,
-                     a.new_head AS attempted_new_head,
-                     o.completed_at,
-                     o.result,
-                     o.github_status,
-                     o.message,
-                     res.decided_at,
-                     res.decision,
-                     res.operator,
-                     res.reason,
-                     res.mint_jti,
-                     res.mint_github_app_id,
-                     res.mint_issued_at,
-                     res.mint_expires_at
-                 FROM git_push_request r
-                 LEFT JOIN git_push_attempt a ON a.push_request_id = r.push_request_id
-                 LEFT JOIN git_push_outcome o ON o.push_request_id = r.push_request_id
-                 LEFT JOIN git_push_resolution res ON res.push_request_id = r.push_request_id
-                 WHERE r.session_id = ?1
-                 ORDER BY r.received_at ASC, r.rowid ASC",
-            )?;
+            let mut stmt = c.prepare(GIT_PUSH_AUDIT_ENTRY_BY_SESSION_SQL)?;
             let rows = stmt
                 .query_map(
                     params![id.as_uuid().to_string()],
@@ -551,6 +453,367 @@ impl AuditLog {
             rows.into_iter().collect::<Result<Vec<_>, _>>()
         })
     }
+
+    /// Insert a fresh `Started` approve attempt against a staged push.
+    /// Required preconditions: the request row exists and has a
+    /// `Staged` outcome row (the v3 trigger
+    /// `git_push_resolution_requires_staged` reaches the same shape from
+    /// the resolution side; this DAO mirrors that for attempts so an
+    /// attempt cannot land for a push the audit log never observed
+    /// staged).
+    pub fn start_approve_attempt(
+        &self,
+        attempt_id: ApproveAttemptId,
+        push_request_id: RequestId,
+        operator: &str,
+        started_at: UnixMillis,
+    ) -> Result<(), AuditError> {
+        if operator.is_empty() {
+            return Err(AuditError::Invariant(
+                "approve attempt operator must not be empty",
+            ));
+        }
+        self.with_conn_mut(|c| {
+            let tx = c.transaction()?;
+            let staged: Option<i64> = tx
+                .query_row(
+                    "SELECT 1 FROM git_push_outcome
+                     WHERE push_request_id = ?1 AND result = 'staged'",
+                    params![push_request_id.as_uuid().to_string()],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if staged.is_none() {
+                return Err(AuditError::Invariant(
+                    "approve attempt requires staged outcome",
+                ));
+            }
+
+            tx.execute(
+                "INSERT INTO git_push_approve_attempt (
+                     attempt_id, push_request_id, operator, started_at,
+                     state, outcome, completed_at, new_app_tip, failure_detail,
+                     mint_jti, mint_github_app_id, mint_issued_at, mint_expires_at
+                 ) VALUES (?1, ?2, ?3, ?4, 'started',
+                           NULL, NULL, NULL, NULL,
+                           NULL, NULL, NULL, NULL)",
+                params![
+                    attempt_id.as_uuid().to_string(),
+                    push_request_id.as_uuid().to_string(),
+                    operator,
+                    started_at.as_millis(),
+                ],
+            )?;
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
+    /// Transition a `Started` attempt to `Uncertain`, persisting the
+    /// captured mint context. Called immediately before issuing the
+    /// GitHub `update_ref` PATCH: once this commit lands the broker
+    /// owes the audit log a `Resolved` row, and reject must be refused
+    /// in the interim.
+    pub fn mark_attempt_uncertain(
+        &self,
+        attempt_id: ApproveAttemptId,
+        mint: PromoteMintAudit,
+    ) -> Result<(), AuditError> {
+        let github_app_id = i64::try_from(mint.github_app_id).map_err(|_| {
+            AuditError::Invariant("approve attempt mint github_app_id exceeds SQLite integer")
+        })?;
+        self.with_conn_mut(|c| {
+            let updated = c.execute(
+                "UPDATE git_push_approve_attempt
+                    SET state = 'uncertain',
+                        mint_jti = ?2,
+                        mint_github_app_id = ?3,
+                        mint_issued_at = ?4,
+                        mint_expires_at = ?5
+                  WHERE attempt_id = ?1
+                    AND state = 'started'",
+                params![
+                    attempt_id.as_uuid().to_string(),
+                    mint.jti.as_uuid().to_string(),
+                    github_app_id,
+                    mint.issued_at.as_millis(),
+                    mint.expires_at.as_millis(),
+                ],
+            )?;
+            if updated == 0 {
+                return Err(AuditError::Invariant(
+                    "approve attempt is not in 'started' state",
+                ));
+            }
+            Ok(())
+        })
+    }
+
+    /// Atomically complete an `Uncertain` attempt as `Succeeded` *and*
+    /// write the matching `git_push_resolution(decision='approved')`
+    /// row. This is the load-bearing transactional commit of the
+    /// approve workflow: the audit log either records the full
+    /// approval (attempt resolved + resolution row) or neither side
+    /// commits. The resolution row's mint columns are derived from the
+    /// attempt's stored mint to guarantee they agree.
+    pub fn complete_attempt_succeeded(
+        &self,
+        attempt_id: ApproveAttemptId,
+        new_app_tip: &GitObjectId,
+        operator: &str,
+        reason: &str,
+        completed_at: UnixMillis,
+    ) -> Result<(), AuditError> {
+        if operator.is_empty() {
+            return Err(AuditError::Invariant(
+                "approve resolution operator must not be empty",
+            ));
+        }
+        if reason.is_empty() {
+            return Err(AuditError::Invariant(
+                "approve resolution reason must not be empty",
+            ));
+        }
+
+        self.with_conn_mut(|c| {
+            let tx = c.transaction()?;
+            // Load the current attempt row inside the TX so the
+            // resolution row is written from the same mint context that
+            // the attempt records.
+            let row = tx
+                .query_row(
+                    "SELECT state, push_request_id,
+                            mint_jti, mint_github_app_id, mint_issued_at, mint_expires_at
+                       FROM git_push_approve_attempt
+                      WHERE attempt_id = ?1",
+                    params![attempt_id.as_uuid().to_string()],
+                    |row| {
+                        Ok(ApproveAttemptMintRow {
+                            state: row.get(0)?,
+                            push_request_id: row.get(1)?,
+                            mint_jti: row.get(2)?,
+                            mint_app: row.get(3)?,
+                            mint_iat: row.get(4)?,
+                            mint_exp: row.get(5)?,
+                        })
+                    },
+                )
+                .optional()?;
+            let Some(ApproveAttemptMintRow {
+                state,
+                push_request_id,
+                mint_jti,
+                mint_app,
+                mint_iat,
+                mint_exp,
+            }) = row
+            else {
+                return Err(AuditError::Invariant("approve attempt does not exist"));
+            };
+            if state != "uncertain" {
+                return Err(AuditError::Invariant(
+                    "approve attempt is not in 'uncertain' state",
+                ));
+            }
+            let (Some(mint_jti), Some(mint_app), Some(mint_iat), Some(mint_exp)) =
+                (mint_jti, mint_app, mint_iat, mint_exp)
+            else {
+                return Err(AuditError::Invariant(
+                    "approve attempt 'uncertain' row is missing mint context",
+                ));
+            };
+
+            tx.execute(
+                "UPDATE git_push_approve_attempt
+                    SET state = 'resolved',
+                        outcome = 'succeeded',
+                        new_app_tip = ?2,
+                        completed_at = ?3
+                  WHERE attempt_id = ?1",
+                params![
+                    attempt_id.as_uuid().to_string(),
+                    new_app_tip.as_str(),
+                    completed_at.as_millis(),
+                ],
+            )?;
+
+            tx.execute(
+                "INSERT INTO git_push_resolution (
+                     push_request_id, decided_at, decision, operator, reason,
+                     mint_jti, mint_github_app_id, mint_issued_at, mint_expires_at
+                 ) VALUES (?1, ?2, 'approved', ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    push_request_id,
+                    completed_at.as_millis(),
+                    operator,
+                    reason,
+                    mint_jti,
+                    mint_app,
+                    mint_iat,
+                    mint_exp,
+                ],
+            )?;
+
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
+    /// Complete a `Started` or `Uncertain` attempt as
+    /// `PrePatchFailure`. The schema's forward-only trigger allows this
+    /// transition from either non-terminal state; the DAO does the
+    /// matching state check before issuing the UPDATE so an attempt
+    /// that has already resolved produces a readable invariant error
+    /// instead of a silent no-op.
+    pub fn complete_attempt_pre_patch_failure(
+        &self,
+        attempt_id: ApproveAttemptId,
+        detail: &str,
+        completed_at: UnixMillis,
+    ) -> Result<(), AuditError> {
+        self.complete_attempt_failure(
+            attempt_id,
+            "pre_patch_failure",
+            &["started", "uncertain"],
+            detail,
+            completed_at,
+        )
+    }
+
+    /// Complete an `Uncertain` attempt as `PostPatchFailure`. Only
+    /// admitted from `uncertain` — `started` cannot reach this state
+    /// because no PATCH could have been issued yet.
+    pub fn complete_attempt_post_patch_failure(
+        &self,
+        attempt_id: ApproveAttemptId,
+        detail: &str,
+        completed_at: UnixMillis,
+    ) -> Result<(), AuditError> {
+        self.complete_attempt_failure(
+            attempt_id,
+            "post_patch_failure",
+            &["uncertain"],
+            detail,
+            completed_at,
+        )
+    }
+
+    fn complete_attempt_failure(
+        &self,
+        attempt_id: ApproveAttemptId,
+        outcome: &'static str,
+        allowed_states: &[&'static str],
+        detail: &str,
+        completed_at: UnixMillis,
+    ) -> Result<(), AuditError> {
+        if detail.is_empty() {
+            return Err(AuditError::Invariant(
+                "approve attempt failure detail must not be empty",
+            ));
+        }
+        // SQLite CHECK forbids `failure_detail = ''` but a caller-supplied
+        // string with whitespace-only content would pass; we keep the
+        // strict empty-string check at the DAO boundary as a thin
+        // sanity net. The `not empty` guard is intentionally tight; the
+        // schema allows any non-empty string.
+
+        self.with_conn_mut(|c| {
+            let tx = c.transaction()?;
+            let current_state: Option<String> = tx
+                .query_row(
+                    "SELECT state FROM git_push_approve_attempt WHERE attempt_id = ?1",
+                    params![attempt_id.as_uuid().to_string()],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let Some(state) = current_state else {
+                return Err(AuditError::Invariant("approve attempt does not exist"));
+            };
+            if !allowed_states.contains(&state.as_str()) {
+                return Err(AuditError::Invariant(
+                    "approve attempt is not in a state that admits this failure outcome",
+                ));
+            }
+
+            tx.execute(
+                "UPDATE git_push_approve_attempt
+                    SET state = 'resolved',
+                        outcome = ?2,
+                        failure_detail = ?3,
+                        completed_at = ?4
+                  WHERE attempt_id = ?1",
+                params![
+                    attempt_id.as_uuid().to_string(),
+                    outcome,
+                    detail,
+                    completed_at.as_millis(),
+                ],
+            )?;
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
+    /// Return every approve-attempt row for one staged push, ordered
+    /// by `started_at` ascending (then by attempt_id as a stable
+    /// tiebreaker for the rare same-millisecond case). The reject
+    /// handler and boot reconcile both consume this view.
+    pub fn approve_attempts_for_push(
+        &self,
+        push_request_id: RequestId,
+    ) -> Result<Vec<GitPushApproveAttemptEntry>, AuditError> {
+        self.with_conn(|c| {
+            let mut stmt = c.prepare(
+                "SELECT attempt_id, push_request_id, operator, started_at,
+                        state, outcome, completed_at,
+                        new_app_tip, failure_detail,
+                        mint_jti, mint_github_app_id, mint_issued_at, mint_expires_at
+                   FROM git_push_approve_attempt
+                  WHERE push_request_id = ?1
+                  ORDER BY started_at ASC, attempt_id ASC",
+            )?;
+            let rows = stmt
+                .query_map(
+                    params![push_request_id.as_uuid().to_string()],
+                    git_push_approve_attempt_from_row,
+                )?
+                .collect::<Result<Vec<_>, _>>()?;
+            rows.into_iter().collect::<Result<Vec<_>, _>>()
+        })
+    }
+
+    /// First attempt (oldest by `started_at`) whose state prevents
+    /// reject from succeeding. Returns `None` when reject is allowed
+    /// (no attempts, or only `PrePatchFailure` attempts).
+    pub fn reject_blocker_for_push(
+        &self,
+        push_request_id: RequestId,
+    ) -> Result<Option<RejectBlocker>, AuditError> {
+        let attempts = self.approve_attempts_for_push(push_request_id)?;
+        Ok(attempts
+            .into_iter()
+            .find_map(|attempt| match attempt.state {
+                GitPushApproveAttemptState::Started
+                | GitPushApproveAttemptState::Uncertain { .. } => {
+                    Some(RejectBlocker::AttemptInFlight {
+                        attempt_id: attempt.attempt_id,
+                    })
+                }
+                GitPushApproveAttemptState::Resolved { outcome, .. } => match outcome {
+                    GitPushApproveAttemptOutcome::Succeeded { .. } => {
+                        Some(RejectBlocker::AlreadyApproved {
+                            attempt_id: attempt.attempt_id,
+                        })
+                    }
+                    GitPushApproveAttemptOutcome::PostPatchFailure { .. } => {
+                        Some(RejectBlocker::PostPatchUncertain {
+                            attempt_id: attempt.attempt_id,
+                        })
+                    }
+                    GitPushApproveAttemptOutcome::PrePatchFailure { .. } => None,
+                },
+            }))
+    }
 }
 
 impl GitPushOutcomeResult {
@@ -559,11 +822,6 @@ impl GitPushOutcomeResult {
             Self::Denied => "denied",
             Self::ValidationFailed => "validation_failed",
             Self::Staged => "staged",
-            Self::Pushed => "pushed",
-            Self::LeaseRejected => "lease_rejected",
-            Self::PushRejected => "push_rejected",
-            Self::PushFailed => "push_failed",
-            Self::AuditFailedAfterPush => "audit_failed_after_push",
         }
     }
 
@@ -572,11 +830,6 @@ impl GitPushOutcomeResult {
             "denied" => Ok(Self::Denied),
             "validation_failed" => Ok(Self::ValidationFailed),
             "staged" => Ok(Self::Staged),
-            "pushed" => Ok(Self::Pushed),
-            "lease_rejected" => Ok(Self::LeaseRejected),
-            "push_rejected" => Ok(Self::PushRejected),
-            "push_failed" => Ok(Self::PushFailed),
-            "audit_failed_after_push" => Ok(Self::AuditFailedAfterPush),
             _ => Err(AuditError::Invariant(
                 "Git push audit outcome result is invalid",
             )),
@@ -661,17 +914,6 @@ impl GitPushResolution {
     }
 }
 
-fn git_push_result_requires_attempt(result: GitPushOutcomeResult) -> bool {
-    matches!(
-        result,
-        GitPushOutcomeResult::Pushed
-            | GitPushOutcomeResult::LeaseRejected
-            | GitPushOutcomeResult::PushRejected
-            | GitPushOutcomeResult::PushFailed
-            | GitPushOutcomeResult::AuditFailedAfterPush
-    )
-}
-
 fn git_push_audit_entry_from_row(
     row: &Row<'_>,
 ) -> rusqlite::Result<Result<GitPushAuditEntry, AuditError>> {
@@ -683,12 +925,6 @@ fn git_push_audit_entry_from_row(
     let expected_remote_head_str: Option<String> = row.get("expected_remote_head")?;
     let new_head_str: String = row.get("request_new_head")?;
     let correlation_id_raw: Option<String> = row.get("correlation_id")?;
-    let push_attempt_id_str: Option<String> = row.get("push_attempt_id")?;
-    let capability_request_id_str: Option<String> = row.get("capability_request_id")?;
-    let grant_jti_str: Option<String> = row.get("grant_jti")?;
-    let planned_at: Option<i64> = row.get("planned_at")?;
-    let old_head_str: Option<String> = row.get("old_head")?;
-    let attempted_new_head_str: Option<String> = row.get("attempted_new_head")?;
     let completed_at: Option<i64> = row.get("completed_at")?;
     let result_str: Option<String> = row.get("result")?;
     let github_status: Option<i64> = row.get("github_status")?;
@@ -726,62 +962,6 @@ fn git_push_audit_entry_from_row(
             .map(CorrelationId::try_new)
             .transpose()
             .map_err(|_| AuditError::Invariant("Git push audit row: correlation_id is invalid"))?;
-
-        // SQLite's `TEXT PRIMARY KEY` does not imply NOT NULL, so a
-        // corrupt row could carry a NULL `push_attempt_id` alongside
-        // populated attempt columns and the LEFT JOIN would still hit.
-        // `capability_request_id` is `NOT NULL REFERENCES request(...)`,
-        // so it is a sound presence signal; if the row really is joined,
-        // the in-branch `parse_required_*` calls surface a specific
-        // invariant error for any per-column NULL surprise (including a
-        // NULL primary key). `old_head` is no longer a discriminator
-        // because it represents "branch creation" when null.
-        let (
-            push_attempt_id,
-            capability_request_id,
-            grant_jti,
-            planned_at,
-            old_head,
-            attempted_new_head,
-        ) = if capability_request_id_str.is_some() {
-            let push_attempt_id = parse_required_request_id(
-                push_attempt_id_str,
-                "Git push audit row: attempt id missing or invalid",
-            )?;
-            let capability_request_id = parse_required_request_id(
-                capability_request_id_str,
-                "Git push audit row: capability request id missing or invalid",
-            )?;
-            let grant_jti = parse_required_jti(
-                grant_jti_str,
-                "Git push audit row: grant jti missing or invalid",
-            )?;
-            let planned_at = planned_at.ok_or(AuditError::Invariant(
-                "Git push audit row: planned_at missing",
-            ))?;
-            let old_head = old_head_str
-                .map(|s| s.parse::<GitObjectId>())
-                .transpose()
-                .map_err(|_| AuditError::Invariant("Git push audit row: old head invalid"))?;
-            let attempted_new_head = attempted_new_head_str
-                .ok_or(AuditError::Invariant(
-                    "Git push audit row: attempted new head missing",
-                ))?
-                .parse::<GitObjectId>()
-                .map_err(|_| {
-                    AuditError::Invariant("Git push audit row: attempted new head invalid")
-                })?;
-            (
-                Some(push_attempt_id),
-                Some(capability_request_id),
-                Some(grant_jti),
-                Some(UnixMillis::from_millis(planned_at)),
-                old_head,
-                Some(attempted_new_head),
-            )
-        } else {
-            (None, None, None, None, None, None)
-        };
 
         let (completed_at, result, message) = match (completed_at, result_str, message) {
             (None, None, None) => (None, None, None),
@@ -853,12 +1033,6 @@ fn git_push_audit_entry_from_row(
             expected_remote_head,
             new_head,
             correlation_id,
-            push_attempt_id,
-            capability_request_id,
-            grant_jti,
-            planned_at,
-            old_head,
-            attempted_new_head,
             completed_at,
             result,
             github_status,
@@ -869,28 +1043,179 @@ fn git_push_audit_entry_from_row(
     Ok(parse())
 }
 
+fn git_push_approve_attempt_from_row(
+    row: &Row<'_>,
+) -> rusqlite::Result<Result<GitPushApproveAttemptEntry, AuditError>> {
+    let attempt_id_str: String = row.get("attempt_id")?;
+    let push_request_id_str: String = row.get("push_request_id")?;
+    let operator: String = row.get("operator")?;
+    let started_at: i64 = row.get("started_at")?;
+    let state_str: String = row.get("state")?;
+    let outcome_str: Option<String> = row.get("outcome")?;
+    let completed_at: Option<i64> = row.get("completed_at")?;
+    let new_app_tip_str: Option<String> = row.get("new_app_tip")?;
+    let failure_detail: Option<String> = row.get("failure_detail")?;
+    let mint_jti_str: Option<String> = row.get("mint_jti")?;
+    let mint_github_app_id: Option<i64> = row.get("mint_github_app_id")?;
+    let mint_issued_at: Option<i64> = row.get("mint_issued_at")?;
+    let mint_expires_at: Option<i64> = row.get("mint_expires_at")?;
+
+    let parse = || -> Result<GitPushApproveAttemptEntry, AuditError> {
+        let attempt_id = uuid::Uuid::parse_str(&attempt_id_str)
+            .map(ApproveAttemptId::from_uuid)
+            .map_err(|_| AuditError::Invariant("approve attempt row: attempt id is not a uuid"))?;
+        let push_request_id = uuid::Uuid::parse_str(&push_request_id_str)
+            .map(RequestId::from_uuid)
+            .map_err(|_| AuditError::Invariant("approve attempt row: request id is not a uuid"))?;
+        let started_at = UnixMillis::from_millis(started_at);
+
+        // Mint context is all-or-nothing per the schema CHECK; reconstruct
+        // a single Option<PromoteMintAudit> here so the rest of the parse
+        // can treat it as one value.
+        let mint = match (
+            mint_jti_str,
+            mint_github_app_id,
+            mint_issued_at,
+            mint_expires_at,
+        ) {
+            (None, None, None, None) => None,
+            (Some(jti_str), Some(app_id), Some(issued_at), Some(expires_at)) => {
+                let jti = uuid::Uuid::parse_str(&jti_str)
+                    .map(Jti::from_uuid)
+                    .map_err(|_| {
+                        AuditError::Invariant("approve attempt row: mint jti is not a uuid")
+                    })?;
+                let github_app_id = u64::try_from(app_id).map_err(|_| {
+                    AuditError::Invariant("approve attempt row: mint github_app_id is negative")
+                })?;
+                Some(PromoteMintAudit {
+                    jti,
+                    github_app_id,
+                    issued_at: UnixMillis::from_millis(issued_at),
+                    expires_at: UnixMillis::from_millis(expires_at),
+                })
+            }
+            _ => {
+                return Err(AuditError::Invariant(
+                    "approve attempt row: mint context is partially populated",
+                ));
+            }
+        };
+
+        let state = match state_str.as_str() {
+            "started" => {
+                if outcome_str.is_some()
+                    || completed_at.is_some()
+                    || new_app_tip_str.is_some()
+                    || failure_detail.is_some()
+                    || mint.is_some()
+                {
+                    return Err(AuditError::Invariant(
+                        "approve attempt row: 'started' state must not carry terminal fields",
+                    ));
+                }
+                GitPushApproveAttemptState::Started
+            }
+            "uncertain" => {
+                let mint = mint.ok_or(AuditError::Invariant(
+                    "approve attempt row: 'uncertain' state requires mint context",
+                ))?;
+                if outcome_str.is_some()
+                    || completed_at.is_some()
+                    || new_app_tip_str.is_some()
+                    || failure_detail.is_some()
+                {
+                    return Err(AuditError::Invariant(
+                        "approve attempt row: 'uncertain' state must not carry terminal fields",
+                    ));
+                }
+                GitPushApproveAttemptState::Uncertain { mint }
+            }
+            "resolved" => {
+                let outcome_str = outcome_str.ok_or(AuditError::Invariant(
+                    "approve attempt row: 'resolved' state requires an outcome",
+                ))?;
+                let completed_at = completed_at.ok_or(AuditError::Invariant(
+                    "approve attempt row: 'resolved' state requires completed_at",
+                ))?;
+                let outcome = match outcome_str.as_str() {
+                    "succeeded" => {
+                        let new_app_tip_str = new_app_tip_str.ok_or(AuditError::Invariant(
+                            "approve attempt row: 'succeeded' outcome requires new_app_tip",
+                        ))?;
+                        let new_app_tip = new_app_tip_str.parse::<GitObjectId>().map_err(|_| {
+                            AuditError::Invariant("approve attempt row: new_app_tip is invalid")
+                        })?;
+                        if failure_detail.is_some() {
+                            return Err(AuditError::Invariant(
+                                "approve attempt row: 'succeeded' outcome must not carry failure_detail",
+                            ));
+                        }
+                        GitPushApproveAttemptOutcome::Succeeded { new_app_tip }
+                    }
+                    "pre_patch_failure" => {
+                        let detail = failure_detail.ok_or(AuditError::Invariant(
+                            "approve attempt row: failure outcome requires failure_detail",
+                        ))?;
+                        if new_app_tip_str.is_some() {
+                            return Err(AuditError::Invariant(
+                                "approve attempt row: failure outcome must not carry new_app_tip",
+                            ));
+                        }
+                        GitPushApproveAttemptOutcome::PrePatchFailure { detail }
+                    }
+                    "post_patch_failure" => {
+                        let detail = failure_detail.ok_or(AuditError::Invariant(
+                            "approve attempt row: failure outcome requires failure_detail",
+                        ))?;
+                        if new_app_tip_str.is_some() {
+                            return Err(AuditError::Invariant(
+                                "approve attempt row: failure outcome must not carry new_app_tip",
+                            ));
+                        }
+                        GitPushApproveAttemptOutcome::PostPatchFailure { detail }
+                    }
+                    _ => {
+                        return Err(AuditError::Invariant(
+                            "approve attempt row: outcome value is invalid",
+                        ));
+                    }
+                };
+                GitPushApproveAttemptState::Resolved {
+                    outcome,
+                    mint,
+                    completed_at: UnixMillis::from_millis(completed_at),
+                }
+            }
+            _ => {
+                return Err(AuditError::Invariant(
+                    "approve attempt row: state value is invalid",
+                ));
+            }
+        };
+
+        Ok(GitPushApproveAttemptEntry {
+            attempt_id,
+            push_request_id,
+            operator,
+            started_at,
+            state,
+        })
+    };
+    Ok(parse())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::audit::test_support::{pre_mint, record_sample_write_grant, sample_session};
-    use crate::core::{
-        CapabilityRequest, CredentialGrant, GitHubGrantedScope, GitHubPermissions, GitHubRequest,
-        MetadataAccess, PolicyDecision, RepoRef, TtlSeconds,
-    };
+    use crate::audit::test_support::sample_session;
+    use crate::core::RepoRef;
     use proptest::prelude::*;
 
     fn sample_git_repo() -> GitCloneRepo {
         GitCloneRepo::new(RepoRef {
             owner: "o".into(),
             name: "n".into(),
-        })
-        .unwrap()
-    }
-
-    fn git_repo(owner: &str, name: &str) -> GitCloneRepo {
-        GitCloneRepo::new(RepoRef {
-            owner: owner.into(),
-            name: name.into(),
         })
         .unwrap()
     }
@@ -918,634 +1243,29 @@ mod tests {
         }
     }
 
-    fn git_push_attempt_record(
-        push_attempt_id: RequestId,
-        push_request_id: RequestId,
-        capability_request_id: RequestId,
-        grant_jti: Jti,
-        repo: GitCloneRepo,
-        branch: GitBranchName,
-    ) -> GitPushAttemptRecord {
-        GitPushAttemptRecord {
-            push_attempt_id,
-            push_request_id,
-            capability_request_id,
-            grant_jti,
-            planned_at: UnixMillis::from_millis(1_700_000_120),
-            repo,
-            branch,
-            old_head: Some(git_oid('1')),
-            new_head: git_oid('2'),
-        }
-    }
-
-    #[derive(Clone, Debug)]
-    enum GitPushAuditScript {
-        ValidAttempted {
-            result: GitPushOutcomeResult,
-            github_status: Option<u16>,
-            close_before_outcome: bool,
-            attempt_repo_case_differs: bool,
-            /// `true` exercises the branch-creation path: request and
-            /// attempt both record `None` for their respective heads.
-            branch_creation: bool,
-        },
-        ValidUnattempted {
-            result: GitPushOutcomeResult,
-            close_before_outcome: bool,
-            branch_creation: bool,
-        },
-        RequestAfterClose,
-        AttemptBeforeRequest,
-        AttemptMissingGrant,
-        AttemptMismatchedRepo,
-        AttemptMismatchedBranch,
-        /// `request_has_head = true`: request records `Some`, attempt
-        /// records `None`. `false`: request `None`, attempt `Some`.
-        /// Either way the attempt must be rejected.
-        AttemptHeadPresenceMismatch {
-            request_has_head: bool,
-        },
-        OutcomeWithoutRequest,
-        OutcomeRequiresAttemptWithoutAttempt {
-            result: GitPushOutcomeResult,
-        },
-        OutcomeUnexpectedAttempt {
-            result: GitPushOutcomeResult,
-        },
-        OutcomeDifferentRequest {
-            result: GitPushOutcomeResult,
-        },
-    }
-
-    fn attempted_git_push_result_strategy() -> impl Strategy<Value = GitPushOutcomeResult> {
-        prop_oneof![
-            Just(GitPushOutcomeResult::Pushed),
-            Just(GitPushOutcomeResult::LeaseRejected),
-            Just(GitPushOutcomeResult::PushRejected),
-            Just(GitPushOutcomeResult::PushFailed),
-            Just(GitPushOutcomeResult::AuditFailedAfterPush),
-        ]
-    }
-
-    fn unattempted_git_push_result_strategy() -> impl Strategy<Value = GitPushOutcomeResult> {
-        prop_oneof![
-            Just(GitPushOutcomeResult::Denied),
-            Just(GitPushOutcomeResult::ValidationFailed),
-            Just(GitPushOutcomeResult::Staged),
-        ]
-    }
-
-    fn github_status_strategy() -> impl Strategy<Value = Option<u16>> {
-        prop_oneof![Just(None), (100u16..=599).prop_map(Some)]
-    }
-
-    fn git_push_audit_script_strategy() -> impl Strategy<Value = GitPushAuditScript> {
-        prop_oneof![
-            (
-                attempted_git_push_result_strategy(),
-                github_status_strategy(),
-                any::<bool>(),
-                any::<bool>(),
-                any::<bool>(),
-            )
-                .prop_map(
-                    |(
-                        result,
-                        github_status,
-                        close_before_outcome,
-                        attempt_repo_case_differs,
-                        branch_creation,
-                    )| {
-                        GitPushAuditScript::ValidAttempted {
-                            result,
-                            github_status,
-                            close_before_outcome,
-                            attempt_repo_case_differs,
-                            branch_creation,
-                        }
-                    },
-                ),
-            (
-                unattempted_git_push_result_strategy(),
-                any::<bool>(),
-                any::<bool>(),
-            )
-                .prop_map(|(result, close_before_outcome, branch_creation)| {
-                    GitPushAuditScript::ValidUnattempted {
-                        result,
-                        close_before_outcome,
-                        branch_creation,
-                    }
-                }),
-            Just(GitPushAuditScript::RequestAfterClose),
-            Just(GitPushAuditScript::AttemptBeforeRequest),
-            Just(GitPushAuditScript::AttemptMissingGrant),
-            Just(GitPushAuditScript::AttemptMismatchedRepo),
-            Just(GitPushAuditScript::AttemptMismatchedBranch),
-            any::<bool>().prop_map(|request_has_head| {
-                GitPushAuditScript::AttemptHeadPresenceMismatch { request_has_head }
-            }),
-            Just(GitPushAuditScript::OutcomeWithoutRequest),
-            attempted_git_push_result_strategy().prop_map(|result| {
-                GitPushAuditScript::OutcomeRequiresAttemptWithoutAttempt { result }
-            },),
-            unattempted_git_push_result_strategy()
-                .prop_map(|result| GitPushAuditScript::OutcomeUnexpectedAttempt { result }),
-            attempted_git_push_result_strategy()
-                .prop_map(|result| GitPushAuditScript::OutcomeDifferentRequest { result }),
-        ]
-    }
-
-    #[test]
-    fn git_push_request_attempt_and_outcome_roundtrip() {
-        let log = AuditLog::open_in_memory().unwrap();
-        let s = sample_session();
-        log.open_session(&s).unwrap();
-        let push_request_id = RequestId::new();
-        let push_request = sample_git_push_request_record(push_request_id, s.session_id);
-        log.record_git_push_request(&push_request).unwrap();
-
-        let capability_request_id = RequestId::new();
-        let grant = record_sample_write_grant(&log, s.session_id, capability_request_id);
-        let push_attempt_id = RequestId::new();
-        log.record_git_push_attempt(&GitPushAttemptRecord {
-            push_attempt_id,
-            push_request_id,
-            capability_request_id,
-            grant_jti: grant.jti,
-            planned_at: UnixMillis::from_millis(1_700_000_120),
-            repo: sample_git_repo(),
-            branch: "main".parse().unwrap(),
-            old_head: Some(git_oid('1')),
-            new_head: git_oid('2'),
-        })
-        .unwrap();
+    fn record_staged_request(log: &AuditLog, push_request_id: RequestId, session_id: SessionId) {
+        log.record_git_push_request(&sample_git_push_request_record(push_request_id, session_id))
+            .unwrap();
         log.record_git_push_outcome(&GitPushOutcomeRecord {
             push_request_id,
-            push_attempt_id: Some(push_attempt_id),
-            completed_at: UnixMillis::from_millis(1_700_000_130),
-            result: GitPushOutcomeResult::Pushed,
-            github_status: None,
-            message: "pushed",
-        })
-        .unwrap();
-
-        let entries = log.list_git_pushes_for_session(s.session_id).unwrap();
-        assert_eq!(entries.len(), 1);
-        let entry = &entries[0];
-        assert_eq!(entry.push_request_id, push_request_id);
-        assert_eq!(entry.session_id, s.session_id);
-        assert_eq!(entry.repo, sample_git_repo());
-        assert_eq!(entry.branch, "main".parse::<GitBranchName>().unwrap());
-        assert_eq!(entry.expected_remote_head, Some(git_oid('1')));
-        assert_eq!(entry.new_head, git_oid('2'));
-        assert_eq!(entry.push_attempt_id, Some(push_attempt_id));
-        assert_eq!(entry.capability_request_id, Some(capability_request_id));
-        assert_eq!(entry.grant_jti, Some(grant.jti));
-        assert_eq!(
-            entry.planned_at,
-            Some(UnixMillis::from_millis(1_700_000_120))
-        );
-        assert_eq!(entry.old_head, Some(git_oid('1')));
-        assert_eq!(entry.attempted_new_head, Some(git_oid('2')));
-        assert_eq!(
-            entry.completed_at,
-            Some(UnixMillis::from_millis(1_700_000_130))
-        );
-        assert_eq!(entry.result, Some(GitPushOutcomeResult::Pushed));
-        assert_eq!(entry.github_status, None);
-        assert_eq!(entry.message.as_deref(), Some("pushed"));
-    }
-
-    proptest! {
-        #[test]
-        fn git_push_audit_state_machine_rejects_out_of_order_or_mismatched_rows(
-            script in git_push_audit_script_strategy(),
-        ) {
-            let log = AuditLog::open_in_memory().unwrap();
-            let s = sample_session();
-            log.open_session(&s).unwrap();
-
-            let push_request_id = RequestId::new();
-            let push_request = sample_git_push_request_record(push_request_id, s.session_id);
-            let capability_request_id = RequestId::new();
-            let push_attempt_id = RequestId::new();
-
-            match script {
-                GitPushAuditScript::ValidAttempted {
-                    result,
-                    github_status,
-                    close_before_outcome,
-                    attempt_repo_case_differs,
-                    branch_creation,
-                } => {
-                    let push_request = GitPushRequestRecord {
-                        expected_remote_head: if branch_creation { None } else { Some(git_oid('1')) },
-                        ..sample_git_push_request_record(push_request_id, s.session_id)
-                    };
-                    log.record_git_push_request(&push_request).unwrap();
-                    let grant = record_sample_write_grant(&log, s.session_id, capability_request_id);
-                    let attempt_repo = if attempt_repo_case_differs {
-                        git_repo("O", "N")
-                    } else {
-                        sample_git_repo()
-                    };
-                    let attempt = GitPushAttemptRecord {
-                        old_head: if branch_creation { None } else { Some(git_oid('1')) },
-                        ..git_push_attempt_record(
-                            push_attempt_id,
-                            push_request_id,
-                            capability_request_id,
-                            grant.jti,
-                            attempt_repo,
-                            "main".parse().unwrap(),
-                        )
-                    };
-                    log.record_git_push_attempt(&attempt).unwrap();
-                    if close_before_outcome {
-                        log.close_session(s.session_id, UnixMillis::from_millis(1_700_000_125))
-                            .unwrap();
-                    }
-                    log.record_git_push_outcome(&GitPushOutcomeRecord {
-                        push_request_id,
-                        push_attempt_id: Some(push_attempt_id),
-                        completed_at: UnixMillis::from_millis(1_700_000_130),
-                        result,
-                        github_status,
-                        message: "state-machine outcome",
-                    })
-                    .unwrap();
-
-                    let entries = log.list_git_pushes_for_session(s.session_id).unwrap();
-                    assert_eq!(
-                        entries,
-                        vec![GitPushAuditEntry {
-                            push_request_id,
-                            session_id: s.session_id,
-                            received_at: push_request.received_at,
-                            repo: push_request.repo,
-                            branch: push_request.branch,
-                            expected_remote_head: push_request.expected_remote_head,
-                            new_head: push_request.new_head,
-                            correlation_id: push_request.correlation_id,
-                            push_attempt_id: Some(push_attempt_id),
-                            capability_request_id: Some(capability_request_id),
-                            grant_jti: Some(grant.jti),
-                            planned_at: Some(UnixMillis::from_millis(1_700_000_120)),
-                            old_head: if branch_creation { None } else { Some(git_oid('1')) },
-                            attempted_new_head: Some(git_oid('2')),
-                            completed_at: Some(UnixMillis::from_millis(1_700_000_130)),
-                            result: Some(result),
-                            github_status,
-                            message: Some("state-machine outcome".into()),
-                            resolution: None,
-                        }]
-                    );
-                }
-                GitPushAuditScript::ValidUnattempted {
-                    result,
-                    close_before_outcome,
-                    branch_creation,
-                } => {
-                    let push_request = GitPushRequestRecord {
-                        expected_remote_head: if branch_creation { None } else { Some(git_oid('1')) },
-                        ..sample_git_push_request_record(push_request_id, s.session_id)
-                    };
-                    log.record_git_push_request(&push_request).unwrap();
-                    if close_before_outcome {
-                        log.close_session(s.session_id, UnixMillis::from_millis(1_700_000_125))
-                            .unwrap();
-                    }
-                    log.record_git_push_outcome(&GitPushOutcomeRecord {
-                        push_request_id,
-                        push_attempt_id: None,
-                        completed_at: UnixMillis::from_millis(1_700_000_130),
-                        result,
-                        github_status: None,
-                        message: "state-machine outcome",
-                    })
-                    .unwrap();
-
-                    let entries = log.list_git_pushes_for_session(s.session_id).unwrap();
-                    assert_eq!(
-                        entries,
-                        vec![GitPushAuditEntry {
-                            push_request_id,
-                            session_id: s.session_id,
-                            received_at: push_request.received_at,
-                            repo: push_request.repo,
-                            branch: push_request.branch,
-                            expected_remote_head: push_request.expected_remote_head,
-                            new_head: push_request.new_head,
-                            correlation_id: push_request.correlation_id,
-                            push_attempt_id: None,
-                            capability_request_id: None,
-                            grant_jti: None,
-                            planned_at: None,
-                            old_head: None,
-                            attempted_new_head: None,
-                            completed_at: Some(UnixMillis::from_millis(1_700_000_130)),
-                            result: Some(result),
-                            github_status: None,
-                            message: Some("state-machine outcome".into()),
-                            resolution: None,
-                        }]
-                    );
-                }
-                GitPushAuditScript::RequestAfterClose => {
-                    log.close_session(s.session_id, UnixMillis::from_millis(1_700_000_090))
-                        .unwrap();
-                    assert!(log.record_git_push_request(&push_request).is_err());
-                }
-                GitPushAuditScript::AttemptBeforeRequest => {
-                    let grant = record_sample_write_grant(&log, s.session_id, capability_request_id);
-                    let err = log
-                        .record_git_push_attempt(&git_push_attempt_record(
-                            push_attempt_id,
-                            push_request_id,
-                            capability_request_id,
-                            grant.jti,
-                            sample_git_repo(),
-                            "main".parse().unwrap(),
-                        ))
-                        .unwrap_err();
-                    assert!(
-                        matches!(err, AuditError::Invariant("git push request does not exist")),
-                        "got: {err:?}"
-                    );
-                }
-                GitPushAuditScript::AttemptMissingGrant => {
-                    log.record_git_push_request(&push_request).unwrap();
-                    let err = log
-                        .record_git_push_attempt(&git_push_attempt_record(
-                            push_attempt_id,
-                            push_request_id,
-                            capability_request_id,
-                            Jti::new(),
-                            sample_git_repo(),
-                            "main".parse().unwrap(),
-                        ))
-                        .unwrap_err();
-                    assert!(
-                        matches!(err, AuditError::Invariant("git push grant does not exist")),
-                        "got: {err:?}"
-                    );
-                }
-                GitPushAuditScript::AttemptMismatchedRepo => {
-                    log.record_git_push_request(&push_request).unwrap();
-                    let grant = record_sample_write_grant(&log, s.session_id, capability_request_id);
-                    let err = log
-                        .record_git_push_attempt(&git_push_attempt_record(
-                            push_attempt_id,
-                            push_request_id,
-                            capability_request_id,
-                            grant.jti,
-                            git_repo("o", "other"),
-                            "main".parse().unwrap(),
-                        ))
-                        .unwrap_err();
-                    assert!(
-                        matches!(
-                            err,
-                            AuditError::Invariant("git push attempt repo differs from request")
-                        ),
-                        "got: {err:?}"
-                    );
-                }
-                GitPushAuditScript::AttemptMismatchedBranch => {
-                    log.record_git_push_request(&push_request).unwrap();
-                    let grant = record_sample_write_grant(&log, s.session_id, capability_request_id);
-                    let err = log
-                        .record_git_push_attempt(&git_push_attempt_record(
-                            push_attempt_id,
-                            push_request_id,
-                            capability_request_id,
-                            grant.jti,
-                            sample_git_repo(),
-                            "Main".parse().unwrap(),
-                        ))
-                        .unwrap_err();
-                    assert!(
-                        matches!(
-                            err,
-                            AuditError::Invariant("git push attempt branch differs from request")
-                        ),
-                        "got: {err:?}"
-                    );
-                }
-                GitPushAuditScript::AttemptHeadPresenceMismatch { request_has_head } => {
-                    let push_request = GitPushRequestRecord {
-                        expected_remote_head: if request_has_head { Some(git_oid('1')) } else { None },
-                        ..sample_git_push_request_record(push_request_id, s.session_id)
-                    };
-                    log.record_git_push_request(&push_request).unwrap();
-                    let grant = record_sample_write_grant(&log, s.session_id, capability_request_id);
-                    let attempt = GitPushAttemptRecord {
-                        old_head: if request_has_head { None } else { Some(git_oid('1')) },
-                        ..git_push_attempt_record(
-                            push_attempt_id,
-                            push_request_id,
-                            capability_request_id,
-                            grant.jti,
-                            sample_git_repo(),
-                            "main".parse().unwrap(),
-                        )
-                    };
-                    let err = log.record_git_push_attempt(&attempt).unwrap_err();
-                    assert!(
-                        matches!(
-                            err,
-                            AuditError::Invariant("git push attempt old head differs from request")
-                        ),
-                        "got: {err:?}"
-                    );
-                }
-                GitPushAuditScript::OutcomeWithoutRequest => {
-                    let err = log
-                        .record_git_push_outcome(&GitPushOutcomeRecord {
-                            push_request_id,
-                            push_attempt_id: None,
-                            completed_at: UnixMillis::from_millis(1_700_000_130),
-                            result: GitPushOutcomeResult::Denied,
-                            github_status: None,
-                            message: "policy denied",
-                        })
-                        .unwrap_err();
-                    assert!(matches!(err, AuditError::Sqlite(_)), "got: {err:?}");
-                }
-                GitPushAuditScript::OutcomeRequiresAttemptWithoutAttempt { result } => {
-                    log.record_git_push_request(&push_request).unwrap();
-                    let err = log
-                        .record_git_push_outcome(&GitPushOutcomeRecord {
-                            push_request_id,
-                            push_attempt_id: None,
-                            completed_at: UnixMillis::from_millis(1_700_000_130),
-                            result,
-                            github_status: None,
-                            message: "attempt required",
-                        })
-                        .unwrap_err();
-                    assert!(
-                        matches!(
-                            err,
-                            AuditError::Invariant("git push outcome result requires an attempt")
-                        ),
-                        "got: {err:?}"
-                    );
-                }
-                GitPushAuditScript::OutcomeUnexpectedAttempt { result } => {
-                    log.record_git_push_request(&push_request).unwrap();
-                    let grant = record_sample_write_grant(&log, s.session_id, capability_request_id);
-                    log.record_git_push_attempt(&git_push_attempt_record(
-                        push_attempt_id,
-                        push_request_id,
-                        capability_request_id,
-                        grant.jti,
-                        sample_git_repo(),
-                        "main".parse().unwrap(),
-                    ))
-                    .unwrap();
-                    let err = log
-                        .record_git_push_outcome(&GitPushOutcomeRecord {
-                            push_request_id,
-                            push_attempt_id: Some(push_attempt_id),
-                            completed_at: UnixMillis::from_millis(1_700_000_130),
-                            result,
-                            github_status: None,
-                            message: "attempt not expected",
-                        })
-                        .unwrap_err();
-                    assert!(
-                        matches!(
-                            err,
-                            AuditError::Invariant(
-                                "git push outcome result must not reference an attempt"
-                            )
-                        ),
-                        "got: {err:?}"
-                    );
-                }
-                GitPushAuditScript::OutcomeDifferentRequest { result } => {
-                    log.record_git_push_request(&push_request).unwrap();
-                    let second_push_request_id = RequestId::new();
-                    log.record_git_push_request(&sample_git_push_request_record(
-                        second_push_request_id,
-                        s.session_id,
-                    ))
-                    .unwrap();
-                    let grant = record_sample_write_grant(&log, s.session_id, capability_request_id);
-                    log.record_git_push_attempt(&git_push_attempt_record(
-                        push_attempt_id,
-                        push_request_id,
-                        capability_request_id,
-                        grant.jti,
-                        sample_git_repo(),
-                        "main".parse().unwrap(),
-                    ))
-                    .unwrap();
-                    let err = log
-                        .record_git_push_outcome(&GitPushOutcomeRecord {
-                            push_request_id: second_push_request_id,
-                            push_attempt_id: Some(push_attempt_id),
-                            completed_at: UnixMillis::from_millis(1_700_000_130),
-                            result,
-                            github_status: None,
-                            message: "wrong attempt",
-                        })
-                        .unwrap_err();
-                    assert!(
-                        matches!(
-                            err,
-                            AuditError::Invariant(
-                                "git push outcome attempt belongs to a different request"
-                            )
-                        ),
-                        "got: {err:?}"
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn get_git_push_returns_none_when_request_missing() {
-        let log = AuditLog::open_in_memory().unwrap();
-        assert!(log.get_git_push(RequestId::new()).unwrap().is_none());
-    }
-
-    #[test]
-    fn get_git_push_returns_request_only_view_before_attempt() {
-        let log = AuditLog::open_in_memory().unwrap();
-        let s = sample_session();
-        log.open_session(&s).unwrap();
-        let push_request_id = RequestId::new();
-        log.record_git_push_request(&sample_git_push_request_record(
-            push_request_id,
-            s.session_id,
-        ))
-        .unwrap();
-
-        let entry = log.get_git_push(push_request_id).unwrap().unwrap();
-        assert_eq!(entry.push_request_id, push_request_id);
-        assert_eq!(entry.session_id, s.session_id);
-        assert_eq!(entry.push_attempt_id, None);
-        assert_eq!(entry.result, None);
-        assert_eq!(entry.completed_at, None);
-    }
-
-    #[test]
-    fn get_git_push_returns_full_view_after_outcome() {
-        let log = AuditLog::open_in_memory().unwrap();
-        let s = sample_session();
-        log.open_session(&s).unwrap();
-        let push_request_id = RequestId::new();
-        log.record_git_push_request(&sample_git_push_request_record(
-            push_request_id,
-            s.session_id,
-        ))
-        .unwrap();
-        log.record_git_push_outcome(&GitPushOutcomeRecord {
-            push_request_id,
-            push_attempt_id: None,
             completed_at: UnixMillis::from_millis(1_700_000_130),
             result: GitPushOutcomeResult::Staged,
             github_status: None,
             message: "queued for review",
         })
         .unwrap();
-
-        let entry = log.get_git_push(push_request_id).unwrap().unwrap();
-        assert_eq!(entry.result, Some(GitPushOutcomeResult::Staged));
-        assert_eq!(
-            entry.completed_at,
-            Some(UnixMillis::from_millis(1_700_000_130))
-        );
-        assert_eq!(entry.message.as_deref(), Some("queued for review"));
     }
 
-    /// The SQL `result` column stores the same strings produced by the
-    /// `Serialize` impl. Pin them so a future serde rename can't silently
-    /// orphan existing audit rows.
-    #[test]
-    fn outcome_result_sql_strings_match_serde_form() {
-        let variants = [
-            GitPushOutcomeResult::Denied,
-            GitPushOutcomeResult::ValidationFailed,
-            GitPushOutcomeResult::Staged,
-            GitPushOutcomeResult::Pushed,
-            GitPushOutcomeResult::LeaseRejected,
-            GitPushOutcomeResult::PushRejected,
-            GitPushOutcomeResult::PushFailed,
-            GitPushOutcomeResult::AuditFailedAfterPush,
-        ];
-        for v in variants {
-            let json = serde_json::to_value(v).unwrap();
-            assert_eq!(json, serde_json::Value::String(v.as_str().to_string()));
-            let back: GitPushOutcomeResult = serde_json::from_value(json).unwrap();
-            assert_eq!(back, v);
+    fn sample_promote_mint_audit() -> PromoteMintAudit {
+        PromoteMintAudit {
+            jti: Jti::new(),
+            github_app_id: 42,
+            issued_at: UnixMillis::from_millis(1_700_000_190),
+            expires_at: UnixMillis::from_millis(1_700_000_490),
         }
     }
+
+    // ---- request / outcome scaffolding still under test --------------------
 
     #[test]
     fn git_push_request_requires_open_session_but_outcome_can_land_after_close() {
@@ -1574,7 +1294,6 @@ mod tests {
 
         log.record_git_push_outcome(&GitPushOutcomeRecord {
             push_request_id,
-            push_attempt_id: None,
             completed_at: UnixMillis::from_millis(1_700_000_130),
             result: GitPushOutcomeResult::ValidationFailed,
             github_status: None,
@@ -1584,174 +1303,11 @@ mod tests {
     }
 
     #[test]
-    fn git_push_attempt_requires_matching_contents_write_grant() {
-        let log = AuditLog::open_in_memory().unwrap();
-        let s = sample_session();
-        log.open_session(&s).unwrap();
-        let push_request_id = RequestId::new();
-        log.record_git_push_request(&sample_git_push_request_record(
-            push_request_id,
-            s.session_id,
-        ))
-        .unwrap();
-
-        let missing_grant = log
-            .record_git_push_attempt(&GitPushAttemptRecord {
-                push_attempt_id: RequestId::new(),
-                push_request_id,
-                capability_request_id: RequestId::new(),
-                grant_jti: Jti::new(),
-                planned_at: UnixMillis::from_millis(1_700_000_120),
-                repo: sample_git_repo(),
-                branch: "main".parse().unwrap(),
-                old_head: Some(git_oid('1')),
-                new_head: git_oid('2'),
-            })
-            .unwrap_err();
-        assert!(
-            matches!(
-                missing_grant,
-                AuditError::Invariant("git push grant does not exist")
-            ),
-            "got: {missing_grant:?}"
-        );
-
-        let capability_request_id = RequestId::new();
-        let other_repo = RepoRef {
-            owner: "o".into(),
-            name: "other".into(),
-        };
-        let other_request = CapabilityRequest::GitHub(GitHubRequest::Contents {
-            access: GitHubAccess::Write,
-            repo: other_repo.clone(),
-        });
-        let other_scope = GrantedScope::GitHub(GitHubGrantedScope {
-            repository: other_repo,
-            permissions: GitHubPermissions {
-                contents: Some(GitHubAccess::Write),
-                metadata: Some(MetadataAccess::Read),
-                ..Default::default()
-            },
-        });
-        pre_mint(
-            &log,
-            capability_request_id,
-            s.session_id,
-            &other_request,
-            &PolicyDecision::Grant {
-                scope: other_scope.clone(),
-                ttl: TtlSeconds::new(300).unwrap(),
-            },
-            UnixMillis::from_millis(1_700_000_110),
-        )
-        .unwrap();
-        let wrong_repo_grant = CredentialGrant {
-            jti: Jti::new(),
-            request_id: capability_request_id,
-            session_id: s.session_id,
-            github_app_id: Some(42),
-            scope: other_scope,
-            issued_at: UnixMillis::from_millis(1_700_000_110),
-            expires_at: UnixMillis::from_millis(1_700_000_410),
-        };
-        log.record_grant(&wrong_repo_grant).unwrap();
-
-        let wrong_repo = log
-            .record_git_push_attempt(&GitPushAttemptRecord {
-                push_attempt_id: RequestId::new(),
-                push_request_id,
-                capability_request_id,
-                grant_jti: wrong_repo_grant.jti,
-                planned_at: UnixMillis::from_millis(1_700_000_120),
-                repo: sample_git_repo(),
-                branch: "main".parse().unwrap(),
-                old_head: Some(git_oid('1')),
-                new_head: git_oid('2'),
-            })
-            .unwrap_err();
-        assert!(
-            matches!(
-                wrong_repo,
-                AuditError::Invariant(
-                    "git push grant is not contents:write for the requested repo"
-                )
-            ),
-            "got: {wrong_repo:?}"
-        );
-    }
-
-    #[test]
-    fn git_push_outcome_enforces_attempt_requirement() {
-        let log = AuditLog::open_in_memory().unwrap();
-        let s = sample_session();
-        log.open_session(&s).unwrap();
-        let push_request_id = RequestId::new();
-        log.record_git_push_request(&sample_git_push_request_record(
-            push_request_id,
-            s.session_id,
-        ))
-        .unwrap();
-
-        let pushed_without_attempt = log
-            .record_git_push_outcome(&GitPushOutcomeRecord {
-                push_request_id,
-                push_attempt_id: None,
-                completed_at: UnixMillis::from_millis(1_700_000_130),
-                result: GitPushOutcomeResult::Pushed,
-                github_status: None,
-                message: "pushed",
-            })
-            .unwrap_err();
-        assert!(
-            matches!(
-                pushed_without_attempt,
-                AuditError::Invariant("git push outcome result requires an attempt")
-            ),
-            "got: {pushed_without_attempt:?}"
-        );
-
-        let capability_request_id = RequestId::new();
-        let grant = record_sample_write_grant(&log, s.session_id, capability_request_id);
-        let push_attempt_id = RequestId::new();
-        log.record_git_push_attempt(&GitPushAttemptRecord {
-            push_attempt_id,
-            push_request_id,
-            capability_request_id,
-            grant_jti: grant.jti,
-            planned_at: UnixMillis::from_millis(1_700_000_120),
-            repo: sample_git_repo(),
-            branch: "main".parse().unwrap(),
-            old_head: Some(git_oid('1')),
-            new_head: git_oid('2'),
-        })
-        .unwrap();
-
-        let denied_with_attempt = log
-            .record_git_push_outcome(&GitPushOutcomeRecord {
-                push_request_id,
-                push_attempt_id: Some(push_attempt_id),
-                completed_at: UnixMillis::from_millis(1_700_000_130),
-                result: GitPushOutcomeResult::Denied,
-                github_status: None,
-                message: "policy denied",
-            })
-            .unwrap_err();
-        assert!(
-            matches!(
-                denied_with_attempt,
-                AuditError::Invariant("git push outcome result must not reference an attempt")
-            ),
-            "got: {denied_with_attempt:?}"
-        );
-    }
-
-    #[test]
     fn git_push_outcome_without_request_is_rejected() {
         let log = AuditLog::open_in_memory().unwrap();
         let err = log
             .record_git_push_outcome(&GitPushOutcomeRecord {
                 push_request_id: RequestId::new(),
-                push_attempt_id: None,
                 completed_at: UnixMillis::from_millis(1),
                 result: GitPushOutcomeResult::Denied,
                 github_status: None,
@@ -1767,14 +1323,14 @@ mod tests {
         );
     }
 
-    /// SQLite's `TEXT PRIMARY KEY` columns are nullable, so a corrupt
-    /// row could land with `push_attempt_id = NULL` while the other
-    /// (`NOT NULL`) attempt columns are populated. The LEFT JOIN would
-    /// still hit. The row parser must surface that as a specific
-    /// invariant error rather than silently report "no attempt" by
-    /// using the nullable PK as its presence discriminator.
     #[test]
-    fn list_surfaces_attempt_row_with_null_primary_key_as_invariant_error() {
+    fn get_git_push_returns_none_when_request_missing() {
+        let log = AuditLog::open_in_memory().unwrap();
+        assert!(log.get_git_push(RequestId::new()).unwrap().is_none());
+    }
+
+    #[test]
+    fn get_git_push_returns_request_only_view_before_outcome() {
         let log = AuditLog::open_in_memory().unwrap();
         let s = sample_session();
         log.open_session(&s).unwrap();
@@ -1784,53 +1340,111 @@ mod tests {
             s.session_id,
         ))
         .unwrap();
-        let capability_request_id = RequestId::new();
-        let grant = record_sample_write_grant(&log, s.session_id, capability_request_id);
 
-        log.with_conn_mut(|c| {
-            c.execute(
-                "INSERT INTO git_push_attempt \
-                 (push_attempt_id, push_request_id, capability_request_id, grant_jti, planned_at, repo, branch, old_head, new_head) \
-                 VALUES (NULL, ?1, ?2, ?3, ?4, 'o/n', 'main', ?5, ?6)",
-                rusqlite::params![
-                    push_request_id.as_uuid().to_string(),
-                    capability_request_id.as_uuid().to_string(),
-                    grant.jti.as_uuid().to_string(),
-                    1_700_000_120_i64,
-                    git_oid('1').as_str(),
-                    git_oid('2').as_str(),
-                ],
-            )?;
-            Ok(())
-        })
-        .unwrap();
-
-        let err = log.list_git_pushes_for_session(s.session_id).unwrap_err();
-        assert!(
-            matches!(
-                err,
-                AuditError::Invariant("Git push audit row: attempt id missing or invalid")
-            ),
-            "got: {err:?}"
-        );
+        let entry = log.get_git_push(push_request_id).unwrap().unwrap();
+        assert_eq!(entry.push_request_id, push_request_id);
+        assert_eq!(entry.session_id, s.session_id);
+        assert_eq!(entry.result, None);
+        assert_eq!(entry.completed_at, None);
+        assert_eq!(entry.resolution, None);
     }
 
-    fn record_staged_request(log: &AuditLog, push_request_id: RequestId, session_id: SessionId) {
-        log.record_git_push_request(&sample_git_push_request_record(push_request_id, session_id))
-            .unwrap();
+    #[test]
+    fn get_git_push_returns_full_view_after_outcome() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+        let push_request_id = RequestId::new();
+        log.record_git_push_request(&sample_git_push_request_record(
+            push_request_id,
+            s.session_id,
+        ))
+        .unwrap();
         log.record_git_push_outcome(&GitPushOutcomeRecord {
             push_request_id,
-            push_attempt_id: None,
             completed_at: UnixMillis::from_millis(1_700_000_130),
             result: GitPushOutcomeResult::Staged,
             github_status: None,
             message: "queued for review",
         })
         .unwrap();
+
+        let entry = log.get_git_push(push_request_id).unwrap().unwrap();
+        assert_eq!(entry.result, Some(GitPushOutcomeResult::Staged));
+        assert_eq!(
+            entry.completed_at,
+            Some(UnixMillis::from_millis(1_700_000_130))
+        );
+        assert_eq!(entry.message.as_deref(), Some("queued for review"));
+    }
+
+    /// `result` strings written into the DB must match the strings the
+    /// `Serialize` impl produces. A future serde rename here would orphan
+    /// existing audit rows on disk; pin both representations together.
+    #[test]
+    fn outcome_result_sql_strings_match_serde_form() {
+        let variants = [
+            GitPushOutcomeResult::Denied,
+            GitPushOutcomeResult::ValidationFailed,
+            GitPushOutcomeResult::Staged,
+        ];
+        for v in variants {
+            let json = serde_json::to_value(v).unwrap();
+            assert_eq!(json, serde_json::Value::String(v.as_str().to_string()));
+            let back: GitPushOutcomeResult = serde_json::from_value(json).unwrap();
+            assert_eq!(back, v);
+        }
     }
 
     #[test]
-    fn record_resolution_roundtrips_via_get_git_push() {
+    fn git_push_request_roundtrips_with_correlation_id() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+        let push_request_id = RequestId::new();
+        let correlation = CorrelationId::try_new("feat-abc_123").unwrap();
+        let record = GitPushRequestRecord {
+            correlation_id: Some(correlation.clone()),
+            ..sample_git_push_request_record(push_request_id, s.session_id)
+        };
+        log.record_git_push_request(&record).unwrap();
+
+        let entry = log.get_git_push(push_request_id).unwrap().unwrap();
+        assert_eq!(entry.correlation_id, Some(correlation));
+    }
+
+    /// The CHECK constraint on `git_push_request.correlation_id` is the
+    /// belt-and-braces line of defence behind `CorrelationId::try_new`.
+    #[test]
+    fn git_push_request_correlation_id_check_constraint_rejects_invalid_bytes() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+        let push_request_id = RequestId::new();
+        let err = log
+            .with_conn_mut(|c| {
+                c.execute(
+                    "INSERT INTO git_push_request (
+                         push_request_id, session_id, received_at, repo,
+                         branch, expected_remote_head, new_head, correlation_id
+                     ) VALUES (?1, ?2, 1, 'o/n', 'main', NULL, ?3, ?4)",
+                    params![
+                        push_request_id.as_uuid().to_string(),
+                        s.session_id.as_uuid().to_string(),
+                        "a".repeat(40),
+                        "bad/slash",
+                    ],
+                )
+                .map_err(AuditError::from)
+            })
+            .unwrap_err();
+        assert!(err.to_string().contains("CHECK"), "got: {err:?}");
+    }
+
+    // ---- resolution scaffolding ---------------------------------------------
+
+    #[test]
+    fn record_resolution_roundtrips_rejected_via_get_git_push() {
         let log = AuditLog::open_in_memory().unwrap();
         let s = sample_session();
         log.open_session(&s).unwrap();
@@ -1862,18 +1476,6 @@ mod tests {
         assert_eq!(entries[0].resolution, entry.resolution);
     }
 
-    fn sample_promote_mint_audit() -> PromoteMintAudit {
-        PromoteMintAudit {
-            jti: Jti::new(),
-            github_app_id: 42,
-            issued_at: UnixMillis::from_millis(1_700_000_190),
-            expires_at: UnixMillis::from_millis(1_700_000_490),
-        }
-    }
-
-    /// `Approved` carries a `PromoteMintAudit` payload that the SQL
-    /// trigger requires to be present iff the decision is approved.
-    /// Round-trip the mint context through INSERT + LEFT JOIN read.
     #[test]
     fn record_resolution_roundtrips_approved_with_mint_payload() {
         let log = AuditLog::open_in_memory().unwrap();
@@ -1899,9 +1501,6 @@ mod tests {
         );
     }
 
-    /// A `Rejected` resolution leaves all four mint columns NULL —
-    /// reading the row back observes exactly `Rejected`, not a corrupt
-    /// `Approved` with partial mint context.
     #[test]
     fn record_resolution_rejected_persists_null_mint_columns() {
         let log = AuditLog::open_in_memory().unwrap();
@@ -1938,18 +1537,8 @@ mod tests {
             (jti, app_id, issued_at, expires_at),
             (None, None, None, None)
         );
-
-        let entry = log.get_git_push(push_request_id).unwrap().unwrap();
-        assert_eq!(
-            entry.resolution.unwrap().decision,
-            GitPushResolution::Rejected
-        );
     }
 
-    /// Trigger defence: a direct INSERT that claims `approved` without
-    /// supplying every mint column is refused. This guards against a
-    /// caller bypassing the DAO and writing the column-form direct
-    /// without the matching mint context.
     #[test]
     fn direct_insert_approved_without_mint_columns_is_rejected_by_trigger() {
         let log = AuditLog::open_in_memory().unwrap();
@@ -1977,8 +1566,6 @@ mod tests {
         );
     }
 
-    /// Mirror image of the previous trigger guard: a `rejected` row
-    /// carrying mint context is refused.
     #[test]
     fn direct_insert_rejected_with_mint_columns_is_rejected_by_trigger() {
         let log = AuditLog::open_in_memory().unwrap();
@@ -2027,7 +1614,6 @@ mod tests {
         .unwrap();
         log.record_git_push_outcome(&GitPushOutcomeRecord {
             push_request_id,
-            push_attempt_id: None,
             completed_at: UnixMillis::from_millis(1_700_000_130),
             result: GitPushOutcomeResult::Denied,
             github_status: None,
@@ -2173,10 +1759,6 @@ mod tests {
         );
     }
 
-    /// Pin the mapping between the in-memory variant and the SQL
-    /// `decision` string. The CHECK constraint on `git_push_resolution`
-    /// only admits `'rejected'` and `'approved'`, so an accidental
-    /// rename here would orphan existing audit rows.
     #[test]
     fn resolution_decision_sql_strings_match_variant_kind() {
         assert_eq!(GitPushResolution::Rejected.kind_str(), "rejected");
@@ -2186,51 +1768,836 @@ mod tests {
         );
     }
 
-    #[test]
-    fn git_push_request_roundtrips_with_correlation_id() {
-        let log = AuditLog::open_in_memory().unwrap();
+    // ---- approve-attempt state machine --------------------------------------
+
+    fn open_with_staged_request(log: &AuditLog, push_request_id: RequestId) -> SessionId {
         let s = sample_session();
         log.open_session(&s).unwrap();
-        let push_request_id = RequestId::new();
-        let correlation = CorrelationId::try_new("feat-abc_123").unwrap();
-        let record = GitPushRequestRecord {
-            correlation_id: Some(correlation.clone()),
-            ..sample_git_push_request_record(push_request_id, s.session_id)
-        };
-        log.record_git_push_request(&record).unwrap();
-
-        let entry = log.get_git_push(push_request_id).unwrap().unwrap();
-        assert_eq!(entry.correlation_id, Some(correlation));
+        record_staged_request(log, push_request_id, s.session_id);
+        s.session_id
     }
 
-    /// The CHECK constraint on `git_push_request.correlation_id` is the
-    /// belt-and-braces line of defence. The DAO is the parse-don't-
-    /// validate boundary today, but a future code path that writes the
-    /// row directly must not be able to land bytes outside the allowed
-    /// class.
     #[test]
-    fn git_push_request_correlation_id_check_constraint_rejects_invalid_bytes() {
+    fn start_approve_attempt_requires_staged_outcome() {
         let log = AuditLog::open_in_memory().unwrap();
         let s = sample_session();
         log.open_session(&s).unwrap();
         let push_request_id = RequestId::new();
+        log.record_git_push_request(&sample_git_push_request_record(
+            push_request_id,
+            s.session_id,
+        ))
+        .unwrap();
+        // No outcome row yet — start_approve_attempt must refuse.
+
+        let err = log
+            .start_approve_attempt(
+                ApproveAttemptId::new(),
+                push_request_id,
+                "alice",
+                UnixMillis::from_millis(1_700_000_200),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                AuditError::Invariant("approve attempt requires staged outcome")
+            ),
+            "got: {err:?}"
+        );
+
+        // A `Denied` outcome (not `Staged`) is also insufficient.
+        log.record_git_push_outcome(&GitPushOutcomeRecord {
+            push_request_id,
+            completed_at: UnixMillis::from_millis(1_700_000_130),
+            result: GitPushOutcomeResult::Denied,
+            github_status: None,
+            message: "policy denied",
+        })
+        .unwrap();
+        let err = log
+            .start_approve_attempt(
+                ApproveAttemptId::new(),
+                push_request_id,
+                "alice",
+                UnixMillis::from_millis(1_700_000_201),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                AuditError::Invariant("approve attempt requires staged outcome")
+            ),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn start_approve_attempt_rejects_empty_operator() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let push_request_id = RequestId::new();
+        let _session = open_with_staged_request(&log, push_request_id);
+
+        let err = log
+            .start_approve_attempt(
+                ApproveAttemptId::new(),
+                push_request_id,
+                "",
+                UnixMillis::from_millis(1_700_000_200),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                AuditError::Invariant("approve attempt operator must not be empty")
+            ),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn start_approve_attempt_roundtrips_as_started_state() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let push_request_id = RequestId::new();
+        let _session = open_with_staged_request(&log, push_request_id);
+        let attempt_id = ApproveAttemptId::new();
+        log.start_approve_attempt(
+            attempt_id,
+            push_request_id,
+            "alice",
+            UnixMillis::from_millis(1_700_000_200),
+        )
+        .unwrap();
+
+        let attempts = log.approve_attempts_for_push(push_request_id).unwrap();
+        assert_eq!(attempts.len(), 1);
+        let attempt = &attempts[0];
+        assert_eq!(attempt.attempt_id, attempt_id);
+        assert_eq!(attempt.push_request_id, push_request_id);
+        assert_eq!(attempt.operator, "alice");
+        assert_eq!(attempt.started_at, UnixMillis::from_millis(1_700_000_200));
+        assert_eq!(attempt.state, GitPushApproveAttemptState::Started);
+    }
+
+    #[test]
+    fn mark_attempt_uncertain_succeeds_from_started() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let push_request_id = RequestId::new();
+        let _session = open_with_staged_request(&log, push_request_id);
+        let attempt_id = ApproveAttemptId::new();
+        log.start_approve_attempt(
+            attempt_id,
+            push_request_id,
+            "alice",
+            UnixMillis::from_millis(1_700_000_200),
+        )
+        .unwrap();
+        let mint = sample_promote_mint_audit();
+        log.mark_attempt_uncertain(attempt_id, mint).unwrap();
+
+        let attempts = log.approve_attempts_for_push(push_request_id).unwrap();
+        assert_eq!(
+            attempts[0].state,
+            GitPushApproveAttemptState::Uncertain { mint }
+        );
+    }
+
+    #[test]
+    fn mark_attempt_uncertain_rejects_already_uncertain() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let push_request_id = RequestId::new();
+        let _session = open_with_staged_request(&log, push_request_id);
+        let attempt_id = ApproveAttemptId::new();
+        log.start_approve_attempt(
+            attempt_id,
+            push_request_id,
+            "alice",
+            UnixMillis::from_millis(1_700_000_200),
+        )
+        .unwrap();
+        let mint = sample_promote_mint_audit();
+        log.mark_attempt_uncertain(attempt_id, mint).unwrap();
+
+        // Second attempt to mark uncertain must surface an invariant.
+        let err = log.mark_attempt_uncertain(attempt_id, mint).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                AuditError::Invariant("approve attempt is not in 'started' state")
+            ),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn complete_attempt_succeeded_writes_resolution_in_same_tx() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let push_request_id = RequestId::new();
+        let _session = open_with_staged_request(&log, push_request_id);
+        let attempt_id = ApproveAttemptId::new();
+        log.start_approve_attempt(
+            attempt_id,
+            push_request_id,
+            "alice",
+            UnixMillis::from_millis(1_700_000_200),
+        )
+        .unwrap();
+        let mint = sample_promote_mint_audit();
+        log.mark_attempt_uncertain(attempt_id, mint).unwrap();
+        let new_app_tip = git_oid('a');
+        log.complete_attempt_succeeded(
+            attempt_id,
+            &new_app_tip,
+            "alice",
+            "looks good",
+            UnixMillis::from_millis(1_700_000_220),
+        )
+        .unwrap();
+
+        let attempts = log.approve_attempts_for_push(push_request_id).unwrap();
+        assert_eq!(
+            attempts[0].state,
+            GitPushApproveAttemptState::Resolved {
+                outcome: GitPushApproveAttemptOutcome::Succeeded {
+                    new_app_tip: new_app_tip.clone(),
+                },
+                mint: Some(mint),
+                completed_at: UnixMillis::from_millis(1_700_000_220),
+            }
+        );
+
+        let entry = log.get_git_push(push_request_id).unwrap().unwrap();
+        let resolution = entry.resolution.expect("resolution must be present");
+        assert_eq!(resolution.decision, GitPushResolution::Approved(mint));
+        assert_eq!(resolution.operator, "alice");
+        assert_eq!(resolution.reason, "looks good");
+        assert_eq!(
+            resolution.decided_at,
+            UnixMillis::from_millis(1_700_000_220)
+        );
+    }
+
+    #[test]
+    fn complete_attempt_succeeded_rejects_when_not_uncertain() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let push_request_id = RequestId::new();
+        let _session = open_with_staged_request(&log, push_request_id);
+        let attempt_id = ApproveAttemptId::new();
+        log.start_approve_attempt(
+            attempt_id,
+            push_request_id,
+            "alice",
+            UnixMillis::from_millis(1_700_000_200),
+        )
+        .unwrap();
+
+        // Still 'started' — succeeded is illegal from this state.
+        let err = log
+            .complete_attempt_succeeded(
+                attempt_id,
+                &git_oid('a'),
+                "alice",
+                "looks good",
+                UnixMillis::from_millis(1_700_000_220),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                AuditError::Invariant("approve attempt is not in 'uncertain' state")
+            ),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn complete_attempt_pre_patch_failure_from_started() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let push_request_id = RequestId::new();
+        let _session = open_with_staged_request(&log, push_request_id);
+        let attempt_id = ApproveAttemptId::new();
+        log.start_approve_attempt(
+            attempt_id,
+            push_request_id,
+            "alice",
+            UnixMillis::from_millis(1_700_000_200),
+        )
+        .unwrap();
+        log.complete_attempt_pre_patch_failure(
+            attempt_id,
+            "mint failed",
+            UnixMillis::from_millis(1_700_000_210),
+        )
+        .unwrap();
+
+        let attempts = log.approve_attempts_for_push(push_request_id).unwrap();
+        assert_eq!(
+            attempts[0].state,
+            GitPushApproveAttemptState::Resolved {
+                outcome: GitPushApproveAttemptOutcome::PrePatchFailure {
+                    detail: "mint failed".into(),
+                },
+                mint: None,
+                completed_at: UnixMillis::from_millis(1_700_000_210),
+            }
+        );
+        // No git_push_resolution row was written.
+        assert!(
+            log.get_git_push(push_request_id)
+                .unwrap()
+                .unwrap()
+                .resolution
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn complete_attempt_pre_patch_failure_from_uncertain_preserves_mint() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let push_request_id = RequestId::new();
+        let _session = open_with_staged_request(&log, push_request_id);
+        let attempt_id = ApproveAttemptId::new();
+        log.start_approve_attempt(
+            attempt_id,
+            push_request_id,
+            "alice",
+            UnixMillis::from_millis(1_700_000_200),
+        )
+        .unwrap();
+        let mint = sample_promote_mint_audit();
+        log.mark_attempt_uncertain(attempt_id, mint).unwrap();
+        log.complete_attempt_pre_patch_failure(
+            attempt_id,
+            "patch send aborted",
+            UnixMillis::from_millis(1_700_000_220),
+        )
+        .unwrap();
+
+        let attempts = log.approve_attempts_for_push(push_request_id).unwrap();
+        assert_eq!(
+            attempts[0].state,
+            GitPushApproveAttemptState::Resolved {
+                outcome: GitPushApproveAttemptOutcome::PrePatchFailure {
+                    detail: "patch send aborted".into(),
+                },
+                mint: Some(mint),
+                completed_at: UnixMillis::from_millis(1_700_000_220),
+            }
+        );
+    }
+
+    #[test]
+    fn complete_attempt_post_patch_failure_only_from_uncertain() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let push_request_id = RequestId::new();
+        let _session = open_with_staged_request(&log, push_request_id);
+        let attempt_id = ApproveAttemptId::new();
+        log.start_approve_attempt(
+            attempt_id,
+            push_request_id,
+            "alice",
+            UnixMillis::from_millis(1_700_000_200),
+        )
+        .unwrap();
+        // From 'started' must fail.
+        let err = log
+            .complete_attempt_post_patch_failure(
+                attempt_id,
+                "boom",
+                UnixMillis::from_millis(1_700_000_210),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                AuditError::Invariant(
+                    "approve attempt is not in a state that admits this failure outcome"
+                )
+            ),
+            "got: {err:?}"
+        );
+
+        // After mark_uncertain it must succeed.
+        let mint = sample_promote_mint_audit();
+        log.mark_attempt_uncertain(attempt_id, mint).unwrap();
+        log.complete_attempt_post_patch_failure(
+            attempt_id,
+            "transport drop",
+            UnixMillis::from_millis(1_700_000_220),
+        )
+        .unwrap();
+        let attempts = log.approve_attempts_for_push(push_request_id).unwrap();
+        assert_eq!(
+            attempts[0].state,
+            GitPushApproveAttemptState::Resolved {
+                outcome: GitPushApproveAttemptOutcome::PostPatchFailure {
+                    detail: "transport drop".into(),
+                },
+                mint: Some(mint),
+                completed_at: UnixMillis::from_millis(1_700_000_220),
+            }
+        );
+    }
+
+    #[test]
+    fn complete_attempt_failure_rejects_empty_detail() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let push_request_id = RequestId::new();
+        let _session = open_with_staged_request(&log, push_request_id);
+        let attempt_id = ApproveAttemptId::new();
+        log.start_approve_attempt(
+            attempt_id,
+            push_request_id,
+            "alice",
+            UnixMillis::from_millis(1_700_000_200),
+        )
+        .unwrap();
+        let err = log
+            .complete_attempt_pre_patch_failure(
+                attempt_id,
+                "",
+                UnixMillis::from_millis(1_700_000_210),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                AuditError::Invariant("approve attempt failure detail must not be empty")
+            ),
+            "got: {err:?}"
+        );
+    }
+
+    /// The `git_push_approve_attempt_forward_only` trigger refuses any
+    /// transition that isn't one of the three legal arrows.
+    #[test]
+    fn forward_only_trigger_blocks_reverting_resolved_to_started() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let push_request_id = RequestId::new();
+        let _session = open_with_staged_request(&log, push_request_id);
+        let attempt_id = ApproveAttemptId::new();
+        log.start_approve_attempt(
+            attempt_id,
+            push_request_id,
+            "alice",
+            UnixMillis::from_millis(1_700_000_200),
+        )
+        .unwrap();
+        log.complete_attempt_pre_patch_failure(
+            attempt_id,
+            "no go",
+            UnixMillis::from_millis(1_700_000_210),
+        )
+        .unwrap();
+
+        // Try to UPDATE the row back to 'started' by raw SQL — trigger
+        // must abort.
         let err = log
             .with_conn_mut(|c| {
-                c.execute(
-                    "INSERT INTO git_push_request (
-                         push_request_id, session_id, received_at, repo,
-                         branch, expected_remote_head, new_head, correlation_id
-                     ) VALUES (?1, ?2, 1, 'o/n', 'main', NULL, ?3, ?4)",
-                    params![
-                        push_request_id.as_uuid().to_string(),
-                        s.session_id.as_uuid().to_string(),
-                        "a".repeat(40),
-                        "bad/slash",
-                    ],
-                )
-                .map_err(AuditError::from)
+                Ok(c.execute(
+                    "UPDATE git_push_approve_attempt
+                        SET state = 'started',
+                            outcome = NULL,
+                            completed_at = NULL,
+                            failure_detail = NULL
+                      WHERE attempt_id = ?1",
+                    params![attempt_id.as_uuid().to_string()],
+                ))
             })
+            .unwrap()
             .unwrap_err();
-        assert!(err.to_string().contains("CHECK"), "got: {err:?}");
+        assert!(
+            err.to_string()
+                .contains("illegal git_push_approve_attempt state transition"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// The forward-only trigger also blocks `started → resolved(succeeded)`
+    /// jumping past the mandatory uncertain step.
+    #[test]
+    fn forward_only_trigger_blocks_started_to_succeeded() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let push_request_id = RequestId::new();
+        let _session = open_with_staged_request(&log, push_request_id);
+        let attempt_id = ApproveAttemptId::new();
+        log.start_approve_attempt(
+            attempt_id,
+            push_request_id,
+            "alice",
+            UnixMillis::from_millis(1_700_000_200),
+        )
+        .unwrap();
+
+        let err = log
+            .with_conn_mut(|c| {
+                Ok(c.execute(
+                    "UPDATE git_push_approve_attempt
+                        SET state = 'resolved',
+                            outcome = 'succeeded',
+                            new_app_tip = ?2,
+                            completed_at = ?3
+                      WHERE attempt_id = ?1",
+                    params![
+                        attempt_id.as_uuid().to_string(),
+                        git_oid('a').as_str(),
+                        1_700_000_210_i64,
+                    ],
+                ))
+            })
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("illegal git_push_approve_attempt state transition"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// `git_push_approve_attempt_mint_immutable` refuses any UPDATE that
+    /// changes a mint column once it has been written.
+    #[test]
+    fn mint_immutable_trigger_rejects_changed_mint_jti() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let push_request_id = RequestId::new();
+        let _session = open_with_staged_request(&log, push_request_id);
+        let attempt_id = ApproveAttemptId::new();
+        log.start_approve_attempt(
+            attempt_id,
+            push_request_id,
+            "alice",
+            UnixMillis::from_millis(1_700_000_200),
+        )
+        .unwrap();
+        let mint = sample_promote_mint_audit();
+        log.mark_attempt_uncertain(attempt_id, mint).unwrap();
+
+        let err = log
+            .with_conn_mut(|c| {
+                Ok(c.execute(
+                    "UPDATE git_push_approve_attempt
+                        SET mint_jti = ?2
+                      WHERE attempt_id = ?1",
+                    params![
+                        attempt_id.as_uuid().to_string(),
+                        Jti::new().as_uuid().to_string(),
+                    ],
+                ))
+            })
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("git_push_approve_attempt mint context is immutable once set"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn approve_attempts_for_push_returns_in_started_at_order() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let push_request_id = RequestId::new();
+        let _session = open_with_staged_request(&log, push_request_id);
+        let first = ApproveAttemptId::new();
+        let second = ApproveAttemptId::new();
+        let third = ApproveAttemptId::new();
+        log.start_approve_attempt(
+            second,
+            push_request_id,
+            "alice",
+            UnixMillis::from_millis(1_700_000_220),
+        )
+        .unwrap();
+        log.complete_attempt_pre_patch_failure(
+            second,
+            "first failure",
+            UnixMillis::from_millis(1_700_000_221),
+        )
+        .unwrap();
+        log.start_approve_attempt(
+            first,
+            push_request_id,
+            "alice",
+            UnixMillis::from_millis(1_700_000_210),
+        )
+        .unwrap();
+        log.complete_attempt_pre_patch_failure(
+            first,
+            "earlier",
+            UnixMillis::from_millis(1_700_000_211),
+        )
+        .unwrap();
+        log.start_approve_attempt(
+            third,
+            push_request_id,
+            "alice",
+            UnixMillis::from_millis(1_700_000_230),
+        )
+        .unwrap();
+
+        let ids: Vec<ApproveAttemptId> = log
+            .approve_attempts_for_push(push_request_id)
+            .unwrap()
+            .into_iter()
+            .map(|a| a.attempt_id)
+            .collect();
+        assert_eq!(ids, vec![first, second, third]);
+    }
+
+    #[test]
+    fn reject_blocker_for_push_returns_none_when_no_attempts() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let push_request_id = RequestId::new();
+        let _session = open_with_staged_request(&log, push_request_id);
+
+        assert_eq!(log.reject_blocker_for_push(push_request_id).unwrap(), None);
+    }
+
+    #[test]
+    fn reject_blocker_for_push_ignores_pre_patch_failure_only() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let push_request_id = RequestId::new();
+        let _session = open_with_staged_request(&log, push_request_id);
+        let attempt_id = ApproveAttemptId::new();
+        log.start_approve_attempt(
+            attempt_id,
+            push_request_id,
+            "alice",
+            UnixMillis::from_millis(1_700_000_200),
+        )
+        .unwrap();
+        log.complete_attempt_pre_patch_failure(
+            attempt_id,
+            "nope",
+            UnixMillis::from_millis(1_700_000_210),
+        )
+        .unwrap();
+
+        assert_eq!(log.reject_blocker_for_push(push_request_id).unwrap(), None);
+    }
+
+    #[test]
+    fn reject_blocker_for_push_flags_started_attempt() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let push_request_id = RequestId::new();
+        let _session = open_with_staged_request(&log, push_request_id);
+        let attempt_id = ApproveAttemptId::new();
+        log.start_approve_attempt(
+            attempt_id,
+            push_request_id,
+            "alice",
+            UnixMillis::from_millis(1_700_000_200),
+        )
+        .unwrap();
+
+        assert_eq!(
+            log.reject_blocker_for_push(push_request_id).unwrap(),
+            Some(RejectBlocker::AttemptInFlight { attempt_id })
+        );
+    }
+
+    #[test]
+    fn reject_blocker_for_push_flags_uncertain_attempt() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let push_request_id = RequestId::new();
+        let _session = open_with_staged_request(&log, push_request_id);
+        let attempt_id = ApproveAttemptId::new();
+        log.start_approve_attempt(
+            attempt_id,
+            push_request_id,
+            "alice",
+            UnixMillis::from_millis(1_700_000_200),
+        )
+        .unwrap();
+        let mint = sample_promote_mint_audit();
+        log.mark_attempt_uncertain(attempt_id, mint).unwrap();
+
+        assert_eq!(
+            log.reject_blocker_for_push(push_request_id).unwrap(),
+            Some(RejectBlocker::AttemptInFlight { attempt_id })
+        );
+    }
+
+    #[test]
+    fn reject_blocker_for_push_flags_already_approved() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let push_request_id = RequestId::new();
+        let _session = open_with_staged_request(&log, push_request_id);
+        let attempt_id = ApproveAttemptId::new();
+        log.start_approve_attempt(
+            attempt_id,
+            push_request_id,
+            "alice",
+            UnixMillis::from_millis(1_700_000_200),
+        )
+        .unwrap();
+        let mint = sample_promote_mint_audit();
+        log.mark_attempt_uncertain(attempt_id, mint).unwrap();
+        log.complete_attempt_succeeded(
+            attempt_id,
+            &git_oid('a'),
+            "alice",
+            "looks good",
+            UnixMillis::from_millis(1_700_000_220),
+        )
+        .unwrap();
+
+        assert_eq!(
+            log.reject_blocker_for_push(push_request_id).unwrap(),
+            Some(RejectBlocker::AlreadyApproved { attempt_id })
+        );
+    }
+
+    #[test]
+    fn reject_blocker_for_push_flags_post_patch_uncertain() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let push_request_id = RequestId::new();
+        let _session = open_with_staged_request(&log, push_request_id);
+        let attempt_id = ApproveAttemptId::new();
+        log.start_approve_attempt(
+            attempt_id,
+            push_request_id,
+            "alice",
+            UnixMillis::from_millis(1_700_000_200),
+        )
+        .unwrap();
+        let mint = sample_promote_mint_audit();
+        log.mark_attempt_uncertain(attempt_id, mint).unwrap();
+        log.complete_attempt_post_patch_failure(
+            attempt_id,
+            "transport drop",
+            UnixMillis::from_millis(1_700_000_220),
+        )
+        .unwrap();
+
+        assert_eq!(
+            log.reject_blocker_for_push(push_request_id).unwrap(),
+            Some(RejectBlocker::PostPatchUncertain { attempt_id })
+        );
+    }
+
+    /// Property test: any sequence of legal DAO calls leaves the
+    /// attempt in a state that the row parser can round-trip.
+    ///
+    /// We model "any legal sequence" as one of four scripts. Each script
+    /// drives the attempt to a state explicitly, exercising every arrow
+    /// of the state machine. The invariant: round-tripping the row
+    /// through `approve_attempts_for_push` produces a state value that
+    /// equals the one we expect.
+    #[derive(Clone, Debug)]
+    enum AttemptScript {
+        Started,
+        StartedToPrePatchFailure,
+        Uncertain,
+        UncertainToSucceeded,
+        UncertainToPrePatchFailure,
+        UncertainToPostPatchFailure,
+    }
+
+    fn attempt_script_strategy() -> impl Strategy<Value = AttemptScript> {
+        prop_oneof![
+            Just(AttemptScript::Started),
+            Just(AttemptScript::StartedToPrePatchFailure),
+            Just(AttemptScript::Uncertain),
+            Just(AttemptScript::UncertainToSucceeded),
+            Just(AttemptScript::UncertainToPrePatchFailure),
+            Just(AttemptScript::UncertainToPostPatchFailure),
+        ]
+    }
+
+    proptest! {
+        #[test]
+        fn approve_attempt_state_machine_roundtrips_through_dao(
+            script in attempt_script_strategy(),
+        ) {
+            let log = AuditLog::open_in_memory().unwrap();
+            let push_request_id = RequestId::new();
+            let _session = open_with_staged_request(&log, push_request_id);
+            let attempt_id = ApproveAttemptId::new();
+            let started_at = UnixMillis::from_millis(1_700_000_200);
+            log.start_approve_attempt(attempt_id, push_request_id, "alice", started_at)
+                .unwrap();
+
+            let mint = sample_promote_mint_audit();
+            let new_app_tip = git_oid('a');
+            let expected_state = match script {
+                AttemptScript::Started => GitPushApproveAttemptState::Started,
+                AttemptScript::StartedToPrePatchFailure => {
+                    log.complete_attempt_pre_patch_failure(
+                        attempt_id,
+                        "no go",
+                        UnixMillis::from_millis(1_700_000_210),
+                    )
+                    .unwrap();
+                    GitPushApproveAttemptState::Resolved {
+                        outcome: GitPushApproveAttemptOutcome::PrePatchFailure {
+                            detail: "no go".into(),
+                        },
+                        mint: None,
+                        completed_at: UnixMillis::from_millis(1_700_000_210),
+                    }
+                }
+                AttemptScript::Uncertain => {
+                    log.mark_attempt_uncertain(attempt_id, mint).unwrap();
+                    GitPushApproveAttemptState::Uncertain { mint }
+                }
+                AttemptScript::UncertainToSucceeded => {
+                    log.mark_attempt_uncertain(attempt_id, mint).unwrap();
+                    log.complete_attempt_succeeded(
+                        attempt_id,
+                        &new_app_tip,
+                        "alice",
+                        "looks good",
+                        UnixMillis::from_millis(1_700_000_220),
+                    )
+                    .unwrap();
+                    GitPushApproveAttemptState::Resolved {
+                        outcome: GitPushApproveAttemptOutcome::Succeeded {
+                            new_app_tip: new_app_tip.clone(),
+                        },
+                        mint: Some(mint),
+                        completed_at: UnixMillis::from_millis(1_700_000_220),
+                    }
+                }
+                AttemptScript::UncertainToPrePatchFailure => {
+                    log.mark_attempt_uncertain(attempt_id, mint).unwrap();
+                    log.complete_attempt_pre_patch_failure(
+                        attempt_id,
+                        "aborted",
+                        UnixMillis::from_millis(1_700_000_220),
+                    )
+                    .unwrap();
+                    GitPushApproveAttemptState::Resolved {
+                        outcome: GitPushApproveAttemptOutcome::PrePatchFailure {
+                            detail: "aborted".into(),
+                        },
+                        mint: Some(mint),
+                        completed_at: UnixMillis::from_millis(1_700_000_220),
+                    }
+                }
+                AttemptScript::UncertainToPostPatchFailure => {
+                    log.mark_attempt_uncertain(attempt_id, mint).unwrap();
+                    log.complete_attempt_post_patch_failure(
+                        attempt_id,
+                        "transport drop",
+                        UnixMillis::from_millis(1_700_000_220),
+                    )
+                    .unwrap();
+                    GitPushApproveAttemptState::Resolved {
+                        outcome: GitPushApproveAttemptOutcome::PostPatchFailure {
+                            detail: "transport drop".into(),
+                        },
+                        mint: Some(mint),
+                        completed_at: UnixMillis::from_millis(1_700_000_220),
+                    }
+                }
+            };
+
+            let attempts = log.approve_attempts_for_push(push_request_id).unwrap();
+            prop_assert_eq!(attempts.len(), 1);
+            prop_assert_eq!(&attempts[0].state, &expected_state);
+            prop_assert_eq!(attempts[0].attempt_id, attempt_id);
+            prop_assert_eq!(attempts[0].started_at, started_at);
+        }
     }
 }
