@@ -609,7 +609,12 @@ impl GitPushResolution {
         mint_expires_at: Option<i64>,
     ) -> Result<Self, AuditError> {
         match decision {
-            "rejected" => match (mint_jti, mint_github_app_id, mint_issued_at, mint_expires_at) {
+            "rejected" => match (
+                mint_jti,
+                mint_github_app_id,
+                mint_issued_at,
+                mint_expires_at,
+            ) {
                 (None, None, None, None) => Ok(Self::Rejected),
                 _ => Err(AuditError::Invariant(
                     "Git push audit row: rejected resolution carries mint context",
@@ -619,25 +624,29 @@ impl GitPushResolution {
                 let jti_str = mint_jti.ok_or(AuditError::Invariant(
                     "Git push audit row: approved resolution missing mint jti",
                 ))?;
-                let jti = uuid::Uuid::parse_str(&jti_str).map(Jti::from_uuid).map_err(|_| {
-                    AuditError::Invariant("Git push audit row: mint jti is not a uuid")
-                })?;
+                let jti = uuid::Uuid::parse_str(&jti_str)
+                    .map(Jti::from_uuid)
+                    .map_err(|_| {
+                        AuditError::Invariant("Git push audit row: mint jti is not a uuid")
+                    })?;
                 let github_app_id_i64 = mint_github_app_id.ok_or(AuditError::Invariant(
                     "Git push audit row: approved resolution missing mint github_app_id",
                 ))?;
                 let github_app_id = u64::try_from(github_app_id_i64).map_err(|_| {
                     AuditError::Invariant("Git push audit row: mint github_app_id is negative")
                 })?;
-                let issued_at = mint_issued_at.map(UnixMillis::from_millis).ok_or(
-                    AuditError::Invariant(
-                        "Git push audit row: approved resolution missing mint issued_at",
-                    ),
-                )?;
-                let expires_at = mint_expires_at.map(UnixMillis::from_millis).ok_or(
-                    AuditError::Invariant(
-                        "Git push audit row: approved resolution missing mint expires_at",
-                    ),
-                )?;
+                let issued_at =
+                    mint_issued_at
+                        .map(UnixMillis::from_millis)
+                        .ok_or(AuditError::Invariant(
+                            "Git push audit row: approved resolution missing mint issued_at",
+                        ))?;
+                let expires_at =
+                    mint_expires_at
+                        .map(UnixMillis::from_millis)
+                        .ok_or(AuditError::Invariant(
+                            "Git push audit row: approved resolution missing mint expires_at",
+                        ))?;
                 Ok(Self::Approved(PromoteMintAudit {
                     jti,
                     github_app_id,
@@ -1925,10 +1934,16 @@ mod tests {
                 )?)
             })
             .unwrap();
-        assert_eq!((jti, app_id, issued_at, expires_at), (None, None, None, None));
+        assert_eq!(
+            (jti, app_id, issued_at, expires_at),
+            (None, None, None, None)
+        );
 
         let entry = log.get_git_push(push_request_id).unwrap().unwrap();
-        assert_eq!(entry.resolution.unwrap().decision, GitPushResolution::Rejected);
+        assert_eq!(
+            entry.resolution.unwrap().decision,
+            GitPushResolution::Rejected
+        );
     }
 
     /// Trigger defence: a direct INSERT that claims `approved` without
@@ -1951,10 +1966,7 @@ mod tests {
                          mint_jti, mint_github_app_id, mint_issued_at, mint_expires_at
                      ) VALUES (?1, ?2, 'approved', 'alice', 'looks good',
                                NULL, NULL, NULL, NULL)",
-                    params![
-                        push_request_id.as_uuid().to_string(),
-                        1_700_000_200_i64,
-                    ],
+                    params![push_request_id.as_uuid().to_string(), 1_700_000_200_i64,],
                 ))
             })
             .unwrap()

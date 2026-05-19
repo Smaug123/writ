@@ -427,11 +427,9 @@ mod tests {
         // transaction. Reopening still observes schema_version = 3.
         let current = Connection::open(db.path())
             .unwrap()
-            .query_row(
-                "SELECT MAX(version) FROM schema_version",
-                [],
-                |row| row.get::<_, i32>(0),
-            )
+            .query_row("SELECT MAX(version) FROM schema_version", [], |row| {
+                row.get::<_, i32>(0)
+            })
             .unwrap();
         assert_eq!(current, 3);
     }
