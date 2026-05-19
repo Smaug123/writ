@@ -29,9 +29,8 @@ use crate::audit::{
     GitPushResolutionRecord, PlanDecisionRecord, PreMintRecord,
 };
 use crate::core::{
-    CapabilityRequest, GITHUB_INSTALLATION_TOKEN_MAX_SECONDS, GitHubAccess, GitHubGrantedScope,
-    GitHubPermissions, GrantedScope, MetadataAccess, PolicyDecision, RequestId, SessionId,
-    SessionRecord, TtlSeconds, UnixMillis,
+    CapabilityRequest, GITHUB_INSTALLATION_TOKEN_MAX_SECONDS, GitHubAccess, GitHubRequest,
+    GrantedScope, PolicyDecision, RequestId, SessionId, SessionRecord, TtlSeconds, UnixMillis,
 };
 use crate::core::{NotesRef, Sha256Hex};
 use crate::git_push_approve::{RunApproveError, run_approve};
@@ -1200,27 +1199,62 @@ async fn approve_staged_push<S: SecretStore + Send + Sync + 'static>(
         }
     };
 
-    // Static scope for promote: `contents:write` is what the Git Data
-    // REST API needs to upload blobs, trees, commits, and update the
-    // branch ref; `metadata:read` is implicit but listed explicitly
-    // because GitHub's permissions echo step rejects scopes whose
-    // returned permissions don't match exactly. The single repo on the
-    // scope is the one the staged push targets — anything else would be
-    // either a silent over-grant (mint signs for repo A, walker writes
-    // to repo B) or a guaranteed failure (mint refuses on
-    // installation-owner mismatch).
-    let github_scope = GitHubGrantedScope {
-        repository: entry.receipt().repo().as_repo_ref().clone(),
-        permissions: GitHubPermissions {
-            contents: Some(GitHubAccess::Write),
-            metadata: Some(MetadataAccess::Read),
-            ..Default::default()
-        },
+    // Defence in depth: the staging receipt and the audit row must
+    // agree on the load-bearing push fields. They are written in
+    // lock-step at staging time, so disagreement means either a manual
+    // edit of the audit DB, a bundle replayed into staging without an
+    // audit row, or DB corruption — none of which the broker can
+    // safely promote through. Compare *before* the mint so a drift
+    // never produces a credential.
+    let receipt = entry.receipt();
+    if receipt.repo() != &audit_entry.repo
+        || receipt.branch() != &audit_entry.branch
+        || receipt.expected_remote_head() != audit_entry.expected_remote_head.as_ref()
+        || receipt.new_head() != &audit_entry.new_head
+    {
+        return ServerMessage::Error {
+            message: format!(
+                "staged push {request_id}: staging receipt and audit row disagree on the \
+                 push target (repo/branch/expected_remote_head/new_head); refusing to \
+                 mint a credential against an inconsistent push description"
+            ),
+        };
+    }
+
+    // Route the approve through the policy engine. Without this, a
+    // GitHub App installation that can see more repos than the
+    // `writable_repos` allowlist could still get an approve-time mint
+    // for any of them — bypassing the same gate that ordinary capability
+    // requests pay attention to. The granted scope is functionally
+    // identical to the previous hand-built one (`contents:write` +
+    // implicit `metadata:read`); the new behaviour is the deny gate.
+    let policy_request = CapabilityRequest::GitHub(GitHubRequest::Contents {
+        access: GitHubAccess::Write,
+        repo: receipt.repo().as_repo_ref().clone(),
+    });
+    let github_scope = match crate::policy::decide(&policy_request, &state.policy) {
+        PolicyDecision::Grant {
+            scope: GrantedScope::GitHub(scope),
+            ..
+        } => scope,
+        PolicyDecision::Deny { reason } => {
+            return ServerMessage::Error {
+                message: format!("policy denied approve of staged push {request_id}: {reason}"),
+            };
+        }
     };
+    // The TTL used here is intentionally *not* `policy.default_ttl`.
+    // Policy's TTL bounds the lifetime of agent-facing credentials,
+    // where a short ceiling caps the blast radius of a leaked token.
+    // The approve mint is broker-internal: nobody but the broker ever
+    // holds the token, the broker uses it for one HTTP burst, and
+    // GitHub returns a fixed ~1h token regardless of what we request.
+    // Capping below the GitHub-imposed maximum would make every real
+    // approve fail (see the `APPROVE_MINT_TTL_SECONDS` rationale above).
+    // The policy gate above remains the load-bearing access check.
+    //
     // `unwrap`: `APPROVE_MINT_TTL_SECONDS == GITHUB_INSTALLATION_TOKEN_MAX_SECONDS`,
-    // which is the documented upper bound `TtlSeconds::new` accepts (see
-    // `core::decision`), so this conversion is infallible by
-    // construction.
+    // which is the documented upper bound `TtlSeconds::new` accepts.
     let ttl = TtlSeconds::new(APPROVE_MINT_TTL_SECONDS)
         .expect("APPROVE_MINT_TTL_SECONDS is in TtlSeconds range");
 
@@ -1268,15 +1302,26 @@ async fn approve_staged_push<S: SecretStore + Send + Sync + 'static>(
         }
     };
 
-    let receipt = entry.receipt();
     let repo = receipt.repo().clone();
     let branch = receipt.branch().clone();
-    // `unwrap`: checked `is_none` above. Cloning lifts the receipt
-    // borrow ahead of the await so it doesn't have to be held across.
-    let expected_remote_head = receipt
-        .expected_remote_head()
-        .cloned()
-        .expect("expected_remote_head presence was checked above");
+    // `expected_remote_head` was checked `Some` on `audit_entry` above
+    // and proved equal to the receipt's value by the drift check, so
+    // unwrapping here is provable from local code (not a distant
+    // invariant). Bail with a clean error rather than panic on the
+    // theoretical impossible case so a mid-flight mint never crashes
+    // the daemon.
+    let expected_remote_head = match receipt.expected_remote_head().cloned() {
+        Some(h) => h,
+        None => {
+            return ServerMessage::Error {
+                message: format!(
+                    "staged push {request_id}: receipt lost expected_remote_head \
+                     between the drift check and the run_approve call; this should be \
+                     impossible — staging entry has been mutated concurrently"
+                ),
+            };
+        }
+    };
     let bundle_tip = receipt.new_head().clone();
     let (_, bundle_bytes) = entry.into_parts();
 
@@ -3203,7 +3248,14 @@ mod tests {
     ) -> (Arc<BrokerState<InMemStore>>, tempfile::TempDir) {
         let tmp = tempfile::tempdir().unwrap();
         let store = GitPushStagingStore::open(tmp.path().join("staging")).unwrap();
-        let mut state = make_state(server, vec![], "o");
+        // sample_clone_repo() is "owner/repo"; the approve handler's
+        // policy gate requires the request's repo to be on the
+        // writable-repos allowlist, so include it here. The
+        // installation_owner is still "o" (different from "owner") so
+        // approve tests that want to exercise the post-policy mint
+        // step still get a clean `RepoNotInInstallation` from the
+        // minter without standing up a wiremock fixture.
+        let mut state = make_state(server, vec![sample_clone_repo().as_repo_ref().clone()], "o");
         let inner = Arc::get_mut(&mut state).expect("fresh Arc has no other handles");
         inner.staging_store = Some(Arc::new(store));
         (state, tmp)
@@ -4052,6 +4104,63 @@ mod tests {
         );
     }
 
+    /// The approve path routes through `policy::decide` against the
+    /// configured `writable_repos` allowlist. A staged push whose repo
+    /// is not on that list must be denied *before* the mint runs, so
+    /// the operator cannot smuggle a write to an installation-visible
+    /// repo that policy never authorised. The handler must surface a
+    /// "policy denied" error, must not call the GitHub mock, and must
+    /// not write a resolution row (the staged push remains promotable
+    /// once policy is corrected).
+    #[tokio::test]
+    async fn approve_staged_push_denied_when_repo_not_on_writable_repos_allowlist() {
+        let server = MockServer::start().await;
+        let (mut state, _tmp) = make_state_with_approve_ready(&server);
+        {
+            let inner = Arc::get_mut(&mut state).expect("fresh Arc has no other handles");
+            inner.policy.writable_repos.clear();
+        }
+        let session_id = open_session(&state).await;
+        let request_id = stage_with_staged_outcome(
+            &state,
+            session_id,
+            b"bundle".to_vec(),
+            UnixMillis::from_millis(1_700_000_040_000),
+            UnixMillis::from_millis(1_700_000_040_500),
+        )
+        .await;
+
+        let resp = dispatch_message(
+            ClientMessage::ApproveStagedPush {
+                request_id,
+                operator: "alice".into(),
+            },
+            &state,
+        )
+        .await;
+
+        match resp {
+            ServerMessage::Error { message } => {
+                assert!(
+                    message.contains("policy denied approve of staged push"),
+                    "expected policy-denial error, got: {message}",
+                );
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+
+        let audit_entry = state.audit.get_git_push(request_id).unwrap().unwrap();
+        assert!(audit_entry.resolution.is_none());
+        assert!(
+            state
+                .staging_store
+                .as_ref()
+                .unwrap()
+                .load(request_id)
+                .is_ok()
+        );
+    }
+
     /// A staged push that already carries a `git_push_resolution` row
     /// (here, a prior reject) is reported as already-resolved without
     /// triggering a mint. This matters because every approve mint
@@ -4308,8 +4417,15 @@ mod tests {
 
         let server = MockServer::start().await;
         // installation_owner = "owner" so the staged push's
-        // `sample_clone_repo()` ("owner/repo") matches the App config.
-        let mut state = make_state(&server, vec![], "owner");
+        // `sample_clone_repo()` ("owner/repo") matches the App config,
+        // and writable_repos includes that repo so the policy gate
+        // admits the request through to run_approve (which is what
+        // this test exercises failing).
+        let mut state = make_state(
+            &server,
+            vec![sample_clone_repo().as_repo_ref().clone()],
+            "owner",
+        );
         let tmp = tempfile::tempdir().unwrap();
         let store = GitPushStagingStore::open(tmp.path().join("staging")).unwrap();
         let work_root = tmp.path().join("promote");
