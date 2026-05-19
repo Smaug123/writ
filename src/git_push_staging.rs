@@ -34,6 +34,21 @@ const TMP_DIR: &str = "tmp";
 const ENTRY_FILE: &str = "entry.json";
 const BUNDLE_FILE: &str = "bundle";
 
+/// Sentinel file placed inside `<staged>/<request_id>/` by the approve
+/// handler immediately before it calls into `run_approve`. Its presence
+/// means "an approve attempt for this id has reached the point of
+/// contacting GitHub; the outcome (and therefore the durable audit
+/// record) may or may not have committed yet". Both the approve and
+/// reject handlers refuse to act on entries that carry this marker —
+/// otherwise a crash between GitHub's PATCH succeeding and the local
+/// `git_push_resolution` insert would let a follow-up reject record a
+/// `Rejected` row for a push that actually landed.
+///
+/// The marker is intentionally a separate file rather than a flag in
+/// the receipt JSON so that creating it does not require rewriting the
+/// receipt under the rename-based atomicity contract.
+const PROMOTE_IN_FLIGHT_MARKER: &str = "promote-in-flight";
+
 /// A staged push as stored on disk: the receipt that was returned to the
 /// guest plus the git bundle bytes.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -80,6 +95,21 @@ pub enum StagingError {
     UnrecognisedStagedDir { name: String, message: String },
     #[error("staging IO error: {0}")]
     Io(#[from] io::Error),
+}
+
+/// Outcome of [`GitPushStagingStore::mark_promote_in_flight`].
+/// Callers gate behaviour on which arm fires: `NewlyMarked` is the
+/// normal "first approve attempt" path; `AlreadyMarked` means a prior
+/// approve for this id reached the GitHub-contact point without the
+/// audit row landing — the operator must reconcile manually (verify
+/// the GitHub ref state against the staged tip, then either confirm
+/// the push and import the audit row, or clear the marker to allow
+/// normal reject).
+#[must_use]
+#[derive(Debug, Eq, PartialEq)]
+pub enum PromoteMarkOutcome {
+    NewlyMarked,
+    AlreadyMarked,
 }
 
 /// Host-local persistence for VM-staged pushes. Cheap to clone (only owns
@@ -251,6 +281,100 @@ impl GitPushStagingStore {
             Ok(false) => Ok(None),
             Err(err) => Err(StagingError::Io(err)),
         }
+    }
+
+    /// Atomically write the promote-in-flight sentinel for `request_id`.
+    ///
+    /// Errors only on genuine IO problems (missing staging dir, perm
+    /// flip, disk full); the "marker already present" case is a normal
+    /// outcome reflecting a prior in-progress approve attempt, not an
+    /// error. The file is fsync'd along with the containing staging dir
+    /// so a crash immediately after this call still observes the marker
+    /// on the next boot — that durability is the whole point of the
+    /// write-ahead.
+    pub fn mark_promote_in_flight(
+        &self,
+        request_id: RequestId,
+    ) -> Result<PromoteMarkOutcome, StagingError> {
+        let dir = self.staged_path(request_id);
+        // The marker only makes sense for an entry that is actually
+        // staged. If the dir is gone the caller skipped the
+        // staging-entry-exists pre-flight.
+        if !dir.try_exists().map_err(StagingError::Io)? {
+            return Err(StagingError::NotFound { request_id });
+        }
+        let marker = dir.join(PROMOTE_IN_FLIGHT_MARKER);
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&marker)
+        {
+            Ok(f) => {
+                // Empty body is fine; the existence of the file *is*
+                // the signal. Fsync the file and its parent so a crash
+                // here cannot lose the marker.
+                f.sync_all()?;
+                fsync_dir(&dir)?;
+                Ok(PromoteMarkOutcome::NewlyMarked)
+            }
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+                Ok(PromoteMarkOutcome::AlreadyMarked)
+            }
+            Err(err) => Err(StagingError::Io(err)),
+        }
+    }
+
+    /// Remove the promote-in-flight sentinel for `request_id`,
+    /// preserving the rest of the staging entry. Idempotent: a
+    /// missing marker (or a missing staging dir) is reported as
+    /// success.
+    ///
+    /// The approve handler calls this after a `run_approve` failure
+    /// whose variant proves the GitHub PATCH cannot have happened
+    /// (prepare/plan/mint errors), so a retry of approve sees a clean
+    /// staging entry. The handler intentionally leaves the marker in
+    /// place after an `Execute`-stage failure (the only path that
+    /// actually issues the PATCH): in that case the PATCH may have
+    /// landed even though the response was lost, so the entry must
+    /// stay quarantined until an operator confirms the GitHub state.
+    pub fn clear_promote_in_flight(&self, request_id: RequestId) -> Result<(), StagingError> {
+        let dir = self.staged_path(request_id);
+        let marker = dir.join(PROMOTE_IN_FLIGHT_MARKER);
+        match fs::remove_file(&marker) {
+            Ok(()) => {}
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(err) => return Err(StagingError::Io(err)),
+        }
+        // Fsync the containing dir so a crash here cannot resurrect
+        // the marker on next boot. If the dir itself has gone away
+        // since the remove_file call (e.g. concurrent scrub), the
+        // marker is already durably gone — nothing to flush.
+        match fsync_dir(&dir) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(StagingError::Io(err)),
+        }
+    }
+
+    /// Returns `Ok(true)` iff a promote-in-flight marker is currently
+    /// present for `request_id`. The reject handler calls this before
+    /// reading the staged receipt: a present marker means a prior
+    /// approve crossed into the GitHub-contact phase, so the reject
+    /// must refuse rather than record a decision that could contradict
+    /// a push that actually landed.
+    ///
+    /// Like [`Self::try_load_receipt`], permission / not-a-directory
+    /// errors surface as `Err` rather than being folded into "absent"
+    /// — the caller must be able to distinguish "definitely no marker"
+    /// from "couldn't tell".
+    pub fn has_promote_in_flight_marker(
+        &self,
+        request_id: RequestId,
+    ) -> Result<bool, StagingError> {
+        self.staged_path(request_id)
+            .join(PROMOTE_IN_FLIGHT_MARKER)
+            .try_exists()
+            .map_err(StagingError::Io)
     }
 
     fn staged_path(&self, request_id: RequestId) -> PathBuf {
@@ -694,6 +818,85 @@ mod tests {
         fs::write(&staged, b"").unwrap();
         let err = store.try_load_receipt(request_id).unwrap_err();
         assert!(matches!(err, StagingError::Io(_)), "got: {err:?}");
+    }
+
+    #[test]
+    fn mark_promote_in_flight_is_newly_marked_then_already_marked() {
+        let (store, _tmp) = open_store();
+        let request_id: RequestId = "cccccccc-0000-0000-0000-000000000000".parse().unwrap();
+        store
+            .stage(
+                request_id,
+                UnixMillis::from_millis(1),
+                sample_metadata(),
+                b"bundle".to_vec(),
+            )
+            .unwrap();
+
+        // No marker initially.
+        assert!(!store.has_promote_in_flight_marker(request_id).unwrap());
+
+        // First mark is the new-marker arm.
+        assert_eq!(
+            store.mark_promote_in_flight(request_id).unwrap(),
+            PromoteMarkOutcome::NewlyMarked,
+        );
+        assert!(store.has_promote_in_flight_marker(request_id).unwrap());
+
+        // Subsequent marks observe the existing marker and do not error
+        // — the broker reads this arm as "operator must reconcile".
+        assert_eq!(
+            store.mark_promote_in_flight(request_id).unwrap(),
+            PromoteMarkOutcome::AlreadyMarked,
+        );
+        assert!(store.has_promote_in_flight_marker(request_id).unwrap());
+    }
+
+    #[test]
+    fn mark_promote_in_flight_errors_on_absent_staging_dir() {
+        let (store, _tmp) = open_store();
+        let request_id: RequestId = "dddddddd-0000-0000-0000-000000000000".parse().unwrap();
+        // No `stage()` call: the dir does not exist.
+        let err = store.mark_promote_in_flight(request_id).unwrap_err();
+        assert!(
+            matches!(err, StagingError::NotFound { request_id: id } if id == request_id),
+            "expected NotFound for missing staging dir, got: {err:?}",
+        );
+    }
+
+    #[test]
+    fn clear_promote_in_flight_is_idempotent_and_leaves_entry_intact() {
+        let (store, _tmp) = open_store();
+        let request_id: RequestId = "eeeeeeee-0000-0000-0000-000000000000".parse().unwrap();
+        let metadata = sample_metadata();
+        let bundle = b"bundle for clear test".to_vec();
+        store
+            .stage(
+                request_id,
+                UnixMillis::from_millis(7),
+                metadata,
+                bundle.clone(),
+            )
+            .unwrap();
+        let _ = store.mark_promote_in_flight(request_id).unwrap();
+        assert!(store.has_promote_in_flight_marker(request_id).unwrap());
+
+        // Clear the marker. The receipt + bundle must remain readable
+        // — `clear_promote_in_flight` is the pre-PATCH-failure recovery
+        // path, and a retry of approve must find the staging entry
+        // exactly as it was before the mark.
+        store.clear_promote_in_flight(request_id).unwrap();
+        assert!(!store.has_promote_in_flight_marker(request_id).unwrap());
+        let loaded = store.load(request_id).unwrap();
+        assert_eq!(loaded.bundle(), bundle.as_slice());
+
+        // Idempotent: a second clear on an already-cleared entry is Ok.
+        store.clear_promote_in_flight(request_id).unwrap();
+
+        // Idempotent: a clear on an unknown id is Ok (the dir is gone
+        // entirely, so the marker is trivially absent).
+        let unknown: RequestId = "ffffffff-0000-0000-0000-000000000000".parse().unwrap();
+        store.clear_promote_in_flight(unknown).unwrap();
     }
 
     #[test]

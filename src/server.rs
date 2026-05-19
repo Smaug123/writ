@@ -35,7 +35,7 @@ use crate::core::{
 use crate::core::{NotesRef, Sha256Hex};
 use crate::git_push_approve::{RunApproveError, run_approve};
 use crate::git_push_promote::PromoteRuntimeConfig;
-use crate::git_push_staging::{GitPushStagingStore, StagedEntry, StagingError};
+use crate::git_push_staging::{GitPushStagingStore, PromoteMarkOutcome, StagedEntry, StagingError};
 use crate::github::GitHubMinter;
 use crate::notes_repo::NotesRepo;
 use crate::policy::{self, PolicyConfig};
@@ -913,6 +913,49 @@ async fn reject_staged_push<S: SecretStore + Send + Sync + 'static>(
     let decision_lock = acquire_decision_lock(state, request_id);
     let _decision_guard = decision_lock.lock_owned().await;
 
+    // Refuse to reject if an approve attempt previously crossed into
+    // the GitHub-contact phase without a durable resolution landing.
+    // Recording `Rejected` here would let the audit log claim a push
+    // was rejected for a request that may have actually advanced the
+    // branch on GitHub. The operator must inspect the remote ref and
+    // either record the missing approval or clear the marker by hand
+    // before reject can run.
+    let marker_check = {
+        let staging_store = Arc::clone(&staging_store);
+        tokio::task::spawn_blocking(move || staging_store.has_promote_in_flight_marker(request_id))
+            .await
+    };
+    match marker_check {
+        Ok(Ok(false)) => {}
+        Ok(Ok(true)) => {
+            tracing::error!(
+                target: AUDIT_WRITE_FAILURE_TARGET,
+                kind = "promote_in_flight_marker",
+                request_id = %request_id,
+                "reject refused: prior approve attempt left a promote-in-flight \
+                 marker; operator must reconcile against the remote ref",
+            );
+            return ServerMessage::Error {
+                message: format!(
+                    "staged push {request_id}: a prior approve attempt entered the \
+                     GitHub-contact phase without recording a resolution; the GitHub \
+                     branch state may or may not have been advanced. Inspect the \
+                     remote ref and reconcile manually before rejecting."
+                ),
+            };
+        }
+        Ok(Err(err)) => {
+            return ServerMessage::Error {
+                message: format!("could not check promote-in-flight marker: {err}"),
+            };
+        }
+        Err(err) => {
+            return ServerMessage::Error {
+                message: format!("promote-in-flight marker check task failed: {err}"),
+            };
+        }
+    }
+
     // Verify the staging directory exists before touching the audit
     // log. Matching `show_staged_push`'s ordering lets the two endpoints
     // agree on what "the staging is gone" means and gives the operator
@@ -1386,6 +1429,57 @@ async fn approve_staged_push<S: SecretStore + Send + Sync + 'static>(
     let bundle_tip = receipt.new_head().clone();
     let (_, bundle_bytes) = entry.into_parts();
 
+    // Write-ahead the approve intent on disk before any GitHub-contact
+    // step in `run_approve`. The marker means "an approve for this id
+    // has reached the point where the PATCH may land"; the reject
+    // handler refuses while it is present. Without this, a crash
+    // between PATCH success and the audit-row write would leave the
+    // staging entry rejectable, letting an operator record a `Rejected`
+    // resolution for a push that actually landed on GitHub.
+    let mark_outcome = {
+        let store = Arc::clone(&staging_store);
+        match tokio::task::spawn_blocking(move || store.mark_promote_in_flight(request_id)).await {
+            Ok(Ok(outcome)) => outcome,
+            Ok(Err(err)) => {
+                return ServerMessage::Error {
+                    message: format!(
+                        "could not write promote-in-flight marker for {request_id}: {err}"
+                    ),
+                };
+            }
+            Err(err) => {
+                return ServerMessage::Error {
+                    message: format!(
+                        "promote-in-flight marker task for {request_id} failed: {err}"
+                    ),
+                };
+            }
+        }
+    };
+    if mark_outcome == PromoteMarkOutcome::AlreadyMarked {
+        // A previous approve attempt for this id reached the PATCH
+        // phase without a durable audit resolution landing. We do not
+        // know whether the GitHub branch was advanced. Refuse: the
+        // operator must inspect the remote ref and either confirm
+        // the push (recording the resolution out-of-band) or clear
+        // the marker after confirming the push did not happen.
+        tracing::error!(
+            target: AUDIT_WRITE_FAILURE_TARGET,
+            kind = "promote_in_flight_marker",
+            request_id = %request_id,
+            "approve refused: prior attempt reached the GitHub-contact \
+             phase without a durable resolution; manual reconciliation required",
+        );
+        return ServerMessage::Error {
+            message: format!(
+                "staged push {request_id}: a prior approve attempt entered the \
+                 GitHub-contact phase without recording a resolution; the GitHub \
+                 branch state may or may not have been advanced. Inspect the \
+                 remote ref and reconcile manually before retrying."
+            ),
+        };
+    }
+
     let run_result = run_approve(
         &promote_runtime,
         &api_base,
@@ -1410,18 +1504,60 @@ async fn approve_staged_push<S: SecretStore + Send + Sync + 'static>(
     let outcome = match run_result {
         Ok(outcome) => outcome,
         Err(err) => {
-            // No resolution row was written, the staging dir is still
-            // on disk: the staged push remains promotable on retry.
-            // Surface the error string for the operator; the specific
-            // `RunApproveError` variant carries the stage that failed.
+            // No resolution row was written. The staging dir is still
+            // on disk; whether a retry is safe depends on whether the
+            // failure could have reached the GitHub PATCH.
             tracing::error!(
                 target: AUDIT_WRITE_FAILURE_TARGET,
                 kind = "approve_run",
                 request_id = %request_id,
                 error = %err,
-                "approve-time run_approve failed; no resolution row written, \
-                 staging dir left for retry",
+                "approve-time run_approve failed; no resolution row written",
             );
+            // `Execute` is the only variant whose code path can issue
+            // an `update_ref` PATCH; the prior variants fail before any
+            // GitHub-mutating call. For Execute we leave the
+            // promote-in-flight marker in place — the PATCH may have
+            // landed even if the response was lost — and force operator
+            // reconciliation. For the others we clear the marker so a
+            // retry of approve starts from a clean entry.
+            let crossed_patch_boundary = matches!(&err, RunApproveError::Execute(_));
+            if !crossed_patch_boundary {
+                let store = Arc::clone(&staging_store);
+                let clear_outcome =
+                    tokio::task::spawn_blocking(move || store.clear_promote_in_flight(request_id))
+                        .await;
+                match clear_outcome {
+                    Ok(Ok(())) => {}
+                    Ok(Err(clear_err)) => {
+                        tracing::warn!(
+                            request_id = %request_id,
+                            error = %clear_err,
+                            "could not clear promote-in-flight marker after pre-PATCH \
+                             failure; a retry of approve will be refused until the \
+                             operator clears the marker manually",
+                        );
+                    }
+                    Err(join_err) => {
+                        tracing::warn!(
+                            request_id = %request_id,
+                            error = %join_err,
+                            "promote-in-flight clear task failed after pre-PATCH \
+                             failure; the marker may still be on disk",
+                        );
+                    }
+                }
+            } else {
+                tracing::error!(
+                    target: AUDIT_WRITE_FAILURE_TARGET,
+                    kind = "approve_run_execute",
+                    request_id = %request_id,
+                    "run_approve failed inside Execute: the GitHub PATCH may have \
+                     landed even though no response was received. Leaving the \
+                     promote-in-flight marker in place; operator must reconcile \
+                     against the remote ref before retrying.",
+                );
+            }
             // Discriminate the specific shape for the test harness and
             // for the operator: PrepareStagingError::StagingDirExists is
             // the duplicate-concurrent-approve case from B1e.2b.
@@ -4064,6 +4200,172 @@ mod tests {
         )
         .await;
         assert_eq!(resp, ServerMessage::UnknownStagedPush { request_id });
+    }
+
+    /// R6 P1 regression: a staged push that carries a
+    /// promote-in-flight marker must NOT accept a reject. The marker
+    /// records that a prior approve crossed into the GitHub-contact
+    /// phase without a durable resolution landing — the branch on
+    /// GitHub may or may not have advanced, and recording `Rejected`
+    /// here would let the audit log contradict reality.
+    #[tokio::test]
+    async fn reject_staged_push_refused_when_promote_in_flight_marker_present() {
+        let server = MockServer::start().await;
+        let (state, _tmp) = make_state_with_staging(&server);
+        let session_id = open_session(&state).await;
+
+        // Stage an entry exactly as a normal push would.
+        let request_id = stage_with_audit(
+            &state,
+            session_id,
+            b"bundle".to_vec(),
+            UnixMillis::from_millis(1_700_000_090_000),
+            UnixMillis::from_millis(1_700_000_090_500),
+        )
+        .await;
+
+        // Plant the marker directly — equivalent to the state left
+        // after a crash between PATCH success and audit-row write.
+        let store = state.staging_store.as_ref().expect("staging configured");
+        let mark = store.mark_promote_in_flight(request_id).unwrap();
+        assert_eq!(mark, PromoteMarkOutcome::NewlyMarked);
+
+        // Reject must refuse with a message that points the operator
+        // at remote-ref reconciliation. No resolution row may be
+        // written.
+        let resp = dispatch_message(
+            ClientMessage::RejectStagedPush {
+                request_id,
+                operator: "alice".into(),
+                reason: reason("rejected after promote-in-flight"),
+            },
+            &state,
+        )
+        .await;
+        match resp {
+            ServerMessage::Error { message } => {
+                assert!(
+                    message.contains("reconcile"),
+                    "expected reconcile-required message, got: {message}",
+                );
+                assert!(
+                    message.contains("GitHub") || message.contains("remote ref"),
+                    "message should reference the remote-ref check, got: {message}",
+                );
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+        let audit_entry = state.audit.get_git_push(request_id).unwrap().unwrap();
+        assert!(audit_entry.resolution.is_none());
+    }
+
+    /// R6 P1 regression: a pre-PATCH `run_approve` failure (the
+    /// fixture forces `RunApproveError::Prepare` by wiring an
+    /// unreachable git binary) must clear the promote-in-flight
+    /// marker on the way out. Otherwise every benign prepare/mint
+    /// failure would permanently quarantine the staged push, even
+    /// though the GitHub branch was provably not contacted.
+    #[tokio::test]
+    async fn approve_clears_promote_in_flight_marker_on_pre_patch_failure() {
+        use crate::git_push_promote::PromoteRuntimeConfig;
+        use crate::signing::WritSigningKey;
+        use crate::vm_git_bundle::{GitCloneBaseUrl, GitCredentialBoundary, GitSecretEnvVar};
+        const SIGNING_PEM: &str = include_str!("../tests/fixtures/ed25519_test_signing.key");
+
+        let server = MockServer::start().await;
+        let mut state = make_state(
+            &server,
+            vec![sample_clone_repo().as_repo_ref().clone()],
+            "owner",
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let store = GitPushStagingStore::open(tmp.path().join("staging")).unwrap();
+        let work_root = tmp.path().join("promote");
+        std::fs::create_dir_all(&work_root).unwrap();
+        let runtime = PromoteRuntimeConfig::new(
+            PathBuf::from("/nonexistent/bin/git"),
+            GitCloneBaseUrl::github(),
+            GitCredentialBoundary::new(
+                PathBuf::from("/nonexistent/bin/askpass"),
+                GitSecretEnvVar::new("WRIT_GIT_TOKEN").unwrap(),
+            )
+            .unwrap(),
+            work_root,
+            std::time::Duration::from_secs(30),
+        )
+        .unwrap();
+        let signing_key = WritSigningKey::from_openssh_pem(SIGNING_PEM).unwrap();
+        {
+            let inner = Arc::get_mut(&mut state).expect("fresh Arc has no other handles");
+            inner.staging_store = Some(Arc::new(store));
+            inner.promote_runtime = Some(Arc::new(runtime));
+            inner.signing_key = Some(signing_key);
+        }
+        let expiry = expiry_str_from_now(3600);
+        Mock::given(method("POST"))
+            .and(path("/app/installations/999/access_tokens"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "token": "ghs_promote_token",
+                "expires_at": expiry,
+                "permissions": {"contents": "write", "metadata": "read"},
+                "repository_selection": "selected",
+                "repositories": [{"full_name": "owner/repo"}]
+            })))
+            .mount(&server)
+            .await;
+
+        let session_id = open_session(&state).await;
+        let request_id = stage_with_staged_outcome(
+            &state,
+            session_id,
+            b"bundle".to_vec(),
+            UnixMillis::from_millis(1_700_000_100_000),
+            UnixMillis::from_millis(1_700_000_100_500),
+        )
+        .await;
+
+        // Run the approve: it will fail in Prepare(GitInit) because
+        // `/nonexistent/bin/git` cannot be executed. The handler must
+        // surface the prepare-failure error AND clear the marker so
+        // a subsequent reject works normally.
+        let resp = dispatch_message(
+            ClientMessage::ApproveStagedPush {
+                request_id,
+                operator: "alice".into(),
+            },
+            &state,
+        )
+        .await;
+        match resp {
+            ServerMessage::Error { message } => {
+                assert!(
+                    message.contains("staging preparation failed"),
+                    "expected prepare-failure error, got: {message}",
+                );
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+
+        // The marker must be cleared.
+        let store = state.staging_store.as_ref().unwrap();
+        assert!(
+            !store.has_promote_in_flight_marker(request_id).unwrap(),
+            "pre-PATCH failure must clear the promote-in-flight marker so retry is not blocked",
+        );
+
+        // A follow-up reject succeeds (records Rejected, removes
+        // staging) — the marker cleanup means we are back to the
+        // normal post-stage state.
+        let resp = dispatch_message(
+            ClientMessage::RejectStagedPush {
+                request_id,
+                operator: "alice".into(),
+                reason: reason("rejected after prepare failure"),
+            },
+            &state,
+        )
+        .await;
+        assert_eq!(resp, ServerMessage::StagedPushRejected { request_id });
     }
 
     /// R5 P1 regression: `scrub_staging_after_failed_audit` must
