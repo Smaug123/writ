@@ -507,6 +507,29 @@ impl AuditLog {
                     "approve attempt refused: push already has a resolution",
                 ));
             }
+            // Another attempt is still running (`started`/`uncertain`)
+            // or a prior attempt is quarantined as `post_patch_failure`.
+            // A second attempt would race the first's PATCH (in-flight)
+            // or contradict the quarantine (post-patch failure leaves
+            // GitHub's state uncertain until manual reconciliation).
+            // Only a clean slate, or a history of `pre_patch_failure`
+            // resolutions, is retryable.
+            let blocker: Option<i64> = tx
+                .query_row(
+                    "SELECT 1 FROM git_push_approve_attempt
+                      WHERE push_request_id = ?1
+                        AND (state IN ('started', 'uncertain')
+                          OR (state = 'resolved' AND outcome = 'post_patch_failure'))
+                      LIMIT 1",
+                    params![push_request_id.as_uuid().to_string()],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if blocker.is_some() {
+                return Err(AuditError::Invariant(
+                    "approve attempt refused: prior attempt is in-flight or quarantined",
+                ));
+            }
 
             tx.execute(
                 "INSERT INTO git_push_approve_attempt (
@@ -1933,6 +1956,162 @@ mod tests {
             ),
             "got: {err:?}"
         );
+    }
+
+    /// A second attempt while the first is still `Started` would race
+    /// the first attempt's PATCH if it advances to `update_ref`. Refuse
+    /// at the DAO so the state machine has one attempt in flight at a
+    /// time.
+    #[test]
+    fn start_approve_attempt_refused_when_prior_started() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let push_request_id = RequestId::new();
+        let _session = open_with_staged_request(&log, push_request_id);
+        log.start_approve_attempt(
+            ApproveAttemptId::new(),
+            push_request_id,
+            "alice",
+            UnixMillis::from_millis(1_700_000_200),
+        )
+        .unwrap();
+
+        let err = log
+            .start_approve_attempt(
+                ApproveAttemptId::new(),
+                push_request_id,
+                "bob",
+                UnixMillis::from_millis(1_700_000_300),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                AuditError::Invariant(
+                    "approve attempt refused: prior attempt is in-flight or quarantined"
+                )
+            ),
+            "got: {err:?}"
+        );
+    }
+
+    /// A second attempt while the first is `Uncertain` would issue a
+    /// fresh PATCH against a branch the first attempt's PATCH may
+    /// already have advanced. Refuse.
+    #[test]
+    fn start_approve_attempt_refused_when_prior_uncertain() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let push_request_id = RequestId::new();
+        let _session = open_with_staged_request(&log, push_request_id);
+        let first = ApproveAttemptId::new();
+        log.start_approve_attempt(
+            first,
+            push_request_id,
+            "alice",
+            UnixMillis::from_millis(1_700_000_200),
+        )
+        .unwrap();
+        log.mark_attempt_uncertain(first, sample_promote_mint_audit())
+            .unwrap();
+
+        let err = log
+            .start_approve_attempt(
+                ApproveAttemptId::new(),
+                push_request_id,
+                "bob",
+                UnixMillis::from_millis(1_700_000_300),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                AuditError::Invariant(
+                    "approve attempt refused: prior attempt is in-flight or quarantined"
+                )
+            ),
+            "got: {err:?}"
+        );
+    }
+
+    /// A second attempt after a quarantined `PostPatchFailure` would
+    /// contradict the quarantine: that prior attempt's GitHub state is
+    /// unknown, and a new attempt could either succeed redundantly
+    /// (PATCH was honoured) or advance from a wrong base (PATCH was
+    /// not). Manual reconciliation must complete the quarantined
+    /// attempt before a fresh start is permitted.
+    #[test]
+    fn start_approve_attempt_refused_when_prior_post_patch_failure() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let push_request_id = RequestId::new();
+        let _session = open_with_staged_request(&log, push_request_id);
+        let first = ApproveAttemptId::new();
+        log.start_approve_attempt(
+            first,
+            push_request_id,
+            "alice",
+            UnixMillis::from_millis(1_700_000_200),
+        )
+        .unwrap();
+        log.mark_attempt_uncertain(first, sample_promote_mint_audit())
+            .unwrap();
+        log.complete_attempt_post_patch_failure(
+            first,
+            "transport drop after PATCH",
+            UnixMillis::from_millis(1_700_000_250),
+        )
+        .unwrap();
+
+        let err = log
+            .start_approve_attempt(
+                ApproveAttemptId::new(),
+                push_request_id,
+                "bob",
+                UnixMillis::from_millis(1_700_000_300),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                AuditError::Invariant(
+                    "approve attempt refused: prior attempt is in-flight or quarantined"
+                )
+            ),
+            "got: {err:?}"
+        );
+    }
+
+    /// `pre_patch_failure` proves the PATCH was never issued, so a
+    /// fresh attempt is safe and admitted. This is the only retry path
+    /// before slice C's reconciliation tooling.
+    #[test]
+    fn start_approve_attempt_allowed_after_pre_patch_failure() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let push_request_id = RequestId::new();
+        let _session = open_with_staged_request(&log, push_request_id);
+        let first = ApproveAttemptId::new();
+        log.start_approve_attempt(
+            first,
+            push_request_id,
+            "alice",
+            UnixMillis::from_millis(1_700_000_200),
+        )
+        .unwrap();
+        log.complete_attempt_pre_patch_failure(
+            first,
+            "mint failed",
+            UnixMillis::from_millis(1_700_000_210),
+        )
+        .unwrap();
+
+        let second = ApproveAttemptId::new();
+        log.start_approve_attempt(
+            second,
+            push_request_id,
+            "bob",
+            UnixMillis::from_millis(1_700_000_300),
+        )
+        .unwrap();
+        let attempts = log.approve_attempts_for_push(push_request_id).unwrap();
+        assert_eq!(attempts.len(), 2);
     }
 
     #[test]
