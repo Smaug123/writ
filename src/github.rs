@@ -21,6 +21,7 @@
 //! works unchanged. We record the `jti` we generated alongside the grant
 //! so webhooks observed later can be reconciled by time, actor, and repo.
 
+use crate::audit::PromoteMintAudit;
 use crate::core::{
     AgentKind, CredentialGrant, GitHubGrantedScope, GitHubPermissions, GrantedScope, Jti, RepoRef,
     RequestId, SessionId, TtlSeconds, UnixMillis,
@@ -122,12 +123,23 @@ impl GitHubAppRegistryConfig {
 /// to build a matching audit record. Fields are private on purpose: the
 /// only way to get the raw token out — and the only way to produce a
 /// `CredentialGrant` for the audit log — is to consume this value via
-/// [`MintedToken::into_grant_and_token`]. Pairing the token and the
-/// grant through a single consuming call rules out a whole class of
-/// drift bugs where the audit record disagrees with the token that was
-/// actually handed to the agent (wrong `jti`, a fresh `UnixMillis::now()`
-/// instead of the broker-clock reading the TTL check validated, a scope
-/// different from the one the minter signed for).
+/// [`MintedToken::into_grant_and_token`] (capability-grant flow) or
+/// [`MintedToken::into_promote_pieces`] (approve-time promote flow).
+/// Pairing the token and its matching audit-context through a single
+/// consuming call rules out a whole class of drift bugs where the audit
+/// record disagrees with the token that was actually handed to the agent
+/// (wrong `jti`, a fresh `UnixMillis::now()` instead of the broker-clock
+/// reading the TTL check validated, a scope different from the one the
+/// minter signed for).
+///
+/// `api_base` is carried alongside the token because the credential is
+/// only meaningful against the same GitHub instance the minter signed
+/// against. The promote consumer needs it to construct
+/// [`crate::github_git_db::GitDataClient`]; leaving it on the minter and
+/// re-resolving per-agent at call time would risk drift between the
+/// instance the token was minted against and the instance it is used
+/// against. Trailing slashes are stripped on construction so callers can
+/// concatenate it onto path suffixes directly.
 ///
 /// `Debug` is hand-rolled to redact the token string: a stray
 /// `tracing::debug!({minted:?})` or `dbg!` would otherwise spray a live
@@ -139,6 +151,7 @@ pub struct MintedToken {
     expires_at: UnixMillis,
     scope: GitHubGrantedScope,
     github_app_id: u64,
+    api_base: String,
 }
 
 impl std::fmt::Debug for MintedToken {
@@ -150,6 +163,7 @@ impl std::fmt::Debug for MintedToken {
             .field("expires_at", &self.expires_at)
             .field("scope", &self.scope)
             .field("github_app_id", &self.github_app_id)
+            .field("api_base", &self.api_base)
             .finish()
     }
 }
@@ -199,6 +213,28 @@ impl MintedToken {
             expires_at: self.expires_at,
         };
         (self.token, grant)
+    }
+
+    /// Consume the minted token for the approve-time promote flow.
+    /// Returns `(api_base, token, mint_audit)` — the API base the token
+    /// authenticates against (suitable for [`crate::github_git_db::GitDataClient`]),
+    /// the raw token string, and the [`PromoteMintAudit`] payload to
+    /// record on the approve attempt and resolution rows. Unlike
+    /// [`Self::into_grant_and_token`] this does not produce a
+    /// `CredentialGrant`: the approve handler runs after the originating
+    /// session is closed, so this mint cannot be threaded through the
+    /// session-scoped `request` / `grant_log` audit chain. The four
+    /// mint fields are recorded inline on the
+    /// `git_push_approve_attempt` row (and the joint
+    /// `git_push_resolution` row on the success path) instead.
+    pub fn into_promote_pieces(self) -> (String, String, PromoteMintAudit) {
+        let audit = PromoteMintAudit {
+            jti: self.jti,
+            github_app_id: self.github_app_id,
+            issued_at: self.issued_at,
+            expires_at: self.expires_at,
+        };
+        (self.api_base, self.token, audit)
     }
 }
 
@@ -421,6 +457,11 @@ impl GitHubMinter {
             expires_at: UnixMillis::from_seconds(expires_at_seconds),
             scope,
             github_app_id: config.app_id,
+            // Canonical form (trailing slash stripped) so downstream
+            // consumers can concatenate `/path` directly without
+            // re-normalising. The mint URL above already strips for the
+            // same reason.
+            api_base: config.api_base.trim_end_matches('/').to_string(),
         })
     }
 }
