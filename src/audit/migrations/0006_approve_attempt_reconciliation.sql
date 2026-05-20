@@ -123,3 +123,67 @@ WHEN EXISTS (
 BEGIN
     SELECT RAISE(ABORT, 'git push resolution refused: approve attempt is in-flight or quarantined');
 END;
+
+-- Reconciliation against an `Uncertain` predecessor is only safe once
+-- the predecessor cannot still be in flight on a running broker. The
+-- live broker writes an `Uncertain` row at TX2 of approve_staged_push
+-- and a terminal resolution at TX3; if an operator reconciles between
+-- TX2 and TX3, the live worker's eventual resolution either conflicts
+-- on the `git_push_resolution` primary key (after a successful PATCH)
+-- or contradicts the operator-recorded outcome (after a failed PATCH),
+-- and a reject committed under the cleared blocker would race a live
+-- approve to GitHub.
+--
+-- This table is the "the original worker is provably no longer running"
+-- marker. Boot reconcile (see `src/boot_reconcile.rs`) writes one row
+-- per `Uncertain` attempt it observes at startup, *before* any request
+-- handler can run. The live broker NEVER writes the marker for rows
+-- it produced in-process, so any `Uncertain` row with a marker has
+-- demonstrably survived a daemon restart and the prior process that
+-- wrote it is dead.
+--
+-- `Resolved(PostPatchFailure)` predecessors do not need this gate:
+-- once a Resolved row is committed (TX3 happened), the live broker
+-- never touches that row again (the v5 forward_only trigger refuses
+-- any UPDATE from `state='resolved'`).
+CREATE TABLE git_push_approve_attempt_boot_observed (
+    attempt_id TEXT PRIMARY KEY
+        REFERENCES git_push_approve_attempt(attempt_id),
+    observed_at INTEGER NOT NULL
+);
+
+-- Defence-in-depth: refuse to write a reconciliation row whose
+-- `Uncertain` predecessor has not yet been boot-observed. The DAO
+-- check (in `load_reconciliation_predecessor`) catches the same
+-- violation with a typed Invariant error, but the trigger guards
+-- against raw-SQL or future-DAO bypass.
+CREATE TRIGGER git_push_approve_attempt_reconciliation_uncertain_needs_boot_observed
+BEFORE INSERT ON git_push_approve_attempt
+WHEN NEW.supersedes_attempt_id IS NOT NULL
+ AND EXISTS (
+        SELECT 1 FROM git_push_approve_attempt p
+        WHERE p.attempt_id = NEW.supersedes_attempt_id
+          AND p.state = 'uncertain'
+ )
+ AND NOT EXISTS (
+        SELECT 1 FROM git_push_approve_attempt_boot_observed b
+        WHERE b.attempt_id = NEW.supersedes_attempt_id
+ )
+BEGIN
+    SELECT RAISE(ABORT, 'reconciliation of uncertain predecessor requires boot-observed marker');
+END;
+
+-- `supersedes_attempt_id` is established at INSERT and the three
+-- reconciliation triggers above (born_terminal, predecessor_eligible,
+-- same_push) fire only on INSERT. Without an UPDATE guard, a legal
+-- state transition such as `started -> resolved(pre_patch_failure)`
+-- (executed by `complete_attempt_pre_patch_failure`) could be coerced
+-- to also flip `supersedes_attempt_id` from NULL to a value of the
+-- writer's choosing, sidestepping every reconciliation check. Make
+-- the column immutable after INSERT.
+CREATE TRIGGER git_push_approve_attempt_supersedes_immutable
+BEFORE UPDATE ON git_push_approve_attempt
+WHEN NEW.supersedes_attempt_id IS NOT OLD.supersedes_attempt_id
+BEGIN
+    SELECT RAISE(ABORT, 'supersedes_attempt_id is immutable after insert');
+END;

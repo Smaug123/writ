@@ -354,9 +354,10 @@ fn load_reconciliation_predecessor(
             "reconciliation predecessor does not exist",
         ));
     };
-    let eligible = state == "uncertain"
-        || (state == "resolved" && outcome.as_deref() == Some("post_patch_failure"));
-    if !eligible {
+    let is_uncertain = state == "uncertain";
+    let is_post_patch_failure =
+        state == "resolved" && outcome.as_deref() == Some("post_patch_failure");
+    if !is_uncertain && !is_post_patch_failure {
         return Err(AuditError::Invariant(
             "reconciliation predecessor is not in an eligible state",
         ));
@@ -373,6 +374,29 @@ fn load_reconciliation_predecessor(
         return Err(AuditError::Invariant(
             "reconciliation predecessor has already been superseded",
         ));
+    }
+    // An Uncertain row may belong to the currently-running broker (it
+    // is written between TX2 and TX3 of approve_staged_push). Reconciling
+    // such a row before the worker finishes would race the worker's
+    // resolution write — see comment on the boot-observed table in
+    // migration 0006. Require the boot-observed marker, which only boot
+    // reconcile writes, before admitting an Uncertain predecessor.
+    // Resolved(PostPatchFailure) rows are terminal: once TX3 commits the
+    // live broker never touches them again, so no gate is needed.
+    if is_uncertain {
+        let observed: Option<i64> = tx
+            .query_row(
+                "SELECT 1 FROM git_push_approve_attempt_boot_observed
+                  WHERE attempt_id = ?1",
+                params![supersedes.as_uuid().to_string()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if observed.is_none() {
+            return Err(AuditError::Invariant(
+                "reconciliation of uncertain predecessor requires boot-observed marker",
+            ));
+        }
     }
     Ok(ReconciliationPredecessor {
         push_request_id,
@@ -949,6 +973,33 @@ impl AuditLog {
             detail,
             completed_at,
         )
+    }
+
+    /// Record that boot reconcile observed an `Uncertain` attempt at
+    /// daemon startup. The marker is the "this row has survived a
+    /// daemon restart" claim that the reconciliation DAO requires
+    /// before admitting an `Uncertain` predecessor — see comment on
+    /// the `git_push_approve_attempt_boot_observed` table in
+    /// migration 0006.
+    ///
+    /// Idempotent: a second call against the same `attempt_id` is a
+    /// no-op (preserving the original `observed_at`), matching the
+    /// boot reconcile contract that re-observing a still-Uncertain row
+    /// across successive boots must not error.
+    pub fn mark_attempt_boot_observed(
+        &self,
+        attempt_id: ApproveAttemptId,
+        observed_at: UnixMillis,
+    ) -> Result<(), AuditError> {
+        self.with_conn_mut(|c| {
+            c.execute(
+                "INSERT OR IGNORE INTO git_push_approve_attempt_boot_observed
+                     (attempt_id, observed_at)
+                 VALUES (?1, ?2)",
+                params![attempt_id.as_uuid().to_string(), observed_at.as_millis()],
+            )?;
+            Ok(())
+        })
     }
 
     /// Record a manual reconciliation attempt against a quarantined
@@ -3940,6 +3991,11 @@ mod tests {
         .unwrap();
         let mint = sample_promote_mint_audit();
         log.mark_attempt_uncertain(predecessor, mint).unwrap();
+        // Simulate boot reconcile observing the Uncertain row across a
+        // restart, which is what makes the row eligible for manual
+        // reconciliation in the first place.
+        log.mark_attempt_boot_observed(predecessor, UnixMillis::from_millis(1_700_000_250))
+            .unwrap();
 
         let reconciliation = ApproveAttemptId::new();
         log.record_reconciliation_attempt_applied(
@@ -3955,6 +4011,130 @@ mod tests {
         // Boot reconcile no longer sees the uncertain predecessor —
         // a successful manual reconciliation cleared the quarantine.
         assert!(log.list_blocking_approve_attempts().unwrap().is_empty());
+    }
+
+    /// An `Uncertain` predecessor that has NOT been boot-observed must
+    /// be refused — the live broker process may still be racing the
+    /// PATCH to GitHub. Without this gate, an operator could supersede
+    /// the row while the worker is between TX2 and TX3 and a reject
+    /// would then commit under the cleared blocker, racing the
+    /// worker's eventual resolution write to GitHub.
+    #[test]
+    fn reconciliation_refused_when_uncertain_predecessor_not_boot_observed() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let push_request_id = RequestId::new();
+        let _session = open_with_staged_request(&log, push_request_id);
+        let predecessor = ApproveAttemptId::new();
+        log.start_approve_attempt(
+            predecessor,
+            push_request_id,
+            "alice",
+            UnixMillis::from_millis(1_700_000_200),
+        )
+        .unwrap();
+        let mint = sample_promote_mint_audit();
+        log.mark_attempt_uncertain(predecessor, mint).unwrap();
+        // No mark_attempt_boot_observed call here — this row is from
+        // the live broker process from the operator's perspective.
+
+        let err = log
+            .record_reconciliation_attempt_applied(
+                ApproveAttemptId::new(),
+                predecessor,
+                &git_oid('b'),
+                "carol",
+                "verified ref applied",
+                UnixMillis::from_millis(1_700_000_300),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                AuditError::Invariant(
+                    "reconciliation of uncertain predecessor requires boot-observed marker"
+                )
+            ),
+            "got: {err:?}"
+        );
+
+        // The not-applied path must refuse for the same reason.
+        let err = log
+            .record_reconciliation_attempt_not_applied(
+                ApproveAttemptId::new(),
+                predecessor,
+                "carol",
+                "verified ref did not apply",
+                UnixMillis::from_millis(1_700_000_300),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                AuditError::Invariant(
+                    "reconciliation of uncertain predecessor requires boot-observed marker"
+                )
+            ),
+            "got: {err:?}"
+        );
+
+        // The push must remain blocked on the original Uncertain row —
+        // critical for the contradiction-window guarantee.
+        assert_eq!(
+            log.list_blocking_approve_attempts().unwrap().len(),
+            1,
+            "the Uncertain row must still appear as a blocker"
+        );
+    }
+
+    /// `Resolved(PostPatchFailure)` predecessors do NOT need a
+    /// boot-observed marker: a Resolved row is terminal, the
+    /// forward_only trigger refuses any UPDATE from it, so the live
+    /// broker provably won't race the reconciliation. The DAO must
+    /// admit reconciliation against a PostPatchFailure predecessor
+    /// even when no boot-observed marker exists.
+    #[test]
+    fn reconciliation_against_post_patch_failure_admitted_without_boot_observed() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let push_request_id = RequestId::new();
+        let _session = open_with_staged_request(&log, push_request_id);
+        let (predecessor, _) = drive_to_post_patch_failure(&log, push_request_id);
+        // No mark_attempt_boot_observed call — PostPatchFailure is
+        // terminal and does not need the gate.
+
+        log.record_reconciliation_attempt_not_applied(
+            ApproveAttemptId::new(),
+            predecessor,
+            "carol",
+            "verified ref did not apply",
+            UnixMillis::from_millis(1_700_000_500),
+        )
+        .unwrap();
+    }
+
+    /// `mark_attempt_boot_observed` is idempotent — boot reconcile
+    /// runs once per daemon startup, and across successive restarts
+    /// an `Uncertain` row that survives must not error a second call.
+    #[test]
+    fn mark_attempt_boot_observed_is_idempotent() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let push_request_id = RequestId::new();
+        let _session = open_with_staged_request(&log, push_request_id);
+        let attempt = ApproveAttemptId::new();
+        log.start_approve_attempt(
+            attempt,
+            push_request_id,
+            "alice",
+            UnixMillis::from_millis(1_700_000_200),
+        )
+        .unwrap();
+        log.mark_attempt_uncertain(attempt, sample_promote_mint_audit())
+            .unwrap();
+
+        log.mark_attempt_boot_observed(attempt, UnixMillis::from_millis(1_700_000_250))
+            .unwrap();
+        // A second call must not error.
+        log.mark_attempt_boot_observed(attempt, UnixMillis::from_millis(1_700_000_400))
+            .unwrap();
     }
 
     #[test]
@@ -4307,6 +4487,100 @@ mod tests {
                 .contains("reconciliation attempt must reference the same push as its predecessor"),
             "got: {err}"
         );
+    }
+
+    /// `supersedes_attempt_id` is established at INSERT, and the three
+    /// reconciliation INSERT triggers (born_terminal, predecessor_eligible,
+    /// same_push) fire only on INSERT. Without the UPDATE immutability
+    /// guard, a legal state transition such as
+    /// `started -> resolved(pre_patch_failure)` could be coerced to also
+    /// flip `supersedes_attempt_id`, bypassing every reconciliation
+    /// check. The trigger must refuse such an UPDATE.
+    #[test]
+    fn supersedes_immutable_trigger_refuses_update_setting_column() {
+        let log = AuditLog::open_in_memory().unwrap();
+        // Use two pushes: the PostPatchFailure predecessor lives on
+        // push_a (it blocks start_approve_attempt for push_a), and the
+        // fresh `started` attempt that we mutate lives on push_b (which
+        // has no blocker). The same_push trigger only fires on INSERT,
+        // so an UPDATE that flips supersedes_attempt_id to a different
+        // push's predecessor would still bypass that check without the
+        // immutability guard — exactly the bypass we're proving the
+        // new trigger closes.
+        let push_a = RequestId::new();
+        let push_b = RequestId::new();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+        record_staged_request(&log, push_a, s.session_id);
+        record_staged_request(&log, push_b, s.session_id);
+        let (predecessor, _) = drive_to_post_patch_failure(&log, push_a);
+
+        let new_attempt = ApproveAttemptId::new();
+        log.start_approve_attempt(
+            new_attempt,
+            push_b,
+            "alice",
+            UnixMillis::from_millis(1_700_000_500),
+        )
+        .unwrap();
+
+        // UPDATE the `started` row to land in `resolved(pre_patch_failure)`
+        // AND set supersedes_attempt_id at the same time. The legal
+        // version of this transition (via complete_attempt_pre_patch_failure)
+        // does not touch supersedes_attempt_id; we are simulating a
+        // future-DAO or raw-SQL bypass.
+        let err = log
+            .with_conn_mut(|c| {
+                Ok(c.execute(
+                    "UPDATE git_push_approve_attempt
+                       SET state = 'resolved',
+                           outcome = 'pre_patch_failure',
+                           completed_at = 1700000600,
+                           failure_detail = 'sneaky',
+                           supersedes_attempt_id = ?1
+                     WHERE attempt_id = ?2",
+                    params![
+                        predecessor.as_uuid().to_string(),
+                        new_attempt.as_uuid().to_string(),
+                    ],
+                ))
+            })
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("supersedes_attempt_id is immutable after insert"),
+            "got: {err}"
+        );
+    }
+
+    /// Sanity check that legal state transitions which do NOT touch
+    /// `supersedes_attempt_id` continue to work unchanged after the
+    /// UPDATE immutability trigger is in place.
+    #[test]
+    fn supersedes_immutable_trigger_admits_normal_state_transitions() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let push_request_id = RequestId::new();
+        let _session = open_with_staged_request(&log, push_request_id);
+
+        let attempt = ApproveAttemptId::new();
+        log.start_approve_attempt(
+            attempt,
+            push_request_id,
+            "alice",
+            UnixMillis::from_millis(1_700_000_500),
+        )
+        .unwrap();
+        // started -> uncertain: must succeed (no supersedes change).
+        log.mark_attempt_uncertain(attempt, sample_promote_mint_audit())
+            .unwrap();
+        // uncertain -> resolved(post_patch_failure): must succeed.
+        log.complete_attempt_post_patch_failure(
+            attempt,
+            "github 5xx",
+            UnixMillis::from_millis(1_700_000_600),
+        )
+        .unwrap();
     }
 
     /// Property test: any sequence of legal DAO calls leaves the
