@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 6fa6d1f027e238e960565ec7b37f979d1e78eab58ae3be9ce465f0821659fbd6 # shrinks to events = [Stage(1), Approve(1, StartedOrphan), Crash]
