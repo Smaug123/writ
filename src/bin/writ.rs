@@ -20,18 +20,26 @@ use std::path::{Path, PathBuf};
 
 use clap::{ArgGroup, Parser, Subcommand, ValueEnum};
 
-use writ::agent_plan::{CorrelationId, Decider, DecisionOutcome, PlanId, Stage};
+use writ::agent_plan::{CorrelationId, Decider, PlanId, Stage};
 use writ::agent_run::AgentPrompt;
+use writ::cli::identity::{
+    capture_operator_identity, resolve_decision_outcome, resolve_reconcile_outcome,
+};
 use writ::cli::output::{
     write_agent_vm_sessions, write_plan_detail, write_plan_summaries, write_staged_push_detail,
     write_staged_push_summaries,
 };
+use writ::cli::parse::{parse_agent_kind, parse_correlation_id, parse_plan_id, parse_stage};
+use writ::cli::workspace::{
+    GuestSystem, build_workspace_bootstrap, build_workspace_bootstrap_from_repo,
+    default_guest_system, guest_image_attr,
+};
 use writ::core::{
     AgentKind, CapabilityRequest, GitHubAccess, GitHubRequest, RepoRef, RequestId, SessionId,
 };
-use writ::protocol::{ClientMessage, ReconcileOutcome, RejectionReason, ServerMessage};
+use writ::protocol::{ClientMessage, RejectionReason, ServerMessage};
 use writ::server::default_socket_path;
-use writ::vm_git::{AgentVmWorkspaceBootstrap, GitCloneRepo, GitObjectId, WorkspaceWarmMode};
+use writ::vm_git::{AgentVmWorkspaceBootstrap, WorkspaceWarmMode};
 
 #[derive(Parser)]
 #[command(name = "writ", about = "writ broker client")]
@@ -363,15 +371,6 @@ enum GuestSystemArg {
     X86_64Linux,
 }
 
-impl GuestSystemArg {
-    fn as_str(self) -> &'static str {
-        match self {
-            GuestSystemArg::Aarch64Linux => "aarch64-linux",
-            GuestSystemArg::X86_64Linux => "x86_64-linux",
-        }
-    }
-}
-
 impl From<Access> for GitHubAccess {
     fn from(a: Access) -> Self {
         match a {
@@ -461,7 +460,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 warm,
                 guest_command,
             } => {
-                let workspace = build_workspace_bootstrap(repo, workspace, warm)?;
+                let workspace =
+                    build_workspace_bootstrap(repo, workspace, warm.map(WorkspaceWarmMode::from))?;
                 start_agent_vm(&socket_path, label, agent, model, workspace, guest_command)?;
             }
             AgentVmCmd::Stop { session_id } => {
@@ -710,103 +710,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn parse_agent_kind(raw: &str) -> Result<AgentKind, String> {
-    raw.parse::<AgentKind>().map_err(|err| err.to_string())
-}
-
-fn parse_correlation_id(raw: &str) -> Result<CorrelationId, String> {
-    CorrelationId::try_new(raw).map_err(|err| err.to_string())
-}
-
-fn parse_stage(raw: &str) -> Result<Stage, String> {
-    raw.parse::<Stage>().map_err(|err| err.to_string())
-}
-
-fn parse_plan_id(raw: &str) -> Result<PlanId, String> {
-    raw.parse::<PlanId>().map_err(|err| err.to_string())
-}
-
-/// Read the operator identity the CLI will assert to the broker.
-///
-/// The local socket is the trust boundary, so this only needs to be a
-/// stable, human-readable label. The pure mapping lives in
-/// [`classify_operator_identity`] so it can be exercised in tests
-/// without mutating the process environment — `std::env::set_var` is
-/// unsafe under Rust 2024 and would race with Clap's env-aware
-/// argument parsing in other unit tests.
-fn capture_operator_identity() -> String {
-    classify_operator_identity(std::env::var("USER").ok())
-}
-
-/// `$USER` is what every interactive shell sets; if it is missing or
-/// empty (some CI containers drop it), record `"unknown"` rather than
-/// failing the reject — the audit row should always land.
-fn classify_operator_identity(user: Option<String>) -> String {
-    match user {
-        Some(value) if !value.is_empty() => value,
-        _ => "unknown".to_string(),
-    }
-}
-
-/// Map the parsed `--accept` / `--reject-restart` flags to a
-/// [`DecisionOutcome`]. Clap's `ArgGroup` enforces exactly-one before
-/// we get here, so the `(false, false)` and `(true, true)` cases are
-/// unreachable in practice — they panic loudly rather than guess.
-fn resolve_decision_outcome(accept: bool, reject_restart: bool) -> DecisionOutcome {
-    match (accept, reject_restart) {
-        (true, false) => DecisionOutcome::Accepted,
-        (false, true) => DecisionOutcome::RejectedRestart,
-        (false, false) | (true, true) => {
-            unreachable!("clap ArgGroup enforces exactly one of --accept / --reject-restart")
-        }
-    }
-}
-
-/// Map the parsed reconcile flag set to a [`ReconcileOutcome`]. Clap's
-/// `ArgGroup` enforces exactly-one of `--confirmed-applied` /
-/// `--confirmed-not-applied`, and `required_if_eq` enforces that the
-/// dependent text/SHA flags are present, so the `None` arms here are
-/// unreachable in practice and panic rather than guess.
-///
-/// `new_app_tip` is parsed via [`GitObjectId::from_str`] so a malformed
-/// SHA fails fast at the CLI instead of after the daemon round-trip.
-fn resolve_reconcile_outcome(
-    confirmed_applied: bool,
-    confirmed_not_applied: bool,
-    new_app_tip: Option<String>,
-    reason: Option<String>,
-    detail: Option<String>,
-) -> Result<ReconcileOutcome, Box<dyn std::error::Error>> {
-    match (confirmed_applied, confirmed_not_applied) {
-        (true, false) => {
-            let new_app_tip = new_app_tip.unwrap_or_else(|| {
-                unreachable!("clap required_if_eq enforces --new-app-tip with --confirmed-applied")
-            });
-            let reason = reason.unwrap_or_else(|| {
-                unreachable!("clap required_if_eq enforces --reason with --confirmed-applied")
-            });
-            let new_app_tip: GitObjectId = new_app_tip
-                .parse()
-                .map_err(|e| format!("invalid --new-app-tip: {e}"))?;
-            Ok(ReconcileOutcome::Applied {
-                new_app_tip,
-                reason,
-            })
-        }
-        (false, true) => {
-            let detail = detail.unwrap_or_else(|| {
-                unreachable!("clap required_if_eq enforces --detail with --confirmed-not-applied")
-            });
-            Ok(ReconcileOutcome::NotApplied { detail })
-        }
-        (false, false) | (true, true) => {
-            unreachable!(
-                "clap ArgGroup enforces exactly one of --confirmed-applied / --confirmed-not-applied"
-            )
-        }
-    }
-}
-
 fn start_agent_vm(
     socket_path: &Path,
     label: Option<String>,
@@ -901,7 +804,7 @@ fn build_agent_vm_guest_image(
         .into());
     }
     let guest_system = match guest_system {
-        Some(g) => g,
+        Some(g) => GuestSystem::from(g),
         None => default_guest_system(std::env::consts::ARCH)?,
     };
     let attr = guest_image_attr(proof, guest_system);
@@ -945,83 +848,21 @@ fn build_agent_vm_guest_image(
     Ok(())
 }
 
-/// Pure mapping from `std::env::consts::ARCH` (or equivalent string)
-/// to the flake's guest system suffix. Mirrors the proof harness's
-/// `default_guest_system` shell helper.
-fn default_guest_system(arch: &str) -> Result<GuestSystemArg, Box<dyn std::error::Error>> {
-    match arch {
-        "aarch64" | "arm64" => Ok(GuestSystemArg::Aarch64Linux),
-        "x86_64" | "amd64" => Ok(GuestSystemArg::X86_64Linux),
-        other => Err(format!(
-            "unsupported host architecture for default guest image: {other}; \
-             pass --guest-system aarch64-linux|x86_64-linux to override",
-        )
-        .into()),
-    }
-}
-
-/// Pure helper picking the flake attribute name for a given variant
-/// and guest system. The flake exposes
-/// `agent-vm-guest-image-<system>` and
-/// `agent-vm-guest-proof-image-<system>`; keeping this in one place
-/// means the CLI can never drift from the flake's naming scheme.
-fn guest_image_attr(proof: bool, guest_system: GuestSystemArg) -> String {
-    let prefix = if proof {
-        "agent-vm-guest-proof-image"
-    } else {
-        "agent-vm-guest-image"
-    };
-    format!("{prefix}-{}", guest_system.as_str())
-}
-
-fn build_workspace_bootstrap(
-    repo: Option<String>,
-    destination: Option<PathBuf>,
-    warm: Option<WorkspaceWarmArg>,
-) -> Result<Option<AgentVmWorkspaceBootstrap>, Box<dyn std::error::Error>> {
-    let Some(raw_repo) = repo else {
-        if destination.is_some() {
-            return Err("--workspace requires --repo".into());
-        }
-        if warm.is_some() {
-            return Err("--warm requires --repo".into());
-        }
-        return Ok(None);
-    };
-    build_workspace_bootstrap_from_repo(
-        raw_repo,
-        destination,
-        warm.unwrap_or(WorkspaceWarmArg::DevShell).into(),
-    )
-    .map(Some)
-}
-
-fn build_workspace_bootstrap_from_repo(
-    raw_repo: String,
-    destination: Option<PathBuf>,
-    warm: WorkspaceWarmMode,
-) -> Result<AgentVmWorkspaceBootstrap, Box<dyn std::error::Error>> {
-    if let Some(destination) = destination.as_ref()
-        && destination.to_str().is_none()
-    {
-        return Err("--workspace path must be valid UTF-8".into());
-    }
-    let repo: GitCloneRepo = raw_repo
-        .parse()
-        .map_err(|err| format!("invalid GitHub repository {raw_repo:?}: {err}"))?;
-    Ok(AgentVmWorkspaceBootstrap {
-        repo,
-        destination,
-        warm,
-    })
-}
-
 impl From<WorkspaceWarmArg> for WorkspaceWarmMode {
     fn from(value: WorkspaceWarmArg) -> Self {
         match value {
             WorkspaceWarmArg::None => Self::None,
             WorkspaceWarmArg::Sources => Self::Sources,
             WorkspaceWarmArg::DevShell => Self::DevShell,
+        }
+    }
+}
+
+impl From<GuestSystemArg> for GuestSystem {
+    fn from(value: GuestSystemArg) -> Self {
+        match value {
+            GuestSystemArg::Aarch64Linux => Self::Aarch64Linux,
+            GuestSystemArg::X86_64Linux => Self::X86_64Linux,
         }
     }
 }
@@ -1109,50 +950,6 @@ fn call_with_timeout(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn workspace_related_flags_require_repo() {
-        assert!(
-            build_workspace_bootstrap(None, Some(PathBuf::from("/workspace/repo")), None)
-                .unwrap_err()
-                .to_string()
-                .contains("--workspace requires --repo")
-        );
-        assert!(
-            build_workspace_bootstrap(None, None, Some(WorkspaceWarmArg::Sources))
-                .unwrap_err()
-                .to_string()
-                .contains("--warm requires --repo")
-        );
-    }
-
-    #[test]
-    fn workspace_bootstrap_defaults_to_devshell_warmup_when_repo_is_set() {
-        let workspace = build_workspace_bootstrap(Some("owner/repo".into()), None, None)
-            .unwrap()
-            .unwrap();
-
-        assert_eq!(workspace.repo.to_string(), "owner/repo");
-        assert_eq!(workspace.destination, None);
-        assert_eq!(workspace.warm, WorkspaceWarmMode::DevShell);
-    }
-
-    #[test]
-    fn workspace_bootstrap_accepts_explicit_none_warmup() {
-        let workspace = build_workspace_bootstrap(
-            Some("owner/repo".into()),
-            Some(PathBuf::from("/workspace/repo")),
-            Some(WorkspaceWarmArg::None),
-        )
-        .unwrap()
-        .unwrap();
-
-        assert_eq!(
-            workspace.destination,
-            Some(PathBuf::from("/workspace/repo"))
-        );
-        assert_eq!(workspace.warm, WorkspaceWarmMode::None);
-    }
 
     #[test]
     fn agent_run_cli_accepts_agent_repo_prompt_and_warmup() {
@@ -1462,23 +1259,6 @@ mod tests {
             err.to_string().contains("--model"),
             "unexpected clap error: {err}"
         );
-    }
-
-    #[test]
-    fn agent_run_workspace_uses_requested_repo_destination_and_warmup() {
-        let workspace = build_workspace_bootstrap_from_repo(
-            "owner/repo".into(),
-            Some(PathBuf::from("/workspace/custom")),
-            WorkspaceWarmMode::Sources,
-        )
-        .unwrap();
-
-        assert_eq!(workspace.repo.to_string(), "owner/repo");
-        assert_eq!(
-            workspace.destination,
-            Some(PathBuf::from("/workspace/custom"))
-        );
-        assert_eq!(workspace.warm, WorkspaceWarmMode::Sources);
     }
 
     #[test]
@@ -1824,81 +1604,6 @@ mod tests {
         }
     }
 
-    /// The pure resolver returns `Applied { new_app_tip, reason }` when
-    /// `--confirmed-applied` is set and the dependent flags are present.
-    /// This pins the field mapping so a future refactor that swaps
-    /// argument order at the call site can't silently mis-route values.
-    #[test]
-    fn resolve_reconcile_outcome_applied_returns_applied_variant() {
-        let outcome = resolve_reconcile_outcome(
-            true,
-            false,
-            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into()),
-            Some("manual confirmation".into()),
-            None,
-        )
-        .expect("applied resolution should succeed");
-        match outcome {
-            ReconcileOutcome::Applied {
-                new_app_tip,
-                reason,
-            } => {
-                assert_eq!(
-                    new_app_tip.as_str(),
-                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                );
-                assert_eq!(reason, "manual confirmation");
-            }
-            ReconcileOutcome::NotApplied { .. } => panic!("expected Applied variant"),
-        }
-    }
-
-    /// Symmetric coverage for the not-applied verdict; `detail` flows
-    /// through unchanged.
-    #[test]
-    fn resolve_reconcile_outcome_not_applied_returns_not_applied_variant() {
-        let outcome =
-            resolve_reconcile_outcome(false, true, None, None, Some("no remote movement".into()))
-                .expect("not-applied resolution should succeed");
-        match outcome {
-            ReconcileOutcome::NotApplied { detail } => {
-                assert_eq!(detail, "no remote movement");
-            }
-            ReconcileOutcome::Applied { .. } => panic!("expected NotApplied variant"),
-        }
-    }
-
-    /// A malformed SHA on `--new-app-tip` should fail at the CLI rather
-    /// than after the daemon round-trip; the resolver parses it via
-    /// `GitObjectId::from_str` and surfaces the parse error verbatim.
-    #[test]
-    fn resolve_reconcile_outcome_rejects_invalid_new_app_tip() {
-        let err = resolve_reconcile_outcome(
-            true,
-            false,
-            Some("not-a-sha".into()),
-            Some("manual confirmation".into()),
-            None,
-        )
-        .expect_err("invalid SHA should fail");
-        assert!(
-            err.to_string().contains("--new-app-tip"),
-            "unexpected error: {err}",
-        );
-    }
-
-    /// Pins the operator-identity mapping: a set value flows through
-    /// verbatim; missing or empty falls back to `"unknown"` so the
-    /// audit row always lands. Tested on the pure helper so the suite
-    /// never mutates `USER` at runtime — `set_var` would race with
-    /// Clap's env-aware parsers in other parallel tests.
-    #[test]
-    fn classify_operator_identity_maps_user_env_with_unknown_fallback() {
-        assert_eq!(classify_operator_identity(Some("alice".into())), "alice");
-        assert_eq!(classify_operator_identity(Some(String::new())), "unknown");
-        assert_eq!(classify_operator_identity(None), "unknown");
-    }
-
     #[test]
     fn plan_list_cli_accepts_correlation_id_filter() {
         let args =
@@ -2033,82 +1738,6 @@ mod tests {
         let both =
             Args::try_parse_from(["writ", "plan", "decide", id, "--accept", "--reject-restart"]);
         assert!(both.is_err(), "expected clap to reject both outcomes");
-    }
-
-    #[test]
-    fn resolve_decision_outcome_maps_each_flag() {
-        assert_eq!(
-            resolve_decision_outcome(true, false),
-            DecisionOutcome::Accepted,
-        );
-        assert_eq!(
-            resolve_decision_outcome(false, true),
-            DecisionOutcome::RejectedRestart,
-        );
-    }
-
-    /// The CLI must accept exactly the four host-arch spellings the
-    /// proof harness's `default_guest_system` shell helper accepts
-    /// (`arm64`/`aarch64`, `x86_64`/`amd64`) and surface a clear error
-    /// for anything else. This is the only place the `writ` CLI maps
-    /// host arch onto the flake's `agent-vm-guest-image-<system>`
-    /// suffix, so it doubles as a regression test for the suffix
-    /// names.
-    #[test]
-    fn default_guest_system_maps_arm_and_x86_aliases() {
-        for raw in ["aarch64", "arm64"] {
-            assert_eq!(
-                default_guest_system(raw).unwrap(),
-                GuestSystemArg::Aarch64Linux,
-                "{raw} should map to aarch64-linux",
-            );
-        }
-        for raw in ["x86_64", "amd64"] {
-            assert_eq!(
-                default_guest_system(raw).unwrap(),
-                GuestSystemArg::X86_64Linux,
-                "{raw} should map to x86_64-linux",
-            );
-        }
-    }
-
-    #[test]
-    fn default_guest_system_rejects_unknown_arch_with_actionable_message() {
-        let err = default_guest_system("riscv64")
-            .expect_err("riscv64 has no flake guest image target")
-            .to_string();
-        assert!(
-            err.contains("riscv64"),
-            "error should name the bad arch: {err}"
-        );
-        assert!(
-            err.contains("--guest-system"),
-            "error should point at the override flag: {err}",
-        );
-    }
-
-    /// The attribute name is the contract between the CLI and the
-    /// flake's `packages` set; if either side renames an attr without
-    /// the other, the CLI starts asking for a target that doesn't
-    /// exist. Lock the four spellings down.
-    #[test]
-    fn guest_image_attr_matches_flake_attribute_names() {
-        assert_eq!(
-            guest_image_attr(false, GuestSystemArg::Aarch64Linux),
-            "agent-vm-guest-image-aarch64-linux",
-        );
-        assert_eq!(
-            guest_image_attr(false, GuestSystemArg::X86_64Linux),
-            "agent-vm-guest-image-x86_64-linux",
-        );
-        assert_eq!(
-            guest_image_attr(true, GuestSystemArg::Aarch64Linux),
-            "agent-vm-guest-proof-image-aarch64-linux",
-        );
-        assert_eq!(
-            guest_image_attr(true, GuestSystemArg::X86_64Linux),
-            "agent-vm-guest-proof-image-x86_64-linux",
-        );
     }
 
     #[test]
