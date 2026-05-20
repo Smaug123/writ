@@ -324,6 +324,38 @@ impl SignedRunMetadata {
     }
 }
 
+/// Operator-supplied outcome for a manual reconciliation against a
+/// quarantined staged push. Mirrors the two terminal states a
+/// reconciliation row may land in.
+///
+/// `Applied` declares that the broker's earlier PATCH did land on
+/// GitHub. `new_app_tip` is the SHA the operator observed on the
+/// remote branch — copied verbatim into the
+/// `git_push_resolution(decision='approved').new_app_tip` column the
+/// joint TX writes alongside the born-terminal attempt row. `reason`
+/// is the human note recorded as the resolution row's `reason`.
+///
+/// `NotApplied` declares that the PATCH did *not* land. No
+/// resolution row is written; the predecessor is cleared as a
+/// blocker and the push becomes rejectable/retryable. `detail` is
+/// recorded verbatim on the attempt row's `failure_detail`.
+///
+/// The inner tag is `kind` (rather than `type`) so the wire shape
+/// stays readable when nested under
+/// `ClientMessage::ReconcileStagedPush` — the outer envelope already
+/// owns the `type` key.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ReconcileOutcome {
+    Applied {
+        new_app_tip: GitObjectId,
+        reason: String,
+    },
+    NotApplied {
+        detail: String,
+    },
+}
+
 /// A message from the agent to the broker.
 ///
 /// `#[serde(deny_unknown_fields)]` at the enum level catches typos at the
@@ -489,6 +521,38 @@ pub enum ClientMessage {
         request_id: RequestId,
         operator: String,
     },
+    /// Record an operator decision to manually reconcile a quarantined
+    /// staged push: one whose latest non-superseded approve attempt is
+    /// either `Resolved(PostPatchFailure)` (the broker observed the
+    /// PATCH go out but the response was ambiguous) or `Uncertain` and
+    /// marked boot-observed (the daemon that wrote the row is provably
+    /// dead, so the row can no longer race a live worker). The broker
+    /// writes a born-terminal reconciliation attempt row that
+    /// `supersedes_attempt_id`-references the predecessor; for an
+    /// `Applied` outcome the same transaction also writes the
+    /// `git_push_resolution(decision='approved')` row, advancing the
+    /// push to a terminal "approved" state. For `NotApplied`, no
+    /// resolution row is written and the push becomes
+    /// rejectable/retryable.
+    ///
+    /// Replies with [`ServerMessage::StagedPushReconciled`] on success,
+    /// [`ServerMessage::UnknownStagedPush`] if the staging directory is
+    /// gone, [`ServerMessage::StagedPushAlreadyResolved`] if a prior
+    /// resolution is already recorded, or
+    /// [`ServerMessage::StagedPushNotReconcilable`] when no eligible
+    /// blocker exists (no attempts at all, the latest attempt is still
+    /// in flight, every blocker has already been superseded, or only
+    /// `Resolved(PrePatchFailure)` attempts remain).
+    ///
+    /// `operator` is the human identity the broker records in both the
+    /// reconciliation attempt row and (for `Applied`) the resolution
+    /// row. As with reject/approve, the local socket is the trust
+    /// boundary.
+    ReconcileStagedPush {
+        request_id: RequestId,
+        operator: String,
+        outcome: ReconcileOutcome,
+    },
     /// List every plan recorded in the audit log, optionally filtered
     /// to those whose planner run carries `correlation_id`. Replies
     /// with [`ServerMessage::Plans`].
@@ -652,6 +716,27 @@ pub enum ServerMessage {
         request_id: RequestId,
         new_app_tip: GitObjectId,
     },
+    /// Acknowledges [`ClientMessage::ReconcileStagedPush`]: the
+    /// born-terminal reconciliation attempt row was committed,
+    /// superseding the predecessor blocker. For an `Applied` outcome
+    /// the joint TX also committed the
+    /// `git_push_resolution(decision='approved')` row; for
+    /// `NotApplied`, no resolution row was written and the push is
+    /// once again rejectable/retryable. The CLI already knows which
+    /// outcome it sent, so the ack does not echo it.
+    StagedPushReconciled { request_id: RequestId },
+    /// The staged push referenced by
+    /// [`ClientMessage::ReconcileStagedPush`] has no eligible blocker
+    /// to clear — no `Uncertain` (with a boot-observed marker) or
+    /// `Resolved(PostPatchFailure)` attempt is currently outstanding
+    /// against it. `reason` carries a typed diagnostic the CLI
+    /// surfaces verbatim. Distinct from [`ServerMessage::Error`] so
+    /// the CLI distinguishes "nothing to reconcile" from a broker
+    /// failure without parsing prose.
+    StagedPushNotReconcilable {
+        request_id: RequestId,
+        reason: String,
+    },
     /// Listing of plans returned by [`ClientMessage::ListPlans`].
     /// Ordered ascending by `submitted_at` with rowid as the
     /// tie-break, matching the DAO query.
@@ -773,6 +858,15 @@ impl std::fmt::Debug for ServerMessage {
                 .debug_struct("StagedPushApproved")
                 .field("request_id", request_id)
                 .field("new_app_tip", new_app_tip)
+                .finish(),
+            Self::StagedPushReconciled { request_id } => f
+                .debug_struct("StagedPushReconciled")
+                .field("request_id", request_id)
+                .finish(),
+            Self::StagedPushNotReconcilable { request_id, reason } => f
+                .debug_struct("StagedPushNotReconcilable")
+                .field("request_id", request_id)
+                .field("reason", reason)
                 .finish(),
             Self::Plans { plans } => f.debug_struct("Plans").field("plans", plans).finish(),
             Self::Plan { plan } => f.debug_struct("Plan").field("plan", plan).finish(),
@@ -1280,6 +1374,86 @@ mod tests {
     }
 
     #[test]
+    fn reconcile_staged_push_applied_roundtrips() {
+        let msg = ClientMessage::ReconcileStagedPush {
+            request_id: sample_request_id(),
+            operator: "alice".into(),
+            outcome: ReconcileOutcome::Applied {
+                new_app_tip: sample_object_id('c'),
+                reason: "verified on GitHub UI".into(),
+            },
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert_eq!(serde_json::from_str::<ClientMessage>(&json).unwrap(), msg);
+        // The outcome is nested under `outcome` and carries its own `kind` tag,
+        // distinct from the outer `type` discriminator.
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["type"], "reconcile_staged_push");
+        assert_eq!(value["outcome"]["kind"], "applied");
+        assert_eq!(
+            value["outcome"]["new_app_tip"],
+            serde_json::Value::String(sample_object_id('c').as_str().to_string()),
+        );
+        assert_eq!(value["outcome"]["reason"], "verified on GitHub UI");
+    }
+
+    #[test]
+    fn reconcile_staged_push_not_applied_roundtrips() {
+        let msg = ClientMessage::ReconcileStagedPush {
+            request_id: sample_request_id(),
+            operator: "alice".into(),
+            outcome: ReconcileOutcome::NotApplied {
+                detail: "branch on GitHub is unchanged".into(),
+            },
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert_eq!(serde_json::from_str::<ClientMessage>(&json).unwrap(), msg);
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["outcome"]["kind"], "not_applied");
+        assert_eq!(value["outcome"]["detail"], "branch on GitHub is unchanged");
+        // `new_app_tip` and `reason` are exclusive to the `applied` variant.
+        assert!(value["outcome"].get("new_app_tip").is_none());
+        assert!(value["outcome"].get("reason").is_none());
+    }
+
+    /// `ReconcileOutcome` is `deny_unknown_fields`: a typo in one of
+    /// the variant fields must be a parse error, not silently dropped.
+    #[test]
+    fn reconcile_outcome_rejects_unknown_fields() {
+        let bad = serde_json::json!({
+            "kind": "applied",
+            "new_app_tip": sample_object_id('c').as_str(),
+            "reason": "ok",
+            "extra": "stray",
+        });
+        let err = serde_json::from_value::<ReconcileOutcome>(bad).unwrap_err();
+        assert!(
+            err.to_string().contains("unknown field"),
+            "expected unknown-field error, got: {err}"
+        );
+    }
+
+    /// Swapping the outcome `kind` must yield a different variant on
+    /// the other end — the discriminator is load-bearing.
+    #[test]
+    fn reconcile_outcome_discriminator_chooses_variant() {
+        let applied = serde_json::json!({
+            "kind": "applied",
+            "new_app_tip": sample_object_id('d').as_str(),
+            "reason": "matches",
+        });
+        let parsed: ReconcileOutcome = serde_json::from_value(applied).unwrap();
+        assert!(matches!(parsed, ReconcileOutcome::Applied { .. }));
+
+        let not_applied = serde_json::json!({
+            "kind": "not_applied",
+            "detail": "no",
+        });
+        let parsed: ReconcileOutcome = serde_json::from_value(not_applied).unwrap();
+        assert!(matches!(parsed, ReconcileOutcome::NotApplied { .. }));
+    }
+
+    #[test]
     fn rejection_reason_empty_is_rejected() {
         let err = RejectionReason::try_new("").unwrap_err();
         assert!(matches!(err, RejectionReasonError::Empty));
@@ -1589,6 +1763,30 @@ mod tests {
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert_eq!(serde_json::from_str::<ServerMessage>(&json).unwrap(), msg);
+    }
+
+    #[test]
+    fn staged_push_reconciled_roundtrips() {
+        let msg = ServerMessage::StagedPushReconciled {
+            request_id: sample_request_id(),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert_eq!(serde_json::from_str::<ServerMessage>(&json).unwrap(), msg);
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["type"], "staged_push_reconciled");
+    }
+
+    #[test]
+    fn staged_push_not_reconcilable_roundtrips() {
+        let msg = ServerMessage::StagedPushNotReconcilable {
+            request_id: sample_request_id(),
+            reason: "no eligible blocker".into(),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert_eq!(serde_json::from_str::<ServerMessage>(&json).unwrap(), msg);
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["type"], "staged_push_not_reconcilable");
+        assert_eq!(value["reason"], "no eligible blocker");
     }
 
     #[test]
@@ -2076,6 +2274,36 @@ mod tests {
             approved["new_app_tip"],
             serde_json::Value::String(sample_object_id('e').as_str().to_string()),
         );
+
+        let reconcile: serde_json::Value =
+            serde_json::to_value(ClientMessage::ReconcileStagedPush {
+                request_id: sample_request_id(),
+                operator: "alice".into(),
+                outcome: ReconcileOutcome::NotApplied {
+                    detail: "no PATCH".into(),
+                },
+            })
+            .unwrap();
+        assert_eq!(reconcile["type"], "reconcile_staged_push");
+        assert_eq!(reconcile["operator"], "alice");
+        assert_eq!(reconcile["outcome"]["kind"], "not_applied");
+        assert_eq!(reconcile["outcome"]["detail"], "no PATCH");
+
+        let reconciled: serde_json::Value =
+            serde_json::to_value(ServerMessage::StagedPushReconciled {
+                request_id: sample_request_id(),
+            })
+            .unwrap();
+        assert_eq!(reconciled["type"], "staged_push_reconciled");
+
+        let not_reconcilable: serde_json::Value =
+            serde_json::to_value(ServerMessage::StagedPushNotReconcilable {
+                request_id: sample_request_id(),
+                reason: "no eligible blocker".into(),
+            })
+            .unwrap();
+        assert_eq!(not_reconcilable["type"], "staged_push_not_reconcilable");
+        assert_eq!(not_reconcilable["reason"], "no eligible blocker");
     }
 
     /// `unknown_staged_push` carries its own type tag so a client
@@ -2579,7 +2807,7 @@ mod tests {
         /// variant, and assert the result fails to parse.
         #[test]
         fn client_message_rejects_unknown_top_level_fields(
-            variant_index in 0usize..15,
+            variant_index in 0usize..16,
             // ASCII-letters-only key, excluded against the union of every
             // variant's known field names below.
             unknown_key in "[a-z]{1,16}",
@@ -2684,6 +2912,14 @@ mod tests {
             14 => ClientMessage::ApproveStagedPush {
                 request_id: "12345678-1234-1234-1234-123456789012".parse().unwrap(),
                 operator: "alice".into(),
+            },
+            15 => ClientMessage::ReconcileStagedPush {
+                request_id: "12345678-1234-1234-1234-123456789012".parse().unwrap(),
+                operator: "alice".into(),
+                outcome: ReconcileOutcome::Applied {
+                    new_app_tip: sample_object_id('c'),
+                    reason: "verified".into(),
+                },
             },
             other => unreachable!("variant index out of range: {other}"),
         }

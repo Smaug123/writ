@@ -166,6 +166,39 @@ pub struct GitPushApproveAttemptEntry {
     pub state: GitPushApproveAttemptState,
 }
 
+/// Whether a staged push has an approve attempt that the manual
+/// reconciliation handler can act on. Returned by
+/// [`AuditLog::classify_reconciliation_target`]; the broker's
+/// `reconcile_staged_push` RPC maps this into the
+/// reconciled-vs-not-reconcilable reply.
+///
+/// The variants are mutually exclusive: a push has exactly one
+/// classification at any point in time. The `Eligible` variant carries
+/// the attempt id that a follow-up
+/// [`AuditLog::record_reconciliation_attempt_applied`] /
+/// [`AuditLog::record_reconciliation_attempt_not_applied`] call will
+/// supersede.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ReconciliationTarget {
+    /// Found a non-superseded predecessor in an eligible state — the
+    /// caller should drive the reconciliation through the DAO. An
+    /// `Uncertain` predecessor only counts as eligible when it carries
+    /// a boot-observed marker (proof that the live broker is no longer
+    /// running the attempt); a `Resolved(PostPatchFailure)` predecessor
+    /// is always eligible.
+    Eligible { attempt_id: ApproveAttemptId },
+    /// No approve attempt has ever been recorded against this push.
+    NoAttempts,
+    /// At least one non-superseded attempt is `Started`, or `Uncertain`
+    /// without a boot-observed marker. The live broker may still be
+    /// driving it; reconciliation must wait until boot reconcile runs.
+    AttemptInFlight,
+    /// Every non-superseded attempt is `Resolved(PrePatchFailure)`
+    /// (cleanly terminated) or `Resolved(Succeeded)` (already approved).
+    /// Nothing for the operator to clear.
+    NothingToReconcile,
+}
+
 /// Whether a staged push has any approve attempt that prevents it from
 /// being rejected. Returned by [`AuditLog::reject_blocker_for_push`];
 /// the reject handler maps this into the reject-vs-refuse decision.
@@ -1303,6 +1336,106 @@ impl AuditLog {
                     .map(ApproveAttemptId::from_uuid)
                     .map_err(|_| {
                         AuditError::Invariant("approve attempt row: supersedes id is not a uuid")
+                    })?;
+                out.insert(id);
+            }
+            Ok(out)
+        })
+    }
+
+    /// Classify the staged push for the manual reconciliation handler.
+    /// Picks the oldest non-superseded eligible predecessor (`Uncertain`
+    /// with a boot-observed marker, or `Resolved(PostPatchFailure)`).
+    /// Returns a typed [`ReconciliationTarget`] so the broker reply can
+    /// distinguish "go ahead" from the four distinct "nothing to do"
+    /// shapes without parsing prose.
+    ///
+    /// Composes the existing reads ([`Self::approve_attempts_for_push`],
+    /// supersession-set lookup, boot-observed-set lookup) rather than
+    /// pushing the classification down into one SQL query: each
+    /// sub-read is already tested in isolation, and the classification
+    /// is a small Rust match the schema is too coarse to express.
+    pub fn classify_reconciliation_target(
+        &self,
+        push_request_id: RequestId,
+    ) -> Result<ReconciliationTarget, AuditError> {
+        let attempts = self.approve_attempts_for_push(push_request_id)?;
+        if attempts.is_empty() {
+            return Ok(ReconciliationTarget::NoAttempts);
+        }
+        let superseded = self.superseded_attempt_ids_for_push(push_request_id)?;
+        let boot_observed = self.boot_observed_attempt_ids_for_push(push_request_id)?;
+
+        // First non-superseded eligible attempt wins (started_at ASC).
+        let mut in_flight = false;
+        let mut eligible: Option<ApproveAttemptId> = None;
+
+        for attempt in attempts {
+            if superseded.contains(&attempt.attempt_id) {
+                continue;
+            }
+            match &attempt.state {
+                GitPushApproveAttemptState::Started => {
+                    in_flight = true;
+                }
+                GitPushApproveAttemptState::Uncertain { .. } => {
+                    if boot_observed.contains(&attempt.attempt_id) {
+                        if eligible.is_none() {
+                            eligible = Some(attempt.attempt_id);
+                        }
+                    } else {
+                        in_flight = true;
+                    }
+                }
+                GitPushApproveAttemptState::Resolved { outcome, .. } => match outcome {
+                    GitPushApproveAttemptOutcome::PostPatchFailure { .. } => {
+                        if eligible.is_none() {
+                            eligible = Some(attempt.attempt_id);
+                        }
+                    }
+                    GitPushApproveAttemptOutcome::Succeeded { .. }
+                    | GitPushApproveAttemptOutcome::PrePatchFailure { .. } => {}
+                },
+            }
+        }
+
+        if let Some(attempt_id) = eligible {
+            return Ok(ReconciliationTarget::Eligible { attempt_id });
+        }
+        if in_flight {
+            return Ok(ReconciliationTarget::AttemptInFlight);
+        }
+        Ok(ReconciliationTarget::NothingToReconcile)
+    }
+
+    /// `attempt_id`s for one push that boot reconcile has observed as
+    /// `Uncertain` survivors of a daemon restart — the live broker
+    /// never writes these markers, so any row in the set is provably
+    /// out from under the live worker. The reconciliation DAO requires
+    /// a marker before admitting an `Uncertain` predecessor, and
+    /// `classify_reconciliation_target` consults the same set so the
+    /// `AttemptInFlight` reply means "wait for boot reconcile" rather
+    /// than "wait forever."
+    fn boot_observed_attempt_ids_for_push(
+        &self,
+        push_request_id: RequestId,
+    ) -> Result<std::collections::HashSet<ApproveAttemptId>, AuditError> {
+        self.with_conn(|c| {
+            let mut stmt = c.prepare(
+                "SELECT bo.attempt_id
+                   FROM git_push_approve_attempt_boot_observed bo
+                   JOIN git_push_approve_attempt a
+                     ON a.attempt_id = bo.attempt_id
+                  WHERE a.push_request_id = ?1",
+            )?;
+            let mut out = std::collections::HashSet::new();
+            let mut rows = stmt.query(params![push_request_id.as_uuid().to_string()])?;
+            while let Some(row) = rows.next()? {
+                let raw: String = row.get(0)?;
+                let id = uuid::Uuid::parse_str(&raw)
+                    .map(ApproveAttemptId::from_uuid)
+                    .map_err(|_| {
+                        AuditError::Invariant("boot-observed row: attempt_id is not a uuid")
                     })?;
                 out.insert(id);
             }

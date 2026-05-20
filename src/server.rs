@@ -25,7 +25,8 @@ use crate::agent_run::{AgentPrompt, AgentRunId, sha256_hex};
 use crate::agent_vm_daemon::AgentVmDaemon;
 use crate::audit::{
     AUDIT_WRITE_FAILURE_TARGET, AuditError, AuditLog, GitPushOutcomeResult, GitPushResolution,
-    GitPushResolutionRecord, PlanDecisionRecord, PreMintRecord, PromoteMintAudit, RejectBlocker,
+    GitPushResolutionRecord, PlanDecisionRecord, PreMintRecord, PromoteMintAudit,
+    ReconciliationTarget, RejectBlocker,
 };
 use crate::core::{
     ApproveAttemptId, CapabilityRequest, GITHUB_INSTALLATION_TOKEN_MAX_SECONDS, GitHubAccess,
@@ -41,8 +42,8 @@ use crate::notes_repo::NotesRepo;
 use crate::policy::{self, PolicyConfig};
 use crate::protocol::{
     ClientMessage, PlanAbortView, PlanAddendumView, PlanDetail, PlanReviewView, PlanSummary,
-    RejectionReason, ServerMessage, SignedRunMetadata, StagedPushAuditView, StagedPushDetail,
-    StagedPushSummary,
+    ReconcileOutcome, RejectionReason, ServerMessage, SignedRunMetadata, StagedPushAuditView,
+    StagedPushDetail, StagedPushSummary,
 };
 use crate::run_envelope::{OutputEnvelope, SignedRunEnvelope};
 use crate::secret::SecretStore;
@@ -332,6 +333,11 @@ pub async fn dispatch_message_with_agent_vm<S: SecretStore + Send + Sync + 'stat
             request_id,
             operator,
         } => approve_staged_push(state, request_id, operator).await,
+        ClientMessage::ReconcileStagedPush {
+            request_id,
+            operator,
+            outcome,
+        } => reconcile_staged_push(state, request_id, operator, outcome).await,
         ClientMessage::ListPlans { correlation_id } => list_plans(state, correlation_id).await,
         ClientMessage::ShowPlan { plan_id } => show_plan(state, plan_id).await,
         ClientMessage::DecidePlan {
@@ -1574,6 +1580,339 @@ fn approve_staged_push_not_configured(component: &str) -> ServerMessage {
              writd needs staging_store + promote_runtime + signing_key to serve ApproveStagedPush"
         ),
     }
+}
+
+/// Handler for [`ClientMessage::ReconcileStagedPush`].
+///
+/// Drives a manual reconciliation of a quarantined approve attempt by
+/// inserting a born-terminal `git_push_approve_attempt` row whose
+/// `supersedes_attempt_id` points back at the predecessor. The
+/// predecessor is the oldest non-superseded attempt in either
+/// `Uncertain` (boot-observed only) or `Resolved(PostPatchFailure)` —
+/// the two states that wedge a staged push between reject and approve
+/// after the broker observes (or may have observed) the PATCH go out.
+///
+/// Flow:
+///   1. Wire-side validation of `operator` and the outcome's free-form
+///      text (`reason` on `Applied`, `detail` on `NotApplied`): non-empty
+///      and bounded so a malformed CLI cannot bloat the audit DB. The
+///      DAO repeats the non-empty check as defence-in-depth; the upper
+///      bound is enforced at the wire only.
+///   2. Require `staging_store` configured. Reconciliation requires a
+///      staging dir to act against (operators inspect it to decide
+///      Applied vs NotApplied); a daemon without staging cannot honour
+///      the request.
+///   3. Load the staging entry. Missing dir surfaces as
+///      `UnknownStagedPush` — symmetrical with reject/approve.
+///   4. Joined audit view: a prior resolution row short-circuits to
+///      `StagedPushAlreadyResolved`. This guards against the operator
+///      racing themselves (e.g. running `promote reconcile` against a
+///      push that just landed a duplicate approve).
+///   5. Classify the push via [`AuditLog::classify_reconciliation_target`]:
+///        * `Eligible { attempt_id }` → fall through to the DAO write.
+///        * Anything else → `StagedPushNotReconcilable` with a typed
+///          reason naming the classification.
+///   6. Mint a fresh `ApproveAttemptId` for the reconciliation row and
+///      branch on `outcome`:
+///        * `Applied` → joint TX writes the reconciliation attempt row
+///          *and* the `git_push_resolution(decision='approved')` row,
+///          carrying the predecessor's captured mint context verbatim.
+///        * `NotApplied` → born-terminal `Resolved(PrePatchFailure)`
+///          reconciliation row. No resolution row is written; the push
+///          is once again rejectable.
+///   7. On `Applied` success: best-effort `staging_store.delete`. On
+///      `NotApplied`: leave the staging dir on disk so the operator can
+///      drive a follow-up reject/retry.
+///   8. Map any `AuditError::Invariant` returned by the DAO into
+///      `StagedPushNotReconcilable` — the predecessor's eligibility
+///      slipped between classify and the write (concurrent
+///      reconciliation, race with a state change). Other errors land
+///      as `ServerMessage::Error` and are logged at
+///      [`AUDIT_WRITE_FAILURE_TARGET`].
+async fn reconcile_staged_push<S: SecretStore + Send + Sync + 'static>(
+    state: &Arc<BrokerState<S>>,
+    request_id: RequestId,
+    operator: String,
+    outcome: ReconcileOutcome,
+) -> ServerMessage {
+    if operator.is_empty() {
+        return ServerMessage::Error {
+            message: "operator identity must not be empty".into(),
+        };
+    }
+    if operator.len() > MAX_OPERATOR_BYTES {
+        return ServerMessage::Error {
+            message: format!(
+                "operator identity is {} bytes, exceeding the {MAX_OPERATOR_BYTES}-byte limit",
+                operator.len(),
+            ),
+        };
+    }
+
+    // The free-form outcome text gets recorded verbatim on the audit
+    // row (`reason` on the resolution row for Applied, `failure_detail`
+    // on the reconciliation attempt for NotApplied). Cap at the same
+    // 4 KiB upper bound the `RejectionReason` parser enforces so the
+    // audit DB cannot be bloated by a malformed CLI.
+    let outcome_text = match &outcome {
+        ReconcileOutcome::Applied { reason, .. } => ("reason", reason.as_str()),
+        ReconcileOutcome::NotApplied { detail } => ("detail", detail.as_str()),
+    };
+    if outcome_text.1.is_empty() {
+        return ServerMessage::Error {
+            message: format!(
+                "reconciliation {label} must not be empty",
+                label = outcome_text.0,
+            ),
+        };
+    }
+    if outcome_text.1.len() > crate::protocol::MAX_REJECTION_REASON_BYTES {
+        return ServerMessage::Error {
+            message: format!(
+                "reconciliation {label} is {len} bytes, exceeding the {cap}-byte limit",
+                label = outcome_text.0,
+                len = outcome_text.1.len(),
+                cap = crate::protocol::MAX_REJECTION_REASON_BYTES,
+            ),
+        };
+    }
+
+    let Some(staging_store) = state.staging_store.clone() else {
+        return staging_not_configured();
+    };
+
+    // Probe staging before any audit work. Missing-dir is the same
+    // surface as reject/approve; if the operator passes a stale request
+    // id we want to say so explicitly rather than write an audit row
+    // referencing a push the broker can no longer see.
+    let load_check = {
+        let staging_store = Arc::clone(&staging_store);
+        tokio::task::spawn_blocking(move || staging_store.load(request_id)).await
+    };
+    match load_check {
+        Ok(Ok(_)) => {}
+        Ok(Err(StagingError::NotFound { request_id })) => {
+            return ServerMessage::UnknownStagedPush { request_id };
+        }
+        Ok(Err(err)) => {
+            return ServerMessage::Error {
+                message: err.to_string(),
+            };
+        }
+        Err(err) => {
+            return ServerMessage::Error {
+                message: format!("staging load task failed: {err}"),
+            };
+        }
+    }
+
+    // Short-circuit on a prior resolution row before classifying. A
+    // resolved push has nothing to reconcile (the operator decision
+    // is already in place), and saying so explicitly avoids spending
+    // a classify SELECT on a no-op.
+    let audit_lookup = {
+        let audit = Arc::clone(&state.audit);
+        tokio::task::spawn_blocking(move || audit.get_git_push(request_id)).await
+    };
+    match audit_lookup {
+        Ok(Ok(Some(entry))) => {
+            if entry.resolution.is_some() {
+                return ServerMessage::StagedPushAlreadyResolved { request_id };
+            }
+        }
+        Ok(Ok(None)) => {
+            return ServerMessage::Error {
+                message: format!(
+                    "staged push {request_id} has a staging directory but no audit row; \
+                     broker audit log and staging store have drifted apart"
+                ),
+            };
+        }
+        Ok(Err(err)) => {
+            return ServerMessage::Error {
+                message: format!("audit lookup failed: {err}"),
+            };
+        }
+        Err(err) => {
+            return ServerMessage::Error {
+                message: format!("audit lookup task failed: {err}"),
+            };
+        }
+    }
+
+    // Classify the push. The variants surface to the operator as four
+    // distinct "nothing to reconcile" reasons so the CLI can guide the
+    // next action (wait for boot reconcile vs. there was never an
+    // attempt vs. every blocker is already cleared).
+    let target_lookup = {
+        let audit = Arc::clone(&state.audit);
+        tokio::task::spawn_blocking(move || audit.classify_reconciliation_target(request_id)).await
+    };
+    let predecessor = match target_lookup {
+        Ok(Ok(ReconciliationTarget::Eligible { attempt_id })) => attempt_id,
+        Ok(Ok(ReconciliationTarget::NoAttempts)) => {
+            return ServerMessage::StagedPushNotReconcilable {
+                request_id,
+                reason: format!(
+                    "no approve attempt has been recorded against staged push {request_id}; \
+                     nothing to reconcile"
+                ),
+            };
+        }
+        Ok(Ok(ReconciliationTarget::AttemptInFlight)) => {
+            return ServerMessage::StagedPushNotReconcilable {
+                request_id,
+                reason: format!(
+                    "staged push {request_id} has an in-flight approve attempt; \
+                     reconciliation must wait for the live attempt to resolve \
+                     (or for boot reconcile to drive a daemon-survivor row)"
+                ),
+            };
+        }
+        Ok(Ok(ReconciliationTarget::NothingToReconcile)) => {
+            return ServerMessage::StagedPushNotReconcilable {
+                request_id,
+                reason: format!(
+                    "staged push {request_id} has no quarantined approve attempt to clear; \
+                     every attempt is already cleanly terminated"
+                ),
+            };
+        }
+        Ok(Err(err)) => {
+            tracing::error!(
+                target: AUDIT_WRITE_FAILURE_TARGET,
+                kind = "classify_reconciliation_target",
+                request_id = %request_id,
+                error = %err,
+                "audit read failed: reconciliation classification errored",
+            );
+            return ServerMessage::Error {
+                message: format!("reconciliation classification failed: {err}"),
+            };
+        }
+        Err(err) => {
+            return ServerMessage::Error {
+                message: format!("reconciliation classification task failed: {err}"),
+            };
+        }
+    };
+
+    let attempt_id = ApproveAttemptId::new();
+    let completed_at = UnixMillis::now();
+    let is_applied = matches!(outcome, ReconcileOutcome::Applied { .. });
+    let write_result = match outcome {
+        ReconcileOutcome::Applied {
+            new_app_tip,
+            reason,
+        } => {
+            let audit = Arc::clone(&state.audit);
+            let operator = operator.clone();
+            tokio::task::spawn_blocking(move || {
+                audit.record_reconciliation_attempt_applied(
+                    attempt_id,
+                    predecessor,
+                    &new_app_tip,
+                    &operator,
+                    &reason,
+                    completed_at,
+                )
+            })
+            .await
+        }
+        ReconcileOutcome::NotApplied { detail } => {
+            let audit = Arc::clone(&state.audit);
+            let operator = operator.clone();
+            tokio::task::spawn_blocking(move || {
+                audit.record_reconciliation_attempt_not_applied(
+                    attempt_id,
+                    predecessor,
+                    &operator,
+                    &detail,
+                    completed_at,
+                )
+            })
+            .await
+        }
+    };
+
+    // The DAO refuses on Invariant shapes that all reduce to "the
+    // predecessor isn't actually clearable any more" — most likely a
+    // concurrent reconciliation landed first. Surface the typed
+    // `NotReconcilable` so the operator re-runs `promote list` and
+    // picks the next blocker.
+    match write_result {
+        Ok(Ok(())) => {}
+        Ok(Err(AuditError::Invariant(detail))) => {
+            return ServerMessage::StagedPushNotReconcilable {
+                request_id,
+                reason: format!(
+                    "staged push {request_id} reconciliation refused by audit invariant: \
+                     {detail}; re-run promote list and retry"
+                ),
+            };
+        }
+        Ok(Err(AuditError::LabeledInvariant { label, message })) => {
+            return ServerMessage::StagedPushNotReconcilable {
+                request_id,
+                reason: format!(
+                    "staged push {request_id} reconciliation refused by audit invariant \
+                     ({label}): {message}; re-run promote list and retry"
+                ),
+            };
+        }
+        Ok(Err(err)) => {
+            tracing::error!(
+                target: AUDIT_WRITE_FAILURE_TARGET,
+                kind = "git_push_approve_attempt_reconciliation",
+                request_id = %request_id,
+                attempt_id = %attempt_id,
+                predecessor = %predecessor,
+                error = %err,
+                "audit write failed: reconciliation attempt not recorded",
+            );
+            return ServerMessage::Error {
+                message: err.to_string(),
+            };
+        }
+        Err(err) => {
+            return ServerMessage::Error {
+                message: format!("reconciliation audit write task failed: {err}"),
+            };
+        }
+    }
+
+    // Applied: the joint TX committed the resolution row. The push is
+    // now terminally approved, so the staging dir is finished — try to
+    // delete it the same way `approve_staged_push` does. NotApplied
+    // leaves the staging dir alone so a follow-up reject sees it on
+    // disk.
+    if is_applied {
+        let delete_result = {
+            let staging_store = Arc::clone(&staging_store);
+            tokio::task::spawn_blocking(move || staging_store.delete(request_id)).await
+        };
+        match delete_result {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                tracing::warn!(
+                    request_id = %request_id,
+                    error = %err,
+                    "reconciled (applied) staged push: staging dir delete failed; \
+                     audit row is committed, dir will appear in `promote list`",
+                );
+            }
+            Err(err) => {
+                tracing::warn!(
+                    request_id = %request_id,
+                    error = %err,
+                    "reconciled (applied) staged push: staging dir delete task failed; \
+                     leaving for boot-time reconciliation",
+                );
+            }
+        }
+    }
+
+    ServerMessage::StagedPushReconciled { request_id }
 }
 
 /// Maximum byte length of an error string echoed back on the wire in a
@@ -5282,6 +5621,709 @@ mod tests {
                 assert_eq!(request_id, unknown);
             }
             other => panic!("expected UnknownStagedPush, got {other:?}"),
+        }
+    }
+
+    // --- Reconcile staged push -----------------------------------------
+
+    /// Stage a push, start an approve attempt, drive it to `Uncertain`,
+    /// then mark it boot-observed so the row is eligible for manual
+    /// reconciliation. Returns `(request_id, predecessor_attempt_id)`.
+    /// Mirrors the `Uncertain` survivor case boot reconcile leaves on
+    /// disk after a daemon restart.
+    async fn stage_with_boot_observed_uncertain_attempt(
+        state: &Arc<BrokerState<InMemStore>>,
+        timeline_base_ms: i64,
+    ) -> (RequestId, ApproveAttemptId) {
+        let session_id = open_session(state).await;
+        let request_id = stage_with_staged_outcome(
+            state,
+            session_id,
+            b"bundle".to_vec(),
+            UnixMillis::from_millis(timeline_base_ms),
+            UnixMillis::from_millis(timeline_base_ms + 500),
+        )
+        .await;
+        let attempt_id = ApproveAttemptId::new();
+        state
+            .audit
+            .start_approve_attempt(
+                attempt_id,
+                request_id,
+                "alice",
+                UnixMillis::from_millis(timeline_base_ms + 1_000),
+            )
+            .unwrap();
+        state
+            .audit
+            .mark_attempt_uncertain(attempt_id, sample_promote_mint_audit())
+            .unwrap();
+        state
+            .audit
+            .mark_attempt_boot_observed(
+                attempt_id,
+                UnixMillis::from_millis(timeline_base_ms + 2_000),
+            )
+            .unwrap();
+        (request_id, attempt_id)
+    }
+
+    /// Stage a push, start an approve attempt, drive it through
+    /// `Uncertain` to `Resolved(PostPatchFailure)`. The predecessor is
+    /// terminal and does not require a boot-observed marker —
+    /// reconciliation is admitted directly.
+    async fn stage_with_post_patch_failure_attempt(
+        state: &Arc<BrokerState<InMemStore>>,
+        timeline_base_ms: i64,
+    ) -> (RequestId, ApproveAttemptId) {
+        let session_id = open_session(state).await;
+        let request_id = stage_with_staged_outcome(
+            state,
+            session_id,
+            b"bundle".to_vec(),
+            UnixMillis::from_millis(timeline_base_ms),
+            UnixMillis::from_millis(timeline_base_ms + 500),
+        )
+        .await;
+        let attempt_id = ApproveAttemptId::new();
+        state
+            .audit
+            .start_approve_attempt(
+                attempt_id,
+                request_id,
+                "alice",
+                UnixMillis::from_millis(timeline_base_ms + 1_000),
+            )
+            .unwrap();
+        state
+            .audit
+            .mark_attempt_uncertain(attempt_id, sample_promote_mint_audit())
+            .unwrap();
+        state
+            .audit
+            .complete_attempt_post_patch_failure(
+                attempt_id,
+                "github 502 on update_ref",
+                UnixMillis::from_millis(timeline_base_ms + 2_000),
+            )
+            .unwrap();
+        (request_id, attempt_id)
+    }
+
+    #[tokio::test]
+    async fn reconcile_staged_push_without_staging_configured_returns_error() {
+        let server = MockServer::start().await;
+        let state = make_state(&server, vec![], "o");
+        let resp = dispatch_message(
+            ClientMessage::ReconcileStagedPush {
+                request_id: RequestId::new(),
+                operator: "alice".into(),
+                outcome: ReconcileOutcome::NotApplied {
+                    detail: "operator confirmed no PATCH landed".into(),
+                },
+            },
+            &state,
+        )
+        .await;
+        match resp {
+            ServerMessage::Error { message } => {
+                assert!(message.contains("staging"), "got: {message}");
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn reconcile_staged_push_with_empty_operator_returns_error() {
+        let server = MockServer::start().await;
+        let (state, _tmp) = make_state_with_staging(&server);
+        let resp = dispatch_message(
+            ClientMessage::ReconcileStagedPush {
+                request_id: RequestId::new(),
+                operator: String::new(),
+                outcome: ReconcileOutcome::NotApplied { detail: "x".into() },
+            },
+            &state,
+        )
+        .await;
+        match resp {
+            ServerMessage::Error { message } => {
+                assert!(message.contains("operator"), "got: {message}");
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn reconcile_staged_push_with_oversize_operator_returns_error() {
+        let server = MockServer::start().await;
+        let (state, _tmp) = make_state_with_staging(&server);
+        let oversize = "a".repeat(MAX_OPERATOR_BYTES + 1);
+        let resp = dispatch_message(
+            ClientMessage::ReconcileStagedPush {
+                request_id: RequestId::new(),
+                operator: oversize,
+                outcome: ReconcileOutcome::NotApplied { detail: "x".into() },
+            },
+            &state,
+        )
+        .await;
+        match resp {
+            ServerMessage::Error { message } => {
+                assert!(message.contains("operator"), "got: {message}");
+                assert!(message.contains("byte"), "got: {message}");
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn reconcile_staged_push_with_empty_detail_returns_error() {
+        let server = MockServer::start().await;
+        let (state, _tmp) = make_state_with_staging(&server);
+        let resp = dispatch_message(
+            ClientMessage::ReconcileStagedPush {
+                request_id: RequestId::new(),
+                operator: "alice".into(),
+                outcome: ReconcileOutcome::NotApplied {
+                    detail: String::new(),
+                },
+            },
+            &state,
+        )
+        .await;
+        match resp {
+            ServerMessage::Error { message } => {
+                assert!(
+                    message.contains("detail") && message.contains("empty"),
+                    "got: {message}",
+                );
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn reconcile_staged_push_with_empty_reason_returns_error() {
+        let server = MockServer::start().await;
+        let (state, _tmp) = make_state_with_staging(&server);
+        let resp = dispatch_message(
+            ClientMessage::ReconcileStagedPush {
+                request_id: RequestId::new(),
+                operator: "alice".into(),
+                outcome: ReconcileOutcome::Applied {
+                    new_app_tip: sample_object_id('c'),
+                    reason: String::new(),
+                },
+            },
+            &state,
+        )
+        .await;
+        match resp {
+            ServerMessage::Error { message } => {
+                assert!(
+                    message.contains("reason") && message.contains("empty"),
+                    "got: {message}",
+                );
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn reconcile_staged_push_with_oversize_detail_returns_error() {
+        let server = MockServer::start().await;
+        let (state, _tmp) = make_state_with_staging(&server);
+        let oversize = "z".repeat(crate::protocol::MAX_REJECTION_REASON_BYTES + 1);
+        let resp = dispatch_message(
+            ClientMessage::ReconcileStagedPush {
+                request_id: RequestId::new(),
+                operator: "alice".into(),
+                outcome: ReconcileOutcome::NotApplied { detail: oversize },
+            },
+            &state,
+        )
+        .await;
+        match resp {
+            ServerMessage::Error { message } => {
+                assert!(message.contains("detail"), "got: {message}");
+                assert!(message.contains("byte"), "got: {message}");
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn reconcile_staged_push_with_unknown_request_returns_unknown_staged_push() {
+        let server = MockServer::start().await;
+        let (state, _tmp) = make_state_with_staging(&server);
+        let request_id = RequestId::new();
+        let resp = dispatch_message(
+            ClientMessage::ReconcileStagedPush {
+                request_id,
+                operator: "alice".into(),
+                outcome: ReconcileOutcome::NotApplied {
+                    detail: "operator confirmed nothing landed".into(),
+                },
+            },
+            &state,
+        )
+        .await;
+        assert_eq!(resp, ServerMessage::UnknownStagedPush { request_id });
+    }
+
+    #[tokio::test]
+    async fn reconcile_staged_push_with_no_attempts_returns_not_reconcilable() {
+        let server = MockServer::start().await;
+        let (state, _tmp) = make_state_with_staging(&server);
+        let session_id = open_session(&state).await;
+        let request_id = stage_with_staged_outcome(
+            &state,
+            session_id,
+            b"bundle".to_vec(),
+            UnixMillis::from_millis(1_700_010_000_000),
+            UnixMillis::from_millis(1_700_010_000_500),
+        )
+        .await;
+        let resp = dispatch_message(
+            ClientMessage::ReconcileStagedPush {
+                request_id,
+                operator: "alice".into(),
+                outcome: ReconcileOutcome::NotApplied {
+                    detail: "no attempts to reconcile".into(),
+                },
+            },
+            &state,
+        )
+        .await;
+        match resp {
+            ServerMessage::StagedPushNotReconcilable {
+                request_id: got_id,
+                reason,
+            } => {
+                assert_eq!(got_id, request_id);
+                assert!(
+                    reason.contains("no approve attempt"),
+                    "got reason: {reason}",
+                );
+            }
+            other => panic!("expected StagedPushNotReconcilable, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn reconcile_staged_push_with_in_flight_started_attempt_returns_not_reconcilable() {
+        let server = MockServer::start().await;
+        let (state, _tmp) = make_state_with_staging(&server);
+        let session_id = open_session(&state).await;
+        let request_id = stage_with_staged_outcome(
+            &state,
+            session_id,
+            b"bundle".to_vec(),
+            UnixMillis::from_millis(1_700_011_000_000),
+            UnixMillis::from_millis(1_700_011_000_500),
+        )
+        .await;
+        let attempt_id = ApproveAttemptId::new();
+        state
+            .audit
+            .start_approve_attempt(
+                attempt_id,
+                request_id,
+                "alice",
+                UnixMillis::from_millis(1_700_011_001_000),
+            )
+            .unwrap();
+
+        let resp = dispatch_message(
+            ClientMessage::ReconcileStagedPush {
+                request_id,
+                operator: "alice".into(),
+                outcome: ReconcileOutcome::NotApplied {
+                    detail: "racing reconciliation".into(),
+                },
+            },
+            &state,
+        )
+        .await;
+        match resp {
+            ServerMessage::StagedPushNotReconcilable {
+                request_id: got_id,
+                reason,
+            } => {
+                assert_eq!(got_id, request_id);
+                assert!(reason.contains("in-flight"), "got reason: {reason}");
+            }
+            other => panic!("expected StagedPushNotReconcilable, got {other:?}"),
+        }
+
+        // No reconciliation row was written.
+        let attempts = state.audit.approve_attempts_for_push(request_id).unwrap();
+        assert_eq!(attempts.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn reconcile_staged_push_with_uncertain_not_boot_observed_returns_not_reconcilable() {
+        let server = MockServer::start().await;
+        let (state, _tmp) = make_state_with_staging(&server);
+        let session_id = open_session(&state).await;
+        let request_id = stage_with_staged_outcome(
+            &state,
+            session_id,
+            b"bundle".to_vec(),
+            UnixMillis::from_millis(1_700_011_200_000),
+            UnixMillis::from_millis(1_700_011_200_500),
+        )
+        .await;
+        let attempt_id = ApproveAttemptId::new();
+        state
+            .audit
+            .start_approve_attempt(
+                attempt_id,
+                request_id,
+                "alice",
+                UnixMillis::from_millis(1_700_011_201_000),
+            )
+            .unwrap();
+        state
+            .audit
+            .mark_attempt_uncertain(attempt_id, sample_promote_mint_audit())
+            .unwrap();
+        // Note: no mark_attempt_boot_observed — the row may belong to a
+        // live worker and reconciliation must wait.
+
+        let resp = dispatch_message(
+            ClientMessage::ReconcileStagedPush {
+                request_id,
+                operator: "alice".into(),
+                outcome: ReconcileOutcome::NotApplied {
+                    detail: "racing reconciliation".into(),
+                },
+            },
+            &state,
+        )
+        .await;
+        match resp {
+            ServerMessage::StagedPushNotReconcilable {
+                request_id: got_id,
+                reason,
+            } => {
+                assert_eq!(got_id, request_id);
+                assert!(reason.contains("in-flight"), "got reason: {reason}");
+            }
+            other => panic!("expected StagedPushNotReconcilable, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn reconcile_staged_push_with_only_pre_patch_failure_returns_not_reconcilable() {
+        let server = MockServer::start().await;
+        let (state, _tmp) = make_state_with_staging(&server);
+        let session_id = open_session(&state).await;
+        let request_id = stage_with_staged_outcome(
+            &state,
+            session_id,
+            b"bundle".to_vec(),
+            UnixMillis::from_millis(1_700_012_000_000),
+            UnixMillis::from_millis(1_700_012_000_500),
+        )
+        .await;
+        let attempt_id = ApproveAttemptId::new();
+        state
+            .audit
+            .start_approve_attempt(
+                attempt_id,
+                request_id,
+                "alice",
+                UnixMillis::from_millis(1_700_012_001_000),
+            )
+            .unwrap();
+        state
+            .audit
+            .complete_attempt_pre_patch_failure(
+                attempt_id,
+                "mint failed",
+                UnixMillis::from_millis(1_700_012_002_000),
+            )
+            .unwrap();
+
+        let resp = dispatch_message(
+            ClientMessage::ReconcileStagedPush {
+                request_id,
+                operator: "alice".into(),
+                outcome: ReconcileOutcome::NotApplied {
+                    detail: "nothing to clear".into(),
+                },
+            },
+            &state,
+        )
+        .await;
+        match resp {
+            ServerMessage::StagedPushNotReconcilable {
+                request_id: got_id,
+                reason,
+            } => {
+                assert_eq!(got_id, request_id);
+                assert!(
+                    reason.contains("no quarantined approve attempt"),
+                    "got reason: {reason}",
+                );
+            }
+            other => panic!("expected StagedPushNotReconcilable, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn reconcile_staged_push_with_prior_resolution_returns_already_resolved() {
+        let server = MockServer::start().await;
+        let (state, _tmp) = make_state_with_staging(&server);
+        let session_id = open_session(&state).await;
+        let request_id = stage_with_staged_outcome(
+            &state,
+            session_id,
+            b"bundle".to_vec(),
+            UnixMillis::from_millis(1_700_013_000_000),
+            UnixMillis::from_millis(1_700_013_000_500),
+        )
+        .await;
+        state
+            .audit
+            .record_git_push_resolution(&GitPushResolutionRecord {
+                push_request_id: request_id,
+                decided_at: UnixMillis::from_millis(1_700_013_001_000),
+                decision: GitPushResolution::Rejected,
+                operator: "alice",
+                reason: "prior decision",
+            })
+            .unwrap();
+
+        let resp = dispatch_message(
+            ClientMessage::ReconcileStagedPush {
+                request_id,
+                operator: "bob".into(),
+                outcome: ReconcileOutcome::NotApplied {
+                    detail: "racing reconciliation".into(),
+                },
+            },
+            &state,
+        )
+        .await;
+        assert_eq!(
+            resp,
+            ServerMessage::StagedPushAlreadyResolved { request_id }
+        );
+    }
+
+    /// Happy-path: a `Resolved(PostPatchFailure)` attempt is the
+    /// canonical reconciliation target — terminal, no boot-observed
+    /// marker required. `Applied` writes the reconciliation row and
+    /// the joint-TX `git_push_resolution(decision='approved')` row,
+    /// then deletes the staging dir.
+    #[tokio::test]
+    async fn reconcile_staged_push_applied_against_post_patch_failure_records_resolution() {
+        let server = MockServer::start().await;
+        let (state, _tmp) = make_state_with_staging(&server);
+        let (request_id, predecessor) =
+            stage_with_post_patch_failure_attempt(&state, 1_700_020_000_000).await;
+        let new_app_tip = sample_object_id('c');
+
+        let resp = dispatch_message(
+            ClientMessage::ReconcileStagedPush {
+                request_id,
+                operator: "bob".into(),
+                outcome: ReconcileOutcome::Applied {
+                    new_app_tip: new_app_tip.clone(),
+                    reason: "operator confirmed branch advanced".into(),
+                },
+            },
+            &state,
+        )
+        .await;
+        assert_eq!(resp, ServerMessage::StagedPushReconciled { request_id });
+
+        // The resolution row is now `Approved` with the predecessor's
+        // mint context copied through.
+        let audit_entry = state.audit.get_git_push(request_id).unwrap().unwrap();
+        let resolution = audit_entry.resolution.expect("resolution row recorded");
+        assert!(
+            matches!(resolution.decision, GitPushResolution::Approved(_)),
+            "expected Approved decision, got {:?}",
+            resolution.decision,
+        );
+        assert_eq!(resolution.operator, "bob");
+
+        // The reconciliation row supersedes the predecessor and carries
+        // the new_app_tip via its `Succeeded` outcome. Two attempt
+        // rows, both committed.
+        let attempts = state.audit.approve_attempts_for_push(request_id).unwrap();
+        assert_eq!(attempts.len(), 2);
+        assert!(
+            attempts.iter().any(|a| a.attempt_id == predecessor),
+            "predecessor row must remain",
+        );
+        let reconciliation = attempts
+            .iter()
+            .find(|a| a.attempt_id != predecessor)
+            .expect("reconciliation row recorded");
+        match &reconciliation.state {
+            GitPushApproveAttemptState::Resolved {
+                outcome: GitPushApproveAttemptOutcome::Succeeded { new_app_tip: tip },
+                ..
+            } => {
+                assert_eq!(tip, &new_app_tip);
+            }
+            other => {
+                panic!("expected reconciliation row to be Resolved(Succeeded), got {other:?}",)
+            }
+        }
+
+        // Staging dir was deleted after the joint TX committed.
+        match state.staging_store.as_ref().unwrap().load(request_id) {
+            Err(StagingError::NotFound { .. }) => {}
+            other => panic!("expected staging cleanup, got {other:?}"),
+        }
+    }
+
+    /// `NotApplied` against a `Resolved(PostPatchFailure)` predecessor
+    /// writes a born-terminal `Resolved(PrePatchFailure)` reconciliation
+    /// row but no resolution row. The staging dir survives so a
+    /// follow-up reject can decide the operator action.
+    #[tokio::test]
+    async fn reconcile_staged_push_not_applied_against_post_patch_failure_leaves_push_rejectable() {
+        let server = MockServer::start().await;
+        let (state, _tmp) = make_state_with_staging(&server);
+        let (request_id, _predecessor) =
+            stage_with_post_patch_failure_attempt(&state, 1_700_021_000_000).await;
+
+        let resp = dispatch_message(
+            ClientMessage::ReconcileStagedPush {
+                request_id,
+                operator: "bob".into(),
+                outcome: ReconcileOutcome::NotApplied {
+                    detail: "operator confirmed branch did not advance".into(),
+                },
+            },
+            &state,
+        )
+        .await;
+        assert_eq!(resp, ServerMessage::StagedPushReconciled { request_id });
+
+        // No resolution row — push is again rejectable.
+        let audit_entry = state.audit.get_git_push(request_id).unwrap().unwrap();
+        assert!(audit_entry.resolution.is_none());
+
+        // Staging dir is still on disk so a follow-up reject finds it.
+        assert!(
+            state
+                .staging_store
+                .as_ref()
+                .unwrap()
+                .load(request_id)
+                .is_ok(),
+        );
+
+        // Follow-up reject now proceeds (PrePatchFailure is not a
+        // blocker after the predecessor was superseded).
+        let follow_up = dispatch_message(
+            ClientMessage::RejectStagedPush {
+                request_id,
+                operator: "bob".into(),
+                reason: reason("after not-applied reconciliation"),
+            },
+            &state,
+        )
+        .await;
+        assert_eq!(follow_up, ServerMessage::StagedPushRejected { request_id });
+    }
+
+    /// A boot-observed `Uncertain` row is the survivor case: the
+    /// daemon crashed mid-approve, boot reconcile marked the row
+    /// observable, and the operator manually decides the GitHub side.
+    /// Reconciliation `Applied` lands the resolution row and clears
+    /// the quarantine.
+    #[tokio::test]
+    async fn reconcile_staged_push_applied_against_boot_observed_uncertain_records_resolution() {
+        let server = MockServer::start().await;
+        let (state, _tmp) = make_state_with_staging(&server);
+        let (request_id, _predecessor) =
+            stage_with_boot_observed_uncertain_attempt(&state, 1_700_022_000_000).await;
+        let new_app_tip = sample_object_id('d');
+
+        let resp = dispatch_message(
+            ClientMessage::ReconcileStagedPush {
+                request_id,
+                operator: "bob".into(),
+                outcome: ReconcileOutcome::Applied {
+                    new_app_tip: new_app_tip.clone(),
+                    reason: "branch advanced under restart".into(),
+                },
+            },
+            &state,
+        )
+        .await;
+        assert_eq!(resp, ServerMessage::StagedPushReconciled { request_id });
+
+        let audit_entry = state.audit.get_git_push(request_id).unwrap().unwrap();
+        let resolution = audit_entry.resolution.expect("resolution row recorded");
+        assert!(matches!(
+            resolution.decision,
+            GitPushResolution::Approved(_)
+        ));
+    }
+
+    /// Two reconciliations in a row against the same push: the second
+    /// fails because the predecessor is already superseded. The handler
+    /// surfaces the DAO Invariant as `StagedPushNotReconcilable` rather
+    /// than a generic Error so the CLI can guide the operator to
+    /// re-list and pick the new state.
+    #[tokio::test]
+    async fn reconcile_staged_push_against_already_superseded_predecessor_returns_not_reconcilable()
+    {
+        let server = MockServer::start().await;
+        let (state, _tmp) = make_state_with_staging(&server);
+        let (request_id, _predecessor) =
+            stage_with_post_patch_failure_attempt(&state, 1_700_023_000_000).await;
+
+        // First reconciliation clears the predecessor.
+        let first = dispatch_message(
+            ClientMessage::ReconcileStagedPush {
+                request_id,
+                operator: "bob".into(),
+                outcome: ReconcileOutcome::NotApplied {
+                    detail: "no patch landed".into(),
+                },
+            },
+            &state,
+        )
+        .await;
+        assert_eq!(first, ServerMessage::StagedPushReconciled { request_id });
+
+        // Second call sees the predecessor has been superseded; the
+        // classifier now reports NothingToReconcile (every blocker is
+        // cleared) rather than Eligible.
+        let second = dispatch_message(
+            ClientMessage::ReconcileStagedPush {
+                request_id,
+                operator: "bob".into(),
+                outcome: ReconcileOutcome::NotApplied {
+                    detail: "racing second call".into(),
+                },
+            },
+            &state,
+        )
+        .await;
+        match second {
+            ServerMessage::StagedPushNotReconcilable {
+                request_id: got_id,
+                reason,
+            } => {
+                assert_eq!(got_id, request_id);
+                assert!(
+                    reason.contains("no quarantined approve attempt"),
+                    "got reason: {reason}",
+                );
+            }
+            other => panic!("expected StagedPushNotReconcilable, got {other:?}"),
         }
     }
 

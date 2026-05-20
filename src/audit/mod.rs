@@ -51,7 +51,7 @@ pub use git_push::{
     GitPushApproveAttemptEntry, GitPushApproveAttemptOutcome, GitPushApproveAttemptState,
     GitPushAuditEntry, GitPushOutcomeRecord, GitPushOutcomeResult, GitPushRequestRecord,
     GitPushResolution, GitPushResolutionEntry, GitPushResolutionRecord, PromoteMintAudit,
-    RejectBlocker,
+    ReconciliationTarget, RejectBlocker,
 };
 pub use grant::{MintFailureRecord, PreMintRecord};
 pub use nix_cache::{
