@@ -81,23 +81,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let audit = AuditLog::open(&audit_db_path)?;
 
-    // Before binding the broker socket, sweep approve attempts left
-    // non-terminal by a prior crash. `Started` rows are recovered to
-    // `Resolved(PrePatchFailure)` so the affected pushes become
-    // rejectable/retryable; `Uncertain` rows are logged to
-    // AUDIT_WRITE_FAILURE_TARGET and left in place — they require
-    // operator reconciliation (B2). Failure here is correctness-fatal:
-    // the audit DB is the single source of truth, so we refuse to come
-    // online rather than serve requests against a stale state.
-    let reconcile_report = reconcile_pending_approve_attempts(&audit, UnixMillis::now())?;
-    if !reconcile_report.is_empty() {
-        tracing::warn!(
-            recovered_started = reconcile_report.recovered_started.len(),
-            requires_reconcile = reconcile_report.flagged_uncertain.len(),
-            "reconciled approve attempts left in non-terminal state at last shutdown",
-        );
-    }
-
     // Dispatch on the secret store type at the binary boundary so the
     // library stays fully generic. Both arms produce the same concrete
     // `BrokerState<Box<dyn SecretStore>>`, just via different constructors.
@@ -129,6 +112,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // generated key, leaving the surviving daemon signing with a
     // key that is no longer the stored trust anchor.
     let broker_listener = prepare_broker_listener(&socket_path).await?;
+
+    // Now that the broker socket is bound, this process is the sole
+    // owner of the audit DB for the lifetime of the bind. Sweep approve
+    // attempts left non-terminal by a prior crash: `Started` rows are
+    // recovered to `Resolved(PrePatchFailure)` so the affected pushes
+    // become rejectable/retryable, and `Uncertain` rows are logged to
+    // AUDIT_WRITE_FAILURE_TARGET and left in place for operator
+    // reconciliation (B2). Reconcile MUST happen after the bind: a
+    // second `writd` racing the live daemon's startup would otherwise
+    // mutate the shared DB before its bind fails on `AddrInUse`, and
+    // could resolve the live process's legitimate in-flight `Started`
+    // attempt as a fake "broker restart" failure. The bind succeeds for
+    // exactly one process per socket path, so the reconcile call below
+    // is single-writer by construction.
+    //
+    // Reconcile MUST also complete before any request handler runs, so
+    // it sits before the agent-VM and broker spawn calls — the audit
+    // DB is the single source of truth, and a DAO failure here is
+    // correctness-fatal.
+    let reconcile_report = reconcile_pending_approve_attempts(&audit, UnixMillis::now())?;
+    if !reconcile_report.is_empty() {
+        tracing::warn!(
+            recovered_started = reconcile_report.recovered_started.len(),
+            requires_reconcile = reconcile_report.flagged_uncertain.len(),
+            "reconciled approve attempts left in non-terminal state at last shutdown",
+        );
+    }
 
     let (notes_repo, signing_key, run_agent_spawn) = match run_agent.as_ref() {
         Some(cfg) => {

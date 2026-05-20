@@ -291,8 +291,11 @@ For each row:
   `boot_reconcile` module that drives `Started` rows to
   `Resolved(PrePatchFailure { detail = "broker restart" })` and
   surfaces `Uncertain` rows on `AUDIT_WRITE_FAILURE_TARGET`. Wired
-  into `writd` before the broker socket binds: a DAO failure here
-  refuses startup (the audit DB is the system of record).
+  into `writd` *after* the broker socket bind (the singleton claim,
+  so a second `writd` racing the live daemon cannot mutate the shared
+  audit DB before its bind fails) but before any request serving. A
+  DAO failure here refuses startup (the audit DB is the system of
+  record).
 - **B1e.3d.2** — end-to-end property test that generates
   approve/reject/crash/restart traces and asserts the audit-log
   invariants stated below.

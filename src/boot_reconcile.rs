@@ -58,8 +58,17 @@ impl ReconcileReport {
 
 /// Sweep `git_push_approve_attempt` for rows whose state would block
 /// the broker from accepting a fresh approve or reject for the same
-/// push. Called once during daemon startup, before the broker socket
-/// is bound, so that the first request to land sees a quiescent state.
+/// push. Called once during daemon startup, *after* the broker socket
+/// is bound (so this process has proven singleton ownership of the
+/// audit DB) but *before* any request handler can run (so the first
+/// request to land sees a quiescent state).
+///
+/// Ordering is load-bearing: running this before the bind would let a
+/// second `writd` racing the live daemon's startup mutate the shared
+/// DB before its bind fails on `AddrInUse`, potentially resolving the
+/// live process's legitimate in-flight `Started` attempt as a fake
+/// "broker restart" failure. The bind is the singleton claim; this
+/// pass must come after it.
 ///
 /// Errors abort startup: the audit DB is the single source of truth,
 /// so a DAO failure here is correctness-fatal — refusing to start
