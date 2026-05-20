@@ -26,11 +26,11 @@ use writ::core::{
     AgentKind, CapabilityRequest, GitHubAccess, GitHubRequest, RepoRef, RequestId, SessionId,
 };
 use writ::protocol::{
-    AgentVmSessionInfo, ClientMessage, PlanDetail, PlanSummary, RejectionReason, ServerMessage,
-    StagedPushDetail, StagedPushSummary,
+    AgentVmSessionInfo, ClientMessage, PlanDetail, PlanSummary, ReconcileOutcome, RejectionReason,
+    ServerMessage, StagedPushDetail, StagedPushSummary,
 };
 use writ::server::default_socket_path;
-use writ::vm_git::{AgentVmWorkspaceBootstrap, GitCloneRepo, WorkspaceWarmMode};
+use writ::vm_git::{AgentVmWorkspaceBootstrap, GitCloneRepo, GitObjectId, WorkspaceWarmMode};
 
 #[derive(Parser)]
 #[command(name = "writ", about = "writ broker client")]
@@ -145,6 +145,57 @@ enum PromoteCmd {
         /// Human-readable justification recorded verbatim in the audit row.
         #[arg(long)]
         reason: String,
+    },
+    /// Reconcile a quarantined staged push by recording an operator's
+    /// out-of-band observation of GitHub. Used when a prior approve
+    /// attempt left the push in a blocking state — `Resolved(PostPatchFailure)`
+    /// or a boot-observed `Uncertain` — that the broker can't clear on
+    /// its own. Exactly one of `--confirmed-applied` and
+    /// `--confirmed-not-applied` must be passed.
+    ///
+    /// `--confirmed-applied` records that the operator confirmed the
+    /// PATCH did land on GitHub; the broker writes a born-terminal
+    /// reconciliation row that supersedes the predecessor and a
+    /// `git_push_resolution(decision='approved')` row. `--new-app-tip`
+    /// is the App-side commit SHA the operator observed on the branch
+    /// and `--reason` carries the human-readable justification stored
+    /// verbatim on the audit row.
+    ///
+    /// `--confirmed-not-applied` records that the operator confirmed
+    /// the PATCH did NOT land; the broker writes only the
+    /// reconciliation row (no resolution), so the push becomes
+    /// rejectable/retryable. `--detail` carries the audit-row
+    /// justification.
+    ///
+    /// As with reject/approve, the operator identity is taken from
+    /// `$USER` (or `unknown` if unset).
+    #[command(group(
+        ArgGroup::new("reconcile_verdict")
+            .required(true)
+            .args(["confirmed_applied", "confirmed_not_applied"])
+    ))]
+    Reconcile {
+        request_id: String,
+        /// Record that the operator confirmed the PATCH landed on
+        /// GitHub. Requires `--new-app-tip` and `--reason`.
+        #[arg(long)]
+        confirmed_applied: bool,
+        /// Record that the operator confirmed the PATCH did NOT land
+        /// on GitHub. Requires `--detail`.
+        #[arg(long)]
+        confirmed_not_applied: bool,
+        /// App-side commit SHA the operator observed at the branch tip
+        /// on GitHub. Required with `--confirmed-applied`.
+        #[arg(long, required_if_eq("confirmed_applied", "true"))]
+        new_app_tip: Option<String>,
+        /// Human-readable justification recorded verbatim on the
+        /// reconciliation audit row. Required with `--confirmed-applied`.
+        #[arg(long, required_if_eq("confirmed_applied", "true"))]
+        reason: Option<String>,
+        /// Human-readable detail recorded verbatim on the
+        /// reconciliation audit row. Required with `--confirmed-not-applied`.
+        #[arg(long, required_if_eq("confirmed_not_applied", "true"))]
+        detail: Option<String>,
     },
 }
 
@@ -519,6 +570,53 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     other => return Err(format!("unexpected response: {other:?}").into()),
                 }
             }
+            PromoteCmd::Reconcile {
+                request_id,
+                confirmed_applied,
+                confirmed_not_applied,
+                new_app_tip,
+                reason,
+                detail,
+            } => {
+                let id: RequestId = request_id
+                    .parse()
+                    .map_err(|e| format!("invalid request ID: {e}"))?;
+                let outcome = resolve_reconcile_outcome(
+                    confirmed_applied,
+                    confirmed_not_applied,
+                    new_app_tip,
+                    reason,
+                    detail,
+                )?;
+                let operator = capture_operator_identity();
+                let msg = ClientMessage::ReconcileStagedPush {
+                    request_id: id,
+                    operator,
+                    outcome,
+                };
+                match call(&socket_path, &msg)? {
+                    ServerMessage::StagedPushReconciled { request_id } => {
+                        println!("reconciled push_request_id={request_id}");
+                    }
+                    ServerMessage::UnknownStagedPush { request_id } => {
+                        return Err(format!("no staged push with id {request_id}").into());
+                    }
+                    ServerMessage::StagedPushAlreadyResolved { request_id } => {
+                        return Err(format!(
+                            "staged push {request_id} already has an operator decision recorded",
+                        )
+                        .into());
+                    }
+                    ServerMessage::StagedPushNotReconcilable { request_id, reason } => {
+                        return Err(format!(
+                            "staged push {request_id} is not reconcilable: {reason}",
+                        )
+                        .into());
+                    }
+                    ServerMessage::Error { message } => return Err(message.into()),
+                    other => return Err(format!("unexpected response: {other:?}").into()),
+                }
+            }
         },
         Cmd::Plan { action } => match action {
             PlanCmd::List { correlation_id } => {
@@ -642,6 +740,51 @@ fn resolve_decision_outcome(accept: bool, reject_restart: bool) -> DecisionOutco
         (false, true) => DecisionOutcome::RejectedRestart,
         (false, false) | (true, true) => {
             unreachable!("clap ArgGroup enforces exactly one of --accept / --reject-restart")
+        }
+    }
+}
+
+/// Map the parsed reconcile flag set to a [`ReconcileOutcome`]. Clap's
+/// `ArgGroup` enforces exactly-one of `--confirmed-applied` /
+/// `--confirmed-not-applied`, and `required_if_eq` enforces that the
+/// dependent text/SHA flags are present, so the `None` arms here are
+/// unreachable in practice and panic rather than guess.
+///
+/// `new_app_tip` is parsed via [`GitObjectId::from_str`] so a malformed
+/// SHA fails fast at the CLI instead of after the daemon round-trip.
+fn resolve_reconcile_outcome(
+    confirmed_applied: bool,
+    confirmed_not_applied: bool,
+    new_app_tip: Option<String>,
+    reason: Option<String>,
+    detail: Option<String>,
+) -> Result<ReconcileOutcome, Box<dyn std::error::Error>> {
+    match (confirmed_applied, confirmed_not_applied) {
+        (true, false) => {
+            let new_app_tip = new_app_tip.unwrap_or_else(|| {
+                unreachable!("clap required_if_eq enforces --new-app-tip with --confirmed-applied")
+            });
+            let reason = reason.unwrap_or_else(|| {
+                unreachable!("clap required_if_eq enforces --reason with --confirmed-applied")
+            });
+            let new_app_tip: GitObjectId = new_app_tip
+                .parse()
+                .map_err(|e| format!("invalid --new-app-tip: {e}"))?;
+            Ok(ReconcileOutcome::Applied {
+                new_app_tip,
+                reason,
+            })
+        }
+        (false, true) => {
+            let detail = detail.unwrap_or_else(|| {
+                unreachable!("clap required_if_eq enforces --detail with --confirmed-not-applied")
+            });
+            Ok(ReconcileOutcome::NotApplied { detail })
+        }
+        (false, false) | (true, true) => {
+            unreachable!(
+                "clap ArgGroup enforces exactly one of --confirmed-applied / --confirmed-not-applied"
+            )
         }
     }
 }
@@ -1747,6 +1890,268 @@ mod tests {
             }
             _ => panic!("unexpected command"),
         }
+    }
+
+    /// Clap must reject `promote reconcile` invocations that pass
+    /// neither verdict flag — the `ArgGroup` declares the group
+    /// required, so the parse should fail before the dispatch arm runs.
+    #[test]
+    fn promote_reconcile_cli_requires_one_verdict_flag() {
+        let err = match Args::try_parse_from([
+            "writ",
+            "promote",
+            "reconcile",
+            "11111111-1111-1111-1111-111111111111",
+        ]) {
+            Ok(_) => panic!("expected clap to require a verdict flag"),
+            Err(error) => error,
+        };
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("--confirmed-applied")
+                || rendered.contains("--confirmed-not-applied"),
+            "unexpected clap error: {rendered}",
+        );
+    }
+
+    /// Clap must reject invocations that pass both verdict flags — the
+    /// `ArgGroup` is single-valued by default, so `multiple(false)`
+    /// makes the two flags mutually exclusive.
+    #[test]
+    fn promote_reconcile_cli_rejects_both_verdict_flags() {
+        let err = match Args::try_parse_from([
+            "writ",
+            "promote",
+            "reconcile",
+            "11111111-1111-1111-1111-111111111111",
+            "--confirmed-applied",
+            "--confirmed-not-applied",
+            "--new-app-tip",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "--reason",
+            "x",
+            "--detail",
+            "y",
+        ]) {
+            Ok(_) => panic!("expected clap to reject both verdict flags"),
+            Err(error) => error,
+        };
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("cannot be used with"),
+            "unexpected clap error: {rendered}",
+        );
+    }
+
+    /// `--confirmed-applied` without `--new-app-tip` must fail at parse
+    /// time; the `required_if_eq` predicate is what catches this before
+    /// the daemon round-trip.
+    #[test]
+    fn promote_reconcile_cli_applied_requires_new_app_tip() {
+        let err = match Args::try_parse_from([
+            "writ",
+            "promote",
+            "reconcile",
+            "11111111-1111-1111-1111-111111111111",
+            "--confirmed-applied",
+            "--reason",
+            "operator confirmed via GitHub UI",
+        ]) {
+            Ok(_) => panic!("expected clap to require --new-app-tip"),
+            Err(error) => error,
+        };
+        assert!(
+            err.to_string().contains("--new-app-tip"),
+            "unexpected clap error: {err}",
+        );
+    }
+
+    /// `--confirmed-applied` without `--reason` must fail at parse time
+    /// even when `--new-app-tip` is present; the reason is the audit
+    /// row's free-form text and the broker rejects empty values.
+    #[test]
+    fn promote_reconcile_cli_applied_requires_reason() {
+        let err = match Args::try_parse_from([
+            "writ",
+            "promote",
+            "reconcile",
+            "11111111-1111-1111-1111-111111111111",
+            "--confirmed-applied",
+            "--new-app-tip",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ]) {
+            Ok(_) => panic!("expected clap to require --reason"),
+            Err(error) => error,
+        };
+        assert!(
+            err.to_string().contains("--reason"),
+            "unexpected clap error: {err}",
+        );
+    }
+
+    /// `--confirmed-not-applied` without `--detail` must fail at parse
+    /// time — symmetry with the applied-side `--reason` requirement.
+    #[test]
+    fn promote_reconcile_cli_not_applied_requires_detail() {
+        let err = match Args::try_parse_from([
+            "writ",
+            "promote",
+            "reconcile",
+            "11111111-1111-1111-1111-111111111111",
+            "--confirmed-not-applied",
+        ]) {
+            Ok(_) => panic!("expected clap to require --detail"),
+            Err(error) => error,
+        };
+        assert!(
+            err.to_string().contains("--detail"),
+            "unexpected clap error: {err}",
+        );
+    }
+
+    /// Happy path: a fully-specified applied invocation parses into the
+    /// expected enum shape with every field preserved verbatim.
+    #[test]
+    fn promote_reconcile_cli_applied_parses_full_flag_set() {
+        let args = Args::try_parse_from([
+            "writ",
+            "promote",
+            "reconcile",
+            "11111111-1111-1111-1111-111111111111",
+            "--confirmed-applied",
+            "--new-app-tip",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "--reason",
+            "confirmed via GitHub UI after PostPatchFailure",
+        ])
+        .unwrap();
+        match args.cmd {
+            Cmd::Promote {
+                action:
+                    PromoteCmd::Reconcile {
+                        request_id,
+                        confirmed_applied,
+                        confirmed_not_applied,
+                        new_app_tip,
+                        reason,
+                        detail,
+                    },
+            } => {
+                assert_eq!(request_id, "11111111-1111-1111-1111-111111111111");
+                assert!(confirmed_applied);
+                assert!(!confirmed_not_applied);
+                assert_eq!(
+                    new_app_tip.as_deref(),
+                    Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+                );
+                assert_eq!(
+                    reason.as_deref(),
+                    Some("confirmed via GitHub UI after PostPatchFailure"),
+                );
+                assert_eq!(detail, None);
+            }
+            _ => panic!("unexpected command"),
+        }
+    }
+
+    /// Happy path for the not-applied verdict; mirrors the applied
+    /// parse test but with the inverse flag set.
+    #[test]
+    fn promote_reconcile_cli_not_applied_parses_full_flag_set() {
+        let args = Args::try_parse_from([
+            "writ",
+            "promote",
+            "reconcile",
+            "22222222-2222-2222-2222-222222222222",
+            "--confirmed-not-applied",
+            "--detail",
+            "branch tip unchanged on GitHub",
+        ])
+        .unwrap();
+        match args.cmd {
+            Cmd::Promote {
+                action:
+                    PromoteCmd::Reconcile {
+                        request_id,
+                        confirmed_applied,
+                        confirmed_not_applied,
+                        new_app_tip,
+                        reason,
+                        detail,
+                    },
+            } => {
+                assert_eq!(request_id, "22222222-2222-2222-2222-222222222222");
+                assert!(!confirmed_applied);
+                assert!(confirmed_not_applied);
+                assert_eq!(new_app_tip, None);
+                assert_eq!(reason, None);
+                assert_eq!(detail.as_deref(), Some("branch tip unchanged on GitHub"));
+            }
+            _ => panic!("unexpected command"),
+        }
+    }
+
+    /// The pure resolver returns `Applied { new_app_tip, reason }` when
+    /// `--confirmed-applied` is set and the dependent flags are present.
+    /// This pins the field mapping so a future refactor that swaps
+    /// argument order at the call site can't silently mis-route values.
+    #[test]
+    fn resolve_reconcile_outcome_applied_returns_applied_variant() {
+        let outcome = resolve_reconcile_outcome(
+            true,
+            false,
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into()),
+            Some("manual confirmation".into()),
+            None,
+        )
+        .expect("applied resolution should succeed");
+        match outcome {
+            ReconcileOutcome::Applied {
+                new_app_tip,
+                reason,
+            } => {
+                assert_eq!(
+                    new_app_tip.as_str(),
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                );
+                assert_eq!(reason, "manual confirmation");
+            }
+            ReconcileOutcome::NotApplied { .. } => panic!("expected Applied variant"),
+        }
+    }
+
+    /// Symmetric coverage for the not-applied verdict; `detail` flows
+    /// through unchanged.
+    #[test]
+    fn resolve_reconcile_outcome_not_applied_returns_not_applied_variant() {
+        let outcome =
+            resolve_reconcile_outcome(false, true, None, None, Some("no remote movement".into()))
+                .expect("not-applied resolution should succeed");
+        match outcome {
+            ReconcileOutcome::NotApplied { detail } => {
+                assert_eq!(detail, "no remote movement");
+            }
+            ReconcileOutcome::Applied { .. } => panic!("expected NotApplied variant"),
+        }
+    }
+
+    /// A malformed SHA on `--new-app-tip` should fail at the CLI rather
+    /// than after the daemon round-trip; the resolver parses it via
+    /// `GitObjectId::from_str` and surfaces the parse error verbatim.
+    #[test]
+    fn resolve_reconcile_outcome_rejects_invalid_new_app_tip() {
+        let err = resolve_reconcile_outcome(
+            true,
+            false,
+            Some("not-a-sha".into()),
+            Some("manual confirmation".into()),
+            None,
+        )
+        .expect_err("invalid SHA should fail");
+        assert!(
+            err.to_string().contains("--new-app-tip"),
+            "unexpected error: {err}",
+        );
     }
 
     /// Pins the operator-identity mapping: a set value flows through
