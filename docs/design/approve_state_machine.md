@@ -286,9 +286,16 @@ For each row:
   translates the SELECT-vs-INSERT race back into the same typed
   surface. The R6-era marker code never landed on `main` (see the
   table above), so this slice has no deletion work.
-- **B1e.3d** — boot reconcile worker; end-to-end property test that
-  generates approve/reject/crash/restart traces and asserts the
-  audit-log invariants stated below.
+- **B1e.3d.1** — boot reconcile worker:
+  `AuditLog::list_blocking_approve_attempts` DAO + new
+  `boot_reconcile` module that drives `Started` rows to
+  `Resolved(PrePatchFailure { detail = "broker restart" })` and
+  surfaces `Uncertain` rows on `AUDIT_WRITE_FAILURE_TARGET`. Wired
+  into `writd` before the broker socket binds: a DAO failure here
+  refuses startup (the audit DB is the system of record).
+- **B1e.3d.2** — end-to-end property test that generates
+  approve/reject/crash/restart traces and asserts the audit-log
+  invariants stated below.
 
 ## Test strategy
 

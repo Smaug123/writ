@@ -11,7 +11,9 @@ use clap::Parser;
 
 use writ::agent_vm_daemon::AgentVmDaemon;
 use writ::audit::AuditLog;
+use writ::boot_reconcile::reconcile_pending_approve_attempts;
 use writ::config::{DaemonConfig, SecretStoreConfig, default_audit_db_path, default_config_path};
+use writ::core::UnixMillis;
 use writ::git_push_staging::GitPushStagingStore;
 use writ::github::GitHubMinter;
 use writ::secret::{FileSecretStore, KeyringSecretStore, SecretStore};
@@ -78,6 +80,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::fs::create_dir_all(parent)?;
     }
     let audit = AuditLog::open(&audit_db_path)?;
+
+    // Before binding the broker socket, sweep approve attempts left
+    // non-terminal by a prior crash. `Started` rows are recovered to
+    // `Resolved(PrePatchFailure)` so the affected pushes become
+    // rejectable/retryable; `Uncertain` rows are logged to
+    // AUDIT_WRITE_FAILURE_TARGET and left in place — they require
+    // operator reconciliation (B2). Failure here is correctness-fatal:
+    // the audit DB is the single source of truth, so we refuse to come
+    // online rather than serve requests against a stale state.
+    let reconcile_report = reconcile_pending_approve_attempts(&audit, UnixMillis::now())?;
+    if !reconcile_report.is_empty() {
+        tracing::warn!(
+            recovered_started = reconcile_report.recovered_started.len(),
+            requires_reconcile = reconcile_report.flagged_uncertain.len(),
+            "reconciled approve attempts left in non-terminal state at last shutdown",
+        );
+    }
 
     // Dispatch on the secret store type at the binary boundary so the
     // library stays fully generic. Both arms produce the same concrete

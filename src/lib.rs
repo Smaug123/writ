@@ -31,6 +31,8 @@ pub mod bailiff_plan_write;
 pub mod bailiff_repo_guard;
 pub(crate) mod bearer;
 #[cfg(feature = "host")]
+pub mod boot_reconcile;
+#[cfg(feature = "host")]
 pub(crate) mod clean_git;
 #[cfg(feature = "host")]
 pub mod config;
