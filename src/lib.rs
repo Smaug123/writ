@@ -35,6 +35,8 @@ pub mod boot_reconcile;
 #[cfg(feature = "host")]
 pub(crate) mod clean_git;
 #[cfg(feature = "host")]
+pub mod cli;
+#[cfg(feature = "host")]
 pub mod config;
 pub mod core;
 #[cfg(feature = "host")]
