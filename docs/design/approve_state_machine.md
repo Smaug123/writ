@@ -259,29 +259,33 @@ For each row:
 
 | Existing mechanism | Fate |
 |---|---|
-| `PROMOTE_IN_FLIGHT_MARKER` file + `mark_promote_in_flight` / `clear_promote_in_flight` / `has_promote_in_flight_marker` (R6) | Deleted |
-| `scrub_staging_after_failed_audit` (R5) | Deleted; subsumed by the joint TX |
+| `PROMOTE_IN_FLIGHT_MARKER` file + `mark_promote_in_flight` / `clear_promote_in_flight` / `has_promote_in_flight_marker` (R6) | Never landed on `main`; lived only on the abandoned `slice-b1e2e-approve-handler` branch which was superseded by the state-machine restructure — no deletion needed |
+| `scrub_staging_after_failed_audit` (R5) | Same as above; subsumed by the joint TX in the design and never imported into the restructure |
 | Variant discrimination `RunApproveError::Execute(_)` vs `ExecuteError::UpdateRef(_)` (R7) | Becomes the `Resolved(PrePatchFailure)` vs `Resolved(PostPatchFailure)` outcome choice |
-| Per-`RequestId` `decision_lock` (R3) | Kept — still needed for concurrent approve/reject within one broker process |
+| Per-`RequestId` `decision_lock` (R3) | Dropped — the `git_push_resolution_refuses_active_approve` BEFORE INSERT trigger refuses contradictory commits at the SQL boundary; the in-process lock was an R3-era optimization for diagnostic quality, which `reject_blocker_for_push` + the trigger-error mapping now provide |
 | `git_push_resolution` table | Kept; success-row write becomes joint with attempt completion |
-| `git_push_attempt` table | Deleted (never wired up in production code) |
-| `git_push_outcome.push_attempt_id` column + dependent result values | Deleted (same reason) |
+| `git_push_attempt` table | Deleted in B1e.3a (never wired up in production code) |
+| `git_push_outcome.push_attempt_id` column + dependent result values | Deleted in B1e.3a (same reason) |
 
 ## Slice breakdown
 
 - **B1e.3a** — schema v5 migration; `GitPushApproveAttemptRecord` types;
   DAO methods (`start_approve_attempt`, `mark_attempt_uncertain`,
   `complete_attempt_succeeded`, `complete_attempt_pre_patch_failure`,
-  `complete_attempt_post_patch_failure`, `attempts_blocking_reject`);
+  `complete_attempt_post_patch_failure`, `reject_blocker_for_push`);
   trigger tests + DAO property tests. **No handler changes.**
 - **B1e.3b** — refactor `approve_staged_push` to drive the state
   machine. All existing approve tests pass under the new model.
-  Marker code stays in place but is no longer called (deletion in
-  B1e.3c).
-- **B1e.3c** — refactor `reject_staged_push` to consult attempts.
-  Delete `mark_promote_in_flight` / `has_promote_in_flight_marker` /
-  `clear_promote_in_flight` from `git_push_staging.rs`. Delete
-  `scrub_staging_after_failed_audit`. Delete `run_approve_error_crossed_patch_boundary`.
+- **B1e.3c** — wire `AuditLog::reject_blocker_for_push` into
+  `reject_staged_push`. Before the resolution INSERT, classify any
+  blocking attempt and surface a typed diagnostic
+  (`AttemptInFlight`, `AlreadyApproved`, `PostPatchUncertain`)
+  instead of leaking the trigger's raw ABORT text. The
+  `git_push_resolution_refuses_active_approve` trigger stays as
+  defence-in-depth; add an `is_active_approve_refusal` predicate that
+  translates the SELECT-vs-INSERT race back into the same typed
+  surface. The R6-era marker code never landed on `main` (see the
+  table above), so this slice has no deletion work.
 - **B1e.3d** — boot reconcile worker; end-to-end property test that
   generates approve/reject/crash/restart traces and asserts the
   audit-log invariants stated below.
