@@ -1350,7 +1350,7 @@ impl AuditLog {
     /// distinguish "go ahead" from the four distinct "nothing to do"
     /// shapes without parsing prose.
     ///
-    /// Composes the existing reads ([`approve_attempts_for_push`],
+    /// Composes the existing reads ([`Self::approve_attempts_for_push`],
     /// supersession-set lookup, boot-observed-set lookup) rather than
     /// pushing the classification down into one SQL query: each
     /// sub-read is already tested in isolation, and the classification
