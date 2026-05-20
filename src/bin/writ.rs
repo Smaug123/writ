@@ -185,16 +185,33 @@ enum PromoteCmd {
         #[arg(long)]
         confirmed_not_applied: bool,
         /// App-side commit SHA the operator observed at the branch tip
-        /// on GitHub. Required with `--confirmed-applied`.
-        #[arg(long, required_if_eq("confirmed_applied", "true"))]
+        /// on GitHub. Required with `--confirmed-applied`; forbidden
+        /// with `--confirmed-not-applied` so a mistyped verdict can't
+        /// silently discard a SHA the operator meant to record.
+        #[arg(
+            long,
+            required_if_eq("confirmed_applied", "true"),
+            conflicts_with = "confirmed_not_applied"
+        )]
         new_app_tip: Option<String>,
         /// Human-readable justification recorded verbatim on the
-        /// reconciliation audit row. Required with `--confirmed-applied`.
-        #[arg(long, required_if_eq("confirmed_applied", "true"))]
+        /// reconciliation audit row. Required with `--confirmed-applied`;
+        /// forbidden with `--confirmed-not-applied` (use `--detail`).
+        #[arg(
+            long,
+            required_if_eq("confirmed_applied", "true"),
+            conflicts_with = "confirmed_not_applied"
+        )]
         reason: Option<String>,
         /// Human-readable detail recorded verbatim on the
-        /// reconciliation audit row. Required with `--confirmed-not-applied`.
-        #[arg(long, required_if_eq("confirmed_not_applied", "true"))]
+        /// reconciliation audit row. Required with
+        /// `--confirmed-not-applied`; forbidden with `--confirmed-applied`
+        /// (use `--reason`).
+        #[arg(
+            long,
+            required_if_eq("confirmed_not_applied", "true"),
+            conflicts_with = "confirmed_applied"
+        )]
         detail: Option<String>,
     },
 }
@@ -1985,6 +2002,86 @@ mod tests {
         };
         assert!(
             err.to_string().contains("--reason"),
+            "unexpected clap error: {err}",
+        );
+    }
+
+    /// A mistyped verdict — operator wrote `--confirmed-not-applied`
+    /// but supplied applied-side flags — must fail at parse time
+    /// rather than have clap silently discard the would-be applied
+    /// SHA. For an audit-recording command this is a footgun: ignoring
+    /// the flag would record a different decision than the operator
+    /// intended.
+    #[test]
+    fn promote_reconcile_cli_rejects_new_app_tip_with_not_applied() {
+        let err = match Args::try_parse_from([
+            "writ",
+            "promote",
+            "reconcile",
+            "11111111-1111-1111-1111-111111111111",
+            "--confirmed-not-applied",
+            "--detail",
+            "branch tip unchanged",
+            "--new-app-tip",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ]) {
+            Ok(_) => panic!("expected clap to reject --new-app-tip with --confirmed-not-applied"),
+            Err(error) => error,
+        };
+        assert!(
+            err.to_string().contains("cannot be used with"),
+            "unexpected clap error: {err}",
+        );
+    }
+
+    /// `--reason` paired with `--confirmed-not-applied` is the same
+    /// contradiction shape — without `conflicts_with` the `--reason`
+    /// would have been silently discarded in favour of `--detail`.
+    #[test]
+    fn promote_reconcile_cli_rejects_reason_with_not_applied() {
+        let err = match Args::try_parse_from([
+            "writ",
+            "promote",
+            "reconcile",
+            "11111111-1111-1111-1111-111111111111",
+            "--confirmed-not-applied",
+            "--detail",
+            "branch tip unchanged",
+            "--reason",
+            "wrong field",
+        ]) {
+            Ok(_) => panic!("expected clap to reject --reason with --confirmed-not-applied"),
+            Err(error) => error,
+        };
+        assert!(
+            err.to_string().contains("cannot be used with"),
+            "unexpected clap error: {err}",
+        );
+    }
+
+    /// `--detail` paired with `--confirmed-applied` is the inverse
+    /// contradiction — without `conflicts_with` the `--detail` would
+    /// have been silently discarded in favour of `--reason`.
+    #[test]
+    fn promote_reconcile_cli_rejects_detail_with_applied() {
+        let err = match Args::try_parse_from([
+            "writ",
+            "promote",
+            "reconcile",
+            "11111111-1111-1111-1111-111111111111",
+            "--confirmed-applied",
+            "--new-app-tip",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "--reason",
+            "manual confirmation",
+            "--detail",
+            "wrong field",
+        ]) {
+            Ok(_) => panic!("expected clap to reject --detail with --confirmed-applied"),
+            Err(error) => error,
+        };
+        assert!(
+            err.to_string().contains("cannot be used with"),
             "unexpected clap error: {err}",
         );
     }
