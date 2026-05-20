@@ -18,8 +18,8 @@ pub use agent_vm::{
 };
 pub use capability_set::CapabilitySet;
 pub use decision::{
-    GitHubGrantedScope, GitHubPermissions, GrantedScope, MetadataAccess, PolicyDecision, TtlError,
-    TtlSeconds,
+    GITHUB_INSTALLATION_TOKEN_MAX_SECONDS, GitHubGrantedScope, GitHubPermissions, GrantedScope,
+    MetadataAccess, PolicyDecision, TtlError, TtlSeconds,
 };
 pub use grant::CredentialGrant;
 pub use notes_ref::{NotesRef, NotesRefError};

@@ -24,15 +24,17 @@ use crate::agent_plan::{
 use crate::agent_run::{AgentPrompt, AgentRunId, sha256_hex};
 use crate::agent_vm_daemon::AgentVmDaemon;
 use crate::audit::{
-    AUDIT_WRITE_FAILURE_TARGET, AuditError, AuditLog, GitPushResolution, GitPushResolutionRecord,
-    PlanDecisionRecord, PreMintRecord,
+    AUDIT_WRITE_FAILURE_TARGET, AuditError, AuditLog, GitPushOutcomeResult, GitPushResolution,
+    GitPushResolutionRecord, PlanDecisionRecord, PreMintRecord, PromoteMintAudit,
 };
 use crate::core::{
-    CapabilityRequest, GrantedScope, PolicyDecision, RequestId, SessionId, SessionRecord,
-    TtlSeconds, UnixMillis,
+    ApproveAttemptId, CapabilityRequest, GITHUB_INSTALLATION_TOKEN_MAX_SECONDS, GitHubAccess,
+    GitHubGrantedScope, GitHubPermissions, GrantedScope, MetadataAccess, PolicyDecision, RequestId,
+    SessionId, SessionRecord, TtlSeconds, UnixMillis,
 };
 use crate::core::{NotesRef, Sha256Hex};
-use crate::git_push_promote::PromoteRuntimeConfig;
+use crate::git_push_approve::{RunApproveError, run_approve};
+use crate::git_push_promote::{ExecuteError, PromoteRuntimeConfig};
 use crate::git_push_staging::{GitPushStagingStore, StagedEntry, StagingError};
 use crate::github::GitHubMinter;
 use crate::notes_repo::NotesRepo;
@@ -45,6 +47,7 @@ use crate::protocol::{
 use crate::run_envelope::{OutputEnvelope, SignedRunEnvelope};
 use crate::secret::SecretStore;
 use crate::signing::WritSigningKey;
+use crate::vm_git_bundle::GitSecretValue;
 
 /// Boot-time description of the child process that produces an agent
 /// run's stdout. Pure data — dispatch reads `command` and `args`,
@@ -895,24 +898,92 @@ async fn reject_staged_push<S: SecretStore + Send + Sync + 'static>(
     }
 }
 
-/// Partial handler for [`ClientMessage::ApproveStagedPush`].
+/// TTL for the GitHub installation token minted by an approve decision.
 ///
-/// Slice B1e.2c lands the operator validation, the three configured-state
-/// checks (`staging_store`, `promote_runtime`, `signing_key` must all be
-/// `Some`), and the staging-entry load. The mint step lands in B1e.2d
-/// and the call into [`crate::git_push_approve::run_approve`] plus
-/// audit-write/cleanup lands in B1e.2e. On the success path of the load,
-/// this slice returns a self-describing [`ServerMessage::Error`] so an
-/// operator (or a future reviewer) can locate the next plan slice from
-/// the response alone — no audit row is written and the staging dir is
-/// left untouched, exactly as in the B1e.1 stub.
+/// GitHub returns ~1h installation tokens regardless of what we request
+/// and the minter rejects responses where `expires_at` exceeds
+/// `issued_at + ttl + TTL_SKEW_TOLERANCE_SECONDS`. Setting the ceiling
+/// any lower than [`GITHUB_INSTALLATION_TOKEN_MAX_SECONDS`] makes every
+/// real mint fail with `TtlExceeded`. The minter's TTL is an
+/// *accept-back* bound on the GitHub-returned expiry, not a request the
+/// server honours — pinning it at the GitHub-imposed maximum is the
+/// only correct setting. The credential's actual lifetime is bounded by
+/// the duration of this single `run_approve` invocation; the broker
+/// drops the token (and the only reference to it) once the call
+/// returns.
+const APPROVE_MINT_TTL_SECONDS: i64 = GITHUB_INSTALLATION_TOKEN_MAX_SECONDS;
+
+/// Handler for [`ClientMessage::ApproveStagedPush`].
 ///
-/// Ordering: operator validation runs before the configured-state checks
-/// so a caller can never use a malformed operator to probe the broker's
-/// internal config shape. The staging load runs *after* every
-/// configured check so a bare `request_id` cannot drive any disk IO in
-/// the not-configured case; that mirrors `reject_staged_push`'s
-/// "validate-then-load" ordering for the same reason.
+/// Drives the approve-attempt state machine defined in
+/// `docs/design/approve_state_machine.md`. Each invocation creates one
+/// `git_push_approve_attempt` row; the row transitions
+/// `Started → Uncertain → Resolved` (or `Started → Resolved` on a
+/// pre-mint failure) with the schema's forward-only trigger enforcing
+/// the order. The state machine — not a filesystem marker, not an
+/// in-memory mutex — is the load-bearing piece that gates reject and
+/// the only durable state approve mutates outside of GitHub.
+///
+/// Flow:
+///
+///   1. Validate `operator` (non-empty, bounded) before any IO so a
+///      caller cannot probe broker state via a malformed identity field.
+///   2. Check the three configured-state slots (`staging_store`,
+///      `promote_runtime`, `signing_key`) so a not-configured broker
+///      returns a precise diagnosis rather than dead-ending later.
+///   3. Load the staging entry atomically (receipt + bundle bytes); a
+///      missing entry surfaces as `UnknownStagedPush`.
+///   4. Read the joined audit view via [`AuditLog::get_git_push`]:
+///        * **Early short-circuit** on a prior resolution row — no
+///          attempt is started and no credential is wasted.
+///        * Refuse if no `Staged` outcome row exists (the staging dir
+///          and the audit log have drifted apart — operator must
+///          investigate).
+///        * Refuse a branch-creation push (no `expected_remote_head`):
+///          the walker needs a lease anchor a fresh branch does not
+///          have. Documented gap; failing closed is the right shape.
+///   5. Look up the originating session for `agent_kind`. The session
+///      is by definition closed by now; `get_session` reads it just the
+///      same.
+///   6. `start_approve_attempt`: insert `Started` row. The DAO refuses
+///      if any attempt is `Started`/`Uncertain` or
+///      `Resolved(PostPatchFailure)` — those are the
+///      reject-blocking states and would also block a fresh approve.
+///   7. Mint a one-shot installation token. On failure: transition the
+///      attempt to `Resolved(PrePatchFailure)` (no mint to capture).
+///   8. `mark_attempt_uncertain`: capture the mint context inline on
+///      the attempt row. **This is the TX that commits the broker to
+///      "the PATCH may exist on GitHub"** — reject is refused from this
+///      point until the attempt resolves.
+///   9. Run [`run_approve`] against the staging entry. The current
+///      slice writes `Uncertain` *before* `run_approve` rather than
+///      between the walker and `update_ref`; the cost is that
+///      `prepare`/`plan`/`walker` failures resolve from `Uncertain`
+///      instead of `Started`, blocking reject during the brief window
+///      they run. A follow-up slice can refactor `run_approve` to
+///      expose a post-walker hook if the over-conservative window
+///      proves costly. The schema's forward-only trigger admits
+///      `Uncertain → Resolved(PrePatchFailure)` so the path is valid.
+///  10. On success: `complete_attempt_succeeded` atomically transitions
+///      the attempt to `Resolved(Succeeded)` *and* writes the
+///      `git_push_resolution(decision='approved')` row in a single
+///      SQLite transaction (the resolution-INSERT trigger sees the
+///      attempt already at `succeeded` and lets the row through).
+///  11. On `RunApproveError::Execute(ExecuteError::UpdateRef(_))`:
+///      `update_ref` was issued and GitHub's state is uncertain →
+///      `complete_attempt_post_patch_failure` (quarantines the push).
+///  12. On any other `RunApproveError`: no PATCH was issued →
+///      `complete_attempt_pre_patch_failure`. The mint context is
+///      preserved on the row.
+///  13. Staging-dir delete is best-effort after the joint TX; failures
+///      are logged. A stale dir surfaces in `promote list` for manual
+///      cleanup.
+///
+/// The token's `api_base` is plumbed straight through from
+/// [`crate::github::MintedToken::into_promote_pieces`] — using a
+/// different base would mint against one GitHub instance and call the
+/// Git Data REST API against another, which the consume-and-pair shape
+/// rules out at compile time.
 async fn approve_staged_push<S: SecretStore + Send + Sync + 'static>(
     state: &Arc<BrokerState<S>>,
     request_id: RequestId,
@@ -935,28 +1006,18 @@ async fn approve_staged_push<S: SecretStore + Send + Sync + 'static>(
     let Some(staging_store) = state.staging_store.clone() else {
         return staging_not_configured();
     };
-    if state.promote_runtime.is_none() {
+    let Some(promote_runtime) = state.promote_runtime.clone() else {
         return approve_staged_push_not_configured("promote_runtime");
-    }
-    if state.signing_key.is_none() {
+    };
+    let Some(signing_key) = state.signing_key.clone() else {
         return approve_staged_push_not_configured("signing_key");
-    }
+    };
 
-    // Load the entry up-front: this proves the staged push exists,
-    // surfaces a clean `UnknownStagedPush` if the operator's id is
-    // stale, and is the input the follow-up slices (mint in B1e.2d,
-    // run_approve in B1e.2e) consume. Reading the bundle bytes here is
-    // wasted work in the slice-B1e.2c surface — but the alternative
-    // (load receipt now, re-load bundle later) would have the follow-up
-    // slice introduce a second `spawn_blocking` for what is logically
-    // one load, and would let the receipt and bundle disagree if a
-    // concurrent `reject_staged_push` deleted the dir between the two
-    // reads. Loading both atomically here is cheaper.
     let load_result = {
         let staging_store = Arc::clone(&staging_store);
         tokio::task::spawn_blocking(move || staging_store.load(request_id)).await
     };
-    let _entry = match load_result {
+    let entry = match load_result {
         Ok(Ok(entry)) => entry,
         Ok(Err(StagingError::NotFound { request_id })) => {
             return ServerMessage::UnknownStagedPush { request_id };
@@ -973,10 +1034,466 @@ async fn approve_staged_push<S: SecretStore + Send + Sync + 'static>(
         }
     };
 
-    ServerMessage::Error {
-        message: "ApproveStagedPush dispatch validated and loaded; \
-                  the mint + run_approve pipeline lands in slice B1e.2d/2e"
-            .into(),
+    // Joined audit view: the source of truth for the prior-resolution
+    // short-circuit (so a duplicate approve never starts an attempt or
+    // wastes a mint), the outcome-row precondition, and the session-id
+    // we need to select the GitHub App.
+    let audit_lookup = {
+        let audit = Arc::clone(&state.audit);
+        tokio::task::spawn_blocking(move || audit.get_git_push(request_id)).await
+    };
+    let audit_entry = match audit_lookup {
+        Ok(Ok(Some(entry))) => entry,
+        Ok(Ok(None)) => {
+            return ServerMessage::Error {
+                message: format!(
+                    "staged push {request_id} has a staging directory but no audit row; \
+                     broker audit log and staging store have drifted apart"
+                ),
+            };
+        }
+        Ok(Err(err)) => {
+            return ServerMessage::Error {
+                message: format!("audit lookup failed: {err}"),
+            };
+        }
+        Err(err) => {
+            return ServerMessage::Error {
+                message: format!("audit lookup task failed: {err}"),
+            };
+        }
+    };
+
+    if audit_entry.resolution.is_some() {
+        return ServerMessage::StagedPushAlreadyResolved { request_id };
+    }
+
+    if audit_entry.result != Some(GitPushOutcomeResult::Staged) {
+        return ServerMessage::Error {
+            message: format!(
+                "staged push {request_id} has no `staged` outcome row \
+                 (audit result: {:?}); refusing to approve a push that is not staged",
+                audit_entry.result,
+            ),
+        };
+    }
+
+    if audit_entry.expected_remote_head.is_none() {
+        return ServerMessage::Error {
+            message: format!(
+                "staged push {request_id} is a branch-creation push \
+                 (no expected_remote_head); approve does not yet support branch creation"
+            ),
+        };
+    }
+
+    let session_id = audit_entry.session_id;
+    let session_lookup = {
+        let audit = Arc::clone(&state.audit);
+        tokio::task::spawn_blocking(move || audit.get_session(session_id)).await
+    };
+    let session = match session_lookup {
+        Ok(Ok(Some(s))) => s,
+        Ok(Ok(None)) => {
+            return ServerMessage::Error {
+                message: format!(
+                    "staged push {request_id} references session {session_id} \
+                     but that session is not in the audit log"
+                ),
+            };
+        }
+        Ok(Err(err)) => {
+            return ServerMessage::Error {
+                message: format!("session lookup failed: {err}"),
+            };
+        }
+        Err(err) => {
+            return ServerMessage::Error {
+                message: format!("session lookup task failed: {err}"),
+            };
+        }
+    };
+
+    let attempt_id = ApproveAttemptId::new();
+    let started_at = UnixMillis::now();
+    let start_result = {
+        let audit = Arc::clone(&state.audit);
+        let operator = operator.clone();
+        tokio::task::spawn_blocking(move || {
+            audit.start_approve_attempt(attempt_id, request_id, &operator, started_at)
+        })
+        .await
+    };
+    match start_result {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => {
+            // `start_approve_attempt` refuses in three shapes: a prior
+            // resolution row exists (the early short-circuit above
+            // would normally catch this, but a race between two
+            // concurrent approves can land both past the
+            // `audit_entry.resolution.is_some()` check before either
+            // has inserted), a non-`pre_patch_failure` attempt is
+            // active for the same push, or the staged-outcome
+            // precondition has gone away under us. All are surfaced as
+            // a generic error: the operator (or a future reviewer)
+            // reads the audit row to disambiguate.
+            return ServerMessage::Error {
+                message: format!("approve attempt could not be started: {err}"),
+            };
+        }
+        Err(err) => {
+            return ServerMessage::Error {
+                message: format!("approve attempt start task failed: {err}"),
+            };
+        }
+    }
+
+    // Static promote scope: `contents:write` is what the Git Data REST
+    // API needs to upload blobs/trees/commits and update the branch
+    // ref; `metadata:read` is implicit but listed explicitly because
+    // the minter's permissions-echo check refuses any drift between
+    // what we asked for and what GitHub returned. The single repo on
+    // the scope is the one the staged push targets.
+    let github_scope = GitHubGrantedScope {
+        repository: entry.receipt().repo().as_repo_ref().clone(),
+        permissions: GitHubPermissions {
+            contents: Some(GitHubAccess::Write),
+            metadata: Some(MetadataAccess::Read),
+            ..Default::default()
+        },
+    };
+    let ttl = TtlSeconds::new(APPROVE_MINT_TTL_SECONDS)
+        .expect("APPROVE_MINT_TTL_SECONDS is in TtlSeconds range");
+
+    let mint_result = state
+        .minter
+        .mint_for_agent(&state.secrets, session.agent_kind, github_scope, ttl)
+        .await;
+    let minted = match mint_result {
+        Ok(m) => m,
+        Err(err) => {
+            let detail = format!("mint failed: {}", err.agent_message());
+            resolve_pre_patch_failure(state, attempt_id, request_id, &detail, None).await;
+            return ServerMessage::Error {
+                message: format!("approve-time mint failed: {}", err.agent_message()),
+            };
+        }
+    };
+
+    let (api_base, raw_token, mint_audit) = minted.into_promote_pieces();
+    let token = match GitSecretValue::new(raw_token) {
+        Ok(t) => t,
+        Err(err) => {
+            let detail = format!("mint produced unusable token: {err}");
+            // Mint succeeded by the time we have a `MintedToken`, so
+            // capture the mint context on the attempt row even though
+            // the token cannot be used. The audit log can still answer
+            // "what mint was issued for this attempt."
+            resolve_pre_patch_failure(state, attempt_id, request_id, &detail, Some(mint_audit))
+                .await;
+            return ServerMessage::Error {
+                message: format!("approve-time mint produced an unusable token: {err}"),
+            };
+        }
+    };
+
+    // Commit to "the PATCH may exist on GitHub": from here until
+    // `Resolved` lands the attempt is `Uncertain` and the new
+    // `git_push_resolution_refuses_active_approve` trigger blocks any
+    // concurrent reject. Failures from `run_approve` after this point
+    // resolve through the `complete_attempt_*` DAO methods, never via
+    // a direct `record_git_push_resolution` call.
+    let uncertain_result = {
+        let audit = Arc::clone(&state.audit);
+        tokio::task::spawn_blocking(move || audit.mark_attempt_uncertain(attempt_id, mint_audit))
+            .await
+    };
+    match uncertain_result {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => {
+            // The attempt row is still `Started` (the UPDATE was
+            // refused) so a `pre_patch_failure` capturing the mint is
+            // the correct shape: no PATCH was issued, but the mint was.
+            let detail = format!("mark_attempt_uncertain failed: {err}");
+            resolve_pre_patch_failure(state, attempt_id, request_id, &detail, Some(mint_audit))
+                .await;
+            return ServerMessage::Error {
+                message: format!("approve attempt could not enter Uncertain: {err}"),
+            };
+        }
+        Err(err) => {
+            let detail = format!("mark_attempt_uncertain task failed: {err}");
+            resolve_pre_patch_failure(state, attempt_id, request_id, &detail, Some(mint_audit))
+                .await;
+            return ServerMessage::Error {
+                message: format!("approve attempt Uncertain task failed: {err}"),
+            };
+        }
+    }
+
+    let receipt = entry.receipt();
+    let repo = receipt.repo().clone();
+    let branch = receipt.branch().clone();
+    let expected_remote_head = receipt
+        .expected_remote_head()
+        .cloned()
+        .expect("expected_remote_head presence was checked above");
+    let bundle_tip = receipt.new_head().clone();
+    let (_, bundle_bytes) = entry.into_parts();
+
+    let run_result = run_approve(
+        &promote_runtime,
+        &api_base,
+        &token,
+        &repo,
+        &branch,
+        &expected_remote_head,
+        &bundle_tip,
+        &bundle_bytes,
+        &signing_key,
+        // Trailers are an open follow-up: the design pins a per-approve
+        // trailer set (operator id, original commit sha) but the policy
+        // hasn't been ratified yet, so the slice ships with no trailers
+        // and the bundle's commits are replayed verbatim. The empty
+        // slice is identical in shape to what the run_approve unit
+        // tests pass.
+        &[],
+        request_id,
+    )
+    .await;
+
+    let outcome = match run_result {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            // `Execute(UpdateRef(_))` is the only variant that proves a
+            // PATCH was sent to GitHub; every other variant fires
+            // before `execute_fast_forward_plan` issues
+            // `PATCH /git/refs/...`. Map the variant onto the
+            // attempt's terminal state accordingly.
+            let detail = format!("run_approve failed: {err}");
+            match &err {
+                RunApproveError::Execute(ExecuteError::UpdateRef(_)) => {
+                    resolve_post_patch_failure(state, attempt_id, request_id, &detail).await;
+                    return ServerMessage::Error {
+                        message: format!(
+                            "approve pipeline issued update_ref against GitHub but the response \
+                             could not be confirmed; staged push {request_id} is quarantined and \
+                             must be reconciled manually: {err}"
+                        ),
+                    };
+                }
+                _ => {
+                    resolve_pre_patch_failure(state, attempt_id, request_id, &detail, None).await;
+                    let message = match &err {
+                        RunApproveError::Prepare(_) => format!("staging preparation failed: {err}"),
+                        _ => format!("approve pipeline failed: {err}"),
+                    };
+                    return ServerMessage::Error { message };
+                }
+            }
+        }
+    };
+
+    // Joint TX: attempt → Resolved(Succeeded) *and* the
+    // `git_push_resolution(decision='approved')` row land in one
+    // SQLite transaction. The resolution-INSERT trigger sees the
+    // attempt at `succeeded` (the UPDATE runs first) and admits the
+    // row; an in-flight reject would have been refused at its own
+    // INSERT by the same trigger.
+    let new_app_tip = outcome.new_app_tip().clone();
+    let completed_at = UnixMillis::now();
+    let reason = format!("approved by {operator}");
+    let success_result = {
+        let audit = Arc::clone(&state.audit);
+        let new_app_tip = new_app_tip.clone();
+        let operator = operator.clone();
+        let reason = reason.clone();
+        tokio::task::spawn_blocking(move || {
+            audit.complete_attempt_succeeded(
+                attempt_id,
+                &new_app_tip,
+                &operator,
+                &reason,
+                completed_at,
+            )
+        })
+        .await
+    };
+    match success_result {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => {
+            // The branch on GitHub now points at `new_app_tip` but the
+            // audit log could not commit the joint TX. The attempt is
+            // still `Uncertain`. Try to record `PostPatchFailure` so
+            // reject is refused going forward; if that also fails the
+            // attempt stays `Uncertain` and boot reconcile surfaces it.
+            tracing::error!(
+                target: AUDIT_WRITE_FAILURE_TARGET,
+                kind = "git_push_approve_attempt_succeeded",
+                request_id = %request_id,
+                attempt_id = %attempt_id,
+                jti = %mint_audit.jti,
+                error = %err,
+                "audit write failed: approve succeeded on GitHub but joint TX did not commit; \
+                 falling back to PostPatchFailure",
+            );
+            let detail = format!("complete_attempt_succeeded failed: {err}");
+            resolve_post_patch_failure(state, attempt_id, request_id, &detail).await;
+            return ServerMessage::Error {
+                message: format!(
+                    "branch was advanced on GitHub (new_app_tip = {new_app_tip}) but the audit \
+                     resolution row could not be committed: {err}"
+                ),
+            };
+        }
+        Err(err) => {
+            tracing::error!(
+                target: AUDIT_WRITE_FAILURE_TARGET,
+                kind = "git_push_approve_attempt_succeeded",
+                request_id = %request_id,
+                attempt_id = %attempt_id,
+                jti = %mint_audit.jti,
+                error = %err,
+                "audit write task failed: approve succeeded on GitHub but joint TX did not commit; \
+                 falling back to PostPatchFailure",
+            );
+            let detail = format!("complete_attempt_succeeded task failed: {err}");
+            resolve_post_patch_failure(state, attempt_id, request_id, &detail).await;
+            return ServerMessage::Error {
+                message: format!("approve resolution task failed: {err}"),
+            };
+        }
+    }
+
+    // Best-effort staging-dir delete after the joint TX. A stale dir
+    // surfaces in `promote list` and cannot cause a contradictory
+    // reject because the resolution row is already in place.
+    let delete_result = {
+        let staging_store = Arc::clone(&staging_store);
+        tokio::task::spawn_blocking(move || staging_store.delete(request_id)).await
+    };
+    match delete_result {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => {
+            tracing::warn!(
+                request_id = %request_id,
+                error = %err,
+                "approved staged push: staging dir delete failed; \
+                 audit row is committed, dir will appear in `promote list`",
+            );
+        }
+        Err(err) => {
+            tracing::warn!(
+                request_id = %request_id,
+                error = %err,
+                "approved staged push: staging dir delete task failed; \
+                 leaving for boot-time reconciliation",
+            );
+        }
+    }
+
+    ServerMessage::StagedPushApproved {
+        request_id,
+        new_app_tip,
+    }
+}
+
+/// Drive an attempt to `Resolved(PrePatchFailure)`. Chooses between the
+/// mint-capturing and non-capturing DAO variants based on whether the
+/// caller has a mint to record: the column-immutability trigger refuses
+/// to write a mint different from one that's already there, so we must
+/// not pass `Some(mint)` to the capturing variant when the attempt is
+/// already `Uncertain` (it carries the mint inline already).
+async fn resolve_pre_patch_failure<S: SecretStore + Send + Sync + 'static>(
+    state: &Arc<BrokerState<S>>,
+    attempt_id: ApproveAttemptId,
+    request_id: RequestId,
+    detail: &str,
+    mint_to_capture: Option<PromoteMintAudit>,
+) {
+    let completed_at = UnixMillis::now();
+    let audit = Arc::clone(&state.audit);
+    let detail_owned = detail.to_string();
+    let result = tokio::task::spawn_blocking(move || match mint_to_capture {
+        Some(mint) => audit.complete_attempt_pre_patch_failure_capturing_mint(
+            attempt_id,
+            mint,
+            &detail_owned,
+            completed_at,
+        ),
+        None => audit.complete_attempt_pre_patch_failure(attempt_id, &detail_owned, completed_at),
+    })
+    .await;
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => {
+            tracing::error!(
+                target: AUDIT_WRITE_FAILURE_TARGET,
+                kind = "git_push_approve_attempt_pre_patch_failure",
+                request_id = %request_id,
+                attempt_id = %attempt_id,
+                error = %err,
+                "audit write failed: approve attempt could not be resolved as PrePatchFailure; \
+                 attempt remains Started/Uncertain — boot reconcile will surface it",
+            );
+        }
+        Err(err) => {
+            tracing::error!(
+                target: AUDIT_WRITE_FAILURE_TARGET,
+                kind = "git_push_approve_attempt_pre_patch_failure",
+                request_id = %request_id,
+                attempt_id = %attempt_id,
+                error = %err,
+                "audit write task failed: approve attempt could not be resolved as PrePatchFailure; \
+                 attempt remains Started/Uncertain — boot reconcile will surface it",
+            );
+        }
+    }
+}
+
+/// Drive an `Uncertain` attempt to `Resolved(PostPatchFailure)`. Used
+/// by the two paths that prove the PATCH was sent: a direct
+/// `Execute(UpdateRef(_))` error from `run_approve` (non-2xx /
+/// transport drop on the PATCH itself) and the post-success
+/// joint-TX-failed path (the PATCH succeeded but the audit log could
+/// not commit it).
+async fn resolve_post_patch_failure<S: SecretStore + Send + Sync + 'static>(
+    state: &Arc<BrokerState<S>>,
+    attempt_id: ApproveAttemptId,
+    request_id: RequestId,
+    detail: &str,
+) {
+    let completed_at = UnixMillis::now();
+    let audit = Arc::clone(&state.audit);
+    let detail_owned = detail.to_string();
+    let result = tokio::task::spawn_blocking(move || {
+        audit.complete_attempt_post_patch_failure(attempt_id, &detail_owned, completed_at)
+    })
+    .await;
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => {
+            tracing::error!(
+                target: AUDIT_WRITE_FAILURE_TARGET,
+                kind = "git_push_approve_attempt_post_patch_failure",
+                request_id = %request_id,
+                attempt_id = %attempt_id,
+                error = %err,
+                "audit write failed: approve attempt could not be resolved as PostPatchFailure; \
+                 attempt remains Uncertain — boot reconcile will surface it",
+            );
+        }
+        Err(err) => {
+            tracing::error!(
+                target: AUDIT_WRITE_FAILURE_TARGET,
+                kind = "git_push_approve_attempt_post_patch_failure",
+                request_id = %request_id,
+                attempt_id = %attempt_id,
+                error = %err,
+                "audit write task failed: approve attempt could not be resolved as PostPatchFailure; \
+                 attempt remains Uncertain — boot reconcile will surface it",
+            );
+        }
     }
 }
 
@@ -1791,6 +2308,7 @@ pub async fn serve_broker_with_agent_vm<S: SecretStore + Send + Sync + 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audit::{GitPushApproveAttemptOutcome, GitPushApproveAttemptState};
     use crate::core::{AgentKind, GitHubAccess, RepoRef};
     use crate::github::{GitHubAppConfig, GitHubAppRegistryConfig, GitHubMinter};
     use crate::policy::PolicyConfig;
@@ -2766,7 +3284,11 @@ mod tests {
     ) -> (Arc<BrokerState<InMemStore>>, tempfile::TempDir) {
         let tmp = tempfile::tempdir().unwrap();
         let store = GitPushStagingStore::open(tmp.path().join("staging")).unwrap();
-        let mut state = make_state(server, vec![], "o");
+        // Installation owner matches `sample_clone_repo()`'s "owner/repo"
+        // so the minter's repository-belongs-to-installation check
+        // passes when an approve test reaches the mint step. Tests that
+        // don't mint are unaffected by the owner string.
+        let mut state = make_state(server, vec![], "owner");
         let inner = Arc::get_mut(&mut state).expect("fresh Arc has no other handles");
         inner.staging_store = Some(Arc::new(store));
         (state, tmp)
@@ -3555,21 +4077,23 @@ mod tests {
         );
     }
 
-    // --- Staged-push approve (stub) -------------------------------------
+    // --- Staged-push approve (state machine) ----------------------------
 
-    /// Slice B1e.2c lands operator validation, configured-state guards,
-    /// and the staging load; the mint and `run_approve` calls land in
-    /// B1e.2d/2e. On the happy path of the load, the handler must
-    /// surface a self-describing Error pointing at the follow-up slice
-    /// so an operator (or future reviewer) can locate the plan from
-    /// the response alone, and must emit that Error *without* touching
-    /// the audit log or staging directory — promotion is the only
-    /// client-message side-effect the real handler will have, and a
-    /// half-done one (e.g. audit row but no replay) would be more
-    /// dangerous than one that wrote none.
+    /// Mint failure (no GitHub mock for the access_tokens endpoint) must
+    /// drive the attempt to `Resolved(PrePatchFailure)` with no mint
+    /// captured — mint never produced a `MintedToken`, so there is no
+    /// `PromoteMintAudit` to record. The handler surfaces a generic
+    /// Error to the caller; no resolution row is written (the schema
+    /// trigger insists approved/rejected resolutions are operator
+    /// decisions, not failure side effects), and the staging dir
+    /// remains so the operator can retry once the GitHub App config is
+    /// healed.
     #[tokio::test]
-    async fn approve_staged_push_loads_entry_and_defers_pipeline_to_b1e_2d() {
+    async fn approve_staged_push_mint_failure_resolves_attempt_as_pre_patch_failure() {
         let server = MockServer::start().await;
+        // No `/app/installations/.../access_tokens` mock: the mint
+        // request falls through wiremock's default 404 handler and
+        // surfaces as a mint failure inside the handler.
         let (state, _tmp) = make_state_with_approve_ready(&server);
         let session_id = open_session(&state).await;
         let request_id = stage_with_staged_outcome(
@@ -3593,24 +4117,281 @@ mod tests {
         match resp {
             ServerMessage::Error { message } => {
                 assert!(
-                    message.contains("B1e.2d"),
-                    "Error must name the follow-up slice so the plan is locatable; got: {message}",
-                );
-                assert!(
-                    message.contains("validated and loaded"),
-                    "Error must signal the load step succeeded, not a config error; got: {message}",
+                    message.contains("mint failed"),
+                    "expected mint-failure error, got: {message}",
                 );
             }
             other => panic!("expected Error, got {other:?}"),
         }
 
-        // No audit resolution row was written: a half-done approve
-        // would be worse than a deferred one. The follow-up slice owns
-        // this transition.
+        // Attempt row reached `Resolved(PrePatchFailure)` without a
+        // mint context: the mint never succeeded, so the row carries
+        // `mint: None`.
+        let attempts = state.audit.approve_attempts_for_push(request_id).unwrap();
+        assert_eq!(attempts.len(), 1);
+        match &attempts[0].state {
+            GitPushApproveAttemptState::Resolved {
+                outcome: GitPushApproveAttemptOutcome::PrePatchFailure { detail },
+                mint,
+                ..
+            } => {
+                assert!(mint.is_none(), "mint must not be captured on pre-mint fail");
+                assert!(
+                    detail.contains("mint failed"),
+                    "failure detail must name the mint step: {detail}",
+                );
+            }
+            other => panic!("expected Resolved(PrePatchFailure), got {other:?}"),
+        }
+
+        // No resolution row: PrePatchFailure leaves the push rejectable.
         let audit_entry = state.audit.get_git_push(request_id).unwrap().unwrap();
         assert!(audit_entry.resolution.is_none());
 
-        // Staging dir is still there: nothing was deleted.
+        // Staging dir is still there so reject (or a follow-up
+        // approve) can act on the same staged push.
+        assert!(
+            state
+                .staging_store
+                .as_ref()
+                .unwrap()
+                .load(request_id)
+                .is_ok()
+        );
+    }
+
+    /// A prior `Rejected` resolution row makes the push immutable: any
+    /// follow-up approve must short-circuit with
+    /// `StagedPushAlreadyResolved` before starting an attempt or
+    /// minting a token. The check sits on the joined audit view so a
+    /// rejected-then-deleted-staging-dir push (the normal reject
+    /// outcome) still races correctly with a concurrent approve.
+    #[tokio::test]
+    async fn approve_staged_push_with_prior_resolution_short_circuits() {
+        let server = MockServer::start().await;
+        let (state, _tmp) = make_state_with_approve_ready(&server);
+        let session_id = open_session(&state).await;
+        let request_id = stage_with_staged_outcome(
+            &state,
+            session_id,
+            b"bundle".to_vec(),
+            UnixMillis::from_millis(1_700_000_040_000),
+            UnixMillis::from_millis(1_700_000_040_500),
+        )
+        .await;
+
+        state
+            .audit
+            .record_git_push_resolution(&crate::audit::GitPushResolutionRecord {
+                push_request_id: request_id,
+                decided_at: UnixMillis::from_millis(1_700_000_041_000),
+                decision: crate::audit::GitPushResolution::Rejected,
+                operator: "bob",
+                reason: "not ready",
+            })
+            .unwrap();
+
+        // Belt-and-braces: a mock with `expect(0)` on the mint endpoint
+        // would panic if the handler reached the mint step. The short-
+        // circuit must fire before that.
+        Mock::given(method("POST"))
+            .and(path("/app/installations/999/access_tokens"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let resp = dispatch_message(
+            ClientMessage::ApproveStagedPush {
+                request_id,
+                operator: "alice".into(),
+            },
+            &state,
+        )
+        .await;
+
+        assert_eq!(
+            resp,
+            ServerMessage::StagedPushAlreadyResolved { request_id }
+        );
+
+        // No attempt row created: the short-circuit fires before
+        // `start_approve_attempt`.
+        let attempts = state.audit.approve_attempts_for_push(request_id).unwrap();
+        assert!(attempts.is_empty());
+    }
+
+    /// Branch-creation pushes (no `expected_remote_head`) are refused
+    /// by the handler before any attempt or mint: the fast-forward
+    /// planner needs a lease anchor, and approve does not yet have a
+    /// safe story for creating a brand-new branch via PUT. Refusing
+    /// here gives the operator a clear diagnostic instead of letting
+    /// the request fail deeper in the pipeline.
+    #[tokio::test]
+    async fn approve_staged_push_for_branch_creation_returns_error() {
+        let server = MockServer::start().await;
+        let (state, _tmp) = make_state_with_approve_ready(&server);
+        let session_id = open_session(&state).await;
+
+        // Build a staged push whose audit row has
+        // `expected_remote_head = None`. Mirrors `stage_with_audit`
+        // but with a hand-rolled metadata that carries no parent.
+        let request_id = RequestId::new();
+        let metadata = crate::vm_git::VmGitPushMetadata::new(
+            sample_clone_repo(),
+            sample_branch(),
+            None,
+            sample_object_id('b'),
+        );
+        let staging = state.staging_store.as_ref().unwrap().clone();
+        let bundle = b"bundle".to_vec();
+        tokio::task::spawn_blocking(move || {
+            staging
+                .stage(
+                    request_id,
+                    UnixMillis::from_millis(1_700_000_040_000),
+                    metadata,
+                    bundle,
+                )
+                .unwrap();
+        })
+        .await
+        .unwrap();
+        state
+            .audit
+            .record_git_push_request(&crate::audit::GitPushRequestRecord {
+                push_request_id: request_id,
+                session_id,
+                received_at: UnixMillis::from_millis(1_700_000_040_500),
+                repo: sample_clone_repo(),
+                branch: sample_branch(),
+                expected_remote_head: None,
+                new_head: sample_object_id('b'),
+                correlation_id: None,
+            })
+            .unwrap();
+        state
+            .audit
+            .record_git_push_outcome(&crate::audit::GitPushOutcomeRecord {
+                push_request_id: request_id,
+                completed_at: UnixMillis::from_millis(1_700_000_040_500),
+                result: crate::audit::GitPushOutcomeResult::Staged,
+                github_status: None,
+                message: "staged for operator review",
+            })
+            .unwrap();
+
+        let resp = dispatch_message(
+            ClientMessage::ApproveStagedPush {
+                request_id,
+                operator: "alice".into(),
+            },
+            &state,
+        )
+        .await;
+
+        match resp {
+            ServerMessage::Error { message } => {
+                assert!(
+                    message.contains("branch-creation"),
+                    "expected branch-creation refusal, got: {message}",
+                );
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+
+        // No attempt row: refusal happens before
+        // `start_approve_attempt`.
+        let attempts = state.audit.approve_attempts_for_push(request_id).unwrap();
+        assert!(attempts.is_empty());
+    }
+
+    /// `run_approve` failure that fires before `update_ref` (e.g. the
+    /// `git init --bare` in `prepare_staging_repo` because the
+    /// configured `git_program` is bogus) must drive the attempt from
+    /// `Uncertain` to `Resolved(PrePatchFailure)`. The mint context
+    /// recorded by `mark_attempt_uncertain` survives on the resolved
+    /// row, and reject becomes legal again because the trigger admits
+    /// reject when every attempt is `PrePatchFailure`.
+    #[tokio::test]
+    async fn approve_staged_push_run_approve_failure_resolves_as_pre_patch_failure() {
+        let server = MockServer::start().await;
+        let (state, _tmp) = make_state_with_approve_ready(&server);
+        // `make_state_with_approve_ready` wires git_program to
+        // `/nonexistent/bin/git`, so `prepare_staging_repo`'s
+        // `git init --bare` fails — exactly the pre-PATCH failure
+        // mode this test wants to exercise.
+        let session_id = open_session(&state).await;
+        let request_id = stage_with_staged_outcome(
+            &state,
+            session_id,
+            b"bundle".to_vec(),
+            UnixMillis::from_millis(1_700_000_040_000),
+            UnixMillis::from_millis(1_700_000_040_500),
+        )
+        .await;
+
+        let expiry = expiry_str_from_now(3600);
+        Mock::given(method("POST"))
+            .and(path("/app/installations/999/access_tokens"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "token": "ghs_test_token",
+                "expires_at": expiry,
+                "permissions": {"contents": "write", "metadata": "read"},
+                "repository_selection": "selected",
+                "repositories": [{"full_name": "owner/repo"}],
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let resp = dispatch_message(
+            ClientMessage::ApproveStagedPush {
+                request_id,
+                operator: "alice".into(),
+            },
+            &state,
+        )
+        .await;
+
+        match resp {
+            ServerMessage::Error { message } => {
+                assert!(
+                    message.contains("staging preparation failed")
+                        || message.contains("approve pipeline failed"),
+                    "expected pre-PATCH pipeline failure, got: {message}",
+                );
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+
+        // Attempt row reached `Resolved(PrePatchFailure)` with the
+        // mint context the `Uncertain` step recorded (the column-
+        // immutability trigger preserves it across the resolve).
+        let attempts = state.audit.approve_attempts_for_push(request_id).unwrap();
+        assert_eq!(attempts.len(), 1);
+        match &attempts[0].state {
+            GitPushApproveAttemptState::Resolved {
+                outcome: GitPushApproveAttemptOutcome::PrePatchFailure { detail },
+                mint,
+                ..
+            } => {
+                assert!(
+                    mint.is_some(),
+                    "mint context must persist from Uncertain across the resolve",
+                );
+                assert!(
+                    detail.contains("run_approve failed"),
+                    "failure detail must name the pipeline step: {detail}",
+                );
+            }
+            other => panic!("expected Resolved(PrePatchFailure), got {other:?}"),
+        }
+
+        // PrePatchFailure leaves the push rejectable: no resolution
+        // row, staging dir still on disk.
+        let audit_entry = state.audit.get_git_push(request_id).unwrap().unwrap();
+        assert!(audit_entry.resolution.is_none());
         assert!(
             state
                 .staging_store
