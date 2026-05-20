@@ -5,3 +5,6 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc 6fa6d1f027e238e960565ec7b37f979d1e78eab58ae3be9ce465f0821659fbd6 # shrinks to events = [Stage(1), Approve(1, StartedOrphan), Crash]
+cc 6659dbde1565c855ec6a2e5d76710d9831591e9d99fcd5668f9f8d624965ba40 # shrinks to events = [Stage(3), Approve(3, UncertainOrphan), Crash, Reconcile(3, Applied)]
+cc a61ccaa3495d71c7e7e00ba34241650f1806cef01740dc9b8c6a21d329e0f354 # shrinks to events = [Stage(1), Approve(1, UncertainOrphan), Crash, Reconcile(1, NotApplied), Reject(1)]
+cc e1e1b44248fd1370ab38fe8b538d249630ae3597aa9671ef9cade6c4f017d63b # shrinks to events = [Stage(1), Approve(1, UncertainPostPatchFailure), Reconcile(1, NotApplied), Approve(1, UncertainOrphan), Crash, Reconcile(1, Applied)]

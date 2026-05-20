@@ -14,13 +14,15 @@
 //! state machine + reconcile + reject-blocker composition without
 //! pulling in HTTP / signing-key fixtures.
 
+use std::collections::HashSet;
+
 use proptest::prelude::*;
 use uuid::Uuid;
 
 use writ::audit::{
     AuditLog, GitPushApproveAttemptOutcome, GitPushApproveAttemptState, GitPushOutcomeRecord,
     GitPushOutcomeResult, GitPushRequestRecord, GitPushResolution, GitPushResolutionRecord,
-    PromoteMintAudit,
+    PromoteMintAudit, ReconciliationTarget,
 };
 use writ::boot_reconcile::reconcile_pending_approve_attempts;
 use writ::core::{
@@ -32,6 +34,8 @@ const NUM_PUSHES: usize = 4;
 const OPERATOR: &str = "alice";
 const APPROVE_REASON: &str = "looks good";
 const REJECT_REASON: &str = "no thanks";
+const RECONCILE_REASON: &str = "manual reconciliation";
+const RECONCILE_NOT_APPLIED_DETAIL: &str = "remote tip unchanged";
 
 /// Outcomes the broker can drive a single approve attempt to. Mirrors
 /// the design-doc enumeration of sub-step failure points; the
@@ -66,6 +70,22 @@ enum ApproveOutcome {
     UncertainPostPatchFailure,
 }
 
+/// Verdict the operator records during a manual reconciliation. The
+/// reconciliation DAO has two entry points (`_applied` /
+/// `_not_applied`) and the random walk needs both; the SHA / operator
+/// / reason / detail are all fixtures so shrunk traces stay small.
+#[derive(Clone, Debug)]
+enum ReconcileVerdict {
+    /// Operator confirmed the PATCH did land on GitHub. Writes a
+    /// born-terminal `Resolved(Succeeded)` attempt row plus the
+    /// matching `git_push_resolution(Approved)` row in one TX.
+    Applied,
+    /// Operator confirmed the PATCH did *not* land. Writes a
+    /// born-terminal `Resolved(PrePatchFailure)` attempt row that
+    /// supersedes the predecessor; no resolution row.
+    NotApplied,
+}
+
 #[derive(Clone, Debug)]
 enum Event {
     /// Record a `git_push_request` + `git_push_outcome(Staged)` pair
@@ -82,6 +102,14 @@ enum Event {
     /// for every non-terminal `Started` row; `Uncertain` rows
     /// untouched.
     Crash,
+    /// Manual reconciliation against the oldest non-superseded
+    /// eligible predecessor (per [`AuditLog::classify_reconciliation_target`]).
+    /// Refused if no eligible predecessor exists — the proptest skips
+    /// the step so traces shrink down to minimal violating sequences.
+    /// The `Uncertain`-with-boot-observed precondition is enforced by
+    /// `classify_reconciliation_target` itself, so no special event
+    /// pairing is required.
+    Reconcile(usize, ReconcileVerdict),
 }
 
 fn arb_outcome() -> impl Strategy<Value = ApproveOutcome> {
@@ -95,6 +123,13 @@ fn arb_outcome() -> impl Strategy<Value = ApproveOutcome> {
     ]
 }
 
+fn arb_verdict() -> impl Strategy<Value = ReconcileVerdict> {
+    prop_oneof![
+        Just(ReconcileVerdict::Applied),
+        Just(ReconcileVerdict::NotApplied),
+    ]
+}
+
 fn arb_event() -> impl Strategy<Value = Event> {
     let slot = 0usize..NUM_PUSHES;
     prop_oneof![
@@ -102,6 +137,7 @@ fn arb_event() -> impl Strategy<Value = Event> {
         (slot.clone(), arb_outcome()).prop_map(|(i, o)| Event::Approve(i, o)),
         slot.clone().prop_map(Event::Reject),
         Just(Event::Crash),
+        (slot.clone(), arb_verdict()).prop_map(|(i, v)| Event::Reconcile(i, v)),
     ]
 }
 
@@ -122,6 +158,19 @@ struct Scenario {
     pushes: [Option<RequestId>; NUM_PUSHES],
     session_id: SessionId,
     next_ts_ms: i64,
+    /// Mirror of the DAO's `superseded_attempt_ids_for_push` set,
+    /// kept in-test because that lookup is private. Each successful
+    /// reconciliation pushes its `supersedes` here so the invariant
+    /// checks can ignore attempts that have been retired by a
+    /// reconciliation row — matching what `reject_blocker_for_push`
+    /// and `classify_reconciliation_target` do internally.
+    superseded: HashSet<ApproveAttemptId>,
+    /// Attempt ids born from successful reconciliation rows — i.e.
+    /// attempts whose `supersedes_attempt_id` is set. Invariant 6 says
+    /// the chain has length at most 1: no attempt with
+    /// `supersedes_attempt_id` set may itself be superseded. We assert
+    /// this as `reconciliations ∩ superseded = ∅`.
+    reconciliations: HashSet<ApproveAttemptId>,
 }
 
 #[derive(Debug)]
@@ -144,6 +193,8 @@ impl Scenario {
             pushes: Default::default(),
             session_id: session.session_id,
             next_ts_ms: 1_000,
+            superseded: HashSet::new(),
+            reconciliations: HashSet::new(),
         }
     }
 
@@ -303,6 +354,52 @@ impl Scenario {
         reconcile_pending_approve_attempts(&self.audit, now).unwrap();
     }
 
+    /// Drive a manual reconciliation against the push at `slot`.
+    /// Defers eligibility entirely to `classify_reconciliation_target`,
+    /// which encapsulates the supersession + boot-observed-marker
+    /// checks. Refusal becomes `Refused` so the proptest skips the
+    /// step rather than panicking — exactly mirroring the
+    /// approve/reject pattern.
+    fn reconcile(&mut self, slot: usize, verdict: &ReconcileVerdict) -> Result<(), Refused> {
+        let Some(push_id) = self.pushes[slot] else {
+            return Err(Refused);
+        };
+        let target = self.audit.classify_reconciliation_target(push_id).unwrap();
+        let ReconciliationTarget::Eligible {
+            attempt_id: supersedes,
+        } = target
+        else {
+            return Err(Refused);
+        };
+        let attempt_id = ApproveAttemptId::new();
+        let now = self.next_ts();
+        let result = match verdict {
+            ReconcileVerdict::Applied => self.audit.record_reconciliation_attempt_applied(
+                attempt_id,
+                supersedes,
+                &oid('4'),
+                OPERATOR,
+                RECONCILE_REASON,
+                now,
+            ),
+            ReconcileVerdict::NotApplied => self.audit.record_reconciliation_attempt_not_applied(
+                attempt_id,
+                supersedes,
+                OPERATOR,
+                RECONCILE_NOT_APPLIED_DETAIL,
+                now,
+            ),
+        };
+        match result {
+            Ok(()) => {
+                self.superseded.insert(supersedes);
+                self.reconciliations.insert(attempt_id);
+                Ok(())
+            }
+            Err(_) => Err(Refused),
+        }
+    }
+
     /// Counts the resolution rows currently in the DB by walking the
     /// pushes the test created. Used for invariant 5.
     fn count_resolutions(&self) -> u32 {
@@ -391,11 +488,17 @@ impl Scenario {
             }
 
             // Invariant 3: if a `git_push_resolution(rejected)` row exists,
-            // then no attempt is `Uncertain`, `Succeeded`, or `PostPatchFailure`.
+            // then no *live* attempt is `Uncertain`, `Succeeded`, or
+            // `PostPatchFailure`. Superseded attempts are excluded —
+            // a NotApplied reconciliation retires its predecessor, which
+            // is exactly what allows the subsequent reject to land.
             if let Some(res) = entry.resolution.as_ref()
                 && matches!(res.decision, GitPushResolution::Rejected)
             {
                 for a in &attempts {
+                    if self.superseded.contains(&a.attempt_id) {
+                        continue;
+                    }
                     match &a.state {
                         GitPushApproveAttemptState::Uncertain { .. } => {
                             return Err(format!(
@@ -420,6 +523,22 @@ impl Scenario {
                 }
             }
 
+            // Invariant 6: no attempt with `supersedes_attempt_id` set
+            // is itself superseded — i.e. the chain length is at most
+            // 1. The UNIQUE partial index in schema v6 enforces this
+            // at the DB layer; pinning it in-test means a future schema
+            // change that drops the index would surface here.
+            for a in &attempts {
+                if self.reconciliations.contains(&a.attempt_id)
+                    && self.superseded.contains(&a.attempt_id)
+                {
+                    return Err(format!(
+                        "invariant 6: reconciliation attempt {} for push {} was itself superseded",
+                        a.attempt_id, push_id,
+                    ));
+                }
+            }
+
             // Invariant 4: immediately after a boot-reconcile pass,
             // no attempt is in `Started`.
             if last_was_crash {
@@ -441,7 +560,12 @@ proptest! {
     /// Drive a randomly generated trace and assert all five
     /// invariants. Invariants 1–4 are checked after every step;
     /// invariant 5 is checked at the end of the trace (it's a global
-    /// counter relation, not a per-step property).
+    /// counter relation, not a per-step property). The two
+    /// reconciliation-specific invariants (I7 / I8) are spot-checked
+    /// inline immediately after a successful `Reconcile` event,
+    /// because their preconditions ("we just confirmed Applied" /
+    /// "we just confirmed NotApplied") are not visible from the
+    /// audit-log state alone.
     #[test]
     fn approve_state_machine_invariants_hold_under_random_traces(
         events in proptest::collection::vec(arb_event(), 0..40),
@@ -462,6 +586,50 @@ proptest! {
                     }
                 }
                 Event::Crash => scenario.crash(),
+                Event::Reconcile(i, v) => {
+                    if scenario.reconcile(*i, v).is_ok() {
+                        let push_id = scenario.pushes[*i].unwrap();
+                        let entry = scenario
+                            .audit
+                            .get_git_push(push_id)
+                            .unwrap()
+                            .expect("push must exist after a successful reconcile");
+                        match v {
+                            ReconcileVerdict::Applied => {
+                                // I7: a successful Applied reconciliation must
+                                // leave the push with a `git_push_resolution(Approved)`
+                                // row — written in the same TX as the new
+                                // `Resolved(Succeeded)` attempt.
+                                let resolution = entry
+                                    .resolution
+                                    .as_ref()
+                                    .expect("I7: Applied must produce a resolution row");
+                                prop_assert!(
+                                    matches!(resolution.decision, GitPushResolution::Approved(_)),
+                                    "I7: Applied wrote a non-Approved resolution: {:?}",
+                                    resolution.decision,
+                                );
+                                // Generalised I5: Applied counts as one submitted decision
+                                // (it writes a resolution row).
+                                submitted_decisions += 1;
+                            }
+                            ReconcileVerdict::NotApplied => {
+                                // I8: NotApplied writes an attempt row only;
+                                // no `git_push_resolution` row. The reconciliation
+                                // DAO refuses if the push is already resolved
+                                // (predecessor must be Uncertain or
+                                // PostPatchFailure, neither of which has a
+                                // resolution), so the absence is checkable
+                                // unconditionally on the success branch.
+                                prop_assert!(
+                                    entry.resolution.is_none(),
+                                    "I8: NotApplied wrote a resolution row: {:?}",
+                                    entry.resolution,
+                                );
+                            }
+                        }
+                    }
+                }
             }
             let last_was_crash = matches!(ev, Event::Crash);
             if let Err(violation) = scenario.check_invariants(last_was_crash) {
