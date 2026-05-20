@@ -1114,6 +1114,18 @@ async fn approve_staged_push<S: SecretStore + Send + Sync + 'static>(
         }
     };
 
+    // A `Started` row written here is durable. If writd crashes
+    // between this INSERT and the next `complete_attempt_*` call, the
+    // attempt row stays `Started` and blocks both a follow-up approve
+    // (the DAO refuses to start a second non-`pre_patch_failure`
+    // attempt) and a follow-up reject (the
+    // `git_push_resolution_refuses_active_approve` trigger treats
+    // `started` as in-flight). Boot reconcile is the load-bearing
+    // recovery story for that window — slice B1e.3d adds the daemon
+    // startup pass that drives every stale `Started` attempt (and the
+    // `Uncertain` ones whose mint is past `expires_at`) to
+    // `Resolved(PrePatchFailure)` so the staged push becomes
+    // reject-eligible again without manual DB repair.
     let attempt_id = ApproveAttemptId::new();
     let started_at = UnixMillis::now();
     let start_result = {
@@ -1270,15 +1282,26 @@ async fn approve_staged_push<S: SecretStore + Send + Sync + 'static>(
             // before `execute_fast_forward_plan` issues
             // `PATCH /git/refs/...`. Map the variant onto the
             // attempt's terminal state accordingly.
-            let detail = format!("run_approve failed: {err}");
+            //
+            // `err` can wrap `GitDataError::ApiError { body, .. }`
+            // whose `body` is unbounded GitHub/GHES bytes; cap both
+            // the audit `detail` and the wire `message` at
+            // `MAX_WIRE_ERROR_BYTES` so a hostile or misbehaving
+            // server can't bloat the audit DB column or blow up the
+            // `ServerMessage::Error` envelope.
+            let detail =
+                truncate_for_wire(format!("run_approve failed: {err}"), MAX_WIRE_ERROR_BYTES);
             match &err {
                 RunApproveError::Execute(ExecuteError::UpdateRef(_)) => {
                     resolve_post_patch_failure(state, attempt_id, request_id, &detail).await;
                     return ServerMessage::Error {
-                        message: format!(
-                            "approve pipeline issued update_ref against GitHub but the response \
-                             could not be confirmed; staged push {request_id} is quarantined and \
-                             must be reconciled manually: {err}"
+                        message: truncate_for_wire(
+                            format!(
+                                "approve pipeline issued update_ref against GitHub but the \
+                                 response could not be confirmed; staged push {request_id} is \
+                                 quarantined and must be reconciled manually: {err}"
+                            ),
+                            MAX_WIRE_ERROR_BYTES,
                         ),
                     };
                 }
@@ -1288,7 +1311,9 @@ async fn approve_staged_push<S: SecretStore + Send + Sync + 'static>(
                         RunApproveError::Prepare(_) => format!("staging preparation failed: {err}"),
                         _ => format!("approve pipeline failed: {err}"),
                     };
-                    return ServerMessage::Error { message };
+                    return ServerMessage::Error {
+                        message: truncate_for_wire(message, MAX_WIRE_ERROR_BYTES),
+                    };
                 }
             }
         }
@@ -1504,6 +1529,40 @@ fn approve_staged_push_not_configured(component: &str) -> ServerMessage {
              writd needs staging_store + promote_runtime + signing_key to serve ApproveStagedPush"
         ),
     }
+}
+
+/// Maximum byte length of an error string echoed back on the wire in a
+/// [`ServerMessage::Error`] or written into the
+/// `git_push_approve_attempt.failure_detail` audit column. The approve
+/// pipeline can wrap a [`crate::github_git_db::GitDataError::ApiError`]
+/// whose `body` is the raw bytes a GitHub Enterprise instance (or a
+/// proxy in front of it) returns; that body is otherwise unbounded and
+/// would expand both the broker's per-error wire footprint *and* the
+/// audit DB without limit. 4 KiB is large enough to preserve the
+/// diagnostic shape (status line, JSON error object, the first few
+/// stack-trace-ish lines) while keeping a worst-case error envelope
+/// comfortably under the broker's per-message processing budget.
+const MAX_WIRE_ERROR_BYTES: usize = 4 * 1024;
+
+/// Truncate `s` to at most `cap` bytes, with a sentinel marker so the
+/// reader can tell the message is a prefix. The marker is appended
+/// after the cap (the returned string is `cap + marker.len()` bytes
+/// long when truncation happens), because the goal is to bound the
+/// *body* the broker reflects from GitHub, not to bound the total
+/// envelope to the byte. Splits on a `char` boundary so the result is
+/// valid UTF-8 even when the cap lands inside a multi-byte sequence.
+fn truncate_for_wire(s: String, cap: usize) -> String {
+    if s.len() <= cap {
+        return s;
+    }
+    let mut boundary = cap;
+    while boundary > 0 && !s.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    let mut out = s;
+    out.truncate(boundary);
+    out.push_str("... [truncated]");
+    out
 }
 
 /// Best-effort retry of the staging-dir delete on a duplicate-resolution
@@ -4400,6 +4459,41 @@ mod tests {
                 .load(request_id)
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn truncate_for_wire_passes_short_input_through() {
+        let s = "hello".to_string();
+        assert_eq!(truncate_for_wire(s.clone(), 16), s);
+    }
+
+    #[test]
+    fn truncate_for_wire_passes_exact_cap_through() {
+        // At exactly `cap` bytes there is nothing to truncate; the
+        // sentinel marker must not be appended.
+        let s = "x".repeat(8);
+        assert_eq!(truncate_for_wire(s.clone(), 8), s);
+    }
+
+    #[test]
+    fn truncate_for_wire_caps_oversize_input_and_appends_marker() {
+        let s = "x".repeat(10);
+        let out = truncate_for_wire(s, 4);
+        assert_eq!(out, "xxxx... [truncated]");
+    }
+
+    #[test]
+    fn truncate_for_wire_respects_utf8_boundary_when_cap_lands_mid_codepoint() {
+        // "é" is a two-byte UTF-8 sequence (0xC3 0xA9). With cap=1 the
+        // naive split would land between the two bytes; the helper must
+        // back up to the previous char boundary so the result is valid
+        // UTF-8.
+        let s = "é".to_string();
+        let out = truncate_for_wire(s.clone(), 1);
+        // s is 2 bytes so cap=1 triggers truncation; the prefix before
+        // the marker must be empty (the only char boundary at-or-below
+        // 1 is 0).
+        assert_eq!(out, "... [truncated]");
     }
 
     /// Operator validation runs before the configured-state checks so a
