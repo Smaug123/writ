@@ -3,4 +3,7 @@
 //! writers live here so they can be unit-tested without the binary's
 //! socket/argv machinery in the way.
 
+pub mod identity;
 pub mod output;
+pub mod parse;
+pub mod workspace;
