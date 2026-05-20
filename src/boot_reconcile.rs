@@ -60,15 +60,21 @@ impl ReconcileReport {
 /// the broker from accepting a fresh approve or reject for the same
 /// push. Called once during daemon startup, *after* the broker socket
 /// is bound (so this process has proven singleton ownership of the
-/// audit DB) but *before* any request handler can run (so the first
+/// socket path) but *before* any request handler can run (so the first
 /// request to land sees a quiescent state).
 ///
-/// Ordering is load-bearing: running this before the bind would let a
+/// Ordering is load-bearing against any other daemon configured
+/// against the same socket: running this before the bind would let a
 /// second `writd` racing the live daemon's startup mutate the shared
 /// DB before its bind fails on `AddrInUse`, potentially resolving the
 /// live process's legitimate in-flight `Started` attempt as a fake
-/// "broker restart" failure. The bind is the singleton claim; this
-/// pass must come after it.
+/// "broker restart" failure. The bind is the singleton claim for the
+/// socket path; this pass must come after it.
+///
+/// Single-writer-ness against the audit DB itself is an operator-config
+/// invariant — "one daemon per `--audit-db`" — shared with the signing
+/// key, agent-VM session ledger, and UI bearer-file writes. See the
+/// matching comment in `src/bin/writd.rs` for the cross-cutting context.
 ///
 /// Errors abort startup: the audit DB is the single source of truth,
 /// so a DAO failure here is correctness-fatal — refusing to start
@@ -111,7 +117,16 @@ fn recover_started(
     entry: &GitPushApproveAttemptEntry,
     now: UnixMillis,
 ) -> Result<(), AuditError> {
-    audit.complete_attempt_pre_patch_failure(entry.attempt_id, BROKER_RESTART_DETAIL, now)
+    // Schema CHECK: `completed_at IS NULL OR completed_at >= started_at`.
+    // If the wall clock moved backwards between the original
+    // `start_approve_attempt` and this boot, the supplied `now` can be
+    // strictly earlier than `entry.started_at`, and the DAO write would
+    // fail the CHECK. Clamping forward preserves the invariant that
+    // completed_at is monotonic per-row without lying about wall-clock
+    // time outside the recovered band — the row's own `started_at`
+    // bounds the lie.
+    let completed_at = std::cmp::max(now, entry.started_at);
+    audit.complete_attempt_pre_patch_failure(entry.attempt_id, BROKER_RESTART_DETAIL, completed_at)
 }
 
 fn flag_uncertain(entry: &GitPushApproveAttemptEntry) {
@@ -407,6 +422,38 @@ mod tests {
                 .unwrap();
         assert!(second.recovered_started.is_empty());
         assert_eq!(second.flagged_uncertain, vec![uncertain]);
+    }
+
+    /// If the wall clock moved backwards between the original
+    /// `start_approve_attempt` and this boot, the supplied `now` is
+    /// earlier than `entry.started_at`. The reconcile must still
+    /// succeed (the DB CHECK `completed_at >= started_at` would
+    /// otherwise reject the write), and the recovered row's
+    /// `completed_at` must be clamped to at least `started_at`.
+    #[test]
+    fn recover_clamps_now_below_started_at() {
+        let (log, session_id) = open_log_with_session();
+        let push_request_id = record_staged_push(&log, session_id);
+        let attempt_id = ApproveAttemptId::new();
+        let started_at_value = UnixMillis::from_millis(1_700_000_500);
+        log.start_approve_attempt(attempt_id, push_request_id, "alice", started_at_value)
+            .unwrap();
+
+        let earlier_now = UnixMillis::from_millis(1_700_000_400);
+        assert!(earlier_now < started_at_value);
+        let report = reconcile_pending_approve_attempts(&log, earlier_now).unwrap();
+        assert_eq!(report.recovered_started, vec![attempt_id]);
+
+        let attempts = log.approve_attempts_for_push(push_request_id).unwrap();
+        match &attempts[0].state {
+            GitPushApproveAttemptState::Resolved { completed_at, .. } => {
+                assert_eq!(
+                    *completed_at, started_at_value,
+                    "clamp must pull completed_at up to started_at",
+                );
+            }
+            other => panic!("expected Resolved, got {other:?}"),
+        }
     }
 
     /// Mixed state across many pushes: only the Started rows

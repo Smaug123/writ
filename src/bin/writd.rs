@@ -113,19 +113,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // key that is no longer the stored trust anchor.
     let broker_listener = prepare_broker_listener(&socket_path).await?;
 
-    // Now that the broker socket is bound, this process is the sole
-    // owner of the audit DB for the lifetime of the bind. Sweep approve
-    // attempts left non-terminal by a prior crash: `Started` rows are
-    // recovered to `Resolved(PrePatchFailure)` so the affected pushes
-    // become rejectable/retryable, and `Uncertain` rows are logged to
-    // AUDIT_WRITE_FAILURE_TARGET and left in place for operator
-    // reconciliation (B2). Reconcile MUST happen after the bind: a
-    // second `writd` racing the live daemon's startup would otherwise
-    // mutate the shared DB before its bind fails on `AddrInUse`, and
-    // could resolve the live process's legitimate in-flight `Started`
-    // attempt as a fake "broker restart" failure. The bind succeeds for
-    // exactly one process per socket path, so the reconcile call below
-    // is single-writer by construction.
+    // Sweep approve attempts left non-terminal by a prior crash:
+    // `Started` rows are recovered to `Resolved(PrePatchFailure)` so
+    // the affected pushes become rejectable/retryable, and `Uncertain`
+    // rows are logged to AUDIT_WRITE_FAILURE_TARGET and left in place
+    // for operator reconciliation (B2).
+    //
+    // Reconcile MUST happen after the broker bind: a second `writd`
+    // started against the same socket path would otherwise mutate the
+    // shared DB before its bind fails on `AddrInUse`, and could resolve
+    // the live process's legitimate in-flight `Started` attempt as a
+    // fake "broker restart" failure. The bind is the singleton claim
+    // for the socket path, so this call is single-writer with respect
+    // to any other daemon configured against the same socket.
+    //
+    // Single-writer-ness against the *audit DB* is an operator-config
+    // invariant, not a runtime guarantee: nothing here stops an
+    // operator from pointing two daemons at the same `--audit-db` via
+    // different `--socket` paths. That same operator-config invariant
+    // is already load-bearing for the signing key in the secret store,
+    // the agent-VM on-disk session ledger, and the UI HTTP bearer
+    // file. A DB-scoped lock that covers all of them is a separate
+    // slice (see follow-up tracked alongside #69).
     //
     // Reconcile MUST also complete before any request handler runs, so
     // it sits before the agent-VM and broker spawn calls — the audit
