@@ -11,7 +11,9 @@ use clap::Parser;
 
 use writ::agent_vm_daemon::AgentVmDaemon;
 use writ::audit::AuditLog;
+use writ::boot_reconcile::reconcile_pending_approve_attempts;
 use writ::config::{DaemonConfig, SecretStoreConfig, default_audit_db_path, default_config_path};
+use writ::core::UnixMillis;
 use writ::git_push_staging::GitPushStagingStore;
 use writ::github::GitHubMinter;
 use writ::secret::{FileSecretStore, KeyringSecretStore, SecretStore};
@@ -110,6 +112,42 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // generated key, leaving the surviving daemon signing with a
     // key that is no longer the stored trust anchor.
     let broker_listener = prepare_broker_listener(&socket_path).await?;
+
+    // Sweep approve attempts left non-terminal by a prior crash:
+    // `Started` rows are recovered to `Resolved(PrePatchFailure)` so
+    // the affected pushes become rejectable/retryable, and `Uncertain`
+    // rows are logged to AUDIT_WRITE_FAILURE_TARGET and left in place
+    // for operator reconciliation (B2).
+    //
+    // Reconcile MUST happen after the broker bind: a second `writd`
+    // started against the same socket path would otherwise mutate the
+    // shared DB before its bind fails on `AddrInUse`, and could resolve
+    // the live process's legitimate in-flight `Started` attempt as a
+    // fake "broker restart" failure. The bind is the singleton claim
+    // for the socket path, so this call is single-writer with respect
+    // to any other daemon configured against the same socket.
+    //
+    // Single-writer-ness against the *audit DB* is an operator-config
+    // invariant, not a runtime guarantee: nothing here stops an
+    // operator from pointing two daemons at the same `--audit-db` via
+    // different `--socket` paths. That same operator-config invariant
+    // is already load-bearing for the signing key in the secret store,
+    // the agent-VM on-disk session ledger, and the UI HTTP bearer
+    // file. A DB-scoped lock that covers all of them is a separate
+    // slice (see follow-up tracked alongside #69).
+    //
+    // Reconcile MUST also complete before any request handler runs, so
+    // it sits before the agent-VM and broker spawn calls — the audit
+    // DB is the single source of truth, and a DAO failure here is
+    // correctness-fatal.
+    let reconcile_report = reconcile_pending_approve_attempts(&audit, UnixMillis::now())?;
+    if !reconcile_report.is_empty() {
+        tracing::warn!(
+            recovered_started = reconcile_report.recovered_started.len(),
+            requires_reconcile = reconcile_report.flagged_uncertain.len(),
+            "reconciled approve attempts left in non-terminal state at last shutdown",
+        );
+    }
 
     let (notes_repo, signing_key, run_agent_spawn) = match run_agent.as_ref() {
         Some(cfg) => {

@@ -935,6 +935,34 @@ impl AuditLog {
                 },
             }))
     }
+
+    /// Every approve-attempt row currently in a non-terminal state
+    /// (`Started` or `Uncertain`), ordered by `started_at` ascending
+    /// (then by `attempt_id` as a stable tiebreaker for the rare
+    /// same-millisecond case). Consumed by boot reconcile to drive
+    /// `Started` attempts to `Resolved(PrePatchFailure)` and to flag
+    /// `Uncertain` attempts for operator review; the schema's
+    /// forward-only triggers guarantee no `Resolved` row appears in
+    /// the result set.
+    pub fn list_blocking_approve_attempts(
+        &self,
+    ) -> Result<Vec<GitPushApproveAttemptEntry>, AuditError> {
+        self.with_conn(|c| {
+            let mut stmt = c.prepare(
+                "SELECT attempt_id, push_request_id, operator, started_at,
+                        state, outcome, completed_at,
+                        new_app_tip, failure_detail,
+                        mint_jti, mint_github_app_id, mint_issued_at, mint_expires_at
+                   FROM git_push_approve_attempt
+                  WHERE state IN ('started', 'uncertain')
+                  ORDER BY started_at ASC, attempt_id ASC",
+            )?;
+            let rows = stmt
+                .query_map([], git_push_approve_attempt_from_row)?
+                .collect::<Result<Vec<_>, _>>()?;
+            rows.into_iter().collect::<Result<Vec<_>, _>>()
+        })
+    }
 }
 
 impl GitPushOutcomeResult {
@@ -3261,6 +3289,117 @@ mod tests {
             log.reject_blocker_for_push(push_request_id).unwrap(),
             Some(RejectBlocker::PostPatchUncertain { attempt_id })
         );
+    }
+
+    #[test]
+    fn list_blocking_approve_attempts_is_empty_when_no_rows() {
+        let log = AuditLog::open_in_memory().unwrap();
+        assert!(log.list_blocking_approve_attempts().unwrap().is_empty());
+    }
+
+    #[test]
+    fn list_blocking_approve_attempts_returns_started_rows() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let push_request_id = RequestId::new();
+        let _session = open_with_staged_request(&log, push_request_id);
+        let attempt_id = ApproveAttemptId::new();
+        log.start_approve_attempt(
+            attempt_id,
+            push_request_id,
+            "alice",
+            UnixMillis::from_millis(1_700_000_200),
+        )
+        .unwrap();
+
+        let blocking = log.list_blocking_approve_attempts().unwrap();
+        assert_eq!(blocking.len(), 1);
+        assert_eq!(blocking[0].attempt_id, attempt_id);
+        assert_eq!(blocking[0].state, GitPushApproveAttemptState::Started);
+    }
+
+    #[test]
+    fn list_blocking_approve_attempts_returns_uncertain_rows() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let push_request_id = RequestId::new();
+        let _session = open_with_staged_request(&log, push_request_id);
+        let attempt_id = ApproveAttemptId::new();
+        log.start_approve_attempt(
+            attempt_id,
+            push_request_id,
+            "alice",
+            UnixMillis::from_millis(1_700_000_200),
+        )
+        .unwrap();
+        let mint = sample_promote_mint_audit();
+        log.mark_attempt_uncertain(attempt_id, mint).unwrap();
+
+        let blocking = log.list_blocking_approve_attempts().unwrap();
+        assert_eq!(blocking.len(), 1);
+        assert_eq!(blocking[0].attempt_id, attempt_id);
+        assert!(matches!(
+            blocking[0].state,
+            GitPushApproveAttemptState::Uncertain { .. }
+        ));
+    }
+
+    #[test]
+    fn list_blocking_approve_attempts_excludes_resolved_rows() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let push_request_id = RequestId::new();
+        let _session = open_with_staged_request(&log, push_request_id);
+        let attempt_id = ApproveAttemptId::new();
+        log.start_approve_attempt(
+            attempt_id,
+            push_request_id,
+            "alice",
+            UnixMillis::from_millis(1_700_000_200),
+        )
+        .unwrap();
+        log.complete_attempt_pre_patch_failure(
+            attempt_id,
+            "walker rejected",
+            UnixMillis::from_millis(1_700_000_210),
+        )
+        .unwrap();
+
+        assert!(log.list_blocking_approve_attempts().unwrap().is_empty());
+    }
+
+    /// Multiple non-terminal rows across different pushes must all
+    /// surface, ordered by `started_at` then `attempt_id`. The boot
+    /// reconcile worker relies on this ordering so that operator-facing
+    /// log lines remain stable across binary versions.
+    #[test]
+    fn list_blocking_approve_attempts_orders_by_started_at_then_id() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+        let push_a = RequestId::new();
+        let push_b = RequestId::new();
+        record_staged_request(&log, push_a, s.session_id);
+        record_staged_request(&log, push_b, s.session_id);
+
+        let older = ApproveAttemptId::new();
+        let newer = ApproveAttemptId::new();
+        log.start_approve_attempt(
+            older,
+            push_a,
+            "alice",
+            UnixMillis::from_millis(1_700_000_200),
+        )
+        .unwrap();
+        log.start_approve_attempt(
+            newer,
+            push_b,
+            "alice",
+            UnixMillis::from_millis(1_700_000_300),
+        )
+        .unwrap();
+
+        let blocking = log.list_blocking_approve_attempts().unwrap();
+        assert_eq!(blocking.len(), 2);
+        assert_eq!(blocking[0].attempt_id, older);
+        assert_eq!(blocking[1].attempt_id, newer);
     }
 
     /// Property test: any sequence of legal DAO calls leaves the

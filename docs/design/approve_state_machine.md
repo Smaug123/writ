@@ -286,9 +286,27 @@ For each row:
   translates the SELECT-vs-INSERT race back into the same typed
   surface. The R6-era marker code never landed on `main` (see the
   table above), so this slice has no deletion work.
-- **B1e.3d** — boot reconcile worker; end-to-end property test that
-  generates approve/reject/crash/restart traces and asserts the
-  audit-log invariants stated below.
+- **B1e.3d.1** — boot reconcile worker:
+  `AuditLog::list_blocking_approve_attempts` DAO + new
+  `boot_reconcile` module that drives `Started` rows to
+  `Resolved(PrePatchFailure { detail = "broker restart" })` and
+  surfaces `Uncertain` rows on `AUDIT_WRITE_FAILURE_TARGET`. Wired
+  into `writd` *after* the broker socket bind (the singleton claim
+  for the socket path, so a second `writd` configured against the
+  same `--socket` cannot mutate the shared audit DB before its bind
+  fails) but before any request serving. Single-writer-ness against
+  the audit DB itself is an operator-config invariant — "one daemon
+  per `--audit-db`" — shared with the signing-key, VM-session-ledger
+  and UI-bearer-file writes; a cross-cutting DB-lock slice is
+  deferred. A DAO failure here refuses startup (the audit DB is the
+  system of record). The clock supplied to reconcile is clamped up
+  to each row's `started_at` before the
+  `complete_attempt_pre_patch_failure` write, so a backwards
+  wall-clock step between `start_approve_attempt` and the next boot
+  cannot violate the `completed_at >= started_at` CHECK.
+- **B1e.3d.2** — end-to-end property test that generates
+  approve/reject/crash/restart traces and asserts the audit-log
+  invariants stated below.
 
 ## Test strategy
 
