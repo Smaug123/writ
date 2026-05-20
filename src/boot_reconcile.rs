@@ -14,8 +14,12 @@
 //!   landed) but never recorded the outcome. GitHub's state is
 //!   uncertain; only manual reconciliation against the remote ref can
 //!   resolve the row. We log the row to `AUDIT_WRITE_FAILURE_TARGET`
-//!   so the operator sees it on the next boot, and leave it in place
-//!   for `reject_blocker_for_push` to surface as `AttemptInFlight`.
+//!   so the operator sees it on the next boot, write a boot-observed
+//!   marker so the reconciliation DAO will accept the row as a valid
+//!   supersession predecessor (see comment on the
+//!   `git_push_approve_attempt_boot_observed` table in migration
+//!   0006), and leave the row itself in place for
+//!   `reject_blocker_for_push` to surface as `AttemptInFlight`.
 //!
 //! No filesystem state is consulted: the audit log is the system of
 //! record. The schema's forward-only triggers admit the
@@ -94,7 +98,7 @@ pub fn reconcile_pending_approve_attempts(
                 report.recovered_started.push(entry.attempt_id);
             }
             GitPushApproveAttemptState::Uncertain { .. } => {
-                flag_uncertain(&entry);
+                flag_uncertain(audit, &entry, now)?;
                 report.flagged_uncertain.push(entry.attempt_id);
             }
             // The DAO query filters `state IN ('started', 'uncertain')`,
@@ -129,7 +133,11 @@ fn recover_started(
     audit.complete_attempt_pre_patch_failure(entry.attempt_id, BROKER_RESTART_DETAIL, completed_at)
 }
 
-fn flag_uncertain(entry: &GitPushApproveAttemptEntry) {
+fn flag_uncertain(
+    audit: &AuditLog,
+    entry: &GitPushApproveAttemptEntry,
+    now: UnixMillis,
+) -> Result<(), AuditError> {
     tracing::error!(
         target: AUDIT_WRITE_FAILURE_TARGET,
         kind = "boot_reconcile_uncertain_attempt",
@@ -140,6 +148,15 @@ fn flag_uncertain(entry: &GitPushApproveAttemptEntry) {
         "approve attempt left uncertain across broker restart; manual reconciliation required \
          before any further approve/reject for this push can land",
     );
+    // Stamp the row as observed across a daemon restart. The
+    // reconciliation DAO refuses to supersede an `Uncertain` predecessor
+    // without this marker, since the in-process broker that originally
+    // wrote the row may still be racing to complete it. Writing here
+    // (after the broker socket bind, before any request handler runs)
+    // is the only place where "this row has survived a boot cycle" can
+    // be established. The DAO call is idempotent so a re-boot against
+    // a still-Uncertain row is a no-op.
+    audit.mark_attempt_boot_observed(entry.attempt_id, now)
 }
 
 #[cfg(test)]
@@ -314,7 +331,9 @@ mod tests {
     /// `Uncertain` is the post-PATCH-commit-pre-PATCH-result state.
     /// Boot reconcile must NOT transition it (only operator
     /// reconciliation can), but it must surface the row so the
-    /// operator sees it in the boot logs.
+    /// operator sees it in the boot logs AND stamp a boot-observed
+    /// marker so the reconciliation DAO will accept the row as an
+    /// eligible supersession predecessor on the next operator action.
     #[test]
     fn uncertain_attempt_is_flagged_and_not_modified() {
         let (log, session_id) = open_log_with_session();
@@ -344,6 +363,19 @@ mod tests {
                 .is_some(),
             "post-reconcile: Uncertain must still block reject",
         );
+        // The boot-observed marker is the load-bearing contract with
+        // the reconciliation DAO: confirm operator reconciliation
+        // against this row will now succeed (the DAO refuses Uncertain
+        // predecessors without this marker — see
+        // `reconciliation_refused_when_uncertain_predecessor_not_boot_observed`).
+        log.record_reconciliation_attempt_not_applied(
+            ApproveAttemptId::new(),
+            attempt_id,
+            "carol",
+            "remote ref did not advance",
+            UnixMillis::from_millis(1_700_001_500),
+        )
+        .expect("boot reconcile must have stamped the boot-observed marker");
     }
 
     /// A reconcile pass against a steady-state DB (only `Resolved`

@@ -263,6 +263,150 @@ struct ApproveAttemptMintRow {
     mint_exp: Option<i64>,
 }
 
+/// Metadata about a quarantined predecessor attempt that a
+/// reconciliation row is about to supersede. Built inside the
+/// reconciliation joint TX from a single SELECT so the eligibility
+/// check and the row-copy run from the same snapshot.
+struct ReconciliationPredecessor {
+    /// The predecessor's push request id, copied verbatim into the
+    /// reconciliation row so the schema's `same_push` trigger has
+    /// nothing to complain about and the resolution INSERT lands on
+    /// the right push.
+    push_request_id: String,
+    /// The predecessor's captured mint columns. Always present for
+    /// eligible predecessors: `Uncertain` rows carry mint by the v5
+    /// `state != 'uncertain' OR mint_jti IS NOT NULL` CHECK, and
+    /// `Resolved(PostPatchFailure)` rows carry mint by the matching
+    /// `coalesce(outcome, '') != 'post_patch_failure' OR mint_jti IS NOT NULL`
+    /// CHECK.
+    mint_jti: Option<String>,
+    mint_app: Option<i64>,
+    mint_iat: Option<i64>,
+    mint_exp: Option<i64>,
+}
+
+struct PredecessorMintColumns<'a> {
+    jti: &'a str,
+    github_app_id: i64,
+    issued_at: i64,
+    expires_at: i64,
+}
+
+impl ReconciliationPredecessor {
+    /// Borrow the predecessor's mint columns as a struct of `Some`-only
+    /// fields. The eligibility check guarantees mint is present, but
+    /// the parse boundary still surfaces an `Invariant` error rather
+    /// than panicking if a future schema change weakens the CHECK.
+    fn require_mint(&self) -> Result<PredecessorMintColumns<'_>, AuditError> {
+        let (Some(jti), Some(github_app_id), Some(issued_at), Some(expires_at)) = (
+            self.mint_jti.as_deref(),
+            self.mint_app,
+            self.mint_iat,
+            self.mint_exp,
+        ) else {
+            return Err(AuditError::Invariant(
+                "reconciliation predecessor missing mint context",
+            ));
+        };
+        Ok(PredecessorMintColumns {
+            jti,
+            github_app_id,
+            issued_at,
+            expires_at,
+        })
+    }
+}
+
+/// Look up the predecessor of a reconciliation row inside the joint TX,
+/// verifying it exists, is in an eligible state (`Uncertain` or
+/// `Resolved(PostPatchFailure)`), and has not already been superseded.
+/// The schema's `predecessor_eligible` and supersedes-UNIQUE constraints
+/// catch the same violations as defence in depth, but doing the check
+/// in Rust surfaces a typed `Invariant` error rather than the raw
+/// `RAISE(ABORT)` message.
+fn load_reconciliation_predecessor(
+    tx: &rusqlite::Transaction<'_>,
+    supersedes: ApproveAttemptId,
+) -> Result<ReconciliationPredecessor, AuditError> {
+    let row = tx
+        .query_row(
+            "SELECT state, outcome, push_request_id,
+                    mint_jti, mint_github_app_id, mint_issued_at, mint_expires_at
+               FROM git_push_approve_attempt
+              WHERE attempt_id = ?1",
+            params![supersedes.as_uuid().to_string()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                    row.get::<_, Option<i64>>(5)?,
+                    row.get::<_, Option<i64>>(6)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((state, outcome, push_request_id, mint_jti, mint_app, mint_iat, mint_exp)) = row
+    else {
+        return Err(AuditError::Invariant(
+            "reconciliation predecessor does not exist",
+        ));
+    };
+    let is_uncertain = state == "uncertain";
+    let is_post_patch_failure =
+        state == "resolved" && outcome.as_deref() == Some("post_patch_failure");
+    if !is_uncertain && !is_post_patch_failure {
+        return Err(AuditError::Invariant(
+            "reconciliation predecessor is not in an eligible state",
+        ));
+    }
+    let already_superseded: Option<i64> = tx
+        .query_row(
+            "SELECT 1 FROM git_push_approve_attempt
+              WHERE supersedes_attempt_id = ?1",
+            params![supersedes.as_uuid().to_string()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if already_superseded.is_some() {
+        return Err(AuditError::Invariant(
+            "reconciliation predecessor has already been superseded",
+        ));
+    }
+    // An Uncertain row may belong to the currently-running broker (it
+    // is written between TX2 and TX3 of approve_staged_push). Reconciling
+    // such a row before the worker finishes would race the worker's
+    // resolution write — see comment on the boot-observed table in
+    // migration 0006. Require the boot-observed marker, which only boot
+    // reconcile writes, before admitting an Uncertain predecessor.
+    // Resolved(PostPatchFailure) rows are terminal: once TX3 commits the
+    // live broker never touches them again, so no gate is needed.
+    if is_uncertain {
+        let observed: Option<i64> = tx
+            .query_row(
+                "SELECT 1 FROM git_push_approve_attempt_boot_observed
+                  WHERE attempt_id = ?1",
+                params![supersedes.as_uuid().to_string()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if observed.is_none() {
+            return Err(AuditError::Invariant(
+                "reconciliation of uncertain predecessor requires boot-observed marker",
+            ));
+        }
+    }
+    Ok(ReconciliationPredecessor {
+        push_request_id,
+        mint_jti,
+        mint_app,
+        mint_iat,
+        mint_exp,
+    })
+}
+
 impl AuditLog {
     /// Persist a parsed VM Git push request before any credential mint,
     /// remote fetch, or external push is attempted.
@@ -514,12 +658,24 @@ impl AuditLog {
             // GitHub's state uncertain until manual reconciliation).
             // Only a clean slate, or a history of `pre_patch_failure`
             // resolutions, is retryable.
+            //
+            // The NOT EXISTS clause excludes attempts that have been
+            // cleared by a v6 reconciliation row (a successful manual
+            // reconciliation supersedes its predecessor's quarantine).
+            // Without this filter, an operator who reconciled a
+            // `PostPatchFailure` to "did not apply" could never retry
+            // the push — the predecessor would forever block fresh
+            // starts.
             let blocker: Option<i64> = tx
                 .query_row(
-                    "SELECT 1 FROM git_push_approve_attempt
-                      WHERE push_request_id = ?1
-                        AND (state IN ('started', 'uncertain')
-                          OR (state = 'resolved' AND outcome = 'post_patch_failure'))
+                    "SELECT 1 FROM git_push_approve_attempt a
+                      WHERE a.push_request_id = ?1
+                        AND (a.state IN ('started', 'uncertain')
+                          OR (a.state = 'resolved' AND a.outcome = 'post_patch_failure'))
+                        AND NOT EXISTS (
+                            SELECT 1 FROM git_push_approve_attempt b
+                            WHERE b.supersedes_attempt_id = a.attempt_id
+                        )
                       LIMIT 1",
                     params![push_request_id.as_uuid().to_string()],
                     |row| row.get(0),
@@ -819,6 +975,186 @@ impl AuditLog {
         )
     }
 
+    /// Record that boot reconcile observed an `Uncertain` attempt at
+    /// daemon startup. The marker is the "this row has survived a
+    /// daemon restart" claim that the reconciliation DAO requires
+    /// before admitting an `Uncertain` predecessor — see comment on
+    /// the `git_push_approve_attempt_boot_observed` table in
+    /// migration 0006.
+    ///
+    /// Idempotent: a second call against the same `attempt_id` is a
+    /// no-op (preserving the original `observed_at`), matching the
+    /// boot reconcile contract that re-observing a still-Uncertain row
+    /// across successive boots must not error.
+    pub fn mark_attempt_boot_observed(
+        &self,
+        attempt_id: ApproveAttemptId,
+        observed_at: UnixMillis,
+    ) -> Result<(), AuditError> {
+        self.with_conn_mut(|c| {
+            c.execute(
+                "INSERT OR IGNORE INTO git_push_approve_attempt_boot_observed
+                     (attempt_id, observed_at)
+                 VALUES (?1, ?2)",
+                params![attempt_id.as_uuid().to_string(), observed_at.as_millis()],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Record a manual reconciliation attempt against a quarantined
+    /// predecessor (state `Uncertain` or `Resolved(PostPatchFailure)`),
+    /// declaring that the operator has confirmed the PATCH did land on
+    /// GitHub. Writes a born-terminal `Resolved(Succeeded)` attempt row
+    /// pointing back at the predecessor via `supersedes_attempt_id`,
+    /// and — in the same transaction — the matching
+    /// `git_push_resolution(decision='approved')` row carrying the
+    /// predecessor's captured mint context. The mint is copied verbatim
+    /// (rather than re-captured at reconciliation time) because the
+    /// audit log's promise is "this approval used credential X"; only
+    /// the predecessor knows which credential was issued to GitHub.
+    ///
+    /// The DAO refuses to write if the predecessor is not in an
+    /// eligible state or has already been superseded; the schema
+    /// triggers enforce the same invariant as defence in depth.
+    pub fn record_reconciliation_attempt_applied(
+        &self,
+        attempt_id: ApproveAttemptId,
+        supersedes: ApproveAttemptId,
+        new_app_tip: &GitObjectId,
+        operator: &str,
+        reason: &str,
+        completed_at: UnixMillis,
+    ) -> Result<(), AuditError> {
+        if operator.is_empty() {
+            return Err(AuditError::Invariant(
+                "reconciliation attempt operator must not be empty",
+            ));
+        }
+        if reason.is_empty() {
+            return Err(AuditError::Invariant(
+                "reconciliation attempt reason must not be empty",
+            ));
+        }
+
+        self.with_conn_mut(|c| {
+            let tx = c.transaction()?;
+            let predecessor = load_reconciliation_predecessor(&tx, supersedes)?;
+            let mint = predecessor.require_mint()?;
+
+            tx.execute(
+                "INSERT INTO git_push_approve_attempt (
+                     attempt_id, push_request_id, operator, started_at,
+                     state, outcome, completed_at, new_app_tip, failure_detail,
+                     mint_jti, mint_github_app_id, mint_issued_at, mint_expires_at,
+                     supersedes_attempt_id
+                 ) VALUES (?1, ?2, ?3, ?4, 'resolved', 'succeeded', ?4,
+                           ?5, NULL,
+                           ?6, ?7, ?8, ?9,
+                           ?10)",
+                params![
+                    attempt_id.as_uuid().to_string(),
+                    predecessor.push_request_id,
+                    operator,
+                    completed_at.as_millis(),
+                    new_app_tip.as_str(),
+                    mint.jti,
+                    mint.github_app_id,
+                    mint.issued_at,
+                    mint.expires_at,
+                    supersedes.as_uuid().to_string(),
+                ],
+            )?;
+
+            tx.execute(
+                "INSERT INTO git_push_resolution (
+                     push_request_id, decided_at, decision, operator, reason,
+                     mint_jti, mint_github_app_id, mint_issued_at, mint_expires_at
+                 ) VALUES (?1, ?2, 'approved', ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    predecessor.push_request_id,
+                    completed_at.as_millis(),
+                    operator,
+                    reason,
+                    mint.jti,
+                    mint.github_app_id,
+                    mint.issued_at,
+                    mint.expires_at,
+                ],
+            )?;
+
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
+    /// Record a manual reconciliation attempt declaring that the
+    /// operator has confirmed the PATCH did *not* land on GitHub. Writes
+    /// a born-terminal `Resolved(PrePatchFailure)` attempt row that
+    /// supersedes the predecessor; once this commits, the push is once
+    /// again rejectable (a follow-up Reject would write the
+    /// `decision='rejected'` row). The reconciliation row carries the
+    /// predecessor's mint context — even though no PATCH landed, the
+    /// audit log records the credential that *was* issued to GitHub —
+    /// and the schema CHECK admits mint on a `pre_patch_failure` row.
+    ///
+    /// No `git_push_resolution` row is written here. Reconciliation as
+    /// "not applied" leaves the push in the same state as if the
+    /// original approve had hit a pre-PATCH failure; the operator drives
+    /// the eventual reject/retry through the existing handlers.
+    pub fn record_reconciliation_attempt_not_applied(
+        &self,
+        attempt_id: ApproveAttemptId,
+        supersedes: ApproveAttemptId,
+        operator: &str,
+        detail: &str,
+        completed_at: UnixMillis,
+    ) -> Result<(), AuditError> {
+        if operator.is_empty() {
+            return Err(AuditError::Invariant(
+                "reconciliation attempt operator must not be empty",
+            ));
+        }
+        if detail.is_empty() {
+            return Err(AuditError::Invariant(
+                "reconciliation attempt failure detail must not be empty",
+            ));
+        }
+
+        self.with_conn_mut(|c| {
+            let tx = c.transaction()?;
+            let predecessor = load_reconciliation_predecessor(&tx, supersedes)?;
+            let mint = predecessor.require_mint()?;
+
+            tx.execute(
+                "INSERT INTO git_push_approve_attempt (
+                     attempt_id, push_request_id, operator, started_at,
+                     state, outcome, completed_at, new_app_tip, failure_detail,
+                     mint_jti, mint_github_app_id, mint_issued_at, mint_expires_at,
+                     supersedes_attempt_id
+                 ) VALUES (?1, ?2, ?3, ?4, 'resolved', 'pre_patch_failure', ?4,
+                           NULL, ?5,
+                           ?6, ?7, ?8, ?9,
+                           ?10)",
+                params![
+                    attempt_id.as_uuid().to_string(),
+                    predecessor.push_request_id,
+                    operator,
+                    completed_at.as_millis(),
+                    detail,
+                    mint.jti,
+                    mint.github_app_id,
+                    mint.issued_at,
+                    mint.expires_at,
+                    supersedes.as_uuid().to_string(),
+                ],
+            )?;
+
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
     fn complete_attempt_failure(
         &self,
         attempt_id: ApproveAttemptId,
@@ -905,15 +1241,20 @@ impl AuditLog {
 
     /// First attempt (oldest by `started_at`) whose state prevents
     /// reject from succeeding. Returns `None` when reject is allowed
-    /// (no attempts, or only `PrePatchFailure` attempts).
+    /// (no attempts, only `PrePatchFailure` attempts, or every
+    /// blocker has been cleared by a v6 reconciliation row that
+    /// supersedes it).
     pub fn reject_blocker_for_push(
         &self,
         push_request_id: RequestId,
     ) -> Result<Option<RejectBlocker>, AuditError> {
         let attempts = self.approve_attempts_for_push(push_request_id)?;
-        Ok(attempts
-            .into_iter()
-            .find_map(|attempt| match attempt.state {
+        let superseded_ids = self.superseded_attempt_ids_for_push(push_request_id)?;
+        Ok(attempts.into_iter().find_map(|attempt| {
+            if superseded_ids.contains(&attempt.attempt_id) {
+                return None;
+            }
+            match attempt.state {
                 GitPushApproveAttemptState::Started
                 | GitPushApproveAttemptState::Uncertain { .. } => {
                     Some(RejectBlocker::AttemptInFlight {
@@ -933,7 +1274,40 @@ impl AuditLog {
                     }
                     GitPushApproveAttemptOutcome::PrePatchFailure { .. } => None,
                 },
-            }))
+            }
+        }))
+    }
+
+    /// Set of `attempt_id`s for a push that have been superseded by a
+    /// v6 reconciliation row. Helper for `reject_blocker_for_push` so
+    /// the in-Rust classification logic stays alongside the row-walk;
+    /// pushing the filter into the underlying SQL would force
+    /// `approve_attempts_for_push` (which is also the audit-history
+    /// view) to decide whether to hide superseded rows or not.
+    fn superseded_attempt_ids_for_push(
+        &self,
+        push_request_id: RequestId,
+    ) -> Result<std::collections::HashSet<ApproveAttemptId>, AuditError> {
+        self.with_conn(|c| {
+            let mut stmt = c.prepare(
+                "SELECT supersedes_attempt_id
+                   FROM git_push_approve_attempt
+                  WHERE push_request_id = ?1
+                    AND supersedes_attempt_id IS NOT NULL",
+            )?;
+            let mut out = std::collections::HashSet::new();
+            let mut rows = stmt.query(params![push_request_id.as_uuid().to_string()])?;
+            while let Some(row) = rows.next()? {
+                let raw: String = row.get(0)?;
+                let id = uuid::Uuid::parse_str(&raw)
+                    .map(ApproveAttemptId::from_uuid)
+                    .map_err(|_| {
+                        AuditError::Invariant("approve attempt row: supersedes id is not a uuid")
+                    })?;
+                out.insert(id);
+            }
+            Ok(out)
+        })
     }
 
     /// Every approve-attempt row currently in a non-terminal state
@@ -944,18 +1318,27 @@ impl AuditLog {
     /// `Uncertain` attempts for operator review; the schema's
     /// forward-only triggers guarantee no `Resolved` row appears in
     /// the result set.
+    ///
+    /// The NOT EXISTS clause excludes attempts that a v6 reconciliation
+    /// row already cleared — an `Uncertain` predecessor superseded by
+    /// a successful manual reconciliation is no longer something boot
+    /// reconcile needs to act on.
     pub fn list_blocking_approve_attempts(
         &self,
     ) -> Result<Vec<GitPushApproveAttemptEntry>, AuditError> {
         self.with_conn(|c| {
             let mut stmt = c.prepare(
-                "SELECT attempt_id, push_request_id, operator, started_at,
-                        state, outcome, completed_at,
-                        new_app_tip, failure_detail,
-                        mint_jti, mint_github_app_id, mint_issued_at, mint_expires_at
-                   FROM git_push_approve_attempt
-                  WHERE state IN ('started', 'uncertain')
-                  ORDER BY started_at ASC, attempt_id ASC",
+                "SELECT a.attempt_id, a.push_request_id, a.operator, a.started_at,
+                        a.state, a.outcome, a.completed_at,
+                        a.new_app_tip, a.failure_detail,
+                        a.mint_jti, a.mint_github_app_id, a.mint_issued_at, a.mint_expires_at
+                   FROM git_push_approve_attempt a
+                  WHERE a.state IN ('started', 'uncertain')
+                    AND NOT EXISTS (
+                        SELECT 1 FROM git_push_approve_attempt b
+                        WHERE b.supersedes_attempt_id = a.attempt_id
+                    )
+                  ORDER BY a.started_at ASC, a.attempt_id ASC",
             )?;
             let rows = stmt
                 .query_map([], git_push_approve_attempt_from_row)?
@@ -3400,6 +3783,804 @@ mod tests {
         assert_eq!(blocking.len(), 2);
         assert_eq!(blocking[0].attempt_id, older);
         assert_eq!(blocking[1].attempt_id, newer);
+    }
+
+    // ---- reconciliation (schema v6) ----------------------------------------
+
+    /// Drive a fresh attempt to `Resolved(PostPatchFailure)` — the
+    /// quintessential reconciliation predecessor. Returns the attempt
+    /// id and the captured mint so the test body can drive the
+    /// reconciliation path with the right copy-forward expectations.
+    fn drive_to_post_patch_failure(
+        log: &AuditLog,
+        push_request_id: RequestId,
+    ) -> (ApproveAttemptId, PromoteMintAudit) {
+        let attempt_id = ApproveAttemptId::new();
+        log.start_approve_attempt(
+            attempt_id,
+            push_request_id,
+            "alice",
+            UnixMillis::from_millis(1_700_000_200),
+        )
+        .unwrap();
+        let mint = sample_promote_mint_audit();
+        log.mark_attempt_uncertain(attempt_id, mint).unwrap();
+        log.complete_attempt_post_patch_failure(
+            attempt_id,
+            "transport drop after PATCH",
+            UnixMillis::from_millis(1_700_000_250),
+        )
+        .unwrap();
+        (attempt_id, mint)
+    }
+
+    #[test]
+    fn reconciliation_applied_writes_succeeded_row_carrying_predecessor_mint() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let push_request_id = RequestId::new();
+        let _session = open_with_staged_request(&log, push_request_id);
+        let (predecessor, mint) = drive_to_post_patch_failure(&log, push_request_id);
+        let new_app_tip = git_oid('b');
+
+        let reconciliation = ApproveAttemptId::new();
+        log.record_reconciliation_attempt_applied(
+            reconciliation,
+            predecessor,
+            &new_app_tip,
+            "carol",
+            "verified ref against GitHub",
+            UnixMillis::from_millis(1_700_000_300),
+        )
+        .unwrap();
+
+        let attempts = log.approve_attempts_for_push(push_request_id).unwrap();
+        assert_eq!(attempts.len(), 2);
+        let recon = attempts
+            .iter()
+            .find(|a| a.attempt_id == reconciliation)
+            .expect("reconciliation row must be present");
+        assert_eq!(
+            recon.state,
+            GitPushApproveAttemptState::Resolved {
+                outcome: GitPushApproveAttemptOutcome::Succeeded {
+                    new_app_tip: new_app_tip.clone(),
+                },
+                mint: Some(mint),
+                completed_at: UnixMillis::from_millis(1_700_000_300),
+            }
+        );
+        assert_eq!(recon.operator, "carol");
+
+        // The joint TX wrote the resolution row carrying the
+        // predecessor's mint — the audit log records the credential
+        // that actually advanced GitHub, not a fresh mint at
+        // reconciliation time.
+        let entry = log.get_git_push(push_request_id).unwrap().unwrap();
+        let resolution = entry.resolution.expect("resolution must be present");
+        assert_eq!(resolution.decision, GitPushResolution::Approved(mint));
+        assert_eq!(resolution.operator, "carol");
+        assert_eq!(resolution.reason, "verified ref against GitHub");
+    }
+
+    #[test]
+    fn reconciliation_not_applied_writes_pre_patch_failure_without_resolution() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let push_request_id = RequestId::new();
+        let _session = open_with_staged_request(&log, push_request_id);
+        let (predecessor, mint) = drive_to_post_patch_failure(&log, push_request_id);
+
+        let reconciliation = ApproveAttemptId::new();
+        log.record_reconciliation_attempt_not_applied(
+            reconciliation,
+            predecessor,
+            "carol",
+            "verified ref unchanged on GitHub",
+            UnixMillis::from_millis(1_700_000_300),
+        )
+        .unwrap();
+
+        let attempts = log.approve_attempts_for_push(push_request_id).unwrap();
+        let recon = attempts
+            .iter()
+            .find(|a| a.attempt_id == reconciliation)
+            .expect("reconciliation row must be present");
+        assert_eq!(
+            recon.state,
+            GitPushApproveAttemptState::Resolved {
+                outcome: GitPushApproveAttemptOutcome::PrePatchFailure {
+                    detail: "verified ref unchanged on GitHub".into(),
+                },
+                mint: Some(mint),
+                completed_at: UnixMillis::from_millis(1_700_000_300),
+            }
+        );
+
+        // No resolution row written: a "not applied" reconciliation
+        // leaves the push in the same shape as a pre-PATCH failure.
+        // Reject would write its own resolution row later.
+        assert!(
+            log.get_git_push(push_request_id)
+                .unwrap()
+                .unwrap()
+                .resolution
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn reconciliation_applied_clears_post_patch_blocker_from_reject() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let push_request_id = RequestId::new();
+        let _session = open_with_staged_request(&log, push_request_id);
+        let (predecessor, _) = drive_to_post_patch_failure(&log, push_request_id);
+
+        assert_eq!(
+            log.reject_blocker_for_push(push_request_id).unwrap(),
+            Some(RejectBlocker::PostPatchUncertain {
+                attempt_id: predecessor
+            })
+        );
+
+        let reconciliation = ApproveAttemptId::new();
+        log.record_reconciliation_attempt_applied(
+            reconciliation,
+            predecessor,
+            &git_oid('b'),
+            "carol",
+            "verified ref against GitHub",
+            UnixMillis::from_millis(1_700_000_300),
+        )
+        .unwrap();
+
+        // The push is now `AlreadyApproved` (the reconciliation row
+        // is `Resolved(Succeeded)`); the predecessor is hidden.
+        assert_eq!(
+            log.reject_blocker_for_push(push_request_id).unwrap(),
+            Some(RejectBlocker::AlreadyApproved {
+                attempt_id: reconciliation
+            })
+        );
+    }
+
+    #[test]
+    fn reconciliation_not_applied_unblocks_reject_and_subsequent_attempts() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let push_request_id = RequestId::new();
+        let _session = open_with_staged_request(&log, push_request_id);
+        let (predecessor, _) = drive_to_post_patch_failure(&log, push_request_id);
+
+        let reconciliation = ApproveAttemptId::new();
+        log.record_reconciliation_attempt_not_applied(
+            reconciliation,
+            predecessor,
+            "carol",
+            "verified ref unchanged",
+            UnixMillis::from_millis(1_700_000_300),
+        )
+        .unwrap();
+
+        // Reject is now admitted — the predecessor is superseded
+        // and the reconciliation row's PrePatchFailure outcome is
+        // not a blocker.
+        assert_eq!(log.reject_blocker_for_push(push_request_id).unwrap(), None);
+
+        // A fresh approve attempt is also admitted, mirroring the
+        // post-`PrePatchFailure` retry path that v5 already allowed.
+        let retry = ApproveAttemptId::new();
+        log.start_approve_attempt(
+            retry,
+            push_request_id,
+            "dave",
+            UnixMillis::from_millis(1_700_000_400),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn reconciliation_applied_against_uncertain_predecessor_admitted() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let push_request_id = RequestId::new();
+        let _session = open_with_staged_request(&log, push_request_id);
+        let predecessor = ApproveAttemptId::new();
+        log.start_approve_attempt(
+            predecessor,
+            push_request_id,
+            "alice",
+            UnixMillis::from_millis(1_700_000_200),
+        )
+        .unwrap();
+        let mint = sample_promote_mint_audit();
+        log.mark_attempt_uncertain(predecessor, mint).unwrap();
+        // Simulate boot reconcile observing the Uncertain row across a
+        // restart, which is what makes the row eligible for manual
+        // reconciliation in the first place.
+        log.mark_attempt_boot_observed(predecessor, UnixMillis::from_millis(1_700_000_250))
+            .unwrap();
+
+        let reconciliation = ApproveAttemptId::new();
+        log.record_reconciliation_attempt_applied(
+            reconciliation,
+            predecessor,
+            &git_oid('b'),
+            "carol",
+            "broker crashed mid-PATCH; verified ref applied",
+            UnixMillis::from_millis(1_700_000_300),
+        )
+        .unwrap();
+
+        // Boot reconcile no longer sees the uncertain predecessor —
+        // a successful manual reconciliation cleared the quarantine.
+        assert!(log.list_blocking_approve_attempts().unwrap().is_empty());
+    }
+
+    /// An `Uncertain` predecessor that has NOT been boot-observed must
+    /// be refused — the live broker process may still be racing the
+    /// PATCH to GitHub. Without this gate, an operator could supersede
+    /// the row while the worker is between TX2 and TX3 and a reject
+    /// would then commit under the cleared blocker, racing the
+    /// worker's eventual resolution write to GitHub.
+    #[test]
+    fn reconciliation_refused_when_uncertain_predecessor_not_boot_observed() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let push_request_id = RequestId::new();
+        let _session = open_with_staged_request(&log, push_request_id);
+        let predecessor = ApproveAttemptId::new();
+        log.start_approve_attempt(
+            predecessor,
+            push_request_id,
+            "alice",
+            UnixMillis::from_millis(1_700_000_200),
+        )
+        .unwrap();
+        let mint = sample_promote_mint_audit();
+        log.mark_attempt_uncertain(predecessor, mint).unwrap();
+        // No mark_attempt_boot_observed call here — this row is from
+        // the live broker process from the operator's perspective.
+
+        let err = log
+            .record_reconciliation_attempt_applied(
+                ApproveAttemptId::new(),
+                predecessor,
+                &git_oid('b'),
+                "carol",
+                "verified ref applied",
+                UnixMillis::from_millis(1_700_000_300),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                AuditError::Invariant(
+                    "reconciliation of uncertain predecessor requires boot-observed marker"
+                )
+            ),
+            "got: {err:?}"
+        );
+
+        // The not-applied path must refuse for the same reason.
+        let err = log
+            .record_reconciliation_attempt_not_applied(
+                ApproveAttemptId::new(),
+                predecessor,
+                "carol",
+                "verified ref did not apply",
+                UnixMillis::from_millis(1_700_000_300),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                AuditError::Invariant(
+                    "reconciliation of uncertain predecessor requires boot-observed marker"
+                )
+            ),
+            "got: {err:?}"
+        );
+
+        // The push must remain blocked on the original Uncertain row —
+        // critical for the contradiction-window guarantee.
+        assert_eq!(
+            log.list_blocking_approve_attempts().unwrap().len(),
+            1,
+            "the Uncertain row must still appear as a blocker"
+        );
+    }
+
+    /// `Resolved(PostPatchFailure)` predecessors do NOT need a
+    /// boot-observed marker: a Resolved row is terminal, the
+    /// forward_only trigger refuses any UPDATE from it, so the live
+    /// broker provably won't race the reconciliation. The DAO must
+    /// admit reconciliation against a PostPatchFailure predecessor
+    /// even when no boot-observed marker exists.
+    #[test]
+    fn reconciliation_against_post_patch_failure_admitted_without_boot_observed() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let push_request_id = RequestId::new();
+        let _session = open_with_staged_request(&log, push_request_id);
+        let (predecessor, _) = drive_to_post_patch_failure(&log, push_request_id);
+        // No mark_attempt_boot_observed call — PostPatchFailure is
+        // terminal and does not need the gate.
+
+        log.record_reconciliation_attempt_not_applied(
+            ApproveAttemptId::new(),
+            predecessor,
+            "carol",
+            "verified ref did not apply",
+            UnixMillis::from_millis(1_700_000_500),
+        )
+        .unwrap();
+    }
+
+    /// `mark_attempt_boot_observed` is idempotent — boot reconcile
+    /// runs once per daemon startup, and across successive restarts
+    /// an `Uncertain` row that survives must not error a second call.
+    #[test]
+    fn mark_attempt_boot_observed_is_idempotent() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let push_request_id = RequestId::new();
+        let _session = open_with_staged_request(&log, push_request_id);
+        let attempt = ApproveAttemptId::new();
+        log.start_approve_attempt(
+            attempt,
+            push_request_id,
+            "alice",
+            UnixMillis::from_millis(1_700_000_200),
+        )
+        .unwrap();
+        log.mark_attempt_uncertain(attempt, sample_promote_mint_audit())
+            .unwrap();
+
+        log.mark_attempt_boot_observed(attempt, UnixMillis::from_millis(1_700_000_250))
+            .unwrap();
+        // A second call must not error.
+        log.mark_attempt_boot_observed(attempt, UnixMillis::from_millis(1_700_000_400))
+            .unwrap();
+    }
+
+    #[test]
+    fn reconciliation_refused_when_predecessor_missing() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let err = log
+            .record_reconciliation_attempt_applied(
+                ApproveAttemptId::new(),
+                ApproveAttemptId::new(),
+                &git_oid('b'),
+                "carol",
+                "no such predecessor",
+                UnixMillis::from_millis(1_700_000_300),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                AuditError::Invariant("reconciliation predecessor does not exist")
+            ),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn reconciliation_refused_when_predecessor_is_started() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let push_request_id = RequestId::new();
+        let _session = open_with_staged_request(&log, push_request_id);
+        let predecessor = ApproveAttemptId::new();
+        log.start_approve_attempt(
+            predecessor,
+            push_request_id,
+            "alice",
+            UnixMillis::from_millis(1_700_000_200),
+        )
+        .unwrap();
+
+        let err = log
+            .record_reconciliation_attempt_applied(
+                ApproveAttemptId::new(),
+                predecessor,
+                &git_oid('b'),
+                "carol",
+                "should not be admitted",
+                UnixMillis::from_millis(1_700_000_300),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                AuditError::Invariant("reconciliation predecessor is not in an eligible state")
+            ),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn reconciliation_refused_when_predecessor_is_succeeded() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let push_request_id = RequestId::new();
+        let _session = open_with_staged_request(&log, push_request_id);
+        let predecessor = ApproveAttemptId::new();
+        log.start_approve_attempt(
+            predecessor,
+            push_request_id,
+            "alice",
+            UnixMillis::from_millis(1_700_000_200),
+        )
+        .unwrap();
+        let mint = sample_promote_mint_audit();
+        log.mark_attempt_uncertain(predecessor, mint).unwrap();
+        log.complete_attempt_succeeded(
+            predecessor,
+            &git_oid('a'),
+            "alice",
+            "ship it",
+            UnixMillis::from_millis(1_700_000_220),
+        )
+        .unwrap();
+
+        let err = log
+            .record_reconciliation_attempt_not_applied(
+                ApproveAttemptId::new(),
+                predecessor,
+                "carol",
+                "no",
+                UnixMillis::from_millis(1_700_000_300),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                AuditError::Invariant("reconciliation predecessor is not in an eligible state")
+            ),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn reconciliation_refused_when_predecessor_already_superseded() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let push_request_id = RequestId::new();
+        let _session = open_with_staged_request(&log, push_request_id);
+        let (predecessor, _) = drive_to_post_patch_failure(&log, push_request_id);
+
+        let first = ApproveAttemptId::new();
+        log.record_reconciliation_attempt_not_applied(
+            first,
+            predecessor,
+            "carol",
+            "verified unchanged",
+            UnixMillis::from_millis(1_700_000_300),
+        )
+        .unwrap();
+
+        let err = log
+            .record_reconciliation_attempt_not_applied(
+                ApproveAttemptId::new(),
+                predecessor,
+                "dave",
+                "second attempt",
+                UnixMillis::from_millis(1_700_000_400),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                AuditError::Invariant("reconciliation predecessor has already been superseded")
+            ),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn reconciliation_applied_rejects_empty_operator_and_reason() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let push_request_id = RequestId::new();
+        let _session = open_with_staged_request(&log, push_request_id);
+        let (predecessor, _) = drive_to_post_patch_failure(&log, push_request_id);
+
+        let err = log
+            .record_reconciliation_attempt_applied(
+                ApproveAttemptId::new(),
+                predecessor,
+                &git_oid('b'),
+                "",
+                "reason",
+                UnixMillis::from_millis(1_700_000_300),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                AuditError::Invariant("reconciliation attempt operator must not be empty")
+            ),
+            "got: {err:?}"
+        );
+
+        let err = log
+            .record_reconciliation_attempt_applied(
+                ApproveAttemptId::new(),
+                predecessor,
+                &git_oid('b'),
+                "carol",
+                "",
+                UnixMillis::from_millis(1_700_000_300),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                AuditError::Invariant("reconciliation attempt reason must not be empty")
+            ),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn reconciliation_not_applied_rejects_empty_operator_and_detail() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let push_request_id = RequestId::new();
+        let _session = open_with_staged_request(&log, push_request_id);
+        let (predecessor, _) = drive_to_post_patch_failure(&log, push_request_id);
+
+        let err = log
+            .record_reconciliation_attempt_not_applied(
+                ApproveAttemptId::new(),
+                predecessor,
+                "",
+                "detail",
+                UnixMillis::from_millis(1_700_000_300),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                AuditError::Invariant("reconciliation attempt operator must not be empty")
+            ),
+            "got: {err:?}"
+        );
+
+        let err = log
+            .record_reconciliation_attempt_not_applied(
+                ApproveAttemptId::new(),
+                predecessor,
+                "carol",
+                "",
+                UnixMillis::from_millis(1_700_000_300),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                AuditError::Invariant("reconciliation attempt failure detail must not be empty")
+            ),
+            "got: {err:?}"
+        );
+    }
+
+    /// Defence-in-depth: even when the DAO is bypassed by raw SQL, the
+    /// trigger refuses a reconciliation row that is not born terminal.
+    /// `state = 'started'` here would also fail the existing CHECK that
+    /// `(state = 'resolved') = (outcome IS NOT NULL)`, but the trigger
+    /// gives a reconciliation-specific message that pinpoints the
+    /// invariant the caller is violating.
+    #[test]
+    fn reconciliation_trigger_refuses_non_resolved_row() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let push_request_id = RequestId::new();
+        let _session = open_with_staged_request(&log, push_request_id);
+        let (predecessor, _) = drive_to_post_patch_failure(&log, push_request_id);
+
+        let err = log
+            .with_conn_mut(|c| {
+                Ok(c.execute(
+                    "INSERT INTO git_push_approve_attempt
+                        (attempt_id, push_request_id, operator, started_at,
+                         state, supersedes_attempt_id)
+                     VALUES (?1, ?2, 'carol', 1700000300,
+                             'uncertain', ?3)",
+                    params![
+                        ApproveAttemptId::new().as_uuid().to_string(),
+                        push_request_id.as_uuid().to_string(),
+                        predecessor.as_uuid().to_string(),
+                    ],
+                ))
+            })
+            .unwrap()
+            .unwrap_err();
+        // Either the born-terminal trigger or the existing CHECK
+        // matches first depending on SQLite's evaluation order; both
+        // are correctness-equivalent here.
+        let msg = err.to_string();
+        assert!(
+            msg.contains("reconciliation attempt must be born resolved")
+                || msg.to_lowercase().contains("check"),
+            "got: {err}"
+        );
+    }
+
+    /// Defence-in-depth: the trigger refuses a reconciliation row whose
+    /// outcome is `post_patch_failure`. Allowing that would let a
+    /// reconciliation be re-reconciled indefinitely, defeating the
+    /// "operator commits the answer" semantics.
+    #[test]
+    fn reconciliation_trigger_refuses_post_patch_failure_outcome() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let push_request_id = RequestId::new();
+        let _session = open_with_staged_request(&log, push_request_id);
+        let (predecessor, mint) = drive_to_post_patch_failure(&log, push_request_id);
+
+        let err = log
+            .with_conn_mut(|c| {
+                Ok(c.execute(
+                    "INSERT INTO git_push_approve_attempt
+                        (attempt_id, push_request_id, operator, started_at,
+                         state, outcome, completed_at, failure_detail,
+                         mint_jti, mint_github_app_id, mint_issued_at, mint_expires_at,
+                         supersedes_attempt_id)
+                     VALUES (?1, ?2, 'carol', 1700000300,
+                             'resolved', 'post_patch_failure', 1700000300, 'still uncertain',
+                             ?3, ?4, ?5, ?6,
+                             ?7)",
+                    params![
+                        ApproveAttemptId::new().as_uuid().to_string(),
+                        push_request_id.as_uuid().to_string(),
+                        mint.jti.as_uuid().to_string(),
+                        mint.github_app_id as i64,
+                        mint.issued_at.as_millis(),
+                        mint.expires_at.as_millis(),
+                        predecessor.as_uuid().to_string(),
+                    ],
+                ))
+            })
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("reconciliation attempt must be born resolved"),
+            "got: {err}"
+        );
+    }
+
+    /// The same-push trigger refuses a reconciliation row that
+    /// references a different push from its predecessor. Without this,
+    /// a manual SQL writer could "clear" a quarantine on push A by
+    /// writing a row that the resolution INSERT then lands on push B.
+    #[test]
+    fn reconciliation_trigger_refuses_cross_push_reference() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let push_a = RequestId::new();
+        let push_b = RequestId::new();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+        record_staged_request(&log, push_a, s.session_id);
+        record_staged_request(&log, push_b, s.session_id);
+        let (predecessor, mint) = drive_to_post_patch_failure(&log, push_a);
+
+        // INSERT a row that names push_b but supersedes push_a's
+        // predecessor. The trigger must refuse.
+        let err = log
+            .with_conn_mut(|c| {
+                Ok(c.execute(
+                    "INSERT INTO git_push_approve_attempt
+                        (attempt_id, push_request_id, operator, started_at,
+                         state, outcome, completed_at, new_app_tip,
+                         mint_jti, mint_github_app_id, mint_issued_at, mint_expires_at,
+                         supersedes_attempt_id)
+                     VALUES (?1, ?2, 'carol', 1700000300,
+                             'resolved', 'succeeded', 1700000300, ?3,
+                             ?4, ?5, ?6, ?7,
+                             ?8)",
+                    params![
+                        ApproveAttemptId::new().as_uuid().to_string(),
+                        push_b.as_uuid().to_string(),
+                        git_oid('b').as_str(),
+                        mint.jti.as_uuid().to_string(),
+                        mint.github_app_id as i64,
+                        mint.issued_at.as_millis(),
+                        mint.expires_at.as_millis(),
+                        predecessor.as_uuid().to_string(),
+                    ],
+                ))
+            })
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("reconciliation attempt must reference the same push as its predecessor"),
+            "got: {err}"
+        );
+    }
+
+    /// `supersedes_attempt_id` is established at INSERT, and the three
+    /// reconciliation INSERT triggers (born_terminal, predecessor_eligible,
+    /// same_push) fire only on INSERT. Without the UPDATE immutability
+    /// guard, a legal state transition such as
+    /// `started -> resolved(pre_patch_failure)` could be coerced to also
+    /// flip `supersedes_attempt_id`, bypassing every reconciliation
+    /// check. The trigger must refuse such an UPDATE.
+    #[test]
+    fn supersedes_immutable_trigger_refuses_update_setting_column() {
+        let log = AuditLog::open_in_memory().unwrap();
+        // Use two pushes: the PostPatchFailure predecessor lives on
+        // push_a (it blocks start_approve_attempt for push_a), and the
+        // fresh `started` attempt that we mutate lives on push_b (which
+        // has no blocker). The same_push trigger only fires on INSERT,
+        // so an UPDATE that flips supersedes_attempt_id to a different
+        // push's predecessor would still bypass that check without the
+        // immutability guard — exactly the bypass we're proving the
+        // new trigger closes.
+        let push_a = RequestId::new();
+        let push_b = RequestId::new();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+        record_staged_request(&log, push_a, s.session_id);
+        record_staged_request(&log, push_b, s.session_id);
+        let (predecessor, _) = drive_to_post_patch_failure(&log, push_a);
+
+        let new_attempt = ApproveAttemptId::new();
+        log.start_approve_attempt(
+            new_attempt,
+            push_b,
+            "alice",
+            UnixMillis::from_millis(1_700_000_500),
+        )
+        .unwrap();
+
+        // UPDATE the `started` row to land in `resolved(pre_patch_failure)`
+        // AND set supersedes_attempt_id at the same time. The legal
+        // version of this transition (via complete_attempt_pre_patch_failure)
+        // does not touch supersedes_attempt_id; we are simulating a
+        // future-DAO or raw-SQL bypass.
+        let err = log
+            .with_conn_mut(|c| {
+                Ok(c.execute(
+                    "UPDATE git_push_approve_attempt
+                       SET state = 'resolved',
+                           outcome = 'pre_patch_failure',
+                           completed_at = 1700000600,
+                           failure_detail = 'sneaky',
+                           supersedes_attempt_id = ?1
+                     WHERE attempt_id = ?2",
+                    params![
+                        predecessor.as_uuid().to_string(),
+                        new_attempt.as_uuid().to_string(),
+                    ],
+                ))
+            })
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("supersedes_attempt_id is immutable after insert"),
+            "got: {err}"
+        );
+    }
+
+    /// Sanity check that legal state transitions which do NOT touch
+    /// `supersedes_attempt_id` continue to work unchanged after the
+    /// UPDATE immutability trigger is in place.
+    #[test]
+    fn supersedes_immutable_trigger_admits_normal_state_transitions() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let push_request_id = RequestId::new();
+        let _session = open_with_staged_request(&log, push_request_id);
+
+        let attempt = ApproveAttemptId::new();
+        log.start_approve_attempt(
+            attempt,
+            push_request_id,
+            "alice",
+            UnixMillis::from_millis(1_700_000_500),
+        )
+        .unwrap();
+        // started -> uncertain: must succeed (no supersedes change).
+        log.mark_attempt_uncertain(attempt, sample_promote_mint_audit())
+            .unwrap();
+        // uncertain -> resolved(post_patch_failure): must succeed.
+        log.complete_attempt_post_patch_failure(
+            attempt,
+            "github 5xx",
+            UnixMillis::from_millis(1_700_000_600),
+        )
+        .unwrap();
     }
 
     /// Property test: any sequence of legal DAO calls leaves the

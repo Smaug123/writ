@@ -49,7 +49,7 @@ pub(super) struct Migration {
 /// a version higher than this is rejected with [`AuditError::SchemaTooNew`]
 /// rather than opened — we'd rather fail to start than silently drop data
 /// into a schema a newer broker wrote.
-pub(super) const SCHEMA_VERSION: i32 = 5;
+pub(super) const SCHEMA_VERSION: i32 = 6;
 
 /// The full migration history. Each entry documents exactly one state
 /// transition; the sequence of entries is the schema's lineage. Order
@@ -79,6 +79,11 @@ pub(super) const MIGRATIONS: &[Migration] = &[
         version: 5,
         name: "0005_approve_attempt_state_machine",
         sql: include_str!("migrations/0005_approve_attempt_state_machine.sql"),
+    },
+    Migration {
+        version: 6,
+        name: "0006_approve_attempt_reconciliation",
+        sql: include_str!("migrations/0006_approve_attempt_reconciliation.sql"),
     },
 ];
 
@@ -311,6 +316,7 @@ mod tests {
             "git_push_outcome",
             "git_push_resolution",
             "git_push_approve_attempt",
+            "git_push_approve_attempt_boot_observed",
             "plan",
             "plan_decision",
             "plan_review",
@@ -337,6 +343,11 @@ mod tests {
             "git_push_resolution_mint_matches_decision_update",
             "git_push_approve_attempt_forward_only",
             "git_push_approve_attempt_mint_immutable",
+            "git_push_approve_attempt_reconciliation_is_born_terminal",
+            "git_push_approve_attempt_reconciliation_predecessor_eligible",
+            "git_push_approve_attempt_reconciliation_same_push",
+            "git_push_approve_attempt_reconciliation_uncertain_needs_boot_observed",
+            "git_push_approve_attempt_supersedes_immutable",
             "plan_requires_open_session",
             "plan_review_requires_open_session",
             "plan_review_requires_reviewer_run",
