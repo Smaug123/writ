@@ -25,7 +25,7 @@ use crate::agent_run::{AgentPrompt, AgentRunId, sha256_hex};
 use crate::agent_vm_daemon::AgentVmDaemon;
 use crate::audit::{
     AUDIT_WRITE_FAILURE_TARGET, AuditError, AuditLog, GitPushOutcomeResult, GitPushResolution,
-    GitPushResolutionRecord, PlanDecisionRecord, PreMintRecord, PromoteMintAudit,
+    GitPushResolutionRecord, PlanDecisionRecord, PreMintRecord, PromoteMintAudit, RejectBlocker,
 };
 use crate::core::{
     ApproveAttemptId, CapabilityRequest, GITHUB_INSTALLATION_TOKEN_MAX_SECONDS, GitHubAccess,
@@ -824,6 +824,23 @@ async fn reject_staged_push<S: SecretStore + Send + Sync + 'static>(
         }
     }
 
+    // Consult the approve-attempt state machine before attempting the
+    // INSERT. The `git_push_resolution_refuses_active_approve` trigger
+    // is the load-bearing correctness piece (it refuses contradictory
+    // commits at the SQL boundary), but its raw `RAISE(ABORT, ...)`
+    // text is opaque to the operator. Calling `reject_blocker_for_push`
+    // first lets the handler surface a typed diagnostic that names the
+    // attempt and points at the operator action. The trigger-mapping
+    // below covers the SELECT-vs-INSERT race where a fresh `Started`
+    // row lands in the gap.
+    match preflight_reject_blocker(state, request_id).await {
+        Ok(None) => {}
+        Ok(Some(blocker)) => {
+            return reject_blocker_response(&staging_store, request_id, blocker).await;
+        }
+        Err(message) => return ServerMessage::Error { message },
+    }
+
     let decided_at = UnixMillis::now();
     let reason_owned = reason.as_str().to_string();
     let operator_owned = operator.clone();
@@ -857,6 +874,34 @@ async fn reject_staged_push<S: SecretStore + Send + Sync + 'static>(
                 // D's promotion flow owns that directory's lifecycle.
                 retry_cleanup_for_rejected(state, &staging_store, request_id).await;
                 return ServerMessage::StagedPushAlreadyResolved { request_id };
+            }
+            if is_active_approve_refusal(&err) {
+                // The defence-in-depth path: an attempt row landed
+                // between our preflight blocker check and this INSERT,
+                // and the trigger refused the commit. Re-query so the
+                // operator gets the same typed diagnostic the preflight
+                // path would have produced.
+                match preflight_reject_blocker(state, request_id).await {
+                    Ok(Some(blocker)) => {
+                        return reject_blocker_response(&staging_store, request_id, blocker).await;
+                    }
+                    // The blocker disappeared between the trigger
+                    // firing and the re-query (e.g. the racing approve
+                    // resolved to PrePatchFailure). This is a stale
+                    // refusal — the row is now insertable. Rather than
+                    // retry here and risk an infinite-loop interaction
+                    // with whatever wrote the row, surface a concrete
+                    // diagnostic so the operator retries explicitly.
+                    Ok(None) => {
+                        return ServerMessage::Error {
+                            message: format!(
+                                "staged push {request_id} reject was refused by an in-flight \
+                                 approve attempt that has since resolved; retry the reject"
+                            ),
+                        };
+                    }
+                    Err(message) => return ServerMessage::Error { message },
+                }
             }
             tracing::error!(
                 target: AUDIT_WRITE_FAILURE_TARGET,
@@ -1583,18 +1628,45 @@ async fn retry_cleanup_for_rejected<S: SecretStore + Send + Sync + 'static>(
         Ok(Ok(Some(entry))) => entry.resolution.map(|r| r.decision),
         _ => None,
     };
-    if prior_decision != Some(GitPushResolution::Rejected) {
+    if !matches!(prior_decision, Some(GitPushResolution::Rejected)) {
         return;
     }
+    retry_staging_delete(staging_store, request_id, "duplicate-reject").await;
+}
+
+/// Best-effort staging-dir delete used by the duplicate-resolution
+/// recovery paths. Logs a `warn` if the delete itself errors;
+/// task-join failures are surfaced the same way. Centralised here so
+/// the duplicate-reject and the
+/// `RejectBlocker::AlreadyApproved` branches share the same
+/// observable behaviour — both are "a prior resolution committed, the
+/// staging dir may have leaked, retry the cleanup."
+async fn retry_staging_delete(
+    staging_store: &Arc<GitPushStagingStore>,
+    request_id: RequestId,
+    context: &'static str,
+) {
     let staging_store = Arc::clone(staging_store);
     let delete_outcome =
         tokio::task::spawn_blocking(move || staging_store.delete(request_id)).await;
-    if let Ok(Err(err)) = delete_outcome {
-        tracing::warn!(
-            request_id = %request_id,
-            error = %err,
-            "duplicate-reject cleanup retry failed; staging dir may still be present",
-        );
+    match delete_outcome {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => {
+            tracing::warn!(
+                request_id = %request_id,
+                context,
+                error = %err,
+                "staging cleanup retry failed; staging dir may still be present",
+            );
+        }
+        Err(err) => {
+            tracing::warn!(
+                request_id = %request_id,
+                context,
+                error = %err,
+                "staging cleanup retry task failed; staging dir may still be present",
+            );
+        }
     }
 }
 
@@ -1614,6 +1686,106 @@ fn is_unique_constraint_violation(err: &crate::audit::AuditError) -> bool {
     }
     let message = sql_err.to_string().to_lowercase();
     message.contains("unique") || message.contains("primary key")
+}
+
+/// Detect the `git_push_resolution_refuses_active_approve` trigger
+/// firing. The trigger is the schema-level defence-in-depth for the
+/// approve-attempt state machine: any attempted `INSERT` into
+/// `git_push_resolution` while a same-push attempt is `Started`,
+/// `Uncertain`, or `Resolved(PostPatchFailure)` is refused with the
+/// literal message below. The reject handler calls
+/// [`AuditLog::reject_blocker_for_push`] *first* to give the operator a
+/// typed diagnostic, but the SELECT-vs-INSERT window admits a racing
+/// approve that lands a fresh `Started` row in between; matching the
+/// trigger's text lets the handler translate that race back into the
+/// same typed surface instead of leaking the raw SQL refusal.
+///
+/// The matched literal is mirrored from
+/// `src/audit/migrations/0005_approve_attempt_state_machine.sql`.
+fn is_active_approve_refusal(err: &crate::audit::AuditError) -> bool {
+    const TRIGGER_MESSAGE: &str =
+        "git push resolution refused: approve attempt is in-flight or quarantined";
+    let crate::audit::AuditError::Sqlite(sql_err) = err else {
+        return false;
+    };
+    let rusqlite::Error::SqliteFailure(code, _) = sql_err else {
+        return false;
+    };
+    if !matches!(code.code, rusqlite::ErrorCode::ConstraintViolation) {
+        return false;
+    }
+    sql_err.to_string().contains(TRIGGER_MESSAGE)
+}
+
+/// Query [`AuditLog::reject_blocker_for_push`] from the broker's tokio
+/// runtime, returning the typed `Option<RejectBlocker>` plus a wire
+/// error message if the spawn-blocking call itself fails. Centralising
+/// this lets the handler call the same machinery twice (preflight and
+/// the trigger-race recovery path) without duplicating the join /
+/// error-mapping boilerplate.
+async fn preflight_reject_blocker<S: SecretStore + Send + Sync + 'static>(
+    state: &Arc<BrokerState<S>>,
+    request_id: RequestId,
+) -> Result<Option<RejectBlocker>, String> {
+    let audit = Arc::clone(&state.audit);
+    match tokio::task::spawn_blocking(move || audit.reject_blocker_for_push(request_id)).await {
+        Ok(Ok(blocker)) => Ok(blocker),
+        Ok(Err(err)) => {
+            tracing::error!(
+                target: AUDIT_WRITE_FAILURE_TARGET,
+                kind = "reject_blocker_for_push",
+                request_id = %request_id,
+                error = %err,
+                "audit read failed: reject blocker query errored",
+            );
+            Err(err.to_string())
+        }
+        Err(err) => Err(format!("audit read task failed: {err}")),
+    }
+}
+
+/// Map a non-`None` [`RejectBlocker`] into the reject handler's
+/// response. `AlreadyApproved` reuses the existing
+/// `StagedPushAlreadyResolved` surface — when the joint TX in
+/// `complete_attempt_succeeded` commits, the resolution row is present
+/// alongside the attempt row, so the operator-facing behaviour matches
+/// a duplicate-reject hit. The other variants surface as `Error` with
+/// a diagnostic that names the attempt and points the operator at the
+/// next action.
+async fn reject_blocker_response(
+    staging_store: &Arc<GitPushStagingStore>,
+    request_id: RequestId,
+    blocker: RejectBlocker,
+) -> ServerMessage {
+    match blocker {
+        RejectBlocker::AttemptInFlight { attempt_id } => ServerMessage::Error {
+            message: format!(
+                "staged push {request_id} cannot be rejected: approve attempt {attempt_id} \
+                 is in flight; retry once it resolves or wait for boot reconcile to drive \
+                 the attempt to a terminal state"
+            ),
+        },
+        RejectBlocker::AlreadyApproved { .. } => {
+            // The approve handler best-effort deletes the staging dir
+            // post-joint-TX (`approve_staged_push` line ~1449); if that
+            // delete failed the dir is still on disk and the operator's
+            // late reject is the second chance to remove it. The
+            // existing `retry_cleanup_for_rejected` path only fires for
+            // a prior `Rejected` decision, so the shared
+            // `retry_staging_delete` helper covers the
+            // duplicate-approve branch with the same observable
+            // behaviour.
+            retry_staging_delete(staging_store, request_id, "duplicate-approve").await;
+            ServerMessage::StagedPushAlreadyResolved { request_id }
+        }
+        RejectBlocker::PostPatchUncertain { attempt_id } => ServerMessage::Error {
+            message: format!(
+                "staged push {request_id} cannot be rejected: approve attempt {attempt_id} \
+                 may have advanced the branch on GitHub; inspect the remote ref and \
+                 reconcile manually before retrying"
+            ),
+        },
+    }
 }
 
 fn staging_not_configured() -> ServerMessage {
@@ -3411,6 +3583,19 @@ mod tests {
             .unwrap()
     }
 
+    /// Mirror of the same-named helper in `audit::git_push::tests`; the
+    /// values aren't significant — the tests that consume this just
+    /// need a `PromoteMintAudit` whose shape passes the DAO's column
+    /// checks when transitioning an attempt to `Uncertain`.
+    fn sample_promote_mint_audit() -> PromoteMintAudit {
+        PromoteMintAudit {
+            jti: crate::core::Jti::new(),
+            github_app_id: 42,
+            issued_at: UnixMillis::from_millis(1_700_000_190),
+            expires_at: UnixMillis::from_millis(1_700_000_490),
+        }
+    }
+
     /// Stage a push on disk *and* record the matching audit row plus a
     /// `Staged` outcome row so the resolution trigger admits operator
     /// decisions against the resulting request id. Returns the request id.
@@ -4134,6 +4319,405 @@ mod tests {
                 .load(request_id)
                 .is_ok()
         );
+    }
+
+    /// A `Started` attempt blocks reject: the broker has committed to an
+    /// approve in flight but hasn't yet reached the PATCH boundary.
+    /// Surfacing the typed diagnostic (with the attempt_id and an
+    /// actionable hint) is the point of this slice — the raw trigger
+    /// ABORT text is opaque to the operator.
+    #[tokio::test]
+    async fn reject_staged_push_with_started_attempt_refuses_with_in_flight_diagnostic() {
+        let server = MockServer::start().await;
+        let (state, _tmp) = make_state_with_staging(&server);
+        let session_id = open_session(&state).await;
+        let request_id = stage_with_staged_outcome(
+            &state,
+            session_id,
+            b"bundle".to_vec(),
+            UnixMillis::from_millis(1_700_001_010_000),
+            UnixMillis::from_millis(1_700_001_010_500),
+        )
+        .await;
+        let attempt_id = ApproveAttemptId::new();
+        state
+            .audit
+            .start_approve_attempt(
+                attempt_id,
+                request_id,
+                "alice",
+                UnixMillis::from_millis(1_700_001_011_000),
+            )
+            .unwrap();
+
+        let resp = dispatch_message(
+            ClientMessage::RejectStagedPush {
+                request_id,
+                operator: "bob".into(),
+                reason: reason("racing reject"),
+            },
+            &state,
+        )
+        .await;
+
+        match resp {
+            ServerMessage::Error { message } => {
+                assert!(
+                    message.contains(&attempt_id.to_string()),
+                    "expected attempt id in diagnostic, got: {message}",
+                );
+                assert!(
+                    message.contains("in flight"),
+                    "expected 'in flight' phrasing, got: {message}",
+                );
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+
+        // No resolution row should have been written; the attempt
+        // remains `Started` and the staging dir is still on disk.
+        let audit_entry = state.audit.get_git_push(request_id).unwrap().unwrap();
+        assert!(audit_entry.resolution.is_none());
+        assert!(
+            state
+                .staging_store
+                .as_ref()
+                .unwrap()
+                .load(request_id)
+                .is_ok()
+        );
+    }
+
+    /// Same shape as the `Started` case but the attempt has advanced to
+    /// `Uncertain` — the broker may have issued the PATCH but not yet
+    /// confirmed it. Reject is still refused with the in-flight
+    /// diagnostic; the operator waits for the attempt to resolve.
+    #[tokio::test]
+    async fn reject_staged_push_with_uncertain_attempt_refuses_with_in_flight_diagnostic() {
+        let server = MockServer::start().await;
+        let (state, _tmp) = make_state_with_staging(&server);
+        let session_id = open_session(&state).await;
+        let request_id = stage_with_staged_outcome(
+            &state,
+            session_id,
+            b"bundle".to_vec(),
+            UnixMillis::from_millis(1_700_001_020_000),
+            UnixMillis::from_millis(1_700_001_020_500),
+        )
+        .await;
+        let attempt_id = ApproveAttemptId::new();
+        state
+            .audit
+            .start_approve_attempt(
+                attempt_id,
+                request_id,
+                "alice",
+                UnixMillis::from_millis(1_700_001_021_000),
+            )
+            .unwrap();
+        state
+            .audit
+            .mark_attempt_uncertain(attempt_id, sample_promote_mint_audit())
+            .unwrap();
+
+        let resp = dispatch_message(
+            ClientMessage::RejectStagedPush {
+                request_id,
+                operator: "bob".into(),
+                reason: reason("racing reject"),
+            },
+            &state,
+        )
+        .await;
+
+        match resp {
+            ServerMessage::Error { message } => {
+                assert!(
+                    message.contains(&attempt_id.to_string()),
+                    "expected attempt id in diagnostic, got: {message}",
+                );
+                assert!(
+                    message.contains("in flight"),
+                    "expected 'in flight' phrasing, got: {message}",
+                );
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+
+        let audit_entry = state.audit.get_git_push(request_id).unwrap().unwrap();
+        assert!(audit_entry.resolution.is_none());
+    }
+
+    /// A `Resolved(Succeeded)` attempt is the joint-TX outcome: the
+    /// resolution row is already present alongside the attempt row.
+    /// Reject must reuse the existing already-resolved path so the
+    /// operator gets the same surface that a duplicate reject produces,
+    /// and so the staging dir cleanup retries on this call.
+    #[tokio::test]
+    async fn reject_staged_push_with_succeeded_attempt_returns_already_resolved() {
+        let server = MockServer::start().await;
+        let (state, _tmp) = make_state_with_staging(&server);
+        let session_id = open_session(&state).await;
+        let request_id = stage_with_staged_outcome(
+            &state,
+            session_id,
+            b"bundle".to_vec(),
+            UnixMillis::from_millis(1_700_001_030_000),
+            UnixMillis::from_millis(1_700_001_030_500),
+        )
+        .await;
+        let attempt_id = ApproveAttemptId::new();
+        state
+            .audit
+            .start_approve_attempt(
+                attempt_id,
+                request_id,
+                "alice",
+                UnixMillis::from_millis(1_700_001_031_000),
+            )
+            .unwrap();
+        state
+            .audit
+            .mark_attempt_uncertain(attempt_id, sample_promote_mint_audit())
+            .unwrap();
+        state
+            .audit
+            .complete_attempt_succeeded(
+                attempt_id,
+                &sample_object_id('a'),
+                "alice",
+                "promoted by test",
+                UnixMillis::from_millis(1_700_001_032_000),
+            )
+            .unwrap();
+        // The joint TX wrote the resolution row alongside the attempt.
+        let before = state.audit.get_git_push(request_id).unwrap().unwrap();
+        assert!(before.resolution.is_some());
+
+        let resp = dispatch_message(
+            ClientMessage::RejectStagedPush {
+                request_id,
+                operator: "bob".into(),
+                reason: reason("late reject"),
+            },
+            &state,
+        )
+        .await;
+
+        assert_eq!(
+            resp,
+            ServerMessage::StagedPushAlreadyResolved { request_id }
+        );
+
+        // Original (approved) resolution row is untouched.
+        let after = state.audit.get_git_push(request_id).unwrap().unwrap();
+        let resolution = after.resolution.expect("resolution row remains");
+        assert!(
+            matches!(resolution.decision, GitPushResolution::Approved(_)),
+            "expected approved decision, got {:?}",
+            resolution.decision,
+        );
+        assert_eq!(resolution.operator, "alice");
+
+        // The retry-cleanup path ran: staging dir is gone.
+        match state.staging_store.as_ref().unwrap().load(request_id) {
+            Err(StagingError::NotFound { .. }) => {}
+            other => panic!("expected staging cleanup, got {other:?}"),
+        }
+    }
+
+    /// A `Resolved(PostPatchFailure)` attempt quarantines the push: the
+    /// broker called `update_ref` but cannot confirm GitHub's terminal
+    /// state. Reject is refused until manual reconciliation; the
+    /// diagnostic must point at that operator action.
+    #[tokio::test]
+    async fn reject_staged_push_with_post_patch_failure_refuses_with_uncertain_diagnostic() {
+        let server = MockServer::start().await;
+        let (state, _tmp) = make_state_with_staging(&server);
+        let session_id = open_session(&state).await;
+        let request_id = stage_with_staged_outcome(
+            &state,
+            session_id,
+            b"bundle".to_vec(),
+            UnixMillis::from_millis(1_700_001_040_000),
+            UnixMillis::from_millis(1_700_001_040_500),
+        )
+        .await;
+        let attempt_id = ApproveAttemptId::new();
+        state
+            .audit
+            .start_approve_attempt(
+                attempt_id,
+                request_id,
+                "alice",
+                UnixMillis::from_millis(1_700_001_041_000),
+            )
+            .unwrap();
+        state
+            .audit
+            .mark_attempt_uncertain(attempt_id, sample_promote_mint_audit())
+            .unwrap();
+        state
+            .audit
+            .complete_attempt_post_patch_failure(
+                attempt_id,
+                "github 502 on update_ref",
+                UnixMillis::from_millis(1_700_001_042_000),
+            )
+            .unwrap();
+
+        let resp = dispatch_message(
+            ClientMessage::RejectStagedPush {
+                request_id,
+                operator: "bob".into(),
+                reason: reason("late reject"),
+            },
+            &state,
+        )
+        .await;
+
+        match resp {
+            ServerMessage::Error { message } => {
+                assert!(
+                    message.contains(&attempt_id.to_string()),
+                    "expected attempt id in diagnostic, got: {message}",
+                );
+                assert!(
+                    message.contains("reconcile") && message.contains("manually"),
+                    "expected manual-reconciliation hint, got: {message}",
+                );
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+
+        // No resolution row got written; the attempt remains in
+        // `Resolved(PostPatchFailure)` quarantine.
+        let audit_entry = state.audit.get_git_push(request_id).unwrap().unwrap();
+        assert!(audit_entry.resolution.is_none());
+    }
+
+    /// Pre-patch failure is *not* a blocker — `reject_blocker_for_push`
+    /// returns `None` for an attempt that proved no PATCH was issued
+    /// (mint failure, plan failure, etc.), so reject proceeds normally.
+    /// This is the retry-after-transient-approve-failure path.
+    #[tokio::test]
+    async fn reject_staged_push_with_pre_patch_failure_attempt_proceeds_normally() {
+        let server = MockServer::start().await;
+        let (state, _tmp) = make_state_with_staging(&server);
+        let session_id = open_session(&state).await;
+        let request_id = stage_with_staged_outcome(
+            &state,
+            session_id,
+            b"bundle".to_vec(),
+            UnixMillis::from_millis(1_700_001_050_000),
+            UnixMillis::from_millis(1_700_001_050_500),
+        )
+        .await;
+        let attempt_id = ApproveAttemptId::new();
+        state
+            .audit
+            .start_approve_attempt(
+                attempt_id,
+                request_id,
+                "alice",
+                UnixMillis::from_millis(1_700_001_051_000),
+            )
+            .unwrap();
+        state
+            .audit
+            .complete_attempt_pre_patch_failure(
+                attempt_id,
+                "mint failed",
+                UnixMillis::from_millis(1_700_001_052_000),
+            )
+            .unwrap();
+
+        let resp = dispatch_message(
+            ClientMessage::RejectStagedPush {
+                request_id,
+                operator: "bob".into(),
+                reason: reason("operator decision"),
+            },
+            &state,
+        )
+        .await;
+
+        assert_eq!(resp, ServerMessage::StagedPushRejected { request_id });
+
+        // Resolution row was written, staging dir removed.
+        let audit_entry = state.audit.get_git_push(request_id).unwrap().unwrap();
+        let resolution = audit_entry.resolution.expect("rejected resolution row");
+        assert_eq!(resolution.decision, GitPushResolution::Rejected);
+        assert_eq!(resolution.operator, "bob");
+    }
+
+    /// `is_active_approve_refusal` detects the
+    /// `git_push_resolution_refuses_active_approve` trigger's raised
+    /// message verbatim. This is the contract the handler depends on
+    /// when it re-queries the blocker on INSERT failure. Verifies the
+    /// match string is wired up correctly without standing up a full
+    /// dispatch — the literal lives in the migration SQL.
+    /// `is_active_approve_refusal` detects the
+    /// `git_push_resolution_refuses_active_approve` trigger firing.
+    /// This is the defence-in-depth path the handler relies on when an
+    /// attempt row lands between the preflight blocker check and the
+    /// resolution INSERT. Asserts both that a real trigger ABORT
+    /// matches the predicate and that a sibling PK violation does
+    /// *not* — keeping the existing
+    /// `is_unique_constraint_violation` branch distinct.
+    #[tokio::test]
+    async fn is_active_approve_refusal_matches_the_trigger_message() {
+        let server = MockServer::start().await;
+        let (state, _tmp) = make_state_with_staging(&server);
+        let session_id = open_session(&state).await;
+        let request_id = stage_with_staged_outcome(
+            &state,
+            session_id,
+            b"bundle".to_vec(),
+            UnixMillis::from_millis(1_700_002_000_000),
+            UnixMillis::from_millis(1_700_002_000_500),
+        )
+        .await;
+        let attempt_id = ApproveAttemptId::new();
+        state
+            .audit
+            .start_approve_attempt(
+                attempt_id,
+                request_id,
+                "alice",
+                UnixMillis::from_millis(1_700_002_001_000),
+            )
+            .unwrap();
+
+        let err = state
+            .audit
+            .record_git_push_resolution(&GitPushResolutionRecord {
+                push_request_id: request_id,
+                decided_at: UnixMillis::from_millis(1_700_002_002_000),
+                decision: GitPushResolution::Rejected,
+                operator: "bob",
+                reason: "racing",
+            })
+            .expect_err("trigger refuses the INSERT");
+        assert!(
+            is_active_approve_refusal(&err),
+            "predicate must classify trigger ABORT, got: {err:?}",
+        );
+        // A PK violation must *not* match this predicate so the
+        // existing `is_unique_constraint_violation` branch keeps its
+        // distinct behaviour.
+        let fake_pk_err = crate::audit::AuditError::Sqlite(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                code: rusqlite::ErrorCode::ConstraintViolation,
+                extended_code: 0,
+            },
+            Some("UNIQUE constraint failed: git_push_resolution.push_request_id".into()),
+        ));
+        assert!(
+            !is_active_approve_refusal(&fake_pk_err),
+            "PK violation must not match the trigger predicate",
+        );
+        assert!(is_unique_constraint_violation(&fake_pk_err));
     }
 
     // --- Staged-push approve (state machine) ----------------------------
