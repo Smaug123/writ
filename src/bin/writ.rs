@@ -20,14 +20,11 @@ use std::path::{Path, PathBuf};
 
 use clap::{ArgGroup, Parser, Subcommand, ValueEnum};
 
-use writ::agent_plan::{CorrelationId, Decider, PlanId, Stage};
+use writ::agent_plan::{CorrelationId, PlanId, Stage};
 use writ::agent_run::AgentPrompt;
-use writ::cli::identity::{
-    capture_operator_identity, resolve_decision_outcome, resolve_reconcile_outcome,
-};
+use writ::cli::identity::{capture_operator_identity, resolve_reconcile_outcome};
 use writ::cli::output::{
-    write_agent_vm_sessions, write_plan_detail, write_plan_summaries, write_staged_push_detail,
-    write_staged_push_summaries,
+    write_agent_vm_sessions, write_staged_push_detail, write_staged_push_summaries,
 };
 use writ::cli::parse::{parse_agent_kind, parse_correlation_id, parse_plan_id, parse_stage};
 use writ::cli::workspace::{
@@ -88,46 +85,6 @@ enum Cmd {
     Promote {
         #[command(subcommand)]
         action: PromoteCmd,
-    },
-    /// Inspect plans recorded by planner-stage agent runs.
-    Plan {
-        #[command(subcommand)]
-        action: PlanCmd,
-    },
-}
-
-#[derive(Subcommand)]
-enum PlanCmd {
-    /// List every plan the broker holds, optionally filtered by the
-    /// planner run's correlation id. Bodies are not loaded — use
-    /// `writ plan show <id>` for the body.
-    List {
-        /// Restrict the listing to plans whose planner run was tagged
-        /// with this correlation id.
-        #[arg(long, value_parser = parse_correlation_id)]
-        correlation_id: Option<CorrelationId>,
-    },
-    /// Show one plan: metadata followed by the verbatim body.
-    Show { plan_id: String },
-    /// Record an operator decision on a plan. Exactly one of
-    /// `--accept` or `--reject-restart` is required. The operator
-    /// identity defaults to `cli:$USER` (or `cli:unknown` if unset);
-    /// pass `--decider` to override the attribution stored in the
-    /// audit row.
-    #[command(group(ArgGroup::new("outcome").required(true).args(["accept", "reject_restart"])))]
-    Decide {
-        plan_id: String,
-        /// Record the plan as accepted (review approves it).
-        #[arg(long)]
-        accept: bool,
-        /// Record the plan as rejected for restart (review rejects
-        /// the plan and the planner must run again).
-        #[arg(long = "reject-restart")]
-        reject_restart: bool,
-        /// Override the decider attribution stored in the audit row.
-        /// Defaults to `cli:$USER`.
-        #[arg(long)]
-        decider: Option<String>,
     },
 }
 
@@ -628,76 +585,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     ServerMessage::StagedPushNotReconcilable { request_id, reason } => {
                         return Err(format!(
                             "staged push {request_id} is not reconcilable: {reason}",
-                        )
-                        .into());
-                    }
-                    ServerMessage::Error { message } => return Err(message.into()),
-                    other => return Err(format!("unexpected response: {other:?}").into()),
-                }
-            }
-        },
-        Cmd::Plan { action } => match action {
-            PlanCmd::List { correlation_id } => {
-                let msg = ClientMessage::ListPlans { correlation_id };
-                match call(&socket_path, &msg)? {
-                    ServerMessage::Plans { plans } => {
-                        let mut out = std::io::stdout().lock();
-                        write_plan_summaries(&mut out, &plans)?;
-                    }
-                    ServerMessage::Error { message } => return Err(message.into()),
-                    other => return Err(format!("unexpected response: {other:?}").into()),
-                }
-            }
-            PlanCmd::Show { plan_id } => {
-                let id: PlanId = plan_id
-                    .parse()
-                    .map_err(|e| format!("invalid plan ID: {e}"))?;
-                let msg = ClientMessage::ShowPlan { plan_id: id };
-                match call(&socket_path, &msg)? {
-                    ServerMessage::Plan { plan } => {
-                        let mut out = std::io::stdout().lock();
-                        write_plan_detail(&mut out, &plan)?;
-                    }
-                    ServerMessage::UnknownPlan { plan_id } => {
-                        return Err(format!("no plan with id {plan_id}").into());
-                    }
-                    ServerMessage::Error { message } => return Err(message.into()),
-                    other => return Err(format!("unexpected response: {other:?}").into()),
-                }
-            }
-            PlanCmd::Decide {
-                plan_id,
-                accept,
-                reject_restart,
-                decider,
-            } => {
-                let id: PlanId = plan_id
-                    .parse()
-                    .map_err(|e| format!("invalid plan ID: {e}"))?;
-                let outcome = resolve_decision_outcome(accept, reject_restart);
-                let decider = match decider {
-                    Some(raw) => Decider::try_new(raw).map_err(|e| e.to_string())?,
-                    None => {
-                        let identity = capture_operator_identity();
-                        Decider::try_new(format!("cli:{identity}"))
-                            .map_err(|e| format!("invalid default decider: {e}"))?
-                    }
-                };
-                let msg = ClientMessage::DecidePlan {
-                    plan_id: id,
-                    outcome,
-                    decider,
-                };
-                match call(&socket_path, &msg)? {
-                    ServerMessage::PlanDecided { plan_id } => {
-                        println!("decided plan_id={plan_id} outcome={outcome}");
-                    }
-                    ServerMessage::UnknownPlan { plan_id } => {
-                        return Err(format!("no plan with id {plan_id}").into());
-                    }
-                    ServerMessage::PlanAlreadyDecided { plan_id } => {
-                        return Err(format!(
-                            "plan {plan_id} already has an operator decision recorded",
                         )
                         .into());
                     }
@@ -1602,142 +1489,6 @@ mod tests {
             }
             _ => panic!("unexpected command"),
         }
-    }
-
-    #[test]
-    fn plan_list_cli_accepts_correlation_id_filter() {
-        let args =
-            Args::try_parse_from(["writ", "plan", "list", "--correlation-id", "feat-42_xyz"])
-                .unwrap();
-        match args.cmd {
-            Cmd::Plan {
-                action: PlanCmd::List { correlation_id },
-            } => {
-                let id = correlation_id.expect("--correlation-id should parse");
-                assert_eq!(id.as_str(), "feat-42_xyz");
-            }
-            _ => panic!("unexpected command"),
-        }
-    }
-
-    #[test]
-    fn plan_list_cli_without_correlation_id_filter_is_none() {
-        let args = Args::try_parse_from(["writ", "plan", "list"]).unwrap();
-        match args.cmd {
-            Cmd::Plan {
-                action: PlanCmd::List { correlation_id },
-            } => {
-                assert!(correlation_id.is_none());
-            }
-            _ => panic!("unexpected command"),
-        }
-    }
-
-    #[test]
-    fn plan_list_cli_rejects_invalid_correlation_id() {
-        let err =
-            match Args::try_parse_from(["writ", "plan", "list", "--correlation-id", "bad space"]) {
-                Ok(_) => panic!("expected clap to reject malformed --correlation-id"),
-                Err(error) => error,
-            };
-        let rendered = err.to_string();
-        assert!(rendered.contains("correlation id"), "{rendered}");
-    }
-
-    #[test]
-    fn plan_show_cli_accepts_plan_id() {
-        let id = "f1f1f1f1-0000-0000-0000-000000000001";
-        let args = Args::try_parse_from(["writ", "plan", "show", id]).unwrap();
-        match args.cmd {
-            Cmd::Plan {
-                action: PlanCmd::Show { plan_id },
-            } => assert_eq!(plan_id, id),
-            _ => panic!("unexpected command"),
-        }
-    }
-
-    #[test]
-    fn plan_decide_cli_accepts_accept_flag() {
-        let id = "f1f1f1f1-0000-0000-0000-000000000001";
-        let args = Args::try_parse_from(["writ", "plan", "decide", id, "--accept"]).unwrap();
-        match args.cmd {
-            Cmd::Plan {
-                action:
-                    PlanCmd::Decide {
-                        plan_id,
-                        accept,
-                        reject_restart,
-                        decider,
-                    },
-            } => {
-                assert_eq!(plan_id, id);
-                assert!(accept);
-                assert!(!reject_restart);
-                assert!(decider.is_none());
-            }
-            _ => panic!("unexpected command"),
-        }
-    }
-
-    #[test]
-    fn plan_decide_cli_accepts_reject_restart_flag() {
-        let id = "f1f1f1f1-0000-0000-0000-000000000001";
-        let args =
-            Args::try_parse_from(["writ", "plan", "decide", id, "--reject-restart"]).unwrap();
-        match args.cmd {
-            Cmd::Plan {
-                action:
-                    PlanCmd::Decide {
-                        plan_id,
-                        accept,
-                        reject_restart,
-                        decider,
-                    },
-            } => {
-                assert_eq!(plan_id, id);
-                assert!(!accept);
-                assert!(reject_restart);
-                assert!(decider.is_none());
-            }
-            _ => panic!("unexpected command"),
-        }
-    }
-
-    #[test]
-    fn plan_decide_cli_accepts_decider_override() {
-        let id = "f1f1f1f1-0000-0000-0000-000000000001";
-        let args = Args::try_parse_from([
-            "writ",
-            "plan",
-            "decide",
-            id,
-            "--accept",
-            "--decider",
-            "agent:run-42",
-        ])
-        .unwrap();
-        match args.cmd {
-            Cmd::Plan {
-                action: PlanCmd::Decide { decider, .. },
-            } => assert_eq!(decider.as_deref(), Some("agent:run-42")),
-            _ => panic!("unexpected command"),
-        }
-    }
-
-    /// Clap's `ArgGroup` on the outcome flags must reject both
-    /// invocations that omit the outcome and invocations that pass
-    /// both — neither is meaningful and silently picking one would
-    /// hide an operator typo.
-    #[test]
-    fn plan_decide_cli_requires_exactly_one_outcome_flag() {
-        let id = "f1f1f1f1-0000-0000-0000-000000000001";
-
-        let missing = Args::try_parse_from(["writ", "plan", "decide", id]);
-        assert!(missing.is_err(), "expected clap to reject missing outcome");
-
-        let both =
-            Args::try_parse_from(["writ", "plan", "decide", id, "--accept", "--reject-restart"]);
-        assert!(both.is_err(), "expected clap to reject both outcomes");
     }
 
     #[test]
