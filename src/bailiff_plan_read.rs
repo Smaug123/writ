@@ -370,19 +370,36 @@ pub fn list_plan_ids(bailiff_repo: &NotesRepo) -> Result<Vec<PlanId>, ListPlanId
                 tail: tail.to_string(),
                 source,
             })?;
+        // `Uuid::parse_str` accepts non-canonical spellings (32 hex
+        // characters without hyphens, uppercase hex) that
+        // `plan_notes_ref(plan_id)` never emits — it always uses
+        // `PlanId::Display` which is the lowercase-hyphenated canonical
+        // form. If we let a non-canonical tail through, `summarize_plan`
+        // would re-derive the ref name canonically, look there, and
+        // find nothing — silently hiding the corrupted ref that
+        // actually carries the notes. Reject up front so the operator
+        // sees which on-disk ref is the offender.
+        if tail != id.to_string() {
+            return Err(ListPlanIdsError::NonCanonicalRef {
+                raw_ref: r.as_str().to_string(),
+                tail: tail.to_string(),
+                canonical: id.to_string(),
+            });
+        }
         ids.push(id);
     }
     Ok(ids)
 }
 
-/// Tagged failure modes of [`list_plan_ids`]. The two variants
+/// Tagged failure modes of [`list_plan_ids`]. The three variants
 /// distinguish "reading the ref set from bailiff's repo failed" from
-/// "a ref was returned whose tail isn't a parseable UUID." The latter
-/// is semantic corruption — bailiff is the sole writer to the
-/// `refs/notes/bailiff/v1/plans/` namespace and always uses
-/// `plan_notes_ref(plan_id)` to derive the name, so a non-UUID tail
-/// means a manual `git update-ref` or an external writer has injected
-/// state that bailiff cannot interpret.
+/// "a ref was returned whose tail isn't a parseable UUID" from "a ref
+/// parses but uses a non-canonical UUID spelling." All three of the
+/// latter two are semantic corruption — bailiff is the sole writer to
+/// the `refs/notes/bailiff/v1/plans/` namespace and always uses
+/// `plan_notes_ref(plan_id)` (i.e. `PlanId::Display`) to derive the
+/// name, so any deviation means a manual `git update-ref` or an
+/// external writer has injected state that bailiff cannot interpret.
 #[derive(Debug, Error)]
 pub enum ListPlanIdsError {
     /// Reading the ref set from bailiff's repo failed.
@@ -396,6 +413,20 @@ pub enum ListPlanIdsError {
         raw_ref: String,
         tail: String,
         source: uuid::Error,
+    },
+    /// A ref under the plan prefix has a UUID tail that parses but is
+    /// not the canonical lowercase-hyphenated form bailiff would write
+    /// — for example, 32 unhyphenated hex characters or uppercase hex.
+    /// Surfaces the raw ref, the tail as observed on disk, and the
+    /// canonical spelling so the operator can rename or remove the
+    /// offending ref.
+    #[error(
+        "plan ref {raw_ref:?} has non-canonical UUID tail {tail:?}; canonical form is {canonical:?}"
+    )]
+    NonCanonicalRef {
+        raw_ref: String,
+        tail: String,
+        canonical: String,
     },
 }
 
@@ -2644,6 +2675,68 @@ mod list_tests {
                 assert_eq!(tail, "not-a-uuid");
             }
             other => panic!("expected ParseRef, got: {other:?}"),
+        }
+    }
+
+    /// `Uuid::parse_str` accepts non-canonical spellings (uppercase
+    /// hex, 32 unhyphenated hex characters) that `plan_notes_ref`
+    /// never emits. If `list_plan_ids` let those through, the
+    /// downstream `summarize_plan` would re-derive the ref name in
+    /// canonical lowercase-hyphenated form and look there — finding
+    /// nothing and silently hiding the corrupted ref that actually
+    /// carries the notes. Surface them as `NonCanonicalRef` so the
+    /// operator sees which on-disk ref is the offender.
+    #[test]
+    fn list_plan_ids_rejects_uppercase_hex_uuid_tail() {
+        let tmp = TempDir::new().unwrap();
+        let bailiff = bailiff_repo(&tmp);
+        let bad_ref =
+            NotesRef::try_new("refs/notes/bailiff/v1/plans/AAAAAAAA-BBBB-4CCC-8DDD-EEEEEEEEEEEE")
+                .unwrap();
+        bailiff
+            .write_note(&bad_ref, b"seed-bytes", b"body")
+            .unwrap();
+        let err = list_plan_ids(&bailiff).unwrap_err();
+        match err {
+            ListPlanIdsError::NonCanonicalRef {
+                raw_ref,
+                tail,
+                canonical,
+            } => {
+                assert_eq!(
+                    raw_ref,
+                    "refs/notes/bailiff/v1/plans/AAAAAAAA-BBBB-4CCC-8DDD-EEEEEEEEEEEE"
+                );
+                assert_eq!(tail, "AAAAAAAA-BBBB-4CCC-8DDD-EEEEEEEEEEEE");
+                assert_eq!(canonical, "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee");
+            }
+            other => panic!("expected NonCanonicalRef, got: {other:?}"),
+        }
+    }
+
+    /// The other non-canonical spelling `uuid` accepts: 32 hex
+    /// characters without hyphens. Same risk and same fix as the
+    /// uppercase case, separately pinned because the two code paths
+    /// inside `Uuid::parse_str` are independent.
+    #[test]
+    fn list_plan_ids_rejects_unhyphenated_uuid_tail() {
+        let tmp = TempDir::new().unwrap();
+        let bailiff = bailiff_repo(&tmp);
+        let bad_ref =
+            NotesRef::try_new("refs/notes/bailiff/v1/plans/aaaaaaaabbbb4ccc8dddeeeeeeeeeeee")
+                .unwrap();
+        bailiff
+            .write_note(&bad_ref, b"seed-bytes", b"body")
+            .unwrap();
+        let err = list_plan_ids(&bailiff).unwrap_err();
+        match err {
+            ListPlanIdsError::NonCanonicalRef {
+                tail, canonical, ..
+            } => {
+                assert_eq!(tail, "aaaaaaaabbbb4ccc8dddeeeeeeeeeeee");
+                assert_eq!(canonical, "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee");
+            }
+            other => panic!("expected NonCanonicalRef, got: {other:?}"),
         }
     }
 
