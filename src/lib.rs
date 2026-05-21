@@ -18,6 +18,8 @@ pub mod bailiff;
 #[cfg(feature = "host")]
 pub mod bailiff_decision;
 #[cfg(feature = "host")]
+pub mod bailiff_plan_implement;
+#[cfg(feature = "host")]
 pub mod bailiff_plan_note;
 #[cfg(feature = "host")]
 pub mod bailiff_plan_read;
