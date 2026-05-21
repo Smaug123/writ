@@ -64,7 +64,7 @@ use std::process::{Command, ExitStatus, Stdio};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use crate::clean_git::CLEAN_GIT_CONFIG_ENV;
-use crate::core::NotesRef;
+use crate::core::{NotesRef, NotesRefError};
 use crate::vm_git::{GitObjectId, GitObjectIdError};
 
 /// Snapshot of the parent-process environment values that flow into
@@ -486,6 +486,77 @@ impl NotesRepo {
         )?;
         self.read_note_if_present(notes_ref, &target_oid)
     }
+
+    /// Enumerate every ref whose full name starts with `prefix`,
+    /// in git's lexicographic `for-each-ref` order.
+    ///
+    /// Used by reader-side helpers — `bailiff plan list` walks every
+    /// plan-id under `refs/notes/bailiff/v1/plans/` this way. The
+    /// caller passes the trailing slash explicitly: `for-each-ref`
+    /// matches its argument as a literal path prefix when no glob
+    /// chars are present, so `refs/notes/foo/` matches only refs
+    /// inside that directory, not a sibling named `refs/notes/foo2`.
+    ///
+    /// An empty repo or a prefix that matches no refs returns
+    /// `Ok(vec![])` — neither is an error. If git emits a refname
+    /// our [`NotesRef`] validator refuses (the operator-corruption
+    /// case: someone planted a malformed loose ref by hand), the
+    /// helper surfaces it as `ForEachRefRefnameInvalid` rather than
+    /// silently dropping the row, so callers cannot conflate
+    /// "corrupted ref namespace" with "nothing here yet".
+    pub fn list_refs_under_prefix(&self, prefix: &str) -> Result<Vec<NotesRef>, NotesRepoError> {
+        let (stdout, stderr) = run_git_capturing_stderr(
+            &self.canonical_path,
+            ["for-each-ref", "--format=%(refname)", prefix],
+            None,
+            CaptureOutput::Capture,
+            &self.inherited_env,
+        )?;
+        // `git for-each-ref --format=%(refname)` drops a row from
+        // stdout (no `<missing>` placeholder) while writing a
+        // warning to stderr and exiting 0 whenever it can't
+        // enumerate a ref. The known shapes today are:
+        //
+        //   - `warning: ignoring ref with broken name <name>`
+        //     — refname fails check-ref-format (e.g. ASCII
+        //     whitespace, control char, `..` traversal).
+        //   - `warning: ignoring broken ref <name>`
+        //     — refname is fine but the ref's contents won't
+        //     parse as a git object name.
+        //
+        // Without inspecting stderr the helper would return the
+        // surviving rows and silently mask the broken one — which
+        // is exactly the corruption-to-missing-row data loss this
+        // primitive must surface. `for-each-ref` is documented as
+        // silent on success, so we treat any non-empty stderr as
+        // a corruption signal uniformly. That way today's known
+        // shapes and any future-version shape both surface as the
+        // same `ForEachRefStderr` error rather than silently
+        // regressing on the property.
+        let stderr_text = String::from_utf8_lossy(&stderr);
+        let stderr_trimmed = stderr_text.trim();
+        if !stderr_trimmed.is_empty() {
+            return Err(NotesRepoError::ForEachRefStderr {
+                stderr: stderr_trimmed.to_string(),
+            });
+        }
+        let text = String::from_utf8(stdout)
+            .map_err(|source| NotesRepoError::ForEachRefNonUtf8 { source })?;
+        let mut refs = Vec::new();
+        for line in text.lines() {
+            if line.is_empty() {
+                continue;
+            }
+            let nref = NotesRef::try_new(line).map_err(|source| {
+                NotesRepoError::ForEachRefRefnameInvalid {
+                    raw: line.to_string(),
+                    source,
+                }
+            })?;
+            refs.push(nref);
+        }
+        Ok(refs)
+    }
 }
 
 fn validate_bare_layout(path: &Path, env: &InheritedEnv) -> Result<(), NotesRepoError> {
@@ -586,6 +657,37 @@ fn run_git<'a, I>(
 where
     I: IntoIterator<Item = &'a str>,
 {
+    run_git_capturing_stderr(repo, args, stdin_input, capture, env).map(|(stdout, _stderr)| stdout)
+}
+
+/// Variant of [`run_git`] that hands the caller both stdout and the
+/// captured stderr on success. Most callers never need stderr on the
+/// happy path — git prints to it only on warnings — but a few do.
+/// `git for-each-ref` emits `warning: ignoring ref with broken name`
+/// to stderr while exiting 0 when it encounters a loose ref whose
+/// name fails `check-ref-format` (e.g. an operator hand-planted a
+/// refname containing ASCII whitespace). That warning is a corruption
+/// signal we have to surface; discarding stderr on success would let
+/// it masquerade as "no rows here", so this helper exposes the bytes
+/// and the caller decides.
+///
+/// Stdout and stderr are drained concurrently (stderr on a background
+/// thread). A serial drain — read stdout to EOF, then read stderr —
+/// deadlocks if the child fills the stderr pipe buffer before stdout
+/// closes: `git for-each-ref` over a heavily corrupted ref namespace
+/// emits one warning per broken ref and can easily exceed the
+/// platform pipe-buffer size (64KiB on Linux). With parallel drains
+/// neither pipe can ever fill while the other is being read.
+fn run_git_capturing_stderr<'a, I>(
+    repo: &Path,
+    args: I,
+    stdin_input: Option<&[u8]>,
+    capture: CaptureOutput,
+    env: &InheritedEnv,
+) -> Result<(Vec<u8>, Vec<u8>), NotesRepoError>
+where
+    I: IntoIterator<Item = &'a str>,
+{
     let args: Vec<&str> = args.into_iter().collect();
     let mut command = prepare_git_command(repo, env);
     command.args(&args);
@@ -615,16 +717,24 @@ where
         drop(stdin);
     }
 
+    // Drain stderr on a background thread so the child never blocks
+    // writing to a full pipe while the parent is still reading stdout.
+    let stderr_pipe = child.stderr.take();
+    let stderr_handle = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut stderr) = stderr_pipe {
+            let _ = stderr.read_to_end(&mut buf);
+        }
+        buf
+    });
+
     let mut stdout_bytes = Vec::new();
     if let Some(mut stdout) = child.stdout.take() {
         stdout
             .read_to_end(&mut stdout_bytes)
             .map_err(|source| NotesRepoError::GitStdoutRead { source })?;
     }
-    let mut stderr_bytes = Vec::new();
-    if let Some(mut stderr) = child.stderr.take() {
-        let _ = stderr.read_to_end(&mut stderr_bytes);
-    }
+    let stderr_bytes = stderr_handle.join().expect("stderr drain thread panicked");
 
     let status = child
         .wait()
@@ -636,7 +746,7 @@ where
             stderr: String::from_utf8_lossy(&stderr_bytes).into_owned(),
         });
     }
-    Ok(stdout_bytes)
+    Ok((stdout_bytes, stderr_bytes))
 }
 
 fn git_config_get_bool(
@@ -838,6 +948,12 @@ pub enum NotesRepoError {
         status: ExitStatus,
         stderr: String,
     },
+    #[error("git for-each-ref output is not valid UTF-8: {source}")]
+    ForEachRefNonUtf8 { source: std::string::FromUtf8Error },
+    #[error("git for-each-ref returned refname {raw:?} that fails validation: {source}")]
+    ForEachRefRefnameInvalid { raw: String, source: NotesRefError },
+    #[error("git for-each-ref wrote to stderr (corruption signal): {stderr}")]
+    ForEachRefStderr { stderr: String },
 }
 
 #[cfg(test)]
@@ -1616,5 +1732,200 @@ mod tests {
             before, after,
             "read_note_at_seed must not write seed blobs (before={before}, after={after})",
         );
+    }
+
+    #[test]
+    fn list_refs_under_prefix_returns_empty_vec_on_empty_repo() {
+        let tmp = TempDir::new().unwrap();
+        let repo = NotesRepo::init_or_open(tmp.path().join("r")).unwrap();
+        let refs = repo
+            .list_refs_under_prefix("refs/notes/bailiff/v1/plans/")
+            .unwrap();
+        assert!(refs.is_empty(), "expected empty vec, got: {refs:?}");
+    }
+
+    #[test]
+    fn list_refs_under_prefix_returns_refs_lexicographically_sorted() {
+        let tmp = TempDir::new().unwrap();
+        let repo = NotesRepo::init_or_open(tmp.path().join("r")).unwrap();
+        let ref_c = NotesRef::try_new("refs/notes/bailiff/v1/plans/plan-c").unwrap();
+        let ref_a = NotesRef::try_new("refs/notes/bailiff/v1/plans/plan-a").unwrap();
+        let ref_b = NotesRef::try_new("refs/notes/bailiff/v1/plans/plan-b").unwrap();
+        // Write in non-sorted order so the assertion pins git's
+        // lexicographic default rather than insertion order.
+        let _ = repo.write_note(&ref_c, b"seed-c", b"body-c").unwrap();
+        let _ = repo.write_note(&ref_a, b"seed-a", b"body-a").unwrap();
+        let _ = repo.write_note(&ref_b, b"seed-b", b"body-b").unwrap();
+        let refs = repo
+            .list_refs_under_prefix("refs/notes/bailiff/v1/plans/")
+            .unwrap();
+        assert_eq!(refs, vec![ref_a, ref_b, ref_c]);
+    }
+
+    #[test]
+    fn list_refs_under_prefix_excludes_refs_outside_prefix() {
+        let tmp = TempDir::new().unwrap();
+        let repo = NotesRepo::init_or_open(tmp.path().join("r")).unwrap();
+        let in_prefix = NotesRef::try_new("refs/notes/bailiff/v1/plans/plan-a").unwrap();
+        let outside = NotesRef::try_new("refs/notes/writ/v1/agent-outputs").unwrap();
+        let _ = repo.write_note(&in_prefix, b"seed-in", b"body-in").unwrap();
+        let _ = repo.write_note(&outside, b"seed-out", b"body-out").unwrap();
+        let refs = repo
+            .list_refs_under_prefix("refs/notes/bailiff/v1/plans/")
+            .unwrap();
+        assert_eq!(refs, vec![in_prefix]);
+    }
+
+    #[test]
+    fn list_refs_under_prefix_returns_empty_vec_on_no_match() {
+        let tmp = TempDir::new().unwrap();
+        let repo = NotesRepo::init_or_open(tmp.path().join("r")).unwrap();
+        // Populate a different namespace so the repo isn't empty —
+        // we want to assert the prefix filter, not the empty-repo
+        // case (already covered in a sibling test).
+        let nref = NotesRef::try_new("refs/notes/writ/v1/agent-outputs").unwrap();
+        let _ = repo.write_note(&nref, b"seed", b"body").unwrap();
+        let refs = repo
+            .list_refs_under_prefix("refs/notes/bailiff/v1/plans/")
+            .unwrap();
+        assert!(refs.is_empty(), "expected empty vec, got: {refs:?}");
+    }
+
+    #[test]
+    fn list_refs_under_prefix_surfaces_broken_refname_warning_as_error() {
+        // Branch 1 of the stderr-warning property: a loose ref with
+        // a name git's check-ref-format rejects (ASCII whitespace).
+        // `git for-each-ref` emits
+        // `warning: ignoring ref with broken name <name>` to stderr
+        // and exits 0; without inspecting stderr the helper would
+        // return only the surviving valid rows and pretend nothing
+        // was missing. Pin that the warning surfaces as
+        // `ForEachRefStderr` so corruption never masquerades as
+        // "missing row".
+        let tmp = TempDir::new().unwrap();
+        let repo = NotesRepo::init_or_open(tmp.path().join("r")).unwrap();
+        let valid_ref = NotesRef::try_new("refs/notes/bailiff/v1/plans/sentinel").unwrap();
+        let real_oid = repo.write_note(&valid_ref, b"seed", b"body").unwrap();
+        let plans_dir = repo.path().join("refs/notes/bailiff/v1/plans");
+        fs::create_dir_all(&plans_dir).unwrap();
+        fs::write(
+            plans_dir.join("has space"),
+            format!("{}\n", real_oid.as_str()),
+        )
+        .unwrap();
+        let err = repo
+            .list_refs_under_prefix("refs/notes/bailiff/v1/plans/")
+            .unwrap_err();
+        match &err {
+            NotesRepoError::ForEachRefStderr { stderr } => {
+                assert!(
+                    stderr.contains("broken name"),
+                    "expected the broken-name warning, got: {stderr:?}",
+                );
+            }
+            other => panic!("expected ForEachRefStderr, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn list_refs_under_prefix_does_not_deadlock_on_many_warnings() {
+        // Pipe-buffer-fill regression. Each broken-ref warning git
+        // writes to stderr is ~80 bytes; the Linux default pipe
+        // buffer is 64 KiB, so on the order of 800 warnings is
+        // enough to fill it. Plant well over that many so git's
+        // stderr pipe fills before stdout closes — without the
+        // concurrent stderr drain in `run_git_capturing_stderr` the
+        // child blocks on its next stderr write, parent waits on
+        // stdout forever, classic pipe-buffer deadlock. The test
+        // asserts the call returns at all; a regression manifests
+        // as the test-suite timeout. With the drain, it returns
+        // promptly with `ForEachRefStderr`.
+        let tmp = TempDir::new().unwrap();
+        let repo = NotesRepo::init_or_open(tmp.path().join("r")).unwrap();
+        let plans_dir = repo.path().join("refs/notes/bailiff/v1/plans");
+        fs::create_dir_all(&plans_dir).unwrap();
+        for i in 0..3000 {
+            fs::write(plans_dir.join(format!("bad-{i:04}")), "not-an-oid\n").unwrap();
+        }
+        let err = repo
+            .list_refs_under_prefix("refs/notes/bailiff/v1/plans/")
+            .unwrap_err();
+        match &err {
+            NotesRepoError::ForEachRefStderr { .. } => {}
+            other => panic!("expected ForEachRefStderr, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn list_refs_under_prefix_surfaces_broken_ref_contents_warning_as_error() {
+        // Branch 2 of the stderr-warning property: a loose ref whose
+        // name is fine but whose contents aren't a parseable OID.
+        // `git for-each-ref` emits
+        // `warning: ignoring broken ref <name>` to stderr and exits
+        // 0, dropping the row from stdout. This is a separate git
+        // shape from the broken-name case, and the previous narrow
+        // match-on-substring would have missed it; pin that we
+        // surface this too as `ForEachRefStderr` — the load-bearing
+        // property is "any non-empty for-each-ref stderr means
+        // corruption", not the specific phrasing.
+        let tmp = TempDir::new().unwrap();
+        let repo = NotesRepo::init_or_open(tmp.path().join("r")).unwrap();
+        let plans_dir = repo.path().join("refs/notes/bailiff/v1/plans");
+        fs::create_dir_all(&plans_dir).unwrap();
+        // Refname is fine; the contents (where the OID should live)
+        // are not. git emits `ignoring broken ref` for this case.
+        fs::write(plans_dir.join("bad-contents"), "not-an-oid\n").unwrap();
+        let err = repo
+            .list_refs_under_prefix("refs/notes/bailiff/v1/plans/")
+            .unwrap_err();
+        match &err {
+            NotesRepoError::ForEachRefStderr { stderr } => {
+                assert!(
+                    stderr.contains("broken ref"),
+                    "expected the broken-ref-contents warning, got: {stderr:?}",
+                );
+            }
+            other => panic!("expected ForEachRefStderr, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn list_refs_under_prefix_surfaces_corruption_as_error() {
+        // Operator-corruption case: someone plants a loose ref whose
+        // name contains a non-ASCII whitespace character (U+00A0,
+        // NBSP). Git's refname rules forbid ASCII whitespace, but
+        // its loose-ref scanner walks the filesystem and doesn't
+        // re-validate names against check-ref-format; `for-each-ref
+        // --format=%(refname)` will happily emit a name our
+        // `NotesRef::try_new` refuses. The helper must surface that
+        // as `ForEachRefRefnameInvalid` rather than silently
+        // dropping the row — operators must never have corruption
+        // masquerade as "no rows here".
+        let tmp = TempDir::new().unwrap();
+        let repo = NotesRepo::init_or_open(tmp.path().join("r")).unwrap();
+        // Write a real note first to get a valid OID the bad loose
+        // ref can point at — git's loose-ref reader rejects a
+        // ref whose contents aren't a parseable OID, but accepts
+        // any 40-hex string regardless of whether that object
+        // exists locally.
+        let valid_ref = NotesRef::try_new("refs/notes/bailiff/v1/plans/sentinel").unwrap();
+        let real_oid = repo.write_note(&valid_ref, b"seed", b"body").unwrap();
+        let plans_dir = repo.path().join("refs/notes/bailiff/v1/plans");
+        fs::create_dir_all(&plans_dir).unwrap();
+        let bad_name = "has\u{00a0}nbsp";
+        fs::write(plans_dir.join(bad_name), format!("{}\n", real_oid.as_str())).unwrap();
+        let err = repo
+            .list_refs_under_prefix("refs/notes/bailiff/v1/plans/")
+            .unwrap_err();
+        match &err {
+            NotesRepoError::ForEachRefRefnameInvalid { raw, .. } => {
+                assert!(
+                    raw.contains('\u{00a0}'),
+                    "expected raw refname to carry the NBSP, got: {raw:?}",
+                );
+            }
+            NotesRepoError::GitFailed { .. } => {}
+            other => panic!("expected corruption-surfaced error, got: {other:?}"),
+        }
     }
 }
