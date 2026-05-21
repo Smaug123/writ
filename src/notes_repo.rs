@@ -505,13 +505,29 @@ impl NotesRepo {
     /// silently dropping the row, so callers cannot conflate
     /// "corrupted ref namespace" with "nothing here yet".
     pub fn list_refs_under_prefix(&self, prefix: &str) -> Result<Vec<NotesRef>, NotesRepoError> {
-        let stdout = run_git(
+        let (stdout, stderr) = run_git_capturing_stderr(
             &self.canonical_path,
             ["for-each-ref", "--format=%(refname)", prefix],
             None,
             CaptureOutput::Capture,
             &self.inherited_env,
         )?;
+        // Git emits `warning: ignoring ref with broken name <name>`
+        // to stderr (and exits 0) when it encounters a loose ref
+        // whose name fails check-ref-format — the ASCII-whitespace
+        // / control-char branch of operator corruption. Without
+        // checking stderr we'd return the surviving rows and
+        // silently mask the broken one; surface the warning as an
+        // explicit error so a corrupted namespace cannot pose as
+        // "nothing here yet". The check is on the specific phrase
+        // because git emits other warnings on success that aren't
+        // corruption signals.
+        let stderr_text = String::from_utf8_lossy(&stderr);
+        if stderr_text.contains("ignoring ref with broken name") {
+            return Err(NotesRepoError::ForEachRefBrokenRef {
+                stderr: stderr_text.into_owned(),
+            });
+        }
         let text = String::from_utf8(stdout)
             .map_err(|source| NotesRepoError::ForEachRefNonUtf8 { source })?;
         let mut refs = Vec::new();
@@ -629,6 +645,29 @@ fn run_git<'a, I>(
 where
     I: IntoIterator<Item = &'a str>,
 {
+    run_git_capturing_stderr(repo, args, stdin_input, capture, env).map(|(stdout, _stderr)| stdout)
+}
+
+/// Variant of [`run_git`] that hands the caller both stdout and the
+/// captured stderr on success. Most callers never need stderr on the
+/// happy path — git prints to it only on warnings — but a few do.
+/// `git for-each-ref` emits `warning: ignoring ref with broken name`
+/// to stderr while exiting 0 when it encounters a loose ref whose
+/// name fails `check-ref-format` (e.g. an operator hand-planted a
+/// refname containing ASCII whitespace). That warning is a corruption
+/// signal we have to surface; discarding stderr on success would let
+/// it masquerade as "no rows here", so this helper exposes the bytes
+/// and the caller decides.
+fn run_git_capturing_stderr<'a, I>(
+    repo: &Path,
+    args: I,
+    stdin_input: Option<&[u8]>,
+    capture: CaptureOutput,
+    env: &InheritedEnv,
+) -> Result<(Vec<u8>, Vec<u8>), NotesRepoError>
+where
+    I: IntoIterator<Item = &'a str>,
+{
     let args: Vec<&str> = args.into_iter().collect();
     let mut command = prepare_git_command(repo, env);
     command.args(&args);
@@ -679,7 +718,7 @@ where
             stderr: String::from_utf8_lossy(&stderr_bytes).into_owned(),
         });
     }
-    Ok(stdout_bytes)
+    Ok((stdout_bytes, stderr_bytes))
 }
 
 fn git_config_get_bool(
@@ -885,6 +924,8 @@ pub enum NotesRepoError {
     ForEachRefNonUtf8 { source: std::string::FromUtf8Error },
     #[error("git for-each-ref returned refname {raw:?} that fails validation: {source}")]
     ForEachRefRefnameInvalid { raw: String, source: NotesRefError },
+    #[error("git for-each-ref reported a broken ref name: {stderr}")]
+    ForEachRefBrokenRef { stderr: String },
 }
 
 #[cfg(test)]
@@ -1720,6 +1761,45 @@ mod tests {
             .list_refs_under_prefix("refs/notes/bailiff/v1/plans/")
             .unwrap();
         assert!(refs.is_empty(), "expected empty vec, got: {refs:?}");
+    }
+
+    #[test]
+    fn list_refs_under_prefix_surfaces_broken_ref_warning_as_error() {
+        // Operator-corruption case: someone plants a loose ref whose
+        // name contains ASCII whitespace, which git's check-ref-format
+        // rejects. `git for-each-ref` emits
+        // `warning: ignoring ref with broken name <name>` to stderr
+        // and exits 0; without inspecting stderr the helper would
+        // return the surviving valid rows and pretend nothing is
+        // wrong. Pin that the warning surfaces as
+        // `ForEachRefBrokenRef`, so corruption never masquerades as
+        // "missing row" — which would be silent data loss from the
+        // operator's perspective.
+        let tmp = TempDir::new().unwrap();
+        let repo = NotesRepo::init_or_open(tmp.path().join("r")).unwrap();
+        let valid_ref = NotesRef::try_new("refs/notes/bailiff/v1/plans/sentinel").unwrap();
+        let real_oid = repo.write_note(&valid_ref, b"seed", b"body").unwrap();
+        let plans_dir = repo.path().join("refs/notes/bailiff/v1/plans");
+        fs::create_dir_all(&plans_dir).unwrap();
+        // ASCII space in the name triggers check-ref-format's
+        // rejection.
+        fs::write(
+            plans_dir.join("has space"),
+            format!("{}\n", real_oid.as_str()),
+        )
+        .unwrap();
+        let err = repo
+            .list_refs_under_prefix("refs/notes/bailiff/v1/plans/")
+            .unwrap_err();
+        match &err {
+            NotesRepoError::ForEachRefBrokenRef { stderr } => {
+                assert!(
+                    stderr.contains("ignoring ref with broken name"),
+                    "expected the broken-name warning, got: {stderr:?}",
+                );
+            }
+            other => panic!("expected ForEachRefBrokenRef, got: {other:?}"),
+        }
     }
 
     #[test]
