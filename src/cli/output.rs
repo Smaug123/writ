@@ -221,6 +221,15 @@ pub fn write_plan_detail(out: &mut dyn Write, plan: &PlanDetail) -> std::io::Res
 /// `<none>` is emitted unconditionally for absent fields rather than
 /// silently elided so operators can distinguish "key missing because
 /// no value" from "key missing because the formatter regressed."
+///
+/// `purpose` and `decision_decider` are free-form text — `--purpose`
+/// accepts arbitrary strings, and `Decider::try_new` rejects only
+/// embedded NUL. Both are routed through [`write_inline_value`], which
+/// emits a bare token when the value is safe and a double-quoted,
+/// backslash-escaped token when it contains newlines, carriage
+/// returns, backslashes, double quotes, or matches the literal
+/// `<none>` sentinel. This keeps each plan block parseable as one
+/// line per key even when persisted metadata is adversarial.
 pub fn write_bailiff_plan_list(
     out: &mut dyn Write,
     plans: &[BailiffPlanSummary],
@@ -237,7 +246,8 @@ pub fn write_bailiff_plan_list(
         writeln!(out, "state={}", plan.state())?;
         match &plan.submission {
             Some(s) => {
-                writeln!(out, "purpose={}", s.purpose)?;
+                write!(out, "purpose=")?;
+                write_inline_value(out, &s.purpose)?;
                 writeln!(out, "submitted_at={}", s.submitted_at.as_millis())?;
             }
             None => {
@@ -248,7 +258,8 @@ pub fn write_bailiff_plan_list(
         match &plan.decision {
             Some(d) => {
                 writeln!(out, "decision_outcome={}", d.outcome)?;
-                writeln!(out, "decision_decider={}", d.decider.as_str())?;
+                write!(out, "decision_decider=")?;
+                write_inline_value(out, d.decider.as_str())?;
                 writeln!(out, "decided_at={}", d.decided_at.as_millis())?;
             }
             None => {
@@ -267,6 +278,40 @@ pub fn write_bailiff_plan_list(
         }
     }
     Ok(())
+}
+
+/// Inline writer for free-form text values that share a line with their
+/// `key=` prefix. Writes a single line terminated by `\n`.
+///
+/// Bare form: emit the raw value verbatim when it is a single line free
+/// of backslashes, double quotes, and not equal to the `<none>`
+/// sentinel. This keeps validated/well-behaved values readable.
+///
+/// Quoted form: when the value would otherwise break the one-line-per-
+/// key invariant or collide with `<none>`, wrap in double quotes and
+/// backslash-escape `\`, `"`, `\n`, `\r`. The leading `"` is the
+/// unambiguous marker that the value is escaped; consumers can detect
+/// the quoted form by inspecting the first byte after `=` and reverse
+/// the escapes if they need the original string.
+fn write_inline_value(out: &mut dyn Write, value: &str) -> std::io::Result<()> {
+    let needs_quoting = value == "<none>"
+        || value
+            .bytes()
+            .any(|b| matches!(b, b'\n' | b'\r' | b'\\' | b'"'));
+    if !needs_quoting {
+        return writeln!(out, "{value}");
+    }
+    out.write_all(b"\"")?;
+    for ch in value.chars() {
+        match ch {
+            '\\' => out.write_all(b"\\\\")?,
+            '"' => out.write_all(b"\\\"")?,
+            '\n' => out.write_all(b"\\n")?,
+            '\r' => out.write_all(b"\\r")?,
+            c => write!(out, "{c}")?,
+        }
+    }
+    writeln!(out, "\"")
 }
 
 pub fn write_agent_vm_sessions(
@@ -1379,6 +1424,88 @@ mod tests {
         );
         assert!(rendered.starts_with("plan_id=11111111-"));
         assert!(rendered.contains("\nplan_id=22222222-"));
+    }
+
+    /// `purpose` accepts arbitrary `--purpose` input, and `Decider`
+    /// rejects only embedded NUL — neither restricts newlines or the
+    /// literal `<none>` sentinel. Without escaping, a purpose
+    /// containing `\npurpose=injected\nplan_id=fake-id` would forge a
+    /// new key=value block and split one plan row into two, and a
+    /// decider literally equal to `<none>` would be indistinguishable
+    /// from absence. Pins the quoted-form output so a regression that
+    /// reverted to bare `key=value` for free-form text would surface
+    /// here.
+    #[test]
+    fn bailiff_plan_list_quotes_purpose_and_decider_with_injection_characters() {
+        use crate::bailiff_decision::{Decider, Decision};
+        use crate::bailiff_plan_note::PlanId;
+        use crate::bailiff_plan_read::{BailiffPlanSummary, DecisionSummary, SubmissionSummary};
+
+        let summary = BailiffPlanSummary {
+            plan_id: PlanId::from_uuid("33333333-3333-4333-8333-333333333333".parse().unwrap()),
+            submission: Some(SubmissionSummary {
+                purpose: "line1\nplan_id=forged\nline3".into(),
+                submitted_at: UnixMillis::from_millis(10),
+            }),
+            decision: Some(DecisionSummary {
+                outcome: Decision::Accepted,
+                decider: Decider::try_new("<none>").unwrap(),
+                decided_at: UnixMillis::from_millis(20),
+            }),
+            reviewed_at: None,
+            implemented_at: None,
+        };
+        let mut out = Vec::new();
+        write_bailiff_plan_list(&mut out, &[summary]).unwrap();
+        let rendered = String::from_utf8(out).unwrap();
+        // The forged-newline purpose round-trips as one quoted line.
+        assert!(
+            rendered.contains("\npurpose=\"line1\\nplan_id=forged\\nline3\"\n"),
+            "expected escaped purpose, got: {rendered}"
+        );
+        // The literal-`<none>` decider is distinguishable from absence
+        // because the quoted form starts with `"`.
+        assert!(
+            rendered.contains("\ndecision_decider=\"<none>\"\n"),
+            "expected quoted decider, got: {rendered}"
+        );
+        // Sanity: exactly one line *starts* with `plan_id=`. The
+        // forged `plan_id=forged` substring survives inside the
+        // quoted purpose value, but it is no longer at the start of
+        // a line, so the framing is unambiguous to a consumer that
+        // tokenises by `\n` first.
+        let plan_id_line_count = rendered
+            .lines()
+            .filter(|line| line.starts_with("plan_id="))
+            .count();
+        assert_eq!(plan_id_line_count, 1, "got: {rendered}");
+    }
+
+    /// A purpose containing characters that need quoting — backslash,
+    /// double quote, carriage return — round-trips through the escape
+    /// table. Pins each escape so the quoted form is reversible.
+    #[test]
+    fn bailiff_plan_list_escapes_backslash_quote_and_carriage_return() {
+        use crate::bailiff_plan_note::PlanId;
+        use crate::bailiff_plan_read::{BailiffPlanSummary, SubmissionSummary};
+
+        let summary = BailiffPlanSummary {
+            plan_id: PlanId::from_uuid("44444444-4444-4444-8444-444444444444".parse().unwrap()),
+            submission: Some(SubmissionSummary {
+                purpose: "a\\b\"c\rd".into(),
+                submitted_at: UnixMillis::from_millis(1),
+            }),
+            decision: None,
+            reviewed_at: None,
+            implemented_at: None,
+        };
+        let mut out = Vec::new();
+        write_bailiff_plan_list(&mut out, &[summary]).unwrap();
+        let rendered = String::from_utf8(out).unwrap();
+        assert!(
+            rendered.contains("\npurpose=\"a\\\\b\\\"c\\rd\"\n"),
+            "expected escapes for backslash, quote, and CR; got: {rendered}"
+        );
     }
 
     /// The `Corrupt` state — submission missing but other notes
