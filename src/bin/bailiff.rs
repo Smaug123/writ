@@ -29,11 +29,11 @@ use tokio::sync::Mutex as AsyncMutex;
 use writ::agent_run::AgentPrompt;
 use writ::bailiff_decision::{Decider, Decision};
 use writ::bailiff_plan_note::{DecisionNote, PlanId};
-use writ::bailiff_plan_read::{list_plan_ids, summarize_plan};
+use writ::bailiff_plan_read::{list_plan_ids, read_full_plan, summarize_plan};
 use writ::bailiff_plan_review::{SubmitReviewError, SubmitReviewInputs, submit_review};
 use writ::bailiff_plan_submit::{SubmitPlanInputs, submit_plan};
 use writ::bailiff_plan_write::{WriteDecisionNoteError, WriteReviewNoteError, write_decision_note};
-use writ::cli::output::write_bailiff_plan_list;
+use writ::cli::output::{write_bailiff_plan_list, write_bailiff_plan_show};
 use writ::core::{AgentKind, CapabilitySet, NotesRef, RepoRef, UnixMillis};
 use writ::notes_repo::NotesRepo;
 use writ::run_verify::AllowedSigners;
@@ -257,6 +257,40 @@ enum PlanCmd {
         #[arg(long)]
         bailiff_repo: Option<PathBuf>,
     },
+    /// Render every available note for one plan, verifying the
+    /// writ-side envelope per signed section. Reads bailiff's own
+    /// notes plus bailiff's local copy of writ's
+    /// `refs/notes/writ/v1/agent-outputs`; does NOT touch the writ
+    /// socket and does NOT fetch from writ. If the operator wants
+    /// "show what's on writ right now," they should re-run the
+    /// relevant `submit*` verb to bring fresh envelopes across.
+    ///
+    /// Slice F's per-plan read verb. Sections render in a fixed
+    /// order — Plan / Decision / Review / Implement — each headed by
+    /// its verification status; missing-because-not-yet-written
+    /// sections render with an explicit `<none>` and a
+    /// missing-because-not-fetched section renders with the failure
+    /// noted explicitly (see `VerifiedSection`).
+    Show {
+        /// Plan to render. Must parse as the canonical UUID form
+        /// `PlanId` prints. Matches `decide` and `review`'s flag
+        /// shape rather than taking the id as a positional, so the
+        /// three per-plan verbs feel consistent.
+        #[arg(long)]
+        plan_id: PlanId,
+        /// OpenSSH `allowed_signers` file enumerating which writ
+        /// signing keys bailiff will accept envelopes from. Used by
+        /// every signed section's verification step.
+        #[arg(long)]
+        writ_allowed_signers: PathBuf,
+        /// Path to bailiff's bare git repo. Defaults to
+        /// `$XDG_DATA_HOME/bailiff/repo` (or
+        /// `~/.local/share/bailiff/repo` if `XDG_DATA_HOME` is
+        /// unset). Created on first use via
+        /// [`NotesRepo::init_or_open`].
+        #[arg(long)]
+        bailiff_repo: Option<PathBuf>,
+    },
 }
 
 fn parse_agent_kind(raw: &str) -> Result<AgentKind, String> {
@@ -346,6 +380,11 @@ async fn dispatch(cmd: Cmd, socket_path: PathBuf) -> Result<(), Box<dyn std::err
                 .await
             }
             PlanCmd::List { bailiff_repo } => plan_list(bailiff_repo).await,
+            PlanCmd::Show {
+                plan_id,
+                writ_allowed_signers,
+                bailiff_repo,
+            } => plan_show(plan_id, writ_allowed_signers, bailiff_repo).await,
         },
     }
 }
@@ -660,6 +699,75 @@ enum ListError {
 impl From<writ::notes_repo::NotesRepoError> for ListError {
     fn from(e: writ::notes_repo::NotesRepoError) -> Self {
         ListError::OpenRepo(e)
+    }
+}
+
+async fn plan_show(
+    plan_id: PlanId,
+    writ_allowed_signers: PathBuf,
+    bailiff_repo: Option<PathBuf>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Pre-RPC discipline: read & parse the allowed-signers file
+    // before any git work, so a bad path or malformed file surfaces
+    // before bailiff opens its repo.
+    let allowed_signers_text = std::fs::read_to_string(&writ_allowed_signers).map_err(|e| {
+        format!(
+            "reading writ allowed-signers file {}: {e}",
+            writ_allowed_signers.display()
+        )
+    })?;
+    let allowed = AllowedSigners::from_openssh_lines(&allowed_signers_text).map_err(|e| {
+        format!(
+            "parsing writ allowed-signers file {}: {e}",
+            writ_allowed_signers.display()
+        )
+    })?;
+
+    let bailiff_repo_path = bailiff_repo.unwrap_or_else(default_bailiff_repo_path);
+
+    // Both `init_or_open` and `read_full_plan` shell out to git; do
+    // them on a blocking thread so the runtime stays responsive
+    // (mirrors `plan_list`). The pure-data result (`PlanFullView`) is
+    // what we hand to the formatter on the runtime thread.
+    let bailiff_repo_path_for_task = bailiff_repo_path.clone();
+    let result: Result<_, ShowError> = tokio::task::spawn_blocking(move || {
+        let repo = NotesRepo::init_or_open(bailiff_repo_path_for_task)?;
+        read_full_plan(&repo, plan_id, &allowed).map_err(ShowError::ReadFullPlan)
+    })
+    .await
+    .map_err(|e| format!("show task failed: {e}"))?;
+
+    let view = match result {
+        Ok(v) => v,
+        Err(ShowError::OpenRepo(e)) => {
+            return Err(format!(
+                "opening bailiff repo at {}: {e}",
+                bailiff_repo_path.display()
+            )
+            .into());
+        }
+        Err(ShowError::ReadFullPlan(e)) => return Err(format!("reading plan: {e}").into()),
+    };
+
+    let stdout = std::io::stdout();
+    let mut handle = stdout.lock();
+    write_bailiff_plan_show(&mut handle, &view)?;
+    Ok(())
+}
+
+/// Tagged failure modes for the `spawn_blocking` show closure. Mirrors
+/// `ListError` / `DecideError`'s pattern: tag enough to give the
+/// post-await arm a specific error message rather than collapsing
+/// everything into a single string. Local to this binary; not a wire
+/// contract.
+enum ShowError {
+    OpenRepo(writ::notes_repo::NotesRepoError),
+    ReadFullPlan(writ::bailiff_plan_read::ReadFullPlanError),
+}
+
+impl From<writ::notes_repo::NotesRepoError> for ShowError {
+    fn from(e: writ::notes_repo::NotesRepoError) -> Self {
+        ShowError::OpenRepo(e)
     }
 }
 
@@ -1324,6 +1432,134 @@ mod tests {
         assert_eq!(
             bailiff_repo.as_deref(),
             Some(std::path::Path::new("/var/bailiff"))
+        );
+    }
+
+    /// `bailiff plan show` parses the minimum required flag set
+    /// (`--plan-id`, `--writ-allowed-signers`) and threads each
+    /// argument into the corresponding field. Pins the clap surface
+    /// so a renamed flag surfaces here rather than as a confused
+    /// operator running into an unknown-argument message.
+    #[test]
+    fn plan_show_parses_minimum_required_flags() {
+        let plan_id_str = "5d5d5d5d-6d6d-7d7d-8d8d-9d9d9d9d9d9d";
+        let args = Args::try_parse_from([
+            "bailiff",
+            "plan",
+            "show",
+            "--plan-id",
+            plan_id_str,
+            "--writ-allowed-signers",
+            "/etc/bailiff/allowed_signers",
+        ])
+        .unwrap();
+        let Cmd::Plan {
+            action:
+                PlanCmd::Show {
+                    plan_id,
+                    writ_allowed_signers,
+                    bailiff_repo,
+                },
+        } = args.cmd
+        else {
+            panic!("expected PlanCmd::Show");
+        };
+        assert_eq!(plan_id.to_string(), plan_id_str);
+        assert_eq!(
+            writ_allowed_signers,
+            PathBuf::from("/etc/bailiff/allowed_signers")
+        );
+        assert!(bailiff_repo.is_none());
+    }
+
+    /// `--bailiff-repo` round-trips for `show`. Pins the optional-flag
+    /// contract; scripted callers that override the default path
+    /// depend on this.
+    #[test]
+    fn plan_show_accepts_bailiff_repo_override() {
+        let plan_id_str = "6d6d6d6d-7d7d-8d8d-9d9d-1e1e1e1e1e1e";
+        let args = Args::try_parse_from([
+            "bailiff",
+            "plan",
+            "show",
+            "--plan-id",
+            plan_id_str,
+            "--writ-allowed-signers",
+            "/etc/bailiff/allowed_signers",
+            "--bailiff-repo",
+            "/var/bailiff",
+        ])
+        .unwrap();
+        let Cmd::Plan {
+            action: PlanCmd::Show { bailiff_repo, .. },
+        } = args.cmd
+        else {
+            panic!("expected PlanCmd::Show");
+        };
+        assert_eq!(
+            bailiff_repo.as_deref(),
+            Some(std::path::Path::new("/var/bailiff"))
+        );
+    }
+
+    /// `--plan-id` is required. A regression that made it optional
+    /// (a copy-paste of `plan submit`'s opt-in shape) would silently
+    /// accept this and reach `plan_show` with a `None` id.
+    #[test]
+    fn plan_show_rejects_missing_plan_id() {
+        let err = Args::try_parse_from([
+            "bailiff",
+            "plan",
+            "show",
+            "--writ-allowed-signers",
+            "/etc/bailiff/allowed_signers",
+        ])
+        .err()
+        .expect("expected parse error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--plan-id") || msg.contains("required"),
+            "expected missing-plan-id failure, got: {msg}",
+        );
+    }
+
+    /// `--writ-allowed-signers` is required. A regression that made
+    /// it optional would let `plan_show` reach the on-disk read with
+    /// a `None` path; pin the contract here at the parser tier.
+    #[test]
+    fn plan_show_rejects_missing_writ_allowed_signers() {
+        let plan_id_str = "7d7d7d7d-8d8d-9d9d-1e1e-2e2e2e2e2e2e";
+        let err = Args::try_parse_from(["bailiff", "plan", "show", "--plan-id", plan_id_str])
+            .err()
+            .expect("expected parse error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--writ-allowed-signers") || msg.contains("required"),
+            "expected missing-writ-allowed-signers failure, got: {msg}",
+        );
+    }
+
+    /// `PlanId::from_str` runs at parse, so a malformed UUID is a
+    /// parse error rather than a runtime failure inside `plan_show`.
+    /// Pins that the value_parser stays wired to the validating
+    /// constructor.
+    #[test]
+    fn plan_show_rejects_malformed_plan_id() {
+        let err = Args::try_parse_from([
+            "bailiff",
+            "plan",
+            "show",
+            "--plan-id",
+            "not-a-uuid",
+            "--writ-allowed-signers",
+            "/etc/bailiff/allowed_signers",
+        ])
+        .err()
+        .expect("expected parse error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--plan-id") || msg.contains("uuid") || msg.contains("UUID"),
+            "expected malformed-plan-id failure, got: {msg}",
         );
     }
 
