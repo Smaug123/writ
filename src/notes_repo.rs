@@ -670,6 +670,14 @@ where
 /// signal we have to surface; discarding stderr on success would let
 /// it masquerade as "no rows here", so this helper exposes the bytes
 /// and the caller decides.
+///
+/// Stdout and stderr are drained concurrently (stderr on a background
+/// thread). A serial drain — read stdout to EOF, then read stderr —
+/// deadlocks if the child fills the stderr pipe buffer before stdout
+/// closes: `git for-each-ref` over a heavily corrupted ref namespace
+/// emits one warning per broken ref and can easily exceed the
+/// platform pipe-buffer size (64KiB on Linux). With parallel drains
+/// neither pipe can ever fill while the other is being read.
 fn run_git_capturing_stderr<'a, I>(
     repo: &Path,
     args: I,
@@ -709,16 +717,24 @@ where
         drop(stdin);
     }
 
+    // Drain stderr on a background thread so the child never blocks
+    // writing to a full pipe while the parent is still reading stdout.
+    let stderr_pipe = child.stderr.take();
+    let stderr_handle = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut stderr) = stderr_pipe {
+            let _ = stderr.read_to_end(&mut buf);
+        }
+        buf
+    });
+
     let mut stdout_bytes = Vec::new();
     if let Some(mut stdout) = child.stdout.take() {
         stdout
             .read_to_end(&mut stdout_bytes)
             .map_err(|source| NotesRepoError::GitStdoutRead { source })?;
     }
-    let mut stderr_bytes = Vec::new();
-    if let Some(mut stderr) = child.stderr.take() {
-        let _ = stderr.read_to_end(&mut stderr_bytes);
-    }
+    let stderr_bytes = stderr_handle.join().expect("stderr drain thread panicked");
 
     let status = child
         .wait()
@@ -1807,6 +1823,35 @@ mod tests {
                     "expected the broken-name warning, got: {stderr:?}",
                 );
             }
+            other => panic!("expected ForEachRefStderr, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn list_refs_under_prefix_does_not_deadlock_on_many_warnings() {
+        // Pipe-buffer-fill regression. Each broken-ref warning git
+        // writes to stderr is ~80 bytes; the Linux default pipe
+        // buffer is 64 KiB, so on the order of 800 warnings is
+        // enough to fill it. Plant well over that many so git's
+        // stderr pipe fills before stdout closes — without the
+        // concurrent stderr drain in `run_git_capturing_stderr` the
+        // child blocks on its next stderr write, parent waits on
+        // stdout forever, classic pipe-buffer deadlock. The test
+        // asserts the call returns at all; a regression manifests
+        // as the test-suite timeout. With the drain, it returns
+        // promptly with `ForEachRefStderr`.
+        let tmp = TempDir::new().unwrap();
+        let repo = NotesRepo::init_or_open(tmp.path().join("r")).unwrap();
+        let plans_dir = repo.path().join("refs/notes/bailiff/v1/plans");
+        fs::create_dir_all(&plans_dir).unwrap();
+        for i in 0..3000 {
+            fs::write(plans_dir.join(format!("bad-{i:04}")), "not-an-oid\n").unwrap();
+        }
+        let err = repo
+            .list_refs_under_prefix("refs/notes/bailiff/v1/plans/")
+            .unwrap_err();
+        match &err {
+            NotesRepoError::ForEachRefStderr { .. } => {}
             other => panic!("expected ForEachRefStderr, got: {other:?}"),
         }
     }
