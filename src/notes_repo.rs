@@ -64,7 +64,7 @@ use std::process::{Command, ExitStatus, Stdio};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use crate::clean_git::CLEAN_GIT_CONFIG_ENV;
-use crate::core::NotesRef;
+use crate::core::{NotesRef, NotesRefError};
 use crate::vm_git::{GitObjectId, GitObjectIdError};
 
 /// Snapshot of the parent-process environment values that flow into
@@ -486,6 +486,49 @@ impl NotesRepo {
         )?;
         self.read_note_if_present(notes_ref, &target_oid)
     }
+
+    /// Enumerate every ref whose full name starts with `prefix`,
+    /// in git's lexicographic `for-each-ref` order.
+    ///
+    /// Used by reader-side helpers — `bailiff plan list` walks every
+    /// plan-id under `refs/notes/bailiff/v1/plans/` this way. The
+    /// caller passes the trailing slash explicitly: `for-each-ref`
+    /// matches its argument as a literal path prefix when no glob
+    /// chars are present, so `refs/notes/foo/` matches only refs
+    /// inside that directory, not a sibling named `refs/notes/foo2`.
+    ///
+    /// An empty repo or a prefix that matches no refs returns
+    /// `Ok(vec![])` — neither is an error. If git emits a refname
+    /// our [`NotesRef`] validator refuses (the operator-corruption
+    /// case: someone planted a malformed loose ref by hand), the
+    /// helper surfaces it as `ForEachRefRefnameInvalid` rather than
+    /// silently dropping the row, so callers cannot conflate
+    /// "corrupted ref namespace" with "nothing here yet".
+    pub fn list_refs_under_prefix(&self, prefix: &str) -> Result<Vec<NotesRef>, NotesRepoError> {
+        let stdout = run_git(
+            &self.canonical_path,
+            ["for-each-ref", "--format=%(refname)", prefix],
+            None,
+            CaptureOutput::Capture,
+            &self.inherited_env,
+        )?;
+        let text = String::from_utf8(stdout)
+            .map_err(|source| NotesRepoError::ForEachRefNonUtf8 { source })?;
+        let mut refs = Vec::new();
+        for line in text.lines() {
+            if line.is_empty() {
+                continue;
+            }
+            let nref = NotesRef::try_new(line).map_err(|source| {
+                NotesRepoError::ForEachRefRefnameInvalid {
+                    raw: line.to_string(),
+                    source,
+                }
+            })?;
+            refs.push(nref);
+        }
+        Ok(refs)
+    }
 }
 
 fn validate_bare_layout(path: &Path, env: &InheritedEnv) -> Result<(), NotesRepoError> {
@@ -838,6 +881,10 @@ pub enum NotesRepoError {
         status: ExitStatus,
         stderr: String,
     },
+    #[error("git for-each-ref output is not valid UTF-8: {source}")]
+    ForEachRefNonUtf8 { source: std::string::FromUtf8Error },
+    #[error("git for-each-ref returned refname {raw:?} that fails validation: {source}")]
+    ForEachRefRefnameInvalid { raw: String, source: NotesRefError },
 }
 
 #[cfg(test)]
@@ -1616,5 +1663,102 @@ mod tests {
             before, after,
             "read_note_at_seed must not write seed blobs (before={before}, after={after})",
         );
+    }
+
+    #[test]
+    fn list_refs_under_prefix_returns_empty_vec_on_empty_repo() {
+        let tmp = TempDir::new().unwrap();
+        let repo = NotesRepo::init_or_open(tmp.path().join("r")).unwrap();
+        let refs = repo
+            .list_refs_under_prefix("refs/notes/bailiff/v1/plans/")
+            .unwrap();
+        assert!(refs.is_empty(), "expected empty vec, got: {refs:?}");
+    }
+
+    #[test]
+    fn list_refs_under_prefix_returns_refs_lexicographically_sorted() {
+        let tmp = TempDir::new().unwrap();
+        let repo = NotesRepo::init_or_open(tmp.path().join("r")).unwrap();
+        let ref_c = NotesRef::try_new("refs/notes/bailiff/v1/plans/plan-c").unwrap();
+        let ref_a = NotesRef::try_new("refs/notes/bailiff/v1/plans/plan-a").unwrap();
+        let ref_b = NotesRef::try_new("refs/notes/bailiff/v1/plans/plan-b").unwrap();
+        // Write in non-sorted order so the assertion pins git's
+        // lexicographic default rather than insertion order.
+        let _ = repo.write_note(&ref_c, b"seed-c", b"body-c").unwrap();
+        let _ = repo.write_note(&ref_a, b"seed-a", b"body-a").unwrap();
+        let _ = repo.write_note(&ref_b, b"seed-b", b"body-b").unwrap();
+        let refs = repo
+            .list_refs_under_prefix("refs/notes/bailiff/v1/plans/")
+            .unwrap();
+        assert_eq!(refs, vec![ref_a, ref_b, ref_c]);
+    }
+
+    #[test]
+    fn list_refs_under_prefix_excludes_refs_outside_prefix() {
+        let tmp = TempDir::new().unwrap();
+        let repo = NotesRepo::init_or_open(tmp.path().join("r")).unwrap();
+        let in_prefix = NotesRef::try_new("refs/notes/bailiff/v1/plans/plan-a").unwrap();
+        let outside = NotesRef::try_new("refs/notes/writ/v1/agent-outputs").unwrap();
+        let _ = repo.write_note(&in_prefix, b"seed-in", b"body-in").unwrap();
+        let _ = repo.write_note(&outside, b"seed-out", b"body-out").unwrap();
+        let refs = repo
+            .list_refs_under_prefix("refs/notes/bailiff/v1/plans/")
+            .unwrap();
+        assert_eq!(refs, vec![in_prefix]);
+    }
+
+    #[test]
+    fn list_refs_under_prefix_returns_empty_vec_on_no_match() {
+        let tmp = TempDir::new().unwrap();
+        let repo = NotesRepo::init_or_open(tmp.path().join("r")).unwrap();
+        // Populate a different namespace so the repo isn't empty —
+        // we want to assert the prefix filter, not the empty-repo
+        // case (already covered in a sibling test).
+        let nref = NotesRef::try_new("refs/notes/writ/v1/agent-outputs").unwrap();
+        let _ = repo.write_note(&nref, b"seed", b"body").unwrap();
+        let refs = repo
+            .list_refs_under_prefix("refs/notes/bailiff/v1/plans/")
+            .unwrap();
+        assert!(refs.is_empty(), "expected empty vec, got: {refs:?}");
+    }
+
+    #[test]
+    fn list_refs_under_prefix_surfaces_corruption_as_error() {
+        // Operator-corruption case: someone plants a loose ref whose
+        // name contains a non-ASCII whitespace character (U+00A0,
+        // NBSP). Git's refname rules forbid ASCII whitespace, but
+        // its loose-ref scanner walks the filesystem and doesn't
+        // re-validate names against check-ref-format; `for-each-ref
+        // --format=%(refname)` will happily emit a name our
+        // `NotesRef::try_new` refuses. The helper must surface that
+        // as `ForEachRefRefnameInvalid` rather than silently
+        // dropping the row — operators must never have corruption
+        // masquerade as "no rows here".
+        let tmp = TempDir::new().unwrap();
+        let repo = NotesRepo::init_or_open(tmp.path().join("r")).unwrap();
+        // Write a real note first to get a valid OID the bad loose
+        // ref can point at — git's loose-ref reader rejects a
+        // ref whose contents aren't a parseable OID, but accepts
+        // any 40-hex string regardless of whether that object
+        // exists locally.
+        let valid_ref = NotesRef::try_new("refs/notes/bailiff/v1/plans/sentinel").unwrap();
+        let real_oid = repo.write_note(&valid_ref, b"seed", b"body").unwrap();
+        let plans_dir = repo.path().join("refs/notes/bailiff/v1/plans");
+        fs::create_dir_all(&plans_dir).unwrap();
+        let bad_name = "has\u{00a0}nbsp";
+        fs::write(plans_dir.join(bad_name), format!("{}\n", real_oid.as_str())).unwrap();
+        let err = repo
+            .list_refs_under_prefix("refs/notes/bailiff/v1/plans/")
+            .unwrap_err();
+        match &err {
+            NotesRepoError::ForEachRefRefnameInvalid { raw, .. } => {
+                assert!(
+                    raw.contains('\u{00a0}'),
+                    "expected raw refname to carry the NBSP, got: {raw:?}",
+                );
+            }
+            NotesRepoError::GitFailed { .. } => {}
+            other => panic!("expected corruption-surfaced error, got: {other:?}"),
+        }
     }
 }
