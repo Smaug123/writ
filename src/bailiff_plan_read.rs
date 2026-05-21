@@ -37,6 +37,17 @@ use crate::core::{NotesRef, UnixMillis};
 use crate::notes_repo::{NotesRepo, NotesRepoError};
 use crate::run_envelope::{OutputEnvelope, SignedRunEnvelope};
 use crate::run_verify::{AllowedSigners, VerifyError, verify_run_envelope};
+use crate::vm_git::GitObjectId;
+
+/// Bailiff's local copy of writ's per-run signed-output notes ref.
+/// `submit_plan` / `submit_review` / `submit_implement` fetch this
+/// ref from writ at attest time, so the reader can always find an
+/// envelope here when bailiff has been kept up to date.
+///
+/// Sibling to [`crate::bailiff_plan_write::WRIT_V1_NOTES_REFSPEC`] —
+/// that pins the refspec the fetcher uses, this pins the single ref
+/// name a reader looks up.
+const WRIT_AGENT_OUTPUTS_REF: &str = "refs/notes/writ/v1/agent-outputs";
 
 /// Read the decision note for `plan_id`, if one has been recorded.
 /// Returns `Ok(None)` when no decision exists yet — both the
@@ -615,6 +626,273 @@ pub enum SummarizePlanError {
     ReadReview(#[from] ReadReviewError),
     #[error("reading implement note: {0}")]
     ReadImplement(#[from] ReadImplementError),
+}
+
+/// Read the [`SignedRunEnvelope`] writ produced at `oid` from
+/// bailiff's local copy of writ's `refs/notes/writ/v1/agent-outputs`
+/// ref. Returns `Ok(None)` when no note is attached at `oid` — both
+/// the no-such-ref case (writ's notes ref has never been fetched into
+/// bailiff's repo) and the ref-exists-but-no-annotation case fold
+/// into the same `None` because both mean "bailiff's local view does
+/// not have an envelope at this OID."
+///
+/// The note body is the JSON-encoded envelope itself (per slice B's
+/// "envelope in note body, not a separate blob" decision), so this
+/// helper decodes straight into [`SignedRunEnvelope`]. Used by
+/// [`read_full_plan`] to pair each signed bailiff note with its
+/// envelope before verification.
+pub fn read_writ_envelope_at_oid(
+    bailiff_repo: &NotesRepo,
+    oid: &GitObjectId,
+) -> Result<Option<SignedRunEnvelope>, ReadWritEnvelopeError> {
+    let writ_ref = NotesRef::try_new(WRIT_AGENT_OUTPUTS_REF)
+        .expect("WRIT_AGENT_OUTPUTS_REF is a compile-time-valid notes ref");
+    let Some(body) = bailiff_repo
+        .read_note_if_present(&writ_ref, oid)
+        .map_err(ReadWritEnvelopeError::Read)?
+    else {
+        return Ok(None);
+    };
+    let envelope = SignedRunEnvelope::from_bytes(&body).map_err(ReadWritEnvelopeError::Decode)?;
+    Ok(Some(envelope))
+}
+
+/// Tagged failure modes of [`read_writ_envelope_at_oid`]. Absence is
+/// not an error — both the ref-not-fetched and ref-present-but-empty
+/// cases fold into `Ok(None)`. Surfaces here are:
+///
+/// - `Read`: git refused to read at all (permissions, broken repo) —
+///   propagates the underlying [`NotesRepoError`].
+/// - `Decode`: the note body existed but did not parse as
+///   [`SignedRunEnvelope`]. Indicates wire-level corruption of a
+///   writ-produced envelope.
+#[derive(Debug, Error)]
+pub enum ReadWritEnvelopeError {
+    #[error("reading the writ output envelope note from bailiff's repo failed: {0}")]
+    Read(#[source] NotesRepoError),
+    #[error("decoding the writ output envelope body failed: {0}")]
+    Decode(#[source] serde_json::Error),
+}
+
+/// Aggregate per-plan view used by `bailiff plan show` (slice F4).
+/// Returned by [`read_full_plan`] after composing the four
+/// `read_*_note` helpers and, for every available signed note,
+/// pairing it with the writ envelope referenced by its
+/// `writ_output_oid` and verifying the signature against
+/// [`AllowedSigners`].
+///
+/// All four note fields are `Option`: a workflow-conformant plan has
+/// every field set, but each can independently be absent. The plan
+/// note is `Option<VerifiedSection<PlanNote>>` rather than bare
+/// `VerifiedSection<PlanNote>` so the corrupt-state anomaly F2
+/// surfaces in [`WorkflowState::Corrupt`] (ref exists, submission
+/// note never attached) keeps being representable here. The decision
+/// is `Option<DecisionNote>` because decision notes are bailiff-owned
+/// and unsigned in this slice — no envelope to verify.
+#[derive(Debug)]
+pub struct PlanFullView {
+    pub plan_id: PlanId,
+    pub plan: Option<VerifiedSection<PlanNote>>,
+    pub decision: Option<DecisionNote>,
+    pub review: Option<VerifiedSection<ReviewNote>>,
+    pub implement: Option<VerifiedSection<ImplementNote>>,
+}
+
+/// Pairs a bailiff-side signed note with the outcome of verifying its
+/// referenced writ envelope. The four-way split mirrors what
+/// `bailiff plan show` (slice F4) must surface:
+///
+/// - [`VerifiedSection::Verified`]: envelope present, decoded, and
+///   end-to-end verified by [`verify_run_envelope`]. Carries both the
+///   note and the envelope so the F4 renderer can project from
+///   either without re-reading.
+/// - [`VerifiedSection::WritEnvelopeMissing`]: bailiff's local copy
+///   of writ's notes ref has no annotation at the note's
+///   `writ_output_oid`. Either bailiff has not fetched writ's notes
+///   since the envelope was minted, or the envelope has been deleted
+///   from writ. Operator-recoverable by re-running the relevant
+///   `submit*` verb.
+/// - [`VerifiedSection::EnvelopeMalformed`]: an envelope body is
+///   present at the OID but does not decode as
+///   [`SignedRunEnvelope`]. Pure on-disk corruption — surfaces with
+///   the underlying [`serde_json::Error`] so the operator can locate
+///   the offending note blob.
+/// - [`VerifiedSection::SignatureFailure`]: envelope decoded but
+///   [`verify_run_envelope`] rejected it. The wrapped [`VerifyError`]
+///   names the specific check that failed (output-digest mismatch,
+///   signer not in allowed list, or signature invalid).
+///
+/// The reason to surface failure variants rather than fold them into
+/// a top-level `Result<T, _>` is that `show` wants to print every
+/// available section even when one fails to verify — collapsing a
+/// single failed section into an `Err` would suppress the rest of
+/// the plan history, exactly when an operator most needs to see it.
+#[derive(Debug)]
+pub enum VerifiedSection<T> {
+    Verified {
+        note: T,
+        envelope: SignedRunEnvelope,
+    },
+    WritEnvelopeMissing {
+        note: T,
+    },
+    EnvelopeMalformed {
+        note: T,
+        error: serde_json::Error,
+    },
+    SignatureFailure {
+        note: T,
+        error: VerifyError,
+    },
+}
+
+/// Outcome of pairing a writ output OID with an envelope and running
+/// the verifier. Internal projection consumed by [`wrap_section`];
+/// the public surface is [`VerifiedSection`]. Separating this from
+/// the per-section type means the read-and-verify step doesn't know
+/// or care which kind of bailiff note (plan / review / implement)
+/// will be paired with the outcome.
+enum EnvelopeVerification {
+    Verified(SignedRunEnvelope),
+    Missing,
+    Malformed(serde_json::Error),
+    Failed(VerifyError),
+}
+
+/// Look up the envelope at `oid` in bailiff's local copy of writ's
+/// notes ref, decode it, and verify it against `allowed`. Returns the
+/// outcome as an [`EnvelopeVerification`] so [`read_full_plan`] can
+/// pair each one with its bailiff-side note via [`wrap_section`].
+///
+/// Only the *read* failure on writ's notes ref propagates as an
+/// `Err` — decode failures fold into [`EnvelopeVerification::Malformed`]
+/// and verification failures into [`EnvelopeVerification::Failed`] so
+/// the caller can render the rest of the plan even when one section
+/// is broken.
+fn read_and_verify_envelope(
+    bailiff_repo: &NotesRepo,
+    oid: &GitObjectId,
+    allowed: &AllowedSigners,
+) -> Result<EnvelopeVerification, NotesRepoError> {
+    match read_writ_envelope_at_oid(bailiff_repo, oid) {
+        Ok(Some(envelope)) => match verify_run_envelope(&envelope, allowed) {
+            Ok(()) => Ok(EnvelopeVerification::Verified(envelope)),
+            Err(error) => Ok(EnvelopeVerification::Failed(error)),
+        },
+        Ok(None) => Ok(EnvelopeVerification::Missing),
+        Err(ReadWritEnvelopeError::Read(error)) => Err(error),
+        Err(ReadWritEnvelopeError::Decode(error)) => Ok(EnvelopeVerification::Malformed(error)),
+    }
+}
+
+/// Project a `(verification, note)` pair into the user-visible
+/// [`VerifiedSection`]. The same shape works for every signed bailiff
+/// note (`PlanNote`, `ReviewNote`, `ImplementNote`) because all three
+/// expose `writ_output_oid` and carry a `signed_metadata` /
+/// `signature` pair that the envelope at the OID already covers — so
+/// the per-section pairing logic is purely "stash this note next to
+/// its verification outcome."
+fn wrap_section<T>(verification: EnvelopeVerification, note: T) -> VerifiedSection<T> {
+    match verification {
+        EnvelopeVerification::Verified(envelope) => VerifiedSection::Verified { note, envelope },
+        EnvelopeVerification::Missing => VerifiedSection::WritEnvelopeMissing { note },
+        EnvelopeVerification::Malformed(error) => {
+            VerifiedSection::EnvelopeMalformed { note, error }
+        }
+        EnvelopeVerification::Failed(error) => VerifiedSection::SignatureFailure { note, error },
+    }
+}
+
+/// For an optional bailiff-side signed note, read the corresponding
+/// writ envelope, verify it, and wrap the outcome. Returns `Ok(None)`
+/// when the note itself is absent — the no-yet-attached case for
+/// review/implement sections, and the corrupt case for plan
+/// submissions. Used three times by [`read_full_plan`] with one
+/// closure per call site projecting `writ_output_oid` off the
+/// particular note type.
+fn read_and_project_section<T>(
+    bailiff_repo: &NotesRepo,
+    note: Option<T>,
+    oid_of: impl FnOnce(&T) -> &GitObjectId,
+    allowed: &AllowedSigners,
+) -> Result<Option<VerifiedSection<T>>, ReadFullPlanError> {
+    let Some(note) = note else {
+        return Ok(None);
+    };
+    let verification = read_and_verify_envelope(bailiff_repo, oid_of(&note), allowed)
+        .map_err(ReadFullPlanError::ReadEnvelope)?;
+    Ok(Some(wrap_section(verification, note)))
+}
+
+/// Read every per-plan note for `plan_id`, pair each signed note with
+/// the writ envelope it references, and verify the envelope against
+/// `allowed_signers`. Returns a [`PlanFullView`] with all four
+/// projections folded in.
+///
+/// Per-section failure modes (envelope missing, envelope malformed,
+/// signature invalid) surface inside the relevant
+/// [`VerifiedSection`] rather than collapsing the whole view into an
+/// `Err`. The two failure modes that *do* surface as `Err` are
+/// (a) bailiff's own note reads (a broken bailiff repo is not
+/// recoverable by reading less) and (b) the git read on writ's notes
+/// ref (same reason). Both are recoverable by fixing the local repo,
+/// not by re-running with a different plan id.
+///
+/// Pure-library: no socket, no fetches. F4 wires this to clap; a
+/// future agent-facing API can reuse it without going through the
+/// CLI.
+pub fn read_full_plan(
+    bailiff_repo: &NotesRepo,
+    plan_id: PlanId,
+    allowed_signers: &AllowedSigners,
+) -> Result<PlanFullView, ReadFullPlanError> {
+    let plan = read_and_project_section(
+        bailiff_repo,
+        read_plan_note(bailiff_repo, plan_id)?,
+        |n| &n.writ_output_oid,
+        allowed_signers,
+    )?;
+    let decision = read_decision_note(bailiff_repo, plan_id)?;
+    let review = read_and_project_section(
+        bailiff_repo,
+        read_review_note(bailiff_repo, plan_id)?,
+        |n| &n.writ_output_oid,
+        allowed_signers,
+    )?;
+    let implement = read_and_project_section(
+        bailiff_repo,
+        read_implement_note(bailiff_repo, plan_id)?,
+        |n| &n.writ_output_oid,
+        allowed_signers,
+    )?;
+    Ok(PlanFullView {
+        plan_id,
+        plan,
+        decision,
+        review,
+        implement,
+    })
+}
+
+/// Tagged failure modes of [`read_full_plan`]. The four note-read
+/// variants are pass-throughs of the per-section read errors so an
+/// operator sees the same diagnostic the per-note helpers would
+/// produce. `ReadEnvelope` covers a git failure reading writ's notes
+/// ref from bailiff's repo — distinct from per-section
+/// "envelope missing / malformed / signature failed," which surface
+/// inside the [`VerifiedSection`] variants instead.
+#[derive(Debug, Error)]
+pub enum ReadFullPlanError {
+    #[error("reading plan submission note: {0}")]
+    ReadPlan(#[from] ReadPlanError),
+    #[error("reading decision note: {0}")]
+    ReadDecision(#[from] ReadDecisionError),
+    #[error("reading review note: {0}")]
+    ReadReview(#[from] ReadReviewError),
+    #[error("reading implement note: {0}")]
+    ReadImplement(#[from] ReadImplementError),
+    #[error("reading writ output envelope from bailiff's repo: {0}")]
+    ReadEnvelope(#[source] NotesRepoError),
 }
 
 #[cfg(test)]
@@ -2876,5 +3154,567 @@ mod list_tests {
         assert_eq!(WorkflowState::Implemented.as_str(), "implemented");
         // Display must agree with as_str.
         assert_eq!(WorkflowState::Submitted.to_string(), "submitted");
+    }
+}
+
+#[cfg(test)]
+mod full_plan_tests {
+    //! Tests for [`read_writ_envelope_at_oid`] and [`read_full_plan`] —
+    //! slice F3's read-and-verify composition.
+    //!
+    //! Fixtures plant coherent writ runs (envelope + paired bailiff
+    //! signed note pointing at the envelope's target OID) directly
+    //! through [`NotesRepo::write_note`]. This bypasses the writ broker
+    //! and the writ→bailiff fetch hop on purpose — those are the
+    //! concern of the end-to-end round-trip in
+    //! `run_verify::tests::round_trip_writ_writes_bailiff_fetches_and_verifies`.
+    //! Here we exercise the pure read-side composition under the same
+    //! crypto primitives.
+    //!
+    //! The four [`VerifiedSection`] variants are each driven by a
+    //! distinct fault injection: missing envelope (no writ note at the
+    //! OID), malformed envelope (non-JSON bytes), output tamper
+    //! (envelope output bytes don't hash to the metadata's digest), and
+    //! metadata tamper (canonical bytes diverge from what was signed,
+    //! plus the signer-not-in-allowed-signers variant).
+    use super::*;
+    use crate::agent_run::{AgentRunId, sha256_hex};
+    use crate::bailiff_decision::{Decider, Decision};
+    use crate::bailiff_plan_note::{
+        DecisionNote, ImplementNote, PlanId, PlanNote, ReviewNote, plan_decision_seed_blob_bytes,
+        plan_implement_seed_blob_bytes, plan_notes_ref, plan_review_seed_blob_bytes,
+        plan_submission_seed_blob_bytes,
+    };
+    use crate::core::{
+        CapabilitySet, NotesRef, RepoRef, SessionId, Sha256Hex, SshSignature, UnixMillis,
+    };
+    use crate::protocol::SignedRunMetadata;
+    use crate::run_envelope::{OutputEnvelope, SignedRunEnvelope};
+    use crate::run_verify::VerifyError;
+    use crate::signing::WritSigningKey;
+    use crate::vm_git::GitObjectId;
+    use tempfile::TempDir;
+
+    const SIGNING_PEM: &str = include_str!("../tests/fixtures/ed25519_test_signing.key");
+    const OTHER_PEM: &str = include_str!("../tests/fixtures/ed25519_test_signing_other.key");
+
+    fn bailiff_repo(tmp: &TempDir) -> NotesRepo {
+        NotesRepo::init_or_open(tmp.path().join("bailiff-bare")).unwrap()
+    }
+
+    fn writ_notes_ref() -> NotesRef {
+        NotesRef::try_new(WRIT_AGENT_OUTPUTS_REF).unwrap()
+    }
+
+    /// Build a `SignedRunMetadata` whose `output_envelope_sha256` binds
+    /// to the canonical bytes of an empty [`OutputEnvelope`]. Used by
+    /// every helper here so a paired envelope plants without any
+    /// additional bookkeeping; the `seed_str` differentiates prompt
+    /// digests across plants so the metadatas don't compare equal.
+    fn build_metadata(
+        signing_key: &WritSigningKey,
+        completed_at_millis: i64,
+        seed_str: &str,
+    ) -> (SignedRunMetadata, Vec<u8>) {
+        let output = OutputEnvelope {
+            stdout: format!("{seed_str}-stdout").into_bytes(),
+            stderr: Vec::new(),
+            stdout_truncated_at: None,
+            stderr_truncated_at: None,
+        };
+        let output_bytes = output.to_bytes();
+        let output_sha = Sha256Hex::try_new(sha256_hex(&output_bytes)).unwrap();
+        let prompt_sha = Sha256Hex::try_new(sha256_hex(seed_str.as_bytes())).unwrap();
+        let metadata = SignedRunMetadata {
+            run_id: AgentRunId::new(),
+            session_id: SessionId::new(),
+            prompt_sha256: prompt_sha,
+            output_envelope_sha256: output_sha,
+            capabilities: vec![CapabilitySet::WorkspaceRead {
+                repo: RepoRef {
+                    owner: "smaug123".into(),
+                    name: "writ".into(),
+                },
+            }],
+            exit_code: 0,
+            completed_at: UnixMillis::from_millis(completed_at_millis),
+            signing_key_fingerprint: signing_key.fingerprint(),
+        };
+        (metadata, output_bytes)
+    }
+
+    /// Bundle of (writ envelope target OID, signed metadata, signature)
+    /// returned by [`plant_run`]: enough for a paired bailiff signed
+    /// note to reference and re-sign over the same metadata. Each
+    /// `plant_run` call seeds a fresh [`AgentRunId`] so multiple runs
+    /// in one test plant at distinct target OIDs.
+    struct PlantedRun {
+        writ_output_oid: GitObjectId,
+        metadata: SignedRunMetadata,
+        signature: SshSignature,
+    }
+
+    /// Build a fresh writ envelope under `signing_key`, plant it on
+    /// bailiff's writ notes ref keyed by the run id, and return the
+    /// projection a paired bailiff note will reuse. The envelope's
+    /// output bytes are seeded by `seed_str` so the planted body is
+    /// distinct across calls within one test.
+    fn plant_run(
+        bailiff: &NotesRepo,
+        signing_key: &WritSigningKey,
+        completed_at_millis: i64,
+        seed_str: &str,
+    ) -> PlantedRun {
+        let (metadata, output_bytes) = build_metadata(signing_key, completed_at_millis, seed_str);
+        let signature = signing_key.sign(&metadata.canonical_bytes()).unwrap();
+        let envelope = SignedRunEnvelope {
+            metadata: metadata.clone(),
+            signature: signature.clone(),
+            output: output_bytes,
+        };
+        let writ_output_oid = bailiff
+            .write_note(
+                &writ_notes_ref(),
+                metadata.run_id.to_string().as_bytes(),
+                &envelope.to_bytes(),
+            )
+            .unwrap();
+        PlantedRun {
+            writ_output_oid,
+            metadata,
+            signature,
+        }
+    }
+
+    fn plant_plan_note_for(bailiff: &NotesRepo, plan_id: PlanId, run: &PlantedRun) {
+        let note = PlanNote {
+            plan_id,
+            purpose: "plan-submission".into(),
+            writ_output_oid: run.writ_output_oid.clone(),
+            signed_metadata: run.metadata.clone(),
+            signature: run.signature.clone(),
+        };
+        bailiff
+            .write_note(
+                &plan_notes_ref(plan_id),
+                &plan_submission_seed_blob_bytes(plan_id),
+                &note.canonical_bytes(),
+            )
+            .unwrap();
+    }
+
+    fn plant_review_note_for(bailiff: &NotesRepo, plan_id: PlanId, run: &PlantedRun) {
+        let note = ReviewNote {
+            plan_id,
+            purpose: "plan-review".into(),
+            writ_output_oid: run.writ_output_oid.clone(),
+            signed_metadata: run.metadata.clone(),
+            signature: run.signature.clone(),
+        };
+        bailiff
+            .write_note(
+                &plan_notes_ref(plan_id),
+                &plan_review_seed_blob_bytes(plan_id),
+                &note.canonical_bytes(),
+            )
+            .unwrap();
+    }
+
+    fn plant_implement_note_for(bailiff: &NotesRepo, plan_id: PlanId, run: &PlantedRun) {
+        let note = ImplementNote {
+            plan_id,
+            purpose: "plan-implement".into(),
+            writ_output_oid: run.writ_output_oid.clone(),
+            signed_metadata: run.metadata.clone(),
+            signature: run.signature.clone(),
+        };
+        bailiff
+            .write_note(
+                &plan_notes_ref(plan_id),
+                &plan_implement_seed_blob_bytes(plan_id),
+                &note.canonical_bytes(),
+            )
+            .unwrap();
+    }
+
+    fn plant_decision_note_for(bailiff: &NotesRepo, plan_id: PlanId, outcome: Decision) {
+        let note = DecisionNote {
+            plan_id,
+            outcome,
+            decider: Decider::try_new("cli:alice").unwrap(),
+            decided_at: UnixMillis::from_millis(1_700_000_500_000),
+        };
+        bailiff
+            .write_note(
+                &plan_notes_ref(plan_id),
+                &plan_decision_seed_blob_bytes(plan_id),
+                &note.canonical_bytes(),
+            )
+            .unwrap();
+    }
+
+    fn allowed_signers_for(signing_key: &WritSigningKey) -> AllowedSigners {
+        AllowedSigners::from_keys([signing_key.verifying_key()])
+    }
+
+    /// Absent: bailiff has not fetched a writ envelope at this OID, so
+    /// the read returns `Ok(None)`. Pins the "not fetched yet" case the
+    /// `WritEnvelopeMissing` variant rests on.
+    #[test]
+    fn read_writ_envelope_at_oid_returns_none_when_absent() {
+        let tmp = TempDir::new().unwrap();
+        let bailiff = bailiff_repo(&tmp);
+        let oid = GitObjectId::new("a".repeat(40)).unwrap();
+        let result = read_writ_envelope_at_oid(&bailiff, &oid).unwrap();
+        assert!(result.is_none());
+    }
+
+    /// Present: plant a real envelope, read by the returned OID, and
+    /// the decoded envelope round-trips byte-equal in metadata and
+    /// signature.
+    #[test]
+    fn read_writ_envelope_at_oid_round_trips_planted_envelope() {
+        let tmp = TempDir::new().unwrap();
+        let bailiff = bailiff_repo(&tmp);
+        let signing_key = WritSigningKey::from_openssh_pem(SIGNING_PEM).unwrap();
+        let run = plant_run(&bailiff, &signing_key, 1, "roundtrip");
+        let envelope = read_writ_envelope_at_oid(&bailiff, &run.writ_output_oid)
+            .unwrap()
+            .expect("envelope was just planted");
+        assert_eq!(envelope.metadata, run.metadata);
+        assert_eq!(envelope.signature, run.signature);
+    }
+
+    /// Garbage body at a real OID: the read returns `Decode`, not
+    /// `Ok(None)` and not `Read`. Pins the "envelope present but
+    /// corrupted on disk" diagnostic.
+    #[test]
+    fn read_writ_envelope_at_oid_surfaces_decode_failure_on_garbage_body() {
+        let tmp = TempDir::new().unwrap();
+        let bailiff = bailiff_repo(&tmp);
+        let oid = bailiff
+            .write_note(&writ_notes_ref(), b"garbage-seed", b"not-json-at-all")
+            .unwrap();
+        match read_writ_envelope_at_oid(&bailiff, &oid) {
+            Err(ReadWritEnvelopeError::Decode(_)) => {}
+            other => panic!("expected Decode error, got {other:?}"),
+        }
+    }
+
+    /// Happy path: plant + decision + review + implement, all signed
+    /// by the same writ key listed in allowed-signers. Every section
+    /// surfaces as [`VerifiedSection::Verified`] and the decision
+    /// projects through unchanged.
+    #[test]
+    fn read_full_plan_returns_verified_view_when_all_four_sections_present() {
+        let tmp = TempDir::new().unwrap();
+        let bailiff = bailiff_repo(&tmp);
+        let signing_key = WritSigningKey::from_openssh_pem(SIGNING_PEM).unwrap();
+        let plan_id = PlanId::new();
+
+        let plan_run = plant_run(&bailiff, &signing_key, 1, "plan");
+        let review_run = plant_run(&bailiff, &signing_key, 2, "review");
+        let implement_run = plant_run(&bailiff, &signing_key, 3, "implement");
+
+        plant_plan_note_for(&bailiff, plan_id, &plan_run);
+        plant_decision_note_for(&bailiff, plan_id, Decision::Accepted);
+        plant_review_note_for(&bailiff, plan_id, &review_run);
+        plant_implement_note_for(&bailiff, plan_id, &implement_run);
+
+        let view = read_full_plan(&bailiff, plan_id, &allowed_signers_for(&signing_key)).unwrap();
+        assert_eq!(view.plan_id, plan_id);
+        match view.plan.as_ref().expect("plan section must be present") {
+            VerifiedSection::Verified { note, envelope } => {
+                assert_eq!(note.plan_id, plan_id);
+                assert_eq!(envelope.metadata, plan_run.metadata);
+            }
+            other => panic!("expected Verified plan section, got {other:?}"),
+        }
+        assert!(view.decision.is_some(), "decision must be present");
+        match view
+            .review
+            .as_ref()
+            .expect("review section must be present")
+        {
+            VerifiedSection::Verified { note, envelope } => {
+                assert_eq!(note.plan_id, plan_id);
+                assert_eq!(envelope.metadata, review_run.metadata);
+            }
+            other => panic!("expected Verified review section, got {other:?}"),
+        }
+        match view
+            .implement
+            .as_ref()
+            .expect("implement section must be present")
+        {
+            VerifiedSection::Verified { note, envelope } => {
+                assert_eq!(note.plan_id, plan_id);
+                assert_eq!(envelope.metadata, implement_run.metadata);
+            }
+            other => panic!("expected Verified implement section, got {other:?}"),
+        }
+    }
+
+    /// Plan-only: just the plan submission is planted. The other three
+    /// fields surface as `None` (structural absence), not as failure
+    /// variants — `None` and "failure to verify" are different
+    /// states.
+    #[test]
+    fn read_full_plan_returns_only_plan_section_when_other_notes_missing() {
+        let tmp = TempDir::new().unwrap();
+        let bailiff = bailiff_repo(&tmp);
+        let signing_key = WritSigningKey::from_openssh_pem(SIGNING_PEM).unwrap();
+        let plan_id = PlanId::new();
+        let plan_run = plant_run(&bailiff, &signing_key, 1, "plan-only");
+        plant_plan_note_for(&bailiff, plan_id, &plan_run);
+        let view = read_full_plan(&bailiff, plan_id, &allowed_signers_for(&signing_key)).unwrap();
+        assert!(matches!(view.plan, Some(VerifiedSection::Verified { .. })));
+        assert!(view.decision.is_none());
+        assert!(view.review.is_none());
+        assert!(view.implement.is_none());
+    }
+
+    /// Corrupt anomaly: downstream notes (decision + review) present
+    /// but plan submission absent. `view.plan = None` is representable
+    /// because `plan` is `Option<VerifiedSection<_>>`, and the other
+    /// available sections still render — exactly the property
+    /// [`PlanFullView`]'s doc string promises.
+    #[test]
+    fn read_full_plan_returns_none_plan_when_only_downstream_notes_present() {
+        let tmp = TempDir::new().unwrap();
+        let bailiff = bailiff_repo(&tmp);
+        let signing_key = WritSigningKey::from_openssh_pem(SIGNING_PEM).unwrap();
+        let plan_id = PlanId::new();
+        plant_decision_note_for(&bailiff, plan_id, Decision::Accepted);
+        let review_run = plant_run(&bailiff, &signing_key, 2, "orphan-review");
+        plant_review_note_for(&bailiff, plan_id, &review_run);
+        let view = read_full_plan(&bailiff, plan_id, &allowed_signers_for(&signing_key)).unwrap();
+        assert!(view.plan.is_none(), "plan missing in corrupt state");
+        assert!(view.decision.is_some());
+        assert!(matches!(
+            view.review,
+            Some(VerifiedSection::Verified { .. })
+        ));
+        assert!(view.implement.is_none());
+    }
+
+    /// Writ envelope missing: a plan note references a synthetic OID
+    /// where bailiff has no writ note. The section surfaces as
+    /// [`VerifiedSection::WritEnvelopeMissing`] — the
+    /// "operator forgot to fetch" recoverable state.
+    #[test]
+    fn read_full_plan_marks_section_when_writ_envelope_missing() {
+        let tmp = TempDir::new().unwrap();
+        let bailiff = bailiff_repo(&tmp);
+        let signing_key = WritSigningKey::from_openssh_pem(SIGNING_PEM).unwrap();
+        let plan_id = PlanId::new();
+
+        let synthetic_oid = GitObjectId::new("d".repeat(40)).unwrap();
+        let (metadata, _output_bytes) = build_metadata(&signing_key, 1, "no-envelope");
+        let signature = signing_key.sign(&metadata.canonical_bytes()).unwrap();
+        let note = PlanNote {
+            plan_id,
+            purpose: "plan".into(),
+            writ_output_oid: synthetic_oid.clone(),
+            signed_metadata: metadata,
+            signature,
+        };
+        bailiff
+            .write_note(
+                &plan_notes_ref(plan_id),
+                &plan_submission_seed_blob_bytes(plan_id),
+                &note.canonical_bytes(),
+            )
+            .unwrap();
+
+        let view = read_full_plan(&bailiff, plan_id, &allowed_signers_for(&signing_key)).unwrap();
+        match view.plan.as_ref().unwrap() {
+            VerifiedSection::WritEnvelopeMissing { note } => {
+                assert_eq!(note.writ_output_oid, synthetic_oid);
+            }
+            other => panic!("expected WritEnvelopeMissing, got {other:?}"),
+        }
+    }
+
+    /// Envelope body malformed: plant non-JSON bytes on the writ ref,
+    /// capture the resulting OID, and point a plan note at it. The
+    /// section surfaces as [`VerifiedSection::EnvelopeMalformed`] —
+    /// distinct from missing (so an operator can tell "not fetched"
+    /// from "fetched but corrupt").
+    #[test]
+    fn read_full_plan_marks_section_when_envelope_body_malformed() {
+        let tmp = TempDir::new().unwrap();
+        let bailiff = bailiff_repo(&tmp);
+        let signing_key = WritSigningKey::from_openssh_pem(SIGNING_PEM).unwrap();
+        let plan_id = PlanId::new();
+
+        let malformed_oid = bailiff
+            .write_note(&writ_notes_ref(), b"malformed-seed", b"<<not json>>")
+            .unwrap();
+        let (metadata, _output_bytes) = build_metadata(&signing_key, 1, "malformed-envelope");
+        let signature = signing_key.sign(&metadata.canonical_bytes()).unwrap();
+        let note = PlanNote {
+            plan_id,
+            purpose: "plan".into(),
+            writ_output_oid: malformed_oid.clone(),
+            signed_metadata: metadata,
+            signature,
+        };
+        bailiff
+            .write_note(
+                &plan_notes_ref(plan_id),
+                &plan_submission_seed_blob_bytes(plan_id),
+                &note.canonical_bytes(),
+            )
+            .unwrap();
+
+        let view = read_full_plan(&bailiff, plan_id, &allowed_signers_for(&signing_key)).unwrap();
+        match view.plan.as_ref().unwrap() {
+            VerifiedSection::EnvelopeMalformed { note, .. } => {
+                assert_eq!(note.writ_output_oid, malformed_oid);
+            }
+            other => panic!("expected EnvelopeMalformed, got {other:?}"),
+        }
+    }
+
+    /// Output digest mismatch: plant an envelope whose `output` bytes
+    /// don't hash to the metadata's `output_envelope_sha256` claim,
+    /// then verify under the legitimate signer. The verifier rejects
+    /// at the digest step before consulting the signature.
+    #[test]
+    fn read_full_plan_marks_section_when_output_digest_mismatches() {
+        let tmp = TempDir::new().unwrap();
+        let bailiff = bailiff_repo(&tmp);
+        let signing_key = WritSigningKey::from_openssh_pem(SIGNING_PEM).unwrap();
+        let plan_id = PlanId::new();
+
+        let (metadata, output_bytes) = build_metadata(&signing_key, 1, "digest-mismatch");
+        let signature = signing_key.sign(&metadata.canonical_bytes()).unwrap();
+        // Swap the bound output bytes for an unrelated payload after
+        // the metadata digest is fixed — re-hashing on the verifier
+        // side will surface the divergence.
+        let mut tampered_output = output_bytes.clone();
+        tampered_output.push(0xFF);
+        let envelope = SignedRunEnvelope {
+            metadata: metadata.clone(),
+            signature: signature.clone(),
+            output: tampered_output,
+        };
+        let oid = bailiff
+            .write_note(
+                &writ_notes_ref(),
+                metadata.run_id.to_string().as_bytes(),
+                &envelope.to_bytes(),
+            )
+            .unwrap();
+        let note = PlanNote {
+            plan_id,
+            purpose: "plan".into(),
+            writ_output_oid: oid,
+            signed_metadata: metadata,
+            signature,
+        };
+        bailiff
+            .write_note(
+                &plan_notes_ref(plan_id),
+                &plan_submission_seed_blob_bytes(plan_id),
+                &note.canonical_bytes(),
+            )
+            .unwrap();
+
+        let view = read_full_plan(&bailiff, plan_id, &allowed_signers_for(&signing_key)).unwrap();
+        match view.plan.as_ref().unwrap() {
+            VerifiedSection::SignatureFailure {
+                error: VerifyError::OutputDigestMismatch { .. },
+                ..
+            } => {}
+            other => panic!("expected SignatureFailure(OutputDigestMismatch), got {other:?}"),
+        }
+    }
+
+    /// Unknown signer: envelope is built and signed by writ key A, but
+    /// allowed-signers contains only key B. The verifier rejects at
+    /// the fingerprint-lookup step (before consulting the signature),
+    /// surfacing as `SignatureFailure(UnknownSigner)`.
+    #[test]
+    fn read_full_plan_marks_section_when_signer_not_in_allowed_signers() {
+        let tmp = TempDir::new().unwrap();
+        let bailiff = bailiff_repo(&tmp);
+        let other_key = WritSigningKey::from_openssh_pem(OTHER_PEM).unwrap();
+        let primary_key = WritSigningKey::from_openssh_pem(SIGNING_PEM).unwrap();
+        let plan_id = PlanId::new();
+
+        // Envelope and bailiff plan note are both signed by the
+        // *other* key; the AllowedSigners passed to read_full_plan
+        // contains only the *primary* key.
+        let plan_run = plant_run(&bailiff, &other_key, 1, "signed-by-other");
+        plant_plan_note_for(&bailiff, plan_id, &plan_run);
+
+        let view = read_full_plan(&bailiff, plan_id, &allowed_signers_for(&primary_key)).unwrap();
+        match view.plan.as_ref().unwrap() {
+            VerifiedSection::SignatureFailure {
+                error: VerifyError::UnknownSigner { fingerprint },
+                ..
+            } => {
+                assert_eq!(fingerprint, &other_key.fingerprint());
+            }
+            other => panic!("expected SignatureFailure(UnknownSigner), got {other:?}"),
+        }
+    }
+
+    /// Metadata tamper: build and sign an envelope, then mutate one
+    /// non-digest metadata field (`exit_code`) before encoding. The
+    /// output digest still binds (we didn't touch the output bytes or
+    /// `output_envelope_sha256`), the signer is known, but the
+    /// signature no longer matches `canonical_bytes` — surfaces as
+    /// `SignatureFailure(SignatureInvalid)`.
+    #[test]
+    fn read_full_plan_marks_section_when_metadata_tampered_post_sign() {
+        let tmp = TempDir::new().unwrap();
+        let bailiff = bailiff_repo(&tmp);
+        let signing_key = WritSigningKey::from_openssh_pem(SIGNING_PEM).unwrap();
+        let plan_id = PlanId::new();
+
+        let (mut metadata, output_bytes) = build_metadata(&signing_key, 1, "metadata-tamper");
+        let signature = signing_key.sign(&metadata.canonical_bytes()).unwrap();
+        // Mutate after signing. The output digest still binds because
+        // `output_envelope_sha256` is unchanged; only the exit code
+        // diverges from what the signature covered.
+        metadata.exit_code = metadata.exit_code.wrapping_add(1);
+        let envelope = SignedRunEnvelope {
+            metadata: metadata.clone(),
+            signature: signature.clone(),
+            output: output_bytes,
+        };
+        let oid = bailiff
+            .write_note(
+                &writ_notes_ref(),
+                metadata.run_id.to_string().as_bytes(),
+                &envelope.to_bytes(),
+            )
+            .unwrap();
+        let note = PlanNote {
+            plan_id,
+            purpose: "plan".into(),
+            writ_output_oid: oid,
+            signed_metadata: metadata,
+            signature,
+        };
+        bailiff
+            .write_note(
+                &plan_notes_ref(plan_id),
+                &plan_submission_seed_blob_bytes(plan_id),
+                &note.canonical_bytes(),
+            )
+            .unwrap();
+
+        let view = read_full_plan(&bailiff, plan_id, &allowed_signers_for(&signing_key)).unwrap();
+        match view.plan.as_ref().unwrap() {
+            VerifiedSection::SignatureFailure {
+                error: VerifyError::SignatureInvalid(_),
+                ..
+            } => {}
+            other => panic!("expected SignatureFailure(SignatureInvalid), got {other:?}"),
+        }
     }
 }
