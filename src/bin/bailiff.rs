@@ -29,9 +29,11 @@ use tokio::sync::Mutex as AsyncMutex;
 use writ::agent_run::AgentPrompt;
 use writ::bailiff_decision::{Decider, Decision};
 use writ::bailiff_plan_note::{DecisionNote, PlanId};
+use writ::bailiff_plan_read::{list_plan_ids, summarize_plan};
 use writ::bailiff_plan_review::{SubmitReviewError, SubmitReviewInputs, submit_review};
 use writ::bailiff_plan_submit::{SubmitPlanInputs, submit_plan};
 use writ::bailiff_plan_write::{WriteDecisionNoteError, WriteReviewNoteError, write_decision_note};
+use writ::cli::output::write_bailiff_plan_list;
 use writ::core::{AgentKind, CapabilitySet, NotesRef, RepoRef, UnixMillis};
 use writ::notes_repo::NotesRepo;
 use writ::run_verify::AllowedSigners;
@@ -237,6 +239,24 @@ enum PlanCmd {
         #[arg(long)]
         model: Option<String>,
     },
+    /// Enumerate every plan in bailiff's repo. Lists plan id +
+    /// workflow state + the four per-stage timestamps, one
+    /// key=value block per plan separated by blank lines. Empty
+    /// repo prints a single `no plans` line, exit 0.
+    ///
+    /// Slice F's read-only verb. Verifies nothing — each row is
+    /// metadata pulled from bailiff's own notes; `bailiff plan show`
+    /// (slice F4) is where writ-side signature verification happens.
+    List {
+        /// Path to bailiff's bare git repo. Defaults to
+        /// `$XDG_DATA_HOME/bailiff/repo` (or
+        /// `~/.local/share/bailiff/repo` if `XDG_DATA_HOME` is
+        /// unset). Created on first use via
+        /// [`NotesRepo::init_or_open`] — listing an empty repo is
+        /// not an error.
+        #[arg(long)]
+        bailiff_repo: Option<PathBuf>,
+    },
 }
 
 fn parse_agent_kind(raw: &str) -> Result<AgentKind, String> {
@@ -325,6 +345,7 @@ async fn dispatch(cmd: Cmd, socket_path: PathBuf) -> Result<(), Box<dyn std::err
                 )
                 .await
             }
+            PlanCmd::List { bailiff_repo } => plan_list(bailiff_repo).await,
         },
     }
 }
@@ -583,6 +604,62 @@ async fn plan_decide(
         )
         .into()),
         Err(DecideError::Write(e)) => Err(format!("recording decision: {e}").into()),
+    }
+}
+
+async fn plan_list(bailiff_repo: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
+    let bailiff_repo_path = bailiff_repo.unwrap_or_else(default_bailiff_repo_path);
+
+    // Both `init_or_open` and the read helpers shell out to git; do
+    // them on a blocking thread so the runtime stays responsive
+    // (mirrors the pattern `plan_submit` / `plan_decide` use). The
+    // pure-data result (`Vec<BailiffPlanSummary>`) is what we hand to
+    // the formatter on the runtime thread.
+    let bailiff_repo_path_for_task = bailiff_repo_path.clone();
+    let result: Result<Vec<_>, ListError> = tokio::task::spawn_blocking(move || {
+        let repo = NotesRepo::init_or_open(bailiff_repo_path_for_task)?;
+        let ids = list_plan_ids(&repo).map_err(ListError::List)?;
+        let mut summaries = Vec::with_capacity(ids.len());
+        for id in ids {
+            summaries.push(summarize_plan(&repo, id).map_err(ListError::Summarize)?);
+        }
+        Ok(summaries)
+    })
+    .await
+    .map_err(|e| format!("list task failed: {e}"))?;
+
+    let summaries = match result {
+        Ok(s) => s,
+        Err(ListError::OpenRepo(e)) => {
+            return Err(format!(
+                "opening bailiff repo at {}: {e}",
+                bailiff_repo_path.display()
+            )
+            .into());
+        }
+        Err(ListError::List(e)) => return Err(format!("listing plans: {e}").into()),
+        Err(ListError::Summarize(e)) => return Err(format!("summarizing plan: {e}").into()),
+    };
+
+    let stdout = std::io::stdout();
+    let mut handle = stdout.lock();
+    write_bailiff_plan_list(&mut handle, &summaries)?;
+    Ok(())
+}
+
+/// Tagged failure modes for the `spawn_blocking` list closure.
+/// Mirrors `DecideError`'s pattern: tag enough to give the post-await
+/// arm a specific error message rather than collapsing everything
+/// into a single string. Local to this binary; not a wire contract.
+enum ListError {
+    OpenRepo(writ::notes_repo::NotesRepoError),
+    List(writ::bailiff_plan_read::ListPlanIdsError),
+    Summarize(writ::bailiff_plan_read::SummarizePlanError),
+}
+
+impl From<writ::notes_repo::NotesRepoError> for ListError {
+    fn from(e: writ::notes_repo::NotesRepoError) -> Self {
+        ListError::OpenRepo(e)
     }
 }
 
@@ -1208,6 +1285,45 @@ mod tests {
         assert!(
             msg.contains("--plan-id") || msg.contains("uuid") || msg.contains("UUID"),
             "expected malformed-plan-id failure, got: {msg}",
+        );
+    }
+
+    /// `bailiff plan list` parses with no required flags and accepts
+    /// the single optional `--bailiff-repo` override. The body of
+    /// `plan_list` (path resolution, repo init, ref enumeration,
+    /// formatter) is exercised by the library-side helper tests in
+    /// `bailiff_plan_read::list_tests` and `cli::output::tests` — the
+    /// parser test pins the clap surface so a renamed flag surfaces
+    /// here rather than as a confused operator running into an unknown
+    /// argument message.
+    #[test]
+    fn plan_list_parses_with_no_flags() {
+        let args = Args::try_parse_from(["bailiff", "plan", "list"]).unwrap();
+        let Cmd::Plan {
+            action: PlanCmd::List { bailiff_repo },
+        } = args.cmd
+        else {
+            panic!("expected PlanCmd::List");
+        };
+        assert!(bailiff_repo.is_none());
+    }
+
+    /// `--bailiff-repo` round-trips. Pins the optional-flag contract;
+    /// scripted callers that override the default path depend on this.
+    #[test]
+    fn plan_list_accepts_bailiff_repo_override() {
+        let args =
+            Args::try_parse_from(["bailiff", "plan", "list", "--bailiff-repo", "/var/bailiff"])
+                .unwrap();
+        let Cmd::Plan {
+            action: PlanCmd::List { bailiff_repo },
+        } = args.cmd
+        else {
+            panic!("expected PlanCmd::List");
+        };
+        assert_eq!(
+            bailiff_repo.as_deref(),
+            Some(std::path::Path::new("/var/bailiff"))
         );
     }
 

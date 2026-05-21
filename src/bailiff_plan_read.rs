@@ -25,14 +25,15 @@ use std::string::FromUtf8Error;
 
 use thiserror::Error;
 
+use crate::bailiff_decision::{Decider, Decision};
 use crate::bailiff_plan_note::{
-    DecisionNote, DecisionNoteParseError, ImplementNote, ImplementNoteParseError, PlanId, PlanNote,
-    PlanNoteParseError, ReviewNote, ReviewNoteParseError, plan_decision_seed_blob_bytes,
-    plan_implement_seed_blob_bytes, plan_notes_ref, plan_review_seed_blob_bytes,
-    plan_submission_seed_blob_bytes,
+    BAILIFF_PLAN_NOTES_REF_PREFIX, DecisionNote, DecisionNoteParseError, ImplementNote,
+    ImplementNoteParseError, PlanId, PlanNote, PlanNoteParseError, ReviewNote,
+    ReviewNoteParseError, plan_decision_seed_blob_bytes, plan_implement_seed_blob_bytes,
+    plan_notes_ref, plan_review_seed_blob_bytes, plan_submission_seed_blob_bytes,
 };
 use crate::bailiff_plan_write::WRIT_V1_NOTES_REFSPEC;
-use crate::core::NotesRef;
+use crate::core::{NotesRef, UnixMillis};
 use crate::notes_repo::{NotesRepo, NotesRepoError};
 use crate::run_envelope::{OutputEnvelope, SignedRunEnvelope};
 use crate::run_verify::{AllowedSigners, VerifyError, verify_run_envelope};
@@ -330,6 +331,290 @@ pub enum ReadImplementError {
         "implement note at plan {requested} carries embedded plan_id {found}; refusing to surface a cross-plan implement"
     )]
     PlanIdMismatch { requested: PlanId, found: PlanId },
+}
+
+/// Enumerate every plan-id bailiff has any notes for, in the
+/// lexicographic order [`NotesRepo::list_refs_under_prefix`] returns.
+///
+/// "Has any notes for" is a deliberate lower bar than "has a
+/// submission for" — the underlying for-each-ref scan reports a plan
+/// ref the moment any of the four seed-OIDs under it has a note
+/// attached, so a plan with only a decision (or only a review) note
+/// is still listed. The summary helper distinguishes those states via
+/// [`BailiffPlanSummary::submission`] being `None`; that's where the
+/// "workflow integrity" signal surfaces. Filtering here would hide
+/// such states from list output, which is exactly when an operator
+/// needs to see them.
+///
+/// Returned ids are not deduplicated because the underlying refs are
+/// one-per-plan by construction (the ref name embeds the id and
+/// `for-each-ref` returns each ref once).
+pub fn list_plan_ids(bailiff_repo: &NotesRepo) -> Result<Vec<PlanId>, ListPlanIdsError> {
+    let refs = bailiff_repo
+        .list_refs_under_prefix(BAILIFF_PLAN_NOTES_REF_PREFIX)
+        .map_err(ListPlanIdsError::Read)?;
+    let mut ids = Vec::with_capacity(refs.len());
+    for r in refs {
+        // `list_refs_under_prefix` guarantees every returned ref starts
+        // with the supplied prefix. A failure here would be a contract
+        // violation in `NotesRepo`, not on-disk corruption — `expect`
+        // rather than fold into the error type.
+        let tail = r
+            .as_str()
+            .strip_prefix(BAILIFF_PLAN_NOTES_REF_PREFIX)
+            .expect("list_refs_under_prefix returned a ref outside the requested prefix");
+        let id = tail
+            .parse::<PlanId>()
+            .map_err(|source| ListPlanIdsError::ParseRef {
+                raw_ref: r.as_str().to_string(),
+                tail: tail.to_string(),
+                source,
+            })?;
+        // `Uuid::parse_str` accepts non-canonical spellings (32 hex
+        // characters without hyphens, uppercase hex) that
+        // `plan_notes_ref(plan_id)` never emits — it always uses
+        // `PlanId::Display` which is the lowercase-hyphenated canonical
+        // form. If we let a non-canonical tail through, `summarize_plan`
+        // would re-derive the ref name canonically, look there, and
+        // find nothing — silently hiding the corrupted ref that
+        // actually carries the notes. Reject up front so the operator
+        // sees which on-disk ref is the offender.
+        if tail != id.to_string() {
+            return Err(ListPlanIdsError::NonCanonicalRef {
+                raw_ref: r.as_str().to_string(),
+                tail: tail.to_string(),
+                canonical: id.to_string(),
+            });
+        }
+        ids.push(id);
+    }
+    Ok(ids)
+}
+
+/// Tagged failure modes of [`list_plan_ids`]. The three variants
+/// distinguish "reading the ref set from bailiff's repo failed" from
+/// "a ref was returned whose tail isn't a parseable UUID" from "a ref
+/// parses but uses a non-canonical UUID spelling." All three of the
+/// latter two are semantic corruption — bailiff is the sole writer to
+/// the `refs/notes/bailiff/v1/plans/` namespace and always uses
+/// `plan_notes_ref(plan_id)` (i.e. `PlanId::Display`) to derive the
+/// name, so any deviation means a manual `git update-ref` or an
+/// external writer has injected state that bailiff cannot interpret.
+#[derive(Debug, Error)]
+pub enum ListPlanIdsError {
+    /// Reading the ref set from bailiff's repo failed.
+    #[error("listing bailiff plan refs failed: {0}")]
+    Read(#[source] NotesRepoError),
+    /// A ref under the plan prefix has a non-UUID tail. Surfaces the
+    /// raw ref and the offending tail so the operator can locate the
+    /// bad object.
+    #[error("plan ref {raw_ref:?} has non-UUID tail {tail:?}: {source}")]
+    ParseRef {
+        raw_ref: String,
+        tail: String,
+        source: uuid::Error,
+    },
+    /// A ref under the plan prefix has a UUID tail that parses but is
+    /// not the canonical lowercase-hyphenated form bailiff would write
+    /// — for example, 32 unhyphenated hex characters or uppercase hex.
+    /// Surfaces the raw ref, the tail as observed on disk, and the
+    /// canonical spelling so the operator can rename or remove the
+    /// offending ref.
+    #[error(
+        "plan ref {raw_ref:?} has non-canonical UUID tail {tail:?}; canonical form is {canonical:?}"
+    )]
+    NonCanonicalRef {
+        raw_ref: String,
+        tail: String,
+        canonical: String,
+    },
+}
+
+/// Aggregate per-plan view used by `bailiff plan list`. Each `Option`
+/// field is `None` when the corresponding note has not been attached
+/// to this plan's ref yet. The two-pass design (`list_plan_ids` then
+/// `summarize_plan` per id) is one repo-read for the ref set plus four
+/// reads per plan — symmetric with the existing read helpers and
+/// requires no schema beyond the seed-OID convention they already
+/// share.
+///
+/// Workflow state is derived from the field set via [`Self::state`];
+/// the formatter pins the rendering. Keeping state as a method rather
+/// than a stored field means a future caller (e.g. `bailiff plan
+/// show`) can recompute it without going through the formatter.
+///
+/// Submission absent (`submission.is_none()`) is a possible-but-rare
+/// state: the plan's ref exists (otherwise [`list_plan_ids`] wouldn't
+/// have reported the id), yet no submission has been recorded.
+/// Reachable only when a non-submission note was attached first (e.g.
+/// a decision written before the plan submission landed) or when a
+/// submission note was manually deleted after the fact. Surfaced as
+/// [`WorkflowState::Corrupt`] so an operator sees the anomaly rather
+/// than silently rendering an incomplete row.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BailiffPlanSummary {
+    pub plan_id: PlanId,
+    pub submission: Option<SubmissionSummary>,
+    pub decision: Option<DecisionSummary>,
+    pub reviewed_at: Option<UnixMillis>,
+    pub implemented_at: Option<UnixMillis>,
+}
+
+/// Submission-side projection: `purpose` (the opaque tag bailiff sent
+/// to writ on `RunAgent`) and `submitted_at` (lifted from
+/// `PlanNote.signed_metadata.completed_at` so the timestamp matches
+/// what writ recorded for the planner run). Kept distinct from the
+/// other timestamp fields because it is the only one with an
+/// associated string, so collapsing it into a bare `Option<UnixMillis>`
+/// would lose information.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SubmissionSummary {
+    pub purpose: String,
+    pub submitted_at: UnixMillis,
+}
+
+/// Decision-side projection: outcome, decider, and timestamp. A
+/// projection of [`DecisionNote`] rather than the note itself so the
+/// summary type stays narrow — `summarize_plan` discards the
+/// `plan_id` field on the note (already on the summary).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DecisionSummary {
+    pub outcome: Decision,
+    pub decider: Decider,
+    pub decided_at: UnixMillis,
+}
+
+/// High-level workflow state derived from the presence and content of
+/// the four per-plan notes. The variant tree matches the workflow
+/// progression — `Submitted` → (`Accepted` | `Rejected`) → `Reviewed`
+/// → `Implemented` — except for `Corrupt`, which is the
+/// ref-exists-without-submission anomaly.
+///
+/// State is "the highest workflow step reached," with one caveat:
+/// `Rejected` is terminal in the sense that reviewer/implementer
+/// stages should not run on a rejected plan, but the repo doesn't
+/// enforce the workflow ordering — a manual write could attach a
+/// review note to a rejected plan. The derivation prefers to surface
+/// the latest stage present in the underlying data; that's why
+/// `Implemented` overrides everything else, and `Reviewed` overrides
+/// `Rejected` if both are present. The decision field stays visible
+/// on the summary so the operator sees the conflict directly.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum WorkflowState {
+    /// Plan ref exists but no submission note is attached. Indicates
+    /// either a workflow-ordering anomaly (non-submission note written
+    /// first) or manual repo repair.
+    Corrupt,
+    /// Submission attached; no decision, review, or implement yet.
+    Submitted,
+    /// Submission + `Decision::Accepted`; no review or implement yet.
+    Accepted,
+    /// Submission + `Decision::Rejected`; no review or implement yet.
+    Rejected,
+    /// Submission + review note attached; no implement note yet.
+    /// Decision may or may not be present — the derivation prefers
+    /// the latest stage in the data.
+    Reviewed,
+    /// Implement note attached. Highest stage; overrides all others.
+    Implemented,
+}
+
+impl WorkflowState {
+    /// Stable lowercase string for CLI output. Mirrors the convention
+    /// used by [`Decision::as_str`] so the rendered state column reads
+    /// naturally next to `decision_outcome=accepted`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            WorkflowState::Corrupt => "corrupt",
+            WorkflowState::Submitted => "submitted",
+            WorkflowState::Accepted => "accepted",
+            WorkflowState::Rejected => "rejected",
+            WorkflowState::Reviewed => "reviewed",
+            WorkflowState::Implemented => "implemented",
+        }
+    }
+}
+
+impl std::fmt::Display for WorkflowState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl BailiffPlanSummary {
+    /// Derived workflow state. See [`WorkflowState`] for the
+    /// progression rule.
+    pub fn state(&self) -> WorkflowState {
+        if self.submission.is_none() {
+            return WorkflowState::Corrupt;
+        }
+        if self.implemented_at.is_some() {
+            return WorkflowState::Implemented;
+        }
+        if self.reviewed_at.is_some() {
+            return WorkflowState::Reviewed;
+        }
+        match &self.decision {
+            Some(d) => match d.outcome {
+                Decision::Accepted => WorkflowState::Accepted,
+                Decision::Rejected => WorkflowState::Rejected,
+            },
+            None => WorkflowState::Submitted,
+        }
+    }
+}
+
+/// Read every per-plan note for `plan_id` and project them into a
+/// summary suitable for `bailiff plan list`. One pass over the four
+/// `read_*_note` helpers — four ref/seed lookups, no envelope reads.
+/// The `submitted_at` / `reviewed_at` / `implemented_at` timestamps
+/// are lifted from `SignedRunMetadata.completed_at` on the
+/// corresponding notes, so no fetch into writ's repo is required.
+///
+/// Returns a summary with all four note projections folded in. A
+/// missing submission folds into `submission: None` rather than an
+/// error: the list view's job is to render what's there, and the
+/// derived [`WorkflowState::Corrupt`] flag surfaces the anomaly
+/// instead.
+pub fn summarize_plan(
+    bailiff_repo: &NotesRepo,
+    plan_id: PlanId,
+) -> Result<BailiffPlanSummary, SummarizePlanError> {
+    let submission = read_plan_note(bailiff_repo, plan_id)?.map(|note| SubmissionSummary {
+        purpose: note.purpose,
+        submitted_at: note.signed_metadata.completed_at,
+    });
+    let decision = read_decision_note(bailiff_repo, plan_id)?.map(|note| DecisionSummary {
+        outcome: note.outcome,
+        decider: note.decider,
+        decided_at: note.decided_at,
+    });
+    let reviewed_at =
+        read_review_note(bailiff_repo, plan_id)?.map(|note| note.signed_metadata.completed_at);
+    let implemented_at =
+        read_implement_note(bailiff_repo, plan_id)?.map(|note| note.signed_metadata.completed_at);
+    Ok(BailiffPlanSummary {
+        plan_id,
+        submission,
+        decision,
+        reviewed_at,
+        implemented_at,
+    })
+}
+
+/// Tagged failure modes of [`summarize_plan`]. Each variant is a
+/// straight pass-through of the underlying `Read*Error`, so an
+/// operator sees the same diagnostic the per-note read would produce.
+#[derive(Debug, Error)]
+pub enum SummarizePlanError {
+    #[error("reading plan submission note: {0}")]
+    ReadPlan(#[from] ReadPlanError),
+    #[error("reading decision note: {0}")]
+    ReadDecision(#[from] ReadDecisionError),
+    #[error("reading review note: {0}")]
+    ReadReview(#[from] ReadReviewError),
+    #[error("reading implement note: {0}")]
+    ReadImplement(#[from] ReadImplementError),
 }
 
 #[cfg(test)]
@@ -2165,5 +2450,431 @@ mod read_plan_body_tests {
             matches!(err, ReadPlanBodyError::OutputNotUtf8(_)),
             "expected OutputNotUtf8, got: {err:?}",
         );
+    }
+}
+
+#[cfg(test)]
+mod list_tests {
+    //! Tests for [`list_plan_ids`] and [`summarize_plan`] — slice F2's
+    //! aggregate read primitives. The helpers compose over the existing
+    //! `read_*_note` siblings (already covered by their own modules) so
+    //! these tests focus on:
+    //!
+    //! - ref enumeration: empty repo, multiple plans, lexicographic
+    //!   ordering, parse failure on a non-UUID tail.
+    //! - summary aggregation: each subset of the four notes maps to
+    //!   the expected `BailiffPlanSummary` field set.
+    //! - workflow-state derivation: every variant of [`WorkflowState`]
+    //!   is reachable from a corresponding fixture.
+    //!
+    //! Notes are planted directly via [`NotesRepo::write_note`] rather
+    //! than through the real write workflow because the summary helper
+    //! is a pure read-side composition; exercising the write workflow
+    //! end-to-end would require a writ broker per test, which is the
+    //! existing round-trip tests' concern in the sibling modules.
+    use super::*;
+    use crate::agent_run::{AgentRunId, sha256_hex};
+    use crate::bailiff_decision::{Decider, Decision};
+    use crate::bailiff_plan_note::{
+        DecisionNote, ImplementNote, PlanId, PlanNote, ReviewNote, plan_decision_seed_blob_bytes,
+        plan_implement_seed_blob_bytes, plan_notes_ref, plan_review_seed_blob_bytes,
+        plan_submission_seed_blob_bytes,
+    };
+    use crate::core::{
+        CapabilitySet, NotesRef, RepoRef, SessionId, Sha256Hex, SshSignature, UnixMillis,
+    };
+    use crate::protocol::SignedRunMetadata;
+    use crate::run_envelope::OutputEnvelope;
+    use crate::signing::WritSigningKey;
+    use crate::vm_git::GitObjectId;
+    use tempfile::TempDir;
+
+    const SIGNING_PEM: &str = include_str!("../tests/fixtures/ed25519_test_signing.key");
+
+    fn bailiff_repo(tmp: &TempDir) -> NotesRepo {
+        NotesRepo::init_or_open(tmp.path().join("bailiff-bare")).unwrap()
+    }
+
+    /// Build a `SignedRunMetadata` + matching signature with a given
+    /// `completed_at`. Reused across the three signed note types
+    /// (`PlanNote`, `ReviewNote`, `ImplementNote`) because the read
+    /// helpers only consult `completed_at` and the typed signature
+    /// must round-trip through `from_canonical_bytes`. The signature
+    /// is computed under the test signing key so the bytes are
+    /// structurally valid even though no verifier runs in this test
+    /// module.
+    fn sample_metadata_and_signature(
+        completed_at_millis: i64,
+    ) -> (SignedRunMetadata, SshSignature) {
+        let signing_key = WritSigningKey::from_openssh_pem(SIGNING_PEM).unwrap();
+        let output = OutputEnvelope {
+            stdout: b"agent stdout".to_vec(),
+            stderr: Vec::new(),
+            stdout_truncated_at: None,
+            stderr_truncated_at: None,
+        };
+        let output_sha = Sha256Hex::try_new(sha256_hex(&output.to_bytes())).unwrap();
+        let prompt_sha = Sha256Hex::try_new(sha256_hex(b"agent-prompt")).unwrap();
+        let metadata = SignedRunMetadata {
+            run_id: AgentRunId::new(),
+            session_id: SessionId::new(),
+            prompt_sha256: prompt_sha,
+            output_envelope_sha256: output_sha,
+            capabilities: vec![CapabilitySet::WorkspaceRead {
+                repo: RepoRef {
+                    owner: "smaug123".into(),
+                    name: "writ".into(),
+                },
+            }],
+            exit_code: 0,
+            completed_at: UnixMillis::from_millis(completed_at_millis),
+            signing_key_fingerprint: signing_key.fingerprint(),
+        };
+        let signature = signing_key.sign(&metadata.canonical_bytes()).unwrap();
+        (metadata, signature)
+    }
+
+    fn plant_plan_note(
+        bailiff: &NotesRepo,
+        plan_id: PlanId,
+        purpose: &str,
+        submitted_at_millis: i64,
+    ) {
+        let (metadata, signature) = sample_metadata_and_signature(submitted_at_millis);
+        let note = PlanNote {
+            plan_id,
+            purpose: purpose.to_string(),
+            writ_output_oid: GitObjectId::new("a".repeat(40)).unwrap(),
+            signed_metadata: metadata,
+            signature,
+        };
+        bailiff
+            .write_note(
+                &plan_notes_ref(plan_id),
+                &plan_submission_seed_blob_bytes(plan_id),
+                &note.canonical_bytes(),
+            )
+            .unwrap();
+    }
+
+    fn plant_decision_note(
+        bailiff: &NotesRepo,
+        plan_id: PlanId,
+        outcome: Decision,
+        decider: &str,
+        decided_at_millis: i64,
+    ) {
+        let note = DecisionNote {
+            plan_id,
+            outcome,
+            decider: Decider::try_new(decider).unwrap(),
+            decided_at: UnixMillis::from_millis(decided_at_millis),
+        };
+        bailiff
+            .write_note(
+                &plan_notes_ref(plan_id),
+                &plan_decision_seed_blob_bytes(plan_id),
+                &note.canonical_bytes(),
+            )
+            .unwrap();
+    }
+
+    fn plant_review_note(bailiff: &NotesRepo, plan_id: PlanId, reviewed_at_millis: i64) {
+        let (metadata, signature) = sample_metadata_and_signature(reviewed_at_millis);
+        let note = ReviewNote {
+            plan_id,
+            purpose: "plan-review".into(),
+            writ_output_oid: GitObjectId::new("b".repeat(40)).unwrap(),
+            signed_metadata: metadata,
+            signature,
+        };
+        bailiff
+            .write_note(
+                &plan_notes_ref(plan_id),
+                &plan_review_seed_blob_bytes(plan_id),
+                &note.canonical_bytes(),
+            )
+            .unwrap();
+    }
+
+    fn plant_implement_note(bailiff: &NotesRepo, plan_id: PlanId, implemented_at_millis: i64) {
+        let (metadata, signature) = sample_metadata_and_signature(implemented_at_millis);
+        let note = ImplementNote {
+            plan_id,
+            purpose: "plan-implement".into(),
+            writ_output_oid: GitObjectId::new("c".repeat(40)).unwrap(),
+            signed_metadata: metadata,
+            signature,
+        };
+        bailiff
+            .write_note(
+                &plan_notes_ref(plan_id),
+                &plan_implement_seed_blob_bytes(plan_id),
+                &note.canonical_bytes(),
+            )
+            .unwrap();
+    }
+
+    /// Empty repo has no plan refs → empty vec, exit success. Common
+    /// state on a fresh bailiff install.
+    #[test]
+    fn list_plan_ids_returns_empty_vec_on_empty_repo() {
+        let tmp = TempDir::new().unwrap();
+        let bailiff = bailiff_repo(&tmp);
+        assert_eq!(list_plan_ids(&bailiff).unwrap(), Vec::<PlanId>::new());
+    }
+
+    /// Three plans with attached submission notes — listing returns
+    /// the three ids in `for-each-ref` (lexicographic-by-ref-name)
+    /// order. Pins the contract operators rely on when piping list
+    /// output through `head -n` or similar.
+    #[test]
+    fn list_plan_ids_returns_plans_in_lexicographic_order() {
+        let tmp = TempDir::new().unwrap();
+        let bailiff = bailiff_repo(&tmp);
+        let id_a = PlanId::from_uuid("0a000000-0000-4000-8000-000000000001".parse().unwrap());
+        let id_b = PlanId::from_uuid("0b000000-0000-4000-8000-000000000002".parse().unwrap());
+        let id_c = PlanId::from_uuid("0c000000-0000-4000-8000-000000000003".parse().unwrap());
+        // Plant out of order to confirm the helper does not preserve
+        // insertion order — only the ref-name lex order matters.
+        plant_plan_note(&bailiff, id_c, "third", 3);
+        plant_plan_note(&bailiff, id_a, "first", 1);
+        plant_plan_note(&bailiff, id_b, "second", 2);
+        let ids = list_plan_ids(&bailiff).unwrap();
+        assert_eq!(ids, vec![id_a, id_b, id_c]);
+    }
+
+    /// A ref under the plan prefix whose tail is not a parseable UUID
+    /// surfaces as `ListPlanIdsError::ParseRef` with the offending tail
+    /// in the error payload. Constructed by planting a note under a
+    /// manually-constructed ref name that bypasses
+    /// `plan_notes_ref(plan_id)`. This is the corruption-detection
+    /// signal: bailiff is the sole writer to the plan namespace, so
+    /// the only way to reach this state is manual `git update-ref` or
+    /// an external writer.
+    #[test]
+    fn list_plan_ids_returns_parse_error_on_non_uuid_tail() {
+        let tmp = TempDir::new().unwrap();
+        let bailiff = bailiff_repo(&tmp);
+        // The bad ref name still has to satisfy `NotesRef::try_new`'s
+        // validators (no whitespace, no `..`, etc.) — using `garbage`
+        // as the tail keeps the ref well-formed while the tail fails
+        // UUID parsing.
+        let bad_ref = NotesRef::try_new("refs/notes/bailiff/v1/plans/not-a-uuid").unwrap();
+        bailiff
+            .write_note(&bad_ref, b"seed-bytes", b"body")
+            .unwrap();
+        let err = list_plan_ids(&bailiff).unwrap_err();
+        match err {
+            ListPlanIdsError::ParseRef {
+                raw_ref,
+                tail,
+                source: _,
+            } => {
+                assert_eq!(raw_ref, "refs/notes/bailiff/v1/plans/not-a-uuid");
+                assert_eq!(tail, "not-a-uuid");
+            }
+            other => panic!("expected ParseRef, got: {other:?}"),
+        }
+    }
+
+    /// `Uuid::parse_str` accepts non-canonical spellings (uppercase
+    /// hex, 32 unhyphenated hex characters) that `plan_notes_ref`
+    /// never emits. If `list_plan_ids` let those through, the
+    /// downstream `summarize_plan` would re-derive the ref name in
+    /// canonical lowercase-hyphenated form and look there — finding
+    /// nothing and silently hiding the corrupted ref that actually
+    /// carries the notes. Surface them as `NonCanonicalRef` so the
+    /// operator sees which on-disk ref is the offender.
+    #[test]
+    fn list_plan_ids_rejects_uppercase_hex_uuid_tail() {
+        let tmp = TempDir::new().unwrap();
+        let bailiff = bailiff_repo(&tmp);
+        let bad_ref =
+            NotesRef::try_new("refs/notes/bailiff/v1/plans/AAAAAAAA-BBBB-4CCC-8DDD-EEEEEEEEEEEE")
+                .unwrap();
+        bailiff
+            .write_note(&bad_ref, b"seed-bytes", b"body")
+            .unwrap();
+        let err = list_plan_ids(&bailiff).unwrap_err();
+        match err {
+            ListPlanIdsError::NonCanonicalRef {
+                raw_ref,
+                tail,
+                canonical,
+            } => {
+                assert_eq!(
+                    raw_ref,
+                    "refs/notes/bailiff/v1/plans/AAAAAAAA-BBBB-4CCC-8DDD-EEEEEEEEEEEE"
+                );
+                assert_eq!(tail, "AAAAAAAA-BBBB-4CCC-8DDD-EEEEEEEEEEEE");
+                assert_eq!(canonical, "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee");
+            }
+            other => panic!("expected NonCanonicalRef, got: {other:?}"),
+        }
+    }
+
+    /// The other non-canonical spelling `uuid` accepts: 32 hex
+    /// characters without hyphens. Same risk and same fix as the
+    /// uppercase case, separately pinned because the two code paths
+    /// inside `Uuid::parse_str` are independent.
+    #[test]
+    fn list_plan_ids_rejects_unhyphenated_uuid_tail() {
+        let tmp = TempDir::new().unwrap();
+        let bailiff = bailiff_repo(&tmp);
+        let bad_ref =
+            NotesRef::try_new("refs/notes/bailiff/v1/plans/aaaaaaaabbbb4ccc8dddeeeeeeeeeeee")
+                .unwrap();
+        bailiff
+            .write_note(&bad_ref, b"seed-bytes", b"body")
+            .unwrap();
+        let err = list_plan_ids(&bailiff).unwrap_err();
+        match err {
+            ListPlanIdsError::NonCanonicalRef {
+                tail, canonical, ..
+            } => {
+                assert_eq!(tail, "aaaaaaaabbbb4ccc8dddeeeeeeeeeeee");
+                assert_eq!(canonical, "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee");
+            }
+            other => panic!("expected NonCanonicalRef, got: {other:?}"),
+        }
+    }
+
+    /// A plan-id whose ref exists but carries no submission note
+    /// (decision attached first, manual repo state) folds into
+    /// `submission: None` rather than an error. Pin the surface so
+    /// `bailiff plan list` keeps rendering the row instead of failing
+    /// the whole command — the [`WorkflowState::Corrupt`] derivation
+    /// is how the operator sees the anomaly.
+    #[test]
+    fn summarize_plan_returns_corrupt_state_when_only_decision_present() {
+        let tmp = TempDir::new().unwrap();
+        let bailiff = bailiff_repo(&tmp);
+        let plan_id = PlanId::new();
+        plant_decision_note(&bailiff, plan_id, Decision::Accepted, "cli:tester", 100);
+        let summary = summarize_plan(&bailiff, plan_id).unwrap();
+        assert_eq!(summary.plan_id, plan_id);
+        assert!(summary.submission.is_none());
+        assert!(summary.decision.is_some());
+        assert!(summary.reviewed_at.is_none());
+        assert!(summary.implemented_at.is_none());
+        assert_eq!(summary.state(), WorkflowState::Corrupt);
+    }
+
+    /// Submission only: the four optionals are submission=Some,
+    /// decision=None, reviewed_at=None, implemented_at=None.
+    /// `purpose` and `submitted_at` come from the plan note's body and
+    /// metadata; pin both.
+    #[test]
+    fn summarize_plan_returns_submission_only_when_just_submitted() {
+        let tmp = TempDir::new().unwrap();
+        let bailiff = bailiff_repo(&tmp);
+        let plan_id = PlanId::new();
+        plant_plan_note(&bailiff, plan_id, "fix-oauth-drift", 1_700_000_000_000);
+        let summary = summarize_plan(&bailiff, plan_id).unwrap();
+        let submission = summary
+            .submission
+            .as_ref()
+            .expect("submission must be Some");
+        assert_eq!(submission.purpose, "fix-oauth-drift");
+        assert_eq!(submission.submitted_at.as_millis(), 1_700_000_000_000);
+        assert!(summary.decision.is_none());
+        assert!(summary.reviewed_at.is_none());
+        assert!(summary.implemented_at.is_none());
+        assert_eq!(summary.state(), WorkflowState::Submitted);
+    }
+
+    /// Submission + accept decision → state=accepted, decision fields
+    /// projected from the note. A regression that swapped accept and
+    /// reject would be catastrophically wrong but invisible to the
+    /// `submitted` test above.
+    #[test]
+    fn summarize_plan_projects_accepted_decision() {
+        let tmp = TempDir::new().unwrap();
+        let bailiff = bailiff_repo(&tmp);
+        let plan_id = PlanId::new();
+        plant_plan_note(&bailiff, plan_id, "p", 1);
+        plant_decision_note(&bailiff, plan_id, Decision::Accepted, "cli:alice", 2);
+        let summary = summarize_plan(&bailiff, plan_id).unwrap();
+        let decision = summary.decision.as_ref().expect("decision must be Some");
+        assert_eq!(decision.outcome, Decision::Accepted);
+        assert_eq!(decision.decider.as_str(), "cli:alice");
+        assert_eq!(decision.decided_at.as_millis(), 2);
+        assert_eq!(summary.state(), WorkflowState::Accepted);
+    }
+
+    /// Submission + reject decision → state=rejected.
+    #[test]
+    fn summarize_plan_projects_rejected_decision() {
+        let tmp = TempDir::new().unwrap();
+        let bailiff = bailiff_repo(&tmp);
+        let plan_id = PlanId::new();
+        plant_plan_note(&bailiff, plan_id, "p", 1);
+        plant_decision_note(&bailiff, plan_id, Decision::Rejected, "cli:bob", 2);
+        let summary = summarize_plan(&bailiff, plan_id).unwrap();
+        assert_eq!(
+            summary.decision.as_ref().map(|d| d.outcome),
+            Some(Decision::Rejected),
+        );
+        assert_eq!(summary.state(), WorkflowState::Rejected);
+    }
+
+    /// Submission + accept + review → state=reviewed; `reviewed_at`
+    /// lifted from the review note's signed metadata.
+    #[test]
+    fn summarize_plan_projects_reviewed_at_when_reviewed() {
+        let tmp = TempDir::new().unwrap();
+        let bailiff = bailiff_repo(&tmp);
+        let plan_id = PlanId::new();
+        plant_plan_note(&bailiff, plan_id, "p", 1);
+        plant_decision_note(&bailiff, plan_id, Decision::Accepted, "cli:alice", 2);
+        plant_review_note(&bailiff, plan_id, 1_700_000_001_000);
+        let summary = summarize_plan(&bailiff, plan_id).unwrap();
+        assert_eq!(
+            summary.reviewed_at.map(|t| t.as_millis()),
+            Some(1_700_000_001_000),
+        );
+        assert!(summary.implemented_at.is_none());
+        assert_eq!(summary.state(), WorkflowState::Reviewed);
+    }
+
+    /// All four notes present → state=implemented; every projection
+    /// populated. The "highest stage" rule means `Implemented` wins
+    /// over `Reviewed` even though both notes are attached.
+    #[test]
+    fn summarize_plan_projects_implemented_at_when_implemented() {
+        let tmp = TempDir::new().unwrap();
+        let bailiff = bailiff_repo(&tmp);
+        let plan_id = PlanId::new();
+        plant_plan_note(&bailiff, plan_id, "p", 1);
+        plant_decision_note(&bailiff, plan_id, Decision::Accepted, "cli:alice", 2);
+        plant_review_note(&bailiff, plan_id, 3);
+        plant_implement_note(&bailiff, plan_id, 1_700_000_002_000);
+        let summary = summarize_plan(&bailiff, plan_id).unwrap();
+        assert_eq!(
+            summary.implemented_at.map(|t| t.as_millis()),
+            Some(1_700_000_002_000),
+        );
+        assert_eq!(
+            summary.reviewed_at.map(|t| t.as_millis()),
+            Some(3),
+            "reviewed_at must still surface even though state overrides to implemented",
+        );
+        assert_eq!(summary.state(), WorkflowState::Implemented);
+    }
+
+    /// `WorkflowState::as_str` pins the lowercase string the formatter
+    /// writes; a rename would surface here rather than as a test-snapshot
+    /// drift somewhere far from the source.
+    #[test]
+    fn workflow_state_as_str_is_stable_lowercase() {
+        assert_eq!(WorkflowState::Corrupt.as_str(), "corrupt");
+        assert_eq!(WorkflowState::Submitted.as_str(), "submitted");
+        assert_eq!(WorkflowState::Accepted.as_str(), "accepted");
+        assert_eq!(WorkflowState::Rejected.as_str(), "rejected");
+        assert_eq!(WorkflowState::Reviewed.as_str(), "reviewed");
+        assert_eq!(WorkflowState::Implemented.as_str(), "implemented");
+        // Display must agree with as_str.
+        assert_eq!(WorkflowState::Submitted.to_string(), "submitted");
     }
 }
