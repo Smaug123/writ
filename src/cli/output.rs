@@ -224,12 +224,12 @@ pub fn write_plan_detail(out: &mut dyn Write, plan: &PlanDetail) -> std::io::Res
 ///
 /// `purpose` and `decision_decider` are free-form text — `--purpose`
 /// accepts arbitrary strings, and `Decider::try_new` rejects only
-/// embedded NUL. Both are routed through [`write_inline_value`], which
-/// emits a bare token when the value is safe and a double-quoted,
-/// backslash-escaped token when it contains newlines, carriage
-/// returns, backslashes, double quotes, or matches the literal
-/// `<none>` sentinel. This keeps each plan block parseable as one
-/// line per key even when persisted metadata is adversarial.
+/// embedded NUL. Both are routed through an inline-escape helper
+/// that emits a bare token when the value is safe and a double-
+/// quoted, backslash-escaped token when it contains newlines,
+/// carriage returns, backslashes, double quotes, or matches the
+/// literal `<none>` sentinel. This keeps each plan block parseable
+/// as one line per key even when persisted metadata is adversarial.
 pub fn write_bailiff_plan_list(
     out: &mut dyn Write,
     plans: &[BailiffPlanSummary],
