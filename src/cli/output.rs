@@ -485,7 +485,16 @@ fn write_envelope_metadata(
         metadata.signing_key_fingerprint.as_str()
     )?;
     for capability in &metadata.capabilities {
-        writeln!(out, "{prefix}capability={}", capability_inline(capability))?;
+        write!(out, "{prefix}capability=")?;
+        // Route the inline projection through `write_inline_value`:
+        // `RepoRef::from_str` only rejects empty parts and embedded
+        // '/', so a tampered envelope can still carry a `RepoRef`
+        // whose owner or name contains a newline / CR. Without
+        // quoting, that byte would break the one-key-per-line
+        // invariant `bailiff plan show` promises and could forge
+        // additional lines under any later key.
+        // `write_inline_value` emits its own terminating newline.
+        write_inline_value(out, &capability_inline(capability))?;
     }
     Ok(())
 }
@@ -2227,6 +2236,50 @@ mod tests {
                     "capability=workspace_read:smaug123/alpha",
                     "capability=workspace_write:smaug123/beta",
                 ],
+            );
+        }
+
+        /// A capability whose `RepoRef` carries a newline (which
+        /// `RepoRef::from_str` does not reject; a tampered envelope
+        /// can still deserialize one) must be quoted, not emitted
+        /// raw. The unquoted form would break the one-key-per-line
+        /// invariant and could forge additional lines under any
+        /// later key. Pins that `capability=` routes through
+        /// `write_inline_value`.
+        #[test]
+        fn show_quotes_capability_with_embedded_newline() {
+            let mut metadata = sample_metadata();
+            metadata.capabilities = vec![CapabilitySet::WorkspaceRead {
+                repo: RepoRef {
+                    owner: "evil\noutput".into(),
+                    name: "victim".into(),
+                },
+            }];
+            let mut note = sample_plan_note();
+            note.signed_metadata = metadata.clone();
+            let envelope = SignedRunEnvelope {
+                metadata,
+                signature: sample_signature(),
+                output: b"out".to_vec(),
+            };
+            let view = PlanFullView {
+                plan_id: PlanId::from_uuid(PLAN_ID_HEX.parse().unwrap()),
+                plan: Some(VerifiedSection::Verified { note, envelope }),
+                decision: None,
+                review: None,
+                implement: None,
+            };
+            let rendered = render(&view);
+            assert!(
+                rendered.contains("capability=\"workspace_read:evil\\noutput/victim\""),
+                "got: {rendered}",
+            );
+            // And the literal newline must NOT appear inside the
+            // capability line — otherwise the injected `output`
+            // token would surface as its own bogus key.
+            assert!(
+                !rendered.contains("evil\noutput"),
+                "literal newline leaked into output: {rendered}",
             );
         }
     }
