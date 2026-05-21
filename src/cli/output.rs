@@ -404,6 +404,26 @@ fn write_signed_section<T: SignedBailiffNote>(
             write_signed_note_common(out, note)?;
             write_envelope_metadata(out, &envelope.metadata, "")?;
             write_envelope_metadata(out, note.signed_metadata(), "note_")?;
+            // Without these two digest lines, a signature-only
+            // divergence (metadata byte-equal, signature differs) is
+            // invisible — the two metadata projections render
+            // identically and the operator sees
+            // `verification=note_envelope_mismatch` with no
+            // differing field. Dumping the full PEM-armoured
+            // signature here would flood the page; a SHA-256 of the
+            // signature string is enough to confirm "differ vs
+            // identical" at a glance, and the operator can `git
+            // notes show` the relevant ref if they need the body.
+            writeln!(
+                out,
+                "signature_sha256={}",
+                crate::agent_run::sha256_hex(envelope.signature.as_str().as_bytes())
+            )?;
+            writeln!(
+                out,
+                "note_signature_sha256={}",
+                crate::agent_run::sha256_hex(note.signature().as_str().as_bytes())
+            )?;
         }
         VerifiedSection::WritEnvelopeMissing { note } => {
             writeln!(out, "verification=writ_envelope_missing")?;
@@ -1964,6 +1984,71 @@ mod tests {
             // Note-side carries the divergent values under `note_`.
             assert!(rendered.contains("note_run_id=99999999-9999-4999-8999-999999999999\n"));
             assert!(rendered.contains("note_completed_at=1800000000000\n"));
+            // Both signatures hash to the same value (this fixture
+            // reuses `sample_signature()` on both sides). The lines
+            // must still be present so the operator can confirm the
+            // divergence is metadata-only.
+            let expected_sig_digest =
+                crate::agent_run::sha256_hex(sample_signature().as_str().as_bytes());
+            assert!(
+                rendered.contains(&format!("signature_sha256={expected_sig_digest}\n")),
+                "missing envelope-side signature digest: {rendered}",
+            );
+            assert!(
+                rendered.contains(&format!("note_signature_sha256={expected_sig_digest}\n")),
+                "missing note-side signature digest: {rendered}",
+            );
+        }
+
+        /// Regression for a Codex P2 finding: when only the signature
+        /// differs (metadata byte-equal) the previous formatter
+        /// emitted two byte-identical metadata projections with no
+        /// hint as to what diverged. The `signature_sha256` /
+        /// `note_signature_sha256` lines must hash the two
+        /// signatures separately so the operator sees the
+        /// divergence at a glance — full PEM-armoured signatures
+        /// would flood the page, but a digest pin is enough to
+        /// confirm "the two differ."
+        #[test]
+        fn show_signature_only_mismatch_renders_distinct_signature_digests() {
+            // Note and envelope share metadata but carry distinct
+            // signature bodies — the case Codex called out.
+            let envelope_signature = sample_signature();
+            let note_signature = SshSignature::try_new(
+                "-----BEGIN SSH SIGNATURE-----\ndifferentbase64==\n-----END SSH SIGNATURE-----"
+                    .to_string(),
+            )
+            .unwrap();
+            let mut note = sample_plan_note();
+            note.signature = note_signature.clone();
+            let envelope = SignedRunEnvelope {
+                metadata: sample_metadata(),
+                signature: envelope_signature.clone(),
+                output: b"out".to_vec(),
+            };
+            let view = PlanFullView {
+                plan_id: PlanId::from_uuid(PLAN_ID_HEX.parse().unwrap()),
+                plan: Some(VerifiedSection::NoteEnvelopeMismatch { note, envelope }),
+                decision: None,
+                review: None,
+                implement: None,
+            };
+            let rendered = render(&view);
+            let envelope_digest =
+                crate::agent_run::sha256_hex(envelope_signature.as_str().as_bytes());
+            let note_digest = crate::agent_run::sha256_hex(note_signature.as_str().as_bytes());
+            assert_ne!(
+                envelope_digest, note_digest,
+                "fixture must exercise a real divergence",
+            );
+            assert!(
+                rendered.contains(&format!("signature_sha256={envelope_digest}\n")),
+                "missing envelope-side signature digest: {rendered}",
+            );
+            assert!(
+                rendered.contains(&format!("note_signature_sha256={note_digest}\n")),
+                "missing note-side signature digest: {rendered}",
+            );
         }
 
         /// `WritEnvelopeMissing` projects the note's metadata as the
