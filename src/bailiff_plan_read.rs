@@ -33,8 +33,9 @@ use crate::bailiff_plan_note::{
     plan_notes_ref, plan_review_seed_blob_bytes, plan_submission_seed_blob_bytes,
 };
 use crate::bailiff_plan_write::WRIT_V1_NOTES_REFSPEC;
-use crate::core::{NotesRef, UnixMillis};
+use crate::core::{NotesRef, SshSignature, UnixMillis};
 use crate::notes_repo::{NotesRepo, NotesRepoError};
+use crate::protocol::SignedRunMetadata;
 use crate::run_envelope::{OutputEnvelope, SignedRunEnvelope};
 use crate::run_verify::{AllowedSigners, VerifyError, verify_run_envelope};
 use crate::vm_git::GitObjectId;
@@ -699,13 +700,21 @@ pub struct PlanFullView {
 }
 
 /// Pairs a bailiff-side signed note with the outcome of verifying its
-/// referenced writ envelope. The four-way split mirrors what
+/// referenced writ envelope. The five-way split mirrors what
 /// `bailiff plan show` (slice F4) must surface:
 ///
-/// - [`VerifiedSection::Verified`]: envelope present, decoded, and
-///   end-to-end verified by [`verify_run_envelope`]. Carries both the
-///   note and the envelope so the F4 renderer can project from
-///   either without re-reading.
+/// - [`VerifiedSection::Verified`]: envelope present, decoded,
+///   end-to-end verified by [`verify_run_envelope`], **and** the
+///   note's copied `(signed_metadata, signature)` pair matches the
+///   envelope's. Carries both the note and the envelope so the F4
+///   renderer can project from either without re-reading.
+/// - [`VerifiedSection::NoteEnvelopeMismatch`]: envelope verifies on
+///   its own, but the bailiff note's `signed_metadata` /
+///   `signature` copies don't match the envelope at the OID. A
+///   tampered or stale note paired with a legitimate envelope must
+///   never render as `Verified` — the bailiff note's stated
+///   metadata is what the operator sees, and it has to be exactly
+///   what writ signed.
 /// - [`VerifiedSection::WritEnvelopeMissing`]: bailiff's local copy
 ///   of writ's notes ref has no annotation at the note's
 ///   `writ_output_oid`. Either bailiff has not fetched writ's notes
@@ -733,6 +742,10 @@ pub enum VerifiedSection<T> {
         note: T,
         envelope: SignedRunEnvelope,
     },
+    NoteEnvelopeMismatch {
+        note: T,
+        envelope: SignedRunEnvelope,
+    },
     WritEnvelopeMissing {
         note: T,
     },
@@ -744,6 +757,59 @@ pub enum VerifiedSection<T> {
         note: T,
         error: VerifyError,
     },
+}
+
+/// Projection shared by the three signed bailiff note types
+/// ([`PlanNote`], [`ReviewNote`], [`ImplementNote`]). Each carries the
+/// same `(writ_output_oid, signed_metadata, signature)` triple even
+/// though the surrounding fields (`purpose`, `plan_id`) differ; this
+/// trait lets [`read_full_plan`] dispatch the read-and-verify path
+/// uniformly without unifying the note structs themselves.
+///
+/// **Not** a polymorphism point: the only implementors are the three
+/// note types and the only consumer is [`read_full_plan`]. The trait
+/// is here as a static field-projection abstraction (rule of three),
+/// not as an extension surface.
+trait SignedBailiffNote {
+    fn writ_output_oid(&self) -> &GitObjectId;
+    fn signed_metadata(&self) -> &SignedRunMetadata;
+    fn signature(&self) -> &SshSignature;
+}
+
+impl SignedBailiffNote for PlanNote {
+    fn writ_output_oid(&self) -> &GitObjectId {
+        &self.writ_output_oid
+    }
+    fn signed_metadata(&self) -> &SignedRunMetadata {
+        &self.signed_metadata
+    }
+    fn signature(&self) -> &SshSignature {
+        &self.signature
+    }
+}
+
+impl SignedBailiffNote for ReviewNote {
+    fn writ_output_oid(&self) -> &GitObjectId {
+        &self.writ_output_oid
+    }
+    fn signed_metadata(&self) -> &SignedRunMetadata {
+        &self.signed_metadata
+    }
+    fn signature(&self) -> &SshSignature {
+        &self.signature
+    }
+}
+
+impl SignedBailiffNote for ImplementNote {
+    fn writ_output_oid(&self) -> &GitObjectId {
+        &self.writ_output_oid
+    }
+    fn signed_metadata(&self) -> &SignedRunMetadata {
+        &self.signed_metadata
+    }
+    fn signature(&self) -> &SshSignature {
+        &self.signature
+    }
 }
 
 /// Outcome of pairing a writ output OID with an envelope and running
@@ -786,15 +852,26 @@ fn read_and_verify_envelope(
 }
 
 /// Project a `(verification, note)` pair into the user-visible
-/// [`VerifiedSection`]. The same shape works for every signed bailiff
-/// note (`PlanNote`, `ReviewNote`, `ImplementNote`) because all three
-/// expose `writ_output_oid` and carry a `signed_metadata` /
-/// `signature` pair that the envelope at the OID already covers — so
-/// the per-section pairing logic is purely "stash this note next to
-/// its verification outcome."
-fn wrap_section<T>(verification: EnvelopeVerification, note: T) -> VerifiedSection<T> {
+/// [`VerifiedSection`]. For the `Verified` envelope outcome,
+/// additionally checks that the note's copied `signed_metadata` and
+/// `signature` match the envelope's — otherwise an operator could be
+/// shown a stale or forged note alongside a legitimate envelope and
+/// see the section render as "verified" when the visible note bytes
+/// were not what writ signed.
+fn wrap_section<T: SignedBailiffNote>(
+    verification: EnvelopeVerification,
+    note: T,
+) -> VerifiedSection<T> {
     match verification {
-        EnvelopeVerification::Verified(envelope) => VerifiedSection::Verified { note, envelope },
+        EnvelopeVerification::Verified(envelope) => {
+            if &envelope.metadata == note.signed_metadata()
+                && &envelope.signature == note.signature()
+            {
+                VerifiedSection::Verified { note, envelope }
+            } else {
+                VerifiedSection::NoteEnvelopeMismatch { note, envelope }
+            }
+        }
         EnvelopeVerification::Missing => VerifiedSection::WritEnvelopeMissing { note },
         EnvelopeVerification::Malformed(error) => {
             VerifiedSection::EnvelopeMalformed { note, error }
@@ -807,19 +884,17 @@ fn wrap_section<T>(verification: EnvelopeVerification, note: T) -> VerifiedSecti
 /// writ envelope, verify it, and wrap the outcome. Returns `Ok(None)`
 /// when the note itself is absent — the no-yet-attached case for
 /// review/implement sections, and the corrupt case for plan
-/// submissions. Used three times by [`read_full_plan`] with one
-/// closure per call site projecting `writ_output_oid` off the
-/// particular note type.
-fn read_and_project_section<T>(
+/// submissions. Used three times by [`read_full_plan`], once per
+/// concrete `T: SignedBailiffNote`.
+fn read_and_project_section<T: SignedBailiffNote>(
     bailiff_repo: &NotesRepo,
     note: Option<T>,
-    oid_of: impl FnOnce(&T) -> &GitObjectId,
     allowed: &AllowedSigners,
 ) -> Result<Option<VerifiedSection<T>>, ReadFullPlanError> {
     let Some(note) = note else {
         return Ok(None);
     };
-    let verification = read_and_verify_envelope(bailiff_repo, oid_of(&note), allowed)
+    let verification = read_and_verify_envelope(bailiff_repo, note.writ_output_oid(), allowed)
         .map_err(ReadFullPlanError::ReadEnvelope)?;
     Ok(Some(wrap_section(verification, note)))
 }
@@ -849,20 +924,17 @@ pub fn read_full_plan(
     let plan = read_and_project_section(
         bailiff_repo,
         read_plan_note(bailiff_repo, plan_id)?,
-        |n| &n.writ_output_oid,
         allowed_signers,
     )?;
     let decision = read_decision_note(bailiff_repo, plan_id)?;
     let review = read_and_project_section(
         bailiff_repo,
         read_review_note(bailiff_repo, plan_id)?,
-        |n| &n.writ_output_oid,
         allowed_signers,
     )?;
     let implement = read_and_project_section(
         bailiff_repo,
         read_implement_note(bailiff_repo, plan_id)?,
-        |n| &n.writ_output_oid,
         allowed_signers,
     )?;
     Ok(PlanFullView {
@@ -3716,5 +3788,104 @@ mod full_plan_tests {
             } => {}
             other => panic!("expected SignatureFailure(SignatureInvalid), got {other:?}"),
         }
+    }
+
+    /// Note/envelope binding: plant a legitimate envelope under one
+    /// signed metadata, then plant a bailiff plan note that points at
+    /// the same OID but carries a *different* signed metadata (also
+    /// validly signed in isolation). The envelope verifies, but the
+    /// note's copied `(signed_metadata, signature)` pair doesn't
+    /// match the envelope's — so the section must surface as
+    /// `NoteEnvelopeMismatch`, never as `Verified`.
+    ///
+    /// This is the attack vector codex P1 surfaced: without the
+    /// binding check, an operator who edits the bailiff plan note
+    /// (mutating `purpose`, or replacing `signed_metadata` with the
+    /// metadata of a different run) could be shown the forged note
+    /// next to a legitimate envelope's `Verified` status.
+    #[test]
+    fn read_full_plan_rejects_note_when_metadata_does_not_match_envelope() {
+        let tmp = TempDir::new().unwrap();
+        let bailiff = bailiff_repo(&tmp);
+        let signing_key = WritSigningKey::from_openssh_pem(SIGNING_PEM).unwrap();
+        let plan_id = PlanId::new();
+
+        // Envelope: signed run A, planted on bailiff's writ ref.
+        let envelope_run = plant_run(&bailiff, &signing_key, 1, "envelope-run");
+
+        // Note: built from a *different* signed run B, but pointing
+        // at run A's envelope OID. Both metadatas are independently
+        // valid; the binding from note → envelope is what's broken.
+        let (note_metadata, _) = build_metadata(&signing_key, 2, "note-run");
+        let note_signature = signing_key.sign(&note_metadata.canonical_bytes()).unwrap();
+        let note = PlanNote {
+            plan_id,
+            purpose: "plan".into(),
+            writ_output_oid: envelope_run.writ_output_oid.clone(),
+            signed_metadata: note_metadata,
+            signature: note_signature,
+        };
+        bailiff
+            .write_note(
+                &plan_notes_ref(plan_id),
+                &plan_submission_seed_blob_bytes(plan_id),
+                &note.canonical_bytes(),
+            )
+            .unwrap();
+
+        let view = read_full_plan(&bailiff, plan_id, &allowed_signers_for(&signing_key)).unwrap();
+        match view.plan.as_ref().unwrap() {
+            VerifiedSection::NoteEnvelopeMismatch { note, envelope } => {
+                assert_eq!(note.writ_output_oid, envelope_run.writ_output_oid);
+                assert_eq!(envelope.metadata, envelope_run.metadata);
+                assert_ne!(note.signed_metadata, envelope.metadata);
+            }
+            other => panic!("expected NoteEnvelopeMismatch, got {other:?}"),
+        }
+    }
+
+    /// Mutating only the bailiff note's `signature` (but leaving its
+    /// `signed_metadata` byte-for-byte equal to the envelope's) must
+    /// still trip the binding check. The note claims a different
+    /// signature than the envelope carries; rendering it as
+    /// `Verified` would let a stale or attacker-supplied signature
+    /// ride alongside a legitimate envelope.
+    #[test]
+    fn read_full_plan_rejects_note_when_only_signature_diverges() {
+        let tmp = TempDir::new().unwrap();
+        let bailiff = bailiff_repo(&tmp);
+        let signing_key = WritSigningKey::from_openssh_pem(SIGNING_PEM).unwrap();
+        let plan_id = PlanId::new();
+
+        let envelope_run = plant_run(&bailiff, &signing_key, 1, "binding-signature");
+        // Re-sign the same metadata under a different key (the
+        // ssh-sig signing process incorporates a random nonce, so
+        // even signing under the same key would give different bytes;
+        // a different key just makes the divergence more obvious).
+        let other_key = WritSigningKey::from_openssh_pem(OTHER_PEM).unwrap();
+        let foreign_signature = other_key
+            .sign(&envelope_run.metadata.canonical_bytes())
+            .unwrap();
+        assert_ne!(foreign_signature, envelope_run.signature);
+        let note = PlanNote {
+            plan_id,
+            purpose: "plan".into(),
+            writ_output_oid: envelope_run.writ_output_oid.clone(),
+            signed_metadata: envelope_run.metadata.clone(),
+            signature: foreign_signature,
+        };
+        bailiff
+            .write_note(
+                &plan_notes_ref(plan_id),
+                &plan_submission_seed_blob_bytes(plan_id),
+                &note.canonical_bytes(),
+            )
+            .unwrap();
+
+        let view = read_full_plan(&bailiff, plan_id, &allowed_signers_for(&signing_key)).unwrap();
+        assert!(matches!(
+            view.plan,
+            Some(VerifiedSection::NoteEnvelopeMismatch { .. }),
+        ));
     }
 }
