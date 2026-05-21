@@ -580,7 +580,6 @@ mod tests {
             openai_proxy: Some(openai_proxy),
             agent_runs: None,
             git_push: None,
-            plans: None,
         }
     }
 

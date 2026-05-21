@@ -458,7 +458,6 @@ mod tests {
             openai_proxy: None,
             agent_runs: None,
             git_push: None,
-            plans: None,
         }
     }
 
@@ -812,7 +811,6 @@ work_root=${{work_dir%/*}}
                 claude: None,
                 openai: None,
             },
-            None,
             None,
             None,
             shutdown_rx,

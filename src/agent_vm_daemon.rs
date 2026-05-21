@@ -42,8 +42,8 @@ use crate::vm_git::{
 };
 use crate::vm_http::{
     RunningVmHttpSession, VM_NIX_BASIC_LOGIN, VM_NIX_CACHE_PATH_PREFIX, VmHttpAgentRunService,
-    VmHttpGitPushService, VmHttpPlanService, VmHttpRuntimeConfig, VmHttpRuntimeError,
-    VmHttpRuntimeShutdownError, prepare_vm_http_session_with_agent_runs,
+    VmHttpGitPushService, VmHttpRuntimeConfig, VmHttpRuntimeError, VmHttpRuntimeShutdownError,
+    prepare_vm_http_session_with_agent_runs,
 };
 
 pub use crate::vm_client::{
@@ -999,7 +999,6 @@ impl AgentVmDaemon {
                 Arc::new(staging_store),
                 self.config.vm_http.git_push_body_limits(),
             );
-            let plans = VmHttpPlanService::new(Arc::clone(&state));
             let prepared = prepare_vm_http_session_with_agent_runs(
                 Arc::clone(&state),
                 &self.config.vm_http,
@@ -1007,7 +1006,6 @@ impl AgentVmDaemon {
                 network.ipv4(),
                 agent_runs,
                 Some(git_push),
-                Some(plans),
             )
             .await?;
             let broker_port = prepared.broker_port();
