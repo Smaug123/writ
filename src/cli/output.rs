@@ -9,9 +9,13 @@
 
 use std::io::Write;
 
-use crate::bailiff_plan_read::BailiffPlanSummary;
+use crate::bailiff_plan_note::DecisionNote;
+use crate::bailiff_plan_read::{
+    BailiffPlanSummary, PlanFullView, SignedBailiffNote, VerifiedSection,
+};
 use crate::protocol::{
-    AgentVmSessionInfo, PlanDetail, PlanSummary, StagedPushDetail, StagedPushSummary,
+    AgentVmSessionInfo, PlanDetail, PlanSummary, SignedRunMetadata, StagedPushDetail,
+    StagedPushSummary,
 };
 
 pub fn write_staged_push_summaries(
@@ -312,6 +316,209 @@ fn write_inline_value(out: &mut dyn Write, value: &str) -> std::io::Result<()> {
         }
     }
     writeln!(out, "\"")
+}
+
+/// Render the `bailiff plan show` output. Emits a top-level
+/// `plan_id=<uuid>` line followed by four section blocks
+/// (`-- plan --`, `-- decision --`, `-- review --`, `-- implement --`),
+/// each separated from the previous by a blank line. Every section is
+/// emitted unconditionally — an absent signed section surfaces as
+/// `verification=<none>`, an absent decision surfaces as
+/// `outcome=<none>`. This mirrors the always-emit convention
+/// [`write_plan_detail`] uses, so the rendered surface is parallel
+/// across the writ-side and bailiff-side detail verbs.
+///
+/// For each signed section the `verification` key carries one of:
+///
+/// - `verified` — envelope present at the writ output OID, decoded,
+///   end-to-end verified, and the note's persisted `signed_metadata`
+///   / `signature` match the envelope's. The metadata fields
+///   (`run_id`, `session_id`, …) are projected from the envelope
+///   (which agrees with the note in this state).
+/// - `note_envelope_mismatch` — envelope verifies on its own but the
+///   note's persisted metadata diverges from the envelope's. Both
+///   sides render: the envelope's values as the unprefixed keys
+///   (the cryptographic truth) and the note's values with a `note_`
+///   prefix, so an operator can diff the two without re-reading
+///   either source. The divergence itself is the trust violation;
+///   the renderer's job is to surface it, not to choose which side
+///   is "right."
+/// - `writ_envelope_missing` — bailiff's local copy of writ's notes
+///   ref has no annotation at the note's `writ_output_oid`. The
+///   note's metadata is rendered (operator can compare against
+///   writ's authoritative copy after a fetch). Recoverable by
+///   re-running the relevant `submit*` verb to pull the envelope
+///   across.
+/// - `envelope_malformed` — an envelope body exists at the OID but
+///   does not decode as `SignedRunEnvelope`. The note's metadata
+///   is rendered plus a quoted `envelope_error=` line carrying the
+///   underlying decode message.
+/// - `signature_failure` — envelope decoded but the verifier
+///   rejected it. The note's metadata is rendered plus a quoted
+///   `verify_error=` line naming the specific check that failed.
+///
+/// `purpose` and the wrapped error strings are routed through the
+/// same `write_inline_value` helper that [`write_bailiff_plan_list`]
+/// uses — newlines, backslashes, embedded quotes, and the literal
+/// `<none>` sentinel are double-quoted and escaped so the
+/// one-line-per-key invariant survives even adversarial agent
+/// output (the verify error chain may quote bytes from writ's
+/// signed metadata).
+pub fn write_bailiff_plan_show(out: &mut dyn Write, view: &PlanFullView) -> std::io::Result<()> {
+    writeln!(out, "plan_id={}", view.plan_id)?;
+    writeln!(out)?;
+    writeln!(out, "-- plan --")?;
+    write_signed_section(out, view.plan.as_ref())?;
+    writeln!(out)?;
+    writeln!(out, "-- decision --")?;
+    write_decision_section(out, view.decision.as_ref())?;
+    writeln!(out)?;
+    writeln!(out, "-- review --")?;
+    write_signed_section(out, view.review.as_ref())?;
+    writeln!(out)?;
+    writeln!(out, "-- implement --")?;
+    write_signed_section(out, view.implement.as_ref())?;
+    Ok(())
+}
+
+/// Render one signed section's body — the lines that follow the
+/// `-- plan --` / `-- review --` / `-- implement --` header in
+/// [`write_bailiff_plan_show`]. `None` surfaces as
+/// `verification=<none>`; the five [`VerifiedSection`] variants each
+/// pick the metadata projection appropriate to their trust state.
+fn write_signed_section<T: SignedBailiffNote>(
+    out: &mut dyn Write,
+    section: Option<&VerifiedSection<T>>,
+) -> std::io::Result<()> {
+    let Some(section) = section else {
+        return writeln!(out, "verification=<none>");
+    };
+    match section {
+        VerifiedSection::Verified { note, envelope } => {
+            writeln!(out, "verification=verified")?;
+            write_signed_note_common(out, note)?;
+            write_envelope_metadata(out, &envelope.metadata, "")?;
+        }
+        VerifiedSection::NoteEnvelopeMismatch { note, envelope } => {
+            writeln!(out, "verification=note_envelope_mismatch")?;
+            write_signed_note_common(out, note)?;
+            write_envelope_metadata(out, &envelope.metadata, "")?;
+            write_envelope_metadata(out, note.signed_metadata(), "note_")?;
+        }
+        VerifiedSection::WritEnvelopeMissing { note } => {
+            writeln!(out, "verification=writ_envelope_missing")?;
+            write_signed_note_common(out, note)?;
+            write_envelope_metadata(out, note.signed_metadata(), "")?;
+        }
+        VerifiedSection::EnvelopeMalformed { note, error } => {
+            writeln!(out, "verification=envelope_malformed")?;
+            write_signed_note_common(out, note)?;
+            write_envelope_metadata(out, note.signed_metadata(), "")?;
+            write!(out, "envelope_error=")?;
+            write_inline_value(out, &error.to_string())?;
+        }
+        VerifiedSection::SignatureFailure { note, error } => {
+            writeln!(out, "verification=signature_failure")?;
+            write_signed_note_common(out, note)?;
+            write_envelope_metadata(out, note.signed_metadata(), "")?;
+            write!(out, "verify_error=")?;
+            write_inline_value(out, &error.to_string())?;
+        }
+    }
+    Ok(())
+}
+
+/// Render the note-side scalar lines (`purpose`, `writ_output_oid`).
+/// Shared across every [`VerifiedSection`] variant: those fields are
+/// bailiff-owned and present in every signed-note state, regardless of
+/// what happened to the writ-side envelope.
+fn write_signed_note_common<T: SignedBailiffNote>(
+    out: &mut dyn Write,
+    note: &T,
+) -> std::io::Result<()> {
+    write!(out, "purpose=")?;
+    write_inline_value(out, note.purpose())?;
+    writeln!(out, "writ_output_oid={}", note.writ_output_oid().as_str())?;
+    Ok(())
+}
+
+/// Render the eight [`SignedRunMetadata`] scalar lines under the
+/// supplied `prefix`. Used three ways: unprefixed for the cryptographic
+/// truth (envelope-side in `Verified` / `NoteEnvelopeMismatch`, or
+/// note-side in the failure variants where there is no trusted
+/// envelope); prefixed `note_` only in `NoteEnvelopeMismatch`, where
+/// the note's stored copy diverged from the envelope and the operator
+/// needs to see both.
+///
+/// `capabilities` is emitted as one `{prefix}capability=` line per
+/// entry: the wire shape is a list, and a single key with a
+/// comma-joined value would collide with `RepoRef`'s `owner/name`
+/// separator if a future capability ever embedded a list-of-repos.
+/// One line per element also keeps each value short enough that no
+/// quoting is required.
+fn write_envelope_metadata(
+    out: &mut dyn Write,
+    metadata: &SignedRunMetadata,
+    prefix: &str,
+) -> std::io::Result<()> {
+    writeln!(out, "{prefix}run_id={}", metadata.run_id)?;
+    writeln!(out, "{prefix}session_id={}", metadata.session_id)?;
+    writeln!(
+        out,
+        "{prefix}prompt_sha256={}",
+        metadata.prompt_sha256.as_str()
+    )?;
+    writeln!(
+        out,
+        "{prefix}output_envelope_sha256={}",
+        metadata.output_envelope_sha256.as_str()
+    )?;
+    writeln!(out, "{prefix}exit_code={}", metadata.exit_code)?;
+    writeln!(
+        out,
+        "{prefix}completed_at={}",
+        metadata.completed_at.as_millis()
+    )?;
+    writeln!(
+        out,
+        "{prefix}signing_key_fingerprint={}",
+        metadata.signing_key_fingerprint.as_str()
+    )?;
+    for capability in &metadata.capabilities {
+        writeln!(out, "{prefix}capability={}", capability_inline(capability))?;
+    }
+    Ok(())
+}
+
+/// One-line projection of a [`CapabilitySet`] variant for the show
+/// formatter. Inline form: `<kind>:<owner>/<name>`. Each variant has
+/// exactly one repo field today, so the projection is total; a future
+/// list-of-repos variant would shift to multi-line.
+fn capability_inline(capability: &crate::core::CapabilitySet) -> String {
+    use crate::core::CapabilitySet;
+    match capability {
+        CapabilitySet::WorkspaceRead { repo } => format!("workspace_read:{repo}"),
+        CapabilitySet::WorkspaceWrite { repo } => format!("workspace_write:{repo}"),
+    }
+}
+
+/// Render the decision-section body. Mirrors the [`write_plan_detail`]
+/// decision block: `outcome=<none>` when absent, three key=value lines
+/// otherwise. `decider` is free-form (today `cli:<USER>` /
+/// `agent:<run_id>`) so it is routed through [`write_inline_value`] for
+/// injection-safety, parallel with the list verb's handling.
+fn write_decision_section(
+    out: &mut dyn Write,
+    decision: Option<&DecisionNote>,
+) -> std::io::Result<()> {
+    let Some(decision) = decision else {
+        return writeln!(out, "outcome=<none>");
+    };
+    writeln!(out, "outcome={}", decision.outcome)?;
+    write!(out, "decider=")?;
+    write_inline_value(out, decision.decider.as_str())?;
+    writeln!(out, "decided_at={}", decision.decided_at.as_millis())?;
+    Ok(())
 }
 
 pub fn write_agent_vm_sessions(
@@ -1537,5 +1744,490 @@ mod tests {
         assert!(rendered.contains("\npurpose=<none>\n"));
         assert!(rendered.contains("\nsubmitted_at=<none>\n"));
         assert!(rendered.contains("\ndecision_outcome=rejected\n"));
+    }
+
+    // --- bailiff plan show formatter -----------------------------------
+
+    mod show_tests {
+        use super::*;
+        use crate::bailiff_decision::{Decider, Decision};
+        use crate::bailiff_plan_note::{DecisionNote, ImplementNote, PlanId, PlanNote, ReviewNote};
+        use crate::bailiff_plan_read::{PlanFullView, VerifiedSection};
+        use crate::core::{
+            CapabilitySet, RepoRef, Sha256Hex, SshKeyFingerprint, SshSignature, UnixMillis,
+        };
+        use crate::protocol::SignedRunMetadata;
+        use crate::run_envelope::SignedRunEnvelope;
+        use crate::run_verify::VerifyError;
+        use crate::vm_git::GitObjectId;
+
+        const PLAN_ID_HEX: &str = "01234567-89ab-4cde-8123-456789abcdef";
+        const WRIT_OUTPUT_OID: &str = "1111111111111111111111111111111111111111";
+        const RUN_ID: &str = "22222222-2222-4222-8222-222222222222";
+        const SESSION_ID: &str = "33333333-3333-4333-8333-333333333333";
+        const FINGERPRINT: &str = "SHA256:nP9o8AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+
+        fn sample_metadata() -> SignedRunMetadata {
+            SignedRunMetadata {
+                run_id: RUN_ID.parse().unwrap(),
+                session_id: SESSION_ID.parse().unwrap(),
+                prompt_sha256: Sha256Hex::try_new("a".repeat(64)).unwrap(),
+                output_envelope_sha256: Sha256Hex::try_new("b".repeat(64)).unwrap(),
+                capabilities: vec![CapabilitySet::WorkspaceRead {
+                    repo: RepoRef {
+                        owner: "smaug123".into(),
+                        name: "writ".into(),
+                    },
+                }],
+                exit_code: 0,
+                completed_at: UnixMillis::from_millis(1_700_000_000_000),
+                signing_key_fingerprint: SshKeyFingerprint::try_new(FINGERPRINT.to_string())
+                    .unwrap(),
+            }
+        }
+
+        fn sample_signature() -> SshSignature {
+            SshSignature::try_new(
+                "-----BEGIN SSH SIGNATURE-----\nsomebase64==\n-----END SSH SIGNATURE-----"
+                    .to_string(),
+            )
+            .unwrap()
+        }
+
+        fn sample_envelope() -> SignedRunEnvelope {
+            // Output bytes don't need to match the digest in
+            // `sample_metadata`'s `output_envelope_sha256` — the show
+            // formatter does not re-verify; it only projects fields
+            // through to text. The verification status is what the
+            // `VerifiedSection` variant carries.
+            SignedRunEnvelope {
+                metadata: sample_metadata(),
+                signature: sample_signature(),
+                output: b"agent stdout bytes".to_vec(),
+            }
+        }
+
+        fn sample_plan_note() -> PlanNote {
+            PlanNote {
+                plan_id: PlanId::from_uuid(PLAN_ID_HEX.parse().unwrap()),
+                purpose: "plan-submit".into(),
+                writ_output_oid: GitObjectId::new(WRIT_OUTPUT_OID.to_string()).unwrap(),
+                signed_metadata: sample_metadata(),
+                signature: sample_signature(),
+            }
+        }
+
+        fn sample_review_note() -> ReviewNote {
+            ReviewNote {
+                plan_id: PlanId::from_uuid(PLAN_ID_HEX.parse().unwrap()),
+                purpose: "plan-review".into(),
+                writ_output_oid: GitObjectId::new(WRIT_OUTPUT_OID.to_string()).unwrap(),
+                signed_metadata: sample_metadata(),
+                signature: sample_signature(),
+            }
+        }
+
+        fn sample_implement_note() -> ImplementNote {
+            ImplementNote {
+                plan_id: PlanId::from_uuid(PLAN_ID_HEX.parse().unwrap()),
+                purpose: "plan-implement".into(),
+                writ_output_oid: GitObjectId::new(WRIT_OUTPUT_OID.to_string()).unwrap(),
+                signed_metadata: sample_metadata(),
+                signature: sample_signature(),
+            }
+        }
+
+        fn empty_view() -> PlanFullView {
+            PlanFullView {
+                plan_id: PlanId::from_uuid(PLAN_ID_HEX.parse().unwrap()),
+                plan: None,
+                decision: None,
+                review: None,
+                implement: None,
+            }
+        }
+
+        fn render(view: &PlanFullView) -> String {
+            let mut out = Vec::new();
+            write_bailiff_plan_show(&mut out, view).unwrap();
+            String::from_utf8(out).unwrap()
+        }
+
+        /// An empty view (no notes attached under the plan ref — the
+        /// "lookup hit nothing" case) still renders the canonical
+        /// four-section frame, every section showing `<none>`. Pins
+        /// the always-emit-headers contract so a regression that
+        /// silently skipped absent sections surfaces here.
+        #[test]
+        fn show_renders_all_four_section_headers_with_none_when_empty() {
+            let rendered = render(&empty_view());
+            assert_eq!(
+                rendered,
+                concat!(
+                    "plan_id=01234567-89ab-4cde-8123-456789abcdef\n",
+                    "\n",
+                    "-- plan --\n",
+                    "verification=<none>\n",
+                    "\n",
+                    "-- decision --\n",
+                    "outcome=<none>\n",
+                    "\n",
+                    "-- review --\n",
+                    "verification=<none>\n",
+                    "\n",
+                    "-- implement --\n",
+                    "verification=<none>\n",
+                ),
+            );
+        }
+
+        /// A `Verified` plan section renders the unified metadata
+        /// projection: note-side scalars (`purpose`, `writ_output_oid`)
+        /// plus envelope-side metadata. No `note_` prefixes appear
+        /// because note and envelope agree in this variant. Pins the
+        /// concrete shape so an operator scripting against the output
+        /// has a stable contract.
+        #[test]
+        fn show_renders_verified_plan_section_with_full_metadata_projection() {
+            let view = PlanFullView {
+                plan_id: PlanId::from_uuid(PLAN_ID_HEX.parse().unwrap()),
+                plan: Some(VerifiedSection::Verified {
+                    note: sample_plan_note(),
+                    envelope: sample_envelope(),
+                }),
+                decision: None,
+                review: None,
+                implement: None,
+            };
+            let rendered = render(&view);
+            let plan_block = concat!(
+                "-- plan --\n",
+                "verification=verified\n",
+                "purpose=plan-submit\n",
+                "writ_output_oid=1111111111111111111111111111111111111111\n",
+                "run_id=22222222-2222-4222-8222-222222222222\n",
+                "session_id=33333333-3333-4333-8333-333333333333\n",
+                "prompt_sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
+                "output_envelope_sha256=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n",
+                "exit_code=0\n",
+                "completed_at=1700000000000\n",
+                "signing_key_fingerprint=SHA256:nP9o8AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n",
+                "capability=workspace_read:smaug123/writ\n",
+            );
+            assert!(rendered.contains(plan_block), "got: {rendered}");
+            assert!(
+                !rendered.contains("note_run_id="),
+                "Verified must not emit note_ prefixes; got: {rendered}",
+            );
+        }
+
+        /// A `NoteEnvelopeMismatch` plan section renders both the
+        /// envelope's metadata (unprefixed; the cryptographic truth)
+        /// and the note's metadata (prefixed `note_`). Pins the
+        /// dual-projection that lets operators diff the two without
+        /// re-reading either source — the divergence is the trust
+        /// violation.
+        #[test]
+        fn show_renders_note_envelope_mismatch_with_both_projections() {
+            // Make the note's metadata visibly divergent from the
+            // envelope's so a regression that emits the same values
+            // under both prefixes surfaces here.
+            let mut divergent_note = sample_plan_note();
+            divergent_note.signed_metadata.run_id =
+                "99999999-9999-4999-8999-999999999999".parse().unwrap();
+            divergent_note.signed_metadata.completed_at =
+                UnixMillis::from_millis(1_800_000_000_000);
+            let view = PlanFullView {
+                plan_id: PlanId::from_uuid(PLAN_ID_HEX.parse().unwrap()),
+                plan: Some(VerifiedSection::NoteEnvelopeMismatch {
+                    note: divergent_note,
+                    envelope: sample_envelope(),
+                }),
+                decision: None,
+                review: None,
+                implement: None,
+            };
+            let rendered = render(&view);
+            assert!(rendered.contains("verification=note_envelope_mismatch\n"));
+            // Envelope-side (unprefixed) holds the original metadata.
+            assert!(rendered.contains("run_id=22222222-2222-4222-8222-222222222222\n"));
+            assert!(rendered.contains("completed_at=1700000000000\n"));
+            // Note-side carries the divergent values under `note_`.
+            assert!(rendered.contains("note_run_id=99999999-9999-4999-8999-999999999999\n"));
+            assert!(rendered.contains("note_completed_at=1800000000000\n"));
+        }
+
+        /// `WritEnvelopeMissing` projects the note's metadata as the
+        /// best available view (envelope is absent). The verification
+        /// line names the variant so an operator can re-run the
+        /// relevant `submit*` verb to recover.
+        #[test]
+        fn show_renders_writ_envelope_missing_with_note_metadata() {
+            let view = PlanFullView {
+                plan_id: PlanId::from_uuid(PLAN_ID_HEX.parse().unwrap()),
+                plan: Some(VerifiedSection::WritEnvelopeMissing {
+                    note: sample_plan_note(),
+                }),
+                decision: None,
+                review: None,
+                implement: None,
+            };
+            let rendered = render(&view);
+            assert!(rendered.contains("verification=writ_envelope_missing\n"));
+            assert!(rendered.contains("purpose=plan-submit\n"));
+            assert!(rendered.contains("run_id=22222222-2222-4222-8222-222222222222\n"));
+            // No envelope-side payload or error line: those keys belong
+            // to the variants that carry an envelope or an error.
+            assert!(!rendered.contains("envelope_error="), "{rendered}");
+            assert!(!rendered.contains("verify_error="), "{rendered}");
+            assert!(!rendered.contains("note_run_id="), "{rendered}");
+        }
+
+        /// `EnvelopeMalformed` projects the note's metadata plus a
+        /// quoted `envelope_error=` line carrying the decode failure
+        /// message. The error string is routed through
+        /// [`write_inline_value`] so a serde error containing a
+        /// newline cannot inject a fake key=value line downstream.
+        #[test]
+        fn show_renders_envelope_malformed_with_quoted_decode_error() {
+            // Synthesise a `serde_json::Error` whose `Display` form
+            // contains a newline so the inline-quoting branch fires.
+            let decode_error: serde_json::Error =
+                serde_json::from_slice::<SignedRunEnvelope>(b"not\njson").unwrap_err();
+            let view = PlanFullView {
+                plan_id: PlanId::from_uuid(PLAN_ID_HEX.parse().unwrap()),
+                plan: Some(VerifiedSection::EnvelopeMalformed {
+                    note: sample_plan_note(),
+                    error: decode_error,
+                }),
+                decision: None,
+                review: None,
+                implement: None,
+            };
+            let rendered = render(&view);
+            assert!(rendered.contains("verification=envelope_malformed\n"));
+            // The error line is present, on its own one-line key=value.
+            let envelope_error_line = rendered
+                .lines()
+                .find(|l| l.starts_with("envelope_error="))
+                .unwrap_or_else(|| panic!("missing envelope_error line in {rendered}"));
+            // Exactly one `envelope_error=` line — the inline-quote
+            // branch must collapse multi-line decode messages into a
+            // single quoted token rather than emitting them verbatim.
+            assert_eq!(
+                rendered
+                    .lines()
+                    .filter(|l| l.starts_with("envelope_error="))
+                    .count(),
+                1,
+                "expected exactly one envelope_error line, got: {rendered}",
+            );
+            // The note-side projection is still there.
+            assert!(rendered.contains("purpose=plan-submit\n"));
+            // The quoted form is present iff the error needs quoting;
+            // we don't pin the exact decode message because serde_json's
+            // wording is implementation-detail.
+            assert!(
+                !envelope_error_line.is_empty(),
+                "envelope_error must not be blank, got: {rendered}",
+            );
+        }
+
+        /// `SignatureFailure` projects the note's metadata plus a
+        /// quoted `verify_error=` line naming the specific check that
+        /// failed. Pin the error projection here so a regression that
+        /// dropped the failure detail surfaces.
+        #[test]
+        fn show_renders_signature_failure_with_verify_error_line() {
+            let view = PlanFullView {
+                plan_id: PlanId::from_uuid(PLAN_ID_HEX.parse().unwrap()),
+                plan: Some(VerifiedSection::SignatureFailure {
+                    note: sample_plan_note(),
+                    error: VerifyError::UnknownSigner {
+                        fingerprint: SshKeyFingerprint::try_new(FINGERPRINT.to_string()).unwrap(),
+                    },
+                }),
+                decision: None,
+                review: None,
+                implement: None,
+            };
+            let rendered = render(&view);
+            assert!(rendered.contains("verification=signature_failure\n"));
+            assert!(
+                rendered.contains(&format!(
+                    "verify_error=signing key {FINGERPRINT} is not in the allowed-signers list\n"
+                )),
+                "{rendered}"
+            );
+        }
+
+        /// A populated decision section renders three key=value lines.
+        /// Pins the shape; an absent decision (covered above) renders
+        /// `outcome=<none>`.
+        #[test]
+        fn show_renders_decision_block_with_outcome_decider_and_decided_at() {
+            let view = PlanFullView {
+                plan_id: PlanId::from_uuid(PLAN_ID_HEX.parse().unwrap()),
+                plan: None,
+                decision: Some(DecisionNote {
+                    plan_id: PlanId::from_uuid(PLAN_ID_HEX.parse().unwrap()),
+                    outcome: Decision::Accepted,
+                    decider: Decider::try_new("cli:alice").unwrap(),
+                    decided_at: UnixMillis::from_millis(1_700_000_001_000),
+                }),
+                review: None,
+                implement: None,
+            };
+            let rendered = render(&view);
+            let block = concat!(
+                "-- decision --\n",
+                "outcome=accepted\n",
+                "decider=cli:alice\n",
+                "decided_at=1700000001000\n",
+            );
+            assert!(rendered.contains(block), "got: {rendered}");
+        }
+
+        /// An adversarial purpose carrying a newline survives the
+        /// inline-quote pass — it cannot inject a fake `verification=`
+        /// or `outcome=` line downstream. Pins the injection-safety
+        /// contract for free-form text fields, parallel with the list
+        /// verb's `bailiff_plan_list_quotes_purpose_and_decider_with_injection_characters`.
+        #[test]
+        fn show_quotes_purpose_with_embedded_newline() {
+            let mut hostile_note = sample_plan_note();
+            hostile_note.purpose = "first\nverification=forged\nsecond".into();
+            let view = PlanFullView {
+                plan_id: PlanId::from_uuid(PLAN_ID_HEX.parse().unwrap()),
+                plan: Some(VerifiedSection::WritEnvelopeMissing { note: hostile_note }),
+                decision: None,
+                review: None,
+                implement: None,
+            };
+            let rendered = render(&view);
+            // The forged "verification=forged" survives inside the
+            // quoted purpose but is no longer at the start of a line.
+            assert!(
+                rendered.contains("\npurpose=\"first\\nverification=forged\\nsecond\"\n"),
+                "expected quoted purpose, got: {rendered}",
+            );
+            // Exactly one line starts with `verification=` — the real
+            // one — so a tokeniser splitting on `\n` first cannot be
+            // tricked into seeing the forged value.
+            let count = rendered
+                .lines()
+                .filter(|l| l.starts_with("verification="))
+                .count();
+            // The three signed sections each emit one
+            // `verification=` line; the decision section emits
+            // `outcome=` instead.
+            assert_eq!(count, 3, "got: {rendered}");
+        }
+
+        /// An adversarial decider equal to the literal `<none>`
+        /// sentinel renders in quoted form so it is distinguishable
+        /// from absence. Parallel with the list verb's pin.
+        #[test]
+        fn show_quotes_decider_when_equal_to_none_sentinel() {
+            let view = PlanFullView {
+                plan_id: PlanId::from_uuid(PLAN_ID_HEX.parse().unwrap()),
+                plan: None,
+                decision: Some(DecisionNote {
+                    plan_id: PlanId::from_uuid(PLAN_ID_HEX.parse().unwrap()),
+                    outcome: Decision::Rejected,
+                    decider: Decider::try_new("<none>").unwrap(),
+                    decided_at: UnixMillis::from_millis(1),
+                }),
+                review: None,
+                implement: None,
+            };
+            let rendered = render(&view);
+            assert!(
+                rendered.contains("decider=\"<none>\"\n"),
+                "expected quoted decider, got: {rendered}",
+            );
+        }
+
+        /// Section ordering is `plan` → `decision` → `review` →
+        /// `implement`. A regression to a different order would break
+        /// scripts that parse positionally; pin the contract.
+        #[test]
+        fn show_emits_sections_in_canonical_order() {
+            let view = PlanFullView {
+                plan_id: PlanId::from_uuid(PLAN_ID_HEX.parse().unwrap()),
+                plan: Some(VerifiedSection::WritEnvelopeMissing {
+                    note: sample_plan_note(),
+                }),
+                decision: Some(DecisionNote {
+                    plan_id: PlanId::from_uuid(PLAN_ID_HEX.parse().unwrap()),
+                    outcome: Decision::Accepted,
+                    decider: Decider::try_new("cli:alice").unwrap(),
+                    decided_at: UnixMillis::from_millis(2),
+                }),
+                review: Some(VerifiedSection::WritEnvelopeMissing {
+                    note: sample_review_note(),
+                }),
+                implement: Some(VerifiedSection::WritEnvelopeMissing {
+                    note: sample_implement_note(),
+                }),
+            };
+            let rendered = render(&view);
+            let plan_at = rendered.find("-- plan --").unwrap();
+            let decision_at = rendered.find("-- decision --").unwrap();
+            let review_at = rendered.find("-- review --").unwrap();
+            let implement_at = rendered.find("-- implement --").unwrap();
+            assert!(plan_at < decision_at);
+            assert!(decision_at < review_at);
+            assert!(review_at < implement_at);
+        }
+
+        /// Multiple capabilities render as one `capability=` line per
+        /// entry, in input order. Pins the per-entry shape so a
+        /// future capability variant carrying a list-of-repos doesn't
+        /// regress the per-line invariant.
+        #[test]
+        fn show_renders_one_capability_line_per_entry_in_input_order() {
+            let mut metadata = sample_metadata();
+            metadata.capabilities = vec![
+                CapabilitySet::WorkspaceRead {
+                    repo: RepoRef {
+                        owner: "smaug123".into(),
+                        name: "alpha".into(),
+                    },
+                },
+                CapabilitySet::WorkspaceWrite {
+                    repo: RepoRef {
+                        owner: "smaug123".into(),
+                        name: "beta".into(),
+                    },
+                },
+            ];
+            let mut note = sample_plan_note();
+            note.signed_metadata = metadata.clone();
+            let envelope = SignedRunEnvelope {
+                metadata,
+                signature: sample_signature(),
+                output: b"out".to_vec(),
+            };
+            let view = PlanFullView {
+                plan_id: PlanId::from_uuid(PLAN_ID_HEX.parse().unwrap()),
+                plan: Some(VerifiedSection::Verified { note, envelope }),
+                decision: None,
+                review: None,
+                implement: None,
+            };
+            let rendered = render(&view);
+            let lines: Vec<&str> = rendered
+                .lines()
+                .filter(|l| l.starts_with("capability="))
+                .collect();
+            assert_eq!(
+                lines,
+                vec![
+                    "capability=workspace_read:smaug123/alpha",
+                    "capability=workspace_write:smaug123/beta",
+                ],
+            );
+        }
     }
 }

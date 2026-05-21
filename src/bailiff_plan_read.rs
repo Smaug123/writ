@@ -761,22 +761,30 @@ pub enum VerifiedSection<T> {
 
 /// Projection shared by the three signed bailiff note types
 /// ([`PlanNote`], [`ReviewNote`], [`ImplementNote`]). Each carries the
-/// same `(writ_output_oid, signed_metadata, signature)` triple even
-/// though the surrounding fields (`purpose`, `plan_id`) differ; this
-/// trait lets [`read_full_plan`] dispatch the read-and-verify path
-/// uniformly without unifying the note structs themselves.
+/// same `(purpose, writ_output_oid, signed_metadata, signature)`
+/// quadruple even though the surrounding fields (`plan_id`) differ;
+/// this trait lets [`read_full_plan`] dispatch the read-and-verify
+/// path uniformly without unifying the note structs themselves, and
+/// lets the F4 formatter render the three sections from a single
+/// shared body.
 ///
 /// **Not** a polymorphism point: the only implementors are the three
-/// note types and the only consumer is [`read_full_plan`]. The trait
-/// is here as a static field-projection abstraction (rule of three),
-/// not as an extension surface.
-trait SignedBailiffNote {
+/// note types and the only consumers are [`read_full_plan`] and the
+/// F4 show-formatter. The trait is here as a static field-projection
+/// abstraction (rule of three), not as an extension surface;
+/// `pub(crate)` scopes it to the same library where both consumers
+/// live so it does not leak to downstream code.
+pub(crate) trait SignedBailiffNote {
+    fn purpose(&self) -> &str;
     fn writ_output_oid(&self) -> &GitObjectId;
     fn signed_metadata(&self) -> &SignedRunMetadata;
     fn signature(&self) -> &SshSignature;
 }
 
 impl SignedBailiffNote for PlanNote {
+    fn purpose(&self) -> &str {
+        &self.purpose
+    }
     fn writ_output_oid(&self) -> &GitObjectId {
         &self.writ_output_oid
     }
@@ -789,6 +797,9 @@ impl SignedBailiffNote for PlanNote {
 }
 
 impl SignedBailiffNote for ReviewNote {
+    fn purpose(&self) -> &str {
+        &self.purpose
+    }
     fn writ_output_oid(&self) -> &GitObjectId {
         &self.writ_output_oid
     }
@@ -801,6 +812,9 @@ impl SignedBailiffNote for ReviewNote {
 }
 
 impl SignedBailiffNote for ImplementNote {
+    fn purpose(&self) -> &str {
+        &self.purpose
+    }
     fn writ_output_oid(&self) -> &GitObjectId {
         &self.writ_output_oid
     }
