@@ -24,7 +24,8 @@
 //! `$XDG_DATA_HOME/writ/repo` for the writ-owned repo bailiff
 //! fetches from. `--bailiff-repo` and `--writ-repo` override either.
 
-use std::path::PathBuf;
+use std::fs::File;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use clap::{ArgGroup, Parser, Subcommand};
@@ -704,6 +705,53 @@ async fn plan_review(
     }
 }
 
+/// Repo-scoped exclusive lockfile guard for cross-process serialisation
+/// of `bailiff plan implement` runs.
+///
+/// The library workflow ([`submit_implement`]) takes an
+/// `Arc<AsyncMutex<NotesRepo>>` for the in-process single-writer
+/// invariant via [`writ::bailiff_repo_guard::BailiffRepoGuard`], but
+/// the CLI constructs a fresh `Arc` per invocation, so two CLI
+/// processes against the same `--bailiff-repo` can each pass the
+/// in-process pre-RPC `AlreadyImplemented` gate, both kick off
+/// `WorkspaceWrite`-capable agent runs (with `git push` side effects
+/// minted by writ), and only the second's notes-add loses the
+/// duplicate-implement race. The `BailiffRepoGuard` module docstring
+/// names git's notes-add idempotency at the seed OID as the
+/// cross-process fallback — that fallback fires *after* the agent has
+/// already executed, which is acceptable for `WorkspaceRead` verbs
+/// (no externally-observable side effects) but is load-bearing for
+/// `WorkspaceWrite`.
+///
+/// The lockfile lives at `<bailiff_repo>/bailiff-implement.lock` and
+/// is held by an OS-level advisory `flock` (`std::fs::File::try_lock`).
+/// Distinct `--bailiff-repo` paths do not contend. The lock is
+/// released when the returned `File` is dropped, or — as a backstop
+/// against unclean exits — when the process terminates and the kernel
+/// closes the descriptor.
+fn acquire_implement_lock(bailiff_repo_path: &Path) -> Result<File, String> {
+    let lock_path = bailiff_repo_path.join("bailiff-implement.lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|e| format!("opening implement lockfile {}: {e}", lock_path.display()))?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(std::fs::TryLockError::WouldBlock) => Err(format!(
+            "another `bailiff plan implement` is in progress against {}; retry once it finishes \
+             (lockfile at {})",
+            bailiff_repo_path.display(),
+            lock_path.display(),
+        )),
+        Err(std::fs::TryLockError::Error(e)) => Err(format!(
+            "acquiring implement lockfile at {}: {e}",
+            lock_path.display()
+        )),
+    }
+}
+
 /// Drive `submit_implement` from the CLI: read the feature prompt and
 /// allowed-signers file, open bailiff's repo, build the inputs (with
 /// the single `WorkspaceWrite` capability that distinguishes this
@@ -779,6 +827,15 @@ async fn plan_implement(
                 )
             })?;
     let bailiff = Arc::new(AsyncMutex::new(bailiff));
+
+    // Cross-process flock: distinct from the in-process `Arc<AsyncMutex>`
+    // above, which only serialises callers sharing this CLI process.
+    // Two concurrent `bailiff plan implement` processes would both pass
+    // `submit_implement`'s pre-RPC `AlreadyImplemented` gate and both
+    // launch `WorkspaceWrite` agent runs before either reached the final
+    // notes-add. Held to scope end (Drop releases) so the lock spans the
+    // entire workflow.
+    let _implement_lock = acquire_implement_lock(&bailiff_repo_path)?;
 
     let writ_output_ref =
         NotesRef::try_new(WRIT_OUTPUT_REF).expect("WRIT_OUTPUT_REF is a static well-formed ref");
@@ -2057,5 +2114,43 @@ mod tests {
             msg.contains("--plan-id") || msg.contains("uuid") || msg.contains("UUID"),
             "expected malformed-plan-id failure, got: {msg}",
         );
+    }
+
+    /// Acquire → second acquire fails fast → drop → reacquire round-trips.
+    /// Pins the cross-process invariant the helper exists to enforce:
+    /// two concurrent `bailiff plan implement` invocations against the
+    /// same `--bailiff-repo` cannot both pass the lockfile. A regression
+    /// (e.g. swapping `try_lock` for `lock`, dropping the lockfile path
+    /// to a process-shared temp directory that other tests reuse, or
+    /// reopening the lock by path instead of holding the `File`) would
+    /// fail this test: either the second acquire would block forever
+    /// (and the test would time out) or the reacquire after drop would
+    /// fail because the OS-level lock had leaked.
+    #[test]
+    fn implement_lock_blocks_concurrent_acquire_and_releases_on_drop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_path = tmp.path();
+
+        let first = acquire_implement_lock(repo_path).expect("first acquire must succeed");
+
+        // The same process can hold an `flock` exclusive lock only once;
+        // an in-process re-acquire on a separately-opened handle must
+        // surface the `WouldBlock` translation. The point of the test is
+        // that the *operator-facing* error message names the contention
+        // (rather than e.g. blocking forever or surfacing an opaque IO
+        // error).
+        let err = acquire_implement_lock(repo_path)
+            .expect_err("second acquire must fail while first lock is held");
+        assert!(
+            err.contains("in progress"),
+            "expected operator-facing contention message, got: {err}",
+        );
+
+        drop(first);
+
+        // After the first guard drops the lock is released, so a fresh
+        // acquire on the same path must succeed.
+        let _second = acquire_implement_lock(repo_path)
+            .expect("reacquire must succeed after the first guard drops");
     }
 }
