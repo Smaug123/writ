@@ -1295,6 +1295,61 @@ fn close_audit_session_best_effort<S: SecretStore + Send + Sync>(
     }
 }
 
+/// Errors returned by [`wait_for_agent_run_outcome`].
+///
+/// `Timeout` carries the elapsed deadline rather than a free-form
+/// message so the synchronous `RunAgent` dispatch arm (slice VM2b) can
+/// format a stable operator-facing message and verifiers can assert on
+/// the structured fields. `Audit` propagates the underlying audit
+/// failure verbatim — a poll that surfaces an audit error is almost
+/// always a sign the broker is wedged (the in-memory SQLite handle is
+/// poisoned, the disk is gone), not a transient miss.
+#[derive(Debug, thiserror::Error)]
+pub enum WaitForAgentRunOutcomeError {
+    #[error("agent run {run_id} did not complete within {timeout:?}")]
+    Timeout {
+        run_id: AgentRunId,
+        timeout: std::time::Duration,
+    },
+    #[error("audit lookup failed: {0}")]
+    Audit(#[from] crate::audit::AuditError),
+}
+
+/// Poll the audit log for `run_id`'s outcome row until it appears, the
+/// audit lookup fails, or `timeout` elapses. The wait helper does not
+/// drive the VM's lifecycle — it is a one-shot read-side primitive for
+/// the synchronous-wait shape that slice VM2b's `RunAgent` dispatch
+/// arm needs (the guest POSTs `/v1/agent-runs/<id>/outcome`, which
+/// writes the row from `route_agent_run_outcome_request`; this helper
+/// observes that write).
+///
+/// `poll_interval` bounds how often the audit table is queried; the
+/// final sleep is clamped to the remaining deadline so an oversized
+/// `poll_interval` cannot stretch the call past `timeout`. `Duration::ZERO`
+/// for either parameter is legal: with zero timeout the helper checks
+/// once and returns Timeout if the row is absent; with zero interval
+/// the helper spins (only sensible when the row is expected to be
+/// already present).
+pub async fn wait_for_agent_run_outcome(
+    audit: &crate::audit::AuditLog,
+    run_id: AgentRunId,
+    timeout: std::time::Duration,
+    poll_interval: std::time::Duration,
+) -> Result<crate::audit::AgentRunOutcomeAuditRecord, WaitForAgentRunOutcomeError> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if let Some(record) = audit.get_agent_run_outcome(run_id)? {
+            return Ok(record);
+        }
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return Err(WaitForAgentRunOutcomeError::Timeout { run_id, timeout });
+        }
+        let remaining = deadline.saturating_duration_since(now);
+        tokio::time::sleep(poll_interval.min(remaining)).await;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2387,6 +2442,142 @@ mod tests {
                     other => prop_assert!(false, "unexpected subnet selection result: {other:?}"),
                 },
             }
+        }
+    }
+
+    /// Seed the FK chain (`session` → `agent_run`) the outcome row
+    /// references, and return a matching `AgentRunOutcomeAuditRecord`
+    /// the caller can hand to `record_agent_run_outcome` (or to the
+    /// wait helper as the expected return value). The outcome row is
+    /// *not* inserted — tests that exercise the "row appears later"
+    /// path want the chain present but the outcome absent until the
+    /// writer task fires.
+    ///
+    /// `validate_stream_summary` requires an absolute UTF-8 path and a
+    /// 64-char hex sha256, so the synthetic record uses `/tmp` + a
+    /// zeroed digest. The wait helper does not inspect either field;
+    /// it just hands the record back verbatim.
+    fn seed_synthetic_outcome(
+        audit: &AuditLog,
+        run_id: AgentRunId,
+    ) -> crate::audit::AgentRunOutcomeAuditRecord {
+        use crate::agent_run::{AgentRunOutcome, AgentRunStreamSummary, AgentRunTerminalStatus};
+        let session_id = SessionId::new();
+        audit
+            .open_session(&SessionRecord {
+                session_id,
+                label: Some("wait-helper test".into()),
+                agent_kind: Some(AgentKind::Claude),
+                agent_model: Some("claude-opus-4-7".into()),
+                opened_at: UnixMillis::from_millis(1_700_000_000),
+                closed_at: None,
+            })
+            .unwrap();
+        audit
+            .record_agent_run(&AgentRunAuditRecord {
+                run_id,
+                session_id,
+                requested_at: UnixMillis::from_millis(1_700_000_050),
+                agent_kind: AgentKind::Claude,
+                prompt: crate::agent_run::AgentPrompt::new("test").summary(),
+                correlation_id: None,
+            })
+            .unwrap();
+        let stream = |label: &str| AgentRunStreamSummary {
+            path: PathBuf::from(format!("/tmp/agent-runs/{run_id}/{label}.log")),
+            byte_len: 0,
+            sha256_hex: "0".repeat(64),
+            truncated: false,
+        };
+        crate::audit::AgentRunOutcomeAuditRecord {
+            completed_at: UnixMillis::from_millis(1_700_000_100),
+            outcome: AgentRunOutcome {
+                run_id,
+                status: AgentRunTerminalStatus::Succeeded,
+                exit_code: 0,
+                stdout: stream("stdout"),
+                stderr: stream("stderr"),
+            },
+        }
+    }
+
+    /// When the outcome row is already in the audit log, the wait helper
+    /// returns it on the first poll. Calling with `Duration::ZERO` proves
+    /// the helper does *not* wait one poll interval before checking — the
+    /// VM dispatch arm reaches the wait helper *after* `start_agent_run`
+    /// has run, so a fast-completing run (e.g. agent crashed during
+    /// startup, outcome already posted by the guest's error path) must
+    /// return immediately rather than burning a full poll interval.
+    #[tokio::test]
+    async fn wait_for_agent_run_outcome_returns_existing_row_immediately() {
+        let audit = AuditLog::open_in_memory().unwrap();
+        let run_id = AgentRunId::new();
+        let record = seed_synthetic_outcome(&audit, run_id);
+        audit.record_agent_run_outcome(&record).unwrap();
+
+        let got =
+            wait_for_agent_run_outcome(&audit, run_id, Duration::ZERO, Duration::from_millis(100))
+                .await
+                .unwrap();
+        assert_eq!(got, record);
+    }
+
+    /// When the outcome row appears *after* the wait helper is called,
+    /// the helper returns it on the next poll. Spawns a background task
+    /// that inserts the row 30ms after the helper starts polling at
+    /// 10ms intervals; the helper's 1s timeout gives plenty of slack so
+    /// the assertion is on *correctness* (the returned record matches),
+    /// not on tight latency.
+    #[tokio::test]
+    async fn wait_for_agent_run_outcome_returns_when_row_appears_after_delay() {
+        let audit = AuditLog::open_in_memory().unwrap();
+        let run_id = AgentRunId::new();
+        let record = seed_synthetic_outcome(&audit, run_id);
+        let audit_arc = Arc::new(audit);
+
+        let audit_writer = Arc::clone(&audit_arc);
+        let record_for_writer = record.clone();
+        let writer = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            audit_writer
+                .record_agent_run_outcome(&record_for_writer)
+                .unwrap();
+        });
+
+        let got = wait_for_agent_run_outcome(
+            &audit_arc,
+            run_id,
+            Duration::from_secs(1),
+            Duration::from_millis(10),
+        )
+        .await
+        .unwrap();
+        assert_eq!(got, record);
+        writer.await.unwrap();
+    }
+
+    /// When the outcome row never appears, the wait helper returns
+    /// `Timeout` after `timeout` elapses. Pin the run_id and timeout on
+    /// the error so the operator surface (the bailiff CLI will format
+    /// this) can name both fields.
+    #[tokio::test]
+    async fn wait_for_agent_run_outcome_returns_timeout_when_row_never_appears() {
+        let audit = AuditLog::open_in_memory().unwrap();
+        let run_id = AgentRunId::new();
+        let timeout = Duration::from_millis(50);
+
+        let err = wait_for_agent_run_outcome(&audit, run_id, timeout, Duration::from_millis(10))
+            .await
+            .unwrap_err();
+        match err {
+            WaitForAgentRunOutcomeError::Timeout {
+                run_id: got_id,
+                timeout: got_timeout,
+            } => {
+                assert_eq!(got_id, run_id);
+                assert_eq!(got_timeout, timeout);
+            }
+            other => panic!("expected Timeout, got {other:?}"),
         }
     }
 }
