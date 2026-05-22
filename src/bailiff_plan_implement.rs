@@ -20,24 +20,18 @@
 //!    surfaces three pre-RPC error variants — `PlanSubmissionMissing`,
 //!    `PlanNotDecided`, `PlanRejected` — so an operator can tell which
 //!    precondition tripped.
-//! 2. The composed prompt uses
-//!    [`crate::bailiff::PLAN_PROMPT_SEPARATOR`] (`# Approved plan`),
-//!    not the reviewer's `# Proposed plan`. The implementer is acting
-//!    on an accepted artefact and the prompt framing makes that
-//!    explicit so an LLM reading the combined prompt cannot mistake
-//!    the plan's status.
+//! 2. The composed prompt uses `PLAN_PROMPT_SEPARATOR`
+//!    (`# Approved plan`), not the reviewer's `# Proposed plan`. The
+//!    implementer is acting on an accepted artefact and the prompt
+//!    framing makes that explicit so an LLM reading the combined
+//!    prompt cannot mistake the plan's status.
 //!
 //! # Composition
 //!
 //! The implementer prompt is `feature_prompt` + the
-//! [`crate::bailiff::PLAN_PROMPT_SEPARATOR`] string + the plan body
-//! bytes, joined inline (rather than via
-//! [`crate::bailiff::compose_implementer_prompt`]) so this slice does
-//! not grow a fresh dependency on `agent_plan::PlanBody` — slice G
-//! deletes that type, and re-wrapping bytes in `PlanBody` just to
-//! unwrap them again would be churn. Sharing only the `&'static str`
-//! separator keeps the two compositions phrase-identical until the
-//! constant moves to its post-slice-G home.
+//! `PLAN_PROMPT_SEPARATOR` string + the plan body bytes, joined
+//! inline (rather than wrapping into `agent_plan::PlanBody` first)
+//! to avoid re-wrapping bytes just to unwrap them again for signing.
 //!
 //! Reviewer feedback stays *out* of the composed prompt: per
 //! `docs/plans/2026-05-11-agent-plans.md` §"Implementer prompt
@@ -63,7 +57,6 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio::task::JoinError;
 
 use crate::agent_run::{AgentPrompt, AgentPromptError};
-use crate::bailiff::PLAN_PROMPT_SEPARATOR;
 use crate::bailiff_decision::Decision;
 use crate::bailiff_plan_note::{PlanId, PlanNote};
 use crate::bailiff_plan_read::{
@@ -328,13 +321,19 @@ pub async fn submit_implement(
     })
 }
 
+/// Separator the implementer's effective prompt uses between the
+/// feature-request prompt and the approved plan body. `# Approved
+/// plan` makes the artefact's status explicit so an LLM reading the
+/// combined prompt cannot mistake an accepted plan for a proposed
+/// one (the reviewer-side composer in `bailiff_plan_review.rs` uses
+/// a different heading for the same reason).
+const PLAN_PROMPT_SEPARATOR: &str = "\n\n---\n\n# Approved plan\n\n";
+
 /// Compose the implementer's effective prompt from the operator's
-/// feature prompt and the approved plan body. Inline counterpart to
-/// [`crate::bailiff::compose_implementer_prompt`] that takes raw `&str`
-/// rather than `agent_plan::PlanBody` — slice G deletes that type
-/// and re-wrapping bytes in it just to unwrap them is churn. The
-/// separator string is the same `&'static str` the existing
-/// composer uses so both renderings stay phrase-identical.
+/// feature prompt and the approved plan body. Takes raw `&str` rather
+/// than `agent_plan::PlanBody` because the plan body has already been
+/// extracted from the signed planner envelope as bytes — re-wrapping
+/// it just to unwrap it again for signing would be churn.
 fn compose_implementer_prompt_bytes(
     feature_prompt: &str,
     plan_body: &str,
@@ -487,12 +486,13 @@ pub enum SubmitImplementError {
 #[cfg(test)]
 mod compose_tests {
     //! Tests for [`compose_implementer_prompt_bytes`]. The composer
-    //! is intentionally tiny — same shape as the existing
-    //! [`crate::bailiff::compose_implementer_prompt`] but taking
-    //! `&str` — and the two tests pin the load-bearing properties:
-    //! the separator appears verbatim, and the byte cap fires on
-    //! the combined length.
+    //! is intentionally tiny; the unit tests pin the load-bearing
+    //! properties: the separator appears verbatim, and the byte cap
+    //! fires on the combined length. The proptest below additionally
+    //! checks that, for any feature/plan within range, the output is
+    //! exactly `feature || SEPARATOR || plan`.
     use super::*;
+    use proptest::prelude::*;
 
     #[test]
     fn separator_appears_verbatim_between_feature_prompt_and_body() {
@@ -510,6 +510,29 @@ mod compose_tests {
         let feature_prompt = "x".repeat(crate::agent_run::MAX_AGENT_PROMPT_BYTES);
         let err = compose_implementer_prompt_bytes(&feature_prompt, "p").unwrap_err();
         assert!(err.to_string().contains("exceeding"), "{err}");
+    }
+
+    proptest! {
+        /// `compose_implementer_prompt_bytes` is a structural
+        /// concatenation: the result starts with the feature prompt,
+        /// ends with the plan body, contains the separator between
+        /// them, and has byte length equal to the sum of the three
+        /// parts.
+        #[test]
+        fn compose_implementer_prompt_three_segments(
+            feature_text in "[ -~]{1,1024}",
+            plan_text in "[ -~]{1,1024}",
+        ) {
+            let combined = compose_implementer_prompt_bytes(&feature_text, &plan_text).unwrap();
+            let s = combined.as_str();
+            prop_assert!(s.starts_with(&feature_text), "missing prefix");
+            prop_assert!(s.ends_with(&plan_text), "missing suffix");
+            prop_assert!(s.contains(PLAN_PROMPT_SEPARATOR), "missing separator");
+            prop_assert_eq!(
+                s.len(),
+                feature_text.len() + PLAN_PROMPT_SEPARATOR.len() + plan_text.len(),
+            );
+        }
     }
 }
 

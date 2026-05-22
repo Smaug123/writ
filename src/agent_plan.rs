@@ -655,9 +655,10 @@ impl<'de> Deserialize<'de> for Decider {
     }
 }
 
-// Prompt composition for executor / reviewer runs lives in
-// [`crate::bailiff`]. It is workflow logic — the broker persists
-// [`PlanBody`] and [`Stage`] but does not splice them.
+// Prompt composition for executor / reviewer runs lives in the
+// bailiff workflow modules ([`crate::bailiff_plan_implement`] and
+// [`crate::bailiff_plan_review`]). The broker persists [`PlanBody`]
+// and [`Stage`] but does not splice them.
 
 // --- Route authorisation matrix --------------------------------------
 

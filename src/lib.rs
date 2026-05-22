@@ -14,7 +14,6 @@ pub mod agent_vm_firewall;
 pub mod agent_vm_lifecycle;
 #[cfg(feature = "host")]
 pub mod audit;
-pub mod bailiff;
 #[cfg(feature = "host")]
 pub mod bailiff_decision;
 #[cfg(feature = "host")]

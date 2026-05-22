@@ -14,7 +14,6 @@ use writ::agent_run::{AgentPrompt, AgentRunId};
 use writ::audit::{
     AgentRunAuditRecord, AuditLog, GitPushRequestRecord, PlanSubmissionRecord, PreMintRecord,
 };
-use writ::bailiff::{PLAN_PROMPT_SEPARATOR, compose_implementer_prompt};
 use writ::bailiff_decision::{Decider, Decision, MAX_DECIDER_BYTES};
 use writ::bailiff_plan_note::{
     DecisionNote, PlanId as BailiffPlanId, plan_decision_seed_blob_bytes,
@@ -725,29 +724,6 @@ proptest! {
         let submission = plan_submission_seed_blob_bytes(plan_id);
         let decision = plan_decision_seed_blob_bytes(plan_id);
         prop_assert_ne!(submission, decision);
-    }
-
-    /// `compose_implementer_prompt` is a structural concatenation: the
-    /// result starts with the feature prompt, ends with the plan body,
-    /// contains the separator between them, and has byte length equal
-    /// to the sum of the three parts.
-    #[test]
-    fn compose_implementer_prompt_three_segments(
-        feature_text in "[ -~]{1,1024}",
-        plan_text in "[ -~]{1,1024}",
-    ) {
-        let feature = AgentPrompt::try_new(feature_text.clone()).unwrap();
-        let plan = PlanBody::try_new(plan_text.clone()).unwrap();
-        let combined = compose_implementer_prompt(&feature, &plan).unwrap();
-
-        let s = combined.as_str();
-        prop_assert!(s.starts_with(&feature_text), "missing prefix");
-        prop_assert!(s.ends_with(&plan_text), "missing suffix");
-        prop_assert!(s.contains(PLAN_PROMPT_SEPARATOR), "missing separator");
-        prop_assert_eq!(
-            s.len(),
-            feature_text.len() + PLAN_PROMPT_SEPARATOR.len() + plan_text.len(),
-        );
     }
 
     /// `route_permitted_by_stage_and_decision` agrees with the oracle on
