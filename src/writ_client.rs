@@ -170,6 +170,12 @@ impl WritClient {
                 purpose: req.purpose,
                 output_ref: req.output_ref,
                 session_id: req.session_id,
+                // VM1 only wires the protocol field. VM3 threads
+                // `RunAgentRequest::workspace` through so bailiff's
+                // `submit_implement` can request a per-run VM
+                // checkout; until then, callers stay on the
+                // host-spawn path.
+                workspace: None,
             })
             .await?;
         match reply {

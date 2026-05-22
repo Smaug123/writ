@@ -328,7 +328,19 @@ pub async fn dispatch_message_with_agent_vm<S: SecretStore + Send + Sync + 'stat
             purpose,
             output_ref,
             session_id,
-        } => run_agent(state, prompt, capabilities, purpose, output_ref, session_id).await,
+            workspace,
+        } => {
+            run_agent(
+                state,
+                prompt,
+                capabilities,
+                purpose,
+                output_ref,
+                session_id,
+                workspace,
+            )
+            .await
+        }
     }
 }
 
@@ -1950,11 +1962,38 @@ async fn run_agent<S: SecretStore + Send + Sync + 'static>(
     purpose: String,
     output_ref: NotesRef,
     request_session_id: Option<SessionId>,
+    workspace: Option<crate::vm_git::AgentVmWorkspaceBootstrap>,
 ) -> ServerMessage {
     // `purpose` is part of the wire contract and will land on the
     // audit row in the follow-up slice. Holding the name in scope (not
     // discarding via `_`) keeps the future plumbing self-evident.
     let _purpose = purpose;
+
+    // VM1 invariant: a `WorkspaceWrite` capability is only meaningful
+    // when the request also carries a workspace bootstrap, because the
+    // host-spawn path has no cwd for the agent to mutate. Reject the
+    // lie before any state work happens — an unconfigured broker still
+    // fails here rather than masking the gate with a not-configured
+    // message. Slice VM2 will wire the `Some(workspace)` arm to the
+    // real per-run VM dispatch; until then the placeholder error stops
+    // the request from silently falling back to the host path.
+    let needs_workspace = capabilities
+        .iter()
+        .any(|c| matches!(c, crate::core::CapabilitySet::WorkspaceWrite { .. }));
+    match (needs_workspace, workspace.as_ref()) {
+        (true, None) => {
+            return ServerMessage::Error {
+                message: "RunAgent: WorkspaceWrite capability requires a workspace bootstrap"
+                    .into(),
+            };
+        }
+        (_, Some(_)) => {
+            return ServerMessage::Error {
+                message: "RunAgent: VM dispatch not yet wired (slice VM2)".into(),
+            };
+        }
+        (false, None) => {}
+    }
 
     let Some(notes_repo) = state.notes_repo.clone() else {
         return run_agent_not_configured("notes_repo");
@@ -2869,6 +2908,7 @@ mod tests {
                 output_ref: crate::core::NotesRef::try_new("refs/notes/writ/agent-outputs")
                     .unwrap(),
                 session_id: None,
+                workspace: None,
             },
             &state,
         )
@@ -2880,6 +2920,90 @@ mod tests {
         assert!(
             message.contains("not configured") && message.contains("notes_repo"),
             "expected 'not configured' message naming the missing component, got: {message}",
+        );
+    }
+
+    /// `WorkspaceWrite` is only meaningful inside a VM workspace: the
+    /// host spawn path has no cwd, so granting write authority over a
+    /// nonexistent checkout would be a wire-level lie. The broker
+    /// must refuse a `RunAgent` carrying any `WorkspaceWrite`
+    /// capability whose `workspace` bootstrap is `None`, *before*
+    /// touching broker state — so an unconfigured broker still
+    /// rejects with this gate rather than the not-configured message.
+    /// Slice VM1's load-bearing invariant.
+    #[tokio::test]
+    async fn run_agent_rejects_workspace_write_without_workspace_bootstrap() {
+        let server = MockServer::start().await;
+        let state = make_state(&server, vec![], "o");
+
+        let resp = dispatch_message(
+            ClientMessage::RunAgent {
+                prompt: crate::agent_run::AgentPrompt::new("implement"),
+                capabilities: vec![crate::core::CapabilitySet::WorkspaceWrite {
+                    repo: RepoRef {
+                        owner: "smaug123".into(),
+                        name: "writ".into(),
+                    },
+                }],
+                purpose: "implement-stage".into(),
+                output_ref: crate::core::NotesRef::try_new("refs/notes/writ/agent-outputs")
+                    .unwrap(),
+                session_id: None,
+                workspace: None,
+            },
+            &state,
+        )
+        .await;
+
+        let ServerMessage::Error { message } = resp else {
+            panic!("expected ServerMessage::Error, got {resp:?}");
+        };
+        assert!(
+            message.contains("WorkspaceWrite") && message.contains("workspace"),
+            "expected gate error naming WorkspaceWrite and the workspace bootstrap requirement, got: {message}",
+        );
+    }
+
+    /// When `workspace` is `Some`, the broker is meant to route
+    /// through the agent-VM lifecycle. Slice VM1 stops short of
+    /// wiring that path; the placeholder surface must be a clear
+    /// `Error` rather than a panic or a silent fall-through to the
+    /// host spawn (which would defeat the whole point of the field).
+    /// Slice VM2 replaces this placeholder with the real VM dispatch.
+    #[tokio::test]
+    async fn run_agent_with_workspace_returns_vm_not_yet_wired_error() {
+        let server = MockServer::start().await;
+        let state = make_state(&server, vec![], "o");
+
+        let resp = dispatch_message(
+            ClientMessage::RunAgent {
+                prompt: crate::agent_run::AgentPrompt::new("implement"),
+                capabilities: vec![crate::core::CapabilitySet::WorkspaceWrite {
+                    repo: RepoRef {
+                        owner: "smaug123".into(),
+                        name: "writ".into(),
+                    },
+                }],
+                purpose: "implement-stage".into(),
+                output_ref: crate::core::NotesRef::try_new("refs/notes/writ/agent-outputs")
+                    .unwrap(),
+                session_id: None,
+                workspace: Some(crate::vm_git::AgentVmWorkspaceBootstrap {
+                    repo: "owner/repo".parse().unwrap(),
+                    destination: None,
+                    warm: crate::vm_git::WorkspaceWarmMode::None,
+                }),
+            },
+            &state,
+        )
+        .await;
+
+        let ServerMessage::Error { message } = resp else {
+            panic!("expected ServerMessage::Error, got {resp:?}");
+        };
+        assert!(
+            message.contains("VM dispatch not yet wired"),
+            "expected placeholder VM-not-yet-wired message, got: {message}",
         );
     }
 
@@ -2955,6 +3079,7 @@ mod tests {
                 purpose: "round-trip-test".into(),
                 output_ref: output_ref.clone(),
                 session_id: None,
+                workspace: None,
             },
             &state,
         )
@@ -3059,6 +3184,7 @@ mod tests {
                 output_ref: crate::core::NotesRef::try_new("refs/notes/writ/v1/agent-outputs")
                     .unwrap(),
                 session_id: None,
+                workspace: None,
             },
             &state,
         )
@@ -3132,6 +3258,7 @@ mod tests {
                 purpose: "stderr-capture".into(),
                 output_ref: output_ref.clone(),
                 session_id: None,
+                workspace: None,
             },
             &state,
         )
@@ -3224,6 +3351,7 @@ mod tests {
                 purpose: "truncation".into(),
                 output_ref: output_ref.clone(),
                 session_id: None,
+                workspace: None,
             },
             &state,
         )
@@ -3310,6 +3438,7 @@ mod tests {
                 output_ref: crate::core::NotesRef::try_new("refs/notes/writ/v1/agent-outputs")
                     .unwrap(),
                 session_id: Some(session_id),
+                workspace: None,
             },
             &state,
         )
@@ -3367,6 +3496,7 @@ mod tests {
                 output_ref: crate::core::NotesRef::try_new("refs/notes/writ/v1/agent-outputs")
                     .unwrap(),
                 session_id: Some(bogus),
+                workspace: None,
             },
             &state,
         )
@@ -3435,6 +3565,7 @@ mod tests {
                 output_ref: crate::core::NotesRef::try_new("refs/notes/writ/v1/agent-outputs")
                     .unwrap(),
                 session_id: Some(session_id),
+                workspace: None,
             },
             &state,
         )
