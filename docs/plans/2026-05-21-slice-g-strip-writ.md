@@ -137,7 +137,7 @@ readers (`vm_http/plan.rs`, `bailiff.rs`).
 
 ~-1.7k LoC. Single PR.
 
-### G2 — strip VM HTTP plan route layer
+### G2 — strip VM HTTP plan route layer (and Path-2 caller chain)
 
 Delete `src/vm_http/plan.rs` entirely; remove its module
 declaration; remove the writ-vm route mount.
@@ -146,10 +146,25 @@ This is where the `Stage` / `read_plan_id` route-auth checks live;
 deleting the route layer drops those reads. `audit::plan`'s
 remaining readers go to zero after this PR.
 
-`src/bailiff.rs` still reads `Stage` from `VmAgentRunConfigResponse`
-at this point.
+**Scope expansion (in-progress):** Codex flagged a P1 on the first
+G2 attempt — removing the plan routes leaves
+`StartAgentRun { stage, read_plan_id }` and the writ-vm `Cmd::Agent`
+dispatch as half-migrated state with no surviving consumer. The
+fix-forward (this PR) absorbs what was originally planned as G4
+into G2: strip `stage` / `read_plan_id` from the entire Path-2
+chain (`writ agent run` CLI args → `ClientMessage::StartAgentRun`
+wire variant → `server.rs` dispatch → `start_agent_run_session` →
+`VmHttpAgentRunService::insert_run_config` → `VmAgentRunConfigResponse`),
+restore writ-vm `Cmd::Agent { AgentCmd::Run }` minus
+`fetch_effective_prompt` (pass raw prompt through), and delete
+`check_start_agent_run_binding`. The audit DAO row still carries
+`stage` / `read_plan_id` columns (defaulted to `Stage::Execute` /
+`None` at insert time) until G5's pure-deletion sweep.
 
-~-3.6k LoC. Single PR.
+`src/bailiff.rs` and `fetch_effective_prompt` are now the only
+remaining `Stage` readers; G3 deletes them.
+
+~-3.6k LoC (route layer) + ~-400 LoC (Path-2 strip) net. Single PR.
 
 ### G3 — relocate compose helpers, delete src/bailiff.rs
 
@@ -175,19 +190,17 @@ have no readers and `agent_plan.rs`'s sole remaining reader is
 ~-300 LoC net (separators / compose move; fetch_effective_prompt
 deletes; src/bailiff.rs gone). Single PR.
 
-### G4 — strip `stage` and `read_plan_id` from `agent_run.rs`
+### G4 — absorbed into G2
 
-Surgical: remove the two fields from `VmAgentRunConfigResponse`,
-the visitor cases that parse them (lines 127–173), the getters
-(lines 317, 321), and the five dedicated tests (lines 823–880).
+The `VmAgentRunConfigResponse` field strip originally planned for
+G4 was pulled forward into G2 (see scope-expansion note above)
+because removing the VM HTTP plan routes is exactly what makes
+the carried `stage` / `read_plan_id` fields dead end-to-end. The
+hand-rolled missing-vs-null visitor was replaced with derive +
+`deny_unknown_fields` at the same time — the distinction only
+mattered while `read_plan_id` was load-bearing.
 
-This is the smallest sub-slice; it's separated from G3 so a
-regression in either is independently revertible. The fields
-deserialize via a hand-rolled visitor that distinguishes "missing
-key" from "key present with null" — those tests would otherwise
-mask any visitor regression caused by other field removals.
-
-~-200 LoC. Single PR.
+No standalone PR.
 
 ### G5 — combined pure-deletion PR (agent_run fields + audit DAO + agent_plan)
 

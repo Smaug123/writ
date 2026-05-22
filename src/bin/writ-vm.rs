@@ -13,7 +13,6 @@ use clap::{Parser, Subcommand};
 use writ::agent_run::{
     AgentProcessPlan, AgentPrompt, AgentRunId, AgentRunTerminalStatus, run_agent_process,
 };
-use writ::bailiff::fetch_effective_prompt;
 use writ::core::AgentKind;
 use writ::vm_client::{
     VM_BROKER_TOKEN_ENV, VM_BROKER_URL_ENV, VmClientConfig, VmClientConfigError, VmGitCloneCommand,
@@ -129,7 +128,7 @@ enum WorkspaceCmd {
 
 #[derive(Subcommand)]
 enum AgentCmd {
-    /// Fetch the brokered prompt and run the configured stage adapter.
+    /// Fetch the brokered prompt and run the agent adapter.
     Run {
         /// Agent run UUID assigned by the host daemon.
         #[arg(long)]
@@ -236,14 +235,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 fake_agent,
             } => {
                 let run_id = parse_agent_run_id(&run_id)?;
-                let (prompt, model, stage, read_plan_id) =
-                    fetch_agent_run_config(&config, run_id).await?;
-                let effective_prompt =
-                    fetch_effective_prompt(&config, &prompt, stage, read_plan_id).await?;
+                let (prompt, model) = fetch_agent_run_config(&config, run_id).await?;
                 run_stage_agent(
                     agent,
                     run_id,
-                    &effective_prompt,
+                    &prompt,
                     &model,
                     &config,
                     fake_agent.as_deref(),

@@ -1166,7 +1166,6 @@ mod tests {
             openai_proxy: None,
             agent_runs: None,
             git_push: None,
-            plans: None,
         }
     }
 

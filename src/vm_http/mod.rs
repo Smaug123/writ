@@ -10,7 +10,6 @@ mod git_clone;
 mod git_push;
 mod nix_cache;
 mod openai_proxy;
-mod plan;
 mod proxy_common;
 
 pub use agent_runs::VmHttpAgentRunService;
@@ -37,13 +36,6 @@ use nix_cache::{is_nix_cache_target, record_nix_cache_local_response, route_nix_
 use openai_proxy::VmHttpOpenAiProxyService;
 pub use openai_proxy::{
     VmHttpOpenAiProxyAuthKind, VmHttpOpenAiProxyConfig, VmHttpOpenAiProxyConfigError,
-};
-pub use plan::VmHttpPlanService;
-use plan::{
-    is_plans_collection_target, parse_plan_abort_target, parse_plan_addenda_target,
-    parse_plan_id_target, parse_plan_reviews_target, route_plan_abort_request,
-    route_plan_addenda_request, route_plan_id_request, route_plan_reviews_request,
-    route_plans_collection_request,
 };
 use proxy_common::{
     ClaudeBackend, OpenAiBackend, ProxyAuditDecision, ProxyBackend, ProxyStream,
@@ -133,7 +125,6 @@ pub struct PreparedVmHttpSession<S: SecretStore + Send + Sync + 'static> {
     proxies: VmHttpProxies<S>,
     agent_runs: Option<VmHttpAgentRunService<S>>,
     git_push: Option<VmHttpGitPushService<S>>,
-    plans: Option<VmHttpPlanService<S>>,
 }
 
 pub(in crate::vm_http) struct VmHttpProxies<S: SecretStore + Send + Sync + 'static> {
@@ -157,7 +148,6 @@ struct VmHttpServices<S: SecretStore + Send + Sync + 'static> {
     openai_proxy: Option<VmHttpOpenAiProxyService<S>>,
     agent_runs: Option<VmHttpAgentRunService<S>>,
     git_push: Option<VmHttpGitPushService<S>>,
-    plans: Option<VmHttpPlanService<S>>,
 }
 
 pub struct RunningVmHttpSession {
@@ -376,7 +366,6 @@ impl<S: SecretStore + Send + Sync + 'static> VmHttpServices<S> {
             openai_proxy: None,
             agent_runs: None,
             git_push: None,
-            plans: None,
         }
     }
 
@@ -386,7 +375,6 @@ impl<S: SecretStore + Send + Sync + 'static> VmHttpServices<S> {
         proxies: VmHttpProxies<S>,
         agent_runs: Option<VmHttpAgentRunService<S>>,
         git_push: Option<VmHttpGitPushService<S>>,
-        plans: Option<VmHttpPlanService<S>>,
     ) -> Self {
         Self {
             git_clone: Some(git_clone),
@@ -395,7 +383,6 @@ impl<S: SecretStore + Send + Sync + 'static> VmHttpServices<S> {
             openai_proxy: proxies.openai,
             agent_runs,
             git_push,
-            plans,
         }
     }
 }
@@ -409,7 +396,6 @@ impl<S: SecretStore + Send + Sync + 'static> Clone for VmHttpServices<S> {
             openai_proxy: self.openai_proxy.clone(),
             agent_runs: self.agent_runs.clone(),
             git_push: self.git_push.clone(),
-            plans: self.plans.clone(),
         }
     }
 }
@@ -557,7 +543,6 @@ impl<S: SecretStore + Send + Sync + 'static> PreparedVmHttpSession<S> {
             self.proxies,
             self.agent_runs,
             self.git_push,
-            self.plans,
             shutdown_rx,
         ));
         RunningVmHttpSession {
@@ -658,19 +643,10 @@ pub async fn prepare_vm_http_session<S: SecretStore + Send + Sync + 'static>(
     session_id: SessionId,
     source_ipv4: Ipv4Cidr,
 ) -> Result<PreparedVmHttpSession<S>, VmHttpRuntimeError> {
-    prepare_vm_http_session_with_agent_runs(
-        state,
-        config,
-        session_id,
-        source_ipv4,
-        None,
-        None,
-        None,
-    )
-    .await
+    prepare_vm_http_session_with_agent_runs(state, config, session_id, source_ipv4, None, None)
+        .await
 }
 
-#[allow(clippy::too_many_arguments)]
 pub async fn prepare_vm_http_session_with_agent_runs<S: SecretStore + Send + Sync + 'static>(
     state: Arc<BrokerState<S>>,
     config: &VmHttpRuntimeConfig,
@@ -678,7 +654,6 @@ pub async fn prepare_vm_http_session_with_agent_runs<S: SecretStore + Send + Syn
     source_ipv4: Ipv4Cidr,
     agent_runs: Option<VmHttpAgentRunService<S>>,
     git_push: Option<VmHttpGitPushService<S>>,
-    plans: Option<VmHttpPlanService<S>>,
 ) -> Result<PreparedVmHttpSession<S>, VmHttpRuntimeError> {
     let listener =
         bind_ephemeral_vm_http_listener(config.bind_addr, config.broker_port_range).await?;
@@ -708,7 +683,6 @@ pub async fn prepare_vm_http_session_with_agent_runs<S: SecretStore + Send + Syn
         },
         agent_runs,
         git_push,
-        plans,
     })
 }
 
@@ -744,13 +718,12 @@ pub(in crate::vm_http) async fn run_vm_http_with_services_until_shutdown<
     proxies: VmHttpProxies<S>,
     agent_runs: Option<VmHttpAgentRunService<S>>,
     git_push: Option<VmHttpGitPushService<S>>,
-    plans: Option<VmHttpPlanService<S>>,
     shutdown: watch::Receiver<bool>,
 ) -> std::io::Result<()> {
     run_vm_http_runtime_until_shutdown(
         listener,
         session,
-        VmHttpServices::with_git(git_clone, nix_cache, proxies, agent_runs, git_push, plans),
+        VmHttpServices::with_git(git_clone, nix_cache, proxies, agent_runs, git_push),
         shutdown,
     )
     .await
@@ -1238,53 +1211,6 @@ fn route_request_body_limit<S: SecretStore + Send + Sync + 'static>(
     {
         return Some(MAX_VM_HTTP_AGENT_RUN_OUTCOME_BODY_BYTES);
     }
-    if is_plans_collection_target(&request.target)
-        && request.method == "POST"
-        && services.plans.is_some()
-    {
-        // The cap must admit every body `PlanBody::try_new` would
-        // accept (any non-empty UTF-8 ≤ `MAX_PLAN_BODY_BYTES`). The
-        // hard limit is `Limited::collect`'s view of *encoded* bytes,
-        // so the cap has to cover worst-case JSON expansion: an ASCII
-        // control byte serialises as `\u00XX` — 6 bytes for 1. The
-        // envelope (`{"agent_run_id":"<uuid>","body":""}`) is well
-        // under 100 bytes; 1 KiB is generous headroom.
-        return Some(6 * crate::agent_plan::MAX_PLAN_BODY_BYTES + 1024);
-    }
-    if parse_plan_reviews_target(&request.target).is_some()
-        && request.method == "POST"
-        && services.plans.is_some()
-    {
-        // Same worst-case-expansion logic as the plans collection
-        // route: `PlanFeedback::try_new` admits any non-empty UTF-8
-        // ≤ `MAX_PLAN_FEEDBACK_BYTES`, and an ASCII control byte
-        // expands 6:1 in JSON (`\u00XX`). The envelope
-        // (`{"agent_run_id":"<uuid>","verdict":"request_changes",
-        // "feedback":""}`) stays comfortably under 200 bytes; 1 KiB is
-        // generous headroom.
-        return Some(6 * crate::agent_plan::MAX_PLAN_FEEDBACK_BYTES + 1024);
-    }
-    if parse_plan_addenda_target(&request.target).is_some()
-        && request.method == "POST"
-        && services.plans.is_some()
-    {
-        // `AddendumSubmission.body` reuses the `PlanBody` newtype, so
-        // the cap mirrors the plans collection route: any non-empty
-        // UTF-8 ≤ `MAX_PLAN_BODY_BYTES` with 6:1 worst-case JSON
-        // expansion for ASCII control bytes. The envelope
-        // (`{"body":""}`) is trivial; 1 KiB headroom is plenty.
-        return Some(6 * crate::agent_plan::MAX_PLAN_BODY_BYTES + 1024);
-    }
-    if parse_plan_abort_target(&request.target).is_some()
-        && request.method == "POST"
-        && services.plans.is_some()
-    {
-        // `AbortSubmission.reason` is a `PlanAbortReason`, capped at
-        // `MAX_PLAN_ABORT_REASON_BYTES`. Same 6:1 worst-case JSON
-        // expansion (`\u00XX` for ASCII control bytes); the envelope
-        // (`{"reason":""}`) is well under 100 bytes.
-        return Some(6 * crate::agent_plan::MAX_PLAN_ABORT_REASON_BYTES + 1024);
-    }
     None
 }
 
@@ -1329,56 +1255,6 @@ where
             return VmHttpResponse::text(VmHttpStatus::NotFound, "not found").into();
         };
         return route_git_push_request(session, request, body, service)
-            .await
-            .into();
-    }
-
-    if is_plans_collection_target(&request.target) {
-        let Some(service) = services.plans else {
-            return VmHttpResponse::text(VmHttpStatus::NotFound, "not found").into();
-        };
-        return route_plans_collection_request(session, request, body, service)
-            .await
-            .into();
-    }
-
-    // `parse_plan_reviews_target`, `parse_plan_addenda_target`, and
-    // `parse_plan_abort_target` run before `parse_plan_id_target` for
-    // readability — the sub-route parsers and the id-only parser are
-    // disjoint (the id-only parser rejects any suffix containing a
-    // `/`), so ordering here does not affect correctness.
-    if let Some(plan_id) = parse_plan_reviews_target(&request.target) {
-        let Some(service) = services.plans else {
-            return VmHttpResponse::text(VmHttpStatus::NotFound, "not found").into();
-        };
-        return route_plan_reviews_request(session, request, body, plan_id, service)
-            .await
-            .into();
-    }
-
-    if let Some(plan_id) = parse_plan_addenda_target(&request.target) {
-        let Some(service) = services.plans else {
-            return VmHttpResponse::text(VmHttpStatus::NotFound, "not found").into();
-        };
-        return route_plan_addenda_request(session, request, body, plan_id, service)
-            .await
-            .into();
-    }
-
-    if let Some(plan_id) = parse_plan_abort_target(&request.target) {
-        let Some(service) = services.plans else {
-            return VmHttpResponse::text(VmHttpStatus::NotFound, "not found").into();
-        };
-        return route_plan_abort_request(session, request, body, plan_id, service)
-            .await
-            .into();
-    }
-
-    if let Some(plan_id) = parse_plan_id_target(&request.target) {
-        let Some(service) = services.plans else {
-            return VmHttpResponse::text(VmHttpStatus::NotFound, "not found").into();
-        };
-        return route_plan_id_request(session, request, plan_id, service)
             .await
             .into();
     }
@@ -1692,7 +1568,6 @@ mod tests {
             openai_proxy: None,
             agent_runs: None,
             git_push: None,
-            plans: None,
         }
     }
 
