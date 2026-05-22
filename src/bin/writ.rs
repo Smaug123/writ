@@ -520,7 +520,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     request_id: id,
                     operator,
                 };
-                match call(&socket_path, &msg)? {
+                // Use the promote-specific timeout: the broker's approve
+                // pipeline (mint → walk-and-sign → push → audit) can run
+                // far longer than the default 60s `CALL_TIMEOUT`. Timing
+                // out before the broker would silently lose the
+                // `new_app_tip` receipt even though the push may have
+                // landed.
+                match call_with_timeout(&socket_path, &msg, PROMOTE_APPROVE_CALL_TIMEOUT)? {
                     ServerMessage::StagedPushApproved {
                         request_id,
                         new_app_tip,
@@ -818,6 +824,18 @@ const AGENT_VM_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 // prefetching, and the daemon's workspace bootstrap timeout is 20 minutes.
 const AGENT_VM_WORKSPACE_CALL_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(30 * 60);
+// `promote approve` shells the broker through the full mint → walk-and-sign →
+// push → audit-write pipeline; for a multi-commit replay over a slow network
+// this dwarfs the 60s default. The broker's `APPROVE_MINT_TTL_SECONDS` is
+// 3600s, the upper bound on how long the broker is willing to spend before
+// the minted token expires; a CLI cap above that adds nothing but invites
+// shells to hang on a wedged daemon. 30 minutes matches
+// `AGENT_VM_WORKSPACE_CALL_TIMEOUT` — both are "host CLI waits for broker
+// to do potentially-network-bound work synchronously" — and leaves
+// half the broker-side budget as headroom. A timeout here means the broker
+// may still complete the push and stamp the resolution row; the operator's
+// recourse is `writ promote show <id>` to find out.
+const PROMOTE_APPROVE_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 
 fn call(
     socket_path: &Path,
