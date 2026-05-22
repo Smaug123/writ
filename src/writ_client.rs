@@ -176,6 +176,8 @@ impl WritClient {
                 // checkout; until then, callers stay on the
                 // host-spawn path.
                 workspace: None,
+                agent_kind: None,
+                agent_model: None,
             })
             .await?;
         match reply {
