@@ -479,6 +479,25 @@ pub enum ClientMessage {
         /// predates the field still parses.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         session_id: Option<SessionId>,
+        /// When present, writ must run the agent inside a per-run VM
+        /// provisioned with a checkout per the bootstrap. The agent's
+        /// cwd inside the VM is the checkout destination, so a
+        /// `CapabilitySet::WorkspaceWrite` capability is meaningful.
+        /// When absent, writ takes the host-spawn path (no cwd,
+        /// suitable only for read-only or prompt-only agent runs).
+        ///
+        /// Required when any element of `capabilities` is
+        /// `CapabilitySet::WorkspaceWrite { .. }`: the broker rejects
+        /// such a request with no workspace bootstrap, so the host
+        /// path cannot mint write-capable runs against no checkout.
+        /// Omitted on the wire when `None` so a legacy caller that
+        /// predates this field still parses.
+        ///
+        /// Slice VM1 adds the field and the rejection gate. Slice VM2
+        /// will replace today's "VM dispatch not yet wired" placeholder
+        /// error with the real VM dispatch.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        workspace: Option<AgentVmWorkspaceBootstrap>,
     },
 }
 
@@ -877,6 +896,7 @@ mod tests {
             purpose: "plan-stage".into(),
             output_ref: NotesRef::try_new("refs/notes/writ/agent-outputs").unwrap(),
             session_id: Some(fixed_session_id()),
+            workspace: None,
         };
         let json = serde_json::to_string(&msg).unwrap();
         let back: ClientMessage = serde_json::from_str(&json).unwrap();
@@ -897,6 +917,7 @@ mod tests {
             purpose: "reviewer".into(),
             output_ref: NotesRef::try_new("refs/notes/writ/agent-outputs").unwrap(),
             session_id: None,
+            workspace: None,
         };
         let value: serde_json::Value = serde_json::to_value(&msg).unwrap();
         assert_eq!(value["type"], "run_agent");
@@ -907,6 +928,10 @@ mod tests {
         // round-trips byte-for-byte. The bound test below pins the
         // present-on-the-wire spelling.
         assert!(value.get("session_id").is_none(), "wire: {value}");
+        // Same elision rule for the VM1 `workspace` field: omitted on
+        // the wire when `None` so the pre-VM1 shape (a host-path
+        // `WorkspaceRead` caller) still encodes byte-for-byte the same.
+        assert!(value.get("workspace").is_none(), "wire: {value}");
         let back: ClientMessage = serde_json::from_value(value).unwrap();
         assert_eq!(back, msg);
     }
@@ -925,6 +950,7 @@ mod tests {
             purpose: "plan-submit".into(),
             output_ref: NotesRef::try_new("refs/notes/writ/agent-outputs").unwrap(),
             session_id: Some(session_id),
+            workspace: None,
         };
         let value: serde_json::Value = serde_json::to_value(&msg).unwrap();
         assert_eq!(
@@ -950,6 +976,55 @@ mod tests {
         let back: ClientMessage = serde_json::from_value(value).unwrap();
         match back {
             ClientMessage::RunAgent { session_id, .. } => assert_eq!(session_id, None),
+            other => panic!("expected RunAgent, got {other:?}"),
+        }
+    }
+
+    /// When the caller supplies a `workspace` bootstrap, the field
+    /// appears on the wire under that exact name and round-trips
+    /// byte-equal. Pinning the spelling here means a future refactor
+    /// to `vm_workspace` or `agent_workspace` fails this test rather
+    /// than silently changing the broker contract — `bailiff plan
+    /// implement` will be the first caller to depend on the field.
+    #[test]
+    fn run_agent_roundtrips_with_workspace_field() {
+        let msg = ClientMessage::RunAgent {
+            prompt: AgentPrompt::new("implement the plan"),
+            capabilities: vec![CapabilitySet::WorkspaceWrite {
+                repo: sample_repo(),
+            }],
+            purpose: "implement-stage".into(),
+            output_ref: NotesRef::try_new("refs/notes/writ/agent-outputs").unwrap(),
+            session_id: Some(fixed_session_id()),
+            workspace: Some(AgentVmWorkspaceBootstrap {
+                repo: sample_clone_repo(),
+                destination: Some(PathBuf::from("/workspace/repo")),
+                warm: WorkspaceWarmMode::DevShell,
+            }),
+        };
+        let value: serde_json::Value = serde_json::to_value(&msg).unwrap();
+        assert!(value.get("workspace").is_some(), "wire: {value}");
+        let back: ClientMessage = serde_json::from_value(value).unwrap();
+        assert_eq!(back, msg);
+    }
+
+    /// A wire payload that omits `workspace` decodes as `None` —
+    /// preserves backward compatibility with the pre-VM1 wire shape
+    /// for `WorkspaceRead` callers (`bailiff plan submit` and `bailiff
+    /// plan review`), and is the spelling `skip_serializing_if =
+    /// "Option::is_none"` produces on encode.
+    #[test]
+    fn run_agent_accepts_payload_without_workspace_field() {
+        let value = serde_json::json!({
+            "type": "run_agent",
+            "prompt": "p",
+            "capabilities": [],
+            "purpose": "legacy",
+            "output_ref": "refs/notes/writ/agent-outputs",
+        });
+        let back: ClientMessage = serde_json::from_value(value).unwrap();
+        match back {
+            ClientMessage::RunAgent { workspace, .. } => assert_eq!(workspace, None),
             other => panic!("expected RunAgent, got {other:?}"),
         }
     }
@@ -2102,6 +2177,7 @@ mod tests {
                 purpose: "plan-stage".into(),
                 output_ref: NotesRef::try_new("refs/notes/writ/agent-outputs").unwrap(),
                 session_id: Some(fixed_session_id()),
+                workspace: None,
             },
             11 => ClientMessage::ApproveStagedPush {
                 request_id: "12345678-1234-1234-1234-123456789012".parse().unwrap(),
