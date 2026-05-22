@@ -103,6 +103,18 @@ pub enum WritClientError {
         #[source]
         source: io::Error,
     },
+    /// `serde_json::to_string` refused the [`ClientMessage`]. The only
+    /// path that lands here in practice is a `RunAgent` workspace whose
+    /// `destination: PathBuf` carries non-UTF-8 bytes (legal on Unix,
+    /// inexpressible in JSON); the bailiff CLI rejects this at the
+    /// `--workspace-destination` flag, but the `WritClient` API is
+    /// public and any other consumer should see a typed error rather
+    /// than a panic.
+    #[error("encoding request to writ as JSON failed: {source}")]
+    Serialize {
+        #[source]
+        source: serde_json::Error,
+    },
     #[error("writing request to writ failed: {source}")]
     Write {
         #[source]
@@ -278,7 +290,8 @@ impl WritClient {
         let (reader, mut writer) = stream.into_split();
         let mut reader = BufReader::new(reader);
 
-        let mut json = serde_json::to_string(&msg).expect("ClientMessage always serializes");
+        let mut json =
+            serde_json::to_string(&msg).map_err(|source| WritClientError::Serialize { source })?;
         json.push('\n');
         writer
             .write_all(json.as_bytes())
@@ -577,6 +590,62 @@ mod tests {
             }
             other => panic!("expected RunAgent, got {other:?}"),
         }
+    }
+
+    /// A `RunAgentRequest` whose workspace `destination` carries
+    /// non-UTF-8 bytes (legal `PathBuf` content on Unix) must come back
+    /// as a typed `WritClientError::Serialize`, not a panic from the
+    /// `serde_json::to_string` call inside `roundtrip`. The bailiff CLI
+    /// validates its `--workspace-destination` flag before constructing
+    /// a `RunAgentRequest`, but `WritClient` is a public API and any
+    /// other consumer that hands in a non-UTF-8 path must observe an
+    /// error variant they can react to without parsing prose.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn run_agent_returns_serialize_error_for_non_utf8_workspace_destination() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        // The broker is wired up but should never actually see a line:
+        // the client should fail before writing. `start` is enough — the
+        // broker queues one reply that simply goes unused.
+        let broker = StubBroker::start(ServerMessage::RunAgentCompleted {
+            output_oid: sample_object_id(),
+            signed_metadata: sample_signed_metadata(),
+            signature: sample_signature(),
+        })
+        .await;
+
+        let bad_destination = PathBuf::from(OsString::from_vec(vec![0xff, 0xfe, 0xfd]));
+        let workspace = AgentVmWorkspaceBootstrap {
+            repo: GitCloneRepo::new(RepoRef {
+                owner: "smaug123".into(),
+                name: "writ".into(),
+            })
+            .unwrap(),
+            destination: Some(bad_destination),
+            warm: WorkspaceWarmMode::DevShell,
+        };
+
+        let mut req = sample_request();
+        req.workspace = Some(workspace);
+        req.agent_kind = Some(AgentKind::Claude);
+        req.agent_model = Some("claude-opus-4-7".into());
+
+        let client = WritClient::new(&broker.socket_path);
+        let err = client.run_agent(req).await.unwrap_err();
+        assert!(
+            matches!(err, WritClientError::Serialize { .. }),
+            "expected Serialize, got {err:?}",
+        );
+
+        // And the broker must not have received any framed request:
+        // `serde_json::to_string` failed before the write hit the wire,
+        // so the stub's accept loop sees no line.
+        assert!(
+            broker.observed_requests().await.is_empty(),
+            "client must fail before writing when serialization refuses the message",
+        );
     }
 
     /// A structured `ServerMessage::Error` becomes
