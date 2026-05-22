@@ -57,8 +57,14 @@ pub(super) const SCHEMA_VERSION: i32 = 4;
 pub(super) const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 1,
-        name: "0001_initial",
-        sql: include_str!("migrations/0001_initial.sql"),
+        // Renamed from "0001_initial" in slice G5: the v1 SQL was
+        // squashed in place to drop plan-era tables and columns, so
+        // a pre-G5 DB that records the bare "0001_initial" name now
+        // has an incompatible on-disk shape. The `_v2` suffix makes
+        // `verify_schema_history` reject those DBs at version 1
+        // instead of resuming forward over a non-squashed base.
+        name: "0001_initial_v2",
+        sql: include_str!("migrations/0001_initial_v2.sql"),
     },
     Migration {
         version: 2,
@@ -508,38 +514,70 @@ mod tests {
         }
     }
 
-    /// A DB written by a binary whose migration list has since been
-    /// re-arranged (e.g. the pre-G5 broker, where post-plan migrations
-    /// were numbered 0004-0006 before slice G's schema squash
-    /// renumbered them 0002-0004) records a different `name` for the
-    /// same `version`. Trusting the version alone would silently treat
-    /// the old DB as already-migrated; the name-match check catches
-    /// the mismatch and refuses to open.
+    /// A pre-G5 DB stopped at version 1 recorded the unsuffixed
+    /// `0001_initial` name. Post-G5 the v1 migration was squashed in
+    /// place and renamed `0001_initial_v2`, so the same recorded name
+    /// now signals "DB is at the pre-squash v1 shape (plan tables
+    /// present, `agent_run.stage`/`read_plan_id` still there)" rather
+    /// than the new squashed shape. Refusing to open is required:
+    /// blindly applying the renumbered 0002-0004 migrations over a
+    /// pre-squash v1 base would leave the DB in a hybrid half-squashed
+    /// state.
     #[test]
-    fn open_rejects_schema_with_mismatched_history() {
+    fn open_rejects_pre_squash_v1_history() {
         let db = NamedTempFile::new().unwrap();
         {
-            // Stand up the v1 shape, then forge a pre-squash v2 row:
-            // pre-G5, `0002_plan_addendum` was the migration at version 2.
-            // The current binary expects `0002_git_push_resolution_mint`
-            // at that version, so the registry rows disagree.
-            let mut conn = Connection::open(db.path()).unwrap();
+            // We have to write the row manually rather than execute
+            // pre-G5 SQL: the squash drops the old plan tables, so
+            // simulating the *exact* old-v1 shape would require an
+            // archived copy of the old 0001_initial.sql. The name
+            // mismatch alone is what catches this on a real upgrade,
+            // and that's what's under test.
+            let conn = Connection::open(db.path()).unwrap();
             ensure_schema_version_table(&conn).unwrap();
-            let tx = conn
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .unwrap();
-            tx.execute_batch(MIGRATIONS[0].sql).unwrap();
-            tx.execute(
+            conn.execute(
                 "INSERT INTO schema_version (version, name, applied_at_ms) VALUES (?1, ?2, ?3)",
                 params![1, "0001_initial", 1_i64],
             )
             .unwrap();
-            tx.execute(
+        }
+        let err = AuditLog::open(db.path()).unwrap_err();
+        match err {
+            AuditError::SchemaHistoryMismatch {
+                version,
+                found_name,
+                expected_name,
+            } => {
+                assert_eq!(version, 1);
+                assert_eq!(found_name, "0001_initial");
+                assert_eq!(expected_name, "0001_initial_v2");
+            }
+            other => panic!("expected SchemaHistoryMismatch, got {other:?}"),
+        }
+    }
+
+    /// A DB written by a pre-G5 binary that ran past v1 records a
+    /// different `name` for at least one post-v1 version (the slice-G
+    /// squash renumbered 0004-0006 → 0002-0004). Catching the v2
+    /// mismatch is the same correctness story as the v1 case above,
+    /// but the second-row check exercises the loop's "skip v1, fault
+    /// on v2" path.
+    #[test]
+    fn open_rejects_schema_with_mismatched_post_v1_history() {
+        let db = NamedTempFile::new().unwrap();
+        {
+            let conn = Connection::open(db.path()).unwrap();
+            ensure_schema_version_table(&conn).unwrap();
+            conn.execute(
+                "INSERT INTO schema_version (version, name, applied_at_ms) VALUES (?1, ?2, ?3)",
+                params![1, "0001_initial_v2", 1_i64],
+            )
+            .unwrap();
+            conn.execute(
                 "INSERT INTO schema_version (version, name, applied_at_ms) VALUES (?1, ?2, ?3)",
                 params![2, "0002_plan_addendum", 2_i64],
             )
             .unwrap();
-            tx.commit().unwrap();
         }
         let err = AuditLog::open(db.path()).unwrap_err();
         match err {
@@ -556,9 +594,9 @@ mod tests {
         }
     }
 
-    /// Counterpart to the rejection test: a partially-migrated DB at v1
-    /// whose only recorded row genuinely matches the in-code v1
-    /// migration must still open and complete the remaining migrations.
+    /// Counterpart to the rejection tests: a partially-migrated DB at
+    /// v1 whose recorded row matches the in-code v1 migration name
+    /// must still open and complete the remaining migrations.
     /// Otherwise the history check would refuse legitimate resumption
     /// after a process killed mid-migration sequence.
     #[test]
@@ -573,7 +611,7 @@ mod tests {
             tx.execute_batch(MIGRATIONS[0].sql).unwrap();
             tx.execute(
                 "INSERT INTO schema_version (version, name, applied_at_ms) VALUES (?1, ?2, ?3)",
-                params![1, "0001_initial", 1_i64],
+                params![1, "0001_initial_v2", 1_i64],
             )
             .unwrap();
             tx.commit().unwrap();
