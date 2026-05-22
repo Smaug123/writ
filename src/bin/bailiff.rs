@@ -433,6 +433,45 @@ fn parse_workspace_warm(raw: &str) -> Result<WorkspaceWarmMode, String> {
     }
 }
 
+/// Validate `--workspace-destination` and assemble the per-run VM
+/// workspace bootstrap. The UTF-8 check is what makes the surrounding
+/// CLI safe: `AgentVmWorkspaceBootstrap` carries `destination:
+/// Option<PathBuf>`, and on Unix a `PathBuf` can hold arbitrary bytes
+/// — but the wire is JSON, and `serde_json` returns an error rather
+/// than emit a non-UTF-8 byte sequence. The writ client's `roundtrip`
+/// path `.expect()`s serialization to succeed (every other
+/// `ClientMessage` variant uses serializer-infallible types), so a
+/// non-UTF-8 destination smuggled past clap would crash the client
+/// instead of surfacing as a `WritClientError`. The validation is
+/// here, not on `AgentVmWorkspaceBootstrap` itself, because the
+/// invariant is *outbound* — the broker never accepts an inbound
+/// non-UTF-8 path either, but that's a server-side concern. Mirrors
+/// [`writ::cli::workspace::build_workspace_bootstrap_from_repo`]'s
+/// check for the writ-side `--workspace` flag.
+fn build_implement_workspace_bootstrap(
+    repo: &RepoRef,
+    destination: Option<PathBuf>,
+    warm: WorkspaceWarmMode,
+) -> Result<AgentVmWorkspaceBootstrap, String> {
+    if let Some(dest) = destination.as_ref()
+        && dest.to_str().is_none()
+    {
+        return Err(format!(
+            "--workspace-destination {dest:?} is not valid UTF-8; the wire is \
+             newline-delimited JSON and serde_json refuses to encode non-UTF-8 \
+             paths, so the request would crash the client instead of round-\
+             tripping",
+        ));
+    }
+    let workspace_repo = GitCloneRepo::new(repo.clone())
+        .map_err(|e| format!("--repo {repo} is not a valid workspace target: {e}"))?;
+    Ok(AgentVmWorkspaceBootstrap {
+        repo: workspace_repo,
+        destination,
+        warm,
+    })
+}
+
 fn main() {
     if let Err(e) = run() {
         eprintln!("error: {e}");
@@ -883,14 +922,11 @@ async fn plan_implement(
     // Workspace bootstrap routes the run into writd's VM dispatch
     // arm. The bootstrap repo and the `WorkspaceWrite` capability
     // must agree on `owner/name` — both come from `--repo` so they
-    // do by construction.
-    let workspace_repo = GitCloneRepo::new(repo.clone())
-        .map_err(|e| format!("--repo {repo} is not a valid workspace target: {e}"))?;
-    let workspace = AgentVmWorkspaceBootstrap {
-        repo: workspace_repo,
-        destination: workspace_destination,
-        warm: workspace_warm,
-    };
+    // do by construction. The helper also rejects a non-UTF-8
+    // `--workspace-destination` so the wire-serialiser's UTF-8
+    // assumption holds.
+    let workspace =
+        build_implement_workspace_bootstrap(&repo, workspace_destination, workspace_warm)?;
 
     let inputs = SubmitImplementInputs {
         plan_id,
@@ -2295,6 +2331,61 @@ mod tests {
         };
         assert_eq!(workspace_warm, WorkspaceWarmMode::DevShell);
         assert!(workspace_destination.is_none());
+    }
+
+    /// Happy path for `build_implement_workspace_bootstrap`: a UTF-8
+    /// `--workspace-destination` round-trips verbatim onto the
+    /// bootstrap, the warm mode passes through unchanged, and the
+    /// bootstrap's `repo` agrees with the `RepoRef` the helper was
+    /// handed (the workflow's "capability and bootstrap target must
+    /// be the same owner/name" invariant).
+    #[test]
+    fn build_implement_workspace_bootstrap_threads_utf8_destination_and_warm() {
+        let repo: RepoRef = "smaug123/writ".parse().unwrap();
+        let dest = PathBuf::from("/workspace/writ");
+        let workspace = build_implement_workspace_bootstrap(
+            &repo,
+            Some(dest.clone()),
+            WorkspaceWarmMode::Sources,
+        )
+        .expect("UTF-8 destination must be accepted");
+        assert_eq!(workspace.destination, Some(dest));
+        assert_eq!(workspace.warm, WorkspaceWarmMode::Sources);
+        assert_eq!(workspace.repo.to_string(), "smaug123/writ");
+    }
+
+    /// `build_implement_workspace_bootstrap` rejects a non-UTF-8
+    /// `--workspace-destination` *at the CLI boundary*. Codex review
+    /// on slice VM3 flagged that without this check, a non-UTF-8 path
+    /// (entirely legal at the OS level on Unix) flows onto the wire,
+    /// where `writ_client::roundtrip` does
+    /// `serde_json::to_string(&msg).expect("ClientMessage always
+    /// serializes")` — `serde_json`'s `PathBuf` serializer returns an
+    /// error for non-UTF-8 paths, so the `expect` would panic the
+    /// client instead of returning a `WritClientError`. The
+    /// validation belongs here (and not on
+    /// `AgentVmWorkspaceBootstrap` itself) because the invariant is
+    /// outbound-only: the bootstrap type is shared with deserialise
+    /// paths where a non-UTF-8 path would already have failed at
+    /// `serde_json`.
+    #[test]
+    #[cfg(unix)]
+    fn build_implement_workspace_bootstrap_rejects_non_utf8_destination() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let repo: RepoRef = "smaug123/writ".parse().unwrap();
+        let bad = PathBuf::from(OsString::from_vec(vec![0xff, 0xfe, 0xfd]));
+        let err =
+            build_implement_workspace_bootstrap(&repo, Some(bad), WorkspaceWarmMode::DevShell)
+                .expect_err(
+                    "non-UTF-8 --workspace-destination must surface at the CLI boundary, \
+             not as a serialize-time panic in writ_client::roundtrip",
+                );
+        assert!(
+            err.contains("UTF-8") || err.contains("--workspace-destination"),
+            "expected UTF-8 validation failure naming the flag, got: {err}",
+        );
     }
 
     /// Acquire → second acquire fails fast → drop → reacquire round-trips.
