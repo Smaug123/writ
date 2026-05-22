@@ -2379,12 +2379,27 @@ async fn run_agent_in_vm<S: SecretStore + Send + Sync + 'static>(
     .await;
 
     if let Err(err) = agent_vm.stop_session(state, session_id).await {
-        tracing::warn!(
+        tracing::error!(
             session_id = %session_id,
             run_id = %run_id,
             error = %err,
             "stop agent VM session after RunAgent dispatch failed",
         );
+        // A successful envelope is moot if the guest is still
+        // authorised: the trust boundary says "a finished RunAgent
+        // returns a guest with no live broker authority." Surface the
+        // cleanup failure as an Error so the caller can't read
+        // `RunAgentCompleted` as a clean shutdown — the signed note
+        // is still on disk for the operator to retrieve via audit,
+        // but the wire response no longer asserts a fully-torn-down
+        // run. Operator action is required: daemon reconcile (or
+        // restart) will clean up the dangling session/state.
+        return ServerMessage::Error {
+            message: format!(
+                "RunAgent: stop agent VM session {session_id} (run {run_id}) failed: {err}; \
+                 the managed VM may still hold broker authority — operator action required",
+            ),
+        };
     }
 
     response

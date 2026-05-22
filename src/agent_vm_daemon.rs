@@ -1396,8 +1396,8 @@ pub struct MaterializedVmRunEnvelope {
 /// and what a verifier should follow.
 ///
 /// Streams are read off the on-disk paths the outcome row points at
-/// and re-capped at [`crate::server::MAX_RUN_AGENT_STREAM_BYTES`] (4
-/// MiB) — the same cap the host path applies. The guest-side audit
+/// and re-capped at `MAX_RUN_AGENT_STREAM_BYTES` (4 MiB) — the same
+/// cap the host path applies. The guest-side audit
 /// policy permits up to 1 GiB per stream, so the file on disk may be
 /// substantially larger than the envelope can carry; the
 /// `_truncated_at` marker on `OutputEnvelope` records the per-call
