@@ -27,8 +27,20 @@
 //! time and by the rarity of overlapping bailiff operations, and per
 //! plan-id locking would be a much bigger structural change.
 //! Cross-process callers (two bailiff CLI invocations against the
-//! same on-disk repo) are out of scope for this primitive; git's
-//! notes-add idempotency at the seed OID is what catches that case.
+//! same on-disk repo) are out of scope for this in-process primitive.
+//! For `WorkspaceRead` workflows (`submit_plan`, `submit_review`) the
+//! cross-process race is benign: git's notes-add idempotency at the
+//! seed OID catches the duplicate write and the read-only agent runs
+//! that preceded it produce no externally-observable side effects, so
+//! losing the post-RPC race is at worst wasted compute. For
+//! `WorkspaceWrite` workflows (`submit_implement`), the agent run has
+//! already minted credentials and pushed by the time the duplicate
+//! gate fires, so the in-process invariant is load-bearing. The
+//! `bailiff plan implement` CLI binding (`src/bin/bailiff.rs`)
+//! therefore wraps its workflow call in a `std::fs::File::try_lock`
+//! flock at `<bailiff_repo>/bailiff-implement.lock` to serialise
+//! across processes; that lock is a CLI-layer concern, not a property
+//! of this primitive.
 
 use std::sync::Arc;
 

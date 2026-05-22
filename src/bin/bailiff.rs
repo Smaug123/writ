@@ -12,7 +12,11 @@
 //! plan id on success. Slice D2.5 adds the parallel `bailiff plan
 //! review` verb, which reads the submission note, runs the reviewer
 //! agent through writ, and persists a
-//! [`writ::bailiff_plan_note::ReviewNote`].
+//! [`writ::bailiff_plan_note::ReviewNote`]. The implement verb
+//! mirrors review but grants the implementer agent
+//! `WorkspaceWrite`, composes the operator's feature prompt with the
+//! verified plan body, and persists a
+//! [`writ::bailiff_plan_note::ImplementNote`].
 //!
 //! Paths default to the same XDG convention `docs/design/broker.md`
 //! pins for writ, mirrored under `bailiff/`:
@@ -20,7 +24,8 @@
 //! `$XDG_DATA_HOME/writ/repo` for the writ-owned repo bailiff
 //! fetches from. `--bailiff-repo` and `--writ-repo` override either.
 
-use std::path::PathBuf;
+use std::fs::File;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use clap::{ArgGroup, Parser, Subcommand};
@@ -28,11 +33,14 @@ use tokio::sync::Mutex as AsyncMutex;
 
 use writ::agent_run::AgentPrompt;
 use writ::bailiff_decision::{Decider, Decision};
+use writ::bailiff_plan_implement::{SubmitImplementError, SubmitImplementInputs, submit_implement};
 use writ::bailiff_plan_note::{DecisionNote, PlanId};
 use writ::bailiff_plan_read::{list_plan_ids, read_full_plan, summarize_plan};
 use writ::bailiff_plan_review::{SubmitReviewError, SubmitReviewInputs, submit_review};
 use writ::bailiff_plan_submit::{SubmitPlanInputs, submit_plan};
-use writ::bailiff_plan_write::{WriteDecisionNoteError, WriteReviewNoteError, write_decision_note};
+use writ::bailiff_plan_write::{
+    WriteDecisionNoteError, WriteImplementNoteError, WriteReviewNoteError, write_decision_note,
+};
 use writ::cli::output::{write_bailiff_plan_list, write_bailiff_plan_show};
 use writ::core::{AgentKind, CapabilitySet, NotesRef, RepoRef, UnixMillis};
 use writ::notes_repo::NotesRepo;
@@ -62,8 +70,8 @@ struct Args {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Plan workflows (submit/decide/review today; implement lands in
-    /// a later slice).
+    /// Plan workflows: submit / decide / review / implement, plus
+    /// the read-only list / show verbs.
     Plan {
         #[command(subcommand)]
         action: PlanCmd,
@@ -239,6 +247,97 @@ enum PlanCmd {
         #[arg(long)]
         model: Option<String>,
     },
+    /// Run an implementer agent against a previously-submitted,
+    /// *accepted* plan and persist the bailiff-side implement note.
+    /// Bailiff fetches the planner envelope, re-verifies its
+    /// signature, decodes the plan body, and composes the
+    /// implementer's effective prompt as
+    /// `--prompt-file bytes + separator + plan body` before handing
+    /// the result to writ. The implementer is granted
+    /// `WorkspaceWrite` on `--repo` so it can push; the pre-RPC
+    /// duplicate gate refuses a second `bailiff plan implement` on
+    /// the same plan to foreclose a double-push. Prints the implement
+    /// note's bailiff-side OID on success.
+    ///
+    /// Pre-RPC gates the verb surfaces (each as a typed
+    /// [`SubmitImplementError`] variant):
+    /// - missing submission note → "run `bailiff plan submit` first"
+    /// - missing decision note → "run `bailiff plan decide --accept` first"
+    /// - rejected decision → "submit a fresh plan"
+    /// - already-implemented → "submit a fresh plan if a re-implement
+    ///   is needed"
+    ///
+    /// Mirrors [`PlanCmd::Review`] minus auto-allocation of
+    /// `--plan-id` (implement needs an existing, decided plan), with
+    /// `--purpose` defaulting to `"plan-implement"`, and with the
+    /// implementer's capability set being `WorkspaceWrite` rather
+    /// than `WorkspaceRead`.
+    Implement {
+        /// Plan to implement. Must parse as the canonical UUID form
+        /// `PlanId` prints. As with `review`, the id is required:
+        /// there is no auto-allocation, since implementing
+        /// presupposes an existing accepted plan.
+        #[arg(long)]
+        plan_id: PlanId,
+        /// File containing the operator's original feature prompt —
+        /// the request that triggered the plan in the first place.
+        /// The bytes are read once, validated through
+        /// [`AgentPrompt::try_new`], and passed to [`submit_implement`]
+        /// which composes them with the verified plan body before
+        /// handing the result to writ. Crucially this is **not** the
+        /// plan body; `submit_implement` decodes that from the signed
+        /// planner envelope itself.
+        #[arg(long)]
+        prompt_file: PathBuf,
+        /// Repository the implementer agent is allowed to write to,
+        /// in `owner/name` form. Granted as a `WorkspaceWrite`
+        /// capability (the difference from `plan submit` / `plan
+        /// review`, which grant `WorkspaceRead`); the
+        /// `WorkspaceWrite` is what lets the agent push, and is the
+        /// reason the duplicate gate inside `submit_implement` is
+        /// load-bearing.
+        #[arg(long)]
+        repo: String,
+        /// Path to bailiff's bare git repo. Defaults to
+        /// `$XDG_DATA_HOME/bailiff/repo` (or
+        /// `~/.local/share/bailiff/repo` if `XDG_DATA_HOME` is
+        /// unset). Created on first use via
+        /// [`NotesRepo::init_or_open`].
+        #[arg(long)]
+        bailiff_repo: Option<PathBuf>,
+        /// Path to writ's bare git repo. Defaults to
+        /// `$XDG_DATA_HOME/writ/repo`. Bailiff fetches writ's notes
+        /// namespace from this path twice during an implement run:
+        /// once to read the planner's envelope for plan-body
+        /// extraction, once after the implementer run to verify the
+        /// implementer envelope.
+        #[arg(long)]
+        writ_repo: Option<PathBuf>,
+        /// OpenSSH `allowed_signers` file enumerating which writ
+        /// signing keys bailiff will accept envelopes from. Used for
+        /// both the planner re-verify (defence in depth) and the
+        /// implementer envelope.
+        #[arg(long)]
+        writ_allowed_signers: PathBuf,
+        /// Opaque tag recorded verbatim on writ's audit row and on
+        /// the bailiff-side implement note. Defaults to
+        /// `"plan-implement"`.
+        #[arg(long, default_value = "plan-implement")]
+        purpose: String,
+        /// Human-readable session label stored in writ's audit log.
+        /// Informational only.
+        #[arg(long)]
+        label: Option<String>,
+        /// Coarse agent identity passed to writ's `OpenSession`. With
+        /// `WorkspaceWrite` granted, this field selects which GitHub
+        /// App writ uses to mint push credentials. Defaults to
+        /// `claude`.
+        #[arg(long, default_value = "claude", value_parser = parse_agent_kind)]
+        agent: AgentKind,
+        /// Optional model identifier stored on writ's session row.
+        #[arg(long)]
+        model: Option<String>,
+    },
     /// Enumerate every plan in bailiff's repo. Lists plan id +
     /// workflow state + the four per-stage timestamps, one
     /// key=value block per plan separated by blank lines. Empty
@@ -365,6 +464,33 @@ async fn dispatch(cmd: Cmd, socket_path: PathBuf) -> Result<(), Box<dyn std::err
                 model,
             } => {
                 plan_review(
+                    socket_path,
+                    plan_id,
+                    prompt_file,
+                    repo,
+                    bailiff_repo,
+                    writ_repo,
+                    writ_allowed_signers,
+                    purpose,
+                    label,
+                    agent,
+                    model,
+                )
+                .await
+            }
+            PlanCmd::Implement {
+                plan_id,
+                prompt_file,
+                repo,
+                bailiff_repo,
+                writ_repo,
+                writ_allowed_signers,
+                purpose,
+                label,
+                agent,
+                model,
+            } => {
+                plan_implement(
                     socket_path,
                     plan_id,
                     prompt_file,
@@ -573,6 +699,202 @@ async fn plan_review(
             "review already recorded for plan {plan_id} at target {target_oid}; bailiff does not \
              overwrite reviews — submit a fresh plan if the operator wants a re-review (multi-review \
              history is a future v1 → v2 migration)"
+        )
+        .into()),
+        Err(e) => Err(format!("{e}").into()),
+    }
+}
+
+/// Repo-scoped exclusive lockfile guard for cross-process serialisation
+/// of `bailiff plan implement` runs.
+///
+/// The library workflow ([`submit_implement`]) takes an
+/// `Arc<AsyncMutex<NotesRepo>>` for the in-process single-writer
+/// invariant via [`writ::bailiff_repo_guard::BailiffRepoGuard`], but
+/// the CLI constructs a fresh `Arc` per invocation, so two CLI
+/// processes against the same `--bailiff-repo` can each pass the
+/// in-process pre-RPC `AlreadyImplemented` gate, both kick off
+/// `WorkspaceWrite`-capable agent runs (with `git push` side effects
+/// minted by writ), and only the second's notes-add loses the
+/// duplicate-implement race. The `BailiffRepoGuard` module docstring
+/// names git's notes-add idempotency at the seed OID as the
+/// cross-process fallback — that fallback fires *after* the agent has
+/// already executed, which is acceptable for `WorkspaceRead` verbs
+/// (no externally-observable side effects) but is load-bearing for
+/// `WorkspaceWrite`.
+///
+/// The lockfile lives at `<bailiff_repo>/bailiff-implement.lock` and
+/// is held by an OS-level advisory `flock` (`std::fs::File::try_lock`).
+/// Distinct `--bailiff-repo` paths do not contend. The lock is
+/// released when the returned `File` is dropped, or — as a backstop
+/// against unclean exits — when the process terminates and the kernel
+/// closes the descriptor.
+fn acquire_implement_lock(bailiff_repo_path: &Path) -> Result<File, String> {
+    let lock_path = bailiff_repo_path.join("bailiff-implement.lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|e| format!("opening implement lockfile {}: {e}", lock_path.display()))?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(std::fs::TryLockError::WouldBlock) => Err(format!(
+            "another `bailiff plan implement` is in progress against {}; retry once it finishes \
+             (lockfile at {})",
+            bailiff_repo_path.display(),
+            lock_path.display(),
+        )),
+        Err(std::fs::TryLockError::Error(e)) => Err(format!(
+            "acquiring implement lockfile at {}: {e}",
+            lock_path.display()
+        )),
+    }
+}
+
+/// Drive `submit_implement` from the CLI: read the feature prompt and
+/// allowed-signers file, open bailiff's repo, build the inputs (with
+/// the single `WorkspaceWrite` capability that distinguishes this
+/// verb from `submit` / `review`), call the workflow, and surface its
+/// outcome.
+///
+/// The error-mapping arms below cover the variants where the
+/// passthrough `format!("{e}")` would be the wrong shape — either
+/// because the operator's recourse is non-obvious from
+/// [`SubmitImplementError`]'s `#[error]` message alone, or because the
+/// invariant lives in a wrapped error and the unwrapped message would
+/// not name it. The remaining variants fall through to the passthrough
+/// because their existing `#[error]` strings already name the broken
+/// precondition.
+#[allow(clippy::too_many_arguments)]
+async fn plan_implement(
+    socket_path: PathBuf,
+    plan_id: PlanId,
+    prompt_file: PathBuf,
+    repo: String,
+    bailiff_repo: Option<PathBuf>,
+    writ_repo: Option<PathBuf>,
+    writ_allowed_signers: PathBuf,
+    purpose: String,
+    label: Option<String>,
+    agent: AgentKind,
+    model: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Same pre-RPC discipline as `plan_submit` / `plan_review`:
+    // validate every on-disk input before opening any sockets, so a
+    // typo in `--prompt-file` or `--writ-allowed-signers` fails before
+    // bailiff makes a side-effecting writ call.
+    let prompt_bytes = std::fs::read(&prompt_file)
+        .map_err(|e| format!("reading prompt file {}: {e}", prompt_file.display()))?;
+    let prompt_str = String::from_utf8(prompt_bytes).map_err(|e| {
+        format!(
+            "prompt file {} is not valid UTF-8: {e}",
+            prompt_file.display()
+        )
+    })?;
+    let feature_prompt = AgentPrompt::try_new(prompt_str)
+        .map_err(|e| format!("prompt from {} rejected: {e}", prompt_file.display()))?;
+
+    let repo: RepoRef = repo
+        .parse()
+        .map_err(|e| format!("--repo {repo:?} is not 'owner/name': {e}"))?;
+
+    let bailiff_repo_path = bailiff_repo.unwrap_or_else(default_bailiff_repo_path);
+    let writ_repo_path = writ_repo.unwrap_or_else(default_writ_repo_path);
+
+    let allowed_signers_text = std::fs::read_to_string(&writ_allowed_signers).map_err(|e| {
+        format!(
+            "reading writ allowed-signers file {}: {e}",
+            writ_allowed_signers.display()
+        )
+    })?;
+    let allowed = AllowedSigners::from_openssh_lines(&allowed_signers_text).map_err(|e| {
+        format!(
+            "parsing writ allowed-signers file {}: {e}",
+            writ_allowed_signers.display()
+        )
+    })?;
+
+    let bailiff_repo_path_for_init = bailiff_repo_path.clone();
+    let bailiff =
+        tokio::task::spawn_blocking(move || NotesRepo::init_or_open(bailiff_repo_path_for_init))
+            .await
+            .map_err(|e| format!("bailiff-repo init task failed: {e}"))?
+            .map_err(|e| {
+                format!(
+                    "opening bailiff repo at {}: {e}",
+                    bailiff_repo_path.display()
+                )
+            })?;
+    let bailiff = Arc::new(AsyncMutex::new(bailiff));
+
+    // Cross-process flock: distinct from the in-process `Arc<AsyncMutex>`
+    // above, which only serialises callers sharing this CLI process.
+    // Two concurrent `bailiff plan implement` processes would both pass
+    // `submit_implement`'s pre-RPC `AlreadyImplemented` gate and both
+    // launch `WorkspaceWrite` agent runs before either reached the final
+    // notes-add. Held to scope end (Drop releases) so the lock spans the
+    // entire workflow.
+    let _implement_lock = acquire_implement_lock(&bailiff_repo_path)?;
+
+    let writ_output_ref =
+        NotesRef::try_new(WRIT_OUTPUT_REF).expect("WRIT_OUTPUT_REF is a static well-formed ref");
+
+    let inputs = SubmitImplementInputs {
+        plan_id,
+        feature_prompt,
+        capabilities: vec![CapabilitySet::WorkspaceWrite { repo }],
+        purpose,
+        writ_output_ref,
+        session_label: label,
+        session_agent_kind: Some(agent),
+        session_agent_model: model,
+    };
+
+    let client = WritClient::new(&socket_path);
+    match submit_implement(&client, bailiff, &writ_repo_path, allowed, inputs).await {
+        Ok(outcome) => {
+            println!("{}", outcome.implement_note_oid);
+            Ok(())
+        }
+        // The four pre-RPC gates each get a message that names the
+        // operator's next step. Same shape `plan_review` uses for
+        // `ReviewAlreadyRecorded`.
+        Err(SubmitImplementError::PlanSubmissionMissing { plan_id }) => Err(format!(
+            "no plan submission note recorded for plan {plan_id}; run `bailiff plan submit` first"
+        )
+        .into()),
+        Err(SubmitImplementError::PlanNotDecided { plan_id }) => Err(format!(
+            "no decision recorded for plan {plan_id}; run `bailiff plan decide --accept` first"
+        )
+        .into()),
+        Err(SubmitImplementError::PlanRejected { plan_id }) => Err(format!(
+            "plan {plan_id} was rejected; refusing to implement a rejected plan — submit a fresh \
+             plan if the operator wants to try a different approach"
+        )
+        .into()),
+        Err(SubmitImplementError::AlreadyImplemented { plan_id }) => Err(format!(
+            "implement already recorded for plan {plan_id}; bailiff does not re-run the \
+             implementer — submit a fresh plan if a re-implement is needed (multi-attempt \
+             implement history is a future v1 → v2 migration)"
+        )
+        .into()),
+        // Post-RPC variant of the same idempotency invariant: the
+        // implementer agent ran and writ stamped an envelope, but
+        // bailiff's note-write lost a race against another caller.
+        // Recourse is identical to the pre-RPC `AlreadyImplemented`
+        // case — same message, surfaced verbatim.
+        Err(SubmitImplementError::WriteImplementNote {
+            session_id: _,
+            source:
+                WriteImplementNoteError::ImplementAlreadyRecorded {
+                    plan_id,
+                    target_oid,
+                },
+        }) => Err(format!(
+            "implement already recorded for plan {plan_id} at target {target_oid}; bailiff does \
+             not overwrite implement notes — submit a fresh plan if a re-implement is needed \
+             (multi-attempt implement history is a future v1 → v2 migration)"
         )
         .into()),
         Err(e) => Err(format!("{e}").into()),
@@ -1587,5 +1909,248 @@ mod tests {
             msg.contains("--prompt-file") || msg.contains("required"),
             "expected missing-prompt-file failure, got: {msg}",
         );
+    }
+
+    /// `bailiff plan implement` parses the minimum required flag set
+    /// (`--plan-id`, `--prompt-file`, `--repo`, `--writ-allowed-signers`)
+    /// and threads each argument into the corresponding field of
+    /// `PlanCmd::Implement`. The defaults pin the operator-facing
+    /// contract: `--purpose` is `"plan-implement"` (parallels
+    /// `plan-submit` / `plan-review`); `--agent` is `claude` to match
+    /// the GitHub-App selection writ uses when no explicit identity is
+    /// passed. A regression in the clap attribute set surfaces here
+    /// rather than at runtime.
+    #[test]
+    fn plan_implement_parses_minimum_required_flags() {
+        let plan_id_str = "1e1e1e1e-2e2e-3e3e-4e4e-5e5e5e5e5e5e";
+        let args = Args::try_parse_from([
+            "bailiff",
+            "plan",
+            "implement",
+            "--plan-id",
+            plan_id_str,
+            "--prompt-file",
+            "/tmp/i.txt",
+            "--repo",
+            "smaug123/writ",
+            "--writ-allowed-signers",
+            "/etc/bailiff/allowed_signers",
+        ])
+        .unwrap();
+        let Cmd::Plan {
+            action:
+                PlanCmd::Implement {
+                    plan_id,
+                    prompt_file,
+                    repo,
+                    bailiff_repo,
+                    writ_repo,
+                    writ_allowed_signers,
+                    purpose,
+                    label,
+                    agent,
+                    model,
+                },
+        } = args.cmd
+        else {
+            panic!("expected PlanCmd::Implement");
+        };
+        assert_eq!(plan_id.to_string(), plan_id_str);
+        assert_eq!(prompt_file, PathBuf::from("/tmp/i.txt"));
+        assert_eq!(repo, "smaug123/writ");
+        assert!(bailiff_repo.is_none());
+        assert!(writ_repo.is_none());
+        assert_eq!(
+            writ_allowed_signers,
+            PathBuf::from("/etc/bailiff/allowed_signers")
+        );
+        assert_eq!(purpose, "plan-implement");
+        assert!(label.is_none());
+        assert_eq!(agent, AgentKind::Claude);
+        assert!(model.is_none());
+    }
+
+    /// Every optional flag round-trips. Pins the full implement CLI
+    /// surface so scripted callers see a stable contract.
+    #[test]
+    fn plan_implement_accepts_every_optional_flag() {
+        let plan_id_str = "2e2e2e2e-3e3e-4e4e-5e5e-6e6e6e6e6e6e";
+        let args = Args::try_parse_from([
+            "bailiff",
+            "plan",
+            "implement",
+            "--plan-id",
+            plan_id_str,
+            "--prompt-file",
+            "/tmp/i.txt",
+            "--repo",
+            "smaug123/writ",
+            "--bailiff-repo",
+            "/var/bailiff",
+            "--writ-repo",
+            "/var/writ",
+            "--writ-allowed-signers",
+            "/etc/bailiff/allowed_signers",
+            "--purpose",
+            "plan-implement:rev-2",
+            "--label",
+            "feature 42 implement",
+            "--agent",
+            "codex",
+            "--model",
+            "gpt-test",
+        ])
+        .unwrap();
+        let Cmd::Plan {
+            action:
+                PlanCmd::Implement {
+                    plan_id,
+                    bailiff_repo,
+                    writ_repo,
+                    purpose,
+                    label,
+                    agent,
+                    model,
+                    ..
+                },
+        } = args.cmd
+        else {
+            panic!("expected PlanCmd::Implement");
+        };
+        assert_eq!(plan_id.to_string(), plan_id_str);
+        assert_eq!(
+            bailiff_repo.as_deref(),
+            Some(std::path::Path::new("/var/bailiff"))
+        );
+        assert_eq!(
+            writ_repo.as_deref(),
+            Some(std::path::Path::new("/var/writ"))
+        );
+        assert_eq!(purpose, "plan-implement:rev-2");
+        assert_eq!(label.as_deref(), Some("feature 42 implement"));
+        assert_eq!(agent, AgentKind::Codex);
+        assert_eq!(model.as_deref(), Some("gpt-test"));
+    }
+
+    /// `--plan-id` is required. Implementing presupposes a submitted +
+    /// decided plan, so there is no auto-allocation — the id is
+    /// mandatory. A regression to `Option<PlanId>` (a copy-paste of
+    /// `plan submit`'s opt-in shape) would silently accept this and
+    /// reach `plan_implement` with a `None` id.
+    #[test]
+    fn plan_implement_rejects_missing_plan_id() {
+        let err = Args::try_parse_from([
+            "bailiff",
+            "plan",
+            "implement",
+            "--prompt-file",
+            "/tmp/i.txt",
+            "--repo",
+            "smaug123/writ",
+            "--writ-allowed-signers",
+            "/etc/bailiff/allowed_signers",
+        ])
+        .err()
+        .expect("expected parse error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--plan-id") || msg.contains("required"),
+            "expected missing-plan-id failure, got: {msg}",
+        );
+    }
+
+    /// `--prompt-file` is required. Pins the surface — a regression
+    /// that made it optional would let `plan_implement` reach the
+    /// on-disk read with a `None` path. The clap-side doc on this flag
+    /// must continue to read "the operator's original feature prompt"
+    /// because `submit_implement` composes the implementer's effective
+    /// prompt internally from this plus the verified plan body.
+    #[test]
+    fn plan_implement_rejects_missing_prompt_file() {
+        let plan_id_str = "3e3e3e3e-4e4e-5e5e-6e6e-7e7e7e7e7e7e";
+        let err = Args::try_parse_from([
+            "bailiff",
+            "plan",
+            "implement",
+            "--plan-id",
+            plan_id_str,
+            "--repo",
+            "smaug123/writ",
+            "--writ-allowed-signers",
+            "/etc/bailiff/allowed_signers",
+        ])
+        .err()
+        .expect("expected parse error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--prompt-file") || msg.contains("required"),
+            "expected missing-prompt-file failure, got: {msg}",
+        );
+    }
+
+    /// `PlanId::from_str` runs at parse, so a malformed UUID is a
+    /// parse error rather than a runtime failure inside `plan_implement`.
+    /// Pins that the value_parser stays wired to the validating
+    /// constructor.
+    #[test]
+    fn plan_implement_rejects_malformed_plan_id() {
+        let err = Args::try_parse_from([
+            "bailiff",
+            "plan",
+            "implement",
+            "--plan-id",
+            "not-a-uuid",
+            "--prompt-file",
+            "/tmp/i.txt",
+            "--repo",
+            "smaug123/writ",
+            "--writ-allowed-signers",
+            "/etc/bailiff/allowed_signers",
+        ])
+        .err()
+        .expect("expected parse error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--plan-id") || msg.contains("uuid") || msg.contains("UUID"),
+            "expected malformed-plan-id failure, got: {msg}",
+        );
+    }
+
+    /// Acquire → second acquire fails fast → drop → reacquire round-trips.
+    /// Pins the cross-process invariant the helper exists to enforce:
+    /// two concurrent `bailiff plan implement` invocations against the
+    /// same `--bailiff-repo` cannot both pass the lockfile. A regression
+    /// (e.g. swapping `try_lock` for `lock`, dropping the lockfile path
+    /// to a process-shared temp directory that other tests reuse, or
+    /// reopening the lock by path instead of holding the `File`) would
+    /// fail this test: either the second acquire would block forever
+    /// (and the test would time out) or the reacquire after drop would
+    /// fail because the OS-level lock had leaked.
+    #[test]
+    fn implement_lock_blocks_concurrent_acquire_and_releases_on_drop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_path = tmp.path();
+
+        let first = acquire_implement_lock(repo_path).expect("first acquire must succeed");
+
+        // The same process can hold an `flock` exclusive lock only once;
+        // an in-process re-acquire on a separately-opened handle must
+        // surface the `WouldBlock` translation. The point of the test is
+        // that the *operator-facing* error message names the contention
+        // (rather than e.g. blocking forever or surfacing an opaque IO
+        // error).
+        let err = acquire_implement_lock(repo_path)
+            .expect_err("second acquire must fail while first lock is held");
+        assert!(
+            err.contains("in progress"),
+            "expected operator-facing contention message, got: {err}",
+        );
+
+        drop(first);
+
+        // After the first guard drops the lock is released, so a fresh
+        // acquire on the same path must succeed.
+        let _second = acquire_implement_lock(repo_path)
+            .expect("reacquire must succeed after the first guard drops");
     }
 }
