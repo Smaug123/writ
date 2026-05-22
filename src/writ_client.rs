@@ -31,7 +31,7 @@ use tokio::net::UnixStream;
 use crate::agent_run::AgentPrompt;
 use crate::core::{AgentKind, CapabilitySet, NotesRef, SessionId, SshSignature};
 use crate::protocol::{ClientMessage, ServerMessage, SignedRunMetadata};
-use crate::vm_git::GitObjectId;
+use crate::vm_git::{AgentVmWorkspaceBootstrap, GitObjectId};
 
 /// Matches the broker-side cap in `src/server.rs`. The largest legal
 /// reply is a `RunAgentCompleted` whose canonical metadata plus
@@ -63,10 +63,30 @@ pub struct RunAgentRequest {
     /// caller has already opened the session via
     /// [`WritClient::open_session`] (or otherwise) and writ will stamp
     /// the same id into the signed metadata; when `None`, writ mints a
-    /// fresh id for the signature alone. Bailiff's slice-C workflows
-    /// always supply `Some(_)` so the envelope correlates with the
-    /// workflow session row.
+    /// fresh id for the signature alone. Bailiff's slice-C plan-submit
+    /// and plan-review workflows pre-open and pass `Some(_)`; the VM-
+    /// mode plan-implement workflow passes `None` because writ's VM
+    /// dispatch arm mints the audit session itself (it would reject a
+    /// caller-supplied id alongside a workspace bootstrap).
     pub session_id: Option<SessionId>,
+    /// When `Some`, writd dispatches the agent into a per-run VM
+    /// provisioned per the bootstrap; when `None`, writd takes the
+    /// host-spawn path. Required for any run carrying a
+    /// `WorkspaceWrite` capability — the broker rejects that
+    /// combination if `workspace` is `None`. Bailiff's `submit_implement`
+    /// sets this; the read-side `submit_plan` / `submit_review`
+    /// workflows leave it `None`.
+    pub workspace: Option<AgentVmWorkspaceBootstrap>,
+    /// Agent kind to pin onto the per-run VM. Required by writd's VM
+    /// dispatch arm when `workspace` is `Some` (the broker has no
+    /// default and rejects the request rather than guess). Ignored
+    /// on the host-spawn path.
+    pub agent_kind: Option<AgentKind>,
+    /// Agent model identifier the broker hands to the VM's
+    /// `/v1/agent-runs/<id>/config` response. Required alongside
+    /// `agent_kind` in VM mode; free-form string the broker does not
+    /// parse. Ignored on the host-spawn path.
+    pub agent_model: Option<String>,
 }
 
 /// Tagged failure mode of [`WritClient::run_agent`]. The split between
@@ -170,14 +190,9 @@ impl WritClient {
                 purpose: req.purpose,
                 output_ref: req.output_ref,
                 session_id: req.session_id,
-                // VM1 only wires the protocol field. VM3 threads
-                // `RunAgentRequest::workspace` through so bailiff's
-                // `submit_implement` can request a per-run VM
-                // checkout; until then, callers stay on the
-                // host-spawn path.
-                workspace: None,
-                agent_kind: None,
-                agent_model: None,
+                workspace: req.workspace,
+                agent_kind: req.agent_kind,
+                agent_model: req.agent_model,
             })
             .await?;
         match reply {
@@ -341,10 +356,11 @@ mod tests {
     use super::*;
     use crate::agent_run::AgentPrompt;
     use crate::core::{
-        AgentKind, NotesRef, SessionId, Sha256Hex, SshKeyFingerprint, SshSignature, UnixMillis,
+        AgentKind, NotesRef, RepoRef, SessionId, Sha256Hex, SshKeyFingerprint, SshSignature,
+        UnixMillis,
     };
     use crate::protocol::{ClientMessage, SignedRunMetadata};
-    use crate::vm_git::GitObjectId;
+    use crate::vm_git::{AgentVmWorkspaceBootstrap, GitCloneRepo, GitObjectId, WorkspaceWarmMode};
 
     fn sample_request() -> RunAgentRequest {
         RunAgentRequest {
@@ -353,6 +369,21 @@ mod tests {
             purpose: "test".to_string(),
             output_ref: NotesRef::try_new("refs/notes/writ/agent-outputs").unwrap(),
             session_id: None,
+            workspace: None,
+            agent_kind: None,
+            agent_model: None,
+        }
+    }
+
+    fn sample_workspace_bootstrap() -> AgentVmWorkspaceBootstrap {
+        AgentVmWorkspaceBootstrap {
+            repo: GitCloneRepo::new(RepoRef {
+                owner: "smaug123".into(),
+                name: "writ".into(),
+            })
+            .unwrap(),
+            destination: Some(std::path::PathBuf::from("/workspace/writ")),
+            warm: WorkspaceWarmMode::DevShell,
         }
     }
 
@@ -501,6 +532,48 @@ mod tests {
             } => {
                 assert_eq!(purpose, "plan-stage:abc123");
                 assert_eq!(output_ref, &req.output_ref);
+            }
+            other => panic!("expected RunAgent, got {other:?}"),
+        }
+    }
+
+    /// Workspace bootstrap on the `RunAgentRequest` lands on the wire
+    /// under the `workspace` field of `ClientMessage::RunAgent`, and
+    /// the paired `agent_kind` / `agent_model` ride along verbatim.
+    /// Slice VM3 wires bailiff's `submit_implement` to set these so
+    /// the broker dispatches into the per-run VM arm; a regression
+    /// that drops any of the three on the floor would surface here as
+    /// a `None` on the captured wire message instead of being noticed
+    /// only when the VM dispatch arm rejects the request.
+    #[tokio::test]
+    async fn run_agent_serializes_workspace_and_agent_identity_verbatim() {
+        let broker = StubBroker::start(ServerMessage::RunAgentCompleted {
+            output_oid: sample_object_id(),
+            signed_metadata: sample_signed_metadata(),
+            signature: sample_signature(),
+        })
+        .await;
+
+        let workspace = sample_workspace_bootstrap();
+        let mut req = sample_request();
+        req.workspace = Some(workspace.clone());
+        req.agent_kind = Some(AgentKind::Claude);
+        req.agent_model = Some("claude-opus-4-7".into());
+
+        let client = WritClient::new(&broker.socket_path);
+        client.run_agent(req).await.unwrap();
+
+        let seen = broker.observed_requests().await;
+        match &seen[0] {
+            ClientMessage::RunAgent {
+                workspace: wire_workspace,
+                agent_kind: wire_kind,
+                agent_model: wire_model,
+                ..
+            } => {
+                assert_eq!(wire_workspace.as_ref(), Some(&workspace));
+                assert_eq!(*wire_kind, Some(AgentKind::Claude));
+                assert_eq!(wire_model.as_deref(), Some("claude-opus-4-7"));
             }
             other => panic!("expected RunAgent, got {other:?}"),
         }
@@ -963,6 +1036,9 @@ mod end_to_end_tests {
                 purpose: "round-trip-test".into(),
                 output_ref: output_ref.clone(),
                 session_id: None,
+                workspace: None,
+                agent_kind: None,
+                agent_model: None,
             }),
         )
         .await
@@ -1119,6 +1195,9 @@ mod end_to_end_tests {
                 purpose: "large-prompt".into(),
                 output_ref,
                 session_id: None,
+                workspace: None,
+                agent_kind: None,
+                agent_model: None,
             }),
         )
         .await

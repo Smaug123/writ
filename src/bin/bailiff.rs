@@ -46,6 +46,7 @@ use writ::core::{AgentKind, CapabilitySet, NotesRef, RepoRef, UnixMillis};
 use writ::notes_repo::NotesRepo;
 use writ::run_verify::AllowedSigners;
 use writ::server::default_socket_path;
+use writ::vm_git::{AgentVmWorkspaceBootstrap, GitCloneRepo, WorkspaceWarmMode};
 use writ::writ_client::WritClient;
 
 /// Notes ref writ writes the signed envelope to. Bailiff is the
@@ -337,6 +338,22 @@ enum PlanCmd {
         /// Optional model identifier stored on writ's session row.
         #[arg(long)]
         model: Option<String>,
+        /// How aggressively to pre-warm the per-run VM checkout
+        /// before the agent runs. `none` does nothing,
+        /// `sources` fetches Nix sources for the flake's
+        /// `devShell`, and `devshell` (the default) materialises
+        /// the dev-shell environment in full. The cost / hit-rate
+        /// trade-off is operator-tunable per invocation;
+        /// `devshell` matches what the broker would do on its own
+        /// if the operator omitted the flag.
+        #[arg(long, default_value = "devshell", value_parser = parse_workspace_warm)]
+        workspace_warm: WorkspaceWarmMode,
+        /// Override the workspace checkout location inside the VM.
+        /// Defaults to `default_workspace_destination(repo)`
+        /// (`/workspace/<repo-name>`); only override if a flake
+        /// expects the checkout at a different path.
+        #[arg(long)]
+        workspace_destination: Option<PathBuf>,
     },
     /// Enumerate every plan in bailiff's repo. Lists plan id +
     /// workflow state + the four per-stage timestamps, one
@@ -394,6 +411,22 @@ enum PlanCmd {
 
 fn parse_agent_kind(raw: &str) -> Result<AgentKind, String> {
     raw.parse::<AgentKind>().map_err(|e| e.to_string())
+}
+
+/// clap value parser for `--workspace-warm`. Matches the JSON
+/// `snake_case` rendering of [`WorkspaceWarmMode`] so the on-disk and
+/// CLI surfaces stay aligned: a config dumper that round-trips a
+/// bootstrap through JSON and a CLI operator typing the flag both
+/// spell the variants the same way.
+fn parse_workspace_warm(raw: &str) -> Result<WorkspaceWarmMode, String> {
+    match raw {
+        "none" => Ok(WorkspaceWarmMode::None),
+        "sources" => Ok(WorkspaceWarmMode::Sources),
+        "devshell" => Ok(WorkspaceWarmMode::DevShell),
+        other => Err(format!(
+            "expected `none`, `sources`, or `devshell`, got {other:?}"
+        )),
+    }
 }
 
 fn main() {
@@ -489,6 +522,8 @@ async fn dispatch(cmd: Cmd, socket_path: PathBuf) -> Result<(), Box<dyn std::err
                 label,
                 agent,
                 model,
+                workspace_warm,
+                workspace_destination,
             } => {
                 plan_implement(
                     socket_path,
@@ -502,6 +537,8 @@ async fn dispatch(cmd: Cmd, socket_path: PathBuf) -> Result<(), Box<dyn std::err
                     label,
                     agent,
                     model,
+                    workspace_warm,
+                    workspace_destination,
                 )
                 .await
             }
@@ -779,6 +816,8 @@ async fn plan_implement(
     label: Option<String>,
     agent: AgentKind,
     model: Option<String>,
+    workspace_warm: WorkspaceWarmMode,
+    workspace_destination: Option<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Same pre-RPC discipline as `plan_submit` / `plan_review`:
     // validate every on-disk input before opening any sockets, so a
@@ -840,6 +879,18 @@ async fn plan_implement(
     let writ_output_ref =
         NotesRef::try_new(WRIT_OUTPUT_REF).expect("WRIT_OUTPUT_REF is a static well-formed ref");
 
+    // Workspace bootstrap routes the run into writd's VM dispatch
+    // arm. The bootstrap repo and the `WorkspaceWrite` capability
+    // must agree on `owner/name` — both come from `--repo` so they
+    // do by construction.
+    let workspace_repo = GitCloneRepo::new(repo.clone())
+        .map_err(|e| format!("--repo {repo} is not a valid workspace target: {e}"))?;
+    let workspace = AgentVmWorkspaceBootstrap {
+        repo: workspace_repo,
+        destination: workspace_destination,
+        warm: workspace_warm,
+    };
+
     let inputs = SubmitImplementInputs {
         plan_id,
         feature_prompt,
@@ -849,6 +900,7 @@ async fn plan_implement(
         session_label: label,
         session_agent_kind: Some(agent),
         session_agent_model: model,
+        workspace,
     };
 
     let client = WritClient::new(&socket_path);
@@ -1950,6 +2002,7 @@ mod tests {
                     label,
                     agent,
                     model,
+                    ..
                 },
         } = args.cmd
         else {
@@ -2114,6 +2167,95 @@ mod tests {
             msg.contains("--plan-id") || msg.contains("uuid") || msg.contains("UUID"),
             "expected malformed-plan-id failure, got: {msg}",
         );
+    }
+
+    /// `bailiff plan implement` parses the workspace bootstrap flags
+    /// (`--workspace-warm`, `--workspace-destination`) and threads them
+    /// into `PlanCmd::Implement` so the CLI binding can build an
+    /// `AgentVmWorkspaceBootstrap` for `SubmitImplementInputs`. Slice
+    /// VM3 introduces the flags so `submit_implement` can request a
+    /// per-run VM checkout; the workspace repo is taken from the
+    /// existing `--repo` flag (`WorkspaceWrite` capability and the
+    /// bootstrap target are the same `owner/name`). A regression that
+    /// dropped either flag from the surface would surface here as a
+    /// clap parse error or as a `None` on the parsed variant.
+    #[test]
+    fn plan_implement_parses_workspace_flags() {
+        let plan_id_str = "4e4e4e4e-5e5e-6e6e-7e7e-8e8e8e8e8e8e";
+        let args = Args::try_parse_from([
+            "bailiff",
+            "plan",
+            "implement",
+            "--plan-id",
+            plan_id_str,
+            "--prompt-file",
+            "/tmp/i.txt",
+            "--repo",
+            "smaug123/writ",
+            "--writ-allowed-signers",
+            "/etc/bailiff/allowed_signers",
+            "--workspace-warm",
+            "sources",
+            "--workspace-destination",
+            "/repo",
+        ])
+        .unwrap();
+        let Cmd::Plan {
+            action:
+                PlanCmd::Implement {
+                    workspace_warm,
+                    workspace_destination,
+                    ..
+                },
+        } = args.cmd
+        else {
+            panic!("expected PlanCmd::Implement");
+        };
+        assert_eq!(workspace_warm, WorkspaceWarmMode::Sources);
+        assert_eq!(
+            workspace_destination.as_deref(),
+            Some(std::path::Path::new("/repo"))
+        );
+    }
+
+    /// The workspace flags are optional with sensible defaults: omitted
+    /// `--workspace-warm` defaults to `devshell` (the
+    /// `WorkspaceWarmMode::Default` impl), and omitted
+    /// `--workspace-destination` lands as `None` (so writd picks
+    /// `default_workspace_destination` for the repo). A regression that
+    /// made either flag required would force every operator invocation
+    /// to spell out the default, which is contrary to the slice's
+    /// "operator supplies repo, broker picks the rest" ergonomics.
+    #[test]
+    fn plan_implement_defaults_workspace_warm_to_devshell() {
+        let plan_id_str = "5e5e5e5e-6e6e-7e7e-8e8e-9e9e9e9e9e9e";
+        let args = Args::try_parse_from([
+            "bailiff",
+            "plan",
+            "implement",
+            "--plan-id",
+            plan_id_str,
+            "--prompt-file",
+            "/tmp/i.txt",
+            "--repo",
+            "smaug123/writ",
+            "--writ-allowed-signers",
+            "/etc/bailiff/allowed_signers",
+        ])
+        .unwrap();
+        let Cmd::Plan {
+            action:
+                PlanCmd::Implement {
+                    workspace_warm,
+                    workspace_destination,
+                    ..
+                },
+        } = args.cmd
+        else {
+            panic!("expected PlanCmd::Implement");
+        };
+        assert_eq!(workspace_warm, WorkspaceWarmMode::DevShell);
+        assert!(workspace_destination.is_none());
     }
 
     /// Acquire → second acquire fails fast → drop → reacquire round-trips.
