@@ -101,6 +101,17 @@ enum PromoteCmd {
     },
     /// Show the full detail of one staged push, including its audit context.
     Show { request_id: String },
+    /// Approve a staged push: the broker mints an installation token,
+    /// replays the staged commits onto GitHub under the App's identity
+    /// (signing each one), points the branch at the resulting tip,
+    /// writes the audit resolution row, and removes the staging
+    /// directory. Prints the App-side commit SHA on success so the
+    /// caller can verify the push landed without querying the audit
+    /// DB. Bare verb (no `--reason`): the broker's wire shape carries
+    /// no reason field and adding one CLI-side that the broker
+    /// discards would mislead the operator. Operator identity is taken
+    /// from `$USER` (or `unknown` if unset).
+    Approve { request_id: String },
     /// Reject a staged push: records the operator decision in the audit
     /// log and removes the staging directory. The operator identity is
     /// taken from `$USER` (or `unknown` if unset); the host is trusted to
@@ -500,6 +511,41 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     other => return Err(format!("unexpected response: {other:?}").into()),
                 }
             }
+            PromoteCmd::Approve { request_id } => {
+                let id: RequestId = request_id
+                    .parse()
+                    .map_err(|e| format!("invalid request ID: {e}"))?;
+                let operator = capture_operator_identity();
+                let msg = ClientMessage::ApproveStagedPush {
+                    request_id: id,
+                    operator,
+                };
+                // Use the promote-specific timeout: the broker's approve
+                // pipeline (mint → walk-and-sign → push → audit) can run
+                // far longer than the default 60s `CALL_TIMEOUT`. Timing
+                // out before the broker would silently lose the
+                // `new_app_tip` receipt even though the push may have
+                // landed.
+                match call_with_timeout(&socket_path, &msg, PROMOTE_APPROVE_CALL_TIMEOUT)? {
+                    ServerMessage::StagedPushApproved {
+                        request_id,
+                        new_app_tip,
+                    } => {
+                        println!("approved push_request_id={request_id} new_app_tip={new_app_tip}");
+                    }
+                    ServerMessage::UnknownStagedPush { request_id } => {
+                        return Err(format!("no staged push with id {request_id}").into());
+                    }
+                    ServerMessage::StagedPushAlreadyResolved { request_id } => {
+                        return Err(format!(
+                            "staged push {request_id} already has an operator decision recorded",
+                        )
+                        .into());
+                    }
+                    ServerMessage::Error { message } => return Err(message.into()),
+                    other => return Err(format!("unexpected response: {other:?}").into()),
+                }
+            }
             PromoteCmd::Reject { request_id, reason } => {
                 let id: RequestId = request_id
                     .parse()
@@ -778,6 +824,18 @@ const AGENT_VM_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 // prefetching, and the daemon's workspace bootstrap timeout is 20 minutes.
 const AGENT_VM_WORKSPACE_CALL_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(30 * 60);
+// `promote approve` shells the broker through the full mint → walk-and-sign →
+// push → audit-write pipeline; for a multi-commit replay over a slow network
+// this dwarfs the 60s default. The broker's `APPROVE_MINT_TTL_SECONDS` is
+// 3600s, the upper bound on how long the broker is willing to spend before
+// the minted token expires; a CLI cap above that adds nothing but invites
+// shells to hang on a wedged daemon. 30 minutes matches
+// `AGENT_VM_WORKSPACE_CALL_TIMEOUT` — both are "host CLI waits for broker
+// to do potentially-network-bound work synchronously" — and leaves
+// half the broker-side budget as headroom. A timeout here means the broker
+// may still complete the push and stamp the resolution row; the operator's
+// recourse is `writ promote show <id>` to find out.
+const PROMOTE_APPROVE_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 
 fn call(
     socket_path: &Path,
@@ -988,6 +1046,72 @@ mod tests {
 
         assert!(!debug.contains("SECRET prompt"), "{debug}");
         assert!(debug.contains("<redacted>"), "{debug}");
+    }
+
+    /// `writ promote approve <id>` parses into `PromoteCmd::Approve`
+    /// with the request id threaded verbatim. The variant is bare —
+    /// no flags, no reason, no per-resolution metadata — because the
+    /// wire shape (`ClientMessage::ApproveStagedPush`) is bare; a
+    /// surface that asked for more than the broker recorded would
+    /// silently discard operator input.
+    #[test]
+    fn promote_approve_cli_parses_request_id() {
+        let args = Args::try_parse_from([
+            "writ",
+            "promote",
+            "approve",
+            "22222222-2222-2222-2222-222222222222",
+        ])
+        .unwrap();
+        match args.cmd {
+            Cmd::Promote {
+                action: PromoteCmd::Approve { request_id },
+            } => {
+                assert_eq!(request_id, "22222222-2222-2222-2222-222222222222");
+            }
+            _ => panic!("unexpected command"),
+        }
+    }
+
+    /// `writ promote approve` with no positional argument must fail
+    /// parse: the request id is the only thing identifying which push
+    /// to approve, and there is no plausible default.
+    #[test]
+    fn promote_approve_cli_requires_request_id() {
+        let err = match Args::try_parse_from(["writ", "promote", "approve"]) {
+            Ok(_) => panic!("expected clap to reject missing request id"),
+            Err(error) => error,
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("REQUEST_ID") || msg.contains("request_id") || msg.contains("required"),
+            "unexpected clap error: {err}",
+        );
+    }
+
+    /// `writ promote approve` must reject `--reason`. The wire
+    /// shape has no reason field; accepting one and discarding it
+    /// would be a lie. This test pins the variant stays bare — a
+    /// future "add a reason field" PR has to delete this test
+    /// deliberately, which is the right threshold for that decision.
+    #[test]
+    fn promote_approve_cli_rejects_reason_flag() {
+        let err = match Args::try_parse_from([
+            "writ",
+            "promote",
+            "approve",
+            "33333333-3333-3333-3333-333333333333",
+            "--reason",
+            "lgtm",
+        ]) {
+            Ok(_) => panic!("expected clap to reject unknown --reason flag"),
+            Err(error) => error,
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--reason") || msg.contains("unexpected"),
+            "unexpected clap error: {err}",
+        );
     }
 
     #[test]
