@@ -325,19 +325,23 @@ enum PlanCmd {
         /// `"plan-implement"`.
         #[arg(long, default_value = "plan-implement")]
         purpose: String,
-        /// Human-readable session label stored in writ's audit log.
-        /// Informational only.
-        #[arg(long)]
-        label: Option<String>,
-        /// Coarse agent identity passed to writ's `OpenSession`. With
-        /// `WorkspaceWrite` granted, this field selects which GitHub
-        /// App writ uses to mint push credentials. Defaults to
-        /// `claude`.
+        /// Coarse agent identity passed to writ's VM dispatch arm.
+        /// With `WorkspaceWrite` granted, this field selects which
+        /// GitHub App writ uses to mint push credentials. Defaults
+        /// to `claude`. Required (not optional) on the wire because
+        /// writd's VM dispatch arm rejects a `RunAgent` carrying a
+        /// workspace bootstrap but no `agent_kind`.
         #[arg(long, default_value = "claude", value_parser = parse_agent_kind)]
         agent: AgentKind,
-        /// Optional model identifier stored on writ's session row.
+        /// Model identifier stored on writ's session row. Required
+        /// (not optional) because writd's VM dispatch arm rejects a
+        /// `RunAgent` carrying a workspace bootstrap but no
+        /// `agent_model`: `bailiff plan implement` always routes
+        /// into VM mode (the implementer holds `WorkspaceWrite`), so
+        /// omitting the flag would be a guaranteed broker-side
+        /// failure rather than a sensible default.
         #[arg(long)]
-        model: Option<String>,
+        model: String,
         /// How aggressively to pre-warm the per-run VM checkout
         /// before the agent runs. `none` does nothing,
         /// `sources` fetches Nix sources for the flake's
@@ -519,7 +523,6 @@ async fn dispatch(cmd: Cmd, socket_path: PathBuf) -> Result<(), Box<dyn std::err
                 writ_repo,
                 writ_allowed_signers,
                 purpose,
-                label,
                 agent,
                 model,
                 workspace_warm,
@@ -534,7 +537,6 @@ async fn dispatch(cmd: Cmd, socket_path: PathBuf) -> Result<(), Box<dyn std::err
                     writ_repo,
                     writ_allowed_signers,
                     purpose,
-                    label,
                     agent,
                     model,
                     workspace_warm,
@@ -813,9 +815,8 @@ async fn plan_implement(
     writ_repo: Option<PathBuf>,
     writ_allowed_signers: PathBuf,
     purpose: String,
-    label: Option<String>,
     agent: AgentKind,
-    model: Option<String>,
+    model: String,
     workspace_warm: WorkspaceWarmMode,
     workspace_destination: Option<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -897,8 +898,7 @@ async fn plan_implement(
         capabilities: vec![CapabilitySet::WorkspaceWrite { repo }],
         purpose,
         writ_output_ref,
-        session_label: label,
-        session_agent_kind: Some(agent),
+        session_agent_kind: agent,
         session_agent_model: model,
         workspace,
     };
@@ -1987,6 +1987,8 @@ mod tests {
             "smaug123/writ",
             "--writ-allowed-signers",
             "/etc/bailiff/allowed_signers",
+            "--model",
+            "claude-opus-4-7",
         ])
         .unwrap();
         let Cmd::Plan {
@@ -1999,7 +2001,6 @@ mod tests {
                     writ_repo,
                     writ_allowed_signers,
                     purpose,
-                    label,
                     agent,
                     model,
                     ..
@@ -2018,9 +2019,8 @@ mod tests {
             PathBuf::from("/etc/bailiff/allowed_signers")
         );
         assert_eq!(purpose, "plan-implement");
-        assert!(label.is_none());
         assert_eq!(agent, AgentKind::Claude);
-        assert!(model.is_none());
+        assert_eq!(model, "claude-opus-4-7");
     }
 
     /// Every optional flag round-trips. Pins the full implement CLI
@@ -2046,8 +2046,6 @@ mod tests {
             "/etc/bailiff/allowed_signers",
             "--purpose",
             "plan-implement:rev-2",
-            "--label",
-            "feature 42 implement",
             "--agent",
             "codex",
             "--model",
@@ -2061,7 +2059,6 @@ mod tests {
                     bailiff_repo,
                     writ_repo,
                     purpose,
-                    label,
                     agent,
                     model,
                     ..
@@ -2080,9 +2077,8 @@ mod tests {
             Some(std::path::Path::new("/var/writ"))
         );
         assert_eq!(purpose, "plan-implement:rev-2");
-        assert_eq!(label.as_deref(), Some("feature 42 implement"));
         assert_eq!(agent, AgentKind::Codex);
-        assert_eq!(model.as_deref(), Some("gpt-test"));
+        assert_eq!(model, "gpt-test");
     }
 
     /// `--plan-id` is required. Implementing presupposes a submitted +
@@ -2102,6 +2098,8 @@ mod tests {
             "smaug123/writ",
             "--writ-allowed-signers",
             "/etc/bailiff/allowed_signers",
+            "--model",
+            "claude-opus-4-7",
         ])
         .err()
         .expect("expected parse error");
@@ -2131,6 +2129,8 @@ mod tests {
             "smaug123/writ",
             "--writ-allowed-signers",
             "/etc/bailiff/allowed_signers",
+            "--model",
+            "claude-opus-4-7",
         ])
         .err()
         .expect("expected parse error");
@@ -2138,6 +2138,39 @@ mod tests {
         assert!(
             msg.contains("--prompt-file") || msg.contains("required"),
             "expected missing-prompt-file failure, got: {msg}",
+        );
+    }
+
+    /// `--model` is required for `plan implement`. Writd's VM dispatch
+    /// arm rejects a `RunAgent` carrying a workspace bootstrap but no
+    /// `agent_model` with "VM mode requires agent_model", so accepting
+    /// the flag as optional would mean the default `bailiff plan
+    /// implement …` invocation fails at the broker rather than at parse
+    /// time. Codex review on slice VM3 flagged this — pin the surface
+    /// so a regression to `Option<String>` (the shape inherited from
+    /// the read-side `plan submit` / `plan review` verbs) fails here.
+    #[test]
+    fn plan_implement_rejects_missing_model() {
+        let plan_id_str = "6e6e6e6e-7e7e-8e8e-9e9e-aeaeaeaeaeae";
+        let err = Args::try_parse_from([
+            "bailiff",
+            "plan",
+            "implement",
+            "--plan-id",
+            plan_id_str,
+            "--prompt-file",
+            "/tmp/i.txt",
+            "--repo",
+            "smaug123/writ",
+            "--writ-allowed-signers",
+            "/etc/bailiff/allowed_signers",
+        ])
+        .err()
+        .expect("expected parse error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--model") || msg.contains("required"),
+            "expected missing-model failure, got: {msg}",
         );
     }
 
@@ -2159,6 +2192,8 @@ mod tests {
             "smaug123/writ",
             "--writ-allowed-signers",
             "/etc/bailiff/allowed_signers",
+            "--model",
+            "claude-opus-4-7",
         ])
         .err()
         .expect("expected parse error");
@@ -2194,6 +2229,8 @@ mod tests {
             "smaug123/writ",
             "--writ-allowed-signers",
             "/etc/bailiff/allowed_signers",
+            "--model",
+            "claude-opus-4-7",
             "--workspace-warm",
             "sources",
             "--workspace-destination",
@@ -2241,6 +2278,8 @@ mod tests {
             "smaug123/writ",
             "--writ-allowed-signers",
             "/etc/bailiff/allowed_signers",
+            "--model",
+            "claude-opus-4-7",
         ])
         .unwrap();
         let Cmd::Plan {

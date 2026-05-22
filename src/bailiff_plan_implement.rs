@@ -106,22 +106,19 @@ pub struct SubmitImplementInputs {
     /// the function honest about the same ref bailiff later passes
     /// to [`write_implement_note`].
     pub writ_output_ref: NotesRef,
-    /// Optional human-readable session label. Stored on writ's audit
-    /// session row; informational only.
-    pub session_label: Option<String>,
-    /// Optional coarse agent identity. Writ uses it for GitHub-App
-    /// selection on credential mints; with a `WorkspaceWrite`
-    /// capability set the field selects which GitHub App to use for
-    /// the implementer's push credentials. In VM mode the broker
-    /// additionally requires this on the wire (the VM dispatch arm
-    /// has no default), so a bailiff caller must supply it.
-    pub session_agent_kind: Option<AgentKind>,
-    /// Optional model identifier (e.g. `"claude-opus-4-7"`). Stored
-    /// on writ's audit session row alongside `agent_kind`. In VM
-    /// mode the broker additionally requires this on the wire (the
-    /// VM dispatch arm has no default), so a bailiff caller must
-    /// supply it.
-    pub session_agent_model: Option<String>,
+    /// Coarse agent identity. Writ uses it for GitHub-App selection
+    /// on credential mints; with a `WorkspaceWrite` capability set
+    /// the field selects which GitHub App to use for the
+    /// implementer's push credentials. Required (not optional) here
+    /// because writd's VM dispatch arm rejects a `RunAgent` carrying
+    /// a workspace bootstrap but no `agent_kind`.
+    pub session_agent_kind: AgentKind,
+    /// Model identifier (e.g. `"claude-opus-4-7"`). Stored on writ's
+    /// audit session row alongside `agent_kind`. Required (not
+    /// optional) here because writd's VM dispatch arm rejects a
+    /// `RunAgent` carrying a workspace bootstrap but no
+    /// `agent_model`.
+    pub session_agent_model: String,
     /// Workspace bootstrap describing the per-run VM checkout the
     /// implementer agent runs in. The implementer always carries a
     /// `WorkspaceWrite` capability, so the broker rejects the
@@ -325,8 +322,8 @@ fn build_implementer_run_agent_request(
         output_ref: inputs.writ_output_ref.clone(),
         session_id: None,
         workspace: Some(inputs.workspace.clone()),
-        agent_kind: inputs.session_agent_kind,
-        agent_model: inputs.session_agent_model.clone(),
+        agent_kind: Some(inputs.session_agent_kind),
+        agent_model: Some(inputs.session_agent_model.clone()),
     }
 }
 
@@ -548,9 +545,8 @@ mod build_request_tests {
             }],
             purpose: "plan-implement".into(),
             writ_output_ref: NotesRef::try_new("refs/notes/writ/v1/agent-outputs").unwrap(),
-            session_label: Some("plan-implement:test".into()),
-            session_agent_kind: Some(AgentKind::Claude),
-            session_agent_model: Some("claude-opus-4-7".into()),
+            session_agent_kind: AgentKind::Claude,
+            session_agent_model: "claude-opus-4-7".into(),
             workspace: sample_workspace(),
         }
     }
@@ -582,8 +578,11 @@ mod build_request_tests {
             Some(&inputs.workspace),
             "workspace bootstrap must thread through verbatim",
         );
-        assert_eq!(req.agent_kind, inputs.session_agent_kind);
-        assert_eq!(req.agent_model, inputs.session_agent_model);
+        assert_eq!(req.agent_kind, Some(inputs.session_agent_kind));
+        assert_eq!(
+            req.agent_model.as_deref(),
+            Some(inputs.session_agent_model.as_str())
+        );
     }
 }
 
@@ -786,9 +785,8 @@ mod end_to_end_tests {
             }],
             purpose: "plan-implement".into(),
             writ_output_ref: NotesRef::try_new("refs/notes/writ/v1/agent-outputs").unwrap(),
-            session_label: Some("plan-implement:test".into()),
-            session_agent_kind: Some(AgentKind::Claude),
-            session_agent_model: Some("claude-test".into()),
+            session_agent_kind: AgentKind::Claude,
+            session_agent_model: "claude-test".into(),
             workspace: AgentVmWorkspaceBootstrap {
                 repo: GitCloneRepo::new(writ_repo_ref()).unwrap(),
                 destination: None,
