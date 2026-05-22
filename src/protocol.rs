@@ -12,8 +12,7 @@
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::agent_plan::CorrelationId;
-use crate::agent_run::{AgentPrompt, AgentRunId};
+use crate::agent_run::{AgentPrompt, AgentRunId, CorrelationId};
 use crate::agent_vm_lifecycle::AgentVmSessionStateStatus;
 use crate::audit::GitPushOutcomeResult;
 use crate::core::{

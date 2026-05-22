@@ -32,7 +32,6 @@ mod git_push;
 mod grant;
 mod nix_cache;
 mod openai_proxy;
-mod plan;
 mod proxy_table;
 mod schema;
 mod session;
@@ -61,9 +60,6 @@ pub use nix_cache::{
 pub use openai_proxy::{
     OpenAiProxyAuditDecision, OpenAiProxyAuditRoute, OpenAiProxyOutcomeRecord,
     OpenAiProxyRequestRecord,
-};
-pub use plan::{
-    PlanAbortRecord, PlanAddendumRecord, PlanDecisionRecord, PlanReviewRecord, PlanSubmissionRecord,
 };
 pub use proxy_table::ProxyAuditDecision;
 

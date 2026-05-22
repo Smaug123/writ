@@ -49,7 +49,7 @@ pub(super) struct Migration {
 /// a version higher than this is rejected with [`AuditError::SchemaTooNew`]
 /// rather than opened — we'd rather fail to start than silently drop data
 /// into a schema a newer broker wrote.
-pub(super) const SCHEMA_VERSION: i32 = 6;
+pub(super) const SCHEMA_VERSION: i32 = 4;
 
 /// The full migration history. Each entry documents exactly one state
 /// transition; the sequence of entries is the schema's lineage. Order
@@ -62,28 +62,18 @@ pub(super) const MIGRATIONS: &[Migration] = &[
     },
     Migration {
         version: 2,
-        name: "0002_plan_addendum",
-        sql: include_str!("migrations/0002_plan_addendum.sql"),
+        name: "0002_git_push_resolution_mint",
+        sql: include_str!("migrations/0002_git_push_resolution_mint.sql"),
     },
     Migration {
         version: 3,
-        name: "0003_plan_abort",
-        sql: include_str!("migrations/0003_plan_abort.sql"),
+        name: "0003_approve_attempt_state_machine",
+        sql: include_str!("migrations/0003_approve_attempt_state_machine.sql"),
     },
     Migration {
         version: 4,
-        name: "0004_git_push_resolution_mint",
-        sql: include_str!("migrations/0004_git_push_resolution_mint.sql"),
-    },
-    Migration {
-        version: 5,
-        name: "0005_approve_attempt_state_machine",
-        sql: include_str!("migrations/0005_approve_attempt_state_machine.sql"),
-    },
-    Migration {
-        version: 6,
-        name: "0006_approve_attempt_reconciliation",
-        sql: include_str!("migrations/0006_approve_attempt_reconciliation.sql"),
+        name: "0004_approve_attempt_reconciliation",
+        sql: include_str!("migrations/0004_approve_attempt_reconciliation.sql"),
     },
 ];
 
@@ -317,13 +307,23 @@ mod tests {
             "git_push_resolution",
             "git_push_approve_attempt",
             "git_push_approve_attempt_boot_observed",
+        ] {
+            assert!(tables.contains(expected), "missing table: {expected}");
+        }
+
+        // Plan lifecycle tables were removed in slice G: bailiff owns
+        // plan storage as git notes; the audit log no longer mirrors it.
+        for forbidden in [
             "plan",
             "plan_decision",
             "plan_review",
             "plan_addendum",
             "plan_abort",
         ] {
-            assert!(tables.contains(expected), "missing table: {expected}");
+            assert!(
+                !tables.contains(forbidden),
+                "plan-era table {forbidden} should have been dropped"
+            );
         }
 
         let triggers = names("trigger");
@@ -348,36 +348,28 @@ mod tests {
             "git_push_approve_attempt_reconciliation_same_push",
             "git_push_approve_attempt_reconciliation_uncertain_needs_boot_observed",
             "git_push_approve_attempt_supersedes_immutable",
-            "plan_requires_open_session",
-            "plan_review_requires_open_session",
-            "plan_review_requires_reviewer_run",
-            "plan_addendum_requires_open_session",
-            "plan_addendum_requires_executor_run",
-            "plan_addendum_requires_accepted_decision",
-            "plan_abort_requires_open_session",
-            "plan_abort_requires_executor_run",
         ] {
             assert!(triggers.contains(expected), "missing trigger: {expected}");
         }
     }
 
-    /// A v3 DB that already carried a `decision = 'approved'` row
+    /// A v1 DB that already carried a `decision = 'approved'` row
     /// cannot be upgraded — the new schema needs mint context that
-    /// pre-upgrade rows lack. The v4 migration's defensive guard
+    /// pre-upgrade rows lack. The v2 migration's defensive guard
     /// refuses the upgrade so an operator deliberately resolves the
     /// situation rather than discovering unreadable rows later. No
     /// shipped broker actually writes legacy approved rows, but the
-    /// pre-v4 schema admitted them, so the guard is principled even
+    /// pre-v2 schema admitted them, so the guard is principled even
     /// if rarely triggered.
     #[test]
-    fn v4_migration_refuses_legacy_approved_resolution_row() {
+    fn v2_migration_refuses_legacy_approved_resolution_row() {
         let db = NamedTempFile::new().unwrap();
-        // Build a v3 DB shape by hand: apply migrations 1..=3 directly
-        // and stop. `AuditLog::open` would otherwise run v4 first.
+        // Build a v1 DB shape by hand: apply migration 1 directly
+        // and stop. `AuditLog::open` would otherwise run v2 first.
         {
             let mut conn = Connection::open(db.path()).unwrap();
             ensure_schema_version_table(&conn).unwrap();
-            for migration in MIGRATIONS.iter().take_while(|m| m.version < 4) {
+            for migration in MIGRATIONS.iter().take_while(|m| m.version < 2) {
                 let tx = conn
                     .transaction_with_behavior(TransactionBehavior::Immediate)
                     .unwrap();
@@ -391,7 +383,7 @@ mod tests {
             }
 
             // Plant a legacy 'approved' row by walking the audit chain
-            // the v3 schema requires (session → request → staged
+            // the v1 schema requires (session → request → staged
             // outcome → resolution) without going through the DAO,
             // which would reject the inconsistency at the type layer.
             let session_id = SessionId::new();
@@ -440,15 +432,15 @@ mod tests {
             "expected CHECK constraint failure, got: {e}"
         );
 
-        // The v3 DB is unchanged: the migration aborted in a single
-        // transaction. Reopening still observes schema_version = 3.
+        // The v1 DB is unchanged: the migration aborted in a single
+        // transaction. Reopening still observes schema_version = 1.
         let current = Connection::open(db.path())
             .unwrap()
             .query_row("SELECT MAX(version) FROM schema_version", [], |row| {
                 row.get::<_, i32>(0)
             })
             .unwrap();
-        assert_eq!(current, 3);
+        assert_eq!(current, 1);
     }
 
     /// A DB written by a future broker will carry a `schema_version`

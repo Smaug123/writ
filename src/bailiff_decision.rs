@@ -2,10 +2,6 @@
 //!
 //! Types in this module model the operator-driven accept/reject
 //! verdict bailiff records against a previously-submitted plan.
-//! They are deliberately disjoint from the writ-side decision types
-//! in [`crate::agent_plan`]: bailiff's lifecycle vocabulary belongs
-//! in bailiff-owned namespaces from day one, even though slice G
-//! still has work to do to remove the writ-side counterparts.
 //!
 //! See `docs/plans/2026-05-16-slice-d1-decide.md` for the slice plan.
 
@@ -14,18 +10,13 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-/// Largest byte length accepted for a [`Decider`] string. The bound
-/// matches the writ-side `MAX_DECIDER_BYTES` in
-/// [`crate::agent_plan`] because the same operator attribution
-/// strings (`cli:<user>`, `agent:<run_id>`) flow through both
-/// surfaces during the C→G transition.
+/// Largest byte length accepted for a [`Decider`] string. Operator
+/// attribution strings take the form `cli:<user>` or `agent:<run_id>`.
 pub const MAX_DECIDER_BYTES: usize = 256;
 
-/// Operator verdict on a submitted plan. The bailiff-owned counterpart
-/// to the writ-side `DecisionOutcome` enum; slice G deletes the
-/// latter. We drop the `Restart` suffix on the reject variant because
-/// bailiff does no auto-anything: "rejected" is "this plan is dead;
-/// the operator does whatever they want next."
+/// Operator verdict on a submitted plan. We use bare `Rejected` (no
+/// `Restart` suffix) because bailiff does no auto-anything: "rejected"
+/// is "this plan is dead; the operator does whatever they want next."
 ///
 /// Serialised as `"accepted"` / `"rejected"` — short, snake_case,
 /// matching the surrounding convention.

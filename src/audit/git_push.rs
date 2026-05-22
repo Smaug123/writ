@@ -3,7 +3,7 @@
 use rusqlite::{OptionalExtension, Row, params};
 
 use super::{AuditError, AuditLog};
-use crate::agent_plan::CorrelationId;
+use crate::agent_run::CorrelationId;
 use crate::core::{ApproveAttemptId, Jti, RequestId, SessionId, UnixMillis};
 use crate::vm_git::{GitBranchName, GitCloneRepo, GitObjectId};
 

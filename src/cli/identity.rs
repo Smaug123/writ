@@ -4,7 +4,6 @@
 //! mutating process env (`std::env::set_var` is unsafe under Rust 2024
 //! and would race with Clap's env-aware parsers in parallel tests).
 
-use crate::agent_plan::DecisionOutcome;
 use crate::protocol::ReconcileOutcome;
 use crate::vm_git::GitObjectId;
 
@@ -27,20 +26,6 @@ pub fn classify_operator_identity(user: Option<String>) -> String {
     match user {
         Some(value) if !value.is_empty() => value,
         _ => "unknown".to_string(),
-    }
-}
-
-/// Map the parsed `--accept` / `--reject-restart` flags to a
-/// [`DecisionOutcome`]. Clap's `ArgGroup` enforces exactly-one before
-/// we get here, so the `(false, false)` and `(true, true)` cases are
-/// unreachable in practice — they panic loudly rather than guess.
-pub fn resolve_decision_outcome(accept: bool, reject_restart: bool) -> DecisionOutcome {
-    match (accept, reject_restart) {
-        (true, false) => DecisionOutcome::Accepted,
-        (false, true) => DecisionOutcome::RejectedRestart,
-        (false, false) | (true, true) => {
-            unreachable!("clap ArgGroup enforces exactly one of --accept / --reject-restart")
-        }
     }
 }
 
@@ -104,18 +89,6 @@ mod tests {
         assert_eq!(classify_operator_identity(Some("alice".into())), "alice");
         assert_eq!(classify_operator_identity(Some(String::new())), "unknown");
         assert_eq!(classify_operator_identity(None), "unknown");
-    }
-
-    #[test]
-    fn resolve_decision_outcome_maps_each_flag() {
-        assert_eq!(
-            resolve_decision_outcome(true, false),
-            DecisionOutcome::Accepted,
-        );
-        assert_eq!(
-            resolve_decision_outcome(false, true),
-            DecisionOutcome::RejectedRestart,
-        );
     }
 
     /// `--confirmed-applied` is set and the dependent flags are present.

@@ -7,20 +7,15 @@ CREATE TABLE agent_run (
     agent_kind              TEXT NOT NULL CHECK (agent_kind IN ('claude', 'codex')),
     prompt_bytes            INTEGER NOT NULL CHECK (prompt_bytes >= 0),
     prompt_sha256           TEXT NOT NULL CHECK (length(prompt_sha256) = 64),
-    prompt_redacted_preview TEXT NOT NULL CHECK (prompt_redacted_preview != '')
-, correlation_id TEXT
+    prompt_redacted_preview TEXT NOT NULL CHECK (prompt_redacted_preview != ''),
+    correlation_id          TEXT
     CHECK (correlation_id IS NULL OR (
         typeof(correlation_id) = 'text'
         AND length(correlation_id) = length(cast(correlation_id AS BLOB))
         AND length(correlation_id) BETWEEN 1 AND 64
         AND correlation_id NOT GLOB '*[^A-Za-z0-9_-]*'
-    )), stage TEXT NOT NULL DEFAULT 'execute'
-    CHECK (
-        typeof(stage) = 'text'
-        AND stage IN ('plan','review','execute')
-    ), read_plan_id TEXT NULL
-    REFERENCES plan(plan_id)
-    CHECK (read_plan_id IS NULL OR typeof(read_plan_id) = 'text'));
+    ))
+);
 
 CREATE TABLE agent_run_outcome (
     run_id           TEXT PRIMARY KEY REFERENCES agent_run(run_id),
@@ -123,14 +118,15 @@ CREATE TABLE git_push_request (
     repo                 TEXT NOT NULL CHECK (repo != ''),
     branch               TEXT NOT NULL CHECK (branch != ''),
     expected_remote_head TEXT CHECK (expected_remote_head IS NULL OR length(expected_remote_head) = 40),
-    new_head             TEXT NOT NULL CHECK (length(new_head) = 40)
-, correlation_id TEXT
+    new_head             TEXT NOT NULL CHECK (length(new_head) = 40),
+    correlation_id       TEXT
     CHECK (correlation_id IS NULL OR (
         typeof(correlation_id) = 'text'
         AND length(correlation_id) = length(cast(correlation_id AS BLOB))
         AND length(correlation_id) BETWEEN 1 AND 64
         AND correlation_id NOT GLOB '*[^A-Za-z0-9_-]*'
-    )));
+    ))
+);
 
 CREATE TABLE git_push_resolution (
     push_request_id TEXT PRIMARY KEY REFERENCES git_push_request(push_request_id),
@@ -146,8 +142,9 @@ CREATE TABLE grant_log (
     session_id  TEXT NOT NULL REFERENCES session(session_id),
     scope_json  TEXT NOT NULL,
     issued_at   INTEGER NOT NULL,
-    expires_at  INTEGER NOT NULL
-, github_app_id INTEGER CHECK (github_app_id IS NULL OR github_app_id >= 0));
+    expires_at  INTEGER NOT NULL,
+    github_app_id INTEGER CHECK (github_app_id IS NULL OR github_app_id >= 0)
+);
 
 CREATE TABLE mint_failure (
     request_id   TEXT PRIMARY KEY REFERENCES request(request_id),
@@ -205,92 +202,6 @@ CREATE TABLE openai_proxy_request (
     )
 );
 
-CREATE TABLE plan (
-    plan_id       TEXT PRIMARY KEY,
-    agent_run_id  TEXT NOT NULL REFERENCES agent_run(run_id),
-    submitted_at  INTEGER NOT NULL,
-    body          TEXT NOT NULL CHECK (
-        typeof(body) = 'text'
-        AND length(cast(body AS BLOB)) BETWEEN 1 AND 262144
-        AND instr(cast(body AS BLOB), x'00') = 0
-    ),
-    body_sha256   TEXT NOT NULL CHECK (length(body_sha256) = 64),
-    UNIQUE (agent_run_id)
-);
-
-CREATE TABLE plan_decision (
-    -- TEXT PRIMARY KEY in a rowid table is a long-standing SQLite quirk:
-    -- it does *not* imply NOT NULL (preserved for v1/v2 compat). NULL
-    -- child keys also bypass the FK reference rule. Without an explicit
-    -- NOT NULL, a raw INSERT with `plan_id = NULL` would slip past both
-    -- guards and break the "exactly one decision per plan" invariant.
-    plan_id     TEXT PRIMARY KEY NOT NULL REFERENCES plan(plan_id),
-    decided_at  INTEGER NOT NULL,
-    outcome     TEXT NOT NULL CHECK (outcome IN ('accepted', 'rejected_restart')),
-    decider     TEXT NOT NULL CHECK (
-        typeof(decider) = 'text'
-        AND length(cast(decider AS BLOB)) BETWEEN 1 AND 256
-        AND instr(cast(decider AS BLOB), x'00') = 0
-    )
-);
-
-CREATE TABLE plan_review (
-    -- TEXT PRIMARY KEY in a rowid table does not imply NOT NULL (the
-    -- v1/v2 compat quirk also exploited by the plan_decision migration);
-    -- mark explicitly so a raw INSERT with `review_id = NULL` cannot
-    -- bypass the per-row uniqueness.
-    review_id        TEXT PRIMARY KEY NOT NULL,
-    plan_id          TEXT NOT NULL REFERENCES plan(plan_id),
-    agent_run_id     TEXT NOT NULL REFERENCES agent_run(run_id),
-    submitted_at     INTEGER NOT NULL,
-    verdict          TEXT NOT NULL CHECK (
-        typeof(verdict) = 'text'
-        AND verdict IN ('approve', 'request_changes', 'reject')
-    ),
-    feedback         TEXT NULL CHECK (
-        feedback IS NULL OR (
-            typeof(feedback) = 'text'
-            AND length(cast(feedback AS BLOB)) BETWEEN 1 AND 65536
-            AND instr(cast(feedback AS BLOB), x'00') = 0
-        )
-    ),
-    -- The digest must be exactly 64 lowercase hex chars in TEXT storage
-    -- class; a BLOB binding, a 64-character non-hex value, or a value
-    -- like `<64 hex chars>\0junk` would otherwise be silently accepted
-    -- and then fail later inside the DAO read path
-    -- (`plan_review_from_row` runs `validate_sha256_hex`).
-    --
-    -- The four clauses combine to make every byte of the stored value
-    -- pass the hex test:
-    --
-    --   * `typeof = 'text'` rejects a BLOB binding (SQLite's declared
-    --     column types are advisory — TEXT NULL accepts a BLOB unless
-    --     this guard is present).
-    --   * `length(cast AS BLOB) = length(...)` rejects any embedded
-    --     NUL, because `length()` on TEXT stops at the first NUL while
-    --     the BLOB length walks every byte.
-    --   * `length(...) = 64` pins the size.
-    --   * `NOT GLOB '*[^0-9a-f]*'` rejects any non-hex character.
-    --
-    -- Without the NUL parity guard, `length()` and `GLOB` only see the
-    -- prefix before a NUL, so a value such as `'aa..aa\0junk'` would
-    -- slip past the size and class checks and then be unreadable by
-    -- the typed reader.
-    feedback_sha256  TEXT NULL CHECK (
-        feedback_sha256 IS NULL OR (
-            typeof(feedback_sha256) = 'text'
-            AND length(feedback_sha256) = length(cast(feedback_sha256 AS BLOB))
-            AND length(feedback_sha256) = 64
-            AND feedback_sha256 NOT GLOB '*[^0-9a-f]*'
-        )
-    ),
-    UNIQUE (agent_run_id),
-    CHECK (
-        (feedback IS NULL AND feedback_sha256 IS NULL)
-        OR (feedback IS NOT NULL AND feedback_sha256 IS NOT NULL)
-    )
-);
-
 CREATE TABLE request (
     request_id    TEXT PRIMARY KEY,
     session_id    TEXT NOT NULL REFERENCES session(session_id),
@@ -304,8 +215,9 @@ CREATE TABLE session (
     label       TEXT,
     agent_model TEXT,
     opened_at   INTEGER NOT NULL,
-    closed_at   INTEGER
-, agent_kind TEXT CHECK (agent_kind IN ('claude', 'codex')));
+    closed_at   INTEGER,
+    agent_kind  TEXT CHECK (agent_kind IN ('claude', 'codex'))
+);
 
 
 -- indexes
@@ -323,10 +235,6 @@ CREATE INDEX idx_nix_cache_request_session
 
 CREATE INDEX idx_openai_proxy_request_session
     ON openai_proxy_request(session_id, received_at);
-
-CREATE INDEX idx_plan_agent_run ON plan(agent_run_id);
-
-CREATE INDEX idx_plan_review_plan ON plan_review(plan_id);
 
 CREATE INDEX idx_request_session ON request(session_id, received_at);
 
@@ -440,41 +348,6 @@ BEGIN
     SELECT RAISE(ABORT, 'session is closed');
 END;
 
-CREATE TRIGGER plan_requires_open_session
-BEFORE INSERT ON plan
-WHEN EXISTS (
-    SELECT 1 FROM agent_run ar
-    JOIN session s ON s.session_id = ar.session_id
-    WHERE ar.run_id = NEW.agent_run_id AND s.closed_at IS NOT NULL
-)
-BEGIN
-    SELECT RAISE(ABORT, 'session is closed');
-END;
-
-CREATE TRIGGER plan_review_requires_open_session
-BEFORE INSERT ON plan_review
-WHEN EXISTS (
-    SELECT 1 FROM agent_run ar
-    JOIN session s ON s.session_id = ar.session_id
-    WHERE ar.run_id = NEW.agent_run_id AND s.closed_at IS NOT NULL
-)
-BEGIN
-    SELECT RAISE(ABORT, 'session is closed');
-END;
-
-CREATE TRIGGER plan_review_requires_reviewer_run
-BEFORE INSERT ON plan_review
-WHEN NOT EXISTS (
-    SELECT 1 FROM agent_run ar
-    WHERE ar.run_id = NEW.agent_run_id
-      AND ar.stage = 'review'
-      AND ar.read_plan_id = NEW.plan_id
-)
-BEGIN
-    SELECT RAISE(ABORT,
-        'plan_review requires agent_run.stage = ''review'' AND agent_run.read_plan_id = plan_id');
-END;
-
 CREATE TRIGGER request_requires_open_session
 BEFORE INSERT ON request
 WHEN EXISTS (
@@ -484,4 +357,3 @@ WHEN EXISTS (
 BEGIN
     SELECT RAISE(ABORT, 'session is closed');
 END;
-

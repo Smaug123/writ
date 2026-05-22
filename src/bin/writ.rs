@@ -20,8 +20,7 @@ use std::path::{Path, PathBuf};
 
 use clap::{ArgGroup, Parser, Subcommand, ValueEnum};
 
-use writ::agent_plan::CorrelationId;
-use writ::agent_run::AgentPrompt;
+use writ::agent_run::{AgentPrompt, CorrelationId};
 use writ::cli::identity::{capture_operator_identity, resolve_reconcile_outcome};
 use writ::cli::output::{
     write_agent_vm_sessions, write_staged_push_detail, write_staged_push_summaries,
