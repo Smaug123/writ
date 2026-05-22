@@ -329,6 +329,8 @@ pub async fn dispatch_message_with_agent_vm<S: SecretStore + Send + Sync + 'stat
             output_ref,
             session_id,
             workspace,
+            agent_kind,
+            agent_model,
         } => {
             run_agent(
                 state,
@@ -338,6 +340,9 @@ pub async fn dispatch_message_with_agent_vm<S: SecretStore + Send + Sync + 'stat
                 output_ref,
                 session_id,
                 workspace,
+                agent_kind,
+                agent_model,
+                agent_vm,
             )
             .await
         }
@@ -1887,7 +1892,23 @@ fn staging_not_configured() -> ServerMessage {
 /// keeps the per-call footprint bounded; the `truncated_at` marker on
 /// `OutputEnvelope` records the cap so verifiers know the capture is
 /// a prefix rather than the whole stream.
-const MAX_RUN_AGENT_STREAM_BYTES: usize = 4 * 1024 * 1024;
+pub(crate) const MAX_RUN_AGENT_STREAM_BYTES: usize = 4 * 1024 * 1024;
+
+/// Total wall-clock budget the VM dispatch arm gives a per-run VM
+/// agent to complete and POST its outcome to writd. Implementer runs
+/// can be long — the bailiff CLI's flock acceptance message already
+/// pins "30-minute hold per implement" — so the writd-side wait must
+/// be at least as generous as the operator's mental model. A run that
+/// blows past this is almost always a stuck guest, not a slow agent;
+/// the wait helper returns a structured `Timeout` so the caller
+/// surface names both the run id and the elapsed duration.
+const RUN_AGENT_VM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+/// How often the wait helper polls the audit table for the outcome
+/// row. 500ms keeps the audit handle warm without spinning; the row
+/// arrives within one POST round-trip after the guest finishes, so
+/// the observed latency from "outcome lands" to "wait returns" is
+/// bounded by this interval rather than the full timeout.
+const RUN_AGENT_VM_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// Read `reader` to EOF, retaining at most `cap` bytes. After the cap
 /// is hit, further bytes are drained and discarded so the child does
@@ -1895,7 +1916,7 @@ const MAX_RUN_AGENT_STREAM_BYTES: usize = 4 * 1024 * 1024;
 /// `Some(cap)` iff any bytes were dropped — `None` means the entire
 /// stream fit. The cap is byte-aligned to whatever the underlying read
 /// returned; we do not bisect a single read across the boundary.
-async fn capture_stream_capped<R>(
+pub(crate) async fn capture_stream_capped<R>(
     mut reader: R,
     cap: usize,
 ) -> std::io::Result<(Vec<u8>, Option<u64>)>
@@ -1955,6 +1976,7 @@ fn run_agent_not_configured(component: &str) -> ServerMessage {
 /// Capability-set policy enforcement (refusing to spawn if a granted
 /// variant is denied by `policy::*`) is deferred to a follow-up slice
 /// alongside the audit row — see the plan doc.
+#[allow(clippy::too_many_arguments)]
 async fn run_agent<S: SecretStore + Send + Sync + 'static>(
     state: &Arc<BrokerState<S>>,
     prompt: AgentPrompt,
@@ -1963,6 +1985,9 @@ async fn run_agent<S: SecretStore + Send + Sync + 'static>(
     output_ref: NotesRef,
     request_session_id: Option<SessionId>,
     workspace: Option<crate::vm_git::AgentVmWorkspaceBootstrap>,
+    agent_kind: Option<crate::core::AgentKind>,
+    agent_model: Option<String>,
+    agent_vm: Option<&Arc<crate::agent_vm_daemon::AgentVmDaemon>>,
 ) -> ServerMessage {
     // `purpose` is part of the wire contract and will land on the
     // audit row in the follow-up slice. Holding the name in scope (not
@@ -1974,23 +1999,32 @@ async fn run_agent<S: SecretStore + Send + Sync + 'static>(
     // host-spawn path has no cwd for the agent to mutate. Reject the
     // lie before any state work happens — an unconfigured broker still
     // fails here rather than masking the gate with a not-configured
-    // message. Slice VM2 will wire the `Some(workspace)` arm to the
-    // real per-run VM dispatch; until then the placeholder error stops
-    // the request from silently falling back to the host path.
+    // message. When `workspace` is `Some`, route to the per-run VM
+    // dispatch; the host-spawn path below is for read-only or
+    // prompt-only runs that have no checkout to operate on.
     let needs_workspace = capabilities
         .iter()
         .any(|c| matches!(c, crate::core::CapabilitySet::WorkspaceWrite { .. }));
-    match (needs_workspace, workspace.as_ref()) {
+    match (needs_workspace, workspace) {
         (true, None) => {
             return ServerMessage::Error {
                 message: "RunAgent: WorkspaceWrite capability requires a workspace bootstrap"
                     .into(),
             };
         }
-        (_, Some(_)) => {
-            return ServerMessage::Error {
-                message: "RunAgent: VM dispatch not yet wired (slice VM2)".into(),
-            };
+        (_, Some(ws)) => {
+            return run_agent_in_vm(
+                state,
+                agent_vm,
+                prompt,
+                capabilities,
+                output_ref,
+                request_session_id,
+                ws,
+                agent_kind,
+                agent_model,
+            )
+            .await;
         }
         (false, None) => {}
     }
@@ -2199,6 +2233,237 @@ async fn run_agent<S: SecretStore + Send + Sync + 'static>(
     let write_result = {
         let notes_repo = Arc::clone(&notes_repo);
         let output_ref = output_ref.clone();
+        tokio::task::spawn_blocking(move || {
+            notes_repo.write_note(&output_ref, &run_id_seed, &envelope_bytes)
+        })
+        .await
+    };
+    let output_oid = match write_result {
+        Ok(Ok(oid)) => oid,
+        Ok(Err(err)) => {
+            return ServerMessage::Error {
+                message: format!("RunAgent: write signed-run note: {err}"),
+            };
+        }
+        Err(err) => {
+            return ServerMessage::Error {
+                message: format!("RunAgent: notes-write task failed: {err}"),
+            };
+        }
+    };
+
+    ServerMessage::RunAgentCompleted {
+        output_oid,
+        signed_metadata: metadata,
+        signature,
+    }
+}
+
+/// VM dispatch arm for [`ClientMessage::RunAgent`]: open a per-run agent
+/// VM via [`AgentVmDaemon::start_agent_run_session`], wait for the
+/// guest's outcome row to land, materialise the signed envelope from
+/// the on-disk streams, and persist it to writ's notes repo.
+///
+/// The arm is structurally distinct from the host-spawn path:
+/// * `session_id` is *minted by the VM lifecycle* (the agent VM opens
+///   its own audit session). A caller that passes `session_id: Some(_)`
+///   alongside a `workspace` bootstrap is asking for two contradictory
+///   session bindings; reject up front rather than silently ignoring
+///   one.
+/// * `agent_kind` and `agent_model` must both be present — the VM
+///   lifecycle needs them to record the agent_run row and to build the
+///   guest command. The host path tolerates them being absent because
+///   it doesn't open an audit session; the VM path cannot.
+/// * The 30-minute timeout matches bailiff's flock "30-minute hold per
+///   implement" message so the operator's mental model matches reality
+///   on both sides.
+///
+/// The envelope materialiser is pure-with-IO: no audit writes, no
+/// network. This arm assembles the surrounding context (configuration
+/// checks, prompt hashing, lifecycle start, wait, notes-repo write)
+/// and returns the same `RunAgentCompleted` wire variant the host path
+/// returns, so a verifier consumes both shapes uniformly.
+#[allow(clippy::too_many_arguments)]
+async fn run_agent_in_vm<S: SecretStore + Send + Sync + 'static>(
+    state: &Arc<BrokerState<S>>,
+    agent_vm: Option<&Arc<crate::agent_vm_daemon::AgentVmDaemon>>,
+    prompt: AgentPrompt,
+    capabilities: Vec<crate::core::CapabilitySet>,
+    output_ref: NotesRef,
+    request_session_id: Option<SessionId>,
+    workspace: crate::vm_git::AgentVmWorkspaceBootstrap,
+    agent_kind: Option<crate::core::AgentKind>,
+    agent_model: Option<String>,
+) -> ServerMessage {
+    if request_session_id.is_some() {
+        return ServerMessage::Error {
+            message: "RunAgent: VM mode mints its own audit session; \
+                      caller must not supply session_id alongside a workspace bootstrap"
+                .into(),
+        };
+    }
+
+    let Some(agent_vm) = agent_vm else {
+        return ServerMessage::Error {
+            message: "RunAgent: agent VM runtime is not configured; \
+                      the broker config needs an agent_vm.vm_http section"
+                .into(),
+        };
+    };
+    let Some(agent_kind) = agent_kind else {
+        return ServerMessage::Error {
+            message: "RunAgent: VM mode requires agent_kind".into(),
+        };
+    };
+    let Some(agent_model) = agent_model else {
+        return ServerMessage::Error {
+            message: "RunAgent: VM mode requires agent_model".into(),
+        };
+    };
+
+    let Some(notes_repo) = state.notes_repo.clone() else {
+        return run_agent_not_configured("notes_repo");
+    };
+    let Some(signing_key) = state.signing_key.clone() else {
+        return run_agent_not_configured("signing_key");
+    };
+
+    let prompt_bytes = prompt.as_bytes().to_vec();
+    let prompt_sha256_str = sha256_hex(&prompt_bytes);
+    let prompt_sha256 = Sha256Hex::try_new(prompt_sha256_str)
+        .expect("sha256_hex returns canonical 64-lowercase-hex output");
+
+    let started = match agent_vm
+        .start_agent_run_session(
+            Arc::clone(state),
+            None,
+            agent_kind,
+            agent_model,
+            workspace,
+            prompt,
+            None,
+        )
+        .await
+    {
+        Ok(s) => s,
+        Err(err) => {
+            // Start failed: the lifecycle never registered a managed
+            // VM (the `Err` arm of `start_agent_run_session` already
+            // closes the audit session on failure), so there's
+            // nothing to tear down here.
+            return ServerMessage::Error {
+                message: format!("RunAgent: start agent VM run: {err}"),
+            };
+        }
+    };
+
+    let session_id = started.session_id();
+    let run_id = started.run_id();
+
+    // After `start_agent_run_session` returns Ok, the VM is live with
+    // an open audit session and broker token. Every return path below
+    // must funnel through `stop_session` so a completed (or
+    // timed-out) run can't leave a guest holding broker authority
+    // until daemon restart. This is the trust-boundary invariant the
+    // VM design rests on: a finished run is no longer authorised.
+    let response = run_agent_in_vm_after_start(
+        &state.audit,
+        &notes_repo,
+        &signing_key,
+        session_id,
+        run_id,
+        prompt_sha256,
+        capabilities,
+        output_ref,
+    )
+    .await;
+
+    if let Err(err) = agent_vm.stop_session(state, session_id).await {
+        tracing::error!(
+            session_id = %session_id,
+            run_id = %run_id,
+            error = %err,
+            "stop agent VM session after RunAgent dispatch failed",
+        );
+        // A successful envelope is moot if the guest is still
+        // authorised: the trust boundary says "a finished RunAgent
+        // returns a guest with no live broker authority." Surface the
+        // cleanup failure as an Error so the caller can't read
+        // `RunAgentCompleted` as a clean shutdown — the signed note
+        // is still on disk for the operator to retrieve via audit,
+        // but the wire response no longer asserts a fully-torn-down
+        // run. Operator action is required: daemon reconcile (or
+        // restart) will clean up the dangling session/state.
+        return ServerMessage::Error {
+            message: format!(
+                "RunAgent: stop agent VM session {session_id} (run {run_id}) failed: {err}; \
+                 the managed VM may still hold broker authority — operator action required",
+            ),
+        };
+    }
+
+    response
+}
+
+/// Post-start half of the VM dispatch arm: wait for the guest's
+/// outcome row, materialise the signed envelope, write the note.
+///
+/// Split out so the caller can wrap every return path with a single
+/// `stop_session` cleanup — the trust-boundary invariant is that a
+/// finished `RunAgent` returns a guest with no live broker authority
+/// regardless of which step inside the dispatch arm produced the
+/// error.
+#[allow(clippy::too_many_arguments)]
+async fn run_agent_in_vm_after_start(
+    audit: &crate::audit::AuditLog,
+    notes_repo: &Arc<crate::notes_repo::NotesRepo>,
+    signing_key: &crate::signing::WritSigningKey,
+    session_id: SessionId,
+    run_id: AgentRunId,
+    prompt_sha256: Sha256Hex,
+    capabilities: Vec<crate::core::CapabilitySet>,
+    output_ref: NotesRef,
+) -> ServerMessage {
+    let outcome = match crate::agent_vm_daemon::wait_for_agent_run_outcome(
+        audit,
+        run_id,
+        RUN_AGENT_VM_TIMEOUT,
+        RUN_AGENT_VM_POLL_INTERVAL,
+    )
+    .await
+    {
+        Ok(o) => o,
+        Err(err) => {
+            return ServerMessage::Error {
+                message: format!("RunAgent: wait for agent VM outcome: {err}"),
+            };
+        }
+    };
+
+    let materialised = match crate::agent_vm_daemon::materialize_vm_signed_envelope(
+        &outcome,
+        session_id,
+        prompt_sha256,
+        capabilities,
+        signing_key,
+    )
+    .await
+    {
+        Ok(m) => m,
+        Err(err) => {
+            return ServerMessage::Error {
+                message: format!("RunAgent: materialise signed envelope: {err}"),
+            };
+        }
+    };
+
+    let run_id_seed = run_id.to_string().into_bytes();
+    let envelope_bytes = materialised.envelope_bytes;
+    let metadata = materialised.envelope.metadata;
+    let signature = materialised.envelope.signature;
+
+    let write_result = {
+        let notes_repo = Arc::clone(notes_repo);
         tokio::task::spawn_blocking(move || {
             notes_repo.write_note(&output_ref, &run_id_seed, &envelope_bytes)
         })
@@ -2909,6 +3174,8 @@ mod tests {
                     .unwrap(),
                 session_id: None,
                 workspace: None,
+                agent_kind: None,
+                agent_model: None,
             },
             &state,
         )
@@ -2950,6 +3217,8 @@ mod tests {
                     .unwrap(),
                 session_id: None,
                 workspace: None,
+                agent_kind: None,
+                agent_model: None,
             },
             &state,
         )
@@ -2964,14 +3233,17 @@ mod tests {
         );
     }
 
-    /// When `workspace` is `Some`, the broker is meant to route
-    /// through the agent-VM lifecycle. Slice VM1 stops short of
-    /// wiring that path; the placeholder surface must be a clear
-    /// `Error` rather than a panic or a silent fall-through to the
-    /// host spawn (which would defeat the whole point of the field).
-    /// Slice VM2 replaces this placeholder with the real VM dispatch.
+    /// When `workspace` is `Some`, the broker routes through the
+    /// agent-VM lifecycle. `dispatch_message` forwards `agent_vm: None`
+    /// — the runtime is not configured on this code path — so the VM
+    /// dispatch arm must surface a clear "agent VM runtime is not
+    /// configured" error rather than a panic or silent fall-through to
+    /// the host spawn (which would defeat the point of the field).
+    /// Slice VM2b wires the dispatch arm; this test pins the
+    /// unconfigured-runtime gate that protects callers from a silent
+    /// host-spawn fallback.
     #[tokio::test]
-    async fn run_agent_with_workspace_returns_vm_not_yet_wired_error() {
+    async fn run_agent_with_workspace_reports_unconfigured_vm_runtime() {
         let server = MockServer::start().await;
         let state = make_state(&server, vec![], "o");
 
@@ -2993,6 +3265,8 @@ mod tests {
                     destination: None,
                     warm: crate::vm_git::WorkspaceWarmMode::None,
                 }),
+                agent_kind: Some(crate::core::AgentKind::Claude),
+                agent_model: Some("claude-opus".into()),
             },
             &state,
         )
@@ -3002,8 +3276,8 @@ mod tests {
             panic!("expected ServerMessage::Error, got {resp:?}");
         };
         assert!(
-            message.contains("VM dispatch not yet wired"),
-            "expected placeholder VM-not-yet-wired message, got: {message}",
+            message.contains("agent VM runtime is not configured"),
+            "expected unconfigured-runtime error, got: {message}",
         );
     }
 
@@ -3080,6 +3354,8 @@ mod tests {
                 output_ref: output_ref.clone(),
                 session_id: None,
                 workspace: None,
+                agent_kind: None,
+                agent_model: None,
             },
             &state,
         )
@@ -3185,6 +3461,8 @@ mod tests {
                     .unwrap(),
                 session_id: None,
                 workspace: None,
+                agent_kind: None,
+                agent_model: None,
             },
             &state,
         )
@@ -3259,6 +3537,8 @@ mod tests {
                 output_ref: output_ref.clone(),
                 session_id: None,
                 workspace: None,
+                agent_kind: None,
+                agent_model: None,
             },
             &state,
         )
@@ -3352,6 +3632,8 @@ mod tests {
                 output_ref: output_ref.clone(),
                 session_id: None,
                 workspace: None,
+                agent_kind: None,
+                agent_model: None,
             },
             &state,
         )
@@ -3439,6 +3721,8 @@ mod tests {
                     .unwrap(),
                 session_id: Some(session_id),
                 workspace: None,
+                agent_kind: None,
+                agent_model: None,
             },
             &state,
         )
@@ -3497,6 +3781,8 @@ mod tests {
                     .unwrap(),
                 session_id: Some(bogus),
                 workspace: None,
+                agent_kind: None,
+                agent_model: None,
             },
             &state,
         )
@@ -3566,6 +3852,8 @@ mod tests {
                     .unwrap(),
                 session_id: Some(session_id),
                 workspace: None,
+                agent_kind: None,
+                agent_model: None,
             },
             &state,
         )

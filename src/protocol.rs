@@ -498,6 +498,23 @@ pub enum ClientMessage {
         /// error with the real VM dispatch.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         workspace: Option<AgentVmWorkspaceBootstrap>,
+        /// Agent kind to launch inside the VM. Required when `workspace`
+        /// is present (VM mode); ignored on the host path. The wire
+        /// shape carries the field as optional so a host-path caller
+        /// that doesn't know about VM mode can omit it. A VM-mode
+        /// request that omits the field is rejected by the dispatcher
+        /// before any state work happens — picking a default would be
+        /// a lie about which model the broker pins onto the VM's
+        /// agent-run config.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_kind: Option<AgentKind>,
+        /// Agent model identifier the broker pins onto the VM's
+        /// `/v1/agent-runs/<id>/config` response. Required alongside
+        /// `agent_kind` when `workspace` is present; ignored otherwise.
+        /// Free-form string — the broker never parses the value, just
+        /// hands it to the guest.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_model: Option<String>,
     },
 }
 
@@ -897,6 +914,8 @@ mod tests {
             output_ref: NotesRef::try_new("refs/notes/writ/agent-outputs").unwrap(),
             session_id: Some(fixed_session_id()),
             workspace: None,
+            agent_kind: None,
+            agent_model: None,
         };
         let json = serde_json::to_string(&msg).unwrap();
         let back: ClientMessage = serde_json::from_str(&json).unwrap();
@@ -918,6 +937,8 @@ mod tests {
             output_ref: NotesRef::try_new("refs/notes/writ/agent-outputs").unwrap(),
             session_id: None,
             workspace: None,
+            agent_kind: None,
+            agent_model: None,
         };
         let value: serde_json::Value = serde_json::to_value(&msg).unwrap();
         assert_eq!(value["type"], "run_agent");
@@ -951,6 +972,8 @@ mod tests {
             output_ref: NotesRef::try_new("refs/notes/writ/agent-outputs").unwrap(),
             session_id: Some(session_id),
             workspace: None,
+            agent_kind: None,
+            agent_model: None,
         };
         let value: serde_json::Value = serde_json::to_value(&msg).unwrap();
         assert_eq!(
@@ -1001,6 +1024,8 @@ mod tests {
                 destination: Some(PathBuf::from("/workspace/repo")),
                 warm: WorkspaceWarmMode::DevShell,
             }),
+            agent_kind: None,
+            agent_model: None,
         };
         let value: serde_json::Value = serde_json::to_value(&msg).unwrap();
         assert!(value.get("workspace").is_some(), "wire: {value}");
@@ -1025,6 +1050,71 @@ mod tests {
         let back: ClientMessage = serde_json::from_value(value).unwrap();
         match back {
             ClientMessage::RunAgent { workspace, .. } => assert_eq!(workspace, None),
+            other => panic!("expected RunAgent, got {other:?}"),
+        }
+    }
+
+    /// When the caller supplies `agent_kind` and `agent_model`, both
+    /// fields appear on the wire under those exact names and
+    /// round-trip byte-equal. Slice VM2b adds the pair so VM-mode
+    /// `RunAgent` callers can pick the model the broker pins onto the
+    /// VM's `/v1/agent-runs/<id>/config` response — the host path
+    /// ignores both fields, but the wire shape carries them
+    /// regardless so a single decoder serves both modes.
+    #[test]
+    fn run_agent_roundtrips_with_agent_kind_and_model() {
+        let msg = ClientMessage::RunAgent {
+            prompt: AgentPrompt::new("implement on vm"),
+            capabilities: vec![CapabilitySet::WorkspaceWrite {
+                repo: sample_repo(),
+            }],
+            purpose: "implement-stage".into(),
+            output_ref: NotesRef::try_new("refs/notes/writ/agent-outputs").unwrap(),
+            session_id: None,
+            workspace: Some(AgentVmWorkspaceBootstrap {
+                repo: sample_clone_repo(),
+                destination: Some(PathBuf::from("/workspace/repo")),
+                warm: WorkspaceWarmMode::DevShell,
+            }),
+            agent_kind: Some(AgentKind::Claude),
+            agent_model: Some("claude-opus-4-7".into()),
+        };
+        let value: serde_json::Value = serde_json::to_value(&msg).unwrap();
+        assert_eq!(
+            value["agent_kind"],
+            serde_json::Value::String("claude".into())
+        );
+        assert_eq!(
+            value["agent_model"],
+            serde_json::Value::String("claude-opus-4-7".into()),
+        );
+        let back: ClientMessage = serde_json::from_value(value).unwrap();
+        assert_eq!(back, msg);
+    }
+
+    /// A wire payload that omits `agent_kind` / `agent_model` decodes
+    /// with both fields as `None` — preserves backward compatibility
+    /// with the pre-VM2b wire shape (a host-path `WorkspaceRead`
+    /// caller, e.g. `bailiff plan submit`, never supplies them).
+    #[test]
+    fn run_agent_accepts_payload_without_agent_kind_or_model() {
+        let value = serde_json::json!({
+            "type": "run_agent",
+            "prompt": "p",
+            "capabilities": [],
+            "purpose": "legacy",
+            "output_ref": "refs/notes/writ/agent-outputs",
+        });
+        let back: ClientMessage = serde_json::from_value(value).unwrap();
+        match back {
+            ClientMessage::RunAgent {
+                agent_kind,
+                agent_model,
+                ..
+            } => {
+                assert_eq!(agent_kind, None);
+                assert_eq!(agent_model, None);
+            }
             other => panic!("expected RunAgent, got {other:?}"),
         }
     }
@@ -2178,6 +2268,8 @@ mod tests {
                 output_ref: NotesRef::try_new("refs/notes/writ/agent-outputs").unwrap(),
                 session_id: Some(fixed_session_id()),
                 workspace: None,
+                agent_kind: None,
+                agent_model: None,
             },
             11 => ClientMessage::ApproveStagedPush {
                 request_id: "12345678-1234-1234-1234-123456789012".parse().unwrap(),
