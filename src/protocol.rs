@@ -12,7 +12,7 @@
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::agent_plan::{CorrelationId, PlanId, Stage};
+use crate::agent_plan::CorrelationId;
 use crate::agent_run::{AgentPrompt, AgentRunId};
 use crate::agent_vm_lifecycle::AgentVmSessionStateStatus;
 use crate::audit::GitPushOutcomeResult;
@@ -303,7 +303,8 @@ pub enum ClientMessage {
     },
     /// Start a product-level agent run in a daemon-managed VM. The prompt is
     /// carried as protocol data and must not be copied into guest argv or
-    /// lifecycle state.
+    /// lifecycle state. The broker delivers it verbatim over the brokered
+    /// prompt channel; no further composition happens guest-side.
     StartAgentRun {
         /// Human-readable description stored in the audit log.
         #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -320,22 +321,12 @@ pub enum ClientMessage {
         /// Prompt to deliver to the guest agent over the brokered prompt
         /// channel. Debug output redacts this value.
         prompt: AgentPrompt,
-        /// Role of this run in the plan/review/execute pipeline. Stored
-        /// on the `agent_run.stage` audit column and used by the VM HTTP
-        /// plan routes for per-stage authorisation.
-        stage: Stage,
         /// Opaque caller-supplied identifier joining this run to a
         /// wider task (per `docs/plans/2026-05-11-agent-plans.md`).
         /// Stored verbatim on the `agent_run` audit row; the broker
         /// never interprets it.
         #[serde(skip_serializing_if = "Option::is_none", default)]
         correlation_id: Option<CorrelationId>,
-        /// Plan this run is bound to read (and act on). Required by
-        /// the VM HTTP plan routes that gate review and execute runs
-        /// on `agent_run.read_plan_id`. `None` for planner runs and
-        /// for legacy execute runs that pre-date the plan pipeline.
-        #[serde(skip_serializing_if = "Option::is_none", default)]
-        read_plan_id: Option<PlanId>,
     },
     /// Stop a daemon-managed agent VM session and close its audit session.
     StopAgentVm { session_id: SessionId },
@@ -834,90 +825,14 @@ mod tests {
                 warm: WorkspaceWarmMode::Sources,
             },
             prompt: AgentPrompt::new("fix the failing test"),
-            stage: Stage::Execute,
             correlation_id: None,
-            read_plan_id: None,
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert_eq!(serde_json::from_str::<ClientMessage>(&json).unwrap(), msg);
         assert!(json.contains("fix the failing test"));
-        // The optional fields are elided when None so older clients/servers
-        // that predate them can still parse the message.
+        // The optional correlation_id is elided when None so older
+        // clients/servers that predate it can still parse the message.
         assert!(!json.contains("correlation_id"));
-        assert!(!json.contains("read_plan_id"));
-    }
-
-    #[test]
-    fn start_agent_run_serialises_stage_for_every_variant() {
-        for stage in [Stage::Plan, Stage::Review, Stage::Execute] {
-            let msg = ClientMessage::StartAgentRun {
-                label: None,
-                agent_kind: AgentKind::Claude,
-                agent_model: "claude-test".into(),
-                workspace: AgentVmWorkspaceBootstrap {
-                    repo: sample_clone_repo(),
-                    destination: None,
-                    warm: WorkspaceWarmMode::None,
-                },
-                prompt: AgentPrompt::new("p"),
-                stage,
-                correlation_id: None,
-                read_plan_id: None,
-            };
-            let json = serde_json::to_string(&msg).unwrap();
-            let value: serde_json::Value = serde_json::from_str(&json).unwrap();
-            assert_eq!(value["stage"], stage.as_str(), "wire bytes: {json}");
-            let back: ClientMessage = serde_json::from_str(&json).unwrap();
-            assert_eq!(back, msg);
-        }
-    }
-
-    /// `stage` is required on the wire — omitting it is a parse error,
-    /// not a silent default to `execute`. The audit log can only hold
-    /// one of the three legal stages, so the broker should reject
-    /// stageless messages rather than fall back to a guess.
-    #[test]
-    fn start_agent_run_rejects_missing_stage() {
-        let mut value = serde_json::json!({
-            "type": "start_agent_run",
-            "agent_kind": "claude",
-            "agent_model": "claude-test",
-            "workspace": {
-                "repo": "owner/repo",
-                "warm": "none",
-            },
-            "prompt": "p",
-            "stage": "execute",
-        });
-        // Sanity check: with `stage` present, the message parses.
-        assert!(serde_json::from_value::<ClientMessage>(value.clone()).is_ok());
-        value.as_object_mut().unwrap().remove("stage");
-        let err = serde_json::from_value::<ClientMessage>(value).unwrap_err();
-        assert!(
-            err.to_string().contains("stage"),
-            "expected missing-stage error, got: {err}",
-        );
-    }
-
-    #[test]
-    fn start_agent_run_rejects_unknown_stage() {
-        let value = serde_json::json!({
-            "type": "start_agent_run",
-            "agent_kind": "claude",
-            "agent_model": "claude-test",
-            "workspace": {
-                "repo": "owner/repo",
-                "warm": "none",
-            },
-            "prompt": "p",
-            "stage": "planner",
-        });
-        let err = serde_json::from_value::<ClientMessage>(value).unwrap_err();
-        assert!(
-            err.to_string().contains("planner")
-                || err.to_string().to_lowercase().contains("variant"),
-            "expected unknown-stage error, got: {err}",
-        );
     }
 
     #[test]
@@ -932,70 +847,11 @@ mod tests {
                 warm: WorkspaceWarmMode::None,
             },
             prompt: AgentPrompt::new("p"),
-            stage: Stage::Execute,
             correlation_id: Some(CorrelationId::try_new("feat-42_xyz").unwrap()),
-            read_plan_id: None,
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert_eq!(serde_json::from_str::<ClientMessage>(&json).unwrap(), msg);
         assert!(json.contains("feat-42_xyz"));
-    }
-
-    /// `read_plan_id` round-trips on the wire when present, and is
-    /// elided when absent (so older deserialisers still parse the
-    /// message). The field is the per-stage authorisation handle
-    /// for the VM HTTP plan-read route; the broker writes whatever
-    /// value the message carries straight onto the
-    /// `agent_run.read_plan_id` audit column.
-    #[test]
-    fn start_agent_run_roundtrips_with_read_plan_id() {
-        let plan_id = sample_plan_id();
-        let msg = ClientMessage::StartAgentRun {
-            label: None,
-            agent_kind: AgentKind::Claude,
-            agent_model: "claude-test".into(),
-            workspace: AgentVmWorkspaceBootstrap {
-                repo: sample_clone_repo(),
-                destination: None,
-                warm: WorkspaceWarmMode::None,
-            },
-            prompt: AgentPrompt::new("p"),
-            stage: Stage::Execute,
-            correlation_id: None,
-            read_plan_id: Some(plan_id),
-        };
-        let json = serde_json::to_string(&msg).unwrap();
-        assert_eq!(serde_json::from_str::<ClientMessage>(&json).unwrap(), msg);
-        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(
-            value["read_plan_id"],
-            serde_json::Value::String(plan_id.as_uuid().to_string()),
-        );
-    }
-
-    /// A garbage `read_plan_id` must be rejected at the protocol
-    /// boundary; the audit-log CHECK should never be the line of
-    /// defence. `PlanId` parses through `Uuid::from_str`, so any
-    /// non-UUID payload is a deserialise error.
-    #[test]
-    fn start_agent_run_rejects_malformed_read_plan_id() {
-        let value = serde_json::json!({
-            "type": "start_agent_run",
-            "agent_kind": "claude",
-            "agent_model": "claude-test",
-            "workspace": {
-                "repo": "owner/repo",
-                "warm": "none",
-            },
-            "prompt": "p",
-            "stage": "execute",
-            "read_plan_id": "not-a-uuid",
-        });
-        let err = serde_json::from_value::<ClientMessage>(value).unwrap_err();
-        assert!(
-            err.to_string().to_lowercase().contains("uuid"),
-            "expected uuid-parse error, got: {err}",
-        );
     }
 
     #[test]
@@ -1408,10 +1264,6 @@ mod tests {
 
     fn sample_request_id() -> RequestId {
         "f0f0f0f0-0000-0000-0000-000000000001".parse().unwrap()
-    }
-
-    fn sample_plan_id() -> PlanId {
-        "f1f1f1f1-0000-0000-0000-000000000001".parse().unwrap()
     }
 
     fn sample_agent_run_id() -> AgentRunId {
@@ -2039,13 +1891,10 @@ mod tests {
                 warm: WorkspaceWarmMode::None,
             },
             prompt: AgentPrompt::new("secret prompt"),
-            stage: Stage::Execute,
             correlation_id: None,
-            read_plan_id: None,
         })
         .unwrap();
         assert_eq!(run["type"], "start_agent_run");
-        assert_eq!(run["stage"], "execute");
 
         let run_started: serde_json::Value = serde_json::to_value(ServerMessage::AgentRunStarted {
             session_id: fixed_session_id(),
@@ -2120,9 +1969,7 @@ mod tests {
                 warm: WorkspaceWarmMode::None,
             },
             prompt: AgentPrompt::new("SECRET prompt"),
-            stage: Stage::Execute,
             correlation_id: None,
-            read_plan_id: None,
         };
 
         let debug = format!("{msg:?}");
@@ -2176,7 +2023,7 @@ mod tests {
             const KNOWN_FIELDS: &[&str] = &[
                 "type", "label", "agent_kind", "agent_model", "workspace",
                 "guest_command", "session_id", "capability", "prompt",
-                "stage", "correlation_id", "read_plan_id",
+                "correlation_id",
                 "request_id", "reason", "operator",
                 "outcome",
                 "capabilities", "purpose", "output_ref",
@@ -2233,9 +2080,7 @@ mod tests {
                     warm: WorkspaceWarmMode::None,
                 },
                 prompt: AgentPrompt::new("p"),
-                stage: Stage::Plan,
                 correlation_id: None,
-                read_plan_id: None,
             },
             5 => ClientMessage::StopAgentVm {
                 session_id: fixed_session_id(),

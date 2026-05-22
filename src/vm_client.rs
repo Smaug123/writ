@@ -13,7 +13,7 @@ use std::process::{Command, ExitStatus, Stdio};
 
 use reqwest::Url;
 
-use crate::agent_plan::{PlanId, PlanView, Stage, vm_plan_path};
+use crate::agent_plan::{PlanId, PlanView, vm_plan_path};
 use crate::agent_run::{
     AgentPrompt, AgentRunId, AgentRunOutcome, AgentRunStreamSummary, AgentRunStreamUpload,
     VmAgentRunConfigResponse, VmAgentRunOutcomeUpload, vm_agent_run_config_path,
@@ -428,7 +428,7 @@ pub async fn get_session_json(config: &VmClientConfig) -> Result<serde_json::Val
 pub async fn fetch_agent_run_config(
     config: &VmClientConfig,
     run_id: AgentRunId,
-) -> Result<(AgentPrompt, String, Stage, Option<PlanId>), VmClientError> {
+) -> Result<(AgentPrompt, String), VmClientError> {
     let response = reqwest::Client::new()
         .get(config.endpoint(&vm_agent_run_config_path(run_id)))
         .bearer_auth(config.bearer_token().as_str())
@@ -443,16 +443,11 @@ pub async fn fetch_agent_run_config(
         .map_err(VmClientError::from)
 }
 
-/// Fetch a plan view from the host broker. Used by the implementer
-/// VM wrapper to compose the originating prompt with the approved
-/// plan body before invoking the LLM (see
-/// [`crate::bailiff::compose_effective_prompt`]).
-///
-/// Authorisation happens host-side: the broker checks that the
-/// calling session's agent_run has `read_plan_id = <plan_id>` and
-/// that the stage gate is satisfied. If the wrapper's run was not
-/// bound to this plan, the broker returns 401/403 and this function
-/// surfaces a `VmClientError::BrokerHttp`.
+/// Fetch a plan view from the host broker. Orphan-pub: the live caller
+/// (`writ-vm`'s legacy plan dispatch) was removed in slice G2's
+/// follow-up; the route handler at `/v1/plans/<id>` is gone after
+/// G2 too. Kept for one more slice so the G3 deletion of the
+/// related compose helpers in `src/bailiff.rs` lands cleanly.
 pub async fn fetch_plan(
     config: &VmClientConfig,
     plan_id: PlanId,
@@ -1692,26 +1687,21 @@ mod tests {
     async fn fetch_agent_run_config_gets_one_run_config_with_bearer_token() {
         let run_id: AgentRunId = "00000000-0000-0000-0000-000000000501".parse().unwrap();
         let prompt = AgentPrompt::new("SECRET prompt");
-        let plan_id: PlanId = "00000000-0000-0000-0000-000000000b01".parse().unwrap();
         let body = serde_json::to_vec(&VmAgentRunConfigResponse::new(
             run_id,
             prompt.clone(),
             "gpt-5.4-mini",
-            Stage::Execute,
-            Some(plan_id),
         ))
         .unwrap();
         let (broker_url, captured) =
             serve_once(http_response("200 OK", "application/json", &body)).await;
         let config = VmClientConfig::new(broker_url, "writ-vm-secret").unwrap();
 
-        let (fetched_prompt, fetched_model, fetched_stage, fetched_plan_id) =
+        let (fetched_prompt, fetched_model) =
             fetch_agent_run_config(&config, run_id).await.unwrap();
 
         assert_eq!(fetched_prompt, prompt);
         assert_eq!(fetched_model, "gpt-5.4-mini");
-        assert_eq!(fetched_stage, Stage::Execute);
-        assert_eq!(fetched_plan_id, Some(plan_id));
         let request = captured.lock().unwrap().clone();
         assert!(
             request.starts_with(

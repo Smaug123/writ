@@ -8,7 +8,6 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use crate::agent_plan::{PlanId, Stage};
 use crate::agent_run::{
     AgentPrompt, AgentRunId, AgentRunOutcome, AgentRunStreamSummary, AgentRunStreamUpload,
     VM_AGENT_RUN_OUTCOME_PATH_SUFFIX, VM_AGENT_RUN_PATH_PREFIX, VmAgentRunConfigResponse,
@@ -54,8 +53,6 @@ impl<S: SecretStore> Clone for VmHttpAgentRunService<S> {
 struct AgentRunInflight {
     prompt: AgentPrompt,
     model: String,
-    stage: Stage,
-    read_plan_id: Option<PlanId>,
 }
 
 impl<S: SecretStore> VmHttpAgentRunService<S> {
@@ -72,8 +69,6 @@ impl<S: SecretStore> VmHttpAgentRunService<S> {
         run_id: AgentRunId,
         prompt: AgentPrompt,
         model: impl Into<String>,
-        stage: Stage,
-        read_plan_id: Option<PlanId>,
     ) {
         self.run_configs
             .lock()
@@ -83,8 +78,6 @@ impl<S: SecretStore> VmHttpAgentRunService<S> {
                 AgentRunInflight {
                     prompt,
                     model: model.into(),
-                    stage,
-                    read_plan_id,
                 },
             );
     }
@@ -136,13 +129,7 @@ pub(super) fn route_agent_run_config_request<S: SecretStore>(
     };
     VmHttpResponse::json(
         VmHttpStatus::Ok,
-        &VmAgentRunConfigResponse::new(
-            run_id,
-            inflight.prompt,
-            inflight.model,
-            inflight.stage,
-            inflight.read_plan_id,
-        ),
+        &VmAgentRunConfigResponse::new(run_id, inflight.prompt, inflight.model),
     )
 }
 
@@ -391,14 +378,7 @@ mod tests {
         let service = VmHttpAgentRunService::new(state, temp.path().join("agent-runs"));
         let run_id: AgentRunId = "00000000-0000-0000-0000-000000000401".parse().unwrap();
         let prompt = AgentPrompt::new("SECRET prompt");
-        let plan_id: PlanId = "00000000-0000-0000-0000-000000000a01".parse().unwrap();
-        service.insert_run_config(
-            run_id,
-            prompt.clone(),
-            "gpt-5.4-mini",
-            Stage::Execute,
-            Some(plan_id),
-        );
+        service.insert_run_config(run_id, prompt.clone(), "gpt-5.4-mini");
 
         let response = route_agent_run_config_request(run_id, &service);
 
@@ -407,34 +387,11 @@ mod tests {
         assert_eq!(body.run_id(), run_id);
         assert_eq!(body.prompt(), &prompt);
         assert_eq!(body.model(), "gpt-5.4-mini");
-        assert_eq!(body.stage(), Stage::Execute);
-        assert_eq!(body.read_plan_id(), Some(plan_id));
         let debug = format!("{body:?}");
         assert!(!debug.contains(prompt.as_str()), "{debug}");
 
         let second = route_agent_run_config_request(run_id, &service);
         assert_eq!(second.status, VmHttpStatus::NotFound);
-    }
-
-    #[tokio::test]
-    async fn agent_run_config_route_serializes_null_plan_id_when_absent() {
-        let github = MockServer::start().await;
-        let state = make_broker_state(&github);
-        let temp = tempfile::tempdir().unwrap();
-        let service = VmHttpAgentRunService::new(state, temp.path().join("agent-runs"));
-        let run_id: AgentRunId = "00000000-0000-0000-0000-000000000404".parse().unwrap();
-        let prompt = AgentPrompt::new("plain prompt");
-        service.insert_run_config(run_id, prompt.clone(), "gpt-5.4-mini", Stage::Execute, None);
-
-        let response = route_agent_run_config_request(run_id, &service);
-
-        assert_eq!(response.status, VmHttpStatus::Ok);
-        let raw: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
-        assert_eq!(raw["stage"], "execute");
-        // `read_plan_id` is explicit `null` on the wire, not a missing key,
-        // so callers can distinguish "no binding" from "wrong schema".
-        assert!(raw.get("read_plan_id").is_some(), "{raw}");
-        assert!(raw["read_plan_id"].is_null(), "{raw}");
     }
 
     #[tokio::test]

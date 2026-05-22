@@ -20,13 +20,13 @@ use std::path::{Path, PathBuf};
 
 use clap::{ArgGroup, Parser, Subcommand, ValueEnum};
 
-use writ::agent_plan::{CorrelationId, PlanId, Stage};
+use writ::agent_plan::CorrelationId;
 use writ::agent_run::AgentPrompt;
 use writ::cli::identity::{capture_operator_identity, resolve_reconcile_outcome};
 use writ::cli::output::{
     write_agent_vm_sessions, write_staged_push_detail, write_staged_push_summaries,
 };
-use writ::cli::parse::{parse_agent_kind, parse_correlation_id, parse_plan_id, parse_stage};
+use writ::cli::parse::{parse_agent_kind, parse_correlation_id};
 use writ::cli::workspace::{
     GuestSystem, build_workspace_bootstrap, build_workspace_bootstrap_from_repo,
     default_guest_system, guest_image_attr,
@@ -208,23 +208,11 @@ enum AgentCmd {
         /// Workspace warmup level to complete before starting the agent.
         #[arg(long, value_enum, default_value = "devshell")]
         warm: WorkspaceWarmArg,
-        /// Role of this run in the plan/review/execute pipeline. The
-        /// broker stamps it on the `agent_run.stage` audit column and
-        /// the VM HTTP plan routes use it for per-stage authorisation.
-        /// Defaults to `execute`, the historical (pre-pipeline) shape.
-        #[arg(long, value_parser = parse_stage, default_value = "execute")]
-        stage: Stage,
         /// Opaque caller-supplied id that ties this run to a wider
         /// task. Validated only as a safe id (`[A-Za-z0-9_-]`, 1..=64
         /// bytes); the broker never interprets the contents.
         #[arg(long, value_parser = parse_correlation_id)]
         correlation_id: Option<CorrelationId>,
-        /// Plan this run is bound to read. Required for `--stage
-        /// review` and for `--stage execute` runs that implement an
-        /// accepted plan. Stamped on the `agent_run.read_plan_id`
-        /// audit column and enforced by the VM HTTP plan-read route.
-        #[arg(long, value_parser = parse_plan_id)]
-        read_plan: Option<PlanId>,
     },
 }
 
@@ -460,9 +448,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 model,
                 workspace,
                 warm,
-                stage,
                 correlation_id,
-                read_plan,
             } => {
                 let warm_mode = warm.into();
                 let workspace = build_workspace_bootstrap_from_repo(repo, workspace, warm_mode)?;
@@ -473,9 +459,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     model,
                     workspace,
                     AgentPrompt::try_new(prompt)?,
-                    stage,
                     correlation_id,
-                    read_plan,
                 )?;
             }
         },
@@ -631,7 +615,6 @@ fn start_agent_vm(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn start_agent_run(
     socket_path: &Path,
     label: Option<String>,
@@ -639,9 +622,7 @@ fn start_agent_run(
     agent_model: String,
     workspace: AgentVmWorkspaceBootstrap,
     prompt: AgentPrompt,
-    stage: Stage,
     correlation_id: Option<CorrelationId>,
-    read_plan_id: Option<PlanId>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let msg = ClientMessage::StartAgentRun {
         label,
@@ -649,9 +630,7 @@ fn start_agent_run(
         agent_model,
         workspace,
         prompt,
-        stage,
         correlation_id,
-        read_plan_id,
     };
     match call_with_timeout(socket_path, &msg, AGENT_VM_WORKSPACE_CALL_TIMEOUT)? {
         ServerMessage::AgentRunStarted {
@@ -866,9 +845,7 @@ mod tests {
                         prompt,
                         model,
                         warm,
-                        stage,
                         correlation_id,
-                        read_plan,
                         ..
                     },
             } => {
@@ -877,99 +854,10 @@ mod tests {
                 assert_eq!(prompt, "fix the failing test");
                 assert_eq!(model, "claude-test");
                 assert_eq!(warm, WorkspaceWarmArg::Sources);
-                assert_eq!(stage, Stage::Execute);
                 assert!(correlation_id.is_none());
-                assert!(read_plan.is_none());
             }
             _ => panic!("unexpected command"),
         }
-    }
-
-    #[test]
-    fn agent_run_cli_defaults_stage_to_execute() {
-        let args = Args::try_parse_from([
-            "writ",
-            "agent",
-            "run",
-            "--repo",
-            "owner/repo",
-            "--agent",
-            "claude",
-            "--model",
-            "claude-test",
-            "--prompt",
-            "p",
-        ])
-        .unwrap();
-        match args.cmd {
-            Cmd::Agent {
-                action: AgentCmd::Run { stage, .. },
-            } => assert_eq!(stage, Stage::Execute),
-            _ => panic!("unexpected command"),
-        }
-    }
-
-    #[test]
-    fn agent_run_cli_accepts_stage_flag_for_every_stage() {
-        for (raw, expected) in [
-            ("plan", Stage::Plan),
-            ("review", Stage::Review),
-            ("execute", Stage::Execute),
-        ] {
-            let args = Args::try_parse_from([
-                "writ",
-                "agent",
-                "run",
-                "--repo",
-                "owner/repo",
-                "--agent",
-                "claude",
-                "--model",
-                "claude-test",
-                "--prompt",
-                "p",
-                "--stage",
-                raw,
-            ])
-            .unwrap();
-            match args.cmd {
-                Cmd::Agent {
-                    action: AgentCmd::Run { stage, .. },
-                } => assert_eq!(stage, expected, "raw {raw}"),
-                _ => panic!("unexpected command"),
-            }
-        }
-    }
-
-    /// Malformed stages must fail at clap rather than reach the broker,
-    /// so the audit-log CHECK is never the line of defence. The
-    /// `Stage::from_str` test in `agent_plan` already covers the
-    /// character class; here we only verify the CLI surfaces the
-    /// rejection on the `--stage` flag.
-    #[test]
-    fn agent_run_cli_rejects_unknown_stage() {
-        let err = match Args::try_parse_from([
-            "writ",
-            "agent",
-            "run",
-            "--repo",
-            "owner/repo",
-            "--agent",
-            "claude",
-            "--model",
-            "claude-test",
-            "--prompt",
-            "p",
-            "--stage",
-            "planner",
-        ]) {
-            Ok(_) => panic!("expected clap to reject malformed --stage"),
-            Err(error) => error,
-        };
-        assert!(
-            err.to_string().contains("--stage"),
-            "unexpected clap error: {err}",
-        );
     }
 
     #[test]
@@ -1030,74 +918,6 @@ mod tests {
         assert!(
             err.to_string().contains("--correlation-id"),
             "unexpected clap error: {err}"
-        );
-    }
-
-    /// `--read-plan` is the CLI surface for the
-    /// `agent_run.read_plan_id` audit column and the VM HTTP
-    /// plan-read authorisation gate; the parser must accept a
-    /// well-formed UUID and surface it as `Some` on the parsed
-    /// command.
-    #[test]
-    fn agent_run_cli_accepts_read_plan_flag() {
-        let plan_uuid = "f1f1f1f1-0000-0000-0000-000000000001";
-        let args = Args::try_parse_from([
-            "writ",
-            "agent",
-            "run",
-            "--repo",
-            "owner/repo",
-            "--agent",
-            "claude",
-            "--model",
-            "claude-test",
-            "--prompt",
-            "implement plan",
-            "--stage",
-            "execute",
-            "--read-plan",
-            plan_uuid,
-        ])
-        .unwrap();
-
-        match args.cmd {
-            Cmd::Agent {
-                action: AgentCmd::Run { read_plan, .. },
-            } => {
-                let id = read_plan.expect("--read-plan should parse");
-                assert_eq!(id.as_uuid().to_string(), plan_uuid);
-            }
-            _ => panic!("unexpected command"),
-        }
-    }
-
-    /// `parse_plan_id` runs the same `PlanId::from_str` (UUID parse)
-    /// that the audit DAO uses, so any non-UUID payload is a clap
-    /// error rather than a broker rejection — the parse-don't-
-    /// validate boundary lives at the CLI.
-    #[test]
-    fn agent_run_cli_rejects_malformed_read_plan() {
-        let err = match Args::try_parse_from([
-            "writ",
-            "agent",
-            "run",
-            "--repo",
-            "owner/repo",
-            "--agent",
-            "claude",
-            "--model",
-            "claude-test",
-            "--prompt",
-            "p",
-            "--read-plan",
-            "not-a-uuid",
-        ]) {
-            Ok(_) => panic!("expected clap to reject malformed --read-plan"),
-            Err(error) => error,
-        };
-        assert!(
-            err.to_string().contains("--read-plan"),
-            "unexpected clap error: {err}",
         );
     }
 
@@ -1162,9 +982,7 @@ mod tests {
             agent_model: "claude-test".into(),
             workspace,
             prompt: AgentPrompt::try_new("SECRET prompt").unwrap(),
-            stage: Stage::Execute,
             correlation_id: None,
-            read_plan_id: None,
         };
 
         let debug = format!("{msg:?}");

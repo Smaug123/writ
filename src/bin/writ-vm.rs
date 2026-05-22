@@ -5,14 +5,19 @@
 //! environment variables and exposes narrow VM-safe operations without ever
 //! handling host-side GitHub credentials.
 
-use std::path::PathBuf;
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
 
+use writ::agent_run::{
+    AgentProcessPlan, AgentPrompt, AgentRunId, AgentRunTerminalStatus, run_agent_process,
+};
+use writ::core::AgentKind;
 use writ::vm_client::{
     VM_BROKER_TOKEN_ENV, VM_BROKER_URL_ENV, VmClientConfig, VmClientConfigError, VmGitCloneCommand,
-    VmGitPushCommand, VmWorkspaceInitCommand, clone_from_broker, get_session_json,
-    init_workspace_from_broker, push_to_broker,
+    VmGitPushCommand, VmWorkspaceInitCommand, clone_from_broker, fetch_agent_run_config,
+    get_session_json, init_workspace_from_broker, push_to_broker, upload_agent_run_outcome,
 };
 use writ::vm_git::{GitBranchName, GitCloneRef, GitCloneRepo, GitObjectId, WorkspaceWarmMode};
 
@@ -42,6 +47,11 @@ enum Cmd {
     Workspace {
         #[command(subcommand)]
         action: WorkspaceCmd,
+    },
+    /// Agent runtime operations.
+    Agent {
+        #[command(subcommand)]
+        action: AgentCmd,
     },
 }
 
@@ -113,6 +123,22 @@ enum WorkspaceCmd {
         /// Nix executable inside the guest.
         #[arg(long, default_value = "nix")]
         nix: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+enum AgentCmd {
+    /// Fetch the brokered prompt and run the agent adapter.
+    Run {
+        /// Agent run UUID assigned by the host daemon.
+        #[arg(long)]
+        run_id: String,
+        /// Session agent identity.
+        #[arg(long, value_parser = parse_agent_kind)]
+        agent: AgentKind,
+        /// Test-only external fake adapter. The prompt is written to stdin.
+        #[arg(long, hide = true)]
+        fake_agent: Option<PathBuf>,
     },
 }
 
@@ -202,6 +228,25 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 println!("{}", destination.display());
             }
         },
+        Cmd::Agent { action } => match action {
+            AgentCmd::Run {
+                run_id,
+                agent,
+                fake_agent,
+            } => {
+                let run_id = parse_agent_run_id(&run_id)?;
+                let (prompt, model) = fetch_agent_run_config(&config, run_id).await?;
+                run_stage_agent(
+                    agent,
+                    run_id,
+                    &prompt,
+                    &model,
+                    &config,
+                    fake_agent.as_deref(),
+                )
+                .await?;
+            }
+        },
     }
     Ok(())
 }
@@ -236,6 +281,161 @@ fn parse_branch(raw: &str) -> Result<GitBranchName, Box<dyn std::error::Error>> 
 fn parse_object_id(raw: &str) -> Result<GitObjectId, Box<dyn std::error::Error>> {
     raw.parse()
         .map_err(|error| format!("invalid Git object id {raw:?}: {error}").into())
+}
+
+fn parse_agent_kind(raw: &str) -> Result<AgentKind, String> {
+    raw.parse::<AgentKind>().map_err(|error| error.to_string())
+}
+
+fn parse_agent_run_id(raw: &str) -> Result<AgentRunId, Box<dyn std::error::Error>> {
+    raw.parse()
+        .map_err(|error| format!("invalid agent run ID {raw:?}: {error}").into())
+}
+
+async fn run_stage_agent(
+    agent: AgentKind,
+    run_id: AgentRunId,
+    prompt: &AgentPrompt,
+    model: &str,
+    config: &VmClientConfig,
+    fake_agent: Option<&Path>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let plan = match fake_agent {
+        Some(program) => fake_agent_plan(agent, run_id, program)?,
+        None => agent_process_plan(agent, run_id, model, config)?,
+    };
+    let log_root = std::env::temp_dir().join("writ-vm-agent-runs");
+    let outcome = run_agent_process(&plan, prompt, &log_root)?;
+    let agent_failed = outcome.status != AgentRunTerminalStatus::Succeeded;
+    let exit_code = outcome.exit_code;
+    upload_agent_run_outcome(config, &outcome).await?;
+    if agent_failed {
+        return Err(format!("agent exited with status code {exit_code}").into());
+    }
+    Ok(())
+}
+
+fn fake_agent_plan(
+    agent: AgentKind,
+    run_id: AgentRunId,
+    program: &Path,
+) -> Result<AgentProcessPlan, Box<dyn std::error::Error>> {
+    Ok(AgentProcessPlan::new(run_id, program, [] as [OsString; 0])?
+        .with_env_remove(VM_BROKER_URL_ENV)
+        .with_env_remove(VM_BROKER_TOKEN_ENV)
+        .with_env("WRIT_AGENT_KIND", agent.as_str()))
+}
+
+fn agent_process_plan(
+    agent: AgentKind,
+    run_id: AgentRunId,
+    model: &str,
+    config: &VmClientConfig,
+) -> Result<AgentProcessPlan, Box<dyn std::error::Error>> {
+    match agent {
+        AgentKind::Claude => claude_process_plan(run_id, model, config),
+        AgentKind::Codex => codex_process_plan(run_id, model, config),
+    }
+}
+
+fn claude_process_plan(
+    run_id: AgentRunId,
+    model: &str,
+    config: &VmClientConfig,
+) -> Result<AgentProcessPlan, Box<dyn std::error::Error>> {
+    let claude_config_dir = std::env::temp_dir().join("writ-vm-claude-code");
+    std::fs::create_dir_all(&claude_config_dir)?;
+    Ok(AgentProcessPlan::new(
+        run_id,
+        "claude",
+        [
+            OsString::from("--bare"),
+            OsString::from("--print"),
+            OsString::from("--model"),
+            OsString::from(model),
+            OsString::from("--effort"),
+            OsString::from("low"),
+            OsString::from("--output-format"),
+            OsString::from("text"),
+            OsString::from("--no-session-persistence"),
+            OsString::from("--tools"),
+            OsString::from(""),
+        ],
+    )?
+    .with_env_remove(VM_BROKER_URL_ENV)
+    .with_env_remove(VM_BROKER_TOKEN_ENV)
+    .with_env_remove("ANTHROPIC_API_KEY")
+    .with_env_remove("CLAUDE_CODE_OAUTH_TOKEN")
+    .with_env("ANTHROPIC_BASE_URL", config.broker_url().as_str())
+    .with_env("ANTHROPIC_AUTH_TOKEN", config.bearer_token().as_str())
+    .with_env("CLAUDE_CONFIG_DIR", claude_config_dir.as_os_str())
+    .with_env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
+    // The guest image installs the upstream claude binary directly, without
+    // the nixpkgs wrapper that normally pins these. The VM has no outbound
+    // network beyond the broker, so any auto-update or install check just
+    // wastes time blocking on a connection it cannot make.
+    .with_env("DISABLE_AUTOUPDATER", "1")
+    .with_env("DISABLE_INSTALLATION_CHECKS", "1"))
+}
+
+fn codex_process_plan(
+    run_id: AgentRunId,
+    model: &str,
+    config: &VmClientConfig,
+) -> Result<AgentProcessPlan, Box<dyn std::error::Error>> {
+    // Configure codex to treat the broker as an API-key-style provider:
+    // `env_key="OPENAI_API_KEY"` makes codex read the broker bearer from
+    // the env and send it as `Authorization: Bearer …`. The broker
+    // performs the real ChatGPT-OAuth swap on the host side
+    // (`Authorization`, `ChatGPT-Account-ID`, `X-OpenAI-Fedramp` are all
+    // injected upstream by `VmHttpOpenAiProxyService`). Inside the VM
+    // codex never goes down the ChatGPT-auth path and never tries to
+    // refresh against `auth.openai.com` (which we couldn't reach
+    // anyway).
+    //
+    // We set `supports_websockets=false` because the broker exposes
+    // HTTP only; letting codex try wss:// first just wastes ~50s on
+    // retries.
+    let openai_base_url = format!("{}v1", config.broker_url().as_str());
+    let provider_name_arg = "model_providers.writ-broker.name=\"writ broker\"";
+    let provider_base_url_arg =
+        format!("model_providers.writ-broker.base_url=\"{openai_base_url}\"");
+    let provider_wire_api_arg = "model_providers.writ-broker.wire_api=\"responses\"";
+    let provider_env_key_arg = "model_providers.writ-broker.env_key=\"OPENAI_API_KEY\"";
+    let provider_supports_ws_arg = "model_providers.writ-broker.supports_websockets=false";
+    let model_provider_arg = "model_provider=\"writ-broker\"";
+    Ok(AgentProcessPlan::new(
+        run_id,
+        "codex",
+        [
+            OsString::from("exec"),
+            OsString::from("--model"),
+            OsString::from(model),
+            OsString::from("--config"),
+            OsString::from("model_reasoning_effort=low"),
+            OsString::from("--config"),
+            OsString::from("web_search=disabled"),
+            OsString::from("--config"),
+            OsString::from("tools.view_image=false"),
+            OsString::from("--config"),
+            OsString::from(provider_name_arg),
+            OsString::from("--config"),
+            OsString::from(provider_base_url_arg),
+            OsString::from("--config"),
+            OsString::from(provider_wire_api_arg),
+            OsString::from("--config"),
+            OsString::from(provider_env_key_arg),
+            OsString::from("--config"),
+            OsString::from(provider_supports_ws_arg),
+            OsString::from("--config"),
+            OsString::from(model_provider_arg),
+            OsString::from("--json"),
+            OsString::from("-"),
+        ],
+    )?
+    .with_env_remove(VM_BROKER_URL_ENV)
+    .with_env_remove(VM_BROKER_TOKEN_ENV)
+    .with_env("OPENAI_API_KEY", config.bearer_token().as_str()))
 }
 
 impl From<WorkspaceWarmArg> for WorkspaceWarmMode {
@@ -464,6 +664,165 @@ mod tests {
                 assert_eq!(warm, WorkspaceWarmArg::None);
             }
             _ => panic!("unexpected command"),
+        }
+    }
+
+    #[test]
+    fn agent_run_accepts_run_id_and_agent_without_prompt_arg() {
+        let args = Args::try_parse_from([
+            "writ-vm",
+            "agent",
+            "run",
+            "--run-id",
+            "00000000-0000-0000-0000-000000000301",
+            "--agent",
+            "claude",
+        ])
+        .unwrap();
+
+        match args.cmd {
+            Cmd::Agent {
+                action:
+                    AgentCmd::Run {
+                        run_id,
+                        agent,
+                        fake_agent,
+                    },
+            } => {
+                assert_eq!(run_id, "00000000-0000-0000-0000-000000000301");
+                assert_eq!(agent, AgentKind::Claude);
+                assert_eq!(fake_agent, None);
+            }
+            _ => panic!("unexpected command"),
+        }
+    }
+
+    #[test]
+    fn claude_agent_plan_uses_low_cost_health_check_settings() {
+        let run_id: AgentRunId = "00000000-0000-0000-0000-000000000302".parse().unwrap();
+        let config = VmClientConfig::new("http://192.168.252.1:49152/", "writ-vm-secret").unwrap();
+
+        let plan = claude_process_plan(run_id, "haiku", &config).unwrap();
+
+        assert_eq!(plan.program(), std::path::Path::new("claude"));
+        assert_eq!(
+            plan.args(),
+            &[
+                OsString::from("--bare"),
+                OsString::from("--print"),
+                OsString::from("--model"),
+                OsString::from("haiku"),
+                OsString::from("--effort"),
+                OsString::from("low"),
+                OsString::from("--output-format"),
+                OsString::from("text"),
+                OsString::from("--no-session-persistence"),
+                OsString::from("--tools"),
+                OsString::from(""),
+            ]
+        );
+
+        let env: std::collections::HashMap<&OsString, &OsString> =
+            plan.env().iter().map(|(key, value)| (key, value)).collect();
+        assert_eq!(
+            env.get(&OsString::from("ANTHROPIC_BASE_URL"))
+                .map(|v| v.to_str().unwrap()),
+            Some("http://192.168.252.1:49152/"),
+        );
+        assert_eq!(
+            env.get(&OsString::from("ANTHROPIC_AUTH_TOKEN"))
+                .map(|v| v.to_str().unwrap()),
+            Some("writ-vm-secret"),
+        );
+        assert_eq!(
+            env.get(&OsString::from("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"))
+                .map(|v| v.to_str().unwrap()),
+            Some("1"),
+        );
+        assert_eq!(
+            env.get(&OsString::from("DISABLE_AUTOUPDATER"))
+                .map(|v| v.to_str().unwrap()),
+            Some("1"),
+        );
+        assert_eq!(
+            env.get(&OsString::from("DISABLE_INSTALLATION_CHECKS"))
+                .map(|v| v.to_str().unwrap()),
+            Some("1"),
+        );
+        assert!(env.contains_key(&OsString::from("CLAUDE_CONFIG_DIR")));
+
+        let removed: std::collections::HashSet<&OsString> = plan.env_remove().iter().collect();
+        for key in [
+            VM_BROKER_URL_ENV,
+            VM_BROKER_TOKEN_ENV,
+            "ANTHROPIC_API_KEY",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+        ] {
+            assert!(
+                removed.contains(&OsString::from(key)),
+                "expected {key} to be removed from the Claude child env",
+            );
+        }
+    }
+
+    #[test]
+    fn codex_agent_plan_uses_low_cost_health_check_settings() {
+        let run_id: AgentRunId = "00000000-0000-0000-0000-000000000303".parse().unwrap();
+        let config = VmClientConfig::new("http://192.168.252.1:49152/", "writ-vm-secret").unwrap();
+
+        let plan = codex_process_plan(run_id, "gpt-5.4-mini", &config).unwrap();
+
+        assert_eq!(plan.program(), std::path::Path::new("codex"));
+        assert_eq!(
+            plan.args(),
+            &[
+                OsString::from("exec"),
+                OsString::from("--model"),
+                OsString::from("gpt-5.4-mini"),
+                OsString::from("--config"),
+                OsString::from("model_reasoning_effort=low"),
+                OsString::from("--config"),
+                OsString::from("web_search=disabled"),
+                OsString::from("--config"),
+                OsString::from("tools.view_image=false"),
+                OsString::from("--config"),
+                OsString::from("model_providers.writ-broker.name=\"writ broker\""),
+                OsString::from("--config"),
+                OsString::from(
+                    "model_providers.writ-broker.base_url=\"http://192.168.252.1:49152/v1\""
+                ),
+                OsString::from("--config"),
+                OsString::from("model_providers.writ-broker.wire_api=\"responses\""),
+                OsString::from("--config"),
+                OsString::from("model_providers.writ-broker.env_key=\"OPENAI_API_KEY\""),
+                OsString::from("--config"),
+                OsString::from("model_providers.writ-broker.supports_websockets=false"),
+                OsString::from("--config"),
+                OsString::from("model_provider=\"writ-broker\""),
+                OsString::from("--json"),
+                OsString::from("-"),
+            ]
+        );
+
+        let env: std::collections::HashMap<&OsString, &OsString> =
+            plan.env().iter().map(|(key, value)| (key, value)).collect();
+        assert!(
+            !env.contains_key(&OsString::from("OPENAI_BASE_URL")),
+            "OPENAI_BASE_URL is ignored by codex; the broker URL is passed via --config openai_base_url",
+        );
+        assert_eq!(
+            env.get(&OsString::from("OPENAI_API_KEY"))
+                .map(|v| v.to_str().unwrap()),
+            Some("writ-vm-secret"),
+            "OPENAI_API_KEY carries the broker bearer; the broker swaps it for the real ChatGPT credentials upstream",
+        );
+
+        let removed: std::collections::HashSet<&OsString> = plan.env_remove().iter().collect();
+        for key in [VM_BROKER_URL_ENV, VM_BROKER_TOKEN_ENV] {
+            assert!(
+                removed.contains(&OsString::from(key)),
+                "expected {key} to be removed from the Codex child env",
+            );
         }
     }
 }

@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::Mutex;
 
-use crate::agent_plan::{CorrelationId, PlanId, Stage};
+use crate::agent_plan::{CorrelationId, Stage};
 use crate::agent_run::{AgentPrompt, AgentRunId};
 use crate::agent_vm_lifecycle::{
     AgentVmGuestEnvVar, AgentVmLifecycleConfigError, AgentVmResources, AgentVmSessionManagerError,
@@ -614,9 +614,7 @@ impl AgentVmDaemon {
         agent_model: String,
         workspace: AgentVmWorkspaceBootstrap,
         prompt: AgentPrompt,
-        stage: Stage,
         correlation_id: Option<CorrelationId>,
-        read_plan_id: Option<PlanId>,
     ) -> Result<AgentRunStarted, AgentVmDaemonError> {
         let session_id = SessionId::new();
         let run_id = AgentRunId::new();
@@ -644,20 +642,14 @@ impl AgentVmDaemon {
                     agent_kind,
                     prompt: prompt.summary(),
                     correlation_id: correlation_id.clone(),
-                    stage,
-                    read_plan_id,
+                    stage: Stage::Execute,
+                    read_plan_id: None,
                 })?;
                 let agent_runs = VmHttpAgentRunService::new(
                     Arc::clone(&state),
                     self.config.vm_http.agent_run_log_root(),
                 );
-                agent_runs.insert_run_config(
-                    run_id,
-                    prompt.clone(),
-                    agent_model.clone(),
-                    stage,
-                    read_plan_id,
-                );
+                agent_runs.insert_run_config(run_id, prompt.clone(), agent_model.clone());
                 let guest_command =
                     build_agent_run_guest_command(agent_kind, run_id, workspace.warm);
                 self.start_session_after_audit_opened(

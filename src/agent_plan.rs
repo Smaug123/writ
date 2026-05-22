@@ -786,46 +786,6 @@ pub fn route_permitted_by_stage_and_decision(
     Ok(())
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
-pub enum StartAgentRunBindingError {
-    /// A `plan`-stage run carries `read_plan_id`. Planner runs
-    /// create plans; binding to a pre-existing plan has no defined
-    /// meaning and the broker has no route that honours such a row.
-    #[error("stage `plan` must not carry read_plan_id (planner runs create plans, not read them)")]
-    PlanWithReadPlanId,
-    /// A `review`-stage run omits `read_plan_id`. Every route a
-    /// reviewer needs (`GET /v1/plans/<id>`,
-    /// `POST /v1/plans/<id>/reviews`) gates on
-    /// `agent_run.read_plan_id = <plan_id>`, so a NULL binding
-    /// produces a VM that can never satisfy authorisation.
-    #[error(
-        "stage `review` requires read_plan_id (reviewer runs must bind to the plan they review)"
-    )]
-    ReviewWithoutReadPlanId,
-}
-
-/// Pure cross-field gate on a `StartAgentRun` request: the
-/// `(stage, read_plan_id)` pair must be coherent with the plan
-/// pipeline contract in `docs/plans/2026-05-11-agent-plans.md`.
-///
-/// `plan`-stage runs create plans, so they must not bind to one.
-/// `review`-stage runs read a specific plan and must bind at
-/// start time — the plan-read and review-submission routes gate
-/// on `agent_run.read_plan_id = <plan_id>`, and a NULL binding
-/// can never satisfy that. `execute`-stage is permissive in
-/// either direction: the historical pre-pipeline default omits
-/// the binding, and the plan-implementer shape carries it.
-pub fn check_start_agent_run_binding(
-    stage: Stage,
-    has_read_plan_id: bool,
-) -> Result<(), StartAgentRunBindingError> {
-    match (stage, has_read_plan_id) {
-        (Stage::Plan, true) => Err(StartAgentRunBindingError::PlanWithReadPlanId),
-        (Stage::Review, false) => Err(StartAgentRunBindingError::ReviewWithoutReadPlanId),
-        _ => Ok(()),
-    }
-}
-
 // --- VM HTTP path constructors ---------------------------------------
 
 pub fn vm_plans_collection_path() -> &'static str {
@@ -1415,40 +1375,6 @@ mod tests {
             err,
             PlanRouteAuthError::DecisionNotAccepted { .. }
         ));
-    }
-
-    /// Exhaustive table covering the six `(stage, has_read_plan_id)`
-    /// combinations the broker can see at `StartAgentRun` time.
-    /// Mirrors the per-stage CLI shape in
-    /// `docs/plans/2026-05-11-agent-plans.md`: `plan` must not bind,
-    /// `review` must bind, `execute` is permissive in either
-    /// direction (legacy pre-pipeline shape + plan-implementer
-    /// shape).
-    #[test]
-    fn start_agent_run_binding_table() {
-        let cases: [(Stage, bool, Result<(), StartAgentRunBindingError>); 6] = [
-            (Stage::Plan, false, Ok(())),
-            (
-                Stage::Plan,
-                true,
-                Err(StartAgentRunBindingError::PlanWithReadPlanId),
-            ),
-            (
-                Stage::Review,
-                false,
-                Err(StartAgentRunBindingError::ReviewWithoutReadPlanId),
-            ),
-            (Stage::Review, true, Ok(())),
-            (Stage::Execute, false, Ok(())),
-            (Stage::Execute, true, Ok(())),
-        ];
-        for (stage, has_id, expected) in cases {
-            assert_eq!(
-                check_start_agent_run_binding(stage, has_id),
-                expected,
-                "({stage:?}, has_read_plan_id={has_id})",
-            );
-        }
     }
 
     // --- VM HTTP paths -------------------------------------------------------
