@@ -214,50 +214,49 @@ mattered while `read_plan_id` was load-bearing.
 
 No standalone PR.
 
-### G5 — combined pure-deletion PR (agent_run fields + audit DAO + agent_plan)
+### G5 — combined pure-deletion PR + schema squash (as landed)
 
 Bundled per "you can combine any amount of pure deletion you
-like": once G1–G4 have removed the readers, this PR is a single
-sweep of pure removals.
+like": once G1–G3 had removed the readers, this PR is a single
+sweep of pure removals, plus the schema squash absorbed into
+the same atomic commit (originally drafted as a standalone
+PR; folded in here because the schema-vs-source agreement is
+cleaner if both land together).
 
+- Add `CorrelationId` to `agent_run.rs` (general primitive,
+  formerly co-located with `agent_plan`).
+- Strip `stage` and `read_plan_id` fields from
+  `AgentRunAuditRecord` and every caller (this was the G4
+  surgical strip; reintegrated into G5 because the post-G3
+  callers were already few enough that splitting added churn
+  rather than safety).
+- Delete dead helpers exposed by G1/G2 strip: `vm_client::fetch_plan`,
+  `cli::identity::resolve_decision_outcome`.
 - Delete `src/audit/plan.rs` (~3.7k LoC). Remove its `pub mod
-  plan;` registration from `src/audit/mod.rs`. Update any
-  audit-level integration tests that exercise the plan DAO
-  (they should fail to compile, which is the signal).
+  plan;` registration from `src/audit/mod.rs`.
 - Delete `src/agent_plan.rs` (~1.7k LoC). Remove `pub mod
   agent_plan;` from `src/lib.rs`. The compiler is the verifier
   here: if anything still imports from `agent_plan`, the build
   fails and reveals an earlier slice missed a caller.
-
-(`agent_run.rs`'s `Stage` / `read_plan_id` strip is its own
-sub-slice, G4 above. Originally I drafted these as G4/G5/G6;
-bundling G5+G6 here because both are pure deletions once their
-readers are gone. Holding G4 separate because the visitor /
-field-removal edits are surgical rather than wholesale and
-deserve to be reverted in isolation if anything regresses.)
-
-The schema-migration squash is **not part of this PR** — see
-the standalone migration PR below.
-
-~-5.4k LoC. Single PR.
-
-### Standalone PR — migration squash
-
-Independent of the G-ordered work; runs in parallel with G1–G5
-and can land in any order relative to them (its only constraint
-is that no in-tree code reads from the plan tables once it lands,
-which G5 guarantees). Worth landing **after** G5 so the source-
-tree and the schema agree at every commit, but the PR itself
-touches only `src/audit/migrations/`.
-
-- Edit `src/audit/migrations/0001_initial.sql` in place to drop
-  the plan-related `CREATE TABLE`s (`plan`, `plan_decision`,
-  `plan_review`).
-- Delete `src/audit/migrations/0002_plan_addendum.sql`.
-- Delete `src/audit/migrations/0003_plan_abort.sql`.
-- Pin a schema-migration unit test: fresh-init runs all current
-  migrations and `SELECT name FROM sqlite_master WHERE
-  type='table' AND name LIKE 'plan%'` returns the empty set.
+- Schema squash:
+  - Edit `src/audit/migrations/0001_initial.sql` in place to
+    drop the plan-related `CREATE TABLE`s (`plan`,
+    `plan_decision`, `plan_review`), the plan-related indexes,
+    the plan triggers, and the `stage` / `read_plan_id`
+    columns on `agent_run`. Also folds the original ALTER-
+    style trailing additions into proper inline column
+    definitions.
+  - Delete `src/audit/migrations/0002_plan_addendum.sql` and
+    `0003_plan_abort.sql`.
+  - Renumber the surviving post-plan migrations: 0004→0002,
+    0005→0003, 0006→0004. Update `SCHEMA_VERSION` from 6 to 4
+    and adjust the `v4_migration_refuses_legacy_approved_resolution_row`
+    test (anchored to the renamed `0002_git_push_resolution_mint`
+    migration) to use v2/v1 version numbers.
+  - Pin a schema-migration unit test: fresh-init runs all
+    current migrations and asserts no `plan*` tables are
+    present (new "forbidden" assertion in
+    `applied_schema_contains_expected_tables_and_triggers`).
 
 Sanctioned by the bailiff-split design's "pre-v1, we just bulk-
 drop the audit DB" sentence: any dev environment that already
@@ -269,17 +268,17 @@ through slice G — flagging out-of-date references to deleted
 plan types is not actionable feedback for this slice**" so
 Codex doesn't churn on it.
 
-~-200 LoC (migration files only). Single PR.
+~-5.6k LoC. Single PR.
 
 ## Estimated total
 
-~-11k LoC across five PRs (G1–G5) plus the standalone migration
-squash. Each is independently revertible: G1 removes a self-
-contained RPC path, G2 removes a self-contained HTTP path, G3 is
-the only sub-slice with a non-trivial move (separators and
-compose into the bailiff workflow modules), G4 is the surgical
-visitor-field strip, G5 is the combined pure-deletion sweep, and
-the migration PR touches only `src/audit/migrations/`.
+~-11k LoC across four PRs (G1, G2, G3, G5). As landed, G4's
+surgical field strip and the standalone migration squash were
+folded into G5: G1 removes a self-contained RPC path, G2 removes
+a self-contained HTTP path, G3 is the only sub-slice with a
+non-trivial move (separators and compose into the bailiff
+workflow modules), and G5 is the combined pure-deletion sweep
+plus the schema squash.
 
 ## Risks and tradeoffs
 

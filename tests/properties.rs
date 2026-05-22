@@ -4,16 +4,10 @@
 //! mistakes (typos in `rename_all`, adjacent-tag clashes, etc.).
 
 use proptest::prelude::*;
-use writ::agent_plan::{
-    AbortSubmission, AddendumSubmission, CorrelationId, DecisionOutcome, DecisionView,
-    MAX_CORRELATION_ID_BYTES, MIN_CORRELATION_ID_BYTES, PlanAbortReason, PlanBody, PlanCreated,
-    PlanFeedback, PlanId, PlanRouteAction, PlanSubmission, PlanView, ReviewSubmission, Stage,
-    Verdict, route_permitted_by_stage_and_decision,
+use writ::agent_run::{
+    AgentPrompt, AgentRunId, CorrelationId, MAX_CORRELATION_ID_BYTES, MIN_CORRELATION_ID_BYTES,
 };
-use writ::agent_run::{AgentPrompt, AgentRunId};
-use writ::audit::{
-    AgentRunAuditRecord, AuditLog, GitPushRequestRecord, PlanSubmissionRecord, PreMintRecord,
-};
+use writ::audit::{AgentRunAuditRecord, AuditLog, GitPushRequestRecord, PreMintRecord};
 use writ::bailiff_decision::{Decider, Decision, MAX_DECIDER_BYTES};
 use writ::bailiff_plan_note::{
     DecisionNote, PlanId as BailiffPlanId, plan_decision_seed_blob_bytes,
@@ -415,65 +409,12 @@ fn oracle_scope_authorises_request(req: &GitHubRequest, scope: &GitHubGrantedSco
 }
 
 // ---------------------------------------------------------------------------
-// agent_plan: pure types for the plan/review/decide/execute lifecycle.
-//
-// The inline unit tests in `src/agent_plan.rs` pin individual examples and
-// the exhaustive route-authorisation cube. These properties extend that by
-// fuzzing over the full input space — the gospel principle is "always write
-// the property-based tests", and several of these caught their own
-// candidate bugs during authoring (e.g. that the `[^...]` regex emits
-// multi-byte codepoints whose continuation bytes the byte-level class
-// check must still reject).
+// Correlation IDs and bailiff-side plan/decision primitives.
 // ---------------------------------------------------------------------------
 
 fn arb_correlation_id() -> impl Strategy<Value = CorrelationId> {
     "[A-Za-z0-9_-]{1,64}"
         .prop_map(|s| CorrelationId::try_new(s).expect("regex produces only valid correlation ids"))
-}
-
-fn arb_plan_body() -> impl Strategy<Value = PlanBody> {
-    // Bounded so per-case work stays cheap; the `MAX_PLAN_BODY_BYTES`
-    // boundary is pinned in the inline unit tests. NULs are excluded
-    // because the newtype rejects them at the parse boundary to match
-    // the audit-schema CHECK on `plan.body`.
-    "[^\\x00]{1,256}"
-        .prop_map(|s| PlanBody::try_new(s).expect("regex produces non-empty NUL-free bounded body"))
-}
-
-fn arb_plan_feedback() -> impl Strategy<Value = PlanFeedback> {
-    // NULs are excluded because the newtype rejects them at the parse
-    // boundary to match the audit-schema CHECK on
-    // `plan_review.feedback`.
-    "[^\\x00]{1,128}".prop_map(|s| {
-        PlanFeedback::try_new(s).expect("regex produces non-empty NUL-free bounded body")
-    })
-}
-
-fn arb_plan_abort_reason() -> impl Strategy<Value = PlanAbortReason> {
-    // NULs are excluded because the newtype rejects them at the parse
-    // boundary to match the audit-schema CHECK on `plan_abort.reason`.
-    "[^\\x00]{1,128}".prop_map(|s| {
-        PlanAbortReason::try_new(s).expect("regex produces non-empty NUL-free bounded body")
-    })
-}
-
-fn arb_stage() -> impl Strategy<Value = Stage> {
-    prop_oneof![Just(Stage::Plan), Just(Stage::Review), Just(Stage::Execute)]
-}
-
-fn arb_verdict() -> impl Strategy<Value = Verdict> {
-    prop_oneof![
-        Just(Verdict::Approve),
-        Just(Verdict::RequestChanges),
-        Just(Verdict::Reject),
-    ]
-}
-
-fn arb_decision_outcome() -> impl Strategy<Value = DecisionOutcome> {
-    prop_oneof![
-        Just(DecisionOutcome::Accepted),
-        Just(DecisionOutcome::RejectedRestart),
-    ]
 }
 
 fn arb_bailiff_decision() -> impl Strategy<Value = Decision> {
@@ -519,55 +460,6 @@ fn arb_decision_note() -> impl Strategy<Value = DecisionNote> {
         })
 }
 
-fn arb_plan_route_action() -> impl Strategy<Value = PlanRouteAction> {
-    prop_oneof![
-        Just(PlanRouteAction::SubmitPlan),
-        Just(PlanRouteAction::ReadPlan),
-        Just(PlanRouteAction::SubmitReview),
-        Just(PlanRouteAction::SubmitAddendum),
-        Just(PlanRouteAction::SubmitAbort),
-    ]
-}
-
-fn arb_plan_id() -> impl Strategy<Value = PlanId> {
-    any::<u128>().prop_map(|n| PlanId::from_uuid(uuid::Uuid::from_u128(n)))
-}
-
-fn arb_agent_run_id() -> impl Strategy<Value = AgentRunId> {
-    any::<u128>().prop_map(|n| AgentRunId::from_uuid(uuid::Uuid::from_u128(n)))
-}
-
-fn arb_decision_view() -> impl Strategy<Value = DecisionView> {
-    (arb_decision_outcome(), 0i64..10_000_000_000).prop_map(|(outcome, decided_at)| DecisionView {
-        outcome,
-        decided_at: writ::core::UnixMillis::from_millis(decided_at),
-    })
-}
-
-/// Oracle re-implementation of the route-authorisation rules from
-/// §"Protocol additions" in `docs/plans/2026-05-11-agent-plans.md`, written
-/// without consulting `route_permitted_by_stage_and_decision`. When both
-/// implementations agree on every cube cell we know the gate faithfully
-/// encodes the spec.
-fn oracle_route_allowed(
-    action: PlanRouteAction,
-    stage: Stage,
-    decision: Option<DecisionOutcome>,
-) -> bool {
-    let accepted = decision == Some(DecisionOutcome::Accepted);
-    match action {
-        PlanRouteAction::SubmitPlan => stage == Stage::Plan,
-        PlanRouteAction::ReadPlan => match stage {
-            Stage::Plan => false,
-            Stage::Review => true,
-            Stage::Execute => accepted,
-        },
-        PlanRouteAction::SubmitReview => stage == Stage::Review,
-        PlanRouteAction::SubmitAddendum => stage == Stage::Execute && accepted,
-        PlanRouteAction::SubmitAbort => stage == Stage::Execute,
-    }
-}
-
 proptest! {
     /// Any valid `CorrelationId` survives the `try_new(as_str())` and
     /// JSON round-trips, and its on-wire form is a bare string equal to
@@ -603,65 +495,6 @@ proptest! {
             "expected {:?} to be rejected for a non-class byte",
             id,
         );
-    }
-
-    /// `PlanBody` round-trips through JSON for any valid body.
-    #[test]
-    fn plan_body_roundtrips_through_json(body in arb_plan_body()) {
-        let j = serde_json::to_string(&body).unwrap();
-        let back: PlanBody = serde_json::from_str(&j).unwrap();
-        prop_assert_eq!(back, body);
-    }
-
-    /// `PlanFeedback` round-trips through JSON.
-    #[test]
-    fn plan_feedback_roundtrips_through_json(fb in arb_plan_feedback()) {
-        let j = serde_json::to_string(&fb).unwrap();
-        let back: PlanFeedback = serde_json::from_str(&j).unwrap();
-        prop_assert_eq!(back, fb);
-    }
-
-    /// `PlanAbortReason` round-trips through JSON.
-    #[test]
-    fn plan_abort_reason_roundtrips_through_json(r in arb_plan_abort_reason()) {
-        let j = serde_json::to_string(&r).unwrap();
-        let back: PlanAbortReason = serde_json::from_str(&j).unwrap();
-        prop_assert_eq!(back, r);
-    }
-
-    /// `Stage`: `as_str`, `FromStr`, `Display`, and JSON form all agree.
-    /// If a new variant is added, this property fails until every
-    /// projection is wired up.
-    #[test]
-    fn stage_all_text_projections_agree(s in arb_stage()) {
-        prop_assert_eq!(s.as_str().parse::<Stage>().unwrap(), s);
-        prop_assert_eq!(s.to_string(), s.as_str());
-        let j = serde_json::to_string(&s).unwrap();
-        prop_assert_eq!(&j, &format!("\"{}\"", s.as_str()));
-        let back: Stage = serde_json::from_str(&j).unwrap();
-        prop_assert_eq!(back, s);
-    }
-
-    /// `Verdict`: as above.
-    #[test]
-    fn verdict_all_text_projections_agree(v in arb_verdict()) {
-        prop_assert_eq!(v.as_str().parse::<Verdict>().unwrap(), v);
-        prop_assert_eq!(v.to_string(), v.as_str());
-        let j = serde_json::to_string(&v).unwrap();
-        prop_assert_eq!(&j, &format!("\"{}\"", v.as_str()));
-        let back: Verdict = serde_json::from_str(&j).unwrap();
-        prop_assert_eq!(back, v);
-    }
-
-    /// `DecisionOutcome`: as above.
-    #[test]
-    fn decision_outcome_all_text_projections_agree(d in arb_decision_outcome()) {
-        prop_assert_eq!(d.as_str().parse::<DecisionOutcome>().unwrap(), d);
-        prop_assert_eq!(d.to_string(), d.as_str());
-        let j = serde_json::to_string(&d).unwrap();
-        prop_assert_eq!(&j, &format!("\"{}\"", d.as_str()));
-        let back: DecisionOutcome = serde_json::from_str(&j).unwrap();
-        prop_assert_eq!(back, d);
     }
 
     /// Bailiff-side `Decision` enum: every variant's text projections
@@ -726,164 +559,6 @@ proptest! {
         prop_assert_ne!(submission, decision);
     }
 
-    /// `route_permitted_by_stage_and_decision` agrees with the oracle on
-    /// every `(action, stage, decision)` triple. The inline unit test
-    /// enumerates the same cube; this property generates additionally so
-    /// a future variant added to either `PlanRouteAction` or `Stage`
-    /// gets picked up by *both* without further plumbing.
-    #[test]
-    fn route_authorisation_agrees_with_oracle(
-        action in arb_plan_route_action(),
-        stage in arb_stage(),
-        decision in prop::option::of(arb_decision_outcome()),
-    ) {
-        let expected = oracle_route_allowed(action, stage, decision);
-        let actual = route_permitted_by_stage_and_decision(action, stage, decision);
-        prop_assert_eq!(
-            actual.is_ok(),
-            expected,
-            "({:?}, {:?}, {:?}): expected {}, got {:?}",
-            action,
-            stage,
-            decision,
-            expected,
-            actual,
-        );
-    }
-
-    /// Wire-format: `PlanSubmission` round-trips through JSON.
-    #[test]
-    fn plan_submission_roundtrips(
-        agent_run_id in arb_agent_run_id(),
-        body in arb_plan_body(),
-    ) {
-        let m = PlanSubmission { agent_run_id, body };
-        let j = serde_json::to_string(&m).unwrap();
-        let back: PlanSubmission = serde_json::from_str(&j).unwrap();
-        prop_assert_eq!(back, m);
-    }
-
-    /// Wire-format: `PlanCreated` is `{ "plan_id": "<uuid>" }`. Picks up
-    /// any `serde(transparent)` mistake on `PlanId` and any rename slip
-    /// on the field name.
-    #[test]
-    fn plan_created_roundtrips(plan_id in arb_plan_id()) {
-        let m = PlanCreated { plan_id };
-        let j = serde_json::to_string(&m).unwrap();
-        let back: PlanCreated = serde_json::from_str(&j).unwrap();
-        prop_assert_eq!(back, m);
-        prop_assert_eq!(&j, &format!("{{\"plan_id\":\"{}\"}}", plan_id));
-    }
-
-    /// Wire-format: `ReviewSubmission` round-trips with and without the
-    /// optional feedback field, and the absent case omits the key
-    /// entirely (per `skip_serializing_if = "Option::is_none"`).
-    #[test]
-    fn review_submission_roundtrips(
-        agent_run_id in arb_agent_run_id(),
-        verdict in arb_verdict(),
-        feedback in prop::option::of(arb_plan_feedback()),
-    ) {
-        let r = ReviewSubmission { agent_run_id, verdict, feedback };
-        let j = serde_json::to_string(&r).unwrap();
-        if r.feedback.is_none() {
-            prop_assert!(
-                !j.contains("feedback"),
-                "skip_serializing_if violated: {}",
-                j,
-            );
-        }
-        let back: ReviewSubmission = serde_json::from_str(&j).unwrap();
-        prop_assert_eq!(back, r);
-    }
-
-    /// Wire-format: `AddendumSubmission` round-trips through JSON.
-    #[test]
-    fn addendum_submission_roundtrips(body in arb_plan_body()) {
-        let m = AddendumSubmission { body };
-        let j = serde_json::to_string(&m).unwrap();
-        let back: AddendumSubmission = serde_json::from_str(&j).unwrap();
-        prop_assert_eq!(back, m);
-    }
-
-    /// Wire-format: `AbortSubmission` round-trips through JSON.
-    #[test]
-    fn abort_submission_roundtrips(reason in arb_plan_abort_reason()) {
-        let m = AbortSubmission { reason };
-        let j = serde_json::to_string(&m).unwrap();
-        let back: AbortSubmission = serde_json::from_str(&j).unwrap();
-        prop_assert_eq!(back, m);
-    }
-
-    /// Wire-format: `PlanView` round-trips with and without a decision,
-    /// across freshly-generated `PlanId` / `AgentRunId` / prompt
-    /// content. The `decision` key is always present per the spec
-    /// (§"Protocol additions": `decision: { ... } | null`) — when the
-    /// plan is still under review it serialises as explicit `null`,
-    /// never an absent key.
-    #[test]
-    fn plan_view_roundtrips(
-        plan_id in arb_plan_id(),
-        run_id in arb_agent_run_id(),
-        body in arb_plan_body(),
-        decision in prop::option::of(arb_decision_view()),
-    ) {
-        let view = PlanView {
-            plan_id,
-            body,
-            originating_run_id: run_id,
-            decision,
-        };
-        let j = serde_json::to_string(&view).unwrap();
-        let back: PlanView = serde_json::from_str(&j).unwrap();
-        prop_assert_eq!(&back, &view);
-
-        // The `decision` key is always present; if `None`, it must be
-        // explicit `null` rather than an absent key.
-        let value: serde_json::Value = serde_json::from_str(&j).unwrap();
-        let decision_value = value.get("decision");
-        prop_assert!(decision_value.is_some(), "decision key absent: {j}");
-        if view.decision.is_none() {
-            prop_assert_eq!(
-                decision_value,
-                Some(&serde_json::Value::Null),
-                "decision must be explicit null when absent: {}",
-                j,
-            );
-        }
-    }
-
-    /// Any `Stage` round-trips through the `agent_run` audit DAO. The
-    /// migration-16 CHECK lists exactly the three variants the Rust enum
-    /// names, so a write of any variant must read back unchanged.
-    #[test]
-    fn agent_run_stage_roundtrips_through_audit_log(stage in arb_stage()) {
-        let log = AuditLog::open_in_memory().unwrap();
-        let session = SessionRecord {
-            session_id: SessionId::new(),
-            label: None,
-            agent_kind: None,
-            agent_model: None,
-            opened_at: UnixMillis::from_millis(0),
-            closed_at: None,
-        };
-        log.open_session(&session).unwrap();
-        let run_id = AgentRunId::new();
-        log.record_agent_run(&AgentRunAuditRecord {
-            run_id,
-            session_id: session.session_id,
-            requested_at: UnixMillis::from_millis(1),
-            agent_kind: AgentKind::Claude,
-            prompt: AgentPrompt::try_new("p").unwrap().summary(),
-            correlation_id: None,
-            stage,
-            read_plan_id: None,
-        })
-        .unwrap();
-        let entry = log.get_agent_run(run_id).unwrap().unwrap();
-        prop_assert_eq!(entry.stage, stage);
-    }
-
     /// Any valid `CorrelationId` round-trips through the `agent_run`
     /// audit DAO. The DAO's CHECK constraint and the `CorrelationId`
     /// newtype agree on the allowed character class, so writes through
@@ -910,54 +585,10 @@ proptest! {
             agent_kind: AgentKind::Claude,
             prompt: AgentPrompt::try_new("p").unwrap().summary(),
             correlation_id: Some(c.clone()),
-            stage: Stage::Execute,
-            read_plan_id: None,
         })
         .unwrap();
         let entry = log.get_agent_run(run_id).unwrap().unwrap();
         prop_assert_eq!(entry.correlation_id, Some(c));
-    }
-
-    /// Any valid `PlanBody` round-trips through the plan audit DAO. The
-    /// DAO computes `body_sha256` on insert, so this also exercises the
-    /// `sha256_hex` projection — a body that survives a roundtrip is
-    /// one whose stored digest agrees with a fresh recompute (see the
-    /// belt-and-braces check in `plan_from_row`).
-    #[test]
-    fn plan_body_roundtrips_through_audit_log(body in arb_plan_body()) {
-        let log = AuditLog::open_in_memory().unwrap();
-        let session = SessionRecord {
-            session_id: SessionId::new(),
-            label: None,
-            agent_kind: None,
-            agent_model: None,
-            opened_at: UnixMillis::from_millis(0),
-            closed_at: None,
-        };
-        log.open_session(&session).unwrap();
-        let run_id = AgentRunId::new();
-        log.record_agent_run(&AgentRunAuditRecord {
-            run_id,
-            session_id: session.session_id,
-            requested_at: UnixMillis::from_millis(1),
-            agent_kind: AgentKind::Claude,
-            prompt: AgentPrompt::try_new("p").unwrap().summary(),
-            correlation_id: None,
-            stage: Stage::Plan,
-            read_plan_id: None,
-        })
-        .unwrap();
-
-        let plan_id = PlanId::new();
-        let record = PlanSubmissionRecord {
-            plan_id,
-            agent_run_id: run_id,
-            submitted_at: UnixMillis::from_millis(2),
-            body,
-        };
-        log.record_plan_submission(&record).unwrap();
-        let entry = log.get_plan(plan_id).unwrap().unwrap();
-        prop_assert_eq!(entry, record);
     }
 
     /// Same invariant for the git push request DAO.

@@ -4,7 +4,6 @@
 //!
 //! See `docs/design/broker.md` for the architecture overview.
 
-pub mod agent_plan;
 pub mod agent_run;
 #[cfg(feature = "host")]
 pub mod agent_vm_daemon;

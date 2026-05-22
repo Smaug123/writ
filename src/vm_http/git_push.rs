@@ -564,8 +564,7 @@ mod tests {
     /// pushes together.
     #[tokio::test]
     async fn git_push_inherits_correlation_id_from_tagged_agent_run() {
-        use crate::agent_plan::{CorrelationId, Stage};
-        use crate::agent_run::{AgentPrompt, AgentRunId};
+        use crate::agent_run::{AgentPrompt, AgentRunId, CorrelationId};
         use crate::audit::AgentRunAuditRecord;
         use crate::core::AgentKind;
 
@@ -583,8 +582,6 @@ mod tests {
                 agent_kind: AgentKind::Claude,
                 prompt: AgentPrompt::new("prompt").summary(),
                 correlation_id: Some(correlation.clone()),
-                stage: Stage::Execute,
-                read_plan_id: None,
             })
             .unwrap();
         let (staging, _tmp) = open_test_staging_store();
@@ -641,7 +638,6 @@ mod tests {
     /// NULL even though the run exists.
     #[tokio::test]
     async fn git_push_with_untagged_agent_run_leaves_correlation_id_null() {
-        use crate::agent_plan::Stage;
         use crate::agent_run::{AgentPrompt, AgentRunId};
         use crate::audit::AgentRunAuditRecord;
         use crate::core::AgentKind;
@@ -659,8 +655,6 @@ mod tests {
                 agent_kind: AgentKind::Claude,
                 prompt: AgentPrompt::new("prompt").summary(),
                 correlation_id: None,
-                stage: Stage::Execute,
-                read_plan_id: None,
             })
             .unwrap();
         let (staging, _tmp) = open_test_staging_store();

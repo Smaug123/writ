@@ -49,7 +49,7 @@ pub(super) struct Migration {
 /// a version higher than this is rejected with [`AuditError::SchemaTooNew`]
 /// rather than opened — we'd rather fail to start than silently drop data
 /// into a schema a newer broker wrote.
-pub(super) const SCHEMA_VERSION: i32 = 6;
+pub(super) const SCHEMA_VERSION: i32 = 4;
 
 /// The full migration history. Each entry documents exactly one state
 /// transition; the sequence of entries is the schema's lineage. Order
@@ -57,33 +57,29 @@ pub(super) const SCHEMA_VERSION: i32 = 6;
 pub(super) const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 1,
-        name: "0001_initial",
-        sql: include_str!("migrations/0001_initial.sql"),
+        // Renamed from "0001_initial" in slice G5: the v1 SQL was
+        // squashed in place to drop plan-era tables and columns, so
+        // a pre-G5 DB that records the bare "0001_initial" name now
+        // has an incompatible on-disk shape. The `_v2` suffix makes
+        // `verify_schema_history` reject those DBs at version 1
+        // instead of resuming forward over a non-squashed base.
+        name: "0001_initial_v2",
+        sql: include_str!("migrations/0001_initial_v2.sql"),
     },
     Migration {
         version: 2,
-        name: "0002_plan_addendum",
-        sql: include_str!("migrations/0002_plan_addendum.sql"),
+        name: "0002_git_push_resolution_mint",
+        sql: include_str!("migrations/0002_git_push_resolution_mint.sql"),
     },
     Migration {
         version: 3,
-        name: "0003_plan_abort",
-        sql: include_str!("migrations/0003_plan_abort.sql"),
+        name: "0003_approve_attempt_state_machine",
+        sql: include_str!("migrations/0003_approve_attempt_state_machine.sql"),
     },
     Migration {
         version: 4,
-        name: "0004_git_push_resolution_mint",
-        sql: include_str!("migrations/0004_git_push_resolution_mint.sql"),
-    },
-    Migration {
-        version: 5,
-        name: "0005_approve_attempt_state_machine",
-        sql: include_str!("migrations/0005_approve_attempt_state_machine.sql"),
-    },
-    Migration {
-        version: 6,
-        name: "0006_approve_attempt_reconciliation",
-        sql: include_str!("migrations/0006_approve_attempt_reconciliation.sql"),
+        name: "0004_approve_attempt_reconciliation",
+        sql: include_str!("migrations/0004_approve_attempt_reconciliation.sql"),
     },
 ];
 
@@ -136,6 +132,7 @@ const _: () = {
 /// global write lock for its entire duration.
 pub(super) fn migrate(conn: &mut Connection) -> Result<(), AuditError> {
     ensure_schema_version_table(conn)?;
+    verify_schema_history(conn)?;
 
     loop {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -174,6 +171,44 @@ fn ensure_schema_version_table(conn: &Connection) -> Result<(), AuditError> {
             applied_at_ms INTEGER NOT NULL CHECK(applied_at_ms > 0)
          );",
     )?;
+    Ok(())
+}
+
+/// Every recorded `schema_version.name` must match the in-code migration
+/// at that version. A mismatch means the DB was written by a binary
+/// whose migration list has since been re-arranged (e.g. the slice-G
+/// schema squash that renumbered post-plan migrations from 0004→0002
+/// etc.). Trusting the version number alone would silently treat an
+/// old-shape DB as if the new migrations had already run, leaving the
+/// DB missing tables and columns the new code expects. The audit log's
+/// correctness-over-availability stance demands we refuse to open
+/// rather than limp along on a half-migrated database.
+fn verify_schema_history(conn: &Connection) -> Result<(), AuditError> {
+    let mut stmt = conn.prepare("SELECT version, name FROM schema_version ORDER BY version")?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, i32>(0)?, row.get::<_, String>(1)?))
+    })?;
+    for row in rows {
+        let (version, found_name) = row?;
+        if !(1..=SCHEMA_VERSION).contains(&version) {
+            // A version outside `1..=SCHEMA_VERSION` is either future
+            // (`SchemaTooNew` handles that downstream) or impossibly
+            // low (`CHECK(version >= 1)` blocks that at write-time).
+            // Leave it for the version-bound check rather than misclassify.
+            continue;
+        }
+        let expected = MIGRATIONS
+            .iter()
+            .find(|m| m.version == version)
+            .expect("MIGRATIONS covers 1..=SCHEMA_VERSION contiguously (compile-time asserted)");
+        if expected.name != found_name {
+            return Err(AuditError::SchemaHistoryMismatch {
+                version,
+                found_name,
+                expected_name: expected.name,
+            });
+        }
+    }
     Ok(())
 }
 
@@ -317,13 +352,23 @@ mod tests {
             "git_push_resolution",
             "git_push_approve_attempt",
             "git_push_approve_attempt_boot_observed",
+        ] {
+            assert!(tables.contains(expected), "missing table: {expected}");
+        }
+
+        // Plan lifecycle tables were removed in slice G: bailiff owns
+        // plan storage as git notes; the audit log no longer mirrors it.
+        for forbidden in [
             "plan",
             "plan_decision",
             "plan_review",
             "plan_addendum",
             "plan_abort",
         ] {
-            assert!(tables.contains(expected), "missing table: {expected}");
+            assert!(
+                !tables.contains(forbidden),
+                "plan-era table {forbidden} should have been dropped"
+            );
         }
 
         let triggers = names("trigger");
@@ -348,36 +393,28 @@ mod tests {
             "git_push_approve_attempt_reconciliation_same_push",
             "git_push_approve_attempt_reconciliation_uncertain_needs_boot_observed",
             "git_push_approve_attempt_supersedes_immutable",
-            "plan_requires_open_session",
-            "plan_review_requires_open_session",
-            "plan_review_requires_reviewer_run",
-            "plan_addendum_requires_open_session",
-            "plan_addendum_requires_executor_run",
-            "plan_addendum_requires_accepted_decision",
-            "plan_abort_requires_open_session",
-            "plan_abort_requires_executor_run",
         ] {
             assert!(triggers.contains(expected), "missing trigger: {expected}");
         }
     }
 
-    /// A v3 DB that already carried a `decision = 'approved'` row
+    /// A v1 DB that already carried a `decision = 'approved'` row
     /// cannot be upgraded — the new schema needs mint context that
-    /// pre-upgrade rows lack. The v4 migration's defensive guard
+    /// pre-upgrade rows lack. The v2 migration's defensive guard
     /// refuses the upgrade so an operator deliberately resolves the
     /// situation rather than discovering unreadable rows later. No
     /// shipped broker actually writes legacy approved rows, but the
-    /// pre-v4 schema admitted them, so the guard is principled even
+    /// pre-v2 schema admitted them, so the guard is principled even
     /// if rarely triggered.
     #[test]
-    fn v4_migration_refuses_legacy_approved_resolution_row() {
+    fn v2_migration_refuses_legacy_approved_resolution_row() {
         let db = NamedTempFile::new().unwrap();
-        // Build a v3 DB shape by hand: apply migrations 1..=3 directly
-        // and stop. `AuditLog::open` would otherwise run v4 first.
+        // Build a v1 DB shape by hand: apply migration 1 directly
+        // and stop. `AuditLog::open` would otherwise run v2 first.
         {
             let mut conn = Connection::open(db.path()).unwrap();
             ensure_schema_version_table(&conn).unwrap();
-            for migration in MIGRATIONS.iter().take_while(|m| m.version < 4) {
+            for migration in MIGRATIONS.iter().take_while(|m| m.version < 2) {
                 let tx = conn
                     .transaction_with_behavior(TransactionBehavior::Immediate)
                     .unwrap();
@@ -391,7 +428,7 @@ mod tests {
             }
 
             // Plant a legacy 'approved' row by walking the audit chain
-            // the v3 schema requires (session → request → staged
+            // the v1 schema requires (session → request → staged
             // outcome → resolution) without going through the DAO,
             // which would reject the inconsistency at the type layer.
             let session_id = SessionId::new();
@@ -440,15 +477,15 @@ mod tests {
             "expected CHECK constraint failure, got: {e}"
         );
 
-        // The v3 DB is unchanged: the migration aborted in a single
-        // transaction. Reopening still observes schema_version = 3.
+        // The v1 DB is unchanged: the migration aborted in a single
+        // transaction. Reopening still observes schema_version = 1.
         let current = Connection::open(db.path())
             .unwrap()
             .query_row("SELECT MAX(version) FROM schema_version", [], |row| {
                 row.get::<_, i32>(0)
             })
             .unwrap();
-        assert_eq!(current, 3);
+        assert_eq!(current, 1);
     }
 
     /// A DB written by a future broker will carry a `schema_version`
@@ -475,6 +512,120 @@ mod tests {
             }
             other => panic!("expected SchemaTooNew, got {other:?}"),
         }
+    }
+
+    /// A pre-G5 DB stopped at version 1 recorded the unsuffixed
+    /// `0001_initial` name. Post-G5 the v1 migration was squashed in
+    /// place and renamed `0001_initial_v2`, so the same recorded name
+    /// now signals "DB is at the pre-squash v1 shape (plan tables
+    /// present, `agent_run.stage`/`read_plan_id` still there)" rather
+    /// than the new squashed shape. Refusing to open is required:
+    /// blindly applying the renumbered 0002-0004 migrations over a
+    /// pre-squash v1 base would leave the DB in a hybrid half-squashed
+    /// state.
+    #[test]
+    fn open_rejects_pre_squash_v1_history() {
+        let db = NamedTempFile::new().unwrap();
+        {
+            // We have to write the row manually rather than execute
+            // pre-G5 SQL: the squash drops the old plan tables, so
+            // simulating the *exact* old-v1 shape would require an
+            // archived copy of the old 0001_initial.sql. The name
+            // mismatch alone is what catches this on a real upgrade,
+            // and that's what's under test.
+            let conn = Connection::open(db.path()).unwrap();
+            ensure_schema_version_table(&conn).unwrap();
+            conn.execute(
+                "INSERT INTO schema_version (version, name, applied_at_ms) VALUES (?1, ?2, ?3)",
+                params![1, "0001_initial", 1_i64],
+            )
+            .unwrap();
+        }
+        let err = AuditLog::open(db.path()).unwrap_err();
+        match err {
+            AuditError::SchemaHistoryMismatch {
+                version,
+                found_name,
+                expected_name,
+            } => {
+                assert_eq!(version, 1);
+                assert_eq!(found_name, "0001_initial");
+                assert_eq!(expected_name, "0001_initial_v2");
+            }
+            other => panic!("expected SchemaHistoryMismatch, got {other:?}"),
+        }
+    }
+
+    /// A DB written by a pre-G5 binary that ran past v1 records a
+    /// different `name` for at least one post-v1 version (the slice-G
+    /// squash renumbered 0004-0006 → 0002-0004). Catching the v2
+    /// mismatch is the same correctness story as the v1 case above,
+    /// but the second-row check exercises the loop's "skip v1, fault
+    /// on v2" path.
+    #[test]
+    fn open_rejects_schema_with_mismatched_post_v1_history() {
+        let db = NamedTempFile::new().unwrap();
+        {
+            let conn = Connection::open(db.path()).unwrap();
+            ensure_schema_version_table(&conn).unwrap();
+            conn.execute(
+                "INSERT INTO schema_version (version, name, applied_at_ms) VALUES (?1, ?2, ?3)",
+                params![1, "0001_initial_v2", 1_i64],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO schema_version (version, name, applied_at_ms) VALUES (?1, ?2, ?3)",
+                params![2, "0002_plan_addendum", 2_i64],
+            )
+            .unwrap();
+        }
+        let err = AuditLog::open(db.path()).unwrap_err();
+        match err {
+            AuditError::SchemaHistoryMismatch {
+                version,
+                found_name,
+                expected_name,
+            } => {
+                assert_eq!(version, 2);
+                assert_eq!(found_name, "0002_plan_addendum");
+                assert_eq!(expected_name, "0002_git_push_resolution_mint");
+            }
+            other => panic!("expected SchemaHistoryMismatch, got {other:?}"),
+        }
+    }
+
+    /// Counterpart to the rejection tests: a partially-migrated DB at
+    /// v1 whose recorded row matches the in-code v1 migration name
+    /// must still open and complete the remaining migrations.
+    /// Otherwise the history check would refuse legitimate resumption
+    /// after a process killed mid-migration sequence.
+    #[test]
+    fn open_resumes_when_recorded_history_matches() {
+        let db = NamedTempFile::new().unwrap();
+        {
+            let mut conn = Connection::open(db.path()).unwrap();
+            ensure_schema_version_table(&conn).unwrap();
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            tx.execute_batch(MIGRATIONS[0].sql).unwrap();
+            tx.execute(
+                "INSERT INTO schema_version (version, name, applied_at_ms) VALUES (?1, ?2, ?3)",
+                params![1, "0001_initial_v2", 1_i64],
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+        // `AuditLog::open` walks forward to SCHEMA_VERSION; nothing in
+        // the v1 fixture conflicts with the post-v1 migrations.
+        let _ = AuditLog::open(db.path()).unwrap();
+        let current = Connection::open(db.path())
+            .unwrap()
+            .query_row("SELECT MAX(version) FROM schema_version", [], |row| {
+                row.get::<_, i32>(0)
+            })
+            .unwrap();
+        assert_eq!(current, SCHEMA_VERSION);
     }
 
     /// Documents the lock contract: while another writer holds the

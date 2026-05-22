@@ -410,8 +410,6 @@ mod tests {
                 agent_kind: crate::core::AgentKind::Claude,
                 prompt: AgentPrompt::new("prompt").summary(),
                 correlation_id: None,
-                stage: crate::agent_plan::Stage::Execute,
-                read_plan_id: None,
             })
             .unwrap();
         let temp = tempfile::tempdir().unwrap();
@@ -478,8 +476,6 @@ mod tests {
                 agent_kind: crate::core::AgentKind::Claude,
                 prompt: AgentPrompt::new("prompt").summary(),
                 correlation_id: None,
-                stage: crate::agent_plan::Stage::Execute,
-                read_plan_id: None,
             })
             .unwrap();
         let temp = tempfile::tempdir().unwrap();

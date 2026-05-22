@@ -8,6 +8,7 @@
 
 use std::fmt;
 use std::path::PathBuf;
+use std::str::FromStr;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use uuid::Uuid;
@@ -16,6 +17,12 @@ pub const VM_AGENT_RUN_PATH_PREFIX: &str = "/v1/agent-runs";
 pub const MAX_AGENT_PROMPT_BYTES: usize = 1024 * 1024;
 pub const DEFAULT_AGENT_RUN_STREAM_CAPTURE_BYTES: u64 = 1024 * 1024;
 pub const VM_AGENT_RUN_OUTCOME_PATH_SUFFIX: &str = "outcome";
+
+/// Inclusive bounds on a [`CorrelationId`]. The lower bound rejects
+/// the empty string at parse time so the audit column never has to
+/// distinguish "absent" from "zero-length present".
+pub const MIN_CORRELATION_ID_BYTES: usize = 1;
+pub const MAX_CORRELATION_ID_BYTES: usize = 64;
 
 #[derive(Copy, Clone, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -243,6 +250,88 @@ fn hex_lower(bytes: &[u8]) -> String {
         out.push(HEX[(byte & 0x0f) as usize] as char);
     }
     out
+}
+
+// --- CorrelationId ----------------------------------------------------
+
+/// Opaque caller-supplied identifier tying related agent runs and git
+/// pushes together. Per the broker design (§"Correlation ID"), the
+/// broker validates only as a safe id — bounded length, restricted
+/// character class — and never interprets the contents. The upstream
+/// orchestrator (today: a human; later: a separate agent) decides
+/// what the id means.
+///
+/// Character class is `[A-Za-z0-9_-]` and length is
+/// [`MIN_CORRELATION_ID_BYTES`]..=[`MAX_CORRELATION_ID_BYTES`]. The
+/// class is deliberately narrow: no dots, slashes, or colons — that
+/// way a correlation id cannot pose as a path segment or scheme
+/// component if it ever leaks into a URL.
+#[derive(Clone, Eq, Hash, PartialEq)]
+pub struct CorrelationId(String);
+
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum CorrelationIdError {
+    #[error(
+        "correlation id must be {min}..={max} bytes; got {got}",
+        min = MIN_CORRELATION_ID_BYTES,
+        max = MAX_CORRELATION_ID_BYTES,
+    )]
+    InvalidLength { got: usize },
+    #[error("correlation id byte at offset {at} is {byte:?}; expected [A-Za-z0-9_-]")]
+    InvalidByte { at: usize, byte: u8 },
+}
+
+impl CorrelationId {
+    pub fn try_new(raw: impl Into<String>) -> Result<Self, CorrelationIdError> {
+        let raw = raw.into();
+        let len = raw.len();
+        if !(MIN_CORRELATION_ID_BYTES..=MAX_CORRELATION_ID_BYTES).contains(&len) {
+            return Err(CorrelationIdError::InvalidLength { got: len });
+        }
+        for (at, byte) in raw.bytes().enumerate() {
+            let ok = byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_';
+            if !ok {
+                return Err(CorrelationIdError::InvalidByte { at, byte });
+            }
+        }
+        Ok(Self(raw))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for CorrelationId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl fmt::Debug for CorrelationId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "CorrelationId({:?})", self.0)
+    }
+}
+
+impl FromStr for CorrelationId {
+    type Err = CorrelationIdError;
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        Self::try_new(raw)
+    }
+}
+
+impl Serialize for CorrelationId {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for CorrelationId {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(d)?;
+        Self::try_new(raw).map_err(serde::de::Error::custom)
+    }
 }
 
 #[cfg(any(feature = "host", feature = "vm-client"))]
@@ -622,6 +711,60 @@ mod tests {
 
         assert!(!debug.contains(prompt.as_str()), "{debug}");
         assert!(debug.contains("<redacted>"), "{debug}");
+    }
+
+    #[test]
+    fn correlation_id_accepts_safe_alphanumeric_underscore_dash() {
+        for ok in [
+            "a",
+            "ABC",
+            "feat-2026-05-11",
+            "task_123",
+            "Z9_-",
+            // exactly max length
+            &"a".repeat(MAX_CORRELATION_ID_BYTES),
+        ] {
+            let parsed = CorrelationId::try_new(ok)
+                .unwrap_or_else(|e| panic!("expected {ok:?} to parse, got {e}"));
+            assert_eq!(parsed.as_str(), ok);
+        }
+    }
+
+    #[test]
+    fn correlation_id_rejects_empty_too_long_and_bad_chars() {
+        // empty
+        assert!(matches!(
+            CorrelationId::try_new(""),
+            Err(CorrelationIdError::InvalidLength { got: 0 })
+        ));
+        // one over max
+        let too_long = "a".repeat(MAX_CORRELATION_ID_BYTES + 1);
+        assert!(matches!(
+            CorrelationId::try_new(&too_long),
+            Err(CorrelationIdError::InvalidLength { .. })
+        ));
+        // forbidden bytes — path/scheme-style separators
+        for bad in [
+            "foo.bar", "foo/bar", "foo:bar", "foo bar", "foo\nbar", "foo!",
+        ] {
+            let err = CorrelationId::try_new(bad).unwrap_err();
+            assert!(
+                matches!(err, CorrelationIdError::InvalidByte { .. }),
+                "expected InvalidByte for {bad:?}, got {err:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn correlation_id_serde_is_bare_string_and_roundtrips() {
+        let c = CorrelationId::try_new("plan-2026-05-11_42").unwrap();
+        let json = serde_json::to_string(&c).unwrap();
+        assert_eq!(json, r#""plan-2026-05-11_42""#);
+        let back: CorrelationId = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, c);
+        // invalid wire payloads are rejected on parse
+        assert!(serde_json::from_str::<CorrelationId>(r#""bad/id""#).is_err());
+        assert!(serde_json::from_str::<CorrelationId>(r#""""#).is_err());
     }
 
     #[cfg(feature = "host")]

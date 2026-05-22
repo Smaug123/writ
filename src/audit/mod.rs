@@ -32,7 +32,6 @@ mod git_push;
 mod grant;
 mod nix_cache;
 mod openai_proxy;
-mod plan;
 mod proxy_table;
 mod schema;
 mod session;
@@ -61,9 +60,6 @@ pub use nix_cache::{
 pub use openai_proxy::{
     OpenAiProxyAuditDecision, OpenAiProxyAuditRoute, OpenAiProxyOutcomeRecord,
     OpenAiProxyRequestRecord,
-};
-pub use plan::{
-    PlanAbortRecord, PlanAddendumRecord, PlanDecisionRecord, PlanReviewRecord, PlanSubmissionRecord,
 };
 pub use proxy_table::ProxyAuditDecision;
 
@@ -114,6 +110,26 @@ pub enum AuditError {
          upgrade the broker"
     )]
     SchemaTooNew { found: i32, supported: i32 },
+
+    /// The on-disk schema_version registry records a migration name at
+    /// `version` that disagrees with the in-code migration at that
+    /// version. This is the signal that the DB was written by a binary
+    /// whose migration list has since been re-arranged (e.g. a slice-G
+    /// schema squash that renumbered post-plan migrations). Refusing
+    /// to open is the only safe answer: pretending the DB is at this
+    /// binary's `version` would skip migrations the new shape needs.
+    /// Pre-v1, the resolution is to drop the DB and let `AuditLog::open`
+    /// re-init from scratch.
+    #[error(
+        "audit DB schema history is incompatible with this binary: \
+         version {version} on disk is {found_name:?} but this binary expects {expected_name:?}; \
+         pre-v1 resolution is to drop the audit DB and let it re-init"
+    )]
+    SchemaHistoryMismatch {
+        version: i32,
+        found_name: String,
+        expected_name: &'static str,
+    },
 }
 
 pub struct AuditLog {
