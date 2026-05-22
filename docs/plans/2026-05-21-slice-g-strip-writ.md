@@ -168,27 +168,39 @@ remaining `Stage` readers; G3 deletes them.
 
 ### G3 — relocate compose helpers, delete src/bailiff.rs
 
-Move `PLAN_PROMPT_SEPARATOR` and `compose_implementer_prompt` into
-`src/bailiff_plan_implement.rs`. Move `REVIEWER_PROMPT_SEPARATOR`
-and `compose_reviewer_prompt` into `src/bailiff_plan_review.rs`.
-Each constant lives next to its single consumer; the trait
-extraction (`SignedBailiffNote` style) the F-track established is
-not needed here because there's no third caller.
+Landed as a single PR on branch
+`slice-g3-relocate-compose-helpers`. Final shape diverged slightly
+from this plan:
 
-Delete `fetch_effective_prompt` outright — its only consumer
-(`src/bin/writ-vm.rs`'s legacy VM-side plan dispatch) ceases to
-have a destination after G2, so the dispatch is dead code; delete
-both. Update `src/vm_client.rs`'s docstring reference.
-
-Remove `pub mod bailiff;` from `src/lib.rs`; delete
-`src/bailiff.rs`.
+- `PLAN_PROMPT_SEPARATOR` is now a private `const` in
+  `src/bailiff_plan_implement.rs`; the `AgentPrompt`-typed
+  `compose_implementer_prompt` from `src/bailiff.rs` was *not*
+  relocated — it had no production callers (only an integration
+  proptest), and the consumer module already had its own bytes-
+  typed `compose_implementer_prompt_bytes`. Delete-not-move was the
+  cleaner outcome (gospel principle 3, no speculative generality).
+- The proptest that previously called `compose_implementer_prompt`
+  in `tests/properties.rs` was relocated into
+  `src/bailiff_plan_implement.rs`'s `compose_tests` mod, retargeted
+  at `compose_implementer_prompt_bytes` (now reachable via
+  `use super::*` since both items are private). Gospel principle 4
+  said keep the property test; principle 1 said run it next to
+  what it tests.
+- Symmetric treatment for the reviewer side: `REVIEWER_PROMPT_SEPARATOR`
+  moved into `src/bailiff_plan_review.rs` as a private `const`;
+  `compose_reviewer_prompt` was a no-caller delete.
+- `fetch_effective_prompt` was already deleted in G2's fix-forward
+  (writ-vm plan dispatch went with it), so G3 just confirmed
+  no callers remained.
+- `src/vm_client.rs`'s `fetch_plan` docstring was updated to note
+  the route handler is gone and the function awaits deletion in G5.
+- A stale `// crate::bailiff` comment in `src/agent_plan.rs` was
+  retargeted to point at the surviving workflow modules.
 
 After G3, `src/agent_run.rs`'s `Stage` / `read_plan_id` fields
 have no readers and `agent_plan.rs`'s sole remaining reader is
-`src/audit/plan.rs`.
-
-~-300 LoC net (separators / compose move; fetch_effective_prompt
-deletes; src/bailiff.rs gone). Single PR.
+`src/audit/plan.rs`. Final diff was -347 / +105 LoC across 8 files
+(`src/bailiff.rs` deleted outright at 251 LoC).
 
 ### G4 — absorbed into G2
 

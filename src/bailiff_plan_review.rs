@@ -17,14 +17,9 @@
 //! # Composition
 //!
 //! The reviewer prompt is `reviewer_instructions` + the
-//! [`crate::bailiff::REVIEWER_PROMPT_SEPARATOR`] string + the plan
-//! body bytes, joined inline (rather than via
-//! [`crate::bailiff::compose_reviewer_prompt`]) so this slice does
-//! not grow a fresh dependency on `agent_plan::PlanBody` — slice G
-//! deletes that type, and re-wrapping bytes in `PlanBody` just to
-//! unwrap them again would be churn. Sharing only the `&'static str`
-//! separator keeps the two compositions phrase-identical until the
-//! constant moves to its post-slice-G home.
+//! [`REVIEWER_PROMPT_SEPARATOR`] string + the plan body bytes, joined
+//! inline (rather than wrapping into `agent_plan::PlanBody` first) to
+//! avoid re-wrapping bytes just to unwrap them again for signing.
 //!
 //! # Error handling
 //!
@@ -45,7 +40,6 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio::task::JoinError;
 
 use crate::agent_run::{AgentPrompt, AgentPromptError};
-use crate::bailiff::REVIEWER_PROMPT_SEPARATOR;
 use crate::bailiff_plan_note::{PlanId, PlanNote};
 use crate::bailiff_plan_read::{
     ReadPlanBodyError, ReadPlanError, read_plan_body_bytes, read_plan_note,
@@ -275,13 +269,20 @@ pub async fn submit_review(
     })
 }
 
+/// Separator the reviewer's effective prompt uses between the
+/// reviewer instructions and the plan body under evaluation. Distinct
+/// from the implementer-side `# Approved plan` heading
+/// (`bailiff_plan_implement.rs::PLAN_PROMPT_SEPARATOR`) because the
+/// plan has not been accepted at the point the reviewer reads it:
+/// `# Proposed plan` makes that frame explicit so an LLM cannot
+/// mistake the artefact's status.
+const REVIEWER_PROMPT_SEPARATOR: &str = "\n\n---\n\n# Proposed plan\n\n";
+
 /// Compose the reviewer's effective prompt from operator instructions
-/// and the planner's plan body. Inline counterpart to
-/// [`crate::bailiff::compose_reviewer_prompt`] that takes raw `&str`
-/// rather than `agent_plan::PlanBody` — slice G deletes that type
-/// and re-wrapping bytes in it just to unwrap them is churn. The
-/// separator string is the same `&'static str` the existing
-/// composer uses so both renderings stay phrase-identical.
+/// and the planner's plan body. Takes raw `&str` rather than
+/// `agent_plan::PlanBody` because the plan body has already been
+/// extracted from the signed planner envelope as bytes — re-wrapping
+/// it just to unwrap it again for signing would be churn.
 fn compose_reviewer_prompt_bytes(
     reviewer_instructions: &str,
     plan_body: &str,
@@ -404,11 +405,9 @@ pub enum SubmitReviewError {
 #[cfg(test)]
 mod compose_tests {
     //! Tests for [`compose_reviewer_prompt_bytes`]. The composer
-    //! is intentionally tiny — same shape as the existing
-    //! [`crate::bailiff::compose_reviewer_prompt`] but taking
-    //! `&str` — and the two tests pin the load-bearing properties:
-    //! the separator appears verbatim, and the byte cap fires on
-    //! the combined length.
+    //! is intentionally tiny; the two tests pin the load-bearing
+    //! properties: the separator appears verbatim, and the byte cap
+    //! fires on the combined length.
     use super::*;
 
     #[test]

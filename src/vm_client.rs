@@ -443,11 +443,10 @@ pub async fn fetch_agent_run_config(
         .map_err(VmClientError::from)
 }
 
-/// Fetch a plan view from the host broker. Orphan-pub: the live caller
-/// (`writ-vm`'s legacy plan dispatch) was removed in slice G2's
-/// follow-up; the route handler at `/v1/plans/<id>` is gone after
-/// G2 too. Kept for one more slice so the G3 deletion of the
-/// related compose helpers in `src/bailiff.rs` lands cleanly.
+/// Fetch a plan view from the host broker. Orphan-pub: the live
+/// caller (`writ-vm`'s legacy plan dispatch) was removed in slice
+/// G2's follow-up and the route handler at `/v1/plans/<id>` is also
+/// gone. Deleted alongside the rest of `agent_plan` in slice G5.
 pub async fn fetch_plan(
     config: &VmClientConfig,
     plan_id: PlanId,
