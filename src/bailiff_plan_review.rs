@@ -17,7 +17,7 @@
 //! # Composition
 //!
 //! The reviewer prompt is `reviewer_instructions` + the
-//! [`REVIEWER_PROMPT_SEPARATOR`] string + the plan body bytes, joined
+//! `REVIEWER_PROMPT_SEPARATOR` string + the plan body bytes, joined
 //! inline (rather than wrapping into `agent_plan::PlanBody` first) to
 //! avoid re-wrapping bytes just to unwrap them again for signing.
 //!

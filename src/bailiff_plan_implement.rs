@@ -20,7 +20,7 @@
 //!    surfaces three pre-RPC error variants — `PlanSubmissionMissing`,
 //!    `PlanNotDecided`, `PlanRejected` — so an operator can tell which
 //!    precondition tripped.
-//! 2. The composed prompt uses [`PLAN_PROMPT_SEPARATOR`]
+//! 2. The composed prompt uses `PLAN_PROMPT_SEPARATOR`
 //!    (`# Approved plan`), not the reviewer's `# Proposed plan`. The
 //!    implementer is acting on an accepted artefact and the prompt
 //!    framing makes that explicit so an LLM reading the combined
@@ -29,7 +29,7 @@
 //! # Composition
 //!
 //! The implementer prompt is `feature_prompt` + the
-//! [`PLAN_PROMPT_SEPARATOR`] string + the plan body bytes, joined
+//! `PLAN_PROMPT_SEPARATOR` string + the plan body bytes, joined
 //! inline (rather than wrapping into `agent_plan::PlanBody` first)
 //! to avoid re-wrapping bytes just to unwrap them again for signing.
 //!
