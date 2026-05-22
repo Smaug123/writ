@@ -1416,18 +1416,42 @@ pub async fn materialize_vm_signed_envelope(
     use crate::protocol::SignedRunMetadata;
     use crate::run_envelope::{OutputEnvelope, SignedRunEnvelope};
 
-    let (stdout_bytes, stdout_truncated_at) = read_stream_capped_from_disk(
+    let (stdout_bytes, stdout_host_truncated_at) = read_stream_capped_from_disk(
         "stdout",
         &outcome.outcome.stdout.path,
         crate::server::MAX_RUN_AGENT_STREAM_BYTES,
     )
     .await?;
-    let (stderr_bytes, stderr_truncated_at) = read_stream_capped_from_disk(
+    let (stderr_bytes, stderr_host_truncated_at) = read_stream_capped_from_disk(
         "stderr",
         &outcome.outcome.stderr.path,
         crate::server::MAX_RUN_AGENT_STREAM_BYTES,
     )
     .await?;
+    // Two truncation layers stack on the VM path: the guest-side
+    // capture cap (default 1 MiB per stream, configurable via
+    // `DEFAULT_AGENT_RUN_STREAM_CAPTURE_BYTES`) decides what landed on
+    // disk in the first place, and the host-side envelope cap
+    // (`MAX_RUN_AGENT_STREAM_BYTES`, 4 MiB) re-bounds what we read off
+    // disk. The on-disk file is at most the guest-retained prefix —
+    // when the guest truncated, the file *is* the prefix and the
+    // 4-MiB host cap doesn't fire, so `host_truncated_at` is `None`.
+    // Without inspecting `outcome.outcome.<stream>.truncated`, a
+    // 2-MiB-of-stdout run that the guest already cut to 1 MiB would
+    // be signed as if 1 MiB were the whole stream — a verifier would
+    // not see the prefix marker. Fall back to the guest-side flag
+    // when the host cap didn't trigger; `byte_len` is the retained
+    // prefix length when truncated, which is the correct cap point.
+    let stdout_truncated_at = stdout_host_truncated_at.or(outcome
+        .outcome
+        .stdout
+        .truncated
+        .then_some(outcome.outcome.stdout.byte_len));
+    let stderr_truncated_at = stderr_host_truncated_at.or(outcome
+        .outcome
+        .stderr
+        .truncated
+        .then_some(outcome.outcome.stderr.byte_len));
 
     let output_envelope = OutputEnvelope {
         stdout: stdout_bytes,
@@ -2948,6 +2972,81 @@ mod tests {
         assert_eq!(output_envelope.stdout.len(), cap);
         assert_eq!(output_envelope.stdout_truncated_at, Some(cap as u64));
         assert!(output_envelope.stderr.is_empty());
+        assert_eq!(output_envelope.stderr_truncated_at, None);
+    }
+
+    /// When the guest already truncated a stream (the VM HTTP runner
+    /// caps at `DEFAULT_AGENT_RUN_STREAM_CAPTURE_BYTES`, default 1 MiB)
+    /// the on-disk file is the retained prefix — strictly smaller than
+    /// the host's 4-MiB envelope cap. Without consulting
+    /// `outcome.<stream>.truncated`, the materialiser would sign the
+    /// prefix as if it were the whole stream. Pin: a guest-truncated
+    /// stream surfaces a non-None `*_truncated_at` marker pointing at
+    /// the retained byte length, so a verifier can tell the envelope
+    /// holds a prefix.
+    #[tokio::test]
+    async fn materialize_vm_envelope_preserves_guest_truncation_flag() {
+        use crate::agent_run::{
+            AgentRunOutcome, AgentRunStreamSummary, AgentRunTerminalStatus, sha256_hex,
+        };
+        use crate::core::Sha256Hex;
+        use crate::run_envelope::{OutputEnvelope, SignedRunEnvelope};
+        use crate::signing::WritSigningKey;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let signing_key = WritSigningKey::from_openssh_pem(TEST_SIGNING_PEM).unwrap();
+        let run_id = AgentRunId::new();
+        let run_dir = tmp.path().join(run_id.to_string());
+        fs::create_dir_all(&run_dir).unwrap();
+        // The retained prefix sits well under the host's 4-MiB cap so
+        // `read_stream_capped_from_disk` returns host_truncated_at =
+        // None. The audit row's `truncated: true` is what carries the
+        // signal that this is a prefix.
+        let stdout_prefix = vec![b'g'; 8 * 1024];
+        let stdout_path = run_dir.join("stdout.log");
+        let stderr_path = run_dir.join("stderr.log");
+        fs::write(&stdout_path, &stdout_prefix).unwrap();
+        fs::write(&stderr_path, b"").unwrap();
+        let outcome = crate::audit::AgentRunOutcomeAuditRecord {
+            completed_at: UnixMillis::from_millis(1_700_000_000),
+            outcome: AgentRunOutcome {
+                run_id,
+                status: AgentRunTerminalStatus::Succeeded,
+                exit_code: 0,
+                stdout: AgentRunStreamSummary {
+                    path: stdout_path,
+                    byte_len: stdout_prefix.len() as u64,
+                    sha256_hex: sha256_hex(&stdout_prefix),
+                    truncated: true,
+                },
+                stderr: AgentRunStreamSummary {
+                    path: stderr_path,
+                    byte_len: 0,
+                    sha256_hex: sha256_hex(b""),
+                    truncated: false,
+                },
+            },
+        };
+
+        let prompt_sha256 = Sha256Hex::try_new(crate::agent_run::sha256_hex(b"prompt")).unwrap();
+        let materialized = materialize_vm_signed_envelope(
+            &outcome,
+            SessionId::new(),
+            prompt_sha256,
+            vec![],
+            &signing_key,
+        )
+        .await
+        .unwrap();
+
+        let decoded = SignedRunEnvelope::from_bytes(&materialized.envelope_bytes).unwrap();
+        let output_envelope = OutputEnvelope::from_bytes(&decoded.output).unwrap();
+        assert_eq!(output_envelope.stdout, stdout_prefix);
+        assert_eq!(
+            output_envelope.stdout_truncated_at,
+            Some(stdout_prefix.len() as u64),
+            "guest truncation must reach the envelope marker even when the host cap doesn't fire",
+        );
         assert_eq!(output_envelope.stderr_truncated_at, None);
     }
 }

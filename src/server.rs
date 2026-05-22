@@ -2347,6 +2347,10 @@ async fn run_agent_in_vm<S: SecretStore + Send + Sync + 'static>(
     {
         Ok(s) => s,
         Err(err) => {
+            // Start failed: the lifecycle never registered a managed
+            // VM (the `Err` arm of `start_agent_run_session` already
+            // closes the audit session on failure), so there's
+            // nothing to tear down here.
             return ServerMessage::Error {
                 message: format!("RunAgent: start agent VM run: {err}"),
             };
@@ -2356,8 +2360,57 @@ async fn run_agent_in_vm<S: SecretStore + Send + Sync + 'static>(
     let session_id = started.session_id();
     let run_id = started.run_id();
 
-    let outcome = match crate::agent_vm_daemon::wait_for_agent_run_outcome(
+    // After `start_agent_run_session` returns Ok, the VM is live with
+    // an open audit session and broker token. Every return path below
+    // must funnel through `stop_session` so a completed (or
+    // timed-out) run can't leave a guest holding broker authority
+    // until daemon restart. This is the trust-boundary invariant the
+    // VM design rests on: a finished run is no longer authorised.
+    let response = run_agent_in_vm_after_start(
         &state.audit,
+        &notes_repo,
+        &signing_key,
+        session_id,
+        run_id,
+        prompt_sha256,
+        capabilities,
+        output_ref,
+    )
+    .await;
+
+    if let Err(err) = agent_vm.stop_session(state, session_id).await {
+        tracing::warn!(
+            session_id = %session_id,
+            run_id = %run_id,
+            error = %err,
+            "stop agent VM session after RunAgent dispatch failed",
+        );
+    }
+
+    response
+}
+
+/// Post-start half of the VM dispatch arm: wait for the guest's
+/// outcome row, materialise the signed envelope, write the note.
+///
+/// Split out so the caller can wrap every return path with a single
+/// `stop_session` cleanup — the trust-boundary invariant is that a
+/// finished `RunAgent` returns a guest with no live broker authority
+/// regardless of which step inside the dispatch arm produced the
+/// error.
+#[allow(clippy::too_many_arguments)]
+async fn run_agent_in_vm_after_start(
+    audit: &crate::audit::AuditLog,
+    notes_repo: &Arc<crate::notes_repo::NotesRepo>,
+    signing_key: &crate::signing::WritSigningKey,
+    session_id: SessionId,
+    run_id: AgentRunId,
+    prompt_sha256: Sha256Hex,
+    capabilities: Vec<crate::core::CapabilitySet>,
+    output_ref: NotesRef,
+) -> ServerMessage {
+    let outcome = match crate::agent_vm_daemon::wait_for_agent_run_outcome(
+        audit,
         run_id,
         RUN_AGENT_VM_TIMEOUT,
         RUN_AGENT_VM_POLL_INTERVAL,
@@ -2377,7 +2430,7 @@ async fn run_agent_in_vm<S: SecretStore + Send + Sync + 'static>(
         session_id,
         prompt_sha256,
         capabilities,
-        &signing_key,
+        signing_key,
     )
     .await
     {
@@ -2395,8 +2448,7 @@ async fn run_agent_in_vm<S: SecretStore + Send + Sync + 'static>(
     let signature = materialised.envelope.signature;
 
     let write_result = {
-        let notes_repo = Arc::clone(&notes_repo);
-        let output_ref = output_ref.clone();
+        let notes_repo = Arc::clone(notes_repo);
         tokio::task::spawn_blocking(move || {
             notes_repo.write_note(&output_ref, &run_id_seed, &envelope_bytes)
         })
