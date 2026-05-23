@@ -143,6 +143,7 @@ FAKE_GITHUB_PID=""
 FAKE_GIT_ORIGIN_PORT=""
 FAKE_GIT_ORIGIN_PID=""
 WRITD_PID=""
+SUDO_KEEPALIVE_PID=""
 SESSION_ID=""
 NETWORK_NAME=""
 VM_NAME=""
@@ -242,6 +243,10 @@ cleanup() {
   if [[ -n "$WRITD_PID" ]]; then
     kill "$WRITD_PID" >/dev/null 2>&1 || true
     wait "$WRITD_PID" 2>/dev/null || true
+  fi
+  if [[ -n "$SUDO_KEEPALIVE_PID" ]]; then
+    kill "$SUDO_KEEPALIVE_PID" >/dev/null 2>&1 || true
+    wait "$SUDO_KEEPALIVE_PID" 2>/dev/null || true
   fi
   if [[ -n "$FAKE_GITHUB_PID" ]]; then
     kill "$FAKE_GITHUB_PID" >/dev/null 2>&1 || true
@@ -876,6 +881,21 @@ IPV4_CIDR="$(cidr_alloc_subnet "$IPV4_POOL" 24 "$SUBNET_INDEX")"
 
 log "requesting sudo credentials for pfctl"
 sudo -v
+
+# Keep the sudo timestamp warm. The default tty_tickets timeout is short
+# (typically 5 minutes) and this harness shells out to sudo from writd's
+# background dispatch arm long after the initial prompt — after a build,
+# guest-image load, and a real Claude implement run that can each take
+# minutes. Without a refresh loop the later `sudo writ-agent-vm-pf-helper`
+# invocations fail on passworded setups.
+(
+  while true; do
+    sudo -nv >/dev/null 2>&1 || exit 0
+    sleep 60
+  done
+) &
+SUDO_KEEPALIVE_PID=$!
+disown "$SUDO_KEEPALIVE_PID" 2>/dev/null || true
 
 if ! sudo pfctl -s info 2>/dev/null | grep -q 'Status: Enabled'; then
   die "PF is not enabled; enable it before running this proof harness"
