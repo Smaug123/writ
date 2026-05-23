@@ -358,8 +358,8 @@ fn claude_process_plan(
             OsString::from("--output-format"),
             OsString::from("text"),
             OsString::from("--no-session-persistence"),
-            OsString::from("--tools"),
-            OsString::from(""),
+            OsString::from("--permission-mode"),
+            OsString::from("bypassPermissions"),
         ],
     )?
     .with_env_remove(VM_BROKER_URL_ENV)
@@ -375,7 +375,12 @@ fn claude_process_plan(
     // network beyond the broker, so any auto-update or install check just
     // wastes time blocking on a connection it cannot make.
     .with_env("DISABLE_AUTOUPDATER", "1")
-    .with_env("DISABLE_INSTALLATION_CHECKS", "1"))
+    .with_env("DISABLE_INSTALLATION_CHECKS", "1")
+    // Claude Code refuses --permission-mode bypassPermissions under uid 0
+    // unless the process is explicitly marked as sandboxed. The guest image
+    // currently runs this adapter as root, so without IS_SANDBOX=1 the
+    // child exits before it can run any tool calls.
+    .with_env("IS_SANDBOX", "1"))
 }
 
 fn codex_process_plan(
@@ -717,8 +722,8 @@ mod tests {
                 OsString::from("--output-format"),
                 OsString::from("text"),
                 OsString::from("--no-session-persistence"),
-                OsString::from("--tools"),
-                OsString::from(""),
+                OsString::from("--permission-mode"),
+                OsString::from("bypassPermissions"),
             ]
         );
 
@@ -746,6 +751,11 @@ mod tests {
         );
         assert_eq!(
             env.get(&OsString::from("DISABLE_INSTALLATION_CHECKS"))
+                .map(|v| v.to_str().unwrap()),
+            Some("1"),
+        );
+        assert_eq!(
+            env.get(&OsString::from("IS_SANDBOX"))
                 .map(|v| v.to_str().unwrap()),
             Some("1"),
         );
