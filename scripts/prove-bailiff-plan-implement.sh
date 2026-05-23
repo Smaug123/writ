@@ -132,6 +132,7 @@ IMPLEMENT_OUTPUT="${TMP_DIR}/bailiff-implement.out"
 PROMOTE_OUTPUT="${TMP_DIR}/writ-promote-list.out"
 
 CARGO_CMD=()
+TIMEOUT_CMD=""
 REAL_GIT=""
 WRIT_BIN=""
 WRITD_BIN=""
@@ -278,6 +279,16 @@ choose_cargo() {
 choose_real_git() {
   REAL_GIT="$(command -v git || true)"
   [[ -n "$REAL_GIT" ]] || die "missing required command: git"
+}
+
+choose_timeout_cmd() {
+  for candidate in timeout gtimeout; do
+    if command -v "$candidate" >/dev/null 2>&1; then
+      TIMEOUT_CMD="$candidate"
+      return
+    fi
+  done
+  die "missing required command: timeout or gtimeout (install coreutils to enforce WRIT_PROVE_TIMEOUT_SECS)"
 }
 
 default_guest_system() {
@@ -790,7 +801,7 @@ Do exactly these steps using Bash and Edit tools, then exit. Do not ask question
 3. Use the Write or Edit tool to create the file /workspace/{repo_name}/{demo_file} with the literal content: demo content
 4. Run: git -c user.email=demo@writ.invalid -c user.name=demo add {demo_file}
 5. Run: git -c user.email=demo@writ.invalid -c user.name=demo commit -m "demo: add {demo_file}"
-6. Run: NEW_HEAD=$(git rev-parse HEAD); /bin/writ-vm git push {repo_full} --branch {branch} --new-head $NEW_HEAD --create-branch --workdir /workspace/{repo_name}
+6. Run: NEW_HEAD=$(git rev-parse HEAD); /bin/writ-vm --broker-url "$ANTHROPIC_BASE_URL" --broker-token "$ANTHROPIC_AUTH_TOKEN" git push {repo_full} --branch {branch} --new-head $NEW_HEAD --create-branch --workdir /workspace/{repo_name}
 
 When step 6 succeeds, print DONE and exit. If any step fails, print the exact error and exit.
 """
@@ -834,6 +845,7 @@ require_cmd sqlite3
 require_cmd sudo
 choose_cargo
 choose_real_git
+choose_timeout_cmd
 
 case "$WARM" in
   none|sources|devshell) ;;
@@ -958,7 +970,8 @@ fi
 cat "$DECIDE_OUTPUT"
 
 log "running bailiff plan implement (real Claude in VM, timeout=${TIMEOUT_SECS}s)"
-if ! "$BAILIFF_BIN" --socket "$SOCKET_PATH" plan implement \
+if ! "$TIMEOUT_CMD" --kill-after=30 "$TIMEOUT_SECS" \
+  "$BAILIFF_BIN" --socket "$SOCKET_PATH" plan implement \
   --plan-id "$PLAN_ID" \
   --prompt-file "$IMPLEMENT_PROMPT_FILE" \
   --repo "$PROOF_REPO_FULL" \
