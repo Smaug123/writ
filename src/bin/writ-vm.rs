@@ -358,8 +358,6 @@ fn claude_process_plan(
             OsString::from("--output-format"),
             OsString::from("text"),
             OsString::from("--no-session-persistence"),
-            OsString::from("--tools"),
-            OsString::from(""),
         ],
     )?
     .with_env_remove(VM_BROKER_URL_ENV)
@@ -717,8 +715,6 @@ mod tests {
                 OsString::from("--output-format"),
                 OsString::from("text"),
                 OsString::from("--no-session-persistence"),
-                OsString::from("--tools"),
-                OsString::from(""),
             ]
         );
 
