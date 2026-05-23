@@ -627,12 +627,14 @@ import sys
 ) = sys.argv[1:]
 
 config = {
-    "github": {
-        "app_id": 42,
-        "installation_id": 999,
-        "installation_owner": owner,
-        "private_key_secret": "gh-app-pk",
-        "api_base": f"http://127.0.0.1:{fake_github_port}",
+    "github_apps": {
+        "claude": {
+            "app_id": 42,
+            "installation_id": 999,
+            "installation_owner": owner,
+            "private_key_secret": "gh-app-pk",
+            "api_base": f"http://127.0.0.1:{fake_github_port}",
+        },
     },
     "policy": {"default_ttl": 3600, "writable_repos": []},
     "secret_store": {"type": "file", "path": secrets_dir},
@@ -671,7 +673,6 @@ config = {
             "clone_timeout_secs": 10,
             "max_bundle_bytes": 1048576,
             "nix_cache_url": "https://cache.nixos.org",
-            "nix_cache_trusted_public_keys": [],
             "nix_cache_max_metadata_bytes": 1048576,
             "nix_cache_max_nar_bytes": 67108864,
             "claude_proxy": {
