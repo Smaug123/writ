@@ -3,15 +3,16 @@
 //! recording an *accepted* verdict, fetch + verify the signed planner
 //! envelope, decode the planner's stdout as the plan body, compose the
 //! implementer's effective prompt from the operator's feature prompt
-//! and the approved plan body, open a writ session, run the implementer
-//! agent, persist a [`crate::bailiff_plan_note::ImplementNote`] in
-//! bailiff's repo, close the session.
+//! and the approved plan body, request the implementer run via writ's
+//! `RunAgent` RPC (which dispatches to writd's VM arm: the broker
+//! mints its own audit session, runs the agent inside a per-run VM,
+//! and closes the session before returning), persist a
+//! [`crate::bailiff_plan_note::ImplementNote`] in bailiff's repo.
 //!
-//! Sibling to [`crate::bailiff_plan_review::submit_review`]: the
-//! post-`OpenSession` contract is identical (close-on-error on every
-//! later failure) and the pre-RPC fetch-verify-decode chain is the
-//! same lifted `read_plan_body_bytes` helper. The two novelties of
-//! the implement workflow are:
+//! Sibling to [`crate::bailiff_plan_review::submit_review`], with the
+//! same pre-RPC fetch-verify-decode chain via the lifted
+//! `read_plan_body_bytes` helper. The two novelties of the implement
+//! workflow are:
 //!
 //! 1. The decision-note gate. Per slice E of
 //!    `docs/plans/2026-05-14-bailiff-split.md`: "the *is the plan
@@ -41,13 +42,11 @@
 //! # Error handling
 //!
 //! Pre-RPC failures (read-side, decision gate, prompt composition)
-//! return without ever opening a writ session, so writ's audit log
-//! stays clean. After the session opens, every failure path attempts
-//! to close the session before returning. A close-during-cleanup
-//! failure is suppressed in favour of the original error — the
-//! original is always the more actionable one. Returning a
-//! close-only failure is still surfaced when the workflow itself
-//! succeeded.
+//! return without ever invoking writ, so writ's audit log stays
+//! clean. VM mode mints its own audit session and closes it on the
+//! broker side before `RunAgent` returns, so bailiff has no session
+//! to clean up on a post-RPC failure: the audit window is entirely
+//! broker-managed.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -68,7 +67,7 @@ use crate::bailiff_repo_guard::BailiffRepoGuard;
 use crate::core::{AgentKind, CapabilitySet, NotesRef, SessionId};
 use crate::notes_repo::NotesRepo;
 use crate::run_verify::AllowedSigners;
-use crate::vm_git::GitObjectId;
+use crate::vm_git::{AgentVmWorkspaceBootstrap, GitObjectId};
 use crate::writ_client::{RunAgentCompleted, RunAgentRequest, WritClient, WritClientError};
 
 /// Inputs to [`submit_implement`]. Mirror of
@@ -107,17 +106,33 @@ pub struct SubmitImplementInputs {
     /// the function honest about the same ref bailiff later passes
     /// to [`write_implement_note`].
     pub writ_output_ref: NotesRef,
-    /// Optional human-readable session label. Stored on writ's audit
-    /// session row; informational only.
-    pub session_label: Option<String>,
-    /// Optional coarse agent identity. Writ uses it for GitHub-App
-    /// selection on credential mints; with a `WorkspaceWrite`
-    /// capability set the field selects which GitHub App to use for
-    /// the implementer's push credentials.
-    pub session_agent_kind: Option<AgentKind>,
-    /// Optional model identifier (e.g. `"claude-opus-4-7"`). Stored
-    /// on writ's audit session row alongside `agent_kind`.
-    pub session_agent_model: Option<String>,
+    /// Coarse agent identity. Writ uses it for GitHub-App selection
+    /// on credential mints; with a `WorkspaceWrite` capability set
+    /// the field selects which GitHub App to use for the
+    /// implementer's push credentials. Required (not optional) here
+    /// because writd's VM dispatch arm rejects a `RunAgent` carrying
+    /// a workspace bootstrap but no `agent_kind`.
+    pub session_agent_kind: AgentKind,
+    /// Model identifier (e.g. `"claude-opus-4-7"`). Stored on writ's
+    /// audit session row alongside `agent_kind`. Required (not
+    /// optional) here because writd's VM dispatch arm rejects a
+    /// `RunAgent` carrying a workspace bootstrap but no
+    /// `agent_model`.
+    pub session_agent_model: String,
+    /// Workspace bootstrap describing the per-run VM checkout the
+    /// implementer agent runs in. The implementer always carries a
+    /// `WorkspaceWrite` capability, so the broker rejects the
+    /// request unless a workspace is supplied; the bootstrap is what
+    /// routes the run into writd's VM dispatch arm.
+    ///
+    /// The bootstrap's `repo` should match the `repo` referenced by
+    /// the `WorkspaceWrite` element of [`Self::capabilities`] (the
+    /// agent's cwd inside the VM is the checkout, and the
+    /// capability tells writd which credential to mint for the push
+    /// — the two must agree or the push will be denied at policy
+    /// time). The CLI binding takes both from the same `--repo`
+    /// flag.
+    pub workspace: AgentVmWorkspaceBootstrap,
 }
 
 /// Outcome of a successful [`submit_implement`] call. Carries the
@@ -236,46 +251,20 @@ pub async fn submit_implement(
         compose_implementer_prompt_bytes(inputs.feature_prompt.as_str(), plan_body.as_str())
             .map_err(SubmitImplementError::ComposeImplementerPrompt)?;
 
-    let session_id = client
-        .open_session(
-            inputs.session_label.clone(),
-            inputs.session_agent_kind,
-            inputs.session_agent_model.clone(),
-        )
+    // VM mode mints its own audit session (the broker rejects a
+    // caller-supplied `session_id` alongside a workspace bootstrap),
+    // and `agent_vm.stop_session` closes that session on the broker
+    // side before `RunAgent` returns. Bailiff therefore neither
+    // opens nor closes a session here: the run's audit window is
+    // entirely broker-managed. The session id surfaces back via the
+    // signed envelope's metadata, which is where the workflow's
+    // `implementer_session_id` field comes from.
+    let run_agent_request = build_implementer_run_agent_request(implementer_prompt, &inputs);
+    let completed = client
+        .run_agent(run_agent_request)
         .await
-        .map_err(SubmitImplementError::OpenSession)?;
-
-    // From here on, every early return must close the session.
-    let run_result = client
-        .run_agent(RunAgentRequest {
-            prompt: implementer_prompt,
-            capabilities: inputs.capabilities,
-            purpose: inputs.purpose.clone(),
-            output_ref: inputs.writ_output_ref.clone(),
-            session_id: Some(session_id),
-        })
-        .await;
-    let completed = match run_result {
-        Ok(c) => c,
-        Err(source) => {
-            let _ = client.close_session(session_id).await;
-            return Err(SubmitImplementError::RunAgent { session_id, source });
-        }
-    };
-
-    // Cross-check the broker honoured the session binding we asked
-    // for: the signed metadata must stamp the same session id we
-    // opened. A mismatch means the broker minted its own id and the
-    // envelope can't be correlated with our audit row — refuse to
-    // persist the implement note.
-    if completed.signed_metadata.session_id != session_id {
-        let returned_session_id = completed.signed_metadata.session_id;
-        let _ = client.close_session(session_id).await;
-        return Err(SubmitImplementError::SessionIdMismatch {
-            session_id,
-            returned_session_id,
-        });
-    }
+        .map_err(SubmitImplementError::RunAgent)?;
+    let session_id = completed.signed_metadata.session_id;
 
     // `write_implement_note` is blocking (shells out to git). Run
     // under the workflow-held guard so the lock spans this section
@@ -300,18 +289,12 @@ pub async fn submit_implement(
     let implement_note_oid = match write_outcome {
         Ok(Ok(oid)) => oid,
         Ok(Err(source)) => {
-            let _ = client.close_session(session_id).await;
             return Err(SubmitImplementError::WriteImplementNote { session_id, source });
         }
         Err(source) => {
-            let _ = client.close_session(session_id).await;
             return Err(SubmitImplementError::WriteTaskFailed { session_id, source });
         }
     };
-
-    if let Err(source) = client.close_session(session_id).await {
-        return Err(SubmitImplementError::CloseSession { session_id, source });
-    }
 
     Ok(SubmitImplementOutcome {
         plan_id,
@@ -319,6 +302,29 @@ pub async fn submit_implement(
         implementer_session_id: session_id,
         run: completed,
     })
+}
+
+/// Pure binding from [`SubmitImplementInputs`] to the wire-level
+/// [`RunAgentRequest`] writd receives. Lifted out so the field-level
+/// invariants — the workspace bootstrap routes the run into writd's
+/// VM dispatch arm, `agent_kind` / `agent_model` carry the
+/// VM-required identity, and `session_id` stays `None` so writd's
+/// VM dispatch arm mints its own audit session — are testable
+/// without standing up a broker.
+fn build_implementer_run_agent_request(
+    composed_prompt: AgentPrompt,
+    inputs: &SubmitImplementInputs,
+) -> RunAgentRequest {
+    RunAgentRequest {
+        prompt: composed_prompt,
+        capabilities: inputs.capabilities.clone(),
+        purpose: inputs.purpose.clone(),
+        output_ref: inputs.writ_output_ref.clone(),
+        session_id: None,
+        workspace: Some(inputs.workspace.clone()),
+        agent_kind: Some(inputs.session_agent_kind),
+        agent_model: Some(inputs.session_agent_model.clone()),
+    }
 }
 
 /// Separator the implementer's effective prompt uses between the
@@ -347,11 +353,13 @@ fn compose_implementer_prompt_bytes(
 }
 
 /// Tagged failure modes of [`submit_implement`]. Pre-RPC variants
-/// return before any writ session is opened; post-RPC variants
-/// carry the [`SessionId`] [`submit_implement`] minted, and by the
-/// time the variant is returned, [`submit_implement`] has *attempted*
-/// to close that session. `CloseSession` is the one variant where
-/// the close itself failed — the session may still be open.
+/// return before writ is invoked; post-RPC variants surface either
+/// the `RunAgent` failure itself (no session id is available — the
+/// VM dispatch arm mints its own and closes it before returning)
+/// or a failure that happens after `RunAgent` succeeded, in which
+/// case the variant carries the [`SessionId`] writ stamped into the
+/// signed metadata. The broker-side session is already closed by
+/// the time any post-RPC variant returns.
 #[derive(Debug, Error)]
 pub enum SubmitImplementError {
     /// The `spawn_blocking` task that owns the pre-RPC read chain
@@ -417,37 +425,12 @@ pub enum SubmitImplementError {
     /// the operator's recourse is to narrow one side. Pre-RPC.
     #[error("composing the implementer prompt failed: {0}")]
     ComposeImplementerPrompt(#[source] AgentPromptError),
-    /// The initial `OpenSession` RPC failed. Workflow never
-    /// started; no cleanup needed.
-    #[error("opening writ session failed: {0}")]
-    OpenSession(#[source] WritClientError),
-    /// The `RunAgent` RPC failed. The session was closed before
-    /// returning this error so writ's audit log shows the workflow
-    /// ended cleanly.
-    #[error("RunAgent RPC failed (session {session_id}): {source}")]
-    RunAgent {
-        session_id: SessionId,
-        #[source]
-        source: WritClientError,
-    },
-    /// The broker stamped a different session id into the signed
-    /// metadata than the one we asked it to bind. Indicates the
-    /// broker is at a wire version that ignores the `session_id`
-    /// field — the envelope is unusable because it can't be
-    /// correlated to our audit row. The session bailiff opened was
-    /// closed before this error returned; no bailiff-side implement
-    /// note is written.
-    #[error(
-        "broker returned signed metadata bound to session {returned_session_id}, \
-         expected {session_id}"
-    )]
-    SessionIdMismatch {
-        /// The session id bailiff opened and passed in `RunAgent`.
-        session_id: SessionId,
-        /// The session id the broker actually stamped into the
-        /// signed metadata.
-        returned_session_id: SessionId,
-    },
+    /// The `RunAgent` RPC failed. The VM dispatch arm mints its
+    /// own audit session and closes it on the broker side before
+    /// returning, so no caller-side cleanup is needed; there is
+    /// also no session id to surface (one was never returned).
+    #[error("RunAgent RPC failed: {0}")]
+    RunAgent(#[source] WritClientError),
     /// Fetch/verify/write of the bailiff-side implement note failed.
     /// Writ already ran the implementer agent and signed the envelope,
     /// so an operator can re-attempt the implement-note write against
@@ -469,17 +452,6 @@ pub enum SubmitImplementError {
         session_id: SessionId,
         #[source]
         source: JoinError,
-    },
-    /// The implement note was written but the closing `CloseSession`
-    /// failed. The workflow's persistent state (the implement note in
-    /// bailiff's repo) is already in place; this is a session-row
-    /// cleanup failure that an operator can ignore in most cases,
-    /// but the variant surfaces it so scripts can react if needed.
-    #[error("closing writ session {session_id} after implement submit failed: {source}")]
-    CloseSession {
-        session_id: SessionId,
-        #[source]
-        source: WritClientError,
     },
 }
 
@@ -533,6 +505,84 @@ mod compose_tests {
                 feature_text.len() + PLAN_PROMPT_SEPARATOR.len() + plan_text.len(),
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod build_request_tests {
+    //! Unit tests for the pure `build_implementer_run_agent_request`
+    //! helper. The helper is the binding between `SubmitImplementInputs`
+    //! and the wire-level `RunAgentRequest` writd receives: every field
+    //! the implementer cares about (workspace bootstrap, agent kind,
+    //! agent model) must flow through verbatim, and the VM-mints-its-
+    //! own-session invariant (`session_id: None`) must hold.
+    use super::*;
+    use crate::core::{AgentKind, RepoRef};
+    use crate::vm_git::{AgentVmWorkspaceBootstrap, GitCloneRepo, WorkspaceWarmMode};
+    use std::path::PathBuf;
+
+    fn sample_workspace() -> AgentVmWorkspaceBootstrap {
+        AgentVmWorkspaceBootstrap {
+            repo: GitCloneRepo::new(RepoRef {
+                owner: "smaug123".into(),
+                name: "writ".into(),
+            })
+            .unwrap(),
+            destination: Some(PathBuf::from("/workspace/writ")),
+            warm: WorkspaceWarmMode::DevShell,
+        }
+    }
+
+    fn sample_inputs() -> SubmitImplementInputs {
+        SubmitImplementInputs {
+            plan_id: PlanId::new(),
+            feature_prompt: AgentPrompt::try_new("Implement feature X.").unwrap(),
+            capabilities: vec![CapabilitySet::WorkspaceWrite {
+                repo: RepoRef {
+                    owner: "smaug123".into(),
+                    name: "writ".into(),
+                },
+            }],
+            purpose: "plan-implement".into(),
+            writ_output_ref: NotesRef::try_new("refs/notes/writ/v1/agent-outputs").unwrap(),
+            session_agent_kind: AgentKind::Claude,
+            session_agent_model: "claude-opus-4-7".into(),
+            workspace: sample_workspace(),
+        }
+    }
+
+    /// `build_implementer_run_agent_request` carries every VM-relevant
+    /// field of `SubmitImplementInputs` onto the `RunAgentRequest` writd
+    /// will see: the workspace bootstrap (so dispatch routes into the
+    /// VM arm), the agent kind and agent model (required by the VM arm
+    /// since the broker doesn't pick a default), and `session_id: None`
+    /// (VM mode mints its own audit session; passing a caller-supplied
+    /// id alongside a workspace bootstrap is what `run_agent_in_vm`
+    /// rejects with "VM mode mints its own audit session").
+    #[test]
+    fn build_implementer_run_agent_request_threads_workspace_and_agent_identity() {
+        let inputs = sample_inputs();
+        let prompt = AgentPrompt::try_new("composed-prompt").unwrap();
+        let req = build_implementer_run_agent_request(prompt.clone(), &inputs);
+
+        assert_eq!(req.prompt.as_str(), prompt.as_str());
+        assert_eq!(req.capabilities, inputs.capabilities);
+        assert_eq!(req.purpose, inputs.purpose);
+        assert_eq!(req.output_ref, inputs.writ_output_ref);
+        assert_eq!(
+            req.session_id, None,
+            "VM mode mints its own audit session; bailiff must not pre-open one",
+        );
+        assert_eq!(
+            req.workspace.as_ref(),
+            Some(&inputs.workspace),
+            "workspace bootstrap must thread through verbatim",
+        );
+        assert_eq!(req.agent_kind, Some(inputs.session_agent_kind));
+        assert_eq!(
+            req.agent_model.as_deref(),
+            Some(inputs.session_agent_model.as_str())
+        );
     }
 }
 
@@ -726,6 +776,7 @@ mod end_to_end_tests {
     }
 
     fn implement_inputs(plan_id: PlanId) -> SubmitImplementInputs {
+        use crate::vm_git::{GitCloneRepo, WorkspaceWarmMode};
         SubmitImplementInputs {
             plan_id,
             feature_prompt: AgentPrompt::try_new("Rename foo to bar.").unwrap(),
@@ -734,9 +785,13 @@ mod end_to_end_tests {
             }],
             purpose: "plan-implement".into(),
             writ_output_ref: NotesRef::try_new("refs/notes/writ/v1/agent-outputs").unwrap(),
-            session_label: Some("plan-implement:test".into()),
-            session_agent_kind: Some(AgentKind::Claude),
-            session_agent_model: Some("claude-test".into()),
+            session_agent_kind: AgentKind::Claude,
+            session_agent_model: "claude-test".into(),
+            workspace: AgentVmWorkspaceBootstrap {
+                repo: GitCloneRepo::new(writ_repo_ref()).unwrap(),
+                destination: None,
+                warm: WorkspaceWarmMode::DevShell,
+            },
         }
     }
 

@@ -201,6 +201,9 @@ pub async fn submit_review(
             purpose: inputs.purpose.clone(),
             output_ref: inputs.writ_output_ref.clone(),
             session_id: Some(session_id),
+            workspace: None,
+            agent_kind: None,
+            agent_model: None,
         })
         .await;
     let completed = match run_result {
