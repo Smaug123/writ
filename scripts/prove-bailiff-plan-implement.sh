@@ -879,6 +879,18 @@ else
   die "set WRIT_PROVE_CLAUDE_CODE_OAUTH_TOKEN, CLAUDE_CODE_OAUTH_TOKEN, WRIT_PROVE_ANTHROPIC_API_KEY, or ANTHROPIC_API_KEY in the host environment"
 fi
 
+# Confine the credential to CRED_VALUE before we invoke any subprocesses.
+# load_guest_image, cargo build, and the Nix/cargo build scripts those
+# fan out into would otherwise inherit the live Anthropic token from the
+# caller's environment. Past this point only the temp secrets store
+# (later written under SECRETS_DIR) holds the value.
+unset CLAUDE_OAUTH_TOKEN_VALUE
+unset ANTHROPIC_API_KEY_VALUE
+unset WRIT_PROVE_CLAUDE_CODE_OAUTH_TOKEN
+unset CLAUDE_CODE_OAUTH_TOKEN
+unset WRIT_PROVE_ANTHROPIC_API_KEY
+unset ANTHROPIC_API_KEY
+
 IPV4_CIDR="$(cidr_alloc_subnet "$IPV4_POOL" 24 "$SUBNET_INDEX")"
 
 log "requesting sudo credentials for pfctl"
