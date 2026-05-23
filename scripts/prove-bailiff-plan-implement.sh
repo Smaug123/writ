@@ -174,8 +174,10 @@ dump_audit_summary() {
        LEFT JOIN claude_proxy_outcome USING (request_id);" \
     >&2 || true
   sqlite3 "$AUDIT_DB" \
-    "SELECT request_id, repo, branch, new_head, expected_remote_head, staged_at
-       FROM git_push_staged;" \
+    "SELECT r.push_request_id, r.repo, r.branch, r.new_head,
+            r.expected_remote_head, o.result, o.completed_at, o.message
+       FROM git_push_request r
+       LEFT JOIN git_push_outcome o USING (push_request_id);" \
     >&2 || true
 }
 
