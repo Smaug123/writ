@@ -962,6 +962,38 @@ impl<S: SecretStore> VmHttpNixCacheService<S> {
         admission: &VmHttpNixCacheAdmittedNar,
     ) -> VmHttpNixCacheProxyFetch {
         let local_url = local_file_url(nar_path);
+        if method == "HEAD" {
+            // HEAD needs only the (bounded) length — never buffer a potentially
+            // large NAR just to discard it.
+            return match stat_local_cache_file(nar_path, self.config.max_nar_bytes).await {
+                LocalCacheStat::Missing => {
+                    local_failure(local_url, "local nar missing for admitted path")
+                }
+                LocalCacheStat::TooLarge => local_failure(local_url, "local nar too large"),
+                LocalCacheStat::Io(err) => {
+                    tracing::warn!(
+                        path = %nar_path.display(),
+                        error = %err,
+                        "vm http nix cache local nar stat failed",
+                    );
+                    local_failure(local_url, "local nar read failed")
+                }
+                LocalCacheStat::Len(content_length) => VmHttpNixCacheProxyFetch {
+                    upstream_url: local_url,
+                    upstream_status: None,
+                    response_bytes: 0,
+                    error: None,
+                    response: VmHttpResponse {
+                        status: VmHttpStatus::Ok,
+                        content_type: "application/x-nix-nar",
+                        body: Vec::new(),
+                        content_length: Some(content_length),
+                        www_authenticate: None,
+                        headers: Vec::new(),
+                    },
+                },
+            };
+        }
         let body = match read_local_cache_file(nar_path, self.config.max_nar_bytes).await {
             LocalCacheFile::Missing => {
                 return local_failure(local_url, "local nar missing for admitted path");
@@ -978,23 +1010,6 @@ impl<S: SecretStore> VmHttpNixCacheService<S> {
             LocalCacheFile::Bytes(body) => body,
         };
         let content_length = body.len() as u64;
-        if method == "HEAD" {
-            let response = VmHttpResponse {
-                status: VmHttpStatus::Ok,
-                content_type: "application/x-nix-nar",
-                body: Vec::new(),
-                content_length: Some(content_length),
-                www_authenticate: None,
-                headers: Vec::new(),
-            };
-            return VmHttpNixCacheProxyFetch {
-                upstream_url: local_url,
-                upstream_status: None,
-                response_bytes: 0,
-                error: None,
-                response,
-            };
-        }
         let response_bytes = content_length;
         let body = match verify_nar_body_on_blocking_thread(
             admission.clone(),
@@ -1389,6 +1404,29 @@ async fn read_local_cache_file(path: &Path, max: u64) -> LocalCacheFile {
         return LocalCacheFile::TooLarge;
     }
     LocalCacheFile::Bytes(body)
+}
+
+/// Outcome of a bounded *stat* of a local-archive file — its length without
+/// reading the body. Used to answer a NAR `HEAD` without buffering the (large)
+/// payload.
+enum LocalCacheStat {
+    Missing,
+    TooLarge,
+    Io(std::io::Error),
+    Len(u64),
+}
+
+/// Stat a local-archive file, enforcing `max` fail-closed and mapping an absent
+/// (or non-regular) file to [`LocalCacheStat::Missing`]. Returns the byte length
+/// without opening the body.
+async fn stat_local_cache_file(path: &Path, max: u64) -> LocalCacheStat {
+    match tokio::fs::metadata(path).await {
+        Ok(metadata) if !metadata.is_file() => LocalCacheStat::Missing,
+        Ok(metadata) if metadata.len() > max => LocalCacheStat::TooLarge,
+        Ok(metadata) => LocalCacheStat::Len(metadata.len()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => LocalCacheStat::Missing,
+        Err(err) => LocalCacheStat::Io(err),
+    }
 }
 
 /// The `file://` URL recorded as the (non-HTTP) source of a local serve, so the
@@ -3528,6 +3566,49 @@ mod tests {
             entries[1].error.as_deref(),
             Some("local nar missing for admitted path"),
         );
+    }
+
+    #[tokio::test]
+    async fn local_nar_head_returns_content_length_without_the_body() {
+        let upstream = MockServer::start().await;
+        let state = make_broker_state(&upstream);
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+        open_audit_session(&state, session.session_id());
+        let cache = tempfile::tempdir().unwrap();
+        let nar_file = "input.nar.xz";
+        let (hash, _, compressed) =
+            write_local_ca_entry(cache.path(), "source", nar_file, b"head this nar");
+        let service =
+            nix_cache_service_with_local_cache(&state, DEAD_UPSTREAM, cache.path(), 4096, 4096);
+
+        let narinfo = route_nix_cache_with_service(
+            &session,
+            "GET",
+            format!("{VM_NIX_CACHE_PATH_PREFIX}/{hash}.narinfo"),
+            service.clone(),
+        )
+        .await;
+        let head = route_nix_cache_with_service(
+            &session,
+            "HEAD",
+            format!("{VM_NIX_CACHE_PATH_PREFIX}/nar/{nar_file}"),
+            service,
+        )
+        .await;
+
+        assert_eq!(narinfo.status, VmHttpStatus::Ok);
+        assert_eq!(head.status, VmHttpStatus::Ok);
+        assert_eq!(head.content_type, "application/x-nix-nar");
+        assert!(head.body.is_empty());
+        assert_eq!(head.content_length, Some(compressed.len() as u64));
+        let entries = state
+            .audit
+            .list_nix_cache_requests_for_session(session.session_id())
+            .unwrap();
+        assert_eq!(entries[1].route, NixCacheAuditRoute::Nar);
+        assert_eq!(entries[1].http_status, Some(200));
+        assert_eq!(entries[1].response_bytes, Some(0));
+        assert_eq!(entries[1].error, None);
     }
 
     #[tokio::test]
