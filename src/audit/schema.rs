@@ -49,7 +49,7 @@ pub(super) struct Migration {
 /// a version higher than this is rejected with [`AuditError::SchemaTooNew`]
 /// rather than opened — we'd rather fail to start than silently drop data
 /// into a schema a newer broker wrote.
-pub(super) const SCHEMA_VERSION: i32 = 4;
+pub(super) const SCHEMA_VERSION: i32 = 5;
 
 /// The full migration history. Each entry documents exactly one state
 /// transition; the sequence of entries is the schema's lineage. Order
@@ -80,6 +80,11 @@ pub(super) const MIGRATIONS: &[Migration] = &[
         version: 4,
         name: "0004_approve_attempt_reconciliation",
         sql: include_str!("migrations/0004_approve_attempt_reconciliation.sql"),
+    },
+    Migration {
+        version: 5,
+        name: "0005_flake_provision",
+        sql: include_str!("migrations/0005_flake_provision.sql"),
     },
 ];
 
@@ -347,6 +352,8 @@ mod tests {
             "openai_proxy_outcome",
             "nix_cache_request",
             "nix_cache_outcome",
+            "flake_provision_request",
+            "flake_provision_outcome",
             "git_push_request",
             "git_push_outcome",
             "git_push_resolution",
@@ -381,6 +388,7 @@ mod tests {
             "claude_proxy_request_requires_open_session",
             "openai_proxy_request_requires_open_session",
             "nix_cache_request_requires_open_session",
+            "flake_provision_request_requires_open_session",
             "git_push_request_requires_open_session",
             "git_push_resolution_requires_staged",
             "git_push_resolution_refuses_active_approve",
