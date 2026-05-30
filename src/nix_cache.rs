@@ -4,6 +4,9 @@ use base64::Engine as _;
 
 const NIX_STORE_HASH_LEN: usize = 32;
 const NIX_STORE_HASH_ALPHABET: &[u8] = b"0123456789abcdfghijklmnpqrsvwxyz";
+/// Truncated-SHA-256 length (in bytes) of a Nix store-path hash; the 32-char
+/// store hash is this many bytes in nix-base32.
+const NIX_STORE_PATH_HASH_LEN: usize = 20;
 const NIX_SHA256_DIGEST_LEN: usize = 32;
 const NIX_SHA256_BASE32_LEN: usize = 52;
 const NIX_ED25519_PUBLIC_KEY_LEN: usize = 32;
@@ -355,6 +358,15 @@ impl NixStorePath {
 
     pub fn hash(&self) -> &NixStoreHashPart {
         &self.hash
+    }
+
+    /// The name part after `/nix/store/<hash>-`.
+    pub fn name(&self) -> &str {
+        self.raw
+            .strip_prefix("/nix/store/")
+            .and_then(|rest| rest.split_once('-'))
+            .map(|(_, name)| name)
+            .expect("a parsed NixStorePath always has the /nix/store/<hash>-<name> shape")
     }
 }
 
@@ -892,6 +904,20 @@ pub enum NixContentAddressedNarInfoError {
         content_address: String,
         nar_hash: String,
     },
+    /// The narinfo self-certifies by CA/NarHash, but its StorePath hash is not
+    /// the reference-free Nix fixed-output path derived from that content
+    /// address and store name — so the path's identity does not match its
+    /// content (and the guest would reject it). Refused. A referenced CA path,
+    /// which fetched flake inputs never are, also lands here: only the
+    /// reference-free derivation is checked.
+    #[error(
+        "content-addressed narinfo StorePath {store_path:?} is not the reference-free fixed-output \
+         path derived from its content address {content_address:?}"
+    )]
+    StorePathNotContentDerived {
+        store_path: String,
+        content_address: String,
+    },
 }
 
 /// Parse a narinfo from the broker's *local* flake-input archive and admit it
@@ -935,6 +961,27 @@ pub fn parse_content_addressed_narinfo_for_store_hash(
             nar_hash: narinfo.nar_hash.as_str().to_owned(),
         });
     }
+    // Fully self-certify: the StorePath hash must be the Nix fixed-output path
+    // derived from the content address and store name, with no references (what
+    // fetched flake inputs are). Otherwise the broker would be serving a path
+    // whose identity does not match its content — which the guest would reject —
+    // so fail closed here with a clear reason instead.
+    let derived = if narinfo.references.iter().next().is_some() {
+        None
+    } else {
+        fixed_output_recursive_sha256_store_hash(
+            narinfo.nar_hash.digest(),
+            narinfo.store_path.name(),
+        )
+    };
+    if derived.as_deref() != Some(narinfo.store_path.hash().as_str()) {
+        return Err(
+            NixContentAddressedNarInfoError::StorePathNotContentDerived {
+                store_path: narinfo.store_path.as_str().to_owned(),
+                content_address,
+            },
+        );
+    }
     Ok(narinfo)
 }
 
@@ -968,18 +1015,92 @@ pub fn verify_narinfo_signature(
 }
 
 pub fn nix_base32_encode_sha256_digest(digest: &[u8; NIX_SHA256_DIGEST_LEN]) -> String {
-    let mut encoded = String::with_capacity(NIX_SHA256_BASE32_LEN);
-    for n in (0..NIX_SHA256_BASE32_LEN).rev() {
+    nix_base32_encode(digest)
+}
+
+/// Nix's little-endian base32 of an arbitrary byte slice (the encoding Nix uses
+/// for store hashes and digests). The output length is `ceil(8 * len / 5)`.
+fn nix_base32_encode(bytes: &[u8]) -> String {
+    if bytes.is_empty() {
+        return String::new();
+    }
+    let len = (bytes.len() * 8 - 1) / 5 + 1;
+    let mut encoded = String::with_capacity(len);
+    for n in (0..len).rev() {
         let bit = n * 5;
         let byte_index = bit / 8;
         let bit_offset = bit % 8;
-        debug_assert!(byte_index < NIX_SHA256_DIGEST_LEN);
-        let current = digest[byte_index] as u16;
-        let next = digest.get(byte_index + 1).copied().unwrap_or(0) as u16;
+        let current = bytes[byte_index] as u16;
+        let next = bytes.get(byte_index + 1).copied().unwrap_or(0) as u16;
         let value = (current >> bit_offset) | (next << (8 - bit_offset));
         encoded.push(NIX_STORE_HASH_ALPHABET[(value & 0x1f) as usize] as char);
     }
     encoded
+}
+
+/// Inverse of [`nix_base32_encode`] for a 52-character SHA-256 digest. Returns
+/// `None` if the input is the wrong length, contains a non-alphabet byte, or
+/// carries non-zero overflow bits (an invalid encoding).
+fn nix_base32_decode_sha256(encoded: &str) -> Option<[u8; NIX_SHA256_DIGEST_LEN]> {
+    if encoded.len() != NIX_SHA256_BASE32_LEN {
+        return None;
+    }
+    let mut out = [0u8; NIX_SHA256_DIGEST_LEN];
+    for (n, byte) in encoded.bytes().rev().enumerate() {
+        let digit = NIX_STORE_HASH_ALPHABET.iter().position(|&c| c == byte)? as u16;
+        let bit = n * 5;
+        let byte_index = bit / 8;
+        let bit_offset = (bit % 8) as u16;
+        out[byte_index] |= ((digit << bit_offset) & 0xff) as u8;
+        let carry = digit >> (8 - bit_offset);
+        match out.get_mut(byte_index + 1) {
+            Some(slot) => *slot |= carry as u8,
+            None if carry != 0 => return None,
+            None => {}
+        }
+    }
+    Some(out)
+}
+
+/// XOR-fold `bytes` down to `out_len` bytes — Nix's `compressHash`.
+fn compress_hash_xor(bytes: &[u8], out_len: usize) -> Vec<u8> {
+    let mut out = vec![0u8; out_len];
+    for (i, byte) in bytes.iter().enumerate() {
+        out[i % out_len] ^= byte;
+    }
+    out
+}
+
+fn base16_lower(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    encoded
+}
+
+/// The Nix store-path hash of a reference-free recursive-SHA256 fixed-output
+/// (`source`) store object whose NAR hash is `nar_digest` (52 nix-base32 chars)
+/// and whose name is `name`, reproducing Nix's `makeFixedOutputPath` /
+/// `makeStorePath`. Returns `None` if `nar_digest` is not a valid nix-base32
+/// SHA-256 digest.
+///
+/// This is what makes a `fixed:r:sha256` narinfo *self-certifying*: the store
+/// path is a pure function of the content (its NAR hash) and name, so the
+/// broker can confirm a local narinfo's identity without a signature — and Nix
+/// derives the same path, so a guest accepts it. Verified against real
+/// `nix flake archive` output in the tests.
+pub(crate) fn fixed_output_recursive_sha256_store_hash(
+    nar_digest: &str,
+    name: &str,
+) -> Option<String> {
+    let hash = nix_base32_decode_sha256(nar_digest)?;
+    let inner = format!("source:sha256:{}:/nix/store:{name}", base16_lower(&hash));
+    let fingerprint = ring::digest::digest(&ring::digest::SHA256, inner.as_bytes());
+    let compressed = compress_hash_xor(fingerprint.as_ref(), NIX_STORE_PATH_HASH_LEN);
+    Some(nix_base32_encode(&compressed))
 }
 
 impl NixTrustedPublicKey {
@@ -2171,6 +2292,107 @@ mod tests {
         );
     }
 
+    #[test]
+    fn fixed_output_store_hash_matches_nix_for_real_archive_paths() {
+        // (CA digest, name) -> store hash, taken verbatim from a real
+        // `nix flake archive` of `github:numtide/flake-utils`. This pins the
+        // derivation against Nix itself, so the self-certification cannot drift.
+        for (digest, name, expected) in [
+            (
+                "1cii9id0k1vsa3r53k54bndyl6kxzgm1nsgj7gncgbp3j61qahlp",
+                "source",
+                "01x5k4nlxcpyd85nnr0b9gm89rm8ff4x",
+            ),
+            (
+                "00r0rqlxr7f3rmc5rn4055x9lv6jzal6d9gh39mny2byaiczzlld",
+                "source",
+                "h5jznf8hfa1690xlk7qmf34iia8mh2hh",
+            ),
+            (ARCHIVE_CA_NAR_DIGEST, "source", ARCHIVE_CA_STORE_HASH),
+        ] {
+            assert_eq!(
+                fixed_output_recursive_sha256_store_hash(digest, name).as_deref(),
+                Some(expected),
+                "derivation mismatch for {name}",
+            );
+        }
+    }
+
+    #[test]
+    fn content_addressed_narinfo_rejects_store_hash_not_derived_from_ca() {
+        // A self-certifying CA (CA == NarHash) but a StorePath hash that is not
+        // the fixed-output path of that content: identity does not match content.
+        let digest = ARCHIVE_CA_NAR_DIGEST;
+        let wrong_hash = "00000000000000000000000000000000";
+        let raw = unsigned_ca_narinfo(
+            wrong_hash,
+            "source",
+            "input.nar.xz",
+            digest,
+            2440,
+            &format!("fixed:r:sha256:{digest}"),
+        );
+        let expected = NixStoreHashPart::new(wrong_hash).unwrap();
+        assert!(
+            matches!(
+                parse_content_addressed_narinfo_for_store_hash(raw.as_bytes(), &expected),
+                Err(NixContentAddressedNarInfoError::StorePathNotContentDerived { .. })
+            ),
+            "a non-derived store hash must be refused",
+        );
+    }
+
+    #[test]
+    fn content_addressed_narinfo_rejects_wrong_store_name_for_ca() {
+        // The real archive narinfo, but the store name changed: the derived hash
+        // depends on the name, so identity no longer matches.
+        let raw = ARCHIVE_CA_NARINFO.replace("-source\n", "-renamed\n");
+        let expected = NixStoreHashPart::new(ARCHIVE_CA_STORE_HASH).unwrap();
+        assert!(
+            matches!(
+                parse_content_addressed_narinfo_for_store_hash(raw.as_bytes(), &expected),
+                Err(NixContentAddressedNarInfoError::StorePathNotContentDerived { .. })
+            ),
+            "a mismatched store name must be refused",
+        );
+    }
+
+    #[test]
+    fn content_addressed_narinfo_with_references_is_refused() {
+        // A correctly-derived, self-certifying reference-free narinfo is admitted;
+        // adding a reference makes it a referenced fixed-output, which the broker
+        // refuses (only the reference-free derivation is verified).
+        let body = b"a body with references added later";
+        let nar_digest = nar_digest_for_body(body);
+        let store_hash = fixed_output_recursive_sha256_store_hash(&nar_digest, "source").unwrap();
+        let expected = NixStoreHashPart::new(store_hash.clone()).unwrap();
+        let with_reference = format!(
+            "StorePath: /nix/store/{store_hash}-source\nURL: nar/input.nar.xz\nCompression: xz\nNarHash: sha256:{nar_digest}\nNarSize: {}\nReferences: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-dep\nCA: fixed:r:sha256:{nar_digest}\n",
+            body.len(),
+        );
+        assert!(
+            matches!(
+                parse_content_addressed_narinfo_for_store_hash(
+                    with_reference.as_bytes(),
+                    &expected
+                ),
+                Err(NixContentAddressedNarInfoError::StorePathNotContentDerived { .. })
+            ),
+            "a referenced CA path must be refused",
+        );
+
+        // Sanity: the same entry without the reference is admitted.
+        let without_reference = format!(
+            "StorePath: /nix/store/{store_hash}-source\nURL: nar/input.nar.xz\nCompression: xz\nNarHash: sha256:{nar_digest}\nNarSize: {}\nReferences: \nCA: fixed:r:sha256:{nar_digest}\n",
+            body.len(),
+        );
+        assert!(
+            parse_content_addressed_narinfo_for_store_hash(without_reference.as_bytes(), &expected)
+                .is_ok(),
+            "the reference-free entry should be admitted",
+        );
+    }
+
     proptest! {
         /// The admission oracle: an archive-style narinfo is admitted as
         /// content-addressed *iff* its recursive-SHA256 CA digest equals the
@@ -2180,23 +2402,26 @@ mod tests {
         /// check and NAR verification.
         #[test]
         fn recursive_sha256_ca_admits_iff_digest_matches_nar_hash(
-            hash in valid_store_hash_part(),
             name in valid_store_name(),
             file in valid_nar_file_name(),
             body in prop::collection::vec(any::<u8>(), 0..256),
             tamper in any::<bool>(),
         ) {
             let nar_digest = nar_digest_for_body(&body);
+            // The store hash is the Nix fixed-output path of this content + name,
+            // so the generated narinfo is exactly what `nix flake archive` writes.
+            let store_hash =
+                fixed_output_recursive_sha256_store_hash(&nar_digest, &name).unwrap();
             let ca_digest = if tamper { different_hash(&nar_digest) } else { nar_digest.clone() };
             let raw = unsigned_ca_narinfo(
-                &hash,
+                &store_hash,
                 &name,
                 &file,
                 &nar_digest,
                 body.len() as u64,
                 &format!("fixed:r:sha256:{ca_digest}"),
             );
-            let expected = NixStoreHashPart::new(hash).unwrap();
+            let expected = NixStoreHashPart::new(store_hash).unwrap();
             let result = parse_content_addressed_narinfo_for_store_hash(raw.as_bytes(), &expected);
             if tamper {
                 let rejected = matches!(
@@ -2209,6 +2434,13 @@ mod tests {
                 prop_assert_eq!(parsed.nar_hash().digest(), nar_digest.as_str());
                 prop_assert!(parsed.nar_hash().verify_sha256_body(&body).is_ok());
             }
+        }
+
+        #[test]
+        fn nix_base32_sha256_round_trips(bytes in prop::collection::vec(any::<u8>(), 32..=32)) {
+            let digest: [u8; NIX_SHA256_DIGEST_LEN] = bytes.try_into().unwrap();
+            let encoded = nix_base32_encode_sha256_digest(&digest);
+            prop_assert_eq!(nix_base32_decode_sha256(&encoded), Some(digest));
         }
 
         #[test]
