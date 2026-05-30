@@ -600,12 +600,19 @@ impl FlakeProvisionPlan {
         self.bounds
     }
 
-    /// The `file://` substituter URL the cache is served and copied from.
+    /// The `file://` substituter URL of the final cache (the published
+    /// destination the guest substitutes from).
     pub fn cache_file_url(&self) -> String {
-        format!("file://{}", self.cache_dir.display())
+        file_url(&self.cache_dir)
     }
 
-    /// The argv (excluding the program) for `nix flake archive`.
+    /// The argv (excluding the program) for `nix flake archive`, targeting
+    /// `archive_to` via `--to`.
+    ///
+    /// The target is a parameter rather than `cache_dir` so the edge can
+    /// archive into a staging directory and publish atomically into the final
+    /// `cache_dir` only after the run is verified and audited — `nix` must
+    /// never write straight into the guest-visible cache.
     ///
     /// `--no-update-lock-file` is load-bearing: with it, a `flake.nix` and
     /// `flake.lock` that disagree fail closed instead of letting Nix resolve
@@ -614,7 +621,7 @@ impl FlakeProvisionPlan {
     /// flags make the command work on a host whose `nix.conf` has not opted
     /// into flakes; `allow-import-from-derivation=false` keeps input
     /// discovery from triggering a build on hostile input.
-    pub fn nix_archive_args(&self) -> Vec<OsString> {
+    pub fn nix_archive_args(&self, archive_to: &Path) -> Vec<OsString> {
         vec![
             OsString::from("--extra-experimental-features"),
             OsString::from("nix-command"),
@@ -626,11 +633,22 @@ impl FlakeProvisionPlan {
             OsString::from("flake"),
             OsString::from("archive"),
             OsString::from("--to"),
-            OsString::from(self.cache_file_url()),
+            OsString::from(file_url(archive_to)),
             OsString::from("--no-update-lock-file"),
             self.flake_dir.as_os_str().to_os_string(),
         ]
     }
+}
+
+/// Build a `file://` URL for an absolute path, percent-encoding spaces and
+/// other URL-reserved characters via the url crate's file-URL serialiser —
+/// `format!("file://{path}")` produces an unparseable `--to` store URL for a
+/// path like `…/Application Support/…`. Falls back to the raw form only if the
+/// path is not absolute (which the plan's constructor already rejects).
+fn file_url(path: &Path) -> String {
+    reqwest::Url::from_file_path(path)
+        .map(|url| url.to_string())
+        .unwrap_or_else(|()| format!("file://{}", path.display()))
 }
 
 #[cfg(test)]
@@ -1034,8 +1052,9 @@ mod tests {
         .unwrap();
         assert_eq!(plan.input_count(), 1);
         assert_eq!(plan.cache_file_url(), "file:///cache/flake");
+        // `--to` targets the supplied (staging) dir, not the final cache_dir.
         let args: Vec<String> = plan
-            .nix_archive_args()
+            .nix_archive_args(Path::new("/stage/dir"))
             .into_iter()
             .map(|a| a.to_string_lossy().into_owned())
             .collect();
@@ -1052,11 +1071,37 @@ mod tests {
                 "flake",
                 "archive",
                 "--to",
-                "file:///cache/flake",
+                "file:///stage/dir",
                 "--no-update-lock-file",
                 "/work/repo",
             ]
         );
+    }
+
+    #[test]
+    fn nix_archive_to_url_percent_encodes_spaces() {
+        let lock = parse_json(&lock_json(7, &[("u", github_locked("a", "b"))])).unwrap();
+        let plan = FlakeProvisionPlan::new(
+            PathBuf::from("/usr/bin/nix"),
+            PathBuf::from("/work/repo"),
+            PathBuf::from("/Users/x/Library/Application Support/cache"),
+            bounds(8),
+            &lock,
+        )
+        .unwrap();
+        // A space-bearing parent (`Application Support`) must yield a valid,
+        // percent-encoded file URL nix can parse — not a raw space.
+        assert_eq!(
+            plan.cache_file_url(),
+            "file:///Users/x/Library/Application%20Support/cache"
+        );
+        let to = plan
+            .nix_archive_args(Path::new("/stage dir/cache"))
+            .into_iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        let to_value = &to[to.iter().position(|a| a == "--to").unwrap() + 1];
+        assert_eq!(to_value, "file:///stage%20dir/cache");
     }
 
     // ---- property-based tests ----

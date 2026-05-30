@@ -42,6 +42,8 @@ pub mod core;
 #[cfg(feature = "host")]
 pub mod flake_lock;
 #[cfg(feature = "host")]
+pub mod flake_provision;
+#[cfg(feature = "host")]
 pub mod git_commit_sign;
 #[cfg(feature = "host")]
 pub mod git_push_approve;
