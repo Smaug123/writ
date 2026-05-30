@@ -69,6 +69,8 @@ pub mod openai_chatgpt_auth;
 pub mod policy;
 pub mod process_spawn;
 #[cfg(feature = "host")]
+pub(crate) mod process_supervisor;
+#[cfg(feature = "host")]
 pub mod protocol;
 #[cfg(feature = "host")]
 pub mod run_envelope;

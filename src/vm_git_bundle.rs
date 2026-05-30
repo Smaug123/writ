@@ -798,8 +798,9 @@ fn github_https_url(repo: &GitCloneRepo) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::clean_git::{is_executable_file, resolve_program_for_clean_env};
+    use crate::clean_git::resolve_program_for_clean_env;
     use crate::core::RepoRef;
+    use crate::process_supervisor::is_executable_file;
     use crate::vm_git::GitCloneRef;
     use proptest::prelude::*;
     use std::os::unix::fs::PermissionsExt;
