@@ -28,6 +28,7 @@ use thiserror::Error;
 
 mod agent_run;
 mod claude_proxy;
+mod flake_provision;
 mod git_push;
 mod grant;
 mod nix_cache;
@@ -45,6 +46,10 @@ pub use agent_run::{
 pub use claude_proxy::{
     ClaudeProxyAuditDecision, ClaudeProxyAuditRoute, ClaudeProxyOutcomeRecord,
     ClaudeProxyRequestRecord,
+};
+pub use flake_provision::{
+    FlakeProvisionAuditEntry, FlakeProvisionAuditOutcome, FlakeProvisionOutcomeRecord,
+    FlakeProvisionRequestRecord, FlakeProvisionResult,
 };
 pub use git_push::{
     GitPushApproveAttemptEntry, GitPushApproveAttemptOutcome, GitPushApproveAttemptState,
