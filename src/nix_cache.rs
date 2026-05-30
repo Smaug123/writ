@@ -649,14 +649,31 @@ impl NixNarInfo {
     }
 }
 
-pub fn parse_narinfo(bytes: &[u8]) -> Result<NixNarInfo, NixNarInfoError> {
-    let raw = std::str::from_utf8(bytes).map_err(|_| NixNarInfoError::InvalidUtf8)?;
+/// Raw, deduplicated narinfo fields, before any field is *required* or typed.
+/// Borrows the narinfo text. Both the signed ([`parse_narinfo`]) and the
+/// content-addressed ([`parse_content_addressed_narinfo_for_store_hash`])
+/// parsers build on this; they differ only in which fields they then require.
+struct RawNarInfoFields<'a> {
+    store_path: Option<&'a str>,
+    url: Option<&'a str>,
+    compression: Option<&'a str>,
+    nar_hash: Option<&'a str>,
+    nar_size: Option<&'a str>,
+    references: Option<&'a str>,
+    content_address: Option<&'a str>,
+    signatures: Vec<NixNarSignature>,
+}
+
+/// Scan a narinfo's `KEY: VALUE` lines into deduplicated raw fields, without
+/// requiring any particular field to be present.
+fn scan_narinfo_fields(raw: &str) -> Result<RawNarInfoFields<'_>, NixNarInfoError> {
     let mut store_path = None;
     let mut url = None;
     let mut compression = None;
     let mut nar_hash = None;
     let mut nar_size = None;
     let mut references = None;
+    let mut content_address = None;
     let mut signatures = Vec::new();
     for line in raw.lines() {
         let Some((key, value)) = line.split_once(':') else {
@@ -733,16 +750,38 @@ pub fn parse_narinfo(bytes: &[u8]) -> Result<NixNarInfo, NixNarInfoError> {
                 })?;
                 signatures.push(signature);
             }
+            // `CA` is captured leniently (last value wins, no duplicate error):
+            // it is advisory for the signed path and only *validated* by the
+            // content-addressed parser. Real Nix narinfos carry exactly one.
+            "CA" => {
+                content_address = Some(value);
+            }
             _ => {}
         }
     }
-    let store_path = store_path.ok_or(NixNarInfoError::MissingStorePath)?;
+    Ok(RawNarInfoFields {
+        store_path,
+        url,
+        compression,
+        nar_hash,
+        nar_size,
+        references,
+        content_address,
+        signatures,
+    })
+}
+
+/// Require and type every load-bearing narinfo field, *without* requiring a
+/// signature. The signed path adds the signature requirement on top; the
+/// content-addressed path adds the CA self-certification check instead.
+fn build_narinfo(fields: RawNarInfoFields<'_>) -> Result<NixNarInfo, NixNarInfoError> {
+    let store_path = fields.store_path.ok_or(NixNarInfoError::MissingStorePath)?;
     let store_path =
         NixStorePath::new(store_path).map_err(|source| NixNarInfoError::InvalidStorePath {
             raw: store_path.to_string(),
             source,
         })?;
-    let url = url.ok_or(NixNarInfoError::MissingUrl)?;
+    let url = fields.url.ok_or(NixNarInfoError::MissingUrl)?;
     let Some(file) = url.strip_prefix("nar/") else {
         return Err(NixNarInfoError::UnsupportedUrl(url.to_string()));
     };
@@ -751,32 +790,33 @@ pub fn parse_narinfo(bytes: &[u8]) -> Result<NixNarInfo, NixNarInfoError> {
             url: url.to_string(),
             source,
         })?;
-    let nar_hash = nar_hash.ok_or(NixNarInfoError::MissingNarHash)?;
+    let nar_hash = fields.nar_hash.ok_or(NixNarInfoError::MissingNarHash)?;
     let nar_hash = NixNarHash::new(nar_hash).map_err(|source| NixNarInfoError::InvalidNarHash {
         raw: nar_hash.to_string(),
         source,
     })?;
-    let compression = compression.ok_or(NixNarInfoError::MissingCompression)?;
+    let compression = fields
+        .compression
+        .ok_or(NixNarInfoError::MissingCompression)?;
     let compression = NixNarCompression::new(compression).map_err(|source| {
         NixNarInfoError::InvalidCompression {
             raw: compression.to_string(),
             source,
         }
     })?;
-    let nar_size = nar_size.ok_or(NixNarInfoError::MissingNarSize)?;
+    let nar_size = fields.nar_size.ok_or(NixNarInfoError::MissingNarSize)?;
     let nar_size = NixNarSize::new(nar_size).map_err(|source| NixNarInfoError::InvalidNarSize {
         raw: nar_size.to_string(),
         source,
     })?;
-    let references = references.ok_or(NixNarInfoError::MissingReferences)?;
+    let references = fields
+        .references
+        .ok_or(NixNarInfoError::MissingReferences)?;
     let references =
         NixNarReferences::new(references).map_err(|source| NixNarInfoError::InvalidReferences {
             raw: references.to_string(),
             source,
         })?;
-    if signatures.is_empty() {
-        return Err(NixNarInfoError::MissingSignature);
-    }
     Ok(NixNarInfo {
         store_path,
         nar_file,
@@ -784,8 +824,20 @@ pub fn parse_narinfo(bytes: &[u8]) -> Result<NixNarInfo, NixNarInfoError> {
         nar_hash,
         nar_size,
         references,
-        signatures,
+        signatures: fields.signatures,
     })
+}
+
+pub fn parse_narinfo(bytes: &[u8]) -> Result<NixNarInfo, NixNarInfoError> {
+    let raw = std::str::from_utf8(bytes).map_err(|_| NixNarInfoError::InvalidUtf8)?;
+    let fields = scan_narinfo_fields(raw)?;
+    // Validate every other field before reporting a missing signature, so the
+    // error precedence matches the historical single-pass parser.
+    let narinfo = build_narinfo(fields)?;
+    if narinfo.signatures.is_empty() {
+        return Err(NixNarInfoError::MissingSignature);
+    }
+    Ok(narinfo)
 }
 
 pub fn parse_narinfo_for_store_hash(
@@ -809,6 +861,80 @@ pub fn parse_signed_narinfo_for_store_hash(
 ) -> Result<NixNarInfo, NixNarInfoError> {
     let narinfo = parse_narinfo_for_store_hash(bytes, expected)?;
     verify_narinfo_signature(&narinfo, trusted_public_keys)?;
+    Ok(narinfo)
+}
+
+/// The `CA` value prefix of a recursive ("r") SHA-256 fixed-output store path —
+/// the only content-address form the broker admits unsigned. For such a path
+/// the store object's identity is the SHA-256 of its NAR serialization, so the
+/// `<digest>` after this prefix is exactly the path's NarHash digest.
+const NIX_CA_RECURSIVE_SHA256_PREFIX: &str = "fixed:r:sha256:";
+
+#[derive(Debug, thiserror::Error, Eq, PartialEq)]
+pub enum NixContentAddressedNarInfoError {
+    /// The narinfo is malformed independently of content-addressing (bad
+    /// field, or its StorePath hash does not match the requested hash).
+    #[error(transparent)]
+    NarInfo(#[from] NixNarInfoError),
+    /// The narinfo carries no `CA` field, so the broker cannot self-certify it
+    /// and would need a trusted signature it does not have.
+    #[error("content-addressed narinfo is missing the CA field required to admit it unsigned")]
+    MissingContentAddress,
+    /// The narinfo has a `CA` field, but it is not a recursive-SHA256
+    /// fixed-output whose digest equals NarHash — so verifying the NAR body
+    /// would not verify the store path's identity. Refused.
+    #[error(
+        "content-addressed narinfo CA {content_address:?} is not a recursive-SHA256 fixed-output \
+         whose digest equals NarHash {nar_hash:?}; only such self-certifying paths are admitted \
+         unsigned"
+    )]
+    NotSelfCertifying {
+        content_address: String,
+        nar_hash: String,
+    },
+}
+
+/// Parse a narinfo from the broker's *local* flake-input archive and admit it
+/// for **unsigned** serving iff it is self-certifying: it carries a
+/// recursive-SHA256 fixed-output content address (`CA: fixed:r:sha256:<digest>`)
+/// whose digest equals its NarHash.
+///
+/// For such a path the store object's identity *is* the SHA-256 of the NAR the
+/// broker later verifies, so verifying the NAR body against NarHash also
+/// verifies the content address — no signature is required, and `nix flake
+/// archive` produces exactly these (unsigned). Anything else — a missing CA, a
+/// non-recursive or non-SHA256 CA, or a CA whose digest differs from NarHash —
+/// is refused, because the broker cannot certify it without a trusted
+/// signature. `expected` is the store hash from the request path; the narinfo's
+/// StorePath must match it, so a `<hash>.narinfo` file always describes
+/// `<hash>`.
+pub fn parse_content_addressed_narinfo_for_store_hash(
+    bytes: &[u8],
+    expected: &NixStoreHashPart,
+) -> Result<NixNarInfo, NixContentAddressedNarInfoError> {
+    let raw = std::str::from_utf8(bytes).map_err(|_| NixNarInfoError::InvalidUtf8)?;
+    let fields = scan_narinfo_fields(raw)?;
+    // Capture the (owned) CA before `build_narinfo` consumes the borrowed fields.
+    let content_address = fields.content_address.map(str::to_owned);
+    let narinfo = build_narinfo(fields)?;
+    if narinfo.store_path.hash() != expected {
+        return Err(NixNarInfoError::StorePathHashMismatch {
+            expected: expected.clone(),
+            actual: narinfo.store_path.hash().clone(),
+        }
+        .into());
+    }
+    let content_address =
+        content_address.ok_or(NixContentAddressedNarInfoError::MissingContentAddress)?;
+    let self_certifying = narinfo.nar_hash.algorithm() == "sha256"
+        && content_address.strip_prefix(NIX_CA_RECURSIVE_SHA256_PREFIX)
+            == Some(narinfo.nar_hash.digest());
+    if !self_certifying {
+        return Err(NixContentAddressedNarInfoError::NotSelfCertifying {
+            content_address,
+            nar_hash: narinfo.nar_hash.as_str().to_owned(),
+        });
+    }
     Ok(narinfo)
 }
 
@@ -1874,5 +2000,224 @@ mod tests {
         assert_eq!(err.index(), 1);
         assert_eq!(err.raw(), second);
         assert_eq!(err.source(), &NixTrustedPublicKeyError::DuplicateName);
+    }
+
+    // --- content-addressed (unsigned) narinfo admission ---
+    //
+    // Exactly what `nix flake archive --to file://<cache>` writes: an unsigned
+    // narinfo carrying `CA: fixed:r:sha256:<digest>` where `<digest>` equals the
+    // NarHash digest. The store hash and digests below are taken verbatim from a
+    // real archive of `github:numtide/flake-utils`.
+    const ARCHIVE_CA_STORE_HASH: &str = "yj1wxm9hh8610iyzqnz75kvs6xl8j3my";
+    const ARCHIVE_CA_NAR_DIGEST: &str = "1bzg89hgcr2gvza35vqi4n1jbb2gz1yg4b8p7gry4ihsj2mnnbap";
+    const ARCHIVE_CA_NARINFO: &str = concat!(
+        "StorePath: /nix/store/yj1wxm9hh8610iyzqnz75kvs6xl8j3my-source\n",
+        "URL: nar/096mx83hxig0azq3zk8q1ali20sd85d2xirzfylnngfn8gp3akmv.nar.xz\n",
+        "Compression: xz\n",
+        "FileHash: sha256:096mx83hxig0azq3zk8q1ali20sd85d2xirzfylnngfn8gp3akmv\n",
+        "FileSize: 1100\n",
+        "NarHash: sha256:1bzg89hgcr2gvza35vqi4n1jbb2gz1yg4b8p7gry4ihsj2mnnbap\n",
+        "NarSize: 2440\n",
+        "References: \n",
+        "CA: fixed:r:sha256:1bzg89hgcr2gvza35vqi4n1jbb2gz1yg4b8p7gry4ihsj2mnnbap\n",
+    );
+
+    fn nar_digest_for_body(body: &[u8]) -> String {
+        let digest = ring::digest::digest(&ring::digest::SHA256, body);
+        let digest: [u8; NIX_SHA256_DIGEST_LEN] = digest.as_ref().try_into().unwrap();
+        nix_base32_encode_sha256_digest(&digest)
+    }
+
+    fn unsigned_ca_narinfo(
+        hash: &str,
+        name: &str,
+        file: &str,
+        nar_digest: &str,
+        nar_size: u64,
+        ca: &str,
+    ) -> String {
+        format!(
+            "StorePath: /nix/store/{hash}-{name}\nURL: nar/{file}\nCompression: xz\nNarHash: sha256:{nar_digest}\nNarSize: {nar_size}\nReferences: \nCA: {ca}\n"
+        )
+    }
+
+    #[test]
+    fn archive_style_unsigned_ca_narinfo_is_admitted() {
+        let expected = NixStoreHashPart::new(ARCHIVE_CA_STORE_HASH).unwrap();
+        let parsed = parse_content_addressed_narinfo_for_store_hash(
+            ARCHIVE_CA_NARINFO.as_bytes(),
+            &expected,
+        )
+        .unwrap();
+
+        assert_eq!(parsed.store_path().hash().as_str(), ARCHIVE_CA_STORE_HASH);
+        assert_eq!(
+            parsed.nar_file().as_str(),
+            "096mx83hxig0azq3zk8q1ali20sd85d2xirzfylnngfn8gp3akmv.nar.xz"
+        );
+        assert_eq!(parsed.compression(), NixNarCompression::Xz);
+        assert_eq!(parsed.nar_hash().digest(), ARCHIVE_CA_NAR_DIGEST);
+        assert_eq!(parsed.nar_size().get(), 2440);
+        // Crucially admitted with no signature at all.
+        assert!(parsed.signatures().is_empty());
+    }
+
+    #[test]
+    fn content_addressed_narinfo_requires_a_ca_field() {
+        // The archive narinfo with its CA line removed: a well-formed but
+        // unsigned, non-self-certifying narinfo must be refused.
+        let without_ca = ARCHIVE_CA_NARINFO
+            .lines()
+            .filter(|line| !line.starts_with("CA:"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let expected = NixStoreHashPart::new(ARCHIVE_CA_STORE_HASH).unwrap();
+
+        assert_eq!(
+            parse_content_addressed_narinfo_for_store_hash(without_ca.as_bytes(), &expected),
+            Err(NixContentAddressedNarInfoError::MissingContentAddress),
+        );
+    }
+
+    #[test]
+    fn content_addressed_narinfo_rejects_non_self_certifying_ca() {
+        let hash = "00000000000000000000000000000000";
+        let expected = NixStoreHashPart::new(hash).unwrap();
+        let digest = ARCHIVE_CA_NAR_DIGEST;
+        let other_digest = different_hash(digest);
+        for ca in [
+            // text-hashed, not recursive NAR.
+            format!("text:sha256:{digest}"),
+            // flat (non-recursive) fixed-output: hash is over the file, not the NAR.
+            format!("fixed:sha256:{digest}"),
+            // recursive SHA-256, but the digest is not this path's NarHash.
+            format!("fixed:r:sha256:{other_digest}"),
+            // wrong algorithm.
+            format!("fixed:r:sha512:{digest}"),
+        ] {
+            let raw = unsigned_ca_narinfo(hash, "source", "input.nar.xz", digest, 2440, &ca);
+            assert_eq!(
+                parse_content_addressed_narinfo_for_store_hash(raw.as_bytes(), &expected),
+                Err(NixContentAddressedNarInfoError::NotSelfCertifying {
+                    content_address: ca.clone(),
+                    nar_hash: format!("sha256:{digest}"),
+                }),
+                "CA {ca:?} should not self-certify",
+            );
+        }
+    }
+
+    #[test]
+    fn content_addressed_narinfo_rejects_store_hash_mismatch() {
+        let store_hash = "00000000000000000000000000000000";
+        let requested = "11111111111111111111111111111111";
+        let digest = ARCHIVE_CA_NAR_DIGEST;
+        let raw = unsigned_ca_narinfo(
+            store_hash,
+            "source",
+            "input.nar.xz",
+            digest,
+            2440,
+            &format!("fixed:r:sha256:{digest}"),
+        );
+        let expected = NixStoreHashPart::new(requested).unwrap();
+
+        assert_eq!(
+            parse_content_addressed_narinfo_for_store_hash(raw.as_bytes(), &expected),
+            Err(NixContentAddressedNarInfoError::NarInfo(
+                NixNarInfoError::StorePathHashMismatch {
+                    expected: NixStoreHashPart::new(requested).unwrap(),
+                    actual: NixStoreHashPart::new(store_hash).unwrap(),
+                }
+            )),
+        );
+    }
+
+    #[test]
+    fn content_addressed_narinfo_still_requires_well_formed_fields() {
+        // A self-certifying CA does not excuse a malformed narinfo.
+        let digest = ARCHIVE_CA_NAR_DIGEST;
+        let raw = format!(
+            "StorePath: /nix/store/00000000000000000000000000000000-source\nCompression: xz\nNarHash: sha256:{digest}\nNarSize: 2440\nReferences: \nCA: fixed:r:sha256:{digest}\n"
+        );
+        let expected = NixStoreHashPart::new("00000000000000000000000000000000").unwrap();
+
+        assert_eq!(
+            parse_content_addressed_narinfo_for_store_hash(raw.as_bytes(), &expected),
+            Err(NixContentAddressedNarInfoError::NarInfo(
+                NixNarInfoError::MissingUrl
+            )),
+        );
+    }
+
+    #[test]
+    fn signed_narinfo_with_flat_ca_is_not_admitted_unsigned() {
+        // The trusted-key signed narinfo from the signed-path tests carries a
+        // *flat* `fixed:sha256:` CA (hash over the file, not the NAR), so the
+        // content-addressed path refuses it: a signature is not a content
+        // address, and a flat CA is not verified by NarHash. It would still be
+        // admitted by the *signed* path.
+        let expected = NixStoreHashPart::new("rzv95bakh41zrn5ji23pfc11x5vq2z4d").unwrap();
+        assert_eq!(
+            parse_content_addressed_narinfo_for_store_hash(
+                TEST_SIGNED_NARINFO.as_bytes(),
+                &expected
+            ),
+            Err(NixContentAddressedNarInfoError::NotSelfCertifying {
+                content_address:
+                    "fixed:sha256:1ivkzvg86cqy19yf9bg4aaqf6a9prfbjn18jclk6k2w2c9is5kf1".to_owned(),
+                nar_hash: "sha256:0n62ny3wh4ayp887m60r6ja1p7hrdqnlaq2avb1177zc5gmm6nny".to_owned(),
+            }),
+        );
+    }
+
+    proptest! {
+        /// The admission oracle: an archive-style narinfo is admitted as
+        /// content-addressed *iff* its recursive-SHA256 CA digest equals the
+        /// actual SHA-256 of the NAR body — and when admitted, that NarHash
+        /// really verifies the body. Tying admission to a freshly-hashed body
+        /// (rather than a hand-written digest) catches any drift between the CA
+        /// check and NAR verification.
+        #[test]
+        fn recursive_sha256_ca_admits_iff_digest_matches_nar_hash(
+            hash in valid_store_hash_part(),
+            name in valid_store_name(),
+            file in valid_nar_file_name(),
+            body in prop::collection::vec(any::<u8>(), 0..256),
+            tamper in any::<bool>(),
+        ) {
+            let nar_digest = nar_digest_for_body(&body);
+            let ca_digest = if tamper { different_hash(&nar_digest) } else { nar_digest.clone() };
+            let raw = unsigned_ca_narinfo(
+                &hash,
+                &name,
+                &file,
+                &nar_digest,
+                body.len() as u64,
+                &format!("fixed:r:sha256:{ca_digest}"),
+            );
+            let expected = NixStoreHashPart::new(hash).unwrap();
+            let result = parse_content_addressed_narinfo_for_store_hash(raw.as_bytes(), &expected);
+            if tamper {
+                let rejected = matches!(
+                    result,
+                    Err(NixContentAddressedNarInfoError::NotSelfCertifying { .. })
+                );
+                prop_assert!(rejected, "tampered CA digest should be rejected: {result:?}");
+            } else {
+                let parsed = result.unwrap();
+                prop_assert_eq!(parsed.nar_hash().digest(), nar_digest.as_str());
+                prop_assert!(parsed.nar_hash().verify_sha256_body(&body).is_ok());
+            }
+        }
+
+        #[test]
+        fn content_addressed_parser_is_total_for_arbitrary_bytes(
+            bytes in prop::collection::vec(any::<u8>(), 0..4096),
+            hash in valid_store_hash_part(),
+        ) {
+            let expected = NixStoreHashPart::new(hash).unwrap();
+            let _ = parse_content_addressed_narinfo_for_store_hash(&bytes, &expected);
+        }
     }
 }
