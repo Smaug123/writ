@@ -27,6 +27,12 @@ pub const VM_NIX_CACHE_PATH_PREFIX: &str = "/v1/nix/cache";
 pub(super) const VM_NIX_CACHE_INFO_PATH: &str = "/v1/nix/cache/nix-cache-info";
 pub const VM_NIX_BASIC_LOGIN: &str = "writ-vm";
 const XZ_DECODER_MEMLIMIT_OVERHEAD: u64 = 16 * 1024 * 1024;
+/// The `nix-cache-info` body the broker advertises for the `/v1/nix/cache`
+/// endpoint. `StoreDir` is the load-bearing field — it matches the upstream
+/// (`/nix/store`) so the guest accepts the substituter — and it is served
+/// synthetically (no upstream round-trip) whenever the endpoint can answer
+/// locally.
+const VM_NIX_CACHE_INFO_BODY: &str = "StoreDir: /nix/store\nWantMassQuery: 0\nPriority: 40\n";
 
 pub struct VmHttpNixCacheService<S: SecretStore> {
     broker_state: Arc<BrokerState<S>>,
@@ -434,10 +440,9 @@ pub(super) fn route_nix_cache_request_without_upstream(request: &VmHttpRequest) 
         return VmHttpResponse::text(VmHttpStatus::NotFound, "not found");
     };
     match (request.method.as_str(), route) {
-        ("GET", VmNixCacheRoute::CacheInfo) => VmHttpResponse::text(
-            VmHttpStatus::Ok,
-            "StoreDir: /nix/store\nWantMassQuery: 0\nPriority: 40\n",
-        ),
+        ("GET", VmNixCacheRoute::CacheInfo) => {
+            VmHttpResponse::text(VmHttpStatus::Ok, VM_NIX_CACHE_INFO_BODY)
+        }
         ("HEAD", VmNixCacheRoute::CacheInfo) => VmHttpResponse::text(VmHttpStatus::Ok, ""),
         ("GET" | "HEAD", VmNixCacheRoute::NarInfo { .. } | VmNixCacheRoute::Nar { .. }) => {
             VmHttpResponse::text(VmHttpStatus::NotFound, "not found")
@@ -454,7 +459,19 @@ pub(super) fn route_nix_cache_request_without_upstream(request: &VmHttpRequest) 
 impl<S: SecretStore> VmHttpNixCacheService<S> {
     async fn fetch_route(&self, method: &str, route: &VmNixCacheRoute) -> VmHttpNixCacheProxyFetch {
         match route {
-            VmNixCacheRoute::CacheInfo => self.fetch_metadata(method, route).await,
+            VmNixCacheRoute::CacheInfo => {
+                // Serve the cache metadata locally whenever a local archive is
+                // configured, so the guest's mandatory pre-flight
+                // `nix-cache-info` does not depend on upstream reachability — a
+                // no-egress guest can substitute the local archive even if the
+                // upstream cache is momentarily unavailable. Without a local
+                // archive this proxies the upstream exactly as before.
+                if self.config.local_cache_dir().is_some() {
+                    local_cache_info(method)
+                } else {
+                    self.fetch_metadata(method, route).await
+                }
+            }
             VmNixCacheRoute::NarInfo { hash } => {
                 // Local-first: a content-addressed narinfo in the broker's
                 // archive is served (and admitted) without contacting the
@@ -1300,33 +1317,58 @@ enum LocalCacheFile {
 }
 
 /// Read a local-archive file, enforcing `max` fail-closed and mapping an absent
-/// file to [`LocalCacheFile::Missing`] (so the caller can fall through to the
-/// upstream). The size is checked from metadata *before* reading, then again
-/// after, so a hostile/racing grow cannot exceed the bound in memory.
+/// (or non-regular) file to [`LocalCacheFile::Missing`] so the caller can fall
+/// through to the upstream. The read is hard-capped at `max + 1` bytes — never
+/// buffering the whole file first — so the bound holds unconditionally even if
+/// the file is replaced or grows between open and read.
 async fn read_local_cache_file(path: &Path, max: u64) -> LocalCacheFile {
-    let metadata = match tokio::fs::metadata(path).await {
-        Ok(metadata) => metadata,
+    use tokio::io::AsyncReadExt as _;
+
+    let file = match tokio::fs::File::open(path).await {
+        Ok(file) => file,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return LocalCacheFile::Missing,
         Err(err) => return LocalCacheFile::Io(err),
     };
-    if !metadata.is_file() {
-        return LocalCacheFile::Missing;
+    match file.metadata().await {
+        Ok(metadata) if !metadata.is_file() => return LocalCacheFile::Missing,
+        Ok(_) => {}
+        Err(err) => return LocalCacheFile::Io(err),
     }
-    if metadata.len() > max {
+    // Read at most `max + 1` bytes: reaching the cap means the file is over
+    // budget, without ever holding more than `max + 1` bytes in memory.
+    let cap = max.saturating_add(1);
+    let mut body = Vec::new();
+    if let Err(err) = file.take(cap).read_to_end(&mut body).await {
+        return LocalCacheFile::Io(err);
+    }
+    if body.len() as u64 > max {
         return LocalCacheFile::TooLarge;
     }
-    match tokio::fs::read(path).await {
-        Ok(bytes) if bytes.len() as u64 > max => LocalCacheFile::TooLarge,
-        Ok(bytes) => LocalCacheFile::Bytes(bytes),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => LocalCacheFile::Missing,
-        Err(err) => LocalCacheFile::Io(err),
-    }
+    LocalCacheFile::Bytes(body)
 }
 
 /// The `file://` URL recorded as the (non-HTTP) source of a local serve, so the
 /// audit log distinguishes a local-archive hit from an upstream proxy.
 fn local_file_url(path: &Path) -> String {
     format!("file://{}", path.display())
+}
+
+/// Synthesize the `nix-cache-info` response locally (no upstream round-trip).
+/// Audited with no upstream URL or status, since nothing was proxied.
+fn local_cache_info(method: &str) -> VmHttpNixCacheProxyFetch {
+    let response = if method == "HEAD" {
+        VmHttpResponse::text(VmHttpStatus::Ok, "")
+    } else {
+        VmHttpResponse::text(VmHttpStatus::Ok, VM_NIX_CACHE_INFO_BODY)
+    };
+    let response_bytes = response.body.len() as u64;
+    VmHttpNixCacheProxyFetch {
+        upstream_url: String::new(),
+        upstream_status: None,
+        response_bytes,
+        error: None,
+        response,
+    }
 }
 
 /// A fail-closed local outcome: HTTP 502, no upstream status, with `error` set
@@ -3151,6 +3193,38 @@ mod tests {
             "a local miss should proxy and audit the upstream URL, got {:?}",
             entries[0].upstream_url,
         );
+    }
+
+    #[tokio::test]
+    async fn local_cache_info_is_served_synthetically_without_upstream() {
+        let upstream = MockServer::start().await;
+        let state = make_broker_state(&upstream);
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+        open_audit_session(&state, session.session_id());
+        let cache = tempfile::tempdir().unwrap();
+        // Local cache configured + a dead upstream: the mandatory cache-info
+        // pre-flight must still succeed so the guest reaches the local-first
+        // narinfo/NAR paths rather than rejecting the substituter.
+        let service =
+            nix_cache_service_with_local_cache(&state, DEAD_UPSTREAM, cache.path(), 4096, 4096);
+
+        let response =
+            route_nix_cache_with_service(&session, "GET", VM_NIX_CACHE_INFO_PATH.into(), service)
+                .await;
+
+        assert_eq!(response.status, VmHttpStatus::Ok);
+        let body = String::from_utf8(response.body).unwrap();
+        assert!(body.contains("StoreDir: /nix/store"), "{body}");
+        let entries = state
+            .audit
+            .list_nix_cache_requests_for_session(session.session_id())
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].route, NixCacheAuditRoute::CacheInfo);
+        assert_eq!(entries[0].http_status, Some(200));
+        assert_eq!(entries[0].upstream_status, None);
+        assert_eq!(entries[0].upstream_url, None);
+        assert_eq!(entries[0].error, None);
     }
 
     #[tokio::test]
