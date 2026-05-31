@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 use std::io::Read as _;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use crate::audit::{
@@ -13,9 +14,9 @@ use crate::audit::{
 };
 use crate::core::{RequestId, UnixMillis};
 use crate::nix_cache::{
-    NixCacheNarFileName, NixNarBodyHashError, NixNarCompression, NixNarHash, NixNarInfo,
-    NixNarInfoError, NixNarSize, NixStoreHashPart, NixTrustedPublicKeys,
-    parse_signed_narinfo_for_store_hash,
+    NixCacheNarFileName, NixContentAddressedNarInfoError, NixNarBodyHashError, NixNarCompression,
+    NixNarHash, NixNarInfo, NixNarInfoError, NixNarSize, NixStoreHashPart, NixTrustedPublicKeys,
+    parse_content_addressed_narinfo_for_store_hash, parse_signed_narinfo_for_store_hash,
 };
 use crate::secret::SecretStore;
 use crate::server::BrokerState;
@@ -26,6 +27,12 @@ pub const VM_NIX_CACHE_PATH_PREFIX: &str = "/v1/nix/cache";
 pub(super) const VM_NIX_CACHE_INFO_PATH: &str = "/v1/nix/cache/nix-cache-info";
 pub const VM_NIX_BASIC_LOGIN: &str = "writ-vm";
 const XZ_DECODER_MEMLIMIT_OVERHEAD: u64 = 16 * 1024 * 1024;
+/// The `nix-cache-info` body the broker advertises for the `/v1/nix/cache`
+/// endpoint. `StoreDir` is the load-bearing field — it matches the upstream
+/// (`/nix/store`) so the guest accepts the substituter — and it is served
+/// synthetically (no upstream round-trip) whenever the endpoint can answer
+/// locally.
+const VM_NIX_CACHE_INFO_BODY: &str = "StoreDir: /nix/store\nWantMassQuery: 0\nPriority: 40\n";
 
 pub struct VmHttpNixCacheService<S: SecretStore> {
     broker_state: Arc<BrokerState<S>>,
@@ -35,7 +42,7 @@ pub struct VmHttpNixCacheService<S: SecretStore> {
     // state is intentionally kept for that session runtime lifetime. Entries
     // are small, and eviction would risk turning a valid NAR follow-up request
     // into an order-dependent cache miss.
-    admitted_nars: Arc<Mutex<HashMap<NixCacheNarFileName, VmHttpNixCacheAdmittedNar>>>,
+    admitted_nars: Arc<Mutex<HashMap<NixCacheNarFileName, VmHttpNixCacheNarEntry>>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -44,6 +51,12 @@ pub struct VmHttpNixCacheConfig {
     max_metadata_bytes: u64,
     max_nar_bytes: u64,
     trusted_public_keys: NixTrustedPublicKeys,
+    /// The broker's local flake-input archive (`nix flake archive --to
+    /// file://…`), served *local-first*: a hash present here is served from
+    /// disk (admitting its content-addressed narinfo unsigned), a miss falls
+    /// through to the upstream proxy. `None` (the default) leaves behaviour
+    /// identical to a pure upstream proxy.
+    local_cache_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, thiserror::Error, Eq, PartialEq)]
@@ -86,6 +99,28 @@ struct VmHttpNixCacheAdmittedNar {
     compression: NixNarCompression,
     nar_hash: NixNarHash,
     nar_size: NixNarSize,
+}
+
+/// Where an admitted NAR is fetched from. The source is decided when the
+/// *narinfo* is admitted and pins where the matching NAR comes from, so a NAR
+/// admitted from the signed upstream is never shadowed by a same-named file in
+/// the local archive (and vice-versa).
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum VmNixCacheNarSource {
+    /// Admitted from the broker's local archive (a content-addressed narinfo);
+    /// the NAR is served authoritatively from `local_cache_dir/nar/<file>`.
+    Local,
+    /// Admitted from the signed upstream; the NAR is fetched from the upstream.
+    Upstream,
+}
+
+/// An admitted NAR plus where it is served from. Equality of the admission
+/// (content metadata) alone gates the conflict check; the source is bookkeeping
+/// for routing the NAR fetch.
+#[derive(Clone, Debug)]
+struct VmHttpNixCacheNarEntry {
+    admission: VmHttpNixCacheAdmittedNar,
+    source: VmNixCacheNarSource,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -212,11 +247,27 @@ impl VmHttpNixCacheConfig {
             max_metadata_bytes,
             max_nar_bytes,
             trusted_public_keys,
+            local_cache_dir: None,
         })
+    }
+
+    /// Serve the broker's local flake-input archive at `dir` local-first (see
+    /// [`VmHttpNixCacheConfig::local_cache_dir`]). `None` disables it. The
+    /// directory need not exist yet — an absent file is treated as a local
+    /// miss, so behaviour is identical to upstream-only until provisioning
+    /// populates it.
+    #[must_use]
+    pub fn with_local_cache_dir(mut self, dir: Option<PathBuf>) -> Self {
+        self.local_cache_dir = dir;
+        self
     }
 
     pub fn upstream_base_url(&self) -> &reqwest::Url {
         &self.upstream_base_url
+    }
+
+    pub fn local_cache_dir(&self) -> Option<&Path> {
+        self.local_cache_dir.as_deref()
     }
 
     pub fn max_metadata_bytes(&self) -> u64 {
@@ -411,10 +462,9 @@ pub(super) fn route_nix_cache_request_without_upstream(request: &VmHttpRequest) 
         return VmHttpResponse::text(VmHttpStatus::NotFound, "not found");
     };
     match (request.method.as_str(), route) {
-        ("GET", VmNixCacheRoute::CacheInfo) => VmHttpResponse::text(
-            VmHttpStatus::Ok,
-            "StoreDir: /nix/store\nWantMassQuery: 0\nPriority: 40\n",
-        ),
+        ("GET", VmNixCacheRoute::CacheInfo) => {
+            VmHttpResponse::text(VmHttpStatus::Ok, VM_NIX_CACHE_INFO_BODY)
+        }
         ("HEAD", VmNixCacheRoute::CacheInfo) => VmHttpResponse::text(VmHttpStatus::Ok, ""),
         ("GET" | "HEAD", VmNixCacheRoute::NarInfo { .. } | VmNixCacheRoute::Nar { .. }) => {
             VmHttpResponse::text(VmHttpStatus::NotFound, "not found")
@@ -431,7 +481,27 @@ pub(super) fn route_nix_cache_request_without_upstream(request: &VmHttpRequest) 
 impl<S: SecretStore> VmHttpNixCacheService<S> {
     async fn fetch_route(&self, method: &str, route: &VmNixCacheRoute) -> VmHttpNixCacheProxyFetch {
         match route {
-            VmNixCacheRoute::CacheInfo | VmNixCacheRoute::NarInfo { .. } => {
+            VmNixCacheRoute::CacheInfo => {
+                // Serve the cache metadata locally whenever a local archive is
+                // configured, so the guest's mandatory pre-flight
+                // `nix-cache-info` does not depend on upstream reachability — a
+                // no-egress guest can substitute the local archive even if the
+                // upstream cache is momentarily unavailable. Without a local
+                // archive this proxies the upstream exactly as before.
+                if self.config.local_cache_dir().is_some() {
+                    local_cache_info(method)
+                } else {
+                    self.fetch_metadata(method, route).await
+                }
+            }
+            VmNixCacheRoute::NarInfo { hash } => {
+                // Local-first: a content-addressed narinfo in the broker's
+                // archive is served (and admitted) without contacting the
+                // upstream; a local miss falls through to the signed upstream
+                // proxy, so an empty/absent local cache behaves identically.
+                if let Some(fetch) = self.try_serve_local_narinfo(method, hash).await {
+                    return fetch;
+                }
                 self.fetch_metadata(method, route).await
             }
             VmNixCacheRoute::Nar { .. } => self.fetch_nar(method, route).await,
@@ -568,7 +638,7 @@ impl<S: SecretStore> VmHttpNixCacheService<S> {
                     };
                 }
             };
-            if let Err(err) = self.admit_narinfo(&narinfo) {
+            if let Err(err) = self.admit_narinfo(&narinfo, VmNixCacheNarSource::Upstream) {
                 tracing::warn!(
                     upstream_url = %upstream_url,
                     error = %err,
@@ -606,7 +676,7 @@ impl<S: SecretStore> VmHttpNixCacheService<S> {
         let VmNixCacheRoute::Nar { file } = route else {
             unreachable!("caller dispatches only NAR routes to fetch_nar");
         };
-        let Some(admission) = self.admitted_nar(file) else {
+        let Some(entry) = self.admitted_nar(file) else {
             let response =
                 VmHttpResponse::text(VmHttpStatus::BadGateway, "nix cache upstream failed");
             return VmHttpNixCacheProxyFetch {
@@ -617,6 +687,19 @@ impl<S: SecretStore> VmHttpNixCacheService<S> {
                 response,
             };
         };
+        let admission = entry.admission;
+        // The NAR's source was pinned when its narinfo was admitted. A NAR
+        // admitted from the local archive is served authoritatively from disk
+        // (so an upstream-admitted NAR is never broken by a same-named local
+        // file, and vice-versa); only an upstream admission proxies the upstream.
+        if entry.source == VmNixCacheNarSource::Local {
+            let dir = self
+                .config
+                .local_cache_dir()
+                .expect("a local NAR admission implies a configured local cache");
+            let nar_path = dir.join("nar").join(file.as_str());
+            return self.serve_local_nar(method, &nar_path, &admission).await;
+        }
         let url = self.upstream_url(route);
         let upstream_url = url.to_string();
         let is_head = method == "HEAD";
@@ -782,6 +865,195 @@ impl<S: SecretStore> VmHttpNixCacheService<S> {
         }
     }
 
+    /// Serve a narinfo from the broker's local flake-input archive, local-first.
+    ///
+    /// `Some` means the request was handled locally: either the
+    /// content-addressed narinfo was served (and its NAR admitted), or a
+    /// present-but-uncertifiable / oversized / unreadable local file failed
+    /// closed. `None` means there is no local cache or no file for this hash, so
+    /// the caller proxies the upstream exactly as before. A present file is
+    /// authoritative — we never silently fall through to the upstream for it,
+    /// because the upstream cannot hold these CA input-source paths anyway.
+    async fn try_serve_local_narinfo(
+        &self,
+        method: &str,
+        hash: &NixStoreHashPart,
+    ) -> Option<VmHttpNixCacheProxyFetch> {
+        let dir = self.config.local_cache_dir()?;
+        let path = dir.join(format!("{}.narinfo", hash.as_str()));
+        let local_url = local_file_url(&path);
+        let bytes = match read_local_cache_file(&path, self.config.max_metadata_bytes).await {
+            LocalCacheFile::Missing => return None,
+            LocalCacheFile::TooLarge => {
+                return Some(local_failure(local_url, "local narinfo too large"));
+            }
+            LocalCacheFile::Io(err) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %err,
+                    "vm http nix cache local narinfo read failed",
+                );
+                return Some(local_failure(local_url, "local narinfo read failed"));
+            }
+            LocalCacheFile::Bytes(bytes) => bytes,
+        };
+        let narinfo = match parse_content_addressed_narinfo_for_store_hash(&bytes, hash) {
+            Ok(narinfo) => narinfo,
+            Err(err) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %err,
+                    "vm http nix cache local narinfo was refused",
+                );
+                return Some(local_failure(local_url, local_ca_narinfo_error_label(&err)));
+            }
+        };
+        if let Err(err) = self.admit_narinfo(&narinfo, VmNixCacheNarSource::Local) {
+            tracing::warn!(
+                path = %path.display(),
+                error = %err,
+                "vm http nix cache local narinfo admission failed",
+            );
+            return Some(local_failure(local_url, err.audit_error_label()));
+        }
+        if method == "HEAD" {
+            let content_length = bytes.len() as u64;
+            let response = VmHttpResponse::text(VmHttpStatus::Ok, "")
+                .with_content_length(Some(content_length));
+            return Some(VmHttpNixCacheProxyFetch {
+                upstream_url: local_url,
+                upstream_status: None,
+                response_bytes: 0,
+                error: None,
+                response,
+            });
+        }
+        // Serve the narinfo bytes verbatim — including the self-certifying CA —
+        // so the guest accepts the path unsigned, exactly as it would from a
+        // local `file://` substituter.
+        let response_bytes = bytes.len() as u64;
+        Some(VmHttpNixCacheProxyFetch {
+            upstream_url: local_url,
+            upstream_status: None,
+            response_bytes,
+            error: None,
+            response: VmHttpResponse {
+                status: VmHttpStatus::Ok,
+                content_type: "text/plain; charset=utf-8",
+                body: bytes,
+                content_length: None,
+                www_authenticate: None,
+                headers: Vec::new(),
+            },
+        })
+    }
+
+    /// Serve a locally-admitted NAR authoritatively from the broker's archive at
+    /// `nar_path`. The narinfo was admitted from the local archive, so the NAR is
+    /// expected on disk; an absent / oversized / unreadable / hash-mismatched
+    /// file fails closed rather than proxying the upstream (which cannot hold a
+    /// content-addressed flake-input NAR anyway). The body is verified against
+    /// the admitted narinfo before it is served, defence in depth against
+    /// on-disk tamper.
+    async fn serve_local_nar(
+        &self,
+        method: &str,
+        nar_path: &Path,
+        admission: &VmHttpNixCacheAdmittedNar,
+    ) -> VmHttpNixCacheProxyFetch {
+        let local_url = local_file_url(nar_path);
+        if method == "HEAD" {
+            // HEAD needs only the (bounded) length — never buffer a potentially
+            // large NAR just to discard it.
+            return match stat_local_cache_file(nar_path, self.config.max_nar_bytes).await {
+                LocalCacheStat::Missing => {
+                    local_failure(local_url, "local nar missing for admitted path")
+                }
+                LocalCacheStat::TooLarge => local_failure(local_url, "local nar too large"),
+                LocalCacheStat::Io(err) => {
+                    tracing::warn!(
+                        path = %nar_path.display(),
+                        error = %err,
+                        "vm http nix cache local nar stat failed",
+                    );
+                    local_failure(local_url, "local nar read failed")
+                }
+                LocalCacheStat::Len(content_length) => VmHttpNixCacheProxyFetch {
+                    upstream_url: local_url,
+                    upstream_status: None,
+                    response_bytes: 0,
+                    error: None,
+                    response: VmHttpResponse {
+                        status: VmHttpStatus::Ok,
+                        content_type: "application/x-nix-nar",
+                        body: Vec::new(),
+                        content_length: Some(content_length),
+                        www_authenticate: None,
+                        headers: Vec::new(),
+                    },
+                },
+            };
+        }
+        let body = match read_local_cache_file(nar_path, self.config.max_nar_bytes).await {
+            LocalCacheFile::Missing => {
+                return local_failure(local_url, "local nar missing for admitted path");
+            }
+            LocalCacheFile::TooLarge => return local_failure(local_url, "local nar too large"),
+            LocalCacheFile::Io(err) => {
+                tracing::warn!(
+                    path = %nar_path.display(),
+                    error = %err,
+                    "vm http nix cache local nar read failed",
+                );
+                return local_failure(local_url, "local nar read failed");
+            }
+            LocalCacheFile::Bytes(body) => body,
+        };
+        let content_length = body.len() as u64;
+        let response_bytes = content_length;
+        let body = match verify_nar_body_on_blocking_thread(
+            admission.clone(),
+            body,
+            self.config.max_nar_bytes,
+        )
+        .await
+        {
+            Ok(body) => body,
+            Err(err) => {
+                tracing::warn!(
+                    path = %nar_path.display(),
+                    error = %err,
+                    "vm http nix cache local nar body was rejected",
+                );
+                let response = VmHttpResponse::text(
+                    VmHttpStatus::BadGateway,
+                    "nix cache local archive failed",
+                );
+                return VmHttpNixCacheProxyFetch {
+                    upstream_url: local_url,
+                    upstream_status: None,
+                    response_bytes,
+                    error: Some(err.audit_error_label()),
+                    response,
+                };
+            }
+        };
+        VmHttpNixCacheProxyFetch {
+            upstream_url: local_url,
+            upstream_status: None,
+            response_bytes,
+            error: None,
+            response: VmHttpResponse {
+                status: VmHttpStatus::Ok,
+                content_type: "application/x-nix-nar",
+                body,
+                content_length: Some(content_length),
+                www_authenticate: None,
+                headers: Vec::new(),
+            },
+        }
+    }
+
     fn upstream_url(&self, route: &VmNixCacheRoute) -> reqwest::Url {
         let path = match route {
             VmNixCacheRoute::CacheInfo => "nix-cache-info".to_string(),
@@ -794,7 +1066,11 @@ impl<S: SecretStore> VmHttpNixCacheService<S> {
             .expect("Nix cache route paths are URL-safe relative paths")
     }
 
-    fn admit_narinfo(&self, narinfo: &NixNarInfo) -> Result<(), VmHttpNixCacheNarAdmissionError> {
+    fn admit_narinfo(
+        &self,
+        narinfo: &NixNarInfo,
+        source: VmNixCacheNarSource,
+    ) -> Result<(), VmHttpNixCacheNarAdmissionError> {
         let admission = VmHttpNixCacheAdmittedNar::from_narinfo(narinfo);
         let actual = admission.nar_size.get();
         let max = self.config.max_nar_bytes;
@@ -810,18 +1086,31 @@ impl<S: SecretStore> VmHttpNixCacheService<S> {
             .admitted_nars
             .lock()
             .expect("Nix cache admission lock should not be poisoned");
-        if let Some(existing) = admitted_nars.get(&admission.file)
-            && existing != &admission
-        {
-            return Err(VmHttpNixCacheNarAdmissionError::ConflictingNarFile {
-                file: admission.file,
-            });
-        }
-        admitted_nars.insert(admission.file.clone(), admission);
+        // The conflict check is on the admission *content* only: a NAR file name
+        // is content-addressed, so re-admitting the same file with different
+        // metadata is a poisoning attempt. The source is not part of identity.
+        let source = match admitted_nars.get(&admission.file) {
+            Some(existing) if existing.admission != admission => {
+                return Err(VmHttpNixCacheNarAdmissionError::ConflictingNarFile {
+                    file: admission.file,
+                });
+            }
+            // Once a NAR is admitted from the local archive, keep serving it
+            // locally even if a later content-identical upstream admission
+            // arrives (local-first, no egress).
+            Some(existing) if existing.source == VmNixCacheNarSource::Local => {
+                VmNixCacheNarSource::Local
+            }
+            _ => source,
+        };
+        admitted_nars.insert(
+            admission.file.clone(),
+            VmHttpNixCacheNarEntry { admission, source },
+        );
         Ok(())
     }
 
-    fn admitted_nar(&self, file: &NixCacheNarFileName) -> Option<VmHttpNixCacheAdmittedNar> {
+    fn admitted_nar(&self, file: &NixCacheNarFileName) -> Option<VmHttpNixCacheNarEntry> {
         self.admitted_nars
             .lock()
             .expect("Nix cache admission lock should not be poisoned")
@@ -1072,6 +1361,173 @@ fn classify_nix_cache_target(target: &str) -> Option<VmNixCacheRoute> {
     }
     let hash = NixStoreHashPart::new(hash).expect("validated Nix store hash should parse");
     Some(VmNixCacheRoute::NarInfo { hash })
+}
+
+/// Outcome of a bounded read of a local-archive file.
+enum LocalCacheFile {
+    /// No such file (or not a regular file) — a local miss; the caller proxies
+    /// upstream.
+    Missing,
+    /// The file exceeds the configured byte bound; fail closed.
+    TooLarge,
+    /// An unexpected I/O error reading a file that exists; fail closed.
+    Io(std::io::Error),
+    Bytes(Vec<u8>),
+}
+
+/// `lstat` of a local-archive entry, classifying it without opening anything.
+enum LocalCacheLstat {
+    /// Absent, or not a *regular* file (a symlink, FIFO, directory, socket, …).
+    /// Treated as a miss.
+    Missing,
+    Io(std::io::Error),
+    /// A regular file of this byte length.
+    RegularFile {
+        len: u64,
+    },
+}
+
+/// `lstat` a local-archive entry and require it be a *regular* file. Used by the
+/// HEAD path, which only needs the length and never opens the entry, so it can
+/// neither block on a FIFO nor follow a symlink. A Nix file cache holds only
+/// regular files; symlinks/FIFOs/dirs are reported as a miss.
+async fn lstat_local_cache_file(path: &Path) -> LocalCacheLstat {
+    match tokio::fs::symlink_metadata(path).await {
+        Ok(metadata) if metadata.file_type().is_file() => LocalCacheLstat::RegularFile {
+            len: metadata.len(),
+        },
+        Ok(_) => LocalCacheLstat::Missing,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => LocalCacheLstat::Missing,
+        Err(err) => LocalCacheLstat::Io(err),
+    }
+}
+
+/// Read a local-archive file, enforcing `max` fail-closed and mapping an absent
+/// (or non-regular) file to [`LocalCacheFile::Missing`] so the caller can fall
+/// through to the upstream. Then read hard-capped at `max + 1` bytes — never
+/// buffering the whole file first — so the bound holds unconditionally even if
+/// the file grows after it is opened.
+///
+/// The open closes the classify/open race a bare `lstat` would leave: `O_NOFOLLOW`
+/// refuses a final-component symlink (so a swapped-in link cannot redirect the
+/// read outside the cache dir), `O_NONBLOCK` makes opening a FIFO return
+/// immediately instead of blocking the request, and the held fd is then `fstat`'d
+/// to require a *regular* file — validating the object actually opened, not a
+/// name re-stat. A Nix file cache holds only regular files, so this rejects
+/// nothing legitimate.
+async fn read_local_cache_file(path: &Path, max: u64) -> LocalCacheFile {
+    use tokio::io::AsyncReadExt as _;
+
+    let file = match tokio::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .await
+    {
+        Ok(file) => file,
+        // Absent, or a final-component symlink refused by `O_NOFOLLOW` (ELOOP):
+        // a local miss. (`ErrorKind::FilesystemLoop` is still unstable, so match
+        // the errno directly.)
+        Err(err)
+            if err.kind() == std::io::ErrorKind::NotFound
+                || err.raw_os_error() == Some(libc::ELOOP) =>
+        {
+            return LocalCacheFile::Missing;
+        }
+        Err(err) => return LocalCacheFile::Io(err),
+    };
+    match file.metadata().await {
+        // `fstat` on the held fd: only a regular file is served. A FIFO/socket/
+        // device that `O_NONBLOCK` let us open, or a directory, is a miss.
+        Ok(metadata) if metadata.file_type().is_file() => {}
+        Ok(_) => return LocalCacheFile::Missing,
+        Err(err) => return LocalCacheFile::Io(err),
+    }
+    // Read at most `max + 1` bytes: reaching the cap means the file is over
+    // budget, without ever holding more than `max + 1` bytes in memory.
+    let cap = max.saturating_add(1);
+    let mut body = Vec::new();
+    if let Err(err) = file.take(cap).read_to_end(&mut body).await {
+        return LocalCacheFile::Io(err);
+    }
+    if body.len() as u64 > max {
+        return LocalCacheFile::TooLarge;
+    }
+    LocalCacheFile::Bytes(body)
+}
+
+/// Outcome of a bounded *stat* of a local-archive file — its length without
+/// reading the body. Used to answer a NAR `HEAD` without buffering the (large)
+/// payload.
+enum LocalCacheStat {
+    Missing,
+    TooLarge,
+    Io(std::io::Error),
+    Len(u64),
+}
+
+/// Stat a local-archive file, enforcing `max` fail-closed and mapping an absent
+/// (or non-regular, including symlink) file to [`LocalCacheStat::Missing`].
+/// Returns the byte length without opening the body.
+async fn stat_local_cache_file(path: &Path, max: u64) -> LocalCacheStat {
+    match lstat_local_cache_file(path).await {
+        LocalCacheLstat::Missing => LocalCacheStat::Missing,
+        LocalCacheLstat::Io(err) => LocalCacheStat::Io(err),
+        LocalCacheLstat::RegularFile { len } if len > max => LocalCacheStat::TooLarge,
+        LocalCacheLstat::RegularFile { len } => LocalCacheStat::Len(len),
+    }
+}
+
+/// The `file://` URL recorded as the (non-HTTP) source of a local serve, so the
+/// audit log distinguishes a local-archive hit from an upstream proxy.
+fn local_file_url(path: &Path) -> String {
+    format!("file://{}", path.display())
+}
+
+/// Synthesize the `nix-cache-info` response locally (no upstream round-trip).
+/// Audited with no upstream URL or status, since nothing was proxied.
+fn local_cache_info(method: &str) -> VmHttpNixCacheProxyFetch {
+    let response = if method == "HEAD" {
+        VmHttpResponse::text(VmHttpStatus::Ok, "")
+    } else {
+        VmHttpResponse::text(VmHttpStatus::Ok, VM_NIX_CACHE_INFO_BODY)
+    };
+    let response_bytes = response.body.len() as u64;
+    VmHttpNixCacheProxyFetch {
+        upstream_url: String::new(),
+        upstream_status: None,
+        response_bytes,
+        error: None,
+        response,
+    }
+}
+
+/// A fail-closed local outcome: HTTP 502, no upstream status, with `error` set
+/// for the audit row. The body is opaque to the guest.
+fn local_failure(upstream_url: String, error: &'static str) -> VmHttpNixCacheProxyFetch {
+    let response = VmHttpResponse::text(VmHttpStatus::BadGateway, "nix cache local archive failed");
+    VmHttpNixCacheProxyFetch {
+        upstream_url,
+        upstream_status: None,
+        response_bytes: response.body.len() as u64,
+        error: Some(error),
+        response,
+    }
+}
+
+fn local_ca_narinfo_error_label(err: &NixContentAddressedNarInfoError) -> &'static str {
+    match err {
+        NixContentAddressedNarInfoError::NarInfo(err) => narinfo_audit_error_label(err),
+        NixContentAddressedNarInfoError::MissingContentAddress => {
+            "local narinfo missing content address"
+        }
+        NixContentAddressedNarInfoError::NotSelfCertifying { .. } => {
+            "local narinfo not self-certifying"
+        }
+        NixContentAddressedNarInfoError::StorePathNotContentDerived { .. } => {
+            "local narinfo store path not content-derived"
+        }
+    }
 }
 
 fn narinfo_audit_error_label(err: &NixNarInfoError) -> &'static str {
@@ -1327,7 +1783,9 @@ mod tests {
     }
 
     fn admit_test_nar(service: &VmHttpNixCacheService<Box<dyn SecretStore>>) {
-        service.admit_narinfo(&test_signed_narinfo()).unwrap();
+        service
+            .admit_narinfo(&test_signed_narinfo(), VmNixCacheNarSource::Upstream)
+            .unwrap();
     }
 
     fn nix_cache_request(
@@ -2655,6 +3113,662 @@ mod tests {
                 "accepted {target:?}"
             );
         }
+    }
+
+    /// Write a `nix flake archive`-style local entry: an unsigned narinfo whose
+    /// `CA: fixed:r:sha256:<digest>` self-certifies against its NarHash and whose
+    /// StorePath is the Nix fixed-output path derived from that content (so it
+    /// passes the broker's full self-certification), plus the xz-compressed NAR
+    /// at `nar/<file>`. Returns the derived store hash and the narinfo and
+    /// compressed-NAR bytes the served responses must match.
+    fn write_local_ca_entry(
+        cache_dir: &std::path::Path,
+        store_name: &str,
+        nar_file: &str,
+        raw_body: &[u8],
+    ) -> (String, Vec<u8>, Vec<u8>) {
+        let compressed = xz_nar_body_for(raw_body);
+        let nar_hash = nar_hash_for_body(raw_body);
+        let nar_digest = nar_hash
+            .strip_prefix("sha256:")
+            .expect("nar_hash_for_body returns a sha256 hash");
+        let store_hash =
+            crate::nix_cache::fixed_output_recursive_sha256_store_hash(nar_digest, store_name)
+                .expect("a valid sha256 digest derives a store hash");
+        let narinfo = format!(
+            "StorePath: /nix/store/{store_hash}-{store_name}\nURL: nar/{nar_file}\nCompression: xz\nNarHash: {nar_hash}\nNarSize: {}\nReferences: \nCA: fixed:r:sha256:{nar_digest}\n",
+            raw_body.len(),
+        );
+        std::fs::create_dir_all(cache_dir.join("nar")).unwrap();
+        std::fs::write(
+            cache_dir.join(format!("{store_hash}.narinfo")),
+            narinfo.as_bytes(),
+        )
+        .unwrap();
+        std::fs::write(cache_dir.join("nar").join(nar_file), &compressed).unwrap();
+        (store_hash, narinfo.into_bytes(), compressed)
+    }
+
+    fn nix_cache_service_with_local_cache(
+        state: &Arc<BrokerState<Box<dyn SecretStore>>>,
+        upstream_url: &str,
+        cache_dir: &std::path::Path,
+        max_metadata_bytes: u64,
+        max_nar_bytes: u64,
+    ) -> VmHttpNixCacheService<Box<dyn SecretStore>> {
+        VmHttpNixCacheService::new(
+            Arc::clone(state),
+            VmHttpNixCacheConfig::new(upstream_url, max_metadata_bytes, max_nar_bytes)
+                .unwrap()
+                .with_local_cache_dir(Some(cache_dir.to_path_buf())),
+        )
+    }
+
+    // A dead upstream: any fallthrough to the proxy fails to connect, so a 200
+    // proves the response was served entirely from the local archive.
+    const DEAD_UPSTREAM: &str = "http://127.0.0.1:9";
+
+    #[tokio::test]
+    async fn local_archive_narinfo_and_nar_are_served_without_upstream() {
+        let upstream = MockServer::start().await;
+        let state = make_broker_state(&upstream);
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+        open_audit_session(&state, session.session_id());
+        let cache = tempfile::tempdir().unwrap();
+        let nar_file = "input.nar.xz";
+        let (hash, narinfo_bytes, compressed) =
+            write_local_ca_entry(cache.path(), "source", nar_file, b"local flake input nar");
+        let service =
+            nix_cache_service_with_local_cache(&state, DEAD_UPSTREAM, cache.path(), 4096, 4096);
+
+        let narinfo_response = route_nix_cache_with_service(
+            &session,
+            "GET",
+            format!("{VM_NIX_CACHE_PATH_PREFIX}/{hash}.narinfo"),
+            service.clone(),
+        )
+        .await;
+        let nar_response = route_nix_cache_with_service(
+            &session,
+            "GET",
+            format!("{VM_NIX_CACHE_PATH_PREFIX}/nar/{nar_file}"),
+            service,
+        )
+        .await;
+
+        assert_eq!(narinfo_response.status, VmHttpStatus::Ok);
+        assert_eq!(narinfo_response.body, narinfo_bytes);
+        assert_eq!(nar_response.status, VmHttpStatus::Ok);
+        assert_eq!(nar_response.content_type, "application/x-nix-nar");
+        assert_eq!(nar_response.content_length, Some(compressed.len() as u64));
+        assert_eq!(nar_response.body, compressed);
+
+        let entries = state
+            .audit
+            .list_nix_cache_requests_for_session(session.session_id())
+            .unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].route, NixCacheAuditRoute::NarInfo);
+        assert_eq!(entries[0].http_status, Some(200));
+        assert_eq!(entries[0].upstream_status, None);
+        assert_eq!(entries[0].error, None);
+        assert!(
+            entries[0]
+                .upstream_url
+                .as_deref()
+                .is_some_and(|url| url.starts_with("file://")),
+            "narinfo served locally should record a file:// source, got {:?}",
+            entries[0].upstream_url,
+        );
+        assert_eq!(entries[1].route, NixCacheAuditRoute::Nar);
+        assert_eq!(entries[1].http_status, Some(200));
+        assert_eq!(entries[1].upstream_status, None);
+        assert_eq!(entries[1].error, None);
+        assert_eq!(
+            entries[1].response_bytes,
+            Some(compressed.len() as u64),
+            "nar response bytes should match the compressed body",
+        );
+        assert!(
+            entries[1]
+                .upstream_url
+                .as_deref()
+                .is_some_and(|url| url.starts_with("file://")),
+        );
+    }
+
+    #[tokio::test]
+    async fn local_archive_narinfo_head_returns_length_and_admits_the_nar() {
+        let upstream = MockServer::start().await;
+        let state = make_broker_state(&upstream);
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+        open_audit_session(&state, session.session_id());
+        let cache = tempfile::tempdir().unwrap();
+        let nar_file = "input.nar.xz";
+        let (hash, narinfo_bytes, compressed) =
+            write_local_ca_entry(cache.path(), "source", nar_file, b"head then get");
+        let service =
+            nix_cache_service_with_local_cache(&state, DEAD_UPSTREAM, cache.path(), 4096, 4096);
+
+        let head = route_nix_cache_with_service(
+            &session,
+            "HEAD",
+            format!("{VM_NIX_CACHE_PATH_PREFIX}/{hash}.narinfo"),
+            service.clone(),
+        )
+        .await;
+        // A HEAD must still admit the path, so the following NAR GET succeeds.
+        let nar = route_nix_cache_with_service(
+            &session,
+            "GET",
+            format!("{VM_NIX_CACHE_PATH_PREFIX}/nar/{nar_file}"),
+            service,
+        )
+        .await;
+
+        assert_eq!(head.status, VmHttpStatus::Ok);
+        assert!(head.body.is_empty());
+        assert_eq!(head.content_length, Some(narinfo_bytes.len() as u64));
+        assert_eq!(nar.status, VmHttpStatus::Ok);
+        assert_eq!(nar.body, compressed);
+    }
+
+    #[tokio::test]
+    async fn local_cache_miss_falls_through_to_signed_upstream() {
+        let upstream = MockServer::start().await;
+        let state = make_broker_state(&upstream);
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+        open_audit_session(&state, session.session_id());
+        // An empty local cache dir: every hash is a local miss.
+        let cache = tempfile::tempdir().unwrap();
+        let hash = "rzv95bakh41zrn5ji23pfc11x5vq2z4d";
+        Mock::given(method("GET"))
+            .and(path(format!("/{hash}.narinfo")))
+            .respond_with(ResponseTemplate::new(200).set_body_string(TEST_SIGNED_NARINFO))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+        let service = VmHttpNixCacheService::new(
+            Arc::clone(&state),
+            VmHttpNixCacheConfig::new_with_trusted_public_keys(
+                upstream.uri(),
+                1024,
+                1024,
+                NixTrustedPublicKeys::from_strings([TEST_NIX_CACHE_PUBLIC_KEY]).unwrap(),
+            )
+            .unwrap()
+            .with_local_cache_dir(Some(cache.path().to_path_buf())),
+        );
+
+        let response = route_nix_cache_with_service(
+            &session,
+            "GET",
+            format!("{VM_NIX_CACHE_PATH_PREFIX}/{hash}.narinfo"),
+            service,
+        )
+        .await;
+
+        assert_eq!(response.status, VmHttpStatus::Ok);
+        assert_eq!(response.body, TEST_SIGNED_NARINFO.as_bytes());
+        upstream.verify().await;
+        let entries = state
+            .audit
+            .list_nix_cache_requests_for_session(session.session_id())
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].http_status, Some(200));
+        assert_eq!(entries[0].upstream_status, Some(200));
+        assert!(
+            entries[0]
+                .upstream_url
+                .as_deref()
+                .is_some_and(|url| url.ends_with(&format!("/{hash}.narinfo"))),
+            "a local miss should proxy and audit the upstream URL, got {:?}",
+            entries[0].upstream_url,
+        );
+    }
+
+    #[tokio::test]
+    async fn local_cache_info_is_served_synthetically_without_upstream() {
+        let upstream = MockServer::start().await;
+        let state = make_broker_state(&upstream);
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+        open_audit_session(&state, session.session_id());
+        let cache = tempfile::tempdir().unwrap();
+        // Local cache configured + a dead upstream: the mandatory cache-info
+        // pre-flight must still succeed so the guest reaches the local-first
+        // narinfo/NAR paths rather than rejecting the substituter.
+        let service =
+            nix_cache_service_with_local_cache(&state, DEAD_UPSTREAM, cache.path(), 4096, 4096);
+
+        let response =
+            route_nix_cache_with_service(&session, "GET", VM_NIX_CACHE_INFO_PATH.into(), service)
+                .await;
+
+        assert_eq!(response.status, VmHttpStatus::Ok);
+        let body = String::from_utf8(response.body).unwrap();
+        assert!(body.contains("StoreDir: /nix/store"), "{body}");
+        let entries = state
+            .audit
+            .list_nix_cache_requests_for_session(session.session_id())
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].route, NixCacheAuditRoute::CacheInfo);
+        assert_eq!(entries[0].http_status, Some(200));
+        assert_eq!(entries[0].upstream_status, None);
+        assert_eq!(entries[0].upstream_url, None);
+        assert_eq!(entries[0].error, None);
+    }
+
+    #[tokio::test]
+    async fn local_narinfo_present_but_not_self_certifying_fails_closed() {
+        let upstream = MockServer::start().await;
+        let state = make_broker_state(&upstream);
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+        open_audit_session(&state, session.session_id());
+        let cache = tempfile::tempdir().unwrap();
+        let hash = "00000000000000000000000000000000";
+        // A narinfo whose CA is `text:` rather than the required recursive
+        // `fixed:r:sha256:` — present, so it is authoritative and fails closed
+        // rather than proxying the (dead) upstream.
+        let nar_hash = nar_hash_for_body(b"whatever");
+        let nar_digest = nar_hash.strip_prefix("sha256:").unwrap();
+        let narinfo = format!(
+            "StorePath: /nix/store/{hash}-source\nURL: nar/input.nar.xz\nCompression: xz\nNarHash: {nar_hash}\nNarSize: 8\nReferences: \nCA: text:sha256:{nar_digest}\n"
+        );
+        std::fs::write(
+            cache.path().join(format!("{hash}.narinfo")),
+            narinfo.as_bytes(),
+        )
+        .unwrap();
+        let service =
+            nix_cache_service_with_local_cache(&state, DEAD_UPSTREAM, cache.path(), 4096, 4096);
+
+        let response = route_nix_cache_with_service(
+            &session,
+            "GET",
+            format!("{VM_NIX_CACHE_PATH_PREFIX}/{hash}.narinfo"),
+            service,
+        )
+        .await;
+
+        assert_eq!(response.status, VmHttpStatus::BadGateway);
+        let entries = state
+            .audit
+            .list_nix_cache_requests_for_session(session.session_id())
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].route, NixCacheAuditRoute::NarInfo);
+        assert_eq!(entries[0].http_status, Some(502));
+        assert_eq!(entries[0].upstream_status, None);
+        assert_eq!(
+            entries[0].error.as_deref(),
+            Some("local narinfo not self-certifying"),
+        );
+    }
+
+    #[tokio::test]
+    async fn local_narinfo_over_metadata_budget_fails_closed() {
+        let upstream = MockServer::start().await;
+        let state = make_broker_state(&upstream);
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+        open_audit_session(&state, session.session_id());
+        let cache = tempfile::tempdir().unwrap();
+        let (hash, _, _) =
+            write_local_ca_entry(cache.path(), "source", "input.nar.xz", b"local nar body");
+        // A metadata budget smaller than the narinfo file forces a fail-closed.
+        let service =
+            nix_cache_service_with_local_cache(&state, DEAD_UPSTREAM, cache.path(), 8, 4096);
+
+        let response = route_nix_cache_with_service(
+            &session,
+            "GET",
+            format!("{VM_NIX_CACHE_PATH_PREFIX}/{hash}.narinfo"),
+            service,
+        )
+        .await;
+
+        assert_eq!(response.status, VmHttpStatus::BadGateway);
+        let entries = state
+            .audit
+            .list_nix_cache_requests_for_session(session.session_id())
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].error.as_deref(), Some("local narinfo too large"));
+        assert_eq!(entries[0].upstream_status, None);
+    }
+
+    #[tokio::test]
+    async fn local_nar_body_tamper_is_rejected_before_serving() {
+        let upstream = MockServer::start().await;
+        let state = make_broker_state(&upstream);
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+        open_audit_session(&state, session.session_id());
+        let cache = tempfile::tempdir().unwrap();
+        let nar_file = "input.nar.xz";
+        let (hash, _, _) =
+            write_local_ca_entry(cache.path(), "source", nar_file, b"trusted local body");
+        // Overwrite the on-disk NAR with a different (valid xz) body: its hash no
+        // longer matches the admitted narinfo, so serving must fail closed.
+        std::fs::write(
+            cache.path().join("nar").join(nar_file),
+            xz_nar_body_for(b"tampered body of different length"),
+        )
+        .unwrap();
+        let service =
+            nix_cache_service_with_local_cache(&state, DEAD_UPSTREAM, cache.path(), 4096, 4096);
+
+        let narinfo = route_nix_cache_with_service(
+            &session,
+            "GET",
+            format!("{VM_NIX_CACHE_PATH_PREFIX}/{hash}.narinfo"),
+            service.clone(),
+        )
+        .await;
+        let nar = route_nix_cache_with_service(
+            &session,
+            "GET",
+            format!("{VM_NIX_CACHE_PATH_PREFIX}/nar/{nar_file}"),
+            service,
+        )
+        .await;
+
+        assert_eq!(narinfo.status, VmHttpStatus::Ok);
+        assert_eq!(nar.status, VmHttpStatus::BadGateway);
+        let entries = state
+            .audit
+            .list_nix_cache_requests_for_session(session.session_id())
+            .unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[1].route, NixCacheAuditRoute::Nar);
+        assert_eq!(entries[1].http_status, Some(502));
+        assert_eq!(entries[1].upstream_status, None);
+        assert_eq!(
+            entries[1].error.as_deref(),
+            Some("mismatched upstream nar size"),
+        );
+    }
+
+    #[tokio::test]
+    async fn upstream_admitted_nar_is_not_shadowed_by_a_local_file() {
+        let upstream = MockServer::start().await;
+        let state = make_broker_state(&upstream);
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+        open_audit_session(&state, session.session_id());
+        let cache = tempfile::tempdir().unwrap();
+        let hash = "rzv95bakh41zrn5ji23pfc11x5vq2z4d";
+        let nar_body = test_xz_nar_body();
+        // The signed narinfo is only upstream (no `<hash>.narinfo` locally), so it
+        // proxies and admits from the upstream.
+        Mock::given(method("GET"))
+            .and(path(format!("/{hash}.narinfo")))
+            .respond_with(ResponseTemplate::new(200).set_body_string(TEST_SIGNED_NARINFO))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/nar/{TEST_NAR_FILE}")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(nar_body.clone()))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+        // A garbage local NAR sharing the upstream narinfo's URL name must NOT
+        // shadow the valid signed upstream NAR.
+        std::fs::create_dir_all(cache.path().join("nar")).unwrap();
+        std::fs::write(
+            cache.path().join("nar").join(TEST_NAR_FILE),
+            xz_nar_body_for(b"unrelated local content"),
+        )
+        .unwrap();
+        let service = VmHttpNixCacheService::new(
+            Arc::clone(&state),
+            VmHttpNixCacheConfig::new_with_trusted_public_keys(
+                upstream.uri(),
+                1024,
+                1024,
+                NixTrustedPublicKeys::from_strings([TEST_NIX_CACHE_PUBLIC_KEY]).unwrap(),
+            )
+            .unwrap()
+            .with_local_cache_dir(Some(cache.path().to_path_buf())),
+        );
+
+        let narinfo = route_nix_cache_with_service(
+            &session,
+            "GET",
+            format!("{VM_NIX_CACHE_PATH_PREFIX}/{hash}.narinfo"),
+            service.clone(),
+        )
+        .await;
+        let nar = route_nix_cache_with_service(
+            &session,
+            "GET",
+            format!("{VM_NIX_CACHE_PATH_PREFIX}/nar/{TEST_NAR_FILE}"),
+            service,
+        )
+        .await;
+
+        assert_eq!(narinfo.status, VmHttpStatus::Ok);
+        assert_eq!(nar.status, VmHttpStatus::Ok);
+        // The valid upstream body, not the local garbage.
+        assert_eq!(nar.body, nar_body);
+        upstream.verify().await;
+        let entries = state
+            .audit
+            .list_nix_cache_requests_for_session(session.session_id())
+            .unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[1].route, NixCacheAuditRoute::Nar);
+        assert_eq!(entries[1].http_status, Some(200));
+        assert_eq!(entries[1].upstream_status, Some(200));
+        assert!(
+            entries[1]
+                .upstream_url
+                .as_deref()
+                .is_some_and(|url| url.ends_with(&format!("/nar/{TEST_NAR_FILE}"))),
+            "an upstream-admitted NAR must be fetched from the upstream, got {:?}",
+            entries[1].upstream_url,
+        );
+    }
+
+    #[tokio::test]
+    async fn local_admitted_nar_missing_on_disk_fails_closed() {
+        let upstream = MockServer::start().await;
+        let state = make_broker_state(&upstream);
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+        open_audit_session(&state, session.session_id());
+        let cache = tempfile::tempdir().unwrap();
+        let nar_file = "input.nar.xz";
+        let (hash, _, _) =
+            write_local_ca_entry(cache.path(), "source", nar_file, b"present then gone");
+        // Remove the NAR after the narinfo is in place: a local (authoritative)
+        // admission whose NAR is missing must fail closed, not proxy the upstream.
+        std::fs::remove_file(cache.path().join("nar").join(nar_file)).unwrap();
+        let service =
+            nix_cache_service_with_local_cache(&state, DEAD_UPSTREAM, cache.path(), 4096, 4096);
+
+        let narinfo = route_nix_cache_with_service(
+            &session,
+            "GET",
+            format!("{VM_NIX_CACHE_PATH_PREFIX}/{hash}.narinfo"),
+            service.clone(),
+        )
+        .await;
+        let nar = route_nix_cache_with_service(
+            &session,
+            "GET",
+            format!("{VM_NIX_CACHE_PATH_PREFIX}/nar/{nar_file}"),
+            service,
+        )
+        .await;
+
+        assert_eq!(narinfo.status, VmHttpStatus::Ok);
+        assert_eq!(nar.status, VmHttpStatus::BadGateway);
+        let entries = state
+            .audit
+            .list_nix_cache_requests_for_session(session.session_id())
+            .unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[1].route, NixCacheAuditRoute::Nar);
+        assert_eq!(entries[1].http_status, Some(502));
+        assert_eq!(entries[1].upstream_status, None);
+        assert_eq!(
+            entries[1].error.as_deref(),
+            Some("local nar missing for admitted path"),
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn local_nar_non_regular_file_is_refused_not_opened() {
+        // FIFO-class guard: a non-regular cache entry (here a symlink, which on
+        // Unix could point at a FIFO) at the NAR path must be refused via lstat
+        // before opening — opening a FIFO for read would block the request. The
+        // narinfo is admitted from a regular file; the NAR is then swapped for a
+        // symlink to a valid sibling and must fail closed (not be followed).
+        let upstream = MockServer::start().await;
+        let state = make_broker_state(&upstream);
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+        open_audit_session(&state, session.session_id());
+        let cache = tempfile::tempdir().unwrap();
+        let nar_file = "input.nar.xz";
+        let (hash, _, _) =
+            write_local_ca_entry(cache.path(), "source", nar_file, b"regular then link");
+        // Replace the regular NAR with a symlink to a valid sibling NAR file.
+        let nar_path = cache.path().join("nar").join(nar_file);
+        let target = cache.path().join("nar").join("target.nar.xz");
+        std::fs::write(&target, xz_nar_body_for(b"symlink target body")).unwrap();
+        std::fs::remove_file(&nar_path).unwrap();
+        std::os::unix::fs::symlink(&target, &nar_path).unwrap();
+        let service =
+            nix_cache_service_with_local_cache(&state, DEAD_UPSTREAM, cache.path(), 4096, 4096);
+
+        let narinfo = route_nix_cache_with_service(
+            &session,
+            "GET",
+            format!("{VM_NIX_CACHE_PATH_PREFIX}/{hash}.narinfo"),
+            service.clone(),
+        )
+        .await;
+        let nar = route_nix_cache_with_service(
+            &session,
+            "GET",
+            format!("{VM_NIX_CACHE_PATH_PREFIX}/nar/{nar_file}"),
+            service,
+        )
+        .await;
+
+        assert_eq!(narinfo.status, VmHttpStatus::Ok);
+        assert_eq!(nar.status, VmHttpStatus::BadGateway);
+        let entries = state
+            .audit
+            .list_nix_cache_requests_for_session(session.session_id())
+            .unwrap();
+        assert_eq!(entries[1].route, NixCacheAuditRoute::Nar);
+        assert_eq!(entries[1].http_status, Some(502));
+        assert_eq!(
+            entries[1].error.as_deref(),
+            Some("local nar missing for admitted path"),
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn local_nar_fifo_does_not_block_and_is_refused() {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let upstream = MockServer::start().await;
+        let state = make_broker_state(&upstream);
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+        open_audit_session(&state, session.session_id());
+        let cache = tempfile::tempdir().unwrap();
+        let nar_file = "input.nar.xz";
+        let (hash, _, _) =
+            write_local_ca_entry(cache.path(), "source", nar_file, b"regular then fifo");
+        // Replace the regular NAR with a FIFO: opening it for read blocks until a
+        // writer appears unless the open is non-blocking. There is no writer here,
+        // so a blocking open would hang the request forever.
+        let nar_path = cache.path().join("nar").join(nar_file);
+        std::fs::remove_file(&nar_path).unwrap();
+        let c_path = std::ffi::CString::new(nar_path.as_os_str().as_bytes()).unwrap();
+        let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+        assert_eq!(rc, 0, "mkfifo failed: {}", std::io::Error::last_os_error());
+        let service =
+            nix_cache_service_with_local_cache(&state, DEAD_UPSTREAM, cache.path(), 4096, 4096);
+
+        let narinfo = route_nix_cache_with_service(
+            &session,
+            "GET",
+            format!("{VM_NIX_CACHE_PATH_PREFIX}/{hash}.narinfo"),
+            service.clone(),
+        )
+        .await;
+        let nar = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            route_nix_cache_with_service(
+                &session,
+                "GET",
+                format!("{VM_NIX_CACHE_PATH_PREFIX}/nar/{nar_file}"),
+                service,
+            ),
+        )
+        .await
+        .expect("a FIFO NAR must not block the request");
+
+        assert_eq!(narinfo.status, VmHttpStatus::Ok);
+        assert_eq!(nar.status, VmHttpStatus::BadGateway);
+        let entries = state
+            .audit
+            .list_nix_cache_requests_for_session(session.session_id())
+            .unwrap();
+        assert_eq!(entries[1].route, NixCacheAuditRoute::Nar);
+        assert_eq!(entries[1].http_status, Some(502));
+        assert_eq!(
+            entries[1].error.as_deref(),
+            Some("local nar missing for admitted path"),
+        );
+    }
+
+    #[tokio::test]
+    async fn local_nar_head_returns_content_length_without_the_body() {
+        let upstream = MockServer::start().await;
+        let state = make_broker_state(&upstream);
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+        open_audit_session(&state, session.session_id());
+        let cache = tempfile::tempdir().unwrap();
+        let nar_file = "input.nar.xz";
+        let (hash, _, compressed) =
+            write_local_ca_entry(cache.path(), "source", nar_file, b"head this nar");
+        let service =
+            nix_cache_service_with_local_cache(&state, DEAD_UPSTREAM, cache.path(), 4096, 4096);
+
+        let narinfo = route_nix_cache_with_service(
+            &session,
+            "GET",
+            format!("{VM_NIX_CACHE_PATH_PREFIX}/{hash}.narinfo"),
+            service.clone(),
+        )
+        .await;
+        let head = route_nix_cache_with_service(
+            &session,
+            "HEAD",
+            format!("{VM_NIX_CACHE_PATH_PREFIX}/nar/{nar_file}"),
+            service,
+        )
+        .await;
+
+        assert_eq!(narinfo.status, VmHttpStatus::Ok);
+        assert_eq!(head.status, VmHttpStatus::Ok);
+        assert_eq!(head.content_type, "application/x-nix-nar");
+        assert!(head.body.is_empty());
+        assert_eq!(head.content_length, Some(compressed.len() as u64));
+        let entries = state
+            .audit
+            .list_nix_cache_requests_for_session(session.session_id())
+            .unwrap();
+        assert_eq!(entries[1].route, NixCacheAuditRoute::Nar);
+        assert_eq!(entries[1].http_status, Some(200));
+        assert_eq!(entries[1].response_bytes, Some(0));
+        assert_eq!(entries[1].error, None);
     }
 
     #[tokio::test]
