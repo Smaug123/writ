@@ -355,7 +355,15 @@ mod tests {
         );
         let stdout = run_clean_git_capture_stdout(&invocation, Duration::from_secs(10), None)
             .await
-            .expect("env probe must succeed");
+            .unwrap_or_else(|err| {
+                // A `Spawn(ETXTBSY)` here means a sibling test's `fork()`
+                // held a writable fd to the just-written probe past the
+                // retry ceiling under parallel-test load; any other
+                // variant points elsewhere. Surface the exact error so a
+                // future flake is self-diagnosing rather than a bare
+                // "env probe must succeed".
+                panic!("env probe must succeed, but clean-git run failed: {err:?}");
+            });
         let text = std::str::from_utf8(&stdout).expect("env output is UTF-8");
 
         let hardened: BTreeMap<&str, &str> = [
