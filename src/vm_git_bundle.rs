@@ -938,7 +938,7 @@ exit 42
     /// How long [`wait_for_path_or_finished`] waits for the marker before
     /// declaring a hang. Deliberately generous: the marker is written by a
     /// freshly-`exec`ed descendant process whose startup (subprocess spawn
-    /// + OS scheduling of the new process) can be delayed by many seconds
+    /// and OS scheduling of the new process) can be delayed by many seconds
     /// under peak parallel-test load — the machine is oversubscribed while
     /// ~1500 tests run, many spawning their own subprocesses. The previous
     /// 10s bound was occasionally too tight and flaked. Since the wait
