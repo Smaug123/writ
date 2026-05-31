@@ -6945,6 +6945,20 @@ mod tests {
 
     /// A leftover socket file with no live listener (stale) is detected
     /// (connect fails), cleaned up, and the rebind succeeds.
+    ///
+    /// The reclaim is retried on a bounded deadline. In the parallel test
+    /// harness a sibling `fork()` in another test can transiently inherit
+    /// this just-dropped listener's fd — `O_CLOEXEC` closes it only at the
+    /// child's `exec`, not at `fork` — keeping the AF_UNIX socket
+    /// momentarily connectable (into the listen backlog) so `bind_socket`'s
+    /// liveness probe reports `AddrInUse`. The window is sub-millisecond:
+    /// once the forked child `exec`s, the socket is truly gone and the
+    /// reclaim succeeds. Production `writd` startup binds the socket once
+    /// with no concurrent listener being dropped, so it never sees this
+    /// transient; only the test harness manufactures it, so only the test
+    /// tolerates it. A genuine reclaim failure still surfaces: any other
+    /// error fails immediately, and exhausting the deadline panics rather
+    /// than hanging.
     #[tokio::test]
     async fn bind_socket_reclaims_stale_socket_file() {
         let dir = tempfile::tempdir().unwrap();
@@ -6955,7 +6969,21 @@ mod tests {
             let _listener = UnixListener::bind(&sock).unwrap();
         }
         assert!(sock.exists(), "precondition: stale socket file present");
-        let l = bind_socket(&sock).await.unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let l = loop {
+            match bind_socket(&sock).await {
+                Ok(l) => break l,
+                Err(e)
+                    if e.kind() == io::ErrorKind::AddrInUse
+                        && std::time::Instant::now() < deadline =>
+                {
+                    // Transient fork-inherited connectability; retry once
+                    // the holding child has had a chance to exec.
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                Err(e) => panic!("bind_socket failed to reclaim stale socket: {e}"),
+            }
+        };
         assert!(sock.exists());
         drop(l);
     }
