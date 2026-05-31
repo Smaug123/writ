@@ -1375,7 +1375,7 @@ enum LocalCacheFile {
     Bytes(Vec<u8>),
 }
 
-/// `lstat` of a local-archive entry, classifying it before anything opens it.
+/// `lstat` of a local-archive entry, classifying it without opening anything.
 enum LocalCacheLstat {
     /// Absent, or not a *regular* file (a symlink, FIFO, directory, socket, …).
     /// Treated as a miss.
@@ -1387,11 +1387,10 @@ enum LocalCacheLstat {
     },
 }
 
-/// `lstat` a local-archive entry and require it be a *regular* file. A Nix file
-/// cache holds only regular files; this refuses symlinks (keeping reads inside
-/// the cache dir) and — crucially — never opens the path, so it cannot block on
-/// a FIFO. Opening a FIFO (or a symlink to one) for read blocks until a writer
-/// appears, which would hang the request; classifying first avoids that.
+/// `lstat` a local-archive entry and require it be a *regular* file. Used by the
+/// HEAD path, which only needs the length and never opens the entry, so it can
+/// neither block on a FIFO nor follow a symlink. A Nix file cache holds only
+/// regular files; symlinks/FIFOs/dirs are reported as a miss.
 async fn lstat_local_cache_file(path: &Path) -> LocalCacheLstat {
     match tokio::fs::symlink_metadata(path).await {
         Ok(metadata) if metadata.file_type().is_file() => LocalCacheLstat::RegularFile {
@@ -1405,23 +1404,45 @@ async fn lstat_local_cache_file(path: &Path) -> LocalCacheLstat {
 
 /// Read a local-archive file, enforcing `max` fail-closed and mapping an absent
 /// (or non-regular) file to [`LocalCacheFile::Missing`] so the caller can fall
-/// through to the upstream. The entry is `lstat`-checked to be a regular file
-/// before opening (so a FIFO cannot block the open), then read hard-capped at
-/// `max + 1` bytes — never buffering the whole file first — so the bound holds
-/// unconditionally even if the file is replaced or grows between open and read.
+/// through to the upstream. Then read hard-capped at `max + 1` bytes — never
+/// buffering the whole file first — so the bound holds unconditionally even if
+/// the file grows after it is opened.
+///
+/// The open closes the classify/open race a bare `lstat` would leave: `O_NOFOLLOW`
+/// refuses a final-component symlink (so a swapped-in link cannot redirect the
+/// read outside the cache dir), `O_NONBLOCK` makes opening a FIFO return
+/// immediately instead of blocking the request, and the held fd is then `fstat`'d
+/// to require a *regular* file — validating the object actually opened, not a
+/// name re-stat. A Nix file cache holds only regular files, so this rejects
+/// nothing legitimate.
 async fn read_local_cache_file(path: &Path, max: u64) -> LocalCacheFile {
     use tokio::io::AsyncReadExt as _;
 
-    match lstat_local_cache_file(path).await {
-        LocalCacheLstat::Missing => return LocalCacheFile::Missing,
-        LocalCacheLstat::Io(err) => return LocalCacheFile::Io(err),
-        LocalCacheLstat::RegularFile { .. } => {}
-    }
-    let file = match tokio::fs::File::open(path).await {
+    let file = match tokio::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .await
+    {
         Ok(file) => file,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return LocalCacheFile::Missing,
+        // Absent, or a final-component symlink refused by `O_NOFOLLOW` (ELOOP):
+        // a local miss. (`ErrorKind::FilesystemLoop` is still unstable, so match
+        // the errno directly.)
+        Err(err)
+            if err.kind() == std::io::ErrorKind::NotFound
+                || err.raw_os_error() == Some(libc::ELOOP) =>
+        {
+            return LocalCacheFile::Missing;
+        }
         Err(err) => return LocalCacheFile::Io(err),
     };
+    match file.metadata().await {
+        // `fstat` on the held fd: only a regular file is served. A FIFO/socket/
+        // device that `O_NONBLOCK` let us open, or a directory, is a miss.
+        Ok(metadata) if metadata.file_type().is_file() => {}
+        Ok(_) => return LocalCacheFile::Missing,
+        Err(err) => return LocalCacheFile::Io(err),
+    }
     // Read at most `max + 1` bytes: reaching the cap means the file is over
     // budget, without ever holding more than `max + 1` bytes in memory.
     let cap = max.saturating_add(1);
@@ -3635,6 +3656,63 @@ mod tests {
             service,
         )
         .await;
+
+        assert_eq!(narinfo.status, VmHttpStatus::Ok);
+        assert_eq!(nar.status, VmHttpStatus::BadGateway);
+        let entries = state
+            .audit
+            .list_nix_cache_requests_for_session(session.session_id())
+            .unwrap();
+        assert_eq!(entries[1].route, NixCacheAuditRoute::Nar);
+        assert_eq!(entries[1].http_status, Some(502));
+        assert_eq!(
+            entries[1].error.as_deref(),
+            Some("local nar missing for admitted path"),
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn local_nar_fifo_does_not_block_and_is_refused() {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let upstream = MockServer::start().await;
+        let state = make_broker_state(&upstream);
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+        open_audit_session(&state, session.session_id());
+        let cache = tempfile::tempdir().unwrap();
+        let nar_file = "input.nar.xz";
+        let (hash, _, _) =
+            write_local_ca_entry(cache.path(), "source", nar_file, b"regular then fifo");
+        // Replace the regular NAR with a FIFO: opening it for read blocks until a
+        // writer appears unless the open is non-blocking. There is no writer here,
+        // so a blocking open would hang the request forever.
+        let nar_path = cache.path().join("nar").join(nar_file);
+        std::fs::remove_file(&nar_path).unwrap();
+        let c_path = std::ffi::CString::new(nar_path.as_os_str().as_bytes()).unwrap();
+        let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+        assert_eq!(rc, 0, "mkfifo failed: {}", std::io::Error::last_os_error());
+        let service =
+            nix_cache_service_with_local_cache(&state, DEAD_UPSTREAM, cache.path(), 4096, 4096);
+
+        let narinfo = route_nix_cache_with_service(
+            &session,
+            "GET",
+            format!("{VM_NIX_CACHE_PATH_PREFIX}/{hash}.narinfo"),
+            service.clone(),
+        )
+        .await;
+        let nar = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            route_nix_cache_with_service(
+                &session,
+                "GET",
+                format!("{VM_NIX_CACHE_PATH_PREFIX}/nar/{nar_file}"),
+                service,
+            ),
+        )
+        .await
+        .expect("a FIFO NAR must not block the request");
 
         assert_eq!(narinfo.status, VmHttpStatus::Ok);
         assert_eq!(nar.status, VmHttpStatus::BadGateway);
