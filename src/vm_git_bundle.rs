@@ -935,8 +935,25 @@ exit 42
         (git, log)
     }
 
+    /// How long [`wait_for_path_or_finished`] waits for the marker before
+    /// declaring a hang. Deliberately generous: the marker is written by a
+    /// freshly-`exec`ed descendant process whose startup (subprocess spawn
+    /// and OS scheduling of the new process) can be delayed by many seconds
+    /// under peak parallel-test load — the machine is oversubscribed while
+    /// ~1500 tests run, many spawning their own subprocesses. The previous
+    /// 10s bound was occasionally too tight and flaked. Since the wait
+    /// returns the instant the marker appears, a large bound costs nothing
+    /// on healthy runs and only delays the failure of a genuine hang.
+    const MARKER_WAIT_BUDGET: Duration = Duration::from_secs(60);
+
+    /// Poll until `path` appears, returning the instant it does. Fails fast
+    /// if `handle` finishes first (the descendant was never spawned), and
+    /// bounds the wait by [`MARKER_WAIT_BUDGET`] (wall-clock, so timer slop
+    /// under load cannot shorten it) so a genuine hang surfaces as a
+    /// failure with diagnostics rather than blocking forever.
     async fn wait_for_path_or_finished<T>(path: &Path, handle: &tokio::task::JoinHandle<T>) {
-        for _ in 0..1000 {
+        let start = std::time::Instant::now();
+        loop {
             if path.exists() {
                 return;
             }
@@ -945,9 +962,27 @@ exit 42
                 "task finished before {} appeared",
                 path.display()
             );
+            if start.elapsed() >= MARKER_WAIT_BUDGET {
+                let parent = path.parent().unwrap();
+                let listing: Vec<String> = std::fs::read_dir(parent)
+                    .map(|rd| {
+                        rd.filter_map(|e| {
+                            e.ok().map(|e| e.file_name().to_string_lossy().into_owned())
+                        })
+                        .collect()
+                    })
+                    .unwrap_or_default();
+                panic!(
+                    "timed out waiting for {} after {:?}; handle.is_finished()={}; \
+                     sibling files: {:?}",
+                    path.display(),
+                    start.elapsed(),
+                    handle.is_finished(),
+                    listing
+                );
+            }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        panic!("timed out waiting for {}", path.display());
     }
 
     fn ascii_alnum() -> impl Strategy<Value = char> {
