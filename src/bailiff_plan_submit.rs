@@ -339,6 +339,7 @@ mod end_to_end_tests {
     use super::*;
     use crate::audit::AuditLog;
     use crate::bailiff_plan_note::{PlanNote, plan_notes_ref};
+    use crate::bailiff_plan_write::FetchVerifyError;
     use crate::core::{AgentKind, CapabilitySet, NotesRef, RepoRef, TtlSeconds};
     use crate::github::{GitHubAppConfig, GitHubAppRegistryConfig, GitHubMinter};
     use crate::notes_repo::NotesRepo;
@@ -598,7 +599,7 @@ mod end_to_end_tests {
         let session_id = match &err {
             SubmitPlanError::WritePlanNote {
                 session_id,
-                source: WritePlanNoteError::Verify(_),
+                source: WritePlanNoteError::FetchVerify(FetchVerifyError::Verify(_)),
             } => *session_id,
             other => panic!("expected WritePlanNote{{Verify}}, got {other:?}"),
         };

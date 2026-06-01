@@ -60,6 +60,97 @@ use crate::writ_client::RunAgentCompleted;
 /// truth for its own namespace.
 pub(crate) const WRIT_V1_NOTES_REFSPEC: &str = "+refs/notes/writ/v1/*:refs/notes/writ/v1/*";
 
+/// Fetch writ's `v1` notes namespace into bailiff's repo, read the
+/// signed envelope writ stored at `completed.output_oid` under
+/// `writ_notes_ref`, and verify it end-to-end. Returns the verified
+/// [`SignedRunEnvelope`].
+///
+/// This is the fetch→verify phase shared byte-for-byte by
+/// [`write_plan_note`], [`write_review_note`], and
+/// [`write_implement_note`]; only the subsequent attach — note type,
+/// seed, and storage policy — differs between the three verbs. See the
+/// module docstring for the step-by-step flow and [`FetchVerifyError`]
+/// for the failure shape.
+fn fetch_and_verify(
+    bailiff_repo: &NotesRepo,
+    writ_repo_path: &Path,
+    writ_notes_ref: &NotesRef,
+    completed: &RunAgentCompleted,
+    allowed_signers: &AllowedSigners,
+) -> Result<SignedRunEnvelope, FetchVerifyError> {
+    bailiff_repo
+        .fetch_from_remote(writ_repo_path, &[WRIT_V1_NOTES_REFSPEC])
+        .map_err(FetchVerifyError::Fetch)?;
+    let body = bailiff_repo
+        .read_note(writ_notes_ref, &completed.output_oid)
+        .map_err(FetchVerifyError::ReadEnvelope)?;
+    let envelope =
+        SignedRunEnvelope::from_bytes(&body).map_err(FetchVerifyError::DecodeEnvelope)?;
+
+    if envelope.metadata != completed.signed_metadata {
+        return Err(FetchVerifyError::EnvelopeMetadataMismatch);
+    }
+    if envelope.signature != completed.signature {
+        return Err(FetchVerifyError::EnvelopeSignatureMismatch);
+    }
+
+    verify_run_envelope(&envelope, allowed_signers).map_err(FetchVerifyError::Verify)?;
+    Ok(envelope)
+}
+
+/// Tagged failure modes of [`fetch_and_verify`] — the fetch→read→
+/// decode→parity-check→verify phase that precedes the attach in
+/// [`write_plan_note`], [`write_review_note`], and
+/// [`write_implement_note`]. Each verb's error type embeds this via a
+/// transparent `FetchVerify` variant, so the six pre-storage failure
+/// modes are named once rather than copied per verb. Each maps to one
+/// specific step so a caller can surface the right operator action:
+/// "writ repo path wrong" vs "fetched but no such note" vs "envelope
+/// and reply disagree" vs "signature doesn't verify" are all different
+/// problems.
+#[derive(Debug, Error)]
+pub enum FetchVerifyError {
+    /// `git fetch` against writ's repo failed. Usually a wrong
+    /// `writ_repo_path` or filesystem permission problem.
+    #[error("fetching writ's notes ref failed: {0}")]
+    Fetch(#[source] NotesRepoError),
+    /// The fetch succeeded but no note exists at
+    /// `completed.output_oid` under `writ_notes_ref`. Either the
+    /// fetch refspec didn't cover the ref writ used, or writ's note
+    /// hasn't propagated yet (a race the synchronous-reply RPC
+    /// contract forecloses, but the variant exists so the failure is
+    /// named rather than swallowed).
+    #[error("reading the writ envelope note failed: {0}")]
+    ReadEnvelope(#[source] NotesRepoError),
+    /// The note body exists but isn't a valid [`SignedRunEnvelope`].
+    /// Indicates wire-level corruption — `deny_unknown_fields` and
+    /// the strict newtype validators on the envelope make this
+    /// near-impossible for any envelope writ itself produced.
+    #[error("decoding the writ envelope failed: {0}")]
+    DecodeEnvelope(#[source] serde_json::Error),
+    /// The envelope's `metadata` in writ's repo differs from the
+    /// `signed_metadata` writ returned in [`RunAgentCompleted`].
+    /// Writ is either equivocating or one of the two sources is
+    /// corrupt; bailiff refuses to attach a note in either case.
+    #[error(
+        "envelope metadata fetched from writ's repo does not match the metadata writ \
+         returned in RunAgentCompleted"
+    )]
+    EnvelopeMetadataMismatch,
+    /// Same defence-in-depth check as [`Self::EnvelopeMetadataMismatch`]
+    /// but for the signature field.
+    #[error(
+        "envelope signature fetched from writ's repo does not match the signature writ \
+         returned in RunAgentCompleted"
+    )]
+    EnvelopeSignatureMismatch,
+    /// [`verify_run_envelope`] rejected the envelope. The wrapped
+    /// [`VerifyError`] names whether the failure was an output
+    /// digest mismatch, an unknown signer, or a bad signature.
+    #[error("verifying the fetched envelope failed: {0}")]
+    Verify(#[source] VerifyError),
+}
+
 /// Fetch writ's signed envelope, verify it end-to-end, and attach a
 /// [`PlanNote`] for `plan_id` to bailiff's per-plan notes ref.
 ///
@@ -79,23 +170,13 @@ pub fn write_plan_note(
     completed: &RunAgentCompleted,
     allowed_signers: &AllowedSigners,
 ) -> Result<GitObjectId, WritePlanNoteError> {
-    bailiff_repo
-        .fetch_from_remote(writ_repo_path, &[WRIT_V1_NOTES_REFSPEC])
-        .map_err(WritePlanNoteError::Fetch)?;
-    let body = bailiff_repo
-        .read_note(writ_notes_ref, &completed.output_oid)
-        .map_err(WritePlanNoteError::ReadEnvelope)?;
-    let envelope =
-        SignedRunEnvelope::from_bytes(&body).map_err(WritePlanNoteError::DecodeEnvelope)?;
-
-    if envelope.metadata != completed.signed_metadata {
-        return Err(WritePlanNoteError::EnvelopeMetadataMismatch);
-    }
-    if envelope.signature != completed.signature {
-        return Err(WritePlanNoteError::EnvelopeSignatureMismatch);
-    }
-
-    verify_run_envelope(&envelope, allowed_signers).map_err(WritePlanNoteError::Verify)?;
+    let envelope = fetch_and_verify(
+        bailiff_repo,
+        writ_repo_path,
+        writ_notes_ref,
+        completed,
+        allowed_signers,
+    )?;
 
     let note = PlanNote {
         plan_id,
@@ -112,52 +193,16 @@ pub fn write_plan_note(
         .map_err(WritePlanNoteError::WritePlanNote)
 }
 
-/// Tagged failure modes of [`write_plan_note`]. Each variant maps to
-/// one specific step of the flow so a caller can surface the right
-/// operator action: "writ repo path wrong" vs "fetched but no such
-/// note" vs "envelope and reply disagree" vs "signature doesn't
-/// verify" are all different problems.
+/// Tagged failure modes of [`write_plan_note`]. The shared
+/// fetch→verify phase's failures arrive via the transparent
+/// [`FetchVerifyError`] embedded in [`Self::FetchVerify`]; only the
+/// plan-note write itself is specific to this verb.
 #[derive(Debug, Error)]
 pub enum WritePlanNoteError {
-    /// `git fetch` against writ's repo failed. Usually a wrong
-    /// `writ_repo_path` or filesystem permission problem.
-    #[error("fetching writ's notes ref failed: {0}")]
-    Fetch(#[source] NotesRepoError),
-    /// The fetch succeeded but no note exists at
-    /// `completed.output_oid` under `writ_notes_ref`. Either the
-    /// fetch refspec didn't cover the ref writ used, or writ's note
-    /// hasn't propagated yet (a race that can't happen with the
-    /// synchronous-reply RPC contract, but the error variant exists
-    /// so the failure is named rather than swallowed).
-    #[error("reading the writ envelope note failed: {0}")]
-    ReadEnvelope(#[source] NotesRepoError),
-    /// The note body exists but isn't a valid [`SignedRunEnvelope`].
-    /// Indicates wire-level corruption — `deny_unknown_fields` and
-    /// the strict newtype validators on the envelope make this
-    /// near-impossible for any envelope writ itself produced.
-    #[error("decoding the writ envelope failed: {0}")]
-    DecodeEnvelope(#[source] serde_json::Error),
-    /// The envelope's `metadata` in writ's repo differs from the
-    /// `signed_metadata` writ returned in [`RunAgentCompleted`].
-    /// Writ is either equivocating or one of the two sources is
-    /// corrupt; bailiff refuses to attach a plan note in either case.
-    #[error(
-        "envelope metadata fetched from writ's repo does not match the metadata writ \
-         returned in RunAgentCompleted"
-    )]
-    EnvelopeMetadataMismatch,
-    /// Same defence-in-depth check as [`Self::EnvelopeMetadataMismatch`]
-    /// but for the signature field.
-    #[error(
-        "envelope signature fetched from writ's repo does not match the signature writ \
-         returned in RunAgentCompleted"
-    )]
-    EnvelopeSignatureMismatch,
-    /// [`verify_run_envelope`] rejected the envelope. The wrapped
-    /// [`VerifyError`] names whether the failure was an output
-    /// digest mismatch, an unknown signer, or a bad signature.
-    #[error("verifying the fetched envelope failed: {0}")]
-    Verify(#[source] VerifyError),
+    /// The shared fetch→verify phase failed before any plan note was
+    /// written. See [`FetchVerifyError`] for the step-by-step matrix.
+    #[error(transparent)]
+    FetchVerify(#[from] FetchVerifyError),
     /// Writing the bailiff-side plan note failed. Usually a
     /// duplicate-write (a plan id reused against an existing ref) or
     /// a filesystem problem.
@@ -274,23 +319,13 @@ pub fn write_review_note(
     completed: &RunAgentCompleted,
     allowed_signers: &AllowedSigners,
 ) -> Result<GitObjectId, WriteReviewNoteError> {
-    bailiff_repo
-        .fetch_from_remote(writ_repo_path, &[WRIT_V1_NOTES_REFSPEC])
-        .map_err(WriteReviewNoteError::Fetch)?;
-    let body = bailiff_repo
-        .read_note(writ_notes_ref, &completed.output_oid)
-        .map_err(WriteReviewNoteError::ReadEnvelope)?;
-    let envelope =
-        SignedRunEnvelope::from_bytes(&body).map_err(WriteReviewNoteError::DecodeEnvelope)?;
-
-    if envelope.metadata != completed.signed_metadata {
-        return Err(WriteReviewNoteError::EnvelopeMetadataMismatch);
-    }
-    if envelope.signature != completed.signature {
-        return Err(WriteReviewNoteError::EnvelopeSignatureMismatch);
-    }
-
-    verify_run_envelope(&envelope, allowed_signers).map_err(WriteReviewNoteError::Verify)?;
+    let envelope = fetch_and_verify(
+        bailiff_repo,
+        writ_repo_path,
+        writ_notes_ref,
+        completed,
+        allowed_signers,
+    )?;
 
     let note = ReviewNote {
         plan_id,
@@ -316,54 +351,17 @@ pub fn write_review_note(
     }
 }
 
-/// Tagged failure modes of [`write_review_note`]. The shape merges
-/// [`WritePlanNoteError`]'s pre-write-verification matrix
-/// (Fetch / ReadEnvelope / DecodeEnvelope / EnvelopeMetadataMismatch /
-/// EnvelopeSignatureMismatch / Verify) with
-/// [`WriteDecisionNoteError`]'s idempotent-by-error storage primitive
-/// (`ReviewAlreadyRecorded` distinct from a generic
-/// `WriteReviewNote`).
+/// Tagged failure modes of [`write_review_note`]. The shared
+/// fetch→verify phase's failures arrive via the transparent
+/// [`FetchVerifyError`] in [`Self::FetchVerify`]; the two storage
+/// variants are specific to this verb's idempotent-by-error write
+/// (`ReviewAlreadyRecorded` distinct from a generic `WriteReviewNote`).
 #[derive(Debug, Error)]
 pub enum WriteReviewNoteError {
-    /// `git fetch` against writ's repo failed. Usually a wrong
-    /// `writ_repo_path` or filesystem permission problem.
-    #[error("fetching writ's notes ref failed: {0}")]
-    Fetch(#[source] NotesRepoError),
-    /// The fetch succeeded but no note exists at
-    /// `completed.output_oid` under `writ_notes_ref`. Either the
-    /// fetch refspec didn't cover the ref writ used, or writ's note
-    /// hasn't propagated yet (a race the synchronous-reply RPC
-    /// contract forecloses, but the variant exists so the failure is
-    /// named rather than swallowed).
-    #[error("reading the writ envelope note failed: {0}")]
-    ReadEnvelope(#[source] NotesRepoError),
-    /// The note body exists but isn't a valid [`SignedRunEnvelope`].
-    /// Indicates wire-level corruption — `deny_unknown_fields` and
-    /// the strict newtype validators on the envelope make this
-    /// near-impossible for any envelope writ itself produced.
-    #[error("decoding the writ envelope failed: {0}")]
-    DecodeEnvelope(#[source] serde_json::Error),
-    /// The envelope's `metadata` in writ's repo differs from the
-    /// `signed_metadata` writ returned in [`RunAgentCompleted`].
-    /// Writ is either equivocating or one of the two sources is
-    /// corrupt; bailiff refuses to attach a review note in either case.
-    #[error(
-        "envelope metadata fetched from writ's repo does not match the metadata writ \
-         returned in RunAgentCompleted"
-    )]
-    EnvelopeMetadataMismatch,
-    /// Same defence-in-depth check as [`Self::EnvelopeMetadataMismatch`]
-    /// but for the signature field.
-    #[error(
-        "envelope signature fetched from writ's repo does not match the signature writ \
-         returned in RunAgentCompleted"
-    )]
-    EnvelopeSignatureMismatch,
-    /// [`verify_run_envelope`] rejected the envelope. The wrapped
-    /// [`VerifyError`] names whether the failure was an output
-    /// digest mismatch, an unknown signer, or a bad signature.
-    #[error("verifying the fetched envelope failed: {0}")]
-    Verify(#[source] VerifyError),
+    /// The shared fetch→verify phase failed before any review note was
+    /// written. See [`FetchVerifyError`] for the step-by-step matrix.
+    #[error(transparent)]
+    FetchVerify(#[from] FetchVerifyError),
     /// A review note for this plan already exists under
     /// [`plan_notes_ref`]`(plan_id)` at `target_oid`. D2 does not
     /// overwrite; the operator's recourse is to submit a fresh plan
@@ -424,23 +422,13 @@ pub fn write_implement_note(
     completed: &RunAgentCompleted,
     allowed_signers: &AllowedSigners,
 ) -> Result<GitObjectId, WriteImplementNoteError> {
-    bailiff_repo
-        .fetch_from_remote(writ_repo_path, &[WRIT_V1_NOTES_REFSPEC])
-        .map_err(WriteImplementNoteError::Fetch)?;
-    let body = bailiff_repo
-        .read_note(writ_notes_ref, &completed.output_oid)
-        .map_err(WriteImplementNoteError::ReadEnvelope)?;
-    let envelope =
-        SignedRunEnvelope::from_bytes(&body).map_err(WriteImplementNoteError::DecodeEnvelope)?;
-
-    if envelope.metadata != completed.signed_metadata {
-        return Err(WriteImplementNoteError::EnvelopeMetadataMismatch);
-    }
-    if envelope.signature != completed.signature {
-        return Err(WriteImplementNoteError::EnvelopeSignatureMismatch);
-    }
-
-    verify_run_envelope(&envelope, allowed_signers).map_err(WriteImplementNoteError::Verify)?;
+    let envelope = fetch_and_verify(
+        bailiff_repo,
+        writ_repo_path,
+        writ_notes_ref,
+        completed,
+        allowed_signers,
+    )?;
 
     let note = ImplementNote {
         plan_id,
@@ -467,54 +455,18 @@ pub fn write_implement_note(
 }
 
 /// Tagged failure modes of [`write_implement_note`]. Shape parallels
-/// [`WriteReviewNoteError`] field-for-field: the pre-write-verification
-/// matrix (Fetch / ReadEnvelope / DecodeEnvelope /
-/// EnvelopeMetadataMismatch / EnvelopeSignatureMismatch / Verify) is
-/// shared with [`WritePlanNoteError`], and the idempotent-by-error
-/// storage primitive (`ImplementAlreadyRecorded` distinct from a
-/// generic `WriteImplementNote`) is shared with
-/// [`WriteDecisionNoteError`] and [`WriteReviewNoteError`].
+/// [`WriteReviewNoteError`]: the shared fetch→verify phase's failures
+/// arrive via the transparent [`FetchVerifyError`] in
+/// [`Self::FetchVerify`], and the idempotent-by-error storage primitive
+/// (`ImplementAlreadyRecorded` distinct from a generic
+/// `WriteImplementNote`) mirrors [`WriteReviewNoteError`] and
+/// [`WriteDecisionNoteError`].
 #[derive(Debug, Error)]
 pub enum WriteImplementNoteError {
-    /// `git fetch` against writ's repo failed. Usually a wrong
-    /// `writ_repo_path` or filesystem permission problem.
-    #[error("fetching writ's notes ref failed: {0}")]
-    Fetch(#[source] NotesRepoError),
-    /// The fetch succeeded but no note exists at
-    /// `completed.output_oid` under `writ_notes_ref`. Either the
-    /// fetch refspec didn't cover the ref writ used, or writ's note
-    /// hasn't propagated yet (a race the synchronous-reply RPC
-    /// contract forecloses, but the variant exists so the failure is
-    /// named rather than swallowed).
-    #[error("reading the writ envelope note failed: {0}")]
-    ReadEnvelope(#[source] NotesRepoError),
-    /// The note body exists but isn't a valid [`SignedRunEnvelope`].
-    /// Indicates wire-level corruption — `deny_unknown_fields` and
-    /// the strict newtype validators on the envelope make this
-    /// near-impossible for any envelope writ itself produced.
-    #[error("decoding the writ envelope failed: {0}")]
-    DecodeEnvelope(#[source] serde_json::Error),
-    /// The envelope's `metadata` in writ's repo differs from the
-    /// `signed_metadata` writ returned in [`RunAgentCompleted`].
-    /// Writ is either equivocating or one of the two sources is
-    /// corrupt; bailiff refuses to attach an implement note in either case.
-    #[error(
-        "envelope metadata fetched from writ's repo does not match the metadata writ \
-         returned in RunAgentCompleted"
-    )]
-    EnvelopeMetadataMismatch,
-    /// Same defence-in-depth check as [`Self::EnvelopeMetadataMismatch`]
-    /// but for the signature field.
-    #[error(
-        "envelope signature fetched from writ's repo does not match the signature writ \
-         returned in RunAgentCompleted"
-    )]
-    EnvelopeSignatureMismatch,
-    /// [`verify_run_envelope`] rejected the envelope. The wrapped
-    /// [`VerifyError`] names whether the failure was an output
-    /// digest mismatch, an unknown signer, or a bad signature.
-    #[error("verifying the fetched envelope failed: {0}")]
-    Verify(#[source] VerifyError),
+    /// The shared fetch→verify phase failed before any implement note
+    /// was written. See [`FetchVerifyError`] for the step-by-step matrix.
+    #[error(transparent)]
+    FetchVerify(#[from] FetchVerifyError),
     /// An implement note for this plan already exists under
     /// [`plan_notes_ref`]`(plan_id)` at `target_oid`. Slice E does not
     /// overwrite; the operator's recourse is to submit a fresh plan
@@ -714,7 +666,10 @@ mod tests {
         )
         .unwrap_err();
         assert!(
-            matches!(err, WritePlanNoteError::EnvelopeMetadataMismatch),
+            matches!(
+                err,
+                WritePlanNoteError::FetchVerify(FetchVerifyError::EnvelopeMetadataMismatch)
+            ),
             "expected EnvelopeMetadataMismatch, got: {err:?}",
         );
     }
@@ -748,14 +703,17 @@ mod tests {
         )
         .unwrap_err();
         assert!(
-            matches!(err, WritePlanNoteError::EnvelopeSignatureMismatch),
+            matches!(
+                err,
+                WritePlanNoteError::FetchVerify(FetchVerifyError::EnvelopeSignatureMismatch)
+            ),
             "expected EnvelopeSignatureMismatch, got: {err:?}",
         );
     }
 
     /// If bailiff's keyring doesn't contain writ's signing key the
     /// envelope verification step fails with `UnknownSigner`, which
-    /// surfaces as `WritePlanNoteError::Verify`. This is the
+    /// surfaces as `WritePlanNoteError::FetchVerify(FetchVerifyError::Verify(..))`. This is the
     /// operator-misconfigured-trust case.
     #[test]
     fn write_plan_note_rejects_envelope_when_signer_not_trusted() {
@@ -780,7 +738,9 @@ mod tests {
         )
         .unwrap_err();
         match err {
-            WritePlanNoteError::Verify(VerifyError::UnknownSigner { .. }) => {}
+            WritePlanNoteError::FetchVerify(FetchVerifyError::Verify(
+                VerifyError::UnknownSigner { .. },
+            )) => {}
             other => panic!("expected Verify(UnknownSigner), got: {other:?}"),
         }
     }
@@ -808,7 +768,10 @@ mod tests {
         )
         .unwrap_err();
         assert!(
-            matches!(err, WritePlanNoteError::Fetch(_)),
+            matches!(
+                err,
+                WritePlanNoteError::FetchVerify(FetchVerifyError::Fetch(_))
+            ),
             "expected Fetch error, got: {err:?}",
         );
     }
@@ -1452,7 +1415,10 @@ mod review_tests {
         )
         .unwrap_err();
         assert!(
-            matches!(err, WriteReviewNoteError::EnvelopeMetadataMismatch),
+            matches!(
+                err,
+                WriteReviewNoteError::FetchVerify(FetchVerifyError::EnvelopeMetadataMismatch)
+            ),
             "expected EnvelopeMetadataMismatch, got: {err:?}",
         );
     }
@@ -1483,14 +1449,17 @@ mod review_tests {
         )
         .unwrap_err();
         assert!(
-            matches!(err, WriteReviewNoteError::EnvelopeSignatureMismatch),
+            matches!(
+                err,
+                WriteReviewNoteError::FetchVerify(FetchVerifyError::EnvelopeSignatureMismatch)
+            ),
             "expected EnvelopeSignatureMismatch, got: {err:?}",
         );
     }
 
     /// If bailiff's keyring doesn't contain writ's signing key, the
     /// envelope verification step fails with `UnknownSigner`, which
-    /// surfaces as `WriteReviewNoteError::Verify`. Operator-
+    /// surfaces as `WriteReviewNoteError::FetchVerify(FetchVerifyError::Verify(..))`. Operator-
     /// misconfigured-trust case.
     #[test]
     fn write_review_note_rejects_envelope_when_signer_not_trusted() {
@@ -1513,7 +1482,9 @@ mod review_tests {
         )
         .unwrap_err();
         match err {
-            WriteReviewNoteError::Verify(VerifyError::UnknownSigner { .. }) => {}
+            WriteReviewNoteError::FetchVerify(FetchVerifyError::Verify(
+                VerifyError::UnknownSigner { .. },
+            )) => {}
             other => panic!("expected Verify(UnknownSigner), got: {other:?}"),
         }
     }
@@ -1541,7 +1512,10 @@ mod review_tests {
         )
         .unwrap_err();
         assert!(
-            matches!(err, WriteReviewNoteError::Fetch(_)),
+            matches!(
+                err,
+                WriteReviewNoteError::FetchVerify(FetchVerifyError::Fetch(_))
+            ),
             "expected Fetch error, got: {err:?}",
         );
     }
@@ -1978,7 +1952,10 @@ mod implement_tests {
         )
         .unwrap_err();
         assert!(
-            matches!(err, WriteImplementNoteError::EnvelopeMetadataMismatch),
+            matches!(
+                err,
+                WriteImplementNoteError::FetchVerify(FetchVerifyError::EnvelopeMetadataMismatch)
+            ),
             "expected EnvelopeMetadataMismatch, got: {err:?}",
         );
     }
@@ -2009,14 +1986,17 @@ mod implement_tests {
         )
         .unwrap_err();
         assert!(
-            matches!(err, WriteImplementNoteError::EnvelopeSignatureMismatch),
+            matches!(
+                err,
+                WriteImplementNoteError::FetchVerify(FetchVerifyError::EnvelopeSignatureMismatch)
+            ),
             "expected EnvelopeSignatureMismatch, got: {err:?}",
         );
     }
 
     /// If bailiff's keyring doesn't contain writ's signing key, the
     /// envelope verification step fails with `UnknownSigner`, which
-    /// surfaces as `WriteImplementNoteError::Verify`. Operator-
+    /// surfaces as `WriteImplementNoteError::FetchVerify(FetchVerifyError::Verify(..))`. Operator-
     /// misconfigured-trust case.
     #[test]
     fn write_implement_note_rejects_envelope_when_signer_not_trusted() {
@@ -2039,7 +2019,9 @@ mod implement_tests {
         )
         .unwrap_err();
         match err {
-            WriteImplementNoteError::Verify(VerifyError::UnknownSigner { .. }) => {}
+            WriteImplementNoteError::FetchVerify(FetchVerifyError::Verify(
+                VerifyError::UnknownSigner { .. },
+            )) => {}
             other => panic!("expected Verify(UnknownSigner), got: {other:?}"),
         }
     }
@@ -2067,7 +2049,10 @@ mod implement_tests {
         )
         .unwrap_err();
         assert!(
-            matches!(err, WriteImplementNoteError::Fetch(_)),
+            matches!(
+                err,
+                WriteImplementNoteError::FetchVerify(FetchVerifyError::Fetch(_))
+            ),
             "expected Fetch error, got: {err:?}",
         );
     }
