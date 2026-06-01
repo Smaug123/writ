@@ -98,7 +98,7 @@ fn fetch_and_verify(
     Ok(envelope)
 }
 
-/// Tagged failure modes of [`fetch_and_verify`] — the fetch→read→
+/// Tagged failure modes of `fetch_and_verify` — the fetch→read→
 /// decode→parity-check→verify phase that precedes the attach in
 /// [`write_plan_note`], [`write_review_note`], and
 /// [`write_implement_note`]. Each verb's error type embeds this via a
