@@ -487,90 +487,128 @@ pub enum WriteImplementNoteError {
 }
 
 #[cfg(test)]
-mod tests {
-    //! Unit tests bypass the broker: the helper's contract is "given a
-    //! writ repo that contains a freshly-signed envelope, fetch it
-    //! across to bailiff's repo, verify, and write a PlanNote." We
-    //! exercise that contract directly by writing a known envelope
-    //! into a tempdir-backed writ repo and driving `write_plan_note`
-    //! against it.
-    //!
-    //! The full broker bring-up is covered by the integration test
-    //! in `end_to_end_tests` below, which mirrors the slice-B5
-    //! round-trip in `writ_client.rs` and tacks `write_plan_note` on
-    //! the end.
-    use super::*;
-    use crate::agent_run::{AgentRunId, sha256_hex};
-    use crate::bailiff_plan_note::{
-        PlanId, PlanNote, plan_notes_ref, plan_submission_seed_blob_bytes,
+mod decision_tests;
+#[cfg(test)]
+mod end_to_end_tests;
+#[cfg(test)]
+mod implement_tests;
+#[cfg(test)]
+mod plan_tests;
+#[cfg(test)]
+mod review_tests;
+#[cfg(test)]
+mod test_support;
+
+/// Property-based spec for the fetch→verify→attach contract that the
+/// three envelope-bearing write helpers share via `fetch_and_verify`.
+/// The example/edge-case tests in the sibling `*_tests` modules pin
+/// specific scenarios; this module asserts the same contract holds for
+/// *arbitrary* envelope payloads. Each case drives real git repos in
+/// tempdirs, so the proptest case counts are deliberately low — git
+/// fork/exec dominates the wall-clock.
+#[cfg(test)]
+mod spec {
+    use super::test_support::{
+        OTHER_PUB, SIGNING_PEM, SIGNING_PUB, bailiff_repo, signed_envelope, writ_notes_ref,
     };
-    use crate::core::{CapabilitySet, NotesRef, RepoRef, SessionId, Sha256Hex, UnixMillis};
-    use crate::protocol::SignedRunMetadata;
-    use crate::run_envelope::{OutputEnvelope, SignedRunEnvelope};
+    use super::*;
+    use crate::bailiff_plan_note::{
+        ImplementNote, PlanId, PlanNote, ReviewNote, plan_implement_seed_blob_bytes,
+        plan_notes_ref, plan_review_seed_blob_bytes, plan_submission_seed_blob_bytes,
+    };
+    use crate::core::{CapabilitySet, RepoRef, SshSignature};
     use crate::signing::{WritSigningKey, WritVerifyingKey};
+    use proptest::prelude::*;
     use tempfile::TempDir;
 
-    const SIGNING_PEM: &str = include_str!("../tests/fixtures/ed25519_test_signing.key");
-    const SIGNING_PUB: &str = include_str!("../tests/fixtures/ed25519_test_signing.key.pub");
-    const OTHER_PUB: &str = include_str!("../tests/fixtures/ed25519_test_signing_other.key.pub");
-
-    fn writ_notes_ref() -> NotesRef {
-        NotesRef::try_new("refs/notes/writ/v1/agent-outputs").unwrap()
+    /// The three verbs that share `fetch_and_verify`. Round-trip (and,
+    /// for review/implement, idempotency) differs per verb; the
+    /// fetch-verify failure matrix does not, so the rejection property
+    /// drives one representative verb.
+    #[derive(Debug, Clone, Copy)]
+    enum Verb {
+        Plan,
+        Review,
+        Implement,
     }
 
-    /// Build a freshly-signed envelope under `signing_key`. Mirrors
-    /// the `freshly_signed` helper in `run_verify.rs` tests so the
-    /// envelope shape is the realistic one writ produces.
-    fn freshly_signed(signing_key: &WritSigningKey) -> SignedRunEnvelope {
-        let output = OutputEnvelope {
-            stdout: b"hello".to_vec(),
-            stderr: Vec::new(),
-            stdout_truncated_at: None,
-            stderr_truncated_at: None,
-        };
-        let output_bytes = output.to_bytes();
-        let output_sha = Sha256Hex::try_new(sha256_hex(&output_bytes)).unwrap();
-        let prompt_sha = Sha256Hex::try_new(sha256_hex(b"prompt")).unwrap();
-        let metadata = SignedRunMetadata {
-            run_id: AgentRunId::new(),
-            session_id: SessionId::new(),
-            prompt_sha256: prompt_sha,
-            output_envelope_sha256: output_sha,
-            capabilities: vec![CapabilitySet::WorkspaceRead {
-                repo: RepoRef {
-                    owner: "smaug123".into(),
-                    name: "writ".into(),
+    fn arb_verb() -> impl Strategy<Value = Verb> {
+        prop_oneof![Just(Verb::Plan), Just(Verb::Review), Just(Verb::Implement)]
+    }
+
+    fn arb_capabilities() -> impl Strategy<Value = Vec<CapabilitySet>> {
+        let cap = ("[a-z0-9_-]{1,16}", "[a-z0-9_.-]{1,16}", any::<bool>()).prop_map(
+            |(owner, name, writable)| {
+                let repo = RepoRef { owner, name };
+                if writable {
+                    CapabilitySet::WorkspaceWrite { repo }
+                } else {
+                    CapabilitySet::WorkspaceRead { repo }
+                }
+            },
+        );
+        prop::collection::vec(cap, 0..3)
+    }
+
+    /// The *inputs* to an envelope; signing happens in the test body so
+    /// the signature binds the generated metadata.
+    #[derive(Debug, Clone)]
+    struct Payload {
+        stdout: Vec<u8>,
+        stderr: Vec<u8>,
+        prompt: Vec<u8>,
+        capabilities: Vec<CapabilitySet>,
+        exit_code: i32,
+        completed_at_millis: i64,
+    }
+
+    fn arb_payload() -> impl Strategy<Value = Payload> {
+        (
+            prop::collection::vec(any::<u8>(), 0..64),
+            prop::collection::vec(any::<u8>(), 0..64),
+            prop::collection::vec(any::<u8>(), 0..64),
+            arb_capabilities(),
+            any::<i32>(),
+            any::<i64>(),
+        )
+            .prop_map(
+                |(stdout, stderr, prompt, capabilities, exit_code, completed_at_millis)| Payload {
+                    stdout,
+                    stderr,
+                    prompt,
+                    capabilities,
+                    exit_code,
+                    completed_at_millis,
                 },
-            }],
-            exit_code: 0,
-            completed_at: UnixMillis::from_millis(1_700_000_000_000),
-            signing_key_fingerprint: signing_key.fingerprint(),
-        };
-        let signature = signing_key.sign(&metadata.canonical_bytes()).unwrap();
-        SignedRunEnvelope {
-            metadata,
-            signature,
-            output: output_bytes,
-        }
+            )
     }
 
-    /// Prepare a writ repo containing one signed envelope keyed on the
-    /// run id, exactly the shape writ's `RunAgent` handler produces.
-    /// Returns the writ repo, the `RunAgentCompleted` reply bailiff
-    /// would have seen, and the envelope itself for tampering tests.
-    fn writ_repo_with_envelope(
+    fn envelope_for(signing_key: &WritSigningKey, p: &Payload) -> SignedRunEnvelope {
+        signed_envelope(
+            signing_key,
+            p.stdout.clone(),
+            p.stderr.clone(),
+            &p.prompt,
+            p.capabilities.clone(),
+            p.exit_code,
+            p.completed_at_millis,
+        )
+    }
+
+    /// Write `envelope` into a fresh tempdir writ repo and return the
+    /// repo plus the `RunAgentCompleted` reply bailiff would have seen.
+    /// Mirrors `test_support::writ_repo_with_envelope` for a
+    /// caller-supplied envelope.
+    fn writ_repo_for(
         tmp: &TempDir,
-        signing_key: &WritSigningKey,
-    ) -> (NotesRepo, RunAgentCompleted, SignedRunEnvelope) {
+        envelope: &SignedRunEnvelope,
+    ) -> (NotesRepo, RunAgentCompleted) {
         let writ_repo = NotesRepo::init_or_open(tmp.path().join("writ-bare")).unwrap();
-        let nref = writ_notes_ref();
-        let envelope = freshly_signed(signing_key);
-        let body = envelope.to_bytes();
         let target = writ_repo
             .write_note(
-                &nref,
+                &writ_notes_ref(),
                 envelope.metadata.run_id.to_string().as_bytes(),
-                &body,
+                &envelope.to_bytes(),
             )
             .unwrap();
         let completed = RunAgentCompleted {
@@ -578,2004 +616,146 @@ mod tests {
             signed_metadata: envelope.metadata.clone(),
             signature: envelope.signature.clone(),
         };
-        (writ_repo, completed, envelope)
+        (writ_repo, completed)
     }
 
-    fn bailiff_repo(tmp: &TempDir) -> NotesRepo {
-        NotesRepo::init_or_open(tmp.path().join("bailiff-bare")).unwrap()
-    }
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(24))]
 
-    /// Happy path: with writ's note in place and an allowed-signers
-    /// list that contains writ's key, `write_plan_note` writes a
-    /// plan note that decodes back to a `PlanNote` whose envelope
-    /// fields match what writ produced.
-    ///
-    /// This is the load-bearing contract bailiff's slice-C CLI relies
-    /// on. A regression in fetch, verify, ref derivation, or write
-    /// surfaces here.
-    #[test]
-    fn write_plan_note_happy_path_round_trips_through_bailiff_repo() {
-        let tmp = TempDir::new().unwrap();
-        let signing_key = WritSigningKey::from_openssh_pem(SIGNING_PEM).unwrap();
-        let (writ_repo, completed, envelope) = writ_repo_with_envelope(&tmp, &signing_key);
-        let bailiff = bailiff_repo(&tmp);
-        let allowed = AllowedSigners::from_openssh_lines(SIGNING_PUB).unwrap();
+        /// For any valid payload and any verb, a trusted-signer write
+        /// succeeds and the bailiff-side note reads back with exactly
+        /// the envelope fields writ signed.
+        #[test]
+        fn every_verb_round_trips_a_trusted_envelope(verb in arb_verb(), payload in arb_payload()) {
+            let tmp = TempDir::new().unwrap();
+            let signing_key = WritSigningKey::from_openssh_pem(SIGNING_PEM).unwrap();
+            let envelope = envelope_for(&signing_key, &payload);
+            let (writ_repo, completed) = writ_repo_for(&tmp, &envelope);
+            let bailiff = bailiff_repo(&tmp);
+            let allowed = AllowedSigners::from_openssh_lines(SIGNING_PUB).unwrap();
+            let plan_id = PlanId::new();
+            let purpose = "spec".to_string();
 
-        let plan_id = PlanId::new();
-        let purpose = "plan-stage:c2".to_string();
-        let returned_oid = write_plan_note(
-            &bailiff,
-            writ_repo.path(),
-            &writ_notes_ref(),
-            plan_id,
-            purpose.clone(),
-            &completed,
-            &allowed,
-        )
-        .expect("happy path must succeed");
+            let (returned_oid, seed) = match verb {
+                Verb::Plan => (
+                    write_plan_note(&bailiff, writ_repo.path(), &writ_notes_ref(), plan_id, purpose.clone(), &completed, &allowed)
+                        .expect("plan write must succeed"),
+                    plan_submission_seed_blob_bytes(plan_id),
+                ),
+                Verb::Review => (
+                    write_review_note(&bailiff, writ_repo.path(), &writ_notes_ref(), plan_id, purpose.clone(), &completed, &allowed)
+                        .expect("review write must succeed"),
+                    plan_review_seed_blob_bytes(plan_id),
+                ),
+                Verb::Implement => (
+                    write_implement_note(&bailiff, writ_repo.path(), &writ_notes_ref(), plan_id, purpose.clone(), &completed, &allowed)
+                        .expect("implement write must succeed"),
+                    plan_implement_seed_blob_bytes(plan_id),
+                ),
+            };
 
-        // The returned OID is the deterministic seed-blob OID derived
-        // from plan_id alone — pin that contract so a future schema
-        // change can't quietly diverge the writer and reader.
-        let expected_seed_bytes = plan_submission_seed_blob_bytes(plan_id);
-        let body = bailiff
-            .read_note(&plan_notes_ref(plan_id), &returned_oid)
-            .expect("bailiff-side note must be readable at the returned OID");
+            prop_assert!(!seed.is_empty());
+            let body = bailiff
+                .read_note(&plan_notes_ref(plan_id), &returned_oid)
+                .expect("bailiff-side note must be readable at the returned OID");
 
-        let note = PlanNote::from_canonical_bytes(&body).expect("body must decode");
-        assert_eq!(note.plan_id, plan_id);
-        assert_eq!(note.purpose, purpose);
-        assert_eq!(note.writ_output_oid, completed.output_oid);
-        assert_eq!(note.signed_metadata, envelope.metadata);
-        assert_eq!(note.signature, envelope.signature);
-
-        // Sanity: the seed bytes are not the same as the OID — the
-        // OID is what `git hash-object` of the seed bytes produces.
-        // We don't recompute the SHA-1 here; we just confirm the
-        // function returned something and the bytes are stable.
-        assert!(!expected_seed_bytes.is_empty());
-    }
-
-    /// Defence in depth: if the envelope writ stored in its repo
-    /// disagrees with what writ returned over the wire, bailiff
-    /// refuses to attach a plan note. Construct that case by giving
-    /// `write_plan_note` a `RunAgentCompleted` whose metadata field
-    /// has been tampered with.
-    #[test]
-    fn write_plan_note_rejects_metadata_mismatch_between_envelope_and_reply() {
-        let tmp = TempDir::new().unwrap();
-        let signing_key = WritSigningKey::from_openssh_pem(SIGNING_PEM).unwrap();
-        let (writ_repo, mut completed, _envelope) = writ_repo_with_envelope(&tmp, &signing_key);
-        let bailiff = bailiff_repo(&tmp);
-        let allowed = AllowedSigners::from_openssh_lines(SIGNING_PUB).unwrap();
-
-        // Flip a metadata field on the wire-side reply without
-        // touching the on-disk envelope. The envelope is still
-        // cryptographically valid; the divergence is what the check
-        // catches.
-        completed.signed_metadata.exit_code = completed.signed_metadata.exit_code.wrapping_add(1);
-
-        let err = write_plan_note(
-            &bailiff,
-            writ_repo.path(),
-            &writ_notes_ref(),
-            PlanId::new(),
-            "p".into(),
-            &completed,
-            &allowed,
-        )
-        .unwrap_err();
-        assert!(
-            matches!(
-                err,
-                WritePlanNoteError::FetchVerify(FetchVerifyError::EnvelopeMetadataMismatch)
-            ),
-            "expected EnvelopeMetadataMismatch, got: {err:?}",
-        );
-    }
-
-    /// Same defence as the metadata case but for the signature
-    /// field. A wire reply whose signature differs from the stored
-    /// envelope's signature is also a refusal.
-    #[test]
-    fn write_plan_note_rejects_signature_mismatch_between_envelope_and_reply() {
-        let tmp = TempDir::new().unwrap();
-        let signing_key = WritSigningKey::from_openssh_pem(SIGNING_PEM).unwrap();
-        let (writ_repo, mut completed, _envelope) = writ_repo_with_envelope(&tmp, &signing_key);
-        let bailiff = bailiff_repo(&tmp);
-        let allowed = AllowedSigners::from_openssh_lines(SIGNING_PUB).unwrap();
-
-        // Substitute the signature with a different (still well-formed)
-        // SshSignature — the byte mismatch is what trips the check.
-        completed.signature = crate::core::SshSignature::try_new(
-            "-----BEGIN SSH SIGNATURE-----\nU1NIU0lH-other-bytes\n-----END SSH SIGNATURE-----",
-        )
-        .unwrap();
-
-        let err = write_plan_note(
-            &bailiff,
-            writ_repo.path(),
-            &writ_notes_ref(),
-            PlanId::new(),
-            "p".into(),
-            &completed,
-            &allowed,
-        )
-        .unwrap_err();
-        assert!(
-            matches!(
-                err,
-                WritePlanNoteError::FetchVerify(FetchVerifyError::EnvelopeSignatureMismatch)
-            ),
-            "expected EnvelopeSignatureMismatch, got: {err:?}",
-        );
-    }
-
-    /// If bailiff's keyring doesn't contain writ's signing key the
-    /// envelope verification step fails with `UnknownSigner`, which
-    /// surfaces as `WritePlanNoteError::FetchVerify(FetchVerifyError::Verify(..))`. This is the
-    /// operator-misconfigured-trust case.
-    #[test]
-    fn write_plan_note_rejects_envelope_when_signer_not_trusted() {
-        let tmp = TempDir::new().unwrap();
-        let signing_key = WritSigningKey::from_openssh_pem(SIGNING_PEM).unwrap();
-        let (writ_repo, completed, _envelope) = writ_repo_with_envelope(&tmp, &signing_key);
-        let bailiff = bailiff_repo(&tmp);
-
-        // Keyring contains *only* an unrelated key — verification
-        // fails before signature math runs.
-        let other = WritVerifyingKey::from_openssh(OTHER_PUB.trim()).unwrap();
-        let allowed = AllowedSigners::from_keys([other]);
-
-        let err = write_plan_note(
-            &bailiff,
-            writ_repo.path(),
-            &writ_notes_ref(),
-            PlanId::new(),
-            "p".into(),
-            &completed,
-            &allowed,
-        )
-        .unwrap_err();
-        match err {
-            WritePlanNoteError::FetchVerify(FetchVerifyError::Verify(
-                VerifyError::UnknownSigner { .. },
-            )) => {}
-            other => panic!("expected Verify(UnknownSigner), got: {other:?}"),
+            // Every note type carries the same envelope fields; assert
+            // the round-trip preserved them regardless of which verb wrote.
+            let (got_plan_id, got_purpose, got_oid, got_meta, got_sig) = match verb {
+                Verb::Plan => {
+                    let n = PlanNote::from_canonical_bytes(&body).expect("body must decode");
+                    (n.plan_id, n.purpose, n.writ_output_oid, n.signed_metadata, n.signature)
+                }
+                Verb::Review => {
+                    let n = ReviewNote::from_canonical_bytes(&body).expect("body must decode");
+                    (n.plan_id, n.purpose, n.writ_output_oid, n.signed_metadata, n.signature)
+                }
+                Verb::Implement => {
+                    let n = ImplementNote::from_canonical_bytes(&body).expect("body must decode");
+                    (n.plan_id, n.purpose, n.writ_output_oid, n.signed_metadata, n.signature)
+                }
+            };
+            prop_assert_eq!(got_plan_id, plan_id);
+            prop_assert_eq!(got_purpose, purpose);
+            prop_assert_eq!(got_oid, completed.output_oid.clone());
+            prop_assert_eq!(got_meta, envelope.metadata.clone());
+            prop_assert_eq!(got_sig, envelope.signature.clone());
         }
-    }
 
-    /// A bad writ-repo path surfaces as `Fetch`, distinct from the
-    /// later `ReadEnvelope` variant. Operators see "your writ repo
-    /// path is wrong" instead of "no such note."
-    #[test]
-    fn write_plan_note_reports_fetch_failure_for_missing_writ_repo() {
-        let tmp = TempDir::new().unwrap();
-        let signing_key = WritSigningKey::from_openssh_pem(SIGNING_PEM).unwrap();
-        let (_writ_repo, completed, _envelope) = writ_repo_with_envelope(&tmp, &signing_key);
-        let bailiff = bailiff_repo(&tmp);
-        let allowed = AllowedSigners::from_openssh_lines(SIGNING_PUB).unwrap();
+        /// The shared fetch-verify phase rejects a tampered or
+        /// untrusted envelope with the matching variant: metadata
+        /// divergence, signature divergence, or an unknown signer.
+        /// Driven through `write_plan_note` as a representative verb.
+        #[test]
+        fn fetch_verify_rejects_tampered_or_untrusted_envelopes(payload in arb_payload(), fault in 0u8..3) {
+            let tmp = TempDir::new().unwrap();
+            let signing_key = WritSigningKey::from_openssh_pem(SIGNING_PEM).unwrap();
+            let envelope = envelope_for(&signing_key, &payload);
+            let (writ_repo, mut completed) = writ_repo_for(&tmp, &envelope);
+            let bailiff = bailiff_repo(&tmp);
 
-        let bogus = tmp.path().join("does-not-exist");
-        let err = write_plan_note(
-            &bailiff,
-            &bogus,
-            &writ_notes_ref(),
-            PlanId::new(),
-            "p".into(),
-            &completed,
-            &allowed,
-        )
-        .unwrap_err();
-        assert!(
-            matches!(
-                err,
-                WritePlanNoteError::FetchVerify(FetchVerifyError::Fetch(_))
-            ),
-            "expected Fetch error, got: {err:?}",
-        );
-    }
-
-    /// `write_plan_note` calls `write_note` on the bailiff repo,
-    /// which refuses to overwrite an existing note for the same
-    /// target. A duplicate-plan-id call must surface as
-    /// `WritePlanNote`, not silently overwrite.
-    #[test]
-    fn write_plan_note_refuses_to_overwrite_existing_plan_id() {
-        let tmp = TempDir::new().unwrap();
-        let signing_key = WritSigningKey::from_openssh_pem(SIGNING_PEM).unwrap();
-        let (writ_repo, completed, _envelope) = writ_repo_with_envelope(&tmp, &signing_key);
-        let bailiff = bailiff_repo(&tmp);
-        let allowed = AllowedSigners::from_openssh_lines(SIGNING_PUB).unwrap();
-
-        let plan_id = PlanId::new();
-        write_plan_note(
-            &bailiff,
-            writ_repo.path(),
-            &writ_notes_ref(),
-            plan_id,
-            "first".into(),
-            &completed,
-            &allowed,
-        )
-        .expect("first write succeeds");
-
-        let err = write_plan_note(
-            &bailiff,
-            writ_repo.path(),
-            &writ_notes_ref(),
-            plan_id,
-            "second".into(),
-            &completed,
-            &allowed,
-        )
-        .unwrap_err();
-        assert!(
-            matches!(err, WritePlanNoteError::WritePlanNote(_)),
-            "expected WritePlanNote error, got: {err:?}",
-        );
-    }
-
-    /// Two distinct plan ids produce two distinct bailiff-side notes
-    /// from the *same* writ envelope. The plan id is the only thing
-    /// that varies between the two writes; the writ-side OID stays
-    /// the same in both notes.
-    #[test]
-    fn write_plan_note_supports_two_plans_referencing_one_writ_envelope() {
-        let tmp = TempDir::new().unwrap();
-        let signing_key = WritSigningKey::from_openssh_pem(SIGNING_PEM).unwrap();
-        let (writ_repo, completed, _envelope) = writ_repo_with_envelope(&tmp, &signing_key);
-        let bailiff = bailiff_repo(&tmp);
-        let allowed = AllowedSigners::from_openssh_lines(SIGNING_PUB).unwrap();
-
-        let p1 = PlanId::new();
-        let p2 = PlanId::new();
-        let oid1 = write_plan_note(
-            &bailiff,
-            writ_repo.path(),
-            &writ_notes_ref(),
-            p1,
-            "first".into(),
-            &completed,
-            &allowed,
-        )
-        .unwrap();
-        let oid2 = write_plan_note(
-            &bailiff,
-            writ_repo.path(),
-            &writ_notes_ref(),
-            p2,
-            "second".into(),
-            &completed,
-            &allowed,
-        )
-        .unwrap();
-        assert_ne!(oid1, oid2, "distinct plan ids must seed distinct OIDs");
-
-        let body1 = bailiff.read_note(&plan_notes_ref(p1), &oid1).unwrap();
-        let body2 = bailiff.read_note(&plan_notes_ref(p2), &oid2).unwrap();
-        let note1 = PlanNote::from_canonical_bytes(&body1).unwrap();
-        let note2 = PlanNote::from_canonical_bytes(&body2).unwrap();
-        assert_eq!(note1.plan_id, p1);
-        assert_eq!(note2.plan_id, p2);
-        assert_eq!(
-            note1.writ_output_oid, note2.writ_output_oid,
-            "both plans reference the same writ envelope",
-        );
-        assert_ne!(note1.purpose, note2.purpose);
-    }
-}
-
-#[cfg(test)]
-mod decision_tests {
-    //! Tests for [`write_decision_note`] — the slice D1.3 idempotent
-    //! write helper. Each test drives the helper directly against a
-    //! tempdir-backed bare repo (no broker, no writ side).
-    use super::*;
-    use crate::bailiff_decision::{Decider, Decision};
-    use crate::bailiff_plan_note::{
-        DecisionNote, PlanId, plan_decision_seed_blob_bytes, plan_notes_ref,
-    };
-    use crate::core::UnixMillis;
-    use tempfile::TempDir;
-
-    fn bailiff_repo(tmp: &TempDir) -> NotesRepo {
-        NotesRepo::init_or_open(tmp.path().join("bailiff-bare")).unwrap()
-    }
-
-    fn sample_decider() -> Decider {
-        Decider::try_new("cli:alice").unwrap()
-    }
-
-    fn sample_decision_note(plan_id: PlanId, outcome: Decision) -> DecisionNote {
-        DecisionNote {
-            plan_id,
-            outcome,
-            decider: sample_decider(),
-            decided_at: UnixMillis::from_millis(1_700_000_000_456),
-        }
-    }
-
-    /// Happy path: first decision for a plan writes a note whose body
-    /// decodes back to the same `DecisionNote` the caller submitted,
-    /// attached at the deterministic decision-seed OID.
-    #[test]
-    fn write_decision_note_writes_then_reads_back() {
-        let tmp = TempDir::new().unwrap();
-        let bailiff = bailiff_repo(&tmp);
-        let plan_id = PlanId::new();
-        let note = sample_decision_note(plan_id, Decision::Accepted);
-
-        let returned_oid =
-            write_decision_note(&bailiff, &note).expect("first decision must succeed");
-
-        // The returned OID must be the deterministic decision-seed
-        // OID for this plan id — readers recompute it from the plan
-        // id alone, so any drift between writer and reader here is
-        // a silent break of the read path.
-        let body = bailiff
-            .read_note(&plan_notes_ref(plan_id), &returned_oid)
-            .expect("decision body must be readable at the returned OID");
-        let parsed =
-            DecisionNote::from_canonical_bytes(&body).expect("body must decode as DecisionNote");
-        assert_eq!(parsed, note);
-
-        // Sanity: the seed bytes are non-empty and have the expected
-        // `<plan_id>::decision` shape (already pinned in
-        // `bailiff_plan_note` tests, but pinning here too means a
-        // future writer-side change can't silently diverge).
-        let seed = plan_decision_seed_blob_bytes(plan_id);
-        assert_eq!(
-            std::str::from_utf8(&seed).unwrap(),
-            format!("{plan_id}::decision"),
-        );
-    }
-
-    /// Idempotent-by-error: a second decide call for the same plan
-    /// returns `DecisionAlreadyRecorded` rather than overwriting. The
-    /// second call's note carries different content (Rejected vs
-    /// Accepted, different decider) so any silent overwrite would
-    /// surface as a body mismatch on the read-back.
-    #[test]
-    fn write_decision_note_returns_already_recorded_on_second_call() {
-        let tmp = TempDir::new().unwrap();
-        let bailiff = bailiff_repo(&tmp);
-        let plan_id = PlanId::new();
-        let first = sample_decision_note(plan_id, Decision::Accepted);
-        let returned_oid = write_decision_note(&bailiff, &first).unwrap();
-
-        let mut second = sample_decision_note(plan_id, Decision::Rejected);
-        second.decider = Decider::try_new("cli:bob").unwrap();
-        let err = write_decision_note(&bailiff, &second).unwrap_err();
-        match err {
-            WriteDecisionNoteError::DecisionAlreadyRecorded {
-                plan_id: pid,
-                target_oid,
-            } => {
-                assert_eq!(pid, plan_id);
-                assert_eq!(target_oid, returned_oid);
+            // fault 0: metadata tamper; 1: signature tamper; 2: untrusted signer.
+            let allowed = if fault == 2 {
+                let other = WritVerifyingKey::from_openssh(OTHER_PUB.trim()).unwrap();
+                AllowedSigners::from_keys([other])
+            } else {
+                AllowedSigners::from_openssh_lines(SIGNING_PUB).unwrap()
+            };
+            if fault == 0 {
+                completed.signed_metadata.exit_code = completed.signed_metadata.exit_code.wrapping_add(1);
+            } else if fault == 1 {
+                completed.signature = SshSignature::try_new(
+                    "-----BEGIN SSH SIGNATURE-----\nU1NIU0lH-other-bytes\n-----END SSH SIGNATURE-----",
+                )
+                .unwrap();
             }
-            other => panic!("expected DecisionAlreadyRecorded, got: {other:?}"),
-        }
 
-        // The original Accepted body must still be the one attached.
-        let body = bailiff
-            .read_note(&plan_notes_ref(plan_id), &returned_oid)
-            .unwrap();
-        let parsed = DecisionNote::from_canonical_bytes(&body).unwrap();
-        assert_eq!(parsed, first);
-    }
-
-    /// Distinct plan ids each get their own decision note under the
-    /// same notes-ref *prefix* but at different per-plan refs. A
-    /// regression that drops the plan id from the ref derivation would
-    /// silently collapse both into one ref.
-    #[test]
-    fn write_decision_note_supports_distinct_plans_independently() {
-        let tmp = TempDir::new().unwrap();
-        let bailiff = bailiff_repo(&tmp);
-        let p1 = PlanId::new();
-        let p2 = PlanId::new();
-        let note1 = sample_decision_note(p1, Decision::Accepted);
-        let note2 = sample_decision_note(p2, Decision::Rejected);
-
-        let oid1 = write_decision_note(&bailiff, &note1).unwrap();
-        let oid2 = write_decision_note(&bailiff, &note2).unwrap();
-        assert_ne!(oid1, oid2, "distinct plans must seed distinct targets");
-
-        let body1 = bailiff.read_note(&plan_notes_ref(p1), &oid1).unwrap();
-        let body2 = bailiff.read_note(&plan_notes_ref(p2), &oid2).unwrap();
-        let parsed1 = DecisionNote::from_canonical_bytes(&body1).unwrap();
-        let parsed2 = DecisionNote::from_canonical_bytes(&body2).unwrap();
-        assert_eq!(parsed1, note1);
-        assert_eq!(parsed2, note2);
-    }
-
-    /// Load-bearing coexistence pin: a submission note and a decision
-    /// note for the same plan live under the same per-plan ref at
-    /// distinct seed OIDs. The decision write must not collide with a
-    /// pre-existing submission, and the submission must remain
-    /// readable after the decision is attached. This is the property
-    /// the two-seeds-per-plan design exists to provide.
-    #[test]
-    fn write_decision_note_coexists_with_existing_submission_under_same_ref() {
-        let tmp = TempDir::new().unwrap();
-        let bailiff = bailiff_repo(&tmp);
-        let plan_id = PlanId::new();
-        let plan_ref = plan_notes_ref(plan_id);
-
-        // Plant a submission-shaped note directly via `write_note` so
-        // we don't need to drive the full slice-C broker round-trip
-        // for a coexistence pin. The exact body shape doesn't matter
-        // here; we only care that the decision write doesn't trip
-        // over an existing note under the same ref.
-        let submission_seed = crate::bailiff_plan_note::plan_submission_seed_blob_bytes(plan_id);
-        let submission_target = bailiff
-            .write_note(&plan_ref, &submission_seed, b"submission-body")
-            .expect("submission write must succeed");
-
-        let decision = sample_decision_note(plan_id, Decision::Accepted);
-        let decision_target =
-            write_decision_note(&bailiff, &decision).expect("decision write must succeed");
-
-        assert_ne!(
-            submission_target, decision_target,
-            "submission and decision must attach at distinct OIDs",
-        );
-        assert_eq!(
-            bailiff.read_note(&plan_ref, &submission_target).unwrap(),
-            b"submission-body",
-            "submission body must survive the decision write",
-        );
-        let decision_body = bailiff.read_note(&plan_ref, &decision_target).unwrap();
-        assert_eq!(
-            DecisionNote::from_canonical_bytes(&decision_body).unwrap(),
-            decision,
-        );
-    }
-
-    /// Decision can be written even when no submission note exists
-    /// yet. D1 chose not to gate the decide verb on submission
-    /// presence — the only invariant the write helper enforces is
-    /// "one decision per plan." Pin that choice so a future change
-    /// that adds a precondition has to update this test.
-    #[test]
-    fn write_decision_note_does_not_require_pre_existing_submission() {
-        let tmp = TempDir::new().unwrap();
-        let bailiff = bailiff_repo(&tmp);
-        let plan_id = PlanId::new();
-        let note = sample_decision_note(plan_id, Decision::Rejected);
-
-        let oid = write_decision_note(&bailiff, &note)
-            .expect("decision write must succeed without a prior submission note");
-        let body = bailiff.read_note(&plan_notes_ref(plan_id), &oid).unwrap();
-        assert_eq!(DecisionNote::from_canonical_bytes(&body).unwrap(), note);
-    }
-}
-
-#[cfg(test)]
-mod review_tests {
-    //! Tests for [`write_review_note`] — the slice D2.2 fetch-verify-
-    //! attach helper. Same harness shape as `tests` (a tempdir-backed
-    //! writ repo holding one signed envelope, a sibling bailiff repo,
-    //! and an `AllowedSigners` keyring); the round-trip is exercised
-    //! directly without standing up the broker. The full broker
-    //! handshake is covered by `end_to_end_tests` below.
-    use super::*;
-    use crate::agent_run::{AgentRunId, sha256_hex};
-    use crate::bailiff_plan_note::{
-        PlanId, ReviewNote, plan_notes_ref, plan_review_seed_blob_bytes,
-    };
-    use crate::core::{CapabilitySet, NotesRef, RepoRef, SessionId, Sha256Hex, UnixMillis};
-    use crate::protocol::SignedRunMetadata;
-    use crate::run_envelope::{OutputEnvelope, SignedRunEnvelope};
-    use crate::signing::{WritSigningKey, WritVerifyingKey};
-    use tempfile::TempDir;
-
-    const SIGNING_PEM: &str = include_str!("../tests/fixtures/ed25519_test_signing.key");
-    const SIGNING_PUB: &str = include_str!("../tests/fixtures/ed25519_test_signing.key.pub");
-    const OTHER_PUB: &str = include_str!("../tests/fixtures/ed25519_test_signing_other.key.pub");
-
-    fn writ_notes_ref() -> NotesRef {
-        NotesRef::try_new("refs/notes/writ/v1/agent-outputs").unwrap()
-    }
-
-    /// Build a freshly-signed envelope under `signing_key`. Mirrors
-    /// the same-named helper in `tests` so the envelope shape matches
-    /// what writ produces today.
-    fn freshly_signed(signing_key: &WritSigningKey) -> SignedRunEnvelope {
-        let output = OutputEnvelope {
-            stdout: b"reviewer prose".to_vec(),
-            stderr: Vec::new(),
-            stdout_truncated_at: None,
-            stderr_truncated_at: None,
-        };
-        let output_bytes = output.to_bytes();
-        let output_sha = Sha256Hex::try_new(sha256_hex(&output_bytes)).unwrap();
-        let prompt_sha = Sha256Hex::try_new(sha256_hex(b"reviewer-prompt")).unwrap();
-        let metadata = SignedRunMetadata {
-            run_id: AgentRunId::new(),
-            session_id: SessionId::new(),
-            prompt_sha256: prompt_sha,
-            output_envelope_sha256: output_sha,
-            capabilities: vec![CapabilitySet::WorkspaceRead {
-                repo: RepoRef {
-                    owner: "smaug123".into(),
-                    name: "writ".into(),
-                },
-            }],
-            exit_code: 0,
-            completed_at: UnixMillis::from_millis(1_700_000_000_000),
-            signing_key_fingerprint: signing_key.fingerprint(),
-        };
-        let signature = signing_key.sign(&metadata.canonical_bytes()).unwrap();
-        SignedRunEnvelope {
-            metadata,
-            signature,
-            output: output_bytes,
-        }
-    }
-
-    /// Prepare a writ repo containing one signed envelope keyed on the
-    /// run id, the same shape writ's `RunAgent` handler produces.
-    fn writ_repo_with_envelope(
-        tmp: &TempDir,
-        signing_key: &WritSigningKey,
-    ) -> (NotesRepo, RunAgentCompleted, SignedRunEnvelope) {
-        let writ_repo = NotesRepo::init_or_open(tmp.path().join("writ-bare")).unwrap();
-        let nref = writ_notes_ref();
-        let envelope = freshly_signed(signing_key);
-        let body = envelope.to_bytes();
-        let target = writ_repo
-            .write_note(
-                &nref,
-                envelope.metadata.run_id.to_string().as_bytes(),
-                &body,
-            )
-            .unwrap();
-        let completed = RunAgentCompleted {
-            output_oid: target,
-            signed_metadata: envelope.metadata.clone(),
-            signature: envelope.signature.clone(),
-        };
-        (writ_repo, completed, envelope)
-    }
-
-    fn bailiff_repo(tmp: &TempDir) -> NotesRepo {
-        NotesRepo::init_or_open(tmp.path().join("bailiff-bare")).unwrap()
-    }
-
-    /// Happy path: with writ's envelope in place and an allowed-signers
-    /// list that contains writ's key, `write_review_note` attaches a
-    /// review note that decodes back to a `ReviewNote` whose envelope
-    /// fields match what writ produced. Load-bearing contract D2.4's
-    /// `submit_review` relies on.
-    #[test]
-    fn write_review_note_happy_path_round_trips_through_bailiff_repo() {
-        let tmp = TempDir::new().unwrap();
-        let signing_key = WritSigningKey::from_openssh_pem(SIGNING_PEM).unwrap();
-        let (writ_repo, completed, envelope) = writ_repo_with_envelope(&tmp, &signing_key);
-        let bailiff = bailiff_repo(&tmp);
-        let allowed = AllowedSigners::from_openssh_lines(SIGNING_PUB).unwrap();
-
-        let plan_id = PlanId::new();
-        let purpose = "plan-review".to_string();
-        let returned_oid = write_review_note(
-            &bailiff,
-            writ_repo.path(),
-            &writ_notes_ref(),
-            plan_id,
-            purpose.clone(),
-            &completed,
-            &allowed,
-        )
-        .expect("happy path must succeed");
-
-        let body = bailiff
-            .read_note(&plan_notes_ref(plan_id), &returned_oid)
-            .expect("bailiff-side review note must be readable at the returned OID");
-        let note = ReviewNote::from_canonical_bytes(&body).expect("body must decode");
-        assert_eq!(note.plan_id, plan_id);
-        assert_eq!(note.purpose, purpose);
-        assert_eq!(note.writ_output_oid, completed.output_oid);
-        assert_eq!(note.signed_metadata, envelope.metadata);
-        assert_eq!(note.signature, envelope.signature);
-
-        // The seed bytes are the load-bearing input to `git hash-object`;
-        // pin them here so a future writer-side change can't silently
-        // diverge the seed from the slice-D2 plan doc.
-        let seed = plan_review_seed_blob_bytes(plan_id);
-        assert_eq!(
-            std::str::from_utf8(&seed).unwrap(),
-            format!("{plan_id}::review"),
-        );
-    }
-
-    /// Idempotent-by-error: a second review for the same plan returns
-    /// `ReviewAlreadyRecorded` rather than overwriting. The second call
-    /// carries a different `purpose` so any silent overwrite would
-    /// surface as a body mismatch on the read-back.
-    #[test]
-    fn write_review_note_returns_already_recorded_on_second_call() {
-        let tmp = TempDir::new().unwrap();
-        let signing_key = WritSigningKey::from_openssh_pem(SIGNING_PEM).unwrap();
-        let (writ_repo, completed, _envelope) = writ_repo_with_envelope(&tmp, &signing_key);
-        let bailiff = bailiff_repo(&tmp);
-        let allowed = AllowedSigners::from_openssh_lines(SIGNING_PUB).unwrap();
-
-        let plan_id = PlanId::new();
-        let first_oid = write_review_note(
-            &bailiff,
-            writ_repo.path(),
-            &writ_notes_ref(),
-            plan_id,
-            "first".into(),
-            &completed,
-            &allowed,
-        )
-        .expect("first review must succeed");
-
-        let err = write_review_note(
-            &bailiff,
-            writ_repo.path(),
-            &writ_notes_ref(),
-            plan_id,
-            "second".into(),
-            &completed,
-            &allowed,
-        )
-        .unwrap_err();
-        match err {
-            WriteReviewNoteError::ReviewAlreadyRecorded {
-                plan_id: pid,
-                target_oid,
-            } => {
-                assert_eq!(pid, plan_id);
-                assert_eq!(target_oid, first_oid);
+            let err = write_plan_note(&bailiff, writ_repo.path(), &writ_notes_ref(), PlanId::new(), "spec".into(), &completed, &allowed)
+                .unwrap_err();
+            match (fault, &err) {
+                (0, WritePlanNoteError::FetchVerify(FetchVerifyError::EnvelopeMetadataMismatch)) => {}
+                (1, WritePlanNoteError::FetchVerify(FetchVerifyError::EnvelopeSignatureMismatch)) => {}
+                (2, WritePlanNoteError::FetchVerify(FetchVerifyError::Verify(VerifyError::UnknownSigner { .. }))) => {}
+                _ => prop_assert!(false, "fault {fault} produced unexpected error: {err:?}"),
             }
-            other => panic!("expected ReviewAlreadyRecorded, got: {other:?}"),
-        }
-
-        // First body must survive.
-        let body = bailiff
-            .read_note(&plan_notes_ref(plan_id), &first_oid)
-            .unwrap();
-        let note = ReviewNote::from_canonical_bytes(&body).unwrap();
-        assert_eq!(note.purpose, "first");
-    }
-
-    /// Coexistence pin: a submission note and a review note for the
-    /// same plan live under the same per-plan ref at distinct seed
-    /// OIDs. The review write must not collide with a pre-existing
-    /// submission, and the submission must remain readable after the
-    /// review is attached. Property the three-seeds-per-plan design
-    /// exists to provide.
-    #[test]
-    fn write_review_note_coexists_with_existing_submission_under_same_ref() {
-        let tmp = TempDir::new().unwrap();
-        let signing_key = WritSigningKey::from_openssh_pem(SIGNING_PEM).unwrap();
-        let (writ_repo, completed, _envelope) = writ_repo_with_envelope(&tmp, &signing_key);
-        let bailiff = bailiff_repo(&tmp);
-        let allowed = AllowedSigners::from_openssh_lines(SIGNING_PUB).unwrap();
-
-        let plan_id = PlanId::new();
-        let plan_ref = plan_notes_ref(plan_id);
-
-        // Plant a submission-shaped note directly via `write_note` so
-        // we don't drag the full slice-C broker round-trip in here.
-        let submission_seed = crate::bailiff_plan_note::plan_submission_seed_blob_bytes(plan_id);
-        let submission_target = bailiff
-            .write_note(&plan_ref, &submission_seed, b"submission-body")
-            .expect("submission write must succeed");
-
-        let review_target = write_review_note(
-            &bailiff,
-            writ_repo.path(),
-            &writ_notes_ref(),
-            plan_id,
-            "plan-review".into(),
-            &completed,
-            &allowed,
-        )
-        .expect("review write must succeed alongside a submission");
-
-        assert_ne!(
-            submission_target, review_target,
-            "submission and review must attach at distinct OIDs",
-        );
-        assert_eq!(
-            bailiff.read_note(&plan_ref, &submission_target).unwrap(),
-            b"submission-body",
-            "submission body must survive the review write",
-        );
-        let review_body = bailiff.read_note(&plan_ref, &review_target).unwrap();
-        assert_eq!(
-            ReviewNote::from_canonical_bytes(&review_body)
-                .unwrap()
-                .plan_id,
-            plan_id,
-        );
-    }
-
-    /// Coexistence pin: a decision note and a review note for the same
-    /// plan live under the same per-plan ref at distinct seed OIDs.
-    /// Mirrors the submission-coexistence test for the third pairwise
-    /// combination; without this, a future suffix collision between
-    /// `::decision` and `::review` would only surface in slice F's
-    /// read paths.
-    #[test]
-    fn write_review_note_coexists_with_existing_decision_under_same_ref() {
-        let tmp = TempDir::new().unwrap();
-        let signing_key = WritSigningKey::from_openssh_pem(SIGNING_PEM).unwrap();
-        let (writ_repo, completed, _envelope) = writ_repo_with_envelope(&tmp, &signing_key);
-        let bailiff = bailiff_repo(&tmp);
-        let allowed = AllowedSigners::from_openssh_lines(SIGNING_PUB).unwrap();
-
-        let plan_id = PlanId::new();
-        let plan_ref = plan_notes_ref(plan_id);
-
-        // Plant a decision-shaped note directly via `write_note`.
-        let decision_seed = crate::bailiff_plan_note::plan_decision_seed_blob_bytes(plan_id);
-        let decision_target = bailiff
-            .write_note(&plan_ref, &decision_seed, b"decision-body")
-            .expect("decision write must succeed");
-
-        let review_target = write_review_note(
-            &bailiff,
-            writ_repo.path(),
-            &writ_notes_ref(),
-            plan_id,
-            "plan-review".into(),
-            &completed,
-            &allowed,
-        )
-        .expect("review write must succeed alongside a decision");
-
-        assert_ne!(
-            decision_target, review_target,
-            "decision and review must attach at distinct OIDs",
-        );
-        assert_eq!(
-            bailiff.read_note(&plan_ref, &decision_target).unwrap(),
-            b"decision-body",
-            "decision body must survive the review write",
-        );
-    }
-
-    /// Two distinct plan ids produce two distinct bailiff-side reviews
-    /// from the *same* writ envelope. The plan id is the only thing
-    /// that varies between the two writes; the writ-side OID stays the
-    /// same in both notes.
-    #[test]
-    fn write_review_note_supports_distinct_plans_independently() {
-        let tmp = TempDir::new().unwrap();
-        let signing_key = WritSigningKey::from_openssh_pem(SIGNING_PEM).unwrap();
-        let (writ_repo, completed, _envelope) = writ_repo_with_envelope(&tmp, &signing_key);
-        let bailiff = bailiff_repo(&tmp);
-        let allowed = AllowedSigners::from_openssh_lines(SIGNING_PUB).unwrap();
-
-        let p1 = PlanId::new();
-        let p2 = PlanId::new();
-        let oid1 = write_review_note(
-            &bailiff,
-            writ_repo.path(),
-            &writ_notes_ref(),
-            p1,
-            "first".into(),
-            &completed,
-            &allowed,
-        )
-        .unwrap();
-        let oid2 = write_review_note(
-            &bailiff,
-            writ_repo.path(),
-            &writ_notes_ref(),
-            p2,
-            "second".into(),
-            &completed,
-            &allowed,
-        )
-        .unwrap();
-        assert_ne!(oid1, oid2, "distinct plan ids must seed distinct OIDs");
-
-        let body1 = bailiff.read_note(&plan_notes_ref(p1), &oid1).unwrap();
-        let body2 = bailiff.read_note(&plan_notes_ref(p2), &oid2).unwrap();
-        let note1 = ReviewNote::from_canonical_bytes(&body1).unwrap();
-        let note2 = ReviewNote::from_canonical_bytes(&body2).unwrap();
-        assert_eq!(note1.plan_id, p1);
-        assert_eq!(note2.plan_id, p2);
-        assert_eq!(
-            note1.writ_output_oid, note2.writ_output_oid,
-            "both reviews reference the same writ envelope",
-        );
-        assert_ne!(note1.purpose, note2.purpose);
-    }
-
-    /// Defence in depth: if the envelope writ stored in its repo
-    /// disagrees with the metadata writ returned over the wire,
-    /// bailiff refuses to attach the review.
-    #[test]
-    fn write_review_note_rejects_metadata_mismatch_between_envelope_and_reply() {
-        let tmp = TempDir::new().unwrap();
-        let signing_key = WritSigningKey::from_openssh_pem(SIGNING_PEM).unwrap();
-        let (writ_repo, mut completed, _envelope) = writ_repo_with_envelope(&tmp, &signing_key);
-        let bailiff = bailiff_repo(&tmp);
-        let allowed = AllowedSigners::from_openssh_lines(SIGNING_PUB).unwrap();
-
-        completed.signed_metadata.exit_code = completed.signed_metadata.exit_code.wrapping_add(1);
-
-        let err = write_review_note(
-            &bailiff,
-            writ_repo.path(),
-            &writ_notes_ref(),
-            PlanId::new(),
-            "p".into(),
-            &completed,
-            &allowed,
-        )
-        .unwrap_err();
-        assert!(
-            matches!(
-                err,
-                WriteReviewNoteError::FetchVerify(FetchVerifyError::EnvelopeMetadataMismatch)
-            ),
-            "expected EnvelopeMetadataMismatch, got: {err:?}",
-        );
-    }
-
-    /// Defence in depth: same as the metadata case but for the
-    /// signature field.
-    #[test]
-    fn write_review_note_rejects_signature_mismatch_between_envelope_and_reply() {
-        let tmp = TempDir::new().unwrap();
-        let signing_key = WritSigningKey::from_openssh_pem(SIGNING_PEM).unwrap();
-        let (writ_repo, mut completed, _envelope) = writ_repo_with_envelope(&tmp, &signing_key);
-        let bailiff = bailiff_repo(&tmp);
-        let allowed = AllowedSigners::from_openssh_lines(SIGNING_PUB).unwrap();
-
-        completed.signature = crate::core::SshSignature::try_new(
-            "-----BEGIN SSH SIGNATURE-----\nU1NIU0lH-other-bytes\n-----END SSH SIGNATURE-----",
-        )
-        .unwrap();
-
-        let err = write_review_note(
-            &bailiff,
-            writ_repo.path(),
-            &writ_notes_ref(),
-            PlanId::new(),
-            "p".into(),
-            &completed,
-            &allowed,
-        )
-        .unwrap_err();
-        assert!(
-            matches!(
-                err,
-                WriteReviewNoteError::FetchVerify(FetchVerifyError::EnvelopeSignatureMismatch)
-            ),
-            "expected EnvelopeSignatureMismatch, got: {err:?}",
-        );
-    }
-
-    /// If bailiff's keyring doesn't contain writ's signing key, the
-    /// envelope verification step fails with `UnknownSigner`, which
-    /// surfaces as `WriteReviewNoteError::FetchVerify(FetchVerifyError::Verify(..))`. Operator-
-    /// misconfigured-trust case.
-    #[test]
-    fn write_review_note_rejects_envelope_when_signer_not_trusted() {
-        let tmp = TempDir::new().unwrap();
-        let signing_key = WritSigningKey::from_openssh_pem(SIGNING_PEM).unwrap();
-        let (writ_repo, completed, _envelope) = writ_repo_with_envelope(&tmp, &signing_key);
-        let bailiff = bailiff_repo(&tmp);
-
-        let other = WritVerifyingKey::from_openssh(OTHER_PUB.trim()).unwrap();
-        let allowed = AllowedSigners::from_keys([other]);
-
-        let err = write_review_note(
-            &bailiff,
-            writ_repo.path(),
-            &writ_notes_ref(),
-            PlanId::new(),
-            "p".into(),
-            &completed,
-            &allowed,
-        )
-        .unwrap_err();
-        match err {
-            WriteReviewNoteError::FetchVerify(FetchVerifyError::Verify(
-                VerifyError::UnknownSigner { .. },
-            )) => {}
-            other => panic!("expected Verify(UnknownSigner), got: {other:?}"),
         }
     }
 
-    /// A bad writ-repo path surfaces as `Fetch`, distinct from the
-    /// later `ReadEnvelope` variant. Operators see "your writ repo
-    /// path is wrong" instead of "no such note."
-    #[test]
-    fn write_review_note_reports_fetch_failure_for_missing_writ_repo() {
-        let tmp = TempDir::new().unwrap();
-        let signing_key = WritSigningKey::from_openssh_pem(SIGNING_PEM).unwrap();
-        let (_writ_repo, completed, _envelope) = writ_repo_with_envelope(&tmp, &signing_key);
-        let bailiff = bailiff_repo(&tmp);
-        let allowed = AllowedSigners::from_openssh_lines(SIGNING_PUB).unwrap();
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(16))]
 
-        let bogus = tmp.path().join("does-not-exist");
-        let err = write_review_note(
-            &bailiff,
-            &bogus,
-            &writ_notes_ref(),
-            PlanId::new(),
-            "p".into(),
-            &completed,
-            &allowed,
-        )
-        .unwrap_err();
-        assert!(
-            matches!(
-                err,
-                WriteReviewNoteError::FetchVerify(FetchVerifyError::Fetch(_))
-            ),
-            "expected Fetch error, got: {err:?}",
-        );
-    }
+        /// Review and implement writes are idempotent by error: the
+        /// second write for a plan id is refused rather than silently
+        /// overwriting the first.
+        #[test]
+        fn review_and_implement_writes_are_idempotent(payload in arb_payload(), use_implement in any::<bool>()) {
+            let tmp = TempDir::new().unwrap();
+            let signing_key = WritSigningKey::from_openssh_pem(SIGNING_PEM).unwrap();
+            let envelope = envelope_for(&signing_key, &payload);
+            let (writ_repo, completed) = writ_repo_for(&tmp, &envelope);
+            let bailiff = bailiff_repo(&tmp);
+            let allowed = AllowedSigners::from_openssh_lines(SIGNING_PUB).unwrap();
+            let plan_id = PlanId::new();
 
-    /// Review can be written even when no submission note exists yet.
-    /// D2 chose not to gate the write helper on submission presence
-    /// (mirrors D1.3's decoupling); the submission-presence gate lives
-    /// in slice D2.4's `submit_review` workflow, where the body is
-    /// consumed for prompt composition. Pin that choice so a future
-    /// change that adds a precondition has to update this test.
-    #[test]
-    fn write_review_note_does_not_require_pre_existing_submission() {
-        let tmp = TempDir::new().unwrap();
-        let signing_key = WritSigningKey::from_openssh_pem(SIGNING_PEM).unwrap();
-        let (writ_repo, completed, _envelope) = writ_repo_with_envelope(&tmp, &signing_key);
-        let bailiff = bailiff_repo(&tmp);
-        let allowed = AllowedSigners::from_openssh_lines(SIGNING_PUB).unwrap();
-
-        let plan_id = PlanId::new();
-        let returned_oid = write_review_note(
-            &bailiff,
-            writ_repo.path(),
-            &writ_notes_ref(),
-            plan_id,
-            "plan-review".into(),
-            &completed,
-            &allowed,
-        )
-        .expect("review write must succeed without a prior submission note");
-        let body = bailiff
-            .read_note(&plan_notes_ref(plan_id), &returned_oid)
-            .unwrap();
-        let note = ReviewNote::from_canonical_bytes(&body).unwrap();
-        assert_eq!(note.plan_id, plan_id);
-    }
-}
-
-#[cfg(test)]
-mod implement_tests {
-    //! Tests for [`write_implement_note`] — the slice E2 fetch-verify-
-    //! attach helper. Same harness shape as `review_tests` (a
-    //! tempdir-backed writ repo holding one signed envelope, a sibling
-    //! bailiff repo, and an `AllowedSigners` keyring); the round-trip
-    //! is exercised directly without standing up the broker. The full
-    //! broker handshake is covered by `end_to_end_tests` below.
-    use super::*;
-    use crate::agent_run::{AgentRunId, sha256_hex};
-    use crate::bailiff_plan_note::{
-        ImplementNote, PlanId, plan_implement_seed_blob_bytes, plan_notes_ref,
-    };
-    use crate::core::{CapabilitySet, NotesRef, RepoRef, SessionId, Sha256Hex, UnixMillis};
-    use crate::protocol::SignedRunMetadata;
-    use crate::run_envelope::{OutputEnvelope, SignedRunEnvelope};
-    use crate::signing::{WritSigningKey, WritVerifyingKey};
-    use tempfile::TempDir;
-
-    const SIGNING_PEM: &str = include_str!("../tests/fixtures/ed25519_test_signing.key");
-    const SIGNING_PUB: &str = include_str!("../tests/fixtures/ed25519_test_signing.key.pub");
-    const OTHER_PUB: &str = include_str!("../tests/fixtures/ed25519_test_signing_other.key.pub");
-
-    fn writ_notes_ref() -> NotesRef {
-        NotesRef::try_new("refs/notes/writ/v1/agent-outputs").unwrap()
-    }
-
-    /// Build a freshly-signed envelope under `signing_key`. Mirrors
-    /// the same-named helper in `tests` and `review_tests` so the
-    /// envelope shape matches what writ produces today. The stdout
-    /// payload is the only thing that differs (implementer prose
-    /// rather than reviewer prose), and it's not load-bearing — it
-    /// just makes the round-trip self-documenting.
-    fn freshly_signed(signing_key: &WritSigningKey) -> SignedRunEnvelope {
-        let output = OutputEnvelope {
-            stdout: b"implementer prose".to_vec(),
-            stderr: Vec::new(),
-            stdout_truncated_at: None,
-            stderr_truncated_at: None,
-        };
-        let output_bytes = output.to_bytes();
-        let output_sha = Sha256Hex::try_new(sha256_hex(&output_bytes)).unwrap();
-        let prompt_sha = Sha256Hex::try_new(sha256_hex(b"implementer-prompt")).unwrap();
-        let metadata = SignedRunMetadata {
-            run_id: AgentRunId::new(),
-            session_id: SessionId::new(),
-            prompt_sha256: prompt_sha,
-            output_envelope_sha256: output_sha,
-            capabilities: vec![CapabilitySet::WorkspaceWrite {
-                repo: RepoRef {
-                    owner: "smaug123".into(),
-                    name: "writ".into(),
-                },
-            }],
-            exit_code: 0,
-            completed_at: UnixMillis::from_millis(1_700_000_000_000),
-            signing_key_fingerprint: signing_key.fingerprint(),
-        };
-        let signature = signing_key.sign(&metadata.canonical_bytes()).unwrap();
-        SignedRunEnvelope {
-            metadata,
-            signature,
-            output: output_bytes,
-        }
-    }
-
-    /// Prepare a writ repo containing one signed envelope keyed on the
-    /// run id, the same shape writ's `RunAgent` handler produces.
-    fn writ_repo_with_envelope(
-        tmp: &TempDir,
-        signing_key: &WritSigningKey,
-    ) -> (NotesRepo, RunAgentCompleted, SignedRunEnvelope) {
-        let writ_repo = NotesRepo::init_or_open(tmp.path().join("writ-bare")).unwrap();
-        let nref = writ_notes_ref();
-        let envelope = freshly_signed(signing_key);
-        let body = envelope.to_bytes();
-        let target = writ_repo
-            .write_note(
-                &nref,
-                envelope.metadata.run_id.to_string().as_bytes(),
-                &body,
-            )
-            .unwrap();
-        let completed = RunAgentCompleted {
-            output_oid: target,
-            signed_metadata: envelope.metadata.clone(),
-            signature: envelope.signature.clone(),
-        };
-        (writ_repo, completed, envelope)
-    }
-
-    fn bailiff_repo(tmp: &TempDir) -> NotesRepo {
-        NotesRepo::init_or_open(tmp.path().join("bailiff-bare")).unwrap()
-    }
-
-    /// Happy path: with writ's envelope in place and an allowed-signers
-    /// list that contains writ's key, `write_implement_note` attaches
-    /// an implement note that decodes back to an `ImplementNote` whose
-    /// envelope fields match what writ produced. Load-bearing contract
-    /// slice E4's `submit_implement` relies on.
-    #[test]
-    fn write_implement_note_happy_path_round_trips_through_bailiff_repo() {
-        let tmp = TempDir::new().unwrap();
-        let signing_key = WritSigningKey::from_openssh_pem(SIGNING_PEM).unwrap();
-        let (writ_repo, completed, envelope) = writ_repo_with_envelope(&tmp, &signing_key);
-        let bailiff = bailiff_repo(&tmp);
-        let allowed = AllowedSigners::from_openssh_lines(SIGNING_PUB).unwrap();
-
-        let plan_id = PlanId::new();
-        let purpose = "plan-implement".to_string();
-        let returned_oid = write_implement_note(
-            &bailiff,
-            writ_repo.path(),
-            &writ_notes_ref(),
-            plan_id,
-            purpose.clone(),
-            &completed,
-            &allowed,
-        )
-        .expect("happy path must succeed");
-
-        let body = bailiff
-            .read_note(&plan_notes_ref(plan_id), &returned_oid)
-            .expect("bailiff-side implement note must be readable at the returned OID");
-        let note = ImplementNote::from_canonical_bytes(&body).expect("body must decode");
-        assert_eq!(note.plan_id, plan_id);
-        assert_eq!(note.purpose, purpose);
-        assert_eq!(note.writ_output_oid, completed.output_oid);
-        assert_eq!(note.signed_metadata, envelope.metadata);
-        assert_eq!(note.signature, envelope.signature);
-
-        // The seed bytes are the load-bearing input to `git hash-object`;
-        // pin them here so a future writer-side change can't silently
-        // diverge the seed from the slice-E plan doc.
-        let seed = plan_implement_seed_blob_bytes(plan_id);
-        assert_eq!(
-            std::str::from_utf8(&seed).unwrap(),
-            format!("{plan_id}::implement"),
-        );
-    }
-
-    /// Idempotent-by-error: a second implement-note write for the same
-    /// plan returns `ImplementAlreadyRecorded` rather than overwriting.
-    /// The second call carries a different `purpose` so any silent
-    /// overwrite would surface as a body mismatch on the read-back.
-    #[test]
-    fn write_implement_note_returns_already_recorded_on_second_call() {
-        let tmp = TempDir::new().unwrap();
-        let signing_key = WritSigningKey::from_openssh_pem(SIGNING_PEM).unwrap();
-        let (writ_repo, completed, _envelope) = writ_repo_with_envelope(&tmp, &signing_key);
-        let bailiff = bailiff_repo(&tmp);
-        let allowed = AllowedSigners::from_openssh_lines(SIGNING_PUB).unwrap();
-
-        let plan_id = PlanId::new();
-        let first_oid = write_implement_note(
-            &bailiff,
-            writ_repo.path(),
-            &writ_notes_ref(),
-            plan_id,
-            "first".into(),
-            &completed,
-            &allowed,
-        )
-        .expect("first implement must succeed");
-
-        let err = write_implement_note(
-            &bailiff,
-            writ_repo.path(),
-            &writ_notes_ref(),
-            plan_id,
-            "second".into(),
-            &completed,
-            &allowed,
-        )
-        .unwrap_err();
-        match err {
-            WriteImplementNoteError::ImplementAlreadyRecorded {
-                plan_id: pid,
-                target_oid,
-            } => {
-                assert_eq!(pid, plan_id);
-                assert_eq!(target_oid, first_oid);
+            if use_implement {
+                write_implement_note(&bailiff, writ_repo.path(), &writ_notes_ref(), plan_id, "spec".into(), &completed, &allowed)
+                    .expect("first implement write succeeds");
+                let err = write_implement_note(&bailiff, writ_repo.path(), &writ_notes_ref(), plan_id, "spec".into(), &completed, &allowed)
+                    .unwrap_err();
+                prop_assert!(
+                    matches!(err, WriteImplementNoteError::ImplementAlreadyRecorded { .. }),
+                    "second implement must be refused, got: {err:?}",
+                );
+            } else {
+                write_review_note(&bailiff, writ_repo.path(), &writ_notes_ref(), plan_id, "spec".into(), &completed, &allowed)
+                    .expect("first review write succeeds");
+                let err = write_review_note(&bailiff, writ_repo.path(), &writ_notes_ref(), plan_id, "spec".into(), &completed, &allowed)
+                    .unwrap_err();
+                prop_assert!(
+                    matches!(err, WriteReviewNoteError::ReviewAlreadyRecorded { .. }),
+                    "second review must be refused, got: {err:?}",
+                );
             }
-            other => panic!("expected ImplementAlreadyRecorded, got: {other:?}"),
         }
-
-        // First body must survive.
-        let body = bailiff
-            .read_note(&plan_notes_ref(plan_id), &first_oid)
-            .unwrap();
-        let note = ImplementNote::from_canonical_bytes(&body).unwrap();
-        assert_eq!(note.purpose, "first");
-    }
-
-    /// Coexistence pin: a submission note and an implement note for
-    /// the same plan live under the same per-plan ref at distinct seed
-    /// OIDs. Property the four-seeds-per-plan design exists to provide.
-    #[test]
-    fn write_implement_note_coexists_with_existing_submission_under_same_ref() {
-        let tmp = TempDir::new().unwrap();
-        let signing_key = WritSigningKey::from_openssh_pem(SIGNING_PEM).unwrap();
-        let (writ_repo, completed, _envelope) = writ_repo_with_envelope(&tmp, &signing_key);
-        let bailiff = bailiff_repo(&tmp);
-        let allowed = AllowedSigners::from_openssh_lines(SIGNING_PUB).unwrap();
-
-        let plan_id = PlanId::new();
-        let plan_ref = plan_notes_ref(plan_id);
-
-        let submission_seed = crate::bailiff_plan_note::plan_submission_seed_blob_bytes(plan_id);
-        let submission_target = bailiff
-            .write_note(&plan_ref, &submission_seed, b"submission-body")
-            .expect("submission write must succeed");
-
-        let implement_target = write_implement_note(
-            &bailiff,
-            writ_repo.path(),
-            &writ_notes_ref(),
-            plan_id,
-            "plan-implement".into(),
-            &completed,
-            &allowed,
-        )
-        .expect("implement write must succeed alongside a submission");
-
-        assert_ne!(
-            submission_target, implement_target,
-            "submission and implement must attach at distinct OIDs",
-        );
-        assert_eq!(
-            bailiff.read_note(&plan_ref, &submission_target).unwrap(),
-            b"submission-body",
-            "submission body must survive the implement write",
-        );
-        let implement_body = bailiff.read_note(&plan_ref, &implement_target).unwrap();
-        assert_eq!(
-            ImplementNote::from_canonical_bytes(&implement_body)
-                .unwrap()
-                .plan_id,
-            plan_id,
-        );
-    }
-
-    /// Coexistence pin: a decision note and an implement note for the
-    /// same plan live under the same per-plan ref at distinct seed OIDs.
-    /// Without this, a future suffix collision between `::decision` and
-    /// `::implement` would only surface in slice F's read paths.
-    #[test]
-    fn write_implement_note_coexists_with_existing_decision_under_same_ref() {
-        let tmp = TempDir::new().unwrap();
-        let signing_key = WritSigningKey::from_openssh_pem(SIGNING_PEM).unwrap();
-        let (writ_repo, completed, _envelope) = writ_repo_with_envelope(&tmp, &signing_key);
-        let bailiff = bailiff_repo(&tmp);
-        let allowed = AllowedSigners::from_openssh_lines(SIGNING_PUB).unwrap();
-
-        let plan_id = PlanId::new();
-        let plan_ref = plan_notes_ref(plan_id);
-
-        let decision_seed = crate::bailiff_plan_note::plan_decision_seed_blob_bytes(plan_id);
-        let decision_target = bailiff
-            .write_note(&plan_ref, &decision_seed, b"decision-body")
-            .expect("decision write must succeed");
-
-        let implement_target = write_implement_note(
-            &bailiff,
-            writ_repo.path(),
-            &writ_notes_ref(),
-            plan_id,
-            "plan-implement".into(),
-            &completed,
-            &allowed,
-        )
-        .expect("implement write must succeed alongside a decision");
-
-        assert_ne!(
-            decision_target, implement_target,
-            "decision and implement must attach at distinct OIDs",
-        );
-        assert_eq!(
-            bailiff.read_note(&plan_ref, &decision_target).unwrap(),
-            b"decision-body",
-            "decision body must survive the implement write",
-        );
-    }
-
-    /// Coexistence pin: a review note and an implement note for the
-    /// same plan live under the same per-plan ref at distinct seed OIDs.
-    /// Closes the all-pairs coexistence matrix against the existing
-    /// three seed kinds.
-    #[test]
-    fn write_implement_note_coexists_with_existing_review_under_same_ref() {
-        let tmp = TempDir::new().unwrap();
-        let signing_key = WritSigningKey::from_openssh_pem(SIGNING_PEM).unwrap();
-        let (writ_repo, completed, _envelope) = writ_repo_with_envelope(&tmp, &signing_key);
-        let bailiff = bailiff_repo(&tmp);
-        let allowed = AllowedSigners::from_openssh_lines(SIGNING_PUB).unwrap();
-
-        let plan_id = PlanId::new();
-        let plan_ref = plan_notes_ref(plan_id);
-
-        let review_seed = crate::bailiff_plan_note::plan_review_seed_blob_bytes(plan_id);
-        let review_target = bailiff
-            .write_note(&plan_ref, &review_seed, b"review-body")
-            .expect("review write must succeed");
-
-        let implement_target = write_implement_note(
-            &bailiff,
-            writ_repo.path(),
-            &writ_notes_ref(),
-            plan_id,
-            "plan-implement".into(),
-            &completed,
-            &allowed,
-        )
-        .expect("implement write must succeed alongside a review");
-
-        assert_ne!(
-            review_target, implement_target,
-            "review and implement must attach at distinct OIDs",
-        );
-        assert_eq!(
-            bailiff.read_note(&plan_ref, &review_target).unwrap(),
-            b"review-body",
-            "review body must survive the implement write",
-        );
-    }
-
-    /// Two distinct plan ids produce two distinct bailiff-side implement
-    /// notes from the *same* writ envelope. The plan id is the only
-    /// thing that varies between the two writes; the writ-side OID
-    /// stays the same in both notes.
-    #[test]
-    fn write_implement_note_supports_distinct_plans_independently() {
-        let tmp = TempDir::new().unwrap();
-        let signing_key = WritSigningKey::from_openssh_pem(SIGNING_PEM).unwrap();
-        let (writ_repo, completed, _envelope) = writ_repo_with_envelope(&tmp, &signing_key);
-        let bailiff = bailiff_repo(&tmp);
-        let allowed = AllowedSigners::from_openssh_lines(SIGNING_PUB).unwrap();
-
-        let p1 = PlanId::new();
-        let p2 = PlanId::new();
-        let oid1 = write_implement_note(
-            &bailiff,
-            writ_repo.path(),
-            &writ_notes_ref(),
-            p1,
-            "first".into(),
-            &completed,
-            &allowed,
-        )
-        .unwrap();
-        let oid2 = write_implement_note(
-            &bailiff,
-            writ_repo.path(),
-            &writ_notes_ref(),
-            p2,
-            "second".into(),
-            &completed,
-            &allowed,
-        )
-        .unwrap();
-        assert_ne!(oid1, oid2, "distinct plan ids must seed distinct OIDs");
-
-        let body1 = bailiff.read_note(&plan_notes_ref(p1), &oid1).unwrap();
-        let body2 = bailiff.read_note(&plan_notes_ref(p2), &oid2).unwrap();
-        let note1 = ImplementNote::from_canonical_bytes(&body1).unwrap();
-        let note2 = ImplementNote::from_canonical_bytes(&body2).unwrap();
-        assert_eq!(note1.plan_id, p1);
-        assert_eq!(note2.plan_id, p2);
-        assert_eq!(
-            note1.writ_output_oid, note2.writ_output_oid,
-            "both implements reference the same writ envelope",
-        );
-        assert_ne!(note1.purpose, note2.purpose);
-    }
-
-    /// Defence in depth: if the envelope writ stored in its repo
-    /// disagrees with the metadata writ returned over the wire,
-    /// bailiff refuses to attach the implement.
-    #[test]
-    fn write_implement_note_rejects_metadata_mismatch_between_envelope_and_reply() {
-        let tmp = TempDir::new().unwrap();
-        let signing_key = WritSigningKey::from_openssh_pem(SIGNING_PEM).unwrap();
-        let (writ_repo, mut completed, _envelope) = writ_repo_with_envelope(&tmp, &signing_key);
-        let bailiff = bailiff_repo(&tmp);
-        let allowed = AllowedSigners::from_openssh_lines(SIGNING_PUB).unwrap();
-
-        completed.signed_metadata.exit_code = completed.signed_metadata.exit_code.wrapping_add(1);
-
-        let err = write_implement_note(
-            &bailiff,
-            writ_repo.path(),
-            &writ_notes_ref(),
-            PlanId::new(),
-            "p".into(),
-            &completed,
-            &allowed,
-        )
-        .unwrap_err();
-        assert!(
-            matches!(
-                err,
-                WriteImplementNoteError::FetchVerify(FetchVerifyError::EnvelopeMetadataMismatch)
-            ),
-            "expected EnvelopeMetadataMismatch, got: {err:?}",
-        );
-    }
-
-    /// Defence in depth: same as the metadata case but for the
-    /// signature field.
-    #[test]
-    fn write_implement_note_rejects_signature_mismatch_between_envelope_and_reply() {
-        let tmp = TempDir::new().unwrap();
-        let signing_key = WritSigningKey::from_openssh_pem(SIGNING_PEM).unwrap();
-        let (writ_repo, mut completed, _envelope) = writ_repo_with_envelope(&tmp, &signing_key);
-        let bailiff = bailiff_repo(&tmp);
-        let allowed = AllowedSigners::from_openssh_lines(SIGNING_PUB).unwrap();
-
-        completed.signature = crate::core::SshSignature::try_new(
-            "-----BEGIN SSH SIGNATURE-----\nU1NIU0lH-other-bytes\n-----END SSH SIGNATURE-----",
-        )
-        .unwrap();
-
-        let err = write_implement_note(
-            &bailiff,
-            writ_repo.path(),
-            &writ_notes_ref(),
-            PlanId::new(),
-            "p".into(),
-            &completed,
-            &allowed,
-        )
-        .unwrap_err();
-        assert!(
-            matches!(
-                err,
-                WriteImplementNoteError::FetchVerify(FetchVerifyError::EnvelopeSignatureMismatch)
-            ),
-            "expected EnvelopeSignatureMismatch, got: {err:?}",
-        );
-    }
-
-    /// If bailiff's keyring doesn't contain writ's signing key, the
-    /// envelope verification step fails with `UnknownSigner`, which
-    /// surfaces as `WriteImplementNoteError::FetchVerify(FetchVerifyError::Verify(..))`. Operator-
-    /// misconfigured-trust case.
-    #[test]
-    fn write_implement_note_rejects_envelope_when_signer_not_trusted() {
-        let tmp = TempDir::new().unwrap();
-        let signing_key = WritSigningKey::from_openssh_pem(SIGNING_PEM).unwrap();
-        let (writ_repo, completed, _envelope) = writ_repo_with_envelope(&tmp, &signing_key);
-        let bailiff = bailiff_repo(&tmp);
-
-        let other = WritVerifyingKey::from_openssh(OTHER_PUB.trim()).unwrap();
-        let allowed = AllowedSigners::from_keys([other]);
-
-        let err = write_implement_note(
-            &bailiff,
-            writ_repo.path(),
-            &writ_notes_ref(),
-            PlanId::new(),
-            "p".into(),
-            &completed,
-            &allowed,
-        )
-        .unwrap_err();
-        match err {
-            WriteImplementNoteError::FetchVerify(FetchVerifyError::Verify(
-                VerifyError::UnknownSigner { .. },
-            )) => {}
-            other => panic!("expected Verify(UnknownSigner), got: {other:?}"),
-        }
-    }
-
-    /// A bad writ-repo path surfaces as `Fetch`, distinct from the
-    /// later `ReadEnvelope` variant. Operators see "your writ repo
-    /// path is wrong" instead of "no such note."
-    #[test]
-    fn write_implement_note_reports_fetch_failure_for_missing_writ_repo() {
-        let tmp = TempDir::new().unwrap();
-        let signing_key = WritSigningKey::from_openssh_pem(SIGNING_PEM).unwrap();
-        let (_writ_repo, completed, _envelope) = writ_repo_with_envelope(&tmp, &signing_key);
-        let bailiff = bailiff_repo(&tmp);
-        let allowed = AllowedSigners::from_openssh_lines(SIGNING_PUB).unwrap();
-
-        let bogus = tmp.path().join("does-not-exist");
-        let err = write_implement_note(
-            &bailiff,
-            &bogus,
-            &writ_notes_ref(),
-            PlanId::new(),
-            "p".into(),
-            &completed,
-            &allowed,
-        )
-        .unwrap_err();
-        assert!(
-            matches!(
-                err,
-                WriteImplementNoteError::FetchVerify(FetchVerifyError::Fetch(_))
-            ),
-            "expected Fetch error, got: {err:?}",
-        );
-    }
-
-    /// Implement can be written even when no submission, decision, or
-    /// review note exists yet. Slice E chose not to gate the write
-    /// helper on any of those preconditions (mirrors D1.3 and D2.2's
-    /// decoupling); the acceptance gate lives in slice E4's
-    /// `submit_implement` workflow. Pin that choice so a future change
-    /// that adds a precondition has to update this test.
-    #[test]
-    fn write_implement_note_does_not_require_pre_existing_submission() {
-        let tmp = TempDir::new().unwrap();
-        let signing_key = WritSigningKey::from_openssh_pem(SIGNING_PEM).unwrap();
-        let (writ_repo, completed, _envelope) = writ_repo_with_envelope(&tmp, &signing_key);
-        let bailiff = bailiff_repo(&tmp);
-        let allowed = AllowedSigners::from_openssh_lines(SIGNING_PUB).unwrap();
-
-        let plan_id = PlanId::new();
-        let returned_oid = write_implement_note(
-            &bailiff,
-            writ_repo.path(),
-            &writ_notes_ref(),
-            plan_id,
-            "plan-implement".into(),
-            &completed,
-            &allowed,
-        )
-        .expect("implement write must succeed without a prior submission note");
-        let body = bailiff
-            .read_note(&plan_notes_ref(plan_id), &returned_oid)
-            .unwrap();
-        let note = ImplementNote::from_canonical_bytes(&body).unwrap();
-        assert_eq!(note.plan_id, plan_id);
-    }
-}
-
-#[cfg(test)]
-mod end_to_end_tests {
-    //! Full slice-C handshake against a real writ broker. Mirrors the
-    //! slice-B5 round-trip in `writ_client.rs` and tacks
-    //! `write_plan_note` on the end: bailiff sends `RunAgent`, writ
-    //! signs and persists the envelope, then bailiff drives
-    //! `write_plan_note` to fetch the envelope, verify it, and store
-    //! a `PlanNote` keyed on the plan id.
-    //!
-    //! A regression anywhere in the chain — protocol framing, signing
-    //! namespace, notes write, fetch refspec, envelope/reply
-    //! agreement, plan-note serialisation — fails this test rather
-    //! than getting caught by a downstream consumer.
-    use std::collections::{BTreeMap, HashMap};
-    use std::os::unix::fs::PermissionsExt;
-    use std::sync::{Arc, Mutex};
-    use std::time::Duration;
-
-    use tokio::sync::Mutex as AsyncMutex;
-    use wiremock::MockServer;
-
-    use super::*;
-    use crate::agent_run::AgentPrompt;
-    use crate::audit::AuditLog;
-    use crate::bailiff_plan_note::{ImplementNote, PlanId, PlanNote, ReviewNote, plan_notes_ref};
-    use crate::core::{AgentKind, CapabilitySet, NotesRef, RepoRef, TtlSeconds};
-    use crate::github::{GitHubAppConfig, GitHubAppRegistryConfig, GitHubMinter};
-    use crate::notes_repo::NotesRepo;
-    use crate::policy::PolicyConfig;
-    use crate::run_verify::AllowedSigners;
-    use crate::secret::{SecretError, SecretKey, SecretStore};
-    use crate::server::{
-        BrokerState, RunAgentSpawnConfig, prepare_broker_listener, serve_broker_with_agent_vm,
-    };
-    use crate::signing::WritSigningKey;
-    use crate::writ_client::{RunAgentRequest, WritClient};
-
-    const SIGNING_PEM: &str = include_str!("../tests/fixtures/ed25519_test_signing.key");
-    const SIGNING_PUB: &str = include_str!("../tests/fixtures/ed25519_test_signing.key.pub");
-    const TEST_PRIV: &str = include_str!("../tests/fixtures/rsa_test_1.pem");
-
-    /// In-memory `SecretStore`. Same minimal shim as the writ_client
-    /// end-to-end test uses — production runs against
-    /// `FileSecretStore`, but for a test that only stores the
-    /// GitHub-app PEM to satisfy `BrokerState`'s non-empty registry
-    /// invariant, an in-memory map is enough.
-    #[derive(Default)]
-    struct InMemStore(Mutex<HashMap<String, String>>);
-
-    impl SecretStore for InMemStore {
-        fn get(&self, key: &SecretKey) -> Result<Option<String>, SecretError> {
-            Ok(self.0.lock().unwrap().get(key.as_str()).cloned())
-        }
-        fn put(&self, key: &SecretKey, value: &str) -> Result<(), SecretError> {
-            self.0
-                .lock()
-                .unwrap()
-                .insert(key.as_str().to_string(), value.to_string());
-            Ok(())
-        }
-        fn delete(&self, key: &SecretKey) -> Result<(), SecretError> {
-            self.0.lock().unwrap().remove(key.as_str());
-            Ok(())
-        }
-    }
-
-    fn find_in_path(name: &str) -> Option<std::path::PathBuf> {
-        std::env::var_os("PATH").and_then(|paths| {
-            std::env::split_paths(&paths)
-                .map(|p| p.join(name))
-                .find(|p| p.is_file())
-        })
-    }
-
-    #[tokio::test]
-    async fn write_plan_note_completes_after_real_broker_round_trip() {
-        // --- Broker bring-up (writ side) ----------------------------
-        let tmp = tempfile::tempdir().unwrap();
-        let writ_repo = NotesRepo::init_or_open(tmp.path().join("writ-bare")).unwrap();
-        let bailiff_repo_handle = NotesRepo::init_or_open(tmp.path().join("bailiff-bare")).unwrap();
-        let signing_key = WritSigningKey::from_openssh_pem(SIGNING_PEM).unwrap();
-        let cat = find_in_path("cat").expect("cat must be on PATH for the round-trip test");
-
-        let github_server = MockServer::start().await;
-        let pk = SecretKey::new("gh-app-pk").unwrap();
-        let store = InMemStore::default();
-        store.put(&pk, TEST_PRIV).unwrap();
-        let mut apps = BTreeMap::new();
-        apps.insert(
-            AgentKind::Claude,
-            GitHubAppConfig {
-                app_id: 42,
-                installation_id: 999,
-                installation_owner: "o".into(),
-                private_key_secret: pk,
-                api_base: github_server.uri(),
-            },
-        );
-        let minter = GitHubMinter::new_registry(GitHubAppRegistryConfig::new(apps).unwrap());
-
-        let state = Arc::new(BrokerState {
-            audit: Arc::new(AuditLog::open_in_memory().unwrap()),
-            minter,
-            secrets: store,
-            policy: PolicyConfig {
-                writable_repos: vec![],
-                default_ttl: TtlSeconds::new(3600).unwrap(),
-            },
-            staging_store: None,
-            notes_repo: Some(Arc::new(writ_repo)),
-            signing_key: Some(signing_key.clone()),
-            run_agent_spawn: Some(RunAgentSpawnConfig {
-                command: cat,
-                args: Vec::new(),
-            }),
-            promote_runtime: None,
-        });
-
-        let socket_dir = tempfile::tempdir().unwrap();
-        std::fs::set_permissions(socket_dir.path(), std::fs::Permissions::from_mode(0o700))
-            .unwrap();
-        let socket_path = socket_dir.path().join("writ.sock");
-        let listener = prepare_broker_listener(&socket_path).await.unwrap();
-        let broker_state = Arc::clone(&state);
-        let broker_task = tokio::spawn(async move {
-            let _ = serve_broker_with_agent_vm(listener, broker_state, None).await;
-        });
-
-        // --- Client request (bailiff side) --------------------------
-        let prompt_text = "noop\n";
-        let writ_notes_ref = NotesRef::try_new("refs/notes/writ/v1/agent-outputs").unwrap();
-        let purpose = "plan-submit".to_string();
-        let client = WritClient::new(&socket_path);
-        let completed = tokio::time::timeout(
-            Duration::from_secs(15),
-            client.run_agent(RunAgentRequest {
-                prompt: AgentPrompt::new(prompt_text),
-                capabilities: vec![CapabilitySet::WorkspaceRead {
-                    repo: RepoRef {
-                        owner: "smaug123".into(),
-                        name: "writ".into(),
-                    },
-                }],
-                purpose: purpose.clone(),
-                output_ref: writ_notes_ref.clone(),
-                session_id: None,
-                workspace: None,
-                agent_kind: None,
-                agent_model: None,
-            }),
-        )
-        .await
-        .expect("RunAgent must complete within 15s")
-        .expect("RunAgent must succeed");
-
-        // --- Plan-note write (bailiff side) -------------------------
-        // `write_plan_note` is blocking (shells out to git); wrap it
-        // in `spawn_blocking` so we don't stall the runtime. A short
-        // async lock on the bailiff repo keeps the single-writer
-        // invariant visible at the call site.
-        let writ_repo_path = state.notes_repo.as_ref().unwrap().path().to_path_buf();
-        let allowed = AllowedSigners::from_openssh_lines(SIGNING_PUB).unwrap();
-        let plan_id = PlanId::new();
-        let completed_clone = completed.clone();
-        let writ_notes_ref_clone = writ_notes_ref.clone();
-        let bailiff = Arc::new(AsyncMutex::new(bailiff_repo_handle));
-        let bailiff_for_block = Arc::clone(&bailiff);
-        let returned_oid = tokio::task::spawn_blocking(move || {
-            let bailiff = bailiff_for_block.blocking_lock();
-            write_plan_note(
-                &bailiff,
-                &writ_repo_path,
-                &writ_notes_ref_clone,
-                plan_id,
-                purpose.clone(),
-                &completed_clone,
-                &allowed,
-            )
-        })
-        .await
-        .unwrap()
-        .expect("write_plan_note must succeed under the trusted-signer keyring");
-
-        // --- Read back the plan note from bailiff's repo ------------
-        let bailiff_for_read = Arc::clone(&bailiff);
-        let plan_ref = plan_notes_ref(plan_id);
-        let body = tokio::task::spawn_blocking(move || {
-            let bailiff = bailiff_for_read.blocking_lock();
-            bailiff.read_note(&plan_ref, &returned_oid)
-        })
-        .await
-        .unwrap()
-        .expect("bailiff-side plan note must be readable at the returned OID");
-        let note = PlanNote::from_canonical_bytes(&body)
-            .expect("bailiff-side body must decode as PlanNote");
-
-        // The note carries the plan-id bailiff allocated, the purpose
-        // bailiff sent on the wire, the writ-side OID writ returned,
-        // and the signed metadata + signature the broker produced.
-        assert_eq!(note.plan_id, plan_id);
-        assert_eq!(note.purpose, "plan-submit");
-        assert_eq!(note.writ_output_oid, completed.output_oid);
-        assert_eq!(note.signed_metadata, completed.signed_metadata);
-        assert_eq!(note.signature, completed.signature);
-
-        broker_task.abort();
-        let _ = broker_task.await;
-    }
-
-    /// Full slice-D2 handshake against a real writ broker: bailiff
-    /// sends `RunAgent` for a reviewer run, writ signs and persists
-    /// the envelope, then bailiff drives `write_review_note` to fetch
-    /// the envelope, verify it, and store a `ReviewNote` keyed on the
-    /// plan id. Parallel to
-    /// [`write_plan_note_completes_after_real_broker_round_trip`];
-    /// the only material differences are the helper under test, the
-    /// purpose string, and the read-back type.
-    #[tokio::test]
-    async fn write_review_note_completes_after_real_broker_round_trip() {
-        // --- Broker bring-up (writ side) ----------------------------
-        let tmp = tempfile::tempdir().unwrap();
-        let writ_repo = NotesRepo::init_or_open(tmp.path().join("writ-bare")).unwrap();
-        let bailiff_repo_handle = NotesRepo::init_or_open(tmp.path().join("bailiff-bare")).unwrap();
-        let signing_key = WritSigningKey::from_openssh_pem(SIGNING_PEM).unwrap();
-        let cat = find_in_path("cat").expect("cat must be on PATH for the round-trip test");
-
-        let github_server = MockServer::start().await;
-        let pk = SecretKey::new("gh-app-pk").unwrap();
-        let store = InMemStore::default();
-        store.put(&pk, TEST_PRIV).unwrap();
-        let mut apps = BTreeMap::new();
-        apps.insert(
-            AgentKind::Claude,
-            GitHubAppConfig {
-                app_id: 42,
-                installation_id: 999,
-                installation_owner: "o".into(),
-                private_key_secret: pk,
-                api_base: github_server.uri(),
-            },
-        );
-        let minter = GitHubMinter::new_registry(GitHubAppRegistryConfig::new(apps).unwrap());
-
-        let state = Arc::new(BrokerState {
-            audit: Arc::new(AuditLog::open_in_memory().unwrap()),
-            minter,
-            secrets: store,
-            policy: PolicyConfig {
-                writable_repos: vec![],
-                default_ttl: TtlSeconds::new(3600).unwrap(),
-            },
-            staging_store: None,
-            notes_repo: Some(Arc::new(writ_repo)),
-            signing_key: Some(signing_key.clone()),
-            run_agent_spawn: Some(RunAgentSpawnConfig {
-                command: cat,
-                args: Vec::new(),
-            }),
-            promote_runtime: None,
-        });
-
-        let socket_dir = tempfile::tempdir().unwrap();
-        std::fs::set_permissions(socket_dir.path(), std::fs::Permissions::from_mode(0o700))
-            .unwrap();
-        let socket_path = socket_dir.path().join("writ.sock");
-        let listener = prepare_broker_listener(&socket_path).await.unwrap();
-        let broker_state = Arc::clone(&state);
-        let broker_task = tokio::spawn(async move {
-            let _ = serve_broker_with_agent_vm(listener, broker_state, None).await;
-        });
-
-        // --- Client request (bailiff side) --------------------------
-        let prompt_text = "reviewer-prompt + plan body\n";
-        let writ_notes_ref = NotesRef::try_new("refs/notes/writ/v1/agent-outputs").unwrap();
-        let purpose = "plan-review".to_string();
-        let client = WritClient::new(&socket_path);
-        let completed = tokio::time::timeout(
-            Duration::from_secs(15),
-            client.run_agent(RunAgentRequest {
-                prompt: AgentPrompt::new(prompt_text),
-                capabilities: vec![CapabilitySet::WorkspaceRead {
-                    repo: RepoRef {
-                        owner: "smaug123".into(),
-                        name: "writ".into(),
-                    },
-                }],
-                purpose: purpose.clone(),
-                output_ref: writ_notes_ref.clone(),
-                session_id: None,
-                workspace: None,
-                agent_kind: None,
-                agent_model: None,
-            }),
-        )
-        .await
-        .expect("RunAgent must complete within 15s")
-        .expect("RunAgent must succeed");
-
-        // --- Review-note write (bailiff side) -----------------------
-        // `write_review_note` is blocking (shells out to git); wrap
-        // it in `spawn_blocking` so we don't stall the runtime. Same
-        // `AsyncMutex<NotesRepo>` shape the plan-note round-trip uses.
-        let writ_repo_path = state.notes_repo.as_ref().unwrap().path().to_path_buf();
-        let allowed = AllowedSigners::from_openssh_lines(SIGNING_PUB).unwrap();
-        let plan_id = PlanId::new();
-        let completed_clone = completed.clone();
-        let writ_notes_ref_clone = writ_notes_ref.clone();
-        let bailiff = Arc::new(AsyncMutex::new(bailiff_repo_handle));
-        let bailiff_for_block = Arc::clone(&bailiff);
-        let returned_oid = tokio::task::spawn_blocking(move || {
-            let bailiff = bailiff_for_block.blocking_lock();
-            write_review_note(
-                &bailiff,
-                &writ_repo_path,
-                &writ_notes_ref_clone,
-                plan_id,
-                purpose.clone(),
-                &completed_clone,
-                &allowed,
-            )
-        })
-        .await
-        .unwrap()
-        .expect("write_review_note must succeed under the trusted-signer keyring");
-
-        // --- Read back the review note from bailiff's repo ----------
-        let bailiff_for_read = Arc::clone(&bailiff);
-        let plan_ref = plan_notes_ref(plan_id);
-        let body = tokio::task::spawn_blocking(move || {
-            let bailiff = bailiff_for_read.blocking_lock();
-            bailiff.read_note(&plan_ref, &returned_oid)
-        })
-        .await
-        .unwrap()
-        .expect("bailiff-side review note must be readable at the returned OID");
-        let note = ReviewNote::from_canonical_bytes(&body)
-            .expect("bailiff-side body must decode as ReviewNote");
-
-        assert_eq!(note.plan_id, plan_id);
-        assert_eq!(note.purpose, "plan-review");
-        assert_eq!(note.writ_output_oid, completed.output_oid);
-        assert_eq!(note.signed_metadata, completed.signed_metadata);
-        assert_eq!(note.signature, completed.signature);
-
-        broker_task.abort();
-        let _ = broker_task.await;
-    }
-
-    /// Full slice-E handshake against a real writ broker: bailiff
-    /// sends `RunAgent` for an implementer run, writ signs and persists
-    /// the envelope, then bailiff drives `write_implement_note` to
-    /// fetch the envelope, verify it, and store an `ImplementNote`
-    /// keyed on the plan id. Parallel to
-    /// [`write_plan_note_completes_after_real_broker_round_trip`] and
-    /// [`write_review_note_completes_after_real_broker_round_trip`];
-    /// the only material differences are the helper under test, the
-    /// purpose string, and the read-back type.
-    #[tokio::test]
-    async fn write_implement_note_completes_after_real_broker_round_trip() {
-        // --- Broker bring-up (writ side) ----------------------------
-        let tmp = tempfile::tempdir().unwrap();
-        let writ_repo = NotesRepo::init_or_open(tmp.path().join("writ-bare")).unwrap();
-        let bailiff_repo_handle = NotesRepo::init_or_open(tmp.path().join("bailiff-bare")).unwrap();
-        let signing_key = WritSigningKey::from_openssh_pem(SIGNING_PEM).unwrap();
-        let cat = find_in_path("cat").expect("cat must be on PATH for the round-trip test");
-
-        let github_server = MockServer::start().await;
-        let pk = SecretKey::new("gh-app-pk").unwrap();
-        let store = InMemStore::default();
-        store.put(&pk, TEST_PRIV).unwrap();
-        let mut apps = BTreeMap::new();
-        apps.insert(
-            AgentKind::Claude,
-            GitHubAppConfig {
-                app_id: 42,
-                installation_id: 999,
-                installation_owner: "o".into(),
-                private_key_secret: pk,
-                api_base: github_server.uri(),
-            },
-        );
-        let minter = GitHubMinter::new_registry(GitHubAppRegistryConfig::new(apps).unwrap());
-
-        let state = Arc::new(BrokerState {
-            audit: Arc::new(AuditLog::open_in_memory().unwrap()),
-            minter,
-            secrets: store,
-            policy: PolicyConfig {
-                writable_repos: vec![],
-                default_ttl: TtlSeconds::new(3600).unwrap(),
-            },
-            staging_store: None,
-            notes_repo: Some(Arc::new(writ_repo)),
-            signing_key: Some(signing_key.clone()),
-            run_agent_spawn: Some(RunAgentSpawnConfig {
-                command: cat,
-                args: Vec::new(),
-            }),
-            promote_runtime: None,
-        });
-
-        let socket_dir = tempfile::tempdir().unwrap();
-        std::fs::set_permissions(socket_dir.path(), std::fs::Permissions::from_mode(0o700))
-            .unwrap();
-        let socket_path = socket_dir.path().join("writ.sock");
-        let listener = prepare_broker_listener(&socket_path).await.unwrap();
-        let broker_state = Arc::clone(&state);
-        let broker_task = tokio::spawn(async move {
-            let _ = serve_broker_with_agent_vm(listener, broker_state, None).await;
-        });
-
-        // --- Client request (bailiff side) --------------------------
-        let prompt_text = "implementer-prompt + plan body\n";
-        let writ_notes_ref = NotesRef::try_new("refs/notes/writ/v1/agent-outputs").unwrap();
-        let purpose = "plan-implement".to_string();
-        let client = WritClient::new(&socket_path);
-        let completed = tokio::time::timeout(
-            Duration::from_secs(15),
-            client.run_agent(RunAgentRequest {
-                prompt: AgentPrompt::new(prompt_text),
-                capabilities: vec![CapabilitySet::WorkspaceRead {
-                    repo: RepoRef {
-                        owner: "smaug123".into(),
-                        name: "writ".into(),
-                    },
-                }],
-                purpose: purpose.clone(),
-                output_ref: writ_notes_ref.clone(),
-                session_id: None,
-                workspace: None,
-                agent_kind: None,
-                agent_model: None,
-            }),
-        )
-        .await
-        .expect("RunAgent must complete within 15s")
-        .expect("RunAgent must succeed");
-
-        // --- Implement-note write (bailiff side) --------------------
-        // `write_implement_note` is blocking (shells out to git); wrap
-        // it in `spawn_blocking` so we don't stall the runtime. Same
-        // `AsyncMutex<NotesRepo>` shape the plan-note and review-note
-        // round-trips use.
-        let writ_repo_path = state.notes_repo.as_ref().unwrap().path().to_path_buf();
-        let allowed = AllowedSigners::from_openssh_lines(SIGNING_PUB).unwrap();
-        let plan_id = PlanId::new();
-        let completed_clone = completed.clone();
-        let writ_notes_ref_clone = writ_notes_ref.clone();
-        let bailiff = Arc::new(AsyncMutex::new(bailiff_repo_handle));
-        let bailiff_for_block = Arc::clone(&bailiff);
-        let returned_oid = tokio::task::spawn_blocking(move || {
-            let bailiff = bailiff_for_block.blocking_lock();
-            write_implement_note(
-                &bailiff,
-                &writ_repo_path,
-                &writ_notes_ref_clone,
-                plan_id,
-                purpose.clone(),
-                &completed_clone,
-                &allowed,
-            )
-        })
-        .await
-        .unwrap()
-        .expect("write_implement_note must succeed under the trusted-signer keyring");
-
-        // --- Read back the implement note from bailiff's repo -------
-        let bailiff_for_read = Arc::clone(&bailiff);
-        let plan_ref = plan_notes_ref(plan_id);
-        let body = tokio::task::spawn_blocking(move || {
-            let bailiff = bailiff_for_read.blocking_lock();
-            bailiff.read_note(&plan_ref, &returned_oid)
-        })
-        .await
-        .unwrap()
-        .expect("bailiff-side implement note must be readable at the returned OID");
-        let note = ImplementNote::from_canonical_bytes(&body)
-            .expect("bailiff-side body must decode as ImplementNote");
-
-        assert_eq!(note.plan_id, plan_id);
-        assert_eq!(note.purpose, "plan-implement");
-        assert_eq!(note.writ_output_oid, completed.output_oid);
-        assert_eq!(note.signed_metadata, completed.signed_metadata);
-        assert_eq!(note.signature, completed.signature);
-
-        broker_task.abort();
-        let _ = broker_task.await;
     }
 }
