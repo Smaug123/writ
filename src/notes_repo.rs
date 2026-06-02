@@ -58,10 +58,11 @@
 
 use std::collections::HashMap;
 use std::ffi::OsString;
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::time::Duration;
 
 use crate::clean_git::CLEAN_GIT_CONFIG_ENV;
 use crate::core::{NotesRef, NotesRefError};
@@ -647,6 +648,61 @@ fn prepare_git_command(repo: &Path, env: &InheritedEnv) -> Command {
     command
 }
 
+/// Number of `git` spawn attempts (initial + retries) before giving up
+/// on a transient resource refusal.
+const GIT_SPAWN_MAX_ATTEMPTS: u32 = 4;
+
+/// True if a failed `Command::spawn()` is a *transient* resource
+/// refusal that a retry can clear. The fork/`posix_spawn` was rejected,
+/// so the child never ran — re-running is correct (nothing
+/// half-happened), which is what makes the retry in [`spawn_with_retry`]
+/// safe rather than hopeful.
+///
+/// `EAGAIN` is the one observed under parallel-test fork pressure: the
+/// per-user process table (`RLIMIT_NPROC`) momentarily fills when many
+/// git children spawn at once. `ENOMEM` / `EMFILE` / `ENFILE` are the
+/// same all-or-nothing class (out of memory / fd-table full). Permanent
+/// failures — `ENOENT` (git not on `PATH`), `EACCES`, an error with no
+/// OS errno — are deliberately excluded: those must fail fast.
+fn spawn_is_retryable(err: &io::Error) -> bool {
+    matches!(
+        err.raw_os_error(),
+        Some(libc::EAGAIN) | Some(libc::ENOMEM) | Some(libc::EMFILE) | Some(libc::ENFILE)
+    )
+}
+
+/// Run `attempt` up to `max_attempts` times, retrying only when it fails
+/// with a transient spawn refusal (see [`spawn_is_retryable`]). A short
+/// linear backoff between tries gives the contended resource (process
+/// table, fd table) a moment to drain. Any non-transient error, or the
+/// final attempt's error, is returned unchanged.
+///
+/// Generic over the attempt's result so the retry/backoff control flow
+/// is unit-testable with a synthetic spawner, without exhausting the
+/// real process table.
+fn spawn_with_retry<T, F>(max_attempts: u32, mut attempt: F) -> io::Result<T>
+where
+    F: FnMut() -> io::Result<T>,
+{
+    let mut n: u32 = 1;
+    loop {
+        match attempt() {
+            Ok(value) => return Ok(value),
+            Err(err) if n < max_attempts && spawn_is_retryable(&err) => {
+                tracing::warn!(
+                    attempt = n,
+                    max_attempts,
+                    errno = err.raw_os_error(),
+                    "git spawn refused with a transient resource error; retrying after backoff"
+                );
+                std::thread::sleep(Duration::from_millis(u64::from(n)));
+                n += 1;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
 fn run_git<'a, I>(
     repo: &Path,
     args: I,
@@ -702,8 +758,10 @@ where
     });
     command.stderr(Stdio::piped());
 
-    let mut child = command
-        .spawn()
+    // Retry transient spawn refusals (EAGAIN under fork pressure, &c.).
+    // A refused spawn ran nothing, so this is safe; a child that starts
+    // and exits non-zero is handled separately below and never retried.
+    let mut child = spawn_with_retry(GIT_SPAWN_MAX_ATTEMPTS, || command.spawn())
         .map_err(|source| NotesRepoError::GitSpawn { source })?;
 
     if let Some(bytes) = stdin_input {
@@ -965,6 +1023,67 @@ mod tests {
 
     fn notes_ref() -> NotesRef {
         NotesRef::try_new("refs/notes/writ/v1/agent-outputs").unwrap()
+    }
+
+    #[test]
+    fn spawn_is_retryable_only_for_transient_resource_errors() {
+        // EAGAIN is the failure confirmed under parallel-test fork
+        // pressure (RLIMIT_NPROC); ENOMEM / EMFILE / ENFILE are the same
+        // all-or-nothing "spawn refused" class.
+        for errno in [libc::EAGAIN, libc::ENOMEM, libc::EMFILE, libc::ENFILE] {
+            assert!(
+                spawn_is_retryable(&io::Error::from_raw_os_error(errno)),
+                "errno {errno} should be retryable",
+            );
+        }
+        // Permanent failures must fail fast, not spin on a retry.
+        for errno in [libc::ENOENT, libc::EACCES] {
+            assert!(
+                !spawn_is_retryable(&io::Error::from_raw_os_error(errno)),
+                "errno {errno} must not be retryable",
+            );
+        }
+        // An error with no OS errno (e.g. a synthetic kind) is permanent.
+        assert!(!spawn_is_retryable(&io::Error::from(
+            io::ErrorKind::NotFound
+        )));
+    }
+
+    #[test]
+    fn spawn_with_retry_succeeds_after_transient_failures() {
+        let mut attempts = 0u32;
+        let got = spawn_with_retry(4, || {
+            attempts += 1;
+            if attempts < 3 {
+                Err(io::Error::from_raw_os_error(libc::EAGAIN))
+            } else {
+                Ok("spawned")
+            }
+        });
+        assert_eq!(got.unwrap(), "spawned");
+        assert_eq!(attempts, 3, "should retry twice, then succeed on the third");
+    }
+
+    #[test]
+    fn spawn_with_retry_gives_up_after_max_attempts_on_persistent_transient() {
+        let mut attempts = 0u32;
+        let got: io::Result<()> = spawn_with_retry(4, || {
+            attempts += 1;
+            Err(io::Error::from_raw_os_error(libc::EAGAIN))
+        });
+        assert_eq!(attempts, 4, "exactly max_attempts attempts, then give up");
+        assert_eq!(got.unwrap_err().raw_os_error(), Some(libc::EAGAIN));
+    }
+
+    #[test]
+    fn spawn_with_retry_does_not_retry_permanent_errors() {
+        let mut attempts = 0u32;
+        let got: io::Result<()> = spawn_with_retry(4, || {
+            attempts += 1;
+            Err(io::Error::from_raw_os_error(libc::ENOENT))
+        });
+        assert!(got.is_err());
+        assert_eq!(attempts, 1, "a permanent error must not be retried");
     }
 
     #[test]
