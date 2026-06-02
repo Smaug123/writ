@@ -1,0 +1,136 @@
+//! Configuration for the VM-facing Nix binary-cache proxy: the validated,
+//! normalised upstream URL, the metadata/NAR byte bounds, the trusted signing
+//! keys, and the optional local flake-input archive served local-first.
+
+use std::path::{Path, PathBuf};
+
+use crate::nix_cache::NixTrustedPublicKeys;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VmHttpNixCacheConfig {
+    upstream_base_url: reqwest::Url,
+    max_metadata_bytes: u64,
+    max_nar_bytes: u64,
+    trusted_public_keys: NixTrustedPublicKeys,
+    /// The broker's local flake-input archive (`nix flake archive --to
+    /// file://…`), served *local-first*: a hash present here is served from
+    /// disk (admitting its content-addressed narinfo unsigned), a miss falls
+    /// through to the upstream proxy. `None` (the default) leaves behaviour
+    /// identical to a pure upstream proxy.
+    local_cache_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, thiserror::Error, Eq, PartialEq)]
+pub enum VmHttpNixCacheConfigError {
+    #[error("Nix cache upstream URL must not be empty")]
+    EmptyUpstreamUrl,
+    #[error("Nix cache upstream URL {raw:?} is invalid: {message}")]
+    InvalidUpstreamUrl { raw: String, message: String },
+    #[error("Nix cache upstream URL {raw:?} uses unsupported scheme {scheme:?}")]
+    UnsupportedUpstreamScheme { raw: String, scheme: String },
+    #[error("Nix cache upstream URL must not contain embedded credentials: {0:?}")]
+    UpstreamUrlHasCredentials(String),
+    #[error("Nix cache upstream URL must not contain a query or fragment: {0:?}")]
+    UpstreamUrlHasQueryOrFragment(String),
+    #[error("Nix cache max metadata bytes must be greater than zero")]
+    EmptyMaxMetadataBytes,
+    #[error("Nix cache max NAR bytes must be greater than zero")]
+    EmptyMaxNarBytes,
+}
+
+impl VmHttpNixCacheConfig {
+    pub fn new(
+        upstream_base_url: impl AsRef<str>,
+        max_metadata_bytes: u64,
+        max_nar_bytes: u64,
+    ) -> Result<Self, VmHttpNixCacheConfigError> {
+        Self::new_with_trusted_public_keys(
+            upstream_base_url,
+            max_metadata_bytes,
+            max_nar_bytes,
+            NixTrustedPublicKeys::empty(),
+        )
+    }
+
+    pub fn new_with_trusted_public_keys(
+        upstream_base_url: impl AsRef<str>,
+        max_metadata_bytes: u64,
+        max_nar_bytes: u64,
+        trusted_public_keys: NixTrustedPublicKeys,
+    ) -> Result<Self, VmHttpNixCacheConfigError> {
+        let raw = upstream_base_url.as_ref();
+        if raw.is_empty() {
+            return Err(VmHttpNixCacheConfigError::EmptyUpstreamUrl);
+        }
+        if max_metadata_bytes == 0 {
+            return Err(VmHttpNixCacheConfigError::EmptyMaxMetadataBytes);
+        }
+        if max_nar_bytes == 0 {
+            return Err(VmHttpNixCacheConfigError::EmptyMaxNarBytes);
+        }
+        let mut url = reqwest::Url::parse(raw).map_err(|err| {
+            VmHttpNixCacheConfigError::InvalidUpstreamUrl {
+                raw: raw.to_string(),
+                message: err.to_string(),
+            }
+        })?;
+        if !matches!(url.scheme(), "http" | "https") {
+            return Err(VmHttpNixCacheConfigError::UnsupportedUpstreamScheme {
+                raw: raw.to_string(),
+                scheme: url.scheme().to_string(),
+            });
+        }
+        if !url.username().is_empty() || url.password().is_some() {
+            return Err(VmHttpNixCacheConfigError::UpstreamUrlHasCredentials(
+                raw.to_string(),
+            ));
+        }
+        if url.query().is_some() || url.fragment().is_some() {
+            return Err(VmHttpNixCacheConfigError::UpstreamUrlHasQueryOrFragment(
+                raw.to_string(),
+            ));
+        }
+        if !url.path().ends_with('/') {
+            let path = format!("{}/", url.path());
+            url.set_path(&path);
+        }
+        Ok(Self {
+            upstream_base_url: url,
+            max_metadata_bytes,
+            max_nar_bytes,
+            trusted_public_keys,
+            local_cache_dir: None,
+        })
+    }
+
+    /// Serve the broker's local flake-input archive at `dir` local-first (see
+    /// [`VmHttpNixCacheConfig::local_cache_dir`]). `None` disables it. The
+    /// directory need not exist yet — an absent file is treated as a local
+    /// miss, so behaviour is identical to upstream-only until provisioning
+    /// populates it.
+    #[must_use]
+    pub fn with_local_cache_dir(mut self, dir: Option<PathBuf>) -> Self {
+        self.local_cache_dir = dir;
+        self
+    }
+
+    pub fn upstream_base_url(&self) -> &reqwest::Url {
+        &self.upstream_base_url
+    }
+
+    pub fn local_cache_dir(&self) -> Option<&Path> {
+        self.local_cache_dir.as_deref()
+    }
+
+    pub fn max_metadata_bytes(&self) -> u64 {
+        self.max_metadata_bytes
+    }
+
+    pub fn max_nar_bytes(&self) -> u64 {
+        self.max_nar_bytes
+    }
+
+    pub fn trusted_public_keys(&self) -> &NixTrustedPublicKeys {
+        &self.trusted_public_keys
+    }
+}
