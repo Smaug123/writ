@@ -1,0 +1,329 @@
+//! Shared fixtures for the `agent_vm_daemon` test modules: the in-memory
+//! secret store and broker state, the fake `container`/`pf-helper` tools
+//! the lifecycle drives, and the daemon-config constructors.
+//!
+//! Hoisted here so the per-concern `*_tests` modules and the inline `spec`
+//! reuse one set of constructors. `super::*` re-exports the production
+//! items and the parent's private `crate::*` imports; the explicit `use`s
+//! below cover the test-only constructors these helpers call.
+use super::*;
+use std::collections::BTreeMap;
+use std::fs;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex as StdMutex;
+
+use crate::audit::AuditLog;
+use crate::core::{
+    BrokerPort, BrokerPortRange, BrokerPorts, Ipv4Cidr, Ipv6Cidr, RepoRef, TtlSeconds,
+};
+use crate::github::{GitHubAppConfig, GitHubAppRegistryConfig, GitHubMinter};
+use crate::nix_cache::NixTrustedPublicKeys;
+use crate::policy::PolicyConfig;
+use crate::secret::{SecretError, SecretKey};
+use crate::vm_git::VmGitPushBodyLimits;
+use crate::vm_git_bundle::{GitCredentialBoundary, GitSecretEnvVar};
+use crate::vm_http::{VmHttpGitCloneConfig, VmHttpNixCacheConfig};
+
+pub(super) const TEST_NIX_CACHE_PUBLIC_KEY: &str =
+    "cache.example-1:IsGkyTbr2sed7tWowgiPcI0ZHhBAHoGQ7TyYRweyzwE=";
+pub(super) const SECOND_TEST_NIX_CACHE_PUBLIC_KEY: &str =
+    "cache.example-2:KinekIvGUnCJ2dP5u+7MmV9svoga1i9pbI98OXh+zZg=";
+
+#[derive(Default)]
+pub(super) struct InMemStore(StdMutex<std::collections::HashMap<String, String>>);
+
+impl SecretStore for InMemStore {
+    fn get(&self, key: &SecretKey) -> Result<Option<String>, SecretError> {
+        Ok(self.0.lock().unwrap().get(key.as_str()).cloned())
+    }
+
+    fn put(&self, key: &SecretKey, value: &str) -> Result<(), SecretError> {
+        self.0
+            .lock()
+            .unwrap()
+            .insert(key.as_str().to_string(), value.to_string());
+        Ok(())
+    }
+
+    fn delete(&self, key: &SecretKey) -> Result<(), SecretError> {
+        self.0.lock().unwrap().remove(key.as_str());
+        Ok(())
+    }
+}
+
+pub(super) fn make_state() -> Arc<BrokerState<InMemStore>> {
+    make_state_with_audit(AuditLog::open_in_memory().unwrap())
+}
+
+pub(super) fn make_state_with_audit(audit: AuditLog) -> Arc<BrokerState<InMemStore>> {
+    let key = SecretKey::new("gh-app-pk").unwrap();
+    let mut apps = BTreeMap::new();
+    apps.insert(
+        AgentKind::Claude,
+        GitHubAppConfig {
+            app_id: 42,
+            installation_id: 999,
+            installation_owner: "o".into(),
+            private_key_secret: key,
+            api_base: "http://127.0.0.1".into(),
+        },
+    );
+    Arc::new(BrokerState {
+        audit: Arc::new(audit),
+        minter: GitHubMinter::new_registry(GitHubAppRegistryConfig::new(apps).unwrap()),
+        secrets: InMemStore::default(),
+        policy: PolicyConfig {
+            writable_repos: Vec::<RepoRef>::new(),
+            default_ttl: TtlSeconds::new(3600).unwrap(),
+        },
+        staging_store: None,
+        notes_repo: None,
+        signing_key: None,
+        run_agent_spawn: None,
+        promote_runtime: None,
+    })
+}
+
+pub(super) fn shell_quote(path: &Path) -> String {
+    format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
+}
+
+pub(super) fn write_fake_tool(
+    dir: &Path,
+    args_log: &Path,
+    env_path_log: &Path,
+    env_log: &Path,
+) -> PathBuf {
+    let path = dir.join("fake-tool");
+    let script = format!(
+        "#!/bin/sh\n\
+             printf '%s\\n' \"$*\" >> {args_log}\n\
+             if [ \"$1\" = \"network\" ] && [ \"$2\" = \"inspect\" ]; then\n\
+             printf '%s\\n' 'ipv4Subnet: 192.168.252.0/24' 'ipv4Gateway: 192.168.252.1'\n\
+             fi\n\
+             if [ \"$1\" = \"run\" ]; then\n\
+             while [ \"$#\" -gt 0 ]; do\n\
+             if [ \"$1\" = \"--env-file\" ]; then\n\
+             printf '%s\\n' \"$2\" > {env_path_log}\n\
+             cat \"$2\" > {env_log}\n\
+             fi\n\
+             shift\n\
+             done\n\
+             fi\n\
+             exit 0\n",
+        args_log = shell_quote(args_log),
+        env_path_log = shell_quote(env_path_log),
+        env_log = shell_quote(env_log),
+    );
+    fs::write(&path, script).unwrap();
+    let mut permissions = fs::metadata(&path).unwrap().permissions();
+    permissions.set_mode(0o700);
+    fs::set_permissions(&path, permissions).unwrap();
+    path
+}
+
+pub(super) fn write_fake_network_create_failure_tool(dir: &Path, args_log: &Path) -> PathBuf {
+    let path = dir.join("fake-failing-tool");
+    let script = format!(
+        "#!/bin/sh\n\
+             printf '%s\\n' \"$*\" >> {args_log}\n\
+             if [ \"$1\" = \"network\" ] && [ \"$2\" = \"create\" ]; then\n\
+             exit 42\n\
+             fi\n\
+             exit 0\n",
+        args_log = shell_quote(args_log),
+    );
+    fs::write(&path, script).unwrap();
+    let mut permissions = fs::metadata(&path).unwrap().permissions();
+    permissions.set_mode(0o700);
+    fs::set_permissions(&path, permissions).unwrap();
+    path
+}
+
+/// Fail only when invoked as the `pf-helper remove ...` step of a stop plan.
+///
+/// All non-pf-helper invocations (`container list/rm/stop/delete`,
+/// `container network ...`) take `rm`/`stop`/`delete`/`list` as `$2`, so
+/// matching on `$2 = "remove"` isolates the firewall-removal failure from
+/// the VM and network teardown probes.
+pub(super) fn write_fake_pf_remove_failure_tool(dir: &Path, args_log: &Path) -> PathBuf {
+    let path = dir.join("fake-pf-remove-failure-tool");
+    let script = format!(
+        "#!/bin/sh\n\
+             printf '%s\\n' \"$*\" >> {args_log}\n\
+             if [ \"$2\" = \"remove\" ]; then\n\
+             exit 7\n\
+             fi\n\
+             exit 0\n",
+        args_log = shell_quote(args_log),
+    );
+    fs::write(&path, script).unwrap();
+    let mut permissions = fs::metadata(&path).unwrap().permissions();
+    permissions.set_mode(0o700);
+    fs::set_permissions(&path, permissions).unwrap();
+    path
+}
+
+pub(super) fn write_fake_workspace_failure_tool(
+    dir: &Path,
+    args_log: &Path,
+    env_path_log: &Path,
+    env_log: &Path,
+) -> PathBuf {
+    let path = dir.join("fake-workspace-failure-tool");
+    let script = format!(
+        "#!/bin/sh\n\
+             printf '%s\\n' \"$*\" >> {args_log}\n\
+             if [ \"$1\" = \"network\" ] && [ \"$2\" = \"inspect\" ]; then\n\
+             printf '%s\\n' 'ipv4Subnet: 192.168.252.0/24' 'ipv4Gateway: 192.168.252.1'\n\
+             fi\n\
+             if [ \"$1\" = \"run\" ]; then\n\
+             while [ \"$#\" -gt 0 ]; do\n\
+             if [ \"$1\" = \"--env-file\" ]; then\n\
+             printf '%s\\n' \"$2\" > {env_path_log}\n\
+             cat \"$2\" > {env_log}\n\
+             fi\n\
+             shift\n\
+             done\n\
+             fi\n\
+             if [ \"$1\" = \"exec\" ]; then\n\
+             case \"${{5:-}}\" in\n\
+             *bootstrap-failed*) printf 'failed\\nsimulated workspace failure\\n' ;;\n\
+             esac\n\
+             fi\n\
+             exit 0\n",
+        args_log = shell_quote(args_log),
+        env_path_log = shell_quote(env_path_log),
+        env_log = shell_quote(env_log),
+    );
+    fs::write(&path, script).unwrap();
+    let mut permissions = fs::metadata(&path).unwrap().permissions();
+    permissions.set_mode(0o700);
+    fs::set_permissions(&path, permissions).unwrap();
+    path
+}
+
+pub(super) fn write_fake_workspace_success_tool(
+    dir: &Path,
+    args_log: &Path,
+    env_path_log: &Path,
+    env_log: &Path,
+) -> PathBuf {
+    let path = dir.join("fake-workspace-success-tool");
+    let script = format!(
+        "#!/bin/sh\n\
+             printf '%s\\n' \"$*\" >> {args_log}\n\
+             if [ \"$1\" = \"network\" ] && [ \"$2\" = \"inspect\" ]; then\n\
+             printf '%s\\n' 'ipv4Subnet: 192.168.252.0/24' 'ipv4Gateway: 192.168.252.1'\n\
+             fi\n\
+             if [ \"$1\" = \"run\" ]; then\n\
+             while [ \"$#\" -gt 0 ]; do\n\
+             if [ \"$1\" = \"--env-file\" ]; then\n\
+             printf '%s\\n' \"$2\" > {env_path_log}\n\
+             cat \"$2\" > {env_log}\n\
+             fi\n\
+             shift\n\
+             done\n\
+             fi\n\
+             if [ \"$1\" = \"exec\" ]; then\n\
+             case \"${{5:-}}\" in\n\
+             *bootstrap-failed*) printf 'ok' ;;\n\
+             esac\n\
+             fi\n\
+             exit 0\n",
+        args_log = shell_quote(args_log),
+        env_path_log = shell_quote(env_path_log),
+        env_log = shell_quote(env_log),
+    );
+    fs::write(&path, script).unwrap();
+    let mut permissions = fs::metadata(&path).unwrap().permissions();
+    permissions.set_mode(0o700);
+    fs::set_permissions(&path, permissions).unwrap();
+    path
+}
+
+pub(super) fn agent_vm_pool() -> AgentNetworkPool {
+    AgentNetworkPool::new(
+        Ipv4Cidr::new("192.168.0.0".parse().unwrap(), 16).unwrap(),
+        Ipv6Cidr::new("fd83:b6f2:e57::".parse().unwrap(), 48).unwrap(),
+    )
+    .unwrap()
+}
+
+pub(super) fn daemon_config(
+    dir: &Path,
+    fake_tool: &Path,
+) -> (AgentVmDaemonRuntimeConfig, AgentVmSessionStateStore) {
+    daemon_config_with_subnet_range(dir, fake_tool, 252, 253)
+}
+
+pub(super) fn daemon_config_with_subnet_range(
+    dir: &Path,
+    fake_tool: &Path,
+    subnet_index_min: u16,
+    subnet_index_max: u16,
+) -> (AgentVmDaemonRuntimeConfig, AgentVmSessionStateStore) {
+    let state_store = AgentVmSessionStateStore::new(dir.join("state"));
+    let lifecycle = AgentVmLifecycleRuntimeConfig::new(
+        agent_vm_pool(),
+        subnet_index_min,
+        subnet_index_max,
+        state_store.clone(),
+        Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6,
+        ContainerImage::new("alpine:latest").unwrap(),
+        AgentVmResources::new(1, 512).unwrap(),
+        AgentVmToolPaths::new(fake_tool, fake_tool, fake_tool),
+    )
+    .unwrap();
+    let credential =
+        GitCredentialBoundary::new(fake_tool, GitSecretEnvVar::new("WRIT_GIT_TOKEN").unwrap())
+            .unwrap();
+    let git_clone = VmHttpGitCloneConfig::new(
+        fake_tool,
+        credential,
+        dir.join("git-work"),
+        std::time::Duration::from_secs(1),
+        1024 * 1024,
+    )
+    .unwrap();
+    (
+        AgentVmDaemonRuntimeConfig::new(
+            lifecycle,
+            VmHttpRuntimeConfig::new(
+                "0.0.0.0".parse().unwrap(),
+                BrokerPortRange::new(1024, 65535).unwrap(),
+                git_clone,
+                VmHttpNixCacheConfig::new_with_trusted_public_keys(
+                    "http://127.0.0.1:9",
+                    1024 * 1024,
+                    1024 * 1024,
+                    NixTrustedPublicKeys::from_strings([TEST_NIX_CACHE_PUBLIC_KEY]).unwrap(),
+                )
+                .unwrap(),
+                dir.join("agent-runs"),
+                dir.join("git-push-staging"),
+                VmGitPushBodyLimits::new(65 * 1024 * 1024, 16 * 1024, 64 * 1024 * 1024).unwrap(),
+            ),
+        )
+        .unwrap(),
+        state_store,
+    )
+}
+
+pub(super) fn occupy_subnet(store: &AgentVmSessionStateStore, index: u16) {
+    let plan = AgentVmSessionPlan::new(
+        SessionId::from_uuid(uuid::Uuid::from_u128(0x1000 + u128::from(index))),
+        agent_vm_pool(),
+        index,
+        BrokerPorts::new([BrokerPort::new(51375).unwrap()]).unwrap(),
+        BrokerPortRange::new(1024, 65535).unwrap(),
+        Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6,
+        ContainerImage::new("alpine:latest").unwrap(),
+        vec!["sleep".into(), "600".into()],
+        AgentVmResources::new(1, 512).unwrap(),
+        AgentVmToolPaths::new("container", "writ-agent-vm-pf-helper", "sudo"),
+    )
+    .unwrap();
+    store.create_starting(&plan).unwrap();
+}
