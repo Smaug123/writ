@@ -18,7 +18,7 @@ fn guest_nix_setup_script_writes_configured_trusted_public_keys() {
 
     let status = Command::new("sh")
         .arg("-c")
-        .arg(AGENT_VM_GUEST_NIX_SETUP_SCRIPT)
+        .arg(nix_setup_script())
         .arg("writ-agent-vm-nix-setup")
         .arg("true")
         .env("WRIT_BROKER_TOKEN", "writ-vm-token")
@@ -45,9 +45,9 @@ fn guest_nix_setup_script_writes_configured_trusted_public_keys() {
 
 #[test]
 fn non_workspace_nix_setup_does_not_enable_flakes() {
-    assert!(AGENT_VM_GUEST_NIX_SETUP_SCRIPT.contains("experimental-features = nix-command"));
-    assert!(!AGENT_VM_GUEST_NIX_SETUP_SCRIPT.contains("nix-command flakes"));
-    assert!(AGENT_VM_GUEST_WORKSPACE_BOOTSTRAP_SCRIPT.contains("nix-command flakes"));
+    assert!(nix_setup_script().contains("experimental-features = nix-command"));
+    assert!(!nix_setup_script().contains("nix-command flakes"));
+    assert!(workspace_bootstrap_script().contains("nix-command flakes"));
 }
 
 #[test]
@@ -101,16 +101,10 @@ fn agent_run_devshell_command_wraps_without_adding_prompt() {
 
 #[test]
 fn workspace_bootstrap_script_mentions_sentinel_paths() {
-    assert!(
-        AGENT_VM_GUEST_WORKSPACE_BOOTSTRAP_SCRIPT.contains(AGENT_VM_WORKSPACE_BROKER_READY_PATH)
-    );
-    assert!(
-        AGENT_VM_GUEST_WORKSPACE_BOOTSTRAP_SCRIPT.contains(AGENT_VM_WORKSPACE_BOOTSTRAP_OK_PATH)
-    );
-    assert!(
-        AGENT_VM_GUEST_WORKSPACE_BOOTSTRAP_SCRIPT
-            .contains(AGENT_VM_WORKSPACE_BOOTSTRAP_FAILED_PATH)
-    );
+    let script = workspace_bootstrap_script();
+    assert!(script.contains(AGENT_VM_WORKSPACE_BROKER_READY_PATH));
+    assert!(script.contains(AGENT_VM_WORKSPACE_BOOTSTRAP_OK_PATH));
+    assert!(script.contains(AGENT_VM_WORKSPACE_BOOTSTRAP_FAILED_PATH));
 }
 #[cfg(unix)]
 #[test]
@@ -131,4 +125,41 @@ fn workspace_bootstrap_rejects_non_utf8_destination() {
         err,
         AgentVmDaemonError::NonUtf8WorkspaceDestination(_)
     ));
+}
+
+/// Both guest scripts are assembled from one shared nix prologue. Assert
+/// the security-critical lines — the broker-token guard, the netrc
+/// credential write, and the nix.conf trusted-keys / substituter block —
+/// appear identically in both, and that the only divergences are the
+/// documented three (flakes, the runtime dir, the positional parse). This
+/// guards the dedup'd prologue against a future edit silently desyncing
+/// the two scripts.
+#[test]
+fn both_guest_scripts_share_the_nix_prologue() {
+    let nix = nix_setup_script();
+    let workspace = workspace_bootstrap_script();
+
+    for shared in [
+        r#": "${WRIT_BROKER_TOKEN:?}""#,
+        r#"  "$cache_host" "$WRIT_NIX_BASIC_LOGIN" "$WRIT_BROKER_TOKEN" > "$WRIT_NIX_NETRC""#,
+        r#"printf 'trusted-public-keys = %s\n' "$WRIT_NIX_TRUSTED_PUBLIC_KEYS""#,
+        r#"} > "$NIX_CONF_DIR/nix.conf""#,
+    ] {
+        assert!(
+            nix.contains(shared),
+            "nix script missing shared fragment: {shared}"
+        );
+        assert!(
+            workspace.contains(shared),
+            "workspace script missing shared fragment: {shared}"
+        );
+    }
+
+    // The three documented divergences, and only those.
+    assert!(workspace.contains("nix-command flakes"));
+    assert!(!nix.contains("nix-command flakes"));
+    assert!(workspace.contains(r#"mkdir -p "$netrc_dir" "$NIX_CONF_DIR" /run/writ-agent-vm"#));
+    assert!(!nix.contains("/run/writ-agent-vm"));
+    assert!(workspace.contains(r#"repo="$1""#));
+    assert!(!nix.contains(r#"repo="$1""#));
 }

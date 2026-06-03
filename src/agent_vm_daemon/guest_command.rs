@@ -18,7 +18,16 @@ use crate::vm_git::{
 
 use super::AgentVmDaemonError;
 
-pub(super) const AGENT_VM_GUEST_NIX_SETUP_SCRIPT: &str = r#"set -eu
+// The two guest setup scripts share a nix.conf / netrc prologue that is
+// byte-identical save for three points: the workspace script parses
+// positional repo/destination/warm arguments up front, creates the
+// `/run/writ-agent-vm` runtime dir, and enables `flakes`. The prologue is
+// held once as the fragments below and assembled per script, so the
+// security-critical netrc write and substituter/trusted-keys block live
+// in a single place.
+
+/// Env-var guards plus the trailing blank line, shared by both scripts.
+const GUEST_NIX_PROLOGUE_HEAD: &str = r#"set -eu
 : "${WRIT_BROKER_TOKEN:?}"
 : "${WRIT_NIX_CACHE_URL:?}"
 : "${WRIT_NIX_BASIC_LOGIN:?}"
@@ -26,7 +35,11 @@ pub(super) const AGENT_VM_GUEST_NIX_SETUP_SCRIPT: &str = r#"set -eu
 : "${WRIT_NIX_TRUSTED_PUBLIC_KEYS:=}"
 : "${NIX_CONF_DIR:?}"
 
-case "$WRIT_NIX_CACHE_URL" in
+"#;
+
+/// Cache-URL validation, host derivation, and netrc-dir resolution, up to
+/// (but not including) the `mkdir -p` line.
+const GUEST_NIX_PROLOGUE_MIDDLE: &str = r#"case "$WRIT_NIX_CACHE_URL" in
   http://*|https://*) ;;
   *) echo "WRIT_NIX_CACHE_URL must be http or https" >&2; exit 64 ;;
 esac
@@ -46,13 +59,19 @@ netrc_dir="${WRIT_NIX_NETRC%/*}"
 if [ "$netrc_dir" = "$WRIT_NIX_NETRC" ]; then
   netrc_dir=.
 fi
-mkdir -p "$netrc_dir" "$NIX_CONF_DIR"
-umask 077
+"#;
+
+/// `umask`, the netrc write, and the opening brace of the nix.conf block,
+/// up to (but not including) the `experimental-features` line.
+const GUEST_NIX_PROLOGUE_NETRC: &str = r#"umask 077
 printf 'machine %s login %s password %s\n' \
   "$cache_host" "$WRIT_NIX_BASIC_LOGIN" "$WRIT_BROKER_TOKEN" > "$WRIT_NIX_NETRC"
 {
-  printf 'experimental-features = nix-command\n'
-  printf 'netrc-file = %s\n' "$WRIT_NIX_NETRC"
+"#;
+
+/// The remainder of the nix.conf block, after the `experimental-features`
+/// line through the closing redirect.
+const GUEST_NIX_PROLOGUE_NIXCONF_REST: &str = r#"  printf 'netrc-file = %s\n' "$WRIT_NIX_NETRC"
   printf 'access-tokens =\n'
   printf 'substituters = %s\n' "$WRIT_NIX_CACHE_URL"
   if [ -n "$WRIT_NIX_TRUSTED_PUBLIC_KEYS" ]; then
@@ -61,59 +80,25 @@ printf 'machine %s login %s password %s\n' \
     printf 'trusted-public-keys =\n'
   fi
 } > "$NIX_CONF_DIR/nix.conf"
-
-exec "$@"
 "#;
 
-pub(super) const AGENT_VM_GUEST_WORKSPACE_BOOTSTRAP_SCRIPT: &str = r#"set -eu
-: "${WRIT_BROKER_TOKEN:?}"
-: "${WRIT_NIX_CACHE_URL:?}"
-: "${WRIT_NIX_BASIC_LOGIN:?}"
-: "${WRIT_NIX_NETRC:?}"
-: "${WRIT_NIX_TRUSTED_PUBLIC_KEYS:=}"
-: "${NIX_CONF_DIR:?}"
-
-repo="$1"
+/// Positional-argument parse the workspace script runs between the guards
+/// and the cache validation; the plain nix-setup script has none.
+const GUEST_WORKSPACE_POSITIONAL: &str = r#"repo="$1"
 destination="$2"
 warm="$3"
 shift 3
 
-case "$WRIT_NIX_CACHE_URL" in
-  http://*|https://*) ;;
-  *) echo "WRIT_NIX_CACHE_URL must be http or https" >&2; exit 64 ;;
-esac
+"#;
 
-cache_authority="${WRIT_NIX_CACHE_URL#http://}"
-if [ "$cache_authority" = "$WRIT_NIX_CACHE_URL" ]; then
-  cache_authority="${WRIT_NIX_CACHE_URL#https://}"
-fi
-cache_host="${cache_authority%%/*}"
-cache_host="${cache_host%%:*}"
-if [ -z "$cache_host" ]; then
-  echo "WRIT_NIX_CACHE_URL has no host" >&2
-  exit 64
-fi
+/// Tail of the plain nix-setup script: exec the wrapped guest command.
+const GUEST_NIX_SETUP_TAIL: &str = r#"
+exec "$@"
+"#;
 
-netrc_dir="${WRIT_NIX_NETRC%/*}"
-if [ "$netrc_dir" = "$WRIT_NIX_NETRC" ]; then
-  netrc_dir=.
-fi
-mkdir -p "$netrc_dir" "$NIX_CONF_DIR" /run/writ-agent-vm
-umask 077
-printf 'machine %s login %s password %s\n' \
-  "$cache_host" "$WRIT_NIX_BASIC_LOGIN" "$WRIT_BROKER_TOKEN" > "$WRIT_NIX_NETRC"
-{
-  printf 'experimental-features = nix-command flakes\n'
-  printf 'netrc-file = %s\n' "$WRIT_NIX_NETRC"
-  printf 'access-tokens =\n'
-  printf 'substituters = %s\n' "$WRIT_NIX_CACHE_URL"
-  if [ -n "$WRIT_NIX_TRUSTED_PUBLIC_KEYS" ]; then
-    printf 'trusted-public-keys = %s\n' "$WRIT_NIX_TRUSTED_PUBLIC_KEYS"
-  else
-    printf 'trusted-public-keys =\n'
-  fi
-} > "$NIX_CONF_DIR/nix.conf"
-
+/// Tail of the workspace script: wait for the broker, run the workspace
+/// init, then run the agent as a child so the container outlives it.
+const GUEST_WORKSPACE_BOOTSTRAP_TAIL: &str = r#"
 while [ ! -f /run/writ-agent-vm/broker-ready ]; do
   sleep 0.2
 done
@@ -161,6 +146,52 @@ printf '%s\n' "$agent_code" > /run/writ-agent-vm/agent.exit
 while :; do sleep 3600; done
 "#;
 
+/// Assemble a guest setup script from the shared nix prologue plus the
+/// per-script `positional` parse, `mkdir_line`, `features_line`, and
+/// `tail`. See [`nix_setup_script`] and [`workspace_bootstrap_script`].
+fn build_guest_nix_setup_script(
+    positional: &str,
+    mkdir_line: &str,
+    features_line: &str,
+    tail: &str,
+) -> String {
+    let mut script = String::with_capacity(2048);
+    script.push_str(GUEST_NIX_PROLOGUE_HEAD);
+    script.push_str(positional);
+    script.push_str(GUEST_NIX_PROLOGUE_MIDDLE);
+    script.push_str(mkdir_line);
+    script.push('\n');
+    script.push_str(GUEST_NIX_PROLOGUE_NETRC);
+    script.push_str(features_line);
+    script.push('\n');
+    script.push_str(GUEST_NIX_PROLOGUE_NIXCONF_REST);
+    script.push_str(tail);
+    script
+}
+
+/// The non-workspace guest setup script: configure the nix cache, then
+/// `exec` the wrapped guest command. Does not enable flakes.
+pub(super) fn nix_setup_script() -> String {
+    build_guest_nix_setup_script(
+        "",
+        r#"mkdir -p "$netrc_dir" "$NIX_CONF_DIR""#,
+        r#"  printf 'experimental-features = nix-command\n'"#,
+        GUEST_NIX_SETUP_TAIL,
+    )
+}
+
+/// The workspace guest setup script: the shared nix prologue (with flakes
+/// and the `/run/writ-agent-vm` runtime dir), the workspace init, then the
+/// agent run.
+pub(super) fn workspace_bootstrap_script() -> String {
+    build_guest_nix_setup_script(
+        GUEST_WORKSPACE_POSITIONAL,
+        r#"mkdir -p "$netrc_dir" "$NIX_CONF_DIR" /run/writ-agent-vm"#,
+        r#"  printf 'experimental-features = nix-command flakes\n'"#,
+        GUEST_WORKSPACE_BOOTSTRAP_TAIL,
+    )
+}
+
 pub(super) fn wrap_guest_command(
     workspace: Option<&AgentVmWorkspaceBootstrap>,
     guest_command: Vec<String>,
@@ -173,7 +204,7 @@ pub(super) fn wrap_guest_command(
 
 fn wrap_guest_command_with_nix_setup(guest_command: Vec<String>) -> Vec<String> {
     shell_wrapped_command(
-        AGENT_VM_GUEST_NIX_SETUP_SCRIPT,
+        &nix_setup_script(),
         "writ-agent-vm-nix-setup",
         std::iter::empty::<String>(),
         guest_command,
@@ -190,7 +221,7 @@ pub(super) fn wrap_guest_command_with_workspace_bootstrap(
         .map(str::to_owned)
         .ok_or_else(|| AgentVmDaemonError::NonUtf8WorkspaceDestination(destination.clone()))?;
     Ok(shell_wrapped_command(
-        AGENT_VM_GUEST_WORKSPACE_BOOTSTRAP_SCRIPT,
+        &workspace_bootstrap_script(),
         "writ-agent-vm-workspace-bootstrap",
         [
             workspace.repo.to_string(),
@@ -308,7 +339,7 @@ mod spec {
             prop_assert_eq!(&wrapped[..4], &[
                 "sh".to_string(),
                 "-c".to_string(),
-                AGENT_VM_GUEST_NIX_SETUP_SCRIPT.to_string(),
+                nix_setup_script(),
                 "writ-agent-vm-nix-setup".to_string(),
             ]);
             prop_assert_eq!(&wrapped[4..], guest_command.as_slice());
@@ -336,7 +367,7 @@ mod spec {
             prop_assert_eq!(&wrapped[..4], &[
                 "sh".to_string(),
                 "-c".to_string(),
-                AGENT_VM_GUEST_WORKSPACE_BOOTSTRAP_SCRIPT.to_string(),
+                workspace_bootstrap_script(),
                 "writ-agent-vm-workspace-bootstrap".to_string(),
             ]);
             prop_assert_eq!(&wrapped[4..7], &[
