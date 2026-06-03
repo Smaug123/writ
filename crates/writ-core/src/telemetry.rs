@@ -1,6 +1,6 @@
 //! Operator-facing structured logging.
 //!
-//! Installs a JSON [`tracing`] subscriber that writes line-delimited
+//! Installs a JSON `tracing` subscriber that writes line-delimited
 //! events to stderr. The audit log remains the system of record for
 //! grants and proxy outcomes; tracing covers the operational dimension
 //! where today the codebase has only ad-hoc `eprintln!`.
