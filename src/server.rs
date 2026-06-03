@@ -810,6 +810,49 @@ async fn approve_staged_push<S: SecretStore + Send + Sync + 'static>(
         Err(resp) => return resp,
     };
 
+    let agent_kind = match check_approvable_push(state, request_id).await {
+        Ok(agent_kind) => agent_kind,
+        Err(resp) => return resp,
+    };
+
+    let attempt_id = match start_approve_attempt_row(state, request_id, &operator).await {
+        Ok(attempt_id) => attempt_id,
+        Err(resp) => return resp,
+    };
+
+    let new_app_tip = match execute_started_attempt(
+        state,
+        attempt_id,
+        request_id,
+        &operator,
+        agent_kind,
+        entry,
+        &promote_runtime,
+        &signing_key,
+    )
+    .await
+    {
+        Ok(new_app_tip) => new_app_tip,
+        Err(resp) => return resp,
+    };
+
+    delete_staging_after_approve(&staging_store, request_id).await;
+
+    ServerMessage::StagedPushApproved {
+        request_id,
+        new_app_tip,
+    }
+}
+
+/// Read the joined audit view and confirm the push is approvable,
+/// returning the originating session's `agent_kind` (the GitHub App to
+/// mint against). Refuses — without starting an attempt — on a prior
+/// resolution, a missing `Staged` outcome row, or a branch-creation push
+/// (no `expected_remote_head`, which the walker's lease anchor requires).
+async fn check_approvable_push<S: SecretStore + Send + Sync + 'static>(
+    state: &Arc<BrokerState<S>>,
+    request_id: RequestId,
+) -> Result<Option<crate::core::AgentKind>, ServerMessage> {
     // Joined audit view: the source of truth for the prior-resolution
     // short-circuit (so a duplicate approve never starts an attempt or
     // wastes a mint), the outcome-row precondition, and the session-id
@@ -821,46 +864,46 @@ async fn approve_staged_push<S: SecretStore + Send + Sync + 'static>(
     let audit_entry = match audit_lookup {
         Ok(Ok(Some(entry))) => entry,
         Ok(Ok(None)) => {
-            return ServerMessage::Error {
+            return Err(ServerMessage::Error {
                 message: format!(
                     "staged push {request_id} has a staging directory but no audit row; \
                      broker audit log and staging store have drifted apart"
                 ),
-            };
+            });
         }
         Ok(Err(err)) => {
-            return ServerMessage::Error {
+            return Err(ServerMessage::Error {
                 message: format!("audit lookup failed: {err}"),
-            };
+            });
         }
         Err(err) => {
-            return ServerMessage::Error {
+            return Err(ServerMessage::Error {
                 message: format!("audit lookup task failed: {err}"),
-            };
+            });
         }
     };
 
     if audit_entry.resolution.is_some() {
-        return ServerMessage::StagedPushAlreadyResolved { request_id };
+        return Err(ServerMessage::StagedPushAlreadyResolved { request_id });
     }
 
     if audit_entry.result != Some(GitPushOutcomeResult::Staged) {
-        return ServerMessage::Error {
+        return Err(ServerMessage::Error {
             message: format!(
                 "staged push {request_id} has no `staged` outcome row \
                  (audit result: {:?}); refusing to approve a push that is not staged",
                 audit_entry.result,
             ),
-        };
+        });
     }
 
     if audit_entry.expected_remote_head.is_none() {
-        return ServerMessage::Error {
+        return Err(ServerMessage::Error {
             message: format!(
                 "staged push {request_id} is a branch-creation push \
                  (no expected_remote_head); approve does not yet support branch creation"
             ),
-        };
+        });
     }
 
     let session_id = audit_entry.session_id;
@@ -871,71 +914,97 @@ async fn approve_staged_push<S: SecretStore + Send + Sync + 'static>(
     let session = match session_lookup {
         Ok(Ok(Some(s))) => s,
         Ok(Ok(None)) => {
-            return ServerMessage::Error {
+            return Err(ServerMessage::Error {
                 message: format!(
                     "staged push {request_id} references session {session_id} \
                      but that session is not in the audit log"
                 ),
-            };
+            });
         }
         Ok(Err(err)) => {
-            return ServerMessage::Error {
+            return Err(ServerMessage::Error {
                 message: format!("session lookup failed: {err}"),
-            };
+            });
         }
         Err(err) => {
-            return ServerMessage::Error {
+            return Err(ServerMessage::Error {
                 message: format!("session lookup task failed: {err}"),
-            };
+            });
         }
     };
 
-    // A `Started` row written here is durable. If writd crashes
-    // between this INSERT and the next `complete_attempt_*` call, the
-    // attempt row stays `Started` and blocks both a follow-up approve
-    // (the DAO refuses to start a second non-`pre_patch_failure`
-    // attempt) and a follow-up reject (the
-    // `git_push_resolution_refuses_active_approve` trigger treats
-    // `started` as in-flight). Boot reconcile is the load-bearing
-    // recovery story for that window — slice B1e.3d adds the daemon
-    // startup pass that drives every stale `Started` attempt (and the
-    // `Uncertain` ones whose mint is past `expires_at`) to
-    // `Resolved(PrePatchFailure)` so the staged push becomes
-    // reject-eligible again without manual DB repair.
+    Ok(session.agent_kind)
+}
+
+/// Insert the durable `Started` attempt row that gates concurrent
+/// approve/reject. A `Started` row written here survives a crash: the
+/// DAO refuses to start a second non-`pre_patch_failure` attempt and the
+/// `git_push_resolution_refuses_active_approve` trigger treats `started`
+/// as in-flight, so a wedged `Started` row is recovered by boot reconcile
+/// (which drives stale `Started` attempts — and `Uncertain` ones past
+/// their mint `expires_at` — to `Resolved(PrePatchFailure)`) rather than
+/// by manual DB repair.
+async fn start_approve_attempt_row<S: SecretStore + Send + Sync + 'static>(
+    state: &Arc<BrokerState<S>>,
+    request_id: RequestId,
+    operator: &str,
+) -> Result<ApproveAttemptId, ServerMessage> {
     let attempt_id = ApproveAttemptId::new();
     let started_at = UnixMillis::now();
     let start_result = {
         let audit = Arc::clone(&state.audit);
-        let operator = operator.clone();
+        let operator = operator.to_string();
         tokio::task::spawn_blocking(move || {
             audit.start_approve_attempt(attempt_id, request_id, &operator, started_at)
         })
         .await
     };
     match start_result {
-        Ok(Ok(())) => {}
+        Ok(Ok(())) => Ok(attempt_id),
         Ok(Err(err)) => {
             // `start_approve_attempt` refuses in three shapes: a prior
-            // resolution row exists (the early short-circuit above
-            // would normally catch this, but a race between two
-            // concurrent approves can land both past the
-            // `audit_entry.resolution.is_some()` check before either
-            // has inserted), a non-`pre_patch_failure` attempt is
-            // active for the same push, or the staged-outcome
-            // precondition has gone away under us. All are surfaced as
-            // a generic error: the operator (or a future reviewer)
-            // reads the audit row to disambiguate.
-            return ServerMessage::Error {
+            // resolution row exists (the short-circuit in
+            // `check_approvable_push` normally catches this, but a race
+            // between two concurrent approves can land both past that
+            // check before either has inserted), a non-`pre_patch_failure`
+            // attempt is active for the same push, or the staged-outcome
+            // precondition has gone away under us. All are surfaced as a
+            // generic error: the operator (or a future reviewer) reads the
+            // audit row to disambiguate.
+            Err(ServerMessage::Error {
                 message: format!("approve attempt could not be started: {err}"),
-            };
+            })
         }
-        Err(err) => {
-            return ServerMessage::Error {
-                message: format!("approve attempt start task failed: {err}"),
-            };
-        }
+        Err(err) => Err(ServerMessage::Error {
+            message: format!("approve attempt start task failed: {err}"),
+        }),
     }
+}
 
+/// Drive a freshly-`Started` attempt to a terminal state and return the
+/// new app tip on success. Mints a one-shot installation token, marks the
+/// attempt `Uncertain` (the commit point past which a concurrent reject is
+/// refused), runs the approve pipeline, and commits the joint
+/// success/resolution TX. Every failure path first resolves the attempt
+/// through the appropriate `resolve_*_failure` DAO (so the row never stays
+/// `Started`/`Uncertain` on a returned error) and then yields the wire
+/// `Error` for the caller to return; this is the one place the
+/// `attempt_id`/`mint_audit` threading lives.
+// `result_large_err`: `ServerMessage` is the wire reply type; this transient
+// local Result early-returns it unchanged, so boxing would only add indirection
+// at every construction site. `too_many_arguments`: the flat shape matches the
+// `run_approve` / run_agent precedent in this crate.
+#[allow(clippy::result_large_err, clippy::too_many_arguments)]
+async fn execute_started_attempt<S: SecretStore + Send + Sync + 'static>(
+    state: &Arc<BrokerState<S>>,
+    attempt_id: ApproveAttemptId,
+    request_id: RequestId,
+    operator: &str,
+    agent_kind: Option<crate::core::AgentKind>,
+    entry: StagedEntry,
+    promote_runtime: &PromoteRuntimeConfig,
+    signing_key: &WritSigningKey,
+) -> Result<crate::vm_git::GitObjectId, ServerMessage> {
     // Static promote scope: `contents:write` is what the Git Data REST
     // API needs to upload blobs/trees/commits and update the branch
     // ref; `metadata:read` is implicit but listed explicitly because
@@ -955,16 +1024,16 @@ async fn approve_staged_push<S: SecretStore + Send + Sync + 'static>(
 
     let mint_result = state
         .minter
-        .mint_for_agent(&state.secrets, session.agent_kind, github_scope, ttl)
+        .mint_for_agent(&state.secrets, agent_kind, github_scope, ttl)
         .await;
     let minted = match mint_result {
         Ok(m) => m,
         Err(err) => {
             let detail = format!("mint failed: {}", err.agent_message());
             resolve_pre_patch_failure(state, attempt_id, request_id, &detail, None).await;
-            return ServerMessage::Error {
+            return Err(ServerMessage::Error {
                 message: format!("approve-time mint failed: {}", err.agent_message()),
-            };
+            });
         }
     };
 
@@ -979,9 +1048,9 @@ async fn approve_staged_push<S: SecretStore + Send + Sync + 'static>(
             // "what mint was issued for this attempt."
             resolve_pre_patch_failure(state, attempt_id, request_id, &detail, Some(mint_audit))
                 .await;
-            return ServerMessage::Error {
+            return Err(ServerMessage::Error {
                 message: format!("approve-time mint produced an unusable token: {err}"),
-            };
+            });
         }
     };
 
@@ -1005,17 +1074,17 @@ async fn approve_staged_push<S: SecretStore + Send + Sync + 'static>(
             let detail = format!("mark_attempt_uncertain failed: {err}");
             resolve_pre_patch_failure(state, attempt_id, request_id, &detail, Some(mint_audit))
                 .await;
-            return ServerMessage::Error {
+            return Err(ServerMessage::Error {
                 message: format!("approve attempt could not enter Uncertain: {err}"),
-            };
+            });
         }
         Err(err) => {
             let detail = format!("mark_attempt_uncertain task failed: {err}");
             resolve_pre_patch_failure(state, attempt_id, request_id, &detail, Some(mint_audit))
                 .await;
-            return ServerMessage::Error {
+            return Err(ServerMessage::Error {
                 message: format!("approve attempt Uncertain task failed: {err}"),
-            };
+            });
         }
     }
 
@@ -1025,12 +1094,12 @@ async fn approve_staged_push<S: SecretStore + Send + Sync + 'static>(
     let expected_remote_head = receipt
         .expected_remote_head()
         .cloned()
-        .expect("expected_remote_head presence was checked above");
+        .expect("expected_remote_head presence was checked by check_approvable_push");
     let bundle_tip = receipt.new_head().clone();
     let (_, bundle_bytes) = entry.into_parts();
 
     let run_result = run_approve(
-        &promote_runtime,
+        promote_runtime,
         &api_base,
         &token,
         &repo,
@@ -1038,7 +1107,7 @@ async fn approve_staged_push<S: SecretStore + Send + Sync + 'static>(
         &expected_remote_head,
         &bundle_tip,
         &bundle_bytes,
-        &signing_key,
+        signing_key,
         // Trailers are an open follow-up: the design pins a per-approve
         // trailer set (operator id, original commit sha) but the policy
         // hasn't been ratified yet, so the slice ships with no trailers
@@ -1070,7 +1139,7 @@ async fn approve_staged_push<S: SecretStore + Send + Sync + 'static>(
             match &err {
                 RunApproveError::Execute(ExecuteError::UpdateRef(_)) => {
                     resolve_post_patch_failure(state, attempt_id, request_id, &detail).await;
-                    return ServerMessage::Error {
+                    return Err(ServerMessage::Error {
                         message: truncate_for_wire(
                             format!(
                                 "approve pipeline issued update_ref against GitHub but the \
@@ -1079,7 +1148,7 @@ async fn approve_staged_push<S: SecretStore + Send + Sync + 'static>(
                             ),
                             MAX_WIRE_ERROR_BYTES,
                         ),
-                    };
+                    });
                 }
                 _ => {
                     resolve_pre_patch_failure(state, attempt_id, request_id, &detail, None).await;
@@ -1087,9 +1156,9 @@ async fn approve_staged_push<S: SecretStore + Send + Sync + 'static>(
                         RunApproveError::Prepare(_) => format!("staging preparation failed: {err}"),
                         _ => format!("approve pipeline failed: {err}"),
                     };
-                    return ServerMessage::Error {
+                    return Err(ServerMessage::Error {
                         message: truncate_for_wire(message, MAX_WIRE_ERROR_BYTES),
-                    };
+                    });
                 }
             }
         }
@@ -1107,7 +1176,7 @@ async fn approve_staged_push<S: SecretStore + Send + Sync + 'static>(
     let success_result = {
         let audit = Arc::clone(&state.audit);
         let new_app_tip = new_app_tip.clone();
-        let operator = operator.clone();
+        let operator = operator.to_string();
         let reason = reason.clone();
         tokio::task::spawn_blocking(move || {
             audit.complete_attempt_succeeded(
@@ -1140,12 +1209,12 @@ async fn approve_staged_push<S: SecretStore + Send + Sync + 'static>(
             );
             let detail = format!("complete_attempt_succeeded failed: {err}");
             resolve_post_patch_failure(state, attempt_id, request_id, &detail).await;
-            return ServerMessage::Error {
+            return Err(ServerMessage::Error {
                 message: format!(
                     "branch was advanced on GitHub (new_app_tip = {new_app_tip}) but the audit \
                      resolution row could not be committed: {err}"
                 ),
-            };
+            });
         }
         Err(err) => {
             tracing::error!(
@@ -1160,17 +1229,25 @@ async fn approve_staged_push<S: SecretStore + Send + Sync + 'static>(
             );
             let detail = format!("complete_attempt_succeeded task failed: {err}");
             resolve_post_patch_failure(state, attempt_id, request_id, &detail).await;
-            return ServerMessage::Error {
+            return Err(ServerMessage::Error {
                 message: format!("approve resolution task failed: {err}"),
-            };
+            });
         }
     }
 
-    // Best-effort staging-dir delete after the joint TX. A stale dir
-    // surfaces in `promote list` and cannot cause a contradictory
-    // reject because the resolution row is already in place.
+    Ok(new_app_tip)
+}
+
+/// Best-effort staging-dir delete after the approve resolution row is
+/// committed. A stale dir surfaces in `promote list` for manual cleanup
+/// and cannot cause a contradictory reject because the resolution row is
+/// already in place, so failures are logged, not surfaced.
+async fn delete_staging_after_approve(
+    staging_store: &Arc<GitPushStagingStore>,
+    request_id: RequestId,
+) {
     let delete_result = {
-        let staging_store = Arc::clone(&staging_store);
+        let staging_store = Arc::clone(staging_store);
         tokio::task::spawn_blocking(move || staging_store.delete(request_id)).await
     };
     match delete_result {
@@ -1191,11 +1268,6 @@ async fn approve_staged_push<S: SecretStore + Send + Sync + 'static>(
                  leaving for boot-time reconciliation",
             );
         }
-    }
-
-    ServerMessage::StagedPushApproved {
-        request_id,
-        new_app_tip,
     }
 }
 
