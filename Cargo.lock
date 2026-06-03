@@ -2933,7 +2933,22 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "wiremock",
+ "writ-core",
  "xz2",
+]
+
+[[package]]
+name = "writ-core"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "time",
+ "tokio",
+ "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

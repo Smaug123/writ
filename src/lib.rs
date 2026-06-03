@@ -29,7 +29,7 @@ pub mod bailiff_plan_submit;
 pub mod bailiff_plan_write;
 #[cfg(feature = "host")]
 pub mod bailiff_repo_guard;
-pub(crate) mod bearer;
+pub(crate) use writ_core::bearer;
 #[cfg(feature = "host")]
 pub mod boot_reconcile;
 #[cfg(feature = "host")]
@@ -38,7 +38,7 @@ pub(crate) mod clean_git;
 pub mod cli;
 #[cfg(feature = "host")]
 pub mod config;
-pub mod core;
+pub use writ_core::core;
 #[cfg(feature = "host")]
 pub mod flake_lock;
 #[cfg(feature = "host")]
@@ -71,7 +71,7 @@ pub mod notes_repo;
 pub mod openai_chatgpt_auth;
 #[cfg(feature = "host")]
 pub mod policy;
-pub mod process_spawn;
+pub use writ_core::process_spawn;
 #[cfg(feature = "host")]
 pub(crate) mod process_supervisor;
 #[cfg(feature = "host")]
@@ -86,7 +86,7 @@ pub mod secret;
 pub mod server;
 #[cfg(feature = "host")]
 pub mod signing;
-pub mod telemetry;
+pub use writ_core::telemetry;
 #[cfg(feature = "host")]
 pub mod ui_http;
 #[cfg(feature = "vm-client")]
