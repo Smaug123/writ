@@ -25,7 +25,6 @@ use std::string::FromUtf8Error;
 
 use thiserror::Error;
 
-use crate::bailiff_decision::{Decider, Decision};
 use crate::bailiff_plan_note::{
     BAILIFF_PLAN_NOTES_REF_PREFIX, DecisionNote, DecisionNoteParseError, ImplementNote,
     ImplementNoteParseError, PlanId, PlanNote, PlanNoteParseError, ReviewNote,
@@ -33,12 +32,22 @@ use crate::bailiff_plan_note::{
     plan_notes_ref, plan_review_seed_blob_bytes, plan_submission_seed_blob_bytes,
 };
 use crate::bailiff_plan_write::WRIT_V1_NOTES_REFSPEC;
-use crate::core::{NotesRef, SshSignature, UnixMillis};
+use crate::core::NotesRef;
 use crate::notes_repo::{NotesRepo, NotesRepoError};
-use crate::protocol::SignedRunMetadata;
 use crate::run_envelope::{OutputEnvelope, SignedRunEnvelope};
 use crate::run_verify::{AllowedSigners, VerifyError, verify_run_envelope};
 use crate::vm_git::GitObjectId;
+
+// The read-projection types these helpers return now live in
+// `bailiff_plan_view` so presentation code can depend on the types
+// without depending on this reader. Re-exported here so the read
+// functions, their tests, and the `bailiff` binary keep resolving
+// them via `crate::bailiff_plan_read::…`.
+pub(crate) use crate::bailiff_plan_view::SignedBailiffNote;
+pub use crate::bailiff_plan_view::{
+    BailiffPlanSummary, DecisionSummary, PlanFullView, SubmissionSummary, VerifiedSection,
+    WorkflowState,
+};
 
 /// Bailiff's local copy of writ's per-run signed-output notes ref.
 /// `submit_plan` / `submit_review` / `submit_implement` fetch this
@@ -442,140 +451,6 @@ pub enum ListPlanIdsError {
     },
 }
 
-/// Aggregate per-plan view used by `bailiff plan list`. Each `Option`
-/// field is `None` when the corresponding note has not been attached
-/// to this plan's ref yet. The two-pass design (`list_plan_ids` then
-/// `summarize_plan` per id) is one repo-read for the ref set plus four
-/// reads per plan — symmetric with the existing read helpers and
-/// requires no schema beyond the seed-OID convention they already
-/// share.
-///
-/// Workflow state is derived from the field set via [`Self::state`];
-/// the formatter pins the rendering. Keeping state as a method rather
-/// than a stored field means a future caller (e.g. `bailiff plan
-/// show`) can recompute it without going through the formatter.
-///
-/// Submission absent (`submission.is_none()`) is a possible-but-rare
-/// state: the plan's ref exists (otherwise [`list_plan_ids`] wouldn't
-/// have reported the id), yet no submission has been recorded.
-/// Reachable only when a non-submission note was attached first (e.g.
-/// a decision written before the plan submission landed) or when a
-/// submission note was manually deleted after the fact. Surfaced as
-/// [`WorkflowState::Corrupt`] so an operator sees the anomaly rather
-/// than silently rendering an incomplete row.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct BailiffPlanSummary {
-    pub plan_id: PlanId,
-    pub submission: Option<SubmissionSummary>,
-    pub decision: Option<DecisionSummary>,
-    pub reviewed_at: Option<UnixMillis>,
-    pub implemented_at: Option<UnixMillis>,
-}
-
-/// Submission-side projection: `purpose` (the opaque tag bailiff sent
-/// to writ on `RunAgent`) and `submitted_at` (lifted from
-/// `PlanNote.signed_metadata.completed_at` so the timestamp matches
-/// what writ recorded for the planner run). Kept distinct from the
-/// other timestamp fields because it is the only one with an
-/// associated string, so collapsing it into a bare `Option<UnixMillis>`
-/// would lose information.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SubmissionSummary {
-    pub purpose: String,
-    pub submitted_at: UnixMillis,
-}
-
-/// Decision-side projection: outcome, decider, and timestamp. A
-/// projection of [`DecisionNote`] rather than the note itself so the
-/// summary type stays narrow — `summarize_plan` discards the
-/// `plan_id` field on the note (already on the summary).
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct DecisionSummary {
-    pub outcome: Decision,
-    pub decider: Decider,
-    pub decided_at: UnixMillis,
-}
-
-/// High-level workflow state derived from the presence and content of
-/// the four per-plan notes. The variant tree matches the workflow
-/// progression — `Submitted` → (`Accepted` | `Rejected`) → `Reviewed`
-/// → `Implemented` — except for `Corrupt`, which is the
-/// ref-exists-without-submission anomaly.
-///
-/// State is "the highest workflow step reached," with one caveat:
-/// `Rejected` is terminal in the sense that reviewer/implementer
-/// stages should not run on a rejected plan, but the repo doesn't
-/// enforce the workflow ordering — a manual write could attach a
-/// review note to a rejected plan. The derivation prefers to surface
-/// the latest stage present in the underlying data; that's why
-/// `Implemented` overrides everything else, and `Reviewed` overrides
-/// `Rejected` if both are present. The decision field stays visible
-/// on the summary so the operator sees the conflict directly.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum WorkflowState {
-    /// Plan ref exists but no submission note is attached. Indicates
-    /// either a workflow-ordering anomaly (non-submission note written
-    /// first) or manual repo repair.
-    Corrupt,
-    /// Submission attached; no decision, review, or implement yet.
-    Submitted,
-    /// Submission + `Decision::Accepted`; no review or implement yet.
-    Accepted,
-    /// Submission + `Decision::Rejected`; no review or implement yet.
-    Rejected,
-    /// Submission + review note attached; no implement note yet.
-    /// Decision may or may not be present — the derivation prefers
-    /// the latest stage in the data.
-    Reviewed,
-    /// Implement note attached. Highest stage; overrides all others.
-    Implemented,
-}
-
-impl WorkflowState {
-    /// Stable lowercase string for CLI output. Mirrors the convention
-    /// used by [`Decision::as_str`] so the rendered state column reads
-    /// naturally next to `decision_outcome=accepted`.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            WorkflowState::Corrupt => "corrupt",
-            WorkflowState::Submitted => "submitted",
-            WorkflowState::Accepted => "accepted",
-            WorkflowState::Rejected => "rejected",
-            WorkflowState::Reviewed => "reviewed",
-            WorkflowState::Implemented => "implemented",
-        }
-    }
-}
-
-impl std::fmt::Display for WorkflowState {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-impl BailiffPlanSummary {
-    /// Derived workflow state. See [`WorkflowState`] for the
-    /// progression rule.
-    pub fn state(&self) -> WorkflowState {
-        if self.submission.is_none() {
-            return WorkflowState::Corrupt;
-        }
-        if self.implemented_at.is_some() {
-            return WorkflowState::Implemented;
-        }
-        if self.reviewed_at.is_some() {
-            return WorkflowState::Reviewed;
-        }
-        match &self.decision {
-            Some(d) => match d.outcome {
-                Decision::Accepted => WorkflowState::Accepted,
-                Decision::Rejected => WorkflowState::Rejected,
-            },
-            None => WorkflowState::Submitted,
-        }
-    }
-}
-
 /// Read every per-plan note for `plan_id` and project them into a
 /// summary suitable for `bailiff plan list`. One pass over the four
 /// `read_*_note` helpers — four ref/seed lookups, no envelope reads.
@@ -673,157 +548,6 @@ pub enum ReadWritEnvelopeError {
     Read(#[source] NotesRepoError),
     #[error("decoding the writ output envelope body failed: {0}")]
     Decode(#[source] serde_json::Error),
-}
-
-/// Aggregate per-plan view used by `bailiff plan show` (slice F4).
-/// Returned by [`read_full_plan`] after composing the four
-/// `read_*_note` helpers and, for every available signed note,
-/// pairing it with the writ envelope referenced by its
-/// `writ_output_oid` and verifying the signature against
-/// [`AllowedSigners`].
-///
-/// All four note fields are `Option`: a workflow-conformant plan has
-/// every field set, but each can independently be absent. The plan
-/// note is `Option<VerifiedSection<PlanNote>>` rather than bare
-/// `VerifiedSection<PlanNote>` so the corrupt-state anomaly F2
-/// surfaces in [`WorkflowState::Corrupt`] (ref exists, submission
-/// note never attached) keeps being representable here. The decision
-/// is `Option<DecisionNote>` because decision notes are bailiff-owned
-/// and unsigned in this slice — no envelope to verify.
-#[derive(Debug)]
-pub struct PlanFullView {
-    pub plan_id: PlanId,
-    pub plan: Option<VerifiedSection<PlanNote>>,
-    pub decision: Option<DecisionNote>,
-    pub review: Option<VerifiedSection<ReviewNote>>,
-    pub implement: Option<VerifiedSection<ImplementNote>>,
-}
-
-/// Pairs a bailiff-side signed note with the outcome of verifying its
-/// referenced writ envelope. The five-way split mirrors what
-/// `bailiff plan show` (slice F4) must surface:
-///
-/// - [`VerifiedSection::Verified`]: envelope present, decoded,
-///   end-to-end verified by [`verify_run_envelope`], **and** the
-///   note's copied `(signed_metadata, signature)` pair matches the
-///   envelope's. Carries both the note and the envelope so the F4
-///   renderer can project from either without re-reading.
-/// - [`VerifiedSection::NoteEnvelopeMismatch`]: envelope verifies on
-///   its own, but the bailiff note's `signed_metadata` /
-///   `signature` copies don't match the envelope at the OID. A
-///   tampered or stale note paired with a legitimate envelope must
-///   never render as `Verified` — the bailiff note's stated
-///   metadata is what the operator sees, and it has to be exactly
-///   what writ signed.
-/// - [`VerifiedSection::WritEnvelopeMissing`]: bailiff's local copy
-///   of writ's notes ref has no annotation at the note's
-///   `writ_output_oid`. Either bailiff has not fetched writ's notes
-///   since the envelope was minted, or the envelope has been deleted
-///   from writ. Operator-recoverable by re-running the relevant
-///   `submit*` verb.
-/// - [`VerifiedSection::EnvelopeMalformed`]: an envelope body is
-///   present at the OID but does not decode as
-///   [`SignedRunEnvelope`]. Pure on-disk corruption — surfaces with
-///   the underlying [`serde_json::Error`] so the operator can locate
-///   the offending note blob.
-/// - [`VerifiedSection::SignatureFailure`]: envelope decoded but
-///   [`verify_run_envelope`] rejected it. The wrapped [`VerifyError`]
-///   names the specific check that failed (output-digest mismatch,
-///   signer not in allowed list, or signature invalid).
-///
-/// The reason to surface failure variants rather than fold them into
-/// a top-level `Result<T, _>` is that `show` wants to print every
-/// available section even when one fails to verify — collapsing a
-/// single failed section into an `Err` would suppress the rest of
-/// the plan history, exactly when an operator most needs to see it.
-#[derive(Debug)]
-pub enum VerifiedSection<T> {
-    Verified {
-        note: T,
-        envelope: SignedRunEnvelope,
-    },
-    NoteEnvelopeMismatch {
-        note: T,
-        envelope: SignedRunEnvelope,
-    },
-    WritEnvelopeMissing {
-        note: T,
-    },
-    EnvelopeMalformed {
-        note: T,
-        error: serde_json::Error,
-    },
-    SignatureFailure {
-        note: T,
-        error: VerifyError,
-    },
-}
-
-/// Projection shared by the three signed bailiff note types
-/// ([`PlanNote`], [`ReviewNote`], [`ImplementNote`]). Each carries the
-/// same `(purpose, writ_output_oid, signed_metadata, signature)`
-/// quadruple even though the surrounding fields (`plan_id`) differ;
-/// this trait lets [`read_full_plan`] dispatch the read-and-verify
-/// path uniformly without unifying the note structs themselves, and
-/// lets the F4 formatter render the three sections from a single
-/// shared body.
-///
-/// **Not** a polymorphism point: the only implementors are the three
-/// note types and the only consumers are [`read_full_plan`] and the
-/// F4 show-formatter. The trait is here as a static field-projection
-/// abstraction (rule of three), not as an extension surface;
-/// `pub(crate)` scopes it to the same library where both consumers
-/// live so it does not leak to downstream code.
-pub(crate) trait SignedBailiffNote {
-    fn purpose(&self) -> &str;
-    fn writ_output_oid(&self) -> &GitObjectId;
-    fn signed_metadata(&self) -> &SignedRunMetadata;
-    fn signature(&self) -> &SshSignature;
-}
-
-impl SignedBailiffNote for PlanNote {
-    fn purpose(&self) -> &str {
-        &self.purpose
-    }
-    fn writ_output_oid(&self) -> &GitObjectId {
-        &self.writ_output_oid
-    }
-    fn signed_metadata(&self) -> &SignedRunMetadata {
-        &self.signed_metadata
-    }
-    fn signature(&self) -> &SshSignature {
-        &self.signature
-    }
-}
-
-impl SignedBailiffNote for ReviewNote {
-    fn purpose(&self) -> &str {
-        &self.purpose
-    }
-    fn writ_output_oid(&self) -> &GitObjectId {
-        &self.writ_output_oid
-    }
-    fn signed_metadata(&self) -> &SignedRunMetadata {
-        &self.signed_metadata
-    }
-    fn signature(&self) -> &SshSignature {
-        &self.signature
-    }
-}
-
-impl SignedBailiffNote for ImplementNote {
-    fn purpose(&self) -> &str {
-        &self.purpose
-    }
-    fn writ_output_oid(&self) -> &GitObjectId {
-        &self.writ_output_oid
-    }
-    fn signed_metadata(&self) -> &SignedRunMetadata {
-        &self.signed_metadata
-    }
-    fn signature(&self) -> &SshSignature {
-        &self.signature
-    }
 }
 
 /// Outcome of pairing a writ output OID with an envelope and running
