@@ -185,9 +185,12 @@ async fn local_cache_info_is_served_synthetically_without_upstream() {
     let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
     open_audit_session(&state, session.session_id());
     let cache = tempfile::tempdir().unwrap();
-    // Local cache configured + a dead upstream: the mandatory cache-info
-    // pre-flight must still succeed so the guest reaches the local-first
-    // narinfo/NAR paths rather than rejecting the substituter.
+    // A *provisioned* local archive + a dead upstream: the mandatory cache-info
+    // pre-flight is served synthetically so the guest reaches the local-first
+    // narinfo/NAR paths rather than rejecting the substituter. (An empty archive
+    // instead proxies the upstream — see
+    // `cache_info_proxies_upstream_when_local_cache_empty`.)
+    write_local_ca_entry(cache.path(), "source", "input.nar.xz", b"local flake input nar");
     let service =
         nix_cache_service_with_local_cache(&state, DEAD_UPSTREAM, cache.path(), 4096, 4096);
 
@@ -207,6 +210,49 @@ async fn local_cache_info_is_served_synthetically_without_upstream() {
     assert_eq!(entries[0].upstream_status, None);
     assert_eq!(entries[0].upstream_url, None);
     assert_eq!(entries[0].error, None);
+}
+
+#[tokio::test]
+async fn cache_info_proxies_upstream_when_local_cache_empty() {
+    let upstream = MockServer::start().await;
+    let state = make_broker_state(&upstream);
+    let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+    open_audit_session(&state, session.session_id());
+    // A configured-but-empty local archive has nothing to serve, so cache-info
+    // is proxied (not synthesised): a still-unprovisioned broker stays
+    // byte-identical to upstream-only and the upstream sees the request.
+    let cache = tempfile::tempdir().unwrap();
+    let upstream_body = "StoreDir: /nix/store\nWantMassQuery: 1\nPriority: 30\n";
+    Mock::given(method("GET"))
+        .and(path("/nix-cache-info"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(upstream_body))
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    let service =
+        nix_cache_service_with_local_cache(&state, &upstream.uri(), cache.path(), 1024, 1024);
+
+    let response =
+        route_nix_cache_with_service(&session, "GET", VM_NIX_CACHE_INFO_PATH.into(), service).await;
+
+    assert_eq!(response.status, VmHttpStatus::Ok);
+    assert_eq!(String::from_utf8(response.body).unwrap(), upstream_body);
+    upstream.verify().await;
+    let entries = state
+        .audit
+        .list_nix_cache_requests_for_session(session.session_id())
+        .unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].route, NixCacheAuditRoute::CacheInfo);
+    assert_eq!(entries[0].upstream_status, Some(200));
+    assert!(
+        entries[0]
+            .upstream_url
+            .as_deref()
+            .is_some_and(|url| url.ends_with("/nix-cache-info")),
+        "an empty local cache must proxy + audit the upstream cache-info, got {:?}",
+        entries[0].upstream_url,
+    );
 }
 
 #[tokio::test]

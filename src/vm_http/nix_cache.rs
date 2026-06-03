@@ -321,13 +321,16 @@ impl<S: SecretStore> VmHttpNixCacheService<S> {
     async fn fetch_route(&self, method: &str, route: &VmNixCacheRoute) -> VmHttpNixCacheProxyFetch {
         match route {
             VmNixCacheRoute::CacheInfo => {
-                // Serve the cache metadata locally whenever a local archive is
-                // configured, so the guest's mandatory pre-flight
-                // `nix-cache-info` does not depend on upstream reachability — a
-                // no-egress guest can substitute the local archive even if the
-                // upstream cache is momentarily unavailable. Without a local
-                // archive this proxies the upstream exactly as before.
-                if self.config.local_cache_dir().is_some() {
+                // Serve the cache metadata locally only once the archive holds
+                // something to serve, so the guest's mandatory pre-flight
+                // `nix-cache-info` is decoupled from upstream reachability
+                // exactly when that buys resilience — a no-egress guest can
+                // substitute a provisioned local archive even if the upstream
+                // cache is momentarily unavailable. A configured-but-empty
+                // archive (nothing provisioned yet) has nothing to serve, so it
+                // proxies the upstream exactly as before and stays
+                // byte-identical to upstream-only.
+                if self.local_cache_has_narinfo().await {
                     local_cache_info(method)
                 } else {
                     self.fetch_metadata(method, route).await
@@ -653,6 +656,34 @@ impl<S: SecretStore> VmHttpNixCacheService<S> {
                 headers: Vec::new(),
             },
         }
+    }
+
+    /// Whether the local archive currently holds at least one narinfo to serve.
+    /// Gates the synthetic `nix-cache-info`: its upstream-independence only
+    /// earns its keep when there is local content to substitute, so an empty or
+    /// absent archive proxies the upstream and stays byte-identical to
+    /// upstream-only. `nix-cache-info` is requested once per substituter
+    /// pre-flight, so the directory scan (short-circuiting on the first
+    /// narinfo) is off the hot path.
+    async fn local_cache_has_narinfo(&self) -> bool {
+        let Some(dir) = self.config.local_cache_dir() else {
+            return false;
+        };
+        let mut entries = match tokio::fs::read_dir(dir).await {
+            Ok(entries) => entries,
+            // A missing or unreadable archive dir has nothing to serve: proxy.
+            Err(_) => return false,
+        };
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            if entry
+                .path()
+                .extension()
+                .is_some_and(|ext| ext == "narinfo")
+            {
+                return true;
+            }
+        }
+        false
     }
 
     /// Serve a narinfo from the broker's local flake-input archive, local-first.
