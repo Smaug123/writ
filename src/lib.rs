@@ -26,6 +26,8 @@ pub mod bailiff_plan_review;
 #[cfg(feature = "host")]
 pub mod bailiff_plan_submit;
 #[cfg(feature = "host")]
+pub mod bailiff_plan_view;
+#[cfg(feature = "host")]
 pub mod bailiff_plan_write;
 #[cfg(feature = "host")]
 pub mod bailiff_repo_guard;

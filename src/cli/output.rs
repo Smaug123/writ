@@ -10,7 +10,7 @@
 use std::io::Write;
 
 use crate::bailiff_plan_note::DecisionNote;
-use crate::bailiff_plan_read::{
+use crate::bailiff_plan_view::{
     BailiffPlanSummary, PlanFullView, SignedBailiffNote, VerifiedSection,
 };
 use crate::protocol::{AgentVmSessionInfo, SignedRunMetadata, StagedPushDetail, StagedPushSummary};
@@ -62,10 +62,10 @@ pub fn write_staged_push_detail(
 /// key=value block separated by blank lines. Per-plan keys:
 ///
 /// - `plan_id` — UUID.
-/// - `state` — derived [`crate::bailiff_plan_read::WorkflowState`].
+/// - `state` — derived [`crate::bailiff_plan_view::WorkflowState`].
 /// - `purpose` / `submitted_at` — submission projection (or `<none>`
 ///   when no submission has been recorded, the
-///   [`crate::bailiff_plan_read::WorkflowState::Corrupt`] case).
+///   [`crate::bailiff_plan_view::WorkflowState::Corrupt`] case).
 /// - `decision_outcome` / `decision_decider` / `decided_at` — decision
 ///   projection (or `<none>` when no decision has been recorded).
 /// - `reviewed_at` / `implemented_at` — timestamps from the matching
@@ -638,7 +638,7 @@ mod tests {
     fn bailiff_plan_list_renders_full_fidelity_implemented_row() {
         use crate::bailiff_decision::{Decider, Decision};
         use crate::bailiff_plan_note::PlanId;
-        use crate::bailiff_plan_read::{BailiffPlanSummary, DecisionSummary, SubmissionSummary};
+        use crate::bailiff_plan_view::{BailiffPlanSummary, DecisionSummary, SubmissionSummary};
 
         let plan_id = PlanId::from_uuid("01234567-89ab-4cde-8123-456789abcdef".parse().unwrap());
         let summary = BailiffPlanSummary {
@@ -680,7 +680,7 @@ mod tests {
     #[test]
     fn bailiff_plan_list_renders_none_markers_for_unset_fields() {
         use crate::bailiff_plan_note::PlanId;
-        use crate::bailiff_plan_read::{BailiffPlanSummary, SubmissionSummary};
+        use crate::bailiff_plan_view::{BailiffPlanSummary, SubmissionSummary};
 
         let plan_id = PlanId::from_uuid("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee".parse().unwrap());
         let summary = BailiffPlanSummary {
@@ -718,7 +718,7 @@ mod tests {
     #[test]
     fn bailiff_plan_list_separates_multiple_plans_with_blank_line() {
         use crate::bailiff_plan_note::PlanId;
-        use crate::bailiff_plan_read::{BailiffPlanSummary, SubmissionSummary};
+        use crate::bailiff_plan_view::{BailiffPlanSummary, SubmissionSummary};
 
         let p1 = BailiffPlanSummary {
             plan_id: PlanId::from_uuid("11111111-1111-4111-8111-111111111111".parse().unwrap()),
@@ -766,7 +766,7 @@ mod tests {
     fn bailiff_plan_list_quotes_purpose_and_decider_with_injection_characters() {
         use crate::bailiff_decision::{Decider, Decision};
         use crate::bailiff_plan_note::PlanId;
-        use crate::bailiff_plan_read::{BailiffPlanSummary, DecisionSummary, SubmissionSummary};
+        use crate::bailiff_plan_view::{BailiffPlanSummary, DecisionSummary, SubmissionSummary};
 
         let summary = BailiffPlanSummary {
             plan_id: PlanId::from_uuid("33333333-3333-4333-8333-333333333333".parse().unwrap()),
@@ -814,7 +814,7 @@ mod tests {
     #[test]
     fn bailiff_plan_list_escapes_backslash_quote_and_carriage_return() {
         use crate::bailiff_plan_note::PlanId;
-        use crate::bailiff_plan_read::{BailiffPlanSummary, SubmissionSummary};
+        use crate::bailiff_plan_view::{BailiffPlanSummary, SubmissionSummary};
 
         let summary = BailiffPlanSummary {
             plan_id: PlanId::from_uuid("44444444-4444-4444-8444-444444444444".parse().unwrap()),
@@ -844,7 +844,7 @@ mod tests {
     fn bailiff_plan_list_renders_corrupt_state_when_submission_missing() {
         use crate::bailiff_decision::{Decider, Decision};
         use crate::bailiff_plan_note::PlanId;
-        use crate::bailiff_plan_read::{BailiffPlanSummary, DecisionSummary};
+        use crate::bailiff_plan_view::{BailiffPlanSummary, DecisionSummary};
 
         let summary = BailiffPlanSummary {
             plan_id: PlanId::from_uuid("ccccdddd-eeee-4fff-8000-111111111111".parse().unwrap()),
@@ -872,7 +872,7 @@ mod tests {
         use super::*;
         use crate::bailiff_decision::{Decider, Decision};
         use crate::bailiff_plan_note::{DecisionNote, ImplementNote, PlanId, PlanNote, ReviewNote};
-        use crate::bailiff_plan_read::{PlanFullView, VerifiedSection};
+        use crate::bailiff_plan_view::{PlanFullView, VerifiedSection};
         use crate::core::{
             CapabilitySet, RepoRef, Sha256Hex, SshKeyFingerprint, SshSignature, UnixMillis,
         };
