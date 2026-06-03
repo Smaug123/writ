@@ -454,26 +454,9 @@ async fn show_staged_push<S: SecretStore + Send + Sync + 'static>(
     let Some(staging_store) = state.staging_store.clone() else {
         return staging_not_configured();
     };
-    let entry: StagedEntry = match tokio::task::spawn_blocking({
-        let staging_store = Arc::clone(&staging_store);
-        move || staging_store.load(request_id)
-    })
-    .await
-    {
-        Ok(Ok(entry)) => entry,
-        Ok(Err(StagingError::NotFound { request_id })) => {
-            return ServerMessage::UnknownStagedPush { request_id };
-        }
-        Ok(Err(err)) => {
-            return ServerMessage::Error {
-                message: err.to_string(),
-            };
-        }
-        Err(err) => {
-            return ServerMessage::Error {
-                message: format!("staging load task failed: {err}"),
-            };
-        }
+    let entry = match load_staged_entry(&staging_store, request_id).await {
+        Ok(entry) => entry,
+        Err(resp) => return resp,
     };
 
     let audit_lookup = {
@@ -528,6 +511,53 @@ async fn show_staged_push<S: SecretStore + Send + Sync + 'static>(
 /// operator field is informational only.
 pub(crate) const MAX_OPERATOR_BYTES: usize = 256;
 
+/// Reject an empty or oversize operator identity before any IO, so a
+/// caller cannot probe broker state via a malformed identity field.
+/// Shared verbatim by reject/approve/reconcile; the limit and the
+/// wording live in one place. Returns `Some(error_response)` when the
+/// operator is invalid, `None` when it passes.
+fn validate_operator(operator: &str) -> Option<ServerMessage> {
+    if operator.is_empty() {
+        return Some(ServerMessage::Error {
+            message: "operator identity must not be empty".into(),
+        });
+    }
+    if operator.len() > MAX_OPERATOR_BYTES {
+        return Some(ServerMessage::Error {
+            message: format!(
+                "operator identity is {} bytes, exceeding the {MAX_OPERATOR_BYTES}-byte limit",
+                operator.len(),
+            ),
+        });
+    }
+    None
+}
+
+/// Load a staging entry off the blocking pool, mapping the absence of a
+/// staging directory to a clean `UnknownStagedPush`. Every staged-push
+/// handler probes staging through here so they agree on what "the
+/// staging is gone" means: a missing dir is `UnknownStagedPush`, a
+/// failed `spawn_blocking` join is a generic `Error`. Callers that only
+/// need an existence check discard the returned [`StagedEntry`].
+async fn load_staged_entry(
+    staging_store: &Arc<GitPushStagingStore>,
+    request_id: RequestId,
+) -> Result<StagedEntry, ServerMessage> {
+    let staging_store = Arc::clone(staging_store);
+    match tokio::task::spawn_blocking(move || staging_store.load(request_id)).await {
+        Ok(Ok(entry)) => Ok(entry),
+        Ok(Err(StagingError::NotFound { request_id })) => {
+            Err(ServerMessage::UnknownStagedPush { request_id })
+        }
+        Ok(Err(err)) => Err(ServerMessage::Error {
+            message: err.to_string(),
+        }),
+        Err(err) => Err(ServerMessage::Error {
+            message: format!("staging load task failed: {err}"),
+        }),
+    }
+}
+
 async fn reject_staged_push<S: SecretStore + Send + Sync + 'static>(
     state: &Arc<BrokerState<S>>,
     request_id: RequestId,
@@ -538,18 +568,8 @@ async fn reject_staged_push<S: SecretStore + Send + Sync + 'static>(
         return staging_not_configured();
     };
 
-    if operator.is_empty() {
-        return ServerMessage::Error {
-            message: "operator identity must not be empty".into(),
-        };
-    }
-    if operator.len() > MAX_OPERATOR_BYTES {
-        return ServerMessage::Error {
-            message: format!(
-                "operator identity is {} bytes, exceeding the {MAX_OPERATOR_BYTES}-byte limit",
-                operator.len(),
-            ),
-        };
+    if let Some(resp) = validate_operator(&operator) {
+        return resp;
     }
 
     // Verify the staging directory exists before touching the audit
@@ -557,25 +577,8 @@ async fn reject_staged_push<S: SecretStore + Send + Sync + 'static>(
     // agree on what "the staging is gone" means and gives the operator
     // a clean `UnknownStagedPush` instead of a trigger-violation error
     // when the dir was already deleted by a prior reject.
-    let load_check = {
-        let staging_store = Arc::clone(&staging_store);
-        tokio::task::spawn_blocking(move || staging_store.load(request_id)).await
-    };
-    match load_check {
-        Ok(Ok(_)) => {}
-        Ok(Err(StagingError::NotFound { request_id })) => {
-            return ServerMessage::UnknownStagedPush { request_id };
-        }
-        Ok(Err(err)) => {
-            return ServerMessage::Error {
-                message: err.to_string(),
-            };
-        }
-        Err(err) => {
-            return ServerMessage::Error {
-                message: format!("staging load task failed: {err}"),
-            };
-        }
+    if let Err(resp) = load_staged_entry(&staging_store, request_id).await {
+        return resp;
     }
 
     // Consult the approve-attempt state machine before attempting the
@@ -788,18 +791,8 @@ async fn approve_staged_push<S: SecretStore + Send + Sync + 'static>(
     request_id: RequestId,
     operator: String,
 ) -> ServerMessage {
-    if operator.is_empty() {
-        return ServerMessage::Error {
-            message: "operator identity must not be empty".into(),
-        };
-    }
-    if operator.len() > MAX_OPERATOR_BYTES {
-        return ServerMessage::Error {
-            message: format!(
-                "operator identity is {} bytes, exceeding the {MAX_OPERATOR_BYTES}-byte limit",
-                operator.len(),
-            ),
-        };
+    if let Some(resp) = validate_operator(&operator) {
+        return resp;
     }
 
     let Some(staging_store) = state.staging_store.clone() else {
@@ -812,25 +805,9 @@ async fn approve_staged_push<S: SecretStore + Send + Sync + 'static>(
         return approve_staged_push_not_configured("signing_key");
     };
 
-    let load_result = {
-        let staging_store = Arc::clone(&staging_store);
-        tokio::task::spawn_blocking(move || staging_store.load(request_id)).await
-    };
-    let entry = match load_result {
-        Ok(Ok(entry)) => entry,
-        Ok(Err(StagingError::NotFound { request_id })) => {
-            return ServerMessage::UnknownStagedPush { request_id };
-        }
-        Ok(Err(err)) => {
-            return ServerMessage::Error {
-                message: err.to_string(),
-            };
-        }
-        Err(err) => {
-            return ServerMessage::Error {
-                message: format!("staging load task failed: {err}"),
-            };
-        }
+    let entry = match load_staged_entry(&staging_store, request_id).await {
+        Ok(entry) => entry,
+        Err(resp) => return resp,
     };
 
     // Joined audit view: the source of truth for the prior-resolution
@@ -1383,18 +1360,8 @@ async fn reconcile_staged_push<S: SecretStore + Send + Sync + 'static>(
     operator: String,
     outcome: ReconcileOutcome,
 ) -> ServerMessage {
-    if operator.is_empty() {
-        return ServerMessage::Error {
-            message: "operator identity must not be empty".into(),
-        };
-    }
-    if operator.len() > MAX_OPERATOR_BYTES {
-        return ServerMessage::Error {
-            message: format!(
-                "operator identity is {} bytes, exceeding the {MAX_OPERATOR_BYTES}-byte limit",
-                operator.len(),
-            ),
-        };
+    if let Some(resp) = validate_operator(&operator) {
+        return resp;
     }
 
     // The free-form outcome text gets recorded verbatim on the audit
@@ -1433,25 +1400,8 @@ async fn reconcile_staged_push<S: SecretStore + Send + Sync + 'static>(
     // surface as reject/approve; if the operator passes a stale request
     // id we want to say so explicitly rather than write an audit row
     // referencing a push the broker can no longer see.
-    let load_check = {
-        let staging_store = Arc::clone(&staging_store);
-        tokio::task::spawn_blocking(move || staging_store.load(request_id)).await
-    };
-    match load_check {
-        Ok(Ok(_)) => {}
-        Ok(Err(StagingError::NotFound { request_id })) => {
-            return ServerMessage::UnknownStagedPush { request_id };
-        }
-        Ok(Err(err)) => {
-            return ServerMessage::Error {
-                message: err.to_string(),
-            };
-        }
-        Err(err) => {
-            return ServerMessage::Error {
-                message: format!("staging load task failed: {err}"),
-            };
-        }
+    if let Err(resp) = load_staged_entry(&staging_store, request_id).await {
+        return resp;
     }
 
     // Short-circuit on a prior resolution row before classifying. A
