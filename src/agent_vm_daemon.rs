@@ -562,17 +562,42 @@ impl AgentVmDaemon {
         result
     }
 
-    async fn stop_session_locked<S: SecretStore + Send + Sync + 'static>(
+    /// Run the blocking VM/firewall/network teardown for `session_id` on a
+    /// blocking thread. The nested result preserves the join-vs-manager
+    /// distinction the reconcile sweep maps onto its per-stage error; the
+    /// stop/cleanup paths flatten it with `??`.
+    async fn spawn_cleanup_session(
         &self,
-        state: &Arc<BrokerState<S>>,
         session_id: SessionId,
-    ) -> Result<(), AgentVmDaemonError> {
+    ) -> Result<Result<(), AgentVmSessionManagerError>, tokio::task::JoinError> {
         let store = self.config.lifecycle.state_store.clone();
         let tools = self.config.lifecycle.tools.clone();
         tokio::task::spawn_blocking(move || {
             cleanup_managed_agent_vm_session(&store, session_id, tools)
         })
-        .await??;
+        .await
+    }
+
+    /// Remove the persisted state record for `session_id` on a blocking
+    /// thread, releasing its subnet index and per-session names. Nested
+    /// result as in [`Self::spawn_cleanup_session`].
+    async fn spawn_remove_session_state(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Result<(), AgentVmSessionManagerError>, tokio::task::JoinError> {
+        let store = self.config.lifecycle.state_store.clone();
+        tokio::task::spawn_blocking(move || {
+            remove_managed_agent_vm_session_state(&store, session_id)
+        })
+        .await
+    }
+
+    async fn stop_session_locked<S: SecretStore + Send + Sync + 'static>(
+        &self,
+        state: &Arc<BrokerState<S>>,
+        session_id: SessionId,
+    ) -> Result<(), AgentVmDaemonError> {
+        self.spawn_cleanup_session(session_id).await??;
 
         let audit_close = state.audit.close_session(session_id, UnixMillis::now());
         let http_shutdown = match self.running.lock().await.remove(&session_id) {
@@ -582,11 +607,7 @@ impl AgentVmDaemon {
 
         match (audit_close, http_shutdown) {
             (Ok(()), Ok(())) => {
-                let store = self.config.lifecycle.state_store.clone();
-                tokio::task::spawn_blocking(move || {
-                    remove_managed_agent_vm_session_state(&store, session_id)
-                })
-                .await??;
+                self.spawn_remove_session_state(session_id).await??;
                 Ok(())
             }
             (Err(audit), Ok(())) => Err(AgentVmDaemonError::Audit(audit)),
@@ -701,22 +722,13 @@ impl AgentVmDaemon {
         &self,
         session_id: SessionId,
     ) -> Result<(), AgentVmDaemonError> {
-        let store = self.config.lifecycle.state_store.clone();
-        let tools = self.config.lifecycle.tools.clone();
-        tokio::task::spawn_blocking(move || {
-            cleanup_managed_agent_vm_session(&store, session_id, tools)
-        })
-        .await??;
+        self.spawn_cleanup_session(session_id).await??;
 
         if let Some(running) = self.running.lock().await.remove(&session_id) {
             running.shutdown().await?;
         }
 
-        let store = self.config.lifecycle.state_store.clone();
-        tokio::task::spawn_blocking(move || {
-            remove_managed_agent_vm_session_state(&store, session_id)
-        })
-        .await??;
+        self.spawn_remove_session_state(session_id).await??;
         Ok(())
     }
 
@@ -765,13 +777,7 @@ impl AgentVmDaemon {
         audit: &Arc<AuditLog>,
         session_id: SessionId,
     ) -> Result<(), (AgentVmReconcileStage, AgentVmReconcileStageError)> {
-        let store = self.config.lifecycle.state_store.clone();
-        let tools = self.config.lifecycle.tools.clone();
-        match tokio::task::spawn_blocking(move || {
-            cleanup_managed_agent_vm_session(&store, session_id, tools)
-        })
-        .await
-        {
+        match self.spawn_cleanup_session(session_id).await {
             Err(join) => return Err((AgentVmReconcileStage::Cleanup, join.into())),
             Ok(Err(err)) => return Err((AgentVmReconcileStage::Cleanup, err.into())),
             Ok(Ok(())) => {}
@@ -781,12 +787,7 @@ impl AgentVmDaemon {
             return Err((AgentVmReconcileStage::AuditClose, err.into()));
         }
 
-        let store = self.config.lifecycle.state_store.clone();
-        match tokio::task::spawn_blocking(move || {
-            remove_managed_agent_vm_session_state(&store, session_id)
-        })
-        .await
-        {
+        match self.spawn_remove_session_state(session_id).await {
             Err(join) => return Err((AgentVmReconcileStage::StateRemove, join.into())),
             Ok(Err(err)) => return Err((AgentVmReconcileStage::StateRemove, err.into())),
             Ok(Ok(())) => {}
