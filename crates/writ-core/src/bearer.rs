@@ -1,6 +1,6 @@
 //! Shared bearer-token syntax checks for the VM broker boundary.
 
-pub(crate) fn is_bearer_token_byte(byte: u8) -> bool {
+pub fn is_bearer_token_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~')
 }
 

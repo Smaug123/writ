@@ -1,0 +1,21 @@
+[package]
+name = "writ-core"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+# `process_spawn::spawn_async` is the only host-only surface in this crate;
+# it needs tokio. The parent crate's `host` feature enables `writ-core/host`.
+host = ["dep:tokio"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+time = { version = "0.3", features = ["serde", "formatting", "parsing", "macros"] }
+thiserror = "2"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt", "json", "std"] }
+tokio = { version = "1", features = ["process", "time"], optional = true }
+
+[dev-dependencies]
+serde_json = "1"
+proptest = "1"

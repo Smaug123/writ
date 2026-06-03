@@ -29,6 +29,8 @@
             || rel == "Cargo.toml"
             || rel == "src"
             || lib.hasPrefix "src/" rel
+            || rel == "crates"
+            || lib.hasPrefix "crates/" rel
             || rel == "tests"
             || lib.hasPrefix "tests/" rel;
         };
