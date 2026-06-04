@@ -18,20 +18,20 @@ use tokio::sync::Mutex as AsyncMutex;
 use wiremock::MockServer;
 
 use super::*;
-use crate::agent_run::AgentPrompt;
-use crate::audit::AuditLog;
 use crate::bailiff_plan_note::{ImplementNote, PlanId, PlanNote, ReviewNote, plan_notes_ref};
-use crate::core::{AgentKind, CapabilitySet, NotesRef, RepoRef, TtlSeconds};
-use crate::github::{GitHubAppConfig, GitHubAppRegistryConfig, GitHubMinter};
-use crate::notes_repo::NotesRepo;
-use crate::policy::PolicyConfig;
-use crate::run_verify::AllowedSigners;
-use crate::secret::{SecretError, SecretKey, SecretStore};
-use crate::server::{
+use writ::agent_run::AgentPrompt;
+use writ::audit::AuditLog;
+use writ::core::{AgentKind, CapabilitySet, NotesRef, RepoRef, TtlSeconds};
+use writ::github::{GitHubAppConfig, GitHubAppRegistryConfig, GitHubMinter};
+use writ::notes_repo::NotesRepo;
+use writ::policy::PolicyConfig;
+use writ::run_verify::AllowedSigners;
+use writ::secret::{SecretError, SecretKey, SecretStore};
+use writ::server::{
     BrokerState, RunAgentSpawnConfig, prepare_broker_listener, serve_broker_with_agent_vm,
 };
-use crate::signing::WritSigningKey;
-use crate::writ_client::{RunAgentRequest, WritClient};
+use writ::signing::WritSigningKey;
+use writ::writ_client::{RunAgentRequest, WritClient};
 
 const SIGNING_PEM: &str = include_str!("../../tests/fixtures/ed25519_test_signing.key");
 const SIGNING_PUB: &str = include_str!("../../tests/fixtures/ed25519_test_signing.key.pub");
@@ -131,7 +131,7 @@ async fn write_plan_note_completes_after_real_broker_round_trip() {
     let completed = tokio::time::timeout(
         Duration::from_secs(15),
         client.run_agent(RunAgentRequest {
-            prompt: AgentPrompt::new(prompt_text),
+            prompt: AgentPrompt::try_new(prompt_text).unwrap(),
             capabilities: vec![CapabilitySet::WorkspaceRead {
                 repo: RepoRef {
                     owner: "smaug123".into(),
@@ -273,7 +273,7 @@ async fn write_review_note_completes_after_real_broker_round_trip() {
     let completed = tokio::time::timeout(
         Duration::from_secs(15),
         client.run_agent(RunAgentRequest {
-            prompt: AgentPrompt::new(prompt_text),
+            prompt: AgentPrompt::try_new(prompt_text).unwrap(),
             capabilities: vec![CapabilitySet::WorkspaceRead {
                 repo: RepoRef {
                     owner: "smaug123".into(),
@@ -412,7 +412,7 @@ async fn write_implement_note_completes_after_real_broker_round_trip() {
     let completed = tokio::time::timeout(
         Duration::from_secs(15),
         client.run_agent(RunAgentRequest {
-            prompt: AgentPrompt::new(prompt_text),
+            prompt: AgentPrompt::try_new(prompt_text).unwrap(),
             capabilities: vec![CapabilitySet::WorkspaceRead {
                 repo: RepoRef {
                     owner: "smaug123".into(),

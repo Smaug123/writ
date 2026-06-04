@@ -44,9 +44,9 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::bailiff_decision::{Decider, Decision};
-use crate::core::{NotesRef, NotesRefError, SshSignature, UnixMillis};
-use crate::protocol::SignedRunMetadata;
-use crate::vm_git::GitObjectId;
+use writ::core::{NotesRef, NotesRefError, SshSignature, UnixMillis};
+use writ::protocol::SignedRunMetadata;
+use writ::vm_git::GitObjectId;
 
 /// Notes-ref prefix for every bailiff-managed plan. The `<plan-id>`
 /// segment is appended verbatim; see [`plan_notes_ref`].
@@ -536,9 +536,9 @@ pub enum PlanNotesRefError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent_run::AgentRunId;
-    use crate::core::SessionId;
-    use crate::core::{CapabilitySet, RepoRef, Sha256Hex, SshKeyFingerprint, UnixMillis};
+    use writ::agent_run::AgentRunId;
+    use writ::core::SessionId;
+    use writ::core::{CapabilitySet, RepoRef, Sha256Hex, SshKeyFingerprint, UnixMillis};
 
     fn sample_repo() -> RepoRef {
         RepoRef {

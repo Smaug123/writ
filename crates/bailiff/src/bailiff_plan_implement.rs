@@ -55,7 +55,6 @@ use thiserror::Error;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::task::JoinError;
 
-use crate::agent_run::{AgentPrompt, AgentPromptError};
 use crate::bailiff_decision::Decision;
 use crate::bailiff_plan_note::{PlanId, PlanNote};
 use crate::bailiff_plan_read::{
@@ -64,11 +63,12 @@ use crate::bailiff_plan_read::{
 };
 use crate::bailiff_plan_write::{WriteImplementNoteError, write_implement_note};
 use crate::bailiff_repo_guard::BailiffRepoGuard;
-use crate::core::{AgentKind, CapabilitySet, NotesRef, SessionId};
-use crate::notes_repo::NotesRepo;
-use crate::run_verify::AllowedSigners;
-use crate::vm_git::{AgentVmWorkspaceBootstrap, GitObjectId};
-use crate::writ_client::{RunAgentCompleted, RunAgentRequest, WritClient, WritClientError};
+use writ::agent_run::{AgentPrompt, AgentPromptError};
+use writ::core::{AgentKind, CapabilitySet, NotesRef, SessionId};
+use writ::notes_repo::NotesRepo;
+use writ::run_verify::AllowedSigners;
+use writ::vm_git::{AgentVmWorkspaceBootstrap, GitObjectId};
+use writ::writ_client::{RunAgentCompleted, RunAgentRequest, WritClient, WritClientError};
 
 /// Inputs to [`submit_implement`]. Mirror of
 /// [`crate::bailiff_plan_review::SubmitReviewInputs`] with
@@ -420,7 +420,7 @@ pub enum SubmitImplementError {
     ReadPlanEnvelope(#[source] ReadPlanBodyError),
     /// The composed implementer prompt (`feature_prompt` +
     /// separator + `plan_body`) exceeded
-    /// [`crate::agent_run::MAX_AGENT_PROMPT_BYTES`]. Either the
+    /// [`writ::agent_run::MAX_AGENT_PROMPT_BYTES`]. Either the
     /// feature prompt is large, the plan body is large, or both —
     /// the operator's recourse is to narrow one side. Pre-RPC.
     #[error("composing the implementer prompt failed: {0}")]
@@ -479,7 +479,7 @@ mod compose_tests {
     fn errors_when_combined_exceeds_agent_prompt_limit() {
         // Feature prompt at the cap, non-empty plan body, plus the
         // separator must overflow `AgentPrompt::try_new`.
-        let feature_prompt = "x".repeat(crate::agent_run::MAX_AGENT_PROMPT_BYTES);
+        let feature_prompt = "x".repeat(writ::agent_run::MAX_AGENT_PROMPT_BYTES);
         let err = compose_implementer_prompt_bytes(&feature_prompt, "p").unwrap_err();
         assert!(err.to_string().contains("exceeding"), "{err}");
     }
@@ -517,9 +517,9 @@ mod build_request_tests {
     //! agent model) must flow through verbatim, and the VM-mints-its-
     //! own-session invariant (`session_id: None`) must hold.
     use super::*;
-    use crate::core::{AgentKind, RepoRef};
-    use crate::vm_git::{AgentVmWorkspaceBootstrap, GitCloneRepo, WorkspaceWarmMode};
     use std::path::PathBuf;
+    use writ::core::{AgentKind, RepoRef};
+    use writ::vm_git::{AgentVmWorkspaceBootstrap, GitCloneRepo, WorkspaceWarmMode};
 
     fn sample_workspace() -> AgentVmWorkspaceBootstrap {
         AgentVmWorkspaceBootstrap {
@@ -603,22 +603,22 @@ mod end_to_end_tests {
     use wiremock::MockServer;
 
     use super::*;
-    use crate::audit::AuditLog;
     use crate::bailiff_decision::{Decider, Decision};
     use crate::bailiff_plan_note::{DecisionNote, ImplementNote, plan_notes_ref};
     use crate::bailiff_plan_submit::{SubmitPlanInputs, submit_plan};
     use crate::bailiff_plan_write::write_decision_note;
-    use crate::core::{AgentKind, CapabilitySet, NotesRef, RepoRef, TtlSeconds, UnixMillis};
-    use crate::github::{GitHubAppConfig, GitHubAppRegistryConfig, GitHubMinter};
-    use crate::notes_repo::NotesRepo;
-    use crate::policy::PolicyConfig;
-    use crate::run_verify::AllowedSigners;
-    use crate::secret::{SecretError, SecretKey, SecretStore};
-    use crate::server::{
+    use writ::audit::AuditLog;
+    use writ::core::{AgentKind, CapabilitySet, NotesRef, RepoRef, TtlSeconds, UnixMillis};
+    use writ::github::{GitHubAppConfig, GitHubAppRegistryConfig, GitHubMinter};
+    use writ::notes_repo::NotesRepo;
+    use writ::policy::PolicyConfig;
+    use writ::run_verify::AllowedSigners;
+    use writ::secret::{SecretError, SecretKey, SecretStore};
+    use writ::server::{
         BrokerState, RunAgentSpawnConfig, prepare_broker_listener, serve_broker_with_agent_vm,
     };
-    use crate::signing::WritSigningKey;
-    use crate::writ_client::WritClient;
+    use writ::signing::WritSigningKey;
+    use writ::writ_client::WritClient;
 
     const SIGNING_PEM: &str = include_str!("../tests/fixtures/ed25519_test_signing.key");
     const SIGNING_PUB: &str = include_str!("../tests/fixtures/ed25519_test_signing.key.pub");
@@ -776,7 +776,7 @@ mod end_to_end_tests {
     }
 
     fn implement_inputs(plan_id: PlanId) -> SubmitImplementInputs {
-        use crate::vm_git::{GitCloneRepo, WorkspaceWarmMode};
+        use writ::vm_git::{GitCloneRepo, WorkspaceWarmMode};
         SubmitImplementInputs {
             plan_id,
             feature_prompt: AgentPrompt::try_new("Rename foo to bar.").unwrap(),
