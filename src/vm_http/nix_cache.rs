@@ -664,7 +664,7 @@ impl<S: SecretStore> VmHttpNixCacheService<S> {
     /// absent archive proxies the upstream and stays byte-identical to
     /// upstream-only. `nix-cache-info` is requested once per substituter
     /// pre-flight, so the directory scan (short-circuiting on the first
-    /// narinfo) is off the hot path.
+    /// servable narinfo) is off the hot path.
     async fn local_cache_has_narinfo(&self) -> bool {
         let Some(dir) = self.config.local_cache_dir() else {
             return false;
@@ -675,7 +675,7 @@ impl<S: SecretStore> VmHttpNixCacheService<S> {
             Err(_) => return false,
         };
         while let Ok(Some(entry)) = entries.next_entry().await {
-            if entry.path().extension().is_some_and(|ext| ext == "narinfo") {
+            if is_servable_local_narinfo_name(&entry.file_name()) {
                 return true;
             }
         }
@@ -1000,6 +1000,19 @@ fn upstream_failure(
         error: Some(error),
         response,
     }
+}
+
+/// Whether a directory entry name is one `try_serve_local_narinfo` would serve:
+/// exactly `<hash>.narinfo` for a valid store hash, matching the path it builds
+/// (`format!("{}.narinfo", hash.as_str())`). The `.narinfo` extension alone is
+/// not enough — a provisioning that was interrupted after copying a narinfo to
+/// its temp sibling (`.writ-tmp-<uuid>-<hash>.narinfo`, see `flake_provision`)
+/// but before the final rename shares the extension yet is never served, so it
+/// must not advertise the archive as provisioned.
+fn is_servable_local_narinfo_name(name: &std::ffi::OsStr) -> bool {
+    name.to_str()
+        .and_then(|name| name.strip_suffix(".narinfo"))
+        .is_some_and(|hash| NixStoreHashPart::validate(hash).is_ok())
 }
 
 /// Synthesize the `nix-cache-info` response locally (no upstream round-trip).

@@ -261,6 +261,45 @@ async fn cache_info_proxies_upstream_when_local_cache_empty() {
 }
 
 #[tokio::test]
+async fn cache_info_ignores_stale_provisioning_temp_narinfo_and_proxies_upstream() {
+    let upstream = MockServer::start().await;
+    let state = make_broker_state(&upstream);
+    let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+    open_audit_session(&state, session.session_id());
+    // Provisioning was interrupted after copying a narinfo to its temp sibling
+    // (`.writ-tmp-<uuid>-<hash>.narinfo`) but before the final rename, so the
+    // only `.narinfo`-suffixed file is one `try_serve_local_narinfo` will never
+    // read (it serves `<hash>.narinfo` only). The archive is effectively empty,
+    // so cache-info must proxy the upstream rather than synthesise a cache for
+    // content it cannot serve.
+    let cache = tempfile::tempdir().unwrap();
+    let hash = "rzv95bakh41zrn5ji23pfc11x5vq2z4d";
+    std::fs::write(
+        cache
+            .path()
+            .join(format!(".writ-tmp-0123456789abcdef-{hash}.narinfo")),
+        b"StorePath: /nix/store/rzv95bakh41zrn5ji23pfc11x5vq2z4d-src\n",
+    )
+    .unwrap();
+    let upstream_body = "StoreDir: /nix/store\nWantMassQuery: 1\nPriority: 30\n";
+    Mock::given(method("GET"))
+        .and(path("/nix-cache-info"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(upstream_body))
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    let service =
+        nix_cache_service_with_local_cache(&state, &upstream.uri(), cache.path(), 1024, 1024);
+
+    let response =
+        route_nix_cache_with_service(&session, "GET", VM_NIX_CACHE_INFO_PATH.into(), service).await;
+
+    assert_eq!(response.status, VmHttpStatus::Ok);
+    assert_eq!(String::from_utf8(response.body).unwrap(), upstream_body);
+    upstream.verify().await;
+}
+
+#[tokio::test]
 async fn local_narinfo_present_but_not_self_certifying_fails_closed() {
     let upstream = MockServer::start().await;
     let state = make_broker_state(&upstream);
