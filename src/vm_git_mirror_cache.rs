@@ -135,8 +135,9 @@ pub enum MirrorCacheInsertion {
     /// The mirror was moved into the cache and now backs this key.
     Stored,
     /// An entry for this key already existed (an equivalent mirror from a
-    /// concurrent or earlier clone of the same `(repo, rev)`); the caller's
-    /// source mirror was left untouched for it to clean up.
+    /// concurrent or earlier clone of the same `(repo, rev)`), so the existing
+    /// mirror was kept. The caller's source may or may not have been consumed
+    /// (see [`MirrorCache::insert`]); clean up the work directory regardless.
     AlreadyPresent,
 }
 
@@ -160,44 +161,62 @@ impl MirrorCache {
         &self.root
     }
 
-    /// Publish a freshly-cloned bare mirror into the cache under `key` by moving
-    /// `src_mirror` into the keyed slot. The slot is claimed atomically
-    /// (`create_dir`), so concurrent clones of the same `(repo, rev)` resolve to
-    /// one winner; the losers see [`MirrorCacheInsertion::AlreadyPresent`] and
-    /// keep the existing (equivalent) mirror. After a successful store the bound
-    /// is enforced best-effort.
+    /// Publish a freshly-cloned bare mirror into the cache under `key`. A
+    /// *complete* entry is staged in a private temp directory and published with
+    /// a single atomic `rename`, so concurrent clones of the same `(repo, rev)`
+    /// resolve to one winner and a crash or lost race can only leave a
+    /// discardable `.staging-*` directory — never a half-built slot that would
+    /// shadow the key while `get` returns `None`. Losers (and the fast-path
+    /// case where a complete entry already exists) see
+    /// [`MirrorCacheInsertion::AlreadyPresent`]. After a successful store the
+    /// bound is enforced best-effort.
     ///
-    /// Requires `src_mirror` to be on the same filesystem as the cache root so
-    /// the publish is an atomic rename (the default puts both under the broker
-    /// work root).
+    /// `src_mirror` is moved, and on the race-loser path may be consumed even
+    /// though the existing entry is kept — so the caller must clean up its own
+    /// work directory regardless of the outcome rather than rely on
+    /// `src_mirror` surviving. Requires `src_mirror` to be on the same
+    /// filesystem as the cache root so both moves are atomic renames (the
+    /// default puts both under the broker work root).
     pub fn insert(
         &self,
         key: &MirrorCacheKey,
         src_mirror: &Path,
     ) -> std::io::Result<MirrorCacheInsertion> {
-        std::fs::create_dir_all(&self.root)?;
+        create_private_dir_all(&self.root)?;
         let entry = self.root.join(key.slug());
-        match std::fs::create_dir(&entry) {
+        // Fast path: a complete entry already backs this key. Keep it and leave
+        // the caller's source for it to clean up.
+        if entry.join(MIRROR_DIR_NAME).is_dir() {
+            let _ = self.touch(&entry);
+            return Ok(MirrorCacheInsertion::AlreadyPresent);
+        }
+        // Stage the whole entry, then publish atomically.
+        let staging = self
+            .root
+            .join(format!(".staging-{}", uuid::Uuid::new_v4().simple()));
+        create_private_dir(&staging)?;
+        if let Err(err) = std::fs::rename(src_mirror, staging.join(MIRROR_DIR_NAME)) {
+            let _ = std::fs::remove_dir_all(&staging);
+            return Err(err);
+        }
+        let _ = std::fs::File::create(staging.join(LAST_USED_FILE));
+        // `rename` onto a missing or empty `entry` succeeds (publishing, or
+        // healing a leftover empty slot from an earlier crash); onto a populated
+        // `entry` it fails, so a concurrent winner is preserved.
+        match std::fs::rename(&staging, &entry) {
             Ok(()) => {
-                let dest = entry.join(MIRROR_DIR_NAME);
-                if let Err(err) = std::fs::rename(src_mirror, &dest) {
-                    // The slot was claimed but never populated; remove it so a
-                    // later insert for this key is not permanently shadowed by
-                    // an empty directory.
-                    let _ = std::fs::remove_dir_all(&entry);
-                    return Err(err);
-                }
-                self.touch(&entry)?;
                 self.enforce_bound();
                 Ok(MirrorCacheInsertion::Stored)
             }
-            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-                // Refresh the recency of the surviving entry so a concurrent
-                // clone counts as a use, not a no-op.
-                let _ = self.touch(&entry);
-                Ok(MirrorCacheInsertion::AlreadyPresent)
+            Err(err) => {
+                let _ = std::fs::remove_dir_all(&staging);
+                if entry.join(MIRROR_DIR_NAME).is_dir() {
+                    let _ = self.touch(&entry);
+                    Ok(MirrorCacheInsertion::AlreadyPresent)
+                } else {
+                    Err(err)
+                }
             }
-            Err(err) => Err(err),
         }
     }
 
@@ -251,6 +270,11 @@ impl MirrorCache {
                 continue;
             }
             let slug = entry.file_name().to_string_lossy().into_owned();
+            // Skip in-flight `.staging-*` publishes (and any other dotfile): a
+            // real entry slug is a 64-char hex digest and never starts with `.`.
+            if slug.starts_with('.') {
+                continue;
+            }
             let last_used = self.last_used_of(&entry.path());
             entries.push(MirrorCacheEntry { slug, last_used });
         }
@@ -266,6 +290,27 @@ impl MirrorCache {
             .or_else(|_| std::fs::metadata(entry).and_then(|metadata| metadata.modified()))
             .unwrap_or(SystemTime::UNIX_EPOCH)
     }
+}
+
+/// Create a directory (and any missing parents) restricted to the owner. The
+/// cache holds bare clones of possibly-private repositories, so other local
+/// users must not be able to traverse into it; the explicit `set_permissions`
+/// after creation defeats the process umask (which would otherwise commonly
+/// leave a world-traversable 0755 directory).
+fn create_private_dir_all(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(path)?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+}
+
+/// Create a single new private directory, failing if it already exists.
+fn create_private_dir(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    std::fs::DirBuilder::new().mode(0o700).create(path)?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
 }
 
 #[cfg(test)]
@@ -413,6 +458,42 @@ mod tests {
             MirrorCacheInsertion::Stored
         );
         assert!(cache.get(&key).is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn insert_creates_owner_only_directories() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = MirrorCache::new(tmp.path().join("cache"), NonZeroUsize::new(4).unwrap());
+        let key = MirrorCacheKey::new(&repo("o", "r"), &sha(&forty(1)));
+        let src = make_mirror(tmp.path(), "private");
+        cache.insert(&key, &src).unwrap();
+
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        // The mirror holds possibly-private repo objects, so the cache root and
+        // each entry must be owner-only regardless of the process umask.
+        assert_eq!(mode(cache.root()), 0o700);
+        assert_eq!(mode(&cache.root().join(key.slug())), 0o700);
+    }
+
+    #[test]
+    fn insert_heals_an_orphaned_empty_slot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = MirrorCache::new(tmp.path().join("cache"), NonZeroUsize::new(4).unwrap());
+        let key = MirrorCacheKey::new(&repo("o", "r"), &sha(&forty(1)));
+        // Simulate a crash that left an empty slug directory with no mirror: a
+        // poisoned slot that must not block this key from ever caching again.
+        std::fs::create_dir_all(cache.root().join(key.slug())).unwrap();
+        assert!(cache.get(&key).is_none());
+
+        let src = make_mirror(tmp.path(), "healed");
+        assert_eq!(
+            cache.insert(&key, &src).unwrap(),
+            MirrorCacheInsertion::Stored
+        );
+        let mirror = cache.get(&key).unwrap();
+        assert_eq!(std::fs::read(mirror.join("HEAD")).unwrap(), b"healed");
     }
 
     #[test]
