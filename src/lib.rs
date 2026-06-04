@@ -98,6 +98,8 @@ pub mod vm_git;
 #[cfg(feature = "host")]
 pub mod vm_git_bundle;
 #[cfg(feature = "host")]
+pub mod vm_git_mirror_cache;
+#[cfg(feature = "host")]
 pub mod vm_http;
 #[cfg(feature = "host")]
 pub mod writ_client;

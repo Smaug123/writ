@@ -1,0 +1,528 @@
+//! A `(repo, rev)`-keyed on-disk cache of bare `git clone --mirror`
+//! repositories.
+//!
+//! The broker already clones every requested repo into a bare mirror to build
+//! the guest's bundle, then discards it. Flake-input provisioning needs that
+//! same checkout again — to read `flake.lock` and run `nix flake archive` — so
+//! this cache retains the mirror under a key derived from the repository and
+//! the resolved commit, letting a later provision step reuse it without a
+//! second fetch. Keying by `(repo, rev)` lets many concurrent VMs that clone
+//! the same flake at the same commit share one mirror, while a moved branch
+//! gets a fresh entry (so a still-running VM's older revision stays available).
+//!
+//! The store is just a directory on disk: there is no shared in-memory state,
+//! so concurrent broker tasks coordinate purely through atomic filesystem
+//! operations (`create_dir` to claim a slot, `rename` to publish the mirror).
+//! The cache is the imperative shell; [`plan_eviction`] is the pure core that
+//! decides what the bound sheds.
+
+use std::num::NonZeroUsize;
+use std::path::{Path, PathBuf};
+use std::time::SystemTime;
+
+use crate::agent_run::sha256_hex;
+use crate::core::RepoRef;
+
+/// Name of the bare mirror directory inside each cache entry. Matches the
+/// `mirror.git` the clone planner produces, so the moved-in directory keeps a
+/// familiar shape for an operator inspecting the cache.
+const MIRROR_DIR_NAME: &str = "mirror.git";
+
+/// A zero-byte sentinel whose mtime records when an entry was last inserted or
+/// looked up. The directory's own mtime is not portable enough to rely on for
+/// LRU ordering, so the cache stamps this file explicitly.
+const LAST_USED_FILE: &str = ".last_used";
+
+/// A resolved Git commit hash (the output of `git rev-parse`). Parsed, not
+/// validated: an interior value is always 40 (SHA-1) or 64 (SHA-256) lowercase
+/// hex characters, so it is safe to embed in a cache key without further
+/// sanitising.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct GitCommitSha(String);
+
+#[derive(Debug, thiserror::Error, Eq, PartialEq)]
+pub enum GitCommitShaError {
+    #[error("git commit sha must be 40 or 64 lowercase hex characters, got {0:?}")]
+    Invalid(String),
+}
+
+impl GitCommitSha {
+    /// Parse `git rev-parse` output (or any candidate commit hash). Trims
+    /// surrounding whitespace — `git` appends a newline — then requires exactly
+    /// 40 or 64 lowercase hex characters. `git` always prints lowercase, so
+    /// requiring it keeps the canonical form unambiguous for keying.
+    pub fn parse(raw: &str) -> Result<Self, GitCommitShaError> {
+        let trimmed = raw.trim();
+        let len_ok = trimmed.len() == 40 || trimmed.len() == 64;
+        let chars_ok = trimmed
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+        if len_ok && chars_ok {
+            Ok(Self(trimmed.to_string()))
+        } else {
+            Err(GitCommitShaError::Invalid(raw.to_string()))
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// The filesystem-safe key for a cached mirror, derived from the case-folded
+/// repository identity and the resolved commit. The slug is a SHA-256 hex
+/// digest, so it can never escape the cache root via a crafted repository name
+/// and two distinct `(repo, rev)` pairs never collide in practice.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct MirrorCacheKey {
+    slug: String,
+}
+
+impl MirrorCacheKey {
+    pub fn new(repo: &RepoRef, rev: &GitCommitSha) -> Self {
+        // The canonical (case-folded) repo identity matches GitHub's own
+        // resolution, so `Owner/Repo` and `owner/repo` at the same commit share
+        // one entry. The newline separates the fields unambiguously because a
+        // canonical owner/name never contains one.
+        let material = format!("{}\n{}", repo.canonicalise(), rev.as_str());
+        Self {
+            slug: sha256_hex(material.as_bytes()),
+        }
+    }
+
+    /// The entry's directory name within the cache root.
+    pub fn slug(&self) -> &str {
+        &self.slug
+    }
+}
+
+/// One cache entry as seen by the eviction planner: its directory name and when
+/// it was last used. Kept separate from the on-disk representation so the
+/// planner is a pure function over plain data.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MirrorCacheEntry {
+    pub slug: String,
+    pub last_used: SystemTime,
+}
+
+/// Choose which entries to evict so that at most `max_entries` remain, oldest
+/// `last_used` first. Pure and total: ties are broken by slug so the result is
+/// deterministic, and nothing is evicted while the cache is at or under the
+/// bound.
+pub fn plan_eviction(entries: &[MirrorCacheEntry], max_entries: NonZeroUsize) -> Vec<String> {
+    let max = max_entries.get();
+    if entries.len() <= max {
+        return Vec::new();
+    }
+    let mut ordered: Vec<&MirrorCacheEntry> = entries.iter().collect();
+    // Oldest first; slug breaks last_used ties for a deterministic victim set.
+    ordered.sort_by(|a, b| {
+        a.last_used
+            .cmp(&b.last_used)
+            .then_with(|| a.slug.cmp(&b.slug))
+    });
+    let evict_count = entries.len() - max;
+    ordered
+        .into_iter()
+        .take(evict_count)
+        .map(|entry| entry.slug.clone())
+        .collect()
+}
+
+/// Outcome of an [`MirrorCache::insert`].
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum MirrorCacheInsertion {
+    /// The mirror was moved into the cache and now backs this key.
+    Stored,
+    /// An entry for this key already existed (an equivalent mirror from a
+    /// concurrent or earlier clone of the same `(repo, rev)`); the caller's
+    /// source mirror was left untouched for it to clean up.
+    AlreadyPresent,
+}
+
+/// A `(repo, rev)`-keyed cache of bare mirrors rooted at a directory. Cheap to
+/// clone (a path plus a bound); all state lives on disk.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MirrorCache {
+    root: PathBuf,
+    max_entries: NonZeroUsize,
+}
+
+impl MirrorCache {
+    pub fn new(root: impl Into<PathBuf>, max_entries: NonZeroUsize) -> Self {
+        Self {
+            root: root.into(),
+            max_entries,
+        }
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// Publish a freshly-cloned bare mirror into the cache under `key` by moving
+    /// `src_mirror` into the keyed slot. The slot is claimed atomically
+    /// (`create_dir`), so concurrent clones of the same `(repo, rev)` resolve to
+    /// one winner; the losers see [`MirrorCacheInsertion::AlreadyPresent`] and
+    /// keep the existing (equivalent) mirror. After a successful store the bound
+    /// is enforced best-effort.
+    ///
+    /// Requires `src_mirror` to be on the same filesystem as the cache root so
+    /// the publish is an atomic rename (the default puts both under the broker
+    /// work root).
+    pub fn insert(
+        &self,
+        key: &MirrorCacheKey,
+        src_mirror: &Path,
+    ) -> std::io::Result<MirrorCacheInsertion> {
+        std::fs::create_dir_all(&self.root)?;
+        let entry = self.root.join(key.slug());
+        match std::fs::create_dir(&entry) {
+            Ok(()) => {
+                let dest = entry.join(MIRROR_DIR_NAME);
+                if let Err(err) = std::fs::rename(src_mirror, &dest) {
+                    // The slot was claimed but never populated; remove it so a
+                    // later insert for this key is not permanently shadowed by
+                    // an empty directory.
+                    let _ = std::fs::remove_dir_all(&entry);
+                    return Err(err);
+                }
+                self.touch(&entry)?;
+                self.enforce_bound();
+                Ok(MirrorCacheInsertion::Stored)
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                // Refresh the recency of the surviving entry so a concurrent
+                // clone counts as a use, not a no-op.
+                let _ = self.touch(&entry);
+                Ok(MirrorCacheInsertion::AlreadyPresent)
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    /// Return the path to the cached bare mirror for `key`, if present, marking
+    /// it as freshly used. `None` means no mirror is cached for this key (or the
+    /// slot is mid-publish), so the caller must fall back to a fresh clone.
+    pub fn get(&self, key: &MirrorCacheKey) -> Option<PathBuf> {
+        let entry = self.root.join(key.slug());
+        let mirror = entry.join(MIRROR_DIR_NAME);
+        if mirror.is_dir() {
+            let _ = self.touch(&entry);
+            Some(mirror)
+        } else {
+            None
+        }
+    }
+
+    /// Stamp the entry's last-used sentinel with the current time by recreating
+    /// it (an `O_CREAT|O_TRUNC` open updates the mtime).
+    fn touch(&self, entry: &Path) -> std::io::Result<()> {
+        std::fs::File::create(entry.join(LAST_USED_FILE)).map(drop)
+    }
+
+    /// Evict the oldest entries until the cache is within its bound. Best-effort
+    /// and race-tolerant: a victim another task already removed is ignored, and
+    /// because eviction targets the oldest entries a just-inserted mirror is
+    /// never the victim. The bound may be transiently exceeded by the number of
+    /// in-flight concurrent inserts before it settles.
+    fn enforce_bound(&self) {
+        let Ok(entries) = self.scan() else {
+            return;
+        };
+        for slug in plan_eviction(&entries, self.max_entries) {
+            let _ = std::fs::remove_dir_all(self.root.join(slug));
+        }
+    }
+
+    /// List the current cache entries (immediate subdirectories) with their
+    /// last-used times.
+    fn scan(&self) -> std::io::Result<Vec<MirrorCacheEntry>> {
+        let mut entries = Vec::new();
+        let read_dir = match std::fs::read_dir(&self.root) {
+            Ok(read_dir) => read_dir,
+            // No root yet => nothing cached.
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(entries),
+            Err(err) => return Err(err),
+        };
+        for entry in read_dir {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            let slug = entry.file_name().to_string_lossy().into_owned();
+            let last_used = self.last_used_of(&entry.path());
+            entries.push(MirrorCacheEntry { slug, last_used });
+        }
+        Ok(entries)
+    }
+
+    /// Read an entry's last-used time, falling back to the directory's own mtime
+    /// and finally the epoch (so a sentinel-less entry sorts as oldest and is
+    /// shed first rather than lingering forever).
+    fn last_used_of(&self, entry: &Path) -> SystemTime {
+        std::fs::metadata(entry.join(LAST_USED_FILE))
+            .and_then(|metadata| metadata.modified())
+            .or_else(|_| std::fs::metadata(entry).and_then(|metadata| metadata.modified()))
+            .unwrap_or(SystemTime::UNIX_EPOCH)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+    use std::time::Duration;
+
+    use proptest::prelude::*;
+
+    use super::*;
+
+    fn repo(owner: &str, name: &str) -> RepoRef {
+        RepoRef {
+            owner: owner.to_string(),
+            name: name.to_string(),
+        }
+    }
+
+    fn sha(hex: &str) -> GitCommitSha {
+        GitCommitSha::parse(hex).unwrap()
+    }
+
+    fn forty(seed: u8) -> String {
+        format!("{seed:02x}").repeat(20)
+    }
+
+    /// Create a stand-in bare mirror (a directory carrying one marker file) for
+    /// the cache to move; the cache treats it as an opaque directory, so a real
+    /// git repo is unnecessary here.
+    fn make_mirror(parent: &Path, marker: &str) -> PathBuf {
+        let dir = parent.join(format!("src-{marker}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("HEAD"), marker.as_bytes()).unwrap();
+        dir
+    }
+
+    #[test]
+    fn parse_accepts_sha1_and_sha256_and_trims_newline() {
+        assert_eq!(sha(&"a".repeat(40)).as_str(), &"a".repeat(40));
+        assert_eq!(sha(&"0".repeat(64)).as_str(), &"0".repeat(64));
+        // `git rev-parse` appends a newline.
+        assert_eq!(
+            GitCommitSha::parse("0123456789abcdef0123456789abcdef01234567\n")
+                .unwrap()
+                .as_str(),
+            "0123456789abcdef0123456789abcdef01234567"
+        );
+    }
+
+    #[test]
+    fn parse_rejects_wrong_length_uppercase_and_non_hex() {
+        for bad in [
+            "a".repeat(39),
+            "a".repeat(41),
+            "A".repeat(40), // uppercase is not git's canonical output
+            "g".repeat(40), // non-hex
+            String::new(),
+        ] {
+            assert_eq!(
+                GitCommitSha::parse(&bad),
+                Err(GitCommitShaError::Invalid(bad.clone())),
+                "{bad:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn key_is_stable_case_folded_and_rev_sensitive() {
+        let rev = sha(&forty(1));
+        let base = MirrorCacheKey::new(&repo("Owner", "Repo"), &rev);
+        // Same (repo, rev) => same slug.
+        assert_eq!(base, MirrorCacheKey::new(&repo("Owner", "Repo"), &rev));
+        // GitHub-equivalent casing => same slug.
+        assert_eq!(base, MirrorCacheKey::new(&repo("owner", "repo"), &rev));
+        // A different commit => a different slug.
+        assert_ne!(base, MirrorCacheKey::new(&repo("Owner", "Repo"), &sha(&forty(2))));
+        // A different repo => a different slug.
+        assert_ne!(base, MirrorCacheKey::new(&repo("Owner", "Other"), &rev));
+        // The slug is a SHA-256 hex digest, so it is filesystem-safe.
+        assert_eq!(base.slug().len(), 64);
+        assert!(base.slug().bytes().all(|b| b.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn insert_then_get_returns_the_moved_mirror() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = MirrorCache::new(tmp.path().join("cache"), NonZeroUsize::new(4).unwrap());
+        let key = MirrorCacheKey::new(&repo("o", "r"), &sha(&forty(1)));
+        let src = make_mirror(tmp.path(), "content");
+
+        assert_eq!(
+            cache.insert(&key, &src).unwrap(),
+            MirrorCacheInsertion::Stored
+        );
+        // The source was moved, not copied.
+        assert!(!src.exists());
+        let mirror = cache.get(&key).expect("mirror should be cached");
+        assert_eq!(std::fs::read(mirror.join("HEAD")).unwrap(), b"content");
+    }
+
+    #[test]
+    fn get_misses_for_an_unknown_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = MirrorCache::new(tmp.path().join("cache"), NonZeroUsize::new(4).unwrap());
+        let key = MirrorCacheKey::new(&repo("o", "r"), &sha(&forty(9)));
+        assert!(cache.get(&key).is_none());
+    }
+
+    #[test]
+    fn second_insert_for_same_key_dedups_and_keeps_the_original() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = MirrorCache::new(tmp.path().join("cache"), NonZeroUsize::new(4).unwrap());
+        let key = MirrorCacheKey::new(&repo("o", "r"), &sha(&forty(1)));
+
+        let first = make_mirror(tmp.path(), "first");
+        assert_eq!(
+            cache.insert(&key, &first).unwrap(),
+            MirrorCacheInsertion::Stored
+        );
+        let second = make_mirror(tmp.path(), "second");
+        assert_eq!(
+            cache.insert(&key, &second).unwrap(),
+            MirrorCacheInsertion::AlreadyPresent
+        );
+
+        // The original is preserved; the losing source is left for its caller.
+        let mirror = cache.get(&key).unwrap();
+        assert_eq!(std::fs::read(mirror.join("HEAD")).unwrap(), b"first");
+        assert!(second.exists(), "the deduped source must be left untouched");
+    }
+
+    #[test]
+    fn insert_with_missing_source_errors_and_leaves_no_poisoned_slot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = MirrorCache::new(tmp.path().join("cache"), NonZeroUsize::new(4).unwrap());
+        let key = MirrorCacheKey::new(&repo("o", "r"), &sha(&forty(1)));
+        let missing = tmp.path().join("does-not-exist");
+
+        assert!(cache.insert(&key, &missing).is_err());
+        // No empty slot is left behind, so a later real insert still wins.
+        assert!(cache.get(&key).is_none());
+        let real = make_mirror(tmp.path(), "real");
+        assert_eq!(
+            cache.insert(&key, &real).unwrap(),
+            MirrorCacheInsertion::Stored
+        );
+        assert!(cache.get(&key).is_some());
+    }
+
+    #[test]
+    fn insert_enforces_the_entry_bound() {
+        let tmp = tempfile::tempdir().unwrap();
+        let max = NonZeroUsize::new(3).unwrap();
+        let cache = MirrorCache::new(tmp.path().join("cache"), max);
+
+        // Insert well past the bound with distinct keys.
+        for seed in 0u8..8 {
+            let key = MirrorCacheKey::new(&repo("o", "r"), &sha(&forty(seed)));
+            let src = make_mirror(tmp.path(), &format!("m{seed}"));
+            cache.insert(&key, &src).unwrap();
+        }
+
+        let count = std::fs::read_dir(cache.root())
+            .unwrap()
+            .filter(|e| e.as_ref().unwrap().file_type().unwrap().is_dir())
+            .count();
+        assert_eq!(count, max.get(), "the bound must cap retained entries");
+    }
+
+    #[test]
+    fn under_bound_evicts_nothing() {
+        let entries = vec![
+            MirrorCacheEntry {
+                slug: "a".into(),
+                last_used: SystemTime::UNIX_EPOCH,
+            },
+            MirrorCacheEntry {
+                slug: "b".into(),
+                last_used: SystemTime::UNIX_EPOCH + Duration::from_secs(1),
+            },
+        ];
+        assert!(plan_eviction(&entries, NonZeroUsize::new(2).unwrap()).is_empty());
+        assert!(plan_eviction(&entries, NonZeroUsize::new(5).unwrap()).is_empty());
+    }
+
+    #[test]
+    fn eviction_sheds_the_oldest_first() {
+        let entries = vec![
+            MirrorCacheEntry {
+                slug: "newest".into(),
+                last_used: SystemTime::UNIX_EPOCH + Duration::from_secs(30),
+            },
+            MirrorCacheEntry {
+                slug: "oldest".into(),
+                last_used: SystemTime::UNIX_EPOCH + Duration::from_secs(10),
+            },
+            MirrorCacheEntry {
+                slug: "middle".into(),
+                last_used: SystemTime::UNIX_EPOCH + Duration::from_secs(20),
+            },
+        ];
+        assert_eq!(
+            plan_eviction(&entries, NonZeroUsize::new(1).unwrap()),
+            vec!["oldest".to_string(), "middle".to_string()]
+        );
+    }
+
+    proptest! {
+        /// The planner always lands the cache within its bound, evicts exactly
+        /// the overflow, and never sheds a newer entry while keeping an older
+        /// one (the LRU invariant, ties broken deterministically by slug).
+        #[test]
+        fn eviction_is_bounded_and_oldest_first(
+            raw in proptest::collection::vec((0u64..1000, "[a-z0-9]{1,10}"), 0..40),
+            max in 1usize..15,
+        ) {
+            // Distinct slugs model distinct cache directories.
+            let mut seen = HashSet::new();
+            let entries: Vec<MirrorCacheEntry> = raw
+                .into_iter()
+                .filter(|(_, slug)| seen.insert(slug.clone()))
+                .map(|(secs, slug)| MirrorCacheEntry {
+                    slug,
+                    last_used: SystemTime::UNIX_EPOCH + Duration::from_secs(secs),
+                })
+                .collect();
+            let max_nz = NonZeroUsize::new(max).unwrap();
+
+            let evicted = plan_eviction(&entries, max_nz);
+            let survivors = entries.len() - evicted.len();
+
+            prop_assert_eq!(evicted.len(), entries.len().saturating_sub(max));
+            prop_assert!(survivors <= max);
+            if entries.len() <= max {
+                prop_assert!(evicted.is_empty());
+            }
+
+            // No evicted entry is newer than any survivor, under the same total
+            // order the planner uses (last_used, then slug).
+            let evicted_set: HashSet<&String> = evicted.iter().collect();
+            let order = |e: &MirrorCacheEntry| (e.last_used, e.slug.clone());
+            let newest_evicted = entries
+                .iter()
+                .filter(|e| evicted_set.contains(&e.slug))
+                .map(order)
+                .max();
+            let oldest_survivor = entries
+                .iter()
+                .filter(|e| !evicted_set.contains(&e.slug))
+                .map(order)
+                .min();
+            if let (Some(evicted_max), Some(survivor_min)) = (newest_evicted, oldest_survivor) {
+                prop_assert!(
+                    evicted_max <= survivor_min,
+                    "evicted {evicted_max:?} should not be newer than survivor {survivor_min:?}"
+                );
+            }
+        }
+    }
+}
