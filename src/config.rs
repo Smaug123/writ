@@ -27,6 +27,7 @@ use crate::vm_git_bundle::{
     DEFAULT_GIT_CLONE_BASE_URL, GitCloneBaseUrl, GitCloneBundlePlanError, GitCredentialBoundary,
     GitSecretEnvVar, GitSecretEnvVarError,
 };
+use crate::vm_git_mirror_cache::MirrorCache;
 use crate::vm_http::{
     DEFAULT_CLAUDE_ANTHROPIC_VERSION, VmHttpClaudeProxyAuthKind, VmHttpClaudeProxyConfig,
     VmHttpClaudeProxyConfigError, VmHttpGitCloneConfig, VmHttpNixCacheConfig,
@@ -388,6 +389,13 @@ pub struct AgentVmHttpConfig {
     /// leaves nix-cache behaviour identical to upstream-only.
     #[serde(default)]
     pub flake_input_cache_dir: Option<PathBuf>,
+    /// Directory of the `(repo, rev)`-keyed cache that retains each clone's bare
+    /// mirror for later flake-input provisioning. `None` (the default) keeps the
+    /// historical behaviour — the mirror is discarded once its bundle is read.
+    /// The cache holds bare clones of possibly-private repositories, so the
+    /// directory is created owner-only (0700) on first use.
+    #[serde(default)]
+    pub flake_mirror_cache_dir: Option<PathBuf>,
     #[serde(default)]
     pub claude_proxy: Option<AgentVmHttpClaudeProxyConfig>,
     #[serde(default)]
@@ -515,6 +523,10 @@ pub enum AgentVmHttpConfigError {
         path: PathBuf,
         source: std::io::Error,
     },
+    #[error("flake mirror cache dir path must not be empty")]
+    EmptyFlakeMirrorCacheDir,
+    #[error("flake mirror cache dir path must be absolute: {0:?}")]
+    RelativeFlakeMirrorCacheDir(PathBuf),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -592,6 +604,16 @@ impl AgentVmHttpConfig {
             Duration::from_secs(self.clone_timeout_secs),
             self.max_bundle_bytes,
         )?;
+        // When configured, retain each clone's bare mirror for later
+        // flake-input provisioning; the cache creates its (owner-only) directory
+        // on first insert. `None` keeps the discard-after-bundle behaviour.
+        let mirror_cache = self
+            .flake_mirror_cache_dir
+            .clone()
+            .map(validate_flake_mirror_cache_dir)
+            .transpose()?
+            .map(MirrorCache::new);
+        let git_clone = git_clone.with_mirror_cache(mirror_cache);
         // `prepare_git_work_root` refuses to clone into a work root whose mode
         // has group/world bits set, but `validate_*_root` below creates the
         // staging/log subdirs with `create_dir_all`, which propagates the
@@ -849,6 +871,20 @@ fn validate_git_push_staging_root(path: PathBuf) -> Result<PathBuf, AgentVmHttpC
             source,
         }
     })?;
+    Ok(path)
+}
+
+/// Validate a configured flake mirror cache directory: a non-empty absolute
+/// path. The owner-only directory is created lazily on first insert by
+/// [`MirrorCache`], so this only fails fast on a misconfigured path rather than
+/// creating or probing anything.
+fn validate_flake_mirror_cache_dir(path: PathBuf) -> Result<PathBuf, AgentVmHttpConfigError> {
+    if path.as_os_str().is_empty() {
+        return Err(AgentVmHttpConfigError::EmptyFlakeMirrorCacheDir);
+    }
+    if !path.is_absolute() {
+        return Err(AgentVmHttpConfigError::RelativeFlakeMirrorCacheDir(path));
+    }
     Ok(path)
 }
 
@@ -1564,6 +1600,7 @@ mod tests {
             nix_cache_max_metadata_bytes: 1_048_576,
             nix_cache_max_nar_bytes: 67_108_864,
             flake_input_cache_dir: None,
+            flake_mirror_cache_dir: None,
             claude_proxy: None,
             openai_proxy: None,
             agent_run_log_root: None,
@@ -1872,6 +1909,7 @@ mod tests {
         assert!(c.agent_run_log_root.is_none());
         assert!(c.git_push_staging_root.is_none());
         assert!(c.flake_input_cache_dir.is_none());
+        assert!(c.flake_mirror_cache_dir.is_none());
     }
 
     #[test]
@@ -1980,6 +2018,40 @@ mod tests {
             c.to_runtime_config(),
             Err(AgentVmHttpConfigError::RelativeFlakeInputCacheDir(path))
                 if path.as_os_str() == "flake-input-cache"
+        ));
+    }
+
+    #[test]
+    fn agent_vm_http_config_wires_explicit_flake_mirror_cache_dir() {
+        let mirror_cache = unique_config_test_path("flake-mirror-cache");
+        let mut c = valid_agent_vm_http_config();
+        c.flake_mirror_cache_dir = Some(mirror_cache.clone());
+
+        let runtime = c.to_runtime_config().unwrap();
+
+        assert_eq!(
+            runtime.git_clone().mirror_cache().map(|cache| cache.root()),
+            Some(mirror_cache.as_path())
+        );
+    }
+
+    #[test]
+    fn agent_vm_http_config_defaults_to_no_mirror_cache() {
+        let runtime = valid_agent_vm_http_config().to_runtime_config().unwrap();
+        // Retention is opt-in: without the dir, the clone handler discards the
+        // mirror exactly as before.
+        assert!(runtime.git_clone().mirror_cache().is_none());
+    }
+
+    #[test]
+    fn agent_vm_http_config_rejects_relative_flake_mirror_cache_dir() {
+        let mut c = valid_agent_vm_http_config();
+        c.flake_mirror_cache_dir = Some(PathBuf::from("flake-mirror-cache"));
+
+        assert!(matches!(
+            c.to_runtime_config(),
+            Err(AgentVmHttpConfigError::RelativeFlakeMirrorCacheDir(path))
+                if path.as_os_str() == "flake-mirror-cache"
         ));
     }
 

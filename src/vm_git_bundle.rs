@@ -452,6 +452,10 @@ impl GitCloneBundlePlan {
         &self.mirror_dir
     }
 
+    pub fn git_program(&self) -> &Path {
+        &self.git_program
+    }
+
     pub fn bundle_path(&self) -> &Path {
         &self.bundle_path
     }

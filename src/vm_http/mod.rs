@@ -1665,6 +1665,11 @@ mod tests {
             .unwrap();
     }
 
+    /// The commit hash the fake git's `rev-parse` reports, so a test that
+    /// configures a mirror cache can compute the `(repo, rev)` key the clone
+    /// handler retains under.
+    pub(super) const FAKE_GIT_REV_PARSE_SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+
     pub(super) fn write_fake_git(dir: &Path) -> PathBuf {
         write_fake_git_with_bundle_epilogue(dir, "")
     }
@@ -1711,6 +1716,9 @@ case " $* " in
     printf 'bundle-from-fake-git\n' > "$bundle"
     {bundle_epilogue}
     ;;
+  *" rev-parse "*)
+    printf '%s\n' '{sha}'
+    ;;
   *)
     exit 64
     ;;
@@ -1719,6 +1727,7 @@ esac
             shell = shell.display(),
             log = log_path,
             mkdir = mkdir,
+            sha = FAKE_GIT_REV_PARSE_SHA,
             bundle_epilogue = bundle_epilogue,
         );
         std::fs::write(&git, script).unwrap();
