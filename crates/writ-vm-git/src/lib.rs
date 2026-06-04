@@ -13,7 +13,9 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
-use crate::core::{CapabilityRequest, GitHubAccess, GitHubRequest, RepoRef, RequestId, UnixMillis};
+use writ_core::core::{
+    CapabilityRequest, GitHubAccess, GitHubRequest, RepoRef, RequestId, UnixMillis,
+};
 
 pub const VM_GIT_CLONE_PATH: &str = "/v1/git/clone";
 pub const VM_GIT_PUSH_PATH: &str = "/v1/git/push";

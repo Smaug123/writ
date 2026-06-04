@@ -76,7 +76,7 @@ pub mod ui_http;
 #[cfg(feature = "vm-client")]
 pub mod vm_client;
 #[cfg(feature = "vm-client")]
-pub mod vm_git;
+pub use writ_vm_git as vm_git;
 #[cfg(feature = "host")]
 pub mod vm_git_bundle;
 #[cfg(feature = "host")]
