@@ -12,9 +12,15 @@
 //!
 //! The store is just a directory on disk: there is no shared in-memory state,
 //! so concurrent broker tasks coordinate purely through atomic filesystem
-//! operations (`create_dir` to claim a slot, `rename` to publish the mirror).
-//! The cache is the imperative shell; [`plan_eviction`] is the pure core that
-//! decides what the bound sheds.
+//! operations — each insert stages a complete entry in a private temp
+//! directory and publishes it with a single `rename`. The cache is the
+//! imperative shell; [`plan_eviction`] is the pure core that decides what the
+//! bound sheds.
+//!
+//! Retaining mirrors is all this stage does. The read/lease side that hands a
+//! *pinned* mirror to the provisioner — and so must be safe against concurrent
+//! eviction (a bare `get` returning a path the bound could delete out from
+//! under the caller is not) — lands with that consumer in a later stage.
 
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
@@ -233,20 +239,6 @@ impl MirrorCache {
         }
     }
 
-    /// Return the path to the cached bare mirror for `key`, if present, marking
-    /// it as freshly used. `None` means no mirror is cached for this key (or the
-    /// slot is mid-publish), so the caller must fall back to a fresh clone.
-    pub fn get(&self, key: &MirrorCacheKey) -> Option<PathBuf> {
-        let entry = self.root.join(key.slug());
-        let mirror = entry.join(MIRROR_DIR_NAME);
-        if mirror.is_dir() {
-            let _ = self.touch(&entry);
-            Some(mirror)
-        } else {
-            None
-        }
-    }
-
     /// Stamp the entry's last-used sentinel with the current time by recreating
     /// it (an `O_CREAT|O_TRUNC` open updates the mtime).
     fn touch(&self, entry: &Path) -> std::io::Result<()> {
@@ -390,6 +382,13 @@ mod tests {
         dir
     }
 
+    /// The on-disk path where a stored mirror lives. FK3b ships no read API
+    /// (the safe, eviction-pinned read lands with its consumer), so the tests
+    /// assert cache state directly against the layout.
+    fn stored_mirror(cache: &MirrorCache, key: &MirrorCacheKey) -> PathBuf {
+        cache.root().join(key.slug()).join(MIRROR_DIR_NAME)
+    }
+
     #[test]
     fn parse_accepts_sha1_and_sha256_and_trims_newline() {
         assert_eq!(sha(&"a".repeat(40)).as_str(), &"a".repeat(40));
@@ -438,7 +437,7 @@ mod tests {
     }
 
     #[test]
-    fn insert_then_get_returns_the_moved_mirror() {
+    fn insert_moves_the_mirror_into_the_cache() {
         let tmp = tempfile::tempdir().unwrap();
         let cache = MirrorCache::new(tmp.path().join("cache"), NonZeroUsize::new(4).unwrap());
         let key = MirrorCacheKey::new(&repo("o", "r"), &sha(&forty(1)));
@@ -450,16 +449,10 @@ mod tests {
         );
         // The source was moved, not copied.
         assert!(!src.exists());
-        let mirror = cache.get(&key).expect("mirror should be cached");
-        assert_eq!(std::fs::read(mirror.join("HEAD")).unwrap(), b"content");
-    }
-
-    #[test]
-    fn get_misses_for_an_unknown_key() {
-        let tmp = tempfile::tempdir().unwrap();
-        let cache = MirrorCache::new(tmp.path().join("cache"), NonZeroUsize::new(4).unwrap());
-        let key = MirrorCacheKey::new(&repo("o", "r"), &sha(&forty(9)));
-        assert!(cache.get(&key).is_none());
+        assert_eq!(
+            std::fs::read(stored_mirror(&cache, &key).join("HEAD")).unwrap(),
+            b"content"
+        );
     }
 
     #[test]
@@ -480,8 +473,10 @@ mod tests {
         );
 
         // The original is preserved; the losing source is left for its caller.
-        let mirror = cache.get(&key).unwrap();
-        assert_eq!(std::fs::read(mirror.join("HEAD")).unwrap(), b"first");
+        assert_eq!(
+            std::fs::read(stored_mirror(&cache, &key).join("HEAD")).unwrap(),
+            b"first"
+        );
         assert!(second.exists(), "the deduped source must be left untouched");
     }
 
@@ -493,14 +488,14 @@ mod tests {
         let missing = tmp.path().join("does-not-exist");
 
         assert!(cache.insert(&key, &missing).is_err());
-        // No empty slot is left behind, so a later real insert still wins.
-        assert!(cache.get(&key).is_none());
+        // No slot is left behind, so a later real insert still wins.
+        assert!(!stored_mirror(&cache, &key).exists());
         let real = make_mirror(tmp.path(), "real");
         assert_eq!(
             cache.insert(&key, &real).unwrap(),
             MirrorCacheInsertion::Stored
         );
-        assert!(cache.get(&key).is_some());
+        assert!(stored_mirror(&cache, &key).exists());
     }
 
     #[cfg(unix)]
@@ -528,15 +523,17 @@ mod tests {
         // Simulate a crash that left an empty slug directory with no mirror: a
         // poisoned slot that must not block this key from ever caching again.
         std::fs::create_dir_all(cache.root().join(key.slug())).unwrap();
-        assert!(cache.get(&key).is_none());
+        assert!(!stored_mirror(&cache, &key).exists());
 
         let src = make_mirror(tmp.path(), "healed");
         assert_eq!(
             cache.insert(&key, &src).unwrap(),
             MirrorCacheInsertion::Stored
         );
-        let mirror = cache.get(&key).unwrap();
-        assert_eq!(std::fs::read(mirror.join("HEAD")).unwrap(), b"healed");
+        assert_eq!(
+            std::fs::read(stored_mirror(&cache, &key).join("HEAD")).unwrap(),
+            b"healed"
+        );
     }
 
     #[test]
@@ -578,7 +575,10 @@ mod tests {
         // real entry is left untouched.
         cache.sweep_stale_staging(SystemTime::now() + STALE_STAGING_AGE + Duration::from_secs(1));
         assert!(!staging.exists(), "an aged-out staging dir must be swept");
-        assert!(cache.get(&key).is_some(), "the real entry must survive a sweep");
+        assert!(
+            stored_mirror(&cache, &key).exists(),
+            "the real entry must survive a sweep"
+        );
     }
 
     #[test]
