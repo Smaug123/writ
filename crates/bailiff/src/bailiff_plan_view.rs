@@ -6,11 +6,11 @@
 
 use crate::bailiff_decision::{Decider, Decision};
 use crate::bailiff_plan_note::{DecisionNote, ImplementNote, PlanId, PlanNote, ReviewNote};
-use crate::core::{SshSignature, UnixMillis};
-use crate::protocol::SignedRunMetadata;
-use crate::run_envelope::SignedRunEnvelope;
-use crate::run_verify::VerifyError;
-use crate::vm_git::GitObjectId;
+use writ::core::{SshSignature, UnixMillis};
+use writ::protocol::SignedRunMetadata;
+use writ::run_envelope::SignedRunEnvelope;
+use writ::run_verify::VerifyError;
+use writ::vm_git::GitObjectId;
 
 /// Aggregate per-plan view used by `bailiff plan list`. Each `Option`
 /// field is `None` when the corresponding note has not been attached
@@ -151,7 +151,7 @@ impl BailiffPlanSummary {
 /// `read_*_note` helpers and, for every available signed note,
 /// pairing it with the writ envelope referenced by its
 /// `writ_output_oid` and verifying the signature against
-/// [`crate::run_verify::AllowedSigners`].
+/// [`writ::run_verify::AllowedSigners`].
 ///
 /// All four note fields are `Option`: a workflow-conformant plan has
 /// every field set, but each can independently be absent. The plan
@@ -175,7 +175,7 @@ pub struct PlanFullView {
 /// `bailiff plan show` (slice F4) must surface:
 ///
 /// - [`VerifiedSection::Verified`]: envelope present, decoded,
-///   end-to-end verified by [`crate::run_verify::verify_run_envelope`], **and** the
+///   end-to-end verified by [`writ::run_verify::verify_run_envelope`], **and** the
 ///   note's copied `(signed_metadata, signature)` pair matches the
 ///   envelope's. Carries both the note and the envelope so the F4
 ///   renderer can project from either without re-reading.
@@ -198,7 +198,7 @@ pub struct PlanFullView {
 ///   the underlying [`serde_json::Error`] so the operator can locate
 ///   the offending note blob.
 /// - [`VerifiedSection::SignatureFailure`]: envelope decoded but
-///   [`crate::run_verify::verify_run_envelope`] rejected it. The wrapped [`VerifyError`]
+///   [`writ::run_verify::verify_run_envelope`] rejected it. The wrapped [`VerifyError`]
 ///   names the specific check that failed (output-digest mismatch,
 ///   signer not in allowed list, or signature invalid).
 ///

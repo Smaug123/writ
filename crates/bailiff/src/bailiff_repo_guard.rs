@@ -47,7 +47,7 @@ use std::sync::Arc;
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 use tokio::task::JoinError;
 
-use crate::notes_repo::NotesRepo;
+use writ::notes_repo::NotesRepo;
 
 /// Lock-hold scope for one bailiff workflow.
 ///

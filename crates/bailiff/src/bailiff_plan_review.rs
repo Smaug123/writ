@@ -39,18 +39,18 @@ use thiserror::Error;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::task::JoinError;
 
-use crate::agent_run::{AgentPrompt, AgentPromptError};
 use crate::bailiff_plan_note::{PlanId, PlanNote};
 use crate::bailiff_plan_read::{
     ReadPlanBodyError, ReadPlanError, read_plan_body_bytes, read_plan_note,
 };
 use crate::bailiff_plan_write::{WriteReviewNoteError, write_review_note};
 use crate::bailiff_repo_guard::BailiffRepoGuard;
-use crate::core::{AgentKind, CapabilitySet, NotesRef, SessionId};
-use crate::notes_repo::NotesRepo;
-use crate::run_verify::AllowedSigners;
-use crate::vm_git::GitObjectId;
-use crate::writ_client::{RunAgentCompleted, RunAgentRequest, WritClient, WritClientError};
+use writ::agent_run::{AgentPrompt, AgentPromptError};
+use writ::core::{AgentKind, CapabilitySet, NotesRef, SessionId};
+use writ::notes_repo::NotesRepo;
+use writ::run_verify::AllowedSigners;
+use writ::vm_git::GitObjectId;
+use writ::writ_client::{RunAgentCompleted, RunAgentRequest, WritClient, WritClientError};
 
 /// Inputs to [`submit_review`]. Mirror of [`crate::bailiff_plan_submit::SubmitPlanInputs`]
 /// with `plan_id` non-optional (the plan must already exist) and
@@ -333,7 +333,7 @@ pub enum SubmitReviewError {
     ReadPlanEnvelope(#[source] ReadPlanBodyError),
     /// The composed reviewer prompt (`reviewer_instructions` +
     /// separator + `plan_body`) exceeded
-    /// [`crate::agent_run::MAX_AGENT_PROMPT_BYTES`]. Either the
+    /// [`writ::agent_run::MAX_AGENT_PROMPT_BYTES`]. Either the
     /// reviewer instructions are large, the plan body is large, or
     /// both — the operator's recourse is to narrow one side.
     /// Pre-RPC.
@@ -426,7 +426,7 @@ mod compose_tests {
     fn errors_when_combined_exceeds_agent_prompt_limit() {
         // Instructions at the cap, non-empty plan body, plus the
         // separator must overflow `AgentPrompt::try_new`.
-        let instructions = "x".repeat(crate::agent_run::MAX_AGENT_PROMPT_BYTES);
+        let instructions = "x".repeat(writ::agent_run::MAX_AGENT_PROMPT_BYTES);
         let err = compose_reviewer_prompt_bytes(&instructions, "p").unwrap_err();
         assert!(err.to_string().contains("exceeding"), "{err}");
     }
@@ -448,20 +448,20 @@ mod end_to_end_tests {
     use wiremock::MockServer;
 
     use super::*;
-    use crate::audit::AuditLog;
     use crate::bailiff_plan_note::{ReviewNote, plan_notes_ref};
     use crate::bailiff_plan_submit::{SubmitPlanInputs, submit_plan};
-    use crate::core::{AgentKind, CapabilitySet, NotesRef, RepoRef, TtlSeconds};
-    use crate::github::{GitHubAppConfig, GitHubAppRegistryConfig, GitHubMinter};
-    use crate::notes_repo::NotesRepo;
-    use crate::policy::PolicyConfig;
-    use crate::run_verify::AllowedSigners;
-    use crate::secret::{SecretError, SecretKey, SecretStore};
-    use crate::server::{
+    use writ::audit::AuditLog;
+    use writ::core::{AgentKind, CapabilitySet, NotesRef, RepoRef, TtlSeconds};
+    use writ::github::{GitHubAppConfig, GitHubAppRegistryConfig, GitHubMinter};
+    use writ::notes_repo::NotesRepo;
+    use writ::policy::PolicyConfig;
+    use writ::run_verify::AllowedSigners;
+    use writ::secret::{SecretError, SecretKey, SecretStore};
+    use writ::server::{
         BrokerState, RunAgentSpawnConfig, prepare_broker_listener, serve_broker_with_agent_vm,
     };
-    use crate::signing::WritSigningKey;
-    use crate::writ_client::WritClient;
+    use writ::signing::WritSigningKey;
+    use writ::writ_client::WritClient;
 
     const SIGNING_PEM: &str = include_str!("../tests/fixtures/ed25519_test_signing.key");
     const SIGNING_PUB: &str = include_str!("../tests/fixtures/ed25519_test_signing.key.pub");

@@ -175,13 +175,34 @@ still pass.
 
 ### FK3 — Wire provisioning into bootstrap
 
-Guest, after clone and before `warm_workspace`, triggers provisioning and
-realises the input paths (`src/vm_client.rs:518`). The host runs FK1 while
-it has the repo checked out from the clone, avoiding a second fetch.
-Oracle: `scripts/prove-agent-vm-devshell-warm.sh` boots a no-egress VM,
-clones a fixture repo with a real github input, warms `devshell`, asserts
-success, asserts no guest github egress, checks the `flake_provision`
-audit rows.
+Trigger shape decided (2026-06-03): a **separate `/v1/nix/flake/provision`
+endpoint** the guest calls after clone and before `warm_workspace`
+(`src/vm_client.rs:518`), backed by a **host-side retained bare-`mirror.git`
+cache keyed by `(repo, rev)`** so concurrent VMs provisioning the same flake
+share one fetch. The broker re-derives the checkout from its own retained
+mirror (`git archive <rev>` → temp `flake_dir` → `provision_flake_inputs`);
+the guest never POSTs flake content.
+
+Decomposed into reviewable stages:
+
+- **FK3a — serve a shared CA cache dir.** Add `flake_input_cache_dir` to
+  `AgentVmHttpConfig` (default `<work_root>/flake-input-cache`) and wire it
+  into the runtime nix-cache via `with_local_cache_dir`. Empty dir ⇒ no
+  behaviour change. *(landed in this PR)*
+- **FK3b — retain the cloned mirror.** Replace the clone handler's immediate
+  `remove_dir_all` (`src/vm_http/git_clone.rs:302`) with a `(repo, rev)`-keyed,
+  bounded mirror store; functional core for the key + lifecycle, with
+  concurrent-populate handling.
+- **FK3c — the provision endpoint.** `/v1/nix/flake/provision`: protocol +
+  route + session-capability auth; materialises a temp `flake_dir` from the
+  retained mirror and calls `provision_flake_inputs` into the shared cache.
+  Introduces the host `nix_program` path + bounds config.
+- **FK3d — guest bootstrap call.** In `init_workspace_from_broker`, between
+  checkout and warm, POST the provision request; degrade on refuse.
+- **FK3e — end-to-end oracle.** `scripts/prove-agent-vm-devshell-warm.sh`
+  boots a no-egress VM, clones a fixture repo with a real github input, warms
+  `devshell`, asserts success, asserts no guest github egress, checks the
+  `flake_provision` audit rows.
 
 ### FK4 — Docs, config, GC
 
@@ -217,10 +238,11 @@ than papered over.
 
 ## Open questions
 
-- Per-session vs. shared content-addressed broker archive. Default: shared
-  CA store with per-session `flake_provision` audit rows. Revisit if audit
-  isolation demands per-session.
+- Per-session vs. shared content-addressed broker archive. **Resolved:**
+  shared CA store with per-session `flake_provision` audit rows (the user
+  expects many concurrent VMs provisioning the same flake, so cross-session
+  dedup matters). Revisit only if audit isolation later demands per-session.
 - Whether FK3 folds provisioning into the clone response or uses a separate
-  `/v1/nix/flake/provision` call. Leaning separate-endpoint for
-  orthogonality, with a short-lived host repo cache keyed by (repo, rev) so
-  clone + provision don't double-fetch.
+  `/v1/nix/flake/provision` call. **Resolved (2026-06-03):** separate
+  endpoint, with a `(repo, rev)`-keyed retained host mirror cache so clone +
+  provision don't double-fetch and concurrent VMs share one fetch.

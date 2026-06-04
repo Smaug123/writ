@@ -12,8 +12,8 @@
 use super::test_support::*;
 use super::*;
 use crate::bailiff_plan_note::{PlanId, PlanNote, plan_notes_ref, plan_submission_seed_blob_bytes};
-use crate::signing::{WritSigningKey, WritVerifyingKey};
 use tempfile::TempDir;
+use writ::signing::{WritSigningKey, WritVerifyingKey};
 
 /// Happy path: with writ's note in place and an allowed-signers
 /// list that contains writ's key, `write_plan_note` writes a
@@ -117,7 +117,7 @@ fn write_plan_note_rejects_signature_mismatch_between_envelope_and_reply() {
 
     // Substitute the signature with a different (still well-formed)
     // SshSignature — the byte mismatch is what trips the check.
-    completed.signature = crate::core::SshSignature::try_new(
+    completed.signature = writ::core::SshSignature::try_new(
         "-----BEGIN SSH SIGNATURE-----\nU1NIU0lH-other-bytes\n-----END SSH SIGNATURE-----",
     )
     .unwrap();

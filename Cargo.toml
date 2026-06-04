@@ -4,11 +4,11 @@ version = "0.1.0"
 edition = "2024"
 
 [workspace]
-members = ["crates/writ-core"]
+members = ["crates/writ-core", "crates/bailiff"]
 # Without this, root-level `cargo clippy/test/doc` (as run by CI) select only
-# the root `writ` package, silently skipping writ-core's own test targets and
-# rustdoc. Keep every member in the default gate set.
-default-members = [".", "crates/writ-core"]
+# the root `writ` package, silently skipping member crates' own test targets
+# and rustdoc. Keep every member in the default gate set.
+default-members = [".", "crates/writ-core", "crates/bailiff"]
 resolver = "3"
 
 [features]
@@ -57,11 +57,6 @@ required-features = ["vm-client"]
 [[bin]]
 name = "writd"
 path = "src/bin/writd.rs"
-required-features = ["host"]
-
-[[bin]]
-name = "bailiff"
-path = "src/bin/bailiff.rs"
 required-features = ["host"]
 
 [dependencies]

@@ -381,6 +381,13 @@ pub struct AgentVmHttpConfig {
     pub nix_cache_max_metadata_bytes: u64,
     #[serde(default = "default_nix_cache_max_nar_bytes")]
     pub nix_cache_max_nar_bytes: u64,
+    /// Directory of the broker-local, content-addressed flake-input cache the
+    /// nix-cache endpoint serves local-first (before proxying upstream).
+    /// `None` defaults to `<work_root>/flake-input-cache`. Flake-input
+    /// provisioning (a later bootstrap stage) populates it; an empty directory
+    /// leaves nix-cache behaviour identical to upstream-only.
+    #[serde(default)]
+    pub flake_input_cache_dir: Option<PathBuf>,
     #[serde(default)]
     pub claude_proxy: Option<AgentVmHttpClaudeProxyConfig>,
     #[serde(default)]
@@ -494,6 +501,20 @@ pub enum AgentVmHttpConfigError {
          use a dedicated 0700 directory"
     )]
     WorkRootInsecure { path: PathBuf, mode: u32 },
+    #[error("flake input cache dir path must not be empty")]
+    EmptyFlakeInputCacheDir,
+    #[error("flake input cache dir path must be absolute: {0:?}")]
+    RelativeFlakeInputCacheDir(PathBuf),
+    #[error("flake input cache dir {path:?} could not be created: {source}")]
+    FlakeInputCacheDirCreate {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    #[error("flake input cache dir {path:?} is not writable: {source}")]
+    FlakeInputCacheDirProbe {
+        path: PathBuf,
+        source: std::io::Error,
+    },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -581,12 +602,23 @@ impl AgentVmHttpConfig {
         ensure_vm_http_work_root_private(&self.work_root)?;
         let trusted_public_keys =
             NixTrustedPublicKeys::from_strings(self.nix_cache_trusted_public_keys.clone())?;
+        // The broker-local flake-input archive lives under work_root by default,
+        // alongside the agent-run and git-push roots. Wiring it as the nix-cache
+        // local cache makes the endpoint serve archived inputs local-first; an
+        // empty directory (nothing provisioned yet) is byte-identical to
+        // upstream-only serving.
+        let flake_input_cache_dir = match &self.flake_input_cache_dir {
+            Some(path) => path.clone(),
+            None => self.work_root.join("flake-input-cache"),
+        };
+        let flake_input_cache_dir = validate_flake_input_cache_dir(flake_input_cache_dir)?;
         let nix_cache = VmHttpNixCacheConfig::new_with_trusted_public_keys(
             &self.nix_cache_url,
             self.nix_cache_max_metadata_bytes,
             self.nix_cache_max_nar_bytes,
             trusted_public_keys,
-        )?;
+        )?
+        .with_local_cache_dir(Some(flake_input_cache_dir));
         let claude_proxy = self
             .claude_proxy
             .as_ref()
@@ -813,6 +845,49 @@ fn validate_git_push_staging_root(path: PathBuf) -> Result<PathBuf, AgentVmHttpC
         })?;
     std::fs::remove_file(&probe).map_err(|source| {
         AgentVmHttpConfigError::GitPushStagingRootProbe {
+            path: path.clone(),
+            source,
+        }
+    })?;
+    Ok(path)
+}
+
+fn validate_flake_input_cache_dir(path: PathBuf) -> Result<PathBuf, AgentVmHttpConfigError> {
+    if path.as_os_str().is_empty() {
+        return Err(AgentVmHttpConfigError::EmptyFlakeInputCacheDir);
+    }
+    if !path.is_absolute() {
+        return Err(AgentVmHttpConfigError::RelativeFlakeInputCacheDir(path));
+    }
+    std::fs::create_dir_all(&path).map_err(|source| {
+        AgentVmHttpConfigError::FlakeInputCacheDirCreate {
+            path: path.clone(),
+            source,
+        }
+    })?;
+    let probe = path.join(format!(
+        ".writ-flake-input-cache-probe-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+        .and_then(|mut file| {
+            use std::io::Write as _;
+            file.write_all(b"probe")?;
+            file.sync_all()
+        })
+        .map_err(|source| AgentVmHttpConfigError::FlakeInputCacheDirProbe {
+            path: path.clone(),
+            source,
+        })?;
+    std::fs::remove_file(&probe).map_err(|source| {
+        AgentVmHttpConfigError::FlakeInputCacheDirProbe {
             path: path.clone(),
             source,
         }
@@ -1345,6 +1420,12 @@ mod tests {
             1_048_576
         );
         assert_eq!(runtime.vm_http().nix_cache().max_nar_bytes(), 67_108_864);
+        // Omitted from JSON, so the local flake-input cache defaults under
+        // work_root and is wired into the nix-cache config.
+        assert_eq!(
+            runtime.vm_http().nix_cache().local_cache_dir(),
+            Some(work_root.join("flake-input-cache").as_path())
+        );
         assert_eq!(
             runtime
                 .vm_http()
@@ -1482,6 +1563,7 @@ mod tests {
             nix_cache_trusted_public_keys: Vec::new(),
             nix_cache_max_metadata_bytes: 1_048_576,
             nix_cache_max_nar_bytes: 67_108_864,
+            flake_input_cache_dir: None,
             claude_proxy: None,
             openai_proxy: None,
             agent_run_log_root: None,
@@ -1789,6 +1871,7 @@ mod tests {
         assert!(c.openai_proxy.is_none());
         assert!(c.agent_run_log_root.is_none());
         assert!(c.git_push_staging_root.is_none());
+        assert!(c.flake_input_cache_dir.is_none());
     }
 
     #[test]
@@ -1868,6 +1951,49 @@ mod tests {
         assert!(matches!(
             c.to_runtime_config(),
             Err(AgentVmHttpConfigError::GitPushStagingRootCreate {
+                path: failed,
+                ..
+            }) if failed == path
+        ));
+    }
+
+    #[test]
+    fn agent_vm_http_config_wires_explicit_flake_input_cache_dir() {
+        let flake_cache = unique_config_test_path("flake-input-cache");
+        let mut c = valid_agent_vm_http_config();
+        c.flake_input_cache_dir = Some(flake_cache.clone());
+
+        let runtime = c.to_runtime_config().unwrap();
+
+        assert_eq!(
+            runtime.nix_cache().local_cache_dir(),
+            Some(flake_cache.as_path())
+        );
+    }
+
+    #[test]
+    fn agent_vm_http_config_rejects_relative_flake_input_cache_dir() {
+        let mut c = valid_agent_vm_http_config();
+        c.flake_input_cache_dir = Some(PathBuf::from("flake-input-cache"));
+
+        assert!(matches!(
+            c.to_runtime_config(),
+            Err(AgentVmHttpConfigError::RelativeFlakeInputCacheDir(path))
+                if path.as_os_str() == "flake-input-cache"
+        ));
+    }
+
+    #[test]
+    fn agent_vm_http_config_rejects_unwritable_flake_input_cache_dir() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("not-a-directory");
+        std::fs::write(&path, b"file").unwrap();
+        let mut c = valid_agent_vm_http_config();
+        c.flake_input_cache_dir = Some(path.clone());
+
+        assert!(matches!(
+            c.to_runtime_config(),
+            Err(AgentVmHttpConfigError::FlakeInputCacheDirCreate {
                 path: failed,
                 ..
             }) if failed == path
@@ -1994,6 +2120,22 @@ mod tests {
         assert_eq!(
             runtime.git_push_staging_root(),
             work_root.join("git-push-staging")
+        );
+    }
+
+    #[test]
+    fn agent_vm_http_config_defaults_flake_input_cache_dir_to_work_root_subdir() {
+        let temp = tempfile::tempdir().unwrap();
+        let work_root = temp.path().join("vm-work");
+        let mut c = valid_agent_vm_http_config();
+        c.work_root = work_root.clone();
+        c.flake_input_cache_dir = None;
+
+        let runtime = c.to_runtime_config().unwrap();
+
+        assert_eq!(
+            runtime.nix_cache().local_cache_dir(),
+            Some(work_root.join("flake-input-cache").as_path())
         );
     }
 
