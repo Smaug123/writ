@@ -18,7 +18,7 @@
 
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use crate::agent_run::sha256_hex;
 use crate::core::RepoRef;
@@ -32,6 +32,15 @@ const MIRROR_DIR_NAME: &str = "mirror.git";
 /// looked up. The directory's own mtime is not portable enough to rely on for
 /// LRU ordering, so the cache stamps this file explicitly.
 const LAST_USED_FILE: &str = ".last_used";
+
+/// Prefix of the private temporary directory an in-flight publish stages into.
+const STAGING_PREFIX: &str = ".staging-";
+
+/// A `.staging-*` directory older than this is treated as a crash leftover and
+/// swept. A real publish only holds its staging directory for two renames
+/// (the clone already happened), so any staging directory this old cannot
+/// belong to a live insert; the margin is generous to tolerate slow disks.
+const STALE_STAGING_AGE: Duration = Duration::from_secs(3600);
 
 /// A resolved Git commit hash (the output of `git rev-parse`). Parsed, not
 /// validated: an interior value is always 40 (SHA-1) or 64 (SHA-256) lowercase
@@ -193,18 +202,22 @@ impl MirrorCache {
         // Stage the whole entry, then publish atomically.
         let staging = self
             .root
-            .join(format!(".staging-{}", uuid::Uuid::new_v4().simple()));
+            .join(format!("{STAGING_PREFIX}{}", uuid::Uuid::new_v4().simple()));
         create_private_dir(&staging)?;
         if let Err(err) = std::fs::rename(src_mirror, staging.join(MIRROR_DIR_NAME)) {
             let _ = std::fs::remove_dir_all(&staging);
             return Err(err);
         }
-        let _ = std::fs::File::create(staging.join(LAST_USED_FILE));
         // `rename` onto a missing or empty `entry` succeeds (publishing, or
         // healing a leftover empty slot from an earlier crash); onto a populated
         // `entry` it fails, so a concurrent winner is preserved.
         match std::fs::rename(&staging, &entry) {
             Ok(()) => {
+                // Stamp last-used as of publication, not staging creation: a
+                // slow insert must not hand `enforce_bound` a stale timestamp
+                // that makes the just-published entry look like the oldest and
+                // get evicted out from under this `Stored` return.
+                let _ = self.touch(&entry);
                 self.enforce_bound();
                 Ok(MirrorCacheInsertion::Stored)
             }
@@ -246,11 +259,41 @@ impl MirrorCache {
     /// never the victim. The bound may be transiently exceeded by the number of
     /// in-flight concurrent inserts before it settles.
     fn enforce_bound(&self) {
+        // Sweep crash leftovers first: a `.staging-*` directory holds a full
+        // mirror but is invisible to `scan`/the bound, so without this repeated
+        // interrupted inserts could grow the cache without limit.
+        self.sweep_stale_staging(SystemTime::now());
         let Ok(entries) = self.scan() else {
             return;
         };
         for slug in plan_eviction(&entries, self.max_entries) {
             let _ = std::fs::remove_dir_all(self.root.join(slug));
+        }
+    }
+
+    /// Remove `.staging-*` directories older than [`STALE_STAGING_AGE`] relative
+    /// to `now`, leaving younger ones (which may belong to a live insert)
+    /// alone. The reference time is injected so the sweep is deterministic in
+    /// tests. Best-effort: unreadable or racing entries are skipped.
+    fn sweep_stale_staging(&self, now: SystemTime) {
+        let Ok(read_dir) = std::fs::read_dir(&self.root) else {
+            return;
+        };
+        for entry in read_dir.flatten() {
+            if !entry.file_name().to_string_lossy().starts_with(STAGING_PREFIX) {
+                continue;
+            }
+            if !entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
+                continue;
+            }
+            let aged_out = std::fs::metadata(entry.path())
+                .and_then(|metadata| metadata.modified())
+                .ok()
+                .and_then(|mtime| now.duration_since(mtime).ok())
+                .is_some_and(|age| age >= STALE_STAGING_AGE);
+            if aged_out {
+                let _ = std::fs::remove_dir_all(entry.path());
+            }
         }
     }
 
@@ -514,6 +557,28 @@ mod tests {
             .filter(|e| e.as_ref().unwrap().file_type().unwrap().is_dir())
             .count();
         assert_eq!(count, max.get(), "the bound must cap retained entries");
+    }
+
+    #[test]
+    fn sweep_removes_only_aged_out_staging_dirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = MirrorCache::new(tmp.path().join("cache"), NonZeroUsize::new(4).unwrap());
+        // A real published entry plus a leftover staging dir holding a mirror
+        // (as a crash mid-publish would leave behind).
+        let key = MirrorCacheKey::new(&repo("o", "r"), &sha(&forty(1)));
+        cache.insert(&key, &make_mirror(tmp.path(), "live")).unwrap();
+        let staging = cache.root().join(format!("{STAGING_PREFIX}orphan"));
+        std::fs::create_dir_all(staging.join(MIRROR_DIR_NAME)).unwrap();
+
+        // A fresh staging dir might belong to a live insert, so it is kept.
+        cache.sweep_stale_staging(SystemTime::now());
+        assert!(staging.exists(), "a fresh staging dir must not be swept");
+
+        // Far enough ahead that it has aged out: now it is swept, while the
+        // real entry is left untouched.
+        cache.sweep_stale_staging(SystemTime::now() + STALE_STAGING_AGE + Duration::from_secs(1));
+        assert!(!staging.exists(), "an aged-out staging dir must be swept");
+        assert!(cache.get(&key).is_some(), "the real entry must survive a sweep");
     }
 
     #[test]
