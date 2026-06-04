@@ -13,16 +13,17 @@
 //! The store is just a directory on disk: there is no shared in-memory state,
 //! so concurrent broker tasks coordinate purely through atomic filesystem
 //! operations — each insert stages a complete entry in a private temp
-//! directory and publishes it with a single `rename`. The cache is the
-//! imperative shell; [`plan_eviction`] is the pure core that decides what the
-//! bound sheds.
+//! directory and publishes it with a single `rename`, deduping clones of the
+//! same key. A crash mid-publish can only leave a discardable `.staging-*`
+//! directory, which a later insert sweeps.
 //!
-//! Retaining mirrors is all this stage does. The read/lease side that hands a
-//! *pinned* mirror to the provisioner — and so must be safe against concurrent
-//! eviction (a bare `get` returning a path the bound could delete out from
-//! under the caller is not) — lands with that consumer in a later stage.
+//! This stage only *retains* mirrors; it deliberately does not evict. Deleting
+//! an entry safely means knowing which mirrors are pinned by an in-flight
+//! provision — the same coordination the eviction-safe read side needs — so a
+//! bound that races in-flight inserts and readers here would be unsound.
+//! Bounding and the pinned read both land with the provisioner (this cache's
+//! consumer) and the GC stage, where that coordination exists.
 
-use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -33,11 +34,6 @@ use crate::core::RepoRef;
 /// `mirror.git` the clone planner produces, so the moved-in directory keeps a
 /// familiar shape for an operator inspecting the cache.
 const MIRROR_DIR_NAME: &str = "mirror.git";
-
-/// A zero-byte sentinel whose mtime records when an entry was last inserted or
-/// looked up. The directory's own mtime is not portable enough to rely on for
-/// LRU ordering, so the cache stamps this file explicitly.
-const LAST_USED_FILE: &str = ".last_used";
 
 /// Prefix of the private temporary directory an in-flight publish stages into.
 const STAGING_PREFIX: &str = ".staging-";
@@ -111,39 +107,6 @@ impl MirrorCacheKey {
     }
 }
 
-/// One cache entry as seen by the eviction planner: its directory name and when
-/// it was last used. Kept separate from the on-disk representation so the
-/// planner is a pure function over plain data.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MirrorCacheEntry {
-    pub slug: String,
-    pub last_used: SystemTime,
-}
-
-/// Choose which entries to evict so that at most `max_entries` remain, oldest
-/// `last_used` first. Pure and total: ties are broken by slug so the result is
-/// deterministic, and nothing is evicted while the cache is at or under the
-/// bound.
-pub fn plan_eviction(entries: &[MirrorCacheEntry], max_entries: NonZeroUsize) -> Vec<String> {
-    let max = max_entries.get();
-    if entries.len() <= max {
-        return Vec::new();
-    }
-    let mut ordered: Vec<&MirrorCacheEntry> = entries.iter().collect();
-    // Oldest first; slug breaks last_used ties for a deterministic victim set.
-    ordered.sort_by(|a, b| {
-        a.last_used
-            .cmp(&b.last_used)
-            .then_with(|| a.slug.cmp(&b.slug))
-    });
-    let evict_count = entries.len() - max;
-    ordered
-        .into_iter()
-        .take(evict_count)
-        .map(|entry| entry.slug.clone())
-        .collect()
-}
-
 /// Outcome of an [`MirrorCache::insert`].
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum MirrorCacheInsertion {
@@ -157,19 +120,15 @@ pub enum MirrorCacheInsertion {
 }
 
 /// A `(repo, rev)`-keyed cache of bare mirrors rooted at a directory. Cheap to
-/// clone (a path plus a bound); all state lives on disk.
+/// clone (just a path); all state lives on disk.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MirrorCache {
     root: PathBuf,
-    max_entries: NonZeroUsize,
 }
 
 impl MirrorCache {
-    pub fn new(root: impl Into<PathBuf>, max_entries: NonZeroUsize) -> Self {
-        Self {
-            root: root.into(),
-            max_entries,
-        }
+    pub fn new(root: impl Into<PathBuf>) -> Self {
+        Self { root: root.into() }
     }
 
     pub fn root(&self) -> &Path {
@@ -181,10 +140,8 @@ impl MirrorCache {
     /// a single atomic `rename`, so concurrent clones of the same `(repo, rev)`
     /// resolve to one winner and a crash or lost race can only leave a
     /// discardable `.staging-*` directory — never a half-built slot that would
-    /// shadow the key while `get` returns `None`. Losers (and the fast-path
-    /// case where a complete entry already exists) see
-    /// [`MirrorCacheInsertion::AlreadyPresent`]. After a successful store the
-    /// bound is enforced best-effort.
+    /// shadow the key. Losers (and the fast-path case where a complete entry
+    /// already exists) see [`MirrorCacheInsertion::AlreadyPresent`].
     ///
     /// `src_mirror` is moved, and on the race-loser path may be consumed even
     /// though the existing entry is kept — so the caller must clean up its own
@@ -202,7 +159,6 @@ impl MirrorCache {
         // Fast path: a complete entry already backs this key. Keep it and leave
         // the caller's source for it to clean up.
         if entry.join(MIRROR_DIR_NAME).is_dir() {
-            let _ = self.touch(&entry);
             return Ok(MirrorCacheInsertion::AlreadyPresent);
         }
         // Stage the whole entry, then publish atomically.
@@ -219,18 +175,12 @@ impl MirrorCache {
         // `entry` it fails, so a concurrent winner is preserved.
         match std::fs::rename(&staging, &entry) {
             Ok(()) => {
-                // Stamp last-used as of publication, not staging creation: a
-                // slow insert must not hand `enforce_bound` a stale timestamp
-                // that makes the just-published entry look like the oldest and
-                // get evicted out from under this `Stored` return.
-                let _ = self.touch(&entry);
-                self.enforce_bound();
+                self.sweep_stale_staging(SystemTime::now());
                 Ok(MirrorCacheInsertion::Stored)
             }
             Err(err) => {
                 let _ = std::fs::remove_dir_all(&staging);
                 if entry.join(MIRROR_DIR_NAME).is_dir() {
-                    let _ = self.touch(&entry);
                     Ok(MirrorCacheInsertion::AlreadyPresent)
                 } else {
                     Err(err)
@@ -239,34 +189,12 @@ impl MirrorCache {
         }
     }
 
-    /// Stamp the entry's last-used sentinel with the current time by recreating
-    /// it (an `O_CREAT|O_TRUNC` open updates the mtime).
-    fn touch(&self, entry: &Path) -> std::io::Result<()> {
-        std::fs::File::create(entry.join(LAST_USED_FILE)).map(drop)
-    }
-
-    /// Evict the oldest entries until the cache is within its bound. Best-effort
-    /// and race-tolerant: a victim another task already removed is ignored, and
-    /// because eviction targets the oldest entries a just-inserted mirror is
-    /// never the victim. The bound may be transiently exceeded by the number of
-    /// in-flight concurrent inserts before it settles.
-    fn enforce_bound(&self) {
-        // Sweep crash leftovers first: a `.staging-*` directory holds a full
-        // mirror but is invisible to `scan`/the bound, so without this repeated
-        // interrupted inserts could grow the cache without limit.
-        self.sweep_stale_staging(SystemTime::now());
-        let Ok(entries) = self.scan() else {
-            return;
-        };
-        for slug in plan_eviction(&entries, self.max_entries) {
-            let _ = std::fs::remove_dir_all(self.root.join(slug));
-        }
-    }
-
     /// Remove `.staging-*` directories older than [`STALE_STAGING_AGE`] relative
     /// to `now`, leaving younger ones (which may belong to a live insert)
-    /// alone. The reference time is injected so the sweep is deterministic in
-    /// tests. Best-effort: unreadable or racing entries are skipped.
+    /// alone. Without this, a crash after the source moved into staging but
+    /// before publish would leave a full mirror that nothing ever reclaims. The
+    /// reference time is injected so the sweep is deterministic in tests.
+    /// Best-effort: unreadable or racing entries are skipped.
     fn sweep_stale_staging(&self, now: SystemTime) {
         let Ok(read_dir) = std::fs::read_dir(&self.root) else {
             return;
@@ -291,43 +219,6 @@ impl MirrorCache {
                 let _ = std::fs::remove_dir_all(entry.path());
             }
         }
-    }
-
-    /// List the current cache entries (immediate subdirectories) with their
-    /// last-used times.
-    fn scan(&self) -> std::io::Result<Vec<MirrorCacheEntry>> {
-        let mut entries = Vec::new();
-        let read_dir = match std::fs::read_dir(&self.root) {
-            Ok(read_dir) => read_dir,
-            // No root yet => nothing cached.
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(entries),
-            Err(err) => return Err(err),
-        };
-        for entry in read_dir {
-            let entry = entry?;
-            if !entry.file_type()?.is_dir() {
-                continue;
-            }
-            let slug = entry.file_name().to_string_lossy().into_owned();
-            // Skip in-flight `.staging-*` publishes (and any other dotfile): a
-            // real entry slug is a 64-char hex digest and never starts with `.`.
-            if slug.starts_with('.') {
-                continue;
-            }
-            let last_used = self.last_used_of(&entry.path());
-            entries.push(MirrorCacheEntry { slug, last_used });
-        }
-        Ok(entries)
-    }
-
-    /// Read an entry's last-used time, falling back to the directory's own mtime
-    /// and finally the epoch (so a sentinel-less entry sorts as oldest and is
-    /// shed first rather than lingering forever).
-    fn last_used_of(&self, entry: &Path) -> SystemTime {
-        std::fs::metadata(entry.join(LAST_USED_FILE))
-            .and_then(|metadata| metadata.modified())
-            .or_else(|_| std::fs::metadata(entry).and_then(|metadata| metadata.modified()))
-            .unwrap_or(SystemTime::UNIX_EPOCH)
     }
 }
 
@@ -354,10 +245,7 @@ fn create_private_dir(path: &Path) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
     use std::time::Duration;
-
-    use proptest::prelude::*;
 
     use super::*;
 
@@ -386,9 +274,9 @@ mod tests {
         dir
     }
 
-    /// The on-disk path where a stored mirror lives. FK3b ships no read API
-    /// (the safe, eviction-pinned read lands with its consumer), so the tests
-    /// assert cache state directly against the layout.
+    /// The on-disk path where a stored mirror lives. The cache exposes no read
+    /// API yet (the safe, eviction-pinned read lands with its consumer), so the
+    /// tests assert cache state directly against the layout.
     fn stored_mirror(cache: &MirrorCache, key: &MirrorCacheKey) -> PathBuf {
         cache.root().join(key.slug()).join(MIRROR_DIR_NAME)
     }
@@ -446,7 +334,7 @@ mod tests {
     #[test]
     fn insert_moves_the_mirror_into_the_cache() {
         let tmp = tempfile::tempdir().unwrap();
-        let cache = MirrorCache::new(tmp.path().join("cache"), NonZeroUsize::new(4).unwrap());
+        let cache = MirrorCache::new(tmp.path().join("cache"));
         let key = MirrorCacheKey::new(&repo("o", "r"), &sha(&forty(1)));
         let src = make_mirror(tmp.path(), "content");
 
@@ -465,7 +353,7 @@ mod tests {
     #[test]
     fn second_insert_for_same_key_dedups_and_keeps_the_original() {
         let tmp = tempfile::tempdir().unwrap();
-        let cache = MirrorCache::new(tmp.path().join("cache"), NonZeroUsize::new(4).unwrap());
+        let cache = MirrorCache::new(tmp.path().join("cache"));
         let key = MirrorCacheKey::new(&repo("o", "r"), &sha(&forty(1)));
 
         let first = make_mirror(tmp.path(), "first");
@@ -490,7 +378,7 @@ mod tests {
     #[test]
     fn insert_with_missing_source_errors_and_leaves_no_poisoned_slot() {
         let tmp = tempfile::tempdir().unwrap();
-        let cache = MirrorCache::new(tmp.path().join("cache"), NonZeroUsize::new(4).unwrap());
+        let cache = MirrorCache::new(tmp.path().join("cache"));
         let key = MirrorCacheKey::new(&repo("o", "r"), &sha(&forty(1)));
         let missing = tmp.path().join("does-not-exist");
 
@@ -510,7 +398,7 @@ mod tests {
     fn insert_creates_owner_only_directories() {
         use std::os::unix::fs::PermissionsExt;
         let tmp = tempfile::tempdir().unwrap();
-        let cache = MirrorCache::new(tmp.path().join("cache"), NonZeroUsize::new(4).unwrap());
+        let cache = MirrorCache::new(tmp.path().join("cache"));
         let key = MirrorCacheKey::new(&repo("o", "r"), &sha(&forty(1)));
         let src = make_mirror(tmp.path(), "private");
         cache.insert(&key, &src).unwrap();
@@ -525,7 +413,7 @@ mod tests {
     #[test]
     fn insert_heals_an_orphaned_empty_slot() {
         let tmp = tempfile::tempdir().unwrap();
-        let cache = MirrorCache::new(tmp.path().join("cache"), NonZeroUsize::new(4).unwrap());
+        let cache = MirrorCache::new(tmp.path().join("cache"));
         let key = MirrorCacheKey::new(&repo("o", "r"), &sha(&forty(1)));
         // Simulate a crash that left an empty slug directory with no mirror: a
         // poisoned slot that must not block this key from ever caching again.
@@ -544,29 +432,9 @@ mod tests {
     }
 
     #[test]
-    fn insert_enforces_the_entry_bound() {
+    fn insert_sweeps_only_aged_out_staging_dirs() {
         let tmp = tempfile::tempdir().unwrap();
-        let max = NonZeroUsize::new(3).unwrap();
-        let cache = MirrorCache::new(tmp.path().join("cache"), max);
-
-        // Insert well past the bound with distinct keys.
-        for seed in 0u8..8 {
-            let key = MirrorCacheKey::new(&repo("o", "r"), &sha(&forty(seed)));
-            let src = make_mirror(tmp.path(), &format!("m{seed}"));
-            cache.insert(&key, &src).unwrap();
-        }
-
-        let count = std::fs::read_dir(cache.root())
-            .unwrap()
-            .filter(|e| e.as_ref().unwrap().file_type().unwrap().is_dir())
-            .count();
-        assert_eq!(count, max.get(), "the bound must cap retained entries");
-    }
-
-    #[test]
-    fn sweep_removes_only_aged_out_staging_dirs() {
-        let tmp = tempfile::tempdir().unwrap();
-        let cache = MirrorCache::new(tmp.path().join("cache"), NonZeroUsize::new(4).unwrap());
+        let cache = MirrorCache::new(tmp.path().join("cache"));
         // A real published entry plus a leftover staging dir holding a mirror
         // (as a crash mid-publish would leave behind).
         let key = MirrorCacheKey::new(&repo("o", "r"), &sha(&forty(1)));
@@ -588,96 +456,5 @@ mod tests {
             stored_mirror(&cache, &key).exists(),
             "the real entry must survive a sweep"
         );
-    }
-
-    #[test]
-    fn under_bound_evicts_nothing() {
-        let entries = vec![
-            MirrorCacheEntry {
-                slug: "a".into(),
-                last_used: SystemTime::UNIX_EPOCH,
-            },
-            MirrorCacheEntry {
-                slug: "b".into(),
-                last_used: SystemTime::UNIX_EPOCH + Duration::from_secs(1),
-            },
-        ];
-        assert!(plan_eviction(&entries, NonZeroUsize::new(2).unwrap()).is_empty());
-        assert!(plan_eviction(&entries, NonZeroUsize::new(5).unwrap()).is_empty());
-    }
-
-    #[test]
-    fn eviction_sheds_the_oldest_first() {
-        let entries = vec![
-            MirrorCacheEntry {
-                slug: "newest".into(),
-                last_used: SystemTime::UNIX_EPOCH + Duration::from_secs(30),
-            },
-            MirrorCacheEntry {
-                slug: "oldest".into(),
-                last_used: SystemTime::UNIX_EPOCH + Duration::from_secs(10),
-            },
-            MirrorCacheEntry {
-                slug: "middle".into(),
-                last_used: SystemTime::UNIX_EPOCH + Duration::from_secs(20),
-            },
-        ];
-        assert_eq!(
-            plan_eviction(&entries, NonZeroUsize::new(1).unwrap()),
-            vec!["oldest".to_string(), "middle".to_string()]
-        );
-    }
-
-    proptest! {
-        /// The planner always lands the cache within its bound, evicts exactly
-        /// the overflow, and never sheds a newer entry while keeping an older
-        /// one (the LRU invariant, ties broken deterministically by slug).
-        #[test]
-        fn eviction_is_bounded_and_oldest_first(
-            raw in proptest::collection::vec((0u64..1000, "[a-z0-9]{1,10}"), 0..40),
-            max in 1usize..15,
-        ) {
-            // Distinct slugs model distinct cache directories.
-            let mut seen = HashSet::new();
-            let entries: Vec<MirrorCacheEntry> = raw
-                .into_iter()
-                .filter(|(_, slug)| seen.insert(slug.clone()))
-                .map(|(secs, slug)| MirrorCacheEntry {
-                    slug,
-                    last_used: SystemTime::UNIX_EPOCH + Duration::from_secs(secs),
-                })
-                .collect();
-            let max_nz = NonZeroUsize::new(max).unwrap();
-
-            let evicted = plan_eviction(&entries, max_nz);
-            let survivors = entries.len() - evicted.len();
-
-            prop_assert_eq!(evicted.len(), entries.len().saturating_sub(max));
-            prop_assert!(survivors <= max);
-            if entries.len() <= max {
-                prop_assert!(evicted.is_empty());
-            }
-
-            // No evicted entry is newer than any survivor, under the same total
-            // order the planner uses (last_used, then slug).
-            let evicted_set: HashSet<&String> = evicted.iter().collect();
-            let order = |e: &MirrorCacheEntry| (e.last_used, e.slug.clone());
-            let newest_evicted = entries
-                .iter()
-                .filter(|e| evicted_set.contains(&e.slug))
-                .map(order)
-                .max();
-            let oldest_survivor = entries
-                .iter()
-                .filter(|e| !evicted_set.contains(&e.slug))
-                .map(order)
-                .min();
-            if let (Some(evicted_max), Some(survivor_min)) = (newest_evicted, oldest_survivor) {
-                prop_assert!(
-                    evicted_max <= survivor_min,
-                    "evicted {evicted_max:?} should not be newer than survivor {survivor_min:?}"
-                );
-            }
-        }
     }
 }

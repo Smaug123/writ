@@ -189,14 +189,21 @@ Decomposed into reviewable stages:
   `AgentVmHttpConfig` (default `<work_root>/flake-input-cache`) and wire it
   into the runtime nix-cache via `with_local_cache_dir`. Empty dir ⇒ no
   behaviour change. *(landed in this PR)*
-- **FK3b — retain the cloned mirror.** Replace the clone handler's immediate
-  `remove_dir_all` (`src/vm_http/git_clone.rs:302`) with a `(repo, rev)`-keyed,
-  bounded mirror store; functional core for the key + lifecycle, with
-  concurrent-populate handling.
-- **FK3c — the provision endpoint.** `/v1/nix/flake/provision`: protocol +
-  route + session-capability auth; materialises a temp `flake_dir` from the
-  retained mirror and calls `provision_flake_inputs` into the shared cache.
-  Introduces the host `nix_program` path + bounds config.
+- **FK3b — the `(repo, rev)`-keyed mirror store** (`src/vm_git_mirror_cache.rs`).
+  A retain-only cache: atomic staged publish, dedup of concurrent clones of the
+  same key, and a stale-staging sweep. It deliberately does **not** evict —
+  deleting an entry safely needs to know which mirrors are pinned by an
+  in-flight provision, the same coordination the eviction-safe read needs, so
+  bounding races in-flight inserts/readers if done here. Bounded GC moves to
+  FK4 and the pinned read to FK3c. *(primitive landed in #193; the eviction it
+  initially carried was dropped as premature.)*
+- **FK3c — wire retention + the provision endpoint.** Replace the clone
+  handler's immediate `remove_dir_all` (`src/vm_http/git_clone.rs`) by resolving
+  the rev and inserting the mirror into the store; add `/v1/nix/flake/provision`
+  (protocol + route + session-capability auth) which leases a `flake_dir` from
+  the retained mirror (pinned against eviction) and calls
+  `provision_flake_inputs` into the shared cache. Introduces the host
+  `nix_program` path + bounds config.
 - **FK3d — guest bootstrap call.** In `init_workspace_from_broker`, between
   checkout and warm, POST the provision request; degrade on refuse.
 - **FK3e — end-to-end oracle.** `scripts/prove-agent-vm-devshell-warm.sh`
@@ -208,6 +215,10 @@ Decomposed into reviewable stages:
 
 Document the behaviour and knobs (bounds, enable flag, cache GC), update
 getting-started / configuration. State the guarantee precisely (below).
+Includes the bounded GC for the `(repo, rev)` mirror store deferred from FK3b:
+an eviction pass that skips mirrors pinned by an in-flight provision (the pin
+coordination FK3c introduces), so it cannot delete an entry out from under a
+running `git`/`nix`.
 
 ## Guarantee / envelope
 
