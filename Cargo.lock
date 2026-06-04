@@ -2951,6 +2951,7 @@ dependencies = [
  "uuid",
  "wiremock",
  "writ-core",
+ "writ-vm-git",
  "xz2",
 ]
 
@@ -2966,6 +2967,17 @@ dependencies = [
  "tokio",
  "tracing-subscriber",
  "uuid",
+]
+
+[[package]]
+name = "writ-vm-git"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "writ-core",
 ]
 
 [[package]]
