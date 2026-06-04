@@ -23,7 +23,7 @@
 //! open their own writ session per run; all stages attach their notes
 //! under the same plan-scoped ref. This supersedes the earlier
 //! "one session per plan workflow" pin: writ's
-//! [`crate::core::SessionRecord`] carries a single `agent_kind` /
+//! [`writ::core::SessionRecord`] carries a single `agent_kind` /
 //! `agent_model` chosen at `OpenSession`, so a workflow that uses
 //! different agents per stage cannot share one session by
 //! construction.
@@ -42,15 +42,15 @@ use thiserror::Error;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::task::JoinError;
 
-use crate::agent_run::AgentPrompt;
 use crate::bailiff_plan_note::PlanId;
 use crate::bailiff_plan_write::{WritePlanNoteError, write_plan_note};
 use crate::bailiff_repo_guard::BailiffRepoGuard;
-use crate::core::{AgentKind, CapabilitySet, NotesRef, SessionId};
-use crate::notes_repo::NotesRepo;
-use crate::run_verify::AllowedSigners;
-use crate::vm_git::GitObjectId;
-use crate::writ_client::{RunAgentCompleted, RunAgentRequest, WritClient, WritClientError};
+use writ::agent_run::AgentPrompt;
+use writ::core::{AgentKind, CapabilitySet, NotesRef, SessionId};
+use writ::notes_repo::NotesRepo;
+use writ::run_verify::AllowedSigners;
+use writ::vm_git::GitObjectId;
+use writ::writ_client::{RunAgentCompleted, RunAgentRequest, WritClient, WritClientError};
 
 /// Inputs to [`submit_plan`]. An explicit struct keeps the call site
 /// readable when more fields land in slices D/E (review-plan id,
@@ -337,20 +337,20 @@ mod end_to_end_tests {
     use wiremock::MockServer;
 
     use super::*;
-    use crate::audit::AuditLog;
     use crate::bailiff_plan_note::{PlanNote, plan_notes_ref};
     use crate::bailiff_plan_write::FetchVerifyError;
-    use crate::core::{AgentKind, CapabilitySet, NotesRef, RepoRef, TtlSeconds};
-    use crate::github::{GitHubAppConfig, GitHubAppRegistryConfig, GitHubMinter};
-    use crate::notes_repo::NotesRepo;
-    use crate::policy::PolicyConfig;
-    use crate::run_verify::AllowedSigners;
-    use crate::secret::{SecretError, SecretKey, SecretStore};
-    use crate::server::{
+    use writ::audit::AuditLog;
+    use writ::core::{AgentKind, CapabilitySet, NotesRef, RepoRef, TtlSeconds};
+    use writ::github::{GitHubAppConfig, GitHubAppRegistryConfig, GitHubMinter};
+    use writ::notes_repo::NotesRepo;
+    use writ::policy::PolicyConfig;
+    use writ::run_verify::AllowedSigners;
+    use writ::secret::{SecretError, SecretKey, SecretStore};
+    use writ::server::{
         BrokerState, RunAgentSpawnConfig, prepare_broker_listener, serve_broker_with_agent_vm,
     };
-    use crate::signing::WritSigningKey;
-    use crate::writ_client::WritClient;
+    use writ::signing::WritSigningKey;
+    use writ::writ_client::WritClient;
 
     const SIGNING_PEM: &str = include_str!("../tests/fixtures/ed25519_test_signing.key");
     const SIGNING_PUB: &str = include_str!("../tests/fixtures/ed25519_test_signing.key.pub");
@@ -642,15 +642,15 @@ mod session_mismatch_tests {
     use tokio::task::JoinHandle;
 
     use super::*;
-    use crate::agent_run::AgentPrompt;
-    use crate::core::{
+    use writ::agent_run::AgentPrompt;
+    use writ::core::{
         AgentKind, CapabilitySet, NotesRef, RepoRef, Sha256Hex, SshKeyFingerprint, SshSignature,
         UnixMillis,
     };
-    use crate::notes_repo::NotesRepo;
-    use crate::protocol::{ClientMessage, ServerMessage, SignedRunMetadata};
-    use crate::run_verify::AllowedSigners;
-    use crate::vm_git::GitObjectId;
+    use writ::notes_repo::NotesRepo;
+    use writ::protocol::{ClientMessage, ServerMessage, SignedRunMetadata};
+    use writ::run_verify::AllowedSigners;
+    use writ::vm_git::GitObjectId;
 
     const SIGNING_PUB: &str = include_str!("../tests/fixtures/ed25519_test_signing.key.pub");
 
