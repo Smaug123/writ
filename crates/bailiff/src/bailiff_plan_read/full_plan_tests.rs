@@ -18,20 +18,20 @@
 //! plus the signer-not-in-allowed-signers variant).
 use super::test_support::*;
 use super::*;
-use crate::agent_run::{AgentRunId, sha256_hex};
 use crate::bailiff_decision::{Decider, Decision};
 use crate::bailiff_plan_note::{
     DecisionNote, ImplementNote, PlanId, PlanNote, ReviewNote, plan_decision_seed_blob_bytes,
     plan_implement_seed_blob_bytes, plan_notes_ref, plan_review_seed_blob_bytes,
     plan_submission_seed_blob_bytes,
 };
-use crate::core::{CapabilitySet, RepoRef, SessionId, Sha256Hex, SshSignature, UnixMillis};
-use crate::protocol::SignedRunMetadata;
-use crate::run_envelope::{OutputEnvelope, SignedRunEnvelope};
-use crate::run_verify::VerifyError;
-use crate::signing::WritSigningKey;
-use crate::vm_git::GitObjectId;
 use tempfile::TempDir;
+use writ::agent_run::{AgentRunId, sha256_hex};
+use writ::core::{CapabilitySet, RepoRef, SessionId, Sha256Hex, SshSignature, UnixMillis};
+use writ::protocol::SignedRunMetadata;
+use writ::run_envelope::{OutputEnvelope, SignedRunEnvelope};
+use writ::run_verify::VerifyError;
+use writ::signing::WritSigningKey;
+use writ::vm_git::GitObjectId;
 
 /// Build a `SignedRunMetadata` whose `output_envelope_sha256` binds
 /// to the canonical bytes of an empty [`OutputEnvelope`]. Used by

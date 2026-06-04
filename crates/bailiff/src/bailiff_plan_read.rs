@@ -32,11 +32,11 @@ use crate::bailiff_plan_note::{
     plan_notes_ref, plan_review_seed_blob_bytes, plan_submission_seed_blob_bytes,
 };
 use crate::bailiff_plan_write::WRIT_V1_NOTES_REFSPEC;
-use crate::core::NotesRef;
-use crate::notes_repo::{NotesRepo, NotesRepoError};
-use crate::run_envelope::{OutputEnvelope, SignedRunEnvelope};
-use crate::run_verify::{AllowedSigners, VerifyError, verify_run_envelope};
-use crate::vm_git::GitObjectId;
+use writ::core::NotesRef;
+use writ::notes_repo::{NotesRepo, NotesRepoError};
+use writ::run_envelope::{OutputEnvelope, SignedRunEnvelope};
+use writ::run_verify::{AllowedSigners, VerifyError, verify_run_envelope};
+use writ::vm_git::GitObjectId;
 
 // The read-projection types these helpers return now live in
 // `bailiff_plan_view` so presentation code can depend on the types
@@ -123,7 +123,7 @@ pub enum ReadDecisionError {
     /// [`crate::bailiff_plan_write::write_decision_note`] (which always
     /// derives the attach seed from `decision_note.plan_id`), so this
     /// surfaces only when bytes were planted via the low-level
-    /// [`crate::notes_repo::NotesRepo::write_note`] path or pasted by
+    /// [`writ::notes_repo::NotesRepo::write_note`] path or pasted by
     /// hand after manual repo repair. Treat it as semantic corruption:
     /// a future acceptance gate must not be fooled into ruling on
     /// plan A by reading plan B's verdict.
@@ -195,7 +195,7 @@ pub enum ReadReviewError {
     /// derives the attach seed from the `plan_id` argument it
     /// embeds in the note), so this surfaces only when bytes were
     /// planted via the low-level
-    /// [`crate::notes_repo::NotesRepo::write_note`] path or pasted by
+    /// [`writ::notes_repo::NotesRepo::write_note`] path or pasted by
     /// hand after manual repo repair. Treat it as semantic corruption:
     /// a future reader rendering reviewer prose must not be fooled
     /// into displaying plan B's review when asked about plan A.
@@ -268,7 +268,7 @@ pub enum ReadPlanError {
     /// [`crate::bailiff_plan_write::write_plan_note`] (which always
     /// derives the attach seed from the `plan_id` argument it embeds
     /// in the note), so this surfaces only when bytes were planted
-    /// via the low-level [`crate::notes_repo::NotesRepo::write_note`]
+    /// via the low-level [`writ::notes_repo::NotesRepo::write_note`]
     /// path or pasted by hand after manual repo repair. Treat it as
     /// semantic corruption: the upcoming `submit_review` workflow
     /// must not be fooled into composing a reviewer prompt from
@@ -343,7 +343,7 @@ pub enum ReadImplementError {
     /// [`crate::bailiff_plan_write::write_implement_note`] (which
     /// always derives the attach seed from the `plan_id` argument it
     /// embeds in the note), so this surfaces only when bytes were
-    /// planted via the low-level [`crate::notes_repo::NotesRepo::write_note`]
+    /// planted via the low-level [`writ::notes_repo::NotesRepo::write_note`]
     /// path or pasted by hand after manual repo repair. Treat it as
     /// semantic corruption: a future caller rendering implementer
     /// output must not be fooled into surfacing plan B's implement
@@ -898,9 +898,9 @@ mod spec {
     use super::*;
     use crate::bailiff_decision::{Decider, Decision};
     use crate::bailiff_plan_write::write_decision_note;
-    use crate::core::UnixMillis;
     use proptest::prelude::*;
     use tempfile::TempDir;
+    use writ::core::UnixMillis;
 
     fn arb_outcome() -> impl Strategy<Value = Decision> {
         prop_oneof![Just(Decision::Accepted), Just(Decision::Rejected)]

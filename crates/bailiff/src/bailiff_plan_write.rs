@@ -45,12 +45,12 @@ use crate::bailiff_plan_note::{
     plan_implement_seed_blob_bytes, plan_notes_ref, plan_review_seed_blob_bytes,
     plan_submission_seed_blob_bytes,
 };
-use crate::core::NotesRef;
-use crate::notes_repo::{NotesRepo, NotesRepoError, WriteOutcome};
-use crate::run_envelope::SignedRunEnvelope;
-use crate::run_verify::{AllowedSigners, VerifyError, verify_run_envelope};
-use crate::vm_git::GitObjectId;
-use crate::writ_client::RunAgentCompleted;
+use writ::core::NotesRef;
+use writ::notes_repo::{NotesRepo, NotesRepoError, WriteOutcome};
+use writ::run_envelope::SignedRunEnvelope;
+use writ::run_verify::{AllowedSigners, VerifyError, verify_run_envelope};
+use writ::vm_git::GitObjectId;
+use writ::writ_client::RunAgentCompleted;
 
 /// Refspec bailiff uses to mirror writ's `v1` notes namespace into
 /// its own repo. The leading `+` is load-bearing: writ may rewrite
@@ -516,10 +516,10 @@ mod spec {
         ImplementNote, PlanId, PlanNote, ReviewNote, plan_implement_seed_blob_bytes,
         plan_notes_ref, plan_review_seed_blob_bytes, plan_submission_seed_blob_bytes,
     };
-    use crate::core::{CapabilitySet, RepoRef, SshSignature};
-    use crate::signing::{WritSigningKey, WritVerifyingKey};
     use proptest::prelude::*;
     use tempfile::TempDir;
+    use writ::core::{CapabilitySet, RepoRef, SshSignature};
+    use writ::signing::{WritSigningKey, WritVerifyingKey};
 
     /// The three verbs that share `fetch_and_verify`. Round-trip (and,
     /// for review/implement, idempotency) differs per verb; the

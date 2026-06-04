@@ -12,8 +12,8 @@ use crate::bailiff_plan_note::{
     plan_submission_seed_blob_bytes,
 };
 use crate::bailiff_plan_write::write_decision_note;
-use crate::core::UnixMillis;
 use tempfile::TempDir;
+use writ::core::UnixMillis;
 
 fn sample_decision_note(plan_id: PlanId, outcome: Decision) -> DecisionNote {
     DecisionNote {
