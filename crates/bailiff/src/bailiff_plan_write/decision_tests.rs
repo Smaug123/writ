@@ -7,8 +7,8 @@ use crate::bailiff_decision::{Decider, Decision};
 use crate::bailiff_plan_note::{
     DecisionNote, PlanId, plan_decision_seed_blob_bytes, plan_notes_ref,
 };
-use crate::core::UnixMillis;
 use tempfile::TempDir;
+use writ::core::UnixMillis;
 
 fn sample_decider() -> Decider {
     Decider::try_new("cli:alice").unwrap()

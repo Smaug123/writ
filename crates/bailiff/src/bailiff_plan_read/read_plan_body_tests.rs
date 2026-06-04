@@ -6,13 +6,13 @@
 //! variant of [`ReadPlanBodyError`] gets a pinned test.
 use super::test_support::*;
 use super::*;
-use crate::agent_run::{AgentRunId, sha256_hex};
 use crate::bailiff_plan_note::PlanId;
-use crate::core::{CapabilitySet, RepoRef, SessionId, Sha256Hex, UnixMillis};
-use crate::protocol::SignedRunMetadata;
-use crate::signing::WritSigningKey;
-use crate::vm_git::GitObjectId;
 use tempfile::TempDir;
+use writ::agent_run::{AgentRunId, sha256_hex};
+use writ::core::{CapabilitySet, RepoRef, SessionId, Sha256Hex, UnixMillis};
+use writ::protocol::SignedRunMetadata;
+use writ::signing::WritSigningKey;
+use writ::vm_git::GitObjectId;
 
 /// Build an envelope around an arbitrary stdout payload. Used
 /// for tests that need to exercise the post-verify decode steps

@@ -12,13 +12,13 @@ use crate::bailiff_plan_note::{
     plan_submission_seed_blob_bytes,
 };
 use crate::bailiff_plan_write::write_plan_note;
-use crate::core::{CapabilitySet, RepoRef};
-use crate::run_envelope::SignedRunEnvelope;
-use crate::run_verify::AllowedSigners;
-use crate::signing::WritSigningKey;
-use crate::vm_git::GitObjectId;
-use crate::writ_client::RunAgentCompleted;
 use tempfile::TempDir;
+use writ::core::{CapabilitySet, RepoRef};
+use writ::run_envelope::SignedRunEnvelope;
+use writ::run_verify::AllowedSigners;
+use writ::signing::WritSigningKey;
+use writ::vm_git::GitObjectId;
+use writ::writ_client::RunAgentCompleted;
 
 /// Build a freshly-signed envelope under `signing_key`. Mirrors
 /// the same-named helper in `bailiff_plan_write::tests` so the

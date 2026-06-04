@@ -5,18 +5,18 @@
 //! Slice C3 introduces the first operator-facing verb,
 //! `bailiff plan submit`: open a writ session, run the planner agent,
 //! verify writ's signed envelope, and persist a
-//! [`writ::bailiff_plan_note::PlanNote`] in bailiff's own bare repo.
+//! [`bailiff::bailiff_plan_note::PlanNote`] in bailiff's own bare repo.
 //! The workflow itself lives in
-//! [`writ::bailiff_plan_submit::submit_plan`]; this binary is the
+//! [`bailiff::bailiff_plan_submit::submit_plan`]; this binary is the
 //! thin CLI layer that resolves paths, parses flags, and prints the
 //! plan id on success. Slice D2.5 adds the parallel `bailiff plan
 //! review` verb, which reads the submission note, runs the reviewer
 //! agent through writ, and persists a
-//! [`writ::bailiff_plan_note::ReviewNote`]. The implement verb
+//! [`bailiff::bailiff_plan_note::ReviewNote`]. The implement verb
 //! mirrors review but grants the implementer agent
 //! `WorkspaceWrite`, composes the operator's feature prompt with the
 //! verified plan body, and persists a
-//! [`writ::bailiff_plan_note::ImplementNote`].
+//! [`bailiff::bailiff_plan_note::ImplementNote`].
 //!
 //! Paths default to the same XDG convention `docs/design/broker.md`
 //! pins for writ, mirrored under `bailiff/`:
@@ -31,17 +31,19 @@ use std::sync::Arc;
 use clap::{ArgGroup, Parser, Subcommand};
 use tokio::sync::Mutex as AsyncMutex;
 
-use writ::agent_run::AgentPrompt;
-use writ::bailiff_decision::{Decider, Decision};
-use writ::bailiff_plan_implement::{SubmitImplementError, SubmitImplementInputs, submit_implement};
-use writ::bailiff_plan_note::{DecisionNote, PlanId};
-use writ::bailiff_plan_read::{list_plan_ids, read_full_plan, summarize_plan};
-use writ::bailiff_plan_review::{SubmitReviewError, SubmitReviewInputs, submit_review};
-use writ::bailiff_plan_submit::{SubmitPlanInputs, submit_plan};
-use writ::bailiff_plan_write::{
+use bailiff::bailiff_decision::{Decider, Decision};
+use bailiff::bailiff_plan_implement::{
+    SubmitImplementError, SubmitImplementInputs, submit_implement,
+};
+use bailiff::bailiff_plan_note::{DecisionNote, PlanId};
+use bailiff::bailiff_plan_read::{list_plan_ids, read_full_plan, summarize_plan};
+use bailiff::bailiff_plan_review::{SubmitReviewError, SubmitReviewInputs, submit_review};
+use bailiff::bailiff_plan_submit::{SubmitPlanInputs, submit_plan};
+use bailiff::bailiff_plan_write::{
     WriteDecisionNoteError, WriteImplementNoteError, WriteReviewNoteError, write_decision_note,
 };
-use writ::cli::output::{write_bailiff_plan_list, write_bailiff_plan_show};
+use bailiff::output::{write_bailiff_plan_list, write_bailiff_plan_show};
+use writ::agent_run::AgentPrompt;
 use writ::core::{AgentKind, CapabilitySet, NotesRef, RepoRef, UnixMillis};
 use writ::notes_repo::NotesRepo;
 use writ::run_verify::AllowedSigners;
@@ -788,7 +790,7 @@ async fn plan_review(
 ///
 /// The library workflow ([`submit_implement`]) takes an
 /// `Arc<AsyncMutex<NotesRepo>>` for the in-process single-writer
-/// invariant via [`writ::bailiff_repo_guard::BailiffRepoGuard`], but
+/// invariant via [`bailiff::bailiff_repo_guard::BailiffRepoGuard`], but
 /// the CLI constructs a fresh `Arc` per invocation, so two CLI
 /// processes against the same `--bailiff-repo` can each pass the
 /// in-process pre-RPC `AlreadyImplemented` gate, both kick off
@@ -1102,8 +1104,8 @@ async fn plan_list(bailiff_repo: Option<PathBuf>) -> Result<(), Box<dyn std::err
 /// into a single string. Local to this binary; not a wire contract.
 enum ListError {
     OpenRepo(writ::notes_repo::NotesRepoError),
-    List(writ::bailiff_plan_read::ListPlanIdsError),
-    Summarize(writ::bailiff_plan_read::SummarizePlanError),
+    List(bailiff::bailiff_plan_read::ListPlanIdsError),
+    Summarize(bailiff::bailiff_plan_read::SummarizePlanError),
 }
 
 impl From<writ::notes_repo::NotesRepoError> for ListError {
@@ -1172,7 +1174,7 @@ async fn plan_show(
 /// contract.
 enum ShowError {
     OpenRepo(writ::notes_repo::NotesRepoError),
-    ReadFullPlan(writ::bailiff_plan_read::ReadFullPlanError),
+    ReadFullPlan(bailiff::bailiff_plan_read::ReadFullPlanError),
 }
 
 impl From<writ::notes_repo::NotesRepoError> for ShowError {

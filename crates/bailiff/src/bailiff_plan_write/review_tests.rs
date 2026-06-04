@@ -7,8 +7,8 @@
 use super::test_support::*;
 use super::*;
 use crate::bailiff_plan_note::{PlanId, ReviewNote, plan_notes_ref, plan_review_seed_blob_bytes};
-use crate::signing::{WritSigningKey, WritVerifyingKey};
 use tempfile::TempDir;
+use writ::signing::{WritSigningKey, WritVerifyingKey};
 
 /// Happy path: with writ's envelope in place and an allowed-signers
 /// list that contains writ's key, `write_review_note` attaches a
@@ -298,7 +298,7 @@ fn write_review_note_rejects_signature_mismatch_between_envelope_and_reply() {
     let bailiff = bailiff_repo(&tmp);
     let allowed = AllowedSigners::from_openssh_lines(SIGNING_PUB).unwrap();
 
-    completed.signature = crate::core::SshSignature::try_new(
+    completed.signature = writ::core::SshSignature::try_new(
         "-----BEGIN SSH SIGNATURE-----\nU1NIU0lH-other-bytes\n-----END SSH SIGNATURE-----",
     )
     .unwrap();

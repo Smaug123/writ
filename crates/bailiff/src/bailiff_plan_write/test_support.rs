@@ -9,12 +9,12 @@
 //! types those helpers construct.
 
 use super::*;
-use crate::agent_run::{AgentRunId, sha256_hex};
-use crate::core::{CapabilitySet, NotesRef, RepoRef, SessionId, Sha256Hex, UnixMillis};
-use crate::protocol::SignedRunMetadata;
-use crate::run_envelope::{OutputEnvelope, SignedRunEnvelope};
-use crate::signing::WritSigningKey;
 use tempfile::TempDir;
+use writ::agent_run::{AgentRunId, sha256_hex};
+use writ::core::{CapabilitySet, NotesRef, RepoRef, SessionId, Sha256Hex, UnixMillis};
+use writ::protocol::SignedRunMetadata;
+use writ::run_envelope::{OutputEnvelope, SignedRunEnvelope};
+use writ::signing::WritSigningKey;
 
 pub(super) const SIGNING_PEM: &str = include_str!("../../tests/fixtures/ed25519_test_signing.key");
 pub(super) const SIGNING_PUB: &str =
