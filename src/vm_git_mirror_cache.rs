@@ -272,7 +272,11 @@ impl MirrorCache {
             return;
         };
         for entry in read_dir.flatten() {
-            if !entry.file_name().to_string_lossy().starts_with(STAGING_PREFIX) {
+            if !entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(STAGING_PREFIX)
+            {
                 continue;
             }
             if !entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
@@ -428,7 +432,10 @@ mod tests {
         // GitHub-equivalent casing => same slug.
         assert_eq!(base, MirrorCacheKey::new(&repo("owner", "repo"), &rev));
         // A different commit => a different slug.
-        assert_ne!(base, MirrorCacheKey::new(&repo("Owner", "Repo"), &sha(&forty(2))));
+        assert_ne!(
+            base,
+            MirrorCacheKey::new(&repo("Owner", "Repo"), &sha(&forty(2)))
+        );
         // A different repo => a different slug.
         assert_ne!(base, MirrorCacheKey::new(&repo("Owner", "Other"), &rev));
         // The slug is a SHA-256 hex digest, so it is filesystem-safe.
@@ -563,7 +570,9 @@ mod tests {
         // A real published entry plus a leftover staging dir holding a mirror
         // (as a crash mid-publish would leave behind).
         let key = MirrorCacheKey::new(&repo("o", "r"), &sha(&forty(1)));
-        cache.insert(&key, &make_mirror(tmp.path(), "live")).unwrap();
+        cache
+            .insert(&key, &make_mirror(tmp.path(), "live"))
+            .unwrap();
         let staging = cache.root().join(format!("{STAGING_PREFIX}orphan"));
         std::fs::create_dir_all(staging.join(MIRROR_DIR_NAME)).unwrap();
 
