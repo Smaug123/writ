@@ -675,11 +675,7 @@ impl<S: SecretStore> VmHttpNixCacheService<S> {
             Err(_) => return false,
         };
         while let Ok(Some(entry)) = entries.next_entry().await {
-            if entry
-                .path()
-                .extension()
-                .is_some_and(|ext| ext == "narinfo")
-            {
+            if entry.path().extension().is_some_and(|ext| ext == "narinfo") {
                 return true;
             }
         }

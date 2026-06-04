@@ -190,7 +190,12 @@ async fn local_cache_info_is_served_synthetically_without_upstream() {
     // narinfo/NAR paths rather than rejecting the substituter. (An empty archive
     // instead proxies the upstream — see
     // `cache_info_proxies_upstream_when_local_cache_empty`.)
-    write_local_ca_entry(cache.path(), "source", "input.nar.xz", b"local flake input nar");
+    write_local_ca_entry(
+        cache.path(),
+        "source",
+        "input.nar.xz",
+        b"local flake input nar",
+    );
     let service =
         nix_cache_service_with_local_cache(&state, DEAD_UPSTREAM, cache.path(), 4096, 4096);
 
