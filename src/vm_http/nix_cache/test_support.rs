@@ -58,6 +58,7 @@ pub(super) fn services_with_nix_cache(
         openai_proxy: None,
         agent_runs: None,
         git_push: None,
+        flake_provision: None,
     }
 }
 

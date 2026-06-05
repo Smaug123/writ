@@ -19,6 +19,7 @@ use writ_core::core::{
 
 pub const VM_GIT_CLONE_PATH: &str = "/v1/git/clone";
 pub const VM_GIT_PUSH_PATH: &str = "/v1/git/push";
+pub const VM_FLAKE_PROVISION_PATH: &str = "/v1/nix/flake/provision";
 pub const GIT_BUNDLE_CONTENT_TYPE: &str = "application/x-git-bundle";
 pub const GIT_PUSH_BUNDLE_CONTENT_TYPE: &str = "application/vnd.writ.git-push-bundle";
 pub const DEFAULT_WORKSPACE_ROOT: &str = "/workspace";
@@ -50,6 +51,87 @@ pub struct VmGitCloneRequest {
     repo: GitCloneRepo,
     #[serde(rename = "ref", default, skip_serializing_if = "Option::is_none")]
     git_ref: Option<GitCloneRef>,
+}
+
+/// Coordinates the guest sends to provision a flake's committed, locked inputs
+/// from the broker's retained `(repo, rev)` mirror. The guest sends only these
+/// coordinates — never flake content: the broker re-derives the checkout from
+/// its own mirror, so the request surface stays a repository and a commit.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct VmFlakeProvisionRequest {
+    repo: GitCloneRepo,
+    rev: GitObjectId,
+}
+
+/// Successful outcome of a provision request. `MirrorNotCached` is a success,
+/// not an error: no mirror is retained for `(repo, rev)` (retention is off, or
+/// the clone that would have populated it has not run), so the guest proceeds
+/// without the optimisation rather than failing.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum VmFlakeProvisionResponse {
+    Provisioned {
+        request_id: RequestId,
+        input_count: u64,
+        archived_path_count: u64,
+        archived_bytes: u64,
+    },
+    MirrorNotCached,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct VmFlakeProvisionErrorResponse {
+    error: VmFlakeProvisionErrorCode,
+    message: String,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VmFlakeProvisionErrorCode {
+    /// The request body was not a valid provision request.
+    InvalidRequest,
+    /// The session is not active (unknown or closed).
+    Denied,
+    /// The repository's committed lock cannot be auto-provisioned: no
+    /// `flake.lock`, or an input the broker refuses to fetch (local, private,
+    /// credential-requiring, or unpinned). A property of the repository, not
+    /// the broker — the guest degrades and lets the warm step surface the
+    /// original failure.
+    Unprovisionable,
+    /// The broker failed to provision the inputs (a git, nix, or I/O failure
+    /// on the host).
+    ProvisionFailed,
+}
+
+impl VmFlakeProvisionRequest {
+    pub fn new(repo: GitCloneRepo, rev: GitObjectId) -> Self {
+        Self { repo, rev }
+    }
+
+    pub fn repo(&self) -> &GitCloneRepo {
+        &self.repo
+    }
+
+    pub fn rev(&self) -> &GitObjectId {
+        &self.rev
+    }
+}
+
+impl VmFlakeProvisionErrorResponse {
+    pub fn new(error: VmFlakeProvisionErrorCode, message: impl Into<String>) -> Self {
+        Self {
+            error,
+            message: message.into(),
+        }
+    }
+
+    pub fn error(&self) -> VmFlakeProvisionErrorCode {
+        self.error
+    }
+
+    pub fn message(&self) -> &str {
+        &self.message
+    }
 }
 
 /// Wire-validated push metadata. `expected_remote_head` is required to be
@@ -1293,6 +1375,25 @@ mod tests {
         }
 
         #[test]
+        fn flake_provision_request_roundtrips_any_valid_generated_coordinates(
+            owner in owner_strategy(),
+            name in repo_name_strategy(),
+            rev in object_id_strategy(),
+        ) {
+            let repo_ref: RepoRef = format!("{owner}/{name}").parse().unwrap();
+            let request = VmFlakeProvisionRequest::new(
+                GitCloneRepo::new(repo_ref.clone()).unwrap(),
+                rev.parse().unwrap(),
+            );
+
+            let json = serde_json::to_string(&request).unwrap();
+            let roundtrip: VmFlakeProvisionRequest = serde_json::from_str(&json).unwrap();
+
+            prop_assert_eq!(roundtrip.repo().as_repo_ref(), &repo_ref);
+            prop_assert_eq!(roundtrip, request);
+        }
+
+        #[test]
         fn vm_push_metadata_roundtrips_any_valid_generated_fields(
             owner in owner_strategy(),
             name in repo_name_strategy(),
@@ -1354,6 +1455,49 @@ mod tests {
         assert_eq!(
             serde_json::from_value::<VmGitCloneRequest>(value).unwrap(),
             request
+        );
+    }
+
+    #[test]
+    fn flake_provision_request_wire_shape_is_repo_and_rev() {
+        let request = VmFlakeProvisionRequest::new(
+            repo("owner", "repo.name"),
+            "0123456789abcdef0123456789abcdef01234567".parse().unwrap(),
+        );
+        let value = serde_json::to_value(&request).unwrap();
+        assert_eq!(value["repo"], "owner/repo.name");
+        assert_eq!(value["rev"], "0123456789abcdef0123456789abcdef01234567");
+        assert_eq!(
+            serde_json::from_value::<VmFlakeProvisionRequest>(value).unwrap(),
+            request
+        );
+    }
+
+    #[test]
+    fn flake_provision_response_is_tagged_by_status() {
+        let request_id = RequestId::new();
+        let provisioned = VmFlakeProvisionResponse::Provisioned {
+            request_id,
+            input_count: 3,
+            archived_path_count: 7,
+            archived_bytes: 4096,
+        };
+        let value = serde_json::to_value(&provisioned).unwrap();
+        assert_eq!(value["status"], "provisioned");
+        assert_eq!(value["input_count"], 3);
+        assert_eq!(value["archived_path_count"], 7);
+        assert_eq!(value["archived_bytes"], 4096);
+        assert_eq!(value["request_id"], request_id.to_string());
+        assert_eq!(
+            serde_json::from_value::<VmFlakeProvisionResponse>(value).unwrap(),
+            provisioned
+        );
+
+        let not_cached = serde_json::to_value(VmFlakeProvisionResponse::MirrorNotCached).unwrap();
+        assert_eq!(not_cached["status"], "mirror_not_cached");
+        assert_eq!(
+            serde_json::from_value::<VmFlakeProvisionResponse>(not_cached).unwrap(),
+            VmFlakeProvisionResponse::MirrorNotCached
         );
     }
 
@@ -1678,6 +1822,7 @@ mod tests {
     fn clone_route_and_bundle_content_type_are_pinned() {
         assert_eq!(VM_GIT_CLONE_PATH, "/v1/git/clone");
         assert_eq!(VM_GIT_PUSH_PATH, "/v1/git/push");
+        assert_eq!(VM_FLAKE_PROVISION_PATH, "/v1/nix/flake/provision");
         assert_eq!(GIT_BUNDLE_CONTENT_TYPE, "application/x-git-bundle");
         assert_eq!(
             GIT_PUSH_BUNDLE_CONTENT_TYPE,

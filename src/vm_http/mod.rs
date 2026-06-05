@@ -6,6 +6,7 @@
 
 mod agent_runs;
 mod claude_proxy;
+mod flake_provision;
 mod git_clone;
 mod git_push;
 mod nix_cache;
@@ -22,6 +23,8 @@ pub use claude_proxy::{
     DEFAULT_CLAUDE_ANTHROPIC_VERSION, VmHttpClaudeProxyAuthKind, VmHttpClaudeProxyConfig,
     VmHttpClaudeProxyConfigError,
 };
+pub use flake_provision::{VmHttpFlakeProvisionConfig, VmHttpFlakeProvisionService};
+use flake_provision::{is_flake_provision_target, route_flake_provision_request};
 pub use git_clone::{VmHttpGitCloneConfig, VmHttpGitCloneService};
 use git_clone::{is_git_clone_target, route_git_clone_request};
 pub use git_push::VmHttpGitPushService;
@@ -115,6 +118,11 @@ pub struct VmHttpRuntimeConfig {
     agent_run_log_root: PathBuf,
     git_push_staging_root: PathBuf,
     git_push_body_limits: VmGitPushBodyLimits,
+    /// Flake-input provisioning. `None` disables the `/v1/nix/flake/provision`
+    /// endpoint (it answers `404`); it is enabled only when the `(repo, rev)`
+    /// mirror cache that backs it is configured, since provisioning re-derives
+    /// the checkout from a retained mirror.
+    flake_provision: Option<VmHttpFlakeProvisionConfig>,
 }
 
 pub struct PreparedVmHttpSession<S: SecretStore + Send + Sync + 'static> {
@@ -125,6 +133,7 @@ pub struct PreparedVmHttpSession<S: SecretStore + Send + Sync + 'static> {
     proxies: VmHttpProxies<S>,
     agent_runs: Option<VmHttpAgentRunService<S>>,
     git_push: Option<VmHttpGitPushService<S>>,
+    flake_provision: Option<VmHttpFlakeProvisionService<S>>,
 }
 
 pub(in crate::vm_http) struct VmHttpProxies<S: SecretStore + Send + Sync + 'static> {
@@ -148,6 +157,7 @@ struct VmHttpServices<S: SecretStore + Send + Sync + 'static> {
     openai_proxy: Option<VmHttpOpenAiProxyService<S>>,
     agent_runs: Option<VmHttpAgentRunService<S>>,
     git_push: Option<VmHttpGitPushService<S>>,
+    flake_provision: Option<VmHttpFlakeProvisionService<S>>,
 }
 
 pub struct RunningVmHttpSession {
@@ -224,6 +234,7 @@ pub(super) enum VmHttpStatus {
     MethodNotAllowed,
     Conflict,
     Gone,
+    UnprocessableContent,
     BadGateway,
     InternalServerError,
     Upstream(u16),
@@ -366,6 +377,7 @@ impl<S: SecretStore + Send + Sync + 'static> VmHttpServices<S> {
             openai_proxy: None,
             agent_runs: None,
             git_push: None,
+            flake_provision: None,
         }
     }
 
@@ -375,6 +387,7 @@ impl<S: SecretStore + Send + Sync + 'static> VmHttpServices<S> {
         proxies: VmHttpProxies<S>,
         agent_runs: Option<VmHttpAgentRunService<S>>,
         git_push: Option<VmHttpGitPushService<S>>,
+        flake_provision: Option<VmHttpFlakeProvisionService<S>>,
     ) -> Self {
         Self {
             git_clone: Some(git_clone),
@@ -383,6 +396,7 @@ impl<S: SecretStore + Send + Sync + 'static> VmHttpServices<S> {
             openai_proxy: proxies.openai,
             agent_runs,
             git_push,
+            flake_provision,
         }
     }
 }
@@ -396,6 +410,7 @@ impl<S: SecretStore + Send + Sync + 'static> Clone for VmHttpServices<S> {
             openai_proxy: self.openai_proxy.clone(),
             agent_runs: self.agent_runs.clone(),
             git_push: self.git_push.clone(),
+            flake_provision: self.flake_provision.clone(),
         }
     }
 }
@@ -468,7 +483,22 @@ impl VmHttpRuntimeConfig {
             agent_run_log_root: agent_run_log_root.into(),
             git_push_staging_root: git_push_staging_root.into(),
             git_push_body_limits,
+            flake_provision: None,
         }
+    }
+
+    /// Enable flake-input provisioning with the given config. `None` (the
+    /// default) leaves the `/v1/nix/flake/provision` endpoint disabled.
+    pub fn with_flake_provision(
+        mut self,
+        flake_provision: Option<VmHttpFlakeProvisionConfig>,
+    ) -> Self {
+        self.flake_provision = flake_provision;
+        self
+    }
+
+    pub fn flake_provision(&self) -> Option<&VmHttpFlakeProvisionConfig> {
+        self.flake_provision.as_ref()
     }
 
     pub fn bind_addr(&self) -> Ipv4Addr {
@@ -543,6 +573,7 @@ impl<S: SecretStore + Send + Sync + 'static> PreparedVmHttpSession<S> {
             self.proxies,
             self.agent_runs,
             self.git_push,
+            self.flake_provision,
             shutdown_rx,
         ));
         RunningVmHttpSession {
@@ -672,6 +703,10 @@ pub async fn prepare_vm_http_session_with_agent_runs<S: SecretStore + Send + Syn
         .map(|config| VmHttpOpenAiProxyService::new(Arc::clone(&state), config))
         .transpose()
         .map_err(VmHttpRuntimeError::OpenAiProxyClient)?;
+    let flake_provision = config
+        .flake_provision
+        .clone()
+        .map(|config| VmHttpFlakeProvisionService::new(Arc::clone(&state), config));
     Ok(PreparedVmHttpSession {
         listener,
         session,
@@ -683,6 +718,7 @@ pub async fn prepare_vm_http_session_with_agent_runs<S: SecretStore + Send + Syn
         },
         agent_runs,
         git_push,
+        flake_provision,
     })
 }
 
@@ -718,12 +754,20 @@ pub(in crate::vm_http) async fn run_vm_http_with_services_until_shutdown<
     proxies: VmHttpProxies<S>,
     agent_runs: Option<VmHttpAgentRunService<S>>,
     git_push: Option<VmHttpGitPushService<S>>,
+    flake_provision: Option<VmHttpFlakeProvisionService<S>>,
     shutdown: watch::Receiver<bool>,
 ) -> std::io::Result<()> {
     run_vm_http_runtime_until_shutdown(
         listener,
         session,
-        VmHttpServices::with_git(git_clone, nix_cache, proxies, agent_runs, git_push),
+        VmHttpServices::with_git(
+            git_clone,
+            nix_cache,
+            proxies,
+            agent_runs,
+            git_push,
+            flake_provision,
+        ),
         shutdown,
     )
     .await
@@ -1205,6 +1249,12 @@ fn route_request_body_limit<S: SecretStore + Send + Sync + 'static>(
             .as_ref()
             .map(|service| service.body_limits().max_body_bytes());
     }
+    if is_flake_provision_target(&request.target)
+        && request.method == "POST"
+        && services.flake_provision.is_some()
+    {
+        return Some(MAX_VM_HTTP_BODY_BYTES);
+    }
     if parse_agent_run_outcome_target(&request.target).is_some()
         && request.method == "POST"
         && services.agent_runs.is_some()
@@ -1255,6 +1305,15 @@ where
             return VmHttpResponse::text(VmHttpStatus::NotFound, "not found").into();
         };
         return route_git_push_request(session, request, body, service)
+            .await
+            .into();
+    }
+
+    if is_flake_provision_target(&request.target) {
+        let Some(service) = services.flake_provision else {
+            return VmHttpResponse::text(VmHttpStatus::NotFound, "not found").into();
+        };
+        return route_flake_provision_request(session, request, body, service)
             .await
             .into();
     }
@@ -1495,6 +1554,7 @@ impl VmHttpStatus {
             Self::MethodNotAllowed => 405,
             Self::Conflict => 409,
             Self::Gone => 410,
+            Self::UnprocessableContent => 422,
             Self::BadGateway => 502,
             Self::InternalServerError => 500,
             Self::Upstream(code) => code,
@@ -1512,6 +1572,7 @@ impl VmHttpStatus {
             405 => Self::MethodNotAllowed,
             409 => Self::Conflict,
             410 => Self::Gone,
+            422 => Self::UnprocessableContent,
             500 => Self::InternalServerError,
             502 => Self::BadGateway,
             other => Self::Upstream(other),
@@ -1568,6 +1629,7 @@ mod tests {
             openai_proxy: None,
             agent_runs: None,
             git_push: None,
+            flake_provision: None,
         }
     }
 
