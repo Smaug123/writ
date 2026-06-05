@@ -1,20 +1,22 @@
-//! Materialise a working tree of a flake from a retained bare mirror.
+//! Materialise a standalone working tree of a flake from a retained bare mirror.
 //!
 //! Flake-input provisioning runs `nix flake archive` against a *directory*
 //! containing the repo's `flake.nix` and committed `flake.lock`. The broker
 //! retains each clone as a bare mirror (see [`crate::vm_git_mirror_cache`]), so
-//! to provision we first check the relevant commit out of that mirror into a
+//! to provision we check the relevant commit out of that mirror into a
 //! throwaway working tree.
 //!
-//! A `git worktree` linked to the mirror gives that tree without re-cloning and
-//! without copying the object store. The materialised tree is independent of
-//! the mirror's lifetime once checked out, so a later eviction of the mirror
-//! cannot pull the floor out from under an in-flight provision (the
-//! eviction-vs-reader hazard a bare path handout would have).
+//! The tree is produced with a **local clone** (`git clone --local`), not a
+//! linked `git worktree`. A linked worktree's `.git` points back into the
+//! mirror's object store, so `nix flake archive` (which opens the directory as
+//! a Git repo) would break if the mirror were evicted mid-provision. A local
+//! clone instead hardlinks the object store (or copies it, cross-filesystem)
+//! into a self-contained repository, so the materialised tree is independent of
+//! the mirror's lifetime — dissolving the eviction-vs-reader hazard a bare path
+//! handout (or a linked worktree) would have had, without needing a pin.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::time::Duration;
 
 use crate::clean_git::{CleanGitInvocation, clean_git_config_env, run_clean_git};
@@ -22,23 +24,24 @@ use crate::vm_git_mirror_cache::GitCommitSha;
 
 #[derive(Debug, thiserror::Error)]
 pub enum MaterializeError {
-    #[error("could not create flake worktree scratch dir {path:?}: {source}")]
+    #[error("could not create flake materialisation scratch dir {path:?}: {source}")]
     Scratch {
         path: PathBuf,
         source: std::io::Error,
     },
-    #[error("git worktree add failed: {0}")]
-    WorktreeAdd(String),
+    #[error("git clone --local of the mirror failed: {0}")]
+    Clone(String),
+    #[error("git checkout of {rev} failed: {message}")]
+    Checkout { rev: String, message: String },
 }
 
-/// A checked-out working tree of a flake, linked to the bare mirror it came
-/// from. Dropping it detaches the worktree from the mirror and removes the
-/// checked-out files (best-effort), so a provision that returns early or panics
-/// still cleans up.
+/// A standalone checkout of a flake, cloned from the bare mirror it came from.
+/// Dropping it removes the checked-out repository (best-effort), so a provision
+/// that returns early or panics still cleans up. Because it is a full local
+/// clone, it has no back-reference into the mirror and stays usable even if the
+/// mirror is removed.
 #[derive(Debug)]
 pub struct MaterializedFlake {
-    git_program: PathBuf,
-    mirror_dir: PathBuf,
     path: PathBuf,
 }
 
@@ -52,75 +55,95 @@ impl MaterializedFlake {
 
 impl Drop for MaterializedFlake {
     fn drop(&mut self) {
-        // Best-effort teardown, synchronous because Drop cannot await. Detach
-        // the worktree from the mirror (which also removes its files), then make
-        // sure the directory is gone. A leftover worktree registration is
-        // reclaimed by a later `git worktree prune`; the files live under the
-        // broker's scratch root. Errors are deliberately ignored — cleanup must
-        // not panic during unwinding, and the inputs (our own paths) are
-        // trusted, so the hardened `clean_git` path is unnecessary here.
-        let mut git_dir_arg = OsString::from("--git-dir=");
-        git_dir_arg.push(self.mirror_dir.as_os_str());
-        let _ = std::process::Command::new(&self.git_program)
-            .arg(&git_dir_arg)
-            .args(["worktree", "remove", "--force"])
-            .arg(&self.path)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+        // Best-effort: a local clone registers nothing in the mirror, so
+        // removing the directory is the whole teardown. Errors are ignored so
+        // cleanup never panics during unwinding.
         let _ = std::fs::remove_dir_all(&self.path);
     }
 }
 
-/// Check `rev` out of the bare mirror at `mirror_dir` into a fresh worktree
-/// under `scratch_root`, returning a guard that cleans the worktree up when
-/// dropped. `scratch_root` must already exist; the worktree directory itself is
-/// created by `git` and must not pre-exist (a unique name guarantees that).
+/// Clone `rev` out of the bare mirror at `mirror_dir` into a fresh standalone
+/// repository under `scratch_root`, returning a guard that removes it when
+/// dropped. The destination directory is allocated internally (so it always
+/// lives under `scratch_root`); `scratch_root` is created owner-only because
+/// the checkout holds possibly-private repository content.
 pub async fn materialize_flake_tree(
     git_program: &Path,
     mirror_dir: &Path,
     rev: &GitCommitSha,
     scratch_root: &Path,
-    worktree_name: &str,
     timeout: Duration,
 ) -> Result<MaterializedFlake, MaterializeError> {
-    if let Err(source) = std::fs::create_dir_all(scratch_root) {
-        return Err(MaterializeError::Scratch {
-            path: scratch_root.to_path_buf(),
-            source,
-        });
-    }
-    let worktree = scratch_root.join(worktree_name);
+    create_private_dir_all(scratch_root).map_err(|source| MaterializeError::Scratch {
+        path: scratch_root.to_path_buf(),
+        source,
+    })?;
+    // Allocate the destination ourselves so it cannot escape `scratch_root`.
+    let dest = scratch_root.join(format!("flake-{}", uuid::Uuid::new_v4().simple()));
 
-    let mut git_dir_arg = OsString::from("--git-dir=");
-    git_dir_arg.push(mirror_dir.as_os_str());
-    let invocation = CleanGitInvocation::new(
+    // A `--local` clone hardlinks (or, cross-filesystem, copies) the mirror's
+    // object store into a self-contained repo. `--no-checkout` skips the
+    // default-branch checkout; the explicit detached checkout below puts the
+    // requested commit's tree on disk.
+    let clone = CleanGitInvocation::new(
         git_program.to_path_buf(),
         vec![
-            git_dir_arg,
-            OsString::from("worktree"),
-            OsString::from("add"),
+            OsString::from("clone"),
+            OsString::from("--local"),
+            OsString::from("--no-checkout"),
+            OsString::from("--quiet"),
+            OsString::from("--"),
+            mirror_dir.as_os_str().to_os_string(),
+            dest.as_os_str().to_os_string(),
+        ],
+        clean_git_config_env(),
+        Vec::new(),
+    );
+    if let Err(err) = run_clean_git(&clone, timeout, None).await {
+        let _ = std::fs::remove_dir_all(&dest);
+        return Err(MaterializeError::Clone(err.to_string()));
+    }
+
+    let checkout = CleanGitInvocation::new(
+        git_program.to_path_buf(),
+        vec![
+            OsString::from("-C"),
+            dest.as_os_str().to_os_string(),
+            OsString::from("checkout"),
             OsString::from("--detach"),
-            worktree.as_os_str().to_os_string(),
             OsString::from(rev.as_str()),
         ],
         clean_git_config_env(),
         Vec::new(),
     );
-    run_clean_git(&invocation, timeout, None)
-        .await
-        .map_err(|err| MaterializeError::WorktreeAdd(err.to_string()))?;
+    if let Err(err) = run_clean_git(&checkout, timeout, None).await {
+        let _ = std::fs::remove_dir_all(&dest);
+        return Err(MaterializeError::Checkout {
+            rev: rev.as_str().to_string(),
+            message: err.to_string(),
+        });
+    }
 
-    Ok(MaterializedFlake {
-        git_program: git_program.to_path_buf(),
-        mirror_dir: mirror_dir.to_path_buf(),
-        path: worktree,
-    })
+    Ok(MaterializedFlake { path: dest })
+}
+
+/// Create a directory tree restricted to the owner; the checkout holds
+/// possibly-private repository content, so other local users must not be able
+/// to traverse into the scratch root. The explicit `set_permissions` defeats
+/// the process umask.
+fn create_private_dir_all(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(path)?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
 }
 
 #[cfg(test)]
 mod tests {
+    use std::process::Stdio;
+
     use super::*;
 
     fn git_on_path() -> PathBuf {
@@ -134,7 +157,6 @@ mod tests {
         panic!("git must be on PATH for flake_materialize tests");
     }
 
-    /// Run a git command to completion, asserting success, for test fixtures.
     fn git(program: &Path, args: &[&str], cwd: &Path) {
         let status = std::process::Command::new(program)
             .args(args)
@@ -205,13 +227,11 @@ mod tests {
                 &mirror,
                 &rev,
                 &scratch,
-                "flake-wt",
                 Duration::from_secs(30),
             )
             .await
             .unwrap();
 
-            // The committed flake is present and readable as a plain directory.
             assert_eq!(
                 std::fs::read(materialized.path().join("flake.nix")).unwrap(),
                 b"{ outputs = _: {}; }"
@@ -223,11 +243,74 @@ mod tests {
             materialized.path().to_path_buf()
         };
 
-        // Dropping the guard removed the checked-out tree.
         assert!(
             !worktree_path.exists(),
-            "the worktree should be cleaned up on drop"
+            "the checkout should be cleaned up on drop"
         );
+    }
+
+    #[tokio::test]
+    async fn materialized_tree_survives_mirror_deletion() {
+        let git_program = git_on_path();
+        let tmp = tempfile::tempdir().unwrap();
+        let (mirror, rev) = fixture_mirror(&git_program, tmp.path());
+        let scratch = tmp.path().join("scratch");
+        let materialized = materialize_flake_tree(
+            &git_program,
+            &mirror,
+            &rev,
+            &scratch,
+            Duration::from_secs(30),
+        )
+        .await
+        .unwrap();
+
+        // Remove the source mirror entirely: a self-contained clone must keep
+        // working, which is what nix flake archive needs.
+        std::fs::remove_dir_all(&mirror).unwrap();
+
+        assert_eq!(
+            std::fs::read(materialized.path().join("flake.nix")).unwrap(),
+            b"{ outputs = _: {}; }"
+        );
+        let head = git_stdout(
+            &git_program,
+            &[
+                "-C",
+                materialized.path().to_str().unwrap(),
+                "rev-parse",
+                "HEAD",
+            ],
+            tmp.path(),
+        );
+        assert_eq!(
+            head,
+            rev.as_str(),
+            "the clone resolves the commit on its own"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn materialize_creates_an_owner_only_scratch_root() {
+        use std::os::unix::fs::PermissionsExt;
+        let git_program = git_on_path();
+        let tmp = tempfile::tempdir().unwrap();
+        let (mirror, rev) = fixture_mirror(&git_program, tmp.path());
+        let scratch = tmp.path().join("nested/scratch");
+
+        let _materialized = materialize_flake_tree(
+            &git_program,
+            &mirror,
+            &rev,
+            &scratch,
+            Duration::from_secs(30),
+        )
+        .await
+        .unwrap();
+
+        let mode = std::fs::metadata(&scratch).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "scratch root must be owner-only");
     }
 
     #[tokio::test]
@@ -243,11 +326,10 @@ mod tests {
             &mirror,
             &missing,
             &scratch,
-            "flake-wt",
             Duration::from_secs(30),
         )
         .await;
 
-        assert!(matches!(result, Err(MaterializeError::WorktreeAdd(_))));
+        assert!(matches!(result, Err(MaterializeError::Checkout { .. })));
     }
 }
