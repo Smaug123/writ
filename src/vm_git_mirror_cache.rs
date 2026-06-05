@@ -146,9 +146,11 @@ impl MirrorCache {
     /// `src_mirror` is moved, and on the race-loser path may be consumed even
     /// though the existing entry is kept — so the caller must clean up its own
     /// work directory regardless of the outcome rather than rely on
-    /// `src_mirror` surviving. Requires `src_mirror` to be on the same
-    /// filesystem as the cache root so both moves are atomic renames (the
-    /// default puts both under the broker work root).
+    /// `src_mirror` surviving. When `src_mirror` is on the cache root's
+    /// filesystem the move is an atomic rename; when it is on a different
+    /// filesystem (a separate cache volume), the stage falls back to a
+    /// recursive copy. The staging-to-entry publish is always same-filesystem
+    /// and atomic either way.
     pub fn insert(
         &self,
         key: &MirrorCacheKey,
@@ -166,9 +168,21 @@ impl MirrorCache {
             .root
             .join(format!("{STAGING_PREFIX}{}", uuid::Uuid::new_v4().simple()));
         create_private_dir(&staging)?;
-        if let Err(err) = std::fs::rename(src_mirror, staging.join(MIRROR_DIR_NAME)) {
-            let _ = std::fs::remove_dir_all(&staging);
-            return Err(err);
+        let staged_mirror = staging.join(MIRROR_DIR_NAME);
+        if let Err(err) = std::fs::rename(src_mirror, &staged_mirror) {
+            // A cross-device rename (cache root and clone work dir on different
+            // filesystems) fails with `CrossesDevices`; fall back to a recursive
+            // copy into staging so a separate cache volume still works. Other
+            // failures (missing or unreadable source) are propagated.
+            if err.kind() == std::io::ErrorKind::CrossesDevices {
+                if let Err(copy_err) = copy_dir_recursive(src_mirror, &staged_mirror) {
+                    let _ = std::fs::remove_dir_all(&staging);
+                    return Err(copy_err);
+                }
+            } else {
+                let _ = std::fs::remove_dir_all(&staging);
+                return Err(err);
+            }
         }
         // `rename` onto a missing or empty `entry` succeeds (publishing, or
         // healing a leftover empty slot from an earlier crash); onto a populated
@@ -241,6 +255,27 @@ fn create_private_dir(path: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
     std::fs::DirBuilder::new().mode(0o700).create(path)?;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+}
+
+/// Recursively copy a directory tree — the cross-device fallback for staging a
+/// mirror whose work dir is on a different filesystem from the cache. A bare git
+/// mirror contains only regular files and directories, so symlinks are not
+/// handled. `dest` is created; the source is left in place for its owner to
+/// clean up. `fs::copy` preserves file modes; the published entry's privacy
+/// comes from its 0700 root, not from the inner directory modes.
+fn copy_dir_recursive(src: &Path, dest: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dest)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let from = entry.path();
+        let to = dest.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_dir_recursive(&from, &to)?;
+        } else {
+            std::fs::copy(&from, &to)?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -429,6 +464,29 @@ mod tests {
             std::fs::read(stored_mirror(&cache, &key).join("HEAD")).unwrap(),
             b"healed"
         );
+    }
+
+    #[test]
+    fn copy_dir_recursive_copies_a_nested_tree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(src.join("objects/pack")).unwrap();
+        std::fs::write(src.join("HEAD"), b"ref: refs/heads/main").unwrap();
+        std::fs::write(src.join("objects/pack/p.idx"), b"idx").unwrap();
+        let dest = tmp.path().join("dest");
+
+        copy_dir_recursive(&src, &dest).unwrap();
+
+        assert_eq!(
+            std::fs::read(dest.join("HEAD")).unwrap(),
+            b"ref: refs/heads/main"
+        );
+        assert_eq!(
+            std::fs::read(dest.join("objects/pack/p.idx")).unwrap(),
+            b"idx"
+        );
+        // The cross-device fallback leaves the source in place for its owner.
+        assert!(src.join("HEAD").exists());
     }
 
     #[test]

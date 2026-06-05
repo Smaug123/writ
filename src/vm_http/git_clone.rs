@@ -3,9 +3,11 @@
 //! followed by `git bundle create`, and returning the bundle bytes to the
 //! guest.
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::clean_git::{CleanGitInvocation, clean_git_config_env, run_clean_git_capture_stdout};
 use crate::core::{CapabilityRequest, GitHubAccess, GitHubRequest};
 use crate::secret::SecretStore;
 use crate::server::{BrokerState, CapabilityOutcome, request_capability};
@@ -18,6 +20,7 @@ use crate::vm_git_bundle::{
     GitCloneBundleSource, GitCredentialBoundary, GitSecretValue, GitSecretValueError,
     run_git_clone_bundle,
 };
+use crate::vm_git_mirror_cache::{GitCommitSha, MirrorCache, MirrorCacheKey};
 
 use super::{VmHttpRequest, VmHttpResponse, VmHttpSession, VmHttpStatus};
 
@@ -34,6 +37,11 @@ pub struct VmHttpGitCloneConfig {
     work_root: PathBuf,
     timeout: std::time::Duration,
     max_bundle_bytes: u64,
+    /// When set, the bare mirror produced for each clone is retained in this
+    /// `(repo, rev)`-keyed cache (for later flake-input provisioning) instead of
+    /// being discarded. `None` keeps the historical behaviour: the work dir,
+    /// mirror and all, is removed once the bundle is read.
+    mirror_cache: Option<MirrorCache>,
 }
 
 impl<S: SecretStore> VmHttpGitCloneService<S> {
@@ -109,7 +117,19 @@ impl VmHttpGitCloneConfig {
             work_root,
             timeout,
             max_bundle_bytes,
+            mirror_cache: None,
         })
+    }
+
+    /// Attach the `(repo, rev)` mirror cache that retains each clone's bare
+    /// mirror. `None` (the default) discards the mirror as before.
+    pub fn with_mirror_cache(mut self, mirror_cache: Option<MirrorCache>) -> Self {
+        self.mirror_cache = mirror_cache;
+        self
+    }
+
+    pub fn mirror_cache(&self) -> Option<&MirrorCache> {
+        self.mirror_cache.as_ref()
     }
 
     pub fn work_root(&self) -> &Path {
@@ -213,7 +233,7 @@ async fn handle_git_clone_request<S: SecretStore + Send + Sync>(
         }
     };
 
-    match run_git_clone_bundle_and_read(&plan, &secret).await {
+    match run_git_clone_bundle_and_read(&plan, &secret, service.config.mirror_cache()).await {
         Ok(bundle) => VmHttpResponse {
             status: VmHttpStatus::Ok,
             content_type: GIT_BUNDLE_CONTENT_TYPE,
@@ -271,9 +291,66 @@ fn git_clone_token_from_capability_outcome(
     }
 }
 
+/// Retain a freshly-cloned bare mirror in the `(repo, rev)` cache, best-effort.
+/// Resolves the commit the requested ref points to, then moves the mirror into
+/// the cache under that key. Any failure (rev resolution or the move) is logged
+/// and swallowed: retention is an optimisation for later provisioning, never a
+/// precondition for returning the bundle.
+async fn retain_clone_mirror(plan: &GitCloneBundlePlan, cache: &MirrorCache) {
+    let rev = match resolve_mirror_rev(plan).await {
+        Ok(rev) => rev,
+        Err(err) => {
+            tracing::warn!(error = %err, "not retaining clone mirror: could not resolve rev");
+            return;
+        }
+    };
+    let key = MirrorCacheKey::new(plan.request().repo().as_repo_ref(), &rev);
+    // `MirrorCache::insert` is synchronous filesystem work; move it off the
+    // async runtime. The cache is cheap to clone (just a path).
+    let cache = cache.clone();
+    let mirror = plan.mirror_dir().to_path_buf();
+    match tokio::task::spawn_blocking(move || cache.insert(&key, &mirror)).await {
+        Ok(Ok(outcome)) => tracing::debug!(?outcome, "retained clone mirror for provisioning"),
+        Ok(Err(err)) => tracing::warn!(error = %err, "clone mirror cache insert failed"),
+        Err(err) => tracing::warn!(error = %err, "clone mirror cache insert task failed"),
+    }
+}
+
+/// Resolve the commit the clone's requested ref points to in the bare mirror,
+/// via `git -C <mirror> rev-parse --verify <ref>^{commit}`. Falls back to
+/// `HEAD` when the request named no ref (an all-refs clone). `--end-of-options`
+/// keeps a hostile-looking ref from being parsed as a flag, and `^{commit}`
+/// peels tags so the key is always a commit.
+async fn resolve_mirror_rev(plan: &GitCloneBundlePlan) -> Result<GitCommitSha, String> {
+    let refspec = plan
+        .request()
+        .git_ref()
+        .map(|git_ref| git_ref.as_str().to_string())
+        .unwrap_or_else(|| "HEAD".to_string());
+    let invocation = CleanGitInvocation::new(
+        plan.git_program().to_path_buf(),
+        [
+            OsString::from("-C"),
+            plan.mirror_dir().as_os_str().to_os_string(),
+            OsString::from("rev-parse"),
+            OsString::from("--verify"),
+            OsString::from("--end-of-options"),
+            OsString::from(format!("{refspec}^{{commit}}")),
+        ],
+        clean_git_config_env(),
+        Vec::new(),
+    );
+    let stdout = run_clean_git_capture_stdout(&invocation, plan.timeout(), None)
+        .await
+        .map_err(|err| format!("git rev-parse failed: {err}"))?;
+    GitCommitSha::parse(&String::from_utf8_lossy(&stdout))
+        .map_err(|err| format!("git rev-parse output was not a commit hash: {err}"))
+}
+
 async fn run_git_clone_bundle_and_read(
     plan: &GitCloneBundlePlan,
     secret: &GitSecretValue,
+    mirror_cache: Option<&MirrorCache>,
 ) -> Result<Vec<u8>, String> {
     prepare_git_work_root(plan.work_dir().parent().ok_or_else(|| {
         format!(
@@ -298,6 +375,16 @@ async fn run_git_clone_bundle_and_read(
         })
     }
     .await;
+
+    // Retain the bare mirror for later flake-input provisioning before the work
+    // dir — the mirror with it — is removed. Best-effort and only on a
+    // successful clone: a retention failure is logged inside `retain_clone_mirror`
+    // and never fails the clone, whose product is the bundle.
+    if run_result.is_ok()
+        && let Some(cache) = mirror_cache
+    {
+        retain_clone_mirror(plan, cache).await;
+    }
 
     let cleanup_result = match tokio::fs::remove_dir_all(&work_dir).await {
         Ok(()) => Ok(()),
@@ -410,9 +497,9 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::super::tests::{
-        bearer, git_clone_config_for_test, make_broker_state, no_services, open_audit_session,
-        required_test_tool, session_for_subnet, shell_single_quote, token, write_fake_git,
-        write_fake_git_with_bundle_epilogue,
+        FAKE_GIT_REV_PARSE_SHA, bearer, git_clone_config_for_test, make_broker_state, no_services,
+        open_audit_session, required_test_tool, session_for_subnet, shell_single_quote, token,
+        write_fake_git, write_fake_git_with_bundle_epilogue,
     };
     use super::super::{
         VM_HTTP_READ_TIMEOUT, VmHttpProxies, VmHttpRequest, VmHttpServices, VmHttpSession,
@@ -763,6 +850,59 @@ work_root=${{work_dir%/*}}
         );
         assert!(!body.message().contains("bundle-from-fake-git"));
         assert_eq!(std::fs::read_dir(work_root).unwrap().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn git_clone_retains_the_mirror_when_a_cache_is_configured() {
+        let github = MockServer::start().await;
+        let state = make_broker_state(&github);
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+        open_audit_session(&state, session.session_id());
+        Mock::given(method("POST"))
+            .and(path("/app/installations/999/access_tokens"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "token": "ghs_vm_token",
+                "expires_at": expiry_str_from_now(3600),
+                "permissions": {"contents": "read", "metadata": "read"},
+                "repository_selection": "selected",
+                "repositories": [{"full_name": "o/n"}]
+            })))
+            .expect(1)
+            .mount(&github)
+            .await;
+
+        let temp = tempfile::tempdir().unwrap();
+        let cache_dir = temp.path().join("mirror-cache");
+        let service = VmHttpGitCloneService::new(
+            Arc::clone(&state),
+            git_clone_config_for_test(&temp, write_fake_git(temp.path()))
+                .with_mirror_cache(Some(MirrorCache::new(cache_dir.clone()))),
+        );
+        let clone_repo = GitCloneRepo::new(repo("o", "n")).unwrap();
+        let body = serde_json::to_vec(&VmGitCloneRequest::new(clone_repo, None)).unwrap();
+
+        let response = handle_git_clone_request(&session, &body, service).await;
+        assert_eq!(response.status, VmHttpStatus::Ok);
+
+        // The bare mirror is retained under the (repo, resolved-rev) key, and the
+        // transient clone work dir is still cleaned up.
+        let key = MirrorCacheKey::new(
+            &repo("o", "n"),
+            &GitCommitSha::parse(FAKE_GIT_REV_PARSE_SHA).unwrap(),
+        );
+        let retained = cache_dir.join(key.slug()).join("mirror.git");
+        assert!(
+            retained.is_dir(),
+            "mirror should be retained at {}",
+            retained.display()
+        );
+        assert!(
+            !temp.path().join("git-work").exists()
+                || std::fs::read_dir(temp.path().join("git-work"))
+                    .map(|mut d| d.next().is_none())
+                    .unwrap_or(true),
+            "the clone work dir should be cleaned up after retention"
+        );
     }
 
     #[tokio::test]
