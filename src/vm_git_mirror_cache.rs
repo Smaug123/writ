@@ -135,6 +135,16 @@ impl MirrorCache {
         &self.root
     }
 
+    /// Return the path to the retained bare mirror for `key`, if one is cached.
+    /// The caller should materialise an *independent* tree from it promptly (see
+    /// [`crate::flake_materialize`]) rather than hold the path: there is no
+    /// eviction today, but FK4's GC will reclaim mirrors, and a local clone is
+    /// unaffected by that whereas the returned path is not.
+    pub fn get(&self, key: &MirrorCacheKey) -> Option<PathBuf> {
+        let mirror = self.root.join(key.slug()).join(MIRROR_DIR_NAME);
+        mirror.is_dir().then_some(mirror)
+    }
+
     /// Publish a freshly-cloned bare mirror into the cache under `key`. A
     /// *complete* entry is staged in a private temp directory and published with
     /// a single atomic `rename`, so concurrent clones of the same `(repo, rev)`
@@ -382,6 +392,25 @@ mod tests {
         assert_eq!(
             std::fs::read(stored_mirror(&cache, &key).join("HEAD")).unwrap(),
             b"content"
+        );
+    }
+
+    #[test]
+    fn get_returns_a_present_mirror_and_misses_otherwise() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = MirrorCache::new(tmp.path().join("cache"));
+        let key = MirrorCacheKey::new(&repo("o", "r"), &sha(&forty(1)));
+        assert!(cache.get(&key).is_none());
+
+        cache
+            .insert(&key, &make_mirror(tmp.path(), "content"))
+            .unwrap();
+        assert_eq!(cache.get(&key), Some(stored_mirror(&cache, &key)));
+        // A different key still misses.
+        assert!(
+            cache
+                .get(&MirrorCacheKey::new(&repo("o", "r"), &sha(&forty(2))))
+                .is_none()
         );
     }
 
