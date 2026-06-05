@@ -19,7 +19,7 @@ use crate::vm_git_mirror_cache::{GitCommitSha, MirrorCache, MirrorCacheKey};
 
 /// The host paths, directories, and bounds the broker supplies once for
 /// provisioning flake inputs from a cached mirror.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MirrorFlakeProvisionConfig {
     git_program: PathBuf,
     nix_program: PathBuf,

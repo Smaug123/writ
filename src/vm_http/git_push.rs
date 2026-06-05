@@ -367,6 +367,7 @@ mod tests {
             openai_proxy: None,
             agent_runs: None,
             git_push: Some(git_push),
+            flake_provision: None,
         }
     }
 

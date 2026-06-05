@@ -15,6 +15,8 @@ use crate::agent_vm_lifecycle::{
     AgentVmToolPaths, ContainerImage, Ipv6IsolationMode, default_agent_vm_state_dir,
 };
 use crate::core::{AgentNetworkPool, AgentVmConfigError, BrokerPortRange, Ipv4Cidr, Ipv6Cidr};
+use crate::flake_lock::{FlakeProvisionBounds, FlakeProvisionBoundsError};
+use crate::flake_provision_from_mirror::MirrorFlakeProvisionConfig;
 use crate::github::GitHubAppRegistryConfig;
 use crate::nix_cache::{NixTrustedPublicKeys, NixTrustedPublicKeysError};
 use crate::notes_repo::{NotesRepo, NotesRepoError};
@@ -30,9 +32,9 @@ use crate::vm_git_bundle::{
 use crate::vm_git_mirror_cache::MirrorCache;
 use crate::vm_http::{
     DEFAULT_CLAUDE_ANTHROPIC_VERSION, VmHttpClaudeProxyAuthKind, VmHttpClaudeProxyConfig,
-    VmHttpClaudeProxyConfigError, VmHttpGitCloneConfig, VmHttpNixCacheConfig,
-    VmHttpNixCacheConfigError, VmHttpOpenAiProxyAuthKind, VmHttpOpenAiProxyConfig,
-    VmHttpOpenAiProxyConfigError, VmHttpRuntimeConfig,
+    VmHttpClaudeProxyConfigError, VmHttpFlakeProvisionConfig, VmHttpGitCloneConfig,
+    VmHttpNixCacheConfig, VmHttpNixCacheConfigError, VmHttpOpenAiProxyAuthKind,
+    VmHttpOpenAiProxyConfig, VmHttpOpenAiProxyConfigError, VmHttpRuntimeConfig,
 };
 
 /// Top-level daemon configuration. Loaded from a JSON file at startup;
@@ -363,6 +365,11 @@ pub struct AgentVmHttpConfig {
     pub broker_port_max: u16,
     #[serde(default = "default_vm_http_git_program")]
     pub git_program: PathBuf,
+    /// `nix` binary the broker runs to provision a flake's locked inputs
+    /// (`nix flake archive`). Only used when flake-input provisioning is
+    /// enabled (`flake_mirror_cache_dir` set).
+    #[serde(default = "default_vm_http_nix_program")]
+    pub nix_program: PathBuf,
     #[serde(default = "default_git_clone_base_url")]
     pub git_clone_base_url: String,
     pub askpass_program: PathBuf,
@@ -394,8 +401,29 @@ pub struct AgentVmHttpConfig {
     /// historical behaviour — the mirror is discarded once its bundle is read.
     /// The cache holds bare clones of possibly-private repositories, so the
     /// directory is created owner-only (0700) on first use.
+    ///
+    /// Setting this also enables the `/v1/nix/flake/provision` endpoint, which
+    /// re-derives a checkout from a retained mirror; with the cache absent there
+    /// is nothing to provision from, so the endpoint stays disabled.
     #[serde(default)]
     pub flake_mirror_cache_dir: Option<PathBuf>,
+    /// Directory under which the broker materialises throwaway local clones to
+    /// run `nix flake archive` against. `None` defaults to
+    /// `<work_root>/flake-materialize`. Created owner-only (0700).
+    #[serde(default)]
+    pub flake_materialize_scratch_dir: Option<PathBuf>,
+    /// Maximum number of locked flake inputs the broker will provision in one
+    /// request; a lock with more inputs is refused fail-closed.
+    #[serde(default = "default_flake_provision_max_input_count")]
+    pub flake_provision_max_input_count: usize,
+    /// Maximum total bytes the broker will archive for one provision request;
+    /// an over-budget archive is not published (fail-closed).
+    #[serde(default = "default_flake_provision_max_total_bytes")]
+    pub flake_provision_max_total_bytes: u64,
+    /// Timeout (seconds) for the `nix flake archive` step of one provision
+    /// request.
+    #[serde(default = "default_flake_provision_timeout_secs")]
+    pub flake_provision_timeout_secs: u64,
     #[serde(default)]
     pub claude_proxy: Option<AgentVmHttpClaudeProxyConfig>,
     #[serde(default)]
@@ -527,6 +555,12 @@ pub enum AgentVmHttpConfigError {
     EmptyFlakeMirrorCacheDir,
     #[error("flake mirror cache dir path must be absolute: {0:?}")]
     RelativeFlakeMirrorCacheDir(PathBuf),
+    #[error("flake materialize scratch dir path must not be empty")]
+    EmptyFlakeMaterializeScratchDir,
+    #[error("flake materialize scratch dir path must be absolute: {0:?}")]
+    RelativeFlakeMaterializeScratchDir(PathBuf),
+    #[error(transparent)]
+    FlakeProvisionBounds(#[from] FlakeProvisionBoundsError),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -606,14 +640,16 @@ impl AgentVmHttpConfig {
         )?;
         // When configured, retain each clone's bare mirror for later
         // flake-input provisioning; the cache creates its (owner-only) directory
-        // on first insert. `None` keeps the discard-after-bundle behaviour.
+        // on first insert. `None` keeps the discard-after-bundle behaviour. The
+        // same cache backs the flake-provision endpoint below, so clone +
+        // provision share one fetch.
         let mirror_cache = self
             .flake_mirror_cache_dir
             .clone()
             .map(validate_flake_mirror_cache_dir)
             .transpose()?
             .map(MirrorCache::new);
-        let git_clone = git_clone.with_mirror_cache(mirror_cache);
+        let git_clone = git_clone.with_mirror_cache(mirror_cache.clone());
         // `prepare_git_work_root` refuses to clone into a work root whose mode
         // has group/world bits set, but `validate_*_root` below creates the
         // staging/log subdirs with `create_dir_all`, which propagates the
@@ -634,6 +670,35 @@ impl AgentVmHttpConfig {
             None => self.work_root.join("flake-input-cache"),
         };
         let flake_input_cache_dir = validate_flake_input_cache_dir(flake_input_cache_dir)?;
+        // Flake-input provisioning re-derives a checkout from a retained mirror,
+        // so it is enabled exactly when the mirror cache is. It archives the
+        // committed, locked inputs into the very same shared CA cache the
+        // nix-cache endpoint serves local-first, so the guest realises them
+        // through the substituter it already trusts.
+        let flake_provision = match mirror_cache {
+            Some(mirror_cache) => {
+                let scratch_root = match &self.flake_materialize_scratch_dir {
+                    Some(path) => path.clone(),
+                    None => self.work_root.join("flake-materialize"),
+                };
+                let scratch_root = validate_flake_materialize_scratch_dir(scratch_root)?;
+                let bounds = FlakeProvisionBounds::new(
+                    self.flake_provision_max_input_count,
+                    self.flake_provision_max_total_bytes,
+                    Duration::from_secs(self.flake_provision_timeout_secs),
+                )?;
+                let provision = MirrorFlakeProvisionConfig::new(
+                    self.git_program.clone(),
+                    self.nix_program.clone(),
+                    scratch_root,
+                    flake_input_cache_dir.clone(),
+                    bounds,
+                    Duration::from_secs(self.clone_timeout_secs),
+                );
+                Some(VmHttpFlakeProvisionConfig::new(provision, mirror_cache))
+            }
+            None => None,
+        };
         let nix_cache = VmHttpNixCacheConfig::new_with_trusted_public_keys(
             &self.nix_cache_url,
             self.nix_cache_max_metadata_bytes,
@@ -676,7 +741,8 @@ impl AgentVmHttpConfig {
             agent_run_log_root,
             git_push_staging_root,
             git_push_body_limits,
-        ))
+        )
+        .with_flake_provision(flake_provision))
     }
 }
 
@@ -888,6 +954,24 @@ fn validate_flake_mirror_cache_dir(path: PathBuf) -> Result<PathBuf, AgentVmHttp
     Ok(path)
 }
 
+/// Validate a configured flake materialize scratch directory: a non-empty
+/// absolute path. `materialize_flake_tree` creates it owner-only (0700) on
+/// first use and refuses a relative path (it runs git from `cwd=/`), so this
+/// only fails fast on a misconfigured path rather than creating anything.
+fn validate_flake_materialize_scratch_dir(
+    path: PathBuf,
+) -> Result<PathBuf, AgentVmHttpConfigError> {
+    if path.as_os_str().is_empty() {
+        return Err(AgentVmHttpConfigError::EmptyFlakeMaterializeScratchDir);
+    }
+    if !path.is_absolute() {
+        return Err(AgentVmHttpConfigError::RelativeFlakeMaterializeScratchDir(
+            path,
+        ));
+    }
+    Ok(path)
+}
+
 fn validate_flake_input_cache_dir(path: PathBuf) -> Result<PathBuf, AgentVmHttpConfigError> {
     if path.as_os_str().is_empty() {
         return Err(AgentVmHttpConfigError::EmptyFlakeInputCacheDir);
@@ -977,6 +1061,18 @@ fn default_vm_http_bind_addr() -> Ipv4Addr {
 
 fn default_vm_http_git_program() -> PathBuf {
     PathBuf::from("git")
+}
+fn default_vm_http_nix_program() -> PathBuf {
+    PathBuf::from("nix")
+}
+fn default_flake_provision_max_input_count() -> usize {
+    256
+}
+fn default_flake_provision_max_total_bytes() -> u64 {
+    2 * 1024 * 1024 * 1024
+}
+fn default_flake_provision_timeout_secs() -> u64 {
+    600
 }
 
 fn default_clone_timeout_secs() -> u64 {
@@ -1589,6 +1685,7 @@ mod tests {
             broker_port_min: 18080,
             broker_port_max: 18081,
             git_program: PathBuf::from("/usr/bin/git"),
+            nix_program: PathBuf::from("/usr/bin/nix"),
             git_clone_base_url: DEFAULT_GIT_CLONE_BASE_URL.into(),
             askpass_program: PathBuf::from("/usr/local/libexec/writ-git-askpass"),
             token_env: "WRIT_GIT_TOKEN".into(),
@@ -1601,6 +1698,10 @@ mod tests {
             nix_cache_max_nar_bytes: 67_108_864,
             flake_input_cache_dir: None,
             flake_mirror_cache_dir: None,
+            flake_materialize_scratch_dir: None,
+            flake_provision_max_input_count: default_flake_provision_max_input_count(),
+            flake_provision_max_total_bytes: default_flake_provision_max_total_bytes(),
+            flake_provision_timeout_secs: default_flake_provision_timeout_secs(),
             claude_proxy: None,
             openai_proxy: None,
             agent_run_log_root: None,
@@ -2052,6 +2153,51 @@ mod tests {
             c.to_runtime_config(),
             Err(AgentVmHttpConfigError::RelativeFlakeMirrorCacheDir(path))
                 if path.as_os_str() == "flake-mirror-cache"
+        ));
+    }
+
+    #[test]
+    fn agent_vm_http_config_enables_flake_provision_with_the_mirror_cache() {
+        let mut c = valid_agent_vm_http_config();
+        c.flake_mirror_cache_dir = Some(unique_config_test_path("flake-mirror-cache"));
+
+        let runtime = c.to_runtime_config().unwrap();
+
+        // Provisioning re-derives a checkout from the retained mirror, so it is
+        // enabled exactly when the mirror cache is configured.
+        assert!(runtime.flake_provision().is_some());
+    }
+
+    #[test]
+    fn agent_vm_http_config_disables_flake_provision_without_the_mirror_cache() {
+        let runtime = valid_agent_vm_http_config().to_runtime_config().unwrap();
+        // With nothing to provision from, the endpoint stays disabled even
+        // though the flake-input cache is always wired for serving.
+        assert!(runtime.flake_provision().is_none());
+    }
+
+    #[test]
+    fn agent_vm_http_config_rejects_relative_flake_materialize_scratch_dir() {
+        let mut c = valid_agent_vm_http_config();
+        c.flake_mirror_cache_dir = Some(unique_config_test_path("flake-mirror-cache"));
+        c.flake_materialize_scratch_dir = Some(PathBuf::from("flake-materialize"));
+
+        assert!(matches!(
+            c.to_runtime_config(),
+            Err(AgentVmHttpConfigError::RelativeFlakeMaterializeScratchDir(path))
+                if path.as_os_str() == "flake-materialize"
+        ));
+    }
+
+    #[test]
+    fn agent_vm_http_config_rejects_zero_flake_provision_input_bound() {
+        let mut c = valid_agent_vm_http_config();
+        c.flake_mirror_cache_dir = Some(unique_config_test_path("flake-mirror-cache"));
+        c.flake_provision_max_input_count = 0;
+
+        assert!(matches!(
+            c.to_runtime_config(),
+            Err(AgentVmHttpConfigError::FlakeProvisionBounds(_))
         ));
     }
 

@@ -286,6 +286,24 @@ impl AuditLog {
         })
     }
 
+    /// True iff this session holds a recorded grant that authorises `request`.
+    /// Lets a later action reuse a capability the session already proved —
+    /// e.g. provisioning a repo the session was granted contents-read on by an
+    /// earlier clone — without minting a fresh credential. It applies the same
+    /// structural `scope_authorised_by_request` check that guards `grant_log`
+    /// rows against cross-request wire-ups, so a grant only ever authorises the
+    /// request it could itself have been minted from.
+    pub fn session_holds_grant_authorising(
+        &self,
+        session_id: SessionId,
+        request: &CapabilityRequest,
+    ) -> Result<bool, AuditError> {
+        Ok(self
+            .list_grants_for_session(session_id)?
+            .iter()
+            .any(|grant| scope_authorised_by_request(request, &grant.scope)))
+    }
+
     pub fn get_grant(&self, jti: Jti) -> Result<Option<CredentialGrant>, AuditError> {
         self.with_conn(|c| {
             let row = c
@@ -454,6 +472,63 @@ mod tests {
         assert_eq!(grants, vec![grant.clone()]);
         let got = log.get_grant(grant.jti).unwrap().unwrap();
         assert_eq!(got, grant);
+    }
+
+    #[test]
+    fn session_holds_grant_authorising_matches_only_the_recorded_request() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+
+        let request_id = RequestId::new();
+        let req = sample_request();
+        let scope = sample_scope();
+        let decision = PolicyDecision::Grant {
+            scope: scope.clone(),
+            ttl: TtlSeconds::new(300).unwrap(),
+        };
+        pre_mint(
+            &log,
+            request_id,
+            s.session_id,
+            &req,
+            &decision,
+            UnixMillis::from_millis(1_700_000_100),
+        )
+        .unwrap();
+        log.record_grant(&CredentialGrant {
+            jti: Jti::new(),
+            request_id,
+            session_id: s.session_id,
+            github_app_id: Some(42),
+            scope,
+            issued_at: UnixMillis::from_millis(1_700_000_100),
+            expires_at: UnixMillis::from_millis(1_700_000_400),
+        })
+        .unwrap();
+
+        // The recorded grant authorises the exact request it was minted from.
+        assert!(
+            log.session_holds_grant_authorising(s.session_id, &req)
+                .unwrap()
+        );
+        // It does not authorise a different repository,
+        let other_repo = CapabilityRequest::GitHub(GitHubRequest::Contents {
+            access: GitHubAccess::Write,
+            repo: RepoRef {
+                owner: "o".into(),
+                name: "other".into(),
+            },
+        });
+        assert!(
+            !log.session_holds_grant_authorising(s.session_id, &other_repo)
+                .unwrap()
+        );
+        // nor any request for a session that holds no grants.
+        assert!(
+            !log.session_holds_grant_authorising(SessionId::new(), &req)
+                .unwrap()
+        );
     }
 
     #[test]
