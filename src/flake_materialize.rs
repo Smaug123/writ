@@ -24,6 +24,8 @@ use crate::vm_git_mirror_cache::GitCommitSha;
 
 #[derive(Debug, thiserror::Error)]
 pub enum MaterializeError {
+    #[error("{which} path must be absolute: {path:?}")]
+    RelativePath { which: &'static str, path: PathBuf },
     #[error("could not create flake materialisation scratch dir {path:?}: {source}")]
     Scratch {
         path: PathBuf,
@@ -74,6 +76,19 @@ pub async fn materialize_flake_tree(
     scratch_root: &Path,
     timeout: Duration,
 ) -> Result<MaterializedFlake, MaterializeError> {
+    // `run_clean_git` runs git from a fixed root cwd, so every path in the argv
+    // must be absolute or it would resolve differently from the Rust-side
+    // create/chmod/remove (leaking a private checkout, or removing the wrong
+    // directory on drop). The broker always passes absolute paths; fail loud
+    // otherwise.
+    for (which, path) in [("mirror_dir", mirror_dir), ("scratch_root", scratch_root)] {
+        if !path.is_absolute() {
+            return Err(MaterializeError::RelativePath {
+                which,
+                path: path.to_path_buf(),
+            });
+        }
+    }
     create_private_dir_all(scratch_root).map_err(|source| MaterializeError::Scratch {
         path: scratch_root.to_path_buf(),
         source,
@@ -311,6 +326,30 @@ mod tests {
 
         let mode = std::fs::metadata(&scratch).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o700, "scratch root must be owner-only");
+    }
+
+    #[tokio::test]
+    async fn materialize_rejects_a_relative_scratch_root() {
+        let git_program = git_on_path();
+        let tmp = tempfile::tempdir().unwrap();
+        let (mirror, rev) = fixture_mirror(&git_program, tmp.path());
+
+        let result = materialize_flake_tree(
+            &git_program,
+            &mirror,
+            &rev,
+            Path::new("relative/scratch"),
+            Duration::from_secs(30),
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(MaterializeError::RelativePath {
+                which: "scratch_root",
+                ..
+            })
+        ));
     }
 
     #[tokio::test]
