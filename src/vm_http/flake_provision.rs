@@ -17,6 +17,7 @@
 
 use std::sync::Arc;
 
+use crate::core::{CapabilityRequest, GitHubAccess, GitHubRequest, RepoRef};
 use crate::flake_lock::{FlakeLockError, FlakeProvisionPlanError};
 use crate::flake_provision::FlakeProvisionError;
 use crate::flake_provision_from_mirror::{
@@ -117,6 +118,19 @@ async fn handle_flake_provision_request<S: SecretStore + Send + Sync>(
     }
 
     let repo = request.repo().as_repo_ref().clone();
+
+    // Authorize the repository against this session's own recorded grants. The
+    // retained mirror cache is shared across sessions and can hold private
+    // repos cloned by *other* sessions, so an open session is not enough: a
+    // session may only provision a repo it was itself granted contents-read on
+    // — i.e. one it cloned in this session. `policy::decide` grants read on any
+    // repo (the real read gate is the mint, scoped to the session's GitHub App
+    // installation), so reusing the recorded clone grant is what fences
+    // cross-session access here, and it mints nothing and adds no egress.
+    if let Err(response) = authorize_repo(session, &service, &repo) {
+        return response;
+    }
+
     // The wire `rev` is a validated 40-hex object id; `GitCommitSha::parse`
     // re-checks the (40|64)-hex commit shape the mirror key requires.
     let rev = match GitCommitSha::parse(request.rev().as_str()) {
@@ -182,6 +196,42 @@ fn preflight_session<S: SecretStore + Send + Sync>(
                 VmHttpStatus::InternalServerError,
                 VmFlakeProvisionErrorCode::ProvisionFailed,
                 "session preflight failed",
+            ))
+        }
+    }
+}
+
+/// Require that this session holds a contents-read grant for `repo`. Returns a
+/// `403` otherwise — the caller is authenticated but never proved it may read
+/// this repository, so it cannot drive provisioning of another session's
+/// cached private mirror. An audit read failure is an internal error so the
+/// guest never provisions on an unverifiable authorization.
+fn authorize_repo<S: SecretStore + Send + Sync>(
+    session: &VmHttpSession,
+    service: &VmHttpFlakeProvisionService<S>,
+    repo: &RepoRef,
+) -> Result<(), VmHttpResponse> {
+    let read_request = CapabilityRequest::GitHub(GitHubRequest::Contents {
+        access: GitHubAccess::Read,
+        repo: repo.clone(),
+    });
+    match service
+        .broker_state
+        .audit
+        .session_holds_grant_authorising(session.session_id(), &read_request)
+    {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(error_response(
+            VmHttpStatus::Forbidden,
+            VmFlakeProvisionErrorCode::Denied,
+            "session has no contents-read grant for this repository",
+        )),
+        Err(err) => {
+            tracing::warn!(error = %err, "vm http flake provision authorization check failed");
+            Err(error_response(
+                VmHttpStatus::InternalServerError,
+                VmFlakeProvisionErrorCode::ProvisionFailed,
+                "authorization check failed",
             ))
         }
     }
@@ -266,7 +316,8 @@ mod tests {
     use wiremock::MockServer;
 
     use super::super::tests::{
-        bearer, make_broker_state, open_audit_session, session_for_subnet, token,
+        bearer, make_broker_state, open_audit_session, record_contents_read_grant,
+        session_for_subnet, token,
     };
     use super::super::{VmHttpRequest, VmHttpServices, route_authenticated_vm_http_request};
     use super::*;
@@ -301,12 +352,15 @@ mod tests {
     }
 
     fn provision_request_body(owner: &str, name: &str, rev: &str) -> Vec<u8> {
-        let repo = GitCloneRepo::new(RepoRef {
+        let repo = GitCloneRepo::new(repo_ref(owner, name)).unwrap();
+        serde_json::to_vec(&VmFlakeProvisionRequest::new(repo, rev.parse().unwrap())).unwrap()
+    }
+
+    fn repo_ref(owner: &str, name: &str) -> RepoRef {
+        RepoRef {
             owner: owner.into(),
             name: name.into(),
-        })
-        .unwrap();
-        serde_json::to_vec(&VmFlakeProvisionRequest::new(repo, rev.parse().unwrap())).unwrap()
+        }
     }
 
     fn session() -> VmHttpSession {
@@ -397,6 +451,7 @@ mod tests {
         let state = make_broker_state(&github);
         let session = session();
         open_audit_session(&state, session.session_id());
+        record_contents_read_grant(&state, session.session_id(), repo_ref("o", "n"));
         let temp = tempfile::tempdir().unwrap();
         // The mirror cache is empty, so the provisioner short-circuits before
         // any git/nix work and reports the miss as a successful outcome.
@@ -409,6 +464,35 @@ mod tests {
         let parsed: VmFlakeProvisionResponse = serde_json::from_slice(&response.body).unwrap();
         assert_eq!(parsed, VmFlakeProvisionResponse::MirrorNotCached);
         // The miss is not audited as a provision request: nothing was fetched.
+        assert!(
+            state
+                .audit
+                .list_flake_provision_requests_for_session(session.session_id())
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn repo_without_a_session_grant_is_forbidden() {
+        let github = MockServer::start().await;
+        let state = make_broker_state(&github);
+        let session = session();
+        open_audit_session(&state, session.session_id());
+        // The session was granted read on "o/n" (it cloned it), but now asks to
+        // provision a *different* repo it never cloned — the cross-session
+        // mirror-cache bypass this gate exists to stop.
+        record_contents_read_grant(&state, session.session_id(), repo_ref("o", "n"));
+        let temp = tempfile::tempdir().unwrap();
+        let service = provision_service_for_test(&state, temp.path());
+        let body = provision_request_body("other", "repo", TEST_REV);
+
+        let response = handle_flake_provision_request(&session, &body, service).await;
+
+        assert_eq!(response.status, VmHttpStatus::Forbidden);
+        let parsed: VmFlakeProvisionErrorResponse = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(parsed.error(), VmFlakeProvisionErrorCode::Denied);
+        // Denied before any provisioning was attempted.
         assert!(
             state
                 .audit

@@ -1727,6 +1727,64 @@ mod tests {
             .unwrap();
     }
 
+    /// Record a contents-read grant for `repo` against `session_id`, as a clone
+    /// would, so a test can exercise endpoints that gate on a prior grant. The
+    /// session must already be open.
+    pub(super) fn record_contents_read_grant(
+        state: &BrokerState<Box<dyn SecretStore>>,
+        session_id: SessionId,
+        repo: crate::core::RepoRef,
+    ) {
+        use crate::audit::PreMintRecord;
+        use crate::core::{
+            CapabilityRequest, CredentialGrant, GitHubAccess, GitHubGrantedScope,
+            GitHubPermissions, GitHubRequest, GrantedScope, Jti, MetadataAccess, PolicyDecision,
+            RequestId,
+        };
+
+        let request = CapabilityRequest::GitHub(GitHubRequest::Contents {
+            access: GitHubAccess::Read,
+            repo: repo.clone(),
+        });
+        let scope = GrantedScope::GitHub(GitHubGrantedScope {
+            repository: repo,
+            permissions: GitHubPermissions {
+                contents: Some(GitHubAccess::Read),
+                metadata: Some(MetadataAccess::Read),
+                ..Default::default()
+            },
+        });
+        let ttl = TtlSeconds::new(3600).unwrap();
+        let decision = PolicyDecision::Grant {
+            scope: scope.clone(),
+            ttl,
+        };
+        let request_id = RequestId::new();
+        let issued_at = UnixMillis::from_millis(1_700_000_000);
+        state
+            .audit
+            .record_pre_mint(&PreMintRecord {
+                request_id,
+                session_id,
+                received_at: issued_at,
+                request: &request,
+                decision: &decision,
+            })
+            .unwrap();
+        state
+            .audit
+            .record_grant(&CredentialGrant {
+                jti: Jti::new(),
+                request_id,
+                session_id,
+                github_app_id: Some(42),
+                scope,
+                issued_at,
+                expires_at: UnixMillis::from_millis(1_700_003_600),
+            })
+            .unwrap();
+    }
+
     /// The commit hash the fake git's `rev-parse` reports, so a test that
     /// configures a mirror cache can compute the `(repo, rev)` key the clone
     /// handler retains under.
