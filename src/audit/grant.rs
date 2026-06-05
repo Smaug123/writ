@@ -290,7 +290,7 @@ impl AuditLog {
     /// Lets a later action reuse a capability the session already proved —
     /// e.g. provisioning a repo the session was granted contents-read on by an
     /// earlier clone — without minting a fresh credential. It applies the same
-    /// structural [`scope_authorised_by_request`] check that guards `grant_log`
+    /// structural `scope_authorised_by_request` check that guards `grant_log`
     /// rows against cross-request wire-ups, so a grant only ever authorises the
     /// request it could itself have been minted from.
     pub fn session_holds_grant_authorising(
