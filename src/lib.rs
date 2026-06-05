@@ -26,6 +26,8 @@ pub use writ_core::core;
 #[cfg(feature = "host")]
 pub mod flake_lock;
 #[cfg(feature = "host")]
+pub mod flake_materialize;
+#[cfg(feature = "host")]
 pub mod flake_provision;
 #[cfg(feature = "host")]
 pub mod git_commit_sign;
