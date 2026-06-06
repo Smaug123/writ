@@ -556,20 +556,40 @@ metadata address) / private / CGNAT, or `localhost` — parsed through the WHATW
 URL parser first so integer/hex/octal and short-form IPv4 spellings and
 authority-smuggling tricks are canonicalised before the range check.
 
-Two residuals are worth stating plainly rather than overclaiming:
+The host fetch runs **credential-free**: the broker clears the environment to
+the non-credential plumbing nix needs (PATH, daemon socket, CA certs) with a
+fresh `HOME`, so the operator's user-level `nix.conf` / `~/.netrc` / git
+credentials cannot reach it. That is what makes "a private input fails at
+fetch" hold instead of silently caching private source for the guest with the
+operator's tokens.
 
-- The host check inspects the *literal* host only; it does not resolve DNS, and
-  `nix flake archive` runs without a fetch-time egress filter. A locked input
-  whose hostname resolves to an internal address is therefore not blocked. What
-  bounds this is that the inputs come from the repo's own committed, reviewed
-  lock — it is not a general SSRF guarantee for DNS names.
-- A private `github:`/`https:` input whose lock entry *looks* public (no static
-  credential markers) passes the classifier and then fails inside `nix flake
-  archive`, surfacing as a generic provisioning failure — not the clear
-  "unprovisionable" message the statically auth-requiring cases get.
+Residuals worth stating plainly rather than overclaiming (the implementation
+documents these in `src/flake_provision.rs`; the deferred disposable egress-VM
+provisioner would close the first two):
 
-Brokered private-input fetch via the GitHub App, and host-side locking for
-lock-less repos, are follow-ups.
+- **System nix credentials.** A system-level `/etc/nix/nix.conf`
+  `access-tokens`, on a host where the broker is not a trusted nix user, is not
+  overridden by the credential-free environment, so a private input could
+  authenticate through it.
+- **Pre-realised store paths.** nix runs against the host's default
+  store/daemon, so a private input whose fixed-output source is *already
+  realised* in that store is archived without a fetch — bypassing the "fails at
+  fetch" assumption. A fresh per-run store would close this.
+- **DNS to internal addresses.** The classifier rejects only *literal* internal
+  hosts; an allowed *domain* can DNS-resolve to an internal address, and `nix
+  flake archive` runs with no fetch-time egress filter, so it would connect
+  before any hash check. Fetch-time public-IP enforcement (a network sandbox or
+  proxy) is needed.
+
+Separately, a private `github:`/`https:` input whose lock entry *looks* public
+(no static credential markers) passes the classifier and then fails inside `nix
+flake archive`, surfacing as a generic provisioning failure — not the clear
+"unprovisionable" message the statically auth-requiring cases get.
+
+Until the egress-VM provisioner lands, run the broker as a non-trusted nix
+user, without system credentials, on a host whose outbound network it is
+acceptable for the broker to reach. Brokered private-input fetch via the GitHub
+App, and host-side locking for lock-less repos, are follow-ups.
 
 **Guarantee / envelope.** At bootstrap, every *provisionable* input in the
 committed lock becomes available to the guest, so `nix develop` evaluates and
