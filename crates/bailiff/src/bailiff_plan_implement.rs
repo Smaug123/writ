@@ -702,6 +702,7 @@ mod end_to_end_tests {
                 args: Vec::new(),
             }),
             promote_runtime: None,
+            mirror_pins: writ::vm_git_mirror_cache::MirrorPins::new(),
         });
         let socket_dir = tempfile::tempdir().unwrap();
         std::fs::set_permissions(socket_dir.path(), std::fs::Permissions::from_mode(0o700))

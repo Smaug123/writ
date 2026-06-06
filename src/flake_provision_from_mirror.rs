@@ -15,7 +15,7 @@ use crate::core::{RepoRef, SessionId};
 use crate::flake_lock::FlakeProvisionBounds;
 use crate::flake_materialize::{MaterializeError, materialize_flake_tree};
 use crate::flake_provision::{FlakeProvisionError, FlakeProvisionReport, provision_flake_inputs};
-use crate::vm_git_mirror_cache::{GitCommitSha, MirrorCache, MirrorCacheKey};
+use crate::vm_git_mirror_cache::{GitCommitSha, MirrorCache, MirrorCacheKey, MirrorPins};
 
 /// The host paths, directories, and bounds the broker supplies once for
 /// provisioning flake inputs from a cached mirror.
@@ -79,26 +79,39 @@ pub enum MirrorFlakeProvisionError {
 /// otherwise materialises the flake into a throwaway clone and runs the host
 /// provisioning primitive against it. The materialised clone is always cleaned
 /// up before returning (its guard is dropped here), whatever the outcome.
+///
+/// `pins` guards against the clone handler's opportunistic eviction: the
+/// entry's slug is pinned across the cache lookup and the `git clone --local`
+/// materialise, so GC cannot remove the mirror mid-clone. The pin is released
+/// once the tree is materialised — it is then independent of the mirror — so the
+/// longer `nix flake archive` step does not keep the entry from being reclaimed.
 pub async fn provision_flake_from_cached_mirror(
     config: &MirrorFlakeProvisionConfig,
     cache: &MirrorCache,
+    pins: &MirrorPins,
     repo: &RepoRef,
     rev: &GitCommitSha,
     audit: &AuditLog,
     session_id: SessionId,
 ) -> Result<MirrorFlakeProvisionOutcome, MirrorFlakeProvisionError> {
     let key = MirrorCacheKey::new(repo, rev);
-    let Some(mirror) = cache.get(&key) else {
-        return Ok(MirrorFlakeProvisionOutcome::MirrorNotCached);
+    let flake = {
+        // Hold the pin only across lookup + materialise. A pin taken here makes
+        // a concurrent eviction skip this slug; if eviction already claimed it,
+        // the lookup misses and we report a cache miss rather than racing.
+        let _pin = pins.pin(key.slug());
+        let Some(mirror) = cache.get(&key) else {
+            return Ok(MirrorFlakeProvisionOutcome::MirrorNotCached);
+        };
+        materialize_flake_tree(
+            &config.git_program,
+            &mirror,
+            rev,
+            &config.materialize_scratch_root,
+            config.git_timeout,
+        )
+        .await?
     };
-    let flake = materialize_flake_tree(
-        &config.git_program,
-        &mirror,
-        rev,
-        &config.materialize_scratch_root,
-        config.git_timeout,
-    )
-    .await?;
     let report = provision_flake_inputs(
         &config.nix_program,
         flake.path(),
@@ -240,10 +253,17 @@ mod tests {
         };
         let rev = GitCommitSha::parse(&"a".repeat(40)).unwrap();
 
-        let outcome =
-            provision_flake_from_cached_mirror(&cfg, &cache, &repo, &rev, &audit, session_id)
-                .await
-                .unwrap();
+        let outcome = provision_flake_from_cached_mirror(
+            &cfg,
+            &cache,
+            &MirrorPins::new(),
+            &repo,
+            &rev,
+            &audit,
+            session_id,
+        )
+        .await
+        .unwrap();
 
         assert!(matches!(
             outcome,
@@ -275,10 +295,17 @@ mod tests {
         let audit = AuditLog::open_in_memory().unwrap();
         let session_id = open_session(&audit);
 
-        let outcome =
-            provision_flake_from_cached_mirror(&cfg, &cache, &repo, &rev, &audit, session_id)
-                .await
-                .unwrap();
+        let outcome = provision_flake_from_cached_mirror(
+            &cfg,
+            &cache,
+            &MirrorPins::new(),
+            &repo,
+            &rev,
+            &audit,
+            session_id,
+        )
+        .await
+        .unwrap();
 
         let report = match outcome {
             MirrorFlakeProvisionOutcome::Provisioned(report) => report,

@@ -17,14 +17,19 @@
 //! same key. A crash mid-publish can only leave a discardable `.staging-*`
 //! directory, which a later insert sweeps.
 //!
-//! This stage only *retains* mirrors; it deliberately does not evict. Deleting
-//! an entry safely means knowing which mirrors are pinned by an in-flight
-//! provision — the same coordination the eviction-safe read side needs — so a
-//! bound that races in-flight inserts and readers here would be unsound.
-//! Bounding and the pinned read both land with the provisioner (this cache's
-//! consumer) and the GC stage, where that coordination exists.
+//! Eviction ([`MirrorCache::evict_to_bounds`]) is bounded by both an entry
+//! count and a total-byte budget, evicting oldest-first. It coordinates with
+//! in-flight provisions through an in-memory [`MirrorPins`] registry: a
+//! provision pins an entry's slug for the duration of its `git clone --local`
+//! materialise, and eviction skips any pinned slug, so GC can never delete a
+//! mirror out from under a running clone. The pin check and the entry's
+//! atomic rename-aside happen under the same lock, so a pin taken after the
+//! rename simply finds the entry gone (the provision then sees a cache miss and
+//! degrades) rather than racing a half-deleted mirror.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use crate::agent_run::sha256_hex;
@@ -37,6 +42,11 @@ const MIRROR_DIR_NAME: &str = "mirror.git";
 
 /// Prefix of the private temporary directory an in-flight publish stages into.
 const STAGING_PREFIX: &str = ".staging-";
+
+/// Prefix of a directory an eviction has renamed aside and is about to remove.
+/// Like a `.staging-*` leftover, a `.deleting-*` directory left by a crash
+/// mid-eviction is swept later; both are non-entry slots that lookups ignore.
+const DELETING_PREFIX: &str = ".deleting-";
 
 /// A `.staging-*` directory older than this is treated as a crash leftover and
 /// swept. A real publish only holds its staging directory for two renames
@@ -119,8 +129,99 @@ pub enum MirrorCacheInsertion {
     AlreadyPresent,
 }
 
+/// In-memory record of which cache entries (by slug) an in-flight provision is
+/// mid-materialising, so [`MirrorCache::evict_to_bounds`] never deletes a mirror
+/// out from under a running `git clone --local`. Shared (cheap `Arc` clone)
+/// between the clone handler that runs eviction and the provision path that
+/// pins; broker-wide, since a clone in one session may evict while another
+/// session provisions the same `(repo, rev)`.
+///
+/// The map holds a *reference count* per slug: two VMs provisioning the same
+/// commit concurrently both pin it, and the entry stays protected until the
+/// last guard drops.
+#[derive(Clone, Default)]
+pub struct MirrorPins {
+    pinned: Arc<Mutex<HashMap<String, usize>>>,
+}
+
+/// Holds a pin on one slug for its lifetime; dropping it releases the pin.
+pub struct MirrorPinGuard {
+    pins: MirrorPins,
+    slug: String,
+}
+
+impl MirrorPins {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Pin `slug` until the returned guard is dropped. Acquire this *before*
+    /// [`MirrorCache::get`] and hold it across the materialise, so eviction
+    /// (which checks the pin set under the same lock) cannot remove the entry
+    /// while the clone reads it.
+    pub fn pin(&self, slug: &str) -> MirrorPinGuard {
+        *self.lock().entry(slug.to_string()).or_insert(0) += 1;
+        MirrorPinGuard {
+            pins: self.clone(),
+            slug: slug.to_string(),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, usize>> {
+        // A poisoned pins lock means a thread panicked mid-update; the map is
+        // still structurally valid (counts are plain integers), so recover the
+        // guard rather than propagate the panic into eviction or provisioning.
+        self.pinned.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+impl Drop for MirrorPinGuard {
+    fn drop(&mut self) {
+        let mut map = self.pins.lock();
+        if let Some(count) = map.get_mut(&self.slug) {
+            *count -= 1;
+            if *count == 0 {
+                map.remove(&self.slug);
+            }
+        }
+    }
+}
+
+/// The size budget an eviction pass holds the mirror store under: an entry
+/// count *and* a total-byte ceiling. Eviction removes oldest-first until the
+/// store is at or under both (skipping pinned entries).
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct MirrorCacheBounds {
+    max_entries: usize,
+    max_bytes: u64,
+}
+
+impl MirrorCacheBounds {
+    pub fn new(max_entries: usize, max_bytes: u64) -> Self {
+        Self {
+            max_entries,
+            max_bytes,
+        }
+    }
+}
+
+/// What one [`MirrorCache::evict_to_bounds`] pass did.
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
+pub struct MirrorEvictionOutcome {
+    /// Entries removed to get under the bounds.
+    pub evicted: usize,
+    /// Total bytes the removed entries occupied.
+    pub bytes_freed: u64,
+    /// Entries that would have been evicted but were pinned by an in-flight
+    /// provision, so they were left in place — the store may stay over budget
+    /// until they are unpinned.
+    pub retained_pinned: usize,
+}
+
 /// A `(repo, rev)`-keyed cache of bare mirrors rooted at a directory. Cheap to
-/// clone (just a path); all state lives on disk.
+/// clone (just a path); all on-disk state lives under the root, and the only
+/// in-memory coordination — pins for eviction — is passed in explicitly via
+/// [`MirrorPins`] rather than held here, so the cache stays a comparable value.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MirrorCache {
     root: PathBuf,
@@ -199,7 +300,7 @@ impl MirrorCache {
         // `entry` it fails, so a concurrent winner is preserved.
         match std::fs::rename(&staging, &entry) {
             Ok(()) => {
-                self.sweep_stale_staging(SystemTime::now());
+                self.sweep_stale(SystemTime::now());
                 Ok(MirrorCacheInsertion::Stored)
             }
             Err(err) => {
@@ -213,22 +314,116 @@ impl MirrorCache {
         }
     }
 
-    /// Remove `.staging-*` directories older than [`STALE_STAGING_AGE`] relative
-    /// to `now`, leaving younger ones (which may belong to a live insert)
-    /// alone. Without this, a crash after the source moved into staging but
-    /// before publish would leave a full mirror that nothing ever reclaims. The
-    /// reference time is injected so the sweep is deterministic in tests.
-    /// Best-effort: unreadable or racing entries are skipped.
-    fn sweep_stale_staging(&self, now: SystemTime) {
+    /// Evict oldest-first until the store is at or under `bounds`, skipping any
+    /// entry pinned by an in-flight provision. Each victim is claimed under the
+    /// `pins` lock — renamed aside to a `.deleting-*` slot atomically with the
+    /// pin check — and removed afterwards, so the lock is held only for fast
+    /// metadata operations and a pin taken after the claim finds the entry gone
+    /// (its provision then sees a cache miss and degrades) rather than racing a
+    /// half-deleted mirror. If every over-budget candidate is pinned the store
+    /// stays over budget until they unpin; the [`MirrorEvictionOutcome`] reports
+    /// that so the caller can log it. Best-effort: a stale-leftover sweep runs
+    /// first, and unreadable or racing entries are skipped.
+    pub fn evict_to_bounds(
+        &self,
+        pins: &MirrorPins,
+        bounds: MirrorCacheBounds,
+    ) -> MirrorEvictionOutcome {
+        self.sweep_stale(SystemTime::now());
+
+        let mut entries = self.scan_entries();
+        let mut total_entries = entries.len();
+        let mut total_bytes: u64 = entries.iter().map(|entry| entry.bytes).sum();
+        if total_entries <= bounds.max_entries && total_bytes <= bounds.max_bytes {
+            return MirrorEvictionOutcome::default();
+        }
+        // Oldest first: the entry directory's mtime is its publish time.
+        entries.sort_by_key(|entry| entry.modified);
+
+        let mut outcome = MirrorEvictionOutcome::default();
+        let mut claimed: Vec<(PathBuf, u64)> = Vec::new();
+        {
+            let pinned = pins.lock();
+            for entry in &entries {
+                if total_entries <= bounds.max_entries && total_bytes <= bounds.max_bytes {
+                    break;
+                }
+                if pinned.contains_key(&entry.slug) {
+                    outcome.retained_pinned += 1;
+                    continue;
+                }
+                let deleting = self.root.join(format!(
+                    "{DELETING_PREFIX}{}",
+                    uuid::Uuid::new_v4().simple()
+                ));
+                if std::fs::rename(&entry.path, &deleting).is_ok() {
+                    claimed.push((deleting, entry.bytes));
+                    total_entries -= 1;
+                    total_bytes = total_bytes.saturating_sub(entry.bytes);
+                }
+            }
+        }
+
+        // Remove the claimed entries with the pins lock released — the rename
+        // already made them invisible to lookups, so the (slow) recursive
+        // delete must not block concurrent pins.
+        for (path, bytes) in claimed {
+            if std::fs::remove_dir_all(&path).is_ok() {
+                outcome.evicted += 1;
+                outcome.bytes_freed = outcome.bytes_freed.saturating_add(bytes);
+            }
+        }
+        outcome
+    }
+
+    /// Snapshot the published entries (slug dirs holding a `mirror.git`), with
+    /// each one's publish time and on-disk size. Non-entry slots
+    /// (`.staging-*`, `.deleting-*`, and empty leftovers) are skipped. No lock
+    /// is held: sizing walks files and must not block pinning.
+    fn scan_entries(&self) -> Vec<MirrorEntryInfo> {
+        let mut out = Vec::new();
+        let Ok(read_dir) = std::fs::read_dir(&self.root) else {
+            return out;
+        };
+        for entry in read_dir.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with(STAGING_PREFIX) || name.starts_with(DELETING_PREFIX) {
+                continue;
+            }
+            let path = entry.path();
+            if !path.join(MIRROR_DIR_NAME).is_dir() {
+                continue;
+            }
+            let modified = std::fs::metadata(&path)
+                .and_then(|metadata| metadata.modified())
+                .unwrap_or(SystemTime::UNIX_EPOCH);
+            out.push(MirrorEntryInfo {
+                slug: name.into_owned(),
+                bytes: dir_size(&path),
+                modified,
+                path,
+            });
+        }
+        out
+    }
+
+    /// Remove `.staging-*` / `.deleting-*` directories older than
+    /// [`STALE_STAGING_AGE`] relative to `now`, leaving younger ones (which may
+    /// belong to a live insert or eviction) alone. Without this, a crash after
+    /// the source moved into staging but before publish — or after an eviction
+    /// renamed an entry aside but before it removed it — would leave a full
+    /// mirror that nothing ever reclaims. The reference time is injected so the
+    /// sweep is deterministic in tests. Best-effort: unreadable or racing
+    /// entries are skipped.
+    fn sweep_stale(&self, now: SystemTime) {
         let Ok(read_dir) = std::fs::read_dir(&self.root) else {
             return;
         };
         for entry in read_dir.flatten() {
-            if !entry
-                .file_name()
-                .to_string_lossy()
-                .starts_with(STAGING_PREFIX)
-            {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if !(name.starts_with(STAGING_PREFIX) || name.starts_with(DELETING_PREFIX)) {
                 continue;
             }
             if !entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
@@ -244,6 +439,35 @@ impl MirrorCache {
             }
         }
     }
+}
+
+/// One published cache entry, captured for an eviction pass.
+struct MirrorEntryInfo {
+    slug: String,
+    path: PathBuf,
+    modified: SystemTime,
+    bytes: u64,
+}
+
+/// Total size of the regular files under `path` (recursively). Best-effort:
+/// unreadable entries contribute zero rather than aborting the walk, so a racing
+/// removal can only under-count, never panic.
+fn dir_size(path: &Path) -> u64 {
+    let mut total: u64 = 0;
+    let Ok(read_dir) = std::fs::read_dir(path) else {
+        return 0;
+    };
+    for entry in read_dir.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_dir() {
+            total = total.saturating_add(dir_size(&entry.path()));
+        } else if let Ok(metadata) = entry.metadata() {
+            total = total.saturating_add(metadata.len());
+        }
+    }
+    total
 }
 
 /// Create a directory (and any missing parents) restricted to the owner. The
@@ -532,16 +756,150 @@ mod tests {
         std::fs::create_dir_all(staging.join(MIRROR_DIR_NAME)).unwrap();
 
         // A fresh staging dir might belong to a live insert, so it is kept.
-        cache.sweep_stale_staging(SystemTime::now());
+        cache.sweep_stale(SystemTime::now());
         assert!(staging.exists(), "a fresh staging dir must not be swept");
 
         // Far enough ahead that it has aged out: now it is swept, while the
         // real entry is left untouched.
-        cache.sweep_stale_staging(SystemTime::now() + STALE_STAGING_AGE + Duration::from_secs(1));
+        cache.sweep_stale(SystemTime::now() + STALE_STAGING_AGE + Duration::from_secs(1));
         assert!(!staging.exists(), "an aged-out staging dir must be swept");
         assert!(
             stored_mirror(&cache, &key).exists(),
             "the real entry must survive a sweep"
         );
+    }
+
+    /// Stamp an entry directory's mtime so eviction's oldest-first ordering is
+    /// deterministic: a larger `secs_ago` is older. Opening a directory
+    /// read-only and `set_modified` (futimens on the fd) is allowed on Unix.
+    fn age_entry(cache: &MirrorCache, key: &MirrorCacheKey, secs_ago: u64) {
+        let dir = cache.root().join(key.slug());
+        let when = SystemTime::now() - Duration::from_secs(secs_ago);
+        std::fs::File::options()
+            .read(true)
+            .open(&dir)
+            .unwrap()
+            .set_modified(when)
+            .unwrap();
+    }
+
+    /// Insert a mirror whose payload is `bytes` long, so a byte-budget eviction
+    /// has a known size to work with, and return its key.
+    fn insert_sized(cache: &MirrorCache, parent: &Path, seed: u8, bytes: usize) -> MirrorCacheKey {
+        let key = MirrorCacheKey::new(&repo("o", "n"), &sha(&forty(seed)));
+        let src = parent.join(format!("src-{seed}"));
+        std::fs::create_dir_all(src.join(MIRROR_DIR_NAME)).unwrap();
+        std::fs::write(src.join(MIRROR_DIR_NAME).join("pack"), vec![b'x'; bytes]).unwrap();
+        cache.insert(&key, &src).unwrap();
+        key
+    }
+
+    #[test]
+    fn evict_is_a_noop_within_bounds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = MirrorCache::new(tmp.path().join("cache"));
+        let pins = MirrorPins::new();
+        let a = insert_sized(&cache, tmp.path(), 1, 16);
+        let b = insert_sized(&cache, tmp.path(), 2, 16);
+
+        let outcome = cache.evict_to_bounds(&pins, MirrorCacheBounds::new(8, u64::MAX));
+
+        assert_eq!(outcome, MirrorEvictionOutcome::default());
+        assert!(cache.get(&a).is_some());
+        assert!(cache.get(&b).is_some());
+    }
+
+    #[test]
+    fn evict_removes_oldest_first_to_entry_bound() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = MirrorCache::new(tmp.path().join("cache"));
+        let pins = MirrorPins::new();
+        let keys: Vec<_> = (0..4u8)
+            .map(|i| insert_sized(&cache, tmp.path(), i, 16))
+            .collect();
+        // Oldest (index 0) .. newest (index 3).
+        for (i, key) in keys.iter().enumerate() {
+            age_entry(&cache, key, 100 - (i as u64) * 10);
+        }
+
+        let outcome = cache.evict_to_bounds(&pins, MirrorCacheBounds::new(2, u64::MAX));
+
+        assert_eq!(outcome.evicted, 2);
+        assert_eq!(outcome.retained_pinned, 0);
+        assert!(cache.get(&keys[0]).is_none(), "oldest evicted");
+        assert!(cache.get(&keys[1]).is_none(), "second-oldest evicted");
+        assert!(cache.get(&keys[2]).is_some(), "newer kept");
+        assert!(cache.get(&keys[3]).is_some(), "newest kept");
+    }
+
+    #[test]
+    fn evict_honours_the_byte_budget() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = MirrorCache::new(tmp.path().join("cache"));
+        let pins = MirrorPins::new();
+        // Three ~1 KiB entries; budget for ~one and a half, so two oldest go.
+        let keys: Vec<_> = (0..3u8)
+            .map(|i| insert_sized(&cache, tmp.path(), i, 1024))
+            .collect();
+        for (i, key) in keys.iter().enumerate() {
+            age_entry(&cache, key, 100 - (i as u64) * 10);
+        }
+
+        let outcome = cache.evict_to_bounds(&pins, MirrorCacheBounds::new(usize::MAX, 1536));
+
+        assert_eq!(outcome.evicted, 2);
+        assert!(outcome.bytes_freed >= 2048, "freed both payloads");
+        assert!(cache.get(&keys[0]).is_none());
+        assert!(cache.get(&keys[1]).is_none());
+        assert!(cache.get(&keys[2]).is_some(), "newest kept under budget");
+    }
+
+    #[test]
+    fn evict_never_removes_a_pinned_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = MirrorCache::new(tmp.path().join("cache"));
+        let pins = MirrorPins::new();
+        let old = insert_sized(&cache, tmp.path(), 1, 16);
+        let new = insert_sized(&cache, tmp.path(), 2, 16);
+        age_entry(&cache, &old, 100);
+        age_entry(&cache, &new, 50);
+
+        // Pin the oldest; it is the natural first eviction victim but must be
+        // kept, so the bound is met by evicting the (newer) unpinned entry.
+        let guard = pins.pin(old.slug());
+        let outcome = cache.evict_to_bounds(&pins, MirrorCacheBounds::new(1, u64::MAX));
+
+        assert_eq!(outcome.retained_pinned, 1);
+        assert_eq!(outcome.evicted, 1);
+        assert!(cache.get(&old).is_some(), "pinned entry survives eviction");
+        assert!(cache.get(&new).is_none(), "unpinned entry evicted to bound");
+
+        // Once unpinned, a later pass can reclaim it.
+        drop(guard);
+        let outcome = cache.evict_to_bounds(&pins, MirrorCacheBounds::new(0, u64::MAX));
+        assert_eq!(outcome.evicted, 1);
+        assert!(cache.get(&old).is_none(), "evictable once unpinned");
+    }
+
+    #[test]
+    fn pins_refcount_until_the_last_guard_drops() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = MirrorCache::new(tmp.path().join("cache"));
+        let pins = MirrorPins::new();
+        let key = insert_sized(&cache, tmp.path(), 1, 16);
+
+        let g1 = pins.pin(key.slug());
+        let g2 = pins.pin(key.slug());
+        drop(g1);
+        // One guard still held: eviction must still skip it.
+        let outcome = cache.evict_to_bounds(&pins, MirrorCacheBounds::new(0, u64::MAX));
+        assert_eq!(outcome.retained_pinned, 1);
+        assert_eq!(outcome.evicted, 0);
+        assert!(cache.get(&key).is_some());
+
+        drop(g2);
+        let outcome = cache.evict_to_bounds(&pins, MirrorCacheBounds::new(0, u64::MAX));
+        assert_eq!(outcome.evicted, 1);
+        assert!(cache.get(&key).is_none());
     }
 }

@@ -147,6 +147,7 @@ async fn handle_flake_provision_request<S: SecretStore + Send + Sync>(
     let outcome = provision_flake_from_cached_mirror(
         &service.config.provision,
         &service.config.mirror_cache,
+        &service.broker_state.mirror_pins,
         &repo,
         &rev,
         &service.broker_state.audit,
