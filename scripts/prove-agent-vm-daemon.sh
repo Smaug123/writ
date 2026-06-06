@@ -635,12 +635,15 @@ import sys
 ) = sys.argv[1:]
 
 config = {
-    "github": {
-        "app_id": 42,
-        "installation_id": 999,
-        "installation_owner": owner,
-        "private_key_secret": "gh-app-pk",
-        "api_base": f"http://127.0.0.1:{fake_github_port}",
+    # Agent-keyed registry: the session's --agent claude selects this App.
+    "github_apps": {
+        "claude": {
+            "app_id": 42,
+            "installation_id": 999,
+            "installation_owner": owner,
+            "private_key_secret": "gh-app-pk",
+            "api_base": f"http://127.0.0.1:{fake_github_port}",
+        },
     },
     "policy": {"default_ttl": 3600, "writable_repos": []},
     "secret_store": {"type": "file", "path": secrets_dir},
@@ -982,6 +985,7 @@ wait_for_writd_socket
 log "starting daemon-managed VM on ${IPV4_CIDR}"
 if ! "$WRIT_BIN" --socket "$SOCKET_PATH" agent-vm start \
   --label "daemon proof" \
+  --agent claude \
   --model "proof" \
   -- sh -lc 'printf daemon-released >/tmp/writ-agent-vm-daemon-released; sleep 600' \
   >"$START_OUTPUT"; then
@@ -1036,7 +1040,9 @@ expect_guest_success "VM can clone a host-produced Git bundle through writ-vm" \
     test \"\$(git -C /tmp/writ-agent-vm-checkout rev-parse --is-inside-work-tree)\" = true && \
     test \"\$(cat /tmp/writ-agent-vm-checkout/README.md)\" = '${PROOF_BUNDLE_MARKER}'"
 expect_guest_success "VM Nix realises a signed store path through daemon VM HTTP cache" \
-  'contains_file() {
+  "store_path=$PROOF_NIX_STORE_PATH
+marker=$PROOF_NIX_MARKER
+"'contains_file() {
      needle="$1"
      file="$2"
      while IFS= read -r line; do
@@ -1048,7 +1054,6 @@ expect_guest_success "VM Nix realises a signed store path through daemon VM HTTP
      file="$1"
      while IFS= read -r line; do printf "%s\n" "$line"; done < "$file"
    }
-   store_path='"$PROOF_NIX_STORE_PATH"'
    stdout=/tmp/writ-nix-cache.stdout
    stderr=/tmp/writ-nix-cache.stderr
    set +e
@@ -1067,7 +1072,7 @@ expect_guest_success "VM Nix realises a signed store path through daemon VM HTTP
      dump_file "$stderr"
      exit 1
    fi
-   test "$(cat "$store_path")" = '"'"$PROOF_NIX_MARKER"'"''
+   test "$(cat "$store_path")" = "$marker"'
 assert_real_git_origin_used_cleanly
 assert_fake_nix_cache_used
 
