@@ -844,6 +844,40 @@ assert_broker_cache_populated() {
   log "pass: broker flake-input cache holds at least one provisioned narinfo"
 }
 
+assert_guest_consumed_provisioned_cache() {
+  log "assert: the warm fetched a flake input from the provisioned local cache, not upstream"
+  # The nix-cache endpoint serves local-first: a hit served from the local
+  # archive records http_status 200, no upstream_status, and an upstream_url
+  # naming the `file://` archive; an upstream proxy records the real
+  # cache.nixos.org URL instead. So a `file://` hit proves the guest consumed
+  # the provisioned cache rather than just refetching the (also-public) input
+  # sources from cache.nixos.org through the proxy.
+  local hits
+  hits="$(python3 - "$AUDIT_DB" "$SESSION_ID" <<'PY'
+import sqlite3
+import sys
+
+audit_db, session_id = sys.argv[1:]
+con = sqlite3.connect(audit_db)
+try:
+    n = con.execute(
+        "SELECT count(*) FROM nix_cache_outcome o "
+        "JOIN nix_cache_request r ON r.request_id = o.request_id "
+        "WHERE r.session_id = ? AND o.http_status = 200 "
+        "AND o.upstream_url LIKE 'file://%'",
+        (session_id,),
+    ).fetchone()[0]
+finally:
+    con.close()
+print(n)
+PY
+)" || die "could not query nix_cache audit rows from ${AUDIT_DB}"
+  if [[ "$hits" -lt 1 ]]; then
+    die "no local-first (file://) nix-cache hit for session ${SESSION_ID}; the warm may have used upstream instead of the provisioned cache"
+  fi
+  log "pass: ${hits} flake-input request(s) were served locally from the provisioned cache"
+}
+
 container_list_contains() {
   local name="$1"
   local listed
@@ -1038,6 +1072,7 @@ expect_guest_success "bootstrap left the workspace checkout and an ok marker" \
 assert_real_git_origin_used_cleanly
 assert_flake_provision_audited
 assert_broker_cache_populated
+assert_guest_consumed_provisioned_cache
 
 log "stopping session through daemon"
 "$WRIT_BIN" --socket "$SOCKET_PATH" agent-vm stop "$SESSION_ID"
@@ -1049,4 +1084,4 @@ assert_pf_anchor_empty
 assert_no_pf_state_for_guest
 assert_state_removed
 
-log "devshell-warm proof succeeded for ${IPV4_CIDR}: the no-egress VM cloned the fixture, the broker provisioned its locked flake inputs, and \`nix develop\` entered the devShell with github unreachable; daemon stop cleanup was verified"
+log "devshell-warm proof succeeded for ${IPV4_CIDR}: the no-egress VM cloned the fixture, the broker provisioned its locked flake inputs, \`nix develop\` entered the devShell with github unreachable while consuming the provisioned local cache, and daemon stop cleanup was verified"
