@@ -539,14 +539,30 @@ Without it the endpoint answers `404` and the guest degrades — the bootstrap
 provision call is best-effort, so warm still runs and surfaces the original
 github-unreachable failure only if the inputs were really needed.
 
-**Scope (v1).** Public inputs only (github/https needing no credentials); a
-private or auth-requiring input fails with a clear message. A committed
-`flake.lock` is required; a missing lock is a clear error. The classifier
-admits an input only if it is locked (carries `narHash`, plus `rev` for
-git-like inputs), non-local (no `path:`/`file://`), not credential-requiring
-(no ssh / userinfo), and not SSRF-prone (no loopback/link-local/private/CGNAT
-host). Brokered private-input fetch via the GitHub App, and host-side locking
-for lock-less repos, are follow-ups.
+**Scope (v1).** Public inputs only. A committed `flake.lock` is required; a
+missing lock is a clear error. The host-side classifier admits an input only if
+it is locked (carries `narHash`, plus `rev` for git-like inputs), non-local (no
+`path:`/`file://`), and free of *static* credential markers (no `ssh`/`git+ssh`
+transport, no `user[:pass]@` userinfo). It also rejects a *literal* internal
+host — an IP literal that is loopback / link-local (incl. the `169.254.169.254`
+metadata address) / private / CGNAT, or `localhost` — parsed through the WHATWG
+URL parser first so integer/hex/octal and short-form IPv4 spellings and
+authority-smuggling tricks are canonicalised before the range check.
+
+Two residuals are worth stating plainly rather than overclaiming:
+
+- The host check inspects the *literal* host only; it does not resolve DNS, and
+  `nix flake archive` runs without a fetch-time egress filter. A locked input
+  whose hostname resolves to an internal address is therefore not blocked. What
+  bounds this is that the inputs come from the repo's own committed, reviewed
+  lock — it is not a general SSRF guarantee for DNS names.
+- A private `github:`/`https:` input whose lock entry *looks* public (no static
+  credential markers) passes the classifier and then fails inside `nix flake
+  archive`, surfacing as a generic provisioning failure — not the clear
+  "unprovisionable" message the statically auth-requiring cases get.
+
+Brokered private-input fetch via the GitHub App, and host-side locking for
+lock-less repos, are follow-ups.
 
 **Guarantee / envelope.** At bootstrap, every input in the committed lock
 becomes available to the guest, so `nix develop` evaluates and enters the
