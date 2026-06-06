@@ -526,11 +526,18 @@ platform-independent — an aarch64-darwin host produces exactly the input
 outputs* still substitute from cache.nixos.org.
 
 The guest gains no new egress, preserving the trust model: the broker (which
-already has egress for `git clone`) is the boundary. The host fetch is bounded
-(input count / total bytes / timeout), pure-eval / no-IFD / sandboxed, and
-audited in the `flake_provision` table. Because a session may only provision a
-repo it was itself granted contents-read on — the provision endpoint requires a
-prior clone grant for `(repo)` in the session — a session cannot drive
+already has egress for `git clone`) is the boundary. The host fetch runs with
+import-from-derivation disabled (`allow-import-from-derivation=false`) and
+against the committed lock only (`--no-update-lock-file`), and is audited in the
+`flake_provision` table. Its bounds differ in kind: the input *count* is checked
+against the lock before any fetch; the *timeout* caps wall-clock; the
+total-*bytes* cap is a fail-closed check on the archived result (an over-budget
+archive is discarded, never published) rather than an in-flight limit — a single
+very large input can still consume network and disk up to the timeout before
+being rejected, and `nix flake archive` is not run in a forced sandbox. Because
+a session may only provision a repo it was itself granted contents-read on — the
+provision endpoint requires a prior clone grant for `(repo)` in the session — a
+session cannot drive
 provisioning of another session's cached private mirror.
 
 **Enabling.** Provisioning is on exactly when `flake_mirror_cache_dir` is set:
@@ -564,12 +571,16 @@ Two residuals are worth stating plainly rather than overclaiming:
 Brokered private-input fetch via the GitHub App, and host-side locking for
 lock-less repos, are follow-ups.
 
-**Guarantee / envelope.** At bootstrap, every input in the committed lock
-becomes available to the guest, so `nix develop` evaluates and enters the
-devShell **provided the devShell's output closure is substitutable from
-cache.nixos.org for the guest system**. A later in-guest flake edit that needs
-a brand-new input will not substitute — that is the no-egress envelope, by
-design: the broker is not a general egress proxy.
+**Guarantee / envelope.** At bootstrap, every *provisionable* input in the
+committed lock becomes available to the guest, so `nix develop` evaluates and
+enters the devShell **provided (a) the committed lock's inputs are all
+provisionable — public and classifier-admitted, per "Scope" above — and (b) the
+devShell's output closure is substitutable from cache.nixos.org for the guest
+system**. If the lock pins a non-provisionable input (private/auth-requiring/
+local), that input is not provisioned and warm fails even when the output
+closure is cached. A later in-guest flake edit that needs a brand-new input
+will not substitute either — that is the no-egress envelope, by design: the
+broker is not a general egress proxy.
 
 **Cache growth.** Both the `(repo, rev)` mirror store and the content-addressed
 input archive accumulate across sessions; the archive is content-addressed, so

@@ -223,10 +223,11 @@ omitted they default to subdirectories of `work_root`.
 
 `flake_mirror_cache_dir` is optional but recommended: setting it turns on
 **flake-input provisioning**, so `writ agent … --warm devshell` works for a
-repo with flake inputs even though the guest has no egress. The broker fetches
-the repo's committed, locked inputs on the host and serves them to the guest's
-Nix through the cache it already trusts; without this key, a no-egress
-`nix develop` cannot resolve `github:` inputs and warm fails. See
+repo with public flake inputs even though the guest has no egress. The broker
+fetches the repo's committed, locked inputs on the host and serves them to the
+guest's Nix through the cache it already trusts; without this key, a no-egress
+`nix develop` cannot resolve `github:` inputs and warm fails. (v1 provisions
+public inputs only; a private or auth-requiring input is not provisioned.) See
 [configuration](configuration.md#agent_vm) for the related knobs and
 [the design doc](../design/apple-container-agent-vm.md) for the
 guarantee/envelope.

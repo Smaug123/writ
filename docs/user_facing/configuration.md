@@ -159,7 +159,8 @@ flake-input provisioning knobs (all under `agent_vm.vm_http`) are:
 
 See [the agent-VM design doc](../design/apple-container-agent-vm.md)
 ("Flake-input provisioning") for the behaviour, the trust model, and the
-guarantee/envelope (a no-egress guest warms a flake devShell iff the
+guarantee/envelope (a no-egress guest warms a flake devShell when the committed
+lock's inputs are all provisionable — public and classifier-admitted — and the
 devShell's output closure is substitutable from cache.nixos.org for the guest
 system).
 
