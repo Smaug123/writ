@@ -73,6 +73,15 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/writ-devshell-proof.XXXXXX")"
 chmod 700 "$TMP_DIR"
 
+# `nix flake lock` (in prepare_fake_git_origin) realises the fixture's input
+# *sources*. Keep them out of the shared /nix/store the broker uses, so the
+# broker's later `nix flake archive` must fetch them itself — proving its
+# egress and the real provisioning path rather than copying paths this harness
+# pre-realised. A chroot store's parent must not be a symlink, which on macOS
+# rules out $TMPDIR/var; anchor it under $HOME, like prove-flake-offline.sh.
+LOCK_STORE_BASE="$(mktemp -d "${HOME}/.writ-devshell-proof.XXXXXX")"
+chmod 700 "$LOCK_STORE_BASE"
+
 if [[ -n "${WRIT_PROVE_IMAGE:-}" ]]; then
   IMAGE="$WRIT_PROVE_IMAGE"
   BUILD_GUEST_IMAGE="${WRIT_PROVE_BUILD_GUEST_IMAGE:-0}"
@@ -229,6 +238,11 @@ cleanup() {
   fi
 
   rm -rf "$TMP_DIR"
+  if [[ -n "$LOCK_STORE_BASE" && -d "$LOCK_STORE_BASE" ]]; then
+    # Nix store paths are read-only (0444/0555); make them writable before rm.
+    chmod -R u+w "$LOCK_STORE_BASE" 2>/dev/null || true
+    rm -rf "$LOCK_STORE_BASE"
+  fi
 }
 trap cleanup EXIT INT TERM
 
@@ -419,9 +433,16 @@ EOF
   "$REAL_GIT" -C "$FAKE_GIT_ORIGIN_SOURCE" add flake.nix
 
   # Generate the committed lock on the host (which has github egress); v1
-  # provisioning requires a committed flake.lock and provisions exactly it.
-  log "locking fixture flake inputs on the host (needs github egress)"
-  "$REAL_NIX" --extra-experimental-features 'nix-command flakes' \
+  # provisioning requires a committed flake.lock and provisions exactly it. Run
+  # it against an isolated chroot store + cache so the realised input sources do
+  # NOT land in the shared /nix/store the broker uses; the lock written to the
+  # working tree is store-independent (content-addressed narHash/rev).
+  log "locking fixture flake inputs on the host into an isolated store (needs github egress)"
+  mkdir -p "${LOCK_STORE_BASE}/home/.cache"
+  HOME="${LOCK_STORE_BASE}/home" \
+    XDG_CACHE_HOME="${LOCK_STORE_BASE}/home/.cache" \
+    "$REAL_NIX" --extra-experimental-features 'nix-command flakes' \
+    --store "local?root=${LOCK_STORE_BASE}/store" \
     flake lock "$FAKE_GIT_ORIGIN_SOURCE" >/dev/null 2>&1 || \
     die "nix flake lock failed; the host needs github egress to lock the fixture"
   [[ -f "${FAKE_GIT_ORIGIN_SOURCE}/flake.lock" ]] || \
@@ -862,14 +883,14 @@ assert_guest_consumed_provisioned_cache() {
   log "assert: every provisioned flake input the warm requested was served locally, none from upstream"
   # The nix-cache endpoint serves local-first: a 200 served from the local
   # archive records an `upstream_url` naming the `file://` archive, while an
-  # upstream proxy records the real cache.nixos.org URL. We cross-reference the
-  # store-path hashes the broker actually provisioned (the narinfo basenames in
-  # the local cache) against what the guest requested: at least one provisioned
-  # path must have been served locally, and *no* provisioned path may have been
-  # served from upstream. The latter is the real guard — it fails if local-first
-  # regresses for any input even though that input is also public on
-  # cache.nixos.org. (The devShell's own closure legitimately comes from
-  # upstream; those paths are not in the local cache, so they are ignored.)
+  # upstream proxy records the real cache.nixos.org URL. We cross-reference
+  # everything the broker provisioned (both narinfo metadata and NAR bodies)
+  # against what the guest requested: at least one provisioned object must have
+  # been served locally, and *no* provisioned object may have been served from
+  # upstream. The latter is the real guard — it fails if local-first regresses
+  # for any input even though that input is also public on cache.nixos.org.
+  # (The devShell's own closure legitimately comes from upstream; those objects
+  # are not in the local cache, so they are ignored.)
   local result
   result="$(python3 - "$AUDIT_DB" "$SESSION_ID" "$FLAKE_INPUT_CACHE_DIR" <<'PY'
 import os
@@ -878,11 +899,15 @@ import sys
 
 audit_db, session_id, cache_dir = sys.argv[1:]
 
-provisioned = {
-    name[: -len(".narinfo")]
-    for name in os.listdir(cache_dir)
-    if name.endswith(".narinfo")
-}
+# Every file the broker provisioned, by request basename: the narinfos
+# (`<hash>.narinfo`, requested at `.../<hash>.narinfo`) and their NAR bodies
+# (`nar/<file>`, requested at `.../nar/<file>`). Matching on basename covers
+# both the metadata and the bytes, so a regression that serves the narinfo
+# locally but proxies the NAR upstream is still caught.
+provisioned = {name for name in os.listdir(cache_dir) if name.endswith(".narinfo")}
+nar_dir = os.path.join(cache_dir, "nar")
+if os.path.isdir(nar_dir):
+    provisioned.update(os.listdir(nar_dir))
 
 con = sqlite3.connect(audit_db)
 try:
@@ -896,24 +921,18 @@ try:
 finally:
     con.close()
 
-
-def narinfo_hash(target):
-    base = (target or "").rsplit("/", 1)[-1]
-    return base[: -len(".narinfo")] if base.endswith(".narinfo") else None
-
-
 local_hits = 0
-upstream_leaks = set()
+upstream_leaks = 0
 for target, http_status, upstream_url in rows:
-    digest = narinfo_hash(target)
-    if digest is None or digest not in provisioned or http_status != 200:
+    base = (target or "").rsplit("/", 1)[-1]
+    if base not in provisioned or http_status != 200:
         continue
     if upstream_url and upstream_url.startswith("file://"):
         local_hits += 1
     elif upstream_url:
-        upstream_leaks.add(digest)
+        upstream_leaks += 1
 
-print(f"{len(provisioned)} {local_hits} {len(upstream_leaks)}")
+print(f"{len(provisioned)} {local_hits} {upstream_leaks}")
 PY
 )" || die "could not query nix_cache audit rows from ${AUDIT_DB}"
   local provisioned_count="${result%% *}"
