@@ -733,16 +733,16 @@ expect_guest_success() {
 }
 
 wait_for_released_guest_command() {
-  log "assert: daemon-started guest command is running"
+  log "assert: the agent command runs after the workspace bootstrap"
   for _ in {1..50}; do
-    if guest 'test "$(cat /tmp/writ-agent-vm-daemon-released 2>/dev/null)" = daemon-released' \
+    if guest 'test "$(cat /tmp/writ-agent-vm-devshell-released 2>/dev/null)" = devshell-released' \
       >/dev/null 2>&1; then
-      log "pass: daemon-started guest command is running"
+      log "pass: the agent command is running after bootstrap"
       return
     fi
     sleep 0.1
   done
-  die "daemon-started guest command did not write its marker"
+  die "the post-bootstrap agent command did not write its marker"
 }
 
 guest_ipv4_addr() {
@@ -951,17 +951,28 @@ log "starting writd with fake GitHub API on port ${FAKE_GITHUB_PORT}, fake Git o
 WRITD_PID="$!"
 wait_for_writd_socket
 
-log "starting daemon-managed VM on ${IPV4_CIDR}"
+# Start with the workspace bootstrap: this is the production warm path. The
+# daemon uses the flakes-enabling bootstrap script and, before the agent runs,
+# performs `writ-vm workspace init --warm devshell` in-guest (clone, then
+# POST /v1/nix/flake/provision, then `nix develop`). The start call BLOCKS
+# until that bootstrap reports ok or fails, so a successful return here IS the
+# headline assertion: warm succeeded inside the no-egress VM.
+log "starting daemon-managed VM on ${IPV4_CIDR} with --warm devshell (clone + provision + nix develop run in-guest before start returns)"
 if ! "$WRIT_BIN" --socket "$SOCKET_PATH" agent-vm start \
   --label "devshell warm proof" \
+  --agent claude \
   --model "proof" \
-  -- sh -lc 'printf daemon-released >/tmp/writ-agent-vm-daemon-released; sleep 600' \
+  --repo "$PROOF_REPO_FULL" \
+  --workspace "$WORKSPACE_DEST" \
+  --warm devshell \
+  -- sh -lc 'printf devshell-released >/tmp/writ-agent-vm-devshell-released; sleep 600' \
   >"$START_OUTPUT"; then
   cat "$START_OUTPUT" >&2 || true
   cat "$WRITD_LOG" >&2 || true
-  die "writ agent-vm start failed"
+  die "writ agent-vm start failed (workspace bootstrap / devshell warm did not succeed)"
 fi
 cat "$START_OUTPUT"
+log "pass: no-egress VM completed clone + flake-input provisioning + devshell warm at bootstrap"
 
 SESSION_ID="$(awk -F= '$1 == "session_id" {print $2}' "$START_OUTPUT")"
 [[ -n "$SESSION_ID" ]] || die "could not parse session_id from daemon start output"
@@ -1016,14 +1027,13 @@ expect_guest_success "guest cannot reach github directly (no egress)" \
      exit 1; \
    fi"
 
-# The headline assertion: clone + provision + `nix develop` all succeed inside
-# the no-egress VM. Since github is unreachable (asserted above), the locked
-# flake inputs can only have come from the broker's provisioned cache.
-expect_guest_success "VM warms a devShell from broker-provisioned flake inputs with no egress" \
-  "rm -rf '${WORKSPACE_DEST}' && \
-    writ-vm workspace init '${PROOF_REPO_FULL}' '${WORKSPACE_DEST}' --warm devshell && \
-    test -f '${WORKSPACE_DEST}/flake.nix' && \
-    test -f '${WORKSPACE_DEST}/flake.lock'"
+# The bootstrap already cloned + provisioned + warmed before start returned
+# (asserted by the start succeeding). Confirm in-guest that it left the clean
+# workspace checkout and signalled bootstrap success.
+expect_guest_success "bootstrap left the workspace checkout and an ok marker" \
+  "test -f '${WORKSPACE_DEST}/flake.nix' && \
+    test -f '${WORKSPACE_DEST}/flake.lock' && \
+    test -f /run/writ-agent-vm/bootstrap-ok"
 
 assert_real_git_origin_used_cleanly
 assert_flake_provision_audited
