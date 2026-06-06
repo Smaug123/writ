@@ -130,6 +130,7 @@ FAKE_GITHUB_PORT=""
 FAKE_GITHUB_PID=""
 FAKE_GIT_ORIGIN_PORT=""
 FAKE_GIT_ORIGIN_PID=""
+SUDO_KEEPALIVE_PID=""
 WRITD_PID=""
 SESSION_ID=""
 NETWORK_NAME=""
@@ -206,6 +207,10 @@ cleanup() {
       container network delete "$NETWORK_NAME" >/dev/null 2>&1 || true
   fi
 
+  if [[ -n "$SUDO_KEEPALIVE_PID" ]]; then
+    kill "$SUDO_KEEPALIVE_PID" >/dev/null 2>&1 || true
+    wait "$SUDO_KEEPALIVE_PID" 2>/dev/null || true
+  fi
   if [[ -n "$WRITD_PID" ]]; then
     kill "$WRITD_PID" >/dev/null 2>&1 || true
     wait "$WRITD_PID" 2>/dev/null || true
@@ -788,6 +793,15 @@ assert_real_git_origin_used_cleanly() {
   if ! grep -Fq "auth=ok method=POST path=/${PROOF_REPO_FULL}.git/git-upload-pack" "$FAKE_GIT_ORIGIN_LOG"; then
     die "fake Git origin log does not show the expected upload-pack request"
   fi
+  # Exactly one fetch must hit the origin: the workspace clone. Provisioning
+  # must re-derive its checkout from the retained (repo, rev) mirror, never by
+  # re-fetching the origin. A second upload-pack would mean that mirror reuse
+  # regressed to a re-clone fallback, which this proof exists to rule out.
+  local upload_pack_count
+  upload_pack_count="$(grep -Fc "auth=ok method=POST path=/${PROOF_REPO_FULL}.git/git-upload-pack" "$FAKE_GIT_ORIGIN_LOG" || true)"
+  if [[ "$upload_pack_count" -ne 1 ]]; then
+    die "expected exactly one origin upload-pack (the workspace clone), saw ${upload_pack_count}; provisioning may have re-cloned instead of reusing the retained mirror"
+  fi
   if ! grep -Fq "Username" "$FAKE_ASKPASS_LOG"; then
     die "askpass log does not show a username prompt from host Git"
   fi
@@ -845,37 +859,77 @@ assert_broker_cache_populated() {
 }
 
 assert_guest_consumed_provisioned_cache() {
-  log "assert: the warm fetched a flake input from the provisioned local cache, not upstream"
-  # The nix-cache endpoint serves local-first: a hit served from the local
-  # archive records http_status 200, no upstream_status, and an upstream_url
-  # naming the `file://` archive; an upstream proxy records the real
-  # cache.nixos.org URL instead. So a `file://` hit proves the guest consumed
-  # the provisioned cache rather than just refetching the (also-public) input
-  # sources from cache.nixos.org through the proxy.
-  local hits
-  hits="$(python3 - "$AUDIT_DB" "$SESSION_ID" <<'PY'
+  log "assert: every provisioned flake input the warm requested was served locally, none from upstream"
+  # The nix-cache endpoint serves local-first: a 200 served from the local
+  # archive records an `upstream_url` naming the `file://` archive, while an
+  # upstream proxy records the real cache.nixos.org URL. We cross-reference the
+  # store-path hashes the broker actually provisioned (the narinfo basenames in
+  # the local cache) against what the guest requested: at least one provisioned
+  # path must have been served locally, and *no* provisioned path may have been
+  # served from upstream. The latter is the real guard — it fails if local-first
+  # regresses for any input even though that input is also public on
+  # cache.nixos.org. (The devShell's own closure legitimately comes from
+  # upstream; those paths are not in the local cache, so they are ignored.)
+  local result
+  result="$(python3 - "$AUDIT_DB" "$SESSION_ID" "$FLAKE_INPUT_CACHE_DIR" <<'PY'
+import os
 import sqlite3
 import sys
 
-audit_db, session_id = sys.argv[1:]
+audit_db, session_id, cache_dir = sys.argv[1:]
+
+provisioned = {
+    name[: -len(".narinfo")]
+    for name in os.listdir(cache_dir)
+    if name.endswith(".narinfo")
+}
+
 con = sqlite3.connect(audit_db)
 try:
-    n = con.execute(
-        "SELECT count(*) FROM nix_cache_outcome o "
+    rows = con.execute(
+        "SELECT r.target, o.http_status, o.upstream_url "
+        "FROM nix_cache_outcome o "
         "JOIN nix_cache_request r ON r.request_id = o.request_id "
-        "WHERE r.session_id = ? AND o.http_status = 200 "
-        "AND o.upstream_url LIKE 'file://%'",
+        "WHERE r.session_id = ?",
         (session_id,),
-    ).fetchone()[0]
+    ).fetchall()
 finally:
     con.close()
-print(n)
+
+
+def narinfo_hash(target):
+    base = (target or "").rsplit("/", 1)[-1]
+    return base[: -len(".narinfo")] if base.endswith(".narinfo") else None
+
+
+local_hits = 0
+upstream_leaks = set()
+for target, http_status, upstream_url in rows:
+    digest = narinfo_hash(target)
+    if digest is None or digest not in provisioned or http_status != 200:
+        continue
+    if upstream_url and upstream_url.startswith("file://"):
+        local_hits += 1
+    elif upstream_url:
+        upstream_leaks.add(digest)
+
+print(f"{len(provisioned)} {local_hits} {len(upstream_leaks)}")
 PY
 )" || die "could not query nix_cache audit rows from ${AUDIT_DB}"
-  if [[ "$hits" -lt 1 ]]; then
-    die "no local-first (file://) nix-cache hit for session ${SESSION_ID}; the warm may have used upstream instead of the provisioned cache"
+  local provisioned_count="${result%% *}"
+  local rest="${result#* }"
+  local local_hits="${rest%% *}"
+  local upstream_leaks="${rest##* }"
+  if [[ "$provisioned_count" -lt 1 ]]; then
+    die "no provisioned narinfos in ${FLAKE_INPUT_CACHE_DIR}; provisioning wrote nothing to consume"
   fi
-  log "pass: ${hits} flake-input request(s) were served locally from the provisioned cache"
+  if [[ "$upstream_leaks" -ne 0 ]]; then
+    die "${upstream_leaks} provisioned flake-input path(s) were served from upstream instead of the local cache; local-first serving regressed"
+  fi
+  if [[ "$local_hits" -lt 1 ]]; then
+    die "the warm requested no provisioned flake-input path locally; it may not have consumed the provisioned cache at all"
+  fi
+  log "pass: ${local_hits} provisioned flake-input request(s) served locally, 0 served from upstream"
 }
 
 container_list_contains() {
@@ -943,6 +997,12 @@ IPV4_CIDR="$(cidr_alloc_subnet "$IPV4_POOL" 24 "$SUBNET_INDEX")"
 
 log "requesting sudo credentials for pfctl"
 sudo -v
+# The guest-image build and the in-guest `--warm devshell` bootstrap can run
+# well past sudo's default 5-minute timestamp before writd invokes
+# `sudo writ-agent-vm-pf-helper` (with stdin closed). Refresh the timestamp in
+# the background so those later, non-interactive PF operations still succeed.
+( while true; do sudo -n -v >/dev/null 2>&1 || exit; sleep 60; done ) &
+SUDO_KEEPALIVE_PID="$!"
 
 if ! sudo pfctl -s info 2>/dev/null | grep -q 'Status: Enabled'; then
   die "PF is not enabled; enable it before running this proof harness"
