@@ -142,6 +142,11 @@ pub enum MirrorCacheInsertion {
 #[derive(Clone, Default)]
 pub struct MirrorPins {
     pinned: Arc<Mutex<HashMap<String, usize>>>,
+    /// Serializes whole eviction passes. Without it, two concurrent passes
+    /// could each snapshot the same over-budget store and both claim victims,
+    /// over-evicting. It is distinct from `pinned` so an eviction's (slow)
+    /// sizing never blocks pinning — only other evictions wait.
+    gc: Arc<Mutex<()>>,
 }
 
 /// Holds a pin on one slug for its lifetime; dropping it releases the pin.
@@ -160,24 +165,28 @@ impl MirrorPins {
     /// (which checks the pin set under the same lock) cannot remove the entry
     /// while the clone reads it.
     pub fn pin(&self, slug: &str) -> MirrorPinGuard {
-        *self.lock().entry(slug.to_string()).or_insert(0) += 1;
+        *self.pinned_lock().entry(slug.to_string()).or_insert(0) += 1;
         MirrorPinGuard {
             pins: self.clone(),
             slug: slug.to_string(),
         }
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, usize>> {
+    fn pinned_lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, usize>> {
         // A poisoned pins lock means a thread panicked mid-update; the map is
         // still structurally valid (counts are plain integers), so recover the
         // guard rather than propagate the panic into eviction or provisioning.
         self.pinned.lock().unwrap_or_else(|e| e.into_inner())
     }
+
+    fn gc_lock(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.gc.lock().unwrap_or_else(|e| e.into_inner())
+    }
 }
 
 impl Drop for MirrorPinGuard {
     fn drop(&mut self) {
-        let mut map = self.pins.lock();
+        let mut map = self.pins.pinned_lock();
         if let Some(count) = map.get_mut(&self.slug) {
             *count -= 1;
             if *count == 0 {
@@ -315,20 +324,28 @@ impl MirrorCache {
     }
 
     /// Evict oldest-first until the store is at or under `bounds`, skipping any
-    /// entry pinned by an in-flight provision. Each victim is claimed under the
-    /// `pins` lock — renamed aside to a `.deleting-*` slot atomically with the
-    /// pin check — and removed afterwards, so the lock is held only for fast
-    /// metadata operations and a pin taken after the claim finds the entry gone
-    /// (its provision then sees a cache miss and degrades) rather than racing a
-    /// half-deleted mirror. If every over-budget candidate is pinned the store
-    /// stays over budget until they unpin; the [`MirrorEvictionOutcome`] reports
-    /// that so the caller can log it. Best-effort: a stale-leftover sweep runs
-    /// first, and unreadable or racing entries are skipped.
+    /// entry pinned by an in-flight provision. The whole pass runs under the
+    /// `pins` GC lock, so concurrent passes serialize rather than each acting on
+    /// the same stale over-budget snapshot and over-evicting. Each victim is
+    /// claimed under the `pins` map lock — renamed aside to a `.deleting-*` slot
+    /// atomically with the pin check — and removed afterwards, so the map lock is
+    /// held only for fast metadata operations and a pin taken after the claim
+    /// finds the entry gone (its provision then sees a cache miss and degrades)
+    /// rather than racing a half-deleted mirror. If every over-budget candidate
+    /// is pinned the store stays over budget until they unpin; the
+    /// [`MirrorEvictionOutcome`] reports that so the caller can log it.
+    /// Best-effort: a stale-leftover sweep runs first, and unreadable or racing
+    /// entries are skipped.
     pub fn evict_to_bounds(
         &self,
         pins: &MirrorPins,
         bounds: MirrorCacheBounds,
     ) -> MirrorEvictionOutcome {
+        // Serialize whole passes: snapshot, claim, and remove all happen under
+        // this lock so a second concurrent pass sees the first's effect rather
+        // than a stale snapshot. The (slow) sizing below is under this GC lock,
+        // not the pins map lock, so it never blocks pinning.
+        let _gc = pins.gc_lock();
         self.sweep_stale(SystemTime::now());
 
         let mut entries = self.scan_entries();
@@ -343,7 +360,7 @@ impl MirrorCache {
         let mut outcome = MirrorEvictionOutcome::default();
         let mut claimed: Vec<(PathBuf, u64)> = Vec::new();
         {
-            let pinned = pins.lock();
+            let pinned = pins.pinned_lock();
             for entry in &entries {
                 if total_entries <= bounds.max_entries && total_bytes <= bounds.max_bytes {
                     break;
@@ -879,6 +896,35 @@ mod tests {
         let outcome = cache.evict_to_bounds(&pins, MirrorCacheBounds::new(0, u64::MAX));
         assert_eq!(outcome.evicted, 1);
         assert!(cache.get(&old).is_none(), "evictable once unpinned");
+    }
+
+    #[test]
+    fn concurrent_evictions_do_not_over_evict() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = MirrorCache::new(tmp.path().join("cache"));
+        let pins = MirrorPins::new();
+        // Six entries, distinct ages; bound to four.
+        let keys: Vec<_> = (0..6u8)
+            .map(|i| {
+                let key = insert_sized(&cache, tmp.path(), i, 16);
+                age_entry(&cache, &key, 100 - (i as u64) * 5);
+                key
+            })
+            .collect();
+
+        // Two passes race. The GC lock serializes them, so the second sees the
+        // first's effect and stops at the bound instead of acting on a stale
+        // over-budget snapshot and removing extra entries.
+        let (c1, p1) = (cache.clone(), pins.clone());
+        let (c2, p2) = (cache.clone(), pins.clone());
+        let bounds = MirrorCacheBounds::new(4, u64::MAX);
+        let h1 = std::thread::spawn(move || c1.evict_to_bounds(&p1, bounds));
+        let h2 = std::thread::spawn(move || c2.evict_to_bounds(&p2, bounds));
+        h1.join().unwrap();
+        h2.join().unwrap();
+
+        let remaining = keys.iter().filter(|k| cache.get(k).is_some()).count();
+        assert_eq!(remaining, 4, "exactly the bound remains; no over-eviction");
     }
 
     #[test]
