@@ -1138,26 +1138,35 @@ expect_guest_success "VM can call daemon VM HTTP session endpoint through writ-v
 # rate limit (egress open but throttled), or any non-network error must NOT be
 # mistaken for "no egress", so we capture the output and classify it.
 expect_guest_success "guest cannot reach github directly (no egress)" \
-  "probe_out=/tmp/writ-egress-probe.out; \
-    set +e; \
-    nix --extra-experimental-features 'nix-command flakes' \
-        --option connect-timeout 5 --option download-attempts 1 \
-        flake metadata '${GUEST_EGRESS_PROBE_FLAKE}/main' --refresh \
-        > \"\$probe_out\" 2>&1; \
-    probe_rc=\$?; \
-    set -e; \
-    if [ \"\$probe_rc\" -eq 0 ]; then \
-      printf 'guest unexpectedly resolved %s from github (egress is open)\n' '${GUEST_EGRESS_PROBE_FLAKE}/main'; \
-      cat \"\$probe_out\"; exit 1; \
-    fi; \
-    if ! grep -qi github \"\$probe_out\"; then \
-      printf 'negative-control failure does not mention github; cannot attribute it to no-egress\n'; \
-      cat \"\$probe_out\"; exit 1; \
-    fi; \
-    if ! grep -qiE 'could not resolve|couldn.t resolve|name resolution|temporary failure|network is unreachable|connection refused|connection timed out|timeout was reached|failed to connect|could not connect|no route to host' \"\$probe_out\"; then \
-      printf 'negative-control failed for a non-network reason (rate limit, bad ref, or nix config); not a clean no-egress signal\n'; \
-      cat \"\$probe_out\"; exit 1; \
-    fi"
+  "probe_out=/tmp/writ-egress-probe.out
+set +e
+nix --extra-experimental-features 'nix-command flakes' \
+    --option connect-timeout 5 --option download-attempts 1 \
+    flake metadata '${GUEST_EGRESS_PROBE_FLAKE}/main' --refresh > \"\$probe_out\" 2>&1
+probe_rc=\$?
+set -e
+# The production guest image deliberately omits grep/sed/awk, so classify the
+# output with pure-shell case matching (and printf, not cat).
+dump_probe() { while IFS= read -r line; do printf '%s\n' \"\$line\"; done < \"\$probe_out\"; }
+if [ \"\$probe_rc\" -eq 0 ]; then
+  printf 'guest unexpectedly resolved %s from github (egress is open)\n' '${GUEST_EGRESS_PROBE_FLAKE}/main'
+  dump_probe
+  exit 1
+fi
+mentions_github=0
+network_error=0
+while IFS= read -r line; do
+  case \"\$line\" in *github*) mentions_github=1 ;; esac
+  case \"\$line\" in
+    *resolve*|*'Network is unreachable'*|*'Connection refused'*|*'Connection timed out'*|*'Timeout was reached'*|*'Failed to connect'*|*'No route to host'*)
+      network_error=1 ;;
+  esac
+done < \"\$probe_out\"
+if [ \"\$mentions_github\" -ne 1 ] || [ \"\$network_error\" -ne 1 ]; then
+  printf 'negative-control failure was not a clean github connectivity failure (rate limit, bad ref, or nix config?)\n'
+  dump_probe
+  exit 1
+fi"
 
 # The bootstrap already cloned + provisioned + warmed before start returned
 # (asserted by the start succeeding). Confirm in-guest that it left the clean
