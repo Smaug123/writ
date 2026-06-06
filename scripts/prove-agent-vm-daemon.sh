@@ -1040,7 +1040,9 @@ expect_guest_success "VM can clone a host-produced Git bundle through writ-vm" \
     test \"\$(git -C /tmp/writ-agent-vm-checkout rev-parse --is-inside-work-tree)\" = true && \
     test \"\$(cat /tmp/writ-agent-vm-checkout/README.md)\" = '${PROOF_BUNDLE_MARKER}'"
 expect_guest_success "VM Nix realises a signed store path through daemon VM HTTP cache" \
-  'contains_file() {
+  "store_path=$PROOF_NIX_STORE_PATH
+marker=$PROOF_NIX_MARKER
+"'contains_file() {
      needle="$1"
      file="$2"
      while IFS= read -r line; do
@@ -1052,7 +1054,6 @@ expect_guest_success "VM Nix realises a signed store path through daemon VM HTTP
      file="$1"
      while IFS= read -r line; do printf "%s\n" "$line"; done < "$file"
    }
-   store_path='"$PROOF_NIX_STORE_PATH"'
    stdout=/tmp/writ-nix-cache.stdout
    stderr=/tmp/writ-nix-cache.stderr
    set +e
@@ -1071,7 +1072,7 @@ expect_guest_success "VM Nix realises a signed store path through daemon VM HTTP
      dump_file "$stderr"
      exit 1
    fi
-   test "$(cat "$store_path")" = '"'"$PROOF_NIX_MARKER"'"''
+   test "$(cat "$store_path")" = "$marker"'
 assert_real_git_origin_used_cleanly
 assert_fake_nix_cache_used
 
