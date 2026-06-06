@@ -139,6 +139,31 @@ curl -sS -H "Authorization: Bearer $TOKEN" \
 The listener is read-only: only `GET` is accepted. See
 [CLI reference](cli-reference.md) for the available routes.
 
+### `agent_vm`
+
+Optional. Configures daemon-managed agent VMs: networking, the guest image,
+and the per-session VM HTTP broker (`agent_vm.lifecycle` and
+`agent_vm.vm_http`). The lifecycle and transport fields are described in
+[the agent-VM design doc](../design/apple-container-agent-vm.md); the
+flake-input provisioning knobs (all under `agent_vm.vm_http`) are:
+
+| Field | Required | Description |
+| ----- | -------- | ----------- |
+| `flake_mirror_cache_dir` | no | Directory for the `(repo, rev)`-keyed cache of bare clone mirrors. **Setting this enables flake-input provisioning**: the clone handler retains each clone's mirror and the `/v1/nix/flake/provision` endpoint is served. Unset (default) ⇒ mirrors are discarded after cloning and the endpoint answers `404`. Holds clones of possibly-private repos; created owner-only (`0700`). |
+| `flake_input_cache_dir` | no | Directory of the content-addressed archive that provisioned inputs land in and that the nix-cache endpoint serves local-first. Defaults to `<work_root>/flake-input-cache`. Safe to share across sessions (content-addressed). |
+| `flake_materialize_scratch_dir` | no | Where the broker materialises throwaway checkouts to run `nix flake archive`. Defaults to `<work_root>/flake-materialize`; created owner-only. |
+| `nix_program` | no | The `nix` binary the broker runs for provisioning. Default `nix`. |
+| `flake_provision_max_input_count` | no | Fail-closed cap on locked inputs per provision. Default `256`. |
+| `flake_provision_max_total_bytes` | no | Fail-closed cap on archived bytes per provision. Default `2147483648` (2 GiB). |
+| `flake_provision_timeout_secs` | no | Timeout for the `nix flake archive` step. Default `600`. |
+
+See [the agent-VM design doc](../design/apple-container-agent-vm.md)
+("Flake-input provisioning") for the behaviour, the trust model, and the
+guarantee/envelope (a no-egress guest warms a flake devShell when the committed
+lock's inputs are all provisionable — public and classifier-admitted — and the
+devShell's output closure is substitutable from cache.nixos.org for the guest
+system).
+
 ## Secret stores
 
 The broker holds one long-lived secret per configured GitHub App: that
