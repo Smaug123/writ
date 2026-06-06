@@ -186,6 +186,7 @@ start.
     ],
     "nix_cache_max_metadata_bytes": 1048576,
     "nix_cache_max_nar_bytes": 67108864,
+    "flake_mirror_cache_dir": "/abs/path/to/writ/flake-mirror-cache",
     "agent_run_log_root": "/abs/path/to/writ/agent-run-logs",
     "git_push_staging_root": "/abs/path/to/writ/git-push-staging"
   }
@@ -219,6 +220,16 @@ Before that block does anything useful you need four things on disk:
 
 `agent_run_log_root` and `git_push_staging_root` are optional; if
 omitted they default to subdirectories of `work_root`.
+
+`flake_mirror_cache_dir` is optional but recommended: setting it turns on
+**flake-input provisioning**, so `writ agent … --warm devshell` works for a
+repo with flake inputs even though the guest has no egress. The broker fetches
+the repo's committed, locked inputs on the host and serves them to the guest's
+Nix through the cache it already trusts; without this key, a no-egress
+`nix develop` cannot resolve `github:` inputs and warm fails. See
+[configuration](configuration.md#agent_vm) for the related knobs and
+[the design doc](../design/apple-container-agent-vm.md) for the
+guarantee/envelope.
 
 ### Optional: `claude_proxy` block
 

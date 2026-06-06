@@ -484,6 +484,88 @@ substituters are reached through the broker proxy. The broker can enforce:
 Do not mount the host Nix store. Sharing the host store would break the
 filesystem isolation goal and complicate auditability.
 
+### Flake-input provisioning
+
+A no-egress guest cannot fetch a flake's *inputs*. `nix develop` /
+`nix flake metadata` resolve the inputs a repo's `flake.lock` pins
+(`github:numtide/flake-utils`, `github:NixOS/nixpkgs`, …) directly from their
+origins, which the guest firewall blocks; the nix-cache proxy only substitutes
+*store paths by hash*, so it is not a flake-input fetcher. Out of the box a
+no-egress guest therefore cannot evaluate any flake with inputs.
+
+The broker closes this gap the same way it provisions a repo for `git clone`:
+the host (which has egress) fetches the inputs, and the guest consumes them
+through the substituter it already trusts.
+
+1. **Retain.** Each `git clone` keeps its bare mirror in a `(repo, rev)`-keyed
+   cache (`flake_mirror_cache_dir`). Concurrent VMs cloning the same commit
+   share one mirror.
+2. **Provision.** Between checkout and warm, the guest POSTs `(repo, rev)` to
+   `/v1/nix/flake/provision`. The broker re-derives the checkout from its
+   retained mirror (a `git clone --local`, so the working tree is independent
+   of the mirror's lifetime) and runs `nix flake archive
+   --no-update-lock-file` over the committed lock, fetching the inputs'
+   content-addressed source paths into a shared cache (`flake_input_cache_dir`).
+   The guest never sends flake content. `--no-update-lock-file` (not merely
+   `--no-write-lock-file`) is load-bearing: a stale lock — `flake.nix` and
+   `flake.lock` disagreeing — fails closed rather than provisioning an
+   unreviewed, in-memory-updated input graph. The committed lock is *untrusted*
+   input (the agent's repo wrote it), so the host-side classifier is a security
+   gate, not just a feature filter (see "Scope" below).
+3. **Serve + substitute.** The nix-cache endpoint serves that cache
+   *local-first*: a provisioned path is served from the local archive; anything
+   else proxies upstream (cache.nixos.org). With github blocked, the guest's
+   `nix develop` substitutes the locked inputs from the local archive and never
+   contacts github. Build outputs substitute from cache.nixos.org as normal.
+
+The inputs are content-addressed (`fixed:r:sha256:…`), hence self-certifying:
+the local archive is admitted by hash verification, so no broker signing key
+and no guest `trusted-public-keys` change are needed. `nix flake archive` is
+platform-independent — an aarch64-darwin host produces exactly the input
+*source* paths an aarch64-linux guest needs to evaluate; the guest's *build
+outputs* still substitute from cache.nixos.org.
+
+The guest gains no new egress, preserving the trust model: the broker (which
+already has egress for `git clone`) is the boundary. The host fetch is bounded
+(input count / total bytes / timeout), pure-eval / no-IFD / sandboxed, and
+audited in the `flake_provision` table. Because a session may only provision a
+repo it was itself granted contents-read on — the provision endpoint requires a
+prior clone grant for `(repo)` in the session — a session cannot drive
+provisioning of another session's cached private mirror.
+
+**Enabling.** Provisioning is on exactly when `flake_mirror_cache_dir` is set:
+the clone handler then retains mirrors and `/v1/nix/flake/provision` is served.
+Without it the endpoint answers `404` and the guest degrades — the bootstrap
+provision call is best-effort, so warm still runs and surfaces the original
+github-unreachable failure only if the inputs were really needed.
+
+**Scope (v1).** Public inputs only (github/https needing no credentials); a
+private or auth-requiring input fails with a clear message. A committed
+`flake.lock` is required; a missing lock is a clear error. The classifier
+admits an input only if it is locked (carries `narHash`, plus `rev` for
+git-like inputs), non-local (no `path:`/`file://`), not credential-requiring
+(no ssh / userinfo), and not SSRF-prone (no loopback/link-local/private/CGNAT
+host). Brokered private-input fetch via the GitHub App, and host-side locking
+for lock-less repos, are follow-ups.
+
+**Guarantee / envelope.** At bootstrap, every input in the committed lock
+becomes available to the guest, so `nix develop` evaluates and enters the
+devShell **provided the devShell's output closure is substitutable from
+cache.nixos.org for the guest system**. A later in-guest flake edit that needs
+a brand-new input will not substitute — that is the no-egress envelope, by
+design: the broker is not a general egress proxy.
+
+**Cache growth.** Both the `(repo, rev)` mirror store and the content-addressed
+input archive accumulate across sessions; the archive is content-addressed, so
+cross-session sharing is safe and deduplicates. A bounded GC for the mirror
+store is a follow-up — it must skip a mirror that a provision is mid-`git clone
+--local`-ing, so it cannot delete an entry out from under a running clone.
+
+The end-to-end behaviour is exercised by
+`scripts/prove-agent-vm-devshell-warm.sh`, which boots a no-egress VM, warms a
+real flake devShell, and asserts the locked inputs were served from the
+provisioned cache rather than fetched from github.
+
 ## Git model
 
 The current broker mints short-lived GitHub App tokens and returns them to the
