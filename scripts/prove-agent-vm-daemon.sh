@@ -635,12 +635,15 @@ import sys
 ) = sys.argv[1:]
 
 config = {
-    "github": {
-        "app_id": 42,
-        "installation_id": 999,
-        "installation_owner": owner,
-        "private_key_secret": "gh-app-pk",
-        "api_base": f"http://127.0.0.1:{fake_github_port}",
+    # Agent-keyed registry: the session's --agent claude selects this App.
+    "github_apps": {
+        "claude": {
+            "app_id": 42,
+            "installation_id": 999,
+            "installation_owner": owner,
+            "private_key_secret": "gh-app-pk",
+            "api_base": f"http://127.0.0.1:{fake_github_port}",
+        },
     },
     "policy": {"default_ttl": 3600, "writable_repos": []},
     "secret_store": {"type": "file", "path": secrets_dir},
@@ -982,6 +985,7 @@ wait_for_writd_socket
 log "starting daemon-managed VM on ${IPV4_CIDR}"
 if ! "$WRIT_BIN" --socket "$SOCKET_PATH" agent-vm start \
   --label "daemon proof" \
+  --agent claude \
   --model "proof" \
   -- sh -lc 'printf daemon-released >/tmp/writ-agent-vm-daemon-released; sleep 600' \
   >"$START_OUTPUT"; then
