@@ -632,12 +632,15 @@ import sys
 ) = sys.argv[1:]
 
 config = {
-    "github": {
-        "app_id": 42,
-        "installation_id": 999,
-        "installation_owner": owner,
-        "private_key_secret": "gh-app-pk",
-        "api_base": f"http://127.0.0.1:{fake_github_port}",
+    # Agent-keyed registry: the session's --agent claude selects this App.
+    "github_apps": {
+        "claude": {
+            "app_id": 42,
+            "installation_id": 999,
+            "installation_owner": owner,
+            "private_key_secret": "gh-app-pk",
+            "api_base": f"http://127.0.0.1:{fake_github_port}",
+        },
     },
     "policy": {"default_ttl": 3600, "writable_repos": []},
     "secret_store": {"type": "file", "path": secrets_dir},
