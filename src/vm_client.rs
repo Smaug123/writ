@@ -23,7 +23,8 @@ use crate::process_spawn;
 use crate::vm_git::{
     DEFAULT_DEVSHELL_ATTR, DEFAULT_WORKSPACE_BRANCH, GIT_BUNDLE_CONTENT_TYPE,
     GIT_PUSH_BUNDLE_CONTENT_TYPE, GitBranchName, GitCloneRef, GitCloneRepo, GitObjectId,
-    VM_GIT_CLONE_PATH, VM_GIT_PUSH_PATH, VmGitCloneErrorResponse, VmGitCloneRequest,
+    VM_FLAKE_PROVISION_PATH, VM_GIT_CLONE_PATH, VM_GIT_PUSH_PATH, VmFlakeProvisionErrorResponse,
+    VmFlakeProvisionRequest, VmFlakeProvisionResponse, VmGitCloneErrorResponse, VmGitCloneRequest,
     VmGitPushErrorResponse, VmGitPushMetadata, VmGitPushRequest, VmGitPushStagedReceipt,
     WorkspaceWarmMode, default_workspace_destination, encode_vm_git_push_request_body,
     nix_develop_command_args,
@@ -79,6 +80,7 @@ pub enum VmGitCloneStep {
     CheckoutBranch,
     SetUpstream,
     Status,
+    ResolveHead,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -532,9 +534,143 @@ pub async fn init_workspace_from_broker(
         command.destination(),
         &bundle,
     )?;
+    // Ask the broker to provision the flake's locked inputs into the shared
+    // cache *before* warm, so the no-egress guest's `nix develop` can evaluate
+    // the locked flake without reaching github. Best-effort: warm runs whatever
+    // the outcome, and surfaces its own error if the inputs really were needed.
+    provision_flake_inputs_best_effort(config, command).await;
     warm_workspace(command)?;
     require_clean_workspace(command.git_program(), command.destination())?;
     Ok(command.destination().to_path_buf())
+}
+
+/// Reasons a provision attempt did not complete that the guest treats as
+/// non-fatal: provisioning is an optimisation, so each is logged and swallowed.
+#[derive(Debug)]
+enum FlakeProvisionDegrade {
+    /// The provision request never reached the broker (transport failure).
+    Request(reqwest::Error),
+    /// The broker answered with a non-success status (e.g. `404` when the
+    /// endpoint is disabled, `403` when unauthorized, `5xx` on a host failure).
+    Status { code: u16, message: Option<String> },
+    /// The broker answered `2xx` but the body was not a provision response.
+    Body(reqwest::Error),
+}
+
+impl std::fmt::Display for FlakeProvisionDegrade {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Request(err) => write!(f, "broker request failed: {err}"),
+            Self::Status {
+                code,
+                message: Some(message),
+            } => write!(f, "broker returned status {code}: {message}"),
+            Self::Status {
+                code,
+                message: None,
+            } => write!(f, "broker returned status {code}"),
+            Self::Body(err) => write!(f, "broker response was not understood: {err}"),
+        }
+    }
+}
+
+/// Best-effort flake-input provisioning. Resolves the checked-out commit and
+/// asks the broker to provision that `(repo, rev)`'s locked inputs. Any failure
+/// — unresolved HEAD, transport, refusal, cache miss — is reported on stderr
+/// and swallowed; the caller proceeds to warm regardless. Skipped entirely when
+/// no warm step will run, since nothing in the workspace would consume the
+/// inputs yet.
+async fn provision_flake_inputs_best_effort(
+    config: &VmClientConfig,
+    command: &VmWorkspaceInitCommand,
+) {
+    if command.warm() == WorkspaceWarmMode::None {
+        return;
+    }
+    let rev = match resolve_head_object_id(command.git_program(), command.destination()) {
+        Ok(rev) => rev,
+        Err(message) => {
+            eprintln!("writ-vm: skipping flake-input provisioning: {message}");
+            return;
+        }
+    };
+    let request = VmFlakeProvisionRequest::new(command.repo().clone(), rev);
+    match post_flake_provision(config, &request).await {
+        Ok(VmFlakeProvisionResponse::Provisioned {
+            input_count,
+            archived_path_count,
+            ..
+        }) => eprintln!(
+            "writ-vm: provisioned {input_count} flake input(s) into the broker cache \
+             ({archived_path_count} store path(s))"
+        ),
+        Ok(VmFlakeProvisionResponse::MirrorNotCached) => eprintln!(
+            "writ-vm: flake inputs were not pre-provisioned (broker has no cached mirror); \
+             an offline `nix develop` may fail to fetch them"
+        ),
+        Err(degrade) => {
+            eprintln!("writ-vm: flake-input provisioning unavailable: {degrade}")
+        }
+    }
+}
+
+/// Resolve the commit currently checked out at `destination`. Returns a
+/// human-readable message (not a hard error) so the best-effort caller can log
+/// and continue.
+fn resolve_head_object_id(git_program: &Path, destination: &Path) -> Result<GitObjectId, String> {
+    let cwd = std::env::current_dir()
+        .map_err(|source| format!("cannot read current directory: {source}"))?;
+    let output = run_git_command_output(
+        git_program,
+        VmGitCloneStep::ResolveHead,
+        vec![
+            OsString::from("-C"),
+            destination.as_os_str().to_os_string(),
+            OsString::from("rev-parse"),
+            OsString::from("--verify"),
+            OsString::from("--end-of-options"),
+            OsString::from("HEAD^{commit}"),
+        ],
+        &cwd,
+    )
+    .map_err(|err| err.to_string())?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    GitObjectId::new(text.trim())
+        .map_err(|err| format!("git rev-parse HEAD returned an invalid commit id: {err}"))
+}
+
+/// POST a provision request and classify the answer. Returns the broker's
+/// successful outcome (provisioned or mirror-not-cached), or a
+/// [`FlakeProvisionDegrade`] the caller logs and ignores.
+async fn post_flake_provision(
+    config: &VmClientConfig,
+    request: &VmFlakeProvisionRequest,
+) -> Result<VmFlakeProvisionResponse, FlakeProvisionDegrade> {
+    let response = reqwest::Client::new()
+        .post(config.endpoint(VM_FLAKE_PROVISION_PATH))
+        .bearer_auth(config.bearer_token().as_str())
+        .json(request)
+        .send()
+        .await
+        .map_err(FlakeProvisionDegrade::Request)?;
+    let status = response.status();
+    if status.is_success() {
+        return response
+            .json::<VmFlakeProvisionResponse>()
+            .await
+            .map_err(FlakeProvisionDegrade::Body);
+    }
+    // A refusal carries a structured error body on the broker's own routes, but
+    // a disabled endpoint answers `404` with plain text; tolerate both.
+    let message = response
+        .json::<VmFlakeProvisionErrorResponse>()
+        .await
+        .ok()
+        .map(|err| err.message().to_string());
+    Err(FlakeProvisionDegrade::Status {
+        code: status.as_u16(),
+        message,
+    })
 }
 
 async fn fetch_git_clone_bundle(
@@ -1107,6 +1243,7 @@ impl std::fmt::Display for VmGitCloneStep {
             Self::CheckoutBranch => f.write_str("git checkout branch"),
             Self::SetUpstream => f.write_str("git branch --set-upstream-to"),
             Self::Status => f.write_str("git status"),
+            Self::ResolveHead => f.write_str("git rev-parse HEAD"),
         }
     }
 }
@@ -1920,6 +2057,172 @@ mod tests {
             .unwrap();
         assert!(head.status.success());
         assert_eq!(String::from_utf8_lossy(&head.stdout).trim(), "HEAD");
+    }
+
+    fn commit_one_file(git: &Path, repo_dir: &Path) -> String {
+        let arg = repo_dir.to_str().unwrap();
+        run_test_git(git, &["init", "--", arg]);
+        run_test_git(git, &["-C", arg, "config", "user.email", "a@example.com"]);
+        run_test_git(git, &["-C", arg, "config", "user.name", "a"]);
+        run_test_git(git, &["-C", arg, "config", "commit.gpgsign", "false"]);
+        fs::write(repo_dir.join("flake.nix"), "{}\n").unwrap();
+        run_test_git(git, &["-C", arg, "add", "."]);
+        run_test_git(git, &["-C", arg, "commit", "-m", "init"]);
+        let head = Command::new(git)
+            .args(["-C", arg, "rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        assert!(head.status.success());
+        String::from_utf8_lossy(&head.stdout).trim().to_string()
+    }
+
+    fn provision_request() -> VmFlakeProvisionRequest {
+        VmFlakeProvisionRequest::new(
+            repo(),
+            "0123456789abcdef0123456789abcdef01234567".parse().unwrap(),
+        )
+    }
+
+    #[test]
+    fn resolve_head_object_id_returns_the_checked_out_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = required_test_tool("git");
+        let repo_dir = dir.path().join("repo");
+        let expected = commit_one_file(&git, &repo_dir);
+
+        let rev = resolve_head_object_id(&git, &repo_dir).unwrap();
+
+        assert_eq!(rev.as_str(), expected);
+    }
+
+    #[tokio::test]
+    async fn provision_best_effort_posts_repo_and_resolved_rev() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = required_test_tool("git");
+        let repo_dir = dir.path().join("repo");
+        let rev = commit_one_file(&git, &repo_dir);
+
+        let body = br#"{"status":"provisioned","request_id":"00000000-0000-0000-0000-000000000001","input_count":2,"archived_path_count":5,"archived_bytes":1024}"#;
+        let (broker_url, captured) =
+            serve_once(http_response("200 OK", "application/json", body)).await;
+        let config = VmClientConfig::new(broker_url, "writ-vm-secret").unwrap();
+        let command = VmWorkspaceInitCommand::new(
+            repo(),
+            Some(repo_dir),
+            WorkspaceWarmMode::Sources,
+            git,
+            "nix",
+        )
+        .unwrap();
+
+        provision_flake_inputs_best_effort(&config, &command).await;
+
+        let request = captured.lock().unwrap().clone();
+        assert!(
+            request.starts_with("POST /v1/nix/flake/provision "),
+            "{request}"
+        );
+        assert!(request.contains(r#""repo":"owner/repo""#), "{request}");
+        assert!(request.contains(&format!(r#""rev":"{rev}""#)), "{request}");
+        assert!(
+            request
+                .to_ascii_lowercase()
+                .contains("authorization: bearer writ-vm-secret"),
+            "{request}"
+        );
+    }
+
+    #[tokio::test]
+    async fn provision_best_effort_skips_when_warm_is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = required_test_tool("git");
+        let repo_dir = dir.path().join("repo");
+        commit_one_file(&git, &repo_dir);
+        let (broker_url, captured) = serve_once(http_response(
+            "200 OK",
+            "application/json",
+            br#"{"status":"mirror_not_cached"}"#,
+        ))
+        .await;
+        let config = VmClientConfig::new(broker_url, "writ-vm-secret").unwrap();
+        let command = VmWorkspaceInitCommand::new(
+            repo(),
+            Some(repo_dir),
+            WorkspaceWarmMode::None,
+            git,
+            "nix",
+        )
+        .unwrap();
+
+        provision_flake_inputs_best_effort(&config, &command).await;
+
+        // No warm step will run, so nothing is provisioned and the broker is
+        // never contacted.
+        assert!(captured.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn post_flake_provision_reads_mirror_not_cached() {
+        let (broker_url, _captured) = serve_once(http_response(
+            "200 OK",
+            "application/json",
+            br#"{"status":"mirror_not_cached"}"#,
+        ))
+        .await;
+        let config = VmClientConfig::new(broker_url, "writ-vm-secret").unwrap();
+
+        let outcome = post_flake_provision(&config, &provision_request())
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, VmFlakeProvisionResponse::MirrorNotCached);
+    }
+
+    #[tokio::test]
+    async fn post_flake_provision_classifies_a_structured_refusal() {
+        let body =
+            br#"{"error":"unprovisionable","message":"the repository has no committed flake.lock"}"#;
+        let (broker_url, _captured) = serve_once(http_response(
+            "422 Unprocessable Content",
+            "application/json",
+            body,
+        ))
+        .await;
+        let config = VmClientConfig::new(broker_url, "writ-vm-secret").unwrap();
+
+        let err = post_flake_provision(&config, &provision_request())
+            .await
+            .unwrap_err();
+
+        match err {
+            FlakeProvisionDegrade::Status { code, message } => {
+                assert_eq!(code, 422);
+                assert_eq!(
+                    message.as_deref(),
+                    Some("the repository has no committed flake.lock")
+                );
+            }
+            other => panic!("expected a Status degrade, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn post_flake_provision_tolerates_a_plain_text_disabled_endpoint() {
+        let (broker_url, _captured) =
+            serve_once(http_response("404 Not Found", "text/plain", b"not found")).await;
+        let config = VmClientConfig::new(broker_url, "writ-vm-secret").unwrap();
+
+        let err = post_flake_provision(&config, &provision_request())
+            .await
+            .unwrap_err();
+
+        match err {
+            FlakeProvisionDegrade::Status { code, message } => {
+                assert_eq!(code, 404);
+                assert_eq!(message, None);
+            }
+            other => panic!("expected a Status degrade, got {other:?}"),
+        }
     }
 
     #[test]
