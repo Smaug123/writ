@@ -191,6 +191,7 @@ async fn run_agent_round_trip_signs_and_writes_note() {
             args: Vec::new(),
         }),
         promote_runtime: base.promote_runtime,
+        mirror_pins: base.mirror_pins,
     });
 
     let prompt_text = "hello world from cat\n";
@@ -304,6 +305,7 @@ async fn run_agent_signs_non_zero_exit() {
             args: Vec::new(),
         }),
         promote_runtime: base.promote_runtime,
+        mirror_pins: base.mirror_pins,
     });
 
     let resp = dispatch_message(
@@ -378,6 +380,7 @@ async fn run_agent_captures_stderr_in_envelope() {
             args: vec!["-c".into(), "printf out; printf err 1>&2; exit 0".into()],
         }),
         promote_runtime: base.promote_runtime,
+        mirror_pins: base.mirror_pins,
     });
 
     let output_ref = crate::core::NotesRef::try_new("refs/notes/writ/v1/agent-outputs").unwrap();
@@ -472,6 +475,7 @@ async fn run_agent_caps_stream_capture_records_truncation() {
             ],
         }),
         promote_runtime: base.promote_runtime,
+        mirror_pins: base.mirror_pins,
     });
 
     let output_ref = crate::core::NotesRef::try_new("refs/notes/writ/v1/agent-outputs").unwrap();
@@ -548,6 +552,7 @@ async fn run_agent_stamps_caller_supplied_session_id_into_signed_metadata() {
             args: Vec::new(),
         }),
         promote_runtime: base.promote_runtime,
+        mirror_pins: base.mirror_pins,
     });
 
     let session_id = SessionId::new();
@@ -619,6 +624,7 @@ async fn run_agent_rejects_unknown_session_id() {
             args: Vec::new(),
         }),
         promote_runtime: base.promote_runtime,
+        mirror_pins: base.mirror_pins,
     });
 
     let bogus = SessionId::new();
@@ -673,6 +679,7 @@ async fn run_agent_rejects_closed_session_id() {
             args: Vec::new(),
         }),
         promote_runtime: base.promote_runtime,
+        mirror_pins: base.mirror_pins,
     });
 
     let session_id = SessionId::new();

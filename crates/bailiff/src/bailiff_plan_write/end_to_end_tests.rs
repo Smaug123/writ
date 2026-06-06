@@ -112,6 +112,7 @@ async fn write_plan_note_completes_after_real_broker_round_trip() {
             args: Vec::new(),
         }),
         promote_runtime: None,
+        mirror_pins: writ::vm_git_mirror_cache::MirrorPins::new(),
     });
 
     let socket_dir = tempfile::tempdir().unwrap();
@@ -254,6 +255,7 @@ async fn write_review_note_completes_after_real_broker_round_trip() {
             args: Vec::new(),
         }),
         promote_runtime: None,
+        mirror_pins: writ::vm_git_mirror_cache::MirrorPins::new(),
     });
 
     let socket_dir = tempfile::tempdir().unwrap();
@@ -393,6 +395,7 @@ async fn write_implement_note_completes_after_real_broker_round_trip() {
             args: Vec::new(),
         }),
         promote_runtime: None,
+        mirror_pins: writ::vm_git_mirror_cache::MirrorPins::new(),
     });
 
     let socket_dir = tempfile::tempdir().unwrap();

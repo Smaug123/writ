@@ -29,7 +29,7 @@ use crate::vm_git_bundle::{
     DEFAULT_GIT_CLONE_BASE_URL, GitCloneBaseUrl, GitCloneBundlePlanError, GitCredentialBoundary,
     GitSecretEnvVar, GitSecretEnvVarError,
 };
-use crate::vm_git_mirror_cache::MirrorCache;
+use crate::vm_git_mirror_cache::{MirrorCache, MirrorCacheBounds};
 use crate::vm_http::{
     DEFAULT_CLAUDE_ANTHROPIC_VERSION, VmHttpClaudeProxyAuthKind, VmHttpClaudeProxyConfig,
     VmHttpClaudeProxyConfigError, VmHttpFlakeProvisionConfig, VmHttpGitCloneConfig,
@@ -407,6 +407,17 @@ pub struct AgentVmHttpConfig {
     /// is nothing to provision from, so the endpoint stays disabled.
     #[serde(default)]
     pub flake_mirror_cache_dir: Option<PathBuf>,
+    /// Eviction ceiling on the number of retained mirrors. After each clone an
+    /// opportunistic pass evicts oldest-first (skipping mirrors an in-flight
+    /// provision has pinned) until the cache is under both this and
+    /// `flake_mirror_cache_max_bytes`. Only meaningful with
+    /// `flake_mirror_cache_dir` set.
+    #[serde(default = "default_flake_mirror_cache_max_entries")]
+    pub flake_mirror_cache_max_entries: usize,
+    /// Eviction ceiling on the total bytes the retained mirrors occupy. See
+    /// `flake_mirror_cache_max_entries`.
+    #[serde(default = "default_flake_mirror_cache_max_bytes")]
+    pub flake_mirror_cache_max_bytes: u64,
     /// Directory under which the broker materialises throwaway local clones to
     /// run `nix flake archive` against. `None` defaults to
     /// `<work_root>/flake-materialize`. Created owner-only (0700).
@@ -649,7 +660,17 @@ impl AgentVmHttpConfig {
             .map(validate_flake_mirror_cache_dir)
             .transpose()?
             .map(MirrorCache::new);
-        let git_clone = git_clone.with_mirror_cache(mirror_cache.clone());
+        // The eviction bounds only matter when the cache is enabled; pair them
+        // with the cache so the clone handler runs a bounded pass after retain.
+        let mirror_gc_bounds = mirror_cache.as_ref().map(|_| {
+            MirrorCacheBounds::new(
+                self.flake_mirror_cache_max_entries,
+                self.flake_mirror_cache_max_bytes,
+            )
+        });
+        let git_clone = git_clone
+            .with_mirror_cache(mirror_cache.clone())
+            .with_mirror_gc_bounds(mirror_gc_bounds);
         // `prepare_git_work_root` refuses to clone into a work root whose mode
         // has group/world bits set, but `validate_*_root` below creates the
         // staging/log subdirs with `create_dir_all`, which propagates the
@@ -1073,6 +1094,12 @@ fn default_flake_provision_max_total_bytes() -> u64 {
 }
 fn default_flake_provision_timeout_secs() -> u64 {
     600
+}
+fn default_flake_mirror_cache_max_entries() -> usize {
+    64
+}
+fn default_flake_mirror_cache_max_bytes() -> u64 {
+    10 * 1024 * 1024 * 1024
 }
 
 fn default_clone_timeout_secs() -> u64 {
@@ -1698,6 +1725,8 @@ mod tests {
             nix_cache_max_nar_bytes: 67_108_864,
             flake_input_cache_dir: None,
             flake_mirror_cache_dir: None,
+            flake_mirror_cache_max_entries: default_flake_mirror_cache_max_entries(),
+            flake_mirror_cache_max_bytes: default_flake_mirror_cache_max_bytes(),
             flake_materialize_scratch_dir: None,
             flake_provision_max_input_count: default_flake_provision_max_input_count(),
             flake_provision_max_total_bytes: default_flake_provision_max_total_bytes(),
@@ -2140,8 +2169,25 @@ mod tests {
     fn agent_vm_http_config_defaults_to_no_mirror_cache() {
         let runtime = valid_agent_vm_http_config().to_runtime_config().unwrap();
         // Retention is opt-in: without the dir, the clone handler discards the
-        // mirror exactly as before.
+        // mirror exactly as before, and there is nothing to bound.
         assert!(runtime.git_clone().mirror_cache().is_none());
+        assert!(runtime.git_clone().mirror_gc_bounds().is_none());
+    }
+
+    #[test]
+    fn agent_vm_http_config_pairs_gc_bounds_with_the_mirror_cache() {
+        let mut c = valid_agent_vm_http_config();
+        c.flake_mirror_cache_dir = Some(unique_config_test_path("flake-mirror-cache"));
+        c.flake_mirror_cache_max_entries = 7;
+        c.flake_mirror_cache_max_bytes = 4096;
+
+        let runtime = c.to_runtime_config().unwrap();
+
+        // Eviction bounds are wired exactly when the cache they bound exists.
+        assert_eq!(
+            runtime.git_clone().mirror_gc_bounds(),
+            Some(crate::vm_git_mirror_cache::MirrorCacheBounds::new(7, 4096))
+        );
     }
 
     #[test]

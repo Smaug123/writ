@@ -212,6 +212,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         signing_key,
         run_agent_spawn,
         promote_runtime,
+        mirror_pins: writ::vm_git_mirror_cache::MirrorPins::new(),
     });
 
     tracing::info!(
