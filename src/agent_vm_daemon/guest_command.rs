@@ -71,8 +71,36 @@ printf 'machine %s login %s password %s\n' \
 
 /// The remainder of the nix.conf block, after the `experimental-features`
 /// line through the closing redirect.
+///
+/// `build-users-group =` is pinned empty deliberately. The guest runs Nix as
+/// root in a single-user, root-owned store with no `nixbld` build-users group,
+/// but Nix defaults `build-users-group` to `nixbld` whenever euid is 0. Any
+/// *local* build (which the `nix develop` warm now permits under
+/// `max-jobs = 1`, and which the agent's own later Nix commands run at the
+/// default non-zero `max-jobs`) would otherwise fail with "the group 'nixbld'
+/// ... does not exist". Empty means "build as the calling user", i.e. root.
+///
+/// Running those builds as root — with no Nix build sandbox and the broker
+/// token sitting in the netrc this same prologue just wrote — is acceptable
+/// under writ's trust model: the broker, not anything inside the guest, is the
+/// trust boundary (the guest VM is untrusted-by-design). The same untrusted,
+/// repo-controlled code reaches that token by other means in the same VM
+/// regardless of this setting, so it grants no escalation:
+///   * the warm's own `nix develop --command true` sources the devShell
+///     `shellHook` (arbitrary repo code) as root even at `max-jobs = 0`, with
+///     this netrc already present;
+///   * the agent runs inside the same `nix develop` wrapper as root, holds the
+///     broker token in its environment, and can trigger its own builds at the
+///     default non-zero `max-jobs`, all reading the same persistent netrc.
+/// `max-jobs = 1` only moves a malicious devShell build slightly earlier (warm
+/// vs. the agent's own devShell entry); the root/token/netrc access is
+/// identical either way. Sandboxing only the warm build would close no door the
+/// agent leaves wide open. Genuinely keeping the token away from root would
+/// need a different credential design (scoped, short-lived, never materialised
+/// in a root-readable file) — a separate, larger change.
 const GUEST_NIX_PROLOGUE_NIXCONF_REST: &str = r#"  printf 'netrc-file = %s\n' "$WRIT_NIX_NETRC"
   printf 'access-tokens =\n'
+  printf 'build-users-group =\n'
   printf 'substituters = %s\n' "$WRIT_NIX_CACHE_URL"
   if [ -n "$WRIT_NIX_TRUSTED_PUBLIC_KEYS" ]; then
     printf 'trusted-public-keys = %s\n' "$WRIT_NIX_TRUSTED_PUBLIC_KEYS"
