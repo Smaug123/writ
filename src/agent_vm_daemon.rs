@@ -72,6 +72,11 @@ const AGENT_VM_WORKSPACE_BOOTSTRAP_QUICK_POLL_INTERVAL: Duration = Duration::fro
 const AGENT_VM_WORKSPACE_BOOTSTRAP_SLOW_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const AGENT_VM_WORKSPACE_BOOTSTRAP_QUICK_POLLS: u32 = 10;
 const AGENT_VM_WORKSPACE_BOOTSTRAP_FAILURE_MESSAGE_LIMIT: usize = 16 * 1024;
+/// Prepended to a truncated failure message. The marker leads (rather than
+/// trails) because the truncation keeps the *tail* of the output: Nix prints the
+/// line that actually explains the failure last, after a long run of
+/// `copying path ...` substitution progress.
+const AGENT_VM_WORKSPACE_BOOTSTRAP_FAILURE_TRUNCATION_MARKER: &str = "[truncated]\n";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AgentVmDaemonRuntimeConfig {
@@ -981,24 +986,36 @@ fn workspace_bootstrap_poll_interval(poll_count: u32) -> Duration {
 }
 
 fn normalise_workspace_bootstrap_failure_message(raw: &str) -> String {
-    let mut out = String::new();
-    let mut truncated = false;
-    for ch in raw.chars() {
-        let ch = if ch.is_control() && ch != '\n' && ch != '\t' {
-            '?'
-        } else {
-            ch
-        };
-        if out.len() + ch.len_utf8() > AGENT_VM_WORKSPACE_BOOTSTRAP_FAILURE_MESSAGE_LIMIT {
-            truncated = true;
-            break;
-        }
-        out.push(ch);
+    // Replace terminal-corrupting control characters (anything other than
+    // newlines and tabs) so echoing the message back to the operator is safe.
+    let scrubbed: String = raw
+        .chars()
+        .map(|ch| {
+            if ch.is_control() && ch != '\n' && ch != '\t' {
+                '?'
+            } else {
+                ch
+            }
+        })
+        .collect();
+
+    if scrubbed.len() <= AGENT_VM_WORKSPACE_BOOTSTRAP_FAILURE_MESSAGE_LIMIT {
+        return scrubbed;
     }
-    if truncated {
-        out.push_str("\n[truncated]");
+
+    // Keep the tail, not the head: Nix prints the line that actually explains
+    // the failure last, after a long run of `copying path ...` substitution
+    // progress, so the head is noise and the tail is the diagnosis. Take at most
+    // LIMIT bytes from the end, snapping forward to a char boundary so we never
+    // split a multi-byte character.
+    let mut start = scrubbed.len() - AGENT_VM_WORKSPACE_BOOTSTRAP_FAILURE_MESSAGE_LIMIT;
+    while !scrubbed.is_char_boundary(start) {
+        start += 1;
     }
-    out
+    format!(
+        "{AGENT_VM_WORKSPACE_BOOTSTRAP_FAILURE_TRUNCATION_MARKER}{}",
+        &scrubbed[start..]
+    )
 }
 
 impl AgentVmStarted {

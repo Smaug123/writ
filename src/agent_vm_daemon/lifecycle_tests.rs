@@ -5,6 +5,7 @@ use super::test_support::*;
 use super::*;
 use crate::agent_vm_lifecycle::AgentVmSessionStateStatus;
 use crate::vm_git::{DEFAULT_WORKSPACE_BRANCH, WorkspaceWarmMode};
+use proptest::prelude::*;
 use std::fs;
 use std::path::Path;
 
@@ -527,10 +528,93 @@ fn workspace_bootstrap_failure_message_is_bounded_and_control_scrubbed() {
     let message = normalise_workspace_bootstrap_failure_message(&raw);
 
     assert!(
-        message.len() <= AGENT_VM_WORKSPACE_BOOTSTRAP_FAILURE_MESSAGE_LIMIT + "\n[truncated]".len()
+        message.len()
+            <= AGENT_VM_WORKSPACE_BOOTSTRAP_FAILURE_MESSAGE_LIMIT
+                + AGENT_VM_WORKSPACE_BOOTSTRAP_FAILURE_TRUNCATION_MARKER.len()
     );
+    // The trailing BEL falls inside the kept tail, so it must be scrubbed.
+    assert!(!message.contains('\u{7}'));
     assert!(!message.contains('\u{1b}'));
-    assert!(message.ends_with("[truncated]"));
+    // The marker leads, because the meaningful Nix error lives at the tail.
+    assert!(message.starts_with(AGENT_VM_WORKSPACE_BOOTSTRAP_FAILURE_TRUNCATION_MARKER));
+}
+
+#[test]
+fn workspace_bootstrap_failure_message_keeps_tail_not_head() {
+    // Nix emits hundreds of `copying path ...` progress lines before the line
+    // that actually explains the failure. The head-noise alone overflows the
+    // limit, so the meaningful tail must survive while the head is dropped.
+    let head_marker = "HEAD_MARKER_SHOULD_BE_DROPPED\n";
+    let noise =
+        "copying path '/nix/store/deadbeefdeadbeefdeadbeefdeadbeef-source' from cache...\n"
+            .repeat(AGENT_VM_WORKSPACE_BOOTSTRAP_FAILURE_MESSAGE_LIMIT / 16);
+    let real_error = "error: cannot build '/nix/store/abcd.drv' since max-jobs is set to 0";
+    let raw = format!("{head_marker}{noise}{real_error}");
+    assert!(raw.len() > AGENT_VM_WORKSPACE_BOOTSTRAP_FAILURE_MESSAGE_LIMIT);
+
+    let message = normalise_workspace_bootstrap_failure_message(&raw);
+
+    assert!(message.starts_with(AGENT_VM_WORKSPACE_BOOTSTRAP_FAILURE_TRUNCATION_MARKER));
+    assert!(message.ends_with(real_error));
+    assert!(!message.contains(head_marker));
+}
+
+#[test]
+fn workspace_bootstrap_failure_message_passes_short_input_through_with_scrubbing() {
+    let raw = "error: oh no\u{1b}[0m\u{7}\twith tab\n";
+
+    let message = normalise_workspace_bootstrap_failure_message(raw);
+
+    // Short enough to keep verbatim: no marker, controls (ESC/BEL) scrubbed,
+    // tab and newline preserved.
+    assert_eq!(message, "error: oh no?[0m?\twith tab\n");
+    assert!(!message.contains(AGENT_VM_WORKSPACE_BOOTSTRAP_FAILURE_TRUNCATION_MARKER));
+}
+
+fn failure_message_input() -> impl Strategy<Value = String> {
+    // Repeat an arbitrary (possibly multi-byte, possibly control-laden) unit so
+    // the generator straddles the truncation threshold instead of only ever
+    // producing short strings.
+    (prop::collection::vec(any::<char>(), 1..64), 0usize..400usize)
+        .prop_map(|(chars, reps)| chars.into_iter().collect::<String>().repeat(reps))
+}
+
+proptest! {
+    #[test]
+    fn workspace_bootstrap_failure_message_is_bounded_scrubbed_and_tail_preserving(
+        raw in failure_message_input(),
+    ) {
+        let scrubbed: String = raw
+            .chars()
+            .map(|ch| if ch.is_control() && ch != '\n' && ch != '\t' { '?' } else { ch })
+            .collect();
+
+        let message = normalise_workspace_bootstrap_failure_message(&raw);
+
+        // No terminal-corrupting control characters survive.
+        prop_assert!(
+            !message.chars().any(|ch| ch.is_control() && ch != '\n' && ch != '\t')
+        );
+        // Always bounded by the limit plus the (prepended) marker.
+        prop_assert!(
+            message.len()
+                <= AGENT_VM_WORKSPACE_BOOTSTRAP_FAILURE_MESSAGE_LIMIT
+                    + AGENT_VM_WORKSPACE_BOOTSTRAP_FAILURE_TRUNCATION_MARKER.len()
+        );
+
+        if scrubbed.len() <= AGENT_VM_WORKSPACE_BOOTSTRAP_FAILURE_MESSAGE_LIMIT {
+            // Fits: passed through verbatim with no marker.
+            prop_assert_eq!(&message, &scrubbed);
+        } else {
+            // Overflows: marker leads, and the kept content is a genuine suffix
+            // of the scrubbed input (the tail, not the head).
+            let content = message
+                .strip_prefix(AGENT_VM_WORKSPACE_BOOTSTRAP_FAILURE_TRUNCATION_MARKER)
+                .expect("a truncated message must start with the marker");
+            prop_assert!(scrubbed.ends_with(content));
+            prop_assert!(content.len() <= AGENT_VM_WORKSPACE_BOOTSTRAP_FAILURE_MESSAGE_LIMIT);
+        }
+    }
 }
 #[tokio::test]
 async fn workspace_bootstrap_wait_reports_timeout_at_supplied_bound() {
