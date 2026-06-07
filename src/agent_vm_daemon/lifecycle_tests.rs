@@ -545,9 +545,8 @@ fn workspace_bootstrap_failure_message_keeps_tail_not_head() {
     // that actually explains the failure. The head-noise alone overflows the
     // limit, so the meaningful tail must survive while the head is dropped.
     let head_marker = "HEAD_MARKER_SHOULD_BE_DROPPED\n";
-    let noise =
-        "copying path '/nix/store/deadbeefdeadbeefdeadbeefdeadbeef-source' from cache...\n"
-            .repeat(AGENT_VM_WORKSPACE_BOOTSTRAP_FAILURE_MESSAGE_LIMIT / 16);
+    let noise = "copying path '/nix/store/deadbeefdeadbeefdeadbeefdeadbeef-source' from cache...\n"
+        .repeat(AGENT_VM_WORKSPACE_BOOTSTRAP_FAILURE_MESSAGE_LIMIT / 16);
     let real_error = "error: cannot build '/nix/store/abcd.drv' since max-jobs is set to 0";
     let raw = format!("{head_marker}{noise}{real_error}");
     assert!(raw.len() > AGENT_VM_WORKSPACE_BOOTSTRAP_FAILURE_MESSAGE_LIMIT);
@@ -575,7 +574,10 @@ fn failure_message_input() -> impl Strategy<Value = String> {
     // Repeat an arbitrary (possibly multi-byte, possibly control-laden) unit so
     // the generator straddles the truncation threshold instead of only ever
     // producing short strings.
-    (prop::collection::vec(any::<char>(), 1..64), 0usize..400usize)
+    (
+        prop::collection::vec(any::<char>(), 1..64),
+        0usize..400usize,
+    )
         .prop_map(|(chars, reps)| chars.into_iter().collect::<String>().repeat(reps))
 }
 
