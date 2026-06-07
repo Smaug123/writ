@@ -28,6 +28,31 @@ pub const DEFAULT_DEVSHELL_ATTR: &str = ".#default";
 const GIT_PUSH_METADATA_LENGTH_BYTES: usize = 8;
 const GIT_OBJECT_ID_HEX_BYTES: usize = 40;
 
+/// Local build jobs the no-egress guest may run while warming the devShell.
+///
+/// The motivating case is `allowSubstitutes = false` / `preferLocalBuild`
+/// setup-hook derivations (e.g. `cargoHelperFunctionsHook`): Nix refuses to
+/// *substitute* these and insists on building them, so under a strictly
+/// substitute-only (`max-jobs = 0`) guest they are unrealisable and the warm
+/// fails even when every other path substitutes fine. Their inputs are
+/// themselves substitutable, so building them needs no egress.
+///
+/// This deliberately widens the warm envelope from "substitute only" to
+/// "substitute, plus build anything that has no substituter". Substitution is
+/// still always preferred, and `fallback` stays `false` so a *failed*
+/// substitution (a substituter that has the path but errors) is a hard error
+/// rather than a from-source rebuild. But a path with *no* substituter — a
+/// local package or `runCommand` in the devShell — will now build locally
+/// during warm rather than failing fast. That residual is bounded by the
+/// no-egress sandbox (any build needing to fetch sources/FODs still fails) and
+/// by the workspace-bootstrap timeout; `builders` stays empty so no work is
+/// offloaded. A guest that must never run flake build code needs the closure
+/// pre-realised in an egress builder (the deferred egress-VM provisioner)
+/// instead, which is a separate, larger change.
+///
+/// Kept at 1 to bound the work and keep guest resource use predictable.
+const GUEST_DEVSHELL_WARM_MAX_JOBS: &str = "1";
+
 pub fn nix_develop_command_args(attr: &str) -> Vec<String> {
     vec![
         "--option".to_string(),
@@ -35,7 +60,7 @@ pub fn nix_develop_command_args(attr: &str) -> Vec<String> {
         String::new(),
         "--option".to_string(),
         "max-jobs".to_string(),
-        "0".to_string(),
+        GUEST_DEVSHELL_WARM_MAX_JOBS.to_string(),
         "--option".to_string(),
         "fallback".to_string(),
         "false".to_string(),
@@ -1831,7 +1856,7 @@ mod tests {
     }
 
     #[test]
-    fn nix_develop_command_args_pin_no_build_no_lockfile_envelope() {
+    fn nix_develop_command_args_pin_bounded_build_no_lockfile_envelope() {
         assert_eq!(
             nix_develop_command_args(DEFAULT_DEVSHELL_ATTR),
             vec![
@@ -1840,7 +1865,7 @@ mod tests {
                 "",
                 "--option",
                 "max-jobs",
-                "0",
+                GUEST_DEVSHELL_WARM_MAX_JOBS,
                 "--option",
                 "fallback",
                 "false",
@@ -1850,5 +1875,41 @@ mod tests {
                 "--command",
             ]
         );
+    }
+
+    /// Extract the `--option <key> <value>` pairs from the leading run of the
+    /// arg vector (before the `develop` subcommand).
+    fn nix_develop_options(attr: &str) -> std::collections::HashMap<String, String> {
+        let args = nix_develop_command_args(attr);
+        let develop = args.iter().position(|a| a == "develop").unwrap();
+        let mut options = std::collections::HashMap::new();
+        let mut i = 0;
+        while i < develop {
+            assert_eq!(args[i], "--option", "non-option arg before `develop`");
+            options.insert(args[i + 1].clone(), args[i + 2].clone());
+            i += 3;
+        }
+        options
+    }
+
+    #[test]
+    fn nix_develop_warm_substitutes_first_but_permits_bounded_local_build() {
+        let options = nix_develop_options(DEFAULT_DEVSHELL_ATTR);
+
+        // No remote builders, and a failed *substitution* is a hard error
+        // rather than a from-source rebuild (which could need egress).
+        assert_eq!(options.get("builders").map(String::as_str), Some(""));
+        assert_eq!(options.get("fallback").map(String::as_str), Some("false"));
+
+        // `max-jobs` must be non-zero so the guest can locally realise the
+        // handful of `allowSubstitutes = false` / `preferLocalBuild` setup-hook
+        // derivations (e.g. `cargoHelperFunctionsHook`) that Nix refuses to
+        // substitute. At zero, those are unrealisable and the warm fails.
+        let max_jobs: u32 = options
+            .get("max-jobs")
+            .expect("max-jobs option is set")
+            .parse()
+            .expect("max-jobs is an integer");
+        assert!(max_jobs > 0, "max-jobs must be non-zero, got {max_jobs}");
     }
 }

@@ -1263,16 +1263,24 @@ First workspace bootstrap slice implemented in `src/protocol.rs`,
   credentials, and the resulting `origin` URL is not usable authority without a
   later brokered fetch/push operation;
 - `sources` warmup runs Nix flake metadata refresh with lockfile writes
-  disabled. `devshell` warmup additionally runs
-  `nix develop .#default --command true`. Both use the daemon-injected brokered
-  Nix cache configuration and pass Nix options intended to avoid local or remote
-  builds (`builders =`, `max-jobs = 0`, `fallback = false`), so startup fails
-  visibly if the devshell closure is not available from configured
-  substituters. The flake feature is enabled only in the workspace bootstrap
-  wrapper; non-workspace VM sessions keep the narrower Nix setup. This is
-  source/substitute prefetching only: the daemon does not run `cargo build`,
-  `nix build`, or other repository build commands as part of first-version
-  bootstrap;
+  disabled, under a strictly substitute-only envelope (`builders =`,
+  `max-jobs = 0`, `fallback = false`) — metadata builds nothing. `devshell`
+  warmup additionally runs `nix develop .#default --command true` under the same
+  envelope except `max-jobs = 1`. That deliberately widens the devshell envelope
+  from "substitute only" to "substitute, plus build anything with no
+  substituter": substitution is still always preferred and `fallback` stays
+  `false` (a *failed* substitution is a hard error, not a from-source rebuild),
+  but `allowSubstitutes = false` / `preferLocalBuild` setup-hook derivations
+  (e.g. `cargoHelperFunctionsHook`) Nix refuses to substitute — and any local
+  package or `runCommand` in the devshell — now build locally rather than
+  failing the warm. `builders` stays empty so nothing is offloaded, and the
+  no-egress sandbox still fails any build that must fetch sources/FODs. Both use
+  the daemon-injected brokered Nix cache configuration, so startup fails visibly
+  if the devshell closure is not realisable from configured substituters plus
+  those bounded local builds. The flake feature is enabled only in the workspace
+  bootstrap wrapper; non-workspace VM sessions keep the narrower Nix setup. The
+  daemon still does not run `cargo build`, `nix build`, or other repository
+  build commands as an explicit first-version bootstrap step;
 - Cargo dependency-source prefetching remains deliberately outside this first
   slice. A generic Rust workspace can require crates.io or Git dependency
   network access after the devshell starts, and the VM has no general outbound
@@ -1312,11 +1320,11 @@ First agent-runner UX slice implemented in `src/bin/writ.rs`:
   captures stdout/stderr into private per-run files, and uploads the run
   outcome metadata plus retained stream bytes back to the broker. With the
   default `--warm devshell`, the command is executed through the same
-  no-build/no-lockfile envelope as workspace devshell warmup:
+  bounded-build/no-lockfile envelope as workspace devshell warmup:
 
   ```text
   nix --option builders "" \
-    --option max-jobs 0 \
+    --option max-jobs 1 \
     --option fallback false \
     develop --no-write-lock-file .#default \
     --command writ-vm agent run --run-id <run-id> --agent <agent>

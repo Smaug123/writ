@@ -127,12 +127,15 @@ into the VM.
 fails before launching an agent process.
 
 With the default `--warm devshell`, the adapter is executed inside the default
-devshell with the same no-build/no-lockfile envelope used by workspace
-devshell warmup:
+devshell with the same bounded-build/no-lockfile envelope used by workspace
+devshell warmup — substitution is preferred (`fallback` stays `false`, so a
+failed substitution is a hard error), but `max-jobs = 1` lets the handful of
+un-substitutable setup-hook derivations build locally rather than failing the
+warm; `builders` stays empty so nothing is offloaded:
 
 ```text
 nix --option builders "" \
-  --option max-jobs 0 \
+  --option max-jobs 1 \
   --option fallback false \
   develop --no-write-lock-file .#default \
   --command writ-vm agent run --run-id <uuid> --agent <agent>

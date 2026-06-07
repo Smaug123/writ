@@ -44,6 +44,49 @@ fn guest_nix_setup_script_writes_configured_trusted_public_keys() {
 }
 
 #[test]
+fn guest_nix_conf_disables_build_users_group_for_single_user_root_store() {
+    // The guest runs Nix as root in a single-user, root-owned store with no
+    // `nixbld` build-users group. Nix defaults `build-users-group` to `nixbld`
+    // exactly when euid is 0, so any *local* build (which the `nix develop`
+    // warm now permits under `max-jobs = 1`) fails with "the group 'nixbld'
+    // ... does not exist". The guest nix.conf must pin `build-users-group =`
+    // empty so Nix builds as the calling user (root) rather than switching to
+    // a non-existent build user. Asserted on both guest scripts via the shared
+    // prologue, so this covers the warm and the agent run alike.
+    let dir = tempfile::tempdir().unwrap();
+    let netrc = dir.path().join("run").join("netrc");
+    let nix_conf_dir = dir.path().join("nix-conf");
+
+    let status = Command::new("sh")
+        .arg("-c")
+        .arg(nix_setup_script())
+        .arg("writ-agent-vm-nix-setup")
+        .arg("true")
+        .env("WRIT_BROKER_TOKEN", "writ-vm-token")
+        .env(
+            "WRIT_NIX_CACHE_URL",
+            "http://192.168.252.1:51375/v1/nix/cache",
+        )
+        .env("WRIT_NIX_BASIC_LOGIN", VM_NIX_BASIC_LOGIN)
+        .env("WRIT_NIX_NETRC", &netrc)
+        .env(AGENT_VM_NIX_TRUSTED_PUBLIC_KEYS_ENV, "")
+        .env("NIX_CONF_DIR", &nix_conf_dir)
+        .status()
+        .unwrap();
+
+    assert!(status.success());
+    let nix_conf = fs::read_to_string(nix_conf_dir.join("nix.conf")).unwrap();
+    assert!(
+        nix_conf.contains("build-users-group =\n"),
+        "nix.conf must pin build-users-group empty to build as the calling user; got:\n{nix_conf}"
+    );
+    assert!(
+        !nix_conf.contains("build-users-group = nixbld"),
+        "nix.conf must not point build-users-group at the non-existent nixbld group; got:\n{nix_conf}"
+    );
+}
+
+#[test]
 fn non_workspace_nix_setup_does_not_enable_flakes() {
     assert!(nix_setup_script().contains("experimental-features = nix-command"));
     assert!(!nix_setup_script().contains("nix-command flakes"));
@@ -142,6 +185,7 @@ fn both_guest_scripts_share_the_nix_prologue() {
     for shared in [
         r#": "${WRIT_BROKER_TOKEN:?}""#,
         r#"  "$cache_host" "$WRIT_NIX_BASIC_LOGIN" "$WRIT_BROKER_TOKEN" > "$WRIT_NIX_NETRC""#,
+        r#"printf 'build-users-group =\n'"#,
         r#"printf 'trusted-public-keys = %s\n' "$WRIT_NIX_TRUSTED_PUBLIC_KEYS""#,
         r#"} > "$NIX_CONF_DIR/nix.conf""#,
     ] {
