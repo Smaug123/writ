@@ -20,7 +20,9 @@ use crate::vm_git_bundle::{
     GitCloneBundleSource, GitCredentialBoundary, GitSecretValue, GitSecretValueError,
     run_git_clone_bundle,
 };
-use crate::vm_git_mirror_cache::{GitCommitSha, MirrorCache, MirrorCacheKey};
+use crate::vm_git_mirror_cache::{
+    GitCommitSha, MirrorCache, MirrorCacheBounds, MirrorCacheKey, MirrorPins,
+};
 
 use super::{VmHttpRequest, VmHttpResponse, VmHttpSession, VmHttpStatus};
 
@@ -42,6 +44,10 @@ pub struct VmHttpGitCloneConfig {
     /// being discarded. `None` keeps the historical behaviour: the work dir,
     /// mirror and all, is removed once the bundle is read.
     mirror_cache: Option<MirrorCache>,
+    /// Size budget the retained mirror cache is held under by an opportunistic
+    /// eviction pass after each retain. Only meaningful when `mirror_cache` is
+    /// set; `None` leaves the cache unbounded.
+    mirror_gc_bounds: Option<MirrorCacheBounds>,
 }
 
 impl<S: SecretStore> VmHttpGitCloneService<S> {
@@ -118,6 +124,7 @@ impl VmHttpGitCloneConfig {
             timeout,
             max_bundle_bytes,
             mirror_cache: None,
+            mirror_gc_bounds: None,
         })
     }
 
@@ -128,8 +135,19 @@ impl VmHttpGitCloneConfig {
         self
     }
 
+    /// Bound the retained mirror cache: after each retain, an eviction pass
+    /// holds it under `bounds`. Only has effect alongside [`Self::with_mirror_cache`].
+    pub fn with_mirror_gc_bounds(mut self, bounds: Option<MirrorCacheBounds>) -> Self {
+        self.mirror_gc_bounds = bounds;
+        self
+    }
+
     pub fn mirror_cache(&self) -> Option<&MirrorCache> {
         self.mirror_cache.as_ref()
+    }
+
+    pub fn mirror_gc_bounds(&self) -> Option<MirrorCacheBounds> {
+        self.mirror_gc_bounds
     }
 
     pub fn work_root(&self) -> &Path {
@@ -233,7 +251,15 @@ async fn handle_git_clone_request<S: SecretStore + Send + Sync>(
         }
     };
 
-    match run_git_clone_bundle_and_read(&plan, &secret, service.config.mirror_cache()).await {
+    match run_git_clone_bundle_and_read(
+        &plan,
+        &secret,
+        service.config.mirror_cache(),
+        &service.broker_state.mirror_pins,
+        service.config.mirror_gc_bounds(),
+    )
+    .await
+    {
         Ok(bundle) => VmHttpResponse {
             status: VmHttpStatus::Ok,
             content_type: GIT_BUNDLE_CONTENT_TYPE,
@@ -291,12 +317,19 @@ fn git_clone_token_from_capability_outcome(
     }
 }
 
-/// Retain a freshly-cloned bare mirror in the `(repo, rev)` cache, best-effort.
+/// Retain a freshly-cloned bare mirror in the `(repo, rev)` cache, best-effort,
+/// then run a bounded eviction pass so the cache cannot grow without limit.
 /// Resolves the commit the requested ref points to, then moves the mirror into
 /// the cache under that key. Any failure (rev resolution or the move) is logged
 /// and swallowed: retention is an optimisation for later provisioning, never a
-/// precondition for returning the bundle.
-async fn retain_clone_mirror(plan: &GitCloneBundlePlan, cache: &MirrorCache) {
+/// precondition for returning the bundle. Eviction skips entries an in-flight
+/// provision has pinned (via `pins`), so it never deletes a mirror mid-clone.
+async fn retain_clone_mirror(
+    plan: &GitCloneBundlePlan,
+    cache: &MirrorCache,
+    pins: &MirrorPins,
+    gc_bounds: Option<MirrorCacheBounds>,
+) {
     let rev = match resolve_mirror_rev(plan).await {
         Ok(rev) => rev,
         Err(err) => {
@@ -305,12 +338,32 @@ async fn retain_clone_mirror(plan: &GitCloneBundlePlan, cache: &MirrorCache) {
         }
     };
     let key = MirrorCacheKey::new(plan.request().repo().as_repo_ref(), &rev);
-    // `MirrorCache::insert` is synchronous filesystem work; move it off the
-    // async runtime. The cache is cheap to clone (just a path).
+    // `insert` and `evict_to_bounds` are synchronous filesystem work; run both
+    // off the async runtime in one task. The cache and pins are cheap to clone
+    // (a path and an `Arc`).
     let cache = cache.clone();
+    let pins = pins.clone();
     let mirror = plan.mirror_dir().to_path_buf();
-    match tokio::task::spawn_blocking(move || cache.insert(&key, &mirror)).await {
-        Ok(Ok(outcome)) => tracing::debug!(?outcome, "retained clone mirror for provisioning"),
+    let result = tokio::task::spawn_blocking(move || {
+        let insertion = cache.insert(&key, &mirror)?;
+        let eviction = gc_bounds.map(|bounds| cache.evict_to_bounds(&pins, bounds));
+        Ok::<_, std::io::Error>((insertion, eviction))
+    })
+    .await;
+    match result {
+        Ok(Ok((insertion, eviction))) => {
+            tracing::debug!(?insertion, "retained clone mirror for provisioning");
+            if let Some(eviction) = eviction
+                && (eviction.evicted > 0 || eviction.retained_pinned > 0)
+            {
+                tracing::debug!(
+                    evicted = eviction.evicted,
+                    bytes_freed = eviction.bytes_freed,
+                    retained_pinned = eviction.retained_pinned,
+                    "mirror cache eviction pass",
+                );
+            }
+        }
         Ok(Err(err)) => tracing::warn!(error = %err, "clone mirror cache insert failed"),
         Err(err) => tracing::warn!(error = %err, "clone mirror cache insert task failed"),
     }
@@ -351,6 +404,8 @@ async fn run_git_clone_bundle_and_read(
     plan: &GitCloneBundlePlan,
     secret: &GitSecretValue,
     mirror_cache: Option<&MirrorCache>,
+    mirror_pins: &MirrorPins,
+    mirror_gc_bounds: Option<MirrorCacheBounds>,
 ) -> Result<Vec<u8>, String> {
     prepare_git_work_root(plan.work_dir().parent().ok_or_else(|| {
         format!(
@@ -383,7 +438,7 @@ async fn run_git_clone_bundle_and_read(
     if run_result.is_ok()
         && let Some(cache) = mirror_cache
     {
-        retain_clone_mirror(plan, cache).await;
+        retain_clone_mirror(plan, cache, mirror_pins, mirror_gc_bounds).await;
     }
 
     let cleanup_result = match tokio::fs::remove_dir_all(&work_dir).await {

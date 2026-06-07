@@ -44,6 +44,7 @@ use crate::run_envelope::{OutputEnvelope, SignedRunEnvelope};
 use crate::secret::SecretStore;
 use crate::signing::WritSigningKey;
 use crate::vm_git_bundle::GitSecretValue;
+use crate::vm_git_mirror_cache::MirrorPins;
 
 /// Boot-time description of the child process that produces an agent
 /// run's stdout. Pure data — dispatch reads `command` and `args`,
@@ -92,6 +93,11 @@ pub struct BrokerState<S: SecretStore> {
     pub signing_key: Option<WritSigningKey>,
     pub run_agent_spawn: Option<RunAgentSpawnConfig>,
     pub promote_runtime: Option<Arc<PromoteRuntimeConfig>>,
+    /// Broker-wide registry pinning `(repo, rev)` mirror entries that an
+    /// in-flight flake-input provision is materialising, so the clone handler's
+    /// opportunistic eviction never deletes a mirror out from under a running
+    /// `git clone --local`. Shared (cheap `Arc` clone) across every session.
+    pub mirror_pins: MirrorPins,
 }
 
 #[derive(Clone, Eq, PartialEq)]

@@ -1707,6 +1707,7 @@ mod tests {
             signing_key: None,
             run_agent_spawn: None,
             promote_runtime: None,
+            mirror_pins: crate::vm_git_mirror_cache::MirrorPins::new(),
         })
     }
 
