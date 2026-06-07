@@ -92,6 +92,7 @@ printf 'machine %s login %s password %s\n' \
 ///   * the agent runs inside the same `nix develop` wrapper as root, holds the
 ///     broker token in its environment, and can trigger its own builds at the
 ///     default non-zero `max-jobs`, all reading the same persistent netrc.
+///
 /// `max-jobs = 1` only moves a malicious devShell build slightly earlier (warm
 /// vs. the agent's own devShell entry); the root/token/netrc access is
 /// identical either way. Sandboxing only the warm build would close no door the
