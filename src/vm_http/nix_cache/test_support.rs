@@ -141,6 +141,30 @@ pub(super) fn nix_cache_service_with_local_cache(
     )
 }
 
+/// A local-archive service that also trusts `trusted_keys`, so the local path
+/// can admit a *signed* input-addressed narinfo (a pre-warmed devShell-closure
+/// path), not only a self-certifying content-addressed one.
+pub(super) fn nix_cache_service_with_local_cache_and_trusted_keys(
+    state: &Arc<BrokerState<Box<dyn SecretStore>>>,
+    upstream_url: &str,
+    cache_dir: &std::path::Path,
+    trusted_keys: NixTrustedPublicKeys,
+    max_metadata_bytes: u64,
+    max_nar_bytes: u64,
+) -> VmHttpNixCacheService<Box<dyn SecretStore>> {
+    VmHttpNixCacheService::new(
+        Arc::clone(state),
+        VmHttpNixCacheConfig::new_with_trusted_public_keys(
+            upstream_url,
+            max_metadata_bytes,
+            max_nar_bytes,
+            trusted_keys,
+        )
+        .unwrap()
+        .with_local_cache_dir(Some(cache_dir.to_path_buf())),
+    )
+}
+
 pub(super) fn test_ed25519_key_pair() -> ring::signature::Ed25519KeyPair {
     ring::signature::Ed25519KeyPair::from_seed_unchecked(&[7_u8; 32]).unwrap()
 }
@@ -274,6 +298,43 @@ pub(super) async fn route_nix_cache_with_service(
     )
     .await
     .into_buffered()
+}
+
+/// Write a pre-warm-style local entry: a *signed*, **input-addressed** narinfo
+/// (no `CA` field at all — exactly what a compiled devShell-closure path is,
+/// unlike a self-certifying flake input) signed by `key_pair` under
+/// [`TEST_SIGNING_KEY_NAME`], plus the xz-compressed NAR at `nar/<file>`. The
+/// store hash is the caller's (input-addressed paths are not content-derived).
+/// Returns the narinfo and compressed-NAR bytes the served responses must
+/// match. Trust the key with `trusted_public_key_for_test(TEST_SIGNING_KEY_NAME,
+/// key_pair)`.
+pub(super) fn write_local_signed_entry(
+    cache_dir: &std::path::Path,
+    key_pair: &ring::signature::Ed25519KeyPair,
+    store_hash: &str,
+    store_name: &str,
+    nar_file: &str,
+    raw_body: &[u8],
+) -> (Vec<u8>, Vec<u8>) {
+    let compressed = xz_nar_body_for(raw_body);
+    let nar_hash = nar_hash_for_body(raw_body);
+    let narinfo = signed_test_narinfo(
+        key_pair,
+        store_hash,
+        store_name,
+        nar_file,
+        NixNarCompression::Xz,
+        &nar_hash,
+        raw_body.len() as u64,
+    );
+    std::fs::create_dir_all(cache_dir.join("nar")).unwrap();
+    std::fs::write(
+        cache_dir.join(format!("{store_hash}.narinfo")),
+        narinfo.as_bytes(),
+    )
+    .unwrap();
+    std::fs::write(cache_dir.join("nar").join(nar_file), &compressed).unwrap();
+    (narinfo.into_bytes(), compressed)
 }
 
 /// Write a `nix flake archive`-style local entry: an unsigned narinfo whose

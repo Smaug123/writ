@@ -985,6 +985,66 @@ pub fn parse_content_addressed_narinfo_for_store_hash(
     Ok(narinfo)
 }
 
+/// Why a narinfo from the broker's *local* archive was not admissible for
+/// serving. The local path admits a narinfo iff it is self-certifying
+/// (content-addressed; see [`parse_content_addressed_narinfo_for_store_hash`])
+/// *or* signed by a key the broker trusts — the latter being how a pre-warmed
+/// devShell closure's input-addressed outputs, which are not self-certifying,
+/// are served.
+#[derive(Debug, thiserror::Error, Eq, PartialEq)]
+pub enum NixLocalNarInfoError {
+    /// The narinfo is malformed independently of how it would be admitted (a bad
+    /// field, or a StorePath hash that does not match the requested hash). This
+    /// is terminal: a signature can never rescue a broken or mislabelled file.
+    #[error(transparent)]
+    Malformed(NixNarInfoError),
+    /// The narinfo is well-formed for the requested hash but admissible as
+    /// neither self-certifying nor trusted-signed: it carries no usable content
+    /// address and no signature by a trusted key. The inner error is the
+    /// signature-verification failure (missing / untrusted / mismatched).
+    #[error("local narinfo is neither self-certifying nor signed by a trusted key: {0}")]
+    UntrustedOrUnsigned(NixNarInfoError),
+}
+
+/// Admit a narinfo from the broker's *local* archive for serving iff it is
+/// self-certifying **or** signed by a trusted key.
+///
+/// Content-addressing is tried first: it needs no key and is exactly what `nix
+/// flake archive` writes for flake inputs. A well-formed-but-not-self-certifying
+/// narinfo (no `CA`, or a `CA` that does not certify it) then falls back to
+/// signature verification against `trusted_public_keys`, admitting a pre-warmed,
+/// human-signed closure path whose input-addressed outputs are not
+/// self-certifying. A *malformed* narinfo, or one whose StorePath hash does not
+/// match `expected`, is terminal and never reaches the signature check.
+///
+/// This is only the broker half of the check: the guest re-verifies the served
+/// narinfo's signature against its own `trusted-public-keys`, so a path the
+/// broker admits by signature is still rejected by the guest unless the guest
+/// trusts the same key.
+pub fn parse_local_admissible_narinfo_for_store_hash(
+    bytes: &[u8],
+    expected: &NixStoreHashPart,
+    trusted_public_keys: &NixTrustedPublicKeys,
+) -> Result<NixNarInfo, NixLocalNarInfoError> {
+    match parse_content_addressed_narinfo_for_store_hash(bytes, expected) {
+        Ok(narinfo) => Ok(narinfo),
+        // Malformed / wrong-hash: terminal. Do not mask it with a signature
+        // attempt that would re-parse the same broken bytes.
+        Err(NixContentAddressedNarInfoError::NarInfo(err)) => {
+            Err(NixLocalNarInfoError::Malformed(err))
+        }
+        // Well-formed but not self-certifying (no CA, a non-self-certifying CA,
+        // or a CA whose store path is not content-derived): admit iff a trusted
+        // key signed it.
+        Err(
+            NixContentAddressedNarInfoError::MissingContentAddress
+            | NixContentAddressedNarInfoError::NotSelfCertifying { .. }
+            | NixContentAddressedNarInfoError::StorePathNotContentDerived { .. },
+        ) => parse_signed_narinfo_for_store_hash(bytes, expected, trusted_public_keys)
+            .map_err(NixLocalNarInfoError::UntrustedOrUnsigned),
+    }
+}
+
 pub fn verify_narinfo_signature(
     narinfo: &NixNarInfo,
     trusted_public_keys: &NixTrustedPublicKeys,
@@ -2393,6 +2453,128 @@ mod tests {
         );
     }
 
+    /// Drop the `CA:` line from a narinfo. The narinfo signature fingerprint is
+    /// `1;StorePath;NarHash;NarSize;References` — it does not cover `CA` — so a
+    /// signed narinfo stays validly signed after its CA is removed, yielding a
+    /// genuinely input-addressed (no-CA) signed narinfo like a devShell output.
+    fn strip_ca_line(narinfo: &str) -> String {
+        narinfo
+            .lines()
+            .filter(|line| !line.starts_with("CA:"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn local_admissible_admits_self_certifying_ca_with_no_trusted_keys() {
+        // The content-addressed path needs no key: a flake-archive narinfo is
+        // admitted even when the broker trusts nothing.
+        let expected = NixStoreHashPart::new(ARCHIVE_CA_STORE_HASH).unwrap();
+        let parsed = parse_local_admissible_narinfo_for_store_hash(
+            ARCHIVE_CA_NARINFO.as_bytes(),
+            &expected,
+            &NixTrustedPublicKeys::empty(),
+        )
+        .unwrap();
+        assert_eq!(parsed.store_path().hash().as_str(), ARCHIVE_CA_STORE_HASH);
+        assert!(parsed.signatures().is_empty());
+    }
+
+    #[test]
+    fn local_admissible_admits_trusted_signed_input_addressed() {
+        // A genuinely input-addressed path: TEST_SIGNED_NARINFO with its CA line
+        // removed. Admitted via the signature because its key is trusted — this
+        // is the pre-warmed devShell-output case PW1 enables.
+        let raw = strip_ca_line(TEST_SIGNED_NARINFO);
+        let expected = NixStoreHashPart::new("rzv95bakh41zrn5ji23pfc11x5vq2z4d").unwrap();
+        let trusted = NixTrustedPublicKeys::from_strings([TEST_PUBLIC_KEY]).unwrap();
+        let parsed =
+            parse_local_admissible_narinfo_for_store_hash(raw.as_bytes(), &expected, &trusted)
+                .unwrap();
+        assert_eq!(parsed.signatures().len(), 1);
+    }
+
+    #[test]
+    fn local_admissible_admits_trusted_signed_with_non_self_certifying_ca() {
+        // TEST_SIGNED_NARINFO carries a *flat* `fixed:sha256:` CA (not
+        // self-certifying), so the content-addressed path refuses it; the
+        // signature path admits it when the key is trusted.
+        let expected = NixStoreHashPart::new("rzv95bakh41zrn5ji23pfc11x5vq2z4d").unwrap();
+        let trusted = NixTrustedPublicKeys::from_strings([TEST_PUBLIC_KEY]).unwrap();
+        assert!(
+            parse_local_admissible_narinfo_for_store_hash(
+                TEST_SIGNED_NARINFO.as_bytes(),
+                &expected,
+                &trusted,
+            )
+            .is_ok(),
+        );
+    }
+
+    #[test]
+    fn local_admissible_refuses_signed_path_with_untrusted_key() {
+        // Same input-addressed signed path, but the broker trusts no key: refused.
+        let raw = strip_ca_line(TEST_SIGNED_NARINFO);
+        let expected = NixStoreHashPart::new("rzv95bakh41zrn5ji23pfc11x5vq2z4d").unwrap();
+        assert_eq!(
+            parse_local_admissible_narinfo_for_store_hash(
+                raw.as_bytes(),
+                &expected,
+                &NixTrustedPublicKeys::empty(),
+            ),
+            Err(NixLocalNarInfoError::UntrustedOrUnsigned(
+                NixNarInfoError::UntrustedSignatureKey
+            )),
+        );
+    }
+
+    #[test]
+    fn local_admissible_refuses_unsigned_non_self_certifying() {
+        // No CA and no Sig: admissible by neither path, even with a trusted key
+        // configured.
+        let hash = "00000000000000000000000000000000";
+        let expected = NixStoreHashPart::new(hash).unwrap();
+        let nar_digest = nar_digest_for_body(b"unsigned input-addressed");
+        let raw = format!(
+            "StorePath: /nix/store/{hash}-out\nURL: nar/x.nar.xz\nCompression: xz\nNarHash: sha256:{nar_digest}\nNarSize: 24\nReferences: \n"
+        );
+        let trusted = NixTrustedPublicKeys::from_strings([TEST_PUBLIC_KEY]).unwrap();
+        assert_eq!(
+            parse_local_admissible_narinfo_for_store_hash(raw.as_bytes(), &expected, &trusted),
+            Err(NixLocalNarInfoError::UntrustedOrUnsigned(
+                NixNarInfoError::MissingSignature
+            )),
+        );
+    }
+
+    #[test]
+    fn local_admissible_propagates_malformation_terminally() {
+        let expected = NixStoreHashPart::new("00000000000000000000000000000000").unwrap();
+        let trusted = NixTrustedPublicKeys::from_strings([TEST_PUBLIC_KEY]).unwrap();
+        // A signed narinfo for a *different* store hash than requested: a
+        // mislabelled file is terminal — never rescued by its (valid) signature.
+        let wrong_hash = strip_ca_line(TEST_SIGNED_NARINFO);
+        assert!(matches!(
+            parse_local_admissible_narinfo_for_store_hash(
+                wrong_hash.as_bytes(),
+                &expected,
+                &trusted
+            ),
+            Err(NixLocalNarInfoError::Malformed(
+                NixNarInfoError::StorePathHashMismatch { .. }
+            )),
+        ));
+        // A missing required field is terminal regardless of trust.
+        let digest = ARCHIVE_CA_NAR_DIGEST;
+        let no_url = format!(
+            "StorePath: /nix/store/00000000000000000000000000000000-out\nCompression: xz\nNarHash: sha256:{digest}\nNarSize: 2440\nReferences: \n"
+        );
+        assert_eq!(
+            parse_local_admissible_narinfo_for_store_hash(no_url.as_bytes(), &expected, &trusted),
+            Err(NixLocalNarInfoError::Malformed(NixNarInfoError::MissingUrl)),
+        );
+    }
+
     proptest! {
         /// The admission oracle: an archive-style narinfo is admitted as
         /// content-addressed *iff* its recursive-SHA256 CA digest equals the
@@ -2450,6 +2632,23 @@ mod tests {
         ) {
             let expected = NixStoreHashPart::new(hash).unwrap();
             let _ = parse_content_addressed_narinfo_for_store_hash(&bytes, &expected);
+        }
+
+        /// The local-admission parser never panics on arbitrary bytes / keys,
+        /// and — crucially — admitting it never *weakens* the content-addressed
+        /// parser: whatever the CA parser admits, the local parser admits too
+        /// (the signature path only ever adds, never removes, admissions).
+        #[test]
+        fn local_admissible_parser_is_total_and_a_superset_of_ca(
+            bytes in prop::collection::vec(any::<u8>(), 0..4096),
+            hash in valid_store_hash_part(),
+        ) {
+            let expected = NixStoreHashPart::new(hash).unwrap();
+            let trusted = NixTrustedPublicKeys::from_strings([TEST_PUBLIC_KEY]).unwrap();
+            let local = parse_local_admissible_narinfo_for_store_hash(&bytes, &expected, &trusted);
+            if parse_content_addressed_narinfo_for_store_hash(&bytes, &expected).is_ok() {
+                prop_assert!(local.is_ok(), "CA-admitted narinfo must stay admitted: {local:?}");
+            }
         }
     }
 }

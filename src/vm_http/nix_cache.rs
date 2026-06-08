@@ -18,8 +18,8 @@ use crate::audit::{
 };
 use crate::core::{RequestId, UnixMillis};
 use crate::nix_cache::{
-    NixCacheNarFileName, NixContentAddressedNarInfoError, NixNarBodyHashError, NixNarInfo,
-    NixNarInfoError, NixStoreHashPart, parse_content_addressed_narinfo_for_store_hash,
+    NixCacheNarFileName, NixLocalNarInfoError, NixNarBodyHashError, NixNarInfo, NixNarInfoError,
+    NixStoreHashPart, parse_local_admissible_narinfo_for_store_hash,
     parse_signed_narinfo_for_store_hash,
 };
 use crate::secret::SecretStore;
@@ -682,15 +682,19 @@ impl<S: SecretStore> VmHttpNixCacheService<S> {
         false
     }
 
-    /// Serve a narinfo from the broker's local flake-input archive, local-first.
+    /// Serve a narinfo from the broker's local archive, local-first.
     ///
-    /// `Some` means the request was handled locally: either the
-    /// content-addressed narinfo was served (and its NAR admitted), or a
-    /// present-but-uncertifiable / oversized / unreadable local file failed
-    /// closed. `None` means there is no local cache or no file for this hash, so
-    /// the caller proxies the upstream exactly as before. A present file is
-    /// authoritative — we never silently fall through to the upstream for it,
-    /// because the upstream cannot hold these CA input-source paths anyway.
+    /// A local narinfo is admitted if it is self-certifying (a content-addressed
+    /// flake input) **or** signed by a trusted key (a pre-warmed devShell-closure
+    /// path, whose input-addressed outputs are not self-certifying).
+    ///
+    /// `Some` means the request was handled locally: either an admissible narinfo
+    /// was served (and its NAR admitted), or a present-but-inadmissible /
+    /// oversized / unreadable local file failed closed. `None` means there is no
+    /// local cache or no file for this hash, so the caller proxies the upstream
+    /// exactly as before. A present file is authoritative — we never silently
+    /// fall through to the upstream for it, because the upstream cannot hold
+    /// these locally-provisioned paths anyway.
     async fn try_serve_local_narinfo(
         &self,
         method: &str,
@@ -714,7 +718,11 @@ impl<S: SecretStore> VmHttpNixCacheService<S> {
             }
             LocalCacheFile::Bytes(bytes) => bytes,
         };
-        let narinfo = match parse_content_addressed_narinfo_for_store_hash(&bytes, hash) {
+        let narinfo = match parse_local_admissible_narinfo_for_store_hash(
+            &bytes,
+            hash,
+            self.config.trusted_public_keys(),
+        ) {
             Ok(narinfo) => narinfo,
             Err(err) => {
                 tracing::warn!(
@@ -722,7 +730,7 @@ impl<S: SecretStore> VmHttpNixCacheService<S> {
                     error = %err,
                     "vm http nix cache local narinfo was refused",
                 );
-                return Some(local_failure(local_url, local_ca_narinfo_error_label(&err)));
+                return Some(local_failure(local_url, local_narinfo_error_label(&err)));
             }
         };
         if let Err(err) = self.admit_narinfo(&narinfo, VmNixCacheNarSource::Local) {
@@ -745,9 +753,10 @@ impl<S: SecretStore> VmHttpNixCacheService<S> {
                 response,
             });
         }
-        // Serve the narinfo bytes verbatim — including the self-certifying CA —
-        // so the guest accepts the path unsigned, exactly as it would from a
-        // local `file://` substituter.
+        // Serve the narinfo bytes verbatim — including the self-certifying CA or
+        // the Sig line — so the guest accepts the path exactly as it would from a
+        // local `file://` substituter: a CA path unsigned, a signed path after
+        // re-verifying the signature against its own trusted keys.
         let response_bytes = bytes.len() as u64;
         Some(VmHttpNixCacheProxyFetch {
             upstream_url: local_url,
@@ -1046,17 +1055,15 @@ fn local_failure(upstream_url: String, error: &'static str) -> VmHttpNixCachePro
     }
 }
 
-fn local_ca_narinfo_error_label(err: &NixContentAddressedNarInfoError) -> &'static str {
+fn local_narinfo_error_label(err: &NixLocalNarInfoError) -> &'static str {
     match err {
-        NixContentAddressedNarInfoError::NarInfo(err) => narinfo_audit_error_label(err),
-        NixContentAddressedNarInfoError::MissingContentAddress => {
-            "local narinfo missing content address"
-        }
-        NixContentAddressedNarInfoError::NotSelfCertifying { .. } => {
-            "local narinfo not self-certifying"
-        }
-        NixContentAddressedNarInfoError::StorePathNotContentDerived { .. } => {
-            "local narinfo store path not content-derived"
+        // A genuinely malformed / mislabelled local file: reuse the field-level
+        // narinfo labels (the "upstream" wording is the shared label set).
+        NixLocalNarInfoError::Malformed(err) => narinfo_audit_error_label(err),
+        // Well-formed but admissible as neither self-certifying nor
+        // trusted-signed (no usable CA, and no signature by a trusted key).
+        NixLocalNarInfoError::UntrustedOrUnsigned(_) => {
+            "local narinfo neither self-certifying nor trusted-signed"
         }
     }
 }
