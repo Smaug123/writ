@@ -179,6 +179,145 @@ async fn local_cache_miss_falls_through_to_signed_upstream() {
 }
 
 #[tokio::test]
+async fn local_signed_input_addressed_narinfo_and_nar_are_served_with_trusted_key() {
+    // A pre-warmed devShell-closure path: a *signed*, input-addressed narinfo
+    // (no CA field) whose key the broker trusts. The local archive must serve it
+    // local-first, exactly as it serves a self-certifying CA flake input -- this
+    // is the capability PW1 adds on top of FK's CA-only local serving.
+    let upstream = MockServer::start().await;
+    let state = make_broker_state(&upstream);
+    let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+    open_audit_session(&state, session.session_id());
+    let cache = tempfile::tempdir().unwrap();
+    let key_pair = test_ed25519_key_pair();
+    let store_hash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let nar_file = "prewarm-closure.nar.xz";
+    let (narinfo_bytes, compressed) = write_local_signed_entry(
+        cache.path(),
+        &key_pair,
+        store_hash,
+        "writ-prewarm-closure",
+        nar_file,
+        b"a compiled devShell output",
+    );
+    let trusted = NixTrustedPublicKeys::from_strings([trusted_public_key_for_test(
+        TEST_SIGNING_KEY_NAME,
+        &key_pair,
+    )])
+    .unwrap();
+    let service = nix_cache_service_with_local_cache_and_trusted_keys(
+        &state,
+        DEAD_UPSTREAM,
+        cache.path(),
+        trusted,
+        4096,
+        4096,
+    );
+
+    let narinfo_response = route_nix_cache_with_service(
+        &session,
+        "GET",
+        format!("{VM_NIX_CACHE_PATH_PREFIX}/{store_hash}.narinfo"),
+        service.clone(),
+    )
+    .await;
+    let nar_response = route_nix_cache_with_service(
+        &session,
+        "GET",
+        format!("{VM_NIX_CACHE_PATH_PREFIX}/nar/{nar_file}"),
+        service,
+    )
+    .await;
+
+    assert_eq!(narinfo_response.status, VmHttpStatus::Ok);
+    // Served verbatim, Sig line intact, so the guest can verify it independently.
+    assert_eq!(narinfo_response.body, narinfo_bytes);
+    assert_eq!(nar_response.status, VmHttpStatus::Ok);
+    assert_eq!(nar_response.content_type, "application/x-nix-nar");
+    assert_eq!(nar_response.content_length, Some(compressed.len() as u64));
+    assert_eq!(nar_response.body, compressed);
+
+    let entries = state
+        .audit
+        .list_nix_cache_requests_for_session(session.session_id())
+        .unwrap();
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0].route, NixCacheAuditRoute::NarInfo);
+    assert_eq!(entries[0].http_status, Some(200));
+    assert_eq!(entries[0].error, None);
+    assert!(
+        entries[0]
+            .upstream_url
+            .as_deref()
+            .is_some_and(|url| url.starts_with("file://")),
+        "a trusted-signed local narinfo must be served from the local archive, not upstream: {:?}",
+        entries[0].upstream_url,
+    );
+    assert_eq!(entries[1].route, NixCacheAuditRoute::Nar);
+    assert_eq!(entries[1].http_status, Some(200));
+    assert_eq!(entries[1].error, None);
+    assert!(
+        entries[1]
+            .upstream_url
+            .as_deref()
+            .is_some_and(|url| url.starts_with("file://")),
+    );
+}
+
+#[tokio::test]
+async fn local_signed_narinfo_with_untrusted_key_fails_closed() {
+    // The same signed, input-addressed narinfo, but the broker trusts no keys:
+    // it is admissible by neither the CA path (no CA) nor the signature path
+    // (untrusted key), so it fails closed against the dead upstream rather than
+    // serving an unvouched-for path. This is the security gate PW1 rests on.
+    let upstream = MockServer::start().await;
+    let state = make_broker_state(&upstream);
+    let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+    open_audit_session(&state, session.session_id());
+    let cache = tempfile::tempdir().unwrap();
+    let key_pair = test_ed25519_key_pair();
+    let store_hash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    write_local_signed_entry(
+        cache.path(),
+        &key_pair,
+        store_hash,
+        "writ-prewarm-closure",
+        "prewarm-closure.nar.xz",
+        b"a compiled devShell output",
+    );
+    let service = nix_cache_service_with_local_cache_and_trusted_keys(
+        &state,
+        DEAD_UPSTREAM,
+        cache.path(),
+        NixTrustedPublicKeys::empty(),
+        4096,
+        4096,
+    );
+
+    let response = route_nix_cache_with_service(
+        &session,
+        "GET",
+        format!("{VM_NIX_CACHE_PATH_PREFIX}/{store_hash}.narinfo"),
+        service,
+    )
+    .await;
+
+    assert_eq!(response.status, VmHttpStatus::BadGateway);
+    let entries = state
+        .audit
+        .list_nix_cache_requests_for_session(session.session_id())
+        .unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].route, NixCacheAuditRoute::NarInfo);
+    assert_eq!(entries[0].http_status, Some(502));
+    assert_eq!(entries[0].upstream_status, None);
+    assert_eq!(
+        entries[0].error.as_deref(),
+        Some("local narinfo neither self-certifying nor trusted-signed"),
+    );
+}
+
+#[tokio::test]
 async fn local_cache_info_is_served_synthetically_without_upstream() {
     let upstream = MockServer::start().await;
     let state = make_broker_state(&upstream);
@@ -308,8 +447,10 @@ async fn local_narinfo_present_but_not_self_certifying_fails_closed() {
     let cache = tempfile::tempdir().unwrap();
     let hash = "00000000000000000000000000000000";
     // A narinfo whose CA is `text:` rather than the required recursive
-    // `fixed:r:sha256:` — present, so it is authoritative and fails closed
-    // rather than proxying the (dead) upstream.
+    // `fixed:r:sha256:` (so it is not self-certifying) and which carries no
+    // signature — present, so it is authoritative and fails closed rather than
+    // proxying the (dead) upstream. Post-PW1 the refusal lands at the signature
+    // stage (neither self-certifying nor trusted-signed), not the CA stage.
     let nar_hash = nar_hash_for_body(b"whatever");
     let nar_digest = nar_hash.strip_prefix("sha256:").unwrap();
     let narinfo = format!(
@@ -342,7 +483,7 @@ async fn local_narinfo_present_but_not_self_certifying_fails_closed() {
     assert_eq!(entries[0].upstream_status, None);
     assert_eq!(
         entries[0].error.as_deref(),
-        Some("local narinfo not self-certifying"),
+        Some("local narinfo neither self-certifying nor trusted-signed"),
     );
 }
 
