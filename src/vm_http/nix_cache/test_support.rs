@@ -137,7 +137,7 @@ pub(super) fn nix_cache_service_with_local_cache(
         Arc::clone(state),
         VmHttpNixCacheConfig::new(upstream_url, max_metadata_bytes, max_nar_bytes)
             .unwrap()
-            .with_local_cache_dir(Some(cache_dir.to_path_buf())),
+            .with_local_cache_dirs(vec![cache_dir.to_path_buf()]),
     )
 }
 
@@ -152,6 +152,27 @@ pub(super) fn nix_cache_service_with_local_cache_and_trusted_keys(
     max_metadata_bytes: u64,
     max_nar_bytes: u64,
 ) -> VmHttpNixCacheService<Box<dyn SecretStore>> {
+    nix_cache_service_with_local_cache_dirs_and_trusted_keys(
+        state,
+        upstream_url,
+        vec![cache_dir.to_path_buf()],
+        trusted_keys,
+        max_metadata_bytes,
+        max_nar_bytes,
+    )
+}
+
+/// A service serving an ordered list of local archives (pre-warm dir first,
+/// then flake-input dir) that also trusts `trusted_keys`. The vehicle for the
+/// PW2 multi-dir, local-first serving and per-dir NAR routing.
+pub(super) fn nix_cache_service_with_local_cache_dirs_and_trusted_keys(
+    state: &Arc<BrokerState<Box<dyn SecretStore>>>,
+    upstream_url: &str,
+    cache_dirs: Vec<std::path::PathBuf>,
+    trusted_keys: NixTrustedPublicKeys,
+    max_metadata_bytes: u64,
+    max_nar_bytes: u64,
+) -> VmHttpNixCacheService<Box<dyn SecretStore>> {
     VmHttpNixCacheService::new(
         Arc::clone(state),
         VmHttpNixCacheConfig::new_with_trusted_public_keys(
@@ -161,7 +182,7 @@ pub(super) fn nix_cache_service_with_local_cache_and_trusted_keys(
             trusted_keys,
         )
         .unwrap()
-        .with_local_cache_dir(Some(cache_dir.to_path_buf())),
+        .with_local_cache_dirs(cache_dirs),
     )
 }
 

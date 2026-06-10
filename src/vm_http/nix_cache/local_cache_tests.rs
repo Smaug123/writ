@@ -147,7 +147,7 @@ async fn local_cache_miss_falls_through_to_signed_upstream() {
             NixTrustedPublicKeys::from_strings([TEST_NIX_CACHE_PUBLIC_KEY]).unwrap(),
         )
         .unwrap()
-        .with_local_cache_dir(Some(cache.path().to_path_buf())),
+        .with_local_cache_dirs(vec![cache.path().to_path_buf()]),
     );
 
     let response = route_nix_cache_with_service(
@@ -314,6 +314,198 @@ async fn local_signed_narinfo_with_untrusted_key_fails_closed() {
     assert_eq!(
         entries[0].error.as_deref(),
         Some("local narinfo neither self-certifying nor trusted-signed"),
+    );
+}
+
+#[tokio::test]
+async fn prewarm_dir_is_served_local_first_ahead_of_the_flake_input_dir() {
+    // Two local archives [pre-warm, flake-input]; a signed closure path lives in
+    // the pre-warm dir and the flake-input dir is empty. The pre-warm dir serves
+    // it local-first.
+    let upstream = MockServer::start().await;
+    let state = make_broker_state(&upstream);
+    let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+    open_audit_session(&state, session.session_id());
+    let prewarm = tempfile::tempdir().unwrap();
+    let flake_input = tempfile::tempdir().unwrap();
+    let key_pair = test_ed25519_key_pair();
+    let store_hash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let nar_file = "prewarm-closure.nar.xz";
+    let (narinfo_bytes, compressed) = write_local_signed_entry(
+        prewarm.path(),
+        &key_pair,
+        store_hash,
+        "writ-prewarm-closure",
+        nar_file,
+        b"a compiled devShell output",
+    );
+    let trusted = NixTrustedPublicKeys::from_strings([trusted_public_key_for_test(
+        TEST_SIGNING_KEY_NAME,
+        &key_pair,
+    )])
+    .unwrap();
+    let service = nix_cache_service_with_local_cache_dirs_and_trusted_keys(
+        &state,
+        DEAD_UPSTREAM,
+        vec![
+            prewarm.path().to_path_buf(),
+            flake_input.path().to_path_buf(),
+        ],
+        trusted,
+        4096,
+        4096,
+    );
+
+    let narinfo_response = route_nix_cache_with_service(
+        &session,
+        "GET",
+        format!("{VM_NIX_CACHE_PATH_PREFIX}/{store_hash}.narinfo"),
+        service.clone(),
+    )
+    .await;
+    let nar_response = route_nix_cache_with_service(
+        &session,
+        "GET",
+        format!("{VM_NIX_CACHE_PATH_PREFIX}/nar/{nar_file}"),
+        service,
+    )
+    .await;
+
+    assert_eq!(narinfo_response.status, VmHttpStatus::Ok);
+    assert_eq!(narinfo_response.body, narinfo_bytes);
+    assert_eq!(nar_response.status, VmHttpStatus::Ok);
+    assert_eq!(nar_response.body, compressed);
+    let entries = state
+        .audit
+        .list_nix_cache_requests_for_session(session.session_id())
+        .unwrap();
+    let prewarm_prefix = format!("file://{}", prewarm.path().display());
+    assert!(
+        entries.iter().all(|e| e
+            .upstream_url
+            .as_deref()
+            .is_some_and(|u| u.starts_with(&prewarm_prefix))),
+        "both responses must be served from the pre-warm dir, got {:?}",
+        entries
+            .iter()
+            .map(|e| e.upstream_url.clone())
+            .collect::<Vec<_>>(),
+    );
+}
+
+#[tokio::test]
+async fn a_hash_absent_from_the_first_dir_is_served_and_nar_routed_from_the_second() {
+    // The pre-warm dir does not hold this hash; the flake-input dir holds a CA
+    // entry for it. Serving must fall through to the second dir for the narinfo
+    // AND fetch its NAR from that same (second) dir — the dir-routing invariant.
+    // A routing bug that read the NAR from the first dir would 502 (missing).
+    let upstream = MockServer::start().await;
+    let state = make_broker_state(&upstream);
+    let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+    open_audit_session(&state, session.session_id());
+    let prewarm = tempfile::tempdir().unwrap(); // present but lacks this hash
+    let flake_input = tempfile::tempdir().unwrap();
+    let nar_file = "input.nar.xz";
+    let (hash, narinfo_bytes, compressed) =
+        write_local_ca_entry(flake_input.path(), "source", nar_file, b"a flake input nar");
+    let service = nix_cache_service_with_local_cache_dirs_and_trusted_keys(
+        &state,
+        DEAD_UPSTREAM,
+        vec![
+            prewarm.path().to_path_buf(),
+            flake_input.path().to_path_buf(),
+        ],
+        NixTrustedPublicKeys::empty(), // CA needs no key
+        4096,
+        4096,
+    );
+
+    let narinfo_response = route_nix_cache_with_service(
+        &session,
+        "GET",
+        format!("{VM_NIX_CACHE_PATH_PREFIX}/{hash}.narinfo"),
+        service.clone(),
+    )
+    .await;
+    let nar_response = route_nix_cache_with_service(
+        &session,
+        "GET",
+        format!("{VM_NIX_CACHE_PATH_PREFIX}/nar/{nar_file}"),
+        service,
+    )
+    .await;
+
+    assert_eq!(narinfo_response.status, VmHttpStatus::Ok);
+    assert_eq!(narinfo_response.body, narinfo_bytes);
+    assert_eq!(nar_response.status, VmHttpStatus::Ok);
+    assert_eq!(nar_response.body, compressed);
+    let entries = state
+        .audit
+        .list_nix_cache_requests_for_session(session.session_id())
+        .unwrap();
+    let flake_prefix = format!("file://{}", flake_input.path().display());
+    assert!(
+        entries[1]
+            .upstream_url
+            .as_deref()
+            .is_some_and(|u| u.starts_with(&flake_prefix)),
+        "the NAR must be served from the second (flake-input) dir, got {:?}",
+        entries[1].upstream_url,
+    );
+}
+
+#[tokio::test]
+async fn cache_info_synthesised_when_only_the_prewarm_dir_is_nonempty() {
+    // `nix-cache-info` is synthesised (not proxied) when *any* local dir has a
+    // servable narinfo — here only the pre-warm dir does.
+    let upstream = MockServer::start().await;
+    let state = make_broker_state(&upstream);
+    let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+    open_audit_session(&state, session.session_id());
+    let prewarm = tempfile::tempdir().unwrap();
+    let flake_input = tempfile::tempdir().unwrap(); // empty
+    let key_pair = test_ed25519_key_pair();
+    write_local_signed_entry(
+        prewarm.path(),
+        &key_pair,
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "writ-prewarm-closure",
+        "prewarm-closure.nar.xz",
+        b"a compiled devShell output",
+    );
+    let trusted = NixTrustedPublicKeys::from_strings([trusted_public_key_for_test(
+        TEST_SIGNING_KEY_NAME,
+        &key_pair,
+    )])
+    .unwrap();
+    let service = nix_cache_service_with_local_cache_dirs_and_trusted_keys(
+        &state,
+        DEAD_UPSTREAM,
+        vec![
+            prewarm.path().to_path_buf(),
+            flake_input.path().to_path_buf(),
+        ],
+        trusted,
+        4096,
+        4096,
+    );
+
+    let response =
+        route_nix_cache_with_service(&session, "GET", VM_NIX_CACHE_INFO_PATH.into(), service).await;
+
+    assert_eq!(response.status, VmHttpStatus::Ok);
+    assert!(
+        String::from_utf8(response.body)
+            .unwrap()
+            .contains("StoreDir: /nix/store")
+    );
+    let entries = state
+        .audit
+        .list_nix_cache_requests_for_session(session.session_id())
+        .unwrap();
+    assert_eq!(
+        entries[0].upstream_url, None,
+        "cache-info must be synthesised, not proxied",
     );
 }
 
@@ -608,7 +800,7 @@ async fn upstream_admitted_nar_is_not_shadowed_by_a_local_file() {
             NixTrustedPublicKeys::from_strings([TEST_NIX_CACHE_PUBLIC_KEY]).unwrap(),
         )
         .unwrap()
-        .with_local_cache_dir(Some(cache.path().to_path_buf())),
+        .with_local_cache_dirs(vec![cache.path().to_path_buf()]),
     );
 
     let narinfo = route_nix_cache_with_service(

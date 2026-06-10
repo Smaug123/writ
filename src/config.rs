@@ -396,6 +396,19 @@ pub struct AgentVmHttpConfig {
     /// leaves nix-cache behaviour identical to upstream-only.
     #[serde(default)]
     pub flake_input_cache_dir: Option<PathBuf>,
+    /// Directory of a durable, operator-managed pre-warmed devShell-closure
+    /// cache, served local-first **ahead of** `flake_input_cache_dir`. `None`
+    /// (the default) means no pre-warm dir — behaviour is identical to before.
+    ///
+    /// Unlike `flake_input_cache_dir`, the broker only *reads* this dir; an
+    /// egress builder populates it out of band (`nix copy --to file://…
+    /// ?secret-key=…`), so it is never created or written by the broker, and a
+    /// missing/empty dir simply serves nothing. Its signed, input-addressed
+    /// paths are admitted iff their key is in `nix_cache_trusted_public_keys`
+    /// (the same list the guest verifies against) — there is no separate
+    /// pre-warm key.
+    #[serde(default)]
+    pub nix_prewarm_cache_dir: Option<PathBuf>,
     /// Directory of the `(repo, rev)`-keyed cache that retains each clone's bare
     /// mirror for later flake-input provisioning. `None` (the default) keeps the
     /// historical behaviour — the mirror is discarded once its bundle is read.
@@ -562,6 +575,15 @@ pub enum AgentVmHttpConfigError {
         path: PathBuf,
         source: std::io::Error,
     },
+    #[error("nix pre-warm cache dir path must not be empty")]
+    EmptyNixPrewarmCacheDir,
+    #[error("nix pre-warm cache dir path must be absolute: {0:?}")]
+    RelativeNixPrewarmCacheDir(PathBuf),
+    #[error("nix pre-warm cache dir {path:?} exists but is not a listable directory: {source}")]
+    NixPrewarmCacheDirUnusable {
+        path: PathBuf,
+        source: std::io::Error,
+    },
     #[error("flake mirror cache dir path must not be empty")]
     EmptyFlakeMirrorCacheDir,
     #[error("flake mirror cache dir path must be absolute: {0:?}")]
@@ -720,13 +742,25 @@ impl AgentVmHttpConfig {
             }
             None => None,
         };
+        // Local archives served local-first, in order: a durable, operator-
+        // managed pre-warmed closure cache (when configured) ahead of the
+        // auto-provisioned flake-input cache. The pre-warm dir is read-only to
+        // the broker — the egress builder writes it out of band — so it is not
+        // created here; an absent/empty dir simply serves nothing. Trust for its
+        // signed paths rides the existing `nix_cache_trusted_public_keys`
+        // (the same list the guest verifies against), so no separate key.
+        let mut local_cache_dirs = Vec::new();
+        if let Some(prewarm) = &self.nix_prewarm_cache_dir {
+            local_cache_dirs.push(validate_nix_prewarm_cache_dir(prewarm.clone())?);
+        }
+        local_cache_dirs.push(flake_input_cache_dir);
         let nix_cache = VmHttpNixCacheConfig::new_with_trusted_public_keys(
             &self.nix_cache_url,
             self.nix_cache_max_metadata_bytes,
             self.nix_cache_max_nar_bytes,
             trusted_public_keys,
         )?
-        .with_local_cache_dir(Some(flake_input_cache_dir));
+        .with_local_cache_dirs(local_cache_dirs);
         let claude_proxy = self
             .claude_proxy
             .as_ref()
@@ -973,6 +1007,55 @@ fn validate_flake_mirror_cache_dir(path: PathBuf) -> Result<PathBuf, AgentVmHttp
         return Err(AgentVmHttpConfigError::RelativeFlakeMirrorCacheDir(path));
     }
     Ok(path)
+}
+
+/// Validate a configured nix pre-warm cache directory: a non-empty absolute
+/// path that, *if it exists*, the broker can both list and open children of.
+/// Unlike the flake-input cache, the broker only *reads* this dir (an egress
+/// builder populates it out of band), so this never creates or writes it — a
+/// still-absent path is tolerated (set the path before populating).
+///
+/// The broker uses an existing dir two ways, each needing a different bit, so it
+/// must have **both**:
+///   - it LISTS the dir — `local_cache_has_narinfo` gates the synthetic
+///     `nix-cache-info` on whether any local dir holds a narinfo — which needs
+///     **read** (`r`);
+///   - it OPENS children by name — serving `<prewarm>/<hash>.narinfo` — which
+///     needs **search** (`x`).
+///
+/// A dir missing either bit silently breaks a pre-warm-only, no-egress guest: no
+/// search bit fails every narinfo open closed (502); no read bit makes the
+/// cache-info preflight proxy the (unreachable) upstream, so Nix rejects the
+/// substituter before requesting any local path. Both must fail fast here rather
+/// than at request time, when the local-first path would treat them as
+/// authoritative and never fall through to the flake-input cache or upstream.
+/// (The broker runs as the invoking user, not root, so the bits are enforced.)
+fn validate_nix_prewarm_cache_dir(path: PathBuf) -> Result<PathBuf, AgentVmHttpConfigError> {
+    if path.as_os_str().is_empty() {
+        return Err(AgentVmHttpConfigError::EmptyNixPrewarmCacheDir);
+    }
+    if !path.is_absolute() {
+        return Err(AgentVmHttpConfigError::RelativeNixPrewarmCacheDir(path));
+    }
+    // Listability (read): `read_dir` opens the dir for enumeration.
+    match std::fs::read_dir(&path) {
+        // Absent: tolerated, so the path can be set before the builder fills it.
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(path),
+        // A file (`ENOTDIR`) or an unreadable dir (`EACCES`): unusable.
+        Err(source) => {
+            return Err(AgentVmHttpConfigError::NixPrewarmCacheDirUnusable { path, source });
+        }
+        Ok(_) => {}
+    }
+    // Searchability (execute): `lstat` of a child name resolves through the dir,
+    // needing only its search bit. `NotFound` (the probe child is simply absent)
+    // confirms search works; `EACCES` denies it.
+    let probe = path.join(".writ-prewarm-cache-search-probe");
+    match std::fs::symlink_metadata(&probe) {
+        Ok(_) => Ok(path),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(path),
+        Err(source) => Err(AgentVmHttpConfigError::NixPrewarmCacheDirUnusable { path, source }),
+    }
 }
 
 /// Validate a configured flake materialize scratch directory: a non-empty
@@ -1580,10 +1663,11 @@ mod tests {
         );
         assert_eq!(runtime.vm_http().nix_cache().max_nar_bytes(), 67_108_864);
         // Omitted from JSON, so the local flake-input cache defaults under
-        // work_root and is wired into the nix-cache config.
+        // work_root and is the sole local cache dir wired into the nix-cache
+        // config (no pre-warm dir configured).
         assert_eq!(
-            runtime.vm_http().nix_cache().local_cache_dir(),
-            Some(work_root.join("flake-input-cache").as_path())
+            runtime.vm_http().nix_cache().local_cache_dirs(),
+            [work_root.join("flake-input-cache")],
         );
         assert_eq!(
             runtime
@@ -1724,6 +1808,7 @@ mod tests {
             nix_cache_max_metadata_bytes: 1_048_576,
             nix_cache_max_nar_bytes: 67_108_864,
             flake_input_cache_dir: None,
+            nix_prewarm_cache_dir: None,
             flake_mirror_cache_dir: None,
             flake_mirror_cache_max_entries: default_flake_mirror_cache_max_entries(),
             flake_mirror_cache_max_bytes: default_flake_mirror_cache_max_bytes(),
@@ -2134,8 +2219,8 @@ mod tests {
         let runtime = c.to_runtime_config().unwrap();
 
         assert_eq!(
-            runtime.nix_cache().local_cache_dir(),
-            Some(flake_cache.as_path())
+            runtime.nix_cache().local_cache_dirs(),
+            std::slice::from_ref(&flake_cache),
         );
     }
 
@@ -2148,6 +2233,138 @@ mod tests {
             c.to_runtime_config(),
             Err(AgentVmHttpConfigError::RelativeFlakeInputCacheDir(path))
                 if path.as_os_str() == "flake-input-cache"
+        ));
+    }
+
+    #[test]
+    fn agent_vm_http_config_wires_prewarm_cache_dir_first() {
+        let prewarm = unique_config_test_path("nix-prewarm-cache");
+        let flake_cache = unique_config_test_path("flake-input-cache");
+        let mut c = valid_agent_vm_http_config();
+        c.nix_prewarm_cache_dir = Some(prewarm.clone());
+        c.flake_input_cache_dir = Some(flake_cache.clone());
+
+        let runtime = c.to_runtime_config().unwrap();
+
+        // Served local-first in order: the durable pre-warm dir ahead of the
+        // auto-provisioned flake-input dir.
+        assert_eq!(
+            runtime.nix_cache().local_cache_dirs(),
+            [prewarm.clone(), flake_cache.clone()],
+        );
+    }
+
+    #[test]
+    fn agent_vm_http_config_tolerates_a_missing_prewarm_cache_dir() {
+        // Unlike the flake-input cache, the broker only reads the pre-warm dir
+        // (an egress builder writes it out of band), so config must NOT create or
+        // probe it: a not-yet-populated path is accepted and left untouched.
+        let prewarm = unique_config_test_path("nix-prewarm-cache-absent");
+        assert!(!prewarm.exists());
+        let mut c = valid_agent_vm_http_config();
+        c.nix_prewarm_cache_dir = Some(prewarm.clone());
+
+        let runtime = c.to_runtime_config().unwrap();
+
+        assert_eq!(
+            runtime.nix_cache().local_cache_dirs().first(),
+            Some(&prewarm)
+        );
+        assert!(
+            !prewarm.exists(),
+            "config must not create the read-only pre-warm dir",
+        );
+    }
+
+    #[test]
+    fn agent_vm_http_config_rejects_relative_prewarm_cache_dir() {
+        let mut c = valid_agent_vm_http_config();
+        c.nix_prewarm_cache_dir = Some(PathBuf::from("nix-prewarm-cache"));
+
+        assert!(matches!(
+            c.to_runtime_config(),
+            Err(AgentVmHttpConfigError::RelativeNixPrewarmCacheDir(path))
+                if path.as_os_str() == "nix-prewarm-cache"
+        ));
+    }
+
+    #[test]
+    fn agent_vm_http_config_rejects_prewarm_cache_dir_that_is_not_a_directory() {
+        // A typo pointing the (read-only, never-created) pre-warm dir at a file
+        // must fail fast: otherwise every narinfo lookup would hit an I/O error
+        // and fail closed before the flake-input cache or upstream is tried.
+        let not_a_dir = unique_config_test_path("nix-prewarm-not-a-dir");
+        std::fs::write(&not_a_dir, b"oops").unwrap();
+        let mut c = valid_agent_vm_http_config();
+        c.nix_prewarm_cache_dir = Some(not_a_dir.clone());
+
+        let result = c.to_runtime_config();
+        std::fs::remove_file(&not_a_dir).ok();
+
+        assert!(matches!(
+            result,
+            Err(AgentVmHttpConfigError::NixPrewarmCacheDirUnusable { path, .. })
+                if path == not_a_dir
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agent_vm_http_config_rejects_non_searchable_prewarm_cache_dir() {
+        use std::os::unix::fs::PermissionsExt as _;
+        // Root bypasses the directory search bit, so the invariant is only
+        // observable as a non-root user — which is how the broker runs. Skip
+        // under root rather than assert a rejection that cannot happen there.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        // A dir that is listable (r) but not searchable (no x): `read_dir` would
+        // succeed, yet every `<dir>/<hash>.narinfo` open would 502. The
+        // child-stat probe must reject it.
+        let dir = unique_config_test_path("nix-prewarm-no-search");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o400)).unwrap();
+        let mut c = valid_agent_vm_http_config();
+        c.nix_prewarm_cache_dir = Some(dir.clone());
+
+        let result = c.to_runtime_config();
+        // Restore searchable perms so cleanup can remove the dir.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).ok();
+        std::fs::remove_dir(&dir).ok();
+
+        assert!(matches!(
+            result,
+            Err(AgentVmHttpConfigError::NixPrewarmCacheDirUnusable { path, .. })
+                if path == dir
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agent_vm_http_config_rejects_non_readable_prewarm_cache_dir() {
+        use std::os::unix::fs::PermissionsExt as _;
+        // Root bypasses the read bit too; skip there (the broker runs non-root).
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        // A dir that is searchable (x) but not listable (no r): children open by
+        // name, but `local_cache_has_narinfo`'s `read_dir` would hit EACCES,
+        // making a pre-warm-only no-egress guest proxy cache-info to an
+        // unreachable upstream. Require listability too.
+        let dir = unique_config_test_path("nix-prewarm-no-read");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o100)).unwrap();
+        let mut c = valid_agent_vm_http_config();
+        c.nix_prewarm_cache_dir = Some(dir.clone());
+
+        let result = c.to_runtime_config();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).ok();
+        std::fs::remove_dir(&dir).ok();
+
+        assert!(matches!(
+            result,
+            Err(AgentVmHttpConfigError::NixPrewarmCacheDirUnusable { path, .. })
+                if path == dir
         ));
     }
 
@@ -2398,8 +2615,8 @@ mod tests {
         let runtime = c.to_runtime_config().unwrap();
 
         assert_eq!(
-            runtime.nix_cache().local_cache_dir(),
-            Some(work_root.join("flake-input-cache").as_path())
+            runtime.nix_cache().local_cache_dirs(),
+            [work_root.join("flake-input-cache")],
         );
     }
 
