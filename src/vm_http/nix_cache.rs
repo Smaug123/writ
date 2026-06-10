@@ -87,9 +87,11 @@ struct VmHttpNixCacheProxyFetch {
 /// the local archive (and vice-versa).
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum VmNixCacheNarSource {
-    /// Admitted from the broker's local archive (a content-addressed narinfo);
-    /// the NAR is served authoritatively from `local_cache_dir/nar/<file>`.
-    Local,
+    /// Admitted from the broker's local archive at
+    /// `local_cache_dirs()[dir_index]`; the NAR is served authoritatively from
+    /// that same dir's `nar/<file>` (so a NAR is never served from a different
+    /// local dir than the one whose narinfo admitted it).
+    Local { dir_index: usize },
     /// Admitted from the signed upstream; the NAR is fetched from the upstream.
     Upstream,
 }
@@ -501,11 +503,12 @@ impl<S: SecretStore> VmHttpNixCacheService<S> {
         // admitted from the local archive is served authoritatively from disk
         // (so an upstream-admitted NAR is never broken by a same-named local
         // file, and vice-versa); only an upstream admission proxies the upstream.
-        if entry.source == VmNixCacheNarSource::Local {
+        if let VmNixCacheNarSource::Local { dir_index } = entry.source {
             let dir = self
                 .config
-                .local_cache_dir()
-                .expect("a local NAR admission implies a configured local cache");
+                .local_cache_dirs()
+                .get(dir_index)
+                .expect("a local NAR admission pins a configured local cache dir");
             let nar_path = dir.join("nar").join(file.as_str());
             return self.serve_local_nar(method, &nar_path, &admission).await;
         }
@@ -658,120 +661,126 @@ impl<S: SecretStore> VmHttpNixCacheService<S> {
         }
     }
 
-    /// Whether the local archive currently holds at least one narinfo to serve.
+    /// Whether any local archive currently holds at least one narinfo to serve.
     /// Gates the synthetic `nix-cache-info`: its upstream-independence only
-    /// earns its keep when there is local content to substitute, so an empty or
-    /// absent archive proxies the upstream and stays byte-identical to
-    /// upstream-only. `nix-cache-info` is requested once per substituter
-    /// pre-flight, so the directory scan (short-circuiting on the first
-    /// servable narinfo) is off the hot path.
+    /// earns its keep when there is local content to substitute, so when every
+    /// configured dir is empty or absent the broker proxies the upstream and
+    /// stays byte-identical to upstream-only. `nix-cache-info` is requested once
+    /// per substituter pre-flight, so the directory scan (short-circuiting on
+    /// the first servable narinfo in the first dir that has one) is off the hot
+    /// path.
     async fn local_cache_has_narinfo(&self) -> bool {
-        let Some(dir) = self.config.local_cache_dir() else {
-            return false;
-        };
-        let mut entries = match tokio::fs::read_dir(dir).await {
-            Ok(entries) => entries,
-            // A missing or unreadable archive dir has nothing to serve: proxy.
-            Err(_) => return false,
-        };
-        while let Ok(Some(entry)) = entries.next_entry().await {
-            if is_servable_local_narinfo_name(&entry.file_name()) {
-                return true;
+        for dir in self.config.local_cache_dirs() {
+            let mut entries = match tokio::fs::read_dir(dir).await {
+                Ok(entries) => entries,
+                // A missing or unreadable archive dir has nothing to serve.
+                Err(_) => continue,
+            };
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                if is_servable_local_narinfo_name(&entry.file_name()) {
+                    return true;
+                }
             }
         }
         false
     }
 
-    /// Serve a narinfo from the broker's local archive, local-first.
+    /// Serve a narinfo from the broker's local archives, local-first and in
+    /// configured order (pre-warm dir before flake-input dir).
     ///
     /// A local narinfo is admitted if it is self-certifying (a content-addressed
     /// flake input) **or** signed by a trusted key (a pre-warmed devShell-closure
     /// path, whose input-addressed outputs are not self-certifying).
     ///
-    /// `Some` means the request was handled locally: either an admissible narinfo
-    /// was served (and its NAR admitted), or a present-but-inadmissible /
-    /// oversized / unreadable local file failed closed. `None` means there is no
-    /// local cache or no file for this hash, so the caller proxies the upstream
-    /// exactly as before. A present file is authoritative — we never silently
-    /// fall through to the upstream for it, because the upstream cannot hold
-    /// these locally-provisioned paths anyway.
+    /// `Some` means the request was handled locally by the first dir that holds
+    /// `<hash>.narinfo`: either an admissible narinfo was served (and its NAR
+    /// admitted, pinned to *that* dir), or a present-but-inadmissible / oversized
+    /// / unreadable file in that dir failed closed. A present file is
+    /// authoritative for its dir — we neither fall through to a later dir nor to
+    /// the upstream for a hash a dir already claims. `None` means *no* dir holds
+    /// the hash, so the caller proxies the upstream exactly as before.
     async fn try_serve_local_narinfo(
         &self,
         method: &str,
         hash: &NixStoreHashPart,
     ) -> Option<VmHttpNixCacheProxyFetch> {
-        let dir = self.config.local_cache_dir()?;
-        let path = dir.join(format!("{}.narinfo", hash.as_str()));
-        let local_url = local_file_url(&path);
-        let bytes = match read_local_cache_file(&path, self.config.max_metadata_bytes()).await {
-            LocalCacheFile::Missing => return None,
-            LocalCacheFile::TooLarge => {
-                return Some(local_failure(local_url, "local narinfo too large"));
-            }
-            LocalCacheFile::Io(err) => {
+        for (dir_index, dir) in self.config.local_cache_dirs().iter().enumerate() {
+            let path = dir.join(format!("{}.narinfo", hash.as_str()));
+            let local_url = local_file_url(&path);
+            let bytes = match read_local_cache_file(&path, self.config.max_metadata_bytes()).await {
+                // Absent from this dir: try the next one (a later dir, or finally
+                // the upstream).
+                LocalCacheFile::Missing => continue,
+                LocalCacheFile::TooLarge => {
+                    return Some(local_failure(local_url, "local narinfo too large"));
+                }
+                LocalCacheFile::Io(err) => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %err,
+                        "vm http nix cache local narinfo read failed",
+                    );
+                    return Some(local_failure(local_url, "local narinfo read failed"));
+                }
+                LocalCacheFile::Bytes(bytes) => bytes,
+            };
+            let narinfo = match parse_local_admissible_narinfo_for_store_hash(
+                &bytes,
+                hash,
+                self.config.trusted_public_keys(),
+            ) {
+                Ok(narinfo) => narinfo,
+                Err(err) => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %err,
+                        "vm http nix cache local narinfo was refused",
+                    );
+                    return Some(local_failure(local_url, local_narinfo_error_label(&err)));
+                }
+            };
+            if let Err(err) = self.admit_narinfo(&narinfo, VmNixCacheNarSource::Local { dir_index })
+            {
                 tracing::warn!(
                     path = %path.display(),
                     error = %err,
-                    "vm http nix cache local narinfo read failed",
+                    "vm http nix cache local narinfo admission failed",
                 );
-                return Some(local_failure(local_url, "local narinfo read failed"));
+                return Some(local_failure(local_url, err.audit_error_label()));
             }
-            LocalCacheFile::Bytes(bytes) => bytes,
-        };
-        let narinfo = match parse_local_admissible_narinfo_for_store_hash(
-            &bytes,
-            hash,
-            self.config.trusted_public_keys(),
-        ) {
-            Ok(narinfo) => narinfo,
-            Err(err) => {
-                tracing::warn!(
-                    path = %path.display(),
-                    error = %err,
-                    "vm http nix cache local narinfo was refused",
-                );
-                return Some(local_failure(local_url, local_narinfo_error_label(&err)));
+            if method == "HEAD" {
+                let content_length = bytes.len() as u64;
+                let response = VmHttpResponse::text(VmHttpStatus::Ok, "")
+                    .with_content_length(Some(content_length));
+                return Some(VmHttpNixCacheProxyFetch {
+                    upstream_url: local_url,
+                    upstream_status: None,
+                    response_bytes: 0,
+                    error: None,
+                    response,
+                });
             }
-        };
-        if let Err(err) = self.admit_narinfo(&narinfo, VmNixCacheNarSource::Local) {
-            tracing::warn!(
-                path = %path.display(),
-                error = %err,
-                "vm http nix cache local narinfo admission failed",
-            );
-            return Some(local_failure(local_url, err.audit_error_label()));
-        }
-        if method == "HEAD" {
-            let content_length = bytes.len() as u64;
-            let response = VmHttpResponse::text(VmHttpStatus::Ok, "")
-                .with_content_length(Some(content_length));
+            // Serve the narinfo bytes verbatim — including the self-certifying CA
+            // or the Sig line — so the guest accepts the path exactly as it would
+            // from a local `file://` substituter: a CA path unsigned, a signed
+            // path after re-verifying the signature against its own trusted keys.
+            let response_bytes = bytes.len() as u64;
             return Some(VmHttpNixCacheProxyFetch {
                 upstream_url: local_url,
                 upstream_status: None,
-                response_bytes: 0,
+                response_bytes,
                 error: None,
-                response,
+                response: VmHttpResponse {
+                    status: VmHttpStatus::Ok,
+                    content_type: "text/plain; charset=utf-8",
+                    body: bytes,
+                    content_length: None,
+                    www_authenticate: None,
+                    headers: Vec::new(),
+                },
             });
         }
-        // Serve the narinfo bytes verbatim — including the self-certifying CA or
-        // the Sig line — so the guest accepts the path exactly as it would from a
-        // local `file://` substituter: a CA path unsigned, a signed path after
-        // re-verifying the signature against its own trusted keys.
-        let response_bytes = bytes.len() as u64;
-        Some(VmHttpNixCacheProxyFetch {
-            upstream_url: local_url,
-            upstream_status: None,
-            response_bytes,
-            error: None,
-            response: VmHttpResponse {
-                status: VmHttpStatus::Ok,
-                content_type: "text/plain; charset=utf-8",
-                body: bytes,
-                content_length: None,
-                www_authenticate: None,
-                headers: Vec::new(),
-            },
-        })
+        None
     }
 
     /// Serve a locally-admitted NAR authoritatively from the broker's archive at
@@ -921,11 +930,12 @@ impl<S: SecretStore> VmHttpNixCacheService<S> {
                     file: admission.file,
                 });
             }
-            // Once a NAR is admitted from the local archive, keep serving it
-            // locally even if a later content-identical upstream admission
-            // arrives (local-first, no egress).
-            Some(existing) if existing.source == VmNixCacheNarSource::Local => {
-                VmNixCacheNarSource::Local
+            // Once a NAR is admitted from a local archive, keep serving it from
+            // that same local dir even if a later content-identical admission
+            // arrives — from the upstream or from another local dir (local-first,
+            // no egress; the dir that first claimed the NAR keeps it).
+            Some(existing) if matches!(existing.source, VmNixCacheNarSource::Local { .. }) => {
+                existing.source
             }
             _ => source,
         };

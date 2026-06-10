@@ -2,7 +2,7 @@
 //! normalised upstream URL, the metadata/NAR byte bounds, the trusted signing
 //! keys, and the optional local flake-input archive served local-first.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use crate::nix_cache::NixTrustedPublicKeys;
 
@@ -12,12 +12,16 @@ pub struct VmHttpNixCacheConfig {
     max_metadata_bytes: u64,
     max_nar_bytes: u64,
     trusted_public_keys: NixTrustedPublicKeys,
-    /// The broker's local flake-input archive (`nix flake archive --to
-    /// file://…`), served *local-first*: a hash present here is served from
-    /// disk (admitting its content-addressed narinfo unsigned), a miss falls
-    /// through to the upstream proxy. `None` (the default) leaves behaviour
-    /// identical to a pure upstream proxy.
-    local_cache_dir: Option<PathBuf>,
+    /// The broker's local archives, served *local-first* and in order ahead of
+    /// the upstream proxy: for a requested hash the first dir holding a
+    /// `<hash>.narinfo` is authoritative (admitting it content-addressed-unsigned
+    /// or trusted-signed; see `parse_local_admissible_narinfo_for_store_hash`),
+    /// and only a miss in *every* dir falls through to the upstream. Empty (the
+    /// default) leaves behaviour identical to a pure upstream proxy.
+    ///
+    /// Ordered pre-warm-first: a durable, operator-managed pre-warmed closure
+    /// cache ahead of the auto-provisioned, content-addressed flake-input cache.
+    local_cache_dirs: Vec<PathBuf>,
 }
 
 #[derive(Debug, thiserror::Error, Eq, PartialEq)]
@@ -99,18 +103,18 @@ impl VmHttpNixCacheConfig {
             max_metadata_bytes,
             max_nar_bytes,
             trusted_public_keys,
-            local_cache_dir: None,
+            local_cache_dirs: Vec::new(),
         })
     }
 
-    /// Serve the broker's local flake-input archive at `dir` local-first (see
-    /// [`VmHttpNixCacheConfig::local_cache_dir`]). `None` disables it. The
-    /// directory need not exist yet — an absent file is treated as a local
-    /// miss, so behaviour is identical to upstream-only until provisioning
-    /// populates it.
+    /// Serve the broker's local archives `dirs` local-first, in order (see
+    /// [`VmHttpNixCacheConfig::local_cache_dirs`]). An empty vec disables local
+    /// serving. The directories need not exist yet — an absent dir is treated as
+    /// a local miss, so behaviour is identical to upstream-only until one is
+    /// populated.
     #[must_use]
-    pub fn with_local_cache_dir(mut self, dir: Option<PathBuf>) -> Self {
-        self.local_cache_dir = dir;
+    pub fn with_local_cache_dirs(mut self, dirs: Vec<PathBuf>) -> Self {
+        self.local_cache_dirs = dirs;
         self
     }
 
@@ -118,8 +122,8 @@ impl VmHttpNixCacheConfig {
         &self.upstream_base_url
     }
 
-    pub fn local_cache_dir(&self) -> Option<&Path> {
-        self.local_cache_dir.as_deref()
+    pub fn local_cache_dirs(&self) -> &[PathBuf] {
+        &self.local_cache_dirs
     }
 
     pub fn max_metadata_bytes(&self) -> u64 {
