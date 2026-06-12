@@ -92,12 +92,15 @@ The script:
    `manifest/devshells-warmed.log` (`ts <TAB> flakeref <TAB> rev <TAB>
    path`) — the input for future pruning.
 
-Guard rails, machine-enforced: wrong-platform hosts are refused; the
-`devShells.<system>.<attr>` derivation's `.system` is asserted; a checkout
-with modified tracked files is refused (its closure would be no commit's
-closure, so the signature would attest to nothing reviewable); warming a
-branch other than `main` warns loudly. Concurrent warms serialise on a lock
-under the base dir.
+Guard rails, machine-enforced and fail-closed: wrong-platform hosts are
+refused; the `devShells.<system>.<attr>` derivation's `.system` is asserted;
+a local directory is refused unless it is a git work tree whose clean status
+was successfully verified (no git, not a work tree, a failed `git status`,
+or modified tracked files all abort — the closure would, or could, be no
+commit's closure, so the signature would attest to nothing reviewable);
+every flakeref must resolve to a git revision, which rides each manifest
+line; warming a branch other than `main` warns loudly. Concurrent warms
+serialise on a lock under the base dir.
 
 Re-warm whenever `main` moves in a way that changes the devShell (most
 commonly a `flake.lock` bump or dependency change). Warming is incremental:
@@ -138,6 +141,28 @@ repeat.
   avoids running the repo's `shellHook` outside the Nix build sandbox
   (`print-dev-env` realises without executing it), but Nix builds themselves
   execute repo-controlled derivations.
-- Rotation: generate `writ-prewarm-2` alongside (set
-  `WRIT_PREWARM_KEY_NAME`), add it to `nix_cache_trusted_public_keys`, re-warm,
-  then retire `-1` from the config and delete its key.
+- Rotation: re-warming with a new key is **not** enough — `nix copy` skips
+  paths already in the cache, so their narinfos would keep only the old
+  signature and be rejected the moment `-1` is retired. Instead:
+
+  1. generate `writ-prewarm-2` (`WRIT_PREWARM_KEY_NAME=writ-prewarm-2
+     ./init-prewarm-cache.sh`) and add its public key to
+     `nix_cache_trusted_public_keys` **alongside** `-1`;
+  2. re-sign everything already in the cache with the new key — the
+     manifests enumerate every warmed path:
+
+     ```sh
+     prewarm=~/.local/share/writ-prewarm
+     cut -f4 "$prewarm"/manifest/*.log | sort -u \
+       | nix --extra-experimental-features nix-command \
+           store sign --stdin \
+           --store "file://$prewarm/cache" \
+           --key-file "$prewarm/keys/writ-prewarm-2.secret"
+     ```
+
+  3. re-transfer the cache (the narinfos changed; same `nar/`-first order),
+     and only then retire `-1` from the config and delete its key.
+
+  The conservative alternative is to rotate into a fresh cache: point
+  `WRIT_PREWARM_DIR` somewhere new, re-warm every repo (the builder's local
+  store makes this cheap), transfer, and flip `nix_prewarm_cache_dir` over.

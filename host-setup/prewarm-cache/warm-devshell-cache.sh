@@ -30,12 +30,15 @@
 #     resolved derivation's `.system` — an unguarded `nix develop .#default`
 #     on the operator's Mac would silently sign a darwin closure no guest can
 #     use (belt, braces: a flake could also define a cross attr).
-#   - EXACTNESS. A local checkout with modified tracked files is refused: its
-#     closure is no commit's closure, so the signature would attest to
-#     nothing reviewable. (Untracked files are tolerated — a git-backed flake
-#     archives tracked content only.) The resolved revision is recorded in
-#     every manifest line; warming a branch other than `main` warns loudly
-#     but proceeds (release branches are the operator's call).
+#   - EXACTNESS, fail-closed. A local directory must be a git work tree whose
+#     clean status was successfully verified; modified tracked files — or any
+#     failure to verify at all — are refused: the closure would be (or could
+#     be) no commit's closure, so the signature would attest to nothing
+#     reviewable. (Untracked files are tolerated — a git-backed flake
+#     archives tracked content only.) Every flakeref must resolve to a git
+#     revision, recorded in each manifest line; warming a branch other than
+#     `main` warns loudly but proceeds (release branches are the operator's
+#     call).
 #   - HOOK CODE. Realisation builds the repo's derivations (that is the
 #     point — this VM is the egress sandbox), but `print-dev-env` does NOT
 #     execute the devShell's `shellHook` the way `nix develop --command`
@@ -153,33 +156,55 @@ if [ -d "$raw_flakeref" ]; then
     echo "error: $flakeref has no flake.nix." >&2
     exit 1
   fi
-  # EXACTNESS: refuse modified tracked files — the resulting closure would be
-  # no commit's closure, so the signature would attest to nothing reviewable.
-  # Untracked files are tolerated: a git-backed flake archives tracked content
-  # only, so they cannot change what is warmed. Loudly note a non-main branch;
-  # the signature's meaning is "warmed from main".
-  if command -v git >/dev/null 2>&1 && git -C "$flakeref" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-    dirty="$(git -C "$flakeref" status --porcelain | grep -v '^??' || true)"
-    if [ -n "$dirty" ]; then
-      echo "error: $flakeref has modified tracked files; commit or stash before warming:" >&2
-      printf '%s\n' "$dirty" >&2
-      exit 1
-    fi
-    branch="$(git -C "$flakeref" symbolic-ref --short -q HEAD || echo "(detached HEAD)")"
-    if [ "$branch" != "main" ]; then
-      echo "WARNING: warming branch '$branch', not 'main'. The pre-warm signature is" >&2
-      echo "         normally the attestation that a closure came from reviewed main." >&2
-    fi
+  # EXACTNESS, fail-closed: a local directory must be a git work tree whose
+  # clean status we successfully VERIFIED — anything less (no git, not a work
+  # tree, `git status` itself failing) is refused, because a tree whose
+  # exactness cannot be checked could be a dirty or no-commit's tree and the
+  # signature would attest to nothing reviewable. Modified tracked files are
+  # refused for the same reason; untracked files are tolerated (a git-backed
+  # flake archives tracked content only, so they cannot change what is
+  # warmed). Loudly note a non-main branch; the signature's meaning is
+  # "warmed from main".
+  if ! command -v git >/dev/null 2>&1; then
+    echo "error: git not found on PATH; it is required to verify a local checkout's exactness." >&2
+    exit 1
+  fi
+  if ! git -C "$flakeref" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    echo "error: $flakeref is not a git work tree. The pre-warm signature attests a reviewed" >&2
+    echo "       commit; warm a git checkout (or a remote flakeref like github:owner/repo/main)." >&2
+    exit 1
+  fi
+  if ! status_out="$(git -C "$flakeref" status --porcelain)"; then
+    echo "error: 'git status' failed in $flakeref; refusing to warm a tree whose cleanliness cannot be verified." >&2
+    exit 1
+  fi
+  dirty="$(printf '%s\n' "$status_out" | grep -v '^??' || true)"
+  if [ -n "$dirty" ]; then
+    echo "error: $flakeref has modified tracked files; commit or stash before warming:" >&2
+    printf '%s\n' "$dirty" >&2
+    exit 1
+  fi
+  branch="$(git -C "$flakeref" symbolic-ref --short -q HEAD || echo "(detached HEAD)")"
+  if [ "$branch" != "main" ]; then
+    echo "WARNING: warming branch '$branch', not 'main'. The pre-warm signature is" >&2
+    echo "         normally the attestation that a closure came from reviewed main." >&2
   fi
 else
   flakeref="$raw_flakeref"
 fi
 
 # The resolved revision, recorded in every manifest line so a later prune can
-# group warms by (repo, rev). --no-update-lock-file: a stale lock — flake.nix
-# and flake.lock disagreeing — fails here rather than warming an in-memory
-# updated input graph the committed repo will not use.
-rev="$(nix "${nix_flags[@]}" flake metadata --json --no-update-lock-file "$flakeref" | jq -r '.revision // "unknown"')"
+# group warms by (repo, rev) — and so the signature is always attributable to
+# an exact commit. A flakeref that resolves to no revision (a tarball, a
+# non-git path) is refused outright: nothing reviewable to attest.
+# --no-update-lock-file: a stale lock — flake.nix and flake.lock disagreeing —
+# fails here rather than warming an in-memory updated input graph the
+# committed repo will not use.
+rev="$(nix "${nix_flags[@]}" flake metadata --json --no-update-lock-file "$flakeref" | jq -r '.revision // empty')"
+if [ -z "$rev" ]; then
+  echo "error: $flakeref resolves to no git revision; the manifest must record the exact commit the signature attests." >&2
+  exit 1
+fi
 echo "==> warming $flakeref (rev $rev), devShell attr '$attr' for $target_system"
 
 # --- lock --------------------------------------------------------------------
