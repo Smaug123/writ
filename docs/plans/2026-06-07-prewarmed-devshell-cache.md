@@ -228,7 +228,7 @@ Decisions made during implementation (2026-06-12, with the user):
   is what keeps an FK-provisionable but not-yet-pre-warmed repo evaluable
   (the pre-warm view serves the FK dir too).
 
-### PW4 — Builder tooling (committed scripts)
+### PW4 — Builder tooling (committed scripts) — landed
 
 Under `host-setup/` (ported from the orchestrator): a key-init script and
 `warm-devshell-cache.sh <repo> [#attr]` that runs the `nix flake archive`
@@ -236,6 +236,45 @@ Under `host-setup/` (ported from the orchestrator): a key-init script and
 manifest line (what was warmed, for later pruning), and shellchecks clean.
 Docs: a runbook for warming from `main` on the builder VM and transferring
 the dir to the broker host.
+
+Landed as `host-setup/prewarm-cache/{common.sh,init-prewarm-cache.sh,
+warm-devshell-cache.sh,README.md}`, with four deliberate deviations from
+the sketch above:
+
+- **Platform guard.** The warmer refuses any host whose
+  `builtins.currentSystem` is not the guest system (`WRIT_PREWARM_SYSTEM`,
+  default `aarch64-linux`), forces the `devShells.<system>.<attr>`
+  qualification, and asserts the resolved derivation's `.system` — the
+  sketch's bare `nix develop "$REPO#default"` on the operator's Mac would
+  silently sign a darwin closure no guest can substitute.
+- **`nix print-dev-env --profile`, not `nix develop --profile --command
+  true`.** Identical realisation and profile, but it never executes the
+  repo's `shellHook` outside the build sandbox as the user that can read
+  the signing key.
+- **Inputs filtered to `.inputs`** (`nix flake archive --json` + jq +
+  signed `nix copy --stdin`) rather than `archive --to`: skips signing the
+  flake's own per-rev source tree (the guest has the brokered checkout and
+  never substitutes it; in a durable dir it is pure bloat) and yields the
+  per-path manifest pruning needs.
+- **"From main" machine-enforced where possible**: a local checkout with
+  modified tracked files is refused, the resolved rev is recorded in every
+  manifest line, and a non-`main` branch warns loudly.
+
+Codex review hardening (five convergent rounds of disjoint findings; the
+sixth came back clean):
+exactness fails closed (non-git dirs / failed `git status` abort, not
+skip); the key-rotation runbook re-signs via manifest-driven `nix store
+sign --stdin` (a re-warm alone never re-signs cached paths); every nix
+invocation is pinned to the rev resolved once by `flake metadata
+--refresh` (mutable refs cannot drift mid-warm, nor pin a stale TTL'd
+resolution); `WRIT_PREWARM_DIR` is validated absolute + URL-safe before
+any work (it is embedded in `file://` store URLs); the mkdir lock became
+`flock` (Linux-only script; kernel-released, no stale-reclaim race); the
+non-`main` warning covers remote refs via the metadata's `.original.ref`;
+and a committed lock pinning local (`path:`/`git+file:`) inputs is
+refused before archiving — those would sign builder-local files, in the
+worst case the key dir itself, into the broker-served cache (mirrors the
+FK provisioner's local-input refusal).
 
 ### PW5 — End-to-end oracle
 
