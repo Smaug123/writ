@@ -47,6 +47,11 @@
 #     execute the devShell's `shellHook` the way `nix develop --command`
 #     would: repo-controlled hook code never runs unsandboxed as the user
 #     that can read the signing key. Warm only reviewed refs regardless.
+#   - NO LOCAL INPUTS. A committed lock pinning `path:`/`git+file:` inputs is
+#     refused before anything is archived: those would copy builder-local
+#     files — outside the reviewed revision, potentially the key dir itself —
+#     into the signed, broker-served cache. Mirrors the broker-side FK
+#     provisioner's refusal of local inputs.
 #
 # Mechanism notes carried over from the reviewed orchestrator warmer this is
 # ported from (host-setup/mac-cache in github-actions-runner-orchestrator):
@@ -240,6 +245,34 @@ if [ ! -d "$raw_flakeref" ]; then
     echo "         signature is normally the attestation that a closure came from reviewed main." >&2
   fi
 fi
+# Refuse LOCAL flake inputs before anything is archived. A committed lock can
+# pin `path:` / `git+file:` / `file:` inputs naming builder-local filesystem
+# trees — bytes that are not part of the reviewed repo revision, which the
+# archive step would copy and the signed `nix copy` would ship into the
+# broker-served cache (a malicious lock could even name this builder's key
+# directory). The broker-side FK provisioner refuses local inputs for the
+# same reason; mirror it here. The metadata already embeds the full lock
+# graph, so this is a pure preflight — nothing is fetched.
+local_inputs="$(printf '%s' "$metadata_json" | jq -r '
+  .locks.nodes
+  | to_entries[]
+  | select(.key != "root")
+  | select(.value.locked != null)
+  | select(
+      (.value.locked.type == "path")
+      or ((.value.locked.url // "") | startswith("file:"))
+      or ((.value.locked.path // "") != "")
+    )
+  | "  \(.key): type \(.value.locked.type), \(.value.locked.url // .value.locked.path // "?")"
+')"
+if [ -n "$local_inputs" ]; then
+  echo "error: REFUSING to warm $flakeref: its committed lock pins local filesystem input(s):" >&2
+  printf '%s\n' "$local_inputs" >&2
+  echo "       Archiving those would sign builder-local files (outside the reviewed revision)" >&2
+  echo "       into the broker-served cache. Vendor them or pin remote-fetchable inputs." >&2
+  exit 1
+fi
+
 echo "==> warming $flakeref (rev $rev, pinned as $pinned_flakeref), devShell attr '$attr' for $target_system"
 
 # --- lock --------------------------------------------------------------------

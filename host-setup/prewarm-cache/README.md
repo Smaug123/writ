@@ -100,8 +100,11 @@ was successfully verified (no git, not a work tree, a failed `git status`,
 or modified tracked files all abort — the closure would, or could, be no
 commit's closure, so the signature would attest to nothing reviewable);
 every flakeref must resolve to a git revision, which rides each manifest
-line; warming a branch other than `main` warns loudly. Concurrent warms
-serialise on a lock under the base dir.
+line; a committed lock that pins local filesystem inputs (`path:`,
+`git+file:`) is refused before anything is archived — those would sign
+builder-local files, outside the reviewed revision, into the broker-served
+cache; warming a branch other than `main` (local or remote ref alike) warns
+loudly. Concurrent warms serialise on a lock under the base dir.
 
 Re-warm whenever `main` moves in a way that changes the devShell (most
 commonly a `flake.lock` bump or dependency change). Warming is incremental:
