@@ -242,7 +242,10 @@ than papered over.
 - **Output closure must be in cache.nixos.org.** If a repo's devShell
   pulls something not in the binary cache for the guest system, warm still
   fails (this slice does not change that). Pre-existing constraint of the
-  `max-jobs=0 / fallback=false` warm; called out in docs.
+  `max-jobs=0 / fallback=false` warm; called out in docs. *Lifted by the
+  follow-on `2026-06-07-prewarmed-devshell-cache` slice (PW3): with
+  `nix_prewarm_cache_dir` configured, the devShell warm is served strictly
+  from the operator's signed pre-warm archive instead of cache.nixos.org.*
 - **Cache growth.** The broker-local archive accumulates across sessions;
   FK4 adds a size cap / GC. Content-addressed, so sharing across sessions
   is safe and deduplicates.
