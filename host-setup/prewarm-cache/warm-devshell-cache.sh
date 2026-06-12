@@ -36,7 +36,10 @@
 #     be) no commit's closure, so the signature would attest to nothing
 #     reviewable. (Untracked files are tolerated — a git-backed flake
 #     archives tracked content only.) Every flakeref must resolve to a git
-#     revision, recorded in each manifest line; warming a branch other than
+#     revision, recorded in each manifest line — and the revision is resolved
+#     ONCE, with all later nix invocations pinned to it, so a mutable ref
+#     (github:owner/repo/main) that advances mid-warm cannot make the signed
+#     closure disagree with the recorded rev. Warming a branch other than
 #     `main` warns loudly but proceeds (release branches are the operator's
 #     call).
 #   - HOOK CODE. Realisation builds the repo's derivations (that is the
@@ -193,19 +196,24 @@ else
   flakeref="$raw_flakeref"
 fi
 
-# The resolved revision, recorded in every manifest line so a later prune can
-# group warms by (repo, rev) — and so the signature is always attributable to
-# an exact commit. A flakeref that resolves to no revision (a tarball, a
-# non-git path) is refused outright: nothing reviewable to attest.
-# --no-update-lock-file: a stale lock — flake.nix and flake.lock disagreeing —
-# fails here rather than warming an in-memory updated input graph the
-# committed repo will not use.
-rev="$(nix "${nix_flags[@]}" flake metadata --json --no-update-lock-file "$flakeref" | jq -r '.revision // empty')"
-if [ -z "$rev" ]; then
+# Resolve the revision ONCE and PIN every later nix invocation to it. The
+# metadata's `.url` is the rev-locked flakeref (github:owner/repo/<rev>;
+# git+file://…?rev=<rev>): a mutable ref like github:owner/repo/main is
+# dereferenced exactly here, so a branch that advances mid-warm (or a fetcher
+# cache that expires between steps) cannot make the signed closure disagree
+# with the manifest's recorded rev. A flakeref that resolves to no revision
+# (a tarball, a non-git path) is refused outright: nothing reviewable to
+# attest. --no-update-lock-file: a stale lock — flake.nix and flake.lock
+# disagreeing — fails here rather than warming an in-memory updated input
+# graph the committed repo will not use.
+metadata_json="$(nix "${nix_flags[@]}" flake metadata --json --no-update-lock-file "$flakeref")"
+rev="$(printf '%s' "$metadata_json" | jq -r '.revision // empty')"
+pinned_flakeref="$(printf '%s' "$metadata_json" | jq -r '.url // empty')"
+if [ -z "$rev" ] || [ -z "$pinned_flakeref" ]; then
   echo "error: $flakeref resolves to no git revision; the manifest must record the exact commit the signature attests." >&2
   exit 1
 fi
-echo "==> warming $flakeref (rev $rev), devShell attr '$attr' for $target_system"
+echo "==> warming $flakeref (rev $rev, pinned as $pinned_flakeref), devShell attr '$attr' for $target_system"
 
 # --- lock --------------------------------------------------------------------
 # ONE host-level lock around the whole mutating sequence (cache writes +
@@ -286,7 +294,7 @@ signed_dest="file://$cache_dir?secret-key=$secret_key"
 # needs these inputs present — the pre-warm view is its ONLY substituter, so
 # there is no upstream to supply even nixpkgs.
 echo "==> archiving locked flake inputs"
-archive_json="$(nix "${nix_flags[@]}" flake archive --json --no-update-lock-file "$flakeref")"
+archive_json="$(nix "${nix_flags[@]}" flake archive --json --no-update-lock-file "$pinned_flakeref")"
 input_paths="$(printf '%s' "$archive_json" | jq -r '[.inputs | .. | .path? // empty] | unique[]' | grep '^/nix/store/' || true)"
 if [ -z "$input_paths" ]; then
   echo "    note: flake has no inputs; nothing to archive."
@@ -304,10 +312,11 @@ else
 fi
 
 # --- 2. devShell closure --------------------------------------------------------
-# Force the system-qualified attr (never host-native resolution), then assert
-# the resolved derivation really builds for the guest system — a flake that
-# overrides `system` per-shell would slip past the qualification alone.
-installable="$flakeref#devShells.$target_system.$attr"
+# Force the system-qualified attr (never host-native resolution) on the
+# rev-PINNED flakeref, then assert the resolved derivation really builds for
+# the guest system — a flake that overrides `system` per-shell would slip
+# past the qualification alone.
+installable="$pinned_flakeref#devShells.$target_system.$attr"
 echo "==> resolving $installable"
 if ! drv="$(nix "${nix_flags[@]}" eval --raw "$installable.drvPath")"; then
   echo "error: could not resolve a derivation for $installable (does the flake define devShells.$target_system.$attr?)." >&2
