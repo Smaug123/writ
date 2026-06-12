@@ -27,6 +27,7 @@ set -euo pipefail
 # cache_dir, manifest_dir, profiles_dir, secret_key, public_key). One
 # definition, shared with warm-devshell-cache.sh.
 dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source-path=SCRIPTDIR
 # shellcheck source=./common.sh
 . "$dir/common.sh"
 

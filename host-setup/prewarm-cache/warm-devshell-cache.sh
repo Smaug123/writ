@@ -86,6 +86,7 @@ EOF
 # definition, shared with init-prewarm-cache.sh, so we sign with exactly the
 # key it created.
 dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source-path=SCRIPTDIR
 # shellcheck source=./common.sh
 . "$dir/common.sh"
 
@@ -219,6 +220,25 @@ pinned_flakeref="$(printf '%s' "$metadata_json" | jq -r '.url // empty')"
 if [ -z "$rev" ] || [ -z "$pinned_flakeref" ]; then
   echo "error: $flakeref resolves to no git revision; the manifest must record the exact commit the signature attests." >&2
   exit 1
+fi
+
+# The non-`main` warning for REMOTE flakerefs (the local-dir path warned via
+# git above): the metadata's `.original.ref` is the branch the operator
+# actually asked for, so `github:owner/repo/feature` or
+# `git+…?ref=feature` warns exactly like a local feature-branch checkout. A
+# bare repo ref (no branch named) resolves the default branch — the remote
+# analogue of main — and stays quiet; an explicit rev pin has no branch to
+# confirm, which mirrors the local detached-HEAD warning.
+if [ ! -d "$raw_flakeref" ]; then
+  remote_ref="$(printf '%s' "$metadata_json" | jq -r '.original.ref // empty')"
+  remote_ref="${remote_ref#refs/heads/}"
+  if [ -n "$remote_ref" ] && [ "$remote_ref" != "main" ]; then
+    echo "WARNING: warming remote ref '$remote_ref', not 'main'. The pre-warm signature is" >&2
+    echo "         normally the attestation that a closure came from reviewed main." >&2
+  elif [ -z "$remote_ref" ] && [ -n "$(printf '%s' "$metadata_json" | jq -r '.original.rev // empty')" ]; then
+    echo "WARNING: warming an explicit rev pin; cannot confirm it is on 'main'. The pre-warm" >&2
+    echo "         signature is normally the attestation that a closure came from reviewed main." >&2
+  fi
 fi
 echo "==> warming $flakeref (rev $rev, pinned as $pinned_flakeref), devShell attr '$attr' for $target_system"
 
