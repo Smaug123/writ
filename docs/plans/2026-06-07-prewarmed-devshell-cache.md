@@ -168,7 +168,7 @@ Hermetic (the probe needs no network to build), so it runs anywhere on
 macOS. Proves the "sign + substitute input-addressed offline" mechanic, and
 that signature verification is load-bearing, before any broker change.
 
-### PW1 — Broker: admit signed local narinfos
+### PW1 — Broker: admit signed local narinfos — landed
 
 Relax `try_serve_local_narinfo` to admit "CA self-certifying **OR** signed
 by a trusted key" (try CA parse first; on `NotSelfCertifying`, try
@@ -180,7 +180,7 @@ served + admitted + NAR-verified; an unsigned or untrusted-signed
 input-addressed narinfo fails closed; the existing CA path is byte-for-byte
 unchanged. *This is the pure, security-critical core; keep it small.*
 
-### PW2 — Config: a separate, durable pre-warm cache dir
+### PW2 — Config: a separate, durable pre-warm cache dir — landed
 
 Add `nix_prewarm_cache_dir` to the vm_http config and runtime
 (`src/config.rs`), served local-first **before** `flake_input_cache_dir`.
@@ -191,20 +191,42 @@ pre-warm public key rides the existing `nix_cache_trusted_public_keys` (no
 new key field). Tests: config parse/validation; the broker serves the new
 dir local-first; the guest nix.conf carries the pre-warm key.
 
-### PW3 — Strict warm view + warm command wiring
+### PW3 — Strict warm view + warm command wiring — landed
 
 Expose a pre-warm-only serving view (no upstream proxy; serves pre-warm +
 FK CA dirs, 404 on miss) and point the warm command's substituters at it.
-Likely shape: a dedicated route (e.g. `/v1/nix/prewarm/`) reusing the local
-serving + signed admission but with upstream disabled, and an extra
-`--option substituters <prewarm-url>` on `nix_develop_command_args`
-(`crates/writ-vm-git/src/lib.rs:56`) so the warm cannot reach upstream even
-though the session nix.conf default still can. The runtime FK
-`/v1/nix/flake/provision` step becomes redundant for a pre-warmed repo
-(inputs are in the pre-warm dir); keep it as belt-and-braces or gate it —
-decide during implementation. Tests: the warm's substituter override is
+Shape as landed: a dedicated route `/v1/nix/prewarm` reusing the local
+serving + signed admission with the upstream disabled, and a
+`--option substituters <prewarm-url>` override on the warm's nix
+invocations, so the warm cannot reach upstream even though the session
+nix.conf default still can. Tests: the warm's substituter override is
 present and points at the pre-warm view; the pre-warm view never proxies
 upstream.
+
+Decisions made during implementation (2026-06-12, with the user):
+
+- **Strictness is gated on the operator opting in.** The daemon injects
+  `WRIT_NIX_PREWARM_URL` (and the guest warm goes strict) only when
+  `nix_prewarm_cache_dir` is configured. Plan-literal unconditional
+  strictness would have broken every devShell warm of a not-yet-pre-warmed
+  repo (and `scripts/prove-agent-vm-devshell-warm.sh`) between PW3 and PW5;
+  gating keeps PW3 inert-by-default, the PW2 precedent.
+- **Both warm steps are pinned, not just `nix develop`.** The devShell
+  warm's `nix flake metadata` (eval/input fetch) and `nix develop`
+  (realisation) both carry the override, so the *whole* warm provably never
+  proxies upstream — otherwise PW5's "0 warm requests hit upstream" would
+  hold only by accident of the FK dir being populated. The sources-only
+  warm (`--warm sources`) keeps the proxied default: strictness is the
+  devShell warm's contract.
+- **Not** wired into the shared `nix_develop_command_args`: that function
+  also builds the agent-run `nix develop` wrapper, which decision 1
+  deliberately leaves on the proxied endpoint (and which is assembled
+  before the broker URL exists). The override is scoped to the warm call
+  sites in `vm_client`.
+- **The runtime FK `/v1/nix/flake/provision` step is kept unconditionally**
+  (belt-and-braces): it is already best-effort, and under a strict warm it
+  is what keeps an FK-provisionable but not-yet-pre-warmed repo evaluable
+  (the pre-warm view serves the FK dir too).
 
 ### PW4 — Builder tooling (committed scripts)
 

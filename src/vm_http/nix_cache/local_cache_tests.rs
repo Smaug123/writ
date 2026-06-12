@@ -4,6 +4,10 @@
 //! narinfo, over-budget file, on-disk tamper, missing NAR, and the non-regular
 //! (symlink / FIFO) guards — plus the rule that an upstream-admitted NAR is
 //! never shadowed by a same-named local file.
+//!
+//! The `prewarm_view_*` tests at the bottom cover the `/v1/nix/prewarm`
+//! local-only view: the same local archives, but a miss is a `404` and the
+//! upstream is never contacted.
 
 use std::net::Ipv4Addr;
 use std::sync::Arc;
@@ -12,7 +16,6 @@ use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use super::super::tests::{make_broker_state, open_audit_session, session_for_subnet};
-use super::route::VM_NIX_CACHE_INFO_PATH;
 use super::test_support::*;
 use super::*;
 use crate::core::Ipv4Cidr;
@@ -1037,4 +1040,382 @@ async fn local_nar_head_returns_content_length_without_the_body() {
     assert_eq!(entries[1].http_status, Some(200));
     assert_eq!(entries[1].response_bytes, Some(0));
     assert_eq!(entries[1].error, None);
+}
+
+#[tokio::test]
+async fn prewarm_view_serves_a_trusted_signed_closure_path_without_upstream() {
+    // The strict warm's substituter: a signed, input-addressed closure path in
+    // the pre-warm dir is served (narinfo + NAR) through `/v1/nix/prewarm`
+    // against a dead upstream, proving the view needs no proxy.
+    let upstream = MockServer::start().await;
+    let state = make_broker_state(&upstream);
+    let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+    open_audit_session(&state, session.session_id());
+    let prewarm = tempfile::tempdir().unwrap();
+    let key_pair = test_ed25519_key_pair();
+    let store_hash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let nar_file = "prewarm-closure.nar.xz";
+    let (narinfo_bytes, compressed) = write_local_signed_entry(
+        prewarm.path(),
+        &key_pair,
+        store_hash,
+        "writ-prewarm-closure",
+        nar_file,
+        b"a compiled devShell output",
+    );
+    let trusted = NixTrustedPublicKeys::from_strings([trusted_public_key_for_test(
+        TEST_SIGNING_KEY_NAME,
+        &key_pair,
+    )])
+    .unwrap();
+    let service = nix_cache_service_with_local_cache_and_trusted_keys(
+        &state,
+        DEAD_UPSTREAM,
+        prewarm.path(),
+        trusted,
+        4096,
+        4096,
+    );
+
+    let narinfo_response = route_nix_cache_with_service(
+        &session,
+        "GET",
+        format!("{VM_NIX_PREWARM_PATH_PREFIX}/{store_hash}.narinfo"),
+        service.clone(),
+    )
+    .await;
+    let nar_response = route_nix_cache_with_service(
+        &session,
+        "GET",
+        format!("{VM_NIX_PREWARM_PATH_PREFIX}/nar/{nar_file}"),
+        service,
+    )
+    .await;
+
+    assert_eq!(narinfo_response.status, VmHttpStatus::Ok);
+    assert_eq!(narinfo_response.body, narinfo_bytes);
+    assert_eq!(nar_response.status, VmHttpStatus::Ok);
+    assert_eq!(nar_response.content_type, "application/x-nix-nar");
+    assert_eq!(nar_response.body, compressed);
+    let entries = state
+        .audit
+        .list_nix_cache_requests_for_session(session.session_id())
+        .unwrap();
+    assert_eq!(entries.len(), 2);
+    assert!(
+        entries.iter().all(|e| e
+            .upstream_url
+            .as_deref()
+            .is_some_and(|url| url.starts_with("file://"))),
+        "both responses must come from the local archive: {:?}",
+        entries
+            .iter()
+            .map(|e| e.upstream_url.clone())
+            .collect::<Vec<_>>(),
+    );
+}
+
+#[tokio::test]
+async fn prewarm_view_serves_the_flake_input_dir_too() {
+    // The strict warm still needs the FK CA input archive (eval inputs); the
+    // pre-warm view serves the whole ordered dir list, with the NAR routed from
+    // the dir that admitted it (here the second, flake-input dir).
+    let upstream = MockServer::start().await;
+    let state = make_broker_state(&upstream);
+    let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+    open_audit_session(&state, session.session_id());
+    let prewarm = tempfile::tempdir().unwrap(); // present but lacks this hash
+    let flake_input = tempfile::tempdir().unwrap();
+    let nar_file = "input.nar.xz";
+    let (hash, narinfo_bytes, compressed) =
+        write_local_ca_entry(flake_input.path(), "source", nar_file, b"a flake input nar");
+    let service = nix_cache_service_with_local_cache_dirs_and_trusted_keys(
+        &state,
+        DEAD_UPSTREAM,
+        vec![
+            prewarm.path().to_path_buf(),
+            flake_input.path().to_path_buf(),
+        ],
+        NixTrustedPublicKeys::empty(),
+        4096,
+        4096,
+    );
+
+    let narinfo_response = route_nix_cache_with_service(
+        &session,
+        "GET",
+        format!("{VM_NIX_PREWARM_PATH_PREFIX}/{hash}.narinfo"),
+        service.clone(),
+    )
+    .await;
+    let nar_response = route_nix_cache_with_service(
+        &session,
+        "GET",
+        format!("{VM_NIX_PREWARM_PATH_PREFIX}/nar/{nar_file}"),
+        service,
+    )
+    .await;
+
+    assert_eq!(narinfo_response.status, VmHttpStatus::Ok);
+    assert_eq!(narinfo_response.body, narinfo_bytes);
+    assert_eq!(nar_response.status, VmHttpStatus::Ok);
+    assert_eq!(nar_response.body, compressed);
+    let entries = state
+        .audit
+        .list_nix_cache_requests_for_session(session.session_id())
+        .unwrap();
+    let flake_prefix = format!("file://{}", flake_input.path().display());
+    assert!(
+        entries[1]
+            .upstream_url
+            .as_deref()
+            .is_some_and(|u| u.starts_with(&flake_prefix)),
+        "the NAR must be served from the flake-input dir, got {:?}",
+        entries[1].upstream_url,
+    );
+}
+
+#[tokio::test]
+async fn prewarm_view_narinfo_miss_is_a_404_not_an_upstream_proxy() {
+    // The strict guarantee: a hash absent from every local dir 404s on the
+    // pre-warm view even though a live upstream *would* serve it (the same
+    // request through `/v1/nix/cache` proxies). `expect(0)` proves the pre-warm
+    // view never contacted the upstream.
+    let upstream = MockServer::start().await;
+    let state = make_broker_state(&upstream);
+    let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+    open_audit_session(&state, session.session_id());
+    let cache = tempfile::tempdir().unwrap(); // empty: every hash is a local miss
+    let hash = "rzv95bakh41zrn5ji23pfc11x5vq2z4d";
+    Mock::given(method("GET"))
+        .and(path(format!("/{hash}.narinfo")))
+        .respond_with(ResponseTemplate::new(200).set_body_string(TEST_SIGNED_NARINFO))
+        .expect(0)
+        .mount(&upstream)
+        .await;
+    let service = VmHttpNixCacheService::new(
+        Arc::clone(&state),
+        VmHttpNixCacheConfig::new_with_trusted_public_keys(
+            upstream.uri(),
+            1024,
+            1024,
+            NixTrustedPublicKeys::from_strings([TEST_NIX_CACHE_PUBLIC_KEY]).unwrap(),
+        )
+        .unwrap()
+        .with_local_cache_dirs(vec![cache.path().to_path_buf()]),
+    );
+
+    let response = route_nix_cache_with_service(
+        &session,
+        "GET",
+        format!("{VM_NIX_PREWARM_PATH_PREFIX}/{hash}.narinfo"),
+        service,
+    )
+    .await;
+
+    assert_eq!(response.status, VmHttpStatus::NotFound);
+    upstream.verify().await;
+    let entries = state
+        .audit
+        .list_nix_cache_requests_for_session(session.session_id())
+        .unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].route, NixCacheAuditRoute::NarInfo);
+    assert_eq!(entries[0].http_status, Some(404));
+    assert_eq!(entries[0].upstream_url, None);
+    assert_eq!(entries[0].upstream_status, None);
+    assert_eq!(entries[0].error, None);
+}
+
+#[tokio::test]
+async fn prewarm_view_cache_info_is_synthetic_even_when_archives_are_empty() {
+    // Unlike the proxied view (which proxies cache-info while the archive is
+    // empty), the pre-warm view always synthesises it: an empty cache is a
+    // valid cache that misses every narinfo, and Nix rejects a substituter
+    // whose cache-info errors.
+    let upstream = MockServer::start().await;
+    let state = make_broker_state(&upstream);
+    let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+    open_audit_session(&state, session.session_id());
+    let cache = tempfile::tempdir().unwrap(); // empty
+    Mock::given(method("GET"))
+        .and(path("/nix-cache-info"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("StoreDir: /nix/store\n"))
+        .expect(0)
+        .mount(&upstream)
+        .await;
+    let service =
+        nix_cache_service_with_local_cache(&state, &upstream.uri(), cache.path(), 1024, 1024);
+
+    let response = route_nix_cache_with_service(
+        &session,
+        "GET",
+        VM_NIX_PREWARM_CACHE_INFO_PATH.into(),
+        service,
+    )
+    .await;
+
+    assert_eq!(response.status, VmHttpStatus::Ok);
+    let body = String::from_utf8(response.body).unwrap();
+    assert!(body.contains("StoreDir: /nix/store"), "{body}");
+    upstream.verify().await;
+    let entries = state
+        .audit
+        .list_nix_cache_requests_for_session(session.session_id())
+        .unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].route, NixCacheAuditRoute::CacheInfo);
+    assert_eq!(entries[0].upstream_url, None);
+}
+
+#[tokio::test]
+async fn prewarm_view_narinfo_present_but_inadmissible_fails_closed_not_404() {
+    // The 404-on-miss contract is for *absent* hashes only: a present but
+    // inadmissible narinfo (signed by an untrusted key) is authoritative for
+    // its dir and fails closed with a 502, exactly as on the proxied view — it
+    // must not be soft-missed into "never warmed".
+    let upstream = MockServer::start().await;
+    let state = make_broker_state(&upstream);
+    let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+    open_audit_session(&state, session.session_id());
+    let cache = tempfile::tempdir().unwrap();
+    let key_pair = test_ed25519_key_pair();
+    let store_hash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    write_local_signed_entry(
+        cache.path(),
+        &key_pair,
+        store_hash,
+        "writ-prewarm-closure",
+        "prewarm-closure.nar.xz",
+        b"a compiled devShell output",
+    );
+    let service = nix_cache_service_with_local_cache_and_trusted_keys(
+        &state,
+        DEAD_UPSTREAM,
+        cache.path(),
+        NixTrustedPublicKeys::empty(), // the signing key is not trusted
+        4096,
+        4096,
+    );
+
+    let response = route_nix_cache_with_service(
+        &session,
+        "GET",
+        format!("{VM_NIX_PREWARM_PATH_PREFIX}/{store_hash}.narinfo"),
+        service,
+    )
+    .await;
+
+    assert_eq!(response.status, VmHttpStatus::BadGateway);
+    let entries = state
+        .audit
+        .list_nix_cache_requests_for_session(session.session_id())
+        .unwrap();
+    assert_eq!(
+        entries[0].error.as_deref(),
+        Some("local narinfo neither self-certifying nor trusted-signed"),
+    );
+}
+
+#[tokio::test]
+async fn prewarm_view_refuses_an_upstream_admitted_nar() {
+    // A narinfo admitted from the upstream through the proxied view pins its
+    // NAR to the upstream; asking the pre-warm view for that NAR must fail
+    // closed rather than proxy. `expect(0)` on the NAR endpoint proves it.
+    let upstream = MockServer::start().await;
+    let state = make_broker_state(&upstream);
+    let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+    open_audit_session(&state, session.session_id());
+    let hash = "rzv95bakh41zrn5ji23pfc11x5vq2z4d";
+    Mock::given(method("GET"))
+        .and(path(format!("/{hash}.narinfo")))
+        .respond_with(ResponseTemplate::new(200).set_body_string(TEST_SIGNED_NARINFO))
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/nar/{TEST_NAR_FILE}")))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(test_xz_nar_body()))
+        .expect(0)
+        .mount(&upstream)
+        .await;
+    let service = signed_nix_cache_service_for_test(&state, &upstream, 1024);
+
+    let narinfo = route_nix_cache_with_service(
+        &session,
+        "GET",
+        format!("{VM_NIX_CACHE_PATH_PREFIX}/{hash}.narinfo"),
+        service.clone(),
+    )
+    .await;
+    let nar = route_nix_cache_with_service(
+        &session,
+        "GET",
+        format!("{VM_NIX_PREWARM_PATH_PREFIX}/nar/{TEST_NAR_FILE}"),
+        service,
+    )
+    .await;
+
+    assert_eq!(narinfo.status, VmHttpStatus::Ok);
+    assert_eq!(nar.status, VmHttpStatus::BadGateway);
+    upstream.verify().await;
+    let entries = state
+        .audit
+        .list_nix_cache_requests_for_session(session.session_id())
+        .unwrap();
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[1].route, NixCacheAuditRoute::Nar);
+    assert_eq!(entries[1].http_status, Some(502));
+    assert_eq!(
+        entries[1].error.as_deref(),
+        Some("upstream-admitted nar refused on pre-warm route"),
+    );
+}
+
+#[tokio::test]
+async fn nar_admitted_via_prewarm_view_is_served_locally_through_the_cache_view() {
+    // Source pinning holds across views: a narinfo admitted from the local
+    // archive via the pre-warm view serves its NAR from that same dir even
+    // when the NAR is requested through the proxied `/v1/nix/cache` view.
+    let upstream = MockServer::start().await;
+    let state = make_broker_state(&upstream);
+    let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+    open_audit_session(&state, session.session_id());
+    let cache = tempfile::tempdir().unwrap();
+    let nar_file = "input.nar.xz";
+    let (hash, _, compressed) =
+        write_local_ca_entry(cache.path(), "source", nar_file, b"cross-view pinning");
+    let service =
+        nix_cache_service_with_local_cache(&state, DEAD_UPSTREAM, cache.path(), 4096, 4096);
+
+    let narinfo = route_nix_cache_with_service(
+        &session,
+        "GET",
+        format!("{VM_NIX_PREWARM_PATH_PREFIX}/{hash}.narinfo"),
+        service.clone(),
+    )
+    .await;
+    let nar = route_nix_cache_with_service(
+        &session,
+        "GET",
+        format!("{VM_NIX_CACHE_PATH_PREFIX}/nar/{nar_file}"),
+        service,
+    )
+    .await;
+
+    assert_eq!(narinfo.status, VmHttpStatus::Ok);
+    assert_eq!(nar.status, VmHttpStatus::Ok);
+    assert_eq!(nar.body, compressed);
+    let entries = state
+        .audit
+        .list_nix_cache_requests_for_session(session.session_id())
+        .unwrap();
+    assert!(
+        entries[1]
+            .upstream_url
+            .as_deref()
+            .is_some_and(|url| url.starts_with("file://")),
+        "the NAR must be served from the pinned local dir, got {:?}",
+        entries[1].upstream_url,
+    );
 }

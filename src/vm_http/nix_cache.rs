@@ -3,6 +3,11 @@
 //! configured upstream while admitting only signed narinfos and verifying NAR
 //! bodies before they reach the guest.
 //!
+//! Two views over the same service: `/v1/nix/cache` serves the local archives
+//! local-first and falls through to the upstream proxy, while `/v1/nix/prewarm`
+//! serves the local archives *only* (a miss is a `404`, never an upstream
+//! fetch) so the devShell warm can be pinned to the pre-warmed closure.
+//!
 //! This module is the imperative shell that wires the request-classification
 //! (`route`), config validation (`config`), NAR verification (`nar_verify`) and
 //! local-archive file IO (`local_cache`) submodules into the proxy service and
@@ -33,7 +38,7 @@ mod nar_verify;
 mod route;
 
 pub use config::{VmHttpNixCacheConfig, VmHttpNixCacheConfigError};
-pub use route::{VM_NIX_BASIC_LOGIN, VM_NIX_CACHE_PATH_PREFIX};
+pub use route::{VM_NIX_BASIC_LOGIN, VM_NIX_CACHE_PATH_PREFIX, VM_NIX_PREWARM_PATH_PREFIX};
 
 use local_cache::{
     LocalCacheFile, LocalCacheStat, local_file_url, read_local_cache_file, stat_local_cache_file,
@@ -42,7 +47,7 @@ use nar_verify::{
     VmHttpNixCacheAdmittedNar, nar_body_hash_error_label, validate_nar_body_length,
     validate_nar_content_length, verify_nar_body_on_blocking_thread,
 };
-use route::{VM_NIX_CACHE_INFO_BODY, VmNixCacheRoute, classify_nix_cache_target};
+use route::{VM_NIX_CACHE_INFO_BODY, VmNixCacheRoute, VmNixCacheView, classify_nix_cache_target};
 // Re-exported for `super` (the `vm_http` dispatcher), which routes to these but
 // does not define them. `route_nix_cache_request_without_upstream` is also used
 // directly below when no upstream service is configured.
@@ -153,7 +158,7 @@ pub(super) async fn route_nix_cache_request<S: SecretStore>(
     let Some(service) = service else {
         return route_nix_cache_request_without_upstream(request).into();
     };
-    let Some(route) = classify_nix_cache_target(&request.target) else {
+    let Some((view, route)) = classify_nix_cache_target(&request.target) else {
         let response = VmHttpResponse::text(VmHttpStatus::NotFound, "not found");
         return record_nix_cache_local_response(
             Some(&service),
@@ -199,7 +204,9 @@ pub(super) async fn route_nix_cache_request<S: SecretStore>(
             .into();
     }
 
-    let fetch = service.fetch_route(request.method.as_str(), &route).await;
+    let fetch = service
+        .fetch_route(request.method.as_str(), view, &route)
+        .await;
     if let Err(err) = record_nix_cache_outcome(&service, request_id, &fetch) {
         tracing::error!(
             target: AUDIT_WRITE_FAILURE_TARGET,
@@ -310,7 +317,7 @@ fn nix_cache_audit_route(
 ) -> NixCacheAuditRoute {
     let route = route
         .cloned()
-        .or_else(|| classify_nix_cache_target(&request.target));
+        .or_else(|| classify_nix_cache_target(&request.target).map(|(_view, route)| route));
     match route {
         Some(VmNixCacheRoute::CacheInfo) => NixCacheAuditRoute::CacheInfo,
         Some(VmNixCacheRoute::NarInfo { .. }) => NixCacheAuditRoute::NarInfo,
@@ -320,9 +327,14 @@ fn nix_cache_audit_route(
 }
 
 impl<S: SecretStore> VmHttpNixCacheService<S> {
-    async fn fetch_route(&self, method: &str, route: &VmNixCacheRoute) -> VmHttpNixCacheProxyFetch {
+    async fn fetch_route(
+        &self,
+        method: &str,
+        view: VmNixCacheView,
+        route: &VmNixCacheRoute,
+    ) -> VmHttpNixCacheProxyFetch {
         match route {
-            VmNixCacheRoute::CacheInfo => {
+            VmNixCacheRoute::CacheInfo => match view {
                 // Serve the cache metadata locally only once the archive holds
                 // something to serve, so the guest's mandatory pre-flight
                 // `nix-cache-info` is decoupled from upstream reachability
@@ -332,23 +344,36 @@ impl<S: SecretStore> VmHttpNixCacheService<S> {
                 // archive (nothing provisioned yet) has nothing to serve, so it
                 // proxies the upstream exactly as before and stays
                 // byte-identical to upstream-only.
-                if self.local_cache_has_narinfo().await {
-                    local_cache_info(method)
-                } else {
-                    self.fetch_metadata(method, route).await
+                VmNixCacheView::Proxied => {
+                    if self.local_cache_has_narinfo().await {
+                        local_cache_info(method)
+                    } else {
+                        self.fetch_metadata(method, route).await
+                    }
                 }
-            }
+                // The pre-warm-only view has no upstream to defer to: the
+                // synthetic metadata is always the answer, even over empty
+                // archives (an empty cache is a valid cache that simply misses
+                // every narinfo; Nix rejects a substituter whose
+                // `nix-cache-info` errors, so this must never 404).
+                VmNixCacheView::LocalOnly => local_cache_info(method),
+            },
             VmNixCacheRoute::NarInfo { hash } => {
-                // Local-first: a content-addressed narinfo in the broker's
-                // archive is served (and admitted) without contacting the
-                // upstream; a local miss falls through to the signed upstream
-                // proxy, so an empty/absent local cache behaves identically.
+                // Local-first on both views: a narinfo in the broker's archives
+                // is served (and admitted) without contacting the upstream. On
+                // a local miss the proxied view falls through to the signed
+                // upstream proxy; the pre-warm-only view answers a clean miss,
+                // so the warm fails fast instead of substituting a path that
+                // was never warmed.
                 if let Some(fetch) = self.try_serve_local_narinfo(method, hash).await {
                     return fetch;
                 }
-                self.fetch_metadata(method, route).await
+                match view {
+                    VmNixCacheView::Proxied => self.fetch_metadata(method, route).await,
+                    VmNixCacheView::LocalOnly => local_not_found(),
+                }
             }
-            VmNixCacheRoute::Nar { .. } => self.fetch_nar(method, route).await,
+            VmNixCacheRoute::Nar { .. } => self.fetch_nar(method, view, route).await,
         }
     }
 
@@ -491,7 +516,12 @@ impl<S: SecretStore> VmHttpNixCacheService<S> {
         }
     }
 
-    async fn fetch_nar(&self, method: &str, route: &VmNixCacheRoute) -> VmHttpNixCacheProxyFetch {
+    async fn fetch_nar(
+        &self,
+        method: &str,
+        view: VmNixCacheView,
+        route: &VmNixCacheRoute,
+    ) -> VmHttpNixCacheProxyFetch {
         let VmNixCacheRoute::Nar { file } = route else {
             unreachable!("caller dispatches only NAR routes to fetch_nar");
         };
@@ -511,6 +541,17 @@ impl<S: SecretStore> VmHttpNixCacheService<S> {
                 .expect("a local NAR admission pins a configured local cache dir");
             let nar_path = dir.join("nar").join(file.as_str());
             return self.serve_local_nar(method, &nar_path, &admission).await;
+        }
+        // An upstream-admitted NAR can only be served by proxying the upstream,
+        // which the pre-warm-only view exists to forbid. Reachable only if the
+        // guest admits a narinfo through the proxied view and then asks the
+        // pre-warm view for its NAR (Nix itself never splits a substituter's
+        // narinfo/NAR fetches across base URLs); fail closed rather than proxy.
+        if view == VmNixCacheView::LocalOnly {
+            return local_failure(
+                String::new(),
+                "upstream-admitted nar refused on pre-warm route",
+            );
         }
         let url = self.upstream_url(route);
         let upstream_url = url.to_string();
@@ -1047,6 +1088,20 @@ fn local_cache_info(method: &str) -> VmHttpNixCacheProxyFetch {
         upstream_url: String::new(),
         upstream_status: None,
         response_bytes,
+        error: None,
+        response,
+    }
+}
+
+/// A clean local miss on the pre-warm-only view: HTTP 404 with no upstream
+/// contact and no audit error — a miss is the expected answer for a path that
+/// was never warmed, mirroring the proxied view's handling of an upstream 404.
+fn local_not_found() -> VmHttpNixCacheProxyFetch {
+    let response = VmHttpResponse::text(VmHttpStatus::NotFound, "not found");
+    VmHttpNixCacheProxyFetch {
+        upstream_url: String::new(),
+        upstream_status: None,
+        response_bytes: response.body.len() as u64,
         error: None,
         response,
     }

@@ -32,8 +32,8 @@ use git_push::{is_git_push_target, route_git_push_request};
 #[cfg(test)]
 use nix_cache::route_nix_cache_request_without_upstream;
 pub use nix_cache::{
-    VM_NIX_BASIC_LOGIN, VM_NIX_CACHE_PATH_PREFIX, VmHttpNixCacheConfig, VmHttpNixCacheConfigError,
-    VmHttpNixCacheService,
+    VM_NIX_BASIC_LOGIN, VM_NIX_CACHE_PATH_PREFIX, VM_NIX_PREWARM_PATH_PREFIX, VmHttpNixCacheConfig,
+    VmHttpNixCacheConfigError, VmHttpNixCacheService,
 };
 use nix_cache::{is_nix_cache_target, record_nix_cache_local_response, route_nix_cache_request};
 use openai_proxy::VmHttpOpenAiProxyService;
@@ -123,6 +123,12 @@ pub struct VmHttpRuntimeConfig {
     /// mirror cache that backs it is configured, since provisioning re-derives
     /// the checkout from a retained mirror.
     flake_provision: Option<VmHttpFlakeProvisionConfig>,
+    /// The operator-managed pre-warm cache dir, when configured. The serving
+    /// side only sees the role-agnostic ordered dir list inside `nix_cache`;
+    /// this records the *role* so the daemon can tell whether pre-warming is in
+    /// effect (and so advertise the strict `/v1/nix/prewarm` substituter to the
+    /// guest warm). `None` leaves the warm on the proxied view, as before.
+    nix_prewarm_cache_dir: Option<PathBuf>,
 }
 
 pub struct PreparedVmHttpSession<S: SecretStore + Send + Sync + 'static> {
@@ -484,6 +490,7 @@ impl VmHttpRuntimeConfig {
             git_push_staging_root: git_push_staging_root.into(),
             git_push_body_limits,
             flake_provision: None,
+            nix_prewarm_cache_dir: None,
         }
     }
 
@@ -499,6 +506,18 @@ impl VmHttpRuntimeConfig {
 
     pub fn flake_provision(&self) -> Option<&VmHttpFlakeProvisionConfig> {
         self.flake_provision.as_ref()
+    }
+
+    /// Record the configured pre-warm cache dir (see the field docs). The same
+    /// path must already lead the nix-cache config's ordered local dir list;
+    /// this records only the role.
+    pub fn with_nix_prewarm_cache_dir(mut self, dir: Option<PathBuf>) -> Self {
+        self.nix_prewarm_cache_dir = dir;
+        self
+    }
+
+    pub fn nix_prewarm_cache_dir(&self) -> Option<&Path> {
+        self.nix_prewarm_cache_dir.as_deref()
     }
 
     pub fn bind_addr(&self) -> Ipv4Addr {

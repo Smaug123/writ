@@ -259,11 +259,32 @@ pub(super) fn daemon_config(
     daemon_config_with_subnet_range(dir, fake_tool, 252, 253)
 }
 
+/// A daemon config whose broker serves a configured pre-warm cache dir, so a
+/// started session advertises the strict `/v1/nix/prewarm` substituter to the
+/// guest warm.
+pub(super) fn daemon_config_with_prewarm_dir(
+    dir: &Path,
+    fake_tool: &Path,
+    prewarm_dir: &Path,
+) -> (AgentVmDaemonRuntimeConfig, AgentVmSessionStateStore) {
+    daemon_config_inner(dir, fake_tool, 252, 253, Some(prewarm_dir.to_path_buf()))
+}
+
 pub(super) fn daemon_config_with_subnet_range(
     dir: &Path,
     fake_tool: &Path,
     subnet_index_min: u16,
     subnet_index_max: u16,
+) -> (AgentVmDaemonRuntimeConfig, AgentVmSessionStateStore) {
+    daemon_config_inner(dir, fake_tool, subnet_index_min, subnet_index_max, None)
+}
+
+fn daemon_config_inner(
+    dir: &Path,
+    fake_tool: &Path,
+    subnet_index_min: u16,
+    subnet_index_max: u16,
+    nix_prewarm_cache_dir: Option<PathBuf>,
 ) -> (AgentVmDaemonRuntimeConfig, AgentVmSessionStateStore) {
     let state_store = AgentVmSessionStateStore::new(dir.join("state"));
     let lifecycle = AgentVmLifecycleRuntimeConfig::new(
@@ -288,6 +309,14 @@ pub(super) fn daemon_config_with_subnet_range(
         1024 * 1024,
     )
     .unwrap();
+    let nix_cache = VmHttpNixCacheConfig::new_with_trusted_public_keys(
+        "http://127.0.0.1:9",
+        1024 * 1024,
+        1024 * 1024,
+        NixTrustedPublicKeys::from_strings([TEST_NIX_CACHE_PUBLIC_KEY]).unwrap(),
+    )
+    .unwrap()
+    .with_local_cache_dirs(nix_prewarm_cache_dir.iter().cloned().collect());
     (
         AgentVmDaemonRuntimeConfig::new(
             lifecycle,
@@ -295,17 +324,12 @@ pub(super) fn daemon_config_with_subnet_range(
                 "0.0.0.0".parse().unwrap(),
                 BrokerPortRange::new(1024, 65535).unwrap(),
                 git_clone,
-                VmHttpNixCacheConfig::new_with_trusted_public_keys(
-                    "http://127.0.0.1:9",
-                    1024 * 1024,
-                    1024 * 1024,
-                    NixTrustedPublicKeys::from_strings([TEST_NIX_CACHE_PUBLIC_KEY]).unwrap(),
-                )
-                .unwrap(),
+                nix_cache,
                 dir.join("agent-runs"),
                 dir.join("git-push-staging"),
                 VmGitPushBodyLimits::new(65 * 1024 * 1024, 16 * 1024, 64 * 1024 * 1024).unwrap(),
-            ),
+            )
+            .with_nix_prewarm_cache_dir(nix_prewarm_cache_dir),
         )
         .unwrap(),
         state_store,

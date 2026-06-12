@@ -27,11 +27,16 @@ use crate::vm_git::{
     VmFlakeProvisionRequest, VmFlakeProvisionResponse, VmGitCloneErrorResponse, VmGitCloneRequest,
     VmGitPushErrorResponse, VmGitPushMetadata, VmGitPushRequest, VmGitPushStagedReceipt,
     WorkspaceWarmMode, default_workspace_destination, encode_vm_git_push_request_body,
-    nix_develop_command_args,
+    nix_develop_command_args, nix_substituters_override_args,
 };
 
 pub const VM_BROKER_URL_ENV: &str = "WRIT_BROKER_URL";
 pub const VM_BROKER_TOKEN_ENV: &str = "WRIT_BROKER_TOKEN";
+/// The strict, pre-warm-only substituter URL, injected by the daemon exactly
+/// when the broker serves a pre-warm cache dir. When present, the devShell
+/// warm's nix invocations replace their substituters with this URL, so the
+/// warm never reaches the upstream-proxying cache view.
+pub const VM_NIX_PREWARM_URL_ENV: &str = "WRIT_NIX_PREWARM_URL";
 pub const DEFAULT_VM_CLIENT_MAX_BUNDLE_BYTES: u64 = 512 * 1024 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -68,6 +73,10 @@ pub struct VmWorkspaceInitCommand {
     warm: WorkspaceWarmMode,
     git_program: PathBuf,
     nix_program: PathBuf,
+    /// The strict pre-warm-only substituter (see [`VM_NIX_PREWARM_URL_ENV`]).
+    /// `Some` pins the devShell warm's nix invocations to this URL; `None` (no
+    /// pre-warming in this deployment) leaves them on the session default.
+    prewarm_substituter_url: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -112,6 +121,8 @@ pub enum VmGitPushCommandError {
 pub enum VmWorkspaceInitCommandError {
     #[error("workspace destination path must not be empty")]
     EmptyDestination,
+    #[error("pre-warm substituter URL must be http or https: {0:?}")]
+    UnsupportedPrewarmSubstituterUrl(String),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -375,6 +386,7 @@ impl VmWorkspaceInitCommand {
         warm: WorkspaceWarmMode,
         git_program: impl Into<PathBuf>,
         nix_program: impl Into<PathBuf>,
+        prewarm_substituter_url: Option<String>,
     ) -> Result<Self, VmWorkspaceInitCommandError> {
         let destination = match destination {
             Some(path) => path,
@@ -383,12 +395,18 @@ impl VmWorkspaceInitCommand {
         if destination.as_os_str().is_empty() {
             return Err(VmWorkspaceInitCommandError::EmptyDestination);
         }
+        if let Some(url) = &prewarm_substituter_url
+            && !(url.starts_with("http://") || url.starts_with("https://"))
+        {
+            return Err(VmWorkspaceInitCommandError::UnsupportedPrewarmSubstituterUrl(url.clone()));
+        }
         Ok(Self {
             repo,
             destination,
             warm,
             git_program: git_program.into(),
             nix_program: nix_program.into(),
+            prewarm_substituter_url,
         })
     }
 
@@ -410,6 +428,10 @@ impl VmWorkspaceInitCommand {
 
     pub fn nix_program(&self) -> &Path {
         &self.nix_program
+    }
+
+    pub fn prewarm_substituter_url(&self) -> Option<&str> {
+        self.prewarm_substituter_url.as_deref()
     }
 }
 
@@ -1464,42 +1486,73 @@ fn canonical_github_origin_url(repo: &GitCloneRepo) -> String {
 fn warm_workspace(command: &VmWorkspaceInitCommand) -> Result<(), VmClientError> {
     match command.warm() {
         WorkspaceWarmMode::None => Ok(()),
-        WorkspaceWarmMode::Sources => run_nix_flake_metadata(command),
+        // The sources warm stays on the session-default (proxied) substituter:
+        // strictness is the *devShell* warm's contract (decision 1 of the
+        // pre-warmed-devshell-cache plan).
+        WorkspaceWarmMode::Sources => run_nix_flake_metadata(command, None),
+        // Strict devShell warm: when the daemon advertised a pre-warm-only
+        // substituter, pin *both* warm steps to it — eval input fetches and
+        // closure realisation alike — so the whole warm is served from the
+        // pre-warm + flake-input archives and provably never proxies upstream.
         WorkspaceWarmMode::DevShell => {
-            run_nix_flake_metadata(command)?;
-            run_nix_develop_true(command)
+            let substituter_override = command.prewarm_substituter_url();
+            run_nix_flake_metadata(command, substituter_override)?;
+            run_nix_develop_true(command, substituter_override)
         }
     }
 }
 
-fn run_nix_flake_metadata(command: &VmWorkspaceInitCommand) -> Result<(), VmClientError> {
+/// The leading `--option substituters <url>` run for a strict warm invocation,
+/// or no args at all when no pre-warm substituter is in effect.
+fn warm_substituter_override_args(substituter_override: Option<&str>) -> Vec<OsString> {
+    substituter_override
+        .map(|url| {
+            nix_substituters_override_args(url)
+                .into_iter()
+                .map(OsString::from)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn run_nix_flake_metadata(
+    command: &VmWorkspaceInitCommand,
+    substituter_override: Option<&str>,
+) -> Result<(), VmClientError> {
+    let mut args = warm_substituter_override_args(substituter_override);
+    args.extend([
+        OsString::from("--option"),
+        OsString::from("builders"),
+        OsString::from(""),
+        OsString::from("--option"),
+        OsString::from("max-jobs"),
+        OsString::from("0"),
+        OsString::from("--option"),
+        OsString::from("fallback"),
+        OsString::from("false"),
+        OsString::from("flake"),
+        OsString::from("metadata"),
+        OsString::from("--refresh"),
+        OsString::from("--no-write-lock-file"),
+    ]);
     run_nix_command(
         command.nix_program(),
         VmWorkspaceWarmStep::FlakeMetadata,
-        vec![
-            OsString::from("--option"),
-            OsString::from("builders"),
-            OsString::from(""),
-            OsString::from("--option"),
-            OsString::from("max-jobs"),
-            OsString::from("0"),
-            OsString::from("--option"),
-            OsString::from("fallback"),
-            OsString::from("false"),
-            OsString::from("flake"),
-            OsString::from("metadata"),
-            OsString::from("--refresh"),
-            OsString::from("--no-write-lock-file"),
-        ],
+        args,
         command.destination(),
     )
 }
 
-fn run_nix_develop_true(command: &VmWorkspaceInitCommand) -> Result<(), VmClientError> {
-    let mut args: Vec<OsString> = nix_develop_command_args(DEFAULT_DEVSHELL_ATTR)
-        .into_iter()
-        .map(OsString::from)
-        .collect();
+fn run_nix_develop_true(
+    command: &VmWorkspaceInitCommand,
+    substituter_override: Option<&str>,
+) -> Result<(), VmClientError> {
+    let mut args = warm_substituter_override_args(substituter_override);
+    args.extend(
+        nix_develop_command_args(DEFAULT_DEVSHELL_ATTR)
+            .into_iter()
+            .map(OsString::from),
+    );
     args.push(OsString::from("true"));
     run_nix_command(
         command.nix_program(),
@@ -2112,6 +2165,7 @@ mod tests {
             WorkspaceWarmMode::Sources,
             git,
             "nix",
+            None,
         )
         .unwrap();
 
@@ -2151,6 +2205,7 @@ mod tests {
             WorkspaceWarmMode::None,
             git,
             "nix",
+            None,
         )
         .unwrap();
 
@@ -2327,6 +2382,7 @@ mod tests {
             WorkspaceWarmMode::None,
             git,
             "nix",
+            None,
         )
         .unwrap();
 
@@ -2357,6 +2413,118 @@ mod tests {
         assert!(!git_log.contains("writ-vm-secret"), "{git_log}");
         assert!(git_log.contains("broker_url=unset"), "{git_log}");
         assert!(git_log.contains("broker_token=unset"), "{git_log}");
+    }
+
+    /// A fake `nix` that logs each invocation's argv (one line per call) and
+    /// succeeds, so warm tests can pin the exact argument envelope.
+    fn write_fake_nix(dir: &Path) -> PathBuf {
+        let path = dir.join("fake-nix");
+        let log = dir.join("nix.log");
+        let script = format!(
+            "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$*\" >> {log}\nexit 0\n",
+            log = log.display()
+        );
+        fs::write(&path, script).unwrap();
+        let mut permissions = fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&path, permissions).unwrap();
+        path
+    }
+
+    fn warm_command(
+        dir: &Path,
+        warm: WorkspaceWarmMode,
+        prewarm_substituter_url: Option<String>,
+    ) -> VmWorkspaceInitCommand {
+        let destination = dir.join("checkout");
+        fs::create_dir_all(&destination).unwrap();
+        VmWorkspaceInitCommand::new(
+            repo(),
+            Some(destination),
+            warm,
+            "git",
+            write_fake_nix(dir),
+            prewarm_substituter_url,
+        )
+        .unwrap()
+    }
+
+    const TEST_PREWARM_URL: &str = "http://192.168.252.1:51375/v1/nix/prewarm";
+
+    #[test]
+    fn devshell_warm_pins_both_steps_to_the_prewarm_substituter() {
+        let dir = tempfile::tempdir().unwrap();
+        let command = warm_command(
+            dir.path(),
+            WorkspaceWarmMode::DevShell,
+            Some(TEST_PREWARM_URL.to_string()),
+        );
+
+        warm_workspace(&command).unwrap();
+
+        let nix_log = fs::read_to_string(dir.path().join("nix.log")).unwrap();
+        let calls: Vec<&str> = nix_log.lines().collect();
+        assert_eq!(calls.len(), 2, "{nix_log}");
+        let override_prefix = format!("--option substituters {TEST_PREWARM_URL} ");
+        // The strict guarantee covers the *whole* warm: eval input fetches
+        // (flake metadata) and closure realisation (develop) alike.
+        assert!(calls[0].starts_with(&override_prefix), "{nix_log}");
+        assert!(calls[0].contains("flake metadata"), "{nix_log}");
+        assert!(calls[1].starts_with(&override_prefix), "{nix_log}");
+        assert!(calls[1].contains("develop"), "{nix_log}");
+    }
+
+    #[test]
+    fn devshell_warm_without_prewarm_url_keeps_session_default_substituters() {
+        let dir = tempfile::tempdir().unwrap();
+        let command = warm_command(dir.path(), WorkspaceWarmMode::DevShell, None);
+
+        warm_workspace(&command).unwrap();
+
+        let nix_log = fs::read_to_string(dir.path().join("nix.log")).unwrap();
+        assert_eq!(nix_log.lines().count(), 2, "{nix_log}");
+        assert!(
+            !nix_log.contains("substituters"),
+            "no pre-warm URL means no substituter override: {nix_log}"
+        );
+    }
+
+    #[test]
+    fn sources_warm_stays_on_the_session_default_substituters() {
+        // Strictness is the devShell warm's contract; a sources-only warm keeps
+        // the proxied default even when the daemon advertised the pre-warm URL.
+        let dir = tempfile::tempdir().unwrap();
+        let command = warm_command(
+            dir.path(),
+            WorkspaceWarmMode::Sources,
+            Some(TEST_PREWARM_URL.to_string()),
+        );
+
+        warm_workspace(&command).unwrap();
+
+        let nix_log = fs::read_to_string(dir.path().join("nix.log")).unwrap();
+        assert_eq!(nix_log.lines().count(), 1, "{nix_log}");
+        assert!(!nix_log.contains("substituters"), "{nix_log}");
+    }
+
+    #[test]
+    fn workspace_init_command_rejects_a_non_http_prewarm_substituter_url() {
+        let err = VmWorkspaceInitCommand::new(
+            repo(),
+            Some(PathBuf::from("/workspace/repo")),
+            WorkspaceWarmMode::DevShell,
+            "git",
+            "nix",
+            Some("file:///srv/prewarm".to_string()),
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            err,
+            VmWorkspaceInitCommandError::UnsupportedPrewarmSubstituterUrl(
+                "file:///srv/prewarm".to_string()
+            )
+        );
     }
 
     #[tokio::test]

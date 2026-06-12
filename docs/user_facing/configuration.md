@@ -156,13 +156,15 @@ flake-input provisioning knobs (all under `agent_vm.vm_http`) are:
 | `flake_provision_max_input_count` | no | Fail-closed cap on locked inputs per provision. Default `256`. |
 | `flake_provision_max_total_bytes` | no | Fail-closed cap on archived bytes per provision. Default `2147483648` (2 GiB). |
 | `flake_provision_timeout_secs` | no | Timeout for the `nix flake archive` step. Default `600`. |
+| `nix_prewarm_cache_dir` | no | Directory of the operator-managed, *signed* pre-warmed devShell-closure cache (written out of band by an egress builder via `nix copy --to "file://…?secret-key=…"`; the broker only reads it). **Setting this makes the devshell warm strict**: the warm's substituters are replaced with the broker's pre-warm-only `/v1/nix/prewarm` view (this dir plus `flake_input_cache_dir`, never the public upstream), so a path absent from the pre-warmed closure fails the warm instead of substituting from cache.nixos.org. The signing public key must be listed in `nix_cache_trusted_public_keys`. Unset (default) ⇒ the warm uses the ordinary proxied cache, as before. |
 
 See [the agent-VM design doc](../design/apple-container-agent-vm.md)
 ("Flake-input provisioning") for the behaviour, the trust model, and the
 guarantee/envelope (a no-egress guest warms a flake devShell when the committed
 lock's inputs are all provisionable — public and classifier-admitted — and the
 devShell's output closure is substitutable from cache.nixos.org for the guest
-system).
+system, or — with `nix_prewarm_cache_dir` set — from the signed pre-warm
+archive alone).
 
 ## Secret stores
 

@@ -71,6 +71,22 @@ pub fn nix_develop_command_args(attr: &str) -> Vec<String> {
     ]
 }
 
+/// Replace the session's substituters for one `nix` invocation, pinning it to
+/// `substituter_url` — the broker's pre-warm-only `/v1/nix/prewarm` view during
+/// a strict devShell warm. `substituters` (not `extra-substituters`) so the
+/// session nix.conf default (the upstream-proxying `/v1/nix/cache`) is
+/// *removed*, not augmented: a path absent from the pre-warmed closure then
+/// fails the warm instead of silently substituting from the public upstream.
+/// Scoped to the warm's own invocations; the session nix.conf — and so the
+/// agent's later Nix usage — keeps the proxied default.
+pub fn nix_substituters_override_args(substituter_url: &str) -> Vec<String> {
+    vec![
+        "--option".to_string(),
+        "substituters".to_string(),
+        substituter_url.to_string(),
+    ]
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct VmGitCloneRequest {
     repo: GitCloneRepo,
@@ -1873,6 +1889,21 @@ mod tests {
                 "--no-write-lock-file",
                 ".#default",
                 "--command",
+            ]
+        );
+    }
+
+    #[test]
+    fn nix_substituters_override_args_pin_full_replacement_envelope() {
+        // `substituters`, not `extra-substituters`: the strict warm must
+        // *replace* the session default, or the upstream-proxying substituter
+        // would remain reachable and the override would enforce nothing.
+        assert_eq!(
+            nix_substituters_override_args("http://192.168.252.1:51375/v1/nix/prewarm"),
+            vec![
+                "--option",
+                "substituters",
+                "http://192.168.252.1:51375/v1/nix/prewarm",
             ]
         );
     }

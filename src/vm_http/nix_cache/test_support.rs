@@ -21,6 +21,8 @@ use super::super::{VmHttpServices, route_authenticated_vm_http_request};
 use super::*;
 use crate::nix_cache::{NixNarCompression, NixNarHash, NixNarSize, NixTrustedPublicKeys};
 
+pub(super) const VM_NIX_CACHE_INFO_PATH: &str = "/v1/nix/cache/nix-cache-info";
+pub(super) const VM_NIX_PREWARM_CACHE_INFO_PATH: &str = "/v1/nix/prewarm/nix-cache-info";
 pub(super) const TEST_NIX_CACHE_PUBLIC_KEY: &str =
     "cache.example:IsGkyTbr2sed7tWowgiPcI0ZHhBAHoGQ7TyYRweyzwE=";
 pub(super) const TEST_SIGNED_NARINFO: &str = concat!(

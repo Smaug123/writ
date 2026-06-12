@@ -598,7 +598,13 @@ provisionable — public and classifier-admitted, per "Scope" above — and (b) 
 devShell's output closure is substitutable from cache.nixos.org for the guest
 system**. If the lock pins a non-provisionable input (private/auth-requiring/
 local), that input is not provisioned and warm fails even when the output
-closure is cached. A later in-guest flake edit that needs a brand-new input
+closure is cached. Constraint (b) is lifted by the pre-warmed devShell cache
+(`docs/plans/2026-06-07-prewarmed-devshell-cache.md`): with
+`nix_prewarm_cache_dir` configured, the devShell warm is served strictly from
+the operator's signed pre-warm archive (plus this input archive) through the
+`/v1/nix/prewarm` view, so the closure need not be on cache.nixos.org — but
+must instead have been pre-warmed; the warm never proxies the public upstream
+at all. A later in-guest flake edit that needs a brand-new input
 will not substitute either — that is the no-egress envelope, by design: the
 broker is not a general egress proxy.
 
@@ -1280,7 +1286,14 @@ First workspace bootstrap slice implemented in `src/protocol.rs`,
   those bounded local builds. The flake feature is enabled only in the workspace
   bootstrap wrapper; non-workspace VM sessions keep the narrower Nix setup. The
   daemon still does not run `cargo build`, `nix build`, or other repository
-  build commands as an explicit first-version bootstrap step;
+  build commands as an explicit first-version bootstrap step. When the broker
+  has a `nix_prewarm_cache_dir` configured, the daemon additionally injects
+  `WRIT_NIX_PREWARM_URL` and the `devshell` warm becomes *strict*: both warm
+  invocations replace their substituters with the broker's pre-warm-only
+  `/v1/nix/prewarm` view (local archives only, miss ⇒ 404, never an upstream
+  proxy), so the warm realises exactly the human-pre-warmed closure or fails
+  fast — `sources` warms and the agent's later Nix usage stay on the proxied
+  `/v1/nix/cache` view;
 - Cargo dependency-source prefetching remains deliberately outside this first
   slice. A generic Rust workspace can require crates.io or Git dependency
   network access after the devshell starts, and the VM has no general outbound
