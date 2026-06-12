@@ -53,9 +53,12 @@
 #   - STREAM the input path list into `nix copy --stdin` (an input set is many
 #     paths; never splat it into argv — E2BIG). The closure copy passes the
 #     single profile path and lets nix compute the closure itself.
-#   - ONE host-level lock (atomic mkdir + stale-PID reclaim) around the whole
-#     mutating sequence, so two concurrent warms cannot interleave cache
-#     writes or manifest lines.
+#   - ONE host-level lock around the whole mutating sequence, so two
+#     concurrent warms cannot interleave cache writes or manifest lines. The
+#     orchestrator used an mkdir lock because macOS ships no flock(1); this
+#     script is Linux-only (platform guard above), so it uses flock — the
+#     kernel releases it with the process, so there is no stale-lock state
+#     and no reclaim race.
 #   - Manifests live OUTSIDE the transferable cache dir.
 #
 # PRUNING is out of scope (plan follow-on): the manifest written here is its
@@ -102,7 +105,9 @@ esac
 # --- preconditions -----------------------------------------------------------
 
 # nix: archive/eval/print-dev-env/copy. jq: parse the archive's --json tree.
-for tool in nix jq; do
+# flock: the host-level warm lock (util-linux; in every Linux distro base —
+# for a darwin test run, `nix shell nixpkgs#flock`).
+for tool in nix jq flock; do
   if ! command -v "$tool" >/dev/null 2>&1; then
     echo "error: $tool not found on PATH." >&2
     exit 1
@@ -201,12 +206,14 @@ fi
 # git+file://…?rev=<rev>): a mutable ref like github:owner/repo/main is
 # dereferenced exactly here, so a branch that advances mid-warm (or a fetcher
 # cache that expires between steps) cannot make the signed closure disagree
-# with the manifest's recorded rev. A flakeref that resolves to no revision
+# with the manifest's recorded rev. `--refresh` makes this one resolution
+# bypass nix's cached ref→rev mapping, so the pin is the branch's CURRENT
+# head, not a stale TTL'd one. A flakeref that resolves to no revision
 # (a tarball, a non-git path) is refused outright: nothing reviewable to
 # attest. --no-update-lock-file: a stale lock — flake.nix and flake.lock
 # disagreeing — fails here rather than warming an in-memory updated input
 # graph the committed repo will not use.
-metadata_json="$(nix "${nix_flags[@]}" flake metadata --json --no-update-lock-file "$flakeref")"
+metadata_json="$(nix "${nix_flags[@]}" flake metadata --refresh --json --no-update-lock-file "$flakeref")"
 rev="$(printf '%s' "$metadata_json" | jq -r '.revision // empty')"
 pinned_flakeref="$(printf '%s' "$metadata_json" | jq -r '.url // empty')"
 if [ -z "$rev" ] || [ -z "$pinned_flakeref" ]; then
@@ -217,54 +224,18 @@ echo "==> warming $flakeref (rev $rev, pinned as $pinned_flakeref), devShell att
 
 # --- lock --------------------------------------------------------------------
 # ONE host-level lock around the whole mutating sequence (cache writes +
-# manifest appends): two concurrent warms must not interleave. Atomic mkdir is
-# create-or-fail on POSIX with no external dependency (works on any builder,
-# unlike flock(1)). The lock lives OUTSIDE the transferable cache dir.
-#
-# A stale lock (a previous warm killed mid-run) would otherwise wedge all
-# future warms: we record our PID inside the lockdir; on contention we reclaim
-# only if the recorded PID is dead. We never auto-reclaim a live lock.
-lock_dir="$base/warm.lock"
-# `held` gates the release trap: only ever rm the lock dir we actually own, so
-# a failed acquire (timeout below) never deletes the live holder's lock.
-held=0
-release_lock() {
-  if [ "$held" -eq 1 ]; then
-    rm -rf "$lock_dir" 2>/dev/null || true
-  fi
-}
-trap 'release_lock' EXIT
-trap 'exit 130' INT
-trap 'exit 143' TERM
-
-acquire_lock() {
-  local tries=0 owner
-  while ! mkdir "$lock_dir" 2>/dev/null; do
-    owner=""
-    [ -f "$lock_dir/pid" ] && owner="$(cat "$lock_dir/pid" 2>/dev/null || true)"
-    if [ -n "$owner" ] && kill -0 "$owner" 2>/dev/null; then
-      tries=$((tries + 1))
-      if [ "$tries" -ge 60 ]; then
-        echo "error: could not acquire $lock_dir after 60s; warm held by live PID $owner." >&2
-        exit 1
-      fi
-      sleep 1
-      continue
-    fi
-    # No live owner: the lock is stale (holder died). Reclaim it; a race here
-    # just means another waiter wins the re-mkdir and we keep waiting.
-    # (Residual narrow window: a holder that has mkdir'd but not yet written
-    # its pid looks stale; acceptable for a manual warmer.)
-    echo "warn: reclaiming stale lock $lock_dir (owner PID '${owner:-unknown}' not alive)." >&2
-    rm -rf "$lock_dir" 2>/dev/null || true
-  done
-  # Mark held BEFORE writing pid so the release trap cleans up even if the
-  # pid write fails.
-  held=1
-  echo "$$" > "$lock_dir/pid"
-}
-
-acquire_lock
+# manifest appends): two concurrent warms must not interleave. flock(2) via a
+# held fd: the kernel releases the lock when the process exits (however it
+# exits), so there is no stale-lock state to reclaim and no reclaim race —
+# the failure modes an mkdir lock has to hand-handle. The lock file lives
+# OUTSIDE the transferable cache dir; its content is unused (append-open so
+# we never truncate while another holder runs).
+lock_file="$base/warm.lock"
+exec 9>>"$lock_file"
+if ! flock -w 60 9; then
+  echo "error: could not acquire $lock_file within 60s; another warm is running." >&2
+  exit 1
+fi
 
 # --- manifest ----------------------------------------------------------------
 # One append-only line per warmed store path, OUTSIDE the transferable cache

@@ -16,6 +16,26 @@
 # profiles are builder-VM state; only the *scripts* are version-controlled.
 base="${WRIT_PREWARM_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/writ-prewarm}"
 
+# The base is interpolated into `file://$cache_dir?secret-key=$secret_key`
+# store URLs. A relative path makes that URL invalid (failing only at the
+# first `nix copy`, after archive/build work), and URL-special characters
+# (`?`, `#`, `%`, spaces, …) would silently change the URL's meaning. Require
+# an absolute path over a conservative URL-safe charset up front, so a bad
+# override fails before any work is done.
+case "$base" in
+  /*) ;;
+  *)
+    echo "error: WRIT_PREWARM_DIR must be an absolute path; got '$base'." >&2
+    exit 1
+    ;;
+esac
+case "$base" in
+  *[!A-Za-z0-9._~+/-]*)
+    echo "error: WRIT_PREWARM_DIR may contain only [A-Za-z0-9._~+/-] (it is embedded in file:// store URLs); got '$base'." >&2
+    exit 1
+    ;;
+esac
+
 # The signing key name becomes the prefix of every narinfo signature and must
 # match a `nix_cache_trusted_public_keys` entry on the broker (which is also
 # what the guest's nix.conf trusts — one list, both sides). The `-1` suffix
