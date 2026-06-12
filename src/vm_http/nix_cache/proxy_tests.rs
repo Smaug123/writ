@@ -13,7 +13,6 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use super::super::tests::{make_broker_state, open_audit_session, session_for_subnet};
 use super::super::{VM_HTTP_READ_TIMEOUT, dispatch_vm_http_head_and_body};
-use super::route::VM_NIX_CACHE_INFO_PATH;
 use super::test_support::*;
 use super::*;
 use crate::core::Ipv4Cidr;

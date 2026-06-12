@@ -749,9 +749,14 @@ impl AgentVmHttpConfig {
         // created here; an absent/empty dir simply serves nothing. Trust for its
         // signed paths rides the existing `nix_cache_trusted_public_keys`
         // (the same list the guest verifies against), so no separate key.
+        let nix_prewarm_cache_dir = self
+            .nix_prewarm_cache_dir
+            .clone()
+            .map(validate_nix_prewarm_cache_dir)
+            .transpose()?;
         let mut local_cache_dirs = Vec::new();
-        if let Some(prewarm) = &self.nix_prewarm_cache_dir {
-            local_cache_dirs.push(validate_nix_prewarm_cache_dir(prewarm.clone())?);
+        if let Some(prewarm) = &nix_prewarm_cache_dir {
+            local_cache_dirs.push(prewarm.clone());
         }
         local_cache_dirs.push(flake_input_cache_dir);
         let nix_cache = VmHttpNixCacheConfig::new_with_trusted_public_keys(
@@ -797,7 +802,8 @@ impl AgentVmHttpConfig {
             git_push_staging_root,
             git_push_body_limits,
         )
-        .with_flake_provision(flake_provision))
+        .with_flake_provision(flake_provision)
+        .with_nix_prewarm_cache_dir(nix_prewarm_cache_dir))
     }
 }
 
@@ -2252,6 +2258,16 @@ mod tests {
             runtime.nix_cache().local_cache_dirs(),
             [prewarm.clone(), flake_cache.clone()],
         );
+        // The role is recorded on the runtime config so the daemon can tell a
+        // pre-warming deployment apart (it gates the strict warm substituter).
+        assert_eq!(runtime.nix_prewarm_cache_dir(), Some(prewarm.as_path()));
+    }
+
+    #[test]
+    fn agent_vm_http_config_records_no_prewarm_role_when_unconfigured() {
+        let runtime = valid_agent_vm_http_config().to_runtime_config().unwrap();
+
+        assert_eq!(runtime.nix_prewarm_cache_dir(), None);
     }
 
     #[test]

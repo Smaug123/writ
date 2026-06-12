@@ -15,9 +15,10 @@ use writ::agent_run::{
 };
 use writ::core::AgentKind;
 use writ::vm_client::{
-    VM_BROKER_TOKEN_ENV, VM_BROKER_URL_ENV, VmClientConfig, VmClientConfigError, VmGitCloneCommand,
-    VmGitPushCommand, VmWorkspaceInitCommand, clone_from_broker, fetch_agent_run_config,
-    get_session_json, init_workspace_from_broker, push_to_broker, upload_agent_run_outcome,
+    VM_BROKER_TOKEN_ENV, VM_BROKER_URL_ENV, VM_NIX_PREWARM_URL_ENV, VmClientConfig,
+    VmClientConfigError, VmGitCloneCommand, VmGitPushCommand, VmWorkspaceInitCommand,
+    clone_from_broker, fetch_agent_run_config, get_session_json, init_workspace_from_broker,
+    push_to_broker, upload_agent_run_outcome,
 };
 use writ::vm_git::{GitBranchName, GitCloneRef, GitCloneRepo, GitObjectId, WorkspaceWarmMode};
 
@@ -123,6 +124,11 @@ enum WorkspaceCmd {
         /// Nix executable inside the guest.
         #[arg(long, default_value = "nix")]
         nix: PathBuf,
+        /// Strict pre-warm-only substituter URL, injected by the daemon when
+        /// the broker serves a pre-warm cache. When set, the devshell warm's
+        /// nix invocations replace their substituters with it.
+        #[arg(long, env = VM_NIX_PREWARM_URL_ENV)]
+        prewarm_substituter_url: Option<String>,
     },
 }
 
@@ -220,10 +226,17 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 warm,
                 git,
                 nix,
+                prewarm_substituter_url,
             } => {
                 let repo = parse_repo(&repo)?;
-                let command =
-                    VmWorkspaceInitCommand::new(repo, destination, warm.into(), git, nix)?;
+                let command = VmWorkspaceInitCommand::new(
+                    repo,
+                    destination,
+                    warm.into(),
+                    git,
+                    nix,
+                    prewarm_substituter_url,
+                )?;
                 let destination = init_workspace_from_broker(&config, &command).await?;
                 println!("{}", destination.display());
             }

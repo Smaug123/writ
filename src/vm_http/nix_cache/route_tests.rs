@@ -11,7 +11,6 @@ use super::super::{
     VM_HTTP_READ_TIMEOUT, VmHttpAuthError, VmHttpAuthorization, authorize_vm_http_request,
     dispatch_vm_http_head, dispatch_vm_http_head_and_body,
 };
-use super::route::VM_NIX_CACHE_INFO_PATH;
 use super::test_support::*;
 use super::*;
 use crate::core::Ipv4Cidr;
@@ -56,24 +55,28 @@ fn nix_cache_routes_accept_basic_auth_only() {
 
 #[test]
 fn nix_cache_auth_challenge_is_basic() {
-    let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(10, 1, 2, 0), 24).unwrap());
-    let response = dispatch_vm_http_head(
-        &session,
-        SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(10, 1, 2, 3), 12345)),
-        "GET",
-        VM_NIX_CACHE_INFO_PATH,
-        None,
-    );
+    // Both serving views are nix-cache targets, so both take the Basic
+    // challenge (the guest's netrc is keyed by host and covers either path).
+    for target in [VM_NIX_CACHE_INFO_PATH, VM_NIX_PREWARM_CACHE_INFO_PATH] {
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(10, 1, 2, 0), 24).unwrap());
+        let response = dispatch_vm_http_head(
+            &session,
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(10, 1, 2, 3), 12345)),
+            "GET",
+            target,
+            None,
+        );
 
-    assert_eq!(response.status, VmHttpStatus::Unauthorized);
-    let challenge = response
-        .www_authenticate
-        .expect("nix cache must issue a Basic challenge");
-    assert!(
-        challenge.starts_with("Basic realm=\"writ-nix-cache\""),
-        "{challenge}"
-    );
-    assert!(!challenge.contains("Bearer"), "{challenge}");
+        assert_eq!(response.status, VmHttpStatus::Unauthorized, "{target}");
+        let challenge = response
+            .www_authenticate
+            .expect("nix cache must issue a Basic challenge");
+        assert!(
+            challenge.starts_with("Basic realm=\"writ-nix-cache\""),
+            "{challenge}"
+        );
+        assert!(!challenge.contains("Bearer"), "{challenge}");
+    }
 }
 
 #[test]
@@ -97,18 +100,20 @@ fn nix_cache_info_route_returns_binary_cache_metadata() {
 
 #[test]
 fn nix_cache_narinfo_route_returns_controlled_miss() {
-    let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(10, 1, 2, 0), 24).unwrap());
-    let target = format!("{VM_NIX_CACHE_PATH_PREFIX}/00000000000000000000000000000000.narinfo");
-    let basic_auth = basic(token().as_str());
-    let response = dispatch_vm_http_head(
-        &session,
-        SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(10, 1, 2, 3), 12345)),
-        "GET",
-        &target,
-        Some(basic_auth.as_str()),
-    );
+    for prefix in [VM_NIX_CACHE_PATH_PREFIX, VM_NIX_PREWARM_PATH_PREFIX] {
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(10, 1, 2, 0), 24).unwrap());
+        let target = format!("{prefix}/00000000000000000000000000000000.narinfo");
+        let basic_auth = basic(token().as_str());
+        let response = dispatch_vm_http_head(
+            &session,
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(10, 1, 2, 3), 12345)),
+            "GET",
+            &target,
+            Some(basic_auth.as_str()),
+        );
 
-    assert_eq!(response.status, VmHttpStatus::NotFound);
+        assert_eq!(response.status, VmHttpStatus::NotFound, "{target}");
+    }
 }
 
 #[test]
@@ -131,6 +136,14 @@ fn nix_cache_path_classifier_rejects_non_cache_protocol_paths() {
         "/v1/nix/cache/nar/proof nar",
         "/v1/nix/cache/nar/proof%2Fnar",
         "/v1/nix/cache/nar/proof.nar?download=1",
+        VM_NIX_PREWARM_PATH_PREFIX,
+        "/v1/nix/prewarm/",
+        "/v1/nix/prewarm/not-a-store-hash.narinfo",
+        "/v1/nix/prewarmevil/00000000000000000000000000000000.narinfo",
+        "/v1/nix/prewarm/nar",
+        "/v1/nix/prewarm/nar/",
+        "/v1/nix/prewarm/nar/../proof.nar",
+        "/v1/nix/prewarm/nar/subdir/proof.nar",
     ] {
         assert_eq!(
             classify_nix_cache_target(target),
@@ -138,6 +151,18 @@ fn nix_cache_path_classifier_rejects_non_cache_protocol_paths() {
             "accepted {target:?}"
         );
     }
+}
+
+#[test]
+fn prewarm_view_targets_classify_to_local_only_routes() {
+    assert_eq!(
+        classify_nix_cache_target(VM_NIX_PREWARM_CACHE_INFO_PATH),
+        Some((VmNixCacheView::LocalOnly, VmNixCacheRoute::CacheInfo)),
+    );
+    assert_eq!(
+        classify_nix_cache_target(VM_NIX_CACHE_INFO_PATH),
+        Some((VmNixCacheView::Proxied, VmNixCacheRoute::CacheInfo)),
+    );
 }
 
 #[tokio::test]

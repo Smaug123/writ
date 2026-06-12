@@ -64,6 +64,10 @@ async fn daemon_start_injects_vm_http_env_without_persisting_token_and_stop_clea
     assert!(env.contains(&format!(
         "{AGENT_VM_NIX_CONF_DIR_ENV}={AGENT_VM_NIX_CONF_DIR}"
     )));
+    assert!(
+        !env.contains(AGENT_VM_NIX_PREWARM_URL_ENV),
+        "no pre-warm dir is configured, so the strict warm substituter must not be advertised: {env}"
+    );
     let args = fs::read_to_string(&args_log).unwrap();
     assert!(args.contains("--env-file"));
     assert!(args.contains("writ-agent-vm-nix-setup"));
@@ -111,6 +115,46 @@ async fn daemon_start_injects_vm_http_env_without_persisting_token_and_stop_clea
         .unwrap()
         .unwrap();
     assert!(audit_session.closed_at.is_some());
+}
+
+#[tokio::test]
+async fn daemon_start_advertises_prewarm_substituter_when_prewarm_dir_configured() {
+    let dir = tempfile::tempdir().unwrap();
+    let args_log = dir.path().join("args.log");
+    let env_path_log = dir.path().join("env-path.log");
+    let env_log = dir.path().join("env.log");
+    let fake_tool = write_fake_tool(dir.path(), &args_log, &env_path_log, &env_log);
+    let prewarm_dir = dir.path().join("prewarm-cache");
+    let (config, _state_store) =
+        daemon_config_with_prewarm_dir(dir.path(), &fake_tool, &prewarm_dir);
+    let daemon = AgentVmDaemon::new(config);
+    let state = make_state();
+
+    let started = daemon
+        .start_session(
+            Arc::clone(&state),
+            None,
+            None,
+            None,
+            None,
+            vec!["sleep".into(), "600".into()],
+        )
+        .await
+        .unwrap();
+
+    let env = fs::read_to_string(&env_log).unwrap();
+    assert!(
+        env.contains(&format!(
+            "{AGENT_VM_NIX_PREWARM_URL_ENV}={}",
+            nix_prewarm_url_for_broker_url(started.broker_url())
+        )),
+        "a configured pre-warm dir must advertise the strict substituter: {env}"
+    );
+
+    daemon
+        .stop_session(&state, started.session_id())
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -500,6 +544,18 @@ fn nix_cache_url_is_the_broker_url_under_the_cache_route() {
     assert_eq!(
         nix_cache_url_for_broker_url("http://192.168.252.1:51375"),
         "http://192.168.252.1:51375/v1/nix/cache"
+    );
+}
+
+#[test]
+fn nix_prewarm_url_is_the_broker_url_under_the_prewarm_route() {
+    assert_eq!(
+        nix_prewarm_url_for_broker_url("http://192.168.252.1:51375/"),
+        "http://192.168.252.1:51375/v1/nix/prewarm"
+    );
+    assert_eq!(
+        nix_prewarm_url_for_broker_url("http://192.168.252.1:51375"),
+        "http://192.168.252.1:51375/v1/nix/prewarm"
     );
 }
 #[test]

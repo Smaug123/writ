@@ -35,9 +35,9 @@ use crate::secret::SecretStore;
 use crate::server::BrokerState;
 use crate::vm_git::AgentVmWorkspaceBootstrap;
 use crate::vm_http::{
-    RunningVmHttpSession, VM_NIX_BASIC_LOGIN, VM_NIX_CACHE_PATH_PREFIX, VmHttpAgentRunService,
-    VmHttpGitPushService, VmHttpRuntimeConfig, VmHttpRuntimeError, VmHttpRuntimeShutdownError,
-    prepare_vm_http_session_with_agent_runs,
+    RunningVmHttpSession, VM_NIX_BASIC_LOGIN, VM_NIX_CACHE_PATH_PREFIX, VM_NIX_PREWARM_PATH_PREFIX,
+    VmHttpAgentRunService, VmHttpGitPushService, VmHttpRuntimeConfig, VmHttpRuntimeError,
+    VmHttpRuntimeShutdownError, prepare_vm_http_session_with_agent_runs,
 };
 
 pub use crate::vm_client::{
@@ -58,6 +58,12 @@ mod run_outcome;
 pub use run_outcome::{WaitForAgentRunOutcomeError, wait_for_agent_run_outcome};
 
 pub const AGENT_VM_NIX_CACHE_URL_ENV: &str = "WRIT_NIX_CACHE_URL";
+/// The strict, pre-warm-only substituter URL. Injected only when the broker has
+/// a `nix_prewarm_cache_dir` configured: its presence is what switches the
+/// guest's devShell warm onto the local-only `/v1/nix/prewarm` view. Absent (no
+/// pre-warming in this deployment), the warm keeps the session-default proxied
+/// substituter, exactly as before.
+pub const AGENT_VM_NIX_PREWARM_URL_ENV: &str = "WRIT_NIX_PREWARM_URL";
 pub const AGENT_VM_NIX_BASIC_LOGIN_ENV: &str = "WRIT_NIX_BASIC_LOGIN";
 pub const AGENT_VM_NIX_NETRC_ENV: &str = "WRIT_NIX_NETRC";
 pub const AGENT_VM_NIX_NETRC_PATH: &str = "/run/writ-agent-vm/netrc";
@@ -878,7 +884,7 @@ impl AgentVmDaemon {
                 .trusted_public_keys()
                 .nix_conf_value();
             let broker_ports = BrokerPorts::new([broker_port])?;
-            let guest_env = vec![
+            let mut guest_env = vec![
                 AgentVmGuestEnvVar::new(AGENT_VM_BROKER_URL_ENV, broker_url.clone())?,
                 AgentVmGuestEnvVar::new(
                     AGENT_VM_BROKER_TOKEN_ENV,
@@ -890,6 +896,16 @@ impl AgentVmDaemon {
                 AgentVmGuestEnvVar::new(AGENT_VM_NIX_TRUSTED_PUBLIC_KEYS_ENV, trusted_public_keys)?,
                 AgentVmGuestEnvVar::new(AGENT_VM_NIX_CONF_DIR_ENV, AGENT_VM_NIX_CONF_DIR)?,
             ];
+            // Advertise the strict pre-warm-only substituter exactly when the
+            // operator has configured a pre-warm dir: the variable's presence is
+            // the guest-side switch that pins the devShell warm to the local-only
+            // view (see AGENT_VM_NIX_PREWARM_URL_ENV).
+            if self.config.vm_http.nix_prewarm_cache_dir().is_some() {
+                guest_env.push(AgentVmGuestEnvVar::new(
+                    AGENT_VM_NIX_PREWARM_URL_ENV,
+                    nix_prewarm_url_for_broker_url(&broker_url),
+                )?);
+            }
             let guest_command = wrap_guest_command(workspace.as_ref(), guest_command)?;
             let plan = AgentVmSessionPlan::new_with_guest_env(
                 session_id,
@@ -974,6 +990,14 @@ fn nix_cache_url_for_broker_url(broker_url: &str) -> String {
         "{}{}",
         broker_url.trim_end_matches('/'),
         VM_NIX_CACHE_PATH_PREFIX
+    )
+}
+
+fn nix_prewarm_url_for_broker_url(broker_url: &str) -> String {
+    format!(
+        "{}{}",
+        broker_url.trim_end_matches('/'),
+        VM_NIX_PREWARM_PATH_PREFIX
     )
 }
 

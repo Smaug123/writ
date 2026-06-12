@@ -8,7 +8,13 @@ use crate::nix_cache::{NixCacheNarFileName, NixStoreHashPart};
 use super::super::{VmHttpRequest, VmHttpResponse, VmHttpStatus};
 
 pub const VM_NIX_CACHE_PATH_PREFIX: &str = "/v1/nix/cache";
-pub(super) const VM_NIX_CACHE_INFO_PATH: &str = "/v1/nix/cache/nix-cache-info";
+/// The pre-warm-only serving view: the same binary-cache protocol as
+/// `/v1/nix/cache`, served *exclusively* from the broker's local archives
+/// (pre-warm dir, then flake-input dir) — a miss is a `404`, never an upstream
+/// proxy fetch. The devShell warm points its `substituters` here so a path
+/// absent from the pre-warmed closure fails the warm instead of silently
+/// substituting from the public upstream.
+pub const VM_NIX_PREWARM_PATH_PREFIX: &str = "/v1/nix/prewarm";
 pub const VM_NIX_BASIC_LOGIN: &str = "writ-vm";
 /// The `nix-cache-info` body the broker advertises for the `/v1/nix/cache`
 /// endpoint. `StoreDir` is the load-bearing field — it matches the upstream
@@ -25,24 +31,48 @@ pub(in crate::vm_http) enum VmNixCacheRoute {
     Nar { file: NixCacheNarFileName },
 }
 
+/// Which serving view a request addressed. Both views speak the same protocol
+/// over the same local archives; they differ only in what a local miss means.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(in crate::vm_http) enum VmNixCacheView {
+    /// `/v1/nix/cache`: local-first, falling through to the signed upstream
+    /// proxy on a local miss.
+    Proxied,
+    /// `/v1/nix/prewarm`: local archives only; a miss is a `404`. The upstream
+    /// is never contacted, so a substituter pointed here is provably offline.
+    LocalOnly,
+}
+
 pub(in crate::vm_http) fn is_nix_cache_target(target: &str) -> bool {
-    target == VM_NIX_CACHE_PATH_PREFIX
-        || target == VM_NIX_CACHE_INFO_PATH
+    is_target_under(VM_NIX_CACHE_PATH_PREFIX, target)
+        || is_target_under(VM_NIX_PREWARM_PATH_PREFIX, target)
+}
+
+fn is_target_under(prefix: &str, target: &str) -> bool {
+    target == prefix
         || target
-            .strip_prefix(VM_NIX_CACHE_PATH_PREFIX)
+            .strip_prefix(prefix)
             .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
-pub(super) fn classify_nix_cache_target(target: &str) -> Option<VmNixCacheRoute> {
-    if target == VM_NIX_CACHE_INFO_PATH {
+pub(super) fn classify_nix_cache_target(target: &str) -> Option<(VmNixCacheView, VmNixCacheRoute)> {
+    if let Some(route) = classify_target_under(VM_NIX_CACHE_PATH_PREFIX, target) {
+        return Some((VmNixCacheView::Proxied, route));
+    }
+    classify_target_under(VM_NIX_PREWARM_PATH_PREFIX, target)
+        .map(|route| (VmNixCacheView::LocalOnly, route))
+}
+
+fn classify_target_under(prefix: &str, target: &str) -> Option<VmNixCacheRoute> {
+    let suffix = target.strip_prefix(prefix)?.strip_prefix('/')?;
+    if suffix == "nix-cache-info" {
         return Some(VmNixCacheRoute::CacheInfo);
     }
-    if let Some(file) = target.strip_prefix(&format!("{VM_NIX_CACHE_PATH_PREFIX}/nar/")) {
+    if let Some(file) = suffix.strip_prefix("nar/") {
         return NixCacheNarFileName::new(file)
             .ok()
             .map(|file| VmNixCacheRoute::Nar { file });
     }
-    let suffix = target.strip_prefix(&format!("{VM_NIX_CACHE_PATH_PREFIX}/"))?;
     let hash = suffix.strip_suffix(".narinfo")?;
     if NixStoreHashPart::validate(hash).is_err() {
         return None;
@@ -54,7 +84,9 @@ pub(super) fn classify_nix_cache_target(target: &str) -> Option<VmNixCacheRoute>
 pub(in crate::vm_http) fn route_nix_cache_request_without_upstream(
     request: &VmHttpRequest,
 ) -> VmHttpResponse {
-    let Some(route) = classify_nix_cache_target(&request.target) else {
+    // With no upstream service configured the two views coincide: nothing is
+    // served but the synthetic cache metadata, and every narinfo/NAR is a miss.
+    let Some((_view, route)) = classify_nix_cache_target(&request.target) else {
         return VmHttpResponse::text(VmHttpStatus::NotFound, "not found");
     };
     match (request.method.as_str(), route) {
@@ -75,14 +107,22 @@ pub(in crate::vm_http) fn route_nix_cache_request_without_upstream(
 }
 
 /// Property-based spec for [`classify_nix_cache_target`]: arbitrary valid
-/// store-hash narinfo paths and NAR filenames classify to the matching route,
-/// and arbitrary malformed ones (wrong-length hashes, illegal NAR-name bytes)
-/// classify to nothing. Example/edge-case path rejections live in
+/// store-hash narinfo paths and NAR filenames classify to the matching route
+/// under *both* serving prefixes (proxied and pre-warm-only), and arbitrary
+/// malformed ones (wrong-length hashes, illegal NAR-name bytes) classify to
+/// nothing under either. Example/edge-case path rejections live in
 /// `route_tests.rs`.
 #[cfg(test)]
 mod spec {
     use super::*;
     use proptest::prelude::*;
+
+    fn arb_view_prefix() -> impl Strategy<Value = (VmNixCacheView, &'static str)> {
+        prop_oneof![
+            Just((VmNixCacheView::Proxied, VM_NIX_CACHE_PATH_PREFIX)),
+            Just((VmNixCacheView::LocalOnly, VM_NIX_PREWARM_PATH_PREFIX)),
+        ]
+    }
 
     fn arb_nix_hash_part() -> impl Strategy<Value = String> {
         prop::collection::vec(
@@ -186,34 +226,46 @@ mod spec {
 
     proptest! {
         #[test]
-        fn valid_nix_store_hash_parts_are_narinfo_routes(hash in arb_nix_hash_part()) {
-            let target = format!("{VM_NIX_CACHE_PATH_PREFIX}/{hash}.narinfo");
+        fn valid_nix_store_hash_parts_are_narinfo_routes(
+            (view, prefix) in arb_view_prefix(),
+            hash in arb_nix_hash_part(),
+        ) {
+            let target = format!("{prefix}/{hash}.narinfo");
             let parsed_hash = NixStoreHashPart::new(hash).unwrap();
             prop_assert_eq!(
                 classify_nix_cache_target(&target),
-                Some(VmNixCacheRoute::NarInfo { hash: parsed_hash })
+                Some((view, VmNixCacheRoute::NarInfo { hash: parsed_hash }))
             );
         }
 
         #[test]
-        fn wrong_length_nix_store_hash_parts_are_not_narinfo_routes(hash in arb_wrong_length_nix_hash_part()) {
-            let target = format!("{VM_NIX_CACHE_PATH_PREFIX}/{hash}.narinfo");
+        fn wrong_length_nix_store_hash_parts_are_not_narinfo_routes(
+            (_view, prefix) in arb_view_prefix(),
+            hash in arb_wrong_length_nix_hash_part(),
+        ) {
+            let target = format!("{prefix}/{hash}.narinfo");
             prop_assert_eq!(classify_nix_cache_target(&target), None);
         }
 
         #[test]
-        fn valid_nix_cache_nar_filenames_are_nar_routes(file in arb_nix_nar_file()) {
-            let target = format!("{VM_NIX_CACHE_PATH_PREFIX}/nar/{file}");
+        fn valid_nix_cache_nar_filenames_are_nar_routes(
+            (view, prefix) in arb_view_prefix(),
+            file in arb_nix_nar_file(),
+        ) {
+            let target = format!("{prefix}/nar/{file}");
             let parsed_file = NixCacheNarFileName::new(file).unwrap();
             prop_assert_eq!(
                 classify_nix_cache_target(&target),
-                Some(VmNixCacheRoute::Nar { file: parsed_file })
+                Some((view, VmNixCacheRoute::Nar { file: parsed_file }))
             );
         }
 
         #[test]
-        fn invalid_nix_cache_nar_filename_characters_are_not_nar_routes(file in arb_nix_nar_file_with_invalid_char()) {
-            let target = format!("{VM_NIX_CACHE_PATH_PREFIX}/nar/{file}");
+        fn invalid_nix_cache_nar_filename_characters_are_not_nar_routes(
+            (_view, prefix) in arb_view_prefix(),
+            file in arb_nix_nar_file_with_invalid_char(),
+        ) {
+            let target = format!("{prefix}/nar/{file}");
             prop_assert_eq!(classify_nix_cache_target(&target), None);
         }
     }
