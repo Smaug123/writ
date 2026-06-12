@@ -260,6 +260,22 @@ the sketch above:
   modified tracked files is refused, the resolved rev is recorded in every
   manifest line, and a non-`main` branch warns loudly.
 
+Codex review hardening (five convergent rounds of disjoint findings; the
+sixth came back clean):
+exactness fails closed (non-git dirs / failed `git status` abort, not
+skip); the key-rotation runbook re-signs via manifest-driven `nix store
+sign --stdin` (a re-warm alone never re-signs cached paths); every nix
+invocation is pinned to the rev resolved once by `flake metadata
+--refresh` (mutable refs cannot drift mid-warm, nor pin a stale TTL'd
+resolution); `WRIT_PREWARM_DIR` is validated absolute + URL-safe before
+any work (it is embedded in `file://` store URLs); the mkdir lock became
+`flock` (Linux-only script; kernel-released, no stale-reclaim race); the
+non-`main` warning covers remote refs via the metadata's `.original.ref`;
+and a committed lock pinning local (`path:`/`git+file:`) inputs is
+refused before archiving — those would sign builder-local files, in the
+worst case the key dir itself, into the broker-served cache (mirrors the
+FK provisioner's local-input refusal).
+
 ### PW5 — End-to-end oracle
 
 Extend `scripts/prove-agent-vm-devshell-warm.sh` (or a sibling) so the
