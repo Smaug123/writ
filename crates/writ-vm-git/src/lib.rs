@@ -87,6 +87,38 @@ pub fn nix_substituters_override_args(substituter_url: &str) -> Vec<String> {
     ]
 }
 
+/// The *strict* devShell warm realisation: `nix print-dev-env` under the same
+/// envelope as [`nix_develop_command_args`].
+///
+/// A strict warm must demand exactly the closure the pre-warm builder signed —
+/// and the builder realises via `nix print-dev-env --profile`. `nix develop`
+/// demands MORE than that closure: it also resolves an interactive shell
+/// (`nixpkgs#bashInteractive` from the flake's nixpkgs input), which is not in
+/// the dev-env closure, so under a pre-warm-only substituter it 404s and
+/// `max-jobs = 1` then attempts a from-source bash build whose fixed-output
+/// fetches need egress (verified empirically: a fresh-store, egress-denied
+/// `nix develop` against a pre-warmed cache queued the whole bash+bison build
+/// graph). `print-dev-env` realises the identical environment without spawning
+/// a shell, so warm-demands ≡ signed-closure holds by construction. The
+/// agent-run wrapper still uses `nix develop` on the session's proxied
+/// substituter, where the shell substitutes from the public upstream as today.
+pub fn nix_print_dev_env_command_args(attr: &str) -> Vec<String> {
+    vec![
+        "--option".to_string(),
+        "builders".to_string(),
+        String::new(),
+        "--option".to_string(),
+        "max-jobs".to_string(),
+        GUEST_DEVSHELL_WARM_MAX_JOBS.to_string(),
+        "--option".to_string(),
+        "fallback".to_string(),
+        "false".to_string(),
+        "print-dev-env".to_string(),
+        "--no-write-lock-file".to_string(),
+        attr.to_string(),
+    ]
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct VmGitCloneRequest {
     repo: GitCloneRepo,
@@ -1889,6 +1921,31 @@ mod tests {
                 "--no-write-lock-file",
                 ".#default",
                 "--command",
+            ]
+        );
+    }
+
+    #[test]
+    fn nix_print_dev_env_command_args_pin_bounded_build_no_lockfile_no_shell_envelope() {
+        // Identical envelope to the develop warm, but `print-dev-env`: the
+        // strict warm must never invoke `nix develop`'s interactive-shell
+        // resolution (nixpkgs#bashInteractive), which demands paths outside
+        // the pre-warmed closure.
+        assert_eq!(
+            nix_print_dev_env_command_args(DEFAULT_DEVSHELL_ATTR),
+            vec![
+                "--option",
+                "builders",
+                "",
+                "--option",
+                "max-jobs",
+                GUEST_DEVSHELL_WARM_MAX_JOBS,
+                "--option",
+                "fallback",
+                "false",
+                "print-dev-env",
+                "--no-write-lock-file",
+                ".#default",
             ]
         );
     }
