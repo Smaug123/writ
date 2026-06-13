@@ -103,8 +103,19 @@ fn guest_ipv6_posture_reports_missing_probe_tool() {
 }
 
 #[test]
-fn guest_ipv6_probe_script_fails_closed_on_partial_probe_failure() {
-    assert!(GUEST_IPV6_PROBE_SCRIPT.starts_with("set -e\n"));
-    assert!(GUEST_IPV6_PROBE_SCRIPT.contains("addr show 2>&1"));
-    assert!(GUEST_IPV6_PROBE_SCRIPT.contains("route show default 2>&1"));
+fn guest_ipv6_enforce_and_probe_script_disables_then_fails_closed_on_partial_probe_failure() {
+    // `set -e` so a probe whose `ip` half partially fails aborts non-zero
+    // (the runner then fails the start) rather than reporting an incomplete,
+    // falsely-clean posture.
+    assert!(GUEST_IPV6_ENFORCE_AND_PROBE_SCRIPT.starts_with("set -e\n"));
+    // Enforce "no guest IPv6" before reporting: disable IPv6 in the guest
+    // kernel (all + default), flushing any RA-acquired address, so a host
+    // vmnet Router Advertisement cannot leave the guest with a routable ULA.
+    assert!(GUEST_IPV6_ENFORCE_AND_PROBE_SCRIPT.contains("conf/$scope/disable_ipv6"));
+    assert!(GUEST_IPV6_ENFORCE_AND_PROBE_SCRIPT.contains("for scope in all default"));
+    // Guarded write, so a kernel without IPv6 (absent path) is tolerated.
+    assert!(GUEST_IPV6_ENFORCE_AND_PROBE_SCRIPT.contains("[ -w \"$path\" ]"));
+    // Then report the resulting state for validation.
+    assert!(GUEST_IPV6_ENFORCE_AND_PROBE_SCRIPT.contains("addr show 2>&1"));
+    assert!(GUEST_IPV6_ENFORCE_AND_PROBE_SCRIPT.contains("route show default 2>&1"));
 }

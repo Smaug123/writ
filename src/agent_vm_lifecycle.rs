@@ -41,7 +41,38 @@ const IPV4_ONLY_PRELAUNCH_SCRIPT: &str = concat!(
     "exec \"$@\"",
 );
 
-const GUEST_IPV6_PROBE_SCRIPT: &str = r#"set -e
+/// Under [`Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6`], the guest's start sequence
+/// runs this in the guest: it first *enforces* "no guest IPv6" by disabling
+/// IPv6 in the guest kernel, then reports the resulting state for
+/// [`GuestIpv6Inspection`] to validate.
+///
+/// Why enforce, not just observe: the agent network is created `--internal`
+/// and IPv4-only (no `--subnet-v6`), but the host's Apple `container`/vmnet
+/// layer can still advertise IPv6 Router Advertisements on the shared vmnet —
+/// observed after a macOS update (26.5.1 / `container` 0.11.0): a guest with
+/// default `accept_ra` SLAACs a global-scope ULA (`fd…/64 … proto kernel_ra`)
+/// a beat after boot, defeating the no-guest-IPv6 posture. Refusing the RA at
+/// the *network* layer is not in our control (vmnet sends it regardless of the
+/// network's own v6 config), so we refuse it at the *guest kernel* layer:
+/// `disable_ipv6=1` on `all` (which flushes every existing IPv6 address,
+/// including any already SLAAC'd) and `default` (so any interface that appears
+/// later is born without IPv6). Verified on a throwaway container: the write
+/// drops the RA-acquired address immediately.
+///
+/// Enforce and report are one atomic guest exec, so there is no window between
+/// a separate "disable" and "probe" in which a fresh RA could re-add an
+/// address. The report is still load-bearing: if the disable writes had failed
+/// (e.g. a read-only `/proc`), the RA address would remain and
+/// [`GuestIpv6Inspection::require_no_routable_ipv6`] would fail the start — the
+/// validation confirms the enforcement actually took.
+///
+/// `[ -w … ]` guards the writes so a guest whose kernel has no IPv6 at all
+/// (the path is absent) is tolerated rather than failing under `set -e`.
+const GUEST_IPV6_ENFORCE_AND_PROBE_SCRIPT: &str = r#"set -e
+for scope in all default; do
+  path="/proc/sys/net/ipv6/conf/$scope/disable_ipv6"
+  if [ -w "$path" ]; then printf 1 > "$path"; fi
+done
 if ! command -v ip >/dev/null 2>&1; then echo writ-ip-command-missing; exit 77; fi
 ip -6 -o addr show 2>&1
 ip -6 route show default 2>&1"#;
@@ -488,8 +519,12 @@ impl AgentVmSessionPlan {
             AgentVmStartStep::StartVm(self.start_vm_invocation()),
         ];
         if self.ipv6_mode == Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6 {
+            // Enforce-then-verify the no-guest-IPv6 posture in one guest exec
+            // (the script disables IPv6 in the guest kernel before reporting;
+            // see GUEST_IPV6_ENFORCE_AND_PROBE_SCRIPT), then release the guest
+            // command only once the posture is confirmed.
             steps.push(AgentVmStartStep::ProbeAndValidateGuestIpv6 {
-                probe_invocation: self.probe_guest_ipv6_invocation(),
+                probe_invocation: self.enforce_and_probe_guest_ipv6_invocation(),
             });
             steps.push(AgentVmStartStep::ReleaseGuestCommand(
                 self.release_guest_command_invocation(),
@@ -714,7 +749,7 @@ impl AgentVmSessionPlan {
             .map_err(StartFailure::from)
     }
 
-    fn probe_guest_ipv6_invocation(&self) -> ProcessInvocation {
+    fn enforce_and_probe_guest_ipv6_invocation(&self) -> ProcessInvocation {
         ProcessInvocation::new(
             self.tools.container.clone(),
             [
@@ -722,7 +757,7 @@ impl AgentVmSessionPlan {
                 self.names.vm.clone(),
                 "sh".to_string(),
                 "-c".to_string(),
-                GUEST_IPV6_PROBE_SCRIPT.to_string(),
+                GUEST_IPV6_ENFORCE_AND_PROBE_SCRIPT.to_string(),
             ],
         )
     }
