@@ -69,7 +69,7 @@ fn ipv4_only_start_invocations_probe_before_releasing_guest_command() {
             "writ-agent-vm-51b8fd0f-6c10-454c-b0e6-7df1d60e2e6d",
             "sh",
             "-c",
-            GUEST_IPV6_PROBE_SCRIPT,
+            GUEST_IPV6_ENFORCE_AND_PROBE_SCRIPT,
         ]
     );
     assert_eq!(

@@ -349,9 +349,15 @@ Third manual lifecycle slice: explicit IPv6 posture:
   then starts the VM with a small guarded prelaunch command rather than
   immediately running the authority-bearing agent command;
 - the guarded VM waits on `/run/writ-agent-vm/start`. While it is waiting, the
-  runner executes `ip -6` inside the guest and refuses to release the real
-  command unless the guest has no non-link-local IPv6 address and no IPv6
-  default route. If the image lacks the `ip` command, the start fails closed;
+  runner runs one guest exec that first **enforces** the posture — disabling
+  IPv6 in the guest kernel (`net.ipv6.conf.{all,default}.disable_ipv6=1`, which
+  flushes any address the guest already SLAAC'd) — and then **verifies** it by
+  running `ip -6`, refusing to release the real command unless the guest now
+  has no non-link-local IPv6 address and no IPv6 default route. Enforce and
+  verify are one atomic exec, so no Router Advertisement can re-add an address
+  between them; the verify is still load-bearing (a failed disable leaves the
+  address and fails the start). If the image lacks the `ip` command, the start
+  fails closed;
 - because this mode wraps and later `exec`s the requested command, it requires
   an explicit guest command rather than relying on an image default command;
 - only after the guest IPv6 posture check passes does the runner touch the
@@ -368,12 +374,18 @@ would be misleading when Apple attached a different ULA prefix. The active
 protection, and the only IPv6 enforcement in this mode, is the pre-release
 guest proof that there is no routable IPv6 state.
 
-That proof is point-in-time: it runs immediately before releasing the guarded
-guest command. The current assumption is that Apple `--internal` networks do
-not later inject IPv6 router advertisements or otherwise add a routable IPv6
-configuration after the probe. If that assumption fails in manual testing, this
-mode should stay disabled until the runner can continuously monitor IPv6 state
-or enforce an equivalent in-guest IPv6 disablement before release.
+The original probe was point-in-time and rested on an assumption that Apple
+`--internal` networks do not later inject IPv6 Router Advertisements. **That
+assumption failed**: on macOS 26.5.1 / `container` 0.11.0 the host vmnet
+advertises IPv6 RAs on the shared link regardless of the network's own (absent)
+v6 config, and a guest with default `accept_ra` SLAACs a global-scope ULA
+(`fd…/64 … proto kernel_ra`) a beat after boot — after the point-in-time probe
+would have passed. The remedy this doc anticipated ("enforce an equivalent
+in-guest IPv6 disablement before release") is now what the mode does: the
+pre-release step disables IPv6 in the guest kernel (flushing any RA-acquired
+address and ignoring later RAs) and then verifies the clean posture. The
+guarantee is therefore no longer "the network happened to have no v6" but "the
+guest kernel has IPv6 disabled", which holds against host vmnet RAs.
 
 ### PF strategy
 
