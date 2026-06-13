@@ -1058,6 +1058,20 @@ assert_broker_cache_populated() {
   log "pass: broker flake-input cache holds at least one provisioned narinfo"
 }
 
+# Dump the offending audit rows (everything after the summary's first line)
+# an assertion's Python emitted, so a failed run is self-diagnosing even though
+# cleanup deletes the audit DB. No-op when there is no detail.
+dump_audit_detail() {
+  local detail
+  detail="$(printf '%s\n' "$1" | sed -n '2,$p')"
+  [[ -n "$detail" ]] || return 0
+  printf '[prove-prewarm-strict] offending / relevant nix_cache audit rows:\n' >&2
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    printf '[prove-prewarm-strict]   %s\n' "$line" >&2
+  done <<<"$detail"
+}
+
 assert_guest_consumed_provisioned_cache() {
   log "assert: every provisioned flake input the warm requested was served locally, none from upstream"
   # The nix-cache endpoint serves local-first: a 200 served from the local
@@ -1102,6 +1116,7 @@ finally:
 
 local_hits = 0
 upstream_leaks = 0
+detail = []
 for target, http_status, upstream_url in rows:
     base = (target or "").rsplit("/", 1)[-1]
     if base not in provisioned or http_status != 200:
@@ -1110,18 +1125,24 @@ for target, http_status, upstream_url in rows:
         local_hits += 1
     elif upstream_url:
         upstream_leaks += 1
+        detail.append(
+            f"upstream-leak target={target} status={http_status} url={upstream_url}"
+        )
 
+# Summary on line 1 (the shell reads only this line for the counts); offending
+# rows follow for dump_audit_detail.
 print(f"{len(provisioned)} {local_hits} {upstream_leaks}")
+for line in detail:
+    print(line)
 PY
 )" || die "could not query nix_cache audit rows from ${AUDIT_DB}"
-  local provisioned_count="${result%% *}"
-  local rest="${result#* }"
-  local local_hits="${rest%% *}"
-  local upstream_leaks="${rest##* }"
+  local provisioned_count local_hits upstream_leaks
+  read -r provisioned_count local_hits upstream_leaks <<<"$result"
   if [[ "$provisioned_count" -lt 1 ]]; then
     die "no provisioned narinfos in ${FLAKE_INPUT_CACHE_DIR}; provisioning wrote nothing to consume"
   fi
   if [[ "$upstream_leaks" -ne 0 ]]; then
+    dump_audit_detail "$result"
     die "${upstream_leaks} provisioned flake-input path(s) were served from upstream instead of the local cache; local-first serving regressed"
   fi
   if [[ "$local_hits" -lt 1 ]]; then
@@ -1168,13 +1189,20 @@ proxied_view = 0
 prewarm_hits = 0
 tool_narinfo_ok = 0
 tool_nar_ok = 0
+detail = []
 for target, http_status, upstream_url in rows:
     target = target or ""
     upstream_url = upstream_url or ""
     if upstream_url.startswith("http"):
         upstream_http += 1
+        detail.append(
+            f"upstream-proxied target={target} status={http_status} url={upstream_url}"
+        )
     if target.startswith("/v1/nix/cache/"):
         proxied_view += 1
+        detail.append(
+            f"proxied-view target={target} status={http_status} url={upstream_url or '(synthetic/none)'}"
+        )
     if (
         target.startswith("/v1/nix/prewarm/")
         and http_status == 200
@@ -1187,7 +1215,27 @@ for target, http_status, upstream_url in rows:
         if target == f"/v1/nix/prewarm/nar/{tool_nar_file}":
             tool_nar_ok = 1
 
+# When the tool was NOT seen served from the pre-warm dir, list what we expected
+# and every pre-warm request we DID see, so a hash / NAR-name mismatch (builder
+# vs guest) or a serve-source surprise is obvious from the dump alone.
+if not tool_narinfo_ok or not tool_nar_ok:
+    detail.append(
+        f"expected-tool narinfo=/v1/nix/prewarm/{tool_hash}.narinfo "
+        f"nar=/v1/nix/prewarm/nar/{tool_nar_file}"
+    )
+    for target, http_status, upstream_url in rows:
+        target = target or ""
+        if target.startswith("/v1/nix/prewarm/"):
+            detail.append(
+                f"prewarm-request target={target} status={http_status} "
+                f"url={upstream_url or '(synthetic/none)'}"
+            )
+
+# Summary on line 1 (the shell reads only this line for the counts); detail
+# rows follow for dump_audit_detail.
 print(f"{len(rows)} {upstream_http} {proxied_view} {prewarm_hits} {tool_narinfo_ok} {tool_nar_ok}")
+for line in detail:
+    print(line)
 PY
 )" || die "could not query nix_cache audit rows from ${AUDIT_DB}"
   local total upstream_http proxied_view prewarm_hits tool_narinfo_ok tool_nar_ok
@@ -1196,18 +1244,23 @@ PY
     die "no nix_cache audit rows for session ${SESSION_ID}; the warm made no cache requests at all?"
   fi
   if [[ "$upstream_http" -ne 0 ]]; then
+    dump_audit_detail "$result"
     die "${upstream_http} session request(s) were proxied to the http(s) upstream; the strict warm leaked upstream"
   fi
   if [[ "$proxied_view" -ne 0 ]]; then
+    dump_audit_detail "$result"
     die "${proxied_view} session request(s) hit the proxied /v1/nix/cache view; the strict substituter override is not load-bearing"
   fi
   if [[ "$prewarm_hits" -lt 1 ]]; then
+    dump_audit_detail "$result"
     die "no 200s served through /v1/nix/prewarm; the warm did not flow through the strict view"
   fi
   if [[ "$tool_narinfo_ok" -ne 1 ]]; then
+    dump_audit_detail "$result"
     die "the non-public tool's narinfo was not served from the pre-warm dir through the strict view"
   fi
   if [[ "$tool_nar_ok" -ne 1 ]]; then
+    dump_audit_detail "$result"
     die "the non-public tool's NAR was not served from the pre-warm dir through the strict view"
   fi
   log "pass: ${total} session cache request(s); 0 upstream, 0 proxied-view; ${prewarm_hits} pre-warm-view 200s; tool narinfo + NAR served from the pre-warm dir"
