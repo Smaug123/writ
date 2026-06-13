@@ -128,18 +128,32 @@ if ! container image inspect "$image" >/dev/null 2>&1; then
   exit 1
 fi
 
-# Resolve <repo> to a clone URL. owner/name is the common case and mirrors
-# `agent-vm start --repo owner/name`; a full URL is honoured verbatim so a
-# private repo clones with your configured git credentials.
+# Resolve <repo> to a clone URL (`repo_url`, used only for `git clone`) and a
+# REDACTED label (`repo_label`, used for every log line and the manifest-bearing
+# slug). owner/name is the common case and mirrors `agent-vm start --repo
+# owner/name`; a full URL is honoured verbatim so a private repo clones with
+# your configured git credentials.
 case "$raw_repo" in
-  *://* | git@*) repo_url="$raw_repo" ;;
+  *://* | git@*)
+    repo_url="$raw_repo"
+    # Strip any embedded userinfo (https://token@host/...) so a credential
+    # never reaches a log line, the manifest, or the on-disk slug. The
+    # scp-form `git@host:...` carries no secret, so it is left as-is.
+    case "$repo_url" in
+      *://*@*) repo_label="${repo_url%%://*}://${repo_url#*://*@}" ;;
+      *) repo_label="$repo_url" ;;
+    esac
+    ;;
   */*)
     case "$raw_repo" in
       *[!A-Za-z0-9._/-]* | */*/* | /* | */)
         echo "error: '$raw_repo' is not an owner/name; pass a full git URL instead." >&2
         exit 1
         ;;
-      *) repo_url="https://github.com/$raw_repo" ;;
+      *)
+        repo_url="https://github.com/$raw_repo"
+        repo_label="$raw_repo"
+        ;;
     esac
     ;;
   *)
@@ -147,6 +161,15 @@ case "$raw_repo" in
     exit 1
     ;;
 esac
+
+# A filesystem-safe, repo-distinguishing slug for the in-container checkout
+# path. warm-devshell-cache.sh records that path as the flakeref in its
+# manifest and derives the gc-root profile name from it, so a per-repo slug
+# keeps per-repo pruning/auditing and profile separation — a fixed
+# `/work/repo` would collapse every repo's bookkeeping into one. Derived from
+# the REDACTED label, never repo_url, so a credential can never reach it.
+slug="$(printf '%s' "$repo_label" | tr -c 'A-Za-z0-9._-' '-' | sed -E 's/-+/-/g; s/^-//; s/-$//')"
+[ -n "$slug" ] || slug="repo"
 
 # --- work dir + container cleanup --------------------------------------------
 builder_name="writ-prewarm-builder-$$"
@@ -165,13 +188,13 @@ clone_args=(clone --quiet)
 if [ -n "${WRIT_PREWARM_REF:-}" ]; then
   clone_args+=(--branch "$WRIT_PREWARM_REF")
 fi
-echo "==> cloning $repo_url${WRIT_PREWARM_REF:+ (ref $WRIT_PREWARM_REF)}"
-git "${clone_args[@]}" -- "$repo_url" "$work_dir/repo"
-if [ ! -f "$work_dir/repo/flake.nix" ]; then
-  echo "error: $repo_url has no flake.nix at the checked-out ref." >&2
+echo "==> cloning $repo_label${WRIT_PREWARM_REF:+ (ref $WRIT_PREWARM_REF)}"
+git "${clone_args[@]}" -- "$repo_url" "$work_dir/$slug"
+if [ ! -f "$work_dir/$slug/flake.nix" ]; then
+  echo "error: $repo_label has no flake.nix at the checked-out ref." >&2
   exit 1
 fi
-rev="$(git -C "$work_dir/repo" rev-parse HEAD)"
+rev="$(git -C "$work_dir/$slug" rev-parse HEAD)"
 echo "    rev $rev"
 
 # --- 2. nixpkgs for the injected toolset -------------------------------------
@@ -182,7 +205,7 @@ echo "    rev $rev"
 if [ -n "${WRIT_PREWARM_TOOLS_NIXPKGS:-}" ]; then
   tools_nixpkgs="$WRIT_PREWARM_TOOLS_NIXPKGS"
 else
-  tools_nixpkgs="$(python3 - "$work_dir/repo/flake.lock" <<'PY'
+  tools_nixpkgs="$(python3 - "$work_dir/$slug/flake.lock" <<'PY'
 import json, sys
 try:
     lock = json.load(open(sys.argv[1]))
@@ -196,7 +219,7 @@ for node in lock.get("nodes", {}).values():
 PY
 )"
   if [ -z "$tools_nixpkgs" ]; then
-    echo "error: could not find a nixpkgs input in $repo_url's flake.lock to source" >&2
+    echo "error: could not find a nixpkgs input in $repo_label's flake.lock to source" >&2
     echo "       the builder toolset (grep/find/jq/flock); set WRIT_PREWARM_TOOLS_NIXPKGS." >&2
     exit 1
   fi
@@ -219,8 +242,8 @@ tools=(nix --extra-experimental-features "nix-command flakes" shell
   '$tools_nixpkgs#jq' '$tools_nixpkgs#flock' '$tools_nixpkgs#gnugrep' '$tools_nixpkgs#findutils' -c)
 echo "== init-prewarm-cache.sh =="
 "\${tools[@]}" bash /prewarm-scripts/init-prewarm-cache.sh
-echo "== warm-devshell-cache.sh /work/repo $attr =="
-"\${tools[@]}" bash /prewarm-scripts/warm-devshell-cache.sh /work/repo '$attr'
+echo "== warm-devshell-cache.sh /work/$slug $attr =="
+"\${tools[@]}" bash /prewarm-scripts/warm-devshell-cache.sh '/work/$slug' '$attr'
 EOF
 
 # --- 4. start the egress builder + run init + warm ---------------------------
@@ -263,7 +286,7 @@ container exec "$builder_name" sh -lc 'chmod -R a+rX /prewarm/cache /prewarm/man
 cache_dir="$prewarm_dir/cache"
 echo
 echo "warm-via-container: done."
-echo "  warmed:   $repo_url (rev $rev) devShells.$guest_system.$attr"
+echo "  warmed:   $repo_label (rev $rev) devShells.$guest_system.$attr"
 echo "  cache:    $cache_dir"
 echo "  key:      $public_key"
 echo
