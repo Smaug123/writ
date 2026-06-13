@@ -31,7 +31,9 @@
 # mount). The strict trust model puts the key "only on the builder, never on
 # the broker"; here builder and broker are one Mac, so that separation is
 # relaxed. It is still sound: the guest only ever sees `cache/` over HTTP and
-# never `keys/`. For a true split (separate builder VM), run
+# never `keys/`, and realisation builds the repo's derivations under a pinned
+# Nix sandbox (no fallback; see the nix.conf below) so repo-controlled build
+# code cannot read the key either. For a true split (separate builder VM), run
 # `warm-devshell-cache.sh` there and rsync only `cache/` per README.md.
 set -Eeuo pipefail
 
@@ -246,8 +248,14 @@ export HOME=/root NIX_CONF_DIR=/root/nix-conf
 export WRIT_PREWARM_DIR=/prewarm WRIT_PREWARM_SYSTEM='$guest_system'
 # What the daemon's nix.conf prologue gives agent guests, supplied by hand
 # here: root builds (the image has no nixbld group) and the flake features.
+# Plus pin the build SANDBOX on and disable nix's silent unsandboxed fallback:
+# realisation builds the warmed repo's derivations as root with /prewarm
+# (including /prewarm/keys, the signing secret) bind-mounted, so an unsandboxed
+# build would be a key-exfiltration path. sandbox=true is nix's Linux default,
+# but sandbox-fallback=false makes a non-sandboxable build FAIL rather than
+# quietly run unconfined.
 mkdir -p /root/nix-conf
-printf 'experimental-features = nix-command flakes\nbuild-users-group =\n' > /root/nix-conf/nix.conf
+printf 'experimental-features = nix-command flakes\nbuild-users-group =\nsandbox = true\nsandbox-fallback = false\n' > /root/nix-conf/nix.conf
 # The bind-mounted checkout is host-owned, so root's git needs safe.directory.
 git config --global safe.directory '*'
 tools=(nix --extra-experimental-features "nix-command flakes" shell
@@ -292,8 +300,14 @@ case "$public_key" in
 esac
 # cache/ and manifest/ are written 0700 under the container's umask; the broker
 # (writd) must read cache/ and these assertions read the manifest. keys/ stays
-# closed — it is never transferred and the guest never sees it.
-container exec "$builder_name" sh -lc 'chmod -R a+rX /prewarm/cache /prewarm/manifest' || true
+# closed — it is never transferred and the guest never sees it. A hard error:
+# if cache/ is left unreadable, writd fails to serve it and the strict warm
+# 404s — reporting success here would hide that.
+if ! container exec "$builder_name" sh -lc 'chmod -R a+rX /prewarm/cache /prewarm/manifest'; then
+  echo "error: could not make $prewarm_dir/{cache,manifest} host-readable;" >&2
+  echo "       writd must read the cache dir, so refusing to report success." >&2
+  exit 1
+fi
 
 cache_dir="$prewarm_dir/cache"
 echo
