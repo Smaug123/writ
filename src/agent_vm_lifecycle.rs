@@ -66,12 +66,21 @@ const IPV4_ONLY_PRELAUNCH_SCRIPT: &str = concat!(
 /// [`GuestIpv6Inspection::require_no_routable_ipv6`] would fail the start — the
 /// validation confirms the enforcement actually took.
 ///
-/// `[ -w … ]` guards the writes so a guest whose kernel has no IPv6 at all
-/// (the path is absent) is tolerated rather than failing under `set -e`.
+/// Fail-closed enforcement: for each sysctl that EXISTS we write `1` and then
+/// read it back, failing the start unless it actually reads `1`. Only an
+/// *absent* path is tolerated (a guest kernel with no IPv6 has nothing to
+/// disable and cannot acquire an RA address). A present-but-unwritable sysctl
+/// — `container exec` as a non-root user, a read-only `/proc/sys` — must NOT
+/// pass: the read-back is what catches it, independent of why the write didn't
+/// take, rather than trusting the `ip -6` snapshot (which could look clean if
+/// the RA simply has not arrived yet, only to gain the ULA moments later).
 const GUEST_IPV6_ENFORCE_AND_PROBE_SCRIPT: &str = r#"set -e
 for scope in all default; do
   path="/proc/sys/net/ipv6/conf/$scope/disable_ipv6"
-  if [ -w "$path" ]; then printf 1 > "$path"; fi
+  [ -e "$path" ] || continue
+  printf 1 > "$path" 2>/dev/null || true
+  read -r state < "$path" 2>/dev/null || state=
+  [ "$state" = 1 ] || { echo "writ-ipv6-not-disabled $path=$state"; exit 1; }
 done
 if ! command -v ip >/dev/null 2>&1; then echo writ-ip-command-missing; exit 77; fi
 ip -6 -o addr show 2>&1

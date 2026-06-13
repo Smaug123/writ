@@ -113,8 +113,13 @@ fn guest_ipv6_enforce_and_probe_script_disables_then_fails_closed_on_partial_pro
     // vmnet Router Advertisement cannot leave the guest with a routable ULA.
     assert!(GUEST_IPV6_ENFORCE_AND_PROBE_SCRIPT.contains("conf/$scope/disable_ipv6"));
     assert!(GUEST_IPV6_ENFORCE_AND_PROBE_SCRIPT.contains("for scope in all default"));
-    // Guarded write, so a kernel without IPv6 (absent path) is tolerated.
-    assert!(GUEST_IPV6_ENFORCE_AND_PROBE_SCRIPT.contains("[ -w \"$path\" ]"));
+    // Fail closed: only an ABSENT sysctl is tolerated; a present one must read
+    // back `1`, so a present-but-unwritable path fails the start rather than
+    // releasing the guest command with IPv6 still live.
+    assert!(GUEST_IPV6_ENFORCE_AND_PROBE_SCRIPT.contains("[ -e \"$path\" ] || continue"));
+    assert!(GUEST_IPV6_ENFORCE_AND_PROBE_SCRIPT.contains("read -r state < \"$path\""));
+    assert!(GUEST_IPV6_ENFORCE_AND_PROBE_SCRIPT.contains("[ \"$state\" = 1 ]"));
+    assert!(GUEST_IPV6_ENFORCE_AND_PROBE_SCRIPT.contains("writ-ipv6-not-disabled"));
     // Then report the resulting state for validation.
     assert!(GUEST_IPV6_ENFORCE_AND_PROBE_SCRIPT.contains("addr show 2>&1"));
     assert!(GUEST_IPV6_ENFORCE_AND_PROBE_SCRIPT.contains("route show default 2>&1"));
