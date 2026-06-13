@@ -31,7 +31,10 @@ dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=./common.sh
 . "$dir/common.sh"
 
-for tool in nix-store nix; do
+# `find` is used by the hard-link safety check below; without it that check
+# would silently pass (an empty `$(find ...)`), skipping a real defence. Treat
+# it as a hard dependency, like nix.
+for tool in nix-store nix find; do
   if ! command -v "$tool" >/dev/null 2>&1; then
     echo "error: $tool not found on PATH." >&2
     exit 1

@@ -112,8 +112,11 @@ esac
 
 # nix: archive/eval/print-dev-env/copy. jq: parse the archive's --json tree.
 # flock: the host-level warm lock (util-linux; in every Linux distro base —
-# for a darwin test run, `nix shell nixpkgs#flock`).
-for tool in nix jq flock; do
+# for a darwin test run, `nix shell nixpkgs#flock`). grep: filter the input
+# path list and the dirty-tree check; without it those `$(... | grep ...)`
+# pipes would silently yield empty (an archived-nothing warm that still
+# reports success), so treat it as a hard dependency.
+for tool in nix jq flock grep; do
   if ! command -v "$tool" >/dev/null 2>&1; then
     echo "error: $tool not found on PATH." >&2
     exit 1

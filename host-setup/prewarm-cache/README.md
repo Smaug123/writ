@@ -26,8 +26,11 @@ need Apple's `container` tooling). It needs:
 - outbound network (this is the one machine in the scheme that fetches from
   the open internet: github, cache.nixos.org, nuget.org, …);
 - `nix` (any version with `nix-command` + `flakes`; the scripts pass
-  `--extra-experimental-features` themselves), `jq`, `git`, `bash`, and
-  `flock` (util-linux, in every distro base — the warm lock);
+  `--extra-experimental-features` themselves), `jq`, `git`, `bash`, `flock`
+  (util-linux, in every distro base — the warm lock), and the usual
+  `grep` / `find` / coreutils (present on any normal Linux; the scripts
+  preflight-check them and abort loudly if absent, since a missing `grep`
+  would otherwise make input-archiving a silent no-op);
 - disk for the Nix store plus the cache dir (devShell closures run to
   gigabytes).
 
