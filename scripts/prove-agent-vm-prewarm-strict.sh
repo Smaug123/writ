@@ -676,24 +676,34 @@ run_prewarm_builder() {
     git config --global safe.directory "*"
   ' >>"$BUILDER_LOG" 2>&1 || die "could not prepare the builder container environment"
 
+  # The committed scripts run in a NORMAL Linux userland — but this proof
+  # reuses the *production* guest image, which deliberately strips grep, find,
+  # sed, awk (the no-egress security posture; see productionForbiddenBins in
+  # flake.nix). init needs `find` (its hard-link safety check) and warm needs
+  # `grep` (input filtering, the dirty-tree check), so ride a real toolset in
+  # via `nix shell` from the same pinned nixpkgs the fixture uses (the builder
+  # has egress — that is its purpose). On a real builder VM these are present
+  # already; the scripts' own preflight now fails loudly if they are not,
+  # rather than silently no-op'ing (which is how the missing tools first
+  # surfaced here — a warm that archived zero inputs yet reported success).
+  local builder_tool_shell
+  builder_tool_shell="nix --extra-experimental-features 'nix-command flakes' \
+    shell '${NIXPKGS_REF}#jq' '${NIXPKGS_REF}#flock' \
+    '${NIXPKGS_REF}#gnugrep' '${NIXPKGS_REF}#findutils' -c"
+
   log "builder: init-prewarm-cache.sh (keypair + cache layout)"
   builder "
     set -eu
     export HOME=/root NIX_CONF_DIR=/root/nix-conf WRIT_PREWARM_DIR=/prewarm
-    bash /prewarm-scripts/init-prewarm-cache.sh
+    ${builder_tool_shell} bash /prewarm-scripts/init-prewarm-cache.sh
   " >>"$BUILDER_LOG" 2>&1 || die "init-prewarm-cache.sh failed in the builder (see ${BUILDER_LOG})"
 
-  # The committed warmer, unmodified. The guest image ships bash, git, nix,
-  # and coreutils; jq and flock ride in via `nix shell` from the same pinned
-  # nixpkgs the fixture uses (the builder has egress — that is its purpose).
   log "builder: warm-devshell-cache.sh /fixture (archive inputs + realise + sign the devShell closure)"
   builder "
     set -eu
     export HOME=/root NIX_CONF_DIR=/root/nix-conf
     export WRIT_PREWARM_DIR=/prewarm WRIT_PREWARM_SYSTEM='${GUEST_SYSTEM}'
-    nix --extra-experimental-features 'nix-command flakes' \
-      shell '${NIXPKGS_REF}#jq' '${NIXPKGS_REF}#flock' \
-      -c bash /prewarm-scripts/warm-devshell-cache.sh /fixture
+    ${builder_tool_shell} bash /prewarm-scripts/warm-devshell-cache.sh /fixture
   " >>"$BUILDER_LOG" 2>&1 || die "warm-devshell-cache.sh failed in the builder (see ${BUILDER_LOG})"
 
   # Read the public key before opening anything up; only the transferable
