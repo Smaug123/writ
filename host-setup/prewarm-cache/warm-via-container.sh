@@ -179,10 +179,12 @@ slug="$(printf '%s' "$repo_label" | tr -c 'A-Za-z0-9._-' '-' | sed -E 's/-+/-/g;
 # --- work dir + container cleanup --------------------------------------------
 builder_name="writ-prewarm-builder-$$"
 work_dir="$(mktemp -d "${TMPDIR:-/tmp}/writ-prewarm-via-container.XXXXXX")"
+lock_dir=""  # set once we OWN the host lock, so cleanup never removes another's
 cleanup() {
   container stop "$builder_name" >/dev/null 2>&1 || true
   container delete "$builder_name" >/dev/null 2>&1 || container rm "$builder_name" >/dev/null 2>&1 || true
   rm -rf "$work_dir"
+  [ -n "$lock_dir" ] && rmdir "$lock_dir" 2>/dev/null || true
 }
 trap cleanup EXIT
 
@@ -193,6 +195,21 @@ mkdir -p "$prewarm_dir"
 # nix_prewarm_cache_dir would be relative — which writd rejects. Resolve it on
 # the host before mounting or printing.
 prewarm_dir="$(cd "$prewarm_dir" && pwd)"
+
+# ONE host lock around init+warm against this prewarm dir. The first warm of an
+# empty dir runs init-prewarm-cache.sh, which generates the signing key BEFORE
+# warm-devshell-cache.sh takes its own (in-container) warm lock; two concurrent
+# first runs could each regenerate the key, leaving cache entries signed by a
+# different key than the one printed for registration. An atomic mkdir lock
+# (macOS ships no flock(1), so not flock) serialises the whole wrapper. It is
+# only ever set after we own it, so cleanup cannot remove another holder's.
+candidate_lock="$prewarm_dir/.warm-via-container.lock"
+if ! mkdir "$candidate_lock" 2>/dev/null; then
+  echo "error: another warm-via-container.sh is running against $prewarm_dir" >&2
+  echo "       (lock $candidate_lock). Wait for it; if none is running, rmdir the lock." >&2
+  exit 1
+fi
+lock_dir="$candidate_lock"
 
 # --- 1. fresh checkout at the rev the guest will use -------------------------
 # The guest's workspace init always checks out DEFAULT_WORKSPACE_BRANCH —
@@ -311,10 +328,25 @@ case "$public_key" in
 esac
 # cache/ and manifest/ are written 0700 under the container's umask; the broker
 # (writd) must read cache/ and these assertions read the manifest. keys/ stays
-# closed — it is never transferred and the guest never sees it. A hard error:
-# if cache/ is left unreadable, writd fails to serve it and the strict warm
-# 404s — reporting success here would hide that.
-if ! container exec "$builder_name" sh -lc 'chmod -R a+rX /prewarm/cache /prewarm/manifest'; then
+# closed — it is never transferred and the guest never sees it.
+#
+# REFUSE a symlinked cache/ or manifest/ before chmod: `chmod -R` follows a
+# symlink given as its argument, so a manifest/ symlinked at keys/ would make
+# the private signing key world-readable. (init/warm only guard cache/ and
+# keys/.) nix writes only regular files under these dirs, so a top-level
+# non-symlink check is sufficient. A hard error: if cache/ is left unreadable,
+# writd fails to serve it and the strict warm 404s — reporting success here
+# would hide that.
+# shellcheck disable=SC2016  # $d is for the inner sh -lc, not the outer shell
+if ! container exec "$builder_name" sh -lc '
+  for d in /prewarm/cache /prewarm/manifest; do
+    if [ -L "$d" ] || [ ! -d "$d" ]; then
+      echo "refusing: $d is not a real directory (symlink?)" >&2
+      exit 1
+    fi
+  done
+  chmod -R a+rX /prewarm/cache /prewarm/manifest
+'; then
   echo "error: could not make $prewarm_dir/{cache,manifest} host-readable;" >&2
   echo "       writd must read the cache dir, so refusing to report success." >&2
   exit 1
