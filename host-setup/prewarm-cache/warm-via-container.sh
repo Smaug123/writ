@@ -17,13 +17,14 @@
 # `run_prewarm_builder`, generalised from the test fixture to any repo and a
 # durable output dir.
 #
-# WHICH REV. The agent VM clones the repo's DEFAULT BRANCH and checks out its
-# HEAD (the broker bundles `--all` and the guest follows the mirror HEAD;
-# src/vm_git_bundle.rs). A plain `git clone` reproduces exactly that rev, so
-# by default this warms what `agent-vm start --repo <repo>` (no ref) will
-# demand. Warming a stale or different rev whose devShell derivation differs
-# would leave the guest's `nix develop` 404ing under the strict warm and
-# falling through to an egress-needing build — the very failure this avoids.
+# WHICH REV. The agent VM's workspace init checks out DEFAULT_WORKSPACE_BRANCH
+# — "main" (crates/writ-vm-git/src/lib.rs; src/vm_client.rs requests
+# refs/heads/main), NOT the remote's default branch. So this warms `main` by
+# default (override with WRIT_PREWARM_REF), matching exactly what
+# `agent-vm start --repo <repo>` will demand. Warming a different rev whose
+# devShell derivation differs would leave the guest's `nix develop` 404ing
+# under the strict warm and falling through to an egress-needing build — the
+# very failure this avoids.
 #
 # SINGLE-MACHINE SECURITY NOTE. The signing key is written to
 # $WRIT_PREWARM_DIR/keys/ on THIS host (the container writes it through a bind
@@ -53,13 +54,15 @@ Environment overrides:
   WRIT_PREWARM_DIR       host pre-warm base, default ~/.local/share/writ-prewarm
   WRIT_PREWARM_SYSTEM    guest system, default derived from arch (aarch64-linux)
   WRIT_PREWARM_IMAGE     builder/guest image, default writ-agent-vm-guest:latest
-  WRIT_PREWARM_REF       git ref to clone+warm, default the remote default branch
+  WRIT_PREWARM_REF       git ref to clone+warm, default 'main' (the branch the
+                         guest's workspace init checks out)
   WRIT_PREWARM_CPUS      builder container vCPUs, default 4
   WRIT_PREWARM_MEMORY    builder container memory, default 8192m
   WRIT_PREWARM_TOOLS_NIXPKGS
                          nixpkgs flakeref for the injected grep/find/jq/flock
                          (the production guest image strips them). Default: the
-                         nixpkgs the warmed repo's flake.lock pins.
+                         nixpkgs writ itself pins (trusted) — NOT the warmed
+                         repo's, which runs as root near the signing key.
 
 Run on the broker Mac with Apple \`container\` installed and
 \`container system start\` already done. The builder container needs egress
@@ -184,12 +187,15 @@ trap cleanup EXIT
 mkdir -p "$prewarm_dir"
 
 # --- 1. fresh checkout at the rev the guest will use -------------------------
-clone_args=(clone --quiet)
-if [ -n "${WRIT_PREWARM_REF:-}" ]; then
-  clone_args+=(--branch "$WRIT_PREWARM_REF")
-fi
-echo "==> cloning $repo_label${WRIT_PREWARM_REF:+ (ref $WRIT_PREWARM_REF)}"
-git "${clone_args[@]}" -- "$repo_url" "$work_dir/$slug"
+# The guest's workspace init always checks out DEFAULT_WORKSPACE_BRANCH —
+# "main" (crates/writ-vm-git/src/lib.rs; src/vm_client.rs requests
+# refs/heads/main) — NOT the remote's default branch. Warm that exact ref so
+# the closure matches what `agent-vm start --repo <repo>` demands; warming a
+# divergent default-HEAD would 404 the strict warm even as this script reports
+# success. Override only to warm a different ref deliberately.
+ref="${WRIT_PREWARM_REF:-main}"
+echo "==> cloning $repo_label (ref $ref)"
+git clone --quiet --branch "$ref" -- "$repo_url" "$work_dir/$slug"
 if [ ! -f "$work_dir/$slug/flake.nix" ]; then
   echo "error: $repo_label has no flake.nix at the checked-out ref." >&2
   exit 1
@@ -200,12 +206,18 @@ echo "    rev $rev"
 # --- 2. nixpkgs for the injected toolset -------------------------------------
 # The production guest image strips grep/find/sed/awk (no-egress posture); init
 # needs `find` and warm needs `grep`, so ride a real toolset in via `nix shell`.
-# Default to the SAME nixpkgs the repo pins (already a flake input — no extra
-# fetch); fall back to an operator-supplied ref if the lock names none.
+#
+# TRUST: source the toolset from WRIT's OWN pinned nixpkgs — a trusted, reviewed
+# ref — NEVER the warmed repo's flake.lock. The driver runs these tools as root,
+# OUTSIDE the nix build sandbox, with /prewarm/keys mounted; a repo-pinned
+# toolset (an attacker's `github:<evil>/nixpkgs` masquerading via repo ==
+# "nixpkgs") would execute repo-controlled binaries with access to the signing
+# key. writ's lock is the trust anchor this script already ships under.
 if [ -n "${WRIT_PREWARM_TOOLS_NIXPKGS:-}" ]; then
   tools_nixpkgs="$WRIT_PREWARM_TOOLS_NIXPKGS"
 else
-  tools_nixpkgs="$(python3 - "$work_dir/$slug/flake.lock" <<'PY'
+  writ_lock="$dir/../../flake.lock"
+  tools_nixpkgs="$(python3 - "$writ_lock" <<'PY'
 import json, sys
 try:
     lock = json.load(open(sys.argv[1]))
@@ -219,12 +231,12 @@ for node in lock.get("nodes", {}).values():
 PY
 )"
   if [ -z "$tools_nixpkgs" ]; then
-    echo "error: could not find a nixpkgs input in $repo_label's flake.lock to source" >&2
-    echo "       the builder toolset (grep/find/jq/flock); set WRIT_PREWARM_TOOLS_NIXPKGS." >&2
+    echo "error: could not derive a trusted nixpkgs from writ's flake.lock ($writ_lock);" >&2
+    echo "       set WRIT_PREWARM_TOOLS_NIXPKGS to a trusted nixpkgs flakeref." >&2
     exit 1
   fi
 fi
-echo "    toolset nixpkgs: $tools_nixpkgs"
+echo "    toolset nixpkgs (trusted, from writ): $tools_nixpkgs"
 
 # --- 3. inner driver (runs inside the guest-system container) ----------------
 cat > "$work_dir/driver-inner.sh" <<EOF

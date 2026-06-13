@@ -30,10 +30,14 @@ container system start                                   # once per boot
 ./warm-via-container.sh Smaug123/dumb-fsharp-lsp         # owner/name, or a git URL
 ```
 
-It clones the repo's **default branch HEAD** — exactly the rev
-`agent-vm start --repo <repo>` (no ref) makes the guest check out — so the warm
-matches what the guest will demand. A full git URL is cloned verbatim with your
-configured credentials, so **private repos work**. The signed `cache/` lands
+It clones **`main`** — the branch the guest's workspace init checks out
+(`DEFAULT_WORKSPACE_BRANCH`), exactly the rev `agent-vm start --repo <repo>`
+demands — so the warm matches what the guest will need (override with
+`WRIT_PREWARM_REF`). A full git URL is cloned verbatim with your configured
+credentials, so **private repos work** (its userinfo is redacted from logs).
+The injected build toolset (grep/find/jq/flock) comes from *writ's* pinned
+nixpkgs, not the warmed repo's lock — it runs as root near the signing key, so
+it must be trusted. The signed `cache/` lands
 directly in `WRIT_PREWARM_DIR/cache` on this host, so the "Transferring to the
 broker host" step below is a no-op; the script prints the exact
 `nix_prewarm_cache_dir` + `nix_cache_trusted_public_keys` lines to paste into
