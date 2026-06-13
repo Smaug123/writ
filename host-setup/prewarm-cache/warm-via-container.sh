@@ -107,6 +107,19 @@ else
   esac
 fi
 
+# Signing key name (the key-rotation flow runs with WRIT_PREWARM_KEY_NAME set).
+# It must be threaded through to the in-container init/warm AND used when this
+# wrapper reads/prints the public key, or a rotated run would sign with one key
+# while we register another. Constrain it exactly as common.sh does (it lands
+# in keys/<name>.public and the `<name>:` signature prefix).
+key_name="${WRIT_PREWARM_KEY_NAME:-writ-prewarm-1}"
+case "$key_name" in
+  "" | *[!A-Za-z0-9._-]* | *..*)
+    echo "error: WRIT_PREWARM_KEY_NAME must be a non-empty name of [A-Za-z0-9._-] with no '..'; got '$key_name'." >&2
+    exit 1
+    ;;
+esac
+
 # --- preconditions -----------------------------------------------------------
 # Host tools: container (the builder), git (the clone), python3 (parse the
 # repo's flake.lock for its nixpkgs). The committed scripts that run INSIDE
@@ -274,6 +287,7 @@ cat > "$work_dir/driver-inner.sh" <<EOF
 set -Eeuo pipefail
 export HOME=/root NIX_CONF_DIR=/root/nix-conf
 export WRIT_PREWARM_DIR=/prewarm WRIT_PREWARM_SYSTEM='$guest_system'
+export WRIT_PREWARM_KEY_NAME='$key_name'
 # What the daemon's nix.conf prologue gives agent guests, supplied by hand
 # here: root builds (the image has no nixbld group) and the flake features.
 # Plus pin the build SANDBOX on and disable nix's silent unsandboxed fallback:
@@ -318,11 +332,11 @@ echo "==> warming inside the builder"
 container exec "$builder_name" sh -lc 'bash /work/driver-inner.sh'
 
 # --- 5. read the key, open the cache for host (writd) reads ------------------
-public_key="$(container exec "$builder_name" sh -lc 'cat /prewarm/keys/writ-prewarm-1.public')"
+public_key="$(container exec "$builder_name" sh -lc "cat /prewarm/keys/$key_name.public")"
 case "$public_key" in
-  writ-prewarm-1:*) ;;
+  "$key_name":*) ;;
   *)
-    echo "error: unexpected pre-warm public key shape: $public_key" >&2
+    echo "error: unexpected pre-warm public key shape (expected $key_name:...): $public_key" >&2
     exit 1
     ;;
 esac
