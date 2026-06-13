@@ -187,6 +187,12 @@ cleanup() {
 trap cleanup EXIT
 
 mkdir -p "$prewarm_dir"
+# Canonicalise to an ABSOLUTE path. A relative WRIT_PREWARM_DIR / XDG_DATA_HOME
+# would still mount as the absolute `/prewarm` inside the container (so
+# common.sh's in-container absolute-path guard passes), yet the printed
+# nix_prewarm_cache_dir would be relative — which writd rejects. Resolve it on
+# the host before mounting or printing.
+prewarm_dir="$(cd "$prewarm_dir" && pwd)"
 
 # --- 1. fresh checkout at the rev the guest will use -------------------------
 # The guest's workspace init always checks out DEFAULT_WORKSPACE_BRANCH —
@@ -196,13 +202,18 @@ mkdir -p "$prewarm_dir"
 # divergent default-HEAD would 404 the strict warm even as this script reports
 # success. Override only to warm a different ref deliberately.
 ref="${WRIT_PREWARM_REF:-main}"
+# Clone under a reserved checkout/ subtree so the slug can never collide with
+# the generated driver-inner.sh sibling (a repo named e.g. `driver/inner.sh`
+# sanitises to exactly that filename).
+checkout="$work_dir/checkout/$slug"
+mkdir -p "$work_dir/checkout"
 echo "==> cloning $repo_label (ref $ref)"
-git clone --quiet --branch "$ref" -- "$repo_url" "$work_dir/$slug"
-if [ ! -f "$work_dir/$slug/flake.nix" ]; then
+git clone --quiet --branch "$ref" -- "$repo_url" "$checkout"
+if [ ! -f "$checkout/flake.nix" ]; then
   echo "error: $repo_label has no flake.nix at the checked-out ref." >&2
   exit 1
 fi
-rev="$(git -C "$work_dir/$slug" rev-parse HEAD)"
+rev="$(git -C "$checkout" rev-parse HEAD)"
 echo "    rev $rev"
 
 # --- 2. nixpkgs for the injected toolset -------------------------------------
@@ -262,8 +273,8 @@ tools=(nix --extra-experimental-features "nix-command flakes" shell
   '$tools_nixpkgs#jq' '$tools_nixpkgs#flock' '$tools_nixpkgs#gnugrep' '$tools_nixpkgs#findutils' -c)
 echo "== init-prewarm-cache.sh =="
 "\${tools[@]}" bash /prewarm-scripts/init-prewarm-cache.sh
-echo "== warm-devshell-cache.sh /work/$slug $attr =="
-"\${tools[@]}" bash /prewarm-scripts/warm-devshell-cache.sh '/work/$slug' '$attr'
+echo "== warm-devshell-cache.sh /work/checkout/$slug $attr =="
+"\${tools[@]}" bash /prewarm-scripts/warm-devshell-cache.sh '/work/checkout/$slug' '$attr'
 EOF
 
 # --- 4. start the egress builder + run init + warm ---------------------------
