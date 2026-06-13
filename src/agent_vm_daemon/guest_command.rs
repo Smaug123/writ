@@ -88,7 +88,9 @@ printf 'machine %s login %s password %s\n' \
 /// regardless of this setting, so it grants no escalation:
 ///   * the warm's own `nix develop --command true` sources the devShell
 ///     `shellHook` (arbitrary repo code) as root even at `max-jobs = 0`, with
-///     this netrc already present;
+///     this netrc already present (a strict pre-warm warm realises via
+///     `print-dev-env` and runs no hook, but the agent's `nix develop`
+///     wrapper sources it moments later regardless);
 ///   * the agent runs inside the same `nix develop` wrapper as root, holds the
 ///     broker token in its environment, and can trigger its own builds at the
 ///     default non-zero `max-jobs`, all reading the same persistent netrc.

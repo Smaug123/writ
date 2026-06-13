@@ -27,7 +27,7 @@ use crate::vm_git::{
     VmFlakeProvisionRequest, VmFlakeProvisionResponse, VmGitCloneErrorResponse, VmGitCloneRequest,
     VmGitPushErrorResponse, VmGitPushMetadata, VmGitPushRequest, VmGitPushStagedReceipt,
     WorkspaceWarmMode, default_workspace_destination, encode_vm_git_push_request_body,
-    nix_develop_command_args, nix_substituters_override_args,
+    nix_develop_command_args, nix_print_dev_env_command_args, nix_substituters_override_args,
 };
 
 pub const VM_BROKER_URL_ENV: &str = "WRIT_BROKER_URL";
@@ -1547,13 +1547,30 @@ fn run_nix_develop_true(
     command: &VmWorkspaceInitCommand,
     substituter_override: Option<&str>,
 ) -> Result<(), VmClientError> {
+    // The strict warm realises via `print-dev-env`, never `nix develop`: the
+    // latter additionally resolves an interactive shell (nixpkgs#bashInteractive)
+    // outside the pre-warmed closure, which the pre-warm-only substituter
+    // cannot serve (see `nix_print_dev_env_command_args`). The non-strict warm
+    // keeps `nix develop --command true` byte-for-byte, with the shell
+    // substituting through the upstream-capable proxy as before.
     let mut args = warm_substituter_override_args(substituter_override);
-    args.extend(
-        nix_develop_command_args(DEFAULT_DEVSHELL_ATTR)
-            .into_iter()
-            .map(OsString::from),
-    );
-    args.push(OsString::from("true"));
+    match substituter_override {
+        Some(_) => {
+            args.extend(
+                nix_print_dev_env_command_args(DEFAULT_DEVSHELL_ATTR)
+                    .into_iter()
+                    .map(OsString::from),
+            );
+        }
+        None => {
+            args.extend(
+                nix_develop_command_args(DEFAULT_DEVSHELL_ATTR)
+                    .into_iter()
+                    .map(OsString::from),
+            );
+            args.push(OsString::from("true"));
+        }
+    }
     run_nix_command(
         command.nix_program(),
         VmWorkspaceWarmStep::DevShell,
@@ -2467,11 +2484,15 @@ mod tests {
         assert_eq!(calls.len(), 2, "{nix_log}");
         let override_prefix = format!("--option substituters {TEST_PREWARM_URL} ");
         // The strict guarantee covers the *whole* warm: eval input fetches
-        // (flake metadata) and closure realisation (develop) alike.
+        // (flake metadata) and closure realisation alike.
         assert!(calls[0].starts_with(&override_prefix), "{nix_log}");
         assert!(calls[0].contains("flake metadata"), "{nix_log}");
         assert!(calls[1].starts_with(&override_prefix), "{nix_log}");
-        assert!(calls[1].contains("develop"), "{nix_log}");
+        // Strict realisation is `print-dev-env`, never `nix develop`: develop
+        // additionally resolves nixpkgs#bashInteractive, which is outside the
+        // pre-warmed closure and unservable by the strict substituter.
+        assert!(calls[1].contains("print-dev-env"), "{nix_log}");
+        assert!(!calls[1].contains(" develop "), "{nix_log}");
     }
 
     #[test]
@@ -2482,11 +2503,16 @@ mod tests {
         warm_workspace(&command).unwrap();
 
         let nix_log = fs::read_to_string(dir.path().join("nix.log")).unwrap();
-        assert_eq!(nix_log.lines().count(), 2, "{nix_log}");
+        let calls: Vec<&str> = nix_log.lines().collect();
+        assert_eq!(calls.len(), 2, "{nix_log}");
         assert!(
             !nix_log.contains("substituters"),
             "no pre-warm URL means no substituter override: {nix_log}"
         );
+        // The non-strict warm keeps `nix develop --command true` byte-for-byte
+        // (the shell substitutes through the upstream-capable proxy as before).
+        assert!(calls[1].contains("develop"), "{nix_log}");
+        assert!(!calls[1].contains("print-dev-env"), "{nix_log}");
     }
 
     #[test]

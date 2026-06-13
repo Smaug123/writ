@@ -1293,7 +1293,13 @@ First workspace bootstrap slice implemented in `src/protocol.rs`,
   `/v1/nix/prewarm` view (local archives only, miss ⇒ 404, never an upstream
   proxy), so the warm realises exactly the human-pre-warmed closure or fails
   fast — `sources` warms and the agent's later Nix usage stay on the proxied
-  `/v1/nix/cache` view;
+  `/v1/nix/cache` view. The strict realisation step is `nix print-dev-env`
+  rather than `nix develop --command true`: it realises the identical dev-env
+  closure — the same one the pre-warm builder signed via `print-dev-env
+  --profile` — without `nix develop`'s additional interactive-shell
+  resolution (`nixpkgs#bashInteractive`), which lies outside that closure and
+  is unservable by the strict substituter. The agent's own `nix develop`
+  wrapper still pulls the shell through the proxied view at run time;
 - Cargo dependency-source prefetching remains deliberately outside this first
   slice. A generic Rust workspace can require crates.io or Git dependency
   network access after the devshell starts, and the VM has no general outbound

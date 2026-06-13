@@ -276,7 +276,7 @@ refused before archiving — those would sign builder-local files, in the
 worst case the key dir itself, into the broker-served cache (mirrors the
 FK provisioner's local-input refusal).
 
-### PW5 — End-to-end oracle
+### PW5 — End-to-end oracle — landed
 
 Extend `scripts/prove-agent-vm-devshell-warm.sh` (or a sibling) so the
 fixture devShell contains a path **absent from `cache.nixos.org`** (a
@@ -286,6 +286,39 @@ only substituter. Assert: (a) the warm succeeds with the guest firewalled
 off both github and `nuget.org`; (b) the non-public path was served from
 the pre-warm dir, **0** warm requests hit upstream; (c) the guest still
 cannot reach the FOD's source host (negative control).
+
+Landed as the sibling `scripts/prove-agent-vm-prewarm-strict.sh`, plus one
+**production fix the oracle's de-risking surfaced** (decided with the user,
+2026-06-12): the strict warm's realisation step is `nix print-dev-env`, not
+`nix develop --command true`. An empirical fresh-store, egress-denied
+`nix develop` against a PW4-warmed cache failed: `nix develop` additionally
+resolves an interactive shell (`nixpkgs#bashInteractive` from the flake's
+nixpkgs input), which is **not** in the dev-env closure the builder signed
+— under the strict substituter it 404s, and `max-jobs = 1` then queues a
+from-source bash+bison build whose fixed-output fetches need egress.
+`print-dev-env` realises the identical environment (the same closure the
+builder's `print-dev-env --profile` signed), so warm-demands ≡
+signed-closure holds by construction. The non-strict warm keeps
+`nix develop --command true` byte-for-byte; the agent's `nix develop`
+wrapper still resolves the shell through the proxied view at run time.
+The same `print-dev-env` consumer experiment then succeeded offline, with
+the non-public `runCommand` tool realised and executable.
+
+Oracle shape, beyond the sketch: the pre-warm cache is produced the
+*production* way — a second, egress-capable Apple container (the "builder
+VM" in miniature, same guest image, default NAT network) runs the
+committed `host-setup/prewarm-cache` scripts against the fixture checkout
+through bind mounts, and the resulting `cache/` becomes the broker's
+`nix_prewarm_cache_dir` — so PW4's tooling is itself under test on a real
+guest-system builder. Assertions beyond (a)–(c): zero session requests hit
+the proxied `/v1/nix/cache` view at all (the substituter override is
+load-bearing, not incidental); the daemon advertised `WRIT_NIX_PREWARM_URL`
+and the guest's trusted keys carry `writ-prewarm-1`; the non-public tool's
+narinfo **and** NAR were each served 200 from the pre-warm dir through the
+strict view; and the realised tool executes inside the guest. The fixture
+needs no `nuget.org` (its non-public path is a `runCommand`, whose only
+"source" is the fixture flake itself); the github negative control carries
+over from the FK proof unchanged.
 
 ## Guarantee / envelope
 
