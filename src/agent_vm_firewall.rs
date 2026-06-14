@@ -59,6 +59,8 @@ pub enum PfctlError {
     MissingBootstrapAnchor(&'static str),
     #[error("PF is not enabled")]
     PfDisabled,
+    #[error("PF session anchor {anchor} still contains rules after removal: {rules}")]
+    SessionAnchorNotEmpty { anchor: String, rules: String },
 }
 
 impl SessionFirewallInstall {
@@ -166,15 +168,23 @@ impl PfctlInvocation {
         &self.args
     }
 
-    fn run(&self, pfctl: &Path) -> Result<Output, PfctlError> {
-        let output = Command::new(pfctl)
+    /// Run the command and return its raw output, erroring only if pfctl could
+    /// not be executed at all — NOT on a non-zero exit. For status-query reads
+    /// (`-sr`) where pfctl may exit non-zero on an empty/absent anchor yet still
+    /// print the (empty) ruleset to stdout.
+    fn output(&self, pfctl: &Path) -> Result<Output, PfctlError> {
+        Command::new(pfctl)
             .args(&self.args)
             .output()
             .map_err(|source| PfctlError::Run {
                 program: pfctl.display().to_string(),
                 args: self.args.join(" "),
                 source,
-            })?;
+            })
+    }
+
+    fn run(&self, pfctl: &Path) -> Result<Output, PfctlError> {
+        let output = self.output(pfctl)?;
         if output.status.success() {
             return Ok(output);
         }
@@ -205,6 +215,13 @@ pub fn pf_info_says_enabled(info: &str) -> bool {
     })
 }
 
+/// True if a `pfctl -a <anchor> -sr` dump still lists any rule. An emptied
+/// anchor prints nothing; a stale one lists its rules. Mirrors the proof's
+/// `grep -q '[^[:space:]]'`: any non-whitespace content means rules remain.
+pub fn pf_anchor_has_rules(rules: &str) -> bool {
+    rules.chars().any(|c| !c.is_whitespace())
+}
+
 pub fn ensure_pf_enabled(pfctl: &Path) -> Result<(), PfctlError> {
     let output = PfctlInvocation::new(["-s", "info"]).run(pfctl)?;
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -222,6 +239,32 @@ pub fn ensure_session_bootstrap_anchor(pfctl: &Path) -> Result<(), PfctlError> {
         Ok(())
     } else {
         Err(PfctlError::MissingBootstrapAnchor(SESSION_BOOTSTRAP_ANCHOR))
+    }
+}
+
+/// Read back the session anchor and fail if it still lists rules. A flush that
+/// exits 0 but leaves rules (a wrong anchor name, a pfctl edge case) would
+/// otherwise leak this session's rules under the catch-all `writ/session/*`
+/// bootstrap anchor — and the guest-side egress gate cannot catch it, since the
+/// VM is gone by the time we tear down.
+pub fn ensure_session_anchor_empty(pfctl: &Path, anchor: &PfAnchorName) -> Result<(), PfctlError> {
+    // `.output()`, not `.run()`: pfctl may exit non-zero on an empty/absent
+    // anchor while still printing the (empty) ruleset, so key off stdout
+    // content — never the exit code — exactly as the proof does.
+    let output = PfctlInvocation::new([
+        "-a".to_string(),
+        anchor.as_str().to_string(),
+        "-sr".to_string(),
+    ])
+    .output(pfctl)?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if pf_anchor_has_rules(&stdout) {
+        Err(PfctlError::SessionAnchorNotEmpty {
+            anchor: anchor.as_str().to_string(),
+            rules: stdout.trim().to_string(),
+        })
+    } else {
+        Ok(())
     }
 }
 
@@ -250,10 +293,13 @@ pub fn remove_session_firewall(
             first_error = Some(err);
         }
     }
-    match first_error {
-        Some(err) => Err(err),
-        None => Ok(()),
+    if let Some(err) = first_error {
+        return Err(err);
     }
+    // Every removal invocation reported success; confirm the anchor is actually
+    // empty before declaring the session torn down (fail-closed on a stale
+    // anchor rather than leaking its rules).
+    ensure_session_anchor_empty(pfctl, removal.anchor())
 }
 
 struct TempRulesFile {
@@ -463,5 +509,73 @@ mod tests {
                 .collect::<Vec<_>>(),
             ]
         );
+    }
+
+    #[test]
+    fn anchor_has_rules_detects_any_nonwhitespace() {
+        // An emptied anchor prints nothing; a stale one lists its rules.
+        assert!(!pf_anchor_has_rules(""));
+        assert!(!pf_anchor_has_rules("\n  \t\n"));
+        assert!(pf_anchor_has_rules("block drop out all\n"));
+        assert!(pf_anchor_has_rules("   pass in quick proto tcp   "));
+    }
+
+    /// A fake `pfctl` that prints `sr_output` and exits `sr_exit` for
+    /// `-a <anchor> -sr`, and exits 0 for every other invocation — so a flush
+    /// can "succeed" yet leave the anchor non-empty, and a status read can exit
+    /// non-zero while still reporting an empty ruleset.
+    fn write_fake_pfctl_with_sr_exit(dir: &Path, sr_output: &str, sr_exit: i32) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("fake-pfctl");
+        let script = format!(
+            "#!/bin/sh\n\
+             if [ \"$1\" = \"-a\" ] && [ \"$3\" = \"-sr\" ]; then printf '%s' '{}'; exit {}; fi\n\
+             exit 0\n",
+            sr_output.replace('\'', r"'\''"),
+            sr_exit,
+        );
+        std::fs::write(&path, script).unwrap();
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o700);
+        std::fs::set_permissions(&path, perms).unwrap();
+        path
+    }
+
+    fn write_fake_pfctl(dir: &Path, sr_output: &str) -> PathBuf {
+        write_fake_pfctl_with_sr_exit(dir, sr_output, 0)
+    }
+
+    #[test]
+    fn remove_session_firewall_verifies_the_anchor_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let pfctl = write_fake_pfctl(dir.path(), "");
+        let removal =
+            SessionFirewallRemoval::new(session_id(), pool(), ipv4(), Some(ipv6())).unwrap();
+        remove_session_firewall(&pfctl, &removal).unwrap();
+    }
+
+    #[test]
+    fn remove_session_firewall_errors_on_a_stale_anchor() {
+        let dir = tempfile::tempdir().unwrap();
+        // The flush exits 0, but the anchor still lists a rule.
+        let pfctl = write_fake_pfctl(dir.path(), "block drop out all\n");
+        let removal =
+            SessionFirewallRemoval::new(session_id(), pool(), ipv4(), Some(ipv6())).unwrap();
+        let err = remove_session_firewall(&pfctl, &removal).unwrap_err();
+        assert!(
+            matches!(err, PfctlError::SessionAnchorNotEmpty { .. }),
+            "expected SessionAnchorNotEmpty, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn remove_session_firewall_tolerates_nonzero_sr_exit_on_empty_anchor() {
+        // pfctl may exit non-zero reading an emptied/absent anchor while still
+        // printing an empty ruleset; that must not false-fail a clean teardown.
+        let dir = tempfile::tempdir().unwrap();
+        let pfctl = write_fake_pfctl_with_sr_exit(dir.path(), "", 1);
+        let removal =
+            SessionFirewallRemoval::new(session_id(), pool(), ipv4(), Some(ipv6())).unwrap();
+        remove_session_firewall(&pfctl, &removal).unwrap();
     }
 }
