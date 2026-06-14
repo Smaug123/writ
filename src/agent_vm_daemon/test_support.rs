@@ -112,10 +112,36 @@ pub(super) fn write_fake_tool(
              shift\n\
              done\n\
              fi\n\
+             if [ \"$1\" = \"exec\" ]; then\n\
+             case \"${{5:-}}\" in\n\
+             *bootstrap-failed*) printf 'ok' ;;\n\
+             esac\n\
+             fi\n\
              exit 0\n",
         args_log = shell_quote(args_log),
         env_path_log = shell_quote(env_path_log),
         env_log = shell_quote(env_log),
+    );
+    fs::write(&path, script).unwrap();
+    let mut permissions = fs::metadata(&path).unwrap().permissions();
+    permissions.set_mode(0o700);
+    fs::set_permissions(&path, permissions).unwrap();
+    path
+}
+
+/// Like [`write_fake_tool`] but never signals a bootstrap outcome — the
+/// inspect always reports "pending". Used to exercise the bootstrap wait's
+/// timeout path (the default tool now reports `ok`, since every start waits).
+pub(super) fn write_fake_pending_bootstrap_tool(dir: &Path, args_log: &Path) -> PathBuf {
+    let path = dir.join("fake-pending-bootstrap-tool");
+    let script = format!(
+        "#!/bin/sh\n\
+             printf '%s\\n' \"$*\" >> {args_log}\n\
+             if [ \"$1\" = \"network\" ] && [ \"$2\" = \"inspect\" ]; then\n\
+             printf '%s\\n' 'ipv4Subnet: 192.168.252.0/24' 'ipv4Gateway: 192.168.252.1'\n\
+             fi\n\
+             exit 0\n",
+        args_log = shell_quote(args_log),
     );
     fs::write(&path, script).unwrap();
     let mut permissions = fs::metadata(&path).unwrap().permissions();

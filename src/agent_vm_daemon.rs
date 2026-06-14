@@ -647,6 +647,12 @@ impl AgentVmDaemon {
         .await
     }
 
+    /// Signal the guest that the broker is up (so the boot-time egress gate's
+    /// positive control + broker-ready wait can proceed), then wait for the
+    /// guest's bootstrap sentinels. Used for EVERY session: both guest scripts
+    /// run the gate and signal bootstrap-ok/failed identically, so a gate
+    /// failure is surfaced here rather than returning a "started" VM the gate
+    /// then kills. Released only after the broker has spawned, so it cannot lie.
     async fn release_and_wait_for_workspace_bootstrap_with_timeout(
         &self,
         vm_name: &str,
@@ -654,7 +660,7 @@ impl AgentVmDaemon {
     ) -> Result<(), AgentVmDaemonError> {
         self.run_container_exec_shell(
             vm_name,
-            "release workspace bootstrap",
+            "release guest bootstrap",
             &format!(
                 "mkdir -p /run/writ-agent-vm && touch {}",
                 AGENT_VM_WORKSPACE_BROKER_READY_PATH
@@ -957,10 +963,13 @@ impl AgentVmDaemon {
 
         let running = prepared.spawn();
         self.running.lock().await.insert(session_id, running);
-        if workspace.is_some()
-            && let Err(err) = self
-                .release_and_wait_for_workspace_bootstrap(plan.names().vm())
-                .await
+        // Release broker-ready and wait for the guest's bootstrap sentinels for
+        // EVERY session: both guest scripts run the egress gate and signal
+        // bootstrap-ok/failed, so a gate failure (or workspace-init failure) is
+        // surfaced before we report the session started.
+        if let Err(err) = self
+            .release_and_wait_for_workspace_bootstrap(plan.names().vm())
+            .await
         {
             let bootstrap = err.to_string();
             if let Err(cleanup) = self.cleanup_failed_started_session(session_id).await {

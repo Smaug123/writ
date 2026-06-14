@@ -18,7 +18,7 @@ fn guest_nix_setup_script_writes_configured_trusted_public_keys() {
 
     let status = Command::new("sh")
         .arg("-c")
-        .arg(nix_setup_script())
+        .arg(nix_conf_prologue_script_for_test())
         .arg("writ-agent-vm-nix-setup")
         .arg("true")
         .env("WRIT_BROKER_TOKEN", "writ-vm-token")
@@ -59,7 +59,7 @@ fn guest_nix_conf_disables_build_users_group_for_single_user_root_store() {
 
     let status = Command::new("sh")
         .arg("-c")
-        .arg(nix_setup_script())
+        .arg(nix_conf_prologue_script_for_test())
         .arg("writ-agent-vm-nix-setup")
         .arg("true")
         .env("WRIT_BROKER_TOKEN", "writ-vm-token")
@@ -205,10 +205,59 @@ fn egress_gate_failure_surfaces_through_bootstrap_failed() {
 }
 
 #[test]
-fn non_workspace_nix_setup_has_no_egress_gate() {
-    // The nix-setup path has no broker-ready wait, so the gate's positive
-    // control could not hold there; gating it is a separate follow-up.
-    assert!(!nix_setup_script().contains("/dev/tcp/"));
+fn nix_setup_gates_then_signals_ok_and_runs_command() {
+    // The non-workspace path gates on egress too: it waits for broker-ready,
+    // runs the same gate (routing a failure through the daemon-polled
+    // bootstrap-failed sentinel, like the workspace path), then signals
+    // bootstrap-ok and runs the guest command.
+    let script = nix_setup_script();
+    assert!(
+        script.contains(AGENT_VM_WORKSPACE_BROKER_READY_PATH),
+        "nix-setup must wait for broker-ready before the gate"
+    );
+    assert!(
+        script.contains("/dev/tcp/") && script.contains("LEAK"),
+        "nix-setup must run the egress gate"
+    );
+    assert!(
+        script.contains(AGENT_VM_WORKSPACE_BOOTSTRAP_FAILED_PATH),
+        "a gate failure must route through the bootstrap-failed sentinel"
+    );
+
+    // On success: signal bootstrap-ok, then run the command. As a CHILD, not
+    // `exec`, so the container outlives a fast command and the daemon reliably
+    // observes bootstrap-ok.
+    let gate = script.find("/dev/tcp/").expect("gate present");
+    let ok = script
+        .find(AGENT_VM_WORKSPACE_BOOTSTRAP_OK_PATH)
+        .expect("bootstrap-ok signal present");
+    let run = script.rfind(r#""$@""#).expect("guest command run present");
+    assert!(
+        gate < ok && ok < run,
+        "must pass the gate, then signal bootstrap-ok, then run the command"
+    );
+    assert!(
+        !script.contains(r#"exec "$@""#),
+        "must not exec the command — the container must outlive a fast command"
+    );
+}
+
+#[test]
+fn both_guest_scripts_share_the_egress_gate() {
+    // The broker-ready wait and the gate function are shared, so neither script
+    // can silently drift from the other's egress posture.
+    let nix = nix_setup_script();
+    let workspace = workspace_bootstrap_script();
+    for shared in ["egress_gate() {", "1.1.1.1:443", "8.8.8.8:443"] {
+        assert!(
+            nix.contains(shared),
+            "nix-setup missing gate fragment: {shared}"
+        );
+        assert!(
+            workspace.contains(shared),
+            "workspace missing gate fragment: {shared}"
+        );
+    }
 }
 
 #[test]
@@ -277,6 +326,9 @@ fn both_guest_scripts_share_the_nix_prologue() {
         r#"printf 'build-users-group =\n'"#,
         r#"printf 'trusted-public-keys = %s\n' "$WRIT_NIX_TRUSTED_PUBLIC_KEYS""#,
         r#"} > "$NIX_CONF_DIR/nix.conf""#,
+        // The runtime dir and the egress gate are now shared by both scripts.
+        r#""$NIX_CONF_DIR" /run/writ-agent-vm"#,
+        "egress_gate() {",
     ] {
         assert!(
             nix.contains(shared),
@@ -288,11 +340,10 @@ fn both_guest_scripts_share_the_nix_prologue() {
         );
     }
 
-    // The three documented divergences, and only those.
+    // The two remaining documented divergences, and only those: the workspace
+    // script enables flakes and parses positional repo/destination/warm args.
     assert!(workspace.contains("nix-command flakes"));
     assert!(!nix.contains("nix-command flakes"));
-    assert!(workspace.contains(r#"mkdir -p "$netrc_dir" "$NIX_CONF_DIR" /run/writ-agent-vm"#));
-    assert!(!nix.contains("/run/writ-agent-vm"));
     assert!(workspace.contains(r#"repo="$1""#));
     assert!(!nix.contains(r#"repo="$1""#));
 }

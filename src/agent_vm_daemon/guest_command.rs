@@ -122,28 +122,24 @@ shift 3
 
 "#;
 
-/// Tail of the plain nix-setup script: exec the wrapped guest command.
-const GUEST_NIX_SETUP_TAIL: &str = r#"
-exec "$@"
-"#;
-
-/// Tail of the workspace script: wait for the broker, run the workspace
-/// init, then run the agent as a child so the container outlives it.
-const GUEST_WORKSPACE_BOOTSTRAP_TAIL: &str = r#"
+/// Shared by BOTH guest scripts: wait for the broker, then run the
+/// egress-isolation gate, routing a failure through the daemon-polled
+/// bootstrap-failed sentinel (both scripts surface failures identically). Runs
+/// in the trusted window — after broker-ready, before any repo/agent/guest
+/// command — so on failure neither workload starts.
+///
+/// Adversarially confirm the no-egress invariant: the guest must reach the
+/// broker (positive control — proves the probe itself works, so a failed
+/// external probe means isolation, not a broken probe) and must NOT reach the
+/// public internet (negative control). Any external TCP connect that SUCCEEDS,
+/// any global-scope IPv6 address (a SLAAC'd ULA from a host RA included; see
+/// #218), or an unreachable broker aborts. Pure bash /dev/tcp + coreutils
+/// timeout + iproute2; raw IPs, so it probes L3/L4 egress without DNS.
+const GUEST_BROKER_READY_AND_EGRESS_GATE: &str = r#"
 while [ ! -f /run/writ-agent-vm/broker-ready ]; do
   sleep 0.2
 done
 
-# === egress isolation gate (fail-closed) ===
-# Adversarially confirm the no-egress invariant BEFORE any repo/agent code
-# runs: the guest must reach the broker (positive control — proves the probe
-# itself works, so a failed external probe means isolation, not a broken
-# probe) and must NOT reach the public internet (negative control). Any
-# external TCP connect that SUCCEEDS, any global-scope IPv6 address (a SLAAC'd
-# ULA from a host RA included; see #218), or an unreachable broker aborts the
-# bootstrap. Pure bash /dev/tcp + coreutils timeout + iproute2; raw IPs, so it
-# probes L3/L4 egress without depending on DNS. Runs here, in the trusted
-# window after broker-ready and before workspace init.
 egress_gate() {
   _auth="${WRIT_NIX_CACHE_URL#*://}"
   _hostport="${_auth%%/*}"
@@ -202,19 +198,42 @@ egress_gate() {
   return 0
 }
 
+# Run the gate; on failure route the reason through the daemon-polled
+# bootstrap-failed sentinel and stay alive so the daemon reads it before
+# teardown. Shared by both scripts (the daemon waits on the same sentinels for
+# both), so every session surfaces a gate failure identically rather than
+# returning a "started" VM that the gate then kills.
 if ! egress_gate 2>/run/writ-agent-vm/egress-gate.stderr; then
   set +e
   {
-    printf 'egress isolation gate failed; refusing to run the agent\n'
+    printf 'egress isolation gate failed; refusing to run the guest command\n'
     cat /run/writ-agent-vm/egress-gate.stderr
   } > /run/writ-agent-vm/bootstrap-failed
   set -e
-  # Stay alive so the daemon surfaces bootstrap-failed before teardown, exactly
-  # as the workspace-init failure path below does.
   while :; do sleep 3600; done
 fi
 rm -f /run/writ-agent-vm/egress-gate.stderr
+"#;
 
+/// Tail of the plain nix-setup script: the egress gate has passed (shared
+/// fragment above), so signal bootstrap-ok and run the guest command as a
+/// CHILD, then loop — exactly the workspace script's agent-run shape. Running
+/// the command as a child (not `exec`) keeps the container alive past it, so
+/// the daemon reliably observes bootstrap-ok even for a fast command, and a
+/// gate failure is surfaced through bootstrap-failed rather than a silently
+/// dead VM. The daemon owns teardown via the stop API.
+const GUEST_NIX_SETUP_TAIL: &str = r#"
+touch /run/writ-agent-vm/bootstrap-ok
+set +e
+"$@"
+set -e
+while :; do sleep 3600; done
+"#;
+
+/// Tail of the workspace script: the egress gate has passed (shared fragment
+/// above); run the workspace init, then the agent as a child so the container
+/// outlives it.
+const GUEST_WORKSPACE_BOOTSTRAP_TAIL: &str = r#"
 set +e
 writ-vm workspace init "$repo" "$destination" --warm "$warm" \
   > /run/writ-agent-vm/bootstrap.stdout \
@@ -258,15 +277,12 @@ printf '%s\n' "$agent_code" > /run/writ-agent-vm/agent.exit
 while :; do sleep 3600; done
 "#;
 
-/// Assemble a guest setup script from the shared nix prologue plus the
-/// per-script `positional` parse, `mkdir_line`, `features_line`, and
-/// `tail`. See [`nix_setup_script`] and [`workspace_bootstrap_script`].
-fn build_guest_nix_setup_script(
-    positional: &str,
-    mkdir_line: &str,
-    features_line: &str,
-    tail: &str,
-) -> String {
+/// The shared nix prologue — env guards, positional parse, cache-host
+/// derivation, the netrc credential write, and the nix.conf block — up to (but
+/// not including) the egress gate. Factored out so a test can exercise the
+/// nix.conf generation on its own: the full scripts cannot run on the build
+/// host (the gate needs a container, `timeout`, and a no-egress network).
+fn nix_conf_prologue(positional: &str, mkdir_line: &str, features_line: &str) -> String {
     let mut script = String::with_capacity(2048);
     script.push_str(GUEST_NIX_PROLOGUE_HEAD);
     script.push_str(positional);
@@ -277,24 +293,59 @@ fn build_guest_nix_setup_script(
     script.push_str(features_line);
     script.push('\n');
     script.push_str(GUEST_NIX_PROLOGUE_NIXCONF_REST);
+    script
+}
+
+/// A host-runnable script that exercises exactly the shared nix.conf prologue
+/// (no `/run` mkdir, no gate, no `broker-ready` wait), then execs the command.
+/// The two nix.conf-generation tests use this; the real scripts cannot run on
+/// the build host because the gate requires the guest container environment.
+#[cfg(test)]
+pub(super) fn nix_conf_prologue_script_for_test() -> String {
+    let mut script = nix_conf_prologue(
+        "",
+        r#"mkdir -p "$netrc_dir" "$NIX_CONF_DIR""#,
+        r#"  printf 'experimental-features = nix-command\n'"#,
+    );
+    script.push_str("\nexec \"$@\"\n");
+    script
+}
+
+/// Assemble a guest setup script from the shared nix prologue, the egress gate
+/// (shared by both scripts), and the per-script `tail`. See [`nix_setup_script`]
+/// and [`workspace_bootstrap_script`].
+fn build_guest_nix_setup_script(
+    positional: &str,
+    mkdir_line: &str,
+    features_line: &str,
+    tail: &str,
+) -> String {
+    let mut script = nix_conf_prologue(positional, mkdir_line, features_line);
+    // Both scripts gate on egress isolation in the same trusted window, with
+    // identical failure handling, so the broker-ready wait + gate + its
+    // bootstrap-failed routing are shared here; each tail picks up after a
+    // passed gate.
+    script.push_str(GUEST_BROKER_READY_AND_EGRESS_GATE);
     script.push_str(tail);
     script
 }
 
-/// The non-workspace guest setup script: configure the nix cache, then
-/// `exec` the wrapped guest command. Does not enable flakes.
+/// The non-workspace guest setup script: configure the nix cache, run the
+/// egress gate, then `exec` the wrapped guest command. Does not enable flakes.
+/// Creates the `/run/writ-agent-vm` runtime dir the gate and the broker-ready
+/// signal need.
 pub(super) fn nix_setup_script() -> String {
     build_guest_nix_setup_script(
         "",
-        r#"mkdir -p "$netrc_dir" "$NIX_CONF_DIR""#,
+        r#"mkdir -p "$netrc_dir" "$NIX_CONF_DIR" /run/writ-agent-vm"#,
         r#"  printf 'experimental-features = nix-command\n'"#,
         GUEST_NIX_SETUP_TAIL,
     )
 }
 
 /// The workspace guest setup script: the shared nix prologue (with flakes
-/// and the `/run/writ-agent-vm` runtime dir), the workspace init, then the
-/// agent run.
+/// and the `/run/writ-agent-vm` runtime dir), the egress gate, the workspace
+/// init, then the agent run.
 pub(super) fn workspace_bootstrap_script() -> String {
     build_guest_nix_setup_script(
         GUEST_WORKSPACE_POSITIONAL,
