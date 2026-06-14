@@ -205,10 +205,11 @@ fn egress_gate_failure_surfaces_through_bootstrap_failed() {
 }
 
 #[test]
-fn nix_setup_runs_egress_gate_then_execs_aborting_on_failure() {
+fn nix_setup_gates_then_signals_ok_and_runs_command() {
     // The non-workspace path gates on egress too: it waits for broker-ready,
-    // runs the same gate, and on failure aborts the container (exit) — there is
-    // no daemon-polled sentinel here — rather than exec-ing the guest command.
+    // runs the same gate (routing a failure through the daemon-polled
+    // bootstrap-failed sentinel, like the workspace path), then signals
+    // bootstrap-ok and runs the guest command.
     let script = nix_setup_script();
     assert!(
         script.contains(AGENT_VM_WORKSPACE_BROKER_READY_PATH),
@@ -218,12 +219,26 @@ fn nix_setup_runs_egress_gate_then_execs_aborting_on_failure() {
         script.contains("/dev/tcp/") && script.contains("LEAK"),
         "nix-setup must run the egress gate"
     );
-    let gate = script.find("/dev/tcp/").expect("gate present");
-    let abort = script.find("exit 1").expect("gate abort present");
-    let exec = script.find(r#"exec "$@""#).expect("exec present");
     assert!(
-        gate < abort && abort < exec,
-        "the gate (and its exit-on-failure) must run before exec-ing the guest command"
+        script.contains(AGENT_VM_WORKSPACE_BOOTSTRAP_FAILED_PATH),
+        "a gate failure must route through the bootstrap-failed sentinel"
+    );
+
+    // On success: signal bootstrap-ok, then run the command. As a CHILD, not
+    // `exec`, so the container outlives a fast command and the daemon reliably
+    // observes bootstrap-ok.
+    let gate = script.find("/dev/tcp/").expect("gate present");
+    let ok = script
+        .find(AGENT_VM_WORKSPACE_BOOTSTRAP_OK_PATH)
+        .expect("bootstrap-ok signal present");
+    let run = script.rfind(r#""$@""#).expect("guest command run present");
+    assert!(
+        gate < ok && ok < run,
+        "must pass the gate, then signal bootstrap-ok, then run the command"
+    );
+    assert!(
+        !script.contains(r#"exec "$@""#),
+        "must not exec the command — the container must outlive a fast command"
     );
 }
 

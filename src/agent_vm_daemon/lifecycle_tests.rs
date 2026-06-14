@@ -678,9 +678,9 @@ proptest! {
 async fn workspace_bootstrap_wait_reports_timeout_at_supplied_bound() {
     let dir = tempfile::tempdir().unwrap();
     let args_log = dir.path().join("args.log");
-    let env_path_log = dir.path().join("env-path.log");
-    let env_log = dir.path().join("env.log");
-    let fake_tool = write_fake_tool(dir.path(), &args_log, &env_path_log, &env_log);
+    // A tool that never signals bootstrap-ok/failed, so the wait reaches its
+    // timeout (the default tool now reports ok, since every start waits).
+    let fake_tool = write_fake_pending_bootstrap_tool(dir.path(), &args_log);
     let (config, _) = daemon_config(dir.path(), &fake_tool);
     let daemon = AgentVmDaemon::new(config);
 

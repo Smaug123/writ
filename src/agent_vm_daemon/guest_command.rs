@@ -122,12 +122,11 @@ shift 3
 
 "#;
 
-/// Shared by BOTH guest scripts: wait for the broker, then DEFINE the
-/// egress-isolation gate. Each script invokes `egress_gate` itself, with the
-/// failure handling its lifecycle affords (the workspace script routes through
-/// the daemon-polled bootstrap-failed sentinel; the nix-setup script, which has
-/// no such sentinel, aborts the container directly). The gate runs in the
-/// trusted window — after broker-ready, before any repo/agent/guest command.
+/// Shared by BOTH guest scripts: wait for the broker, then run the
+/// egress-isolation gate, routing a failure through the daemon-polled
+/// bootstrap-failed sentinel (both scripts surface failures identically). Runs
+/// in the trusted window — after broker-ready, before any repo/agent/guest
+/// command — so on failure neither workload starts.
 ///
 /// Adversarially confirm the no-egress invariant: the guest must reach the
 /// broker (positive control — proves the probe itself works, so a failed
@@ -136,7 +135,7 @@ shift 3
 /// any global-scope IPv6 address (a SLAAC'd ULA from a host RA included; see
 /// #218), or an unreachable broker aborts. Pure bash /dev/tcp + coreutils
 /// timeout + iproute2; raw IPs, so it probes L3/L4 egress without DNS.
-const GUEST_BROKER_READY_AND_EGRESS_GATE_FN: &str = r#"
+const GUEST_BROKER_READY_AND_EGRESS_GATE: &str = r#"
 while [ ! -f /run/writ-agent-vm/broker-ready ]; do
   sleep 0.2
 done
@@ -198,38 +197,43 @@ egress_gate() {
   fi
   return 0
 }
-"#;
 
-/// Tail of the plain nix-setup script: run the egress gate, then exec the
-/// wrapped guest command. The non-workspace path has no daemon-polled
-/// bootstrap sentinel, so a gate failure aborts the container directly
-/// (fail-closed) — the dead VM is the signal, and the gate's own stderr
-/// (passed through to the container log) explains why.
-const GUEST_NIX_SETUP_TAIL: &str = r#"
-if ! egress_gate; then
-  exit 1
-fi
-
-exec "$@"
-"#;
-
-/// Tail of the workspace script: route a gate failure through the
-/// daemon-polled bootstrap-failed sentinel, then run the workspace init, then
-/// run the agent as a child so the container outlives it.
-const GUEST_WORKSPACE_BOOTSTRAP_TAIL: &str = r#"
+# Run the gate; on failure route the reason through the daemon-polled
+# bootstrap-failed sentinel and stay alive so the daemon reads it before
+# teardown. Shared by both scripts (the daemon waits on the same sentinels for
+# both), so every session surfaces a gate failure identically rather than
+# returning a "started" VM that the gate then kills.
 if ! egress_gate 2>/run/writ-agent-vm/egress-gate.stderr; then
   set +e
   {
-    printf 'egress isolation gate failed; refusing to run the agent\n'
+    printf 'egress isolation gate failed; refusing to run the guest command\n'
     cat /run/writ-agent-vm/egress-gate.stderr
   } > /run/writ-agent-vm/bootstrap-failed
   set -e
-  # Stay alive so the daemon surfaces bootstrap-failed before teardown, exactly
-  # as the workspace-init failure path below does.
   while :; do sleep 3600; done
 fi
 rm -f /run/writ-agent-vm/egress-gate.stderr
+"#;
 
+/// Tail of the plain nix-setup script: the egress gate has passed (shared
+/// fragment above), so signal bootstrap-ok and run the guest command as a
+/// CHILD, then loop — exactly the workspace script's agent-run shape. Running
+/// the command as a child (not `exec`) keeps the container alive past it, so
+/// the daemon reliably observes bootstrap-ok even for a fast command, and a
+/// gate failure is surfaced through bootstrap-failed rather than a silently
+/// dead VM. The daemon owns teardown via the stop API.
+const GUEST_NIX_SETUP_TAIL: &str = r#"
+touch /run/writ-agent-vm/bootstrap-ok
+set +e
+"$@"
+set -e
+while :; do sleep 3600; done
+"#;
+
+/// Tail of the workspace script: the egress gate has passed (shared fragment
+/// above); run the workspace init, then the agent as a child so the container
+/// outlives it.
+const GUEST_WORKSPACE_BOOTSTRAP_TAIL: &str = r#"
 set +e
 writ-vm workspace init "$repo" "$destination" --warm "$warm" \
   > /run/writ-agent-vm/bootstrap.stdout \
@@ -317,10 +321,11 @@ fn build_guest_nix_setup_script(
     tail: &str,
 ) -> String {
     let mut script = nix_conf_prologue(positional, mkdir_line, features_line);
-    // Both scripts gate on egress isolation in the same trusted window, so the
-    // broker-ready wait + gate function are shared here; each tail invokes the
-    // gate with its own failure handling.
-    script.push_str(GUEST_BROKER_READY_AND_EGRESS_GATE_FN);
+    // Both scripts gate on egress isolation in the same trusted window, with
+    // identical failure handling, so the broker-ready wait + gate + its
+    // bootstrap-failed routing are shared here; each tail picks up after a
+    // passed gate.
+    script.push_str(GUEST_BROKER_READY_AND_EGRESS_GATE);
     script.push_str(tail);
     script
 }
