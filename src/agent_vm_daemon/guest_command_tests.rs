@@ -149,6 +149,95 @@ fn workspace_bootstrap_script_mentions_sentinel_paths() {
     assert!(script.contains(AGENT_VM_WORKSPACE_BOOTSTRAP_OK_PATH));
     assert!(script.contains(AGENT_VM_WORKSPACE_BOOTSTRAP_FAILED_PATH));
 }
+
+#[test]
+fn workspace_bootstrap_runs_egress_gate_between_broker_ready_and_workspace_init() {
+    let script = workspace_bootstrap_script();
+
+    // The adversarial probe (bash /dev/tcp to public IPv4) and the
+    // global-scope IPv6 rejection are present, with a named leak abort.
+    assert!(
+        script.contains("/dev/tcp/"),
+        "gate must probe via bash /dev/tcp"
+    );
+    assert!(
+        script.contains("1.1.1.1:443") && script.contains("8.8.8.8:443"),
+        "gate must probe public IPv4 targets"
+    );
+    assert!(
+        script.contains("ip -6 addr show scope global"),
+        "gate must reject a global-scope IPv6 address"
+    );
+    assert!(
+        script.contains("LEAK"),
+        "gate must name an egress leak on abort"
+    );
+
+    // Positioned in the trusted window: after broker-ready (so the positive
+    // control is sound) and before any repo/agent code runs.
+    let broker_ready = script
+        .find(AGENT_VM_WORKSPACE_BROKER_READY_PATH)
+        .expect("broker-ready wait present");
+    let gate = script.find("1.1.1.1:443").expect("gate present");
+    let workspace_init = script
+        .find("writ-vm workspace init")
+        .expect("workspace init present");
+    assert!(
+        broker_ready < gate,
+        "gate must run after the broker-ready wait"
+    );
+    assert!(gate < workspace_init, "gate must run before workspace init");
+}
+
+#[test]
+fn egress_gate_failure_surfaces_through_bootstrap_failed() {
+    // A gate failure must report through the same sentinel the daemon already
+    // polls, so an egress leak is surfaced rather than silently looping.
+    let script = workspace_bootstrap_script();
+    let gate = script.find("1.1.1.1:443").expect("gate present");
+    let workspace_init = script
+        .find("writ-vm workspace init")
+        .expect("workspace init present");
+    assert!(
+        script[gate..workspace_init].contains(AGENT_VM_WORKSPACE_BOOTSTRAP_FAILED_PATH),
+        "the gate's own failure path must write the bootstrap-failed sentinel"
+    );
+}
+
+#[test]
+fn non_workspace_nix_setup_has_no_egress_gate() {
+    // The nix-setup path has no broker-ready wait, so the gate's positive
+    // control could not hold there; gating it is a separate follow-up.
+    assert!(!nix_setup_script().contains("/dev/tcp/"));
+}
+
+#[test]
+fn egress_gate_no_ipv6_check_is_gated_on_the_mode_env() {
+    // The no-IPv6 assertion must only run when the daemon advertises that
+    // posture, so the dual-stack mode (which provisions a ULA deliberately) is
+    // not rejected. The IPv6 probe must sit inside the env guard.
+    let script = workspace_bootstrap_script();
+    assert!(
+        script.contains(AGENT_VM_EGRESS_GATE_REQUIRE_NO_IPV6_ENV),
+        "the gate must consult the mode env var before forbidding IPv6"
+    );
+    let guard = script
+        .find(AGENT_VM_EGRESS_GATE_REQUIRE_NO_IPV6_ENV)
+        .expect("env guard present");
+    let probe = script
+        .find("ip -6 addr show scope global")
+        .expect("ipv6 probe present");
+    assert!(
+        guard < probe,
+        "the no-IPv6 probe must be guarded by the mode env var"
+    );
+    // The IPv4-egress probe is unconditional; it must NOT be inside the guard.
+    let v4 = script.find("/dev/tcp/").expect("v4 probe present");
+    assert!(
+        v4 < guard,
+        "the IPv4-egress probe must run regardless of the IPv6 mode"
+    );
+}
 #[cfg(unix)]
 #[test]
 fn workspace_bootstrap_rejects_non_utf8_destination() {

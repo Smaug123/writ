@@ -134,6 +134,87 @@ while [ ! -f /run/writ-agent-vm/broker-ready ]; do
   sleep 0.2
 done
 
+# === egress isolation gate (fail-closed) ===
+# Adversarially confirm the no-egress invariant BEFORE any repo/agent code
+# runs: the guest must reach the broker (positive control — proves the probe
+# itself works, so a failed external probe means isolation, not a broken
+# probe) and must NOT reach the public internet (negative control). Any
+# external TCP connect that SUCCEEDS, any global-scope IPv6 address (a SLAAC'd
+# ULA from a host RA included; see #218), or an unreachable broker aborts the
+# bootstrap. Pure bash /dev/tcp + coreutils timeout + iproute2; raw IPs, so it
+# probes L3/L4 egress without depending on DNS. Runs here, in the trusted
+# window after broker-ready and before workspace init.
+egress_gate() {
+  _auth="${WRIT_NIX_CACHE_URL#*://}"
+  _hostport="${_auth%%/*}"
+  _bhost="${_hostport%%:*}"
+  case "$_hostport" in
+    *:*) _bport="${_hostport##*:}" ;;
+    *) _bport=80 ;;
+  esac
+  # rc 0 iff a TCP connection is established within $1 seconds. The host/port
+  # are passed as the inner bash's $1/$2 (after the _ argv0); the bash -c body
+  # is single-quoted, so they expand in the INNER bash, never the caller.
+  _connect() { timeout "$1" bash -c ': <"/dev/tcp/$1/$2"' _ "$2" "$3" 2>/dev/null; }
+  # Positive control: the broker must be reachable, else a failed external probe
+  # cannot be attributed to isolation. broker-ready was just signalled, but
+  # tolerate a slow first accept with a short retry — a false abort here would
+  # refuse a perfectly isolated VM. Generous per-try timeout for the same
+  # reason.
+  _n=0
+  until _connect 5 "$_bhost" "$_bport"; do
+    _n=$((_n + 1))
+    if [ "$_n" -ge 5 ]; then
+      echo "egress gate: broker $_bhost:$_bport unreachable after $_n tries; cannot validate egress isolation" >&2
+      return 1
+    fi
+    sleep 0.5
+  done
+  # Negative control: the public internet must be unreachable. A handshake to a
+  # reachable host completes in well under 2s on this path; a blocked one never
+  # completes (a firewall that drops rather than rejects makes connect hang), so
+  # a tight 2s bounds the per-probe boot cost. Raw IPs avoid any DNS dependency.
+  for _t in 1.1.1.1:443 8.8.8.8:443; do
+    if _connect 2 "${_t%%:*}" "${_t##*:}"; then
+      echo "egress gate: LEAK — connected to ${_t} from the guest; refusing to run the agent" >&2
+      return 1
+    fi
+  done
+  # No global-scope IPv6 — but only in the no-guest-IPv6 lifecycle mode. The
+  # daemon sets WRIT_EGRESS_GATE_REQUIRE_NO_IPV6=1 there and =0 for the
+  # dual-stack mode, which provisions a ULA on purpose; a missing value defaults
+  # to "do not enforce" so this never breaks a mode it was not told to police.
+  if [ "${WRIT_EGRESS_GATE_REQUIRE_NO_IPV6:-0}" = 1 ]; then
+    # Fail closed if the probe cannot RUN (ip missing / errors): an empty result
+    # must mean "ip ran and found no global address", never "ip could not be
+    # asked". A query that finds nothing still exits 0, so a non-zero status
+    # here is an inability to validate, which aborts.
+    if ! _v6="$(ip -6 addr show scope global 2>/dev/null)"; then
+      echo "egress gate: could not run 'ip -6 addr' to validate IPv6 posture; refusing to run the agent" >&2
+      return 1
+    fi
+    if [ -n "$_v6" ]; then
+      echo "egress gate: guest holds a global-scope IPv6 address; refusing to run the agent" >&2
+      echo "$_v6" >&2
+      return 1
+    fi
+  fi
+  return 0
+}
+
+if ! egress_gate 2>/run/writ-agent-vm/egress-gate.stderr; then
+  set +e
+  {
+    printf 'egress isolation gate failed; refusing to run the agent\n'
+    cat /run/writ-agent-vm/egress-gate.stderr
+  } > /run/writ-agent-vm/bootstrap-failed
+  set -e
+  # Stay alive so the daemon surfaces bootstrap-failed before teardown, exactly
+  # as the workspace-init failure path below does.
+  while :; do sleep 3600; done
+fi
+rm -f /run/writ-agent-vm/egress-gate.stderr
+
 set +e
 writ-vm workspace init "$repo" "$destination" --warm "$warm" \
   > /run/writ-agent-vm/bootstrap.stdout \
