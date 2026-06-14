@@ -647,20 +647,29 @@ impl AgentVmDaemon {
         .await
     }
 
-    async fn release_and_wait_for_workspace_bootstrap_with_timeout(
-        &self,
-        vm_name: &str,
-        timeout: Duration,
-    ) -> Result<(), AgentVmDaemonError> {
+    /// Signal the guest that the broker is up, so the boot-time egress gate's
+    /// positive control (and, on the workspace path, the broker-ready wait) can
+    /// proceed. Released for EVERY session — both guest scripts gate on egress —
+    /// only after the broker has actually spawned, so the signal does not lie.
+    async fn release_broker_ready(&self, vm_name: &str) -> Result<(), AgentVmDaemonError> {
         self.run_container_exec_shell(
             vm_name,
-            "release workspace bootstrap",
+            "release guest bootstrap",
             &format!(
                 "mkdir -p /run/writ-agent-vm && touch {}",
                 AGENT_VM_WORKSPACE_BROKER_READY_PATH
             ),
         )
         .await?;
+        Ok(())
+    }
+
+    async fn release_and_wait_for_workspace_bootstrap_with_timeout(
+        &self,
+        vm_name: &str,
+        timeout: Duration,
+    ) -> Result<(), AgentVmDaemonError> {
+        self.release_broker_ready(vm_name).await?;
 
         let start = Instant::now();
         let mut poll_count = 0;
@@ -957,11 +966,18 @@ impl AgentVmDaemon {
 
         let running = prepared.spawn();
         self.running.lock().await.insert(session_id, running);
-        if workspace.is_some()
-            && let Err(err) = self
-                .release_and_wait_for_workspace_bootstrap(plan.names().vm())
+        // Release broker-ready for EVERY session so the boot-time egress gate
+        // runs its positive control; the workspace path then also waits for its
+        // bootstrap sentinels. The non-workspace path has none (it `exec`s the
+        // guest command, preserving the auto-stop semantics), so its gate
+        // aborts the container directly on failure — there is nothing to poll.
+        let bootstrap_result = if workspace.is_some() {
+            self.release_and_wait_for_workspace_bootstrap(plan.names().vm())
                 .await
-        {
+        } else {
+            self.release_broker_ready(plan.names().vm()).await
+        };
+        if let Err(err) = bootstrap_result {
             let bootstrap = err.to_string();
             if let Err(cleanup) = self.cleanup_failed_started_session(session_id).await {
                 return Err(AgentVmDaemonError::WorkspaceBootstrapCleanupFailed {
