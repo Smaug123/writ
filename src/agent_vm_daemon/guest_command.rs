@@ -180,7 +180,14 @@ egress_gate() {
       return 1
     fi
   done
-  _v6="$(ip -6 addr show scope global 2>/dev/null || true)"
+  # Fail closed if the IPv6 probe cannot RUN (ip missing / errors): an empty
+  # result must mean "ip ran and found no global address", never "ip could not
+  # be asked". A query that finds nothing still exits 0, so a non-zero status
+  # here is an inability to validate, which aborts.
+  if ! _v6="$(ip -6 addr show scope global 2>/dev/null)"; then
+    echo "egress gate: could not run 'ip -6 addr' to validate IPv6 posture; refusing to run the agent" >&2
+    return 1
+  fi
   if [ -n "$_v6" ]; then
     echo "egress gate: guest holds a global-scope IPv6 address; refusing to run the agent" >&2
     echo "$_v6" >&2
