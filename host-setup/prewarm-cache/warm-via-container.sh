@@ -315,7 +315,11 @@ container run --name "$builder_name" --cpus "$cpus" --memory "$memory" \
   --volume "$prewarm_dir:/prewarm" \
   --volume "$work_dir:/work" \
   --volume "$dir:/prewarm-scripts" \
-  -d "$image" sleep 7200 >/dev/null
+  -d "$image" sleep infinity >/dev/null
+# `sleep infinity` is PID 1: a cold cache-miss warm (toolchain built from
+# source) can outlast any fixed bound, and killing PID 1 mid-build would fail
+# the `container exec` warm. The cleanup trap stops/deletes the container on
+# exit regardless, so an unbounded sleep just defers teardown to that trap.
 
 # Wait for the container to become exec-able (mirrors the oracle's poll).
 ready=""
