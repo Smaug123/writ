@@ -180,18 +180,24 @@ egress_gate() {
       return 1
     fi
   done
-  # Fail closed if the IPv6 probe cannot RUN (ip missing / errors): an empty
-  # result must mean "ip ran and found no global address", never "ip could not
-  # be asked". A query that finds nothing still exits 0, so a non-zero status
-  # here is an inability to validate, which aborts.
-  if ! _v6="$(ip -6 addr show scope global 2>/dev/null)"; then
-    echo "egress gate: could not run 'ip -6 addr' to validate IPv6 posture; refusing to run the agent" >&2
-    return 1
-  fi
-  if [ -n "$_v6" ]; then
-    echo "egress gate: guest holds a global-scope IPv6 address; refusing to run the agent" >&2
-    echo "$_v6" >&2
-    return 1
+  # No global-scope IPv6 — but only in the no-guest-IPv6 lifecycle mode. The
+  # daemon sets WRIT_EGRESS_GATE_REQUIRE_NO_IPV6=1 there and =0 for the
+  # dual-stack mode, which provisions a ULA on purpose; a missing value defaults
+  # to "do not enforce" so this never breaks a mode it was not told to police.
+  if [ "${WRIT_EGRESS_GATE_REQUIRE_NO_IPV6:-0}" = 1 ]; then
+    # Fail closed if the probe cannot RUN (ip missing / errors): an empty result
+    # must mean "ip ran and found no global address", never "ip could not be
+    # asked". A query that finds nothing still exits 0, so a non-zero status
+    # here is an inability to validate, which aborts.
+    if ! _v6="$(ip -6 addr show scope global 2>/dev/null)"; then
+      echo "egress gate: could not run 'ip -6 addr' to validate IPv6 posture; refusing to run the agent" >&2
+      return 1
+    fi
+    if [ -n "$_v6" ]; then
+      echo "egress gate: guest holds a global-scope IPv6 address; refusing to run the agent" >&2
+      echo "$_v6" >&2
+      return 1
+    fi
   fi
   return 0
 }

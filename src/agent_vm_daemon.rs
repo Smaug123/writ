@@ -69,6 +69,12 @@ pub const AGENT_VM_NIX_NETRC_ENV: &str = "WRIT_NIX_NETRC";
 pub const AGENT_VM_NIX_NETRC_PATH: &str = "/run/writ-agent-vm/netrc";
 pub const AGENT_VM_NIX_TRUSTED_PUBLIC_KEYS_ENV: &str = "WRIT_NIX_TRUSTED_PUBLIC_KEYS";
 pub const AGENT_VM_NIX_CONF_DIR_ENV: &str = "NIX_CONF_DIR";
+/// The boot-time egress gate's expected IPv6 posture, set from the lifecycle
+/// `ipv6_mode`: `1` (the guest must hold no global-scope IPv6 address) only for
+/// `Ipv4OnlyNoGuestIpv6`, `0` for `DualStackRequired` (which provisions a ULA
+/// deliberately). The IPv4-egress and broker checks are mode-independent and
+/// always run; only the no-IPv6 assertion is gated on this.
+pub const AGENT_VM_EGRESS_GATE_REQUIRE_NO_IPV6_ENV: &str = "WRIT_EGRESS_GATE_REQUIRE_NO_IPV6";
 pub const AGENT_VM_NIX_CONF_DIR: &str = "/run/writ-agent-vm/nix-conf";
 const AGENT_VM_WORKSPACE_BROKER_READY_PATH: &str = "/run/writ-agent-vm/broker-ready";
 const AGENT_VM_WORKSPACE_BOOTSTRAP_OK_PATH: &str = "/run/writ-agent-vm/bootstrap-ok";
@@ -896,6 +902,19 @@ impl AgentVmDaemon {
                 AgentVmGuestEnvVar::new(AGENT_VM_NIX_TRUSTED_PUBLIC_KEYS_ENV, trusted_public_keys)?,
                 AgentVmGuestEnvVar::new(AGENT_VM_NIX_CONF_DIR_ENV, AGENT_VM_NIX_CONF_DIR)?,
             ];
+            // Tell the boot-time egress gate whether to enforce no-guest-IPv6.
+            // Exhaustive over the mode so a future variant must decide: the
+            // dual-stack mode provisions a ULA on purpose, so only the
+            // no-guest-IPv6 mode forbids a global-scope address.
+            let require_no_ipv6 = match self.config.lifecycle.ipv6_mode {
+                Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6 => "1",
+                Ipv6IsolationMode::DualStackRequired => "0",
+            };
+            guest_env.push(AgentVmGuestEnvVar::new(
+                AGENT_VM_EGRESS_GATE_REQUIRE_NO_IPV6_ENV,
+                require_no_ipv6,
+            )?);
+
             // Advertise the strict pre-warm-only substituter exactly when the
             // operator has configured a pre-warm dir: the variable's presence is
             // the guest-side switch that pins the devShell warm to the local-only

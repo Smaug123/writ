@@ -210,6 +210,34 @@ fn non_workspace_nix_setup_has_no_egress_gate() {
     // control could not hold there; gating it is a separate follow-up.
     assert!(!nix_setup_script().contains("/dev/tcp/"));
 }
+
+#[test]
+fn egress_gate_no_ipv6_check_is_gated_on_the_mode_env() {
+    // The no-IPv6 assertion must only run when the daemon advertises that
+    // posture, so the dual-stack mode (which provisions a ULA deliberately) is
+    // not rejected. The IPv6 probe must sit inside the env guard.
+    let script = workspace_bootstrap_script();
+    assert!(
+        script.contains(AGENT_VM_EGRESS_GATE_REQUIRE_NO_IPV6_ENV),
+        "the gate must consult the mode env var before forbidding IPv6"
+    );
+    let guard = script
+        .find(AGENT_VM_EGRESS_GATE_REQUIRE_NO_IPV6_ENV)
+        .expect("env guard present");
+    let probe = script
+        .find("ip -6 addr show scope global")
+        .expect("ipv6 probe present");
+    assert!(
+        guard < probe,
+        "the no-IPv6 probe must be guarded by the mode env var"
+    );
+    // The IPv4-egress probe is unconditional; it must NOT be inside the guard.
+    let v4 = script.find("/dev/tcp/").expect("v4 probe present");
+    assert!(
+        v4 < guard,
+        "the IPv4-egress probe must run regardless of the IPv6 mode"
+    );
+}
 #[cfg(unix)]
 #[test]
 fn workspace_bootstrap_rejects_non_utf8_destination() {
