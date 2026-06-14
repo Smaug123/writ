@@ -16,6 +16,45 @@ the builder VM** — never on the broker host, never in a guest — so a valid
 `main`". The broker verifies it on admission and the guest verifies it again
 on substitution.
 
+## Single-machine macOS shortcut (`warm-via-container.sh`)
+
+If the broker is your Mac and you just want a repo pre-warmed locally, you do
+**not** need to stand up a separate builder VM by hand. `warm-via-container.sh`
+is the host-side automation: it drives an Apple `container` (the same guest
+image the agent VMs use, on the default NAT network so it has egress) as the
+aarch64-linux builder, and runs `init-prewarm-cache.sh` + `warm-devshell-cache.sh`
+inside it against a fresh checkout of the repo:
+
+```sh
+container system start                                   # once per boot
+./warm-via-container.sh Smaug123/dumb-fsharp-lsp         # owner/name, or a git URL
+```
+
+It clones **`main`** — the branch the guest's workspace init checks out
+(`DEFAULT_WORKSPACE_BRANCH`), exactly the rev `agent-vm start --repo <repo>`
+demands — so the warm matches what the guest will need (override with
+`WRIT_PREWARM_REF`). A full git URL is cloned verbatim with your configured
+credentials, so **private repos work** (its userinfo is redacted from logs).
+The injected build toolset (grep/find/jq/flock) comes from *writ's* pinned
+nixpkgs, not the warmed repo's lock — it runs as root near the signing key, so
+it must be trusted. The signed `cache/` lands
+directly in `WRIT_PREWARM_DIR/cache` on this host, so the "Transferring to the
+broker host" step below is a no-op; the script prints the exact
+`nix_prewarm_cache_dir` + `nix_cache_trusted_public_keys` lines to paste into
+`writd`'s config. Restart `writd` once after the first config change. Re-run to
+refresh after the default branch moves (already-signed paths are skipped).
+
+Tunables via env (`WRIT_PREWARM_DIR`, `WRIT_PREWARM_REF`, `WRIT_PREWARM_IMAGE`,
+`WRIT_PREWARM_SYSTEM`, `WRIT_PREWARM_CPUS`, `WRIT_PREWARM_MEMORY`,
+`WRIT_PREWARM_TOOLS_NIXPKGS`); run with no args for the full list.
+
+**Security trade-off.** Here the builder and broker are one machine, so the
+signing key lives under `WRIT_PREWARM_DIR/keys/` on the broker host — a
+relaxation of the "key only on the builder" model above. It is still sound: the
+guest only ever sees `cache/` over HTTP, never `keys/`. For a true split, use
+the manual builder-VM flow below (run `warm-devshell-cache.sh` on a separate
+machine and rsync only `cache/`).
+
 ## The builder VM
 
 Warming *realises* the devShell, which means building for the guest system —
@@ -50,14 +89,14 @@ Generates the `writ-prewarm-1` signing keypair under
 re-running never regenerates the key — regenerating would invalidate the
 public key registered in broker configs, untrusting everything warmed so far.
 
-Register the printed public key on the broker host (`writd`'s config):
+Register the printed public key on the broker host (`writd`'s config, which is
+JSON), under `agent_vm.vm_http`:
 
-```toml
-[agent_vm.vm_http]
-nix_prewarm_cache_dir = "/var/lib/writ/prewarm-cache"   # wherever you transfer to
-nix_cache_trusted_public_keys = [
+```json
+"nix_prewarm_cache_dir": "/var/lib/writ/prewarm-cache",
+"nix_cache_trusted_public_keys": [
   "cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=",
-  "writ-prewarm-1:<base64 from init-prewarm-cache.sh>",
+  "writ-prewarm-1:<base64 from init-prewarm-cache.sh>"
 ]
 ```
 
