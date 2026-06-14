@@ -373,11 +373,16 @@ echo "  warmed:   $repo_label (rev $rev) devShells.$guest_system.$attr"
 echo "  cache:    $cache_dir"
 echo "  key:      $public_key"
 echo
-echo "Wire it into the broker (writd) config's [agent_vm.vm_http] and restart writd:"
-echo "  nix_prewarm_cache_dir = \"$cache_dir\""
-echo "  nix_cache_trusted_public_keys = ["
+# writd parses its config as JSON (serde_json; src/bin/writd.rs), so emit
+# pasteable JSON fields — not TOML — to add under agent_vm.vm_http. Keep
+# cache.nixos.org-1 alongside the pre-warm key (the field overrides the
+# default that would otherwise supply it).
+echo "Add these JSON fields under agent_vm.vm_http in the broker (writd) config,"
+echo "then restart writd:"
+echo "  \"nix_prewarm_cache_dir\": \"$cache_dir\","
+echo "  \"nix_cache_trusted_public_keys\": ["
 echo "    \"cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=\","
-echo "    \"$public_key\","
+echo "    \"$public_key\""
 echo "  ]"
 echo
 echo "Re-run this to refresh after the repo's default branch moves; already-signed"

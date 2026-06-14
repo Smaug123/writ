@@ -89,14 +89,14 @@ Generates the `writ-prewarm-1` signing keypair under
 re-running never regenerates the key — regenerating would invalidate the
 public key registered in broker configs, untrusting everything warmed so far.
 
-Register the printed public key on the broker host (`writd`'s config):
+Register the printed public key on the broker host (`writd`'s config, which is
+JSON), under `agent_vm.vm_http`:
 
-```toml
-[agent_vm.vm_http]
-nix_prewarm_cache_dir = "/var/lib/writ/prewarm-cache"   # wherever you transfer to
-nix_cache_trusted_public_keys = [
+```json
+"nix_prewarm_cache_dir": "/var/lib/writ/prewarm-cache",
+"nix_cache_trusted_public_keys": [
   "cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=",
-  "writ-prewarm-1:<base64 from init-prewarm-cache.sh>",
+  "writ-prewarm-1:<base64 from init-prewarm-cache.sh>"
 ]
 ```
 
