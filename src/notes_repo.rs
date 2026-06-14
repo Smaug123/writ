@@ -58,11 +58,11 @@
 
 use std::collections::HashMap;
 use std::ffi::OsString;
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::{Mutex, MutexGuard, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::clean_git::CLEAN_GIT_CONFIG_ENV;
 use crate::core::{NotesRef, NotesRefError};
@@ -648,9 +648,20 @@ fn prepare_git_command(repo: &Path, env: &InheritedEnv) -> Command {
     command
 }
 
-/// Number of `git` spawn attempts (initial + retries) before giving up
-/// on a transient resource refusal.
-const GIT_SPAWN_MAX_ATTEMPTS: u32 = 4;
+/// How long to keep retrying a `git` spawn (or the stderr-drain thread spawn)
+/// that fails with a *transient* resource refusal before giving up.
+///
+/// A transient refusal (EAGAIN, &c.) means the OS momentarily had no room in
+/// the process table; it WILL clear as concurrent children exit. So the correct
+/// response is "wait for it to clear", bounded by a deadline so a genuinely
+/// wedged host still fails rather than spinning forever — not an arbitrary
+/// attempt count (which is too shallow for a sustained fork-pressure peak, the
+/// flake this replaces). The first attempt is immediate; backoff only applies
+/// between retries, so the happy path pays nothing.
+const GIT_SPAWN_RETRY_DEADLINE: Duration = Duration::from_secs(2);
+
+/// Cap on the exponential backoff between spawn retries.
+const GIT_SPAWN_RETRY_MAX_BACKOFF: Duration = Duration::from_millis(50);
 
 /// True if a failed `Command::spawn()` is a *transient* resource
 /// refusal that a retry can clear. The fork/`posix_spawn` was rejected,
@@ -671,32 +682,38 @@ fn spawn_is_retryable(err: &io::Error) -> bool {
     )
 }
 
-/// Run `attempt` up to `max_attempts` times, retrying only when it fails
-/// with a transient spawn refusal (see [`spawn_is_retryable`]). A short
-/// linear backoff between tries gives the contended resource (process
-/// table, fd table) a moment to drain. Any non-transient error, or the
-/// final attempt's error, is returned unchanged.
+/// Run `attempt`, retrying for up to `deadline` whenever it fails with a
+/// transient spawn refusal (see [`spawn_is_retryable`]), with exponential
+/// backoff (capped at [`GIT_SPAWN_RETRY_MAX_BACKOFF`]) so the contended
+/// resource (process table, fd table) can drain. Any non-transient error, or a
+/// transient one that outlives the deadline, is returned unchanged.
 ///
-/// Generic over the attempt's result so the retry/backoff control flow
-/// is unit-testable with a synthetic spawner, without exhausting the
-/// real process table.
-fn spawn_with_retry<T, F>(max_attempts: u32, mut attempt: F) -> io::Result<T>
+/// Bounding by elapsed TIME rather than an attempt count matches the error's
+/// nature — "resource temporarily unavailable" clears on its own schedule, not
+/// after N tries — and is what keeps a brief fork-pressure peak from surfacing
+/// as a flake while a genuinely wedged host still fails.
+///
+/// Generic over the attempt's result so the retry/backoff control flow is
+/// unit-testable with a synthetic spawner, without exhausting the real process
+/// table.
+fn spawn_with_retry<T, F>(deadline: Duration, mut attempt: F) -> io::Result<T>
 where
     F: FnMut() -> io::Result<T>,
 {
-    let mut n: u32 = 1;
+    let start = Instant::now();
+    let mut backoff = Duration::from_millis(1);
     loop {
         match attempt() {
             Ok(value) => return Ok(value),
-            Err(err) if n < max_attempts && spawn_is_retryable(&err) => {
+            Err(err) if spawn_is_retryable(&err) && start.elapsed() < deadline => {
                 tracing::warn!(
-                    attempt = n,
-                    max_attempts,
+                    elapsed_ms = start.elapsed().as_millis(),
+                    deadline_ms = deadline.as_millis(),
                     errno = err.raw_os_error(),
                     "git spawn refused with a transient resource error; retrying after backoff"
                 );
-                std::thread::sleep(Duration::from_millis(u64::from(n)));
-                n += 1;
+                std::thread::sleep(backoff);
+                backoff = (backoff * 2).min(GIT_SPAWN_RETRY_MAX_BACKOFF);
             }
             Err(err) => return Err(err),
         }
@@ -761,7 +778,7 @@ where
     // Retry transient spawn refusals (EAGAIN under fork pressure, &c.).
     // A refused spawn ran nothing, so this is safe; a child that starts
     // and exits non-zero is handled separately below and never retried.
-    let mut child = spawn_with_retry(GIT_SPAWN_MAX_ATTEMPTS, || command.spawn())
+    let mut child = spawn_with_retry(GIT_SPAWN_RETRY_DEADLINE, || command.spawn())
         .map_err(|source| NotesRepoError::GitSpawn { source })?;
 
     if let Some(bytes) = stdin_input {
@@ -775,36 +792,24 @@ where
         drop(stdin);
     }
 
-    // Drain stderr on a background thread so the child never blocks
-    // writing to a full pipe while the parent is still reading stdout.
-    let stderr_pipe = child.stderr.take();
-    let stderr_handle = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        if let Some(mut stderr) = stderr_pipe {
-            let _ = stderr.read_to_end(&mut buf);
-        }
-        buf
-    });
-
-    let mut stdout_bytes = Vec::new();
-    if let Some(mut stdout) = child.stdout.take() {
-        stdout
-            .read_to_end(&mut stdout_bytes)
-            .map_err(|source| NotesRepoError::GitStdoutRead { source })?;
-    }
-    let stderr_bytes = stderr_handle.join().expect("stderr drain thread panicked");
-
-    let status = child
-        .wait()
+    // `wait_with_output` drains stdout AND stderr concurrently (std's internal
+    // read2: a non-blocking poll loop, not a helper thread) and waits for exit.
+    // This avoids the pipe-buffer deadlock a serial drain would hit on a child
+    // that floods stderr, WITHOUT spawning a per-call thread — that thread
+    // spawn was itself unguarded against the same EAGAIN that
+    // `spawn_with_retry` exists to absorb, so under fork pressure it would
+    // `panic` and become the next flake.
+    let output = child
+        .wait_with_output()
         .map_err(|source| NotesRepoError::GitWait { source })?;
-    if !status.success() {
+    if !output.status.success() {
         return Err(NotesRepoError::GitFailed {
             args: args.iter().map(|s| (*s).to_string()).collect(),
-            status,
-            stderr: String::from_utf8_lossy(&stderr_bytes).into_owned(),
+            status: output.status,
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         });
     }
-    Ok((stdout_bytes, stderr_bytes))
+    Ok((output.stdout, output.stderr))
 }
 
 fn git_config_get_bool(
@@ -996,9 +1001,7 @@ pub enum NotesRepoError {
     GitSpawn { source: std::io::Error },
     #[error("git command stdin write failed: {source}")]
     GitStdinWrite { source: std::io::Error },
-    #[error("git command stdout read failed: {source}")]
-    GitStdoutRead { source: std::io::Error },
-    #[error("git command wait failed: {source}")]
+    #[error("git command wait/drain failed: {source}")]
     GitWait { source: std::io::Error },
     #[error("git {args:?} exited with {status}: {stderr}")]
     GitFailed {
@@ -1052,7 +1055,7 @@ mod tests {
     #[test]
     fn spawn_with_retry_succeeds_after_transient_failures() {
         let mut attempts = 0u32;
-        let got = spawn_with_retry(4, || {
+        let got = spawn_with_retry(Duration::from_secs(5), || {
             attempts += 1;
             if attempts < 3 {
                 Err(io::Error::from_raw_os_error(libc::EAGAIN))
@@ -1065,20 +1068,27 @@ mod tests {
     }
 
     #[test]
-    fn spawn_with_retry_gives_up_after_max_attempts_on_persistent_transient() {
+    fn spawn_with_retry_gives_up_after_the_deadline_on_persistent_transient() {
         let mut attempts = 0u32;
-        let got: io::Result<()> = spawn_with_retry(4, || {
+        let started = Instant::now();
+        let got: io::Result<()> = spawn_with_retry(Duration::from_millis(20), || {
             attempts += 1;
             Err(io::Error::from_raw_os_error(libc::EAGAIN))
         });
-        assert_eq!(attempts, 4, "exactly max_attempts attempts, then give up");
+        // Bounded by time, not a fixed count: it gives up once the deadline
+        // elapses, having retried more than once.
         assert_eq!(got.unwrap_err().raw_os_error(), Some(libc::EAGAIN));
+        assert!(attempts > 1, "should retry at least once before giving up");
+        assert!(
+            started.elapsed() >= Duration::from_millis(20),
+            "should not give up before the deadline"
+        );
     }
 
     #[test]
     fn spawn_with_retry_does_not_retry_permanent_errors() {
         let mut attempts = 0u32;
-        let got: io::Result<()> = spawn_with_retry(4, || {
+        let got: io::Result<()> = spawn_with_retry(Duration::from_secs(5), || {
             attempts += 1;
             Err(io::Error::from_raw_os_error(libc::ENOENT))
         });
