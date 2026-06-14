@@ -243,6 +243,28 @@ fn nix_setup_gates_then_signals_ok_and_runs_command() {
 }
 
 #[test]
+fn egress_gate_probes_external_dns() {
+    // Beyond TCP/443, the gate confirms no external DNS egress — a "allow DNS"
+    // firewall leak that the 443 probes miss. A public resolver answering a UDP
+    // query on :53 is a leak. Shared by both scripts, part of the unconditional
+    // negative control (before the IPv6 mode guard and the workload).
+    for script in [workspace_bootstrap_script(), nix_setup_script()] {
+        assert!(
+            script.contains("/dev/udp/") && script.contains("/53"),
+            "gate must probe an external DNS resolver over UDP/53"
+        );
+        let dns = script.find("/dev/udp/").expect("dns probe present");
+        let v6_guard = script
+            .find(AGENT_VM_EGRESS_GATE_REQUIRE_NO_IPV6_ENV)
+            .expect("ipv6 guard present");
+        assert!(
+            dns < v6_guard,
+            "the DNS probe is unconditional negative control, before the IPv6 mode guard"
+        );
+    }
+}
+
+#[test]
 fn both_guest_scripts_share_the_egress_gate() {
     // The broker-ready wait and the gate function are shared, so neither script
     // can silently drift from the other's egress posture.

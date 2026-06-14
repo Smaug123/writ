@@ -152,6 +152,21 @@ egress_gate() {
   # are passed as the inner bash's $1/$2 (after the _ argv0); the bash -c body
   # is single-quoted, so they expand in the INNER bash, never the caller.
   _connect() { timeout "$1" bash -c ': <"/dev/tcp/$1/$2"' _ "$2" "$3" 2>/dev/null; }
+  # rc 0 iff the resolver at $1 ANSWERS a UDP DNS query within 2s — i.e. port-53
+  # egress is open. A minimal A-query for example.com; `read -n 1` returns on the
+  # first reply byte (a binary DNS reply has no newline, so `read -r` would hang
+  # past the answer). UDP send is fire-and-forget, so only a reply is evidence.
+  # The socket is a redirect on the command GROUP, never `exec` — a failed
+  # `exec` redirect is FATAL, so an unreachable resolver (the isolated case)
+  # would abort the whole gate; here it is just a non-zero "no answer".
+  _dns_answers() {
+    # 2>/dev/null BEFORE 3<> so a failed open (unreachable resolver) is silent,
+    # not just non-fatal — redirects apply left to right.
+    {
+      printf '\xfe\xed\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x07example\x03com\x00\x00\x01\x00\x01' >&3
+      read -t 2 -n 1 _ <&3
+    } 2>/dev/null 3<>"/dev/udp/$1/53"
+  }
   # Positive control: the broker must be reachable, else a failed external probe
   # cannot be attributed to isolation. broker-ready was just signalled, but
   # tolerate a slow first accept with a short retry — a false abort here would
@@ -176,6 +191,13 @@ egress_gate() {
       return 1
     fi
   done
+  # Also confirm no external DNS egress: a firewall that allows port 53 ("for
+  # name resolution") leaks even when 443 is blocked, so probe a public resolver
+  # directly. A reply is a leak.
+  if _dns_answers 1.1.1.1; then
+    echo "egress gate: LEAK — external DNS resolver 1.1.1.1 answered a query; refusing to run the agent" >&2
+    return 1
+  fi
   # No global-scope IPv6 — but only in the no-guest-IPv6 lifecycle mode. The
   # daemon sets WRIT_EGRESS_GATE_REQUIRE_NO_IPV6=1 there and =0 for the
   # dual-stack mode, which provisions a ULA on purpose; a missing value defaults
