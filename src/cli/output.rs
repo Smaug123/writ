@@ -74,6 +74,7 @@ pub fn write_agent_vm_sessions(
         )?;
         writeln!(out, "vm={}", session.vm_name)?;
         writeln!(out, "network={}", session.network_name)?;
+        writeln!(out, "network_health={}", session.network_health.as_str())?;
         for broker_url in &session.broker_urls {
             writeln!(out, "broker_url={broker_url}")?;
         }
@@ -85,7 +86,7 @@ pub fn write_agent_vm_sessions(
 mod tests {
     use super::*;
 
-    use crate::agent_vm_lifecycle::AgentVmSessionStateStatus;
+    use crate::agent_vm_lifecycle::{AgentVmSessionStateStatus, NetworkHealth};
     use crate::audit::GitPushOutcomeResult;
     use crate::core::{RequestId, SessionId, UnixMillis};
     use crate::protocol::StagedPushAuditView;
@@ -103,6 +104,7 @@ mod tests {
                 network_name: format!("writ-agent-net-{detached_id}"),
                 broker_urls: vec!["http://192.168.252.1:51375/".into()],
                 runtime_attached: false,
+                network_health: NetworkHealth::Unknown,
             },
             AgentVmSessionInfo {
                 session_id: attached_id,
@@ -112,6 +114,7 @@ mod tests {
                 network_name: format!("writ-agent-net-{attached_id}"),
                 broker_urls: vec!["http://192.168.253.1:51376/".into()],
                 runtime_attached: true,
+                network_health: NetworkHealth::Reachable,
             },
         ];
         let mut out = Vec::new();
@@ -127,6 +130,7 @@ mod tests {
                 "runtime=detached\n",
                 "vm=writ-agent-vm-51b8fd0f-6c10-454c-b0e6-7df1d60e2e6d\n",
                 "network=writ-agent-net-51b8fd0f-6c10-454c-b0e6-7df1d60e2e6d\n",
+                "network_health=unknown\n",
                 "broker_url=http://192.168.252.1:51375/\n",
                 "\n",
                 "session_id=b7960f37-3888-48a9-b0bb-a4edcaab2194\n",
@@ -135,6 +139,7 @@ mod tests {
                 "runtime=attached\n",
                 "vm=writ-agent-vm-b7960f37-3888-48a9-b0bb-a4edcaab2194\n",
                 "network=writ-agent-net-b7960f37-3888-48a9-b0bb-a4edcaab2194\n",
+                "network_health=reachable\n",
                 "broker_url=http://192.168.253.1:51376/\n",
             )
         );

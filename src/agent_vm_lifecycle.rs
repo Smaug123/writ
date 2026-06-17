@@ -33,6 +33,13 @@ pub use state_store::{
     AgentVmSessionState, AgentVmSessionStateError, AgentVmSessionStateStore, AgentVmStateDirError,
     default_agent_vm_state_dir,
 };
+mod network_health;
+#[cfg(unix)]
+pub use network_health::host_interfaces;
+pub use network_health::{
+    HealthTransition, HostIface, NETWORK_HEALTH_FAILURE_THRESHOLD, NetworkHealth, ProbeDebounce,
+    ProbeObservation, evaluate_host_path,
+};
 
 const IPV4_ONLY_PRELAUNCH_SCRIPT: &str = concat!(
     "set -eu\n",

@@ -49,7 +49,7 @@ pub(super) struct Migration {
 /// a version higher than this is rejected with [`AuditError::SchemaTooNew`]
 /// rather than opened — we'd rather fail to start than silently drop data
 /// into a schema a newer broker wrote.
-pub(super) const SCHEMA_VERSION: i32 = 5;
+pub(super) const SCHEMA_VERSION: i32 = 6;
 
 /// The full migration history. Each entry documents exactly one state
 /// transition; the sequence of entries is the schema's lineage. Order
@@ -85,6 +85,11 @@ pub(super) const MIGRATIONS: &[Migration] = &[
         version: 5,
         name: "0005_flake_provision",
         sql: include_str!("migrations/0005_flake_provision.sql"),
+    },
+    Migration {
+        version: 6,
+        name: "0006_agent_vm_network_health",
+        sql: include_str!("migrations/0006_agent_vm_network_health.sql"),
     },
 ];
 
@@ -359,6 +364,7 @@ mod tests {
             "git_push_resolution",
             "git_push_approve_attempt",
             "git_push_approve_attempt_boot_observed",
+            "agent_vm_network_health_event",
         ] {
             assert!(tables.contains(expected), "missing table: {expected}");
         }
@@ -389,6 +395,7 @@ mod tests {
             "openai_proxy_request_requires_open_session",
             "nix_cache_request_requires_open_session",
             "flake_provision_request_requires_open_session",
+            "agent_vm_network_health_event_requires_open_session",
             "git_push_request_requires_open_session",
             "git_push_resolution_requires_staged",
             "git_push_resolution_refuses_active_approve",

@@ -13,7 +13,7 @@
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::agent_run::{AgentPrompt, AgentRunId, CorrelationId};
-use crate::agent_vm_lifecycle::AgentVmSessionStateStatus;
+use crate::agent_vm_lifecycle::{AgentVmSessionStateStatus, NetworkHealth};
 use crate::audit::GitPushOutcomeResult;
 use crate::core::{
     AgentKind, CapabilityRequest, CapabilitySet, NotesRef, RequestId, SessionId, Sha256Hex,
@@ -34,6 +34,12 @@ pub struct AgentVmSessionInfo {
     pub network_name: String,
     pub broker_urls: Vec<String>,
     pub runtime_attached: bool,
+    /// Host-observed reachability of this session's broker path. `#[serde(default)]`
+    /// keeps the wire compatible with a peer that predates the field (it reads
+    /// as `Unknown`). Only populated for runtime-attached sessions; a
+    /// detached/persisted-only session reports `Unknown`.
+    #[serde(default = "NetworkHealth::unknown")]
+    pub network_health: NetworkHealth,
 }
 
 /// One row of [`ServerMessage::StagedPushes`]: the metadata an operator
@@ -1710,6 +1716,7 @@ mod tests {
                 network_name: format!("writ-agent-net-{}", fixed_session_id()),
                 broker_urls: vec!["http://192.168.252.1:51375/".into()],
                 runtime_attached: false,
+                network_health: NetworkHealth::Reachable,
             }],
         };
         let json = serde_json::to_string(&msg).unwrap();
