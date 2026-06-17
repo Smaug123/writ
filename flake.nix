@@ -305,6 +305,14 @@
                 # it off so the build does no pointless network work. (It was a
                 # second victim of the missing-/etc/passwd hang above.)
                 "DOTNET_CLI_WORKLOAD_UPDATE_NOTIFY_DISABLE=true"
+                # The whole guest VM is the sandbox boundary (the broker + human
+                # review are the trust boundary, never the guest), so Claude Code
+                # may run with permissions bypassed. It refuses
+                # `--permission-mode bypassPermissions` under uid 0 unless marked
+                # sandboxed; the daemon already sets this for the agent run
+                # (writ-vm.rs), and setting it image-wide makes a hand-run
+                # `claude` in a debug shell behave the same.
+                "IS_SANDBOX=1"
               ];
               WorkingDir = "/";
             };
