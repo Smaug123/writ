@@ -172,6 +172,7 @@
             "git"
             "ip"
             "nix"
+            "ps"
             "sh"
             "writ-vm"
           ];
@@ -183,6 +184,18 @@
               fi
             '')
             guestRequiredBins;
+          # getpwuid_r callers (dotnet/NuGet, git, nix) hang or misbehave
+          # without a passwd entry for the running uid; assert one exists.
+          guestRequiredEtcCheck = ''
+            if [ ! -e "${guestRoot}/etc/passwd" ]; then
+              echo "guest image is missing /etc/passwd (getpwuid_r callers like dotnet/NuGet hang)" >&2
+              exit 1
+            fi
+            if ! grep -qE '^[^:]*:[^:]*:0:' "${guestRoot}/etc/passwd"; then
+              echo "guest image /etc/passwd has no uid-0 entry" >&2
+              exit 1
+            fi
+          '';
           productionForbiddenBins = [
             "awk"
             "dig"
@@ -224,11 +237,25 @@
             install -d -m 0755 $out/run
             install -d -m 0700 $out/root
           '';
+          # Without an /etc/passwd entry for the running uid, any getpwuid_r
+          # caller wedges the guest. Concretely: `dotnet restore` (e.g. the
+          # csharp-sidecar build spawned from a crate build.rs) loads NuGet
+          # settings -> NuGetEnvironment.GetNuGetTempDirectory ->
+          # Interop.Sys.GetUserNameFromPasswd, which throws IOException when the
+          # uid has no passwd entry; NuGet's ConcurrencyUtilities.ExecuteWithFileLocked
+          # then swallows it and retries under a Thread.Sleep forever. The guest
+          # runs as root (uid 0), so a single root entry suffices.
+          guestEtcFiles = buildPkgs.runCommand "writ-agent-vm-guest-etc-files" {} ''
+            install -d $out/etc
+            printf 'root:x:0:0:root:/root:/bin/sh\n' > $out/etc/passwd
+            printf 'root:x:0:\n' > $out/etc/group
+          '';
           guestRoot = buildPkgs.buildEnv {
             name = "writ-agent-vm-guest-root";
             paths = [
               writVm
               claudeCode
+              guestEtcFiles
               guestPkgs.bash
               guestPkgs.cacert
               guestPkgs.codex
@@ -236,6 +263,7 @@
               guestPkgs.gitMinimal
               guestPkgs.iproute2
               guestPkgs.nix
+              guestPkgs.procps
             ] ++ lib.optionals includeProofTools proofTools;
             pathsToLink = [
               "/bin"
@@ -271,6 +299,12 @@
                 "SSL_CERT_FILE=/etc/ssl/certs/ca-bundle.crt"
                 "GIT_SSL_CAINFO=/etc/ssl/certs/ca-bundle.crt"
                 "NIX_SSL_CERT_FILE=/etc/ssl/certs/ca-bundle.crt"
+                # The SDK's background advertising-manifest updater fires on
+                # `dotnet build`/restore and reaches out to nuget.org; in a
+                # no-egress guest that just fails quietly in the background. Turn
+                # it off so the build does no pointless network work. (It was a
+                # second victim of the missing-/etc/passwd hang above.)
+                "DOTNET_CLI_WORKLOAD_UPDATE_NOTIFY_DISABLE=true"
               ];
               WorkingDir = "/";
             };
@@ -286,6 +320,7 @@
           }
           ''
             ${guestRequiredBinCheck}
+            ${guestRequiredEtcCheck}
             ${lib.optionalString includeProofTools proofToolCheck}
             ${lib.optionalString (!includeProofTools) productionForbiddenBinCheck}
             ${image.copyTo}/bin/copy-to oci-archive:$out:${imageName}:latest
