@@ -27,6 +27,7 @@ use rusqlite::Connection;
 use thiserror::Error;
 
 mod agent_run;
+mod agent_vm_network_health;
 mod claude_proxy;
 mod flake_provision;
 mod git_push;
@@ -43,6 +44,7 @@ mod validation;
 pub use agent_run::{
     AgentRunAuditRecord, AgentRunOutcomeAuditRecord, AgentVmWorkspaceBootstrapAuditRecord,
 };
+pub use agent_vm_network_health::AgentVmNetworkHealthEventRecord;
 pub use claude_proxy::{
     ClaudeProxyAuditDecision, ClaudeProxyAuditRoute, ClaudeProxyOutcomeRecord,
     ClaudeProxyRequestRecord,

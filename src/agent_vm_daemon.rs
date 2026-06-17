@@ -6,24 +6,25 @@
 //! listener, install PF for the selected port through managed start, then
 //! spawn the HTTP task only after the VM lifecycle reports success.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, watch};
 
 use crate::agent_run::{AgentPrompt, AgentRunId, CorrelationId};
 use crate::agent_vm_lifecycle::{
     AgentVmGuestEnvVar, AgentVmLifecycleConfigError, AgentVmResources, AgentVmSessionManagerError,
-    AgentVmSessionPlan, AgentVmSessionState, AgentVmSessionStateError, AgentVmSessionStateStore,
-    AgentVmToolPaths, ContainerImage, Ipv6IsolationMode, claim_agent_vm_session_subnet,
-    cleanup_managed_agent_vm_session, complete_agent_vm_session_start,
-    remove_managed_agent_vm_session_state,
+    AgentVmSessionPlan, AgentVmSessionState, AgentVmSessionStateError, AgentVmSessionStateStatus,
+    AgentVmSessionStateStore, AgentVmToolPaths, ContainerImage, HostIface, Ipv6IsolationMode,
+    NetworkHealth, ProbeDebounce, ProbeObservation, claim_agent_vm_session_subnet,
+    cleanup_managed_agent_vm_session, complete_agent_vm_session_start, evaluate_host_path,
+    host_interfaces, remove_managed_agent_vm_session_state,
 };
-use crate::audit::{AgentRunAuditRecord, AuditError, AuditLog};
+use crate::audit::{AgentRunAuditRecord, AgentVmNetworkHealthEventRecord, AuditError, AuditLog};
 use crate::core::{
     AgentKind, AgentNetwork, AgentNetworkPool, AgentVmConfigError, BrokerPorts, SessionId,
     SessionRecord, UnixMillis,
@@ -121,6 +122,14 @@ pub struct AgentVmDaemon {
     /// the *same* session serialise here; unrelated sessions don't. Entries
     /// are evicted once no other task holds a handle.
     session_locks: Mutex<HashMap<SessionId, Arc<Mutex<()>>>>,
+    /// Host-observed broker reachability per running session, published by the
+    /// network-health monitor and read by [`Self::list_sessions`]. Transient
+    /// runtime state — deliberately not persisted to the lifecycle record.
+    network_health: Arc<std::sync::Mutex<HashMap<SessionId, NetworkHealth>>>,
+    /// The single daemon-lifetime network-health monitor, spawned lazily on the
+    /// first session start (it needs an [`AuditLog`] handle, which arrives with
+    /// the start request, not at construction).
+    health_monitor: std::sync::Mutex<Option<NetworkHealthMonitorHandle>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -391,6 +400,277 @@ impl PartialEq for AgentVmReconcileFailure {
 
 impl Eq for AgentVmReconcileFailure {}
 
+/// How often the network-health monitor re-checks every running session's
+/// host-side broker reachability. Cheap: one shared `getifaddrs` snapshot per
+/// tick regardless of the number of sessions.
+const NETWORK_HEALTH_PROBE_INTERVAL: Duration = Duration::from_secs(15);
+
+/// Handle to the single daemon-lifetime network-health monitor task. Dropping
+/// the daemon signals shutdown and aborts the task.
+struct NetworkHealthMonitorHandle {
+    shutdown: watch::Sender<bool>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+/// One monitor tick over an already-resolved set of `(session, gateway)` pairs.
+///
+/// Pure but for the shared `published` map it updates: it folds each session's
+/// host-path observation into that session's debounce, publishes any changed
+/// health value, and returns the islanding transitions (`-> Unreachable`) the
+/// caller should audit. Debounce and published entries for sessions no longer
+/// present are pruned. Kept side-effect-thin so it is unit-testable without a
+/// container, the disk, or the clock.
+fn network_health_tick(
+    snapshot: &std::io::Result<Vec<HostIface>>,
+    sessions: &[(SessionId, Ipv4Addr)],
+    debounces: &mut HashMap<SessionId, ProbeDebounce>,
+    published: &std::sync::Mutex<HashMap<SessionId, NetworkHealth>>,
+) -> Vec<(SessionId, crate::agent_vm_lifecycle::HealthTransition, u32)> {
+    let alive: HashSet<SessionId> = sessions.iter().map(|(id, _)| *id).collect();
+    let mut islanding = Vec::new();
+    for (session_id, gateway) in sessions {
+        let observation = match snapshot {
+            Ok(ifaces) => evaluate_host_path(ifaces, *gateway),
+            // A snapshot we could not take is not evidence of islanding.
+            Err(_) => ProbeObservation::Indeterminate,
+        };
+        let debounce = debounces.entry(*session_id).or_default();
+        if let Some(transition) = debounce.observe(observation) {
+            published.lock().unwrap().insert(*session_id, transition.to);
+            if transition.is_islanding() {
+                islanding.push((*session_id, transition, debounce.consecutive_failures()));
+            }
+        }
+    }
+    debounces.retain(|id, _| alive.contains(id));
+    published.lock().unwrap().retain(|id, _| alive.contains(id));
+    islanding
+}
+
+/// The daemon-lifetime monitor loop. Every `interval` it takes one host
+/// interface snapshot (via `snapshot`, injected so tests can drive it) and
+/// evaluates every running session's gateway against it, recording one audit
+/// event per islanding transition (best-effort). Detection is entirely
+/// host-side; the untrusted guest is never probed.
+async fn run_network_health_monitor<F>(
+    state_store: AgentVmSessionStateStore,
+    pool: AgentNetworkPool,
+    published: Arc<std::sync::Mutex<HashMap<SessionId, NetworkHealth>>>,
+    audit: Arc<AuditLog>,
+    interval: Duration,
+    mut shutdown: watch::Receiver<bool>,
+    snapshot: F,
+) where
+    F: Fn() -> std::io::Result<Vec<HostIface>> + Send + Sync + 'static,
+{
+    let mut debounces: HashMap<SessionId, ProbeDebounce> = HashMap::new();
+    loop {
+        tokio::select! {
+            biased;
+            _ = shutdown.changed() => break,
+            _ = tokio::time::sleep(interval) => {}
+        }
+        if *shutdown.borrow() {
+            break;
+        }
+
+        let snapshot = snapshot();
+        let store = state_store.clone();
+        let states = match tokio::task::spawn_blocking(move || store.load_all()).await {
+            Ok(Ok(states)) => states,
+            // A transient load failure (or join error) says nothing about any
+            // session's network; try again next tick.
+            _ => continue,
+        };
+        let sessions: Vec<(SessionId, Ipv4Addr)> = states
+            .iter()
+            .filter(|state| state.status() == AgentVmSessionStateStatus::Running)
+            .filter_map(|state| {
+                pool.allocate(state.subnet_index())
+                    .ok()
+                    .map(|network| (state.session_id(), network.ipv4_gateway()))
+            })
+            .collect();
+
+        for (session_id, transition, consecutive_failures) in
+            network_health_tick(&snapshot, &sessions, &mut debounces, &published)
+        {
+            let record = AgentVmNetworkHealthEventRecord {
+                session_id,
+                observed_at: UnixMillis::now(),
+                from_health: transition.from,
+                to_health: transition.to,
+                consecutive_failures,
+            };
+            if let Err(err) = audit.record_agent_vm_network_health_event(&record) {
+                tracing::warn!(
+                    session_id = %session_id,
+                    error = %err,
+                    "failed to record agent VM network-health event",
+                );
+            }
+        }
+    }
+}
+
+impl Drop for AgentVmDaemon {
+    fn drop(&mut self) {
+        if let Ok(mut guard) = self.health_monitor.lock()
+            && let Some(handle) = guard.take()
+        {
+            let _ = handle.shutdown.send(true);
+            handle.task.abort();
+        }
+    }
+}
+
+#[cfg(test)]
+mod network_health_monitor_tests {
+    use super::*;
+
+    fn snapshot_with_gateway(gateway: Ipv4Addr) -> std::io::Result<Vec<HostIface>> {
+        Ok(vec![
+            HostIface {
+                name: "lo0".into(),
+                addr: Ipv4Addr::LOCALHOST,
+                up: true,
+                loopback: true,
+            },
+            HostIface {
+                name: "vmenet0".into(),
+                addr: gateway,
+                up: true,
+                loopback: false,
+            },
+        ])
+    }
+
+    fn snapshot_without_gateway() -> std::io::Result<Vec<HostIface>> {
+        Ok(vec![HostIface {
+            name: "lo0".into(),
+            addr: Ipv4Addr::LOCALHOST,
+            up: true,
+            loopback: true,
+        }])
+    }
+
+    fn published_health(
+        published: &std::sync::Mutex<HashMap<SessionId, NetworkHealth>>,
+        id: SessionId,
+    ) -> Option<NetworkHealth> {
+        published.lock().unwrap().get(&id).copied()
+    }
+
+    #[test]
+    fn flips_to_unreachable_after_threshold_then_recovers() {
+        let id = SessionId::new();
+        let gateway = Ipv4Addr::new(192, 168, 252, 1);
+        let sessions = vec![(id, gateway)];
+        let mut debounces = HashMap::new();
+        let published = std::sync::Mutex::new(HashMap::new());
+
+        // A healthy tick publishes Reachable (Unknown -> Reachable is not islanding).
+        let events = network_health_tick(
+            &snapshot_with_gateway(gateway),
+            &sessions,
+            &mut debounces,
+            &published,
+        );
+        assert!(events.is_empty());
+        assert_eq!(
+            published_health(&published, id),
+            Some(NetworkHealth::Reachable)
+        );
+
+        // THRESHOLD-1 unreachable ticks: still Reachable, no event yet.
+        for _ in 0..(crate::agent_vm_lifecycle::NETWORK_HEALTH_FAILURE_THRESHOLD - 1) {
+            let events = network_health_tick(
+                &snapshot_without_gateway(),
+                &sessions,
+                &mut debounces,
+                &published,
+            );
+            assert!(events.is_empty());
+        }
+        assert_eq!(
+            published_health(&published, id),
+            Some(NetworkHealth::Reachable)
+        );
+
+        // The threshold-th unreachable tick: exactly one islanding event.
+        let events = network_health_tick(
+            &snapshot_without_gateway(),
+            &sessions,
+            &mut debounces,
+            &published,
+        );
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].0, id);
+        assert!(events[0].1.is_islanding());
+        assert_eq!(
+            published_health(&published, id),
+            Some(NetworkHealth::Unreachable)
+        );
+
+        // Recovery flips back to Reachable and emits no islanding event.
+        let events = network_health_tick(
+            &snapshot_with_gateway(gateway),
+            &sessions,
+            &mut debounces,
+            &published,
+        );
+        assert!(events.iter().all(|event| !event.1.is_islanding()));
+        assert_eq!(
+            published_health(&published, id),
+            Some(NetworkHealth::Reachable)
+        );
+    }
+
+    #[test]
+    fn indeterminate_snapshot_never_islands() {
+        let id = SessionId::new();
+        let gateway = Ipv4Addr::new(192, 168, 252, 1);
+        let sessions = vec![(id, gateway)];
+        let mut debounces = HashMap::new();
+        let published = std::sync::Mutex::new(HashMap::new());
+        let failed: std::io::Result<Vec<HostIface>> =
+            Err(std::io::Error::other("getifaddrs failed"));
+
+        for _ in 0..(crate::agent_vm_lifecycle::NETWORK_HEALTH_FAILURE_THRESHOLD + 2) {
+            let events = network_health_tick(&failed, &sessions, &mut debounces, &published);
+            assert!(events.is_empty());
+        }
+        // Health stays Unknown — a snapshot we could not take is not islanding.
+        assert_eq!(published_health(&published, id), None);
+    }
+
+    #[test]
+    fn prunes_sessions_that_disappear() {
+        let id = SessionId::new();
+        let gateway = Ipv4Addr::new(192, 168, 252, 1);
+        let mut debounces = HashMap::new();
+        let published = std::sync::Mutex::new(HashMap::new());
+
+        network_health_tick(
+            &snapshot_with_gateway(gateway),
+            &[(id, gateway)],
+            &mut debounces,
+            &published,
+        );
+        assert!(published.lock().unwrap().contains_key(&id));
+
+        // A tick that no longer lists the session prunes its state.
+        network_health_tick(
+            &snapshot_with_gateway(gateway),
+            &[],
+            &mut debounces,
+            &published,
+        );
+        assert!(!published.lock().unwrap().contains_key(&id));
+        assert!(debounces.is_empty());
+    }
+}
+
 impl AgentVmDaemon {
     pub fn new(config: AgentVmDaemonRuntimeConfig) -> Self {
         Self {
@@ -398,7 +678,34 @@ impl AgentVmDaemon {
             running: Mutex::new(HashMap::new()),
             subnet_allocation_lock: Mutex::new(()),
             session_locks: Mutex::new(HashMap::new()),
+            network_health: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            health_monitor: std::sync::Mutex::new(None),
         }
+    }
+
+    /// Spawn the daemon-lifetime network-health monitor if it is not already
+    /// running. Called on the first session start, when an [`AuditLog`] handle
+    /// is available. The monitor inspects only the host's own interfaces; it
+    /// never probes the untrusted guest.
+    fn ensure_network_health_monitor(&self, audit: Arc<AuditLog>) {
+        let mut guard = self.health_monitor.lock().unwrap();
+        if guard.is_some() {
+            return;
+        }
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let task = tokio::spawn(run_network_health_monitor(
+            self.config.lifecycle.state_store.clone(),
+            self.config.lifecycle.pool,
+            Arc::clone(&self.network_health),
+            audit,
+            NETWORK_HEALTH_PROBE_INTERVAL,
+            shutdown_rx,
+            host_interfaces,
+        ));
+        *guard = Some(NetworkHealthMonitorHandle {
+            shutdown: shutdown_tx,
+            task,
+        });
     }
 
     async fn session_lock_handle(&self, session_id: SessionId) -> Arc<Mutex<()>> {
@@ -841,6 +1148,19 @@ impl AgentVmDaemon {
                     .map(|url| url.as_str().to_string())
                     .collect(),
                 runtime_attached: running.contains_key(&state.session_id()),
+                // Health is only meaningful for a runtime-attached session (the
+                // monitor publishes it); a detached/persisted-only session is
+                // genuinely Unknown here.
+                network_health: if running.contains_key(&state.session_id()) {
+                    self.network_health
+                        .lock()
+                        .unwrap()
+                        .get(&state.session_id())
+                        .copied()
+                        .unwrap_or(NetworkHealth::Unknown)
+                } else {
+                    NetworkHealth::Unknown
+                },
             })
             .collect())
     }
@@ -963,6 +1283,9 @@ impl AgentVmDaemon {
 
         let running = prepared.spawn();
         self.running.lock().await.insert(session_id, running);
+        // Start the host-side network-health monitor (idempotent). Lazy here
+        // because it needs the audit handle, which arrives with the request.
+        self.ensure_network_health_monitor(Arc::clone(&state.audit));
         // Release broker-ready and wait for the guest's bootstrap sentinels for
         // EVERY session: both guest scripts run the egress gate and signal
         // bootstrap-ok/failed, so a gate failure (or workspace-init failure) is
