@@ -18,7 +18,7 @@
 //!   marker so the reconciliation DAO will accept the row as a valid
 //!   supersession predecessor (see comment on the
 //!   `git_push_approve_attempt_boot_observed` table in migration
-//!   0006), and leave the row itself in place for
+//!   0004), and leave the row itself in place for
 //!   `reject_blocker_for_push` to surface as `AttemptInFlight`.
 //!
 //! No filesystem state is consulted: the audit log is the system of

@@ -412,7 +412,7 @@ fn load_reconciliation_predecessor(
     // is written between TX2 and TX3 of approve_staged_push). Reconciling
     // such a row before the worker finishes would race the worker's
     // resolution write — see comment on the boot-observed table in
-    // migration 0006. Require the boot-observed marker, which only boot
+    // migration 0004. Require the boot-observed marker, which only boot
     // reconcile writes, before admitting an Uncertain predecessor.
     // Resolved(PostPatchFailure) rows are terminal: once TX3 commits the
     // live broker never touches them again, so no gate is needed.
@@ -1013,7 +1013,7 @@ impl AuditLog {
     /// daemon restart" claim that the reconciliation DAO requires
     /// before admitting an `Uncertain` predecessor — see comment on
     /// the `git_push_approve_attempt_boot_observed` table in
-    /// migration 0006.
+    /// migration 0004.
     ///
     /// Idempotent: a second call against the same `attempt_id` is a
     /// no-op (preserving the original `observed_at`), matching the
