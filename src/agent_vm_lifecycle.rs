@@ -213,6 +213,26 @@ pub enum Ipv6IsolationMode {
     Ipv4OnlyNoGuestIpv6,
 }
 
+/// Where the per-session vm_http broker runs.
+///
+/// `Host` (the default) spins the broker up in-process on the macOS host and the
+/// guest reaches it at the subnet gateway — today's behavior. `Vm` runs the
+/// broker in a dedicated trusted VM so the agent→broker `accept()` happens in
+/// Linux, working around the macOS `container`/vmnet defect where the host's
+/// `accept()` returns a not-connected socket for guest connections (see
+/// `vmnet-accept-bug-and-broker-vm-plan.md`).
+///
+/// This is a selectable placement, not a one-way migration: `Host` stays the
+/// default and the revert target, so when the vmnet bug is fixed the `Vm`
+/// machinery can be bypassed (and later deleted) by flipping this back.
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum BrokerPlacement {
+    #[default]
+    Host,
+    Vm,
+}
+
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentVmSessionStateStatus {

@@ -319,6 +319,7 @@ fn daemon_config_inner(
         subnet_index_max,
         state_store.clone(),
         Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6,
+        BrokerPlacement::Host,
         ContainerImage::new("alpine:latest").unwrap(),
         AgentVmResources::new(1, 512).unwrap(),
         AgentVmToolPaths::new(fake_tool, fake_tool, fake_tool),

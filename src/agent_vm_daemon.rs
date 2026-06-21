@@ -19,10 +19,11 @@ use crate::agent_run::{AgentPrompt, AgentRunId, CorrelationId};
 use crate::agent_vm_lifecycle::{
     AgentVmGuestEnvVar, AgentVmLifecycleConfigError, AgentVmResources, AgentVmSessionManagerError,
     AgentVmSessionPlan, AgentVmSessionState, AgentVmSessionStateError, AgentVmSessionStateStatus,
-    AgentVmSessionStateStore, AgentVmToolPaths, ContainerImage, HostIface, Ipv6IsolationMode,
-    NetworkHealth, ProbeDebounce, ProbeObservation, claim_agent_vm_session_subnet,
-    cleanup_managed_agent_vm_session, complete_agent_vm_session_start, evaluate_host_path,
-    host_interfaces, remove_managed_agent_vm_session_state,
+    AgentVmSessionStateStore, AgentVmToolPaths, BrokerPlacement, ContainerImage, HostIface,
+    Ipv6IsolationMode, NetworkHealth, ProbeDebounce, ProbeObservation,
+    claim_agent_vm_session_subnet, cleanup_managed_agent_vm_session,
+    complete_agent_vm_session_start, evaluate_host_path, host_interfaces,
+    remove_managed_agent_vm_session_state,
 };
 use crate::audit::{AgentRunAuditRecord, AgentVmNetworkHealthEventRecord, AuditError, AuditLog};
 use crate::core::{
@@ -104,6 +105,7 @@ pub struct AgentVmLifecycleRuntimeConfig {
     subnet_index_max: u16,
     state_store: AgentVmSessionStateStore,
     ipv6_mode: Ipv6IsolationMode,
+    broker_placement: BrokerPlacement,
     image: ContainerImage,
     resources: AgentVmResources,
     tools: AgentVmToolPaths,
@@ -311,6 +313,7 @@ impl AgentVmLifecycleRuntimeConfig {
         subnet_index_max: u16,
         state_store: AgentVmSessionStateStore,
         ipv6_mode: Ipv6IsolationMode,
+        broker_placement: BrokerPlacement,
         image: ContainerImage,
         resources: AgentVmResources,
         tools: AgentVmToolPaths,
@@ -329,10 +332,18 @@ impl AgentVmLifecycleRuntimeConfig {
             subnet_index_max,
             state_store,
             ipv6_mode,
+            broker_placement,
             image,
             resources,
             tools,
         })
+    }
+
+    /// Where the broker runs for this runtime. See [`BrokerPlacement`]. The
+    /// session-start path branches on this to decide whether to spin the broker
+    /// up in-process on the host (`Host`) or in a dedicated VM (`Vm`).
+    pub fn broker_placement(&self) -> BrokerPlacement {
+        self.broker_placement
     }
 
     pub fn pool(&self) -> AgentNetworkPool {

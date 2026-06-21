@@ -12,7 +12,8 @@ use crate::agent_vm_daemon::{
 };
 use crate::agent_vm_lifecycle::{
     AgentVmLifecycleConfigError, AgentVmResources, AgentVmSessionStateStore, AgentVmStateDirError,
-    AgentVmToolPaths, ContainerImage, Ipv6IsolationMode, default_agent_vm_state_dir,
+    AgentVmToolPaths, BrokerPlacement, ContainerImage, Ipv6IsolationMode,
+    default_agent_vm_state_dir,
 };
 use crate::core::{AgentNetworkPool, AgentVmConfigError, BrokerPortRange, Ipv4Cidr, Ipv6Cidr};
 use crate::flake_lock::{FlakeProvisionBounds, FlakeProvisionBoundsError};
@@ -351,6 +352,11 @@ pub struct AgentVmLifecycleConfig {
     #[serde(default)]
     pub state_dir: Option<PathBuf>,
     pub ipv6_mode: Ipv6IsolationMode,
+    /// Where the per-session broker runs; defaults to [`BrokerPlacement::Host`]
+    /// (today's in-process host broker). Set to `vm` to run the broker in a
+    /// dedicated VM, working around the macOS vmnet `accept()` defect.
+    #[serde(default)]
+    pub broker_placement: BrokerPlacement,
     pub image: String,
     pub cpus: u16,
     pub memory_mib: u32,
@@ -646,6 +652,7 @@ impl AgentVmLifecycleConfig {
             self.subnet_index_max,
             AgentVmSessionStateStore::new(state_dir),
             self.ipv6_mode,
+            self.broker_placement,
             ContainerImage::new(self.image.clone())?,
             AgentVmResources::new(self.cpus, self.memory_mib)?,
             AgentVmToolPaths::new(
@@ -1843,10 +1850,55 @@ mod tests {
             pf_helper: PathBuf::from("/usr/local/libexec/writ-agent-vm-pf-helper"),
             state_dir: Some(PathBuf::from("/var/folders/writ/agent-vm-state")),
             ipv6_mode: Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6,
+            broker_placement: BrokerPlacement::Host,
             image: "alpine:latest".into(),
             cpus: 1,
             memory_mib: 512,
         }
+    }
+
+    fn agent_vm_lifecycle_json(broker_placement_field: &str) -> String {
+        format!(
+            r#"{{
+                "ipv4_pool": "192.168.0.0/16",
+                "ipv6_pool": "fd83:b6f2:e57::/48",
+                "subnet_index_min": 252,
+                "subnet_index_max": 252,
+                "pf_helper": "/usr/local/libexec/writ-agent-vm-pf-helper",
+                "state_dir": "/tmp/writ-test-broker-placement-state",
+                "ipv6_mode": "ipv4_only_no_guest_ipv6",
+                {broker_placement_field}
+                "image": "alpine:latest",
+                "cpus": 1,
+                "memory_mib": 512
+            }}"#
+        )
+    }
+
+    #[test]
+    fn broker_placement_defaults_to_host_when_absent() {
+        let cfg: AgentVmLifecycleConfig =
+            serde_json::from_str(&agent_vm_lifecycle_json("")).unwrap();
+        assert_eq!(cfg.broker_placement, BrokerPlacement::Host);
+        let runtime = cfg.to_runtime_config().unwrap();
+        assert_eq!(runtime.broker_placement(), BrokerPlacement::Host);
+    }
+
+    #[test]
+    fn broker_placement_vm_parses_and_threads_to_runtime() {
+        let cfg: AgentVmLifecycleConfig =
+            serde_json::from_str(&agent_vm_lifecycle_json(r#""broker_placement": "vm","#)).unwrap();
+        assert_eq!(cfg.broker_placement, BrokerPlacement::Vm);
+        let runtime = cfg.to_runtime_config().unwrap();
+        assert_eq!(runtime.broker_placement(), BrokerPlacement::Vm);
+    }
+
+    #[test]
+    fn broker_placement_rejects_unknown_value() {
+        let err = serde_json::from_str::<AgentVmLifecycleConfig>(&agent_vm_lifecycle_json(
+            r#""broker_placement": "elsewhere","#,
+        ));
+        assert!(err.is_err(), "unknown broker_placement should be rejected");
     }
 
     #[test]
