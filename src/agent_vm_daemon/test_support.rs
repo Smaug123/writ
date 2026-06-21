@@ -293,7 +293,14 @@ pub(super) fn daemon_config_with_prewarm_dir(
     fake_tool: &Path,
     prewarm_dir: &Path,
 ) -> (AgentVmDaemonRuntimeConfig, AgentVmSessionStateStore) {
-    daemon_config_inner(dir, fake_tool, 252, 253, Some(prewarm_dir.to_path_buf()))
+    daemon_config_inner(
+        dir,
+        fake_tool,
+        252,
+        253,
+        Some(prewarm_dir.to_path_buf()),
+        BrokerPlacement::Host,
+    )
 }
 
 pub(super) fn daemon_config_with_subnet_range(
@@ -302,7 +309,22 @@ pub(super) fn daemon_config_with_subnet_range(
     subnet_index_min: u16,
     subnet_index_max: u16,
 ) -> (AgentVmDaemonRuntimeConfig, AgentVmSessionStateStore) {
-    daemon_config_inner(dir, fake_tool, subnet_index_min, subnet_index_max, None)
+    daemon_config_inner(
+        dir,
+        fake_tool,
+        subnet_index_min,
+        subnet_index_max,
+        None,
+        BrokerPlacement::Host,
+    )
+}
+
+pub(super) fn daemon_config_with_broker_placement(
+    dir: &Path,
+    fake_tool: &Path,
+    broker_placement: BrokerPlacement,
+) -> (AgentVmDaemonRuntimeConfig, AgentVmSessionStateStore) {
+    daemon_config_inner(dir, fake_tool, 252, 253, None, broker_placement)
 }
 
 fn daemon_config_inner(
@@ -311,6 +333,7 @@ fn daemon_config_inner(
     subnet_index_min: u16,
     subnet_index_max: u16,
     nix_prewarm_cache_dir: Option<PathBuf>,
+    broker_placement: BrokerPlacement,
 ) -> (AgentVmDaemonRuntimeConfig, AgentVmSessionStateStore) {
     let state_store = AgentVmSessionStateStore::new(dir.join("state"));
     let lifecycle = AgentVmLifecycleRuntimeConfig::new(
@@ -319,7 +342,7 @@ fn daemon_config_inner(
         subnet_index_max,
         state_store.clone(),
         Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6,
-        BrokerPlacement::Host,
+        broker_placement,
         ContainerImage::new("alpine:latest").unwrap(),
         AgentVmResources::new(1, 512).unwrap(),
         AgentVmToolPaths::new(fake_tool, fake_tool, fake_tool),
