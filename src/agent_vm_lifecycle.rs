@@ -220,7 +220,7 @@ pub enum Ipv6IsolationMode {
 /// broker in a dedicated trusted VM so the agent→broker `accept()` happens in
 /// Linux, working around the macOS `container`/vmnet defect where the host's
 /// `accept()` returns a not-connected socket for guest connections (see
-/// `vmnet-accept-bug-and-broker-vm-plan.md`).
+/// `docs/vmnet-accept-bug-and-broker-vm-plan.md`).
 ///
 /// This is a selectable placement, not a one-way migration: `Host` stays the
 /// default and the revert target, so when the vmnet bug is fixed the `Vm`

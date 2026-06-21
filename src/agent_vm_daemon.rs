@@ -1189,7 +1189,7 @@ impl AgentVmDaemon {
         guest_command: Vec<String>,
         agent_runs: Option<VmHttpAgentRunService<S>>,
     ) -> Result<AgentVmStarted, AgentVmDaemonError> {
-        // Broker placement seam (see vmnet-accept-bug-and-broker-vm-plan.md). The
+        // Broker placement seam (see docs/vmnet-accept-bug-and-broker-vm-plan.md). The
         // `Vm` arm (broker in a dedicated VM) is not implemented yet; fail fast
         // rather than silently running the host path, which would not work around
         // the macOS vmnet accept() defect the `vm` setting exists to dodge.

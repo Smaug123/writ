@@ -54,7 +54,7 @@ The broker binds `0.0.0.0:<port>` on the host. The guest connects to `192.168.25
 
 4. **Ground truth via raw syscalls, bypassing tokio.** A `libc::recv(MSG_PEEK|MSG_DONTWAIT)` on the accepted fd returns **`ENOTCONN` (errno 57)** continuously for 300 ms; `getpeername` returns **`EINVAL`**. Probed **synchronously the instant `accept()` returns** (before any task scheduling): the fd is *already* not‑connected, while `accept()` simultaneously returned a valid peer address (`192.168.252.2:…`). So a not‑connected socket comes straight out of `accept()`.
 
-5. **Pure‑C minimal repro** (no Rust/tokio/writ/PF, stock `container` default network + stock `alpine`): a blocking‑`accept()` C server on the host; an `alpine` container client over vmnet. In one server process: the loopback control connection is healthy (`getpeername=OK recv=DATA`), and every container/vmnet connection is `getpeername=EINVAL, recv=ENOTCONN`. Deterministic (100% of vmnet connections). See `../vmnet-accept-repro/` (`server.c`, `run.sh`, `README.md`).
+5. **Pure‑C minimal repro** (no Rust/tokio/writ/PF, stock `container` default network + stock `alpine`): a blocking‑`accept()` C server on the host; an `alpine` container client over vmnet. In one server process: the loopback control connection is healthy (`getpeername=OK recv=DATA`), and every container/vmnet connection is `getpeername=EINVAL, recv=ENOTCONN`. Deterministic (100% of vmnet connections). See `../../vmnet-accept-repro/` (`server.c`, `run.sh`, `README.md`).
 
 ### 4.2 Ruled out **[verified]**
 
@@ -171,5 +171,5 @@ Both VMs on one NAT network; host PF pins the agent to "broker‑VM‑IP only." 
 4. Is there a smaller transport fix we've missed (the broker channel is the only thing that must cross the guest↔host boundary)?
 
 ## 11. Reproduction & artifacts
-- Minimal C repro: `../vmnet-accept-repro/` (run `./run.sh`; needs `container system start` + `alpine:latest`).
+- Minimal C repro: `../../vmnet-accept-repro/` (run `./run.sh`; needs `container system start` + `alpine:latest`).
 - Workaround: debug `writd` (`cargo build --bin writd && ./target/debug/writd`).
