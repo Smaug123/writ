@@ -37,10 +37,11 @@ pub const BROKER_VM_SESSION_DIR: &str = "/writ/session";
 /// Guest mount target for the host's file secret store (read-only: the broker
 /// only reads it, via `FileSecretStore::open`).
 pub const BROKER_VM_SECRETS_DIR: &str = "/writ/secrets";
-/// Guest mount target for the durable audit directory (read-write).
+/// Guest mount target for the durable audit directory (read-write). The audit
+/// DB *file* keeps the host's basename within this directory (see
+/// [`broker_config_json`]), so the broker opens the same SQLite file the host
+/// created the session row in.
 pub const BROKER_VM_AUDIT_DIR: &str = "/writ/audit";
-/// Guest path of the audit DB inside the mounted audit directory.
-pub const BROKER_VM_AUDIT_DB: &str = "/writ/audit/audit.db";
 /// Guest working root for the broker (on tmpfs inside the VM): clone scratch,
 /// bundle staging, the local nix-cache. Ephemeral per VM lifetime.
 pub const BROKER_VM_WORK_ROOT: &str = "/tmp/writ-broker-work";
@@ -348,6 +349,20 @@ pub fn broker_config_json(
         serde_json::from_str(host_config_json).map_err(BrokerConfigError::Json)?;
     let obj = config.as_object_mut().ok_or(BrokerConfigError::NotObject)?;
 
+    // The broker opens the host's audit DB through the mounted audit directory.
+    // Keep the host's filename (the operator may override `audit_db` to a
+    // non-`audit.db` basename) so the broker opens the *same* SQLite file the
+    // host created the open session row in, rather than a sibling. Read before
+    // overwriting `audit_db` below.
+    let audit_basename = obj
+        .get("audit_db")
+        .and_then(serde_json::Value::as_str)
+        .map(Path::new)
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
+        .unwrap_or("audit.db")
+        .to_string();
+
     // Secrets and audit move to their mounted guest locations.
     obj.insert(
         "secret_store".to_string(),
@@ -355,7 +370,7 @@ pub fn broker_config_json(
     );
     obj.insert(
         "audit_db".to_string(),
-        serde_json::Value::String(BROKER_VM_AUDIT_DB.to_string()),
+        serde_json::Value::String(format!("{BROKER_VM_AUDIT_DIR}/{audit_basename}")),
     );
 
     let vm_http = obj
@@ -855,7 +870,7 @@ mod tests {
         }
         assert_eq!(
             config.audit_db.as_deref(),
-            Some(Path::new(BROKER_VM_AUDIT_DB))
+            Some(Path::new("/writ/audit/audit.db"))
         );
 
         // The vm_http config is one the broker accepts (the strong oracle), the
@@ -876,6 +891,23 @@ mod tests {
         assert!(
             runtime.flake_provision().is_none(),
             "flake provisioning must be disabled in the v1 broker"
+        );
+    }
+
+    #[test]
+    fn broker_config_preserves_a_custom_host_audit_db_basename() {
+        use crate::config::DaemonConfig;
+        // The operator overrode audit_db to a non-`audit.db` basename; the broker
+        // mounts the audit *directory*, so it must open the same file name.
+        let host = host_config_json().replace(
+            "/Users/me/Library/writ/audit.db",
+            "/Users/me/Library/writ/sessions.sqlite",
+        );
+        let json = broker_config_json(&host, BrokerPort::new(18080).unwrap(), "/tmp/x").unwrap();
+        let config: DaemonConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            config.audit_db.as_deref(),
+            Some(Path::new("/writ/audit/sessions.sqlite"))
         );
     }
 
