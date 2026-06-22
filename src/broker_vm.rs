@@ -340,28 +340,28 @@ const BROKER_DROPPED_VM_HTTP_KEYS: &[&str] = &[
 /// `work_root` is a parameter (not the [`BROKER_VM_WORK_ROOT`] constant) so tests
 /// can point `vm_http.to_runtime_config()` — the oracle that this config is one
 /// the broker accepts — at a temp dir instead of materialising the guest path.
+///
+/// `host_audit_db` is the host's **effective** audit DB path (after the
+/// `--audit-db` CLI override and the default are applied — *not* just the config
+/// field), so the broker opens the same SQLite file through the mounted audit
+/// directory that the host created the open session row in.
 pub fn broker_config_json(
     host_config_json: &str,
     broker_port: BrokerPort,
     work_root: &str,
+    host_audit_db: &Path,
 ) -> Result<String, BrokerConfigError> {
     let mut config: serde_json::Value =
         serde_json::from_str(host_config_json).map_err(BrokerConfigError::Json)?;
     let obj = config.as_object_mut().ok_or(BrokerConfigError::NotObject)?;
 
-    // The broker opens the host's audit DB through the mounted audit directory.
-    // Keep the host's filename (the operator may override `audit_db` to a
-    // non-`audit.db` basename) so the broker opens the *same* SQLite file the
-    // host created the open session row in, rather than a sibling. Read before
-    // overwriting `audit_db` below.
-    let audit_basename = obj
-        .get("audit_db")
-        .and_then(serde_json::Value::as_str)
-        .map(Path::new)
-        .and_then(Path::file_name)
+    // The broker opens the host's audit DB through the mounted audit directory,
+    // keeping the host's filename so it is the *same* SQLite file (a sibling
+    // would miss the open session row). The directory is mounted by the executor.
+    let audit_basename = host_audit_db
+        .file_name()
         .and_then(|name| name.to_str())
-        .unwrap_or("audit.db")
-        .to_string();
+        .unwrap_or("audit.db");
 
     // Secrets and audit move to their mounted guest locations.
     obj.insert(
@@ -857,6 +857,7 @@ mod tests {
             &host_config_json(),
             BrokerPort::new(18080).unwrap(),
             work_root.to_str().unwrap(),
+            Path::new("/Users/me/Library/writ/audit.db"),
         )
         .unwrap();
 
@@ -895,15 +896,19 @@ mod tests {
     }
 
     #[test]
-    fn broker_config_preserves_a_custom_host_audit_db_basename() {
+    fn broker_config_uses_the_effective_audit_db_basename_over_the_config_field() {
         use crate::config::DaemonConfig;
-        // The operator overrode audit_db to a non-`audit.db` basename; the broker
-        // mounts the audit *directory*, so it must open the same file name.
-        let host = host_config_json().replace(
-            "/Users/me/Library/writ/audit.db",
-            "/Users/me/Library/writ/sessions.sqlite",
-        );
-        let json = broker_config_json(&host, BrokerPort::new(18080).unwrap(), "/tmp/x").unwrap();
+        // The host config field says `audit.db`, but the *effective* audit DB
+        // (e.g. selected via `--audit-db`) has a different basename. The broker
+        // must follow the effective path — the file the host opened the session
+        // in — not the stale config field.
+        let json = broker_config_json(
+            &host_config_json(),
+            BrokerPort::new(18080).unwrap(),
+            "/tmp/x",
+            Path::new("/var/run/writ/sessions.sqlite"),
+        )
+        .unwrap();
         let config: DaemonConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(
             config.audit_db.as_deref(),
@@ -919,7 +924,12 @@ mod tests {
             "secret_store": { "type": "keyring", "service": "writ" }
         }"#;
         assert!(matches!(
-            broker_config_json(no_vm_http, BrokerPort::new(18080).unwrap(), "/tmp/x"),
+            broker_config_json(
+                no_vm_http,
+                BrokerPort::new(18080).unwrap(),
+                "/tmp/x",
+                Path::new("/var/lib/writ/audit.db"),
+            ),
             Err(BrokerConfigError::MissingVmHttp)
         ));
     }
