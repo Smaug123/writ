@@ -107,6 +107,10 @@ pub struct AgentVmLifecycleRuntimeConfig {
     ipv6_mode: Ipv6IsolationMode,
     broker_placement: BrokerPlacement,
     image: ContainerImage,
+    /// Image for the dedicated broker VM, required only when
+    /// `broker_placement == Vm` (the `new` constructor enforces this). `None`
+    /// for the host-broker path, which runs no second VM.
+    broker_image: Option<ContainerImage>,
     resources: AgentVmResources,
     tools: AgentVmToolPaths,
 }
@@ -157,6 +161,10 @@ pub enum AgentVmDaemonRuntimeConfigError {
 pub enum AgentVmLifecycleRuntimeConfigError {
     #[error("agent VM subnet index range is empty: minimum {min} is greater than maximum {max}")]
     EmptySubnetIndexRange { min: u16, max: u16 },
+    #[error(
+        "broker_placement = vm requires an agent_vm.lifecycle.broker_image (the dedicated broker VM image)"
+    )]
+    BrokerImageRequiredForVmPlacement,
     #[error(transparent)]
     AgentVm(#[from] AgentVmConfigError),
 }
@@ -320,6 +328,7 @@ impl AgentVmLifecycleRuntimeConfig {
         ipv6_mode: Ipv6IsolationMode,
         broker_placement: BrokerPlacement,
         image: ContainerImage,
+        broker_image: Option<ContainerImage>,
         resources: AgentVmResources,
         tools: AgentVmToolPaths,
     ) -> Result<Self, AgentVmLifecycleRuntimeConfigError> {
@@ -328,6 +337,12 @@ impl AgentVmLifecycleRuntimeConfig {
                 min: subnet_index_min,
                 max: subnet_index_max,
             });
+        }
+        // The `vm` broker arm launches a second VM from `broker_image`; without
+        // it there is nothing to run, so reject the config up front rather than
+        // failing a session start later.
+        if broker_placement == BrokerPlacement::Vm && broker_image.is_none() {
+            return Err(AgentVmLifecycleRuntimeConfigError::BrokerImageRequiredForVmPlacement);
         }
         pool.allocate(subnet_index_min)?;
         pool.allocate(subnet_index_max)?;
@@ -339,6 +354,7 @@ impl AgentVmLifecycleRuntimeConfig {
             ipv6_mode,
             broker_placement,
             image,
+            broker_image,
             resources,
             tools,
         })
@@ -349,6 +365,12 @@ impl AgentVmLifecycleRuntimeConfig {
     /// up in-process on the host (`Host`) or in a dedicated VM (`Vm`).
     pub fn broker_placement(&self) -> BrokerPlacement {
         self.broker_placement
+    }
+
+    /// The dedicated broker VM image; `Some` exactly when
+    /// `broker_placement == Vm` (enforced by [`Self::new`]).
+    pub fn broker_image(&self) -> Option<&ContainerImage> {
+        self.broker_image.as_ref()
     }
 
     pub fn pool(&self) -> AgentNetworkPool {

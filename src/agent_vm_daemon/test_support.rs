@@ -336,6 +336,12 @@ fn daemon_config_inner(
     broker_placement: BrokerPlacement,
 ) -> (AgentVmDaemonRuntimeConfig, AgentVmSessionStateStore) {
     let state_store = AgentVmSessionStateStore::new(dir.join("state"));
+    // The vm placement requires a broker image; supply one so vm-placement
+    // configs construct (the start path then branches on placement).
+    let broker_image = match broker_placement {
+        BrokerPlacement::Host => None,
+        BrokerPlacement::Vm => Some(ContainerImage::new("writ-broker-vm:latest").unwrap()),
+    };
     let lifecycle = AgentVmLifecycleRuntimeConfig::new(
         agent_vm_pool(),
         subnet_index_min,
@@ -344,6 +350,7 @@ fn daemon_config_inner(
         Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6,
         broker_placement,
         ContainerImage::new("alpine:latest").unwrap(),
+        broker_image,
         AgentVmResources::new(1, 512).unwrap(),
         AgentVmToolPaths::new(fake_tool, fake_tool, fake_tool),
     )

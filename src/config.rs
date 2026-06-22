@@ -358,6 +358,10 @@ pub struct AgentVmLifecycleConfig {
     #[serde(default)]
     pub broker_placement: BrokerPlacement,
     pub image: String,
+    /// Image for the dedicated broker VM. Required when `broker_placement = vm`
+    /// (validated in [`Self::to_runtime_config`]); ignored for the host broker.
+    #[serde(default)]
+    pub broker_image: Option<String>,
     pub cpus: u16,
     pub memory_mib: u32,
 }
@@ -646,6 +650,11 @@ impl AgentVmLifecycleConfig {
             Some(path) => path.clone(),
             None => default_agent_vm_state_dir()?,
         };
+        let broker_image = self
+            .broker_image
+            .as_ref()
+            .map(|image| ContainerImage::new(image.clone()))
+            .transpose()?;
         Ok(AgentVmLifecycleRuntimeConfig::new(
             pool,
             self.subnet_index_min,
@@ -654,6 +663,7 @@ impl AgentVmLifecycleConfig {
             self.ipv6_mode,
             self.broker_placement,
             ContainerImage::new(self.image.clone())?,
+            broker_image,
             AgentVmResources::new(self.cpus, self.memory_mib)?,
             AgentVmToolPaths::new(
                 self.container.clone(),
@@ -1852,6 +1862,7 @@ mod tests {
             ipv6_mode: Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6,
             broker_placement: BrokerPlacement::Host,
             image: "alpine:latest".into(),
+            broker_image: None,
             cpus: 1,
             memory_mib: 512,
         }
@@ -1886,11 +1897,37 @@ mod tests {
 
     #[test]
     fn broker_placement_vm_parses_and_threads_to_runtime() {
-        let cfg: AgentVmLifecycleConfig =
-            serde_json::from_str(&agent_vm_lifecycle_json(r#""broker_placement": "vm","#)).unwrap();
+        let cfg: AgentVmLifecycleConfig = serde_json::from_str(&agent_vm_lifecycle_json(
+            r#""broker_placement": "vm", "broker_image": "writ-broker-vm:latest","#,
+        ))
+        .unwrap();
         assert_eq!(cfg.broker_placement, BrokerPlacement::Vm);
         let runtime = cfg.to_runtime_config().unwrap();
         assert_eq!(runtime.broker_placement(), BrokerPlacement::Vm);
+        assert_eq!(
+            runtime.broker_image().map(ContainerImage::as_str),
+            Some("writ-broker-vm:latest")
+        );
+    }
+
+    #[test]
+    fn broker_placement_vm_without_broker_image_is_rejected() {
+        let cfg: AgentVmLifecycleConfig =
+            serde_json::from_str(&agent_vm_lifecycle_json(r#""broker_placement": "vm","#)).unwrap();
+        assert!(matches!(
+            cfg.to_runtime_config(),
+            Err(AgentVmDaemonConfigError::LifecycleRuntime(
+                AgentVmLifecycleRuntimeConfigError::BrokerImageRequiredForVmPlacement
+            ))
+        ));
+    }
+
+    #[test]
+    fn host_placement_leaves_broker_image_unset() {
+        let cfg: AgentVmLifecycleConfig =
+            serde_json::from_str(&agent_vm_lifecycle_json("")).unwrap();
+        let runtime = cfg.to_runtime_config().unwrap();
+        assert!(runtime.broker_image().is_none());
     }
 
     #[test]
