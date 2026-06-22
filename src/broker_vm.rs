@@ -29,9 +29,9 @@ use std::path::{Path, PathBuf};
 use crate::agent_vm_lifecycle::{AgentVmResources, ContainerImage, ProcessInvocation};
 use crate::broker_session::BrokerSessionSpec;
 use crate::config::DaemonConfig;
-use crate::core::{BrokerPort, Ipv4Cidr, SessionId};
+use crate::core::{AgentKind, BrokerPort, Ipv4Cidr, SessionId};
 use crate::secret::{FileSecretStore, SecretError, SecretKey, SecretStore};
-use crate::vm_http::VmHttpBearerToken;
+use crate::vm_http::{VmHttpBearerToken, VmHttpOpenAiProxyAuthKind};
 
 /// Guest mount target for the per-session material directory (config, session
 /// spec, bearer token written by the host; ready file written by the broker).
@@ -461,12 +461,30 @@ pub enum BrokerSecretExportError {
     },
 }
 
-/// The secret-store keys the broker VM needs to do its job: each GitHub App's
-/// private key (for token minting) and each configured proxy's auth secret.
-/// Deduplicated, since an operator may reuse one key across apps/proxies. The
-/// broker's v1 surface has no agent-run/git-push route, so the signing key is
-/// intentionally excluded.
-pub fn broker_secret_keys(config: &DaemonConfig) -> Vec<SecretKey> {
+#[derive(Debug, thiserror::Error, Eq, PartialEq)]
+pub enum BrokerSecretSelectionError {
+    #[error(
+        "the OpenAI proxy uses chatgpt_oauth, which refreshes its token by writing back to the \
+         secret store; a broker VM mounts secrets read-only and the export is ephemeral, so the \
+         refresh would be lost. Use authorization_bearer, or run broker_placement = host."
+    )]
+    ChatgptOauthUnsupported,
+}
+
+/// The secret-store keys a broker VM needs for a session with this `agent_kind`:
+/// that agent's GitHub App private key (the minter selects the app by the
+/// session's `agent_kind`, so only that one is reachable) and that agent's proxy
+/// auth secret (claude → `claude_proxy`, codex → `openai_proxy`). Scoped to the
+/// session so unrelated agents' keys never enter the VM, and a missing *other*
+/// agent's key can't block this session.
+///
+/// The signing key is excluded — the v1 broker has no agent-run/git-push route.
+/// `chatgpt_oauth` is rejected: it mutates the secret store at runtime, which the
+/// read-only ephemeral export cannot support (see [`BrokerSecretSelectionError`]).
+pub fn broker_secret_keys(
+    config: &DaemonConfig,
+    agent_kind: AgentKind,
+) -> Result<Vec<SecretKey>, BrokerSecretSelectionError> {
     let mut keys = Vec::new();
     let mut seen = BTreeSet::new();
     let mut push = |key: &SecretKey, keys: &mut Vec<SecretKey>| {
@@ -474,18 +492,30 @@ pub fn broker_secret_keys(config: &DaemonConfig) -> Vec<SecretKey> {
             keys.push(key.clone());
         }
     };
-    for app in config.github_apps.agent_apps().values() {
+    // Only the app for this session's agent_kind can ever mint.
+    if let Some(app) = config.github_apps.agent_apps().get(&agent_kind) {
         push(&app.private_key_secret, &mut keys);
     }
+    // Each agent talks to exactly one upstream, hence one proxy.
     if let Some(agent_vm) = &config.agent_vm {
-        if let Some(claude) = &agent_vm.vm_http.claude_proxy {
-            push(&claude.auth_secret, &mut keys);
-        }
-        if let Some(openai) = &agent_vm.vm_http.openai_proxy {
-            push(&openai.auth_secret, &mut keys);
+        let vm_http = &agent_vm.vm_http;
+        match agent_kind {
+            AgentKind::Claude => {
+                if let Some(claude) = &vm_http.claude_proxy {
+                    push(&claude.auth_secret, &mut keys);
+                }
+            }
+            AgentKind::Codex => {
+                if let Some(openai) = &vm_http.openai_proxy {
+                    if openai.auth_kind == VmHttpOpenAiProxyAuthKind::ChatgptOauth {
+                        return Err(BrokerSecretSelectionError::ChatgptOauthUnsupported);
+                    }
+                    push(&openai.auth_secret, &mut keys);
+                }
+            }
         }
     }
-    keys
+    Ok(keys)
 }
 
 /// Inject the broker's secrets into a fresh **file** secret store at `dest_dir`,
@@ -1094,9 +1124,9 @@ mod tests {
         let json = r#"{
             "github_apps": {
                 "claude": { "app_id": 1, "installation_id": 2,
-                            "installation_owner": "o", "private_key_secret": "shared-pk" },
+                            "installation_owner": "o", "private_key_secret": "claude-pk" },
                 "codex":  { "app_id": 3, "installation_id": 4,
-                            "installation_owner": "o", "private_key_secret": "shared-pk" }
+                            "installation_owner": "o", "private_key_secret": "codex-pk" }
             },
             "policy": { "default_ttl": 600, "writable_repos": [] },
             "secret_store": { "type": "keyring", "service": "writ" },
@@ -1128,35 +1158,94 @@ mod tests {
         serde_json::from_str(json).unwrap()
     }
 
-    #[test]
-    fn broker_secret_keys_collects_github_and_proxy_secrets_deduped() {
-        let keys: Vec<String> = broker_secret_keys(&secret_config())
+    fn secret_strs(config: &crate::config::DaemonConfig, agent: AgentKind) -> Vec<String> {
+        broker_secret_keys(config, agent)
+            .unwrap()
             .iter()
             .map(|k| k.as_str().to_string())
-            .collect();
-        // Two apps share `shared-pk` (deduped to one), then the proxy secret.
-        assert_eq!(keys, vec!["shared-pk", "anthropic-api-key"]);
+            .collect()
+    }
+
+    #[test]
+    fn broker_secret_keys_for_claude_selects_only_the_claude_app_and_proxy() {
+        // Claude session: its app key + the claude proxy secret; never codex's
+        // app key (the broker can't mint with it).
+        assert_eq!(
+            secret_strs(&secret_config(), AgentKind::Claude),
+            vec!["claude-pk", "anthropic-api-key"]
+        );
+    }
+
+    #[test]
+    fn broker_secret_keys_for_codex_selects_only_the_codex_app() {
+        // Codex session: its app key only (secret_config has no openai proxy).
+        // Crucially excludes claude-pk and the anthropic proxy secret.
+        assert_eq!(
+            secret_strs(&secret_config(), AgentKind::Codex),
+            vec!["codex-pk"]
+        );
+    }
+
+    #[test]
+    fn broker_secret_keys_rejects_chatgpt_oauth_for_vm_brokers() {
+        // A codex session whose openai proxy refreshes its token by writing the
+        // secret store can't be served by a read-only ephemeral export.
+        let json = r#"{
+            "github_apps": { "codex": { "app_id": 1, "installation_id": 2,
+                "installation_owner": "o", "private_key_secret": "codex-pk" } },
+            "policy": { "default_ttl": 600, "writable_repos": [] },
+            "secret_store": { "type": "keyring", "service": "writ" },
+            "agent_vm": {
+                "lifecycle": {
+                    "ipv4_pool": "192.168.0.0/16", "ipv6_pool": "fd83:b6f2:e57::/48",
+                    "subnet_index_min": 252, "subnet_index_max": 253,
+                    "pf_helper": "/usr/local/libexec/writ-agent-vm-pf-helper",
+                    "ipv6_mode": "ipv4_only_no_guest_ipv6",
+                    "image": "writ-agent-vm-guest:latest", "cpus": 1, "memory_mib": 512
+                },
+                "vm_http": {
+                    "bind_addr": "0.0.0.0", "broker_port_min": 18080, "broker_port_max": 18090,
+                    "git_clone_base_url": "https://github.com",
+                    "askpass_program": "/usr/local/libexec/writ-git-askpass",
+                    "work_root": "/tmp/wr", "clone_timeout_secs": 30, "max_bundle_bytes": 1048576,
+                    "nix_cache_url": "https://cache.nixos.org",
+                    "nix_cache_trusted_public_keys": [],
+                    "nix_cache_max_metadata_bytes": 1048576, "nix_cache_max_nar_bytes": 67108864,
+                    "openai_proxy": {
+                        "upstream_base_url": "https://chatgpt.com/backend-api/codex",
+                        "auth_secret": "chatgpt-bundle", "auth_kind": "chatgpt_oauth",
+                        "timeout_secs": 60, "max_request_bytes": 2097152,
+                        "max_response_bytes": 8388608
+                    }
+                }
+            }
+        }"#;
+        let config: crate::config::DaemonConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            broker_secret_keys(&config, AgentKind::Codex),
+            Err(BrokerSecretSelectionError::ChatgptOauthUnsupported)
+        );
     }
 
     #[test]
     fn export_broker_secrets_copies_only_the_needed_keys() {
         let host_dir = tempfile::tempdir().unwrap();
         let host = FileSecretStore::create_or_open(host_dir.path().join("host")).unwrap();
-        host.put(&SecretKey::new("shared-pk").unwrap(), "PEM-DATA")
+        host.put(&SecretKey::new("claude-pk").unwrap(), "PEM-DATA")
             .unwrap();
         host.put(&SecretKey::new("anthropic-api-key").unwrap(), "sk-abc")
             .unwrap();
-        host.put(&SecretKey::new("unrelated").unwrap(), "nope")
+        host.put(&SecretKey::new("codex-pk").unwrap(), "other")
             .unwrap();
 
         let dest_dir = tempfile::tempdir().unwrap();
         let dest_store = dest_dir.path().join("secrets");
-        let keys = broker_secret_keys(&secret_config());
+        let keys = broker_secret_keys(&secret_config(), AgentKind::Claude).unwrap();
         export_broker_secrets(&host, &keys, &dest_store).unwrap();
 
         let injected = FileSecretStore::open(dest_store).unwrap();
         assert_eq!(
-            injected.get(&SecretKey::new("shared-pk").unwrap()).unwrap(),
+            injected.get(&SecretKey::new("claude-pk").unwrap()).unwrap(),
             Some("PEM-DATA".to_string())
         );
         assert_eq!(
@@ -1165,9 +1254,9 @@ mod tests {
                 .unwrap(),
             Some("sk-abc".to_string())
         );
-        // Secrets the broker does not need are not copied into the VM.
+        // The other agent's app key is never copied into a Claude session's VM.
         assert_eq!(
-            injected.get(&SecretKey::new("unrelated").unwrap()).unwrap(),
+            injected.get(&SecretKey::new("codex-pk").unwrap()).unwrap(),
             None
         );
     }
@@ -1176,13 +1265,13 @@ mod tests {
     fn export_broker_secrets_fails_on_a_missing_secret_and_leaves_no_store() {
         let host_dir = tempfile::tempdir().unwrap();
         let host = FileSecretStore::create_or_open(host_dir.path().join("host")).unwrap();
-        // host is missing `shared-pk` and `anthropic-api-key`.
+        // host is missing `claude-pk` and `anthropic-api-key`.
         let dest_dir = tempfile::tempdir().unwrap();
         let dest = dest_dir.path().join("secrets");
-        let keys = broker_secret_keys(&secret_config());
+        let keys = broker_secret_keys(&secret_config(), AgentKind::Claude).unwrap();
         assert!(matches!(
             export_broker_secrets(&host, &keys, &dest),
-            Err(BrokerSecretExportError::Missing(key)) if key == "shared-pk"
+            Err(BrokerSecretExportError::Missing(key)) if key == "claude-pk"
         ));
         // A failed export must not leave a (partial) store to be mounted.
         assert!(!dest.exists(), "partial store must be removed on failure");
@@ -1192,7 +1281,7 @@ mod tests {
     fn export_broker_secrets_clears_a_reused_store_of_stale_secrets() {
         let host_dir = tempfile::tempdir().unwrap();
         let host = FileSecretStore::create_or_open(host_dir.path().join("host")).unwrap();
-        host.put(&SecretKey::new("shared-pk").unwrap(), "PEM-DATA")
+        host.put(&SecretKey::new("claude-pk").unwrap(), "PEM-DATA")
             .unwrap();
         host.put(&SecretKey::new("anthropic-api-key").unwrap(), "sk-abc")
             .unwrap();
@@ -1207,7 +1296,8 @@ mod tests {
                 .unwrap();
         }
 
-        export_broker_secrets(&host, &broker_secret_keys(&secret_config()), &dest).unwrap();
+        let keys = broker_secret_keys(&secret_config(), AgentKind::Claude).unwrap();
+        export_broker_secrets(&host, &keys, &dest).unwrap();
 
         let injected = FileSecretStore::open(dest).unwrap();
         assert_eq!(
@@ -1216,7 +1306,7 @@ mod tests {
             "stale secret from a prior attempt must be cleared"
         );
         assert_eq!(
-            injected.get(&SecretKey::new("shared-pk").unwrap()).unwrap(),
+            injected.get(&SecretKey::new("claude-pk").unwrap()).unwrap(),
             Some("PEM-DATA".to_string())
         );
     }
