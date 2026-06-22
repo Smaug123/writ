@@ -121,6 +121,10 @@ pub struct AgentVmSessionPlan {
     broker_ports: BrokerPorts,
     broker_port_range: BrokerPortRange,
     ipv6_mode: Ipv6IsolationMode,
+    /// Where the session's broker runs. In `Vm` mode the broker arm owns the
+    /// shared network (created/inspected before the agent) and there is no host
+    /// PF, so the agent's start sequence and failure-cleanup omit those steps.
+    broker_placement: BrokerPlacement,
     image: ContainerImage,
     guest_env: Vec<AgentVmGuestEnvVar>,
     guest_command: Vec<String>,
@@ -456,6 +460,8 @@ impl AgentVmSessionPlan {
         resources: AgentVmResources,
         tools: AgentVmToolPaths,
     ) -> Result<Self, AgentVmLifecycleConfigError> {
+        // The convenience constructor (no guest env) is host-mode only; the vm
+        // arm always supplies guest env via `new_with_guest_env`.
         Self::new_with_guest_env(
             session_id,
             pool,
@@ -463,6 +469,7 @@ impl AgentVmSessionPlan {
             broker_ports,
             broker_port_range,
             ipv6_mode,
+            BrokerPlacement::Host,
             image,
             Vec::new(),
             guest_command,
@@ -479,6 +486,7 @@ impl AgentVmSessionPlan {
         broker_ports: BrokerPorts,
         broker_port_range: BrokerPortRange,
         ipv6_mode: Ipv6IsolationMode,
+        broker_placement: BrokerPlacement,
         image: ContainerImage,
         guest_env: Vec<AgentVmGuestEnvVar>,
         guest_command: Vec<String>,
@@ -499,6 +507,7 @@ impl AgentVmSessionPlan {
             broker_ports,
             broker_port_range,
             ipv6_mode,
+            broker_placement,
             image,
             guest_env,
             guest_command,
@@ -548,12 +557,23 @@ impl AgentVmSessionPlan {
     /// [`start_agent_vm_session`] writes the real 0600 env file immediately
     /// before invoking `container run`.
     pub fn start_steps(&self) -> Vec<AgentVmStartStep> {
-        let mut steps = vec![
-            AgentVmStartStep::CreateNetwork(self.create_network_invocation()),
-            AgentVmStartStep::InspectAndValidateNetwork(self.inspect_network_invocation()),
-            AgentVmStartStep::InstallFirewall(self.install_firewall_invocation()),
-            AgentVmStartStep::StartVm(self.start_vm_invocation()),
-        ];
+        let mut steps = Vec::new();
+        // Host mode provisions the agent's own network and host PF. The vm arm
+        // instead shares a network the broker arm has already created, inspected,
+        // and put the broker on, and relies on topology isolation (no host PF) —
+        // so the agent start skips network create/inspect and firewall install.
+        if self.broker_placement == BrokerPlacement::Host {
+            steps.push(AgentVmStartStep::CreateNetwork(
+                self.create_network_invocation(),
+            ));
+            steps.push(AgentVmStartStep::InspectAndValidateNetwork(
+                self.inspect_network_invocation(),
+            ));
+            steps.push(AgentVmStartStep::InstallFirewall(
+                self.install_firewall_invocation(),
+            ));
+        }
+        steps.push(AgentVmStartStep::StartVm(self.start_vm_invocation()));
         if self.ipv6_mode == Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6 {
             // Enforce-then-verify the no-guest-IPv6 posture in one guest exec
             // (the script disables IPv6 in the guest kernel before reporting;
@@ -587,7 +607,15 @@ impl AgentVmSessionPlan {
         match completed {
             CompletedStartStep::None => Vec::new(),
             CompletedStartStep::NetworkCreated => self.stop_plan().network_removal_invocations(),
-            CompletedStartStep::FirewallInstalled => self.stop_plan().stop_invocations(),
+            // In vm mode the only reachable phase is post-StartVm (no
+            // network/firewall steps run), and the broker arm owns the shared
+            // network + there is no host PF — so a failed agent start removes the
+            // agent VM only. The broker arm tears down the broker VM, egress
+            // network, and shared network.
+            CompletedStartStep::FirewallInstalled => match self.broker_placement {
+                BrokerPlacement::Host => self.stop_plan().stop_invocations(),
+                BrokerPlacement::Vm => self.stop_plan().vm_removal_invocations(),
+            },
         }
     }
 

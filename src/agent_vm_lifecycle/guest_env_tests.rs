@@ -13,6 +13,7 @@ fn guest_environment_is_redacted_and_uses_env_file_in_start_invocation() {
         ports(),
         BrokerPortRange::new(49152, 65535).unwrap(),
         Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6,
+        BrokerPlacement::Host,
         ContainerImage::new("alpine:latest").unwrap(),
         vec![
             AgentVmGuestEnvVar::new("WRIT_BROKER_URL", "http://192.168.252.1:51375/").unwrap(),

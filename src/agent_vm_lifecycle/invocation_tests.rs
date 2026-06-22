@@ -196,6 +196,60 @@ fn failed_vm_start_removes_vm_then_firewall_then_network() {
 }
 
 #[test]
+fn vm_placement_start_skips_network_and_firewall_steps() {
+    // The broker arm owns the shared network and there is no host PF, so the
+    // agent start begins at StartVm (then the IPv4-only probe/release).
+    let steps = plan_with_broker_placement(252, BrokerPlacement::Vm).start_steps();
+    assert!(
+        matches!(steps.first(), Some(AgentVmStartStep::StartVm(_))),
+        "vm start must begin with StartVm, got {steps:?}"
+    );
+    assert!(
+        !steps.iter().any(|s| matches!(
+            s,
+            AgentVmStartStep::CreateNetwork(_)
+                | AgentVmStartStep::InspectAndValidateNetwork(_)
+                | AgentVmStartStep::InstallFirewall(_)
+        )),
+        "vm start must not create/inspect the network or install PF: {steps:?}"
+    );
+    // Host placement is unchanged: it still provisions network + firewall first.
+    let host = plan_with_broker_placement(252, BrokerPlacement::Host).start_steps();
+    assert!(matches!(
+        host.first(),
+        Some(AgentVmStartStep::CreateNetwork(_))
+    ));
+}
+
+#[test]
+fn vm_placement_failed_start_removes_the_agent_vm_only() {
+    // The broker arm tears down the broker VM, egress net, and shared net, so a
+    // failed agent start in vm mode cleans up just the agent VM (no PF, no net).
+    let cleanup = plan_with_broker_placement(252, BrokerPlacement::Vm)
+        .cleanup_after_partial_start(CompletedStartStep::FirewallInstalled);
+    assert!(
+        cleanup
+            .iter()
+            .all(|inv| inv.program() == Path::new("container")),
+        "vm cleanup must only touch the agent VM via container: {cleanup:?}"
+    );
+    assert!(
+        !cleanup.iter().any(|inv| {
+            let args = inv.args_lossy();
+            args.first().map(String::as_str) == Some("network")
+                || args.contains(&"writ-agent-vm-pf-helper".to_string())
+        }),
+        "vm cleanup must not remove the shared network or PF: {cleanup:?}"
+    );
+    assert!(
+        cleanup
+            .iter()
+            .any(|inv| inv.args_lossy().starts_with(&["rm".into(), "-f".into()])),
+        "vm cleanup must remove the agent VM: {cleanup:?}"
+    );
+}
+
+#[test]
 fn broker_url_uses_host_only_gateway_and_broker_port() {
     let urls = plan(252).broker_urls();
     assert_eq!(urls[0].as_str(), "http://192.168.252.1:51375/");
