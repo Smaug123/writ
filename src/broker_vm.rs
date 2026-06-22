@@ -293,6 +293,21 @@ impl BrokerVmPlan {
         ProcessInvocation::new(self.container_tool.clone(), args)
     }
 
+    /// `container inspect <broker vm>` — its JSON carries the broker's address on
+    /// the internal network once running (see [`parse_broker_ipv4_on_network`]).
+    pub fn inspect_invocation(&self) -> ProcessInvocation {
+        ProcessInvocation::new(
+            self.container_tool.clone(),
+            ["inspect".to_string(), self.names.vm.clone()],
+        )
+    }
+
+    /// The shared internal network this broker attaches to; used to pick the
+    /// right attachment out of `container inspect` output.
+    pub fn internal_network(&self) -> &str {
+        &self.internal_network
+    }
+
     /// Idempotent teardown: force-remove the broker VM, then remove its egress
     /// network. The shared internal network is torn down by the agent-VM stop
     /// plan, so it is intentionally absent here.
