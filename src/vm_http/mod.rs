@@ -681,6 +681,23 @@ pub async fn bind_ephemeral_vm_http_listener(
     Err(VmHttpBindError::NoAllowedPort { attempts, min, max })
 }
 
+/// Bind the VM HTTP listener on a *specific* broker port (vs.
+/// [`bind_ephemeral_vm_http_listener`], which lets the OS pick within a range).
+///
+/// Used when the broker URL must be known ahead of time rather than discovered
+/// after binding — e.g. a broker that runs in its own VM, whose `host:port` the
+/// host launcher hands to the agent VM before the broker is reachable.
+pub async fn bind_vm_http_listener(
+    bind_addr: Ipv4Addr,
+    port: BrokerPort,
+) -> Result<BoundVmHttpListener, VmHttpBindError> {
+    let listener = TcpListener::bind(SocketAddr::new(IpAddr::V4(bind_addr), port.get())).await?;
+    Ok(BoundVmHttpListener {
+        listener,
+        broker_port: port,
+    })
+}
+
 /// Bind and prepare a per-session VM HTTP runtime without accepting traffic.
 ///
 /// The returned listener owns a concrete broker port before the VM is started.
@@ -707,7 +724,40 @@ pub async fn prepare_vm_http_session_with_agent_runs<S: SecretStore + Send + Syn
 ) -> Result<PreparedVmHttpSession<S>, VmHttpRuntimeError> {
     let listener =
         bind_ephemeral_vm_http_listener(config.bind_addr, config.broker_port_range).await?;
-    let session = VmHttpSession::new(session_id, source_ipv4, VmHttpBearerToken::generate());
+    prepare_vm_http_session_on_listener(
+        state,
+        config,
+        session_id,
+        source_ipv4,
+        VmHttpBearerToken::generate(),
+        listener,
+        agent_runs,
+        git_push,
+    )
+}
+
+/// Assemble a per-session VM HTTP runtime on an already-bound listener with a
+/// caller-supplied bearer token.
+///
+/// [`prepare_vm_http_session_with_agent_runs`] is the host-broker path: it binds
+/// an ephemeral port and generates the bearer itself, since the daemon owns both.
+/// This variant takes the listener and bearer as inputs, for when both must be
+/// fixed ahead of time and shared — e.g. a broker that runs in its own VM
+/// (`broker_placement = vm`), where the host launcher hands the *same* broker URL
+/// (a fixed port) and bearer token to the agent VM. The service assembly is
+/// identical; only how the listener and bearer are obtained differs.
+#[allow(clippy::too_many_arguments)]
+pub fn prepare_vm_http_session_on_listener<S: SecretStore + Send + Sync + 'static>(
+    state: Arc<BrokerState<S>>,
+    config: &VmHttpRuntimeConfig,
+    session_id: SessionId,
+    source_ipv4: Ipv4Cidr,
+    bearer_token: VmHttpBearerToken,
+    listener: BoundVmHttpListener,
+    agent_runs: Option<VmHttpAgentRunService<S>>,
+    git_push: Option<VmHttpGitPushService<S>>,
+) -> Result<PreparedVmHttpSession<S>, VmHttpRuntimeError> {
+    let session = VmHttpSession::new(session_id, source_ipv4, bearer_token);
     let git_clone = VmHttpGitCloneService::new(Arc::clone(&state), config.git_clone.clone());
     let nix_cache = VmHttpNixCacheService::new(Arc::clone(&state), config.nix_cache.clone());
     let claude_proxy = config
@@ -1931,6 +1981,62 @@ esac
 
     pub(super) fn nix_cache_config_for_test() -> VmHttpNixCacheConfig {
         VmHttpNixCacheConfig::new("http://127.0.0.1:9", 1024, 1024).unwrap()
+    }
+
+    /// Bind a free TCP port and release it, returning the port number — so a
+    /// test of the *fixed*-port binder has a port that is (momentarily) free.
+    async fn free_port() -> u16 {
+        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        probe.local_addr().unwrap().port()
+    }
+
+    #[tokio::test]
+    async fn bind_vm_http_listener_binds_the_requested_port() {
+        let port = free_port().await;
+        let bound = bind_vm_http_listener(Ipv4Addr::LOCALHOST, BrokerPort::new(port).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(bound.broker_port().get(), port);
+        assert_eq!(bound.local_addr().unwrap().port(), port);
+    }
+
+    #[tokio::test]
+    async fn prepare_on_listener_uses_the_provided_bearer_and_bound_port() {
+        let github = MockServer::start().await;
+        let state = make_broker_state(&github);
+        let temp = tempfile::tempdir().unwrap();
+        let config = VmHttpRuntimeConfig::new(
+            Ipv4Addr::LOCALHOST,
+            BrokerPortRange::new(1024, 65535).unwrap(),
+            git_clone_config_for_test(&temp, write_fake_git(temp.path())),
+            nix_cache_config_for_test(),
+            temp.path().join("agent-run-logs"),
+            temp.path().join("git-push-staging"),
+            VmGitPushBodyLimits::new(65 * 1024 * 1024, 16 * 1024, 64 * 1024 * 1024).unwrap(),
+        );
+        let port = free_port().await;
+        let listener = bind_vm_http_listener(Ipv4Addr::LOCALHOST, BrokerPort::new(port).unwrap())
+            .await
+            .unwrap();
+        let bearer = VmHttpBearerToken::generate();
+        let bearer_str = bearer.as_str().to_string();
+
+        let prepared = prepare_vm_http_session_on_listener(
+            Arc::clone(&state),
+            &config,
+            "51b8fd0f-6c10-454c-b0e6-7df1d60e2e6d".parse().unwrap(),
+            Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap(),
+            bearer,
+            listener,
+            None,
+            None,
+        )
+        .unwrap();
+
+        // Unlike the ephemeral/generated host-broker path, both the port and the
+        // bearer come from the caller (the broker-VM placement needs them fixed).
+        assert_eq!(prepared.broker_port().get(), port);
+        assert_eq!(prepared.bearer_token().as_str(), bearer_str);
     }
 
     fn request(source: Ipv4Addr, authorization: Option<String>) -> VmHttpRequest {
