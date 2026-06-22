@@ -433,6 +433,12 @@ pub fn broker_config_json(
 
 #[derive(Debug, thiserror::Error)]
 pub enum BrokerSecretExportError {
+    #[error("cannot reset the ephemeral broker secret store at {path}: {source}")]
+    ResetDir {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
     #[error("cannot open the ephemeral broker secret store at {path}: {source}")]
     Open {
         path: String,
@@ -488,7 +494,32 @@ pub fn broker_secret_keys(config: &DaemonConfig) -> Vec<SecretKey> {
 /// the keychain once and writes an ephemeral file store to mount into the broker
 /// VM (the executor removes it on teardown). A missing key is fatal — the broker
 /// would fail later — so it is surfaced here.
+///
+/// `dest_dir` ends up either a **complete** store or **absent**, never stale or
+/// partial: it is cleared first (a retried launch must not keep secrets the
+/// broker no longer needs) and removed again if any read/write fails (so a
+/// half-populated store is never left to be mounted).
 pub fn export_broker_secrets(
+    host_store: &dyn SecretStore,
+    keys: &[SecretKey],
+    dest_dir: &Path,
+) -> Result<(), BrokerSecretExportError> {
+    if dest_dir.exists() {
+        std::fs::remove_dir_all(dest_dir).map_err(|source| BrokerSecretExportError::ResetDir {
+            path: dest_dir.display().to_string(),
+            source,
+        })?;
+    }
+    let result = write_broker_secret_store(host_store, keys, dest_dir);
+    if result.is_err() {
+        // Best-effort: don't leave a partial store behind for the executor to
+        // mount (it aborts on this error, but a later retry also re-clears).
+        let _ = std::fs::remove_dir_all(dest_dir);
+    }
+    result
+}
+
+fn write_broker_secret_store(
     host_store: &dyn SecretStore,
     keys: &[SecretKey],
     dest_dir: &Path,
@@ -1142,16 +1173,52 @@ mod tests {
     }
 
     #[test]
-    fn export_broker_secrets_fails_on_a_missing_secret() {
+    fn export_broker_secrets_fails_on_a_missing_secret_and_leaves_no_store() {
         let host_dir = tempfile::tempdir().unwrap();
         let host = FileSecretStore::create_or_open(host_dir.path().join("host")).unwrap();
         // host is missing `shared-pk` and `anthropic-api-key`.
         let dest_dir = tempfile::tempdir().unwrap();
+        let dest = dest_dir.path().join("secrets");
         let keys = broker_secret_keys(&secret_config());
         assert!(matches!(
-            export_broker_secrets(&host, &keys, &dest_dir.path().join("secrets")),
+            export_broker_secrets(&host, &keys, &dest),
             Err(BrokerSecretExportError::Missing(key)) if key == "shared-pk"
         ));
+        // A failed export must not leave a (partial) store to be mounted.
+        assert!(!dest.exists(), "partial store must be removed on failure");
+    }
+
+    #[test]
+    fn export_broker_secrets_clears_a_reused_store_of_stale_secrets() {
+        let host_dir = tempfile::tempdir().unwrap();
+        let host = FileSecretStore::create_or_open(host_dir.path().join("host")).unwrap();
+        host.put(&SecretKey::new("shared-pk").unwrap(), "PEM-DATA")
+            .unwrap();
+        host.put(&SecretKey::new("anthropic-api-key").unwrap(), "sk-abc")
+            .unwrap();
+
+        // A prior attempt left a now-unneeded secret in the export dir.
+        let dest_dir = tempfile::tempdir().unwrap();
+        let dest = dest_dir.path().join("secrets");
+        {
+            let stale = FileSecretStore::create_or_open(dest.clone()).unwrap();
+            stale
+                .put(&SecretKey::new("stale-key").unwrap(), "leftover")
+                .unwrap();
+        }
+
+        export_broker_secrets(&host, &broker_secret_keys(&secret_config()), &dest).unwrap();
+
+        let injected = FileSecretStore::open(dest).unwrap();
+        assert_eq!(
+            injected.get(&SecretKey::new("stale-key").unwrap()).unwrap(),
+            None,
+            "stale secret from a prior attempt must be cleared"
+        );
+        assert_eq!(
+            injected.get(&SecretKey::new("shared-pk").unwrap()).unwrap(),
+            Some("PEM-DATA".to_string())
+        );
     }
 
     #[test]
