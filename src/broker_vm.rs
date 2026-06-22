@@ -248,16 +248,28 @@ pub fn broker_url(broker_ipv4: std::net::Ipv4Addr, broker_port: BrokerPort) -> S
 }
 
 /// Write the per-session material the broker VM reads (the session spec and the
-/// bearer token) into `staging_dir`, each `0600`. The directory itself is created
-/// `0700` if absent. The broker's config file is written by the executor (it
-/// needs the full daemon config); this writes the two pieces the host owns
-/// directly. Round-trips through the slice-3 readers (see tests).
+/// bearer token) into `staging_dir`, each `0600`, in a `0700` directory. The
+/// broker's config file is written by the executor (it needs the full daemon
+/// config); this writes the two pieces the host owns directly.
+///
+/// Safe to call on a **reused** staging directory (a retried launch): any stale
+/// `ready` marker is cleared first — otherwise the host, which watches that
+/// mounted file to decide the broker is serving, could read a previous run's
+/// marker before the new `writd broker` binds — and material files are forced to
+/// `0600` even when overwriting a pre-existing inode. Round-trips through the
+/// slice-3 readers (see tests).
 pub fn write_session_material(
     staging_dir: &Path,
     spec: &BrokerSessionSpec,
     bearer: &VmHttpBearerToken,
 ) -> std::io::Result<()> {
     create_private_dir(staging_dir)?;
+    // Clear a stale readiness marker from a prior attempt before launch.
+    match std::fs::remove_file(staging_dir.join(READY_FILE)) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err),
+    }
     write_private_file(
         &staging_dir.join(SESSION_SPEC_FILE),
         spec.to_json().as_bytes(),
@@ -271,28 +283,37 @@ pub fn write_session_material(
 
 #[cfg(unix)]
 fn create_private_dir(dir: &Path) -> std::io::Result<()> {
-    use std::os::unix::fs::DirBuilderExt as _;
+    use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
     if dir.exists() {
-        return Ok(());
+        // Enforce 0700 on a reused directory too (DirBuilder::mode only applies
+        // when creating), so a looser pre-existing dir can't expose material.
+        return std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
     }
     std::fs::DirBuilder::new().mode(0o700).create(dir)
 }
 
 #[cfg(not(unix))]
 fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+    if dir.exists() {
+        return Ok(());
+    }
     std::fs::create_dir(dir)
 }
 
 #[cfg(unix)]
 fn write_private_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     use std::io::Write as _;
-    use std::os::unix::fs::OpenOptionsExt as _;
+    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(true)
         .mode(0o600)
         .open(path)?;
+    // `OpenOptions::mode` only applies when creating a new inode; on a retried
+    // launch `path` may already exist with looser perms, so force 0600
+    // explicitly. The bearer token must never be group/world-readable.
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
     file.write_all(contents)
 }
 
@@ -461,6 +482,43 @@ mod tests {
         assert_eq!(read_spec, spec);
         let read_bearer = read_bearer_token_file(&staging.join("bearer-token")).unwrap();
         assert_eq!(read_bearer.as_str(), bearer.as_str());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reused_staging_dir_clears_ready_and_reforces_0600() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let staging = dir.path().join("session");
+        let spec = BrokerSessionSpec::new(
+            session_id(),
+            Ipv4Cidr::new(Ipv4Addr::new(192, 168, 252, 0), 24).unwrap(),
+            Ipv4Addr::UNSPECIFIED,
+            18080,
+        );
+        // First launch, then simulate a prior run leaving a stale ready marker
+        // and a world-readable bearer token (e.g. a crashed/retried attempt).
+        write_session_material(&staging, &spec, &VmHttpBearerToken::generate()).unwrap();
+        std::fs::write(staging.join("ready"), "18080\n").unwrap();
+        std::fs::set_permissions(
+            staging.join("bearer-token"),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+
+        // Re-materialising for the retry must clear the stale marker and tighten
+        // perms back to 0600.
+        write_session_material(&staging, &spec, &VmHttpBearerToken::generate()).unwrap();
+        assert!(
+            !staging.join("ready").exists(),
+            "stale ready marker must be cleared before relaunch"
+        );
+        let token_mode = std::fs::metadata(staging.join("bearer-token"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(token_mode, 0o600, "overwrite must re-force 0600");
     }
 
     #[cfg(unix)]
