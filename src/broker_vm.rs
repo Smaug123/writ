@@ -50,18 +50,30 @@ const BROKER_VM_TMPFS_MOUNTS: &[&str] = &["/tmp", "/run", "/var/tmp"];
 
 /// Guest prologue that runs before `writd broker` to keep the broker's default
 /// route on the **egress** interface. Apple `container` puts the default route on
-/// the first-attached network (so the plan attaches egress first), but as
+/// the first-attached network (so the plan attaches egress first); as
 /// defense-in-depth this also drops any default route still pinned to the
-/// no-egress `--internal` interface — identified by its on-link subnet ($1) —
-/// before exec'ing the real command. Mirrors the agent VM's prelaunch-script
-/// pattern. (Host-verify the `ip`/`awk` specifics against a real broker image.)
+/// no-egress `--internal` interface, identified by its on-link subnet (`$1`).
+///
+/// Deliberately uses **only `ip` and POSIX shell builtins** — no `awk`/`grep`/`sed`,
+/// which the production guest image forbids (see `productionForbiddenBins` in
+/// flake.nix); `ip` is a guaranteed guest binary. It also avoids `set -e`, so a
+/// missing route or no-match can't abort the script before `exec "$@"` — the
+/// route repair is best-effort, with egress-first ordering as the real guarantee.
+/// (`ip` must likewise be present in the broker image; host-verify the route
+/// behaviour on real hardware.)
 const BROKER_VM_ROUTE_FIX_SCRIPT: &str = concat!(
-    "set -eu\n",
     "internal_cidr=\"$1\"\n",
     "shift\n",
-    "internal_if=\"$(ip -o -4 route show scope link 2>/dev/null | ",
-    "awk -v c=\"$internal_cidr\" '$1==c{print $3; exit}')\"\n",
-    "if [ -n \"${internal_if:-}\" ]; then\n",
+    "internal_if=\"\"\n",
+    "while read -r subnet kw dev _rest; do\n",
+    "  [ \"$kw\" = dev ] || continue\n",
+    "  [ \"$subnet\" = \"$internal_cidr\" ] || continue\n",
+    "  internal_if=\"$dev\"\n",
+    "  break\n",
+    "done <<EOF\n",
+    "$(ip -o -4 route show scope link 2>/dev/null || true)\n",
+    "EOF\n",
+    "if [ -n \"$internal_if\" ]; then\n",
     "  while ip route del default dev \"$internal_if\" 2>/dev/null; do :; done\n",
     "fi\n",
     "exec \"$@\"",
@@ -488,7 +500,14 @@ mod tests {
         // The prologue must receive the internal CIDR and drop default routes on
         // the matching interface, so the broker's egress survives dual-homing.
         assert!(BROKER_VM_ROUTE_FIX_SCRIPT.contains("ip route del default dev"));
-        assert!(BROKER_VM_ROUTE_FIX_SCRIPT.contains("$1==c"));
+        // Must use only tools the production guest image allows: no awk/grep/sed
+        // (forbidden), and no `set -e` (so a no-match can't abort before exec).
+        for forbidden in ["awk", "grep", "sed", "set -e"] {
+            assert!(
+                !BROKER_VM_ROUTE_FIX_SCRIPT.contains(forbidden),
+                "route-fix prologue must not use {forbidden:?}"
+            );
+        }
         let args = sample_plan().run_invocation().args_lossy();
         let fix_at = args
             .iter()
@@ -538,7 +557,7 @@ mod tests {
             session_id(),
             Ipv4Cidr::new(Ipv4Addr::new(192, 168, 252, 0), 24).unwrap(),
             Ipv4Addr::UNSPECIFIED,
-            18080,
+            BrokerPort::new(18080).unwrap(),
         );
         let bearer = VmHttpBearerToken::generate();
         write_session_material(&staging, &spec, &bearer).unwrap();
@@ -559,7 +578,7 @@ mod tests {
             session_id(),
             Ipv4Cidr::new(Ipv4Addr::new(192, 168, 252, 0), 24).unwrap(),
             Ipv4Addr::UNSPECIFIED,
-            18080,
+            BrokerPort::new(18080).unwrap(),
         );
         // First launch, then simulate a prior run leaving a stale ready marker
         // and a world-readable bearer token (e.g. a crashed/retried attempt).
@@ -596,7 +615,7 @@ mod tests {
             session_id(),
             Ipv4Cidr::new(Ipv4Addr::new(192, 168, 252, 0), 24).unwrap(),
             Ipv4Addr::UNSPECIFIED,
-            18080,
+            BrokerPort::new(18080).unwrap(),
         );
         write_session_material(&staging, &spec, &VmHttpBearerToken::generate()).unwrap();
         let dir_mode = std::fs::metadata(&staging).unwrap().permissions().mode() & 0o777;

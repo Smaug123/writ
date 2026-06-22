@@ -12,7 +12,7 @@
 use std::net::Ipv4Addr;
 use std::path::Path;
 
-use crate::core::{Ipv4Cidr, SessionId};
+use crate::core::{BrokerPort, Ipv4Cidr, SessionId};
 use crate::vm_http::{VmHttpBearerToken, VmHttpConfigError};
 
 /// A validated broker session spec. Constructed only via [`BrokerSessionSpec::parse_json`]
@@ -61,19 +61,22 @@ pub enum BrokerSessionSpecError {
 
 impl BrokerSessionSpec {
     /// Construct a spec host-side (the inverse direction from [`Self::parse_json`],
-    /// which the broker VM uses to read it back). The port is the listener fact;
-    /// it is range-checked against the vm_http config where the spec is consumed.
+    /// which the broker VM uses to read it back). Takes a [`BrokerPort`] (not a
+    /// raw `u16`) so a zero/privileged port — which `parse_json` would later
+    /// reject, breaking the round-trip and failing the broker VM at startup — is
+    /// unrepresentable here. The port is still range-checked against the vm_http
+    /// config where the spec is consumed.
     pub fn new(
         session_id: SessionId,
         agent_ipv4_cidr: Ipv4Cidr,
         bind_addr: Ipv4Addr,
-        broker_port: u16,
+        broker_port: BrokerPort,
     ) -> Self {
         Self {
             session_id,
             agent_ipv4_cidr,
             bind_addr,
-            broker_port,
+            broker_port: broker_port.get(),
         }
     }
 
@@ -221,7 +224,7 @@ mod tests {
                 .unwrap(),
             Ipv4Cidr::new(Ipv4Addr::new(192, 168, 252, 0), 24).unwrap(),
             Ipv4Addr::UNSPECIFIED,
-            18080,
+            BrokerPort::new(18080).unwrap(),
         );
         let parsed = BrokerSessionSpec::parse_json(&spec.to_json()).unwrap();
         assert_eq!(parsed, spec);
