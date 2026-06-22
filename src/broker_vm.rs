@@ -22,6 +22,7 @@
 //! egress is a network created *without* `--internal`. (Host-verify on a real
 //! image: the virtiofs mount `type` token and that a no-`--internal` network NATs.)
 
+use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 
 use crate::agent_vm_lifecycle::{AgentVmResources, ContainerImage, ProcessInvocation};
@@ -294,8 +295,75 @@ impl BrokerVmPlan {
 /// The agent VM reaches the broker at this URL. The IP is discovered from the
 /// broker VM's internal-network interface after it starts; the port is the fixed
 /// port the broker binds inside its own VM.
-pub fn broker_url(broker_ipv4: std::net::Ipv4Addr, broker_port: BrokerPort) -> String {
+pub fn broker_url(broker_ipv4: Ipv4Addr, broker_port: BrokerPort) -> String {
     format!("http://{broker_ipv4}:{}/", broker_port.get())
+}
+
+#[derive(Debug, thiserror::Error, Eq, PartialEq)]
+pub enum BrokerInspectError {
+    #[error("container inspect output is not valid JSON: {0}")]
+    Json(String),
+    #[error("container inspect output is empty or not a JSON array of containers")]
+    NoContainer,
+    #[error(
+        "container inspect output has no running attachment for network {0:?} \
+         (is the broker VM running and attached to the internal network?)"
+    )]
+    NetworkNotFound(String),
+    #[error("network {network:?} attachment is missing an ipv4Address")]
+    MissingAddress { network: String },
+    #[error("network {network:?} ipv4Address {value:?} is not a valid IPv4 address: {message}")]
+    InvalidAddress {
+        network: String,
+        value: String,
+        message: String,
+    },
+}
+
+/// Extract the broker VM's IPv4 address on `network_name` from `container inspect`
+/// JSON, so the agent's `WRIT_BROKER_URL` can point at it (Apple `container` has
+/// no `--ip`, so the address is only known after the VM starts).
+///
+/// The address lives at `[0].status.networks[]` where `.network == network_name`,
+/// as `.ipv4Address` in `addr/prefix` form. Verified against Apple `container`
+/// 1.0.0 (`status.networks` is empty until the container is running, which
+/// surfaces here as [`BrokerInspectError::NetworkNotFound`]).
+pub fn parse_broker_ipv4_on_network(
+    inspect_json: &str,
+    network_name: &str,
+) -> Result<Ipv4Addr, BrokerInspectError> {
+    let value: serde_json::Value =
+        serde_json::from_str(inspect_json).map_err(|e| BrokerInspectError::Json(e.to_string()))?;
+    let container = value
+        .as_array()
+        .and_then(|containers| containers.first())
+        .ok_or(BrokerInspectError::NoContainer)?;
+    let attachment = container
+        .get("status")
+        .and_then(|status| status.get("networks"))
+        .and_then(|networks| networks.as_array())
+        .into_iter()
+        .flatten()
+        .find(|attachment| {
+            attachment
+                .get("network")
+                .and_then(serde_json::Value::as_str)
+                == Some(network_name)
+        })
+        .ok_or_else(|| BrokerInspectError::NetworkNotFound(network_name.to_string()))?;
+    let raw = attachment
+        .get("ipv4Address")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| BrokerInspectError::MissingAddress {
+            network: network_name.to_string(),
+        })?;
+    let addr = raw.split_once('/').map(|(addr, _)| addr).unwrap_or(raw);
+    addr.parse::<Ipv4Addr>()
+        .map_err(|e| BrokerInspectError::InvalidAddress {
+            network: network_name.to_string(),
+            value: raw.to_string(),
+            message: e.to_string(),
+        })
 }
 
 /// Write the per-session material the broker VM reads (the session spec and the
@@ -547,6 +615,85 @@ mod tests {
             BrokerPort::new(18080).unwrap(),
         );
         assert_eq!(url, "http://192.168.252.3:18080/");
+    }
+
+    /// Shape captured verbatim from `container inspect` (Apple container 1.0.0) on
+    /// a running VM: an array of one container with `status.networks[]` entries
+    /// carrying `network` + `ipv4Address` (`addr/prefix`).
+    fn inspect_json(networks: &str) -> String {
+        format!(
+            r#"[
+              {{
+                "id": "writ-broker-vm-abc",
+                "status": {{
+                  "networks": [{networks}],
+                  "startedDate": "2026-06-22T17:01:04Z",
+                  "state": "running"
+                }}
+              }}
+            ]"#
+        )
+    }
+
+    #[test]
+    fn parses_broker_ipv4_on_the_internal_network() {
+        // Two attachments (egress + internal); must pick the internal one.
+        let json = inspect_json(
+            r#"
+            {"network":"writ-broker-egress-abc","ipv4Address":"192.168.64.5/24","ipv4Gateway":"192.168.64.1"},
+            {"network":"writ-net","ipv4Address":"192.168.252.3/24","ipv4Gateway":"192.168.252.1","macAddress":"fe:6c:2d:f5:08:69","mtu":1280}
+            "#,
+        );
+        let ip = parse_broker_ipv4_on_network(&json, "writ-net").unwrap();
+        assert_eq!(ip, Ipv4Addr::new(192, 168, 252, 3));
+    }
+
+    #[test]
+    fn missing_network_is_an_error() {
+        let json =
+            inspect_json(r#"{"network":"writ-broker-egress-abc","ipv4Address":"192.168.64.5/24"}"#);
+        assert_eq!(
+            parse_broker_ipv4_on_network(&json, "writ-net"),
+            Err(BrokerInspectError::NetworkNotFound("writ-net".to_string()))
+        );
+    }
+
+    #[test]
+    fn stopped_container_has_no_running_attachment() {
+        // `status.networks` is empty until the container is running.
+        let json = inspect_json("");
+        assert_eq!(
+            parse_broker_ipv4_on_network(&json, "writ-net"),
+            Err(BrokerInspectError::NetworkNotFound("writ-net".to_string()))
+        );
+    }
+
+    #[test]
+    fn missing_or_invalid_address_is_an_error() {
+        let no_addr = inspect_json(r#"{"network":"writ-net","ipv4Gateway":"192.168.252.1"}"#);
+        assert_eq!(
+            parse_broker_ipv4_on_network(&no_addr, "writ-net"),
+            Err(BrokerInspectError::MissingAddress {
+                network: "writ-net".to_string()
+            })
+        );
+        let bad_addr = inspect_json(r#"{"network":"writ-net","ipv4Address":"not-an-ip/24"}"#);
+        assert!(matches!(
+            parse_broker_ipv4_on_network(&bad_addr, "writ-net"),
+            Err(BrokerInspectError::InvalidAddress { .. })
+        ));
+    }
+
+    #[test]
+    fn non_json_is_an_error() {
+        assert!(matches!(
+            parse_broker_ipv4_on_network("not json", "writ-net"),
+            Err(BrokerInspectError::Json(_))
+        ));
+        assert_eq!(
+            parse_broker_ipv4_on_network("[]", "writ-net"),
+            Err(BrokerInspectError::NoContainer)
+        );
     }
 
     #[test]
