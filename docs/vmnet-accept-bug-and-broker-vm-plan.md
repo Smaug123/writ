@@ -95,6 +95,16 @@ Run a **debug** build of the broker: `cargo build --bin writd && ./target/debug/
 - **Multi‑network attach** works: a container with `--network internal --network default` gets both interfaces. Caveat: the default route landed on the no‑egress interface, so a dual‑homed VM must set its default route via the NAT interface.
 - **`--publish-socket`** carries host→guest service traffic (the working direction), usable for a host‑side review UI.
 
+### 8.1 Apple `container` 1.0.0 CLI facts that shape the `vm` arm **[verified]**
+
+Checked against `container run --help` / `container network create --help` on the dev host (build `ee848e3`):
+
+- **No `--ip`.** `container run` cannot pin a container's address; `--network <name>[,mac=…][,mtu=…]` only names the network. ⇒ the broker VM's internal‑net IP must be **discovered after start** (`container inspect <id>`, JSON), then fed to the agent's `WRIT_BROKER_URL`. The broker **port** is still fixed by us (the broker binds it inside its own VM), so only the IP is dynamic.
+- **`--network` repeats** for dual‑homing (internal + egress).
+- **Bind mounts:** `--mount type=virtiofs,source=<host>,target=<guest>[,readonly]` (also `-v/--volume`). Used to inject the file secret store (ro), the durable audit dir (rw), and the per‑session material dir (rw, so the broker can publish its ready file back to the host). *Host‑verify on a real image:* the exact `type` token and that no‑`--internal` networks NAT.
+- **Egress network** = `container network create <name>` **without** `--internal` (and without `--subnet`; nothing else attaches, so let `container` assign).
+- Readiness is observed **host‑side** via the shared material mount (the broker's `--ready-file` lands in the mounted session dir), avoiding a `container exec` poll.
+
 ## 9. Proposed plan — Path A: broker in a dedicated trusted VM **[proposed]**
 
 **Principle:** move the broker off the macOS host into a Linux VM, so the agent→broker `accept()` happens in Linux (verified healthy), sidestepping the macOS vmnet bug at the root. Keep Apple `container`, the no‑egress agent, and the broker‑as‑trust‑boundary model.
