@@ -191,9 +191,18 @@ fn write_ready_file_atomic(path: &Path, broker_port: BrokerPort) -> Result<(), B
     };
     let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
     let dir = parent.unwrap_or_else(|| Path::new("."));
-    // The broker port is unique per broker process, so it uniquely names the
-    // temp file within the (host-owned) ready-file directory.
-    let tmp = dir.join(format!(".writd-broker-ready.{}.tmp", broker_port.get()));
+    // Derive the temp name from the *target* file name plus this process's PID,
+    // not from the broker port: two brokers can share a ready-file directory
+    // while reusing the same fixed port (distinct bind addrs, or separate
+    // network namespaces), and a port-only temp name would let one broker's
+    // rename consume the other's half-written temp — spuriously failing
+    // readiness on a listener that is already serving. Per-target + per-process
+    // keeps each broker's temp private.
+    let target_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("writd-broker-ready");
+    let tmp = dir.join(format!(".{target_name}.{}.tmp", std::process::id()));
     std::fs::write(&tmp, format!("{}\n", broker_port.get())).map_err(ready_err)?;
     std::fs::rename(&tmp, path).map_err(|source| {
         // Best-effort cleanup so a failed rename does not leave the temp behind.
@@ -476,6 +485,29 @@ mod tests {
             .filter(|n| n != "ready")
             .collect();
         assert!(leftovers.is_empty(), "unexpected leftovers: {leftovers:?}");
+    }
+
+    #[test]
+    fn write_ready_file_atomic_distinct_targets_share_no_temp() {
+        // Two brokers reusing the same fixed port but writing distinct ready
+        // files in one directory must not race on a shared temp name.
+        let dir = tempfile::tempdir().unwrap();
+        let port = BrokerPort::new(18085).unwrap();
+        let ready_a = dir.path().join("ready-a");
+        let ready_b = dir.path().join("ready-b");
+        write_ready_file_atomic(&ready_a, port).unwrap();
+        write_ready_file_atomic(&ready_b, port).unwrap();
+        assert_eq!(std::fs::read_to_string(&ready_a).unwrap(), "18085\n");
+        assert_eq!(std::fs::read_to_string(&ready_b).unwrap(), "18085\n");
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(
+            names.len(),
+            2,
+            "only the two ready files should remain: {names:?}"
+        );
     }
 
     async fn free_loopback_port() -> u16 {
