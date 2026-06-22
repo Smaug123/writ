@@ -148,6 +148,8 @@ Implementation discipline so the swap stays clean:
 - **Host launcher = slimmed writd** keeping the macOS‑only responsibilities: keychain access + secret injection; `container network/run/exec/stop/delete` (today's `agent_vm_lifecycle`, extended from one VM to two); durable **audit.db + push‑staging on the host** and the human‑review/promote UI.
 - **Agent VM = essentially unchanged.** `guest_command.rs` already parses host:port out of `WRIT_BROKER_URL`; only the value changes.
 
+**Broker image guest-path contract** (`broker_vm.rs` rewrites the host config to these, since the host's own paths aren't mounted into the VM): the image must provide `writd` on `PATH`, `/bin/git`, `/bin/nix`, `ip` (iproute2, for the route-fix prologue), and a `/bin/writ-git-askpass` that echoes the minted token from the configured `token_env`. Secrets/audit/session come in via the mounts; everything else (clone scratch, nix-cache) lives under the guest `work_root` on tmpfs.
+
 ### 9.3 Secrets injection
 Host launcher reads keychain (GitHub app keys, Anthropic key, signing key) → writes an ephemeral `0600` file → mounts it into the broker VM via virtiofs (files traverse virtiofs; sockets don't). Broker VM loads via a file secret‑store (config already has a `File` variant). Removed on teardown.
 

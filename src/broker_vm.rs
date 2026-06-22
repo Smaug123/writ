@@ -46,6 +46,19 @@ pub const BROKER_VM_AUDIT_DIR: &str = "/writ/audit";
 /// bundle staging, the local nix-cache. Ephemeral per VM lifetime.
 pub const BROKER_VM_WORK_ROOT: &str = "/tmp/writ-broker-work";
 
+// Guest executable paths the broker **image** must provide. The derived broker
+// config points the vm_http executables at these, since the host's own
+// git/nix/askpass paths (e.g. Homebrew git, a host libexec askpass) do not exist
+// in the VM, which mounts only session/secrets/audit.
+/// Guest `git` the broker spawns for clone/bundle.
+pub const BROKER_VM_GIT_PROGRAM: &str = "/bin/git";
+/// Guest `nix` (used by nix-dependent endpoints).
+pub const BROKER_VM_NIX_PROGRAM: &str = "/bin/nix";
+/// Guest `GIT_ASKPASS` helper that echoes the minted token from the configured
+/// `token_env`. The broker image must ship this (the host's libexec one is not
+/// mounted).
+pub const BROKER_VM_ASKPASS_PROGRAM: &str = "/bin/writ-git-askpass";
+
 const SESSION_SPEC_FILE: &str = "session-spec.json";
 const BEARER_TOKEN_FILE: &str = "bearer-token";
 const CONFIG_FILE: &str = "config.json";
@@ -392,6 +405,21 @@ pub fn broker_config_json(
     vm_http.insert(
         "broker_port_max".to_string(),
         serde_json::json!(broker_port.get()),
+    );
+    // Point the executables at the broker image's guest paths; the host's own
+    // git/nix/askpass paths are not mounted into the VM. (`token_env` and
+    // `git_clone_base_url` are not paths, so they carry over unchanged.)
+    vm_http.insert(
+        "git_program".to_string(),
+        serde_json::Value::String(BROKER_VM_GIT_PROGRAM.to_string()),
+    );
+    vm_http.insert(
+        "nix_program".to_string(),
+        serde_json::Value::String(BROKER_VM_NIX_PROGRAM.to_string()),
+    );
+    vm_http.insert(
+        "askpass_program".to_string(),
+        serde_json::Value::String(BROKER_VM_ASKPASS_PROGRAM.to_string()),
     );
     for key in BROKER_DROPPED_VM_HTTP_KEYS {
         vm_http.remove(*key);
@@ -877,6 +905,13 @@ mod tests {
         // The vm_http config is one the broker accepts (the strong oracle), the
         // port is pinned, and the host-only features are gone.
         let vm_http = config.agent_vm.expect("agent_vm present").vm_http;
+        // Executables point at the broker image's guest paths, not the host's.
+        assert_eq!(vm_http.git_program, PathBuf::from(BROKER_VM_GIT_PROGRAM));
+        assert_eq!(vm_http.nix_program, PathBuf::from(BROKER_VM_NIX_PROGRAM));
+        assert_eq!(
+            vm_http.askpass_program,
+            PathBuf::from(BROKER_VM_ASKPASS_PROGRAM)
+        );
         let runtime = vm_http.to_runtime_config().unwrap();
         let fixed = BrokerPort::new(18080).unwrap();
         assert!(runtime.broker_port_range().contains(fixed));
