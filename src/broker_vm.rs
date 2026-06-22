@@ -26,7 +26,7 @@ use std::path::{Path, PathBuf};
 
 use crate::agent_vm_lifecycle::{AgentVmResources, ContainerImage, ProcessInvocation};
 use crate::broker_session::BrokerSessionSpec;
-use crate::core::{BrokerPort, SessionId};
+use crate::core::{BrokerPort, Ipv4Cidr, SessionId};
 use crate::vm_http::VmHttpBearerToken;
 
 /// Guest mount target for the per-session material directory (config, session
@@ -47,6 +47,25 @@ const READY_FILE: &str = "ready";
 /// Conventional writable scratch dirs the broker image expects as per-session
 /// tmpfs (mirrors the agent VM's set).
 const BROKER_VM_TMPFS_MOUNTS: &[&str] = &["/tmp", "/run", "/var/tmp"];
+
+/// Guest prologue that runs before `writd broker` to keep the broker's default
+/// route on the **egress** interface. Apple `container` puts the default route on
+/// the first-attached network (so the plan attaches egress first), but as
+/// defense-in-depth this also drops any default route still pinned to the
+/// no-egress `--internal` interface — identified by its on-link subnet ($1) —
+/// before exec'ing the real command. Mirrors the agent VM's prelaunch-script
+/// pattern. (Host-verify the `ip`/`awk` specifics against a real broker image.)
+const BROKER_VM_ROUTE_FIX_SCRIPT: &str = concat!(
+    "set -eu\n",
+    "internal_cidr=\"$1\"\n",
+    "shift\n",
+    "internal_if=\"$(ip -o -4 route show scope link 2>/dev/null | ",
+    "awk -v c=\"$internal_cidr\" '$1==c{print $3; exit}')\"\n",
+    "if [ -n \"${internal_if:-}\" ]; then\n",
+    "  while ip route del default dev \"$internal_if\" 2>/dev/null; do :; done\n",
+    "fi\n",
+    "exec \"$@\"",
+);
 
 /// The container/network names for one session's broker VM. The *internal*
 /// network is owned by the agent-VM plan and shared; only the broker VM and its
@@ -104,6 +123,9 @@ pub struct BrokerVmPlan {
     image: ContainerImage,
     /// The shared `--internal` network (owned by the agent-VM plan).
     internal_network: String,
+    /// The shared internal subnet, so the route-fix prologue can identify (and
+    /// demote) the no-egress interface.
+    internal_cidr: Ipv4Cidr,
     resources: AgentVmResources,
     container_tool: PathBuf,
     mounts: Vec<BrokerVmMount>,
@@ -118,6 +140,7 @@ impl BrokerVmPlan {
         session_id: SessionId,
         image: ContainerImage,
         internal_network: impl Into<String>,
+        internal_cidr: Ipv4Cidr,
         resources: AgentVmResources,
         container_tool: impl Into<PathBuf>,
         staging_dir: impl Into<PathBuf>,
@@ -145,6 +168,7 @@ impl BrokerVmPlan {
             names: BrokerVmNames::for_session(session_id),
             image,
             internal_network: internal_network.into(),
+            internal_cidr,
             resources,
             container_tool: container_tool.into(),
             mounts,
@@ -191,17 +215,23 @@ impl BrokerVmPlan {
         )
     }
 
-    /// `container run …` for the broker VM: dual-homed (internal + egress),
-    /// secrets/audit/session bind-mounted, running `writd broker`.
+    /// `container run …` for the broker VM: dual-homed (egress + internal),
+    /// secrets/audit/session bind-mounted, running `writd broker` behind the
+    /// route-fix prologue.
+    ///
+    /// The egress network is attached **first**: Apple `container` puts the
+    /// default route on the first-attached network, so this keeps the broker's
+    /// outbound traffic on the NAT interface rather than the no-egress internal
+    /// one (the prologue then demotes any stray internal default as backup).
     pub fn run_invocation(&self) -> ProcessInvocation {
         let mut args = vec![
             "run".to_string(),
             "--name".to_string(),
             self.names.vm.clone(),
             "--network".to_string(),
-            self.internal_network.clone(),
-            "--network".to_string(),
             self.names.egress_network.clone(),
+            "--network".to_string(),
+            self.internal_network.clone(),
             "--cpus".to_string(),
             self.resources.cpus().to_string(),
             "--memory".to_string(),
@@ -215,6 +245,15 @@ impl BrokerVmPlan {
         }
         args.push("-d".to_string());
         args.push(self.image.as_str().to_string());
+        // Wrap the broker command in the route-fix prologue (egress default
+        // route), passing the internal subnet so it can identify that interface.
+        args.extend([
+            "sh".to_string(),
+            "-c".to_string(),
+            BROKER_VM_ROUTE_FIX_SCRIPT.to_string(),
+            "writ-broker-route-fix".to_string(),
+            self.internal_cidr.to_string(),
+        ]);
         args.extend(self.broker_command());
         ProcessInvocation::new(self.container_tool.clone(), args)
     }
@@ -338,6 +377,7 @@ mod tests {
             session_id(),
             ContainerImage::new("writ-broker-vm:latest").unwrap(),
             "writ-agent-net-51b8fd0f-6c10-454c-b0e6-7df1d60e2e6d",
+            Ipv4Cidr::new(Ipv4Addr::new(192, 168, 252, 0), 24).unwrap(),
             AgentVmResources::new(2, 1024).unwrap(),
             "/usr/local/bin/container",
             "/var/run/writ/broker/51b8/session",
@@ -382,7 +422,8 @@ mod tests {
         assert_eq!(inv.program(), Path::new("/usr/local/bin/container"));
         let args = inv.args_lossy();
 
-        // Dual-homed: internal network first, then the broker's egress network.
+        // Dual-homed, egress network first so the default route lands on the NAT
+        // interface, then the shared internal network.
         let networks: Vec<&String> = args
             .iter()
             .zip(args.iter().skip(1))
@@ -392,8 +433,8 @@ mod tests {
         assert_eq!(
             networks,
             vec![
-                "writ-agent-net-51b8fd0f-6c10-454c-b0e6-7df1d60e2e6d",
                 "writ-broker-egress-51b8fd0f-6c10-454c-b0e6-7df1d60e2e6d",
+                "writ-agent-net-51b8fd0f-6c10-454c-b0e6-7df1d60e2e6d",
             ]
         );
 
@@ -408,15 +449,25 @@ mod tests {
             "type=virtiofs,source=/var/lib/writ/audit,target={BROKER_VM_AUDIT_DIR}"
         )));
 
-        // Detached, correct image, then the writd broker command pointing at the
-        // mounted material.
+        // Detached, correct image, then the route-fix prologue wrapping the
+        // writd broker command pointing at the mounted material.
         let image_at = args
             .iter()
             .position(|a| a == "writ-broker-vm:latest")
             .unwrap();
         assert_eq!(args[image_at - 1], "-d");
         assert_eq!(
-            &args[image_at + 1..],
+            &args[image_at + 1..image_at + 6],
+            &[
+                "sh".to_string(),
+                "-c".to_string(),
+                BROKER_VM_ROUTE_FIX_SCRIPT.to_string(),
+                "writ-broker-route-fix".to_string(),
+                "192.168.252.0/24".to_string(),
+            ]
+        );
+        assert_eq!(
+            &args[image_at + 6..],
             &[
                 "writd".to_string(),
                 "broker".to_string(),
@@ -430,6 +481,20 @@ mod tests {
                 format!("{BROKER_VM_SESSION_DIR}/ready"),
             ]
         );
+    }
+
+    #[test]
+    fn route_fix_prologue_targets_the_internal_subnet_and_demotes_it() {
+        // The prologue must receive the internal CIDR and drop default routes on
+        // the matching interface, so the broker's egress survives dual-homing.
+        assert!(BROKER_VM_ROUTE_FIX_SCRIPT.contains("ip route del default dev"));
+        assert!(BROKER_VM_ROUTE_FIX_SCRIPT.contains("$1==c"));
+        let args = sample_plan().run_invocation().args_lossy();
+        let fix_at = args
+            .iter()
+            .position(|a| a == "writ-broker-route-fix")
+            .expect("route-fix prologue is present");
+        assert_eq!(args[fix_at + 1], "192.168.252.0/24");
     }
 
     #[test]

@@ -140,7 +140,7 @@ Implementation discipline so the swap stays clean:
 
 - **Internal net** (`container network create --internal writ-net-<id> --subnet …`): carries agent↔broker; no NAT ⇒ the agent has **no egress by topology** (stronger than today's PF‑only control).
 - **Agent VM**: internal net only; its only reachable peer is the broker VM. `WRIT_BROKER_URL` = broker VM internal IP:port (instead of the host gateway). The boot egress‑gate's positive control becomes "reach broker VM"; negative ("no internet") is now also guaranteed by topology.
-- **Broker VM**: dual‑homed (internal + default/NAT); its image sets `default route via eth1` so outbound (GitHub/Anthropic/nix upstream) works while the internal subnet stays on eth0.
+- **Broker VM**: dual‑homed (egress/NAT + internal); outbound (GitHub/Anthropic/nix upstream) must use the NAT interface, not the no‑egress internal one. The launch plan (`broker_vm.rs`) keeps the default route on egress two ways: it attaches the **egress network first** (Apple `container` puts the default route on the first‑attached network — see §8.1), and it wraps `writd broker` in a route‑fix prologue that drops any default route still bound to the internal interface (identified by the internal subnet passed to it).
 
 ### 9.2 What code moves where
 
