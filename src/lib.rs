@@ -17,6 +17,8 @@ pub(crate) use writ_core::bearer;
 #[cfg(feature = "host")]
 pub mod boot_reconcile;
 #[cfg(feature = "host")]
+pub mod broker_entrypoint;
+#[cfg(feature = "host")]
 pub mod broker_session;
 #[cfg(feature = "host")]
 pub(crate) mod clean_git;
