@@ -39,6 +39,11 @@ pub const BROKER_VM_SESSION_DIR: &str = "/writ/session";
 pub const BROKER_VM_SECRETS_DIR: &str = "/writ/secrets";
 /// Guest mount target for the durable audit directory (read-write).
 pub const BROKER_VM_AUDIT_DIR: &str = "/writ/audit";
+/// Guest path of the audit DB inside the mounted audit directory.
+pub const BROKER_VM_AUDIT_DB: &str = "/writ/audit/audit.db";
+/// Guest working root for the broker (on tmpfs inside the VM): clone scratch,
+/// bundle staging, the local nix-cache. Ephemeral per VM lifetime.
+pub const BROKER_VM_WORK_ROOT: &str = "/tmp/writ-broker-work";
 
 const SESSION_SPEC_FILE: &str = "session-spec.json";
 const BEARER_TOKEN_FILE: &str = "bearer-token";
@@ -297,6 +302,87 @@ impl BrokerVmPlan {
 /// port the broker binds inside its own VM.
 pub fn broker_url(broker_ipv4: Ipv4Addr, broker_port: BrokerPort) -> String {
     format!("http://{broker_ipv4}:{}/", broker_port.get())
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum BrokerConfigError {
+    #[error("host config is not valid JSON: {0}")]
+    Json(serde_json::Error),
+    #[error("host config top level is not a JSON object")]
+    NotObject,
+    #[error("host config has no agent_vm.vm_http section to derive the broker vm_http config from")]
+    MissingVmHttp,
+    #[error("derived broker config could not be serialised: {0}")]
+    Serialize(serde_json::Error),
+}
+
+/// Optional `vm_http` features whose backing directories live on the *host* and
+/// would be meaningless (or wrong) inside the broker VM. The first broker slice
+/// serves clone + upstream nix-cache + proxies only, so these are dropped — each
+/// then defaults under the guest `work_root` (or stays disabled). Durable/host-
+/// mounted variants are a later slice (see the plan doc §9.5/§9.6).
+const BROKER_DROPPED_VM_HTTP_KEYS: &[&str] = &[
+    "flake_mirror_cache_dir",
+    "flake_input_cache_dir",
+    "flake_materialize_scratch_dir",
+    "nix_prewarm_cache_dir",
+    "agent_run_log_root",
+    "git_push_staging_root",
+];
+
+/// Derive the broker VM's daemon config from the host daemon config: keep
+/// github_apps / policy / proxy settings, but rewrite the secret store, audit DB,
+/// and `vm_http` working root to the mounted guest locations and pin the broker
+/// port. Operates on the raw JSON so every operator setting the broker reads is
+/// preserved without depending on the (deserialize-only) typed config.
+///
+/// `work_root` is a parameter (not the [`BROKER_VM_WORK_ROOT`] constant) so tests
+/// can point `vm_http.to_runtime_config()` — the oracle that this config is one
+/// the broker accepts — at a temp dir instead of materialising the guest path.
+pub fn broker_config_json(
+    host_config_json: &str,
+    broker_port: BrokerPort,
+    work_root: &str,
+) -> Result<String, BrokerConfigError> {
+    let mut config: serde_json::Value =
+        serde_json::from_str(host_config_json).map_err(BrokerConfigError::Json)?;
+    let obj = config.as_object_mut().ok_or(BrokerConfigError::NotObject)?;
+
+    // Secrets and audit move to their mounted guest locations.
+    obj.insert(
+        "secret_store".to_string(),
+        serde_json::json!({ "type": "file", "path": BROKER_VM_SECRETS_DIR }),
+    );
+    obj.insert(
+        "audit_db".to_string(),
+        serde_json::Value::String(BROKER_VM_AUDIT_DB.to_string()),
+    );
+
+    let vm_http = obj
+        .get_mut("agent_vm")
+        .and_then(|agent_vm| agent_vm.get_mut("vm_http"))
+        .and_then(serde_json::Value::as_object_mut)
+        .ok_or(BrokerConfigError::MissingVmHttp)?;
+    vm_http.insert(
+        "work_root".to_string(),
+        serde_json::Value::String(work_root.to_string()),
+    );
+    // Pin the broker to exactly the fixed port (min == max), so the session
+    // spec's port is the only one in range — the broker entrypoint range-checks
+    // the spec against this.
+    vm_http.insert(
+        "broker_port_min".to_string(),
+        serde_json::json!(broker_port.get()),
+    );
+    vm_http.insert(
+        "broker_port_max".to_string(),
+        serde_json::json!(broker_port.get()),
+    );
+    for key in BROKER_DROPPED_VM_HTTP_KEYS {
+        vm_http.remove(*key);
+    }
+
+    serde_json::to_string_pretty(&config).map_err(BrokerConfigError::Serialize)
 }
 
 #[derive(Debug, thiserror::Error, Eq, PartialEq)]
@@ -694,6 +780,116 @@ mod tests {
             parse_broker_ipv4_on_network("[]", "writ-net"),
             Err(BrokerInspectError::NoContainer)
         );
+    }
+
+    /// A host daemon config whose `vm_http` sets host-path-only features (a
+    /// prewarm dir, a mirror cache, host staging roots) that must not survive
+    /// into the broker VM.
+    fn host_config_json() -> String {
+        r#"{
+            "github_apps": { "claude": {
+                "app_id": 1, "installation_id": 2,
+                "installation_owner": "o", "private_key_secret": "pk"
+            } },
+            "policy": { "default_ttl": 600, "writable_repos": [] },
+            "secret_store": { "type": "keyring", "service": "writ" },
+            "audit_db": "/Users/me/Library/writ/audit.db",
+            "agent_vm": {
+                "lifecycle": {
+                    "ipv4_pool": "192.168.0.0/16",
+                    "ipv6_pool": "fd83:b6f2:e57::/48",
+                    "subnet_index_min": 252,
+                    "subnet_index_max": 253,
+                    "pf_helper": "/usr/local/libexec/writ-agent-vm-pf-helper",
+                    "ipv6_mode": "ipv4_only_no_guest_ipv6",
+                    "image": "writ-agent-vm-guest:latest",
+                    "cpus": 1, "memory_mib": 512
+                },
+                "vm_http": {
+                    "bind_addr": "0.0.0.0",
+                    "broker_port_min": 18080,
+                    "broker_port_max": 18090,
+                    "git_program": "/usr/bin/git",
+                    "git_clone_base_url": "https://github.com",
+                    "askpass_program": "/usr/local/libexec/writ-git-askpass",
+                    "work_root": "/Users/me/Library/writ/git-work",
+                    "clone_timeout_secs": 30,
+                    "max_bundle_bytes": 1048576,
+                    "nix_cache_url": "https://cache.nixos.org",
+                    "nix_cache_trusted_public_keys": [],
+                    "nix_cache_max_metadata_bytes": 1048576,
+                    "nix_cache_max_nar_bytes": 67108864,
+                    "nix_prewarm_cache_dir": "/Users/me/Library/writ/prewarm",
+                    "flake_mirror_cache_dir": "/Users/me/Library/writ/mirror",
+                    "agent_run_log_root": "/Users/me/Library/writ/agent-runs",
+                    "git_push_staging_root": "/Users/me/Library/writ/git-push"
+                }
+            }
+        }"#
+        .to_string()
+    }
+
+    #[test]
+    fn broker_config_rewrites_paths_pins_port_and_drops_host_features() {
+        use crate::config::{DaemonConfig, SecretStoreConfig};
+
+        // A path that does NOT yet exist, so `to_runtime_config` creates it 0700
+        // (as it does for the real guest work_root); a pre-existing 0755 dir is
+        // correctly rejected as insecure.
+        let tmp = tempfile::tempdir().unwrap();
+        let work_root = tmp.path().join("broker-work");
+        let json = broker_config_json(
+            &host_config_json(),
+            BrokerPort::new(18080).unwrap(),
+            work_root.to_str().unwrap(),
+        )
+        .unwrap();
+
+        let config: DaemonConfig = serde_json::from_str(&json).unwrap();
+        // Secrets and audit point at the mounted guest locations.
+        match config.secret_store {
+            SecretStoreConfig::File { ref path } => {
+                assert_eq!(path.to_str().unwrap(), BROKER_VM_SECRETS_DIR)
+            }
+            other => panic!("expected a file secret store, got {other:?}"),
+        }
+        assert_eq!(
+            config.audit_db.as_deref(),
+            Some(Path::new(BROKER_VM_AUDIT_DB))
+        );
+
+        // The vm_http config is one the broker accepts (the strong oracle), the
+        // port is pinned, and the host-only features are gone.
+        let vm_http = config.agent_vm.expect("agent_vm present").vm_http;
+        let runtime = vm_http.to_runtime_config().unwrap();
+        let fixed = BrokerPort::new(18080).unwrap();
+        assert!(runtime.broker_port_range().contains(fixed));
+        assert!(
+            !runtime
+                .broker_port_range()
+                .contains(BrokerPort::new(18090).unwrap())
+        );
+        assert!(
+            runtime.nix_prewarm_cache_dir().is_none(),
+            "prewarm must be disabled in the v1 broker"
+        );
+        assert!(
+            runtime.flake_provision().is_none(),
+            "flake provisioning must be disabled in the v1 broker"
+        );
+    }
+
+    #[test]
+    fn broker_config_requires_a_vm_http_section() {
+        let no_vm_http = r#"{
+            "github_apps": {},
+            "policy": { "default_ttl": 600, "writable_repos": [] },
+            "secret_store": { "type": "keyring", "service": "writ" }
+        }"#;
+        assert!(matches!(
+            broker_config_json(no_vm_http, BrokerPort::new(18080).unwrap(), "/tmp/x"),
+            Err(BrokerConfigError::MissingVmHttp)
+        ));
     }
 
     #[test]
