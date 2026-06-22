@@ -338,12 +338,18 @@ impl AgentVmLifecycleRuntimeConfig {
                 max: subnet_index_max,
             });
         }
-        // The `vm` broker arm launches a second VM from `broker_image`; without
-        // it there is nothing to run, so reject the config up front rather than
-        // failing a session start later.
-        if broker_placement == BrokerPlacement::Vm && broker_image.is_none() {
-            return Err(AgentVmLifecycleRuntimeConfigError::BrokerImageRequiredForVmPlacement);
-        }
+        // Enforce the broker_image invariant at the type boundary: `Some` iff
+        // `Vm`. The vm arm launches a second VM from the image (so it is
+        // required, else nothing runs), and host placement runs no broker VM (so
+        // any image is ignored) — keeping `broker_image()` meaningful regardless
+        // of which constructor path built the config.
+        let broker_image = match broker_placement {
+            BrokerPlacement::Vm => Some(
+                broker_image
+                    .ok_or(AgentVmLifecycleRuntimeConfigError::BrokerImageRequiredForVmPlacement)?,
+            ),
+            BrokerPlacement::Host => None,
+        };
         pool.allocate(subnet_index_min)?;
         pool.allocate(subnet_index_max)?;
         Ok(Self {
@@ -559,6 +565,56 @@ impl Drop for AgentVmDaemon {
             let _ = handle.shutdown.send(true);
             handle.task.abort();
         }
+    }
+}
+
+#[cfg(test)]
+mod broker_image_invariant_tests {
+    use super::*;
+    use crate::core::{Ipv4Cidr, Ipv6Cidr};
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    fn build(
+        placement: BrokerPlacement,
+        broker_image: Option<&str>,
+    ) -> Result<AgentVmLifecycleRuntimeConfig, AgentVmLifecycleRuntimeConfigError> {
+        let pool = AgentNetworkPool::new(
+            Ipv4Cidr::new(Ipv4Addr::new(192, 168, 0, 0), 16).unwrap(),
+            Ipv6Cidr::new("fd83:b6f2:e57::".parse::<Ipv6Addr>().unwrap(), 48).unwrap(),
+        )
+        .unwrap();
+        AgentVmLifecycleRuntimeConfig::new(
+            pool,
+            252,
+            253,
+            AgentVmSessionStateStore::new("/tmp/writ-test-broker-image-invariant"),
+            Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6,
+            placement,
+            ContainerImage::new("agent:latest").unwrap(),
+            broker_image.map(|image| ContainerImage::new(image).unwrap()),
+            AgentVmResources::new(1, 512).unwrap(),
+            AgentVmToolPaths::new("/bin/container", "/bin/pf", "/bin/sudo"),
+        )
+    }
+
+    #[test]
+    fn host_discards_a_supplied_broker_image() {
+        // Even the public constructor keeps `broker_image()` == None for Host.
+        let cfg = build(BrokerPlacement::Host, Some("broker:latest")).unwrap();
+        assert!(cfg.broker_image().is_none());
+    }
+
+    #[test]
+    fn vm_requires_and_keeps_the_broker_image() {
+        assert!(matches!(
+            build(BrokerPlacement::Vm, None),
+            Err(AgentVmLifecycleRuntimeConfigError::BrokerImageRequiredForVmPlacement)
+        ));
+        let cfg = build(BrokerPlacement::Vm, Some("broker:latest")).unwrap();
+        assert_eq!(
+            cfg.broker_image().map(ContainerImage::as_str),
+            Some("broker:latest")
+        );
     }
 }
 
