@@ -95,6 +95,16 @@ Run a **debug** build of the broker: `cargo build --bin writd && ./target/debug/
 - **Multi‑network attach** works: a container with `--network internal --network default` gets both interfaces. Caveat: the default route landed on the no‑egress interface, so a dual‑homed VM must set its default route via the NAT interface.
 - **`--publish-socket`** carries host→guest service traffic (the working direction), usable for a host‑side review UI.
 
+### 8.1 Apple `container` 1.0.0 CLI facts that shape the `vm` arm **[verified]**
+
+Checked against `container run --help` / `container network create --help` on the dev host (build `ee848e3`):
+
+- **No `--ip`.** `container run` cannot pin a container's address; `--network <name>[,mac=…][,mtu=…]` only names the network. ⇒ the broker VM's internal‑net IP must be **discovered after start** (`container inspect <id>`, JSON), then fed to the agent's `WRIT_BROKER_URL`. The broker **port** is still fixed by us (the broker binds it inside its own VM), so only the IP is dynamic.
+- **`--network` repeats** for dual‑homing (internal + egress).
+- **Bind mounts:** `--mount type=virtiofs,source=<host>,target=<guest>[,readonly]` (also `-v/--volume`). Used to inject the file secret store (ro), the durable audit dir (rw), and the per‑session material dir (rw, so the broker can publish its ready file back to the host). *Host‑verify on a real image:* the exact `type` token and that no‑`--internal` networks NAT.
+- **Egress network** = `container network create <name>` **without** `--internal` (and without `--subnet`; nothing else attaches, so let `container` assign).
+- Readiness is observed **host‑side** via the shared material mount (the broker's `--ready-file` lands in the mounted session dir), avoiding a `container exec` poll.
+
 ## 9. Proposed plan — Path A: broker in a dedicated trusted VM **[proposed]**
 
 **Principle:** move the broker off the macOS host into a Linux VM, so the agent→broker `accept()` happens in Linux (verified healthy), sidestepping the macOS vmnet bug at the root. Keep Apple `container`, the no‑egress agent, and the broker‑as‑trust‑boundary model.
@@ -130,7 +140,7 @@ Implementation discipline so the swap stays clean:
 
 - **Internal net** (`container network create --internal writ-net-<id> --subnet …`): carries agent↔broker; no NAT ⇒ the agent has **no egress by topology** (stronger than today's PF‑only control).
 - **Agent VM**: internal net only; its only reachable peer is the broker VM. `WRIT_BROKER_URL` = broker VM internal IP:port (instead of the host gateway). The boot egress‑gate's positive control becomes "reach broker VM"; negative ("no internet") is now also guaranteed by topology.
-- **Broker VM**: dual‑homed (internal + default/NAT); its image sets `default route via eth1` so outbound (GitHub/Anthropic/nix upstream) works while the internal subnet stays on eth0.
+- **Broker VM**: dual‑homed (egress/NAT + internal); outbound (GitHub/Anthropic/nix upstream) must use the NAT interface, not the no‑egress internal one. The launch plan (`broker_vm.rs`) keeps the default route on egress two ways: it attaches the **egress network first** (Apple `container` puts the default route on the first‑attached network — see §8.1), and it wraps `writd broker` in a route‑fix prologue that drops any default route still bound to the internal interface (identified by the internal subnet passed to it).
 
 ### 9.2 What code moves where
 
