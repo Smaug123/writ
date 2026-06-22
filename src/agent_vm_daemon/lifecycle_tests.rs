@@ -10,6 +10,45 @@ use std::fs;
 use std::path::Path;
 
 #[tokio::test]
+async fn vm_broker_placement_is_rejected_until_implemented() {
+    let dir = tempfile::tempdir().unwrap();
+    let args_log = dir.path().join("args.log");
+    let env_path_log = dir.path().join("env-path.log");
+    let env_log = dir.path().join("env.log");
+    let fake_tool = write_fake_tool(dir.path(), &args_log, &env_path_log, &env_log);
+    let (config, _state_store) =
+        daemon_config_with_broker_placement(dir.path(), &fake_tool, BrokerPlacement::Vm);
+    let daemon = AgentVmDaemon::new(config);
+    let state = make_state_with_audit(AuditLog::open(dir.path().join("audit.db")).unwrap());
+
+    let err = daemon
+        .start_session(
+            Arc::clone(&state),
+            Some("vm placement".into()),
+            None,
+            None,
+            None,
+            vec!["sleep".into(), "600".into()],
+        )
+        .await
+        .unwrap_err();
+
+    let AgentVmDaemonError::StartFailed { source, .. } = err else {
+        panic!("vm placement should fail with StartFailed, got {err:?}");
+    };
+    assert!(
+        matches!(*source, AgentVmDaemonError::BrokerPlacementNotImplemented),
+        "vm placement should fail fast with BrokerPlacementNotImplemented, got {source:?}"
+    );
+    // Fail-fast: the guard runs before any container/network work, so the fake
+    // `container` tool was never invoked.
+    assert!(
+        !args_log.exists(),
+        "no container command should run when broker_placement=vm is rejected"
+    );
+}
+
+#[tokio::test]
 async fn daemon_start_injects_vm_http_env_without_persisting_token_and_stop_cleans_up() {
     let dir = tempfile::tempdir().unwrap();
     let args_log = dir.path().join("args.log");

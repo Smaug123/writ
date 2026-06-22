@@ -19,10 +19,11 @@ use crate::agent_run::{AgentPrompt, AgentRunId, CorrelationId};
 use crate::agent_vm_lifecycle::{
     AgentVmGuestEnvVar, AgentVmLifecycleConfigError, AgentVmResources, AgentVmSessionManagerError,
     AgentVmSessionPlan, AgentVmSessionState, AgentVmSessionStateError, AgentVmSessionStateStatus,
-    AgentVmSessionStateStore, AgentVmToolPaths, ContainerImage, HostIface, Ipv6IsolationMode,
-    NetworkHealth, ProbeDebounce, ProbeObservation, claim_agent_vm_session_subnet,
-    cleanup_managed_agent_vm_session, complete_agent_vm_session_start, evaluate_host_path,
-    host_interfaces, remove_managed_agent_vm_session_state,
+    AgentVmSessionStateStore, AgentVmToolPaths, BrokerPlacement, ContainerImage, HostIface,
+    Ipv6IsolationMode, NetworkHealth, ProbeDebounce, ProbeObservation,
+    claim_agent_vm_session_subnet, cleanup_managed_agent_vm_session,
+    complete_agent_vm_session_start, evaluate_host_path, host_interfaces,
+    remove_managed_agent_vm_session_state,
 };
 use crate::audit::{AgentRunAuditRecord, AgentVmNetworkHealthEventRecord, AuditError, AuditLog};
 use crate::core::{
@@ -104,6 +105,7 @@ pub struct AgentVmLifecycleRuntimeConfig {
     subnet_index_max: u16,
     state_store: AgentVmSessionStateStore,
     ipv6_mode: Ipv6IsolationMode,
+    broker_placement: BrokerPlacement,
     image: ContainerImage,
     resources: AgentVmResources,
     tools: AgentVmToolPaths,
@@ -163,6 +165,11 @@ pub enum AgentVmLifecycleRuntimeConfigError {
 pub enum AgentVmDaemonError {
     #[error("agent VM guest command must not be empty")]
     EmptyGuestCommand,
+    #[error(
+        "agent VM broker_placement \"vm\" is not yet implemented; \
+         use \"host\" (the default) until the broker-in-VM arm lands"
+    )]
+    BrokerPlacementNotImplemented,
     #[error("agent VM workspace destination must be absolute: {0}")]
     RelativeWorkspaceDestination(PathBuf),
     #[error("agent VM workspace destination must be valid UTF-8: {0}")]
@@ -311,6 +318,7 @@ impl AgentVmLifecycleRuntimeConfig {
         subnet_index_max: u16,
         state_store: AgentVmSessionStateStore,
         ipv6_mode: Ipv6IsolationMode,
+        broker_placement: BrokerPlacement,
         image: ContainerImage,
         resources: AgentVmResources,
         tools: AgentVmToolPaths,
@@ -329,10 +337,18 @@ impl AgentVmLifecycleRuntimeConfig {
             subnet_index_max,
             state_store,
             ipv6_mode,
+            broker_placement,
             image,
             resources,
             tools,
         })
+    }
+
+    /// Where the broker runs for this runtime. See [`BrokerPlacement`]. The
+    /// session-start path branches on this to decide whether to spin the broker
+    /// up in-process on the host (`Host`) or in a dedicated VM (`Vm`).
+    pub fn broker_placement(&self) -> BrokerPlacement {
+        self.broker_placement
     }
 
     pub fn pool(&self) -> AgentNetworkPool {
@@ -1173,6 +1189,15 @@ impl AgentVmDaemon {
         guest_command: Vec<String>,
         agent_runs: Option<VmHttpAgentRunService<S>>,
     ) -> Result<AgentVmStarted, AgentVmDaemonError> {
+        // Broker placement seam (see docs/vmnet-accept-bug-and-broker-vm-plan.md). The
+        // `Vm` arm (broker in a dedicated VM) is not implemented yet; fail fast
+        // rather than silently running the host path, which would not work around
+        // the macOS vmnet accept() defect the `vm` setting exists to dodge.
+        match self.config.lifecycle.broker_placement {
+            BrokerPlacement::Host => {}
+            BrokerPlacement::Vm => return Err(AgentVmDaemonError::BrokerPlacementNotImplemented),
+        }
+
         // Hold subnet_allocation_lock from `choose_subnet_index` through the
         // `claim_agent_vm_session_subnet` write, so the load+pick+commit
         // window is atomic across concurrent starts. The slow VM boot in
