@@ -650,11 +650,18 @@ impl AgentVmLifecycleConfig {
             Some(path) => path.clone(),
             None => default_agent_vm_state_dir()?,
         };
-        let broker_image = self
-            .broker_image
-            .as_ref()
-            .map(|image| ContainerImage::new(image.clone()))
-            .transpose()?;
+        // Only the vm arm runs a broker VM, so `broker_image` is meaningful only
+        // there. Ignore it entirely for host placement (as documented), so a
+        // stray/empty value on a host config can't reject startup and
+        // `broker_image()` stays `Some` exactly when placement is `Vm`.
+        let broker_image = match self.broker_placement {
+            BrokerPlacement::Vm => self
+                .broker_image
+                .as_ref()
+                .map(|image| ContainerImage::new(image.clone()))
+                .transpose()?,
+            BrokerPlacement::Host => None,
+        };
         Ok(AgentVmLifecycleRuntimeConfig::new(
             pool,
             self.subnet_index_min,
@@ -1926,6 +1933,18 @@ mod tests {
     fn host_placement_leaves_broker_image_unset() {
         let cfg: AgentVmLifecycleConfig =
             serde_json::from_str(&agent_vm_lifecycle_json("")).unwrap();
+        let runtime = cfg.to_runtime_config().unwrap();
+        assert!(runtime.broker_image().is_none());
+    }
+
+    #[test]
+    fn host_placement_ignores_a_set_broker_image() {
+        // broker_image is documented as ignored for the host broker: even an
+        // empty/garbage value must not reject startup, and broker_image() stays
+        // None so the "Some iff vm" invariant holds.
+        let cfg: AgentVmLifecycleConfig =
+            serde_json::from_str(&agent_vm_lifecycle_json(r#""broker_image": "","#)).unwrap();
+        assert_eq!(cfg.broker_placement, BrokerPlacement::Host);
         let runtime = cfg.to_runtime_config().unwrap();
         assert!(runtime.broker_image().is_none());
     }
