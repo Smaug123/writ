@@ -7,11 +7,12 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 
 use writ::agent_vm_daemon::AgentVmDaemon;
 use writ::audit::AuditLog;
 use writ::boot_reconcile::reconcile_pending_approve_attempts;
+use writ::broker_entrypoint::{BrokerArgs, run_broker};
 use writ::config::{DaemonConfig, SecretStoreConfig, default_audit_db_path, default_config_path};
 use writ::core::UnixMillis;
 use writ::git_push_staging::GitPushStagingStore;
@@ -28,6 +29,9 @@ use writ::ui_http::{
 #[derive(Parser)]
 #[command(name = "writd", about = "writ broker daemon")]
 struct Args {
+    #[command(subcommand)]
+    command: Option<Command>,
+
     /// Path to the JSON config file.
     #[arg(long, short = 'c')]
     config: Option<PathBuf>,
@@ -41,12 +45,66 @@ struct Args {
     audit_db: Option<PathBuf>,
 }
 
+#[derive(Subcommand)]
+enum Command {
+    /// Serve a single agent-VM HTTP session on a fixed port (the
+    /// `broker_placement = vm` arm). The host launcher owns the audit session
+    /// and supplies the session spec and bearer token out-of-band; see
+    /// `docs/vmnet-accept-bug-and-broker-vm-plan.md`.
+    Broker {
+        /// Path to the JSON daemon config file (secret store must be `file`).
+        #[arg(long, short = 'c')]
+        config: PathBuf,
+
+        /// Path to the JSON session spec (session id, agent subnet, fixed
+        /// `bind_addr:broker_port`).
+        #[arg(long)]
+        session_spec: PathBuf,
+
+        /// Path to the per-session bearer-token file.
+        #[arg(long)]
+        bearer_token_file: PathBuf,
+
+        /// Optional path created atomically once the broker is serving.
+        #[arg(long)]
+        ready_file: Option<PathBuf>,
+    },
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     writ::telemetry::init("info")?;
     let args = Args::parse();
 
-    let config_path = args.config.unwrap_or_else(default_config_path);
+    match args.command {
+        Some(Command::Broker {
+            config,
+            session_spec,
+            bearer_token_file,
+            ready_file,
+        }) => {
+            run_broker(BrokerArgs {
+                config,
+                session_spec,
+                bearer_token_file,
+                ready_file,
+            })
+            .await?;
+            return Ok(());
+        }
+        None => {}
+    }
+
+    run_host_daemon(args.config, args.socket, args.audit_db).await
+}
+
+/// The default `writd` mode: the host broker daemon listening on a Unix socket.
+async fn run_host_daemon(
+    config: Option<PathBuf>,
+    socket: Option<PathBuf>,
+    audit_db: Option<PathBuf>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let config_path = config.unwrap_or_else(default_config_path);
     let json = std::fs::read_to_string(&config_path)
         .map_err(|e| format!("cannot read config {}: {e}", config_path.display()))?;
     let config: DaemonConfig = serde_json::from_str(&json)
@@ -57,19 +115,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         agent_vm,
         secret_store,
         socket_path,
-        audit_db,
+        audit_db: audit_db_config,
         ui_http,
         run_agent,
     } = config;
 
-    let socket_path = args
-        .socket
-        .or(socket_path)
-        .unwrap_or_else(default_socket_path);
+    let socket_path = socket.or(socket_path).unwrap_or_else(default_socket_path);
 
-    let audit_db_path = args
-        .audit_db
-        .or(audit_db)
+    let audit_db_path = audit_db
+        .or(audit_db_config)
         .unwrap_or_else(default_audit_db_path);
     let agent_vm = agent_vm
         .as_ref()
