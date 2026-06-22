@@ -358,6 +358,10 @@ pub struct AgentVmLifecycleConfig {
     #[serde(default)]
     pub broker_placement: BrokerPlacement,
     pub image: String,
+    /// Image for the dedicated broker VM. Required when `broker_placement = vm`
+    /// (validated in [`Self::to_runtime_config`]); ignored for the host broker.
+    #[serde(default)]
+    pub broker_image: Option<String>,
     pub cpus: u16,
     pub memory_mib: u32,
 }
@@ -646,6 +650,18 @@ impl AgentVmLifecycleConfig {
             Some(path) => path.clone(),
             None => default_agent_vm_state_dir()?,
         };
+        // Only the vm arm runs a broker VM, so `broker_image` is meaningful only
+        // there. Ignore it entirely for host placement (as documented), so a
+        // stray/empty value on a host config can't reject startup and
+        // `broker_image()` stays `Some` exactly when placement is `Vm`.
+        let broker_image = match self.broker_placement {
+            BrokerPlacement::Vm => self
+                .broker_image
+                .as_ref()
+                .map(|image| ContainerImage::new(image.clone()))
+                .transpose()?,
+            BrokerPlacement::Host => None,
+        };
         Ok(AgentVmLifecycleRuntimeConfig::new(
             pool,
             self.subnet_index_min,
@@ -654,6 +670,7 @@ impl AgentVmLifecycleConfig {
             self.ipv6_mode,
             self.broker_placement,
             ContainerImage::new(self.image.clone())?,
+            broker_image,
             AgentVmResources::new(self.cpus, self.memory_mib)?,
             AgentVmToolPaths::new(
                 self.container.clone(),
@@ -1852,6 +1869,7 @@ mod tests {
             ipv6_mode: Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6,
             broker_placement: BrokerPlacement::Host,
             image: "alpine:latest".into(),
+            broker_image: None,
             cpus: 1,
             memory_mib: 512,
         }
@@ -1886,11 +1904,49 @@ mod tests {
 
     #[test]
     fn broker_placement_vm_parses_and_threads_to_runtime() {
-        let cfg: AgentVmLifecycleConfig =
-            serde_json::from_str(&agent_vm_lifecycle_json(r#""broker_placement": "vm","#)).unwrap();
+        let cfg: AgentVmLifecycleConfig = serde_json::from_str(&agent_vm_lifecycle_json(
+            r#""broker_placement": "vm", "broker_image": "writ-broker-vm:latest","#,
+        ))
+        .unwrap();
         assert_eq!(cfg.broker_placement, BrokerPlacement::Vm);
         let runtime = cfg.to_runtime_config().unwrap();
         assert_eq!(runtime.broker_placement(), BrokerPlacement::Vm);
+        assert_eq!(
+            runtime.broker_image().map(ContainerImage::as_str),
+            Some("writ-broker-vm:latest")
+        );
+    }
+
+    #[test]
+    fn broker_placement_vm_without_broker_image_is_rejected() {
+        let cfg: AgentVmLifecycleConfig =
+            serde_json::from_str(&agent_vm_lifecycle_json(r#""broker_placement": "vm","#)).unwrap();
+        assert!(matches!(
+            cfg.to_runtime_config(),
+            Err(AgentVmDaemonConfigError::LifecycleRuntime(
+                AgentVmLifecycleRuntimeConfigError::BrokerImageRequiredForVmPlacement
+            ))
+        ));
+    }
+
+    #[test]
+    fn host_placement_leaves_broker_image_unset() {
+        let cfg: AgentVmLifecycleConfig =
+            serde_json::from_str(&agent_vm_lifecycle_json("")).unwrap();
+        let runtime = cfg.to_runtime_config().unwrap();
+        assert!(runtime.broker_image().is_none());
+    }
+
+    #[test]
+    fn host_placement_ignores_a_set_broker_image() {
+        // broker_image is documented as ignored for the host broker: even an
+        // empty/garbage value must not reject startup, and broker_image() stays
+        // None so the "Some iff vm" invariant holds.
+        let cfg: AgentVmLifecycleConfig =
+            serde_json::from_str(&agent_vm_lifecycle_json(r#""broker_image": "","#)).unwrap();
+        assert_eq!(cfg.broker_placement, BrokerPlacement::Host);
+        let runtime = cfg.to_runtime_config().unwrap();
+        assert!(runtime.broker_image().is_none());
     }
 
     #[test]
