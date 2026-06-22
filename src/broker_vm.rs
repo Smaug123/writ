@@ -22,12 +22,15 @@
 //! egress is a network created *without* `--internal`. (Host-verify on a real
 //! image: the virtiofs mount `type` token and that a no-`--internal` network NATs.)
 
+use std::collections::BTreeSet;
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 
 use crate::agent_vm_lifecycle::{AgentVmResources, ContainerImage, ProcessInvocation};
 use crate::broker_session::BrokerSessionSpec;
+use crate::config::DaemonConfig;
 use crate::core::{BrokerPort, Ipv4Cidr, SessionId};
+use crate::secret::{FileSecretStore, SecretError, SecretKey, SecretStore};
 use crate::vm_http::VmHttpBearerToken;
 
 /// Guest mount target for the per-session material directory (config, session
@@ -426,6 +429,91 @@ pub fn broker_config_json(
     }
 
     serde_json::to_string_pretty(&config).map_err(BrokerConfigError::Serialize)
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum BrokerSecretExportError {
+    #[error("cannot open the ephemeral broker secret store at {path}: {source}")]
+    Open {
+        path: String,
+        #[source]
+        source: SecretError,
+    },
+    #[error("cannot read secret {key:?} from the host secret store: {source}")]
+    HostRead {
+        key: String,
+        #[source]
+        source: SecretError,
+    },
+    #[error("the host secret store has no value for {0:?}, which the broker needs")]
+    Missing(String),
+    #[error("cannot write secret {key:?} to the ephemeral broker secret store: {source}")]
+    Write {
+        key: String,
+        #[source]
+        source: SecretError,
+    },
+}
+
+/// The secret-store keys the broker VM needs to do its job: each GitHub App's
+/// private key (for token minting) and each configured proxy's auth secret.
+/// Deduplicated, since an operator may reuse one key across apps/proxies. The
+/// broker's v1 surface has no agent-run/git-push route, so the signing key is
+/// intentionally excluded.
+pub fn broker_secret_keys(config: &DaemonConfig) -> Vec<SecretKey> {
+    let mut keys = Vec::new();
+    let mut seen = BTreeSet::new();
+    let mut push = |key: &SecretKey, keys: &mut Vec<SecretKey>| {
+        if seen.insert(key.as_str().to_string()) {
+            keys.push(key.clone());
+        }
+    };
+    for app in config.github_apps.agent_apps().values() {
+        push(&app.private_key_secret, &mut keys);
+    }
+    if let Some(agent_vm) = &config.agent_vm {
+        if let Some(claude) = &agent_vm.vm_http.claude_proxy {
+            push(&claude.auth_secret, &mut keys);
+        }
+        if let Some(openai) = &agent_vm.vm_http.openai_proxy {
+            push(&openai.auth_secret, &mut keys);
+        }
+    }
+    keys
+}
+
+/// Inject the broker's secrets into a fresh **file** secret store at `dest_dir`,
+/// reading each from the host store (whatever its backend — keychain or file).
+/// This is what lets a keyring host serve `broker_placement = vm`: the host reads
+/// the keychain once and writes an ephemeral file store to mount into the broker
+/// VM (the executor removes it on teardown). A missing key is fatal — the broker
+/// would fail later — so it is surfaced here.
+pub fn export_broker_secrets(
+    host_store: &dyn SecretStore,
+    keys: &[SecretKey],
+    dest_dir: &Path,
+) -> Result<(), BrokerSecretExportError> {
+    let dest = FileSecretStore::create_or_open(dest_dir.to_path_buf()).map_err(|source| {
+        BrokerSecretExportError::Open {
+            path: dest_dir.display().to_string(),
+            source,
+        }
+    })?;
+    for key in keys {
+        let value = host_store
+            .get(key)
+            .map_err(|source| BrokerSecretExportError::HostRead {
+                key: key.as_str().to_string(),
+                source,
+            })?
+            .ok_or_else(|| BrokerSecretExportError::Missing(key.as_str().to_string()))?;
+        dest.put(key, &value)
+            .map_err(|source| BrokerSecretExportError::Write {
+                key: key.as_str().to_string(),
+                source,
+            })?;
+    }
+    Ok(())
 }
 
 #[derive(Debug, thiserror::Error, Eq, PartialEq)]
@@ -966,6 +1054,103 @@ mod tests {
                 Path::new("/var/lib/writ/audit.db"),
             ),
             Err(BrokerConfigError::MissingVmHttp)
+        ));
+    }
+
+    /// Two GitHub apps that *share* a private-key secret (so dedup is exercised)
+    /// plus a claude proxy with its own auth secret.
+    fn secret_config() -> crate::config::DaemonConfig {
+        let json = r#"{
+            "github_apps": {
+                "claude": { "app_id": 1, "installation_id": 2,
+                            "installation_owner": "o", "private_key_secret": "shared-pk" },
+                "codex":  { "app_id": 3, "installation_id": 4,
+                            "installation_owner": "o", "private_key_secret": "shared-pk" }
+            },
+            "policy": { "default_ttl": 600, "writable_repos": [] },
+            "secret_store": { "type": "keyring", "service": "writ" },
+            "agent_vm": {
+                "lifecycle": {
+                    "ipv4_pool": "192.168.0.0/16", "ipv6_pool": "fd83:b6f2:e57::/48",
+                    "subnet_index_min": 252, "subnet_index_max": 253,
+                    "pf_helper": "/usr/local/libexec/writ-agent-vm-pf-helper",
+                    "ipv6_mode": "ipv4_only_no_guest_ipv6",
+                    "image": "writ-agent-vm-guest:latest", "cpus": 1, "memory_mib": 512
+                },
+                "vm_http": {
+                    "bind_addr": "0.0.0.0", "broker_port_min": 18080, "broker_port_max": 18090,
+                    "git_clone_base_url": "https://github.com",
+                    "askpass_program": "/usr/local/libexec/writ-git-askpass",
+                    "work_root": "/tmp/wr", "clone_timeout_secs": 30, "max_bundle_bytes": 1048576,
+                    "nix_cache_url": "https://cache.nixos.org",
+                    "nix_cache_trusted_public_keys": [],
+                    "nix_cache_max_metadata_bytes": 1048576, "nix_cache_max_nar_bytes": 67108864,
+                    "claude_proxy": {
+                        "upstream_base_url": "https://api.anthropic.com",
+                        "auth_secret": "anthropic-api-key", "auth_kind": "x_api_key",
+                        "anthropic_version": "2023-06-01", "timeout_secs": 60,
+                        "max_request_bytes": 2097152, "max_response_bytes": 8388608
+                    }
+                }
+            }
+        }"#;
+        serde_json::from_str(json).unwrap()
+    }
+
+    #[test]
+    fn broker_secret_keys_collects_github_and_proxy_secrets_deduped() {
+        let keys: Vec<String> = broker_secret_keys(&secret_config())
+            .iter()
+            .map(|k| k.as_str().to_string())
+            .collect();
+        // Two apps share `shared-pk` (deduped to one), then the proxy secret.
+        assert_eq!(keys, vec!["shared-pk", "anthropic-api-key"]);
+    }
+
+    #[test]
+    fn export_broker_secrets_copies_only_the_needed_keys() {
+        let host_dir = tempfile::tempdir().unwrap();
+        let host = FileSecretStore::create_or_open(host_dir.path().join("host")).unwrap();
+        host.put(&SecretKey::new("shared-pk").unwrap(), "PEM-DATA")
+            .unwrap();
+        host.put(&SecretKey::new("anthropic-api-key").unwrap(), "sk-abc")
+            .unwrap();
+        host.put(&SecretKey::new("unrelated").unwrap(), "nope")
+            .unwrap();
+
+        let dest_dir = tempfile::tempdir().unwrap();
+        let dest_store = dest_dir.path().join("secrets");
+        let keys = broker_secret_keys(&secret_config());
+        export_broker_secrets(&host, &keys, &dest_store).unwrap();
+
+        let injected = FileSecretStore::open(dest_store).unwrap();
+        assert_eq!(
+            injected.get(&SecretKey::new("shared-pk").unwrap()).unwrap(),
+            Some("PEM-DATA".to_string())
+        );
+        assert_eq!(
+            injected
+                .get(&SecretKey::new("anthropic-api-key").unwrap())
+                .unwrap(),
+            Some("sk-abc".to_string())
+        );
+        // Secrets the broker does not need are not copied into the VM.
+        assert_eq!(
+            injected.get(&SecretKey::new("unrelated").unwrap()).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn export_broker_secrets_fails_on_a_missing_secret() {
+        let host_dir = tempfile::tempdir().unwrap();
+        let host = FileSecretStore::create_or_open(host_dir.path().join("host")).unwrap();
+        // host is missing `shared-pk` and `anthropic-api-key`.
+        let dest_dir = tempfile::tempdir().unwrap();
+        let keys = broker_secret_keys(&secret_config());
+        assert!(matches!(
+            export_broker_secrets(&host, &keys, &dest_dir.path().join("secrets")),
+            Err(BrokerSecretExportError::Missing(key)) if key == "shared-pk"
         ));
     }
 
