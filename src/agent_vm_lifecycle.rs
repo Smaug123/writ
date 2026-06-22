@@ -1167,12 +1167,24 @@ impl ProcessInvocation {
             .join(" ")
     }
 
-    fn run(&self) -> Result<(), ProcessInvocationError> {
+    pub fn run(&self) -> Result<(), ProcessInvocationError> {
         let output = self.output()?;
         if output.status.success() {
             return Ok(());
         }
         Err(self.failed_from_output(output))
+    }
+
+    /// Run the invocation and return its captured stdout on success (used to
+    /// parse `container inspect` output). Errors identically to [`Self::run`] on
+    /// a non-zero exit.
+    pub fn run_capturing_stdout(&self) -> Result<String, ProcessInvocationError> {
+        let output = self.output()?;
+        if output.status.success() {
+            Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+        } else {
+            Err(self.failed_from_output(output))
+        }
     }
 
     fn failed_from_output(&self, output: std::process::Output) -> ProcessInvocationError {

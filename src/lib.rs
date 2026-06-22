@@ -23,6 +23,8 @@ pub mod broker_session;
 #[cfg(feature = "host")]
 pub mod broker_vm;
 #[cfg(feature = "host")]
+pub mod broker_vm_runner;
+#[cfg(feature = "host")]
 pub(crate) mod clean_git;
 #[cfg(feature = "host")]
 pub mod cli;
