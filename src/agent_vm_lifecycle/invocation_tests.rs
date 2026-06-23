@@ -196,24 +196,31 @@ fn failed_vm_start_removes_vm_then_firewall_then_network() {
 }
 
 #[test]
-fn vm_placement_start_skips_network_and_firewall_steps() {
-    // The broker arm owns the shared network and there is no host PF, so the
-    // agent start begins at StartVm (then the IPv4-only probe/release).
+fn vm_placement_start_skips_only_network_creation_and_keeps_host_pf() {
+    // The broker arm creates the shared network, so the agent start skips
+    // CreateNetwork — but it still inspects the network and installs host PF
+    // (an `--internal` net does not isolate the agent from host services).
     let steps = plan_with_broker_placement(252, BrokerPlacement::Vm).start_steps();
     assert!(
-        matches!(steps.first(), Some(AgentVmStartStep::StartVm(_))),
-        "vm start must begin with StartVm, got {steps:?}"
+        !steps
+            .iter()
+            .any(|s| matches!(s, AgentVmStartStep::CreateNetwork(_))),
+        "vm start must not create the shared network: {steps:?}"
     );
     assert!(
-        !steps.iter().any(|s| matches!(
-            s,
-            AgentVmStartStep::CreateNetwork(_)
-                | AgentVmStartStep::InspectAndValidateNetwork(_)
-                | AgentVmStartStep::InstallFirewall(_)
-        )),
-        "vm start must not create/inspect the network or install PF: {steps:?}"
+        matches!(
+            steps.first(),
+            Some(AgentVmStartStep::InspectAndValidateNetwork(_))
+        ),
+        "vm start must still inspect the network first: {steps:?}"
     );
-    // Host placement is unchanged: it still provisions network + firewall first.
+    assert!(
+        steps
+            .iter()
+            .any(|s| matches!(s, AgentVmStartStep::InstallFirewall(_))),
+        "vm start must still install host PF: {steps:?}"
+    );
+    // Host placement is unchanged: it still creates the network first.
     let host = plan_with_broker_placement(252, BrokerPlacement::Host).start_steps();
     assert!(matches!(
         host.first(),
@@ -222,30 +229,29 @@ fn vm_placement_start_skips_network_and_firewall_steps() {
 }
 
 #[test]
-fn vm_placement_failed_start_removes_the_agent_vm_only() {
-    // The broker arm tears down the broker VM, egress net, and shared net, so a
-    // failed agent start in vm mode cleans up just the agent VM (no PF, no net).
+fn vm_placement_failed_start_removes_the_agent_vm_and_pf_but_not_the_network() {
+    // The broker arm owns the shared network, so a failed agent start cleans up
+    // the agent VM and its host PF anchor — but not the broker-owned network.
     let cleanup = plan_with_broker_placement(252, BrokerPlacement::Vm)
         .cleanup_after_partial_start(CompletedStartStep::FirewallInstalled);
     assert!(
-        cleanup
-            .iter()
-            .all(|inv| inv.program() == Path::new("container")),
-        "vm cleanup must only touch the agent VM via container: {cleanup:?}"
-    );
-    assert!(
-        !cleanup.iter().any(|inv| {
-            let args = inv.args_lossy();
-            args.first().map(String::as_str) == Some("network")
-                || args.contains(&"writ-agent-vm-pf-helper".to_string())
+        cleanup.iter().any(|inv| {
+            inv.args_lossy()
+                .starts_with(&["rm".to_string(), "-f".to_string()])
         }),
-        "vm cleanup must not remove the shared network or PF: {cleanup:?}"
+        "vm cleanup must remove the agent VM: {cleanup:?}"
     );
     assert!(
-        cleanup
+        cleanup.iter().any(|inv| inv
+            .args_lossy()
+            .contains(&"writ-agent-vm-pf-helper".to_string())),
+        "vm cleanup must remove host PF: {cleanup:?}"
+    );
+    assert!(
+        !cleanup
             .iter()
-            .any(|inv| inv.args_lossy().starts_with(&["rm".into(), "-f".into()])),
-        "vm cleanup must remove the agent VM: {cleanup:?}"
+            .any(|inv| inv.args_lossy().first().map(String::as_str) == Some("network")),
+        "vm cleanup must not remove the broker-owned network: {cleanup:?}"
     );
 }
 

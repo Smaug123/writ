@@ -561,21 +561,24 @@ impl AgentVmSessionPlan {
     /// before invoking `container run`.
     pub fn start_steps(&self) -> Vec<AgentVmStartStep> {
         let mut steps = Vec::new();
-        // Host mode provisions the agent's own network and host PF. The vm arm
-        // instead shares a network the broker arm has already created, inspected,
-        // and put the broker on, and relies on topology isolation (no host PF) —
-        // so the agent start skips network create/inspect and firewall install.
+        // Host mode creates the agent's own network; the vm arm shares a network
+        // the broker arm has already created (and removes), so the agent start
+        // skips CreateNetwork. Everything else — inspect/validate and **host PF**
+        // — still runs: `--internal` blocks internet egress but NOT host
+        // reachability (the macOS gateway 192.168.x.1 is still on the link), so
+        // the agent VM must be PF-filtered from host services exactly as in host
+        // mode.
         if self.broker_placement == BrokerPlacement::Host {
             steps.push(AgentVmStartStep::CreateNetwork(
                 self.create_network_invocation(),
             ));
-            steps.push(AgentVmStartStep::InspectAndValidateNetwork(
-                self.inspect_network_invocation(),
-            ));
-            steps.push(AgentVmStartStep::InstallFirewall(
-                self.install_firewall_invocation(),
-            ));
         }
+        steps.push(AgentVmStartStep::InspectAndValidateNetwork(
+            self.inspect_network_invocation(),
+        ));
+        steps.push(AgentVmStartStep::InstallFirewall(
+            self.install_firewall_invocation(),
+        ));
         steps.push(AgentVmStartStep::StartVm(self.start_vm_invocation()));
         if self.ipv6_mode == Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6 {
             // Enforce-then-verify the no-guest-IPv6 posture in one guest exec
@@ -609,16 +612,18 @@ impl AgentVmSessionPlan {
     ) -> Vec<ProcessInvocation> {
         match completed {
             CompletedStartStep::None => Vec::new(),
-            CompletedStartStep::NetworkCreated => self.stop_plan().network_removal_invocations(),
-            // In vm mode the only reachable phase is post-StartVm (no
-            // network/firewall steps run), and the broker arm owns the shared
-            // network + there is no host PF — so a failed agent start removes the
-            // agent VM only. The broker arm tears down the broker VM, egress
-            // network, and shared network.
-            CompletedStartStep::FirewallInstalled => match self.broker_placement {
-                BrokerPlacement::Host => self.stop_plan().stop_invocations(),
-                BrokerPlacement::Vm => self.stop_plan().vm_removal_invocations(),
+            // Host removes the network it created. In vm mode the broker arm owns
+            // the shared network and no firewall is installed in this phase yet,
+            // so there is nothing for the agent to clean up.
+            CompletedStartStep::NetworkCreated => match self.broker_placement {
+                BrokerPlacement::Host => self.stop_plan().network_removal_invocations(),
+                BrokerPlacement::Vm => Vec::new(),
             },
+            // `stop_invocations` is placement-aware: host removes the VM, host PF,
+            // and the network; vm removes the VM and host PF only (the broker arm
+            // owns the network). Both keep the host PF removal — `--internal`
+            // does not isolate the agent from host services.
+            CompletedStartStep::FirewallInstalled => self.stop_plan().stop_invocations(),
         }
     }
 
@@ -903,15 +908,16 @@ impl AgentVmSessionStopPlan {
     }
 
     pub fn stop_invocations(&self) -> Vec<ProcessInvocation> {
-        // In vm mode the broker arm owns the shared network and no host PF was
-        // installed, so teardown removes the agent VM only — never the
-        // broker-owned network or a PF anchor that was never created.
-        if self.broker_placement == BrokerPlacement::Vm {
-            return self.vm_removal_invocations();
-        }
+        // Both placements remove the agent VM and its host PF anchor: an
+        // `--internal` network blocks internet egress but not host reachability,
+        // so the agent VM is PF-filtered from host services in vm mode too. Only
+        // the shared network differs — in vm mode the broker arm owns and removes
+        // it, so the agent teardown leaves it alone.
         let mut invocations = self.vm_removal_invocations();
         invocations.push(self.remove_firewall_invocation());
-        invocations.extend(self.network_removal_invocations());
+        if self.broker_placement == BrokerPlacement::Host {
+            invocations.extend(self.network_removal_invocations());
+        }
         invocations
     }
 
@@ -1661,21 +1667,20 @@ fn run_cleanup_after_start_outcome(
     outcome: StartOutcome,
 ) -> Result<(), CleanupErrors> {
     match cleanup_step_after_start_outcome(outcome) {
-        Some(CompletedStartStep::NetworkCreated) => {
-            single_cleanup_result(run_network_cleanup_until_absent(&plan.stop_plan()))
-        }
-        // Must branch on placement exactly like the planned-cleanup helper
-        // `cleanup_after_partial_start`: in vm mode the broker arm owns the
-        // shared network and there is no host PF, so the real rollback removes
-        // the agent VM only. Running the full host stop here would try to delete
-        // the broker-owned shared network/PF and turn the start failure into a
-        // spurious CleanupAfterFailure.
-        Some(CompletedStartStep::FirewallInstalled) => match plan.broker_placement {
-            BrokerPlacement::Host => run_stop_plan_cleanup(&plan.stop_plan()),
-            BrokerPlacement::Vm => {
-                single_cleanup_result(run_vm_cleanup_until_absent(&plan.stop_plan()))
+        // Network-created phase: the firewall is not yet installed. Host removes
+        // the network it created; vm has nothing to clean (the broker arm owns
+        // the shared network).
+        Some(CompletedStartStep::NetworkCreated) => match plan.broker_placement {
+            BrokerPlacement::Host => {
+                single_cleanup_result(run_network_cleanup_until_absent(&plan.stop_plan()))
             }
+            BrokerPlacement::Vm => Ok(()),
         },
+        // Firewall-installed phase: `run_stop_plan_cleanup` branches on placement
+        // exactly like the planned-cleanup helper — host removes VM+PF+network,
+        // vm removes VM+PF (the broker arm owns the network). Both remove the PF
+        // anchor, so a vm start failure cannot strand host filtering.
+        Some(CompletedStartStep::FirewallInstalled) => run_stop_plan_cleanup(&plan.stop_plan()),
         Some(CompletedStartStep::None) | None => Ok(()),
     }
 }
@@ -1689,16 +1694,18 @@ fn run_stop_plan_cleanup(plan: &AgentVmSessionStopPlan) -> Result<(), CleanupErr
     if let Err(err) = run_vm_cleanup_until_absent(plan) {
         errors.push(err);
     }
-    // vm mode owns no host PF and shares a broker-owned network, so managed stop
-    // and boot reconcile remove the agent VM only. Removing the PF anchor or the
-    // shared network here would tear down resources this session never owned.
-    if plan.broker_placement == BrokerPlacement::Host {
-        if let Err(err) = plan.remove_firewall_invocation().run() {
-            errors.push(err);
-        }
-        if let Err(err) = run_network_cleanup_until_absent(plan) {
-            errors.push(err);
-        }
+    // Both placements remove the host PF anchor (an `--internal` network does not
+    // isolate the agent from host services).
+    if let Err(err) = plan.remove_firewall_invocation().run() {
+        errors.push(err);
+    }
+    // Only host mode removes the network: in vm mode the broker arm owns and
+    // tears down the shared network, so removing it here would destroy a resource
+    // this session never created.
+    if plan.broker_placement == BrokerPlacement::Host
+        && let Err(err) = run_network_cleanup_until_absent(plan)
+    {
+        errors.push(err);
     }
     finish_cleanup_errors(errors)
 }

@@ -132,24 +132,27 @@ fn managed_start_then_managed_stop_success_removes_state_record() {
 
 #[cfg(unix)]
 #[test]
-fn vm_placement_start_failure_rolls_back_the_agent_vm_only() {
-    // Drives the *real* rollback path (not just the planned-cleanup helper): in
-    // vm mode a StartVm failure must remove the agent VM only and never touch the
-    // broker-owned shared network or host PF.
+fn vm_placement_start_failure_rolls_back_the_agent_vm_and_pf_not_the_network() {
+    // Drives the *real* rollback path: in vm mode a StartVm failure removes the
+    // agent VM and its host PF anchor, but never the broker-owned shared network.
     let dir = tempfile::tempdir().unwrap();
     let store = AgentVmSessionStateStore::new(dir.path().join("state"));
     let log = dir.path().join("argv.log");
     let marker = dir.path().join("vm-exists");
-    // A stateful fake container: StartVm (`run`) creates the VM then fails;
-    // removal commands delete it; `list` reports it present iff the marker
-    // exists. This lets the real cleanup loop (probe → remove → probe) run the
-    // removal and then observe absence, i.e. a clean rollback.
+    // A stateful fake container/sudo/pf-helper: `network inspect` reports the
+    // shared subnet (so InspectAndValidate passes); StartVm (`run`) creates the
+    // VM then fails; removal commands delete it; `list` reports it present iff the
+    // marker exists, so the real cleanup loop runs the removal then sees absence.
     let tool = write_executable_script(
         dir.path(),
         "fail-startvm",
         &format!(
             "#!/bin/sh\n\
              printf '%s\\n' \"$*\" >> \"{log}\"\n\
+             if [ \"$1\" = network ] && [ \"$2\" = inspect ]; then\n\
+             printf '%s\\n' 'ipv4Subnet: 192.168.252.0/24' 'ipv4Gateway: 192.168.252.1'\n\
+             exit 0\n\
+             fi\n\
              case \"$1\" in\n\
              run) touch \"{marker}\"; exit 1 ;;\n\
              rm|stop|delete) rm -f \"{marker}\"; exit 0 ;;\n\
@@ -188,24 +191,26 @@ fn vm_placement_start_failure_rolls_back_the_agent_vm_only() {
     );
 
     let argv = std::fs::read_to_string(&log).unwrap();
-    // No network/PF provisioning start steps in vm mode...
+    // vm inspects and PF-installs (host protection), but does not create the
+    // network (the broker arm did)...
+    assert!(argv.contains("network inspect"), "{argv}");
+    assert!(argv.contains("install"), "{argv}"); // pf-helper install
     assert!(!argv.contains("network create"), "{argv}");
-    assert!(!argv.contains("network inspect"), "{argv}");
-    assert!(!argv.contains("install"), "{argv}"); // pf-helper install
     // ...StartVm was attempted (and failed)...
     assert!(argv.contains("run "), "{argv}");
-    // ...and rollback removed the agent VM only, not the broker-owned net/PF.
+    // ...and rollback removed the agent VM and the PF anchor, but not the
+    // broker-owned network.
     assert!(argv.contains("rm -f writ-agent-vm-"), "{argv}");
+    assert!(argv.contains("remove"), "{argv}"); // pf-helper remove
     assert!(!argv.contains("network rm"), "{argv}");
     assert!(!argv.contains("network delete"), "{argv}");
-    assert!(!argv.contains("remove"), "{argv}"); // pf-helper remove
 }
 
 #[test]
-fn vm_placement_persists_and_stop_removes_the_agent_vm_only() {
+fn vm_placement_persists_and_stop_removes_the_agent_vm_and_pf_not_the_network() {
     // The placement survives the persisted record, so a later managed stop /
     // reconcile (which rebuilds the stop plan from state) removes the agent VM
-    // only — never the broker-owned network or a PF anchor.
+    // and its host PF anchor — but not the broker-owned network.
     let plan = plan_with_broker_placement(252, BrokerPlacement::Vm);
     let state = AgentVmSessionState::from_start_plan(&plan, AgentVmSessionStateStatus::Running);
     let restored = AgentVmSessionState::from_json_bytes(&state.to_json_bytes().unwrap()).unwrap();
@@ -215,21 +220,20 @@ fn vm_placement_persists_and_stop_removes_the_agent_vm_only() {
     let stop = restored.to_stop_plan(tools).stop_invocations();
     assert!(
         stop.iter()
-            .all(|inv| inv.program() == Path::new("container")),
-        "{stop:?}"
-    );
-    assert!(
-        !stop.iter().any(|inv| {
-            let args = inv.args_lossy();
-            args.first().map(String::as_str) == Some("network")
-                || args.contains(&"writ-agent-vm-pf-helper".to_string())
-        }),
-        "vm stop must not remove the shared network or PF: {stop:?}"
-    );
-    assert!(
-        stop.iter()
             .any(|inv| inv.args_lossy().starts_with(&["rm".into(), "-f".into()])),
-        "{stop:?}"
+        "vm stop must remove the agent VM: {stop:?}"
+    );
+    assert!(
+        stop.iter().any(|inv| inv
+            .args_lossy()
+            .contains(&"writ-agent-vm-pf-helper".to_string())),
+        "vm stop must remove host PF: {stop:?}"
+    );
+    assert!(
+        !stop
+            .iter()
+            .any(|inv| inv.args_lossy().first().map(String::as_str) == Some("network")),
+        "vm stop must not remove the broker-owned network: {stop:?}"
     );
 }
 
