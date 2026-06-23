@@ -139,6 +139,9 @@ pub struct AgentVmSessionStopPlan {
     network: AgentNetwork,
     firewall_ipv6: Option<Ipv6Cidr>,
     names: AgentVmNames,
+    /// In `Vm` mode the broker arm owns the shared network and no host PF was
+    /// installed, so teardown removes the agent VM only.
+    broker_placement: BrokerPlacement,
     tools: AgentVmToolPaths,
 }
 
@@ -633,6 +636,7 @@ impl AgentVmSessionPlan {
             network: self.network,
             firewall_ipv6: self.firewall_ipv6_cidr(),
             names: self.names.clone(),
+            broker_placement: self.broker_placement,
             tools: self.tools.clone(),
         }
     }
@@ -846,6 +850,7 @@ impl AgentVmSessionStopPlan {
         pool: AgentNetworkPool,
         subnet_index: u16,
         ipv6_mode: Ipv6IsolationMode,
+        broker_placement: BrokerPlacement,
         tools: AgentVmToolPaths,
     ) -> Result<Self, AgentVmLifecycleConfigError> {
         let network = pool.allocate(subnet_index)?;
@@ -856,6 +861,7 @@ impl AgentVmSessionStopPlan {
             network,
             firewall_ipv6,
             names: AgentVmNames::for_session(session_id),
+            broker_placement,
             tools,
         })
     }
@@ -866,6 +872,7 @@ impl AgentVmSessionStopPlan {
         network: AgentNetwork,
         firewall_ipv6: Option<Ipv6Cidr>,
         names: AgentVmNames,
+        broker_placement: BrokerPlacement,
         tools: AgentVmToolPaths,
     ) -> Self {
         // Persisted state has already been parsed and cross-checked against the
@@ -878,6 +885,7 @@ impl AgentVmSessionStopPlan {
             network,
             firewall_ipv6,
             names,
+            broker_placement,
             tools,
         }
     }
@@ -895,6 +903,12 @@ impl AgentVmSessionStopPlan {
     }
 
     pub fn stop_invocations(&self) -> Vec<ProcessInvocation> {
+        // In vm mode the broker arm owns the shared network and no host PF was
+        // installed, so teardown removes the agent VM only — never the
+        // broker-owned network or a PF anchor that was never created.
+        if self.broker_placement == BrokerPlacement::Vm {
+            return self.vm_removal_invocations();
+        }
         let mut invocations = self.vm_removal_invocations();
         invocations.push(self.remove_firewall_invocation());
         invocations.extend(self.network_removal_invocations());
@@ -1675,11 +1689,16 @@ fn run_stop_plan_cleanup(plan: &AgentVmSessionStopPlan) -> Result<(), CleanupErr
     if let Err(err) = run_vm_cleanup_until_absent(plan) {
         errors.push(err);
     }
-    if let Err(err) = plan.remove_firewall_invocation().run() {
-        errors.push(err);
-    }
-    if let Err(err) = run_network_cleanup_until_absent(plan) {
-        errors.push(err);
+    // vm mode owns no host PF and shares a broker-owned network, so managed stop
+    // and boot reconcile remove the agent VM only. Removing the PF anchor or the
+    // shared network here would tear down resources this session never owned.
+    if plan.broker_placement == BrokerPlacement::Host {
+        if let Err(err) = plan.remove_firewall_invocation().run() {
+            errors.push(err);
+        }
+        if let Err(err) = run_network_cleanup_until_absent(plan) {
+            errors.push(err);
+        }
     }
     finish_cleanup_errors(errors)
 }

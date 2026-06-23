@@ -74,6 +74,10 @@ pub struct AgentVmSessionState {
     broker_ports: BrokerPorts,
     broker_port_range: BrokerPortRange,
     ipv6_mode: Ipv6IsolationMode,
+    /// Persisted so a later managed stop / boot reconcile tears the session down
+    /// with the right ownership: `Vm` sessions installed no host PF and share a
+    /// broker-owned network, so their cleanup removes the agent VM only.
+    broker_placement: BrokerPlacement,
     image: ContainerImage,
     guest_command: Vec<String>,
     resources: AgentVmResources,
@@ -119,6 +123,10 @@ struct PersistedAgentVmSessionState {
     broker_port_min: u16,
     broker_port_max: u16,
     ipv6_mode: PersistedIpv6IsolationMode,
+    // Defaulted so version-2 records written before the field existed (all host
+    // placement, since vm placement was never enabled) load as `Host`.
+    #[serde(default)]
+    broker_placement: BrokerPlacement,
     image: String,
     guest_command: Vec<String>,
     cpus: u16,
@@ -149,6 +157,7 @@ impl AgentVmSessionState {
             broker_ports: plan.broker_ports.clone(),
             broker_port_range: plan.broker_port_range,
             ipv6_mode: plan.ipv6_mode,
+            broker_placement: plan.broker_placement,
             image: plan.image.clone(),
             guest_command: plan.guest_command.clone(),
             resources: plan.resources,
@@ -270,6 +279,7 @@ impl AgentVmSessionState {
             broker_ports,
             broker_port_range,
             ipv6_mode,
+            broker_placement: persisted.broker_placement,
             image,
             guest_command: persisted.guest_command,
             resources,
@@ -337,6 +347,7 @@ impl AgentVmSessionState {
             self.network,
             firewall_ipv6_cidr_for_mode(self.ipv6_mode, self.network),
             self.names.clone(),
+            self.broker_placement,
             tools,
         )
     }
@@ -719,6 +730,7 @@ impl From<&AgentVmSessionState> for PersistedAgentVmSessionState {
             broker_port_min: value.broker_port_range.min().get(),
             broker_port_max: value.broker_port_range.max().get(),
             ipv6_mode: value.ipv6_mode.into(),
+            broker_placement: value.broker_placement,
             image: value.image.as_str().to_string(),
             guest_command: value.guest_command.clone(),
             cpus: value.resources.cpus(),

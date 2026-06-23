@@ -202,6 +202,60 @@ fn vm_placement_start_failure_rolls_back_the_agent_vm_only() {
 }
 
 #[test]
+fn vm_placement_persists_and_stop_removes_the_agent_vm_only() {
+    // The placement survives the persisted record, so a later managed stop /
+    // reconcile (which rebuilds the stop plan from state) removes the agent VM
+    // only — never the broker-owned network or a PF anchor.
+    let plan = plan_with_broker_placement(252, BrokerPlacement::Vm);
+    let state = AgentVmSessionState::from_start_plan(&plan, AgentVmSessionStateStatus::Running);
+    let restored = AgentVmSessionState::from_json_bytes(&state.to_json_bytes().unwrap()).unwrap();
+    assert_eq!(restored, state, "broker_placement must round-trip");
+
+    let tools = AgentVmToolPaths::new("container", "writ-agent-vm-pf-helper", "sudo");
+    let stop = restored.to_stop_plan(tools).stop_invocations();
+    assert!(
+        stop.iter()
+            .all(|inv| inv.program() == Path::new("container")),
+        "{stop:?}"
+    );
+    assert!(
+        !stop.iter().any(|inv| {
+            let args = inv.args_lossy();
+            args.first().map(String::as_str) == Some("network")
+                || args.contains(&"writ-agent-vm-pf-helper".to_string())
+        }),
+        "vm stop must not remove the shared network or PF: {stop:?}"
+    );
+    assert!(
+        stop.iter()
+            .any(|inv| inv.args_lossy().starts_with(&["rm".into(), "-f".into()])),
+        "{stop:?}"
+    );
+}
+
+#[test]
+fn pre_placement_record_loads_as_host_and_stops_network_and_pf() {
+    // A version-2 record written before broker_placement existed must default to
+    // Host (serde default) and still tear down the network + PF.
+    let plan = plan_with_broker_placement(252, BrokerPlacement::Host);
+    let state = AgentVmSessionState::from_start_plan(&plan, AgentVmSessionStateStatus::Running);
+    let mut json: serde_json::Value =
+        serde_json::from_slice(&state.to_json_bytes().unwrap()).unwrap();
+    json.as_object_mut().unwrap().remove("broker_placement");
+    let restored =
+        AgentVmSessionState::from_json_bytes(&serde_json::to_vec(&json).unwrap()).unwrap();
+    assert_eq!(restored, state, "absent broker_placement must load as Host");
+
+    let tools = AgentVmToolPaths::new("container", "writ-agent-vm-pf-helper", "sudo");
+    let stop = restored.to_stop_plan(tools).stop_invocations();
+    assert!(
+        stop.iter()
+            .any(|inv| inv.args_lossy().first().map(String::as_str) == Some("network")),
+        "host record must still remove the network: {stop:?}"
+    );
+}
+
+#[test]
 fn mark_running_does_not_recreate_removed_starting_record() {
     let dir = tempfile::tempdir().unwrap();
     let store = AgentVmSessionStateStore::new(dir.path());
