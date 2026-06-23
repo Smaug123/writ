@@ -76,6 +76,22 @@ impl SessionFirewallInstall {
     ) -> Result<Self, AgentVmConfigError> {
         broker_port_range.require_contains(&broker_ports)?;
         let network = pool.claim_firewall(ipv4, ipv6)?;
+        if let Some(broker_host) = broker_ipv4_host {
+            // The override whitelists this address on the broker ports before the
+            // blanket deny, so it must be inside the session subnet — otherwise a
+            // bad inspect result or manual invocation could open a non-broker
+            // host. And it must be an IPv4-only scope: a dual-stack scope would
+            // still allow the agent to the host IPv6 gateway.
+            if !network.ipv4().contains_addr(broker_host) {
+                return Err(AgentVmConfigError::BrokerHostOutsideSubnet {
+                    broker_host,
+                    subnet: network.ipv4(),
+                });
+            }
+            if network.ipv6().is_some() {
+                return Err(AgentVmConfigError::BrokerHostWithIpv6FirewallScope);
+            }
+        }
         Ok(Self {
             network,
             ruleset: session_firewall_pf_ruleset(
@@ -424,6 +440,61 @@ mod tests {
         assert!(matches!(
             err,
             AgentVmConfigError::AgentIpv4SubnetOutsidePool { .. }
+        ));
+    }
+
+    #[test]
+    fn install_accepts_a_broker_host_inside_an_ipv4_only_subnet() {
+        let install = SessionFirewallInstall::new(
+            session_id(),
+            pool(),
+            ipv4(),
+            None,
+            ports(),
+            BrokerPortRange::new(49152, 65535).unwrap(),
+            Some(Ipv4Addr::new(192, 168, 252, 5)),
+        )
+        .unwrap();
+        assert!(
+            install
+                .rendered_rules()
+                .contains("to 192.168.252.5 port $broker_ports")
+        );
+    }
+
+    #[test]
+    fn install_rejects_a_broker_host_outside_the_session_subnet() {
+        let err = SessionFirewallInstall::new(
+            session_id(),
+            pool(),
+            ipv4(),
+            None,
+            ports(),
+            BrokerPortRange::new(49152, 65535).unwrap(),
+            Some(Ipv4Addr::new(10, 0, 0, 5)),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            AgentVmConfigError::BrokerHostOutsideSubnet { .. }
+        ));
+    }
+
+    #[test]
+    fn install_rejects_a_broker_host_with_a_dual_stack_scope() {
+        let err = SessionFirewallInstall::new(
+            session_id(),
+            pool(),
+            ipv4(),
+            Some(ipv6()),
+            ports(),
+            BrokerPortRange::new(49152, 65535).unwrap(),
+            Some(Ipv4Addr::new(192, 168, 252, 5)),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            AgentVmConfigError::BrokerHostWithIpv6FirewallScope
         ));
     }
 

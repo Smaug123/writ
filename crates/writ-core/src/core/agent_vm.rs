@@ -158,6 +158,16 @@ pub enum AgentVmConfigError {
     AgentIpv4SubnetOutsidePool { subnet: Ipv4Cidr, pool: Ipv4Cidr },
     #[error("agent IPv6 subnet {subnet} is not inside configured pool {pool}")]
     AgentIpv6SubnetOutsidePool { subnet: Ipv6Cidr, pool: Ipv6Cidr },
+    #[error("broker host {broker_host} is not inside the session subnet {subnet}")]
+    BrokerHostOutsideSubnet {
+        broker_host: Ipv4Addr,
+        subnet: Ipv4Cidr,
+    },
+    #[error(
+        "a broker host override (broker_placement = vm) requires an IPv4-only firewall scope, \
+         but the session has an IPv6 scope that would still expose the host IPv6 gateway"
+    )]
+    BrokerHostWithIpv6FirewallScope,
 }
 
 impl Ipv4Cidr {
