@@ -8,7 +8,7 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::net::Ipv4Addr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -98,6 +98,18 @@ pub struct AgentVmDaemonRuntimeConfig {
     vm_http: VmHttpRuntimeConfig,
 }
 
+/// Host facts the broker-VM (`broker_placement = vm`) arm needs that are *not*
+/// fields of the parsed config: the raw host config text `broker_config_json`
+/// derives the broker config from, and the host's **effective** audit DB path
+/// (after the `--audit-db` override / config / default are resolved) the broker
+/// reopens through the mounted audit directory. Bundled so they are present as a
+/// unit — both or neither — and only for the vm arm.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct BrokerVmHostFacts {
+    host_config_json: String,
+    host_audit_db: PathBuf,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AgentVmLifecycleRuntimeConfig {
     pool: AgentNetworkPool,
@@ -111,6 +123,12 @@ pub struct AgentVmLifecycleRuntimeConfig {
     /// `broker_placement == Vm` (the `new` constructor enforces this). `None`
     /// for the host-broker path, which runs no second VM.
     broker_image: Option<ContainerImage>,
+    /// Host facts the vm arm needs (raw config text, effective audit DB path),
+    /// attached post-construction by [`Self::with_broker_vm_host_facts`] because
+    /// they are runtime facts (the file's raw text; the resolved audit path), not
+    /// parsed config fields. Retained only for `broker_placement == Vm`; `None`
+    /// for host placement and until the builder runs.
+    broker_vm_host_facts: Option<BrokerVmHostFacts>,
     resources: AgentVmResources,
     tools: AgentVmToolPaths,
 }
@@ -309,6 +327,20 @@ impl AgentVmDaemonRuntimeConfig {
         Ok(Self { lifecycle, vm_http })
     }
 
+    /// Attach the vm-arm host facts to the lifecycle config (see
+    /// [`AgentVmLifecycleRuntimeConfig::with_broker_vm_host_facts`]). A no-op for
+    /// host placement, so writd can call it unconditionally.
+    pub fn with_broker_vm_host_facts(
+        mut self,
+        host_config_json: &str,
+        host_audit_db: &Path,
+    ) -> Self {
+        self.lifecycle = self
+            .lifecycle
+            .with_broker_vm_host_facts(host_config_json, host_audit_db);
+        self
+    }
+
     pub fn lifecycle(&self) -> &AgentVmLifecycleRuntimeConfig {
         &self.lifecycle
     }
@@ -361,9 +393,32 @@ impl AgentVmLifecycleRuntimeConfig {
             broker_placement,
             image,
             broker_image,
+            broker_vm_host_facts: None,
             resources,
             tools,
         })
+    }
+
+    /// Attach the host facts the vm broker arm needs (the raw host config text the
+    /// broker config is derived from, and the effective audit DB path). A no-op
+    /// for host placement — these are meaningless without a broker VM — so the
+    /// caller (writd) can supply them unconditionally and the Some-iff-`Vm`
+    /// invariant holds regardless. Supplied post-construction because neither is a
+    /// parsed config field: the raw text is what writd read off disk, and the
+    /// audit path is resolved from `--audit-db` / config / default.
+    pub fn with_broker_vm_host_facts(
+        mut self,
+        host_config_json: &str,
+        host_audit_db: &Path,
+    ) -> Self {
+        self.broker_vm_host_facts = match self.broker_placement {
+            BrokerPlacement::Vm => Some(BrokerVmHostFacts {
+                host_config_json: host_config_json.to_string(),
+                host_audit_db: host_audit_db.to_path_buf(),
+            }),
+            BrokerPlacement::Host => None,
+        };
+        self
     }
 
     /// Where the broker runs for this runtime. See [`BrokerPlacement`]. The
@@ -377,6 +432,24 @@ impl AgentVmLifecycleRuntimeConfig {
     /// `broker_placement == Vm` (enforced by [`Self::new`]).
     pub fn broker_image(&self) -> Option<&ContainerImage> {
         self.broker_image.as_ref()
+    }
+
+    /// The raw host config text the vm arm derives the broker config from; `Some`
+    /// only for `broker_placement == Vm` once [`Self::with_broker_vm_host_facts`]
+    /// has run.
+    pub fn host_config_json(&self) -> Option<&str> {
+        self.broker_vm_host_facts
+            .as_ref()
+            .map(|facts| facts.host_config_json.as_str())
+    }
+
+    /// The host's effective audit DB path the vm arm mounts into the broker VM;
+    /// `Some` only for `broker_placement == Vm` once
+    /// [`Self::with_broker_vm_host_facts`] has run.
+    pub fn host_audit_db(&self) -> Option<&Path> {
+        self.broker_vm_host_facts
+            .as_ref()
+            .map(|facts| facts.host_audit_db.as_path())
     }
 
     pub fn pool(&self) -> AgentNetworkPool {

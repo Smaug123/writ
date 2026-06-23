@@ -125,10 +125,14 @@ async fn run_host_daemon(
     let audit_db_path = audit_db
         .or(audit_db_config)
         .unwrap_or_else(default_audit_db_path);
+    // Attach the vm-arm host facts (raw config text + effective audit DB path)
+    // the broker-VM placement needs but cannot read from the parsed config. A
+    // no-op for host placement, so it is unconditional here.
     let agent_vm = agent_vm
         .as_ref()
         .map(|agent_vm| agent_vm.to_runtime_config())
-        .transpose()?;
+        .transpose()?
+        .map(|cfg| cfg.with_broker_vm_host_facts(&json, &audit_db_path));
 
     if let Some(parent) = audit_db_path.parent() {
         std::fs::create_dir_all(parent)?;
