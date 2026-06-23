@@ -765,6 +765,133 @@ fn write_private_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     std::fs::write(path, contents)
 }
 
+/// The host-side, **non-secret** facts needed to bring up one session's broker
+/// VM, gathered as pure data (dependency rejection: the daemon supplies these;
+/// this module reads nothing from daemon state). The two secrets — the bearer
+/// token and the host secret store — are passed separately to
+/// [`materialize_broker_vm_session`] so this descriptor stays safe to `Debug`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BrokerVmSessionRequest {
+    /// The session this broker serves.
+    pub session_id: SessionId,
+    /// Selects which GitHub App key and proxy secret the broker may use — hence
+    /// which secrets are exported into its read-only store (see
+    /// [`broker_secret_keys`]).
+    pub agent_kind: AgentKind,
+    /// The broker VM guest image (ships `writd` + git/nix/askpass at the
+    /// well-known guest paths).
+    pub image: ContainerImage,
+    /// The `container` CLI the executor runs.
+    pub container_tool: PathBuf,
+    /// The shared `--internal` network the broker creates and the agent joins.
+    pub internal_network: String,
+    /// That network's subnet — also the agent subnet recorded in the session
+    /// spec, and what the route-fix prologue uses to demote the no-egress link.
+    pub agent_subnet: Ipv4Cidr,
+    /// The address the broker binds inside its own VM (the `vm_http` bind addr,
+    /// which the daemon constrains to `0.0.0.0`).
+    pub bind_addr: Ipv4Addr,
+    /// The fixed port the broker binds; the derived broker config pins the
+    /// allowed range to exactly this port.
+    pub broker_port: BrokerPort,
+    /// CPU/memory for the broker VM.
+    pub resources: AgentVmResources,
+    /// The host's **effective** audit DB path; the broker reopens the same file
+    /// through the mounted audit directory (keeping the basename).
+    pub host_audit_db: PathBuf,
+    /// Host directory mounted read-write at the guest session dir (config,
+    /// session spec, bearer token in; ready file out).
+    pub staging_dir: PathBuf,
+    /// Host directory mounted read-only as the broker's file secret store.
+    pub secrets_dir: PathBuf,
+    /// Host directory mounted read-write as the durable audit directory.
+    pub audit_dir: PathBuf,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum BrokerVmSessionError {
+    #[error("the host config is not valid JSON: {0}")]
+    HostConfigParse(serde_json::Error),
+    #[error("selecting the broker's secrets failed: {0}")]
+    SecretSelection(#[from] BrokerSecretSelectionError),
+    #[error("deriving the broker config failed: {0}")]
+    Config(#[from] BrokerConfigError),
+    #[error("writing broker session material under {dir} failed: {source}")]
+    Material {
+        dir: String,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("exporting the broker's secrets failed: {0}")]
+    SecretExport(#[from] BrokerSecretExportError),
+}
+
+/// Materialise everything one broker VM reads — its derived config, the session
+/// spec, the bearer token, and an ephemeral file secret store — into the
+/// request's host directories, and return the [`BrokerVmPlan`] that launches it.
+/// The caller hands that plan to [`crate::broker_vm_runner::launch_broker_vm`];
+/// this runs no `container` commands itself (functional core, imperative shell).
+///
+/// Ordering is chosen so a rejected or under-provisioned session leaves nothing
+/// to be mounted: secret *selection* (which may reject e.g. chatgpt_oauth) and
+/// config derivation happen before any write, then the ephemeral secret store is
+/// exported (self-cleaning on a missing key — see [`export_broker_secrets`])
+/// *before* the staging material, so a missing secret leaves neither the store
+/// nor the staging dir behind. Safe to re-run on the same directories (a retried
+/// launch): the secret store is reset, the stale `ready` marker cleared, and all
+/// material re-forced to `0600` (see [`write_session_material`]).
+pub fn materialize_broker_vm_session(
+    request: &BrokerVmSessionRequest,
+    host_config_json: &str,
+    bearer: &VmHttpBearerToken,
+    host_store: &dyn SecretStore,
+) -> Result<BrokerVmPlan, BrokerVmSessionError> {
+    // Parse the host config once for secret selection; `broker_config_json`
+    // reparses the raw text so every operator setting survives the rewrite
+    // untyped. Both reject the same malformed input, so this is fail-closed.
+    let config: DaemonConfig =
+        serde_json::from_str(host_config_json).map_err(BrokerVmSessionError::HostConfigParse)?;
+    // Select (and validate) the secrets before touching disk: an unsupported
+    // session fails with nothing materialised.
+    let keys = broker_secret_keys(&config, request.agent_kind)?;
+    let config_json = broker_config_json(
+        host_config_json,
+        request.broker_port,
+        BROKER_VM_WORK_ROOT,
+        &request.host_audit_db,
+    )?;
+
+    // Secrets first (self-cleaning on failure), then staging — so a missing key
+    // leaves no staging material either.
+    export_broker_secrets(host_store, &keys, &request.secrets_dir)?;
+
+    let spec = BrokerSessionSpec::new(
+        request.session_id,
+        request.agent_subnet,
+        request.bind_addr,
+        request.broker_port,
+    );
+    let material = |source| BrokerVmSessionError::Material {
+        dir: request.staging_dir.display().to_string(),
+        source,
+    };
+    write_session_material(&request.staging_dir, &spec, bearer).map_err(material)?;
+    write_private_file(&request.staging_dir.join(CONFIG_FILE), config_json.as_bytes())
+        .map_err(material)?;
+
+    Ok(BrokerVmPlan::new(
+        request.session_id,
+        request.image.clone(),
+        request.internal_network.clone(),
+        request.agent_subnet,
+        request.resources,
+        request.container_tool.clone(),
+        request.staging_dir.clone(),
+        request.secrets_dir.clone(),
+        request.audit_dir.clone(),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1463,5 +1590,306 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(token_mode, 0o600, "bearer token must be private");
+    }
+
+    // ----- materialize_broker_vm_session ------------------------------------
+
+    /// A keyring-backed host config the materializer rewrites for a broker VM: a
+    /// claude app + claude proxy (a Claude session needs `claude-pk` +
+    /// `anthropic-api-key`) and a codex app (whose key must NOT enter a Claude
+    /// VM). Mirrors a real host config so `broker_config_json` is exercised.
+    fn materialize_host_config_json() -> String {
+        r#"{
+            "github_apps": {
+                "claude": { "app_id": 1, "installation_id": 2,
+                            "installation_owner": "o", "private_key_secret": "claude-pk" },
+                "codex":  { "app_id": 3, "installation_id": 4,
+                            "installation_owner": "o", "private_key_secret": "codex-pk" }
+            },
+            "policy": { "default_ttl": 600, "writable_repos": [] },
+            "secret_store": { "type": "keyring", "service": "writ" },
+            "audit_db": "/Users/me/Library/writ/audit.db",
+            "agent_vm": {
+                "lifecycle": {
+                    "ipv4_pool": "192.168.0.0/16", "ipv6_pool": "fd83:b6f2:e57::/48",
+                    "subnet_index_min": 252, "subnet_index_max": 253,
+                    "pf_helper": "/usr/local/libexec/writ-agent-vm-pf-helper",
+                    "ipv6_mode": "ipv4_only_no_guest_ipv6",
+                    "image": "writ-agent-vm-guest:latest", "cpus": 1, "memory_mib": 512
+                },
+                "vm_http": {
+                    "bind_addr": "0.0.0.0", "broker_port_min": 18080, "broker_port_max": 18090,
+                    "git_clone_base_url": "https://github.com",
+                    "askpass_program": "/usr/local/libexec/writ-git-askpass",
+                    "work_root": "/Users/me/Library/writ/git-work",
+                    "clone_timeout_secs": 30, "max_bundle_bytes": 1048576,
+                    "nix_cache_url": "https://cache.nixos.org",
+                    "nix_cache_trusted_public_keys": [],
+                    "nix_cache_max_metadata_bytes": 1048576, "nix_cache_max_nar_bytes": 67108864,
+                    "claude_proxy": {
+                        "upstream_base_url": "https://api.anthropic.com",
+                        "auth_secret": "anthropic-api-key", "auth_kind": "x_api_key",
+                        "anthropic_version": "2023-06-01", "timeout_secs": 60,
+                        "max_request_bytes": 2097152, "max_response_bytes": 8388608
+                    }
+                }
+            }
+        }"#
+        .to_string()
+    }
+
+    /// As above but the codex agent's openai proxy refreshes via `chatgpt_oauth`,
+    /// which a read-only ephemeral export cannot serve — the materializer must
+    /// reject it before writing anything.
+    fn chatgpt_oauth_host_config_json() -> String {
+        r#"{
+            "github_apps": { "codex": { "app_id": 1, "installation_id": 2,
+                "installation_owner": "o", "private_key_secret": "codex-pk" } },
+            "policy": { "default_ttl": 600, "writable_repos": [] },
+            "secret_store": { "type": "keyring", "service": "writ" },
+            "agent_vm": {
+                "lifecycle": {
+                    "ipv4_pool": "192.168.0.0/16", "ipv6_pool": "fd83:b6f2:e57::/48",
+                    "subnet_index_min": 252, "subnet_index_max": 253,
+                    "pf_helper": "/usr/local/libexec/writ-agent-vm-pf-helper",
+                    "ipv6_mode": "ipv4_only_no_guest_ipv6",
+                    "image": "writ-agent-vm-guest:latest", "cpus": 1, "memory_mib": 512
+                },
+                "vm_http": {
+                    "bind_addr": "0.0.0.0", "broker_port_min": 18080, "broker_port_max": 18090,
+                    "git_clone_base_url": "https://github.com",
+                    "askpass_program": "/usr/local/libexec/writ-git-askpass",
+                    "work_root": "/tmp/wr", "clone_timeout_secs": 30, "max_bundle_bytes": 1048576,
+                    "nix_cache_url": "https://cache.nixos.org",
+                    "nix_cache_trusted_public_keys": [],
+                    "nix_cache_max_metadata_bytes": 1048576, "nix_cache_max_nar_bytes": 67108864,
+                    "openai_proxy": {
+                        "upstream_base_url": "https://chatgpt.com/backend-api/codex",
+                        "auth_secret": "chatgpt-bundle", "auth_kind": "chatgpt_oauth",
+                        "timeout_secs": 60, "max_request_bytes": 2097152,
+                        "max_response_bytes": 8388608
+                    }
+                }
+            }
+        }"#
+        .to_string()
+    }
+
+    fn host_store_with(entries: &[(&str, &str)]) -> (tempfile::TempDir, FileSecretStore) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileSecretStore::create_or_open(dir.path().join("host")).unwrap();
+        for (key, value) in entries {
+            store.put(&SecretKey::new(*key).unwrap(), value).unwrap();
+        }
+        (dir, store)
+    }
+
+    fn materialize_request(work: &Path) -> BrokerVmSessionRequest {
+        BrokerVmSessionRequest {
+            session_id: session_id(),
+            agent_kind: AgentKind::Claude,
+            image: ContainerImage::new("writ-broker-vm:latest").unwrap(),
+            container_tool: PathBuf::from("/usr/local/bin/container"),
+            internal_network: "writ-agent-net-51b8fd0f-6c10-454c-b0e6-7df1d60e2e6d".to_string(),
+            agent_subnet: Ipv4Cidr::new(Ipv4Addr::new(192, 168, 252, 0), 24).unwrap(),
+            bind_addr: Ipv4Addr::UNSPECIFIED,
+            broker_port: BrokerPort::new(18080).unwrap(),
+            resources: AgentVmResources::new(2, 1024).unwrap(),
+            host_audit_db: PathBuf::from("/Users/me/Library/writ/audit.db"),
+            staging_dir: work.join("session"),
+            secrets_dir: work.join("secrets"),
+            audit_dir: work.join("audit"),
+        }
+    }
+
+    #[test]
+    fn materialize_writes_material_the_broker_readers_accept() {
+        let (_host_dir, host) = host_store_with(&[
+            ("claude-pk", "PEM-DATA"),
+            ("anthropic-api-key", "sk-abc"),
+            ("codex-pk", "other"),
+        ]);
+        let work = tempfile::tempdir().unwrap();
+        let request = materialize_request(work.path());
+        let bearer = VmHttpBearerToken::generate();
+        let token = bearer.as_str().to_string();
+
+        let plan = materialize_broker_vm_session(
+            &request,
+            &materialize_host_config_json(),
+            &bearer,
+            &host,
+        )
+        .unwrap();
+
+        // config.json is exactly what broker_config_json produces (its own
+        // correctness is tested separately) and still parses as a broker config.
+        let written_config =
+            std::fs::read_to_string(request.staging_dir.join("config.json")).unwrap();
+        let expected_config = broker_config_json(
+            &materialize_host_config_json(),
+            BrokerPort::new(18080).unwrap(),
+            BROKER_VM_WORK_ROOT,
+            Path::new("/Users/me/Library/writ/audit.db"),
+        )
+        .unwrap();
+        assert_eq!(written_config, expected_config);
+        let _: crate::config::DaemonConfig = serde_json::from_str(&written_config).unwrap();
+
+        // The session spec round-trips through the broker's own reader (oracle).
+        let spec =
+            BrokerSessionSpec::read_file(&request.staging_dir.join("session-spec.json")).unwrap();
+        assert_eq!(spec.session_id, session_id());
+        assert_eq!(
+            spec.agent_ipv4_cidr,
+            Ipv4Cidr::new(Ipv4Addr::new(192, 168, 252, 0), 24).unwrap()
+        );
+        assert_eq!(spec.bind_addr, Ipv4Addr::UNSPECIFIED);
+        assert_eq!(spec.broker_port, 18080);
+
+        // The bearer token round-trips through the broker's reader.
+        let read_bearer =
+            read_bearer_token_file(&request.staging_dir.join("bearer-token")).unwrap();
+        assert_eq!(read_bearer.as_str(), token);
+
+        // The exported store holds exactly the Claude session's keys — never the
+        // codex app key.
+        let injected = FileSecretStore::open(request.secrets_dir.clone()).unwrap();
+        assert_eq!(
+            injected.get(&SecretKey::new("claude-pk").unwrap()).unwrap(),
+            Some("PEM-DATA".to_string())
+        );
+        assert_eq!(
+            injected
+                .get(&SecretKey::new("anthropic-api-key").unwrap())
+                .unwrap(),
+            Some("sk-abc".to_string())
+        );
+        assert_eq!(
+            injected.get(&SecretKey::new("codex-pk").unwrap()).unwrap(),
+            None
+        );
+
+        // The returned plan mounts those exact dirs and runs `writd broker`.
+        let args = plan.run_invocation().args_lossy();
+        assert!(args.contains(&format!(
+            "type=virtiofs,source={},target={BROKER_VM_SECRETS_DIR},readonly",
+            request.secrets_dir.display()
+        )));
+        assert!(args.contains(&format!(
+            "type=virtiofs,source={},target={BROKER_VM_SESSION_DIR}",
+            request.staging_dir.display()
+        )));
+        assert!(args.windows(2).any(|w| w[0] == "writd" && w[1] == "broker"));
+    }
+
+    #[test]
+    fn materialize_rejects_chatgpt_oauth_and_writes_nothing() {
+        let (_host_dir, host) = host_store_with(&[("codex-pk", "PEM")]);
+        let work = tempfile::tempdir().unwrap();
+        let mut request = materialize_request(work.path());
+        request.agent_kind = AgentKind::Codex;
+
+        let err = materialize_broker_vm_session(
+            &request,
+            &chatgpt_oauth_host_config_json(),
+            &VmHttpBearerToken::generate(),
+            &host,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            BrokerVmSessionError::SecretSelection(
+                BrokerSecretSelectionError::ChatgptOauthUnsupported
+            )
+        ));
+        assert!(
+            !request.secrets_dir.exists(),
+            "a rejected session must leave no secret store"
+        );
+        assert!(
+            !request.staging_dir.exists(),
+            "a rejected session must leave no staging material"
+        );
+    }
+
+    #[test]
+    fn materialize_fails_on_a_missing_secret_and_writes_nothing() {
+        // Host store is missing claude-pk / anthropic-api-key.
+        let (_host_dir, host) = host_store_with(&[]);
+        let work = tempfile::tempdir().unwrap();
+        let request = materialize_request(work.path());
+
+        let err = materialize_broker_vm_session(
+            &request,
+            &materialize_host_config_json(),
+            &VmHttpBearerToken::generate(),
+            &host,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            BrokerVmSessionError::SecretExport(BrokerSecretExportError::Missing(key))
+                if key == "claude-pk"
+        ));
+        assert!(!request.secrets_dir.exists(), "no partial secret store");
+        // Secrets are exported before staging is written, so a missing key leaves
+        // no staging material behind either.
+        assert!(
+            !request.staging_dir.exists(),
+            "no staging material when secret export fails first"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn materialized_config_is_private() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let (_host_dir, host) =
+            host_store_with(&[("claude-pk", "PEM"), ("anthropic-api-key", "sk")]);
+        let work = tempfile::tempdir().unwrap();
+        let request = materialize_request(work.path());
+        materialize_broker_vm_session(
+            &request,
+            &materialize_host_config_json(),
+            &VmHttpBearerToken::generate(),
+            &host,
+        )
+        .unwrap();
+        let mode = std::fs::metadata(request.staging_dir.join("config.json"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "broker config may carry policy and must be private");
+    }
+
+    #[test]
+    fn materialize_is_safe_to_rerun_and_clears_a_stale_ready_marker() {
+        let (_host_dir, host) =
+            host_store_with(&[("claude-pk", "PEM"), ("anthropic-api-key", "sk")]);
+        let work = tempfile::tempdir().unwrap();
+        let request = materialize_request(work.path());
+        materialize_broker_vm_session(
+            &request,
+            &materialize_host_config_json(),
+            &VmHttpBearerToken::generate(),
+            &host,
+        )
+        .unwrap();
+        // Simulate a prior broker having published readiness on the mount.
+        std::fs::write(request.staging_dir.join("ready"), "18080\n").unwrap();
+
+        materialize_broker_vm_session(
+            &request,
+            &materialize_host_config_json(),
+            &VmHttpBearerToken::generate(),
+            &host,
+        )
+        .unwrap();
+        assert!(
+            !request.staging_dir.join("ready").exists(),
+            "a relaunch must clear the stale ready marker before the broker rebinds"
+        );
     }
 }
