@@ -1908,7 +1908,10 @@ mod tests {
             .permissions()
             .mode()
             & 0o777;
-        assert_eq!(mode, 0o600, "broker config may carry policy and must be private");
+        assert_eq!(
+            mode, 0o600,
+            "broker config may carry policy and must be private"
+        );
     }
 
     #[test]
