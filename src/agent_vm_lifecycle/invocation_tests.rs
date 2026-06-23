@@ -196,6 +196,66 @@ fn failed_vm_start_removes_vm_then_firewall_then_network() {
 }
 
 #[test]
+fn vm_placement_start_skips_only_network_creation_and_keeps_host_pf() {
+    // The broker arm creates the shared network, so the agent start skips
+    // CreateNetwork — but it still inspects the network and installs host PF
+    // (an `--internal` net does not isolate the agent from host services).
+    let steps = plan_with_broker_placement(252, BrokerPlacement::Vm).start_steps();
+    assert!(
+        !steps
+            .iter()
+            .any(|s| matches!(s, AgentVmStartStep::CreateNetwork(_))),
+        "vm start must not create the shared network: {steps:?}"
+    );
+    assert!(
+        matches!(
+            steps.first(),
+            Some(AgentVmStartStep::InspectAndValidateNetwork(_))
+        ),
+        "vm start must still inspect the network first: {steps:?}"
+    );
+    assert!(
+        steps
+            .iter()
+            .any(|s| matches!(s, AgentVmStartStep::InstallFirewall(_))),
+        "vm start must still install host PF: {steps:?}"
+    );
+    // Host placement is unchanged: it still creates the network first.
+    let host = plan_with_broker_placement(252, BrokerPlacement::Host).start_steps();
+    assert!(matches!(
+        host.first(),
+        Some(AgentVmStartStep::CreateNetwork(_))
+    ));
+}
+
+#[test]
+fn vm_placement_failed_start_removes_the_agent_vm_and_pf_but_not_the_network() {
+    // The broker arm owns the shared network, so a failed agent start cleans up
+    // the agent VM and its host PF anchor — but not the broker-owned network.
+    let cleanup = plan_with_broker_placement(252, BrokerPlacement::Vm)
+        .cleanup_after_partial_start(CompletedStartStep::FirewallInstalled);
+    assert!(
+        cleanup.iter().any(|inv| {
+            inv.args_lossy()
+                .starts_with(&["rm".to_string(), "-f".to_string()])
+        }),
+        "vm cleanup must remove the agent VM: {cleanup:?}"
+    );
+    assert!(
+        cleanup.iter().any(|inv| inv
+            .args_lossy()
+            .contains(&"writ-agent-vm-pf-helper".to_string())),
+        "vm cleanup must remove host PF: {cleanup:?}"
+    );
+    assert!(
+        !cleanup
+            .iter()
+            .any(|inv| inv.args_lossy().first().map(String::as_str) == Some("network")),
+        "vm cleanup must not remove the broker-owned network: {cleanup:?}"
+    );
+}
+
+#[test]
 fn broker_url_uses_host_only_gateway_and_broker_port() {
     let urls = plan(252).broker_urls();
     assert_eq!(urls[0].as_str(), "http://192.168.252.1:51375/");

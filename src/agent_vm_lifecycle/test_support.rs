@@ -51,3 +51,24 @@ pub(super) fn plan_with_ipv6_mode(index: u16, ipv6_mode: Ipv6IsolationMode) -> A
     )
     .unwrap()
 }
+
+pub(super) fn plan_with_broker_placement(
+    index: u16,
+    broker_placement: BrokerPlacement,
+) -> AgentVmSessionPlan {
+    AgentVmSessionPlan::new_with_guest_env(
+        session_id(),
+        pool(),
+        index,
+        ports(),
+        BrokerPortRange::new(49152, 65535).unwrap(),
+        Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6,
+        broker_placement,
+        ContainerImage::new("alpine:latest").unwrap(),
+        Vec::new(),
+        vec!["sleep".into(), "600".into()],
+        AgentVmResources::new(1, 512).unwrap(),
+        AgentVmToolPaths::new("container", "writ-agent-vm-pf-helper", "sudo"),
+    )
+    .unwrap()
+}

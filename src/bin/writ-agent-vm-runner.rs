@@ -9,9 +9,9 @@ use std::path::PathBuf;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use writ::agent_vm_lifecycle::{
     AgentVmResources, AgentVmSessionPlan, AgentVmSessionStateStore, AgentVmSessionStopPlan,
-    AgentVmStartInvocation, AgentVmToolPaths, ContainerImage, Ipv6IsolationMode, ProcessInvocation,
-    default_agent_vm_state_dir, start_agent_vm_session, start_managed_agent_vm_session,
-    stop_agent_vm_session, stop_managed_agent_vm_session,
+    AgentVmStartInvocation, AgentVmToolPaths, BrokerPlacement, ContainerImage, Ipv6IsolationMode,
+    ProcessInvocation, default_agent_vm_state_dir, start_agent_vm_session,
+    start_managed_agent_vm_session, stop_agent_vm_session, stop_managed_agent_vm_session,
 };
 use writ::core::{
     AgentNetworkPool, BrokerPort, BrokerPortRange, BrokerPorts, Ipv4Cidr, Ipv6Cidr, SessionId,
@@ -102,6 +102,12 @@ struct StopArgs {
     #[arg(long, value_enum)]
     ipv6_mode: Ipv6ModeArg,
 
+    /// Broker placement used when the session was started. `vm` sessions own no
+    /// host PF and share a broker-owned network, so their teardown removes the
+    /// agent VM only.
+    #[arg(long, value_enum, default_value = "host")]
+    broker_placement: BrokerPlacementArg,
+
     /// Print commands instead of executing them.
     #[arg(long)]
     dry_run: bool,
@@ -164,6 +170,23 @@ impl From<Ipv6ModeArg> for Ipv6IsolationMode {
         match value {
             Ipv6ModeArg::DualStackRequired => Self::DualStackRequired,
             Ipv6ModeArg::Ipv4OnlyNoGuestIpv6 => Self::Ipv4OnlyNoGuestIpv6,
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+enum BrokerPlacementArg {
+    /// In-process host broker (today's default).
+    Host,
+    /// Dedicated broker VM; teardown removes the agent VM only.
+    Vm,
+}
+
+impl From<BrokerPlacementArg> for BrokerPlacement {
+    fn from(value: BrokerPlacementArg) -> Self {
+        match value {
+            BrokerPlacementArg::Host => Self::Host,
+            BrokerPlacementArg::Vm => Self::Vm,
         }
     }
 }
@@ -286,6 +309,7 @@ fn build_stop_plan(
         parsed.pool,
         args.session.subnet_index,
         args.ipv6_mode.into(),
+        args.broker_placement.into(),
         tools,
     )?)
 }

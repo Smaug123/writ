@@ -121,6 +121,10 @@ pub struct AgentVmSessionPlan {
     broker_ports: BrokerPorts,
     broker_port_range: BrokerPortRange,
     ipv6_mode: Ipv6IsolationMode,
+    /// Where the session's broker runs. In `Vm` mode the broker arm owns the
+    /// shared network (created/inspected before the agent) and there is no host
+    /// PF, so the agent's start sequence and failure-cleanup omit those steps.
+    broker_placement: BrokerPlacement,
     image: ContainerImage,
     guest_env: Vec<AgentVmGuestEnvVar>,
     guest_command: Vec<String>,
@@ -135,6 +139,9 @@ pub struct AgentVmSessionStopPlan {
     network: AgentNetwork,
     firewall_ipv6: Option<Ipv6Cidr>,
     names: AgentVmNames,
+    /// In `Vm` mode the broker arm owns the shared network and no host PF was
+    /// installed, so teardown removes the agent VM only.
+    broker_placement: BrokerPlacement,
     tools: AgentVmToolPaths,
 }
 
@@ -456,6 +463,8 @@ impl AgentVmSessionPlan {
         resources: AgentVmResources,
         tools: AgentVmToolPaths,
     ) -> Result<Self, AgentVmLifecycleConfigError> {
+        // The convenience constructor (no guest env) is host-mode only; the vm
+        // arm always supplies guest env via `new_with_guest_env`.
         Self::new_with_guest_env(
             session_id,
             pool,
@@ -463,6 +472,7 @@ impl AgentVmSessionPlan {
             broker_ports,
             broker_port_range,
             ipv6_mode,
+            BrokerPlacement::Host,
             image,
             Vec::new(),
             guest_command,
@@ -479,6 +489,7 @@ impl AgentVmSessionPlan {
         broker_ports: BrokerPorts,
         broker_port_range: BrokerPortRange,
         ipv6_mode: Ipv6IsolationMode,
+        broker_placement: BrokerPlacement,
         image: ContainerImage,
         guest_env: Vec<AgentVmGuestEnvVar>,
         guest_command: Vec<String>,
@@ -499,6 +510,7 @@ impl AgentVmSessionPlan {
             broker_ports,
             broker_port_range,
             ipv6_mode,
+            broker_placement,
             image,
             guest_env,
             guest_command,
@@ -548,12 +560,26 @@ impl AgentVmSessionPlan {
     /// [`start_agent_vm_session`] writes the real 0600 env file immediately
     /// before invoking `container run`.
     pub fn start_steps(&self) -> Vec<AgentVmStartStep> {
-        let mut steps = vec![
-            AgentVmStartStep::CreateNetwork(self.create_network_invocation()),
-            AgentVmStartStep::InspectAndValidateNetwork(self.inspect_network_invocation()),
-            AgentVmStartStep::InstallFirewall(self.install_firewall_invocation()),
-            AgentVmStartStep::StartVm(self.start_vm_invocation()),
-        ];
+        let mut steps = Vec::new();
+        // Host mode creates the agent's own network; the vm arm shares a network
+        // the broker arm has already created (and removes), so the agent start
+        // skips CreateNetwork. Everything else — inspect/validate and **host PF**
+        // — still runs: `--internal` blocks internet egress but NOT host
+        // reachability (the macOS gateway 192.168.x.1 is still on the link), so
+        // the agent VM must be PF-filtered from host services exactly as in host
+        // mode.
+        if self.broker_placement == BrokerPlacement::Host {
+            steps.push(AgentVmStartStep::CreateNetwork(
+                self.create_network_invocation(),
+            ));
+        }
+        steps.push(AgentVmStartStep::InspectAndValidateNetwork(
+            self.inspect_network_invocation(),
+        ));
+        steps.push(AgentVmStartStep::InstallFirewall(
+            self.install_firewall_invocation(),
+        ));
+        steps.push(AgentVmStartStep::StartVm(self.start_vm_invocation()));
         if self.ipv6_mode == Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6 {
             // Enforce-then-verify the no-guest-IPv6 posture in one guest exec
             // (the script disables IPv6 in the guest kernel before reporting;
@@ -586,7 +612,17 @@ impl AgentVmSessionPlan {
     ) -> Vec<ProcessInvocation> {
         match completed {
             CompletedStartStep::None => Vec::new(),
-            CompletedStartStep::NetworkCreated => self.stop_plan().network_removal_invocations(),
+            // Host removes the network it created. In vm mode the broker arm owns
+            // the shared network and no firewall is installed in this phase yet,
+            // so there is nothing for the agent to clean up.
+            CompletedStartStep::NetworkCreated => match self.broker_placement {
+                BrokerPlacement::Host => self.stop_plan().network_removal_invocations(),
+                BrokerPlacement::Vm => Vec::new(),
+            },
+            // `stop_invocations` is placement-aware: host removes the VM, host PF,
+            // and the network; vm removes the VM and host PF only (the broker arm
+            // owns the network). Both keep the host PF removal — `--internal`
+            // does not isolate the agent from host services.
             CompletedStartStep::FirewallInstalled => self.stop_plan().stop_invocations(),
         }
     }
@@ -605,6 +641,7 @@ impl AgentVmSessionPlan {
             network: self.network,
             firewall_ipv6: self.firewall_ipv6_cidr(),
             names: self.names.clone(),
+            broker_placement: self.broker_placement,
             tools: self.tools.clone(),
         }
     }
@@ -818,6 +855,7 @@ impl AgentVmSessionStopPlan {
         pool: AgentNetworkPool,
         subnet_index: u16,
         ipv6_mode: Ipv6IsolationMode,
+        broker_placement: BrokerPlacement,
         tools: AgentVmToolPaths,
     ) -> Result<Self, AgentVmLifecycleConfigError> {
         let network = pool.allocate(subnet_index)?;
@@ -828,6 +866,7 @@ impl AgentVmSessionStopPlan {
             network,
             firewall_ipv6,
             names: AgentVmNames::for_session(session_id),
+            broker_placement,
             tools,
         })
     }
@@ -838,6 +877,7 @@ impl AgentVmSessionStopPlan {
         network: AgentNetwork,
         firewall_ipv6: Option<Ipv6Cidr>,
         names: AgentVmNames,
+        broker_placement: BrokerPlacement,
         tools: AgentVmToolPaths,
     ) -> Self {
         // Persisted state has already been parsed and cross-checked against the
@@ -850,6 +890,7 @@ impl AgentVmSessionStopPlan {
             network,
             firewall_ipv6,
             names,
+            broker_placement,
             tools,
         }
     }
@@ -867,9 +908,16 @@ impl AgentVmSessionStopPlan {
     }
 
     pub fn stop_invocations(&self) -> Vec<ProcessInvocation> {
+        // Both placements remove the agent VM and its host PF anchor: an
+        // `--internal` network blocks internet egress but not host reachability,
+        // so the agent VM is PF-filtered from host services in vm mode too. Only
+        // the shared network differs — in vm mode the broker arm owns and removes
+        // it, so the agent teardown leaves it alone.
         let mut invocations = self.vm_removal_invocations();
         invocations.push(self.remove_firewall_invocation());
-        invocations.extend(self.network_removal_invocations());
+        if self.broker_placement == BrokerPlacement::Host {
+            invocations.extend(self.network_removal_invocations());
+        }
         invocations
     }
 
@@ -1619,9 +1667,19 @@ fn run_cleanup_after_start_outcome(
     outcome: StartOutcome,
 ) -> Result<(), CleanupErrors> {
     match cleanup_step_after_start_outcome(outcome) {
-        Some(CompletedStartStep::NetworkCreated) => {
-            single_cleanup_result(run_network_cleanup_until_absent(&plan.stop_plan()))
-        }
+        // Network-created phase: the firewall is not yet installed. Host removes
+        // the network it created; vm has nothing to clean (the broker arm owns
+        // the shared network).
+        Some(CompletedStartStep::NetworkCreated) => match plan.broker_placement {
+            BrokerPlacement::Host => {
+                single_cleanup_result(run_network_cleanup_until_absent(&plan.stop_plan()))
+            }
+            BrokerPlacement::Vm => Ok(()),
+        },
+        // Firewall-installed phase: `run_stop_plan_cleanup` branches on placement
+        // exactly like the planned-cleanup helper — host removes VM+PF+network,
+        // vm removes VM+PF (the broker arm owns the network). Both remove the PF
+        // anchor, so a vm start failure cannot strand host filtering.
         Some(CompletedStartStep::FirewallInstalled) => run_stop_plan_cleanup(&plan.stop_plan()),
         Some(CompletedStartStep::None) | None => Ok(()),
     }
@@ -1636,10 +1694,17 @@ fn run_stop_plan_cleanup(plan: &AgentVmSessionStopPlan) -> Result<(), CleanupErr
     if let Err(err) = run_vm_cleanup_until_absent(plan) {
         errors.push(err);
     }
+    // Both placements remove the host PF anchor (an `--internal` network does not
+    // isolate the agent from host services).
     if let Err(err) = plan.remove_firewall_invocation().run() {
         errors.push(err);
     }
-    if let Err(err) = run_network_cleanup_until_absent(plan) {
+    // Only host mode removes the network: in vm mode the broker arm owns and
+    // tears down the shared network, so removing it here would destroy a resource
+    // this session never created.
+    if plan.broker_placement == BrokerPlacement::Host
+        && let Err(err) = run_network_cleanup_until_absent(plan)
+    {
         errors.push(err);
     }
     finish_cleanup_errors(errors)

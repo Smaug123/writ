@@ -17,6 +17,8 @@ use crate::broker_vm::{BrokerInspectError, BrokerVmPlan, parse_broker_ipv4_on_ne
 
 #[derive(Debug, thiserror::Error)]
 pub enum BrokerVmLaunchError {
+    #[error("creating the shared internal network failed: {0}")]
+    InternalNetwork(#[source] ProcessInvocationError),
     #[error("creating the broker egress network failed: {0}")]
     EgressNetwork(#[source] ProcessInvocationError),
     #[error("starting the broker VM failed: {0}")]
@@ -39,19 +41,27 @@ pub enum BrokerVmLaunchError {
 
 /// Start the broker VM and return its IPv4 address on the internal network.
 ///
-/// Sequence: create the egress network → `container run` the broker → wait
-/// (bounded by `ready_timeout`, polling every `poll_interval`) for `ready_file`
-/// to appear on the host side of the material mount → `container inspect` and
-/// read the broker's address on `plan.internal_network()`.
+/// Sequence: create the shared internal network (the broker arm owns it) → create
+/// the egress network → `container run` the broker → wait (bounded by
+/// `ready_timeout`, polling every `poll_interval`) for `ready_file` to appear on
+/// the host side of the material mount → `container inspect` and read the
+/// broker's address on `plan.internal_network()`.
 ///
-/// On any error the broker VM and egress network may be partially created; the
-/// caller is responsible for [`teardown_broker_vm`].
+/// On any error the networks and broker VM may be partially created; the caller
+/// is responsible for [`teardown_broker_vm`].
 pub async fn launch_broker_vm(
     plan: &BrokerVmPlan,
     ready_file: &Path,
     ready_timeout: Duration,
     poll_interval: Duration,
 ) -> Result<Ipv4Addr, BrokerVmLaunchError> {
+    // The broker starts first, so it creates the shared network the agent later
+    // joins (and removes it on teardown).
+    let internal = plan.create_internal_network_invocation();
+    tokio::task::spawn_blocking(move || internal.run())
+        .await?
+        .map_err(BrokerVmLaunchError::InternalNetwork)?;
+
     let egress = plan.create_egress_network_invocation();
     tokio::task::spawn_blocking(move || egress.run())
         .await?
@@ -168,7 +178,7 @@ exit 0
     }
 
     #[tokio::test]
-    async fn launch_creates_egress_runs_broker_then_discovers_ip() {
+    async fn launch_creates_networks_runs_broker_then_discovers_ip() {
         let dir = tempfile::tempdir().unwrap();
         let args_log = dir.path().join("args.log");
         let tool = write_fake_container(dir.path(), &args_log, "192.168.252.3");
@@ -188,12 +198,17 @@ exit 0
         .unwrap();
         assert_eq!(ip, Ipv4Addr::new(192, 168, 252, 3));
 
-        // Ordered: egress network created, broker run, then inspected.
+        // Ordered: shared internal network, then egress, then broker run, then
+        // inspect.
         let log = std::fs::read_to_string(&args_log).unwrap();
         let lines: Vec<&str> = log.lines().collect();
+        let internal = lines
+            .iter()
+            .position(|l| l.starts_with("network create --internal"))
+            .expect("shared internal network created");
         let egress = lines
             .iter()
-            .position(|l| l.starts_with("network create"))
+            .position(|l| l.starts_with("network create writ-broker-egress"))
             .expect("egress network created");
         let run = lines
             .iter()
@@ -203,7 +218,10 @@ exit 0
             .iter()
             .position(|l| l.starts_with("inspect "))
             .expect("inspected");
-        assert!(egress < run && run < inspect, "unexpected order: {lines:?}");
+        assert!(
+            internal < egress && egress < run && run < inspect,
+            "unexpected order: {lines:?}"
+        );
     }
 
     #[tokio::test]
@@ -227,7 +245,7 @@ exit 0
     }
 
     #[tokio::test]
-    async fn teardown_removes_the_vm_then_the_egress_network() {
+    async fn teardown_removes_the_vm_then_both_networks() {
         let dir = tempfile::tempdir().unwrap();
         let args_log = dir.path().join("args.log");
         let tool = write_fake_container(dir.path(), &args_log, "192.168.252.3");
@@ -242,13 +260,19 @@ exit 0
             .iter()
             .position(|l| l.starts_with("rm -f writ-broker-vm-"))
             .expect("vm removed");
-        let net_rm = lines
+        let egress_rm = lines
             .iter()
             .position(|l| l.starts_with("network rm writ-broker-egress-"))
             .expect("egress network removed");
+        let internal_rm = lines
+            .iter()
+            .position(|l| l.starts_with(&format!("network rm {INTERNAL_NET}")))
+            .expect("shared internal network removed");
+        // VM first, then egress, then the shared internal network (which is only
+        // free once the agent VM has also been stopped by the orchestrator).
         assert!(
-            rm < net_rm,
-            "vm must be removed before its network: {lines:?}"
+            rm < egress_rm && egress_rm < internal_rm,
+            "unexpected teardown order: {lines:?}"
         );
     }
 }

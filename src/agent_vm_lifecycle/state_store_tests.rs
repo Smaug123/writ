@@ -130,6 +130,135 @@ fn managed_start_then_managed_stop_success_removes_state_record() {
     assert!(matches!(missing, AgentVmSessionStateError::NotFound { .. }));
 }
 
+#[cfg(unix)]
+#[test]
+fn vm_placement_start_failure_rolls_back_the_agent_vm_and_pf_not_the_network() {
+    // Drives the *real* rollback path: in vm mode a StartVm failure removes the
+    // agent VM and its host PF anchor, but never the broker-owned shared network.
+    let dir = tempfile::tempdir().unwrap();
+    let store = AgentVmSessionStateStore::new(dir.path().join("state"));
+    let log = dir.path().join("argv.log");
+    let marker = dir.path().join("vm-exists");
+    // A stateful fake container/sudo/pf-helper: `network inspect` reports the
+    // shared subnet (so InspectAndValidate passes); StartVm (`run`) creates the
+    // VM then fails; removal commands delete it; `list` reports it present iff the
+    // marker exists, so the real cleanup loop runs the removal then sees absence.
+    let tool = write_executable_script(
+        dir.path(),
+        "fail-startvm",
+        &format!(
+            "#!/bin/sh\n\
+             printf '%s\\n' \"$*\" >> \"{log}\"\n\
+             if [ \"$1\" = network ] && [ \"$2\" = inspect ]; then\n\
+             printf '%s\\n' 'ipv4Subnet: 192.168.252.0/24' 'ipv4Gateway: 192.168.252.1'\n\
+             exit 0\n\
+             fi\n\
+             case \"$1\" in\n\
+             run) touch \"{marker}\"; exit 1 ;;\n\
+             rm|stop|delete) rm -f \"{marker}\"; exit 0 ;;\n\
+             list) [ -f \"{marker}\" ] && printf '%s\\n' \"writ-agent-vm-51b8fd0f-6c10-454c-b0e6-7df1d60e2e6d\"; exit 0 ;;\n\
+             *) exit 0 ;;\n\
+             esac\n",
+            log = log.display(),
+            marker = marker.display(),
+        ),
+    );
+    let plan = AgentVmSessionPlan::new_with_guest_env(
+        session_id(),
+        pool(),
+        252,
+        ports(),
+        BrokerPortRange::new(49152, 65535).unwrap(),
+        Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6,
+        BrokerPlacement::Vm,
+        ContainerImage::new("writ-broker-vm:latest").unwrap(),
+        Vec::new(),
+        vec!["sleep".into(), "600".into()],
+        AgentVmResources::new(1, 512).unwrap(),
+        AgentVmToolPaths::new(&tool, &tool, &tool),
+    )
+    .unwrap();
+
+    let err = start_managed_agent_vm_session(&store, &plan).unwrap_err();
+    // Clean rollback: the StartVm failure surfaces directly, not as a
+    // CleanupAfterFailure (which is what a wrong full-stop cleanup would cause).
+    assert!(
+        matches!(
+            err,
+            AgentVmSessionManagerError::Start(AgentVmLifecycleRunError::Start(_))
+        ),
+        "{err:?}"
+    );
+
+    let argv = std::fs::read_to_string(&log).unwrap();
+    // vm inspects and PF-installs (host protection), but does not create the
+    // network (the broker arm did)...
+    assert!(argv.contains("network inspect"), "{argv}");
+    assert!(argv.contains("install"), "{argv}"); // pf-helper install
+    assert!(!argv.contains("network create"), "{argv}");
+    // ...StartVm was attempted (and failed)...
+    assert!(argv.contains("run "), "{argv}");
+    // ...and rollback removed the agent VM and the PF anchor, but not the
+    // broker-owned network.
+    assert!(argv.contains("rm -f writ-agent-vm-"), "{argv}");
+    assert!(argv.contains("remove"), "{argv}"); // pf-helper remove
+    assert!(!argv.contains("network rm"), "{argv}");
+    assert!(!argv.contains("network delete"), "{argv}");
+}
+
+#[test]
+fn vm_placement_persists_and_stop_removes_the_agent_vm_and_pf_not_the_network() {
+    // The placement survives the persisted record, so a later managed stop /
+    // reconcile (which rebuilds the stop plan from state) removes the agent VM
+    // and its host PF anchor — but not the broker-owned network.
+    let plan = plan_with_broker_placement(252, BrokerPlacement::Vm);
+    let state = AgentVmSessionState::from_start_plan(&plan, AgentVmSessionStateStatus::Running);
+    let restored = AgentVmSessionState::from_json_bytes(&state.to_json_bytes().unwrap()).unwrap();
+    assert_eq!(restored, state, "broker_placement must round-trip");
+
+    let tools = AgentVmToolPaths::new("container", "writ-agent-vm-pf-helper", "sudo");
+    let stop = restored.to_stop_plan(tools).stop_invocations();
+    assert!(
+        stop.iter()
+            .any(|inv| inv.args_lossy().starts_with(&["rm".into(), "-f".into()])),
+        "vm stop must remove the agent VM: {stop:?}"
+    );
+    assert!(
+        stop.iter().any(|inv| inv
+            .args_lossy()
+            .contains(&"writ-agent-vm-pf-helper".to_string())),
+        "vm stop must remove host PF: {stop:?}"
+    );
+    assert!(
+        !stop
+            .iter()
+            .any(|inv| inv.args_lossy().first().map(String::as_str) == Some("network")),
+        "vm stop must not remove the broker-owned network: {stop:?}"
+    );
+}
+
+#[test]
+fn pre_placement_record_loads_as_host_and_stops_network_and_pf() {
+    // A version-2 record written before broker_placement existed must default to
+    // Host (serde default) and still tear down the network + PF.
+    let plan = plan_with_broker_placement(252, BrokerPlacement::Host);
+    let state = AgentVmSessionState::from_start_plan(&plan, AgentVmSessionStateStatus::Running);
+    let mut json: serde_json::Value =
+        serde_json::from_slice(&state.to_json_bytes().unwrap()).unwrap();
+    json.as_object_mut().unwrap().remove("broker_placement");
+    let restored =
+        AgentVmSessionState::from_json_bytes(&serde_json::to_vec(&json).unwrap()).unwrap();
+    assert_eq!(restored, state, "absent broker_placement must load as Host");
+
+    let tools = AgentVmToolPaths::new("container", "writ-agent-vm-pf-helper", "sudo");
+    let stop = restored.to_stop_plan(tools).stop_invocations();
+    assert!(
+        stop.iter()
+            .any(|inv| inv.args_lossy().first().map(String::as_str) == Some("network")),
+        "host record must still remove the network: {stop:?}"
+    );
+}
+
 #[test]
 fn mark_running_does_not_recreate_removed_starting_record() {
     let dir = tempfile::tempdir().unwrap();

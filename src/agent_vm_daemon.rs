@@ -1362,6 +1362,7 @@ impl AgentVmDaemon {
                 broker_ports,
                 self.config.vm_http.broker_port_range(),
                 self.config.lifecycle.ipv6_mode,
+                self.config.lifecycle.broker_placement,
                 self.config.lifecycle.image.clone(),
                 guest_env,
                 guest_command,
