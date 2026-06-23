@@ -826,10 +826,10 @@ pub enum BrokerVmSessionError {
     SecretExport(#[from] BrokerSecretExportError),
 }
 
-/// Write the broker VM's staging material as a unit: the session spec + bearer
-/// token (via [`write_session_material`]) and the derived config.json (`0600`).
-/// Grouped so [`materialize_broker_vm_session`] can roll the whole staging write
-/// back if any part fails.
+/// Write the broker VM's staging material: the session spec + bearer token (via
+/// [`write_session_material`]) and the derived config.json (`0600`). Grouped so
+/// [`materialize_broker_vm_session`] treats the staging write as one step (its
+/// caller clears the dir on any failure).
 fn write_broker_staging(
     staging_dir: &Path,
     spec: &BrokerSessionSpec,
@@ -840,21 +840,47 @@ fn write_broker_staging(
     write_private_file(&staging_dir.join(CONFIG_FILE), config_json.as_bytes())
 }
 
+/// Best-effort removal of a per-session path, whether it is a directory tree or a
+/// single file (a non-directory left by a prior attempt). Used to clear the
+/// staging + secret dirs on a failed materialization. A missing path is a no-op.
+fn remove_path_all(path: &Path) {
+    if std::fs::remove_dir_all(path).is_err() {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
 /// Materialise everything one broker VM reads — its derived config, the session
 /// spec, the bearer token, and an ephemeral file secret store — into the
 /// request's host directories, and return the [`BrokerVmPlan`] that launches it.
 /// The caller hands that plan to [`crate::broker_vm_runner::launch_broker_vm`];
 /// this runs no `container` commands itself (functional core, imperative shell).
 ///
-/// Ordering is chosen so a rejected or under-provisioned session leaves nothing
-/// to be mounted: secret *selection* (which may reject e.g. chatgpt_oauth) and
-/// config derivation happen before any write, then the ephemeral secret store is
-/// exported (self-cleaning on a missing key — see [`export_broker_secrets`])
-/// *before* the staging material, so a missing secret leaves neither the store
-/// nor the staging dir behind. Safe to re-run on the same directories (a retried
-/// launch): the secret store is reset, the stale `ready` marker cleared, and all
-/// material re-forced to `0600` (see [`write_session_material`]).
+/// **All-or-nothing.** On success the staging + secret dirs hold complete
+/// material; on *any* failure they are cleared, so an aborted or rejected launch
+/// leaves nothing to be mounted — even on a retry over a previous attempt's
+/// directories, where an early validation rejection (e.g. a config now using
+/// chatgpt_oauth) would otherwise leave stale config/bearer/secrets behind. The
+/// durable, host-shared audit dir is never touched. Safe to re-run on the same
+/// directories: a successful run resets the secret store, clears any stale
+/// `ready` marker, and re-forces material to `0600` (see [`write_session_material`]).
 pub fn materialize_broker_vm_session(
+    request: &BrokerVmSessionRequest,
+    host_config_json: &str,
+    bearer: &VmHttpBearerToken,
+    host_store: &dyn SecretStore,
+) -> Result<BrokerVmPlan, BrokerVmSessionError> {
+    let outcome =
+        materialize_broker_vm_session_inner(request, host_config_json, bearer, host_store);
+    if outcome.is_err() {
+        // Any failure leaves nothing to mount: clear the per-session staging +
+        // secret dirs (which this function owns) — but never the durable audit dir.
+        remove_path_all(&request.secrets_dir);
+        remove_path_all(&request.staging_dir);
+    }
+    outcome
+}
+
+fn materialize_broker_vm_session_inner(
     request: &BrokerVmSessionRequest,
     host_config_json: &str,
     bearer: &VmHttpBearerToken,
@@ -875,28 +901,20 @@ pub fn materialize_broker_vm_session(
         &request.host_audit_db,
     )?;
 
-    // Secrets first (self-cleaning on failure), then staging — so a missing key
-    // leaves no staging material either.
+    // Secrets first (self-cleaning on failure), then staging.
     export_broker_secrets(host_store, &keys, &request.secrets_dir)?;
-
-    // Past this point the exported store holds copied host secrets, so a staging
-    // failure must roll back *both* the store and any partial staging material:
-    // an aborted launch leaves nothing to mount (all-or-nothing, matching
-    // export_broker_secrets' own self-clean).
     let spec = BrokerSessionSpec::new(
         request.session_id,
         request.agent_subnet,
         request.bind_addr,
         request.broker_port,
     );
-    if let Err(source) = write_broker_staging(&request.staging_dir, &spec, bearer, &config_json) {
-        let _ = std::fs::remove_dir_all(&request.secrets_dir);
-        let _ = std::fs::remove_dir_all(&request.staging_dir);
-        return Err(BrokerVmSessionError::Material {
+    write_broker_staging(&request.staging_dir, &spec, bearer, &config_json).map_err(|source| {
+        BrokerVmSessionError::Material {
             dir: request.staging_dir.display().to_string(),
             source,
-        });
-    }
+        }
+    })?;
 
     Ok(BrokerVmPlan::new(
         request.session_id,
@@ -1829,6 +1847,55 @@ mod tests {
         assert!(
             !request.staging_dir.exists(),
             "a rejected session must leave no staging material"
+        );
+    }
+
+    #[test]
+    fn materialize_clears_prior_material_when_a_retry_is_rejected() {
+        // A successful materialization, then a retry on the SAME dirs whose config
+        // now switches the agent to chatgpt_oauth — rejected at selection, an early
+        // return before any write. The prior attempt's material must not survive.
+        let (_host_dir, host) = host_store_with(&[
+            ("claude-pk", "PEM"),
+            ("anthropic-api-key", "sk"),
+            ("codex-pk", "p"),
+        ]);
+        let work = tempfile::tempdir().unwrap();
+        let request = materialize_request(work.path());
+        materialize_broker_vm_session(
+            &request,
+            &materialize_host_config_json(),
+            &VmHttpBearerToken::generate(),
+            &host,
+        )
+        .unwrap();
+        assert!(request.staging_dir.join("config.json").exists());
+        assert!(request.secrets_dir.exists());
+
+        let mut retry = materialize_request(work.path());
+        retry.agent_kind = AgentKind::Codex;
+        let err = materialize_broker_vm_session(
+            &retry,
+            &chatgpt_oauth_host_config_json(),
+            &VmHttpBearerToken::generate(),
+            &host,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            BrokerVmSessionError::SecretSelection(
+                BrokerSecretSelectionError::ChatgptOauthUnsupported
+            )
+        ));
+        // Stale config/bearer/ready marker and copied secrets from the prior run
+        // must be gone — a rejected retry leaves nothing to mount.
+        assert!(
+            !request.staging_dir.exists(),
+            "stale staging material from the prior attempt must be cleared"
+        );
+        assert!(
+            !request.secrets_dir.exists(),
+            "stale exported secrets from the prior attempt must be cleared"
         );
     }
 
