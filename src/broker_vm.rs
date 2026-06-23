@@ -236,6 +236,25 @@ impl BrokerVmPlan {
         ]
     }
 
+    /// `container network create --internal --subnet <cidr> <shared-net>` — the
+    /// **shared** internal network the broker and agent both attach to. The
+    /// broker arm owns it: it starts first (so it must create the network the
+    /// agent later joins) and removes it on teardown. No NAT (`--internal`), so
+    /// the agent has no egress by topology.
+    pub fn create_internal_network_invocation(&self) -> ProcessInvocation {
+        ProcessInvocation::new(
+            self.container_tool.clone(),
+            [
+                "network".to_string(),
+                "create".to_string(),
+                "--internal".to_string(),
+                "--subnet".to_string(),
+                self.internal_cidr.to_string(),
+                self.internal_network.clone(),
+            ],
+        )
+    }
+
     /// `container network create <egress>` — no `--internal`, so the broker VM
     /// gets NAT egress on this interface. No `--subnet`: the address space is
     /// irrelevant (nothing else attaches), so let `container` assign one.
@@ -309,8 +328,12 @@ impl BrokerVmPlan {
     }
 
     /// Idempotent teardown: force-remove the broker VM, then remove its egress
-    /// network. The shared internal network is torn down by the agent-VM stop
-    /// plan, so it is intentionally absent here.
+    /// network, then the **shared internal network** the broker arm created.
+    ///
+    /// The internal network is removed last and must run only after the *agent*
+    /// VM has already been stopped (the daemon's vm-arm orchestration stops the
+    /// agent VM before tearing the broker down) — otherwise the network is still
+    /// in use. The agent VM's own stop plan removes the agent VM only.
     pub fn stop_invocations(&self) -> Vec<ProcessInvocation> {
         vec![
             ProcessInvocation::new(
@@ -323,6 +346,14 @@ impl BrokerVmPlan {
                     "network".to_string(),
                     "rm".to_string(),
                     self.names.egress_network.clone(),
+                ],
+            ),
+            ProcessInvocation::new(
+                self.container_tool.clone(),
+                [
+                    "network".to_string(),
+                    "rm".to_string(),
+                    self.internal_network.clone(),
                 ],
             ),
         ]
@@ -789,6 +820,24 @@ mod tests {
     }
 
     #[test]
+    fn internal_network_is_created_internal_with_the_shared_subnet() {
+        let args = sample_plan()
+            .create_internal_network_invocation()
+            .args_lossy();
+        assert_eq!(
+            args,
+            vec![
+                "network",
+                "create",
+                "--internal",
+                "--subnet",
+                "192.168.252.0/24",
+                "writ-agent-net-51b8fd0f-6c10-454c-b0e6-7df1d60e2e6d",
+            ]
+        );
+    }
+
+    #[test]
     fn run_invocation_is_dual_homed_with_mounts_and_broker_command() {
         let plan = sample_plan();
         let inv = plan.run_invocation();
@@ -878,7 +927,7 @@ mod tests {
     }
 
     #[test]
-    fn stop_invocations_remove_vm_then_egress_network() {
+    fn stop_invocations_remove_vm_then_egress_then_shared_internal_network() {
         let stops: Vec<Vec<String>> = sample_plan()
             .stop_invocations()
             .iter()
@@ -896,6 +945,11 @@ mod tests {
                     "network".to_string(),
                     "rm".to_string(),
                     "writ-broker-egress-51b8fd0f-6c10-454c-b0e6-7df1d60e2e6d".to_string(),
+                ],
+                vec![
+                    "network".to_string(),
+                    "rm".to_string(),
+                    "writ-agent-net-51b8fd0f-6c10-454c-b0e6-7df1d60e2e6d".to_string(),
                 ],
             ]
         );
