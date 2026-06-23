@@ -1950,6 +1950,49 @@ mod tests {
     }
 
     #[test]
+    fn broker_vm_host_facts_attach_only_for_vm_placement() {
+        let vm: AgentVmLifecycleConfig = serde_json::from_str(&agent_vm_lifecycle_json(
+            r#""broker_placement": "vm", "broker_image": "writ-broker-vm:latest","#,
+        ))
+        .unwrap();
+        let runtime = vm.to_runtime_config().unwrap().with_broker_vm_host_facts(
+            "{\"raw\":true}",
+            std::path::Path::new("/var/lib/writ/a.db"),
+        );
+        assert_eq!(runtime.host_config_json(), Some("{\"raw\":true}"));
+        assert_eq!(
+            runtime.host_audit_db(),
+            Some(std::path::Path::new("/var/lib/writ/a.db"))
+        );
+    }
+
+    #[test]
+    fn host_placement_ignores_broker_vm_host_facts() {
+        // writd calls the builder unconditionally; host placement must retain
+        // nothing, keeping the "Some iff vm" invariant.
+        let host: AgentVmLifecycleConfig =
+            serde_json::from_str(&agent_vm_lifecycle_json("")).unwrap();
+        let runtime = host.to_runtime_config().unwrap().with_broker_vm_host_facts(
+            "{\"raw\":true}",
+            std::path::Path::new("/var/lib/writ/a.db"),
+        );
+        assert!(runtime.host_config_json().is_none());
+        assert!(runtime.host_audit_db().is_none());
+    }
+
+    #[test]
+    fn broker_vm_host_facts_are_none_until_the_builder_runs() {
+        // Even a vm config carries no host facts until writd attaches them.
+        let vm: AgentVmLifecycleConfig = serde_json::from_str(&agent_vm_lifecycle_json(
+            r#""broker_placement": "vm", "broker_image": "writ-broker-vm:latest","#,
+        ))
+        .unwrap();
+        let runtime = vm.to_runtime_config().unwrap();
+        assert!(runtime.host_config_json().is_none());
+        assert!(runtime.host_audit_db().is_none());
+    }
+
+    #[test]
     fn broker_placement_rejects_unknown_value() {
         let err = serde_json::from_str::<AgentVmLifecycleConfig>(&agent_vm_lifecycle_json(
             r#""broker_placement": "elsewhere","#,
