@@ -826,6 +826,20 @@ pub enum BrokerVmSessionError {
     SecretExport(#[from] BrokerSecretExportError),
 }
 
+/// Write the broker VM's staging material as a unit: the session spec + bearer
+/// token (via [`write_session_material`]) and the derived config.json (`0600`).
+/// Grouped so [`materialize_broker_vm_session`] can roll the whole staging write
+/// back if any part fails.
+fn write_broker_staging(
+    staging_dir: &Path,
+    spec: &BrokerSessionSpec,
+    bearer: &VmHttpBearerToken,
+    config_json: &str,
+) -> std::io::Result<()> {
+    write_session_material(staging_dir, spec, bearer)?;
+    write_private_file(&staging_dir.join(CONFIG_FILE), config_json.as_bytes())
+}
+
 /// Materialise everything one broker VM reads — its derived config, the session
 /// spec, the bearer token, and an ephemeral file secret store — into the
 /// request's host directories, and return the [`BrokerVmPlan`] that launches it.
@@ -865,19 +879,24 @@ pub fn materialize_broker_vm_session(
     // leaves no staging material either.
     export_broker_secrets(host_store, &keys, &request.secrets_dir)?;
 
+    // Past this point the exported store holds copied host secrets, so a staging
+    // failure must roll back *both* the store and any partial staging material:
+    // an aborted launch leaves nothing to mount (all-or-nothing, matching
+    // export_broker_secrets' own self-clean).
     let spec = BrokerSessionSpec::new(
         request.session_id,
         request.agent_subnet,
         request.bind_addr,
         request.broker_port,
     );
-    let material = |source| BrokerVmSessionError::Material {
-        dir: request.staging_dir.display().to_string(),
-        source,
-    };
-    write_session_material(&request.staging_dir, &spec, bearer).map_err(material)?;
-    write_private_file(&request.staging_dir.join(CONFIG_FILE), config_json.as_bytes())
-        .map_err(material)?;
+    if let Err(source) = write_broker_staging(&request.staging_dir, &spec, bearer, &config_json) {
+        let _ = std::fs::remove_dir_all(&request.secrets_dir);
+        let _ = std::fs::remove_dir_all(&request.staging_dir);
+        return Err(BrokerVmSessionError::Material {
+            dir: request.staging_dir.display().to_string(),
+            source,
+        });
+    }
 
     Ok(BrokerVmPlan::new(
         request.session_id,
@@ -1838,6 +1857,34 @@ mod tests {
         assert!(
             !request.staging_dir.exists(),
             "no staging material when secret export fails first"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn materialize_rolls_back_exported_secrets_when_staging_fails() {
+        let (_host_dir, host) =
+            host_store_with(&[("claude-pk", "PEM"), ("anthropic-api-key", "sk")]);
+        let work = tempfile::tempdir().unwrap();
+        let request = materialize_request(work.path());
+        // Force the staging write to fail *after* secret export: pre-create the
+        // staging path as a regular file, so writing material under it fails
+        // (ENOTDIR). The export of the secret store still succeeds first.
+        std::fs::write(&request.staging_dir, b"not a dir").unwrap();
+
+        let err = materialize_broker_vm_session(
+            &request,
+            &materialize_host_config_json(),
+            &VmHttpBearerToken::generate(),
+            &host,
+        )
+        .unwrap_err();
+        assert!(matches!(err, BrokerVmSessionError::Material { .. }));
+        // The ephemeral store of copied host secrets must not survive an aborted
+        // launch.
+        assert!(
+            !request.secrets_dir.exists(),
+            "exported secrets must be rolled back when staging fails"
         );
     }
 
