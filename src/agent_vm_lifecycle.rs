@@ -8,7 +8,7 @@
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
-use std::net::Ipv6Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
@@ -122,9 +122,15 @@ pub struct AgentVmSessionPlan {
     broker_port_range: BrokerPortRange,
     ipv6_mode: Ipv6IsolationMode,
     /// Where the session's broker runs. In `Vm` mode the broker arm owns the
-    /// shared network (created/inspected before the agent) and there is no host
-    /// PF, so the agent's start sequence and failure-cleanup omit those steps.
+    /// shared network (created/inspected before the agent), so the agent's start
+    /// sequence and failure-cleanup omit the network create/remove (host PF still
+    /// applies — `--internal` does not isolate the agent from host services).
     broker_placement: BrokerPlacement,
+    /// IPv4 endpoint the host PF allows the agent to reach on the broker ports.
+    /// `None` (host placement) defaults to the subnet gateway. For vm placement
+    /// it is the broker VM's discovered IP, so the agent reaches its broker VM
+    /// while the gateway and the rest of the subnet stay blocked.
+    broker_pf_host: Option<Ipv4Addr>,
     image: ContainerImage,
     guest_env: Vec<AgentVmGuestEnvVar>,
     guest_command: Vec<String>,
@@ -511,12 +517,20 @@ impl AgentVmSessionPlan {
             broker_port_range,
             ipv6_mode,
             broker_placement,
+            broker_pf_host: None,
             image,
             guest_env,
             guest_command,
             resources,
             tools,
         })
+    }
+
+    /// Set the host-PF allow target to the broker VM's IP (vm placement). Without
+    /// this the PF allows the subnet gateway (the host-broker default).
+    pub fn with_broker_pf_host(mut self, broker_pf_host: Ipv4Addr) -> Self {
+        self.broker_pf_host = Some(broker_pf_host);
+        self
     }
 
     pub fn session_id(&self) -> SessionId {
@@ -746,6 +760,12 @@ impl AgentVmSessionPlan {
         if self.ipv6_mode == Ipv6IsolationMode::DualStackRequired {
             args.push(OsString::from("--ipv6-cidr"));
             args.push(OsString::from(self.network.ipv6().to_string()));
+        }
+        // Retarget the PF allow rule to the broker VM (vm placement). Absent for
+        // host placement, where the helper defaults to the subnet gateway.
+        if let Some(broker_pf_host) = self.broker_pf_host {
+            args.push(OsString::from("--broker-host"));
+            args.push(OsString::from(broker_pf_host.to_string()));
         }
         for port in self.broker_ports.as_slice() {
             args.push(OsString::from("--broker-port"));

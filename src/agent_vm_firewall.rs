@@ -6,6 +6,7 @@
 
 use std::fs::{self, OpenOptions};
 use std::io::Write;
+use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -71,12 +72,18 @@ impl SessionFirewallInstall {
         ipv6: Option<Ipv6Cidr>,
         broker_ports: BrokerPorts,
         broker_port_range: BrokerPortRange,
+        broker_ipv4_host: Option<Ipv4Addr>,
     ) -> Result<Self, AgentVmConfigError> {
         broker_port_range.require_contains(&broker_ports)?;
         let network = pool.claim_firewall(ipv4, ipv6)?;
         Ok(Self {
             network,
-            ruleset: session_firewall_pf_ruleset(session_id, network, &broker_ports),
+            ruleset: session_firewall_pf_ruleset(
+                session_id,
+                network,
+                &broker_ports,
+                broker_ipv4_host,
+            ),
         })
     }
 
@@ -389,6 +396,7 @@ mod tests {
             Some(ipv6()),
             ports(),
             BrokerPortRange::new(49152, 64999).unwrap(),
+            None,
         )
         .unwrap_err();
         assert_eq!(
@@ -410,6 +418,7 @@ mod tests {
             Some(ipv6()),
             ports(),
             BrokerPortRange::new(49152, 65535).unwrap(),
+            None,
         )
         .unwrap_err();
         assert!(matches!(

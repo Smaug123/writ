@@ -256,6 +256,37 @@ fn vm_placement_failed_start_removes_the_agent_vm_and_pf_but_not_the_network() {
 }
 
 #[test]
+fn vm_broker_pf_host_retargets_the_firewall_install_to_the_broker_vm_ip() {
+    fn firewall_args(plan: &AgentVmSessionPlan) -> Vec<String> {
+        plan.start_steps()
+            .into_iter()
+            .find_map(|s| match s {
+                AgentVmStartStep::InstallFirewall(inv) => Some(inv.args_lossy()),
+                _ => None,
+            })
+            .expect("start installs PF")
+    }
+
+    // vm placement with a discovered broker VM IP passes --broker-host so the PF
+    // allow rule targets the broker VM, not the gateway.
+    let vm = plan_with_broker_placement(252, BrokerPlacement::Vm)
+        .with_broker_pf_host(std::net::Ipv4Addr::new(192, 168, 252, 5));
+    let vm_args = firewall_args(&vm);
+    let pos = vm_args
+        .iter()
+        .position(|a| a == "--broker-host")
+        .expect("--broker-host present for vm");
+    assert_eq!(vm_args[pos + 1], "192.168.252.5");
+
+    // Host placement omits it (the helper defaults to the subnet gateway).
+    let host_args = firewall_args(&plan_with_broker_placement(252, BrokerPlacement::Host));
+    assert!(
+        !host_args.iter().any(|a| a == "--broker-host"),
+        "{host_args:?}"
+    );
+}
+
+#[test]
 fn broker_url_uses_host_only_gateway_and_broker_port() {
     let urls = plan(252).broker_urls();
     assert_eq!(urls[0].as_str(), "http://192.168.252.1:51375/");
