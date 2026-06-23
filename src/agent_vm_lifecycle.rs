@@ -1650,7 +1650,18 @@ fn run_cleanup_after_start_outcome(
         Some(CompletedStartStep::NetworkCreated) => {
             single_cleanup_result(run_network_cleanup_until_absent(&plan.stop_plan()))
         }
-        Some(CompletedStartStep::FirewallInstalled) => run_stop_plan_cleanup(&plan.stop_plan()),
+        // Must branch on placement exactly like the planned-cleanup helper
+        // `cleanup_after_partial_start`: in vm mode the broker arm owns the
+        // shared network and there is no host PF, so the real rollback removes
+        // the agent VM only. Running the full host stop here would try to delete
+        // the broker-owned shared network/PF and turn the start failure into a
+        // spurious CleanupAfterFailure.
+        Some(CompletedStartStep::FirewallInstalled) => match plan.broker_placement {
+            BrokerPlacement::Host => run_stop_plan_cleanup(&plan.stop_plan()),
+            BrokerPlacement::Vm => {
+                single_cleanup_result(run_vm_cleanup_until_absent(&plan.stop_plan()))
+            }
+        },
         Some(CompletedStartStep::None) | None => Ok(()),
     }
 }

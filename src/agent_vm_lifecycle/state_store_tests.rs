@@ -130,6 +130,77 @@ fn managed_start_then_managed_stop_success_removes_state_record() {
     assert!(matches!(missing, AgentVmSessionStateError::NotFound { .. }));
 }
 
+#[cfg(unix)]
+#[test]
+fn vm_placement_start_failure_rolls_back_the_agent_vm_only() {
+    // Drives the *real* rollback path (not just the planned-cleanup helper): in
+    // vm mode a StartVm failure must remove the agent VM only and never touch the
+    // broker-owned shared network or host PF.
+    let dir = tempfile::tempdir().unwrap();
+    let store = AgentVmSessionStateStore::new(dir.path().join("state"));
+    let log = dir.path().join("argv.log");
+    let marker = dir.path().join("vm-exists");
+    // A stateful fake container: StartVm (`run`) creates the VM then fails;
+    // removal commands delete it; `list` reports it present iff the marker
+    // exists. This lets the real cleanup loop (probe → remove → probe) run the
+    // removal and then observe absence, i.e. a clean rollback.
+    let tool = write_executable_script(
+        dir.path(),
+        "fail-startvm",
+        &format!(
+            "#!/bin/sh\n\
+             printf '%s\\n' \"$*\" >> \"{log}\"\n\
+             case \"$1\" in\n\
+             run) touch \"{marker}\"; exit 1 ;;\n\
+             rm|stop|delete) rm -f \"{marker}\"; exit 0 ;;\n\
+             list) [ -f \"{marker}\" ] && printf '%s\\n' \"writ-agent-vm-51b8fd0f-6c10-454c-b0e6-7df1d60e2e6d\"; exit 0 ;;\n\
+             *) exit 0 ;;\n\
+             esac\n",
+            log = log.display(),
+            marker = marker.display(),
+        ),
+    );
+    let plan = AgentVmSessionPlan::new_with_guest_env(
+        session_id(),
+        pool(),
+        252,
+        ports(),
+        BrokerPortRange::new(49152, 65535).unwrap(),
+        Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6,
+        BrokerPlacement::Vm,
+        ContainerImage::new("writ-broker-vm:latest").unwrap(),
+        Vec::new(),
+        vec!["sleep".into(), "600".into()],
+        AgentVmResources::new(1, 512).unwrap(),
+        AgentVmToolPaths::new(&tool, &tool, &tool),
+    )
+    .unwrap();
+
+    let err = start_managed_agent_vm_session(&store, &plan).unwrap_err();
+    // Clean rollback: the StartVm failure surfaces directly, not as a
+    // CleanupAfterFailure (which is what a wrong full-stop cleanup would cause).
+    assert!(
+        matches!(
+            err,
+            AgentVmSessionManagerError::Start(AgentVmLifecycleRunError::Start(_))
+        ),
+        "{err:?}"
+    );
+
+    let argv = std::fs::read_to_string(&log).unwrap();
+    // No network/PF provisioning start steps in vm mode...
+    assert!(!argv.contains("network create"), "{argv}");
+    assert!(!argv.contains("network inspect"), "{argv}");
+    assert!(!argv.contains("install"), "{argv}"); // pf-helper install
+    // ...StartVm was attempted (and failed)...
+    assert!(argv.contains("run "), "{argv}");
+    // ...and rollback removed the agent VM only, not the broker-owned net/PF.
+    assert!(argv.contains("rm -f writ-agent-vm-"), "{argv}");
+    assert!(!argv.contains("network rm"), "{argv}");
+    assert!(!argv.contains("network delete"), "{argv}");
+    assert!(!argv.contains("remove"), "{argv}"); // pf-helper remove
+}
+
 #[test]
 fn mark_running_does_not_recreate_removed_starting_record() {
     let dir = tempfile::tempdir().unwrap();
