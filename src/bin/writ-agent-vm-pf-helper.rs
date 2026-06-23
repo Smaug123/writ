@@ -51,6 +51,13 @@ struct InstallArgs {
     /// Maximum allowed broker listener port.
     #[arg(long, default_value_t = 65535)]
     broker_port_max: u16,
+
+    /// IPv4 endpoint the agent is allowed to reach on the broker ports. Defaults
+    /// to the subnet gateway (the host broker). For broker_placement = vm, pass
+    /// the broker VM's IP on the agent subnet so the agent reaches its broker VM
+    /// while the gateway and the rest of the subnet stay blocked.
+    #[arg(long)]
+    broker_host: Option<String>,
 }
 
 #[derive(Args)]
@@ -103,6 +110,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             )?;
             let broker_port_range =
                 BrokerPortRange::new(args.broker_port_min, args.broker_port_max)?;
+            let broker_host = args
+                .broker_host
+                .as_deref()
+                .map(|raw| raw.parse::<Ipv4Addr>())
+                .transpose()
+                .map_err(|e| format!("invalid --broker-host: {e}"))?;
             let install = SessionFirewallInstall::new(
                 parsed.session_id,
                 parsed.pool,
@@ -110,6 +123,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 parsed.ipv6,
                 broker_ports,
                 broker_port_range,
+                broker_host,
             )?;
             install_session_firewall(&cli.pfctl, &install)?;
             println!("{}", install.ruleset().anchor().as_str());

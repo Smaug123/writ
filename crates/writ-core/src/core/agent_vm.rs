@@ -158,6 +158,16 @@ pub enum AgentVmConfigError {
     AgentIpv4SubnetOutsidePool { subnet: Ipv4Cidr, pool: Ipv4Cidr },
     #[error("agent IPv6 subnet {subnet} is not inside configured pool {pool}")]
     AgentIpv6SubnetOutsidePool { subnet: Ipv6Cidr, pool: Ipv6Cidr },
+    #[error("broker host {broker_host} is not inside the session subnet {subnet}")]
+    BrokerHostOutsideSubnet {
+        broker_host: Ipv4Addr,
+        subnet: Ipv4Cidr,
+    },
+    #[error(
+        "a broker host override (broker_placement = vm) requires an IPv4-only firewall scope, \
+         but the session has an IPv6 scope that would still expose the host IPv6 gateway"
+    )]
+    BrokerHostWithIpv6FirewallScope,
 }
 
 impl Ipv4Cidr {
@@ -599,17 +609,29 @@ pub fn session_pf_ruleset(
     network: AgentNetwork,
     broker_ports: &BrokerPorts,
 ) -> PfRuleset {
-    session_firewall_pf_ruleset(session_id, network.into(), broker_ports)
+    session_firewall_pf_ruleset(session_id, network.into(), broker_ports, None)
 }
 
+/// Build the per-session PF ruleset: allow the agent subnet to reach the broker
+/// on `broker_ports`, deny it everything else.
+///
+/// `broker_ipv4_host` is the broker's IPv4 endpoint the allow rule targets.
+/// `None` defaults to the subnet gateway — the host-broker case, where the
+/// broker is the macOS host on the gateway address. For `broker_placement = vm`
+/// the broker is a VM on the agent subnet, so the caller passes its discovered IP
+/// here; the `pass quick` allow then takes precedence over the subnet deny, so
+/// the agent reaches its broker VM while every other host (including the gateway)
+/// stays blocked.
 pub fn session_firewall_pf_ruleset(
     session_id: SessionId,
     network: AgentFirewallNetwork,
     broker_ports: &BrokerPorts,
+    broker_ipv4_host: Option<Ipv4Addr>,
 ) -> PfRuleset {
+    let allow_host = broker_ipv4_host.unwrap_or_else(|| network.ipv4_gateway());
     let mut allow = vec![PfAllowRule::new(
         PfCidr::Inet(network.ipv4()),
-        PfHost::Inet(network.ipv4_gateway()),
+        PfHost::Inet(allow_host),
     )];
     let mut deny = vec![PfDenyRule::new(
         PfCidr::Inet(network.ipv4()),
@@ -1116,7 +1138,8 @@ mod tests {
     fn render_pf_can_render_ipv4_only_firewall_scope() {
         let network = sample_pool().allocate(0).unwrap();
         let firewall_scope = AgentFirewallNetwork::new(network.ipv4(), None).unwrap();
-        let ruleset = session_firewall_pf_ruleset(session_id(), firewall_scope, &sample_ports());
+        let ruleset =
+            session_firewall_pf_ruleset(session_id(), firewall_scope, &sample_ports(), None);
         assert_eq!(ruleset.allow().len(), 1);
         assert_eq!(ruleset.deny().len(), 1);
         assert_eq!(
@@ -1129,6 +1152,31 @@ mod tests {
                 "block return in quick inet from 192.168.126.0/24 to any label \"writ deny agent v4\"\n",
             ),
         );
+    }
+
+    #[test]
+    fn broker_host_override_retargets_the_allow_rule_to_the_broker_vm_ip() {
+        let network = sample_pool().allocate(0).unwrap();
+        let firewall_scope = AgentFirewallNetwork::new(network.ipv4(), None).unwrap();
+        // The broker VM sits on the agent subnet (.5), not the gateway (.1).
+        let broker_vm_ip = Ipv4Addr::new(192, 168, 126, 5);
+        let rendered = render_pf(&session_firewall_pf_ruleset(
+            session_id(),
+            firewall_scope,
+            &sample_ports(),
+            Some(broker_vm_ip),
+        ));
+        // The `pass quick` allow targets the broker VM IP (and precedes the
+        // subnet deny), so the agent reaches its broker VM...
+        assert!(
+            rendered.contains(
+                "pass in quick inet proto tcp from 192.168.126.0/24 to 192.168.126.5 port $broker_ports"
+            ),
+            "{rendered}"
+        );
+        // ...while the gateway is no longer specially allowed (it falls under the
+        // blanket deny).
+        assert!(!rendered.contains("to 192.168.126.1 port"), "{rendered}");
     }
 
     proptest! {
