@@ -95,6 +95,35 @@
           };
         });
 
+      # The broker VM (broker_placement = vm) runs `writd broker`, so its image
+      # ships writd built with the `host` feature (the default) rather than the
+      # agent's `vm-client`. Cross-compiled to musl for the Linux guest, like
+      # writ-vm. NOTE: `host` pulls in keyring/rusqlite/etc.; the broker only ever
+      # uses the file secret store, but they must still cross-compile. Verify the
+      # build on real guest hardware.
+      mkCrossWritd = buildPkgs: guestSystem:
+        let
+          cross = guestCross guestSystem;
+          pkgs = buildPkgs.pkgsCross.${cross.pkgsCross};
+          writd = mkWrit pkgs {
+            pname = "writd";
+            # Default features include `host` (which `writd` requires); build only
+            # the writd bin so the broker image doesn't carry the other host bins.
+            cargoBuildFlags = [ "--bin" "writd" ];
+            # Target binaries are not executable on the Darwin builder.
+            doCheck = false;
+          };
+        in
+        writd.overrideAttrs (old: {
+          passthru = (old.passthru or {}) // {
+            inherit guestSystem;
+            rustTarget = cross.rustTarget;
+          };
+          meta = (old.meta or {}) // {
+            description = "Cross-compiled writd (host feature) for the broker VM, ${guestSystem}";
+          };
+        });
+
       # claude-code in nixpkgs is a thin wrapper around a prebuilt Linux
       # binary downloaded from upstream. The wrapper derivation refuses to
       # build on Darwin (it uses makeBinaryWrapper and autoPatchelfHook), and
@@ -333,6 +362,128 @@
             ${lib.optionalString (!includeProofTools) productionForbiddenBinCheck}
             ${image.copyTo}/bin/copy-to oci-archive:$out:${imageName}:latest
           '';
+
+      # The broker VM image (broker_placement = vm). It runs `writd broker`
+      # (launched by the daemon with the route-fix prologue and the mounted
+      # config/spec/bearer/secrets), reaching GitHub / Anthropic / nix upstream
+      # over its egress interface. Guest-path contract from broker_vm.rs: writd on
+      # PATH, /bin/git, /bin/nix, ip (route-fix prologue), and /bin/writ-git-askpass
+      # echoing the minted token from token_env (WRIT_GIT_TOKEN by default).
+      mkBrokerVmImage = buildPkgs: nix2containerPkgs: { guestSystem }:
+        let
+          guestPkgs = mkPkgs guestSystem;
+          writd = mkCrossWritd buildPkgs guestSystem;
+          imageName = "writ-broker-vm";
+          # git invokes GIT_ASKPASS for the username and password prompts; echo the
+          # token the broker placed in WRIT_GIT_TOKEN for both (GitHub accepts the
+          # token as the password). Assumes the default token_env; a non-default
+          # token_env needs a matching askpass.
+          brokerAskpass = buildPkgs.writeTextFile {
+            name = "writ-git-askpass";
+            destination = "/bin/writ-git-askpass";
+            executable = true;
+            text = ''
+              #!/bin/sh
+              printf '%s\n' "''${WRIT_GIT_TOKEN:-}"
+            '';
+          };
+          brokerRequiredBins = [ "git" "ip" "nix" "sh" "writ-git-askpass" "writd" ];
+          brokerRequiredBinCheck = lib.concatMapStringsSep "\n"
+            (name: ''
+              if [ ! -x "${brokerRoot}/bin/${name}" ]; then
+                echo "broker image is missing required /bin/${name}" >&2
+                exit 1
+              fi
+            '')
+            brokerRequiredBins;
+          # git and nix call getpwuid_r; without a passwd entry for uid 0 they can
+          # hang or misbehave (same hazard as the agent guest).
+          brokerRequiredEtcCheck = ''
+            if ! grep -qE '^[^:]*:[^:]*:0:' "${brokerRoot}/etc/passwd"; then
+              echo "broker image /etc/passwd has no uid-0 entry" >&2
+              exit 1
+            fi
+          '';
+          # Conventional writable targets; the daemon mounts /tmp, /run, /var/tmp as
+          # tmpfs (BROKER_VM_TMPFS_MOUNTS) and the broker work_root lives under /tmp.
+          brokerRuntimeDirs = buildPkgs.runCommand "writ-broker-vm-runtime-dirs" {} ''
+            install -d -m 1777 $out/tmp
+            install -d -m 1777 $out/var/tmp
+            install -d -m 0755 $out/run
+            install -d -m 0700 $out/root
+          '';
+          brokerEtcFiles = buildPkgs.runCommand "writ-broker-vm-etc-files" {} ''
+            install -d $out/etc
+            printf 'root:x:0:0:root:/root:/bin/sh\n' > $out/etc/passwd
+            printf 'root:x:0:\n' > $out/etc/group
+          '';
+          brokerRoot = buildPkgs.buildEnv {
+            name = "writ-broker-vm-root";
+            paths = [
+              writd
+              brokerAskpass
+              brokerEtcFiles
+              guestPkgs.bash
+              guestPkgs.cacert
+              guestPkgs.coreutils
+              guestPkgs.gitMinimal
+              guestPkgs.iproute2
+              guestPkgs.nix
+            ];
+            pathsToLink = [
+              "/bin"
+              "/etc"
+            ];
+          };
+          image = nix2containerPkgs.nix2container.buildImage {
+            name = imageName;
+            tag = "latest";
+            copyToRoot = [ brokerRuntimeDirs brokerRoot ];
+            arch = guestArchitecture guestSystem;
+            perms = [
+              {
+                path = brokerRuntimeDirs;
+                regex = ".*/tmp$|.*/var/tmp$";
+                mode = "1777";
+              }
+              {
+                path = brokerRuntimeDirs;
+                regex = ".*/var$|.*/run$";
+                mode = "0755";
+              }
+              {
+                path = brokerRuntimeDirs;
+                regex = ".*/root$";
+                mode = "0700";
+              }
+            ];
+            config = {
+              # The daemon overrides the command with the route-fix prologue +
+              # `writd broker …`; this is only a sane default for a debug shell.
+              Cmd = [ "/bin/sh" ];
+              Env = [
+                "PATH=/bin"
+                "SSL_CERT_FILE=/etc/ssl/certs/ca-bundle.crt"
+                "GIT_SSL_CAINFO=/etc/ssl/certs/ca-bundle.crt"
+                "NIX_SSL_CERT_FILE=/etc/ssl/certs/ca-bundle.crt"
+              ];
+              WorkingDir = "/";
+            };
+          };
+        in
+        buildPkgs.runCommand "${imageName}-${guestSystem}.oci.tar"
+          {
+            passthru.imageName = imageName;
+            passthru.imageTag = "latest";
+            passthru.image = image;
+            meta.description =
+              "Darwin-buildable OCI archive for the writ broker VM (broker_placement = vm)";
+          }
+          ''
+            ${brokerRequiredBinCheck}
+            ${brokerRequiredEtcCheck}
+            ${image.copyTo}/bin/copy-to oci-archive:$out:${imageName}:latest
+          '';
     in
     flake-utils.lib.eachDefaultSystem (system:
       let
@@ -369,9 +520,23 @@
             value = mkCrossWritVm pkgs guestSystem;
           })
           guestSystems);
+        brokerImagePackages = lib.listToAttrs (map
+          (guestSystem: {
+            name = "broker-vm-image-${guestSystem}";
+            value = mkBrokerVmImage pkgs nix2containerPkgs {
+              inherit guestSystem;
+            };
+          })
+          guestSystems);
+        crossBrokerBinaryPackages = lib.listToAttrs (map
+          (guestSystem: {
+            name = "broker-vm-writd-${guestSystem}-musl";
+            value = mkCrossWritd pkgs guestSystem;
+          })
+          guestSystems);
       in
       {
-        packages = guestImagePackages // guestProofImagePackages // crossGuestBinaryPackages // {
+        packages = guestImagePackages // guestProofImagePackages // crossGuestBinaryPackages // brokerImagePackages // crossBrokerBinaryPackages // {
           default = writ;
           agent-vm-guest-image = mkAgentVmGuestImage pkgs nix2containerPkgs {
             guestSystem = defaultGuestSystem;
@@ -381,6 +546,10 @@
             includeProofTools = true;
           };
           agent-vm-writ-vm-musl = mkCrossWritVm pkgs defaultGuestSystem;
+          broker-vm-image = mkBrokerVmImage pkgs nix2containerPkgs {
+            guestSystem = defaultGuestSystem;
+          };
+          broker-vm-writd-musl = mkCrossWritd pkgs defaultGuestSystem;
         };
 
         devShells.default = pkgs.mkShell {
