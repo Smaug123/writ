@@ -10,6 +10,7 @@
 //! `crate::core` type the parent module does not itself import.
 
 use super::*;
+use std::net::Ipv4Addr;
 
 #[derive(Debug, thiserror::Error)]
 pub enum AgentVmSessionStateError {
@@ -78,6 +79,11 @@ pub struct AgentVmSessionState {
     /// with the right ownership: `Vm` sessions installed no host PF and share a
     /// broker-owned network, so their cleanup removes the agent VM only.
     broker_placement: BrokerPlacement,
+    /// The broker endpoint the agent reaches. `None` (host placement) means the
+    /// subnet gateway; `Some` (vm placement) is the broker VM's discovered IP,
+    /// recorded when the session is promoted to Running so listings report the
+    /// real URL rather than the gateway.
+    broker_ipv4: Option<Ipv4Addr>,
     image: ContainerImage,
     guest_command: Vec<String>,
     resources: AgentVmResources,
@@ -127,6 +133,10 @@ struct PersistedAgentVmSessionState {
     // placement, since vm placement was never enabled) load as `Host`.
     #[serde(default)]
     broker_placement: BrokerPlacement,
+    // The broker VM's discovered IP (vm placement only); defaulted so older
+    // records (host placement, no broker VM) load as `None` = gateway.
+    #[serde(default)]
+    broker_ipv4: Option<Ipv4Addr>,
     image: String,
     guest_command: Vec<String>,
     cpus: u16,
@@ -158,6 +168,9 @@ impl AgentVmSessionState {
             broker_port_range: plan.broker_port_range,
             ipv6_mode: plan.ipv6_mode,
             broker_placement: plan.broker_placement,
+            // The broker VM's IP is unknown at claim; the vm arm records it when
+            // promoting to Running (see mark_running_with_broker_ipv4).
+            broker_ipv4: None,
             image: plan.image.clone(),
             guest_command: plan.guest_command.clone(),
             resources: plan.resources,
@@ -280,6 +293,7 @@ impl AgentVmSessionState {
             broker_port_range,
             ipv6_mode,
             broker_placement: persisted.broker_placement,
+            broker_ipv4: persisted.broker_ipv4,
             image,
             guest_command: persisted.guest_command,
             resources,
@@ -334,16 +348,15 @@ impl AgentVmSessionState {
     }
 
     pub fn broker_urls(&self) -> Vec<BrokerUrl> {
+        // Host placement reaches the broker on the subnet gateway; vm placement on
+        // the broker VM's discovered IP (recorded at Running promotion).
+        let broker_host = self
+            .broker_ipv4
+            .unwrap_or_else(|| self.network.ipv4_gateway());
         self.broker_ports
             .as_slice()
             .iter()
-            .map(|port| {
-                BrokerUrl(format!(
-                    "http://{}:{}/",
-                    self.network.ipv4_gateway(),
-                    port.get()
-                ))
-            })
+            .map(|port| BrokerUrl(format!("http://{broker_host}:{}/", port.get())))
             .collect()
     }
 
@@ -394,6 +407,29 @@ impl AgentVmSessionStateStore {
     ) -> Result<AgentVmSessionState, AgentVmSessionStateError> {
         let _lock = self.lock_store()?;
         self.mark_running_unlocked(state)
+    }
+
+    /// Promote a claimed `Starting` record to `Running` while recording the broker
+    /// VM's discovered IP, so listings report the real broker URL. The vm arm uses
+    /// this in place of [`Self::mark_running`]; `state` must still match the
+    /// unchanged Starting record (its `broker_ipv4` is `None` from the claim).
+    pub fn mark_running_with_broker_ipv4(
+        &self,
+        state: &AgentVmSessionState,
+        broker_ipv4: Ipv4Addr,
+    ) -> Result<AgentVmSessionState, AgentVmSessionStateError> {
+        let _lock = self.lock_store()?;
+        let current = self.load_unlocked(state.session_id())?;
+        if &current != state || state.status() != AgentVmSessionStateStatus::Starting {
+            return Err(state_mismatch(
+                state.session_id(),
+                "running promotion requires the unchanged Starting state record",
+            ));
+        }
+        let mut running = state.with_status(AgentVmSessionStateStatus::Running);
+        running.broker_ipv4 = Some(broker_ipv4);
+        self.write_replace(&running)?;
+        Ok(running)
     }
 
     pub(super) fn create_starting_unlocked(
@@ -745,6 +781,7 @@ impl From<&AgentVmSessionState> for PersistedAgentVmSessionState {
             broker_port_max: value.broker_port_range.max().get(),
             ipv6_mode: value.ipv6_mode.into(),
             broker_placement: value.broker_placement,
+            broker_ipv4: value.broker_ipv4,
             image: value.image.as_str().to_string(),
             guest_command: value.guest_command.clone(),
             cpus: value.resources.cpus(),

@@ -10,7 +10,7 @@ use std::fs;
 use std::path::Path;
 
 #[tokio::test]
-async fn vm_broker_placement_is_rejected_until_implemented() {
+async fn vm_broker_placement_requires_an_agent_kind() {
     let dir = tempfile::tempdir().unwrap();
     let args_log = dir.path().join("args.log");
     let env_path_log = dir.path().join("env-path.log");
@@ -21,6 +21,8 @@ async fn vm_broker_placement_is_rejected_until_implemented() {
     let daemon = AgentVmDaemon::new(config);
     let state = make_state_with_audit(AuditLog::open(dir.path().join("audit.db")).unwrap());
 
+    // No agent_kind: the broker has no GitHub App to mint with, so vm placement
+    // fails fast — before any container/network work.
     let err = daemon
         .start_session(
             Arc::clone(&state),
@@ -32,19 +34,218 @@ async fn vm_broker_placement_is_rejected_until_implemented() {
         )
         .await
         .unwrap_err();
-
     let AgentVmDaemonError::StartFailed { source, .. } = err else {
         panic!("vm placement should fail with StartFailed, got {err:?}");
     };
     assert!(
-        matches!(*source, AgentVmDaemonError::BrokerPlacementNotImplemented),
-        "vm placement should fail fast with BrokerPlacementNotImplemented, got {source:?}"
+        matches!(*source, AgentVmDaemonError::AgentKindRequiredForVmBroker),
+        "expected AgentKindRequiredForVmBroker, got {source:?}"
     );
-    // Fail-fast: the guard runs before any container/network work, so the fake
-    // `container` tool was never invoked.
     assert!(
         !args_log.exists(),
-        "no container command should run when broker_placement=vm is rejected"
+        "no container command should run when agent_kind is missing"
+    );
+}
+
+#[tokio::test]
+async fn vm_broker_placement_rejects_agent_run_sessions() {
+    let dir = tempfile::tempdir().unwrap();
+    let args_log = dir.path().join("args.log");
+    let env_path_log = dir.path().join("env-path.log");
+    let env_log = dir.path().join("env.log");
+    let fake_tool = write_fake_tool(dir.path(), &args_log, &env_path_log, &env_log);
+    let (config, _state_store) =
+        daemon_config_with_broker_placement(dir.path(), &fake_tool, BrokerPlacement::Vm);
+    let daemon = AgentVmDaemon::new(config);
+    let state = make_state_with_audit(AuditLog::open(dir.path().join("audit.db")).unwrap());
+
+    // The v1 broker VM has no agent-run route, so an agent-run session must be
+    // rejected before any container work (rather than start a VM whose guest 404s
+    // fetching its run config and strands RunAgent waiting for an outcome).
+    let err = daemon
+        .start_agent_run_session(
+            Arc::clone(&state),
+            Some("run".into()),
+            AgentKind::Claude,
+            "claude-test".into(),
+            AgentVmWorkspaceBootstrap {
+                repo: "owner/repo".parse().unwrap(),
+                destination: None,
+                warm: WorkspaceWarmMode::None,
+            },
+            crate::agent_run::AgentPrompt::new("do it"),
+            None,
+        )
+        .await
+        .unwrap_err();
+    let AgentVmDaemonError::StartFailed { source, .. } = err else {
+        panic!("expected StartFailed, got {err:?}");
+    };
+    assert!(
+        matches!(*source, AgentVmDaemonError::AgentRunUnsupportedForVmBroker),
+        "expected AgentRunUnsupportedForVmBroker, got {source:?}"
+    );
+    assert!(
+        !args_log.exists(),
+        "no container command should run for a rejected agent-run session"
+    );
+}
+
+/// A host config the broker VM's materializer accepts: a claude app whose private
+/// key secret matches `make_state`'s app config (`gh-app-pk`), no proxy (so the
+/// only secret the broker needs is that key), and the vm_http section
+/// `broker_config_json` requires.
+fn vm_broker_host_config_json() -> String {
+    r#"{
+        "github_apps": { "claude": { "app_id": 42, "installation_id": 999,
+            "installation_owner": "o", "private_key_secret": "gh-app-pk" } },
+        "policy": { "default_ttl": 3600, "writable_repos": [] },
+        "secret_store": { "type": "keyring", "service": "writ" },
+        "audit_db": "/tmp/audit.db",
+        "agent_vm": {
+            "lifecycle": {
+                "ipv4_pool": "192.168.0.0/16", "ipv6_pool": "fd83:b6f2:e57::/48",
+                "subnet_index_min": 252, "subnet_index_max": 253,
+                "pf_helper": "/usr/local/libexec/writ-agent-vm-pf-helper",
+                "ipv6_mode": "ipv4_only_no_guest_ipv6",
+                "image": "writ-agent-vm-guest:latest", "cpus": 1, "memory_mib": 512
+            },
+            "vm_http": {
+                "bind_addr": "0.0.0.0", "broker_port_min": 1024, "broker_port_max": 65535,
+                "git_clone_base_url": "https://github.com",
+                "askpass_program": "/usr/local/libexec/writ-git-askpass",
+                "work_root": "/var/lib/writ/git-work",
+                "clone_timeout_secs": 30, "max_bundle_bytes": 1048576,
+                "nix_cache_url": "https://cache.nixos.org",
+                "nix_cache_trusted_public_keys": [],
+                "nix_cache_max_metadata_bytes": 1048576, "nix_cache_max_nar_bytes": 67108864
+            }
+        }
+    }"#
+    .to_string()
+}
+
+/// A stateful fake `container` for the full vm-broker start: it answers `network
+/// inspect` (agent subnet), publishes the broker VM's ready file from its
+/// `/writ/session` mount on `run`, returns the broker VM's IP from `inspect`, logs
+/// the agent VM's `--env-file`, and answers the bootstrap `exec` probe.
+fn write_vm_broker_fake_tool(dir: &Path, args_log: &Path, env_log: &Path) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt as _;
+    let path = dir.join("fake-vm-broker");
+    let script = format!(
+        "#!/bin/sh\n\
+         printf '%s\\n' \"$*\" >> {args_log}\n\
+         if [ \"$1\" = network ] && [ \"$2\" = inspect ]; then\n\
+         printf '%s\\n' 'ipv4Subnet: 192.168.252.0/24' 'ipv4Gateway: 192.168.252.1'; exit 0; fi\n\
+         if [ \"$1\" = inspect ]; then id=\"${{2#writ-broker-vm-}}\";\n\
+         printf '[{{\"status\":{{\"networks\":[{{\"network\":\"writ-agent-net-%s\",\"ipv4Address\":\"192.168.252.7/24\"}}],\"state\":\"running\"}}}}]\\n' \"$id\"; exit 0; fi\n\
+         if [ \"$1\" = run ]; then prev=\"\";\n\
+         for a in \"$@\"; do\n\
+         case \"$a\" in type=virtiofs,source=*,target=/writ/session*) s=\"${{a#type=virtiofs,source=}}\"; s=\"${{s%%,*}}\"; : > \"$s/ready\" ;; esac\n\
+         if [ \"$prev\" = --env-file ]; then printf '%s\\n' \"$a\" > {env_path}; cat \"$a\" > {env_log}; fi\n\
+         prev=\"$a\"\n\
+         done\n\
+         exit 0; fi\n\
+         if [ \"$1\" = exec ]; then case \"${{5:-}}\" in *bootstrap-failed*) printf 'ok' ;; esac; fi\n\
+         exit 0\n",
+        args_log = shell_quote(args_log),
+        env_log = shell_quote(env_log),
+        env_path = shell_quote(&dir.join("env-path.log")),
+    );
+    fs::write(&path, script).unwrap();
+    let mut permissions = fs::metadata(&path).unwrap().permissions();
+    permissions.set_mode(0o700);
+    fs::set_permissions(&path, permissions).unwrap();
+    path
+}
+
+#[tokio::test]
+async fn vm_broker_placement_starts_agent_pointed_at_the_broker_vm() {
+    let dir = tempfile::tempdir().unwrap();
+    let args_log = dir.path().join("args.log");
+    let env_log = dir.path().join("env.log");
+    let fake_tool = write_vm_broker_fake_tool(dir.path(), &args_log, &env_log);
+    let (config, _state_store) =
+        daemon_config_with_broker_placement(dir.path(), &fake_tool, BrokerPlacement::Vm);
+    // Thread the host facts the vm arm needs (raw config + effective audit DB),
+    // exactly as writd does.
+    let config = config
+        .with_broker_vm_host_facts(&vm_broker_host_config_json(), &dir.path().join("audit.db"));
+    let daemon = AgentVmDaemon::new(config);
+    let state = make_state_with_audit(AuditLog::open(dir.path().join("audit.db")).unwrap());
+    // The host secret store holds the claude app key the broker exports.
+    state
+        .secrets
+        .put(&crate::secret::SecretKey::new("gh-app-pk").unwrap(), "PEM")
+        .unwrap();
+
+    let started = daemon
+        .start_session(
+            Arc::clone(&state),
+            Some("vm session".into()),
+            Some(AgentKind::Claude),
+            Some("claude-test".into()),
+            None,
+            vec!["sleep".into(), "600".into()],
+        )
+        .await
+        .unwrap();
+
+    // The agent is pointed at the broker VM's discovered IP on the fixed port.
+    assert_eq!(started.broker_url(), "http://192.168.252.7:1024/");
+    let env = fs::read_to_string(&env_log).unwrap();
+    assert!(
+        env.contains(&format!(
+            "{AGENT_VM_BROKER_URL_ENV}=http://192.168.252.7:1024/"
+        )),
+        "agent env must point WRIT_BROKER_URL at the broker VM: {env}"
+    );
+    assert!(env.contains(&format!("{AGENT_VM_BROKER_TOKEN_ENV}=writ-vm-")));
+    let args = fs::read_to_string(&args_log).unwrap();
+    // The broker VM was launched, and the host PF allow target is the broker VM IP.
+    assert!(
+        args.lines().any(|l| l.contains("writ-broker-vm-")),
+        "broker VM must be launched: {args}"
+    );
+    assert!(
+        args.contains("--broker-host 192.168.252.7"),
+        "host PF must target the broker VM IP: {args}"
+    );
+
+    // list_sessions reports the discovered broker VM URL (not the subnet gateway)
+    // and the session as runtime-attached (not orphaned), even though the vm arm
+    // keeps no in-process broker.
+    let sessions = daemon.list_sessions().await.unwrap();
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(
+        sessions[0].broker_urls.as_slice(),
+        &["http://192.168.252.7:1024/".to_string()],
+        "running vm session must list the broker VM URL"
+    );
+    assert!(
+        sessions[0].runtime_attached,
+        "a live vm-broker session must be reported attached, not orphaned"
+    );
+
+    // The start materialised broker session material (config, spec, bearer, copied
+    // secrets) under <state_dir>/broker-vm/<session_id>/.
+    let material = dir
+        .path()
+        .join("state")
+        .join("broker-vm")
+        .join(started.session_id().to_string());
+    assert!(material.exists(), "broker material must exist after start");
+
+    // Stop the vm session: it must succeed (the broker teardown is absence-based,
+    // so the fake reporting everything gone does not strand it) and remove the
+    // per-session material — copied secrets included.
+    daemon
+        .stop_session(&state, started.session_id())
+        .await
+        .unwrap();
+    assert!(
+        !material.exists(),
+        "stop must remove the broker material (copied secrets included)"
     );
 }
 

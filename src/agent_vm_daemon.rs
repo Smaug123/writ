@@ -17,19 +17,22 @@ use tokio::sync::{Mutex, watch};
 
 use crate::agent_run::{AgentPrompt, AgentRunId, CorrelationId};
 use crate::agent_vm_lifecycle::{
-    AgentVmGuestEnvVar, AgentVmLifecycleConfigError, AgentVmResources, AgentVmSessionManagerError,
-    AgentVmSessionPlan, AgentVmSessionState, AgentVmSessionStateError, AgentVmSessionStateStatus,
-    AgentVmSessionStateStore, AgentVmToolPaths, BrokerPlacement, ContainerImage, HostIface,
-    Ipv6IsolationMode, NetworkHealth, ProbeDebounce, ProbeObservation,
+    AgentVmGuestEnvVar, AgentVmLifecycleConfigError, AgentVmNames, AgentVmResources,
+    AgentVmSessionManagerError, AgentVmSessionPlan, AgentVmSessionState, AgentVmSessionStateError,
+    AgentVmSessionStateStatus, AgentVmSessionStateStore, AgentVmToolPaths, BrokerPlacement,
+    ContainerImage, HostIface, Ipv6IsolationMode, NetworkHealth, ProbeDebounce, ProbeObservation,
     claim_agent_vm_session_subnet, cleanup_managed_agent_vm_session,
     complete_agent_vm_session_start, evaluate_host_path, host_interfaces,
-    remove_managed_agent_vm_session_state,
+    remove_managed_agent_vm_session_state, start_agent_vm_session,
 };
 use crate::audit::{AgentRunAuditRecord, AgentVmNetworkHealthEventRecord, AuditError, AuditLog};
-use crate::broker_vm::BrokerVmSessionPaths;
+use crate::broker_vm::{
+    BrokerVmSessionPaths, BrokerVmSessionRequest, broker_url, materialize_broker_vm_session,
+};
+use crate::broker_vm_runner::launch_broker_vm;
 use crate::core::{
-    AgentKind, AgentNetwork, AgentNetworkPool, AgentVmConfigError, BrokerPorts, SessionId,
-    SessionRecord, UnixMillis,
+    AgentKind, AgentNetwork, AgentNetworkPool, AgentVmConfigError, BrokerPort, BrokerPorts,
+    SessionId, SessionRecord, UnixMillis,
 };
 use crate::git_push_staging::GitPushStagingStore;
 use crate::process_spawn;
@@ -39,8 +42,8 @@ use crate::server::BrokerState;
 use crate::vm_git::AgentVmWorkspaceBootstrap;
 use crate::vm_http::{
     RunningVmHttpSession, VM_NIX_BASIC_LOGIN, VM_NIX_CACHE_PATH_PREFIX, VM_NIX_PREWARM_PATH_PREFIX,
-    VmHttpAgentRunService, VmHttpGitPushService, VmHttpRuntimeConfig, VmHttpRuntimeError,
-    VmHttpRuntimeShutdownError, prepare_vm_http_session_with_agent_runs,
+    VmHttpAgentRunService, VmHttpBearerToken, VmHttpGitPushService, VmHttpRuntimeConfig,
+    VmHttpRuntimeError, VmHttpRuntimeShutdownError, prepare_vm_http_session_with_agent_runs,
 };
 
 pub use crate::vm_client::{
@@ -84,6 +87,11 @@ const AGENT_VM_WORKSPACE_BOOTSTRAP_OK_PATH: &str = "/run/writ-agent-vm/bootstrap
 const AGENT_VM_WORKSPACE_BOOTSTRAP_FAILED_PATH: &str = "/run/writ-agent-vm/bootstrap-failed";
 const AGENT_VM_WORKSPACE_BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 const AGENT_VM_WORKSPACE_BOOTSTRAP_QUICK_POLL_INTERVAL: Duration = Duration::from_millis(500);
+/// How long the daemon waits for a broker VM to boot and publish its ready file
+/// (broker_placement = vm) before giving up and tearing it down.
+const BROKER_VM_READY_TIMEOUT: Duration = Duration::from_secs(3 * 60);
+/// How often the daemon polls the broker VM's ready file on the shared mount.
+const BROKER_VM_READY_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const AGENT_VM_WORKSPACE_BOOTSTRAP_SLOW_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const AGENT_VM_WORKSPACE_BOOTSTRAP_QUICK_POLLS: u32 = 10;
 const AGENT_VM_WORKSPACE_BOOTSTRAP_FAILURE_MESSAGE_LIMIT: usize = 16 * 1024;
@@ -155,6 +163,11 @@ pub struct AgentVmDaemon {
     /// first session start (it needs an [`AuditLog`] handle, which arrives with
     /// the start request, not at construction).
     health_monitor: std::sync::Mutex<Option<NetworkHealthMonitorHandle>>,
+    /// Session IDs of live `broker_placement = vm` sessions. The vm arm keeps no
+    /// in-process broker (so nothing in `running`), but the session is still
+    /// runtime-attached to this daemon; this set lets [`Self::list_sessions`]
+    /// report it as attached rather than orphaned.
+    vm_broker_attached: Mutex<HashSet<SessionId>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -184,6 +197,11 @@ pub enum AgentVmLifecycleRuntimeConfigError {
         "broker_placement = vm requires an agent_vm.lifecycle.broker_image (the dedicated broker VM image)"
     )]
     BrokerImageRequiredForVmPlacement,
+    #[error(
+        "broker_placement = vm requires ipv6_mode = ipv4_only_no_guest_ipv6: the broker VM creates \
+         an IPv4-only internal network and the broker host-PF override is IPv4-only"
+    )]
+    VmPlacementRequiresIpv4Only,
     #[error(transparent)]
     AgentVm(#[from] AgentVmConfigError),
 }
@@ -193,10 +211,30 @@ pub enum AgentVmDaemonError {
     #[error("agent VM guest command must not be empty")]
     EmptyGuestCommand,
     #[error(
-        "agent VM broker_placement \"vm\" is not yet implemented; \
-         use \"host\" (the default) until the broker-in-VM arm lands"
+        "broker_placement = vm requires a session agent_kind (the broker mints with that agent's \
+         GitHub App and selects its proxy secret); none was supplied"
     )]
-    BrokerPlacementNotImplemented,
+    AgentKindRequiredForVmBroker,
+    #[error(
+        "agent-run sessions are not supported with broker_placement = vm: the v1 broker VM serves \
+         clone + nix-cache + proxies only, with no agent-run route. Use broker_placement = host."
+    )]
+    AgentRunUnsupportedForVmBroker,
+    #[error(
+        "broker_placement = vm runtime config is incomplete (missing {0}); this is a writd wiring \
+         bug — the daemon should carry it for vm placement"
+    )]
+    VmBrokerRuntimeConfigIncomplete(&'static str),
+    #[error("bringing up the broker VM for session {session_id} failed: {source}")]
+    BrokerVmLaunch {
+        session_id: SessionId,
+        #[source]
+        source: crate::broker_vm_runner::BrokerVmLaunchError,
+    },
+    #[error("materialising broker VM session material failed: {0}")]
+    BrokerVmMaterialize(#[from] crate::broker_vm::BrokerVmSessionError),
+    #[error("cannot resolve the host audit DB path for the broker VM mount: {0}")]
+    BrokerVmAuditDbPath(#[source] std::io::Error),
     #[error("agent VM workspace destination must be absolute: {0}")]
     RelativeWorkspaceDestination(PathBuf),
     #[error("agent VM workspace destination must be valid UTF-8: {0}")]
@@ -383,6 +421,15 @@ impl AgentVmLifecycleRuntimeConfig {
             ),
             BrokerPlacement::Host => None,
         };
+        // The broker VM creates an IPv4-only `--internal` network and the broker
+        // host-PF override rejects an IPv6 firewall scope, so vm placement is
+        // incompatible with dual-stack. Reject it here rather than launch a broker
+        // VM whose agent start then fails every time.
+        if broker_placement == BrokerPlacement::Vm
+            && ipv6_mode == Ipv6IsolationMode::DualStackRequired
+        {
+            return Err(AgentVmLifecycleRuntimeConfigError::VmPlacementRequiresIpv4Only);
+        }
         pool.allocate(subnet_index_min)?;
         pool.allocate(subnet_index_max)?;
         Ok(Self {
@@ -690,6 +737,48 @@ mod broker_image_invariant_tests {
             Some("broker:latest")
         );
     }
+
+    #[test]
+    fn vm_placement_rejects_dual_stack() {
+        // The broker VM creates an IPv4-only internal network and its host-PF
+        // override is IPv4-only, so vm + dual-stack is rejected at construction.
+        let pool = AgentNetworkPool::new(
+            Ipv4Cidr::new(Ipv4Addr::new(192, 168, 0, 0), 16).unwrap(),
+            Ipv6Cidr::new("fd83:b6f2:e57::".parse::<Ipv6Addr>().unwrap(), 48).unwrap(),
+        )
+        .unwrap();
+        let result = AgentVmLifecycleRuntimeConfig::new(
+            pool,
+            252,
+            253,
+            AgentVmSessionStateStore::new("/tmp/writ-test-vm-dual-stack"),
+            Ipv6IsolationMode::DualStackRequired,
+            BrokerPlacement::Vm,
+            ContainerImage::new("agent:latest").unwrap(),
+            Some(ContainerImage::new("broker:latest").unwrap()),
+            AgentVmResources::new(1, 512).unwrap(),
+            AgentVmToolPaths::new("/bin/container", "/bin/pf", "/bin/sudo"),
+        );
+        assert!(matches!(
+            result,
+            Err(AgentVmLifecycleRuntimeConfigError::VmPlacementRequiresIpv4Only)
+        ));
+    }
+
+    #[test]
+    fn broker_audit_paths_resolve_relative_db_to_a_nonempty_mount_dir() {
+        // A relative single-component audit DB path must not yield an empty mount
+        // source (Path::parent() of "audit.db" is Some("")).
+        let (db, dir) = resolve_broker_audit_paths(Path::new("audit.db")).unwrap();
+        assert!(db.is_absolute());
+        assert!(
+            !dir.as_os_str().is_empty() && dir.is_absolute(),
+            "mount dir must be a real absolute path, got {dir:?}"
+        );
+        // An absolute path's directory is preserved.
+        let (_, dir) = resolve_broker_audit_paths(Path::new("/var/lib/writ/audit.db")).unwrap();
+        assert_eq!(dir, Path::new("/var/lib/writ"));
+    }
 }
 
 #[cfg(test)]
@@ -848,6 +937,7 @@ impl AgentVmDaemon {
             session_locks: Mutex::new(HashMap::new()),
             network_health: Arc::new(std::sync::Mutex::new(HashMap::new())),
             health_monitor: std::sync::Mutex::new(None),
+            vm_broker_attached: Mutex::new(HashSet::new()),
         }
     }
 
@@ -938,6 +1028,7 @@ impl AgentVmDaemon {
                 self.start_session_after_audit_opened(
                     Arc::clone(&state),
                     session_id,
+                    agent_kind,
                     workspace,
                     guest_command,
                     None,
@@ -1009,6 +1100,7 @@ impl AgentVmDaemon {
                 self.start_session_after_audit_opened(
                     Arc::clone(&state),
                     session_id,
+                    Some(agent_kind),
                     Some(workspace),
                     guest_command,
                     Some(agent_runs),
@@ -1123,6 +1215,8 @@ impl AgentVmDaemon {
         self.spawn_cleanup_session(session_id).await??;
 
         let audit_close = state.audit.close_session(session_id, UnixMillis::now());
+        // Drop any vm-broker attachment (a no-op for host sessions).
+        self.vm_broker_attached.lock().await.remove(&session_id);
         let http_shutdown = match self.running.lock().await.remove(&session_id) {
             Some(running) => running.shutdown().await,
             None => Ok(()),
@@ -1253,6 +1347,7 @@ impl AgentVmDaemon {
     ) -> Result<(), AgentVmDaemonError> {
         self.spawn_cleanup_session(session_id).await??;
 
+        self.vm_broker_attached.lock().await.remove(&session_id);
         if let Some(running) = self.running.lock().await.remove(&session_id) {
             running.shutdown().await?;
         }
@@ -1333,6 +1428,10 @@ impl AgentVmDaemon {
         let store = self.config.lifecycle.state_store.clone();
         let states = tokio::task::spawn_blocking(move || store.load_all()).await??;
         let running = self.running.lock().await;
+        let vm_attached = self.vm_broker_attached.lock().await;
+        // A session is runtime-attached if its in-process broker is live (host) or
+        // it is a live vm-broker session (no in-process broker, tracked separately).
+        let attached = |id: &SessionId| running.contains_key(id) || vm_attached.contains(id);
         Ok(states
             .into_iter()
             .map(|state| AgentVmSessionInfo {
@@ -1346,11 +1445,11 @@ impl AgentVmDaemon {
                     .into_iter()
                     .map(|url| url.as_str().to_string())
                     .collect(),
-                runtime_attached: running.contains_key(&state.session_id()),
+                runtime_attached: attached(&state.session_id()),
                 // Health is only meaningful for a runtime-attached session (the
                 // monitor publishes it); a detached/persisted-only session is
                 // genuinely Unknown here.
-                network_health: if running.contains_key(&state.session_id()) {
+                network_health: if attached(&state.session_id()) {
                     self.network_health
                         .lock()
                         .unwrap()
@@ -1364,21 +1463,96 @@ impl AgentVmDaemon {
             .collect())
     }
 
+    /// The guest environment variables shared by both broker placements: the
+    /// broker URL and bearer token the agent authenticates with, the nix-cache
+    /// proxy and trust config (served by the broker wherever it runs), the
+    /// egress-gate IPv6 posture, and the strict pre-warm substituter when set.
+    fn build_agent_guest_env(
+        &self,
+        broker_url: &str,
+        bearer_token: &str,
+    ) -> Result<Vec<AgentVmGuestEnvVar>, AgentVmDaemonError> {
+        let trusted_public_keys = self
+            .config
+            .vm_http
+            .nix_cache()
+            .trusted_public_keys()
+            .nix_conf_value();
+        let mut guest_env = vec![
+            AgentVmGuestEnvVar::new(AGENT_VM_BROKER_URL_ENV, broker_url.to_string())?,
+            AgentVmGuestEnvVar::new(AGENT_VM_BROKER_TOKEN_ENV, bearer_token.to_string())?,
+            AgentVmGuestEnvVar::new(
+                AGENT_VM_NIX_CACHE_URL_ENV,
+                nix_cache_url_for_broker_url(broker_url),
+            )?,
+            AgentVmGuestEnvVar::new(AGENT_VM_NIX_BASIC_LOGIN_ENV, VM_NIX_BASIC_LOGIN)?,
+            AgentVmGuestEnvVar::new(AGENT_VM_NIX_NETRC_ENV, AGENT_VM_NIX_NETRC_PATH)?,
+            AgentVmGuestEnvVar::new(AGENT_VM_NIX_TRUSTED_PUBLIC_KEYS_ENV, trusted_public_keys)?,
+            AgentVmGuestEnvVar::new(AGENT_VM_NIX_CONF_DIR_ENV, AGENT_VM_NIX_CONF_DIR)?,
+        ];
+        // Tell the boot-time egress gate whether to enforce no-guest-IPv6.
+        // Exhaustive over the mode so a future variant must decide: the dual-stack
+        // mode provisions a ULA on purpose, so only the no-guest-IPv6 mode forbids
+        // a global-scope address.
+        let require_no_ipv6 = match self.config.lifecycle.ipv6_mode {
+            Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6 => "1",
+            Ipv6IsolationMode::DualStackRequired => "0",
+        };
+        guest_env.push(AgentVmGuestEnvVar::new(
+            AGENT_VM_EGRESS_GATE_REQUIRE_NO_IPV6_ENV,
+            require_no_ipv6,
+        )?);
+        // Advertise the strict pre-warm-only substituter exactly when the broker
+        // actually serves it: its presence pins the devShell warm to the broker's
+        // /v1/nix/prewarm. Only the host broker serves it — the vm broker config
+        // drops nix_prewarm_cache_dir — so for vm placement advertising it would
+        // pin warm to an endpoint that 404s and fail otherwise-valid bootstraps.
+        if self.config.lifecycle.broker_placement == BrokerPlacement::Host
+            && self.config.vm_http.nix_prewarm_cache_dir().is_some()
+        {
+            guest_env.push(AgentVmGuestEnvVar::new(
+                AGENT_VM_NIX_PREWARM_URL_ENV,
+                nix_prewarm_url_for_broker_url(broker_url),
+            )?);
+        }
+        Ok(guest_env)
+    }
+
     async fn start_session_after_audit_opened<S: SecretStore + Send + Sync + 'static>(
         &self,
         state: Arc<BrokerState<S>>,
         session_id: SessionId,
+        agent_kind: Option<AgentKind>,
         workspace: Option<AgentVmWorkspaceBootstrap>,
         guest_command: Vec<String>,
         agent_runs: Option<VmHttpAgentRunService<S>>,
     ) -> Result<AgentVmStarted, AgentVmDaemonError> {
-        // Broker placement seam (see docs/vmnet-accept-bug-and-broker-vm-plan.md). The
-        // `Vm` arm (broker in a dedicated VM) is not implemented yet; fail fast
-        // rather than silently running the host path, which would not work around
-        // the macOS vmnet accept() defect the `vm` setting exists to dodge.
+        // Broker placement seam (see docs/vmnet-accept-bug-and-broker-vm-plan.md):
+        // the host path runs an in-process broker; the vm path runs the broker in a
+        // dedicated VM, working around the macOS vmnet accept() defect. The vm arm
+        // diverges enough (no in-process broker, broker launched before the agent)
+        // that it lives in its own method.
         match self.config.lifecycle.broker_placement {
             BrokerPlacement::Host => {}
-            BrokerPlacement::Vm => return Err(AgentVmDaemonError::BrokerPlacementNotImplemented),
+            BrokerPlacement::Vm => {
+                // The v1 broker VM serves clone + nix-cache + proxies only — no
+                // agent-run config/outcome routes. Reject an agent-run session
+                // up front rather than start a VM whose guest would 404 fetching
+                // its run config and leave RunAgent waiting for an outcome that
+                // can never be uploaded.
+                if agent_runs.is_some() {
+                    return Err(AgentVmDaemonError::AgentRunUnsupportedForVmBroker);
+                }
+                return self
+                    .start_vm_broker_session(
+                        state,
+                        session_id,
+                        agent_kind,
+                        workspace,
+                        guest_command,
+                    )
+                    .await;
+            }
         }
 
         // Hold subnet_allocation_lock from `choose_subnet_index` through the
@@ -1416,63 +1590,16 @@ impl AgentVmDaemon {
             .await?;
             let broker_port = prepared.broker_port();
             let broker_url = format!("http://{}:{}/", network.ipv4_gateway(), broker_port.get());
-            let nix_cache_url = nix_cache_url_for_broker_url(&broker_url);
-            let trusted_public_keys = self
-                .config
-                .vm_http
-                .nix_cache()
-                .trusted_public_keys()
-                .nix_conf_value();
             let broker_ports = BrokerPorts::new([broker_port])?;
-            let mut guest_env = vec![
-                AgentVmGuestEnvVar::new(AGENT_VM_BROKER_URL_ENV, broker_url.clone())?,
-                AgentVmGuestEnvVar::new(
-                    AGENT_VM_BROKER_TOKEN_ENV,
-                    prepared.bearer_token().as_str().to_string(),
-                )?,
-                AgentVmGuestEnvVar::new(AGENT_VM_NIX_CACHE_URL_ENV, nix_cache_url)?,
-                AgentVmGuestEnvVar::new(AGENT_VM_NIX_BASIC_LOGIN_ENV, VM_NIX_BASIC_LOGIN)?,
-                AgentVmGuestEnvVar::new(AGENT_VM_NIX_NETRC_ENV, AGENT_VM_NIX_NETRC_PATH)?,
-                AgentVmGuestEnvVar::new(AGENT_VM_NIX_TRUSTED_PUBLIC_KEYS_ENV, trusted_public_keys)?,
-                AgentVmGuestEnvVar::new(AGENT_VM_NIX_CONF_DIR_ENV, AGENT_VM_NIX_CONF_DIR)?,
-            ];
-            // Tell the boot-time egress gate whether to enforce no-guest-IPv6.
-            // Exhaustive over the mode so a future variant must decide: the
-            // dual-stack mode provisions a ULA on purpose, so only the
-            // no-guest-IPv6 mode forbids a global-scope address.
-            let require_no_ipv6 = match self.config.lifecycle.ipv6_mode {
-                Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6 => "1",
-                Ipv6IsolationMode::DualStackRequired => "0",
-            };
-            guest_env.push(AgentVmGuestEnvVar::new(
-                AGENT_VM_EGRESS_GATE_REQUIRE_NO_IPV6_ENV,
-                require_no_ipv6,
-            )?);
-
-            // Advertise the strict pre-warm-only substituter exactly when the
-            // operator has configured a pre-warm dir: the variable's presence is
-            // the guest-side switch that pins the devShell warm to the local-only
-            // view (see AGENT_VM_NIX_PREWARM_URL_ENV).
-            if self.config.vm_http.nix_prewarm_cache_dir().is_some() {
-                guest_env.push(AgentVmGuestEnvVar::new(
-                    AGENT_VM_NIX_PREWARM_URL_ENV,
-                    nix_prewarm_url_for_broker_url(&broker_url),
-                )?);
-            }
+            let guest_env =
+                self.build_agent_guest_env(&broker_url, prepared.bearer_token().as_str())?;
             let guest_command = wrap_guest_command(workspace.as_ref(), guest_command)?;
-            let plan = AgentVmSessionPlan::new_with_guest_env(
+            let plan = self.build_agent_plan(
                 session_id,
-                self.config.lifecycle.pool,
                 subnet_index,
                 broker_ports,
-                self.config.vm_http.broker_port_range(),
-                self.config.lifecycle.ipv6_mode,
-                self.config.lifecycle.broker_placement,
-                self.config.lifecycle.image.clone(),
                 guest_env,
                 guest_command,
-                self.config.lifecycle.resources,
-                self.config.lifecycle.tools.clone(),
             )?;
             let store = self.config.lifecycle.state_store.clone();
             let plan_for_claim = plan.clone();
@@ -1518,6 +1645,254 @@ impl AgentVmDaemon {
         })
     }
 
+    /// Build the agent VM plan from the daemon's lifecycle config. Shared by both
+    /// placements; the vm arm builds it twice (a claim plan with an empty guest
+    /// env, then a boot plan with the broker VM's URL once discovered).
+    fn build_agent_plan(
+        &self,
+        session_id: SessionId,
+        subnet_index: u16,
+        broker_ports: BrokerPorts,
+        guest_env: Vec<AgentVmGuestEnvVar>,
+        guest_command: Vec<String>,
+    ) -> Result<AgentVmSessionPlan, AgentVmDaemonError> {
+        Ok(AgentVmSessionPlan::new_with_guest_env(
+            session_id,
+            self.config.lifecycle.pool,
+            subnet_index,
+            broker_ports,
+            self.config.vm_http.broker_port_range(),
+            self.config.lifecycle.ipv6_mode,
+            self.config.lifecycle.broker_placement,
+            self.config.lifecycle.image.clone(),
+            guest_env,
+            guest_command,
+            self.config.lifecycle.resources,
+            self.config.lifecycle.tools.clone(),
+        )?)
+    }
+
+    /// The `broker_placement = vm` start arm: bring up a dedicated broker VM, point
+    /// the agent VM at it, and reap everything on any failure.
+    ///
+    /// Unlike the host arm there is no in-process broker. The broker VM must come
+    /// up first (it creates the shared `--internal` network the agent joins), so
+    /// the order is: reserve the subnet (claim, under the lock) → materialise the
+    /// broker session material + launch the broker VM (unlocked, slow) → discover
+    /// its IP → boot the agent VM with the broker URL + bearer + PF allow target →
+    /// promote to Running → release and wait for bootstrap.
+    ///
+    /// The agent boot uses `start_agent_vm_session` + `mark_running` rather than
+    /// `complete_agent_vm_session_start`: the latter removes the claimed record on
+    /// a boot failure, but here the record (Vm placement) is exactly what lets one
+    /// `cleanup_failed_started_session` reap the agent VM *and* the broker VM and
+    /// its material (see the persisted-state teardown). So any failure past the
+    /// claim routes through that single rollback.
+    async fn start_vm_broker_session<S: SecretStore + Send + Sync + 'static>(
+        &self,
+        state: Arc<BrokerState<S>>,
+        session_id: SessionId,
+        agent_kind: Option<AgentKind>,
+        workspace: Option<AgentVmWorkspaceBootstrap>,
+        guest_command: Vec<String>,
+    ) -> Result<AgentVmStarted, AgentVmDaemonError> {
+        // vm placement needs an agent_kind (which app the broker mints with) and
+        // the host facts writd threads in; missing host facts are a wiring bug.
+        let agent_kind = agent_kind.ok_or(AgentVmDaemonError::AgentKindRequiredForVmBroker)?;
+        let broker_image = self
+            .config
+            .lifecycle
+            .broker_image()
+            .ok_or(AgentVmDaemonError::VmBrokerRuntimeConfigIncomplete(
+                "broker_image",
+            ))?
+            .clone();
+        let host_config_json = self
+            .config
+            .lifecycle
+            .host_config_json()
+            .ok_or(AgentVmDaemonError::VmBrokerRuntimeConfigIncomplete(
+                "host_config_json",
+            ))?
+            .to_string();
+        let (host_audit_db, audit_dir) =
+            resolve_broker_audit_paths(self.config.lifecycle.host_audit_db().ok_or(
+                AgentVmDaemonError::VmBrokerRuntimeConfigIncomplete("host_audit_db"),
+            )?)?;
+
+        // The broker binds a fixed port inside its own VM (each broker VM is a
+        // distinct IP, so the same port is reusable across sessions).
+        let broker_port = self.config.vm_http.broker_port_range().min();
+        let broker_ports = BrokerPorts::new([broker_port])?;
+        let guest_command = wrap_guest_command(workspace.as_ref(), guest_command)?;
+
+        // Reserve the subnet atomically (choose + claim under the lock). The
+        // persisted record carries no guest env, so the claim plan uses an empty
+        // one; the boot plan below carries the real broker URL once discovered.
+        let (subnet_index, network) = {
+            let _subnet_guard = self.subnet_allocation_lock.lock().await;
+            let lifecycle = self.config.lifecycle.clone();
+            let (subnet_index, network) =
+                tokio::task::spawn_blocking(move || choose_subnet_index(&lifecycle)).await??;
+            let claim_plan = self.build_agent_plan(
+                session_id,
+                subnet_index,
+                broker_ports.clone(),
+                Vec::new(),
+                guest_command.clone(),
+            )?;
+            let store = self.config.lifecycle.state_store.clone();
+            tokio::task::spawn_blocking(move || claim_agent_vm_session_subnet(&store, &claim_plan))
+                .await??;
+            (subnet_index, network)
+        };
+
+        // Everything past the claim reaps via cleanup_failed_started_session on any
+        // error (it tears down the agent VM, the broker VM, the material, and the
+        // record — see cleanup_managed_agent_vm_session for vm placement).
+        let outcome = self
+            .complete_vm_broker_start(
+                Arc::clone(&state),
+                session_id,
+                agent_kind,
+                &broker_image,
+                &host_config_json,
+                &host_audit_db,
+                &audit_dir,
+                broker_port,
+                broker_ports,
+                subnet_index,
+                network,
+                guest_command,
+            )
+            .await;
+        match outcome {
+            Ok(broker_url) => {
+                // No in-process broker to register, but the session is live; track
+                // it so list_sessions reports it as attached, not orphaned.
+                self.vm_broker_attached.lock().await.insert(session_id);
+                Ok(AgentVmStarted {
+                    session_id,
+                    broker_url,
+                })
+            }
+            Err(err) => {
+                let failure = err.to_string();
+                if let Err(cleanup) = self.cleanup_failed_started_session(session_id).await {
+                    return Err(AgentVmDaemonError::WorkspaceBootstrapCleanupFailed {
+                        bootstrap: failure,
+                        cleanup: cleanup.to_string(),
+                    });
+                }
+                Err(err)
+            }
+        }
+    }
+
+    /// The fallible tail of [`Self::start_vm_broker_session`], after the subnet has
+    /// been claimed: materialise + launch the broker VM, boot the agent against it,
+    /// and wait for bootstrap. Returns the broker URL on success; any error is
+    /// rolled back by the caller via `cleanup_failed_started_session`.
+    #[allow(clippy::too_many_arguments)]
+    async fn complete_vm_broker_start<S: SecretStore + Send + Sync + 'static>(
+        &self,
+        state: Arc<BrokerState<S>>,
+        session_id: SessionId,
+        agent_kind: AgentKind,
+        broker_image: &ContainerImage,
+        host_config_json: &str,
+        host_audit_db: &Path,
+        audit_dir: &Path,
+        broker_port: BrokerPort,
+        broker_ports: BrokerPorts,
+        subnet_index: u16,
+        network: AgentNetwork,
+        guest_command: Vec<String>,
+    ) -> Result<String, AgentVmDaemonError> {
+        let paths = BrokerVmSessionPaths::new(&self.broker_material_root(), session_id);
+        // The broker creates and owns the shared internal network the agent joins;
+        // its name is the agent network name (session-id derived).
+        let internal_network = AgentVmNames::for_session(session_id).network().to_string();
+        let bearer = VmHttpBearerToken::generate();
+        let bearer_token = bearer.as_str().to_string();
+
+        // Materialise the broker session material (config, spec, bearer, ephemeral
+        // secret store) and the launch plan. Synchronous IO, so off the runtime.
+        let request = BrokerVmSessionRequest {
+            session_id,
+            agent_kind,
+            image: broker_image.clone(),
+            container_tool: self.config.lifecycle.tools.container().to_path_buf(),
+            internal_network: internal_network.clone(),
+            agent_subnet: network.ipv4(),
+            bind_addr: self.config.vm_http.bind_addr(),
+            broker_port,
+            resources: self.config.lifecycle.resources,
+            host_audit_db: host_audit_db.to_path_buf(),
+            staging_dir: paths.staging_dir(),
+            secrets_dir: paths.secrets_dir(),
+            audit_dir: audit_dir.to_path_buf(),
+        };
+        let host_config_json = host_config_json.to_string();
+        let state_for_secrets = Arc::clone(&state);
+        let broker_plan = tokio::task::spawn_blocking(move || {
+            materialize_broker_vm_session(
+                &request,
+                &host_config_json,
+                &bearer,
+                &state_for_secrets.secrets,
+            )
+        })
+        .await??;
+
+        // Launch the broker VM and discover its address on the shared network.
+        let broker_ipv4 = launch_broker_vm(
+            &broker_plan,
+            &paths.staging_dir().join("ready"),
+            BROKER_VM_READY_TIMEOUT,
+            BROKER_VM_READY_POLL_INTERVAL,
+        )
+        .await
+        .map_err(|source| AgentVmDaemonError::BrokerVmLaunch { session_id, source })?;
+        let broker_url = broker_url(broker_ipv4, broker_port);
+
+        // Boot the agent VM pointed at the broker VM: WRIT_BROKER_URL + token in the
+        // guest env, and the host PF allow target set to the broker VM's IP.
+        let guest_env = self.build_agent_guest_env(&broker_url, &bearer_token)?;
+        let boot_plan = self
+            .build_agent_plan(
+                session_id,
+                subnet_index,
+                broker_ports,
+                guest_env,
+                guest_command,
+            )?
+            .with_broker_pf_host(broker_ipv4);
+
+        let store = self.config.lifecycle.state_store.clone();
+        let boot_plan_for_start = boot_plan.clone();
+        // start_agent_vm_session rolls back its own agent infrastructure (VM + PF,
+        // not the broker-owned network) on a boot failure; the broker VM is reaped
+        // by the caller's cleanup_failed_started_session.
+        tokio::task::spawn_blocking(move || start_agent_vm_session(&boot_plan_for_start))
+            .await?
+            .map_err(AgentVmSessionManagerError::Start)?;
+        let store_for_running = store.clone();
+        let starting =
+            tokio::task::spawn_blocking(move || store_for_running.load(session_id)).await??;
+        // Promote to Running while recording the discovered broker VM IP, so
+        // list_sessions reports the real broker URL (not the subnet gateway).
+        tokio::task::spawn_blocking(move || {
+            store.mark_running_with_broker_ipv4(&starting, broker_ipv4)
+        })
+        .await??;
+
+        self.ensure_network_health_monitor(Arc::clone(&state.audit));
+        self.release_and_wait_for_workspace_bootstrap(boot_plan.names().vm())
+            .await?;
+        Ok(broker_url)
+    }
+
     #[cfg(test)]
     fn choose_subnet_index(&self) -> Result<(u16, AgentNetwork), AgentVmDaemonError> {
         choose_subnet_index(&self.config.lifecycle)
@@ -1551,6 +1926,25 @@ fn nix_cache_url_for_broker_url(broker_url: &str) -> String {
         broker_url.trim_end_matches('/'),
         VM_NIX_CACHE_PATH_PREFIX
     )
+}
+
+/// Resolve the host audit DB path and the directory the broker VM mounts to reach
+/// it. Returns `(absolute_db, mount_dir)`. The path is made absolute (relative to
+/// writd's cwd, where the host opened the DB) first, so a relative single-component
+/// path like `audit.db` — whose `parent()` is empty — does not yield a `source=`
+/// (empty) virtiofs mount the broker VM cannot open.
+fn resolve_broker_audit_paths(
+    host_audit_db: &Path,
+) -> Result<(PathBuf, PathBuf), AgentVmDaemonError> {
+    let absolute =
+        std::path::absolute(host_audit_db).map_err(AgentVmDaemonError::BrokerVmAuditDbPath)?;
+    let mount_dir = absolute
+        .parent()
+        .ok_or(AgentVmDaemonError::VmBrokerRuntimeConfigIncomplete(
+            "host_audit_db parent",
+        ))?
+        .to_path_buf();
+    Ok((absolute, mount_dir))
 }
 
 /// Remove a directory tree, treating an already-absent path as success. Used for
