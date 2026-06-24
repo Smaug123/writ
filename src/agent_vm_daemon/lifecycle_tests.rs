@@ -47,6 +47,50 @@ async fn vm_broker_placement_requires_an_agent_kind() {
     );
 }
 
+#[tokio::test]
+async fn vm_broker_placement_rejects_agent_run_sessions() {
+    let dir = tempfile::tempdir().unwrap();
+    let args_log = dir.path().join("args.log");
+    let env_path_log = dir.path().join("env-path.log");
+    let env_log = dir.path().join("env.log");
+    let fake_tool = write_fake_tool(dir.path(), &args_log, &env_path_log, &env_log);
+    let (config, _state_store) =
+        daemon_config_with_broker_placement(dir.path(), &fake_tool, BrokerPlacement::Vm);
+    let daemon = AgentVmDaemon::new(config);
+    let state = make_state_with_audit(AuditLog::open(dir.path().join("audit.db")).unwrap());
+
+    // The v1 broker VM has no agent-run route, so an agent-run session must be
+    // rejected before any container work (rather than start a VM whose guest 404s
+    // fetching its run config and strands RunAgent waiting for an outcome).
+    let err = daemon
+        .start_agent_run_session(
+            Arc::clone(&state),
+            Some("run".into()),
+            AgentKind::Claude,
+            "claude-test".into(),
+            AgentVmWorkspaceBootstrap {
+                repo: "owner/repo".parse().unwrap(),
+                destination: None,
+                warm: WorkspaceWarmMode::None,
+            },
+            crate::agent_run::AgentPrompt::new("do it"),
+            None,
+        )
+        .await
+        .unwrap_err();
+    let AgentVmDaemonError::StartFailed { source, .. } = err else {
+        panic!("expected StartFailed, got {err:?}");
+    };
+    assert!(
+        matches!(*source, AgentVmDaemonError::AgentRunUnsupportedForVmBroker),
+        "expected AgentRunUnsupportedForVmBroker, got {source:?}"
+    );
+    assert!(
+        !args_log.exists(),
+        "no container command should run for a rejected agent-run session"
+    );
+}
+
 /// A host config the broker VM's materializer accepts: a claude app whose private
 /// key secret matches `make_state`'s app config (`gh-app-pk`), no proxy (so the
 /// only secret the broker needs is that key), and the vm_http section
@@ -166,6 +210,15 @@ async fn vm_broker_placement_starts_agent_pointed_at_the_broker_vm() {
     assert!(
         args.contains("--broker-host 192.168.252.7"),
         "host PF must target the broker VM IP: {args}"
+    );
+
+    // list_sessions reports the discovered broker VM URL (not the subnet gateway).
+    let sessions = daemon.list_sessions().await.unwrap();
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(
+        sessions[0].broker_urls.as_slice(),
+        &["http://192.168.252.7:1024/".to_string()],
+        "running vm session must list the broker VM URL"
     );
 
     // The start materialised broker session material (config, spec, bearer, copied

@@ -206,6 +206,11 @@ pub enum AgentVmDaemonError {
     )]
     AgentKindRequiredForVmBroker,
     #[error(
+        "agent-run sessions are not supported with broker_placement = vm: the v1 broker VM serves \
+         clone + nix-cache + proxies only, with no agent-run route. Use broker_placement = host."
+    )]
+    AgentRunUnsupportedForVmBroker,
+    #[error(
         "broker_placement = vm runtime config is incomplete (missing {0}); this is a writd wiring \
          bug — the daemon should carry it for vm placement"
     )]
@@ -1426,10 +1431,14 @@ impl AgentVmDaemon {
             AGENT_VM_EGRESS_GATE_REQUIRE_NO_IPV6_ENV,
             require_no_ipv6,
         )?);
-        // Advertise the strict pre-warm-only substituter exactly when the operator
-        // has configured a pre-warm dir: the variable's presence is the guest-side
-        // switch that pins the devShell warm to the local-only view.
-        if self.config.vm_http.nix_prewarm_cache_dir().is_some() {
+        // Advertise the strict pre-warm-only substituter exactly when the broker
+        // actually serves it: its presence pins the devShell warm to the broker's
+        // /v1/nix/prewarm. Only the host broker serves it — the vm broker config
+        // drops nix_prewarm_cache_dir — so for vm placement advertising it would
+        // pin warm to an endpoint that 404s and fail otherwise-valid bootstraps.
+        if self.config.lifecycle.broker_placement == BrokerPlacement::Host
+            && self.config.vm_http.nix_prewarm_cache_dir().is_some()
+        {
             guest_env.push(AgentVmGuestEnvVar::new(
                 AGENT_VM_NIX_PREWARM_URL_ENV,
                 nix_prewarm_url_for_broker_url(broker_url),
@@ -1451,11 +1460,18 @@ impl AgentVmDaemon {
         // the host path runs an in-process broker; the vm path runs the broker in a
         // dedicated VM, working around the macOS vmnet accept() defect. The vm arm
         // diverges enough (no in-process broker, broker launched before the agent)
-        // that it lives in its own method. The v1 broker VM serves clone + nix-cache
-        // + proxies only, so `agent_runs` does not apply there and is dropped.
+        // that it lives in its own method.
         match self.config.lifecycle.broker_placement {
             BrokerPlacement::Host => {}
             BrokerPlacement::Vm => {
+                // The v1 broker VM serves clone + nix-cache + proxies only — no
+                // agent-run config/outcome routes. Reject an agent-run session
+                // up front rather than start a VM whose guest would 404 fetching
+                // its run config and leave RunAgent waiting for an outcome that
+                // can never be uploaded.
+                if agent_runs.is_some() {
+                    return Err(AgentVmDaemonError::AgentRunUnsupportedForVmBroker);
+                }
                 return self
                     .start_vm_broker_session(
                         state,
@@ -1798,7 +1814,12 @@ impl AgentVmDaemon {
         let store_for_running = store.clone();
         let starting =
             tokio::task::spawn_blocking(move || store_for_running.load(session_id)).await??;
-        tokio::task::spawn_blocking(move || store.mark_running(&starting)).await??;
+        // Promote to Running while recording the discovered broker VM IP, so
+        // list_sessions reports the real broker URL (not the subnet gateway).
+        tokio::task::spawn_blocking(move || {
+            store.mark_running_with_broker_ipv4(&starting, broker_ipv4)
+        })
+        .await??;
 
         self.ensure_network_health_monitor(Arc::clone(&state.audit));
         self.release_and_wait_for_workspace_bootstrap(boot_plan.names().vm())
