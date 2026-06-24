@@ -8,11 +8,13 @@ use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use writ::agent_vm_lifecycle::{
-    AgentVmResources, AgentVmSessionPlan, AgentVmSessionStateStore, AgentVmSessionStopPlan,
-    AgentVmStartInvocation, AgentVmToolPaths, BrokerPlacement, ContainerImage, Ipv6IsolationMode,
-    ProcessInvocation, default_agent_vm_state_dir, start_agent_vm_session,
-    start_managed_agent_vm_session, stop_agent_vm_session, stop_managed_agent_vm_session,
+    AgentVmResources, AgentVmSessionPlan, AgentVmSessionState, AgentVmSessionStateStore,
+    AgentVmSessionStopPlan, AgentVmStartInvocation, AgentVmToolPaths, BrokerPlacement,
+    ContainerImage, Ipv6IsolationMode, ProcessInvocation, default_agent_vm_state_dir,
+    start_agent_vm_session, start_managed_agent_vm_session, stop_agent_vm_session,
+    stop_managed_agent_vm_session,
 };
+use writ::broker_vm::{BrokerVmNames, broker_vm_removal_invocations};
 use writ::core::{
     AgentNetworkPool, BrokerPort, BrokerPortRange, BrokerPorts, Ipv4Cidr, Ipv6Cidr, SessionId,
 };
@@ -257,7 +259,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let store = AgentVmSessionStateStore::new(state_dir);
             if dry_run {
                 let state = store.load(session_id)?;
-                print_invocations(&state.to_stop_plan(tools).stop_invocations());
+                print_invocations(&managed_stop_dry_run_invocations(&state, tools));
             } else {
                 stop_managed_agent_vm_session(&store, session_id, tools)?;
             }
@@ -355,6 +357,28 @@ fn split_cidr(raw: &str) -> Result<(&str, &str), Box<dyn std::error::Error>> {
         .ok_or_else(|| format!("CIDR value must contain '/', got {raw:?}").into())
 }
 
+/// The invocations a `managed-stop` will run, for `--dry-run`. The agent VM /
+/// firewall / network teardown from the stop plan, plus — for vm placement — the
+/// broker VM and its two networks the real managed stop also reaps, so the dry
+/// run reflects exactly what the stop does.
+fn managed_stop_dry_run_invocations(
+    state: &AgentVmSessionState,
+    tools: AgentVmToolPaths,
+) -> Vec<ProcessInvocation> {
+    // The container tool is needed after `to_stop_plan` consumes `tools`.
+    let container = tools.container().to_path_buf();
+    let mut invocations = state.to_stop_plan(tools).stop_invocations();
+    if state.broker_placement() == BrokerPlacement::Vm {
+        let names = BrokerVmNames::for_session(state.session_id());
+        invocations.extend(broker_vm_removal_invocations(
+            &container,
+            &names,
+            state.names().network(),
+        ));
+    }
+    invocations
+}
+
 fn print_invocations(invocations: &[ProcessInvocation]) {
     for invocation in invocations {
         println!("{}", invocation.display_shell());
@@ -426,6 +450,72 @@ mod tests {
                 panic!("expected stop command")
             }
         }
+    }
+
+    fn managed_state(placement: BrokerPlacement) -> (tempfile::TempDir, AgentVmSessionState) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = AgentVmSessionStateStore::new(dir.path().join("state"));
+        let pool = AgentNetworkPool::new(
+            Ipv4Cidr::new("192.168.0.0".parse().unwrap(), 16).unwrap(),
+            Ipv6Cidr::new("fd83:b6f2:e57::".parse().unwrap(), 48).unwrap(),
+        )
+        .unwrap();
+        let plan = AgentVmSessionPlan::new_with_guest_env(
+            "51b8fd0f-6c10-454c-b0e6-7df1d60e2e6d".parse().unwrap(),
+            pool,
+            252,
+            BrokerPorts::new([BrokerPort::new(50000).unwrap()]).unwrap(),
+            BrokerPortRange::new(49152, 65535).unwrap(),
+            Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6,
+            placement,
+            ContainerImage::new("alpine:latest").unwrap(),
+            Vec::new(),
+            vec!["sleep".into(), "600".into()],
+            AgentVmResources::new(1, 512).unwrap(),
+            AgentVmToolPaths::new("container", "pf", "sudo"),
+        )
+        .unwrap();
+        let state = store.create_starting(&plan).unwrap();
+        (dir, state)
+    }
+
+    fn dry_run_lines(state: &AgentVmSessionState) -> Vec<String> {
+        managed_stop_dry_run_invocations(
+            state,
+            AgentVmToolPaths::new("/usr/local/bin/container", "pf", "sudo"),
+        )
+        .iter()
+        .map(|invocation| invocation.args_lossy().join(" "))
+        .collect()
+    }
+
+    #[test]
+    fn managed_stop_dry_run_includes_broker_teardown_for_vm_placement() {
+        let (_dir, state) = managed_state(BrokerPlacement::Vm);
+        let id = state.session_id();
+        let lines = dry_run_lines(&state);
+        // The real vm managed stop reaps the broker VM and both broker-owned
+        // networks; the dry run must list them.
+        for expected in [
+            format!("rm -f writ-broker-vm-{id}"),
+            format!("network rm writ-broker-egress-{id}"),
+            format!("network rm writ-agent-net-{id}"),
+        ] {
+            assert!(
+                lines.iter().any(|line| line == &expected),
+                "dry run missing {expected:?}: {lines:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn managed_stop_dry_run_omits_broker_teardown_for_host_placement() {
+        let (_dir, state) = managed_state(BrokerPlacement::Host);
+        let lines = dry_run_lines(&state);
+        assert!(
+            !lines.iter().any(|line| line.contains("writ-broker-vm-")),
+            "host dry run must not list broker VM teardown: {lines:?}"
+        );
     }
 
     #[test]

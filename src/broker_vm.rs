@@ -335,29 +335,44 @@ impl BrokerVmPlan {
     /// agent VM before tearing the broker down) — otherwise the network is still
     /// in use. The agent VM's own stop plan removes the agent VM only.
     pub fn stop_invocations(&self) -> Vec<ProcessInvocation> {
-        vec![
-            ProcessInvocation::new(
-                self.container_tool.clone(),
-                ["rm".to_string(), "-f".to_string(), self.names.vm.clone()],
-            ),
-            ProcessInvocation::new(
-                self.container_tool.clone(),
-                [
-                    "network".to_string(),
-                    "rm".to_string(),
-                    self.names.egress_network.clone(),
-                ],
-            ),
-            ProcessInvocation::new(
-                self.container_tool.clone(),
-                [
-                    "network".to_string(),
-                    "rm".to_string(),
-                    self.internal_network.clone(),
-                ],
-            ),
-        ]
+        broker_vm_removal_invocations(&self.container_tool, &self.names, &self.internal_network)
     }
+}
+
+/// The destructive teardown commands for one session's broker VM, in order:
+/// force-remove the broker VM, remove its egress network, then the shared
+/// internal network (only free once the agent VM has also been stopped). No
+/// launch parameters are needed, so the daemon's persisted-state cleanup and
+/// `managed-stop --dry-run` reconstruct exactly the commands the real stop runs.
+/// The stop path wraps each with an absence probe; these are the side-effecting
+/// commands, mirroring the agent VM's removal-invocation list.
+pub fn broker_vm_removal_invocations(
+    container_tool: &Path,
+    names: &BrokerVmNames,
+    internal_network: &str,
+) -> Vec<ProcessInvocation> {
+    vec![
+        ProcessInvocation::new(
+            container_tool.to_path_buf(),
+            ["rm".to_string(), "-f".to_string(), names.vm().to_string()],
+        ),
+        ProcessInvocation::new(
+            container_tool.to_path_buf(),
+            [
+                "network".to_string(),
+                "rm".to_string(),
+                names.egress_network().to_string(),
+            ],
+        ),
+        ProcessInvocation::new(
+            container_tool.to_path_buf(),
+            [
+                "network".to_string(),
+                "rm".to_string(),
+                internal_network.to_string(),
+            ],
+        ),
+    ]
 }
 
 /// Host directory layout for one session's broker-VM material, all under a single
@@ -1153,6 +1168,44 @@ mod tests {
                     "network".to_string(),
                     "rm".to_string(),
                     "writ-agent-net-51b8fd0f-6c10-454c-b0e6-7df1d60e2e6d".to_string(),
+                ],
+            ]
+        );
+    }
+
+    #[test]
+    fn removal_invocations_from_identity_match_the_plan_in_order() {
+        // The daemon cleanup and dry-run reconstruct teardown from session
+        // identity; it must be exactly the plan's stop sequence, in order: broker
+        // VM, egress network, shared internal network.
+        let plan = sample_plan();
+        let names = BrokerVmNames::for_session(session_id());
+        let from_identity = broker_vm_removal_invocations(
+            Path::new("/usr/local/bin/container"),
+            &names,
+            "writ-agent-net-51b8fd0f-6c10-454c-b0e6-7df1d60e2e6d",
+        );
+        let args = |invs: &[ProcessInvocation]| -> Vec<Vec<String>> {
+            invs.iter().map(ProcessInvocation::args_lossy).collect()
+        };
+        assert_eq!(args(&from_identity), args(&plan.stop_invocations()));
+        assert_eq!(
+            args(&from_identity),
+            vec![
+                vec![
+                    "rm".to_string(),
+                    "-f".to_string(),
+                    format!("writ-broker-vm-{}", session_id())
+                ],
+                vec![
+                    "network".to_string(),
+                    "rm".to_string(),
+                    format!("writ-broker-egress-{}", session_id())
+                ],
+                vec![
+                    "network".to_string(),
+                    "rm".to_string(),
+                    "writ-agent-net-51b8fd0f-6c10-454c-b0e6-7df1d60e2e6d".to_string()
                 ],
             ]
         );

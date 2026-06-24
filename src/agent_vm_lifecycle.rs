@@ -17,7 +17,7 @@ use std::process::Command;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::broker_vm::BrokerVmNames;
+use crate::broker_vm::{BrokerVmNames, broker_vm_removal_invocations};
 use crate::core::{
     AgentNetwork, AgentNetworkPool, AgentVmConfigError, BrokerPortRange, BrokerPorts, Ipv4Cidr,
     Ipv6Cidr, SessionId,
@@ -1812,36 +1812,27 @@ fn run_broker_vm_cleanup_until_absent(
             ],
         )
     };
-    let remove_network = |network: &str| {
-        ProcessInvocation::new(
-            container_tool.to_path_buf(),
-            ["network".to_string(), "rm".to_string(), network.to_string()],
-        )
-    };
-
-    let mut errors = Vec::new();
-    let steps = [
+    // Presence probes in the same resource order as `broker_vm_removal_invocations`
+    // (broker VM, egress network, shared internal network), so each shared removal
+    // command is paired with the right probe.
+    let probes = [
         (
             ResourcePresenceProbe::new(list_containers(), names.vm().to_string()),
-            vec![ProcessInvocation::new(
-                container_tool.to_path_buf(),
-                ["rm".to_string(), "-f".to_string(), names.vm().to_string()],
-            )],
             "broker VM still appears in container list after removal attempts",
         ),
         (
             ResourcePresenceProbe::new(list_networks(), names.egress_network().to_string()),
-            vec![remove_network(names.egress_network())],
             "broker egress network still appears in network list after removal attempts",
         ),
         (
             ResourcePresenceProbe::new(list_networks(), internal_network.to_string()),
-            vec![remove_network(internal_network)],
             "shared internal network still appears in network list after removal attempts",
         ),
     ];
-    for (probe, removals, still_present) in steps {
-        if let Err(err) = run_cleanup_until_resource_absent(&probe, removals, still_present) {
+    let removals = broker_vm_removal_invocations(container_tool, &names, internal_network);
+    let mut errors = Vec::new();
+    for ((probe, still_present), removal) in probes.into_iter().zip(removals) {
+        if let Err(err) = run_cleanup_until_resource_absent(&probe, vec![removal], still_present) {
             errors.push(err);
         }
     }
