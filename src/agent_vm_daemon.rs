@@ -26,6 +26,7 @@ use crate::agent_vm_lifecycle::{
     remove_managed_agent_vm_session_state,
 };
 use crate::audit::{AgentRunAuditRecord, AgentVmNetworkHealthEventRecord, AuditError, AuditLog};
+use crate::broker_vm::BrokerVmSessionPaths;
 use crate::core::{
     AgentKind, AgentNetwork, AgentNetworkPool, AgentVmConfigError, BrokerPorts, SessionId,
     SessionRecord, UnixMillis,
@@ -1063,10 +1064,41 @@ impl AgentVmDaemon {
     ) -> Result<Result<(), AgentVmSessionManagerError>, tokio::task::JoinError> {
         let store = self.config.lifecycle.state_store.clone();
         let tools = self.config.lifecycle.tools.clone();
+        let broker_material_root = self.broker_material_root();
         tokio::task::spawn_blocking(move || {
-            cleanup_managed_agent_vm_session(&store, session_id, tools)
+            let result = cleanup_managed_agent_vm_session(&store, session_id, tools);
+            // Once the broker VM (which mounts the material read-only) is confirmed
+            // torn down, remove this session's per-session material dir — copied
+            // secrets included. Best-effort and only on a successful teardown: a
+            // removal failure is logged, not fatal (the cloud teardown above is the
+            // surfaced result, and the dir is a 0700 daemon-private path), and on a
+            // failed teardown the dir is left for the retry rather than pulled out
+            // from under a still-running broker VM. A no-op for host placement,
+            // whose material dir never existed.
+            if result.is_ok() {
+                let session_dir = BrokerVmSessionPaths::new(&broker_material_root, session_id)
+                    .session_dir()
+                    .to_path_buf();
+                if let Err(err) = remove_dir_all_if_present(&session_dir) {
+                    tracing::warn!(
+                        %session_id,
+                        path = %session_dir.display(),
+                        error = %err,
+                        "failed to remove broker VM material directory",
+                    );
+                }
+            }
+            result
         })
         .await
+    }
+
+    /// The root under which each session's broker-VM host material lives
+    /// (`<state_dir>/broker-vm/<session_id>/…`). Derived from the state directory
+    /// so the start arm (which writes the material) and teardown (which removes it)
+    /// agree without extra configuration.
+    fn broker_material_root(&self) -> PathBuf {
+        self.config.lifecycle.state_store.dir().join("broker-vm")
     }
 
     /// Remove the persisted state record for `session_id` on a blocking
@@ -1519,6 +1551,16 @@ fn nix_cache_url_for_broker_url(broker_url: &str) -> String {
         broker_url.trim_end_matches('/'),
         VM_NIX_CACHE_PATH_PREFIX
     )
+}
+
+/// Remove a directory tree, treating an already-absent path as success. Used for
+/// the best-effort removal of a session's broker-VM material directory.
+fn remove_dir_all_if_present(dir: &Path) -> std::io::Result<()> {
+    match std::fs::remove_dir_all(dir) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err),
+    }
 }
 
 fn nix_prewarm_url_for_broker_url(broker_url: &str) -> String {

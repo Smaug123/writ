@@ -90,6 +90,82 @@ fn managed_cleanup_success_preserves_state_until_explicit_remove() {
 
 #[cfg(unix)]
 #[test]
+fn managed_cleanup_of_a_vm_session_tears_down_the_broker_vm() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = AgentVmSessionStateStore::new(dir.path().join("state"));
+    let log = dir.path().join("argv.log");
+    // A fake container/sudo that logs every argv line and reports all resources
+    // absent (empty output), so the agent VM cleanup completes immediately and we
+    // can assert the broker VM teardown invocations also ran.
+    let tool = write_executable_script(
+        dir.path(),
+        "fake-container",
+        &format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\nexit 0\n",
+            log.display()
+        ),
+    );
+    let plan = plan_with_broker_placement(252, BrokerPlacement::Vm);
+    let starting = store.create_starting(&plan).unwrap();
+    store.mark_running(&starting).unwrap();
+
+    cleanup_managed_agent_vm_session(
+        &store,
+        plan.session_id(),
+        AgentVmToolPaths::new(&tool, &tool, &tool),
+    )
+    .unwrap();
+
+    let logged = fs::read_to_string(&log).unwrap();
+    let id = plan.session_id();
+    // The broker arm's teardown: its VM, its egress network, then the shared
+    // internal network the agent only joined.
+    for expected in [
+        format!("rm -f writ-broker-vm-{id}"),
+        format!("network rm writ-broker-egress-{id}"),
+        format!("network rm writ-agent-net-{id}"),
+    ] {
+        assert!(
+            logged.lines().any(|line| line == expected),
+            "expected broker teardown line {expected:?} in:\n{logged}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn managed_cleanup_of_a_host_session_runs_no_broker_teardown() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = AgentVmSessionStateStore::new(dir.path().join("state"));
+    let log = dir.path().join("argv.log");
+    let tool = write_executable_script(
+        dir.path(),
+        "fake-container",
+        &format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\nexit 0\n",
+            log.display()
+        ),
+    );
+    let plan = plan_with_broker_placement(252, BrokerPlacement::Host);
+    let starting = store.create_starting(&plan).unwrap();
+    store.mark_running(&starting).unwrap();
+
+    cleanup_managed_agent_vm_session(
+        &store,
+        plan.session_id(),
+        AgentVmToolPaths::new(&tool, &tool, &tool),
+    )
+    .unwrap();
+
+    let logged = fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        !logged.contains("writ-broker-vm-"),
+        "host placement must run no broker VM teardown:\n{logged}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn managed_start_then_managed_stop_success_removes_state_record() {
     let dir = tempfile::tempdir().unwrap();
     let store = AgentVmSessionStateStore::new(dir.path().join("state"));

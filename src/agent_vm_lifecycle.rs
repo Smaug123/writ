@@ -17,6 +17,7 @@ use std::process::Command;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::broker_vm::{BrokerVmNames, broker_vm_stop_invocations};
 use crate::core::{
     AgentNetwork, AgentNetworkPool, AgentVmConfigError, BrokerPortRange, BrokerPorts, Ipv4Cidr,
     Ipv6Cidr, SessionId,
@@ -423,6 +424,12 @@ impl CleanupErrors {
 
     pub fn errors(&self) -> &[ProcessInvocationError] {
         &self.errors
+    }
+
+    /// Consume into the underlying errors, so a caller running additional cleanup
+    /// (e.g. the broker VM teardown) can merge them into one [`CleanupErrors`].
+    pub fn into_errors(self) -> Vec<ProcessInvocationError> {
+        self.errors
     }
 }
 
@@ -1623,8 +1630,30 @@ fn cleanup_managed_agent_vm_session_unlocked(
         // Running record, so managed stop must accept both.
         AgentVmSessionStateStatus::Starting | AgentVmSessionStateStatus::Running => {}
     }
-    stop_agent_vm_session(&state.to_stop_plan(tools))?;
-    Ok(())
+    // Capture the container tool before `to_stop_plan` consumes `tools`; the vm
+    // placement broker teardown needs it after the agent VM is stopped.
+    let container = tools.container().to_path_buf();
+    let mut errors = match stop_agent_vm_session(&state.to_stop_plan(tools)) {
+        Ok(()) => Vec::new(),
+        Err(agent) => agent.into_errors(),
+    };
+    // For vm placement the broker arm owns a dedicated broker VM plus the shared
+    // network the agent only joined; tear them down *after* the agent VM is gone
+    // (so removing the shared network is safe). Best-effort, collecting failures
+    // alongside the agent ones so a single stuck resource is surfaced for retry
+    // without skipping the rest. All names derive from session identity, so no
+    // launch plan is needed. (The per-session host material dir — copied secrets
+    // included — is removed by the daemon, which owns that path policy.)
+    if state.broker_placement() == BrokerPlacement::Vm {
+        let names = BrokerVmNames::for_session(state.session_id());
+        let internal_network = state.names().network().to_string();
+        for invocation in broker_vm_stop_invocations(&container, &names, &internal_network) {
+            if let Err(err) = invocation.run() {
+                errors.push(err);
+            }
+        }
+    }
+    finish_cleanup_errors(errors).map_err(Into::into)
 }
 
 fn derive_session_network(
