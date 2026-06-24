@@ -57,10 +57,14 @@ pub const BROKER_VM_WORK_ROOT: &str = "/tmp/writ-broker-work";
 pub const BROKER_VM_GIT_PROGRAM: &str = "/bin/git";
 /// Guest `nix` (used by nix-dependent endpoints).
 pub const BROKER_VM_NIX_PROGRAM: &str = "/bin/nix";
-/// Guest `GIT_ASKPASS` helper that echoes the minted token from the configured
-/// `token_env`. The broker image must ship this (the host's libexec one is not
-/// mounted).
+/// Guest `GIT_ASKPASS` helper that echoes the minted token from
+/// [`BROKER_VM_GIT_TOKEN_ENV`]. The broker image must ship this (the host's
+/// libexec one is not mounted).
 pub const BROKER_VM_ASKPASS_PROGRAM: &str = "/bin/writ-git-askpass";
+/// The env var the broker image's askpass reads the minted token from. The
+/// derived broker config pins `token_env` to this, since the image's askpass is
+/// fixed (a custom host token_env would otherwise break authenticated clones).
+pub const BROKER_VM_GIT_TOKEN_ENV: &str = "WRIT_GIT_TOKEN";
 
 const SESSION_SPEC_FILE: &str = "session-spec.json";
 const BEARER_TOKEN_FILE: &str = "bearer-token";
@@ -510,8 +514,8 @@ pub fn broker_config_json(
         serde_json::json!(broker_port.get()),
     );
     // Point the executables at the broker image's guest paths; the host's own
-    // git/nix/askpass paths are not mounted into the VM. (`token_env` and
-    // `git_clone_base_url` are not paths, so they carry over unchanged.)
+    // git/nix/askpass paths are not mounted into the VM. (`git_clone_base_url` is
+    // not a path, so it carries over unchanged.)
     vm_http.insert(
         "git_program".to_string(),
         serde_json::Value::String(BROKER_VM_GIT_PROGRAM.to_string()),
@@ -523,6 +527,13 @@ pub fn broker_config_json(
     vm_http.insert(
         "askpass_program".to_string(),
         serde_json::Value::String(BROKER_VM_ASKPASS_PROGRAM.to_string()),
+    );
+    // Pin token_env to the variable the broker image's askpass reads. The image's
+    // /bin/writ-git-askpass is fixed, so a custom host token_env would otherwise
+    // leave git without a password and break authenticated clones.
+    vm_http.insert(
+        "token_env".to_string(),
+        serde_json::Value::String(BROKER_VM_GIT_TOKEN_ENV.to_string()),
     );
     for key in BROKER_DROPPED_VM_HTTP_KEYS {
         vm_http.remove(*key);
@@ -1436,6 +1447,33 @@ mod tests {
         assert_eq!(
             config.audit_db.as_deref(),
             Some(Path::new("/writ/audit/sessions.sqlite"))
+        );
+    }
+
+    #[test]
+    fn broker_config_pins_token_env_to_the_image_askpass_var() {
+        use crate::config::DaemonConfig;
+        // A custom host token_env must be rewritten to the var the broker image's
+        // fixed askpass reads, else git gets no password in the broker VM.
+        let host = host_config_json().replace(
+            r#""git_clone_base_url": "https://github.com","#,
+            r#""git_clone_base_url": "https://github.com", "token_env": "CUSTOM_TOKEN","#,
+        );
+        assert!(
+            host.contains("CUSTOM_TOKEN"),
+            "test setup injected token_env"
+        );
+        let json = broker_config_json(
+            &host,
+            BrokerPort::new(18080).unwrap(),
+            "/tmp/x",
+            Path::new("/var/lib/writ/audit.db"),
+        )
+        .unwrap();
+        let config: DaemonConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            config.agent_vm.unwrap().vm_http.token_env,
+            BROKER_VM_GIT_TOKEN_ENV
         );
     }
 

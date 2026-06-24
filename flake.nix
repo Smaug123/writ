@@ -418,9 +418,16 @@
             install -d -m 0700 $out/root
           '';
           brokerEtcFiles = buildPkgs.runCommand "writ-broker-vm-etc-files" {} ''
-            install -d $out/etc
+            install -d $out/etc/ssl/certs
             printf 'root:x:0:0:root:/root:/bin/sh\n' > $out/etc/passwd
             printf 'root:x:0:\n' > $out/etc/group
+            # The broker spawns git through run_clean_git, which clears the
+            # environment — so the image-level SSL_CERT_FILE/GIT_SSL_CAINFO do NOT
+            # reach git. The Nixpkgs curl/OpenSSL stack then looks for the CA bundle
+            # at the default /etc/ssl/certs/ca-certificates.crt, which cacert does
+            # not provide (only ca-bundle.crt); link it so HTTPS clones validate.
+            ln -s ${guestPkgs.cacert}/etc/ssl/certs/ca-bundle.crt \
+              $out/etc/ssl/certs/ca-certificates.crt
           '';
           brokerRoot = buildPkgs.buildEnv {
             name = "writ-broker-vm-root";
