@@ -326,6 +326,13 @@ impl AgentVmSessionState {
         self.ipv6_mode
     }
 
+    /// Where this session's broker runs. Drives placement-aware teardown: a `Vm`
+    /// session also has a dedicated broker VM (and a shared network the broker
+    /// arm owns) to tear down beyond the agent VM.
+    pub fn broker_placement(&self) -> BrokerPlacement {
+        self.broker_placement
+    }
+
     pub fn broker_urls(&self) -> Vec<BrokerUrl> {
         self.broker_ports
             .as_slice()
@@ -360,6 +367,13 @@ impl AgentVmSessionStateStore {
 
     pub fn path_for(&self, session_id: SessionId) -> PathBuf {
         self.dir.join(format!("{session_id}.json"))
+    }
+
+    /// The state directory root. The daemon derives its per-session broker-VM
+    /// material root from this so the start arm (which writes the material) and
+    /// teardown (which removes it) agree on the location.
+    pub fn dir(&self) -> &Path {
+        &self.dir
     }
 
     fn lock_path(&self) -> PathBuf {

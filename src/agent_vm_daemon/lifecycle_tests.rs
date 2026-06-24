@@ -157,6 +157,51 @@ async fn daemon_start_injects_vm_http_env_without_persisting_token_and_stop_clea
 }
 
 #[tokio::test]
+async fn daemon_stop_removes_the_broker_material_dir() {
+    let dir = tempfile::tempdir().unwrap();
+    let args_log = dir.path().join("args.log");
+    let env_path_log = dir.path().join("env-path.log");
+    let env_log = dir.path().join("env.log");
+    let fake_tool = write_fake_tool(dir.path(), &args_log, &env_path_log, &env_log);
+    let (config, _state_store) = daemon_config(dir.path(), &fake_tool);
+    let daemon = AgentVmDaemon::new(config);
+    let state = make_state();
+
+    let started = daemon
+        .start_session(
+            Arc::clone(&state),
+            None,
+            None,
+            None,
+            None,
+            vec!["sleep".into(), "600".into()],
+        )
+        .await
+        .unwrap();
+
+    // Simulate this session's broker material (the start arm writes it here for
+    // vm placement). Stop removes the per-session dir on a successful teardown —
+    // unconditional, so it also collects any copied secrets. Exercised here via
+    // the host start/stop flow, which can actually start.
+    let material = dir
+        .path()
+        .join("state")
+        .join("broker-vm")
+        .join(started.session_id().to_string());
+    fs::create_dir_all(&material).unwrap();
+    fs::write(material.join("bearer-token"), b"writ-vm-secret").unwrap();
+
+    daemon
+        .stop_session(&state, started.session_id())
+        .await
+        .unwrap();
+    assert!(
+        !material.exists(),
+        "stop must remove the broker material dir (copied secrets included)"
+    );
+}
+
+#[tokio::test]
 async fn daemon_start_advertises_prewarm_substituter_when_prewarm_dir_configured() {
     let dir = tempfile::tempdir().unwrap();
     let args_log = dir.path().join("args.log");

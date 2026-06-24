@@ -90,6 +90,126 @@ fn managed_cleanup_success_preserves_state_until_explicit_remove() {
 
 #[cfg(unix)]
 #[test]
+fn managed_cleanup_of_a_vm_session_tears_down_the_broker_vm() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = AgentVmSessionStateStore::new(dir.path().join("state"));
+    let plan = plan_with_broker_placement(252, BrokerPlacement::Vm);
+    let id = plan.session_id();
+    // A *stateful* fake container/sudo: `list`/`network list` report a resource as
+    // present until `rm`/`network rm` marks it removed, so the absence-based
+    // cleanup observes each resource present, removes it, then probes it gone —
+    // exactly the agent VM/network cleanup contract. Pure POSIX shell (markers via
+    // `: >`, no external commands), so it runs in the no-/bin/rm Nix sandbox too.
+    let state = dir.path().join("fakestate");
+    fs::create_dir_all(state.join("vm")).unwrap();
+    fs::create_dir_all(state.join("net")).unwrap();
+    fs::create_dir_all(state.join("removed")).unwrap();
+    for vm in [
+        format!("writ-agent-vm-{id}"),
+        format!("writ-broker-vm-{id}"),
+    ] {
+        fs::write(state.join("vm").join(&vm), b"").unwrap();
+    }
+    for net in [
+        format!("writ-broker-egress-{id}"),
+        format!("writ-agent-net-{id}"),
+    ] {
+        fs::write(state.join("net").join(&net), b"").unwrap();
+    }
+    let tool = write_executable_script(
+        dir.path(),
+        "fake-container",
+        &format!(
+            "#!/bin/sh\n\
+             S={state}\n\
+             if [ \"$1\" = list ]; then for f in \"$S\"/vm/*; do [ -e \"$f\" ] || continue; n=\"${{f##*/}}\"; [ -e \"$S/removed/$n\" ] || echo \"$n\"; done; exit 0; fi\n\
+             if [ \"$1\" = network ] && [ \"$2\" = list ]; then for f in \"$S\"/net/*; do [ -e \"$f\" ] || continue; n=\"${{f##*/}}\"; [ -e \"$S/removed/$n\" ] || echo \"$n\"; done; exit 0; fi\n\
+             if [ \"$1\" = network ] && [ \"$2\" = rm ]; then : > \"$S/removed/$3\"; exit 0; fi\n\
+             if [ \"$1\" = rm ] || [ \"$1\" = stop ] || [ \"$1\" = delete ]; then for a in \"$@\"; do n=\"$a\"; done; : > \"$S/removed/$n\"; exit 0; fi\n\
+             exit 0\n",
+            state = state.display(),
+        ),
+    );
+    let starting = store.create_starting(&plan).unwrap();
+    store.mark_running(&starting).unwrap();
+
+    cleanup_managed_agent_vm_session(
+        &store,
+        plan.session_id(),
+        AgentVmToolPaths::new(&tool, &tool, &tool),
+    )
+    .unwrap();
+
+    // Cleanup succeeding already means the absence probes confirmed each broker
+    // resource gone; assert each was actually issued a removal (its removed-marker
+    // exists): the broker VM, its egress network, and the shared internal network.
+    for removed in [
+        format!("writ-broker-vm-{id}"),
+        format!("writ-broker-egress-{id}"),
+        format!("writ-agent-net-{id}"),
+    ] {
+        assert!(
+            state.join("removed").join(&removed).exists(),
+            "broker resource not torn down: {removed}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn managed_cleanup_of_a_vm_session_is_idempotent_when_resources_already_absent() {
+    // The retry / already-torn-down case Apple Container removals make real: every
+    // resource reports absent (empty list), so cleanup must succeed without ever
+    // treating an already-gone broker resource as a fatal error.
+    let dir = tempfile::tempdir().unwrap();
+    let store = AgentVmSessionStateStore::new(dir.path().join("state"));
+    let tool = write_executable_script(dir.path(), "fake-container", "#!/bin/sh\nexit 0\n");
+    let plan = plan_with_broker_placement(252, BrokerPlacement::Vm);
+    let starting = store.create_starting(&plan).unwrap();
+    store.mark_running(&starting).unwrap();
+
+    cleanup_managed_agent_vm_session(
+        &store,
+        plan.session_id(),
+        AgentVmToolPaths::new(&tool, &tool, &tool),
+    )
+    .expect("already-absent broker resources must not fail the stop");
+}
+
+#[cfg(unix)]
+#[test]
+fn managed_cleanup_of_a_host_session_runs_no_broker_teardown() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = AgentVmSessionStateStore::new(dir.path().join("state"));
+    let log = dir.path().join("argv.log");
+    let tool = write_executable_script(
+        dir.path(),
+        "fake-container",
+        &format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\nexit 0\n",
+            log.display()
+        ),
+    );
+    let plan = plan_with_broker_placement(252, BrokerPlacement::Host);
+    let starting = store.create_starting(&plan).unwrap();
+    store.mark_running(&starting).unwrap();
+
+    cleanup_managed_agent_vm_session(
+        &store,
+        plan.session_id(),
+        AgentVmToolPaths::new(&tool, &tool, &tool),
+    )
+    .unwrap();
+
+    let logged = fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        !logged.contains("writ-broker-vm-"),
+        "host placement must run no broker VM teardown:\n{logged}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn managed_start_then_managed_stop_success_removes_state_record() {
     let dir = tempfile::tempdir().unwrap();
     let store = AgentVmSessionStateStore::new(dir.path().join("state"));
