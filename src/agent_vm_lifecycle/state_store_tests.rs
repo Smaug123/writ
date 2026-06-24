@@ -93,16 +93,17 @@ fn managed_cleanup_success_preserves_state_until_explicit_remove() {
 fn managed_cleanup_of_a_vm_session_tears_down_the_broker_vm() {
     let dir = tempfile::tempdir().unwrap();
     let store = AgentVmSessionStateStore::new(dir.path().join("state"));
-    let log = dir.path().join("argv.log");
     let plan = plan_with_broker_placement(252, BrokerPlacement::Vm);
     let id = plan.session_id();
-    // A *stateful* fake container/sudo: `list`/`network list` report the resources
-    // whose marker files still exist, and `rm`/`network rm` delete the marker. So
-    // the absence-based cleanup observes each resource present, removes it, then
-    // probes it gone — exactly the agent VM/network cleanup contract.
+    // A *stateful* fake container/sudo: `list`/`network list` report a resource as
+    // present until `rm`/`network rm` marks it removed, so the absence-based
+    // cleanup observes each resource present, removes it, then probes it gone —
+    // exactly the agent VM/network cleanup contract. Pure POSIX shell (markers via
+    // `: >`, no external commands), so it runs in the no-/bin/rm Nix sandbox too.
     let state = dir.path().join("fakestate");
     fs::create_dir_all(state.join("vm")).unwrap();
     fs::create_dir_all(state.join("net")).unwrap();
+    fs::create_dir_all(state.join("removed")).unwrap();
     for vm in [
         format!("writ-agent-vm-{id}"),
         format!("writ-broker-vm-{id}"),
@@ -120,14 +121,12 @@ fn managed_cleanup_of_a_vm_session_tears_down_the_broker_vm() {
         "fake-container",
         &format!(
             "#!/bin/sh\n\
-             printf '%s\\n' \"$*\" >> {log}\n\
              S={state}\n\
-             if [ \"$1\" = list ]; then for f in \"$S\"/vm/*; do [ -e \"$f\" ] && echo \"${{f##*/}}\"; done; exit 0; fi\n\
-             if [ \"$1\" = network ] && [ \"$2\" = list ]; then for f in \"$S\"/net/*; do [ -e \"$f\" ] && echo \"${{f##*/}}\"; done; exit 0; fi\n\
-             if [ \"$1\" = network ] && [ \"$2\" = rm ]; then /bin/rm -f \"$S/net/$3\"; exit 0; fi\n\
-             if [ \"$1\" = rm ] || [ \"$1\" = stop ] || [ \"$1\" = delete ]; then for a in \"$@\"; do n=\"$a\"; done; /bin/rm -f \"$S/vm/$n\"; exit 0; fi\n\
+             if [ \"$1\" = list ]; then for f in \"$S\"/vm/*; do [ -e \"$f\" ] || continue; n=\"${{f##*/}}\"; [ -e \"$S/removed/$n\" ] || echo \"$n\"; done; exit 0; fi\n\
+             if [ \"$1\" = network ] && [ \"$2\" = list ]; then for f in \"$S\"/net/*; do [ -e \"$f\" ] || continue; n=\"${{f##*/}}\"; [ -e \"$S/removed/$n\" ] || echo \"$n\"; done; exit 0; fi\n\
+             if [ \"$1\" = network ] && [ \"$2\" = rm ]; then : > \"$S/removed/$3\"; exit 0; fi\n\
+             if [ \"$1\" = rm ] || [ \"$1\" = stop ] || [ \"$1\" = delete ]; then for a in \"$@\"; do n=\"$a\"; done; : > \"$S/removed/$n\"; exit 0; fi\n\
              exit 0\n",
-            log = log.display(),
             state = state.display(),
         ),
     );
@@ -141,26 +140,19 @@ fn managed_cleanup_of_a_vm_session_tears_down_the_broker_vm() {
     )
     .unwrap();
 
-    // The broker arm's resources are all gone (its VM, its egress network, and the
-    // shared internal network the agent only joined) — proving the removals ran
-    // and the absence probes confirmed them.
-    for marker in [
-        state.join("vm").join(format!("writ-broker-vm-{id}")),
-        state.join("net").join(format!("writ-broker-egress-{id}")),
-        state.join("net").join(format!("writ-agent-net-{id}")),
+    // Cleanup succeeding already means the absence probes confirmed each broker
+    // resource gone; assert each was actually issued a removal (its removed-marker
+    // exists): the broker VM, its egress network, and the shared internal network.
+    for removed in [
+        format!("writ-broker-vm-{id}"),
+        format!("writ-broker-egress-{id}"),
+        format!("writ-agent-net-{id}"),
     ] {
         assert!(
-            !marker.exists(),
-            "broker resource not torn down: {marker:?}"
+            state.join("removed").join(&removed).exists(),
+            "broker resource not torn down: {removed}"
         );
     }
-    let logged = fs::read_to_string(&log).unwrap();
-    assert!(
-        logged
-            .lines()
-            .any(|l| l == format!("rm -f writ-broker-vm-{id}")),
-        "broker VM removal not issued:\n{logged}"
-    );
 }
 
 #[cfg(unix)]
