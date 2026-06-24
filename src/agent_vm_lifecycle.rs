@@ -17,7 +17,7 @@ use std::process::Command;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::broker_vm::{BrokerVmNames, broker_vm_stop_invocations};
+use crate::broker_vm::BrokerVmNames;
 use crate::core::{
     AgentNetwork, AgentNetworkPool, AgentVmConfigError, BrokerPortRange, BrokerPorts, Ipv4Cidr,
     Ipv6Cidr, SessionId,
@@ -1639,19 +1639,20 @@ fn cleanup_managed_agent_vm_session_unlocked(
     };
     // For vm placement the broker arm owns a dedicated broker VM plus the shared
     // network the agent only joined; tear them down *after* the agent VM is gone
-    // (so removing the shared network is safe). Best-effort, collecting failures
-    // alongside the agent ones so a single stuck resource is surfaced for retry
-    // without skipping the rest. All names derive from session identity, so no
-    // launch plan is needed. (The per-session host material dir — copied secrets
-    // included — is removed by the daemon, which owns that path policy.)
-    if state.broker_placement() == BrokerPlacement::Vm {
-        let names = BrokerVmNames::for_session(state.session_id());
-        let internal_network = state.names().network().to_string();
-        for invocation in broker_vm_stop_invocations(&container, &names, &internal_network) {
-            if let Err(err) = invocation.run() {
-                errors.push(err);
-            }
-        }
+    // (so removing the shared network is safe). Idempotent + absence-based like the
+    // agent VM/network cleanup, so lagging Apple Container removals and
+    // already-absent resources on retry don't fail the stop. Failures are
+    // collected alongside the agent ones. All names derive from session identity,
+    // so no launch plan is needed. (The per-session host material dir — copied
+    // secrets included — is removed by the daemon, which owns that path policy.)
+    if state.broker_placement() == BrokerPlacement::Vm
+        && let Err(broker) = run_broker_vm_cleanup_until_absent(
+            &container,
+            state.session_id(),
+            state.names().network(),
+        )
+    {
+        errors.extend(broker.into_errors());
     }
     finish_cleanup_errors(errors).map_err(Into::into)
 }
@@ -1775,6 +1776,76 @@ fn run_vm_cleanup_until_absent(
         plan.vm_removal_invocations(),
         "VM still appears in container list after removal attempts",
     )
+}
+
+/// Idempotent, absence-based teardown of a vm session's broker resources, matching
+/// the agent VM/network cleanup: each resource — the broker VM, then its egress
+/// network, then the shared internal network — is removed and probed out of the
+/// container / network list, so a removal that lags after the command returns and
+/// a resource already absent on a retry both resolve to success rather than a
+/// fatal error. The shared internal network is removed last and only after the
+/// agent VM has been torn down (the caller's responsibility). Failures across the
+/// three are collected. All names derive from session identity (no launch plan).
+fn run_broker_vm_cleanup_until_absent(
+    container_tool: &Path,
+    session_id: SessionId,
+    internal_network: &str,
+) -> Result<(), CleanupErrors> {
+    let names = BrokerVmNames::for_session(session_id);
+    let list_containers = || {
+        ProcessInvocation::new(
+            container_tool.to_path_buf(),
+            [
+                "list".to_string(),
+                "--all".to_string(),
+                "--quiet".to_string(),
+            ],
+        )
+    };
+    let list_networks = || {
+        ProcessInvocation::new(
+            container_tool.to_path_buf(),
+            [
+                "network".to_string(),
+                "list".to_string(),
+                "--quiet".to_string(),
+            ],
+        )
+    };
+    let remove_network = |network: &str| {
+        ProcessInvocation::new(
+            container_tool.to_path_buf(),
+            ["network".to_string(), "rm".to_string(), network.to_string()],
+        )
+    };
+
+    let mut errors = Vec::new();
+    let steps = [
+        (
+            ResourcePresenceProbe::new(list_containers(), names.vm().to_string()),
+            vec![ProcessInvocation::new(
+                container_tool.to_path_buf(),
+                ["rm".to_string(), "-f".to_string(), names.vm().to_string()],
+            )],
+            "broker VM still appears in container list after removal attempts",
+        ),
+        (
+            ResourcePresenceProbe::new(list_networks(), names.egress_network().to_string()),
+            vec![remove_network(names.egress_network())],
+            "broker egress network still appears in network list after removal attempts",
+        ),
+        (
+            ResourcePresenceProbe::new(list_networks(), internal_network.to_string()),
+            vec![remove_network(internal_network)],
+            "shared internal network still appears in network list after removal attempts",
+        ),
+    ];
+    for (probe, removals, still_present) in steps {
+        if let Err(err) = run_cleanup_until_resource_absent(&probe, removals, still_present) {
+            errors.push(err);
+        }
+    }
+    finish_cleanup_errors(errors)
 }
 
 fn run_network_cleanup_until_absent(

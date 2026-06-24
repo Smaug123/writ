@@ -335,44 +335,29 @@ impl BrokerVmPlan {
     /// agent VM before tearing the broker down) — otherwise the network is still
     /// in use. The agent VM's own stop plan removes the agent VM only.
     pub fn stop_invocations(&self) -> Vec<ProcessInvocation> {
-        broker_vm_stop_invocations(&self.container_tool, &self.names, &self.internal_network)
+        vec![
+            ProcessInvocation::new(
+                self.container_tool.clone(),
+                ["rm".to_string(), "-f".to_string(), self.names.vm.clone()],
+            ),
+            ProcessInvocation::new(
+                self.container_tool.clone(),
+                [
+                    "network".to_string(),
+                    "rm".to_string(),
+                    self.names.egress_network.clone(),
+                ],
+            ),
+            ProcessInvocation::new(
+                self.container_tool.clone(),
+                [
+                    "network".to_string(),
+                    "rm".to_string(),
+                    self.internal_network.clone(),
+                ],
+            ),
+        ]
     }
-}
-
-/// The teardown invocations for one session's broker VM, derived from just its
-/// names + the shared network — no launch parameters (image, resources, mounts)
-/// are needed to stop it. This lets the daemon's persisted-state stop/cleanup
-/// path tear a broker VM down from session identity alone, without reconstructing
-/// a full [`BrokerVmPlan`]. Same sequence as [`BrokerVmPlan::stop_invocations`]:
-/// force-remove the broker VM, then its egress network, then the shared internal
-/// network (which is only free once the agent VM has also been stopped).
-pub fn broker_vm_stop_invocations(
-    container_tool: &Path,
-    names: &BrokerVmNames,
-    internal_network: &str,
-) -> Vec<ProcessInvocation> {
-    vec![
-        ProcessInvocation::new(
-            container_tool.to_path_buf(),
-            ["rm".to_string(), "-f".to_string(), names.vm().to_string()],
-        ),
-        ProcessInvocation::new(
-            container_tool.to_path_buf(),
-            [
-                "network".to_string(),
-                "rm".to_string(),
-                names.egress_network().to_string(),
-            ],
-        ),
-        ProcessInvocation::new(
-            container_tool.to_path_buf(),
-            [
-                "network".to_string(),
-                "rm".to_string(),
-                internal_network.to_string(),
-            ],
-        ),
-    ]
 }
 
 /// Host directory layout for one session's broker-VM material, all under a single
@@ -1171,27 +1156,6 @@ mod tests {
                 ],
             ]
         );
-    }
-
-    #[test]
-    fn stop_invocations_from_session_identity_match_the_plan() {
-        // The daemon reconstructs teardown from session identity (no launch plan);
-        // it must produce exactly the plan's stop sequence.
-        let plan = sample_plan();
-        let names = BrokerVmNames::for_session(session_id());
-        let from_identity = broker_vm_stop_invocations(
-            Path::new("/usr/local/bin/container"),
-            &names,
-            "writ-agent-net-51b8fd0f-6c10-454c-b0e6-7df1d60e2e6d",
-        );
-        let from_plan = plan.stop_invocations();
-        let args = |invs: &[ProcessInvocation]| -> Vec<Vec<String>> {
-            invs.iter().map(ProcessInvocation::args_lossy).collect()
-        };
-        assert_eq!(args(&from_identity), args(&from_plan));
-        for inv in &from_identity {
-            assert_eq!(inv.program(), Path::new("/usr/local/bin/container"));
-        }
     }
 
     #[test]
