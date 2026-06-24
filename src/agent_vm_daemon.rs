@@ -163,6 +163,11 @@ pub struct AgentVmDaemon {
     /// first session start (it needs an [`AuditLog`] handle, which arrives with
     /// the start request, not at construction).
     health_monitor: std::sync::Mutex<Option<NetworkHealthMonitorHandle>>,
+    /// Session IDs of live `broker_placement = vm` sessions. The vm arm keeps no
+    /// in-process broker (so nothing in `running`), but the session is still
+    /// runtime-attached to this daemon; this set lets [`Self::list_sessions`]
+    /// report it as attached rather than orphaned.
+    vm_broker_attached: Mutex<HashSet<SessionId>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -192,6 +197,11 @@ pub enum AgentVmLifecycleRuntimeConfigError {
         "broker_placement = vm requires an agent_vm.lifecycle.broker_image (the dedicated broker VM image)"
     )]
     BrokerImageRequiredForVmPlacement,
+    #[error(
+        "broker_placement = vm requires ipv6_mode = ipv4_only_no_guest_ipv6: the broker VM creates \
+         an IPv4-only internal network and the broker host-PF override is IPv4-only"
+    )]
+    VmPlacementRequiresIpv4Only,
     #[error(transparent)]
     AgentVm(#[from] AgentVmConfigError),
 }
@@ -409,6 +419,15 @@ impl AgentVmLifecycleRuntimeConfig {
             ),
             BrokerPlacement::Host => None,
         };
+        // The broker VM creates an IPv4-only `--internal` network and the broker
+        // host-PF override rejects an IPv6 firewall scope, so vm placement is
+        // incompatible with dual-stack. Reject it here rather than launch a broker
+        // VM whose agent start then fails every time.
+        if broker_placement == BrokerPlacement::Vm
+            && ipv6_mode == Ipv6IsolationMode::DualStackRequired
+        {
+            return Err(AgentVmLifecycleRuntimeConfigError::VmPlacementRequiresIpv4Only);
+        }
         pool.allocate(subnet_index_min)?;
         pool.allocate(subnet_index_max)?;
         Ok(Self {
@@ -716,6 +735,33 @@ mod broker_image_invariant_tests {
             Some("broker:latest")
         );
     }
+
+    #[test]
+    fn vm_placement_rejects_dual_stack() {
+        // The broker VM creates an IPv4-only internal network and its host-PF
+        // override is IPv4-only, so vm + dual-stack is rejected at construction.
+        let pool = AgentNetworkPool::new(
+            Ipv4Cidr::new(Ipv4Addr::new(192, 168, 0, 0), 16).unwrap(),
+            Ipv6Cidr::new("fd83:b6f2:e57::".parse::<Ipv6Addr>().unwrap(), 48).unwrap(),
+        )
+        .unwrap();
+        let result = AgentVmLifecycleRuntimeConfig::new(
+            pool,
+            252,
+            253,
+            AgentVmSessionStateStore::new("/tmp/writ-test-vm-dual-stack"),
+            Ipv6IsolationMode::DualStackRequired,
+            BrokerPlacement::Vm,
+            ContainerImage::new("agent:latest").unwrap(),
+            Some(ContainerImage::new("broker:latest").unwrap()),
+            AgentVmResources::new(1, 512).unwrap(),
+            AgentVmToolPaths::new("/bin/container", "/bin/pf", "/bin/sudo"),
+        );
+        assert!(matches!(
+            result,
+            Err(AgentVmLifecycleRuntimeConfigError::VmPlacementRequiresIpv4Only)
+        ));
+    }
 }
 
 #[cfg(test)]
@@ -874,6 +920,7 @@ impl AgentVmDaemon {
             session_locks: Mutex::new(HashMap::new()),
             network_health: Arc::new(std::sync::Mutex::new(HashMap::new())),
             health_monitor: std::sync::Mutex::new(None),
+            vm_broker_attached: Mutex::new(HashSet::new()),
         }
     }
 
@@ -1151,6 +1198,8 @@ impl AgentVmDaemon {
         self.spawn_cleanup_session(session_id).await??;
 
         let audit_close = state.audit.close_session(session_id, UnixMillis::now());
+        // Drop any vm-broker attachment (a no-op for host sessions).
+        self.vm_broker_attached.lock().await.remove(&session_id);
         let http_shutdown = match self.running.lock().await.remove(&session_id) {
             Some(running) => running.shutdown().await,
             None => Ok(()),
@@ -1281,6 +1330,7 @@ impl AgentVmDaemon {
     ) -> Result<(), AgentVmDaemonError> {
         self.spawn_cleanup_session(session_id).await??;
 
+        self.vm_broker_attached.lock().await.remove(&session_id);
         if let Some(running) = self.running.lock().await.remove(&session_id) {
             running.shutdown().await?;
         }
@@ -1361,6 +1411,10 @@ impl AgentVmDaemon {
         let store = self.config.lifecycle.state_store.clone();
         let states = tokio::task::spawn_blocking(move || store.load_all()).await??;
         let running = self.running.lock().await;
+        let vm_attached = self.vm_broker_attached.lock().await;
+        // A session is runtime-attached if its in-process broker is live (host) or
+        // it is a live vm-broker session (no in-process broker, tracked separately).
+        let attached = |id: &SessionId| running.contains_key(id) || vm_attached.contains(id);
         Ok(states
             .into_iter()
             .map(|state| AgentVmSessionInfo {
@@ -1374,11 +1428,11 @@ impl AgentVmDaemon {
                     .into_iter()
                     .map(|url| url.as_str().to_string())
                     .collect(),
-                runtime_attached: running.contains_key(&state.session_id()),
+                runtime_attached: attached(&state.session_id()),
                 // Health is only meaningful for a runtime-attached session (the
                 // monitor publishes it); a detached/persisted-only session is
                 // genuinely Unknown here.
-                network_health: if running.contains_key(&state.session_id()) {
+                network_health: if attached(&state.session_id()) {
                     self.network_health
                         .lock()
                         .unwrap()
@@ -1706,10 +1760,15 @@ impl AgentVmDaemon {
             )
             .await;
         match outcome {
-            Ok(broker_url) => Ok(AgentVmStarted {
-                session_id,
-                broker_url,
-            }),
+            Ok(broker_url) => {
+                // No in-process broker to register, but the session is live; track
+                // it so list_sessions reports it as attached, not orphaned.
+                self.vm_broker_attached.lock().await.insert(session_id);
+                Ok(AgentVmStarted {
+                    session_id,
+                    broker_url,
+                })
+            }
             Err(err) => {
                 let failure = err.to_string();
                 if let Err(cleanup) = self.cleanup_failed_started_session(session_id).await {

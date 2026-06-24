@@ -212,13 +212,19 @@ async fn vm_broker_placement_starts_agent_pointed_at_the_broker_vm() {
         "host PF must target the broker VM IP: {args}"
     );
 
-    // list_sessions reports the discovered broker VM URL (not the subnet gateway).
+    // list_sessions reports the discovered broker VM URL (not the subnet gateway)
+    // and the session as runtime-attached (not orphaned), even though the vm arm
+    // keeps no in-process broker.
     let sessions = daemon.list_sessions().await.unwrap();
     assert_eq!(sessions.len(), 1);
     assert_eq!(
         sessions[0].broker_urls.as_slice(),
         &["http://192.168.252.7:1024/".to_string()],
         "running vm session must list the broker VM URL"
+    );
+    assert!(
+        sessions[0].runtime_attached,
+        "a live vm-broker session must be reported attached, not orphaned"
     );
 
     // The start materialised broker session material (config, spec, bearer, copied
