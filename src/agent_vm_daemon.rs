@@ -233,6 +233,8 @@ pub enum AgentVmDaemonError {
     },
     #[error("materialising broker VM session material failed: {0}")]
     BrokerVmMaterialize(#[from] crate::broker_vm::BrokerVmSessionError),
+    #[error("cannot resolve the host audit DB path for the broker VM mount: {0}")]
+    BrokerVmAuditDbPath(#[source] std::io::Error),
     #[error("agent VM workspace destination must be absolute: {0}")]
     RelativeWorkspaceDestination(PathBuf),
     #[error("agent VM workspace destination must be valid UTF-8: {0}")]
@@ -761,6 +763,21 @@ mod broker_image_invariant_tests {
             result,
             Err(AgentVmLifecycleRuntimeConfigError::VmPlacementRequiresIpv4Only)
         ));
+    }
+
+    #[test]
+    fn broker_audit_paths_resolve_relative_db_to_a_nonempty_mount_dir() {
+        // A relative single-component audit DB path must not yield an empty mount
+        // source (Path::parent() of "audit.db" is Some("")).
+        let (db, dir) = resolve_broker_audit_paths(Path::new("audit.db")).unwrap();
+        assert!(db.is_absolute());
+        assert!(
+            !dir.as_os_str().is_empty() && dir.is_absolute(),
+            "mount dir must be a real absolute path, got {dir:?}"
+        );
+        // An absolute path's directory is preserved.
+        let (_, dir) = resolve_broker_audit_paths(Path::new("/var/lib/writ/audit.db")).unwrap();
+        assert_eq!(dir, Path::new("/var/lib/writ"));
     }
 }
 
@@ -1698,20 +1715,10 @@ impl AgentVmDaemon {
                 "host_config_json",
             ))?
             .to_string();
-        let host_audit_db = self
-            .config
-            .lifecycle
-            .host_audit_db()
-            .ok_or(AgentVmDaemonError::VmBrokerRuntimeConfigIncomplete(
-                "host_audit_db",
-            ))?
-            .to_path_buf();
-        let audit_dir = host_audit_db
-            .parent()
-            .ok_or(AgentVmDaemonError::VmBrokerRuntimeConfigIncomplete(
-                "host_audit_db parent",
-            ))?
-            .to_path_buf();
+        let (host_audit_db, audit_dir) =
+            resolve_broker_audit_paths(self.config.lifecycle.host_audit_db().ok_or(
+                AgentVmDaemonError::VmBrokerRuntimeConfigIncomplete("host_audit_db"),
+            )?)?;
 
         // The broker binds a fixed port inside its own VM (each broker VM is a
         // distinct IP, so the same port is reusable across sessions).
@@ -1919,6 +1926,25 @@ fn nix_cache_url_for_broker_url(broker_url: &str) -> String {
         broker_url.trim_end_matches('/'),
         VM_NIX_CACHE_PATH_PREFIX
     )
+}
+
+/// Resolve the host audit DB path and the directory the broker VM mounts to reach
+/// it. Returns `(absolute_db, mount_dir)`. The path is made absolute (relative to
+/// writd's cwd, where the host opened the DB) first, so a relative single-component
+/// path like `audit.db` — whose `parent()` is empty — does not yield a `source=`
+/// (empty) virtiofs mount the broker VM cannot open.
+fn resolve_broker_audit_paths(
+    host_audit_db: &Path,
+) -> Result<(PathBuf, PathBuf), AgentVmDaemonError> {
+    let absolute =
+        std::path::absolute(host_audit_db).map_err(AgentVmDaemonError::BrokerVmAuditDbPath)?;
+    let mount_dir = absolute
+        .parent()
+        .ok_or(AgentVmDaemonError::VmBrokerRuntimeConfigIncomplete(
+            "host_audit_db parent",
+        ))?
+        .to_path_buf();
+    Ok((absolute, mount_dir))
 }
 
 /// Remove a directory tree, treating an already-absent path as success. Used for
