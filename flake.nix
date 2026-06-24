@@ -374,17 +374,22 @@
           guestPkgs = mkPkgs guestSystem;
           writd = mkCrossWritd buildPkgs guestSystem;
           imageName = "writ-broker-vm";
-          # git invokes GIT_ASKPASS for the username and password prompts; echo the
-          # token the broker placed in WRIT_GIT_TOKEN for both (GitHub accepts the
-          # token as the password). Assumes the default token_env; a non-default
-          # token_env needs a matching askpass.
+          # git invokes GIT_ASKPASS for both the username and password prompts (the
+          # clone URL embeds no credentials). GitHub App installation tokens
+          # authenticate as `x-access-token:<token>`, so answer the username prompt
+          # with `x-access-token` and the password prompt with the minted token the
+          # broker placed in WRIT_GIT_TOKEN. Assumes the default token_env; a
+          # non-default token_env needs a matching askpass.
           brokerAskpass = buildPkgs.writeTextFile {
             name = "writ-git-askpass";
             destination = "/bin/writ-git-askpass";
             executable = true;
             text = ''
               #!/bin/sh
-              printf '%s\n' "''${WRIT_GIT_TOKEN:-}"
+              case "$1" in
+                Username*) printf 'x-access-token\n' ;;
+                *) printf '%s\n' "''${WRIT_GIT_TOKEN:-}" ;;
+              esac
             '';
           };
           brokerRequiredBins = [ "git" "ip" "nix" "sh" "writ-git-askpass" "writd" ];
