@@ -343,10 +343,9 @@ async fn prepare_broker(args: &BrokerArgs) -> Result<PreparedBroker, BrokerRunEr
 }
 
 /// Block until every configured egress dependency answers an HTTP request, or
-/// fail once `deadline` elapses. Any HTTP *response* (even 4xx/5xx) proves the
-/// egress path is forwarding — only transport errors (connect/DNS/timeout) are
-/// retried. Each attempt is logged so the warmup duration is visible in the
-/// broker's logs.
+/// fail once `deadline` elapses. Wiring only: it builds the reqwest client and
+/// delegates the retry/deadline logic to [`wait_for_egress_with`], which is what
+/// the tests drive with a fake probe.
 async fn wait_for_egress(
     urls: &[String],
     deadline: Duration,
@@ -358,40 +357,87 @@ async fn wait_for_egress(
         .timeout(EGRESS_PROBE_REQUEST_TIMEOUT)
         .build()
         .expect("reqwest client constructs with default config");
+    wait_for_egress_with(urls, deadline, interval, move |url, attempt_timeout| {
+        // Clone the (Arc-backed) client into the future so it owns its handle —
+        // no borrow to entangle the probe's lifetime.
+        let client = client.clone();
+        async move {
+            // reqwest's *own* per-request timeout spans connect→response and aborts
+            // the request cleanly; capping it by the time left makes the deadline a
+            // hard ceiling. (A `tokio::time::timeout` wrapper does not bound it: the
+            // dropped future leaves a detached connect task whose teardown can hang
+            // until the OS connect timeout.) Any response (even 4xx/5xx) means the
+            // egress path forwarded; only transport errors retry.
+            client
+                .get(&url)
+                .timeout(attempt_timeout)
+                .send()
+                .await
+                .map(|response| response.status().as_u16())
+                .map_err(|err| crate::server::error_with_source_chain(&err))
+        }
+    })
+    .await
+}
+
+/// The retry/deadline core of the egress gate, generic over the probe so it is
+/// testable without a real network. `probe(url, attempt_timeout)` returns the
+/// upstream status on success or an error string (the source chain) on a
+/// transport failure; it must honor `attempt_timeout` so the deadline stays a
+/// hard bound. Each attempt is logged so the warmup duration is visible.
+async fn wait_for_egress_with<F, Fut>(
+    urls: &[String],
+    deadline: Duration,
+    interval: Duration,
+    probe: F,
+) -> Result<(), BrokerRunError>
+where
+    F: Fn(String, Duration) -> Fut,
+    Fut: Future<Output = Result<u16, String>>,
+{
     let start = Instant::now();
     for url in urls {
         let mut attempt = 0u32;
+        let mut last_error: Option<String> = None;
         loop {
+            let remaining = deadline.saturating_sub(start.elapsed());
+            if remaining.is_zero() {
+                return Err(BrokerRunError::EgressUnavailable {
+                    url: url.clone(),
+                    attempts: attempt,
+                    elapsed_secs: start.elapsed().as_secs(),
+                    cause: last_error.unwrap_or_else(|| {
+                        "egress deadline elapsed before any probe completed".to_string()
+                    }),
+                });
+            }
             attempt += 1;
-            match client.get(url).send().await {
-                Ok(response) => {
+            // Cap each probe by the time left so a black-holed connect can't overrun
+            // the deadline by a whole request timeout.
+            let attempt_timeout = remaining.min(EGRESS_PROBE_REQUEST_TIMEOUT);
+            match probe(url.clone(), attempt_timeout).await {
+                Ok(status) => {
                     tracing::info!(
                         %url,
                         attempt,
-                        status = response.status().as_u16(),
+                        status,
                         elapsed_ms = start.elapsed().as_millis() as u64,
                         "broker egress dependency reachable",
                     );
                     break;
                 }
-                Err(err) => {
-                    let elapsed = start.elapsed();
-                    if elapsed >= deadline {
-                        return Err(BrokerRunError::EgressUnavailable {
-                            url: url.clone(),
-                            attempts: attempt,
-                            elapsed_secs: elapsed.as_secs(),
-                            cause: crate::server::error_with_source_chain(&err),
-                        });
-                    }
+                Err(cause) => {
                     tracing::warn!(
                         %url,
                         attempt,
-                        elapsed_ms = elapsed.as_millis() as u64,
-                        error = %crate::server::error_with_source_chain(&err),
+                        elapsed_ms = start.elapsed().as_millis() as u64,
+                        error = %cause,
                         "broker egress dependency not ready; retrying",
                     );
-                    tokio::time::sleep(interval).await;
+                    last_error = Some(cause);
+                    // Don't sleep past the deadline; the loop-top check then ends it.
+                    let remaining_after = deadline.saturating_sub(start.elapsed());
+                    tokio::time::sleep(interval.min(remaining_after)).await;
                 }
             }
         }
@@ -519,6 +565,66 @@ mod tests {
             }
             other => panic!("expected EgressUnavailable, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn egress_loop_retries_a_failing_probe_until_it_succeeds() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        // Models the production race the gate exists to fix: the first probes fail
+        // (egress NAT still warming) and a later one succeeds, so the gate passes.
+        let calls = AtomicU32::new(0);
+        let urls = vec!["https://api.example/".to_string()];
+        wait_for_egress_with(
+            &urls,
+            Duration::from_secs(5),
+            Duration::from_millis(5),
+            |_url, _attempt_timeout| {
+                let n = calls.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if n < 2 {
+                        Err("connect error: egress still warming".to_string())
+                    } else {
+                        Ok(200)
+                    }
+                }
+            },
+        )
+        .await
+        .expect("the gate must pass once a probe finally succeeds");
+        assert!(
+            calls.load(Ordering::SeqCst) >= 3,
+            "expected the gate to retry before the third (succeeding) probe",
+        );
+    }
+
+    #[tokio::test]
+    async fn egress_loop_honors_deadline_with_a_permanently_slow_probe() {
+        // The probe consumes exactly the per-attempt budget it is handed, then
+        // fails — a deterministic stand-in for a black hole. The loop must cap each
+        // attempt by the time left so the *total* wait is ~the deadline, not a
+        // whole request timeout (let alone deadline * attempts).
+        let urls = vec!["https://api.example/".to_string()];
+        let start = Instant::now();
+        let err = wait_for_egress_with(
+            &urls,
+            Duration::from_millis(300),
+            Duration::from_millis(10),
+            |_url, attempt_timeout| async move {
+                tokio::time::sleep(attempt_timeout).await;
+                Err::<u16, String>("connect error: operation timed out".to_string())
+            },
+        )
+        .await
+        .expect_err("a permanently slow probe must hit the deadline");
+        let waited = start.elapsed();
+        assert!(
+            matches!(err, BrokerRunError::EgressUnavailable { .. }),
+            "{err:?}"
+        );
+        assert!(
+            waited < Duration::from_secs(2),
+            "the deadline must be a hard bound; waited {waited:?}",
+        );
     }
 
     fn open_session_record(session_id: SessionId) -> SessionRecord {
