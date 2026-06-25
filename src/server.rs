@@ -2655,11 +2655,14 @@ pub(crate) async fn request_capability<S: SecretStore + Send + Sync>(
 
         Err(e) => {
             // The audit row is the system of record and keeps the full
-            // `Display` (which itself caps `ApiError.body` to 256 chars in
-            // `MintError`'s impl). The agent only ever sees the bounded
-            // label form so the protocol surface can't carry unbounded or
-            // sensitive backend payloads — see `MintError::agent_message`.
-            let audit_message = e.to_string();
+            // `Display` *and its source chain* (the `Display` itself caps
+            // `ApiError.body` to 256 chars in `MintError`'s impl). The chain
+            // matters: opaque outer Displays — notably reqwest's "error sending
+            // request for url (...)" — hide the real DNS/TLS/connect cause in
+            // their source. The agent only ever sees the bounded label form so
+            // the protocol surface can't carry unbounded or sensitive backend
+            // payloads — see `MintError::agent_message`.
+            let audit_message = error_with_source_chain(&e);
             let agent_message = e.agent_message();
             if let Err(ae) =
                 state
@@ -2678,6 +2681,22 @@ pub(crate) async fn request_capability<S: SecretStore + Send + Sync>(
             }
         }
     }
+}
+
+/// Format an error together with its full `source()` chain. Outer `Display`s often
+/// hide the real cause in their source — notably `reqwest`'s "error sending request
+/// for url (...)", whose DNS/TLS/connect detail lives only in the source chain — so
+/// the audit log (the system of record for mint failures) and the nix-cache
+/// upstream logs record the whole chain.
+pub(crate) fn error_with_source_chain(error: &dyn std::error::Error) -> String {
+    use std::fmt::Write as _;
+    let mut message = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        let _ = write!(message, ": {cause}");
+        source = cause.source();
+    }
+    message
 }
 
 /// Maximum bytes we will buffer for a single newline-terminated request.

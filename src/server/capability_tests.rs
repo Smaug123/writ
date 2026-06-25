@@ -7,6 +7,50 @@ use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 #[test]
+fn error_with_source_chain_appends_nested_sources() {
+    use std::error::Error;
+    use std::fmt;
+
+    #[derive(Debug)]
+    struct Inner;
+    impl fmt::Display for Inner {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "dns error: failed to lookup address")
+        }
+    }
+    impl Error for Inner {}
+
+    #[derive(Debug)]
+    struct Outer(Inner);
+    impl fmt::Display for Outer {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            // mimics reqwest's opaque outer Display
+            write!(
+                f,
+                "error sending request for url (https://api.github.com/...)"
+            )
+        }
+    }
+    impl Error for Outer {
+        fn source(&self) -> Option<&(dyn Error + 'static)> {
+            Some(&self.0)
+        }
+    }
+
+    // The opaque outer message keeps its hidden cause via the source chain.
+    assert_eq!(
+        error_with_source_chain(&Outer(Inner)),
+        "error sending request for url (https://api.github.com/...): \
+         dns error: failed to lookup address"
+    );
+    // A sourceless error is just its Display.
+    assert_eq!(
+        error_with_source_chain(&Inner),
+        "dns error: failed to lookup address"
+    );
+}
+
+#[test]
 fn capability_outcome_debug_redacts_granted_token() {
     let outcome = CapabilityOutcome::Granted {
         token: "ghs_should_not_print".into(),
