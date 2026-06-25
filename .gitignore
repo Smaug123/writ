@@ -2,3 +2,6 @@
 target/
 result
 .claude/worktrees/
+
+# stray placeholder occasionally created by ad-hoc sqlite probes
+<audit_db>
