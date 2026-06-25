@@ -1777,6 +1777,21 @@ impl AgentVmDaemon {
                 })
             }
             Err(err) => {
+                // Debug escape hatch: leave the failed session's broker + agent VMs
+                // (and its Starting state record) in place so an operator can
+                // `container logs writ-broker-vm-<session-id>` and `container exec`
+                // into it to diagnose. Stop it manually afterwards with
+                // `writ agent-vm stop <session-id>`. Default behaviour (knob unset)
+                // reaps everything as usual.
+                if std::env::var_os("WRIT_KEEP_FAILED_BROKER_VM").is_some() {
+                    tracing::warn!(
+                        %session_id,
+                        "WRIT_KEEP_FAILED_BROKER_VM set: leaving the failed broker VM \
+                         (writ-broker-vm-<session-id>) and its agent VM running for \
+                         debugging; stop with `writ agent-vm stop <session-id>`",
+                    );
+                    return Err(err);
+                }
                 let failure = err.to_string();
                 if let Err(cleanup) = self.cleanup_failed_started_session(session_id).await {
                     return Err(AgentVmDaemonError::WorkspaceBootstrapCleanupFailed {

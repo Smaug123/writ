@@ -395,7 +395,7 @@ impl<S: SecretStore> VmHttpNixCacheService<S> {
             Err(err) => {
                 tracing::warn!(
                     upstream_url = %upstream_url,
-                    error = %err,
+                    error = %crate::server::error_with_source_chain(&err),
                     "vm http nix cache upstream request failed",
                 );
                 return upstream_failure(upstream_url, None, "upstream request failed");
@@ -566,7 +566,7 @@ impl<S: SecretStore> VmHttpNixCacheService<S> {
             Err(err) => {
                 tracing::warn!(
                     upstream_url = %upstream_url,
-                    error = %err,
+                    error = %crate::server::error_with_source_chain(&err),
                     "vm http nix cache NAR upstream request failed",
                 );
                 return upstream_failure(upstream_url, None, "upstream request failed");
