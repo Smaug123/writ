@@ -438,12 +438,17 @@ pub enum BrokerConfigError {
 }
 
 /// Optional `vm_http` features whose backing directories live on the *host* and
-/// would be meaningless (or wrong) inside the broker VM. The first broker slice
-/// serves clone + upstream nix-cache + proxies only, so these are dropped — each
-/// then defaults under the guest `work_root` (or stays disabled). Durable/host-
-/// mounted variants are a later slice (see the plan doc §9.5/§9.6).
+/// would be meaningless (or wrong) inside the broker VM, so they are dropped —
+/// each then defaults under the guest `work_root` (or stays disabled).
+///
+/// `flake_mirror_cache_dir` is deliberately *not* here: it is re-pointed at the
+/// guest work_root (see [`broker_config_json`]) to enable flake-input
+/// provisioning, which the no-egress agent VM depends on. `flake_input_cache_dir`
+/// and `flake_materialize_scratch_dir` stay dropped because they auto-default
+/// under work_root once provisioning is on. `nix_prewarm_cache_dir` /
+/// `agent_run_log_root` / `git_push_staging_root` stay disabled: the v1 broker
+/// serves no pre-warm, agent-run, or git-push routes.
 const BROKER_DROPPED_VM_HTTP_KEYS: &[&str] = &[
-    "flake_mirror_cache_dir",
     "flake_input_cache_dir",
     "flake_materialize_scratch_dir",
     "nix_prewarm_cache_dir",
@@ -534,6 +539,16 @@ pub fn broker_config_json(
     vm_http.insert(
         "token_env".to_string(),
         serde_json::Value::String(BROKER_VM_GIT_TOKEN_ENV.to_string()),
+    );
+    // Enable flake-input provisioning in the broker VM by pointing the mirror
+    // cache (which both backs the /v1/nix/flake/provision endpoint and is retained
+    // by the clone handler) at the guest work_root. The no-egress agent VM gets its
+    // locked flake inputs from the broker, so this is always on for vm placement —
+    // independent of whether the host broker configured it. The input-cache and
+    // materialize-scratch dirs auto-default under work_root, so they stay dropped.
+    vm_http.insert(
+        "flake_mirror_cache_dir".to_string(),
+        serde_json::Value::String(format!("{work_root}/flake-mirror")),
     );
     for key in BROKER_DROPPED_VM_HTTP_KEYS {
         vm_http.remove(*key);
@@ -1421,11 +1436,37 @@ mod tests {
         );
         assert!(
             runtime.nix_prewarm_cache_dir().is_none(),
-            "prewarm must be disabled in the v1 broker"
+            "prewarm must be disabled in the broker (it serves no prewarm route)"
         );
+        // Flake provisioning is ENABLED in the broker VM (re-pointed mirror cache):
+        // the no-egress agent VM gets its locked flake inputs from the broker.
         assert!(
-            runtime.flake_provision().is_none(),
-            "flake provisioning must be disabled in the v1 broker"
+            runtime.flake_provision().is_some(),
+            "flake provisioning must be enabled in the broker VM"
+        );
+    }
+
+    #[test]
+    fn broker_config_enables_flake_provisioning_under_the_guest_work_root() {
+        use crate::config::DaemonConfig;
+        // The mirror cache (which enables provisioning and is retained by clone)
+        // must land under the guest work_root, not a host path.
+        let json = broker_config_json(
+            &host_config_json(),
+            BrokerPort::new(18080).unwrap(),
+            BROKER_VM_WORK_ROOT,
+            Path::new("/var/lib/writ/audit.db"),
+        )
+        .unwrap();
+        let config: DaemonConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            config
+                .agent_vm
+                .unwrap()
+                .vm_http
+                .flake_mirror_cache_dir
+                .as_deref(),
+            Some(Path::new("/tmp/writ-broker-work/flake-mirror")),
         );
     }
 
