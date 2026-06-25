@@ -58,6 +58,13 @@ pub fn guest_image_attr(proof: bool, guest_system: GuestSystem) -> String {
     format!("{prefix}-{}", guest_system.as_str())
 }
 
+/// The flake attribute name for the broker VM image (`broker_placement = vm`),
+/// mirroring the flake's `broker-vm-image-<system>` outputs. Kept beside
+/// [`guest_image_attr`] so the CLI never drifts from the flake's naming.
+pub fn broker_image_attr(guest_system: GuestSystem) -> String {
+    format!("broker-vm-image-{}", guest_system.as_str())
+}
+
 pub fn build_workspace_bootstrap(
     repo: Option<String>,
     destination: Option<PathBuf>,
@@ -226,6 +233,18 @@ mod tests {
         assert_eq!(
             guest_image_attr(true, GuestSystem::X86_64Linux),
             "agent-vm-guest-proof-image-x86_64-linux",
+        );
+    }
+
+    #[test]
+    fn broker_image_attr_matches_flake_attribute_names() {
+        assert_eq!(
+            broker_image_attr(GuestSystem::Aarch64Linux),
+            "broker-vm-image-aarch64-linux",
+        );
+        assert_eq!(
+            broker_image_attr(GuestSystem::X86_64Linux),
+            "broker-vm-image-x86_64-linux",
         );
     }
 }
