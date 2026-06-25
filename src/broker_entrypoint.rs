@@ -25,7 +25,7 @@
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::audit::{AuditError, AuditLog};
 use crate::broker_session::{
@@ -34,7 +34,7 @@ use crate::broker_session::{
 use crate::config::{
     AgentVmHttpConfigError, DaemonConfig, SecretStoreConfig, default_audit_db_path,
 };
-use crate::core::{AgentVmConfigError, BrokerPort, BrokerPortRange, SessionId};
+use crate::core::{AgentKind, AgentVmConfigError, BrokerPort, BrokerPortRange, SessionId};
 use crate::github::GitHubMinter;
 use crate::secret::{FileSecretStore, SecretError, SecretStore};
 use crate::server::BrokerState;
@@ -48,6 +48,19 @@ use crate::vm_http::{
 /// (which aborts the runtime task). Bounds teardown so a stuck in-flight handler
 /// cannot wedge the broker open past a SIGTERM.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+
+// The broker proves it can actually reach its GitHub API egress dependency
+// before it publishes readiness, so the agent never connects (and mints) until
+// the per-session egress NAT is forwarding. A freshly-created egress network can
+// take a few seconds to warm up; a single early mint that races that warmup
+// black-holes its SYN and times out at the connect layer (libcurl-from-inside
+// works seconds later — the failure is purely temporal). Gating readiness on a
+// real egress probe removes the race; failing loud after the deadline keeps the
+// broker's "I can mint" guarantee honest rather than serving a broker that can't.
+const EGRESS_PROBE_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const EGRESS_PROBE_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+const EGRESS_PROBE_INTERVAL: Duration = Duration::from_secs(2);
+const EGRESS_PROBE_DEADLINE: Duration = Duration::from_secs(90);
 
 /// Inputs for [`run_broker`], parsed from the `writd broker` command line.
 #[derive(Debug, Clone)]
@@ -129,6 +142,16 @@ pub enum BrokerRunError {
     },
     #[error("broker shutdown failed: {0}")]
     Shutdown(#[from] VmHttpRuntimeShutdownError),
+    #[error(
+        "broker egress dependency {url} was unreachable after {attempts} attempt(s) over \
+         {elapsed_secs}s, so the broker cannot mint tokens or proxy the nix cache: {cause}"
+    )]
+    EgressUnavailable {
+        url: String,
+        attempts: u32,
+        elapsed_secs: u64,
+        cause: String,
+    },
 }
 
 /// Open the secret store, enforcing the broker-mode invariant that it is a
@@ -151,7 +174,15 @@ fn open_file_secret_store(
 /// The session named by the spec must already be open in the shared audit DB:
 /// the host launcher owns the session lifecycle, and this process never opens or
 /// closes sessions. Refuse to serve an unknown or already-closed session.
-fn verify_session_open(audit: &AuditLog, session_id: SessionId) -> Result<(), BrokerRunError> {
+///
+/// Returns the session's selected `agent_kind` (the daemon records it at open
+/// time): a broker VM serves exactly one session, so this picks the single
+/// GitHub App — and thus the single API root — this broker can ever mint
+/// against, which is what the egress readiness gate probes.
+fn verify_session_open(
+    audit: &AuditLog,
+    session_id: SessionId,
+) -> Result<Option<AgentKind>, BrokerRunError> {
     match audit
         .get_session(session_id)
         .map_err(|source| BrokerRunError::SessionLookup { source })?
@@ -160,7 +191,7 @@ fn verify_session_open(audit: &AuditLog, session_id: SessionId) -> Result<(), Br
         Some(record) if record.closed_at.is_some() => {
             Err(BrokerRunError::SessionClosed(session_id))
         }
-        Some(_) => Ok(()),
+        Some(record) => Ok(record.agent_kind),
     }
 }
 
@@ -214,9 +245,18 @@ fn write_ready_file_atomic(path: &Path, broker_port: BrokerPort) -> Result<(), B
 /// Validate all inputs and assemble the (not-yet-serving) vm_http session on its
 /// fixed listener. Splitting this from [`serve_broker`] keeps every fail-fast
 /// check testable without spawning a server or waiting on a signal.
-async fn prepare_broker(
-    args: &BrokerArgs,
-) -> Result<PreparedVmHttpSession<Box<dyn SecretStore>>, BrokerRunError> {
+/// The fixed-listener session plus the egress dependencies the broker must be
+/// able to reach before it publishes readiness. Returned by [`prepare_broker`]
+/// so [`run_broker`] can gate readiness on egress without re-reading the config.
+struct PreparedBroker {
+    session: PreparedVmHttpSession<Box<dyn SecretStore>>,
+    /// The GitHub API root of the session's own App (by its `agent_kind`) to
+    /// probe for egress — at most one entry; empty if the session's agent_kind
+    /// resolves to no configured App.
+    egress_probe_urls: Vec<String>,
+}
+
+async fn prepare_broker(args: &BrokerArgs) -> Result<PreparedBroker, BrokerRunError> {
     let config_json =
         std::fs::read_to_string(&args.config).map_err(|source| BrokerRunError::ConfigRead {
             path: args.config.display().to_string(),
@@ -247,7 +287,7 @@ async fn prepare_broker(
         path: audit_db_path.display().to_string(),
         source,
     })?;
-    verify_session_open(&audit, spec.session_id)?;
+    let session_agent_kind = verify_session_open(&audit, spec.session_id)?;
 
     // The vm_http git-clone path reuses the broker's promote runtime config; the
     // remaining BrokerState fields are the host-daemon-only surfaces (notes repo,
@@ -256,6 +296,20 @@ async fn prepare_broker(
     let promote_runtime = Some(Arc::new(
         vm_http_config.git_clone().to_promote_runtime_config(),
     ));
+
+    // Egress dependency to confirm before publishing readiness: the API root of
+    // the *one* GitHub App this session can mint against (by its agent_kind).
+    // Probing every configured App would let an unrelated App's endpoint being
+    // down (e.g. a GHES Codex App while this is a github.com Claude session)
+    // block a broker that could never use it. An unresolvable agent_kind leaves
+    // this empty (no gate) — the minter surfaces that misconfiguration itself.
+    // Computed before `config.github_apps` is moved into the minter below.
+    let egress_probe_urls: Vec<String> = session_agent_kind
+        .as_ref()
+        .and_then(|kind| config.github_apps.agent_apps().get(kind))
+        .map(|app| vec![format!("{}/", app.api_base.trim_end_matches('/'))])
+        .unwrap_or_default();
+
     let state = Arc::new(BrokerState {
         audit: Arc::new(audit),
         minter: GitHubMinter::new_registry(config.github_apps),
@@ -282,7 +336,113 @@ async fn prepare_broker(
         None,
         None,
     )?;
-    Ok(prepared)
+    Ok(PreparedBroker {
+        session: prepared,
+        egress_probe_urls,
+    })
+}
+
+/// Block until every configured egress dependency answers an HTTP request, or
+/// fail once `deadline` elapses. Wiring only: it builds the reqwest client and
+/// delegates the retry/deadline logic to [`wait_for_egress_with`], which is what
+/// the tests drive with a fake probe.
+async fn wait_for_egress(
+    urls: &[String],
+    deadline: Duration,
+    interval: Duration,
+) -> Result<(), BrokerRunError> {
+    let client = reqwest::Client::builder()
+        .user_agent("writ/0.1")
+        .connect_timeout(EGRESS_PROBE_CONNECT_TIMEOUT)
+        .timeout(EGRESS_PROBE_REQUEST_TIMEOUT)
+        .build()
+        .expect("reqwest client constructs with default config");
+    wait_for_egress_with(urls, deadline, interval, move |url, attempt_timeout| {
+        // Clone the (Arc-backed) client into the future so it owns its handle —
+        // no borrow to entangle the probe's lifetime.
+        let client = client.clone();
+        async move {
+            // reqwest's *own* per-request timeout spans connect→response and aborts
+            // the request cleanly; capping it by the time left makes the deadline a
+            // hard ceiling. (A `tokio::time::timeout` wrapper does not bound it: the
+            // dropped future leaves a detached connect task whose teardown can hang
+            // until the OS connect timeout.) Any response (even 4xx/5xx) means the
+            // egress path forwarded; only transport errors retry.
+            client
+                .get(&url)
+                .timeout(attempt_timeout)
+                .send()
+                .await
+                .map(|response| response.status().as_u16())
+                .map_err(|err| crate::server::error_with_source_chain(&err))
+        }
+    })
+    .await
+}
+
+/// The retry/deadline core of the egress gate, generic over the probe so it is
+/// testable without a real network. `probe(url, attempt_timeout)` returns the
+/// upstream status on success or an error string (the source chain) on a
+/// transport failure; it must honor `attempt_timeout` so the deadline stays a
+/// hard bound. Each attempt is logged so the warmup duration is visible.
+async fn wait_for_egress_with<F, Fut>(
+    urls: &[String],
+    deadline: Duration,
+    interval: Duration,
+    probe: F,
+) -> Result<(), BrokerRunError>
+where
+    F: Fn(String, Duration) -> Fut,
+    Fut: Future<Output = Result<u16, String>>,
+{
+    let start = Instant::now();
+    for url in urls {
+        let mut attempt = 0u32;
+        let mut last_error: Option<String> = None;
+        loop {
+            let remaining = deadline.saturating_sub(start.elapsed());
+            if remaining.is_zero() {
+                return Err(BrokerRunError::EgressUnavailable {
+                    url: url.clone(),
+                    attempts: attempt,
+                    elapsed_secs: start.elapsed().as_secs(),
+                    cause: last_error.unwrap_or_else(|| {
+                        "egress deadline elapsed before any probe completed".to_string()
+                    }),
+                });
+            }
+            attempt += 1;
+            // Cap each probe by the time left so a black-holed connect can't overrun
+            // the deadline by a whole request timeout.
+            let attempt_timeout = remaining.min(EGRESS_PROBE_REQUEST_TIMEOUT);
+            match probe(url.clone(), attempt_timeout).await {
+                Ok(status) => {
+                    tracing::info!(
+                        %url,
+                        attempt,
+                        status,
+                        elapsed_ms = start.elapsed().as_millis() as u64,
+                        "broker egress dependency reachable",
+                    );
+                    break;
+                }
+                Err(cause) => {
+                    tracing::warn!(
+                        %url,
+                        attempt,
+                        elapsed_ms = start.elapsed().as_millis() as u64,
+                        error = %cause,
+                        "broker egress dependency not ready; retrying",
+                    );
+                    last_error = Some(cause);
+                    // Don't sleep past the deadline; the loop-top check then ends it.
+                    let remaining_after = deadline.saturating_sub(start.elapsed());
+                    tokio::time::sleep(interval.min(remaining_after)).await;
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Start accepting traffic, publish readiness, and serve until `shutdown`
@@ -348,8 +508,18 @@ async fn shutdown_signal() {
 /// single session until SIGTERM/SIGINT, then drain within the grace period.
 pub async fn run_broker(args: BrokerArgs) -> Result<(), BrokerRunError> {
     let prepared = prepare_broker(&args).await?;
+    // Gate readiness on real egress: don't publish the ready file (which the host
+    // watches before booting the agent) until the broker can actually reach
+    // GitHub. This closes the startup race where the agent's first mint outran
+    // the per-session egress NAT warmup and black-holed its connect.
+    wait_for_egress(
+        &prepared.egress_probe_urls,
+        EGRESS_PROBE_DEADLINE,
+        EGRESS_PROBE_INTERVAL,
+    )
+    .await?;
     serve_broker(
-        prepared,
+        prepared.session,
         args.ready_file.as_deref(),
         shutdown_signal(),
         SHUTDOWN_GRACE,
@@ -361,6 +531,101 @@ pub async fn run_broker(args: BrokerArgs) -> Result<(), BrokerRunError> {
 mod tests {
     use super::*;
     use crate::core::{SessionRecord, UnixMillis};
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    async fn wait_for_egress_succeeds_on_any_http_response() {
+        let server = MockServer::start().await;
+        // A 500 is still a *response* — the egress path forwarded the request and
+        // got an answer, which is all the readiness gate cares about.
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        let urls = vec![format!("{}/", server.uri())];
+        wait_for_egress(&urls, Duration::from_secs(5), Duration::from_millis(10))
+            .await
+            .expect("a reachable dependency (even a 500) confirms egress");
+    }
+
+    #[tokio::test]
+    async fn wait_for_egress_errors_after_deadline_when_unreachable() {
+        // Port 1 is reliably closed, so every attempt is a transport error and
+        // the gate must give up once the (tiny, test-sized) deadline elapses.
+        let urls = vec!["http://127.0.0.1:1/".to_string()];
+        let err = wait_for_egress(&urls, Duration::from_millis(200), Duration::from_millis(20))
+            .await
+            .expect_err("an unreachable dependency must fail the readiness gate");
+        match err {
+            BrokerRunError::EgressUnavailable { url, attempts, .. } => {
+                assert!(url.contains("127.0.0.1:1"), "{url}");
+                assert!(attempts >= 1, "attempts={attempts}");
+            }
+            other => panic!("expected EgressUnavailable, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn egress_loop_retries_a_failing_probe_until_it_succeeds() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        // Models the production race the gate exists to fix: the first probes fail
+        // (egress NAT still warming) and a later one succeeds, so the gate passes.
+        let calls = AtomicU32::new(0);
+        let urls = vec!["https://api.example/".to_string()];
+        wait_for_egress_with(
+            &urls,
+            Duration::from_secs(5),
+            Duration::from_millis(5),
+            |_url, _attempt_timeout| {
+                let n = calls.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if n < 2 {
+                        Err("connect error: egress still warming".to_string())
+                    } else {
+                        Ok(200)
+                    }
+                }
+            },
+        )
+        .await
+        .expect("the gate must pass once a probe finally succeeds");
+        assert!(
+            calls.load(Ordering::SeqCst) >= 3,
+            "expected the gate to retry before the third (succeeding) probe",
+        );
+    }
+
+    #[tokio::test]
+    async fn egress_loop_honors_deadline_with_a_permanently_slow_probe() {
+        // The probe consumes exactly the per-attempt budget it is handed, then
+        // fails — a deterministic stand-in for a black hole. The loop must cap each
+        // attempt by the time left so the *total* wait is ~the deadline, not a
+        // whole request timeout (let alone deadline * attempts).
+        let urls = vec!["https://api.example/".to_string()];
+        let start = Instant::now();
+        let err = wait_for_egress_with(
+            &urls,
+            Duration::from_millis(300),
+            Duration::from_millis(10),
+            |_url, attempt_timeout| async move {
+                tokio::time::sleep(attempt_timeout).await;
+                Err::<u16, String>("connect error: operation timed out".to_string())
+            },
+        )
+        .await
+        .expect_err("a permanently slow probe must hit the deadline");
+        let waited = start.elapsed();
+        assert!(
+            matches!(err, BrokerRunError::EgressUnavailable { .. }),
+            "{err:?}"
+        );
+        assert!(
+            waited < Duration::from_secs(2),
+            "the deadline must be a hard bound; waited {waited:?}",
+        );
+    }
 
     fn open_session_record(session_id: SessionId) -> SessionRecord {
         SessionRecord {
@@ -414,6 +679,21 @@ mod tests {
             .open_session(&open_session_record(session_id))
             .unwrap();
         assert!(verify_session_open(&audit, session_id).is_ok());
+    }
+
+    #[test]
+    fn verify_session_open_returns_the_sessions_agent_kind() {
+        // The egress readiness gate probes the API root of the session's own App,
+        // so the session lookup must surface the recorded agent_kind verbatim.
+        let audit = AuditLog::open_in_memory().unwrap();
+        let session_id = SessionId::new();
+        let mut record = open_session_record(session_id);
+        record.agent_kind = Some(AgentKind::Codex);
+        audit.open_session(&record).unwrap();
+        assert_eq!(
+            verify_session_open(&audit, session_id).unwrap(),
+            Some(AgentKind::Codex),
+        );
     }
 
     #[test]
@@ -640,14 +920,14 @@ mod tests {
 
         let prepared = prepare_broker(&args).await.unwrap();
         assert_eq!(
-            prepared.broker_port().get(),
+            prepared.session.broker_port().get(),
             port,
             "must bind the fixed spec port"
         );
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
         let serve_fut = serve_broker(
-            prepared,
+            prepared.session,
             Some(ready_path.as_path()),
             async move {
                 let _ = shutdown_rx.await;
