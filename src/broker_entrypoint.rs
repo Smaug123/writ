@@ -34,7 +34,7 @@ use crate::broker_session::{
 use crate::config::{
     AgentVmHttpConfigError, DaemonConfig, SecretStoreConfig, default_audit_db_path,
 };
-use crate::core::{AgentVmConfigError, BrokerPort, BrokerPortRange, SessionId};
+use crate::core::{AgentKind, AgentVmConfigError, BrokerPort, BrokerPortRange, SessionId};
 use crate::github::GitHubMinter;
 use crate::secret::{FileSecretStore, SecretError, SecretStore};
 use crate::server::BrokerState;
@@ -174,7 +174,15 @@ fn open_file_secret_store(
 /// The session named by the spec must already be open in the shared audit DB:
 /// the host launcher owns the session lifecycle, and this process never opens or
 /// closes sessions. Refuse to serve an unknown or already-closed session.
-fn verify_session_open(audit: &AuditLog, session_id: SessionId) -> Result<(), BrokerRunError> {
+///
+/// Returns the session's selected `agent_kind` (the daemon records it at open
+/// time): a broker VM serves exactly one session, so this picks the single
+/// GitHub App — and thus the single API root — this broker can ever mint
+/// against, which is what the egress readiness gate probes.
+fn verify_session_open(
+    audit: &AuditLog,
+    session_id: SessionId,
+) -> Result<Option<AgentKind>, BrokerRunError> {
     match audit
         .get_session(session_id)
         .map_err(|source| BrokerRunError::SessionLookup { source })?
@@ -183,7 +191,7 @@ fn verify_session_open(audit: &AuditLog, session_id: SessionId) -> Result<(), Br
         Some(record) if record.closed_at.is_some() => {
             Err(BrokerRunError::SessionClosed(session_id))
         }
-        Some(_) => Ok(()),
+        Some(record) => Ok(record.agent_kind),
     }
 }
 
@@ -242,8 +250,9 @@ fn write_ready_file_atomic(path: &Path, broker_port: BrokerPort) -> Result<(), B
 /// so [`run_broker`] can gate readiness on egress without re-reading the config.
 struct PreparedBroker {
     session: PreparedVmHttpSession<Box<dyn SecretStore>>,
-    /// Distinct GitHub API roots (from the configured Apps) to probe for egress.
-    /// Usually a single entry (`https://api.github.com/`).
+    /// The GitHub API root of the session's own App (by its `agent_kind`) to
+    /// probe for egress — at most one entry; empty if the session's agent_kind
+    /// resolves to no configured App.
     egress_probe_urls: Vec<String>,
 }
 
@@ -278,7 +287,7 @@ async fn prepare_broker(args: &BrokerArgs) -> Result<PreparedBroker, BrokerRunEr
         path: audit_db_path.display().to_string(),
         source,
     })?;
-    verify_session_open(&audit, spec.session_id)?;
+    let session_agent_kind = verify_session_open(&audit, spec.session_id)?;
 
     // The vm_http git-clone path reuses the broker's promote runtime config; the
     // remaining BrokerState fields are the host-daemon-only surfaces (notes repo,
@@ -288,21 +297,18 @@ async fn prepare_broker(args: &BrokerArgs) -> Result<PreparedBroker, BrokerRunEr
         vm_http_config.git_clone().to_promote_runtime_config(),
     ));
 
-    // Egress dependencies to confirm before publishing readiness: the GitHub API
-    // root(s) the minter will hit. Distinct, since multiple Apps typically share
-    // api.github.com. Computed before `config.github_apps` is moved into the
-    // minter below.
-    let egress_probe_urls = {
-        let mut urls: Vec<String> = config
-            .github_apps
-            .agent_apps()
-            .values()
-            .map(|app| format!("{}/", app.api_base.trim_end_matches('/')))
-            .collect();
-        urls.sort();
-        urls.dedup();
-        urls
-    };
+    // Egress dependency to confirm before publishing readiness: the API root of
+    // the *one* GitHub App this session can mint against (by its agent_kind).
+    // Probing every configured App would let an unrelated App's endpoint being
+    // down (e.g. a GHES Codex App while this is a github.com Claude session)
+    // block a broker that could never use it. An unresolvable agent_kind leaves
+    // this empty (no gate) — the minter surfaces that misconfiguration itself.
+    // Computed before `config.github_apps` is moved into the minter below.
+    let egress_probe_urls: Vec<String> = session_agent_kind
+        .as_ref()
+        .and_then(|kind| config.github_apps.agent_apps().get(kind))
+        .map(|app| vec![format!("{}/", app.api_base.trim_end_matches('/'))])
+        .unwrap_or_default();
 
     let state = Arc::new(BrokerState {
         audit: Arc::new(audit),
@@ -567,6 +573,21 @@ mod tests {
             .open_session(&open_session_record(session_id))
             .unwrap();
         assert!(verify_session_open(&audit, session_id).is_ok());
+    }
+
+    #[test]
+    fn verify_session_open_returns_the_sessions_agent_kind() {
+        // The egress readiness gate probes the API root of the session's own App,
+        // so the session lookup must surface the recorded agent_kind verbatim.
+        let audit = AuditLog::open_in_memory().unwrap();
+        let session_id = SessionId::new();
+        let mut record = open_session_record(session_id);
+        record.agent_kind = Some(AgentKind::Codex);
+        audit.open_session(&record).unwrap();
+        assert_eq!(
+            verify_session_open(&audit, session_id).unwrap(),
+            Some(AgentKind::Codex),
+        );
     }
 
     #[test]
