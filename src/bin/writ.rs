@@ -27,7 +27,7 @@ use writ::cli::output::{
 };
 use writ::cli::parse::{parse_agent_kind, parse_correlation_id};
 use writ::cli::workspace::{
-    GuestSystem, build_workspace_bootstrap, build_workspace_bootstrap_from_repo,
+    GuestSystem, broker_image_attr, build_workspace_bootstrap, build_workspace_bootstrap_from_repo,
     default_guest_system, guest_image_attr,
 };
 use writ::core::{
@@ -276,6 +276,20 @@ enum AgentVmCmd {
         #[arg(long, default_value = ".")]
         flake: String,
     },
+    /// Build the broker VM OCI image (`broker_placement = vm`) from the
+    /// repo's Nix flake and load it into the local Apple container image
+    /// store, the same way `build-image` does for the agent guest. The
+    /// daemon's `agent_vm.lifecycle.broker_image` must name the loaded
+    /// image (`writ-broker-vm:latest`). macOS-only.
+    BuildBrokerImage {
+        /// Guest system to target. Defaults to mapping the host CPU
+        /// architecture to `aarch64-linux` or `x86_64-linux`.
+        #[arg(long, value_enum)]
+        guest_system: Option<GuestSystemArg>,
+        /// Flake reference passed to `nix build`. Defaults to `.`.
+        #[arg(long, default_value = ".")]
+        flake: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -447,6 +461,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 flake,
             } => {
                 build_agent_vm_guest_image(proof, guest_system, &flake)?;
+            }
+            AgentVmCmd::BuildBrokerImage {
+                guest_system,
+                flake,
+            } => {
+                build_broker_vm_image(guest_system, &flake)?;
             }
         },
         Cmd::Agent { action } => match action {
@@ -707,28 +727,46 @@ fn build_agent_vm_guest_image(
     guest_system: Option<GuestSystemArg>,
     flake: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let guest_system = resolve_guest_system(guest_system)?;
+    let attr = guest_image_attr(proof, guest_system);
+    nix_build_and_load_oci_image(&format!("{flake}#{attr}"))
+}
+
+/// Build the broker VM OCI image and load it into the Apple container store.
+/// Mirrors [`build_agent_vm_guest_image`] for `broker_placement = vm`.
+fn build_broker_vm_image(
+    guest_system: Option<GuestSystemArg>,
+    flake: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let guest_system = resolve_guest_system(guest_system)?;
+    let attr = broker_image_attr(guest_system);
+    nix_build_and_load_oci_image(&format!("{flake}#{attr}"))
+}
+
+/// Resolve the target guest system, defaulting to the host architecture.
+fn resolve_guest_system(
+    guest_system: Option<GuestSystemArg>,
+) -> Result<GuestSystem, Box<dyn std::error::Error>> {
+    match guest_system {
+        Some(g) => Ok(GuestSystem::from(g)),
+        None => default_guest_system(std::env::consts::ARCH),
+    }
+}
+
+/// `nix build` an OCI-archive flake output and `container image load` it. macOS
+/// only — the `container` CLI is Apple's. The `nix build` step inherits stderr so
+/// substituter progress is visible; stdout is captured for `--print-out-paths`.
+fn nix_build_and_load_oci_image(flake_ref: &str) -> Result<(), Box<dyn std::error::Error>> {
     if std::env::consts::OS != "macos" {
         return Err(format!(
-            "writ agent-vm build-image is macOS-only (Apple container CLI required); host OS is {}",
+            "building agent VM images is macOS-only (Apple container CLI required); host OS is {}",
             std::env::consts::OS,
         )
         .into());
     }
-    let guest_system = match guest_system {
-        Some(g) => GuestSystem::from(g),
-        None => default_guest_system(std::env::consts::ARCH)?,
-    };
-    let attr = guest_image_attr(proof, guest_system);
-    let flake_ref = format!("{flake}#{attr}");
-
     eprintln!("building {flake_ref}");
     let nix_output = std::process::Command::new("nix")
-        .args([
-            "build",
-            "--no-link",
-            "--print-out-paths",
-            flake_ref.as_str(),
-        ])
+        .args(["build", "--no-link", "--print-out-paths", flake_ref])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::inherit())
         .output()
@@ -1476,6 +1514,48 @@ mod tests {
             } => {
                 assert!(proof);
                 assert_eq!(guest_system, Some(GuestSystemArg::X86_64Linux));
+                assert_eq!(flake, "/path/to/repo");
+            }
+            _ => panic!("unexpected command"),
+        }
+    }
+
+    #[test]
+    fn agent_vm_build_broker_image_cli_defaults_and_accepts_guest_system_and_flake() {
+        let args = Args::try_parse_from(["writ", "agent-vm", "build-broker-image"]).unwrap();
+        match args.cmd {
+            Cmd::AgentVm {
+                action:
+                    AgentVmCmd::BuildBrokerImage {
+                        guest_system,
+                        flake,
+                    },
+            } => {
+                assert_eq!(guest_system, None);
+                assert_eq!(flake, ".");
+            }
+            _ => panic!("unexpected command"),
+        }
+
+        let args = Args::try_parse_from([
+            "writ",
+            "agent-vm",
+            "build-broker-image",
+            "--guest-system",
+            "aarch64-linux",
+            "--flake",
+            "/path/to/repo",
+        ])
+        .unwrap();
+        match args.cmd {
+            Cmd::AgentVm {
+                action:
+                    AgentVmCmd::BuildBrokerImage {
+                        guest_system,
+                        flake,
+                    },
+            } => {
+                assert_eq!(guest_system, Some(GuestSystemArg::Aarch64Linux));
                 assert_eq!(flake, "/path/to/repo");
             }
             _ => panic!("unexpected command"),
