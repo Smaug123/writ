@@ -685,6 +685,39 @@ async fn daemon_list_reports_persisted_session_without_runtime_as_detached() {
     assert!(!sessions[0].runtime_attached);
 }
 
+/// A vm-broker session whose stop/cleanup failed re-attaches its log tail, so it
+/// stays reported as runtime-attached (observable + retryable) rather than
+/// appearing orphaned. `false` (no prior forwarder) must not attach anything.
+#[tokio::test]
+async fn reattach_broker_log_forwarder_marks_session_attached() {
+    let dir = tempfile::tempdir().unwrap();
+    let args_log = dir.path().join("args.log");
+    let env_path_log = dir.path().join("env-path.log");
+    let env_log = dir.path().join("env.log");
+    let fake_tool = write_fake_tool(dir.path(), &args_log, &env_path_log, &env_log);
+    let (config, state_store) = daemon_config(dir.path(), &fake_tool);
+    occupy_subnet(&state_store, 252);
+    let state = state_store.load_all().unwrap().pop().unwrap();
+    let session_id = state.session_id();
+    let daemon = AgentVmDaemon::new(config);
+
+    // No prior forwarder: nothing is attached (mirrors the detached case).
+    daemon
+        .reattach_broker_log_forwarder_if(false, session_id)
+        .await;
+    assert!(!daemon.list_sessions().await.unwrap()[0].runtime_attached);
+
+    // A failed stop that had a forwarder re-attaches it: the session is now
+    // reported attached again.
+    daemon
+        .reattach_broker_log_forwarder_if(true, session_id)
+        .await;
+    assert!(
+        daemon.list_sessions().await.unwrap()[0].runtime_attached,
+        "re-attached vm-broker session must be reported attached, not orphaned"
+    );
+}
+
 #[tokio::test]
 async fn daemon_reconcile_on_empty_store_is_noop() {
     let dir = tempfile::tempdir().unwrap();

@@ -1188,12 +1188,47 @@ impl AgentVmDaemon {
         .await
     }
 
+    /// Run [`Self::spawn_cleanup_session`], flattening the join result and the
+    /// inner teardown result into one error type.
+    async fn run_cleanup_session(&self, session_id: SessionId) -> Result<(), AgentVmDaemonError> {
+        match self.spawn_cleanup_session(session_id).await {
+            Ok(inner) => inner.map_err(Into::into),
+            Err(join) => Err(join.into()),
+        }
+    }
+
     /// The root under which each session's broker-VM host material lives
     /// (`<state_dir>/broker-vm/<session_id>/…`). Derived from the state directory
     /// so the start arm (which writes the material) and teardown (which removes it)
     /// agree without extra configuration.
     fn broker_material_root(&self) -> PathBuf {
         self.config.lifecycle.state_store.dir().join("broker-vm")
+    }
+
+    /// Spawn a log tail for a broker VM, pointed at its mirrored log file on the
+    /// shared session mount. Used at start, and to re-attach when a stop/cleanup
+    /// fails with the broker VM (and its log) still live.
+    fn spawn_broker_log_forwarder(&self, session_id: SessionId) -> BrokerLogForwarder {
+        BrokerLogForwarder::spawn(
+            BrokerVmSessionPaths::new(&self.broker_material_root(), session_id)
+                .staging_dir()
+                .join(BROKER_VM_LOG_FILE),
+            session_id,
+            BROKER_VM_READY_POLL_INTERVAL,
+        )
+    }
+
+    /// Re-attach a broker-VM log tail (only when `had` — i.e. there was one) after
+    /// a failed stop/cleanup, so a still-live session stays observable and
+    /// retryable rather than appearing orphaned with forwarding stopped.
+    async fn reattach_broker_log_forwarder_if(&self, had: bool, session_id: SessionId) {
+        if had {
+            let forwarder = self.spawn_broker_log_forwarder(session_id);
+            self.vm_broker_attached
+                .lock()
+                .await
+                .insert(session_id, forwarder);
+        }
     }
 
     /// Remove the persisted state record for `session_id` on a blocking
@@ -1215,15 +1250,25 @@ impl AgentVmDaemon {
         state: &Arc<BrokerState<S>>,
         session_id: SessionId,
     ) -> Result<(), AgentVmDaemonError> {
-        // Drop any vm-broker attachment (a no-op for host sessions), draining its
-        // log tail one last time *before* cleanup — `spawn_cleanup_session` removes
-        // the per-session material dir that holds the log file, so a drain after it
-        // would find nothing and lose the tail. Remove first so the lock is not
-        // held across the drain await.
-        if let Some(forwarder) = self.vm_broker_attached.lock().await.remove(&session_id) {
+        // Drain+stop the broker log tail *before* cleanup — a successful
+        // `spawn_cleanup_session` removes the per-session material dir that holds
+        // the log file, so a drain afterwards would find nothing and lose the tail.
+        // Remove first so the lock is not held across the drain await.
+        let forwarder = self.vm_broker_attached.lock().await.remove(&session_id);
+        let had_forwarder = forwarder.is_some();
+        if let Some(forwarder) = forwarder {
             forwarder.drain_and_stop().await;
         }
-        self.spawn_cleanup_session(session_id).await??;
+
+        if let Err(err) = self.run_cleanup_session(session_id).await {
+            // Cleanup failed: teardown leaves the material dir (and log) for the
+            // retry, so the broker VM may still be live. Re-attach a fresh log tail
+            // so the session stays reported as attached (not orphaned) and keeps
+            // forwarding until a later stop succeeds.
+            self.reattach_broker_log_forwarder_if(had_forwarder, session_id)
+                .await;
+            return Err(err);
+        }
 
         let audit_close = state.audit.close_session(session_id, UnixMillis::now());
         let http_shutdown = match self.running.lock().await.remove(&session_id) {
@@ -1355,13 +1400,22 @@ impl AgentVmDaemon {
         session_id: SessionId,
     ) -> Result<(), AgentVmDaemonError> {
         // Drain the log tail *before* cleanup removes the material dir holding the
-        // log file. A vm-broker session that was fully started (and inserted)
-        // drains here; a start that failed before insertion drained its own local
-        // forwarder already, so this is then a no-op.
-        if let Some(forwarder) = self.vm_broker_attached.lock().await.remove(&session_id) {
+        // log file. A fully-started (inserted) session drains here; a start that
+        // failed before insertion drained its own local forwarder already, so this
+        // is then a no-op.
+        let forwarder = self.vm_broker_attached.lock().await.remove(&session_id);
+        let had_forwarder = forwarder.is_some();
+        if let Some(forwarder) = forwarder {
             forwarder.drain_and_stop().await;
         }
-        self.spawn_cleanup_session(session_id).await??;
+
+        if let Err(err) = self.run_cleanup_session(session_id).await {
+            // Failed teardown leaves the material dir (and log) for the retry, so
+            // re-attach a fresh tail to keep a still-live session observable.
+            self.reattach_broker_log_forwarder_if(had_forwarder, session_id)
+                .await;
+            return Err(err);
+        }
 
         if let Some(running) = self.running.lock().await.remove(&session_id) {
             running.shutdown().await?;
@@ -1767,13 +1821,7 @@ impl AgentVmDaemon {
         // forwards the broker's own egress-probe/startup diagnostics to the host.
         // The broker truncates+appends this file on the shared session mount; it
         // need not exist yet (the tailer tolerates absence).
-        let broker_log_forwarder = BrokerLogForwarder::spawn(
-            BrokerVmSessionPaths::new(&self.broker_material_root(), session_id)
-                .staging_dir()
-                .join(BROKER_VM_LOG_FILE),
-            session_id,
-            BROKER_VM_READY_POLL_INTERVAL,
-        );
+        let broker_log_forwarder = self.spawn_broker_log_forwarder(session_id);
 
         // Everything past the claim reaps via cleanup_failed_started_session on any
         // error (it tears down the agent VM, the broker VM, the material, and the
