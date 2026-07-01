@@ -186,6 +186,32 @@ pub struct ProcessInvocation {
     args: Vec<OsString>,
 }
 
+/// The captured result of a [`ProcessInvocation`] regardless of its exit status,
+/// for callers that need the output even on failure — e.g. polling `container
+/// inspect` (whose non-zero exit while the VM is still being created is benign)
+/// or salvaging `container logs` when the tool itself exits non-zero.
+#[derive(Clone, Debug)]
+pub struct CapturedOutput {
+    pub status: std::process::ExitStatus,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+impl CapturedOutput {
+    /// stdout and stderr concatenated (stdout first), for diagnostics that do not
+    /// care which stream a line came from.
+    pub fn combined(&self) -> String {
+        let mut out = self.stdout.clone();
+        if !self.stderr.is_empty() {
+            if !out.is_empty() && !out.ends_with('\n') {
+                out.push('\n');
+            }
+            out.push_str(&self.stderr);
+        }
+        out
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AgentVmStartInvocation {
     Static(ProcessInvocation),
@@ -1260,6 +1286,19 @@ impl ProcessInvocation {
         } else {
             Err(self.failed_from_output(output))
         }
+    }
+
+    /// Run the invocation and capture both streams and the exit status,
+    /// regardless of exit code — unlike [`Self::run_capturing_stdout`], a
+    /// non-zero exit does not discard the output. Only a failure to *spawn* the
+    /// process is an error; the caller inspects `status` itself.
+    pub fn run_capturing_output(&self) -> Result<CapturedOutput, ProcessInvocationError> {
+        let output = self.output()?;
+        Ok(CapturedOutput {
+            status: output.status,
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        })
     }
 
     fn failed_from_output(&self, output: std::process::Output) -> ProcessInvocationError {

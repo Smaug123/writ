@@ -28,6 +28,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::audit::{AuditError, AuditLog};
+use crate::broker_protocol::BrokerReadyDoc;
 use crate::broker_session::{
     BearerTokenFileError, BrokerSessionSpec, BrokerSessionSpecError, read_bearer_token_file,
 };
@@ -214,7 +215,9 @@ fn validate_broker_port(port: u16, range: BrokerPortRange) -> Result<BrokerPort,
 
 /// Atomically publish the ready file: write a sibling temp file then rename it
 /// into place, so a reader either sees the complete file or no file at all. The
-/// content is the bound broker port (a non-empty, self-identifying signal).
+/// content is a [`BrokerReadyDoc`] carrying this broker's protocol version and
+/// bound port, so the host can gate a stale image (see
+/// [`crate::broker_protocol`]) rather than time out opaquely.
 fn write_ready_file_atomic(path: &Path, broker_port: BrokerPort) -> Result<(), BrokerRunError> {
     let ready_err = |source: std::io::Error| BrokerRunError::ReadyFile {
         path: path.display().to_string(),
@@ -234,7 +237,8 @@ fn write_ready_file_atomic(path: &Path, broker_port: BrokerPort) -> Result<(), B
         .and_then(|n| n.to_str())
         .unwrap_or("writd-broker-ready");
     let tmp = dir.join(format!(".{target_name}.{}.tmp", std::process::id()));
-    std::fs::write(&tmp, format!("{}\n", broker_port.get())).map_err(ready_err)?;
+    let doc = BrokerReadyDoc::current(broker_port.get());
+    std::fs::write(&tmp, doc.to_ready_file()).map_err(ready_err)?;
     std::fs::rename(&tmp, path).map_err(|source| {
         // Best-effort cleanup so a failed rename does not leave the temp behind.
         let _ = std::fs::remove_file(&tmp);
@@ -757,7 +761,15 @@ mod tests {
         let ready = dir.path().join("ready");
         let port = BrokerPort::new(18085).unwrap();
         write_ready_file_atomic(&ready, port).unwrap();
-        assert_eq!(std::fs::read_to_string(&ready).unwrap(), "18085\n");
+        let doc = crate::broker_protocol::BrokerReadyDoc::parse(
+            &std::fs::read_to_string(&ready).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(doc.broker_port, 18085);
+        assert_eq!(
+            doc.protocol_version,
+            crate::broker_protocol::BROKER_PROTOCOL_VERSION
+        );
         // No stray temp file left in the directory.
         let leftovers: Vec<_> = std::fs::read_dir(dir.path())
             .unwrap()
@@ -777,8 +789,13 @@ mod tests {
         let ready_b = dir.path().join("ready-b");
         write_ready_file_atomic(&ready_a, port).unwrap();
         write_ready_file_atomic(&ready_b, port).unwrap();
-        assert_eq!(std::fs::read_to_string(&ready_a).unwrap(), "18085\n");
-        assert_eq!(std::fs::read_to_string(&ready_b).unwrap(), "18085\n");
+        for ready in [&ready_a, &ready_b] {
+            let doc = crate::broker_protocol::BrokerReadyDoc::parse(
+                &std::fs::read_to_string(ready).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(doc.broker_port, 18085);
+        }
         let names: Vec<_> = std::fs::read_dir(dir.path())
             .unwrap()
             .map(|e| e.unwrap().file_name())
@@ -976,9 +993,14 @@ mod tests {
 
         let (serve_result, ()) = tokio::join!(serve_fut, control_fut);
         serve_result.unwrap();
+        let doc = crate::broker_protocol::BrokerReadyDoc::parse(
+            &std::fs::read_to_string(&ready_path).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(doc.broker_port, port);
         assert_eq!(
-            std::fs::read_to_string(&ready_path).unwrap(),
-            format!("{port}\n")
+            doc.protocol_version,
+            crate::broker_protocol::BROKER_PROTOCOL_VERSION
         );
     }
 }

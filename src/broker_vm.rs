@@ -330,11 +330,22 @@ impl BrokerVmPlan {
     }
 
     /// `container inspect <broker vm>` — its JSON carries the broker's address on
-    /// the internal network once running (see [`parse_broker_ipv4_on_network`]).
+    /// the internal network once running (see [`parse_broker_ipv4_on_network`])
+    /// and its lifecycle state (see [`parse_broker_state`]).
     pub fn inspect_invocation(&self) -> ProcessInvocation {
         ProcessInvocation::new(
             self.container_tool.clone(),
             ["inspect".to_string(), self.names.vm.clone()],
+        )
+    }
+
+    /// `container logs <broker vm>` — the broker process's stdout+stderr, used to
+    /// salvage the crash reason when the VM exits before publishing readiness
+    /// (e.g. a stale image rejecting a broker CLI flag at argument parsing).
+    pub fn logs_invocation(&self) -> ProcessInvocation {
+        ProcessInvocation::new(
+            self.container_tool.clone(),
+            ["logs".to_string(), self.names.vm.clone()],
         )
     }
 
@@ -745,6 +756,44 @@ pub enum BrokerInspectError {
 /// as `.ipv4Address` in `addr/prefix` form. Verified against Apple `container`
 /// 1.0.0 (`status.networks` is empty until the container is running, which
 /// surfaces here as [`BrokerInspectError::NetworkNotFound`]).
+/// The broker VM's lifecycle state, as classified from `container inspect`.
+///
+/// Only definitively-terminal states (the container has stopped and will never
+/// become ready) are `Terminal`; everything else — a still-`running` VM, a
+/// not-yet-created one, a transient `creating`/`stopping`, or unparseable JSON —
+/// is `Running`/`Unknown`, which the readiness wait keeps polling through. Being
+/// conservative here means an unrecognised terminal string degrades to the old
+/// timeout behaviour rather than a false "the broker crashed".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BrokerVmState {
+    Running,
+    Terminal(String),
+    Unknown,
+}
+
+/// Classify the broker VM's state from `container inspect` JSON. The state lives
+/// at `[0].status.state` (a sibling of the `networks` array
+/// [`parse_broker_ipv4_on_network`] reads). Verified against Apple `container`
+/// 1.0.0, whose stopped containers report `"state": "stopped"`.
+pub fn parse_broker_state(inspect_json: &str) -> BrokerVmState {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(inspect_json) else {
+        return BrokerVmState::Unknown;
+    };
+    let state = value
+        .as_array()
+        .and_then(|containers| containers.first())
+        .and_then(|container| container.get("status"))
+        .and_then(|status| status.get("state"))
+        .and_then(serde_json::Value::as_str);
+    match state {
+        Some("running") => BrokerVmState::Running,
+        Some(terminal @ ("stopped" | "exited" | "failed")) => {
+            BrokerVmState::Terminal(terminal.to_string())
+        }
+        _ => BrokerVmState::Unknown,
+    }
+}
+
 pub fn parse_broker_ipv4_on_network(
     inspect_json: &str,
     network_name: &str,
@@ -1145,6 +1194,9 @@ mod tests {
                 "192.168.252.0/24".to_string(),
             ]
         );
+        // Changing this argv is a host↔broker contract change: bump
+        // `BROKER_PROTOCOL_VERSION` and rebuild the broker image (see
+        // `broker_contract_fingerprint_is_pinned`).
         assert_eq!(
             &args[image_at + 6..],
             &[
@@ -1161,6 +1213,49 @@ mod tests {
                 "--log-file".to_string(),
                 format!("{BROKER_VM_SESSION_DIR}/broker.log.jsonl"),
             ]
+        );
+    }
+
+    /// CI pin for the host↔broker contract. It combines the broker CLI flag names
+    /// the host passes with the on-disk schema of the ready document. If you change
+    /// either — add/rename a broker CLI flag, or change `BrokerReadyDoc`'s shape
+    /// (the exhaustive struct literal below fails to compile on a field addition) —
+    /// this test fails. When it does, update the snapshot **and** bump
+    /// `BROKER_PROTOCOL_VERSION` (and rebuild the broker image). The session-spec
+    /// schema is guarded independently by its own `version` field and the
+    /// `broker_session` tests.
+    #[test]
+    fn broker_contract_fingerprint_is_pinned() {
+        let args = sample_plan().run_invocation().args_lossy();
+        let broker_at = args
+            .iter()
+            .position(|a| a == "broker")
+            .expect("broker subcommand present");
+        let flags: Vec<&str> = args[broker_at..]
+            .iter()
+            .filter(|a| a.starts_with("--"))
+            .map(String::as_str)
+            .collect();
+
+        // A fully-populated ready doc pins the field names and which fields
+        // serialize; the exhaustive literal forces an update on a field addition.
+        let ready_doc = crate::broker_protocol::BrokerReadyDoc {
+            protocol_version: 1,
+            broker_port: 18080,
+            writd_build: Some("pinned".to_string()),
+        };
+        let fingerprint = format!(
+            "broker-cli-flags: {}\nready-doc: {}",
+            flags.join(" "),
+            serde_json::to_string(&ready_doc).unwrap(),
+        );
+
+        assert_eq!(
+            fingerprint,
+            "broker-cli-flags: --config --session-spec --bearer-token-file --ready-file --log-file\n\
+             ready-doc: {\"protocol_version\":1,\"broker_port\":18080,\"writd_build\":\"pinned\"}",
+            "the host↔broker contract changed. Update this snapshot AND bump \
+             BROKER_PROTOCOL_VERSION (and rebuild the broker image)."
         );
     }
 
@@ -1352,6 +1447,46 @@ mod tests {
             parse_broker_ipv4_on_network("[]", "writ-net"),
             Err(BrokerInspectError::NoContainer)
         );
+    }
+
+    #[test]
+    fn parse_broker_state_reads_running() {
+        assert_eq!(
+            parse_broker_state(&inspect_json("")),
+            BrokerVmState::Running
+        );
+    }
+
+    #[test]
+    fn parse_broker_state_classifies_stopped_like_states_as_terminal() {
+        for terminal in ["stopped", "exited", "failed"] {
+            let json = format!(r#"[{{"status":{{"state":"{terminal}"}}}}]"#);
+            assert_eq!(
+                parse_broker_state(&json),
+                BrokerVmState::Terminal(terminal.to_string()),
+                "state {terminal:?} should be terminal"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_broker_state_is_unknown_for_transient_or_absent_states() {
+        // Transient states, an empty container list, missing state, and unparseable
+        // JSON must all degrade to Unknown so the readiness wait keeps polling
+        // rather than falsely declaring the broker crashed.
+        for json in [
+            r#"[{"status":{"state":"creating"}}]"#,
+            r#"[{"status":{"state":"stopping"}}]"#,
+            r#"[{"status":{}}]"#,
+            "[]",
+            "not json",
+        ] {
+            assert_eq!(
+                parse_broker_state(json),
+                BrokerVmState::Unknown,
+                "json {json:?} should be Unknown"
+            );
+        }
     }
 
     /// A host daemon config whose `vm_http` sets host-path-only features (a
