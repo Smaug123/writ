@@ -68,12 +68,20 @@ enum Command {
         /// Optional path created atomically once the broker is serving.
         #[arg(long)]
         ready_file: Option<PathBuf>,
+
+        /// Optional path the broker mirrors its JSON logs to, on the shared
+        /// session mount, for the host daemon to tail (see the host-side
+        /// `broker_log_forwarder`). Absent for the in-process host daemon.
+        #[arg(long)]
+        log_file: Option<PathBuf>,
     },
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    writ::telemetry::init("info")?;
+    // Parse before installing telemetry: the global subscriber installs only
+    // once, and the broker subcommand adds a second (file) sink whose path we
+    // learn only from the parsed args.
     let args = Args::parse();
 
     match args.command {
@@ -82,19 +90,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             session_spec,
             bearer_token_file,
             ready_file,
+            log_file,
         }) => {
-            run_broker(BrokerArgs {
+            writ::telemetry::init_with_file("info", log_file.as_deref())?;
+            // Log any broker failure via `tracing` before returning: telemetry
+            // (with the file sink) is installed, so this reaches the host tailer.
+            // A bare `?` would instead print only to the guest's stderr, leaving
+            // early startup failures (bad config, missing store, bind error)
+            // looking like a silent ready-file timeout on the host.
+            if let Err(err) = run_broker(BrokerArgs {
                 config,
                 session_spec,
                 bearer_token_file,
                 ready_file,
             })
-            .await?;
+            .await
+            {
+                tracing::error!(error = %err, "writd broker exited with error");
+                return Err(err.into());
+            }
             return Ok(());
         }
         None => {}
     }
 
+    writ::telemetry::init("info")?;
     run_host_daemon(args.config, args.socket, args.audit_db).await
 }
 

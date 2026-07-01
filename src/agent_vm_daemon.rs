@@ -26,8 +26,10 @@ use crate::agent_vm_lifecycle::{
     remove_managed_agent_vm_session_state, start_agent_vm_session,
 };
 use crate::audit::{AgentRunAuditRecord, AgentVmNetworkHealthEventRecord, AuditError, AuditLog};
+use crate::broker_log_forwarder::BrokerLogForwarder;
 use crate::broker_vm::{
-    BrokerVmSessionPaths, BrokerVmSessionRequest, broker_url, materialize_broker_vm_session,
+    BROKER_VM_LOG_FILE, BrokerVmSessionPaths, BrokerVmSessionRequest, broker_url,
+    materialize_broker_vm_session,
 };
 use crate::broker_vm_runner::launch_broker_vm;
 use crate::core::{
@@ -163,11 +165,12 @@ pub struct AgentVmDaemon {
     /// first session start (it needs an [`AuditLog`] handle, which arrives with
     /// the start request, not at construction).
     health_monitor: std::sync::Mutex<Option<NetworkHealthMonitorHandle>>,
-    /// Session IDs of live `broker_placement = vm` sessions. The vm arm keeps no
-    /// in-process broker (so nothing in `running`), but the session is still
-    /// runtime-attached to this daemon; this set lets [`Self::list_sessions`]
-    /// report it as attached rather than orphaned.
-    vm_broker_attached: Mutex<HashSet<SessionId>>,
+    /// Live `broker_placement = vm` sessions, each mapped to the forwarder
+    /// tailing its broker VM's mirrored log file. The vm arm keeps no in-process
+    /// broker (so nothing in `running`), but the session is still runtime-attached
+    /// to this daemon; this map lets [`Self::list_sessions`] report it as attached
+    /// rather than orphaned, and lets teardown drain+stop the log tail.
+    vm_broker_attached: Mutex<HashMap<SessionId, BrokerLogForwarder>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -937,7 +940,7 @@ impl AgentVmDaemon {
             session_locks: Mutex::new(HashMap::new()),
             network_health: Arc::new(std::sync::Mutex::new(HashMap::new())),
             health_monitor: std::sync::Mutex::new(None),
-            vm_broker_attached: Mutex::new(HashSet::new()),
+            vm_broker_attached: Mutex::new(HashMap::new()),
         }
     }
 
@@ -1185,12 +1188,47 @@ impl AgentVmDaemon {
         .await
     }
 
+    /// Run [`Self::spawn_cleanup_session`], flattening the join result and the
+    /// inner teardown result into one error type.
+    async fn run_cleanup_session(&self, session_id: SessionId) -> Result<(), AgentVmDaemonError> {
+        match self.spawn_cleanup_session(session_id).await {
+            Ok(inner) => inner.map_err(Into::into),
+            Err(join) => Err(join.into()),
+        }
+    }
+
     /// The root under which each session's broker-VM host material lives
     /// (`<state_dir>/broker-vm/<session_id>/…`). Derived from the state directory
     /// so the start arm (which writes the material) and teardown (which removes it)
     /// agree without extra configuration.
     fn broker_material_root(&self) -> PathBuf {
         self.config.lifecycle.state_store.dir().join("broker-vm")
+    }
+
+    /// Spawn a log tail for a broker VM, pointed at its mirrored log file on the
+    /// shared session mount. Used at start, and to re-attach when a stop/cleanup
+    /// fails with the broker VM (and its log) still live.
+    fn spawn_broker_log_forwarder(&self, session_id: SessionId) -> BrokerLogForwarder {
+        BrokerLogForwarder::spawn(
+            BrokerVmSessionPaths::new(&self.broker_material_root(), session_id)
+                .staging_dir()
+                .join(BROKER_VM_LOG_FILE),
+            session_id,
+            BROKER_VM_READY_POLL_INTERVAL,
+        )
+    }
+
+    /// Re-attach a broker-VM log tail (only when `had` — i.e. there was one) after
+    /// a failed stop/cleanup, so a still-live session stays observable and
+    /// retryable rather than appearing orphaned with forwarding stopped.
+    async fn reattach_broker_log_forwarder_if(&self, had: bool, session_id: SessionId) {
+        if had {
+            let forwarder = self.spawn_broker_log_forwarder(session_id);
+            self.vm_broker_attached
+                .lock()
+                .await
+                .insert(session_id, forwarder);
+        }
     }
 
     /// Remove the persisted state record for `session_id` on a blocking
@@ -1212,11 +1250,27 @@ impl AgentVmDaemon {
         state: &Arc<BrokerState<S>>,
         session_id: SessionId,
     ) -> Result<(), AgentVmDaemonError> {
-        self.spawn_cleanup_session(session_id).await??;
+        // Drain+stop the broker log tail *before* cleanup — a successful
+        // `spawn_cleanup_session` removes the per-session material dir that holds
+        // the log file, so a drain afterwards would find nothing and lose the tail.
+        // Remove first so the lock is not held across the drain await.
+        let forwarder = self.vm_broker_attached.lock().await.remove(&session_id);
+        let had_forwarder = forwarder.is_some();
+        if let Some(forwarder) = forwarder {
+            forwarder.drain_and_stop().await;
+        }
+
+        if let Err(err) = self.run_cleanup_session(session_id).await {
+            // Cleanup failed: teardown leaves the material dir (and log) for the
+            // retry, so the broker VM may still be live. Re-attach a fresh log tail
+            // so the session stays reported as attached (not orphaned) and keeps
+            // forwarding until a later stop succeeds.
+            self.reattach_broker_log_forwarder_if(had_forwarder, session_id)
+                .await;
+            return Err(err);
+        }
 
         let audit_close = state.audit.close_session(session_id, UnixMillis::now());
-        // Drop any vm-broker attachment (a no-op for host sessions).
-        self.vm_broker_attached.lock().await.remove(&session_id);
         let http_shutdown = match self.running.lock().await.remove(&session_id) {
             Some(running) => running.shutdown().await,
             None => Ok(()),
@@ -1345,9 +1399,24 @@ impl AgentVmDaemon {
         &self,
         session_id: SessionId,
     ) -> Result<(), AgentVmDaemonError> {
-        self.spawn_cleanup_session(session_id).await??;
+        // Drain the log tail *before* cleanup removes the material dir holding the
+        // log file. A fully-started (inserted) session drains here; a start that
+        // failed before insertion drained its own local forwarder already, so this
+        // is then a no-op.
+        let forwarder = self.vm_broker_attached.lock().await.remove(&session_id);
+        let had_forwarder = forwarder.is_some();
+        if let Some(forwarder) = forwarder {
+            forwarder.drain_and_stop().await;
+        }
 
-        self.vm_broker_attached.lock().await.remove(&session_id);
+        if let Err(err) = self.run_cleanup_session(session_id).await {
+            // Failed teardown leaves the material dir (and log) for the retry, so
+            // re-attach a fresh tail to keep a still-live session observable.
+            self.reattach_broker_log_forwarder_if(had_forwarder, session_id)
+                .await;
+            return Err(err);
+        }
+
         if let Some(running) = self.running.lock().await.remove(&session_id) {
             running.shutdown().await?;
         }
@@ -1431,7 +1500,7 @@ impl AgentVmDaemon {
         let vm_attached = self.vm_broker_attached.lock().await;
         // A session is runtime-attached if its in-process broker is live (host) or
         // it is a live vm-broker session (no in-process broker, tracked separately).
-        let attached = |id: &SessionId| running.contains_key(id) || vm_attached.contains(id);
+        let attached = |id: &SessionId| running.contains_key(id) || vm_attached.contains_key(id);
         Ok(states
             .into_iter()
             .map(|state| AgentVmSessionInfo {
@@ -1747,6 +1816,13 @@ impl AgentVmDaemon {
             (subnet_index, network)
         };
 
+        // Start tailing the broker VM's mirrored log file *before* launch, so that
+        // even a readiness timeout (the broker never publishes `ready`) still
+        // forwards the broker's own egress-probe/startup diagnostics to the host.
+        // The broker truncates+appends this file on the shared session mount; it
+        // need not exist yet (the tailer tolerates absence).
+        let broker_log_forwarder = self.spawn_broker_log_forwarder(session_id);
+
         // Everything past the claim reaps via cleanup_failed_started_session on any
         // error (it tears down the agent VM, the broker VM, the material, and the
         // record — see cleanup_managed_agent_vm_session for vm placement).
@@ -1769,14 +1845,29 @@ impl AgentVmDaemon {
         match outcome {
             Ok(broker_url) => {
                 // No in-process broker to register, but the session is live; track
-                // it so list_sessions reports it as attached, not orphaned.
-                self.vm_broker_attached.lock().await.insert(session_id);
+                // it (and keep tailing its logs) so list_sessions reports it as
+                // attached, not orphaned. The tail is drained+stopped on teardown.
+                self.vm_broker_attached
+                    .lock()
+                    .await
+                    .insert(session_id, broker_log_forwarder);
                 Ok(AgentVmStarted {
                     session_id,
                     broker_url,
                 })
             }
             Err(err) => {
+                // Forward whatever the broker VM logged up to now — typically the
+                // failure itself — then stop the tail, before the VM is torn down.
+                // Done up front so it runs on both the keep-VM and cleanup paths,
+                // and log the top-level reason host-side (this path was otherwise
+                // silent in the daemon's own logs).
+                broker_log_forwarder.drain_and_stop().await;
+                tracing::warn!(
+                    %session_id,
+                    error = %err,
+                    "agent VM start failed (broker_placement = vm)",
+                );
                 // Debug escape hatch: leave the failed session's broker + agent VMs
                 // (and its Starting state record) in place so an operator can
                 // `container logs writ-broker-vm-<session-id>` and `container exec`
