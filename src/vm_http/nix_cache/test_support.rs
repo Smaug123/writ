@@ -261,6 +261,32 @@ pub(super) fn multi_stream_xz_body_for(raw: &[u8]) -> Vec<u8> {
     body
 }
 
+pub(super) fn test_zstd_nar_body() -> Vec<u8> {
+    zstd_nar_body_for(&test_raw_nar_body())
+}
+
+pub(super) fn zstd_nar_body_for(raw: &[u8]) -> Vec<u8> {
+    let mut encoder = zstd::stream::write::Encoder::new(Vec::new(), 3).unwrap();
+    encoder.write_all(raw).unwrap();
+    encoder.finish().unwrap()
+}
+
+/// A single zstd frame that advertises `window_log` in its header regardless of
+/// how small the payload is, for exercising the decoder's window-size ceiling.
+pub(super) fn zstd_nar_body_with_window_log(raw: &[u8], window_log: u32) -> Vec<u8> {
+    let mut encoder = zstd::stream::write::Encoder::new(Vec::new(), 3).unwrap();
+    encoder.window_log(window_log).unwrap();
+    encoder.write_all(raw).unwrap();
+    encoder.finish().unwrap()
+}
+
+pub(super) fn multi_stream_zstd_body_for(raw: &[u8]) -> Vec<u8> {
+    let split = raw.len() / 2;
+    let mut body = zstd_nar_body_for(&raw[..split]);
+    body.extend_from_slice(&zstd_nar_body_for(&raw[split..]));
+    body
+}
+
 pub(super) fn admitted_nar_for_body(
     file: &str,
     compression: NixNarCompression,
