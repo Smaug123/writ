@@ -1,15 +1,24 @@
 //! Verifying a NAR body against the metadata admitted from its narinfo: the
 //! admitted-NAR descriptor, the declared/observed length checks, and the
-//! (optionally xz-decompressing) hash+size verification that runs on the
+//! (optionally xz-/zstd-decompressing) hash+size verification that runs on the
 //! blocking pool. Pure given its inputs apart from the `spawn_blocking` hop.
-
-use std::io::Read as _;
 
 use crate::nix_cache::{
     NixCacheNarFileName, NixNarBodyHashError, NixNarCompression, NixNarHash, NixNarInfo, NixNarSize,
 };
 
 const XZ_DECODER_MEMLIMIT_OVERHEAD: u64 = 16 * 1024 * 1024;
+
+/// The zstd decode-window ceiling we admit, as a `windowLog` (log2 of the
+/// window size in bytes). It cannot be derived from `max_nar_bytes`:
+/// cache.nixos.org's zstd NARs come from a streaming compressor that advertises
+/// `windowLog = 21` (a 2 MiB window) *regardless* of the NAR's own size, so a
+/// size-derived ceiling would reject real content. We instead match libzstd's
+/// own default limit (`ZSTD_WINDOWLOG_LIMIT_DEFAULT`), so the broker accepts
+/// exactly the frames the guest's Nix would and refuses (rather than allocates)
+/// any larger declared window — bounding peak decoder window memory at
+/// 2^27 = 128 MiB per decode.
+pub(super) const ZSTD_DECODER_WINDOW_LOG_MAX: u32 = 27;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct VmHttpNixCacheAdmittedNar {
@@ -138,6 +147,14 @@ pub(super) fn verify_nar_body(
             let raw_body = decode_xz_nar_body(body, admission.nar_size.get(), max_nar_bytes)?;
             verify_raw_nar_body(admission, &raw_body)
         }
+        NixNarCompression::Zstd => {
+            // As for xz: the decoded output is capped at the signed NarSize by
+            // the read loop, and the decoder's own window buffer is bounded by
+            // an explicit windowLog ceiling (a frame declaring a larger window
+            // is rejected, not allocated). See `ZSTD_DECODER_WINDOW_LOG_MAX`.
+            let raw_body = decode_zstd_nar_body(body, admission.nar_size.get())?;
+            verify_raw_nar_body(admission, &raw_body)
+        }
     }
 }
 
@@ -164,11 +181,43 @@ fn decode_xz_nar_body(
         .map_err(|err| VmHttpNixCacheNarVerifyError::Decode {
             message: err.to_string(),
         })?;
+    let decoder = xz2::read::XzDecoder::new_stream(std::io::Cursor::new(body), stream);
+    read_decoded_bounded(decoder, expected_size)
+}
+
+fn decode_zstd_nar_body(
+    body: &[u8],
+    expected_size: u64,
+) -> Result<Vec<u8>, VmHttpNixCacheNarVerifyError> {
+    let mut decoder =
+        zstd::stream::read::Decoder::new(std::io::Cursor::new(body)).map_err(|err| {
+            VmHttpNixCacheNarVerifyError::Decode {
+                message: err.to_string(),
+            }
+        })?;
+    // Cap the decoder's window buffer so a frame declaring a larger window is
+    // rejected up front rather than allocating it. Like xz's memlimit, this is
+    // the peak-memory bound; the read loop separately caps decoded output.
+    decoder
+        .window_log_max(ZSTD_DECODER_WINDOW_LOG_MAX)
+        .map_err(|err| VmHttpNixCacheNarVerifyError::Decode {
+            message: err.to_string(),
+        })?;
+    read_decoded_bounded(decoder, expected_size)
+}
+
+/// Drain a decompressing reader into a buffer whose size is capped at the
+/// signed `NarSize`: the moment the decoded stream exceeds it we bail with a
+/// `SizeMismatch` rather than growing without bound. Shared by the xz and zstd
+/// paths so both enforce the same output ceiling identically.
+fn read_decoded_bounded(
+    mut decoder: impl std::io::Read,
+    expected_size: u64,
+) -> Result<Vec<u8>, VmHttpNixCacheNarVerifyError> {
     let capacity =
         usize::try_from(expected_size).map_err(|_| VmHttpNixCacheNarVerifyError::Decode {
             message: format!("signed NarSize {expected_size} does not fit in usize"),
         })?;
-    let mut decoder = xz2::read::XzDecoder::new_stream(std::io::Cursor::new(body), stream);
     let mut decoded = Vec::with_capacity(capacity);
     let mut chunk = [0_u8; 8192];
     loop {
@@ -214,12 +263,12 @@ pub(super) fn nar_body_hash_error_label(error: &NixNarBodyHashError) -> &'static
 }
 
 /// Property-based spec for [`verify_nar_body`]: any byte body, whether served
-/// raw or xz-compressed, verifies against the admitted metadata derived from
-/// that same body. Example mismatches (short bodies, concatenated streams,
-/// missing/oversized lengths) live in `nar_verify_tests.rs`.
+/// raw, xz-, or zstd-compressed, verifies against the admitted metadata derived
+/// from that same body. Example mismatches (short bodies, concatenated streams,
+/// missing/oversized lengths, oversized windows) live in `nar_verify_tests.rs`.
 #[cfg(test)]
 mod spec {
-    use super::super::test_support::{admitted_nar_for_body, xz_nar_body_for};
+    use super::super::test_support::{admitted_nar_for_body, xz_nar_body_for, zstd_nar_body_for};
     use super::*;
     use proptest::prelude::*;
 
@@ -227,17 +276,16 @@ mod spec {
         #[test]
         fn generated_nar_bodies_verify_against_their_admitted_metadata(
             raw_body in prop::collection::vec(any::<u8>(), 0..512),
-            use_xz in any::<bool>(),
+            compression in prop::sample::select(&[
+                NixNarCompression::None,
+                NixNarCompression::Xz,
+                NixNarCompression::Zstd,
+            ]),
         ) {
-            let compression = if use_xz {
-                NixNarCompression::Xz
-            } else {
-                NixNarCompression::None
-            };
-            let wire_body = if use_xz {
-                xz_nar_body_for(&raw_body)
-            } else {
-                raw_body.clone()
+            let wire_body = match compression {
+                NixNarCompression::None => raw_body.clone(),
+                NixNarCompression::Xz => xz_nar_body_for(&raw_body),
+                NixNarCompression::Zstd => zstd_nar_body_for(&raw_body),
             };
             let admission = admitted_nar_for_body("generated.nar", compression, &raw_body);
             verify_nar_body(&admission, &wire_body, 512).unwrap();
