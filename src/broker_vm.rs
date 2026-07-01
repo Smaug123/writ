@@ -70,6 +70,11 @@ const SESSION_SPEC_FILE: &str = "session-spec.json";
 const BEARER_TOKEN_FILE: &str = "bearer-token";
 const CONFIG_FILE: &str = "config.json";
 const READY_FILE: &str = "ready";
+/// Filename (within [`BROKER_VM_SESSION_DIR`]) the broker mirrors its JSON
+/// tracing to; the host daemon tails the host-side end of the session mount
+/// (see the host-side `broker_log_forwarder`). Public so the daemon can build
+/// the host-side path without re-deriving the name.
+pub const BROKER_VM_LOG_FILE: &str = "broker.log.jsonl";
 
 /// Conventional writable scratch dirs the broker image expects as per-session
 /// tmpfs (mirrors the agent VM's set).
@@ -224,6 +229,12 @@ impl BrokerVmPlan {
         format!("{BROKER_VM_SESSION_DIR}/{READY_FILE}")
     }
 
+    /// Guest path of the log file the broker mirrors its tracing to; the host
+    /// tails the host-side end of the session mount (see `broker_log_forwarder`).
+    pub fn guest_log_file(&self) -> String {
+        format!("{BROKER_VM_SESSION_DIR}/{BROKER_VM_LOG_FILE}")
+    }
+
     /// The `writd broker` argument vector, referencing the well-known guest paths.
     fn broker_command(&self) -> Vec<String> {
         vec![
@@ -237,6 +248,8 @@ impl BrokerVmPlan {
             format!("{BROKER_VM_SESSION_DIR}/{BEARER_TOKEN_FILE}"),
             "--ready-file".to_string(),
             self.guest_ready_file(),
+            "--log-file".to_string(),
+            self.guest_log_file(),
         ]
     }
 
@@ -1145,6 +1158,8 @@ mod tests {
                 format!("{BROKER_VM_SESSION_DIR}/bearer-token"),
                 "--ready-file".to_string(),
                 format!("{BROKER_VM_SESSION_DIR}/ready"),
+                "--log-file".to_string(),
+                format!("{BROKER_VM_SESSION_DIR}/broker.log.jsonl"),
             ]
         );
     }
