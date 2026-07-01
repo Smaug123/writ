@@ -115,6 +115,23 @@
           };
         in
         writd.overrideAttrs (old: {
+          # writd's `host` feature pulls in libsqlite3-sys, ring, zstd-sys, and
+          # lzma-sys. Their build.rs scripts compile as host-platform
+          # executables, and on darwin rustc's late_link_args for
+          # aarch64-apple-darwin include `-liconv`. Cargo's RUSTFLAGS (and
+          # CARGO_TARGET_<host>_RUSTFLAGS) do not propagate to build-script
+          # rustc invocations in cross-compile mode, so we feed the
+          # build-side cc-wrapper directly via NIX_LDFLAGS_<suffixSalt>.
+          # writ-vm doesn't need this — vm-client excludes those crates.
+          depsBuildBuild = (old.depsBuildBuild or []) ++ [ buildPkgs.libiconv ];
+          preBuild =
+            let
+              salt = pkgs.pkgsBuildBuild.stdenv.cc.suffixSalt;
+              varName = "NIX_LDFLAGS_${salt}";
+            in ''
+              ${old.preBuild or ""}
+              export ${varName}="-L${buildPkgs.libiconv}/lib ''${${varName}:-}"
+            '';
           passthru = (old.passthru or {}) // {
             inherit guestSystem;
             rustTarget = cross.rustTarget;
