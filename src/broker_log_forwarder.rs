@@ -213,25 +213,37 @@ fn truncate_for_forward(line: &str) -> String {
 /// newline-terminated lines. Bytes after the final `\n` are held as a partial
 /// until their newline arrives. Pure; the unit of correctness the tail loop is
 /// built on.
+///
+/// The partial is capped at [`MAX_LINE_BYTES`]: a broker line longer than that
+/// (or one whose newline never arrives) has its overflow discarded, so a
+/// guest-writable log with a giant unterminated line can't make the host retain
+/// an unbounded buffer despite the per-read cap. The capped line is still
+/// emitted on its newline and further truncated at forward time.
 #[derive(Default)]
 struct LineReassembler {
     partial: Vec<u8>,
 }
 
+/// Maximum bytes retained for one un-terminated broker line. Larger than
+/// [`MAX_FORWARDED_LINE_BYTES`] so an over-long line still trips forward-time
+/// truncation (which marks it), while bounding host memory per line.
+const MAX_LINE_BYTES: usize = 64 * 1024;
+
 impl LineReassembler {
     /// Feed the next chunk, returning every complete line it completes (each
-    /// without its trailing `\n`).
+    /// without its trailing `\n`). Bytes past [`MAX_LINE_BYTES`] within a single
+    /// un-terminated line are discarded.
     fn push(&mut self, chunk: &[u8]) -> Vec<Vec<u8>> {
-        self.partial.extend_from_slice(chunk);
         let mut lines = Vec::new();
-        let mut start = 0;
-        for (i, &byte) in self.partial.iter().enumerate() {
+        for &byte in chunk {
             if byte == b'\n' {
-                lines.push(self.partial[start..i].to_vec());
-                start = i + 1;
+                lines.push(std::mem::take(&mut self.partial));
+            } else if self.partial.len() < MAX_LINE_BYTES {
+                self.partial.push(byte);
             }
+            // else: the line already reached the cap — discard the byte. It is
+            // still emitted (capped) when its newline arrives.
         }
-        self.partial.drain(..start);
         lines
     }
 }
@@ -383,6 +395,22 @@ mod tests {
         let got = collect(&path, &mut offset, &mut reasm);
         assert_eq!(got.len(), line_count);
         assert_eq!(offset, content.len() as u64);
+    }
+
+    #[test]
+    fn reassembler_caps_an_oversized_unterminated_line() {
+        let mut reasm = LineReassembler::default();
+        // A giant line with no newline must not grow the partial without bound.
+        let huge = vec![b'x'; MAX_LINE_BYTES * 4];
+        assert!(reasm.push(&huge).is_empty());
+        assert_eq!(reasm.partial.len(), MAX_LINE_BYTES);
+        // The newline flushes the capped line (overflow discarded); then normal
+        // reassembly resumes.
+        let lines = reasm.push(b"\ntail\n");
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].len(), MAX_LINE_BYTES);
+        assert_eq!(lines[1], b"tail".to_vec());
+        assert!(reasm.partial.is_empty());
     }
 
     #[tokio::test]

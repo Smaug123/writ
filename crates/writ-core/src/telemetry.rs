@@ -41,7 +41,7 @@ const CAP_NOTICE: &str =
     "\n{\"writ_broker_log\":\"log file cap reached; remaining logs only via `container logs`\"}\n";
 
 /// An append-only [`Write`] that stops accepting event bytes once a byte cap is
-/// reached, appending [`CAP_NOTICE`] exactly once the first time it drops.
+/// reached, appending a one-time `CAP_NOTICE` line the first time it drops.
 ///
 /// Whole buffers are written or dropped, never split, so every JSON line stays
 /// intact; the overshoot past the cap is bounded by a single write. The file is
