@@ -1215,15 +1215,17 @@ impl AgentVmDaemon {
         state: &Arc<BrokerState<S>>,
         session_id: SessionId,
     ) -> Result<(), AgentVmDaemonError> {
-        self.spawn_cleanup_session(session_id).await??;
-
-        let audit_close = state.audit.close_session(session_id, UnixMillis::now());
         // Drop any vm-broker attachment (a no-op for host sessions), draining its
-        // log tail one last time before it stops. Remove first so the lock is not
+        // log tail one last time *before* cleanup — `spawn_cleanup_session` removes
+        // the per-session material dir that holds the log file, so a drain after it
+        // would find nothing and lose the tail. Remove first so the lock is not
         // held across the drain await.
         if let Some(forwarder) = self.vm_broker_attached.lock().await.remove(&session_id) {
             forwarder.drain_and_stop().await;
         }
+        self.spawn_cleanup_session(session_id).await??;
+
+        let audit_close = state.audit.close_session(session_id, UnixMillis::now());
         let http_shutdown = match self.running.lock().await.remove(&session_id) {
             Some(running) => running.shutdown().await,
             None => Ok(()),
@@ -1352,14 +1354,15 @@ impl AgentVmDaemon {
         &self,
         session_id: SessionId,
     ) -> Result<(), AgentVmDaemonError> {
-        self.spawn_cleanup_session(session_id).await??;
-
-        // A vm-broker session that was fully started (and inserted) drains its log
-        // tail here; a start that failed before insertion drained its own local
+        // Drain the log tail *before* cleanup removes the material dir holding the
+        // log file. A vm-broker session that was fully started (and inserted)
+        // drains here; a start that failed before insertion drained its own local
         // forwarder already, so this is then a no-op.
         if let Some(forwarder) = self.vm_broker_attached.lock().await.remove(&session_id) {
             forwarder.drain_and_stop().await;
         }
+        self.spawn_cleanup_session(session_id).await??;
+
         if let Some(running) = self.running.lock().await.remove(&session_id) {
             running.shutdown().await?;
         }

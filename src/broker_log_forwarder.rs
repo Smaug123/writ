@@ -19,6 +19,7 @@
 //! across arbitrary read boundaries.
 
 use std::io::{Read, Seek, SeekFrom};
+use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -33,6 +34,11 @@ use crate::core::SessionId;
 const MAX_FORWARDED_LINE_BYTES: usize = 16 * 1024;
 /// Appended to a forwarded line that was truncated at [`MAX_FORWARDED_LINE_BYTES`].
 const TRUNCATION_MARKER: &str = "…[writ: broker log line truncated]";
+/// Bytes read from the broker log per read syscall batch. The log path is on a
+/// mount the broker VM can write, so this bounds host memory even if a
+/// misbehaving/compromised broker writes far past its own [`crate::telemetry`]
+/// cap; a backlog is drained across several bounded reads.
+const MAX_READ_CHUNK_BYTES: u64 = 1024 * 1024;
 
 /// A running tail of one broker VM's log file. Drop-safe: dropping aborts the
 /// task without a final drain, so prefer [`Self::drain_and_stop`] on teardown.
@@ -51,9 +57,9 @@ impl BrokerLogForwarder {
             let mut offset: u64 = 0;
             let mut reassembler = LineReassembler::default();
             loop {
-                for line in read_new_lines(&path, &mut offset, &mut reassembler) {
-                    forward_line(session_id, &line);
-                }
+                drain_into(&path, &mut offset, &mut reassembler, |line| {
+                    forward_line(session_id, line)
+                });
                 tokio::select! {
                     _ = stop_task.notified() => break,
                     _ = tokio::time::sleep(poll_interval) => {}
@@ -61,9 +67,9 @@ impl BrokerLogForwarder {
             }
             // Final drain: capture anything written between the last poll and
             // stop (typically the failure that triggered teardown).
-            for line in read_new_lines(&path, &mut offset, &mut reassembler) {
-                forward_line(session_id, &line);
-            }
+            drain_into(&path, &mut offset, &mut reassembler, |line| {
+                forward_line(session_id, line)
+            });
         });
         Self { stop, handle }
     }
@@ -76,18 +82,41 @@ impl BrokerLogForwarder {
     }
 }
 
-/// Read from `offset` to the current end of `path`, advance `offset`, and return
-/// every complete line the new bytes complete. A missing/unreadable file yields
-/// nothing (the broker may not have created it yet). `offset` only advances, so
-/// the append-only file is never re-read.
-fn read_new_lines(
+/// Open the broker log for reading, refusing to follow symlinks or read
+/// anything but a regular file.
+///
+/// The log path lives on a mount the broker VM can write, so it is untrusted
+/// input (see [`crate::broker_vm::BROKER_VM_SESSION_DIR`], mounted read-write).
+/// `O_NOFOLLOW` fails the open if the final component is a symlink (so the host
+/// can't be steered into reading a host file), and `O_NONBLOCK` keeps the open
+/// from blocking on a FIFO; the `is_file` check then rejects FIFOs/devices. A
+/// missing file (the broker may not have created it yet) is a plain `None`.
+fn open_regular_no_follow(path: &Path) -> Option<std::fs::File> {
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .ok()?;
+    if !file.metadata().ok()?.file_type().is_file() {
+        return None;
+    }
+    Some(file)
+}
+
+/// Read from `offset` to the current end of `path` and emit every complete line
+/// the new bytes complete, advancing `offset`. A missing/unreadable/non-regular
+/// path emits nothing. Reads are chunked at [`MAX_READ_CHUNK_BYTES`] and the
+/// full backlog is drained (looping) so a bounded per-read never loses the tail,
+/// while host memory stays bounded regardless of the file's size.
+fn drain_into(
     path: &Path,
     offset: &mut u64,
     reassembler: &mut LineReassembler,
-) -> Vec<Vec<u8>> {
-    let mut file = match std::fs::File::open(path) {
-        Ok(file) => file,
-        Err(_) => return Vec::new(),
+    mut emit: impl FnMut(&[u8]),
+) {
+    let mut file = match open_regular_no_follow(path) {
+        Some(file) => file,
+        None => return,
     };
     // If the file shrank below our offset it was truncated/rewritten — e.g. a
     // reused session staging dir whose stale log the broker truncated on open.
@@ -98,15 +127,29 @@ fn read_new_lines(
         *offset = 0;
         reassembler.partial.clear();
     }
-    if file.seek(SeekFrom::Start(*offset)).is_err() {
-        return Vec::new();
+    loop {
+        if file.seek(SeekFrom::Start(*offset)).is_err() {
+            return;
+        }
+        let mut buf = Vec::new();
+        let read = (&mut file).take(MAX_READ_CHUNK_BYTES).read_to_end(&mut buf);
+        let n = match read {
+            Ok(n) => n,
+            Err(_) => return,
+        };
+        if n == 0 {
+            return;
+        }
+        *offset += n as u64;
+        for line in reassembler.push(&buf) {
+            emit(&line);
+        }
+        // A short read means we reached EOF; a full chunk means there may be
+        // more backlog, so keep draining.
+        if (n as u64) < MAX_READ_CHUNK_BYTES {
+            return;
+        }
     }
-    let mut buf = Vec::new();
-    match file.read_to_end(&mut buf) {
-        Ok(n) => *offset += n as u64,
-        Err(_) => return Vec::new(),
-    }
-    reassembler.push(&buf)
 }
 
 /// Re-emit one broker line into the host's tracing, preserving its level and
@@ -234,37 +277,45 @@ mod tests {
         assert!(out[..out.len() - TRUNCATION_MARKER.len()].chars().count() > 0);
     }
 
+    /// Drain `path` and collect the emitted lines (tests exercise the pure
+    /// read/reassemble logic without a tracing subscriber).
+    fn collect(path: &Path, offset: &mut u64, reasm: &mut LineReassembler) -> Vec<Vec<u8>> {
+        let mut got = Vec::new();
+        drain_into(path, offset, reasm, |line| got.push(line.to_vec()));
+        got
+    }
+
     #[test]
-    fn read_new_lines_advances_offset_across_partial_reads() {
+    fn drain_advances_offset_across_partial_reads() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("broker.log");
         let mut offset = 0u64;
         let mut reasm = LineReassembler::default();
 
         // Missing file yields nothing.
-        assert!(read_new_lines(&path, &mut offset, &mut reasm).is_empty());
+        assert!(collect(&path, &mut offset, &mut reasm).is_empty());
 
         std::fs::write(&path, b"a\nb\n").unwrap();
         assert_eq!(
-            read_new_lines(&path, &mut offset, &mut reasm),
+            collect(&path, &mut offset, &mut reasm),
             vec![b"a".to_vec(), b"b".to_vec()]
         );
         assert_eq!(offset, 4);
 
         // A line split across two reads: the partial is held until its newline.
         std::fs::write(&path, b"a\nb\nc").unwrap();
-        assert!(read_new_lines(&path, &mut offset, &mut reasm).is_empty());
+        assert!(collect(&path, &mut offset, &mut reasm).is_empty());
         assert_eq!(offset, 5);
         std::fs::write(&path, b"a\nb\nc\nd\n").unwrap();
         assert_eq!(
-            read_new_lines(&path, &mut offset, &mut reasm),
+            collect(&path, &mut offset, &mut reasm),
             vec![b"c".to_vec(), b"d".to_vec()]
         );
         assert_eq!(offset, 8);
     }
 
     #[test]
-    fn read_new_lines_restarts_after_truncation() {
+    fn drain_restarts_after_truncation() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("broker.log");
         let mut offset = 0u64;
@@ -273,7 +324,7 @@ mod tests {
         // A stale log (with a dangling partial) from a prior attempt.
         std::fs::write(&path, b"old1\nold2\npart").unwrap();
         assert_eq!(
-            read_new_lines(&path, &mut offset, &mut reasm),
+            collect(&path, &mut offset, &mut reasm),
             vec![b"old1".to_vec(), b"old2".to_vec()]
         );
         assert_eq!(offset, 14);
@@ -283,10 +334,55 @@ mod tests {
         // does not prepend to the new content).
         std::fs::write(&path, b"new\n").unwrap();
         assert_eq!(
-            read_new_lines(&path, &mut offset, &mut reasm),
+            collect(&path, &mut offset, &mut reasm),
             vec![b"new".to_vec()]
         );
         assert_eq!(offset, 4);
+    }
+
+    #[test]
+    fn drain_refuses_to_follow_a_symlink_to_a_host_file() {
+        // The broker-writable log path must never let the host read an arbitrary
+        // file it points a symlink at.
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("host-secret");
+        std::fs::write(&victim, b"top-secret\n").unwrap();
+        let log = dir.path().join("broker.log");
+        std::os::unix::fs::symlink(&victim, &log).unwrap();
+
+        let mut offset = 0u64;
+        let mut reasm = LineReassembler::default();
+        assert!(
+            collect(&log, &mut offset, &mut reasm).is_empty(),
+            "must not follow a symlink to a host file"
+        );
+        assert_eq!(offset, 0);
+
+        // A fresh regular file at the same path is read normally.
+        std::fs::remove_file(&log).unwrap();
+        std::fs::write(&log, b"real\n").unwrap();
+        assert_eq!(
+            collect(&log, &mut offset, &mut reasm),
+            vec![b"real".to_vec()]
+        );
+    }
+
+    #[test]
+    fn drain_reads_a_backlog_larger_than_one_chunk() {
+        // A backlog exceeding MAX_READ_CHUNK_BYTES is drained fully (looping)
+        // without loading it all at once.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("broker.log");
+        let line_count = 4;
+        let filler = "x".repeat(MAX_READ_CHUNK_BYTES as usize / 2);
+        let content: String = (0..line_count).map(|_| format!("{filler}\n")).collect();
+        std::fs::write(&path, content.as_bytes()).unwrap();
+
+        let mut offset = 0u64;
+        let mut reasm = LineReassembler::default();
+        let got = collect(&path, &mut offset, &mut reasm);
+        assert_eq!(got.len(), line_count);
+        assert_eq!(offset, content.len() as u64);
     }
 
     #[tokio::test]

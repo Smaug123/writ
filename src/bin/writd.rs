@@ -93,13 +93,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             log_file,
         }) => {
             writ::telemetry::init_with_file("info", log_file.as_deref())?;
-            run_broker(BrokerArgs {
+            // Log any broker failure via `tracing` before returning: telemetry
+            // (with the file sink) is installed, so this reaches the host tailer.
+            // A bare `?` would instead print only to the guest's stderr, leaving
+            // early startup failures (bad config, missing store, bind error)
+            // looking like a silent ready-file timeout on the host.
+            if let Err(err) = run_broker(BrokerArgs {
                 config,
                 session_spec,
                 bearer_token_file,
                 ready_file,
             })
-            .await?;
+            .await
+            {
+                tracing::error!(error = %err, "writd broker exited with error");
+                return Err(err.into());
+            }
             return Ok(());
         }
         None => {}
