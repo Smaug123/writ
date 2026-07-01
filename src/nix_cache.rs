@@ -34,6 +34,7 @@ pub struct NixNarSize(u64);
 pub enum NixNarCompression {
     None,
     Xz,
+    Zstd,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
@@ -530,6 +531,7 @@ impl NixNarCompression {
         match raw {
             "none" => Ok(Self::None),
             "xz" => Ok(Self::Xz),
+            "zstd" => Ok(Self::Zstd),
             _ => Err(NixNarCompressionError::Unsupported),
         }
     }
@@ -538,6 +540,7 @@ impl NixNarCompression {
         match self {
             Self::None => "none",
             Self::Xz => "xz",
+            Self::Zstd => "zstd",
         }
     }
 }
@@ -1938,6 +1941,24 @@ mod tests {
         assert_eq!(parsed.nar_size().get(), 120);
         assert_eq!(parsed.references().iter().count(), 0);
         assert_eq!(parsed.signatures()[0].key_name(), "cache.example");
+    }
+
+    #[test]
+    fn nar_compression_parses_supported_values_and_round_trips() {
+        for (raw, parsed) in [
+            ("none", NixNarCompression::None),
+            ("xz", NixNarCompression::Xz),
+            ("zstd", NixNarCompression::Zstd),
+        ] {
+            assert_eq!(NixNarCompression::new(raw), Ok(parsed));
+            assert_eq!(parsed.as_str(), raw);
+        }
+        // Compression is not part of the signed fingerprint, so switching the
+        // upstream to zstd is admitted (and typed as such) exactly like xz.
+        assert_eq!(
+            NixNarCompression::new("bzip2"),
+            Err(NixNarCompressionError::Unsupported),
+        );
     }
 
     #[test]

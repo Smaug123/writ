@@ -31,6 +31,7 @@ host = [
     "dep:ssh-key",
     "dep:subtle",
     "dep:xz2",
+    "dep:zstd",
 ]
 vm-client = ["dep:base64", "dep:reqwest", "dep:ring", "dep:writ-vm-git"]
 
@@ -85,6 +86,7 @@ http-body-util = { version = "0.1", optional = true }
 bytes = { version = "1", optional = true }
 futures-util = { version = "0.3", default-features = false, optional = true }
 xz2 = { version = "0.1", features = ["static"], optional = true }
+zstd = { version = "0.13", optional = true }
 libc = "0.2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt", "json", "std"] }

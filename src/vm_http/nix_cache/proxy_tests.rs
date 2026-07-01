@@ -623,6 +623,77 @@ async fn nix_cache_nar_route_verifies_uncompressed_nar_body() {
 }
 
 #[tokio::test]
+async fn nix_cache_nar_route_verifies_zstd_nar_body() {
+    let upstream = MockServer::start().await;
+    let state = make_broker_state(&upstream);
+    let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+    open_audit_session(&state, session.session_id());
+    let key_pair = test_ed25519_key_pair();
+    let trusted_key = trusted_public_key_for_test(TEST_SIGNING_KEY_NAME, &key_pair);
+    let hash = "00000000000000000000000000000000";
+    let nar_file = "closure.nar.zst";
+    let raw_body = test_raw_nar_body();
+    let nar_body = test_zstd_nar_body();
+    let narinfo = signed_test_narinfo(
+        &key_pair,
+        hash,
+        "closure",
+        nar_file,
+        NixNarCompression::Zstd,
+        &nar_hash_for_body(&raw_body),
+        raw_body.len() as u64,
+    );
+    Mock::given(method("GET"))
+        .and(path(format!("/{hash}.narinfo")))
+        .respond_with(ResponseTemplate::new(200).set_body_string(narinfo))
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/nar/{nar_file}")))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Content-Type", "application/x-nix-nar")
+                .set_body_bytes(nar_body.clone()),
+        )
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    let service = signed_nix_cache_service_for_test_with_key(&state, &upstream, trusted_key, 1024);
+
+    let narinfo_response = route_nix_cache_with_service(
+        &session,
+        "GET",
+        format!("{VM_NIX_CACHE_PATH_PREFIX}/{hash}.narinfo"),
+        service.clone(),
+    )
+    .await;
+    let nar_response = route_nix_cache_with_service(
+        &session,
+        "GET",
+        format!("{VM_NIX_CACHE_PATH_PREFIX}/nar/{nar_file}"),
+        service,
+    )
+    .await;
+
+    assert_eq!(narinfo_response.status, VmHttpStatus::Ok);
+    assert_eq!(nar_response.status, VmHttpStatus::Ok);
+    assert_eq!(nar_response.content_type, "application/x-nix-nar");
+    // The broker verifies the decompressed NAR but forwards the still-zstd bytes
+    // for the guest's own Nix to decompress.
+    assert_eq!(nar_response.content_length, Some(nar_body.len() as u64));
+    assert_eq!(nar_response.body, nar_body);
+    let entries = state
+        .audit
+        .list_nix_cache_requests_for_session(session.session_id())
+        .unwrap();
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[1].route, NixCacheAuditRoute::Nar);
+    assert_eq!(entries[1].decision, NixCacheAuditDecision::Allow);
+    assert_eq!(entries[1].error, None);
+}
+
+#[tokio::test]
 async fn nix_cache_nar_route_rejects_hash_mismatch_before_forwarding_body() {
     let upstream = MockServer::start().await;
     let state = make_broker_state(&upstream);
