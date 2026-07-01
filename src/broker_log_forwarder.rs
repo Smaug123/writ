@@ -39,12 +39,29 @@ const TRUNCATION_MARKER: &str = "…[writ: broker log line truncated]";
 /// misbehaving/compromised broker writes far past its own [`crate::telemetry`]
 /// cap; a backlog is drained across several bounded reads.
 const MAX_READ_CHUNK_BYTES: u64 = 1024 * 1024;
+/// Upper bound on bytes a single [`drain_into`] call will read. Covers a full
+/// (8 MiB-capped) broker log in one go, but stops a broker that *keeps*
+/// appending from making one drain run forever — critical because teardown
+/// awaits the final drain, so an unbounded drain would let a wedged/hostile
+/// broker VM block its own `writ agent-vm stop`. Overflow is picked up by the
+/// next poll (or dropped, for a final drain).
+const MAX_DRAIN_BYTES_PER_CALL: u64 = 16 * 1024 * 1024;
 
 /// A running tail of one broker VM's log file. Drop-safe: dropping aborts the
-/// task without a final drain, so prefer [`Self::drain_and_stop`] on teardown.
+/// tail task (a plain `JoinHandle` drop would *detach* it, leaking a poll loop),
+/// so a dropped daemon can't strand forwarders. Prefer [`Self::drain_and_stop`]
+/// on teardown to capture the final lines before stopping.
 pub struct BrokerLogForwarder {
     stop: Arc<Notify>,
-    handle: JoinHandle<()>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl Drop for BrokerLogForwarder {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+        }
+    }
 }
 
 impl BrokerLogForwarder {
@@ -71,14 +88,20 @@ impl BrokerLogForwarder {
                 forward_line(session_id, line)
             });
         });
-        Self { stop, handle }
+        Self {
+            stop,
+            handle: Some(handle),
+        }
     }
 
-    /// Signal the tail to stop, let it do one last drain, and await it. Used on
-    /// both the success-teardown and failure paths.
-    pub async fn drain_and_stop(self) {
+    /// Signal the tail to stop, let it do one last (bounded) drain, and await it.
+    /// Used on both the success-teardown and failure paths. Taking the handle
+    /// here means the `Drop` abort afterwards is a no-op on the finished task.
+    pub async fn drain_and_stop(mut self) {
         self.stop.notify_one();
-        let _ = self.handle.await;
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.await;
+        }
     }
 }
 
@@ -127,12 +150,14 @@ fn drain_into(
         *offset = 0;
         reassembler.partial.clear();
     }
-    loop {
+    let mut remaining = MAX_DRAIN_BYTES_PER_CALL;
+    while remaining > 0 {
         if file.seek(SeekFrom::Start(*offset)).is_err() {
             return;
         }
+        let want = MAX_READ_CHUNK_BYTES.min(remaining);
         let mut buf = Vec::new();
-        let read = (&mut file).take(MAX_READ_CHUNK_BYTES).read_to_end(&mut buf);
+        let read = (&mut file).take(want).read_to_end(&mut buf);
         let n = match read {
             Ok(n) => n,
             Err(_) => return,
@@ -141,12 +166,15 @@ fn drain_into(
             return;
         }
         *offset += n as u64;
+        remaining -= n as u64;
         for line in reassembler.push(&buf) {
             emit(&line);
         }
-        // A short read means we reached EOF; a full chunk means there may be
-        // more backlog, so keep draining.
-        if (n as u64) < MAX_READ_CHUNK_BYTES {
+        // A read shorter than we asked for means EOF (no more backlog now); a
+        // full read may mean more remains, so keep draining until the per-call
+        // budget is spent. Returning at the budget bounds the work a broker that
+        // keeps appending can impose on one drain (and thus on teardown).
+        if (n as u64) < want {
             return;
         }
     }
@@ -394,6 +422,35 @@ mod tests {
         let mut reasm = LineReassembler::default();
         let got = collect(&path, &mut offset, &mut reasm);
         assert_eq!(got.len(), line_count);
+        assert_eq!(offset, content.len() as u64);
+    }
+
+    #[test]
+    fn drain_bounds_bytes_read_per_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("broker.log");
+        // A backlog larger than the per-call budget, as a broker that keeps
+        // appending would produce.
+        let line = format!("{}\n", "a".repeat(MAX_READ_CHUNK_BYTES as usize - 1)); // 1 MiB
+        let lines = (MAX_DRAIN_BYTES_PER_CALL / MAX_READ_CHUNK_BYTES) as usize + 2;
+        let content = line.repeat(lines);
+        std::fs::write(&path, content.as_bytes()).unwrap();
+
+        let mut offset = 0u64;
+        let mut reasm = LineReassembler::default();
+        // One call is bounded — it can't read the whole oversized backlog, so it
+        // (and the teardown awaiting it) can't be wedged by an appending broker.
+        let _ = collect(&path, &mut offset, &mut reasm);
+        assert!(
+            offset <= MAX_DRAIN_BYTES_PER_CALL,
+            "one drain read {offset} bytes, over the per-call budget"
+        );
+        // Subsequent calls make progress and eventually reach EOF.
+        while offset < content.len() as u64 {
+            let before = offset;
+            let _ = collect(&path, &mut offset, &mut reasm);
+            assert!(offset > before, "drain must make progress");
+        }
         assert_eq!(offset, content.len() as u64);
     }
 
