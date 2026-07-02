@@ -10,11 +10,11 @@
 //! captured stdout pipe open.
 //!
 //! This module is that shared core. Callers own the policy: they build the
-//! [`Command`] (program, argv, env, cwd, stdin/stderr) and map the
+//! [`Command`] (program, argv, env, cwd, stdin) and map the
 //! program-agnostic [`SupervisorError`] into their own step-tagged error
 //! types. The supervisor owns only the parts that are subtle and must not
 //! diverge between callers: the race-free `waitid(WNOWAIT)` observation, the
-//! process-group kill, and the stdout drain.
+//! process-group kill, and the stdout/stderr drains.
 
 use std::mem::MaybeUninit;
 use std::path::{Path, PathBuf};
@@ -27,14 +27,33 @@ use crate::process_spawn;
 
 const CHILD_EXIT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
+/// Upper bound on captured stderr. A [`StderrMode::Capture`] child's stderr is
+/// drained to EOF (so it never stalls on a full pipe) but only a line-aligned
+/// tail of at most this many bytes is retained: a verbose or hostile child
+/// cannot make the host buffer unbounded diagnostics, and a tool's fatal
+/// message is typically its last line, so the tail is the informative part.
+const STDERR_CAPTURE_TAIL_CAP: usize = 8 * 1024;
+
 /// Whether the supervisor should capture the child's stdout or discard it.
 ///
-/// Stderr and stdin are the caller's responsibility (set on the [`Command`]
-/// before calling [`run_supervised`]); the supervisor only manages stdout
-/// because it is the channel whose pipe it must drain to avoid a deadlock
-/// against a child that writes more than one pipe buffer's worth.
+/// Stdin is the caller's responsibility (set on the [`Command`] before calling
+/// [`run_supervised`]); the supervisor manages stdout and stderr because those
+/// are the channels whose pipes it must drain to avoid a deadlock against a
+/// child that writes more than one pipe buffer's worth.
 #[derive(Copy, Clone)]
 pub(crate) enum StdoutMode {
+    Discard,
+    Capture,
+}
+
+/// Whether the supervisor should capture the child's stderr or discard it.
+///
+/// Capture is bounded (see [`STDERR_CAPTURE_TAIL_CAP`]) and tail-biased, so it
+/// is safe even against a child that streams unbounded diagnostics. Callers
+/// that must not retain any child diagnostics at all (e.g. a hostile flake
+/// evaluation) pass [`StderrMode::Discard`].
+#[derive(Copy, Clone)]
+pub(crate) enum StderrMode {
     Discard,
     Capture,
 }
@@ -44,7 +63,18 @@ pub(crate) enum StdoutMode {
 /// reported as [`SupervisedOutcome::Exited`] with the failing status, so the
 /// caller decides whether a non-success exit is fatal for its flow.
 pub(crate) enum SupervisedOutcome {
-    Exited { status: ExitStatus, stdout: Vec<u8> },
+    Exited {
+        status: ExitStatus,
+        stdout: Vec<u8>,
+        /// Line-aligned tail-capped stderr when the run used
+        /// [`StderrMode::Capture`], empty under [`StderrMode::Discard`]. Not yet
+        /// redacted — a caller that may have bound a secret into the child's
+        /// environment must sanitise this before surfacing it. The line
+        /// alignment guarantees truncation can only strand *complete* lines, so
+        /// a caller redacting per line/segment need never chase a mid-line
+        /// fragment left by the cap.
+        stderr: Vec<u8>,
+    },
     TimedOut,
 }
 
@@ -79,18 +109,24 @@ pub(crate) enum SupervisorError {
 /// exit, then SIGKILL the whole group regardless of outcome.
 ///
 /// The caller must have fully configured `command` (program, argv, env, cwd,
-/// stdin, stderr) *except* stdout and the process group, which this function
-/// sets from `stdout_mode` and `process_group(0)` so the kill-the-group
-/// contract holds. The returned [`SupervisedOutcome`] distinguishes a clean
-/// exit (with its status and any captured stdout) from a timeout.
+/// stdin) *except* stdout, stderr, and the process group, which this function
+/// sets from `stdout_mode`/`stderr_mode` and `process_group(0)` so the
+/// kill-the-group contract holds. The returned [`SupervisedOutcome`]
+/// distinguishes a clean exit (with its status and any captured stdout/stderr)
+/// from a timeout.
 pub(crate) async fn run_supervised(
     command: &mut Command,
     timeout: Duration,
     stdout_mode: StdoutMode,
+    stderr_mode: StderrMode,
 ) -> Result<SupervisedOutcome, SupervisorError> {
     command.stdout(match stdout_mode {
         StdoutMode::Discard => Stdio::null(),
         StdoutMode::Capture => Stdio::piped(),
+    });
+    command.stderr(match stderr_mode {
+        StderrMode::Discard => Stdio::null(),
+        StderrMode::Capture => Stdio::piped(),
     });
     command.process_group(0);
 
@@ -99,13 +135,12 @@ pub(crate) async fn run_supervised(
         .map_err(SupervisorError::Spawn)?;
     let pid = child.id().ok_or(SupervisorError::MissingProcessId)?;
     let pgid = process_group_id(pid)?;
-    // Drain stdout concurrently with the child's lifetime so a child that
-    // writes more than one pipe buffer's worth before we reach `wait()`
-    // cannot stall on a full pipe. The drain task only reaches EOF once
-    // every fd pointing at the write end is closed — that includes any
-    // helper the tool forked into the same process group, so we rely on the
-    // group SIGKILL further down to close inherited stdouts when the leader
-    // has exited.
+    // Drain stdout/stderr concurrently with the child's lifetime so a child
+    // that writes more than one pipe buffer's worth before we reach `wait()`
+    // cannot stall on a full pipe. A drain task only reaches EOF once every fd
+    // pointing at the write end is closed — that includes any helper the tool
+    // forked into the same process group, so we rely on the group SIGKILL
+    // further down to close inherited pipes when the leader has exited.
     let stdout_drain = match stdout_mode {
         StdoutMode::Discard => None,
         StdoutMode::Capture => {
@@ -121,6 +156,19 @@ pub(crate) async fn run_supervised(
             }))
         }
     };
+    let stderr_drain = match stderr_mode {
+        StderrMode::Discard => None,
+        StderrMode::Capture => {
+            let stderr = child
+                .stderr
+                .take()
+                .expect("stderr was configured as Stdio::piped()");
+            Some(tokio::spawn(drain_to_tail_cap(
+                stderr,
+                STDERR_CAPTURE_TAIL_CAP,
+            )))
+        }
+    };
     let mut cleanup_guard = ProcessGroupCleanupGuard::new(pgid);
     match wait_for_child_exit_before_reap(pgid, timeout).await? {
         ChildExitObservation::Exited => {
@@ -133,7 +181,15 @@ pub(crate) async fn run_supervised(
                 Some(handle) => handle.await.unwrap_or_default(),
                 None => Vec::new(),
             };
-            Ok(SupervisedOutcome::Exited { status, stdout })
+            let stderr = match stderr_drain {
+                Some(handle) => handle.await.unwrap_or_default(),
+                None => Vec::new(),
+            };
+            Ok(SupervisedOutcome::Exited {
+                status,
+                stdout,
+                stderr,
+            })
         }
         ChildExitObservation::TimedOut => {
             cleanup_guard.kill_now()?;
@@ -142,9 +198,62 @@ pub(crate) async fn run_supervised(
             if let Some(handle) = stdout_drain {
                 let _ = handle.await;
             }
+            if let Some(handle) = stderr_drain {
+                let _ = handle.await;
+            }
             Ok(SupervisedOutcome::TimedOut)
         }
     }
+}
+
+/// Drain `reader` to EOF, retaining a line-aligned tail of at most `cap` bytes.
+///
+/// The whole stream is consumed so the child never stalls on a full pipe, but
+/// memory stays bounded by `cap` (plus one read chunk): a verbose or hostile
+/// child cannot make the host buffer unbounded output. The tail is kept
+/// because a tool's fatal message is typically its last output. When the cap
+/// truncates the head, the retained tail's first (partial) line is dropped so
+/// every retained line is complete — see the body for why that soundness
+/// property matters to a downstream secret redactor. Read errors end the drain
+/// with whatever was accumulated so far, matching the best-effort
+/// `read_to_end` used for stdout.
+async fn drain_to_tail_cap<R>(mut reader: R, cap: usize) -> Vec<u8>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 8192];
+    let mut truncated = false;
+    loop {
+        match reader.read(&mut chunk).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                buf.extend_from_slice(&chunk[..n]);
+                if buf.len() > cap {
+                    let excess = buf.len() - cap;
+                    buf.drain(..excess);
+                    truncated = true;
+                }
+            }
+        }
+    }
+    // On truncation the retained tail begins at an arbitrary byte, so its first
+    // line is a partial fragment of whatever preceded the cap. Drop it so every
+    // retained line is complete. This is what keeps a downstream redactor sound:
+    // a secret (a git token — no embedded newline) that straddled the cap would
+    // otherwise survive as an unredactable partial fragment at the front. The
+    // cost is one already-incomplete line. When the whole tail is one unbroken
+    // line (no newline at all), it is dropped entirely — safe over sorry.
+    if truncated {
+        match buf.iter().position(|&b| b == b'\n') {
+            Some(newline) => {
+                buf.drain(..=newline);
+            }
+            None => buf.clear(),
+        }
+    }
+    buf
 }
 
 /// Resolve a program to an executable, canonicalised path the same way the
@@ -351,4 +460,140 @@ fn kill_process_group_inner(
         return Ok(());
     }
     Err(SupervisorError::KillProcessGroup { pgid, source })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Locate an executable on `PATH`, preserving the caller-visible path so
+    /// the basename survives `execve` (mirrors the clean_git test helper).
+    fn locate_on_path(name: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = std::env::var_os("PATH").expect("PATH must be set in tests");
+        for dir in std::env::split_paths(&path) {
+            let candidate = dir.join(name);
+            if let Ok(meta) = std::fs::metadata(&candidate)
+                && meta.is_file()
+                && (meta.permissions().mode() & 0o111) != 0
+            {
+                return candidate;
+            }
+        }
+        panic!("required test tool {name} not found on PATH");
+    }
+
+    #[tokio::test]
+    async fn drain_to_tail_cap_keeps_all_when_under_cap() {
+        // No truncation: content passes through verbatim, even without a
+        // trailing newline and even with no newline at all.
+        let data = b"short output".to_vec();
+        let out = drain_to_tail_cap(&data[..], 4096).await;
+        assert_eq!(out, data);
+    }
+
+    #[tokio::test]
+    async fn drain_to_tail_cap_drops_partial_leading_line_on_truncation() {
+        // The last `cap` bytes of "aaaa\nbbbb\ncccc\n" are "bb\ncccc\n"; the
+        // leading "bb" is a fragment of a truncated line and must be dropped so
+        // only complete lines remain (the property a redactor relies on).
+        let data = b"aaaa\nbbbb\ncccc\n".to_vec();
+        let out = drain_to_tail_cap(&data[..], 8).await;
+        assert_eq!(out, b"cccc\n");
+    }
+
+    #[tokio::test]
+    async fn drain_to_tail_cap_clears_when_truncated_tail_has_no_newline() {
+        // A single unbroken over-cap line has no complete line to keep, so the
+        // whole (necessarily partial) tail is dropped rather than surfaced.
+        let data = b"aaaaaaaaaa".to_vec();
+        let out = drain_to_tail_cap(&data[..], 4).await;
+        assert!(out.is_empty(), "expected empty, got {out:?}");
+    }
+
+    #[tokio::test]
+    async fn captures_stdout_and_stderr_on_nonzero_exit() {
+        let mut command = Command::new(locate_on_path("sh"));
+        command.arg("-c").arg("printf out; printf err 1>&2; exit 3");
+        let outcome = run_supervised(
+            &mut command,
+            Duration::from_secs(10),
+            StdoutMode::Capture,
+            StderrMode::Capture,
+        )
+        .await
+        .expect("supervised sh run");
+        match outcome {
+            SupervisedOutcome::Exited {
+                status,
+                stdout,
+                stderr,
+            } => {
+                assert_eq!(status.code(), Some(3));
+                assert_eq!(stdout, b"out");
+                assert_eq!(stderr, b"err");
+            }
+            SupervisedOutcome::TimedOut => panic!("sh exited well within the timeout"),
+        }
+    }
+
+    #[tokio::test]
+    async fn discarded_stderr_is_empty() {
+        let mut command = Command::new(locate_on_path("sh"));
+        command.arg("-c").arg("printf noise 1>&2; exit 0");
+        let outcome = run_supervised(
+            &mut command,
+            Duration::from_secs(10),
+            StdoutMode::Discard,
+            StderrMode::Discard,
+        )
+        .await
+        .expect("supervised sh run");
+        match outcome {
+            SupervisedOutcome::Exited { stderr, .. } => assert!(stderr.is_empty()),
+            SupervisedOutcome::TimedOut => panic!("sh exited well within the timeout"),
+        }
+    }
+
+    #[tokio::test]
+    async fn captured_stderr_is_tail_capped_against_a_verbose_child() {
+        // A child that streams far more than the cap must not stall (its stderr
+        // is fully drained) and must not blow the bound (only the tail is kept),
+        // while the final complete line — the informative fatal message — and
+        // the line alignment both survive.
+        let mut command = Command::new(locate_on_path("sh"));
+        command.arg("-c").arg(format!(
+            "i=0; while [ $i -lt {n} ]; do printf 'noise-line-padding\\n' 1>&2; i=$((i+1)); done; printf 'fatal: the-tail\\n' 1>&2; exit 1",
+            n = (STDERR_CAPTURE_TAIL_CAP / 19) + 500,
+        ));
+        let outcome = run_supervised(
+            &mut command,
+            Duration::from_secs(30),
+            StdoutMode::Discard,
+            StderrMode::Capture,
+        )
+        .await
+        .expect("supervised sh run");
+        match outcome {
+            SupervisedOutcome::Exited { stderr, .. } => {
+                assert!(
+                    stderr.len() <= STDERR_CAPTURE_TAIL_CAP,
+                    "stderr {} exceeded cap {STDERR_CAPTURE_TAIL_CAP}",
+                    stderr.len()
+                );
+                assert!(
+                    stderr.ends_with(b"fatal: the-tail\n"),
+                    "the informative tail must be retained"
+                );
+                // Line alignment: the retained tail starts at a line boundary,
+                // never mid-line.
+                assert!(
+                    stderr.starts_with(b"noise-line-padding\n"),
+                    "the retained tail must begin on a line boundary, got {:?}",
+                    String::from_utf8_lossy(&stderr[..stderr.len().min(40)])
+                );
+            }
+            SupervisedOutcome::TimedOut => panic!("verbose child should still exit promptly"),
+        }
+    }
 }

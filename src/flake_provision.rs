@@ -67,7 +67,7 @@ use crate::core::{RequestId, SessionId, UnixMillis};
 use crate::flake_lock::{
     FlakeLock, FlakeLockError, FlakeProvisionBounds, FlakeProvisionPlan, FlakeProvisionPlanError,
 };
-use crate::process_supervisor::{self, StdoutMode, SupervisedOutcome};
+use crate::process_supervisor::{self, StderrMode, StdoutMode, SupervisedOutcome};
 
 const FLAKE_LOCK_FILE: &str = "flake.lock";
 
@@ -248,16 +248,18 @@ pub async fn provision_flake_inputs(
     // `credential.helper`) by walking up from the broker's cwd — the
     // `GIT_CONFIG_*` env only blocks system/global config, not repo-local.
     command.current_dir("/");
-    // nix's stderr is discarded: a hostile flake can spew unbounded diagnostics
-    // during evaluation, and capturing them to a file would let it fill the host
-    // temp volume despite the timeout. Failures report the exit status; an
-    // operator can re-run for detail.
-    command.stderr(Stdio::null());
-    // The supervisor sets stdout + the process group, bounds the wall-clock,
-    // and SIGKILLs the group on exit or timeout.
-    let outcome =
-        process_supervisor::run_supervised(&mut command, bounds.timeout(), StdoutMode::Discard)
-            .await;
+    // The supervisor sets stdout, stderr, and the process group, bounds the
+    // wall-clock, and SIGKILLs the group on exit or timeout. nix's stderr is
+    // discarded (`StderrMode::Discard`): a hostile flake can spew unbounded
+    // diagnostics during evaluation, so we never retain them. Failures report
+    // the exit status; an operator can re-run for detail.
+    let outcome = process_supervisor::run_supervised(
+        &mut command,
+        bounds.timeout(),
+        StdoutMode::Discard,
+        StderrMode::Discard,
+    )
+    .await;
 
     cleanup_home_dir(&home_dir);
 

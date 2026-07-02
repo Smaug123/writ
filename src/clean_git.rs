@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use tokio::process::Command;
 
-use crate::process_supervisor::{self, StdoutMode, SupervisedOutcome, SupervisorError};
+use crate::process_supervisor::{self, StderrMode, StdoutMode, SupervisedOutcome, SupervisorError};
 
 /// Environment variables prepended to every clean-Git invocation.
 ///
@@ -71,8 +71,15 @@ pub(crate) enum CleanGitError {
     Wait(std::io::Error),
     #[error("Git command timed out after {0:?}")]
     TimedOut(Duration),
-    #[error("Git command failed with status {0}")]
-    Failed(ExitStatus),
+    #[error("Git command failed with status {status}: {stderr}")]
+    Failed {
+        status: ExitStatus,
+        /// The child's captured stderr, tail-capped and with any bound secret
+        /// redacted (see [`sanitize_git_stderr`]). Carries the real diagnosis
+        /// (`Authentication failed`, `Could not resolve host`, …) that a bare
+        /// exit status hides.
+        stderr: String,
+    },
     #[error("Git command did not expose a child process id")]
     MissingProcessId,
     #[error("Git child process id {0} cannot be represented as a process group id")]
@@ -225,7 +232,6 @@ async fn run_clean_git_inner(
     command.env_clear();
     command.args(invocation.args());
     command.stdin(Stdio::null());
-    command.stderr(Stdio::null());
     command.current_dir(CLEAN_GIT_CURRENT_DIR);
     for env in invocation.env() {
         command.env(env.name(), env.value());
@@ -236,18 +242,68 @@ async fn run_clean_git_inner(
         }
     }
 
-    // The supervisor owns stdout disposition, the process group, the spawn,
-    // the timeout, and the group SIGKILL; this module keeps only the
+    // The supervisor owns stdout/stderr disposition, the process group, the
+    // spawn, the timeout, and the group SIGKILL; this module keeps only the
     // Git-specific environment hardening and the success/exit-status policy.
-    match process_supervisor::run_supervised(&mut command, timeout, stdout_mode).await? {
-        SupervisedOutcome::Exited { status, stdout } => {
+    // Stderr is captured so a failure surfaces git's real diagnosis rather than
+    // a bare exit code; it is sanitised (secret-redacted) before it escapes.
+    match process_supervisor::run_supervised(
+        &mut command,
+        timeout,
+        stdout_mode,
+        StderrMode::Capture,
+    )
+    .await?
+    {
+        SupervisedOutcome::Exited {
+            status,
+            stdout,
+            stderr,
+        } => {
             if status.success() {
                 Ok(stdout)
             } else {
-                Err(CleanGitError::Failed(status))
+                Err(CleanGitError::Failed {
+                    status,
+                    stderr: sanitize_git_stderr(&stderr, secret),
+                })
             }
         }
         SupervisedOutcome::TimedOut => Err(CleanGitError::TimedOut(timeout)),
+    }
+}
+
+/// Turn captured stderr bytes into a bounded, secret-free diagnostic string.
+///
+/// The bytes are a *line-aligned* tail-capped capture from the supervisor: on
+/// truncation the partial leading line is dropped, so every retained line is
+/// complete. Truncation can therefore strand a full trailing *segment* of the
+/// secret (a complete retained line) but never a mid-line fragment. We redact
+/// the whole secret **and each of its newline-delimited segments**, so the
+/// redaction is complete without assuming the secret is single-line — for the
+/// real credential (a newline-free git token) the only segment is the token
+/// itself, so this is exactly a token redaction; for any multi-line secret a
+/// retained complete segment is still removed.
+///
+/// Redacting the token is defence in depth (git's HTTPS transport takes it via
+/// the askpass helper and does not normally echo it, but a future flow or a
+/// helper that logs a credentialed URL must never leak it). We lossily decode,
+/// redact, and trim; an empty capture becomes a stable placeholder so the error
+/// `Display` stays readable.
+fn sanitize_git_stderr(stderr: &[u8], secret: Option<&str>) -> String {
+    let mut text = String::from_utf8_lossy(stderr).into_owned();
+    if let Some(secret) = secret {
+        for fragment in std::iter::once(secret).chain(secret.split('\n')) {
+            if !fragment.is_empty() {
+                text = text.replace(fragment, "<redacted>");
+            }
+        }
+    }
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        "<no stderr captured>".to_string()
+    } else {
+        trimmed.to_string()
     }
 }
 
@@ -409,5 +465,140 @@ mod tests {
                 "subprocess missing hardened env var {want}; observed output: {text:?}"
             );
         }
+    }
+
+    /// A non-zero exit surfaces the child's stderr in `CleanGitError::Failed`,
+    /// with any bound secret redacted — the whole point of capturing stderr is
+    /// that a failure carries its real diagnosis, and the whole risk is that
+    /// the diagnosis leaks a credential.
+    #[tokio::test]
+    async fn run_clean_git_failure_surfaces_redacted_stderr() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let sh = locate_on_path("sh");
+        let tempdir = tempfile::tempdir().expect("tempdir for fail probe");
+        let probe = tempdir.path().join("fail-probe");
+        // Echo a diagnostic that embeds the bound secret, then fail. `printf`
+        // is a shell builtin so this needs no PATH (env is cleared).
+        let script = format!(
+            "#!{}\nprintf 'fatal: boom for %s\\n' \"$SEKRIT\" 1>&2\nexit 7\n",
+            sh.display()
+        );
+        std::fs::write(&probe, script).expect("write fail probe");
+        let mut perms = std::fs::metadata(&probe).expect("probe meta").permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&probe, perms).expect("chmod fail probe");
+
+        let invocation = CleanGitInvocation::new(
+            probe,
+            std::iter::empty::<OsString>(),
+            clean_git_config_env(),
+            vec!["SEKRIT".to_string()],
+        );
+        let err = run_clean_git(&invocation, Duration::from_secs(10), Some("s3cr3t-token"))
+            .await
+            .expect_err("probe exits non-zero");
+        match err {
+            CleanGitError::Failed { status, stderr } => {
+                assert_eq!(status.code(), Some(7));
+                assert!(
+                    stderr.contains("fatal: boom"),
+                    "stderr diagnosis must be surfaced, got {stderr:?}"
+                );
+                assert!(
+                    !stderr.contains("s3cr3t-token"),
+                    "the bound secret must be redacted, got {stderr:?}"
+                );
+                assert!(
+                    stderr.contains("<redacted>"),
+                    "redaction marker expected, got {stderr:?}"
+                );
+            }
+            other => panic!("expected CleanGitError::Failed, got {other:?}"),
+        }
+    }
+
+    /// End-to-end guard against a secret leaking as a truncation-boundary
+    /// fragment: a child floods stderr so the bound secret sits on a single
+    /// over-cap line (its own line's start is truncated away). The supervisor's
+    /// line-aligned tail drops that partial line wholesale, so neither the
+    /// secret nor a fragment of it reaches the surfaced error — while the
+    /// trailing complete fatal line survives.
+    #[tokio::test]
+    async fn run_clean_git_does_not_leak_secret_at_the_truncation_boundary() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let sh = locate_on_path("sh");
+        let tempdir = tempfile::tempdir().expect("tempdir for flood probe");
+        let probe = tempdir.path().join("flood-probe");
+        // ~13 KiB of newline-free filler, then the secret (still on that same
+        // unbroken line), then a complete trailing line. The cap (8 KiB) lands
+        // inside the giant line, so the retained tail begins mid-line; alignment
+        // drops the whole line (secret and all).
+        let script = format!(
+            "#!{sh}\n\
+             i=0\n\
+             while [ $i -lt 1300 ]; do printf 'ABCDEFGHIJ' 1>&2; i=$((i+1)); done\n\
+             printf 'TOK-%s-END' \"$SEKRIT\" 1>&2\n\
+             printf '\\nfatal: boundary-test done\\n' 1>&2\n\
+             exit 5\n",
+            sh = sh.display()
+        );
+        std::fs::write(&probe, script).expect("write flood probe");
+        let mut perms = std::fs::metadata(&probe).expect("probe meta").permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&probe, perms).expect("chmod flood probe");
+
+        let invocation = CleanGitInvocation::new(
+            probe,
+            std::iter::empty::<OsString>(),
+            clean_git_config_env(),
+            vec!["SEKRIT".to_string()],
+        );
+        let secret = "s3cr3t-boundary-xyz";
+        let err = run_clean_git(&invocation, Duration::from_secs(20), Some(secret))
+            .await
+            .expect_err("probe exits non-zero");
+        match err {
+            CleanGitError::Failed { status, stderr } => {
+                assert_eq!(status.code(), Some(5));
+                assert!(
+                    !stderr.contains(secret),
+                    "the secret must not leak, got {stderr:?}"
+                );
+                // Even a fragment (the surrounding `TOK-...-END` marker) must be
+                // gone: the whole truncated line was dropped, not just the exact
+                // token redacted.
+                assert!(
+                    !stderr.contains("TOK-"),
+                    "no fragment of the truncated secret line may survive, got {stderr:?}"
+                );
+                assert!(
+                    stderr.contains("fatal: boundary-test done"),
+                    "the trailing complete line must survive, got {stderr:?}"
+                );
+            }
+            other => panic!("expected CleanGitError::Failed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sanitize_git_stderr_redacts_and_bounds() {
+        assert_eq!(
+            sanitize_git_stderr(b"  using tok=abc123 here \n", Some("abc123")),
+            "using tok=<redacted> here"
+        );
+        // No secret bound: content passes through trimmed.
+        assert_eq!(sanitize_git_stderr(b"fatal: nope\n", None), "fatal: nope");
+        // Empty secret is not redacted to a marker (would match everywhere).
+        assert_eq!(sanitize_git_stderr(b"hello", Some("")), "hello");
+        // Empty capture yields a stable placeholder.
+        assert_eq!(sanitize_git_stderr(b"   \n", None), "<no stderr captured>");
+        // Multi-line secret: a full trailing segment stranded on a retained
+        // line is redacted even though the whole secret string is not present.
+        assert_eq!(
+            sanitize_git_stderr(b"BBBB tail", Some("AAAA\nBBBB")),
+            "<redacted> tail"
+        );
     }
 }

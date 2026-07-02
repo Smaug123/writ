@@ -174,10 +174,14 @@ pub enum GitCloneBundleRunError {
         step: GitCloneCommandStep,
         timeout: Duration,
     },
-    #[error("{step} command failed with status {status}")]
+    #[error("{step} command failed with status {status}: {stderr}")]
     Failed {
         step: GitCloneCommandStep,
         status: ExitStatus,
+        /// git's captured stderr, tail-capped and secret-redacted by
+        /// `clean_git` — the real reason (auth, DNS, missing repo) behind the
+        /// exit status.
+        stderr: String,
     },
     #[error("{step} command did not expose a child process id")]
     MissingProcessId { step: GitCloneCommandStep },
@@ -646,7 +650,11 @@ fn translate_clean_git_error(
         CleanGitError::Spawn(source) => GitCloneBundleRunError::Spawn { step, source },
         CleanGitError::Wait(source) => GitCloneBundleRunError::Wait { step, source },
         CleanGitError::TimedOut(timeout) => GitCloneBundleRunError::TimedOut { step, timeout },
-        CleanGitError::Failed(status) => GitCloneBundleRunError::Failed { step, status },
+        CleanGitError::Failed { status, stderr } => GitCloneBundleRunError::Failed {
+            step,
+            status,
+            stderr,
+        },
         CleanGitError::MissingProcessId => GitCloneBundleRunError::MissingProcessId { step },
         CleanGitError::InvalidProcessId(pid) => {
             GitCloneBundleRunError::InvalidProcessId { step, pid }

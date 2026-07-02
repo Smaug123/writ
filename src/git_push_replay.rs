@@ -206,10 +206,13 @@ pub enum GitPushReplayRunError {
         step: GitPushReplayCommandStep,
         timeout: Duration,
     },
-    #[error("{step} command failed with status {status}")]
+    #[error("{step} command failed with status {status}: {stderr}")]
     Failed {
         step: GitPushReplayCommandStep,
         status: ExitStatus,
+        /// git's captured stderr, tail-capped and secret-redacted by
+        /// `clean_git` — the real reason behind the exit status.
+        stderr: String,
     },
     #[error("{step} command did not expose a child process id")]
     MissingProcessId { step: GitPushReplayCommandStep },
@@ -784,7 +787,11 @@ fn translate_clean_git_error(
         CleanGitError::Spawn(source) => GitPushReplayRunError::Spawn { step, source },
         CleanGitError::Wait(source) => GitPushReplayRunError::Wait { step, source },
         CleanGitError::TimedOut(timeout) => GitPushReplayRunError::TimedOut { step, timeout },
-        CleanGitError::Failed(status) => GitPushReplayRunError::Failed { step, status },
+        CleanGitError::Failed { status, stderr } => GitPushReplayRunError::Failed {
+            step,
+            status,
+            stderr,
+        },
         CleanGitError::MissingProcessId => GitPushReplayRunError::MissingProcessId { step },
         CleanGitError::InvalidProcessId(pid) => {
             GitPushReplayRunError::InvalidProcessId { step, pid }
