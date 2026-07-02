@@ -656,9 +656,14 @@ exit 0
     async fn launch_times_out_even_when_inspect_hangs() {
         let dir = tempfile::tempdir().unwrap();
         let args_log = dir.path().join("args.log");
-        // `inspect` blocks ~2s; the ready timeout is 300ms, so the overall wait
-        // must be bounded by the timeout, not by the blocking inspect call.
-        let tool = write_fake_container_inspect_hangs(dir.path(), &args_log, 2);
+        // `inspect` blocks for a long time (120s) while the ready timeout is a
+        // short 300ms, so the two possible outcomes are far apart in wall-clock:
+        // a correct impl returns in ~ready_timeout because the outer
+        // `tokio::time::timeout` preempts the in-flight (async, `kill_on_drop`)
+        // inspect, whereas an impl that let a synchronous inspect block the
+        // reactor could only return once inspect finished, i.e. ~120s. The
+        // assertion bound sits between them (see below).
+        let tool = write_fake_container_inspect_hangs(dir.path(), &args_log, 120);
         let plan = plan_with_tool(&tool, dir.path());
         let ready = dir.path().join("ready"); // never created
 
@@ -675,8 +680,17 @@ exit 0
         let waited = start.elapsed();
 
         assert!(matches!(err, BrokerVmLaunchError::ReadyTimeout(_)), "{err}");
+        // The bound only has to separate "bounded by ready_timeout" (~300ms) from
+        // "bounded by the inspect hang" (~120s), so it is deliberately generous:
+        // this is a current-thread runtime whose 300ms timer can fire seconds late
+        // under heavy machine load (a full Nix build in parallel has been seen to
+        // push it past 5s), and a real-time assertion tuned close to ready_timeout
+        // flakes. 30s is well above any plausible scheduling slop yet far below
+        // the 120s inspect hang, so it still fails loudly if the timeout ever stops
+        // preempting a wedged inspect. `kill_on_drop` reaps the hung child the
+        // moment the timeout fires, so the passing case never actually waits 120s.
         assert!(
-            waited < Duration::from_millis(1800),
+            waited < Duration::from_secs(30),
             "the ready wait must be bounded by ready_timeout despite a hung inspect; waited {waited:?}"
         );
     }
