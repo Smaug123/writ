@@ -268,11 +268,17 @@ async fn handle_git_clone_request<S: SecretStore + Send + Sync>(
             www_authenticate: None,
             headers: Vec::new(),
         },
-        Err(message) => git_error_response(
-            VmHttpStatus::InternalServerError,
-            VmGitCloneErrorCode::CloneFailed,
-            message,
-        ),
+        Err(message) => {
+            // The message now carries git's tail-capped, secret-redacted stderr
+            // (the real reason: auth, DNS, missing repo), so log it broker-side
+            // for the operator instead of leaving only an opaque HTTP 500.
+            tracing::warn!(error = %message, "vm http git clone failed");
+            git_error_response(
+                VmHttpStatus::InternalServerError,
+                VmGitCloneErrorCode::CloneFailed,
+                message,
+            )
+        }
     }
 }
 
