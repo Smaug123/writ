@@ -1308,9 +1308,13 @@ impl ProcessInvocation {
     ///   of leaking.
     ///
     /// Only a failure to *spawn* the process is an error; the caller inspects
-    /// `status` itself. Deadlock-free for the well-behaved tools used here
-    /// (`container inspect`/`logs`, which write essentially one stream and exit);
-    /// it does not attempt to drain a child that floods both pipes past the cap.
+    /// `status` itself.
+    ///
+    /// **Deadlock-free even for a one-sided flood.** Both streams are drained
+    /// concurrently with cancel-safe `read`s; the moment *either* buffer reaches
+    /// the cap the child is killed, so a child that floods one pipe past the OS
+    /// pipe buffer (and would otherwise block on the write we stopped draining,
+    /// never closing the other stream) cannot wedge the capture.
     pub async fn run_capturing_output_bounded(
         &self,
         max_bytes: usize,
@@ -1324,44 +1328,71 @@ impl ProcessInvocation {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
-        let mut child = command
-            .spawn()
-            .map_err(|source| ProcessInvocationError::Run {
-                program: self.program.display().to_string(),
-                args: self.args_display(),
-                source,
-            })?;
+        let mut child = command.spawn().map_err(|source| self.run_error(source))?;
         let mut stdout_pipe = child.stdout.take().expect("stdout was piped");
         let mut stderr_pipe = child.stderr.take().expect("stderr was piped");
 
-        // Read one byte past the cap so truncation is detectable, then stop.
-        let probe = max_bytes as u64 + 1;
+        // Drain both streams concurrently, capping each at `max_bytes`. Once a
+        // stream reaches the cap we stop reading it *and kill the child*: a
+        // child flooding a pipe we no longer drain would block on the write and
+        // never exit, so the other stream's EOF would never arrive. Reading with
+        // individual (cancel-safe) `read`s — rather than `read_to_end` inside a
+        // `select!`, which is not cancel-safe — keeps every byte we accept.
         let mut stdout_buf = Vec::new();
         let mut stderr_buf = Vec::new();
-        let mut stdout_take = (&mut stdout_pipe).take(probe);
-        let mut stderr_take = (&mut stderr_pipe).take(probe);
-        let (out_res, err_res) = tokio::join!(
-            stdout_take.read_to_end(&mut stdout_buf),
-            stderr_take.read_to_end(&mut stderr_buf),
-        );
-        out_res.map_err(|source| ProcessInvocationError::Run {
-            program: self.program.display().to_string(),
-            args: self.args_display(),
-            source,
-        })?;
-        err_res.map_err(|source| ProcessInvocationError::Run {
-            program: self.program.display().to_string(),
-            args: self.args_display(),
-            source,
-        })?;
+        let mut stdout_open = true;
+        let mut stderr_open = true;
+        let mut truncated = false;
+        let mut killed = false;
+        let mut stdout_chunk = [0u8; 8192];
+        let mut stderr_chunk = [0u8; 8192];
 
-        let truncated = stdout_buf.len() as u64 >= probe || stderr_buf.len() as u64 >= probe;
+        while stdout_open || stderr_open {
+            tokio::select! {
+                result = stdout_pipe.read(&mut stdout_chunk), if stdout_open => {
+                    let n = result.map_err(|source| self.run_error(source))?;
+                    if n == 0 {
+                        stdout_open = false;
+                    } else {
+                        stdout_buf.extend_from_slice(&stdout_chunk[..n]);
+                        // Strictly greater: an output of exactly `max_bytes`
+                        // followed by EOF is *not* truncated, and we must not
+                        // kill a child that emitted exactly the cap and is
+                        // exiting cleanly (that would forge a kill signal).
+                        if stdout_buf.len() > max_bytes {
+                            stdout_open = false;
+                            truncated = true;
+                        }
+                    }
+                }
+                result = stderr_pipe.read(&mut stderr_chunk), if stderr_open => {
+                    let n = result.map_err(|source| self.run_error(source))?;
+                    if n == 0 {
+                        stderr_open = false;
+                    } else {
+                        stderr_buf.extend_from_slice(&stderr_chunk[..n]);
+                        if stderr_buf.len() > max_bytes {
+                            stderr_open = false;
+                            truncated = true;
+                        }
+                    }
+                }
+            }
+            // We only stop reading a still-live stream when it caps; kill the
+            // child then so the remaining stream reaches EOF instead of blocking
+            // on a full pipe. A natural EOF on one stream never triggers this.
+            if truncated && !killed && (!stdout_open || !stderr_open) {
+                let _ = child.start_kill();
+                killed = true;
+            }
+        }
+
         stdout_buf.truncate(max_bytes);
         stderr_buf.truncate(max_bytes);
 
-        // Stop the child (no-op if it already exited at EOF) and reap it, so we
-        // never leave a zombie or a process blocked writing to a full pipe.
-        let _ = child.start_kill();
+        // Reap the child. If we truncated we already killed it above; otherwise
+        // both streams reached EOF and it is exiting on its own, so `wait`
+        // yields its real status rather than a kill signal.
         let status = child.wait().await.ok();
 
         Ok(BoundedOutput {
@@ -1370,6 +1401,14 @@ impl ProcessInvocation {
             stderr: String::from_utf8_lossy(&stderr_buf).into_owned(),
             truncated,
         })
+    }
+
+    fn run_error(&self, source: std::io::Error) -> ProcessInvocationError {
+        ProcessInvocationError::Run {
+            program: self.program.display().to_string(),
+            args: self.args_display(),
+            source,
+        }
     }
 
     fn failed_from_output(&self, output: std::process::Output) -> ProcessInvocationError {

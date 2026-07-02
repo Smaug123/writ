@@ -329,3 +329,51 @@ async fn run_capturing_output_bounded_caps_and_does_not_hang_on_a_flood() {
     assert!(out.truncated, "output beyond the cap must flag truncation");
     assert_eq!(out.stdout.len(), 64, "stdout must be capped at max_bytes");
 }
+
+#[tokio::test]
+async fn run_capturing_output_bounded_keeps_exactly_max_bytes_without_flagging_truncation() {
+    // An output of exactly the cap followed by EOF is complete, not truncated,
+    // and the child exits cleanly — the capture must not kill it (which would
+    // forge a kill signal in place of its real exit status).
+    let inv = ProcessInvocation::new(
+        std::path::PathBuf::from("/bin/sh"),
+        ["-c".to_string(), "head -c 64 /dev/zero".to_string()],
+    );
+    let out = inv.run_capturing_output_bounded(64).await.unwrap();
+    assert!(
+        !out.truncated,
+        "output of exactly max_bytes must not flag truncation"
+    );
+    assert_eq!(out.stdout.len(), 64);
+    assert!(
+        out.status.is_some_and(|s| s.success()),
+        "a clean exit at exactly the cap must be preserved, not killed: {:?}",
+        out.status
+    );
+}
+
+#[tokio::test]
+async fn run_capturing_output_bounded_does_not_deadlock_on_a_one_sided_flood_past_the_pipe_buffer()
+{
+    // Regression: a child that floods *one* stream far past the OS pipe buffer
+    // (~64 KiB) while writing nothing to the other must not wedge the capture.
+    // If we stop draining stdout at the cap but still wait for stderr EOF, the
+    // child blocks on the full stdout pipe and never exits (so never closes
+    // stderr) -> deadlock. The capture must kill the child once a stream caps
+    // and return promptly. The outer timeout turns a deadlock into a failure
+    // instead of a hung test; a healthy capture returns in milliseconds.
+    let inv = ProcessInvocation::new(
+        std::path::PathBuf::from("/bin/sh"),
+        // 512 KiB of stdout, far past the pipe buffer; not one byte of stderr.
+        ["-c".to_string(), "head -c 524288 /dev/zero".to_string()],
+    );
+    let out = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        inv.run_capturing_output_bounded(64),
+    )
+    .await
+    .expect("capture must not deadlock on a one-sided flood past the pipe buffer")
+    .expect("spawn must succeed");
+    assert!(out.truncated, "a flood past the cap must flag truncation");
+    assert_eq!(out.stdout.len(), 64, "stdout must be capped at max_bytes");
+}
