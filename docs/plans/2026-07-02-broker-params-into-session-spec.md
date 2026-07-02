@@ -136,6 +136,13 @@ mergeable, and it is the foundation the #254 doc wrongly assumed already existed
 
 ## Slice C2 — move `ready_file` + `log_file` into the spec (stop-the-world)
 
+**Status (2026-07-02): implemented** on branch `part-c2-params-into-session-spec`.
+Local gates green (`fmt`, `clippy --all-targets --all-features -D warnings`,
+`cargo test`, `cargo doc`). `nix build .#packages.x86_64-linux` is CI-only on this
+host. **Breaking: rebuild the broker image** (`writ agent-vm build-broker-image`)
+before running the `vm` placement, or a start fails fast with a spec/version
+error (Part A). Modelled `ready_file`/`log_file` as a `GuestAbsPath` newtype.
+
 A single atomic flag-day slice. The broker VM image and host `writd` are built
 from the same tree and have no independent external consumers, so gospel's
 "stop the world" migration applies: change both sides at once, minimise the

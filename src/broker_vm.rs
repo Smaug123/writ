@@ -27,7 +27,7 @@ use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 
 use crate::agent_vm_lifecycle::{AgentVmResources, ContainerImage, ProcessInvocation};
-use crate::broker_session::BrokerSessionSpec;
+use crate::broker_session::{BrokerSessionSpec, GuestAbsPath};
 use crate::config::DaemonConfig;
 use crate::core::{AgentKind, BrokerPort, Ipv4Cidr, SessionId};
 use crate::secret::{FileSecretStore, SecretError, SecretKey, SecretStore};
@@ -230,19 +230,13 @@ impl BrokerVmPlan {
         &self.names
     }
 
-    /// Guest path of the ready file the broker publishes; the host watches the
-    /// host-side end of the session mount for it.
-    pub fn guest_ready_file(&self) -> String {
-        format!("{BROKER_VM_SESSION_DIR}/{READY_FILE}")
-    }
-
-    /// Guest path of the log file the broker mirrors its tracing to; the host
-    /// tails the host-side end of the session mount (see `broker_log_forwarder`).
-    pub fn guest_log_file(&self) -> String {
-        format!("{BROKER_VM_SESSION_DIR}/{BROKER_VM_LOG_FILE}")
-    }
-
-    /// The `writd broker` argument vector, referencing the well-known guest paths.
+    /// The `writd broker` argument vector. **Frozen** to the three bootstrap
+    /// paths needed to locate and authenticate the session spec; everything else
+    /// the broker uses (its ready-file target, its log sink) is carried *in* the
+    /// spec (see [`broker_guest_ready_file`] / [`broker_guest_log_file`]), so a
+    /// future host→broker parameter can never clap-crash a stale broker image the
+    /// way `--log-file` did in #251. See
+    /// `docs/plans/2026-07-02-broker-params-into-session-spec.md`.
     fn broker_command(&self) -> Vec<String> {
         vec![
             "writd".to_string(),
@@ -253,10 +247,6 @@ impl BrokerVmPlan {
             format!("{BROKER_VM_SESSION_DIR}/{SESSION_SPEC_FILE}"),
             "--bearer-token-file".to_string(),
             format!("{BROKER_VM_SESSION_DIR}/{BEARER_TOKEN_FILE}"),
-            "--ready-file".to_string(),
-            self.guest_ready_file(),
-            "--log-file".to_string(),
-            self.guest_log_file(),
         ]
     }
 
@@ -1037,6 +1027,21 @@ pub fn materialize_broker_vm_session(
     outcome
 }
 
+/// Guest path of the ready file the broker atomically creates once it is
+/// serving; the host watches the host-mount side of the session dir for it. Now
+/// carried in the session spec rather than on the argv.
+fn broker_guest_ready_file() -> GuestAbsPath {
+    GuestAbsPath::new(format!("{BROKER_VM_SESSION_DIR}/{READY_FILE}"))
+        .expect("broker guest ready-file path is absolute")
+}
+
+/// Guest path the broker mirrors its JSON tracing to, for the host daemon to
+/// tail (see `broker_log_forwarder`). Also carried in the spec, not the argv.
+fn broker_guest_log_file() -> GuestAbsPath {
+    GuestAbsPath::new(format!("{BROKER_VM_SESSION_DIR}/{BROKER_VM_LOG_FILE}"))
+        .expect("broker guest log-file path is absolute")
+}
+
 fn materialize_broker_vm_session_inner(
     request: &BrokerVmSessionRequest,
     host_config_json: &str,
@@ -1065,6 +1070,8 @@ fn materialize_broker_vm_session_inner(
         request.agent_subnet,
         request.bind_addr,
         request.broker_port,
+        broker_guest_ready_file(),
+        broker_guest_log_file(),
     );
     write_broker_staging(&request.staging_dir, &spec, bearer, &config_json).map_err(|source| {
         BrokerVmSessionError::Material {
@@ -1223,10 +1230,6 @@ mod tests {
                 format!("{BROKER_VM_SESSION_DIR}/session-spec.json"),
                 "--bearer-token-file".to_string(),
                 format!("{BROKER_VM_SESSION_DIR}/bearer-token"),
-                "--ready-file".to_string(),
-                format!("{BROKER_VM_SESSION_DIR}/ready"),
-                "--log-file".to_string(),
-                format!("{BROKER_VM_SESSION_DIR}/broker.log.jsonl"),
             ]
         );
     }
@@ -1270,8 +1273,8 @@ mod tests {
 
         assert_eq!(
             fingerprint,
-            "broker-cli-flags: --config --session-spec --bearer-token-file --ready-file --log-file\n\
-             ready-doc: {\"protocol_version\":1,\"broker_port\":18080,\"writd_build\":\"pinned\"}",
+            "broker-cli-flags: --config --session-spec --bearer-token-file\n\
+             ready-doc: {\"protocol_version\":2,\"broker_port\":18080,\"writd_build\":\"pinned\"}",
             "the host↔broker contract changed. Update this snapshot AND bump \
              BROKER_PROTOCOL_VERSION (and rebuild the broker image)."
         );
@@ -1922,6 +1925,8 @@ mod tests {
             Ipv4Cidr::new(Ipv4Addr::new(192, 168, 252, 0), 24).unwrap(),
             Ipv4Addr::UNSPECIFIED,
             BrokerPort::new(18080).unwrap(),
+            GuestAbsPath::new("/writ/session/ready").unwrap(),
+            GuestAbsPath::new("/writ/session/broker.log.jsonl").unwrap(),
         );
         let bearer = VmHttpBearerToken::generate();
         write_session_material(&staging, &spec, &bearer).unwrap();
@@ -1943,6 +1948,8 @@ mod tests {
             Ipv4Cidr::new(Ipv4Addr::new(192, 168, 252, 0), 24).unwrap(),
             Ipv4Addr::UNSPECIFIED,
             BrokerPort::new(18080).unwrap(),
+            GuestAbsPath::new("/writ/session/ready").unwrap(),
+            GuestAbsPath::new("/writ/session/broker.log.jsonl").unwrap(),
         );
         // First launch, then simulate a prior run leaving a stale ready marker
         // and a world-readable bearer token (e.g. a crashed/retried attempt).
@@ -1980,6 +1987,8 @@ mod tests {
             Ipv4Cidr::new(Ipv4Addr::new(192, 168, 252, 0), 24).unwrap(),
             Ipv4Addr::UNSPECIFIED,
             BrokerPort::new(18080).unwrap(),
+            GuestAbsPath::new("/writ/session/ready").unwrap(),
+            GuestAbsPath::new("/writ/session/broker.log.jsonl").unwrap(),
         );
         write_session_material(&staging, &spec, &VmHttpBearerToken::generate()).unwrap();
         let dir_mode = std::fs::metadata(&staging).unwrap().permissions().mode() & 0o777;

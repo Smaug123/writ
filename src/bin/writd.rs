@@ -13,6 +13,7 @@ use writ::agent_vm_daemon::AgentVmDaemon;
 use writ::audit::AuditLog;
 use writ::boot_reconcile::reconcile_pending_approve_attempts;
 use writ::broker_entrypoint::{BrokerArgs, run_broker};
+use writ::broker_session::BrokerSessionSpec;
 use writ::config::{DaemonConfig, SecretStoreConfig, default_audit_db_path, default_config_path};
 use writ::core::UnixMillis;
 use writ::git_push_staging::GitPushStagingStore;
@@ -64,24 +65,14 @@ enum Command {
         /// Path to the per-session bearer-token file.
         #[arg(long)]
         bearer_token_file: PathBuf,
-
-        /// Optional path created atomically once the broker is serving.
-        #[arg(long)]
-        ready_file: Option<PathBuf>,
-
-        /// Optional path the broker mirrors its JSON logs to, on the shared
-        /// session mount, for the host daemon to tail (see the host-side
-        /// `broker_log_forwarder`). Absent for the in-process host daemon.
-        #[arg(long)]
-        log_file: Option<PathBuf>,
     },
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Parse before installing telemetry: the global subscriber installs only
-    // once, and the broker subcommand adds a second (file) sink whose path we
-    // learn only from the parsed args.
+    // once, and the broker subcommand adds a second (file) sink whose path it
+    // learns only from the parsed session spec (read below).
     let args = Args::parse();
 
     match args.command {
@@ -89,10 +80,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             config,
             session_spec,
             bearer_token_file,
-            ready_file,
-            log_file,
         }) => {
-            writ::telemetry::init_with_file("info", log_file.as_deref())?;
+            // The broker's log-sink path lives in the session spec, so the spec
+            // must be read before telemetry is installed. A spec read/parse
+            // failure therefore predates telemetry and prints to stderr — which
+            // the host's broker-VM liveness check surfaces via `container logs`
+            // (a version-skewed / stale-image spec is exactly this failure class).
+            let spec = match BrokerSessionSpec::read_file(&session_spec) {
+                Ok(spec) => spec,
+                Err(err) => {
+                    eprintln!("writd broker: cannot load session spec: {err}");
+                    return Err(err.into());
+                }
+            };
+            writ::telemetry::init_with_file("info", Some(spec.log_file.as_path()))?;
             // Log any broker failure via `tracing` before returning: telemetry
             // (with the file sink) is installed, so this reaches the host tailer.
             // A bare `?` would instead print only to the guest's stderr, leaving
@@ -100,9 +101,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // looking like a silent ready-file timeout on the host.
             if let Err(err) = run_broker(BrokerArgs {
                 config,
-                session_spec,
+                session_spec: spec,
                 bearer_token_file,
-                ready_file,
             })
             .await
             {
