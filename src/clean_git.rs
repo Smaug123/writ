@@ -275,12 +275,18 @@ async fn run_clean_git_inner(
 
 /// Turn captured stderr bytes into a bounded, secret-free diagnostic string.
 ///
-/// The bytes are already tail-capped by the supervisor; here we lossily decode
-/// them, redact the bound secret (defence in depth — git's HTTPS transport
-/// takes the token via the askpass helper and does not normally echo it, but a
-/// future flow or a helper that logs a credentialed URL must never leak it),
-/// and trim surrounding whitespace. An empty capture becomes a stable
-/// placeholder so the error `Display` stays readable.
+/// The bytes are already a *line-aligned* tail-capped capture from the
+/// supervisor: on truncation the partial leading line is dropped, so every
+/// retained line is complete. That is what makes this redaction sound — the
+/// bound secret is a git token with no embedded newline, so it cannot survive
+/// truncation as a partial fragment on a cut line; any occurrence left in the
+/// capture is a full token on a complete line, which `replace` removes wholesale.
+///
+/// Redacting the token is defence in depth (git's HTTPS transport takes it via
+/// the askpass helper and does not normally echo it, but a future flow or a
+/// helper that logs a credentialed URL must never leak it). We lossily decode,
+/// redact, and trim; an empty capture becomes a stable placeholder so the error
+/// `Display` stays readable.
 fn sanitize_git_stderr(stderr: &[u8], secret: Option<&str>) -> String {
     let mut text = String::from_utf8_lossy(stderr).into_owned();
     if let Some(secret) = secret
@@ -501,6 +507,70 @@ mod tests {
                 assert!(
                     stderr.contains("<redacted>"),
                     "redaction marker expected, got {stderr:?}"
+                );
+            }
+            other => panic!("expected CleanGitError::Failed, got {other:?}"),
+        }
+    }
+
+    /// End-to-end guard against a secret leaking as a truncation-boundary
+    /// fragment: a child floods stderr so the bound secret sits on a single
+    /// over-cap line (its own line's start is truncated away). The supervisor's
+    /// line-aligned tail drops that partial line wholesale, so neither the
+    /// secret nor a fragment of it reaches the surfaced error — while the
+    /// trailing complete fatal line survives.
+    #[tokio::test]
+    async fn run_clean_git_does_not_leak_secret_at_the_truncation_boundary() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let sh = locate_on_path("sh");
+        let tempdir = tempfile::tempdir().expect("tempdir for flood probe");
+        let probe = tempdir.path().join("flood-probe");
+        // ~13 KiB of newline-free filler, then the secret (still on that same
+        // unbroken line), then a complete trailing line. The cap (8 KiB) lands
+        // inside the giant line, so the retained tail begins mid-line; alignment
+        // drops the whole line (secret and all).
+        let script = format!(
+            "#!{sh}\n\
+             i=0\n\
+             while [ $i -lt 1300 ]; do printf 'ABCDEFGHIJ' 1>&2; i=$((i+1)); done\n\
+             printf 'TOK-%s-END' \"$SEKRIT\" 1>&2\n\
+             printf '\\nfatal: boundary-test done\\n' 1>&2\n\
+             exit 5\n",
+            sh = sh.display()
+        );
+        std::fs::write(&probe, script).expect("write flood probe");
+        let mut perms = std::fs::metadata(&probe).expect("probe meta").permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&probe, perms).expect("chmod flood probe");
+
+        let invocation = CleanGitInvocation::new(
+            probe,
+            std::iter::empty::<OsString>(),
+            clean_git_config_env(),
+            vec!["SEKRIT".to_string()],
+        );
+        let secret = "s3cr3t-boundary-xyz";
+        let err = run_clean_git(&invocation, Duration::from_secs(20), Some(secret))
+            .await
+            .expect_err("probe exits non-zero");
+        match err {
+            CleanGitError::Failed { status, stderr } => {
+                assert_eq!(status.code(), Some(5));
+                assert!(
+                    !stderr.contains(secret),
+                    "the secret must not leak, got {stderr:?}"
+                );
+                // Even a fragment (the surrounding `TOK-...-END` marker) must be
+                // gone: the whole truncated line was dropped, not just the exact
+                // token redacted.
+                assert!(
+                    !stderr.contains("TOK-"),
+                    "no fragment of the truncated secret line may survive, got {stderr:?}"
+                );
+                assert!(
+                    stderr.contains("fatal: boundary-test done"),
+                    "the trailing complete line must survive, got {stderr:?}"
                 );
             }
             other => panic!("expected CleanGitError::Failed, got {other:?}"),

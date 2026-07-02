@@ -28,10 +28,10 @@ use crate::process_spawn;
 const CHILD_EXIT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 /// Upper bound on captured stderr. A [`StderrMode::Capture`] child's stderr is
-/// drained to EOF (so it never stalls on a full pipe) but only the last this
-/// many bytes are retained: a verbose or hostile child cannot make the host
-/// buffer unbounded diagnostics, and a tool's fatal message is typically its
-/// last line, so the tail is the informative part.
+/// drained to EOF (so it never stalls on a full pipe) but only a line-aligned
+/// tail of at most this many bytes is retained: a verbose or hostile child
+/// cannot make the host buffer unbounded diagnostics, and a tool's fatal
+/// message is typically its last line, so the tail is the informative part.
 const STDERR_CAPTURE_TAIL_CAP: usize = 8 * 1024;
 
 /// Whether the supervisor should capture the child's stdout or discard it.
@@ -66,10 +66,12 @@ pub(crate) enum SupervisedOutcome {
     Exited {
         status: ExitStatus,
         stdout: Vec<u8>,
-        /// Tail-capped stderr when the run used [`StderrMode::Capture`], empty
-        /// under [`StderrMode::Discard`]. Not yet redacted — a caller that may
-        /// have bound a secret into the child's environment must sanitise this
-        /// before surfacing it.
+        /// Line-aligned tail-capped stderr when the run used
+        /// [`StderrMode::Capture`], empty under [`StderrMode::Discard`]. Not yet
+        /// redacted — a caller that may have bound a secret into the child's
+        /// environment must sanitise this before surfacing it. The line
+        /// alignment means a newline-free secret cannot survive truncation as a
+        /// partial fragment, so a full-token `replace` is a complete redaction.
         stderr: Vec<u8>,
     },
     TimedOut,
@@ -203,14 +205,17 @@ pub(crate) async fn run_supervised(
     }
 }
 
-/// Drain `reader` to EOF, retaining only the last `cap` bytes.
+/// Drain `reader` to EOF, retaining a line-aligned tail of at most `cap` bytes.
 ///
 /// The whole stream is consumed so the child never stalls on a full pipe, but
 /// memory stays bounded by `cap` (plus one read chunk): a verbose or hostile
 /// child cannot make the host buffer unbounded output. The tail is kept
-/// because a tool's fatal message is typically its last output. Read errors
-/// end the drain with whatever was accumulated so far, matching the
-/// best-effort `read_to_end` used for stdout.
+/// because a tool's fatal message is typically its last output. When the cap
+/// truncates the head, the retained tail's first (partial) line is dropped so
+/// every retained line is complete — see the body for why that soundness
+/// property matters to a downstream secret redactor. Read errors end the drain
+/// with whatever was accumulated so far, matching the best-effort
+/// `read_to_end` used for stdout.
 async fn drain_to_tail_cap<R>(mut reader: R, cap: usize) -> Vec<u8>
 where
     R: tokio::io::AsyncRead + Unpin,
@@ -218,6 +223,7 @@ where
     use tokio::io::AsyncReadExt;
     let mut buf = Vec::new();
     let mut chunk = [0u8; 8192];
+    let mut truncated = false;
     loop {
         match reader.read(&mut chunk).await {
             Ok(0) | Err(_) => break,
@@ -226,8 +232,24 @@ where
                 if buf.len() > cap {
                     let excess = buf.len() - cap;
                     buf.drain(..excess);
+                    truncated = true;
                 }
             }
+        }
+    }
+    // On truncation the retained tail begins at an arbitrary byte, so its first
+    // line is a partial fragment of whatever preceded the cap. Drop it so every
+    // retained line is complete. This is what keeps a downstream redactor sound:
+    // a secret (a git token — no embedded newline) that straddled the cap would
+    // otherwise survive as an unredactable partial fragment at the front. The
+    // cost is one already-incomplete line. When the whole tail is one unbroken
+    // line (no newline at all), it is dropped entirely — safe over sorry.
+    if truncated {
+        match buf.iter().position(|&b| b == b'\n') {
+            Some(newline) => {
+                buf.drain(..=newline);
+            }
+            None => buf.clear(),
         }
     }
     buf
@@ -461,17 +483,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn drain_to_tail_cap_keeps_last_cap_bytes() {
-        let data: Vec<u8> = (0..1000u32).map(|i| (i % 251) as u8).collect();
-        let out = drain_to_tail_cap(&data[..], 100).await;
-        assert_eq!(out, &data[900..]);
-    }
-
-    #[tokio::test]
     async fn drain_to_tail_cap_keeps_all_when_under_cap() {
+        // No truncation: content passes through verbatim, even without a
+        // trailing newline and even with no newline at all.
         let data = b"short output".to_vec();
         let out = drain_to_tail_cap(&data[..], 4096).await;
         assert_eq!(out, data);
+    }
+
+    #[tokio::test]
+    async fn drain_to_tail_cap_drops_partial_leading_line_on_truncation() {
+        // The last `cap` bytes of "aaaa\nbbbb\ncccc\n" are "bb\ncccc\n"; the
+        // leading "bb" is a fragment of a truncated line and must be dropped so
+        // only complete lines remain (the property a redactor relies on).
+        let data = b"aaaa\nbbbb\ncccc\n".to_vec();
+        let out = drain_to_tail_cap(&data[..], 8).await;
+        assert_eq!(out, b"cccc\n");
+    }
+
+    #[tokio::test]
+    async fn drain_to_tail_cap_clears_when_truncated_tail_has_no_newline() {
+        // A single unbroken over-cap line has no complete line to keep, so the
+        // whole (necessarily partial) tail is dropped rather than surfaced.
+        let data = b"aaaaaaaaaa".to_vec();
+        let out = drain_to_tail_cap(&data[..], 4).await;
+        assert!(out.is_empty(), "expected empty, got {out:?}");
     }
 
     #[tokio::test]
@@ -521,11 +557,13 @@ mod tests {
     #[tokio::test]
     async fn captured_stderr_is_tail_capped_against_a_verbose_child() {
         // A child that streams far more than the cap must not stall (its stderr
-        // is fully drained) and must not blow the bound (only the tail is kept).
+        // is fully drained) and must not blow the bound (only the tail is kept),
+        // while the final complete line — the informative fatal message — and
+        // the line alignment both survive.
         let mut command = Command::new(locate_on_path("sh"));
         command.arg("-c").arg(format!(
-            "i=0; while [ $i -lt {n} ]; do printf 'xxxxxxxxxx' 1>&2; i=$((i+1)); done; printf TAILMARK 1>&2; exit 1",
-            n = (STDERR_CAPTURE_TAIL_CAP / 10) + 500,
+            "i=0; while [ $i -lt {n} ]; do printf 'noise-line-padding\\n' 1>&2; i=$((i+1)); done; printf 'fatal: the-tail\\n' 1>&2; exit 1",
+            n = (STDERR_CAPTURE_TAIL_CAP / 19) + 500,
         ));
         let outcome = run_supervised(
             &mut command,
@@ -543,8 +581,15 @@ mod tests {
                     stderr.len()
                 );
                 assert!(
-                    stderr.ends_with(b"TAILMARK"),
+                    stderr.ends_with(b"fatal: the-tail\n"),
                     "the informative tail must be retained"
+                );
+                // Line alignment: the retained tail starts at a line boundary,
+                // never mid-line.
+                assert!(
+                    stderr.starts_with(b"noise-line-padding\n"),
+                    "the retained tail must begin on a line boundary, got {:?}",
+                    String::from_utf8_lossy(&stderr[..stderr.len().min(40)])
                 );
             }
             SupervisedOutcome::TimedOut => panic!("verbose child should still exit promptly"),
