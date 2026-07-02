@@ -10,7 +10,7 @@
 
 use std::net::Ipv4Addr;
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::agent_vm_lifecycle::ProcessInvocationError;
 use crate::broker_protocol::{BROKER_PROTOCOL_VERSION, BrokerReadyDoc, BrokerReadyDocError};
@@ -115,7 +115,20 @@ pub async fn launch_broker_vm(
         .await?
         .map_err(BrokerVmLaunchError::RunBroker)?;
 
-    wait_for_ready_or_exit(plan, ready_file, ready_timeout, poll_interval).await?;
+    // Bound the whole ready/liveness wait by `ready_timeout`. The wait polls a
+    // blocking `container inspect`; a wedged container service would otherwise
+    // never return, hanging the launch past the deadline (the internal loop can
+    // only notice the deadline *between* inspect calls). The outer timeout makes
+    // `ReadyTimeout` a hard ceiling regardless.
+    match tokio::time::timeout(
+        ready_timeout,
+        wait_for_ready_or_exit(plan, ready_file, poll_interval),
+    )
+    .await
+    {
+        Ok(result) => result?,
+        Err(_elapsed) => return Err(BrokerVmLaunchError::ReadyTimeout(ready_timeout)),
+    }
     gate_ready_doc(ready_file, expected_port)?;
 
     let inspect = plan.inspect_invocation();
@@ -144,21 +157,21 @@ pub async fn teardown_broker_vm(plan: &BrokerVmPlan) -> Vec<String> {
 
 /// Wait for the broker to publish `ready_file`, but fail fast if the broker VM
 /// exits first. Polls both the ready file and (via `container inspect`) the VM's
-/// lifecycle state every `poll_interval`, up to `ready_timeout`:
+/// lifecycle state every `poll_interval`:
 ///
 /// - ready file present → `Ok`.
 /// - VM observed in a terminal state before the file appears → `ExitedBeforeReady`
 ///   with the broker's captured logs — turning the old 180s opaque timeout into a
 ///   seconds-fast, self-explaining error for a stale/broken image.
-/// - neither, until the deadline → `ReadyTimeout` (unchanged behaviour for a VM
-///   that is up but slow, or whose crash state we don't recognise).
+///
+/// This loops indefinitely on a healthy-but-slow (or unrecognised-state) VM; the
+/// caller wraps it in `tokio::time::timeout(ready_timeout, …)`, which is what
+/// yields `ReadyTimeout` and bounds a wedged `inspect`.
 async fn wait_for_ready_or_exit(
     plan: &BrokerVmPlan,
     ready_file: &Path,
-    ready_timeout: Duration,
     poll_interval: Duration,
 ) -> Result<(), BrokerVmLaunchError> {
-    let start = Instant::now();
     loop {
         if ready_file_exists(ready_file)? {
             return Ok(());
@@ -180,9 +193,6 @@ async fn wait_for_ready_or_exit(
             }
             let logs = capture_broker_logs(plan).await;
             return Err(BrokerVmLaunchError::ExitedBeforeReady { state, logs });
-        }
-        if start.elapsed() >= ready_timeout {
-            return Err(BrokerVmLaunchError::ReadyTimeout(ready_timeout));
         }
         tokio::time::sleep(poll_interval).await;
     }
@@ -323,6 +333,27 @@ exit 0
         tool
     }
 
+    /// A fake `container` whose `inspect` blocks far longer than any test's ready
+    /// timeout (modelling a wedged container service) and never publishes a ready
+    /// file — used to prove the ready wait is bounded by `ready_timeout` even when
+    /// the liveness probe itself stalls.
+    fn write_fake_container_inspect_hangs(dir: &Path, args_log: &Path, sleep_secs: u32) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tool = dir.join("fake-container-inspect-hangs");
+        let script = format!(
+            r#"#!/bin/sh
+printf '%s\n' "$*" >> "{log}"
+if [ "$1" = inspect ]; then sleep {sleep_secs}; fi
+exit 0
+"#,
+            log = args_log.display(),
+            sleep_secs = sleep_secs,
+        );
+        std::fs::write(&tool, script).unwrap();
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+        tool
+    }
+
     fn plan_with_tool(tool: &Path, dir: &Path) -> BrokerVmPlan {
         BrokerVmPlan::new(
             "51b8fd0f-6c10-454c-b0e6-7df1d60e2e6d"
@@ -448,6 +479,35 @@ exit 0
         assert!(
             waited < Duration::from_secs(5),
             "should fail fast on broker exit, not wait out the timeout; waited {waited:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn launch_times_out_even_when_inspect_hangs() {
+        let dir = tempfile::tempdir().unwrap();
+        let args_log = dir.path().join("args.log");
+        // `inspect` blocks ~2s; the ready timeout is 300ms, so the overall wait
+        // must be bounded by the timeout, not by the blocking inspect call.
+        let tool = write_fake_container_inspect_hangs(dir.path(), &args_log, 2);
+        let plan = plan_with_tool(&tool, dir.path());
+        let ready = dir.path().join("ready"); // never created
+
+        let start = std::time::Instant::now();
+        let err = launch_broker_vm(
+            &plan,
+            &ready,
+            BrokerPort::new(18080).unwrap(),
+            Duration::from_millis(300),
+            Duration::from_millis(10),
+        )
+        .await
+        .unwrap_err();
+        let waited = start.elapsed();
+
+        assert!(matches!(err, BrokerVmLaunchError::ReadyTimeout(_)), "{err}");
+        assert!(
+            waited < Duration::from_millis(1800),
+            "the ready wait must be bounded by ready_timeout despite a hung inspect; waited {waited:?}"
         );
     }
 

@@ -76,6 +76,13 @@ const READY_FILE: &str = "ready";
 /// the host-side path without re-deriving the name.
 pub const BROKER_VM_LOG_FILE: &str = "broker.log.jsonl";
 
+/// How many trailing log lines the host requests from `container logs` when
+/// salvaging a crashed broker's output. Requesting a bounded tail from the
+/// container tool (rather than capturing the whole log and truncating after the
+/// fact) keeps a chatty crash path from buffering an unbounded amount on the
+/// host. A crash reason (clap error, config failure, panic) fits comfortably.
+const BROKER_LOG_TAIL_LINES: u32 = 200;
+
 /// Conventional writable scratch dirs the broker image expects as per-session
 /// tmpfs (mirrors the agent VM's set).
 const BROKER_VM_TMPFS_MOUNTS: &[&str] = &["/tmp", "/run", "/var/tmp"];
@@ -339,13 +346,21 @@ impl BrokerVmPlan {
         )
     }
 
-    /// `container logs <broker vm>` — the broker process's stdout+stderr, used to
-    /// salvage the crash reason when the VM exits before publishing readiness
-    /// (e.g. a stale image rejecting a broker CLI flag at argument parsing).
+    /// `container logs -n <tail> <broker vm>` — the last `BROKER_LOG_TAIL_LINES`
+    /// lines of the broker process's output, used to salvage the crash reason when
+    /// the VM exits before publishing readiness (e.g. a stale image rejecting a
+    /// broker CLI flag at argument parsing). The `-n` tail bounds what the host
+    /// buffers, so a broker that emitted a large log before crashing cannot force
+    /// an unbounded host allocation.
     pub fn logs_invocation(&self) -> ProcessInvocation {
         ProcessInvocation::new(
             self.container_tool.clone(),
-            ["logs".to_string(), self.names.vm.clone()],
+            [
+                "logs".to_string(),
+                "-n".to_string(),
+                BROKER_LOG_TAIL_LINES.to_string(),
+                self.names.vm.clone(),
+            ],
         )
     }
 
@@ -1257,6 +1272,22 @@ mod tests {
             "the host↔broker contract changed. Update this snapshot AND bump \
              BROKER_PROTOCOL_VERSION (and rebuild the broker image)."
         );
+    }
+
+    #[test]
+    fn logs_invocation_requests_a_bounded_tail() {
+        // The crash-log capture must ask the container tool for only the last N
+        // lines, so a broker that emitted a huge log before crashing cannot force
+        // the host to buffer it all.
+        let args = sample_plan().logs_invocation().args_lossy();
+        assert_eq!(args[0], "logs");
+        assert_eq!(args[1], "-n");
+        assert_eq!(args[2], BROKER_LOG_TAIL_LINES.to_string());
+        assert!(
+            args[3].starts_with("writ-broker-vm-"),
+            "last arg must be the broker VM name: {args:?}"
+        );
+        assert_eq!(args.len(), 4);
     }
 
     #[test]
