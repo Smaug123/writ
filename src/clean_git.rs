@@ -275,12 +275,15 @@ async fn run_clean_git_inner(
 
 /// Turn captured stderr bytes into a bounded, secret-free diagnostic string.
 ///
-/// The bytes are already a *line-aligned* tail-capped capture from the
-/// supervisor: on truncation the partial leading line is dropped, so every
-/// retained line is complete. That is what makes this redaction sound — the
-/// bound secret is a git token with no embedded newline, so it cannot survive
-/// truncation as a partial fragment on a cut line; any occurrence left in the
-/// capture is a full token on a complete line, which `replace` removes wholesale.
+/// The bytes are a *line-aligned* tail-capped capture from the supervisor: on
+/// truncation the partial leading line is dropped, so every retained line is
+/// complete. Truncation can therefore strand a full trailing *segment* of the
+/// secret (a complete retained line) but never a mid-line fragment. We redact
+/// the whole secret **and each of its newline-delimited segments**, so the
+/// redaction is complete without assuming the secret is single-line — for the
+/// real credential (a newline-free git token) the only segment is the token
+/// itself, so this is exactly a token redaction; for any multi-line secret a
+/// retained complete segment is still removed.
 ///
 /// Redacting the token is defence in depth (git's HTTPS transport takes it via
 /// the askpass helper and does not normally echo it, but a future flow or a
@@ -289,10 +292,12 @@ async fn run_clean_git_inner(
 /// `Display` stays readable.
 fn sanitize_git_stderr(stderr: &[u8], secret: Option<&str>) -> String {
     let mut text = String::from_utf8_lossy(stderr).into_owned();
-    if let Some(secret) = secret
-        && !secret.is_empty()
-    {
-        text = text.replace(secret, "<redacted>");
+    if let Some(secret) = secret {
+        for fragment in std::iter::once(secret).chain(secret.split('\n')) {
+            if !fragment.is_empty() {
+                text = text.replace(fragment, "<redacted>");
+            }
+        }
     }
     let trimmed = text.trim();
     if trimmed.is_empty() {
@@ -589,5 +594,11 @@ mod tests {
         assert_eq!(sanitize_git_stderr(b"hello", Some("")), "hello");
         // Empty capture yields a stable placeholder.
         assert_eq!(sanitize_git_stderr(b"   \n", None), "<no stderr captured>");
+        // Multi-line secret: a full trailing segment stranded on a retained
+        // line is redacted even though the whole secret string is not present.
+        assert_eq!(
+            sanitize_git_stderr(b"BBBB tail", Some("AAAA\nBBBB")),
+            "<redacted> tail"
+        );
     }
 }

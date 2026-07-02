@@ -70,8 +70,9 @@ pub(crate) enum SupervisedOutcome {
         /// [`StderrMode::Capture`], empty under [`StderrMode::Discard`]. Not yet
         /// redacted — a caller that may have bound a secret into the child's
         /// environment must sanitise this before surfacing it. The line
-        /// alignment means a newline-free secret cannot survive truncation as a
-        /// partial fragment, so a full-token `replace` is a complete redaction.
+        /// alignment guarantees truncation can only strand *complete* lines, so
+        /// a caller redacting per line/segment need never chase a mid-line
+        /// fragment left by the cap.
         stderr: Vec<u8>,
     },
     TimedOut,
