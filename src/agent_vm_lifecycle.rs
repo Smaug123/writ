@@ -186,22 +186,26 @@ pub struct ProcessInvocation {
     args: Vec<OsString>,
 }
 
-/// The captured result of a [`ProcessInvocation`] regardless of its exit status,
-/// for callers that need the output even on failure — e.g. polling `container
+/// The captured result of a [`ProcessInvocation`] run under a byte cap, for
+/// callers that need the output even on failure — e.g. polling `container
 /// inspect` (whose non-zero exit while the VM is still being created is benign)
 /// or salvaging `container logs` when the tool itself exits non-zero.
+///
+/// `status` is `None` when the child was killed to enforce the cap (or before it
+/// exited on its own); `truncated` records whether either stream hit the cap.
 #[derive(Clone, Debug)]
-pub struct CapturedOutput {
-    pub status: std::process::ExitStatus,
+pub struct BoundedOutput {
+    pub status: Option<std::process::ExitStatus>,
     pub stdout: String,
     pub stderr: String,
+    pub truncated: bool,
 }
 
-impl CapturedOutput {
+impl BoundedOutput {
     /// stdout and stderr concatenated (stdout first), for diagnostics that do not
     /// care which stream a line came from.
-    pub fn combined(&self) -> String {
-        let mut out = self.stdout.clone();
+    pub fn combined(self) -> String {
+        let mut out = self.stdout;
         if !self.stderr.is_empty() {
             if !out.is_empty() && !out.ends_with('\n') {
                 out.push('\n');
@@ -1288,16 +1292,83 @@ impl ProcessInvocation {
         }
     }
 
-    /// Run the invocation and capture both streams and the exit status,
-    /// regardless of exit code — unlike [`Self::run_capturing_stdout`], a
-    /// non-zero exit does not discard the output. Only a failure to *spawn* the
-    /// process is an error; the caller inspects `status` itself.
-    pub fn run_capturing_output(&self) -> Result<CapturedOutput, ProcessInvocationError> {
-        let output = self.output()?;
-        Ok(CapturedOutput {
-            status: output.status,
-            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    /// Run the invocation via `tokio::process` and capture both streams and the
+    /// exit status, capping each stream at `max_bytes` — unlike
+    /// [`Self::run_capturing_stdout`], a non-zero exit does not discard the output.
+    ///
+    /// Two properties matter for the broker readiness path:
+    /// - **Bounded memory.** At most `max_bytes` per stream is buffered; a child
+    ///   that keeps writing past the cap is killed rather than drained, so a
+    ///   chatty process cannot force an unbounded host allocation. `truncated`
+    ///   records whether the cap was hit and `status` is `None` if the child was
+    ///   killed before exiting.
+    /// - **Cancellation kills the child.** `kill_on_drop(true)` means that if the
+    ///   caller drops this future (e.g. an outer `tokio::time::timeout` fires
+    ///   because `container inspect` wedged), the child process is killed instead
+    ///   of leaking.
+    ///
+    /// Only a failure to *spawn* the process is an error; the caller inspects
+    /// `status` itself. Deadlock-free for the well-behaved tools used here
+    /// (`container inspect`/`logs`, which write essentially one stream and exit);
+    /// it does not attempt to drain a child that floods both pipes past the cap.
+    pub async fn run_capturing_output_bounded(
+        &self,
+        max_bytes: usize,
+    ) -> Result<BoundedOutput, ProcessInvocationError> {
+        use tokio::io::AsyncReadExt as _;
+
+        let mut command = tokio::process::Command::new(&self.program);
+        command
+            .args(&self.args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        let mut child = command
+            .spawn()
+            .map_err(|source| ProcessInvocationError::Run {
+                program: self.program.display().to_string(),
+                args: self.args_display(),
+                source,
+            })?;
+        let mut stdout_pipe = child.stdout.take().expect("stdout was piped");
+        let mut stderr_pipe = child.stderr.take().expect("stderr was piped");
+
+        // Read one byte past the cap so truncation is detectable, then stop.
+        let probe = max_bytes as u64 + 1;
+        let mut stdout_buf = Vec::new();
+        let mut stderr_buf = Vec::new();
+        let mut stdout_take = (&mut stdout_pipe).take(probe);
+        let mut stderr_take = (&mut stderr_pipe).take(probe);
+        let (out_res, err_res) = tokio::join!(
+            stdout_take.read_to_end(&mut stdout_buf),
+            stderr_take.read_to_end(&mut stderr_buf),
+        );
+        out_res.map_err(|source| ProcessInvocationError::Run {
+            program: self.program.display().to_string(),
+            args: self.args_display(),
+            source,
+        })?;
+        err_res.map_err(|source| ProcessInvocationError::Run {
+            program: self.program.display().to_string(),
+            args: self.args_display(),
+            source,
+        })?;
+
+        let truncated = stdout_buf.len() as u64 >= probe || stderr_buf.len() as u64 >= probe;
+        stdout_buf.truncate(max_bytes);
+        stderr_buf.truncate(max_bytes);
+
+        // Stop the child (no-op if it already exited at EOF) and reap it, so we
+        // never leave a zombie or a process blocked writing to a full pipe.
+        let _ = child.start_kill();
+        let status = child.wait().await.ok();
+
+        Ok(BoundedOutput {
+            status,
+            stdout: String::from_utf8_lossy(&stdout_buf).into_owned(),
+            stderr: String::from_utf8_lossy(&stderr_buf).into_owned(),
+            truncated,
         })
     }
 

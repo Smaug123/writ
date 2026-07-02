@@ -299,3 +299,33 @@ fn assert_tmpfs_mounts_present(args: &[String]) {
         .collect::<Vec<_>>();
     assert_eq!(tmpfs_mounts, AGENT_VM_TMPFS_MOUNTS);
 }
+
+#[tokio::test]
+async fn run_capturing_output_bounded_returns_full_small_output() {
+    let inv = ProcessInvocation::new(
+        std::path::PathBuf::from("/bin/sh"),
+        ["-c".to_string(), "printf hello".to_string()],
+    );
+    let out = inv.run_capturing_output_bounded(1024).await.unwrap();
+    assert!(!out.truncated, "small output must not be flagged truncated");
+    assert_eq!(out.stdout, "hello");
+    assert!(
+        out.status.is_some_and(|s| s.success()),
+        "the process must exit successfully: {:?}",
+        out.status
+    );
+}
+
+#[tokio::test]
+async fn run_capturing_output_bounded_caps_and_does_not_hang_on_a_flood() {
+    // The child writes far more than the cap (then exits); the capture must stop
+    // at the cap, flag truncation, and return promptly rather than draining or
+    // hanging (a regression guard for the bounded/killable log + inspect probes).
+    let inv = ProcessInvocation::new(
+        std::path::PathBuf::from("/bin/sh"),
+        ["-c".to_string(), "head -c 4096 /dev/zero".to_string()],
+    );
+    let out = inv.run_capturing_output_bounded(64).await.unwrap();
+    assert!(out.truncated, "output beyond the cap must flag truncation");
+    assert_eq!(out.stdout.len(), 64, "stdout must be capped at max_bytes");
+}

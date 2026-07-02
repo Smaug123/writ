@@ -26,6 +26,11 @@ use crate::core::BrokerPort;
 /// error string.
 const BROKER_LOG_CAPTURE_BYTES: usize = 16 * 1024;
 
+/// Byte cap on a single `container inspect` liveness poll. The status JSON is
+/// small; the cap just guarantees the read is bounded regardless of what the
+/// container tool emits.
+const BROKER_INSPECT_CAP_BYTES: usize = 1024 * 1024;
+
 #[derive(Debug, thiserror::Error)]
 pub enum BrokerVmLaunchError {
     #[error("creating the shared internal network failed: {0}")]
@@ -178,11 +183,15 @@ async fn wait_for_ready_or_exit(
         }
         // Liveness: has the broker VM exited before publishing readiness? A failure
         // to run or parse `inspect` (e.g. the VM is not yet created) is benign —
-        // it degrades to "not terminal", and we keep waiting.
+        // it degrades to "not terminal", and we keep waiting. `kill_on_drop` in the
+        // bounded runner means a wedged inspect is killed if the caller's outer
+        // timeout drops this future, so it can't leak a process.
         let inspect = plan.inspect_invocation();
-        let inspected = tokio::task::spawn_blocking(move || inspect.run_capturing_output()).await?;
+        let inspected = inspect
+            .run_capturing_output_bounded(BROKER_INSPECT_CAP_BYTES)
+            .await;
         if let Ok(output) = inspected
-            && output.status.success()
+            && output.status.is_some_and(|status| status.success())
             && let BrokerVmState::Terminal(state) = parse_broker_state(&output.stdout)
         {
             // The broker can bind, publish `ready`, and exit between our file
@@ -242,8 +251,11 @@ fn gate_ready_doc(ready_file: &Path, expected_port: BrokerPort) -> Result<(), Br
 /// the error still explains what happened.
 async fn capture_broker_logs(plan: &BrokerVmPlan) -> String {
     let logs = plan.logs_invocation();
-    match tokio::task::spawn_blocking(move || logs.run_capturing_output()).await {
-        Ok(Ok(output)) => {
+    match logs
+        .run_capturing_output_bounded(BROKER_LOG_CAPTURE_BYTES)
+        .await
+    {
+        Ok(output) => {
             let combined = output.combined();
             let trimmed = combined.trim();
             if trimmed.is_empty() {
@@ -252,8 +264,7 @@ async fn capture_broker_logs(plan: &BrokerVmPlan) -> String {
                 tail(trimmed, BROKER_LOG_CAPTURE_BYTES)
             }
         }
-        Ok(Err(err)) => format!("(could not read broker logs: {err})"),
-        Err(join) => format!("(broker log capture task failed: {join})"),
+        Err(err) => format!("(could not read broker logs: {err})"),
     }
 }
 
