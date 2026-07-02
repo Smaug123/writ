@@ -7,8 +7,8 @@
 //! session, which agent subnet, which fixed `bind_addr:broker_port`), and a
 //! bearer-token file. This process validates all of that, binds the *named*
 //! port (vs. the host daemon's OS-chosen ephemeral port), serves the session,
-//! and signals readiness by atomically creating `--ready-file` only once the
-//! listener is accepting.
+//! and signals readiness by atomically creating the ready file named in the
+//! session spec only once the listener is accepting.
 //!
 //! Differences from the host daemon (`writd` with no subcommand) are deliberate
 //! and load-bearing:
@@ -29,9 +29,7 @@ use std::time::{Duration, Instant};
 
 use crate::audit::{AuditError, AuditLog};
 use crate::broker_protocol::BrokerReadyDoc;
-use crate::broker_session::{
-    BearerTokenFileError, BrokerSessionSpec, BrokerSessionSpecError, read_bearer_token_file,
-};
+use crate::broker_session::{BearerTokenFileError, BrokerSessionSpec, read_bearer_token_file};
 use crate::config::{
     AgentVmHttpConfigError, DaemonConfig, SecretStoreConfig, default_audit_db_path,
 };
@@ -63,13 +61,17 @@ const EGRESS_PROBE_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const EGRESS_PROBE_INTERVAL: Duration = Duration::from_secs(2);
 const EGRESS_PROBE_DEADLINE: Duration = Duration::from_secs(90);
 
-/// Inputs for [`run_broker`], parsed from the `writd broker` command line.
+/// Inputs for [`run_broker`]. The `writd broker` bin parses the argv paths and,
+/// crucially, reads + parses the session spec itself (so telemetry can be
+/// installed from the spec's log-file field before `run_broker` runs); interior
+/// code therefore receives the typed [`BrokerSessionSpec`], not a path. The
+/// spec also carries the ready-file target, so neither is a CLI argument — the
+/// `writd broker` argv is frozen to `--config --session-spec --bearer-token-file`.
 #[derive(Debug, Clone)]
 pub struct BrokerArgs {
     pub config: PathBuf,
-    pub session_spec: PathBuf,
+    pub session_spec: BrokerSessionSpec,
     pub bearer_token_file: PathBuf,
-    pub ready_file: Option<PathBuf>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -100,8 +102,6 @@ pub enum BrokerRunError {
     AgentVmConfigMissing,
     #[error("invalid vm_http config: {0}")]
     VmHttpConfig(#[from] AgentVmHttpConfigError),
-    #[error(transparent)]
-    SessionSpec(#[from] BrokerSessionSpecError),
     #[error(transparent)]
     BearerToken(#[from] BearerTokenFileError),
     #[error("session spec broker_port is invalid: {source}")]
@@ -282,7 +282,9 @@ async fn prepare_broker(args: &BrokerArgs) -> Result<PreparedBroker, BrokerRunEr
         .ok_or(BrokerRunError::AgentVmConfigMissing)?;
     let vm_http_config = agent_vm.vm_http.to_runtime_config()?;
 
-    let spec = BrokerSessionSpec::read_file(&args.session_spec)?;
+    // The spec is already parsed by the bin (it needed the log-file field to set
+    // up telemetry before this runs); interior code just reads the typed value.
+    let spec = &args.session_spec;
     let broker_port = validate_broker_port(spec.broker_port, vm_http_config.broker_port_range())?;
     let bearer = read_bearer_token_file(&args.bearer_token_file)?;
 
@@ -524,7 +526,7 @@ pub async fn run_broker(args: BrokerArgs) -> Result<(), BrokerRunError> {
     .await?;
     serve_broker(
         prepared.session,
-        args.ready_file.as_deref(),
+        Some(args.session_spec.ready_file.as_path()),
         shutdown_signal(),
         SHUTDOWN_GRACE,
     )
@@ -912,27 +914,30 @@ mod tests {
         )
         .unwrap();
 
+        let ready_path = dir.path().join("ready");
+        let log_path = dir.path().join("broker.log.jsonl");
         let spec_path = dir.path().join("session-spec.json");
         std::fs::write(
             &spec_path,
             format!(
-                r#"{{"version":1,"session_id":"{session_id}","agent_ipv4_cidr":"127.0.0.0/8",
-                     "bind_addr":"127.0.0.1","broker_port":{port}}}"#
+                r#"{{"version":2,"session_id":"{session_id}","agent_ipv4_cidr":"127.0.0.0/8",
+                     "bind_addr":"127.0.0.1","broker_port":{port},
+                     "ready_file":"{ready}","log_file":"{log}"}}"#,
+                ready = ready_path.display(),
+                log = log_path.display(),
             ),
         )
         .unwrap();
+        let spec = BrokerSessionSpec::read_file(&spec_path).unwrap();
 
         let token = "writ-vm-itoken";
         let token_path = dir.path().join("bearer-token");
         std::fs::write(&token_path, format!("{token}\n")).unwrap();
 
-        let ready_path = dir.path().join("ready");
-
         let args = BrokerArgs {
             config: config_path,
-            session_spec: spec_path,
+            session_spec: spec,
             bearer_token_file: token_path,
-            ready_file: Some(ready_path.clone()),
         };
 
         let prepared = prepare_broker(&args).await.unwrap();

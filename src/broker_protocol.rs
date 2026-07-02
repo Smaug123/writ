@@ -31,7 +31,7 @@ use serde::{Deserialize, Serialize};
 /// A CI test (`broker_contract_fingerprint_is_pinned`) derives a structural
 /// fingerprint of that contract and fails when it changes, so a contract change
 /// that forgets to bump this constant is caught at CI, before an image is built.
-pub const BROKER_PROTOCOL_VERSION: u32 = 1;
+pub const BROKER_PROTOCOL_VERSION: u32 = 2;
 
 /// The synthetic version assigned to a *legacy* bare-port ready file — one
 /// written by a pre-handshake broker image. It is distinct from every real

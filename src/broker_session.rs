@@ -15,6 +15,48 @@ use std::path::Path;
 use crate::core::{BrokerPort, Ipv4Cidr, SessionId};
 use crate::vm_http::{VmHttpBearerToken, VmHttpConfigError};
 
+/// An absolute path *in the guest filesystem*, carried in the session spec for
+/// the broker to use once it is running (its log sink and its ready-file target).
+/// Parse-don't-validate: non-empty, absolute, and free of interior NUL, so an
+/// empty/relative/unusable guest path is unrepresentable in interior code. The
+/// host cannot check more than this — the path is only resolved inside the guest.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct GuestAbsPath(String);
+
+#[derive(Debug, thiserror::Error)]
+pub enum GuestAbsPathError {
+    #[error("guest path is empty")]
+    Empty,
+    #[error("guest path {0:?} is not absolute (must start with '/')")]
+    NotAbsolute(String),
+    #[error("guest path {0:?} contains an interior NUL byte")]
+    InteriorNul(String),
+}
+
+impl GuestAbsPath {
+    pub fn new(raw: impl Into<String>) -> Result<Self, GuestAbsPathError> {
+        let raw = raw.into();
+        if raw.is_empty() {
+            return Err(GuestAbsPathError::Empty);
+        }
+        if !raw.starts_with('/') {
+            return Err(GuestAbsPathError::NotAbsolute(raw));
+        }
+        if raw.contains('\0') {
+            return Err(GuestAbsPathError::InteriorNul(raw));
+        }
+        Ok(Self(raw))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn as_path(&self) -> &Path {
+        Path::new(&self.0)
+    }
+}
+
 /// A validated broker session spec. Constructed only via [`BrokerSessionSpec::parse_json`]
 /// / [`BrokerSessionSpec::read_file`], so interior code gets typed fields.
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -25,6 +67,14 @@ pub struct BrokerSessionSpec {
     /// The fixed broker port; range-checked against the configured `vm_http`
     /// port range at the call site, not here.
     pub broker_port: u16,
+    /// Guest path the broker atomically creates once it is serving; the host
+    /// watches the host-mount side of it. Carried in the spec (not on the argv)
+    /// so the `writd broker` argument vector stays frozen — see
+    /// `docs/plans/2026-07-02-broker-params-into-session-spec.md`.
+    pub ready_file: GuestAbsPath,
+    /// Guest path the broker mirrors its JSON tracing to, for the host daemon to
+    /// tail. Also carried in the spec rather than on the argv.
+    pub log_file: GuestAbsPath,
 }
 
 /// The only session-spec schema version this broker understands. A spec at any
@@ -33,7 +83,7 @@ pub struct BrokerSessionSpec {
 /// unknown-field parse error — so a version-skewed host↔broker pair fails loudly
 /// and fast. Bump this in lockstep with the wire schema and
 /// [`crate::broker_protocol::BROKER_PROTOCOL_VERSION`].
-pub const SUPPORTED_SESSION_SPEC_VERSION: u32 = 1;
+pub const SUPPORTED_SESSION_SPEC_VERSION: u32 = 2;
 
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -43,6 +93,8 @@ struct RawBrokerSessionSpec {
     agent_ipv4_cidr: String,
     bind_addr: String,
     broker_port: u16,
+    ready_file: String,
+    log_file: String,
 }
 
 /// A tolerant envelope read *before* the strict body: it recovers only the
@@ -79,6 +131,12 @@ pub enum BrokerSessionSpecError {
     BindAddr(String),
     #[error("session spec broker_port must be non-zero")]
     ZeroPort,
+    #[error("session spec {field} is not a valid guest path: {source}")]
+    GuestPath {
+        field: &'static str,
+        #[source]
+        source: GuestAbsPathError,
+    },
 }
 
 impl BrokerSessionSpec {
@@ -93,16 +151,20 @@ impl BrokerSessionSpec {
         agent_ipv4_cidr: Ipv4Cidr,
         bind_addr: Ipv4Addr,
         broker_port: BrokerPort,
+        ready_file: GuestAbsPath,
+        log_file: GuestAbsPath,
     ) -> Self {
         Self {
             session_id,
             agent_ipv4_cidr,
             bind_addr,
             broker_port: broker_port.get(),
+            ready_file,
+            log_file,
         }
     }
 
-    /// Serialise to the version-1 wire form the broker VM parses with
+    /// Serialise to the current-version wire form the broker VM parses with
     /// [`Self::parse_json`]. Round-trips: `parse_json(spec.to_json()) == spec`.
     pub fn to_json(&self) -> String {
         let raw = RawBrokerSessionSpec {
@@ -111,6 +173,8 @@ impl BrokerSessionSpec {
             agent_ipv4_cidr: self.agent_ipv4_cidr.to_string(),
             bind_addr: self.bind_addr.to_string(),
             broker_port: self.broker_port,
+            ready_file: self.ready_file.as_str().to_string(),
+            log_file: self.log_file.as_str().to_string(),
         };
         serde_json::to_string(&raw).expect("a broker session spec always serialises")
     }
@@ -140,11 +204,25 @@ impl BrokerSessionSpec {
         if raw.broker_port == 0 {
             return Err(BrokerSessionSpecError::ZeroPort);
         }
+        let ready_file = GuestAbsPath::new(raw.ready_file).map_err(|source| {
+            BrokerSessionSpecError::GuestPath {
+                field: "ready_file",
+                source,
+            }
+        })?;
+        let log_file = GuestAbsPath::new(raw.log_file).map_err(|source| {
+            BrokerSessionSpecError::GuestPath {
+                field: "log_file",
+                source,
+            }
+        })?;
         Ok(Self {
             session_id,
             agent_ipv4_cidr,
             bind_addr,
             broker_port: raw.broker_port,
+            ready_file,
+            log_file,
         })
     }
 
@@ -223,9 +301,10 @@ mod tests {
 
     fn valid_spec_json(overrides: &str) -> String {
         format!(
-            r#"{{"version":1,"session_id":"51b8fd0f-6c10-454c-b0e6-7df1d60e2e6d",
+            r#"{{"version":2,"session_id":"51b8fd0f-6c10-454c-b0e6-7df1d60e2e6d",
                  "agent_ipv4_cidr":"192.168.252.0/24","bind_addr":"0.0.0.0",
-                 "broker_port":18080{overrides}}}"#
+                 "broker_port":18080,"ready_file":"/writ/session/ready",
+                 "log_file":"/writ/session/broker.log.jsonl"{overrides}}}"#
         )
     }
 
@@ -244,6 +323,8 @@ mod tests {
         );
         assert_eq!(spec.bind_addr, Ipv4Addr::UNSPECIFIED);
         assert_eq!(spec.broker_port, 18080);
+        assert_eq!(spec.ready_file.as_str(), "/writ/session/ready");
+        assert_eq!(spec.log_file.as_str(), "/writ/session/broker.log.jsonl");
     }
 
     #[test]
@@ -255,6 +336,8 @@ mod tests {
             Ipv4Cidr::new(Ipv4Addr::new(192, 168, 252, 0), 24).unwrap(),
             Ipv4Addr::UNSPECIFIED,
             BrokerPort::new(18080).unwrap(),
+            GuestAbsPath::new("/writ/session/ready").unwrap(),
+            GuestAbsPath::new("/writ/session/broker.log.jsonl").unwrap(),
         );
         let parsed = BrokerSessionSpec::parse_json(&spec.to_json()).unwrap();
         assert_eq!(parsed, spec);
@@ -262,18 +345,22 @@ mod tests {
 
     #[test]
     fn rejects_unsupported_version() {
-        let json = r#"{"version":2,"session_id":"51b8fd0f-6c10-454c-b0e6-7df1d60e2e6d","agent_ipv4_cidr":"192.168.252.0/24","bind_addr":"0.0.0.0","broker_port":18080}"#;
+        // 3 is above the supported version, so the version gate fires before the
+        // body is even parsed (the doc omits the v2 path fields on purpose).
+        let json = r#"{"version":3,"session_id":"51b8fd0f-6c10-454c-b0e6-7df1d60e2e6d","agent_ipv4_cidr":"192.168.252.0/24","bind_addr":"0.0.0.0","broker_port":18080}"#;
         assert!(matches!(
             BrokerSessionSpec::parse_json(json),
-            Err(BrokerSessionSpecError::UnsupportedVersion(2))
+            Err(BrokerSessionSpecError::UnsupportedVersion(3))
         ));
     }
 
     #[test]
     fn rejects_unknown_fields() {
-        let json = r#"{"version":1,"session_id":"51b8fd0f-6c10-454c-b0e6-7df1d60e2e6d","agent_ipv4_cidr":"192.168.252.0/24","bind_addr":"0.0.0.0","broker_port":18080,"surprise":true}"#;
+        // A fully valid v2 spec plus one stray field: within a supported version,
+        // an unknown field is still a hard error (host-typo detection).
+        let json = valid_spec_json(r#","surprise":true"#);
         assert!(matches!(
-            BrokerSessionSpec::parse_json(json),
+            BrokerSessionSpec::parse_json(&json),
             Err(BrokerSessionSpecError::Json(_))
         ));
     }
@@ -284,15 +371,57 @@ mod tests {
         // older broker reading that spec must report a clean version mismatch (the
         // host turns it into "rebuild the image"), NOT an opaque unknown-field JSON
         // error — so the version gate has to run *before* the strict body parse.
-        let json = r#"{"version":2,"session_id":"51b8fd0f-6c10-454c-b0e6-7df1d60e2e6d","agent_ipv4_cidr":"192.168.252.0/24","bind_addr":"0.0.0.0","broker_port":18080,"log_file":"/run/broker/log"}"#;
+        let json = r#"{"version":3,"session_id":"51b8fd0f-6c10-454c-b0e6-7df1d60e2e6d","agent_ipv4_cidr":"192.168.252.0/24","bind_addr":"0.0.0.0","broker_port":18080,"future_field":"whatever"}"#;
         assert!(
             matches!(
                 BrokerSessionSpec::parse_json(json),
-                Err(BrokerSessionSpecError::UnsupportedVersion(2))
+                Err(BrokerSessionSpecError::UnsupportedVersion(3))
             ),
             "got {:?}",
             BrokerSessionSpec::parse_json(json)
         );
+    }
+
+    #[test]
+    fn rejects_missing_guest_path_fields() {
+        // A v2 doc that omits a required guest-path field is a hard error (the
+        // strict body parse catches the missing field within the supported version).
+        let no_ready = r#"{"version":2,"session_id":"51b8fd0f-6c10-454c-b0e6-7df1d60e2e6d","agent_ipv4_cidr":"192.168.252.0/24","bind_addr":"0.0.0.0","broker_port":18080,"log_file":"/writ/session/broker.log.jsonl"}"#;
+        assert!(matches!(
+            BrokerSessionSpec::parse_json(no_ready),
+            Err(BrokerSessionSpecError::Json(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_non_absolute_guest_path() {
+        // A syntactically fine but relative guest path is rejected as a typed
+        // GuestPath error naming the field.
+        let json = valid_spec_json("").replace("/writ/session/ready", "relative/ready");
+        assert!(matches!(
+            BrokerSessionSpec::parse_json(&json),
+            Err(BrokerSessionSpecError::GuestPath {
+                field: "ready_file",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn guest_abs_path_rejects_empty_and_relative() {
+        assert!(matches!(
+            GuestAbsPath::new(""),
+            Err(GuestAbsPathError::Empty)
+        ));
+        assert!(matches!(
+            GuestAbsPath::new("relative/path"),
+            Err(GuestAbsPathError::NotAbsolute(_))
+        ));
+        assert!(matches!(
+            GuestAbsPath::new("/has/\0/nul"),
+            Err(GuestAbsPathError::InteriorNul(_))
+        ));
+        assert_eq!(GuestAbsPath::new("/ok").unwrap().as_str(), "/ok");
     }
 
     proptest! {
@@ -323,9 +452,12 @@ mod tests {
 
     #[test]
     fn rejects_bad_session_id() {
-        let json = r#"{"version":1,"session_id":"not-a-uuid","agent_ipv4_cidr":"192.168.252.0/24","bind_addr":"0.0.0.0","broker_port":18080}"#;
+        // Corrupt exactly one field of an otherwise-valid v2 spec so the version
+        // gate passes and the body validation is what rejects it.
+        let json =
+            valid_spec_json("").replace("51b8fd0f-6c10-454c-b0e6-7df1d60e2e6d", "not-a-uuid");
         assert!(matches!(
-            BrokerSessionSpec::parse_json(json),
+            BrokerSessionSpec::parse_json(&json),
             Err(BrokerSessionSpecError::SessionId(_))
         ));
     }
@@ -338,9 +470,7 @@ mod tests {
             "192.168.252.5/24",
             "nope/24",
         ] {
-            let json = format!(
-                r#"{{"version":1,"session_id":"51b8fd0f-6c10-454c-b0e6-7df1d60e2e6d","agent_ipv4_cidr":"{cidr}","bind_addr":"0.0.0.0","broker_port":18080}}"#
-            );
+            let json = valid_spec_json("").replace("192.168.252.0/24", cidr);
             assert!(
                 matches!(
                     BrokerSessionSpec::parse_json(&json),
@@ -353,14 +483,15 @@ mod tests {
 
     #[test]
     fn rejects_bad_bind_addr_and_zero_port() {
-        let bad_addr = r#"{"version":1,"session_id":"51b8fd0f-6c10-454c-b0e6-7df1d60e2e6d","agent_ipv4_cidr":"192.168.252.0/24","bind_addr":"not-an-ip","broker_port":18080}"#;
+        let bad_addr =
+            valid_spec_json("").replace(r#""bind_addr":"0.0.0.0""#, r#""bind_addr":"not-an-ip""#);
         assert!(matches!(
-            BrokerSessionSpec::parse_json(bad_addr),
+            BrokerSessionSpec::parse_json(&bad_addr),
             Err(BrokerSessionSpecError::BindAddr(_))
         ));
-        let zero_port = r#"{"version":1,"session_id":"51b8fd0f-6c10-454c-b0e6-7df1d60e2e6d","agent_ipv4_cidr":"192.168.252.0/24","bind_addr":"0.0.0.0","broker_port":0}"#;
+        let zero_port = valid_spec_json("").replace(r#""broker_port":18080"#, r#""broker_port":0"#);
         assert!(matches!(
-            BrokerSessionSpec::parse_json(zero_port),
+            BrokerSessionSpec::parse_json(&zero_port),
             Err(BrokerSessionSpecError::ZeroPort)
         ));
     }
