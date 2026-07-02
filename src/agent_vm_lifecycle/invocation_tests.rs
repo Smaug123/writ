@@ -299,3 +299,151 @@ fn assert_tmpfs_mounts_present(args: &[String]) {
         .collect::<Vec<_>>();
     assert_eq!(tmpfs_mounts, AGENT_VM_TMPFS_MOUNTS);
 }
+
+#[tokio::test]
+async fn run_capturing_output_bounded_returns_full_small_output() {
+    let inv = ProcessInvocation::new(
+        std::path::PathBuf::from("/bin/sh"),
+        ["-c".to_string(), "printf hello".to_string()],
+    );
+    let out = inv.run_capturing_output_bounded(1024).await.unwrap();
+    assert!(!out.truncated, "small output must not be flagged truncated");
+    assert_eq!(out.stdout, "hello");
+    assert!(
+        out.status.is_some_and(|s| s.success()),
+        "the process must exit successfully: {:?}",
+        out.status
+    );
+}
+
+#[tokio::test]
+async fn run_capturing_output_bounded_caps_and_does_not_hang_on_a_flood() {
+    // The child writes far more than the cap (then exits); the capture must stop
+    // at the cap, flag truncation, and return promptly rather than draining or
+    // hanging (a regression guard for the bounded/killable log + inspect probes).
+    let inv = ProcessInvocation::new(
+        std::path::PathBuf::from("/bin/sh"),
+        ["-c".to_string(), "head -c 4096 /dev/zero".to_string()],
+    );
+    let out = inv.run_capturing_output_bounded(64).await.unwrap();
+    assert!(out.truncated, "output beyond the cap must flag truncation");
+    assert_eq!(out.stdout.len(), 64, "stdout must be capped at max_bytes");
+}
+
+#[tokio::test]
+async fn run_capturing_output_bounded_keeps_exactly_max_bytes_without_flagging_truncation() {
+    // An output of exactly the cap followed by EOF is complete, not truncated,
+    // and the child exits cleanly — the capture must not kill it (which would
+    // forge a kill signal in place of its real exit status).
+    let inv = ProcessInvocation::new(
+        std::path::PathBuf::from("/bin/sh"),
+        ["-c".to_string(), "head -c 64 /dev/zero".to_string()],
+    );
+    let out = inv.run_capturing_output_bounded(64).await.unwrap();
+    assert!(
+        !out.truncated,
+        "output of exactly max_bytes must not flag truncation"
+    );
+    assert_eq!(out.stdout.len(), 64);
+    assert!(
+        out.status.is_some_and(|s| s.success()),
+        "a clean exit at exactly the cap must be preserved, not killed: {:?}",
+        out.status
+    );
+}
+
+#[tokio::test]
+async fn run_capturing_merged_tail_keeps_short_output_whole() {
+    let inv = ProcessInvocation::new(
+        std::path::PathBuf::from("/bin/sh"),
+        ["-c".to_string(), "printf 'the-whole-log'".to_string()],
+    );
+    let out = inv.run_capturing_merged_tail(1024).await.unwrap();
+    assert!(
+        !out.truncated,
+        "output within the cap must not flag truncation"
+    );
+    assert_eq!(out.text, "the-whole-log");
+}
+
+#[tokio::test]
+async fn run_capturing_merged_tail_keeps_the_newest_bytes() {
+    // Unlike the head-keeping bounded capture, the tail capture must retain the
+    // *end* of a stream that exceeds the cap — that is where a crash log's
+    // actual error lives. Bracket a large filler with distinct start/end
+    // markers; only the end marker may survive.
+    let inv = ProcessInvocation::new(
+        std::path::PathBuf::from("/bin/sh"),
+        [
+            "-c".to_string(),
+            "printf OLDSTART; head -c 20000 /dev/zero; printf NEWEND".to_string(),
+        ],
+    );
+    let out = inv.run_capturing_merged_tail(64).await.unwrap();
+    assert!(out.truncated, "a stream past the cap must flag truncation");
+    assert!(out.text.len() <= 64, "the tail must stay within the cap");
+    assert!(
+        out.text.contains("NEWEND"),
+        "the newest bytes (the error) must survive: {:?}",
+        out.text
+    );
+    assert!(
+        !out.text.contains("OLDSTART"),
+        "the oldest bytes must be discarded: {:?}",
+        out.text
+    );
+}
+
+#[tokio::test]
+async fn run_capturing_merged_tail_does_not_hang_on_a_large_one_sided_stream() {
+    // Draining to EOF (never stopping early) means a flood is discarded, not
+    // wedged; the child exits and the call returns promptly.
+    let inv = ProcessInvocation::new(
+        std::path::PathBuf::from("/bin/sh"),
+        ["-c".to_string(), "head -c 524288 /dev/zero".to_string()],
+    );
+    let out = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        inv.run_capturing_merged_tail(64),
+    )
+    .await
+    .expect("merged tail must not hang on a large stream")
+    .expect("spawn must succeed");
+    assert!(out.truncated);
+    assert!(out.text.len() <= 64);
+}
+
+#[tokio::test]
+async fn run_capturing_output_bounded_does_not_deadlock_on_a_one_sided_flood_past_the_pipe_buffer()
+{
+    // Regression: a child that floods *one* stream far past the OS pipe buffer
+    // (~64 KiB) while writing nothing to the other must not wedge the capture.
+    // If we stop draining stdout at the cap but still wait for stderr EOF, the
+    // child blocks on the full stdout pipe and never exits (so never closes
+    // stderr) -> deadlock. The capture must kill the child once a stream caps
+    // and reap it, returning promptly regardless of whether the other stream
+    // ever EOFs. The outer timeout turns a deadlock into a failure instead of a
+    // hung test; a healthy capture returns in milliseconds.
+    //
+    // The trailing `; :` is load-bearing: it forces the shell to *fork* `head`
+    // as a grandchild rather than exec-optimizing into it (a single simple
+    // command is exec'd by bash but not by dash). Killing the shell then leaves
+    // `head` orphaned, still holding the *stderr* write-end open while blocked
+    // on the undrained stdout pipe — so a capture that waits for stderr EOF
+    // hangs. Without the fork this reproduces only on dash (Linux CI), not on
+    // macOS's bash `/bin/sh`.
+    let inv = ProcessInvocation::new(
+        std::path::PathBuf::from("/bin/sh"),
+        // 512 KiB of stdout, far past the pipe buffer; not one byte of stderr.
+        ["-c".to_string(), "head -c 524288 /dev/zero; :".to_string()],
+    );
+    let out = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        inv.run_capturing_output_bounded(64),
+    )
+    .await
+    .expect("capture must not deadlock on a one-sided flood past the pipe buffer")
+    .expect("spawn must succeed");
+    assert!(out.truncated, "a flood past the cap must flag truncation");
+    assert_eq!(out.stdout.len(), 64, "stdout must be capped at max_bytes");
+}

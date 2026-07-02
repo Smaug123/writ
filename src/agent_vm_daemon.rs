@@ -1955,6 +1955,7 @@ impl AgentVmDaemon {
         let broker_ipv4 = launch_broker_vm(
             &broker_plan,
             &paths.staging_dir().join("ready"),
+            broker_port,
             BROKER_VM_READY_TIMEOUT,
             BROKER_VM_READY_POLL_INTERVAL,
         )

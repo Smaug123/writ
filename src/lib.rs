@@ -21,6 +21,8 @@ pub mod broker_entrypoint;
 #[cfg(feature = "host")]
 pub mod broker_log_forwarder;
 #[cfg(feature = "host")]
+pub mod broker_protocol;
+#[cfg(feature = "host")]
 pub mod broker_session;
 #[cfg(feature = "host")]
 pub mod broker_vm;

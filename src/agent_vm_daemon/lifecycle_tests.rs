@@ -132,6 +132,16 @@ fn vm_broker_host_config_json() -> String {
 fn write_vm_broker_fake_tool(dir: &Path, args_log: &Path, env_log: &Path) -> std::path::PathBuf {
     use std::os::unix::fs::PermissionsExt as _;
     let path = dir.join("fake-vm-broker");
+    // The real broker publishes a versioned ready doc; the host gates its protocol
+    // version and bound port (see `broker_vm_runner::gate_ready_doc`). The fake
+    // must therefore publish a *well-formed* doc for the fixed test port (1024,
+    // the low end of the config's broker port range), not an empty marker.
+    let ready_json = serde_json::to_string(&crate::broker_protocol::BrokerReadyDoc {
+        protocol_version: crate::broker_protocol::BROKER_PROTOCOL_VERSION,
+        broker_port: 1024,
+        writd_build: None,
+    })
+    .unwrap();
     let script = format!(
         "#!/bin/sh\n\
          printf '%s\\n' \"$*\" >> {args_log}\n\
@@ -141,7 +151,7 @@ fn write_vm_broker_fake_tool(dir: &Path, args_log: &Path, env_log: &Path) -> std
          printf '[{{\"status\":{{\"networks\":[{{\"network\":\"writ-agent-net-%s\",\"ipv4Address\":\"192.168.252.7/24\"}}],\"state\":\"running\"}}}}]\\n' \"$id\"; exit 0; fi\n\
          if [ \"$1\" = run ]; then prev=\"\";\n\
          for a in \"$@\"; do\n\
-         case \"$a\" in type=virtiofs,source=*,target=/writ/session*) s=\"${{a#type=virtiofs,source=}}\"; s=\"${{s%%,*}}\"; : > \"$s/ready\" ;; esac\n\
+         case \"$a\" in type=virtiofs,source=*,target=/writ/session*) s=\"${{a#type=virtiofs,source=}}\"; s=\"${{s%%,*}}\"; printf '%s' '{ready_json}' > \"$s/ready\" ;; esac\n\
          if [ \"$prev\" = --env-file ]; then printf '%s\\n' \"$a\" > {env_path}; cat \"$a\" > {env_log}; fi\n\
          prev=\"$a\"\n\
          done\n\
