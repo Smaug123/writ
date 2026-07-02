@@ -1254,8 +1254,11 @@ mod tests {
 
         // A fully-populated ready doc pins the field names and which fields
         // serialize; the exhaustive literal forces an update on a field addition.
+        // `protocol_version` is sourced from the real constant (not a literal), so
+        // bumping `BROKER_PROTOCOL_VERSION` alone breaks this snapshot too — the
+        // token cannot silently drift from the version the broker actually stamps.
         let ready_doc = crate::broker_protocol::BrokerReadyDoc {
-            protocol_version: 1,
+            protocol_version: crate::broker_protocol::BROKER_PROTOCOL_VERSION,
             broker_port: 18080,
             writd_build: Some("pinned".to_string()),
         };

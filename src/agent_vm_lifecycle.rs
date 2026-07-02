@@ -1349,7 +1349,7 @@ impl ProcessInvocation {
     ) -> Result<BoundedOutput, ProcessInvocationError> {
         use tokio::io::AsyncReadExt as _;
 
-        let mut child = self.spawn_piped()?;
+        let mut child = self.spawn_piped().await?;
         let mut stdout_pipe = child.stdout.take().expect("stdout was piped");
         let mut stderr_pipe = child.stderr.take().expect("stderr was piped");
 
@@ -1428,7 +1428,12 @@ impl ProcessInvocation {
     /// drop so that cancelling a capture future (e.g. via an outer
     /// `tokio::time::timeout`) kills the child rather than leaking it. Shared by
     /// the bounded capture readers.
-    fn spawn_piped(&self) -> Result<tokio::process::Child, ProcessInvocationError> {
+    ///
+    /// Goes through [`process_spawn::spawn_async`] so it retries a transient
+    /// `ETXTBSY` ("Text file busy") on the spawn, consistent with the sync
+    /// [`Self::output`] path — a freshly written tool racing a sibling thread's
+    /// `fork` would otherwise flakily fail the spawn.
+    async fn spawn_piped(&self) -> Result<tokio::process::Child, ProcessInvocationError> {
         let mut command = tokio::process::Command::new(&self.program);
         command
             .args(&self.args)
@@ -1436,7 +1441,9 @@ impl ProcessInvocation {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
-        command.spawn().map_err(|source| self.run_error(source))
+        process_spawn::spawn_async(&mut command)
+            .await
+            .map_err(|source| self.run_error(source))
     }
 
     /// Capture the *last* `max_bytes` of the child's merged stdout+stderr — a
@@ -1458,7 +1465,7 @@ impl ProcessInvocation {
     ) -> Result<CapturedTail, ProcessInvocationError> {
         use tokio::io::AsyncReadExt as _;
 
-        let mut child = self.spawn_piped()?;
+        let mut child = self.spawn_piped().await?;
         let mut stdout_pipe = child.stdout.take().expect("stdout was piped");
         let mut stderr_pipe = child.stderr.take().expect("stderr was piped");
 
