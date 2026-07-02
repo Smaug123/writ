@@ -179,19 +179,38 @@ pub async fn teardown_broker_vm(plan: &BrokerVmPlan) -> Vec<String> {
 }
 
 /// Wait for the broker to publish `ready_file`, but fail fast if the broker VM
-/// exits first. Polls both the ready file and (via `container inspect`) the VM's
-/// lifecycle state every `poll_interval`:
+/// exits first:
 ///
 /// - ready file present → `Ok`.
 /// - VM observed in a terminal state before the file appears → `ExitedBeforeReady`
 ///   with the broker's captured logs — turning the old 180s opaque timeout into a
 ///   seconds-fast, self-explaining error for a stale/broken image.
 ///
-/// This loops indefinitely on a healthy-but-slow (or unrecognised-state) VM; the
-/// caller wraps it in `tokio::time::timeout(ready_timeout, …)`, which is what
-/// yields `ReadyTimeout` and bounds a wedged `inspect`.
+/// The two checks run as *independent* concurrent pollers raced with `select!`,
+/// so the fast ready-file `stat` keeps its own `poll_interval` cadence and is
+/// never starved behind a slow `container inspect`: a broker that becomes ready
+/// while an inspect call is in flight is noticed immediately. `select!` is
+/// `biased` toward readiness so a broker that raced ready-then-exit is reported
+/// `Ok`, not as a crash.
+///
+/// Both pollers loop until they conclude; the caller wraps this in
+/// `tokio::time::timeout(ready_timeout, …)`, which yields `ReadyTimeout` on a
+/// healthy-but-slow VM and — via `kill_on_drop` — bounds a wedged `inspect`.
 async fn wait_for_ready_or_exit(
     plan: &BrokerVmPlan,
+    ready_file: &Path,
+    poll_interval: Duration,
+) -> Result<(), BrokerVmLaunchError> {
+    tokio::select! {
+        biased;
+        result = poll_ready_file(ready_file, poll_interval) => result,
+        result = poll_broker_liveness(plan, ready_file, poll_interval) => result,
+    }
+}
+
+/// Poll `ready_file` every `poll_interval` until it appears (→ `Ok`). Runs on
+/// its own cadence, independent of any `inspect` latency.
+async fn poll_ready_file(
     ready_file: &Path,
     poll_interval: Duration,
 ) -> Result<(), BrokerVmLaunchError> {
@@ -199,11 +218,23 @@ async fn wait_for_ready_or_exit(
         if ready_file_exists(ready_file)? {
             return Ok(());
         }
-        // Liveness: has the broker VM exited before publishing readiness? A failure
-        // to run or parse `inspect` (e.g. the VM is not yet created) is benign —
-        // it degrades to "not terminal", and we keep waiting. `kill_on_drop` in the
-        // bounded runner means a wedged inspect is killed if the caller's outer
-        // timeout drops this future, so it can't leak a process.
+        tokio::time::sleep(poll_interval).await;
+    }
+}
+
+/// Poll the broker VM's lifecycle via `container inspect` every `poll_interval`;
+/// return `ExitedBeforeReady` (with captured logs) the first time it is observed
+/// terminal without the ready file present. A failure to run or parse `inspect`
+/// (e.g. the VM is not yet created) is benign — it degrades to "not terminal"
+/// and we keep polling. Never returns `Ok` on its own; readiness is the
+/// [`poll_ready_file`] branch's job. `kill_on_drop` in the bounded runner means a
+/// wedged inspect is killed when the caller's outer timeout drops this future.
+async fn poll_broker_liveness(
+    plan: &BrokerVmPlan,
+    ready_file: &Path,
+    poll_interval: Duration,
+) -> Result<(), BrokerVmLaunchError> {
+    loop {
         let inspect = plan.inspect_invocation();
         let inspected = inspect
             .run_capturing_output_bounded(BROKER_INSPECT_CAP_BYTES)
@@ -212,9 +243,9 @@ async fn wait_for_ready_or_exit(
             && output.status.is_some_and(|status| status.success())
             && let BrokerVmState::Terminal(state) = parse_broker_state(&output.stdout)
         {
-            // The broker can bind, publish `ready`, and exit between our file
-            // check and this inspect; re-check the file so that benign race is not
-            // misreported as a crash.
+            // The broker can bind, publish `ready`, and exit before this inspect
+            // observes the terminal state; re-check the file so that benign race
+            // is not misreported as a crash.
             if ready_file_exists(ready_file)? {
                 return Ok(());
             }
@@ -426,6 +457,41 @@ if [ "$1" = logs ]; then exec sleep 300; fi
 exit 0
 "#,
             log = args_log.display(),
+        );
+        std::fs::write(&tool, script).unwrap();
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+        tool
+    }
+
+    /// A fake `container` whose `inspect` is *slow* (sleeps `sleep_secs`) but then
+    /// answers with a healthy running-VM JSON carrying `broker_ip`. Models a
+    /// container service under load: the ready-file poll must still notice a
+    /// broker that becomes ready while an inspect call is in flight.
+    fn write_fake_container_slow_inspect(
+        dir: &Path,
+        args_log: &Path,
+        broker_ip: &str,
+        sleep_secs: u32,
+    ) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tool = dir.join("fake-container-slow-inspect");
+        let script = format!(
+            r#"#!/bin/sh
+printf '%s\n' "$*" >> "{log}"
+if [ "$1" = inspect ]; then
+  sleep {sleep_secs}
+  cat <<'JSON'
+[ {{ "status": {{ "networks": [
+  {{ "network": "{net}", "ipv4Address": "{ip}/24", "ipv4Gateway": "192.168.252.1" }}
+], "state": "running" }} }} ]
+JSON
+fi
+exit 0
+"#,
+            log = args_log.display(),
+            net = INTERNAL_NET,
+            ip = broker_ip,
+            sleep_secs = sleep_secs,
         );
         std::fs::write(&tool, script).unwrap();
         std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -726,6 +792,48 @@ exit 0
             "the crash path must be bounded by the log-capture timeout, not the ready timeout; \
              waited {waited:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn launch_notices_readiness_even_while_inspect_is_slow() {
+        // Regression: the ready-file poll must run on its own cadence, decoupled
+        // from `container inspect` latency. A healthy broker can publish its ready
+        // doc while an inspect call is stalled; the launch must notice the file
+        // rather than wait out `ready_timeout` behind the slow inspect.
+        let dir = tempfile::tempdir().unwrap();
+        let args_log = dir.path().join("args.log");
+        // inspect sleeps ~1s then reports a running VM; the ready timeout is
+        // shorter, so an inspect-then-file loop would fire ReadyTimeout behind it.
+        let tool = write_fake_container_slow_inspect(dir.path(), &args_log, "192.168.252.3", 1);
+        let plan = plan_with_tool(&tool, dir.path());
+
+        // The broker becomes ready shortly after launch begins — mid-inspect.
+        let ready = dir.path().join("ready");
+        let ready_writer = ready.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            std::fs::write(
+                &ready_writer,
+                BrokerReadyDoc::current(18080).to_ready_file(),
+            )
+            .unwrap();
+        });
+
+        let ip = tokio::time::timeout(
+            Duration::from_secs(10),
+            launch_broker_vm(
+                &plan,
+                &ready,
+                BrokerPort::new(18080).unwrap(),
+                // Shorter than the inspect sleep: the ready poll must win on its own.
+                Duration::from_millis(600),
+                Duration::from_millis(20),
+            ),
+        )
+        .await
+        .expect("launch must not hang")
+        .expect("a broker that becomes ready during a slow inspect must be detected");
+        assert_eq!(ip, Ipv4Addr::new(192, 168, 252, 3));
     }
 
     #[tokio::test]
