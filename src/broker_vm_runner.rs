@@ -82,6 +82,11 @@ pub enum BrokerVmLaunchError {
          well-formed ready document is a few hundred bytes, so this is a broken or hostile broker)"
     )]
     ReadyTooLarge { path: String, max: u64 },
+    #[error(
+        "the broker ready file {path} is not a regular file (a symlink, FIFO, or similar); \
+         refusing to read it — the broker mount is untrusted"
+    )]
+    ReadyNotRegularFile { path: String },
     #[error("could not parse the broker ready file {path}: {source}")]
     ReadyParse {
         path: String,
@@ -264,17 +269,38 @@ fn ready_file_exists(path: &Path) -> Result<bool, BrokerVmLaunchError> {
         })
 }
 
-/// Read the broker's ready file into a `String`, refusing to allocate more than
-/// [`BROKER_READY_DOC_MAX_BYTES`]. The ready file is broker-controlled, so it is
-/// treated as untrusted input: an oversize file is rejected rather than slurped.
+/// Read the broker's ready file into a `String`, treating it as untrusted input
+/// because it lives on the broker-controlled mount:
+///
+/// - `O_NOFOLLOW` refuses a symlink at `open`, so a compromised broker cannot
+///   point `ready` at a host-readable file and leak its bytes through a parse
+///   error.
+/// - `O_NONBLOCK` means opening a FIFO returns immediately instead of blocking
+///   the daemon forever waiting for a writer.
+/// - The opened fd is `fstat`-checked to be a regular file before any read, so
+///   a FIFO/socket/device is rejected rather than read.
+/// - The read itself is capped at [`BROKER_READY_DOC_MAX_BYTES`]; an oversize
+///   file is rejected rather than slurped.
 fn read_ready_file_bounded(ready_file: &Path) -> Result<String, BrokerVmLaunchError> {
     use std::io::Read as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
 
     let read_err = |source| BrokerVmLaunchError::ReadyRead {
         path: ready_file.display().to_string(),
         source,
     };
-    let file = std::fs::File::open(ready_file).map_err(read_err)?;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(ready_file)
+        .map_err(read_err)?;
+    // Reject anything that is not a plain file (FIFO, socket, device, dir) — a
+    // `O_NONBLOCK` FIFO opens fine, so this fstat is what actually refuses it.
+    if !file.metadata().map_err(read_err)?.file_type().is_file() {
+        return Err(BrokerVmLaunchError::ReadyNotRegularFile {
+            path: ready_file.display().to_string(),
+        });
+    }
     // Read one byte past the cap so an over-cap file is detectable rather than
     // silently truncated into a doc that might parse.
     let mut buf = Vec::new();
@@ -791,6 +817,56 @@ exit 0
             waited < BROKER_LOG_CAPTURE_TIMEOUT + Duration::from_secs(10),
             "the crash path must be bounded by the log-capture timeout, not the ready timeout; \
              waited {waited:?}"
+        );
+    }
+
+    #[test]
+    fn gate_ready_doc_refuses_a_symlinked_ready_file() {
+        // The broker mount is untrusted: a `ready` symlink must not be followed,
+        // or a compromised broker could point it at a host-readable file and leak
+        // its first bytes through the `Malformed` parse error.
+        let dir = tempfile::tempdir().unwrap();
+        let secret = dir.path().join("host-secret.txt");
+        std::fs::write(&secret, "TOP-SECRET-HOST-CONTENTS").unwrap();
+        let ready = dir.path().join("ready");
+        std::os::unix::fs::symlink(&secret, &ready).unwrap();
+
+        let err = gate_ready_doc(&ready, BrokerPort::new(18080).unwrap()).unwrap_err();
+        assert!(
+            !err.to_string().contains("TOP-SECRET"),
+            "a symlinked host file's contents must never be read or leaked: {err}"
+        );
+    }
+
+    #[test]
+    fn gate_ready_doc_refuses_a_fifo_ready_file_without_hanging() {
+        // A `ready` FIFO must be rejected, not opened-and-read, or the daemon
+        // blocks forever waiting for a writer. Run in a thread so a regression
+        // surfaces as a bounded timeout rather than hanging the whole suite.
+        use std::os::unix::ffi::OsStrExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let ready = dir.path().join("ready");
+        let c_path = std::ffi::CString::new(ready.as_os_str().as_bytes()).unwrap();
+        assert_eq!(
+            unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) },
+            0,
+            "mkfifo failed"
+        );
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let ready_for_thread = ready.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(gate_ready_doc(
+                &ready_for_thread,
+                BrokerPort::new(18080).unwrap(),
+            ));
+        });
+        let result = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("reading a FIFO ready file must not hang the daemon");
+        assert!(
+            matches!(result, Err(BrokerVmLaunchError::ReadyNotRegularFile { .. })),
+            "{result:?}"
         );
     }
 
