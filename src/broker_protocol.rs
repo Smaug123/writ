@@ -28,7 +28,7 @@ use serde::{Deserialize, Serialize};
 /// - the ready-file schema ([`BrokerReadyDoc`]),
 /// - the slice of daemon config the broker reads.
 ///
-/// A CI test (`broker_protocol_fingerprint_is_pinned`) derives a structural
+/// A CI test (`broker_contract_fingerprint_is_pinned`) derives a structural
 /// fingerprint of that contract and fails when it changes, so a contract change
 /// that forgets to bump this constant is caught at CI, before an image is built.
 pub const BROKER_PROTOCOL_VERSION: u32 = 1;
