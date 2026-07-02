@@ -27,6 +27,14 @@ pub struct BrokerSessionSpec {
     pub broker_port: u16,
 }
 
+/// The only session-spec schema version this broker understands. A spec at any
+/// other version is refused up front (see [`BrokerSessionSpec::parse_json`]) with
+/// a clean [`BrokerSessionSpecError::UnsupportedVersion`] — never an opaque
+/// unknown-field parse error — so a version-skewed host↔broker pair fails loudly
+/// and fast. Bump this in lockstep with the wire schema and
+/// [`crate::broker_protocol::BROKER_PROTOCOL_VERSION`].
+pub const SUPPORTED_SESSION_SPEC_VERSION: u32 = 1;
+
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawBrokerSessionSpec {
@@ -35,6 +43,17 @@ struct RawBrokerSessionSpec {
     agent_ipv4_cidr: String,
     bind_addr: String,
     broker_port: u16,
+}
+
+/// A tolerant envelope read *before* the strict body: it recovers only the
+/// `version`, so a spec at a newer version (which will carry fields this broker
+/// does not know) is refused as a clean [`BrokerSessionSpecError::UnsupportedVersion`]
+/// rather than tripping the body's `deny_unknown_fields`. Deliberately not
+/// `deny_unknown_fields` itself — it must parse a future document far enough to
+/// read its version.
+#[derive(serde::Deserialize)]
+struct SessionSpecVersion {
+    version: u32,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -47,7 +66,10 @@ pub enum BrokerSessionSpecError {
     },
     #[error("session spec is not valid JSON: {0}")]
     Json(serde_json::Error),
-    #[error("unsupported session spec version {0}; this broker supports version 1")]
+    #[error(
+        "unsupported session spec version {0}: this broker speaks a different \
+         session-spec schema; rebuild the broker image"
+    )]
     UnsupportedVersion(u32),
     #[error("session spec session_id is invalid: {0}")]
     SessionId(String),
@@ -84,7 +106,7 @@ impl BrokerSessionSpec {
     /// [`Self::parse_json`]. Round-trips: `parse_json(spec.to_json()) == spec`.
     pub fn to_json(&self) -> String {
         let raw = RawBrokerSessionSpec {
-            version: 1,
+            version: SUPPORTED_SESSION_SPEC_VERSION,
             session_id: self.session_id.to_string(),
             agent_ipv4_cidr: self.agent_ipv4_cidr.to_string(),
             bind_addr: self.bind_addr.to_string(),
@@ -94,11 +116,18 @@ impl BrokerSessionSpec {
     }
 
     pub fn parse_json(raw: &str) -> Result<Self, BrokerSessionSpecError> {
+        // Gate the version first, from a tolerant envelope: a spec at a newer
+        // version (carrying fields we don't know) must surface as a clean version
+        // mismatch, not as the strict body's unknown-field error.
+        let SessionSpecVersion { version } =
+            serde_json::from_str(raw).map_err(BrokerSessionSpecError::Json)?;
+        if version != SUPPORTED_SESSION_SPEC_VERSION {
+            return Err(BrokerSessionSpecError::UnsupportedVersion(version));
+        }
+        // The version matches, so the strict, unknown-field-rejecting body parse
+        // is a *within-version* guard: a host typo is still caught loudly.
         let raw: RawBrokerSessionSpec =
             serde_json::from_str(raw).map_err(BrokerSessionSpecError::Json)?;
-        if raw.version != 1 {
-            return Err(BrokerSessionSpecError::UnsupportedVersion(raw.version));
-        }
         let session_id = raw
             .session_id
             .parse::<SessionId>()
@@ -190,6 +219,7 @@ pub fn read_bearer_token_file(path: &Path) -> Result<VmHttpBearerToken, BearerTo
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     fn valid_spec_json(overrides: &str) -> String {
         format!(
@@ -246,6 +276,49 @@ mod tests {
             BrokerSessionSpec::parse_json(json),
             Err(BrokerSessionSpecError::Json(_))
         ));
+    }
+
+    #[test]
+    fn newer_version_with_added_field_reports_unsupported_version_not_unknown_field() {
+        // A future broker will add fields to the spec alongside a version bump. An
+        // older broker reading that spec must report a clean version mismatch (the
+        // host turns it into "rebuild the image"), NOT an opaque unknown-field JSON
+        // error — so the version gate has to run *before* the strict body parse.
+        let json = r#"{"version":2,"session_id":"51b8fd0f-6c10-454c-b0e6-7df1d60e2e6d","agent_ipv4_cidr":"192.168.252.0/24","bind_addr":"0.0.0.0","broker_port":18080,"log_file":"/run/broker/log"}"#;
+        assert!(
+            matches!(
+                BrokerSessionSpec::parse_json(json),
+                Err(BrokerSessionSpecError::UnsupportedVersion(2))
+            ),
+            "got {:?}",
+            BrokerSessionSpec::parse_json(json)
+        );
+    }
+
+    proptest! {
+        /// Any version other than the supported one is refused as a clean version
+        /// mismatch — regardless of whatever else the document carries, including
+        /// fields a future schema might add — because the version gate precedes the
+        /// strict body parse. It is never a `Json` body error.
+        #[test]
+        fn any_other_version_is_unsupported_not_a_body_error(
+            version in any::<u32>()
+                .prop_filter("not the supported version", |v| *v != SUPPORTED_SESSION_SPEC_VERSION),
+            include_extra in any::<bool>(),
+        ) {
+            let extra = if include_extra { r#","future_field":{"nested":[1,2,3]}"# } else { "" };
+            let json = format!(
+                r#"{{"version":{version},"session_id":"51b8fd0f-6c10-454c-b0e6-7df1d60e2e6d","agent_ipv4_cidr":"192.168.252.0/24","bind_addr":"0.0.0.0","broker_port":18080{extra}}}"#
+            );
+            prop_assert!(
+                matches!(
+                    BrokerSessionSpec::parse_json(&json),
+                    Err(BrokerSessionSpecError::UnsupportedVersion(v)) if v == version
+                ),
+                "version {version} (extra={include_extra}) -> {:?}",
+                BrokerSessionSpec::parse_json(&json)
+            );
+        }
     }
 
     #[test]
