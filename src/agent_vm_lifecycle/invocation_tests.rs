@@ -421,12 +421,21 @@ async fn run_capturing_output_bounded_does_not_deadlock_on_a_one_sided_flood_pas
     // If we stop draining stdout at the cap but still wait for stderr EOF, the
     // child blocks on the full stdout pipe and never exits (so never closes
     // stderr) -> deadlock. The capture must kill the child once a stream caps
-    // and return promptly. The outer timeout turns a deadlock into a failure
-    // instead of a hung test; a healthy capture returns in milliseconds.
+    // and reap it, returning promptly regardless of whether the other stream
+    // ever EOFs. The outer timeout turns a deadlock into a failure instead of a
+    // hung test; a healthy capture returns in milliseconds.
+    //
+    // The trailing `; :` is load-bearing: it forces the shell to *fork* `head`
+    // as a grandchild rather than exec-optimizing into it (a single simple
+    // command is exec'd by bash but not by dash). Killing the shell then leaves
+    // `head` orphaned, still holding the *stderr* write-end open while blocked
+    // on the undrained stdout pipe — so a capture that waits for stderr EOF
+    // hangs. Without the fork this reproduces only on dash (Linux CI), not on
+    // macOS's bash `/bin/sh`.
     let inv = ProcessInvocation::new(
         std::path::PathBuf::from("/bin/sh"),
         // 512 KiB of stdout, far past the pipe buffer; not one byte of stderr.
-        ["-c".to_string(), "head -c 524288 /dev/zero".to_string()],
+        ["-c".to_string(), "head -c 524288 /dev/zero; :".to_string()],
     );
     let out = tokio::time::timeout(
         std::time::Duration::from_secs(10),

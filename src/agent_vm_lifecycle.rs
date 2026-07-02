@@ -1365,6 +1365,8 @@ impl ProcessInvocation {
         let mut stderr_open = true;
         let mut truncated = false;
         let mut killed = false;
+        let mut reaped = false;
+        let mut status = None;
         let mut stdout_chunk = [0u8; 8192];
         let mut stderr_chunk = [0u8; 8192];
 
@@ -1398,11 +1400,25 @@ impl ProcessInvocation {
                         }
                     }
                 }
+                // Once we have killed the child, end the loop as soon as it is
+                // reaped — do not keep waiting on a still-"open" stream. A child
+                // that *forked* its work (e.g. a `sh -c '…'` that does not exec
+                // into the command) leaves that grandchild holding the other
+                // pipe's write-end open after we kill the shell, so waiting for
+                // that stream's EOF would deadlock. `Child::wait` is cancel-safe,
+                // so losing this race to a `read` and rebuilding it next
+                // iteration is fine.
+                wait_result = child.wait(), if killed && !reaped => {
+                    status = wait_result.ok();
+                    reaped = true;
+                    stdout_open = false;
+                    stderr_open = false;
+                }
             }
             // We only stop reading a still-live stream when it caps; kill the
             // child then so the remaining stream reaches EOF instead of blocking
             // on a full pipe. A natural EOF on one stream never triggers this.
-            if truncated && !killed && (!stdout_open || !stderr_open) {
+            if truncated && !killed {
                 let _ = child.start_kill();
                 killed = true;
             }
@@ -1411,10 +1427,12 @@ impl ProcessInvocation {
         stdout_buf.truncate(max_bytes);
         stderr_buf.truncate(max_bytes);
 
-        // Reap the child. If we truncated we already killed it above; otherwise
-        // both streams reached EOF and it is exiting on its own, so `wait`
-        // yields its real status rather than a kill signal.
-        let status = child.wait().await.ok();
+        // If the `wait` branch already reaped a killed child, keep that status;
+        // otherwise both streams reached EOF on their own and the child is
+        // exiting, so `wait` yields its real status rather than a kill signal.
+        if !reaped {
+            status = child.wait().await.ok();
+        }
 
         Ok(BoundedOutput {
             status,
