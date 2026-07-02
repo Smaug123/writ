@@ -26,10 +26,23 @@ use crate::core::BrokerPort;
 /// error string.
 const BROKER_LOG_CAPTURE_BYTES: usize = 16 * 1024;
 
+/// How long to wait for `container logs` to produce the crash-log tail before
+/// giving up with a placeholder note. The broker VM is already known to have
+/// exited; this keeps a wedged `container logs` from stalling the fast
+/// `ExitedBeforeReady` path all the way out to the ready timeout (which would
+/// reintroduce the very opaque 180s failure this path exists to prevent).
+const BROKER_LOG_CAPTURE_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Byte cap on a single `container inspect` liveness poll. The status JSON is
 /// small; the cap just guarantees the read is bounded regardless of what the
 /// container tool emits.
 const BROKER_INSPECT_CAP_BYTES: usize = 1024 * 1024;
+
+/// Byte cap on the broker's ready file. A well-formed [`BrokerReadyDoc`] is a
+/// few hundred bytes; this generous cap just guarantees a stale or misbehaving
+/// broker cannot force an unbounded host allocation by writing a huge ready
+/// file that we would otherwise slurp whole before validating it.
+const BROKER_READY_DOC_MAX_BYTES: u64 = 64 * 1024;
 
 #[derive(Debug, thiserror::Error)]
 pub enum BrokerVmLaunchError {
@@ -64,6 +77,11 @@ pub enum BrokerVmLaunchError {
         #[source]
         source: std::io::Error,
     },
+    #[error(
+        "the broker ready file {path} is larger than the {max}-byte cap; refusing to read it (a \
+         well-formed ready document is a few hundred bytes, so this is a broken or hostile broker)"
+    )]
+    ReadyTooLarge { path: String, max: u64 },
     #[error("could not parse the broker ready file {path}: {source}")]
     ReadyParse {
         path: String,
@@ -215,17 +233,44 @@ fn ready_file_exists(path: &Path) -> Result<bool, BrokerVmLaunchError> {
         })
 }
 
+/// Read the broker's ready file into a `String`, refusing to allocate more than
+/// [`BROKER_READY_DOC_MAX_BYTES`]. The ready file is broker-controlled, so it is
+/// treated as untrusted input: an oversize file is rejected rather than slurped.
+fn read_ready_file_bounded(ready_file: &Path) -> Result<String, BrokerVmLaunchError> {
+    use std::io::Read as _;
+
+    let read_err = |source| BrokerVmLaunchError::ReadyRead {
+        path: ready_file.display().to_string(),
+        source,
+    };
+    let file = std::fs::File::open(ready_file).map_err(read_err)?;
+    // Read one byte past the cap so an over-cap file is detectable rather than
+    // silently truncated into a doc that might parse.
+    let mut buf = Vec::new();
+    file.take(BROKER_READY_DOC_MAX_BYTES + 1)
+        .read_to_end(&mut buf)
+        .map_err(read_err)?;
+    if buf.len() as u64 > BROKER_READY_DOC_MAX_BYTES {
+        return Err(BrokerVmLaunchError::ReadyTooLarge {
+            path: ready_file.display().to_string(),
+            max: BROKER_READY_DOC_MAX_BYTES,
+        });
+    }
+    String::from_utf8(buf).map_err(|_| {
+        read_err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "ready file was not valid UTF-8",
+        ))
+    })
+}
+
 /// Read and validate the broker's ready document once it has appeared: the
 /// broker's protocol version must match this host's (a mismatch means a stale
 /// broker image), and the port it bound must be the one the host assigned. A
 /// legacy bare-port ready file from a pre-handshake image parses as protocol
 /// version 0, so it too fails the version gate with an actionable error.
 fn gate_ready_doc(ready_file: &Path, expected_port: BrokerPort) -> Result<(), BrokerVmLaunchError> {
-    let contents =
-        std::fs::read_to_string(ready_file).map_err(|source| BrokerVmLaunchError::ReadyRead {
-            path: ready_file.display().to_string(),
-            source,
-        })?;
+    let contents = read_ready_file_bounded(ready_file)?;
     let doc =
         BrokerReadyDoc::parse(&contents).map_err(|source| BrokerVmLaunchError::ReadyParse {
             path: ready_file.display().to_string(),
@@ -247,38 +292,35 @@ fn gate_ready_doc(ready_file: &Path, expected_port: BrokerPort) -> Result<(), Br
 }
 
 /// Best-effort capture of the broker VM's log tail for diagnostics; never fails
-/// the launch — if `container logs` is unavailable we substitute a short note so
-/// the error still explains what happened.
+/// the launch — if `container logs` is unavailable or slow we substitute a short
+/// note so the error still explains what happened. The broker VM is already
+/// known to have exited, so this is bounded by [`BROKER_LOG_CAPTURE_TIMEOUT`]:
+/// a wedged `container logs` must not stall the fast crash path.
 async fn capture_broker_logs(plan: &BrokerVmPlan) -> String {
     let logs = plan.logs_invocation();
-    match logs
-        .run_capturing_output_bounded(BROKER_LOG_CAPTURE_BYTES)
-        .await
+    // `run_capturing_merged_tail` keeps the *newest* bytes, so when a chatty
+    // crash exceeds the cap we retain the final lines (which carry the error).
+    match tokio::time::timeout(
+        BROKER_LOG_CAPTURE_TIMEOUT,
+        logs.run_capturing_merged_tail(BROKER_LOG_CAPTURE_BYTES),
+    )
+    .await
     {
-        Ok(output) => {
-            let combined = output.combined();
-            let trimmed = combined.trim();
+        Err(_elapsed) => {
+            format!("(broker logs did not complete within {BROKER_LOG_CAPTURE_TIMEOUT:?})")
+        }
+        Ok(Err(err)) => format!("(could not read broker logs: {err})"),
+        Ok(Ok(captured)) => {
+            let trimmed = captured.text.trim();
             if trimmed.is_empty() {
                 "(broker logs were empty)".to_string()
+            } else if captured.truncated {
+                format!("…{trimmed}")
             } else {
-                tail(trimmed, BROKER_LOG_CAPTURE_BYTES)
+                trimmed.to_string()
             }
         }
-        Err(err) => format!("(could not read broker logs: {err})"),
     }
-}
-
-/// The last `max_bytes` of `s`, snapped up to a UTF-8 char boundary, prefixed
-/// with an ellipsis when truncated.
-fn tail(s: &str, max_bytes: usize) -> String {
-    if s.len() <= max_bytes {
-        return s.to_string();
-    }
-    let mut start = s.len() - max_bytes;
-    while start < s.len() && !s.is_char_boundary(start) {
-        start += 1;
-    }
-    format!("…{}", &s[start..])
 }
 
 #[cfg(test)]
@@ -359,6 +401,31 @@ exit 0
 "#,
             log = args_log.display(),
             sleep_secs = sleep_secs,
+        );
+        std::fs::write(&tool, script).unwrap();
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+        tool
+    }
+
+    /// A fake `container` whose VM has exited (like [`write_fake_container_exited`])
+    /// but whose `logs` subcommand *hangs* — modelling a wedged log retrieval. Used
+    /// to prove the crash path still returns promptly (bounded by the log-capture
+    /// timeout) instead of stalling out to the ready timeout.
+    fn write_fake_container_exited_logs_hang(dir: &Path, args_log: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tool = dir.join("fake-container-exited-logs-hang");
+        let script = format!(
+            r#"#!/bin/sh
+printf '%s\n' "$*" >> "{log}"
+if [ "$1" = inspect ]; then
+  cat <<'JSON'
+[ {{ "status": {{ "networks": [], "state": "stopped" }} }} ]
+JSON
+fi
+if [ "$1" = logs ]; then exec sleep 300; fi
+exit 0
+"#,
+            log = args_log.display(),
         );
         std::fs::write(&tool, script).unwrap();
         std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -581,6 +648,83 @@ exit 0
                 }
             ),
             "{err}"
+        );
+    }
+
+    #[test]
+    fn gate_ready_doc_rejects_an_oversize_ready_file() {
+        // A stale/hostile broker can write an arbitrarily large ready file; the
+        // gate must refuse it rather than slurp it whole. `{` keeps it plausibly
+        // JSON-shaped so we know it's the size cap, not a parse error, firing.
+        let dir = tempfile::tempdir().unwrap();
+        let ready = dir.path().join("ready");
+        let oversize = vec![b'{'; BROKER_READY_DOC_MAX_BYTES as usize + 4096];
+        std::fs::write(&ready, oversize).unwrap();
+
+        match gate_ready_doc(&ready, BrokerPort::new(18080).unwrap()) {
+            Err(BrokerVmLaunchError::ReadyTooLarge { max, .. }) => {
+                assert_eq!(max, BROKER_READY_DOC_MAX_BYTES);
+            }
+            other => panic!("expected ReadyTooLarge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gate_ready_doc_accepts_a_ready_file_at_the_size_cap() {
+        // A doc padded (via an ignored field) right up to the cap must still be
+        // read and validated — the boundary is inclusive.
+        let dir = tempfile::tempdir().unwrap();
+        let ready = dir.path().join("ready");
+        let mut doc = BrokerReadyDoc::current(18080).to_ready_file();
+        let pad = BROKER_READY_DOC_MAX_BYTES as usize - doc.len();
+        // A trailing comment/whitespace line the tolerant parser ignores.
+        doc.push_str(&" ".repeat(pad));
+        assert_eq!(doc.len() as u64, BROKER_READY_DOC_MAX_BYTES);
+        std::fs::write(&ready, &doc).unwrap();
+
+        gate_ready_doc(&ready, BrokerPort::new(18080).unwrap())
+            .expect("a ready doc exactly at the cap must be accepted");
+    }
+
+    #[tokio::test]
+    async fn launch_reports_a_placeholder_when_broker_log_capture_hangs() {
+        // The broker VM exited, but `container logs` wedges. The crash path must
+        // still return `ExitedBeforeReady` promptly (bounded by the log-capture
+        // timeout) with a placeholder, not stall out to the ready timeout and
+        // reintroduce the opaque long failure. (~BROKER_LOG_CAPTURE_TIMEOUT wall.)
+        let dir = tempfile::tempdir().unwrap();
+        let args_log = dir.path().join("args.log");
+        let tool = write_fake_container_exited_logs_hang(dir.path(), &args_log);
+        let plan = plan_with_tool(&tool, dir.path());
+        let ready = dir.path().join("ready"); // never created
+
+        let start = std::time::Instant::now();
+        let err = launch_broker_vm(
+            &plan,
+            &ready,
+            BrokerPort::new(18080).unwrap(),
+            // Generous ready timeout: the log-capture bound must beat it by far.
+            Duration::from_secs(120),
+            Duration::from_millis(10),
+        )
+        .await
+        .unwrap_err();
+        let waited = start.elapsed();
+
+        match err {
+            BrokerVmLaunchError::ExitedBeforeReady { state, logs } => {
+                assert_eq!(state, "stopped");
+                assert!(
+                    logs.contains("did not complete"),
+                    "a wedged log capture should yield a timeout placeholder: {logs}"
+                );
+            }
+            other => panic!("expected ExitedBeforeReady, got {other}"),
+        }
+        assert!(
+            waited < BROKER_LOG_CAPTURE_TIMEOUT + Duration::from_secs(10),
+            "the crash path must be bounded by the log-capture timeout, not the ready timeout; \
+             waited {waited:?}"
         );
     }
 

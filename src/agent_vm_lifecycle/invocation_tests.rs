@@ -353,6 +353,67 @@ async fn run_capturing_output_bounded_keeps_exactly_max_bytes_without_flagging_t
 }
 
 #[tokio::test]
+async fn run_capturing_merged_tail_keeps_short_output_whole() {
+    let inv = ProcessInvocation::new(
+        std::path::PathBuf::from("/bin/sh"),
+        ["-c".to_string(), "printf 'the-whole-log'".to_string()],
+    );
+    let out = inv.run_capturing_merged_tail(1024).await.unwrap();
+    assert!(
+        !out.truncated,
+        "output within the cap must not flag truncation"
+    );
+    assert_eq!(out.text, "the-whole-log");
+}
+
+#[tokio::test]
+async fn run_capturing_merged_tail_keeps_the_newest_bytes() {
+    // Unlike the head-keeping bounded capture, the tail capture must retain the
+    // *end* of a stream that exceeds the cap — that is where a crash log's
+    // actual error lives. Bracket a large filler with distinct start/end
+    // markers; only the end marker may survive.
+    let inv = ProcessInvocation::new(
+        std::path::PathBuf::from("/bin/sh"),
+        [
+            "-c".to_string(),
+            "printf OLDSTART; head -c 20000 /dev/zero; printf NEWEND".to_string(),
+        ],
+    );
+    let out = inv.run_capturing_merged_tail(64).await.unwrap();
+    assert!(out.truncated, "a stream past the cap must flag truncation");
+    assert!(out.text.len() <= 64, "the tail must stay within the cap");
+    assert!(
+        out.text.contains("NEWEND"),
+        "the newest bytes (the error) must survive: {:?}",
+        out.text
+    );
+    assert!(
+        !out.text.contains("OLDSTART"),
+        "the oldest bytes must be discarded: {:?}",
+        out.text
+    );
+}
+
+#[tokio::test]
+async fn run_capturing_merged_tail_does_not_hang_on_a_large_one_sided_stream() {
+    // Draining to EOF (never stopping early) means a flood is discarded, not
+    // wedged; the child exits and the call returns promptly.
+    let inv = ProcessInvocation::new(
+        std::path::PathBuf::from("/bin/sh"),
+        ["-c".to_string(), "head -c 524288 /dev/zero".to_string()],
+    );
+    let out = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        inv.run_capturing_merged_tail(64),
+    )
+    .await
+    .expect("merged tail must not hang on a large stream")
+    .expect("spawn must succeed");
+    assert!(out.truncated);
+    assert!(out.text.len() <= 64);
+}
+
+#[tokio::test]
 async fn run_capturing_output_bounded_does_not_deadlock_on_a_one_sided_flood_past_the_pipe_buffer()
 {
     // Regression: a child that floods *one* stream far past the OS pipe buffer

@@ -216,6 +216,34 @@ impl BoundedOutput {
     }
 }
 
+/// The byte-bounded *tail* captured by
+/// [`ProcessInvocation::run_capturing_merged_tail`]: the last `max_bytes` of a
+/// command's merged output, for salvaging the newest lines of a crash log.
+#[derive(Clone, Debug)]
+pub struct CapturedTail {
+    /// The retained tail (lossy UTF-8; a byte split mid-codepoint becomes a
+    /// replacement char).
+    pub text: String,
+    /// Whether older bytes were discarded to stay within the cap.
+    pub truncated: bool,
+}
+
+/// Append `bytes` to a tail ring buffer that retains only its last `max_bytes`,
+/// bumping `total` by the bytes seen. Draining older bytes here (rather than at
+/// the end) bounds retained memory to `max_bytes` regardless of stream length.
+fn push_ring_tail(
+    ring: &mut std::collections::VecDeque<u8>,
+    total: &mut usize,
+    bytes: &[u8],
+    max_bytes: usize,
+) {
+    *total = total.saturating_add(bytes.len());
+    ring.extend(bytes.iter().copied());
+    while ring.len() > max_bytes {
+        ring.pop_front();
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AgentVmStartInvocation {
     Static(ProcessInvocation),
@@ -1321,14 +1349,7 @@ impl ProcessInvocation {
     ) -> Result<BoundedOutput, ProcessInvocationError> {
         use tokio::io::AsyncReadExt as _;
 
-        let mut command = tokio::process::Command::new(&self.program);
-        command
-            .args(&self.args)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true);
-        let mut child = command.spawn().map_err(|source| self.run_error(source))?;
+        let mut child = self.spawn_piped()?;
         let mut stdout_pipe = child.stdout.take().expect("stdout was piped");
         let mut stderr_pipe = child.stderr.take().expect("stderr was piped");
 
@@ -1400,6 +1421,82 @@ impl ProcessInvocation {
             stdout: String::from_utf8_lossy(&stdout_buf).into_owned(),
             stderr: String::from_utf8_lossy(&stderr_buf).into_owned(),
             truncated,
+        })
+    }
+
+    /// Spawn the invocation with stdin closed and both streams piped, killed on
+    /// drop so that cancelling a capture future (e.g. via an outer
+    /// `tokio::time::timeout`) kills the child rather than leaking it. Shared by
+    /// the bounded capture readers.
+    fn spawn_piped(&self) -> Result<tokio::process::Child, ProcessInvocationError> {
+        let mut command = tokio::process::Command::new(&self.program);
+        command
+            .args(&self.args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        command.spawn().map_err(|source| self.run_error(source))
+    }
+
+    /// Capture the *last* `max_bytes` of the child's merged stdout+stderr — a
+    /// byte-exact tail. Unlike [`Self::run_capturing_output_bounded`], which
+    /// keeps the *head* and is right for output parsed from the start (e.g.
+    /// `container inspect` JSON), this keeps the *newest* bytes, which is what a
+    /// crash-log tail wants: the final lines carry the actual error.
+    ///
+    /// Both streams are drained to EOF (never stopped early), discarding all but
+    /// the last `max_bytes` via a ring buffer. Because we never stop draining, a
+    /// child flooding one pipe can neither block on a full pipe (no deadlock) nor
+    /// force an unbounded allocation (memory is bounded by `max_bytes`). Total
+    /// *work* on a pathologically chatty child is bounded by the caller's outer
+    /// timeout, which — via `kill_on_drop` — kills a runaway when the future is
+    /// dropped. `truncated` records whether any older bytes were discarded.
+    pub async fn run_capturing_merged_tail(
+        &self,
+        max_bytes: usize,
+    ) -> Result<CapturedTail, ProcessInvocationError> {
+        use tokio::io::AsyncReadExt as _;
+
+        let mut child = self.spawn_piped()?;
+        let mut stdout_pipe = child.stdout.take().expect("stdout was piped");
+        let mut stderr_pipe = child.stderr.take().expect("stderr was piped");
+
+        let mut ring: std::collections::VecDeque<u8> = std::collections::VecDeque::new();
+        let mut total: usize = 0;
+        let mut stdout_open = true;
+        let mut stderr_open = true;
+        let mut stdout_chunk = [0u8; 8192];
+        let mut stderr_chunk = [0u8; 8192];
+
+        while stdout_open || stderr_open {
+            tokio::select! {
+                result = stdout_pipe.read(&mut stdout_chunk), if stdout_open => {
+                    let n = result.map_err(|source| self.run_error(source))?;
+                    if n == 0 {
+                        stdout_open = false;
+                    } else {
+                        push_ring_tail(&mut ring, &mut total, &stdout_chunk[..n], max_bytes);
+                    }
+                }
+                result = stderr_pipe.read(&mut stderr_chunk), if stderr_open => {
+                    let n = result.map_err(|source| self.run_error(source))?;
+                    if n == 0 {
+                        stderr_open = false;
+                    } else {
+                        push_ring_tail(&mut ring, &mut total, &stderr_chunk[..n], max_bytes);
+                    }
+                }
+            }
+        }
+
+        // Both streams reached EOF, so the child is exiting on its own; reap it.
+        let _ = child.wait().await;
+
+        let bytes: Vec<u8> = ring.into_iter().collect();
+        Ok(CapturedTail {
+            text: String::from_utf8_lossy(&bytes).into_owned(),
+            truncated: total > max_bytes,
         })
     }
 
