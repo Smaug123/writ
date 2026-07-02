@@ -1158,7 +1158,6 @@ fn narinfo_audit_error_label(err: &NixNarInfoError) -> &'static str {
         NixNarInfoError::DuplicateNarSize => "duplicate upstream narinfo NarSize",
         NixNarInfoError::EmptyNarSize => "empty upstream narinfo NarSize",
         NixNarInfoError::InvalidNarSize { .. } => "invalid upstream narinfo NarSize",
-        NixNarInfoError::MissingReferences => "missing upstream narinfo References",
         NixNarInfoError::DuplicateReferences => "duplicate upstream narinfo References",
         NixNarInfoError::InvalidReferences { .. } => "invalid upstream narinfo References",
         NixNarInfoError::MissingSignature => "missing upstream narinfo Sig",
