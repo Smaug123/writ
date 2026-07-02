@@ -265,8 +265,6 @@ pub enum NixNarInfoError {
         raw: String,
         source: NixNarSizeError,
     },
-    #[error("narinfo is missing References")]
-    MissingReferences,
     #[error("narinfo contains duplicate References")]
     DuplicateReferences,
     #[error("narinfo References {raw:?} is invalid: {source}")]
@@ -824,9 +822,14 @@ fn build_narinfo(fields: RawNarInfoFields<'_>) -> Result<NixNarInfo, NixNarInfoE
         raw: nar_size.to_string(),
         source,
     })?;
-    let references = fields
-        .references
-        .ok_or(NixNarInfoError::MissingReferences)?;
+    // Nix omits the `References:` line entirely for a reference-free path (it
+    // does not emit an empty `References: `), so an absent line means zero
+    // references — not a malformed narinfo. cache.nixos.org relies on this and
+    // signs the fingerprint over the empty reference set, so reading absent as
+    // empty both matches the producer and keeps signature verification honest:
+    // stripping a *non-empty* References line changes the fingerprint and fails
+    // the signature.
+    let references = fields.references.unwrap_or("");
     let references =
         NixNarReferences::new(references).map_err(|source| NixNarInfoError::InvalidReferences {
             raw: references.to_string(),
@@ -1363,7 +1366,6 @@ mod tests {
         DuplicateNarSize,
         EmptyNarSize,
         BadNarSize,
-        MissingReferences,
         DuplicateReferences,
         BadReferences,
         MissingSignature,
@@ -1522,7 +1524,6 @@ mod tests {
             Just(NarInfoMutation::DuplicateNarSize),
             Just(NarInfoMutation::EmptyNarSize),
             Just(NarInfoMutation::BadNarSize),
-            Just(NarInfoMutation::MissingReferences),
             Just(NarInfoMutation::DuplicateReferences),
             Just(NarInfoMutation::BadReferences),
             Just(NarInfoMutation::MissingSignature),
@@ -1637,9 +1638,6 @@ mod tests {
             NarInfoMutation::BadNarSize => format!(
                 "StorePath: /nix/store/{hash}-{name}\nURL: nar/{file}\nCompression: xz\nNarHash: {nar_hash}\nNarSize: 0120\nReferences: \nSig: {TEST_SIGNATURE}\n"
             ),
-            NarInfoMutation::MissingReferences => format!(
-                "StorePath: /nix/store/{hash}-{name}\nURL: nar/{file}\nCompression: xz\nNarHash: {nar_hash}\nNarSize: 120\nSig: {TEST_SIGNATURE}\n"
-            ),
             NarInfoMutation::DuplicateReferences => format!(
                 "StorePath: /nix/store/{hash}-{name}\nURL: nar/{file}\nCompression: xz\nNarHash: {nar_hash}\nNarSize: 120\nReferences: \nReferences: \nSig: {TEST_SIGNATURE}\n"
             ),
@@ -1715,7 +1713,6 @@ mod tests {
                 raw: "0120".into(),
                 source: NixNarSizeError::LeadingZero,
             },
-            NarInfoMutation::MissingReferences => NixNarInfoError::MissingReferences,
             NarInfoMutation::DuplicateReferences => NixNarInfoError::DuplicateReferences,
             NarInfoMutation::BadReferences => NixNarInfoError::InvalidReferences {
                 raw: "bad/reference".into(),
@@ -2011,6 +2008,83 @@ mod tests {
                 "{mutated:?}",
             );
         }
+    }
+
+    /// A real cache.nixos.org narinfo for a reference-free fixed-output source
+    /// path. cache.nixos.org omits the `References:` line entirely when a path
+    /// has no references (it does not emit an empty `References: `), and signs
+    /// the fingerprint over an empty reference set. The broker must read the
+    /// absent line as zero references and verify the signature.
+    ///
+    /// Regression for the nixpkgs refresh that shipped both zstd NARs and
+    /// reference-less narinfos: the zstd half was fixed in #249, but the
+    /// missing-`References` half kept surfacing to no-egress guests as a generic
+    /// 502 "nix cache upstream failed" (audit label
+    /// "missing upstream narinfo References").
+    #[test]
+    fn real_reference_free_cache_narinfo_parses_and_verifies() {
+        const CACHE_NIXOS_ORG_KEY: &str =
+            "cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=";
+        // Fetched verbatim from
+        // https://cache.nixos.org/3lm9ri9lk37f3yhmnybb31ikaj6imivh.narinfo —
+        // note there is no `References:` line at all.
+        const NARINFO: &str = concat!(
+            "StorePath: /nix/store/3lm9ri9lk37f3yhmnybb31ikaj6imivh-cargo-src-proc-macro2-1.0.106\n",
+            "URL: nar/0rcd3qyis3ykddalcdn1z5z6l8iq8cx68f7bff9jpgdjifqfd7zi.nar.zst\n",
+            "Compression: zstd\n",
+            "FileHash: sha256:0y3f4mr1dli672alabhywgvsfxw2gzs0sczacdkgni90hykh08bs\n",
+            "FileSize: 59889\n",
+            "NarHash: sha256:0rcd3qyis3ykddalcdn1z5z6l8iq8cx68f7bff9jpgdjifqfd7zi\n",
+            "NarSize: 59880\n",
+            "Deriver: 8mj278wp2b0asr28gzw8gjfp66nzi867-cargo-src-proc-macro2-1.0.106.drv\n",
+            "Sig: cache.nixos.org-1:PwivEPG8TMkGlbzyfBS6CSCiGyOMVm/JTV+yqXbP+dxT4ZHsF0c2O/GNw3ipP9z70qBe7SaIdBwWWOuXrfwwCQ==\n",
+            "CA: fixed:sha256:0d09nczyaj67x4ihqr5p7gxbkz38gxhk4asc0k8q23g9n85hzl4g\n",
+        );
+
+        let expected_hash = NixStoreHashPart::new("3lm9ri9lk37f3yhmnybb31ikaj6imivh").unwrap();
+        let keys = NixTrustedPublicKeys::from_strings([CACHE_NIXOS_ORG_KEY]).unwrap();
+
+        let narinfo =
+            parse_signed_narinfo_for_store_hash(NARINFO.as_bytes(), &expected_hash, &keys)
+                .expect("reference-free signed narinfo must parse and verify");
+        assert_eq!(narinfo.references().iter().count(), 0);
+        assert_eq!(narinfo.compression(), NixNarCompression::Zstd);
+    }
+
+    /// An absent `References:` line is indistinguishable from an explicit empty
+    /// one: both mean zero references, feed the same signed fingerprint, and so
+    /// verify against the same signature. Uses the locally-signed test narinfo
+    /// (whose fingerprint is over empty references) with its `References:` line
+    /// deleted, so signature parity is checked, not just parseability.
+    #[test]
+    fn absent_references_line_matches_explicit_empty() {
+        let expected_hash = NixStoreHashPart::new("rzv95bakh41zrn5ji23pfc11x5vq2z4d").unwrap();
+        let keys = NixTrustedPublicKeys::from_strings([TEST_PUBLIC_KEY]).unwrap();
+        let without_references = TEST_SIGNED_NARINFO.replace("References: \n", "");
+        assert!(
+            !without_references.contains("References"),
+            "the test narinfo must have no References line for this case",
+        );
+
+        let with_empty = parse_signed_narinfo_for_store_hash(
+            TEST_SIGNED_NARINFO.as_bytes(),
+            &expected_hash,
+            &keys,
+        )
+        .expect("explicit empty References parses and verifies");
+        let without = parse_signed_narinfo_for_store_hash(
+            without_references.as_bytes(),
+            &expected_hash,
+            &keys,
+        )
+        .expect("absent References line parses and verifies");
+
+        assert_eq!(with_empty.references().iter().count(), 0);
+        assert_eq!(without.references().iter().count(), 0);
+        assert_eq!(
+            with_empty.signature_fingerprint(),
+            without.signature_fingerprint()
+        );
     }
 
     #[test]
