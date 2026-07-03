@@ -196,14 +196,13 @@ impl PfctlInvocation {
     /// (`-sr`) where pfctl may exit non-zero on an empty/absent anchor yet still
     /// print the (empty) ruleset to stdout.
     fn output(&self, pfctl: &Path) -> Result<Output, PfctlError> {
-        Command::new(pfctl)
-            .args(&self.args)
-            .output()
-            .map_err(|source| PfctlError::Run {
+        run_with_etxtbsy_retry(|| Command::new(pfctl).args(&self.args).output()).map_err(|source| {
+            PfctlError::Run {
                 program: pfctl.display().to_string(),
                 args: self.args.join(" "),
                 source,
-            })
+            }
+        })
     }
 
     fn run(&self, pfctl: &Path) -> Result<Output, PfctlError> {
@@ -221,6 +220,45 @@ impl PfctlInvocation {
                 .unwrap_or_else(|| "signal".into()),
             stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
         })
+    }
+}
+
+/// Maximum retries when a just-written program cannot yet be executed. The
+/// window that produces `ETXTBSY` clears within microseconds, so a handful of
+/// 1 ms retries is comfortably enough while still failing fast on a program
+/// that is genuinely un-runnable.
+const ETXTBSY_MAX_RETRIES: u32 = 64;
+
+/// Run `spawn`, retrying only while it fails with `ETXTBSY` ("text file busy").
+///
+/// Executing a program that was written moments earlier can transiently fail
+/// with `ETXTBSY`: if another thread in this process `fork`s (e.g. a concurrent
+/// `Command::spawn` in a parallel test) during the window between the program
+/// file's creation and our `execve`, the child inherits the writer's still-open
+/// fd, and Linux refuses to exec a file that any process holds open for
+/// writing. That child clears the condition within microseconds when it execs,
+/// so a bounded retry resolves it. Every other spawn error propagates
+/// immediately (a non-zero *exit* is not a spawn error and never reaches here).
+///
+/// This never fires in production — `/sbin/pfctl` is a stable system binary,
+/// not something writ writes — but it makes the pfctl unit tests, which write a
+/// fake `pfctl` and immediately exec it alongside other process-spawning tests,
+/// robust under load.
+fn run_with_etxtbsy_retry<T, F>(mut spawn: F) -> std::io::Result<T>
+where
+    F: FnMut() -> std::io::Result<T>,
+{
+    let mut attempts = 0;
+    loop {
+        match spawn() {
+            Err(err)
+                if err.raw_os_error() == Some(libc::ETXTBSY) && attempts < ETXTBSY_MAX_RETRIES =>
+            {
+                attempts += 1;
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            result => return result,
+        }
     }
 }
 
@@ -604,6 +642,43 @@ mod tests {
     /// `-a <anchor> -sr`, and exits 0 for every other invocation — so a flush
     /// can "succeed" yet leave the anchor non-empty, and a status read can exit
     /// non-zero while still reporting an empty ruleset.
+    #[test]
+    fn etxtbsy_retry_succeeds_once_the_file_is_no_longer_busy() {
+        let mut attempts = 0;
+        let result = run_with_etxtbsy_retry(|| {
+            attempts += 1;
+            if attempts < 4 {
+                Err(std::io::Error::from_raw_os_error(libc::ETXTBSY))
+            } else {
+                Ok(())
+            }
+        });
+        assert!(result.is_ok());
+        assert_eq!(attempts, 4);
+    }
+
+    #[test]
+    fn etxtbsy_retry_does_not_retry_other_spawn_errors() {
+        let mut attempts = 0;
+        let result: std::io::Result<()> = run_with_etxtbsy_retry(|| {
+            attempts += 1;
+            Err(std::io::Error::from_raw_os_error(libc::ENOENT))
+        });
+        assert_eq!(attempts, 1, "only ETXTBSY should be retried");
+        assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::ENOENT));
+    }
+
+    #[test]
+    fn etxtbsy_retry_is_bounded_and_finally_surfaces_the_busy_error() {
+        let mut attempts = 0;
+        let result: std::io::Result<()> = run_with_etxtbsy_retry(|| {
+            attempts += 1;
+            Err(std::io::Error::from_raw_os_error(libc::ETXTBSY))
+        });
+        assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::ETXTBSY));
+        assert_eq!(attempts, ETXTBSY_MAX_RETRIES + 1);
+    }
+
     fn write_fake_pfctl_with_sr_exit(dir: &Path, sr_output: &str, sr_exit: i32) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
         let path = dir.join("fake-pfctl");
