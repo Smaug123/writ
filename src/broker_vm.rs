@@ -236,13 +236,16 @@ impl BrokerVmPlan {
     /// Bind-mount the host's pre-warm cache dir read-only at
     /// [`BROKER_VM_PREWARM_DIR`], so the in-VM broker serves the pre-warmed
     /// devShell closure local-first (both `/v1/nix/cache` and the strict
-    /// `/v1/nix/prewarm` views). A no-op when the host configured no pre-warm dir
-    /// (`None`), leaving the broker with no pre-warm archive — identical to
-    /// before. This stays consistent with [`broker_config_json`], which re-points
-    /// `nix_prewarm_cache_dir` at the same guest target exactly when the host set
-    /// it: the mount exists iff the broker config names it. The source is the
-    /// host path, already validated absolute + listable by the daemon's
-    /// `to_runtime_config` at startup.
+    /// `/v1/nix/prewarm` views). A no-op given `None`.
+    ///
+    /// This is a pure data-plan builder: it mounts whatever path it is given and
+    /// does no filesystem check. The caller (`materialize_broker_vm_session_inner`)
+    /// owns the effectful decision — it passes `Some` only for a dir that exists,
+    /// since virtiofs would fail `container run` on a missing source and a
+    /// configured-but-absent pre-warm dir is a tolerated state. [`broker_config_json`]
+    /// re-points `nix_prewarm_cache_dir` at this same guest target when the host
+    /// set it; if the dir is absent the mount is skipped and the broker serves an
+    /// empty pre-warm cache (`NotFound` tolerated), matching host placement.
     #[must_use]
     pub fn with_prewarm_cache_mount(mut self, host_prewarm_dir: Option<PathBuf>) -> Self {
         if let Some(source) = host_prewarm_dir {
@@ -1132,12 +1135,21 @@ fn materialize_broker_vm_session_inner(
 
     // Mount the host's pre-warm cache dir (if configured) read-only into the
     // broker VM; `broker_config_json` above re-pointed the broker's
-    // `nix_prewarm_cache_dir` at the matching guest target, so the two stay
-    // consistent. Read from the same typed config `broker_config_json` rewrote.
+    // `nix_prewarm_cache_dir` at the matching guest target. Read from the same
+    // typed config `broker_config_json` rewrote.
+    //
+    // Only mount a dir that actually exists: `validate_nix_prewarm_cache_dir`
+    // deliberately tolerates a configured-but-absent path (so an operator can set
+    // it before the builder fills it), and virtiofs would fail `container run` on
+    // a missing source. Skipping the mount for an absent dir leaves the broker's
+    // /writ/prewarm unmounted, so its own validator tolerates the `NotFound` and
+    // serves an empty pre-warm cache — exactly what host placement does for the
+    // same configured-but-absent state.
     let host_prewarm_dir = config
         .agent_vm
         .as_ref()
-        .and_then(|agent_vm| agent_vm.vm_http.nix_prewarm_cache_dir.clone());
+        .and_then(|agent_vm| agent_vm.vm_http.nix_prewarm_cache_dir.clone())
+        .filter(|dir| dir.is_dir());
 
     Ok(BrokerVmPlan::new(
         request.session_id,
@@ -2259,13 +2271,17 @@ mod tests {
 
     #[test]
     fn materialize_mounts_the_host_prewarm_dir_when_configured() {
-        // A host config that sets nix_prewarm_cache_dir must produce a plan that
-        // bind-mounts *that host path* read-only into the broker VM, so the
-        // re-pointed broker config (which names the guest target) has something to
-        // read there.
+        // A host config that sets nix_prewarm_cache_dir at an EXISTING dir must
+        // produce a plan that bind-mounts *that host path* read-only into the
+        // broker VM, so the re-pointed broker config (which names the guest target)
+        // has something to read there.
+        let prewarm = tempfile::tempdir().unwrap();
+        let prewarm_path = prewarm.path().display().to_string();
         let host_config = materialize_host_config_json().replace(
             "\"nix_cache_max_nar_bytes\": 67108864,",
-            "\"nix_cache_max_nar_bytes\": 67108864, \"nix_prewarm_cache_dir\": \"/host/prewarm\",",
+            &format!(
+                "\"nix_cache_max_nar_bytes\": 67108864, \"nix_prewarm_cache_dir\": \"{prewarm_path}\","
+            ),
         );
         let (_host_dir, host) = host_store_with(&[
             ("claude-pk", "PEM-DATA"),
@@ -2280,9 +2296,36 @@ mod tests {
         let args = plan.run_invocation().args_lossy();
         assert!(
             args.contains(&format!(
-                "type=virtiofs,source=/host/prewarm,target={BROKER_VM_PREWARM_DIR},readonly"
+                "type=virtiofs,source={prewarm_path},target={BROKER_VM_PREWARM_DIR},readonly"
             )),
             "the configured host pre-warm dir must be mounted read-only: {args:?}"
+        );
+    }
+
+    #[test]
+    fn materialize_skips_the_prewarm_mount_when_the_host_dir_is_absent() {
+        // A configured-but-not-yet-created pre-warm dir is a tolerated state (the
+        // validator accepts it). It must NOT crash the broker VM launch by mounting
+        // a missing virtiofs source: materialize succeeds and adds no mount, so the
+        // broker serves an empty pre-warm cache — as host placement does.
+        let host_config = materialize_host_config_json().replace(
+            "\"nix_cache_max_nar_bytes\": 67108864,",
+            "\"nix_cache_max_nar_bytes\": 67108864, \"nix_prewarm_cache_dir\": \"/no/such/prewarm/dir\",",
+        );
+        let (_host_dir, host) = host_store_with(&[
+            ("claude-pk", "PEM-DATA"),
+            ("anthropic-api-key", "sk-abc"),
+            ("codex-pk", "other"),
+        ]);
+        let work = tempfile::tempdir().unwrap();
+        let request = materialize_request(work.path());
+        let bearer = VmHttpBearerToken::generate();
+
+        let plan = materialize_broker_vm_session(&request, &host_config, &bearer, &host).unwrap();
+        let args = plan.run_invocation().args_lossy();
+        assert!(
+            !args.iter().any(|a| a.contains(BROKER_VM_PREWARM_DIR)),
+            "an absent configured pre-warm dir must not be mounted: {args:?}"
         );
     }
 
