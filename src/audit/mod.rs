@@ -149,13 +149,56 @@ impl std::fmt::Debug for AuditLog {
     }
 }
 
+/// Whether an [`AuditLog`] is backed by a file or by `:memory:`. Only the
+/// on-disk log runs the WAL/`synchronous` tuning; an in-memory log (the
+/// pervasive test backing) has no journal to tune and must stay a plain
+/// memory-journal DB.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum Durability {
+    Disk,
+    Memory,
+}
+
+/// On-disk audit DBs run in WAL mode with `synchronous = NORMAL`: a committed
+/// transaction appends to the write-ahead log and the DB is fsynced only at
+/// checkpoint, not once per commit. This is what removes the
+/// ~two-fsyncs-per-write tax that serialized every VM-facing nix-cache request
+/// through the single audit connection — agent-VM provisioning was dominated by
+/// it. WAL keeps a committed transaction durable across a `writd` crash (the WAL
+/// is replayed on the next open); a host power-loss or kernel panic can still
+/// lose transactions committed since the last checkpoint — the accepted
+/// tradeoff for the audit log's write throughput.
+///
+/// `journal_mode = WAL` is persisted in the DB header, so it survives reopen; it
+/// is re-issued on every open so an existing rollback-journal DB is upgraded in
+/// place. If the backing filesystem cannot support WAL — its shared-memory
+/// wal-index needs an mmap the VFS may not provide, a real risk on the virtiofs
+/// mount that backs the broker-VM audit dir under `broker_placement = vm` —
+/// SQLite silently keeps the prior mode. We detect that, keep the fully-durable
+/// `synchronous = FULL` (NORMAL is only safe under WAL), and warn loudly rather
+/// than run in a quietly less-durable rollback-journal + NORMAL combination.
+fn configure_disk_durability(conn: &Connection) -> Result<(), AuditError> {
+    // `PRAGMA journal_mode = WAL` returns the resulting mode as a row.
+    let journal_mode: String = conn.query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))?;
+    if journal_mode.eq_ignore_ascii_case("wal") {
+        conn.execute_batch("PRAGMA synchronous = NORMAL;")?;
+    } else {
+        tracing::warn!(
+            journal_mode = %journal_mode,
+            "audit DB could not enter WAL mode; keeping rollback journal with synchronous=FULL",
+        );
+        conn.execute_batch("PRAGMA synchronous = FULL;")?;
+    }
+    Ok(())
+}
+
 impl AuditLog {
     /// Open (or create) an on-disk audit log. The schema is brought up to
     /// the highest version this binary supports by running any missing
     /// migrations in order.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, AuditError> {
         let mut conn = Connection::open(path)?;
-        Self::init(&mut conn)?;
+        Self::init(&mut conn, Durability::Disk)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -164,18 +207,21 @@ impl AuditLog {
     /// In-memory audit log, for tests.
     pub fn open_in_memory() -> Result<Self, AuditError> {
         let mut conn = Connection::open_in_memory()?;
-        Self::init(&mut conn)?;
+        Self::init(&mut conn, Durability::Memory)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
     }
 
-    fn init(conn: &mut Connection) -> Result<(), AuditError> {
+    fn init(conn: &mut Connection, durability: Durability) -> Result<(), AuditError> {
         // SQLite foreign_keys is per-connection and defaults to OFF, so the
         // REFERENCES clauses in the schema would otherwise be
         // parsed-and-ignored and orphan `request`/`grant_log` rows could
         // slip in. Must be set outside a transaction.
         conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+        if durability == Durability::Disk {
+            configure_disk_durability(conn)?;
+        }
         schema::migrate(conn)
     }
 
@@ -193,5 +239,70 @@ impl AuditLog {
     ) -> Result<R, AuditError> {
         let mut guard = self.conn.lock().map_err(|_| AuditError::Poisoned)?;
         f(&mut guard)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::NamedTempFile;
+
+    fn pragma_string(log: &AuditLog, pragma: &str) -> String {
+        log.with_conn(|c| Ok(c.query_row(&format!("PRAGMA {pragma}"), [], |r| r.get(0))?))
+            .unwrap()
+    }
+
+    fn pragma_int(log: &AuditLog, pragma: &str) -> i64 {
+        log.with_conn(|c| Ok(c.query_row(&format!("PRAGMA {pragma}"), [], |r| r.get(0))?))
+            .unwrap()
+    }
+
+    #[test]
+    fn on_disk_open_uses_wal_and_synchronous_normal() {
+        // WAL turns the per-commit fsync of the rollback journal into an append
+        // that fsyncs only at checkpoint; synchronous=NORMAL (== 1) is the safe
+        // companion under WAL. Together they are what takes the ~2×fsync tax off
+        // every audit write (the agent-VM provisioning hot path).
+        let db = NamedTempFile::new().unwrap();
+        let log = AuditLog::open(db.path()).unwrap();
+        assert_eq!(
+            pragma_string(&log, "journal_mode").to_ascii_lowercase(),
+            "wal"
+        );
+        assert_eq!(
+            pragma_int(&log, "synchronous"),
+            1,
+            "expected synchronous=NORMAL (1)"
+        );
+    }
+
+    #[test]
+    fn wal_data_survives_a_clean_reopen() {
+        // A row committed under WAL by the first connection must be visible after
+        // the log is dropped (checkpointed on close) and reopened.
+        use crate::audit::test_support::sample_session;
+        let db = NamedTempFile::new().unwrap();
+        let s = sample_session();
+        {
+            let log = AuditLog::open(db.path()).unwrap();
+            log.open_session(&s).unwrap();
+        }
+        let log = AuditLog::open(db.path()).unwrap();
+        assert!(
+            log.get_session(s.session_id).unwrap().is_some(),
+            "session written under WAL must survive a clean reopen",
+        );
+    }
+
+    #[test]
+    fn in_memory_open_is_not_forced_into_wal() {
+        // The WAL/synchronous config is disk-only; an in-memory log opens as a
+        // plain memory-journal DB (regression guard so the disk path can't leak
+        // a warning or a wrong-pragma into the pervasive in-memory test opens).
+        let log = AuditLog::open_in_memory().unwrap();
+        assert_eq!(
+            pragma_string(&log, "journal_mode").to_ascii_lowercase(),
+            "memory"
+        );
     }
 }
