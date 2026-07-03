@@ -291,10 +291,14 @@ impl AuditLog {
         request: &ProxyRequestRecord<'_, T::Route>,
         outcome: &ProxyOutcomeRecord<'_>,
     ) -> Result<(), AuditError> {
-        debug_assert_eq!(
-            request.request_id, outcome.request_id,
-            "coalesced audit rows must share a request_id",
-        );
+        // Enforced at runtime, not just in debug: a stripped assert could
+        // otherwise commit the outcome against the wrong request in a release
+        // build, corrupting the request↔outcome association.
+        if request.request_id != outcome.request_id {
+            return Err(AuditError::Invariant(
+                "coalesced audit rows must share a request_id",
+            ));
+        }
         validate_proxy_request::<T>(request)?;
         validate_proxy_outcome::<T>(outcome)?;
         self.with_conn_mut(|c| {
@@ -305,6 +309,15 @@ impl AuditLog {
             tx.commit()?;
             Ok(())
         })
+    }
+
+    /// Read-only check that a session exists and is open. Lets a caller that has
+    /// deferred its audit row write (coalescing request+outcome into one commit
+    /// after the action) still refuse work against a closed or unknown session
+    /// *before* doing it, rather than only when the deferred write lands. Adds
+    /// no commit — it is a single indexed `SELECT`.
+    pub fn require_session_open(&self, session_id: SessionId) -> Result<(), AuditError> {
+        self.with_conn(|c| check_session_open(c, session_id))
     }
 }
 
@@ -596,6 +609,44 @@ END;
             dump_outcome_rows(&log).is_empty(),
             "no outcome row on reject"
         );
+    }
+
+    /// Request and outcome rows that disagree on `request_id` are a programming
+    /// error that must be refused at *runtime* — not merely a debug assert —
+    /// writing nothing, so a release build can never commit an outcome attached
+    /// to the wrong request while its own request row is left without one.
+    #[test]
+    fn request_and_outcome_rejects_mismatched_request_ids_without_writing() {
+        let log = AuditLog::open_in_memory().unwrap();
+        install_test_tables(&log);
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+        let request_id = RequestId::new();
+        let other_id = RequestId::new();
+
+        let err = log
+            .record_proxy_request_and_outcome::<TestTable>(
+                &ProxyRequestRecord {
+                    request_id,
+                    session_id: s.session_id,
+                    received_at: UnixMillis::from_millis(1_700_000_100),
+                    method: "POST",
+                    target: "/x",
+                    route: TestRoute::A,
+                    decision: &ProxyAuditDecision::Allow,
+                },
+                &sample_outcome(other_id),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                AuditError::Invariant("coalesced audit rows must share a request_id")
+            ),
+            "got: {err:?}"
+        );
+        assert!(dump_request_rows(&log).is_empty());
+        assert!(dump_outcome_rows(&log).is_empty());
     }
 
     #[test]

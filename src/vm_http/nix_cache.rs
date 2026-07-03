@@ -185,12 +185,30 @@ pub(super) async fn route_nix_cache_request<S: SecretStore>(
     }
 
     let request_id = RequestId::new();
+    // The audit row is written coalesced with the outcome *after* the fetch (a
+    // cache serve grants no authority, so its request row need not be durable
+    // before the action — one commit beats two on the audit-write `fsync`
+    // path). But refuse a closed/unknown session *before* doing any cache I/O
+    // on its behalf: the coalesced write re-checks inside its transaction, yet
+    // only after the fetch has run. This read-only check adds no commit.
+    if let Err(err) = service
+        .broker_state
+        .audit
+        .require_session_open(session.session_id())
+    {
+        tracing::error!(
+            target: AUDIT_WRITE_FAILURE_TARGET,
+            kind = "nix_cache_request",
+            request_id = %request_id,
+            error = %err,
+            "audit write failed",
+        );
+        return VmHttpResponse::text(VmHttpStatus::InternalServerError, "audit write failed")
+            .into();
+    }
     // Stamp arrival before the fetch so `received_at` still reflects when the
     // request came in; the request row is written together with its outcome in
     // one commit after the fetch (see `record_nix_cache_request_and_outcome`).
-    // A cache serve grants no authority, so — unlike a grant — the request row
-    // need not be durable before the action, and one commit beats two on the
-    // audit-write `fsync` path.
     let received_at = UnixMillis::now();
     let fetch = service
         .fetch_route(request.method.as_str(), view, &route)
