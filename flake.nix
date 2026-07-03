@@ -35,11 +35,19 @@
             || lib.hasPrefix "tests/" rel;
         };
 
+      # NOTE: these are `buildFeatures` / `buildNoDefaultFeatures`, the public
+      # buildRustPackage argument names — NOT `cargoBuildFeatures` /
+      # `cargoBuildNoDefaultFeatures`. buildRustPackage assigns
+      # `cargoBuildFeatures = buildFeatures` internally, so passing the
+      # `cargoBuild*` names directly gets silently clobbered back to the empty
+      # defaults and the feature flags never reach `cargo build` (which built
+      # writ-vm with default `host` features for a long time — see the cross
+      # helpers below). `cargoBuildFlags` is a genuine passthrough and stays.
       mkWrit = pkgs: {
         pname ? "writ",
-        cargoBuildFeatures ? [],
+        buildFeatures ? [],
         cargoBuildFlags ? [],
-        cargoBuildNoDefaultFeatures ? false,
+        buildNoDefaultFeatures ? false,
         doCheck ? true
       }:
         pkgs.rustPlatform.buildRustPackage {
@@ -48,8 +56,29 @@
           src = mkRustSource pkgs;
           cargoLock.lockFile = ./Cargo.lock;
           nativeCheckInputs = [ pkgs.git pkgs.procps ];
-          inherit cargoBuildFeatures cargoBuildFlags cargoBuildNoDefaultFeatures doCheck;
+          inherit buildFeatures cargoBuildFlags buildNoDefaultFeatures doCheck;
         };
+
+      # ring/libsqlite3-sys/zstd-sys/lzma-sys have build.rs scripts that compile
+      # as build-platform (darwin) executables. rustc's late_link_args for
+      # aarch64-apple-darwin include `-liconv`, and Cargo's RUSTFLAGS /
+      # CARGO_TARGET_<host>_RUSTFLAGS do not propagate to build-script rustc in
+      # cross-compile mode, so feed the build-side cc-wrapper directly via
+      # NIX_LDFLAGS_<suffixSalt>. Harmless on Linux build hosts (nothing links
+      # `-liconv` there). `crossPkgs` is the pkgsCross set whose build-build
+      # cc-wrapper salt we target.
+      withDarwinBuildIconv = buildPkgs: crossPkgs: drv:
+        drv.overrideAttrs (old: {
+          depsBuildBuild = (old.depsBuildBuild or []) ++ [ buildPkgs.libiconv ];
+          preBuild =
+            let
+              salt = crossPkgs.pkgsBuildBuild.stdenv.cc.suffixSalt;
+              varName = "NIX_LDFLAGS_${salt}";
+            in ''
+              ${old.preBuild or ""}
+              export ${varName}="-L${buildPkgs.libiconv}/lib ''${${varName}:-}"
+            '';
+        });
 
       guestSystems = [
         "aarch64-linux"
@@ -78,14 +107,16 @@
           pkgs = buildPkgs.pkgsCross.${cross.pkgsCross};
           writVm = mkWrit pkgs {
             pname = "writ-vm";
-            cargoBuildFeatures = [ "vm-client" ];
+            buildFeatures = [ "vm-client" ];
             cargoBuildFlags = [ "--bin" "writ-vm" ];
-            cargoBuildNoDefaultFeatures = true;
+            buildNoDefaultFeatures = true;
             # Target binaries are not executable on the Darwin builder.
             doCheck = false;
           };
         in
-        writVm.overrideAttrs (old: {
+        # vm-client excludes libsqlite3-sys/zstd-sys/lzma-sys, but still pulls
+        # `ring` (reqwest -> rustls), whose build.rs needs `-liconv` on darwin.
+        (withDarwinBuildIconv buildPkgs pkgs writVm).overrideAttrs (old: {
           passthru = (old.passthru or {}) // {
             inherit guestSystem;
             rustTarget = cross.rustTarget;
@@ -114,24 +145,9 @@
             doCheck = false;
           };
         in
-        writd.overrideAttrs (old: {
-          # writd's `host` feature pulls in libsqlite3-sys, ring, zstd-sys, and
-          # lzma-sys. Their build.rs scripts compile as host-platform
-          # executables, and on darwin rustc's late_link_args for
-          # aarch64-apple-darwin include `-liconv`. Cargo's RUSTFLAGS (and
-          # CARGO_TARGET_<host>_RUSTFLAGS) do not propagate to build-script
-          # rustc invocations in cross-compile mode, so we feed the
-          # build-side cc-wrapper directly via NIX_LDFLAGS_<suffixSalt>.
-          # writ-vm doesn't need this — vm-client excludes those crates.
-          depsBuildBuild = (old.depsBuildBuild or []) ++ [ buildPkgs.libiconv ];
-          preBuild =
-            let
-              salt = pkgs.pkgsBuildBuild.stdenv.cc.suffixSalt;
-              varName = "NIX_LDFLAGS_${salt}";
-            in ''
-              ${old.preBuild or ""}
-              export ${varName}="-L${buildPkgs.libiconv}/lib ''${${varName}:-}"
-            '';
+        # writd's `host` feature pulls in libsqlite3-sys, ring, zstd-sys, and
+        # lzma-sys, whose build.rs scripts need `-liconv` on darwin.
+        (withDarwinBuildIconv buildPkgs pkgs writd).overrideAttrs (old: {
           passthru = (old.passthru or {}) // {
             inherit guestSystem;
             rustTarget = cross.rustTarget;
@@ -213,12 +229,21 @@
             then "Darwin-buildable OCI archive for agent VM proof harnesses"
             else "Darwin-buildable OCI archive for daemon-managed writ agent VMs";
           guestRequiredBins = [
+            "awk"
             "claude"
             "codex"
+            "curl"
+            "diff"
+            "find"
             "git"
+            "grep"
             "ip"
+            "jq"
+            "less"
             "nix"
             "ps"
+            "rg"
+            "sed"
             "sh"
             "writ-vm"
           ];
@@ -242,13 +267,18 @@
               exit 1
             fi
           '';
+          # grep/sed/awk/find and curl now ship in production (see the guest
+          # dev toolset in guestRoot below), so they are no longer forbidden.
+          # What stays proof-only is the egress/DNS negative-control set the
+          # prove-*.sh harnesses use to demonstrate the no-egress firewall:
+          # keeping wget/dig/nslookup out of production preserves a meaningful
+          # "proof tools must not leak into prod" regression guard, and curl
+          # already covers the routine in-guest HTTP need (it can only reach the
+          # broker anyway — the firewall, not tool absence, is the egress
+          # boundary).
           productionForbiddenBins = [
-            "awk"
             "dig"
-            "find"
-            "grep"
             "nslookup"
-            "sed"
             "wget"
           ];
           productionForbiddenBinCheck = lib.concatMapStringsSep "\n"
@@ -259,10 +289,11 @@
               fi
             '')
             productionForbiddenBins;
+          # gawk/gnugrep now ship in the production base image, so the proof
+          # image inherits them; proofTools only needs to add the egress/DNS
+          # probe tools that stay out of production (wget, dig, nslookup).
           proofTools = [
             guestPkgs.bind.dnsutils
-            guestPkgs.gawk
-            guestPkgs.gnugrep
             guestPkgs.wget
           ];
           proofToolCheck = lib.concatMapStringsSep "\n"
@@ -306,10 +337,25 @@
               guestPkgs.cacert
               guestPkgs.codex
               guestPkgs.coreutils
+              # Routine development toolset. The agent shells out to these during
+              # real work (curl for HTTP against the broker, the text/search/JSON
+              # utilities in Bash one-liners); the image is minimal by intent but
+              # a bare coreutils+git+nix rootfs is too sparse to develop in. The
+              # egress/DNS probe tools (wget/dig/nslookup) stay proof-only — see
+              # productionForbiddenBins above.
+              guestPkgs.curl
+              guestPkgs.diffutils
+              guestPkgs.findutils
+              guestPkgs.gawk
               guestPkgs.gitMinimal
+              guestPkgs.gnugrep
+              guestPkgs.gnused
               guestPkgs.iproute2
+              guestPkgs.jq
+              guestPkgs.less
               guestPkgs.nix
               guestPkgs.procps
+              guestPkgs.ripgrep
             ] ++ lib.optionals includeProofTools proofTools;
             pathsToLink = [
               "/bin"
