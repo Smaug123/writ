@@ -211,6 +211,10 @@ async fn vm_broker_placement_starts_agent_pointed_at_the_broker_vm() {
         "agent env must point WRIT_BROKER_URL at the broker VM: {env}"
     );
     assert!(env.contains(&format!("{AGENT_VM_BROKER_TOKEN_ENV}=writ-vm-")));
+    assert!(
+        !env.contains(AGENT_VM_NIX_PREWARM_URL_ENV),
+        "no pre-warm dir is configured, so the strict warm substituter must not be advertised even under vm placement: {env}"
+    );
     let args = fs::read_to_string(&args_log).unwrap();
     // The broker VM was launched, and the host PF allow target is the broker VM IP.
     assert!(
@@ -257,6 +261,58 @@ async fn vm_broker_placement_starts_agent_pointed_at_the_broker_vm() {
         !material.exists(),
         "stop must remove the broker material (copied secrets included)"
     );
+}
+
+#[tokio::test]
+async fn vm_broker_placement_advertises_prewarm_substituter_when_prewarm_dir_configured() {
+    // Parity with host placement: once the vm broker serves the pre-warmed closure
+    // (re-pointed dir + read-only mount), the agent's strict devShell warm must be
+    // pinned to /v1/nix/prewarm just as it is for host placement.
+    let dir = tempfile::tempdir().unwrap();
+    let args_log = dir.path().join("args.log");
+    let env_log = dir.path().join("env.log");
+    let fake_tool = write_vm_broker_fake_tool(dir.path(), &args_log, &env_log);
+    let prewarm_dir = dir.path().join("prewarm-cache");
+    let (config, _state_store) = daemon_config_with_prewarm_dir_and_placement(
+        dir.path(),
+        &fake_tool,
+        &prewarm_dir,
+        BrokerPlacement::Vm,
+    );
+    let config = config
+        .with_broker_vm_host_facts(&vm_broker_host_config_json(), &dir.path().join("audit.db"));
+    let daemon = AgentVmDaemon::new(config);
+    let state = make_state_with_audit(AuditLog::open(dir.path().join("audit.db")).unwrap());
+    state
+        .secrets
+        .put(&crate::secret::SecretKey::new("gh-app-pk").unwrap(), "PEM")
+        .unwrap();
+
+    let started = daemon
+        .start_session(
+            Arc::clone(&state),
+            Some("vm session".into()),
+            Some(AgentKind::Claude),
+            Some("claude-test".into()),
+            None,
+            vec!["sleep".into(), "600".into()],
+        )
+        .await
+        .unwrap();
+
+    let env = fs::read_to_string(&env_log).unwrap();
+    assert!(
+        env.contains(&format!(
+            "{AGENT_VM_NIX_PREWARM_URL_ENV}={}",
+            nix_prewarm_url_for_broker_url(started.broker_url())
+        )),
+        "vm placement with a configured pre-warm dir must advertise the strict substituter: {env}"
+    );
+
+    daemon
+        .stop_session(&state, started.session_id())
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
