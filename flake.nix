@@ -35,11 +35,19 @@
             || lib.hasPrefix "tests/" rel;
         };
 
+      # NOTE: these are `buildFeatures` / `buildNoDefaultFeatures`, the public
+      # buildRustPackage argument names — NOT `cargoBuildFeatures` /
+      # `cargoBuildNoDefaultFeatures`. buildRustPackage assigns
+      # `cargoBuildFeatures = buildFeatures` internally, so passing the
+      # `cargoBuild*` names directly gets silently clobbered back to the empty
+      # defaults and the feature flags never reach `cargo build` (which built
+      # writ-vm with default `host` features for a long time — see the cross
+      # helpers below). `cargoBuildFlags` is a genuine passthrough and stays.
       mkWrit = pkgs: {
         pname ? "writ",
-        cargoBuildFeatures ? [],
+        buildFeatures ? [],
         cargoBuildFlags ? [],
-        cargoBuildNoDefaultFeatures ? false,
+        buildNoDefaultFeatures ? false,
         doCheck ? true
       }:
         pkgs.rustPlatform.buildRustPackage {
@@ -48,8 +56,29 @@
           src = mkRustSource pkgs;
           cargoLock.lockFile = ./Cargo.lock;
           nativeCheckInputs = [ pkgs.git pkgs.procps ];
-          inherit cargoBuildFeatures cargoBuildFlags cargoBuildNoDefaultFeatures doCheck;
+          inherit buildFeatures cargoBuildFlags buildNoDefaultFeatures doCheck;
         };
+
+      # ring/libsqlite3-sys/zstd-sys/lzma-sys have build.rs scripts that compile
+      # as build-platform (darwin) executables. rustc's late_link_args for
+      # aarch64-apple-darwin include `-liconv`, and Cargo's RUSTFLAGS /
+      # CARGO_TARGET_<host>_RUSTFLAGS do not propagate to build-script rustc in
+      # cross-compile mode, so feed the build-side cc-wrapper directly via
+      # NIX_LDFLAGS_<suffixSalt>. Harmless on Linux build hosts (nothing links
+      # `-liconv` there). `crossPkgs` is the pkgsCross set whose build-build
+      # cc-wrapper salt we target.
+      withDarwinBuildIconv = buildPkgs: crossPkgs: drv:
+        drv.overrideAttrs (old: {
+          depsBuildBuild = (old.depsBuildBuild or []) ++ [ buildPkgs.libiconv ];
+          preBuild =
+            let
+              salt = crossPkgs.pkgsBuildBuild.stdenv.cc.suffixSalt;
+              varName = "NIX_LDFLAGS_${salt}";
+            in ''
+              ${old.preBuild or ""}
+              export ${varName}="-L${buildPkgs.libiconv}/lib ''${${varName}:-}"
+            '';
+        });
 
       guestSystems = [
         "aarch64-linux"
@@ -78,14 +107,16 @@
           pkgs = buildPkgs.pkgsCross.${cross.pkgsCross};
           writVm = mkWrit pkgs {
             pname = "writ-vm";
-            cargoBuildFeatures = [ "vm-client" ];
+            buildFeatures = [ "vm-client" ];
             cargoBuildFlags = [ "--bin" "writ-vm" ];
-            cargoBuildNoDefaultFeatures = true;
+            buildNoDefaultFeatures = true;
             # Target binaries are not executable on the Darwin builder.
             doCheck = false;
           };
         in
-        writVm.overrideAttrs (old: {
+        # vm-client excludes libsqlite3-sys/zstd-sys/lzma-sys, but still pulls
+        # `ring` (reqwest -> rustls), whose build.rs needs `-liconv` on darwin.
+        (withDarwinBuildIconv buildPkgs pkgs writVm).overrideAttrs (old: {
           passthru = (old.passthru or {}) // {
             inherit guestSystem;
             rustTarget = cross.rustTarget;
@@ -114,24 +145,9 @@
             doCheck = false;
           };
         in
-        writd.overrideAttrs (old: {
-          # writd's `host` feature pulls in libsqlite3-sys, ring, zstd-sys, and
-          # lzma-sys. Their build.rs scripts compile as host-platform
-          # executables, and on darwin rustc's late_link_args for
-          # aarch64-apple-darwin include `-liconv`. Cargo's RUSTFLAGS (and
-          # CARGO_TARGET_<host>_RUSTFLAGS) do not propagate to build-script
-          # rustc invocations in cross-compile mode, so we feed the
-          # build-side cc-wrapper directly via NIX_LDFLAGS_<suffixSalt>.
-          # writ-vm doesn't need this — vm-client excludes those crates.
-          depsBuildBuild = (old.depsBuildBuild or []) ++ [ buildPkgs.libiconv ];
-          preBuild =
-            let
-              salt = pkgs.pkgsBuildBuild.stdenv.cc.suffixSalt;
-              varName = "NIX_LDFLAGS_${salt}";
-            in ''
-              ${old.preBuild or ""}
-              export ${varName}="-L${buildPkgs.libiconv}/lib ''${${varName}:-}"
-            '';
+        # writd's `host` feature pulls in libsqlite3-sys, ring, zstd-sys, and
+        # lzma-sys, whose build.rs scripts need `-liconv` on darwin.
+        (withDarwinBuildIconv buildPkgs pkgs writd).overrideAttrs (old: {
           passthru = (old.passthru or {}) // {
             inherit guestSystem;
             rustTarget = cross.rustTarget;
