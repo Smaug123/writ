@@ -213,12 +213,21 @@
             then "Darwin-buildable OCI archive for agent VM proof harnesses"
             else "Darwin-buildable OCI archive for daemon-managed writ agent VMs";
           guestRequiredBins = [
+            "awk"
             "claude"
             "codex"
+            "curl"
+            "diff"
+            "find"
             "git"
+            "grep"
             "ip"
+            "jq"
+            "less"
             "nix"
             "ps"
+            "rg"
+            "sed"
             "sh"
             "writ-vm"
           ];
@@ -242,13 +251,18 @@
               exit 1
             fi
           '';
+          # grep/sed/awk/find and curl now ship in production (see the guest
+          # dev toolset in guestRoot below), so they are no longer forbidden.
+          # What stays proof-only is the egress/DNS negative-control set the
+          # prove-*.sh harnesses use to demonstrate the no-egress firewall:
+          # keeping wget/dig/nslookup out of production preserves a meaningful
+          # "proof tools must not leak into prod" regression guard, and curl
+          # already covers the routine in-guest HTTP need (it can only reach the
+          # broker anyway — the firewall, not tool absence, is the egress
+          # boundary).
           productionForbiddenBins = [
-            "awk"
             "dig"
-            "find"
-            "grep"
             "nslookup"
-            "sed"
             "wget"
           ];
           productionForbiddenBinCheck = lib.concatMapStringsSep "\n"
@@ -259,10 +273,11 @@
               fi
             '')
             productionForbiddenBins;
+          # gawk/gnugrep now ship in the production base image, so the proof
+          # image inherits them; proofTools only needs to add the egress/DNS
+          # probe tools that stay out of production (wget, dig, nslookup).
           proofTools = [
             guestPkgs.bind.dnsutils
-            guestPkgs.gawk
-            guestPkgs.gnugrep
             guestPkgs.wget
           ];
           proofToolCheck = lib.concatMapStringsSep "\n"
@@ -306,10 +321,25 @@
               guestPkgs.cacert
               guestPkgs.codex
               guestPkgs.coreutils
+              # Routine development toolset. The agent shells out to these during
+              # real work (curl for HTTP against the broker, the text/search/JSON
+              # utilities in Bash one-liners); the image is minimal by intent but
+              # a bare coreutils+git+nix rootfs is too sparse to develop in. The
+              # egress/DNS probe tools (wget/dig/nslookup) stay proof-only — see
+              # productionForbiddenBins above.
+              guestPkgs.curl
+              guestPkgs.diffutils
+              guestPkgs.findutils
+              guestPkgs.gawk
               guestPkgs.gitMinimal
+              guestPkgs.gnugrep
+              guestPkgs.gnused
               guestPkgs.iproute2
+              guestPkgs.jq
+              guestPkgs.less
               guestPkgs.nix
               guestPkgs.procps
+              guestPkgs.ripgrep
             ] ++ lib.optionals includeProofTools proofTools;
             pathsToLink = [
               "/bin"

@@ -963,13 +963,20 @@ First Darwin-hosted OCI assembly slice implemented in `flake.nix` and
 First guest image reduction slice implemented in `flake.nix` and
 `scripts/prove-agent-vm-daemon.sh`:
 
-- `agent-vm-guest-image-*` is now the production/default image and intentionally
-  excludes proof-only `/bin` tools such as `wget`, `nslookup`, `awk`, `grep`,
-  `sed`, and `find`. The production archive build fails if those names appear
-  in the root symlink farm;
+- `agent-vm-guest-image-*` is the production/default image. It carries a routine
+  development toolset (`curl`, `grep`, `sed`, `awk`, `find`, `rg`, `jq`, `less`,
+  `diff` alongside the coreutils/git/nix base) because the agent shells out to
+  these during real work, and its archive build fails if any are absent. It
+  still intentionally excludes the proof-only egress/DNS negative-control tools
+  `wget`, `nslookup`, and `dig`; the production archive build fails if any of
+  those names appear in the root symlink farm. (Tool *absence* was never the
+  egress boundary — the per-session PF firewall is — so this exclusion is a
+  "proof tools must not leak into prod" hygiene guard, not a security control;
+  `curl` covers the in-guest HTTP need and can only reach the broker anyway.)
 - `agent-vm-guest-proof-image-*` is the manual proof image. It keeps the
-  production runtime plus `wget`, `nslookup`, `awk`, and `grep`, and its archive
-  build fails if any of those proof assertions tools are absent;
+  production runtime plus `wget`, `nslookup`, and `dig` (`awk`/`grep` are now
+  inherited from the production base), and its archive build fails if any of
+  those proof assertion tools are absent;
 - the daemon proof harness now avoids proof-only guest tools in its assertions,
   so it defaults to the production `writ-agent-vm-guest:latest` image.
   Supplying `WRIT_PROVE_IMAGE` still opts into an externally-provided image.
