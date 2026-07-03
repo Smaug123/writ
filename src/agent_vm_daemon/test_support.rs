@@ -293,13 +293,25 @@ pub(super) fn daemon_config_with_prewarm_dir(
     fake_tool: &Path,
     prewarm_dir: &Path,
 ) -> (AgentVmDaemonRuntimeConfig, AgentVmSessionStateStore) {
+    daemon_config_with_prewarm_dir_and_placement(dir, fake_tool, prewarm_dir, BrokerPlacement::Host)
+}
+
+/// A daemon config with a configured pre-warm dir under a chosen broker
+/// placement. Both placements serve the pre-warm cache (host directly, vm via the
+/// re-pointed dir + read-only mount), so both advertise the strict substituter.
+pub(super) fn daemon_config_with_prewarm_dir_and_placement(
+    dir: &Path,
+    fake_tool: &Path,
+    prewarm_dir: &Path,
+    broker_placement: BrokerPlacement,
+) -> (AgentVmDaemonRuntimeConfig, AgentVmSessionStateStore) {
     daemon_config_inner(
         dir,
         fake_tool,
         252,
         253,
         Some(prewarm_dir.to_path_buf()),
-        BrokerPlacement::Host,
+        broker_placement,
     )
 }
 

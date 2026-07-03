@@ -389,5 +389,9 @@ echo "    \"cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=\","
 echo "    \"$public_key\""
 echo "  ]"
 echo
+echo "writd serves this under both broker placements: broker_placement = host reads"
+echo "the dir directly; broker_placement = vm bind-mounts it read-only into the"
+echo "broker VM. Either way, keep the dir readable by writd."
+echo
 echo "Re-run this to refresh after the repo's default branch moves; already-signed"
 echo "paths are skipped on copy."

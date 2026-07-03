@@ -1573,12 +1573,12 @@ impl AgentVmDaemon {
         )?);
         // Advertise the strict pre-warm-only substituter exactly when the broker
         // actually serves it: its presence pins the devShell warm to the broker's
-        // /v1/nix/prewarm. Only the host broker serves it — the vm broker config
-        // drops nix_prewarm_cache_dir — so for vm placement advertising it would
-        // pin warm to an endpoint that 404s and fail otherwise-valid bootstraps.
-        if self.config.lifecycle.broker_placement == BrokerPlacement::Host
-            && self.config.vm_http.nix_prewarm_cache_dir().is_some()
-        {
+        // /v1/nix/prewarm so the warm is provably served offline from the
+        // pre-warm + flake-input archives. Both placements now serve it — the host
+        // broker directly, the vm broker via the re-pointed nix_prewarm_cache_dir
+        // and its read-only mount (see broker_vm::with_prewarm_cache_mount) — so
+        // the sole gate is whether the operator configured a pre-warm dir.
+        if self.config.vm_http.nix_prewarm_cache_dir().is_some() {
             guest_env.push(AgentVmGuestEnvVar::new(
                 AGENT_VM_NIX_PREWARM_URL_ENV,
                 nix_prewarm_url_for_broker_url(broker_url),

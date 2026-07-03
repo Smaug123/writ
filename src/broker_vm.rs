@@ -48,6 +48,13 @@ pub const BROKER_VM_AUDIT_DIR: &str = "/writ/audit";
 /// Guest working root for the broker (on tmpfs inside the VM): clone scratch,
 /// bundle staging, the local nix-cache. Ephemeral per VM lifetime.
 pub const BROKER_VM_WORK_ROOT: &str = "/tmp/writ-broker-work";
+/// Guest mount target for the host's pre-warmed devShell-closure cache
+/// (read-only: the broker only reads it). Present only when the host config sets
+/// `nix_prewarm_cache_dir`; [`broker_config_json`] re-points the broker's
+/// `nix_prewarm_cache_dir` here (and [`BrokerVmPlan::with_prewarm_cache_mount`]
+/// bind-mounts the host dir), so the in-VM broker serves the pre-warm archive
+/// local-first exactly as the host broker does.
+pub const BROKER_VM_PREWARM_DIR: &str = "/writ/prewarm";
 
 // Guest executable paths the broker **image** must provide. The derived broker
 // config points the vm_http executables at these, since the host's own
@@ -224,6 +231,31 @@ impl BrokerVmPlan {
             container_tool: container_tool.into(),
             mounts,
         }
+    }
+
+    /// Bind-mount the host's pre-warm cache dir read-only at
+    /// [`BROKER_VM_PREWARM_DIR`], so the in-VM broker serves the pre-warmed
+    /// devShell closure local-first (both `/v1/nix/cache` and the strict
+    /// `/v1/nix/prewarm` views). A no-op given `None`.
+    ///
+    /// This is a pure data-plan builder: it mounts whatever path it is given and
+    /// does no filesystem check. The caller (`materialize_broker_vm_session_inner`)
+    /// owns the effectful decision — it passes `Some` only for a dir that exists,
+    /// since virtiofs would fail `container run` on a missing source and a
+    /// configured-but-absent pre-warm dir is a tolerated state. [`broker_config_json`]
+    /// re-points `nix_prewarm_cache_dir` at this same guest target when the host
+    /// set it; if the dir is absent the mount is skipped and the broker serves an
+    /// empty pre-warm cache (`NotFound` tolerated), matching host placement.
+    #[must_use]
+    pub fn with_prewarm_cache_mount(mut self, host_prewarm_dir: Option<PathBuf>) -> Self {
+        if let Some(source) = host_prewarm_dir {
+            self.mounts.push(BrokerVmMount {
+                source,
+                target: BROKER_VM_PREWARM_DIR.to_string(),
+                readonly: true,
+            });
+        }
+        self
     }
 
     pub fn names(&self) -> &BrokerVmNames {
@@ -474,13 +506,15 @@ pub enum BrokerConfigError {
 /// guest work_root (see [`broker_config_json`]) to enable flake-input
 /// provisioning, which the no-egress agent VM depends on. `flake_input_cache_dir`
 /// and `flake_materialize_scratch_dir` stay dropped because they auto-default
-/// under work_root once provisioning is on. `nix_prewarm_cache_dir` /
-/// `agent_run_log_root` / `git_push_staging_root` stay disabled: the v1 broker
-/// serves no pre-warm, agent-run, or git-push routes.
+/// under work_root once provisioning is on. `nix_prewarm_cache_dir` is *also* not
+/// here: like the mirror cache it is re-pointed (at [`BROKER_VM_PREWARM_DIR`],
+/// the read-only mount [`BrokerVmPlan::with_prewarm_cache_mount`] provides), so
+/// the in-VM broker serves the operator's pre-warmed closure exactly as the host
+/// broker does. `agent_run_log_root` / `git_push_staging_root` stay disabled: the
+/// v1 broker serves no agent-run or git-push routes.
 const BROKER_DROPPED_VM_HTTP_KEYS: &[&str] = &[
     "flake_input_cache_dir",
     "flake_materialize_scratch_dir",
-    "nix_prewarm_cache_dir",
     "agent_run_log_root",
     "git_push_staging_root",
 ];
@@ -579,6 +613,25 @@ pub fn broker_config_json(
         "flake_mirror_cache_dir".to_string(),
         serde_json::Value::String(format!("{work_root}/flake-mirror")),
     );
+    // Re-point the pre-warm cache dir at its read-only guest mount
+    // ([`BROKER_VM_PREWARM_DIR`], provided by `with_prewarm_cache_mount`) exactly
+    // when the host configured one, so the in-VM broker serves the pre-warmed
+    // closure local-first. A present string is rewritten; a `null` or absent value
+    // is removed, leaving the broker with no pre-warm archive (identical to
+    // before, and consistent with no mount being added). The guest path is absent
+    // on the host but `validate_nix_prewarm_cache_dir` tolerates a missing dir, so
+    // this config is accepted whether validated on the host or in the VM.
+    match vm_http.get("nix_prewarm_cache_dir") {
+        Some(value) if value.is_string() => {
+            vm_http.insert(
+                "nix_prewarm_cache_dir".to_string(),
+                serde_json::Value::String(BROKER_VM_PREWARM_DIR.to_string()),
+            );
+        }
+        _ => {
+            vm_http.remove("nix_prewarm_cache_dir");
+        }
+    }
     for key in BROKER_DROPPED_VM_HTTP_KEYS {
         vm_http.remove(*key);
     }
@@ -1080,6 +1133,24 @@ fn materialize_broker_vm_session_inner(
         }
     })?;
 
+    // Mount the host's pre-warm cache dir (if configured) read-only into the
+    // broker VM; `broker_config_json` above re-pointed the broker's
+    // `nix_prewarm_cache_dir` at the matching guest target. Read from the same
+    // typed config `broker_config_json` rewrote.
+    //
+    // Only mount a dir that actually exists: `validate_nix_prewarm_cache_dir`
+    // deliberately tolerates a configured-but-absent path (so an operator can set
+    // it before the builder fills it), and virtiofs would fail `container run` on
+    // a missing source. Skipping the mount for an absent dir leaves the broker's
+    // /writ/prewarm unmounted, so its own validator tolerates the `NotFound` and
+    // serves an empty pre-warm cache — exactly what host placement does for the
+    // same configured-but-absent state.
+    let host_prewarm_dir = config
+        .agent_vm
+        .as_ref()
+        .and_then(|agent_vm| agent_vm.vm_http.nix_prewarm_cache_dir.clone())
+        .filter(|dir| dir.is_dir());
+
     Ok(BrokerVmPlan::new(
         request.session_id,
         request.image.clone(),
@@ -1090,7 +1161,8 @@ fn materialize_broker_vm_session_inner(
         request.staging_dir.clone(),
         request.secrets_dir.clone(),
         request.audit_dir.clone(),
-    ))
+    )
+    .with_prewarm_cache_mount(host_prewarm_dir))
 }
 
 #[cfg(test)]
@@ -1621,9 +1693,10 @@ mod tests {
                 .broker_port_range()
                 .contains(BrokerPort::new(18090).unwrap())
         );
-        assert!(
-            runtime.nix_prewarm_cache_dir().is_none(),
-            "prewarm must be disabled in the broker (it serves no prewarm route)"
+        assert_eq!(
+            runtime.nix_prewarm_cache_dir(),
+            Some(Path::new(BROKER_VM_PREWARM_DIR)),
+            "the host's pre-warm dir must be re-pointed at its read-only guest mount"
         );
         // Flake provisioning is ENABLED in the broker VM (re-pointed mirror cache):
         // the no-egress agent VM gets its locked flake inputs from the broker.
@@ -1654,6 +1727,85 @@ mod tests {
                 .flake_mirror_cache_dir
                 .as_deref(),
             Some(Path::new("/tmp/writ-broker-work/flake-mirror")),
+        );
+    }
+
+    #[test]
+    fn broker_config_repoints_prewarm_dir_at_the_guest_mount() {
+        use crate::config::DaemonConfig;
+        // The host set nix_prewarm_cache_dir to a host path; the broker must see it
+        // re-pointed at the read-only guest mount so it serves the pre-warmed
+        // closure local-first (mirrors flake_mirror_cache_dir).
+        let json = broker_config_json(
+            &host_config_json(),
+            BrokerPort::new(18080).unwrap(),
+            BROKER_VM_WORK_ROOT,
+            Path::new("/var/lib/writ/audit.db"),
+        )
+        .unwrap();
+        let config: DaemonConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            config
+                .agent_vm
+                .unwrap()
+                .vm_http
+                .nix_prewarm_cache_dir
+                .as_deref(),
+            Some(Path::new(BROKER_VM_PREWARM_DIR)),
+        );
+    }
+
+    #[test]
+    fn broker_config_drops_prewarm_dir_when_host_has_none() {
+        use crate::config::DaemonConfig;
+        // A host that configured no pre-warm dir leaves the broker with none, so no
+        // pre-warm route is served (and no mount is added) — identical to before.
+        let host = host_config_json().replace(
+            "\"nix_prewarm_cache_dir\": \"/Users/me/Library/writ/prewarm\",\n",
+            "",
+        );
+        assert!(
+            !host.contains("nix_prewarm_cache_dir"),
+            "test setup removed the pre-warm dir"
+        );
+        let json = broker_config_json(
+            &host,
+            BrokerPort::new(18080).unwrap(),
+            BROKER_VM_WORK_ROOT,
+            Path::new("/var/lib/writ/audit.db"),
+        )
+        .unwrap();
+        let config: DaemonConfig = serde_json::from_str(&json).unwrap();
+        assert!(
+            config
+                .agent_vm
+                .unwrap()
+                .vm_http
+                .nix_prewarm_cache_dir
+                .is_none(),
+        );
+    }
+
+    #[test]
+    fn with_prewarm_cache_mount_adds_a_readonly_mount_when_set() {
+        let plan = sample_plan()
+            .with_prewarm_cache_mount(Some(PathBuf::from("/Users/me/Library/writ/prewarm")));
+        let args = plan.run_invocation().args_lossy();
+        assert!(
+            args.contains(&format!(
+                "type=virtiofs,source=/Users/me/Library/writ/prewarm,target={BROKER_VM_PREWARM_DIR},readonly"
+            )),
+            "the host pre-warm dir must be bind-mounted read-only: {args:?}"
+        );
+    }
+
+    #[test]
+    fn with_prewarm_cache_mount_none_adds_no_mount() {
+        let plan = sample_plan().with_prewarm_cache_mount(None);
+        let args = plan.run_invocation().args_lossy();
+        assert!(
+            !args.iter().any(|a| a.contains(BROKER_VM_PREWARM_DIR)),
+            "no pre-warm dir configured means no pre-warm mount: {args:?}"
         );
     }
 
@@ -2115,6 +2267,93 @@ mod tests {
             secrets_dir: work.join("secrets"),
             audit_dir: work.join("audit"),
         }
+    }
+
+    #[test]
+    fn materialize_mounts_the_host_prewarm_dir_when_configured() {
+        // A host config that sets nix_prewarm_cache_dir at an EXISTING dir must
+        // produce a plan that bind-mounts *that host path* read-only into the
+        // broker VM, so the re-pointed broker config (which names the guest target)
+        // has something to read there.
+        let prewarm = tempfile::tempdir().unwrap();
+        let prewarm_path = prewarm.path().display().to_string();
+        let host_config = materialize_host_config_json().replace(
+            "\"nix_cache_max_nar_bytes\": 67108864,",
+            &format!(
+                "\"nix_cache_max_nar_bytes\": 67108864, \"nix_prewarm_cache_dir\": \"{prewarm_path}\","
+            ),
+        );
+        let (_host_dir, host) = host_store_with(&[
+            ("claude-pk", "PEM-DATA"),
+            ("anthropic-api-key", "sk-abc"),
+            ("codex-pk", "other"),
+        ]);
+        let work = tempfile::tempdir().unwrap();
+        let request = materialize_request(work.path());
+        let bearer = VmHttpBearerToken::generate();
+
+        let plan = materialize_broker_vm_session(&request, &host_config, &bearer, &host).unwrap();
+        let args = plan.run_invocation().args_lossy();
+        assert!(
+            args.contains(&format!(
+                "type=virtiofs,source={prewarm_path},target={BROKER_VM_PREWARM_DIR},readonly"
+            )),
+            "the configured host pre-warm dir must be mounted read-only: {args:?}"
+        );
+    }
+
+    #[test]
+    fn materialize_skips_the_prewarm_mount_when_the_host_dir_is_absent() {
+        // A configured-but-not-yet-created pre-warm dir is a tolerated state (the
+        // validator accepts it). It must NOT crash the broker VM launch by mounting
+        // a missing virtiofs source: materialize succeeds and adds no mount, so the
+        // broker serves an empty pre-warm cache — as host placement does.
+        let host_config = materialize_host_config_json().replace(
+            "\"nix_cache_max_nar_bytes\": 67108864,",
+            "\"nix_cache_max_nar_bytes\": 67108864, \"nix_prewarm_cache_dir\": \"/no/such/prewarm/dir\",",
+        );
+        let (_host_dir, host) = host_store_with(&[
+            ("claude-pk", "PEM-DATA"),
+            ("anthropic-api-key", "sk-abc"),
+            ("codex-pk", "other"),
+        ]);
+        let work = tempfile::tempdir().unwrap();
+        let request = materialize_request(work.path());
+        let bearer = VmHttpBearerToken::generate();
+
+        let plan = materialize_broker_vm_session(&request, &host_config, &bearer, &host).unwrap();
+        let args = plan.run_invocation().args_lossy();
+        assert!(
+            !args.iter().any(|a| a.contains(BROKER_VM_PREWARM_DIR)),
+            "an absent configured pre-warm dir must not be mounted: {args:?}"
+        );
+    }
+
+    #[test]
+    fn materialize_adds_no_prewarm_mount_when_host_has_none() {
+        // The default materialize host config sets no pre-warm dir, so the plan
+        // carries only the three base mounts — no /writ/prewarm.
+        let (_host_dir, host) = host_store_with(&[
+            ("claude-pk", "PEM-DATA"),
+            ("anthropic-api-key", "sk-abc"),
+            ("codex-pk", "other"),
+        ]);
+        let work = tempfile::tempdir().unwrap();
+        let request = materialize_request(work.path());
+        let bearer = VmHttpBearerToken::generate();
+
+        let plan = materialize_broker_vm_session(
+            &request,
+            &materialize_host_config_json(),
+            &bearer,
+            &host,
+        )
+        .unwrap();
+        let args = plan.run_invocation().args_lossy();
+        assert!(
+            !args.iter().any(|a| a.contains(BROKER_VM_PREWARM_DIR)),
+            "no pre-warm dir configured means no pre-warm mount: {args:?}"
+        );
     }
 
     #[test]
