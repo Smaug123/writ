@@ -101,6 +101,20 @@ impl AuditLog {
         self.record_proxy_outcome::<NixCacheAuditTable>(r)
     }
 
+    /// Persist a VM Nix cache request row and its outcome row in a single
+    /// commit. The Nix cache serve path grants no authority, so — unlike a
+    /// grant/mint — the request row need not be durable before the fetch; one
+    /// commit instead of two takes the audit-write `fsync` tax off the agent-VM
+    /// provisioning hot path. Delegates to the shared coalesced proxy-table
+    /// writer, which documents the durability tradeoff in full.
+    pub fn record_nix_cache_request_and_outcome(
+        &self,
+        request: &NixCacheRequestRecord<'_>,
+        outcome: &NixCacheOutcomeRecord<'_>,
+    ) -> Result<(), AuditError> {
+        self.record_proxy_request_and_outcome::<NixCacheAuditTable>(request, outcome)
+    }
+
     pub fn list_nix_cache_requests_for_session(
         &self,
         id: SessionId,

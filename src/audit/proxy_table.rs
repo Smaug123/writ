@@ -14,7 +14,7 @@
 //! a descriptor and re-export the generic record types under the
 //! per-backend names.
 
-use rusqlite::{OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, params};
 
 use super::validation::labeled_invariant;
 use super::{AuditError, AuditLog};
@@ -84,77 +84,169 @@ pub struct ProxyOutcomeRecord<'a> {
     pub error: Option<&'a str>,
 }
 
+/// Field validation for a proxy request row, run before any transaction opens.
+fn validate_proxy_request<T: ProxyAuditTable>(
+    r: &ProxyRequestRecord<'_, T::Route>,
+) -> Result<(), AuditError> {
+    if r.method.is_empty() {
+        return Err(labeled_invariant(T::LABEL, "method must not be empty"));
+    }
+    if r.target.is_empty() {
+        return Err(labeled_invariant(T::LABEL, "target must not be empty"));
+    }
+    if let ProxyAuditDecision::Deny { reason } = r.decision
+        && reason.is_empty()
+    {
+        return Err(labeled_invariant(
+            T::LABEL,
+            "denial reason must not be empty",
+        ));
+    }
+    Ok(())
+}
+
+/// Field validation for a proxy outcome row, run before any transaction opens.
+fn validate_proxy_outcome<T: ProxyAuditTable>(
+    r: &ProxyOutcomeRecord<'_>,
+) -> Result<(), AuditError> {
+    if !(100..=599).contains(&r.http_status) {
+        return Err(labeled_invariant(T::LABEL, "HTTP status must be 100..599"));
+    }
+    if let Some(status) = r.upstream_status
+        && !(100..=599).contains(&status)
+    {
+        return Err(labeled_invariant(
+            T::LABEL,
+            "upstream status must be 100..599",
+        ));
+    }
+    if let Some(error) = r.error
+        && error.is_empty()
+    {
+        return Err(labeled_invariant(
+            T::LABEL,
+            "error must not be empty when present",
+        ));
+    }
+    if r.response_bytes > i64::MAX as u64 {
+        return Err(labeled_invariant(
+            T::LABEL,
+            "response bytes exceeds SQLite integer range",
+        ));
+    }
+    Ok(())
+}
+
+/// Fail if `session_id` is absent or already closed. Runs inside the caller's
+/// transaction so the check and the row insert(s) commit atomically.
+fn check_session_open(conn: &Connection, session_id: SessionId) -> Result<(), AuditError> {
+    let session_closed_at: Option<Option<i64>> = conn
+        .query_row(
+            "SELECT closed_at FROM session WHERE session_id = ?1",
+            params![session_id.as_uuid().to_string()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    match session_closed_at {
+        None => Err(AuditError::Invariant("session does not exist")),
+        Some(Some(_)) => Err(AuditError::Invariant("session is closed")),
+        Some(None) => Ok(()),
+    }
+}
+
+/// Insert one request row into this connection/transaction. Assumes
+/// [`validate_proxy_request`] passed and [`check_session_open`] ran.
+fn insert_proxy_request_row<T: ProxyAuditTable>(
+    conn: &Connection,
+    r: &ProxyRequestRecord<'_, T::Route>,
+) -> Result<(), AuditError> {
+    // Table name comes from a compile-time `&'static str` constant declared in
+    // this crate, never user input.
+    let sql = format!(
+        "INSERT INTO {table} (
+             request_id,
+             session_id,
+             received_at,
+             method,
+             target,
+             route,
+             decision,
+             deny_reason
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        table = T::REQUEST_TABLE,
+    );
+    let (decision, deny_reason) = match r.decision {
+        ProxyAuditDecision::Allow => ("allow", None),
+        ProxyAuditDecision::Deny { reason } => ("deny", Some(reason.as_str())),
+    };
+    conn.execute(
+        &sql,
+        params![
+            r.request_id.as_uuid().to_string(),
+            r.session_id.as_uuid().to_string(),
+            r.received_at.as_millis(),
+            r.method,
+            r.target,
+            r.route.as_str(),
+            decision,
+            deny_reason,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Insert one outcome row into this connection/transaction. Assumes
+/// [`validate_proxy_outcome`] passed.
+fn insert_proxy_outcome_row<T: ProxyAuditTable>(
+    conn: &Connection,
+    r: &ProxyOutcomeRecord<'_>,
+) -> Result<(), AuditError> {
+    // See the table-name interpolation note on `insert_proxy_request_row`.
+    let sql = format!(
+        "INSERT INTO {table} (
+             request_id,
+             completed_at,
+             http_status,
+             upstream_url,
+             upstream_status,
+             response_bytes,
+             error
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        table = T::OUTCOME_TABLE,
+    );
+    conn.execute(
+        &sql,
+        params![
+            r.request_id.as_uuid().to_string(),
+            r.completed_at.as_millis(),
+            i64::from(r.http_status),
+            r.upstream_url,
+            r.upstream_status.map(i64::from),
+            r.response_bytes as i64,
+            r.error,
+        ],
+    )?;
+    Ok(())
+}
+
 impl AuditLog {
     /// Persist a proxy-request audit row before the upstream call is
     /// attempted. The matching outcome row is appended via
     /// [`AuditLog::record_proxy_outcome`].
+    ///
+    /// This two-phase form is what makes the request durable *before* the
+    /// action — required for any write that records granted authority. The
+    /// authority-free proxy/cache read paths can instead coalesce both rows in
+    /// one commit via [`AuditLog::record_proxy_request_and_outcome`].
     pub(super) fn record_proxy_request<T: ProxyAuditTable>(
         &self,
         r: &ProxyRequestRecord<'_, T::Route>,
     ) -> Result<(), AuditError> {
-        if r.method.is_empty() {
-            return Err(labeled_invariant(T::LABEL, "method must not be empty"));
-        }
-        if r.target.is_empty() {
-            return Err(labeled_invariant(T::LABEL, "target must not be empty"));
-        }
-        if let ProxyAuditDecision::Deny { reason } = r.decision
-            && reason.is_empty()
-        {
-            return Err(labeled_invariant(
-                T::LABEL,
-                "denial reason must not be empty",
-            ));
-        }
-
-        // Table name comes from a compile-time `&'static str` constant
-        // declared in this crate, never user input.
-        let sql = format!(
-            "INSERT INTO {table} (
-                 request_id,
-                 session_id,
-                 received_at,
-                 method,
-                 target,
-                 route,
-                 decision,
-                 deny_reason
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            table = T::REQUEST_TABLE,
-        );
-
+        validate_proxy_request::<T>(r)?;
         self.with_conn_mut(|c| {
             let tx = c.transaction()?;
-            let session_closed_at: Option<Option<i64>> = tx
-                .query_row(
-                    "SELECT closed_at FROM session WHERE session_id = ?1",
-                    params![r.session_id.as_uuid().to_string()],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            match session_closed_at {
-                None => return Err(AuditError::Invariant("session does not exist")),
-                Some(Some(_)) => return Err(AuditError::Invariant("session is closed")),
-                Some(None) => {}
-            }
-
-            let (decision, deny_reason) = match r.decision {
-                ProxyAuditDecision::Allow => ("allow", None),
-                ProxyAuditDecision::Deny { reason } => ("deny", Some(reason.as_str())),
-            };
-            tx.execute(
-                &sql,
-                params![
-                    r.request_id.as_uuid().to_string(),
-                    r.session_id.as_uuid().to_string(),
-                    r.received_at.as_millis(),
-                    r.method,
-                    r.target,
-                    r.route.as_str(),
-                    decision,
-                    deny_reason,
-                ],
-            )?;
+            check_session_open(&tx, r.session_id)?;
+            insert_proxy_request_row::<T>(&tx, r)?;
             tx.commit()?;
             Ok(())
         })
@@ -166,60 +258,50 @@ impl AuditLog {
         &self,
         r: &ProxyOutcomeRecord<'_>,
     ) -> Result<(), AuditError> {
-        if !(100..=599).contains(&r.http_status) {
-            return Err(labeled_invariant(T::LABEL, "HTTP status must be 100..599"));
-        }
-        if let Some(status) = r.upstream_status
-            && !(100..=599).contains(&status)
-        {
-            return Err(labeled_invariant(
-                T::LABEL,
-                "upstream status must be 100..599",
-            ));
-        }
-        if let Some(error) = r.error
-            && error.is_empty()
-        {
-            return Err(labeled_invariant(
-                T::LABEL,
-                "error must not be empty when present",
-            ));
-        }
-        if r.response_bytes > i64::MAX as u64 {
-            return Err(labeled_invariant(
-                T::LABEL,
-                "response bytes exceeds SQLite integer range",
-            ));
-        }
-
-        // See the table-name interpolation note on `record_proxy_request`.
-        let sql = format!(
-            "INSERT INTO {table} (
-                 request_id,
-                 completed_at,
-                 http_status,
-                 upstream_url,
-                 upstream_status,
-                 response_bytes,
-                 error
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            table = T::OUTCOME_TABLE,
-        );
-
+        validate_proxy_outcome::<T>(r)?;
         self.with_conn_mut(|c| {
             let tx = c.transaction()?;
-            tx.execute(
-                &sql,
-                params![
-                    r.request_id.as_uuid().to_string(),
-                    r.completed_at.as_millis(),
-                    i64::from(r.http_status),
-                    r.upstream_url,
-                    r.upstream_status.map(i64::from),
-                    r.response_bytes as i64,
-                    r.error,
-                ],
-            )?;
+            insert_proxy_outcome_row::<T>(&tx, r)?;
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
+    /// Persist a proxy request row and its outcome row in a *single*
+    /// transaction — one commit, one `fsync` — for the authority-free
+    /// proxy/cache read paths (the VM Nix cache serve path) where the request
+    /// row need not be durable *before* the action.
+    ///
+    /// This is the throughput lever for those high-volume rows. The two-phase
+    /// [`record_proxy_request`] + [`record_proxy_outcome`] pays two fsync'd
+    /// commits per request; on the broker-VM audit DB (a virtiofs mount, where
+    /// every `fsync` round-trips to the host) that serialized double-commit
+    /// dominated agent-VM provisioning. Coalescing halves it, and — because
+    /// both rows share one transaction — a request row never lands without its
+    /// outcome.
+    ///
+    /// It is deliberately *not* used for writes that record granted authority:
+    /// grants/mints keep the two-phase split so the request is durable before
+    /// the action. The durability this trades away — a request row that is not
+    /// durable until its outcome is known — is harmless for a cache read that
+    /// grants nothing: a crash mid-fetch leaves no row at all, rather than an
+    /// orphan request row.
+    pub(super) fn record_proxy_request_and_outcome<T: ProxyAuditTable>(
+        &self,
+        request: &ProxyRequestRecord<'_, T::Route>,
+        outcome: &ProxyOutcomeRecord<'_>,
+    ) -> Result<(), AuditError> {
+        debug_assert_eq!(
+            request.request_id, outcome.request_id,
+            "coalesced audit rows must share a request_id",
+        );
+        validate_proxy_request::<T>(request)?;
+        validate_proxy_outcome::<T>(outcome)?;
+        self.with_conn_mut(|c| {
+            let tx = c.transaction()?;
+            check_session_open(&tx, request.session_id)?;
+            insert_proxy_request_row::<T>(&tx, request)?;
+            insert_proxy_outcome_row::<T>(&tx, outcome)?;
             tx.commit()?;
             Ok(())
         })
@@ -401,6 +483,119 @@ END;
             response_bytes: 16,
             error: None,
         }
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn dump_request_rows(
+        log: &AuditLog,
+    ) -> Vec<(
+        String,
+        String,
+        i64,
+        String,
+        String,
+        String,
+        String,
+        Option<String>,
+    )> {
+        log.with_conn(|c| {
+            let mut stmt = c.prepare(
+                "SELECT request_id, session_id, received_at, method, target, route, decision, \
+                 deny_reason FROM test_proxy_request ORDER BY rowid",
+            )?;
+            let rows = stmt
+                .query_map([], |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                        r.get(7)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+        .unwrap()
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn dump_outcome_rows(
+        log: &AuditLog,
+    ) -> Vec<(
+        String,
+        i64,
+        i64,
+        Option<String>,
+        Option<i64>,
+        i64,
+        Option<String>,
+    )> {
+        log.with_conn(|c| {
+            let mut stmt = c.prepare(
+                "SELECT request_id, completed_at, http_status, upstream_url, upstream_status, \
+                 response_bytes, error FROM test_proxy_outcome ORDER BY rowid",
+            )?;
+            let rows = stmt
+                .query_map([], |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+        .unwrap()
+    }
+
+    /// The coalesced writer must reject a closed session exactly as the
+    /// two-phase writer does, and — because both rows share one transaction —
+    /// leave *neither* row behind on rejection.
+    #[test]
+    fn request_and_outcome_rejects_closed_session_without_writing() {
+        let log = AuditLog::open_in_memory().unwrap();
+        install_test_tables(&log);
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+        log.close_session(s.session_id, UnixMillis::from_millis(1_700_000_050))
+            .unwrap();
+        let request_id = RequestId::new();
+
+        let err = log
+            .record_proxy_request_and_outcome::<TestTable>(
+                &ProxyRequestRecord {
+                    request_id,
+                    session_id: s.session_id,
+                    received_at: UnixMillis::from_millis(1_700_000_100),
+                    method: "POST",
+                    target: "/x",
+                    route: TestRoute::A,
+                    decision: &ProxyAuditDecision::Allow,
+                },
+                &sample_outcome(request_id),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, AuditError::Invariant("session is closed")),
+            "got: {err:?}"
+        );
+        assert!(
+            dump_request_rows(&log).is_empty(),
+            "no request row on reject"
+        );
+        assert!(
+            dump_outcome_rows(&log).is_empty(),
+            "no outcome row on reject"
+        );
     }
 
     #[test]
@@ -746,6 +941,72 @@ END;
                 .list_proxy_requests_for_session_for_test::<TestTable>(s.session_id)
                 .unwrap();
             prop_assert_eq!(entries, vec![(route, decision, Some(http_status))]);
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        /// Coalescing must be behaviour-preserving: for any valid
+        /// request+outcome pair, writing both in one transaction via
+        /// `record_proxy_request_and_outcome` leaves the two tables
+        /// byte-for-byte identical to the two-phase
+        /// `record_proxy_request` + `record_proxy_outcome`. Same inputs,
+        /// same request_id and session — the only difference is the commit
+        /// count, which the persisted rows must not reflect.
+        #[test]
+        fn request_and_outcome_matches_the_two_phase_writers(
+            method in "[\\x01-\\x7e]{1,16}",
+            target in "/[\\x01-\\x7e&&[^\\x00]]{0,80}",
+            route_is_a in any::<bool>(),
+            deny_reason in proptest::option::of("[\\x01-\\x7e]{1,80}"),
+            http_status in 100u16..=599,
+            upstream_status in proptest::option::of(100u16..=599),
+            upstream_url in proptest::option::of("[\\x01-\\x7e]{1,80}"),
+            response_bytes in 0u64..=(i64::MAX as u64),
+            error in proptest::option::of("[\\x01-\\x7e]{1,80}"),
+        ) {
+            let two_phase = AuditLog::open_in_memory().unwrap();
+            install_test_tables(&two_phase);
+            let combined = AuditLog::open_in_memory().unwrap();
+            install_test_tables(&combined);
+            let s = sample_session();
+            two_phase.open_session(&s).unwrap();
+            combined.open_session(&s).unwrap();
+
+            let request_id = RequestId::new();
+            let route = if route_is_a { TestRoute::A } else { TestRoute::B };
+            let decision = match &deny_reason {
+                None => ProxyAuditDecision::Allow,
+                Some(reason) => ProxyAuditDecision::Deny { reason: reason.clone() },
+            };
+            let request = ProxyRequestRecord {
+                request_id,
+                session_id: s.session_id,
+                received_at: UnixMillis::from_millis(1_700_000_400),
+                method: &method,
+                target: &target,
+                route,
+                decision: &decision,
+            };
+            let outcome = ProxyOutcomeRecord {
+                request_id,
+                completed_at: UnixMillis::from_millis(1_700_000_500),
+                http_status,
+                upstream_url: upstream_url.as_deref(),
+                upstream_status,
+                response_bytes,
+                error: error.as_deref(),
+            };
+
+            two_phase.record_proxy_request::<TestTable>(&request).unwrap();
+            two_phase.record_proxy_outcome::<TestTable>(&outcome).unwrap();
+            combined
+                .record_proxy_request_and_outcome::<TestTable>(&request, &outcome)
+                .unwrap();
+
+            prop_assert_eq!(dump_request_rows(&two_phase), dump_request_rows(&combined));
+            prop_assert_eq!(dump_outcome_rows(&two_phase), dump_outcome_rows(&combined));
         }
     }
 }
