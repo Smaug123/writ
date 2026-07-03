@@ -540,7 +540,7 @@ impl<S: SecretStore> VmHttpNixCacheService<S> {
                 .get(dir_index)
                 .expect("a local NAR admission pins a configured local cache dir");
             let nar_path = dir.join("nar").join(file.as_str());
-            return self.serve_local_nar(method, &nar_path, &admission).await;
+            return self.serve_local_nar(method, &nar_path).await;
         }
         // An upstream-admitted NAR can only be served by proxying the upstream,
         // which the pre-warm-only view exists to forbid. Reachable only if the
@@ -826,17 +826,25 @@ impl<S: SecretStore> VmHttpNixCacheService<S> {
 
     /// Serve a locally-admitted NAR authoritatively from the broker's archive at
     /// `nar_path`. The narinfo was admitted from the local archive, so the NAR is
-    /// expected on disk; an absent / oversized / unreadable / hash-mismatched
-    /// file fails closed rather than proxying the upstream (which cannot hold a
-    /// content-addressed flake-input NAR anyway). The body is verified against
-    /// the admitted narinfo before it is served, defence in depth against
-    /// on-disk tamper.
-    async fn serve_local_nar(
-        &self,
-        method: &str,
-        nar_path: &Path,
-        admission: &VmHttpNixCacheAdmittedNar,
-    ) -> VmHttpNixCacheProxyFetch {
+    /// expected on disk; an absent / oversized / unreadable file fails closed
+    /// rather than proxying the upstream (which cannot hold a content-addressed
+    /// flake-input NAR anyway).
+    ///
+    /// The on-disk bytes are served verbatim — the broker does *not* decompress
+    /// and re-hash them against the admitted narinfo on every serve. The local
+    /// archive is a broker-owned, read-only mount the broker itself provisioned
+    /// (`nix flake archive` → `merge_into_cache`); its narinfo is admitted only
+    /// when self-certifying (a content-addressed flake input) or signed by a
+    /// trusted key, and the guest re-verifies every NAR against that narinfo
+    /// before it enters the store. Re-decompressing and re-hashing the whole NAR
+    /// on every serve (the old defence-in-depth against on-disk tamper) put a
+    /// full xz-decode + SHA-256 on the hot path of *every* substitution for no
+    /// integrity the narinfo admission and the guest's own verification don't
+    /// already provide; on-disk corruption now surfaces as the guest rejecting
+    /// the NAR rather than a broker 502. The compressed read stays bounded by
+    /// `max_nar_bytes`, so response size is still capped. Upstream-admitted NARs
+    /// (untrusted) are still fully verified — see [`Self::fetch_nar`].
+    async fn serve_local_nar(&self, method: &str, nar_path: &Path) -> VmHttpNixCacheProxyFetch {
         let local_url = local_file_url(nar_path);
         if method == "HEAD" {
             // HEAD needs only the (bounded) length — never buffer a potentially
@@ -887,33 +895,6 @@ impl<S: SecretStore> VmHttpNixCacheService<S> {
         };
         let content_length = body.len() as u64;
         let response_bytes = content_length;
-        let body = match verify_nar_body_on_blocking_thread(
-            admission.clone(),
-            body,
-            self.config.max_nar_bytes(),
-        )
-        .await
-        {
-            Ok(body) => body,
-            Err(err) => {
-                tracing::warn!(
-                    path = %nar_path.display(),
-                    error = %err,
-                    "vm http nix cache local nar body was rejected",
-                );
-                let response = VmHttpResponse::text(
-                    VmHttpStatus::BadGateway,
-                    "nix cache local archive failed",
-                );
-                return VmHttpNixCacheProxyFetch {
-                    upstream_url: local_url,
-                    upstream_status: None,
-                    response_bytes,
-                    error: Some(err.audit_error_label()),
-                    response,
-                };
-            }
-        };
         VmHttpNixCacheProxyFetch {
             upstream_url: local_url,
             upstream_status: None,

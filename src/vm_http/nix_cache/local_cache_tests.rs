@@ -713,7 +713,15 @@ async fn local_narinfo_over_metadata_budget_fails_closed() {
 }
 
 #[tokio::test]
-async fn local_nar_body_tamper_is_rejected_before_serving() {
+async fn local_nar_body_is_served_verbatim_trusting_the_mount() {
+    // The broker serves its own read-only, broker-provisioned local archive
+    // verbatim: it does NOT decompress and re-hash the NAR against the admitted
+    // narinfo on every serve. The narinfo is admitted only when self-certifying
+    // (as here, a content-addressed flake input) or trusted-signed, and the
+    // guest re-verifies each NAR against it before it enters the store — so an
+    // on-disk NAR that no longer matches its narinfo is the guest's to reject,
+    // not something the broker spends a full xz-decode + SHA-256 catching on
+    // every substitution.
     let upstream = MockServer::start().await;
     let state = make_broker_state(&upstream);
     let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
@@ -722,13 +730,11 @@ async fn local_nar_body_tamper_is_rejected_before_serving() {
     let nar_file = "input.nar.xz";
     let (hash, _, _) =
         write_local_ca_entry(cache.path(), "source", nar_file, b"trusted local body");
-    // Overwrite the on-disk NAR with a different (valid xz) body: its hash no
-    // longer matches the admitted narinfo, so serving must fail closed.
-    std::fs::write(
-        cache.path().join("nar").join(nar_file),
-        xz_nar_body_for(b"tampered body of different length"),
-    )
-    .unwrap();
+    // Overwrite the on-disk NAR with a different (valid xz) body whose hash and
+    // size no longer match the admitted narinfo. The broker still serves it
+    // verbatim — verification is the guest's job.
+    let tampered = xz_nar_body_for(b"tampered body of different length");
+    std::fs::write(cache.path().join("nar").join(nar_file), &tampered).unwrap();
     let service =
         nix_cache_service_with_local_cache(&state, DEAD_UPSTREAM, cache.path(), 4096, 4096);
 
@@ -748,19 +754,20 @@ async fn local_nar_body_tamper_is_rejected_before_serving() {
     .await;
 
     assert_eq!(narinfo.status, VmHttpStatus::Ok);
-    assert_eq!(nar.status, VmHttpStatus::BadGateway);
+    assert_eq!(nar.status, VmHttpStatus::Ok);
+    assert_eq!(nar.content_type, "application/x-nix-nar");
+    assert_eq!(nar.content_length, Some(tampered.len() as u64));
+    assert_eq!(nar.body, tampered);
     let entries = state
         .audit
         .list_nix_cache_requests_for_session(session.session_id())
         .unwrap();
     assert_eq!(entries.len(), 2);
     assert_eq!(entries[1].route, NixCacheAuditRoute::Nar);
-    assert_eq!(entries[1].http_status, Some(502));
+    assert_eq!(entries[1].http_status, Some(200));
     assert_eq!(entries[1].upstream_status, None);
-    assert_eq!(
-        entries[1].error.as_deref(),
-        Some("mismatched upstream nar size"),
-    );
+    assert_eq!(entries[1].error, None);
+    assert_eq!(entries[1].response_bytes, Some(tampered.len() as u64));
 }
 
 #[tokio::test]
