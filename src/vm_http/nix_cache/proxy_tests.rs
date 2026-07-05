@@ -954,6 +954,37 @@ async fn nix_cache_route_audits_unsupported_upstream_status() {
 }
 
 #[tokio::test]
+async fn nix_cache_route_normalizes_non_standard_upstream_status_for_audit() {
+    let upstream = MockServer::start().await;
+    let state = make_broker_state(&upstream);
+    let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+    open_audit_session(&state, session.session_id());
+    Mock::given(method("GET"))
+        .and(path("/nix-cache-info"))
+        .respond_with(ResponseTemplate::new(700).set_body_string("backend detail"))
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    let service = nix_cache_service_for_test(&state, &upstream, 1024);
+
+    let response =
+        route_nix_cache_with_service(&session, "GET", VM_NIX_CACHE_INFO_PATH.into(), service).await;
+
+    assert_eq!(response.status, VmHttpStatus::BadGateway);
+    let entries = state
+        .audit
+        .list_nix_cache_requests_for_session(session.session_id())
+        .unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].http_status, Some(502));
+    assert_eq!(entries[0].upstream_status, None);
+    assert_eq!(
+        entries[0].error.as_deref(),
+        Some("unsupported upstream status")
+    );
+}
+
+#[tokio::test]
 async fn nix_cache_route_rejects_non_get_head_without_contacting_upstream() {
     let upstream = MockServer::start().await;
     let state = make_broker_state(&upstream);

@@ -317,11 +317,15 @@ fn record_nix_cache_request_and_outcome<S: SecretStore>(
                 completed_at: UnixMillis::now(),
                 http_status: fetch.response.status.code(),
                 upstream_url,
-                upstream_status: fetch.upstream_status,
+                upstream_status: audit_upstream_status(fetch.upstream_status),
                 response_bytes: fetch.response_bytes,
                 error: fetch.error,
             },
         )
+}
+
+fn audit_upstream_status(status: Option<u16>) -> Option<u16> {
+    status.filter(|status| (100..=599).contains(status))
 }
 
 fn nix_cache_audit_route(
