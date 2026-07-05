@@ -113,6 +113,24 @@ const GUEST_NIX_PROLOGUE_NIXCONF_REST: &str = r#"  printf 'netrc-file = %s\n' "$
 } > "$NIX_CONF_DIR/nix.conf"
 "#;
 
+/// Claude Code defaults for both hand-run `claude` in a debug shell and the
+/// managed adapter. `/root` is the intended root home in the guest passwd file;
+/// older loaded images had `HOME=/`, so normalise that here before any workload
+/// starts.
+const GUEST_CLAUDE_SETTINGS: &str = r#"claude_home="${HOME:-/root}"
+if [ "$claude_home" = / ]; then
+  claude_home=/root
+fi
+HOME="$claude_home"
+export HOME
+
+claude_config_dir="$HOME/.claude"
+claude_settings="$claude_config_dir/settings.json"
+mkdir -p "$claude_config_dir"
+printf '%s\n' '{"env":{"CLAUDE_AFK_TIMEOUT_MS":"86400000","CLAUDE_CODE_DISABLE_CRON":"1","CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY":"1"},"sandbox":{"enabled":false,"allowUnsandboxedCommands":true},"defaultMode":"bypassPermissions","skipDangerousModePermissionPrompt":true}' > "$claude_settings"
+chmod 600 "$claude_settings"
+"#;
+
 /// Positional-argument parse the workspace script runs between the guards
 /// and the cache validation; the plain nix-setup script has none.
 const GUEST_WORKSPACE_POSITIONAL: &str = r#"repo="$1"
@@ -315,6 +333,7 @@ fn nix_conf_prologue(positional: &str, mkdir_line: &str, features_line: &str) ->
     script.push_str(features_line);
     script.push('\n');
     script.push_str(GUEST_NIX_PROLOGUE_NIXCONF_REST);
+    script.push_str(GUEST_CLAUDE_SETTINGS);
     script
 }
 
