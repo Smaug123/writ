@@ -875,6 +875,40 @@ const AGENT_VM_WORKSPACE_CALL_TIMEOUT: std::time::Duration =
 // recourse is `writ promote show <id>` to find out.
 const PROMOTE_APPROVE_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 
+#[derive(Debug, thiserror::Error)]
+enum BrokerReplyError {
+    #[error(
+        "writ daemon at {} closed the connection without sending a reply; writd may have crashed or exited while handling the request, so check the writd logs for the daemon-side error",
+        socket_path.display()
+    )]
+    ClosedWithoutReply { socket_path: PathBuf },
+    #[error(
+        "writ daemon at {} sent an empty reply; this is a protocol error, so check the writd logs for the daemon-side error",
+        socket_path.display()
+    )]
+    EmptyReply { socket_path: PathBuf },
+    #[error(
+        "writ daemon at {} sent an incomplete JSON reply: {source}; reply preview: {preview}",
+        socket_path.display()
+    )]
+    IncompleteJson {
+        socket_path: PathBuf,
+        preview: String,
+        #[source]
+        source: serde_json::Error,
+    },
+    #[error(
+        "writ daemon at {} sent an invalid JSON reply: {source}; reply preview: {preview}",
+        socket_path.display()
+    )]
+    InvalidJson {
+        socket_path: PathBuf,
+        preview: String,
+        #[source]
+        source: serde_json::Error,
+    },
+}
+
 fn call(
     socket_path: &Path,
     msg: &ClientMessage,
@@ -894,23 +928,157 @@ fn call_with_timeout(
     stream.set_read_timeout(Some(timeout))?;
     stream.set_write_timeout(Some(timeout))?;
 
-    let mut line = serde_json::to_string(msg)?;
+    let mut line = serde_json::to_string(msg)
+        .map_err(|e| format!("encoding request for writ daemon as JSON failed: {e}"))?;
     line.push('\n');
 
     let mut w = &stream;
-    w.write_all(line.as_bytes())?;
-    w.flush()?;
+    w.write_all(line.as_bytes()).map_err(|e| {
+        format!(
+            "writing request to writ daemon at {} failed: {e}",
+            socket_path.display()
+        )
+    })?;
+    w.flush().map_err(|e| {
+        format!(
+            "flushing request to writ daemon at {} failed: {e}",
+            socket_path.display()
+        )
+    })?;
 
     let mut reader = BufReader::new(&stream);
     let mut reply = String::new();
-    reader.read_line(&mut reply)?;
+    let bytes_read = reader.read_line(&mut reply).map_err(|e| {
+        format!(
+            "reading reply from writ daemon at {} failed: {e}",
+            socket_path.display()
+        )
+    })?;
+    if bytes_read == 0 {
+        return Err(BrokerReplyError::ClosedWithoutReply {
+            socket_path: socket_path.to_path_buf(),
+        }
+        .into());
+    }
 
-    Ok(serde_json::from_str(reply.trim_end_matches('\n'))?)
+    Ok(decode_server_reply(socket_path, &reply)?)
+}
+
+fn decode_server_reply(socket_path: &Path, reply: &str) -> Result<ServerMessage, BrokerReplyError> {
+    let frame = reply.trim_end_matches(['\n', '\r']);
+    if frame.trim().is_empty() {
+        return Err(BrokerReplyError::EmptyReply {
+            socket_path: socket_path.to_path_buf(),
+        });
+    }
+
+    serde_json::from_str(frame).map_err(|source| {
+        let preview = reply_preview(frame);
+        if source.classify() == serde_json::error::Category::Eof {
+            BrokerReplyError::IncompleteJson {
+                socket_path: socket_path.to_path_buf(),
+                preview,
+                source,
+            }
+        } else {
+            BrokerReplyError::InvalidJson {
+                socket_path: socket_path.to_path_buf(),
+                preview,
+                source,
+            }
+        }
+    })
+}
+
+fn reply_preview(reply: &str) -> String {
+    const MAX_CHARS: usize = 160;
+    let mut chars = reply.chars();
+    let mut preview: String = chars.by_ref().take(MAX_CHARS).collect();
+    if chars.next().is_some() {
+        preview.push_str("...");
+    }
+    format!("{preview:?}")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn call_reports_closed_connection_without_raw_json_eof() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("writ.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        let task = std::thread::spawn(move || {
+            if let Ok((stream, _)) = listener.accept() {
+                let mut request = String::new();
+                let _ = BufReader::new(stream).read_line(&mut request);
+            }
+        });
+
+        let err = call_with_timeout(
+            &socket_path,
+            &ClientMessage::ListAgentVms {},
+            std::time::Duration::from_secs(2),
+        )
+        .unwrap_err();
+        task.join().unwrap();
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("closed the connection without sending a reply"),
+            "unexpected error: {msg}",
+        );
+        assert!(
+            !msg.starts_with("EOF while parsing"),
+            "should not surface raw serde EOF: {msg}",
+        );
+    }
+
+    #[test]
+    fn decode_server_reply_reports_blank_line_as_empty_reply() {
+        let err = decode_server_reply(Path::new("/tmp/writ.sock"), "\n").unwrap_err();
+        let msg = err.to_string();
+
+        assert!(
+            msg.contains("sent an empty reply"),
+            "unexpected error: {msg}",
+        );
+        assert!(
+            !msg.contains("EOF while parsing"),
+            "blank replies should not be parsed as JSON: {msg}",
+        );
+    }
+
+    #[test]
+    fn decode_server_reply_reports_incomplete_json_with_context() {
+        let err = decode_server_reply(Path::new("/tmp/writ.sock"), "{").unwrap_err();
+        let msg = err.to_string();
+
+        assert!(
+            msg.contains("sent an incomplete JSON reply"),
+            "unexpected error: {msg}",
+        );
+        assert!(
+            msg.contains("reply preview: \"{\""),
+            "missing reply preview: {msg}",
+        );
+    }
+
+    #[test]
+    fn decode_server_reply_reports_malformed_json_with_context() {
+        let err = decode_server_reply(Path::new("/tmp/writ.sock"), "not json\n").unwrap_err();
+        let msg = err.to_string();
+
+        assert!(
+            msg.contains("sent an invalid JSON reply"),
+            "unexpected error: {msg}",
+        );
+        assert!(
+            msg.contains("reply preview: \"not json\""),
+            "missing reply preview: {msg}",
+        );
+    }
 
     #[test]
     fn agent_run_cli_accepts_agent_repo_prompt_and_warmup() {
