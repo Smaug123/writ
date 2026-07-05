@@ -286,6 +286,21 @@ impl AuditLog {
     /// durable until its outcome is known — is harmless for a cache read that
     /// grants nothing: a crash mid-fetch leaves no row at all, rather than an
     /// orphan request row.
+    ///
+    /// One consequence is explicit and accepted: if the session **closes during
+    /// the fetch**, this coalesced write is refused — the
+    /// `*_request_requires_open_session` trigger forbids a request row for a
+    /// now-closed session, and there is no earlier row to fall back on (unlike
+    /// the two-phase path, whose pre-fetch request row survives a mid-fetch
+    /// close). That cache read then goes unrecorded in the DB. It is bounded and
+    /// benign: the paths that use this coalesced writer grant no authority, the
+    /// caller refuses to serve the response (fail-closed), and — because the
+    /// refusal is an `AuditError` — the caller still emits an
+    /// [`AUDIT_WRITE_FAILURE_TARGET`](crate::audit::AUDIT_WRITE_FAILURE_TARGET)
+    /// event, so the access is logged even when it is not a structured row.
+    /// Reproducing the two-phase's mid-close durability would require the second
+    /// fsync this method exists to remove, so it is a conscious trade for the
+    /// authority-free paths only.
     pub(super) fn record_proxy_request_and_outcome<T: ProxyAuditTable>(
         &self,
         request: &ProxyRequestRecord<'_, T::Route>,
