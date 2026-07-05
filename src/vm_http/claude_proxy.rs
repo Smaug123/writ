@@ -22,6 +22,7 @@ pub(super) const VM_CLAUDE_MESSAGES_PATH: &str = "/v1/messages";
 pub(super) const VM_CLAUDE_COUNT_TOKENS_PATH: &str = "/v1/messages/count_tokens";
 pub(super) const VM_CLAUDE_MODELS_PREFIX: &str = "/v1/models/";
 pub const DEFAULT_CLAUDE_ANTHROPIC_VERSION: &str = "2023-06-01";
+const ANTHROPIC_OAUTH_TOKEN_PREFIX: &str = "sk-ant-oat01-";
 
 pub(super) type VmHttpClaudeProxyService<S> = VmHttpProxyService<ClaudeBackend, S>;
 
@@ -80,6 +81,27 @@ fn claude_proxy_auth_failure(body: &'static str, label: &'static str) -> ProxyFe
         upstream_status: None,
         error: Some(label),
     }
+}
+
+fn claude_proxy_upstream_auth(
+    secret: String,
+    auth_kind: VmHttpClaudeProxyAuthKind,
+) -> Result<UpstreamAuth, Box<ProxyFetch>> {
+    if auth_kind == VmHttpClaudeProxyAuthKind::XApiKey
+        && secret.starts_with(ANTHROPIC_OAUTH_TOKEN_PREFIX)
+    {
+        return Err(Box::new(claude_proxy_auth_failure(
+            "Claude proxy auth_kind x_api_key cannot use an Anthropic OAuth token; set \
+             claude_proxy.auth_kind to oauth",
+            "upstream auth kind mismatch",
+        )));
+    }
+
+    Ok(match auth_kind {
+        VmHttpClaudeProxyAuthKind::XApiKey => UpstreamAuth::XApiKey(secret),
+        VmHttpClaudeProxyAuthKind::AuthorizationBearer => UpstreamAuth::Bearer(secret),
+        VmHttpClaudeProxyAuthKind::OAuth => UpstreamAuth::AnthropicOauth(secret),
+    })
 }
 
 impl VmHttpClaudeProxyConfig {
@@ -314,11 +336,7 @@ impl ProxyBackend for ClaudeBackend {
                 )));
             }
         };
-        Ok(match config.auth_kind() {
-            VmHttpClaudeProxyAuthKind::XApiKey => UpstreamAuth::XApiKey(secret),
-            VmHttpClaudeProxyAuthKind::AuthorizationBearer => UpstreamAuth::Bearer(secret),
-            VmHttpClaudeProxyAuthKind::OAuth => UpstreamAuth::AnthropicOauth(secret),
-        })
+        claude_proxy_upstream_auth(secret, config.auth_kind())
     }
 
     fn record_request_audit(
@@ -1089,6 +1107,61 @@ mod tests {
             !upstream_request.contains(token().as_str()),
             "{upstream_request}"
         );
+    }
+
+    #[tokio::test]
+    async fn claude_proxy_x_api_key_rejects_oauth_token_shape_before_upstream() {
+        let github = MockServer::start().await;
+        let secret_key = SecretKey::new("anthropic-api-key").unwrap();
+        let state = make_broker_state_with_extra_secret(
+            &github,
+            Some((secret_key.clone(), "sk-ant-oat01-host-oauth-token")),
+        );
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::LOCALHOST, 32).unwrap());
+        open_audit_session(&state, session.session_id());
+        let service = VmHttpClaudeProxyService::new(
+            Arc::clone(&state),
+            VmHttpClaudeProxyConfig::new(
+                "http://127.0.0.1:9/",
+                secret_key,
+                VmHttpClaudeProxyAuthKind::XApiKey,
+                std::time::Duration::from_millis(10),
+                1024,
+                1024,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let request = VmHttpRequest::new(
+            "POST",
+            VM_CLAUDE_MESSAGES_PATH,
+            Some(bearer(token().as_str())),
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 34567)),
+        );
+
+        let response = route_claude_proxy_request(
+            &session,
+            &request,
+            br#"{"model":"test"}"#.to_vec(),
+            &service,
+        )
+        .await
+        .into_buffered();
+
+        assert_eq!(response.status, VmHttpStatus::BadGateway);
+        let body = String::from_utf8(response.body).unwrap();
+        assert!(
+            body.contains("set claude_proxy.auth_kind to oauth"),
+            "{body}"
+        );
+        let entries = state
+            .audit
+            .list_claude_proxy_requests_for_session_for_test(session.session_id())
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, ClaudeProxyAuditRoute::Messages);
+        assert_eq!(entries[0].1, ClaudeProxyAuditDecision::Allow);
+        assert_eq!(entries[0].2, Some(502));
     }
 
     #[tokio::test]

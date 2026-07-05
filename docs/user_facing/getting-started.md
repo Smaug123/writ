@@ -254,7 +254,9 @@ rather than the actual upstream call. Add a `claude_proxy` block under
 `auth_secret` is the secret-store key (same store as
 `private_key_secret`) holding the API key or OAuth token.
 `auth_kind` is one of `x_api_key`, `authorization_bearer`, or `oauth`
-— the broker picks the matching header per variant.
+— the broker picks the matching header per variant. Anthropic OAuth
+tokens beginning `sk-ant-oat01-` must use `oauth`; static Anthropic API
+keys use `x_api_key`.
 
 ## 5. Run the daemon
 
