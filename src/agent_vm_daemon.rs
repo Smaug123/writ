@@ -25,7 +25,10 @@ use crate::agent_vm_lifecycle::{
     complete_agent_vm_session_start, evaluate_host_path, host_interfaces,
     remove_managed_agent_vm_session_state, start_agent_vm_session,
 };
-use crate::audit::{AgentRunAuditRecord, AgentVmNetworkHealthEventRecord, AuditError, AuditLog};
+use crate::audit::{
+    AgentRunAuditRecord, AgentVmNetworkHealthEventRecord, AuditError, AuditLog, NixCacheAuditEntry,
+    NixCacheAuditRoute,
+};
 use crate::broker_log_forwarder::BrokerLogForwarder;
 use crate::broker_vm::{
     BROKER_VM_LOG_FILE, BrokerVmSessionPaths, BrokerVmSessionRequest, broker_url,
@@ -102,6 +105,7 @@ const AGENT_VM_WORKSPACE_BOOTSTRAP_FAILURE_MESSAGE_LIMIT: usize = 16 * 1024;
 /// line that actually explains the failure last, after a long run of
 /// `copying path ...` substitution progress.
 const AGENT_VM_WORKSPACE_BOOTSTRAP_FAILURE_TRUNCATION_MARKER: &str = "[truncated]\n";
+const AGENT_VM_WORKSPACE_BOOTSTRAP_PREWARM_SAMPLE_LIMIT: usize = 5;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AgentVmDaemonRuntimeConfig {
@@ -1695,10 +1699,15 @@ impl AgentVmDaemon {
         // EVERY session: both guest scripts run the egress gate and signal
         // bootstrap-ok/failed, so a gate failure (or workspace-init failure) is
         // surfaced before we report the session started.
-        if let Err(err) = self
+        if let Err(mut err) = self
             .release_and_wait_for_workspace_bootstrap(plan.names().vm())
             .await
         {
+            self.annotate_workspace_bootstrap_error_with_prewarm_audit(
+                state.audit.as_ref(),
+                session_id,
+                &mut err,
+            );
             let bootstrap = err.to_string();
             if let Err(cleanup) = self.cleanup_failed_started_session(session_id).await {
                 return Err(AgentVmDaemonError::WorkspaceBootstrapCleanupFailed {
@@ -1995,9 +2004,42 @@ impl AgentVmDaemon {
         .await??;
 
         self.ensure_network_health_monitor(Arc::clone(&state.audit));
-        self.release_and_wait_for_workspace_bootstrap(boot_plan.names().vm())
-            .await?;
+        if let Err(mut err) = self
+            .release_and_wait_for_workspace_bootstrap(boot_plan.names().vm())
+            .await
+        {
+            self.annotate_workspace_bootstrap_error_with_prewarm_audit(
+                state.audit.as_ref(),
+                session_id,
+                &mut err,
+            );
+            return Err(err);
+        }
         Ok(broker_url)
+    }
+
+    fn annotate_workspace_bootstrap_error_with_prewarm_audit(
+        &self,
+        audit: &AuditLog,
+        session_id: SessionId,
+        err: &mut AgentVmDaemonError,
+    ) {
+        if self.config.vm_http.nix_prewarm_cache_dir().is_none() {
+            return;
+        }
+        if !matches!(err, AgentVmDaemonError::WorkspaceBootstrapFailed { .. }) {
+            return;
+        }
+        let Some(diagnostic) = workspace_bootstrap_prewarm_diagnostic_from_audit(audit, session_id)
+        else {
+            return;
+        };
+        if let AgentVmDaemonError::WorkspaceBootstrapFailed { message } = err {
+            if !message.is_empty() {
+                message.push_str("\n\n");
+            }
+            message.push_str(&diagnostic);
+        }
     }
 
     #[cfg(test)]
@@ -2111,6 +2153,90 @@ fn normalise_workspace_bootstrap_failure_message(raw: &str) -> String {
         "{AGENT_VM_WORKSPACE_BOOTSTRAP_FAILURE_TRUNCATION_MARKER}{}",
         &scrubbed[start..]
     )
+}
+
+fn workspace_bootstrap_prewarm_diagnostic_from_audit(
+    audit: &AuditLog,
+    session_id: SessionId,
+) -> Option<String> {
+    let entries = match audit.list_nix_cache_requests_for_session(session_id) {
+        Ok(entries) => entries,
+        Err(err) => {
+            tracing::warn!(
+                %session_id,
+                error = %err,
+                "could not read Nix cache audit rows for workspace bootstrap diagnostic",
+            );
+            return None;
+        }
+    };
+    workspace_bootstrap_prewarm_diagnostic(&entries)
+}
+
+fn workspace_bootstrap_prewarm_diagnostic(entries: &[NixCacheAuditEntry]) -> Option<String> {
+    let mut narinfo_hits = 0usize;
+    let mut narinfo_misses = 0usize;
+    let mut nar_hits = 0usize;
+    let mut nar_misses = 0usize;
+    let mut missing_narinfo_hashes = Vec::new();
+
+    for entry in entries {
+        if !is_prewarm_target(&entry.target) {
+            continue;
+        }
+        match (entry.route, entry.http_status) {
+            (NixCacheAuditRoute::NarInfo, Some(200)) => narinfo_hits += 1,
+            (NixCacheAuditRoute::NarInfo, Some(404)) => {
+                narinfo_misses += 1;
+                if missing_narinfo_hashes.len() < AGENT_VM_WORKSPACE_BOOTSTRAP_PREWARM_SAMPLE_LIMIT
+                {
+                    missing_narinfo_hashes.push(prewarm_narinfo_hash(&entry.target));
+                }
+            }
+            (NixCacheAuditRoute::Nar, Some(200)) => nar_hits += 1,
+            (NixCacheAuditRoute::Nar, Some(404)) => nar_misses += 1,
+            (NixCacheAuditRoute::CacheInfo | NixCacheAuditRoute::Unsupported, _)
+            | (NixCacheAuditRoute::NarInfo | NixCacheAuditRoute::Nar, _) => {}
+        }
+    }
+
+    if narinfo_misses == 0 && nar_misses == 0 {
+        return None;
+    }
+
+    let mut lines = vec![format!(
+        "pre-warm cache diagnostic: strict /v1/nix/prewarm substituter had misses during \
+         workspace bootstrap (narinfo: {narinfo_misses} missing, {narinfo_hits} served; \
+         nar: {nar_misses} missing, {nar_hits} served)."
+    )];
+    if !missing_narinfo_hashes.is_empty() {
+        lines.push(format!(
+            "first missing narinfo hashes: {}",
+            missing_narinfo_hashes.join(", ")
+        ));
+    }
+    lines.push(
+        "refresh the pre-warm cache for this repo/commit, or retry with \
+         `--warm sources`/`--warm none` if devShell warming is not required."
+            .to_string(),
+    );
+    Some(lines.join("\n"))
+}
+
+fn is_prewarm_target(target: &str) -> bool {
+    target
+        .strip_prefix(VM_NIX_PREWARM_PATH_PREFIX)
+        .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+fn prewarm_narinfo_hash(target: &str) -> String {
+    target
+        .strip_prefix(VM_NIX_PREWARM_PATH_PREFIX)
+        .and_then(|suffix| suffix.strip_prefix('/'))
+        .and_then(|suffix| suffix.strip_suffix(".narinfo"))
+        .filter(|hash| !hash.contains('/'))
+        .unwrap_or(target)
+        .to_string()
 }
 
 impl AgentVmStarted {

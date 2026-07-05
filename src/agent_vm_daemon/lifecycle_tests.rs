@@ -4,6 +4,8 @@
 use super::test_support::*;
 use super::*;
 use crate::agent_vm_lifecycle::AgentVmSessionStateStatus;
+use crate::audit::{NixCacheAuditDecision, NixCacheAuditEntry, NixCacheAuditRoute};
+use crate::core::RequestId;
 use crate::vm_git::{DEFAULT_WORKSPACE_BRANCH, WorkspaceWarmMode};
 use proptest::prelude::*;
 use std::fs;
@@ -942,6 +944,97 @@ fn nix_prewarm_url_is_the_broker_url_under_the_prewarm_route() {
         "http://192.168.252.1:51375/v1/nix/prewarm"
     );
 }
+
+fn nix_cache_entry(target: &str, route: NixCacheAuditRoute, status: u16) -> NixCacheAuditEntry {
+    let session_id = SessionId::new();
+    NixCacheAuditEntry {
+        request_id: RequestId::new(),
+        session_id,
+        received_at: UnixMillis::from_millis(1),
+        method: "GET".into(),
+        target: target.into(),
+        route,
+        decision: NixCacheAuditDecision::Allow,
+        completed_at: Some(UnixMillis::from_millis(2)),
+        http_status: Some(status),
+        upstream_url: None,
+        upstream_status: None,
+        response_bytes: Some(9),
+        error: None,
+    }
+}
+
+#[test]
+fn workspace_bootstrap_prewarm_diagnostic_summarises_strict_misses() {
+    let entries = vec![
+        nix_cache_entry(
+            "/v1/nix/prewarm/00000000000000000000000000000000.narinfo",
+            NixCacheAuditRoute::NarInfo,
+            404,
+        ),
+        nix_cache_entry(
+            "/v1/nix/prewarm/11111111111111111111111111111111.narinfo",
+            NixCacheAuditRoute::NarInfo,
+            404,
+        ),
+        nix_cache_entry(
+            "/v1/nix/prewarm/22222222222222222222222222222222.narinfo",
+            NixCacheAuditRoute::NarInfo,
+            200,
+        ),
+        nix_cache_entry(
+            "/v1/nix/prewarm/nar/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.nar.xz",
+            NixCacheAuditRoute::Nar,
+            200,
+        ),
+        nix_cache_entry(
+            "/v1/nix/prewarm/nar/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.nar.xz",
+            NixCacheAuditRoute::Nar,
+            404,
+        ),
+        nix_cache_entry(
+            "/v1/nix/cache/33333333333333333333333333333333.narinfo",
+            NixCacheAuditRoute::NarInfo,
+            404,
+        ),
+    ];
+
+    let diagnostic = workspace_bootstrap_prewarm_diagnostic(&entries).unwrap();
+
+    assert!(diagnostic.contains("narinfo: 2 missing, 1 served"));
+    assert!(diagnostic.contains("nar: 1 missing, 1 served"));
+    assert!(diagnostic.contains(
+        "first missing narinfo hashes: 00000000000000000000000000000000, \
+         11111111111111111111111111111111"
+    ));
+    assert!(diagnostic.contains("--warm sources"));
+    assert!(diagnostic.contains("--warm none"));
+    assert!(!diagnostic.contains("33333333333333333333333333333333"));
+}
+
+#[test]
+fn workspace_bootstrap_prewarm_diagnostic_is_absent_without_prewarm_misses() {
+    let entries = vec![
+        nix_cache_entry(
+            "/v1/nix/prewarm/00000000000000000000000000000000.narinfo",
+            NixCacheAuditRoute::NarInfo,
+            200,
+        ),
+        nix_cache_entry(
+            "/v1/nix/prewarmevil/11111111111111111111111111111111.narinfo",
+            NixCacheAuditRoute::NarInfo,
+            404,
+        ),
+        nix_cache_entry(
+            "/v1/nix/cache/22222222222222222222222222222222.narinfo",
+            NixCacheAuditRoute::NarInfo,
+            404,
+        ),
+    ];
+
+    assert_eq!(workspace_bootstrap_prewarm_diagnostic(&entries), None);
+}
+
 #[test]
 fn workspace_bootstrap_poll_interval_backs_off_after_initial_polls() {
     assert_eq!(
