@@ -770,6 +770,54 @@ async fn local_nar_body_is_served_verbatim_trusting_the_mount() {
     assert_eq!(entries[1].response_bytes, Some(tampered.len() as u64));
 }
 
+/// The cache serve path coalesces its audit request+outcome into one commit
+/// *after* the fetch, but a closed (or unknown) audit session must still be
+/// refused *before* the broker does any cache I/O on its behalf — otherwise a
+/// session whose authority window has closed could still drive an upstream
+/// fetch that leaves no audit trail. A local miss on the proxied view would
+/// normally fall through to the upstream, so any upstream contact fails here.
+#[tokio::test]
+async fn closed_session_is_refused_before_any_upstream_fetch() {
+    let upstream = MockServer::start().await;
+    let state = make_broker_state(&upstream);
+    let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+    open_audit_session(&state, session.session_id());
+    state
+        .audit
+        .close_session(session.session_id(), crate::core::UnixMillis::now())
+        .unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let hash = "rzv95bakh41zrn5ji23pfc11x5vq2z4d";
+    Mock::given(method("GET"))
+        .and(path(format!("/{hash}.narinfo")))
+        .respond_with(ResponseTemplate::new(200).set_body_string("unused"))
+        .expect(0)
+        .mount(&upstream)
+        .await;
+    let service =
+        nix_cache_service_with_local_cache(&state, &upstream.uri(), cache.path(), 1024, 1024);
+
+    let response = route_nix_cache_with_service(
+        &session,
+        "GET",
+        format!("{VM_NIX_CACHE_PATH_PREFIX}/{hash}.narinfo"),
+        service,
+    )
+    .await;
+
+    assert_eq!(response.status, VmHttpStatus::InternalServerError);
+    // `expect(0)`: the upstream must not have been contacted.
+    upstream.verify().await;
+    let entries = state
+        .audit
+        .list_nix_cache_requests_for_session(session.session_id())
+        .unwrap();
+    assert!(
+        entries.is_empty(),
+        "closed session must write no audit rows"
+    );
+}
+
 #[tokio::test]
 async fn upstream_admitted_nar_is_not_shadowed_by_a_local_file() {
     let upstream = MockServer::start().await;

@@ -185,14 +185,17 @@ pub(super) async fn route_nix_cache_request<S: SecretStore>(
     }
 
     let request_id = RequestId::new();
-    if let Err(err) = record_nix_cache_request(
-        &service,
-        request_id,
-        session,
-        request,
-        NixCacheAuditDecision::Allow,
-        Some(&route),
-    ) {
+    // The audit row is written coalesced with the outcome *after* the fetch (a
+    // cache serve grants no authority, so its request row need not be durable
+    // before the action — one commit beats two on the audit-write `fsync`
+    // path). But refuse a closed/unknown session *before* doing any cache I/O
+    // on its behalf: the coalesced write re-checks inside its transaction, yet
+    // only after the fetch has run. This read-only check adds no commit.
+    if let Err(err) = service
+        .broker_state
+        .audit
+        .require_session_open(session.session_id())
+    {
         tracing::error!(
             target: AUDIT_WRITE_FAILURE_TARGET,
             kind = "nix_cache_request",
@@ -203,14 +206,26 @@ pub(super) async fn route_nix_cache_request<S: SecretStore>(
         return VmHttpResponse::text(VmHttpStatus::InternalServerError, "audit write failed")
             .into();
     }
-
+    // Stamp arrival before the fetch so `received_at` still reflects when the
+    // request came in; the request row is written together with its outcome in
+    // one commit after the fetch (see `record_nix_cache_request_and_outcome`).
+    let received_at = UnixMillis::now();
     let fetch = service
         .fetch_route(request.method.as_str(), view, &route)
         .await;
-    if let Err(err) = record_nix_cache_outcome(&service, request_id, &fetch) {
+    if let Err(err) = record_nix_cache_request_and_outcome(
+        &service,
+        request_id,
+        received_at,
+        session,
+        request,
+        NixCacheAuditDecision::Allow,
+        Some(&route),
+        &fetch,
+    ) {
         tracing::error!(
             target: AUDIT_WRITE_FAILURE_TARGET,
-            kind = "nix_cache_outcome",
+            kind = "nix_cache_request_and_outcome",
             request_id = %request_id,
             error = %err,
             "audit write failed",
@@ -233,18 +248,7 @@ pub(super) fn record_nix_cache_local_response<S: SecretStore>(
         return response;
     };
     let request_id = RequestId::new();
-    if let Err(err) =
-        record_nix_cache_request(service, request_id, session, request, decision, route)
-    {
-        tracing::error!(
-            target: AUDIT_WRITE_FAILURE_TARGET,
-            kind = "nix_cache_request",
-            request_id = %request_id,
-            error = %err,
-            "audit write failed",
-        );
-        return VmHttpResponse::text(VmHttpStatus::InternalServerError, "audit write failed");
-    }
+    let received_at = UnixMillis::now();
     let fetch = VmHttpNixCacheProxyFetch {
         upstream_url: String::new(),
         upstream_status: None,
@@ -252,10 +256,19 @@ pub(super) fn record_nix_cache_local_response<S: SecretStore>(
         error: None,
         response,
     };
-    if let Err(err) = record_nix_cache_outcome(service, request_id, &fetch) {
+    if let Err(err) = record_nix_cache_request_and_outcome(
+        service,
+        request_id,
+        received_at,
+        session,
+        request,
+        decision,
+        route,
+        &fetch,
+    ) {
         tracing::error!(
             target: AUDIT_WRITE_FAILURE_TARGET,
-            kind = "nix_cache_outcome",
+            kind = "nix_cache_request_and_outcome",
             request_id = %request_id,
             error = %err,
             "audit write failed",
@@ -265,31 +278,20 @@ pub(super) fn record_nix_cache_local_response<S: SecretStore>(
     fetch.response
 }
 
-fn record_nix_cache_request<S: SecretStore>(
+/// Record a Nix cache request and its outcome as one audit commit. `received_at`
+/// is captured by the caller before the fetch so it still marks arrival, while
+/// `completed_at` is stamped here at write time. Coalescing the two rows keeps a
+/// request row from ever landing without its outcome and halves the audit-write
+/// `fsync` count on the (authority-free) cache serve path.
+#[allow(clippy::too_many_arguments)]
+fn record_nix_cache_request_and_outcome<S: SecretStore>(
     service: &VmHttpNixCacheService<S>,
     request_id: RequestId,
+    received_at: UnixMillis,
     session: &VmHttpSession,
     request: &VmHttpRequest,
     decision: NixCacheAuditDecision,
     route: Option<&VmNixCacheRoute>,
-) -> Result<(), AuditError> {
-    service
-        .broker_state
-        .audit
-        .record_nix_cache_request(&NixCacheRequestRecord {
-            request_id,
-            session_id: session.session_id(),
-            received_at: UnixMillis::now(),
-            method: &request.method,
-            target: &request.target,
-            route: nix_cache_audit_route(request, route),
-            decision: &decision,
-        })
-}
-
-fn record_nix_cache_outcome<S: SecretStore>(
-    service: &VmHttpNixCacheService<S>,
-    request_id: RequestId,
     fetch: &VmHttpNixCacheProxyFetch,
 ) -> Result<(), AuditError> {
     let upstream_url = if fetch.upstream_url.is_empty() {
@@ -300,15 +302,30 @@ fn record_nix_cache_outcome<S: SecretStore>(
     service
         .broker_state
         .audit
-        .record_nix_cache_outcome(&NixCacheOutcomeRecord {
-            request_id,
-            completed_at: UnixMillis::now(),
-            http_status: fetch.response.status.code(),
-            upstream_url,
-            upstream_status: fetch.upstream_status,
-            response_bytes: fetch.response_bytes,
-            error: fetch.error,
-        })
+        .record_nix_cache_request_and_outcome(
+            &NixCacheRequestRecord {
+                request_id,
+                session_id: session.session_id(),
+                received_at,
+                method: &request.method,
+                target: &request.target,
+                route: nix_cache_audit_route(request, route),
+                decision: &decision,
+            },
+            &NixCacheOutcomeRecord {
+                request_id,
+                completed_at: UnixMillis::now(),
+                http_status: fetch.response.status.code(),
+                upstream_url,
+                upstream_status: audit_upstream_status(fetch.upstream_status),
+                response_bytes: fetch.response_bytes,
+                error: fetch.error,
+            },
+        )
+}
+
+fn audit_upstream_status(status: Option<u16>) -> Option<u16> {
+    status.filter(|status| (100..=599).contains(status))
 }
 
 fn nix_cache_audit_route(
