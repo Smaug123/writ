@@ -388,6 +388,7 @@
               Cmd = [ "/bin/sh" ];
               Env = [
                 "PATH=/bin"
+                "HOME=/root"
                 "SSL_CERT_FILE=/etc/ssl/certs/ca-bundle.crt"
                 "GIT_SSL_CAINFO=/etc/ssl/certs/ca-bundle.crt"
                 "NIX_SSL_CERT_FILE=/etc/ssl/certs/ca-bundle.crt"

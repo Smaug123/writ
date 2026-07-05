@@ -356,8 +356,6 @@ fn claude_process_plan(
     model: &str,
     config: &VmClientConfig,
 ) -> Result<AgentProcessPlan, Box<dyn std::error::Error>> {
-    let claude_config_dir = std::env::temp_dir().join("writ-vm-claude-code");
-    std::fs::create_dir_all(&claude_config_dir)?;
     Ok(AgentProcessPlan::new(
         run_id,
         "claude",
@@ -381,7 +379,6 @@ fn claude_process_plan(
     .with_env_remove("CLAUDE_CODE_OAUTH_TOKEN")
     .with_env("ANTHROPIC_BASE_URL", config.broker_url().as_str())
     .with_env("ANTHROPIC_AUTH_TOKEN", config.bearer_token().as_str())
-    .with_env("CLAUDE_CONFIG_DIR", claude_config_dir.as_os_str())
     .with_env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
     // The guest image installs the upstream claude binary directly, without
     // the nixpkgs wrapper that normally pins these. The VM has no outbound
@@ -772,7 +769,10 @@ mod tests {
                 .map(|v| v.to_str().unwrap()),
             Some("1"),
         );
-        assert!(env.contains_key(&OsString::from("CLAUDE_CONFIG_DIR")));
+        assert!(
+            !env.contains_key(&OsString::from("CLAUDE_CONFIG_DIR")),
+            "managed Claude should use the default ~/.claude settings provisioned by the VM bootstrap",
+        );
 
         let removed: std::collections::HashSet<&OsString> = plan.env_remove().iter().collect();
         for key in [

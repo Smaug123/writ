@@ -13,6 +13,7 @@ fn guest_nix_setup_script_writes_configured_trusted_public_keys() {
     let dir = tempfile::tempdir().unwrap();
     let netrc = dir.path().join("run").join("netrc");
     let nix_conf_dir = dir.path().join("nix-conf");
+    let home = dir.path().join("home");
     let trusted_public_keys =
         format!("{TEST_NIX_CACHE_PUBLIC_KEY} {SECOND_TEST_NIX_CACHE_PUBLIC_KEY}");
 
@@ -21,6 +22,7 @@ fn guest_nix_setup_script_writes_configured_trusted_public_keys() {
         .arg(nix_conf_prologue_script_for_test())
         .arg("writ-agent-vm-nix-setup")
         .arg("true")
+        .env("HOME", &home)
         .env("WRIT_BROKER_TOKEN", "writ-vm-token")
         .env(
             "WRIT_NIX_CACHE_URL",
@@ -44,6 +46,49 @@ fn guest_nix_setup_script_writes_configured_trusted_public_keys() {
 }
 
 #[test]
+fn guest_nix_setup_script_writes_claude_default_settings() {
+    let dir = tempfile::tempdir().unwrap();
+    let netrc = dir.path().join("run").join("netrc");
+    let nix_conf_dir = dir.path().join("nix-conf");
+    let home = dir.path().join("home");
+
+    let status = Command::new("sh")
+        .arg("-c")
+        .arg(nix_conf_prologue_script_for_test())
+        .arg("writ-agent-vm-nix-setup")
+        .arg("true")
+        .env("HOME", &home)
+        .env("WRIT_BROKER_TOKEN", "writ-vm-token")
+        .env(
+            "WRIT_NIX_CACHE_URL",
+            "http://192.168.252.1:51375/v1/nix/cache",
+        )
+        .env("WRIT_NIX_BASIC_LOGIN", VM_NIX_BASIC_LOGIN)
+        .env("WRIT_NIX_NETRC", &netrc)
+        .env(AGENT_VM_NIX_TRUSTED_PUBLIC_KEYS_ENV, "")
+        .env("NIX_CONF_DIR", &nix_conf_dir)
+        .status()
+        .unwrap();
+
+    assert!(status.success());
+    let settings_path = home.join(".claude").join("settings.json");
+    let settings = fs::read_to_string(&settings_path).unwrap();
+    assert_eq!(
+        settings,
+        r#"{"env":{"CLAUDE_AFK_TIMEOUT_MS":"86400000","CLAUDE_CODE_DISABLE_CRON":"1","CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY":"1"},"sandbox":{"enabled":false,"allowUnsandboxedCommands":true},"defaultMode":"bypassPermissions","skipDangerousModePermissionPrompt":true}
+"#
+    );
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let settings_mode = fs::metadata(settings_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(settings_mode, 0o600);
+    }
+}
+
+#[test]
 fn guest_nix_conf_disables_build_users_group_for_single_user_root_store() {
     // The guest runs Nix as root in a single-user, root-owned store with no
     // `nixbld` build-users group. Nix defaults `build-users-group` to `nixbld`
@@ -56,12 +101,14 @@ fn guest_nix_conf_disables_build_users_group_for_single_user_root_store() {
     let dir = tempfile::tempdir().unwrap();
     let netrc = dir.path().join("run").join("netrc");
     let nix_conf_dir = dir.path().join("nix-conf");
+    let home = dir.path().join("home");
 
     let status = Command::new("sh")
         .arg("-c")
         .arg(nix_conf_prologue_script_for_test())
         .arg("writ-agent-vm-nix-setup")
         .arg("true")
+        .env("HOME", &home)
         .env("WRIT_BROKER_TOKEN", "writ-vm-token")
         .env(
             "WRIT_NIX_CACHE_URL",
