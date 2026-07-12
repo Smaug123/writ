@@ -52,11 +52,20 @@ Started ──► Uncertain ──── update_ref ───────┤
 ```
 
 - **Started**: written immediately on entry to `approve_staged_push`,
-  before mint, before `run_approve`. Records the operator, the
+  before mint, before `prepare_approve`. Records the operator, the
   push_request_id, and `started_at`. Pre-PATCH transient failures
   (mint failure, prepare failure, plan failure, walker failure,
   pre-PATCH lease failures) transition to
-  `Resolved(PrePatchFailure)`.
+  `Resolved(PrePatchFailure)`. Note that the entire expensive,
+  network-bound part of an approve — the staging fetch, the unbundle,
+  and every object upload — runs in this state: none of it can move a
+  branch, and boot reconcile resolves a wedged `Started` row without an
+  operator. Because that phase runs *after* the mint, the credential's
+  identity is persisted up front in the append-only
+  `git_push_approve_attempt_mint` ledger (schema v7) — the `Started`
+  row itself cannot carry mint columns (v5 CHECK), and without the
+  ledger a crash mid-prepare would lose which credential was issued
+  and used for the uploads.
 - **Uncertain**: written in the same SQLite transaction that completes
   the *last* check before `update_ref` is called — the post-walker
   lease check. Once `Uncertain` lands, the broker has committed to
@@ -161,8 +170,16 @@ mint() ; on fail:
     UPDATE state='resolved', outcome='pre_patch_failure',
            failure_detail=..., completed_at=now                            -- TX
     return Error
-prepare/plan/walker  ; on fail (any non-update_ref ExecuteError, any
-    non-Execute RunApproveError):
+INSERT git_push_approve_attempt_mint (attempt_id, mint_jti, mint_*)        -- TX (v7 ledger)
+  -- the burned credential's identity, durable *before* any of the
+  -- crash-prone prepare work uses it. A crash anywhere below leaves a
+  -- Started row whose mint boot reconcile can recover from this row.
+  ; on fail:
+    UPDATE state='resolved', outcome='pre_patch_failure',
+           mint_jti=..., mint_*, failure_detail=..., completed_at=now      -- TX
+    return Error
+prepare_approve()  ; on fail (any RunApproveError — the type cannot
+    express a PATCH failure, so every one of them is provably pre-PATCH):
     -- mint succeeded but no PATCH was issued. `pre_patch_failure`
     -- proves GitHub is unchanged (retry is safe), but the burned
     -- credential is recorded inline so the audit log can still answer
@@ -173,7 +190,23 @@ prepare/plan/walker  ; on fail (any non-update_ref ExecuteError, any
            failure_detail=..., completed_at=now                            -- TX
     return Error
 UPDATE state='uncertain', mint_jti=..., mint_*                              -- TX2 (load-bearing)
-run_approve.execute_update_ref()
+  -- yields an `UncertainAttempt` witness, which is the only key that
+  -- opens `PreparedApprove::commit`. The PATCH is unreachable without
+  -- this row, so TX2 cannot drift back to before the walker again.
+prepared.commit(&witness)   -- final lease recheck + the one branch-moving call
+  -- re-verifies GET /git/ref/heads/<branch> == expected_remote_head
+  -- immediately before the PATCH, so the time the broker spends
+  -- between prepare and here (object-source reaping, TX2) is outside
+  -- the publish race. GitHub's force=false PATCH is fast-forward-only,
+  -- not compare-and-swap: without this, a branch rewound to an
+  -- ancestor during that interval would still accept the PATCH and
+  -- publish against a baseline the approval never covered.
+  case Err(FinalLeaseLookup | FinalLeaseMoved):
+    -- provably pre-PATCH (the PATCH was never sent); the trigger
+    -- admits Uncertain → Resolved(PrePatchFailure), mint preserved
+    UPDATE state='resolved', outcome='pre_patch_failure',
+           failure_detail=..., completed_at=now                             -- TX
+    return Error (push remains retryable / rejectable)
   case Ok(Noop | Advanced { new_app_tip }):
     -- single transaction commits both halves
     BEGIN
@@ -187,13 +220,14 @@ run_approve.execute_update_ref()
     COMMIT
     DELETE staging dir (best-effort, post-TX, warn on failure)
     return StagedPushApproved
-  case Err(ExecuteError::UpdateRef(_)):
+  case Err(UpdateRef(_)):
+    -- the only variant that wraps a *sent* PATCH; its existence is the
+    -- proof that a PATCH reached GitHub and did not confirm. The
+    -- classification is the variant match itself — no cause-string
+    -- inspection to get wrong.
     UPDATE state='resolved', outcome='post_patch_failure',
            failure_detail=..., completed_at=now                             -- TX
     log AUDIT_WRITE_FAILURE_TARGET ; return Error
-  case Err(other ExecuteError variant):
-    UPDATE state='resolved', outcome='pre_patch_failure', ...               -- TX
-    return Error
 ```
 
 The TX2 transition replaces the R6 marker file. If the broker crashes
@@ -248,7 +282,14 @@ For each row:
 - `state = 'started'`: the broker crashed during an approve attempt
   before any `update_ref` could have been issued. Transition to
   `Resolved(PrePatchFailure { detail = "broker restart" })` so the
-  push is rejectable / retryable.
+  push is rejectable / retryable. If the v7 mint ledger carries a row
+  for the attempt (the crash happened after the mint, e.g. mid-prepare),
+  the recovery copies that mint onto the resolved row so the burned
+  credential's identity survives; a schema trigger pins the two records
+  to agree. The dead attempt's on-disk staging repo is *not* consulted
+  or removed (boot reconcile stays filesystem-blind); staging repos are
+  keyed by attempt id, so the residue can never collide with the fresh
+  attempt a retry mints — it just occupies disk until swept.
 - `state = 'uncertain'`: the broker crashed *after* committing to
   PATCH. Log to `AUDIT_WRITE_FAILURE_TARGET`; leave the row. The push
   surfaces in `promote list` flagged as `requires_reconcile`. Operator

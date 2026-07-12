@@ -1,16 +1,26 @@
 //! Compose a planned fast-forward push into the GitHub publish step.
 //!
-//! [`execute_fast_forward_plan`] takes the output of the slice-B1b
-//! planner ([`FastForwardPlan`]) and runs the two remaining steps of
-//! the staged-push pipeline against GitHub:
+//! Takes the output of the slice-B1b planner ([`FastForwardPlan`]) and
+//! runs the two remaining steps of the staged-push pipeline against
+//! GitHub — as two functions, not one, split exactly where the
+//! consequences change:
 //!
-//! 1. Walk the plan's topo-sorted commits through [`replay_commits`],
-//!    which uploads each commit's full tree-and-blob closure via the
-//!    GitHub Git Data REST API and returns the final App-identity
-//!    commit SHA.
-//! 2. Issue `PATCH /repos/.../git/refs/heads/<branch>` via
+//! 1. [`prepare_fast_forward_plan`] walks the plan's topo-sorted
+//!    commits through [`replay_commits`], which uploads each commit's
+//!    full tree-and-blob closure via the GitHub Git Data REST API and
+//!    returns the final App-identity commit SHA. Nothing it does is
+//!    observable: uploaded objects sit unreferenced in GitHub's object
+//!    database until a ref points at one. Every failure is retryable.
+//! 2. [`commit_prepared_promotion`] issues `PATCH
+//!    /repos/.../git/refs/heads/<branch>` via
 //!    [`GitDataClient::update_ref`] so the branch on GitHub points at
-//!    the App-side SHA.
+//!    the App-side SHA. This is the publish, and the one call in the
+//!    pipeline whose failure leaves the outcome genuinely unknown.
+//!
+//! Keeping them apart lets the broker record "a PATCH may exist" in its
+//! audit log in between — tightly bracketing the one step that can
+//! actually move a branch, rather than the whole pipeline. See
+//! [`crate::git_push_approve`].
 //!
 //! The [`FastForwardPlan::AlreadyAtExpected`] arm short-circuits both
 //! steps: nothing new was pushed, so there is nothing to upload and
@@ -129,7 +139,7 @@ impl PromoteRuntimeConfig {
     }
 }
 
-/// Outcome of running [`execute_fast_forward_plan`].
+/// Outcome of running [`commit_prepared_promotion`].
 ///
 /// Mirrors the two arms of [`FastForwardPlan`], reporting which path
 /// was taken so the caller can audit the promotion without re-parsing
@@ -146,6 +156,87 @@ pub enum ExecuteOutcome {
     /// App-identity SHA GitHub returned for the *last* commit in the
     /// topo-sorted walk.
     Advanced { new_app_tip: GitObjectId },
+}
+
+/// A promotion that has run every step that provably *cannot* have
+/// moved the branch on GitHub, and is now one `PATCH` away from
+/// publishing.
+///
+/// This is the seam the audit layer needs. Everything upstream of a
+/// `PreparedPromotion` — the lease checks and the walker's blob / tree
+/// / commit uploads — leaves the branch ref untouched: the uploads
+/// land in GitHub's object database as unreferenced objects that GC
+/// eventually reclaims, and nothing observes them until a ref points
+/// at one. So a broker that dies anywhere before this value exists
+/// dies in a state that is provably retryable, and the attempt row can
+/// stay in a cheaply-recoverable state until here.
+///
+/// Committing one (see [`commit_prepared_promotion`]) is the step past
+/// which the broker can no longer prove whether GitHub moved the
+/// branch, so the caller must record its intent to PATCH *before*
+/// calling it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PreparedPromotion {
+    /// The plan was [`FastForwardPlan::AlreadyAtExpected`]: the branch
+    /// already points at `tip`. Committing this issues no HTTP at all.
+    Noop { tip: GitObjectId },
+    /// Objects are uploaded and the lease was still intact as of the
+    /// post-walk recheck. The remaining steps are a final lease
+    /// re-verification against `expected_remote_head` and then `PATCH
+    /// /git/refs/heads/<branch>` to `new_app_tip` — both performed by
+    /// [`commit_prepared_promotion`], back to back, so the caller can
+    /// take as long as it needs between prepare and commit without
+    /// widening the publish race window.
+    RefUpdate {
+        new_app_tip: GitObjectId,
+        expected_remote_head: GitObjectId,
+    },
+}
+
+/// The PATCH was issued and did not confirm.
+///
+/// A distinct type rather than an [`ExecuteError`] variant because it
+/// carries a *proof obligation*, not just a cause: a value of this type
+/// exists only where a `PATCH /git/refs/...` was issued and did not
+/// confirm, which means the branch on GitHub may or may not have moved.
+/// The caller owes the audit log a "the PATCH may have landed"
+/// resolution. Encoding that in its own type means the caller cannot
+/// get the classification wrong: [`CommitError`]'s other variants are
+/// all provably pre-PATCH, and only this one wraps a sent PATCH.
+#[derive(Debug, thiserror::Error)]
+#[error("ref update against GitHub failed: {0}")]
+pub struct UpdateRefError(#[source] pub GitDataError);
+
+/// How [`commit_prepared_promotion`] can fail.
+///
+/// The two `FinalLease*` variants fire *before* the PATCH is issued —
+/// GitHub's branch is provably untouched by this attempt, so the
+/// caller resolves them exactly like a prepare-phase failure
+/// (retryable, no quarantine). Only [`CommitError::UpdateRef`] wraps a
+/// sent PATCH; it is the sole variant that owes the audit log a
+/// "the PATCH may have landed" resolution.
+#[derive(Debug, thiserror::Error)]
+pub enum CommitError {
+    /// The last-second `GET /git/ref/heads/<branch>` failed. No PATCH
+    /// was issued.
+    #[error("final branch head lookup before publish failed: {0}")]
+    FinalLeaseLookup(GitDataError),
+    /// The last-second lease check found the branch no longer at
+    /// `expected_remote_head` — another actor moved (or rewound) it
+    /// after the post-walk check. No PATCH was issued: publishing
+    /// would have been a `force=false` fast-forward onto a baseline
+    /// the approval never covered.
+    #[error(
+        "branch head on GitHub is {actual}, but the staged push was authorised against \
+         expected_remote_head {expected} — branch moved after prepare; publish refused"
+    )]
+    FinalLeaseMoved {
+        expected: GitObjectId,
+        actual: GitObjectId,
+    },
+    /// The PATCH was issued and did not confirm. See [`UpdateRefError`].
+    #[error(transparent)]
+    UpdateRef(#[from] UpdateRefError),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -209,25 +300,27 @@ pub enum ExecuteError {
         actual: GitObjectId,
         uploaded_tip: GitObjectId,
     },
-    /// `PATCH /git/refs/heads/<branch>` returned non-2xx. The commits
-    /// already landed in GitHub's object database (replay completed
-    /// before this point), so a retry after fixing the cause is
-    /// idempotent — the prior uploads are reused.
-    #[error("ref update against GitHub failed: {0}")]
-    UpdateRef(GitDataError),
 }
 
-/// Walk the planner's commits onto GitHub and re-point the branch.
+/// Walk the planner's commits onto GitHub, stopping one step short of
+/// re-pointing the branch.
+///
+/// Every failure this can return is provably pre-PATCH: the branch ref
+/// on GitHub is untouched, whatever went wrong. That is what the type
+/// asserts — there is no PATCH-failure variant, because the PATCH is
+/// [`commit_prepared_promotion`]'s job and [`UpdateRefError`]'s to
+/// report. A caller can therefore run this whole phase *before*
+/// durably committing to "a PATCH may exist on GitHub".
 ///
 /// Two return shapes, parallel to the two arms of [`FastForwardPlan`]:
 ///
-/// * `AlreadyAtExpected { tip }` → returns [`ExecuteOutcome::Noop`]
+/// * `AlreadyAtExpected { tip }` → returns [`PreparedPromotion::Noop`]
 ///   immediately. No HTTP call is issued. The audit record should
 ///   note the noop and the staged push's resolution.
 /// * `Replay { commits, seed }` → drives [`replay_commits`] with
-///   `commits`, `seed`, and `trailers`, then calls
-///   [`GitDataClient::update_ref`] on the branch with the final
-///   App-side SHA. Returns [`ExecuteOutcome::Advanced`] on success.
+///   `commits`, `seed`, and `trailers`, and returns
+///   [`PreparedPromotion::RefUpdate`] carrying the final App-side SHA
+///   for [`commit_prepared_promotion`] to publish.
 ///
 /// ## Lease enforcement
 ///
@@ -242,28 +335,34 @@ pub enum ExecuteError {
 /// silently turn an approved fast-forward into a publish onto a
 /// baseline the bailiff never saw.
 ///
-/// The orchestrator therefore checks twice:
+/// The orchestrator therefore checks twice, and
+/// [`commit_prepared_promotion`] a third time:
 ///
 /// 1. **Pre-walk** — `GET /git/ref/heads/<branch>` before any
 ///    upload. If the head ≠ `expected_remote_head`, refuse with
 ///    [`ExecuteError::ExpectedHeadMoved`]. Failing here costs no
 ///    upload bandwidth.
-/// 2. **Post-walk** — a second `GET /git/ref/heads/<branch>`
-///    immediately before the `PATCH`. If the head ≠
-///    `expected_remote_head` (someone raced us during the upload
-///    window), refuse with
+/// 2. **Post-walk** — a second `GET /git/ref/heads/<branch>` after
+///    the uploads. If the head ≠ `expected_remote_head` (someone
+///    raced us during the upload window), refuse with
 ///    [`ExecuteError::ExpectedHeadMovedAfterReplay`]. The walker's
 ///    uploaded objects remain on GitHub unreferenced — they don't
 ///    publish anything because the ref never moves.
+/// 3. **Pre-PATCH** — [`commit_prepared_promotion`] re-verifies the
+///    lease immediately before the `PATCH`, refusing with
+///    [`CommitError::FinalLeaseMoved`] without sending it. The caller
+///    may take arbitrarily long between prepare and commit (reaping
+///    subprocesses, writing the `Uncertain` audit row); this check is
+///    what keeps that interval out of the publish race.
 ///
-/// The residual race window between the second GET and the PATCH
-/// itself is unavoidable without server-side CAS, but is bounded
-/// to a single HTTP round-trip. A race that lands inside that
-/// window surfaces as a 422 from `update_ref` (it would no longer
-/// be a fast-forward) or, in the worst case where the branch has
-/// rewound to an ancestor of `expected_remote_head`, as a silent
-/// stale-baseline publish — the smallest TOCTOU window we can
-/// achieve with the GitHub API as given.
+/// The residual race window is therefore a single GET→PATCH
+/// round-trip inside `commit_prepared_promotion`, regardless of caller
+/// behaviour. Closing even that requires server-side CAS, which the
+/// REST refs API does not offer; a race landing inside it surfaces as
+/// a 422 from `update_ref` (no longer a fast-forward) or, in the worst
+/// case where the branch has rewound to an ancestor of
+/// `expected_remote_head`, as a silent stale-baseline publish — the
+/// smallest TOCTOU window the GitHub REST API admits.
 ///
 /// The `AlreadyAtExpected` arm skips both checks because it issues
 /// no GitHub-mutating call; the audit record speaks for what the
@@ -298,13 +397,6 @@ pub enum ExecuteError {
 ///   moved during the walker upload window. The walker uploaded
 ///   `uploaded_tip` (now unreferenced on GitHub) but the ref was
 ///   not advanced.
-/// * [`ExecuteError::UpdateRef`] — successful walk and post-walk
-///   lease check, but the `PATCH` itself returned non-2xx (e.g.
-///   the branch raced in the tiny window between the recheck and
-///   the PATCH). The commits *are* on GitHub but no ref points
-///   at them yet. Re-running the orchestrator with the same plan
-///   is idempotent: the walker short-circuits every already-mapped
-///   commit, and `update_ref` retries against the same target.
 // One past clippy's argument-count threshold: each arg is a distinct
 // concern (transport, repo, branch, lease tip, object source, plan,
 // trailers, signing key) and the natural caller has them as separate
@@ -313,7 +405,7 @@ pub enum ExecuteError {
 // into the broker's HTTP handler) ends up packing them in a single
 // place anyway.
 #[allow(clippy::too_many_arguments)]
-pub async fn execute_fast_forward_plan<S: GitObjectSource>(
+pub async fn prepare_fast_forward_plan<S: GitObjectSource>(
     client: &GitDataClient,
     repo: &RepoRef,
     branch: &GitBranchName,
@@ -322,9 +414,9 @@ pub async fn execute_fast_forward_plan<S: GitObjectSource>(
     plan: FastForwardPlan,
     trailers: &[TrailerSource],
     signing_key: Option<&WritSigningKey>,
-) -> Result<ExecuteOutcome, ExecuteError> {
+) -> Result<PreparedPromotion, ExecuteError> {
     match plan {
-        FastForwardPlan::AlreadyAtExpected { tip } => Ok(ExecuteOutcome::Noop { tip }),
+        FastForwardPlan::AlreadyAtExpected { tip } => Ok(PreparedPromotion::Noop { tip }),
         FastForwardPlan::Replay { commits, seed } => {
             let actual_head = client
                 .get_branch_head(repo, branch)
@@ -353,10 +445,70 @@ pub async fn execute_fast_forward_plan<S: GitObjectSource>(
                     uploaded_tip: new_app_tip,
                 });
             }
+            Ok(PreparedPromotion::RefUpdate {
+                new_app_tip,
+                expected_remote_head: expected_remote_head.clone(),
+            })
+        }
+    }
+}
+
+/// The publish half of the pipeline, following
+/// [`prepare_fast_forward_plan`]: point the branch at the
+/// [`PreparedPromotion`].
+///
+/// [`PreparedPromotion::Noop`] issues no HTTP — the branch already
+/// points at the tip — so it cannot fail.
+/// [`PreparedPromotion::RefUpdate`] re-verifies the lease with one
+/// last `GET /git/ref/heads/<branch>` and then issues exactly one
+/// `PATCH /git/refs/heads/<branch>`, the only GitHub call in the whole
+/// promote pipeline that can move the branch.
+///
+/// The final GET is load-bearing, not paranoia. `update_ref` runs with
+/// `force=false`, but GitHub's fast-forward check only demands that the
+/// new tip *descend from the current head* — it is not a compare-and-
+/// swap against `expected_remote_head`. If another actor rewinds the
+/// branch to an ancestor after the post-walk check (the caller may
+/// spend arbitrary time between prepare and commit: reaping the object
+/// source, writing the `Uncertain` row), the PATCH would still succeed
+/// and silently publish against a baseline the approval never covered.
+/// Rechecking *inside* commit pins the race window to a single
+/// GET→PATCH round-trip regardless of what the caller does in between;
+/// closing even that residue needs server-side CAS, which the REST API
+/// does not offer (GraphQL's `updateRefs` with `expectedHeadOid` is
+/// the eventual candidate).
+///
+/// Failures split by proof: the `FinalLease*` variants of
+/// [`CommitError`] fire before any PATCH is sent (branch provably
+/// untouched — resolve like a prepare failure), and
+/// [`CommitError::UpdateRef`] wraps a sent PATCH whose outcome is
+/// unknown.
+pub async fn commit_prepared_promotion(
+    client: &GitDataClient,
+    repo: &RepoRef,
+    branch: &GitBranchName,
+    prepared: PreparedPromotion,
+) -> Result<ExecuteOutcome, CommitError> {
+    match prepared {
+        PreparedPromotion::Noop { tip } => Ok(ExecuteOutcome::Noop { tip }),
+        PreparedPromotion::RefUpdate {
+            new_app_tip,
+            expected_remote_head,
+        } => {
+            let actual = client
+                .get_branch_head(repo, branch)
+                .await
+                .map_err(CommitError::FinalLeaseLookup)?;
+            if actual != expected_remote_head {
+                return Err(CommitError::FinalLeaseMoved {
+                    expected: expected_remote_head,
+                    actual,
+                });
+            }
             client
                 .update_ref(repo, branch, &new_app_tip)
                 .await
-                .map_err(ExecuteError::UpdateRef)?;
+                .map_err(UpdateRefError)?;
             Ok(ExecuteOutcome::Advanced { new_app_tip })
         }
     }
@@ -374,7 +526,7 @@ mod tests {
     use super::*;
     use crate::git_push_replay_walker::test_fixture::InMemoryGitObjectSource;
     use crate::git_push_replay_walker::{ShaMap, StagingCommit, StagingTree};
-    use crate::github_git_db::CommitIdentity;
+    use crate::github_git_db::{CommitIdentity, GitDataTimeouts};
 
     fn sample_repo() -> RepoRef {
         RepoRef::from_str("owner/name").unwrap()
@@ -394,7 +546,52 @@ mod tests {
     }
 
     fn client_against(server: &MockServer, token: &str) -> GitDataClient {
-        GitDataClient::new(reqwest::Client::new(), server.uri(), token.to_string())
+        GitDataClient::new(
+            GitDataTimeouts::production(),
+            server.uri(),
+            token.to_string(),
+        )
+    }
+
+    /// Either half of the pipeline can fail, and the tests below care
+    /// which. Production never needs this union: the broker handles the
+    /// two halves at different points in its audit ceremony, so each
+    /// call site sees exactly one of these error types.
+    #[derive(Debug, thiserror::Error)]
+    enum PromoteError {
+        #[error(transparent)]
+        Prepare(#[from] ExecuteError),
+        #[error(transparent)]
+        Commit(#[from] CommitError),
+    }
+
+    /// Run both halves back to back. Production drives them separately
+    /// (recording the attempt `Uncertain` in between); for tests of the
+    /// GitHub-facing behaviour the seam is irrelevant, so they exercise
+    /// the pipeline end to end through this.
+    #[allow(clippy::too_many_arguments)]
+    async fn execute_fast_forward_plan<S: GitObjectSource>(
+        client: &GitDataClient,
+        repo: &RepoRef,
+        branch: &GitBranchName,
+        expected_remote_head: &GitObjectId,
+        source: &S,
+        plan: FastForwardPlan,
+        trailers: &[TrailerSource],
+        signing_key: Option<&WritSigningKey>,
+    ) -> Result<ExecuteOutcome, PromoteError> {
+        let prepared = prepare_fast_forward_plan(
+            client,
+            repo,
+            branch,
+            expected_remote_head,
+            source,
+            plan,
+            trailers,
+            signing_key,
+        )
+        .await?;
+        Ok(commit_prepared_promotion(client, repo, branch, prepared).await?)
     }
 
     fn ref_response_body(sha: &GitObjectId) -> serde_json::Value {
@@ -535,14 +732,100 @@ mod tests {
         assert_eq!(outcome, ExecuteOutcome::Noop { tip });
     }
 
+    /// The commit half's final lease recheck: the prepare half saw the
+    /// expected head, but by the time `commit_prepared_promotion` runs
+    /// the branch has moved (rewound). The PATCH must not be sent —
+    /// `expect(0)` on the PATCH mock is the assertion — and the error
+    /// must be the provably-pre-PATCH `FinalLeaseMoved` variant.
+    #[tokio::test]
+    async fn commit_refuses_when_branch_moved_between_prepare_and_publish() {
+        let server = MockServer::start().await;
+        let expected = sample_object_id('a');
+        let rewound = sample_object_id('9');
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/name/git/ref/heads/main"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(ref_response_body(&rewound)))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let client = client_against(&server, "ghs_fake_token");
+        let branch = GitBranchName::new("main").unwrap();
+        let err = commit_prepared_promotion(
+            &client,
+            &sample_repo(),
+            &branch,
+            PreparedPromotion::RefUpdate {
+                new_app_tip: sample_object_id('e'),
+                expected_remote_head: expected.clone(),
+            },
+        )
+        .await
+        .expect_err("a moved branch must refuse to publish");
+
+        match err {
+            CommitError::FinalLeaseMoved {
+                expected: e,
+                actual,
+            } => {
+                assert_eq!(e, expected);
+                assert_eq!(actual, rewound);
+            }
+            other => panic!("expected FinalLeaseMoved, got {other:?}"),
+        }
+    }
+
+    /// A failing final lease lookup is equally pre-PATCH: no ref
+    /// update may be issued when the branch position cannot be
+    /// re-verified.
+    #[tokio::test]
+    async fn commit_refuses_when_final_lease_lookup_fails() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/name/git/ref/heads/main"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("wobble"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let client = client_against(&server, "ghs_fake_token");
+        let branch = GitBranchName::new("main").unwrap();
+        let err = commit_prepared_promotion(
+            &client,
+            &sample_repo(),
+            &branch,
+            PreparedPromotion::RefUpdate {
+                new_app_tip: sample_object_id('e'),
+                expected_remote_head: sample_object_id('a'),
+            },
+        )
+        .await
+        .expect_err("an unverifiable branch position must refuse to publish");
+
+        assert!(
+            matches!(err, CommitError::FinalLeaseLookup(_)),
+            "expected FinalLeaseLookup, got {err:?}",
+        );
+    }
+
     /// Replay arm happy path: lease-GET returns expected_remote_head
-    /// twice (pre-walk and post-walk), walker uploads the commit
-    /// chain, update_ref PATCHes the branch to the final App-side
-    /// tip. Asserts the full HTTP shape: both lease GETs, the upload
-    /// count (so a regression that drops a commit shows up), and the
-    /// PATCH body which is the only signal that distinguishes "branch
-    /// updated to the right SHA" from "branch update silently sent
-    /// the wrong SHA".
+    /// three times (pre-walk, post-walk, and commit's final pre-PATCH
+    /// recheck), walker uploads the commit chain, update_ref PATCHes
+    /// the branch to the final App-side tip. Asserts the full HTTP
+    /// shape: the lease GETs, the upload count (so a regression that
+    /// drops a commit shows up), and the PATCH body which is the only
+    /// signal that distinguishes "branch updated to the right SHA"
+    /// from "branch update silently sent the wrong SHA".
     #[tokio::test]
     async fn execute_walks_replay_plan_then_calls_update_ref() {
         let server = MockServer::start().await;
@@ -554,7 +837,7 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/repos/owner/name/git/ref/heads/main"))
             .respond_with(ResponseTemplate::new(200).set_body_json(ref_response_body(&expected)))
-            .expect(2)
+            .expect(3)
             .mount(&server)
             .await;
         Mock::given(method("POST"))
@@ -712,10 +995,10 @@ mod tests {
         .await
         .expect_err("stale lease must be rejected");
         match err {
-            ExecuteError::ExpectedHeadMoved {
+            PromoteError::Prepare(ExecuteError::ExpectedHeadMoved {
                 expected: e,
                 actual: a,
-            } => {
+            }) => {
                 assert_eq!(e, expected);
                 assert_eq!(a, actual);
             }
@@ -784,7 +1067,7 @@ mod tests {
         .await
         .expect_err("lease lookup failure must surface");
         assert!(
-            matches!(err, ExecuteError::LeaseLookup(_)),
+            matches!(err, PromoteError::Prepare(ExecuteError::LeaseLookup(_))),
             "expected LeaseLookup, got {err:?}"
         );
     }
@@ -880,11 +1163,11 @@ mod tests {
         .await
         .expect_err("post-replay lease miss must be rejected");
         match err {
-            ExecuteError::ExpectedHeadMovedAfterReplay {
+            PromoteError::Prepare(ExecuteError::ExpectedHeadMovedAfterReplay {
                 expected: e,
                 actual: a,
                 uploaded_tip,
-            } => {
+            }) => {
                 assert_eq!(e, expected);
                 assert_eq!(a, moved);
                 assert_eq!(uploaded_tip, c1_app);
@@ -976,10 +1259,10 @@ mod tests {
         .await
         .expect_err("post-replay lookup failure must surface");
         match err {
-            ExecuteError::LeaseRecheckFailed {
+            PromoteError::Prepare(ExecuteError::LeaseRecheckFailed {
                 uploaded_tip,
                 source: _,
-            } => {
+            }) => {
                 assert_eq!(uploaded_tip, c1_app);
             }
             other => panic!("expected LeaseRecheckFailed, got {other:?}"),
@@ -1050,7 +1333,7 @@ mod tests {
         .await
         .expect_err("replay must surface walker error");
         assert!(
-            matches!(err, ExecuteError::Replay(_)),
+            matches!(err, PromoteError::Prepare(ExecuteError::Replay(_))),
             "expected Replay, got {err:?}"
         );
     }
@@ -1072,7 +1355,7 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/repos/owner/name/git/ref/heads/main"))
             .respond_with(ResponseTemplate::new(200).set_body_json(ref_response_body(&expected)))
-            .expect(2)
+            .expect(3)
             .mount(&server)
             .await;
         Mock::given(method("POST"))
@@ -1136,10 +1419,12 @@ mod tests {
         .await
         .expect_err("update_ref failure must surface");
         match err {
-            ExecuteError::UpdateRef(GitDataError::ApiError { status, .. }) => {
+            PromoteError::Commit(CommitError::UpdateRef(UpdateRefError(
+                GitDataError::ApiError { status, .. },
+            ))) => {
                 assert_eq!(status.as_u16(), 422);
             }
-            other => panic!("expected UpdateRef ApiError 422, got {other:?}"),
+            other => panic!("expected a commit-half UpdateRef ApiError 422, got {other:?}"),
         }
     }
 
@@ -1167,7 +1452,7 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/repos/owner/name/git/ref/heads/main"))
             .respond_with(ResponseTemplate::new(200).set_body_json(ref_response_body(&expected)))
-            .expect(2)
+            .expect(3)
             .mount(&server)
             .await;
         Mock::given(method("POST"))

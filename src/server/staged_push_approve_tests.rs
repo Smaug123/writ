@@ -233,13 +233,14 @@ async fn approve_staged_push_for_branch_creation_returns_error() {
     assert!(attempts.is_empty());
 }
 
-/// `run_approve` failure that fires before `update_ref` (e.g. the
-/// `git init --bare` in `prepare_staging_repo` because the
-/// configured `git_program` is bogus) must drive the attempt from
-/// `Uncertain` to `Resolved(PrePatchFailure)`. The mint context
-/// recorded by `mark_attempt_uncertain` survives on the resolved
-/// row, and reject becomes legal again because the trigger admits
-/// reject when every attempt is `PrePatchFailure`.
+/// An approve failure that fires before `update_ref` (e.g. the
+/// `git init --bare` in `prepare_staging_repo` because the configured
+/// `git_program` is bogus) must drive the attempt from `Started`
+/// straight to `Resolved(PrePatchFailure)` — never through `Uncertain`,
+/// which is reserved for the PATCH round-trip. The mint context is
+/// captured on the resolved row even so (the credential *was* burned),
+/// and reject becomes legal again because the trigger admits reject
+/// when every attempt is `PrePatchFailure`.
 #[tokio::test]
 async fn approve_staged_push_run_approve_failure_resolves_as_pre_patch_failure() {
     let server = MockServer::start().await;
@@ -292,9 +293,12 @@ async fn approve_staged_push_run_approve_failure_resolves_as_pre_patch_failure()
         other => panic!("expected Error, got {other:?}"),
     }
 
-    // Attempt row reached `Resolved(PrePatchFailure)` with the
-    // mint context the `Uncertain` step recorded (the column-
-    // immutability trigger preserves it across the resolve).
+    // Attempt row reached `Resolved(PrePatchFailure)` carrying the mint
+    // context. It got there from `Started`:
+    // `complete_attempt_pre_patch_failure_capturing_mint` is the only
+    // DAO method that writes mint columns on a resolve, and it refuses
+    // any state other than `Started` — so this row is also proof that
+    // the pipeline never entered `Uncertain`.
     let attempts = state.audit.approve_attempts_for_push(request_id).unwrap();
     assert_eq!(attempts.len(), 1);
     match &attempts[0].state {
@@ -305,11 +309,23 @@ async fn approve_staged_push_run_approve_failure_resolves_as_pre_patch_failure()
         } => {
             assert!(
                 mint.is_some(),
-                "mint context must persist from Uncertain across the resolve",
+                "the burned credential must be recorded on the resolved row",
             );
             assert!(
                 detail.contains("run_approve failed"),
                 "failure detail must name the pipeline step: {detail}",
+            );
+            // The v7 mint ledger was written *before* the prepare phase
+            // started, and it agrees with the resolved row — this is the
+            // durable record that would have survived had the broker
+            // crashed instead of failing cleanly.
+            let recorded = state
+                .audit
+                .attempt_recorded_mint(attempts[0].attempt_id)
+                .unwrap();
+            assert_eq!(
+                recorded, *mint,
+                "mint ledger must agree with the resolved row's mint",
             );
         }
         other => panic!("expected Resolved(PrePatchFailure), got {other:?}"),
@@ -327,6 +343,77 @@ async fn approve_staged_push_run_approve_failure_resolves_as_pre_patch_failure()
             .load(request_id)
             .is_ok()
     );
+}
+
+/// Crash residue must not brick retries. A broker that dies
+/// mid-prepare leaves the per-attempt staging repo on disk (its
+/// cleanup never ran); boot reconcile resolves the *audit* row but is
+/// deliberately filesystem-blind. A fresh approve for the same push
+/// must therefore never collide with the residue — staging dirs are
+/// keyed by attempt id, which is minted fresh per approve — so the
+/// retry proceeds to the real pipeline instead of failing
+/// `StagingDirExists` forever.
+#[tokio::test]
+async fn approve_retry_is_not_blocked_by_crash_leftover_staging_dir() {
+    let server = MockServer::start().await;
+    let (state, tmp) = make_state_with_approve_ready(&server);
+    let session_id = open_session(&state).await;
+    let request_id = stage_with_staged_outcome(
+        &state,
+        session_id,
+        b"bundle".to_vec(),
+        UnixMillis::from_millis(1_700_000_040_000),
+        UnixMillis::from_millis(1_700_000_040_500),
+    )
+    .await;
+
+    // Simulate a prior attempt that died mid-prepare: its staging dir
+    // is still on disk. (Keyed by the *push request id* it would
+    // collide with every retry; keyed by attempt id it never can. The
+    // request-id path is the pre-fix layout — a retry must tolerate
+    // residue at either.)
+    let residue = tmp
+        .path()
+        .join("promote")
+        .join("approve")
+        .join(request_id.to_string());
+    std::fs::create_dir_all(&residue).unwrap();
+
+    let expiry = expiry_str_from_now(3600);
+    Mock::given(method("POST"))
+        .and(path("/app/installations/999/access_tokens"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+            "token": "ghs_test_token",
+            "expires_at": expiry,
+            "permissions": {"contents": "write", "metadata": "read"},
+            "repository_selection": "selected",
+            "repositories": [{"full_name": "owner/repo"}],
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let resp = dispatch_message(
+        ClientMessage::ApproveStagedPush {
+            request_id,
+            operator: "alice".into(),
+        },
+        &state,
+    )
+    .await;
+
+    // The bogus `git_program` makes the pipeline fail at `git init`,
+    // which is fine — what must NOT happen is a refusal because the
+    // residue directory already exists.
+    match resp {
+        ServerMessage::Error { message } => {
+            assert!(
+                !message.contains("already exists"),
+                "crash residue must not block the retry: {message}",
+            );
+        }
+        other => panic!("expected Error from the bogus git binary, got {other:?}"),
+    }
 }
 
 #[test]

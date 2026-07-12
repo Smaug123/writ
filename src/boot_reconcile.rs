@@ -130,6 +130,24 @@ fn recover_started(
     // time outside the recovered band — the row's own `started_at`
     // bounds the lie.
     let completed_at = std::cmp::max(now, entry.started_at);
+    // A `Started` row whose mint ledger row exists died *after* the
+    // credential was issued (typically mid-prepare: fetch, unbundle,
+    // plan, object uploads). GitHub's branch is still provably
+    // unchanged — nothing before the PATCH can move it — but the
+    // credential was burned and may have uploaded unreferenced
+    // objects. The resolve below copies the ledger mint onto the
+    // resolved row on its own (and the schema refuses a resolve that
+    // drops it); the read here is only so the operator's boot log
+    // names the credential.
+    if let Some(mint) = audit.attempt_recorded_mint(entry.attempt_id)? {
+        tracing::warn!(
+            attempt_id = %entry.attempt_id,
+            push_request_id = %entry.push_request_id,
+            jti = %mint.jti,
+            "approve attempt recovered from Started with a burned credential on record; \
+             resolving as PrePatchFailure carrying the recorded mint",
+        );
+    }
     audit.complete_attempt_pre_patch_failure(entry.attempt_id, BROKER_RESTART_DETAIL, completed_at)
 }
 
@@ -291,6 +309,56 @@ mod tests {
             }
             other => panic!("expected Resolved(PrePatchFailure), got {other:?}"),
         }
+    }
+
+    /// The review scenario that motivated the v7 mint ledger: the
+    /// broker mints, records the mint in the ledger, and crashes during
+    /// the prepare phase (fetch/unbundle/plan/uploads) with the attempt
+    /// still `Started`. Boot reconcile must resolve the row *carrying*
+    /// the recorded mint — the credential was really issued and used
+    /// for uploads against GitHub, and its identity must not be lost.
+    #[test]
+    fn started_attempt_with_recorded_mint_recovers_capturing_the_mint() {
+        let (log, session_id) = open_log_with_session();
+        let push_request_id = record_staged_push(&log, session_id);
+        let attempt_id = ApproveAttemptId::new();
+        log.start_approve_attempt(attempt_id, push_request_id, "alice", started_at())
+            .unwrap();
+        let mint = sample_mint();
+        log.record_attempt_mint(attempt_id, mint, mint_issued_at())
+            .unwrap();
+
+        let report = reconcile_pending_approve_attempts(&log, now()).unwrap();
+        assert_eq!(report.recovered_started, vec![attempt_id]);
+
+        let attempts = log.approve_attempts_for_push(push_request_id).unwrap();
+        match &attempts[0].state {
+            GitPushApproveAttemptState::Resolved {
+                outcome,
+                mint: resolved_mint,
+                ..
+            } => {
+                assert_eq!(
+                    *outcome,
+                    GitPushApproveAttemptOutcome::PrePatchFailure {
+                        detail: BROKER_RESTART_DETAIL.into(),
+                    }
+                );
+                assert_eq!(
+                    *resolved_mint,
+                    Some(mint),
+                    "the ledger-recorded mint must be captured on the resolved row",
+                );
+            }
+            other => panic!("expected Resolved(PrePatchFailure), got {other:?}"),
+        }
+        // And the push is retryable / rejectable again, exactly like a
+        // mint-less recovery.
+        assert!(
+            log.reject_blocker_for_push(push_request_id)
+                .unwrap()
+                .is_none(),
+        );
     }
 
     /// After reconcile, reject for the recovered push must be allowed

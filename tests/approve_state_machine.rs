@@ -54,9 +54,22 @@ enum ApproveOutcome {
     /// Pre-mint refusal: walker/plan/prepare declined before any
     /// mint was issued. No mint context recorded on the attempt row.
     MintFailure,
-    /// Post-mint, pre-PATCH refusal: mint succeeded but the broker
-    /// refused to issue `update_ref`. Mint context captured.
+    /// Minted (ledger row recorded) then left in place — the broker
+    /// crashed during the prepare phase (fetch/unbundle/plan/uploads)
+    /// after the v7 mint-ledger write. Boot reconcile must drive this
+    /// to `Resolved(PrePatchFailure)` *carrying the recorded mint*
+    /// (invariant 9): the credential was really issued and its
+    /// identity must survive the crash.
+    MintedOrphan,
+    /// Post-mint, pre-PATCH refusal: mint succeeded (and was recorded
+    /// in the ledger) but the broker refused to issue `update_ref`.
+    /// Mint context captured on the resolved row.
     PostMintPrePatchFailure,
+    /// Same refusal, but resolved through the *plain* (non-capturing)
+    /// DAO method. The DAO must copy the ledger mint onto the resolved
+    /// row on its own — the review scenario for invariant 9's "every
+    /// resolve path", not just the capturing one.
+    PostMintPlainPrePatchFailure,
     /// Marked `Uncertain` then left in place — the broker crashed
     /// between TX2 and TX3. Reconcile must NOT advance this row.
     UncertainOrphan,
@@ -116,7 +129,9 @@ fn arb_outcome() -> impl Strategy<Value = ApproveOutcome> {
     prop_oneof![
         Just(ApproveOutcome::StartedOrphan),
         Just(ApproveOutcome::MintFailure),
+        Just(ApproveOutcome::MintedOrphan),
         Just(ApproveOutcome::PostMintPrePatchFailure),
+        Just(ApproveOutcome::PostMintPlainPrePatchFailure),
         Just(ApproveOutcome::UncertainOrphan),
         Just(ApproveOutcome::UncertainSucceeded),
         Just(ApproveOutcome::UncertainPostPatchFailure),
@@ -215,6 +230,18 @@ impl Scenario {
         }
     }
 
+    /// Mint a fresh credential and write its v7 ledger row, mirroring
+    /// the production ordering (`record_attempt_mint` runs before any
+    /// prepare work, and every later write uses the same mint).
+    fn record_mint(&mut self, attempt_id: ApproveAttemptId) -> PromoteMintAudit {
+        let mint = self.fresh_mint();
+        let recorded_at = self.next_ts();
+        self.audit
+            .record_attempt_mint(attempt_id, mint, recorded_at)
+            .unwrap();
+        mint
+    }
+
     fn stage(&mut self, slot: usize) {
         if self.pushes[slot].is_some() {
             return;
@@ -274,8 +301,14 @@ impl Scenario {
                     .complete_attempt_pre_patch_failure(attempt_id, "mint denied", now)
                     .unwrap();
             }
+            ApproveOutcome::MintedOrphan => {
+                // Ledger row only — the broker died in the prepare
+                // phase before any further audit write. The next
+                // `Crash` (boot reconcile) is what advances the row.
+                self.record_mint(attempt_id);
+            }
             ApproveOutcome::PostMintPrePatchFailure => {
-                let mint = self.fresh_mint();
+                let mint = self.record_mint(attempt_id);
                 let now = self.next_ts();
                 self.audit
                     .complete_attempt_pre_patch_failure_capturing_mint(
@@ -286,12 +319,19 @@ impl Scenario {
                     )
                     .unwrap();
             }
+            ApproveOutcome::PostMintPlainPrePatchFailure => {
+                self.record_mint(attempt_id);
+                let now = self.next_ts();
+                self.audit
+                    .complete_attempt_pre_patch_failure(attempt_id, "walker refused", now)
+                    .unwrap();
+            }
             ApproveOutcome::UncertainOrphan => {
-                let mint = self.fresh_mint();
+                let mint = self.record_mint(attempt_id);
                 self.audit.mark_attempt_uncertain(attempt_id, mint).unwrap();
             }
             ApproveOutcome::UncertainSucceeded => {
-                let mint = self.fresh_mint();
+                let mint = self.record_mint(attempt_id);
                 self.audit.mark_attempt_uncertain(attempt_id, mint).unwrap();
                 let now = self.next_ts();
                 self.audit
@@ -305,7 +345,7 @@ impl Scenario {
                     .unwrap();
             }
             ApproveOutcome::UncertainPostPatchFailure => {
-                let mint = self.fresh_mint();
+                let mint = self.record_mint(attempt_id);
                 self.audit.mark_attempt_uncertain(attempt_id, mint).unwrap();
                 let now = self.next_ts();
                 self.audit
@@ -548,6 +588,40 @@ impl Scenario {
                             "invariant 4: Started attempt {} survived crash for push {}",
                             a.attempt_id, push_id
                         ));
+                    }
+                }
+            }
+
+            // Invariant 9 (v7 mint ledger): once a mint is recorded in
+            // the ledger, every later state of that attempt carries
+            // exactly that mint — `Uncertain` inline, `Resolved` in its
+            // mint column. In particular, boot reconcile recovering a
+            // minted `Started` orphan must not drop the credential's
+            // identity (the loss this ledger exists to prevent).
+            for a in &attempts {
+                let recorded = self
+                    .audit
+                    .attempt_recorded_mint(a.attempt_id)
+                    .map_err(|e| e.to_string())?;
+                let Some(recorded) = recorded else { continue };
+                match &a.state {
+                    GitPushApproveAttemptState::Started => {}
+                    GitPushApproveAttemptState::Uncertain { mint } => {
+                        if *mint != recorded {
+                            return Err(format!(
+                                "invariant 9: Uncertain attempt {} mint diverges from ledger",
+                                a.attempt_id,
+                            ));
+                        }
+                    }
+                    GitPushApproveAttemptState::Resolved { mint, .. } => {
+                        if *mint != Some(recorded) {
+                            return Err(format!(
+                                "invariant 9: Resolved attempt {} lost or replaced its \
+                                 ledger-recorded mint (got {mint:?})",
+                                a.attempt_id,
+                            ));
+                        }
                     }
                 }
             }
