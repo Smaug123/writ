@@ -1688,6 +1688,66 @@ mod tests {
         let _ = prepared.commit(&someone_elses).await;
     }
 
+    /// Stage-3 oracle for the crash harness's fake origin: the *real*
+    /// `prepare_staging_repo` — mkdir, bundle write, `git init`, an
+    /// actual `git fetch` over the origin's dumb-HTTP server, and
+    /// `git bundle unbundle` — succeeds end to end, leaving both the
+    /// prerequisite (via the network fetch) and the bundle tip (via
+    /// the unbundle) in the staging repo. This is also the first test
+    /// to exercise a *successful* prepare fetch at all; everything
+    /// prior stubbed git or stopped short of the network.
+    #[tokio::test]
+    async fn prepare_staging_repo_fetches_prereq_from_fake_origin() {
+        use crate::fake_origin::FakeOrigin;
+        let Some(origin) = FakeOrigin::start().await else {
+            eprintln!("skipping: `git` not on PATH");
+            return;
+        };
+        let git = maybe_git().expect("FakeOrigin::start returned Some, so git exists");
+        let work_root = tempfile::tempdir().unwrap();
+        let runtime = PromoteRuntimeConfig::new(
+            git.clone(),
+            origin.clone_base_url(),
+            GitCredentialBoundary::new(
+                PathBuf::from("/usr/local/bin/fake-askpass"),
+                GitSecretEnvVar::new("WRIT_GIT_TOKEN").unwrap(),
+            )
+            .unwrap(),
+            work_root.path().to_path_buf(),
+            Duration::from_secs(30),
+        )
+        .unwrap();
+
+        let staging = prepare_staging_repo(
+            &runtime,
+            ApproveAttemptId::new(),
+            origin.prereq(),
+            &sample_repo(),
+            &sample_token(),
+            origin.bundle_bytes(),
+        )
+        .await
+        .expect("prepare must fetch the prereq over dumb HTTP and unbundle the tip");
+
+        for (what, sha) in [("prereq", origin.prereq()), ("bundle tip", origin.tip())] {
+            let exists = Command::new(&git)
+                .arg("-C")
+                .arg(staging.path())
+                .args(["cat-file", "-e", sha.as_str()])
+                .env_clear()
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("HOME", "/dev/null")
+                .status()
+                .expect("spawning git cat-file failed");
+            assert!(
+                exists.success(),
+                "{what} {sha} must be present in the staging repo",
+                sha = sha.as_str(),
+            );
+        }
+    }
+
     // ---------- prepare-side real-git regression tests ----------
 
     /// Regression test for the `git bundle unbundle --quiet` mistake:
