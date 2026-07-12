@@ -165,9 +165,17 @@ staged for push.
      `Resolved(PrePatchFailure)` carrying exactly that mint.
    - **I-B (pre-PATCH truth).** If the model's request log shows no
      PATCH from the crashed attempt: the model's branch ref is
-     untouched, `reject_blocker_for_push` is `None`, and a fresh
-     approve is not refused for any unmodeled reason (in particular,
-     never `StagingDirExists`).
+     untouched, and the push is recoverable *without publishing*.
+     The broker's own knowledge is deliberately weaker than the
+     model's ground truth here: a crash between the `Uncertain` TX
+     and the PATCH leaves an `Uncertain` row the broker cannot
+     distinguish from a sent PATCH, so `reject_blocker_for_push` is
+     `None` iff the crashed attempt never reached `Uncertain`; an
+     `Uncertain` survivor is quarantined until the operator
+     reconciles it `NotApplied` (the verdict the model's unmoved ref
+     dictates), after which retry and reject both proceed. In no
+     case is recovery refused for an unmodeled reason (in
+     particular, never `StagingDirExists`).
    - **I-C (post-PATCH honesty).** If a PATCH was received: the
      attempt is `Uncertain` (now boot-observed) or terminal with
      mint recorded; reject is refused; `classify_reconciliation_target`
