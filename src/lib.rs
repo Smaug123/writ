@@ -37,6 +37,8 @@ pub mod config;
 pub use writ_core::core;
 #[cfg(feature = "host")]
 pub(crate) mod crash_point;
+#[cfg(all(test, feature = "host"))]
+pub(crate) mod fake_github;
 #[cfg(feature = "host")]
 pub mod flake_lock;
 #[cfg(feature = "host")]
