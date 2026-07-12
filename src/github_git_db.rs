@@ -90,6 +90,36 @@ pub enum GitDataError {
         ref_name: String,
         object_type: String,
     },
+    /// A [`CommitRequest`] carried a `signature`, GitHub created the
+    /// commit, and then reported `verification.verified = false`.
+    ///
+    /// Supplying a signature *is* the claim that the published commit
+    /// will carry the Verified badge — that is the guarantee the whole
+    /// replay path exists to provide. GitHub is the only authority on
+    /// whether the signature actually verifies against the commit it
+    /// assembled, so a `false` verdict means the guarantee is broken
+    /// and the SHA must not travel on to branch publication. Returning
+    /// it as an error strands the commit as an unreferenced object in
+    /// the repo instead (harmless; GitHub garbage-collects it).
+    #[error(
+        "GitHub created signed commit {sha} but reported it as unverified (reason: {reason}); \
+         refusing to publish an unverified commit"
+    )]
+    UnverifiedSignedCommit { sha: String, reason: String },
+    /// A [`CommitRequest`] carried a `signature` and GitHub's response
+    /// omitted the `verification` object entirely.
+    ///
+    /// Distinct from [`GitDataError::UnverifiedSignedCommit`] only in
+    /// diagnosis — an absent verdict is not an affirmative one, so the
+    /// Verified guarantee is equally unconfirmable and we equally
+    /// refuse to publish. In practice this means talking to something
+    /// that is not the GitHub API (a stale GHES, a proxy rewriting
+    /// bodies), which is worth naming distinctly.
+    #[error(
+        "GitHub's response for signed commit {sha} carried no `verification` object, so the \
+         Verified guarantee cannot be confirmed; refusing to publish"
+    )]
+    MissingVerification { sha: String },
 }
 
 impl GitDataClient {
@@ -232,6 +262,22 @@ impl GitDataClient {
     /// `message` is forwarded verbatim — the replay layer is
     /// responsible for appending its provenance trailer before this
     /// is called.
+    ///
+    /// **When `signature` is `Some`, a returned SHA is a commit GitHub
+    /// affirmed as Verified.** GitHub re-canonicalises the wire fields
+    /// and checks the signature against the commit object it actually
+    /// assembled, then reports the outcome in the response's
+    /// `verification` block; a 2xx alone says only "commit created",
+    /// not "signature verified". This method therefore reads that
+    /// verdict back and refuses to hand out the SHA unless it is
+    /// affirmative — see [`GitDataError::UnverifiedSignedCommit`] and
+    /// [`GitDataError::MissingVerification`]. Callers can rely on the
+    /// stronger statement, which is what lets the replay walker's
+    /// output go straight to branch publication.
+    ///
+    /// When `signature` is `None` no such claim was made, so whatever
+    /// verdict GitHub returns (`verified: false, reason: "unsigned"`)
+    /// is expected and ignored.
     pub async fn create_commit(
         &self,
         repo: &RepoRef,
@@ -267,6 +313,25 @@ impl GitDataClient {
             return Err(GitDataError::ApiError { status, body });
         }
         let parsed: CommitCreateResponse = response.json().await?;
+        if request.signature.is_some() {
+            match parsed.verification {
+                Some(CommitVerification { verified: true, .. }) => {}
+                Some(CommitVerification {
+                    verified: false,
+                    reason,
+                }) => {
+                    return Err(GitDataError::UnverifiedSignedCommit {
+                        sha: parsed.sha.as_str().to_string(),
+                        reason: reason.unwrap_or_else(|| "<no reason given>".to_string()),
+                    });
+                }
+                None => {
+                    return Err(GitDataError::MissingVerification {
+                        sha: parsed.sha.as_str().to_string(),
+                    });
+                }
+            }
+        }
         Ok(parsed.sha)
     }
 
@@ -652,9 +717,30 @@ struct CommitIdentityWire<'a> {
     date: &'a str,
 }
 
+/// `POST /repos/{o}/{r}/git/commits` response. `verification` is
+/// GitHub's verdict on the `signature` we sent: the API creates the
+/// commit either way and reports the outcome here, so a 2xx status
+/// alone does not mean the signature verified.
+///
+/// The field is `Option` because a response that omits it is a
+/// distinguishable failure mode we want to report as such, not a
+/// deserialisation error — see [`GitDataError::MissingVerification`].
 #[derive(serde::Deserialize)]
 struct CommitCreateResponse {
     sha: GitObjectId,
+    #[serde(default)]
+    verification: Option<CommitVerification>,
+}
+
+/// The subset of GitHub's `verification` block we act on. `reason` is
+/// the machine-readable string (`valid`, `unsigned`, `unknown_key`,
+/// `bad_email`, …) that tells an operator *why* a signature failed to
+/// verify; it is `Option` because only `verified` is load-bearing.
+#[derive(serde::Deserialize)]
+struct CommitVerification {
+    verified: bool,
+    #[serde(default)]
+    reason: Option<String>,
 }
 
 /// `PATCH /repos/{owner}/{repo}/git/refs/heads/{branch}` body. The
@@ -1365,6 +1451,10 @@ mod tests {
             })))
             .respond_with(ResponseTemplate::new(201).set_body_json(json!({
                 "sha": returned.as_str(),
+                // GitHub reports its verdict on the signature we sent;
+                // a signed create-commit only yields a SHA when that
+                // verdict is affirmative, so the mock must carry it.
+                "verification": { "verified": true, "reason": "valid" },
             })))
             .expect(1)
             .mount(&server)
@@ -1384,6 +1474,227 @@ mod tests {
             .await
             .expect("signed commit create ok");
         assert_eq!(got, returned);
+    }
+
+    /// A signed create-commit whose response says GitHub could not
+    /// verify the signature must fail. The whole point of supplying a
+    /// signature is that the published commit carries the Verified
+    /// badge; if GitHub disagrees, the SHA must not escape this
+    /// function and reach branch publication.
+    #[tokio::test]
+    async fn create_commit_rejects_signed_commit_github_reports_unverified() {
+        use time::macros::datetime;
+        let server = MockServer::start().await;
+        let returned = sample_object_id('b');
+        Mock::given(method("POST"))
+            .and(path("/repos/owner/name/git/commits"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+                "sha": returned.as_str(),
+                "verification": {
+                    "verified": false,
+                    "reason": "unknown_key",
+                    "signature": "-----BEGIN SSH SIGNATURE-----\n…\n",
+                    "payload": "tree …",
+                },
+            })))
+            .mount(&server)
+            .await;
+
+        let ident = sample_identity("Alice", datetime!(2024-01-15 10:30:45 UTC));
+        let tree = sample_object_id('a');
+        let request = CommitRequest {
+            tree: &tree,
+            parents: &[],
+            message: "msg",
+            author: &ident,
+            committer: &ident,
+            signature: Some("-----BEGIN SSH SIGNATURE-----\nx\n-----END SSH SIGNATURE-----\n"),
+        };
+        let client = client_against(&server, "ghs_fake_token");
+        let err = client
+            .create_commit(&sample_repo(), &request)
+            .await
+            .expect_err("an unverified signed commit must not be returned as a success");
+        match err {
+            GitDataError::UnverifiedSignedCommit { sha, reason } => {
+                assert_eq!(sha, returned.as_str());
+                assert_eq!(reason, "unknown_key");
+            }
+            other => panic!("expected UnverifiedSignedCommit, got {other:?}"),
+        }
+    }
+
+    /// GitHub omitting the `verification` object entirely from a
+    /// signed commit's response is just as unusable as a `false`
+    /// verdict: we cannot confirm the Verified guarantee, so we refuse
+    /// rather than publish and hope.
+    #[tokio::test]
+    async fn create_commit_rejects_signed_commit_with_no_verification_object() {
+        use time::macros::datetime;
+        let server = MockServer::start().await;
+        let returned = sample_object_id('b');
+        Mock::given(method("POST"))
+            .and(path("/repos/owner/name/git/commits"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+                "sha": returned.as_str(),
+            })))
+            .mount(&server)
+            .await;
+
+        let ident = sample_identity("Alice", datetime!(2024-01-15 10:30:45 UTC));
+        let tree = sample_object_id('a');
+        let request = CommitRequest {
+            tree: &tree,
+            parents: &[],
+            message: "msg",
+            author: &ident,
+            committer: &ident,
+            signature: Some("-----BEGIN SSH SIGNATURE-----\nx\n-----END SSH SIGNATURE-----\n"),
+        };
+        let client = client_against(&server, "ghs_fake_token");
+        let err = client
+            .create_commit(&sample_repo(), &request)
+            .await
+            .expect_err("a signed commit with no verification verdict must not succeed");
+        assert!(
+            matches!(err, GitDataError::MissingVerification { ref sha } if sha == returned.as_str()),
+            "expected MissingVerification, got {err:?}",
+        );
+    }
+
+    /// The happy path: signature supplied, GitHub reports
+    /// `verified: true`, the SHA flows back to the walker.
+    #[tokio::test]
+    async fn create_commit_accepts_signed_commit_github_reports_verified() {
+        use time::macros::datetime;
+        let server = MockServer::start().await;
+        let returned = sample_object_id('b');
+        Mock::given(method("POST"))
+            .and(path("/repos/owner/name/git/commits"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+                "sha": returned.as_str(),
+                "verification": {
+                    "verified": true,
+                    "reason": "valid",
+                },
+            })))
+            .mount(&server)
+            .await;
+
+        let ident = sample_identity("Alice", datetime!(2024-01-15 10:30:45 UTC));
+        let tree = sample_object_id('a');
+        let request = CommitRequest {
+            tree: &tree,
+            parents: &[],
+            message: "msg",
+            author: &ident,
+            committer: &ident,
+            signature: Some("-----BEGIN SSH SIGNATURE-----\nx\n-----END SSH SIGNATURE-----\n"),
+        };
+        let client = client_against(&server, "ghs_fake_token");
+        let got = client
+            .create_commit(&sample_repo(), &request)
+            .await
+            .expect("verified signed commit is the happy path");
+        assert_eq!(got, returned);
+    }
+
+    /// An *unsigned* create-commit never promised a Verified badge, so
+    /// the (inevitably `verified: false`) verdict is not an error. The
+    /// pre-promote bring-up flows and test fixtures depend on this.
+    #[tokio::test]
+    async fn create_commit_tolerates_unverified_verdict_when_request_is_unsigned() {
+        use time::macros::datetime;
+        let server = MockServer::start().await;
+        let returned = sample_object_id('b');
+        Mock::given(method("POST"))
+            .and(path("/repos/owner/name/git/commits"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+                "sha": returned.as_str(),
+                "verification": {
+                    "verified": false,
+                    "reason": "unsigned",
+                },
+            })))
+            .mount(&server)
+            .await;
+
+        let ident = sample_identity("Alice", datetime!(2024-01-15 10:30:45 UTC));
+        let tree = sample_object_id('a');
+        let client = client_against(&server, "ghs_fake_token");
+        let got = client
+            .create_commit(
+                &sample_repo(),
+                &unsigned_request(&tree, &[], "msg", &ident, &ident),
+            )
+            .await
+            .expect("an unsigned request makes no Verified claim to break");
+        assert_eq!(got, returned);
+    }
+
+    proptest::proptest! {
+        // Each case stands up a wiremock server, so keep the case
+        // count modest; the input space here is tiny (2 × 3 shapes)
+        // and this many cases covers it many times over.
+        #![proptest_config(proptest::test_runner::Config::with_cases(24))]
+
+        /// The invariant the replay path leans on: `create_commit`
+        /// returns a SHA **exactly** when either the request carried no
+        /// signature (no Verified claim was made) or GitHub affirmed
+        /// `verification.verified == true`. Every other combination —
+        /// signed-and-refuted, signed-and-no-verdict — must be an error,
+        /// whatever `reason` string GitHub attaches.
+        #[test]
+        fn signed_create_commit_succeeds_exactly_when_github_reports_verified(
+            signed in proptest::bool::ANY,
+            verification in proptest::option::of((proptest::bool::ANY, "[a-z_]{1,16}")),
+        ) {
+            use time::macros::datetime;
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let server = MockServer::start().await;
+                let returned = sample_object_id('b');
+                let mut body = json!({ "sha": returned.as_str() });
+                if let Some((verified, reason)) = &verification {
+                    body["verification"] = json!({ "verified": verified, "reason": reason });
+                }
+                Mock::given(method("POST"))
+                    .and(path("/repos/owner/name/git/commits"))
+                    .respond_with(ResponseTemplate::new(201).set_body_json(body))
+                    .mount(&server)
+                    .await;
+
+                let ident = sample_identity("Alice", datetime!(2024-01-15 10:30:45 UTC));
+                let tree = sample_object_id('a');
+                let request = CommitRequest {
+                    tree: &tree,
+                    parents: &[],
+                    message: "msg",
+                    author: &ident,
+                    committer: &ident,
+                    signature: signed.then_some(
+                        "-----BEGIN SSH SIGNATURE-----\nx\n-----END SSH SIGNATURE-----\n",
+                    ),
+                };
+                let client = client_against(&server, "ghs_fake_token");
+                let result = client.create_commit(&sample_repo(), &request).await;
+
+                let should_succeed =
+                    !signed || matches!(verification, Some((true, _)));
+                proptest::prop_assert_eq!(
+                    result.is_ok(),
+                    should_succeed,
+                    "signed={:?} verification={:?} gave {:?}",
+                    signed,
+                    verification,
+                    result.map(|sha| sha.as_str().to_string()),
+                );
+                Ok(())
+            })?;
+        }
     }
 
     #[test]

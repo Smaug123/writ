@@ -1182,6 +1182,11 @@ mod tests {
             .and(path("/repos/owner/name/git/commits"))
             .respond_with(ResponseTemplate::new(201).set_body_json(json!({
                 "sha": c1_app.as_str(),
+                // This test drives the signing path, so a faithful
+                // GitHub response carries the affirmative verification
+                // verdict `create_commit` now requires before it will
+                // hand the SHA on to publication.
+                "verification": { "verified": true, "reason": "valid" },
             })))
             .expect(1)
             .mount(&server)
@@ -1262,5 +1267,93 @@ mod tests {
             ssh_key::PublicKey::from_openssh(PUBLIC_OPENSSH).expect("fixture public key parses");
         pubk.verify(GIT_SSHSIG_NAMESPACE, &canonical, &parsed)
             .expect("execute forwarded the signing key — signature verifies");
+    }
+
+    /// The end-to-end guarantee: when GitHub declines to verify a
+    /// signature we sent, the branch is **not** published. The `.expect(0)`
+    /// on the PATCH mock is the load-bearing assertion — before the fix
+    /// this path swallowed the verdict, fast-forwarded `refs/heads/main`
+    /// onto an unverified commit, and recorded the push as a success.
+    #[tokio::test]
+    async fn execute_refuses_to_publish_branch_when_github_reports_commit_unverified() {
+        use crate::signing::WritSigningKey;
+
+        const PRIVATE_PEM: &str = include_str!("../tests/fixtures/ed25519_test_signing.key");
+
+        let server = MockServer::start().await;
+        let expected = sample_object_id('a');
+        let empty_tree_app = sample_object_id('d');
+        let c1_app = sample_object_id('e');
+
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/name/git/ref/heads/main"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(ref_response_body(&expected)))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/repos/owner/name/git/trees"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+                "sha": empty_tree_app.as_str(),
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        // GitHub created the commit — 201 — but refused the signature.
+        Mock::given(method("POST"))
+            .and(path("/repos/owner/name/git/commits"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+                "sha": c1_app.as_str(),
+                "verification": { "verified": false, "reason": "unknown_key" },
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path("/repos/owner/name/git/refs/heads/main"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(ref_response_body(&c1_app)))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let c1 = sample_object_id('b');
+        let empty_tree_bundle = sample_object_id('1');
+        let mut source = InMemoryGitObjectSource::new();
+        source.insert_tree(empty_tree_bundle.clone(), StagingTree { entries: vec![] });
+        source.insert_commit(
+            c1.clone(),
+            StagingCommit {
+                tree: empty_tree_bundle,
+                parents: vec![expected.clone()],
+                author: sample_identity("Alice"),
+                committer: sample_identity("Bot"),
+                message: "signed commit\n".to_string(),
+            },
+        );
+        let mut seed = ShaMap::new();
+        seed.seed_commit_identity(expected.clone());
+
+        let key =
+            WritSigningKey::from_openssh_pem(PRIVATE_PEM).expect("fixture private key parses");
+        let client = client_against(&server, "ghs_fake_token");
+        let branch = GitBranchName::new("main").unwrap();
+        let err = execute_fast_forward_plan(
+            &client,
+            &sample_repo(),
+            &branch,
+            &expected,
+            &source,
+            FastForwardPlan::Replay {
+                commits: vec![c1.clone()],
+                seed,
+            },
+            &[],
+            Some(&key),
+        )
+        .await
+        .expect_err("an unverified commit must abort the promote, not publish");
+        assert!(
+            format!("{err:?}").contains("UnverifiedSignedCommit"),
+            "the failure must name the unverified commit so an operator can act on it: {err:?}",
+        );
     }
 }
