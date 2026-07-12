@@ -43,10 +43,7 @@
 /// `name` is diagnostic only (it appears in counting-mode listings and
 /// crash reports); indices, not names, drive the sweep, so renaming a
 /// point is free.
-// dead_code: the production call sites arrive with the instrumentation
-// stage of the harness plan; this allow goes with them.
 #[cfg(not(test))]
-#[allow(dead_code)]
 #[inline(always)]
 pub(crate) async fn point(_name: &'static str) {}
 

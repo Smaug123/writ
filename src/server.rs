@@ -832,6 +832,7 @@ async fn approve_staged_push<S: SecretStore + Send + Sync + 'static>(
         Ok(attempt_id) => attempt_id,
         Err(resp) => return resp,
     };
+    crate::crash_point::point("approve::attempt_started").await;
 
     let new_app_tip = match execute_started_attempt(
         state,
@@ -1059,6 +1060,7 @@ async fn execute_started_attempt<S: SecretStore + Send + Sync + 'static>(
     };
 
     let (api_base, raw_token, mint_audit) = minted.into_promote_pieces();
+    crate::crash_point::point("approve::minted").await;
 
     // Persist the burned credential's identity *before* anything else
     // uses it. The prepare phase below is long, network-bound, and runs
@@ -1078,7 +1080,9 @@ async fn execute_started_attempt<S: SecretStore + Send + Sync + 'static>(
         .await
     };
     match mint_record_result {
-        Ok(Ok(())) => {}
+        Ok(Ok(())) => {
+            crate::crash_point::point("approve::mint_recorded").await;
+        }
         Ok(Err(err)) => {
             // The ledger INSERT was refused, so the row is still
             // `Started` with no mint anywhere: capture it on the
@@ -1155,7 +1159,10 @@ async fn execute_started_attempt<S: SecretStore + Send + Sync + 'static>(
     .await;
 
     let prepared = match prepare_result {
-        Ok(prepared) => prepared,
+        Ok(prepared) => {
+            crate::crash_point::point("approve::prepared").await;
+            prepared
+        }
         Err(err) => {
             // Every `RunApproveError` is pre-PATCH by construction —
             // the type cannot express a PATCH failure, which is why the
@@ -1198,7 +1205,10 @@ async fn execute_started_attempt<S: SecretStore + Send + Sync + 'static>(
             .await
     };
     let authority = match uncertain_result {
-        Ok(Ok(authority)) => authority,
+        Ok(Ok(authority)) => {
+            crate::crash_point::point("approve::uncertain_recorded").await;
+            authority
+        }
         Ok(Err(err)) => {
             // The attempt row is still `Started` (the UPDATE was
             // refused) so a `pre_patch_failure` capturing the mint is
@@ -1230,7 +1240,10 @@ async fn execute_started_attempt<S: SecretStore + Send + Sync + 'static>(
     // whole classification — there is no cause-string inspection to
     // get wrong.
     let outcome = match prepared.commit(&authority).await {
-        Ok(outcome) => outcome,
+        Ok(outcome) => {
+            crate::crash_point::point("approve::patched").await;
+            outcome
+        }
         Err(err @ (CommitError::FinalLeaseLookup(_) | CommitError::FinalLeaseMoved { .. })) => {
             // `FinalLeaseLookup` can wrap unbounded GitHub/GHES body
             // bytes, same as the prepare-phase errors; cap both copies.
@@ -1291,7 +1304,9 @@ async fn execute_started_attempt<S: SecretStore + Send + Sync + 'static>(
         .await
     };
     match success_result {
-        Ok(Ok(())) => {}
+        Ok(Ok(())) => {
+            crate::crash_point::point("approve::resolved").await;
+        }
         Ok(Err(err)) => {
             // The branch on GitHub now points at `new_app_tip` but the
             // audit log could not commit the joint TX. The attempt is
@@ -3052,6 +3067,8 @@ pub async fn serve_broker_with_agent_vm<S: SecretStore + Send + Sync + 'static>(
     }
 }
 
+#[cfg(test)]
+mod approve_crash_tests;
 #[cfg(test)]
 mod capability_tests;
 #[cfg(test)]

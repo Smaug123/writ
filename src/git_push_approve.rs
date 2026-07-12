@@ -379,6 +379,10 @@ pub async fn prepare_approve_with_staging_repo(
         Some(signing_key),
     )
     .await;
+    // Unconditional: on the error paths the walker may still have
+    // uploaded objects before failing, and GitHub-side durable state
+    // is exactly what a crash boundary marks.
+    crate::crash_point::point("prepare::objects_uploaded").await;
 
     // `close()` reaps the `git cat-file --batch` child even on error
     // paths above; ignore its result because it only signals stderr
@@ -488,6 +492,7 @@ pub async fn prepare_staging_repo(
                 source,
             },
         })?;
+    crate::crash_point::point("prepare::staging_dir_created").await;
 
     // Past this point we own `staging_dir` on disk; any failure must
     // clean it up so the next retry can re-mkdir without tripping the
@@ -532,21 +537,25 @@ async fn run_prepare_steps(
             path: bundle_path.clone(),
             source,
         })?;
+    crate::crash_point::point("prepare::bundle_written").await;
 
     let init = build_init_bare_invocation(runtime, staging_dir);
     clean_git::run_clean_git(&init, runtime.step_timeout(), None)
         .await
         .map_err(|e| PrepareStagingError::GitInit(e.to_string()))?;
+    crate::crash_point::point("prepare::repo_initialised").await;
 
     let fetch = build_fetch_prereq_invocation(runtime, staging_dir, repo, expected_remote_head);
     clean_git::run_clean_git(&fetch, runtime.step_timeout(), Some(token.as_str()))
         .await
         .map_err(|e| PrepareStagingError::GitFetch(e.to_string()))?;
+    crate::crash_point::point("prepare::prereq_fetched").await;
 
     let unbundle = build_unbundle_invocation(runtime, staging_dir, &bundle_path);
     clean_git::run_clean_git(&unbundle, runtime.step_timeout(), None)
         .await
         .map_err(|e| PrepareStagingError::GitUnbundle(e.to_string()))?;
+    crate::crash_point::point("prepare::unbundled").await;
 
     Ok(())
 }
