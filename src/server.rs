@@ -1146,7 +1146,6 @@ async fn execute_started_attempt<S: SecretStore + Send + Sync + 'static>(
         // slice is identical in shape to what the prepare_approve unit
         // tests pass.
         &[],
-        request_id,
         attempt_id,
     )
     .await;

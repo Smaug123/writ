@@ -44,16 +44,17 @@ use crate::vm_git::{GitBranchName, GitBranchNameError, GitObjectId};
 ///
 /// * `connect` — TCP/TLS handshake only. Tight, so a black-holed route
 ///   fails fast instead of eating the whole request budget.
-/// * `small_call` — wall-clock ceiling for every metadata request
-///   (tree/commit creates, ref GET/PATCH, repo lookup). Their request
-///   and response bodies are both small, so elapsed time above this is
-///   a degraded server or a failed network, never a legitimate slow
-///   transfer.
-/// * `total` — wall-clock ceiling on any request, and the *only*
-///   time bound the blob upload runs under besides `connect`. A single
-///   blob create can carry the staging repo's per-object ceiling
-///   (256 MiB, ~342 MiB base64-expanded), which legitimately takes
-///   minutes on a slow uplink.
+/// * `small_call` — wall-clock ceiling for the fixed-size control
+///   calls (ref GET, repo-metadata GET, ref PATCH). Their request and
+///   response bodies are a few hundred bytes by construction, so
+///   elapsed time above this is a degraded server or a failed network,
+///   never a legitimate slow transfer.
+/// * `total` — wall-clock ceiling on any request, and the *only* time
+///   bound the object uploads (blob, tree and commit creates) run
+///   under besides `connect`. Their bodies scale with repo content —
+///   a blob or a commit message up to the staging repo's 256 MiB
+///   per-object ceiling, a tree with one wire entry per row — which
+///   legitimately takes minutes on a slow uplink.
 ///
 /// A per-phase "idle gap" bound would be strictly nicer for the upload
 /// (fail on silence in 30 s instead of on the 300 s ceiling), but
@@ -142,9 +143,10 @@ const USER_AGENT_HEADER: &str = "writ/0.1";
 /// nowhere else.
 pub struct GitDataClient {
     http: reqwest::Client,
-    /// Per-request override applied to every metadata call (see
-    /// [`GitDataTimeouts`]); `create_blob` deliberately runs without
-    /// it, under the client-level `total` ceiling only.
+    /// Per-request override applied to the fixed-size control calls
+    /// (see [`GitDataTimeouts`]); the object uploads (`create_blob`,
+    /// `create_tree`, `create_commit`) deliberately run without it,
+    /// under the client-level `total` ceiling only.
     small_call: Duration,
     api_base: String,
     token: String,
@@ -336,7 +338,10 @@ impl GitDataClient {
         let response = self
             .http
             .post(&url)
-            .timeout(self.small_call)
+            // No `small_call` override: like `create_blob`, this is an
+            // object upload whose body scales with repo content (one
+            // wire entry per tree row), so it runs under the
+            // client-level `total` ceiling.
             .bearer_auth(&self.token)
             .header("Accept", ACCEPT_HEADER)
             .header("X-GitHub-Api-Version", API_VERSION_HEADER)
@@ -413,7 +418,11 @@ impl GitDataClient {
         let response = self
             .http
             .post(&url)
-            .timeout(self.small_call)
+            // No `small_call` override: a commit object's body is
+            // dominated by its message, which the staging repo admits
+            // at up to its 256 MiB per-object ceiling and which is
+            // forwarded here verbatim. Like the blob upload, this runs
+            // under the client-level `total` ceiling.
             .bearer_auth(&self.token)
             .header("Accept", ACCEPT_HEADER)
             .header("X-GitHub-Api-Version", API_VERSION_HEADER)
@@ -1012,6 +1021,83 @@ mod tests {
             .create_blob(&sample_repo(), b"payload")
             .await
             .expect("a slow-but-progressing upload must get the full total budget");
+        assert_eq!(sha, returned);
+    }
+
+    /// Same guarantee for the other two object uploads. A commit is
+    /// not necessarily small — the staging repo admits commit objects
+    /// up to 256 MiB and nearly all of that can be the message
+    /// forwarded verbatim — and a tree body scales with the number of
+    /// entries. Both must run under the `total` budget, not the
+    /// small-call one.
+    #[tokio::test]
+    async fn create_commit_survives_a_response_slower_than_the_small_call_budget() {
+        use time::macros::datetime;
+        let server = MockServer::start().await;
+        let returned = sample_object_id('b');
+        Mock::given(method("POST"))
+            .and(path("/repos/owner/name/git/commits"))
+            .respond_with(
+                ResponseTemplate::new(201)
+                    .set_body_json(json!({ "sha": returned.as_str() }))
+                    .set_delay(Duration::from_millis(500)),
+            )
+            .mount(&server)
+            .await;
+        let client = GitDataClient::new(
+            GitDataTimeouts::new(
+                Duration::from_millis(200),
+                Duration::from_millis(200),
+                Duration::from_secs(5),
+            ),
+            server.uri(),
+            "ghs_token".to_string(),
+        );
+
+        let ident = sample_identity("Alice", datetime!(2024-01-15 10:30:45 UTC));
+        let tree = sample_object_id('a');
+        let request = CommitRequest {
+            tree: &tree,
+            parents: &[],
+            message: "msg",
+            author: &ident,
+            committer: &ident,
+            signature: None,
+        };
+        let sha = client
+            .create_commit(&sample_repo(), &request)
+            .await
+            .expect("a slow-but-progressing commit upload must get the full total budget");
+        assert_eq!(sha, returned);
+    }
+
+    #[tokio::test]
+    async fn create_tree_survives_a_response_slower_than_the_small_call_budget() {
+        let server = MockServer::start().await;
+        let returned = sample_object_id('b');
+        Mock::given(method("POST"))
+            .and(path("/repos/owner/name/git/trees"))
+            .respond_with(
+                ResponseTemplate::new(201)
+                    .set_body_json(json!({ "sha": returned.as_str() }))
+                    .set_delay(Duration::from_millis(500)),
+            )
+            .mount(&server)
+            .await;
+        let client = GitDataClient::new(
+            GitDataTimeouts::new(
+                Duration::from_millis(200),
+                Duration::from_millis(200),
+                Duration::from_secs(5),
+            ),
+            server.uri(),
+            "ghs_token".to_string(),
+        );
+
+        let sha = client
+            .create_tree(&sample_repo(), &[])
+            .await
+            .expect("a slow-but-progressing tree upload must get the full total budget");
         assert_eq!(sha, returned);
     }
 

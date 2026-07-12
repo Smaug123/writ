@@ -272,7 +272,10 @@ For each row:
   for the attempt (the crash happened after the mint, e.g. mid-prepare),
   the recovery copies that mint onto the resolved row so the burned
   credential's identity survives; a schema trigger pins the two records
-  to agree.
+  to agree. The dead attempt's on-disk staging repo is *not* consulted
+  or removed (boot reconcile stays filesystem-blind); staging repos are
+  keyed by attempt id, so the residue can never collide with the fresh
+  attempt a retry mints — it just occupies disk until swept.
 - `state = 'uncertain'`: the broker crashed *after* committing to
   PATCH. Log to `AUDIT_WRITE_FAILURE_TARGET`; leave the row. The push
   surfaces in `promote list` flagged as `requires_reconcile`. Operator

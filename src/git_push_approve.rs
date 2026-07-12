@@ -35,7 +35,7 @@ use std::path::PathBuf;
 
 use crate::audit::UncertainAttempt;
 use crate::clean_git::{self, CleanGitEnv, CleanGitInvocation, clean_git_config_env};
-use crate::core::{ApproveAttemptId, RepoRef, RequestId};
+use crate::core::{ApproveAttemptId, RepoRef};
 use crate::git_push_promote::{
     ExecuteError, ExecuteOutcome, PreparedPromotion, PromoteRuntimeConfig, UpdateRefError,
     commit_prepared_promotion, prepare_fast_forward_plan,
@@ -212,13 +212,18 @@ impl PreparedApprove {
 /// [`PreparedApprove`]; call [`PreparedApprove::commit`] — with the
 /// attempt recorded `Uncertain` first — to actually move the branch.
 ///
-/// On error the partially-populated staging dir is still removed; on
-/// success the staging dir is removed before returning. Removal
-/// failures are logged via `tracing::warn` but never bubble up — a
-/// stale staging dir is recoverable on the next boot reconcile, but a
-/// successful promote that returns Err to the operator is much worse
-/// (it would force the bailiff to retry against a branch that already
-/// moved).
+/// On error the partially-populated staging dir is removed before
+/// returning; on success its removal is *spawned* rather than awaited.
+/// The final lease check lives inside the prepare, so on the success
+/// path every awaited millisecond between here and the caller's PATCH
+/// widens the window in which another actor can move the branch under
+/// a still-passing lease — and a 256 MiB staging repo can take real
+/// time to delete. The PATCH needs nothing from disk, so the deletion
+/// runs concurrently. Removal failures are logged via `tracing::warn`
+/// but never bubble up — a stale staging dir sits harmlessly at its
+/// per-attempt path (it can never collide with a retry) until swept,
+/// but a successful promote that returns Err to the operator would
+/// force the bailiff to retry against a branch that already moved.
 ///
 /// `signing_key` is required (B-track pins app-identity signing) and
 /// is forwarded as `Some(...)` to [`prepare_fast_forward_plan`]. The
@@ -227,7 +232,7 @@ impl PreparedApprove {
 /// anyway, plus pre-B1d call sites that no longer exist in main.
 // Each argument is a distinct concern (runtime config / GitHub
 // access / repo identity / branch / lease anchor / bundle payload /
-// signing identity / trailer set / per-request and attempt ids).
+// signing identity / trailer set / attempt id).
 // Bundling them adds a struct layer without simplifying the call site,
 // so the flat shape matches `prepare_fast_forward_plan` precedent.
 #[allow(clippy::too_many_arguments)]
@@ -242,12 +247,11 @@ pub async fn prepare_approve(
     bundle_bytes: &[u8],
     signing_key: &WritSigningKey,
     trailers: &[TrailerSource],
-    request_id: RequestId,
     attempt_id: ApproveAttemptId,
 ) -> Result<PreparedApprove, RunApproveError> {
     let staging = prepare_staging_repo(
         runtime,
-        request_id,
+        attempt_id,
         expected_remote_head,
         repo,
         token,
@@ -270,12 +274,35 @@ pub async fn prepare_approve(
     )
     .await;
 
-    if let Err(err) = tokio::fs::remove_dir_all(staging.path()).await {
-        tracing::warn!(
-            error = %err,
-            staging_dir = %staging.path().display(),
-            "approve staging dir cleanup failed; leaving for boot-time reconciliation",
-        );
+    let staging_path = staging.path().to_path_buf();
+    match &result {
+        Ok(_) => {
+            // Success means the post-walk lease check has already run
+            // and the caller's next move is the PATCH. Nothing past
+            // this point may add latency to that window, so the
+            // deletion is fire-and-forget; the dir is per-attempt so
+            // a failure to delete strands only disk, never a retry.
+            tokio::spawn(async move {
+                if let Err(err) = tokio::fs::remove_dir_all(&staging_path).await {
+                    tracing::warn!(
+                        error = %err,
+                        staging_dir = %staging_path.display(),
+                        "approve staging dir cleanup failed; leaving for manual sweep",
+                    );
+                }
+            });
+        }
+        Err(_) => {
+            // No PATCH is coming, so there is no window to protect;
+            // clean up before returning.
+            if let Err(err) = tokio::fs::remove_dir_all(&staging_path).await {
+                tracing::warn!(
+                    error = %err,
+                    staging_dir = %staging_path.display(),
+                    "approve staging dir cleanup failed; leaving for manual sweep",
+                );
+            }
+        }
     }
 
     result
@@ -387,25 +414,35 @@ impl StagingRepo {
     }
 }
 
-/// Build a fresh bare staging repo at `<work_root>/approve/<request_id>`
+/// Build a fresh bare staging repo at `<work_root>/approve/<attempt_id>`
 /// containing both the staged push's prerequisite (fetched from
 /// `clone_base_url`/`<owner>/<name>.git`) and the bundle's contents
 /// (unbundled from a temp file inside the same dir).
 ///
-/// Refuses to proceed if the per-request staging dir already exists —
-/// the request_id is a fresh UUID per RPC so the only way to hit this
-/// is a duplicate concurrent approve, which would be the broker
-/// shipping two parallel mints for the same staged push. Refusing
-/// here is the safest outcome.
+/// The dir is keyed by *attempt* id, not push-request id, and that
+/// choice is load-bearing for crash recovery: a broker that dies
+/// mid-prepare never runs its cleanup, and boot reconcile is
+/// deliberately filesystem-blind (the audit log is the system of
+/// record). Since every retry mints a fresh attempt id, the residue
+/// of a dead attempt can never collide with a new one — it just sits
+/// at the dead attempt's path until an operator sweeps it. Keying by
+/// request id would make the same residue block every retry of that
+/// push with `StagingDirExists`.
+///
+/// Refuses to proceed if the per-attempt dir already exists — the
+/// attempt_id is a fresh UUID per approve and the audit DAO refuses
+/// concurrent attempts, so the only ways to hit this are UUID
+/// collision or two brokers sharing a `work_root`. Refusing is the
+/// safest outcome for both.
 pub async fn prepare_staging_repo(
     runtime: &PromoteRuntimeConfig,
-    request_id: RequestId,
+    attempt_id: ApproveAttemptId,
     expected_remote_head: &GitObjectId,
     repo: &GitCloneRepo,
     token: &GitSecretValue,
     bundle_bytes: &[u8],
 ) -> Result<StagingRepo, PrepareStagingError> {
-    let staging_dir = staging_dir_for(runtime, request_id);
+    let staging_dir = staging_dir_for(runtime, attempt_id);
     if let Some(parent) = staging_dir.parent() {
         // Parent is *shared* across approve requests so we must
         // tolerate AlreadyExists (it persists once any first approve
@@ -422,7 +459,7 @@ pub async fn prepare_staging_repo(
             }
         })?;
     }
-    // The per-request staging dir, in contrast, MUST be allocated
+    // The per-attempt staging dir, in contrast, MUST be allocated
     // exclusively by this call. `create_exclusive_private_dir` does
     // a single atomic `mkdir(path, 0700)` and returns AlreadyExists
     // as a hard error; this collapses the prior `try_exists` +
@@ -464,7 +501,7 @@ pub async fn prepare_staging_repo(
                 tracing::warn!(
                     error = %cleanup,
                     staging_dir = %staging_dir.display(),
-                    "approve staging dir cleanup after prepare failure failed; leaving for boot-time reconciliation",
+                    "approve staging dir cleanup after prepare failure failed; leaving for manual sweep",
                 );
             }
             Err(err)
@@ -506,11 +543,14 @@ async fn run_prepare_steps(
     Ok(())
 }
 
-pub(crate) fn staging_dir_for(runtime: &PromoteRuntimeConfig, request_id: RequestId) -> PathBuf {
+pub(crate) fn staging_dir_for(
+    runtime: &PromoteRuntimeConfig,
+    attempt_id: ApproveAttemptId,
+) -> PathBuf {
     runtime
         .work_root()
         .join("approve")
-        .join(request_id.to_string())
+        .join(attempt_id.to_string())
 }
 
 /// Atomic-mode `mkdir(path, 0700)` that fails if `path` already
@@ -813,11 +853,6 @@ mod tests {
 
     // ---------- shared fixtures ----------
 
-    fn sample_request_id() -> RequestId {
-        // Deterministic so test failure messages stay reproducible.
-        RequestId::from_uuid(uuid::Uuid::parse_str("11111111-2222-3333-4444-555555555555").unwrap())
-    }
-
     fn sample_object_id(nibble: char) -> GitObjectId {
         GitObjectId::new(std::iter::repeat_n(nibble, 40).collect::<String>()).unwrap()
     }
@@ -943,10 +978,10 @@ mod tests {
     }
 
     #[test]
-    fn staging_dir_for_isolates_each_request_under_approve() {
+    fn staging_dir_for_isolates_each_attempt_under_approve() {
         let runtime = sample_runtime(PathBuf::from("/tmp/promote"));
-        let id_a = sample_request_id();
-        let id_b = RequestId::new();
+        let id_a = ApproveAttemptId::new();
+        let id_b = ApproveAttemptId::new();
         let a = staging_dir_for(&runtime, id_a);
         let b = staging_dir_for(&runtime, id_b);
         assert_ne!(a, b);
@@ -960,14 +995,14 @@ mod tests {
     async fn prepare_refuses_pre_existing_staging_dir() {
         let work = tempfile::tempdir().unwrap();
         let runtime = sample_runtime(work.path().to_path_buf());
-        let request_id = sample_request_id();
-        let staging = staging_dir_for(&runtime, request_id);
+        let attempt_id = ApproveAttemptId::new();
+        let staging = staging_dir_for(&runtime, attempt_id);
         // Plant a colliding dir.
         std::fs::create_dir_all(&staging).unwrap();
 
         let err = prepare_staging_repo(
             &runtime,
-            request_id,
+            attempt_id,
             &sample_object_id('a'),
             &sample_repo(),
             &sample_token(),
@@ -1836,12 +1871,12 @@ mod tests {
             Duration::from_secs(30),
         )
         .unwrap();
-        let request_id = sample_request_id();
-        let staging_dir = staging_dir_for(&runtime, request_id);
+        let attempt_id = ApproveAttemptId::new();
+        let staging_dir = staging_dir_for(&runtime, attempt_id);
 
         let err = prepare_staging_repo(
             &runtime,
-            request_id,
+            attempt_id,
             &sample_object_id('a'),
             &sample_repo(),
             &sample_token(),
@@ -1872,7 +1907,7 @@ mod tests {
     /// `StagingDirExists`. This test pounds the helper directly with
     /// many concurrent tasks on the same path and asserts exactly one
     /// wins; everyone else gets AlreadyExists. That is the property
-    /// `prepare_staging_repo`'s per-request-dir call site relies on.
+    /// `prepare_staging_repo`'s per-attempt-dir call site relies on.
     #[tokio::test]
     async fn create_exclusive_private_dir_serialises_concurrent_callers() {
         let tmp = tempfile::tempdir().unwrap();

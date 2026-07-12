@@ -345,6 +345,77 @@ async fn approve_staged_push_run_approve_failure_resolves_as_pre_patch_failure()
     );
 }
 
+/// Crash residue must not brick retries. A broker that dies
+/// mid-prepare leaves the per-attempt staging repo on disk (its
+/// cleanup never ran); boot reconcile resolves the *audit* row but is
+/// deliberately filesystem-blind. A fresh approve for the same push
+/// must therefore never collide with the residue — staging dirs are
+/// keyed by attempt id, which is minted fresh per approve — so the
+/// retry proceeds to the real pipeline instead of failing
+/// `StagingDirExists` forever.
+#[tokio::test]
+async fn approve_retry_is_not_blocked_by_crash_leftover_staging_dir() {
+    let server = MockServer::start().await;
+    let (state, tmp) = make_state_with_approve_ready(&server);
+    let session_id = open_session(&state).await;
+    let request_id = stage_with_staged_outcome(
+        &state,
+        session_id,
+        b"bundle".to_vec(),
+        UnixMillis::from_millis(1_700_000_040_000),
+        UnixMillis::from_millis(1_700_000_040_500),
+    )
+    .await;
+
+    // Simulate a prior attempt that died mid-prepare: its staging dir
+    // is still on disk. (Keyed by the *push request id* it would
+    // collide with every retry; keyed by attempt id it never can. The
+    // request-id path is the pre-fix layout — a retry must tolerate
+    // residue at either.)
+    let residue = tmp
+        .path()
+        .join("promote")
+        .join("approve")
+        .join(request_id.to_string());
+    std::fs::create_dir_all(&residue).unwrap();
+
+    let expiry = expiry_str_from_now(3600);
+    Mock::given(method("POST"))
+        .and(path("/app/installations/999/access_tokens"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+            "token": "ghs_test_token",
+            "expires_at": expiry,
+            "permissions": {"contents": "write", "metadata": "read"},
+            "repository_selection": "selected",
+            "repositories": [{"full_name": "owner/repo"}],
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let resp = dispatch_message(
+        ClientMessage::ApproveStagedPush {
+            request_id,
+            operator: "alice".into(),
+        },
+        &state,
+    )
+    .await;
+
+    // The bogus `git_program` makes the pipeline fail at `git init`,
+    // which is fine — what must NOT happen is a refusal because the
+    // residue directory already exists.
+    match resp {
+        ServerMessage::Error { message } => {
+            assert!(
+                !message.contains("already exists"),
+                "crash residue must not block the retry: {message}",
+            );
+        }
+        other => panic!("expected Error from the bogus git binary, got {other:?}"),
+    }
+}
+
 #[test]
 fn truncate_for_wire_passes_short_input_through() {
     let s = "hello".to_string();
