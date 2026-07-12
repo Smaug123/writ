@@ -315,6 +315,18 @@ async fn approve_staged_push_run_approve_failure_resolves_as_pre_patch_failure()
                 detail.contains("run_approve failed"),
                 "failure detail must name the pipeline step: {detail}",
             );
+            // The v7 mint ledger was written *before* the prepare phase
+            // started, and it agrees with the resolved row — this is the
+            // durable record that would have survived had the broker
+            // crashed instead of failing cleanly.
+            let recorded = state
+                .audit
+                .attempt_recorded_mint(attempts[0].attempt_id)
+                .unwrap();
+            assert_eq!(
+                recorded, *mint,
+                "mint ledger must agree with the resolved row's mint",
+            );
         }
         other => panic!("expected Resolved(PrePatchFailure), got {other:?}"),
     }

@@ -60,7 +60,12 @@ Started ──► Uncertain ──── update_ref ───────┤
   network-bound part of an approve — the staging fetch, the unbundle,
   and every object upload — runs in this state: none of it can move a
   branch, and boot reconcile resolves a wedged `Started` row without an
-  operator.
+  operator. Because that phase runs *after* the mint, the credential's
+  identity is persisted up front in the append-only
+  `git_push_approve_attempt_mint` ledger (schema v7) — the `Started`
+  row itself cannot carry mint columns (v5 CHECK), and without the
+  ledger a crash mid-prepare would lose which credential was issued
+  and used for the uploads.
 - **Uncertain**: written in the same SQLite transaction that completes
   the *last* check before `update_ref` is called — the post-walker
   lease check. Once `Uncertain` lands, the broker has committed to
@@ -165,6 +170,14 @@ mint() ; on fail:
     UPDATE state='resolved', outcome='pre_patch_failure',
            failure_detail=..., completed_at=now                            -- TX
     return Error
+INSERT git_push_approve_attempt_mint (attempt_id, mint_jti, mint_*)        -- TX (v7 ledger)
+  -- the burned credential's identity, durable *before* any of the
+  -- crash-prone prepare work uses it. A crash anywhere below leaves a
+  -- Started row whose mint boot reconcile can recover from this row.
+  ; on fail:
+    UPDATE state='resolved', outcome='pre_patch_failure',
+           mint_jti=..., mint_*, failure_detail=..., completed_at=now      -- TX
+    return Error
 prepare_approve()  ; on fail (any RunApproveError — the type cannot
     express a PATCH failure, so every one of them is provably pre-PATCH):
     -- mint succeeded but no PATCH was issued. `pre_patch_failure`
@@ -255,7 +268,11 @@ For each row:
 - `state = 'started'`: the broker crashed during an approve attempt
   before any `update_ref` could have been issued. Transition to
   `Resolved(PrePatchFailure { detail = "broker restart" })` so the
-  push is rejectable / retryable.
+  push is rejectable / retryable. If the v7 mint ledger carries a row
+  for the attempt (the crash happened after the mint, e.g. mid-prepare),
+  the recovery copies that mint onto the resolved row so the burned
+  credential's identity survives; a schema trigger pins the two records
+  to agree.
 - `state = 'uncertain'`: the broker crashed *after* committing to
   PATCH. Log to `AUDIT_WRITE_FAILURE_TARGET`; leave the row. The push
   surfaces in `promote list` flagged as `requires_reconcile`. Operator

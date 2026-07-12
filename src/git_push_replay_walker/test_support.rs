@@ -9,6 +9,8 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::str::FromStr;
 
+use crate::github_git_db::GitDataTimeouts;
+
 use serde_json::json;
 use wiremock::matchers::{body_json, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -32,7 +34,11 @@ pub(super) fn sample_identity(name: &str) -> CommitIdentity {
 }
 
 pub(super) fn client_against(server: &MockServer, token: &str) -> GitDataClient {
-    GitDataClient::new(reqwest::Client::new(), server.uri(), token.to_string())
+    GitDataClient::new(
+        GitDataTimeouts::production(),
+        server.uri(),
+        token.to_string(),
+    )
 }
 
 /// Mount a blob create that strictly matches the given content

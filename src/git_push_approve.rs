@@ -43,7 +43,7 @@ use crate::git_push_promote::{
 use crate::git_push_replay::TrailerSource;
 use crate::git_push_replay_object_source::{CatFileObjectSource, OpenError};
 use crate::git_push_replay_walker::{FastForwardPlanError, plan_fast_forward_via_rev_list};
-use crate::github_git_db::{GitDataClient, GitDataTimeouts, git_data_http_client};
+use crate::github_git_db::{GitDataClient, GitDataTimeouts};
 use crate::signing::WritSigningKey;
 use crate::vm_git::{GitBranchName, GitCloneRepo, GitObjectId};
 use crate::vm_git_bundle::GitSecretValue;
@@ -328,7 +328,7 @@ pub async fn prepare_approve_with_staging_repo(
     // flight, so a GitHub endpoint that black-holes or withholds must
     // fail the attempt rather than park it forever.
     let client = GitDataClient::new(
-        git_data_http_client(GitDataTimeouts::production()),
+        GitDataTimeouts::production(),
         api_base.to_string(),
         token.as_str().to_string(),
     );
@@ -1447,6 +1447,10 @@ mod tests {
             .and(path("/repos/owner/name/git/commits"))
             .respond_with(ResponseTemplate::new(201).set_body_json(json!({
                 "sha": sample_object_id('f').as_str(),
+                // The approve path signs, so GitHub's affirmative
+                // verification verdict is part of a faithful response —
+                // without it `create_commit` refuses the SHA.
+                "verification": { "verified": true, "reason": "valid" },
             })))
             .expect(1)
             .mount(&server)
@@ -1504,8 +1508,20 @@ mod tests {
             .mount(&server)
             .await;
         Mock::given(method("POST"))
+            .and(path("/repos/owner/name/git/trees"))
             .respond_with(ResponseTemplate::new(201).set_body_json(json!({
                 "sha": sample_object_id('e').as_str(),
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/repos/owner/name/git/commits"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+                "sha": sample_object_id('f').as_str(),
+                // The approve path signs, so GitHub's affirmative
+                // verification verdict is part of a faithful response —
+                // without it `create_commit` refuses the SHA.
+                "verification": { "verified": true, "reason": "valid" },
             })))
             .mount(&server)
             .await;

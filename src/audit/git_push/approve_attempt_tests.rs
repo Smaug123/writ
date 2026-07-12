@@ -991,3 +991,396 @@ fn primary_key_constraint_rejects_null_attempt_id() {
         "unexpected error: {err}"
     );
 }
+
+// ---------- mint ledger (v7) ----------
+
+/// The mint ledger round-trip: record right after mint, read back the
+/// identical context, and the eventual `mark_attempt_uncertain` with
+/// the same mint sails through the agreement trigger.
+#[test]
+fn record_attempt_mint_roundtrips_and_agrees_with_uncertain() {
+    let log = AuditLog::open_in_memory().unwrap();
+    let push_request_id = RequestId::new();
+    let _session = open_with_staged_request(&log, push_request_id);
+    let attempt_id = ApproveAttemptId::new();
+    log.start_approve_attempt(
+        attempt_id,
+        push_request_id,
+        "alice",
+        UnixMillis::from_millis(1_700_000_200),
+    )
+    .unwrap();
+
+    let mint = sample_promote_mint_audit();
+    log.record_attempt_mint(attempt_id, mint, UnixMillis::from_millis(1_700_000_210))
+        .unwrap();
+    assert_eq!(log.attempt_recorded_mint(attempt_id).unwrap(), Some(mint));
+
+    log.mark_attempt_uncertain(attempt_id, mint).unwrap();
+    let attempts = log.approve_attempts_for_push(push_request_id).unwrap();
+    assert_eq!(
+        attempts[0].state,
+        GitPushApproveAttemptState::Uncertain { mint },
+    );
+}
+
+#[test]
+fn attempt_recorded_mint_is_none_without_ledger_row() {
+    let log = AuditLog::open_in_memory().unwrap();
+    let push_request_id = RequestId::new();
+    let _session = open_with_staged_request(&log, push_request_id);
+    let attempt_id = ApproveAttemptId::new();
+    log.start_approve_attempt(
+        attempt_id,
+        push_request_id,
+        "alice",
+        UnixMillis::from_millis(1_700_000_200),
+    )
+    .unwrap();
+    assert_eq!(log.attempt_recorded_mint(attempt_id).unwrap(), None);
+}
+
+#[test]
+fn record_attempt_mint_requires_existing_attempt() {
+    let log = AuditLog::open_in_memory().unwrap();
+    let err = log
+        .record_attempt_mint(
+            ApproveAttemptId::new(),
+            sample_promote_mint_audit(),
+            UnixMillis::from_millis(1_700_000_210),
+        )
+        .unwrap_err();
+    assert!(
+        matches!(err, AuditError::Invariant("approve attempt does not exist")),
+        "got: {err:?}"
+    );
+}
+
+/// Once the attempt has left `Started` the mint context lives inline
+/// on the attempt row; a late ledger write could only rewrite history
+/// and is refused (DAO check here; the schema trigger backs it up).
+#[test]
+fn record_attempt_mint_refused_once_past_started() {
+    let log = AuditLog::open_in_memory().unwrap();
+    let push_request_id = RequestId::new();
+    let _session = open_with_staged_request(&log, push_request_id);
+    let attempt_id = ApproveAttemptId::new();
+    log.start_approve_attempt(
+        attempt_id,
+        push_request_id,
+        "alice",
+        UnixMillis::from_millis(1_700_000_200),
+    )
+    .unwrap();
+    let mint = sample_promote_mint_audit();
+    log.mark_attempt_uncertain(attempt_id, mint).unwrap();
+
+    let err = log
+        .record_attempt_mint(attempt_id, mint, UnixMillis::from_millis(1_700_000_210))
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            AuditError::Invariant("approve attempt mint ledger requires 'started' state")
+        ),
+        "got: {err:?}"
+    );
+}
+
+/// An attempt mints at most once; a second ledger row is refused.
+#[test]
+fn record_attempt_mint_refused_twice() {
+    let log = AuditLog::open_in_memory().unwrap();
+    let push_request_id = RequestId::new();
+    let _session = open_with_staged_request(&log, push_request_id);
+    let attempt_id = ApproveAttemptId::new();
+    log.start_approve_attempt(
+        attempt_id,
+        push_request_id,
+        "alice",
+        UnixMillis::from_millis(1_700_000_200),
+    )
+    .unwrap();
+    log.record_attempt_mint(
+        attempt_id,
+        sample_promote_mint_audit(),
+        UnixMillis::from_millis(1_700_000_210),
+    )
+    .unwrap();
+
+    let err = log
+        .record_attempt_mint(
+            attempt_id,
+            sample_promote_mint_audit(),
+            UnixMillis::from_millis(1_700_000_211),
+        )
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            AuditError::Invariant("approve attempt already has a mint ledger row")
+        ),
+        "got: {err:?}"
+    );
+}
+
+/// The agreement trigger: TX2 must not write a mint that differs from
+/// the one the ledger already recorded for the attempt.
+#[test]
+fn mark_attempt_uncertain_refused_when_mint_disagrees_with_ledger() {
+    let log = AuditLog::open_in_memory().unwrap();
+    let push_request_id = RequestId::new();
+    let _session = open_with_staged_request(&log, push_request_id);
+    let attempt_id = ApproveAttemptId::new();
+    log.start_approve_attempt(
+        attempt_id,
+        push_request_id,
+        "alice",
+        UnixMillis::from_millis(1_700_000_200),
+    )
+    .unwrap();
+    log.record_attempt_mint(
+        attempt_id,
+        sample_promote_mint_audit(),
+        UnixMillis::from_millis(1_700_000_210),
+    )
+    .unwrap();
+
+    // `sample_promote_mint_audit` mints a fresh `Jti` per call, so this
+    // is a *different* credential from the recorded one.
+    let err = log
+        .mark_attempt_uncertain(attempt_id, sample_promote_mint_audit())
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("must match the mint ledger row"),
+        "unexpected error: {err}"
+    );
+}
+
+/// Same agreement trigger on the capturing pre-PATCH resolve path.
+#[test]
+fn capturing_pre_patch_failure_refused_when_mint_disagrees_with_ledger() {
+    let log = AuditLog::open_in_memory().unwrap();
+    let push_request_id = RequestId::new();
+    let _session = open_with_staged_request(&log, push_request_id);
+    let attempt_id = ApproveAttemptId::new();
+    log.start_approve_attempt(
+        attempt_id,
+        push_request_id,
+        "alice",
+        UnixMillis::from_millis(1_700_000_200),
+    )
+    .unwrap();
+    log.record_attempt_mint(
+        attempt_id,
+        sample_promote_mint_audit(),
+        UnixMillis::from_millis(1_700_000_210),
+    )
+    .unwrap();
+
+    let err = log
+        .complete_attempt_pre_patch_failure_capturing_mint(
+            attempt_id,
+            sample_promote_mint_audit(),
+            "walker refused",
+            UnixMillis::from_millis(1_700_000_220),
+        )
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("must match the mint ledger row"),
+        "unexpected error: {err}"
+    );
+
+    // And with the *recorded* mint the resolve goes through.
+    let recorded = log.attempt_recorded_mint(attempt_id).unwrap().unwrap();
+    log.complete_attempt_pre_patch_failure_capturing_mint(
+        attempt_id,
+        recorded,
+        "walker refused",
+        UnixMillis::from_millis(1_700_000_221),
+    )
+    .unwrap();
+}
+
+/// The ledger is append-only: raw UPDATE and DELETE are refused by
+/// trigger, and a raw INSERT against a non-`Started` attempt is
+/// refused even when the DAO check is bypassed.
+#[test]
+fn mint_ledger_rows_are_append_only() {
+    let log = AuditLog::open_in_memory().unwrap();
+    let push_request_id = RequestId::new();
+    let _session = open_with_staged_request(&log, push_request_id);
+    let attempt_id = ApproveAttemptId::new();
+    log.start_approve_attempt(
+        attempt_id,
+        push_request_id,
+        "alice",
+        UnixMillis::from_millis(1_700_000_200),
+    )
+    .unwrap();
+    log.record_attempt_mint(
+        attempt_id,
+        sample_promote_mint_audit(),
+        UnixMillis::from_millis(1_700_000_210),
+    )
+    .unwrap();
+
+    let update_err = log
+        .with_conn_mut(|c| {
+            Ok(c.execute(
+                "UPDATE git_push_approve_attempt_mint SET mint_github_app_id = 7
+                  WHERE attempt_id = ?1",
+                params![attempt_id.as_uuid().to_string()],
+            ))
+        })
+        .unwrap()
+        .unwrap_err();
+    assert!(
+        update_err.to_string().contains("immutable"),
+        "unexpected error: {update_err}"
+    );
+
+    let delete_err = log
+        .with_conn_mut(|c| {
+            Ok(c.execute(
+                "DELETE FROM git_push_approve_attempt_mint WHERE attempt_id = ?1",
+                params![attempt_id.as_uuid().to_string()],
+            ))
+        })
+        .unwrap()
+        .unwrap_err();
+    assert!(
+        delete_err.to_string().contains("append-only"),
+        "unexpected error: {delete_err}"
+    );
+}
+
+/// The `requires_started` trigger backs up the DAO state check against
+/// raw-SQL writers: a ledger INSERT against a resolved attempt aborts.
+#[test]
+fn mint_ledger_trigger_refuses_insert_for_resolved_attempt() {
+    let log = AuditLog::open_in_memory().unwrap();
+    let push_request_id = RequestId::new();
+    let _session = open_with_staged_request(&log, push_request_id);
+    let attempt_id = ApproveAttemptId::new();
+    log.start_approve_attempt(
+        attempt_id,
+        push_request_id,
+        "alice",
+        UnixMillis::from_millis(1_700_000_200),
+    )
+    .unwrap();
+    log.complete_attempt_pre_patch_failure(
+        attempt_id,
+        "mint denied",
+        UnixMillis::from_millis(1_700_000_205),
+    )
+    .unwrap();
+
+    let err = log
+        .with_conn_mut(|c| {
+            Ok(c.execute(
+                "INSERT INTO git_push_approve_attempt_mint
+                        (attempt_id, mint_jti, mint_github_app_id,
+                         mint_issued_at, mint_expires_at, recorded_at)
+                 VALUES (?1, '00000000-0000-0000-0000-000000000000', 42,
+                         1700000190, 1700000490, 1700000210)",
+                params![attempt_id.as_uuid().to_string()],
+            ))
+        })
+        .unwrap()
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("requires a started attempt"),
+        "unexpected error: {err}"
+    );
+}
+
+/// Resolving a minted `Started` attempt through the *plain*
+/// pre-PATCH-failure DAO must still carry the ledger mint onto the
+/// resolved row: invariant 9 says a recorded credential's identity
+/// follows the attempt to every later state, whichever DAO method
+/// performs the resolve.
+#[test]
+fn plain_pre_patch_failure_copies_the_ledger_mint() {
+    let log = AuditLog::open_in_memory().unwrap();
+    let push_request_id = RequestId::new();
+    let _session = open_with_staged_request(&log, push_request_id);
+    let attempt_id = ApproveAttemptId::new();
+    log.start_approve_attempt(
+        attempt_id,
+        push_request_id,
+        "alice",
+        UnixMillis::from_millis(1_700_000_200),
+    )
+    .unwrap();
+    let mint = sample_promote_mint_audit();
+    log.record_attempt_mint(attempt_id, mint, UnixMillis::from_millis(1_700_000_210))
+        .unwrap();
+
+    log.complete_attempt_pre_patch_failure(
+        attempt_id,
+        "prepare failed",
+        UnixMillis::from_millis(1_700_000_220),
+    )
+    .unwrap();
+
+    let attempts = log.approve_attempts_for_push(push_request_id).unwrap();
+    match &attempts[0].state {
+        GitPushApproveAttemptState::Resolved {
+            mint: resolved_mint,
+            ..
+        } => {
+            assert_eq!(
+                *resolved_mint,
+                Some(mint),
+                "plain resolve of a minted attempt must copy the ledger mint",
+            );
+        }
+        other => panic!("expected Resolved, got {other:?}"),
+    }
+}
+
+/// Defence-in-depth for the same invariant: a raw-SQL resolve that
+/// leaves the inline mint NULL while a ledger row exists must be
+/// refused by trigger, so no future DAO method (or manual SQL) can
+/// recreate the conflicting projection.
+#[test]
+fn trigger_refuses_resolving_a_minted_attempt_without_its_mint() {
+    let log = AuditLog::open_in_memory().unwrap();
+    let push_request_id = RequestId::new();
+    let _session = open_with_staged_request(&log, push_request_id);
+    let attempt_id = ApproveAttemptId::new();
+    log.start_approve_attempt(
+        attempt_id,
+        push_request_id,
+        "alice",
+        UnixMillis::from_millis(1_700_000_200),
+    )
+    .unwrap();
+    log.record_attempt_mint(
+        attempt_id,
+        sample_promote_mint_audit(),
+        UnixMillis::from_millis(1_700_000_210),
+    )
+    .unwrap();
+
+    let err = log
+        .with_conn_mut(|c| {
+            Ok(c.execute(
+                "UPDATE git_push_approve_attempt
+                    SET state = 'resolved',
+                        outcome = 'pre_patch_failure',
+                        failure_detail = 'raw resolve',
+                        completed_at = 1700000220
+                  WHERE attempt_id = ?1",
+                params![attempt_id.as_uuid().to_string()],
+            ))
+        })
+        .unwrap()
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("must carry the ledger mint"),
+        "unexpected error: {err}"
+    );
+}

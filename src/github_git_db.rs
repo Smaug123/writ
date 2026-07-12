@@ -40,32 +40,44 @@ use crate::vm_git::{GitBranchName, GitBranchNameError, GitObjectId};
 /// staged push (and, once the attempt is `Uncertain`, blocks any
 /// concurrent reject) until the broker is killed. Bound every phase.
 ///
-/// The three bounds are distinct because they fail differently:
+/// The three bounds:
 ///
 /// * `connect` — TCP/TLS handshake only. Tight, so a black-holed route
 ///   fails fast instead of eating the whole request budget.
-/// * `read` — maximum idle gap while reading the response. This is what
-///   catches a server that accepts the connection, takes the body, and
-///   then withholds the response: it trips on silence rather than on
-///   elapsed time, so a legitimately slow (but progressing) upload of a
-///   large blob is not punished.
-/// * `total` — wall-clock ceiling on the whole request, body upload
-///   included. The backstop against a peer that drip-feeds bytes
-///   forever, which no idle-gap bound can catch.
+/// * `small_call` — wall-clock ceiling for every metadata request
+///   (tree/commit creates, ref GET/PATCH, repo lookup). Their request
+///   and response bodies are both small, so elapsed time above this is
+///   a degraded server or a failed network, never a legitimate slow
+///   transfer.
+/// * `total` — wall-clock ceiling on any request, and the *only*
+///   time bound the blob upload runs under besides `connect`. A single
+///   blob create can carry the staging repo's per-object ceiling
+///   (256 MiB, ~342 MiB base64-expanded), which legitimately takes
+///   minutes on a slow uplink.
+///
+/// A per-phase "idle gap" bound would be strictly nicer for the upload
+/// (fail on silence in 30 s instead of on the 300 s ceiling), but
+/// reqwest's builder-level `read_timeout` does not implement one: it
+/// arms a flat deadline at dispatch that runs until the response
+/// *headers* arrive, so the entire upload counts against it and any
+/// blob taking longer than the bound is killed mid-transfer despite
+/// making progress. Hence: no `read_timeout` anywhere, `small_call`
+/// applied per-request to the metadata calls, and the upload bounded
+/// by `total` alone. Bounded-but-slower beats wrongly-failed.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct GitDataTimeouts {
     connect: Duration,
-    read: Duration,
+    small_call: Duration,
     total: Duration,
 }
 
 /// TCP/TLS handshake ceiling. Matches [`crate::github`]'s minter client.
 const GIT_DATA_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-/// Idle-gap ceiling while reading a response. Above this GitHub is
+/// Wall-clock ceiling for a metadata request. Above this GitHub is
 /// either degraded or the network has failed.
-const GIT_DATA_READ_TIMEOUT: Duration = Duration::from_secs(30);
-/// Whole-request ceiling. Deliberately much larger than `read`: a
-/// single blob create can carry up to the staging repo's per-object
+const GIT_DATA_SMALL_CALL_TIMEOUT: Duration = Duration::from_secs(30);
+/// Whole-request ceiling. Deliberately much larger than `small_call`:
+/// a single blob create can carry up to the staging repo's per-object
 /// ceiling (256 MiB, base64-expanded), and a slow uplink must be able
 /// to finish. It exists to bound the pathological case, not the slow
 /// one.
@@ -76,41 +88,36 @@ impl GitDataTimeouts {
     pub const fn production() -> Self {
         Self {
             connect: GIT_DATA_CONNECT_TIMEOUT,
-            read: GIT_DATA_READ_TIMEOUT,
+            small_call: GIT_DATA_SMALL_CALL_TIMEOUT,
             total: GIT_DATA_TOTAL_TIMEOUT,
         }
     }
 
     /// Arbitrary bounds. Tests use this to drive the timeout paths
     /// without waiting out the production values.
-    pub const fn new(connect: Duration, read: Duration, total: Duration) -> Self {
+    pub const fn new(connect: Duration, small_call: Duration, total: Duration) -> Self {
         Self {
             connect,
-            read,
+            small_call,
             total,
         }
     }
 }
 
 /// Build the HTTP client the Git Data endpoints are driven through.
-///
-/// Every production `GitDataClient` must be constructed over this
-/// rather than `reqwest::Client::new()` — see [`GitDataTimeouts`] for
-/// why the raw constructor is unsafe to use here. Tests that talk to a
-/// local `wiremock` server may pass a default client, because a
-/// wiremock server cannot withhold a response indefinitely.
-pub fn git_data_http_client(timeouts: GitDataTimeouts) -> reqwest::Client {
+/// Private: [`GitDataClient::new`] is the only constructor, so every
+/// client in the codebase carries these bounds by construction.
+fn git_data_http_client(timeouts: GitDataTimeouts) -> reqwest::Client {
     debug_assert!(
-        !timeouts.connect.is_zero() && !timeouts.read.is_zero() && !timeouts.total.is_zero(),
+        !timeouts.connect.is_zero() && !timeouts.small_call.is_zero() && !timeouts.total.is_zero(),
         "a zero timeout fails every request immediately",
     );
     debug_assert!(
-        timeouts.total >= timeouts.read,
-        "a total timeout below the idle-gap bound makes `read` unreachable",
+        timeouts.total >= timeouts.small_call,
+        "a total timeout below the small-call bound makes `small_call` meaningless",
     );
     reqwest::Client::builder()
         .connect_timeout(timeouts.connect)
-        .read_timeout(timeouts.read)
         .timeout(timeouts.total)
         .build()
         .expect("reqwest client constructs with timeouts set")
@@ -135,6 +142,10 @@ const USER_AGENT_HEADER: &str = "writ/0.1";
 /// nowhere else.
 pub struct GitDataClient {
     http: reqwest::Client,
+    /// Per-request override applied to every metadata call (see
+    /// [`GitDataTimeouts`]); `create_blob` deliberately runs without
+    /// it, under the client-level `total` ceiling only.
+    small_call: Duration,
     api_base: String,
     token: String,
 }
@@ -215,13 +226,19 @@ impl GitDataClient {
     /// (e.g. `https://api.github.com`); the path segments for each
     /// endpoint are concatenated on. Tests pass a `wiremock` server URI
     /// in to swap the destination.
+    ///
+    /// Taking [`GitDataTimeouts`] rather than a prebuilt
+    /// `reqwest::Client` makes "every Git Data client is bounded" a
+    /// fact of the constructor instead of a convention: there is no
+    /// way to build one over an unbounded transport.
     pub fn new(
-        http: reqwest::Client,
+        timeouts: GitDataTimeouts,
         api_base: impl Into<String>,
         token: impl Into<String>,
     ) -> Self {
         Self {
-            http,
+            http: git_data_http_client(timeouts),
+            small_call: timeouts.small_call,
             api_base: api_base.into(),
             token: token.into(),
         }
@@ -262,6 +279,13 @@ impl GitDataClient {
             .header("Accept", ACCEPT_HEADER)
             .header("X-GitHub-Api-Version", API_VERSION_HEADER)
             .header("User-Agent", USER_AGENT_HEADER)
+            // No `small_call` override here — deliberately. This is the
+            // one request whose body can be huge (up to the staging
+            // repo's 256 MiB per-object ceiling, base64-expanded), and
+            // GitHub sends no response bytes until it has consumed the
+            // upload, so any bound shorter than a slow uplink needs
+            // would kill a legitimately progressing push. The
+            // client-level `total` ceiling is what bounds it.
             .json(&body)
             .send()
             .await?;
@@ -312,6 +336,7 @@ impl GitDataClient {
         let response = self
             .http
             .post(&url)
+            .timeout(self.small_call)
             .bearer_auth(&self.token)
             .header("Accept", ACCEPT_HEADER)
             .header("X-GitHub-Api-Version", API_VERSION_HEADER)
@@ -388,6 +413,7 @@ impl GitDataClient {
         let response = self
             .http
             .post(&url)
+            .timeout(self.small_call)
             .bearer_auth(&self.token)
             .header("Accept", ACCEPT_HEADER)
             .header("X-GitHub-Api-Version", API_VERSION_HEADER)
@@ -448,6 +474,7 @@ impl GitDataClient {
         let response = self
             .http
             .get(&url)
+            .timeout(self.small_call)
             .bearer_auth(&self.token)
             .header("Accept", ACCEPT_HEADER)
             .header("X-GitHub-Api-Version", API_VERSION_HEADER)
@@ -497,6 +524,7 @@ impl GitDataClient {
         let response = self
             .http
             .get(&url)
+            .timeout(self.small_call)
             .bearer_auth(&self.token)
             .header("Accept", ACCEPT_HEADER)
             .header("X-GitHub-Api-Version", API_VERSION_HEADER)
@@ -562,6 +590,7 @@ impl GitDataClient {
         let response = self
             .http
             .patch(&url)
+            .timeout(self.small_call)
             .bearer_auth(&self.token)
             .header("Accept", ACCEPT_HEADER)
             .header("X-GitHub-Api-Version", API_VERSION_HEADER)
@@ -888,14 +917,18 @@ mod tests {
     }
 
     fn client_against(server: &MockServer, token: &str) -> GitDataClient {
-        GitDataClient::new(reqwest::Client::new(), server.uri(), token.to_string())
+        GitDataClient::new(
+            GitDataTimeouts::production(),
+            server.uri(),
+            token.to_string(),
+        )
     }
 
     /// A server that accepts the request and then never answers must
     /// not park a Git Data call forever. Driven with tiny bounds so the
-    /// test costs milliseconds; the mechanism under test (reqwest's
-    /// read timeout firing on an idle response) is the same one the
-    /// production bounds arm.
+    /// test costs milliseconds; the mechanism under test (the
+    /// per-request small-call budget firing on a withheld response) is
+    /// the same one the production bounds arm.
     #[tokio::test]
     async fn git_data_request_against_a_withholding_server_times_out() {
         let server = MockServer::start().await;
@@ -912,11 +945,11 @@ mod tests {
             .mount(&server)
             .await;
         let client = GitDataClient::new(
-            git_data_http_client(GitDataTimeouts::new(
+            GitDataTimeouts::new(
                 Duration::from_millis(200),
                 Duration::from_millis(200),
                 Duration::from_millis(500),
-            )),
+            ),
             server.uri(),
             "ghs_token".to_string(),
         );
@@ -940,21 +973,63 @@ mod tests {
         );
     }
 
+    /// The counterpart guarantee to the withholding test: a blob
+    /// upload that makes steady progress but takes longer than the
+    /// small-call budget must NOT be killed. reqwest's builder-level
+    /// `read_timeout` is a flat deadline armed at dispatch and running
+    /// until the response *headers* arrive — the whole upload phase
+    /// counts against it, and GitHub sends nothing until it has
+    /// consumed the body — so bounding uploads with it rejects
+    /// legitimate slow pushes (a 256 MiB object is ~342 MiB of base64;
+    /// >30 s at uplinks below ~90 Mbit/s). Uploads run under the
+    /// `total` ceiling only; the mock's response delay stands in for
+    /// the time GitHub spends consuming a large body.
+    #[tokio::test]
+    async fn create_blob_survives_a_response_slower_than_the_small_call_budget() {
+        let server = MockServer::start().await;
+        let returned = sample_object_id('b');
+        Mock::given(method("POST"))
+            .and(path("/repos/owner/name/git/blobs"))
+            .respond_with(
+                ResponseTemplate::new(201)
+                    .set_body_json(json!({ "sha": returned.as_str() }))
+                    // Longer than the small-call budget, well inside total.
+                    .set_delay(Duration::from_millis(500)),
+            )
+            .mount(&server)
+            .await;
+        let client = GitDataClient::new(
+            GitDataTimeouts::new(
+                Duration::from_millis(200),
+                Duration::from_millis(200),
+                Duration::from_secs(5),
+            ),
+            server.uri(),
+            "ghs_token".to_string(),
+        );
+
+        let sha = client
+            .create_blob(&sample_repo(), b"payload")
+            .await
+            .expect("a slow-but-progressing upload must get the full total budget");
+        assert_eq!(sha, returned);
+    }
+
     /// The production bounds are what the promote path actually runs
     /// under, and the whole point is that none of them is "unbounded".
     #[test]
     fn production_git_data_timeouts_are_bounded_and_ordered() {
         let timeouts = GitDataTimeouts::production();
         assert!(!timeouts.connect.is_zero());
-        assert!(!timeouts.read.is_zero());
+        assert!(!timeouts.small_call.is_zero());
         assert!(!timeouts.total.is_zero());
         assert!(
-            timeouts.connect <= timeouts.read,
-            "a connect bound above the read bound cannot be reached",
+            timeouts.connect <= timeouts.small_call,
+            "a connect bound above the small-call bound cannot be reached",
         );
         assert!(
-            timeouts.read <= timeouts.total,
-            "an idle-gap bound above the total bound cannot be reached",
+            timeouts.small_call <= timeouts.total,
+            "a small-call bound above the total bound cannot be reached",
         );
         // Not a preference: an hour-long ceiling would be unbounded in
         // every sense that matters to a wedged approve attempt.
@@ -1857,8 +1932,11 @@ mod tests {
 
     #[test]
     fn debug_redacts_token() {
-        let client =
-            GitDataClient::new(reqwest::Client::new(), "https://api.example", "ghs_secret");
+        let client = GitDataClient::new(
+            GitDataTimeouts::production(),
+            "https://api.example",
+            "ghs_secret",
+        );
         let rendered = format!("{client:?}");
         assert!(
             !rendered.contains("ghs_secret"),

@@ -771,6 +771,124 @@ impl AuditLog {
         })
     }
 
+    /// Record the mint an approve attempt just burned in the
+    /// append-only `git_push_approve_attempt_mint` ledger. Called
+    /// immediately after the installation token is issued, *before*
+    /// the prepare phase (staging fetch, unbundle, plan, object
+    /// uploads) starts: that phase is long, network-bound, and runs
+    /// with the attempt row still `Started` (mint columns NULL), so
+    /// without this row a crash mid-prepare would permanently lose the
+    /// identity of a credential that was really issued — and used, for
+    /// the uploads — against GitHub. Boot reconcile reads the ledger
+    /// back via [`AuditLog::attempt_recorded_mint`] and copies the
+    /// mint onto the row it resolves.
+    ///
+    /// Refused unless the attempt exists and is still `Started` (the
+    /// schema trigger enforces the same shape): once the attempt is
+    /// `Uncertain` or `Resolved` the mint is carried inline on the
+    /// attempt row and a late ledger write could only rewrite history.
+    /// At most one ledger row per attempt (it is a primary key): an
+    /// attempt mints at most once.
+    pub fn record_attempt_mint(
+        &self,
+        attempt_id: ApproveAttemptId,
+        mint: PromoteMintAudit,
+        recorded_at: UnixMillis,
+    ) -> Result<(), AuditError> {
+        let github_app_id = i64::try_from(mint.github_app_id).map_err(|_| {
+            AuditError::Invariant("approve attempt mint github_app_id exceeds SQLite integer")
+        })?;
+        self.with_conn_mut(|c| {
+            let tx = c.transaction()?;
+            let state: Option<String> = tx
+                .query_row(
+                    "SELECT state FROM git_push_approve_attempt WHERE attempt_id = ?1",
+                    params![attempt_id.as_uuid().to_string()],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let Some(state) = state else {
+                return Err(AuditError::Invariant("approve attempt does not exist"));
+            };
+            if state != "started" {
+                return Err(AuditError::Invariant(
+                    "approve attempt mint ledger requires 'started' state",
+                ));
+            }
+            let already: Option<i64> = tx
+                .query_row(
+                    "SELECT 1 FROM git_push_approve_attempt_mint WHERE attempt_id = ?1",
+                    params![attempt_id.as_uuid().to_string()],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if already.is_some() {
+                return Err(AuditError::Invariant(
+                    "approve attempt already has a mint ledger row",
+                ));
+            }
+            tx.execute(
+                "INSERT INTO git_push_approve_attempt_mint (
+                     attempt_id, mint_jti, mint_github_app_id,
+                     mint_issued_at, mint_expires_at, recorded_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    attempt_id.as_uuid().to_string(),
+                    mint.jti.as_uuid().to_string(),
+                    github_app_id,
+                    mint.issued_at.as_millis(),
+                    mint.expires_at.as_millis(),
+                    recorded_at.as_millis(),
+                ],
+            )?;
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
+    /// Read back the mint recorded against an attempt by
+    /// [`AuditLog::record_attempt_mint`], if any. Boot reconcile uses
+    /// this to resolve a crashed `Started` attempt *with* the burned
+    /// credential's identity instead of dropping it.
+    pub fn attempt_recorded_mint(
+        &self,
+        attempt_id: ApproveAttemptId,
+    ) -> Result<Option<PromoteMintAudit>, AuditError> {
+        self.with_conn(|c| {
+            let row = c
+                .query_row(
+                    "SELECT mint_jti, mint_github_app_id, mint_issued_at, mint_expires_at
+                       FROM git_push_approve_attempt_mint
+                      WHERE attempt_id = ?1",
+                    params![attempt_id.as_uuid().to_string()],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, i64>(3)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            let Some((jti_str, app_id, issued_at, expires_at)) = row else {
+                return Ok(None);
+            };
+            let jti = uuid::Uuid::parse_str(&jti_str)
+                .map(Jti::from_uuid)
+                .map_err(|_| AuditError::Invariant("attempt mint ledger: jti is not a uuid"))?;
+            let github_app_id = u64::try_from(app_id).map_err(|_| {
+                AuditError::Invariant("attempt mint ledger: github_app_id is negative")
+            })?;
+            Ok(Some(PromoteMintAudit {
+                jti,
+                github_app_id,
+                issued_at: UnixMillis::from_millis(issued_at),
+                expires_at: UnixMillis::from_millis(expires_at),
+            }))
+        })
+    }
+
     /// Transition a `Started` attempt to `Uncertain`, persisting the
     /// captured mint context. Called immediately before issuing the
     /// GitHub `update_ref` PATCH: once this commit lands the broker
@@ -933,11 +1051,15 @@ impl AuditLog {
     /// that has already resolved produces a readable invariant error
     /// instead of a silent no-op.
     ///
-    /// Mint columns are not touched: a `Started` row stays mint-NULL
-    /// and an `Uncertain` row keeps the mint context recorded by
-    /// [`AuditLog::mark_attempt_uncertain`]. If the caller has a mint
-    /// to record (e.g. mint succeeded but the walker refused before
-    /// the PATCH boundary), use
+    /// Mint handling: an `Uncertain` row keeps the mint context
+    /// recorded by [`AuditLog::mark_attempt_uncertain`]; a `Started`
+    /// row with a v7 mint-ledger row (see
+    /// [`AuditLog::record_attempt_mint`]) has that mint copied onto
+    /// the resolved row automatically, so a recorded credential's
+    /// identity follows the attempt whichever resolve path runs; a
+    /// `Started` row with no ledger row resolves mint-NULL. If the
+    /// caller holds a mint that is *not* in the ledger (the ledger
+    /// write itself failed), use
     /// [`AuditLog::complete_attempt_pre_patch_failure_capturing_mint`]
     /// instead.
     pub fn complete_attempt_pre_patch_failure(
@@ -1261,20 +1383,79 @@ impl AuditLog {
                 ));
             }
 
-            tx.execute(
-                "UPDATE git_push_approve_attempt
-                    SET state = 'resolved',
-                        outcome = ?2,
-                        failure_detail = ?3,
-                        completed_at = ?4
-                  WHERE attempt_id = ?1",
-                params![
-                    attempt_id.as_uuid().to_string(),
-                    outcome,
-                    detail,
-                    completed_at.as_millis(),
-                ],
-            )?;
+            // A `started` attempt may carry a v7 mint-ledger row (the
+            // mint is recorded before the prepare phase; the inline
+            // columns stay NULL until `uncertain`). The resolve must
+            // copy that mint onto the row — invariant: a recorded
+            // credential's identity follows the attempt into every
+            // later state. Read it inside the TX so the copy and the
+            // eligibility check see one snapshot; the schema's
+            // `resolve_carries_ledger_mint` trigger backs this up
+            // against paths that forget. An `uncertain` attempt
+            // already carries its mint inline and the UPDATE below
+            // leaves those columns untouched.
+            let ledger_mint = if state == "started" {
+                tx.query_row(
+                    "SELECT mint_jti, mint_github_app_id, mint_issued_at, mint_expires_at
+                       FROM git_push_approve_attempt_mint
+                      WHERE attempt_id = ?1",
+                    params![attempt_id.as_uuid().to_string()],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, i64>(3)?,
+                        ))
+                    },
+                )
+                .optional()?
+            } else {
+                None
+            };
+
+            match ledger_mint {
+                Some((jti, app_id, issued_at, expires_at)) => {
+                    tx.execute(
+                        "UPDATE git_push_approve_attempt
+                            SET state = 'resolved',
+                                outcome = ?2,
+                                failure_detail = ?3,
+                                completed_at = ?4,
+                                mint_jti = ?5,
+                                mint_github_app_id = ?6,
+                                mint_issued_at = ?7,
+                                mint_expires_at = ?8
+                          WHERE attempt_id = ?1",
+                        params![
+                            attempt_id.as_uuid().to_string(),
+                            outcome,
+                            detail,
+                            completed_at.as_millis(),
+                            jti,
+                            app_id,
+                            issued_at,
+                            expires_at,
+                        ],
+                    )?;
+                }
+                None => {
+                    tx.execute(
+                        "UPDATE git_push_approve_attempt
+                            SET state = 'resolved',
+                                outcome = ?2,
+                                failure_detail = ?3,
+                                completed_at = ?4
+                          WHERE attempt_id = ?1",
+                        params![
+                            attempt_id.as_uuid().to_string(),
+                            outcome,
+                            detail,
+                            completed_at.as_millis(),
+                        ],
+                    )?;
+                }
+            }
             tx.commit()?;
             Ok(())
         })

@@ -716,9 +716,9 @@ async fn reject_staged_push<S: SecretStore + Send + Sync + 'static>(
 /// *accept-back* bound on the GitHub-returned expiry, not a request the
 /// server honours — pinning it at the GitHub-imposed maximum is the
 /// only correct setting. The credential's actual lifetime is bounded by
-/// the duration of this single `run_approve` invocation; the broker
-/// drops the token (and the only reference to it) once the call
-/// returns.
+/// the duration of this single approve invocation; the broker drops
+/// the token (and the only reference to it) once the pipeline
+/// completes.
 const APPROVE_MINT_TTL_SECONDS: i64 = GITHUB_INSTALLATION_TOKEN_MAX_SECONDS;
 
 /// Handler for [`ClientMessage::ApproveStagedPush`].
@@ -759,30 +759,33 @@ const APPROVE_MINT_TTL_SECONDS: i64 = GITHUB_INSTALLATION_TOKEN_MAX_SECONDS;
 ///      reject-blocking states and would also block a fresh approve.
 ///   7. Mint a one-shot installation token. On failure: transition the
 ///      attempt to `Resolved(PrePatchFailure)` (no mint to capture).
-///   8. `mark_attempt_uncertain`: capture the mint context inline on
+///   8. `record_attempt_mint`: persist the burned credential's identity
+///      in the append-only mint ledger *before* anything uses it, so a
+///      crash anywhere in the prepare phase cannot lose which credential
+///      was issued. On failure: `Resolved(PrePatchFailure)` capturing
+///      the mint on the resolved row directly.
+///   9. Run [`prepare_approve`] against the staging entry — staging
+///      fetch, unbundle, plan, and every object upload — with the
+///      attempt row still `Started`. None of that can move the branch,
+///      so a crash here is auto-recovered by boot reconcile (which
+///      copies the ledger mint onto the row it resolves). On a returned
+///      error: `Resolved(PrePatchFailure)` capturing the mint — every
+///      [`RunApproveError`] is pre-PATCH by construction.
+///  10. `mark_attempt_uncertain`: capture the mint context inline on
 ///      the attempt row. **This is the TX that commits the broker to
 ///      "the PATCH may exist on GitHub"** — reject is refused from this
-///      point until the attempt resolves.
-///   9. Run [`run_approve`] against the staging entry. The current
-///      slice writes `Uncertain` *before* `run_approve` rather than
-///      between the walker and `update_ref`; the cost is that
-///      `prepare`/`plan`/`walker` failures resolve from `Uncertain`
-///      instead of `Started`, blocking reject during the brief window
-///      they run. A follow-up slice can refactor `run_approve` to
-///      expose a post-walker hook if the over-conservative window
-///      proves costly. The schema's forward-only trigger admits
-///      `Uncertain → Resolved(PrePatchFailure)` so the path is valid.
-///  10. On success: `complete_attempt_succeeded` atomically transitions
+///      point until the attempt resolves. It yields the
+///      [`crate::audit::UncertainAttempt`] witness, the only key that
+///      opens [`crate::git_push_approve::PreparedApprove::commit`].
+///  11. `PreparedApprove::commit` issues the single branch-moving
+///      `PATCH`. Its one error type proves a `PATCH` reached GitHub
+///      without a confirmed response →
+///      `complete_attempt_post_patch_failure` (quarantines the push).
+///  12. On success: `complete_attempt_succeeded` atomically transitions
 ///      the attempt to `Resolved(Succeeded)` *and* writes the
 ///      `git_push_resolution(decision='approved')` row in a single
 ///      SQLite transaction (the resolution-INSERT trigger sees the
 ///      attempt already at `succeeded` and lets the row through).
-///  11. On `RunApproveError::Execute(ExecuteError::UpdateRef(_))`:
-///      `update_ref` was issued and GitHub's state is uncertain →
-///      `complete_attempt_post_patch_failure` (quarantines the push).
-///  12. On any other `RunApproveError`: no PATCH was issued →
-///      `complete_attempt_pre_patch_failure`. The mint context is
-///      preserved on the row.
 ///  13. Staging-dir delete is best-effort after the joint TX; failures
 ///      are logged. A stale dir surfaces in `promote list` for manual
 ///      cleanup.
@@ -1007,7 +1010,7 @@ async fn start_approve_attempt_row<S: SecretStore + Send + Sync + 'static>(
 // `result_large_err`: `ServerMessage` is the wire reply type; this transient
 // local Result early-returns it unchanged, so boxing would only add indirection
 // at every construction site. `too_many_arguments`: the flat shape matches the
-// `run_approve` / run_agent precedent in this crate.
+// `prepare_approve` / run_agent precedent in this crate.
 #[allow(clippy::result_large_err, clippy::too_many_arguments)]
 async fn execute_started_attempt<S: SecretStore + Send + Sync + 'static>(
     state: &Arc<BrokerState<S>>,
@@ -1052,6 +1055,47 @@ async fn execute_started_attempt<S: SecretStore + Send + Sync + 'static>(
     };
 
     let (api_base, raw_token, mint_audit) = minted.into_promote_pieces();
+
+    // Persist the burned credential's identity *before* anything else
+    // uses it. The prepare phase below is long, network-bound, and runs
+    // with the attempt row still `Started` (mint columns NULL by the
+    // schema CHECK); without this ledger row a broker crash mid-prepare
+    // would lose which credential was issued — and used, for the object
+    // uploads — against GitHub. Boot reconcile copies the ledger mint
+    // onto the row it resolves. If the ledger write itself fails, the
+    // broker refuses to proceed: a credential it cannot durably account
+    // for must not touch GitHub (correctness over availability).
+    let mint_record_result = {
+        let audit = Arc::clone(&state.audit);
+        let recorded_at = UnixMillis::now();
+        tokio::task::spawn_blocking(move || {
+            audit.record_attempt_mint(attempt_id, mint_audit, recorded_at)
+        })
+        .await
+    };
+    match mint_record_result {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => {
+            // The ledger INSERT was refused, so the row is still
+            // `Started` with no mint anywhere: capture it on the
+            // resolved row directly.
+            let detail = format!("record_attempt_mint failed: {err}");
+            resolve_pre_patch_failure(state, attempt_id, request_id, &detail, Some(mint_audit))
+                .await;
+            return Err(ServerMessage::Error {
+                message: format!("approve-time mint could not be recorded: {err}"),
+            });
+        }
+        Err(err) => {
+            let detail = format!("record_attempt_mint task failed: {err}");
+            resolve_pre_patch_failure(state, attempt_id, request_id, &detail, Some(mint_audit))
+                .await;
+            return Err(ServerMessage::Error {
+                message: format!("approve-time mint recording task failed: {err}"),
+            });
+        }
+    }
+
     let token = match GitSecretValue::new(raw_token) {
         Ok(t) => t,
         Err(err) => {
@@ -1059,7 +1103,9 @@ async fn execute_started_attempt<S: SecretStore + Send + Sync + 'static>(
             // Mint succeeded by the time we have a `MintedToken`, so
             // capture the mint context on the attempt row even though
             // the token cannot be used. The audit log can still answer
-            // "what mint was issued for this attempt."
+            // "what mint was issued for this attempt." (The ledger row
+            // above already records the same mint; the schema trigger
+            // checks the two agree.)
             resolve_pre_patch_failure(state, attempt_id, request_id, &detail, Some(mint_audit))
                 .await;
             return Err(ServerMessage::Error {
@@ -1112,7 +1158,9 @@ async fn execute_started_attempt<S: SecretStore + Send + Sync + 'static>(
             // the type cannot express a PATCH failure, which is why the
             // classification is no longer a match on variants. The
             // attempt is still `Started`, so the mint context is
-            // captured here (it has nowhere else to be recorded).
+            // captured on the resolved row (the ledger row written
+            // above holds the same mint; the schema trigger checks the
+            // two agree).
             //
             // `err` can wrap `GitDataError::ApiError { body, .. }`
             // whose `body` is unbounded GitHub/GHES bytes; cap both
@@ -1352,8 +1400,8 @@ async fn resolve_pre_patch_failure<S: SecretStore + Send + Sync + 'static>(
 }
 
 /// Drive an `Uncertain` attempt to `Resolved(PostPatchFailure)`. Used
-/// by the two paths that prove the PATCH was sent: a direct
-/// `Execute(UpdateRef(_))` error from `run_approve` (non-2xx /
+/// by the two paths that prove the PATCH was sent: an
+/// `UpdateRefError` from `PreparedApprove::commit` (non-2xx /
 /// transport drop on the PATCH itself) and the post-success
 /// joint-TX-failed path (the PATCH succeeded but the audit log could
 /// not commit it).
