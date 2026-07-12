@@ -22,11 +22,99 @@
 //!   the promote workflow uses to fast-forward the App-side branch
 //!   to the new commit chain the walker uploaded.
 
+use std::time::Duration;
+
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 
 use crate::core::RepoRef;
 use crate::vm_git::{GitBranchName, GitBranchNameError, GitObjectId};
+
+/// Per-request bounds for the Git Data transport.
+///
+/// `reqwest`'s defaults are *no* connect timeout, *no* read timeout and
+/// *no* total timeout, so a `reqwest::Client::new()` parked against a
+/// black-holed or slow-drip endpoint waits forever. That is never
+/// acceptable here: the promote path issues these requests with an
+/// approve attempt row in flight, so an unbounded request wedges the
+/// staged push (and, once the attempt is `Uncertain`, blocks any
+/// concurrent reject) until the broker is killed. Bound every phase.
+///
+/// The three bounds are distinct because they fail differently:
+///
+/// * `connect` — TCP/TLS handshake only. Tight, so a black-holed route
+///   fails fast instead of eating the whole request budget.
+/// * `read` — maximum idle gap while reading the response. This is what
+///   catches a server that accepts the connection, takes the body, and
+///   then withholds the response: it trips on silence rather than on
+///   elapsed time, so a legitimately slow (but progressing) upload of a
+///   large blob is not punished.
+/// * `total` — wall-clock ceiling on the whole request, body upload
+///   included. The backstop against a peer that drip-feeds bytes
+///   forever, which no idle-gap bound can catch.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct GitDataTimeouts {
+    connect: Duration,
+    read: Duration,
+    total: Duration,
+}
+
+/// TCP/TLS handshake ceiling. Matches [`crate::github`]'s minter client.
+const GIT_DATA_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Idle-gap ceiling while reading a response. Above this GitHub is
+/// either degraded or the network has failed.
+const GIT_DATA_READ_TIMEOUT: Duration = Duration::from_secs(30);
+/// Whole-request ceiling. Deliberately much larger than `read`: a
+/// single blob create can carry up to the staging repo's per-object
+/// ceiling (256 MiB, base64-expanded), and a slow uplink must be able
+/// to finish. It exists to bound the pathological case, not the slow
+/// one.
+const GIT_DATA_TOTAL_TIMEOUT: Duration = Duration::from_secs(300);
+
+impl GitDataTimeouts {
+    /// The bounds every production Git Data call runs under.
+    pub const fn production() -> Self {
+        Self {
+            connect: GIT_DATA_CONNECT_TIMEOUT,
+            read: GIT_DATA_READ_TIMEOUT,
+            total: GIT_DATA_TOTAL_TIMEOUT,
+        }
+    }
+
+    /// Arbitrary bounds. Tests use this to drive the timeout paths
+    /// without waiting out the production values.
+    pub const fn new(connect: Duration, read: Duration, total: Duration) -> Self {
+        Self {
+            connect,
+            read,
+            total,
+        }
+    }
+}
+
+/// Build the HTTP client the Git Data endpoints are driven through.
+///
+/// Every production `GitDataClient` must be constructed over this
+/// rather than `reqwest::Client::new()` — see [`GitDataTimeouts`] for
+/// why the raw constructor is unsafe to use here. Tests that talk to a
+/// local `wiremock` server may pass a default client, because a
+/// wiremock server cannot withhold a response indefinitely.
+pub fn git_data_http_client(timeouts: GitDataTimeouts) -> reqwest::Client {
+    debug_assert!(
+        !timeouts.connect.is_zero() && !timeouts.read.is_zero() && !timeouts.total.is_zero(),
+        "a zero timeout fails every request immediately",
+    );
+    debug_assert!(
+        timeouts.total >= timeouts.read,
+        "a total timeout below the idle-gap bound makes `read` unreachable",
+    );
+    reqwest::Client::builder()
+        .connect_timeout(timeouts.connect)
+        .read_timeout(timeouts.read)
+        .timeout(timeouts.total)
+        .build()
+        .expect("reqwest client constructs with timeouts set")
+}
 
 const ACCEPT_HEADER: &str = "application/vnd.github+json";
 const API_VERSION_HEADER: &str = "2022-11-28";
@@ -801,6 +889,76 @@ mod tests {
 
     fn client_against(server: &MockServer, token: &str) -> GitDataClient {
         GitDataClient::new(reqwest::Client::new(), server.uri(), token.to_string())
+    }
+
+    /// A server that accepts the request and then never answers must
+    /// not park a Git Data call forever. Driven with tiny bounds so the
+    /// test costs milliseconds; the mechanism under test (reqwest's
+    /// read timeout firing on an idle response) is the same one the
+    /// production bounds arm.
+    #[tokio::test]
+    async fn git_data_request_against_a_withholding_server_times_out() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/name/git/ref/heads/main"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({
+                        "ref": "refs/heads/main",
+                        "object": { "sha": sample_object_id('a').as_str(), "type": "commit" },
+                    }))
+                    .set_delay(Duration::from_secs(30)),
+            )
+            .mount(&server)
+            .await;
+        let client = GitDataClient::new(
+            git_data_http_client(GitDataTimeouts::new(
+                Duration::from_millis(200),
+                Duration::from_millis(200),
+                Duration::from_millis(500),
+            )),
+            server.uri(),
+            "ghs_token".to_string(),
+        );
+
+        let started = std::time::Instant::now();
+        let err = client
+            .get_branch_head(&sample_repo(), &GitBranchName::new("main").unwrap())
+            .await
+            .expect_err("a withheld response must not resolve");
+
+        assert!(
+            matches!(&err, GitDataError::Http(source) if source.is_timeout()),
+            "expected a timeout, got: {err:?}",
+        );
+        // The bound is 500ms; anything near the mock's 30s delay means
+        // no timeout was armed at all.
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "request took {:?} — the timeout did not fire",
+            started.elapsed(),
+        );
+    }
+
+    /// The production bounds are what the promote path actually runs
+    /// under, and the whole point is that none of them is "unbounded".
+    #[test]
+    fn production_git_data_timeouts_are_bounded_and_ordered() {
+        let timeouts = GitDataTimeouts::production();
+        assert!(!timeouts.connect.is_zero());
+        assert!(!timeouts.read.is_zero());
+        assert!(!timeouts.total.is_zero());
+        assert!(
+            timeouts.connect <= timeouts.read,
+            "a connect bound above the read bound cannot be reached",
+        );
+        assert!(
+            timeouts.read <= timeouts.total,
+            "an idle-gap bound above the total bound cannot be reached",
+        );
+        // Not a preference: an hour-long ceiling would be unbounded in
+        // every sense that matters to a wedged approve attempt.
+        assert!(timeouts.total <= Duration::from_secs(600));
     }
 
     #[tokio::test]

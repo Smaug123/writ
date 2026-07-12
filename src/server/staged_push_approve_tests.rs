@@ -233,13 +233,14 @@ async fn approve_staged_push_for_branch_creation_returns_error() {
     assert!(attempts.is_empty());
 }
 
-/// `run_approve` failure that fires before `update_ref` (e.g. the
-/// `git init --bare` in `prepare_staging_repo` because the
-/// configured `git_program` is bogus) must drive the attempt from
-/// `Uncertain` to `Resolved(PrePatchFailure)`. The mint context
-/// recorded by `mark_attempt_uncertain` survives on the resolved
-/// row, and reject becomes legal again because the trigger admits
-/// reject when every attempt is `PrePatchFailure`.
+/// An approve failure that fires before `update_ref` (e.g. the
+/// `git init --bare` in `prepare_staging_repo` because the configured
+/// `git_program` is bogus) must drive the attempt from `Started`
+/// straight to `Resolved(PrePatchFailure)` — never through `Uncertain`,
+/// which is reserved for the PATCH round-trip. The mint context is
+/// captured on the resolved row even so (the credential *was* burned),
+/// and reject becomes legal again because the trigger admits reject
+/// when every attempt is `PrePatchFailure`.
 #[tokio::test]
 async fn approve_staged_push_run_approve_failure_resolves_as_pre_patch_failure() {
     let server = MockServer::start().await;
@@ -292,9 +293,12 @@ async fn approve_staged_push_run_approve_failure_resolves_as_pre_patch_failure()
         other => panic!("expected Error, got {other:?}"),
     }
 
-    // Attempt row reached `Resolved(PrePatchFailure)` with the
-    // mint context the `Uncertain` step recorded (the column-
-    // immutability trigger preserves it across the resolve).
+    // Attempt row reached `Resolved(PrePatchFailure)` carrying the mint
+    // context. It got there from `Started`:
+    // `complete_attempt_pre_patch_failure_capturing_mint` is the only
+    // DAO method that writes mint columns on a resolve, and it refuses
+    // any state other than `Started` — so this row is also proof that
+    // the pipeline never entered `Uncertain`.
     let attempts = state.audit.approve_attempts_for_push(request_id).unwrap();
     assert_eq!(attempts.len(), 1);
     match &attempts[0].state {
@@ -305,7 +309,7 @@ async fn approve_staged_push_run_approve_failure_resolves_as_pre_patch_failure()
         } => {
             assert!(
                 mint.is_some(),
-                "mint context must persist from Uncertain across the resolve",
+                "the burned credential must be recorded on the resolved row",
             );
             assert!(
                 detail.contains("run_approve failed"),

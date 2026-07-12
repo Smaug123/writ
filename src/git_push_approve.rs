@@ -7,8 +7,18 @@
 //! between — given an already-minted GitHub installation token and the
 //! payload from the staged entry, it stands up an isolated bare staging
 //! repo, fetches the prerequisite commit, ingests the bundle, plans the
-//! per-commit walk, and runs [`execute_fast_forward_plan`] against the
+//! per-commit walk, and runs [`prepare_fast_forward_plan`] against the
 //! GitHub Git Data API.
+//!
+//! It is deliberately in two halves, split at the only step that can
+//! move a branch on GitHub. [`prepare_approve`] does everything up to
+//! the `PATCH` and hands back a [`PreparedApprove`];
+//! [`PreparedApprove::commit`] issues the `PATCH`, and demands an
+//! [`UncertainAttempt`] to do it. The handler mints that witness from
+//! the audit log in between, so the durable "a PATCH may exist" record
+//! brackets the PATCH as tightly as it can — a crash during the fetch,
+//! plan or upload leaves an attempt that boot reconcile resolves on its
+//! own instead of one an operator has to reconcile by hand.
 //!
 //! All side effects happen against the `work_root` carried by the caller's
 //! [`PromoteRuntimeConfig`] plus the GitHub API base; nothing here touches
@@ -23,15 +33,17 @@
 use std::ffi::OsString;
 use std::path::PathBuf;
 
+use crate::audit::UncertainAttempt;
 use crate::clean_git::{self, CleanGitEnv, CleanGitInvocation, clean_git_config_env};
-use crate::core::{RepoRef, RequestId};
+use crate::core::{ApproveAttemptId, RepoRef, RequestId};
 use crate::git_push_promote::{
-    ExecuteError, ExecuteOutcome, PromoteRuntimeConfig, execute_fast_forward_plan,
+    ExecuteError, ExecuteOutcome, PreparedPromotion, PromoteRuntimeConfig, UpdateRefError,
+    commit_prepared_promotion, prepare_fast_forward_plan,
 };
 use crate::git_push_replay::TrailerSource;
 use crate::git_push_replay_object_source::{CatFileObjectSource, OpenError};
 use crate::git_push_replay_walker::{FastForwardPlanError, plan_fast_forward_via_rev_list};
-use crate::github_git_db::GitDataClient;
+use crate::github_git_db::{GitDataClient, GitDataTimeouts, git_data_http_client};
 use crate::signing::WritSigningKey;
 use crate::vm_git::{GitBranchName, GitCloneRepo, GitObjectId};
 use crate::vm_git_bundle::GitSecretValue;
@@ -63,11 +75,16 @@ impl RunApproveOutcome {
     }
 }
 
-/// Errors surfaced from [`run_approve`].
+/// Errors surfaced from [`prepare_approve`].
 ///
 /// Each variant maps onto a specific stage of the orchestrator so the
 /// handler in B1e.2c can record a structured failure reason in the
 /// audit log without re-parsing the wrapped error string.
+///
+/// Every one of them is provably pre-PATCH: the branch on GitHub is
+/// untouched, so the attempt is retryable. The failure that is *not*
+/// retryable has its own type, [`UpdateRefError`], and can only come
+/// out of [`PreparedApprove::commit`].
 #[derive(Debug, thiserror::Error)]
 pub enum RunApproveError {
     #[error("staging repo preparation failed: {0}")]
@@ -86,7 +103,7 @@ pub enum RunApproveError {
     Plan(#[from] FastForwardPlanError),
     #[error("could not open `git cat-file --batch` against the staging repo: {0}")]
     OpenObjectSource(#[from] OpenError),
-    #[error("execute_fast_forward_plan failed: {0}")]
+    #[error("prepare_fast_forward_plan failed: {0}")]
     Execute(#[from] ExecuteError),
 }
 
@@ -128,14 +145,72 @@ pub enum PrepareStagingError {
     GitUnbundle(String),
 }
 
-/// Drive the full approve pipeline end-to-end.
+/// An approve pipeline that has run every step that provably cannot
+/// have moved the branch on GitHub, and is one `PATCH` away from
+/// publishing. Produced by [`prepare_approve`], consumed by
+/// [`PreparedApprove::commit`].
+///
+/// Holding this value means: the staging repo has been built, fetched,
+/// unbundled, planned and torn down again; the lease was checked before
+/// and after the walk; every object the push needs is uploaded to
+/// GitHub's object database, unreferenced. None of that is observable
+/// to anyone else and none of it can be a partial publish, so the
+/// caller's attempt row can still be in the cheap, auto-recoverable
+/// `Started` state.
+///
+/// The PATCH is the step past which the broker cannot prove whether
+/// GitHub moved — hence [`PreparedApprove::commit`] demands an
+/// [`UncertainAttempt`], which only the audit log can mint.
+#[derive(Debug)]
+pub struct PreparedApprove {
+    client: GitDataClient,
+    repo: RepoRef,
+    branch: GitBranchName,
+    attempt_id: ApproveAttemptId,
+    prepared: PreparedPromotion,
+}
+
+impl PreparedApprove {
+    /// Publish: issue the single branch-moving call of the whole
+    /// pipeline (`PATCH /git/refs/heads/<branch>`), or nothing at all
+    /// if the branch already points at the staged tip.
+    ///
+    /// `authority` is the audit log's proof that this attempt is
+    /// durably recorded as `Uncertain`, i.e. that a crash from here on
+    /// will be recognised as "a PATCH may have landed" rather than
+    /// silently retried. It is not decoration: without it there is no
+    /// way to call this function.
+    ///
+    /// The single failure type is deliberate — see [`UpdateRefError`].
+    /// Every *other* way an approve can fail already happened, and
+    /// failed, in [`prepare_approve`].
+    pub async fn commit(
+        self,
+        authority: &UncertainAttempt,
+    ) -> Result<RunApproveOutcome, UpdateRefError> {
+        assert_eq!(
+            authority.attempt_id(),
+            self.attempt_id,
+            "PATCH authorised by the wrong attempt's Uncertain row",
+        );
+        let outcome =
+            commit_prepared_promotion(&self.client, &self.repo, &self.branch, self.prepared)
+                .await?;
+        let new_app_tip = match outcome {
+            ExecuteOutcome::Noop { tip } => tip,
+            ExecuteOutcome::Advanced { new_app_tip } => new_app_tip,
+        };
+        Ok(RunApproveOutcome { new_app_tip })
+    }
+}
+
+/// Drive the approve pipeline up to (but not including) the publish.
 ///
 /// Inputs come from the audit/staging layer (the staged push receipt
 /// plus the bundle bytes) and from the handler's mint step (the
-/// `api_base` and `token` for the GitHub installation). Outputs:
-/// [`RunApproveOutcome::new_app_tip`] is the App-identity SHA the
-/// branch on GitHub now points at (or, for a noop push, the SHA it
-/// already pointed at).
+/// `api_base` and `token` for the GitHub installation). The output is a
+/// [`PreparedApprove`]; call [`PreparedApprove::commit`] — with the
+/// attempt recorded `Uncertain` first — to actually move the branch.
 ///
 /// On error the partially-populated staging dir is still removed; on
 /// success the staging dir is removed before returning. Removal
@@ -146,17 +221,17 @@ pub enum PrepareStagingError {
 /// moved).
 ///
 /// `signing_key` is required (B-track pins app-identity signing) and
-/// is forwarded as `Some(...)` to `execute_fast_forward_plan`. The
+/// is forwarded as `Some(...)` to [`prepare_fast_forward_plan`]. The
 /// `Option` arm in the layer below is reserved for the
 /// `AlreadyAtExpected` short-circuit, where no commits are signed
 /// anyway, plus pre-B1d call sites that no longer exist in main.
 // Each argument is a distinct concern (runtime config / GitHub
 // access / repo identity / branch / lease anchor / bundle payload /
-// signing identity / trailer set / per-request id). Bundling them
-// adds a struct layer without simplifying the call site, so the
-// flat shape matches `execute_fast_forward_plan` precedent.
+// signing identity / trailer set / per-request and attempt ids).
+// Bundling them adds a struct layer without simplifying the call site,
+// so the flat shape matches `prepare_fast_forward_plan` precedent.
 #[allow(clippy::too_many_arguments)]
-pub async fn run_approve(
+pub async fn prepare_approve(
     runtime: &PromoteRuntimeConfig,
     api_base: &str,
     token: &GitSecretValue,
@@ -168,7 +243,8 @@ pub async fn run_approve(
     signing_key: &WritSigningKey,
     trailers: &[TrailerSource],
     request_id: RequestId,
-) -> Result<RunApproveOutcome, RunApproveError> {
+    attempt_id: ApproveAttemptId,
+) -> Result<PreparedApprove, RunApproveError> {
     let staging = prepare_staging_repo(
         runtime,
         request_id,
@@ -179,7 +255,7 @@ pub async fn run_approve(
     )
     .await?;
 
-    let result = run_approve_with_staging_repo(
+    let result = prepare_approve_with_staging_repo(
         &staging,
         runtime,
         api_base,
@@ -190,6 +266,7 @@ pub async fn run_approve(
         bundle_tip,
         signing_key,
         trailers,
+        attempt_id,
     )
     .await;
 
@@ -209,7 +286,7 @@ pub async fn run_approve(
 /// full prepare cost (real `git fetch` against a real origin is out
 /// of scope for fast unit tests).
 #[allow(clippy::too_many_arguments)]
-pub async fn run_approve_with_staging_repo(
+pub async fn prepare_approve_with_staging_repo(
     staging: &StagingRepo,
     runtime: &PromoteRuntimeConfig,
     api_base: &str,
@@ -220,7 +297,8 @@ pub async fn run_approve_with_staging_repo(
     bundle_tip: &GitObjectId,
     signing_key: &WritSigningKey,
     trailers: &[TrailerSource],
-) -> Result<RunApproveOutcome, RunApproveError> {
+    attempt_id: ApproveAttemptId,
+) -> Result<PreparedApprove, RunApproveError> {
     // Mirror `git_push_replay::ingest_bundle`'s commit-type gate. The
     // bundle has been unbundled into the staging repo by this point;
     // `cat-file -t <bundle_tip>` reports the object's *literal* type
@@ -246,13 +324,16 @@ pub async fn run_approve_with_staging_repo(
     )
     .await?;
 
+    // Bounded on every phase: an approve runs with the attempt row in
+    // flight, so a GitHub endpoint that black-holes or withholds must
+    // fail the attempt rather than park it forever.
     let client = GitDataClient::new(
-        reqwest::Client::new(),
+        git_data_http_client(GitDataTimeouts::production()),
         api_base.to_string(),
         token.as_str().to_string(),
     );
 
-    let outcome = execute_fast_forward_plan(
+    let prepared = prepare_fast_forward_plan(
         &client,
         repo,
         branch,
@@ -267,15 +348,16 @@ pub async fn run_approve_with_staging_repo(
     // `close()` reaps the `git cat-file --batch` child even on error
     // paths above; ignore its result because it only signals stderr
     // chatter at this point, and the orchestrator's success/failure
-    // is fully captured by `outcome`.
+    // is fully captured by `prepared`.
     let _ = source.close().await;
 
-    let new_app_tip = match outcome? {
-        ExecuteOutcome::Noop { tip } => tip,
-        ExecuteOutcome::Advanced { new_app_tip } => new_app_tip,
-    };
-
-    Ok(RunApproveOutcome { new_app_tip })
+    Ok(PreparedApprove {
+        client,
+        repo: repo.clone(),
+        branch: branch.clone(),
+        attempt_id,
+        prepared: prepared?,
+    })
 }
 
 /// Owns the on-disk staging repo path for a single approve cycle.
@@ -725,7 +807,7 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::*;
-    use crate::github_git_db::CommitIdentity;
+    use crate::github_git_db::{CommitIdentity, GitDataError};
     use crate::vm_git::GitBranchName;
     use crate::vm_git_bundle::{GitCloneBaseUrl, GitCredentialBoundary, GitSecretEnvVar};
 
@@ -1005,6 +1087,40 @@ mod tests {
         .expect("sample identity must be valid")
     }
 
+    /// Drive both production halves back to back, standing in for the
+    /// `mark_attempt_uncertain` the broker does in between. Tests that
+    /// care about *which* half a failure comes from call the halves
+    /// directly instead.
+    #[allow(clippy::too_many_arguments)]
+    async fn prepare_and_commit(
+        staging: &StagingRepo,
+        runtime: &PromoteRuntimeConfig,
+        api_base: &str,
+        repo: &RepoRef,
+        branch: &GitBranchName,
+        expected_remote_head: &GitObjectId,
+        bundle_tip: &GitObjectId,
+    ) -> Result<Result<RunApproveOutcome, UpdateRefError>, RunApproveError> {
+        let attempt_id = ApproveAttemptId::new();
+        let prepared = prepare_approve_with_staging_repo(
+            staging,
+            runtime,
+            api_base,
+            &sample_token(),
+            repo,
+            branch,
+            expected_remote_head,
+            bundle_tip,
+            &sample_signing_key(),
+            &[],
+            attempt_id,
+        )
+        .await?;
+        Ok(prepared
+            .commit(&UncertainAttempt::for_test(attempt_id))
+            .await)
+    }
+
     fn ref_response_body(branch: &str, sha: &GitObjectId) -> serde_json::Value {
         json!({
             "ref": format!("refs/heads/{branch}"),
@@ -1093,20 +1209,18 @@ mod tests {
             .await;
 
         let branch = GitBranchName::new("main").unwrap();
-        let outcome = run_approve_with_staging_repo(
+        let outcome = prepare_and_commit(
             &staging,
             &runtime,
             &server.uri(),
-            &sample_token(),
             &sample_repo().as_repo_ref().clone(),
             &branch,
             &parent,
             &child,
-            &sample_signing_key(),
-            &[],
         )
         .await
-        .expect("happy-path approve must succeed");
+        .expect("happy-path approve must prepare")
+        .expect("happy-path approve must commit");
 
         assert_eq!(outcome.new_app_tip(), &new_app_tip);
     }
@@ -1147,17 +1261,14 @@ mod tests {
             .await;
 
         let branch = GitBranchName::new("main").unwrap();
-        let err = run_approve_with_staging_repo(
+        let err = prepare_and_commit(
             &staging,
             &runtime,
             &server.uri(),
-            &sample_token(),
             &sample_repo().as_repo_ref().clone(),
             &branch,
             &parent,
             &child,
-            &sample_signing_key(),
-            &[],
         )
         .await
         .expect_err("pre-walk lease miss must surface as ExpectedHeadMoved");
@@ -1200,29 +1311,28 @@ mod tests {
             .await;
 
         let branch = GitBranchName::new("main").unwrap();
-        let outcome = run_approve_with_staging_repo(
+        let outcome = prepare_and_commit(
             &staging,
             &runtime,
             &server.uri(),
-            &sample_token(),
             &sample_repo().as_repo_ref().clone(),
             &branch,
             &child,
             &child,
-            &sample_signing_key(),
-            &[],
         )
         .await
-        .expect("noop approve must succeed");
+        .expect("noop approve must prepare")
+        .expect("noop approve must commit");
 
         assert_eq!(outcome.new_app_tip(), &child);
     }
 
     /// `PATCH /git/refs/heads/<branch>` returns non-2xx after a
     /// successful walk. The walker's commits *did* land on GitHub but
-    /// the ref was not advanced; the orchestrator surfaces
-    /// `ExecuteError::UpdateRef` and the operator's audit row records
-    /// the failure cause.
+    /// the ref was not advanced. The failure must come out of the
+    /// *commit* half — `prepare` has to have succeeded, because that is
+    /// what tells the broker to record `Uncertain` before the PATCH and
+    /// `PostPatchFailure` after it.
     #[tokio::test]
     async fn run_approve_surfaces_update_ref_failure_after_walk() {
         if maybe_git().is_none() {
@@ -1273,25 +1383,156 @@ mod tests {
             .await;
 
         let branch = GitBranchName::new("main").unwrap();
-        let err = run_approve_with_staging_repo(
+        let err = prepare_and_commit(
+            &staging,
+            &runtime,
+            &server.uri(),
+            &sample_repo().as_repo_ref().clone(),
+            &branch,
+            &parent,
+            &child,
+        )
+        .await
+        .expect("the walk and both lease checks succeed: this failure is the PATCH's")
+        .expect_err("update_ref failure must surface");
+
+        let UpdateRefError(GitDataError::ApiError { status, .. }) = err else {
+            panic!("expected an update_ref API error, got: {err:?}");
+        };
+        assert_eq!(status.as_u16(), 422);
+    }
+
+    /// The load-bearing property of the split: `prepare_approve` must
+    /// carry the pipeline all the way to the PATCH's doorstep — both
+    /// lease checks and every object upload — *without* issuing the
+    /// PATCH. That is what lets the broker leave the attempt row in the
+    /// auto-recoverable `Started` state across the whole expensive,
+    /// network-bound part of an approve, and only enter the
+    /// manually-reconciled `Uncertain` state for the one round-trip
+    /// that can actually move the branch.
+    ///
+    /// `expect(0)` on the PATCH mock is the assertion; dropping the
+    /// `PreparedApprove` un-committed must leave GitHub's branch where
+    /// it was.
+    #[tokio::test]
+    async fn prepare_approve_uploads_every_object_but_never_patches() {
+        if maybe_git().is_none() {
+            eprintln!("skipping: `git` not on PATH");
+            return;
+        }
+        let (tmp, staging_path, parent, child) = build_real_staging_repo();
+        let staging = StagingRepo::from_path_for_test(staging_path);
+        let runtime = runtime_pointed_at(tmp.path());
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/name/git/ref/heads/main"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(ref_response_body("main", &parent)),
+            )
+            // Both lease checks — the pre-walk one and the post-walk
+            // recheck — belong to the prepare half.
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/repos/owner/name/git/trees"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+                "sha": sample_object_id('e').as_str(),
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/repos/owner/name/git/commits"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+                "sha": sample_object_id('f').as_str(),
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let prepared = prepare_approve_with_staging_repo(
             &staging,
             &runtime,
             &server.uri(),
             &sample_token(),
             &sample_repo().as_repo_ref().clone(),
-            &branch,
+            &GitBranchName::new("main").unwrap(),
             &parent,
             &child,
             &sample_signing_key(),
             &[],
+            ApproveAttemptId::new(),
         )
         .await
-        .expect_err("update_ref failure must surface");
+        .expect("prepare must run the walk to completion");
 
-        assert!(matches!(
-            err,
-            RunApproveError::Execute(ExecuteError::UpdateRef(_))
-        ));
+        drop(prepared);
+        // `MockServer`'s `expect` bounds are verified on drop; make the
+        // failure legible if the PATCH did fire.
+        server.verify().await;
+    }
+
+    /// The witness is per-attempt: committing a prepared approve under
+    /// some *other* attempt's `Uncertain` row would publish to GitHub
+    /// with the wrong row holding the "a PATCH may exist" record — the
+    /// exact confusion the witness exists to prevent. Fail loudly.
+    #[tokio::test]
+    #[should_panic(expected = "PATCH authorised by the wrong attempt")]
+    async fn commit_under_another_attempts_witness_panics() {
+        if maybe_git().is_none() {
+            // `should_panic` cannot be skipped conditionally, so panic
+            // with the expected message to keep a git-less box green.
+            panic!("PATCH authorised by the wrong attempt (skipped: `git` not on PATH)");
+        }
+        let (tmp, staging_path, parent, child) = build_real_staging_repo();
+        let staging = StagingRepo::from_path_for_test(staging_path);
+        let runtime = runtime_pointed_at(tmp.path());
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/name/git/ref/heads/main"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(ref_response_body("main", &parent)),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+                "sha": sample_object_id('e').as_str(),
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let prepared = prepare_approve_with_staging_repo(
+            &staging,
+            &runtime,
+            &server.uri(),
+            &sample_token(),
+            &sample_repo().as_repo_ref().clone(),
+            &GitBranchName::new("main").unwrap(),
+            &parent,
+            &child,
+            &sample_signing_key(),
+            &[],
+            ApproveAttemptId::new(),
+        )
+        .await
+        .expect("prepare must succeed");
+
+        let someone_elses = UncertainAttempt::for_test(ApproveAttemptId::new());
+        let _ = prepared.commit(&someone_elses).await;
     }
 
     // ---------- prepare-side real-git regression tests ----------
@@ -1423,17 +1664,14 @@ mod tests {
         // Reject before any HTTP traffic is issued: no mocks needed,
         // but assert the staging-repo type check fires first.
         let branch = GitBranchName::new("main").unwrap();
-        let err = run_approve_with_staging_repo(
+        let err = prepare_and_commit(
             &staging,
             &runtime,
             &server.uri(),
-            &sample_token(),
             &sample_repo().as_repo_ref().clone(),
             &branch,
             &commit,
             &tag_sha,
-            &sample_signing_key(),
-            &[],
         )
         .await
         .expect_err("tag-SHA bundle tip must be rejected before planning");

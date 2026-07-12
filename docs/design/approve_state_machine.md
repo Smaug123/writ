@@ -52,11 +52,15 @@ Started ──► Uncertain ──── update_ref ───────┤
 ```
 
 - **Started**: written immediately on entry to `approve_staged_push`,
-  before mint, before `run_approve`. Records the operator, the
+  before mint, before `prepare_approve`. Records the operator, the
   push_request_id, and `started_at`. Pre-PATCH transient failures
   (mint failure, prepare failure, plan failure, walker failure,
   pre-PATCH lease failures) transition to
-  `Resolved(PrePatchFailure)`.
+  `Resolved(PrePatchFailure)`. Note that the entire expensive,
+  network-bound part of an approve — the staging fetch, the unbundle,
+  and every object upload — runs in this state: none of it can move a
+  branch, and boot reconcile resolves a wedged `Started` row without an
+  operator.
 - **Uncertain**: written in the same SQLite transaction that completes
   the *last* check before `update_ref` is called — the post-walker
   lease check. Once `Uncertain` lands, the broker has committed to
@@ -161,8 +165,8 @@ mint() ; on fail:
     UPDATE state='resolved', outcome='pre_patch_failure',
            failure_detail=..., completed_at=now                            -- TX
     return Error
-prepare/plan/walker  ; on fail (any non-update_ref ExecuteError, any
-    non-Execute RunApproveError):
+prepare_approve()  ; on fail (any RunApproveError — the type cannot
+    express a PATCH failure, so every one of them is provably pre-PATCH):
     -- mint succeeded but no PATCH was issued. `pre_patch_failure`
     -- proves GitHub is unchanged (retry is safe), but the burned
     -- credential is recorded inline so the audit log can still answer
@@ -173,7 +177,10 @@ prepare/plan/walker  ; on fail (any non-update_ref ExecuteError, any
            failure_detail=..., completed_at=now                            -- TX
     return Error
 UPDATE state='uncertain', mint_jti=..., mint_*                              -- TX2 (load-bearing)
-run_approve.execute_update_ref()
+  -- yields an `UncertainAttempt` witness, which is the only key that
+  -- opens `PreparedApprove::commit`. The PATCH is unreachable without
+  -- this row, so TX2 cannot drift back to before the walker again.
+prepared.commit(&witness)   -- issues the one branch-moving call
   case Ok(Noop | Advanced { new_app_tip }):
     -- single transaction commits both halves
     BEGIN
@@ -187,13 +194,13 @@ run_approve.execute_update_ref()
     COMMIT
     DELETE staging dir (best-effort, post-TX, warn on failure)
     return StagedPushApproved
-  case Err(ExecuteError::UpdateRef(_)):
+  case Err(UpdateRefError):
+    -- the only error `commit` has. Its existence *is* the proof that a
+    -- PATCH reached GitHub and did not confirm, so there is no variant
+    -- to classify and no way to mis-classify it.
     UPDATE state='resolved', outcome='post_patch_failure',
            failure_detail=..., completed_at=now                             -- TX
     log AUDIT_WRITE_FAILURE_TARGET ; return Error
-  case Err(other ExecuteError variant):
-    UPDATE state='resolved', outcome='pre_patch_failure', ...               -- TX
-    return Error
 ```
 
 The TX2 transition replaces the R6 marker file. If the broker crashes

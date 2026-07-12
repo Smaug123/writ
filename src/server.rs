@@ -30,8 +30,8 @@ use crate::core::{
     SessionId, SessionRecord, TtlSeconds, UnixMillis,
 };
 use crate::core::{NotesRef, Sha256Hex};
-use crate::git_push_approve::{RunApproveError, run_approve};
-use crate::git_push_promote::{ExecuteError, PromoteRuntimeConfig};
+use crate::git_push_approve::{RunApproveError, prepare_approve};
+use crate::git_push_promote::PromoteRuntimeConfig;
 use crate::git_push_staging::{GitPushStagingStore, StagedEntry, StagingError};
 use crate::github::GitHubMinter;
 use crate::notes_repo::NotesRepo;
@@ -988,14 +988,22 @@ async fn start_approve_attempt_row<S: SecretStore + Send + Sync + 'static>(
 }
 
 /// Drive a freshly-`Started` attempt to a terminal state and return the
-/// new app tip on success. Mints a one-shot installation token, marks the
-/// attempt `Uncertain` (the commit point past which a concurrent reject is
-/// refused), runs the approve pipeline, and commits the joint
+/// new app tip on success. Mints a one-shot installation token, runs the
+/// approve pipeline up to the publish, marks the attempt `Uncertain`
+/// (the commit point past which the broker can no longer prove GitHub
+/// did not move), issues the `PATCH`, and commits the joint
 /// success/resolution TX. Every failure path first resolves the attempt
 /// through the appropriate `resolve_*_failure` DAO (so the row never stays
 /// `Started`/`Uncertain` on a returned error) and then yields the wire
 /// `Error` for the caller to return; this is the one place the
 /// `attempt_id`/`mint_audit` threading lives.
+///
+/// The `Uncertain` window is deliberately as narrow as the GitHub API
+/// permits — one `PATCH` round-trip. Everything before it (staging
+/// fetch, unbundle, plan, object uploads) leaves the branch untouched
+/// and so runs under `Started`, which boot reconcile resolves without
+/// an operator. Only a crash that could have moved the branch earns a
+/// manual reconciliation.
 // `result_large_err`: `ServerMessage` is the wire reply type; this transient
 // local Result early-returns it unchanged, so boxing would only add indirection
 // at every construction site. `too_many_arguments`: the flat shape matches the
@@ -1060,19 +1068,86 @@ async fn execute_started_attempt<S: SecretStore + Send + Sync + 'static>(
         }
     };
 
-    // Commit to "the PATCH may exist on GitHub": from here until
-    // `Resolved` lands the attempt is `Uncertain` and the new
+    let receipt = entry.receipt();
+    let repo = receipt.repo().clone();
+    let branch = receipt.branch().clone();
+    let expected_remote_head = receipt
+        .expected_remote_head()
+        .cloned()
+        .expect("expected_remote_head presence was checked by check_approvable_push");
+    let bundle_tip = receipt.new_head().clone();
+    let (_, bundle_bytes) = entry.into_parts();
+
+    // Phase 1 — everything that provably cannot move the branch on
+    // GitHub: fetch, unbundle, plan, and the walker's object uploads.
+    // The attempt row stays `Started` throughout, which is the state
+    // boot reconcile can resolve on its own, so a crash anywhere in
+    // here costs a retry rather than a manual reconciliation.
+    let prepare_result = prepare_approve(
+        promote_runtime,
+        &api_base,
+        &token,
+        &repo,
+        &branch,
+        &expected_remote_head,
+        &bundle_tip,
+        &bundle_bytes,
+        signing_key,
+        // Trailers are an open follow-up: the design pins a per-approve
+        // trailer set (operator id, original commit sha) but the policy
+        // hasn't been ratified yet, so the slice ships with no trailers
+        // and the bundle's commits are replayed verbatim. The empty
+        // slice is identical in shape to what the prepare_approve unit
+        // tests pass.
+        &[],
+        request_id,
+        attempt_id,
+    )
+    .await;
+
+    let prepared = match prepare_result {
+        Ok(prepared) => prepared,
+        Err(err) => {
+            // Every `RunApproveError` is pre-PATCH by construction —
+            // the type cannot express a PATCH failure, which is why the
+            // classification is no longer a match on variants. The
+            // attempt is still `Started`, so the mint context is
+            // captured here (it has nowhere else to be recorded).
+            //
+            // `err` can wrap `GitDataError::ApiError { body, .. }`
+            // whose `body` is unbounded GitHub/GHES bytes; cap both
+            // the audit `detail` and the wire `message` at
+            // `MAX_WIRE_ERROR_BYTES` so a hostile or misbehaving
+            // server can't bloat the audit DB column or blow up the
+            // `ServerMessage::Error` envelope.
+            let detail =
+                truncate_for_wire(format!("run_approve failed: {err}"), MAX_WIRE_ERROR_BYTES);
+            resolve_pre_patch_failure(state, attempt_id, request_id, &detail, Some(mint_audit))
+                .await;
+            let message = match &err {
+                RunApproveError::Prepare(_) => format!("staging preparation failed: {err}"),
+                _ => format!("approve pipeline failed: {err}"),
+            };
+            return Err(ServerMessage::Error {
+                message: truncate_for_wire(message, MAX_WIRE_ERROR_BYTES),
+            });
+        }
+    };
+
+    // Phase 2 — commit to "the PATCH may exist on GitHub". From here
+    // until `Resolved` lands the attempt is `Uncertain`, and the
     // `git_push_resolution_refuses_active_approve` trigger blocks any
-    // concurrent reject. Failures from `run_approve` after this point
-    // resolve through the `complete_attempt_*` DAO methods, never via
-    // a direct `record_git_push_resolution` call.
+    // concurrent reject (it already did while `Started`, so narrowing
+    // this window does not open a reject race). The `UncertainAttempt`
+    // this yields is the only key that opens `PreparedApprove::commit`,
+    // so the record cannot fall on the wrong side of the PATCH.
     let uncertain_result = {
         let audit = Arc::clone(&state.audit);
         tokio::task::spawn_blocking(move || audit.mark_attempt_uncertain(attempt_id, mint_audit))
             .await
     };
-    match uncertain_result {
-        Ok(Ok(())) => {}
+    let authority = match uncertain_result {
+        Ok(Ok(authority)) => authority,
         Ok(Err(err)) => {
             // The attempt row is still `Started` (the UPDATE was
             // refused) so a `pre_patch_failure` capturing the mint is
@@ -1092,81 +1167,27 @@ async fn execute_started_attempt<S: SecretStore + Send + Sync + 'static>(
                 message: format!("approve attempt Uncertain task failed: {err}"),
             });
         }
-    }
+    };
 
-    let receipt = entry.receipt();
-    let repo = receipt.repo().clone();
-    let branch = receipt.branch().clone();
-    let expected_remote_head = receipt
-        .expected_remote_head()
-        .cloned()
-        .expect("expected_remote_head presence was checked by check_approvable_push");
-    let bundle_tip = receipt.new_head().clone();
-    let (_, bundle_bytes) = entry.into_parts();
-
-    let run_result = run_approve(
-        promote_runtime,
-        &api_base,
-        &token,
-        &repo,
-        &branch,
-        &expected_remote_head,
-        &bundle_tip,
-        &bundle_bytes,
-        signing_key,
-        // Trailers are an open follow-up: the design pins a per-approve
-        // trailer set (operator id, original commit sha) but the policy
-        // hasn't been ratified yet, so the slice ships with no trailers
-        // and the bundle's commits are replayed verbatim. The empty
-        // slice is identical in shape to what the run_approve unit
-        // tests pass.
-        &[],
-        request_id,
-    )
-    .await;
-
-    let outcome = match run_result {
+    // Phase 3 — the PATCH. Its one error type *is* the proof that a
+    // ref update reached GitHub and did not confirm, so it resolves as
+    // `PostPatchFailure` with no classification to get wrong.
+    let outcome = match prepared.commit(&authority).await {
         Ok(outcome) => outcome,
         Err(err) => {
-            // `Execute(UpdateRef(_))` is the only variant that proves a
-            // PATCH was sent to GitHub; every other variant fires
-            // before `execute_fast_forward_plan` issues
-            // `PATCH /git/refs/...`. Map the variant onto the
-            // attempt's terminal state accordingly.
-            //
-            // `err` can wrap `GitDataError::ApiError { body, .. }`
-            // whose `body` is unbounded GitHub/GHES bytes; cap both
-            // the audit `detail` and the wire `message` at
-            // `MAX_WIRE_ERROR_BYTES` so a hostile or misbehaving
-            // server can't bloat the audit DB column or blow up the
-            // `ServerMessage::Error` envelope.
             let detail =
                 truncate_for_wire(format!("run_approve failed: {err}"), MAX_WIRE_ERROR_BYTES);
-            match &err {
-                RunApproveError::Execute(ExecuteError::UpdateRef(_)) => {
-                    resolve_post_patch_failure(state, attempt_id, request_id, &detail).await;
-                    return Err(ServerMessage::Error {
-                        message: truncate_for_wire(
-                            format!(
-                                "approve pipeline issued update_ref against GitHub but the \
-                                 response could not be confirmed; staged push {request_id} is \
-                                 quarantined and must be reconciled manually: {err}"
-                            ),
-                            MAX_WIRE_ERROR_BYTES,
-                        ),
-                    });
-                }
-                _ => {
-                    resolve_pre_patch_failure(state, attempt_id, request_id, &detail, None).await;
-                    let message = match &err {
-                        RunApproveError::Prepare(_) => format!("staging preparation failed: {err}"),
-                        _ => format!("approve pipeline failed: {err}"),
-                    };
-                    return Err(ServerMessage::Error {
-                        message: truncate_for_wire(message, MAX_WIRE_ERROR_BYTES),
-                    });
-                }
-            }
+            resolve_post_patch_failure(state, attempt_id, request_id, &detail).await;
+            return Err(ServerMessage::Error {
+                message: truncate_for_wire(
+                    format!(
+                        "approve pipeline issued update_ref against GitHub but the response \
+                         could not be confirmed; staged push {request_id} is quarantined and \
+                         must be reconciled manually: {err}"
+                    ),
+                    MAX_WIRE_ERROR_BYTES,
+                ),
+            });
         }
     };
 

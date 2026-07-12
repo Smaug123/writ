@@ -156,6 +156,37 @@ pub enum GitPushApproveAttemptState {
     },
 }
 
+/// Proof that an approve attempt is durably recorded as `Uncertain`.
+///
+/// Only [`AuditLog::mark_attempt_uncertain`] can produce one (the field
+/// is private to this module), and the promote layer requires one to
+/// issue its `PATCH`. So "the audit log records that a PATCH may exist
+/// *before* one can" is a fact the compiler checks rather than an
+/// ordering convention someone has to keep honouring: without the row
+/// there is no witness, and without the witness there is no PATCH.
+///
+/// It deliberately does *not* implement `Clone`/`Copy`. A witness is
+/// about one attempt; carrying `attempt_id` lets the promote layer
+/// check it is being handed the witness for the attempt it prepared.
+#[derive(Debug, Eq, PartialEq)]
+pub struct UncertainAttempt {
+    attempt_id: ApproveAttemptId,
+}
+
+impl UncertainAttempt {
+    pub fn attempt_id(&self) -> ApproveAttemptId {
+        self.attempt_id
+    }
+
+    /// Fabricate a witness without touching an audit log. Tests of the
+    /// promote layer drive the PATCH directly and have no `AuditLog` to
+    /// mint one from; production code cannot reach this.
+    #[cfg(test)]
+    pub(crate) fn for_test(attempt_id: ApproveAttemptId) -> Self {
+        Self { attempt_id }
+    }
+}
+
 /// A `git_push_approve_attempt` row read back from the audit log.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GitPushApproveAttemptEntry {
@@ -745,11 +776,16 @@ impl AuditLog {
     /// GitHub `update_ref` PATCH: once this commit lands the broker
     /// owes the audit log a `Resolved` row, and reject must be refused
     /// in the interim.
+    ///
+    /// Returns the [`UncertainAttempt`] witness. The promote layer
+    /// demands one to issue its PATCH, so "the durable record that a
+    /// PATCH may exist precedes the PATCH" is a fact the type system
+    /// checks rather than a comment someone has to keep honouring.
     pub fn mark_attempt_uncertain(
         &self,
         attempt_id: ApproveAttemptId,
         mint: PromoteMintAudit,
-    ) -> Result<(), AuditError> {
+    ) -> Result<UncertainAttempt, AuditError> {
         let github_app_id = i64::try_from(mint.github_app_id).map_err(|_| {
             AuditError::Invariant("approve attempt mint github_app_id exceeds SQLite integer")
         })?;
@@ -776,7 +812,7 @@ impl AuditLog {
                     "approve attempt is not in 'started' state",
                 ));
             }
-            Ok(())
+            Ok(UncertainAttempt { attempt_id })
         })
     }
 
