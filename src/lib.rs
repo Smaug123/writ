@@ -36,6 +36,8 @@ pub mod cli;
 pub mod config;
 pub use writ_core::core;
 #[cfg(feature = "host")]
+pub(crate) mod crash_point;
+#[cfg(feature = "host")]
 pub mod flake_lock;
 #[cfg(feature = "host")]
 pub mod flake_materialize;
