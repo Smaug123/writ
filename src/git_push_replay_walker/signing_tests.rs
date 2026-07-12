@@ -72,6 +72,7 @@ async fn replay_with_signing_key_sends_verifiable_signature_to_create_commit() {
         .and(path("/repos/owner/name/git/commits"))
         .respond_with(ResponseTemplate::new(201).set_body_json(json!({
             "sha": commit_app.as_str(),
+            "verification": { "verified": true, "reason": "valid" },
         })))
         .expect(1)
         .mount(&server)
@@ -171,11 +172,14 @@ async fn replay_with_signing_key_signs_every_commit_in_a_chain() {
     mount_tree_create(&server, json!({ "tree": [] }), &tree_app).await;
 
     // Two POSTs to /git/commits, sequenced by .up_to_n_times(1)
-    // + a second mount so each one returns its own SHA.
+    // + a second mount so each one returns its own SHA. Both carry an
+    // affirmative verification verdict: these are signed requests, and
+    // `create_commit` will not return a SHA GitHub declined to verify.
     Mock::given(method("POST"))
         .and(path("/repos/owner/name/git/commits"))
         .respond_with(ResponseTemplate::new(201).set_body_json(json!({
             "sha": c0_app.as_str(),
+            "verification": { "verified": true, "reason": "valid" },
         })))
         .up_to_n_times(1)
         .mount(&server)
@@ -184,6 +188,7 @@ async fn replay_with_signing_key_signs_every_commit_in_a_chain() {
         .and(path("/repos/owner/name/git/commits"))
         .respond_with(ResponseTemplate::new(201).set_body_json(json!({
             "sha": c1_app.as_str(),
+            "verification": { "verified": true, "reason": "valid" },
         })))
         .mount(&server)
         .await;

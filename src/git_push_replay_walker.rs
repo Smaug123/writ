@@ -57,6 +57,13 @@
 //! signature verifies against the commit GitHub assembles and the
 //! published commit's `verification.verified` flag is true.
 //!
+//! That last step is *checked*, not assumed:
+//! [`crate::github_git_db::GitDataClient::create_commit`] reads
+//! GitHub's `verification` verdict back off the create response and
+//! refuses to return a SHA it declined to verify, so a walk that
+//! completes has published only Verified commits and a walk that hits
+//! an unverified one fails before its caller can move the branch ref.
+//!
 //! Callers that do not want signed commits (test fixtures, the
 //! pre-promote bring-up flows) pass `None` and the request goes out
 //! with `signature: None`, matching the pre-B1d behaviour exactly.

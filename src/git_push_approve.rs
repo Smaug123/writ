@@ -1075,6 +1075,10 @@ mod tests {
                     "email": sample_identity().email(),
                     "date": "2024-01-15T10:30:45Z",
                 },
+                // The approve path signs, so GitHub's affirmative
+                // verification verdict is part of a faithful response —
+                // without it `create_commit` refuses the SHA.
+                "verification": { "verified": true, "reason": "valid" },
             })))
             .expect(1)
             .mount(&server)
@@ -1252,6 +1256,7 @@ mod tests {
             .and(path("/repos/owner/name/git/commits"))
             .respond_with(ResponseTemplate::new(201).set_body_json(json!({
                 "sha": new_app_tip.as_str(),
+                "verification": { "verified": true, "reason": "valid" },
             })))
             .expect(1)
             .mount(&server)
