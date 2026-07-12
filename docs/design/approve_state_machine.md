@@ -193,7 +193,20 @@ UPDATE state='uncertain', mint_jti=..., mint_*                              -- T
   -- yields an `UncertainAttempt` witness, which is the only key that
   -- opens `PreparedApprove::commit`. The PATCH is unreachable without
   -- this row, so TX2 cannot drift back to before the walker again.
-prepared.commit(&witness)   -- issues the one branch-moving call
+prepared.commit(&witness)   -- final lease recheck + the one branch-moving call
+  -- re-verifies GET /git/ref/heads/<branch> == expected_remote_head
+  -- immediately before the PATCH, so the time the broker spends
+  -- between prepare and here (object-source reaping, TX2) is outside
+  -- the publish race. GitHub's force=false PATCH is fast-forward-only,
+  -- not compare-and-swap: without this, a branch rewound to an
+  -- ancestor during that interval would still accept the PATCH and
+  -- publish against a baseline the approval never covered.
+  case Err(FinalLeaseLookup | FinalLeaseMoved):
+    -- provably pre-PATCH (the PATCH was never sent); the trigger
+    -- admits Uncertain → Resolved(PrePatchFailure), mint preserved
+    UPDATE state='resolved', outcome='pre_patch_failure',
+           failure_detail=..., completed_at=now                             -- TX
+    return Error (push remains retryable / rejectable)
   case Ok(Noop | Advanced { new_app_tip }):
     -- single transaction commits both halves
     BEGIN
@@ -207,10 +220,11 @@ prepared.commit(&witness)   -- issues the one branch-moving call
     COMMIT
     DELETE staging dir (best-effort, post-TX, warn on failure)
     return StagedPushApproved
-  case Err(UpdateRefError):
-    -- the only error `commit` has. Its existence *is* the proof that a
-    -- PATCH reached GitHub and did not confirm, so there is no variant
-    -- to classify and no way to mis-classify it.
+  case Err(UpdateRef(_)):
+    -- the only variant that wraps a *sent* PATCH; its existence is the
+    -- proof that a PATCH reached GitHub and did not confirm. The
+    -- classification is the variant match itself — no cause-string
+    -- inspection to get wrong.
     UPDATE state='resolved', outcome='post_patch_failure',
            failure_detail=..., completed_at=now                             -- TX
     log AUDIT_WRITE_FAILURE_TARGET ; return Error

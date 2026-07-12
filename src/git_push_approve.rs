@@ -13,12 +13,15 @@
 //! It is deliberately in two halves, split at the only step that can
 //! move a branch on GitHub. [`prepare_approve`] does everything up to
 //! the `PATCH` and hands back a [`PreparedApprove`];
-//! [`PreparedApprove::commit`] issues the `PATCH`, and demands an
-//! [`UncertainAttempt`] to do it. The handler mints that witness from
-//! the audit log in between, so the durable "a PATCH may exist" record
-//! brackets the PATCH as tightly as it can — a crash during the fetch,
-//! plan or upload leaves an attempt that boot reconcile resolves on its
-//! own instead of one an operator has to reconcile by hand.
+//! [`PreparedApprove::commit`] re-verifies the lease one final time
+//! and issues the `PATCH`, and demands an [`UncertainAttempt`] to do
+//! it. The handler mints that witness from the audit log in between,
+//! so the durable "a PATCH may exist" record brackets the PATCH as
+//! tightly as it can — a crash during the fetch, plan or upload leaves
+//! an attempt that boot reconcile resolves on its own instead of one
+//! an operator has to reconcile by hand, and the time spent minting
+//! the witness sits outside the publish race because the lease is
+//! rechecked after it.
 //!
 //! All side effects happen against the `work_root` carried by the caller's
 //! [`PromoteRuntimeConfig`] plus the GitHub API base; nothing here touches
@@ -37,7 +40,7 @@ use crate::audit::UncertainAttempt;
 use crate::clean_git::{self, CleanGitEnv, CleanGitInvocation, clean_git_config_env};
 use crate::core::{ApproveAttemptId, RepoRef};
 use crate::git_push_promote::{
-    ExecuteError, ExecuteOutcome, PreparedPromotion, PromoteRuntimeConfig, UpdateRefError,
+    CommitError, ExecuteError, ExecuteOutcome, PreparedPromotion, PromoteRuntimeConfig,
     commit_prepared_promotion, prepare_fast_forward_plan,
 };
 use crate::git_push_replay::TrailerSource;
@@ -83,8 +86,8 @@ impl RunApproveOutcome {
 ///
 /// Every one of them is provably pre-PATCH: the branch on GitHub is
 /// untouched, so the attempt is retryable. The failure that is *not*
-/// retryable has its own type, [`UpdateRefError`], and can only come
-/// out of [`PreparedApprove::commit`].
+/// retryable has its own type, [`CommitError::UpdateRef`], and can
+/// only come out of [`PreparedApprove::commit`].
 #[derive(Debug, thiserror::Error)]
 pub enum RunApproveError {
     #[error("staging repo preparation failed: {0}")]
@@ -171,9 +174,10 @@ pub struct PreparedApprove {
 }
 
 impl PreparedApprove {
-    /// Publish: issue the single branch-moving call of the whole
-    /// pipeline (`PATCH /git/refs/heads/<branch>`), or nothing at all
-    /// if the branch already points at the staged tip.
+    /// Publish: re-verify the lease one last time, then issue the
+    /// single branch-moving call of the whole pipeline
+    /// (`PATCH /git/refs/heads/<branch>`) — or nothing at all if the
+    /// branch already points at the staged tip.
     ///
     /// `authority` is the audit log's proof that this attempt is
     /// durably recorded as `Uncertain`, i.e. that a crash from here on
@@ -181,13 +185,17 @@ impl PreparedApprove {
     /// silently retried. It is not decoration: without it there is no
     /// way to call this function.
     ///
-    /// The single failure type is deliberate — see [`UpdateRefError`].
-    /// Every *other* way an approve can fail already happened, and
-    /// failed, in [`prepare_approve`].
+    /// The failure type splits by proof — see [`CommitError`]. The
+    /// `FinalLease*` variants fire before any PATCH is sent (the
+    /// caller resolves them like a prepare failure: retryable, no
+    /// quarantine); only [`CommitError::UpdateRef`] proves a PATCH
+    /// reached GitHub without a confirmed response. Every *other* way
+    /// an approve can fail already happened, and failed, in
+    /// [`prepare_approve`].
     pub async fn commit(
         self,
         authority: &UncertainAttempt,
-    ) -> Result<RunApproveOutcome, UpdateRefError> {
+    ) -> Result<RunApproveOutcome, CommitError> {
         assert_eq!(
             authority.attempt_id(),
             self.attempt_id,
@@ -847,6 +855,7 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::*;
+    use crate::git_push_promote::UpdateRefError;
     use crate::github_git_db::{CommitIdentity, GitDataError};
     use crate::vm_git::GitBranchName;
     use crate::vm_git_bundle::{GitCloneBaseUrl, GitCredentialBoundary, GitSecretEnvVar};
@@ -1135,7 +1144,7 @@ mod tests {
         branch: &GitBranchName,
         expected_remote_head: &GitObjectId,
         bundle_tip: &GitObjectId,
-    ) -> Result<Result<RunApproveOutcome, UpdateRefError>, RunApproveError> {
+    ) -> Result<Result<RunApproveOutcome, CommitError>, RunApproveError> {
         let attempt_id = ApproveAttemptId::new();
         let prepared = prepare_approve_with_staging_repo(
             staging,
@@ -1206,7 +1215,8 @@ mod tests {
             .respond_with(
                 ResponseTemplate::new(200).set_body_json(ref_response_body("main", &parent)),
             )
-            .expect(2)
+            // Pre-walk, post-walk, and commit's final pre-PATCH recheck.
+            .expect(3)
             .mount(&server)
             .await;
         Mock::given(method("POST"))
@@ -1386,7 +1396,8 @@ mod tests {
             .respond_with(
                 ResponseTemplate::new(200).set_body_json(ref_response_body("main", &parent)),
             )
-            .expect(2)
+            // Pre-walk, post-walk, and commit's final pre-PATCH recheck.
+            .expect(3)
             .mount(&server)
             .await;
         Mock::given(method("POST"))
@@ -1431,7 +1442,8 @@ mod tests {
         .expect("the walk and both lease checks succeed: this failure is the PATCH's")
         .expect_err("update_ref failure must surface");
 
-        let UpdateRefError(GitDataError::ApiError { status, .. }) = err else {
+        let CommitError::UpdateRef(UpdateRefError(GitDataError::ApiError { status, .. })) = err
+        else {
             panic!("expected an update_ref API error, got: {err:?}");
         };
         assert_eq!(status.as_u16(), 422);
@@ -1515,6 +1527,96 @@ mod tests {
         drop(prepared);
         // `MockServer`'s `expect` bounds are verified on drop; make the
         // failure legible if the PATCH did fire.
+        server.verify().await;
+    }
+
+    /// The reviewer scenario for the last-second lease recheck: both
+    /// prepare-side lease checks pass, then — during the interval the
+    /// broker spends closing the object source and writing the
+    /// `Uncertain` row — another actor rewinds the branch. A
+    /// `force=false` PATCH would still *succeed* (the prepared tip
+    /// descends from the rewound head), publishing against a baseline
+    /// the approval never covered. `commit` must therefore re-verify
+    /// the lease immediately before the PATCH and refuse without
+    /// issuing it: the `expect(0)` on the PATCH mock is the assertion.
+    #[tokio::test]
+    async fn commit_rechecks_lease_and_refuses_when_branch_moved_after_prepare() {
+        if maybe_git().is_none() {
+            eprintln!("skipping: `git` not on PATH");
+            return;
+        }
+        let (tmp, staging_path, parent, child) = build_real_staging_repo();
+        let staging = StagingRepo::from_path_for_test(staging_path);
+        let runtime = runtime_pointed_at(tmp.path());
+
+        let server = MockServer::start().await;
+        // Both prepare-side lease checks see the expected head…
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/name/git/ref/heads/main"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(ref_response_body("main", &parent)),
+            )
+            .up_to_n_times(2)
+            .expect(2)
+            .mount(&server)
+            .await;
+        // …and any later lease check sees the rewound branch.
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/name/git/ref/heads/main"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(ref_response_body("main", &sample_object_id('9'))),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/repos/owner/name/git/trees"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+                "sha": sample_object_id('e').as_str(),
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/repos/owner/name/git/commits"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+                "sha": sample_object_id('f').as_str(),
+                "verification": { "verified": true, "reason": "valid" },
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let branch = GitBranchName::new("main").unwrap();
+        let attempt_id = ApproveAttemptId::new();
+        let prepared = prepare_approve_with_staging_repo(
+            &staging,
+            &runtime,
+            &server.uri(),
+            &sample_token(),
+            &sample_repo().as_repo_ref().clone(),
+            &branch,
+            &parent,
+            &child,
+            &sample_signing_key(),
+            &[],
+            attempt_id,
+        )
+        .await
+        .expect("prepare must succeed while the lease still holds");
+
+        let err = prepared
+            .commit(&UncertainAttempt::for_test(attempt_id))
+            .await
+            .expect_err("a branch rewound after prepare must refuse to publish");
+        assert!(
+            matches!(err, CommitError::FinalLeaseMoved { .. }),
+            "expected FinalLeaseMoved, got {err:?}",
+        );
+        // The PATCH `expect(0)` is enforced here.
         server.verify().await;
     }
 

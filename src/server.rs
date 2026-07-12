@@ -31,7 +31,7 @@ use crate::core::{
 };
 use crate::core::{NotesRef, Sha256Hex};
 use crate::git_push_approve::{RunApproveError, prepare_approve};
-use crate::git_push_promote::PromoteRuntimeConfig;
+use crate::git_push_promote::{CommitError, PromoteRuntimeConfig};
 use crate::git_push_staging::{GitPushStagingStore, StagedEntry, StagingError};
 use crate::github::GitHubMinter;
 use crate::notes_repo::NotesRepo;
@@ -777,8 +777,12 @@ const APPROVE_MINT_TTL_SECONDS: i64 = GITHUB_INSTALLATION_TOKEN_MAX_SECONDS;
 ///      point until the attempt resolves. It yields the
 ///      [`crate::audit::UncertainAttempt`] witness, the only key that
 ///      opens [`crate::git_push_approve::PreparedApprove::commit`].
-///  11. `PreparedApprove::commit` issues the single branch-moving
-///      `PATCH`. Its one error type proves a `PATCH` reached GitHub
+///  11. `PreparedApprove::commit` re-verifies the lease one last time
+///      and issues the single branch-moving `PATCH`. Its error type
+///      splits by proof: the `FinalLease*` variants fire before the
+///      `PATCH` is sent (branch provably untouched →
+///      `Resolved(PrePatchFailure)`, push stays retryable), and
+///      `CommitError::UpdateRef` proves a `PATCH` reached GitHub
 ///      without a confirmed response →
 ///      `complete_attempt_post_patch_failure` (quarantines the push).
 ///  12. On success: `complete_attempt_succeeded` atomically transitions
@@ -1216,12 +1220,35 @@ async fn execute_started_attempt<S: SecretStore + Send + Sync + 'static>(
         }
     };
 
-    // Phase 3 — the PATCH. Its one error type *is* the proof that a
-    // ref update reached GitHub and did not confirm, so it resolves as
-    // `PostPatchFailure` with no classification to get wrong.
+    // Phase 3 — the last-second lease recheck and the PATCH. The error
+    // type splits by proof: the `FinalLease*` variants fire before any
+    // PATCH is sent (the branch is provably untouched, so the attempt
+    // resolves `Uncertain → Resolved(PrePatchFailure)` and the push
+    // stays retryable / rejectable), while `UpdateRef` *is* the proof
+    // that a ref update reached GitHub and did not confirm, so it
+    // resolves as `PostPatchFailure`. Matching on the variant is the
+    // whole classification — there is no cause-string inspection to
+    // get wrong.
     let outcome = match prepared.commit(&authority).await {
         Ok(outcome) => outcome,
-        Err(err) => {
+        Err(err @ (CommitError::FinalLeaseLookup(_) | CommitError::FinalLeaseMoved { .. })) => {
+            // `FinalLeaseLookup` can wrap unbounded GitHub/GHES body
+            // bytes, same as the prepare-phase errors; cap both copies.
+            let detail =
+                truncate_for_wire(format!("run_approve failed: {err}"), MAX_WIRE_ERROR_BYTES);
+            resolve_pre_patch_failure(state, attempt_id, request_id, &detail, None).await;
+            return Err(ServerMessage::Error {
+                message: truncate_for_wire(
+                    format!(
+                        "approve pipeline refused to publish: the branch could not be \
+                         re-verified at expected_remote_head immediately before update_ref; \
+                         staged push {request_id} remains retryable: {err}"
+                    ),
+                    MAX_WIRE_ERROR_BYTES,
+                ),
+            });
+        }
+        Err(err @ CommitError::UpdateRef(_)) => {
             let detail =
                 truncate_for_wire(format!("run_approve failed: {err}"), MAX_WIRE_ERROR_BYTES);
             resolve_post_patch_failure(state, attempt_id, request_id, &detail).await;
@@ -1399,8 +1426,8 @@ async fn resolve_pre_patch_failure<S: SecretStore + Send + Sync + 'static>(
 }
 
 /// Drive an `Uncertain` attempt to `Resolved(PostPatchFailure)`. Used
-/// by the two paths that prove the PATCH was sent: an
-/// `UpdateRefError` from `PreparedApprove::commit` (non-2xx /
+/// by the two paths that prove the PATCH was sent: a
+/// `CommitError::UpdateRef` from `PreparedApprove::commit` (non-2xx /
 /// transport drop on the PATCH itself) and the post-success
 /// joint-TX-failed path (the PATCH succeeded but the audit log could
 /// not commit it).
