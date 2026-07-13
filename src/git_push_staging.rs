@@ -209,12 +209,25 @@ impl GitPushStagingStore {
         };
         let mut entries = Vec::new();
         for child in read {
-            let child = child?;
-            let file_type = child.file_type()?;
-            if !file_type.is_dir() {
-                continue;
+            // A per-child readdir error (or a `file_type` that fails —
+            // e.g. an `lstat` racing a concurrent `delete`) must stay
+            // local: reporting it in-band keeps every healthy sibling
+            // already discovered, which is the whole point of this API
+            // over `list`. Only the `read_dir` open above fails the call.
+            let child = match child {
+                Ok(child) => child,
+                Err(err) => {
+                    entries.push(Err(StagingError::Io(err)));
+                    continue;
+                }
+            };
+            match child.file_type() {
+                // Staged carriers are always directories; skip anything
+                // else silently, matching `list`.
+                Ok(file_type) if !file_type.is_dir() => continue,
+                Ok(_) => entries.push(self.probe_recoverable_entry(&child.file_name())),
+                Err(err) => entries.push(Err(StagingError::Io(err))),
             }
-            entries.push(self.probe_recoverable_entry(&child.file_name()));
         }
         Ok(entries)
     }
@@ -992,6 +1005,40 @@ mod tests {
             entries.into_iter().next().unwrap(),
             Err(StagingError::Corrupt { request_id, .. }) if request_id == id
         ));
+    }
+
+    /// A stray non-directory under `staged/` is skipped silently rather
+    /// than surfaced as an error or an entry — exercises the per-child
+    /// `file_type` branch that must not abort the scan.
+    #[test]
+    fn list_entries_for_recovery_skips_stray_files() {
+        let (store, _tmp) = open_store();
+        let healthy: RequestId = "60000000-0000-0000-0000-000000000001".parse().unwrap();
+        store
+            .stage(
+                healthy,
+                UnixMillis::from_millis(1),
+                sample_metadata(),
+                b"ok".to_vec(),
+            )
+            .unwrap();
+        fs::write(store.root().join(STAGED_DIR).join("stray-file"), b"junk").unwrap();
+
+        let entries = store.list_entries_for_recovery().unwrap();
+        assert_eq!(
+            entries.len(),
+            1,
+            "the stray file must not appear as an entry"
+        );
+        assert_eq!(
+            entries
+                .into_iter()
+                .next()
+                .unwrap()
+                .unwrap()
+                .push_request_id(),
+            healthy,
+        );
     }
 
     #[test]
