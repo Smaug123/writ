@@ -34,6 +34,12 @@ const TMP_DIR: &str = "tmp";
 const ENTRY_FILE: &str = "entry.json";
 const BUNDLE_FILE: &str = "bundle";
 
+/// Upper bound on `entry.json` size the recovery sweep will read. A
+/// receipt is a few hundred bytes of JSON; this generous cap only exists
+/// so a tampered oversized file cannot OOM the startup sweep before its
+/// shape is validated. See [`GitPushStagingStore::verify_receipt_readable`].
+const MAX_RECEIPT_BYTES: u64 = 64 * 1024;
+
 /// A staged push as stored on disk: the receipt that was returned to the
 /// guest plus the git bundle bytes.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -98,6 +104,11 @@ impl GitPushStagingStore {
         create_private_dir(&root)?;
         create_private_dir(&root.join(STAGED_DIR))?;
         create_private_dir(&root.join(TMP_DIR))?;
+        // Durably commit the `staged/` and `tmp/` directory entries so a
+        // freshly-created store survives a power loss with its hierarchy
+        // intact — recovery relies on `staged/` being durably linked
+        // under `root` (see `ensure_carrier_durable`).
+        fsync_dir(&root)?;
         Ok(Self { root })
     }
 
@@ -240,9 +251,44 @@ impl GitPushStagingStore {
         name: &OsStr,
     ) -> Result<VmGitPushStagedReceipt, StagingError> {
         let request_id = parse_request_id_from_dirname(name)?;
+        // Guard the receipt *before* `load_receipt`'s unbounded `fs::read`:
+        // at startup a tampered `entry.json` that is a FIFO, a symlink to
+        // an endless device, or an implausibly large file would otherwise
+        // hang or OOM the sweep and block recovery of every healthy
+        // sibling. `fs::metadata` follows symlinks, so a link to a device
+        // resolves to its non-regular target and is rejected here.
+        self.verify_receipt_readable(request_id)?;
         let receipt = self.load_receipt(request_id)?;
         self.verify_bundle_readable(request_id)?;
         Ok(receipt)
+    }
+
+    /// Confirm the carrier's `entry.json` is a regular file of plausible
+    /// size before it is read. See [`Self::probe_recoverable_entry`] for
+    /// why the recovery sweep must not blindly `fs::read` it.
+    fn verify_receipt_readable(&self, request_id: RequestId) -> Result<(), StagingError> {
+        let path = self.staged_path(request_id).join(ENTRY_FILE);
+        match fs::metadata(&path) {
+            Ok(meta) if meta.is_file() => {
+                if meta.len() > MAX_RECEIPT_BYTES {
+                    Err(StagingError::Corrupt {
+                        request_id,
+                        message: format!("entry.json is implausibly large ({} bytes)", meta.len()),
+                    })
+                } else {
+                    Ok(())
+                }
+            }
+            Ok(_) => Err(StagingError::Corrupt {
+                request_id,
+                message: "entry.json is not a regular file".to_string(),
+            }),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Err(StagingError::Corrupt {
+                request_id,
+                message: "entry.json missing".to_string(),
+            }),
+            Err(err) => Err(StagingError::Io(err)),
+        }
     }
 
     /// Confirm the carrier's `bundle` is a *readable regular file*, not
@@ -296,6 +342,13 @@ impl GitPushStagingStore {
     pub fn ensure_carrier_durable(&self, request_id: RequestId) -> Result<(), StagingError> {
         fsync_dir(&self.staged_path(request_id))?;
         fsync_dir(&self.root.join(STAGED_DIR))?;
+        // Also the store root: it holds the `staged/` directory entry, and
+        // if `staged/` itself is not durably linked (its creation in
+        // `open` is not fsynced) a power loss could drop the whole tree
+        // while the audit outcome survives. Fsyncing `root`'s own parent
+        // is out of scope — `root` is the operator-configured staging
+        // path, created and owned by the config layer.
+        fsync_dir(&self.root)?;
         Ok(())
     }
 
@@ -1069,6 +1122,34 @@ mod tests {
         let bundle = store.staged_path(id).join(BUNDLE_FILE);
         fs::remove_file(&bundle).unwrap();
         fs::create_dir(&bundle).unwrap();
+
+        let entries = store.list_entries_for_recovery().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(matches!(
+            entries.into_iter().next().unwrap(),
+            Err(StagingError::Corrupt { request_id, .. }) if request_id == id
+        ));
+    }
+
+    /// A carrier whose `entry.json` is a non-regular file (here a
+    /// directory) is reported `Corrupt` by the recovery probe *without*
+    /// the sweep blindly reading it — the guard that stops a tampered
+    /// FIFO / device-symlink `entry.json` from hanging startup.
+    #[test]
+    fn list_entries_for_recovery_flags_non_regular_receipt() {
+        let (store, _tmp) = open_store();
+        let id: RequestId = "40000000-0000-0000-0000-0000000000bb".parse().unwrap();
+        store
+            .stage(
+                id,
+                UnixMillis::from_millis(1),
+                sample_metadata(),
+                b"b".to_vec(),
+            )
+            .unwrap();
+        let entry = store.staged_path(id).join(ENTRY_FILE);
+        fs::remove_file(&entry).unwrap();
+        fs::create_dir(&entry).unwrap();
 
         let entries = store.list_entries_for_recovery().unwrap();
         assert_eq!(entries.len(), 1);

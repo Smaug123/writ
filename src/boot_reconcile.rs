@@ -235,8 +235,9 @@ pub fn reconcile_orphaned_staged_carriers(
             // genuinely broken staging root, not a torn sibling. Skip
             // best-effort rather than wedge boot; a misconfigured root is
             // an operator problem the daemon should still start to report.
-            tracing::warn!(
+            tracing::error!(
                 target: AUDIT_WRITE_FAILURE_TARGET,
+                kind = "boot_carrier_sweep_open",
                 error = %err,
                 "boot carrier sweep: could not open the staging tree; skipping",
             );
@@ -253,8 +254,9 @@ pub fn reconcile_orphaned_staged_carriers(
         let receipt = match carrier {
             Ok(receipt) => receipt,
             Err(err) => {
-                tracing::warn!(
+                tracing::error!(
                     target: AUDIT_WRITE_FAILURE_TARGET,
+                    kind = "boot_carrier_sweep_entry",
                     error = %err,
                     "boot carrier sweep: skipping an unreadable staged entry",
                 );
@@ -269,6 +271,7 @@ pub fn reconcile_orphaned_staged_carriers(
             // agent's bundle bytes.
             tracing::error!(
                 target: AUDIT_WRITE_FAILURE_TARGET,
+                kind = "boot_carrier_sweep_drift",
                 push_request_id = %request_id,
                 "boot carrier sweep: staged carrier has no audit request row; \
                  staging store and audit log have drifted apart",
@@ -302,8 +305,9 @@ pub fn reconcile_orphaned_staged_carriers(
                 // guarantee durability, so skip and log rather than record
                 // the outcome; a later boot retries.
                 if let Err(err) = staging.ensure_carrier_durable(request_id) {
-                    tracing::warn!(
+                    tracing::error!(
                         target: AUDIT_WRITE_FAILURE_TARGET,
+                        kind = "boot_carrier_sweep_fsync",
                         push_request_id = %request_id,
                         error = %err,
                         "boot carrier sweep: could not make carrier durable before \
