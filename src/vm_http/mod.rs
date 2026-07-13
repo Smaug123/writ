@@ -1406,7 +1406,8 @@ where
             return VmHttpResponse::text(VmHttpStatus::MethodNotAllowed, "method not allowed")
                 .into();
         }
-        return route_agent_run_outcome_request(run_id, &body, &service).into();
+        return route_agent_run_outcome_request(run_id, session.session_id(), &body, &service)
+            .into();
     }
 
     route_session_endpoint(session, request).into()
