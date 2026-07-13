@@ -379,6 +379,10 @@ pub async fn prepare_approve_with_staging_repo(
         Some(signing_key),
     )
     .await;
+    // Unconditional: on the error paths the walker may still have
+    // uploaded objects before failing, and GitHub-side durable state
+    // is exactly what a crash boundary marks.
+    crate::crash_point::point("prepare::objects_uploaded").await;
 
     // `close()` reaps the `git cat-file --batch` child even on error
     // paths above; ignore its result because it only signals stderr
@@ -488,6 +492,7 @@ pub async fn prepare_staging_repo(
                 source,
             },
         })?;
+    crate::crash_point::point("prepare::staging_dir_created").await;
 
     // Past this point we own `staging_dir` on disk; any failure must
     // clean it up so the next retry can re-mkdir without tripping the
@@ -532,21 +537,25 @@ async fn run_prepare_steps(
             path: bundle_path.clone(),
             source,
         })?;
+    crate::crash_point::point("prepare::bundle_written").await;
 
     let init = build_init_bare_invocation(runtime, staging_dir);
     clean_git::run_clean_git(&init, runtime.step_timeout(), None)
         .await
         .map_err(|e| PrepareStagingError::GitInit(e.to_string()))?;
+    crate::crash_point::point("prepare::repo_initialised").await;
 
     let fetch = build_fetch_prereq_invocation(runtime, staging_dir, repo, expected_remote_head);
     clean_git::run_clean_git(&fetch, runtime.step_timeout(), Some(token.as_str()))
         .await
         .map_err(|e| PrepareStagingError::GitFetch(e.to_string()))?;
+    crate::crash_point::point("prepare::prereq_fetched").await;
 
     let unbundle = build_unbundle_invocation(runtime, staging_dir, &bundle_path);
     clean_git::run_clean_git(&unbundle, runtime.step_timeout(), None)
         .await
         .map_err(|e| PrepareStagingError::GitUnbundle(e.to_string()))?;
+    crate::crash_point::point("prepare::unbundled").await;
 
     Ok(())
 }
@@ -1686,6 +1695,66 @@ mod tests {
 
         let someone_elses = UncertainAttempt::for_test(ApproveAttemptId::new());
         let _ = prepared.commit(&someone_elses).await;
+    }
+
+    /// Stage-3 oracle for the crash harness's fake origin: the *real*
+    /// `prepare_staging_repo` — mkdir, bundle write, `git init`, an
+    /// actual `git fetch` over the origin's dumb-HTTP server, and
+    /// `git bundle unbundle` — succeeds end to end, leaving both the
+    /// prerequisite (via the network fetch) and the bundle tip (via
+    /// the unbundle) in the staging repo. This is also the first test
+    /// to exercise a *successful* prepare fetch at all; everything
+    /// prior stubbed git or stopped short of the network.
+    #[tokio::test]
+    async fn prepare_staging_repo_fetches_prereq_from_fake_origin() {
+        use crate::fake_origin::FakeOrigin;
+        let Some(origin) = FakeOrigin::start().await else {
+            eprintln!("skipping: `git` not on PATH");
+            return;
+        };
+        let git = maybe_git().expect("FakeOrigin::start returned Some, so git exists");
+        let work_root = tempfile::tempdir().unwrap();
+        let runtime = PromoteRuntimeConfig::new(
+            git.clone(),
+            origin.clone_base_url(),
+            GitCredentialBoundary::new(
+                PathBuf::from("/usr/local/bin/fake-askpass"),
+                GitSecretEnvVar::new("WRIT_GIT_TOKEN").unwrap(),
+            )
+            .unwrap(),
+            work_root.path().to_path_buf(),
+            Duration::from_secs(30),
+        )
+        .unwrap();
+
+        let staging = prepare_staging_repo(
+            &runtime,
+            ApproveAttemptId::new(),
+            origin.prereq(),
+            &sample_repo(),
+            &sample_token(),
+            origin.bundle_bytes(),
+        )
+        .await
+        .expect("prepare must fetch the prereq over dumb HTTP and unbundle the tip");
+
+        for (what, sha) in [("prereq", origin.prereq()), ("bundle tip", origin.tip())] {
+            let exists = Command::new(&git)
+                .arg("-C")
+                .arg(staging.path())
+                .args(["cat-file", "-e", sha.as_str()])
+                .env_clear()
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("HOME", "/dev/null")
+                .status()
+                .expect("spawning git cat-file failed");
+            assert!(
+                exists.success(),
+                "{what} {sha} must be present in the staging repo",
+                sha = sha.as_str(),
+            );
+        }
     }
 
     // ---------- prepare-side real-git regression tests ----------
