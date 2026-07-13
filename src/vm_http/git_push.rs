@@ -221,17 +221,23 @@ async fn handle_git_push_request<S: SecretStore + Send + Sync + 'static>(
                     kind = "git_push_outcome",
                     push_request_id = %push_request_id,
                     error = %err,
-                    "audit write failed",
+                    "audit write failed; carrier left intact for boot recovery",
                 );
-                // The carrier is durably on disk but its `Staged` outcome
-                // row did not commit, so it would be stuck — neither
-                // approvable nor rejectable. The process is still alive,
-                // so repair the invariant online: best-effort delete the
-                // carrier before returning failure. The guest treats this
-                // as a failed push and retries under a fresh request id.
-                // If the delete also fails, the boot-time carrier sweep
-                // recovers the orphan on the next start.
-                delete_orphaned_carrier_after_outcome_failure(&service, push_request_id).await;
+                // The carrier is durably and atomically on disk but its
+                // `Staged` outcome row did not commit, so it is stuck —
+                // neither approvable nor rejectable — until recovery.
+                //
+                // We deliberately do *not* delete it here. `delete` is a
+                // non-atomic `remove_dir_all`: a crash part-way through
+                // would tear the carrier (leaving only `bundle` or only
+                // `entry.json`), and a torn carrier is unrecoverable — the
+                // boot sweep would either record `Staged` for a push whose
+                // bundle is gone, or fail to `list()` it at all. Leaving
+                // the intact carrier lets `reconcile_orphaned_staged_carriers`
+                // recover it safely and idempotently on the next boot. An
+                // outcome-write failure on a request row that just
+                // committed is almost always a transient/environmental DB
+                // fault, and the daemon is built for cheap restart.
                 return git_push_error_response(
                     VmHttpStatus::InternalServerError,
                     VmGitPushErrorCode::PushFailed,
@@ -283,42 +289,6 @@ async fn handle_git_push_request<S: SecretStore + Send + Sync + 'static>(
                 VmGitPushErrorCode::PushFailed,
                 "staging failed",
             )
-        }
-    }
-}
-
-/// Best-effort removal of a carrier whose `Staged` outcome row failed to
-/// commit. Keeps the "a carrier on disk is always resolvable" invariant
-/// holding online rather than deferring to the boot-time sweep. A delete
-/// failure is logged to [`AUDIT_WRITE_FAILURE_TARGET`] and swallowed: the
-/// leftover carrier is then exactly the crash-window orphan that
-/// [`crate::boot_reconcile::reconcile_orphaned_staged_carriers`] repairs.
-async fn delete_orphaned_carrier_after_outcome_failure<S: SecretStore>(
-    service: &VmHttpGitPushService<S>,
-    push_request_id: RequestId,
-) {
-    let staging_store = Arc::clone(&service.staging_store);
-    let delete = tokio::task::spawn_blocking(move || staging_store.delete(push_request_id)).await;
-    match delete {
-        Ok(Ok(())) => {}
-        Ok(Err(err)) => {
-            tracing::error!(
-                target: AUDIT_WRITE_FAILURE_TARGET,
-                kind = "git_push_orphan_cleanup",
-                push_request_id = %push_request_id,
-                error = %err,
-                "could not delete carrier orphaned by an outcome-write failure; \
-                 boot carrier sweep will recover it",
-            );
-        }
-        Err(join_err) => {
-            tracing::error!(
-                target: AUDIT_WRITE_FAILURE_TARGET,
-                kind = "git_push_orphan_cleanup",
-                push_request_id = %push_request_id,
-                error = %join_err,
-                "carrier cleanup task panicked; boot carrier sweep will recover it",
-            );
         }
     }
 }
@@ -953,8 +923,20 @@ mod tests {
     /// is forced deterministically by pre-empting the outcome row (with a
     /// terminal `Denied`) at the post-staging crash point, tripping the
     /// primary key on the handler's own write.
+    /// Part 1: when the `Staged` outcome write fails while the process
+    /// is alive, the handler must leave the intact carrier on disk — it
+    /// must not delete it, because `delete` is a non-atomic
+    /// `remove_dir_all` whose interruption would tear the carrier and
+    /// make it unrecoverable. Leaving the complete carrier lets the boot
+    /// sweep recover it (that handoff — intact carrier, no outcome row →
+    /// `Staged` — is exercised by the crash oracle above and by
+    /// `boot_reconcile`'s `orphaned_carrier_is_recovered_to_staged`).
+    ///
+    /// The failure is forced deterministically by pre-empting the outcome
+    /// row at the post-staging crash point, tripping the primary key on
+    /// the handler's own write.
     #[tokio::test]
-    async fn outcome_write_failure_deletes_the_orphaned_carrier() {
+    async fn outcome_write_failure_leaves_the_carrier_intact_for_recovery() {
         use crate::audit::GitPushOutcomeRecord;
         use crate::crash_point::{CrashPlan, run_until_crash};
 
@@ -1016,9 +998,16 @@ mod tests {
 
         assert!(plan.acted(), "the pre-empting action must have fired");
         assert_eq!(response.status, VmHttpStatus::InternalServerError);
-        assert!(
-            staging.list().unwrap().is_empty(),
-            "the carrier orphaned by the outcome-write failure must be deleted online",
+
+        // The carrier must be preserved *and complete* — both the
+        // receipt and the bundle — so the boot sweep can recover it.
+        let carriers = staging.list().unwrap();
+        assert_eq!(
+            carriers.len(),
+            1,
+            "the carrier must be left intact, not deleted, on an outcome-write failure",
         );
+        let loaded = staging.load(carriers[0].push_request_id()).unwrap();
+        assert_eq!(loaded.bundle(), b"x");
     }
 }
