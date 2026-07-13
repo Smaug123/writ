@@ -234,26 +234,69 @@ impl GitPushStagingStore {
 
     /// Probe one `staged/` child for [`Self::list_entries_for_recovery`]:
     /// parse its directory name, load its receipt, and confirm the bundle
-    /// is present.
+    /// is a readable regular file.
     fn probe_recoverable_entry(
         &self,
         name: &OsStr,
     ) -> Result<VmGitPushStagedReceipt, StagingError> {
         let request_id = parse_request_id_from_dirname(name)?;
         let receipt = self.load_receipt(request_id)?;
-        // Completeness: a recovered `staged` outcome must point at a
-        // carrier that can actually be promoted, so the bundle has to be
-        // there. A torn `remove_dir_all` that unlinked the bundle but
-        // left `entry.json` would otherwise pass `load_receipt` and be
-        // "recovered" into an unpromotable state.
-        match self.staged_path(request_id).join(BUNDLE_FILE).try_exists() {
-            Ok(true) => Ok(receipt),
-            Ok(false) => Err(StagingError::Corrupt {
+        self.verify_bundle_readable(request_id)?;
+        Ok(receipt)
+    }
+
+    /// Confirm the carrier's `bundle` is a *readable regular file*, not
+    /// merely present. A recovered `staged` outcome must point at a
+    /// carrier the approve/reject paths can actually `load()` (which
+    /// `fs::read`s the bundle); a bare `try_exists()` would accept a
+    /// directory, FIFO, or mode-denied path and let recovery record
+    /// `staged` for a push that can never be resolved. `is_file()` rules
+    /// out non-regular shapes; opening (without reading) rules out an
+    /// unreadable regular file. Missing bundle → `Corrupt`; other open
+    /// failures → `Io` (the recovery sweep skips both without recording
+    /// an outcome).
+    fn verify_bundle_readable(&self, request_id: RequestId) -> Result<(), StagingError> {
+        let path = self.staged_path(request_id).join(BUNDLE_FILE);
+        match fs::metadata(&path) {
+            Ok(meta) if meta.is_file() => {}
+            Ok(_) => {
+                return Err(StagingError::Corrupt {
+                    request_id,
+                    message: "bundle is not a regular file".to_string(),
+                });
+            }
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                return Err(StagingError::Corrupt {
+                    request_id,
+                    message: "bundle file missing".to_string(),
+                });
+            }
+            Err(err) => return Err(StagingError::Io(err)),
+        }
+        // Confirmed regular above, so opening cannot block on a FIFO.
+        // We open but do not read: this is a cheap readability probe,
+        // not a load of a potentially large bundle.
+        match fs::File::open(&path) {
+            Ok(_) => Ok(()),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Err(StagingError::Corrupt {
                 request_id,
                 message: "bundle file missing".to_string(),
             }),
             Err(err) => Err(StagingError::Io(err)),
         }
+    }
+
+    /// Re-establish the durability of a carrier's directory entry before
+    /// a caller records an audit decision that assumes the carrier
+    /// survives a power loss. `stage()` fsyncs the parent `staged/` after
+    /// its `rename`, but if *that* final fsync failed the rename can be
+    /// visible yet not durable; the boot recovery sweep calls this before
+    /// writing the `staged` outcome so the "carrier durable ⇒ outcome
+    /// recorded" ordering holds on the recovery path too. Idempotent.
+    pub fn ensure_carrier_durable(&self, request_id: RequestId) -> Result<(), StagingError> {
+        fsync_dir(&self.staged_path(request_id))?;
+        fsync_dir(&self.root.join(STAGED_DIR))?;
+        Ok(())
     }
 
     /// Remove the on-disk staging directory for `request_id`. Idempotent:
@@ -1005,6 +1048,51 @@ mod tests {
             entries.into_iter().next().unwrap(),
             Err(StagingError::Corrupt { request_id, .. }) if request_id == id
         ));
+    }
+
+    /// A carrier whose `bundle` is a directory (or any non-regular file)
+    /// must be reported `Corrupt`, not `Ok`: recovering it would record
+    /// `staged` for a push whose bundle `load()` can never `fs::read`.
+    #[test]
+    fn list_entries_for_recovery_flags_non_regular_bundle() {
+        let (store, _tmp) = open_store();
+        let id: RequestId = "40000000-0000-0000-0000-00000000000f".parse().unwrap();
+        store
+            .stage(
+                id,
+                UnixMillis::from_millis(1),
+                sample_metadata(),
+                b"orig".to_vec(),
+            )
+            .unwrap();
+        // Replace the bundle file with a directory.
+        let bundle = store.staged_path(id).join(BUNDLE_FILE);
+        fs::remove_file(&bundle).unwrap();
+        fs::create_dir(&bundle).unwrap();
+
+        let entries = store.list_entries_for_recovery().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(matches!(
+            entries.into_iter().next().unwrap(),
+            Err(StagingError::Corrupt { request_id, .. }) if request_id == id
+        ));
+    }
+
+    #[test]
+    fn ensure_carrier_durable_succeeds_for_a_staged_carrier() {
+        let (store, _tmp) = open_store();
+        let id: RequestId = "40000000-0000-0000-0000-0000000000aa".parse().unwrap();
+        store
+            .stage(
+                id,
+                UnixMillis::from_millis(1),
+                sample_metadata(),
+                b"b".to_vec(),
+            )
+            .unwrap();
+        // Idempotent: safe to call repeatedly.
+        store.ensure_carrier_durable(id).unwrap();
+        store.ensure_carrier_durable(id).unwrap();
     }
 
     /// A stray non-directory under `staged/` is skipped silently rather

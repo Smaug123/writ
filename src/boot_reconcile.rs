@@ -292,7 +292,25 @@ pub fn reconcile_orphaned_staged_carriers(
 
         match entry.result {
             None => {
-                // The orphan this sweep exists to repair.
+                // The orphan this sweep exists to repair. Re-fsync the
+                // carrier's directory entry first: `stage()`'s final
+                // `fsync_dir` may have failed (leaving the rename visible
+                // but not durable), and we must not record `staged` for a
+                // carrier a later power loss could drop — that is exactly
+                // the `staged`-without-carrier state this ordering
+                // prevents. A fsync failure here means we cannot yet
+                // guarantee durability, so skip and log rather than record
+                // the outcome; a later boot retries.
+                if let Err(err) = staging.ensure_carrier_durable(request_id) {
+                    tracing::warn!(
+                        target: AUDIT_WRITE_FAILURE_TARGET,
+                        push_request_id = %request_id,
+                        error = %err,
+                        "boot carrier sweep: could not make carrier durable before \
+                         recording its outcome; leaving for a later boot",
+                    );
+                    continue;
+                }
                 audit.record_git_push_outcome(&GitPushOutcomeRecord {
                     push_request_id: request_id,
                     completed_at: now,
