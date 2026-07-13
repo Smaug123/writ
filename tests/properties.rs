@@ -13,7 +13,7 @@ use writ::core::{
     GitHubPermissions, GitHubRequest, GrantedScope, Jti, MetadataAccess, PolicyDecision, RepoRef,
     RequestId, SessionId, SessionRecord, TtlSeconds, UnixMillis,
 };
-use writ::policy::{PolicyConfig, decide};
+use writ::policy::{Decision, PolicyConfig, decide};
 use writ::vm_git::{GitBranchName, GitCloneRepo, GitObjectId};
 
 fn arb_repo() -> impl Strategy<Value = RepoRef> {
@@ -196,12 +196,12 @@ proptest! {
         let on_allowlist = writable.iter().any(|r| r.matches(req.repo()));
 
         match decide(&wrapped, &policy) {
-            PolicyDecision::Grant { .. } => {
+            Decision::Grant(_) => {
                 if is_write {
                     prop_assert!(on_allowlist, "granted write but repo not on allowlist: {req:?}");
                 }
             }
-            PolicyDecision::Deny { .. } => {
+            Decision::Deny { .. } => {
                 prop_assert!(is_write && !on_allowlist, "denied non-write or allowlisted repo: {req:?}");
             }
         }
@@ -219,11 +219,12 @@ proptest! {
         };
         let wrapped = CapabilityRequest::GitHub(req.clone());
         match decide(&wrapped, &policy) {
-            PolicyDecision::Grant { scope: GrantedScope::GitHub(s), .. } => {
-                prop_assert_eq!(s.repository, req.repo().clone());
+            Decision::Grant(auth) => {
+                let s = auth.scope();
+                prop_assert_eq!(&s.repository, req.repo());
                 prop_assert_eq!(s.permissions.metadata, Some(MetadataAccess::Read));
             }
-            PolicyDecision::Deny { reason } => prop_assert!(false, "unexpectedly denied: {reason}"),
+            Decision::Deny { reason } => prop_assert!(false, "unexpectedly denied: {reason}"),
         }
     }
 
@@ -246,6 +247,7 @@ proptest! {
         };
         let cap_req = CapabilityRequest::GitHub(req.clone());
         let decision = decide(&cap_req, &policy);
+        let decision_record = decision.to_record();
 
         let log = AuditLog::open_in_memory().unwrap();
         let session = SessionRecord {
@@ -264,7 +266,7 @@ proptest! {
             session_id: session.session_id,
             received_at: UnixMillis::from_millis(0),
             request: &cap_req,
-            decision: &decision,
+            decision: &decision_record,
         });
         prop_assert!(
             pre_mint.is_ok(),
@@ -272,8 +274,9 @@ proptest! {
         );
 
         match &decision {
-            PolicyDecision::Grant { scope, ttl: granted_ttl } => {
-                let lifetime_ms = granted_ttl.as_i64().saturating_mul(1000);
+            Decision::Grant(auth) => {
+                let scope = GrantedScope::GitHub(auth.scope().clone());
+                let lifetime_ms = auth.ttl().as_i64().saturating_mul(1000);
                 let grant = CredentialGrant {
                     jti: Jti::new(),
                     request_id,
@@ -289,7 +292,7 @@ proptest! {
                     "Grant decision but record_grant failed: req={req:?} scope={scope:?} err={result:?}",
                 );
             }
-            PolicyDecision::Deny { .. } => {
+            Decision::Deny { .. } => {
                 // Any grant attempt against a Deny pre-mint row must fail.
                 // Scope is irrelevant: record_grant rejects on the recorded
                 // decision before checking the scope.

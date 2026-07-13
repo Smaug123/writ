@@ -14,7 +14,7 @@ use crate::agent_run::{
     VmAgentRunOutcomeUpload,
 };
 use crate::audit::{AUDIT_WRITE_FAILURE_TARGET, AgentRunOutcomeAuditRecord};
-use crate::core::UnixMillis;
+use crate::core::{SessionId, UnixMillis};
 use crate::secret::SecretStore;
 use crate::server::BrokerState;
 
@@ -135,10 +135,30 @@ pub(super) fn route_agent_run_config_request<S: SecretStore>(
 
 pub(super) fn route_agent_run_outcome_request<S: SecretStore>(
     run_id: AgentRunId,
+    authenticated_session_id: SessionId,
     body: &[u8],
     service: &VmHttpAgentRunService<S>,
 ) -> VmHttpResponse {
     let broker_state = service.broker_state();
+    // Bind the run to the authenticated session before any lookup or write.
+    // The run's owning session is fixed at request time; a session may only
+    // submit an outcome for a run it owns. A run belonging to another session —
+    // or one that does not exist — is reported identically as "not found", so
+    // this endpoint cannot be used as an oracle for other sessions' run IDs.
+    match broker_state.audit.get_agent_run(run_id) {
+        Ok(Some(record)) if record.session_id == authenticated_session_id => {}
+        Ok(_) => return VmHttpResponse::text(VmHttpStatus::NotFound, "not found"),
+        Err(err) => {
+            tracing::error!(
+                target: AUDIT_WRITE_FAILURE_TARGET,
+                kind = "agent_run_lookup",
+                run_id = %run_id,
+                error = %err,
+                "audit read failed",
+            );
+            return VmHttpResponse::text(VmHttpStatus::InternalServerError, "audit read failed");
+        }
+    }
     match broker_state.audit.get_agent_run_outcome(run_id) {
         Ok(Some(_)) => return VmHttpResponse::text(VmHttpStatus::Ok, "ok"),
         Ok(None) => {}
@@ -442,7 +462,8 @@ mod tests {
             "Hello\n"
         );
 
-        let response = route_agent_run_outcome_request(run_id, &body, &service);
+        let response =
+            route_agent_run_outcome_request(run_id, session.session_id(), &body, &service);
 
         assert_eq!(response.status, VmHttpStatus::Ok);
         let outcome = state.audit.get_agent_run_outcome(run_id).unwrap().unwrap();
@@ -456,8 +477,107 @@ mod tests {
         );
         assert!(outcome.outcome.stdout.path.starts_with(temp.path()));
 
-        let retried = route_agent_run_outcome_request(run_id, &body, &service);
+        let retried =
+            route_agent_run_outcome_request(run_id, session.session_id(), &body, &service);
         assert_eq!(retried.status, VmHttpStatus::Ok);
+    }
+
+    #[tokio::test]
+    async fn agent_run_outcome_rejects_a_foreign_session() {
+        // A run recorded against session B must not accept an outcome submitted
+        // by session A, even if A authenticated and knows B's run ID. Otherwise
+        // A could have its output signed under B's prompt, capabilities, and
+        // session identity.
+        let github = MockServer::start().await;
+        let state = make_broker_state(&github);
+        let owner = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::LOCALHOST, 32).unwrap());
+        open_audit_session(&state, owner.session_id());
+        let run_id: AgentRunId = "00000000-0000-0000-0000-000000000404".parse().unwrap();
+        state
+            .audit
+            .record_agent_run(&crate::audit::AgentRunAuditRecord {
+                run_id,
+                session_id: owner.session_id(),
+                requested_at: UnixMillis::now(),
+                agent_kind: crate::core::AgentKind::Claude,
+                prompt: AgentPrompt::new("prompt").summary(),
+                correlation_id: None,
+            })
+            .unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let service =
+            VmHttpAgentRunService::new(Arc::clone(&state), temp.path().join("agent-runs"));
+        let upload = VmAgentRunOutcomeUpload {
+            run_id,
+            status: crate::agent_run::AgentRunTerminalStatus::Succeeded,
+            exit_code: 0,
+            stdout: AgentRunStreamUpload {
+                byte_len: 6,
+                sha256_hex: crate::agent_run::sha256_hex(b"Attack"),
+                truncated: false,
+                retained_sha256_hex: crate::agent_run::sha256_hex(b"Attack"),
+                retained_base64: base64::engine::general_purpose::STANDARD.encode(b"Attack"),
+            },
+            stderr: AgentRunStreamUpload {
+                byte_len: 0,
+                sha256_hex: crate::agent_run::sha256_hex(b""),
+                truncated: false,
+                retained_sha256_hex: crate::agent_run::sha256_hex(b""),
+                retained_base64: base64::engine::general_purpose::STANDARD.encode(b""),
+            },
+        };
+        let body = serde_json::to_vec(&upload).unwrap();
+
+        let attacker_session_id = SessionId::new();
+        assert_ne!(attacker_session_id, owner.session_id());
+        let response =
+            route_agent_run_outcome_request(run_id, attacker_session_id, &body, &service);
+
+        assert_eq!(response.status, VmHttpStatus::NotFound);
+        // No outcome may have been written for the owner's run.
+        assert!(state.audit.get_agent_run_outcome(run_id).unwrap().is_none());
+
+        // The rightful owner can still submit its own outcome afterwards.
+        let owner_response =
+            route_agent_run_outcome_request(run_id, owner.session_id(), &body, &service);
+        assert_eq!(owner_response.status, VmHttpStatus::Ok);
+    }
+
+    #[tokio::test]
+    async fn agent_run_outcome_rejects_unknown_run() {
+        let github = MockServer::start().await;
+        let state = make_broker_state(&github);
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::LOCALHOST, 32).unwrap());
+        open_audit_session(&state, session.session_id());
+        let run_id: AgentRunId = "00000000-0000-0000-0000-000000000405".parse().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let service =
+            VmHttpAgentRunService::new(Arc::clone(&state), temp.path().join("agent-runs"));
+        let upload = VmAgentRunOutcomeUpload {
+            run_id,
+            status: crate::agent_run::AgentRunTerminalStatus::Succeeded,
+            exit_code: 0,
+            stdout: AgentRunStreamUpload {
+                byte_len: 0,
+                sha256_hex: crate::agent_run::sha256_hex(b""),
+                truncated: false,
+                retained_sha256_hex: crate::agent_run::sha256_hex(b""),
+                retained_base64: base64::engine::general_purpose::STANDARD.encode(b""),
+            },
+            stderr: AgentRunStreamUpload {
+                byte_len: 0,
+                sha256_hex: crate::agent_run::sha256_hex(b""),
+                truncated: false,
+                retained_sha256_hex: crate::agent_run::sha256_hex(b""),
+                retained_base64: base64::engine::general_purpose::STANDARD.encode(b""),
+            },
+        };
+        let body = serde_json::to_vec(&upload).unwrap();
+
+        let response =
+            route_agent_run_outcome_request(run_id, session.session_id(), &body, &service);
+
+        assert_eq!(response.status, VmHttpStatus::NotFound);
     }
 
     #[tokio::test]
@@ -504,6 +624,7 @@ mod tests {
 
         let response = route_agent_run_outcome_request(
             run_id,
+            session.session_id(),
             &serde_json::to_vec(&upload).unwrap(),
             &service,
         );
@@ -522,6 +643,7 @@ mod tests {
         };
         let response = route_agent_run_outcome_request(
             run_id,
+            session.session_id(),
             &serde_json::to_vec(&upload).unwrap(),
             &service,
         );
@@ -540,6 +662,7 @@ mod tests {
         };
         let response = route_agent_run_outcome_request(
             run_id,
+            session.session_id(),
             &serde_json::to_vec(&upload).unwrap(),
             &service,
         );

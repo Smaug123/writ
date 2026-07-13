@@ -36,14 +36,92 @@ pub struct PolicyConfig {
     pub default_ttl: TtlSeconds,
 }
 
+/// An authorization to mint a credential, produced *only* by [`decide`].
+///
+/// Its fields are private to this module and it has no public
+/// constructor, so the sole way to obtain one is to route a
+/// [`CapabilityRequest`] through the policy engine. [`GitHubMinter`]
+/// accepts nothing else, which makes "mint a credential without a policy
+/// decision" a *compile error* rather than a convention: the staged-push
+/// approve path can no longer hand-build a `contents:write` scope and
+/// mint directly, it must call [`decide`] like every other mint site and
+/// so is subject to the `writable_repos` allowlist.
+///
+/// [`GitHubMinter`]: crate::github::GitHubMinter
+#[derive(Debug)]
+pub struct AuthorizedMint {
+    scope: GitHubGrantedScope,
+    ttl: TtlSeconds,
+}
+
+impl AuthorizedMint {
+    /// The scope the policy engine authorised.
+    pub fn scope(&self) -> &GitHubGrantedScope {
+        &self.scope
+    }
+
+    /// The TTL ceiling the policy engine authorised.
+    pub fn ttl(&self) -> TtlSeconds {
+        self.ttl
+    }
+
+    /// Replace the TTL while keeping the authorised scope. The TTL is a
+    /// mint-mechanics parameter (an accept-back bound on the expiry the
+    /// backend returns), not the security boundary — that is the scope,
+    /// which stays fixed. The approve path uses this to mint on the
+    /// GitHub-imposed installation-token ceiling regardless of the
+    /// policy's default, without being able to alter *which* repo or
+    /// permissions it was authorised for.
+    #[must_use]
+    pub fn with_ttl(self, ttl: TtlSeconds) -> Self {
+        Self { ttl, ..self }
+    }
+
+    /// Construct an authorization directly, bypassing [`decide`]. Test-only:
+    /// unit tests of the minter's HTTP/JWT behaviour need to drive it with
+    /// arbitrary scopes without standing up a full policy, but production
+    /// code has no way to forge this.
+    #[cfg(test)]
+    pub(crate) fn for_test(scope: GitHubGrantedScope, ttl: TtlSeconds) -> Self {
+        Self { scope, ttl }
+    }
+}
+
+/// The output of the policy engine. `Grant` carries an unforgeable
+/// [`AuthorizedMint`]; `Deny` carries the reason for the audit log and
+/// the agent. Distinct from [`PolicyDecision`] (the *serialisable* record
+/// of a decision, written to the audit log) precisely because the grant
+/// here is a capability, not data: [`to_record`](Decision::to_record)
+/// projects it down to the wire form when it is time to persist it.
+#[derive(Debug)]
+pub enum Decision {
+    Grant(AuthorizedMint),
+    Deny { reason: String },
+}
+
+impl Decision {
+    /// The serialisable record of this decision, for the audit log.
+    pub fn to_record(&self) -> PolicyDecision {
+        match self {
+            Decision::Grant(auth) => PolicyDecision::Grant {
+                scope: GrantedScope::GitHub(auth.scope.clone()),
+                ttl: auth.ttl,
+            },
+            Decision::Deny { reason } => PolicyDecision::Deny {
+                reason: reason.clone(),
+            },
+        }
+    }
+}
+
 /// Evaluate the policy for one request.
-pub fn decide(request: &CapabilityRequest, policy: &PolicyConfig) -> PolicyDecision {
+pub fn decide(request: &CapabilityRequest, policy: &PolicyConfig) -> Decision {
     match request {
         CapabilityRequest::GitHub(r) => decide_github(r, policy),
     }
 }
 
-fn decide_github(r: &GitHubRequest, policy: &PolicyConfig) -> PolicyDecision {
+fn decide_github(r: &GitHubRequest, policy: &PolicyConfig) -> Decision {
     if is_write(r) {
         let repo = r.repo();
         // Case-insensitive match so a config entry like `Smaug123/Writ`
@@ -53,18 +131,18 @@ fn decide_github(r: &GitHubRequest, policy: &PolicyConfig) -> PolicyDecision {
         // here would deny writes the rest of the system would then
         // happily perform against differently-cased config.
         if !policy.writable_repos.iter().any(|w| w.matches(repo)) {
-            return PolicyDecision::Deny {
+            return Decision::Deny {
                 reason: format!("write access to {repo} is not on the writable-repos allowlist"),
             };
         }
     }
-    PolicyDecision::Grant {
-        scope: GrantedScope::GitHub(GitHubGrantedScope {
+    Decision::Grant(AuthorizedMint {
+        scope: GitHubGrantedScope {
             repository: r.repo().clone(),
             permissions: permissions_for_request(r),
-        }),
+        },
         ttl: policy.default_ttl,
-    }
+    })
 }
 
 /// Written as an exhaustive `match` (rather than `matches!`) on purpose:
@@ -117,12 +195,9 @@ mod tests {
         }
     }
 
-    fn expect_grant(d: PolicyDecision) -> GitHubGrantedScope {
+    fn expect_grant(d: Decision) -> GitHubGrantedScope {
         match d {
-            PolicyDecision::Grant {
-                scope: GrantedScope::GitHub(s),
-                ..
-            } => s,
+            Decision::Grant(auth) => auth.scope().clone(),
             other => panic!("expected Grant, got {other:?}"),
         }
     }
@@ -162,7 +237,7 @@ mod tests {
             repo: repo("someone-else", "thing"),
         });
         match decide(&req, &policy) {
-            PolicyDecision::Deny { reason } => {
+            Decision::Deny { reason } => {
                 assert!(reason.contains("someone-else/thing"), "got: {reason}");
             }
             other => panic!("expected Deny, got {other:?}"),
@@ -210,7 +285,7 @@ mod tests {
             }),
         ] {
             assert!(
-                matches!(decide(&req, &policy), PolicyDecision::Grant { .. }),
+                matches!(decide(&req, &policy), Decision::Grant(_)),
                 "write on allowlisted repo should be granted: {req:?}"
             );
         }
@@ -227,7 +302,7 @@ mod tests {
             }),
         ] {
             assert!(
-                matches!(decide(&req, &policy), PolicyDecision::Deny { .. }),
+                matches!(decide(&req, &policy), Decision::Deny { .. }),
                 "write on non-allowlisted repo should be denied: {req:?}"
             );
         }
@@ -258,7 +333,7 @@ mod tests {
             repo: repo("any", "repo"),
         });
         match decide(&req, &policy) {
-            PolicyDecision::Grant { ttl, .. } => assert_eq!(ttl, policy.default_ttl),
+            Decision::Grant(auth) => assert_eq!(auth.ttl(), policy.default_ttl),
             other => panic!("expected Grant, got {other:?}"),
         }
     }
@@ -329,7 +404,7 @@ mod tests {
                 proptest::prop_assert!(scope.repository.matches(&allowlist_entry));
             } else {
                 proptest::prop_assert!(
-                    matches!(decide(&req, &policy), PolicyDecision::Deny { .. }),
+                    matches!(decide(&req, &policy), Decision::Deny { .. }),
                     "write on non-matching repo must be denied"
                 );
             }
