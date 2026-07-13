@@ -225,6 +225,12 @@ pub(super) fn make_state_with_approve_ready(
     let inner = Arc::get_mut(&mut state).expect("fresh Arc has no other handles");
     inner.promote_runtime = Some(Arc::new(runtime));
     inner.signing_key = Some(signing_key);
+    // Approve routes the staged push through `policy::decide` before
+    // minting, so the staged repo must be on the write allowlist for a
+    // test to drive the handler as far as its mint step (mint-failure and
+    // pipeline-failure scenarios). Tests that short-circuit earlier are
+    // unaffected.
+    inner.policy.writable_repos = vec![repo("owner", "repo")];
     (state, tmp)
 }
 
