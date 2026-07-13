@@ -1083,6 +1083,20 @@ impl DispatchedTestResponse {
             headers: parts.headers,
         }
     }
+
+    /// Collects a response whose body may abort mid-stream, returning the
+    /// terminal body result separately from the head. Status and headers are
+    /// captured before the body is polled, so they reflect the committed
+    /// response head even when the body then errors — this is exactly the
+    /// case a streaming proxy hits when the upstream fails or overflows after
+    /// the 200 has already been sent.
+    pub(super) async fn from_hyper_response_allow_body_error(
+        response: http::Response<UnsyncBoxBody<Bytes, std::io::Error>>,
+    ) -> (http::response::Parts, Result<Vec<u8>, std::io::Error>) {
+        let (parts, body) = response.into_parts();
+        let body = body.collect().await.map(|buf| buf.to_bytes().to_vec());
+        (parts, body)
+    }
 }
 
 #[cfg(test)]
