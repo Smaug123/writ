@@ -12,7 +12,9 @@
 //! This module carries the Stage-4 oracles: the first end-to-end
 //! *successful* approve through `dispatch_message` (everything prior
 //! stopped at a stubbed git), and the counting run that discovers the
-//! sweep's upper bound. The sweep itself is Stage 5.
+//! sweep's upper bound. The single-crash sweep is Stage 5; the
+//! double-crash and torn-residue stretch tests (Stage 6) reuse its
+//! recovery helpers.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -21,8 +23,7 @@ use super::test_support::{InMemStore, open_session};
 use super::*;
 use crate::audit::{GitPushApproveAttemptOutcome, GitPushApproveAttemptState, GitPushResolution};
 use crate::core::AgentKind;
-use crate::crash_point::CrashPlan;
-use crate::crash_point::run_until_crash;
+use crate::crash_point::{CrashOutcome, CrashPlan, run_until_crash};
 use crate::fake_github::FakeGitHub;
 use crate::fake_origin::{FakeOrigin, ORIGIN_NAME, ORIGIN_OWNER, maybe_git};
 use crate::github::{GitHubAppConfig, GitHubAppRegistryConfig, GitHubMinter};
@@ -317,13 +318,30 @@ async fn counting_run_reports_the_sweeps_upper_bound() {
     );
 }
 
+/// One counting run over a fresh world: the sweep's upper bound `N`
+/// and the point names (for labels). `None` when `git` is absent.
+pub(super) async fn count_points() -> Option<(usize, Vec<&'static str>)> {
+    let world = ApproveWorld::start().await?;
+    let plan = CrashPlan::count();
+    run_until_crash(
+        &plan,
+        dispatch_message(world.approve_message(), &world.state),
+    )
+    .await
+    .expect_completed("counting run must complete");
+    let n = plan.points_passed();
+    let names = plan.names();
+    assert_eq!(names.len(), n);
+    Some((n, names))
+}
+
 /// Everything the sweep needs to know about a world after a crash and
 /// reboot: the reopened audit log, reconciled, with the invariants
 /// I-A (recovery totality) already asserted.
-async fn reboot_and_reconcile(world: &ApproveWorld, k: usize, name: &str) -> AuditLog {
+async fn reboot_and_reconcile(world: &ApproveWorld, label: &str) -> AuditLog {
     let audit = AuditLog::open(&world.audit_path).expect("rebooted audit DB opens");
     crate::boot_reconcile::reconcile_pending_approve_attempts(&audit, UnixMillis::now())
-        .unwrap_or_else(|err| panic!("boot reconcile failed at k={k} ({name}): {err}"));
+        .unwrap_or_else(|err| panic!("boot reconcile failed at {label}: {err}"));
 
     // I-A: recovery totality. No attempt survives reconcile as
     // `Started`, and any attempt whose mint the v7 ledger recorded
@@ -331,29 +349,165 @@ async fn reboot_and_reconcile(world: &ApproveWorld, k: usize, name: &str) -> Aud
     let attempts = audit.approve_attempts_for_push(world.request_id).unwrap();
     assert!(
         !attempts.is_empty(),
-        "the crashed approve started an attempt (k={k}, {name})"
+        "the crashed approve started an attempt ({label})"
     );
     for attempt in &attempts {
         assert!(
             !matches!(attempt.state, GitPushApproveAttemptState::Started),
-            "I-A: Started attempt survived boot reconcile at k={k} ({name})",
+            "I-A: Started attempt survived boot reconcile at {label}",
         );
         if let Some(ledger) = audit.attempt_recorded_mint(attempt.attempt_id).unwrap() {
             match &attempt.state {
                 GitPushApproveAttemptState::Uncertain { mint } => assert_eq!(
                     *mint, ledger,
-                    "I-A: Uncertain mint diverged from ledger at k={k} ({name})",
+                    "I-A: Uncertain mint diverged from ledger at {label}",
                 ),
                 GitPushApproveAttemptState::Resolved { mint, .. } => assert_eq!(
                     *mint,
                     Some(ledger),
-                    "I-A: resolved attempt lost its ledger mint at k={k} ({name})",
+                    "I-A: resolved attempt lost its ledger mint at {label}",
                 ),
                 GitPushApproveAttemptState::Started => unreachable!("asserted above"),
             }
         }
     }
     audit
+}
+
+/// The operator playbook's first step after a reboot, as
+/// [`unblock_retry`] resolves it.
+enum RecoveryStep {
+    /// The joint success TX had already landed; the push is terminal.
+    AlreadyApproved,
+    /// The crashed attempt's PATCH had landed; the operator reconciled
+    /// it `Applied` — terminal.
+    ReconciledApplied,
+    /// No publish happened (possibly established by a `NotApplied`
+    /// reconciliation of an `Uncertain` survivor); a plain retry is
+    /// now unblocked.
+    RetryUnblocked,
+}
+
+/// Follow the operator playbook one step: read the resolution if the
+/// joint TX landed; otherwise reconcile an `Eligible` survivor with
+/// the verdict the fake's *actual branch* dictates (`Applied` when the
+/// crashed attempt's PATCH landed, `NotApplied` when it provably did
+/// not); otherwise the push is already retryable.
+fn unblock_retry(world: &ApproveWorld, audit: &AuditLog, label: &str) -> RecoveryStep {
+    let entry = audit.get_git_push(world.request_id).unwrap().unwrap();
+    if let Some(resolution) = entry.resolution {
+        assert!(
+            matches!(resolution.decision, GitPushResolution::Approved(_)),
+            "a crash mid-approve must never leave a non-approved resolution at {label}",
+        );
+        return RecoveryStep::AlreadyApproved;
+    }
+    match audit
+        .classify_reconciliation_target(world.request_id)
+        .unwrap()
+    {
+        crate::audit::ReconciliationTarget::Eligible {
+            attempt_id: supersedes,
+        } => {
+            let current = world.github.ref_of(WORLD_BRANCH).unwrap();
+            if current == world.origin.prereq().as_str() {
+                audit
+                    .record_reconciliation_attempt_not_applied(
+                        ApproveAttemptId::new(),
+                        supersedes,
+                        OPERATOR,
+                        "fake's branch never moved",
+                        UnixMillis::now(),
+                    )
+                    .unwrap_or_else(|err| panic!("NotApplied must land at {label}: {err}"));
+                RecoveryStep::RetryUnblocked
+            } else {
+                audit
+                    .record_reconciliation_attempt_applied(
+                        ApproveAttemptId::new(),
+                        supersedes,
+                        &current.parse().unwrap(),
+                        OPERATOR,
+                        "confirmed against the fake's branch",
+                        UnixMillis::now(),
+                    )
+                    .unwrap_or_else(|err| panic!("Applied must land at {label}: {err}"));
+                RecoveryStep::ReconciledApplied
+            }
+        }
+        crate::audit::ReconciliationTarget::NothingToReconcile
+        | crate::audit::ReconciliationTarget::NoAttempts => RecoveryStep::RetryUnblocked,
+        crate::audit::ReconciliationTarget::AttemptInFlight => {
+            panic!("boot reconcile left an in-flight attempt at {label}")
+        }
+    }
+}
+
+/// Drive a rebooted world the rest of the way to an approved publish:
+/// one [`unblock_retry`] step, then a crash-free retry if one is
+/// needed. In particular no crash residue (staging dirs, ledger rows)
+/// may block the retry.
+async fn drive_to_approved(world: &ApproveWorld, audit: &AuditLog, label: &str) {
+    match unblock_retry(world, audit, label) {
+        RecoveryStep::AlreadyApproved | RecoveryStep::ReconciledApplied => {}
+        RecoveryStep::RetryUnblocked => {
+            let rebooted = world.rebooted_state();
+            let resp = dispatch_message(world.approve_message(), &rebooted).await;
+            assert!(
+                matches!(resp, ServerMessage::StagedPushApproved { .. }),
+                "retry after recovery at {label} must succeed, got {resp:?}",
+            );
+        }
+    }
+}
+
+/// I-D, single publish: recovery ends with exactly one approved
+/// resolution, exactly one succeeded attempt, exactly one PATCH and
+/// exactly one ref movement — and the fake's ref sits at the succeeded
+/// attempt's tip. Counted against the fake's ground truth, however
+/// many crashes and retries the world went through.
+fn assert_single_publish(world: &ApproveWorld, label: &str) {
+    let audit = AuditLog::open(&world.audit_path).unwrap();
+    let entry = audit.get_git_push(world.request_id).unwrap().unwrap();
+    let resolution = entry
+        .resolution
+        .unwrap_or_else(|| panic!("no resolution after recovery at {label}"));
+    assert!(
+        matches!(resolution.decision, GitPushResolution::Approved(_)),
+        "I-D: recovery must end approved at {label}",
+    );
+    let tips: Vec<String> = audit
+        .approve_attempts_for_push(world.request_id)
+        .unwrap()
+        .iter()
+        .filter_map(|a| match &a.state {
+            GitPushApproveAttemptState::Resolved {
+                outcome: GitPushApproveAttemptOutcome::Succeeded { new_app_tip },
+                ..
+            } => Some(new_app_tip.as_str().to_string()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        tips.len(),
+        1,
+        "I-D: exactly one succeeded attempt at {label}"
+    );
+    assert_eq!(
+        world.github.patch_requests().len(),
+        1,
+        "I-D: exactly one PATCH at {label}"
+    );
+    assert_eq!(
+        world.github.ref_history(WORLD_BRANCH).len(),
+        2,
+        "I-D: seed plus exactly one ref movement at {label}"
+    );
+    assert_eq!(
+        world.github.ref_of(WORLD_BRANCH).unwrap(),
+        tips[0],
+        "I-D: the fake's ref must sit at the published tip at {label}"
+    );
 }
 
 /// The single-crash sweep, retry scenario (DESIGN §6, invariants
@@ -364,24 +518,15 @@ async fn reboot_and_reconcile(world: &ApproveWorld, k: usize, name: &str) -> Aud
 /// reconciliation when the PATCH had already reached the fake.
 #[tokio::test]
 async fn crash_sweep_every_index_recovers_to_one_approved_publish() {
-    let Some(counting_world) = ApproveWorld::start().await else {
+    let Some((_, names)) = count_points().await else {
         eprintln!("skipping: `git` not on PATH");
         return;
     };
-    let count_plan = CrashPlan::count();
-    run_until_crash(
-        &count_plan,
-        dispatch_message(counting_world.approve_message(), &counting_world.state),
-    )
-    .await
-    .expect_completed("counting run must complete");
-    let n = count_plan.points_passed();
-    let names = count_plan.names();
 
     let mut saw_pre_patch = false;
     let mut saw_post_patch = false;
-    assert_eq!(names.len(), n);
     for (k, &name) in names.iter().enumerate() {
+        let label = format!("k={k} ({name})");
         let world = ApproveWorld::start()
             .await
             .expect("git existed for the counting run");
@@ -394,7 +539,7 @@ async fn crash_sweep_every_index_recovers_to_one_approved_publish() {
         .expect_crashed("k is within the counted range");
         assert_eq!(index, k);
 
-        let audit = reboot_and_reconcile(&world, k, name).await;
+        let audit = reboot_and_reconcile(&world, &label).await;
 
         // Classify pre- vs post-PATCH from the fake's request log —
         // the ground truth, not the audit log under test.
@@ -438,125 +583,11 @@ async fn crash_sweep_every_index_recovers_to_one_approved_publish() {
             );
         }
 
-        // Scenario A: drive to completion.
-        let entry = audit.get_git_push(world.request_id).unwrap().unwrap();
-        let final_tip = if let Some(resolution) = entry.resolution {
-            // The crash landed after the joint TX: already terminal.
-            assert!(
-                matches!(resolution.decision, GitPushResolution::Approved(_)),
-                "post-TX crash must leave an approved resolution at k={k} ({name})",
-            );
-            world.github.ref_of(WORLD_BRANCH).unwrap()
-        } else {
-            match audit
-                .classify_reconciliation_target(world.request_id)
-                .unwrap()
-            {
-                crate::audit::ReconciliationTarget::Eligible {
-                    attempt_id: supersedes,
-                } => {
-                    // The operator inspects the fake's actual branch
-                    // and records the verdict it dictates: Applied at
-                    // the current tip when the crashed attempt's PATCH
-                    // landed, NotApplied (then a plain retry) when the
-                    // crash fell between the Uncertain TX and the
-                    // PATCH.
-                    let current = world.github.ref_of(WORLD_BRANCH).unwrap();
-                    if current == world.origin.prereq().as_str() {
-                        audit
-                            .record_reconciliation_attempt_not_applied(
-                                ApproveAttemptId::new(),
-                                supersedes,
-                                OPERATOR,
-                                "fake's branch never moved",
-                                UnixMillis::now(),
-                            )
-                            .unwrap_or_else(|err| {
-                                panic!("NotApplied must land at k={k} ({name}): {err}")
-                            });
-                        let rebooted = world.rebooted_state();
-                        let resp = dispatch_message(world.approve_message(), &rebooted).await;
-                        let ServerMessage::StagedPushApproved { new_app_tip, .. } = resp else {
-                            panic!(
-                                "retry after NotApplied at k={k} ({name}) must succeed, \
-                                 got {resp:?}"
-                            );
-                        };
-                        new_app_tip.as_str().to_string()
-                    } else {
-                        audit
-                            .record_reconciliation_attempt_applied(
-                                ApproveAttemptId::new(),
-                                supersedes,
-                                &current.parse().unwrap(),
-                                OPERATOR,
-                                "confirmed against the fake's branch",
-                                UnixMillis::now(),
-                            )
-                            .unwrap_or_else(|err| {
-                                panic!("Applied must land at k={k} ({name}): {err}")
-                            });
-                        current
-                    }
-                }
-                crate::audit::ReconciliationTarget::NothingToReconcile
-                | crate::audit::ReconciliationTarget::NoAttempts => {
-                    // Pre-PATCH crash, cleanly recovered: a rebooted
-                    // broker retries the approve and it must succeed —
-                    // in particular, no crash residue (staging dirs,
-                    // ledger rows) may block it.
-                    let rebooted = world.rebooted_state();
-                    let resp = dispatch_message(world.approve_message(), &rebooted).await;
-                    let ServerMessage::StagedPushApproved { new_app_tip, .. } = resp else {
-                        panic!("retry after crash at k={k} ({name}) must succeed, got {resp:?}");
-                    };
-                    new_app_tip.as_str().to_string()
-                }
-                crate::audit::ReconciliationTarget::AttemptInFlight => {
-                    panic!("boot reconcile left an in-flight attempt at k={k} ({name})")
-                }
-            }
-        };
-
-        // I-D: single publish. Exactly one approved resolution; the
-        // fake's ref sits at the published tip; and the number of
-        // succeeded attempts equals the number of PATCHes equals the
-        // number of ref movements — no publish happened off the books.
-        let audit = AuditLog::open(&world.audit_path).unwrap();
-        let entry = audit.get_git_push(world.request_id).unwrap().unwrap();
-        let resolution = entry
-            .resolution
-            .unwrap_or_else(|| panic!("no resolution after recovery at k={k} ({name})"));
-        assert!(
-            matches!(resolution.decision, GitPushResolution::Approved(_)),
-            "I-D: recovery must end approved at k={k} ({name})",
-        );
-        assert_eq!(
-            world.github.ref_of(WORLD_BRANCH).unwrap(),
-            final_tip,
-            "I-D: the fake's ref must sit at the published tip at k={k} ({name})",
-        );
-        let succeeded = audit
-            .approve_attempts_for_push(world.request_id)
-            .unwrap()
-            .iter()
-            .filter(|a| {
-                matches!(
-                    a.state,
-                    GitPushApproveAttemptState::Resolved {
-                        outcome: GitPushApproveAttemptOutcome::Succeeded { .. },
-                        ..
-                    }
-                )
-            })
-            .count();
-        let patches = world.github.patch_requests().len();
-        let moves = world.github.ref_history(WORLD_BRANCH).len() - 1;
-        assert!(
-            succeeded == patches && patches == moves,
-            "I-D: succeeded attempts ({succeeded}) / PATCHes ({patches}) / ref moves ({moves}) \
-             disagree at k={k} ({name})",
-        );
+        // Scenario A: drive to completion (the operator playbook:
+        // reconcile per the fake's ground truth, then retry if no
+        // publish happened), then I-D.
+        drive_to_approved(&world, &audit, &label).await;
+        assert_single_publish(&world, &label);
     }
 
     // Meta-check: the sweep must straddle the PATCH, or the classifier
@@ -576,21 +607,11 @@ async fn crash_sweep_every_index_recovers_to_one_approved_publish() {
 /// applied PATCH.
 #[tokio::test]
 async fn crash_sweep_reject_is_permitted_exactly_when_the_patch_provably_never_fired() {
-    let Some(counting_world) = ApproveWorld::start().await else {
+    let Some((_, names)) = count_points().await else {
         eprintln!("skipping: `git` not on PATH");
         return;
     };
-    let count_plan = CrashPlan::count();
-    run_until_crash(
-        &count_plan,
-        dispatch_message(counting_world.approve_message(), &counting_world.state),
-    )
-    .await
-    .expect_completed("counting run must complete");
-    let n = count_plan.points_passed();
-    let names = count_plan.names();
 
-    assert_eq!(names.len(), n);
     for (k, &name) in names.iter().enumerate() {
         let world = ApproveWorld::start()
             .await
@@ -603,7 +624,7 @@ async fn crash_sweep_reject_is_permitted_exactly_when_the_patch_provably_never_f
         .await
         .expect_crashed("k is within the counted range");
 
-        let audit = reboot_and_reconcile(&world, k, name).await;
+        let audit = reboot_and_reconcile(&world, &format!("k={k} ({name})")).await;
         let already_resolved = audit
             .get_git_push(world.request_id)
             .unwrap()
@@ -714,6 +735,168 @@ async fn crash_sweep_reject_is_permitted_exactly_when_the_patch_provably_never_f
                 "post-reconciliation reject must see the resolution at k={k} ({name}), \
                  got {resp:?}",
             );
+        }
+    }
+}
+
+/// Stage 6, double crash (DESIGN §7): crash at `k₁`, reboot, follow
+/// the operator playbook one step; if that step is a retry, crash the
+/// retry at `k₂`; reboot; finish. The invariants are state-based, not
+/// trace-based, so they are unchanged — that is the point of writing
+/// them that way. Sampled rather than swept: the full `N²` grid costs
+/// too many subprocess-heavy runs for `cargo test`; 32 proptest cases
+/// keep the property honest without the bill.
+#[test]
+fn double_crash_sampled_pairs_recover_to_one_approved_publish() {
+    use proptest::test_runner::{Config, TestRunner};
+
+    if maybe_git().is_none() {
+        eprintln!("skipping: `git` not on PATH");
+        return;
+    }
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    let (n, _) = rt
+        .block_on(count_points())
+        .expect("`git` presence checked above");
+
+    let mut config = Config::with_cases(32);
+    config.source_file = Some(file!());
+    // This runner drives an async case on the shared `rt` above, so it
+    // must execute in-process. `Config::with_cases` inherits `fork` /
+    // `timeout` from the environment (`PROPTEST_FORK`, `PROPTEST_TIMEOUT`),
+    // and both fork the case into a subprocess that re-enters the test
+    // binary rather than this closure — meaningless here. Forcing them
+    // off keeps the runtime test honest under any env, and sidesteps the
+    // `Must supply test_name when forking enabled` panic a hand-built
+    // config (no `test_name`) would otherwise hit.
+    config.fork = false;
+    config.timeout = 0;
+    let mut runner = TestRunner::new(config);
+    runner
+        .run(&(0..n, 0..n), |(k1, k2)| {
+            rt.block_on(double_crash_case(k1, k2));
+            Ok(())
+        })
+        .unwrap_or_else(|err| panic!("double-crash property failed: {err}"));
+}
+
+async fn double_crash_case(k1: usize, k2: usize) {
+    let label = format!("k1={k1}, k2={k2}");
+    let world = ApproveWorld::start().await.expect("git is on PATH");
+    let plan = CrashPlan::crash_at(k1);
+    run_until_crash(
+        &plan,
+        dispatch_message(world.approve_message(), &world.state),
+    )
+    .await
+    .expect_crashed("k1 is within the counted range");
+    let audit = reboot_and_reconcile(&world, &label).await;
+
+    match unblock_retry(&world, &audit, &label) {
+        RecoveryStep::AlreadyApproved | RecoveryStep::ReconciledApplied => {
+            // The first crash landed post-publish; there is nothing
+            // left for the second crash to interrupt.
+        }
+        RecoveryStep::RetryUnblocked => {
+            let plan = CrashPlan::crash_at(k2);
+            match run_until_crash(
+                &plan,
+                dispatch_message(world.approve_message(), &world.rebooted_state()),
+            )
+            .await
+            {
+                CrashOutcome::Completed(resp) => {
+                    // `k₂` lay past the retry's last point.
+                    assert!(
+                        matches!(resp, ServerMessage::StagedPushApproved { .. }),
+                        "uncrashed retry must succeed at {label}, got {resp:?}",
+                    );
+                }
+                CrashOutcome::Crashed { .. } => {
+                    let audit = reboot_and_reconcile(&world, &label).await;
+                    drive_to_approved(&world, &audit, &label).await;
+                }
+            }
+        }
+    }
+    assert_single_publish(&world, &label);
+}
+
+/// Stage 6, torn residue (DESIGN §7): a real crash can tear the
+/// staging dir's files, not just abandon them — SQLite's transactions
+/// give the audit store torn-write freedom, but the filesystem has no
+/// such shield. After every staging-phase crash, corrupt the residue
+/// two ways (truncate the bundle; empty the directory) and the
+/// recovery must not notice: attempt-keyed staging dirs mean nothing
+/// ever reads a dead attempt's directory.
+#[tokio::test]
+async fn torn_staging_residue_never_blocks_the_retry() {
+    let Some((_, names)) = count_points().await else {
+        eprintln!("skipping: `git` not on PATH");
+        return;
+    };
+
+    #[derive(Clone, Copy, Debug)]
+    enum Tear {
+        TruncateBundle,
+        EmptyDir,
+    }
+
+    let staging_indices: Vec<usize> = names
+        .iter()
+        .enumerate()
+        .filter(|(_, name)| name.starts_with("prepare::"))
+        .map(|(k, _)| k)
+        .collect();
+    assert!(
+        staging_indices.len() >= 6,
+        "the staging phase has six instrumented steps, saw {names:?}",
+    );
+    for &k in &staging_indices {
+        for tear in [Tear::TruncateBundle, Tear::EmptyDir] {
+            let label = format!("k={k} ({}), {tear:?}", names[k]);
+            let world = ApproveWorld::start()
+                .await
+                .expect("git existed for the counting run");
+            let plan = CrashPlan::crash_at(k);
+            run_until_crash(
+                &plan,
+                dispatch_message(world.approve_message(), &world.state),
+            )
+            .await
+            .expect_crashed("k is within the counted range");
+
+            // The crash abandoned the attempt's staging dir; tear it.
+            let approve_root = world.work_root.join("approve");
+            let dirs: Vec<PathBuf> = std::fs::read_dir(&approve_root)
+                .unwrap_or_else(|err| panic!("staging root must exist after {label}: {err}"))
+                .map(|entry| entry.unwrap().path())
+                .collect();
+            assert!(
+                !dirs.is_empty(),
+                "a staging-phase crash leaves residue at {label}",
+            );
+            for dir in &dirs {
+                match tear {
+                    Tear::TruncateBundle => {
+                        std::fs::write(dir.join("staged.bundle"), b"").unwrap();
+                    }
+                    Tear::EmptyDir => {
+                        for entry in std::fs::read_dir(dir).unwrap() {
+                            let path = entry.unwrap().path();
+                            if path.is_dir() {
+                                std::fs::remove_dir_all(&path).unwrap();
+                            } else {
+                                std::fs::remove_file(&path).unwrap();
+                            }
+                        }
+                    }
+                }
+            }
+
+            let audit = reboot_and_reconcile(&world, &label).await;
+            drive_to_approved(&world, &audit, &label).await;
+            assert_single_publish(&world, &label);
         }
     }
 }

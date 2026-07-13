@@ -18,6 +18,12 @@
 //! run for each `k ∈ 0..N`. Adding a new point later automatically
 //! widens the sweep; no manual index list exists to go stale.
 //!
+//! A third mode, [`CrashPlan::act_at`], keeps the handler alive but
+//! runs an injected action at the chosen point — the *rival actor*:
+//! the world changes under the handler mid-pipeline (a branch moves,
+//! say) and the run continues to whatever outcome the production code
+//! reaches. Same points, same sweep pattern, different adversary.
+//!
 //! See `docs/design/approve-crash-injection-harness.md` for the full
 //! design. Two caveats from there are load-bearing:
 //!
@@ -63,12 +69,28 @@ mod test_impl {
         static CRASH_PLAN: Arc<CrashPlan>;
     }
 
-    #[derive(Debug)]
     enum Mode {
         /// Pass every point, recording it.
         Count,
         /// Park forever at the point whose running index equals this.
         CrashAt(usize),
+        /// Run the injected action at the point whose running index
+        /// equals `index`, then continue — the rival-actor mode: the
+        /// handler lives while the world changes under it.
+        ActAt {
+            index: usize,
+            action: Box<dyn Fn() + Send + Sync>,
+        },
+    }
+
+    impl std::fmt::Debug for Mode {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Self::Count => write!(f, "Count"),
+                Self::CrashAt(index) => write!(f, "CrashAt({index})"),
+                Self::ActAt { index, .. } => write!(f, "ActAt({index})"),
+            }
+        }
     }
 
     /// A single run's fault-injection schedule plus what it observed.
@@ -81,6 +103,7 @@ mod test_impl {
         names: Mutex<Vec<&'static str>>,
         parked: tokio::sync::Notify,
         crashed_at: Mutex<Option<(usize, &'static str)>>,
+        acted_at: Mutex<Option<(usize, &'static str)>>,
     }
 
     impl CrashPlan {
@@ -95,6 +118,16 @@ mod test_impl {
             Arc::new(Self::new(Mode::CrashAt(index)))
         }
 
+        /// A plan that runs `action` at the `index`th point passed and
+        /// lets the run continue — the rival actor's move, injected
+        /// mid-pipeline while the handler is live.
+        pub(crate) fn act_at(index: usize, action: impl Fn() + Send + Sync + 'static) -> Arc<Self> {
+            Arc::new(Self::new(Mode::ActAt {
+                index,
+                action: Box::new(action),
+            }))
+        }
+
         fn new(mode: Mode) -> Self {
             Self {
                 mode,
@@ -102,6 +135,7 @@ mod test_impl {
                 names: Mutex::new(Vec::new()),
                 parked: tokio::sync::Notify::new(),
                 crashed_at: Mutex::new(None),
+                acted_at: Mutex::new(None),
             }
         }
 
@@ -117,6 +151,14 @@ mod test_impl {
                 .lock()
                 .expect("crash plan names poisoned")
                 .clone()
+        }
+
+        /// Whether an [`CrashPlan::act_at`] plan's action has fired.
+        pub(crate) fn acted(&self) -> bool {
+            self.acted_at
+                .lock()
+                .expect("crash plan acted_at poisoned")
+                .is_some()
         }
     }
 
@@ -165,17 +207,31 @@ mod test_impl {
             .lock()
             .expect("crash plan names poisoned")
             .push(name);
-        if let Mode::CrashAt(target) = plan.mode
-            && index == target
-        {
-            *plan
-                .crashed_at
-                .lock()
-                .expect("crash plan crashed_at poisoned") = Some((index, name));
-            plan.parked.notify_one();
-            // Park forever; the harness drops this future, abandoning
-            // everything downstream of the point — the crash.
-            std::future::pending::<()>().await;
+        match &plan.mode {
+            Mode::Count => {}
+            Mode::CrashAt(target) => {
+                if index == *target {
+                    *plan
+                        .crashed_at
+                        .lock()
+                        .expect("crash plan crashed_at poisoned") = Some((index, name));
+                    plan.parked.notify_one();
+                    // Park forever; the harness drops this future,
+                    // abandoning everything downstream of the point —
+                    // the crash.
+                    std::future::pending::<()>().await;
+                }
+            }
+            Mode::ActAt {
+                index: target,
+                action,
+            } => {
+                if index == *target {
+                    *plan.acted_at.lock().expect("crash plan acted_at poisoned") =
+                        Some((index, name));
+                    action();
+                }
+            }
         }
     }
 
@@ -289,6 +345,37 @@ mod tests {
         let out = toy_pipeline(Arc::clone(&effects)).await;
         assert_eq!(out, "done");
         assert_eq!(*effects.lock().unwrap(), vec!["alpha", "beta", "gamma"]);
+    }
+
+    /// The rival-actor mode: the injected action fires exactly at its
+    /// point (after beta's effect, before gamma runs) and the run
+    /// completes normally.
+    #[tokio::test]
+    async fn act_at_runs_the_action_at_its_point_and_completes() {
+        let effects = Arc::new(Mutex::new(Vec::new()));
+        let rival = Arc::clone(&effects);
+        let plan = CrashPlan::act_at(1, move || rival.lock().unwrap().push("rival"));
+        let out = run_until_crash(&plan, toy_pipeline(Arc::clone(&effects)))
+            .await
+            .expect_completed("act mode must not park");
+        assert_eq!(out, "done");
+        assert!(plan.acted());
+        assert_eq!(
+            *effects.lock().unwrap(),
+            vec!["alpha", "beta", "rival", "gamma"],
+        );
+    }
+
+    /// An out-of-range action index never fires, and `acted()` says so
+    /// — the sweep's guard against a rival move that silently missed.
+    #[tokio::test]
+    async fn act_at_beyond_the_run_never_fires() {
+        let effects = Arc::new(Mutex::new(Vec::new()));
+        let plan = CrashPlan::act_at(3, || panic!("out-of-range action must not fire"));
+        run_until_crash(&plan, toy_pipeline(effects))
+            .await
+            .expect_completed("act mode must not park");
+        assert!(!plan.acted());
     }
 
     /// Nested scopes: a crashed inner future must not wedge the outer
