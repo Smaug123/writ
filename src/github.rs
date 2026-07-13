@@ -26,6 +26,7 @@ use crate::core::{
     AgentKind, CredentialGrant, GitHubGrantedScope, GitHubPermissions, GrantedScope, Jti, RepoRef,
     RequestId, SessionId, TtlSeconds, UnixMillis,
 };
+use crate::policy::AuthorizedMint;
 use crate::secret::{SecretError, SecretKey, SecretStore};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -269,15 +270,47 @@ impl GitHubMinter {
 
     /// Mint using the GitHub App selected by the session-level agent kind.
     /// `agent_kind` must be present and must have a matching configured App.
+    ///
+    /// Takes an [`AuthorizedMint`], not a bare scope: the only way to obtain
+    /// one is [`crate::policy::decide`], so a caller cannot mint a credential
+    /// the policy engine never authorised. This is the type-level guard that
+    /// keeps the staged-push approve path subject to `writable_repos`.
     pub async fn mint_for_agent(
+        &self,
+        secrets: &dyn SecretStore,
+        agent_kind: Option<AgentKind>,
+        authorization: AuthorizedMint,
+    ) -> Result<MintedToken, MintError> {
+        let config = self.config_for_agent(agent_kind)?;
+        self.mint_with_config(
+            secrets,
+            config,
+            authorization.scope().clone(),
+            authorization.ttl(),
+        )
+        .await
+    }
+
+    /// Test-only shim: mint from a bare scope by wrapping it in an
+    /// [`AuthorizedMint::for_test`]. The minter's own unit tests exercise its
+    /// HTTP/JWT/echo-check behaviour against arbitrary scopes and have no
+    /// policy to route through; production callers must go via
+    /// [`mint_for_agent`](Self::mint_for_agent).
+    #[cfg(test)]
+    async fn mint_for_agent_scoped(
         &self,
         secrets: &dyn SecretStore,
         agent_kind: Option<AgentKind>,
         scope: GitHubGrantedScope,
         ttl: TtlSeconds,
     ) -> Result<MintedToken, MintError> {
-        let config = self.config_for_agent(agent_kind)?;
-        self.mint_with_config(secrets, config, scope, ttl).await
+        GitHubMinter::mint_for_agent(
+            self,
+            secrets,
+            agent_kind,
+            AuthorizedMint::for_test(scope, ttl),
+        )
+        .await
     }
 
     fn config_for_agent(
@@ -815,7 +848,7 @@ mod tests {
 
         let (minter, store) = minter_with_key(&server);
         let minted = minter
-            .mint_for_agent(
+            .mint_for_agent_scoped(
                 &store,
                 Some(AgentKind::Claude),
                 write_scope("o", "n"),
@@ -844,7 +877,7 @@ mod tests {
 
         let (minter, store) = minter_with_key(&server);
         match minter
-            .mint_for_agent(
+            .mint_for_agent_scoped(
                 &store,
                 Some(AgentKind::Claude),
                 write_scope("o", "nope"),
@@ -880,7 +913,7 @@ mod tests {
         let minter = GitHubMinter::new_registry(GitHubAppRegistryConfig::new(apps).unwrap());
         let store = InMemStore::default();
         match minter
-            .mint_for_agent(
+            .mint_for_agent_scoped(
                 &store,
                 Some(AgentKind::Claude),
                 write_scope("o", "n"),
@@ -930,7 +963,7 @@ mod tests {
 
         let (minter, store) = minter_with_key(&server);
         let err = minter
-            .mint_for_agent(
+            .mint_for_agent_scoped(
                 &store,
                 Some(AgentKind::Claude),
                 write_scope("o", "n"),
@@ -958,7 +991,7 @@ mod tests {
 
         let (minter, store) = minter_with_key(&server);
         match minter
-            .mint_for_agent(
+            .mint_for_agent_scoped(
                 &store,
                 Some(AgentKind::Claude),
                 write_scope("o", "n"),
@@ -992,7 +1025,7 @@ mod tests {
 
         let (minter, store) = minter_with_key(&server);
         let minted = minter
-            .mint_for_agent(
+            .mint_for_agent_scoped(
                 &store,
                 Some(AgentKind::Claude),
                 write_scope("o", "n"),
@@ -1017,7 +1050,7 @@ mod tests {
 
         let (minter, store) = minter_with_key(&server);
         let err = minter
-            .mint_for_agent(
+            .mint_for_agent_scoped(
                 &store,
                 Some(AgentKind::Claude),
                 write_scope("o", "n"),
@@ -1044,7 +1077,7 @@ mod tests {
         let (minter, store) = minter_with_key(&server);
         let before = UnixMillis::now().as_millis();
         let minted = minter
-            .mint_for_agent(
+            .mint_for_agent_scoped(
                 &store,
                 Some(AgentKind::Claude),
                 write_scope("o", "n"),
@@ -1079,7 +1112,7 @@ mod tests {
         let (minter, store) = minter_with_key(&server);
         let requested_scope = write_scope("o", "n");
         let minted = minter
-            .mint_for_agent(
+            .mint_for_agent_scoped(
                 &store,
                 Some(AgentKind::Claude),
                 requested_scope.clone(),
@@ -1170,7 +1203,7 @@ mod tests {
 
         let (minter, store) = minter_with_key(&server);
         let err = minter
-            .mint_for_agent(
+            .mint_for_agent_scoped(
                 &store,
                 Some(AgentKind::Claude),
                 write_scope("o", "n"),
@@ -1193,7 +1226,7 @@ mod tests {
         // error variant.
         let (minter, store) = minter_with_owner(&server, "o");
         let err = minter
-            .mint_for_agent(
+            .mint_for_agent_scoped(
                 &store,
                 Some(AgentKind::Claude),
                 write_scope("someone-else", "n"),
@@ -1234,7 +1267,7 @@ mod tests {
 
         let (minter, store) = minter_with_key(&server);
         let err = minter
-            .mint_for_agent(
+            .mint_for_agent_scoped(
                 &store,
                 Some(AgentKind::Claude),
                 write_scope("o", "n"),
@@ -1278,7 +1311,7 @@ mod tests {
 
         let (minter, store) = minter_with_key(&server);
         let err = minter
-            .mint_for_agent(
+            .mint_for_agent_scoped(
                 &store,
                 Some(AgentKind::Claude),
                 write_scope("o", "n"),
@@ -1321,7 +1354,7 @@ mod tests {
 
         let (minter, store) = minter_with_key(&server);
         let err = minter
-            .mint_for_agent(
+            .mint_for_agent_scoped(
                 &store,
                 Some(AgentKind::Claude),
                 write_scope("o", "n"),
@@ -1356,7 +1389,7 @@ mod tests {
 
         let (minter, store) = minter_with_owner(&server, "smaug123");
         minter
-            .mint_for_agent(
+            .mint_for_agent_scoped(
                 &store,
                 Some(AgentKind::Claude),
                 write_scope("Smaug123", "n"),
@@ -1388,7 +1421,7 @@ mod tests {
 
         let (minter, store) = minter_with_owner(&server, "smaug123");
         minter
-            .mint_for_agent(
+            .mint_for_agent_scoped(
                 &store,
                 Some(AgentKind::Claude),
                 write_scope("smaug123", "writ"),
@@ -1427,7 +1460,7 @@ mod tests {
 
         let (minter, store) = minter_with_key(&server);
         let err = minter
-            .mint_for_agent(
+            .mint_for_agent_scoped(
                 &store,
                 Some(AgentKind::Claude),
                 write_scope("o", "n"),
@@ -1463,7 +1496,7 @@ mod tests {
 
         let (minter, store) = minter_with_key(&server);
         let err = minter
-            .mint_for_agent(
+            .mint_for_agent_scoped(
                 &store,
                 Some(AgentKind::Claude),
                 write_scope("o", "n"),
@@ -1498,7 +1531,7 @@ mod tests {
 
         let (minter, store) = minter_with_key(&server);
         let minted = minter
-            .mint_for_agent(
+            .mint_for_agent_scoped(
                 &store,
                 Some(AgentKind::Claude),
                 write_scope("o", "n"),

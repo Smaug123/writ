@@ -26,8 +26,7 @@ use crate::audit::{
 };
 use crate::core::{
     ApproveAttemptId, CapabilityRequest, GITHUB_INSTALLATION_TOKEN_MAX_SECONDS, GitHubAccess,
-    GitHubGrantedScope, GitHubPermissions, GrantedScope, MetadataAccess, PolicyDecision, RequestId,
-    SessionId, SessionRecord, TtlSeconds, UnixMillis,
+    GitHubRequest, RequestId, SessionId, SessionRecord, TtlSeconds, UnixMillis,
 };
 use crate::core::{NotesRef, Sha256Hex};
 use crate::git_push_approve::{RunApproveError, prepare_approve};
@@ -35,7 +34,7 @@ use crate::git_push_promote::{CommitError, PromoteRuntimeConfig};
 use crate::git_push_staging::{GitPushStagingStore, StagedEntry, StagingError};
 use crate::github::GitHubMinter;
 use crate::notes_repo::NotesRepo;
-use crate::policy::{self, PolicyConfig};
+use crate::policy::{self, Decision, PolicyConfig};
 use crate::protocol::{
     ClientMessage, ReconcileOutcome, RejectionReason, ServerMessage, SignedRunMetadata,
     StagedPushAuditView, StagedPushDetail, StagedPushSummary,
@@ -1027,26 +1026,40 @@ async fn execute_started_attempt<S: SecretStore + Send + Sync + 'static>(
     promote_runtime: &PromoteRuntimeConfig,
     signing_key: &WritSigningKey,
 ) -> Result<crate::vm_git::GitObjectId, ServerMessage> {
-    // Static promote scope: `contents:write` is what the Git Data REST
-    // API needs to upload blobs/trees/commits and update the branch
-    // ref; `metadata:read` is implicit but listed explicitly because
-    // the minter's permissions-echo check refuses any drift between
-    // what we asked for and what GitHub returned. The single repo on
-    // the scope is the one the staged push targets.
-    let github_scope = GitHubGrantedScope {
-        repository: entry.receipt().repo().as_repo_ref().clone(),
-        permissions: GitHubPermissions {
-            contents: Some(GitHubAccess::Write),
-            metadata: Some(MetadataAccess::Read),
-            ..Default::default()
-        },
+    // The staged push targets one repo and needs `contents:write` to
+    // publish it. Route that as a `CapabilityRequest` through the same
+    // policy engine every other mint uses, rather than hand-building the
+    // scope: this is what subjects approvals to the `writable_repos`
+    // allowlist. `decide` grants `contents:write` + `metadata:read` for a
+    // `Contents { Write }` request — exactly the promote scope. Only the
+    // TTL is overridden, to the GitHub installation-token ceiling: see
+    // [`APPROVE_MINT_TTL_SECONDS`] — it is an accept-back bound on the
+    // expiry GitHub returns, not a lifetime the server grants, and the
+    // minter's permissions-echo check still refuses any scope drift.
+    let promote_request = CapabilityRequest::GitHub(GitHubRequest::Contents {
+        access: GitHubAccess::Write,
+        repo: entry.receipt().repo().as_repo_ref().clone(),
+    });
+    let authorization = match policy::decide(&promote_request, &state.policy) {
+        Decision::Grant(authorization) => authorization.with_ttl(
+            TtlSeconds::new(APPROVE_MINT_TTL_SECONDS)
+                .expect("APPROVE_MINT_TTL_SECONDS is in TtlSeconds range"),
+        ),
+        Decision::Deny { reason } => {
+            // A policy denial is a pre-patch failure: nothing has touched
+            // GitHub yet, so the attempt resolves cleanly and the operator
+            // is told the approve was refused by policy.
+            let detail = format!("policy denied approve-time mint: {reason}");
+            resolve_pre_patch_failure(state, attempt_id, request_id, &detail, None).await;
+            return Err(ServerMessage::Error {
+                message: format!("approve refused: {reason}"),
+            });
+        }
     };
-    let ttl = TtlSeconds::new(APPROVE_MINT_TTL_SECONDS)
-        .expect("APPROVE_MINT_TTL_SECONDS is in TtlSeconds range");
 
     let mint_result = state
         .minter
-        .mint_for_agent(&state.secrets, agent_kind, github_scope, ttl)
+        .mint_for_agent(&state.secrets, agent_kind, authorization)
         .await;
     let minted = match mint_result {
         Ok(m) => m,
@@ -2689,6 +2702,7 @@ pub(crate) async fn request_capability<S: SecretStore + Send + Sync>(
     let request_id = RequestId::new();
     let received_at = UnixMillis::now();
     let decision = policy::decide(&capability, &state.policy);
+    let decision_record = decision.to_record();
 
     // Pre-record the request + decision *before* we await the backend
     // mint. If we recorded only on the way back out, a crash (or a
@@ -2704,36 +2718,25 @@ pub(crate) async fn request_capability<S: SecretStore + Send + Sync>(
         session_id,
         received_at,
         request: &capability,
-        decision: &decision,
+        decision: &decision_record,
     }) {
         return CapabilityOutcome::Error {
             message: format!("request could not be recorded: {e}"),
         };
     }
 
-    // Early-return on Deny: no await point follows, so the &decision
-    // borrow is trivially scoped.
-    if let PolicyDecision::Deny { reason } = &decision {
-        return CapabilityOutcome::Denied {
-            reason: reason.clone(),
-        };
-    }
-
-    // Decision is Grant. Extract scope/ttl (cloning) before the await
-    // so the short-lived &decision borrows don't cross the async boundary.
-    let (github_scope, ttl): (_, TtlSeconds) = match &decision {
-        PolicyDecision::Grant { scope, ttl } => {
-            let s = match scope {
-                GrantedScope::GitHub(s) => s.clone(),
-            };
-            (s, *ttl)
+    // The `Grant` carries the unforgeable authorization the minter needs;
+    // `Deny` short-circuits before any mint.
+    let authorization = match decision {
+        Decision::Deny { reason } => {
+            return CapabilityOutcome::Denied { reason };
         }
-        PolicyDecision::Deny { .. } => unreachable!("handled above"),
+        Decision::Grant(authorization) => authorization,
     };
 
     let mint_result = state
         .minter
-        .mint_for_agent(&state.secrets, session.agent_kind, github_scope, ttl)
+        .mint_for_agent(&state.secrets, session.agent_kind, authorization)
         .await;
 
     match mint_result {
