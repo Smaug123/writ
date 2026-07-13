@@ -168,6 +168,11 @@ async fn handle_git_push_request<S: SecretStore + Send + Sync + 'static>(
             );
         }
     }
+    // Durable effect: the request row is committed. A crash from here to
+    // the staging step below leaves a request row with no carrier and no
+    // outcome — benign (nothing to promote; the guest retries under a
+    // fresh id) and invisible to `promote list`.
+    crate::crash_point::point("git_push::request_recorded").await;
 
     let staged_at = UnixMillis::now();
     let staging_result = {
@@ -197,6 +202,14 @@ async fn handle_git_push_request<S: SecretStore + Send + Sync + 'static>(
 
     match staging_result {
         Ok(receipt) => {
+            // Durable effect: the carrier is fsynced and atomically
+            // renamed into `staged/`, so any carrier visible there is
+            // complete. Until the `Staged` outcome row below commits the
+            // push is neither approvable (`check_approvable_push`) nor
+            // rejectable (`git_push_resolution_requires_staged`); a crash
+            // here is recovered by `reconcile_orphaned_staged_carriers`
+            // on the next boot.
+            crate::crash_point::point("git_push::carrier_staged").await;
             if let Err(err) = record_unattempted_outcome(
                 &service,
                 push_request_id,
@@ -210,12 +223,24 @@ async fn handle_git_push_request<S: SecretStore + Send + Sync + 'static>(
                     error = %err,
                     "audit write failed",
                 );
+                // The carrier is durably on disk but its `Staged` outcome
+                // row did not commit, so it would be stuck — neither
+                // approvable nor rejectable. The process is still alive,
+                // so repair the invariant online: best-effort delete the
+                // carrier before returning failure. The guest treats this
+                // as a failed push and retries under a fresh request id.
+                // If the delete also fails, the boot-time carrier sweep
+                // recovers the orphan on the next start.
+                delete_orphaned_carrier_after_outcome_failure(&service, push_request_id).await;
                 return git_push_error_response(
                     VmHttpStatus::InternalServerError,
                     VmGitPushErrorCode::PushFailed,
                     "audit write failed",
                 );
             }
+            // Durable effect: the `Staged` outcome row is committed; the
+            // push is now resolvable.
+            crate::crash_point::point("git_push::outcome_recorded").await;
             VmHttpResponse::json(VmHttpStatus::Ok, &receipt)
         }
         Err(StagingError::Conflict { .. }) => {
@@ -258,6 +283,42 @@ async fn handle_git_push_request<S: SecretStore + Send + Sync + 'static>(
                 VmGitPushErrorCode::PushFailed,
                 "staging failed",
             )
+        }
+    }
+}
+
+/// Best-effort removal of a carrier whose `Staged` outcome row failed to
+/// commit. Keeps the "a carrier on disk is always resolvable" invariant
+/// holding online rather than deferring to the boot-time sweep. A delete
+/// failure is logged to [`AUDIT_WRITE_FAILURE_TARGET`] and swallowed: the
+/// leftover carrier is then exactly the crash-window orphan that
+/// [`crate::boot_reconcile::reconcile_orphaned_staged_carriers`] repairs.
+async fn delete_orphaned_carrier_after_outcome_failure<S: SecretStore>(
+    service: &VmHttpGitPushService<S>,
+    push_request_id: RequestId,
+) {
+    let staging_store = Arc::clone(&service.staging_store);
+    let delete = tokio::task::spawn_blocking(move || staging_store.delete(push_request_id)).await;
+    match delete {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => {
+            tracing::error!(
+                target: AUDIT_WRITE_FAILURE_TARGET,
+                kind = "git_push_orphan_cleanup",
+                push_request_id = %push_request_id,
+                error = %err,
+                "could not delete carrier orphaned by an outcome-write failure; \
+                 boot carrier sweep will recover it",
+            );
+        }
+        Err(join_err) => {
+            tracing::error!(
+                target: AUDIT_WRITE_FAILURE_TARGET,
+                kind = "git_push_orphan_cleanup",
+                push_request_id = %push_request_id,
+                error = %join_err,
+                "carrier cleanup task panicked; boot carrier sweep will recover it",
+            );
         }
     }
 }
@@ -807,6 +868,157 @@ mod tests {
                 .list_git_pushes_for_session(session.session_id())
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    /// The invariant this whole fix protects: for a crash at *every*
+    /// durable-effect boundary in the push handler, running the boot
+    /// carrier sweep afterwards leaves the world in a resolvable state —
+    /// any carrier still on disk has a `staged` outcome row (so it is
+    /// both approvable and rejectable), and there is never a carrier
+    /// stuck without one. Uses the crash-injection harness's count-then-
+    /// sweep pattern so a newly-added point widens coverage automatically.
+    #[tokio::test]
+    async fn crash_between_effects_leaves_every_carrier_resolvable_after_sweep() {
+        use crate::boot_reconcile::reconcile_orphaned_staged_carriers;
+        use crate::crash_point::{CrashPlan, run_until_crash};
+
+        let github = wiremock::MockServer::start().await;
+
+        // One counting run to learn how many crash points the handler has.
+        let n = {
+            let state = make_broker_state(&github);
+            let session =
+                session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+            open_audit_session(&state, session.session_id());
+            let (staging, _tmp) = open_test_staging_store();
+            let plan = CrashPlan::count();
+            run_until_crash(
+                &plan,
+                handle_git_push_request(
+                    &session,
+                    encoded_body(sample_metadata(), b"bundle".to_vec()),
+                    git_push_service_for_test(&state, staging),
+                ),
+            )
+            .await
+            .expect_completed("counting run must not crash");
+            plan.points_passed()
+        };
+        assert!(
+            n >= 3,
+            "handler must instrument its three durable effects (got {n})",
+        );
+
+        for k in 0..n {
+            let state = make_broker_state(&github);
+            let session =
+                session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+            open_audit_session(&state, session.session_id());
+            let (staging, _tmp) = open_test_staging_store();
+            let plan = CrashPlan::crash_at(k);
+            let _ = run_until_crash(
+                &plan,
+                handle_git_push_request(
+                    &session,
+                    encoded_body(sample_metadata(), b"bundle".to_vec()),
+                    git_push_service_for_test(&state, Arc::clone(&staging)),
+                ),
+            )
+            .await;
+
+            // Boot recovery: the sweep the daemon runs at startup.
+            reconcile_orphaned_staged_carriers(&state.audit, &staging, UnixMillis::now()).unwrap();
+
+            // Oracle: any carrier still on disk is resolvable.
+            for receipt in staging.list().unwrap() {
+                let entry = state
+                    .audit
+                    .get_git_push(receipt.push_request_id())
+                    .unwrap()
+                    .expect("a carrier on disk must have an audit request row");
+                assert_eq!(
+                    entry.result,
+                    Some(GitPushOutcomeResult::Staged),
+                    "crash at point {k}: carrier {} left unresolvable",
+                    receipt.push_request_id(),
+                );
+            }
+        }
+    }
+
+    /// Part 1 (online repair): when the `Staged` outcome write fails while
+    /// the process is alive, the handler deletes the carrier before
+    /// returning failure, so no stuck carrier is left behind. The failure
+    /// is forced deterministically by pre-empting the outcome row (with a
+    /// terminal `Denied`) at the post-staging crash point, tripping the
+    /// primary key on the handler's own write.
+    #[tokio::test]
+    async fn outcome_write_failure_deletes_the_orphaned_carrier() {
+        use crate::audit::GitPushOutcomeRecord;
+        use crate::crash_point::{CrashPlan, run_until_crash};
+
+        let github = wiremock::MockServer::start().await;
+
+        let idx = {
+            let state = make_broker_state(&github);
+            let session =
+                session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+            open_audit_session(&state, session.session_id());
+            let (staging, _tmp) = open_test_staging_store();
+            let plan = CrashPlan::count();
+            run_until_crash(
+                &plan,
+                handle_git_push_request(
+                    &session,
+                    encoded_body(sample_metadata(), b"x".to_vec()),
+                    git_push_service_for_test(&state, staging),
+                ),
+            )
+            .await
+            .expect_completed("counting run must not crash");
+            plan.names()
+                .iter()
+                .position(|name| *name == "git_push::carrier_staged")
+                .expect("handler must have a carrier_staged crash point")
+        };
+
+        let state = make_broker_state(&github);
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+        open_audit_session(&state, session.session_id());
+        let (staging, _tmp) = open_test_staging_store();
+
+        let audit_for_action = Arc::clone(&state.audit);
+        let staging_for_action = Arc::clone(&staging);
+        let plan = CrashPlan::act_at(idx, move || {
+            let id = staging_for_action.list().unwrap()[0].push_request_id();
+            audit_for_action
+                .record_git_push_outcome(&GitPushOutcomeRecord {
+                    push_request_id: id,
+                    completed_at: UnixMillis::from_millis(1),
+                    result: GitPushOutcomeResult::Denied,
+                    github_status: None,
+                    message: "pre-empted to force outcome-write failure",
+                })
+                .unwrap();
+        });
+
+        let response = run_until_crash(
+            &plan,
+            handle_git_push_request(
+                &session,
+                encoded_body(sample_metadata(), b"x".to_vec()),
+                git_push_service_for_test(&state, Arc::clone(&staging)),
+            ),
+        )
+        .await
+        .expect_completed("act mode must not park");
+
+        assert!(plan.acted(), "the pre-empting action must have fired");
+        assert_eq!(response.status, VmHttpStatus::InternalServerError);
+        assert!(
+            staging.list().unwrap().is_empty(),
+            "the carrier orphaned by the outcome-write failure must be deleted online",
         );
     }
 }
