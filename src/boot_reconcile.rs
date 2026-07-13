@@ -228,21 +228,39 @@ pub fn reconcile_orphaned_staged_carriers(
     staging: &GitPushStagingStore,
     now: UnixMillis,
 ) -> Result<Vec<RequestId>, AuditError> {
-    let carriers = match staging.list() {
+    let carriers = match staging.list_entries_for_recovery() {
         Ok(carriers) => carriers,
         Err(err) => {
+            // Only a failure to open `staged/` itself reaches here — a
+            // genuinely broken staging root, not a torn sibling. Skip
+            // best-effort rather than wedge boot; a misconfigured root is
+            // an operator problem the daemon should still start to report.
             tracing::warn!(
                 target: AUDIT_WRITE_FAILURE_TARGET,
                 error = %err,
-                "boot carrier sweep: could not list staged pushes; skipping \
-                 (any stuck carrier remains for a later boot to sweep)",
+                "boot carrier sweep: could not open the staging tree; skipping",
             );
             return Ok(Vec::new());
         }
     };
 
     let mut recovered = Vec::new();
-    for receipt in carriers {
+    for carrier in carriers {
+        // Per-entry: a single malformed sibling (e.g. a torn directory
+        // left by an interrupted `delete`) is skipped so it cannot hide
+        // every healthy carrier. It is never "recovered" — a `staged`
+        // outcome for a torn carrier would point at an unpromotable push.
+        let receipt = match carrier {
+            Ok(receipt) => receipt,
+            Err(err) => {
+                tracing::warn!(
+                    target: AUDIT_WRITE_FAILURE_TARGET,
+                    error = %err,
+                    "boot carrier sweep: skipping an unreadable staged entry",
+                );
+                continue;
+            }
+        };
         let request_id = receipt.push_request_id();
         let Some(entry) = audit.get_git_push(request_id)? else {
             // A carrier with no request row. The handler commits the
@@ -907,5 +925,46 @@ mod tests {
                 .resolution
                 .is_some()
         );
+    }
+
+    /// A persistent torn sibling (a carrier whose `entry.json` was
+    /// removed, as an interrupted `delete` would leave) must not block
+    /// recovery of a healthy orphan sitting next to it — and must never
+    /// itself be recovered. Regression test for the all-or-nothing
+    /// `list()` the sweep originally used.
+    #[test]
+    fn corrupt_sibling_does_not_block_recovery_of_a_valid_orphan() {
+        let (log, session_id) = open_log_with_session();
+        let (staging, _tmp) = open_staging();
+
+        // Healthy orphan: request row + intact carrier, no outcome row.
+        let valid = record_push_request_only(&log, session_id);
+        stage_carrier(&staging, valid);
+
+        // Torn sibling: a carrier whose receipt is gone. It has no audit
+        // row and must be skipped, not recovered.
+        let torn = RequestId::new();
+        stage_carrier(&staging, torn);
+        std::fs::remove_file(
+            staging
+                .root()
+                .join("staged")
+                .join(torn.to_string())
+                .join("entry.json"),
+        )
+        .unwrap();
+
+        let recovered = reconcile_orphaned_staged_carriers(&log, &staging, now()).unwrap();
+        assert_eq!(
+            recovered,
+            vec![valid],
+            "the healthy orphan must be recovered"
+        );
+        assert_eq!(
+            log.get_git_push(valid).unwrap().unwrap().result,
+            Some(GitPushOutcomeResult::Staged),
+        );
+        // The torn sibling was never given an outcome row.
+        assert!(log.get_git_push(torn).unwrap().is_none());
     }
 }

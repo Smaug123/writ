@@ -182,6 +182,67 @@ impl GitPushStagingStore {
         Ok(entries)
     }
 
+    /// Enumerate the staging tree entry-by-entry for boot recovery: one
+    /// result per `staged/` child directory, so a single malformed
+    /// sibling cannot hide every healthy carrier the way [`Self::list`]'s
+    /// fail-fast does. A returned `Ok(receipt)` is a *complete* carrier —
+    /// its `entry.json` parses, its directory name matches the recorded
+    /// request id, and its `bundle` file is present — so a recovery
+    /// caller may safely mark it resolvable. Malformed entries (bad or
+    /// missing `entry.json`, missing `bundle`, non-request-id directory
+    /// name) surface as `Err` and must be skipped, never recovered:
+    /// recording a `staged` outcome for a torn carrier would point the
+    /// operator at a push that can never be promoted.
+    ///
+    /// Only a failure to *open* `staged/` itself (a genuinely broken
+    /// staging root) fails the whole call; a missing `staged/` yields an
+    /// empty list. The bundle presence check is a metadata probe, not a
+    /// read, so this stays cheap even for large carriers.
+    pub fn list_entries_for_recovery(
+        &self,
+    ) -> Result<Vec<Result<VmGitPushStagedReceipt, StagingError>>, StagingError> {
+        let dir = self.root.join(STAGED_DIR);
+        let read = match fs::read_dir(&dir) {
+            Ok(r) => r,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(err) => return Err(err.into()),
+        };
+        let mut entries = Vec::new();
+        for child in read {
+            let child = child?;
+            let file_type = child.file_type()?;
+            if !file_type.is_dir() {
+                continue;
+            }
+            entries.push(self.probe_recoverable_entry(&child.file_name()));
+        }
+        Ok(entries)
+    }
+
+    /// Probe one `staged/` child for [`Self::list_entries_for_recovery`]:
+    /// parse its directory name, load its receipt, and confirm the bundle
+    /// is present.
+    fn probe_recoverable_entry(
+        &self,
+        name: &OsStr,
+    ) -> Result<VmGitPushStagedReceipt, StagingError> {
+        let request_id = parse_request_id_from_dirname(name)?;
+        let receipt = self.load_receipt(request_id)?;
+        // Completeness: a recovered `staged` outcome must point at a
+        // carrier that can actually be promoted, so the bundle has to be
+        // there. A torn `remove_dir_all` that unlinked the bundle but
+        // left `entry.json` would otherwise pass `load_receipt` and be
+        // "recovered" into an unpromotable state.
+        match self.staged_path(request_id).join(BUNDLE_FILE).try_exists() {
+            Ok(true) => Ok(receipt),
+            Ok(false) => Err(StagingError::Corrupt {
+                request_id,
+                message: "bundle file missing".to_string(),
+            }),
+            Err(err) => Err(StagingError::Io(err)),
+        }
+    }
+
     /// Remove the on-disk staging directory for `request_id`. Idempotent:
     /// calling twice, or calling against an id that was never staged,
     /// returns `Ok(())`. Used by the broker after recording a terminal
@@ -820,6 +881,144 @@ mod tests {
         let (store, _tmp) = open_store();
         let request_id: RequestId = "eeeeeeee-0000-0000-0000-000000000000".parse().unwrap();
         store.delete(request_id).unwrap();
+    }
+
+    // ---- list_entries_for_recovery ------------------------------------
+
+    #[test]
+    fn list_entries_for_recovery_returns_ok_for_healthy_entries() {
+        let (store, _tmp) = open_store();
+        let ids: [RequestId; 2] = [
+            "20000000-0000-0000-0000-000000000001".parse().unwrap(),
+            "20000000-0000-0000-0000-000000000002".parse().unwrap(),
+        ];
+        for id in &ids {
+            store
+                .stage(
+                    *id,
+                    UnixMillis::from_millis(1),
+                    sample_metadata(),
+                    b"b".to_vec(),
+                )
+                .unwrap();
+        }
+        let mut got: Vec<RequestId> = store
+            .list_entries_for_recovery()
+            .unwrap()
+            .into_iter()
+            .map(|r| r.unwrap().push_request_id())
+            .collect();
+        got.sort();
+        let mut expected = ids.to_vec();
+        expected.sort();
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn list_entries_for_recovery_empty_store_is_empty() {
+        let (store, _tmp) = open_store();
+        assert!(store.list_entries_for_recovery().unwrap().is_empty());
+    }
+
+    /// The key property behind the corrupt-sibling fix: a torn directory
+    /// (here, `entry.json` removed) is reported as a single `Err` while
+    /// every healthy sibling still comes back `Ok` — unlike [`list`],
+    /// which fails the whole call.
+    #[test]
+    fn list_entries_for_recovery_isolates_a_torn_sibling() {
+        let (store, _tmp) = open_store();
+        let healthy: RequestId = "30000000-0000-0000-0000-000000000001".parse().unwrap();
+        let torn: RequestId = "30000000-0000-0000-0000-000000000002".parse().unwrap();
+        store
+            .stage(
+                healthy,
+                UnixMillis::from_millis(1),
+                sample_metadata(),
+                b"ok".to_vec(),
+            )
+            .unwrap();
+        store
+            .stage(
+                torn,
+                UnixMillis::from_millis(2),
+                sample_metadata(),
+                b"torn".to_vec(),
+            )
+            .unwrap();
+        // Tear the second carrier by removing its receipt.
+        fs::remove_file(store.staged_path(torn).join(ENTRY_FILE)).unwrap();
+
+        // `list` fails outright on the torn sibling...
+        assert!(store.list().is_err());
+
+        // ...but the recovery enumeration isolates it.
+        let entries = store.list_entries_for_recovery().unwrap();
+        assert_eq!(entries.len(), 2);
+        let mut healthy_seen = false;
+        let mut torn_seen = false;
+        for entry in entries {
+            match entry {
+                Ok(receipt) => {
+                    assert_eq!(receipt.push_request_id(), healthy);
+                    healthy_seen = true;
+                }
+                Err(StagingError::Corrupt { request_id, .. }) => {
+                    assert_eq!(request_id, torn);
+                    torn_seen = true;
+                }
+                other => panic!("unexpected entry: {other:?}"),
+            }
+        }
+        assert!(healthy_seen && torn_seen);
+    }
+
+    #[test]
+    fn list_entries_for_recovery_flags_missing_bundle() {
+        let (store, _tmp) = open_store();
+        let id: RequestId = "40000000-0000-0000-0000-000000000001".parse().unwrap();
+        store
+            .stage(
+                id,
+                UnixMillis::from_millis(1),
+                sample_metadata(),
+                b"gone".to_vec(),
+            )
+            .unwrap();
+        fs::remove_file(store.staged_path(id).join(BUNDLE_FILE)).unwrap();
+
+        let entries = store.list_entries_for_recovery().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(matches!(
+            entries.into_iter().next().unwrap(),
+            Err(StagingError::Corrupt { request_id, .. }) if request_id == id
+        ));
+    }
+
+    #[test]
+    fn list_entries_for_recovery_flags_unrecognised_dir() {
+        let (store, _tmp) = open_store();
+        let healthy: RequestId = "50000000-0000-0000-0000-000000000001".parse().unwrap();
+        store
+            .stage(
+                healthy,
+                UnixMillis::from_millis(1),
+                sample_metadata(),
+                b"ok".to_vec(),
+            )
+            .unwrap();
+        fs::create_dir(store.root().join(STAGED_DIR).join("not-a-uuid")).unwrap();
+
+        let entries = store.list_entries_for_recovery().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert!(entries.iter().any(|e| matches!(
+            e,
+            Ok(receipt) if receipt.push_request_id() == healthy
+        )));
+        assert!(
+            entries
+                .iter()
+                .any(|e| matches!(e, Err(StagingError::UnrecognisedStagedDir { .. })))
+        );
     }
 
     // ---- proptest strategies ------------------------------------------
