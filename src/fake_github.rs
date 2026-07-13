@@ -372,6 +372,27 @@ impl FakeGitHub {
         );
     }
 
+    /// A `'static` closure that forcibly points `branch` at `sha` —
+    /// the rival actor's move, injectable at a crash point while the
+    /// handler under test is live. Bypasses the fast-forward check,
+    /// as a rival with force-push rights (or any out-of-band actor)
+    /// would.
+    pub(crate) fn force_ref_setter(
+        &self,
+        branch: &str,
+        sha: &str,
+    ) -> impl Fn() + Send + Sync + use<> {
+        let model = Arc::clone(&self.model);
+        let branch = branch.to_string();
+        let sha = sha.to_string();
+        move || {
+            model
+                .lock()
+                .expect("GitHubModel poisoned")
+                .set_ref(&branch, &sha)
+        }
+    }
+
     pub(crate) fn ref_of(&self, branch: &str) -> Option<String> {
         self.lock().refs.get(branch).cloned()
     }

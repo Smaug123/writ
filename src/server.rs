@@ -3070,6 +3070,8 @@ pub async fn serve_broker_with_agent_vm<S: SecretStore + Send + Sync + 'static>(
 #[cfg(test)]
 mod approve_crash_tests;
 #[cfg(test)]
+mod approve_rival_tests;
+#[cfg(test)]
 mod capability_tests;
 #[cfg(test)]
 mod reconcile_tests;

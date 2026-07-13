@@ -198,7 +198,7 @@ each dominated by a handful of subprocess `git` calls on empty-commit
 repos — a few seconds total, acceptable in `cargo test`. If it grows,
 shard by scenario before reaching for `#[ignore]`.
 
-## §7 Stretch: multi-crash traces and torn residue
+## §7 Stretch: multi-crash traces, torn residue, rival actors
 
 - **Double crash:** crash at `k₁`, reboot, retry with a crash at
   `k₂`, reboot, then finish. `N²` is too many with real subprocesses;
@@ -209,12 +209,25 @@ shard by scenario before reaching for `#[ignore]`.
   additionally corrupt the residue (truncate `staged.bundle`, empty
   the dir) before rebooting. Attempt-keyed dirs should make every
   such mutation invisible to the retry; pin that.
+- **Rival actor:** the same point instrumentation in act-instead-of-
+  park mode: at point `k` the plan moves the fake's branch (rewind to
+  a model-known ancestor, or advance to a foreign commit) and lets
+  the handler continue. Oracle: every publish steps from the approved
+  baseline (the fake's ref history shows the PATCH fast-forwarding
+  from `expected_remote_head`, never from the rival's tip), and every
+  failure leaves the ref exactly where the rival put it. This is the
+  race class behind the final-lease-recheck finding, which no crash
+  can express: the rewind is dangerous precisely because GitHub's
+  non-forced PATCH checks descent-from-current, not compare-and-swap.
 
 ## §8 What this deliberately does not cover
 
-- Concurrency races between live tasks (two simultaneous approves):
-  the DAO-level guards have targeted tests; interleaving exploration
-  would need a different scheduler-control harness.
+- Concurrency races between live *broker* tasks (two simultaneous
+  approves): the DAO-level guards have targeted tests; interleaving
+  exploration would need a different scheduler-control harness. (A
+  single external actor racing one approve *is* covered — the §7
+  rival-actor sweep — because the instrumentation points double as
+  injection sites.)
 - reqwest/transport semantics: pinned by the timeout behavioral tests
   in `github_git_db`.
 - The VM/agent side of staging: the harness starts from an
