@@ -223,12 +223,18 @@ pub const RECOVERED_STAGED_CARRIER_MESSAGE: &str =
 /// Call once at startup, after the broker socket bind and before any
 /// request handler runs — the same ordering constraints that govern
 /// [`reconcile_pending_approve_attempts`].
+///
+/// `max_receipt_bytes` bounds the receipt read during the scan; the
+/// caller derives it from the live `git_push_max_metadata_bytes` via
+/// [`crate::git_push_staging::recovery_receipt_bound`] so it tracks the
+/// receipts the request path actually accepts.
 pub fn reconcile_orphaned_staged_carriers(
     audit: &AuditLog,
     staging: &GitPushStagingStore,
+    max_receipt_bytes: u64,
     now: UnixMillis,
 ) -> Result<Vec<RequestId>, AuditError> {
-    let carriers = match staging.list_entries_for_recovery() {
+    let carriers = match staging.list_entries_for_recovery(max_receipt_bytes) {
         Ok(carriers) => carriers,
         Err(err) => {
             // Only a failure to open `staged/` itself reaches here — a
@@ -352,6 +358,7 @@ mod tests {
         GitPushRequestRecord, GitPushResolution, GitPushResolutionRecord, PromoteMintAudit,
     };
     use crate::core::{AgentKind, Jti, RepoRef, RequestId, SessionId, SessionRecord};
+    use crate::git_push_staging::recovery_receipt_bound;
     use crate::vm_git::{GitCloneRepo, GitObjectId, VmGitPushMetadata};
     use tempfile::TempDir;
     use uuid::Uuid;
@@ -850,7 +857,13 @@ mod tests {
                 .is_none()
         );
 
-        let recovered = reconcile_orphaned_staged_carriers(&log, &staging, now()).unwrap();
+        let recovered = reconcile_orphaned_staged_carriers(
+            &log,
+            &staging,
+            recovery_receipt_bound(16 * 1024),
+            now(),
+        )
+        .unwrap();
         assert_eq!(recovered, vec![request_id]);
 
         let entry = log.get_git_push(request_id).unwrap().unwrap();
@@ -872,7 +885,13 @@ mod tests {
         let request_id = record_staged_push(&log, session_id);
         stage_carrier(&staging, request_id);
 
-        let recovered = reconcile_orphaned_staged_carriers(&log, &staging, now()).unwrap();
+        let recovered = reconcile_orphaned_staged_carriers(
+            &log,
+            &staging,
+            recovery_receipt_bound(16 * 1024),
+            now(),
+        )
+        .unwrap();
         assert!(recovered.is_empty());
 
         // Outcome row is the original, not a rewrite.
@@ -892,7 +911,13 @@ mod tests {
         let request_id = RequestId::new();
         stage_carrier(&staging, request_id);
 
-        let recovered = reconcile_orphaned_staged_carriers(&log, &staging, now()).unwrap();
+        let recovered = reconcile_orphaned_staged_carriers(
+            &log,
+            &staging,
+            recovery_receipt_bound(16 * 1024),
+            now(),
+        )
+        .unwrap();
         assert!(recovered.is_empty());
         assert!(log.get_git_push(request_id).unwrap().is_none());
     }
@@ -901,7 +926,13 @@ mod tests {
     fn empty_staging_store_recovers_nothing() {
         let log = AuditLog::open_in_memory().unwrap();
         let (staging, _tmp) = open_staging();
-        let recovered = reconcile_orphaned_staged_carriers(&log, &staging, now()).unwrap();
+        let recovered = reconcile_orphaned_staged_carriers(
+            &log,
+            &staging,
+            recovery_receipt_bound(16 * 1024),
+            now(),
+        )
+        .unwrap();
         assert!(recovered.is_empty());
     }
 
@@ -914,7 +945,13 @@ mod tests {
         let (staging, _tmp) = open_staging();
         std::fs::create_dir(staging.root().join("staged").join("not-a-uuid")).unwrap();
 
-        let recovered = reconcile_orphaned_staged_carriers(&log, &staging, now()).unwrap();
+        let recovered = reconcile_orphaned_staged_carriers(
+            &log,
+            &staging,
+            recovery_receipt_bound(16 * 1024),
+            now(),
+        )
+        .unwrap();
         assert!(recovered.is_empty());
     }
 
@@ -928,7 +965,13 @@ mod tests {
         let request_id = record_push_request_only(&log, session_id);
         stage_carrier(&staging, request_id);
 
-        reconcile_orphaned_staged_carriers(&log, &staging, now()).unwrap();
+        reconcile_orphaned_staged_carriers(
+            &log,
+            &staging,
+            recovery_receipt_bound(16 * 1024),
+            now(),
+        )
+        .unwrap();
 
         // The reject path's audit write now succeeds where it would have
         // been refused before recovery.
@@ -976,7 +1019,13 @@ mod tests {
         )
         .unwrap();
 
-        let recovered = reconcile_orphaned_staged_carriers(&log, &staging, now()).unwrap();
+        let recovered = reconcile_orphaned_staged_carriers(
+            &log,
+            &staging,
+            recovery_receipt_bound(16 * 1024),
+            now(),
+        )
+        .unwrap();
         assert_eq!(
             recovered,
             vec![valid],

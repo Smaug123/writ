@@ -34,11 +34,26 @@ const TMP_DIR: &str = "tmp";
 const ENTRY_FILE: &str = "entry.json";
 const BUNDLE_FILE: &str = "bundle";
 
-/// Upper bound on `entry.json` size the recovery sweep will read. A
-/// receipt is a few hundred bytes of JSON; this generous cap only exists
-/// so a tampered oversized file cannot OOM the startup sweep before its
-/// shape is validated. See [`GitPushStagingStore::verify_receipt_readable`].
-const MAX_RECEIPT_BYTES: u64 = 64 * 1024;
+/// Fixed byte overhead a [`VmGitPushStagedReceipt`] adds over the request
+/// metadata it is derived from — the `request_id` UUID, the `staged_at`
+/// timestamp, and JSON key differences. Generous: the real overhead is a
+/// few hundred bytes. Used by [`recovery_receipt_bound`].
+pub const RECEIPT_METADATA_OVERHEAD_BYTES: u64 = 4096;
+
+/// The largest `entry.json` the recovery sweep should read, given the
+/// broker's configured `git_push_max_metadata_bytes`. A receipt is the
+/// request metadata (repo, branch, object ids — all bounded by the
+/// accepted metadata size, see `parse_vm_git_push_request_body`)
+/// re-serialised with a request id and timestamp, so this admits every
+/// receipt a legitimately-accepted push could have staged while still
+/// bounding a tampered oversized file. The recovery caller derives the
+/// bound from live config and passes it to
+/// [`GitPushStagingStore::list_entries_for_recovery`]; a hard-coded cap
+/// would wrongly classify a legitimate carrier as corrupt whenever an
+/// operator raised the metadata limit past it.
+pub fn recovery_receipt_bound(max_metadata_bytes: usize) -> u64 {
+    (max_metadata_bytes as u64).saturating_add(RECEIPT_METADATA_OVERHEAD_BYTES)
+}
 
 /// A staged push as stored on disk: the receipt that was returned to the
 /// guest plus the git bundle bytes.
@@ -209,8 +224,14 @@ impl GitPushStagingStore {
     /// staging root) fails the whole call; a missing `staged/` yields an
     /// empty list. The bundle presence check is a metadata probe, not a
     /// read, so this stays cheap even for large carriers.
+    ///
+    /// `max_receipt_bytes` bounds the `entry.json` read (see
+    /// [`recovery_receipt_bound`]); the caller derives it from the live
+    /// `git_push_max_metadata_bytes` so the bound tracks the size of
+    /// receipts the request path actually accepts.
     pub fn list_entries_for_recovery(
         &self,
+        max_receipt_bytes: u64,
     ) -> Result<Vec<Result<VmGitPushStagedReceipt, StagingError>>, StagingError> {
         let dir = self.root.join(STAGED_DIR);
         let read = match fs::read_dir(&dir) {
@@ -236,7 +257,8 @@ impl GitPushStagingStore {
                 // Staged carriers are always directories; skip anything
                 // else silently, matching `list`.
                 Ok(file_type) if !file_type.is_dir() => continue,
-                Ok(_) => entries.push(self.probe_recoverable_entry(&child.file_name())),
+                Ok(_) => entries
+                    .push(self.probe_recoverable_entry(&child.file_name(), max_receipt_bytes)),
                 Err(err) => entries.push(Err(StagingError::Io(err))),
             }
         }
@@ -249,6 +271,7 @@ impl GitPushStagingStore {
     fn probe_recoverable_entry(
         &self,
         name: &OsStr,
+        max_receipt_bytes: u64,
     ) -> Result<VmGitPushStagedReceipt, StagingError> {
         let request_id = parse_request_id_from_dirname(name)?;
         // Guard the receipt *before* `load_receipt`'s unbounded `fs::read`:
@@ -257,23 +280,33 @@ impl GitPushStagingStore {
         // hang or OOM the sweep and block recovery of every healthy
         // sibling. `fs::metadata` follows symlinks, so a link to a device
         // resolves to its non-regular target and is rejected here.
-        self.verify_receipt_readable(request_id)?;
+        self.verify_receipt_readable(request_id, max_receipt_bytes)?;
         let receipt = self.load_receipt(request_id)?;
         self.verify_bundle_readable(request_id)?;
         Ok(receipt)
     }
 
-    /// Confirm the carrier's `entry.json` is a regular file of plausible
-    /// size before it is read. See [`Self::probe_recoverable_entry`] for
-    /// why the recovery sweep must not blindly `fs::read` it.
-    fn verify_receipt_readable(&self, request_id: RequestId) -> Result<(), StagingError> {
+    /// Confirm the carrier's `entry.json` is a regular file no larger
+    /// than `max_receipt_bytes` before it is read. See
+    /// [`Self::probe_recoverable_entry`] for why the recovery sweep must
+    /// not blindly `fs::read` it, and [`recovery_receipt_bound`] for how
+    /// the bound is derived.
+    fn verify_receipt_readable(
+        &self,
+        request_id: RequestId,
+        max_receipt_bytes: u64,
+    ) -> Result<(), StagingError> {
         let path = self.staged_path(request_id).join(ENTRY_FILE);
         match fs::metadata(&path) {
             Ok(meta) if meta.is_file() => {
-                if meta.len() > MAX_RECEIPT_BYTES {
+                if meta.len() > max_receipt_bytes {
                     Err(StagingError::Corrupt {
                         request_id,
-                        message: format!("entry.json is implausibly large ({} bytes)", meta.len()),
+                        message: format!(
+                            "entry.json is larger than the accepted receipt bound \
+                             ({} > {max_receipt_bytes} bytes)",
+                            meta.len(),
+                        ),
                     })
                 } else {
                     Ok(())
@@ -1012,7 +1045,7 @@ mod tests {
                 .unwrap();
         }
         let mut got: Vec<RequestId> = store
-            .list_entries_for_recovery()
+            .list_entries_for_recovery(recovery_receipt_bound(64 * 1024))
             .unwrap()
             .into_iter()
             .map(|r| r.unwrap().push_request_id())
@@ -1026,7 +1059,12 @@ mod tests {
     #[test]
     fn list_entries_for_recovery_empty_store_is_empty() {
         let (store, _tmp) = open_store();
-        assert!(store.list_entries_for_recovery().unwrap().is_empty());
+        assert!(
+            store
+                .list_entries_for_recovery(recovery_receipt_bound(64 * 1024))
+                .unwrap()
+                .is_empty()
+        );
     }
 
     /// The key property behind the corrupt-sibling fix: a torn directory
@@ -1061,7 +1099,9 @@ mod tests {
         assert!(store.list().is_err());
 
         // ...but the recovery enumeration isolates it.
-        let entries = store.list_entries_for_recovery().unwrap();
+        let entries = store
+            .list_entries_for_recovery(recovery_receipt_bound(64 * 1024))
+            .unwrap();
         assert_eq!(entries.len(), 2);
         let mut healthy_seen = false;
         let mut torn_seen = false;
@@ -1095,7 +1135,9 @@ mod tests {
             .unwrap();
         fs::remove_file(store.staged_path(id).join(BUNDLE_FILE)).unwrap();
 
-        let entries = store.list_entries_for_recovery().unwrap();
+        let entries = store
+            .list_entries_for_recovery(recovery_receipt_bound(64 * 1024))
+            .unwrap();
         assert_eq!(entries.len(), 1);
         assert!(matches!(
             entries.into_iter().next().unwrap(),
@@ -1123,7 +1165,9 @@ mod tests {
         fs::remove_file(&bundle).unwrap();
         fs::create_dir(&bundle).unwrap();
 
-        let entries = store.list_entries_for_recovery().unwrap();
+        let entries = store
+            .list_entries_for_recovery(recovery_receipt_bound(64 * 1024))
+            .unwrap();
         assert_eq!(entries.len(), 1);
         assert!(matches!(
             entries.into_iter().next().unwrap(),
@@ -1151,12 +1195,61 @@ mod tests {
         fs::remove_file(&entry).unwrap();
         fs::create_dir(&entry).unwrap();
 
-        let entries = store.list_entries_for_recovery().unwrap();
+        let entries = store
+            .list_entries_for_recovery(recovery_receipt_bound(64 * 1024))
+            .unwrap();
         assert_eq!(entries.len(), 1);
         assert!(matches!(
             entries.into_iter().next().unwrap(),
             Err(StagingError::Corrupt { request_id, .. }) if request_id == id
         ));
+    }
+
+    /// The receipt-size bound is caller-supplied and config-derived: a
+    /// receipt is admitted under a bound that covers it and rejected under
+    /// one below it. Guards against a hard-coded cap wrongly failing a
+    /// legitimate carrier when the metadata limit is raised.
+    #[test]
+    fn list_entries_for_recovery_bound_tracks_the_supplied_limit() {
+        let (store, _tmp) = open_store();
+        let id: RequestId = "40000000-0000-0000-0000-0000000000cc".parse().unwrap();
+        store
+            .stage(
+                id,
+                UnixMillis::from_millis(1),
+                sample_metadata(),
+                b"b".to_vec(),
+            )
+            .unwrap();
+        let receipt_len = fs::metadata(store.staged_path(id).join(ENTRY_FILE))
+            .unwrap()
+            .len();
+        assert!(receipt_len > 1, "sanity: receipt has content");
+
+        // A bound below the receipt rejects it as too large...
+        let under = store.list_entries_for_recovery(receipt_len - 1).unwrap();
+        assert!(matches!(
+            under.into_iter().next().unwrap(),
+            Err(StagingError::Corrupt { request_id, .. }) if request_id == id
+        ));
+
+        // ...and a bound at or above it admits the carrier.
+        let over = store.list_entries_for_recovery(receipt_len).unwrap();
+        assert_eq!(
+            over.into_iter().next().unwrap().unwrap().push_request_id(),
+            id,
+        );
+    }
+
+    #[test]
+    fn recovery_receipt_bound_adds_fixed_overhead() {
+        assert_eq!(
+            recovery_receipt_bound(16 * 1024),
+            16 * 1024 + RECEIPT_METADATA_OVERHEAD_BYTES,
+        );
+        // Saturates rather than overflowing (panicking) on an absurd
+        // configured limit.
+        assert!(recovery_receipt_bound(usize::MAX) >= usize::MAX as u64);
     }
 
     #[test]
@@ -1193,7 +1286,9 @@ mod tests {
             .unwrap();
         fs::write(store.root().join(STAGED_DIR).join("stray-file"), b"junk").unwrap();
 
-        let entries = store.list_entries_for_recovery().unwrap();
+        let entries = store
+            .list_entries_for_recovery(recovery_receipt_bound(64 * 1024))
+            .unwrap();
         assert_eq!(
             entries.len(),
             1,
@@ -1224,7 +1319,9 @@ mod tests {
             .unwrap();
         fs::create_dir(store.root().join(STAGED_DIR).join("not-a-uuid")).unwrap();
 
-        let entries = store.list_entries_for_recovery().unwrap();
+        let entries = store
+            .list_entries_for_recovery(recovery_receipt_bound(64 * 1024))
+            .unwrap();
         assert_eq!(entries.len(), 2);
         assert!(entries.iter().any(|e| matches!(
             e,

@@ -898,7 +898,13 @@ mod tests {
             .await;
 
             // Boot recovery: the sweep the daemon runs at startup.
-            reconcile_orphaned_staged_carriers(&state.audit, &staging, UnixMillis::now()).unwrap();
+            reconcile_orphaned_staged_carriers(
+                &state.audit,
+                &staging,
+                crate::git_push_staging::recovery_receipt_bound(64 * 1024),
+                UnixMillis::now(),
+            )
+            .unwrap();
 
             // Oracle: any carrier still on disk is resolvable.
             for receipt in staging.list().unwrap() {

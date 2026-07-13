@@ -236,7 +236,24 @@ async fn run_host_daemon(
     // the socket bind (singleton claim), before any request handler runs.
     // Only runs when the staging store is configured (agent-VM mode).
     if let Some(staging) = staging_store.as_ref() {
-        let recovered = reconcile_orphaned_staged_carriers(&audit, staging, UnixMillis::now())?;
+        // Derive the recovery read bound from the *live* accepted metadata
+        // size so it tracks config rather than a hard-coded cap that could
+        // reject a legitimately-staged receipt. `staging_store` is `Some`
+        // only when the agent-VM config (which carries the body limits)
+        // is present, so the limit is always available here.
+        let max_metadata_bytes = agent_vm
+            .as_ref()
+            .expect("staging store is configured only alongside the agent-VM config")
+            .vm_http()
+            .git_push_body_limits()
+            .max_metadata_bytes();
+        let max_receipt_bytes = writ::git_push_staging::recovery_receipt_bound(max_metadata_bytes);
+        let recovered = reconcile_orphaned_staged_carriers(
+            &audit,
+            staging,
+            max_receipt_bytes,
+            UnixMillis::now(),
+        )?;
         if !recovered.is_empty() {
             tracing::warn!(
                 recovered_staged_carriers = recovered.len(),
