@@ -1173,3 +1173,105 @@ async fn workspace_bootstrap_wait_reports_timeout_at_supplied_bound() {
         }
     ));
 }
+
+#[tokio::test]
+async fn workspace_bootstrap_wait_bounds_a_hung_inspect_exec() {
+    let dir = tempfile::tempdir().unwrap();
+    let args_log = dir.path().join("args.log");
+    // The inspect exec sleeps far longer than the budget; the release exec
+    // still returns fast. A correct wait bounds each exec under the remaining
+    // deadline and returns promptly; the pre-fix code checks the deadline only
+    // *after* an exec returns, so it would block on the wedged exec.
+    let fake_tool = write_fake_hung_inspect_tool(dir.path(), &args_log);
+    let (config, _) = daemon_config(dir.path(), &fake_tool);
+    let daemon = AgentVmDaemon::new(config);
+
+    // Outer cap well below the guest's 30s sleep: if the per-exec deadline is
+    // not enforced, this fires and the `expect` fails loudly rather than
+    // hanging the suite.
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(5),
+        daemon.release_and_wait_for_workspace_bootstrap_with_timeout(
+            "writ-agent-vm-test",
+            Duration::from_millis(200),
+        ),
+    )
+    .await;
+
+    let err = outcome
+        .expect("wait must return within 5s: each guest exec must run under the remaining deadline")
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            AgentVmDaemonError::WorkspaceBootstrapExecTimedOut { .. }
+                | AgentVmDaemonError::WorkspaceBootstrapTimedOut { .. }
+        ),
+        "expected a timeout error, got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn workspace_bootstrap_wait_rejects_oversized_inspect_output() {
+    let dir = tempfile::tempdir().unwrap();
+    let args_log = dir.path().join("args.log");
+    // The inspect exec floods ~2 MiB of output, past the 1 MiB capture cap. A
+    // correct wait caps the read and fails fast; the pre-fix code buffers the
+    // whole guest-controlled payload and reports it as a bootstrap failure.
+    let fake_tool = write_fake_oversized_inspect_tool(dir.path(), &args_log);
+    let (config, _) = daemon_config(dir.path(), &fake_tool);
+    let daemon = AgentVmDaemon::new(config);
+
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(30),
+        daemon.release_and_wait_for_workspace_bootstrap_with_timeout(
+            "writ-agent-vm-test",
+            Duration::from_secs(20),
+        ),
+    )
+    .await;
+
+    let err = outcome
+        .expect("wait must return, not buffer the payload unboundedly")
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            AgentVmDaemonError::WorkspaceBootstrapOutputTooLarge { .. }
+        ),
+        "expected oversized-output error, got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn workspace_bootstrap_wait_preserves_tail_of_large_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let args_log = dir.path().join("args.log");
+    // The guest's failure file is large (the actionable error is its last
+    // line). A plain `cat` would let the host head-truncate and drop that line
+    // as oversized; a cooperative `tail -c` in the inspect script keeps it
+    // under the capture cap, so the daemon surfaces it as a normal failure.
+    let fake_tool = write_fake_large_failure_tool(dir.path(), &args_log);
+    let (config, _) = daemon_config(dir.path(), &fake_tool);
+    let daemon = AgentVmDaemon::new(config);
+
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(30),
+        daemon.release_and_wait_for_workspace_bootstrap_with_timeout(
+            "writ-agent-vm-test",
+            Duration::from_secs(20),
+        ),
+    )
+    .await;
+
+    let err = outcome
+        .expect("wait must return")
+        .expect_err("a large failure is still a bootstrap failure");
+    let AgentVmDaemonError::WorkspaceBootstrapFailed { message } = err else {
+        panic!("expected a preserved bootstrap failure, got {err:?}");
+    };
+    assert!(
+        message.contains("NIX_ERROR_SENTINEL"),
+        "the actionable tail of a large failure must survive, got: {message:?}"
+    );
+}
