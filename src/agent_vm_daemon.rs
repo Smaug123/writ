@@ -9,7 +9,6 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -19,11 +18,11 @@ use crate::agent_run::{AgentPrompt, AgentRunId, CorrelationId};
 use crate::agent_vm_lifecycle::{
     AgentVmGuestEnvVar, AgentVmLifecycleConfigError, AgentVmNames, AgentVmResources,
     AgentVmSessionManagerError, AgentVmSessionPlan, AgentVmSessionState, AgentVmSessionStateError,
-    AgentVmSessionStateStatus, AgentVmSessionStateStore, AgentVmToolPaths, BrokerPlacement,
-    ContainerImage, HostIface, Ipv6IsolationMode, NetworkHealth, ProbeDebounce, ProbeObservation,
-    claim_agent_vm_session_subnet, cleanup_managed_agent_vm_session,
-    complete_agent_vm_session_start, evaluate_host_path, host_interfaces,
-    remove_managed_agent_vm_session_state, start_agent_vm_session,
+    AgentVmSessionStateStatus, AgentVmSessionStateStore, AgentVmToolPaths, BoundedOutput,
+    BrokerPlacement, ContainerImage, HostIface, Ipv6IsolationMode, NetworkHealth, ProbeDebounce,
+    ProbeObservation, ProcessInvocation, ProcessInvocationError, claim_agent_vm_session_subnet,
+    cleanup_managed_agent_vm_session, complete_agent_vm_session_start, evaluate_host_path,
+    host_interfaces, remove_managed_agent_vm_session_state, start_agent_vm_session,
 };
 use crate::audit::{
     AgentRunAuditRecord, AgentVmNetworkHealthEventRecord, AuditError, AuditLog, NixCacheAuditEntry,
@@ -40,7 +39,6 @@ use crate::core::{
     SessionId, SessionRecord, UnixMillis,
 };
 use crate::git_push_staging::GitPushStagingStore;
-use crate::process_spawn;
 use crate::protocol::AgentVmSessionInfo;
 use crate::secret::SecretStore;
 use crate::server::BrokerState;
@@ -100,6 +98,34 @@ const BROKER_VM_READY_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const AGENT_VM_WORKSPACE_BOOTSTRAP_SLOW_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const AGENT_VM_WORKSPACE_BOOTSTRAP_QUICK_POLLS: u32 = 10;
 const AGENT_VM_WORKSPACE_BOOTSTRAP_FAILURE_MESSAGE_LIMIT: usize = 16 * 1024;
+/// Hard cap on the bytes captured from a single guest `container exec` during
+/// the workspace-bootstrap wait. The inspect script's payload is a
+/// guest-controlled failure file (read from inside a VM we treat as
+/// compromised); without a cap a hostile guest could stream unbounded output
+/// and exhaust host memory. This is the authority-side backstop: it does not
+/// rely on the guest cooperating, and exceeding it is treated as abuse that
+/// fails the bootstrap.
+const AGENT_VM_CONTAINER_EXEC_OUTPUT_LIMIT: usize = 1024 * 1024;
+/// How many trailing bytes of the guest's `bootstrap-failed` file the inspect
+/// script cooperatively `tail`s. The guest writes the *whole* failure stream
+/// (see `guest_command`'s `GUEST_WORKSPACE_BOOTSTRAP_TAIL`), which for a large
+/// Nix warm can far exceed the capture cap. Because the actionable Nix error
+/// prints last, tailing guest-side delivers it within the cap, so
+/// [`normalise_workspace_bootstrap_failure_message`] still receives the tail it
+/// is designed to keep — a plain `cat` of a multi-MiB failure would instead
+/// trip the head-truncation cap and discard the diagnosis. Larger than the
+/// message limit so `normalise` still marks the result truncated, and (asserted
+/// below) strictly under the capture cap so a well-behaved guest never trips
+/// [`AgentVmDaemonError::WorkspaceBootstrapOutputTooLarge`]. This is an
+/// ergonomics aid, not a security bound: a hostile guest that ignores it is
+/// still caught by the authority-side cap.
+const AGENT_VM_WORKSPACE_BOOTSTRAP_FAILURE_TAIL_CAPTURE: usize =
+    4 * AGENT_VM_WORKSPACE_BOOTSTRAP_FAILURE_MESSAGE_LIMIT;
+const _: () = assert!(
+    AGENT_VM_WORKSPACE_BOOTSTRAP_FAILURE_TAIL_CAPTURE < AGENT_VM_CONTAINER_EXEC_OUTPUT_LIMIT,
+    "the cooperative failure tail must stay below the exec capture cap so a \
+     well-behaved guest never trips WorkspaceBootstrapOutputTooLarge",
+);
 /// Prepended to a truncated failure message. The marker leads (rather than
 /// trails) because the truncation keeps the *tail* of the output: Nix prints the
 /// line that actually explains the failure last, after a long run of
@@ -277,6 +303,17 @@ pub enum AgentVmDaemonError {
         status: String,
         stderr: String,
     },
+    #[error(
+        "agent VM workspace bootstrap {step} command did not complete within its {timeout:?} deadline"
+    )]
+    WorkspaceBootstrapExecTimedOut {
+        step: &'static str,
+        timeout: Duration,
+    },
+    #[error(
+        "agent VM workspace bootstrap {step} command produced more than {limit} bytes of output"
+    )]
+    WorkspaceBootstrapOutputTooLarge { step: &'static str, limit: usize },
     #[error("agent VM workspace bootstrap failed: {message}")]
     WorkspaceBootstrapFailed { message: String },
     #[error("agent VM workspace bootstrap timed out after {timeout:?}")]
@@ -1316,6 +1353,17 @@ impl AgentVmDaemon {
         vm_name: &str,
         timeout: Duration,
     ) -> Result<(), AgentVmDaemonError> {
+        // The whole release+wait dance shares one budget: `timeout`. Every
+        // `container exec` runs under the *remaining* budget so a wedged guest
+        // exec cannot outlast it (the elapsed check used to sit only *after*
+        // the exec returned, so a hung exec never reached it). The guest is
+        // treated as compromised, so this bound is authority-side, not advisory.
+        let start = Instant::now();
+
+        let remaining = timeout.saturating_sub(start.elapsed());
+        if remaining.is_zero() {
+            return Err(AgentVmDaemonError::WorkspaceBootstrapTimedOut { timeout });
+        }
         self.run_container_exec_shell(
             vm_name,
             "release guest bootstrap",
@@ -1323,26 +1371,32 @@ impl AgentVmDaemon {
                 "mkdir -p /run/writ-agent-vm && touch {}",
                 AGENT_VM_WORKSPACE_BROKER_READY_PATH
             ),
+            remaining,
         )
         .await?;
 
-        let start = Instant::now();
         let mut poll_count = 0;
         loop {
+            let remaining = timeout.saturating_sub(start.elapsed());
+            if remaining.is_zero() {
+                return Err(AgentVmDaemonError::WorkspaceBootstrapTimedOut { timeout });
+            }
             let output = self
                 .run_container_exec_shell(
                     vm_name,
                     "inspect workspace bootstrap",
                     &format!(
                         "if [ -f {ok} ]; then printf ok; \
-                         elif [ -f {failed} ]; then printf 'failed\\n'; cat {failed}; \
+                         elif [ -f {failed} ]; then printf 'failed\\n'; tail -c {tail} {failed}; \
                          else printf pending; fi",
                         ok = AGENT_VM_WORKSPACE_BOOTSTRAP_OK_PATH,
                         failed = AGENT_VM_WORKSPACE_BOOTSTRAP_FAILED_PATH,
+                        tail = AGENT_VM_WORKSPACE_BOOTSTRAP_FAILURE_TAIL_CAPTURE,
                     ),
+                    remaining,
                 )
                 .await?;
-            let status = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            let status = output.stdout.trim();
             if status == "ok" {
                 return Ok(());
             }
@@ -1365,38 +1419,67 @@ impl AgentVmDaemon {
         }
     }
 
+    /// Run `sh -c <script>` inside the guest VM via `container exec`, capturing
+    /// its output under a byte cap and the whole invocation under `deadline`.
+    ///
+    /// Both bounds matter because the guest is untrusted: the payload of the
+    /// bootstrap inspect is a guest-controlled file, so an unbounded read could
+    /// exhaust host memory, and a wedged exec could hang past the caller's
+    /// overall timeout. [`ProcessInvocation::run_capturing_output_bounded`] caps
+    /// the capture (and kills the child if it floods), and `kill_on_drop` means
+    /// the outer `tokio::time::timeout` cancelling the future kills the child
+    /// rather than leaking it.
     async fn run_container_exec_shell(
         &self,
         vm_name: &str,
         step: &'static str,
         script: &str,
-    ) -> Result<std::process::Output, AgentVmDaemonError> {
-        let container = self.config.lifecycle.tools.container().to_path_buf();
-        let vm_name = vm_name.to_string();
-        let script = script.to_string();
-        let output = tokio::task::spawn_blocking(move || {
-            let mut command = Command::new(container);
-            command
-                .args(["exec", &vm_name, "sh", "-c", &script])
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped());
-            process_spawn::output(&mut command)
-        })
-        .await?
-        .map_err(|source| AgentVmDaemonError::WorkspaceBootstrapSpawn { step, source })?;
-        if output.status.success() {
-            return Ok(output);
+        deadline: Duration,
+    ) -> Result<BoundedOutput, AgentVmDaemonError> {
+        let invocation = ProcessInvocation::new(
+            self.config.lifecycle.tools.container(),
+            ["exec", vm_name, "sh", "-c", script],
+        );
+        let output = match tokio::time::timeout(
+            deadline,
+            invocation.run_capturing_output_bounded(AGENT_VM_CONTAINER_EXEC_OUTPUT_LIMIT),
+        )
+        .await
+        {
+            Err(_elapsed) => {
+                return Err(AgentVmDaemonError::WorkspaceBootstrapExecTimedOut {
+                    step,
+                    timeout: deadline,
+                });
+            }
+            Ok(Err(ProcessInvocationError::Run { source, .. })) => {
+                return Err(AgentVmDaemonError::WorkspaceBootstrapSpawn { step, source });
+            }
+            Ok(Err(other)) => {
+                return Err(AgentVmDaemonError::WorkspaceBootstrapSpawn {
+                    step,
+                    source: std::io::Error::other(other.to_string()),
+                });
+            }
+            Ok(Ok(output)) => output,
+        };
+        if output.truncated {
+            return Err(AgentVmDaemonError::WorkspaceBootstrapOutputTooLarge {
+                step,
+                limit: AGENT_VM_CONTAINER_EXEC_OUTPUT_LIMIT,
+            });
         }
-        Err(AgentVmDaemonError::WorkspaceBootstrapCommandFailed {
-            step,
-            status: output
-                .status
-                .code()
-                .map(|code| code.to_string())
-                .unwrap_or_else(|| "signal".into()),
-            stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
-        })
+        match output.status {
+            Some(status) if status.success() => Ok(output),
+            status => Err(AgentVmDaemonError::WorkspaceBootstrapCommandFailed {
+                step,
+                status: status
+                    .and_then(|status| status.code())
+                    .map(|code| code.to_string())
+                    .unwrap_or_else(|| "signal".into()),
+                stderr: output.stderr.trim().to_string(),
+            }),
+        }
     }
 
     async fn cleanup_failed_started_session(

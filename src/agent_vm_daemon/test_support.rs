@@ -150,6 +150,100 @@ pub(super) fn write_fake_pending_bootstrap_tool(dir: &Path, args_log: &Path) -> 
     path
 }
 
+/// Like [`write_fake_pending_bootstrap_tool`] but the bootstrap *inspect* exec
+/// hangs (via `exec sleep`) rather than returning. Exercises the wait's
+/// per-exec deadline: without it, the elapsed check (which only runs *after* an
+/// exec returns) never fires and the wait blocks forever on a wedged guest
+/// exec. The release exec touches the broker-ready path (not the
+/// bootstrap-failed path), so it still returns fast.
+pub(super) fn write_fake_hung_inspect_tool(dir: &Path, args_log: &Path) -> PathBuf {
+    let path = dir.join("fake-hung-inspect-tool");
+    let script = format!(
+        "#!/bin/sh\n\
+             printf '%s\\n' \"$*\" >> {args_log}\n\
+             if [ \"$1\" = \"network\" ] && [ \"$2\" = \"inspect\" ]; then\n\
+             printf '%s\\n' 'ipv4Subnet: 192.168.252.0/24' 'ipv4Gateway: 192.168.252.1'\n\
+             fi\n\
+             if [ \"$1\" = \"exec\" ]; then\n\
+             case \"${{5:-}}\" in\n\
+             *bootstrap-failed*) exec sleep 30 ;;\n\
+             esac\n\
+             fi\n\
+             exit 0\n",
+        args_log = shell_quote(args_log),
+    );
+    fs::write(&path, script).unwrap();
+    let mut permissions = fs::metadata(&path).unwrap().permissions();
+    permissions.set_mode(0o700);
+    fs::set_permissions(&path, permissions).unwrap();
+    path
+}
+
+/// Like [`write_fake_pending_bootstrap_tool`] but the bootstrap *inspect* exec
+/// floods stdout with ~2 MiB of output — a stand-in for a hostile guest whose
+/// failure file `cat`s to an arbitrary size. Exercises the wait's byte cap:
+/// without it, the whole payload would be buffered into host memory.
+pub(super) fn write_fake_oversized_inspect_tool(dir: &Path, args_log: &Path) -> PathBuf {
+    let path = dir.join("fake-oversized-inspect-tool");
+    let script = format!(
+        "#!/bin/sh\n\
+             printf '%s\\n' \"$*\" >> {args_log}\n\
+             if [ \"$1\" = \"network\" ] && [ \"$2\" = \"inspect\" ]; then\n\
+             printf '%s\\n' 'ipv4Subnet: 192.168.252.0/24' 'ipv4Gateway: 192.168.252.1'\n\
+             fi\n\
+             if [ \"$1\" = \"exec\" ]; then\n\
+             case \"${{5:-}}\" in\n\
+             *bootstrap-failed*)\n\
+             printf 'failed\\n'\n\
+             dd if=/dev/zero bs=1048576 count=2 2>/dev/null | tr '\\000' a ;;\n\
+             esac\n\
+             fi\n\
+             exit 0\n",
+        args_log = shell_quote(args_log),
+    );
+    fs::write(&path, script).unwrap();
+    let mut permissions = fs::metadata(&path).unwrap().permissions();
+    permissions.set_mode(0o700);
+    fs::set_permissions(&path, permissions).unwrap();
+    path
+}
+
+/// Emulates a guest holding a *large* `bootstrap-failed` file whose actionable
+/// error is the final line. The fake honours whatever the inspect command asks
+/// for: if the script cooperatively tails (`tail -c`), it returns a bounded
+/// tail (ending in the sentinel, under the capture cap); otherwise it floods
+/// the whole ~2 MiB file, so a host-side head-truncation drops the sentinel.
+/// This lets a test assert the daemon preserves the diagnosis tail rather than
+/// discarding it as oversized.
+pub(super) fn write_fake_large_failure_tool(dir: &Path, args_log: &Path) -> PathBuf {
+    let path = dir.join("fake-large-failure-tool");
+    let script = format!(
+        "#!/bin/sh\n\
+             printf '%s\\n' \"$*\" >> {args_log}\n\
+             if [ \"$1\" = \"network\" ] && [ \"$2\" = \"inspect\" ]; then\n\
+             printf '%s\\n' 'ipv4Subnet: 192.168.252.0/24' 'ipv4Gateway: 192.168.252.1'\n\
+             fi\n\
+             if [ \"$1\" = \"exec\" ]; then\n\
+             case \"${{5:-}}\" in\n\
+             *bootstrap-failed*)\n\
+             printf 'failed\\n'\n\
+             case \"${{5:-}}\" in\n\
+             *'tail -c'*) dd if=/dev/zero bs=1024 count=32 2>/dev/null | tr '\\000' a ;;\n\
+             *) dd if=/dev/zero bs=1048576 count=2 2>/dev/null | tr '\\000' a ;;\n\
+             esac\n\
+             printf 'NIX_ERROR_SENTINEL\\n' ;;\n\
+             esac\n\
+             fi\n\
+             exit 0\n",
+        args_log = shell_quote(args_log),
+    );
+    fs::write(&path, script).unwrap();
+    let mut permissions = fs::metadata(&path).unwrap().permissions();
+    permissions.set_mode(0o700);
+    fs::set_permissions(&path, permissions).unwrap();
+    path
+}
+
 pub(super) fn write_fake_network_create_failure_tool(dir: &Path, args_log: &Path) -> PathBuf {
     let path = dir.join("fake-failing-tool");
     let script = format!(
