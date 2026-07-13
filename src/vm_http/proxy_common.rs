@@ -535,7 +535,16 @@ impl<A: ProxyAudit> HyperBody for ProxyStreamBody<A> {
                     "vm http proxy streaming body read failed",
                 );
                 me.state = ProxyStreamState::UpstreamError;
-                Poll::Ready(None)
+                // The 200 head is already committed, so the only way to signal
+                // failure to the guest is to abort the body: erroring here
+                // makes hyper tear down the chunked response without its
+                // terminating chunk, which a compliant client reads as an
+                // incomplete message rather than a clean EOF. Presenting a
+                // clean EOF would let the guest mistake a truncated stream for
+                // a complete upstream response.
+                Poll::Ready(Some(Err(std::io::Error::other(
+                    "upstream body read failed",
+                ))))
             }
             Poll::Ready(Some(Ok(chunk))) => {
                 let chunk_len = u64::try_from(chunk.len()).expect("HTTP chunk length fits in u64");
@@ -546,7 +555,12 @@ impl<A: ProxyAudit> HyperBody for ProxyStreamBody<A> {
                 if new_len > me.max_response_bytes {
                     me.response_bytes = new_len;
                     me.state = ProxyStreamState::OverMax;
-                    return Poll::Ready(None);
+                    // Abort rather than ending the body cleanly, for the same
+                    // reason as the upstream-error arm above: a clean EOF would
+                    // present a truncated response as a complete one.
+                    return Poll::Ready(Some(Err(std::io::Error::other(
+                        "upstream response too large",
+                    ))));
                 }
                 me.response_bytes = new_len;
                 Poll::Ready(Some(Ok(Frame::data(chunk))))

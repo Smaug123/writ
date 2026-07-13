@@ -1356,17 +1356,33 @@ mod tests {
                 panic!("Claude route produced an OpenAI stream")
             }
         };
-        let response =
-            DispatchedTestResponse::from_hyper_response(dispatch.into_hyper_response()).await;
+        let (parts, body) = DispatchedTestResponse::from_hyper_response_allow_body_error(
+            dispatch.into_hyper_response(),
+        )
+        .await;
 
-        assert_eq!(response.status, VmHttpStatus::Ok);
-        assert_eq!(response.content_type, "text/event-stream");
-        assert_ne!(response.body, upstream_body);
+        // The 200 head is already committed before the overflow is detected,
+        // so the head still looks like a normal streaming response...
+        assert_eq!(parts.status.as_u16(), 200);
+        assert_eq!(
+            parts
+                .headers
+                .get(http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("text/event-stream")
+        );
+        // ...but the body must abort with an error rather than terminating
+        // cleanly, so the guest cannot mistake a truncated stream for a
+        // complete one.
+        assert!(
+            body.is_err(),
+            "oversized streaming body must abort with an error, not a clean EOF; got {body:?}"
+        );
         let outcome = state
             .audit
             .claude_proxy_outcome_for_test(request_id)
             .unwrap()
-            .expect("streaming outcome should be recorded after the body is collected");
+            .expect("streaming outcome should be recorded after the body is aborted");
         assert_eq!(
             outcome,
             (
