@@ -26,7 +26,7 @@
 
 use super::approve_crash_tests::{ApproveWorld, WORLD_BRANCH, count_points};
 use super::*;
-use crate::audit::GitPushApproveAttemptState;
+use crate::audit::{GitPushApproveAttemptOutcome, GitPushApproveAttemptState};
 use crate::crash_point::{CrashPlan, run_until_crash};
 
 /// The rewind target: taught to the model as the seeded head's parent,
@@ -129,19 +129,41 @@ async fn rival_ref_moves_at_every_point_never_publish_off_the_approved_baseline(
                         ],
                         "no publish may land once the rival's move is refused at {label}",
                     );
-                    // The handler lived, so its own error handling ran:
-                    // nothing may be left Started or Uncertain.
+                    // Every failure here means the rival fired before the
+                    // final lease GET: the last-second recheck saw the
+                    // moved ref and refused before `update_ref`, so no
+                    // PATCH ever reached the fake. A PATCH request — even a
+                    // rejected one — would mean the handler tried to
+                    // publish on top of the rival's tip.
+                    assert!(
+                        world.github.patch_requests().is_empty(),
+                        "a refused rival move must send no PATCH at {label}: {:?}",
+                        world.github.patch_requests(),
+                    );
+                    // The handler lived, so its own error handling ran.
+                    // The pre-PATCH refusal resolves the attempt
+                    // specifically as `PrePatchFailure`: not merely
+                    // `Resolved` (a rejected PATCH would still be
+                    // `Resolved`) and not `PostPatchFailure` (which would
+                    // quarantine the push and refuse reject unnecessarily).
                     let attempts = world
                         .state
                         .audit
                         .approve_attempts_for_push(world.request_id)
                         .unwrap();
                     assert!(
+                        !attempts.is_empty(),
+                        "the started attempt row must survive at {label}",
+                    );
+                    assert!(
                         attempts.iter().all(|a| matches!(
                             a.state,
-                            GitPushApproveAttemptState::Resolved { .. }
+                            GitPushApproveAttemptState::Resolved {
+                                outcome: GitPushApproveAttemptOutcome::PrePatchFailure { .. },
+                                ..
+                            }
                         )),
-                        "a live handler must resolve its attempt at {label}: {attempts:?}",
+                        "a refused rival move must resolve PrePatchFailure at {label}: {attempts:?}",
                     );
                 }
                 other => panic!("unexpected reply at {label}: {other:?}"),

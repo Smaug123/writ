@@ -761,6 +761,16 @@ fn double_crash_sampled_pairs_recover_to_one_approved_publish() {
 
     let mut config = Config::with_cases(32);
     config.source_file = Some(file!());
+    // This runner drives an async case on the shared `rt` above, so it
+    // must execute in-process. `Config::with_cases` inherits `fork` /
+    // `timeout` from the environment (`PROPTEST_FORK`, `PROPTEST_TIMEOUT`),
+    // and both fork the case into a subprocess that re-enters the test
+    // binary rather than this closure — meaningless here. Forcing them
+    // off keeps the runtime test honest under any env, and sidesteps the
+    // `Must supply test_name when forking enabled` panic a hand-built
+    // config (no `test_name`) would otherwise hit.
+    config.fork = false;
+    config.timeout = 0;
     let mut runner = TestRunner::new(config);
     runner
         .run(&(0..n, 0..n), |(k1, k2)| {
