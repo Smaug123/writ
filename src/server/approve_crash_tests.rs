@@ -23,6 +23,7 @@ use super::test_support::{InMemStore, open_session};
 use super::*;
 use crate::audit::{GitPushApproveAttemptOutcome, GitPushApproveAttemptState, GitPushResolution};
 use crate::core::AgentKind;
+use crate::core::RepoRef;
 use crate::crash_point::{CrashOutcome, CrashPlan, run_until_crash};
 use crate::fake_github::FakeGitHub;
 use crate::fake_origin::{FakeOrigin, ORIGIN_NAME, ORIGIN_OWNER, maybe_git};
@@ -50,13 +51,29 @@ pub(super) struct ApproveWorld {
     pub(super) audit_path: PathBuf,
     staging_path: PathBuf,
     work_root: PathBuf,
+    /// The write allowlist the broker was built with — reused verbatim
+    /// when the sweep reboots so policy is identical across the crash.
+    writable_repos: Vec<RepoRef>,
     /// Owns staging store, work root and audit DB alike.
     pub(super) _tmp: tempfile::TempDir,
 }
 
 impl ApproveWorld {
-    /// `None` when `git` is not on `PATH` (callers skip).
+    /// `None` when `git` is not on `PATH` (callers skip). The staged
+    /// push's target repo is on the write allowlist, so policy grants
+    /// the approve-time mint — the setup every crash-recovery oracle
+    /// wants. Use [`start_with_writable_repos`](Self::start_with_writable_repos)
+    /// to exercise a policy that denies.
     pub(super) async fn start() -> Option<Self> {
+        let repo: RepoRef = format!("{ORIGIN_OWNER}/{ORIGIN_NAME}").parse().unwrap();
+        Self::start_with_writable_repos(vec![repo]).await
+    }
+
+    /// As [`start`](Self::start), but with an explicit write allowlist.
+    /// The staged push always targets `ORIGIN_OWNER/ORIGIN_NAME`; pass
+    /// an allowlist that omits it to build a world whose policy denies
+    /// the approve.
+    pub(super) async fn start_with_writable_repos(writable_repos: Vec<RepoRef>) -> Option<Self> {
         let origin = FakeOrigin::start().await?;
         let github = FakeGitHub::start(ORIGIN_OWNER, ORIGIN_NAME, INSTALLATION_ID).await;
         // GitHub's branch is at the prerequisite — exactly the state
@@ -69,7 +86,14 @@ impl ApproveWorld {
         let work_root = tmp.path().join("promote");
         std::fs::create_dir_all(&work_root).expect("create work root");
 
-        let state = build_state(&audit_path, &staging_path, &work_root, &github, &origin);
+        let state = build_state(
+            &audit_path,
+            &staging_path,
+            &work_root,
+            &github,
+            &origin,
+            &writable_repos,
+        );
 
         // Stage the push whose prerequisite the origin serves and
         // whose bundle the origin built: receipt and world agree by
@@ -130,6 +154,7 @@ impl ApproveWorld {
             audit_path,
             staging_path,
             work_root,
+            writable_repos,
             _tmp: tmp,
         })
     }
@@ -153,6 +178,7 @@ impl ApproveWorld {
             &self.work_root,
             &self.github,
             &self.origin,
+            &self.writable_repos,
         )
     }
 }
@@ -163,6 +189,7 @@ fn build_state(
     work_root: &std::path::Path,
     github: &FakeGitHub,
     origin: &FakeOrigin,
+    writable_repos: &[RepoRef],
 ) -> Arc<BrokerState<InMemStore>> {
     let git = maybe_git().expect("callers hold a FakeOrigin, so git exists");
     let promote_runtime = crate::git_push_promote::PromoteRuntimeConfig::new(
@@ -198,7 +225,7 @@ fn build_state(
         minter: GitHubMinter::new_registry(GitHubAppRegistryConfig::new(apps).unwrap()),
         secrets,
         policy: PolicyConfig {
-            writable_repos: Vec::new(),
+            writable_repos: writable_repos.to_vec(),
             default_ttl: crate::core::TtlSeconds::new(3600).unwrap(),
         },
         staging_store: Some(Arc::new(
@@ -286,6 +313,70 @@ async fn approve_pipeline_succeeds_end_to_end_against_fake_github() {
         panic!("expected Approved, got {:?}", resolution.decision);
     };
     assert_eq!(resolution_mint.jti, ledger.jti);
+}
+
+/// The write allowlist (`policy.writable_repos`) must gate the
+/// *approve* route, not only the live-credential route. A staged push
+/// carries the exact capability the operator is being asked to
+/// authorise — `VmGitPushMetadata::authorization_request()` yields
+/// `Contents { Write, repo }` — and `policy::decide` denies writes to
+/// a repo that is not on the allowlist. The clone path routes its
+/// request through `policy::decide` and honours that; the approve path
+/// built its `contents:write` scope by hand and minted directly, so an
+/// operator could approve a guest-originated push to any *installed*
+/// repo regardless of policy.
+///
+/// This asserts the invariant against the fake GitHub's ground truth:
+/// approving an off-allowlist push mints no installation token, issues
+/// no branch PATCH, leaves the branch where the lease was taken, and
+/// does not report success.
+#[tokio::test]
+async fn approve_of_push_to_non_writable_repo_is_denied() {
+    // The staged push targets `ORIGIN_OWNER/ORIGIN_NAME`; the allowlist
+    // deliberately names a *different* repo under the same installation
+    // (which the coarse installation-owner check in the minter would
+    // still let a token be minted for). `policy::decide` denies writes
+    // to the staged repo under this policy, and the approve path must
+    // reach the same verdict.
+    let other: RepoRef = format!("{ORIGIN_OWNER}/some-other-repo").parse().unwrap();
+    let Some(world) = ApproveWorld::start_with_writable_repos(vec![other]).await else {
+        eprintln!("skipping: `git` not on PATH");
+        return;
+    };
+
+    let resp = dispatch_message(world.approve_message(), &world.state).await;
+
+    // The security-critical fact: no installation token was minted for
+    // the off-allowlist repo. A mint is a `POST` to
+    // `/app/installations/{id}/access_tokens`, and the fake records
+    // every request it serves.
+    let minted = world
+        .github
+        .requests()
+        .iter()
+        .any(|r| r.method == "POST" && r.path.ends_with("/access_tokens"));
+    assert!(
+        !minted,
+        "approve minted a token for a repo denied by writable_repos: {resp:?}",
+    );
+
+    // Corollaries at the Git Data API: no branch update was attempted,
+    // and the branch still sits at the lease baseline.
+    assert!(
+        world.github.patch_requests().is_empty(),
+        "approve issued a branch PATCH for a policy-denied repo: {resp:?}",
+    );
+    assert_eq!(
+        world.github.ref_of(WORLD_BRANCH).unwrap(),
+        world.origin.prereq().as_str(),
+        "the branch moved despite the push being denied by policy: {resp:?}",
+    );
+
+    // And the operator's approve did not report success.
+    assert!(
+        !matches!(resp, ServerMessage::StagedPushApproved { .. }),
+        "approve of a non-writable repo returned success: {resp:?}",
+    );
 }
 
 /// Stage-4 oracle, part 2: a counting run over the same approve
