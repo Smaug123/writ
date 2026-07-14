@@ -50,6 +50,8 @@ pub(super) fn plan_with_ipv6_mode(index: u16, ipv6_mode: Ipv6IsolationMode) -> A
         AgentVmToolPaths::new("container", "writ-agent-vm-pf-helper", "sudo"),
     )
     .unwrap()
+    // Pin the ownership token so invocation-shape tests see a deterministic label.
+    .with_owner_token(AgentVmOwnerToken::new("writ-test-owner"))
 }
 
 pub(super) fn plan_with_broker_placement(
@@ -71,4 +73,5 @@ pub(super) fn plan_with_broker_placement(
         AgentVmToolPaths::new("container", "writ-agent-vm-pf-helper", "sudo"),
     )
     .unwrap()
+    .with_owner_token(AgentVmOwnerToken::new("writ-test-owner"))
 }

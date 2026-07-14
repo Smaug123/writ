@@ -33,7 +33,7 @@ fn guest_environment_is_redacted_and_uses_env_file_in_start_invocation() {
     let AgentVmStartInvocation::RuntimeGuestEnvFile {
         invocation,
         display_shell,
-    } = &start_invocations[3]
+    } = &start_invocations[5]
     else {
         panic!("guest env should make VM start a runtime-env-file step");
     };

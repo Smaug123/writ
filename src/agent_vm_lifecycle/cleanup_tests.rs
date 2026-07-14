@@ -132,11 +132,13 @@ fn every_failure_outcome_is_producible_by_some_step() {
     }
 
     for outcome in [
+        StartOutcome::NetworkAbsenceProbeFailed,
         StartOutcome::CreateNetworkFailed,
         StartOutcome::InspectNetworkFailed,
         StartOutcome::ParseNetworkInspectionFailed,
         StartOutcome::ValidateNetworkInspectionFailed,
         StartOutcome::InstallFirewallFailed,
+        StartOutcome::VmAbsenceProbeFailed,
         StartOutcome::StartVmFailed,
         StartOutcome::ProbeGuestIpv6Failed,
         StartOutcome::ValidateGuestIpv6Failed,
@@ -144,5 +146,5 @@ fn every_failure_outcome_is_producible_by_some_step() {
     ] {
         assert!(produced.contains(&outcome), "no step produces {outcome:?}",);
     }
-    assert_eq!(produced.len(), 9, "produced = {produced:?}");
+    assert_eq!(produced.len(), 11, "produced = {produced:?}");
 }
