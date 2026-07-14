@@ -117,12 +117,20 @@ impl GitPushStagingStore {
     /// do not already exist.
     pub fn open(root: PathBuf) -> io::Result<Self> {
         create_private_dir(&root)?;
+        // Durably commit `root`'s own directory entry (which the mkdir
+        // above may have just created) by fsyncing its parent, so a
+        // freshly-created store survives a power loss with `root` intact.
+        // Ancestors above `root` are the config/operator layer's concern
+        // — `create_private_dir` is a single non-recursive mkdir, so
+        // `open` itself only ever creates `root`.
+        if let Some(parent) = root.parent() {
+            fsync_dir(parent)?;
+        }
         create_private_dir(&root.join(STAGED_DIR))?;
         create_private_dir(&root.join(TMP_DIR))?;
-        // Durably commit the `staged/` and `tmp/` directory entries so a
-        // freshly-created store survives a power loss with its hierarchy
-        // intact — recovery relies on `staged/` being durably linked
-        // under `root` (see `ensure_carrier_durable`).
+        // Durably commit the `staged/` and `tmp/` directory entries so
+        // recovery can rely on `staged/` being durably linked under
+        // `root` (see `ensure_carrier_durable`).
         fsync_dir(&root)?;
         Ok(Self { root })
     }
@@ -381,13 +389,19 @@ impl GitPushStagingStore {
     pub fn ensure_carrier_durable(&self, request_id: RequestId) -> Result<(), StagingError> {
         fsync_dir(&self.staged_path(request_id))?;
         fsync_dir(&self.root.join(STAGED_DIR))?;
-        // Also the store root: it holds the `staged/` directory entry, and
-        // if `staged/` itself is not durably linked (its creation in
-        // `open` is not fsynced) a power loss could drop the whole tree
-        // while the audit outcome survives. Fsyncing `root`'s own parent
-        // is out of scope — `root` is the operator-configured staging
-        // path, created and owned by the config layer.
+        // Also the store root (it holds the `staged/` directory entry) and
+        // the root's parent (it holds the `root` entry, which `open` may
+        // have created on first boot). Together these make the whole path
+        // the audit outcome will point at durable. We stop one level above
+        // `root`: `root` is the operator-configured staging path, and the
+        // durability of the ancestors *it* was created under is the
+        // config/operator layer's concern, not a per-recovery sweep's —
+        // recursively fsyncing an arbitrary configured hierarchy is out of
+        // scope for this store, which owns only `root` and below.
         fsync_dir(&self.root)?;
+        if let Some(parent) = self.root.parent() {
+            fsync_dir(parent)?;
+        }
         Ok(())
     }
 
