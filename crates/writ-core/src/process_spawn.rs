@@ -86,12 +86,7 @@ pub fn wait_collecting(mut child: std::process::Child) -> io::Result<std::proces
     let (stdout, stderr, status) = if stdout_pipe.is_some() && stderr_pipe.is_some() {
         // Two live pipes: drain one on a thread while draining the other inline.
         // `thread::spawn` *panics* under thread exhaustion, so use
-        // `thread::Builder::spawn`, which surfaces the failure. On failure the
-        // failed spawn has already dropped (closed) the stderr read end, so the
-        // child gets `EPIPE` there rather than blocking — fall back to draining
-        // stdout inline and waiting, without any PID-based kill (which could hit a
-        // recycled PID under an auto/external reaper). Stderr is lost in that rare
-        // path, but the command's real status is still collected.
+        // `thread::Builder::spawn`, which surfaces the failure.
         match spawn_pipe_reader(stderr_pipe) {
             Ok(stderr_reader) => {
                 let stdout = read_pipe(stdout_pipe);
@@ -99,10 +94,17 @@ pub fn wait_collecting(mut child: std::process::Child) -> io::Result<std::proces
                 let stderr = stderr_reader.join().unwrap_or_else(|_| Ok(Vec::new()));
                 (stdout, stderr, status)
             }
-            Err(_) => {
-                let stdout = read_pipe(stdout_pipe);
-                let status = child.wait();
-                (stdout, Ok(Vec::new()), status)
+            Err(err) => {
+                // Report the collection failure — don't fabricate a command
+                // result. Closing the stderr reader can `SIGPIPE`-kill the child,
+                // so its exit status here may be collector-induced. Still reap the
+                // child (no leak) without deadlocking: its stderr read end is
+                // already closed by the failed spawn, and draining stdout inline
+                // keeps it from blocking on a full pipe. No PID-based kill (which
+                // could hit a recycled PID under an auto/external reaper).
+                let _ = read_pipe(stdout_pipe);
+                let _ = child.wait();
+                return Err(err);
             }
         }
     } else {
