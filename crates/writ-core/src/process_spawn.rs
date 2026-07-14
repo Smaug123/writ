@@ -71,41 +71,56 @@ pub fn wait_collecting(mut child: std::process::Child) -> io::Result<std::proces
     // does: a child that reads to EOF would otherwise block forever on the
     // parent-held writer, hanging the wait.
     drop(child.stdin.take());
-    let mut stdout_pipe = child.stdout.take();
-    let mut stderr_pipe = child.stderr.take();
-    let stdout_reader = std::thread::spawn(move || -> io::Result<Vec<u8>> {
-        use std::io::Read as _;
-        let mut buf = Vec::new();
-        if let Some(pipe) = stdout_pipe.as_mut() {
-            pipe.read_to_end(&mut buf)?;
+    // Spawn the pipe readers fallibly. `thread::spawn` *panics* under thread
+    // exhaustion; unwinding would drop the child without reaping it, leaking a
+    // live process. Killing here is safe — the child was just spawned and not yet
+    // waited, so its identity is certain (no PID-reuse hazard).
+    let stdout_reader = match spawn_pipe_reader(child.stdout.take()) {
+        Ok(reader) => reader,
+        Err(err) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(err);
         }
-        Ok(buf)
-    });
-    let stderr_reader = std::thread::spawn(move || -> io::Result<Vec<u8>> {
-        use std::io::Read as _;
-        let mut buf = Vec::new();
-        if let Some(pipe) = stderr_pipe.as_mut() {
-            pipe.read_to_end(&mut buf)?;
+    };
+    let stderr_reader = match spawn_pipe_reader(child.stderr.take()) {
+        Ok(reader) => reader,
+        Err(err) => {
+            // Kill the child so the already-running stdout reader hits EOF and its
+            // join returns, then surface the error.
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = stdout_reader.join();
+            return Err(err);
         }
-        Ok(buf)
-    });
+    };
     // Wait unconditionally so the child is reaped regardless of pipe outcome: on
-    // return the process has exited.
+    // return the process has exited. A `wait` error means the child was already
+    // reaped elsewhere (`ECHILD`), so it is not running — we must *not* kill by
+    // PID (it may have been recycled to an unrelated process); the readers still
+    // reach EOF because the process is gone.
     let status = child.wait();
-    if status.is_err() {
-        // `wait` itself failed (rare) with the child possibly still alive. Kill
-        // and reap it *before* joining the readers: their `read_to_end`s only
-        // finish once the child closes its pipes, so joining first could block
-        // forever.
-        let _ = child.kill();
-        let _ = child.wait();
-    }
     let stdout = stdout_reader.join().unwrap_or_else(|_| Ok(Vec::new()));
     let stderr = stderr_reader.join().unwrap_or_else(|_| Ok(Vec::new()));
     Ok(std::process::Output {
         status: status?,
         stdout: stdout?,
         stderr: stderr?,
+    })
+}
+
+/// Spawn a thread that drains `pipe` to end-of-file. Uses `thread::Builder` so
+/// thread-creation failure surfaces as an `io::Error` rather than a panic.
+fn spawn_pipe_reader<R: std::io::Read + Send + 'static>(
+    pipe: Option<R>,
+) -> io::Result<std::thread::JoinHandle<io::Result<Vec<u8>>>> {
+    std::thread::Builder::new().spawn(move || {
+        let mut pipe = pipe;
+        let mut buf = Vec::new();
+        if let Some(pipe) = pipe.as_mut() {
+            pipe.read_to_end(&mut buf)?;
+        }
+        Ok(buf)
     })
 }
 
