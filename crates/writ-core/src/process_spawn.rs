@@ -85,22 +85,26 @@ pub fn wait_collecting(mut child: std::process::Child) -> io::Result<std::proces
     // gone. On return the process has exited.
     let (stdout, stderr, status) = if stdout_pipe.is_some() && stderr_pipe.is_some() {
         // Two live pipes: drain one on a thread while draining the other inline.
-        // `thread::spawn` *panics* under thread exhaustion, which would drop the
-        // child unreaped; `thread::Builder::spawn` surfaces the error instead, and
-        // we kill+reap the child (just spawned, so its identity is certain) before
-        // returning.
-        let stderr_reader = match spawn_pipe_reader(stderr_pipe) {
-            Ok(reader) => reader,
-            Err(err) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(err);
+        // `thread::spawn` *panics* under thread exhaustion, so use
+        // `thread::Builder::spawn`, which surfaces the failure. On failure the
+        // failed spawn has already dropped (closed) the stderr read end, so the
+        // child gets `EPIPE` there rather than blocking — fall back to draining
+        // stdout inline and waiting, without any PID-based kill (which could hit a
+        // recycled PID under an auto/external reaper). Stderr is lost in that rare
+        // path, but the command's real status is still collected.
+        match spawn_pipe_reader(stderr_pipe) {
+            Ok(stderr_reader) => {
+                let stdout = read_pipe(stdout_pipe);
+                let status = child.wait();
+                let stderr = stderr_reader.join().unwrap_or_else(|_| Ok(Vec::new()));
+                (stdout, stderr, status)
             }
-        };
-        let stdout = read_pipe(stdout_pipe);
-        let status = child.wait();
-        let stderr = stderr_reader.join().unwrap_or_else(|_| Ok(Vec::new()));
-        (stdout, stderr, status)
+            Err(_) => {
+                let stdout = read_pipe(stdout_pipe);
+                let status = child.wait();
+                (stdout, Ok(Vec::new()), status)
+            }
+        }
     } else {
         // At most one pipe: drain it inline, then wait. No deadlock is possible
         // with a single pipe, and no thread is needed.
