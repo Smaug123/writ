@@ -56,7 +56,57 @@ pub fn spawn(command: &mut std::process::Command) -> io::Result<std::process::Ch
 /// stdin to null and stdout/stderr to piped. Pass `Stdio::null()` for
 /// stdin if the child should see EOF.
 pub fn output(command: &mut std::process::Command) -> io::Result<std::process::Output> {
-    spawn(command)?.wait_with_output()
+    wait_collecting(spawn(command)?)
+}
+
+/// Collect a spawned child's output, **always waiting for it to exit** — even if
+/// draining its pipes fails. `std::process::Child::wait_with_output` returns on a
+/// pipe read error *without* waiting, leaving the child running; a caller that
+/// treats a collection error as "the command ran" (and then, say, cleans up based
+/// on the resulting state) would otherwise race a still-live child that can still
+/// perform its side effect. Draining both pipes on separate threads keeps a
+/// one-sided flood from deadlocking the wait.
+pub fn wait_collecting(mut child: std::process::Child) -> io::Result<std::process::Output> {
+    // Drop any piped stdin before waiting, exactly as `Child::wait_with_output`
+    // does: a child that reads to EOF would otherwise block forever on the
+    // parent-held writer, hanging the wait.
+    drop(child.stdin.take());
+    let mut stdout_pipe = child.stdout.take();
+    let mut stderr_pipe = child.stderr.take();
+    let stdout_reader = std::thread::spawn(move || -> io::Result<Vec<u8>> {
+        use std::io::Read as _;
+        let mut buf = Vec::new();
+        if let Some(pipe) = stdout_pipe.as_mut() {
+            pipe.read_to_end(&mut buf)?;
+        }
+        Ok(buf)
+    });
+    let stderr_reader = std::thread::spawn(move || -> io::Result<Vec<u8>> {
+        use std::io::Read as _;
+        let mut buf = Vec::new();
+        if let Some(pipe) = stderr_pipe.as_mut() {
+            pipe.read_to_end(&mut buf)?;
+        }
+        Ok(buf)
+    });
+    // Wait unconditionally so the child is reaped regardless of pipe outcome: on
+    // return the process has exited.
+    let status = child.wait();
+    if status.is_err() {
+        // `wait` itself failed (rare) with the child possibly still alive. Kill
+        // and reap it *before* joining the readers: their `read_to_end`s only
+        // finish once the child closes its pipes, so joining first could block
+        // forever.
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    let stdout = stdout_reader.join().unwrap_or_else(|_| Ok(Vec::new()));
+    let stderr = stderr_reader.join().unwrap_or_else(|_| Ok(Vec::new()));
+    Ok(std::process::Output {
+        status: status?,
+        stdout: stdout?,
+        stderr: stderr?,
+    })
 }
 
 #[cfg(feature = "host")]
@@ -146,5 +196,67 @@ mod tests {
             "expected at least one retry, got {}",
             calls.get()
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wait_collecting_captures_both_streams_and_reaps_the_child() {
+        use std::process::{Command, Stdio};
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", "printf out; printf err >&2; exit 3"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let output = wait_collecting(spawn(&mut command).unwrap()).unwrap();
+        assert_eq!(output.stdout, b"out");
+        assert_eq!(output.stderr, b"err");
+        assert_eq!(output.status.code(), Some(3));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wait_collecting_drops_piped_stdin_so_a_stdin_reader_does_not_hang() {
+        // The command reads stdin to EOF (`cat`). With stdin piped but never
+        // written, `wait_collecting` must drop the writer so the child sees EOF
+        // and exits; otherwise the wait hangs forever. Bound the call in a thread
+        // so a regression fails fast instead of wedging the test run.
+        use std::process::{Command, Stdio};
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut command = Command::new("/bin/sh");
+            command
+                .args(["-c", "cat; printf done"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            let _ = tx.send(wait_collecting(spawn(&mut command).unwrap()));
+        });
+        let output = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("wait_collecting hung — piped stdin was not dropped")
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"done");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wait_collecting_does_not_deadlock_on_a_one_sided_flood() {
+        // A child that floods one stream far past the OS pipe buffer while writing
+        // nothing to the other must not wedge the wait: both pipes are drained
+        // concurrently, so the child never blocks on a full pipe.
+        use std::process::{Command, Stdio};
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", "head -c 1048576 /dev/zero"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let output = wait_collecting(spawn(&mut command).unwrap()).unwrap();
+        assert_eq!(output.stdout.len(), 1_048_576);
+        assert!(output.status.success());
     }
 }
