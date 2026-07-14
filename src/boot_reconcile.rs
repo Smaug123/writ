@@ -34,10 +34,11 @@
 
 use crate::audit::{
     AUDIT_WRITE_FAILURE_TARGET, AuditError, AuditLog, GitPushApproveAttemptEntry,
-    GitPushApproveAttemptState, GitPushOutcomeRecord, GitPushOutcomeResult,
+    GitPushApproveAttemptState, GitPushAuditEntry, GitPushOutcomeRecord, GitPushOutcomeResult,
 };
 use crate::core::{ApproveAttemptId, RequestId, UnixMillis};
 use crate::git_push_staging::GitPushStagingStore;
+use crate::vm_git::VmGitPushStagedReceipt;
 
 /// Detail string written to `git_push_approve_attempt.failure_detail`
 /// when boot reconcile transitions a `Started` attempt to
@@ -301,6 +302,26 @@ pub fn reconcile_orphaned_staged_carriers(
 
         match entry.result {
             None => {
+                // Cross-check the on-disk receipt against the authoritative
+                // audit request row before making the carrier resolvable.
+                // The normal push path writes the request row and the
+                // receipt from the same metadata, so they always agree; a
+                // disagreement here means the receipt was corrupted or
+                // tampered. Recording `staged` anyway would let approve
+                // build a GitHub operation from a receipt that targets a
+                // different branch/head than the audit request records —
+                // `check_approvable_push` never re-compares these fields.
+                if let Some(field) = receipt_request_mismatch(&receipt, &entry) {
+                    tracing::error!(
+                        target: AUDIT_WRITE_FAILURE_TARGET,
+                        kind = "boot_carrier_sweep_mismatch",
+                        push_request_id = %request_id,
+                        field,
+                        "boot carrier sweep: carrier receipt disagrees with the audit \
+                         request row; not recovering",
+                    );
+                    continue;
+                }
                 // The orphan this sweep exists to repair. Re-fsync the
                 // carrier's directory entry first: `stage()`'s final
                 // `fsync_dir` may have failed (leaving the rename visible
@@ -348,6 +369,30 @@ pub fn reconcile_orphaned_staged_carriers(
     }
 
     Ok(recovered)
+}
+
+/// Compare a staged carrier's receipt against the authoritative audit
+/// request row. Returns the name of the first field that disagrees, or
+/// `None` when every field matches. The normal push path derives both
+/// from one `VmGitPushMetadata`, so a mismatch signals a corrupted or
+/// tampered receipt that must not be made resolvable.
+fn receipt_request_mismatch(
+    receipt: &VmGitPushStagedReceipt,
+    entry: &GitPushAuditEntry,
+) -> Option<&'static str> {
+    if receipt.repo() != &entry.repo {
+        return Some("repo");
+    }
+    if receipt.branch() != &entry.branch {
+        return Some("branch");
+    }
+    if receipt.expected_remote_head() != entry.expected_remote_head.as_ref() {
+        return Some("expected_remote_head");
+    }
+    if receipt.new_head() != &entry.new_head {
+        return Some("new_head");
+    }
+    None
 }
 
 #[cfg(test)]
@@ -1037,5 +1082,52 @@ mod tests {
         );
         // The torn sibling was never given an outcome row.
         assert!(log.get_git_push(torn).unwrap().is_none());
+    }
+
+    /// A carrier whose receipt disagrees with the authoritative audit
+    /// request row (here: a different branch) is not made resolvable —
+    /// recovering it would let approve act on metadata the request never
+    /// authorised.
+    #[test]
+    fn carrier_disagreeing_with_the_audit_request_is_not_recovered() {
+        let (log, session_id) = open_log_with_session();
+        let (staging, _tmp) = open_staging();
+
+        // Request row records branch `main` (see `record_push_request_only`).
+        let request_id = record_push_request_only(&log, session_id);
+        // Stage a carrier for the same id but a *different* branch.
+        staging
+            .stage(
+                request_id,
+                UnixMillis::from_millis(1_700_000_120),
+                VmGitPushMetadata::new(
+                    sample_repo(),
+                    "other-branch".parse().unwrap(),
+                    Some(git_oid('1')),
+                    git_oid('2'),
+                ),
+                b"bundle".to_vec(),
+            )
+            .unwrap();
+
+        let recovered = reconcile_orphaned_staged_carriers(
+            &log,
+            &staging,
+            recovery_receipt_bound(16 * 1024),
+            now(),
+        )
+        .unwrap();
+        assert!(
+            recovered.is_empty(),
+            "a mismatched carrier must not be recovered"
+        );
+        assert!(
+            log.get_git_push(request_id)
+                .unwrap()
+                .unwrap()
+                .result
+                .is_none(),
+            "no outcome row must be written for a mismatched carrier",
+        );
     }
 }

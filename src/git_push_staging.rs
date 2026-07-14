@@ -275,11 +275,11 @@ impl GitPushStagingStore {
     ) -> Result<VmGitPushStagedReceipt, StagingError> {
         let request_id = parse_request_id_from_dirname(name)?;
         // Guard the receipt *before* `load_receipt`'s unbounded `fs::read`:
-        // at startup a tampered `entry.json` that is a FIFO, a symlink to
-        // an endless device, or an implausibly large file would otherwise
-        // hang or OOM the sweep and block recovery of every healthy
-        // sibling. `fs::metadata` follows symlinks, so a link to a device
-        // resolves to its non-regular target and is rejected here.
+        // at startup a tampered `entry.json` that is a FIFO, a symlink, or
+        // an implausibly large file would otherwise hang or OOM the sweep
+        // and block recovery of every healthy sibling. The guard uses
+        // no-follow metadata and rejects anything that is not a plain
+        // regular file.
         self.verify_receipt_readable(request_id, max_receipt_bytes)?;
         let receipt = self.load_receipt(request_id)?;
         self.verify_bundle_readable(request_id)?;
@@ -291,14 +291,18 @@ impl GitPushStagingStore {
     /// [`Self::probe_recoverable_entry`] for why the recovery sweep must
     /// not blindly `fs::read` it, and [`recovery_receipt_bound`] for how
     /// the bound is derived.
+    ///
+    /// Uses `symlink_metadata` (no-follow) so a *symlink* — which
+    /// `stage()` never creates — is rejected rather than followed to a
+    /// target that could change or vanish after the outcome commits.
     fn verify_receipt_readable(
         &self,
         request_id: RequestId,
         max_receipt_bytes: u64,
     ) -> Result<(), StagingError> {
         let path = self.staged_path(request_id).join(ENTRY_FILE);
-        match fs::metadata(&path) {
-            Ok(meta) if meta.is_file() => {
+        match fs::symlink_metadata(&path) {
+            Ok(meta) if meta.file_type().is_file() => {
                 if meta.len() > max_receipt_bytes {
                     Err(StagingError::Corrupt {
                         request_id,
@@ -329,15 +333,17 @@ impl GitPushStagingStore {
     /// carrier the approve/reject paths can actually `load()` (which
     /// `fs::read`s the bundle); a bare `try_exists()` would accept a
     /// directory, FIFO, or mode-denied path and let recovery record
-    /// `staged` for a push that can never be resolved. `is_file()` rules
-    /// out non-regular shapes; opening (without reading) rules out an
-    /// unreadable regular file. Missing bundle → `Corrupt`; other open
-    /// failures → `Io` (the recovery sweep skips both without recording
-    /// an outcome).
+    /// `staged` for a push that can never be resolved. `symlink_metadata`
+    /// (no-follow) with `file_type().is_file()` rules out non-regular
+    /// shapes *and* symlinks (which `stage()` never creates, and whose
+    /// target `ensure_carrier_durable` would not fsync); opening (without
+    /// reading) then rules out an unreadable regular file. Missing bundle
+    /// → `Corrupt`; other open failures → `Io` (the recovery sweep skips
+    /// both without recording an outcome).
     fn verify_bundle_readable(&self, request_id: RequestId) -> Result<(), StagingError> {
         let path = self.staged_path(request_id).join(BUNDLE_FILE);
-        match fs::metadata(&path) {
-            Ok(meta) if meta.is_file() => {}
+        match fs::symlink_metadata(&path) {
+            Ok(meta) if meta.file_type().is_file() => {}
             Ok(_) => {
                 return Err(StagingError::Corrupt {
                     request_id,
@@ -1250,6 +1256,48 @@ mod tests {
         // Saturates rather than overflowing (panicking) on an absurd
         // configured limit.
         assert!(recovery_receipt_bound(usize::MAX) >= usize::MAX as u64);
+    }
+
+    /// A symlinked `entry.json` or `bundle` — a shape `stage()` never
+    /// produces and whose target `ensure_carrier_durable` would not fsync
+    /// — is rejected by the no-follow probe rather than followed.
+    #[cfg(unix)]
+    #[test]
+    fn list_entries_for_recovery_rejects_symlinked_carrier_files() {
+        use std::os::unix::fs::symlink;
+
+        for file in [ENTRY_FILE, BUNDLE_FILE] {
+            let (store, _tmp) = open_store();
+            let id: RequestId = "40000000-0000-0000-0000-0000000000dd".parse().unwrap();
+            store
+                .stage(
+                    id,
+                    UnixMillis::from_millis(1),
+                    sample_metadata(),
+                    b"b".to_vec(),
+                )
+                .unwrap();
+            // Replace the file with a symlink pointing at a valid regular
+            // file: `metadata` would follow it and pass, `symlink_metadata`
+            // must reject it.
+            let target = store.root().join(format!("real-{file}"));
+            fs::write(&target, b"{}").unwrap();
+            let path = store.staged_path(id).join(file);
+            fs::remove_file(&path).unwrap();
+            symlink(&target, &path).unwrap();
+
+            let entries = store
+                .list_entries_for_recovery(recovery_receipt_bound(64 * 1024))
+                .unwrap();
+            assert_eq!(entries.len(), 1);
+            assert!(
+                matches!(
+                    entries.into_iter().next().unwrap(),
+                    Err(StagingError::Corrupt { request_id, .. }) if request_id == id
+                ),
+                "symlinked {file} must be rejected",
+            );
+        }
     }
 
     #[test]
