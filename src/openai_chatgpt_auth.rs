@@ -21,6 +21,14 @@
 //! * On a *transient* refresh failure (network error, 5xx) the cache is
 //!   left intact and the request fails with
 //!   `chatgpt_oauth_refresh_transient`.
+//! * When a refresh *succeeds* upstream but the durable write back to the
+//!   secret store fails, the cache keeps the freshly rotated tokens (the
+//!   old refresh token is now spent, so reverting would strand the
+//!   session). The refreshing request surfaces the `SecretStore` error,
+//!   but the cache is flagged as ahead of durable storage and later
+//!   requests keep serving the valid cached token while retrying the
+//!   write until it lands. See [`ChatgptOauthAuthority::current_headers`]
+//!   for the full envelope.
 //!
 //! Concurrency: a single [`tokio::sync::Mutex`] serialises all access to
 //! the cached bundle. That makes refreshes single-shot — concurrent
@@ -388,8 +396,17 @@ pub struct ChatgptOauthAuthority {
 enum ChatgptOauthState {
     /// We have not yet attempted to load the bundle from the secret store.
     Cold,
-    /// A bundle is cached.
-    Loaded(ChatgptAuthBundle),
+    /// A bundle is cached. `needs_persist` records that the cached bundle
+    /// is *ahead* of durable storage — a refresh rotated the tokens in
+    /// memory but the subsequent `put` failed. While set, every
+    /// [`ChatgptOauthAuthority::current_headers`] call retries the durable
+    /// write so the gap closes as soon as the secret store recovers. A
+    /// bundle freshly loaded from the store is in sync, so it starts
+    /// `false`.
+    Loaded {
+        bundle: ChatgptAuthBundle,
+        needs_persist: bool,
+    },
 }
 
 impl ChatgptOauthAuthority {
@@ -409,17 +426,33 @@ impl ChatgptOauthAuthority {
     ///      unparseable), call `/oauth/token`.
     ///   4. Persist any successful refresh back to the secret store
     ///      before returning the new headers.
+    ///
+    /// Persistence-failure envelope: a refresh mutates the in-memory
+    /// bundle with the freshly rotated tokens *before* it attempts the
+    /// durable `put`, and never reverts that mutation — the upstream has
+    /// already invalidated the old refresh token, so the new one is the
+    /// only usable credential and must not be discarded. If the `put`
+    /// fails, the refreshing call surfaces the error (`SecretStore`) but
+    /// the cache retains the new token and is flagged as ahead of durable
+    /// storage; subsequent calls keep serving the valid cached token and
+    /// retry the write until it lands. The only unrecoverable window is a
+    /// process restart between the failed write and a later successful
+    /// one, which loads the stale (spent) durable token and forces a
+    /// re-login.
     pub async fn current_headers<S: SecretStore + ?Sized>(
         &self,
         secret_store: &S,
     ) -> Result<ChatgptUpstreamHeaders, ChatgptOauthError> {
         let mut state = self.state.lock().await;
         let bundle = match &mut *state {
-            ChatgptOauthState::Loaded(bundle) => bundle,
+            ChatgptOauthState::Loaded { bundle, .. } => bundle,
             ChatgptOauthState::Cold => {
                 let loaded = load_bundle_from_secret_store(secret_store, &self.config.secret_key)?;
-                *state = ChatgptOauthState::Loaded(loaded);
-                let ChatgptOauthState::Loaded(bundle) = &mut *state else {
+                *state = ChatgptOauthState::Loaded {
+                    bundle: loaded,
+                    needs_persist: false,
+                };
+                let ChatgptOauthState::Loaded { bundle, .. } = &mut *state else {
                     unreachable!("just assigned Loaded above");
                 };
                 bundle
@@ -437,10 +470,17 @@ impl ChatgptOauthAuthority {
         );
         if decision != RefreshDecision::Fresh {
             self.refresh(secret_store, &mut state).await?;
+        } else {
+            // The cached token is still good, but an earlier refresh may
+            // have left the cache ahead of durable storage. Retry the
+            // write best-effort so the durability gap closes as soon as
+            // the store recovers; a still-failing write must not fail this
+            // request, since the cached token is valid.
+            self.retry_pending_persist(secret_store, &mut state);
         }
 
         let bundle = match &*state {
-            ChatgptOauthState::Loaded(bundle) => bundle,
+            ChatgptOauthState::Loaded { bundle, .. } => bundle,
             ChatgptOauthState::Cold => unreachable!("loaded above"),
         };
         let tokens = bundle.tokens.as_ref().ok_or_else(|| {
@@ -469,7 +509,7 @@ impl ChatgptOauthAuthority {
         secret_store: &S,
         state: &mut ChatgptOauthState,
     ) -> Result<(), ChatgptOauthError> {
-        let ChatgptOauthState::Loaded(bundle) = state else {
+        let ChatgptOauthState::Loaded { bundle, .. } = state else {
             unreachable!("refresh requires Loaded state");
         };
         let refresh_token = bundle
@@ -502,13 +542,64 @@ impl ChatgptOauthAuthority {
             .await
             .map_err(|err| ChatgptOauthError::RefreshTransient(err.to_string()))?;
         let now = self.config.clock.now_rfc3339();
+
+        let ChatgptOauthState::Loaded {
+            bundle,
+            needs_persist,
+        } = state
+        else {
+            unreachable!("refresh requires Loaded state");
+        };
+        // Mutate the cache with the rotated tokens *before* persisting. The
+        // upstream has invalidated the old refresh token, so the new token
+        // is now the only usable credential — we must not lose it, even if
+        // the durable write below fails.
         apply_refresh_response(bundle, &parsed, now)
             .map_err(|err| ChatgptOauthError::BundleMalformed(err.to_string()))?;
-        let serialized = serde_json::to_string(&*bundle).map_err(|_| {
-            ChatgptOauthError::BundleMalformed("failed to serialize refreshed bundle".into())
-        })?;
-        secret_store.put(&self.config.secret_key, &serialized)?;
-        Ok(())
+        match persist_bundle(secret_store, &self.config.secret_key, bundle) {
+            Ok(()) => {
+                *needs_persist = false;
+                Ok(())
+            }
+            Err(err) => {
+                // The cache holds the freshly rotated tokens; flag it as
+                // ahead of durable storage so a later call retries the
+                // write, and surface the failure now.
+                *needs_persist = true;
+                Err(err)
+            }
+        }
+    }
+
+    /// Best-effort retry of a durable write that a prior [`Self::refresh`]
+    /// left pending. A no-op unless the cache is flagged as ahead of
+    /// durable storage. A persist failure here is swallowed (logged): the
+    /// cached token is valid, so the request proceeds and the flag stays
+    /// set for the next attempt.
+    fn retry_pending_persist<S: SecretStore + ?Sized>(
+        &self,
+        secret_store: &S,
+        state: &mut ChatgptOauthState,
+    ) {
+        let ChatgptOauthState::Loaded {
+            bundle,
+            needs_persist,
+        } = state
+        else {
+            return;
+        };
+        if !*needs_persist {
+            return;
+        }
+        match persist_bundle(secret_store, &self.config.secret_key, bundle) {
+            Ok(()) => *needs_persist = false,
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "chatgpt oauth durable persist still failing; serving valid cached token",
+                );
+            }
+        }
     }
 
     fn handle_refresh_failure<S: SecretStore + ?Sized>(
@@ -536,6 +627,21 @@ impl ChatgptOauthAuthority {
             ))),
         }
     }
+}
+
+/// Serialize the bundle and write it to the secret store. A serialization
+/// failure is reported as `BundleMalformed`; a store failure propagates as
+/// `SecretStore`.
+fn persist_bundle<S: SecretStore + ?Sized>(
+    secret_store: &S,
+    secret_key: &SecretKey,
+    bundle: &ChatgptAuthBundle,
+) -> Result<(), ChatgptOauthError> {
+    let serialized = serde_json::to_string(bundle).map_err(|_| {
+        ChatgptOauthError::BundleMalformed("failed to serialize refreshed bundle".into())
+    })?;
+    secret_store.put(secret_key, &serialized)?;
+    Ok(())
 }
 
 fn load_bundle_from_secret_store<S: SecretStore + ?Sized>(

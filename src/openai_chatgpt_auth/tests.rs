@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Mutex as StdMutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use base64::Engine as _;
 use proptest::prelude::*;
@@ -12,15 +13,24 @@ use crate::secret::{SecretError, SecretKey, SecretStore};
 use super::*;
 
 #[derive(Default)]
-struct InMemStore(StdMutex<HashMap<String, String>>);
+struct InMemStore {
+    map: StdMutex<HashMap<String, String>>,
+    /// When set, every `put` fails with a simulated store error. Lets a
+    /// test drive the "refresh succeeded upstream but the durable write
+    /// failed" path, then "repair" the store to watch the cache heal.
+    fail_puts: AtomicBool,
+}
 
 impl SecretStore for InMemStore {
     fn get(&self, key: &SecretKey) -> Result<Option<String>, SecretError> {
-        Ok(self.0.lock().unwrap().get(key.as_str()).cloned())
+        Ok(self.map.lock().unwrap().get(key.as_str()).cloned())
     }
 
     fn put(&self, key: &SecretKey, value: &str) -> Result<(), SecretError> {
-        self.0
+        if self.fail_puts.load(Ordering::SeqCst) {
+            return Err(SecretError::Keyring("simulated put failure".into()));
+        }
+        self.map
             .lock()
             .unwrap()
             .insert(key.as_str().to_string(), value.to_string());
@@ -28,14 +38,18 @@ impl SecretStore for InMemStore {
     }
 
     fn delete(&self, key: &SecretKey) -> Result<(), SecretError> {
-        self.0.lock().unwrap().remove(key.as_str());
+        self.map.lock().unwrap().remove(key.as_str());
         Ok(())
     }
 }
 
 impl InMemStore {
+    fn set_fail_puts(&self, fail: bool) {
+        self.fail_puts.store(fail, Ordering::SeqCst);
+    }
+
     fn contains(&self, key: &SecretKey) -> bool {
-        self.0.lock().unwrap().contains_key(key.as_str())
+        self.map.lock().unwrap().contains_key(key.as_str())
     }
 }
 
@@ -425,6 +439,104 @@ async fn current_headers_refreshes_when_token_is_stale_and_persists_new_bundle()
     let stored_tokens = stored.tokens.unwrap();
     assert_eq!(stored_tokens.refresh_token, "refresh-new");
     assert_eq!(stored_tokens.access_token, access_token_with_exp(50_000));
+}
+
+#[tokio::test]
+async fn put_failure_after_refresh_keeps_new_token_and_heals_durable_on_next_call() {
+    let store = InMemStore::default();
+    let key = SecretKey::new("openai-chatgpt-auth").unwrap();
+    let bundle = make_bundle(/*exp=*/ 1_050, "refresh-old", false);
+    store
+        .put(&key, &serde_json::to_string(&bundle).unwrap())
+        .unwrap();
+    let clock = Arc::new(FakeClock::new(1_000));
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/oauth/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id_token": id_token_with_chatgpt_claims("acct-rotated", false, 99_999),
+            "access_token": access_token_with_exp(50_000),
+            "refresh_token": "refresh-new",
+        })))
+        // Exactly one upstream refresh across BOTH calls: the second call
+        // must heal durable storage from the cached token, not re-refresh.
+        .expect(1)
+        .mount(&server)
+        .await;
+    let refresh_url = format!("{}/oauth/token", server.uri());
+    let (authority, _) = build_authority(&refresh_url, Arc::clone(&clock));
+
+    // First call: token is stale, so we refresh upstream (rotating the
+    // refresh token) — but the durable write fails.
+    store.set_fail_puts(true);
+    let err = authority.current_headers(&store).await.unwrap_err();
+    assert!(
+        matches!(err, ChatgptOauthError::SecretStore(_)),
+        "expected SecretStore error, got {err:?}"
+    );
+    // Durable storage still holds the OLD (now-spent) refresh token: a
+    // restart here would load a token the upstream has already invalidated.
+    let stored: ChatgptAuthBundle =
+        serde_json::from_str(&store.get(&key).unwrap().unwrap()).unwrap();
+    assert_eq!(stored.tokens.unwrap().refresh_token, "refresh-old");
+
+    // The secret store recovers.
+    store.set_fail_puts(false);
+
+    // Second call: the cached access_token is already fresh, so we must not
+    // hit the upstream again (`.expect(1)`). The cache is dirty from the
+    // failed write, so we retry persistence and it now succeeds.
+    let headers = authority.current_headers(&store).await.unwrap();
+    assert_eq!(headers.access_token, access_token_with_exp(50_000));
+
+    // Durable storage has caught up to the rotated token.
+    let stored: ChatgptAuthBundle =
+        serde_json::from_str(&store.get(&key).unwrap().unwrap()).unwrap();
+    let stored_tokens = stored.tokens.unwrap();
+    assert_eq!(stored_tokens.refresh_token, "refresh-new");
+    assert_eq!(stored_tokens.access_token, access_token_with_exp(50_000));
+}
+
+#[tokio::test]
+async fn put_failure_still_serves_cached_token_while_store_stays_broken() {
+    let store = InMemStore::default();
+    let key = SecretKey::new("openai-chatgpt-auth").unwrap();
+    let bundle = make_bundle(/*exp=*/ 1_050, "refresh-old", false);
+    store
+        .put(&key, &serde_json::to_string(&bundle).unwrap())
+        .unwrap();
+    let clock = Arc::new(FakeClock::new(1_000));
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/oauth/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id_token": id_token_with_chatgpt_claims("acct-rotated", false, 99_999),
+            "access_token": access_token_with_exp(50_000),
+            "refresh_token": "refresh-new",
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let refresh_url = format!("{}/oauth/token", server.uri());
+    let (authority, _) = build_authority(&refresh_url, Arc::clone(&clock));
+
+    // The store is broken for the whole test.
+    store.set_fail_puts(true);
+
+    // First call refreshes upstream and fails to persist.
+    let err = authority.current_headers(&store).await.unwrap_err();
+    assert!(matches!(err, ChatgptOauthError::SecretStore(_)), "{err:?}");
+
+    // Second call: even though the durable write is still failing, we hold a
+    // valid, freshly-rotated token in memory, so we serve it rather than
+    // failing closed. The retry attempt is best-effort and swallowed.
+    let headers = authority.current_headers(&store).await.unwrap();
+    assert_eq!(headers.access_token, access_token_with_exp(50_000));
+
+    // Durable storage is still stale — the write never succeeded.
+    let stored: ChatgptAuthBundle =
+        serde_json::from_str(&store.get(&key).unwrap().unwrap()).unwrap();
+    assert_eq!(stored.tokens.unwrap().refresh_token, "refresh-old");
 }
 
 #[tokio::test]
