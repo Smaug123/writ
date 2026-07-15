@@ -785,6 +785,50 @@ async fn concurrent_revocation_during_refresh_is_not_clobbered() {
 }
 
 #[tokio::test]
+async fn pending_persist_retry_reconciles_when_secret_revoked_mid_call() {
+    let store = InMemStore::default();
+    let key = SecretKey::new("openai-chatgpt-auth").unwrap();
+    let bundle = make_bundle(/*exp=*/ 1_050, "refresh-old", false);
+    store
+        .put(&key, &serde_json::to_string(&bundle).unwrap())
+        .unwrap();
+    let clock = Arc::new(FakeClock::new(1_000));
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/oauth/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id_token": id_token_with_chatgpt_claims("acct", false, 99_999),
+            "access_token": access_token_with_exp(50_000),
+            "refresh_token": "refresh-new",
+        })))
+        .mount(&server)
+        .await;
+    let refresh_url = format!("{}/oauth/token", server.uri());
+    let (authority, _) = build_authority(&refresh_url, Arc::clone(&clock));
+
+    // Call 1 refreshes but the durable write fails, leaving the cache ahead
+    // with a pending persist. (Two store reads: reconcile + guarded write.)
+    store.set_fail_puts(true);
+    let err = authority.current_headers(&store).await.unwrap_err();
+    assert!(matches!(err, ChatgptOauthError::SecretStore(_)), "{err:?}");
+
+    // The store recovers, but the operator revokes after call 2's reconcile
+    // read and before the pending-persist retry's guarded read (get #4).
+    store.set_fail_puts(false);
+    store.revoke_after_gets(3);
+
+    // The retry observes the revocation; it must reconcile and refuse *this*
+    // call rather than serving the stale cached token, and must not recreate
+    // the revoked secret.
+    let err = authority.current_headers(&store).await.unwrap_err();
+    assert!(matches!(err, ChatgptOauthError::LoginRequired), "{err:?}");
+    assert!(
+        !store.contains(&key),
+        "a pending-persist retry must not resurrect a revoked secret",
+    );
+}
+
+#[tokio::test]
 async fn out_of_band_secret_deletion_revokes_access() {
     let store = InMemStore::default();
     let key = SecretKey::new("openai-chatgpt-auth").unwrap();
