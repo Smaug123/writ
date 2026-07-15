@@ -113,6 +113,7 @@ async fn write_plan_note_completes_after_real_broker_round_trip() {
         }),
         promote_runtime: None,
         mirror_pins: writ::vm_git_mirror_cache::MirrorPins::new(),
+        chatgpt_oauth_authority: Default::default(),
     });
 
     let socket_dir = tempfile::tempdir().unwrap();
@@ -256,6 +257,7 @@ async fn write_review_note_completes_after_real_broker_round_trip() {
         }),
         promote_runtime: None,
         mirror_pins: writ::vm_git_mirror_cache::MirrorPins::new(),
+        chatgpt_oauth_authority: Default::default(),
     });
 
     let socket_dir = tempfile::tempdir().unwrap();
@@ -396,6 +398,7 @@ async fn write_implement_note_completes_after_real_broker_round_trip() {
         }),
         promote_runtime: None,
         mirror_pins: writ::vm_git_mirror_cache::MirrorPins::new(),
+        chatgpt_oauth_authority: Default::default(),
     });
 
     let socket_dir = tempfile::tempdir().unwrap();

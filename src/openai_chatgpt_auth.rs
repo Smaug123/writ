@@ -33,7 +33,14 @@
 //! Concurrency: a single [`tokio::sync::Mutex`] serialises all access to
 //! the cached bundle. That makes refreshes single-shot — concurrent
 //! requests queue behind the lock and observe the freshly refreshed
-//! token rather than each launching their own refresh.
+//! token rather than each launching their own refresh. For this to hold
+//! across *sessions*, one [`ChatgptOauthAuthority`] is shared broker-wide
+//! (built once, stored on `BrokerState`, handed to every VM session's
+//! OpenAI proxy) rather than reconstructed per session: otherwise
+//! concurrent sessions would each refresh the same rotation-invalidated
+//! token and all but one would hit `refresh_token_reused`, and a token
+//! cached (or left pending-persist) by one session would be lost when it
+//! ends.
 
 use std::sync::Arc;
 

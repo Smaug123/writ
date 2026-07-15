@@ -15,6 +15,7 @@ use crate::openai_chatgpt_auth::{
     ChatgptOauthAuthorityConfig, ChatgptOauthError, SystemClock,
 };
 use crate::secret::{SecretKey, SecretStore};
+use crate::server::BrokerState;
 
 use super::proxy_common::{
     OpenAiBackend, ProxyBackend, ProxyBackendConfig, ProxyFetch, ProxyForwardHeader,
@@ -310,12 +311,29 @@ impl ProxyBackend for OpenAiBackend {
         openai_proxy_forward_headers(request_headers, config.auth_kind())
     }
 
-    fn build_extras(
+    fn build_extras<S>(
+        broker_state: &Arc<BrokerState<S>>,
         config: &VmHttpOpenAiProxyConfig,
-    ) -> Result<Option<Arc<ChatgptOauthAuthority>>, reqwest::Error> {
+    ) -> Result<Option<Arc<ChatgptOauthAuthority>>, reqwest::Error>
+    where
+        S: SecretStore + Send + Sync + 'static,
+    {
         match config.auth_kind() {
             VmHttpOpenAiProxyAuthKind::AuthorizationBearer => Ok(None),
+            // Hand back the broker-wide authority, building it once on first
+            // use. Sharing (rather than a fresh authority per session) is what
+            // keeps the in-memory token cache and its pending-persist retry
+            // alive across session teardown and serialises concurrent-session
+            // refreshes through one mutex. First config wins; a broker has a
+            // single OpenAI upstream config, so this is stable across sessions.
             VmHttpOpenAiProxyAuthKind::ChatgptOauth => {
+                let mut slot = broker_state
+                    .chatgpt_oauth_authority
+                    .lock()
+                    .expect("chatgpt oauth authority mutex poisoned");
+                if let Some(existing) = slot.as_ref() {
+                    return Ok(Some(Arc::clone(existing)));
+                }
                 let refresh_client = reqwest::Client::builder()
                     .connect_timeout(config.timeout)
                     .read_timeout(config.timeout)
@@ -327,7 +345,9 @@ impl ProxyBackend for OpenAiBackend {
                     clock: Arc::new(SystemClock),
                     leeway_seconds: CHATGPT_OAUTH_REFRESH_LEEWAY_SECONDS,
                 };
-                Ok(Some(Arc::new(ChatgptOauthAuthority::new(authority_config))))
+                let authority = Arc::new(ChatgptOauthAuthority::new(authority_config));
+                *slot = Some(Arc::clone(&authority));
+                Ok(Some(authority))
             }
         }
     }
@@ -880,6 +900,64 @@ mod tests {
             err,
             VmHttpOpenAiProxyConfigError::UnsupportedChatgptRefreshScheme { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn chatgpt_authority_is_shared_across_sessions_of_one_broker() {
+        let github = MockServer::start().await;
+        let state = make_broker_state(&github);
+        let make_config = || {
+            VmHttpOpenAiProxyConfig::new(
+                "https://api.openai.com/v1/",
+                SecretKey::new("openai-chatgpt-auth").unwrap(),
+                VmHttpOpenAiProxyAuthKind::ChatgptOauth,
+                std::time::Duration::from_secs(5),
+                1024,
+                1024,
+            )
+            .unwrap()
+        };
+
+        // Two sessions of the same broker build their extras independently,
+        // but must observe the *same* authority so a token refreshed and
+        // cached by one session (and any pending-persist retry) is visible to
+        // the next rather than being reloaded (spent) from durable storage.
+        let first = OpenAiBackend::build_extras(&state, &make_config())
+            .unwrap()
+            .expect("chatgpt auth yields an authority");
+        let second = OpenAiBackend::build_extras(&state, &make_config())
+            .unwrap()
+            .expect("chatgpt auth yields an authority");
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "sessions of one broker must share a single ChatGPT authority",
+        );
+
+        // A different broker is an independent process/state and gets its own.
+        let other = make_broker_state(&github);
+        let third = OpenAiBackend::build_extras(&other, &make_config())
+            .unwrap()
+            .expect("chatgpt auth yields an authority");
+        assert!(
+            !Arc::ptr_eq(&first, &third),
+            "distinct brokers must not share an authority",
+        );
+
+        // The bearer auth kind never constructs an authority.
+        let bearer_config = VmHttpOpenAiProxyConfig::new(
+            "https://api.openai.com/v1/",
+            SecretKey::new("openai-api-key").unwrap(),
+            VmHttpOpenAiProxyAuthKind::AuthorizationBearer,
+            std::time::Duration::from_secs(5),
+            1024,
+            1024,
+        )
+        .unwrap();
+        assert!(
+            OpenAiBackend::build_extras(&state, &bearer_config)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]

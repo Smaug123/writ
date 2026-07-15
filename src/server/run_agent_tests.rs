@@ -192,6 +192,7 @@ async fn run_agent_round_trip_signs_and_writes_note() {
         }),
         promote_runtime: base.promote_runtime,
         mirror_pins: base.mirror_pins,
+        chatgpt_oauth_authority: base.chatgpt_oauth_authority,
     });
 
     let prompt_text = "hello world from cat\n";
@@ -306,6 +307,7 @@ async fn run_agent_signs_non_zero_exit() {
         }),
         promote_runtime: base.promote_runtime,
         mirror_pins: base.mirror_pins,
+        chatgpt_oauth_authority: base.chatgpt_oauth_authority,
     });
 
     let resp = dispatch_message(
@@ -381,6 +383,7 @@ async fn run_agent_captures_stderr_in_envelope() {
         }),
         promote_runtime: base.promote_runtime,
         mirror_pins: base.mirror_pins,
+        chatgpt_oauth_authority: base.chatgpt_oauth_authority,
     });
 
     let output_ref = crate::core::NotesRef::try_new("refs/notes/writ/v1/agent-outputs").unwrap();
@@ -476,6 +479,7 @@ async fn run_agent_caps_stream_capture_records_truncation() {
         }),
         promote_runtime: base.promote_runtime,
         mirror_pins: base.mirror_pins,
+        chatgpt_oauth_authority: base.chatgpt_oauth_authority,
     });
 
     let output_ref = crate::core::NotesRef::try_new("refs/notes/writ/v1/agent-outputs").unwrap();
@@ -553,6 +557,7 @@ async fn run_agent_stamps_caller_supplied_session_id_into_signed_metadata() {
         }),
         promote_runtime: base.promote_runtime,
         mirror_pins: base.mirror_pins,
+        chatgpt_oauth_authority: base.chatgpt_oauth_authority,
     });
 
     let session_id = SessionId::new();
@@ -625,6 +630,7 @@ async fn run_agent_rejects_unknown_session_id() {
         }),
         promote_runtime: base.promote_runtime,
         mirror_pins: base.mirror_pins,
+        chatgpt_oauth_authority: base.chatgpt_oauth_authority,
     });
 
     let bogus = SessionId::new();
@@ -680,6 +686,7 @@ async fn run_agent_rejects_closed_session_id() {
         }),
         promote_runtime: base.promote_runtime,
         mirror_pins: base.mirror_pins,
+        chatgpt_oauth_authority: base.chatgpt_oauth_authority,
     });
 
     let session_id = SessionId::new();

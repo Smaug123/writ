@@ -371,11 +371,18 @@ pub(super) trait ProxyBackend: ProxyAudit + Sized {
         config: &Self::Config,
     ) -> Result<Vec<ProxyForwardHeader>, &'static str>;
 
-    /// Build the per-service `Extras` value at construction time from
-    /// the validated config. Returning `Err` aborts service
-    /// construction (currently only the OpenAI ChatGPT-OAuth path uses
-    /// this to build a refresh authority).
-    fn build_extras(config: &Self::Config) -> Result<Self::Extras, reqwest::Error>;
+    /// Build the per-service `Extras` value at construction time from the
+    /// validated config and the broker-wide state. Returning `Err` aborts
+    /// service construction. The OpenAI ChatGPT-OAuth path uses `broker_state`
+    /// to fetch (or lazily build, once) the *shared* refresh authority, so
+    /// every session observes the same in-memory token cache; Claude ignores
+    /// it and returns `()`.
+    fn build_extras<S>(
+        broker_state: &Arc<BrokerState<S>>,
+        config: &Self::Config,
+    ) -> Result<Self::Extras, reqwest::Error>
+    where
+        S: SecretStore + Send + Sync + 'static;
 
     /// Resolve the per-request upstream auth from the secret store and
     /// any per-backend extras (e.g. the ChatGPT-OAuth refresh
@@ -691,7 +698,7 @@ impl<B: ProxyBackend, S: SecretStore + Send + Sync + 'static> VmHttpProxyService
             .connect_timeout(config.timeout())
             .read_timeout(config.timeout())
             .build()?;
-        let extras = B::build_extras(&config)?;
+        let extras = B::build_extras(&broker_state, &config)?;
         Ok(Self {
             broker_state,
             config,

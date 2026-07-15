@@ -34,6 +34,7 @@ use crate::git_push_promote::{CommitError, PromoteRuntimeConfig};
 use crate::git_push_staging::{GitPushStagingStore, StagedEntry, StagingError};
 use crate::github::GitHubMinter;
 use crate::notes_repo::NotesRepo;
+use crate::openai_chatgpt_auth::ChatgptOauthAuthority;
 use crate::policy::{self, Decision, PolicyConfig};
 use crate::protocol::{
     ClientMessage, ReconcileOutcome, RejectionReason, ServerMessage, SignedRunMetadata,
@@ -97,6 +98,18 @@ pub struct BrokerState<S: SecretStore> {
     /// opportunistic eviction never deletes a mirror out from under a running
     /// `git clone --local`. Shared (cheap `Arc` clone) across every session.
     pub mirror_pins: MirrorPins,
+    /// The broker-wide ChatGPT-OAuth refresh authority, built lazily on the
+    /// first ChatGPT-authenticated OpenAI session and shared across every
+    /// session thereafter. Sharing is load-bearing: the in-memory token
+    /// cache and its pending-persist retry survive session teardown (a new
+    /// per-session authority would reload the spent durable token and force
+    /// a re-login), and concurrent sessions serialise their refreshes
+    /// through the authority's single mutex rather than each racing its own
+    /// refresh against the shared, rotation-invalidated refresh token. `None`
+    /// until first use, and forever when ChatGPT-OAuth is not configured.
+    /// See [`crate::openai_chatgpt_auth`] and
+    /// [`crate::vm_http`]'s OpenAI proxy `build_extras`.
+    pub chatgpt_oauth_authority: std::sync::Mutex<Option<Arc<ChatgptOauthAuthority>>>,
 }
 
 #[derive(Clone, Eq, PartialEq)]

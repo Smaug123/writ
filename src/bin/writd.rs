@@ -421,6 +421,7 @@ async fn run_host_daemon(
         run_agent_spawn,
         promote_runtime,
         mirror_pins: writ::vm_git_mirror_cache::MirrorPins::new(),
+        chatgpt_oauth_authority: Default::default(),
     });
 
     tracing::info!(
