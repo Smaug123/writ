@@ -100,6 +100,7 @@ pub(super) fn make_state(
         run_agent_spawn: None,
         promote_runtime: None,
         mirror_pins: crate::vm_git_mirror_cache::MirrorPins::new(),
+        chatgpt_oauth_authority: Default::default(),
     })
 }
 
@@ -151,6 +152,7 @@ pub(super) fn make_agent_registry_state_for_agents(
         run_agent_spawn: None,
         promote_runtime: None,
         mirror_pins: crate::vm_git_mirror_cache::MirrorPins::new(),
+        chatgpt_oauth_authority: Default::default(),
     })
 }
 

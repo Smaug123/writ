@@ -83,6 +83,7 @@ pub(super) fn make_state_with_audit(audit: AuditLog) -> Arc<BrokerState<InMemSto
         run_agent_spawn: None,
         promote_runtime: None,
         mirror_pins: crate::vm_git_mirror_cache::MirrorPins::new(),
+        chatgpt_oauth_authority: Default::default(),
     })
 }
 

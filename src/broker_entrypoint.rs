@@ -327,6 +327,7 @@ async fn prepare_broker(args: &BrokerArgs) -> Result<PreparedBroker, BrokerRunEr
         run_agent_spawn: None,
         promote_runtime,
         mirror_pins: MirrorPins::new(),
+        chatgpt_oauth_authority: Default::default(),
     });
 
     let listener = bind_vm_http_listener(spec.bind_addr, broker_port).await?;

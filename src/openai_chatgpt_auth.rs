@@ -21,11 +21,36 @@
 //! * On a *transient* refresh failure (network error, 5xx) the cache is
 //!   left intact and the request fails with
 //!   `chatgpt_oauth_refresh_transient`.
+//! * When a refresh *succeeds* upstream but the durable write back to the
+//!   secret store fails, the cache keeps the freshly rotated tokens (the
+//!   old refresh token is now spent, so reverting would strand the
+//!   session). The refreshing request surfaces the `SecretStore` error,
+//!   but the cache is flagged as ahead of durable storage and later
+//!   requests keep serving the valid cached token while retrying the
+//!   write until it lands. See [`ChatgptOauthAuthority::current_headers`]
+//!   for the full envelope.
+//! * Out-of-band changes are honored: each call re-reads the store and
+//!   reconciles the shared cache, so an operator rotating (`writ secret
+//!   put`) or revoking (delete) the credential takes effect without a
+//!   daemon restart, and every durable write is guarded so it will not
+//!   clobber or resurrect such a change. That guard is optimistic, not a
+//!   true atomic compare-and-set (the [`SecretStore`] abstraction has
+//!   none, and the keyring backend could not provide one): a change
+//!   landing in the sub-instruction window between the guard's read and
+//!   its write can still be lost, but the window no longer spans the
+//!   refresh network round-trip.
 //!
 //! Concurrency: a single [`tokio::sync::Mutex`] serialises all access to
 //! the cached bundle. That makes refreshes single-shot — concurrent
 //! requests queue behind the lock and observe the freshly refreshed
-//! token rather than each launching their own refresh.
+//! token rather than each launching their own refresh. For this to hold
+//! across *sessions*, one [`ChatgptOauthAuthority`] is shared broker-wide
+//! (built once, stored on `BrokerState`, handed to every VM session's
+//! OpenAI proxy) rather than reconstructed per session: otherwise
+//! concurrent sessions would each refresh the same rotation-invalidated
+//! token and all but one would hit `refresh_token_reused`, and a token
+//! cached (or left pending-persist) by one session would be lost when it
+//! ends.
 
 use std::sync::Arc;
 
@@ -384,12 +409,61 @@ pub struct ChatgptOauthAuthority {
     state: Mutex<ChatgptOauthState>,
 }
 
-#[derive(Debug)]
+// A single `ChatgptOauthState` lives behind the authority's mutex, and the
+// authority is one broker-wide instance — so the `Cold`/`Loaded` size
+// asymmetry the lint warns about wastes nothing, and boxing would only add
+// indirection on the hot path under the lock.
+//
+// `Debug` is hand-rolled (not derived): `durable_raw` holds the raw
+// `auth.json` blob — live access/refresh/id tokens and possibly
+// `OPENAI_API_KEY` — so a derived `{state:?}` would leak credentials that
+// `ChatgptAuthBundle`'s own redacting `Debug` is careful to hide.
+#[allow(clippy::large_enum_variant)]
 enum ChatgptOauthState {
     /// We have not yet attempted to load the bundle from the secret store.
     Cold,
     /// A bundle is cached.
-    Loaded(ChatgptAuthBundle),
+    ///
+    /// `durable_raw` is the exact serialized bytes we last synced with the
+    /// secret store (read on adoption, or written on a successful persist).
+    /// Each call compares it against the store's current value to detect
+    /// *out-of-band* changes — an operator rotating (`writ secret put`) or
+    /// revoking (delete) the credential — and reconciles the shared cache
+    /// accordingly. Because the authority is broker-wide and long-lived,
+    /// without this check a rotation would be ignored and a deletion would
+    /// not revoke access for the daemon's lifetime.
+    ///
+    /// `needs_persist` records that the cached bundle is *ahead* of durable
+    /// storage — a refresh rotated the tokens in memory but the subsequent
+    /// `put` failed (so `durable_raw` still holds the pre-refresh bytes).
+    /// While set, every [`ChatgptOauthAuthority::current_headers`] call
+    /// retries the durable write so the gap closes as soon as the store
+    /// recovers. A bundle freshly loaded from the store is in sync, so it
+    /// starts `false`.
+    Loaded {
+        bundle: ChatgptAuthBundle,
+        durable_raw: String,
+        needs_persist: bool,
+    },
+}
+
+impl std::fmt::Debug for ChatgptOauthState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ChatgptOauthState::Cold => f.write_str("Cold"),
+            ChatgptOauthState::Loaded {
+                bundle,
+                needs_persist,
+                ..
+            } => f
+                .debug_struct("Loaded")
+                // `bundle` uses `ChatgptAuthBundle`'s redacting `Debug`.
+                .field("bundle", bundle)
+                .field("durable_raw", &"<redacted>")
+                .field("needs_persist", needs_persist)
+                .finish(),
+        }
+    }
 }
 
 impl ChatgptOauthAuthority {
@@ -404,28 +478,55 @@ impl ChatgptOauthAuthority {
     ///
     /// Order of operations:
     ///   1. Acquire the state lock (refresh serialised).
-    ///   2. Load the bundle from the secret store on cold start.
-    ///   3. Inspect the cached `access_token` JWT. If it is stale (or
+    ///   2. Read the secret store and reconcile the (broker-wide, shared)
+    ///      cache with it: adopt an out-of-band rotation, and treat a
+    ///      deleted secret as revocation (`login_required`), never
+    ///      recreating it from cache.
+    ///   3. Flush any write left pending by an earlier refresh whose `put`
+    ///      failed, so durable storage is repaired before we risk another
+    ///      refresh.
+    ///   4. Inspect the cached `access_token` JWT. If it is stale (or
     ///      unparseable), call `/oauth/token`.
-    ///   4. Persist any successful refresh back to the secret store
+    ///   5. Persist any successful refresh back to the secret store
     ///      before returning the new headers.
+    ///
+    /// Persistence-failure envelope: a refresh mutates the in-memory
+    /// bundle with the freshly rotated tokens *before* it attempts the
+    /// durable `put`, and never reverts that mutation — the upstream has
+    /// already invalidated the old refresh token, so the new one is the
+    /// only usable credential and must not be discarded. If the `put`
+    /// fails, the refreshing call surfaces the error (`SecretStore`) but
+    /// the cache retains the new token and is flagged as ahead of durable
+    /// storage; subsequent calls keep serving the valid cached token and
+    /// retry the write until it lands. The only unrecoverable window is a
+    /// process restart between the failed write and a later successful
+    /// one, which loads the stale (spent) durable token and forces a
+    /// re-login.
     pub async fn current_headers<S: SecretStore + ?Sized>(
         &self,
         secret_store: &S,
     ) -> Result<ChatgptUpstreamHeaders, ChatgptOauthError> {
         let mut state = self.state.lock().await;
-        let bundle = match &mut *state {
-            ChatgptOauthState::Loaded(bundle) => bundle,
-            ChatgptOauthState::Cold => {
-                let loaded = load_bundle_from_secret_store(secret_store, &self.config.secret_key)?;
-                *state = ChatgptOauthState::Loaded(loaded);
-                let ChatgptOauthState::Loaded(bundle) = &mut *state else {
-                    unreachable!("just assigned Loaded above");
-                };
-                bundle
-            }
-        };
+        // Reconcile the shared, long-lived cache with the durable store so an
+        // out-of-band rotation is adopted and a deletion revokes access.
+        let current_raw = secret_store.get(&self.config.secret_key)?;
+        self.reconcile_with_store(&mut state, current_raw)?;
 
+        // If an earlier refresh left the cache ahead of durable storage,
+        // flush it now — before any refresh below, which could itself fail
+        // transiently and otherwise leave the spent refresh token durable.
+        // A still-failing write must not fail this request (the cached token
+        // is valid), but an out-of-band change observed here is adopted now
+        // rather than deferred — a deletion surfaces login-required.
+        self.retry_pending_persist(secret_store, &mut state)?;
+
+        // Judge freshness *after* the flush: `put` is synchronous and
+        // unbounded, so a barely-fresh token could cross into expiry while
+        // the flush blocks. Reading `now` here keeps the decision honest.
+        let bundle = match &*state {
+            ChatgptOauthState::Loaded { bundle, .. } => bundle,
+            ChatgptOauthState::Cold => unreachable!("loaded above"),
+        };
         let tokens = bundle
             .tokens
             .as_ref()
@@ -440,7 +541,7 @@ impl ChatgptOauthAuthority {
         }
 
         let bundle = match &*state {
-            ChatgptOauthState::Loaded(bundle) => bundle,
+            ChatgptOauthState::Loaded { bundle, .. } => bundle,
             ChatgptOauthState::Cold => unreachable!("loaded above"),
         };
         let tokens = bundle.tokens.as_ref().ok_or_else(|| {
@@ -464,12 +565,70 @@ impl ChatgptOauthAuthority {
         })
     }
 
+    /// Reconcile the cached state with the store's current raw value.
+    ///
+    /// * `None` — the secret is absent (never seeded, deleted out-of-band as
+    ///   a revocation, or removed by a prior permanent failure). Drop any
+    ///   cache, *including a pending persist*, so we never recreate a revoked
+    ///   secret, and surface `LoginRequired`.
+    /// * `Some(raw)` equal to the cached `durable_raw` — the store is
+    ///   unchanged since we synced; keep the cache (which may be legitimately
+    ///   ahead via `needs_persist`).
+    /// * `Some(raw)` equal to a *pending* cached bundle's serialization — our
+    ///   own write landed observably but its durability could not be confirmed
+    ///   (e.g. the file backend renamed the temp file but the parent-directory
+    ///   fsync failed, so `put` returned an error). This is not an out-of-band
+    ///   change: keep it pending and re-point `durable_raw` at it so the retry
+    ///   re-writes to confirm durability rather than trusting the unconfirmed
+    ///   bytes.
+    /// * `Some(raw)` differing (cold start, or an out-of-band rotation) —
+    ///   parse and adopt it as the authoritative bundle, discarding any stale
+    ///   cache and its pending persist.
+    fn reconcile_with_store(
+        &self,
+        state: &mut ChatgptOauthState,
+        current_raw: Option<String>,
+    ) -> Result<(), ChatgptOauthError> {
+        let Some(raw) = current_raw else {
+            *state = ChatgptOauthState::Cold;
+            return Err(ChatgptOauthError::LoginRequired);
+        };
+        if let ChatgptOauthState::Loaded {
+            bundle,
+            durable_raw,
+            needs_persist,
+        } = state
+        {
+            if *durable_raw == raw {
+                // Store unchanged since we synced; keep the cache as-is.
+                return Ok(());
+            }
+            // A pending write may have landed observably without being
+            // confirmed durable. If the store now holds exactly our pending
+            // bundle, this is our own unconfirmed write — not an out-of-band
+            // change — so keep it pending and re-point `durable_raw` at it,
+            // letting the retry re-write to confirm durability.
+            if *needs_persist && serde_json::to_string(&*bundle).is_ok_and(|s| s == raw) {
+                *durable_raw = raw;
+                return Ok(());
+            }
+        }
+        // Cold, or a genuine out-of-band change: adopt the store's value.
+        let bundle = parse_bundle(&raw)?;
+        *state = ChatgptOauthState::Loaded {
+            bundle,
+            durable_raw: raw,
+            needs_persist: false,
+        };
+        Ok(())
+    }
+
     async fn refresh<S: SecretStore + ?Sized>(
         &self,
         secret_store: &S,
         state: &mut ChatgptOauthState,
     ) -> Result<(), ChatgptOauthError> {
-        let ChatgptOauthState::Loaded(bundle) = state else {
+        let ChatgptOauthState::Loaded { bundle, .. } = state else {
             unreachable!("refresh requires Loaded state");
         };
         let refresh_token = bundle
@@ -502,13 +661,132 @@ impl ChatgptOauthAuthority {
             .await
             .map_err(|err| ChatgptOauthError::RefreshTransient(err.to_string()))?;
         let now = self.config.clock.now_rfc3339();
-        apply_refresh_response(bundle, &parsed, now)
-            .map_err(|err| ChatgptOauthError::BundleMalformed(err.to_string()))?;
-        let serialized = serde_json::to_string(&*bundle).map_err(|_| {
-            ChatgptOauthError::BundleMalformed("failed to serialize refreshed bundle".into())
-        })?;
-        secret_store.put(&self.config.secret_key, &serialized)?;
-        Ok(())
+
+        // Mutate the cache with the rotated tokens *before* persisting. The
+        // upstream has invalidated the old refresh token, so the new token
+        // is now the only usable credential — we must not lose it, even if
+        // the durable write below fails.
+        {
+            let ChatgptOauthState::Loaded { bundle, .. } = state else {
+                unreachable!("refresh requires Loaded state");
+            };
+            apply_refresh_response(bundle, &parsed, now)
+                .map_err(|err| ChatgptOauthError::BundleMalformed(err.to_string()))?;
+        }
+        // Persist, guarding against an operator rotating/revoking the secret
+        // during the network round-trip above.
+        let outcome = {
+            let ChatgptOauthState::Loaded {
+                bundle,
+                durable_raw,
+                ..
+            } = &*state
+            else {
+                unreachable!("refresh requires Loaded state");
+            };
+            persist_if_unchanged(secret_store, &self.config.secret_key, bundle, durable_raw)
+        };
+        match outcome {
+            Ok(PersistOutcome::Written(serialized)) => {
+                // Durable storage now holds exactly these bytes; record them
+                // so the next reconcile does not mistake our own write for an
+                // out-of-band change.
+                let ChatgptOauthState::Loaded {
+                    durable_raw,
+                    needs_persist,
+                    ..
+                } = state
+                else {
+                    unreachable!("refresh requires Loaded state");
+                };
+                *durable_raw = serialized;
+                *needs_persist = false;
+                Ok(())
+            }
+            Ok(PersistOutcome::Diverged(_observed)) => {
+                // The operator changed the secret out-of-band while we
+                // refreshed. Their action wins: drop our freshly rotated
+                // bundle rather than clobber (or resurrect) their change, and
+                // fail closed. We deliberately do *not* adopt-and-serve the
+                // observed value here: `current_headers` already made its
+                // freshness decision before calling us, so serving a replaced
+                // bundle now would bypass that check and could ship a stale or
+                // unparsable token. The next call reconciles from a clean
+                // state — adopting a replacement (with a fresh freshness
+                // check) or surfacing login-required on a deletion.
+                *state = ChatgptOauthState::Cold;
+                Err(ChatgptOauthError::LoginRequired)
+            }
+            Err(err) => {
+                // The cache holds the freshly rotated tokens; flag it as
+                // ahead of durable storage so a later call retries the
+                // write, and surface the failure now.
+                let ChatgptOauthState::Loaded { needs_persist, .. } = state else {
+                    unreachable!("refresh requires Loaded state");
+                };
+                *needs_persist = true;
+                Err(err)
+            }
+        }
+    }
+
+    /// Retry a durable write that a prior [`Self::refresh`] left pending.
+    /// A no-op unless the cache is flagged as ahead of durable storage.
+    ///
+    /// A store I/O failure is swallowed (logged): the cached token is valid,
+    /// so the request proceeds and the flag stays set for the next attempt.
+    /// But if the guarded write observes an *out-of-band* change (the store
+    /// no longer holds what we synced), we adopt it immediately via
+    /// [`Self::reconcile_with_store`] rather than serving the stale cache for
+    /// this request — surfacing login-required on a deletion, or the
+    /// operator's replacement for the rest of the call.
+    fn retry_pending_persist<S: SecretStore + ?Sized>(
+        &self,
+        secret_store: &S,
+        state: &mut ChatgptOauthState,
+    ) -> Result<(), ChatgptOauthError> {
+        let outcome = {
+            let ChatgptOauthState::Loaded {
+                bundle,
+                durable_raw,
+                needs_persist,
+            } = &*state
+            else {
+                return Ok(());
+            };
+            if !*needs_persist {
+                return Ok(());
+            }
+            persist_if_unchanged(secret_store, &self.config.secret_key, bundle, durable_raw)
+        };
+        match outcome {
+            Ok(PersistOutcome::Written(serialized)) => {
+                let ChatgptOauthState::Loaded {
+                    durable_raw,
+                    needs_persist,
+                    ..
+                } = state
+                else {
+                    unreachable!("was Loaded above");
+                };
+                *durable_raw = serialized;
+                *needs_persist = false;
+                Ok(())
+            }
+            Ok(PersistOutcome::Diverged(observed)) => {
+                // We observed an out-of-band change while flushing; adopt it
+                // now instead of serving the stale cache this call.
+                tracing::warn!("chatgpt oauth durable secret changed out-of-band; reconciling",);
+                self.reconcile_with_store(state, observed)
+            }
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "chatgpt oauth durable persist still failing; serving valid cached token",
+                );
+                Ok(())
+            }
+        }
     }
 
     fn handle_refresh_failure<S: SecretStore + ?Sized>(
@@ -526,7 +804,23 @@ impl ChatgptOauthAuthority {
         match kind {
             RefreshOutcomeKind::Success => unreachable!("non-success branch"),
             RefreshOutcomeKind::LoginRequired => {
-                secret_store.delete(&self.config.secret_key)?;
+                // The refresh token is permanently dead, so delete the bundle
+                // and force re-login — but only if the store still holds the
+                // very bundle we tried to refresh. If an operator replaced it
+                // out-of-band during the round-trip, upstream's 401 is about
+                // the *old* token; deleting would erase the operator's new
+                // credential. Guard the delete against `durable_raw` (same
+                // optimistic check as the write path), and always reset to
+                // `Cold` so the next call reconciles from the store.
+                let durable_raw = match &*state {
+                    ChatgptOauthState::Loaded { durable_raw, .. } => durable_raw.clone(),
+                    ChatgptOauthState::Cold => String::new(),
+                };
+                if secret_store.get(&self.config.secret_key)?.as_deref()
+                    == Some(durable_raw.as_str())
+                {
+                    secret_store.delete(&self.config.secret_key)?;
+                }
                 *state = ChatgptOauthState::Cold;
                 Err(ChatgptOauthError::LoginRequired)
             }
@@ -538,14 +832,53 @@ impl ChatgptOauthAuthority {
     }
 }
 
-fn load_bundle_from_secret_store<S: SecretStore + ?Sized>(
+/// Outcome of a guarded persist. `Written` carries the exact bytes stored so
+/// the caller can record them as the durable fingerprint; `Diverged` means
+/// the store no longer held the value we expected to replace (so nothing was
+/// written) and carries the value we *did* observe, so the caller can adopt
+/// the operator's change without a second read.
+enum PersistOutcome {
+    Written(String),
+    Diverged(Option<String>),
+}
+
+/// Serialize `bundle` and write it to the secret store, but *only* if the
+/// store still holds `expected_durable` (the bytes we last synced).
+///
+/// This is optimistic-concurrency, not a true compare-and-set — the
+/// `SecretStore` trait exposes no atomic CAS (and the keyring backend could
+/// not provide one). But by re-reading immediately before the write it
+/// collapses the read→write window to two consecutive calls with no `await`
+/// between, closing the wide window a token refresh's network round-trip
+/// would otherwise leave open. If an operator rotated or revoked the secret
+/// out-of-band in the interim, the store no longer matches and we return
+/// `Diverged` rather than clobbering their change (or resurrecting a deleted
+/// secret). A serialization failure is `BundleMalformed`; a store I/O failure
+/// propagates as `SecretStore`.
+fn persist_if_unchanged<S: SecretStore + ?Sized>(
     secret_store: &S,
     secret_key: &SecretKey,
-) -> Result<ChatgptAuthBundle, ChatgptOauthError> {
-    let raw = secret_store
-        .get(secret_key)?
-        .ok_or(ChatgptOauthError::LoginRequired)?;
-    let bundle: ChatgptAuthBundle = serde_json::from_str(&raw).map_err(|err| {
+    bundle: &ChatgptAuthBundle,
+    expected_durable: &str,
+) -> Result<PersistOutcome, ChatgptOauthError> {
+    let observed = secret_store.get(secret_key)?;
+    match &observed {
+        Some(current) if current == expected_durable => {
+            let serialized = serde_json::to_string(bundle).map_err(|_| {
+                ChatgptOauthError::BundleMalformed("failed to serialize refreshed bundle".into())
+            })?;
+            secret_store.put(secret_key, &serialized)?;
+            Ok(PersistOutcome::Written(serialized))
+        }
+        _ => Ok(PersistOutcome::Diverged(observed)),
+    }
+}
+
+/// Parse and validate a raw secret-store bundle. The caller performs the
+/// `get` itself so the raw bytes can double as the reconciliation
+/// fingerprint (`durable_raw`).
+fn parse_bundle(raw: &str) -> Result<ChatgptAuthBundle, ChatgptOauthError> {
+    let bundle: ChatgptAuthBundle = serde_json::from_str(raw).map_err(|err| {
         // serde_json's Display includes the offending input fragment for some
         // failures (e.g. "unknown variant `<value>`"), and the bundle holds
         // tokens — surface only the position so logs cannot leak fragments.

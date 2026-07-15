@@ -236,6 +236,7 @@ fn build_state(
         run_agent_spawn: None,
         promote_runtime: Some(Arc::new(promote_runtime)),
         mirror_pins: crate::vm_git_mirror_cache::MirrorPins::new(),
+        chatgpt_oauth_authority: Default::default(),
     })
 }
 

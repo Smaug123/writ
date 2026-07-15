@@ -3,6 +3,7 @@
 //! configured upstream), injecting host-side auth and stripping guest auth.
 
 use std::borrow::Cow;
+use std::sync::Arc;
 
 use serde::Deserialize;
 
@@ -10,6 +11,7 @@ use crate::audit::{
     AuditError, AuditLog, ClaudeProxyAuditRoute, ClaudeProxyOutcomeRecord, ClaudeProxyRequestRecord,
 };
 use crate::secret::{SecretKey, SecretStore};
+use crate::server::BrokerState;
 
 use super::proxy_common::{
     ClaudeBackend, ProxyBackend, ProxyBackendConfig, ProxyFetch, ProxyForwardHeader,
@@ -305,7 +307,13 @@ impl ProxyBackend for ClaudeBackend {
         )
     }
 
-    fn build_extras(_config: &VmHttpClaudeProxyConfig) -> Result<(), reqwest::Error> {
+    fn build_extras<S>(
+        _broker_state: &Arc<BrokerState<S>>,
+        _config: &VmHttpClaudeProxyConfig,
+    ) -> Result<(), reqwest::Error>
+    where
+        S: SecretStore + Send + Sync + 'static,
+    {
         Ok(())
     }
 
