@@ -176,8 +176,11 @@ pub struct PreparedApprove {
 impl PreparedApprove {
     /// Publish: re-verify the lease one last time, then issue the
     /// single branch-moving call of the whole pipeline
-    /// (`PATCH /git/refs/heads/<branch>`) — or nothing at all if the
-    /// branch already points at the staged tip.
+    /// (`PATCH /git/refs/heads/<branch>`) — or, on the noop path, no
+    /// branch-moving call at all, once the lease `GET` has confirmed
+    /// the branch still points at the staged tip. Either way the lease
+    /// re-verification runs: recording a noop as approved asserts the
+    /// branch is at that tip just as a PATCH asserts it moved there.
     ///
     /// `authority` is the audit log's proof that this attempt is
     /// durably recorded as `Uncertain`, i.e. that a crash from here on
@@ -1334,11 +1337,13 @@ mod tests {
     }
 
     /// Noop path: bundle's tip equals the lease anchor, so the
-    /// planner returns `AlreadyAtExpected`. The orchestrator must not
-    /// hit *any* GitHub endpoint (no lease GET, no upload, no PATCH);
+    /// planner returns `AlreadyAtExpected`. No upload and no PATCH are
+    /// issued (`expect(0)` on POST/PATCH), but the commit half still
+    /// issues the single lease-check `GET` before recording the noop
+    /// as approved — the branch is confirmed still at the anchor, so
     /// the returned `new_app_tip` is the lease anchor itself.
     #[tokio::test]
-    async fn run_approve_returns_noop_without_http_when_bundle_tip_equals_lease() {
+    async fn run_approve_returns_noop_after_lease_check_when_bundle_tip_equals_lease() {
         if maybe_git().is_none() {
             eprintln!("skipping: `git` not on PATH");
             return;
@@ -1349,8 +1354,11 @@ mod tests {
 
         let server = MockServer::start().await;
         Mock::given(method("GET"))
-            .respond_with(ResponseTemplate::new(500))
-            .expect(0)
+            .and(path("/repos/owner/name/git/ref/heads/main"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(ref_response_body("main", &child)),
+            )
+            .expect(1)
             .mount(&server)
             .await;
         Mock::given(method("POST"))
@@ -1379,6 +1387,62 @@ mod tests {
         .expect("noop approve must commit");
 
         assert_eq!(outcome.new_app_tip(), &child);
+    }
+
+    /// The noop's lease check is load-bearing: bundle tip equals the
+    /// lease anchor, so the planner returns `AlreadyAtExpected`, but a
+    /// rival has moved the branch away from the anchor since the
+    /// receipt was staged. Recording "approved at <anchor>" would then
+    /// be a false branch-state claim, so the commit half must refuse
+    /// with `FinalLeaseMoved` (provably no mutation — `expect(0)` on
+    /// PATCH) rather than resolve the push as approved.
+    #[tokio::test]
+    async fn run_approve_noop_refuses_when_branch_moved_away_from_lease() {
+        if maybe_git().is_none() {
+            eprintln!("skipping: `git` not on PATH");
+            return;
+        }
+        let (tmp, staging_path, _parent, child) = build_real_staging_repo();
+        let staging = StagingRepo::from_path_for_test(staging_path);
+        let runtime = runtime_pointed_at(tmp.path());
+
+        let server = MockServer::start().await;
+        let moved = sample_object_id('9');
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/name/git/ref/heads/main"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(ref_response_body("main", &moved)),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let branch = GitBranchName::new("main").unwrap();
+        let err = prepare_and_commit(
+            &staging,
+            &runtime,
+            &server.uri(),
+            &sample_repo().as_repo_ref().clone(),
+            &branch,
+            &child,
+            &child,
+        )
+        .await
+        .expect("noop approve must prepare")
+        .expect_err("a moved branch must refuse the noop resolution");
+
+        match err {
+            CommitError::FinalLeaseMoved { expected, actual } => {
+                assert_eq!(expected, child);
+                assert_eq!(actual, moved);
+            }
+            other => panic!("expected FinalLeaseMoved, got {other:?}"),
+        }
     }
 
     /// `PATCH /git/refs/heads/<branch>` returns non-2xx after a

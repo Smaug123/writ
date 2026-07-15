@@ -338,6 +338,21 @@ pub enum AgentVmDaemonError {
         path: PathBuf,
         source: std::io::Error,
     },
+    #[error(transparent)]
+    BrokerMaterialRemove(#[from] BrokerMaterialRemoveError),
+}
+
+/// Removing a stopped session's per-session broker material dir (copied secrets
+/// included) failed. Surfaced — not swallowed — so the caller keeps the persisted
+/// state record: that record is the only reconciliation obligation, and dropping
+/// it would strand the copied secrets on disk with nothing left to drive a retry.
+/// The daemon owns the material-path policy, so this is a daemon-layer error
+/// rather than an [`AgentVmSessionManagerError`].
+#[derive(Debug, thiserror::Error)]
+#[error("removing broker VM material dir {path} failed: {source}")]
+pub struct BrokerMaterialRemoveError {
+    path: PathBuf,
+    source: std::io::Error,
 }
 
 /// Report from [`AgentVmDaemon::reconcile_persisted_sessions`].
@@ -363,9 +378,9 @@ pub struct AgentVmReconcileFailure {
 
 /// Which step of the per-session reconcile sequence reported the failure.
 ///
-/// Ordering is `Cleanup` → `AuditClose` → `StateRemove`. A failure short-
-/// circuits the remaining stages so the state record is preserved for retry
-/// on the next boot.
+/// Ordering is `Cleanup` → `AuditClose` → `MaterialRemove` → `StateRemove`. A
+/// failure short-circuits the remaining stages so the state record is preserved
+/// for retry on the next boot.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum AgentVmReconcileStage {
     /// Tear down the VM, firewall anchors, and network via the persisted
@@ -374,6 +389,13 @@ pub enum AgentVmReconcileStage {
     /// Close the audit-DB session row. Idempotent against already-closed
     /// rows: the `UPDATE` only matches `closed_at IS NULL`.
     AuditClose,
+    /// Remove the per-session broker material dir (copied secrets included)
+    /// now that teardown has confirmed the broker VM — which mounts it
+    /// read-only — is gone. Ordered before `StateRemove` so a removal failure
+    /// keeps the state record, leaving the reconciliation obligation for the
+    /// next boot rather than stranding the copied secrets on disk. A no-op
+    /// (absence-based) for host placement, whose material dir never existed.
+    MaterialRemove,
     /// Remove the persisted state record so the subnet index and per-session
     /// names are released for reuse.
     StateRemove,
@@ -385,6 +407,8 @@ pub enum AgentVmReconcileStageError {
     Manager(#[from] AgentVmSessionManagerError),
     #[error(transparent)]
     Audit(#[from] AuditError),
+    #[error(transparent)]
+    Material(#[from] BrokerMaterialRemoveError),
     #[error("reconcile worker task failed: {0}")]
     Join(#[from] tokio::task::JoinError),
 }
@@ -594,6 +618,7 @@ impl AgentVmReconcileStage {
         match self {
             Self::Cleanup => "cleanup",
             Self::AuditClose => "audit_close",
+            Self::MaterialRemove => "material_remove",
             Self::StateRemove => "state_remove",
         }
     }
@@ -1194,37 +1219,20 @@ impl AgentVmDaemon {
     /// blocking thread. The nested result preserves the join-vs-manager
     /// distinction the reconcile sweep maps onto its per-stage error; the
     /// stop/cleanup paths flatten it with `??`.
+    ///
+    /// Teardown only. Removing the per-session material dir (copied secrets) is
+    /// a separate [`Self::spawn_remove_broker_material`] step the callers run
+    /// once this confirms the broker VM — which mounts the material read-only —
+    /// is gone, so its failure can keep the state record for retry instead of
+    /// being swallowed here.
     async fn spawn_cleanup_session(
         &self,
         session_id: SessionId,
     ) -> Result<Result<(), AgentVmSessionManagerError>, tokio::task::JoinError> {
         let store = self.config.lifecycle.state_store.clone();
         let tools = self.config.lifecycle.tools.clone();
-        let broker_material_root = self.broker_material_root();
         tokio::task::spawn_blocking(move || {
-            let result = cleanup_managed_agent_vm_session(&store, session_id, tools);
-            // Once the broker VM (which mounts the material read-only) is confirmed
-            // torn down, remove this session's per-session material dir — copied
-            // secrets included. Best-effort and only on a successful teardown: a
-            // removal failure is logged, not fatal (the cloud teardown above is the
-            // surfaced result, and the dir is a 0700 daemon-private path), and on a
-            // failed teardown the dir is left for the retry rather than pulled out
-            // from under a still-running broker VM. A no-op for host placement,
-            // whose material dir never existed.
-            if result.is_ok() {
-                let session_dir = BrokerVmSessionPaths::new(&broker_material_root, session_id)
-                    .session_dir()
-                    .to_path_buf();
-                if let Err(err) = remove_dir_all_if_present(&session_dir) {
-                    tracing::warn!(
-                        %session_id,
-                        path = %session_dir.display(),
-                        error = %err,
-                        "failed to remove broker VM material directory",
-                    );
-                }
-            }
-            result
+            cleanup_managed_agent_vm_session(&store, session_id, tools)
         })
         .await
     }
@@ -1240,8 +1248,9 @@ impl AgentVmDaemon {
 
     /// The root under which each session's broker-VM host material lives
     /// (`<state_dir>/broker-vm/<session_id>/…`). Derived from the state directory
-    /// so the start arm (which writes the material) and teardown (which removes it)
-    /// agree without extra configuration.
+    /// so the start arm (which writes the material) and stop/reconcile (which
+    /// remove it via [`Self::spawn_remove_broker_material`]) agree without extra
+    /// configuration.
     fn broker_material_root(&self) -> PathBuf {
         self.config.lifecycle.state_store.dir().join("broker-vm")
     }
@@ -1286,15 +1295,44 @@ impl AgentVmDaemon {
         .await
     }
 
+    /// Remove this session's per-session broker material dir — copied secrets
+    /// included — on a blocking thread. Nested result as in
+    /// [`Self::spawn_cleanup_session`].
+    ///
+    /// MUST run only after teardown has confirmed the broker VM (which mounts
+    /// the material read-only) is gone, and MUST precede
+    /// [`Self::spawn_remove_session_state`]: a removal failure is surfaced, not
+    /// swallowed, so the caller keeps the persisted state record. That record is
+    /// the sole reconciliation obligation, so dropping it while the copied
+    /// secrets remain would strand them on disk with nothing to drive a retry.
+    /// Absence-based (a missing dir is a success), so it is a no-op for host
+    /// placement — whose material dir never existed — and idempotent on retry.
+    async fn spawn_remove_broker_material(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Result<(), BrokerMaterialRemoveError>, tokio::task::JoinError> {
+        let session_dir = BrokerVmSessionPaths::new(&self.broker_material_root(), session_id)
+            .session_dir()
+            .to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            remove_dir_all_if_present(&session_dir).map_err(|source| BrokerMaterialRemoveError {
+                path: session_dir,
+                source,
+            })
+        })
+        .await
+    }
+
     async fn stop_session_locked<S: SecretStore + Send + Sync + 'static>(
         &self,
         state: &Arc<BrokerState<S>>,
         session_id: SessionId,
     ) -> Result<(), AgentVmDaemonError> {
-        // Drain+stop the broker log tail *before* cleanup — a successful
-        // `spawn_cleanup_session` removes the per-session material dir that holds
-        // the log file, so a drain afterwards would find nothing and lose the tail.
-        // Remove first so the lock is not held across the drain await.
+        // Drain+stop the broker log tail *before* cleanup — a successful stop
+        // removes the per-session material dir that holds the log file (the
+        // `spawn_remove_broker_material` step below), so a drain afterwards would
+        // find nothing and lose the tail. Remove first so the lock is not held
+        // across the drain await.
         let forwarder = self.vm_broker_attached.lock().await.remove(&session_id);
         let had_forwarder = forwarder.is_some();
         if let Some(forwarder) = forwarder {
@@ -1319,6 +1357,10 @@ impl AgentVmDaemon {
 
         match (audit_close, http_shutdown) {
             (Ok(()), Ok(())) => {
+                // Remove the copied secrets before dropping the state record, so a
+                // removal failure keeps the record (and thus the reconciliation
+                // obligation) rather than stranding the secrets on disk.
+                self.spawn_remove_broker_material(session_id).await??;
                 self.spawn_remove_session_state(session_id).await??;
                 Ok(())
             }
@@ -1486,10 +1528,10 @@ impl AgentVmDaemon {
         &self,
         session_id: SessionId,
     ) -> Result<(), AgentVmDaemonError> {
-        // Drain the log tail *before* cleanup removes the material dir holding the
-        // log file. A fully-started (inserted) session drains here; a start that
-        // failed before insertion drained its own local forwarder already, so this
-        // is then a no-op.
+        // Drain the log tail *before* the material dir holding the log file is
+        // removed (the `spawn_remove_broker_material` step below). A fully-started
+        // (inserted) session drains here; a start that failed before insertion
+        // drained its own local forwarder already, so this is then a no-op.
         let forwarder = self.vm_broker_attached.lock().await.remove(&session_id);
         let had_forwarder = forwarder.is_some();
         if let Some(forwarder) = forwarder {
@@ -1508,13 +1550,17 @@ impl AgentVmDaemon {
             running.shutdown().await?;
         }
 
+        // Remove the copied secrets before dropping the state record: a removal
+        // failure keeps the record so the reconciliation obligation survives.
+        self.spawn_remove_broker_material(session_id).await??;
         self.spawn_remove_session_state(session_id).await??;
         Ok(())
     }
 
     /// Treat every persisted session as a cleanup obligation and drive it to
     /// completion: tear down the VM/firewall/network via the persisted facts,
-    /// close the audit row, then remove the state record.
+    /// close the audit row, remove the per-session material dir (copied secrets),
+    /// then remove the state record.
     ///
     /// MUST be called before [`crate::server::run_with_agent_vm`] begins
     /// accepting connections. Subnet selection in `start_session` is driven
@@ -1565,6 +1611,15 @@ impl AgentVmDaemon {
 
         if let Err(err) = audit.close_session(session_id, UnixMillis::now()) {
             return Err((AgentVmReconcileStage::AuditClose, err.into()));
+        }
+
+        // Remove the copied secrets before the state record: a failure here keeps
+        // the record so this session is retried on the next boot rather than the
+        // secrets being stranded with no reconciliation obligation left.
+        match self.spawn_remove_broker_material(session_id).await {
+            Err(join) => return Err((AgentVmReconcileStage::MaterialRemove, join.into())),
+            Ok(Err(err)) => return Err((AgentVmReconcileStage::MaterialRemove, err.into())),
+            Ok(Ok(())) => {}
         }
 
         match self.spawn_remove_session_state(session_id).await {

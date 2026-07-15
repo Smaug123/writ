@@ -22,9 +22,12 @@
 //! actually move a branch, rather than the whole pipeline. See
 //! [`crate::git_push_approve`].
 //!
-//! The [`FastForwardPlan::AlreadyAtExpected`] arm short-circuits both
-//! steps: nothing new was pushed, so there is nothing to upload and
-//! nothing to re-point.
+//! The [`FastForwardPlan::AlreadyAtExpected`] arm short-circuits the
+//! upload and the re-point: nothing new was pushed, so there is
+//! nothing to upload and no ref to move. It does *not* short-circuit
+//! the lease check — recording a noop as approved is still a claim
+//! that the branch is at the staged tip, so [`commit_prepared_promotion`]
+//! confirms that with one `GET` before the caller records it.
 //!
 //! App-identity commit signing is plumbed straight through to the
 //! walker: when `signing_key` is `Some(&key)`, every commit
@@ -147,8 +150,10 @@ impl PromoteRuntimeConfig {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ExecuteOutcome {
     /// The plan was [`FastForwardPlan::AlreadyAtExpected`]: nothing
-    /// was uploaded and no ref update was issued because the branch
-    /// on GitHub already points at `tip`.
+    /// was uploaded and no ref update was issued. The branch on GitHub
+    /// was confirmed (by [`commit_prepared_promotion`]'s lease `GET`)
+    /// to still point at `tip`, so recording this outcome as approved
+    /// is a claim the broker verified rather than assumed.
     Noop { tip: GitObjectId },
     /// The plan was [`FastForwardPlan::Replay`]: the walker uploaded
     /// every commit in the plan (plus its tree and blob closure) and
@@ -177,8 +182,12 @@ pub enum ExecuteOutcome {
 /// calling it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PreparedPromotion {
-    /// The plan was [`FastForwardPlan::AlreadyAtExpected`]: the branch
-    /// already points at `tip`. Committing this issues no HTTP at all.
+    /// The plan was [`FastForwardPlan::AlreadyAtExpected`]: the staged
+    /// tip equals the lease anchor, so no objects were uploaded and no
+    /// ref update is owed. Committing this issues a single
+    /// lease-verifying `GET` — and no mutation — because recording the
+    /// noop as approved asserts the branch is at `tip`, an assertion
+    /// that must be checked, not assumed. See [`commit_prepared_promotion`].
     Noop { tip: GitObjectId },
     /// Objects are uploaded and the lease was still intact as of the
     /// post-walk recheck. The remaining steps are a final lease
@@ -209,23 +218,29 @@ pub struct UpdateRefError(#[source] pub GitDataError);
 
 /// How [`commit_prepared_promotion`] can fail.
 ///
-/// The two `FinalLease*` variants fire *before* the PATCH is issued —
+/// The two `FinalLease*` variants fire *before* any ref-moving call —
 /// GitHub's branch is provably untouched by this attempt, so the
 /// caller resolves them exactly like a prepare-phase failure
-/// (retryable, no quarantine). Only [`CommitError::UpdateRef`] wraps a
-/// sent PATCH; it is the sole variant that owes the audit log a
-/// "the PATCH may have landed" resolution.
+/// (retryable, no quarantine). They arise on both committed shapes:
+/// the RefUpdate arm checks the lease before its PATCH, and the Noop
+/// arm checks it before returning success (a noop records no mutation
+/// but still asserts the branch is at the staged tip). Only
+/// [`CommitError::UpdateRef`] wraps a sent PATCH; it is the sole
+/// variant that owes the audit log a "the PATCH may have landed"
+/// resolution, and it can only come from the RefUpdate arm.
 #[derive(Debug, thiserror::Error)]
 pub enum CommitError {
-    /// The last-second `GET /git/ref/heads/<branch>` failed. No PATCH
-    /// was issued.
+    /// The last-second `GET /git/ref/heads/<branch>` failed. No ref
+    /// update was issued.
     #[error("final branch head lookup before publish failed: {0}")]
     FinalLeaseLookup(GitDataError),
-    /// The last-second lease check found the branch no longer at
-    /// `expected_remote_head` — another actor moved (or rewound) it
-    /// after the post-walk check. No PATCH was issued: publishing
-    /// would have been a `force=false` fast-forward onto a baseline
-    /// the approval never covered.
+    /// The last-second lease check found the branch no longer at the
+    /// anchor the receipt was authorised against — another actor moved
+    /// (or rewound) it since. No ref update was issued. For the
+    /// RefUpdate arm, publishing would have been a `force=false`
+    /// fast-forward onto a baseline the approval never covered; for the
+    /// Noop arm, recording the push as approved would have asserted a
+    /// branch state (`expected`) that no longer holds.
     #[error(
         "branch head on GitHub is {actual}, but the staged push was authorised against \
          expected_remote_head {expected} — branch moved after prepare; publish refused"
@@ -315,8 +330,10 @@ pub enum ExecuteError {
 /// Two return shapes, parallel to the two arms of [`FastForwardPlan`]:
 ///
 /// * `AlreadyAtExpected { tip }` → returns [`PreparedPromotion::Noop`]
-///   immediately. No HTTP call is issued. The audit record should
-///   note the noop and the staged push's resolution.
+///   immediately. No HTTP call is issued *here* — but the lease is
+///   still enforced later, by [`commit_prepared_promotion`], before
+///   the noop is recorded as approved (see below). The audit record
+///   should note the noop and the staged push's resolution.
 /// * `Replay { commits, seed }` → drives [`replay_commits`] with
 ///   `commits`, `seed`, and `trailers`, and returns
 ///   [`PreparedPromotion::RefUpdate`] carrying the final App-side SHA
@@ -364,10 +381,17 @@ pub enum ExecuteError {
 /// `expected_remote_head`, as a silent stale-baseline publish — the
 /// smallest TOCTOU window the GitHub REST API admits.
 ///
-/// The `AlreadyAtExpected` arm skips both checks because it issues
-/// no GitHub-mutating call; the audit record speaks for what the
-/// orchestrator did (nothing), which remains correct regardless
-/// of how the branch has since moved.
+/// The `AlreadyAtExpected` arm skips the pre-walk and post-walk checks
+/// because it uploads nothing — there is no bandwidth to save and no
+/// upload window to bracket. It does **not** skip the third check:
+/// [`commit_prepared_promotion`]'s `Noop` arm still issues the
+/// lease-verifying `GET` before the caller records the resolution.
+/// The noop makes no *mutating* call, but recording it as approved
+/// asserts `new_app_tip = tip` is the branch's state — an assertion
+/// that is false if a rival moved the branch away from `tip` after the
+/// receipt was staged, so it must be verified against GitHub, not
+/// assumed from the plan. Skipping it would let a noop record a branch
+/// state that never held.
 ///
 /// `trailers` is forwarded to the walker untouched.
 ///
@@ -457,12 +481,18 @@ pub async fn prepare_fast_forward_plan<S: GitObjectSource>(
 /// [`prepare_fast_forward_plan`]: point the branch at the
 /// [`PreparedPromotion`].
 ///
-/// [`PreparedPromotion::Noop`] issues no HTTP — the branch already
-/// points at the tip — so it cannot fail.
-/// [`PreparedPromotion::RefUpdate`] re-verifies the lease with one
-/// last `GET /git/ref/heads/<branch>` and then issues exactly one
+/// Both arms re-verify the lease with one last
+/// `GET /git/ref/heads/<branch>` before doing anything else.
+/// [`PreparedPromotion::RefUpdate`] then issues exactly one
 /// `PATCH /git/refs/heads/<branch>`, the only GitHub call in the whole
 /// promote pipeline that can move the branch.
+/// [`PreparedPromotion::Noop`] issues no mutation — but it is *not*
+/// free of the lease check: the branch already "should" point at the
+/// staged tip, and recording the noop as approved asserts exactly
+/// that, so committing it confirms the branch is still at `tip` and
+/// refuses (`FinalLeaseMoved`) if a rival moved it. Both arms can
+/// therefore fail with the same `FinalLease*` variants; only the
+/// RefUpdate arm can additionally fail past the PATCH.
 ///
 /// The final GET is load-bearing, not paranoia. `update_ref` runs with
 /// `force=false`, but GitHub's fast-forward check only demands that the
@@ -472,6 +502,8 @@ pub async fn prepare_fast_forward_plan<S: GitObjectSource>(
 /// spend arbitrary time between prepare and commit: reaping the object
 /// source, writing the `Uncertain` row), the PATCH would still succeed
 /// and silently publish against a baseline the approval never covered.
+/// (The noop arm has no PATCH, but the symmetric hazard is recording an
+/// approval whose asserted branch tip a rival has since replaced.)
 /// Rechecking *inside* commit pins the race window to a single
 /// GET→PATCH round-trip regardless of what the caller does in between;
 /// closing even that residue needs server-side CAS, which the REST API
@@ -490,7 +522,29 @@ pub async fn commit_prepared_promotion(
     prepared: PreparedPromotion,
 ) -> Result<ExecuteOutcome, CommitError> {
     match prepared {
-        PreparedPromotion::Noop { tip } => Ok(ExecuteOutcome::Noop { tip }),
+        PreparedPromotion::Noop { tip } => {
+            // A noop issues no ref update, but recording it as approved
+            // is still a *claim* that the branch is at `tip` (== the
+            // `expected_remote_head` the receipt was staged against —
+            // the planner guarantees that equality for the
+            // `AlreadyAtExpected` arm). Verify the lease before the
+            // caller writes that claim: if a rival moved the branch
+            // after staging, refuse rather than record a branch state
+            // that never held. Provably no-mutation — the same
+            // pre-PATCH refusal shape the RefUpdate arm gives, so the
+            // caller resolves it identically (retryable, no quarantine).
+            let actual = client
+                .get_branch_head(repo, branch)
+                .await
+                .map_err(CommitError::FinalLeaseLookup)?;
+            if actual != tip {
+                return Err(CommitError::FinalLeaseMoved {
+                    expected: tip,
+                    actual,
+                });
+            }
+            Ok(ExecuteOutcome::Noop { tip })
+        }
         PreparedPromotion::RefUpdate {
             new_app_tip,
             expected_remote_head,
@@ -682,18 +736,24 @@ mod tests {
         let _credential: &GitCredentialBoundary = cfg.credential();
     }
 
-    /// The `AlreadyAtExpected` arm must short-circuit before any
-    /// network call: nothing was pushed at staging time (bundle_tip
-    /// == expected_remote_head), so the orchestrator has nothing to
-    /// upload and no ref to re-point. The lease check is also
-    /// skipped — there is no GitHub-mutating action to lease against.
-    ///
-    /// Asserted by mounting catch-all wiremocks that fail any HTTP
-    /// request of each method. If the function attempts any HTTP,
-    /// the matching catch-all's `.expect(0)` triggers a test failure.
+    /// The `AlreadyAtExpected` arm uploads nothing and re-points
+    /// nothing — but it is *not* HTTP-free: committing a noop records
+    /// `new_app_tip = tip` as the branch's state, so it must confirm
+    /// the branch is still at `tip` (the planner guarantees `tip ==
+    /// expected_remote_head` here) before that record lands. The one
+    /// lease-check `GET` returns `tip`, so the noop succeeds; the
+    /// `expect(0)` on POST/PATCH pins that no upload or ref-update is
+    /// issued.
     #[tokio::test]
-    async fn execute_returns_noop_without_http_when_plan_is_already_at_expected() {
+    async fn execute_noop_verifies_lease_then_returns_noop() {
         let server = MockServer::start().await;
+        let tip = sample_object_id('a');
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/name/git/ref/heads/main"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(ref_response_body(&tip)))
+            .expect(1)
+            .mount(&server)
+            .await;
         Mock::given(method("PATCH"))
             .respond_with(ResponseTemplate::new(500))
             .expect(0)
@@ -704,30 +764,24 @@ mod tests {
             .expect(0)
             .mount(&server)
             .await;
-        Mock::given(method("GET"))
-            .respond_with(ResponseTemplate::new(500))
-            .expect(0)
-            .mount(&server)
-            .await;
 
         let client = client_against(&server, "ghs_fake_token");
         let branch = GitBranchName::new("main").unwrap();
         let source = InMemoryGitObjectSource::new();
-        let tip = sample_object_id('a');
-        let expected = sample_object_id('9');
 
         let outcome = execute_fast_forward_plan(
             &client,
             &sample_repo(),
             &branch,
-            &expected,
+            // AlreadyAtExpected implies bundle_tip == expected_remote_head.
+            &tip,
             &source,
             FastForwardPlan::AlreadyAtExpected { tip: tip.clone() },
             &[],
             None,
         )
         .await
-        .expect("noop must succeed");
+        .expect("noop must succeed when the branch is still at tip");
 
         assert_eq!(outcome, ExecuteOutcome::Noop { tip });
     }
@@ -811,6 +865,90 @@ mod tests {
         )
         .await
         .expect_err("an unverifiable branch position must refuse to publish");
+
+        assert!(
+            matches!(err, CommitError::FinalLeaseLookup(_)),
+            "expected FinalLeaseLookup, got {err:?}",
+        );
+    }
+
+    /// The noop is still a *claim*: committing it records
+    /// `new_app_tip = tip` as the branch's state, so it too must verify
+    /// the lease immediately before that record lands. If a rival moved
+    /// the branch away from `tip` (== the `expected_remote_head` the
+    /// noop was staged against) after the receipt was staged, recording
+    /// "approved at `tip`" would be a false branch-state claim. The
+    /// `GET` reveals the move and `commit` must refuse with
+    /// `FinalLeaseMoved` — the same provably-no-mutation refusal the
+    /// RefUpdate arm gives. `expect(0)` on PATCH is decorative here (a
+    /// noop never patches); the load-bearing assertion is the refusal.
+    #[tokio::test]
+    async fn commit_noop_refuses_when_branch_moved_away_from_tip() {
+        let server = MockServer::start().await;
+        let tip = sample_object_id('a');
+        let moved = sample_object_id('9');
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/name/git/ref/heads/main"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(ref_response_body(&moved)))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let client = client_against(&server, "ghs_fake_token");
+        let branch = GitBranchName::new("main").unwrap();
+        let err = commit_prepared_promotion(
+            &client,
+            &sample_repo(),
+            &branch,
+            PreparedPromotion::Noop { tip: tip.clone() },
+        )
+        .await
+        .expect_err("a moved branch must refuse to record the noop as approved");
+
+        match err {
+            CommitError::FinalLeaseMoved { expected, actual } => {
+                assert_eq!(expected, tip);
+                assert_eq!(actual, moved);
+            }
+            other => panic!("expected FinalLeaseMoved, got {other:?}"),
+        }
+    }
+
+    /// The noop's lease GET can itself fail; like the RefUpdate arm's
+    /// final lookup, an unverifiable branch position must refuse to
+    /// record the approval rather than assume the branch is at `tip`.
+    #[tokio::test]
+    async fn commit_noop_refuses_when_lease_lookup_fails() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/name/git/ref/heads/main"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("wobble"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let client = client_against(&server, "ghs_fake_token");
+        let branch = GitBranchName::new("main").unwrap();
+        let err = commit_prepared_promotion(
+            &client,
+            &sample_repo(),
+            &branch,
+            PreparedPromotion::Noop {
+                tip: sample_object_id('a'),
+            },
+        )
+        .await
+        .expect_err("an unverifiable branch position must refuse the noop resolution");
 
         assert!(
             matches!(err, CommitError::FinalLeaseLookup(_)),

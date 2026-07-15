@@ -34,6 +34,27 @@ const TMP_DIR: &str = "tmp";
 const ENTRY_FILE: &str = "entry.json";
 const BUNDLE_FILE: &str = "bundle";
 
+/// Fixed byte overhead a [`VmGitPushStagedReceipt`] adds over the request
+/// metadata it is derived from — the `request_id` UUID, the `staged_at`
+/// timestamp, and JSON key differences. Generous: the real overhead is a
+/// few hundred bytes. Used by [`recovery_receipt_bound`].
+pub const RECEIPT_METADATA_OVERHEAD_BYTES: u64 = 4096;
+
+/// The largest `entry.json` the recovery sweep should read, given the
+/// broker's configured `git_push_max_metadata_bytes`. A receipt is the
+/// request metadata (repo, branch, object ids — all bounded by the
+/// accepted metadata size, see `parse_vm_git_push_request_body`)
+/// re-serialised with a request id and timestamp, so this admits every
+/// receipt a legitimately-accepted push could have staged while still
+/// bounding a tampered oversized file. The recovery caller derives the
+/// bound from live config and passes it to
+/// [`GitPushStagingStore::list_entries_for_recovery`]; a hard-coded cap
+/// would wrongly classify a legitimate carrier as corrupt whenever an
+/// operator raised the metadata limit past it.
+pub fn recovery_receipt_bound(max_metadata_bytes: usize) -> u64 {
+    (max_metadata_bytes as u64).saturating_add(RECEIPT_METADATA_OVERHEAD_BYTES)
+}
+
 /// A staged push as stored on disk: the receipt that was returned to the
 /// guest plus the git bundle bytes.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -96,8 +117,21 @@ impl GitPushStagingStore {
     /// do not already exist.
     pub fn open(root: PathBuf) -> io::Result<Self> {
         create_private_dir(&root)?;
+        // Durably commit `root`'s own directory entry (which the mkdir
+        // above may have just created) by fsyncing its parent, so a
+        // freshly-created store survives a power loss with `root` intact.
+        // Ancestors above `root` are the config/operator layer's concern
+        // — `create_private_dir` is a single non-recursive mkdir, so
+        // `open` itself only ever creates `root`.
+        if let Some(parent) = root.parent() {
+            fsync_dir(parent)?;
+        }
         create_private_dir(&root.join(STAGED_DIR))?;
         create_private_dir(&root.join(TMP_DIR))?;
+        // Durably commit the `staged/` and `tmp/` directory entries so
+        // recovery can rely on `staged/` being durably linked under
+        // `root` (see `ensure_carrier_durable`).
+        fsync_dir(&root)?;
         Ok(Self { root })
     }
 
@@ -180,6 +214,195 @@ impl GitPushStagingStore {
             entries.push(receipt);
         }
         Ok(entries)
+    }
+
+    /// Enumerate the staging tree entry-by-entry for boot recovery: one
+    /// result per `staged/` child directory, so a single malformed
+    /// sibling cannot hide every healthy carrier the way [`Self::list`]'s
+    /// fail-fast does. A returned `Ok(receipt)` is a *complete* carrier —
+    /// its `entry.json` parses, its directory name matches the recorded
+    /// request id, and its `bundle` file is present — so a recovery
+    /// caller may safely mark it resolvable. Malformed entries (bad or
+    /// missing `entry.json`, missing `bundle`, non-request-id directory
+    /// name) surface as `Err` and must be skipped, never recovered:
+    /// recording a `staged` outcome for a torn carrier would point the
+    /// operator at a push that can never be promoted.
+    ///
+    /// Only a failure to *open* `staged/` itself (a genuinely broken
+    /// staging root) fails the whole call; a missing `staged/` yields an
+    /// empty list. The bundle presence check is a metadata probe, not a
+    /// read, so this stays cheap even for large carriers.
+    ///
+    /// `max_receipt_bytes` bounds the `entry.json` read (see
+    /// [`recovery_receipt_bound`]); the caller derives it from the live
+    /// `git_push_max_metadata_bytes` so the bound tracks the size of
+    /// receipts the request path actually accepts.
+    pub fn list_entries_for_recovery(
+        &self,
+        max_receipt_bytes: u64,
+    ) -> Result<Vec<Result<VmGitPushStagedReceipt, StagingError>>, StagingError> {
+        let dir = self.root.join(STAGED_DIR);
+        let read = match fs::read_dir(&dir) {
+            Ok(r) => r,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(err) => return Err(err.into()),
+        };
+        let mut entries = Vec::new();
+        for child in read {
+            // A per-child readdir error (or a `file_type` that fails —
+            // e.g. an `lstat` racing a concurrent `delete`) must stay
+            // local: reporting it in-band keeps every healthy sibling
+            // already discovered, which is the whole point of this API
+            // over `list`. Only the `read_dir` open above fails the call.
+            let child = match child {
+                Ok(child) => child,
+                Err(err) => {
+                    entries.push(Err(StagingError::Io(err)));
+                    continue;
+                }
+            };
+            match child.file_type() {
+                // Staged carriers are always directories; skip anything
+                // else silently, matching `list`.
+                Ok(file_type) if !file_type.is_dir() => continue,
+                Ok(_) => entries
+                    .push(self.probe_recoverable_entry(&child.file_name(), max_receipt_bytes)),
+                Err(err) => entries.push(Err(StagingError::Io(err))),
+            }
+        }
+        Ok(entries)
+    }
+
+    /// Probe one `staged/` child for [`Self::list_entries_for_recovery`]:
+    /// parse its directory name, load its receipt, and confirm the bundle
+    /// is a readable regular file.
+    fn probe_recoverable_entry(
+        &self,
+        name: &OsStr,
+        max_receipt_bytes: u64,
+    ) -> Result<VmGitPushStagedReceipt, StagingError> {
+        let request_id = parse_request_id_from_dirname(name)?;
+        // Guard the receipt *before* `load_receipt`'s unbounded `fs::read`:
+        // at startup a tampered `entry.json` that is a FIFO, a symlink, or
+        // an implausibly large file would otherwise hang or OOM the sweep
+        // and block recovery of every healthy sibling. The guard uses
+        // no-follow metadata and rejects anything that is not a plain
+        // regular file.
+        self.verify_receipt_readable(request_id, max_receipt_bytes)?;
+        let receipt = self.load_receipt(request_id)?;
+        self.verify_bundle_readable(request_id)?;
+        Ok(receipt)
+    }
+
+    /// Confirm the carrier's `entry.json` is a regular file no larger
+    /// than `max_receipt_bytes` before it is read. See
+    /// [`Self::probe_recoverable_entry`] for why the recovery sweep must
+    /// not blindly `fs::read` it, and [`recovery_receipt_bound`] for how
+    /// the bound is derived.
+    ///
+    /// Uses `symlink_metadata` (no-follow) so a *symlink* — which
+    /// `stage()` never creates — is rejected rather than followed to a
+    /// target that could change or vanish after the outcome commits.
+    fn verify_receipt_readable(
+        &self,
+        request_id: RequestId,
+        max_receipt_bytes: u64,
+    ) -> Result<(), StagingError> {
+        let path = self.staged_path(request_id).join(ENTRY_FILE);
+        match fs::symlink_metadata(&path) {
+            Ok(meta) if meta.file_type().is_file() => {
+                if meta.len() > max_receipt_bytes {
+                    Err(StagingError::Corrupt {
+                        request_id,
+                        message: format!(
+                            "entry.json is larger than the accepted receipt bound \
+                             ({} > {max_receipt_bytes} bytes)",
+                            meta.len(),
+                        ),
+                    })
+                } else {
+                    Ok(())
+                }
+            }
+            Ok(_) => Err(StagingError::Corrupt {
+                request_id,
+                message: "entry.json is not a regular file".to_string(),
+            }),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Err(StagingError::Corrupt {
+                request_id,
+                message: "entry.json missing".to_string(),
+            }),
+            Err(err) => Err(StagingError::Io(err)),
+        }
+    }
+
+    /// Confirm the carrier's `bundle` is a *readable regular file*, not
+    /// merely present. A recovered `staged` outcome must point at a
+    /// carrier the approve/reject paths can actually `load()` (which
+    /// `fs::read`s the bundle); a bare `try_exists()` would accept a
+    /// directory, FIFO, or mode-denied path and let recovery record
+    /// `staged` for a push that can never be resolved. `symlink_metadata`
+    /// (no-follow) with `file_type().is_file()` rules out non-regular
+    /// shapes *and* symlinks (which `stage()` never creates, and whose
+    /// target `ensure_carrier_durable` would not fsync); opening (without
+    /// reading) then rules out an unreadable regular file. Missing bundle
+    /// → `Corrupt`; other open failures → `Io` (the recovery sweep skips
+    /// both without recording an outcome).
+    fn verify_bundle_readable(&self, request_id: RequestId) -> Result<(), StagingError> {
+        let path = self.staged_path(request_id).join(BUNDLE_FILE);
+        match fs::symlink_metadata(&path) {
+            Ok(meta) if meta.file_type().is_file() => {}
+            Ok(_) => {
+                return Err(StagingError::Corrupt {
+                    request_id,
+                    message: "bundle is not a regular file".to_string(),
+                });
+            }
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                return Err(StagingError::Corrupt {
+                    request_id,
+                    message: "bundle file missing".to_string(),
+                });
+            }
+            Err(err) => return Err(StagingError::Io(err)),
+        }
+        // Confirmed regular above, so opening cannot block on a FIFO.
+        // We open but do not read: this is a cheap readability probe,
+        // not a load of a potentially large bundle.
+        match fs::File::open(&path) {
+            Ok(_) => Ok(()),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Err(StagingError::Corrupt {
+                request_id,
+                message: "bundle file missing".to_string(),
+            }),
+            Err(err) => Err(StagingError::Io(err)),
+        }
+    }
+
+    /// Re-establish the durability of a carrier's directory entry before
+    /// a caller records an audit decision that assumes the carrier
+    /// survives a power loss. `stage()` fsyncs the parent `staged/` after
+    /// its `rename`, but if *that* final fsync failed the rename can be
+    /// visible yet not durable; the boot recovery sweep calls this before
+    /// writing the `staged` outcome so the "carrier durable ⇒ outcome
+    /// recorded" ordering holds on the recovery path too. Idempotent.
+    pub fn ensure_carrier_durable(&self, request_id: RequestId) -> Result<(), StagingError> {
+        fsync_dir(&self.staged_path(request_id))?;
+        fsync_dir(&self.root.join(STAGED_DIR))?;
+        // Also the store root (it holds the `staged/` directory entry) and
+        // the root's parent (it holds the `root` entry, which `open` may
+        // have created on first boot). Together these make the whole path
+        // the audit outcome will point at durable. We stop one level above
+        // `root`: `root` is the operator-configured staging path, and the
+        // durability of the ancestors *it* was created under is the
+        // config/operator layer's concern, not a per-recovery sweep's —
+        // recursively fsyncing an arbitrary configured hierarchy is out of
+        // scope for this store, which owns only `root` and below.
+        fsync_dir(&self.root)?;
+        if let Some(parent) = self.root.parent() {
+            fsync_dir(parent)?;
+        }
+        Ok(())
     }
 
     /// Remove the on-disk staging directory for `request_id`. Idempotent:
@@ -820,6 +1043,357 @@ mod tests {
         let (store, _tmp) = open_store();
         let request_id: RequestId = "eeeeeeee-0000-0000-0000-000000000000".parse().unwrap();
         store.delete(request_id).unwrap();
+    }
+
+    // ---- list_entries_for_recovery ------------------------------------
+
+    #[test]
+    fn list_entries_for_recovery_returns_ok_for_healthy_entries() {
+        let (store, _tmp) = open_store();
+        let ids: [RequestId; 2] = [
+            "20000000-0000-0000-0000-000000000001".parse().unwrap(),
+            "20000000-0000-0000-0000-000000000002".parse().unwrap(),
+        ];
+        for id in &ids {
+            store
+                .stage(
+                    *id,
+                    UnixMillis::from_millis(1),
+                    sample_metadata(),
+                    b"b".to_vec(),
+                )
+                .unwrap();
+        }
+        let mut got: Vec<RequestId> = store
+            .list_entries_for_recovery(recovery_receipt_bound(64 * 1024))
+            .unwrap()
+            .into_iter()
+            .map(|r| r.unwrap().push_request_id())
+            .collect();
+        got.sort();
+        let mut expected = ids.to_vec();
+        expected.sort();
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn list_entries_for_recovery_empty_store_is_empty() {
+        let (store, _tmp) = open_store();
+        assert!(
+            store
+                .list_entries_for_recovery(recovery_receipt_bound(64 * 1024))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// The key property behind the corrupt-sibling fix: a torn directory
+    /// (here, `entry.json` removed) is reported as a single `Err` while
+    /// every healthy sibling still comes back `Ok` — unlike [`list`],
+    /// which fails the whole call.
+    #[test]
+    fn list_entries_for_recovery_isolates_a_torn_sibling() {
+        let (store, _tmp) = open_store();
+        let healthy: RequestId = "30000000-0000-0000-0000-000000000001".parse().unwrap();
+        let torn: RequestId = "30000000-0000-0000-0000-000000000002".parse().unwrap();
+        store
+            .stage(
+                healthy,
+                UnixMillis::from_millis(1),
+                sample_metadata(),
+                b"ok".to_vec(),
+            )
+            .unwrap();
+        store
+            .stage(
+                torn,
+                UnixMillis::from_millis(2),
+                sample_metadata(),
+                b"torn".to_vec(),
+            )
+            .unwrap();
+        // Tear the second carrier by removing its receipt.
+        fs::remove_file(store.staged_path(torn).join(ENTRY_FILE)).unwrap();
+
+        // `list` fails outright on the torn sibling...
+        assert!(store.list().is_err());
+
+        // ...but the recovery enumeration isolates it.
+        let entries = store
+            .list_entries_for_recovery(recovery_receipt_bound(64 * 1024))
+            .unwrap();
+        assert_eq!(entries.len(), 2);
+        let mut healthy_seen = false;
+        let mut torn_seen = false;
+        for entry in entries {
+            match entry {
+                Ok(receipt) => {
+                    assert_eq!(receipt.push_request_id(), healthy);
+                    healthy_seen = true;
+                }
+                Err(StagingError::Corrupt { request_id, .. }) => {
+                    assert_eq!(request_id, torn);
+                    torn_seen = true;
+                }
+                other => panic!("unexpected entry: {other:?}"),
+            }
+        }
+        assert!(healthy_seen && torn_seen);
+    }
+
+    #[test]
+    fn list_entries_for_recovery_flags_missing_bundle() {
+        let (store, _tmp) = open_store();
+        let id: RequestId = "40000000-0000-0000-0000-000000000001".parse().unwrap();
+        store
+            .stage(
+                id,
+                UnixMillis::from_millis(1),
+                sample_metadata(),
+                b"gone".to_vec(),
+            )
+            .unwrap();
+        fs::remove_file(store.staged_path(id).join(BUNDLE_FILE)).unwrap();
+
+        let entries = store
+            .list_entries_for_recovery(recovery_receipt_bound(64 * 1024))
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(matches!(
+            entries.into_iter().next().unwrap(),
+            Err(StagingError::Corrupt { request_id, .. }) if request_id == id
+        ));
+    }
+
+    /// A carrier whose `bundle` is a directory (or any non-regular file)
+    /// must be reported `Corrupt`, not `Ok`: recovering it would record
+    /// `staged` for a push whose bundle `load()` can never `fs::read`.
+    #[test]
+    fn list_entries_for_recovery_flags_non_regular_bundle() {
+        let (store, _tmp) = open_store();
+        let id: RequestId = "40000000-0000-0000-0000-00000000000f".parse().unwrap();
+        store
+            .stage(
+                id,
+                UnixMillis::from_millis(1),
+                sample_metadata(),
+                b"orig".to_vec(),
+            )
+            .unwrap();
+        // Replace the bundle file with a directory.
+        let bundle = store.staged_path(id).join(BUNDLE_FILE);
+        fs::remove_file(&bundle).unwrap();
+        fs::create_dir(&bundle).unwrap();
+
+        let entries = store
+            .list_entries_for_recovery(recovery_receipt_bound(64 * 1024))
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(matches!(
+            entries.into_iter().next().unwrap(),
+            Err(StagingError::Corrupt { request_id, .. }) if request_id == id
+        ));
+    }
+
+    /// A carrier whose `entry.json` is a non-regular file (here a
+    /// directory) is reported `Corrupt` by the recovery probe *without*
+    /// the sweep blindly reading it — the guard that stops a tampered
+    /// FIFO / device-symlink `entry.json` from hanging startup.
+    #[test]
+    fn list_entries_for_recovery_flags_non_regular_receipt() {
+        let (store, _tmp) = open_store();
+        let id: RequestId = "40000000-0000-0000-0000-0000000000bb".parse().unwrap();
+        store
+            .stage(
+                id,
+                UnixMillis::from_millis(1),
+                sample_metadata(),
+                b"b".to_vec(),
+            )
+            .unwrap();
+        let entry = store.staged_path(id).join(ENTRY_FILE);
+        fs::remove_file(&entry).unwrap();
+        fs::create_dir(&entry).unwrap();
+
+        let entries = store
+            .list_entries_for_recovery(recovery_receipt_bound(64 * 1024))
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(matches!(
+            entries.into_iter().next().unwrap(),
+            Err(StagingError::Corrupt { request_id, .. }) if request_id == id
+        ));
+    }
+
+    /// The receipt-size bound is caller-supplied and config-derived: a
+    /// receipt is admitted under a bound that covers it and rejected under
+    /// one below it. Guards against a hard-coded cap wrongly failing a
+    /// legitimate carrier when the metadata limit is raised.
+    #[test]
+    fn list_entries_for_recovery_bound_tracks_the_supplied_limit() {
+        let (store, _tmp) = open_store();
+        let id: RequestId = "40000000-0000-0000-0000-0000000000cc".parse().unwrap();
+        store
+            .stage(
+                id,
+                UnixMillis::from_millis(1),
+                sample_metadata(),
+                b"b".to_vec(),
+            )
+            .unwrap();
+        let receipt_len = fs::metadata(store.staged_path(id).join(ENTRY_FILE))
+            .unwrap()
+            .len();
+        assert!(receipt_len > 1, "sanity: receipt has content");
+
+        // A bound below the receipt rejects it as too large...
+        let under = store.list_entries_for_recovery(receipt_len - 1).unwrap();
+        assert!(matches!(
+            under.into_iter().next().unwrap(),
+            Err(StagingError::Corrupt { request_id, .. }) if request_id == id
+        ));
+
+        // ...and a bound at or above it admits the carrier.
+        let over = store.list_entries_for_recovery(receipt_len).unwrap();
+        assert_eq!(
+            over.into_iter().next().unwrap().unwrap().push_request_id(),
+            id,
+        );
+    }
+
+    #[test]
+    fn recovery_receipt_bound_adds_fixed_overhead() {
+        assert_eq!(
+            recovery_receipt_bound(16 * 1024),
+            16 * 1024 + RECEIPT_METADATA_OVERHEAD_BYTES,
+        );
+        // Saturates rather than overflowing (panicking) on an absurd
+        // configured limit.
+        assert!(recovery_receipt_bound(usize::MAX) >= usize::MAX as u64);
+    }
+
+    /// A symlinked `entry.json` or `bundle` — a shape `stage()` never
+    /// produces and whose target `ensure_carrier_durable` would not fsync
+    /// — is rejected by the no-follow probe rather than followed.
+    #[cfg(unix)]
+    #[test]
+    fn list_entries_for_recovery_rejects_symlinked_carrier_files() {
+        use std::os::unix::fs::symlink;
+
+        for file in [ENTRY_FILE, BUNDLE_FILE] {
+            let (store, _tmp) = open_store();
+            let id: RequestId = "40000000-0000-0000-0000-0000000000dd".parse().unwrap();
+            store
+                .stage(
+                    id,
+                    UnixMillis::from_millis(1),
+                    sample_metadata(),
+                    b"b".to_vec(),
+                )
+                .unwrap();
+            // Replace the file with a symlink pointing at a valid regular
+            // file: `metadata` would follow it and pass, `symlink_metadata`
+            // must reject it.
+            let target = store.root().join(format!("real-{file}"));
+            fs::write(&target, b"{}").unwrap();
+            let path = store.staged_path(id).join(file);
+            fs::remove_file(&path).unwrap();
+            symlink(&target, &path).unwrap();
+
+            let entries = store
+                .list_entries_for_recovery(recovery_receipt_bound(64 * 1024))
+                .unwrap();
+            assert_eq!(entries.len(), 1);
+            assert!(
+                matches!(
+                    entries.into_iter().next().unwrap(),
+                    Err(StagingError::Corrupt { request_id, .. }) if request_id == id
+                ),
+                "symlinked {file} must be rejected",
+            );
+        }
+    }
+
+    #[test]
+    fn ensure_carrier_durable_succeeds_for_a_staged_carrier() {
+        let (store, _tmp) = open_store();
+        let id: RequestId = "40000000-0000-0000-0000-0000000000aa".parse().unwrap();
+        store
+            .stage(
+                id,
+                UnixMillis::from_millis(1),
+                sample_metadata(),
+                b"b".to_vec(),
+            )
+            .unwrap();
+        // Idempotent: safe to call repeatedly.
+        store.ensure_carrier_durable(id).unwrap();
+        store.ensure_carrier_durable(id).unwrap();
+    }
+
+    /// A stray non-directory under `staged/` is skipped silently rather
+    /// than surfaced as an error or an entry — exercises the per-child
+    /// `file_type` branch that must not abort the scan.
+    #[test]
+    fn list_entries_for_recovery_skips_stray_files() {
+        let (store, _tmp) = open_store();
+        let healthy: RequestId = "60000000-0000-0000-0000-000000000001".parse().unwrap();
+        store
+            .stage(
+                healthy,
+                UnixMillis::from_millis(1),
+                sample_metadata(),
+                b"ok".to_vec(),
+            )
+            .unwrap();
+        fs::write(store.root().join(STAGED_DIR).join("stray-file"), b"junk").unwrap();
+
+        let entries = store
+            .list_entries_for_recovery(recovery_receipt_bound(64 * 1024))
+            .unwrap();
+        assert_eq!(
+            entries.len(),
+            1,
+            "the stray file must not appear as an entry"
+        );
+        assert_eq!(
+            entries
+                .into_iter()
+                .next()
+                .unwrap()
+                .unwrap()
+                .push_request_id(),
+            healthy,
+        );
+    }
+
+    #[test]
+    fn list_entries_for_recovery_flags_unrecognised_dir() {
+        let (store, _tmp) = open_store();
+        let healthy: RequestId = "50000000-0000-0000-0000-000000000001".parse().unwrap();
+        store
+            .stage(
+                healthy,
+                UnixMillis::from_millis(1),
+                sample_metadata(),
+                b"ok".to_vec(),
+            )
+            .unwrap();
+        fs::create_dir(store.root().join(STAGED_DIR).join("not-a-uuid")).unwrap();
+
+        let entries = store
+            .list_entries_for_recovery(recovery_receipt_bound(64 * 1024))
+            .unwrap();
+        assert_eq!(entries.len(), 2);
+        assert!(entries.iter().any(|e| matches!(
+            e,
+            Ok(receipt) if receipt.push_request_id() == healthy
+        )));
+        assert!(
+            entries
+                .iter()
+                .any(|e| matches!(e, Err(StagingError::UnrecognisedStagedDir { .. })))
+        );
     }
 
     // ---- proptest strategies ------------------------------------------

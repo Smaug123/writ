@@ -471,6 +471,74 @@ async fn daemon_stop_removes_the_broker_material_dir() {
 }
 
 #[tokio::test]
+async fn daemon_stop_preserves_state_record_when_material_removal_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let args_log = dir.path().join("args.log");
+    let env_path_log = dir.path().join("env-path.log");
+    let env_log = dir.path().join("env.log");
+    let fake_tool = write_fake_tool(dir.path(), &args_log, &env_path_log, &env_log);
+    let (config, state_store) = daemon_config(dir.path(), &fake_tool);
+    let daemon = AgentVmDaemon::new(config);
+    let state = make_state();
+
+    let started = daemon
+        .start_session(
+            Arc::clone(&state),
+            None,
+            None,
+            None,
+            None,
+            vec!["sleep".into(), "600".into()],
+        )
+        .await
+        .unwrap();
+    let session_id = started.session_id();
+
+    // Wedge the material removal: put a *file* where the per-session material dir
+    // would be, so `remove_dir_all` fails with NotADirectory (ENOTDIR) rather than
+    // succeeding or being a NotFound no-op. Removing copied secrets must be a hard
+    // step: a failure keeps the persisted state record — the sole reconciliation
+    // obligation — so the stranded secrets are retried, not forgotten.
+    let broker_vm_root = dir.path().join("state").join("broker-vm");
+    fs::create_dir_all(&broker_vm_root).unwrap();
+    let material = broker_vm_root.join(session_id.to_string());
+    fs::write(&material, b"copied-secret").unwrap();
+
+    let err = daemon.stop_session(&state, session_id).await.unwrap_err();
+    assert!(
+        matches!(err, AgentVmDaemonError::BrokerMaterialRemove(_)),
+        "a material-removal failure must be surfaced, got {err:?}"
+    );
+
+    // The state record survives, so a boot-time reconcile (or a later stop) still
+    // sees the session and can retry. The session is no longer runtime-attached
+    // (the broker is torn down); the audit row was closed before the material step.
+    let remaining = state_store.load_all().unwrap();
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0].session_id(), session_id);
+    assert!(
+        !daemon.list_sessions().await.unwrap()[0].runtime_attached,
+        "a torn-down session must not report as runtime-attached"
+    );
+    assert!(
+        state
+            .audit
+            .get_session(session_id)
+            .unwrap()
+            .unwrap()
+            .closed_at
+            .is_some()
+    );
+
+    // Clear the obstruction; the retained obligation now drives to completion:
+    // the copied secrets go and the state record is dropped.
+    fs::remove_file(&material).unwrap();
+    daemon.stop_session(&state, session_id).await.unwrap();
+    assert!(!material.exists());
+    assert!(state_store.load_all().unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn daemon_start_advertises_prewarm_substituter_when_prewarm_dir_configured() {
     let dir = tempfile::tempdir().unwrap();
     let args_log = dir.path().join("args.log");
@@ -919,6 +987,67 @@ async fn daemon_reconcile_preserves_state_record_when_cleanup_fails() {
     assert_eq!(remaining[0].session_id(), session_id);
     let recorded = audit.get_session(session_id).unwrap().unwrap();
     assert!(recorded.closed_at.is_none());
+}
+
+#[tokio::test]
+async fn daemon_reconcile_preserves_state_record_when_material_removal_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let args_log = dir.path().join("args.log");
+    let env_path_log = dir.path().join("env-path.log");
+    let env_log = dir.path().join("env.log");
+    let fake_tool = write_fake_tool(dir.path(), &args_log, &env_path_log, &env_log);
+    let (config, state_store) = daemon_config(dir.path(), &fake_tool);
+    occupy_subnet(&state_store, 252);
+    let session_id = state_store.load_all().unwrap().pop().unwrap().session_id();
+    let audit = Arc::new(AuditLog::open_in_memory().unwrap());
+    audit
+        .open_session(&SessionRecord {
+            session_id,
+            label: None,
+            agent_kind: Some(AgentKind::Claude),
+            agent_model: None,
+            opened_at: UnixMillis::from_millis(1_700_000_000),
+            closed_at: None,
+        })
+        .unwrap();
+    let daemon = AgentVmDaemon::new(config);
+
+    // Wedge the material removal (see the stop-path test): a file where the
+    // per-session material dir would be forces `remove_dir_all` to fail. Teardown
+    // succeeds, so reconcile reaches — and fails at — the MaterialRemove stage.
+    let broker_vm_root = dir.path().join("state").join("broker-vm");
+    fs::create_dir_all(&broker_vm_root).unwrap();
+    let material = broker_vm_root.join(session_id.to_string());
+    fs::write(&material, b"copied-secret").unwrap();
+
+    let report = daemon.reconcile_persisted_sessions(&audit).await.unwrap();
+
+    assert!(report.cleaned().is_empty());
+    assert_eq!(report.failed().len(), 1);
+    let failure = &report.failed()[0];
+    assert_eq!(failure.session_id(), session_id);
+    assert_eq!(failure.stage(), AgentVmReconcileStage::MaterialRemove);
+    // The state record is kept for the next boot's retry rather than being
+    // dropped with the copied secrets stranded on disk. The audit row was closed
+    // (MaterialRemove is ordered after AuditClose).
+    let remaining = state_store.load_all().unwrap();
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0].session_id(), session_id);
+    assert!(
+        audit
+            .get_session(session_id)
+            .unwrap()
+            .unwrap()
+            .closed_at
+            .is_some()
+    );
+
+    // Clear the obstruction; the retained obligation reconciles cleanly next time.
+    fs::remove_file(&material).unwrap();
+    let report = daemon.reconcile_persisted_sessions(&audit).await.unwrap();
+    assert_eq!(report.cleaned(), &[session_id]);
+    assert!(report.failed().is_empty());
+    assert!(state_store.load_all().unwrap().is_empty());
 }
 
 #[test]
