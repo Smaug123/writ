@@ -5,33 +5,40 @@ use super::test_support::*;
 use super::*;
 
 #[test]
-fn start_invocations_create_network_then_inspect_then_firewall_then_vm() {
+fn start_invocations_probe_create_inspect_firewall_probe_vm_then_vm() {
     let invocations = plan(252).start_invocations();
-    assert_eq!(invocations.len(), 4);
+    assert_eq!(invocations.len(), 6);
+    // Each creating step is preceded by its absence probe, and dry-run shows both
+    // probes (and the permissions they need) rather than hiding them.
+    assert_eq!(invocations[0].args_lossy(), ["network", "list", "--quiet"]);
     assert_eq!(
-        invocations[0].args_lossy(),
+        invocations[1].args_lossy(),
         [
             "network",
             "create",
             "--internal",
+            "--label",
+            "writ.owner=writ-test-owner",
             "--subnet",
             "192.168.252.0/24",
             "writ-agent-net-51b8fd0f-6c10-454c-b0e6-7df1d60e2e6d",
         ]
     );
     assert_eq!(
-        invocations[1].args_lossy(),
+        invocations[2].args_lossy(),
         [
             "network",
             "inspect",
             "writ-agent-net-51b8fd0f-6c10-454c-b0e6-7df1d60e2e6d",
         ]
     );
-    assert_eq!(invocations[2].program(), Path::new("sudo"));
-    let firewall_args = invocations[2].args_lossy();
+    assert_eq!(invocations[3].program(), Path::new("sudo"));
+    let firewall_args = invocations[3].args_lossy();
     assert_eq!(&firewall_args[0..2], ["writ-agent-vm-pf-helper", "install"]);
     assert!(firewall_args.contains(&"--ipv6-cidr".to_string()));
-    let vm_args = invocations[3].args_lossy();
+    // The agent-VM absence probe runs just before `run`.
+    assert_eq!(invocations[4].args_lossy(), ["list", "--all", "--quiet"]);
+    let vm_args = invocations[5].args_lossy();
     assert_eq!(&vm_args[0..2], ["run", "--name"]);
     assert!(vm_args.contains(&"writ-agent-vm-51b8fd0f-6c10-454c-b0e6-7df1d60e2e6d".to_string()));
     assert_tmpfs_mounts_present(&vm_args);
@@ -41,12 +48,15 @@ fn start_invocations_create_network_then_inspect_then_firewall_then_vm() {
 fn ipv4_only_start_invocations_probe_before_releasing_guest_command() {
     let invocations =
         plan_with_ipv6_mode(252, Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6).start_invocations();
-    assert_eq!(invocations.len(), 6);
-    let firewall_args = invocations[2].args_lossy();
+    assert_eq!(invocations.len(), 8);
+    // Index 0 is the network-absence probe, index 4 the agent-VM absence probe.
+    assert_eq!(invocations[0].args_lossy(), ["network", "list", "--quiet"]);
+    assert_eq!(invocations[4].args_lossy(), ["list", "--all", "--quiet"]);
+    let firewall_args = invocations[3].args_lossy();
     assert_eq!(&firewall_args[0..2], ["writ-agent-vm-pf-helper", "install"]);
     assert!(!firewall_args.contains(&"--ipv6-cidr".to_string()));
 
-    let start_vm_args = invocations[3].args_lossy();
+    let start_vm_args = invocations[5].args_lossy();
     assert_eq!(&start_vm_args[0..2], ["run", "--name"]);
     assert_tmpfs_mounts_present(&start_vm_args);
     assert!(start_vm_args.contains(&"sh".to_string()));
@@ -63,7 +73,7 @@ fn ipv4_only_start_invocations_probe_before_releasing_guest_command() {
     ]));
 
     assert_eq!(
-        invocations[4].args_lossy(),
+        invocations[6].args_lossy(),
         [
             "exec",
             "writ-agent-vm-51b8fd0f-6c10-454c-b0e6-7df1d60e2e6d",
@@ -73,7 +83,7 @@ fn ipv4_only_start_invocations_probe_before_releasing_guest_command() {
         ]
     );
     assert_eq!(
-        invocations[5].args_lossy(),
+        invocations[7].args_lossy(),
         [
             "exec",
             "writ-agent-vm-51b8fd0f-6c10-454c-b0e6-7df1d60e2e6d",
@@ -180,7 +190,7 @@ fn failed_firewall_install_cleans_up_network_only() {
 
 #[test]
 fn failed_vm_start_removes_vm_then_firewall_then_network() {
-    let cleanup = plan(252).cleanup_after_partial_start(CompletedStartStep::FirewallInstalled);
+    let cleanup = plan(252).cleanup_after_partial_start(CompletedStartStep::VmStarted);
     assert_eq!(cleanup.len(), 7);
     let remove_vm_args = cleanup[0].args_lossy();
     let delete_vm_args = cleanup[2].args_lossy();
@@ -196,6 +206,29 @@ fn failed_vm_start_removes_vm_then_firewall_then_network() {
 }
 
 #[test]
+fn firewall_installed_phase_removes_pf_and_network_but_not_the_vm() {
+    // Reached when the VM was never started (its absence probe failed): remove the
+    // PF anchor and the network we created, but issue no VM teardown.
+    let cleanup = plan(252).cleanup_after_partial_start(CompletedStartStep::FirewallInstalled);
+    assert_eq!(cleanup.len(), 3);
+    assert_eq!(
+        &cleanup[0].args_lossy()[0..2],
+        ["writ-agent-vm-pf-helper", "remove"]
+    );
+    assert_eq!(&cleanup[1].args_lossy()[0..2], ["network", "rm"]);
+    assert_eq!(&cleanup[2].args_lossy()[0..2], ["network", "delete"]);
+    assert!(
+        !cleanup.iter().any(|inv| {
+            let args = inv.args_lossy();
+            args.first().map(String::as_str) == Some("rm")
+                || args.first().map(String::as_str) == Some("delete")
+                || args.first().map(String::as_str) == Some("stop")
+        }),
+        "the firewall-installed phase must not tear down the VM: {cleanup:?}"
+    );
+}
+
+#[test]
 fn vm_placement_start_skips_only_network_creation_and_keeps_host_pf() {
     // The broker arm creates the shared network, so the agent start skips
     // CreateNetwork — but it still inspects the network and installs host PF
@@ -206,6 +239,14 @@ fn vm_placement_start_skips_only_network_creation_and_keeps_host_pf() {
             .iter()
             .any(|s| matches!(s, AgentVmStartStep::CreateNetwork(_))),
         "vm start must not create the shared network: {steps:?}"
+    );
+    // The broker owns the shared network, so vm start must not probe it for
+    // absence either — the probe belongs only to the host path that creates it.
+    assert!(
+        !steps
+            .iter()
+            .any(|s| matches!(s, AgentVmStartStep::ProbeNetworkAbsent(_))),
+        "vm start must not probe the broker-owned network: {steps:?}"
     );
     assert!(
         matches!(
@@ -220,12 +261,24 @@ fn vm_placement_start_skips_only_network_creation_and_keeps_host_pf() {
             .any(|s| matches!(s, AgentVmStartStep::InstallFirewall(_))),
         "vm start must still install host PF: {steps:?}"
     );
-    // Host placement is unchanged: it still creates the network first.
+    // Both placements create the agent VM, so both probe for its absence first.
+    assert!(
+        steps
+            .iter()
+            .any(|s| matches!(s, AgentVmStartStep::ProbeVmAbsent(_))),
+        "vm start must probe the agent VM for absence: {steps:?}"
+    );
+    // Host placement probes for the network's absence, then creates it.
     let host = plan_with_broker_placement(252, BrokerPlacement::Host).start_steps();
     assert!(matches!(
         host.first(),
-        Some(AgentVmStartStep::CreateNetwork(_))
+        Some(AgentVmStartStep::ProbeNetworkAbsent(_))
     ));
+    assert!(
+        host.iter()
+            .any(|s| matches!(s, AgentVmStartStep::CreateNetwork(_))),
+        "host start must still create the network: {host:?}"
+    );
 }
 
 #[test]
@@ -233,7 +286,7 @@ fn vm_placement_failed_start_removes_the_agent_vm_and_pf_but_not_the_network() {
     // The broker arm owns the shared network, so a failed agent start cleans up
     // the agent VM and its host PF anchor — but not the broker-owned network.
     let cleanup = plan_with_broker_placement(252, BrokerPlacement::Vm)
-        .cleanup_after_partial_start(CompletedStartStep::FirewallInstalled);
+        .cleanup_after_partial_start(CompletedStartStep::VmStarted);
     assert!(
         cleanup.iter().any(|inv| {
             inv.args_lossy()

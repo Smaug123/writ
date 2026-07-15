@@ -112,6 +112,41 @@ const GUEST_ENV_FILE_DISPLAY: &str = "<runtime-env-file>";
 // per-session tmpfs state at container start.
 const AGENT_VM_TMPFS_MOUNTS: &[&str] = &["/tmp", "/run", "/var/tmp", "/root"];
 
+/// Apple Container label key stamped on the session's network and agent VM,
+/// carrying the [`AgentVmOwnerToken`] of the start attempt that created them.
+const AGENT_VM_OWNER_LABEL: &str = "writ.owner";
+
+/// A per-start-attempt token stamped (via `--label writ.owner=…`) on the network
+/// and agent VM this attempt creates. **Informational only** — surfaced by
+/// `container inspect` so an operator can see which writ start owns a resource.
+///
+/// It deliberately does *not* gate failure cleanup. Resource names are
+/// host-global but ownership is only per-`--state-dir`, so making cleanup safe
+/// against a concurrent same-name owner would need host-global coordination this
+/// design lacks — and that only matters when a `SessionId` is *deliberately
+/// reused* across state directories (or the raw runner). Normal ids are random v4
+/// UUIDs that never collide, and the prove-absence steps already fail the common
+/// conflict cleanly; the narrow concurrent-reuse race is accepted.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AgentVmOwnerToken(String);
+
+impl AgentVmOwnerToken {
+    /// A fresh random token. Every start attempt gets its own, so no two
+    /// concurrent attempts (even for the same `SessionId`) share one.
+    pub fn generate() -> Self {
+        Self(format!("writ-{}", Uuid::new_v4().simple()))
+    }
+
+    /// Wrap a caller-supplied token (used by tests for a deterministic label).
+    pub fn new(raw: impl Into<String>) -> Self {
+        Self(raw.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AgentVmSessionPlan {
     session_id: SessionId,
@@ -137,6 +172,12 @@ pub struct AgentVmSessionPlan {
     guest_command: Vec<String>,
     resources: AgentVmResources,
     tools: AgentVmToolPaths,
+    /// Per-attempt ownership token stamped on the network and agent VM this start
+    /// creates. Defaults to a fresh random token per plan (so it is impossible to
+    /// forget); tests pin it via [`Self::with_owner_token`] for deterministic
+    /// labels. Not persisted — ownership only matters for *this* start's failure
+    /// cleanup; managed stop tears down a session it already owns.
+    owner_token: AgentVmOwnerToken,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -261,16 +302,30 @@ pub enum AgentVmStartInvocation {
 /// it to [`cleanup_step_after_start_outcome`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AgentVmStartStep {
+    /// Host-only pre-create ownership check: confirm the session's network does
+    /// not already exist before `CreateNetwork` runs. Runs first so a network we
+    /// did not create is never subsequently torn down.
+    ProbeNetworkAbsent(ResourcePresenceProbe),
     CreateNetwork(ProcessInvocation),
     InspectAndValidateNetwork(ProcessInvocation),
     InstallFirewall(ProcessInvocation),
+    /// Pre-start ownership check: confirm the session's agent VM does not already
+    /// exist before `StartVm` runs, so a VM we did not create is never torn down.
+    /// Both placements create the agent VM, so both probe for it.
+    ProbeVmAbsent(ResourcePresenceProbe),
     StartVm(AgentVmStartInvocation),
-    ProbeAndValidateGuestIpv6 { probe_invocation: ProcessInvocation },
+    ProbeAndValidateGuestIpv6 {
+        probe_invocation: ProcessInvocation,
+    },
     ReleaseGuestCommand(ProcessInvocation),
 }
 
+/// A "does resource N appear in the output of list command C" probe. Carried
+/// opaquely inside [`AgentVmStartStep::ProbeNetworkAbsent`] so the pre-create
+/// existence check is one of the projected start steps (and thus visible in
+/// dry-run), not a hidden side effect. Its internals stay private.
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct ResourcePresenceProbe {
+pub struct ResourcePresenceProbe {
     invocation: ProcessInvocation,
     name: String,
 }
@@ -321,21 +376,40 @@ impl AgentVmSessionStateStatus {
     }
 }
 
+/// The infrastructure that exists when a start fails, named for the last
+/// resource successfully created — hence what cleanup must tear down. "No
+/// cleanup at all" (success, or a failure before anything was created) is
+/// carried by `Option::None` out of [`cleanup_step_after_start_outcome`], so
+/// there is no "nothing" variant here.
+///
+/// Each phase is a superset of the previous, and every resource in a phase was
+/// created by a step that ran only after its absence was confirmed (network,
+/// VM) or after our own install succeeded (PF anchor) — so tearing them down is
+/// always ownership-safe.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum CompletedStartStep {
-    None,
+    /// The network exists.
     NetworkCreated,
+    /// The network and the host PF anchor exist; no VM yet.
     FirewallInstalled,
+    /// The network, PF anchor, and agent VM exist.
+    VmStarted,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum StartOutcome {
     Started,
+    /// The pre-create network-absence probe failed (present, or unprobeable):
+    /// nothing was created, so no cleanup.
+    NetworkAbsenceProbeFailed,
     CreateNetworkFailed,
     InspectNetworkFailed,
     ParseNetworkInspectionFailed,
     ValidateNetworkInspectionFailed,
     InstallFirewallFailed,
+    /// The pre-start VM-absence probe failed: the network and PF anchor exist and
+    /// are ours, but the VM is not — clean back through the network and PF only.
+    VmAbsenceProbeFailed,
     StartVmFailed,
     ProbeGuestIpv6Failed,
     ValidateGuestIpv6Failed,
@@ -368,8 +442,21 @@ pub enum AgentVmLifecycleConfigError {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ProcessInvocationError {
+    /// The command could not be spawned at all (missing/non-executable binary,
+    /// fork failure). It provably never executed, so it performed no side
+    /// effects — start-failure cleanup relies on this to skip cleanup for a
+    /// creating step whose command never ran.
     #[error("cannot run {program} {args}: {source}")]
     Run {
+        program: String,
+        args: String,
+        source: std::io::Error,
+    },
+    /// The command spawned but collecting its exit status/output failed. Unlike
+    /// [`Self::Run`], the command *did* execute and may have performed its side
+    /// effect before the wait failed, so cleanup must not treat it as a no-op.
+    #[error("{program} {args} spawned but collecting its result failed: {source}")]
+    WaitOutput {
         program: String,
         args: String,
         source: std::io::Error,
@@ -400,6 +487,36 @@ pub struct CleanupErrors {
 pub enum StartFailure {
     #[error(transparent)]
     Process(#[from] ProcessInvocationError),
+    /// A network already bearing this session's name existed before we tried to
+    /// create it. The name is host-global but ownership is per-state-dir, so it
+    /// may belong to another owner; we refuse to create — and, crucially,
+    /// start-failure cleanup must not remove it.
+    #[error(
+        "network {network} already exists before create; refusing (it may belong to another owner)"
+    )]
+    NetworkAlreadyPresent { network: String },
+    /// The pre-create existence probe itself failed, so absence could not be
+    /// established. `network create` was never attempted, so nothing was created
+    /// — cleanup must remove nothing (a probe failure is not evidence the network
+    /// is ours).
+    #[error("failed to probe for a pre-existing network before create: {source}")]
+    NetworkPresenceProbeFailed {
+        #[source]
+        source: ProcessInvocationError,
+    },
+    /// An agent VM already bearing this session's name existed before start. Like
+    /// the network, the name is host-global but ownership is per-state-dir, so we
+    /// refuse rather than start — and cleanup must not remove the VM.
+    #[error("agent VM {vm} already exists before start; refusing (it may belong to another owner)")]
+    VmAlreadyPresent { vm: String },
+    /// The pre-start VM existence probe itself failed, so VM ownership could not
+    /// be established. Cleanup removes the network and PF anchor (ours) but not
+    /// the VM.
+    #[error("failed to probe for a pre-existing agent VM before start: {source}")]
+    VmPresenceProbeFailed {
+        #[source]
+        source: ProcessInvocationError,
+    },
     #[error(transparent)]
     NetworkInspection(#[from] NetworkInspectionError),
     #[error(transparent)]
@@ -505,18 +622,43 @@ impl std::error::Error for CleanupErrors {
     }
 }
 
+/// Which cleanup phase to run after a start step fails, reported as the
+/// [`CompletedStartStep`] to tear down back through, or `None` when nothing was
+/// created and there is nothing to clean.
+///
+/// Each creating step runs only after the resource it creates was proven absent
+/// (network, VM) or after our own PF install succeeded, so a failure's phase is
+/// exactly the resources that exist and are ours:
+/// - the absence probes (`NetworkAbsenceProbeFailed`, `VmAbsenceProbeFailed`)
+///   found the resource present/unprobeable, so *that* resource is not ours;
+/// - `NetworkAbsenceProbeFailed` created nothing → `None`;
+/// - a network/inspect failure, and an *atomic* firewall-install failure (its
+///   `pfctl -a … -f` load is all-or-nothing, leaving no session anchor), clean
+///   back through `NetworkCreated`;
+/// - a VM-absence-probe failure cleans the already-created network and PF anchor
+///   but not the foreign VM → `FirewallInstalled`;
+/// - a VM-start or later failure cleans everything, including the VM we started
+///   → `VmStarted`.
 pub fn cleanup_step_after_start_outcome(outcome: StartOutcome) -> Option<CompletedStartStep> {
     match outcome {
-        StartOutcome::Started => None,
-        StartOutcome::CreateNetworkFailed => Some(CompletedStartStep::None),
-        StartOutcome::InspectNetworkFailed
+        StartOutcome::Started | StartOutcome::NetworkAbsenceProbeFailed => None,
+        StartOutcome::CreateNetworkFailed
+        | StartOutcome::InspectNetworkFailed
         | StartOutcome::ParseNetworkInspectionFailed
-        | StartOutcome::ValidateNetworkInspectionFailed
-        | StartOutcome::InstallFirewallFailed => Some(CompletedStartStep::NetworkCreated),
+        | StartOutcome::ValidateNetworkInspectionFailed => Some(CompletedStartStep::NetworkCreated),
+        // A firewall install that *ran* may have loaded the PF anchor before
+        // failing (e.g. the helper is killed, or its post-load stdout breaks),
+        // since the `pfctl -a … -f` load is atomic but the command can still exit
+        // nonzero afterwards. So clean the anchor + network. A true spawn failure
+        // (the helper never ran) is demoted to `NetworkCreated` in
+        // `cleanup_phase_for_failure`.
+        StartOutcome::InstallFirewallFailed | StartOutcome::VmAbsenceProbeFailed => {
+            Some(CompletedStartStep::FirewallInstalled)
+        }
         StartOutcome::StartVmFailed
         | StartOutcome::ProbeGuestIpv6Failed
         | StartOutcome::ValidateGuestIpv6Failed
-        | StartOutcome::ReleaseGuestCommandFailed => Some(CompletedStartStep::FirewallInstalled),
+        | StartOutcome::ReleaseGuestCommandFailed => Some(CompletedStartStep::VmStarted),
     }
 }
 
@@ -588,6 +730,7 @@ impl AgentVmSessionPlan {
             guest_command,
             resources,
             tools,
+            owner_token: AgentVmOwnerToken::generate(),
         })
     }
 
@@ -595,6 +738,13 @@ impl AgentVmSessionPlan {
     /// this the PF allows the subnet gateway (the host-broker default).
     pub fn with_broker_pf_host(mut self, broker_pf_host: Ipv4Addr) -> Self {
         self.broker_pf_host = Some(broker_pf_host);
+        self
+    }
+
+    /// Pin the ownership token instead of the random default — for tests that
+    /// assert the exact `--label` on the create/run invocations.
+    pub fn with_owner_token(mut self, owner_token: AgentVmOwnerToken) -> Self {
+        self.owner_token = owner_token;
         self
     }
 
@@ -648,6 +798,13 @@ impl AgentVmSessionPlan {
         // the agent VM must be PF-filtered from host services exactly as in host
         // mode.
         if self.broker_placement == BrokerPlacement::Host {
+            // Prove the network is absent before creating it, so a failure never
+            // tears down a network this call did not create (the name is
+            // host-global but ownership is only per-state-dir). Vm placement joins
+            // a broker-owned network and so has no create — and no probe.
+            steps.push(AgentVmStartStep::ProbeNetworkAbsent(
+                self.stop_plan().network_presence_probe(),
+            ));
             steps.push(AgentVmStartStep::CreateNetwork(
                 self.create_network_invocation(),
             ));
@@ -657,6 +814,12 @@ impl AgentVmSessionPlan {
         ));
         steps.push(AgentVmStartStep::InstallFirewall(
             self.install_firewall_invocation(),
+        ));
+        // Prove the agent VM is absent before starting it, so a start failure
+        // never tears down a VM this call did not create. Both placements create
+        // the agent VM, so both probe for it.
+        steps.push(AgentVmStartStep::ProbeVmAbsent(
+            self.stop_plan().vm_presence_probe(),
         ));
         steps.push(AgentVmStartStep::StartVm(self.start_vm_invocation()));
         if self.ipv6_mode == Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6 {
@@ -689,20 +852,30 @@ impl AgentVmSessionPlan {
         &self,
         completed: CompletedStartStep,
     ) -> Vec<ProcessInvocation> {
+        let stop = self.stop_plan();
         match completed {
-            CompletedStartStep::None => Vec::new(),
             // Host removes the network it created. In vm mode the broker arm owns
             // the shared network and no firewall is installed in this phase yet,
             // so there is nothing for the agent to clean up.
             CompletedStartStep::NetworkCreated => match self.broker_placement {
-                BrokerPlacement::Host => self.stop_plan().network_removal_invocations(),
+                BrokerPlacement::Host => stop.network_removal_invocations(),
                 BrokerPlacement::Vm => Vec::new(),
             },
+            // Firewall installed but no VM yet: remove the host PF anchor, and
+            // (host only) the network. No VM teardown — `StartVm` has not run.
+            // Both placements keep the PF removal — `--internal` does not isolate
+            // the agent from host services.
+            CompletedStartStep::FirewallInstalled => {
+                let mut invocations = vec![stop.remove_firewall_invocation()];
+                if self.broker_placement == BrokerPlacement::Host {
+                    invocations.extend(stop.network_removal_invocations());
+                }
+                invocations
+            }
             // `stop_invocations` is placement-aware: host removes the VM, host PF,
             // and the network; vm removes the VM and host PF only (the broker arm
-            // owns the network). Both keep the host PF removal — `--internal`
-            // does not isolate the agent from host services.
-            CompletedStartStep::FirewallInstalled => self.stop_plan().stop_invocations(),
+            // owns the network).
+            CompletedStartStep::VmStarted => stop.stop_invocations(),
         }
     }
 
@@ -736,11 +909,18 @@ impl AgentVmSessionPlan {
                 "network".to_string(),
                 "create".to_string(),
                 "--internal".to_string(),
+                "--label".to_string(),
+                self.owner_label_arg(),
                 "--subnet".to_string(),
                 self.network.ipv4().to_string(),
                 self.names.network.clone(),
             ],
         )
+    }
+
+    /// `writ.owner=<token>`, the ownership label stamped on the network and VM.
+    fn owner_label_arg(&self) -> String {
+        format!("{AGENT_VM_OWNER_LABEL}={}", self.owner_token.as_str())
     }
 
     fn inspect_network_invocation(&self) -> ProcessInvocation {
@@ -864,6 +1044,8 @@ impl AgentVmSessionPlan {
             "run".to_string(),
             "--name".to_string(),
             self.names.vm.clone(),
+            "--label".to_string(),
+            self.owner_label_arg(),
             "--network".to_string(),
             self.names.network.clone(),
             "--cpus".to_string(),
@@ -1373,7 +1555,7 @@ impl ProcessInvocation {
         while stdout_open || stderr_open {
             tokio::select! {
                 result = stdout_pipe.read(&mut stdout_chunk), if stdout_open => {
-                    let n = result.map_err(|source| self.run_error(source))?;
+                    let n = result.map_err(|source| self.wait_output_error(source))?;
                     if n == 0 {
                         stdout_open = false;
                     } else {
@@ -1389,7 +1571,7 @@ impl ProcessInvocation {
                     }
                 }
                 result = stderr_pipe.read(&mut stderr_chunk), if stderr_open => {
-                    let n = result.map_err(|source| self.run_error(source))?;
+                    let n = result.map_err(|source| self.wait_output_error(source))?;
                     if n == 0 {
                         stderr_open = false;
                     } else {
@@ -1497,7 +1679,7 @@ impl ProcessInvocation {
         while stdout_open || stderr_open {
             tokio::select! {
                 result = stdout_pipe.read(&mut stdout_chunk), if stdout_open => {
-                    let n = result.map_err(|source| self.run_error(source))?;
+                    let n = result.map_err(|source| self.wait_output_error(source))?;
                     if n == 0 {
                         stdout_open = false;
                     } else {
@@ -1505,7 +1687,7 @@ impl ProcessInvocation {
                     }
                 }
                 result = stderr_pipe.read(&mut stderr_chunk), if stderr_open => {
-                    let n = result.map_err(|source| self.run_error(source))?;
+                    let n = result.map_err(|source| self.wait_output_error(source))?;
                     if n == 0 {
                         stderr_open = false;
                     } else {
@@ -1527,6 +1709,17 @@ impl ProcessInvocation {
 
     fn run_error(&self, source: std::io::Error) -> ProcessInvocationError {
         ProcessInvocationError::Run {
+            program: self.program.display().to_string(),
+            args: self.args_display(),
+            source,
+        }
+    }
+
+    /// A failure *after* the child spawned (e.g. draining its output pipes). The
+    /// command executed, so this is [`ProcessInvocationError::WaitOutput`], not a
+    /// spawn failure — start-failure cleanup relies on `Run` meaning "never ran".
+    fn wait_output_error(&self, source: std::io::Error) -> ProcessInvocationError {
+        ProcessInvocationError::WaitOutput {
             program: self.program.display().to_string(),
             args: self.args_display(),
             source,
@@ -1561,7 +1754,19 @@ impl ProcessInvocation {
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
-        process_spawn::output(&mut command).map_err(|source| ProcessInvocationError::Run {
+        // Spawn and wait are mapped to *distinct* errors: a spawn failure proves
+        // the command never executed (`Run`), while a wait/collect failure means
+        // it did run (`WaitOutput`). `wait_collecting` always waits for the child
+        // to exit even when pipe collection fails, so a `WaitOutput` guarantees the
+        // command has finished — cleanup keyed on the resulting state never races a
+        // still-live child.
+        let child =
+            process_spawn::spawn(&mut command).map_err(|source| ProcessInvocationError::Run {
+                program: self.program.display().to_string(),
+                args: self.args_display(),
+                source,
+            })?;
+        process_spawn::wait_collecting(child).map_err(|source| ProcessInvocationError::WaitOutput {
             program: self.program.display().to_string(),
             args: self.args_display(),
             source,
@@ -1603,6 +1808,9 @@ impl AgentVmStartInvocation {
 impl AgentVmStartStep {
     pub fn into_display_invocation(self) -> AgentVmStartInvocation {
         match self {
+            Self::ProbeNetworkAbsent(probe) | Self::ProbeVmAbsent(probe) => {
+                AgentVmStartInvocation::Static(probe.into_invocation())
+            }
             Self::CreateNetwork(inv)
             | Self::InspectAndValidateNetwork(inv)
             | Self::InstallFirewall(inv)
@@ -1615,20 +1823,28 @@ impl AgentVmStartStep {
     }
 }
 
-/// Cleanup phase active *during* `step`: the resources that need tearing down
-/// if `step` fails. The property test
+/// Cleanup phase to run if `step` fails, or `None` when its failure leaves
+/// nothing to clean. The absence-probe steps create nothing themselves, so their
+/// phase reflects only what earlier steps created: `ProbeNetworkAbsent` runs
+/// first (nothing yet → `None`), while `ProbeVmAbsent` runs after the network and
+/// PF anchor exist (→ `FirewallInstalled`, network + PF, no VM). `InstallFirewall`
+/// may have loaded its anchor before failing, so it too cleans back through
+/// `FirewallInstalled` (a true spawn failure is demoted in
+/// `cleanup_phase_for_failure`). The property test
 /// `step_cleanup_phase_agrees_with_outcome_oracle` pins this to
-/// [`cleanup_step_after_start_outcome`] for every outcome the step can
-/// produce.
-pub fn step_cleanup_phase(step: &AgentVmStartStep) -> CompletedStartStep {
+/// [`cleanup_step_after_start_outcome`] for every outcome the step can produce.
+pub fn step_cleanup_phase(step: &AgentVmStartStep) -> Option<CompletedStartStep> {
     match step {
-        AgentVmStartStep::CreateNetwork(_) => CompletedStartStep::None,
-        AgentVmStartStep::InspectAndValidateNetwork(_) | AgentVmStartStep::InstallFirewall(_) => {
-            CompletedStartStep::NetworkCreated
+        AgentVmStartStep::ProbeNetworkAbsent(_) => None,
+        AgentVmStartStep::CreateNetwork(_) | AgentVmStartStep::InspectAndValidateNetwork(_) => {
+            Some(CompletedStartStep::NetworkCreated)
+        }
+        AgentVmStartStep::InstallFirewall(_) | AgentVmStartStep::ProbeVmAbsent(_) => {
+            Some(CompletedStartStep::FirewallInstalled)
         }
         AgentVmStartStep::StartVm(_)
         | AgentVmStartStep::ProbeAndValidateGuestIpv6 { .. }
-        | AgentVmStartStep::ReleaseGuestCommand(_) => CompletedStartStep::FirewallInstalled,
+        | AgentVmStartStep::ReleaseGuestCommand(_) => Some(CompletedStartStep::VmStarted),
     }
 }
 
@@ -1636,6 +1852,7 @@ pub fn step_cleanup_phase(step: &AgentVmStartStep) -> CompletedStartStep {
 /// failure. The runner is required to use only these outcomes for the step.
 pub fn step_failure_outcomes(step: &AgentVmStartStep) -> Vec<StartOutcome> {
     match step {
+        AgentVmStartStep::ProbeNetworkAbsent(_) => vec![StartOutcome::NetworkAbsenceProbeFailed],
         AgentVmStartStep::CreateNetwork(_) => vec![StartOutcome::CreateNetworkFailed],
         AgentVmStartStep::InspectAndValidateNetwork(_) => vec![
             StartOutcome::InspectNetworkFailed,
@@ -1643,6 +1860,7 @@ pub fn step_failure_outcomes(step: &AgentVmStartStep) -> Vec<StartOutcome> {
             StartOutcome::ValidateNetworkInspectionFailed,
         ],
         AgentVmStartStep::InstallFirewall(_) => vec![StartOutcome::InstallFirewallFailed],
+        AgentVmStartStep::ProbeVmAbsent(_) => vec![StartOutcome::VmAbsenceProbeFailed],
         AgentVmStartStep::StartVm(_) => vec![StartOutcome::StartVmFailed],
         AgentVmStartStep::ProbeAndValidateGuestIpv6 { .. } => vec![
             StartOutcome::ProbeGuestIpv6Failed,
@@ -1671,6 +1889,12 @@ impl ResourcePresenceProbe {
     fn resource_still_present(&self, message: impl Into<String>) -> ProcessInvocationError {
         self.invocation.resource_still_present(message)
     }
+
+    /// The underlying list command, for projecting the probe into the dry-run
+    /// start-invocation sequence.
+    fn into_invocation(self) -> ProcessInvocation {
+        self.invocation
+    }
 }
 
 impl BrokerUrl {
@@ -1679,6 +1903,25 @@ impl BrokerUrl {
     }
 }
 
+/// Run the start sequence, tearing down this session's own infrastructure on
+/// failure.
+///
+/// **Ownership.** All resource names derive from the plan's `SessionId`, and
+/// failure cleanup removes resources *by that name*. Each creating step
+/// (`CreateNetwork`, `StartVm`) is preceded by an absence probe
+/// (`ProbeNetworkAbsent`, `ProbeVmAbsent`) that reports
+/// [`StartFailure::NetworkAlreadyPresent`] / [`StartFailure::VmAlreadyPresent`] —
+/// which cleanup leaves untouched — if the resource already exists when the start
+/// begins, so *this function's* in-start cleanup performs no teardown on that
+/// conflict. Names are host-global but ownership is only per-`--state-dir`, and a
+/// foreign same-name resource only exists when a `SessionId` is deliberately
+/// reused across state directories (or the raw runner) — normal ids are random v4
+/// UUIDs that never collide. Reuse is accepted as a fail case, and the failure may
+/// be messy there: the managed daemon's outer rollback tears the session's
+/// resources down *unconditionally by name*, so on the daemon path a refused
+/// foreign resource can still be removed. The `writ.owner` label stamped on the
+/// created resources is informational (see [`AgentVmOwnerToken`]); it does not
+/// gate cleanup.
 pub fn start_agent_vm_session(plan: &AgentVmSessionPlan) -> Result<(), AgentVmLifecycleRunError> {
     for step in plan.start_steps() {
         if let Err((failure, outcome)) = run_start_step(plan, &step) {
@@ -1697,6 +1940,30 @@ fn run_start_step(
     step: &AgentVmStartStep,
 ) -> Result<(), (StartFailure, StartOutcome)> {
     match step {
+        // Prove absence before creating. The network name is host-global but
+        // ownership is per-state-dir (or the caller may be the unmanaged raw
+        // path), so a network already bearing this session's name is not ours to
+        // create — nor, on a later failure, to remove. Refuse rather than risk
+        // disrupting another owner's live session. Only after this confirms
+        // absence does CreateNetwork run, so a create failure can safely be
+        // cleaned as our own partial creation. Best-effort: a concurrent creator
+        // in the window between this probe and create still races; true
+        // exclusivity needs the managed state-store lock.
+        AgentVmStartStep::ProbeNetworkAbsent(probe) => match probe.contains_resource() {
+            Ok(true) => Err((
+                StartFailure::NetworkAlreadyPresent {
+                    network: plan.names().network().to_string(),
+                },
+                StartOutcome::NetworkAbsenceProbeFailed,
+            )),
+            Ok(false) => Ok(()),
+            // The probe failed, so create never ran and nothing was created:
+            // the outcome maps to no teardown.
+            Err(source) => Err((
+                StartFailure::NetworkPresenceProbeFailed { source },
+                StartOutcome::NetworkAbsenceProbeFailed,
+            )),
+        },
         AgentVmStartStep::CreateNetwork(invocation) => invocation
             .run()
             .map_err(|err| (err.into(), StartOutcome::CreateNetworkFailed)),
@@ -1720,6 +1987,22 @@ fn run_start_step(
         AgentVmStartStep::InstallFirewall(invocation) => invocation
             .run()
             .map_err(|err| (err.into(), StartOutcome::InstallFirewallFailed)),
+        // Prove the agent VM absent before starting it (the network and PF anchor
+        // already exist and are ours). A present or unprobeable VM is not ours, so
+        // refuse — cleanup then removes the network and PF but not the VM.
+        AgentVmStartStep::ProbeVmAbsent(probe) => match probe.contains_resource() {
+            Ok(true) => Err((
+                StartFailure::VmAlreadyPresent {
+                    vm: plan.names().vm().to_string(),
+                },
+                StartOutcome::VmAbsenceProbeFailed,
+            )),
+            Ok(false) => Ok(()),
+            Err(source) => Err((
+                StartFailure::VmPresenceProbeFailed { source },
+                StartOutcome::VmAbsenceProbeFailed,
+            )),
+        },
         AgentVmStartStep::StartVm(_) => plan
             .run_start_vm_invocation()
             .map_err(|err| (err, StartOutcome::StartVmFailed)),
@@ -1974,7 +2257,7 @@ fn fail_after_cleanup<T>(
     plan: &AgentVmSessionPlan,
     outcome: StartOutcome,
 ) -> Result<T, AgentVmLifecycleRunError> {
-    match run_cleanup_after_start_outcome(plan, outcome) {
+    match run_cleanup_for_phase(plan, cleanup_phase_for_failure(outcome, &original)) {
         Ok(()) => Err(original.into()),
         Err(cleanup) => Err(AgentVmLifecycleRunError::CleanupAfterFailure {
             original: Box::new(original),
@@ -1983,26 +2266,74 @@ fn fail_after_cleanup<T>(
     }
 }
 
-fn run_cleanup_after_start_outcome(
-    plan: &AgentVmSessionPlan,
+/// Refine the outcome→phase mapping by failure kind. Almost always the outcome
+/// alone determines cleanup, because each creating step runs only after its
+/// resource was proven absent. The one exception: a *creating command* that never
+/// spawned (`ProcessInvocationError::Run`, which is spawn-only) created nothing,
+/// so it must be demoted below its own resource. This matters when the container
+/// tool becomes unavailable between the absence probe and the create/run command
+/// (removed or made non-executable): routing cleanup through the same missing
+/// tool would otherwise fail and strand a recovery record for infrastructure that
+/// never existed. A post-spawn `WaitOutput` or a nonzero `Failed` exit may have
+/// created the resource, so those still use the outcome's phase.
+fn cleanup_phase_for_failure(
     outcome: StartOutcome,
+    original: &StartFailure,
+) -> Option<CompletedStartStep> {
+    let never_spawned = matches!(
+        original,
+        StartFailure::Process(ProcessInvocationError::Run { .. })
+    );
+    if never_spawned {
+        match outcome {
+            // `network create` is the first creating step: nothing exists yet.
+            StartOutcome::CreateNetworkFailed => return None,
+            // The firewall helper never ran, so no anchor was loaded; only the
+            // already-created network exists.
+            StartOutcome::InstallFirewallFailed => return Some(CompletedStartStep::NetworkCreated),
+            // `container run` never started the VM; the network and PF anchor
+            // already exist and are ours.
+            StartOutcome::StartVmFailed => return Some(CompletedStartStep::FirewallInstalled),
+            _ => {}
+        }
+    }
+    cleanup_step_after_start_outcome(outcome)
+}
+
+/// Cleanup after a *start* failure, by phase. Each resource is removed by name;
+/// no ownership check is attempted.
+///
+/// The `writ.owner` label stamped on the network and VM is informational only
+/// (visible via `container inspect`). It deliberately does *not* gate cleanup:
+/// making failure cleanup safe against a concurrent same-name owner would require
+/// host-global coordination the per-`--state-dir` design lacks, and that only
+/// matters when a session id is *deliberately reused* across state directories
+/// (or the raw runner) — normal session ids are random v4 UUIDs that never
+/// collide. The prove-absence steps make the common conflict (the resource
+/// already exists when the start begins) fail cleanly without any teardown; the
+/// residual is the narrow window where two concurrent reused-id starts both
+/// probe absent, which we accept may fail messily. See [`AgentVmOwnerToken`].
+fn run_cleanup_for_phase(
+    plan: &AgentVmSessionPlan,
+    phase: Option<CompletedStartStep>,
 ) -> Result<(), CleanupErrors> {
-    match cleanup_step_after_start_outcome(outcome) {
+    let stop = plan.stop_plan();
+    match phase {
         // Network-created phase: the firewall is not yet installed. Host removes
         // the network it created; vm has nothing to clean (the broker arm owns
         // the shared network).
         Some(CompletedStartStep::NetworkCreated) => match plan.broker_placement {
-            BrokerPlacement::Host => {
-                single_cleanup_result(run_network_cleanup_until_absent(&plan.stop_plan()))
-            }
+            BrokerPlacement::Host => single_cleanup_result(run_network_cleanup_until_absent(&stop)),
             BrokerPlacement::Vm => Ok(()),
         },
-        // Firewall-installed phase: `run_stop_plan_cleanup` branches on placement
-        // exactly like the planned-cleanup helper — host removes VM+PF+network,
-        // vm removes VM+PF (the broker arm owns the network). Both remove the PF
-        // anchor, so a vm start failure cannot strand host filtering.
-        Some(CompletedStartStep::FirewallInstalled) => run_stop_plan_cleanup(&plan.stop_plan()),
-        Some(CompletedStartStep::None) | None => Ok(()),
+        // Firewall-installed phase: PF anchor + (host) network, but no VM — the VM
+        // was never started (its absence probe failed, or the firewall step did).
+        Some(CompletedStartStep::FirewallInstalled) => {
+            finish_cleanup_errors(firewall_then_network_cleanup_errors(&stop))
+        }
+        // Vm-started phase: host removes VM+PF+network, vm removes VM+PF.
+        Some(CompletedStartStep::VmStarted) => run_stop_plan_cleanup(&stop),
+        None => Ok(()),
     }
 }
 
@@ -2015,6 +2346,14 @@ fn run_stop_plan_cleanup(plan: &AgentVmSessionStopPlan) -> Result<(), CleanupErr
     if let Err(err) = run_vm_cleanup_until_absent(plan) {
         errors.push(err);
     }
+    errors.extend(firewall_then_network_cleanup_errors(plan));
+    finish_cleanup_errors(errors)
+}
+
+fn firewall_then_network_cleanup_errors(
+    plan: &AgentVmSessionStopPlan,
+) -> Vec<ProcessInvocationError> {
+    let mut errors = Vec::new();
     // Both placements remove the host PF anchor (an `--internal` network does not
     // isolate the agent from host services).
     if let Err(err) = plan.remove_firewall_invocation().run() {
@@ -2028,7 +2367,7 @@ fn run_stop_plan_cleanup(plan: &AgentVmSessionStopPlan) -> Result<(), CleanupErr
     {
         errors.push(err);
     }
-    finish_cleanup_errors(errors)
+    errors
 }
 
 fn finish_cleanup_errors(errors: Vec<ProcessInvocationError>) -> Result<(), CleanupErrors> {
@@ -2264,11 +2603,13 @@ mod spec {
     fn arb_start_outcome() -> impl Strategy<Value = StartOutcome> {
         prop_oneof![
             Just(StartOutcome::Started),
+            Just(StartOutcome::NetworkAbsenceProbeFailed),
             Just(StartOutcome::CreateNetworkFailed),
             Just(StartOutcome::InspectNetworkFailed),
             Just(StartOutcome::ParseNetworkInspectionFailed),
             Just(StartOutcome::ValidateNetworkInspectionFailed),
             Just(StartOutcome::InstallFirewallFailed),
+            Just(StartOutcome::VmAbsenceProbeFailed),
             Just(StartOutcome::StartVmFailed),
             Just(StartOutcome::ProbeGuestIpv6Failed),
             Just(StartOutcome::ValidateGuestIpv6Failed),
@@ -2512,11 +2853,17 @@ mod spec {
         fn start_outcome_maps_to_the_expected_cleanup(outcome in arb_start_outcome()) {
             let cleanup = plan(7).cleanup_after_start_outcome(outcome);
             let expected_len = match outcome {
-                StartOutcome::Started | StartOutcome::CreateNetworkFailed => 0,
-                StartOutcome::InspectNetworkFailed
+                // Success, or a network-absence-probe failure that created nothing.
+                StartOutcome::Started | StartOutcome::NetworkAbsenceProbeFailed => 0,
+                // Network / inspect failure: remove the network (rm + delete = 2).
+                StartOutcome::CreateNetworkFailed
+                | StartOutcome::InspectNetworkFailed
                 | StartOutcome::ParseNetworkInspectionFailed
-                | StartOutcome::ValidateNetworkInspectionFailed
-                | StartOutcome::InstallFirewallFailed => 2,
+                | StartOutcome::ValidateNetworkInspectionFailed => 2,
+                // Firewall-install failure (may have loaded the anchor) or a
+                // VM-absence-probe failure: PF removal (1) + network (2), no VM.
+                StartOutcome::InstallFirewallFailed | StartOutcome::VmAbsenceProbeFailed => 3,
+                // VM started (or later): VM (4) + PF (1) + network (2).
                 StartOutcome::StartVmFailed
                 | StartOutcome::ProbeGuestIpv6Failed
                 | StartOutcome::ValidateGuestIpv6Failed
@@ -2541,7 +2888,7 @@ mod spec {
                 for outcome in step_failure_outcomes(&step) {
                     prop_assert_eq!(
                         cleanup_step_after_start_outcome(outcome),
-                        Some(phase),
+                        phase,
                         "step {:?} outcome {:?} disagrees with oracle",
                         step,
                         outcome,

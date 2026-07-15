@@ -216,6 +216,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             if dry_run {
                 print_start_invocations(&plan.start_invocations());
             } else {
+                // Ownership is guarded inside start_agent_vm_session itself: its
+                // ProbeNetworkAbsent / ProbeVmAbsent steps refuse to start (and
+                // later tear down) infrastructure this call did not create. This
+                // covers the raw path too, and appears in --dry-run.
                 start_agent_vm_session(&plan)?;
                 println!("session_id={}", plan.session_id());
                 println!("network={}", plan.names().network());

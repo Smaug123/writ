@@ -326,6 +326,443 @@ fn vm_placement_start_failure_rolls_back_the_agent_vm_and_pf_not_the_network() {
     assert!(!argv.contains("network delete"), "{argv}");
 }
 
+#[cfg(unix)]
+#[test]
+fn host_placement_start_tears_down_a_network_that_create_left_behind_on_failure() {
+    // A `container network create` that registers the network and *then* exits
+    // nonzero must not orphan it: managed start must tear the network down even
+    // though the create command reported failure. Regression for the "failed
+    // commands are assumed to have left no residue" gap — the teardown is
+    // idempotent and absence-based, so tearing down a maybe-created resource is
+    // always safe, and leaving it stranded would let a reused subnet collide with
+    // an orphaned network after the recovery record is dropped.
+    let dir = tempfile::tempdir().unwrap();
+    let store = AgentVmSessionStateStore::new(dir.path().join("state"));
+    let log = dir.path().join("argv.log");
+    let marker = dir.path().join("network-exists");
+    let network_name = plan_with_ipv6_mode(252, Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6)
+        .names()
+        .network()
+        .to_string();
+    // A stateful fake `container`: `network create` registers the network then
+    // fails; `network rm`/`delete` deregister it; `network list` reports it
+    // present iff the marker exists, so the absence-based cleanup runs the removal
+    // then observes it gone.
+    let tool = write_executable_script(
+        dir.path(),
+        "create-fails-dirty",
+        &format!(
+            "#!/bin/sh\n\
+             printf '%s\\n' \"$*\" >> \"{log}\"\n\
+             if [ \"$1\" = network ] && [ \"$2\" = create ]; then touch \"{marker}\"; exit 1; fi\n\
+             if [ \"$1\" = network ] && [ \"$2\" = rm ]; then rm -f \"{marker}\"; exit 0; fi\n\
+             if [ \"$1\" = network ] && [ \"$2\" = delete ]; then rm -f \"{marker}\"; exit 0; fi\n\
+             if [ \"$1\" = network ] && [ \"$2\" = list ]; then [ -f \"{marker}\" ] && printf '%s\\n' \"{network}\"; exit 0; fi\n\
+             exit 0\n",
+            log = log.display(),
+            marker = marker.display(),
+            network = network_name,
+        ),
+    );
+    let plan = AgentVmSessionPlan::new(
+        session_id(),
+        pool(),
+        252,
+        ports(),
+        BrokerPortRange::new(49152, 65535).unwrap(),
+        Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6,
+        ContainerImage::new("alpine:latest").unwrap(),
+        vec!["sleep".into(), "600".into()],
+        AgentVmResources::new(1, 512).unwrap(),
+        AgentVmToolPaths::new(&tool, &tool, &tool),
+    )
+    .unwrap();
+
+    let err = start_managed_agent_vm_session(&store, &plan).unwrap_err();
+
+    // Cleanup succeeded (the stranded network was torn down), so the failure
+    // surfaces as a plain Start error, not CleanupAfterFailure.
+    assert!(
+        matches!(
+            err,
+            AgentVmSessionManagerError::Start(AgentVmLifecycleRunError::Start(_))
+        ),
+        "{err:?}"
+    );
+
+    // The create command left a network behind; managed start must have removed
+    // it rather than trusting the nonzero exit to mean nothing was created.
+    let argv = fs::read_to_string(&log).unwrap();
+    assert!(argv.contains("network create"), "{argv}");
+    assert!(argv.contains("network rm"), "{argv}");
+    assert!(
+        !marker.exists(),
+        "create left a network behind that managed start failed to tear down:\n{argv}"
+    );
+
+    // With the orphan cleaned, dropping the recovery record is correct.
+    let missing = store.load(plan.session_id()).unwrap_err();
+    assert!(matches!(missing, AgentVmSessionStateError::NotFound { .. }));
+}
+
+#[cfg(unix)]
+#[test]
+fn host_placement_start_drops_the_record_when_the_tool_cannot_spawn() {
+    // A missing / non-executable container tool fails to *spawn* (the pre-create
+    // probe is the first command to run, so it fails first). Nothing was created,
+    // so no infrastructure exists to recover and cleanup would only route through
+    // the same unavailable binary. Managed start must therefore drop the recovery
+    // record and free the subnet rather than retaining a spurious Starting claim
+    // that repeated attempts would use to exhaust the pool.
+    let dir = tempfile::tempdir().unwrap();
+    let store = AgentVmSessionStateStore::new(dir.path().join("state"));
+    let missing_tool = dir.path().join("definitely-not-a-real-tool");
+    let plan = AgentVmSessionPlan::new(
+        session_id(),
+        pool(),
+        252,
+        ports(),
+        BrokerPortRange::new(49152, 65535).unwrap(),
+        Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6,
+        ContainerImage::new("alpine:latest").unwrap(),
+        vec!["sleep".into(), "600".into()],
+        AgentVmResources::new(1, 512).unwrap(),
+        AgentVmToolPaths::new(&missing_tool, &missing_tool, &missing_tool),
+    )
+    .unwrap();
+
+    let err = start_managed_agent_vm_session(&store, &plan).unwrap_err();
+
+    // Nothing ran to completion, so the failure is a plain Start error, not a
+    // CleanupAfterFailure (which would strand the record).
+    assert!(
+        matches!(
+            err,
+            AgentVmSessionManagerError::Start(AgentVmLifecycleRunError::Start(_))
+        ),
+        "{err:?}"
+    );
+    let missing = store.load(plan.session_id()).unwrap_err();
+    assert!(
+        matches!(missing, AgentVmSessionStateError::NotFound { .. }),
+        "a spawn failure that created nothing must not leave a subnet-claiming record"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn host_placement_start_refuses_and_removes_nothing_when_the_network_predates_it() {
+    // A network already bearing this session's name (another owner, another
+    // --state-dir, or a leak) must not be torn down by a start that did not
+    // create it. The CreateNetwork step probes first, and on finding it present
+    // refuses without issuing any removal.
+    let dir = tempfile::tempdir().unwrap();
+    let store = AgentVmSessionStateStore::new(dir.path().join("state"));
+    let log = dir.path().join("argv.log");
+    let network_name = plan_with_ipv6_mode(252, Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6)
+        .names()
+        .network()
+        .to_string();
+    // Fake container: `network list` always reports the network present (it
+    // predates us); everything else logs and succeeds.
+    let tool = write_executable_script(
+        dir.path(),
+        "network-predates",
+        &format!(
+            "#!/bin/sh\n\
+             printf '%s\\n' \"$*\" >> \"{log}\"\n\
+             if [ \"$1\" = network ] && [ \"$2\" = list ]; then printf '%s\\n' \"{network}\"; exit 0; fi\n\
+             exit 0\n",
+            log = log.display(),
+            network = network_name,
+        ),
+    );
+    let plan = AgentVmSessionPlan::new(
+        session_id(),
+        pool(),
+        252,
+        ports(),
+        BrokerPortRange::new(49152, 65535).unwrap(),
+        Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6,
+        ContainerImage::new("alpine:latest").unwrap(),
+        vec!["sleep".into(), "600".into()],
+        AgentVmResources::new(1, 512).unwrap(),
+        AgentVmToolPaths::new(&tool, &tool, &tool),
+    )
+    .unwrap();
+
+    let err = start_managed_agent_vm_session(&store, &plan).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            AgentVmSessionManagerError::Start(AgentVmLifecycleRunError::Start(ref start))
+                if matches!(**start, StartFailure::NetworkAlreadyPresent { .. })
+        ),
+        "{err:?}"
+    );
+
+    // Never created the network, and — crucially — never tried to remove it.
+    let argv = fs::read_to_string(&log).unwrap();
+    assert!(!argv.contains("network create"), "{argv}");
+    assert!(!argv.contains("network rm"), "{argv}");
+    assert!(!argv.contains("network delete"), "{argv}");
+
+    // No infrastructure was created, so no recovery record is retained.
+    let missing = store.load(plan.session_id()).unwrap_err();
+    assert!(matches!(missing, AgentVmSessionStateError::NotFound { .. }));
+}
+
+#[cfg(unix)]
+#[test]
+fn host_placement_start_removes_nothing_when_the_pre_create_probe_fails() {
+    // If the existence probe itself fails (here `network list` exits nonzero),
+    // create was never attempted, so nothing is ours: the start must refuse and
+    // issue no network removal, and must not strand a recovery record.
+    let dir = tempfile::tempdir().unwrap();
+    let store = AgentVmSessionStateStore::new(dir.path().join("state"));
+    let log = dir.path().join("argv.log");
+    // Fake container: `network list` fails (nonzero, a `Failed` process error —
+    // not a spawn failure); anything else logs and succeeds.
+    let tool = write_executable_script(
+        dir.path(),
+        "probe-fails",
+        &format!(
+            "#!/bin/sh\n\
+             printf '%s\\n' \"$*\" >> \"{log}\"\n\
+             if [ \"$1\" = network ] && [ \"$2\" = list ]; then echo 'boom' >&2; exit 1; fi\n\
+             exit 0\n",
+            log = log.display(),
+        ),
+    );
+    let plan = AgentVmSessionPlan::new(
+        session_id(),
+        pool(),
+        252,
+        ports(),
+        BrokerPortRange::new(49152, 65535).unwrap(),
+        Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6,
+        ContainerImage::new("alpine:latest").unwrap(),
+        vec!["sleep".into(), "600".into()],
+        AgentVmResources::new(1, 512).unwrap(),
+        AgentVmToolPaths::new(&tool, &tool, &tool),
+    )
+    .unwrap();
+
+    let err = start_managed_agent_vm_session(&store, &plan).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            AgentVmSessionManagerError::Start(AgentVmLifecycleRunError::Start(ref start))
+                if matches!(**start, StartFailure::NetworkPresenceProbeFailed { .. })
+        ),
+        "{err:?}"
+    );
+
+    let argv = fs::read_to_string(&log).unwrap();
+    assert!(!argv.contains("network create"), "{argv}");
+    assert!(!argv.contains("network rm"), "{argv}");
+    assert!(!argv.contains("network delete"), "{argv}");
+
+    let missing = store.load(plan.session_id()).unwrap_err();
+    assert!(matches!(missing, AgentVmSessionStateError::NotFound { .. }));
+}
+
+#[cfg(unix)]
+#[test]
+fn host_placement_start_refuses_and_removes_no_vm_when_the_agent_vm_predates_it() {
+    // An agent VM already bearing this session's name (another owner / --state-dir)
+    // must not be torn down by a start that did not create it. The ProbeVmAbsent
+    // step (after the network + PF are created) finds it present and refuses,
+    // cleaning back the network + PF it *did* create but never touching the VM.
+    let dir = tempfile::tempdir().unwrap();
+    let store = AgentVmSessionStateStore::new(dir.path().join("state"));
+    let log = dir.path().join("argv.log");
+    let marker = dir.path().join("network-exists");
+    let network_name = plan_with_ipv6_mode(252, Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6)
+        .names()
+        .network()
+        .to_string();
+    let vm_name = plan_with_ipv6_mode(252, Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6)
+        .names()
+        .vm()
+        .to_string();
+    // Fake container/sudo: `network list` reports the network present iff the
+    // create marker exists (so the pre-create probe sees absent, then create
+    // registers it, and cleanup can remove it); `list` (VM probe) always reports
+    // the agent VM present; `network inspect` reports the subnet; everything logs.
+    let tool = write_executable_script(
+        dir.path(),
+        "vm-predates",
+        &format!(
+            "#!/bin/sh\n\
+             printf '%s\\n' \"$*\" >> \"{log}\"\n\
+             if [ \"$1\" = network ] && [ \"$2\" = list ]; then [ -f \"{marker}\" ] && printf '%s\\n' \"{network}\"; exit 0; fi\n\
+             if [ \"$1\" = network ] && [ \"$2\" = create ]; then touch \"{marker}\"; exit 0; fi\n\
+             if [ \"$1\" = network ] && [ \"$2\" = rm ]; then rm -f \"{marker}\"; exit 0; fi\n\
+             if [ \"$1\" = network ] && [ \"$2\" = delete ]; then rm -f \"{marker}\"; exit 0; fi\n\
+             if [ \"$1\" = network ] && [ \"$2\" = inspect ]; then printf '%s\\n' 'ipv4Subnet: 192.168.252.0/24' 'ipv4Gateway: 192.168.252.1'; exit 0; fi\n\
+             if [ \"$1\" = list ]; then printf '%s\\n' \"{vm}\"; exit 0; fi\n\
+             exit 0\n",
+            log = log.display(),
+            marker = marker.display(),
+            network = network_name,
+            vm = vm_name,
+        ),
+    );
+    let plan = AgentVmSessionPlan::new(
+        session_id(),
+        pool(),
+        252,
+        ports(),
+        BrokerPortRange::new(49152, 65535).unwrap(),
+        Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6,
+        ContainerImage::new("alpine:latest").unwrap(),
+        vec!["sleep".into(), "600".into()],
+        AgentVmResources::new(1, 512).unwrap(),
+        AgentVmToolPaths::new(&tool, &tool, &tool),
+    )
+    .unwrap();
+
+    let err = start_managed_agent_vm_session(&store, &plan).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            AgentVmSessionManagerError::Start(AgentVmLifecycleRunError::Start(ref start))
+                if matches!(**start, StartFailure::VmAlreadyPresent { .. })
+        ),
+        "{err:?}"
+    );
+
+    let argv = fs::read_to_string(&log).unwrap();
+    // Never ran the VM, and never tried to remove it (no `rm -f <vm>` etc.).
+    assert!(!argv.contains("run "), "{argv}");
+    assert!(!argv.contains(&format!("rm -f {vm_name}")), "{argv}");
+    assert!(!argv.contains(&format!("delete {vm_name}")), "{argv}");
+    // But it did clean the network it created.
+    assert!(argv.contains("network rm"), "{argv}");
+
+    let missing = store.load(plan.session_id()).unwrap_err();
+    assert!(matches!(missing, AgentVmSessionStateError::NotFound { .. }));
+}
+
+#[test]
+fn a_creating_command_that_never_spawned_is_demoted_below_its_own_resource() {
+    // A spawn failure (`Run`) proves the command never executed, so it created
+    // nothing: demote below its own resource so cleanup does not route through the
+    // now-missing tool and strand a record. A post-spawn wait failure or a nonzero
+    // exit may have created the resource, so those keep the outcome's phase.
+    let create_spawn = StartFailure::Process(ProcessInvocationError::Run {
+        program: "container".into(),
+        args: "network create".into(),
+        source: std::io::Error::from(std::io::ErrorKind::NotFound),
+    });
+    assert_eq!(
+        cleanup_phase_for_failure(StartOutcome::CreateNetworkFailed, &create_spawn),
+        None
+    );
+
+    let run_spawn = StartFailure::Process(ProcessInvocationError::Run {
+        program: "container".into(),
+        args: "run".into(),
+        source: std::io::Error::from(std::io::ErrorKind::NotFound),
+    });
+    assert_eq!(
+        cleanup_phase_for_failure(StartOutcome::StartVmFailed, &run_spawn),
+        Some(CompletedStartStep::FirewallInstalled)
+    );
+
+    // A firewall install that never spawned loaded no anchor: only the network is
+    // ours (demoted from FirewallInstalled to NetworkCreated).
+    let install_spawn = StartFailure::Process(ProcessInvocationError::Run {
+        program: "sudo".into(),
+        args: "writ-agent-vm-pf-helper install".into(),
+        source: std::io::Error::from(std::io::ErrorKind::NotFound),
+    });
+    assert_eq!(
+        cleanup_phase_for_failure(StartOutcome::InstallFirewallFailed, &install_spawn),
+        Some(CompletedStartStep::NetworkCreated)
+    );
+    // A firewall install that ran but failed may have loaded the anchor → keep the
+    // FirewallInstalled phase.
+    let install_nonzero = StartFailure::Process(ProcessInvocationError::Failed {
+        program: "sudo".into(),
+        args: "writ-agent-vm-pf-helper install".into(),
+        status: "1".into(),
+        stderr: String::new(),
+    });
+    assert_eq!(
+        cleanup_phase_for_failure(StartOutcome::InstallFirewallFailed, &install_nonzero),
+        Some(CompletedStartStep::FirewallInstalled)
+    );
+
+    // Wait failure and nonzero exit both keep the outcome's phase (maybe created).
+    let create_wait = StartFailure::Process(ProcessInvocationError::WaitOutput {
+        program: "container".into(),
+        args: "network create".into(),
+        source: std::io::Error::from(std::io::ErrorKind::BrokenPipe),
+    });
+    assert_eq!(
+        cleanup_phase_for_failure(StartOutcome::CreateNetworkFailed, &create_wait),
+        Some(CompletedStartStep::NetworkCreated)
+    );
+    let run_nonzero = StartFailure::Process(ProcessInvocationError::Failed {
+        program: "container".into(),
+        args: "run".into(),
+        status: "1".into(),
+        stderr: String::new(),
+    });
+    assert_eq!(
+        cleanup_phase_for_failure(StartOutcome::StartVmFailed, &run_nonzero),
+        Some(CompletedStartStep::VmStarted)
+    );
+}
+
+#[test]
+fn outcome_maps_to_the_phase_that_reflects_what_exists() {
+    // The absence-probe outcomes clean nothing of their own resource: the network
+    // probe runs first (nothing exists yet), the VM probe runs after the network
+    // and PF are ours (so it cleans those but not the foreign VM). A create /
+    // inspect failure cleans the network; a firewall-install failure (may have
+    // loaded the anchor) cleans network + PF; a VM-start or later failure cleans
+    // everything.
+    use StartOutcome::*;
+    assert_eq!(
+        cleanup_step_after_start_outcome(NetworkAbsenceProbeFailed),
+        None
+    );
+    for network_phase in [
+        CreateNetworkFailed,
+        InspectNetworkFailed,
+        ParseNetworkInspectionFailed,
+        ValidateNetworkInspectionFailed,
+    ] {
+        assert_eq!(
+            cleanup_step_after_start_outcome(network_phase),
+            Some(CompletedStartStep::NetworkCreated),
+            "{network_phase:?}"
+        );
+    }
+    for firewall_phase in [InstallFirewallFailed, VmAbsenceProbeFailed] {
+        assert_eq!(
+            cleanup_step_after_start_outcome(firewall_phase),
+            Some(CompletedStartStep::FirewallInstalled),
+            "{firewall_phase:?}"
+        );
+    }
+    for vm_phase in [
+        StartVmFailed,
+        ProbeGuestIpv6Failed,
+        ValidateGuestIpv6Failed,
+        ReleaseGuestCommandFailed,
+    ] {
+        assert_eq!(
+            cleanup_step_after_start_outcome(vm_phase),
+            Some(CompletedStartStep::VmStarted),
+            "{vm_phase:?}"
+        );
+    }
+}
+
 #[test]
 fn vm_placement_persists_and_stop_removes_the_agent_vm_and_pf_not_the_network() {
     // The placement survives the persisted record, so a later managed stop /
