@@ -447,21 +447,28 @@ impl ChatgptOauthAuthority {
         secret_store: &S,
     ) -> Result<ChatgptUpstreamHeaders, ChatgptOauthError> {
         let mut state = self.state.lock().await;
-        let bundle = match &mut *state {
-            ChatgptOauthState::Loaded { bundle, .. } => bundle,
-            ChatgptOauthState::Cold => {
-                let loaded = load_bundle_from_secret_store(secret_store, &self.config.secret_key)?;
-                *state = ChatgptOauthState::Loaded {
-                    bundle: loaded,
-                    needs_persist: false,
-                };
-                let ChatgptOauthState::Loaded { bundle, .. } = &mut *state else {
-                    unreachable!("just assigned Loaded above");
-                };
-                bundle
-            }
-        };
+        if matches!(&*state, ChatgptOauthState::Cold) {
+            let loaded = load_bundle_from_secret_store(secret_store, &self.config.secret_key)?;
+            *state = ChatgptOauthState::Loaded {
+                bundle: loaded,
+                needs_persist: false,
+            };
+        }
 
+        // If an earlier refresh left the cache ahead of durable storage,
+        // flush it now — before any refresh below, which could itself fail
+        // transiently and otherwise leave the spent refresh token durable.
+        // Best-effort: a still-failing write must not fail this request,
+        // since the cached token is valid.
+        self.retry_pending_persist(secret_store, &mut state);
+
+        // Judge freshness *after* the flush: `put` is synchronous and
+        // unbounded, so a barely-fresh token could cross into expiry while
+        // the flush blocks. Reading `now` here keeps the decision honest.
+        let bundle = match &*state {
+            ChatgptOauthState::Loaded { bundle, .. } => bundle,
+            ChatgptOauthState::Cold => unreachable!("loaded above"),
+        };
         let tokens = bundle
             .tokens
             .as_ref()
@@ -471,12 +478,6 @@ impl ChatgptOauthAuthority {
             self.config.clock.now_unix_seconds(),
             self.config.leeway_seconds,
         );
-        // If an earlier refresh left the cache ahead of durable storage,
-        // flush it now — before any refresh below, which could itself fail
-        // transiently and otherwise leave the spent refresh token durable.
-        // Best-effort: a still-failing write must not fail this request,
-        // since the cached token is valid.
-        self.retry_pending_persist(secret_store, &mut state);
         if decision != RefreshDecision::Fresh {
             self.refresh(secret_store, &mut state).await?;
         }

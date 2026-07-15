@@ -19,6 +19,11 @@ struct InMemStore {
     /// test drive the "refresh succeeded upstream but the durable write
     /// failed" path, then "repair" the store to watch the cache heal.
     fail_puts: AtomicBool,
+    /// Simulates wall-clock time elapsing inside a (possibly slow) `put`:
+    /// each successful write advances the shared clock by this many
+    /// seconds. Lets a test prove that token freshness is judged *after*
+    /// the pending-persist flush, not before.
+    put_clock: StdMutex<Option<(Arc<FakeClock>, i64)>>,
 }
 
 impl SecretStore for InMemStore {
@@ -34,6 +39,9 @@ impl SecretStore for InMemStore {
             .lock()
             .unwrap()
             .insert(key.as_str().to_string(), value.to_string());
+        if let Some((clock, secs)) = &*self.put_clock.lock().unwrap() {
+            clock.set(clock.now_unix_seconds() + *secs);
+        }
         Ok(())
     }
 
@@ -46,6 +54,10 @@ impl SecretStore for InMemStore {
 impl InMemStore {
     fn set_fail_puts(&self, fail: bool) {
         self.fail_puts.store(fail, Ordering::SeqCst);
+    }
+
+    fn advance_clock_on_put(&self, clock: Arc<FakeClock>, secs: i64) {
+        *self.put_clock.lock().unwrap() = Some((clock, secs));
     }
 
     fn contains(&self, key: &SecretKey) -> bool {
@@ -556,6 +568,62 @@ async fn pending_persist_is_flushed_before_a_stale_token_refresh() {
     let stored: ChatgptAuthBundle =
         serde_json::from_str(&store.get(&key).unwrap().unwrap()).unwrap();
     assert_eq!(stored.tokens.unwrap().refresh_token, "refresh-mid");
+}
+
+#[tokio::test]
+async fn freshness_is_reevaluated_after_a_slow_pending_persist() {
+    let store = InMemStore::default();
+    let key = SecretKey::new("openai-chatgpt-auth").unwrap();
+    let bundle = make_bundle(/*exp=*/ 1_050, "refresh-old", false);
+    store
+        .put(&key, &serde_json::to_string(&bundle).unwrap())
+        .unwrap();
+    let clock = Arc::new(FakeClock::new(1_000));
+    let server = MockServer::start().await;
+    // First refresh rotates to a token that expires at 2_000 — fresh at
+    // now = 1_000. Highest priority, single use.
+    Mock::given(method("POST"))
+        .and(path("/oauth/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id_token": id_token_with_chatgpt_claims("acct-rotated", false, 99_999),
+            "access_token": access_token_with_exp(2_000),
+            "refresh_token": "refresh-mid",
+        })))
+        .with_priority(1)
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    // Any later refresh rotates to a long-lived token.
+    Mock::given(method("POST"))
+        .and(path("/oauth/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id_token": id_token_with_chatgpt_claims("acct-rotated", false, 99_999),
+            "access_token": access_token_with_exp(99_000),
+            "refresh_token": "refresh-new",
+        })))
+        .mount(&server)
+        .await;
+    let refresh_url = format!("{}/oauth/token", server.uri());
+    let (authority, _) = build_authority(&refresh_url, Arc::clone(&clock));
+
+    // First call: stale v1 → refresh to exp=2_000/"refresh-mid", but the
+    // durable write fails, leaving needs_persist set.
+    store.set_fail_puts(true);
+    authority.current_headers(&store).await.unwrap_err();
+
+    // Store recovers, but the now-successful write "takes" 1_500 simulated
+    // seconds each time, so the pending-persist flush pushes the clock from
+    // 1_000 to 2_500 — past the cached token's 2_000 expiry.
+    store.set_fail_puts(false);
+    store.advance_clock_on_put(Arc::clone(&clock), 1_500);
+
+    // Second call: at entry the cached token (exp 2_000) is still fresh
+    // (now = 1_000). The flush advances the clock to 2_500. Freshness must
+    // be judged *after* the flush, so the now-expired token triggers a
+    // refresh and we return the freshly rotated long-lived token rather than
+    // handing back an expired one.
+    let headers = authority.current_headers(&store).await.unwrap();
+    assert_eq!(headers.access_token, access_token_with_exp(99_000));
 }
 
 #[tokio::test]
