@@ -681,16 +681,19 @@ impl ChatgptOauthAuthority {
                 *needs_persist = false;
                 Ok(())
             }
-            Ok(PersistOutcome::Diverged(observed)) => {
+            Ok(PersistOutcome::Diverged(_observed)) => {
                 // The operator changed the secret out-of-band while we
                 // refreshed. Their action wins: drop our freshly rotated
                 // bundle rather than clobber (or resurrect) their change, and
-                // adopt what the store now holds — surfacing login-required
-                // on a deletion, or the operator's replacement on the next
-                // build below.
-                self.reconcile_with_store(state, observed)?;
-                // A replacement was adopted; fall through to serve it.
-                Ok(())
+                // fail closed. We deliberately do *not* adopt-and-serve the
+                // observed value here: `current_headers` already made its
+                // freshness decision before calling us, so serving a replaced
+                // bundle now would bypass that check and could ship a stale or
+                // unparsable token. The next call reconciles from a clean
+                // state — adopting a replacement (with a fresh freshness
+                // check) or surfacing login-required on a deletion.
+                *state = ChatgptOauthState::Cold;
+                Err(ChatgptOauthError::LoginRequired)
             }
             Err(err) => {
                 // The cache holds the freshly rotated tokens; flag it as
