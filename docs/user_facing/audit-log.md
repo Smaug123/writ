@@ -4,7 +4,7 @@ Every session, every capability request, every grant, every mint
 failure, every brokered VM Nix cache request, and every managed agent
 run prompt/outcome record is written to a SQLite database. By default
 it lives at
-`$XDG_DATA_HOME/writ/audit.db`. The log is append-only: nothing is
+`$XDG_DATA_HOME/writ/audit/audit.db`. The log is append-only: nothing is
 updated except `session.closed_at`.
 
 If the broker is the only thing that can mint credentials for your
@@ -173,7 +173,7 @@ A few invariants worth knowing:
 Open a SQLite shell:
 
 ```bash
-sqlite3 "${XDG_DATA_HOME:-$HOME/.local/share}/writ/audit.db"
+sqlite3 "${XDG_DATA_HOME:-$HOME/.local/share}/writ/audit/audit.db"
 ```
 
 (Add `.headers on` and `.mode column` for a friendlier display.)

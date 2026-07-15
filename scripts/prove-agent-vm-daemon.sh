@@ -89,7 +89,7 @@ PROOF_NIX_MARKER="signed-nix-cache-from-daemon"
 
 CONFIG_FILE="${TMP_DIR}/writd-config.json"
 SOCKET_PATH="${TMP_DIR}/writd.sock"
-AUDIT_DB="${TMP_DIR}/audit.db"
+AUDIT_DB="${TMP_DIR}/audit/audit.db"  # dedicated dir: the broker VM mounts the audit DB's parent read-write
 STATE_DIR="${TMP_DIR}/state"
 SECRETS_DIR="${TMP_DIR}/secrets"
 GIT_WORK_ROOT="${TMP_DIR}/git-work"

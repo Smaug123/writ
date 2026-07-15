@@ -4,19 +4,24 @@
 //! a Unix socket. Exits on fatal errors only; individual connection
 //! errors are logged and do not bring down the server.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
 
 use writ::agent_vm_daemon::AgentVmDaemon;
+use writ::agent_vm_lifecycle::BrokerPlacement;
 use writ::audit::AuditLog;
 use writ::boot_reconcile::{
     reconcile_orphaned_staged_carriers, reconcile_pending_approve_attempts,
 };
 use writ::broker_entrypoint::{BrokerArgs, run_broker};
 use writ::broker_session::BrokerSessionSpec;
-use writ::config::{DaemonConfig, SecretStoreConfig, default_audit_db_path, default_config_path};
+use writ::config::{
+    DaemonConfig, LegacyAuditDbNotMigrated, SecretStoreConfig, default_audit_db_path,
+    default_config_path, ensure_audit_db_entry_is_regular_file, ensure_audit_dir_is_dedicated,
+    legacy_audit_db_needs_migration, legacy_default_audit_db_path, path_entry_present,
+};
 use writ::core::UnixMillis;
 use writ::git_push_staging::GitPushStagingStore;
 use writ::github::GitHubMinter;
@@ -71,7 +76,23 @@ enum Command {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> std::process::ExitCode {
+    match run().await {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(err) => {
+            // Print via `Display`, not the `main() -> Result` default (`{err:?}`):
+            // Debug-formatting a boxed `String` escapes quotes and newlines, which
+            // would mangle multi-line actionable messages — notably the audit-DB
+            // migration recovery command. Return an exit *code* (rather than
+            // `process::exit`) so `#[tokio::main]` drops the runtime and runs
+            // spawned tasks' destructors (process-group / temp-file guards).
+            eprintln!("Error: {err}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Parse before installing telemetry: the global subscriber installs only
     // once, and the broker subcommand adds a second (file) sink whose path it
     // learns only from the parsed session spec (read below).
@@ -144,9 +165,56 @@ async fn run_host_daemon(
 
     let socket_path = socket.or(socket_path).unwrap_or_else(default_socket_path);
 
-    let audit_db_path = audit_db
-        .or(audit_db_config)
-        .unwrap_or_else(default_audit_db_path);
+    let audit_db_selected = audit_db.or(audit_db_config);
+    let used_default_audit_db = audit_db_selected.is_none();
+    let audit_db_path = audit_db_selected.unwrap_or_else(default_audit_db_path);
+
+    // The default audit DB path moved into a dedicated `audit/` directory so the
+    // broker VM can mount it read-write without exposing the secret store. An
+    // install that relied on the old default still has its system-of-record at
+    // the legacy path; opening the new default would silently start an empty
+    // audit log and fork history (reconciliation and the UI would lose every
+    // prior session and grant), so refuse and tell the operator to migrate.
+    if used_default_audit_db {
+        let legacy = legacy_default_audit_db_path();
+        // "new already migrated" means opening the new path yields the existing
+        // DB rather than forking — a *following* existence check, so a dangling
+        // symlink at the new path counts as absent and migration still fires
+        // (the preflight below rejects the symlink itself before any open).
+        let new_exists = audit_db_path
+            .try_exists()
+            .map_err(|e| format!("cannot probe audit DB path {audit_db_path:?}: {e}"))?;
+        // Legacy is migration *state*: detect the entry even as a dangling
+        // symlink (non-following) so an unavailable target is not read as
+        // "already migrated". Both fail closed on a probe error.
+        let legacy_exists = path_entry_present(&legacy)
+            .map_err(|e| format!("cannot probe legacy audit DB path {legacy:?}: {e}"))?;
+        if legacy_audit_db_needs_migration(true, new_exists, legacy_exists) {
+            let new_parent = audit_db_path
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_default();
+            // Stringify so `main`'s `{:?}` printing surfaces the actionable
+            // Display message rather than the struct's derived Debug form.
+            return Err(LegacyAuditDbNotMigrated {
+                legacy,
+                new: audit_db_path.clone(),
+                new_parent,
+            }
+            .to_string()
+            .into());
+        }
+    }
+
+    // Create the audit DB's directory now — before the compartment guard — so
+    // the guard's canonicalisation resolves the real mount directory. Without an
+    // existing directory a case-insensitive host (default macOS APFS) would let
+    // an audit dir `.../AUDIT` and a secret dir `.../audit/...` compare as
+    // disjoint even though `create_dir_all` later treats them as one directory.
+    if let Some(parent) = audit_db_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
     // Attach the vm-arm host facts (raw config text + effective audit DB path)
     // the broker-VM placement needs but cannot read from the parsed config. A
     // no-op for host placement, so it is unconditional here.
@@ -156,10 +224,37 @@ async fn run_host_daemon(
         .transpose()?
         .map(|cfg| cfg.with_broker_vm_host_facts(&json, &audit_db_path));
 
-    if let Some(parent) = audit_db_path.parent() {
-        std::fs::create_dir_all(parent)?;
+    // Under vm placement the audit directory is mounted read-write into a broker
+    // VM, so the audit DB path must not redirect the host's open. A compromised
+    // broker VM that outlived a prior daemon (still holding the mount) could
+    // plant a symlink or hard link at audit.db. Two layers: a best-effort
+    // preflight for a clear early error and to catch hard links (which
+    // `NOFOLLOW` does not — a guest cannot forge a cross-filesystem hard link
+    // through the mount, so only an operator can, and that is not TOCTOU-raced),
+    // and an atomic `SQLITE_OPEN_NOFOLLOW` open that closes the check-then-open
+    // race for symlinks. Host placement runs no broker VM that could plant a link.
+    let vm_placement = agent_vm
+        .as_ref()
+        .is_some_and(|cfg| cfg.lifecycle().broker_placement() == BrokerPlacement::Vm);
+    let audit = if vm_placement {
+        ensure_audit_db_entry_is_regular_file(&audit_db_path).map_err(|err| err.to_string())?;
+        AuditLog::open_no_follow(&audit_db_path)?
+    } else {
+        AuditLog::open(&audit_db_path)?
+    };
+
+    // P1 compartment guard (best-effort at startup): with `broker_placement =
+    // vm` the broker VM read-write-mounts the audit DB's *parent directory* (see
+    // `resolve_broker_audit_paths`), so it must contain only the audit DB and its
+    // SQLite sidecars — no config file, executable, secret, or socket the guest
+    // could replace and the host would then re-read or run. Here it catches
+    // whatever already exists at startup for early operator feedback; the
+    // authoritative, complete check runs at broker-VM mount time (in
+    // `AgentVmDaemon`), when every lazily-written file exists. Host placement
+    // runs no broker VM and mounts nothing, so the check is vm-only.
+    if vm_placement {
+        ensure_audit_dir_is_dedicated(&audit_db_path).map_err(|err| err.to_string())?;
     }
-    let audit = AuditLog::open(&audit_db_path)?;
 
     // Dispatch on the secret store type at the binary boundary so the
     // library stays fully generic. Both arms produce the same concrete

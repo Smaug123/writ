@@ -44,6 +44,13 @@ pub const BROKER_VM_SECRETS_DIR: &str = "/writ/secrets";
 /// DB *file* keeps the host's basename within this directory (see
 /// [`broker_config_json`]), so the broker opens the same SQLite file the host
 /// created the session row in.
+///
+/// Because this whole directory is mounted **read-write** into the broker VM,
+/// it must be dedicated to the audit DB (and its WAL/journal) — anything else in
+/// it (the host secret store, a config file, an executable) would be reachable
+/// read-write here, bypassing the scoped read-only [`BROKER_VM_SECRETS_DIR`]
+/// export. The daemon enforces this at broker-VM mount time (and best-effort at
+/// startup); see [`crate::config::ensure_audit_dir_is_dedicated`].
 pub const BROKER_VM_AUDIT_DIR: &str = "/writ/audit";
 /// Guest working root for the broker (on tmpfs inside the VM): clone scratch,
 /// bundle staging, the local nix-cache. Ephemeral per VM lifetime.

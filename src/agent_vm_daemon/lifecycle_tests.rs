@@ -179,12 +179,16 @@ async fn vm_broker_placement_starts_agent_pointed_at_the_broker_vm() {
     let fake_tool = write_vm_broker_fake_tool(dir.path(), &args_log, &env_log);
     let (config, _state_store) =
         daemon_config_with_broker_placement(dir.path(), &fake_tool, BrokerPlacement::Vm);
+    // The broker VM read-write-mounts the audit DB's directory, which must be
+    // dedicated (see `ensure_audit_dir_is_dedicated`), so give it its own subdir
+    // rather than sharing `dir` with the test fixtures.
+    let audit_db = dir.path().join("audit").join("audit.db");
+    std::fs::create_dir_all(audit_db.parent().unwrap()).unwrap();
     // Thread the host facts the vm arm needs (raw config + effective audit DB),
     // exactly as writd does.
-    let config = config
-        .with_broker_vm_host_facts(&vm_broker_host_config_json(), &dir.path().join("audit.db"));
+    let config = config.with_broker_vm_host_facts(&vm_broker_host_config_json(), &audit_db);
     let daemon = AgentVmDaemon::new(config);
-    let state = make_state_with_audit(AuditLog::open(dir.path().join("audit.db")).unwrap());
+    let state = make_state_with_audit(AuditLog::open(&audit_db).unwrap());
     // The host secret store holds the claude app key the broker exports.
     state
         .secrets
@@ -281,10 +285,13 @@ async fn vm_broker_placement_advertises_prewarm_substituter_when_prewarm_dir_con
         &prewarm_dir,
         BrokerPlacement::Vm,
     );
-    let config = config
-        .with_broker_vm_host_facts(&vm_broker_host_config_json(), &dir.path().join("audit.db"));
+    // Dedicated audit dir: the broker VM mounts it read-write (see
+    // `ensure_audit_dir_is_dedicated`).
+    let audit_db = dir.path().join("audit").join("audit.db");
+    std::fs::create_dir_all(audit_db.parent().unwrap()).unwrap();
+    let config = config.with_broker_vm_host_facts(&vm_broker_host_config_json(), &audit_db);
     let daemon = AgentVmDaemon::new(config);
-    let state = make_state_with_audit(AuditLog::open(dir.path().join("audit.db")).unwrap());
+    let state = make_state_with_audit(AuditLog::open(&audit_db).unwrap());
     state
         .secrets
         .put(&crate::secret::SecretKey::new("gh-app-pk").unwrap(), "PEM")

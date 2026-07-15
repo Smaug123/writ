@@ -9,7 +9,7 @@ cheap; no in-memory state is lost.
 | What            | Default location                                | Override                      |
 | --------------- | ----------------------------------------------- | ----------------------------- |
 | Config file     | `$XDG_CONFIG_HOME/writ/config.json`             | `writd --config <path>`       |
-| Audit database  | `$XDG_DATA_HOME/writ/audit.db`                  | `writd --audit-db <path>` or `audit_db` in config |
+| Audit database  | `$XDG_DATA_HOME/writ/audit/audit.db`            | `writd --audit-db <path>` or `audit_db` in config |
 | Unix socket     | `$XDG_RUNTIME_DIR/writ/writd.sock`              | `writd --socket <path>` or `socket_path` in config |
 | File secret store base | `$XDG_DATA_HOME/writ/secrets/`           | `secret_store.path` in config |
 | UI HTTP bearer  | `$XDG_RUNTIME_DIR/writ/ui-bearer`               | `ui_http.bearer_path` in config (only present when `ui_http` is set) |
@@ -46,7 +46,7 @@ The CLI client (`writ`) finds the socket via `--socket`, the
   },
   "secret_store": { "type": "file", "path": "/home/me/.local/share/writ/secrets" },
   "socket_path": "/run/user/1000/writ/writd.sock",
-  "audit_db": "/home/me/.local/share/writ/audit.db",
+  "audit_db": "/home/me/.local/share/writ/audit/audit.db",
   "ui_http": {
     "bind": "127.0.0.1:7717"
   }
@@ -103,6 +103,19 @@ path.
 Optional path overrides. The CLI flags `--socket` and `--audit-db` take
 precedence over the config; the config takes precedence over the XDG
 defaults.
+
+When agent-VM sessions run with `broker_placement = vm`, the broker VM
+mounts the audit DB's **parent directory** read-write (SQLite needs the
+directory writable, and the broker opens the same file the host wrote the
+open-session row into). That directory must therefore be **dedicated to the
+audit DB** — it may hold only the database and its SQLite sidecars
+(`-wal`/`-shm`/`-journal`), nothing else. Anything else placed there (the
+secret store, a config file, an executable, a socket) would be reachable
+read-write inside the broker VM and could be replaced by a compromised guest,
+so give the audit DB its own directory (the default `.../writ/audit/audit.db`
+does this). The daemon enforces this when it launches a broker VM (and
+best-effort at startup): if the directory holds anything foreign it refuses
+rather than mount it.
 
 ### `ui_http`
 

@@ -23,7 +23,7 @@
 use std::path::Path;
 use std::sync::Mutex;
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OpenFlags};
 use thiserror::Error;
 
 mod agent_run;
@@ -161,6 +161,37 @@ impl AuditLog {
         })
     }
 
+    /// Like [`Self::open`], but refuses to follow a symlink at the database
+    /// *file* (via `SQLITE_OPEN_NOFOLLOW`). This is atomic — the kernel rejects
+    /// the open if the final path component is a symlink — closing the
+    /// check-then-open TOCTOU window when the audit directory could be mounted
+    /// read-write into a broker VM: a compromised guest cannot redirect the
+    /// host's open by swapping the database for a symlink between a preflight
+    /// check and the open.
+    ///
+    /// `SQLITE_OPEN_NOFOLLOW` rejects a symlink *anywhere* in the path, so the
+    /// parent directory is canonicalised first (resolving legitimate path
+    /// symlinks like `/var` -> `/private/var`, or a symlinked home). The guest
+    /// can swap only entries *within* the mounted directory, never the mount
+    /// point itself, so this leaves exactly the final component under the atomic
+    /// no-follow check.
+    pub fn open_no_follow(path: impl AsRef<Path>) -> Result<Self, AuditError> {
+        let path = path.as_ref();
+        let resolved = match (path.parent(), path.file_name()) {
+            (Some(parent), Some(name)) => match parent.canonicalize() {
+                Ok(real_parent) => real_parent.join(name),
+                Err(_) => path.to_path_buf(),
+            },
+            _ => path.to_path_buf(),
+        };
+        let flags = OpenFlags::default() | OpenFlags::SQLITE_OPEN_NOFOLLOW;
+        let mut conn = Connection::open_with_flags(resolved, flags)?;
+        Self::init(&mut conn)?;
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
+    }
+
     /// In-memory audit log, for tests.
     pub fn open_in_memory() -> Result<Self, AuditError> {
         let mut conn = Connection::open_in_memory()?;
@@ -193,5 +224,35 @@ impl AuditLog {
     ) -> Result<R, AuditError> {
         let mut guard = self.conn.lock().map_err(|_| AuditError::Poisoned)?;
         f(&mut guard)
+    }
+}
+
+#[cfg(test)]
+mod open_no_follow_tests {
+    use super::AuditLog;
+
+    #[test]
+    fn open_no_follow_creates_and_opens_a_regular_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.db");
+        AuditLog::open_no_follow(&path).expect("a plain regular DB path opens");
+        // Re-opening the now-existing regular file also succeeds.
+        AuditLog::open_no_follow(&path).expect("re-opening a regular DB file succeeds");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_no_follow_rejects_a_symlinked_db_path() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        // A real DB the symlink points at, then a symlink planted at audit.db.
+        let target = dir.path().join("elsewhere.db");
+        AuditLog::open(&target).expect("seed a real target DB");
+        let link = dir.path().join("audit.db");
+        symlink(&target, &link).unwrap();
+        // NOFOLLOW must refuse to follow the link (atomically, in the open).
+        AuditLog::open_no_follow(&link).expect_err("a symlinked DB path must be refused");
+        // The plain follow-through open would have succeeded (sanity check).
+        AuditLog::open(&link).expect("the following open follows the symlink");
     }
 }
