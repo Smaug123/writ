@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Mutex as StdMutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use base64::Engine as _;
 use proptest::prelude::*;
@@ -24,10 +24,21 @@ struct InMemStore {
     /// seconds. Lets a test prove that token freshness is judged *after*
     /// the pending-persist flush, not before.
     put_clock: StdMutex<Option<(Arc<FakeClock>, i64)>>,
+    /// Number of `get`s served so far, and — if set — the count after which
+    /// every subsequent `get` deletes the entry and returns `None`. Models an
+    /// operator revoking the secret out-of-band *during* an operation (e.g.
+    /// between the reconcile read and the guarded write-back of a refresh).
+    get_count: AtomicUsize,
+    revoke_after_gets: StdMutex<Option<usize>>,
 }
 
 impl SecretStore for InMemStore {
     fn get(&self, key: &SecretKey) -> Result<Option<String>, SecretError> {
+        let served = self.get_count.fetch_add(1, Ordering::SeqCst) + 1;
+        if matches!(*self.revoke_after_gets.lock().unwrap(), Some(after) if served > after) {
+            self.map.lock().unwrap().remove(key.as_str());
+            return Ok(None);
+        }
         Ok(self.map.lock().unwrap().get(key.as_str()).cloned())
     }
 
@@ -58,6 +69,10 @@ impl InMemStore {
 
     fn advance_clock_on_put(&self, clock: Arc<FakeClock>, secs: i64) {
         *self.put_clock.lock().unwrap() = Some((clock, secs));
+    }
+
+    fn revoke_after_gets(&self, after: usize) {
+        *self.revoke_after_gets.lock().unwrap() = Some(after);
     }
 
     fn contains(&self, key: &SecretKey) -> bool {
@@ -159,6 +174,27 @@ fn debug_redacts_tokens_and_api_key() {
     // Non-secret fields are still visible so debug output stays useful.
     assert!(rendered.contains("acct-123"), "{rendered}");
     assert!(rendered.contains("2026-01-01T00:00:00Z"), "{rendered}");
+}
+
+#[test]
+fn state_debug_redacts_durable_raw_blob() {
+    // `durable_raw` is the raw auth.json JSON — live tokens. It must not leak
+    // through the state's Debug even though `ChatgptAuthBundle` redacts its
+    // own fields.
+    let bundle = make_bundle(/*exp=*/ 4_000, "very-secret-refresh", false);
+    let durable_raw = serde_json::to_string(&bundle).unwrap();
+    let state = ChatgptOauthState::Loaded {
+        bundle,
+        durable_raw,
+        needs_persist: false,
+    };
+    let rendered = format!("{state:?}");
+    assert!(!rendered.contains("very-secret-refresh"), "{rendered}");
+    assert!(
+        !rendered.contains(&access_token_with_exp(4_000)),
+        "{rendered}"
+    );
+    assert!(rendered.contains("<redacted>"), "{rendered}");
 }
 
 #[test]
@@ -710,6 +746,42 @@ async fn out_of_band_secret_replacement_is_adopted() {
     assert_eq!(h2.account_id.as_deref(), Some("acct-replaced"));
     // No refresh was ever needed.
     assert_eq!(server.received_requests().await.unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn concurrent_revocation_during_refresh_is_not_clobbered() {
+    let store = InMemStore::default();
+    let key = SecretKey::new("openai-chatgpt-auth").unwrap();
+    // Stale token, so this call performs a refresh (network round-trip).
+    let bundle = make_bundle(/*exp=*/ 1_050, "refresh-old", false);
+    store
+        .put(&key, &serde_json::to_string(&bundle).unwrap())
+        .unwrap();
+    let clock = Arc::new(FakeClock::new(1_000));
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/oauth/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id_token": id_token_with_chatgpt_claims("acct", false, 99_999),
+            "access_token": access_token_with_exp(50_000),
+            "refresh_token": "refresh-new",
+        })))
+        .mount(&server)
+        .await;
+    let refresh_url = format!("{}/oauth/token", server.uri());
+    let (authority, _) = build_authority(&refresh_url, Arc::clone(&clock));
+
+    // The operator revokes (deletes) after the first store read — i.e. during
+    // the refresh round-trip, before the guarded write-back re-reads.
+    store.revoke_after_gets(1);
+
+    let err = authority.current_headers(&store).await.unwrap_err();
+    assert!(matches!(err, ChatgptOauthError::LoginRequired), "{err:?}");
+    // The freshly refreshed token must not resurrect the revoked secret.
+    assert!(
+        !store.contains(&key),
+        "a refresh must not recreate a concurrently revoked secret",
+    );
 }
 
 #[tokio::test]
