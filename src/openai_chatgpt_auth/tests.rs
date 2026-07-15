@@ -30,6 +30,10 @@ struct InMemStore {
     /// between the reconcile read and the guarded write-back of a refresh).
     get_count: AtomicUsize,
     revoke_after_gets: StdMutex<Option<usize>>,
+    /// After this many `get`s, every subsequent `get` first overwrites the
+    /// entry with the given value (a concurrent operator *replacement*), then
+    /// returns it.
+    replace_after_gets: StdMutex<Option<(usize, String)>>,
 }
 
 impl SecretStore for InMemStore {
@@ -38,6 +42,18 @@ impl SecretStore for InMemStore {
         if matches!(*self.revoke_after_gets.lock().unwrap(), Some(after) if served > after) {
             self.map.lock().unwrap().remove(key.as_str());
             return Ok(None);
+        }
+        if let Some((_, value)) = self
+            .replace_after_gets
+            .lock()
+            .unwrap()
+            .clone()
+            .filter(|(after, _)| served > *after)
+        {
+            self.map
+                .lock()
+                .unwrap()
+                .insert(key.as_str().to_string(), value);
         }
         Ok(self.map.lock().unwrap().get(key.as_str()).cloned())
     }
@@ -73,6 +89,10 @@ impl InMemStore {
 
     fn revoke_after_gets(&self, after: usize) {
         *self.revoke_after_gets.lock().unwrap() = Some(after);
+    }
+
+    fn replace_after_gets(&self, after: usize, value: String) {
+        *self.replace_after_gets.lock().unwrap() = Some((after, value));
     }
 
     fn contains(&self, key: &SecretKey) -> bool {
@@ -781,6 +801,46 @@ async fn concurrent_revocation_during_refresh_is_not_clobbered() {
     assert!(
         !store.contains(&key),
         "a refresh must not recreate a concurrently revoked secret",
+    );
+}
+
+#[tokio::test]
+async fn permanent_failure_does_not_delete_a_concurrent_replacement() {
+    let store = InMemStore::default();
+    let key = SecretKey::new("openai-chatgpt-auth").unwrap();
+    // Stale token → refresh; upstream will answer 401 (token permanently dead).
+    let dead = make_bundle(/*exp=*/ 1_050, "refresh-dead", false);
+    store
+        .put(&key, &serde_json::to_string(&dead).unwrap())
+        .unwrap();
+    // What the operator installs mid-refresh.
+    let replacement = make_bundle(/*exp=*/ 50_000, "refresh-operator-new", false);
+    let replacement_raw = serde_json::to_string(&replacement).unwrap();
+
+    let clock = Arc::new(FakeClock::new(1_000));
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/oauth/token"))
+        .respond_with(ResponseTemplate::new(401).set_body_json(json!({
+            "error": "refresh_token_expired",
+        })))
+        .mount(&server)
+        .await;
+    let refresh_url = format!("{}/oauth/token", server.uri());
+    let (authority, _) = build_authority(&refresh_url, Arc::clone(&clock));
+
+    // The operator replaces the secret after the reconcile read — during the
+    // refresh round-trip whose 401 concerns only the *old* token.
+    store.replace_after_gets(1, replacement_raw.clone());
+
+    let err = authority.current_headers(&store).await.unwrap_err();
+    assert!(matches!(err, ChatgptOauthError::LoginRequired), "{err:?}");
+    // The permanent-failure delete must not erase the operator's replacement.
+    // (`contains` reads the map directly, so it does not re-trigger the
+    // replacement hook the way another `get` would.)
+    assert!(
+        store.contains(&key),
+        "a 401 for the old token must not delete a concurrent replacement",
     );
 }
 

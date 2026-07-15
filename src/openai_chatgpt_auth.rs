@@ -782,7 +782,23 @@ impl ChatgptOauthAuthority {
         match kind {
             RefreshOutcomeKind::Success => unreachable!("non-success branch"),
             RefreshOutcomeKind::LoginRequired => {
-                secret_store.delete(&self.config.secret_key)?;
+                // The refresh token is permanently dead, so delete the bundle
+                // and force re-login — but only if the store still holds the
+                // very bundle we tried to refresh. If an operator replaced it
+                // out-of-band during the round-trip, upstream's 401 is about
+                // the *old* token; deleting would erase the operator's new
+                // credential. Guard the delete against `durable_raw` (same
+                // optimistic check as the write path), and always reset to
+                // `Cold` so the next call reconciles from the store.
+                let durable_raw = match &*state {
+                    ChatgptOauthState::Loaded { durable_raw, .. } => durable_raw.clone(),
+                    ChatgptOauthState::Cold => String::new(),
+                };
+                if secret_store.get(&self.config.secret_key)?.as_deref()
+                    == Some(durable_raw.as_str())
+                {
+                    secret_store.delete(&self.config.secret_key)?;
+                }
                 *state = ChatgptOauthState::Cold;
                 Err(ChatgptOauthError::LoginRequired)
             }
