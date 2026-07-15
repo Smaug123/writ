@@ -268,6 +268,8 @@ pub enum AgentVmDaemonError {
     BrokerVmMaterialize(#[from] crate::broker_vm::BrokerVmSessionError),
     #[error("cannot resolve the host audit DB path for the broker VM mount: {0}")]
     BrokerVmAuditDbPath(#[source] std::io::Error),
+    #[error("refusing to mount the broker VM audit directory read-write: {0}")]
+    BrokerVmAuditDirNotDedicated(#[from] crate::config::AuditDirNotDedicated),
     #[error("agent VM workspace destination must be absolute: {0}")]
     RelativeWorkspaceDestination(PathBuf),
     #[error("agent VM workspace destination must be valid UTF-8: {0}")]
@@ -2095,6 +2097,20 @@ impl AgentVmDaemon {
                 &bearer,
                 &state_for_secrets.secrets,
             )
+        })
+        .await??;
+
+        // Authoritative compartment guard: the broker VM is about to
+        // read-write-mount the audit DB's directory. Enforce that it holds only
+        // the audit DB and its SQLite sidecars — nothing host-owned the guest
+        // could replace and the host would then re-read or execute. This runs
+        // after materialisation, so every lazily-written file (per-session broker
+        // material, socket, bearer, notes) that could land under a misconfigured
+        // audit directory already exists and is seen. Any error rolls back via
+        // the caller's `cleanup_failed_started_session`.
+        let host_audit_db_for_check = host_audit_db.to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            crate::config::ensure_audit_dir_is_dedicated(&host_audit_db_for_check)
         })
         .await??;
 

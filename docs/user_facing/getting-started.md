@@ -304,7 +304,7 @@ another credential. Each request is one row in the audit log.
 ## 7. Check the audit log
 
 ```bash
-sqlite3 "${XDG_DATA_HOME:-$HOME/.local/share}/writ/audit.db" \
+sqlite3 "${XDG_DATA_HOME:-$HOME/.local/share}/writ/audit/audit.db" \
   'SELECT request_id, request_json, decision_json FROM request ORDER BY received_at DESC LIMIT 5;'
 ```
 

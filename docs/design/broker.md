@@ -149,7 +149,9 @@ handler functions.
 
 ## Audit log
 
-SQLite at `$XDG_DATA_HOME/writ/audit.db`. Schema:
+SQLite at `$XDG_DATA_HOME/writ/audit/audit.db` — a directory dedicated to the
+audit DB (and its WAL/journal), because the broker VM mounts that directory
+read-write and it must not contain the secret store. Schema:
 
 ```sql
 CREATE TABLE session (
