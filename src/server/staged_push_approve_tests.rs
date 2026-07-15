@@ -233,6 +233,171 @@ async fn approve_staged_push_for_branch_creation_returns_error() {
     assert!(attempts.is_empty());
 }
 
+/// Drive an approve against a push whose on-disk carrier metadata
+/// diverges from the audit request row (modelling a local-disk fault or
+/// tamper) and assert the handler fails closed: an `Error` naming the
+/// carrier/audit divergence, no attempt row started, no credential
+/// minted, no resolution written, and the carrier left intact for
+/// operator triage.
+async fn assert_carrier_audit_drift_refused(
+    carrier: crate::vm_git::VmGitPushMetadata,
+    audited: crate::vm_git::VmGitPushMetadata,
+) {
+    let server = MockServer::start().await;
+    // `expect(0)` on the mint endpoint: reaching the mint step is a test
+    // failure — the divergence must be caught before any credential is
+    // minted.
+    Mock::given(method("POST"))
+        .and(path("/app/installations/999/access_tokens"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let (state, _tmp) = make_state_with_approve_ready(&server);
+    let session_id = open_session(&state).await;
+    let request_id = stage_carrier_diverging_from_audit(
+        &state,
+        session_id,
+        carrier,
+        audited,
+        b"bundle".to_vec(),
+        UnixMillis::from_millis(1_700_000_040_000),
+        UnixMillis::from_millis(1_700_000_040_500),
+    )
+    .await;
+
+    let resp = dispatch_message(
+        ClientMessage::ApproveStagedPush {
+            request_id,
+            operator: "alice".into(),
+        },
+        &state,
+    )
+    .await;
+
+    match resp {
+        ServerMessage::Error { message } => {
+            assert!(
+                message.contains("does not match the audit record"),
+                "expected carrier/audit divergence refusal, got: {message}",
+            );
+        }
+        other => panic!("expected Error, got {other:?}"),
+    }
+
+    // No attempt row: the refusal fires before `start_approve_attempt`,
+    // so no credential is minted and the push stays rejectable.
+    let attempts = state.audit.approve_attempts_for_push(request_id).unwrap();
+    assert!(
+        attempts.is_empty(),
+        "divergence must be caught before an attempt is started",
+    );
+
+    // No resolution row and the carrier is intact: the operator can
+    // investigate the drift and reject (or repair) the push.
+    let audit_entry = state.audit.get_git_push(request_id).unwrap().unwrap();
+    assert!(audit_entry.resolution.is_none());
+    assert!(
+        state
+            .staging_store
+            .as_ref()
+            .unwrap()
+            .load(request_id)
+            .is_ok()
+    );
+}
+
+/// A carrier that names a different repo than the audit row must be
+/// refused: minting `contents:write` and pushing against the carrier
+/// repo would redirect the real write while the audit retains the
+/// original repo.
+#[tokio::test]
+async fn approve_refuses_when_carrier_repo_diverges_from_audit() {
+    assert_carrier_audit_drift_refused(
+        crate::vm_git::VmGitPushMetadata::new(
+            "owner/other".parse().unwrap(),
+            sample_branch(),
+            Some(sample_object_id('a')),
+            sample_object_id('b'),
+        ),
+        crate::vm_git::VmGitPushMetadata::new(
+            sample_clone_repo(),
+            sample_branch(),
+            Some(sample_object_id('a')),
+            sample_object_id('b'),
+        ),
+    )
+    .await;
+}
+
+/// A carrier that names a different branch than the audit row must be
+/// refused: the PATCH moves the carrier branch, so a tampered branch
+/// redirects the write to a ref the operator never reviewed.
+#[tokio::test]
+async fn approve_refuses_when_carrier_branch_diverges_from_audit() {
+    assert_carrier_audit_drift_refused(
+        crate::vm_git::VmGitPushMetadata::new(
+            sample_clone_repo(),
+            "feature/y".parse().unwrap(),
+            Some(sample_object_id('a')),
+            sample_object_id('b'),
+        ),
+        crate::vm_git::VmGitPushMetadata::new(
+            sample_clone_repo(),
+            sample_branch(),
+            Some(sample_object_id('a')),
+            sample_object_id('b'),
+        ),
+    )
+    .await;
+}
+
+/// A carrier that names a different tip than the audit row must be
+/// refused: the PATCH sets the branch to the carrier `new_head`, so a
+/// tampered tip advances the branch to a commit the operator never
+/// reviewed.
+#[tokio::test]
+async fn approve_refuses_when_carrier_new_head_diverges_from_audit() {
+    assert_carrier_audit_drift_refused(
+        crate::vm_git::VmGitPushMetadata::new(
+            sample_clone_repo(),
+            sample_branch(),
+            Some(sample_object_id('a')),
+            sample_object_id('c'),
+        ),
+        crate::vm_git::VmGitPushMetadata::new(
+            sample_clone_repo(),
+            sample_branch(),
+            Some(sample_object_id('a')),
+            sample_object_id('b'),
+        ),
+    )
+    .await;
+}
+
+/// A carrier that names a different lease anchor than the audit row must
+/// be refused: `expected_remote_head` is the fast-forward lease the
+/// PATCH is guarded on, so a tampered anchor can smuggle a push past a
+/// lease the operator's review assumed.
+#[tokio::test]
+async fn approve_refuses_when_carrier_expected_remote_head_diverges_from_audit() {
+    assert_carrier_audit_drift_refused(
+        crate::vm_git::VmGitPushMetadata::new(
+            sample_clone_repo(),
+            sample_branch(),
+            Some(sample_object_id('c')),
+            sample_object_id('b'),
+        ),
+        crate::vm_git::VmGitPushMetadata::new(
+            sample_clone_repo(),
+            sample_branch(),
+            Some(sample_object_id('a')),
+            sample_object_id('b'),
+        ),
+    )
+    .await;
+}
+
 /// An approve failure that fires before `update_ref` (e.g. the
 /// `git init --bare` in `prepare_staging_repo` because the configured
 /// `git_program` is bogus) must drive the attempt from `Started`

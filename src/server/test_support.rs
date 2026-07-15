@@ -331,6 +331,62 @@ pub(super) async fn stage_with_audit(
     request_id
 }
 
+/// Stage a carrier whose metadata deliberately diverges from the audit
+/// request row, then record a `Staged` outcome. Models a locally
+/// corrupted or tampered carrier: the audit log holds the `audited`
+/// intent while the on-disk carrier claims `carrier`. Both halves are
+/// otherwise well-formed, so `approve` reaches the carrier/audit
+/// consistency gate. Returns the request id.
+pub(super) async fn stage_carrier_diverging_from_audit(
+    state: &Arc<BrokerState<InMemStore>>,
+    session_id: SessionId,
+    carrier: crate::vm_git::VmGitPushMetadata,
+    audited: crate::vm_git::VmGitPushMetadata,
+    bundle: Vec<u8>,
+    staged_at: UnixMillis,
+    received_at: UnixMillis,
+) -> RequestId {
+    let request_id = RequestId::new();
+    let staging = state
+        .staging_store
+        .as_ref()
+        .expect("staging configured")
+        .clone();
+    let bundle_for_stage = bundle.clone();
+    let carrier_for_stage = carrier.clone();
+    tokio::task::spawn_blocking(move || {
+        staging
+            .stage(request_id, staged_at, carrier_for_stage, bundle_for_stage)
+            .unwrap();
+    })
+    .await
+    .unwrap();
+    state
+        .audit
+        .record_git_push_request(&crate::audit::GitPushRequestRecord {
+            push_request_id: request_id,
+            session_id,
+            received_at,
+            repo: audited.repo().clone(),
+            branch: audited.branch().clone(),
+            expected_remote_head: audited.expected_remote_head().cloned(),
+            new_head: audited.new_head().clone(),
+            correlation_id: None,
+        })
+        .unwrap();
+    state
+        .audit
+        .record_git_push_outcome(&crate::audit::GitPushOutcomeRecord {
+            push_request_id: request_id,
+            completed_at: received_at,
+            result: crate::audit::GitPushOutcomeResult::Staged,
+            github_status: None,
+            message: "staged for operator review",
+        })
+        .unwrap();
+    request_id
+}
+
 pub(super) fn reason(text: &str) -> RejectionReason {
     RejectionReason::try_new(text).expect("test reason fits the bound")
 }

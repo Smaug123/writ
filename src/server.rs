@@ -822,7 +822,7 @@ async fn approve_staged_push<S: SecretStore + Send + Sync + 'static>(
         Err(resp) => return resp,
     };
 
-    let agent_kind = match check_approvable_push(state, request_id).await {
+    let agent_kind = match check_approvable_push(state, request_id, entry.receipt()).await {
         Ok(agent_kind) => agent_kind,
         Err(resp) => return resp,
     };
@@ -857,14 +857,69 @@ async fn approve_staged_push<S: SecretStore + Send + Sync + 'static>(
     }
 }
 
+/// Compare the on-disk staged carrier's metadata against the audited
+/// request row, returning a human-readable description of every field
+/// that has drifted (or `None` when they agree). The two are written
+/// from a single `VmGitPushMetadata` at staging time, so any divergence
+/// is local corruption or tampering; each drifted field is named with
+/// both sides so an operator can see exactly how the carrier was altered.
+fn carrier_audit_divergence(
+    receipt: &crate::vm_git::VmGitPushStagedReceipt,
+    audit_entry: &crate::audit::GitPushAuditEntry,
+) -> Option<String> {
+    let mut drift: Vec<String> = Vec::new();
+    if receipt.repo() != &audit_entry.repo {
+        drift.push(format!(
+            "repo: carrier {}, audit {}",
+            receipt.repo(),
+            audit_entry.repo
+        ));
+    }
+    if receipt.branch() != &audit_entry.branch {
+        drift.push(format!(
+            "branch: carrier {}, audit {}",
+            receipt.branch(),
+            audit_entry.branch
+        ));
+    }
+    if receipt.expected_remote_head() != audit_entry.expected_remote_head.as_ref() {
+        drift.push(format!(
+            "expected_remote_head: carrier {:?}, audit {:?}",
+            receipt.expected_remote_head().map(ToString::to_string),
+            audit_entry
+                .expected_remote_head
+                .as_ref()
+                .map(ToString::to_string),
+        ));
+    }
+    if receipt.new_head() != &audit_entry.new_head {
+        drift.push(format!(
+            "new_head: carrier {}, audit {}",
+            receipt.new_head(),
+            audit_entry.new_head
+        ));
+    }
+    if drift.is_empty() {
+        None
+    } else {
+        Some(drift.join("; "))
+    }
+}
+
 /// Read the joined audit view and confirm the push is approvable,
 /// returning the originating session's `agent_kind` (the GitHub App to
 /// mint against). Refuses — without starting an attempt — on a prior
-/// resolution, a missing `Staged` outcome row, or a branch-creation push
+/// resolution, a missing `Staged` outcome row, a staged carrier whose
+/// metadata has drifted from the audit row, or a branch-creation push
 /// (no `expected_remote_head`, which the walker's lease anchor requires).
+///
+/// `receipt` is the metadata read back from the on-disk carrier; the
+/// consistency check below proves it agrees with the audit row before
+/// the mint and PATCH downstream trust it as the write target.
 async fn check_approvable_push<S: SecretStore + Send + Sync + 'static>(
     state: &Arc<BrokerState<S>>,
     request_id: RequestId,
+    receipt: &crate::vm_git::VmGitPushStagedReceipt,
 ) -> Result<Option<crate::core::AgentKind>, ServerMessage> {
     // Joined audit view: the source of truth for the prior-resolution
     // short-circuit (so a duplicate approve never starts an attempt or
@@ -906,6 +961,28 @@ async fn check_approvable_push<S: SecretStore + Send + Sync + 'static>(
                 "staged push {request_id} has no `staged` outcome row \
                  (audit result: {:?}); refusing to approve a push that is not staged",
                 audit_entry.result,
+            ),
+        });
+    }
+
+    // Defence in depth: the staged carrier and the audit request row are
+    // two persisted copies of one `VmGitPushMetadata`, written together
+    // when the push was accepted (see `vm_http::git_push`), so under
+    // normal operation they agree on repo, branch, lease anchor, and tip.
+    // The mint scope and the branch-moving PATCH downstream are driven
+    // entirely from the *carrier*; the audit log records the *intent*
+    // an operator reviews. A local-disk fault or tamper that drifts the
+    // carrier from the audit row would redirect the real write while the
+    // audit retains the original intent — so refuse before minting. The
+    // audit log is the source of truth; a diverged carrier is corruption,
+    // and correctness beats availability here. Refusing (rather than
+    // preferring one side) keeps the carrier intact for operator triage.
+    if let Some(divergence) = carrier_audit_divergence(receipt, &audit_entry) {
+        return Err(ServerMessage::Error {
+            message: format!(
+                "staged push {request_id} carrier metadata does not match the audit record \
+                 ({divergence}); refusing to approve a push whose on-disk carrier has drifted \
+                 from the audited intent"
             ),
         });
     }
@@ -1138,6 +1215,10 @@ async fn execute_started_attempt<S: SecretStore + Send + Sync + 'static>(
     let receipt = entry.receipt();
     let repo = receipt.repo().clone();
     let branch = receipt.branch().clone();
+    // `check_approvable_push` proved the carrier agrees with the audit
+    // row (`carrier_audit_divergence`) and then refused the audit row's
+    // branch-creation case (`expected_remote_head.is_none()`), so the
+    // carrier's `expected_remote_head` is necessarily `Some` here.
     let expected_remote_head = receipt
         .expected_remote_head()
         .cloned()
