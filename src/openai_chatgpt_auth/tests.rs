@@ -669,6 +669,119 @@ async fn put_failure_still_serves_cached_token_while_store_stays_broken() {
 }
 
 #[tokio::test]
+async fn out_of_band_secret_replacement_is_adopted() {
+    let store = InMemStore::default();
+    let key = SecretKey::new("openai-chatgpt-auth").unwrap();
+    // A fresh bundle: no refresh needed, so any upstream call would be a bug.
+    let original = make_bundle(/*exp=*/ 10_000, "refresh-original", false);
+    store
+        .put(&key, &serde_json::to_string(&original).unwrap())
+        .unwrap();
+    let clock = Arc::new(FakeClock::new(1_000));
+    let server = MockServer::start().await;
+    let (authority, _) = build_authority(&server.uri(), Arc::clone(&clock));
+
+    // Prime the (broker-wide, long-lived) cache with the original bundle.
+    let h1 = authority.current_headers(&store).await.unwrap();
+    assert_eq!(h1.access_token, access_token_with_exp(10_000));
+
+    // Operator rotates the credential out-of-band (e.g. re-ran `codex login`
+    // + `writ secret put`) to a different, still-fresh bundle.
+    let replacement = ChatgptAuthBundle {
+        auth_mode: Some("chatgpt".into()),
+        openai_api_key: None,
+        tokens: Some(ChatgptTokens {
+            id_token: id_token_with_chatgpt_claims("acct-replaced", false, 99_999),
+            access_token: access_token_with_exp(20_000),
+            refresh_token: "refresh-replacement".into(),
+            account_id: Some("acct-replaced".into()),
+        }),
+        last_refresh: Some("2026-03-03T00:00:00Z".into()),
+        agent_identity: None,
+    };
+    store
+        .put(&key, &serde_json::to_string(&replacement).unwrap())
+        .unwrap();
+
+    // The next call must reconcile with the store and serve the replacement,
+    // not the stale cache.
+    let h2 = authority.current_headers(&store).await.unwrap();
+    assert_eq!(h2.access_token, access_token_with_exp(20_000));
+    assert_eq!(h2.account_id.as_deref(), Some("acct-replaced"));
+    // No refresh was ever needed.
+    assert_eq!(server.received_requests().await.unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn out_of_band_secret_deletion_revokes_access() {
+    let store = InMemStore::default();
+    let key = SecretKey::new("openai-chatgpt-auth").unwrap();
+    let bundle = make_bundle(/*exp=*/ 10_000, "refresh-1", false);
+    store
+        .put(&key, &serde_json::to_string(&bundle).unwrap())
+        .unwrap();
+    let clock = Arc::new(FakeClock::new(1_000));
+    let server = MockServer::start().await;
+    let (authority, _) = build_authority(&server.uri(), Arc::clone(&clock));
+
+    // Prime the cache.
+    authority.current_headers(&store).await.unwrap();
+
+    // Operator revokes by deleting the secret.
+    store.delete(&key).unwrap();
+
+    // Access must be refused, and the cache must not recreate the secret.
+    let err = authority.current_headers(&store).await.unwrap_err();
+    assert!(matches!(err, ChatgptOauthError::LoginRequired), "{err:?}");
+    assert!(
+        !store.contains(&key),
+        "revoked secret must not be recreated"
+    );
+}
+
+#[tokio::test]
+async fn out_of_band_deletion_with_pending_persist_does_not_recreate_secret() {
+    let store = InMemStore::default();
+    let key = SecretKey::new("openai-chatgpt-auth").unwrap();
+    let bundle = make_bundle(/*exp=*/ 1_050, "refresh-old", false);
+    store
+        .put(&key, &serde_json::to_string(&bundle).unwrap())
+        .unwrap();
+    let clock = Arc::new(FakeClock::new(1_000));
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/oauth/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id_token": id_token_with_chatgpt_claims("acct", false, 99_999),
+            "access_token": access_token_with_exp(50_000),
+            "refresh_token": "refresh-new",
+        })))
+        .mount(&server)
+        .await;
+    let refresh_url = format!("{}/oauth/token", server.uri());
+    let (authority, _) = build_authority(&refresh_url, Arc::clone(&clock));
+
+    // Refresh succeeds upstream, but the durable write fails: the cache is now
+    // ahead of the store with a pending persist.
+    store.set_fail_puts(true);
+    let err = authority.current_headers(&store).await.unwrap_err();
+    assert!(matches!(err, ChatgptOauthError::SecretStore(_)), "{err:?}");
+
+    // Operator revokes by deleting the secret (the store is healthy for it).
+    store.set_fail_puts(false);
+    store.delete(&key).unwrap();
+
+    // The pending write must NOT resurrect the revoked secret; the next call
+    // reconciles, refuses, and leaves the store empty.
+    let err = authority.current_headers(&store).await.unwrap_err();
+    assert!(matches!(err, ChatgptOauthError::LoginRequired), "{err:?}");
+    assert!(
+        !store.contains(&key),
+        "pending persist must not recreate a revoked secret",
+    );
+}
+
+#[tokio::test]
 async fn permanent_refresh_failure_deletes_secret_and_surfaces_login_required() {
     let store = InMemStore::default();
     let key = SecretKey::new("openai-chatgpt-auth").unwrap();
