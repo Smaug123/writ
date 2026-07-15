@@ -1,5 +1,9 @@
-//! Drive approve attempts left non-terminal by a prior crash to a
-//! state the rest of the broker can act on.
+//! Drive state left non-terminal by a prior crash to a state the rest
+//! of the broker can act on. Two independent boot passes live here:
+//! [`reconcile_pending_approve_attempts`] for the approve-attempt state
+//! machine (audit-only) and [`reconcile_orphaned_staged_carriers`] for
+//! staged-push carriers stranded without an outcome row (filesystem-
+//! aware, because the bundle bytes live only in the staging store).
 //!
 //! The approve state machine (see `docs/design/approve_state_machine.md`)
 //! has two non-terminal states:
@@ -21,16 +25,20 @@
 //!   0004), and leave the row itself in place for
 //!   `reject_blocker_for_push` to surface as `AttemptInFlight`.
 //!
-//! No filesystem state is consulted: the audit log is the system of
-//! record. The schema's forward-only triggers admit the
-//! `Started -> Resolved(PrePatchFailure)` transition; this module is
-//! the only caller that does so for the "broker restart" reason.
+//! The approve-attempt pass consults no filesystem state: for approve
+//! attempts the audit log is the sole system of record. The schema's
+//! forward-only triggers admit the `Started -> Resolved(PrePatchFailure)`
+//! transition; this module is the only caller that does so for the
+//! "broker restart" reason. The carrier pass, by contrast, must read the
+//! staging directory — see [`reconcile_orphaned_staged_carriers`].
 
 use crate::audit::{
     AUDIT_WRITE_FAILURE_TARGET, AuditError, AuditLog, GitPushApproveAttemptEntry,
-    GitPushApproveAttemptState,
+    GitPushApproveAttemptState, GitPushAuditEntry, GitPushOutcomeRecord, GitPushOutcomeResult,
 };
-use crate::core::{ApproveAttemptId, UnixMillis};
+use crate::core::{ApproveAttemptId, RequestId, UnixMillis};
+use crate::git_push_staging::GitPushStagingStore;
+use crate::vm_git::VmGitPushStagedReceipt;
 
 /// Detail string written to `git_push_approve_attempt.failure_detail`
 /// when boot reconcile transitions a `Started` attempt to
@@ -177,6 +185,216 @@ fn flag_uncertain(
     audit.mark_attempt_boot_observed(entry.attempt_id, now)
 }
 
+/// Message recorded on the `git_push_outcome` row that
+/// [`reconcile_orphaned_staged_carriers`] writes retroactively for a
+/// carrier orphaned by a crash between staging and the outcome write.
+/// Operators grep for it to distinguish recovered carriers from pushes
+/// staged normally (`"staged for review"`). Part of the audit surface;
+/// do not change without considering downstream tooling.
+pub const RECOVERED_STAGED_CARRIER_MESSAGE: &str =
+    "recovered: staged carrier without outcome row after restart";
+
+/// Repair carriers left on disk without a `staged` outcome row by a
+/// crash between the filesystem staging step and the outcome write in
+/// `vm_http::git_push`.
+///
+/// Such a carrier is stuck: `check_approvable_push` refuses it (no
+/// `staged` result) and `git_push_resolution_requires_staged` refuses
+/// any reject, so it can be neither approved nor rejected while sitting
+/// visibly in `promote list`. The push handler commits the request row
+/// *before* staging and writes the carrier with an atomic fsync+rename,
+/// so a carrier present under `staged/` is complete and is backed by a
+/// request row; retroactively recording its `staged` outcome (the
+/// PK-unique slot is still empty) is therefore honest and makes the
+/// carrier resolvable again.
+///
+/// Returns the request ids recovered this pass. Unlike
+/// [`reconcile_pending_approve_attempts`] this consults the filesystem:
+/// the bundle bytes live only in the staging store, so for push carriers
+/// the filesystem is co-authoritative with the audit log.
+///
+/// Failure policy mirrors the daemon's split between its two durable
+/// stores. A staging-store `list()` IO error (e.g. a malformed sibling
+/// directory) is **best-effort**: it is logged and the sweep returns
+/// `Ok(vec![])`, because failing to sweep is no worse than the
+/// pre-existing stuck-carrier state and a corrupt sibling must not wedge
+/// boot. An audit **write** failure is correctness-fatal and propagates,
+/// matching [`reconcile_pending_approve_attempts`].
+///
+/// Call once at startup, after the broker socket bind and before any
+/// request handler runs — the same ordering constraints that govern
+/// [`reconcile_pending_approve_attempts`].
+///
+/// `max_receipt_bytes` bounds the receipt read during the scan; the
+/// caller derives it from the live `git_push_max_metadata_bytes` via
+/// [`crate::git_push_staging::recovery_receipt_bound`] so it tracks the
+/// receipts the request path actually accepts.
+pub fn reconcile_orphaned_staged_carriers(
+    audit: &AuditLog,
+    staging: &GitPushStagingStore,
+    max_receipt_bytes: u64,
+    now: UnixMillis,
+) -> Result<Vec<RequestId>, AuditError> {
+    let carriers = match staging.list_entries_for_recovery(max_receipt_bytes) {
+        Ok(carriers) => carriers,
+        Err(err) => {
+            // Only a failure to open `staged/` itself reaches here — a
+            // genuinely broken staging root, not a torn sibling. Skip
+            // best-effort rather than wedge boot; a misconfigured root is
+            // an operator problem the daemon should still start to report.
+            tracing::error!(
+                target: AUDIT_WRITE_FAILURE_TARGET,
+                kind = "boot_carrier_sweep_open",
+                error = %err,
+                "boot carrier sweep: could not open the staging tree; skipping",
+            );
+            return Ok(Vec::new());
+        }
+    };
+
+    let mut recovered = Vec::new();
+    for carrier in carriers {
+        // Per-entry: a single malformed sibling (e.g. a torn directory
+        // left by an interrupted `delete`) is skipped so it cannot hide
+        // every healthy carrier. It is never "recovered" — a `staged`
+        // outcome for a torn carrier would point at an unpromotable push.
+        let receipt = match carrier {
+            Ok(receipt) => receipt,
+            Err(err) => {
+                tracing::error!(
+                    target: AUDIT_WRITE_FAILURE_TARGET,
+                    kind = "boot_carrier_sweep_entry",
+                    error = %err,
+                    "boot carrier sweep: skipping an unreadable staged entry",
+                );
+                continue;
+            }
+        };
+        let request_id = receipt.push_request_id();
+        let Some(entry) = audit.get_git_push(request_id)? else {
+            // A carrier with no request row. The handler commits the
+            // request row before staging, so this is unreachable barring
+            // external tampering; surface it rather than delete the
+            // agent's bundle bytes.
+            tracing::error!(
+                target: AUDIT_WRITE_FAILURE_TARGET,
+                kind = "boot_carrier_sweep_drift",
+                push_request_id = %request_id,
+                "boot carrier sweep: staged carrier has no audit request row; \
+                 staging store and audit log have drifted apart",
+            );
+            continue;
+        };
+
+        if entry.resolution.is_some() {
+            // A resolution can only exist when a `staged` outcome row
+            // exists (the `git_push_resolution_requires_staged` trigger),
+            // so `result` must be `Some(Staged)` here. A resolved push's
+            // staging directory is the resolver's to clean up, not this
+            // sweep's.
+            if entry.result.is_none() {
+                return Err(AuditError::Invariant(
+                    "boot carrier sweep: carrier has a resolution but no outcome row",
+                ));
+            }
+            continue;
+        }
+
+        match entry.result {
+            None => {
+                // Cross-check the on-disk receipt against the authoritative
+                // audit request row before making the carrier resolvable.
+                // The normal push path writes the request row and the
+                // receipt from the same metadata, so they always agree; a
+                // disagreement here means the receipt was corrupted or
+                // tampered. Recording `staged` anyway would let approve
+                // build a GitHub operation from a receipt that targets a
+                // different branch/head than the audit request records —
+                // `check_approvable_push` never re-compares these fields.
+                if let Some(field) = receipt_request_mismatch(&receipt, &entry) {
+                    tracing::error!(
+                        target: AUDIT_WRITE_FAILURE_TARGET,
+                        kind = "boot_carrier_sweep_mismatch",
+                        push_request_id = %request_id,
+                        field,
+                        "boot carrier sweep: carrier receipt disagrees with the audit \
+                         request row; not recovering",
+                    );
+                    continue;
+                }
+                // The orphan this sweep exists to repair. Re-fsync the
+                // carrier's directory entry first: `stage()`'s final
+                // `fsync_dir` may have failed (leaving the rename visible
+                // but not durable), and we must not record `staged` for a
+                // carrier a later power loss could drop — that is exactly
+                // the `staged`-without-carrier state this ordering
+                // prevents. A fsync failure here means we cannot yet
+                // guarantee durability, so skip and log rather than record
+                // the outcome; a later boot retries.
+                if let Err(err) = staging.ensure_carrier_durable(request_id) {
+                    tracing::error!(
+                        target: AUDIT_WRITE_FAILURE_TARGET,
+                        kind = "boot_carrier_sweep_fsync",
+                        push_request_id = %request_id,
+                        error = %err,
+                        "boot carrier sweep: could not make carrier durable before \
+                         recording its outcome; leaving for a later boot",
+                    );
+                    continue;
+                }
+                audit.record_git_push_outcome(&GitPushOutcomeRecord {
+                    push_request_id: request_id,
+                    completed_at: now,
+                    result: GitPushOutcomeResult::Staged,
+                    github_status: None,
+                    message: RECOVERED_STAGED_CARRIER_MESSAGE,
+                })?;
+                recovered.push(request_id);
+            }
+            Some(GitPushOutcomeResult::Staged) => {
+                // Carrier plus a `staged` outcome: already consistent.
+            }
+            Some(other) => {
+                // A terminal non-staged outcome (e.g. `Denied` from a
+                // staging-content conflict) with a carrier still on disk.
+                // Not this sweep's concern; surface it for the operator.
+                tracing::debug!(
+                    push_request_id = %request_id,
+                    result = ?other,
+                    "boot carrier sweep: carrier carries a terminal non-staged \
+                     outcome; leaving in place",
+                );
+            }
+        }
+    }
+
+    Ok(recovered)
+}
+
+/// Compare a staged carrier's receipt against the authoritative audit
+/// request row. Returns the name of the first field that disagrees, or
+/// `None` when every field matches. The normal push path derives both
+/// from one `VmGitPushMetadata`, so a mismatch signals a corrupted or
+/// tampered receipt that must not be made resolvable.
+fn receipt_request_mismatch(
+    receipt: &VmGitPushStagedReceipt,
+    entry: &GitPushAuditEntry,
+) -> Option<&'static str> {
+    if receipt.repo() != &entry.repo {
+        return Some("repo");
+    }
+    if receipt.branch() != &entry.branch {
+        return Some("branch");
+    }
+    if receipt.expected_remote_head() != entry.expected_remote_head.as_ref() {
+        return Some("expected_remote_head");
+    }
+    if receipt.new_head() != &entry.new_head {
+        return Some("new_head");
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -185,7 +403,9 @@ mod tests {
         GitPushRequestRecord, GitPushResolution, GitPushResolutionRecord, PromoteMintAudit,
     };
     use crate::core::{AgentKind, Jti, RepoRef, RequestId, SessionId, SessionRecord};
-    use crate::vm_git::{GitCloneRepo, GitObjectId};
+    use crate::git_push_staging::recovery_receipt_bound;
+    use crate::vm_git::{GitCloneRepo, GitObjectId, VmGitPushMetadata};
+    use tempfile::TempDir;
     use uuid::Uuid;
 
     fn now() -> UnixMillis {
@@ -613,5 +833,301 @@ mod tests {
         let report = reconcile_pending_approve_attempts(&log, now()).unwrap();
         assert_eq!(report.recovered_started, vec![started_old, started_new]);
         assert_eq!(report.flagged_uncertain, vec![uncertain]);
+    }
+
+    // ---- orphaned-carrier sweep ---------------------------------------
+
+    fn open_staging() -> (GitPushStagingStore, TempDir) {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = GitPushStagingStore::open(tmp.path().join("staging")).unwrap();
+        (store, tmp)
+    }
+
+    fn sample_push_metadata() -> VmGitPushMetadata {
+        VmGitPushMetadata::new(
+            sample_repo(),
+            "main".parse().unwrap(),
+            Some(git_oid('1')),
+            git_oid('2'),
+        )
+    }
+
+    /// Record only the `git_push_request` row — the state the handler
+    /// reaches *before* staging the carrier and *before* the outcome
+    /// write. Mirrors `record_staged_push` minus the outcome row.
+    fn record_push_request_only(log: &AuditLog, session_id: SessionId) -> RequestId {
+        let push_request_id = RequestId::new();
+        log.record_git_push_request(&GitPushRequestRecord {
+            push_request_id,
+            session_id,
+            received_at: UnixMillis::from_millis(1_700_000_100),
+            repo: sample_repo(),
+            branch: "main".parse().unwrap(),
+            expected_remote_head: Some(git_oid('1')),
+            new_head: git_oid('2'),
+            correlation_id: None,
+        })
+        .unwrap();
+        push_request_id
+    }
+
+    fn stage_carrier(staging: &GitPushStagingStore, request_id: RequestId) {
+        staging
+            .stage(
+                request_id,
+                UnixMillis::from_millis(1_700_000_120),
+                sample_push_metadata(),
+                b"bundle bytes".to_vec(),
+            )
+            .unwrap();
+    }
+
+    /// The core repair: a carrier on disk whose request row exists but
+    /// whose `staged` outcome row never committed (crash between staging
+    /// and the outcome write) is made resolvable by writing the outcome
+    /// retroactively.
+    #[test]
+    fn orphaned_carrier_is_recovered_to_staged() {
+        let (log, session_id) = open_log_with_session();
+        let (staging, _tmp) = open_staging();
+        let request_id = record_push_request_only(&log, session_id);
+        stage_carrier(&staging, request_id);
+
+        // Precondition: not resolvable — no outcome row.
+        assert!(
+            log.get_git_push(request_id)
+                .unwrap()
+                .unwrap()
+                .result
+                .is_none()
+        );
+
+        let recovered = reconcile_orphaned_staged_carriers(
+            &log,
+            &staging,
+            recovery_receipt_bound(16 * 1024),
+            now(),
+        )
+        .unwrap();
+        assert_eq!(recovered, vec![request_id]);
+
+        let entry = log.get_git_push(request_id).unwrap().unwrap();
+        assert_eq!(entry.result, Some(GitPushOutcomeResult::Staged));
+        assert_eq!(
+            entry.message.as_deref(),
+            Some(RECOVERED_STAGED_CARRIER_MESSAGE)
+        );
+        assert_eq!(entry.completed_at, Some(now()));
+    }
+
+    /// A carrier that already carries its `staged` outcome (the common
+    /// case: no crash) is left untouched — the sweep neither rewrites
+    /// the row (which would trip the PK) nor reports it.
+    #[test]
+    fn already_staged_carrier_is_left_untouched() {
+        let (log, session_id) = open_log_with_session();
+        let (staging, _tmp) = open_staging();
+        let request_id = record_staged_push(&log, session_id);
+        stage_carrier(&staging, request_id);
+
+        let recovered = reconcile_orphaned_staged_carriers(
+            &log,
+            &staging,
+            recovery_receipt_bound(16 * 1024),
+            now(),
+        )
+        .unwrap();
+        assert!(recovered.is_empty());
+
+        // Outcome row is the original, not a rewrite.
+        let entry = log.get_git_push(request_id).unwrap().unwrap();
+        assert_eq!(entry.result, Some(GitPushOutcomeResult::Staged));
+        assert_eq!(entry.message.as_deref(), Some("queued for review"));
+    }
+
+    /// A carrier with no audit request row at all (staging store and
+    /// audit log drifted) is surfaced but not repaired: the sweep must
+    /// not fabricate a `staged` outcome for a push it has no request row
+    /// for, nor delete the agent's bundle.
+    #[test]
+    fn carrier_without_request_row_is_left_in_place() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let (staging, _tmp) = open_staging();
+        let request_id = RequestId::new();
+        stage_carrier(&staging, request_id);
+
+        let recovered = reconcile_orphaned_staged_carriers(
+            &log,
+            &staging,
+            recovery_receipt_bound(16 * 1024),
+            now(),
+        )
+        .unwrap();
+        assert!(recovered.is_empty());
+        assert!(log.get_git_push(request_id).unwrap().is_none());
+    }
+
+    #[test]
+    fn empty_staging_store_recovers_nothing() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let (staging, _tmp) = open_staging();
+        let recovered = reconcile_orphaned_staged_carriers(
+            &log,
+            &staging,
+            recovery_receipt_bound(16 * 1024),
+            now(),
+        )
+        .unwrap();
+        assert!(recovered.is_empty());
+    }
+
+    /// A `list()` IO failure (here: a malformed sibling directory under
+    /// `staged/`) is best-effort — the sweep logs and returns empty
+    /// rather than aborting startup.
+    #[test]
+    fn list_error_is_best_effort() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let (staging, _tmp) = open_staging();
+        std::fs::create_dir(staging.root().join("staged").join("not-a-uuid")).unwrap();
+
+        let recovered = reconcile_orphaned_staged_carriers(
+            &log,
+            &staging,
+            recovery_receipt_bound(16 * 1024),
+            now(),
+        )
+        .unwrap();
+        assert!(recovered.is_empty());
+    }
+
+    /// Recovered carriers are resolvable end to end: after the sweep
+    /// writes the `staged` outcome, a reject resolution is admitted by
+    /// the `git_push_resolution_requires_staged` trigger.
+    #[test]
+    fn recovered_carrier_is_rejectable() {
+        let (log, session_id) = open_log_with_session();
+        let (staging, _tmp) = open_staging();
+        let request_id = record_push_request_only(&log, session_id);
+        stage_carrier(&staging, request_id);
+
+        reconcile_orphaned_staged_carriers(
+            &log,
+            &staging,
+            recovery_receipt_bound(16 * 1024),
+            now(),
+        )
+        .unwrap();
+
+        // The reject path's audit write now succeeds where it would have
+        // been refused before recovery.
+        log.record_git_push_resolution(&GitPushResolutionRecord {
+            push_request_id: request_id,
+            decided_at: now(),
+            decision: GitPushResolution::Rejected,
+            operator: "alice",
+            reason: "not wanted",
+        })
+        .unwrap();
+        assert!(
+            log.get_git_push(request_id)
+                .unwrap()
+                .unwrap()
+                .resolution
+                .is_some()
+        );
+    }
+
+    /// A persistent torn sibling (a carrier whose `entry.json` was
+    /// removed, as an interrupted `delete` would leave) must not block
+    /// recovery of a healthy orphan sitting next to it — and must never
+    /// itself be recovered. Regression test for the all-or-nothing
+    /// `list()` the sweep originally used.
+    #[test]
+    fn corrupt_sibling_does_not_block_recovery_of_a_valid_orphan() {
+        let (log, session_id) = open_log_with_session();
+        let (staging, _tmp) = open_staging();
+
+        // Healthy orphan: request row + intact carrier, no outcome row.
+        let valid = record_push_request_only(&log, session_id);
+        stage_carrier(&staging, valid);
+
+        // Torn sibling: a carrier whose receipt is gone. It has no audit
+        // row and must be skipped, not recovered.
+        let torn = RequestId::new();
+        stage_carrier(&staging, torn);
+        std::fs::remove_file(
+            staging
+                .root()
+                .join("staged")
+                .join(torn.to_string())
+                .join("entry.json"),
+        )
+        .unwrap();
+
+        let recovered = reconcile_orphaned_staged_carriers(
+            &log,
+            &staging,
+            recovery_receipt_bound(16 * 1024),
+            now(),
+        )
+        .unwrap();
+        assert_eq!(
+            recovered,
+            vec![valid],
+            "the healthy orphan must be recovered"
+        );
+        assert_eq!(
+            log.get_git_push(valid).unwrap().unwrap().result,
+            Some(GitPushOutcomeResult::Staged),
+        );
+        // The torn sibling was never given an outcome row.
+        assert!(log.get_git_push(torn).unwrap().is_none());
+    }
+
+    /// A carrier whose receipt disagrees with the authoritative audit
+    /// request row (here: a different branch) is not made resolvable —
+    /// recovering it would let approve act on metadata the request never
+    /// authorised.
+    #[test]
+    fn carrier_disagreeing_with_the_audit_request_is_not_recovered() {
+        let (log, session_id) = open_log_with_session();
+        let (staging, _tmp) = open_staging();
+
+        // Request row records branch `main` (see `record_push_request_only`).
+        let request_id = record_push_request_only(&log, session_id);
+        // Stage a carrier for the same id but a *different* branch.
+        staging
+            .stage(
+                request_id,
+                UnixMillis::from_millis(1_700_000_120),
+                VmGitPushMetadata::new(
+                    sample_repo(),
+                    "other-branch".parse().unwrap(),
+                    Some(git_oid('1')),
+                    git_oid('2'),
+                ),
+                b"bundle".to_vec(),
+            )
+            .unwrap();
+
+        let recovered = reconcile_orphaned_staged_carriers(
+            &log,
+            &staging,
+            recovery_receipt_bound(16 * 1024),
+            now(),
+        )
+        .unwrap();
+        assert!(
+            recovered.is_empty(),
+            "a mismatched carrier must not be recovered"
+        );
+        assert!(
+            log.get_git_push(request_id)
+                .unwrap()
+                .unwrap()
+                .result
+                .is_none(),
+            "no outcome row must be written for a mismatched carrier",
+        );
     }
 }
