@@ -574,6 +574,13 @@ impl ChatgptOauthAuthority {
     /// * `Some(raw)` equal to the cached `durable_raw` — the store is
     ///   unchanged since we synced; keep the cache (which may be legitimately
     ///   ahead via `needs_persist`).
+    /// * `Some(raw)` equal to a *pending* cached bundle's serialization — our
+    ///   own write landed observably but its durability could not be confirmed
+    ///   (e.g. the file backend renamed the temp file but the parent-directory
+    ///   fsync failed, so `put` returned an error). This is not an out-of-band
+    ///   change: keep it pending and re-point `durable_raw` at it so the retry
+    ///   re-writes to confirm durability rather than trusting the unconfirmed
+    ///   bytes.
     /// * `Some(raw)` differing (cold start, or an out-of-band rotation) —
     ///   parse and adopt it as the authoritative bundle, discarding any stale
     ///   cache and its pending persist.
@@ -586,18 +593,33 @@ impl ChatgptOauthAuthority {
             *state = ChatgptOauthState::Cold;
             return Err(ChatgptOauthError::LoginRequired);
         };
-        let in_sync = matches!(
-            &*state,
-            ChatgptOauthState::Loaded { durable_raw, .. } if *durable_raw == raw
-        );
-        if !in_sync {
-            let bundle = parse_bundle(&raw)?;
-            *state = ChatgptOauthState::Loaded {
-                bundle,
-                durable_raw: raw,
-                needs_persist: false,
-            };
+        if let ChatgptOauthState::Loaded {
+            bundle,
+            durable_raw,
+            needs_persist,
+        } = state
+        {
+            if *durable_raw == raw {
+                // Store unchanged since we synced; keep the cache as-is.
+                return Ok(());
+            }
+            // A pending write may have landed observably without being
+            // confirmed durable. If the store now holds exactly our pending
+            // bundle, this is our own unconfirmed write — not an out-of-band
+            // change — so keep it pending and re-point `durable_raw` at it,
+            // letting the retry re-write to confirm durability.
+            if *needs_persist && serde_json::to_string(&*bundle).is_ok_and(|s| s == raw) {
+                *durable_raw = raw;
+                return Ok(());
+            }
         }
+        // Cold, or a genuine out-of-band change: adopt the store's value.
+        let bundle = parse_bundle(&raw)?;
+        *state = ChatgptOauthState::Loaded {
+            bundle,
+            durable_raw: raw,
+            needs_persist: false,
+        };
         Ok(())
     }
 

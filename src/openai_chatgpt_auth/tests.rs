@@ -34,6 +34,13 @@ struct InMemStore {
     /// entry with the given value (a concurrent operator *replacement*), then
     /// returns it.
     replace_after_gets: StdMutex<Option<(usize, String)>>,
+    /// Total `put`s attempted (including those that error), so a test can
+    /// observe whether a durability-confirming re-write happened.
+    put_count: AtomicUsize,
+    /// When set, `put` persists the value but *then* returns an error —
+    /// modelling `FileSecretStore::put`, whose `rename` makes the new bytes
+    /// visible to `get` before the parent-directory fsync that can fail.
+    put_persists_but_errors: AtomicBool,
 }
 
 impl SecretStore for InMemStore {
@@ -59,6 +66,7 @@ impl SecretStore for InMemStore {
     }
 
     fn put(&self, key: &SecretKey, value: &str) -> Result<(), SecretError> {
+        self.put_count.fetch_add(1, Ordering::SeqCst);
         if self.fail_puts.load(Ordering::SeqCst) {
             return Err(SecretError::Keyring("simulated put failure".into()));
         }
@@ -68,6 +76,12 @@ impl SecretStore for InMemStore {
             .insert(key.as_str().to_string(), value.to_string());
         if let Some((clock, secs)) = &*self.put_clock.lock().unwrap() {
             clock.set(clock.now_unix_seconds() + *secs);
+        }
+        if self.put_persists_but_errors.load(Ordering::SeqCst) {
+            // Value is now visible to `get`, but the write reports failure.
+            return Err(SecretError::Keyring(
+                "simulated post-persist failure".into(),
+            ));
         }
         Ok(())
     }
@@ -93,6 +107,14 @@ impl InMemStore {
 
     fn replace_after_gets(&self, after: usize, value: String) {
         *self.replace_after_gets.lock().unwrap() = Some((after, value));
+    }
+
+    fn set_put_persists_but_errors(&self, on: bool) {
+        self.put_persists_but_errors.store(on, Ordering::SeqCst);
+    }
+
+    fn put_count(&self) -> usize {
+        self.put_count.load(Ordering::SeqCst)
     }
 
     fn contains(&self, key: &SecretKey) -> bool {
@@ -680,6 +702,56 @@ async fn freshness_is_reevaluated_after_a_slow_pending_persist() {
     // handing back an expired one.
     let headers = authority.current_headers(&store).await.unwrap();
     assert_eq!(headers.access_token, access_token_with_exp(99_000));
+}
+
+#[tokio::test]
+async fn partially_persisted_write_is_retried_to_confirm_durability() {
+    let store = InMemStore::default();
+    let key = SecretKey::new("openai-chatgpt-auth").unwrap();
+    let bundle = make_bundle(/*exp=*/ 1_050, "refresh-old", false);
+    store
+        .put(&key, &serde_json::to_string(&bundle).unwrap())
+        .unwrap();
+    let clock = Arc::new(FakeClock::new(1_000));
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/oauth/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id_token": id_token_with_chatgpt_claims("acct", false, 99_999),
+            "access_token": access_token_with_exp(50_000),
+            "refresh_token": "refresh-new",
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let refresh_url = format!("{}/oauth/token", server.uri());
+    let (authority, _) = build_authority(&refresh_url, Arc::clone(&clock));
+
+    // First call refreshes and the write becomes visible to `get`, but the
+    // durability fsync fails, so `put` reports an error (file-backend
+    // rename-succeeds-but-dir-fsync-fails).
+    store.set_put_persists_but_errors(true);
+    let err = authority.current_headers(&store).await.unwrap_err();
+    assert!(matches!(err, ChatgptOauthError::SecretStore(_)), "{err:?}");
+    let puts_after_first = store.put_count();
+
+    // The fsync path recovers.
+    store.set_put_persists_but_errors(false);
+
+    // Second call: the store already observably holds the rotated bundle, but
+    // that write was never confirmed durable. We must recognise it as our own
+    // pending write and *re-write* it (not adopt it as synced and stop), so a
+    // later crash cannot lose the rotated token. `.expect(1)` confirms no
+    // second upstream refresh.
+    let headers = authority.current_headers(&store).await.unwrap();
+    assert_eq!(headers.access_token, access_token_with_exp(50_000));
+    assert!(
+        store.put_count() > puts_after_first,
+        "an unconfirmed write must be retried to confirm durability",
+    );
+    let stored: ChatgptAuthBundle =
+        serde_json::from_str(&store.get(&key).unwrap().unwrap()).unwrap();
+    assert_eq!(stored.tokens.unwrap().refresh_token, "refresh-new");
 }
 
 #[tokio::test]
