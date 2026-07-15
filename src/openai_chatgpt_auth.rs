@@ -422,9 +422,12 @@ impl ChatgptOauthAuthority {
     /// Order of operations:
     ///   1. Acquire the state lock (refresh serialised).
     ///   2. Load the bundle from the secret store on cold start.
-    ///   3. Inspect the cached `access_token` JWT. If it is stale (or
+    ///   3. Flush any write left pending by an earlier refresh whose `put`
+    ///      failed, so durable storage is repaired before we risk another
+    ///      refresh.
+    ///   4. Inspect the cached `access_token` JWT. If it is stale (or
     ///      unparseable), call `/oauth/token`.
-    ///   4. Persist any successful refresh back to the secret store
+    ///   5. Persist any successful refresh back to the secret store
     ///      before returning the new headers.
     ///
     /// Persistence-failure envelope: a refresh mutates the in-memory
@@ -468,15 +471,14 @@ impl ChatgptOauthAuthority {
             self.config.clock.now_unix_seconds(),
             self.config.leeway_seconds,
         );
+        // If an earlier refresh left the cache ahead of durable storage,
+        // flush it now — before any refresh below, which could itself fail
+        // transiently and otherwise leave the spent refresh token durable.
+        // Best-effort: a still-failing write must not fail this request,
+        // since the cached token is valid.
+        self.retry_pending_persist(secret_store, &mut state);
         if decision != RefreshDecision::Fresh {
             self.refresh(secret_store, &mut state).await?;
-        } else {
-            // The cached token is still good, but an earlier refresh may
-            // have left the cache ahead of durable storage. Retry the
-            // write best-effort so the durability gap closes as soon as
-            // the store recovers; a still-failing write must not fail this
-            // request, since the cached token is valid.
-            self.retry_pending_persist(secret_store, &mut state);
         }
 
         let bundle = match &*state {

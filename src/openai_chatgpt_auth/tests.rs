@@ -498,6 +498,67 @@ async fn put_failure_after_refresh_keeps_new_token_and_heals_durable_on_next_cal
 }
 
 #[tokio::test]
+async fn pending_persist_is_flushed_before_a_stale_token_refresh() {
+    let store = InMemStore::default();
+    let key = SecretKey::new("openai-chatgpt-auth").unwrap();
+    let bundle = make_bundle(/*exp=*/ 1_050, "refresh-old", false);
+    store
+        .put(&key, &serde_json::to_string(&bundle).unwrap())
+        .unwrap();
+    let clock = Arc::new(FakeClock::new(1_000));
+    let server = MockServer::start().await;
+    // First refresh rotates to a token that expires at 2_000 (fresh now, but
+    // stale once the clock advances). Highest priority + single use.
+    Mock::given(method("POST"))
+        .and(path("/oauth/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id_token": id_token_with_chatgpt_claims("acct-rotated", false, 99_999),
+            "access_token": access_token_with_exp(2_000),
+            "refresh_token": "refresh-mid",
+        })))
+        .with_priority(1)
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    // Every later refresh fails transiently.
+    Mock::given(method("POST"))
+        .and(path("/oauth/token"))
+        .respond_with(ResponseTemplate::new(503).set_body_string("backend down"))
+        .mount(&server)
+        .await;
+    let refresh_url = format!("{}/oauth/token", server.uri());
+    let (authority, _) = build_authority(&refresh_url, Arc::clone(&clock));
+
+    // First call: stale token → refresh to "refresh-mid", but the durable
+    // write fails, leaving the cache ahead of durable storage.
+    store.set_fail_puts(true);
+    let err = authority.current_headers(&store).await.unwrap_err();
+    assert!(matches!(err, ChatgptOauthError::SecretStore(_)), "{err:?}");
+    let stored: ChatgptAuthBundle =
+        serde_json::from_str(&store.get(&key).unwrap().unwrap()).unwrap();
+    assert_eq!(stored.tokens.unwrap().refresh_token, "refresh-old");
+
+    // The store recovers, and enough time passes that the cached
+    // "refresh-mid" access token is now itself stale.
+    store.set_fail_puts(false);
+    clock.set(1_995);
+
+    // Second call: the token is stale, so we head for a refresh — which now
+    // fails transiently (503). The pending write must be flushed *before*
+    // that refresh, so durable storage holds the valid, not-yet-spent
+    // "refresh-mid" token instead of the spent "refresh-old". Otherwise a
+    // restart here would still force a re-login.
+    let err = authority.current_headers(&store).await.unwrap_err();
+    match err {
+        ChatgptOauthError::RefreshTransient(msg) => assert!(msg.contains("503"), "{msg}"),
+        other => panic!("expected RefreshTransient, got {other:?}"),
+    }
+    let stored: ChatgptAuthBundle =
+        serde_json::from_str(&store.get(&key).unwrap().unwrap()).unwrap();
+    assert_eq!(stored.tokens.unwrap().refresh_token, "refresh-mid");
+}
+
+#[tokio::test]
 async fn put_failure_still_serves_cached_token_while_store_stays_broken() {
     let store = InMemStore::default();
     let key = SecretKey::new("openai-chatgpt-auth").unwrap();
