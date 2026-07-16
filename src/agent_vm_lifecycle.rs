@@ -2094,9 +2094,21 @@ fn run_start_step(
         AgentVmStartStep::DiscoverBridgeAndDenyGuestIpv6 {
             discover_invocation,
         } => {
-            let discovery =
-                wait_for_guest_bridge_discovery(discover_invocation, plan.network.ipv4_gateway())
-                    .map_err(|err| (err, StartOutcome::DiscoverBridgeFailed))?;
+            // Wait until the agent's own vmenet has joined the bridge before
+            // installing the deny. Host placement has just the agent's member; vm
+            // placement shares the network with the broker VM, whose member is
+            // already attached, so require two -- otherwise discovery could accept
+            // the broker's member alone and leave the agent's interface unfiltered.
+            let min_members = match plan.broker_placement {
+                BrokerPlacement::Vm => 2,
+                BrokerPlacement::Host => 1,
+            };
+            let discovery = wait_for_guest_bridge_discovery(
+                discover_invocation,
+                plan.network.ipv4_gateway(),
+                min_members,
+            )
+            .map_err(|err| (err, StartOutcome::DiscoverBridgeFailed))?;
             plan.firewall_install_invocation(&discovery.deny_interfaces())
                 .run()
                 .map_err(|err| (err.into(), StartOutcome::InstallIpv6DenyFailed))
@@ -2671,19 +2683,29 @@ fn resource_list_contains_exact_line(raw: &[u8], name: &str) -> bool {
 }
 
 /// Run `ifconfig` (retrying while the bridge is still coming up) and locate the
-/// host bridge carrying `gateway`. A missing gateway is transient (the bridge
-/// appears a beat after `container run`) and retried; an ambiguous or
-/// unparseable interface is a hard failure. Fails closed after the last attempt.
+/// vmnet bridge carrying `gateway` with at least `min_members` `vmenet` members.
+/// Both "no qualifying bridge yet" and "the agent's member has not attached yet"
+/// are transient and retried; an ambiguous or unparseable interface is a hard
+/// failure. Fails closed after the last attempt so the guest is never released
+/// with an unfiltered or wrongly-scoped IPv6 path.
 fn wait_for_guest_bridge_discovery(
     invocation: &ProcessInvocation,
     gateway: Ipv4Addr,
+    min_members: usize,
 ) -> Result<GuestBridgeDiscovery, StartFailure> {
     for attempt in 0..BRIDGE_DISCOVERY_ATTEMPTS {
         let last: StartFailure = match invocation.output() {
             Ok(output) if output.status.success() => {
-                match parse_bridge_for_gateway(&String::from_utf8_lossy(&output.stdout), gateway) {
+                match parse_bridge_for_gateway(
+                    &String::from_utf8_lossy(&output.stdout),
+                    gateway,
+                    min_members,
+                ) {
                     Ok(discovery) => return Ok(discovery),
-                    Err(err @ GuestBridgeDiscoveryError::NoBridgeForGateway(_)) => err.into(),
+                    Err(
+                        err @ (GuestBridgeDiscoveryError::NoBridgeForGateway(_)
+                        | GuestBridgeDiscoveryError::BridgeMembersNotReady { .. }),
+                    ) => err.into(),
                     Err(err) => return Err(err.into()),
                 }
             }

@@ -59,10 +59,19 @@ pub enum GuestIpv6InspectionError {
 
 #[derive(Debug, thiserror::Error, Eq, PartialEq)]
 pub enum GuestBridgeDiscoveryError {
-    #[error("no host interface carries the agent session gateway {0} (the bridge is not up yet)")]
+    #[error("no vmnet bridge carries the agent session gateway {0} yet (the bridge is not up yet)")]
     NoBridgeForGateway(Ipv4Addr),
-    #[error("more than one host interface carries the agent session gateway {0}")]
+    #[error("more than one vmnet bridge carries the agent session gateway {0}")]
     MultipleBridgesForGateway(Ipv4Addr),
+    #[error(
+        "vmnet bridge {bridge} carries the gateway but only has {found} vmenet member(s), \
+         expected at least {expected} (the agent's interface has not attached yet)"
+    )]
+    BridgeMembersNotReady {
+        bridge: String,
+        found: usize,
+        expected: usize,
+    },
     #[error("host interface name is not usable in a PF rule: {0}")]
     InvalidInterfaceName(#[from] AgentVmConfigError),
 }
@@ -111,19 +120,43 @@ struct IfconfigStanza {
     members: Vec<String>,
 }
 
+/// Whether an interface name is the macOS vmnet bridge / member shape the agent
+/// VM uses (`bridge100`, `vmenet0`). Used to reject an unrelated host interface
+/// (e.g. `en0`, `utun3`) that merely happens to carry a gateway address when the
+/// configured RFC1918 pool overlaps a LAN or VPN.
+fn is_vmnet_bridge_name(name: &str) -> bool {
+    matches!(name.strip_prefix("bridge"), Some(n) if !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+}
+
+fn is_vmnet_member_name(name: &str) -> bool {
+    matches!(name.strip_prefix("vmenet"), Some(n) if !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+}
+
 /// Find the vmnet bridge that carries `gateway` (the agent session's IPv4
-/// gateway, which macOS assigns to the bridge interface), and its member
-/// interfaces, from `ifconfig` output.
+/// gateway, which macOS assigns to the bridge interface), and its `vmenet`
+/// member interfaces, from `ifconfig` output.
 ///
 /// The bridge exists only after the agent VM starts, and its name (`bridgeN`)
 /// and member (`vmenetN`) are assigned by vmnet in start order, so they cannot
 /// be predicted — but the session's gateway *is* known, and macOS puts it on the
-/// bridge (`inet 192.168.x.1`), giving a stable, per-session key. Fails closed:
-/// if no interface (or more than one) carries the gateway, the caller must not
-/// release the guest without the backstop.
+/// bridge (`inet 192.168.x.1`), giving a stable, per-session key.
+///
+/// Two fail-open cases the caller relies on this to close:
+/// - A non-vmnet interface (`en0`, a VPN `utun`) that happens to carry the
+///   gateway when the RFC1918 pool overlaps a LAN is *rejected*: only a `bridgeN`
+///   with `vmenetN` membership qualifies, so discovery keeps retrying for the
+///   real bridge instead of denying IPv6 on the wrong interface.
+/// - The bridge appearing before the agent's `vmenet` member attaches: the match
+///   requires at least `min_vmenet_members` members (1 for host placement — the
+///   agent's; 2 for vm placement — the broker's plus the agent's), so the agent
+///   interface is never missing from the deny set.
+///
+/// Fails closed: no qualifying bridge, too few members, or more than one
+/// qualifying bridge all error rather than release the guest unprotected.
 pub fn parse_bridge_for_gateway(
     ifconfig_output: &str,
     gateway: Ipv4Addr,
+    min_vmenet_members: usize,
 ) -> Result<GuestBridgeDiscovery, GuestBridgeDiscoveryError> {
     let mut stanzas: Vec<IfconfigStanza> = Vec::new();
     for line in ifconfig_output.lines() {
@@ -162,7 +195,11 @@ pub fn parse_bridge_for_gateway(
         }
     }
 
-    let mut matching = stanzas.into_iter().filter(|s| s.carries_gateway);
+    // Only a real vmnet bridge carrying the gateway qualifies — never a LAN/VPN
+    // interface that merely shares the address.
+    let mut matching = stanzas
+        .into_iter()
+        .filter(|s| s.carries_gateway && is_vmnet_bridge_name(&s.name));
     let bridge_stanza = matching
         .next()
         .ok_or(GuestBridgeDiscoveryError::NoBridgeForGateway(gateway))?;
@@ -171,9 +208,20 @@ pub fn parse_bridge_for_gateway(
             gateway,
         ));
     }
-    let bridge = PfInterface::new(bridge_stanza.name)?;
-    let members = bridge_stanza
+    let vmenet_members: Vec<String> = bridge_stanza
         .members
+        .into_iter()
+        .filter(|m| is_vmnet_member_name(m))
+        .collect();
+    if vmenet_members.len() < min_vmenet_members {
+        return Err(GuestBridgeDiscoveryError::BridgeMembersNotReady {
+            bridge: bridge_stanza.name,
+            found: vmenet_members.len(),
+            expected: min_vmenet_members,
+        });
+    }
+    let bridge = PfInterface::new(bridge_stanza.name)?;
+    let members = vmenet_members
         .into_iter()
         .map(PfInterface::new)
         .collect::<Result<Vec<_>, _>>()?;

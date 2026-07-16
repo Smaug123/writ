@@ -133,7 +133,9 @@ pub(super) fn write_fake_tool(
 /// A fake `ifconfig` for the post-start bridge discovery. It emits a `bridgeN`
 /// carrying each gateway the daemon tests' 252–253 subnet range can allocate, so
 /// the `Ipv4OnlyNoGuestIpv6` IPv6-deny step finds the session's bridge and the
-/// start proceeds. Indentation is spaces (the parser accepts space or tab).
+/// start proceeds. Each bridge has two `vmenet` members so both host placement
+/// (needs ≥1) and vm placement (needs ≥2: the broker's plus the agent's) accept
+/// it. Indentation is spaces (the parser accepts space or tab).
 pub(super) fn write_fake_ifconfig(dir: &Path) -> PathBuf {
     let path = dir.join("fake-ifconfig");
     let script = "#!/bin/sh\n\
@@ -141,9 +143,11 @@ pub(super) fn write_fake_ifconfig(dir: &Path) -> PathBuf {
          'bridge100: flags=8863<UP> mtu 1500' \\\n\
          '    inet 192.168.252.1 netmask 0xffffff00 broadcast 192.168.252.255' \\\n\
          '    member: vmenet0 flags=20003<VIRTIO>' \\\n\
+         '    member: vmenet1 flags=20003<VIRTIO>' \\\n\
          'bridge101: flags=8863<UP> mtu 1500' \\\n\
          '    inet 192.168.253.1 netmask 0xffffff00 broadcast 192.168.253.255' \\\n\
-         '    member: vmenet1 flags=20003<VIRTIO>'\n\
+         '    member: vmenet2 flags=20003<VIRTIO>' \\\n\
+         '    member: vmenet3 flags=20003<VIRTIO>'\n\
          exit 0\n";
     fs::write(&path, script).unwrap();
     let mut permissions = fs::metadata(&path).unwrap().permissions();

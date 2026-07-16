@@ -137,7 +137,8 @@ bridge101: flags=8a63<UP,BROADCAST,SMART,RUNNING,ALLMULTI,SIMPLEX,MULTICAST> mtu
 
 #[test]
 fn discovery_maps_each_session_gateway_to_its_own_bridge_and_member() {
-    let a = parse_bridge_for_gateway(TWO_BRIDGE_IFCONFIG, Ipv4Addr::new(192, 168, 221, 1)).unwrap();
+    let a =
+        parse_bridge_for_gateway(TWO_BRIDGE_IFCONFIG, Ipv4Addr::new(192, 168, 221, 1), 1).unwrap();
     assert_eq!(a.bridge().as_str(), "bridge100");
     assert_eq!(
         a.members()
@@ -154,7 +155,8 @@ fn discovery_maps_each_session_gateway_to_its_own_bridge_and_member() {
         vec!["bridge100", "vmenet0"]
     );
 
-    let b = parse_bridge_for_gateway(TWO_BRIDGE_IFCONFIG, Ipv4Addr::new(192, 168, 222, 1)).unwrap();
+    let b =
+        parse_bridge_for_gateway(TWO_BRIDGE_IFCONFIG, Ipv4Addr::new(192, 168, 222, 1), 1).unwrap();
     assert_eq!(b.bridge().as_str(), "bridge101");
     assert_eq!(
         b.members()
@@ -167,8 +169,8 @@ fn discovery_maps_each_session_gateway_to_its_own_bridge_and_member() {
 
 #[test]
 fn discovery_fails_closed_when_no_interface_carries_the_gateway() {
-    let err =
-        parse_bridge_for_gateway(TWO_BRIDGE_IFCONFIG, Ipv4Addr::new(192, 168, 99, 1)).unwrap_err();
+    let err = parse_bridge_for_gateway(TWO_BRIDGE_IFCONFIG, Ipv4Addr::new(192, 168, 99, 1), 1)
+        .unwrap_err();
     assert!(matches!(
         err,
         GuestBridgeDiscoveryError::NoBridgeForGateway(_)
@@ -183,12 +185,97 @@ fn discovery_matches_the_gateway_address_exactly_not_as_a_prefix() {
 bridge100: flags=8863<UP> mtu 1500\n\
 \tinet 192.168.221.10 netmask 0xffffff00 broadcast 192.168.221.255\n\
 \tmember: vmenet0 flags=20003<VIRTIO>\n";
-    let err = parse_bridge_for_gateway(ifconfig, Ipv4Addr::new(192, 168, 221, 1)).unwrap_err();
+    let err = parse_bridge_for_gateway(ifconfig, Ipv4Addr::new(192, 168, 221, 1), 1).unwrap_err();
     assert!(matches!(
         err,
         GuestBridgeDiscoveryError::NoBridgeForGateway(_)
     ));
     // The bridge that really holds .10 is found for a query on .10.
-    let found = parse_bridge_for_gateway(ifconfig, Ipv4Addr::new(192, 168, 221, 10)).unwrap();
+    let found = parse_bridge_for_gateway(ifconfig, Ipv4Addr::new(192, 168, 221, 10), 1).unwrap();
     assert_eq!(found.bridge().as_str(), "bridge100");
+}
+
+#[test]
+fn discovery_rejects_a_non_bridge_interface_that_shares_the_gateway_address() {
+    // If the RFC1918 pool overlaps a LAN, a real host interface (en0) can carry
+    // the session gateway before the vmnet bridge appears. It must NOT be selected
+    // (that would deny host IPv6 on en0 and leave the real bridge unfiltered);
+    // discovery keeps retrying instead.
+    let only_en0 = "\
+en0: flags=8863<UP,BROADCAST,SMART,RUNNING> mtu 1500\n\
+\tinet 192.168.221.1 netmask 0xffffff00 broadcast 192.168.221.255\n\
+\tinet6 fe80::1%en0 prefixlen 64 scopeid 0x4\n";
+    let err = parse_bridge_for_gateway(only_en0, Ipv4Addr::new(192, 168, 221, 1), 1).unwrap_err();
+    assert!(
+        matches!(err, GuestBridgeDiscoveryError::NoBridgeForGateway(_)),
+        "{err:?}"
+    );
+
+    // Even when en0 AND the real bridge both carry the address, the vmnet bridge
+    // is chosen (en0 is filtered out, so there is no ambiguity).
+    let both = "\
+en0: flags=8863<UP> mtu 1500\n\
+\tinet 192.168.221.1 netmask 0xffffff00 broadcast 192.168.221.255\n\
+bridge100: flags=8863<UP> mtu 1500\n\
+\tinet 192.168.221.1 netmask 0xffffff00 broadcast 192.168.221.255\n\
+\tmember: vmenet0 flags=20003<VIRTIO>\n";
+    let found = parse_bridge_for_gateway(both, Ipv4Addr::new(192, 168, 221, 1), 1).unwrap();
+    assert_eq!(found.bridge().as_str(), "bridge100");
+}
+
+#[test]
+fn discovery_waits_until_the_expected_vmenet_members_have_attached() {
+    // Host placement (min 1): a bridge carrying the gateway with no vmenet member
+    // yet is not accepted — the agent's interface has not attached.
+    let no_member = "\
+bridge100: flags=8863<UP> mtu 1500\n\
+\tinet 192.168.221.1 netmask 0xffffff00 broadcast 192.168.221.255\n";
+    let err = parse_bridge_for_gateway(no_member, Ipv4Addr::new(192, 168, 221, 1), 1).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            GuestBridgeDiscoveryError::BridgeMembersNotReady {
+                found: 0,
+                expected: 1,
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+
+    // vm placement (min 2): the shared bridge with only the broker's member is not
+    // enough — wait for the agent's member too.
+    let one_member = "\
+bridge100: flags=8863<UP> mtu 1500\n\
+\tinet 192.168.221.1 netmask 0xffffff00 broadcast 192.168.221.255\n\
+\tmember: vmenet0 flags=20003<VIRTIO>\n";
+    let err = parse_bridge_for_gateway(one_member, Ipv4Addr::new(192, 168, 221, 1), 2).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            GuestBridgeDiscoveryError::BridgeMembersNotReady {
+                found: 1,
+                expected: 2,
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+
+    // With both members attached, vm placement accepts and denies on both (plus
+    // the bridge). A non-vmenet member is ignored for the count and the deny set.
+    let two_members = "\
+bridge100: flags=8863<UP> mtu 1500\n\
+\tinet 192.168.221.1 netmask 0xffffff00 broadcast 192.168.221.255\n\
+\tmember: vmenet0 flags=20003<VIRTIO>\n\
+\tmember: vmenet1 flags=20003<VIRTIO>\n";
+    let found = parse_bridge_for_gateway(two_members, Ipv4Addr::new(192, 168, 221, 1), 2).unwrap();
+    assert_eq!(
+        found
+            .deny_interfaces()
+            .iter()
+            .map(PfInterface::as_str)
+            .collect::<Vec<_>>(),
+        vec!["bridge100", "vmenet0", "vmenet1"]
+    );
 }

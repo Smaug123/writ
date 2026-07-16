@@ -486,7 +486,7 @@ proptest! {
             expected.push((gw, bridge, member));
         }
         for (gw, bridge, member) in expected {
-            let disc = parse_bridge_for_gateway(&text, gw).unwrap();
+            let disc = parse_bridge_for_gateway(&text, gw, 1).unwrap();
             prop_assert_eq!(disc.bridge().as_str(), bridge.as_str());
             prop_assert_eq!(
                 disc.members().iter().map(PfInterface::as_str).collect::<Vec<_>>(),
@@ -498,7 +498,7 @@ proptest! {
                 vec![bridge.as_str(), member.as_str()]
             );
         }
-        prop_assert!(parse_bridge_for_gateway(&text, Ipv4Addr::new(203, 0, 113, 1)).is_err());
+        prop_assert!(parse_bridge_for_gateway(&text, Ipv4Addr::new(203, 0, 113, 1), 1).is_err());
     }
 
 
