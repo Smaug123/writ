@@ -58,7 +58,7 @@ fn managed_stop_failure_leaves_state_record_for_retry() {
     let err = stop_managed_agent_vm_session(
         &store,
         plan.session_id(),
-        AgentVmToolPaths::new(&missing_tool, &missing_tool, &missing_tool, &missing_tool),
+        AgentVmToolPaths::new(&missing_tool, &missing_tool, &missing_tool),
     )
     .unwrap_err();
     assert!(matches!(err, AgentVmSessionManagerError::Stop(_)));
@@ -78,7 +78,7 @@ fn managed_cleanup_success_preserves_state_until_explicit_remove() {
     cleanup_managed_agent_vm_session(
         &store,
         plan.session_id(),
-        AgentVmToolPaths::new(&ok_tool, &ok_tool, &ok_tool, &ok_tool),
+        AgentVmToolPaths::new(&ok_tool, &ok_tool, &ok_tool),
     )
     .unwrap();
     assert_eq!(store.load(plan.session_id()).unwrap(), running);
@@ -136,7 +136,7 @@ fn managed_cleanup_of_a_vm_session_tears_down_the_broker_vm() {
     cleanup_managed_agent_vm_session(
         &store,
         plan.session_id(),
-        AgentVmToolPaths::new(&tool, &tool, &tool, &tool),
+        AgentVmToolPaths::new(&tool, &tool, &tool),
     )
     .unwrap();
 
@@ -171,7 +171,7 @@ fn managed_cleanup_of_a_vm_session_is_idempotent_when_resources_already_absent()
     cleanup_managed_agent_vm_session(
         &store,
         plan.session_id(),
-        AgentVmToolPaths::new(&tool, &tool, &tool, &tool),
+        AgentVmToolPaths::new(&tool, &tool, &tool),
     )
     .expect("already-absent broker resources must not fail the stop");
 }
@@ -197,7 +197,7 @@ fn managed_cleanup_of_a_host_session_runs_no_broker_teardown() {
     cleanup_managed_agent_vm_session(
         &store,
         plan.session_id(),
-        AgentVmToolPaths::new(&tool, &tool, &tool, &tool),
+        AgentVmToolPaths::new(&tool, &tool, &tool),
     )
     .unwrap();
 
@@ -233,7 +233,7 @@ fn managed_start_then_managed_stop_success_removes_state_record() {
         base_plan.image.clone(),
         base_plan.guest_command.clone(),
         base_plan.resources,
-        AgentVmToolPaths::new(&ok_tool, &ok_tool, &ok_tool, &ok_tool),
+        AgentVmToolPaths::new(&ok_tool, &ok_tool, &ok_tool),
     )
     .unwrap();
 
@@ -242,7 +242,7 @@ fn managed_start_then_managed_stop_success_removes_state_record() {
     stop_managed_agent_vm_session(
         &store,
         plan.session_id(),
-        AgentVmToolPaths::new(&ok_tool, &ok_tool, &ok_tool, &ok_tool),
+        AgentVmToolPaths::new(&ok_tool, &ok_tool, &ok_tool),
     )
     .unwrap();
 
@@ -285,7 +285,7 @@ fn ipv4_only_start_reinstalls_firewall_with_guest_ipv6_deny_after_vm_start() {
         base_plan.image.clone(),
         base_plan.guest_command.clone(),
         base_plan.resources,
-        AgentVmToolPaths::new(&tool, &tool, &tool, &tool),
+        AgentVmToolPaths::new(&tool, &tool, &tool),
     )
     .unwrap();
 
@@ -299,8 +299,9 @@ fn ipv4_only_start_reinstalls_firewall_with_guest_ipv6_deny_after_vm_start() {
         .filter(|l| l.contains(" install ") && l.contains("--deny-guest-ipv6"))
         .collect();
     assert_eq!(deny_installs.len(), 1, "log:\n{logged}");
+    // The runner passes no discovery tool path — the helper uses a fixed one.
     assert!(
-        deny_installs[0].contains("--ifconfig"),
+        !deny_installs[0].contains("--ifconfig"),
         "{}",
         deny_installs[0]
     );
@@ -359,7 +360,7 @@ fn vm_placement_start_failure_rolls_back_the_agent_vm_and_pf_not_the_network() {
         Vec::new(),
         vec!["sleep".into(), "600".into()],
         AgentVmResources::new(1, 512).unwrap(),
-        AgentVmToolPaths::new(&tool, &tool, &tool, &tool),
+        AgentVmToolPaths::new(&tool, &tool, &tool),
     )
     .unwrap();
 
@@ -438,7 +439,7 @@ fn host_placement_start_tears_down_a_network_that_create_left_behind_on_failure(
         ContainerImage::new("alpine:latest").unwrap(),
         vec!["sleep".into(), "600".into()],
         AgentVmResources::new(1, 512).unwrap(),
-        AgentVmToolPaths::new(&tool, &tool, &tool, &tool),
+        AgentVmToolPaths::new(&tool, &tool, &tool),
     )
     .unwrap();
 
@@ -491,7 +492,7 @@ fn host_placement_start_drops_the_record_when_the_tool_cannot_spawn() {
         ContainerImage::new("alpine:latest").unwrap(),
         vec!["sleep".into(), "600".into()],
         AgentVmResources::new(1, 512).unwrap(),
-        AgentVmToolPaths::new(&missing_tool, &missing_tool, &missing_tool, &missing_tool),
+        AgentVmToolPaths::new(&missing_tool, &missing_tool, &missing_tool),
     )
     .unwrap();
 
@@ -551,7 +552,7 @@ fn host_placement_start_refuses_and_removes_nothing_when_the_network_predates_it
         ContainerImage::new("alpine:latest").unwrap(),
         vec!["sleep".into(), "600".into()],
         AgentVmResources::new(1, 512).unwrap(),
-        AgentVmToolPaths::new(&tool, &tool, &tool, &tool),
+        AgentVmToolPaths::new(&tool, &tool, &tool),
     )
     .unwrap();
 
@@ -608,7 +609,7 @@ fn host_placement_start_removes_nothing_when_the_pre_create_probe_fails() {
         ContainerImage::new("alpine:latest").unwrap(),
         vec!["sleep".into(), "600".into()],
         AgentVmResources::new(1, 512).unwrap(),
-        AgentVmToolPaths::new(&tool, &tool, &tool, &tool),
+        AgentVmToolPaths::new(&tool, &tool, &tool),
     )
     .unwrap();
 
@@ -683,7 +684,7 @@ fn host_placement_start_refuses_and_removes_no_vm_when_the_agent_vm_predates_it(
         ContainerImage::new("alpine:latest").unwrap(),
         vec!["sleep".into(), "600".into()],
         AgentVmResources::new(1, 512).unwrap(),
-        AgentVmToolPaths::new(&tool, &tool, &tool, &tool),
+        AgentVmToolPaths::new(&tool, &tool, &tool),
     )
     .unwrap();
 
@@ -837,7 +838,7 @@ fn vm_placement_persists_and_stop_removes_the_agent_vm_and_pf_not_the_network() 
     let restored = AgentVmSessionState::from_json_bytes(&state.to_json_bytes().unwrap()).unwrap();
     assert_eq!(restored, state, "broker_placement must round-trip");
 
-    let tools = AgentVmToolPaths::new("container", "writ-agent-vm-pf-helper", "sudo", "ifconfig");
+    let tools = AgentVmToolPaths::new("container", "writ-agent-vm-pf-helper", "sudo");
     let stop = restored.to_stop_plan(tools).stop_invocations();
     assert!(
         stop.iter()
@@ -871,7 +872,7 @@ fn pre_placement_record_loads_as_host_and_stops_network_and_pf() {
         AgentVmSessionState::from_json_bytes(&serde_json::to_vec(&json).unwrap()).unwrap();
     assert_eq!(restored, state, "absent broker_placement must load as Host");
 
-    let tools = AgentVmToolPaths::new("container", "writ-agent-vm-pf-helper", "sudo", "ifconfig");
+    let tools = AgentVmToolPaths::new("container", "writ-agent-vm-pf-helper", "sudo");
     let stop = restored.to_stop_plan(tools).stop_invocations();
     assert!(
         stop.iter()
@@ -950,7 +951,7 @@ fn state_store_rejects_duplicate_live_subnet_indexes() {
         ContainerImage::new("alpine:latest").unwrap(),
         vec!["sleep".into(), "600".into()],
         AgentVmResources::new(1, 512).unwrap(),
-        AgentVmToolPaths::new("container", "writ-agent-vm-pf-helper", "sudo", "ifconfig"),
+        AgentVmToolPaths::new("container", "writ-agent-vm-pf-helper", "sudo"),
     )
     .unwrap();
     store.create_starting(&first).unwrap();

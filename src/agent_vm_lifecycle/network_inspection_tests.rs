@@ -105,7 +105,7 @@ fn image_and_resources_reject_empty_values() {
             ContainerImage::new("alpine:latest").unwrap(),
             Vec::new(),
             AgentVmResources::new(1, 512).unwrap(),
-            AgentVmToolPaths::new("container", "writ-agent-vm-pf-helper", "sudo", "ifconfig"),
+            AgentVmToolPaths::new("container", "writ-agent-vm-pf-helper", "sudo"),
         ),
         Err(AgentVmLifecycleConfigError::EmptyGuestCommandForIpv4OnlyNoGuestIpv6)
     );

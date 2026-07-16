@@ -5,7 +5,7 @@
 //! network and broker-port ranges, then performs only scoped `pfctl` changes.
 
 use std::net::{Ipv4Addr, Ipv6Addr};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::{Args, Parser, Subcommand};
 use writ::agent_vm_firewall::{
@@ -15,6 +15,11 @@ use writ::agent_vm_firewall::{
 use writ::core::{
     AgentNetworkPool, BrokerPort, BrokerPortRange, BrokerPorts, Ipv4Cidr, Ipv6Cidr, SessionId,
 };
+
+/// Fixed, root-owned discovery tool for `--deny-guest-ipv6`. Deliberately not a
+/// CLI option: a caller-supplied executable would be arbitrary root code
+/// execution when this helper runs under sudo.
+const SYSTEM_IFCONFIG: &str = "/sbin/ifconfig";
 
 #[derive(Parser)]
 #[command(name = "writ-agent-vm-pf-helper", about = "writ agent VM PF helper")]
@@ -67,11 +72,6 @@ struct InstallArgs {
     /// agent VM (hence its bridge) to be running, and is rejected with `--ipv6-cidr`.
     #[arg(long)]
     deny_guest_ipv6: bool,
-
-    /// Path to `ifconfig`, used to discover the agent VM's bridge for
-    /// `--deny-guest-ipv6`.
-    #[arg(long, default_value = "/sbin/ifconfig", env = "WRIT_IFCONFIG")]
-    ifconfig: PathBuf,
 }
 
 #[derive(Args)]
@@ -132,7 +132,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .map_err(|e| format!("invalid --broker-host: {e}"))?;
             // Discover the deny interfaces here, from the pool-validated session
             // gateway — the privileged boundary never trusts caller-supplied
-            // interface names. The agent's own vmenet must have attached, so
+            // interface names. The discovery tool is a fixed, root-owned system
+            // path (never a caller-supplied executable, which would be arbitrary
+            // root code execution). The agent's own vmenet must have attached, so
             // require its member: host placement has one (the agent's), vm
             // placement shares the bridge with the broker VM, so require two (the
             // broker's plus the agent's). `--broker-host` is set exactly for vm
@@ -143,8 +145,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     .claim_firewall(parsed.ipv4, parsed.ipv6)?
                     .ipv4_gateway();
                 let min_members = if broker_host.is_some() { 2 } else { 1 };
-                discover_session_bridge_interfaces(&args.ifconfig, gateway, min_members)?
-                    .deny_interfaces()
+                discover_session_bridge_interfaces(
+                    Path::new(SYSTEM_IFCONFIG),
+                    gateway,
+                    min_members,
+                )?
+                .deny_interfaces()
             } else {
                 Vec::new()
             };

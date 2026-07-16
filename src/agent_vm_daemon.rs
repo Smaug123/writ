@@ -785,7 +785,7 @@ mod broker_image_invariant_tests {
             ContainerImage::new("agent:latest").unwrap(),
             broker_image.map(|image| ContainerImage::new(image).unwrap()),
             AgentVmResources::new(1, 512).unwrap(),
-            AgentVmToolPaths::new("/bin/container", "/bin/pf", "/bin/sudo", "/bin/ifconfig"),
+            AgentVmToolPaths::new("/bin/container", "/bin/pf", "/bin/sudo"),
         )
     }
 
@@ -828,7 +828,7 @@ mod broker_image_invariant_tests {
             ContainerImage::new("agent:latest").unwrap(),
             Some(ContainerImage::new("broker:latest").unwrap()),
             AgentVmResources::new(1, 512).unwrap(),
-            AgentVmToolPaths::new("/bin/container", "/bin/pf", "/bin/sudo", "/bin/ifconfig"),
+            AgentVmToolPaths::new("/bin/container", "/bin/pf", "/bin/sudo"),
         );
         assert!(matches!(
             result,

@@ -228,9 +228,6 @@ pub struct AgentVmToolPaths {
     container: PathBuf,
     pf_helper: PathBuf,
     sudo: PathBuf,
-    /// `ifconfig`, used post-start to discover the agent VM's host bridge for the
-    /// `Ipv4OnlyNoGuestIpv6` IPv6 deny (see `parse_bridge_for_gateway`).
-    ifconfig: PathBuf,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1027,13 +1024,13 @@ impl AgentVmSessionPlan {
     }
 
     /// The pf-helper install invocation. `deny_guest_ipv6` selects the post-start
-    /// re-install (`Ipv4OnlyNoGuestIpv6`) that adds `--deny-guest-ipv6` and points
-    /// the helper at `ifconfig`: the pf-helper then discovers the agent's bridge
-    /// itself and installs an interface-scoped IPv6 deny (the runner passes no
-    /// interface names — the privileged boundary owns discovery). The pre-start
-    /// install passes `false` (the bridge does not exist yet). Re-loading the same
-    /// anchor replaces its rules atomically, so the second install renders v4 rules
-    /// + the v6 deny.
+    /// re-install (`Ipv4OnlyNoGuestIpv6`) that adds `--deny-guest-ipv6`: the
+    /// pf-helper then discovers the agent's bridge itself (from a fixed root-owned
+    /// `ifconfig`) and installs an interface-scoped IPv6 deny. The runner passes no
+    /// interface names and no tool path — the privileged boundary owns discovery.
+    /// The pre-start install passes `false` (the bridge does not exist yet).
+    /// Re-loading the same anchor replaces its rules atomically, so the second
+    /// install renders v4 rules + the v6 deny.
     fn firewall_install_invocation(&self, deny_guest_ipv6: bool) -> ProcessInvocation {
         let mut args = vec![
             self.tools.pf_helper.as_os_str().to_os_string(),
@@ -1069,8 +1066,6 @@ impl AgentVmSessionPlan {
         ]);
         if deny_guest_ipv6 {
             args.push(OsString::from("--deny-guest-ipv6"));
-            args.push(OsString::from("--ifconfig"));
-            args.push(self.tools.ifconfig.as_os_str().to_os_string());
         }
         ProcessInvocation::new(self.tools.sudo.clone(), args)
     }
@@ -1482,22 +1477,16 @@ impl AgentVmToolPaths {
         container: impl Into<PathBuf>,
         pf_helper: impl Into<PathBuf>,
         sudo: impl Into<PathBuf>,
-        ifconfig: impl Into<PathBuf>,
     ) -> Self {
         Self {
             container: container.into(),
             pf_helper: pf_helper.into(),
             sudo: sudo.into(),
-            ifconfig: ifconfig.into(),
         }
     }
 
     pub fn container(&self) -> &Path {
         &self.container
-    }
-
-    pub fn ifconfig(&self) -> &Path {
-        &self.ifconfig
     }
 }
 
@@ -2828,12 +2817,7 @@ mod spec {
                         ContainerImage::new(image).unwrap(),
                         guest_command,
                         AgentVmResources::new(cpus, memory_mib).unwrap(),
-                        AgentVmToolPaths::new(
-                            "container",
-                            "writ-agent-vm-pf-helper",
-                            "sudo",
-                            "ifconfig",
-                        ),
+                        AgentVmToolPaths::new("container", "writ-agent-vm-pf-helper", "sudo"),
                     )
                     .unwrap()
                 },
@@ -3124,7 +3108,7 @@ mod spec {
             prop_assert_eq!(&decoded, &state);
             prop_assert_eq!(
                 decoded
-                    .to_stop_plan(AgentVmToolPaths::new("container", "writ-agent-vm-pf-helper", "sudo", "ifconfig"))
+                    .to_stop_plan(AgentVmToolPaths::new("container", "writ-agent-vm-pf-helper", "sudo"))
                     .stop_invocations(),
                 plan.stop_plan().stop_invocations()
             );

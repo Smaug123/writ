@@ -76,9 +76,10 @@ fn ipv4_only_start_invocations_probe_before_releasing_guest_command() {
     ]));
 
     // Index 6: the post-start guest-IPv6 deny — a pf-helper re-install that asks
-    // the privileged helper to discover the bridge (`--deny-guest-ipv6`) and points
-    // it at ifconfig. It runs between StartVm and the guest IPv6 probe, so the host
-    // IPv6 deny is installed before the guest command is ever released.
+    // the privileged helper to discover the bridge itself (`--deny-guest-ipv6`).
+    // It runs between StartVm and the guest IPv6 probe, so the host IPv6 deny is
+    // installed before the guest command is ever released. The runner passes no
+    // interface names or tool paths — the helper owns discovery.
     let deny_args = invocations[6].args_lossy();
     assert_eq!(&deny_args[0..2], ["writ-agent-vm-pf-helper", "install"]);
     assert!(
@@ -86,8 +87,8 @@ fn ipv4_only_start_invocations_probe_before_releasing_guest_command() {
         "{deny_args:?}"
     );
     assert!(
-        deny_args.contains(&"--ifconfig".to_string()),
-        "{deny_args:?}"
+        !deny_args.contains(&"--ifconfig".to_string()),
+        "the runner must not pass a discovery tool path: {deny_args:?}"
     );
 
     assert_eq!(

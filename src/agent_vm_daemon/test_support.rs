@@ -536,7 +536,7 @@ fn daemon_config_inner(
         ContainerImage::new("alpine:latest").unwrap(),
         broker_image,
         AgentVmResources::new(1, 512).unwrap(),
-        AgentVmToolPaths::new(fake_tool, fake_tool, fake_tool, fake_tool),
+        AgentVmToolPaths::new(fake_tool, fake_tool, fake_tool),
     )
     .unwrap();
     let credential =
@@ -588,7 +588,7 @@ pub(super) fn occupy_subnet(store: &AgentVmSessionStateStore, index: u16) {
         ContainerImage::new("alpine:latest").unwrap(),
         vec!["sleep".into(), "600".into()],
         AgentVmResources::new(1, 512).unwrap(),
-        AgentVmToolPaths::new("container", "writ-agent-vm-pf-helper", "sudo", "ifconfig"),
+        AgentVmToolPaths::new("container", "writ-agent-vm-pf-helper", "sudo"),
     )
     .unwrap();
     store.create_starting(&plan).unwrap();

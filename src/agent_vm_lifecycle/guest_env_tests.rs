@@ -21,7 +21,7 @@ fn guest_environment_is_redacted_and_uses_env_file_in_start_invocation() {
         ],
         vec!["sleep".into(), "600".into()],
         AgentVmResources::new(1, 512).unwrap(),
-        AgentVmToolPaths::new("container", "writ-agent-vm-pf-helper", "sudo", "ifconfig"),
+        AgentVmToolPaths::new("container", "writ-agent-vm-pf-helper", "sudo"),
     )
     .unwrap();
 

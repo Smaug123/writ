@@ -240,7 +240,25 @@ The helper must validate that:
 - the session ID is a safe anchor name component;
 - broker ports are in an allowed local range;
 - generated PF rules parse with `pfctl -n` before being loaded;
-- cleanup only touches the matching session anchor.
+- cleanup only touches the matching session anchor;
+- any executable it runs (e.g. `ifconfig` for `--deny-guest-ipv6` bridge
+  discovery) is a fixed root-owned path, never a caller-supplied one — otherwise
+  a delegated caller gets arbitrary root code execution.
+
+**Known trust boundary (future hardening).** The helper validates its
+structured arguments for *self-consistency* (in-pool subnets, in-range ports)
+but does not *independently authorize* that a `(session, subnet)` describes a
+live writ session against root-owned state. It trusts the non-root broker to
+supply real session parameters — the "accepts only structured operations" model
+above. A broker account compromise could therefore drive the root helper to act
+on an in-pool subnet of the caller's choosing (e.g. install the interface-scoped
+IPv6 deny on whichever `bridgeN` carries that subnet's gateway). This is
+pre-existing (it applies to the CIDR-scoped rules too, not just the IPv6 deny)
+and is defense-in-depth beyond the stated threat model, in which the broker is
+the trust anchor (a compromised broker already holds signing keys and minted
+tokens). Closing it means resolving/authorizing the session network from
+root-owned configuration/state before acting, across *all* helper operations —
+tracked as separate helper-wide hardening, not the per-session firewall feature.
 
 First manual helper slice implemented as `writ-agent-vm-pf-helper`:
 
@@ -390,11 +408,12 @@ re-acquire the ULA — a bypass the pre-release proof cannot see (#288). So the
 mode also installs a **host-side backstop the guest cannot undo**: after the VM
 (and thus its host `bridgeN`) is up, the runner re-invokes the privileged
 pf-helper with `--deny-guest-ipv6`. The **pf-helper itself** then discovers the
-bridge carrying the session's IPv4 gateway via `ifconfig` (see
-`parse_bridge_for_gateway`), reads its `vmenet*` members, and re-loads the
-session PF anchor with an interface-scoped IPv6 deny (`block return in quick on
-<iface> inet6 all`) on the bridge and members. Discovery lives at the privileged
-boundary, not the unprivileged runner, so the helper never trusts a
+bridge carrying the session's IPv4 gateway via a fixed root-owned `ifconfig`
+(`/sbin/ifconfig`, never a caller-supplied path — that would be arbitrary root
+code execution; see `parse_bridge_for_gateway`), reads its `vmenet*` members, and
+re-loads the session PF anchor with an interface-scoped IPv6 deny (`block return
+in quick on <iface> inet6 all`) on the bridge and members. Discovery lives at the
+privileged boundary, not the unprivileged runner, so the helper never trusts a
 caller-supplied interface name — a direct `--deny-guest-ipv6` invocation cannot
 make it load a rule on an unrelated host interface such as `en0`. The scope is
 by interface rather than source CIDR precisely because the RA ULA prefix is
