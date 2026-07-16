@@ -1341,47 +1341,49 @@ impl AgentVmDaemon {
             forwarder.drain_and_stop().await;
         }
 
+        // Is this a managed agent-VM session? This reads the state store only
+        // (bounded — it runs no container/PF commands), so an unrelated/ordinary
+        // broker session that was never an agent VM (no state record) is
+        // distinguished *before* we touch its audit row.
+        let managed = self.has_agent_vm_session_state(session_id).await;
+
+        // For a managed session, revoke broker authority up front — before the
+        // *unbounded* infrastructure teardown below — and independently of it:
+        // closing the audit session (the broker refuses to mint once `closed_at` is
+        // set) and shutting down + dropping the in-process broker are bounded local
+        // effects, so even if a container/PF command later hangs, the guest is
+        // already de-authorised. The lock is dropped before awaiting `shutdown()` so
+        // a slow drain does not block listing or unrelated sessions on the runtime
+        // map.
+        let (audit_close, http_shutdown) = if managed {
+            let audit_close = state.audit.close_session(session_id, UnixMillis::now());
+            let running = self.running.lock().await.remove(&session_id);
+            let http_shutdown = match running {
+                Some(running) => running.shutdown().await,
+                None => Ok(()),
+            };
+            (audit_close, http_shutdown)
+        } else {
+            (Ok(()), Ok(()))
+        };
+
         if let Err(err) = self.run_cleanup_session(session_id).await {
-            // Cleanup failed: teardown leaves the material dir (and log) for the
-            // retry, so the broker VM may still be live. Re-attach a fresh log tail
-            // so the session stays reported as attached (not orphaned) and keeps
-            // forwarding until a later stop succeeds.
-            //
-            // A `Stop` cleanup error means the state record existed — so this IS a
-            // managed agent-VM session — but the VM/PF/network teardown failed.
-            // Revoke broker authority anyway, independently of the teardown: close
-            // the audit session (the broker refuses to mint once `closed_at` is set)
-            // and shut down + drop the in-process broker, so a possibly-still-live
-            // guest is left de-authorised rather than authorised. A missing state
-            // record (`State`/`NotFound` — e.g. an ordinary broker session that was
-            // never an agent VM) is excluded, so an unrelated session's audit row is
-            // not closed. The persisted state record is kept for retry regardless.
-            if matches!(
-                &err,
-                AgentVmDaemonError::Manager(AgentVmSessionManagerError::Stop(_))
-            ) {
-                close_audit_session_best_effort(state, session_id);
-                if let Some(running) = self.running.lock().await.remove(&session_id)
-                    && let Err(shutdown) = running.shutdown().await
-                {
-                    tracing::warn!(
-                        session_id = %session_id,
-                        error = %shutdown,
-                        "agent VM stop could not shut down broker after teardown failure",
-                    );
-                }
-            }
+            // Teardown failed: it leaves the material dir (and log) for the retry, so
+            // the broker VM may still be live. Authority was already revoked above
+            // (for a managed session), so a possibly-still-live guest is
+            // de-authorised, not authorised. Re-attach a fresh log tail so the
+            // session stays reported as attached (not orphaned) and keeps forwarding
+            // until a later stop succeeds; the persisted state record is kept for
+            // retry.
             self.reattach_broker_log_forwarder_if(had_forwarder, session_id)
                 .await;
             return Err(err);
         }
 
-        let audit_close = state.audit.close_session(session_id, UnixMillis::now());
-        let http_shutdown = match self.running.lock().await.remove(&session_id) {
-            Some(running) => running.shutdown().await,
-            None => Ok(()),
-        };
-
+        // Teardown succeeded, so this WAS a managed session (a missing record would
+        // have surfaced as a cleanup error above). Surface any revocation failure
+        // before dropping the durable records, so the state record — the sole
+        // reconciliation obligation — is kept for retry rather than stranded.
         match (audit_close, http_shutdown) {
             (Ok(()), Ok(())) => {
                 // Remove the copied secrets before dropping the state record, so a
@@ -1398,6 +1400,19 @@ impl AgentVmDaemon {
                 http: Box::new(http),
             }),
         }
+    }
+
+    /// Whether `session_id` has a persisted agent-VM state record. Reads the state
+    /// store only — no container/PF commands — so it is bounded and safe to consult
+    /// before deciding whether a stop should revoke this session's broker authority
+    /// (an ordinary broker session that was never an agent VM has no such record and
+    /// must not have its audit row closed by agent-VM stop).
+    async fn has_agent_vm_session_state(&self, session_id: SessionId) -> bool {
+        let store = self.config.lifecycle.state_store.clone();
+        matches!(
+            tokio::task::spawn_blocking(move || store.load(session_id)).await,
+            Ok(Ok(_))
+        )
     }
 
     async fn release_and_wait_for_workspace_bootstrap(
@@ -1631,23 +1646,23 @@ impl AgentVmDaemon {
         audit: &Arc<AuditLog>,
         session_id: SessionId,
     ) -> Result<(), (AgentVmReconcileStage, AgentVmReconcileStageError)> {
-        // Run infrastructure teardown AND authority revocation independently: a
-        // failure of either must not skip the other. Every persisted session here
-        // is a managed agent-VM session; teardown removes its (possibly autonomous)
-        // broker VM, and closing the audit row revokes that broker's authority to
-        // mint — the host broker and any broker VM both consult `closed_at` before
-        // minting.
+        // Revoke broker authority up front — before the *unbounded* infrastructure
+        // teardown, and independently of it. Every persisted session here is a
+        // managed agent-VM session; closing its audit row is a bounded local
+        // operation that makes the broker refuse to mint (the host broker and any
+        // autonomous broker VM both consult `closed_at`), so doing it first means a
+        // hung container/PF command in teardown cannot leave a surviving broker VM
+        // authorised during boot.
         //
-        // Both are attempted before either is reported: skipping the close on a
-        // teardown failure would leave a still-live broker VM holding authority (the
-        // original fail-open), and skipping teardown on a close failure would leave
-        // the broker VM running — worse, under `SQLITE_BUSY` held by that very VM,
-        // tearing it down is often what frees the audit-DB lock so a later retry can
-        // close. Any failure keeps the state record (we stop before removing it) so
-        // the next boot retries, and the daemon refuses to start while an obligation
-        // remains.
-        let cleanup = self.spawn_cleanup_session(session_id).await;
+        // The result is captured but not branched on: teardown must still run even
+        // when the close failed — skipping it would leave the broker VM running, and
+        // under `SQLITE_BUSY` held by that very VM, tearing it down is often what
+        // frees the audit-DB lock so a later retry can close. Any failure keeps the
+        // state record (we stop before removing it) so the next boot retries, and
+        // the daemon refuses to start while an obligation remains.
         let audit_close = audit.close_session(session_id, UnixMillis::now());
+
+        let cleanup = self.spawn_cleanup_session(session_id).await;
 
         // A teardown failure (a still-live VM) is the more urgent condition, so
         // report it; retain any co-occurring audit-close failure in the log rather
