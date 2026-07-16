@@ -388,19 +388,33 @@ the agent command is released and the guest runs as root: once released, the
 agent can write `0` back to `disable_ipv6`, wait for the next vmnet RA, and
 re-acquire the ULA — a bypass the pre-release proof cannot see (#288). So the
 mode also installs a **host-side backstop the guest cannot undo**: after the VM
-(and thus its host `bridgeN`) is up, the runner discovers the bridge carrying
-the session's IPv4 gateway via `ifconfig` (see `parse_bridge_for_gateway`),
-reads its member `vmenet*`, and re-loads the session PF anchor with an
-interface-scoped IPv6 deny (`block return in quick on <iface> inet6 all`) on
-both. This is scoped by interface rather than source CIDR precisely because the
-RA ULA prefix is unpredictable *and* a root guest could reassign its source
-address anyway — only the interface scope holds. It is installed before the
-guest command is released and blocks all IPv6 on the agent's bridge regardless
-of what the guest does to its own kernel. Discovery fails closed: if no single
-bridge carries the gateway, the start aborts rather than release the guest
-without the backstop. `scripts/prove-agent-vm-lifecycle.sh` proves, on real
-hardware, both that the rule is installed and that a root guest which re-enables
-IPv6 still cannot egress it.
+(and thus its host `bridgeN`) is up, the runner re-invokes the privileged
+pf-helper with `--deny-guest-ipv6`. The **pf-helper itself** then discovers the
+bridge carrying the session's IPv4 gateway via `ifconfig` (see
+`parse_bridge_for_gateway`), reads its `vmenet*` members, and re-loads the
+session PF anchor with an interface-scoped IPv6 deny (`block return in quick on
+<iface> inet6 all`) on the bridge and members. Discovery lives at the privileged
+boundary, not the unprivileged runner, so the helper never trusts a
+caller-supplied interface name — a direct `--deny-guest-ipv6` invocation cannot
+make it load a rule on an unrelated host interface such as `en0`. The scope is
+by interface rather than source CIDR precisely because the RA ULA prefix is
+unpredictable *and* a root guest could reassign its source address anyway — only
+the interface scope holds.
+
+Discovery is defensive on two axes so the deny can never land on the wrong or an
+incomplete interface set: it accepts only a `bridgeN`-named interface with
+`vmenetN` membership (rejecting a LAN/VPN `en0`/`utun` that happens to carry the
+gateway when the RFC1918 pool overlaps), and it waits for the expected number of
+members to attach — one for host placement (the agent's `vmenet`), two for vm
+placement (the broker VM's plus the agent's) — before installing, so the agent's
+own interface is never missing from the deny. It is installed before the guest
+command is released, and fails closed: if no qualifying bridge carries the
+gateway (or too few members have attached) after a bounded retry, the start
+aborts rather than release the guest without the backstop.
+`scripts/prove-agent-vm-lifecycle.sh` proves, on real hardware, both that the
+rule is installed and that a root guest which re-enables IPv6 still cannot egress
+it (it requires a real ICMPv6 probe tool and fails the proof, rather than
+passing, if none is present).
 
 The guarantee is therefore layered: "the guest kernel has IPv6 disabled" (belt,
 guest-side, holds against RAs at boot) **and** "the host drops all IPv6 on the

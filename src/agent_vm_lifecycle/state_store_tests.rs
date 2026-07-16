@@ -220,11 +220,6 @@ fn managed_start_then_managed_stop_success_removes_state_record() {
          if [ \"$1\" = \"network\" ] && [ \"$2\" = \"inspect\" ]; then\n\
          printf '%s\\n' 'ipv4Subnet: 192.168.252.0/24' 'ipv4Gateway: 192.168.252.1'\n\
          fi\n\
-         if [ \"$#\" -eq 0 ]; then\n\
-         printf '%s\\n' 'bridge100: flags=8863<UP> mtu 1500' \\\n\
-         '    inet 192.168.252.1 netmask 0xffffff00 broadcast 192.168.252.255' \\\n\
-         '    member: vmenet0 flags=20003<VIRTIO>'\n\
-         fi\n\
          exit 0\n",
     );
     let base_plan = plan_with_ipv6_mode(252, Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6);
@@ -257,10 +252,12 @@ fn managed_start_then_managed_stop_success_removes_state_record() {
 
 #[cfg(unix)]
 #[test]
-fn ipv4_only_start_installs_interface_scoped_ipv6_deny_after_discovery() {
-    // Drives the *real* post-start path: after StartVm, `ifconfig` discovery finds
-    // the bridge carrying the session gateway, and the session PF anchor is
-    // re-loaded with an interface-scoped IPv6 deny on the bridge and its member.
+fn ipv4_only_start_reinstalls_firewall_with_guest_ipv6_deny_after_vm_start() {
+    // Drives the *real* post-start path: after StartVm, the runner re-invokes the
+    // pf-helper with `--deny-guest-ipv6` so the privileged helper discovers the
+    // bridge itself and installs the interface-scoped IPv6 deny. (The fake helper
+    // here only records that it was asked; the discovery logic is covered by the
+    // pf-helper's own tests and the real-hardware prove script.)
     let dir = tempfile::tempdir().unwrap();
     let store = AgentVmSessionStateStore::new(dir.path().join("state"));
     let log = dir.path().join("argv.log");
@@ -272,11 +269,6 @@ fn ipv4_only_start_installs_interface_scoped_ipv6_deny_after_discovery() {
              printf '%s\\n' \"$*\" >> \"{log}\"\n\
              if [ \"$1\" = \"network\" ] && [ \"$2\" = \"inspect\" ]; then\n\
              printf '%s\\n' 'ipv4Subnet: 192.168.252.0/24' 'ipv4Gateway: 192.168.252.1'\n\
-             fi\n\
-             if [ \"$#\" -eq 0 ]; then\n\
-             printf '%s\\n' 'bridge100: flags=8863<UP> mtu 1500' \\\n\
-             '    inet 192.168.252.1 netmask 0xffffff00 broadcast 192.168.252.255' \\\n\
-             '    member: vmenet0 flags=20003<VIRTIO>'\n\
              fi\n\
              exit 0\n",
             log = log.display(),
@@ -300,29 +292,24 @@ fn ipv4_only_start_installs_interface_scoped_ipv6_deny_after_discovery() {
     start_managed_agent_vm_session(&store, &plan).unwrap();
 
     let logged = std::fs::read_to_string(&log).unwrap();
-    // Exactly one pf-helper install carries the interface-scoped IPv6 deny (the
-    // post-start re-install), naming the discovered bridge and its member.
+    // Exactly one pf-helper install requests the guest-IPv6 deny (the post-start
+    // re-install), and it points the helper at ifconfig for discovery.
     let deny_installs: Vec<&str> = logged
         .lines()
-        .filter(|l| l.contains(" install ") && l.contains("--ipv6-deny-interface"))
+        .filter(|l| l.contains(" install ") && l.contains("--deny-guest-ipv6"))
         .collect();
     assert_eq!(deny_installs.len(), 1, "log:\n{logged}");
     assert!(
-        deny_installs[0].contains("--ipv6-deny-interface bridge100"),
+        deny_installs[0].contains("--ifconfig"),
         "{}",
         deny_installs[0]
     );
-    assert!(
-        deny_installs[0].contains("--ipv6-deny-interface vmenet0"),
-        "{}",
-        deny_installs[0]
-    );
-    // A pre-start install (no interface deny) precedes it: the v4 rules are up
+    // A pre-start install (no guest-IPv6 deny) precedes it: the v4 rules are up
     // before the VM boots.
     assert!(
         logged
             .lines()
-            .any(|l| l.contains(" install ") && !l.contains("--ipv6-deny-interface")),
+            .any(|l| l.contains(" install ") && !l.contains("--deny-guest-ipv6")),
         "log:\n{logged}"
     );
 }

@@ -9,12 +9,11 @@ use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
 use writ::agent_vm_firewall::{
-    SessionFirewallInstall, SessionFirewallRemoval, install_session_firewall,
-    remove_session_firewall,
+    SessionFirewallInstall, SessionFirewallRemoval, discover_session_bridge_interfaces,
+    install_session_firewall, remove_session_firewall,
 };
 use writ::core::{
-    AgentNetworkPool, BrokerPort, BrokerPortRange, BrokerPorts, Ipv4Cidr, Ipv6Cidr, PfInterface,
-    SessionId,
+    AgentNetworkPool, BrokerPort, BrokerPortRange, BrokerPorts, Ipv4Cidr, Ipv6Cidr, SessionId,
 };
 
 #[derive(Parser)]
@@ -60,13 +59,19 @@ struct InstallArgs {
     #[arg(long)]
     broker_host: Option<String>,
 
-    /// Host interface to block *all* IPv6 on (`block ... on <iface> inet6 all`).
-    /// May be supplied more than once. This is the `Ipv4OnlyNoGuestIpv6` backstop:
-    /// the caller discovers the agent VM's bridge (and its member) after the VM
-    /// starts and passes them here so a root guest cannot re-acquire IPv6 via a
-    /// host vmnet router advertisement. Rejected together with `--ipv6-cidr`.
-    #[arg(long = "ipv6-deny-interface")]
-    ipv6_deny_interfaces: Vec<String>,
+    /// Install the `Ipv4OnlyNoGuestIpv6` backstop: block *all* IPv6 on the agent
+    /// VM's host bridge (and its `vmenet` members) so a root guest cannot
+    /// re-acquire IPv6 via a host vmnet router advertisement. The interfaces are
+    /// discovered *here*, at the privileged boundary, by matching the session
+    /// gateway in `ifconfig` output — never trusted from the caller. Requires the
+    /// agent VM (hence its bridge) to be running, and is rejected with `--ipv6-cidr`.
+    #[arg(long)]
+    deny_guest_ipv6: bool,
+
+    /// Path to `ifconfig`, used to discover the agent VM's bridge for
+    /// `--deny-guest-ipv6`.
+    #[arg(long, default_value = "/sbin/ifconfig", env = "WRIT_IFCONFIG")]
+    ifconfig: PathBuf,
 }
 
 #[derive(Args)]
@@ -125,11 +130,24 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .map(|raw| raw.parse::<Ipv4Addr>())
                 .transpose()
                 .map_err(|e| format!("invalid --broker-host: {e}"))?;
-            let ipv6_deny_interfaces = args
-                .ipv6_deny_interfaces
-                .into_iter()
-                .map(PfInterface::new)
-                .collect::<Result<Vec<_>, _>>()?;
+            // Discover the deny interfaces here, from the pool-validated session
+            // gateway — the privileged boundary never trusts caller-supplied
+            // interface names. The agent's own vmenet must have attached, so
+            // require its member: host placement has one (the agent's), vm
+            // placement shares the bridge with the broker VM, so require two (the
+            // broker's plus the agent's). `--broker-host` is set exactly for vm
+            // placement, so it distinguishes the two.
+            let ipv6_deny_interfaces = if args.deny_guest_ipv6 {
+                let gateway = parsed
+                    .pool
+                    .claim_firewall(parsed.ipv4, parsed.ipv6)?
+                    .ipv4_gateway();
+                let min_members = if broker_host.is_some() { 2 } else { 1 };
+                discover_session_bridge_interfaces(&args.ifconfig, gateway, min_members)?
+                    .deny_interfaces()
+            } else {
+                Vec::new()
+            };
             let install = SessionFirewallInstall::new(
                 parsed.session_id,
                 parsed.pool,

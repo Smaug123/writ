@@ -3,6 +3,7 @@
 //! validation.
 use super::test_support::*;
 use super::*;
+use crate::core::PfInterface;
 use std::net::Ipv4Addr;
 
 #[test]

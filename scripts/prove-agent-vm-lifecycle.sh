@@ -12,7 +12,8 @@ Requires:
   - root privileges through sudo for pfctl
   - a top-level PF rule in /etc/pf.conf: anchor "writ/session/*"
   - python3, curl, cargo or nix, and an Alpine-compatible image with sh, ip,
-    wget, and nslookup
+    wget, nslookup, and ping/ping6 (the IPv6 backstop assertion sends a real
+    ICMPv6 probe and fails the proof if no ping tool is present)
 
 Environment overrides:
   WRIT_PROVE_IMAGE       OCI image to run, default alpine:latest
@@ -292,8 +293,14 @@ assert_pf_anchor_has_ipv6_interface_deny() {
 # cannot touch.
 assert_reenabled_ipv6_egress_blocked() {
   log "assert: a root guest that re-enables IPv6 still cannot egress it"
+  # A real IPv6 packet probe is mandatory: without one this assertion could pass
+  # vacuously (a missing tool returns non-zero, which looks "blocked") and so
+  # could not detect a nonfunctional PF rule. Require ping/ping6 up front and fail
+  # the proof — not pass — if the image lacks it.
+  guest 'command -v ping6 >/dev/null 2>&1 || command -v ping >/dev/null 2>&1' \
+    || die "proof image has no ping/ping6; cannot send an IPv6 probe to exercise the backstop (use WRIT_PROVE_IMAGE with ping)"
   # Undo the in-guest disable exactly as a malicious agent would, then nudge the
-  # link so a fresh RA (if any) is solicited.
+  # link so a fresh RA is solicited.
   guest '
     for s in all default eth0; do
       printf 0 > /proc/sys/net/ipv6/conf/$s/disable_ipv6 2>/dev/null || true
@@ -305,14 +312,20 @@ assert_reenabled_ipv6_egress_blocked() {
   sleep 4
   log "guest IPv6 state after re-enabling:"
   guest 'ip -6 -o addr show; ip -6 route show' || true
-  # Whatever it reacquired, IPv6 to the host bridge (the RA router / default
-  # gateway) must be dropped. No gateway => nothing to egress to => trivially
-  # blocked, so treat an absent gateway as a pass.
+  # There must be an IPv6 target to probe. The RA restores a default route via the
+  # host bridge; ping that. Fail the proof (not pass) if no route came back, so a
+  # vacuous "nothing to send" can never masquerade as "blocked".
+  local gw
+  gw="$(guest 'ip -6 route show default 2>/dev/null | awk "{print \$3}" | head -n1' | tr -d "[:space:]")"
+  [ -n "$gw" ] \
+    || die "guest reacquired no IPv6 default route after re-enabling; cannot send a routed IPv6 probe to prove the deny (investigate RA timing)"
+  log "probing IPv6 egress to reacquired gateway ${gw}"
+  # A real ICMPv6 echo to the bridge: absent the deny the host replies (rc 0);
+  # with the deny the packet is dropped/returned (rc != 0). ping6 or `ping -6`,
+  # whichever the image ships.
   expect_guest_blocked \
     "re-enabled guest IPv6 egress to the host bridge is blocked by host PF" \
-    'gw="$(ip -6 route show default 2>/dev/null | awk "{print \$3}" | head -n1)"; \
-     [ -n "$gw" ] || exit 1; \
-     ping -6 -c1 -W2 "$gw" || ping6 -c1 -W2 "$gw"'
+    "if command -v ping6 >/dev/null 2>&1; then ping6 -c1 -w2 '$gw'; else ping -6 -c1 -w2 '$gw'; fi"
 }
 
 assert_pf_anchor_empty() {

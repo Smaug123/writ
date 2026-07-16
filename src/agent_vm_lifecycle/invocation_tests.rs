@@ -55,8 +55,9 @@ fn ipv4_only_start_invocations_probe_before_releasing_guest_command() {
     let firewall_args = invocations[3].args_lossy();
     assert_eq!(&firewall_args[0..2], ["writ-agent-vm-pf-helper", "install"]);
     assert!(!firewall_args.contains(&"--ipv6-cidr".to_string()));
-    // The pre-start install carries no interface deny (the bridge is not up yet).
-    assert!(!firewall_args.contains(&"--ipv6-deny-interface".to_string()));
+    // The pre-start install does not request the guest-IPv6 deny (the bridge is
+    // not up yet).
+    assert!(!firewall_args.contains(&"--deny-guest-ipv6".to_string()));
 
     let start_vm_args = invocations[5].args_lossy();
     assert_eq!(&start_vm_args[0..2], ["run", "--name"]);
@@ -74,11 +75,20 @@ fn ipv4_only_start_invocations_probe_before_releasing_guest_command() {
         "600".into()
     ]));
 
-    // Index 6: the post-start bridge discovery — `ifconfig` with no arguments,
-    // between StartVm and the guest IPv6 probe, so the host IPv6 deny is installed
-    // before the guest command is ever released.
-    assert!(invocations[6].args_lossy().is_empty());
-    assert_eq!(invocations[6].display_shell(), "ifconfig");
+    // Index 6: the post-start guest-IPv6 deny — a pf-helper re-install that asks
+    // the privileged helper to discover the bridge (`--deny-guest-ipv6`) and points
+    // it at ifconfig. It runs between StartVm and the guest IPv6 probe, so the host
+    // IPv6 deny is installed before the guest command is ever released.
+    let deny_args = invocations[6].args_lossy();
+    assert_eq!(&deny_args[0..2], ["writ-agent-vm-pf-helper", "install"]);
+    assert!(
+        deny_args.contains(&"--deny-guest-ipv6".to_string()),
+        "{deny_args:?}"
+    );
+    assert!(
+        deny_args.contains(&"--ifconfig".to_string()),
+        "{deny_args:?}"
+    );
 
     assert_eq!(
         invocations[7].args_lossy(),

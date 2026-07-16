@@ -9,14 +9,99 @@ use std::io::Write;
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::time::Duration;
 
 use uuid::Uuid;
 
+use crate::agent_vm_lifecycle::{
+    GuestBridgeDiscovery, GuestBridgeDiscoveryError, parse_bridge_for_gateway,
+};
 use crate::core::{
     AgentFirewallNetwork, AgentNetworkPool, AgentVmConfigError, BrokerPortRange, BrokerPorts,
     Ipv4Cidr, Ipv6Cidr, PfAnchorName, PfInterface, PfRuleset, SessionId, render_pf,
     session_firewall_pf_ruleset,
 };
+
+/// The host bridge for a session's network is created a beat after `container
+/// run` returns and its members attach shortly after, so the privileged helper
+/// retries discovery on this cadence before failing closed.
+const BRIDGE_DISCOVERY_ATTEMPTS: u32 = 40;
+const _: () = assert!(
+    BRIDGE_DISCOVERY_ATTEMPTS > 0,
+    "discover_session_bridge_interfaces requires at least one attempt"
+);
+const BRIDGE_DISCOVERY_DELAY: Duration = Duration::from_millis(250);
+
+#[derive(Debug, thiserror::Error)]
+pub enum BridgeDiscoveryError {
+    #[error("cannot run {program}: {source}")]
+    Run {
+        program: String,
+        source: std::io::Error,
+    },
+    #[error("{program} failed with status {status}: {stderr}")]
+    Failed {
+        program: String,
+        status: String,
+        stderr: String,
+    },
+    #[error(transparent)]
+    Discovery(#[from] GuestBridgeDiscoveryError),
+}
+
+/// Discover the agent VM's host bridge and `vmenet` members by running
+/// `ifconfig` and matching the session gateway — the privileged boundary's
+/// *independent* source of truth for which interfaces the IPv6 deny may target.
+///
+/// The helper never trusts caller-supplied interface names: it derives them here
+/// from the (pool-validated) session gateway, so a direct malicious invocation
+/// cannot make it load a PF rule on an unrelated host interface (e.g. `en0`).
+/// Retries while the bridge/members are still coming up and fails closed
+/// otherwise (see [`parse_bridge_for_gateway`] for the per-attempt rules).
+pub fn discover_session_bridge_interfaces(
+    ifconfig: &Path,
+    gateway: Ipv4Addr,
+    min_members: usize,
+) -> Result<GuestBridgeDiscovery, BridgeDiscoveryError> {
+    let mut last: Option<BridgeDiscoveryError> = None;
+    for attempt in 0..BRIDGE_DISCOVERY_ATTEMPTS {
+        let err: BridgeDiscoveryError =
+            match run_with_etxtbsy_retry(|| Command::new(ifconfig).output()) {
+                Ok(output) if output.status.success() => {
+                    match parse_bridge_for_gateway(
+                        &String::from_utf8_lossy(&output.stdout),
+                        gateway,
+                        min_members,
+                    ) {
+                        Ok(discovery) => return Ok(discovery),
+                        Err(
+                            err @ (GuestBridgeDiscoveryError::NoBridgeForGateway(_)
+                            | GuestBridgeDiscoveryError::BridgeMembersNotReady { .. }),
+                        ) => err.into(),
+                        Err(err) => return Err(err.into()),
+                    }
+                }
+                Ok(output) => BridgeDiscoveryError::Failed {
+                    program: ifconfig.display().to_string(),
+                    status: output
+                        .status
+                        .code()
+                        .map(|code| code.to_string())
+                        .unwrap_or_else(|| "signal".into()),
+                    stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+                },
+                Err(source) => BridgeDiscoveryError::Run {
+                    program: ifconfig.display().to_string(),
+                    source,
+                },
+            };
+        last = Some(err);
+        if attempt + 1 < BRIDGE_DISCOVERY_ATTEMPTS {
+            std::thread::sleep(BRIDGE_DISCOVERY_DELAY);
+        }
+    }
+    Err(last.expect("BRIDGE_DISCOVERY_ATTEMPTS > 0 guarantees at least one attempt"))
+}
 
 pub const SESSION_BOOTSTRAP_ANCHOR: &str = r#"anchor "writ/session/*""#;
 
@@ -799,5 +884,45 @@ mod tests {
         let removal =
             SessionFirewallRemoval::new(session_id(), pool(), ipv4(), Some(ipv6())).unwrap();
         remove_session_firewall(&pfctl, &removal).unwrap();
+    }
+
+    fn write_fake_ifconfig(dir: &Path, output: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("fake-ifconfig");
+        let script = format!(
+            "#!/bin/sh\nprintf '%s' '{}'\n",
+            output.replace('\'', r"'\''")
+        );
+        std::fs::write(&path, script).unwrap();
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o700);
+        std::fs::set_permissions(&path, perms).unwrap();
+        path
+    }
+
+    #[test]
+    fn discover_session_bridge_interfaces_reads_ifconfig_and_returns_the_deny_set() {
+        // The privileged helper's own discovery: run ifconfig, match the gateway,
+        // and return the bridge plus its vmenet member. (The rejection/member rules
+        // are exercised without the retry delay by the `parse_bridge_for_gateway`
+        // tests; this covers the ifconfig-running wrapper's happy path.)
+        let dir = tempfile::tempdir().unwrap();
+        let ifconfig = write_fake_ifconfig(
+            dir.path(),
+            "bridge100: flags=8863<UP> mtu 1500\n\
+             \tinet 192.168.252.1 netmask 0xffffff00 broadcast 192.168.252.255\n\
+             \tmember: vmenet0 flags=20003<VIRTIO>\n",
+        );
+        let discovery =
+            discover_session_bridge_interfaces(&ifconfig, Ipv4Addr::new(192, 168, 252, 1), 1)
+                .unwrap();
+        assert_eq!(
+            discovery
+                .deny_interfaces()
+                .iter()
+                .map(PfInterface::as_str)
+                .collect::<Vec<_>>(),
+            vec!["bridge100", "vmenet0"]
+        );
     }
 }

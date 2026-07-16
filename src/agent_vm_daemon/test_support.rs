@@ -130,32 +130,6 @@ pub(super) fn write_fake_tool(
     path
 }
 
-/// A fake `ifconfig` for the post-start bridge discovery. It emits a `bridgeN`
-/// carrying each gateway the daemon tests' 252–253 subnet range can allocate, so
-/// the `Ipv4OnlyNoGuestIpv6` IPv6-deny step finds the session's bridge and the
-/// start proceeds. Each bridge has two `vmenet` members so both host placement
-/// (needs ≥1) and vm placement (needs ≥2: the broker's plus the agent's) accept
-/// it. Indentation is spaces (the parser accepts space or tab).
-pub(super) fn write_fake_ifconfig(dir: &Path) -> PathBuf {
-    let path = dir.join("fake-ifconfig");
-    let script = "#!/bin/sh\n\
-         printf '%s\\n' \\\n\
-         'bridge100: flags=8863<UP> mtu 1500' \\\n\
-         '    inet 192.168.252.1 netmask 0xffffff00 broadcast 192.168.252.255' \\\n\
-         '    member: vmenet0 flags=20003<VIRTIO>' \\\n\
-         '    member: vmenet1 flags=20003<VIRTIO>' \\\n\
-         'bridge101: flags=8863<UP> mtu 1500' \\\n\
-         '    inet 192.168.253.1 netmask 0xffffff00 broadcast 192.168.253.255' \\\n\
-         '    member: vmenet2 flags=20003<VIRTIO>' \\\n\
-         '    member: vmenet3 flags=20003<VIRTIO>'\n\
-         exit 0\n";
-    fs::write(&path, script).unwrap();
-    let mut permissions = fs::metadata(&path).unwrap().permissions();
-    permissions.set_mode(0o700);
-    fs::set_permissions(&path, permissions).unwrap();
-    path
-}
-
 /// Like [`write_fake_tool`] but never signals a bootstrap outcome — the
 /// inspect always reports "pending". Used to exercise the bootstrap wait's
 /// timeout path (the default tool now reports `ok`, since every start waits).
@@ -562,7 +536,7 @@ fn daemon_config_inner(
         ContainerImage::new("alpine:latest").unwrap(),
         broker_image,
         AgentVmResources::new(1, 512).unwrap(),
-        AgentVmToolPaths::new(fake_tool, fake_tool, fake_tool, write_fake_ifconfig(dir)),
+        AgentVmToolPaths::new(fake_tool, fake_tool, fake_tool, fake_tool),
     )
     .unwrap();
     let credential =
