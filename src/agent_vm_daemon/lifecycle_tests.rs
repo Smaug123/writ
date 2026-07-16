@@ -992,8 +992,145 @@ async fn daemon_reconcile_preserves_state_record_when_cleanup_fails() {
     let remaining = state_store.load_all().unwrap();
     assert_eq!(remaining.len(), 1);
     assert_eq!(remaining[0].session_id(), session_id);
+    // Broker authority is revoked independently of infrastructure teardown: the
+    // audit row is closed before teardown, so a broker (VM) that outlived the
+    // previous daemon cannot keep minting while this failed cleanup is retried.
     let recorded = audit.get_session(session_id).unwrap().unwrap();
-    assert!(recorded.closed_at.is_none());
+    assert!(recorded.closed_at.is_some());
+}
+
+/// Boot reconcile of a session whose agent VM cannot be proven absent (its
+/// removals never take): the PF anchor — the sole isolation of a possibly-live
+/// guest from host services — MUST be preserved, and broker authority MUST be
+/// revoked regardless of the failed teardown.
+#[tokio::test]
+async fn daemon_reconcile_preserves_firewall_and_revokes_authority_when_vm_absence_unproven() {
+    let dir = tempfile::tempdir().unwrap();
+    let args_log = dir.path().join("args.log");
+    let present_file = dir.path().join("present-vms");
+    let fake_tool = write_fake_vm_present_tool(dir.path(), &args_log, &present_file);
+    let (config, state_store) = daemon_config(dir.path(), &fake_tool);
+    occupy_subnet(&state_store, 252);
+    let session_id = state_store.load_all().unwrap().pop().unwrap().session_id();
+    // Make the agent VM probe as still-present for this session: `container list`
+    // keeps reporting it and the removals never clear the file, so VM cleanup
+    // cannot prove absence.
+    fs::write(&present_file, format!("writ-agent-vm-{session_id}\n")).unwrap();
+    let audit = Arc::new(AuditLog::open_in_memory().unwrap());
+    audit
+        .open_session(&SessionRecord {
+            session_id,
+            label: None,
+            agent_kind: Some(AgentKind::Claude),
+            agent_model: None,
+            opened_at: UnixMillis::from_millis(1_700_000_000),
+            closed_at: None,
+        })
+        .unwrap();
+    let daemon = AgentVmDaemon::new(config);
+
+    let report = daemon.reconcile_persisted_sessions(&audit).await.unwrap();
+
+    assert!(report.cleaned().is_empty());
+    assert_eq!(report.failed().len(), 1);
+    assert_eq!(report.failed()[0].stage(), AgentVmReconcileStage::Cleanup);
+
+    // Problem A — the PF anchor (and the shared network) MUST NOT be removed while
+    // the agent VM cannot be proven absent.
+    let args = fs::read_to_string(&args_log).unwrap();
+    assert!(
+        !args
+            .lines()
+            .any(|line| line.split_whitespace().nth(1) == Some("remove")),
+        "the PF anchor must be preserved until the VM is proven absent; args:\n{args}"
+    );
+    assert!(
+        !args.contains("network rm") && !args.contains("network delete"),
+        "the shared network must not be removed under a possibly-live VM; args:\n{args}"
+    );
+
+    // Problem B — broker authority is revoked independently of teardown.
+    assert!(
+        audit
+            .get_session(session_id)
+            .unwrap()
+            .unwrap()
+            .closed_at
+            .is_some()
+    );
+
+    // The state record is kept so the next boot retries the teardown.
+    let remaining = state_store.load_all().unwrap();
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0].session_id(), session_id);
+}
+
+/// A stop whose infrastructure teardown fails (the `pf-helper remove` step exits
+/// non-zero) must still revoke broker authority: close the audit session and shut
+/// down the in-process broker, leaving a possibly-live guest de-authorised rather
+/// than authorised, while keeping the state record for retry.
+#[tokio::test]
+async fn daemon_stop_revokes_authority_when_teardown_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let args_log = dir.path().join("args.log");
+    let env_path_log = dir.path().join("env-path.log");
+    let env_log = dir.path().join("env.log");
+    let fake_tool = write_fake_stop_firewall_remove_failure_tool(
+        dir.path(),
+        &args_log,
+        &env_path_log,
+        &env_log,
+    );
+    let (config, state_store) = daemon_config(dir.path(), &fake_tool);
+    let daemon = AgentVmDaemon::new(config);
+    let state = make_state();
+
+    let started = daemon
+        .start_session(
+            Arc::clone(&state),
+            None,
+            None,
+            None,
+            None,
+            vec!["sleep".into(), "600".into()],
+        )
+        .await
+        .unwrap();
+    let session_id = started.session_id();
+
+    let err = daemon.stop_session(&state, session_id).await.unwrap_err();
+    assert!(
+        matches!(
+            err,
+            AgentVmDaemonError::Manager(AgentVmSessionManagerError::Stop(_))
+        ),
+        "a firewall-removal failure surfaces as a Stop cleanup error, got {err:?}"
+    );
+
+    // Authority is revoked even though teardown failed: audit session closed and
+    // the in-process broker shut down and dropped.
+    assert!(
+        state
+            .audit
+            .get_session(session_id)
+            .unwrap()
+            .unwrap()
+            .closed_at
+            .is_some()
+    );
+    assert!(
+        daemon.running.lock().await.is_empty(),
+        "the in-process broker must be shut down even when teardown fails"
+    );
+    assert!(
+        !daemon.list_sessions().await.unwrap()[0].runtime_attached,
+        "a de-authorised session must not report as runtime-attached"
+    );
+
+    // The state record is kept so a later stop / boot reconcile retries teardown.
+    let remaining = state_store.load_all().unwrap();
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0].session_id(), session_id);
 }
 
 #[tokio::test]

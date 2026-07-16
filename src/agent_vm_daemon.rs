@@ -1346,6 +1346,31 @@ impl AgentVmDaemon {
             // retry, so the broker VM may still be live. Re-attach a fresh log tail
             // so the session stays reported as attached (not orphaned) and keeps
             // forwarding until a later stop succeeds.
+            //
+            // A `Stop` cleanup error means the state record existed — so this IS a
+            // managed agent-VM session — but the VM/PF/network teardown failed.
+            // Revoke broker authority anyway, independently of the teardown: close
+            // the audit session (the broker refuses to mint once `closed_at` is set)
+            // and shut down + drop the in-process broker, so a possibly-still-live
+            // guest is left de-authorised rather than authorised. A missing state
+            // record (`State`/`NotFound` — e.g. an ordinary broker session that was
+            // never an agent VM) is excluded, so an unrelated session's audit row is
+            // not closed. The persisted state record is kept for retry regardless.
+            if matches!(
+                &err,
+                AgentVmDaemonError::Manager(AgentVmSessionManagerError::Stop(_))
+            ) {
+                close_audit_session_best_effort(state, session_id);
+                if let Some(running) = self.running.lock().await.remove(&session_id)
+                    && let Err(shutdown) = running.shutdown().await
+                {
+                    tracing::warn!(
+                        session_id = %session_id,
+                        error = %shutdown,
+                        "agent VM stop could not shut down broker after teardown failure",
+                    );
+                }
+            }
             self.reattach_broker_log_forwarder_if(had_forwarder, session_id)
                 .await;
             return Err(err);
@@ -1560,9 +1585,10 @@ impl AgentVmDaemon {
     }
 
     /// Treat every persisted session as a cleanup obligation and drive it to
-    /// completion: tear down the VM/firewall/network via the persisted facts,
-    /// close the audit row, remove the per-session material dir (copied secrets),
-    /// then remove the state record.
+    /// completion: close the audit row (revoking broker authority) first, then
+    /// tear down the VM/firewall/network via the persisted facts, remove the
+    /// per-session material dir (copied secrets), and finally remove the state
+    /// record.
     ///
     /// MUST be called before [`crate::server::run_with_agent_vm`] begins
     /// accepting connections. Subnet selection in `start_session` is driven
@@ -1605,14 +1631,23 @@ impl AgentVmDaemon {
         audit: &Arc<AuditLog>,
         session_id: SessionId,
     ) -> Result<(), (AgentVmReconcileStage, AgentVmReconcileStageError)> {
+        // Revoke broker authority BEFORE any infrastructure teardown, and
+        // independently of whether it succeeds. Every persisted session here is a
+        // managed agent-VM session, and closing its audit row makes the broker
+        // refuse to mint — the host broker and any autonomous broker VM both
+        // consult `closed_at` before minting — so a broker VM that outlived the
+        // previous daemon cannot keep minting while a failed teardown is retried on
+        // the next boot. Ordered first so authority is gone before we spend time on
+        // teardown that may fail; a teardown failure below keeps the state record
+        // for retry, with authority already revoked.
+        if let Err(err) = audit.close_session(session_id, UnixMillis::now()) {
+            return Err((AgentVmReconcileStage::AuditClose, err.into()));
+        }
+
         match self.spawn_cleanup_session(session_id).await {
             Err(join) => return Err((AgentVmReconcileStage::Cleanup, join.into())),
             Ok(Err(err)) => return Err((AgentVmReconcileStage::Cleanup, err.into())),
             Ok(Ok(())) => {}
-        }
-
-        if let Err(err) = audit.close_session(session_id, UnixMillis::now()) {
-            return Err((AgentVmReconcileStage::AuditClose, err.into()));
         }
 
         // Remove the copied secrets before the state record: a failure here keeps

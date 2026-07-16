@@ -103,6 +103,58 @@ fn cleanup_absence_loop_reports_still_present_after_bounded_retries() {
 }
 
 #[test]
+fn stop_cleanup_removes_firewall_and_network_once_vm_absent() {
+    let mut removed = false;
+    let errors = stop_plan_cleanup_errors(Ok(()), || {
+        removed = true;
+        Vec::new()
+    });
+    assert!(
+        removed,
+        "the firewall (and network) removal must run once the agent VM is proven absent"
+    );
+    assert!(errors.is_empty());
+}
+
+#[test]
+fn stop_cleanup_preserves_firewall_when_vm_absence_unproven() {
+    // The agent VM could not be proven absent (still lists after removal attempts):
+    // the PF anchor is the only thing isolating a possibly-live guest from host
+    // services, so it MUST NOT be dropped. The removal closure must not run.
+    let vm_err = ProcessInvocation::new("container", ["list", "--all", "--quiet"])
+        .resource_still_present("VM still appears in container list after removal attempts");
+    let mut removed = false;
+    let errors = stop_plan_cleanup_errors(Err(vm_err), || {
+        removed = true;
+        Vec::new()
+    });
+    assert!(
+        !removed,
+        "the PF anchor (and network) must be preserved until the VM is proven absent"
+    );
+    assert_eq!(
+        errors.len(),
+        1,
+        "the VM-cleanup error is surfaced so the stop is retried"
+    );
+    assert!(matches!(
+        errors[0],
+        ProcessInvocationError::ResourceStillPresent { .. }
+    ));
+}
+
+#[test]
+fn stop_cleanup_surfaces_firewall_errors_after_vm_removed() {
+    // Once the VM is gone the anchor removal runs; its errors still propagate.
+    let fw_err = ProcessInvocation::new("/tmp/writ-missing-pf-helper", ["remove"])
+        .run()
+        .unwrap_err();
+    let errors = stop_plan_cleanup_errors(Ok(()), || vec![fw_err]);
+    assert_eq!(errors.len(), 1);
+    assert!(matches!(errors[0], ProcessInvocationError::Run { .. }));
+}
+
+#[test]
 fn resource_still_present_error_names_cleanup_postcondition() {
     let err = ProcessInvocation::new("container", ["list", "--quiet"])
         .resource_still_present("VM still appears in container list");
