@@ -1585,10 +1585,10 @@ impl AgentVmDaemon {
     }
 
     /// Treat every persisted session as a cleanup obligation and drive it to
-    /// completion: close the audit row (revoking broker authority) first, then
-    /// tear down the VM/firewall/network via the persisted facts, remove the
-    /// per-session material dir (copied secrets), and finally remove the state
-    /// record.
+    /// completion: tear down the VM/firewall/network via the persisted facts and
+    /// close the audit row (revoking broker authority) — each attempted regardless
+    /// of the other's outcome — then remove the per-session material dir (copied
+    /// secrets), and finally remove the state record.
     ///
     /// MUST be called before [`crate::server::run_with_agent_vm`] begins
     /// accepting connections. Subnet selection in `start_session` is driven
@@ -1631,23 +1631,44 @@ impl AgentVmDaemon {
         audit: &Arc<AuditLog>,
         session_id: SessionId,
     ) -> Result<(), (AgentVmReconcileStage, AgentVmReconcileStageError)> {
-        // Revoke broker authority BEFORE any infrastructure teardown, and
-        // independently of whether it succeeds. Every persisted session here is a
-        // managed agent-VM session, and closing its audit row makes the broker
-        // refuse to mint — the host broker and any autonomous broker VM both
-        // consult `closed_at` before minting — so a broker VM that outlived the
-        // previous daemon cannot keep minting while a failed teardown is retried on
-        // the next boot. Ordered first so authority is gone before we spend time on
-        // teardown that may fail; a teardown failure below keeps the state record
-        // for retry, with authority already revoked.
-        if let Err(err) = audit.close_session(session_id, UnixMillis::now()) {
-            return Err((AgentVmReconcileStage::AuditClose, err.into()));
-        }
+        // Run infrastructure teardown AND authority revocation independently: a
+        // failure of either must not skip the other. Every persisted session here
+        // is a managed agent-VM session; teardown removes its (possibly autonomous)
+        // broker VM, and closing the audit row revokes that broker's authority to
+        // mint — the host broker and any broker VM both consult `closed_at` before
+        // minting.
+        //
+        // Both are attempted before either is reported: skipping the close on a
+        // teardown failure would leave a still-live broker VM holding authority (the
+        // original fail-open), and skipping teardown on a close failure would leave
+        // the broker VM running — worse, under `SQLITE_BUSY` held by that very VM,
+        // tearing it down is often what frees the audit-DB lock so a later retry can
+        // close. Any failure keeps the state record (we stop before removing it) so
+        // the next boot retries, and the daemon refuses to start while an obligation
+        // remains.
+        let cleanup = self.spawn_cleanup_session(session_id).await;
+        let audit_close = audit.close_session(session_id, UnixMillis::now());
 
-        match self.spawn_cleanup_session(session_id).await {
-            Err(join) => return Err((AgentVmReconcileStage::Cleanup, join.into())),
-            Ok(Err(err)) => return Err((AgentVmReconcileStage::Cleanup, err.into())),
-            Ok(Ok(())) => {}
+        // A teardown failure (a still-live VM) is the more urgent condition, so
+        // report it; retain any co-occurring audit-close failure in the log rather
+        // than dropping it silently.
+        let cleanup_failure = match cleanup {
+            Err(join) => Some((AgentVmReconcileStage::Cleanup, join.into())),
+            Ok(Err(err)) => Some((AgentVmReconcileStage::Cleanup, err.into())),
+            Ok(Ok(())) => None,
+        };
+        if let Some(failure) = cleanup_failure {
+            if let Err(err) = &audit_close {
+                tracing::warn!(
+                    session_id = %session_id,
+                    error = %err,
+                    "agent VM reconcile could not close audit session (teardown also failed)",
+                );
+            }
+            return Err(failure);
+        }
+        if let Err(err) = audit_close {
+            return Err((AgentVmReconcileStage::AuditClose, err.into()));
         }
 
         // Remove the copied secrets before the state record: a failure here keeps

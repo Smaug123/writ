@@ -1065,6 +1065,64 @@ async fn daemon_reconcile_preserves_firewall_and_revokes_authority_when_vm_absen
     assert_eq!(remaining[0].session_id(), session_id);
 }
 
+/// A boot reconcile whose audit-close itself fails (e.g. the audit DB is
+/// unwritable) must STILL attempt infrastructure teardown — otherwise a surviving
+/// broker VM is left both running and (once the audit DB is writable again)
+/// authorised. Teardown and authority revocation are independent: neither is
+/// skipped because the other failed.
+#[tokio::test]
+async fn daemon_reconcile_still_tears_down_when_audit_close_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let args_log = dir.path().join("args.log");
+    let env_path_log = dir.path().join("env-path.log");
+    let env_log = dir.path().join("env.log");
+    // The agent VM and network probe absent, so teardown succeeds if it runs.
+    let fake_tool = write_fake_tool(dir.path(), &args_log, &env_path_log, &env_log);
+    let (config, state_store) = daemon_config(dir.path(), &fake_tool);
+    occupy_subnet(&state_store, 252);
+    let session_id = state_store.load_all().unwrap().pop().unwrap().session_id();
+    let audit_path = dir.path().join("audit.db");
+    let audit = Arc::new(AuditLog::open(&audit_path).unwrap());
+    audit
+        .open_session(&SessionRecord {
+            session_id,
+            label: None,
+            agent_kind: Some(AgentKind::Claude),
+            agent_model: None,
+            opened_at: UnixMillis::from_millis(1_700_000_000),
+            closed_at: None,
+        })
+        .unwrap();
+    // Break `close_session` deterministically: drop the `session` table out from
+    // under the audit log via a second connection, so its UPDATE errors.
+    {
+        let conn = rusqlite::Connection::open(&audit_path).unwrap();
+        conn.execute("DROP TABLE session", []).unwrap();
+    }
+    let daemon = AgentVmDaemon::new(config);
+
+    let report = daemon.reconcile_persisted_sessions(&audit).await.unwrap();
+
+    // Teardown was attempted despite the audit-close failure: the VM presence
+    // probe ran. (On the buggy close-first ordering, the early return on the close
+    // failure would skip teardown entirely and this log would be empty.)
+    let args = fs::read_to_string(&args_log).unwrap_or_default();
+    assert!(
+        args.contains("list --all"),
+        "teardown must run even when audit close fails; args:\n{args}"
+    );
+    // A failure is still reported (so `writd` refuses to start) and the record is
+    // kept for retry.
+    assert_eq!(report.failed().len(), 1);
+    assert_eq!(
+        report.failed()[0].stage(),
+        AgentVmReconcileStage::AuditClose
+    );
+    let remaining = state_store.load_all().unwrap();
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0].session_id(), session_id);
+}
+
 /// A stop whose infrastructure teardown fails (the `pf-helper remove` step exits
 /// non-zero) must still revoke broker authority: close the audit session and shut
 /// down the in-process broker, leaving a possibly-live guest de-authorised rather
