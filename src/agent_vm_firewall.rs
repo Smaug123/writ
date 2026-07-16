@@ -14,7 +14,8 @@ use uuid::Uuid;
 
 use crate::core::{
     AgentFirewallNetwork, AgentNetworkPool, AgentVmConfigError, BrokerPortRange, BrokerPorts,
-    Ipv4Cidr, Ipv6Cidr, PfAnchorName, PfRuleset, SessionId, render_pf, session_firewall_pf_ruleset,
+    Ipv4Cidr, Ipv6Cidr, PfAnchorName, PfInterface, PfRuleset, SessionId, render_pf,
+    session_firewall_pf_ruleset,
 };
 
 pub const SESSION_BOOTSTRAP_ANCHOR: &str = r#"anchor "writ/session/*""#;
@@ -65,6 +66,7 @@ pub enum PfctlError {
 }
 
 impl SessionFirewallInstall {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         session_id: SessionId,
         pool: AgentNetworkPool,
@@ -73,6 +75,7 @@ impl SessionFirewallInstall {
         broker_ports: BrokerPorts,
         broker_port_range: BrokerPortRange,
         broker_ipv4_host: Option<Ipv4Addr>,
+        ipv6_deny_interfaces: Vec<PfInterface>,
     ) -> Result<Self, AgentVmConfigError> {
         broker_port_range.require_contains(&broker_ports)?;
         let network = pool.claim_firewall(ipv4, ipv6)?;
@@ -92,6 +95,14 @@ impl SessionFirewallInstall {
                 return Err(AgentVmConfigError::BrokerHostWithIpv6FirewallScope);
             }
         }
+        // An interface-scoped IPv6 deny is the `Ipv4OnlyNoGuestIpv6` backstop; it
+        // blocks *all* IPv6 on the agent VM's bridge. Pairing it with an IPv6
+        // firewall scope (dual-stack) would contradict that scope's IPv6 allow, so
+        // make the "backstop only when there is no legitimate guest IPv6" invariant
+        // a construction error rather than a silently self-cancelling ruleset.
+        if !ipv6_deny_interfaces.is_empty() && network.ipv6().is_some() {
+            return Err(AgentVmConfigError::Ipv6DenyInterfaceWithIpv6Scope);
+        }
         Ok(Self {
             network,
             ruleset: session_firewall_pf_ruleset(
@@ -99,6 +110,7 @@ impl SessionFirewallInstall {
                 network,
                 &broker_ports,
                 broker_ipv4_host,
+                &ipv6_deny_interfaces,
             ),
         })
     }
@@ -451,6 +463,7 @@ mod tests {
             ports(),
             BrokerPortRange::new(49152, 64999).unwrap(),
             None,
+            Vec::new(),
         )
         .unwrap_err();
         assert_eq!(
@@ -473,6 +486,7 @@ mod tests {
             ports(),
             BrokerPortRange::new(49152, 65535).unwrap(),
             None,
+            Vec::new(),
         )
         .unwrap_err();
         assert!(matches!(
@@ -491,6 +505,7 @@ mod tests {
             ports(),
             BrokerPortRange::new(49152, 65535).unwrap(),
             Some(Ipv4Addr::new(192, 168, 252, 5)),
+            Vec::new(),
         )
         .unwrap();
         assert!(
@@ -510,6 +525,7 @@ mod tests {
             ports(),
             BrokerPortRange::new(49152, 65535).unwrap(),
             Some(Ipv4Addr::new(10, 0, 0, 5)),
+            Vec::new(),
         )
         .unwrap_err();
         assert!(matches!(
@@ -528,11 +544,62 @@ mod tests {
             ports(),
             BrokerPortRange::new(49152, 65535).unwrap(),
             Some(Ipv4Addr::new(192, 168, 252, 5)),
+            Vec::new(),
         )
         .unwrap_err();
         assert!(matches!(
             err,
             AgentVmConfigError::BrokerHostWithIpv6FirewallScope
+        ));
+    }
+
+    #[test]
+    fn install_renders_interface_scoped_ipv6_deny_for_an_ipv4_only_scope() {
+        let install = SessionFirewallInstall::new(
+            session_id(),
+            pool(),
+            ipv4(),
+            None,
+            ports(),
+            BrokerPortRange::new(49152, 65535).unwrap(),
+            None,
+            vec![
+                PfInterface::new("bridge100").unwrap(),
+                PfInterface::new("vmenet0").unwrap(),
+            ],
+        )
+        .unwrap();
+        let rendered = install.rendered_rules();
+        assert!(
+            rendered.contains(
+                "block return in quick on bridge100 inet6 all label \"writ deny agent v6 iface\""
+            ),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "block return in quick on vmenet0 inet6 all label \"writ deny agent v6 iface\""
+            ),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn install_rejects_an_interface_deny_alongside_an_ipv6_scope() {
+        let err = SessionFirewallInstall::new(
+            session_id(),
+            pool(),
+            ipv4(),
+            Some(ipv6()),
+            ports(),
+            BrokerPortRange::new(49152, 65535).unwrap(),
+            None,
+            vec![PfInterface::new("bridge100").unwrap()],
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            AgentVmConfigError::Ipv6DenyInterfaceWithIpv6Scope
         ));
     }
 

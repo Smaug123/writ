@@ -58,7 +58,7 @@ fn managed_stop_failure_leaves_state_record_for_retry() {
     let err = stop_managed_agent_vm_session(
         &store,
         plan.session_id(),
-        AgentVmToolPaths::new(&missing_tool, &missing_tool, &missing_tool),
+        AgentVmToolPaths::new(&missing_tool, &missing_tool, &missing_tool, &missing_tool),
     )
     .unwrap_err();
     assert!(matches!(err, AgentVmSessionManagerError::Stop(_)));
@@ -78,7 +78,7 @@ fn managed_cleanup_success_preserves_state_until_explicit_remove() {
     cleanup_managed_agent_vm_session(
         &store,
         plan.session_id(),
-        AgentVmToolPaths::new(&ok_tool, &ok_tool, &ok_tool),
+        AgentVmToolPaths::new(&ok_tool, &ok_tool, &ok_tool, &ok_tool),
     )
     .unwrap();
     assert_eq!(store.load(plan.session_id()).unwrap(), running);
@@ -136,7 +136,7 @@ fn managed_cleanup_of_a_vm_session_tears_down_the_broker_vm() {
     cleanup_managed_agent_vm_session(
         &store,
         plan.session_id(),
-        AgentVmToolPaths::new(&tool, &tool, &tool),
+        AgentVmToolPaths::new(&tool, &tool, &tool, &tool),
     )
     .unwrap();
 
@@ -171,7 +171,7 @@ fn managed_cleanup_of_a_vm_session_is_idempotent_when_resources_already_absent()
     cleanup_managed_agent_vm_session(
         &store,
         plan.session_id(),
-        AgentVmToolPaths::new(&tool, &tool, &tool),
+        AgentVmToolPaths::new(&tool, &tool, &tool, &tool),
     )
     .expect("already-absent broker resources must not fail the stop");
 }
@@ -197,7 +197,7 @@ fn managed_cleanup_of_a_host_session_runs_no_broker_teardown() {
     cleanup_managed_agent_vm_session(
         &store,
         plan.session_id(),
-        AgentVmToolPaths::new(&tool, &tool, &tool),
+        AgentVmToolPaths::new(&tool, &tool, &tool, &tool),
     )
     .unwrap();
 
@@ -220,6 +220,11 @@ fn managed_start_then_managed_stop_success_removes_state_record() {
          if [ \"$1\" = \"network\" ] && [ \"$2\" = \"inspect\" ]; then\n\
          printf '%s\\n' 'ipv4Subnet: 192.168.252.0/24' 'ipv4Gateway: 192.168.252.1'\n\
          fi\n\
+         if [ \"$#\" -eq 0 ]; then\n\
+         printf '%s\\n' 'bridge100: flags=8863<UP> mtu 1500' \\\n\
+         '    inet 192.168.252.1 netmask 0xffffff00 broadcast 192.168.252.255' \\\n\
+         '    member: vmenet0 flags=20003<VIRTIO>'\n\
+         fi\n\
          exit 0\n",
     );
     let base_plan = plan_with_ipv6_mode(252, Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6);
@@ -233,7 +238,7 @@ fn managed_start_then_managed_stop_success_removes_state_record() {
         base_plan.image.clone(),
         base_plan.guest_command.clone(),
         base_plan.resources,
-        AgentVmToolPaths::new(&ok_tool, &ok_tool, &ok_tool),
+        AgentVmToolPaths::new(&ok_tool, &ok_tool, &ok_tool, &ok_tool),
     )
     .unwrap();
 
@@ -242,12 +247,84 @@ fn managed_start_then_managed_stop_success_removes_state_record() {
     stop_managed_agent_vm_session(
         &store,
         plan.session_id(),
-        AgentVmToolPaths::new(&ok_tool, &ok_tool, &ok_tool),
+        AgentVmToolPaths::new(&ok_tool, &ok_tool, &ok_tool, &ok_tool),
     )
     .unwrap();
 
     let missing = store.load(plan.session_id()).unwrap_err();
     assert!(matches!(missing, AgentVmSessionStateError::NotFound { .. }));
+}
+
+#[cfg(unix)]
+#[test]
+fn ipv4_only_start_installs_interface_scoped_ipv6_deny_after_discovery() {
+    // Drives the *real* post-start path: after StartVm, `ifconfig` discovery finds
+    // the bridge carrying the session gateway, and the session PF anchor is
+    // re-loaded with an interface-scoped IPv6 deny on the bridge and its member.
+    let dir = tempfile::tempdir().unwrap();
+    let store = AgentVmSessionStateStore::new(dir.path().join("state"));
+    let log = dir.path().join("argv.log");
+    let tool = write_executable_script(
+        dir.path(),
+        "logging-tool",
+        &format!(
+            "#!/bin/sh\n\
+             printf '%s\\n' \"$*\" >> \"{log}\"\n\
+             if [ \"$1\" = \"network\" ] && [ \"$2\" = \"inspect\" ]; then\n\
+             printf '%s\\n' 'ipv4Subnet: 192.168.252.0/24' 'ipv4Gateway: 192.168.252.1'\n\
+             fi\n\
+             if [ \"$#\" -eq 0 ]; then\n\
+             printf '%s\\n' 'bridge100: flags=8863<UP> mtu 1500' \\\n\
+             '    inet 192.168.252.1 netmask 0xffffff00 broadcast 192.168.252.255' \\\n\
+             '    member: vmenet0 flags=20003<VIRTIO>'\n\
+             fi\n\
+             exit 0\n",
+            log = log.display(),
+        ),
+    );
+    let base_plan = plan_with_ipv6_mode(252, Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6);
+    let plan = AgentVmSessionPlan::new(
+        base_plan.session_id(),
+        base_plan.pool,
+        base_plan.subnet_index(),
+        base_plan.broker_ports.clone(),
+        base_plan.broker_port_range,
+        base_plan.ipv6_mode(),
+        base_plan.image.clone(),
+        base_plan.guest_command.clone(),
+        base_plan.resources,
+        AgentVmToolPaths::new(&tool, &tool, &tool, &tool),
+    )
+    .unwrap();
+
+    start_managed_agent_vm_session(&store, &plan).unwrap();
+
+    let logged = std::fs::read_to_string(&log).unwrap();
+    // Exactly one pf-helper install carries the interface-scoped IPv6 deny (the
+    // post-start re-install), naming the discovered bridge and its member.
+    let deny_installs: Vec<&str> = logged
+        .lines()
+        .filter(|l| l.contains(" install ") && l.contains("--ipv6-deny-interface"))
+        .collect();
+    assert_eq!(deny_installs.len(), 1, "log:\n{logged}");
+    assert!(
+        deny_installs[0].contains("--ipv6-deny-interface bridge100"),
+        "{}",
+        deny_installs[0]
+    );
+    assert!(
+        deny_installs[0].contains("--ipv6-deny-interface vmenet0"),
+        "{}",
+        deny_installs[0]
+    );
+    // A pre-start install (no interface deny) precedes it: the v4 rules are up
+    // before the VM boots.
+    assert!(
+        logged
+            .lines()
+            .any(|l| l.contains(" install ") && !l.contains("--ipv6-deny-interface")),
+        "log:\n{logged}"
+    );
 }
 
 #[cfg(unix)]
@@ -295,7 +372,7 @@ fn vm_placement_start_failure_rolls_back_the_agent_vm_and_pf_not_the_network() {
         Vec::new(),
         vec!["sleep".into(), "600".into()],
         AgentVmResources::new(1, 512).unwrap(),
-        AgentVmToolPaths::new(&tool, &tool, &tool),
+        AgentVmToolPaths::new(&tool, &tool, &tool, &tool),
     )
     .unwrap();
 
@@ -374,7 +451,7 @@ fn host_placement_start_tears_down_a_network_that_create_left_behind_on_failure(
         ContainerImage::new("alpine:latest").unwrap(),
         vec!["sleep".into(), "600".into()],
         AgentVmResources::new(1, 512).unwrap(),
-        AgentVmToolPaths::new(&tool, &tool, &tool),
+        AgentVmToolPaths::new(&tool, &tool, &tool, &tool),
     )
     .unwrap();
 
@@ -427,7 +504,7 @@ fn host_placement_start_drops_the_record_when_the_tool_cannot_spawn() {
         ContainerImage::new("alpine:latest").unwrap(),
         vec!["sleep".into(), "600".into()],
         AgentVmResources::new(1, 512).unwrap(),
-        AgentVmToolPaths::new(&missing_tool, &missing_tool, &missing_tool),
+        AgentVmToolPaths::new(&missing_tool, &missing_tool, &missing_tool, &missing_tool),
     )
     .unwrap();
 
@@ -487,7 +564,7 @@ fn host_placement_start_refuses_and_removes_nothing_when_the_network_predates_it
         ContainerImage::new("alpine:latest").unwrap(),
         vec!["sleep".into(), "600".into()],
         AgentVmResources::new(1, 512).unwrap(),
-        AgentVmToolPaths::new(&tool, &tool, &tool),
+        AgentVmToolPaths::new(&tool, &tool, &tool, &tool),
     )
     .unwrap();
 
@@ -544,7 +621,7 @@ fn host_placement_start_removes_nothing_when_the_pre_create_probe_fails() {
         ContainerImage::new("alpine:latest").unwrap(),
         vec!["sleep".into(), "600".into()],
         AgentVmResources::new(1, 512).unwrap(),
-        AgentVmToolPaths::new(&tool, &tool, &tool),
+        AgentVmToolPaths::new(&tool, &tool, &tool, &tool),
     )
     .unwrap();
 
@@ -619,7 +696,7 @@ fn host_placement_start_refuses_and_removes_no_vm_when_the_agent_vm_predates_it(
         ContainerImage::new("alpine:latest").unwrap(),
         vec!["sleep".into(), "600".into()],
         AgentVmResources::new(1, 512).unwrap(),
-        AgentVmToolPaths::new(&tool, &tool, &tool),
+        AgentVmToolPaths::new(&tool, &tool, &tool, &tool),
     )
     .unwrap();
 
@@ -773,7 +850,7 @@ fn vm_placement_persists_and_stop_removes_the_agent_vm_and_pf_not_the_network() 
     let restored = AgentVmSessionState::from_json_bytes(&state.to_json_bytes().unwrap()).unwrap();
     assert_eq!(restored, state, "broker_placement must round-trip");
 
-    let tools = AgentVmToolPaths::new("container", "writ-agent-vm-pf-helper", "sudo");
+    let tools = AgentVmToolPaths::new("container", "writ-agent-vm-pf-helper", "sudo", "ifconfig");
     let stop = restored.to_stop_plan(tools).stop_invocations();
     assert!(
         stop.iter()
@@ -807,7 +884,7 @@ fn pre_placement_record_loads_as_host_and_stops_network_and_pf() {
         AgentVmSessionState::from_json_bytes(&serde_json::to_vec(&json).unwrap()).unwrap();
     assert_eq!(restored, state, "absent broker_placement must load as Host");
 
-    let tools = AgentVmToolPaths::new("container", "writ-agent-vm-pf-helper", "sudo");
+    let tools = AgentVmToolPaths::new("container", "writ-agent-vm-pf-helper", "sudo", "ifconfig");
     let stop = restored.to_stop_plan(tools).stop_invocations();
     assert!(
         stop.iter()
@@ -886,7 +963,7 @@ fn state_store_rejects_duplicate_live_subnet_indexes() {
         ContainerImage::new("alpine:latest").unwrap(),
         vec!["sleep".into(), "600".into()],
         AgentVmResources::new(1, 512).unwrap(),
-        AgentVmToolPaths::new("container", "writ-agent-vm-pf-helper", "sudo"),
+        AgentVmToolPaths::new("container", "writ-agent-vm-pf-helper", "sudo", "ifconfig"),
     )
     .unwrap();
     store.create_starting(&first).unwrap();

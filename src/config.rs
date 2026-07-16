@@ -351,6 +351,8 @@ pub struct AgentVmLifecycleConfig {
     pub container: PathBuf,
     #[serde(default = "default_sudo_program")]
     pub sudo: PathBuf,
+    #[serde(default = "default_ifconfig_program")]
+    pub ifconfig: PathBuf,
     pub pf_helper: PathBuf,
     #[serde(default)]
     pub state_dir: Option<PathBuf>,
@@ -679,6 +681,7 @@ impl AgentVmLifecycleConfig {
                 self.container.clone(),
                 self.pf_helper.clone(),
                 self.sudo.clone(),
+                self.ifconfig.clone(),
             ),
         )?)
     }
@@ -1179,6 +1182,10 @@ fn default_container_program() -> PathBuf {
 
 fn default_sudo_program() -> PathBuf {
     PathBuf::from("sudo")
+}
+
+fn default_ifconfig_program() -> PathBuf {
+    PathBuf::from("/sbin/ifconfig")
 }
 
 fn default_vm_git_token_env() -> String {
@@ -2562,6 +2569,7 @@ mod tests {
             subnet_index_max: 253,
             container: PathBuf::from("container"),
             sudo: PathBuf::from("sudo"),
+            ifconfig: PathBuf::from("/sbin/ifconfig"),
             pf_helper: PathBuf::from("/usr/local/libexec/writ-agent-vm-pf-helper"),
             state_dir: Some(PathBuf::from("/var/folders/writ/agent-vm-state")),
             ipv6_mode: Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6,

@@ -13,7 +13,8 @@ use writ::agent_vm_firewall::{
     remove_session_firewall,
 };
 use writ::core::{
-    AgentNetworkPool, BrokerPort, BrokerPortRange, BrokerPorts, Ipv4Cidr, Ipv6Cidr, SessionId,
+    AgentNetworkPool, BrokerPort, BrokerPortRange, BrokerPorts, Ipv4Cidr, Ipv6Cidr, PfInterface,
+    SessionId,
 };
 
 #[derive(Parser)]
@@ -58,6 +59,14 @@ struct InstallArgs {
     /// while the gateway and the rest of the subnet stay blocked.
     #[arg(long)]
     broker_host: Option<String>,
+
+    /// Host interface to block *all* IPv6 on (`block ... on <iface> inet6 all`).
+    /// May be supplied more than once. This is the `Ipv4OnlyNoGuestIpv6` backstop:
+    /// the caller discovers the agent VM's bridge (and its member) after the VM
+    /// starts and passes them here so a root guest cannot re-acquire IPv6 via a
+    /// host vmnet router advertisement. Rejected together with `--ipv6-cidr`.
+    #[arg(long = "ipv6-deny-interface")]
+    ipv6_deny_interfaces: Vec<String>,
 }
 
 #[derive(Args)]
@@ -116,6 +125,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .map(|raw| raw.parse::<Ipv4Addr>())
                 .transpose()
                 .map_err(|e| format!("invalid --broker-host: {e}"))?;
+            let ipv6_deny_interfaces = args
+                .ipv6_deny_interfaces
+                .into_iter()
+                .map(PfInterface::new)
+                .collect::<Result<Vec<_>, _>>()?;
             let install = SessionFirewallInstall::new(
                 parsed.session_id,
                 parsed.pool,
@@ -124,6 +138,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 broker_ports,
                 broker_port_range,
                 broker_host,
+                ipv6_deny_interfaces,
             )?;
             install_session_firewall(&cli.pfctl, &install)?;
             println!("{}", install.ruleset().anchor().as_str());

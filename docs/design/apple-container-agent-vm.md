@@ -370,9 +370,7 @@ own proof obligation, because the guarantee is different: "no guest IPv6
 route/address exists" rather than "PF has been installed for the inspected
 IPv6 prefix." The runner deliberately omits `--ipv6-cidr` when installing the
 PF anchor in this mode; installing a rule for the broker-planned IPv6 prefix
-would be misleading when Apple attached a different ULA prefix. The active
-protection, and the only IPv6 enforcement in this mode, is the pre-release
-guest proof that there is no routable IPv6 state.
+would be misleading when Apple attached a different ULA prefix.
 
 The original probe was point-in-time and rested on an assumption that Apple
 `--internal` networks do not later inject IPv6 Router Advertisements. **That
@@ -380,12 +378,33 @@ assumption failed**: on macOS 26.5.1 / `container` 0.11.0 the host vmnet
 advertises IPv6 RAs on the shared link regardless of the network's own (absent)
 v6 config, and a guest with default `accept_ra` SLAACs a global-scope ULA
 (`fd…/64 … proto kernel_ra`) a beat after boot — after the point-in-time probe
-would have passed. The remedy this doc anticipated ("enforce an equivalent
-in-guest IPv6 disablement before release") is now what the mode does: the
-pre-release step disables IPv6 in the guest kernel (flushing any RA-acquired
-address and ignoring later RAs) and then verifies the clean posture. The
-guarantee is therefore no longer "the network happened to have no v6" but "the
-guest kernel has IPv6 disabled", which holds against host vmnet RAs.
+would have passed. The first remedy ("enforce an equivalent in-guest IPv6
+disablement before release") is one layer of the mode: the pre-release step
+disables IPv6 in the guest kernel (flushing any RA-acquired address and ignoring
+later RAs) and then verifies the clean posture.
+
+That in-guest disable is **not sufficient on its own**, because it runs before
+the agent command is released and the guest runs as root: once released, the
+agent can write `0` back to `disable_ipv6`, wait for the next vmnet RA, and
+re-acquire the ULA — a bypass the pre-release proof cannot see (#288). So the
+mode also installs a **host-side backstop the guest cannot undo**: after the VM
+(and thus its host `bridgeN`) is up, the runner discovers the bridge carrying
+the session's IPv4 gateway via `ifconfig` (see `parse_bridge_for_gateway`),
+reads its member `vmenet*`, and re-loads the session PF anchor with an
+interface-scoped IPv6 deny (`block return in quick on <iface> inet6 all`) on
+both. This is scoped by interface rather than source CIDR precisely because the
+RA ULA prefix is unpredictable *and* a root guest could reassign its source
+address anyway — only the interface scope holds. It is installed before the
+guest command is released and blocks all IPv6 on the agent's bridge regardless
+of what the guest does to its own kernel. Discovery fails closed: if no single
+bridge carries the gateway, the start aborts rather than release the guest
+without the backstop. `scripts/prove-agent-vm-lifecycle.sh` proves, on real
+hardware, both that the rule is installed and that a root guest which re-enables
+IPv6 still cannot egress it.
+
+The guarantee is therefore layered: "the guest kernel has IPv6 disabled" (belt,
+guest-side, holds against RAs at boot) **and** "the host drops all IPv6 on the
+agent's bridge" (suspenders, host-side, holds against a compromised root guest).
 
 ### PF strategy
 

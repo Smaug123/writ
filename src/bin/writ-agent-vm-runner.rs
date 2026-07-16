@@ -37,6 +37,11 @@ struct Cli {
     #[arg(long, env = "WRIT_AGENT_VM_PF_HELPER")]
     pf_helper: Option<PathBuf>,
 
+    /// Path to ifconfig, used to discover the agent VM's host bridge for the
+    /// IPv4-only IPv6 deny.
+    #[arg(long, default_value = "/sbin/ifconfig", env = "WRIT_IFCONFIG")]
+    ifconfig: PathBuf,
+
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -207,6 +212,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         cli.container,
         cli.pf_helper.unwrap_or_else(default_pf_helper_path),
         cli.sudo,
+        cli.ifconfig,
     );
 
     match cli.cmd {
@@ -476,7 +482,7 @@ mod tests {
             Vec::new(),
             vec!["sleep".into(), "600".into()],
             AgentVmResources::new(1, 512).unwrap(),
-            AgentVmToolPaths::new("container", "pf", "sudo"),
+            AgentVmToolPaths::new("container", "pf", "sudo", "ifconfig"),
         )
         .unwrap();
         let state = store.create_starting(&plan).unwrap();
@@ -486,7 +492,7 @@ mod tests {
     fn dry_run_lines(state: &AgentVmSessionState) -> Vec<String> {
         managed_stop_dry_run_invocations(
             state,
-            AgentVmToolPaths::new("/usr/local/bin/container", "pf", "sudo"),
+            AgentVmToolPaths::new("/usr/local/bin/container", "pf", "sudo", "ifconfig"),
         )
         .iter()
         .map(|invocation| invocation.args_lossy().join(" "))

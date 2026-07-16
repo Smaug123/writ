@@ -8,7 +8,7 @@
 //! produces these strings lives in the parent module.
 
 use super::GUEST_IPV6_PROBE_UNAVAILABLE_MARKER;
-use crate::core::{Ipv4Cidr, Ipv6Cidr};
+use crate::core::{AgentVmConfigError, Ipv4Cidr, Ipv6Cidr, PfInterface};
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 #[derive(Debug, thiserror::Error, Eq, PartialEq)]
@@ -55,6 +55,129 @@ pub enum GuestIpv6InspectionError {
     NonLinkLocalAddress(Ipv6Addr),
     #[error("guest has IPv6 default route: {0}")]
     DefaultRoute(String),
+}
+
+#[derive(Debug, thiserror::Error, Eq, PartialEq)]
+pub enum GuestBridgeDiscoveryError {
+    #[error("no host interface carries the agent session gateway {0} (the bridge is not up yet)")]
+    NoBridgeForGateway(Ipv4Addr),
+    #[error("more than one host interface carries the agent session gateway {0}")]
+    MultipleBridgesForGateway(Ipv4Addr),
+    #[error("host interface name is not usable in a PF rule: {0}")]
+    InvalidInterfaceName(#[from] AgentVmConfigError),
+}
+
+/// The host-side interfaces that carry one agent VM's traffic: the vmnet bridge
+/// that holds the session's IPv4 gateway, plus the bridge's member interface(s)
+/// (the `vmenet*` the guest is attached to).
+///
+/// This is what the `Ipv4OnlyNoGuestIpv6` backstop scopes its IPv6 deny to.
+/// Scoping to *both* the bridge and its member removes any dependence on which
+/// interface macOS PF happens to filter bridged IPv6 on; neither carries any
+/// legitimate IPv6 in this mode, so denying all IPv6 on them is safe and cannot
+/// touch the IPv4 broker path.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GuestBridgeDiscovery {
+    bridge: PfInterface,
+    members: Vec<PfInterface>,
+}
+
+impl GuestBridgeDiscovery {
+    pub fn bridge(&self) -> &PfInterface {
+        &self.bridge
+    }
+
+    pub fn members(&self) -> &[PfInterface] {
+        &self.members
+    }
+
+    /// The full set of interfaces to install the IPv6 deny on: the bridge first,
+    /// then each member, de-duplicated while preserving order.
+    pub fn deny_interfaces(&self) -> Vec<PfInterface> {
+        let mut out = Vec::with_capacity(self.members.len() + 1);
+        for iface in std::iter::once(&self.bridge).chain(self.members.iter()) {
+            if !out.contains(iface) {
+                out.push(iface.clone());
+            }
+        }
+        out
+    }
+}
+
+/// One interface stanza scraped from `ifconfig` output.
+struct IfconfigStanza {
+    name: String,
+    carries_gateway: bool,
+    members: Vec<String>,
+}
+
+/// Find the vmnet bridge that carries `gateway` (the agent session's IPv4
+/// gateway, which macOS assigns to the bridge interface), and its member
+/// interfaces, from `ifconfig` output.
+///
+/// The bridge exists only after the agent VM starts, and its name (`bridgeN`)
+/// and member (`vmenetN`) are assigned by vmnet in start order, so they cannot
+/// be predicted — but the session's gateway *is* known, and macOS puts it on the
+/// bridge (`inet 192.168.x.1`), giving a stable, per-session key. Fails closed:
+/// if no interface (or more than one) carries the gateway, the caller must not
+/// release the guest without the backstop.
+pub fn parse_bridge_for_gateway(
+    ifconfig_output: &str,
+    gateway: Ipv4Addr,
+) -> Result<GuestBridgeDiscovery, GuestBridgeDiscoveryError> {
+    let mut stanzas: Vec<IfconfigStanza> = Vec::new();
+    for line in ifconfig_output.lines() {
+        // A top-level interface header starts at column 0 as `name: flags=...`;
+        // every attribute line (inet, member:, Configuration:, …) is indented, so
+        // leading whitespace distinguishes them.
+        let is_header = !line.is_empty() && !line.starts_with([' ', '\t']) && line.contains(':');
+        if is_header {
+            let name = line.split(':').next().unwrap_or_default().to_string();
+            stanzas.push(IfconfigStanza {
+                name,
+                carries_gateway: false,
+                members: Vec::new(),
+            });
+            continue;
+        }
+        let Some(stanza) = stanzas.last_mut() else {
+            continue;
+        };
+        let trimmed = line.trim_start();
+        if let Some(rest) = trimmed.strip_prefix("inet ") {
+            // `inet <addr> netmask …`. Match the exact address token, never a
+            // substring, so 192.168.221.1 does not match 192.168.221.10.
+            if rest
+                .split_whitespace()
+                .next()
+                .and_then(|tok| tok.parse::<Ipv4Addr>().ok())
+                == Some(gateway)
+            {
+                stanza.carries_gateway = true;
+            }
+        } else if let Some(rest) = trimmed.strip_prefix("member:")
+            && let Some(member) = rest.split_whitespace().next()
+        {
+            stanza.members.push(member.to_string());
+        }
+    }
+
+    let mut matching = stanzas.into_iter().filter(|s| s.carries_gateway);
+    let bridge_stanza = matching
+        .next()
+        .ok_or(GuestBridgeDiscoveryError::NoBridgeForGateway(gateway))?;
+    if matching.next().is_some() {
+        return Err(GuestBridgeDiscoveryError::MultipleBridgesForGateway(
+            gateway,
+        ));
+    }
+    let bridge = PfInterface::new(bridge_stanza.name)?;
+    let members = bridge_stanza
+        .members
+        .into_iter()
+        .map(PfInterface::new)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(GuestBridgeDiscovery { bridge, members })
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

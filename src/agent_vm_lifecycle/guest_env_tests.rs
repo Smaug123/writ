@@ -21,7 +21,7 @@ fn guest_environment_is_redacted_and_uses_env_file_in_start_invocation() {
         ],
         vec!["sleep".into(), "600".into()],
         AgentVmResources::new(1, 512).unwrap(),
-        AgentVmToolPaths::new("container", "writ-agent-vm-pf-helper", "sudo"),
+        AgentVmToolPaths::new("container", "writ-agent-vm-pf-helper", "sudo", "ifconfig"),
     )
     .unwrap();
 
@@ -116,9 +116,13 @@ fn guest_ipv6_enforce_and_probe_script_disables_then_fails_closed_on_partial_pro
     assert!(GUEST_IPV6_ENFORCE_AND_PROBE_SCRIPT.contains("for scope in all default"));
     // Fail closed: only an ABSENT sysctl is tolerated; a present one must read
     // back `1`, so a present-but-unwritable path fails the start rather than
-    // releasing the guest command with IPv6 still live.
+    // releasing the guest command with IPv6 still live. The read-back is `cat`
+    // command substitution, not `read`: BusyBox `read` returns non-zero on
+    // `/proc/sys` files even when it assigns the value, so `read … || state=`
+    // wiped the just-read `1` and failed every start on Apple container 1.0.0.
     assert!(GUEST_IPV6_ENFORCE_AND_PROBE_SCRIPT.contains("[ -e \"$path\" ] || continue"));
-    assert!(GUEST_IPV6_ENFORCE_AND_PROBE_SCRIPT.contains("read -r state < \"$path\""));
+    assert!(GUEST_IPV6_ENFORCE_AND_PROBE_SCRIPT.contains("state=\"$(cat \"$path\" 2>/dev/null)\""));
+    assert!(!GUEST_IPV6_ENFORCE_AND_PROBE_SCRIPT.contains("read -r state"));
     assert!(GUEST_IPV6_ENFORCE_AND_PROBE_SCRIPT.contains("[ \"$state\" = 1 ]"));
     assert!(GUEST_IPV6_ENFORCE_AND_PROBE_SCRIPT.contains("writ-ipv6-not-disabled"));
     // Then report the resulting state for validation.

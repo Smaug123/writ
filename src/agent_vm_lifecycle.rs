@@ -20,14 +20,15 @@ use uuid::Uuid;
 use crate::broker_vm::{BrokerVmNames, broker_vm_removal_invocations};
 use crate::core::{
     AgentNetwork, AgentNetworkPool, AgentVmConfigError, BrokerPortRange, BrokerPorts, Ipv4Cidr,
-    Ipv6Cidr, SessionId,
+    Ipv6Cidr, PfInterface, SessionId,
 };
 use crate::process_spawn;
 
 mod parse;
 use parse::validate_ipv4_only_observed_ipv6;
 pub use parse::{
-    AppleNetworkInspection, GuestIpv6Inspection, GuestIpv6InspectionError, NetworkInspectionError,
+    AppleNetworkInspection, GuestBridgeDiscovery, GuestBridgeDiscoveryError, GuestIpv6Inspection,
+    GuestIpv6InspectionError, NetworkInspectionError, parse_bridge_for_gateway,
 };
 mod state_store;
 pub use state_store::{
@@ -82,12 +83,20 @@ const IPV4_ONLY_PRELAUNCH_SCRIPT: &str = concat!(
 /// pass: the read-back is what catches it, independent of why the write didn't
 /// take, rather than trusting the `ip -6` snapshot (which could look clean if
 /// the RA simply has not arrived yet, only to gain the ULA moments later).
+///
+/// The read-back uses `cat` command substitution, not `read`: BusyBox `read`
+/// (the guest image's `sh`) returns non-zero reading `/proc/sys` sysctls even
+/// when it correctly assigns the value, so the earlier `read … || state=` wiped
+/// the just-read `1` to empty and failed every start on Apple `container` 1.0.0.
+/// `$(cat …)` returns the value regardless of `read`'s exit quirk and strips the
+/// trailing newline, so a genuine `0`/empty (write did not take) still fails
+/// closed while a real `1` passes.
 const GUEST_IPV6_ENFORCE_AND_PROBE_SCRIPT: &str = r#"set -e
 for scope in all default; do
   path="/proc/sys/net/ipv6/conf/$scope/disable_ipv6"
   [ -e "$path" ] || continue
   printf 1 > "$path" 2>/dev/null || true
-  read -r state < "$path" 2>/dev/null || state=
+  state="$(cat "$path" 2>/dev/null)" || state=
   [ "$state" = 1 ] || { echo "writ-ipv6-not-disabled $path=$state"; exit 1; }
 done
 if ! command -v ip >/dev/null 2>&1; then echo writ-ip-command-missing; exit 77; fi
@@ -101,6 +110,15 @@ const _: () = assert!(
     "wait_for_guest_ipv6_inspection requires at least one attempt"
 );
 const GUEST_IPV6_PROBE_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
+// The host bridge for a session's network is created a beat after `container run`
+// returns, so the post-start bridge discovery retries on the same cadence as the
+// guest IPv6 probe before failing closed.
+const BRIDGE_DISCOVERY_ATTEMPTS: usize = 40;
+const _: () = assert!(
+    BRIDGE_DISCOVERY_ATTEMPTS > 0,
+    "wait_for_guest_bridge_discovery requires at least one attempt"
+);
+const BRIDGE_DISCOVERY_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
 // Apple Container removals can lag command return briefly. Keep the
 // postcondition wait bounded: after three seconds, report that cleanup could
 // not prove absence instead of claiming success.
@@ -219,6 +237,9 @@ pub struct AgentVmToolPaths {
     container: PathBuf,
     pf_helper: PathBuf,
     sudo: PathBuf,
+    /// `ifconfig`, used post-start to discover the agent VM's host bridge for the
+    /// `Ipv4OnlyNoGuestIpv6` IPv6 deny (see `parse_bridge_for_gateway`).
+    ifconfig: PathBuf,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -314,6 +335,14 @@ pub enum AgentVmStartStep {
     /// Both placements create the agent VM, so both probe for it.
     ProbeVmAbsent(ResourcePresenceProbe),
     StartVm(AgentVmStartInvocation),
+    /// `Ipv4OnlyNoGuestIpv6` only: after the VM (and thus its host bridge) is up,
+    /// discover the bridge that carries the session gateway via `ifconfig`, then
+    /// re-load the session PF anchor with an interface-scoped IPv6 deny on it (and
+    /// its member). The discovery command is carried for dry-run display; the
+    /// re-install invocation is built from the discovered interfaces at run time.
+    DiscoverBridgeAndDenyGuestIpv6 {
+        discover_invocation: ProcessInvocation,
+    },
     ProbeAndValidateGuestIpv6 {
         probe_invocation: ProcessInvocation,
     },
@@ -411,6 +440,13 @@ pub enum StartOutcome {
     /// are ours, but the VM is not — clean back through the network and PF only.
     VmAbsenceProbeFailed,
     StartVmFailed,
+    /// The post-start `ifconfig` discovery of the agent VM's host bridge failed
+    /// (command error, or no/ambiguous interface for the session gateway). The
+    /// network, PF anchor, and VM exist and are ours.
+    DiscoverBridgeFailed,
+    /// The re-install of the session PF anchor with the interface-scoped IPv6
+    /// deny failed. Same phase as a discovery failure: everything is ours.
+    InstallIpv6DenyFailed,
     ProbeGuestIpv6Failed,
     ValidateGuestIpv6Failed,
     ReleaseGuestCommandFailed,
@@ -521,6 +557,8 @@ pub enum StartFailure {
     NetworkInspection(#[from] NetworkInspectionError),
     #[error(transparent)]
     GuestIpv6Inspection(#[from] GuestIpv6InspectionError),
+    #[error(transparent)]
+    GuestBridgeDiscovery(#[from] GuestBridgeDiscoveryError),
     #[error(transparent)]
     GuestEnvironment(#[from] GuestEnvironmentError),
 }
@@ -656,6 +694,8 @@ pub fn cleanup_step_after_start_outcome(outcome: StartOutcome) -> Option<Complet
             Some(CompletedStartStep::FirewallInstalled)
         }
         StartOutcome::StartVmFailed
+        | StartOutcome::DiscoverBridgeFailed
+        | StartOutcome::InstallIpv6DenyFailed
         | StartOutcome::ProbeGuestIpv6Failed
         | StartOutcome::ValidateGuestIpv6Failed
         | StartOutcome::ReleaseGuestCommandFailed => Some(CompletedStartStep::VmStarted),
@@ -823,6 +863,15 @@ impl AgentVmSessionPlan {
         ));
         steps.push(AgentVmStartStep::StartVm(self.start_vm_invocation()));
         if self.ipv6_mode == Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6 {
+            // Host-side backstop first: the VM's bridge now exists, so discover it
+            // and re-load the session PF anchor with an interface-scoped IPv6 deny
+            // — a guest-tamper-proof block that a root agent cannot undo by
+            // re-enabling IPv6 and re-acquiring a vmnet-RA ULA. This runs before
+            // the in-guest enforce/probe (a defence-in-depth belt) and the release,
+            // so IPv6 egress is blocked at the host the whole time.
+            steps.push(AgentVmStartStep::DiscoverBridgeAndDenyGuestIpv6 {
+                discover_invocation: self.ifconfig_discovery_invocation(),
+            });
             // Enforce-then-verify the no-guest-IPv6 posture in one guest exec
             // (the script disables IPv6 in the guest kernel before reporting;
             // see GUEST_IPV6_ENFORCE_AND_PROBE_SCRIPT), then release the guest
@@ -990,6 +1039,18 @@ impl AgentVmSessionPlan {
     }
 
     fn install_firewall_invocation(&self) -> ProcessInvocation {
+        self.firewall_install_invocation(&[])
+    }
+
+    /// The pf-helper install invocation, optionally carrying interface-scoped IPv6
+    /// deny targets. The pre-start install passes none (the bridge does not exist
+    /// yet); the post-start re-install (`Ipv4OnlyNoGuestIpv6`) passes the
+    /// discovered bridge and its member. Re-loading the same anchor replaces its
+    /// rules atomically, so the second install renders v4 rules + the v6 deny.
+    fn firewall_install_invocation(
+        &self,
+        ipv6_deny_interfaces: &[PfInterface],
+    ) -> ProcessInvocation {
         let mut args = vec![
             self.tools.pf_helper.as_os_str().to_os_string(),
             OsString::from("install"),
@@ -1022,7 +1083,17 @@ impl AgentVmSessionPlan {
             OsString::from("--broker-port-max"),
             OsString::from(self.broker_port_range.max().get().to_string()),
         ]);
+        for interface in ipv6_deny_interfaces {
+            args.push(OsString::from("--ipv6-deny-interface"));
+            args.push(OsString::from(interface.as_str()));
+        }
         ProcessInvocation::new(self.tools.sudo.clone(), args)
+    }
+
+    /// `ifconfig` with no arguments: list every interface so the post-start step
+    /// can find the one carrying this session's IPv4 gateway.
+    fn ifconfig_discovery_invocation(&self) -> ProcessInvocation {
+        ProcessInvocation::new(self.tools.ifconfig.clone(), Vec::<OsString>::new())
     }
 
     fn start_vm_invocation(&self) -> AgentVmStartInvocation {
@@ -1432,16 +1503,22 @@ impl AgentVmToolPaths {
         container: impl Into<PathBuf>,
         pf_helper: impl Into<PathBuf>,
         sudo: impl Into<PathBuf>,
+        ifconfig: impl Into<PathBuf>,
     ) -> Self {
         Self {
             container: container.into(),
             pf_helper: pf_helper.into(),
             sudo: sudo.into(),
+            ifconfig: ifconfig.into(),
         }
     }
 
     pub fn container(&self) -> &Path {
         &self.container
+    }
+
+    pub fn ifconfig(&self) -> &Path {
+        &self.ifconfig
     }
 }
 
@@ -1816,6 +1893,9 @@ impl AgentVmStartStep {
             | Self::InstallFirewall(inv)
             | Self::ReleaseGuestCommand(inv) => AgentVmStartInvocation::Static(inv),
             Self::StartVm(inv) => inv,
+            Self::DiscoverBridgeAndDenyGuestIpv6 {
+                discover_invocation,
+            } => AgentVmStartInvocation::Static(discover_invocation),
             Self::ProbeAndValidateGuestIpv6 { probe_invocation } => {
                 AgentVmStartInvocation::Static(probe_invocation)
             }
@@ -1843,6 +1923,7 @@ pub fn step_cleanup_phase(step: &AgentVmStartStep) -> Option<CompletedStartStep>
             Some(CompletedStartStep::FirewallInstalled)
         }
         AgentVmStartStep::StartVm(_)
+        | AgentVmStartStep::DiscoverBridgeAndDenyGuestIpv6 { .. }
         | AgentVmStartStep::ProbeAndValidateGuestIpv6 { .. }
         | AgentVmStartStep::ReleaseGuestCommand(_) => Some(CompletedStartStep::VmStarted),
     }
@@ -1862,6 +1943,10 @@ pub fn step_failure_outcomes(step: &AgentVmStartStep) -> Vec<StartOutcome> {
         AgentVmStartStep::InstallFirewall(_) => vec![StartOutcome::InstallFirewallFailed],
         AgentVmStartStep::ProbeVmAbsent(_) => vec![StartOutcome::VmAbsenceProbeFailed],
         AgentVmStartStep::StartVm(_) => vec![StartOutcome::StartVmFailed],
+        AgentVmStartStep::DiscoverBridgeAndDenyGuestIpv6 { .. } => vec![
+            StartOutcome::DiscoverBridgeFailed,
+            StartOutcome::InstallIpv6DenyFailed,
+        ],
         AgentVmStartStep::ProbeAndValidateGuestIpv6 { .. } => vec![
             StartOutcome::ProbeGuestIpv6Failed,
             StartOutcome::ValidateGuestIpv6Failed,
@@ -2006,6 +2091,16 @@ fn run_start_step(
         AgentVmStartStep::StartVm(_) => plan
             .run_start_vm_invocation()
             .map_err(|err| (err, StartOutcome::StartVmFailed)),
+        AgentVmStartStep::DiscoverBridgeAndDenyGuestIpv6 {
+            discover_invocation,
+        } => {
+            let discovery =
+                wait_for_guest_bridge_discovery(discover_invocation, plan.network.ipv4_gateway())
+                    .map_err(|err| (err, StartOutcome::DiscoverBridgeFailed))?;
+            plan.firewall_install_invocation(&discovery.deny_interfaces())
+                .run()
+                .map_err(|err| (err.into(), StartOutcome::InstallIpv6DenyFailed))
+        }
         AgentVmStartStep::ProbeAndValidateGuestIpv6 { probe_invocation } => {
             let inspection = wait_for_guest_ipv6_inspection(probe_invocation)
                 .map_err(|err| (err, StartOutcome::ProbeGuestIpv6Failed))?;
@@ -2575,6 +2670,34 @@ fn resource_list_contains_exact_line(raw: &[u8], name: &str) -> bool {
         .any(|line| line.trim() == name)
 }
 
+/// Run `ifconfig` (retrying while the bridge is still coming up) and locate the
+/// host bridge carrying `gateway`. A missing gateway is transient (the bridge
+/// appears a beat after `container run`) and retried; an ambiguous or
+/// unparseable interface is a hard failure. Fails closed after the last attempt.
+fn wait_for_guest_bridge_discovery(
+    invocation: &ProcessInvocation,
+    gateway: Ipv4Addr,
+) -> Result<GuestBridgeDiscovery, StartFailure> {
+    for attempt in 0..BRIDGE_DISCOVERY_ATTEMPTS {
+        let last: StartFailure = match invocation.output() {
+            Ok(output) if output.status.success() => {
+                match parse_bridge_for_gateway(&String::from_utf8_lossy(&output.stdout), gateway) {
+                    Ok(discovery) => return Ok(discovery),
+                    Err(err @ GuestBridgeDiscoveryError::NoBridgeForGateway(_)) => err.into(),
+                    Err(err) => return Err(err.into()),
+                }
+            }
+            Ok(output) => invocation.failed_from_output(output).into(),
+            Err(err) => err.into(),
+        };
+        if attempt + 1 == BRIDGE_DISCOVERY_ATTEMPTS {
+            return Err(last);
+        }
+        std::thread::sleep(BRIDGE_DISCOVERY_DELAY);
+    }
+    unreachable!("BRIDGE_DISCOVERY_ATTEMPTS > 0 ensures the loop body always returns")
+}
+
 fn wait_for_guest_ipv6_inspection(
     invocation: &ProcessInvocation,
 ) -> Result<GuestIpv6Inspection, StartFailure> {
@@ -2655,6 +2778,8 @@ mod spec {
             Just(StartOutcome::InstallFirewallFailed),
             Just(StartOutcome::VmAbsenceProbeFailed),
             Just(StartOutcome::StartVmFailed),
+            Just(StartOutcome::DiscoverBridgeFailed),
+            Just(StartOutcome::InstallIpv6DenyFailed),
             Just(StartOutcome::ProbeGuestIpv6Failed),
             Just(StartOutcome::ValidateGuestIpv6Failed),
             Just(StartOutcome::ReleaseGuestCommandFailed),
@@ -2763,7 +2888,12 @@ mod spec {
                         ContainerImage::new(image).unwrap(),
                         guest_command,
                         AgentVmResources::new(cpus, memory_mib).unwrap(),
-                        AgentVmToolPaths::new("container", "writ-agent-vm-pf-helper", "sudo"),
+                        AgentVmToolPaths::new(
+                            "container",
+                            "writ-agent-vm-pf-helper",
+                            "sudo",
+                            "ifconfig",
+                        ),
                     )
                     .unwrap()
                 },
@@ -2909,6 +3039,8 @@ mod spec {
                 StartOutcome::InstallFirewallFailed | StartOutcome::VmAbsenceProbeFailed => 3,
                 // VM started (or later): VM (4) + PF (1) + network (2).
                 StartOutcome::StartVmFailed
+                | StartOutcome::DiscoverBridgeFailed
+                | StartOutcome::InstallIpv6DenyFailed
                 | StartOutcome::ProbeGuestIpv6Failed
                 | StartOutcome::ValidateGuestIpv6Failed
                 | StartOutcome::ReleaseGuestCommandFailed => 7,
@@ -3053,7 +3185,7 @@ mod spec {
             prop_assert_eq!(&decoded, &state);
             prop_assert_eq!(
                 decoded
-                    .to_stop_plan(AgentVmToolPaths::new("container", "writ-agent-vm-pf-helper", "sudo"))
+                    .to_stop_plan(AgentVmToolPaths::new("container", "writ-agent-vm-pf-helper", "sudo", "ifconfig"))
                     .stop_invocations(),
                 plan.stop_plan().stop_invocations()
             );
