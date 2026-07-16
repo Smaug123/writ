@@ -287,6 +287,83 @@ pub(super) fn write_fake_pf_remove_failure_tool(dir: &Path, args_log: &Path) -> 
     path
 }
 
+/// Like [`write_fake_tool`] (so a session starts cleanly), but the
+/// `pf-helper remove` step of a stop plan exits non-zero. The agent VM and the
+/// network both probe absent, so the stop reaches — and fails at — the firewall
+/// removal, exercising the daemon's teardown-failure handling on a *genuine*
+/// managed session (a `Stop` cleanup error, not a missing state record).
+pub(super) fn write_fake_stop_firewall_remove_failure_tool(
+    dir: &Path,
+    args_log: &Path,
+    env_path_log: &Path,
+    env_log: &Path,
+) -> PathBuf {
+    let path = dir.join("fake-stop-firewall-remove-failure-tool");
+    let script = format!(
+        "#!/bin/sh\n\
+             printf '%s\\n' \"$*\" >> {args_log}\n\
+             if [ \"$2\" = \"remove\" ]; then\n\
+             exit 7\n\
+             fi\n\
+             if [ \"$1\" = \"network\" ] && [ \"$2\" = \"inspect\" ]; then\n\
+             printf '%s\\n' 'ipv4Subnet: 192.168.252.0/24' 'ipv4Gateway: 192.168.252.1'\n\
+             fi\n\
+             if [ \"$1\" = \"run\" ]; then\n\
+             while [ \"$#\" -gt 0 ]; do\n\
+             if [ \"$1\" = \"--env-file\" ]; then\n\
+             printf '%s\\n' \"$2\" > {env_path_log}\n\
+             cat \"$2\" > {env_log}\n\
+             fi\n\
+             shift\n\
+             done\n\
+             fi\n\
+             if [ \"$1\" = \"exec\" ]; then\n\
+             case \"${{5:-}}\" in\n\
+             *bootstrap-failed*) printf 'ok' ;;\n\
+             esac\n\
+             fi\n\
+             exit 0\n",
+        args_log = shell_quote(args_log),
+        env_path_log = shell_quote(env_path_log),
+        env_log = shell_quote(env_log),
+    );
+    fs::write(&path, script).unwrap();
+    let mut permissions = fs::metadata(&path).unwrap().permissions();
+    permissions.set_mode(0o700);
+    fs::set_permissions(&path, permissions).unwrap();
+    path
+}
+
+/// A stop/reconcile-only fake whose `container list --all` echoes whatever VM
+/// names are listed (one per line) in `present_file`, while removal commands are
+/// no-ops that never clear it. The agent VM therefore never probes absent and VM
+/// cleanup fails after the bounded retries — the fixture for proving teardown of
+/// a still-present VM preserves the PF anchor. `network list` reports nothing
+/// (absent); the `pf-helper` steps are plain no-ops so their *presence* in the
+/// args log is what a test checks.
+pub(super) fn write_fake_vm_present_tool(
+    dir: &Path,
+    args_log: &Path,
+    present_file: &Path,
+) -> PathBuf {
+    let path = dir.join("fake-vm-present-tool");
+    let script = format!(
+        "#!/bin/sh\n\
+             printf '%s\\n' \"$*\" >> {args_log}\n\
+             if [ \"$1\" = \"list\" ] && [ \"$2\" = \"--all\" ]; then\n\
+             cat {present_file} 2>/dev/null || true\n\
+             fi\n\
+             exit 0\n",
+        args_log = shell_quote(args_log),
+        present_file = shell_quote(present_file),
+    );
+    fs::write(&path, script).unwrap();
+    let mut permissions = fs::metadata(&path).unwrap().permissions();
+    permissions.set_mode(0o700);
+    fs::set_permissions(&path, permissions).unwrap();
+    path
+}
+
 pub(super) fn write_fake_workspace_failure_tool(
     dir: &Path,
     args_log: &Path,

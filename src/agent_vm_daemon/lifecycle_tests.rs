@@ -992,8 +992,251 @@ async fn daemon_reconcile_preserves_state_record_when_cleanup_fails() {
     let remaining = state_store.load_all().unwrap();
     assert_eq!(remaining.len(), 1);
     assert_eq!(remaining[0].session_id(), session_id);
+    // Broker authority is revoked independently of infrastructure teardown: the
+    // audit row is closed before teardown, so a broker (VM) that outlived the
+    // previous daemon cannot keep minting while this failed cleanup is retried.
     let recorded = audit.get_session(session_id).unwrap().unwrap();
-    assert!(recorded.closed_at.is_none());
+    assert!(recorded.closed_at.is_some());
+}
+
+/// Boot reconcile of a session whose agent VM cannot be proven absent (its
+/// removals never take): the PF anchor — the sole isolation of a possibly-live
+/// guest from host services — MUST be preserved, and broker authority MUST be
+/// revoked regardless of the failed teardown.
+#[tokio::test]
+async fn daemon_reconcile_preserves_firewall_and_revokes_authority_when_vm_absence_unproven() {
+    let dir = tempfile::tempdir().unwrap();
+    let args_log = dir.path().join("args.log");
+    let present_file = dir.path().join("present-vms");
+    let fake_tool = write_fake_vm_present_tool(dir.path(), &args_log, &present_file);
+    let (config, state_store) = daemon_config(dir.path(), &fake_tool);
+    occupy_subnet(&state_store, 252);
+    let session_id = state_store.load_all().unwrap().pop().unwrap().session_id();
+    // Make the agent VM probe as still-present for this session: `container list`
+    // keeps reporting it and the removals never clear the file, so VM cleanup
+    // cannot prove absence.
+    fs::write(&present_file, format!("writ-agent-vm-{session_id}\n")).unwrap();
+    let audit = Arc::new(AuditLog::open_in_memory().unwrap());
+    audit
+        .open_session(&SessionRecord {
+            session_id,
+            label: None,
+            agent_kind: Some(AgentKind::Claude),
+            agent_model: None,
+            opened_at: UnixMillis::from_millis(1_700_000_000),
+            closed_at: None,
+        })
+        .unwrap();
+    let daemon = AgentVmDaemon::new(config);
+
+    let report = daemon.reconcile_persisted_sessions(&audit).await.unwrap();
+
+    assert!(report.cleaned().is_empty());
+    assert_eq!(report.failed().len(), 1);
+    assert_eq!(report.failed()[0].stage(), AgentVmReconcileStage::Cleanup);
+
+    // Problem A — the PF anchor (and the shared network) MUST NOT be removed while
+    // the agent VM cannot be proven absent.
+    let args = fs::read_to_string(&args_log).unwrap();
+    assert!(
+        !args
+            .lines()
+            .any(|line| line.split_whitespace().nth(1) == Some("remove")),
+        "the PF anchor must be preserved until the VM is proven absent; args:\n{args}"
+    );
+    assert!(
+        !args.contains("network rm") && !args.contains("network delete"),
+        "the shared network must not be removed under a possibly-live VM; args:\n{args}"
+    );
+
+    // Problem B — broker authority is revoked independently of teardown.
+    assert!(
+        audit
+            .get_session(session_id)
+            .unwrap()
+            .unwrap()
+            .closed_at
+            .is_some()
+    );
+
+    // The state record is kept so the next boot retries the teardown.
+    let remaining = state_store.load_all().unwrap();
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0].session_id(), session_id);
+}
+
+/// The stop path's managed-session classification: a present record is managed, a
+/// genuinely absent one is not, and any *other* load failure (here a corrupt
+/// record) is propagated rather than silently classified as "unmanaged" — which
+/// could otherwise let a stop skip authority revocation yet report success.
+#[tokio::test]
+async fn agent_vm_session_is_managed_classifies_load_outcomes() {
+    let dir = tempfile::tempdir().unwrap();
+    let args_log = dir.path().join("args.log");
+    let env_path_log = dir.path().join("env-path.log");
+    let env_log = dir.path().join("env.log");
+    let fake_tool = write_fake_tool(dir.path(), &args_log, &env_path_log, &env_log);
+    let (config, state_store) = daemon_config(dir.path(), &fake_tool);
+    let daemon = AgentVmDaemon::new(config);
+
+    // Absent record → not a managed agent-VM session (an ordinary broker session).
+    assert!(
+        !daemon
+            .agent_vm_session_is_managed(SessionId::new())
+            .await
+            .unwrap()
+    );
+
+    // Present record → managed.
+    occupy_subnet(&state_store, 252);
+    let session_id = state_store.load_all().unwrap().pop().unwrap().session_id();
+    assert!(
+        daemon
+            .agent_vm_session_is_managed(session_id)
+            .await
+            .unwrap()
+    );
+
+    // Corrupt record → propagated as an error, NOT collapsed to "unmanaged".
+    std::fs::write(state_store.path_for(session_id), b"{ not valid json").unwrap();
+    let err = daemon
+        .agent_vm_session_is_managed(session_id)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            AgentVmDaemonError::Manager(AgentVmSessionManagerError::State(_))
+        ),
+        "a corrupt state record must be propagated, got {err:?}"
+    );
+}
+
+/// A boot reconcile whose audit-close itself fails (e.g. the audit DB is
+/// unwritable) must STILL attempt infrastructure teardown — otherwise a surviving
+/// broker VM is left both running and (once the audit DB is writable again)
+/// authorised. Teardown and authority revocation are independent: neither is
+/// skipped because the other failed.
+#[tokio::test]
+async fn daemon_reconcile_still_tears_down_when_audit_close_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let args_log = dir.path().join("args.log");
+    let env_path_log = dir.path().join("env-path.log");
+    let env_log = dir.path().join("env.log");
+    // The agent VM and network probe absent, so teardown succeeds if it runs.
+    let fake_tool = write_fake_tool(dir.path(), &args_log, &env_path_log, &env_log);
+    let (config, state_store) = daemon_config(dir.path(), &fake_tool);
+    occupy_subnet(&state_store, 252);
+    let session_id = state_store.load_all().unwrap().pop().unwrap().session_id();
+    let audit_path = dir.path().join("audit.db");
+    let audit = Arc::new(AuditLog::open(&audit_path).unwrap());
+    audit
+        .open_session(&SessionRecord {
+            session_id,
+            label: None,
+            agent_kind: Some(AgentKind::Claude),
+            agent_model: None,
+            opened_at: UnixMillis::from_millis(1_700_000_000),
+            closed_at: None,
+        })
+        .unwrap();
+    // Break `close_session` deterministically: drop the `session` table out from
+    // under the audit log via a second connection, so its UPDATE errors.
+    {
+        let conn = rusqlite::Connection::open(&audit_path).unwrap();
+        conn.execute("DROP TABLE session", []).unwrap();
+    }
+    let daemon = AgentVmDaemon::new(config);
+
+    let report = daemon.reconcile_persisted_sessions(&audit).await.unwrap();
+
+    // Teardown was attempted despite the audit-close failure: the VM presence
+    // probe ran. (On the buggy close-first ordering, the early return on the close
+    // failure would skip teardown entirely and this log would be empty.)
+    let args = fs::read_to_string(&args_log).unwrap_or_default();
+    assert!(
+        args.contains("list --all"),
+        "teardown must run even when audit close fails; args:\n{args}"
+    );
+    // A failure is still reported (so `writd` refuses to start) and the record is
+    // kept for retry.
+    assert_eq!(report.failed().len(), 1);
+    assert_eq!(
+        report.failed()[0].stage(),
+        AgentVmReconcileStage::AuditClose
+    );
+    let remaining = state_store.load_all().unwrap();
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0].session_id(), session_id);
+}
+
+/// A stop whose infrastructure teardown fails (the `pf-helper remove` step exits
+/// non-zero) must still revoke broker authority — the audit session is closed up
+/// front, so a possibly-live guest is left de-authorised rather than authorised —
+/// while keeping the state record for retry. The in-process broker is left
+/// attached (its graceful drain is deferred until teardown disconnects the guest),
+/// so the session stays observable and retryable.
+#[tokio::test]
+async fn daemon_stop_revokes_authority_when_teardown_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let args_log = dir.path().join("args.log");
+    let env_path_log = dir.path().join("env-path.log");
+    let env_log = dir.path().join("env.log");
+    let fake_tool = write_fake_stop_firewall_remove_failure_tool(
+        dir.path(),
+        &args_log,
+        &env_path_log,
+        &env_log,
+    );
+    let (config, state_store) = daemon_config(dir.path(), &fake_tool);
+    let daemon = AgentVmDaemon::new(config);
+    let state = make_state();
+
+    let started = daemon
+        .start_session(
+            Arc::clone(&state),
+            None,
+            None,
+            None,
+            None,
+            vec!["sleep".into(), "600".into()],
+        )
+        .await
+        .unwrap();
+    let session_id = started.session_id();
+
+    let err = daemon.stop_session(&state, session_id).await.unwrap_err();
+    assert!(
+        matches!(
+            err,
+            AgentVmDaemonError::Manager(AgentVmSessionManagerError::Stop(_))
+        ),
+        "a firewall-removal failure surfaces as a Stop cleanup error, got {err:?}"
+    );
+
+    // Authority is revoked even though teardown failed: the audit session is closed
+    // up front, so the broker refuses to mint regardless of the still-running VM.
+    assert!(
+        state
+            .audit
+            .get_session(session_id)
+            .unwrap()
+            .unwrap()
+            .closed_at
+            .is_some()
+    );
+    // The in-process broker's graceful drain is deferred until teardown disconnects
+    // the guest, so on a failed teardown it is left attached (de-authorised) and
+    // retryable rather than blocking or being force-dropped mid-connection.
+    assert!(
+        daemon.list_sessions().await.unwrap()[0].runtime_attached,
+        "a failed stop leaves the de-authorised broker attached for retry"
+    );
+
+    // The state record is kept so a later stop / boot reconcile retries teardown.
+    let remaining = state_store.load_all().unwrap();
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0].session_id(), session_id);
 }
 
 #[tokio::test]

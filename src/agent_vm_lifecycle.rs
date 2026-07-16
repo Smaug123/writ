@@ -2187,23 +2187,32 @@ fn cleanup_managed_agent_vm_session_unlocked(
     // Capture the container tool before `to_stop_plan` consumes `tools`; the vm
     // placement broker teardown needs it after the agent VM is stopped.
     let container = tools.container().to_path_buf();
-    let mut errors = match stop_agent_vm_session(&state.to_stop_plan(tools)) {
+    let agent_result = stop_agent_vm_session(&state.to_stop_plan(tools));
+    // A clean agent teardown means the agent VM was proven absent (and its
+    // firewall/network cleanup succeeded) — the precondition for removing the shared
+    // internal network the broker arm owns. A conservative proxy: if any agent-side
+    // step errored we preserve the shared network, fail closed, and let a later
+    // retry remove it once the agent VM is provably gone.
+    let agent_vm_absent = agent_result.is_ok();
+    let mut errors = match agent_result {
         Ok(()) => Vec::new(),
         Err(agent) => agent.into_errors(),
     };
     // For vm placement the broker arm owns a dedicated broker VM plus the shared
-    // network the agent only joined; tear them down *after* the agent VM is gone
-    // (so removing the shared network is safe). Idempotent + absence-based like the
-    // agent VM/network cleanup, so lagging Apple Container removals and
-    // already-absent resources on retry don't fail the stop. Failures are
-    // collected alongside the agent ones. All names derive from session identity,
-    // so no launch plan is needed. (The per-session host material dir — copied
-    // secrets included — is removed by the daemon, which owns that path policy.)
+    // network the agent only joined; tear them down *after* the agent VM is gone.
+    // Idempotent + absence-based like the agent VM/network cleanup, so lagging Apple
+    // Container removals and already-absent resources on retry don't fail the stop.
+    // The shared-network step is gated on `agent_vm_absent` so a possibly-live agent
+    // is never stranded off its network prematurely. Failures are collected
+    // alongside the agent ones. All names derive from session identity, so no launch
+    // plan is needed. (The per-session host material dir — copied secrets included —
+    // is removed by the daemon, which owns that path policy.)
     if state.broker_placement() == BrokerPlacement::Vm
         && let Err(broker) = run_broker_vm_cleanup_until_absent(
             &container,
             state.session_id(),
             state.names().network(),
+            agent_vm_absent,
         )
     {
         errors.extend(broker.into_errors());
@@ -2342,12 +2351,32 @@ fn single_cleanup_result(result: Result<(), ProcessInvocationError>) -> Result<(
 }
 
 fn run_stop_plan_cleanup(plan: &AgentVmSessionStopPlan) -> Result<(), CleanupErrors> {
-    let mut errors = Vec::new();
-    if let Err(err) = run_vm_cleanup_until_absent(plan) {
-        errors.push(err);
-    }
-    errors.extend(firewall_then_network_cleanup_errors(plan));
+    let errors = stop_plan_cleanup_errors(run_vm_cleanup_until_absent(plan), || {
+        firewall_then_network_cleanup_errors(plan)
+    });
     finish_cleanup_errors(errors)
+}
+
+/// Sequence the stop-plan teardown so the host PF anchor outlives the agent VM.
+///
+/// The PF anchor is the *only* thing isolating the (untrusted) agent VM from host
+/// services: an `--internal` network blocks internet egress but not host
+/// reachability, so a live guest with no anchor can reach arbitrary host
+/// services. The firewall — and, in host placement, the shared network — is
+/// therefore removed **only once the agent VM is proven absent** from the
+/// container list. If absence cannot be proven (the VM still lists, or the
+/// presence probe itself errored), the anchor is preserved and only the
+/// VM-cleanup error is surfaced; the removal is retried by a later idempotent
+/// stop/reconcile once the VM is gone. Fail closed: never widen a possibly-live
+/// guest's reach to the host by dropping its firewall before the VM it isolates.
+fn stop_plan_cleanup_errors(
+    vm_cleanup: Result<(), ProcessInvocationError>,
+    remove_firewall_then_network: impl FnOnce() -> Vec<ProcessInvocationError>,
+) -> Vec<ProcessInvocationError> {
+    match vm_cleanup {
+        Ok(()) => remove_firewall_then_network(),
+        Err(vm) => vec![vm],
+    }
 }
 
 fn firewall_then_network_cleanup_errors(
@@ -2393,13 +2422,19 @@ fn run_vm_cleanup_until_absent(
 /// network, then the shared internal network — is removed and probed out of the
 /// container / network list, so a removal that lags after the command returns and
 /// a resource already absent on a retry both resolve to success rather than a
-/// fatal error. The shared internal network is removed last and only after the
-/// agent VM has been torn down (the caller's responsibility). Failures across the
-/// three are collected. All names derive from session identity (no launch plan).
+/// fatal error. The shared internal network is removed last, and only when
+/// `remove_shared_network` — set by the caller once the agent VM (which also joins
+/// that network) is proven absent. While the agent VM cannot be proven gone the
+/// shared network is preserved, mirroring the agent-side fail-closed rule in
+/// [`stop_plan_cleanup_errors`]: never drop a network a possibly-live agent still
+/// sits on. The broker VM and its egress network are always removed (killing the
+/// broker VM revokes its authority source). Failures are collected. All names
+/// derive from session identity (no launch plan).
 fn run_broker_vm_cleanup_until_absent(
     container_tool: &Path,
     session_id: SessionId,
     internal_network: &str,
+    remove_shared_network: bool,
 ) -> Result<(), CleanupErrors> {
     let names = BrokerVmNames::for_session(session_id);
     let list_containers = || {
@@ -2440,8 +2475,17 @@ fn run_broker_vm_cleanup_until_absent(
         ),
     ];
     let removals = broker_vm_removal_invocations(container_tool, &names, internal_network);
+    // The shared internal network is the last (probe, removal) pair; drop it from
+    // the sequence when the agent VM is not proven absent, preserving the network a
+    // possibly-live agent still sits on. The broker VM + egress network pairs always
+    // run.
+    let step_count = if remove_shared_network {
+        probes.len()
+    } else {
+        probes.len() - 1
+    };
     let mut errors = Vec::new();
-    for ((probe, still_present), removal) in probes.into_iter().zip(removals) {
+    for ((probe, still_present), removal) in probes.into_iter().zip(removals).take(step_count) {
         if let Err(err) = run_cleanup_until_resource_absent(&probe, vec![removal], still_present) {
             errors.push(err);
         }

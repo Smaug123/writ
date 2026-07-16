@@ -103,6 +103,89 @@ fn cleanup_absence_loop_reports_still_present_after_bounded_retries() {
 }
 
 #[test]
+fn stop_cleanup_removes_firewall_and_network_once_vm_absent() {
+    let mut removed = false;
+    let errors = stop_plan_cleanup_errors(Ok(()), || {
+        removed = true;
+        Vec::new()
+    });
+    assert!(
+        removed,
+        "the firewall (and network) removal must run once the agent VM is proven absent"
+    );
+    assert!(errors.is_empty());
+}
+
+#[test]
+fn stop_cleanup_preserves_firewall_when_vm_absence_unproven() {
+    // The agent VM could not be proven absent (still lists after removal attempts):
+    // the PF anchor is the only thing isolating a possibly-live guest from host
+    // services, so it MUST NOT be dropped. The removal closure must not run.
+    let vm_err = ProcessInvocation::new("container", ["list", "--all", "--quiet"])
+        .resource_still_present("VM still appears in container list after removal attempts");
+    let mut removed = false;
+    let errors = stop_plan_cleanup_errors(Err(vm_err), || {
+        removed = true;
+        Vec::new()
+    });
+    assert!(
+        !removed,
+        "the PF anchor (and network) must be preserved until the VM is proven absent"
+    );
+    assert_eq!(
+        errors.len(),
+        1,
+        "the VM-cleanup error is surfaced so the stop is retried"
+    );
+    assert!(matches!(
+        errors[0],
+        ProcessInvocationError::ResourceStillPresent { .. }
+    ));
+}
+
+#[test]
+fn stop_cleanup_surfaces_firewall_errors_after_vm_removed() {
+    // Once the VM is gone the anchor removal runs; its errors still propagate.
+    let fw_err = ProcessInvocation::new("/tmp/writ-missing-pf-helper", ["remove"])
+        .run()
+        .unwrap_err();
+    let errors = stop_plan_cleanup_errors(Ok(()), || vec![fw_err]);
+    assert_eq!(errors.len(), 1);
+    assert!(matches!(errors[0], ProcessInvocationError::Run { .. }));
+}
+
+#[test]
+fn broker_vm_cleanup_preserves_shared_network_until_agent_absent() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let args_log = dir.path().join("args.log");
+    let tool = dir.path().join("fake-container");
+    // `network list` reports the shared network present; `list --all` (broker VM)
+    // reports absent. So the broker VM and egress steps resolve fast; only the
+    // shared-network step would ever issue a `network rm` for the shared net.
+    let script = format!(
+        "#!/bin/sh\n\
+         printf '%s\\n' \"$*\" >> '{log}'\n\
+         if [ \"$1\" = network ] && [ \"$2\" = list ]; then printf '%s\\n' writ-shared-net; fi\n\
+         exit 0\n",
+        log = args_log.display(),
+    );
+    std::fs::write(&tool, script).unwrap();
+    std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    // Agent VM not proven absent (`remove_shared_network = false`): the shared
+    // network the agent also joins must be preserved, so no `network rm` for it.
+    run_broker_vm_cleanup_until_absent(&tool, session_id(), "writ-shared-net", false).unwrap();
+
+    let args = std::fs::read_to_string(&args_log).unwrap();
+    assert!(
+        !args.contains("network rm"),
+        "the shared internal network must be preserved while the agent VM is \
+         unproven-absent; args:\n{args}"
+    );
+}
+
+#[test]
 fn resource_still_present_error_names_cleanup_postcondition() {
     let err = ProcessInvocation::new("container", ["list", "--quiet"])
         .resource_still_present("VM still appears in container list");
