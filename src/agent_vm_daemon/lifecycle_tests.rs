@@ -1065,6 +1065,53 @@ async fn daemon_reconcile_preserves_firewall_and_revokes_authority_when_vm_absen
     assert_eq!(remaining[0].session_id(), session_id);
 }
 
+/// The stop path's managed-session classification: a present record is managed, a
+/// genuinely absent one is not, and any *other* load failure (here a corrupt
+/// record) is propagated rather than silently classified as "unmanaged" — which
+/// could otherwise let a stop skip authority revocation yet report success.
+#[tokio::test]
+async fn agent_vm_session_is_managed_classifies_load_outcomes() {
+    let dir = tempfile::tempdir().unwrap();
+    let args_log = dir.path().join("args.log");
+    let env_path_log = dir.path().join("env-path.log");
+    let env_log = dir.path().join("env.log");
+    let fake_tool = write_fake_tool(dir.path(), &args_log, &env_path_log, &env_log);
+    let (config, state_store) = daemon_config(dir.path(), &fake_tool);
+    let daemon = AgentVmDaemon::new(config);
+
+    // Absent record → not a managed agent-VM session (an ordinary broker session).
+    assert!(
+        !daemon
+            .agent_vm_session_is_managed(SessionId::new())
+            .await
+            .unwrap()
+    );
+
+    // Present record → managed.
+    occupy_subnet(&state_store, 252);
+    let session_id = state_store.load_all().unwrap().pop().unwrap().session_id();
+    assert!(
+        daemon
+            .agent_vm_session_is_managed(session_id)
+            .await
+            .unwrap()
+    );
+
+    // Corrupt record → propagated as an error, NOT collapsed to "unmanaged".
+    std::fs::write(state_store.path_for(session_id), b"{ not valid json").unwrap();
+    let err = daemon
+        .agent_vm_session_is_managed(session_id)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            AgentVmDaemonError::Manager(AgentVmSessionManagerError::State(_))
+        ),
+        "a corrupt state record must be propagated, got {err:?}"
+    );
+}
+
 /// A boot reconcile whose audit-close itself fails (e.g. the audit DB is
 /// unwritable) must STILL attempt infrastructure teardown — otherwise a surviving
 /// broker VM is left both running and (once the audit DB is writable again)
@@ -1124,9 +1171,11 @@ async fn daemon_reconcile_still_tears_down_when_audit_close_fails() {
 }
 
 /// A stop whose infrastructure teardown fails (the `pf-helper remove` step exits
-/// non-zero) must still revoke broker authority: close the audit session and shut
-/// down the in-process broker, leaving a possibly-live guest de-authorised rather
-/// than authorised, while keeping the state record for retry.
+/// non-zero) must still revoke broker authority — the audit session is closed up
+/// front, so a possibly-live guest is left de-authorised rather than authorised —
+/// while keeping the state record for retry. The in-process broker is left
+/// attached (its graceful drain is deferred until teardown disconnects the guest),
+/// so the session stays observable and retryable.
 #[tokio::test]
 async fn daemon_stop_revokes_authority_when_teardown_fails() {
     let dir = tempfile::tempdir().unwrap();
@@ -1165,8 +1214,8 @@ async fn daemon_stop_revokes_authority_when_teardown_fails() {
         "a firewall-removal failure surfaces as a Stop cleanup error, got {err:?}"
     );
 
-    // Authority is revoked even though teardown failed: audit session closed and
-    // the in-process broker shut down and dropped.
+    // Authority is revoked even though teardown failed: the audit session is closed
+    // up front, so the broker refuses to mint regardless of the still-running VM.
     assert!(
         state
             .audit
@@ -1176,13 +1225,12 @@ async fn daemon_stop_revokes_authority_when_teardown_fails() {
             .closed_at
             .is_some()
     );
+    // The in-process broker's graceful drain is deferred until teardown disconnects
+    // the guest, so on a failed teardown it is left attached (de-authorised) and
+    // retryable rather than blocking or being force-dropped mid-connection.
     assert!(
-        daemon.running.lock().await.is_empty(),
-        "the in-process broker must be shut down even when teardown fails"
-    );
-    assert!(
-        !daemon.list_sessions().await.unwrap()[0].runtime_attached,
-        "a de-authorised session must not report as runtime-attached"
+        daemon.list_sessions().await.unwrap()[0].runtime_attached,
+        "a failed stop leaves the de-authorised broker attached for retry"
     );
 
     // The state record is kept so a later stop / boot reconcile retries teardown.
