@@ -1330,6 +1330,17 @@ impl AgentVmDaemon {
         state: &Arc<BrokerState<S>>,
         session_id: SessionId,
     ) -> Result<(), AgentVmDaemonError> {
+        // Classify the session using the state store only (bounded — no container/PF
+        // commands): a genuinely absent record (`NotFound`) is an unrelated/ordinary
+        // broker session that was never an agent VM and must NOT have its audit row
+        // closed here. Any other load error is propagated (fail closed) rather than
+        // mis-classified as unmanaged — treating a transient failure as "not an agent
+        // VM" could let a later successful teardown remove the record and report a
+        // clean stop while the broker was never de-authorised. Done *before* the
+        // forwarder is drained so this fallible step, on error, leaves a still-live
+        // VM-broker session's log tail attached rather than orphaned.
+        let managed = self.agent_vm_session_is_managed(session_id).await?;
+
         // Drain+stop the broker log tail *before* cleanup — a successful stop
         // removes the per-session material dir that holds the log file (the
         // `spawn_remove_broker_material` step below), so a drain afterwards would
@@ -1340,15 +1351,6 @@ impl AgentVmDaemon {
         if let Some(forwarder) = forwarder {
             forwarder.drain_and_stop().await;
         }
-
-        // Classify the session using the state store only (bounded — no container/PF
-        // commands): a genuinely absent record (`NotFound`) is an unrelated/ordinary
-        // broker session that was never an agent VM and must NOT have its audit row
-        // closed here. Any other load error is propagated (fail closed) rather than
-        // mis-classified as unmanaged — treating a transient failure as "not an agent
-        // VM" could let a later successful teardown remove the record and report a
-        // clean stop while the broker was never de-authorised.
-        let managed = self.agent_vm_session_is_managed(session_id).await?;
 
         // For a managed session, revoke broker authority up front — before the
         // *unbounded* infrastructure teardown and independently of it — by closing
