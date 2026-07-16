@@ -1396,6 +1396,15 @@ impl AgentVmDaemon {
             None => Ok(()),
         };
 
+        // If the up-front close failed transiently (e.g. `SQLITE_BUSY` from the live
+        // broker VM), teardown has since removed that contender, so retry the
+        // idempotent close now rather than failing an otherwise-clean stop on a stale
+        // error.
+        let audit_close = match audit_close {
+            Ok(()) => Ok(()),
+            Err(_) => state.audit.close_session(session_id, UnixMillis::now()),
+        };
+
         // Surface any revocation failure before dropping the durable records, so the
         // state record — the sole reconciliation obligation — is kept for retry
         // rather than stranded.
@@ -1702,7 +1711,13 @@ impl AgentVmDaemon {
             }
             return Err(failure);
         }
-        if let Err(err) = audit_close {
+        // Teardown succeeded. If the up-front close failed transiently (e.g.
+        // `SQLITE_BUSY` from the broker VM that teardown has now removed), retry the
+        // idempotent close rather than failing an otherwise-clean reconcile — which
+        // would keep the state record and abort daemon startup until another boot.
+        if let Err(_stale) = audit_close
+            && let Err(err) = audit.close_session(session_id, UnixMillis::now())
+        {
             return Err((AgentVmReconcileStage::AuditClose, err.into()));
         }
 
