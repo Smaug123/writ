@@ -175,14 +175,15 @@ approve/reject/reconcile and agent-run/agent-VM orchestration.
 **Lives in.** `server.rs` (881 lines: transport, dispatch, connection handling)
 plus `server/staged_push.rs` (1772: the list/show/reject/approve/reconcile
 approval handlers) and `server/run_agent.rs` (569: the `RunAgent` handler and
-its VM-dispatch path); `server/` also holds the test submodules. `protocol.rs`
-(2296),
+its VM-dispatch path); `server/` also holds the test submodules. `protocol/`
+(`mod.rs` 2072 for the `ClientMessage`/`ServerMessage` DUs + `views.rs` 246 for
+the payload types they carry),
 `broker_session.rs`, `broker_protocol.rs`, `policy.rs`,
 `config/` (`mod.rs` ~2960 + `audit_dir.rs`), `bin/writd.rs`, `bin/writ.rs` (the
 operator CLI verbs).
 
-**Primitives.** Wire DUs `ClientMessage` (`protocol.rs:264`, tagged +
-`deny_unknown_fields`) and `ServerMessage` (`protocol.rs:530`, tagged, not
+**Primitives.** Wire DUs `ClientMessage` (`protocol/mod.rs:38`, tagged +
+`deny_unknown_fields`) and `ServerMessage` (`protocol/mod.rs:304`, tagged, not
 `deny_unknown_fields` since outbound); `Decision`/`AuthorizedMint`
 (`policy.rs:97,52`); config root `DaemonConfig` (`config/mod.rs`,
 `deny_unknown_fields`): `github_apps`, `policy`, `agent_vm?`, `secret_store`,
@@ -527,14 +528,14 @@ downstream consumers (bailiff) verify it.
 
 **Lives in.** The `writ-agent-run` crate (the run contract + process-runner,
 re-exported as `writ::agent_run`), plus `run_envelope.rs`, `run_verify.rs` and
-`SignedRunMetadata` in `protocol.rs`. `writ-agent-run`'s contract types are
+`SignedRunMetadata` in `protocol/views.rs`. `writ-agent-run`'s contract types are
 always compiled; its runner/hashing sit behind the crate's `vm-client` feature
 (and host-only `AgentPrompt::summary` behind `host`), so both the daemon and the
 guest share it. The `run_envelope`/`run_verify` host modules stay in `writ`.
 
 **Primitives.** `SignedRunEnvelope` + `OutputEnvelope`
 (`run_envelope.rs:111,68`); `SignedRunMetadata` with `canonical_bytes()`
-(`protocol.rs:185`); `AllowedSigners`/`verify_run_envelope`
+(`protocol/views.rs:178`); `AllowedSigners`/`verify_run_envelope`
 (`run_verify.rs:61,265`).
 
 **Guarantees & invariants.** The signature covers only

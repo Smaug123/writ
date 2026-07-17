@@ -295,8 +295,14 @@ single file exceeds what one reading can hold.
   seams: the `AgentVmSessionPlan` plan-builder impl (~478 lines) and the
   session-teardown/`run_*_cleanup_until_absent` machinery (~394 lines, with a
   dedicated `cleanup_tests.rs`).
-- **`protocol.rs`:** the staged-push view types + `RejectionReason` newtype are
-  a data-only cluster separable from the `ClientMessage`/`ServerMessage` DUs.
+- **`protocol.rs` (2296 → `protocol/mod.rs` 2072 + `views.rs` 246):** the
+  payload types the wire messages *carry* — the staged-push views, the
+  `SignedRunMetadata` envelope, `ReconcileOutcome`, and the `RejectionReason`
+  newtype with its bounded parse — moved to `protocol/views.rs`, re-exported so
+  `crate::protocol::…` call sites are unchanged. The `ClientMessage`/
+  `ServerMessage` DUs and the wire tests stay in `mod.rs`; views' doc-links to
+  the message enums became `[super::…]`, and the test module picked up the
+  handful of crate-type imports the payload move stranded.
 
 Rule of thumb learned from the config split: extract the chunks with no
 `#[serde(default = "…")]` coupling first — moving a struct away from its default
