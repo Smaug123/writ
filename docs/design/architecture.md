@@ -370,7 +370,8 @@ serves them through a substituter the guest trusts, keeping evaluation offline.
 **Lives in.** `vm_http/` (`mod.rs` [2832 lines], `claude_proxy.rs`,
 `openai_proxy.rs`, `git_clone.rs`, `git_push.rs`, `flake_provision.rs`,
 `nix_cache.rs` + `nix_cache/`, `agent_runs.rs`, `proxy_common.rs`) plus the
-Nix domain modules `nix_binary_cache.rs` (2749), `flake_lock.rs`,
+Nix domain modules `nix_binary_cache.rs` (1345, with its test suite in
+`nix_binary_cache/tests.rs`), `flake_lock.rs`,
 `flake_materialize.rs`, `flake_provision.rs`, `flake_provision_from_mirror.rs`.
 
 **Endpoint map** (dispatch `route_authenticated_vm_http_request`,
