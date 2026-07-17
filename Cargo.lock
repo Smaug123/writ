@@ -2962,10 +2962,25 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "wiremock",
+ "writ-agent-run",
  "writ-core",
  "writ-vm-git",
  "xz2",
  "zstd",
+]
+
+[[package]]
+name = "writ-agent-run"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+ "ring",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "uuid",
+ "writ-core",
 ]
 
 [[package]]

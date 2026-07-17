@@ -52,11 +52,12 @@ Everything below is a consequence of holding those two invariants at once.
 |---|---|---|
 | **`writ-core`** (`crates/writ-core/`) | Pure data core: request/decision/grant types, ids, capability sets, the PF/network model, SSHSIG signing types. No dependency on the rest of writ. | — |
 | **`writ-vm-git`** (`crates/writ-vm-git/`) | Host↔guest wire types for VM-mediated git (clone/push request shapes, object-id/branch parsing). | `writ-core` |
-| **`writ`** (root) | The imperative shell: the daemon, all host effects, and the guest client. Binaries `writd`, `writ`, `writ-vm`, `writ-agent-vm-runner`, `writ-agent-vm-pf-helper`. | `writ-core`, `writ-vm-git` |
+| **`writ-agent-run`** (`crates/writ-agent-run/`) | The managed-agent run contract (prompt/output/correlation-id types) plus the agent process-runner. Shared by host, guest, and bailiff; re-exported as `writ::agent_run`. | `writ-core` |
+| **`writ`** (root) | The imperative shell: the daemon, all host effects, and the guest client. Binaries `writd`, `writ`, `writ-vm`, `writ-agent-vm-runner`, `writ-agent-vm-pf-helper`. | `writ-core`, `writ-vm-git`, `writ-agent-run` |
 | **`bailiff`** (`crates/bailiff/`) | A plan-workflow product (submit → decide → review → implement) built *on top of* writ. | `writ` |
 
 Dependency direction is strict: `bailiff` → `writ` → {`writ-vm-git`,
-`writ-core`}. `writ` never depends on `bailiff`.
+`writ-agent-run`, `writ-core`}. `writ` never depends on `bailiff`.
 
 Almost all of the accretion lives inside the root `writ` crate, which is a flat
 list of ~40 modules gated by `#[cfg(feature = "host")]`. The subsystems in §4
@@ -504,9 +505,12 @@ curates `refs/notes/bailiff/v1/plans/*`).
 run (metadata + detached SSHSIG + framed output), stores it as a git note, and
 downstream consumers (bailiff) verify it.
 
-**Lives in.** `agent_run.rs`, `run_envelope.rs`, `run_verify.rs` (plus
-`SignedRunMetadata` in `protocol.rs`). `agent_run.rs` is *ungated* (shared
-host/guest), the rest are host.
+**Lives in.** The `writ-agent-run` crate (the run contract + process-runner,
+re-exported as `writ::agent_run`), plus `run_envelope.rs`, `run_verify.rs` and
+`SignedRunMetadata` in `protocol.rs`. `writ-agent-run`'s contract types are
+always compiled; its runner/hashing sit behind the crate's `vm-client` feature
+(and host-only `AgentPrompt::summary` behind `host`), so both the daemon and the
+guest share it. The `run_envelope`/`run_verify` host modules stay in `writ`.
 
 **Primitives.** `SignedRunEnvelope` + `OutputEnvelope`
 (`run_envelope.rs:111,68`); `SignedRunMetadata` with `canonical_bytes()`

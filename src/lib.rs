@@ -5,7 +5,7 @@
 //! See `docs/design/architecture.md` for the current-state architecture map
 //! (one section per subsystem, with pointers back into these modules).
 
-pub mod agent_run;
+pub use writ_agent_run as agent_run;
 #[cfg(feature = "host")]
 pub mod agent_vm_daemon;
 #[cfg(feature = "host")]

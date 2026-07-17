@@ -152,16 +152,33 @@ deleting the rest — a module split, not a one-shot delete. Folded into **Slice
 6** (git-pipeline extraction), where these boundaries move anyway; doing it there
 avoids a risky ~1.4k-line surgery bundled with unrelated work.
 
-### Slice 4 — extract the guest client into its own crate (`writ-vm-client`)
+### Slice 4a — relocate `agent_run` into a shared `writ-agent-run` crate (implemented)
+
+A prerequisite for 4b that the original sketch missed: `vm_client` imports the
+`agent_run` contract (prompt/output types + the agent process-runner), and a
+guest-client crate can't depend back on `writ`. `agent_run` is also used by ~20
+host modules and by bailiff, so it belongs in a *shared* crate, not the guest
+one (chosen over folding it into `writ-core`).
+
+Extracted `src/agent_run.rs` → `crates/writ-agent-run/` (deps: `writ-core` for
+`process_spawn`, `serde`, `uuid`, `ring`). The crate mirrors writ's `host` /
+`vm-client` feature names so the moved module's `#[cfg(...)]` attributes are
+unchanged; a `test-support` feature exposes the test-only `AgentPrompt::new` to
+downstream test crates (`writ` enables it as a dev-dependency). `writ` re-exports
+it via `pub use writ_agent_run as agent_run`, so all ~40 `crate::agent_run::…` /
+`writ::agent_run::…` call sites are unchanged. The crate's tests run in the
+workspace `cargo test` via feature unification (writ/host → writ-agent-run/host).
+
+### Slice 4b — extract the guest client into `writ-vm-client`
 
 **The machine-enforced-invariant slice.** "The guest surface must not link host
 deps" is currently upheld only by discipline plus the `writ-vm` binary's build
-flags. Move `vm_client.rs` (and its guest-only helpers) into a crate whose
-manifest depends only on `writ-vm-git`, `writ-core`, `reqwest`, `ring`,
-`base64`. After this, a host dependency creeping into the guest surface is a
-**compile error in the crate graph**, not a lint nobody runs. Depends on Slice 1
-having already severed the feature entanglement. Keep `writ::vm_client`
-re-exporting the crate so `writ-vm` and any host test references don't churn.
+flags. With `agent_run` now in `writ-agent-run` (4a), move `vm_client.rs` into a
+crate depending only on `writ-vm-git`, `writ-agent-run`, `writ-core`, `reqwest`,
+`ring`, `base64`. After this, a host dependency creeping into the guest surface
+is a **compile error in the crate graph**, not a lint nobody runs. Keep
+`writ::vm_client` re-exporting the crate so `writ-vm` and host test references
+don't churn.
 
 ### Slice 5 — extract the audit log into `writ-audit`
 
