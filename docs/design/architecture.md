@@ -482,7 +482,8 @@ was deleted; its one live export, the commit-trailer vocabulary
 ### 5.8 Git storage & transport
 
 **Purpose.** Four host-side components under the pipeline:
-- **`github_git_db.rs`** (2538) — a typed client for GitHub's Git Database API
+- **`github_git_db.rs`** (2146, with the `GitDataClient` request methods in
+  `github_git_db/client.rs`) — a typed client for GitHub's Git Database API
   (blobs/trees/commits/refs), used to re-create bundle commits object-by-object
   under the App identity so published commits land Verified.
 - **`notes_repo.rs`** (2060) — a shared bare-repo wrapper (used by both writ and
@@ -507,7 +508,7 @@ envelope — verification lives in callers** (`run_verify.rs`), not here.
 `vm_git_bundle`: size cap + path-containment re-checked post-run.
 `vm_git_mirror_cache`: atomic-rename publish, pin-protected + bounded eviction.
 
-**Invariants.** Commit-signature check (`github_git_db.rs:439`); bundle byte cap
+**Invariants.** Commit-signature check (`github_git_db/client.rs:228`); bundle byte cap
 + path containment enforced at plan time and re-canonicalised at runtime;
 `GitCommitSha::parse`/`MirrorCacheKey` sha256 slug are parse-don't-validate;
 cache eviction honours `max_entries` + `max_bytes` oldest-first and skips

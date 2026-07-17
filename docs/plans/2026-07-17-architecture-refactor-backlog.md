@@ -309,6 +309,14 @@ single file exceeds what one reading can hold.
   `ServerMessage` DUs and the wire tests stay in `mod.rs`; views' doc-links to
   the message enums became `[super::…]`, and the test module picked up the
   handful of crate-type imports the payload move stranded.
+- **`github_git_db.rs` (2538 → 2146):** the `GitDataClient` request methods
+  (blob/tree/commit creation, ref read/update — a 392-line inherent `impl`)
+  moved to `github_git_db/client.rs`. All seven methods are `pub`, so the
+  by-type inherent-impl move needed zero `pub(super)` bumps and zero call-site
+  changes; the struct, its timeout/error types, the domain types it returns, and
+  the wire DTOs stay in the parent, reached via `super`. (~1.6k of the original
+  lines are the inline test module — a candidate future test-file split, as with
+  `nix_binary_cache.rs`, `broker_vm.rs`, and `git_push_approve.rs`.)
 
 Rule of thumb learned from the config split: extract the chunks with no
 `#[serde(default = "…")]` coupling first — moving a struct away from its default
