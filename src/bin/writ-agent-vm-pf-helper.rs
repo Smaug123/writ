@@ -5,7 +5,7 @@
 //! network and broker-port ranges, then performs only scoped `pfctl` changes.
 
 use std::net::{Ipv4Addr, Ipv6Addr};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use clap::{Args, Parser, Subcommand};
 use writ::agent_vm_firewall::{
@@ -16,18 +16,17 @@ use writ::core::{
     AgentNetworkPool, BrokerPort, BrokerPortRange, BrokerPorts, Ipv4Cidr, Ipv6Cidr, SessionId,
 };
 
-/// Fixed, root-owned discovery tool for `--deny-guest-ipv6`. Deliberately not a
-/// CLI option: a caller-supplied executable would be arbitrary root code
-/// execution when this helper runs under sudo.
+// Fixed, root-owned paths for every executable this helper runs. Deliberately
+// not CLI/env options: a caller-supplied (or `PATH`-resolved) executable would
+// be arbitrary root code execution when the helper runs under sudo. The library
+// functions still take the path as a parameter so tests can inject a fake; only
+// this binary pins them.
+const SYSTEM_PFCTL: &str = "/sbin/pfctl";
 const SYSTEM_IFCONFIG: &str = "/sbin/ifconfig";
 
 #[derive(Parser)]
 #[command(name = "writ-agent-vm-pf-helper", about = "writ agent VM PF helper")]
 struct Cli {
-    /// Path to pfctl.
-    #[arg(long, default_value = "pfctl", env = "WRIT_PFCTL")]
-    pfctl: PathBuf,
-
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -164,7 +163,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 broker_host,
                 ipv6_deny_interfaces,
             )?;
-            install_session_firewall(&cli.pfctl, &install)?;
+            install_session_firewall(Path::new(SYSTEM_PFCTL), &install)?;
             println!("{}", install.ruleset().anchor().as_str());
         }
         Cmd::Remove(args) => {
@@ -175,7 +174,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 parsed.ipv4,
                 parsed.ipv6,
             )?;
-            remove_session_firewall(&cli.pfctl, &removal)?;
+            remove_session_firewall(Path::new(SYSTEM_PFCTL), &removal)?;
         }
     }
     Ok(())
