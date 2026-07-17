@@ -145,8 +145,9 @@ from the root crate as `writ::core` (`lib.rs:37`).
 `TtlSeconds` (≤ `GITHUB_INSTALLATION_TOKEN_MAX_SECONDS`=3600)
 (`core/decision.rs`); `CredentialGrant` (deliberately omits the token string,
 `core/grant.rs:10`); `CapabilitySet`; `Sha256Hex`; `NotesRef`;
-`SshKeyFingerprint`/`SshSignature`; and the entire Apple-container network model
-(`AgentNetwork`, `Ipv4Cidr`, `PfRuleset`, `render_pf`) in `core/agent_vm.rs`.
+`SshKeyFingerprint`/`SshSignature`; the entire Apple-container network model
+(`AgentNetwork`, `Ipv4Cidr`, `PfRuleset`, `render_pf`) in `core/agent_vm.rs`;
+and the `NetworkHealth` reachability enum (`core/network_health.rs`).
 
 **Guarantees.** `core` is pure — no IO. The only host-only surface is
 `process_spawn::spawn_async`, gated behind the crate's own `host` feature (which
