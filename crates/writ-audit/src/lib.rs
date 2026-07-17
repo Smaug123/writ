@@ -210,7 +210,7 @@ impl AuditLog {
         schema::migrate(conn)
     }
 
-    pub(super) fn with_conn<R>(
+    pub(crate) fn with_conn<R>(
         &self,
         f: impl FnOnce(&Connection) -> Result<R, AuditError>,
     ) -> Result<R, AuditError> {
@@ -218,7 +218,7 @@ impl AuditLog {
         f(&guard)
     }
 
-    pub(super) fn with_conn_mut<R>(
+    pub(crate) fn with_conn_mut<R>(
         &self,
         f: impl FnOnce(&mut Connection) -> Result<R, AuditError>,
     ) -> Result<R, AuditError> {

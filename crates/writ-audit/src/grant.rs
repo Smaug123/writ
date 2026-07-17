@@ -5,7 +5,7 @@ use rusqlite::{OptionalExtension, Row, params};
 use serde::{Deserialize, Serialize};
 
 use super::{AuditError, AuditLog};
-use crate::core::{
+use writ_core::core::{
     CapabilityRequest, CredentialGrant, GitHubGrantedScope, GitHubRequest, GrantedScope, Jti,
     MetadataAccess, PolicyDecision, RequestId, SessionId, UnixMillis,
 };
@@ -426,10 +426,10 @@ pub(super) fn grant_from_row(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::audit::test_support::{
+    use crate::test_support::{
         pre_mint, sample_repo, sample_request, sample_scope, sample_session,
     };
-    use crate::core::{
+    use writ_core::core::{
         GitHubAccess, GitHubGrantedScope, GitHubPermissions, GitHubRequest, MetadataAccess,
         RepoRef, TtlSeconds,
     };

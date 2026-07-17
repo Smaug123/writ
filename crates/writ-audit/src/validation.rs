@@ -3,7 +3,7 @@
 //! audit records into bind parameters.
 
 use super::AuditError;
-use crate::agent_run::AgentRunStreamSummary;
+use writ_agent_run::AgentRunStreamSummary;
 
 pub(super) fn u16_from_sql_status(value: i64) -> Result<u16, AuditError> {
     let status = u16::try_from(value)

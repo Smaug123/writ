@@ -1,7 +1,7 @@
 //! Shared test fixtures used by the audit submodules' inline tests.
 
 use super::{AuditError, AuditLog, PreMintRecord};
-use crate::core::{
+use writ_core::core::{
     AgentKind, CapabilityRequest, GitHubAccess, GitHubGrantedScope, GitHubPermissions,
     GitHubRequest, GrantedScope, MetadataAccess, PolicyDecision, RepoRef, RequestId, SessionId,
     SessionRecord, UnixMillis,

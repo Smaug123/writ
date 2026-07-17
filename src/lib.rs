@@ -13,7 +13,7 @@ pub mod agent_vm_firewall;
 #[cfg(feature = "host")]
 pub mod agent_vm_lifecycle;
 #[cfg(feature = "host")]
-pub mod audit;
+pub use writ_audit as audit;
 #[cfg(feature = "host")]
 pub(crate) use writ_core::bearer;
 #[cfg(feature = "host")]

@@ -248,10 +248,10 @@ fn now_unix_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::audit::AuditLog;
-    use crate::audit::test_support::{pre_mint, sample_request, sample_session};
-    use crate::core::{Jti, PolicyDecision, RequestId, SessionId, UnixMillis};
+    use crate::AuditLog;
+    use crate::test_support::{pre_mint, sample_request, sample_session};
     use tempfile::NamedTempFile;
+    use writ_core::core::{Jti, PolicyDecision, RequestId, SessionId, UnixMillis};
 
     #[test]
     fn fresh_open_is_at_current_schema_version() {

@@ -1,0 +1,31 @@
+[package]
+name = "writ-audit"
+version = "0.1.0"
+edition = "2024"
+
+# The append-only SQLite audit log: schema/migrations, the typed row DAOs, and
+# the two-phase write helpers. A self-contained subsystem so editing schema or
+# DAOs no longer recompiles the whole shell. The boot-time reconciler that
+# *drives* these DAOs stays in `writ` (it also needs the git pipeline).
+[dependencies]
+writ-core = { path = "../writ-core" }
+writ-agent-run = { path = "../writ-agent-run", features = ["host"] }
+writ-vm-git = { path = "../writ-vm-git" }
+rusqlite = { version = "0.38", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+time = { version = "0.3", features = ["serde", "formatting", "parsing", "macros"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+thiserror = "2"
+
+[features]
+# Exposes the `*_for_test` DAO read-back helpers (e.g. the proxy outcome/list
+# accessors, `UncertainAttempt::for_test`) to downstream test code. The root
+# crate enables this as a dev-dependency feature.
+test-support = []
+
+[dev-dependencies]
+proptest = "1"
+tempfile = "3"
+# test-support exposes the panicking `AgentPrompt::new` used in the DAO tests.
+writ-agent-run = { path = "../writ-agent-run", features = ["host", "test-support"] }

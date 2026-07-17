@@ -73,18 +73,18 @@ impl AuditLog {
         self.record_proxy_outcome::<ClaudeProxyAuditTable>(r)
     }
 
-    #[cfg(test)]
-    pub(crate) fn claude_proxy_outcome_for_test(
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn claude_proxy_outcome_for_test(
         &self,
-        request_id: crate::core::RequestId,
+        request_id: writ_core::core::RequestId,
     ) -> Result<Option<(u16, u64, Option<String>)>, AuditError> {
         self.proxy_outcome_for_test::<ClaudeProxyAuditTable>(request_id)
     }
 
-    #[cfg(test)]
-    pub(crate) fn list_claude_proxy_requests_for_session_for_test(
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn list_claude_proxy_requests_for_session_for_test(
         &self,
-        id: crate::core::SessionId,
+        id: writ_core::core::SessionId,
     ) -> Result<Vec<(ClaudeProxyAuditRoute, ClaudeProxyAuditDecision, Option<u16>)>, AuditError>
     {
         self.list_proxy_requests_for_session_for_test::<ClaudeProxyAuditTable>(id)
@@ -94,9 +94,9 @@ impl AuditLog {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::audit::test_support::sample_session;
-    use crate::core::{RequestId, UnixMillis};
+    use crate::test_support::sample_session;
     use rusqlite::params;
+    use writ_core::core::{RequestId, UnixMillis};
 
     #[test]
     fn claude_proxy_request_then_outcome_roundtrips() {

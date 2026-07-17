@@ -2033,7 +2033,7 @@ fn is_unique_constraint_violation(err: &crate::audit::AuditError) -> bool {
 /// same typed surface instead of leaking the raw SQL refusal.
 ///
 /// The matched literal is mirrored from
-/// `src/audit/migrations/0005_approve_attempt_state_machine.sql`.
+/// `crates/writ-audit/src/migrations/0005_approve_attempt_state_machine.sql`.
 fn is_active_approve_refusal(err: &crate::audit::AuditError) -> bool {
     const TRIGGER_MESSAGE: &str =
         "git push resolution refused: approve attempt is in-flight or quarantined";

@@ -54,12 +54,14 @@ Everything below is a consequence of holding those two invariants at once.
 | **`writ-vm-git`** (`crates/writ-vm-git/`) | Host↔guest wire types for VM-mediated git (clone/push request shapes, object-id/branch parsing). | `writ-core` |
 | **`writ-agent-run`** (`crates/writ-agent-run/`) | The managed-agent run contract (prompt/output/correlation-id types) plus the agent process-runner. Shared by host, guest, and bailiff; re-exported as `writ::agent_run`. | `writ-core` |
 | **`writ-vm-client`** (`crates/writ-vm-client/`) | The guest-side `writ-vm` command surface that runs inside the agent VM. Links no host-only dependency — enforced by the crate graph. Re-exported as `writ::vm_client` under the `vm-client` feature. | `writ-core`, `writ-vm-git`, `writ-agent-run` |
-| **`writ`** (root) | The imperative shell: the daemon and all host effects. Binaries `writd`, `writ`, `writ-vm`, `writ-agent-vm-runner`, `writ-agent-vm-pf-helper`. | `writ-core`, `writ-vm-git`, `writ-agent-run`, `writ-vm-client` (opt) |
+| **`writ-audit`** (`crates/writ-audit/`) | The append-only SQLite audit log: schema/migrations, the typed row DAOs, and two-phase write helpers. Re-exported as `writ::audit` under the `host` feature. | `writ-core`, `writ-agent-run`, `writ-vm-git` |
+| **`writ`** (root) | The imperative shell: the daemon and all host effects. Binaries `writd`, `writ`, `writ-vm`, `writ-agent-vm-runner`, `writ-agent-vm-pf-helper`. | `writ-core`, `writ-vm-git`, `writ-agent-run`, `writ-vm-client` (opt), `writ-audit` (opt) |
 | **`bailiff`** (`crates/bailiff/`) | A plan-workflow product (submit → decide → review → implement) built *on top of* writ. | `writ` |
 
 Dependency direction is strict: `bailiff` → `writ` → {`writ-vm-git`,
-`writ-agent-run`, `writ-vm-client`, `writ-core`}. `writ` never depends on
-`bailiff`; `writ-vm-client` (the guest surface) never depends on `writ`.
+`writ-agent-run`, `writ-vm-client`, `writ-audit`, `writ-core`}. `writ` never
+depends on `bailiff`; `writ-vm-client` (the guest surface) never depends on
+`writ`.
 
 Almost all of the accretion lives inside the root `writ` crate, which is a flat
 list of ~40 modules gated by `#[cfg(feature = "host")]`. The subsystems in §4
@@ -257,15 +259,19 @@ rotation are new since that doc.
 requests, grants/mint-failures, and every effect path (git-push, proxies,
 nix-cache, flake-provision, agent runs). Complete by construction (§4).
 
-**Lives in.** `audit/` (`mod.rs`, `schema.rs`, `migrations/`, `session.rs`,
-`grant.rs`, `git_push.rs` + `git_push/`, `agent_run.rs`, `proxy_table.rs`,
-`nix_cache.rs`, `flake_provision.rs`, …) and `boot_reconcile.rs`.
+**Lives in.** The `writ-audit` crate (`lib.rs`, `schema.rs`, `migrations/`,
+`session.rs`, `grant.rs`, `git_push.rs` + `git_push/`, `agent_run.rs`,
+`proxy_table.rs`, `nix_binary_cache`-audit `nix_cache.rs`, `flake_provision.rs`,
+…), re-exported as `writ::audit`. Its boot-time reconciler, `boot_reconcile.rs`,
+stays in `writ` — it *drives* the audit DAOs but also needs the git pipeline
+(`git_push_staging`), so it is an orchestrator, not audit storage.
 
-**Primitives.** `AuditLog { conn: Mutex<Connection> }` (`audit/mod.rs:142`);
-refuse-to-open errors `SchemaTooNew`/`SchemaHistoryMismatch`
-(`audit/mod.rs:119,135`); `Migration { version, name, sql }` + `MIGRATIONS`
-(`audit/schema.rs:38,57`); generic proxy row types (`proxy_table.rs`);
-git-push state enums (`audit/git_push.rs`); `ReconcileReport`
+**Primitives.** `AuditLog { conn: Mutex<Connection> }`
+(`writ-audit/src/lib.rs`); refuse-to-open errors
+`SchemaTooNew`/`SchemaHistoryMismatch` (same); `Migration { version, name, sql }`
++ `MIGRATIONS` (`writ-audit/src/schema.rs:38,57`); generic proxy row types
+(`proxy_table.rs`); git-push state enums (`writ-audit/src/git_push.rs`);
+`ReconcileReport`
 (`boot_reconcile.rs:55`).
 
 **Schema.** ~24 live tables across **7 migrations** (`audit/schema.rs`), versus

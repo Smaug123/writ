@@ -10,8 +10,8 @@
 //! modules pick it up through `use super::test_support::*`.
 
 use super::*;
-pub(super) use crate::audit::test_support::sample_session;
-use crate::core::RepoRef;
+pub(super) use crate::test_support::sample_session;
+use writ_core::core::RepoRef;
 
 pub(super) fn sample_git_repo() -> GitCloneRepo {
     GitCloneRepo::new(RepoRef {
