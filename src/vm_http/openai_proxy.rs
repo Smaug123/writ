@@ -12,7 +12,7 @@ use crate::audit::{
 };
 use crate::openai_chatgpt_auth::{
     CHATGPT_OAUTH_REFRESH_LEEWAY_SECONDS, CHATGPT_OAUTH_REFRESH_URL, ChatgptOauthAuthority,
-    ChatgptOauthAuthorityConfig, ChatgptOauthError, SystemClock,
+    ChatgptOauthAuthorityConfig, ChatgptOauthError, SystemClock, build_refresh_http_client,
 };
 use crate::secret::{SecretKey, SecretStore};
 use crate::server::BrokerState;
@@ -334,10 +334,7 @@ impl ProxyBackend for OpenAiBackend {
                 if let Some(existing) = slot.as_ref() {
                     return Ok(Some(Arc::clone(existing)));
                 }
-                let refresh_client = reqwest::Client::builder()
-                    .connect_timeout(config.timeout)
-                    .read_timeout(config.timeout)
-                    .build()?;
+                let refresh_client = build_refresh_http_client(config.timeout)?;
                 let authority_config = ChatgptOauthAuthorityConfig {
                     secret_key: config.auth_secret().clone(),
                     refresh_url: config.chatgpt_refresh_url().clone(),

@@ -382,6 +382,26 @@ pub struct ChatgptOauthAuthorityConfig {
     pub leeway_seconds: i64,
 }
 
+/// Build the HTTP client used for the ChatGPT OAuth refresh POST.
+///
+/// The refresh request carries the live `refresh_token` in its JSON body.
+/// HTTP 307/308 redirects preserve the method *and* body, so a refresh
+/// endpoint (compromised or merely misconfigured) that answered the POST with
+/// such a redirect could hand that credential to an arbitrary origin. We
+/// therefore refuse to follow redirects: a 3xx comes back as a non-success
+/// status and is surfaced as a (transient) refresh failure, never chased to
+/// its `Location`. This constructor is the single place that property is
+/// enforced, so both the daemon and the tests exercise the same client.
+pub(crate) fn build_refresh_http_client(
+    timeout: std::time::Duration,
+) -> Result<reqwest::Client, reqwest::Error> {
+    reqwest::Client::builder()
+        .connect_timeout(timeout)
+        .read_timeout(timeout)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+}
+
 /// Source of "now". Production uses [`SystemClock`]; tests use a fake.
 pub trait ChatgptOauthClock: Send + Sync {
     fn now_unix_seconds(&self) -> i64;
