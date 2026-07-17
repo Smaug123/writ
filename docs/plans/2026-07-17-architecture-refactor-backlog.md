@@ -330,8 +330,14 @@ single file exceeds what one reading can hold.
   its length was the ~1.4k-line inline `#[cfg(test)] mod tests`. Relocated that
   module verbatim to `nix_binary_cache/tests.rs` (a file submodule; `use
   super::*` still resolves), leaving a 1345-line single-concern production file.
-  The 41 tests run unchanged in their new location. This is the template for the
-  other test-dominated single-concern files (e.g. `git_push_approve.rs`).
+  The 41 tests run unchanged in their new location.
+- **`git_push_approve.rs` (2387 → 898):** same template — its production half is
+  the approve-preparation logic (`PreparedApprove`/`StagingRepo` bring-up and
+  verify), and the length was the ~1.5k-line inline test module. Relocated to
+  `git_push_approve/tests.rs`. One wrinkle the compiler caught: an
+  `include_str!("../tests/fixtures/…")` had to become `../../tests/fixtures/…`
+  because the test file sits one directory deeper than the original — the
+  standing gotcha for any `include_*!` when a module moves into a subdirectory.
 
 Rule of thumb learned from the config split: extract the chunks with no
 `#[serde(default = "…")]` coupling first — moving a struct away from its default
