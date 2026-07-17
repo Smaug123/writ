@@ -187,15 +187,31 @@ now `#[cfg(feature = "host")]` (its only guest user left with `vm_client`). The
 41 guest lib tests moved with the crate and run under the default `cargo test`
 (writ-vm-client is a workspace member).
 
-### Slice 5 — extract the audit log into `writ-audit`
+### Slice 5a — move `NetworkHealth` into `writ-core` (implemented)
 
-The cleanest remaining seam and the closest analogue to the existing
-`writ-core` extraction: `src/audit/` + `src/boot_reconcile.rs` are a
-self-contained SQLite subsystem with a narrow interface (open/migrate, the
-typed row DAOs, the two-phase write helpers, reconcile). Depends on `writ-core`
-for the id/`UnixMillis` types. Re-export as `writ::audit` to keep call sites
-stable. Buys compile isolation: editing schema/DAOs stops recompiling the whole
-shell.
+A prerequisite the sketch missed: `src/audit/` references two root-crate
+modules — `agent_vm_lifecycle::NetworkHealth` (the audit network-health row) and
+(via `boot_reconcile.rs`) `git_push_staging`. The first is resolved here; the
+second by leaving `boot_reconcile.rs` in `writ` (it is an *orchestrator* that
+uses the audit DAOs + the git pipeline, not audit storage — see 5b).
+
+`NetworkHealth` is a pure, wire-facing state enum (its own doc says it is
+surfaced in `writ agent-vm list` and stored in the audit log), used by the
+daemon, CLI, protocol, and audit. Moved the enum to a new
+`crates/writ-core/src/core/network_health.rs`; the host
+`agent_vm_lifecycle::network_health` module (the debounced tracker that
+*produces* it) re-exports it via `pub use crate::core::NetworkHealth`, so every
+`agent_vm_lifecycle::NetworkHealth` consumer is unchanged. Three files touched.
+
+### Slice 5b — extract the audit log into `writ-audit`
+
+`src/audit/` is a self-contained SQLite subsystem (open/migrate, the typed row
+DAOs, the two-phase write helpers). With `NetworkHealth` in `writ-core` (5a),
+its only cross-crate deps are `writ-core`, `writ-agent-run`, and `writ-vm-git`.
+Extract it to `crates/writ-audit/`, re-exported as `writ::audit` to keep call
+sites stable. **Not** part of the crate: `boot_reconcile.rs` stays in `writ`
+(it depends on `git_push_staging`, a Slice-6 module). Buys compile isolation:
+editing schema/DAOs stops recompiling the whole shell.
 
 ### Slice 6 — extract the git pipeline into `writ-git`
 

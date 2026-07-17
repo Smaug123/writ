@@ -5,6 +5,7 @@ mod agent_vm;
 mod capability_set;
 mod decision;
 mod grant;
+mod network_health;
 mod notes_ref;
 mod request;
 mod session;
@@ -23,6 +24,7 @@ pub use decision::{
     MetadataAccess, PolicyDecision, TtlError, TtlSeconds,
 };
 pub use grant::CredentialGrant;
+pub use network_health::NetworkHealth;
 pub use notes_ref::{NotesRef, NotesRefError};
 pub use request::{CapabilityRequest, GitHubRequest};
 pub use session::{AgentKind, SessionRecord};

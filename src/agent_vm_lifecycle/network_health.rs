@@ -17,39 +17,15 @@
 
 use std::net::Ipv4Addr;
 
-use serde::{Deserialize, Serialize};
-
 /// Consecutive [`ProbeObservation::Unreachable`] observations required before a
 /// session is declared [`NetworkHealth::Unreachable`]. Absorbs a transient blip
 /// or a guest reboot window (at the daemon's probe interval).
 pub const NETWORK_HEALTH_FAILURE_THRESHOLD: u32 = 3;
 
-/// Whether a session's broker path is currently reachable, as observed from the
-/// host. Wire-facing: surfaced in `writ agent-vm list` and stored (as the
-/// from/to of a transition) in the audit log.
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum NetworkHealth {
-    Reachable,
-    Unreachable,
-    Unknown,
-}
-
-impl NetworkHealth {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Reachable => "reachable",
-            Self::Unreachable => "unreachable",
-            Self::Unknown => "unknown",
-        }
-    }
-
-    /// Serde default so a record (or wire message) that predates the field
-    /// deserialises as `Unknown` rather than failing.
-    pub fn unknown() -> Self {
-        Self::Unknown
-    }
-}
+// The wire/data type lives in writ-core (shared by the daemon, CLI, protocol,
+// and audit log); this module owns the host-side debounced tracker that
+// produces it. Re-exported so `agent_vm_lifecycle::NetworkHealth` is unchanged.
+pub use crate::core::NetworkHealth;
 
 /// A single host-side observation. `Indeterminate` means the snapshot itself
 /// could not be taken (e.g. `getifaddrs` failed) — it is explicitly *not*
