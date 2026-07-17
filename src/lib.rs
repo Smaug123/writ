@@ -58,8 +58,6 @@ pub mod git_push_approve;
 #[cfg(feature = "host")]
 pub mod git_push_promote;
 #[cfg(feature = "host")]
-pub mod git_push_replay;
-#[cfg(feature = "host")]
 pub(crate) mod git_push_replay_object_parse;
 #[cfg(feature = "host")]
 pub mod git_push_replay_object_source;
@@ -67,6 +65,8 @@ pub mod git_push_replay_object_source;
 pub mod git_push_replay_walker;
 #[cfg(feature = "host")]
 pub mod git_push_staging;
+#[cfg(feature = "host")]
+pub mod git_push_trailers;
 #[cfg(feature = "host")]
 pub mod github;
 #[cfg(feature = "host")]

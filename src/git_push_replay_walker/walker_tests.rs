@@ -4,7 +4,7 @@
 use super::test_fixture::InMemoryGitObjectSource;
 use super::test_support::*;
 use super::*;
-use crate::git_push_replay::TrailerKey;
+use crate::git_push_trailers::TrailerKey;
 use serde_json::json;
 use wiremock::MockServer;
 

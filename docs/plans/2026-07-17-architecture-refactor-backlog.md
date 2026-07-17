@@ -220,23 +220,34 @@ were `#[cfg(test)]` and don't cross crates → moved behind a `test-support`
 feature (`writ` enables it as a dev-dependency), matching the 4a pattern. Buys
 compile isolation: editing schema/DAOs stops recompiling the whole shell.
 
-### Slice 6 — extract the git pipeline into `writ-git`
+### Slice 6 — git-pipeline hygiene (no crate)
 
-`git_push_{staging,approve,promote,replay,replay_object_parse,
-replay_object_source,replay_walker}.rs`, `clean_git.rs`, `github_git_db.rs`, and
-the shared `notes_repo.rs` + `vm_git_bundle.rs` + `vm_git_mirror_cache.rs`.
-Larger and with more inbound edges (server, vm_http, bailiff via `notes_repo`),
-so do it after Slices 4–5 prove the extraction pattern. Rename the
-accretion-order modules to domain names *inside* the new crate in the same pass
-(e.g. `git_push_replay_object_source` → `objects::cat_file_source`,
-`git_push_replay_object_parse` → `objects::parse`,
-`git_push_replay_walker` → `replay::walker`). **Absorbs the re-scoped Slice 3
-item**: `git_push_replay.rs` is now dead except for the `TrailerSource` family,
-so extract those into `git_push_trailers` (updating the three importers) and
-delete the vestigial `GitPushReplayPlan` / `ReplayTarget` / `ingest_bundle` /
-`prepare_staging_repo` cluster and its tests. Note `notes_repo` is shared with
-`bailiff`; if the coupling is awkward, split it into a small `writ-git-notes`
-that both depend on rather than forcing `bailiff` to pull the whole pipeline.
+**Decision: do *not* extract a `writ-git` crate.** Investigation showed the git
+pipeline is not a clean crate boundary the way audit/agent-run/vm-client were.
+Its outbound couplings: the shared `signing` subsystem (`WritSigningKey`, also
+used by run-provenance `run_verify`, and needing the `SecretStore`);
+`git_commit_sign` ↔ `github_git_db` mutual entanglement; and `crash_point` /
+`process_supervisor` shared with the shell. (The `github` *minting* coupling was
+only a doc comment — the pipeline doesn't mint.) A `writ-git` crate would need
+3–4 prerequisite relocations first and still depend on many crates, diluting the
+compile-isolation payoff — a boundary whose cost exceeds its benefit per the
+boundary framework. The four *clean* crate boundaries the reviewer named
+(agent-run, guest-client, audit, + pre-existing core/vm-git) are all extracted.
+
+Instead, do the low-risk internal hygiene that improves local reasoning without
+paying for a bad boundary:
+
+**Done — the re-scoped Slice 3 item.** `git_push_replay.rs` was dead except for
+the commit-trailer vocabulary. Extracted `TrailerSource`/`TrailerKey`/
+`TrailerValue` (+ their tests) into `git_push_trailers.rs`, re-pathed the four
+importers, and deleted the vestigial `GitPushReplayPlan`/`ReplayTarget`/
+`ingest_bundle`/`prepare_staging_repo` cluster and its tests — net −1.5k lines.
+
+**Remaining hygiene (optional, module-level):** rename the accretion-order
+modules to domain names (`git_push_replay_object_source` → e.g.
+`git_push_objects_cat_file`, `git_push_replay_object_parse` →
+`git_push_object_parse`, `git_push_replay_walker` → `git_push_walker`) so the
+names encode layering, not commit order. Pure renames, compiler-checked.
 
 ### Slice 7 — extract the VM sandbox into `writ-vm-host`
 

@@ -41,10 +41,10 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::core::RepoRef;
-use crate::git_push_replay::TrailerSource;
 use crate::git_push_replay_walker::{
     FastForwardPlan, GitObjectSource, ReplayError, replay_commits,
 };
+use crate::git_push_trailers::TrailerSource;
 use crate::github_git_db::{GitDataClient, GitDataError};
 use crate::signing::WritSigningKey;
 use crate::vm_git::{GitBranchName, GitObjectId};

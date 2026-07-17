@@ -45,11 +45,11 @@ use crate::git_push_promote::{
     CommitError, ExecuteError, ExecuteOutcome, PreparedPromotion, PromoteRuntimeConfig,
     commit_prepared_promotion, prepare_fast_forward_plan,
 };
-use crate::git_push_replay::TrailerSource;
 use crate::git_push_replay_object_source::{CatFileObjectSource, OpenError};
 use crate::git_push_replay_walker::{
     FastForwardPlanError, REV_LIST_STDOUT_BYTE_CAP, plan_fast_forward_via_rev_list,
 };
+use crate::git_push_trailers::TrailerSource;
 use crate::github_git_db::{GitDataClient, GitDataTimeouts};
 use crate::signing::WritSigningKey;
 use crate::vm_git::{GitBranchName, GitCloneRepo, GitObjectId};
@@ -102,8 +102,7 @@ pub enum RunApproveError {
     /// `commit` — typically an annotated tag, tree, or blob. A hostile
     /// VM that stages a tag-SHA tip would have its tag peeled by
     /// `rev-list` and the wrong commit would be replayed; this gate
-    /// (mirroring `git_push_replay::ingest_bundle`'s post-unbundle
-    /// `cat-file -t == commit` invariant) prevents that.
+    /// (a post-unbundle `cat-file -t == commit` invariant) prevents that.
     #[error("bundle tip {sha} is not a commit object (actual type: {actual_type})")]
     BundleTipNotACommit { sha: String, actual_type: String },
     #[error("fast-forward planning against the staging repo failed: {0}")]
@@ -341,8 +340,8 @@ pub async fn prepare_approve_with_staging_repo(
     trailers: &[TrailerSource],
     attempt_id: ApproveAttemptId,
 ) -> Result<PreparedApprove, RunApproveError> {
-    // Mirror `git_push_replay::ingest_bundle`'s commit-type gate. The
-    // bundle has been unbundled into the staging repo by this point;
+    // Enforce the commit-type gate: the bundle has been unbundled into
+    // the staging repo by this point;
     // `cat-file -t <bundle_tip>` reports the object's *literal* type
     // (`commit` / `tag` / `tree` / `blob`) without peeling, so a
     // hostile VM that stages an annotated tag SHA as the bundle tip
@@ -816,8 +815,7 @@ pub(crate) fn build_fetch_prereq_invocation(
 /// -t` returns the object's literal type (no peeling), so an
 /// annotated-tag SHA shows up as `"tag"` rather than passing through
 /// as `"commit"` like `rev-parse --verify <sha>^{commit}` would.
-/// Mirrors the invariant
-/// [`crate::git_push_replay::ingest_bundle`] enforces post-unbundle.
+/// Enforces the post-unbundle commit-type invariant on the bundle tip.
 pub(crate) fn build_resolve_bundle_tip_invocation(
     runtime: &PromoteRuntimeConfig,
     staging_dir: &std::path::Path,
