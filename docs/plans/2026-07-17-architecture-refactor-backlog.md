@@ -272,14 +272,19 @@ single file exceeds what one reading can hold.
   lines; the large `AgentVm*` config block (structs + validators + their serde
   defaults) is the next candidate, though its `#[serde(default = "…")]` string
   paths make it more coupled than the audit-dir chunk.
-- **`server.rs` (started):** the staged-push approval subsystem — the
-  `list`/`show`/`reject`/`approve`/`reconcile` handlers plus their helpers, a
-  cohesive cluster reached through `dispatch_message` — moved to
-  `server/staged_push.rs` (1772 lines) as a `pub(super)` submodule; the five
-  dispatch arms delegate to it and its four dedicated test files gained explicit
-  `use super::staged_push::…` imports. `server.rs` is now ~1.4k lines. The
-  run-agent orchestration (`run_agent`/`run_agent_in_vm`, ~600 lines) is the
-  next candidate to lift out, leaving `server.rs` as pure transport + dispatch.
+- **`server.rs` (3188 → 881):** two cohesive subsystems, each reached only
+  through `dispatch_message`, lifted into `pub(super)` submodules:
+  - `server/staged_push.rs` (1772) — the `list`/`show`/`reject`/`approve`/
+    `reconcile` approval handlers. The five dispatch arms delegate; the four
+    dedicated test files gained explicit `use super::staged_push::…` imports.
+  - `server/run_agent.rs` (569) — the `RunAgent` handler and its VM-dispatch
+    path. Only `run_agent` is `pub(super)` (dispatch's single entry); the shared
+    output-capture helper `capture_stream_capped` + `MAX_RUN_AGENT_STREAM_BYTES`
+    stay at the module root because `agent_vm_daemon::materialize` also consumes
+    them via `crate::server::…`. `run_agent_tests` drives through
+    `dispatch_message`, so no test edits were needed.
+
+  `server.rs` is now pure transport, dispatch, and connection handling.
 - **`agent_vm_lifecycle.rs`, `protocol.rs`, `git_push_replay_walker.rs`**
   (trait + `ShaMap` + both planners + message rendering are four separable
   concerns in one 1485-line file).
