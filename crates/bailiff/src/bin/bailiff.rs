@@ -171,11 +171,10 @@ enum PlanCmd {
         reject: bool,
         /// Override the decider attribution recorded on the note.
         /// Defaults to `cli:$USER`; the verb fails if neither flag
-        /// nor `$USER` is set — unlike writ's legacy `plan decide`
-        /// (which falls back to `cli:unknown`), bailiff treats an
-        /// unattributable verdict as an operator-config bug rather
-        /// than silently degrading audit value. Slice G deletes
-        /// writ's legacy verb so the divergence is temporary.
+        /// nor `$USER` is set. bailiff treats an unattributable
+        /// verdict as an operator-config bug rather than silently
+        /// degrading audit value (writ's since-removed `plan decide`
+        /// verb used to fall back to `cli:unknown`).
         #[arg(long)]
         decider: Option<String>,
         /// Path to bailiff's bare git repo. Defaults to
@@ -1222,10 +1221,9 @@ fn resolve_decision_outcome(accept: bool, reject: bool) -> Decision {
 /// in this binary used to race on `$USER`. Callers in `main()` pass
 /// `std::env::var("USER").ok().filter(|s| !s.is_empty())`.
 ///
-/// Diverges from writ's legacy `plan decide`, which falls back to
-/// `cli:unknown` — see `PlanCmd::Decide`'s docstring for the
-/// reasoning. The fallback gap is small (writ's verb is going away in
-/// slice G) and the strictness is the bailiff-side default we want to
+/// Stricter than writ's since-removed `plan decide` verb, which fell
+/// back to `cli:unknown` — see `PlanCmd::Decide`'s docstring for the
+/// reasoning. The strictness is the bailiff-side default we want to
 /// keep.
 fn resolve_decider(
     flag: Option<String>,
@@ -1569,8 +1567,8 @@ mod tests {
 
     /// Without `--decider` and with `user_env = None`,
     /// `resolve_decider` fails with a user-actionable message
-    /// mentioning both fallback sources. Diverges from writ's legacy
-    /// `plan decide` (which falls back to `cli:unknown`); the
+    /// mentioning both fallback sources. Stricter than writ's removed
+    /// `plan decide` verb (which fell back to `cli:unknown`); the
     /// `PlanCmd::Decide` docstring explains why. Pin the failure
     /// shape so the divergence is intentional rather than a silent
     /// regression.

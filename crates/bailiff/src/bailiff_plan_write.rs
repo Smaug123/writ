@@ -54,8 +54,7 @@ use writ::writ_client::RunAgentCompleted;
 
 /// Refspec bailiff uses to mirror writ's `v1` notes namespace into
 /// its own repo. The leading `+` is load-bearing: writ may rewrite
-/// history under its own ref (e.g. when slice G strips the legacy
-/// `agent_plan` namespace), and bailiff is the local read mirror —
+/// history under its own ref, and bailiff is the local read mirror —
 /// accepting forced updates is correct because writ is the source of
 /// truth for its own namespace.
 pub(crate) const WRIT_V1_NOTES_REFSPEC: &str = "+refs/notes/writ/v1/*:refs/notes/writ/v1/*";

@@ -31,8 +31,8 @@
 //!
 //! The implementer prompt is `feature_prompt` + the
 //! `PLAN_PROMPT_SEPARATOR` string + the plan body bytes, joined
-//! inline (rather than wrapping into `agent_plan::PlanBody` first)
-//! to avoid re-wrapping bytes just to unwrap them again for signing.
+//! inline (rather than re-wrapping the bytes in a structured
+//! plan-body type first) to avoid unwrapping them again for signing.
 //!
 //! Reviewer feedback stays *out* of the composed prompt: per
 //! `docs/plans/2026-05-11-agent-plans.md` §"Implementer prompt
@@ -337,9 +337,9 @@ const PLAN_PROMPT_SEPARATOR: &str = "\n\n---\n\n# Approved plan\n\n";
 
 /// Compose the implementer's effective prompt from the operator's
 /// feature prompt and the approved plan body. Takes raw `&str` rather
-/// than `agent_plan::PlanBody` because the plan body has already been
-/// extracted from the signed planner envelope as bytes — re-wrapping
-/// it just to unwrap it again for signing would be churn.
+/// than a structured plan-body type because the plan body has already
+/// been extracted from the signed planner envelope as bytes —
+/// re-wrapping it just to unwrap it again for signing would be churn.
 fn compose_implementer_prompt_bytes(
     feature_prompt: &str,
     plan_body: &str,
