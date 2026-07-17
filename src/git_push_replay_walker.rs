@@ -1,7 +1,7 @@
 //! Per-commit GitHub upload walker for staged push replay.
 //!
-//! After [`crate::git_push_replay::prepare_staging_repo`] +
-//! [`crate::git_push_replay::ingest_bundle`], the staging repo holds
+//! After the approve path (`git_push_approve`) stands up the staging repo and
+//! unbundles the objects, the staging repo holds
 //! every git object the bundle declared, with the bundle's commits
 //! reachable from the bundle's new tip. This module walks a
 //! caller-supplied list of those commits in topological order and
@@ -88,7 +88,7 @@ use crate::clean_git::{
 };
 use crate::core::{RepoRef, SshSignature};
 use crate::git_commit_sign::{CommitSignError, CommitSigningInput, sign_commit_for_github};
-use crate::git_push_replay::TrailerSource;
+use crate::git_push_trailers::TrailerSource;
 use crate::github_git_db::{
     CommitIdentity, CommitRequest, GitDataClient, GitDataError, TreeEntry, TreeEntryKind,
 };
@@ -1335,7 +1335,7 @@ mod walker_tests;
 mod spec {
     use super::test_support::*;
     use super::*;
-    use crate::git_push_replay::{TrailerKey, TrailerValue};
+    use crate::git_push_trailers::{TrailerKey, TrailerValue};
     use proptest::prelude::*;
 
     /// Strategy for one well-formed [`TrailerSource`]. Keys and

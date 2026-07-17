@@ -415,10 +415,10 @@ identity via GitHub's Git Data API → move the ref. Nothing the guest claims
 (tip SHA, ancestry, object bytes) is trusted.
 
 **Lives in.** `git_push_staging.rs` (1503), `git_push_approve.rs` (2389),
-`git_push_promote.rs` (1782), `git_push_replay.rs` (1804),
-`git_push_replay_object_parse.rs` (2009), `git_push_replay_object_source.rs`,
-`git_push_replay_walker.rs` (1485) + `git_push_replay_walker/`, `clean_git.rs`
-(hardened git subprocess helpers).
+`git_push_promote.rs` (1782), `git_push_trailers.rs` (the commit-trailer
+vocabulary), `git_push_replay_object_parse.rs` (2009),
+`git_push_replay_object_source.rs`, `git_push_replay_walker.rs` (1485) +
+`git_push_replay_walker/`, `clean_git.rs` (hardened git subprocess helpers).
 
 **Stage flow.**
 1. **Stage** (`git_push_staging.rs:151`): the guest POST persists `bundle` +
@@ -459,11 +459,12 @@ timeout.
 authority; hardened subprocesses via `clean_git`; audit/mint rows are written by
 the caller (`server.rs`); `boot_reconcile` recovers stranded carriers.
 
-**Current-state note.** Entirely absent from `broker.md`. `git_push_replay.rs`
-carries a vestigial bring-up path (`GitPushReplayPlan`/`ingest_bundle`/
-`prepare_staging_repo`) constructed only by its own tests; the live approve
-path reimplements bring-up in `git_push_approve.rs::run_prepare_steps`. Two
-implementations coexist — flagged for deletion in the backlog.
+**Current-state note.** Entirely absent from `broker.md`. The former
+`git_push_replay.rs` held a vestigial staging-repo bring-up path
+(`GitPushReplayPlan`/`ingest_bundle`/`prepare_staging_repo`) constructed only by
+its own tests — a dead duplicate of the live `git_push_approve.rs` bring-up. It
+was deleted; its one live export, the commit-trailer vocabulary
+(`TrailerSource`/`TrailerKey`/`TrailerValue`), moved to `git_push_trailers.rs`.
 
 ### 5.8 Git storage & transport
 

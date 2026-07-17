@@ -3,7 +3,7 @@
 
 use super::test_support::*;
 use super::*;
-use crate::git_push_replay::{TrailerKey, TrailerValue};
+use crate::git_push_trailers::{TrailerKey, TrailerValue};
 
 #[test]
 fn render_message_returns_original_when_no_trailers() {
