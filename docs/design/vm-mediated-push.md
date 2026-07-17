@@ -1,5 +1,11 @@
 # VM-mediated Git push
 
+> **⚠ Historical design journal.** For the current push pipeline — the
+> stage → approve → promote → replay flow, how the broker re-derives the object
+> graph, and the byte/deadline bounds — see [`architecture.md`](./architecture.md)
+> §5.7. Retained here for the trust-boundary argument and ancestry-validation
+> reasoning that motivated the pipeline.
+
 Design for letting a managed agent VM ask the host broker to push Git changes
 without ever receiving a GitHub token.
 

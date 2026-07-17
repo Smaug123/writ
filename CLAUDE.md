@@ -7,8 +7,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 `writ` is a local capability broker for coding agents. `writd` is a daemon on a
 Unix socket; an agent asks it for one narrowly-scoped, short-lived credential
 per action (e.g. "push to `smaug123/writ`"), and every grant is recorded in an
-append-only SQLite audit log. See `docs/design/broker.md` for the canonical
-architecture, and `README.md` for the user-facing framing.
+append-only SQLite audit log. See `docs/design/architecture.md` for the
+canonical current-state architecture (one section per subsystem: guarantees,
+primitives, invariants), and `README.md` for the user-facing framing. The other
+`docs/design/` files are historical build journals, superseded by
+`architecture.md` wherever they describe layout or schema.
 
 ## Build, test, lint
 
@@ -89,7 +92,9 @@ the gates above is what catches feature-combination mistakes.
   command starts** — guest-side `writ-vm` commands are ergonomic wrappers, never
   the authority boundary. The broker independently re-validates every field
   (repo, branch, ancestry, object graph) before using host authority. See
-  `docs/design/apple-container-agent-vm.md` and `docs/design/vm-mediated-push.md`.
+  `docs/design/architecture.md` §5.5–5.7 for the current shape;
+  `docs/design/apple-container-agent-vm.md` and `docs/design/vm-mediated-push.md`
+  are the (historical) design journals behind it.
 - The `scripts/prove-*.sh` scripts are adversarial end-to-end proofs (no-egress,
   offline flake realisation, broker readiness) run on real hardware, not part of
   `cargo test`.
@@ -104,6 +109,7 @@ per-module `#[cfg(test)]` blocks); saved counterexamples live in
 `proptest-regressions/`. When fixing a bug, add the failing property/test first,
 watch it fail, then fix.
 
-Design docs live in `docs/design/`; dated implementation plans (decomposed into
-reviewable slices) live in `docs/plans/`. Known test flakes are documented in
-`docs/known-test-flakes.md` and `FLAKE.md`.
+The current-state architecture map is `docs/design/architecture.md` (start
+there); the other `docs/design/` files are historical build journals. Dated
+implementation plans (decomposed into reviewable slices) live in `docs/plans/`.
+Known test flakes are documented in `docs/known-test-flakes.md` and `FLAKE.md`.

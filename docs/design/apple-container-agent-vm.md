@@ -1,5 +1,13 @@
 # Apple container agent VM plan
 
+> **⚠ Historical design journal.** This is a slice-by-slice build log ("first X
+> implemented… then Y…"), not a description of the current sandbox. For what the
+> VM subsystem *is* today — lifecycle, firewall, broker-in-VM, and the VM HTTP /
+> Nix surfaces, with their guarantees and invariants — see
+> [`architecture.md`](./architecture.md) §5.5–5.6. This doc is retained for its
+> empirical isolation findings, PF strategy, no-egress proof spikes, and
+> Nix-in-VM reasoning; do not extend it slice-by-slice.
+
 Plan for running an LLM coding agent inside an Apple `container` VM, with a
 host broker as the only authority-bearing bridge to the outside world.
 

@@ -1,5 +1,14 @@
 # writ — design (v1)
 
+> **⚠ Historical design journal.** This records the *original v1 plan* and the
+> reasoning behind it, not the system as it stands. For the current
+> architecture — what exists, with each subsystem's guarantees, primitives, and
+> invariants — see [`architecture.md`](./architecture.md), which supersedes this
+> doc's "Directory layout" and audit schema (the real schema is ~24 tables
+> across 7 migrations, keyed off a `schema_version` table, not the 4 tables /
+> `PRAGMA user_version` sketched here). Retained for its capability-model and
+> audit rationale; do not extend it slice-by-slice.
+
 A capability broker for local agents.
 
 > **Scope note.** Agent-plan workflow (plan submission, reviewer

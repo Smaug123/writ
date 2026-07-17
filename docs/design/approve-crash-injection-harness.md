@@ -1,5 +1,10 @@
 # Deterministic crash-injection harness for the approve pipeline
 
+> **ℹ Test-design doc.** Unlike the other design docs, this one is *not*
+> superseded — it describes a testing approach (the fake GitHub, the fake
+> origin, the crash points) that is still current. For the pipeline it exercises,
+> see [`architecture.md`](./architecture.md) §5.7.
+
 Drafted 2026-07-12, following the round of reviews on the
 `unbounded-http-promotion` branch. Companion implementation plan:
 `docs/plans/2026-07-12-approve-crash-injection-harness.md`.
