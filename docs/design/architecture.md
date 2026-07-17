@@ -307,9 +307,10 @@ mounts and no NAT egress, so it can touch neither the host filesystem nor the
 network directly. A broker (the §5.6 HTTP surface) is the sole bridge for
 external effects, reachable only on a whitelisted broker port/IP.
 
-**Lives in.** `agent_vm_lifecycle.rs` (2879) + `agent_vm_lifecycle/` (the
-`parse`/`state_store`/`network_health`/`invocation` submodules — `invocation`
-holds the `ProcessInvocation` process-execution primitive),
+**Lives in.** `agent_vm_lifecycle.rs` (2405) + `agent_vm_lifecycle/` (the
+`parse`/`state_store`/`network_health`/`invocation`/`plan` submodules —
+`invocation` holds the `ProcessInvocation` execution primitive, `plan` the
+`AgentVmSessionPlan` start-step state machine + invocation builders),
 `agent_vm_daemon.rs` (2602) + `agent_vm_daemon/`, `agent_vm_firewall.rs`,
 `broker_vm.rs` (2636), `broker_vm_runner.rs`, `broker_entrypoint.rs`,
 `broker_session.rs`, `broker_log_forwarder.rs`, `process_supervisor.rs`,

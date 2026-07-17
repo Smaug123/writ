@@ -285,16 +285,22 @@ single file exceeds what one reading can hold.
     `dispatch_message`, so no test edits were needed.
 
   `server.rs` is now pure transport, dispatch, and connection handling.
-- **`agent_vm_lifecycle.rs` (3215 → 2879, started):** the largest root-crate
-  god-file. First cut lifted the `ProcessInvocation` process-execution primitive
-  — a 336-line inherent `impl` block — into `agent_vm_lifecycle/invocation.rs`.
-  Inherent-impl moves need no call-site changes (method resolution is by type),
-  so only three helper methods called on `ProcessInvocation` from sibling types
-  (`output`/`failed_from_output`/`resource_still_present`) needed `pub(super)`;
-  the rest stayed private and `invocation_tests` was untouched. Remaining clean
-  seams: the `AgentVmSessionPlan` plan-builder impl (~478 lines) and the
-  session-teardown/`run_*_cleanup_until_absent` machinery (~394 lines, with a
-  dedicated `cleanup_tests.rs`).
+- **`agent_vm_lifecycle.rs` (3215 → 2405, started):** the largest root-crate
+  god-file. Two inherent `impl` blocks lifted into submodules — inherent-impl
+  moves need no call-site changes (method resolution is by type), so only the
+  handful of private methods invoked from *outside* their impl needed
+  `pub(super)`:
+  - `invocation.rs` — the 336-line `ProcessInvocation` execution primitive.
+    Three helpers called on it from sibling types
+    (`output`/`failed_from_output`/`resource_still_present`) became `pub(super)`;
+    `invocation_tests` untouched.
+  - `plan.rs` — the 478-line `AgentVmSessionPlan` start-step/invocation builder.
+    Only `run_start_vm_invocation` (called from the `run_start_step` free
+    function) needed `pub(super)`; the twelve other private builders stayed
+    private.
+
+  Remaining clean seam: the session-teardown/`run_*_cleanup_until_absent`
+  machinery (~394 lines, with a dedicated `cleanup_tests.rs`).
 - **`protocol.rs` (2296 → `protocol/mod.rs` 2072 + `views.rs` 246):** the
   payload types the wire messages *carry* — the staged-push views, the
   `SignedRunMetadata` envelope, `ReconcileOutcome`, and the `RejectionReason`
