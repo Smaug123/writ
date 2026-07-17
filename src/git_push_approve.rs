@@ -355,10 +355,18 @@ pub async fn prepare_approve_with_staging_repo(
     )
     .await?;
 
+    // `step_timeout` becomes the source's per-object read deadline: the
+    // `git cat-file --batch` traversal reads a *local* object DB, so any
+    // single read that outlives the same ceiling the one-shot git steps
+    // run under has wedged. This is where the fix for the unbounded
+    // `read_object_raw` pipe awaits lives — per object, so the walker's
+    // GitHub uploads (bounded separately by `GitDataTimeouts`, and
+    // deliberately allowed to run slower) are never folded into it.
     let source = CatFileObjectSource::open(
         staging.path(),
         runtime.git_program(),
         STAGING_REPO_MAX_OBJECT_BYTES,
+        runtime.step_timeout(),
     )
     .await?;
 
@@ -371,6 +379,15 @@ pub async fn prepare_approve_with_staging_repo(
         token.as_str().to_string(),
     );
 
+    // The cat-file traversal below is bounded from *inside* the object
+    // source: each `read_object_raw` runs under the per-object
+    // `read_timeout` wired above, and a wedged read fails as
+    // `ExecuteError::Replay` — through this normal error return, so it
+    // still crosses the `prepare::objects_uploaded` crash boundary. The
+    // GitHub calls keep their own `GitDataTimeouts` budgets. Nothing
+    // here needs a whole-traversal deadline, which would wrongly fail a
+    // legitimate multi-object replay whose serial uploads outlast one
+    // step.
     let prepared = prepare_fast_forward_plan(
         &client,
         repo,
@@ -389,9 +406,23 @@ pub async fn prepare_approve_with_staging_repo(
 
     // `close()` reaps the `git cat-file --batch` child even on error
     // paths above; ignore its result because it only signals stderr
-    // chatter at this point, and the orchestrator's success/failure
-    // is fully captured by `prepared`.
-    let _ = source.close().await;
+    // chatter at this point, and the orchestrator's success/failure is
+    // fully captured by `prepared`. Unlike the per-object reads, `close`
+    // polls `waitid` for the leader's exit in a loop that never returns
+    // for a wedged child, so it needs its own external deadline. On
+    // elapse the dropped `close()` future runs its internal
+    // `PgidCleanupGuard`, which SIGKILLs the process group (see
+    // `cat_file_source_close_cancellation_kills_process_group`).
+    if tokio::time::timeout(runtime.step_timeout(), source.close())
+        .await
+        .is_err()
+    {
+        tracing::warn!(
+            step_timeout = ?runtime.step_timeout(),
+            "`git cat-file --batch` did not exit within the step timeout; \
+             SIGKILLed its process group via the cancellation guard",
+        );
+    }
 
     Ok(PreparedApprove {
         client,
@@ -1600,6 +1631,153 @@ mod tests {
         drop(prepared);
         // `MockServer`'s `expect` bounds are verified on drop; make the
         // failure legible if the PATCH did fire.
+        server.verify().await;
+    }
+
+    /// Locate an absolute `sleep`. The stall wrapper below runs under
+    /// `env_clear()` (both `CatFileObjectSource::open` and the
+    /// clean-git helpers wipe the environment), so it inherits no
+    /// `PATH` and cannot resolve `sleep` by name — embed the absolute
+    /// path. Mirrors the object-source module's own helper.
+    fn maybe_sleep() -> Option<PathBuf> {
+        let path = std::env::var_os("PATH")?;
+        for dir in std::env::split_paths(&path) {
+            let candidate = dir.join("sleep");
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+        None
+    }
+
+    /// Write a `git` wrapper that behaves like the real binary for every
+    /// invocation the approve pipeline makes (`cat-file -t`, `rev-list`)
+    /// *except* `cat-file --batch`, which it replaces with an unbounded
+    /// sleep. That is exactly the shape of a wedged object-traversal
+    /// child: it accepts the request SHA on stdin (the pipe buffers it)
+    /// but never writes a response, so `read_object_raw`'s `read_line`
+    /// would block forever. Returns the wrapper path.
+    fn write_stalling_cat_file_wrapper(dir: &Path, git: &Path, sleep: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let wrapper = dir.join("git-stall-batch.sh");
+        let script = format!(
+            "#!/bin/sh\n\
+             for arg in \"$@\"; do\n\
+             \tif [ \"$arg\" = \"--batch\" ]; then\n\
+             \t\texec {sleep} 600\n\
+             \tfi\n\
+             done\n\
+             exec {git} \"$@\"\n",
+            sleep = sleep.display(),
+            git = git.display(),
+        );
+        std::fs::write(&wrapper, script).expect("write cat-file stall wrapper");
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod wrapper");
+        wrapper
+    }
+
+    /// End-to-end wiring check for the cat-file read deadline: the
+    /// configured step timeout covered `rev-list` and the other one-shot
+    /// Git commands, but not the long-lived `git cat-file --batch`
+    /// traversal, whose `read_object_raw` pipe reads are unbounded. A
+    /// child that stalls mid-response parked the whole approve — attempt
+    /// row and operator approval still active — long after the CLI
+    /// disconnected. `open` now carries `step_timeout` as a per-object
+    /// read deadline, so a wedged read surfaces as a retryable
+    /// `ExecuteError::Replay` (a `ReadTimedOut` under the hood) instead
+    /// of hanging. (The per-object placement — verified directly in
+    /// `git_push_replay_object_source` — is what keeps a legitimate
+    /// multi-object upload from being folded into one step's budget.)
+    ///
+    /// The outer `tokio::time::timeout` is the anti-hang guard: with the
+    /// fix the inner per-read deadline (500 ms) fires first and the call
+    /// returns; without it the traversal blocks forever and the outer
+    /// guard elapses, failing the test instead of wedging CI.
+    #[tokio::test]
+    async fn prepare_approve_bounds_a_stalled_cat_file_traversal() {
+        let Some(git) = maybe_git() else {
+            eprintln!("skipping: `git` not on PATH");
+            return;
+        };
+        let Some(sleep) = maybe_sleep() else {
+            eprintln!("skipping: `sleep` not on PATH");
+            return;
+        };
+        let (tmp, staging_path, parent, child) = build_real_staging_repo();
+        let staging = StagingRepo::from_path_for_test(staging_path);
+        let wrapper = write_stalling_cat_file_wrapper(tmp.path(), &git, &sleep);
+
+        // A short step timeout keeps the test quick; the cat-file read
+        // below stalls forever, so any positive per-object deadline
+        // exercises the fix.
+        let deadline = Duration::from_millis(500);
+        let runtime = PromoteRuntimeConfig::new(
+            wrapper,
+            GitCloneBaseUrl::github(),
+            GitCredentialBoundary::new(
+                PathBuf::from("/usr/local/bin/fake-askpass"),
+                GitSecretEnvVar::new("WRIT_GIT_TOKEN").unwrap(),
+            )
+            .unwrap(),
+            tmp.path().to_path_buf(),
+            deadline,
+        )
+        .unwrap();
+
+        let server = MockServer::start().await;
+        // The Replay arm's pre-walk lease check must succeed so the walk
+        // reaches the (stalling) object read; the stall precedes any
+        // upload, so no object is ever POSTed and no ref is PATCHed.
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/name/git/ref/heads/main"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(ref_response_body("main", &parent)),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(20),
+            prepare_approve_with_staging_repo(
+                &staging,
+                &runtime,
+                &server.uri(),
+                &sample_token(),
+                &sample_repo().as_repo_ref().clone(),
+                &GitBranchName::new("main").unwrap(),
+                &parent,
+                &child,
+                &sample_signing_key(),
+                &[],
+                ApproveAttemptId::new(),
+            ),
+        )
+        .await
+        .expect("the per-object read deadline must return; a hang means the fix regressed");
+
+        // A wedged read surfaces as a retryable replay failure carrying
+        // the timeout diagnostic — not a hang, and not a whole-traversal
+        // timeout that would also have failed a slow-but-legitimate push.
+        match outcome {
+            Err(RunApproveError::Execute(ExecuteError::Replay(ref replay))) => assert!(
+                replay.to_string().contains("timed out"),
+                "expected a read-timeout replay error, got: {replay}"
+            ),
+            other => panic!("expected Execute(Replay(read timeout)), got {other:?}"),
+        }
+
+        // The stall is upstream of any upload; verify no POST/PATCH fired.
         server.verify().await;
     }
 
