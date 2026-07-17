@@ -429,7 +429,8 @@ time, **re-derives the object graph itself**: unbundle into an isolated repo →
 identity via GitHub's Git Data API → move the ref. Nothing the guest claims
 (tip SHA, ancestry, object bytes) is trusted.
 
-**Lives in.** `git_push_staging.rs` (1503), `git_push_approve.rs` (2389),
+**Lives in.** `git_push_staging.rs` (1503), `git_push_approve.rs` (898, with its
+test suite in `git_push_approve/tests.rs`),
 `git_push_promote.rs` (1782), `git_push_trailers.rs` (the commit-trailer
 vocabulary), `git_push_replay_object_parse.rs` (2009),
 `git_push_replay_object_source.rs`, `git_push_replay_walker.rs` (1485) +
