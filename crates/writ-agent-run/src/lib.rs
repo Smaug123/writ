@@ -152,7 +152,11 @@ impl AgentPrompt {
         Ok(Self(prompt))
     }
 
-    #[cfg(test)]
+    /// Test-only convenience constructor. Panics on an over-limit prompt, so it
+    /// is gated to test builds and the `test-support` feature (which downstream
+    /// test crates enable) rather than exposed as production API — production
+    /// code parses via [`AgentPrompt::try_new`].
+    #[cfg(any(test, feature = "test-support"))]
     pub fn new(prompt: impl Into<String>) -> Self {
         Self::try_new(prompt).expect("test prompt must be within the agent prompt limit")
     }
@@ -343,7 +347,7 @@ mod process_runner {
     use std::process::{Command, Stdio};
     use std::thread;
 
-    use crate::process_spawn;
+    use writ_core::process_spawn;
 
     use super::{
         AgentPrompt, AgentRunId, AgentRunOutcome, AgentRunStreamSummary, AgentRunTerminalStatus,

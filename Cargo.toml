@@ -4,11 +4,11 @@ version = "0.1.0"
 edition = "2024"
 
 [workspace]
-members = ["crates/writ-core", "crates/writ-vm-git", "crates/bailiff"]
+members = ["crates/writ-core", "crates/writ-vm-git", "crates/writ-agent-run", "crates/bailiff"]
 # Without this, root-level `cargo clippy/test/doc` (as run by CI) select only
 # the root `writ` package, silently skipping member crates' own test targets
 # and rustdoc. Keep every member in the default gate set.
-default-members = [".", "crates/writ-core", "crates/writ-vm-git", "crates/bailiff"]
+default-members = [".", "crates/writ-core", "crates/writ-vm-git", "crates/writ-agent-run", "crates/bailiff"]
 resolver = "3"
 
 [features]
@@ -19,6 +19,7 @@ default = ["host"]
 # wire types — so `--features host` no longer compiles `vm_client.rs`.
 host = [
     "writ-core/host",
+    "writ-agent-run/host",
     "dep:base64",
     "dep:bytes",
     "dep:futures-util",
@@ -38,7 +39,7 @@ host = [
     "dep:xz2",
     "dep:zstd",
 ]
-vm-client = ["dep:base64", "dep:reqwest", "dep:ring", "dep:writ-vm-git"]
+vm-client = ["writ-agent-run/vm-client", "dep:base64", "dep:reqwest", "dep:ring", "dep:writ-vm-git"]
 
 [[bin]]
 name = "writ"
@@ -67,6 +68,10 @@ required-features = ["host"]
 
 [dependencies]
 writ-core = { path = "crates/writ-core" }
+# Non-optional: `agent_run` is re-exported as `writ::agent_run` in all builds.
+# The runtime bits (runner, hashing) come from its host/vm-client features,
+# enabled above.
+writ-agent-run = { path = "crates/writ-agent-run" }
 writ-vm-git = { path = "crates/writ-vm-git", optional = true }
 clap = { version = "4", features = ["derive", "env"] }
 serde = { version = "1", features = ["derive"] }
@@ -101,3 +106,6 @@ proptest = "1"
 tempfile = "3"
 wiremock = "0.6"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "test-util"] }
+# `test-support` exposes `AgentPrompt::new` (a panicking test constructor) to
+# this crate's tests, which use it in ~30 places across modules.
+writ-agent-run = { path = "crates/writ-agent-run", features = ["test-support"] }
