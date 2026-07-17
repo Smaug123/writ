@@ -83,7 +83,9 @@ use std::ffi::OsString;
 use std::path::Path;
 use std::time::Duration;
 
-use crate::clean_git::{self, CleanGitError, CleanGitInvocation, clean_git_config_env};
+use crate::clean_git::{
+    self, CleanGitError, CleanGitInvocation, SMALL_STDOUT_CAP, clean_git_config_env,
+};
 use crate::core::{RepoRef, SshSignature};
 use crate::git_commit_sign::{CommitSignError, CommitSigningInput, sign_commit_for_github};
 use crate::git_push_replay::TrailerSource;
@@ -92,6 +94,22 @@ use crate::github_git_db::{
 };
 use crate::signing::WritSigningKey;
 use crate::vm_git::{GitObjectId, GitObjectIdError};
+
+/// Stdout byte cap for the `git rev-list --boundary` walk over a staged,
+/// guest-controlled bundle.
+///
+/// The output is one object id per line (~41 bytes for SHA-1, ~66 with the
+/// SHA-256 and boundary `-` prefix), and [`parse_rev_list_boundary_output`]
+/// allocates one [`GitObjectId`] per line, so the memory a walk consumes is
+/// proportional to this bound. 16 MiB admits on the order of a quarter-million
+/// commits — orders of magnitude more than any legitimate push replay, each of
+/// whose commits is uploaded to GitHub one REST call at a time — while capping
+/// the broker's stdout buffer plus parsed vectors at a few tens of MiB. A
+/// bundle that packs enough commits to exceed it is refused
+/// ([`FastForwardPlanError::RevListOutputTooLarge`] /
+/// [`BranchCreationPlanError::RevListOutputTooLarge`]) rather than allowed to
+/// drive broker memory unbounded.
+pub(crate) const REV_LIST_STDOUT_BYTE_CAP: usize = 16 * 1024 * 1024;
 
 /// One commit, as the walker needs to see it after parsing out of the
 /// staging repository's object database.
@@ -559,6 +577,20 @@ pub enum BranchCreationPlanError {
          (no `--depth`) — or `git fetch --unshallow` — before calling the planner"
     )]
     ShallowStagingRepo { staging_repo: String },
+    /// `git rev-list --boundary` wrote more than `cap` bytes of output before
+    /// the broker stopped draining it and killed the process group.
+    ///
+    /// The output is one object id per line, and the planner allocates one
+    /// object per line, so unbounded output means unbounded broker memory. A
+    /// guest-controlled bundle (up to the staged-push size limit) can pack a
+    /// pathological number of commits whose `rev-list` output would dwarf the
+    /// host's memory. Refusing the walk keeps a hostile bundle from OOM-killing
+    /// the broker mid-approval. `cap` is the byte bound that was exceeded.
+    #[error(
+        "`git rev-list --boundary` output exceeded the {cap}-byte cap; the bundle describes \
+         too many commits to replay and the walk was refused"
+    )]
+    RevListOutputTooLarge { cap: usize },
 }
 
 impl From<CleanGitError> for BranchCreationPlanError {
@@ -662,16 +694,27 @@ pub enum BranchCreationPlan {
 ///   `.git/shallow` file exists.
 /// * `git_program` is the resolved path to the host's `git` binary;
 ///   the same value the rest of the replay pipeline uses.
+/// * `stdout_byte_cap` bounds the `rev-list --boundary` output the broker will
+///   buffer and parse (one object per line). A guest-controlled bundle that
+///   describes enough commits to exceed it is refused with
+///   [`BranchCreationPlanError::RevListOutputTooLarge`] rather than allowed to
+///   drive broker memory unbounded; pass `REV_LIST_STDOUT_BYTE_CAP`.
 pub async fn plan_branch_creation_via_rev_list(
     bundle_tip: &GitObjectId,
     default_head: &GitObjectId,
     staging_repo: &Path,
     git_program: &Path,
     step_timeout: Duration,
+    stdout_byte_cap: usize,
 ) -> Result<BranchCreationPlan, BranchCreationPlanError> {
     let shallow_invocation = build_is_shallow_invocation(staging_repo, git_program);
-    let shallow_stdout =
-        clean_git::run_clean_git_capture_stdout(&shallow_invocation, step_timeout, None).await?;
+    let shallow_stdout = clean_git::run_clean_git_capture_stdout(
+        &shallow_invocation,
+        step_timeout,
+        SMALL_STDOUT_CAP,
+        None,
+    )
+    .await?;
     if parse_is_shallow_output(&shallow_stdout)? {
         return Err(BranchCreationPlanError::ShallowStagingRepo {
             staging_repo: staging_repo.display().to_string(),
@@ -680,7 +723,20 @@ pub async fn plan_branch_creation_via_rev_list(
 
     let invocation =
         build_rev_list_boundary_invocation(staging_repo, git_program, bundle_tip, default_head);
-    let stdout = clean_git::run_clean_git_capture_stdout(&invocation, step_timeout, None).await?;
+    let stdout = match clean_git::run_clean_git_capture_stdout(
+        &invocation,
+        step_timeout,
+        stdout_byte_cap,
+        None,
+    )
+    .await
+    {
+        Ok(stdout) => stdout,
+        Err(CleanGitError::StdoutCapExceeded { cap }) => {
+            return Err(BranchCreationPlanError::RevListOutputTooLarge { cap });
+        }
+        Err(err) => return Err(err.into()),
+    };
     let (commits, boundaries) = parse_rev_list_boundary_output(&stdout)?;
 
     if commits.is_empty() {
@@ -813,6 +869,18 @@ pub enum FastForwardPlanError {
          the planner"
     )]
     ShallowStagingRepo { staging_repo: String },
+    /// `git rev-list --boundary` wrote more than `cap` bytes before the broker
+    /// stopped draining it and killed the process group. Same failure mode as
+    /// [`BranchCreationPlanError::RevListOutputTooLarge`]: the output is one
+    /// object id per line and the planner allocates one object per line, so a
+    /// guest-controlled bundle that packs a pathological commit count could
+    /// otherwise drive broker memory unbounded. The walk is refused; `cap` is
+    /// the byte bound that was exceeded.
+    #[error(
+        "`git rev-list --boundary` output exceeded the {cap}-byte cap; the bundle describes \
+         too many commits to replay and the walk was refused"
+    )]
+    RevListOutputTooLarge { cap: usize },
 }
 
 impl From<CleanGitError> for FastForwardPlanError {
@@ -853,16 +921,27 @@ impl From<CleanGitError> for FastForwardPlanError {
 /// repo must contain both `bundle_tip` (from unbundling) and
 /// `expected_remote_head` (fetched by the orchestrator with full
 /// ancestry); the repo must not be shallow.
+///
+/// `stdout_byte_cap` bounds the `rev-list --boundary` output the same way
+/// [`plan_branch_creation_via_rev_list`] does: output past the cap is refused
+/// with [`FastForwardPlanError::RevListOutputTooLarge`] so a guest-controlled
+/// bundle cannot drive broker memory unbounded. Pass `REV_LIST_STDOUT_BYTE_CAP`.
 pub async fn plan_fast_forward_via_rev_list(
     bundle_tip: &GitObjectId,
     expected_remote_head: &GitObjectId,
     staging_repo: &Path,
     git_program: &Path,
     step_timeout: Duration,
+    stdout_byte_cap: usize,
 ) -> Result<FastForwardPlan, FastForwardPlanError> {
     let shallow_invocation = build_is_shallow_invocation(staging_repo, git_program);
-    let shallow_stdout =
-        clean_git::run_clean_git_capture_stdout(&shallow_invocation, step_timeout, None).await?;
+    let shallow_stdout = clean_git::run_clean_git_capture_stdout(
+        &shallow_invocation,
+        step_timeout,
+        SMALL_STDOUT_CAP,
+        None,
+    )
+    .await?;
     if parse_is_shallow_output(&shallow_stdout).map_err(branch_creation_to_fast_forward)? {
         return Err(FastForwardPlanError::ShallowStagingRepo {
             staging_repo: staging_repo.display().to_string(),
@@ -875,7 +954,20 @@ pub async fn plan_fast_forward_via_rev_list(
         bundle_tip,
         expected_remote_head,
     );
-    let stdout = clean_git::run_clean_git_capture_stdout(&invocation, step_timeout, None).await?;
+    let stdout = match clean_git::run_clean_git_capture_stdout(
+        &invocation,
+        step_timeout,
+        stdout_byte_cap,
+        None,
+    )
+    .await
+    {
+        Ok(stdout) => stdout,
+        Err(CleanGitError::StdoutCapExceeded { cap }) => {
+            return Err(FastForwardPlanError::RevListOutputTooLarge { cap });
+        }
+        Err(err) => return Err(err.into()),
+    };
     let (commits, boundaries) =
         parse_rev_list_boundary_output(&stdout).map_err(branch_creation_to_fast_forward)?;
 
@@ -945,6 +1037,9 @@ fn branch_creation_to_fast_forward(err: BranchCreationPlanError) -> FastForwardP
             expected_remote_head: default_head,
             bundle_tip,
         },
+        BranchCreationPlanError::RevListOutputTooLarge { cap } => {
+            FastForwardPlanError::RevListOutputTooLarge { cap }
+        }
     }
 }
 
@@ -1365,6 +1460,7 @@ mod spec {
                 &repo,
                 &git,
                 TEST_GIT_TIMEOUT,
+                REV_LIST_STDOUT_BYTE_CAP,
             ));
             match result {
                 Err(BranchCreationPlanError::DisjointHistory {

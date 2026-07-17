@@ -37,7 +37,9 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 
 use crate::audit::UncertainAttempt;
-use crate::clean_git::{self, CleanGitEnv, CleanGitInvocation, clean_git_config_env};
+use crate::clean_git::{
+    self, CleanGitEnv, CleanGitInvocation, SMALL_STDOUT_CAP, clean_git_config_env,
+};
 use crate::core::{ApproveAttemptId, RepoRef};
 use crate::git_push_promote::{
     CommitError, ExecuteError, ExecuteOutcome, PreparedPromotion, PromoteRuntimeConfig,
@@ -45,7 +47,9 @@ use crate::git_push_promote::{
 };
 use crate::git_push_replay::TrailerSource;
 use crate::git_push_replay_object_source::{CatFileObjectSource, OpenError};
-use crate::git_push_replay_walker::{FastForwardPlanError, plan_fast_forward_via_rev_list};
+use crate::git_push_replay_walker::{
+    FastForwardPlanError, REV_LIST_STDOUT_BYTE_CAP, plan_fast_forward_via_rev_list,
+};
 use crate::github_git_db::{GitDataClient, GitDataTimeouts};
 use crate::signing::WritSigningKey;
 use crate::vm_git::{GitBranchName, GitCloneRepo, GitObjectId};
@@ -352,6 +356,7 @@ pub async fn prepare_approve_with_staging_repo(
         staging.path(),
         runtime.git_program(),
         runtime.step_timeout(),
+        REV_LIST_STDOUT_BYTE_CAP,
     )
     .await?;
 
@@ -810,9 +815,14 @@ async fn verify_bundle_tip_is_commit(
     bundle_tip: &GitObjectId,
 ) -> Result<(), RunApproveError> {
     let invocation = build_resolve_bundle_tip_invocation(runtime, staging_dir, bundle_tip);
-    let stdout = clean_git::run_clean_git_capture_stdout(&invocation, runtime.step_timeout(), None)
-        .await
-        .map_err(|e| RunApproveError::ResolveBundleTip(e.to_string()))?;
+    let stdout = clean_git::run_clean_git_capture_stdout(
+        &invocation,
+        runtime.step_timeout(),
+        SMALL_STDOUT_CAP,
+        None,
+    )
+    .await
+    .map_err(|e| RunApproveError::ResolveBundleTip(e.to_string()))?;
     let text = std::str::from_utf8(&stdout).unwrap_or("<non-utf8>");
     let actual = text.trim_end();
     if actual == "commit" {

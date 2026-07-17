@@ -19,6 +19,8 @@
 use std::mem::MaybeUninit;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use tokio::process::Command;
@@ -40,10 +42,18 @@ const STDERR_CAPTURE_TAIL_CAP: usize = 8 * 1024;
 /// [`run_supervised`]); the supervisor manages stdout and stderr because those
 /// are the channels whose pipes it must drain to avoid a deadlock against a
 /// child that writes more than one pipe buffer's worth.
+///
+/// [`Capture`](StdoutMode::Capture) carries an explicit `byte_cap`: the drain
+/// retains at most that many bytes, and a child that writes more is rejected
+/// (the group is SIGKILLed and the run surfaces
+/// [`SupervisedOutcome::StdoutCapExceeded`]) instead of letting the host buffer
+/// unbounded output. Callers that process untrusted input (a guest-controlled
+/// git bundle whose `rev-list` output the broker parses one object per line)
+/// rely on this bound to keep a hostile input from OOM-killing the broker.
 #[derive(Copy, Clone)]
 pub(crate) enum StdoutMode {
     Discard,
-    Capture,
+    Capture { byte_cap: usize },
 }
 
 /// Whether the supervisor should capture the child's stderr or discard it.
@@ -76,6 +86,16 @@ pub(crate) enum SupervisedOutcome {
         stderr: Vec<u8>,
     },
     TimedOut,
+    /// The child wrote more than the [`StdoutMode::Capture`] `byte_cap` to
+    /// stdout, so the supervisor stopped draining and SIGKILLed the whole
+    /// group. `cap` is the exceeded bound. No stdout is returned: it is
+    /// deliberately discarded rather than surfaced truncated, because a caller
+    /// that parses the output (e.g. one object per `rev-list` line) must reject
+    /// the whole run, not act on a prefix. Only ever produced under
+    /// [`StdoutMode::Capture`]; a [`StdoutMode::Discard`] run cannot reach it.
+    StdoutCapExceeded {
+        cap: usize,
+    },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -120,9 +140,13 @@ pub(crate) async fn run_supervised(
     stdout_mode: StdoutMode,
     stderr_mode: StderrMode,
 ) -> Result<SupervisedOutcome, SupervisorError> {
+    let stdout_byte_cap = match stdout_mode {
+        StdoutMode::Discard => None,
+        StdoutMode::Capture { byte_cap } => Some(byte_cap),
+    };
     command.stdout(match stdout_mode {
         StdoutMode::Discard => Stdio::null(),
-        StdoutMode::Capture => Stdio::piped(),
+        StdoutMode::Capture { .. } => Stdio::piped(),
     });
     command.stderr(match stderr_mode {
         StderrMode::Discard => Stdio::null(),
@@ -135,25 +159,32 @@ pub(crate) async fn run_supervised(
         .map_err(SupervisorError::Spawn)?;
     let pid = child.id().ok_or(SupervisorError::MissingProcessId)?;
     let pgid = process_group_id(pid)?;
+    // Set by the stdout drain when the child exceeds `byte_cap`. It is a
+    // one-way, monotonic wake-up hint: the poll loop reads it each tick so it
+    // can break out promptly and SIGKILL the group instead of blocking on a
+    // child that has stalled writing into the now-unread pipe until the
+    // wall-clock timeout fires. The drain's return value stays authoritative —
+    // the `Exited` arm re-checks the flag after joining the drain to close the
+    // race where the child exits in the same tick the cap is crossed.
+    let stdout_capped = Arc::new(AtomicBool::new(false));
     // Drain stdout/stderr concurrently with the child's lifetime so a child
     // that writes more than one pipe buffer's worth before we reach `wait()`
     // cannot stall on a full pipe. A drain task only reaches EOF once every fd
     // pointing at the write end is closed — that includes any helper the tool
     // forked into the same process group, so we rely on the group SIGKILL
     // further down to close inherited pipes when the leader has exited.
-    let stdout_drain = match stdout_mode {
-        StdoutMode::Discard => None,
-        StdoutMode::Capture => {
-            let mut stdout = child
+    let stdout_drain = match stdout_byte_cap {
+        None => None,
+        Some(byte_cap) => {
+            let stdout = child
                 .stdout
                 .take()
                 .expect("stdout was configured as Stdio::piped()");
-            Some(tokio::spawn(async move {
-                use tokio::io::AsyncReadExt;
-                let mut buf = Vec::new();
-                let _ = stdout.read_to_end(&mut buf).await;
-                buf
-            }))
+            Some(tokio::spawn(bounded_stdout_drain(
+                stdout,
+                byte_cap,
+                Arc::clone(&stdout_capped),
+            )))
         }
     };
     let stderr_drain = match stderr_mode {
@@ -170,7 +201,7 @@ pub(crate) async fn run_supervised(
         }
     };
     let mut cleanup_guard = ProcessGroupCleanupGuard::new(pgid);
-    match wait_for_child_exit_before_reap(pgid, timeout).await? {
+    match wait_for_child_exit_before_reap(pgid, timeout, &stdout_capped).await? {
         ChildExitObservation::Exited => {
             cleanup_guard.mark_child_exit_observed();
             cleanup_guard.kill_now()?;
@@ -185,10 +216,42 @@ pub(crate) async fn run_supervised(
                 Some(handle) => handle.await.unwrap_or_default(),
                 None => Vec::new(),
             };
+            // Race backstop: the child may have written past the cap and exited
+            // before the poll loop observed the flag. The drain has now fully
+            // joined, so the flag is settled — reject rather than surface the
+            // over-cap prefix.
+            if stdout_capped.load(Ordering::Acquire) {
+                return Ok(SupervisedOutcome::StdoutCapExceeded {
+                    cap: stdout_byte_cap.expect("cap only set under Capture"),
+                });
+            }
             Ok(SupervisedOutcome::Exited {
                 status,
                 stdout,
                 stderr,
+            })
+        }
+        ChildExitObservation::StdoutCapExceeded => {
+            // The child overran the stdout cap and the drain stopped reading and
+            // dropped the read end of the pipe. A child mid-write then takes
+            // SIGPIPE and dies before we reach `killpg`, so — exactly as in the
+            // `Exited` arm — `killpg` can find no live member and report a benign
+            // EPERM on macOS. Mark the exit as observed so that EPERM is
+            // tolerated: we own this group (we created it with `process_group(0)`)
+            // and can always signal a live member, so EPERM here can only mean
+            // the group is already empty, never a real permission failure.
+            cleanup_guard.mark_child_exit_observed();
+            cleanup_guard.kill_now()?;
+            let _ = child.wait().await;
+            cleanup_guard.disarm();
+            if let Some(handle) = stdout_drain {
+                let _ = handle.await;
+            }
+            if let Some(handle) = stderr_drain {
+                let _ = handle.await;
+            }
+            Ok(SupervisedOutcome::StdoutCapExceeded {
+                cap: stdout_byte_cap.expect("cap only set under Capture"),
             })
         }
         ChildExitObservation::TimedOut => {
@@ -202,6 +265,34 @@ pub(crate) async fn run_supervised(
                 let _ = handle.await;
             }
             Ok(SupervisedOutcome::TimedOut)
+        }
+    }
+}
+
+/// Drain `reader`, retaining up to `cap` bytes. Returns the captured bytes on a
+/// clean EOF (or a read error, best-effort like the stderr drain). If the child
+/// writes more than `cap`, set `capped` and stop reading immediately: the
+/// supervisor observes the flag and SIGKILLs the group, so there is no point
+/// continuing to drain (and the returned buffer is discarded anyway). Memory is
+/// therefore bounded by `cap` plus one read chunk regardless of how much a
+/// hostile child tries to emit.
+async fn bounded_stdout_drain<R>(mut reader: R, cap: usize, capped: Arc<AtomicBool>) -> Vec<u8>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        match reader.read(&mut chunk).await {
+            Ok(0) | Err(_) => return buf,
+            Ok(n) => {
+                buf.extend_from_slice(&chunk[..n]);
+                if buf.len() > cap {
+                    capped.store(true, Ordering::Release);
+                    return buf;
+                }
+            }
         }
     }
 }
@@ -346,14 +437,22 @@ pub(crate) fn is_executable_file(metadata: &std::fs::Metadata) -> bool {
 enum ChildExitObservation {
     Exited,
     TimedOut,
+    StdoutCapExceeded,
 }
 
 async fn wait_for_child_exit_before_reap(
     pid: libc::pid_t,
     timeout: Duration,
+    stdout_capped: &AtomicBool,
 ) -> Result<ChildExitObservation, SupervisorError> {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
+        // Checked before the exit probe so an overrun that coincides with the
+        // child exiting is reported as the (more specific, actionable) cap
+        // rejection rather than a plain exit.
+        if stdout_capped.load(Ordering::Acquire) {
+            return Ok(ChildExitObservation::StdoutCapExceeded);
+        }
         if child_has_exited_without_reaping(pid)? {
             return Ok(ChildExitObservation::Exited);
         }
@@ -518,7 +617,7 @@ mod tests {
         let outcome = run_supervised(
             &mut command,
             Duration::from_secs(10),
-            StdoutMode::Capture,
+            StdoutMode::Capture { byte_cap: 4096 },
             StderrMode::Capture,
         )
         .await
@@ -534,6 +633,9 @@ mod tests {
                 assert_eq!(stderr, b"err");
             }
             SupervisedOutcome::TimedOut => panic!("sh exited well within the timeout"),
+            SupervisedOutcome::StdoutCapExceeded { cap } => {
+                panic!("3 bytes of stdout are well under the {cap}-byte cap")
+            }
         }
     }
 
@@ -552,6 +654,9 @@ mod tests {
         match outcome {
             SupervisedOutcome::Exited { stderr, .. } => assert!(stderr.is_empty()),
             SupervisedOutcome::TimedOut => panic!("sh exited well within the timeout"),
+            SupervisedOutcome::StdoutCapExceeded { .. } => {
+                panic!("stdout is discarded, so the cap is never evaluated")
+            }
         }
     }
 
@@ -594,6 +699,69 @@ mod tests {
                 );
             }
             SupervisedOutcome::TimedOut => panic!("verbose child should still exit promptly"),
+            SupervisedOutcome::StdoutCapExceeded { .. } => {
+                panic!("stdout is discarded, so the cap is never evaluated")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn stdout_capture_returns_full_output_at_the_cap_boundary() {
+        // Exactly `cap` bytes is *not* an overrun (the drain rejects on
+        // `len > cap`), so the whole output is returned intact.
+        let mut command = Command::new(locate_on_path("sh"));
+        command.arg("-c").arg("printf aaaa");
+        let outcome = run_supervised(
+            &mut command,
+            Duration::from_secs(10),
+            StdoutMode::Capture { byte_cap: 4 },
+            StderrMode::Discard,
+        )
+        .await
+        .expect("supervised sh run");
+        match outcome {
+            SupervisedOutcome::Exited { stdout, .. } => assert_eq!(stdout, b"aaaa"),
+            other => panic!(
+                "expected Exited with the full 4-byte output, got a different outcome: {}",
+                outcome_name(&other)
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn stdout_capture_rejects_and_kills_when_child_overruns_the_cap() {
+        // A child that streams far more than the cap must be rejected — not
+        // buffered unbounded — and the supervisor must break out and SIGKILL
+        // promptly rather than wait for the wall-clock timeout. A 30s timeout
+        // with a child that would take minutes to emit 64 MiB proves the kill
+        // is driven by the cap, not the clock.
+        let mut command = Command::new(locate_on_path("sh"));
+        // An unbounded shell-builtin writer (no external binary, so no PATH
+        // dependency): it keeps writing until the cap trips and we SIGKILL it.
+        command
+            .arg("-c")
+            .arg("while :; do printf 'writ-overrun-padding\\n'; done");
+        let outcome = run_supervised(
+            &mut command,
+            Duration::from_secs(30),
+            StdoutMode::Capture {
+                byte_cap: 64 * 1024,
+            },
+            StderrMode::Discard,
+        )
+        .await
+        .expect("supervised sh run");
+        match outcome {
+            SupervisedOutcome::StdoutCapExceeded { cap } => assert_eq!(cap, 64 * 1024),
+            other => panic!("expected StdoutCapExceeded, got {}", outcome_name(&other)),
+        }
+    }
+
+    fn outcome_name(outcome: &SupervisedOutcome) -> &'static str {
+        match outcome {
+            SupervisedOutcome::Exited { .. } => "Exited",
+            SupervisedOutcome::TimedOut => "TimedOut",
+            SupervisedOutcome::StdoutCapExceeded { .. } => "StdoutCapExceeded",
         }
     }
 }

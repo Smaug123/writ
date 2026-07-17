@@ -185,14 +185,40 @@ fn parse_rev_list_boundary_output_rejects_non_utf8() {
 // ----- real-git end-to-end -----
 
 #[tokio::test]
+async fn rev_list_plan_rejects_when_rev_list_output_exceeds_cap() {
+    // A single new commit makes `rev-list --boundary` emit well over a handful
+    // of bytes, so a tiny cap trips the guard: the planner must refuse the walk
+    // (killing the git process group) rather than buffer and parse
+    // guest-controlled output unbounded.
+    let (_dir, repo, git) = init_test_repo();
+    let c0 = commit_empty(&git, &repo, "default head");
+    let c1 = commit_empty(&git, &repo, "one new commit");
+
+    let err = plan_branch_creation_via_rev_list(&c1, &c0, &repo, &git, TEST_GIT_TIMEOUT, 8)
+        .await
+        .expect_err("over-cap rev-list output must be refused");
+    match err {
+        BranchCreationPlanError::RevListOutputTooLarge { cap } => assert_eq!(cap, 8),
+        other => panic!("expected RevListOutputTooLarge, got {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn rev_list_plan_returns_single_commit_when_tip_is_child_of_default_head() {
     let (_dir, repo, git) = init_test_repo();
     let c0 = commit_empty(&git, &repo, "default head");
     let c1 = commit_empty(&git, &repo, "one new commit");
 
-    let plan = plan_branch_creation_via_rev_list(&c1, &c0, &repo, &git, TEST_GIT_TIMEOUT)
-        .await
-        .expect("plan ok");
+    let plan = plan_branch_creation_via_rev_list(
+        &c1,
+        &c0,
+        &repo,
+        &git,
+        TEST_GIT_TIMEOUT,
+        REV_LIST_STDOUT_BYTE_CAP,
+    )
+    .await
+    .expect("plan ok");
     let (commits, seed) = expect_replay(plan);
     assert_eq!(commits, vec![c1]);
     assert_eq!(seed.commit(&c0), Some(&c0));
@@ -207,9 +233,16 @@ async fn rev_list_plan_topologically_sorts_linear_chain() {
     let c2 = commit_empty(&git, &repo, "c2");
     let c3 = commit_empty(&git, &repo, "c3");
 
-    let plan = plan_branch_creation_via_rev_list(&c3, &c0, &repo, &git, TEST_GIT_TIMEOUT)
-        .await
-        .expect("plan ok");
+    let plan = plan_branch_creation_via_rev_list(
+        &c3,
+        &c0,
+        &repo,
+        &git,
+        TEST_GIT_TIMEOUT,
+        REV_LIST_STDOUT_BYTE_CAP,
+    )
+    .await
+    .expect("plan ok");
     let (commits, seed) = expect_replay(plan);
     assert_eq!(commits, vec![c1.clone(), c2, c3]);
     // `--boundary` reports the merge-base; for a linear chain
@@ -243,9 +276,16 @@ async fn rev_list_plan_handles_merge_with_mixed_age_parents() {
     let new1 = commit_empty(&git, &repo, "new1");
     let merge = commit_merge(&git, &repo, "merge", &[&c_old, &new1]);
 
-    let plan = plan_branch_creation_via_rev_list(&merge, &c_old, &repo, &git, TEST_GIT_TIMEOUT)
-        .await
-        .expect("plan ok");
+    let plan = plan_branch_creation_via_rev_list(
+        &merge,
+        &c_old,
+        &repo,
+        &git,
+        TEST_GIT_TIMEOUT,
+        REV_LIST_STDOUT_BYTE_CAP,
+    )
+    .await
+    .expect("plan ok");
     let (commits, seed) = expect_replay(plan);
     assert_eq!(commits.len(), 2, "got {commits:?}");
     assert!(
@@ -294,9 +334,16 @@ async fn rev_list_plan_handles_fork_from_older_default_commit() {
     );
     let new = commit_empty(&git, &repo, "new on side");
 
-    let plan = plan_branch_creation_via_rev_list(&new, &c2, &repo, &git, TEST_GIT_TIMEOUT)
-        .await
-        .expect("plan ok");
+    let plan = plan_branch_creation_via_rev_list(
+        &new,
+        &c2,
+        &repo,
+        &git,
+        TEST_GIT_TIMEOUT,
+        REV_LIST_STDOUT_BYTE_CAP,
+    )
+    .await
+    .expect("plan ok");
     let (commits, seed) = expect_replay(plan);
     assert_eq!(commits, vec![new]);
     // Merge-base is c1, which is the boundary rev-list reports.
@@ -320,9 +367,16 @@ async fn rev_list_plan_rejects_shallow_staging_repo() {
     std::fs::write(&shallow_marker, format!("{}\n", default_head.as_str())).unwrap();
     assert!(shallow_marker.exists(), "marker write must succeed");
 
-    let err = plan_branch_creation_via_rev_list(&c1, &default_head, &repo, &git, TEST_GIT_TIMEOUT)
-        .await
-        .expect_err("shallow staging repo must be rejected");
+    let err = plan_branch_creation_via_rev_list(
+        &c1,
+        &default_head,
+        &repo,
+        &git,
+        TEST_GIT_TIMEOUT,
+        REV_LIST_STDOUT_BYTE_CAP,
+    )
+    .await
+    .expect_err("shallow staging repo must be rejected");
     match err {
         BranchCreationPlanError::ShallowStagingRepo { staging_repo } => {
             assert_eq!(staging_repo, repo.display().to_string());
@@ -349,6 +403,7 @@ async fn rev_list_plan_rejects_disjoint_history() {
         &repo,
         &git,
         TEST_GIT_TIMEOUT,
+        REV_LIST_STDOUT_BYTE_CAP,
     )
     .await
     .expect_err("disjoint history must be rejected");
@@ -372,9 +427,16 @@ async fn rev_list_plan_returns_already_on_default_when_bundle_tip_equals_default
     // needs to publish the ref at the existing SHA.
     let (_dir, repo, git) = init_test_repo();
     let head = commit_empty(&git, &repo, "only commit");
-    let plan = plan_branch_creation_via_rev_list(&head, &head, &repo, &git, TEST_GIT_TIMEOUT)
-        .await
-        .expect("bundle_tip == default_head must succeed as AlreadyOnDefault");
+    let plan = plan_branch_creation_via_rev_list(
+        &head,
+        &head,
+        &repo,
+        &git,
+        TEST_GIT_TIMEOUT,
+        REV_LIST_STDOUT_BYTE_CAP,
+    )
+    .await
+    .expect("bundle_tip == default_head must succeed as AlreadyOnDefault");
     match plan {
         BranchCreationPlan::AlreadyOnDefault { tip } => {
             assert_eq!(tip, head);
@@ -392,9 +454,16 @@ async fn rev_list_plan_returns_already_on_default_when_bundle_tip_is_ancestor_of
     let c0 = commit_empty(&git, &repo, "c0");
     let c1 = commit_empty(&git, &repo, "c1 (default head)");
 
-    let plan = plan_branch_creation_via_rev_list(&c0, &c1, &repo, &git, TEST_GIT_TIMEOUT)
-        .await
-        .expect("ancestor bundle_tip must succeed as AlreadyOnDefault");
+    let plan = plan_branch_creation_via_rev_list(
+        &c0,
+        &c1,
+        &repo,
+        &git,
+        TEST_GIT_TIMEOUT,
+        REV_LIST_STDOUT_BYTE_CAP,
+    )
+    .await
+    .expect("ancestor bundle_tip must succeed as AlreadyOnDefault");
     match plan {
         BranchCreationPlan::AlreadyOnDefault { tip } => {
             assert_eq!(tip, c0);
@@ -408,9 +477,16 @@ async fn rev_list_plan_surfaces_git_error_on_unknown_sha() {
     let (_dir, repo, git) = init_test_repo();
     let head = commit_empty(&git, &repo, "only commit");
     let bogus = GitObjectId::new("0".repeat(40)).unwrap();
-    let err = plan_branch_creation_via_rev_list(&bogus, &head, &repo, &git, TEST_GIT_TIMEOUT)
-        .await
-        .expect_err("unknown SHA must surface as Git error");
+    let err = plan_branch_creation_via_rev_list(
+        &bogus,
+        &head,
+        &repo,
+        &git,
+        TEST_GIT_TIMEOUT,
+        REV_LIST_STDOUT_BYTE_CAP,
+    )
+    .await
+    .expect_err("unknown SHA must surface as Git error");
     assert!(
         matches!(err, BranchCreationPlanError::Git(_)),
         "expected Git, got {err:?}",
@@ -430,9 +506,16 @@ async fn rev_list_plan_seeds_replay_commits_end_to_end() {
     let c1 = commit_empty(&git, &repo, "new c1");
     let c2 = commit_empty(&git, &repo, "new c2");
 
-    let plan = plan_branch_creation_via_rev_list(&c2, &default_head, &repo, &git, TEST_GIT_TIMEOUT)
-        .await
-        .expect("plan ok");
+    let plan = plan_branch_creation_via_rev_list(
+        &c2,
+        &default_head,
+        &repo,
+        &git,
+        TEST_GIT_TIMEOUT,
+        REV_LIST_STDOUT_BYTE_CAP,
+    )
+    .await
+    .expect("plan ok");
     let (plan_commits, plan_seed) = expect_replay(plan);
     assert_eq!(plan_commits, vec![c1.clone(), c2.clone()]);
     assert_eq!(plan_seed.commit(&default_head), Some(&default_head));
@@ -609,6 +692,7 @@ async fn plan_branch_creation_surfaces_timeout_when_subprocess_stalls() {
         &staging,
         &probe,
         short_timeout,
+        REV_LIST_STDOUT_BYTE_CAP,
     )
     .await
     .expect_err("sleeping probe must time out");

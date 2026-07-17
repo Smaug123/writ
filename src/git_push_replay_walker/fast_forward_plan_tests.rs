@@ -26,15 +26,42 @@ async fn fast_forward_plan_returns_single_commit_when_tip_is_child_of_expected_r
     let expected = commit_empty(&git, &repo, "expected remote head");
     let new1 = commit_empty(&git, &repo, "one new commit");
 
-    let plan = plan_fast_forward_via_rev_list(&new1, &expected, &repo, &git, TEST_GIT_TIMEOUT)
-        .await
-        .expect("plan ok");
+    let plan = plan_fast_forward_via_rev_list(
+        &new1,
+        &expected,
+        &repo,
+        &git,
+        TEST_GIT_TIMEOUT,
+        REV_LIST_STDOUT_BYTE_CAP,
+    )
+    .await
+    .expect("plan ok");
     let (commits, seed) = expect_replay_ff(plan);
     assert_eq!(commits, vec![new1]);
     // The boundary is `expected_remote_head` itself — strictly the
     // parent of the only new commit.
     assert_eq!(seed.commit(&expected), Some(&expected));
     assert_eq!(seed.commit_count(), 1);
+}
+
+#[tokio::test]
+async fn fast_forward_plan_rejects_when_rev_list_output_exceeds_cap() {
+    // A single new commit already makes `rev-list --boundary` emit far more
+    // than a handful of bytes (the new commit's id plus the boundary id), so a
+    // tiny cap trips the guard. This exercises the real reviewed path: the
+    // planner must refuse the walk (killing the git process group) rather than
+    // buffer and parse guest-controlled `rev-list` output unbounded.
+    let (_dir, repo, git) = init_test_repo();
+    let expected = commit_empty(&git, &repo, "expected remote head");
+    let new1 = commit_empty(&git, &repo, "one new commit");
+
+    let err = plan_fast_forward_via_rev_list(&new1, &expected, &repo, &git, TEST_GIT_TIMEOUT, 8)
+        .await
+        .expect_err("over-cap rev-list output must be refused");
+    match err {
+        FastForwardPlanError::RevListOutputTooLarge { cap } => assert_eq!(cap, 8),
+        other => panic!("expected RevListOutputTooLarge, got {other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -45,9 +72,16 @@ async fn fast_forward_plan_topologically_sorts_linear_chain() {
     let c2 = commit_empty(&git, &repo, "c2");
     let c3 = commit_empty(&git, &repo, "c3");
 
-    let plan = plan_fast_forward_via_rev_list(&c3, &expected, &repo, &git, TEST_GIT_TIMEOUT)
-        .await
-        .expect("plan ok");
+    let plan = plan_fast_forward_via_rev_list(
+        &c3,
+        &expected,
+        &repo,
+        &git,
+        TEST_GIT_TIMEOUT,
+        REV_LIST_STDOUT_BYTE_CAP,
+    )
+    .await
+    .expect("plan ok");
     let (commits, seed) = expect_replay_ff(plan);
     assert_eq!(commits, vec![c1.clone(), c2, c3]);
     // Boundary is `expected` (the parent of the first new commit
@@ -80,9 +114,16 @@ async fn fast_forward_plan_handles_merge_with_mixed_age_parents() {
     let side1 = commit_empty(&git, &repo, "side1");
     let merge = commit_merge(&git, &repo, "merge", &[&expected, &side1]);
 
-    let plan = plan_fast_forward_via_rev_list(&merge, &expected, &repo, &git, TEST_GIT_TIMEOUT)
-        .await
-        .expect("plan ok");
+    let plan = plan_fast_forward_via_rev_list(
+        &merge,
+        &expected,
+        &repo,
+        &git,
+        TEST_GIT_TIMEOUT,
+        REV_LIST_STDOUT_BYTE_CAP,
+    )
+    .await
+    .expect("plan ok");
     let (commits, seed) = expect_replay_ff(plan);
     assert_eq!(commits.len(), 2, "got {commits:?}");
     assert!(
@@ -119,9 +160,16 @@ async fn fast_forward_plan_returns_already_at_expected_when_bundle_tip_equals_ex
     // orchestrator skips both walker and ref-update.
     let (_dir, repo, git) = init_test_repo();
     let head = commit_empty(&git, &repo, "only commit");
-    let plan = plan_fast_forward_via_rev_list(&head, &head, &repo, &git, TEST_GIT_TIMEOUT)
-        .await
-        .expect("bundle_tip == expected_remote_head must succeed as AlreadyAtExpected");
+    let plan = plan_fast_forward_via_rev_list(
+        &head,
+        &head,
+        &repo,
+        &git,
+        TEST_GIT_TIMEOUT,
+        REV_LIST_STDOUT_BYTE_CAP,
+    )
+    .await
+    .expect("bundle_tip == expected_remote_head must succeed as AlreadyAtExpected");
     match plan {
         FastForwardPlan::AlreadyAtExpected { tip } => {
             assert_eq!(tip, head);
@@ -142,9 +190,16 @@ async fn fast_forward_plan_rejects_diverged_history() {
     run_git(&git, &repo, &["checkout", "--quiet", "--orphan", "orphan"]);
     let orphan_tip = commit_empty(&git, &repo, "orphan tip");
 
-    let err = plan_fast_forward_via_rev_list(&orphan_tip, &expected, &repo, &git, TEST_GIT_TIMEOUT)
-        .await
-        .expect_err("diverged history must be rejected");
+    let err = plan_fast_forward_via_rev_list(
+        &orphan_tip,
+        &expected,
+        &repo,
+        &git,
+        TEST_GIT_TIMEOUT,
+        REV_LIST_STDOUT_BYTE_CAP,
+    )
+    .await
+    .expect_err("diverged history must be rejected");
     match err {
         FastForwardPlanError::DivergedHistory {
             expected_remote_head: erh,
@@ -182,9 +237,16 @@ async fn fast_forward_plan_rejects_fork_from_older_ancestor() {
     );
     let side_tip = commit_empty(&git, &repo, "side tip");
 
-    let err = plan_fast_forward_via_rev_list(&side_tip, &expected, &repo, &git, TEST_GIT_TIMEOUT)
-        .await
-        .expect_err("fork from older ancestor must be rejected");
+    let err = plan_fast_forward_via_rev_list(
+        &side_tip,
+        &expected,
+        &repo,
+        &git,
+        TEST_GIT_TIMEOUT,
+        REV_LIST_STDOUT_BYTE_CAP,
+    )
+    .await
+    .expect_err("fork from older ancestor must be rejected");
     match err {
         FastForwardPlanError::DivergedHistory {
             expected_remote_head: erh,
@@ -212,9 +274,16 @@ async fn fast_forward_plan_rejects_rewind() {
     let c1 = commit_empty(&git, &repo, "c1");
     let c2 = commit_empty(&git, &repo, "c2");
 
-    let err = plan_fast_forward_via_rev_list(&c1, &c2, &repo, &git, TEST_GIT_TIMEOUT)
-        .await
-        .expect_err("rewind must be rejected");
+    let err = plan_fast_forward_via_rev_list(
+        &c1,
+        &c2,
+        &repo,
+        &git,
+        TEST_GIT_TIMEOUT,
+        REV_LIST_STDOUT_BYTE_CAP,
+    )
+    .await
+    .expect_err("rewind must be rejected");
     match err {
         FastForwardPlanError::DivergedHistory {
             expected_remote_head: erh,
@@ -237,9 +306,16 @@ async fn fast_forward_plan_rejects_shallow_staging_repo() {
     std::fs::write(&shallow_marker, format!("{}\n", expected.as_str())).unwrap();
     assert!(shallow_marker.exists(), "marker write must succeed");
 
-    let err = plan_fast_forward_via_rev_list(&c1, &expected, &repo, &git, TEST_GIT_TIMEOUT)
-        .await
-        .expect_err("shallow staging repo must be rejected");
+    let err = plan_fast_forward_via_rev_list(
+        &c1,
+        &expected,
+        &repo,
+        &git,
+        TEST_GIT_TIMEOUT,
+        REV_LIST_STDOUT_BYTE_CAP,
+    )
+    .await
+    .expect_err("shallow staging repo must be rejected");
     match err {
         FastForwardPlanError::ShallowStagingRepo { staging_repo } => {
             assert_eq!(staging_repo, repo.display().to_string());
@@ -253,9 +329,16 @@ async fn fast_forward_plan_surfaces_git_error_on_unknown_sha() {
     let (_dir, repo, git) = init_test_repo();
     let head = commit_empty(&git, &repo, "only commit");
     let bogus = GitObjectId::new("0".repeat(40)).unwrap();
-    let err = plan_fast_forward_via_rev_list(&bogus, &head, &repo, &git, TEST_GIT_TIMEOUT)
-        .await
-        .expect_err("unknown SHA must surface as Git error");
+    let err = plan_fast_forward_via_rev_list(
+        &bogus,
+        &head,
+        &repo,
+        &git,
+        TEST_GIT_TIMEOUT,
+        REV_LIST_STDOUT_BYTE_CAP,
+    )
+    .await
+    .expect_err("unknown SHA must surface as Git error");
     assert!(
         matches!(err, FastForwardPlanError::Git(_)),
         "expected Git, got {err:?}",
@@ -276,9 +359,16 @@ async fn fast_forward_plan_seeds_replay_commits_end_to_end() {
     let c1 = commit_empty(&git, &repo, "new c1");
     let c2 = commit_empty(&git, &repo, "new c2");
 
-    let plan = plan_fast_forward_via_rev_list(&c2, &expected, &repo, &git, TEST_GIT_TIMEOUT)
-        .await
-        .expect("plan ok");
+    let plan = plan_fast_forward_via_rev_list(
+        &c2,
+        &expected,
+        &repo,
+        &git,
+        TEST_GIT_TIMEOUT,
+        REV_LIST_STDOUT_BYTE_CAP,
+    )
+    .await
+    .expect("plan ok");
     let (plan_commits, plan_seed) = expect_replay_ff(plan);
     assert_eq!(plan_commits, vec![c1.clone(), c2.clone()]);
     assert_eq!(plan_seed.commit(&expected), Some(&expected));

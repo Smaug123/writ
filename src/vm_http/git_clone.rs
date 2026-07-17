@@ -7,7 +7,9 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::clean_git::{CleanGitInvocation, clean_git_config_env, run_clean_git_capture_stdout};
+use crate::clean_git::{
+    CleanGitInvocation, SMALL_STDOUT_CAP, clean_git_config_env, run_clean_git_capture_stdout,
+};
 use crate::core::{CapabilityRequest, GitHubAccess, GitHubRequest};
 use crate::secret::SecretStore;
 use crate::server::{BrokerState, CapabilityOutcome, request_capability};
@@ -399,7 +401,7 @@ async fn resolve_mirror_rev(plan: &GitCloneBundlePlan) -> Result<GitCommitSha, S
         clean_git_config_env(),
         Vec::new(),
     );
-    let stdout = run_clean_git_capture_stdout(&invocation, plan.timeout(), None)
+    let stdout = run_clean_git_capture_stdout(&invocation, plan.timeout(), SMALL_STDOUT_CAP, None)
         .await
         .map_err(|err| format!("git rev-parse failed: {err}"))?;
     GitCommitSha::parse(&String::from_utf8_lossy(&stdout))

@@ -193,6 +193,13 @@ pub enum GitCloneBundleRunError {
         pgid: libc::pid_t,
         source: std::io::Error,
     },
+    #[error(
+        "{step} command wrote more than the {cap}-byte stdout cap; the process group was killed"
+    )]
+    StdoutCapExceeded {
+        step: GitCloneCommandStep,
+        cap: usize,
+    },
     #[error("cannot inspect bundle {path}: {source}")]
     InspectBundle {
         path: PathBuf,
@@ -661,6 +668,9 @@ fn translate_clean_git_error(
         }
         CleanGitError::KillProcessGroup { pgid, source } => {
             GitCloneBundleRunError::KillProcessGroup { step, pgid, source }
+        }
+        CleanGitError::StdoutCapExceeded { cap } => {
+            GitCloneBundleRunError::StdoutCapExceeded { step, cap }
         }
     }
 }
