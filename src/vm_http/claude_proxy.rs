@@ -740,6 +740,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn claude_proxy_refuses_cross_origin_redirect_that_would_leak_api_key() {
+        // The proxy attaches the host's Anthropic credential as `x-api-key`.
+        // reqwest strips only the standard sensitive headers (`Authorization`,
+        // `Cookie`) on a cross-origin redirect, so `x-api-key` survives a hop:
+        // if the shared proxy client followed redirects, an upstream 3xx whose
+        // `Location` points at an attacker origin would hand it the live host
+        // key. The client disables redirect-following, so a 3xx comes back to
+        // the guest verbatim and the redirect target receives no request.
+
+        // The exfiltration target. If the proxy client (wrongly) chased the
+        // redirect, this origin would receive the re-issued POST — 307
+        // preserves method and body — carrying `x-api-key: host-anthropic-key`.
+        let (attacker_url, attacker_captured) =
+            serve_raw_http_once(raw_http_response("200 OK", "application/json", b"{}")).await;
+
+        // The legitimate upstream answers the POST with a redirect to the
+        // attacker origin.
+        let (upstream_url, upstream_captured) =
+            serve_raw_http_once(raw_http_response_with_headers(
+                "307 Temporary Redirect",
+                "application/json",
+                &[("location", attacker_url.as_str())],
+                b"",
+            ))
+            .await;
+
+        let github = MockServer::start().await;
+        let secret_key = SecretKey::new("anthropic-api-key").unwrap();
+        let state = make_broker_state_with_extra_secret(
+            &github,
+            Some((secret_key.clone(), "host-anthropic-key")),
+        );
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::LOCALHOST, 32).unwrap());
+        open_audit_session(&state, session.session_id());
+        let service = VmHttpClaudeProxyService::new(
+            Arc::clone(&state),
+            VmHttpClaudeProxyConfig::new(
+                upstream_url,
+                secret_key,
+                VmHttpClaudeProxyAuthKind::XApiKey,
+                std::time::Duration::from_secs(5),
+                1024,
+                1024,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let request = VmHttpRequest::new(
+            "POST",
+            VM_CLAUDE_MESSAGES_PATH,
+            Some(bearer(token().as_str())),
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 34567)),
+        );
+
+        let response = route_claude_proxy_request(
+            &session,
+            &request,
+            br#"{"model":"test"}"#.to_vec(),
+            &service,
+        )
+        .await
+        .into_buffered();
+
+        // The redirect is surfaced to the guest, not chased.
+        assert_eq!(response.status, VmHttpStatus::Upstream(307));
+
+        // Sanity check: the legitimate upstream did see the credentialed
+        // request, so the test really exercised the auth-injection path.
+        assert!(
+            upstream_captured
+                .lock()
+                .unwrap()
+                .to_ascii_lowercase()
+                .contains("x-api-key: host-anthropic-key"),
+            "upstream never saw the credentialed request: {}",
+            upstream_captured.lock().unwrap(),
+        );
+
+        // The redirect target received nothing — no connection, no credential.
+        let leaked = attacker_captured.lock().unwrap().clone();
+        assert!(
+            leaked.is_empty(),
+            "request/credential leaked to the redirect target: {leaked}",
+        );
+    }
+
+    #[tokio::test]
     async fn claude_proxy_messages_with_beta_query_strips_to_upstream_path() {
         let upstream_body = br#"{"content":[]}"#;
         let (upstream_url, captured) = serve_raw_http_once(raw_http_response(
