@@ -109,18 +109,23 @@ Steps:
 `writ-vm` (`--no-default-features --features vm-client`) build is unchanged.
 Mechanical; no behaviour change.
 
-### Slice 2 — disambiguate the two `nix_cache` modules
+### Slice 2 — disambiguate the two `nix_cache` modules (implemented)
 
-Rename by layer (they are domain-lib vs HTTP-shell, see `architecture.md` §5.6):
+Renamed by layer (they are domain-lib vs HTTP-shell, see `architecture.md` §5.6):
 - `src/nix_cache.rs` (types + Ed25519 verification + NAR hashing + admission
-  parsers, zero HTTP) → `src/nix_narinfo.rs` (or `nix_cache_admission`).
-- `src/vm_http/nix_cache.rs` (the `VmHttpNixCacheService`) keeps its role; its
-  module path already disambiguates once the domain module is renamed.
+  parsers, zero HTTP) → **`src/nix_binary_cache.rs`**. Chosen over the sketch's
+  `nix_narinfo`/`nix_cache_admission` because the module also owns store paths
+  and NAR hashing, not just narinfo/admission — its own doc already called it
+  the "Nix binary-cache" layer.
+- `src/vm_http/nix_cache.rs` (the `VmHttpNixCacheService`) keeps its name; its
+  module path (`crate::vm_http::nix_cache`) already disambiguates it from the
+  renamed `crate::nix_binary_cache`.
 
-Pure rename + import fixups, fully compiler-checked. Do the analogous
-disambiguation for `flake_provision.rs` (runs `nix flake archive`) vs
-`flake_provision_from_mirror.rs` (mirror lookup + orchestration) vs
-`vm_http/flake_provision.rs` (HTTP shell) if it reads cleanly in the same pass.
+Pure `git mv` + word-boundary-guarded rewrite of `crate::nix_cache` paths, fully
+compiler-checked. The `flake_provision.rs` / `flake_provision_from_mirror.rs` /
+`vm_http/flake_provision.rs` trio is **deferred**: those names do not actually
+*collide* (only the two `nix_cache` did), so renaming them is lower-value churn
+better folded into the god-file/naming pass (Slice 8).
 
 ### Slice 3 — delete vestigial paths and correct stale in-code claims
 

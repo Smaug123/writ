@@ -1,4 +1,7 @@
-//! Host-side Nix binary-cache configuration types.
+//! Host-side Nix binary-cache domain model: store paths, narinfo, NAR hashing,
+//! Ed25519 signature verification, and cache-admission parsing. This is the pure
+//! data-and-crypto layer; the HTTP service that serves the binary-cache protocol
+//! to the no-egress guest lives in the `vm_http::nix_cache` module.
 
 use base64::Engine as _;
 

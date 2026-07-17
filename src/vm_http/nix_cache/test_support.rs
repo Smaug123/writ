@@ -3,9 +3,9 @@
 //! Hoisted here so the per-concern `*_tests` modules and the inline `spec`
 //! modules in `route`/`nar_verify` reuse one set of service constructors, NAR
 //! and narinfo builders, and signing-key helpers instead of each re-defining
-//! them. `super::*` re-exports the production items (and the `crate::nix_cache`
+//! them. `super::*` re-exports the production items (and the `crate::nix_binary_cache`
 //! parsers the parent pulls in privately); the explicit `use`s below cover the
-//! `vm_http` test harness and the extra `crate::nix_cache` value types these
+//! `vm_http` test harness and the extra `crate::nix_binary_cache` value types these
 //! helpers construct.
 
 use std::io::Write as _;
@@ -19,7 +19,7 @@ use wiremock::MockServer;
 use super::super::tests::{basic, token};
 use super::super::{VmHttpServices, route_authenticated_vm_http_request};
 use super::*;
-use crate::nix_cache::{NixNarCompression, NixNarHash, NixNarSize, NixTrustedPublicKeys};
+use crate::nix_binary_cache::{NixNarCompression, NixNarHash, NixNarSize, NixTrustedPublicKeys};
 
 pub(super) const VM_NIX_CACHE_INFO_PATH: &str = "/v1/nix/cache/nix-cache-info";
 pub(super) const VM_NIX_PREWARM_CACHE_INFO_PATH: &str = "/v1/nix/prewarm/nix-cache-info";
@@ -210,7 +210,7 @@ pub(super) fn nar_hash_for_body(body: &[u8]) -> String {
         .expect("ring SHA-256 digest length should be 32 bytes");
     format!(
         "sha256:{}",
-        crate::nix_cache::nix_base32_encode_sha256_digest(&digest)
+        crate::nix_binary_cache::nix_base32_encode_sha256_digest(&digest)
     )
 }
 
@@ -404,7 +404,7 @@ pub(super) fn write_local_ca_entry(
         .strip_prefix("sha256:")
         .expect("nar_hash_for_body returns a sha256 hash");
     let store_hash =
-        crate::nix_cache::fixed_output_recursive_sha256_store_hash(nar_digest, store_name)
+        crate::nix_binary_cache::fixed_output_recursive_sha256_store_hash(nar_digest, store_name)
             .expect("a valid sha256 digest derives a store hash");
     let narinfo = format!(
         "StorePath: /nix/store/{store_hash}-{store_name}\nURL: nar/{nar_file}\nCompression: xz\nNarHash: {nar_hash}\nNarSize: {}\nReferences: \nCA: fixed:r:sha256:{nar_digest}\n",

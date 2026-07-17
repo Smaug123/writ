@@ -71,7 +71,7 @@ pub mod github;
 #[cfg(feature = "host")]
 pub mod github_git_db;
 #[cfg(feature = "host")]
-pub mod nix_cache;
+pub mod nix_binary_cache;
 #[cfg(feature = "host")]
 pub mod notes_repo;
 #[cfg(feature = "host")]

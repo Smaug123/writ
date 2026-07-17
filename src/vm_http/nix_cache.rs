@@ -22,7 +22,7 @@ use crate::audit::{
     NixCacheOutcomeRecord, NixCacheRequestRecord,
 };
 use crate::core::{RequestId, UnixMillis};
-use crate::nix_cache::{
+use crate::nix_binary_cache::{
     NixCacheNarFileName, NixLocalNarInfoError, NixNarBodyHashError, NixNarInfo, NixNarInfoError,
     NixStoreHashPart, parse_local_admissible_narinfo_for_store_hash,
     parse_signed_narinfo_for_store_hash,

@@ -10,7 +10,7 @@ use super::nar_verify::{
 };
 use super::test_support::*;
 use super::*;
-use crate::nix_cache::NixNarCompression;
+use crate::nix_binary_cache::NixNarCompression;
 
 #[test]
 fn nix_cache_nar_length_must_be_declared_and_bounded() {
