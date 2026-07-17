@@ -368,7 +368,8 @@ world. Nix provisioning lets a no-egress guest still realise a locked flake:
 the broker fetches and content-addresses the flake's inputs host-side, then
 serves them through a substituter the guest trusts, keeping evaluation offline.
 
-**Lives in.** `vm_http/` (`mod.rs` [2832 lines], `claude_proxy.rs`,
+**Lives in.** `vm_http/` (`mod.rs` [1677 lines, tests in `vm_http/tests.rs`],
+`claude_proxy.rs`,
 `openai_proxy.rs`, `git_clone.rs`, `git_push.rs`, `flake_provision.rs`,
 `nix_cache.rs` + `nix_cache/`, `agent_runs.rs`, `proxy_common.rs`) plus the
 Nix domain modules `nix_binary_cache.rs` (1345, with its test suite in
