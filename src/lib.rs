@@ -14,6 +14,7 @@ pub mod agent_vm_firewall;
 pub mod agent_vm_lifecycle;
 #[cfg(feature = "host")]
 pub mod audit;
+#[cfg(feature = "host")]
 pub(crate) use writ_core::bearer;
 #[cfg(feature = "host")]
 pub mod boot_reconcile;
@@ -97,7 +98,7 @@ pub use writ_core::telemetry;
 #[cfg(feature = "host")]
 pub mod ui_http;
 #[cfg(feature = "vm-client")]
-pub mod vm_client;
+pub use writ_vm_client as vm_client;
 // The shared VM-git wire types are needed by both the host (git pipeline, agent
 // VM) and the guest client, so the re-export is available under either feature.
 #[cfg(any(feature = "host", feature = "vm-client"))]

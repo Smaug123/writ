@@ -1,0 +1,26 @@
+[package]
+name = "writ-vm-client"
+version = "0.1.0"
+edition = "2024"
+
+# The guest-side command surface that runs inside the agent VM. It must not link
+# any host-only dependency; because it is its own crate, that is now a
+# compile-time property of the dependency graph rather than a discipline upheld
+# by feature flags.
+[dependencies]
+writ-core = { path = "../writ-core" }
+writ-vm-git = { path = "../writ-vm-git" }
+writ-agent-run = { path = "../writ-agent-run", features = ["vm-client"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots", "http2", "stream"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "io-util"] }
+base64 = "0.22"
+serde_json = "1"
+thiserror = "2"
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+proptest = "1"
+tempfile = "3"
+# `test-support` exposes the panicking `AgentPrompt::new` used in this crate's
+# tests.
+writ-agent-run = { path = "../writ-agent-run", features = ["vm-client", "test-support"] }

@@ -13,14 +13,14 @@ use std::process::{Command, ExitStatus, Stdio};
 
 use reqwest::Url;
 
-use crate::agent_run::{
+use writ_agent_run::{
     AgentPrompt, AgentRunId, AgentRunOutcome, AgentRunStreamSummary, AgentRunStreamUpload,
     VmAgentRunConfigResponse, VmAgentRunOutcomeUpload, vm_agent_run_config_path,
     vm_agent_run_outcome_path,
 };
-use crate::bearer::is_bearer_token_byte;
-use crate::process_spawn;
-use crate::vm_git::{
+use writ_core::bearer::is_bearer_token_byte;
+use writ_core::process_spawn;
+use writ_vm_git::{
     DEFAULT_DEVSHELL_ATTR, DEFAULT_WORKSPACE_BRANCH, GIT_BUNDLE_CONTENT_TYPE,
     GIT_PUSH_BUNDLE_CONTENT_TYPE, GitBranchName, GitCloneRef, GitCloneRepo, GitObjectId,
     VM_FLAKE_PROVISION_PATH, VM_GIT_CLONE_PATH, VM_GIT_PUSH_PATH, VmFlakeProvisionErrorResponse,
@@ -32,7 +32,7 @@ use crate::vm_git::{
 
 // The broker/pre-warm env-var names are a host↔guest wire contract, so they
 // live in `writ-vm-git`; re-exported here for existing `vm_client::…` callers.
-pub use crate::vm_git::{VM_BROKER_TOKEN_ENV, VM_BROKER_URL_ENV, VM_NIX_PREWARM_URL_ENV};
+pub use writ_vm_git::{VM_BROKER_TOKEN_ENV, VM_BROKER_URL_ENV, VM_NIX_PREWARM_URL_ENV};
 
 pub const DEFAULT_VM_CLIENT_MAX_BUNDLE_BYTES: u64 = 512 * 1024 * 1024;
 
@@ -517,7 +517,7 @@ pub async fn push_to_broker(
         command.new_head().clone(),
     );
     let request = VmGitPushRequest::new(metadata, bundle).map_err(|err| match err {
-        crate::vm_git::VmGitPushRequestError::EmptyBundle => VmClientError::BundleEmpty {
+        writ_vm_git::VmGitPushRequestError::EmptyBundle => VmClientError::BundleEmpty {
             branch: command.branch().as_str().to_string(),
         },
     })?;
@@ -719,7 +719,7 @@ fn agent_run_stream_upload(
         byte_len: summary.byte_len,
         sha256_hex: summary.sha256_hex.clone(),
         truncated: summary.truncated,
-        retained_sha256_hex: crate::agent_run::sha256_hex(&retained),
+        retained_sha256_hex: writ_agent_run::sha256_hex(&retained),
         retained_base64: base64_standard(&retained),
     })
 }
@@ -1908,18 +1908,18 @@ mod tests {
         fs::write(&stderr_path, b"").unwrap();
         let outcome = AgentRunOutcome {
             run_id,
-            status: crate::agent_run::AgentRunTerminalStatus::Succeeded,
+            status: writ_agent_run::AgentRunTerminalStatus::Succeeded,
             exit_code: 0,
             stdout: AgentRunStreamSummary {
                 path: stdout_path,
                 byte_len: 18,
-                sha256_hex: crate::agent_run::sha256_hex(b"Hello from Claude\n"),
+                sha256_hex: writ_agent_run::sha256_hex(b"Hello from Claude\n"),
                 truncated: false,
             },
             stderr: AgentRunStreamSummary {
                 path: stderr_path,
                 byte_len: 0,
-                sha256_hex: crate::agent_run::sha256_hex(b""),
+                sha256_hex: writ_agent_run::sha256_hex(b""),
                 truncated: false,
             },
         };
@@ -2725,11 +2725,11 @@ mod tests {
         std::iter::repeat_n(nibble, 40).collect()
     }
 
-    fn parse_oid(raw: &str) -> crate::vm_git::GitObjectId {
+    fn parse_oid(raw: &str) -> writ_vm_git::GitObjectId {
         raw.parse().unwrap()
     }
 
-    fn parse_branch(raw: &str) -> crate::vm_git::GitBranchName {
+    fn parse_branch(raw: &str) -> writ_vm_git::GitBranchName {
         raw.parse().unwrap()
     }
 

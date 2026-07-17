@@ -53,11 +53,13 @@ Everything below is a consequence of holding those two invariants at once.
 | **`writ-core`** (`crates/writ-core/`) | Pure data core: request/decision/grant types, ids, capability sets, the PF/network model, SSHSIG signing types. No dependency on the rest of writ. | — |
 | **`writ-vm-git`** (`crates/writ-vm-git/`) | Host↔guest wire types for VM-mediated git (clone/push request shapes, object-id/branch parsing). | `writ-core` |
 | **`writ-agent-run`** (`crates/writ-agent-run/`) | The managed-agent run contract (prompt/output/correlation-id types) plus the agent process-runner. Shared by host, guest, and bailiff; re-exported as `writ::agent_run`. | `writ-core` |
-| **`writ`** (root) | The imperative shell: the daemon, all host effects, and the guest client. Binaries `writd`, `writ`, `writ-vm`, `writ-agent-vm-runner`, `writ-agent-vm-pf-helper`. | `writ-core`, `writ-vm-git`, `writ-agent-run` |
+| **`writ-vm-client`** (`crates/writ-vm-client/`) | The guest-side `writ-vm` command surface that runs inside the agent VM. Links no host-only dependency — enforced by the crate graph. Re-exported as `writ::vm_client` under the `vm-client` feature. | `writ-core`, `writ-vm-git`, `writ-agent-run` |
+| **`writ`** (root) | The imperative shell: the daemon and all host effects. Binaries `writd`, `writ`, `writ-vm`, `writ-agent-vm-runner`, `writ-agent-vm-pf-helper`. | `writ-core`, `writ-vm-git`, `writ-agent-run`, `writ-vm-client` (opt) |
 | **`bailiff`** (`crates/bailiff/`) | A plan-workflow product (submit → decide → review → implement) built *on top of* writ. | `writ` |
 
 Dependency direction is strict: `bailiff` → `writ` → {`writ-vm-git`,
-`writ-agent-run`, `writ-core`}. `writ` never depends on `bailiff`.
+`writ-agent-run`, `writ-vm-client`, `writ-core`}. `writ` never depends on
+`bailiff`; `writ-vm-client` (the guest surface) never depends on `writ`.
 
 Almost all of the accretion lives inside the root `writ` crate, which is a flat
 list of ~40 modules gated by `#[cfg(feature = "host")]`. The subsystems in §4
@@ -72,21 +74,20 @@ backlog proposes promoting the strongest of these boundaries to real crates.
 - **`vm-client`** — the guest-side surface. The `writ-vm` binary builds with
   `--no-default-features --features vm-client` and must not pull in host deps.
 
-The two surfaces are **disjoint**: `host` does not enable `vm-client`, so a
-`--features host` build never compiles the guest client (`vm_client.rs`). The
-shared host↔guest wire contract — the VM-git request/response types and the
+The two surfaces are **disjoint**: `host` does not enable `vm-client`, and the
+guest client is its own crate (`writ-vm-client`), pulled in only under the
+`vm-client` feature — so a `--features host` build never compiles it or its
+`reqwest`-for-guest. Host-dep-freedom is therefore a **crate-graph property**: a
+host dependency creeping into the guest surface is a compile error, not a lint.
+The shared host↔guest wire contract — the VM-git request/response types and the
 broker/pre-warm env-var *names* — lives in `writ-vm-git`; the
 `pub use writ_vm_git as vm_git` re-export is gated on `any(host, vm-client)` so
 both surfaces get it.
 
-Because the surfaces are disjoint, the default `cargo test` (which selects
-`host`) does not exercise the guest tests. CI runs them in a second invocation:
+`writ-vm-client` is a workspace member, so its tests run under the default
+`cargo test`. `writ`'s own remaining vm-client surface is just the `writ-vm`
+binary; CI exercises it with
 `cargo test -p writ --no-default-features --features vm-client --lib --bins`.
-
-The guest client is still a *module* in the root crate, not its own crate, so
-host-dep-freedom is a build-flag property rather than a crate-graph one.
-Promoting it to a `writ-vm-client` crate — making a host dependency in the guest
-surface a compile error — is Slice 4 of the refactor backlog.
 
 ## 4. Cross-cutting invariants
 
@@ -531,10 +532,11 @@ on the VM-sandbox run path and verified by bailiff via a notes-ref fetch.
 ### 5.10 Clients & UI
 
 **Purpose.** The non-daemon surfaces:
-- **`vm_client.rs`** (3294) — the guest-side `writ-vm` command surface. Runs
-  *inside* the VM, consumes daemon-injected `WRIT_BROKER_URL`/`WRIT_BROKER_TOKEN`,
-  and does git clone/push, workspace init/warm, session fetch, and agent-run
-  exchange against the §5.6 HTTP surface. Never touches GitHub credentials.
+- **`writ-vm-client`** crate (re-exported as `writ::vm_client`) — the guest-side
+  `writ-vm` command surface. Runs *inside* the VM, consumes daemon-injected
+  `WRIT_BROKER_URL`/`WRIT_BROKER_TOKEN`, and does git clone/push, workspace
+  init/warm, session fetch, and agent-run exchange against the §5.6 HTTP surface.
+  Never touches GitHub credentials, and — as its own crate — links no host dep.
 - **`writ_client.rs`** (1288) — the *bailiff→writ* async client over the
   Unix-socket RPC (today exposes `run_agent`). Named `writ_client` for accretion
   reasons; it is not the operator CLI.
@@ -548,11 +550,11 @@ on the VM-sandbox run path and verified by bailiff via a notes-ref fetch.
 **Guarantees & invariants.** The guest client is an ergonomic wrapper, **not an
 authority boundary**: it re-asserts local invariants (branch-head/bundle-head
 mismatch, bundle-size cap) for fast failure, but the broker re-validates every
-request server-side. The `vm-client` feature pulls only `base64`, `reqwest`,
-`ring`, `writ-vm-git` — no host deps — and `writ-vm-git` itself depends only on
-`writ-core`/serde; feature-gating is what keeps the guest surface host-dep-free
-(`lib.rs:98`). The UI is read-only over audit: GET-only, 405 on writes. Wire
-boundaries parse-don't-validate (bearer-token byte check, broker-URL rejects
+request server-side. The `writ-vm-client` crate depends only on `writ-core`,
+`writ-vm-git`, `writ-agent-run`, `reqwest`, `base64` — no host crate — so the
+crate graph, not a feature flag, is what keeps the guest surface host-dep-free.
+The UI is read-only over audit: GET-only, 405 on writes. Wire boundaries
+parse-don't-validate (bearer-token byte check, broker-URL rejects
 query/fragment/non-http).
 
 **Neighbours.** `vm_client` → §5.6; `writ_client` → the daemon; `ui_http` →

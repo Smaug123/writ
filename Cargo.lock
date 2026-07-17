@@ -2964,6 +2964,7 @@ dependencies = [
  "wiremock",
  "writ-agent-run",
  "writ-core",
+ "writ-vm-client",
  "writ-vm-git",
  "xz2",
  "zstd",
@@ -2996,6 +2997,23 @@ dependencies = [
  "tokio",
  "tracing-subscriber",
  "uuid",
+]
+
+[[package]]
+name = "writ-vm-client"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "proptest",
+ "reqwest",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "uuid",
+ "writ-agent-run",
+ "writ-core",
+ "writ-vm-git",
 ]
 
 [[package]]
