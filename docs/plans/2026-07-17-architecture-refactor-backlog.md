@@ -285,9 +285,18 @@ single file exceeds what one reading can hold.
     `dispatch_message`, so no test edits were needed.
 
   `server.rs` is now pure transport, dispatch, and connection handling.
-- **`agent_vm_lifecycle.rs`, `protocol.rs`, `git_push_replay_walker.rs`**
-  (trait + `ShaMap` + both planners + message rendering are four separable
-  concerns in one 1485-line file).
+- **`agent_vm_lifecycle.rs` (3215 → 2879, started):** the largest root-crate
+  god-file. First cut lifted the `ProcessInvocation` process-execution primitive
+  — a 336-line inherent `impl` block — into `agent_vm_lifecycle/invocation.rs`.
+  Inherent-impl moves need no call-site changes (method resolution is by type),
+  so only three helper methods called on `ProcessInvocation` from sibling types
+  (`output`/`failed_from_output`/`resource_still_present`) needed `pub(super)`;
+  the rest stayed private and `invocation_tests` was untouched. Remaining clean
+  seams: the `AgentVmSessionPlan` plan-builder impl (~478 lines) and the
+  session-teardown/`run_*_cleanup_until_absent` machinery (~394 lines, with a
+  dedicated `cleanup_tests.rs`).
+- **`protocol.rs`:** the staged-push view types + `RejectionReason` newtype are
+  a data-only cluster separable from the `ClientMessage`/`ServerMessage` DUs.
 
 Rule of thumb learned from the config split: extract the chunks with no
 `#[serde(default = "…")]` coupling first — moving a struct away from its default
