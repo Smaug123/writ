@@ -25,6 +25,20 @@ pub const GIT_PUSH_BUNDLE_CONTENT_TYPE: &str = "application/vnd.writ.git-push-bu
 pub const DEFAULT_WORKSPACE_ROOT: &str = "/workspace";
 pub const DEFAULT_WORKSPACE_BRANCH: &str = "main";
 pub const DEFAULT_DEVSHELL_ATTR: &str = ".#default";
+
+/// Environment variable through which the daemon injects the broker base URL
+/// into the guest. The guest CLI reads it; the host daemon sets it. It lives
+/// here — a host↔guest wire contract — rather than in the guest client, so the
+/// host can name it without depending on the guest client module.
+pub const VM_BROKER_URL_ENV: &str = "WRIT_BROKER_URL";
+/// Environment variable through which the daemon injects the broker bearer
+/// token into the guest. See [`VM_BROKER_URL_ENV`] for why it lives here.
+pub const VM_BROKER_TOKEN_ENV: &str = "WRIT_BROKER_TOKEN";
+/// The strict, pre-warm-only substituter URL, injected by the daemon exactly
+/// when the broker serves a pre-warm cache dir. When present, the devShell
+/// warm's nix invocations replace their substituters with this URL, so the warm
+/// never reaches the upstream-proxying cache view.
+pub const VM_NIX_PREWARM_URL_ENV: &str = "WRIT_NIX_PREWARM_URL";
 const GIT_PUSH_METADATA_LENGTH_BYTES: usize = 8;
 const GIT_OBJECT_ID_HEX_BYTES: usize = 40;
 

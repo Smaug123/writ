@@ -35,6 +35,13 @@ jobs:
       run: |
         nix develop --command cargo test --verbose
 
+    # The default (host) feature no longer enables vm-client, so `cargo test`
+    # above does not compile the guest surface. Run its lib+bin tests directly;
+    # the tests/ integration suites are host-only, hence --lib --bins.
+    - name: Run guest-surface tests
+      run: |
+        nix develop --command cargo test -p writ --no-default-features --features vm-client --lib --bins --verbose
+
     - name: Run fmt
       run: |
         nix develop --command cargo fmt --check

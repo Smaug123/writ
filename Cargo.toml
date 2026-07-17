@@ -13,8 +13,11 @@ resolver = "3"
 
 [features]
 default = ["host"]
+# `host` does NOT enable `vm-client`: the broker never runs the guest HTTP
+# client. It depends directly on what it actually uses — `reqwest` for its own
+# outbound HTTP (GitHub minter, VM proxies) and `writ-vm-git` for the shared
+# wire types — so `--features host` no longer compiles `vm_client.rs`.
 host = [
-    "vm-client",
     "writ-core/host",
     "dep:base64",
     "dep:bytes",
@@ -26,10 +29,12 @@ host = [
     "dep:hyper-util",
     "dep:jsonwebtoken",
     "dep:keyring",
+    "dep:reqwest",
     "dep:ring",
     "dep:rusqlite",
     "dep:ssh-key",
     "dep:subtle",
+    "dep:writ-vm-git",
     "dep:xz2",
     "dep:zstd",
 ]

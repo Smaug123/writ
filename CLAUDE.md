@@ -27,6 +27,9 @@ passing a subset locally still blocks the PR:
 cargo fmt
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test
+# `host` (the default) does not enable `vm-client`, so `cargo test` skips the
+# guest surface; run its lib+bin tests directly (tests/ suites are host-only):
+cargo test -p writ --no-default-features --features vm-client --lib --bins
 RUSTDOCFLAGS='-D warnings' cargo doc --no-deps --all-features
 nix build .#packages.x86_64-linux.default   # the separate Nix-build CI job
 ```

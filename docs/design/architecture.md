@@ -16,9 +16,8 @@ this first.
 > belongs here.
 
 The current module layout has real structural debt (a flat ~40-module root
-crate, several 2.5–3.7k-line god-files, two modules both named `nix_cache`,
-and a feature flag doing a crate's job). That debt is catalogued, with a
-sequenced remediation, in
+crate, several 2.5–3.7k-line god-files, and two modules both named `nix_cache`).
+That debt is catalogued, with a sequenced remediation, in
 [`../plans/2026-07-17-architecture-refactor-backlog.md`](../plans/2026-07-17-architecture-refactor-backlog.md).
 This document describes the system as it *actually behaves* today, using the
 domain subsystems it *should* be organised around, and points at the files
@@ -64,21 +63,29 @@ list of ~40 modules gated by `#[cfg(feature = "host")]`. The subsystems in §4
 are the *domain* structure that flat list should be read through; the refactor
 backlog proposes promoting the strongest of these boundaries to real crates.
 
-## 3. Feature flags (a load-bearing footgun)
+## 3. Feature flags
 
 - **`host`** (in `default`) — the daemon, CLI, and all host-side deps (SQLite,
-  keyring, GitHub/JWT, hyper, compression).
+  keyring, GitHub/JWT, hyper, compression), plus `reqwest` for its own outbound
+  HTTP (GitHub minter, VM proxies) and `writ-vm-git` for the shared wire types.
 - **`vm-client`** — the guest-side surface. The `writ-vm` binary builds with
   `--no-default-features --features vm-client` and must not pull in host deps.
 
-Today `host` *enables* `vm-client` (`Cargo.toml:16`). That is not a real
-dependency: the only thing host code uses from the guest client module is two
-env-var-name constants (`agent_vm_daemon.rs:52`), plus the `writ-vm-git`
-re-export `pub use writ_vm_git as vm_git` which is (incorrectly) gated on
-`vm-client` at `lib.rs:101`. As a result the broker compiles the entire
-3.3k-line guest HTTP client and `reqwest`-for-guest that it never runs. This is
-the headline "feature flag doing a crate's job"; the fix is in the refactor
-backlog (Slice 1).
+The two surfaces are **disjoint**: `host` does not enable `vm-client`, so a
+`--features host` build never compiles the guest client (`vm_client.rs`). The
+shared host↔guest wire contract — the VM-git request/response types and the
+broker/pre-warm env-var *names* — lives in `writ-vm-git`; the
+`pub use writ_vm_git as vm_git` re-export is gated on `any(host, vm-client)` so
+both surfaces get it.
+
+Because the surfaces are disjoint, the default `cargo test` (which selects
+`host`) does not exercise the guest tests. CI runs them in a second invocation:
+`cargo test -p writ --no-default-features --features vm-client --lib --bins`.
+
+The guest client is still a *module* in the root crate, not its own crate, so
+host-dep-freedom is a build-flag property rather than a crate-graph one.
+Promoting it to a `writ-vm-client` crate — making a host dependency in the guest
+surface a compile error — is Slice 4 of the refactor backlog.
 
 ## 4. Cross-cutting invariants
 

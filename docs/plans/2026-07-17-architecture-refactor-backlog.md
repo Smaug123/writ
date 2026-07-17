@@ -84,7 +84,7 @@ below are the subset worth promoting from module to crate.
 `architecture.md`; historical banners on the design journals; `AGENTS.md`,
 `CLAUDE.md`, and `src/lib.rs` repointed at the map. This backlog.
 
-### Slice 1 — sever the `host` → `vm-client` feature entanglement
+### Slice 1 — sever the `host` → `vm-client` feature entanglement (implemented)
 
 **Highest leverage-to-cost in the list.** Today host code uses exactly two
 things that live behind `vm-client`: the env-var-name constants
