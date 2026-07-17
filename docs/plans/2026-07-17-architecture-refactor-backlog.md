@@ -260,18 +260,28 @@ audit), so it goes last among the crate splits. The `writ-agent-vm-runner` and
 
 ### Slice 8 — break up god-files within their crates (opportunistic, ongoing)
 
-Cheap module boundaries, interleavable with the above and each other:
-- `server.rs` → `transport`/`dispatch` + `staged_push` + `run_agent`
+Cheap module boundaries, interleavable with the above and each other. Each split
+is a self-contained PR that moves code without changing it; the target is that no
+single file exceeds what one reading can hold.
+
+- **`config.rs` (started):** `config.rs` (3673) → a `config/` directory. First
+  chunk extracted — the audit-directory dedication check + legacy audit-DB
+  migration (a self-contained filesystem concern with no `#[serde(default)]`
+  coupling) moved to `config/audit_dir.rs` (code + its tests), re-exported so
+  `crate::config::…` call sites are unchanged. `config/mod.rs` is now ~2960
+  lines; the large `AgentVm*` config block (structs + validators + their serde
+  defaults) is the next candidate, though its `#[serde(default = "…")]` string
+  paths make it more coupled than the audit-dir chunk.
+- **`server.rs`** → `transport`/`dispatch` + `staged_push` + `run_agent`
   submodules (the staged-push and run-agent orchestration is ~70% of the file
   and is not transport).
-- `config.rs` → one submodule per config block (`github_apps`, `policy`,
-  `agent_vm`, `ui_http`, `run_agent`, secret store) behind a thin root.
-- `agent_vm_lifecycle.rs`, `vm_client.rs`, `protocol.rs`,
-  `git_push_replay_walker.rs` (trait + `ShaMap` + both planners + message
-  rendering are four separable concerns in one 1485-line file).
+- **`agent_vm_lifecycle.rs`, `protocol.rs`, `git_push_replay_walker.rs`**
+  (trait + `ShaMap` + both planners + message rendering are four separable
+  concerns in one 1485-line file).
 
-Each split is a self-contained PR that moves code without changing it; the
-target is that no single file exceeds what one reading can hold.
+Rule of thumb learned from the config split: extract the chunks with no
+`#[serde(default = "…")]` coupling first — moving a struct away from its default
+fns means re-pathing each `default = "…"` attribute, which is churnier.
 
 ---
 

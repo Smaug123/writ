@@ -174,12 +174,13 @@ approve/reject/reconcile and agent-run/agent-VM orchestration.
 
 **Lives in.** `server.rs` (3188 lines; `server/` holds only test submodules),
 `protocol.rs` (2296), `broker_session.rs`, `broker_protocol.rs`, `policy.rs`,
-`config.rs` (3673), `bin/writd.rs`, `bin/writ.rs` (the operator CLI verbs).
+`config/` (`mod.rs` ~2960 + `audit_dir.rs`), `bin/writd.rs`, `bin/writ.rs` (the
+operator CLI verbs).
 
 **Primitives.** Wire DUs `ClientMessage` (`protocol.rs:264`, tagged +
 `deny_unknown_fields`) and `ServerMessage` (`protocol.rs:530`, tagged, not
 `deny_unknown_fields` since outbound); `Decision`/`AuthorizedMint`
-(`policy.rs:97,52`); config root `DaemonConfig` (`config.rs:67`,
+(`policy.rs:97,52`); config root `DaemonConfig` (`config/mod.rs`,
 `deny_unknown_fields`): `github_apps`, `policy`, `agent_vm?`, `secret_store`,
 `socket_path?`, `audit_db?`, `ui_http?`, `run_agent?`.
 
