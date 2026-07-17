@@ -6,11 +6,12 @@
 
 use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::Duration;
 
+use serde::Deserialize;
 use uuid::Uuid;
 
 use crate::agent_vm_lifecycle::{
@@ -101,6 +102,146 @@ pub fn discover_session_bridge_interfaces(
         }
     }
     Err(last.expect("BRIDGE_DISCOVERY_ATTEMPTS > 0 guarantees at least one attempt"))
+}
+
+/// Root-owned configuration the privileged helper reads to authorize sessions,
+/// instead of trusting the caller's pool/range arguments. It carries the
+/// broker-managed IPv4/IPv6 pools and the allowed broker port range — the
+/// policy against which a per-session subnet/ports must fall. The helper reads
+/// it from a fixed root-owned path (never a caller-supplied one), so a
+/// (non-root) broker compromise cannot widen the pool or plant its own policy.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PfHelperConfig {
+    pool: AgentNetworkPool,
+    broker_port_range: BrokerPortRange,
+}
+
+impl PfHelperConfig {
+    pub fn pool(&self) -> AgentNetworkPool {
+        self.pool
+    }
+
+    pub fn broker_port_range(&self) -> BrokerPortRange {
+        self.broker_port_range
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawPfHelperConfig {
+    ipv4_pool: String,
+    ipv6_pool: String,
+    broker_port_min: u16,
+    broker_port_max: u16,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum PfHelperConfigError {
+    #[error("cannot read pf-helper config {path}: {source}")]
+    Read {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    #[error("pf-helper config {path} must not be writable by group or other (mode {mode:04o})")]
+    InsecurePermissions { path: PathBuf, mode: u32 },
+    #[error("pf-helper config {path} must be owned by root (uid 0), found uid {uid}")]
+    NotRootOwned { path: PathBuf, uid: u32 },
+    #[error("pf-helper config is not valid JSON: {0}")]
+    Parse(serde_json::Error),
+    #[error("pf-helper config has an invalid network value {value:?}: {message}")]
+    InvalidNetwork { value: String, message: String },
+    #[error(transparent)]
+    Config(#[from] AgentVmConfigError),
+}
+
+/// Parse the pf-helper config JSON into a validated [`PfHelperConfig`]. Pure: no
+/// IO, no ownership check (see [`load_pf_helper_config`]). The pool goes through
+/// [`AgentNetworkPool::new`], so RFC1918/ULA membership is enforced here.
+pub fn parse_pf_helper_config(json: &str) -> Result<PfHelperConfig, PfHelperConfigError> {
+    let raw: RawPfHelperConfig = serde_json::from_str(json).map_err(PfHelperConfigError::Parse)?;
+    let ipv4_pool = parse_config_ipv4_cidr(&raw.ipv4_pool)?;
+    let ipv6_pool = parse_config_ipv6_cidr(&raw.ipv6_pool)?;
+    let pool = AgentNetworkPool::new(ipv4_pool, ipv6_pool)?;
+    let broker_port_range = BrokerPortRange::new(raw.broker_port_min, raw.broker_port_max)?;
+    Ok(PfHelperConfig {
+        pool,
+        broker_port_range,
+    })
+}
+
+/// Load the pf-helper config from `path`, failing closed unless it is a
+/// root-owned file that no non-root principal can write. This is what makes the
+/// pool policy authoritative against a non-root broker: the config path is fixed
+/// (never caller-supplied) and the file must be root-owned and not
+/// group/other-writable, so the broker account cannot plant or edit it.
+pub fn load_pf_helper_config(path: &Path) -> Result<PfHelperConfig, PfHelperConfigError> {
+    ensure_config_file_secure(path)?;
+    let contents = fs::read_to_string(path).map_err(|source| PfHelperConfigError::Read {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    parse_pf_helper_config(&contents)
+}
+
+/// Reject a config file that a non-root principal could have written. Checks
+/// permissions before ownership so both failure modes are observable in tests
+/// (a test cannot create a root-owned file, but can create a mode-0666 or a
+/// non-root-owned one). No-op on non-unix, which this helper never targets.
+#[cfg(unix)]
+fn ensure_config_file_secure(path: &Path) -> Result<(), PfHelperConfigError> {
+    use std::os::unix::fs::MetadataExt;
+    let md = fs::metadata(path).map_err(|source| PfHelperConfigError::Read {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if md.mode() & 0o022 != 0 {
+        return Err(PfHelperConfigError::InsecurePermissions {
+            path: path.to_path_buf(),
+            mode: md.mode() & 0o7777,
+        });
+    }
+    if md.uid() != 0 {
+        return Err(PfHelperConfigError::NotRootOwned {
+            path: path.to_path_buf(),
+            uid: md.uid(),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn ensure_config_file_secure(_path: &Path) -> Result<(), PfHelperConfigError> {
+    Ok(())
+}
+
+fn parse_config_ipv4_cidr(raw: &str) -> Result<Ipv4Cidr, PfHelperConfigError> {
+    let (addr, prefix) = split_config_cidr(raw)?;
+    let addr = addr
+        .parse::<Ipv4Addr>()
+        .map_err(|e| invalid_network(raw, e))?;
+    let prefix = prefix.parse::<u8>().map_err(|e| invalid_network(raw, e))?;
+    Ipv4Cidr::new(addr, prefix).map_err(|e| invalid_network(raw, e))
+}
+
+fn parse_config_ipv6_cidr(raw: &str) -> Result<Ipv6Cidr, PfHelperConfigError> {
+    let (addr, prefix) = split_config_cidr(raw)?;
+    let addr = addr
+        .parse::<Ipv6Addr>()
+        .map_err(|e| invalid_network(raw, e))?;
+    let prefix = prefix.parse::<u8>().map_err(|e| invalid_network(raw, e))?;
+    Ipv6Cidr::new(addr, prefix).map_err(|e| invalid_network(raw, e))
+}
+
+fn split_config_cidr(raw: &str) -> Result<(&str, &str), PfHelperConfigError> {
+    raw.split_once('/')
+        .ok_or_else(|| invalid_network(raw, "CIDR value must contain '/'"))
+}
+
+fn invalid_network(value: &str, message: impl std::fmt::Display) -> PfHelperConfigError {
+    PfHelperConfigError::InvalidNetwork {
+        value: value.to_string(),
+        message: message.to_string(),
+    }
 }
 
 pub const SESSION_BOOTSTRAP_ANCHOR: &str = r#"anchor "writ/session/*""#;
@@ -923,6 +1064,94 @@ mod tests {
                 .map(PfInterface::as_str)
                 .collect::<Vec<_>>(),
             vec!["bridge100", "vmenet0"]
+        );
+    }
+
+    #[test]
+    fn pf_helper_config_parses_pool_and_port_range() {
+        let cfg = parse_pf_helper_config(
+            r#"{
+                "ipv4_pool": "192.168.0.0/16",
+                "ipv6_pool": "fd83:b6f2:e57::/48",
+                "broker_port_min": 49152,
+                "broker_port_max": 65535
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.pool().ipv4_base(),
+            Ipv4Cidr::new(Ipv4Addr::new(192, 168, 0, 0), 16).unwrap()
+        );
+        assert_eq!(cfg.broker_port_range().min().get(), 49152);
+        assert_eq!(cfg.broker_port_range().max().get(), 65535);
+    }
+
+    #[test]
+    fn pf_helper_config_rejects_malformed_and_unknown_fields() {
+        assert!(matches!(
+            parse_pf_helper_config("not json"),
+            Err(PfHelperConfigError::Parse(_))
+        ));
+        // `deny_unknown_fields`: an unexpected key is refused, not ignored.
+        assert!(matches!(
+            parse_pf_helper_config(
+                r#"{"ipv4_pool":"192.168.0.0/16","ipv6_pool":"fd83:b6f2:e57::/48","broker_port_min":49152,"broker_port_max":65535,"pfctl":"/tmp/evil"}"#
+            ),
+            Err(PfHelperConfigError::Parse(_))
+        ));
+    }
+
+    #[test]
+    fn pf_helper_config_rejects_a_non_private_pool() {
+        // The pool goes through AgentNetworkPool::new, so a public IPv4 pool is
+        // refused here rather than silently authorizing public space.
+        let err = parse_pf_helper_config(
+            r#"{"ipv4_pool":"8.8.8.0/24","ipv6_pool":"fd83:b6f2:e57::/48","broker_port_min":49152,"broker_port_max":65535}"#,
+        )
+        .unwrap_err();
+        assert!(matches!(err, PfHelperConfigError::Config(_)), "{err:?}");
+    }
+
+    #[test]
+    fn pf_helper_config_rejects_an_empty_port_range() {
+        let err = parse_pf_helper_config(
+            r#"{"ipv4_pool":"192.168.0.0/16","ipv6_pool":"fd83:b6f2:e57::/48","broker_port_min":65535,"broker_port_max":49152}"#,
+        )
+        .unwrap_err();
+        assert!(matches!(err, PfHelperConfigError::Config(_)), "{err:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_pf_helper_config_fails_closed_on_insecure_or_non_root_files() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let json = r#"{"ipv4_pool":"192.168.0.0/16","ipv6_pool":"fd83:b6f2:e57::/48","broker_port_min":49152,"broker_port_max":65535}"#;
+
+        // Group/other-writable: a non-root principal could edit it → refused
+        // before the contents are even read.
+        let world_writable = dir.path().join("world-writable.json");
+        std::fs::write(&world_writable, json).unwrap();
+        std::fs::set_permissions(&world_writable, std::fs::Permissions::from_mode(0o666)).unwrap();
+        assert!(
+            matches!(
+                load_pf_helper_config(&world_writable),
+                Err(PfHelperConfigError::InsecurePermissions { .. })
+            ),
+            "a group/other-writable config must be refused"
+        );
+
+        // Owned by the (non-root) test user: refused even at mode 0600, because a
+        // non-root broker must not be able to supply the policy.
+        let user_owned = dir.path().join("user-owned.json");
+        std::fs::write(&user_owned, json).unwrap();
+        std::fs::set_permissions(&user_owned, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(
+            matches!(
+                load_pf_helper_config(&user_owned),
+                Err(PfHelperConfigError::NotRootOwned { .. })
+            ),
+            "a non-root-owned config must be refused"
         );
     }
 }
