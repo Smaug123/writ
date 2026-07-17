@@ -338,6 +338,11 @@ single file exceeds what one reading can hold.
   `include_str!("../tests/fixtures/…")` had to become `../../tests/fixtures/…`
   because the test file sits one directory deeper than the original — the
   standing gotcha for any `include_*!` when a module moves into a subdirectory.
+- **`writ-vm-client/src/lib.rs` (3291 → 1628):** the single largest file in the
+  tree, and — like the two above — a single-concern guest-command crate whose
+  bulk was a ~1.7k-line inline test module. Relocated to
+  `crates/writ-vm-client/src/tests.rs`; the 41 tests run unchanged. (No
+  `include_*!` paths this time, so no fixup.)
 
 Rule of thumb learned from the config split: extract the chunks with no
 `#[serde(default = "…")]` coupling first — moving a struct away from its default
