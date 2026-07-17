@@ -2,7 +2,8 @@
 //! credentials for agents and records every grant in an append-only
 //! audit log.
 //!
-//! See `docs/design/broker.md` for the architecture overview.
+//! See `docs/design/architecture.md` for the current-state architecture map
+//! (one section per subsystem, with pointers back into these modules).
 
 pub mod agent_run;
 #[cfg(feature = "host")]

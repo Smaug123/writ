@@ -1,5 +1,11 @@
 # Approve as a state machine
 
+> **⚠ Historical design journal.** The "Schema (v5)" section here is a snapshot;
+> the live schema is ~24 tables across 7 migrations (see
+> [`architecture.md`](./architecture.md) §5.4), and the approve/reject/replay
+> mechanics are summarised in §5.7. Retained for the state-model reasoning and
+> the boot-reconcile design.
+
 The first implementation of `approve_staged_push` (slice B1e.2e and the
 codex iteration that followed it) treated approve as a procedural
 sequence: validate, mint, PATCH GitHub, write a `git_push_resolution`
