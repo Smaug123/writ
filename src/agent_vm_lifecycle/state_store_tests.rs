@@ -252,6 +252,71 @@ fn managed_start_then_managed_stop_success_removes_state_record() {
 
 #[cfg(unix)]
 #[test]
+fn ipv4_only_start_reinstalls_firewall_with_guest_ipv6_deny_after_vm_start() {
+    // Drives the *real* post-start path: after StartVm, the runner re-invokes the
+    // pf-helper with `--deny-guest-ipv6` so the privileged helper discovers the
+    // bridge itself and installs the interface-scoped IPv6 deny. (The fake helper
+    // here only records that it was asked; the discovery logic is covered by the
+    // pf-helper's own tests and the real-hardware prove script.)
+    let dir = tempfile::tempdir().unwrap();
+    let store = AgentVmSessionStateStore::new(dir.path().join("state"));
+    let log = dir.path().join("argv.log");
+    let tool = write_executable_script(
+        dir.path(),
+        "logging-tool",
+        &format!(
+            "#!/bin/sh\n\
+             printf '%s\\n' \"$*\" >> \"{log}\"\n\
+             if [ \"$1\" = \"network\" ] && [ \"$2\" = \"inspect\" ]; then\n\
+             printf '%s\\n' 'ipv4Subnet: 192.168.252.0/24' 'ipv4Gateway: 192.168.252.1'\n\
+             fi\n\
+             exit 0\n",
+            log = log.display(),
+        ),
+    );
+    let base_plan = plan_with_ipv6_mode(252, Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6);
+    let plan = AgentVmSessionPlan::new(
+        base_plan.session_id(),
+        base_plan.pool,
+        base_plan.subnet_index(),
+        base_plan.broker_ports.clone(),
+        base_plan.broker_port_range,
+        base_plan.ipv6_mode(),
+        base_plan.image.clone(),
+        base_plan.guest_command.clone(),
+        base_plan.resources,
+        AgentVmToolPaths::new(&tool, &tool, &tool),
+    )
+    .unwrap();
+
+    start_managed_agent_vm_session(&store, &plan).unwrap();
+
+    let logged = std::fs::read_to_string(&log).unwrap();
+    // Exactly one pf-helper install requests the guest-IPv6 deny (the post-start
+    // re-install), and it points the helper at ifconfig for discovery.
+    let deny_installs: Vec<&str> = logged
+        .lines()
+        .filter(|l| l.contains(" install ") && l.contains("--deny-guest-ipv6"))
+        .collect();
+    assert_eq!(deny_installs.len(), 1, "log:\n{logged}");
+    // The runner passes no discovery tool path — the helper uses a fixed one.
+    assert!(
+        !deny_installs[0].contains("--ifconfig"),
+        "{}",
+        deny_installs[0]
+    );
+    // A pre-start install (no guest-IPv6 deny) precedes it: the v4 rules are up
+    // before the VM boots.
+    assert!(
+        logged
+            .lines()
+            .any(|l| l.contains(" install ") && !l.contains("--deny-guest-ipv6")),
+        "log:\n{logged}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn vm_placement_start_failure_rolls_back_the_agent_vm_and_pf_not_the_network() {
     // Drives the *real* rollback path: in vm mode a StartVm failure removes the
     // agent VM and its host PF anchor, but never the broker-owned shared network.

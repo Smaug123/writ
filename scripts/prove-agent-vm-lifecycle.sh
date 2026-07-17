@@ -12,7 +12,8 @@ Requires:
   - root privileges through sudo for pfctl
   - a top-level PF rule in /etc/pf.conf: anchor "writ/session/*"
   - python3, curl, cargo or nix, and an Alpine-compatible image with sh, ip,
-    wget, and nslookup
+    wget, nslookup, and ping/ping6 (the IPv6 backstop assertion sends a real
+    ICMPv6 probe and fails the proof if no ping tool is present)
 
 Environment overrides:
   WRIT_PROVE_IMAGE       OCI image to run, default alpine:latest
@@ -274,6 +275,59 @@ assert_guest_has_no_routable_ipv6() {
   log "pass: guest has no routable IPv6 address or default route"
 }
 
+assert_pf_anchor_has_ipv6_interface_deny() {
+  log "assert: PF session anchor carries an interface-scoped IPv6 deny"
+  local rules
+  rules="$(sudo pfctl -a "$PF_ANCHOR" -sr 2>/dev/null || true)"
+  printf '%s\n' "$rules"
+  # e.g. block return in quick on bridge100 inet6 all label "writ deny agent v6 iface"
+  if ! printf '%s\n' "$rules" | grep -Eq 'block .* on (bridge|vmenet)[0-9]+ inet6 all'; then
+    die "PF anchor lacks an interface-scoped IPv6 deny (the IPv4-only backstop): ${PF_ANCHOR}"
+  fi
+  log "pass: PF session anchor carries an interface-scoped IPv6 deny"
+}
+
+# The core of the P1: a root guest can undo the in-guest IPv6 disable and
+# reacquire a vmnet-RA ULA after release. Prove the *host* PF interface deny
+# still blocks its IPv6 egress, so the bypass is closed at a layer the guest
+# cannot touch.
+assert_reenabled_ipv6_egress_blocked() {
+  log "assert: a root guest that re-enables IPv6 still cannot egress it"
+  # A real IPv6 packet probe is mandatory: without one this assertion could pass
+  # vacuously (a missing tool returns non-zero, which looks "blocked") and so
+  # could not detect a nonfunctional PF rule. Require ping/ping6 up front and fail
+  # the proof — not pass — if the image lacks it.
+  guest 'command -v ping6 >/dev/null 2>&1 || command -v ping >/dev/null 2>&1' \
+    || die "proof image has no ping/ping6; cannot send an IPv6 probe to exercise the backstop (use WRIT_PROVE_IMAGE with ping)"
+  # Undo the in-guest disable exactly as a malicious agent would, then nudge the
+  # link so a fresh RA is solicited.
+  guest '
+    for s in all default eth0; do
+      printf 0 > /proc/sys/net/ipv6/conf/$s/disable_ipv6 2>/dev/null || true
+      printf 2 > /proc/sys/net/ipv6/conf/$s/accept_ra 2>/dev/null || true
+    done
+    ip link set eth0 down 2>/dev/null || true
+    ip link set eth0 up 2>/dev/null || true
+  ' || true
+  sleep 4
+  log "guest IPv6 state after re-enabling:"
+  guest 'ip -6 -o addr show; ip -6 route show' || true
+  # There must be an IPv6 target to probe. The RA restores a default route via the
+  # host bridge; ping that. Fail the proof (not pass) if no route came back, so a
+  # vacuous "nothing to send" can never masquerade as "blocked".
+  local gw
+  gw="$(guest 'ip -6 route show default 2>/dev/null | awk "{print \$3}" | head -n1' | tr -d "[:space:]")"
+  [ -n "$gw" ] \
+    || die "guest reacquired no IPv6 default route after re-enabling; cannot send a routed IPv6 probe to prove the deny (investigate RA timing)"
+  log "probing IPv6 egress to reacquired gateway ${gw}"
+  # A real ICMPv6 echo to the bridge: absent the deny the host replies (rc 0);
+  # with the deny the packet is dropped/returned (rc != 0). ping6 or `ping -6`,
+  # whichever the image ships.
+  expect_guest_blocked \
+    "re-enabled guest IPv6 egress to the host bridge is blocked by host PF" \
+    "if command -v ping6 >/dev/null 2>&1; then ping6 -c1 -w2 '$gw'; else ping -6 -c1 -w2 '$gw'; fi"
+}
+
 assert_pf_anchor_empty() {
   if sudo pfctl -a "$PF_ANCHOR" -sr 2>/dev/null | grep -q '[^[:space:]]'; then
     die "PF anchor still contains rules after runner stop: ${PF_ANCHOR}"
@@ -396,6 +450,10 @@ expect_guest_success \
 
 assert_guest_has_no_routable_ipv6
 
+# The host-side backstop must be installed on the agent VM's bridge before the
+# guest command was ever released.
+assert_pf_anchor_has_ipv6_interface_deny
+
 GUEST_IPV4="$(guest_ipv4_addr)"
 if [[ -z "$GUEST_IPV4" ]]; then
   die "could not determine guest IPv4 address"
@@ -421,6 +479,9 @@ expect_guest_blocked \
   "VM cannot reach direct external DNS" \
   "nslookup github.com 1.1.1.1 >/dev/null"
 
+# Adversarial: closes the exact P1 — a root guest re-enabling IPv6 post-release.
+assert_reenabled_ipv6_egress_blocked
+
 log "stopping session through lifecycle runner"
 "$RUNNER" \
   --pf-helper "$HELPER" \
@@ -439,4 +500,4 @@ assert_no_pf_state_for_guest
 
 cleanup
 trap - EXIT INT TERM
-log "runner lifecycle proof succeeded for ${IPV4_CIDR}; broker reachable, forbidden host port blocked, IPv6 posture proven, and runner cleanup verified"
+log "runner lifecycle proof succeeded for ${IPV4_CIDR}; broker reachable, forbidden host port blocked, IPv6 posture proven, host IPv6 interface deny installed and holds against a re-enabling root guest, and runner cleanup verified"

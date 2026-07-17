@@ -5,16 +5,21 @@
 //! network and broker-port ranges, then performs only scoped `pfctl` changes.
 
 use std::net::{Ipv4Addr, Ipv6Addr};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::{Args, Parser, Subcommand};
 use writ::agent_vm_firewall::{
-    SessionFirewallInstall, SessionFirewallRemoval, install_session_firewall,
-    remove_session_firewall,
+    SessionFirewallInstall, SessionFirewallRemoval, discover_session_bridge_interfaces,
+    install_session_firewall, remove_session_firewall,
 };
 use writ::core::{
     AgentNetworkPool, BrokerPort, BrokerPortRange, BrokerPorts, Ipv4Cidr, Ipv6Cidr, SessionId,
 };
+
+/// Fixed, root-owned discovery tool for `--deny-guest-ipv6`. Deliberately not a
+/// CLI option: a caller-supplied executable would be arbitrary root code
+/// execution when this helper runs under sudo.
+const SYSTEM_IFCONFIG: &str = "/sbin/ifconfig";
 
 #[derive(Parser)]
 #[command(name = "writ-agent-vm-pf-helper", about = "writ agent VM PF helper")]
@@ -58,6 +63,15 @@ struct InstallArgs {
     /// while the gateway and the rest of the subnet stay blocked.
     #[arg(long)]
     broker_host: Option<String>,
+
+    /// Install the `Ipv4OnlyNoGuestIpv6` backstop: block *all* IPv6 on the agent
+    /// VM's host bridge (and its `vmenet` members) so a root guest cannot
+    /// re-acquire IPv6 via a host vmnet router advertisement. The interfaces are
+    /// discovered *here*, at the privileged boundary, by matching the session
+    /// gateway in `ifconfig` output — never trusted from the caller. Requires the
+    /// agent VM (hence its bridge) to be running, and is rejected with `--ipv6-cidr`.
+    #[arg(long)]
+    deny_guest_ipv6: bool,
 }
 
 #[derive(Args)]
@@ -116,6 +130,30 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .map(|raw| raw.parse::<Ipv4Addr>())
                 .transpose()
                 .map_err(|e| format!("invalid --broker-host: {e}"))?;
+            // Discover the deny interfaces here, from the pool-validated session
+            // gateway — the privileged boundary never trusts caller-supplied
+            // interface names. The discovery tool is a fixed, root-owned system
+            // path (never a caller-supplied executable, which would be arbitrary
+            // root code execution). The agent's own vmenet must have attached, so
+            // require its member: host placement has one (the agent's), vm
+            // placement shares the bridge with the broker VM, so require two (the
+            // broker's plus the agent's). `--broker-host` is set exactly for vm
+            // placement, so it distinguishes the two.
+            let ipv6_deny_interfaces = if args.deny_guest_ipv6 {
+                let gateway = parsed
+                    .pool
+                    .claim_firewall(parsed.ipv4, parsed.ipv6)?
+                    .ipv4_gateway();
+                let min_members = if broker_host.is_some() { 2 } else { 1 };
+                discover_session_bridge_interfaces(
+                    Path::new(SYSTEM_IFCONFIG),
+                    gateway,
+                    min_members,
+                )?
+                .deny_interfaces()
+            } else {
+                Vec::new()
+            };
             let install = SessionFirewallInstall::new(
                 parsed.session_id,
                 parsed.pool,
@@ -124,6 +162,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 broker_ports,
                 broker_port_range,
                 broker_host,
+                ipv6_deny_interfaces,
             )?;
             install_session_firewall(&cli.pfctl, &install)?;
             println!("{}", install.ruleset().anchor().as_str());

@@ -3,15 +3,18 @@
 //! one-line assertion but it catches a surprising number of serde
 //! mistakes (typos in `rename_all`, adjacent-tag clashes, etc.).
 
+use std::net::Ipv4Addr;
+
 use proptest::prelude::*;
 use writ::agent_run::{
     AgentPrompt, AgentRunId, CorrelationId, MAX_CORRELATION_ID_BYTES, MIN_CORRELATION_ID_BYTES,
 };
+use writ::agent_vm_lifecycle::parse_bridge_for_gateway;
 use writ::audit::{AgentRunAuditRecord, AuditLog, GitPushRequestRecord, PreMintRecord};
 use writ::core::{
     AgentKind, CapabilityRequest, CapabilitySet, CredentialGrant, GitHubAccess, GitHubGrantedScope,
-    GitHubPermissions, GitHubRequest, GrantedScope, Jti, MetadataAccess, PolicyDecision, RepoRef,
-    RequestId, SessionId, SessionRecord, TtlSeconds, UnixMillis,
+    GitHubPermissions, GitHubRequest, GrantedScope, Jti, MetadataAccess, PfInterface,
+    PolicyDecision, RepoRef, RequestId, SessionId, SessionRecord, TtlSeconds, UnixMillis,
 };
 use writ::policy::{Decision, PolicyConfig, decide};
 use writ::vm_git::{GitBranchName, GitCloneRepo, GitObjectId};
@@ -452,6 +455,51 @@ proptest! {
         );
     }
 
+    /// For any number of concurrent agent VMs, each session's IPv4 gateway maps
+    /// back to exactly its own bridge and member interface, and a gateway no
+    /// interface carries fails closed. This is the guarantee the IPv4-only IPv6
+    /// backstop relies on to scope its deny to the right session's bridge.
+    #[test]
+    fn bridge_discovery_maps_each_gateway_to_its_own_bridge_and_member(n in 2usize..=6) {
+        // Noise the parser must ignore: loopback and a real uplink whose inet is
+        // not a session gateway.
+        let mut text = String::from(
+            "lo0: flags=8049<UP,LOOPBACK> mtu 16384\n\tinet 127.0.0.1 netmask 0xff000000\n\
+             en0: flags=8863<UP> mtu 1500\n\tinet 10.0.0.5 netmask 0xffffff00\n",
+        );
+        let mut expected = Vec::new();
+        for i in 0..n {
+            let bridge = format!("bridge{}", 100 + i);
+            let member = format!("vmenet{i}");
+            let octet = (200 + i) as u8;
+            let gw = Ipv4Addr::new(192, 168, octet, 1);
+            text.push_str(&format!(
+                "{bridge}: flags=8a63<UP,BROADCAST> mtu 1500 index {}\n\
+                 \tether fe:b2:14:ac:08:{:02x}\n\
+                 \tinet {gw} netmask 0xffffff00 broadcast 192.168.{octet}.255\n\
+                 \tinet6 fe80::1%{bridge} prefixlen 64 scopeid 0x19\n\
+                 \tmember: {member} flags=20003<VIRTIO>\n\
+                 \t\tifmaxaddr 0 port 24 priority 0 path cost 0\n",
+                25 + i,
+                i,
+            ));
+            expected.push((gw, bridge, member));
+        }
+        for (gw, bridge, member) in expected {
+            let disc = parse_bridge_for_gateway(&text, gw, 1).unwrap();
+            prop_assert_eq!(disc.bridge().as_str(), bridge.as_str());
+            prop_assert_eq!(
+                disc.members().iter().map(PfInterface::as_str).collect::<Vec<_>>(),
+                vec![member.as_str()]
+            );
+            let deny = disc.deny_interfaces();
+            prop_assert_eq!(
+                deny.iter().map(PfInterface::as_str).collect::<Vec<_>>(),
+                vec![bridge.as_str(), member.as_str()]
+            );
+        }
+        prop_assert!(parse_bridge_for_gateway(&text, Ipv4Addr::new(203, 0, 113, 1), 1).is_err());
+    }
 
 
 

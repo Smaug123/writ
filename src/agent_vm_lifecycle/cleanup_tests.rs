@@ -223,11 +223,12 @@ fn every_failure_outcome_is_producible_by_some_step() {
         StartOutcome::InstallFirewallFailed,
         StartOutcome::VmAbsenceProbeFailed,
         StartOutcome::StartVmFailed,
+        StartOutcome::InstallGuestIpv6DenyFailed,
         StartOutcome::ProbeGuestIpv6Failed,
         StartOutcome::ValidateGuestIpv6Failed,
         StartOutcome::ReleaseGuestCommandFailed,
     ] {
         assert!(produced.contains(&outcome), "no step produces {outcome:?}",);
     }
-    assert_eq!(produced.len(), 11, "produced = {produced:?}");
+    assert_eq!(produced.len(), 12, "produced = {produced:?}");
 }

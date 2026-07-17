@@ -48,13 +48,16 @@ fn start_invocations_probe_create_inspect_firewall_probe_vm_then_vm() {
 fn ipv4_only_start_invocations_probe_before_releasing_guest_command() {
     let invocations =
         plan_with_ipv6_mode(252, Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6).start_invocations();
-    assert_eq!(invocations.len(), 8);
+    assert_eq!(invocations.len(), 9);
     // Index 0 is the network-absence probe, index 4 the agent-VM absence probe.
     assert_eq!(invocations[0].args_lossy(), ["network", "list", "--quiet"]);
     assert_eq!(invocations[4].args_lossy(), ["list", "--all", "--quiet"]);
     let firewall_args = invocations[3].args_lossy();
     assert_eq!(&firewall_args[0..2], ["writ-agent-vm-pf-helper", "install"]);
     assert!(!firewall_args.contains(&"--ipv6-cidr".to_string()));
+    // The pre-start install does not request the guest-IPv6 deny (the bridge is
+    // not up yet).
+    assert!(!firewall_args.contains(&"--deny-guest-ipv6".to_string()));
 
     let start_vm_args = invocations[5].args_lossy();
     assert_eq!(&start_vm_args[0..2], ["run", "--name"]);
@@ -72,8 +75,24 @@ fn ipv4_only_start_invocations_probe_before_releasing_guest_command() {
         "600".into()
     ]));
 
+    // Index 6: the post-start guest-IPv6 deny — a pf-helper re-install that asks
+    // the privileged helper to discover the bridge itself (`--deny-guest-ipv6`).
+    // It runs between StartVm and the guest IPv6 probe, so the host IPv6 deny is
+    // installed before the guest command is ever released. The runner passes no
+    // interface names or tool paths — the helper owns discovery.
+    let deny_args = invocations[6].args_lossy();
+    assert_eq!(&deny_args[0..2], ["writ-agent-vm-pf-helper", "install"]);
+    assert!(
+        deny_args.contains(&"--deny-guest-ipv6".to_string()),
+        "{deny_args:?}"
+    );
+    assert!(
+        !deny_args.contains(&"--ifconfig".to_string()),
+        "the runner must not pass a discovery tool path: {deny_args:?}"
+    );
+
     assert_eq!(
-        invocations[6].args_lossy(),
+        invocations[7].args_lossy(),
         [
             "exec",
             "writ-agent-vm-51b8fd0f-6c10-454c-b0e6-7df1d60e2e6d",
@@ -83,7 +102,7 @@ fn ipv4_only_start_invocations_probe_before_releasing_guest_command() {
         ]
     );
     assert_eq!(
-        invocations[7].args_lossy(),
+        invocations[8].args_lossy(),
         [
             "exec",
             "writ-agent-vm-51b8fd0f-6c10-454c-b0e6-7df1d60e2e6d",

@@ -100,6 +100,18 @@ pub enum PfHost {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PfAnchorName(String);
 
+/// A host network interface name, validated to be safe to interpolate into a
+/// rendered `pf.conf`.
+///
+/// Interface names flow in from untrusted-adjacent tool output (`ifconfig`) and
+/// are rendered verbatim into a `block ... on <iface> ...` rule, so the newtype
+/// exists to make injection unrepresentable: construction rejects anything that
+/// is not a short ASCII-alphanumeric token (letter-led), which is exactly the
+/// shape of a real BSD interface name (`bridge100`, `vmenet0`, `en0`) and
+/// contains no `pf.conf` metacharacter (whitespace, `{`, `"`, `#`, newline).
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct PfInterface(String);
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PfAllowRule {
     source: PfCidr,
@@ -109,6 +121,19 @@ pub struct PfAllowRule {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PfDenyRule {
     source: PfCidr,
+    label: String,
+}
+
+/// An interface-scoped IPv6 deny: `block return in quick on <iface> inet6 all`.
+///
+/// Unlike [`PfDenyRule`], which scopes by source CIDR, this scopes by the host
+/// interface and matches *all* IPv6, regardless of source address. It is the
+/// only backstop that survives a root guest reassigning its own IPv6 source
+/// (see the `Ipv4OnlyNoGuestIpv6` lifecycle mode): a source-CIDR rule keyed on
+/// the RA-acquired ULA is bypassable, an interface rule is not.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PfInterfaceDenyRule {
+    interface: PfInterface,
     label: String,
 }
 
@@ -122,6 +147,7 @@ pub struct PfRuleset {
     broker_ports: BrokerPorts,
     allow: Vec<PfAllowRule>,
     deny: Vec<PfDenyRule>,
+    iface_deny: Vec<PfInterfaceDenyRule>,
 }
 
 #[derive(Debug, thiserror::Error, Eq, PartialEq)]
@@ -168,6 +194,15 @@ pub enum AgentVmConfigError {
          but the session has an IPv6 scope that would still expose the host IPv6 gateway"
     )]
     BrokerHostWithIpv6FirewallScope,
+    #[error(
+        "invalid PF interface name {0:?}: expected a short ASCII-alphanumeric token led by a letter"
+    )]
+    InvalidPfInterface(String),
+    #[error(
+        "an interface-scoped IPv6 deny is only valid without an IPv6 firewall scope, \
+         but the session has an IPv6 scope whose allow it would contradict"
+    )]
+    Ipv6DenyInterfaceWithIpv6Scope,
 }
 
 impl Ipv4Cidr {
@@ -507,6 +542,56 @@ impl std::fmt::Display for PfHost {
     }
 }
 
+impl PfInterface {
+    /// The longest name BSD `ifconfig` will report (`IFNAMSIZ - 1`). A token
+    /// longer than this is not a real interface, so reject it rather than render
+    /// it.
+    const MAX_LEN: usize = 15;
+
+    /// Parse a host interface name, rejecting anything that is not a short
+    /// ASCII-alphanumeric token led by a letter — the shape of a real BSD
+    /// interface name and, by construction, free of any `pf.conf` metacharacter.
+    pub fn new(name: impl Into<String>) -> Result<Self, AgentVmConfigError> {
+        let name = name.into();
+        let mut chars = name.chars();
+        let valid = name.len() <= Self::MAX_LEN
+            && matches!(chars.next(), Some(c) if c.is_ascii_alphabetic())
+            && chars.all(|c| c.is_ascii_alphanumeric());
+        if valid {
+            Ok(Self(name))
+        } else {
+            Err(AgentVmConfigError::InvalidPfInterface(name))
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for PfInterface {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl PfInterfaceDenyRule {
+    fn new(interface: PfInterface, label: impl Into<String>) -> Self {
+        Self {
+            interface,
+            label: label.into(),
+        }
+    }
+
+    pub fn interface(&self) -> &PfInterface {
+        &self.interface
+    }
+
+    pub fn label(&self) -> &str {
+        &self.label
+    }
+}
+
 impl PfAnchorName {
     pub fn for_session(session_id: SessionId) -> Self {
         let session_id = session_id.to_string();
@@ -578,12 +663,14 @@ impl PfRuleset {
         broker_ports: BrokerPorts,
         allow: Vec<PfAllowRule>,
         deny: Vec<PfDenyRule>,
+        iface_deny: Vec<PfInterfaceDenyRule>,
     ) -> Self {
         Self {
             anchor,
             broker_ports,
             allow,
             deny,
+            iface_deny,
         }
     }
 
@@ -602,14 +689,21 @@ impl PfRuleset {
     pub fn deny(&self) -> &[PfDenyRule] {
         &self.deny
     }
+
+    pub fn iface_deny(&self) -> &[PfInterfaceDenyRule] {
+        &self.iface_deny
+    }
 }
+
+/// Label on the interface-scoped IPv6 deny rules (see [`PfInterfaceDenyRule`]).
+const IPV6_IFACE_DENY_LABEL: &str = "writ deny agent v6 iface";
 
 pub fn session_pf_ruleset(
     session_id: SessionId,
     network: AgentNetwork,
     broker_ports: &BrokerPorts,
 ) -> PfRuleset {
-    session_firewall_pf_ruleset(session_id, network.into(), broker_ports, None)
+    session_firewall_pf_ruleset(session_id, network.into(), broker_ports, None, &[])
 }
 
 /// Build the per-session PF ruleset: allow the agent subnet to reach the broker
@@ -622,11 +716,20 @@ pub fn session_pf_ruleset(
 /// here; the `pass quick` allow then takes precedence over the subnet deny, so
 /// the agent reaches its broker VM while every other host (including the gateway)
 /// stays blocked.
+///
+/// `ipv6_deny_interfaces` adds one interface-scoped IPv6 deny per interface
+/// (`block ... on <iface> inet6 all`). This is the `Ipv4OnlyNoGuestIpv6`
+/// backstop: the guest's IPv6 comes from a host vmnet RA on a ULA prefix Apple
+/// chooses (not one we can predict), so a source-CIDR rule cannot pin it and a
+/// root guest could reassign its source anyway — only the interface scope holds.
+/// The interfaces are discovered post-VM-start and passed by the shell; the core
+/// only records the (already validated) names.
 pub fn session_firewall_pf_ruleset(
     session_id: SessionId,
     network: AgentFirewallNetwork,
     broker_ports: &BrokerPorts,
     broker_ipv4_host: Option<Ipv4Addr>,
+    ipv6_deny_interfaces: &[PfInterface],
 ) -> PfRuleset {
     let allow_host = broker_ipv4_host.unwrap_or_else(|| network.ipv4_gateway());
     let mut allow = vec![PfAllowRule::new(
@@ -645,11 +748,17 @@ pub fn session_firewall_pf_ruleset(
         ));
         deny.push(PfDenyRule::new(PfCidr::Inet6(ipv6), "writ deny agent v6"));
     }
+    let iface_deny = ipv6_deny_interfaces
+        .iter()
+        .cloned()
+        .map(|interface| PfInterfaceDenyRule::new(interface, IPV6_IFACE_DENY_LABEL))
+        .collect();
     PfRuleset::new(
         PfAnchorName::for_session(session_id),
         broker_ports.clone(),
         allow,
         deny,
+        iface_deny,
     )
 }
 
@@ -673,6 +782,16 @@ pub fn render_pf(ruleset: &PfRuleset) -> String {
             "block return in quick {} from {} to any label \"{}\"\n",
             rule.family().pf_name(),
             rule.source(),
+            rule.label(),
+        ));
+    }
+    // Interface-scoped IPv6 denies come last: no source CIDR (matches `all`),
+    // scoped to the agent VM's bridge/member so a root guest cannot escape it by
+    // reassigning its IPv6 source address.
+    for rule in ruleset.iface_deny() {
+        out.push_str(&format!(
+            "block return in quick on {} inet6 all label \"{}\"\n",
+            rule.interface(),
             rule.label(),
         ));
     }
@@ -1139,9 +1258,10 @@ mod tests {
         let network = sample_pool().allocate(0).unwrap();
         let firewall_scope = AgentFirewallNetwork::new(network.ipv4(), None).unwrap();
         let ruleset =
-            session_firewall_pf_ruleset(session_id(), firewall_scope, &sample_ports(), None);
+            session_firewall_pf_ruleset(session_id(), firewall_scope, &sample_ports(), None, &[]);
         assert_eq!(ruleset.allow().len(), 1);
         assert_eq!(ruleset.deny().len(), 1);
+        assert!(ruleset.iface_deny().is_empty());
         assert_eq!(
             render_pf(&ruleset),
             concat!(
@@ -1155,6 +1275,65 @@ mod tests {
     }
 
     #[test]
+    fn render_pf_appends_interface_scoped_ipv6_deny_for_each_interface() {
+        let network = sample_pool().allocate(0).unwrap();
+        let firewall_scope = AgentFirewallNetwork::new(network.ipv4(), None).unwrap();
+        let interfaces = [
+            PfInterface::new("bridge100").unwrap(),
+            PfInterface::new("vmenet0").unwrap(),
+        ];
+        let ruleset = session_firewall_pf_ruleset(
+            session_id(),
+            firewall_scope,
+            &sample_ports(),
+            None,
+            &interfaces,
+        );
+        assert_eq!(ruleset.iface_deny().len(), 2);
+        assert_eq!(
+            render_pf(&ruleset),
+            concat!(
+                "broker_ports = \"{ 18080, 18081 }\"\n",
+                "\n",
+                "pass in quick inet proto tcp from 192.168.126.0/24 to 192.168.126.1 port $broker_ports keep state\n",
+                "\n",
+                "block return in quick inet from 192.168.126.0/24 to any label \"writ deny agent v4\"\n",
+                "block return in quick on bridge100 inet6 all label \"writ deny agent v6 iface\"\n",
+                "block return in quick on vmenet0 inet6 all label \"writ deny agent v6 iface\"\n",
+            ),
+        );
+    }
+
+    #[test]
+    fn pf_interface_rejects_names_with_pf_metacharacters() {
+        // A real interface name parses; anything carrying a pf.conf metacharacter,
+        // an empty string, a digit-led token, or an over-long token is refused so
+        // it can never be rendered into a rule.
+        for good in ["bridge100", "vmenet0", "en0", "utun5", "awdl0"] {
+            assert!(PfInterface::new(good).is_ok(), "{good} should parse");
+        }
+        for bad in [
+            "",
+            "0bridge",
+            "br idge",
+            "bridge100 all",
+            "bridge\"",
+            "bridge;rm",
+            "bridge\n",
+            "br{idge}",
+            "verylonginterface0",
+        ] {
+            assert!(
+                matches!(
+                    PfInterface::new(bad),
+                    Err(AgentVmConfigError::InvalidPfInterface(_))
+                ),
+                "{bad:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
     fn broker_host_override_retargets_the_allow_rule_to_the_broker_vm_ip() {
         let network = sample_pool().allocate(0).unwrap();
         let firewall_scope = AgentFirewallNetwork::new(network.ipv4(), None).unwrap();
@@ -1165,6 +1344,7 @@ mod tests {
             firewall_scope,
             &sample_ports(),
             Some(broker_vm_ip),
+            &[],
         ));
         // The `pass quick` allow targets the broker VM IP (and precedes the
         // subnet deny), so the agent reaches its broker VM...
@@ -1202,6 +1382,37 @@ mod tests {
                 ),
                 "expected HostBitsSet for {bad:#034x}/{prefix}"
             );
+        }
+
+        #[test]
+        fn pf_interface_accepts_only_injection_safe_names(raw in ".{0,40}") {
+            // Whatever the input, an accepted PfInterface is an injection-safe
+            // token (letter-led, ASCII-alphanumeric, bounded) — so it can never
+            // introduce a pf.conf metacharacter when rendered.
+            if let Ok(iface) = PfInterface::new(raw.clone()) {
+                let name = iface.as_str();
+                prop_assert_eq!(name, raw.as_str());
+                prop_assert!(!name.is_empty() && name.len() <= PfInterface::MAX_LEN);
+                prop_assert!(name.chars().next().is_some_and(|c| c.is_ascii_alphabetic()));
+                prop_assert!(name.chars().all(|c| c.is_ascii_alphanumeric()));
+                // The rendered rule stays a single, well-formed line.
+                let rendered = render_pf(&session_firewall_pf_ruleset(
+                    session_id(),
+                    AgentFirewallNetwork::new(sample_pool().allocate(0).unwrap().ipv4(), None).unwrap(),
+                    &sample_ports(),
+                    None,
+                    std::slice::from_ref(&iface),
+                ));
+                let iface_lines: Vec<_> = rendered
+                    .lines()
+                    .filter(|l| l.contains("inet6 all"))
+                    .collect();
+                prop_assert_eq!(iface_lines.len(), 1);
+                prop_assert_eq!(
+                    iface_lines[0],
+                    format!("block return in quick on {name} inet6 all label \"writ deny agent v6 iface\"")
+                );
+            }
         }
 
         #[test]
