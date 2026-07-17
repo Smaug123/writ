@@ -312,7 +312,8 @@ external effects, reachable only on a whitelisted broker port/IP.
 `invocation` holds the `ProcessInvocation` execution primitive, `plan` the
 `AgentVmSessionPlan` start-step state machine + invocation builders),
 `agent_vm_daemon.rs` (2602) + `agent_vm_daemon/`, `agent_vm_firewall.rs`,
-`broker_vm.rs` (2636), `broker_vm_runner.rs`, `broker_entrypoint.rs`,
+`broker_vm.rs` (2422, with the `BrokerVmPlan` invocation builders in
+`broker_vm/plan.rs`), `broker_vm_runner.rs`, `broker_entrypoint.rs`,
 `broker_session.rs`, `broker_log_forwarder.rs`, `process_supervisor.rs`,
 `bin/writ-agent-vm-runner.rs`, `bin/writ-agent-vm-pf-helper.rs`. The PF ruleset
 model itself lives in `writ-core` (`core/agent_vm.rs`).
@@ -332,7 +333,7 @@ core (timeout + process-group SIGKILL).
 InstallFirewall → ProbeVmAbsent → StartVm → InstallGuestIpv6Deny →
 ProbeAndValidateGuestIpv6 → ReleaseGuestCommand); firewall
 `SessionFirewallInstall`/`Removal`/`PfctlInvocation` (`agent_vm_firewall.rs`);
-broker `BrokerVmPlan`/`BrokerSessionSpec`/`GuestAbsPath` (`broker_vm.rs:186`,
+broker `BrokerVmPlan`/`BrokerSessionSpec`/`GuestAbsPath` (`broker_vm.rs:190`,
 `broker_session.rs:63,24`).
 
 **Guarantees.** No egress except the broker: host placement via PF default-deny
