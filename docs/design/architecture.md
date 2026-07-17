@@ -104,15 +104,15 @@ These hold across subsystems and are the reason to trust the whole:
   constructors (`TtlSeconds`, `Sha256Hex`, `NotesRef`, `PfInterface`,
   `GitObjectId`, `GitCommitSha`). Interior code receives proof, not promises.
 - **Server-issued identity.** Session ids are minted by the broker
-  (`SessionId::new()` at `server.rs:195`), never chosen by the client. Grant
+  (`SessionId::new()` at `server.rs:199`), never chosen by the client. Grant
   authority (`AuthorizedMint`, `policy.rs:52`) has private fields and no public
   constructor, so it cannot be forged outside the policy engine.
 - **Transport auth = filesystem permissions.** The Unix socket's parent dir is
-  forced/checked to `0700` and refuses group/world bits (`server.rs:3118`). If
+  forced/checked to `0700` and refuses group/world bits (`server.rs:1375`). If
   you can open the socket, you are trusted.
 - **Two-phase, append-only audit.** The request row commits *before* any
   network mint; the outcome row (grant or mint-failure) follows. A minted token
-  whose grant fails to record is never delivered (`server.rs:2854`). A DB at a
+  whose grant fails to record is never delivered (`server.rs:1085`). A DB at a
   higher/mismatched schema version than the binary is refused, not opened
   (correctness over availability).
 - **Re-validation on the guest boundary.** Nothing the guest claims is trusted:
@@ -172,8 +172,10 @@ sessions, runs each capability request through the pure policy chokepoint, mints
 a short-lived token, and audits every step. It also hosts staged-push
 approve/reject/reconcile and agent-run/agent-VM orchestration.
 
-**Lives in.** `server.rs` (3188 lines; `server/` holds only test submodules),
-`protocol.rs` (2296), `broker_session.rs`, `broker_protocol.rs`, `policy.rs`,
+**Lives in.** `server.rs` (1433 lines: transport, dispatch, run-agent) plus
+`server/staged_push.rs` (1772: the list/show/reject/approve/reconcile approval
+handlers); `server/` also holds the test submodules. `protocol.rs` (2296),
+`broker_session.rs`, `broker_protocol.rs`, `policy.rs`,
 `config/` (`mod.rs` ~2960 + `audit_dir.rs`), `bin/writd.rs`, `bin/writ.rs` (the
 operator CLI verbs).
 
@@ -184,14 +186,15 @@ operator CLI verbs).
 `deny_unknown_fields`): `github_apps`, `policy`, `agent_vm?`, `secret_store`,
 `socket_path?`, `audit_db?`, `ui_http?`, `run_agent?`.
 
-**Entry points.** Accept loop `serve_broker_with_agent_vm` (`server.rs:3150`,
-task-per-connection) → `handle_connection` (`server.rs:2969`) →
-`dispatch_message_with_agent_vm` (`server.rs:181`, the big `ClientMessage`
-match) → `dispatch_capability`/`request_capability` (`server.rs:2745`).
+**Entry points.** Accept loop `serve_broker_with_agent_vm` (`server.rs:1395`,
+task-per-connection) → `handle_connection` (`server.rs:1214`) →
+`dispatch_message_with_agent_vm` (`server.rs:185`, the big `ClientMessage`
+match) → `dispatch_capability`/`request_capability` (`server.rs:990`); the
+staged-push arms delegate to `server/staged_push.rs`.
 
 **Guarantees.** Filesystem-permission transport auth (§4); two-phase audit
 ordering (§4); each connection line is bounded (`MAX_LINE_BYTES`,
-`server.rs:2921`) with a 60s idle timeout.
+`server.rs:1166`) with a 60s idle timeout.
 
 **Invariants.** Server-issued session ids; policy exhaustiveness by `match`
 (`decide`, `policy.rs:118`; `is_write`, `policy.rs:148`); config validated at
@@ -208,8 +211,10 @@ prediction has landed as *three* additional transports it never documents: the
 guest-facing `vm_http` HTTP listener (§5.6), the read-only `ui_http` JSON API
 (§5.10), and a broker-in-VM mode (`writd broker`, `broker_entrypoint.rs`) that
 binds a fixed TCP port and negotiates `BROKER_PROTOCOL_VERSION=2` via a
-ready-file handshake (§5.5). `server.rs` is a god-file: only ~30% is
-transport/dispatch; the rest is staged-push and run-agent orchestration.
+ready-file handshake (§5.5). The staged-push approval subsystem has been split
+into `server/staged_push.rs`; `server.rs` retains transport/dispatch and
+run-agent orchestration (still ~1.4k lines — run-agent is the next candidate to
+lift out).
 
 ### 5.3 Credential minting & secrets
 
@@ -246,7 +251,7 @@ carry a live secret refuse redirects so a 3xx `Location` can't exfiltrate it
 (ChatGPT refresh client, `openai_chatgpt_auth.rs:395`; and the shared VM proxy
 client, §5.6).
 
-**Neighbours.** Held by `BrokerState` (`server.rs:88`); called by the
+**Neighbours.** Held by `BrokerState` (`server.rs:90`); called by the
 capability path and staged-push promote; signing consumed by the git pipeline;
 OAuth headers consumed by the VM model proxies.
 

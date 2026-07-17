@@ -1,5 +1,6 @@
 //! `ApproveStagedPush` state-machine tests and `truncate_for_wire` units.
 
+use super::staged_push::{MAX_OPERATOR_BYTES, truncate_for_wire};
 use super::test_support::*;
 use super::*;
 use crate::audit::{GitPushApproveAttemptOutcome, GitPushApproveAttemptState};
