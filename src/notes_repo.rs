@@ -390,7 +390,7 @@ impl NotesRepo {
         args.extend(refspecs.iter().copied());
         run_git(
             &self.canonical_path,
-            args.into_iter(),
+            args,
             None,
             CaptureOutput::Discard,
             &self.inherited_env,
