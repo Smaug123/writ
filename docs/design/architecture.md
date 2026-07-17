@@ -311,7 +311,8 @@ external effects, reachable only on a whitelisted broker port/IP.
 `parse`/`state_store`/`network_health`/`invocation`/`plan` submodules —
 `invocation` holds the `ProcessInvocation` execution primitive, `plan` the
 `AgentVmSessionPlan` start-step state machine + invocation builders),
-`agent_vm_daemon.rs` (2602) + `agent_vm_daemon/`, `agent_vm_firewall.rs`,
+`agent_vm_daemon.rs` (1295, with the `AgentVmDaemon` method impl in
+`agent_vm_daemon/daemon_impl.rs`) + `agent_vm_daemon/`, `agent_vm_firewall.rs`,
 `broker_vm.rs` (2422, with the `BrokerVmPlan` invocation builders in
 `broker_vm/plan.rs`), `broker_vm_runner.rs`, `broker_entrypoint.rs`,
 `broker_session.rs`, `broker_log_forwarder.rs`, `process_supervisor.rs`,
@@ -343,7 +344,7 @@ gets no host mounts (tmpfs only); only the broker VM bind-mounts
 session/secrets(ro)/audit. Idempotent restart: `Probe*Absent` steps refuse to
 touch infra this call didn't create. On boot, `reconcile_one_session` closes
 broker authority in the audit log *before* unbounded teardown, and the daemon
-refuses to start while an obligation remains (`agent_vm_daemon.rs:1678`).
+refuses to start while an obligation remains (`agent_vm_daemon/daemon_impl.rs:704`).
 
 **Invariants.** Fail-closed firewall (`ensure_pf_enabled` +
 `ensure_session_bootstrap_anchor` before install; `ensure_session_anchor_empty`
