@@ -694,9 +694,18 @@ impl<B: ProxyBackend, S: SecretStore + Send + Sync + 'static> VmHttpProxyService
         broker_state: Arc<BrokerState<S>>,
         config: B::Config,
     ) -> Result<Self, reqwest::Error> {
+        // Refuse to follow redirects. The proxy attaches the host's upstream
+        // credential (a static `x-api-key`, an OAuth bearer) to every request,
+        // and reqwest strips only the standard sensitive headers
+        // (`Authorization`, `Cookie`) on a cross-origin redirect — an
+        // `x-api-key` would survive the hop. Chasing an upstream 3xx whose
+        // `Location` points at another origin would therefore hand that
+        // origin the live host key. With redirects disabled a 3xx is relayed
+        // back to the guest verbatim and its `Location` is never fetched.
         let client = reqwest::Client::builder()
             .connect_timeout(config.timeout())
             .read_timeout(config.timeout())
+            .redirect(reqwest::redirect::Policy::none())
             .build()?;
         let extras = B::build_extras(&broker_state, &config)?;
         Ok(Self {
