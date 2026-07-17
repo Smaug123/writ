@@ -496,9 +496,7 @@ pinned slugs.
 
 **Current-state note.** `notes_repo` is *not* bailiff-only: each daemon owns its
 own bare repo (writ writes `refs/notes/writ/v1/*`; bailiff fetches those and
-curates `refs/notes/bailiff/v1/plans/*`). A stale in-code comment on
-`MirrorCache::get` still says "no eviction today" though `evict_to_bounds`
-exists.
+curates `refs/notes/bailiff/v1/plans/*`).
 
 ### 5.9 Run provenance — envelopes & verification
 
@@ -590,9 +588,8 @@ for `implement` (load-bearing because implement grants `WorkspaceWrite`).
 
 **Current-state note.** The bailiff *split* is **complete in code**: the writ
 root crate has no `agent_plan` module and no plan/decide CLI verb (top-level
-`Cmd` is only OpenSession/CloseSession/Request/AgentVm/Agent/Promote). Only
-bailiff's own docstrings still describe the strip as pending — a comment lag,
-not a code lag.
+`Cmd` is only OpenSession/CloseSession/Request/AgentVm/Agent/Promote). bailiff's
+docstrings match: they describe the strip in the past tense, not as pending.
 
 ---
 

@@ -18,8 +18,8 @@
 //!
 //! The reviewer prompt is `reviewer_instructions` + the
 //! `REVIEWER_PROMPT_SEPARATOR` string + the plan body bytes, joined
-//! inline (rather than wrapping into `agent_plan::PlanBody` first) to
-//! avoid re-wrapping bytes just to unwrap them again for signing.
+//! inline (rather than re-wrapping the bytes in a structured
+//! plan-body type first) to avoid unwrapping them again for signing.
 //!
 //! # Error handling
 //!
@@ -282,8 +282,8 @@ pub async fn submit_review(
 const REVIEWER_PROMPT_SEPARATOR: &str = "\n\n---\n\n# Proposed plan\n\n";
 
 /// Compose the reviewer's effective prompt from operator instructions
-/// and the planner's plan body. Takes raw `&str` rather than
-/// `agent_plan::PlanBody` because the plan body has already been
+/// and the planner's plan body. Takes raw `&str` rather than a
+/// structured plan-body type because the plan body has already been
 /// extracted from the signed planner envelope as bytes — re-wrapping
 /// it just to unwrap it again for signing would be churn.
 fn compose_reviewer_prompt_bytes(

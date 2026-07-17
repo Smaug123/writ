@@ -247,9 +247,9 @@ impl MirrorCache {
 
     /// Return the path to the retained bare mirror for `key`, if one is cached.
     /// The caller should materialise an *independent* tree from it promptly (see
-    /// [`crate::flake_materialize`]) rather than hold the path: there is no
-    /// eviction today, but FK4's GC will reclaim mirrors, and a local clone is
-    /// unaffected by that whereas the returned path is not.
+    /// [`crate::flake_materialize`]) rather than hold the path: bounded eviction
+    /// (`evict_to_bounds`) or an external GC pass can reclaim the mirror, and a
+    /// local clone is unaffected by that whereas the returned path is not.
     pub fn get(&self, key: &MirrorCacheKey) -> Option<PathBuf> {
         let mirror = self.root.join(key.slug()).join(MIRROR_DIR_NAME);
         mirror.is_dir().then_some(mirror)

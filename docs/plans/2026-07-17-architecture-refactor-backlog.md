@@ -127,20 +127,30 @@ compiler-checked. The `flake_provision.rs` / `flake_provision_from_mirror.rs` /
 *collide* (only the two `nix_cache` did), so renaming them is lower-value churn
 better folded into the god-file/naming pass (Slice 8).
 
-### Slice 3 — delete vestigial paths and correct stale in-code claims
+### Slice 3 — correct stale in-code claims (implemented); vestigial-replay delete re-scoped
 
-"Delete aggressively." Each is independently verifiable:
-- Remove the vestigial staging-repo bring-up in `git_push_replay.rs`
-  (`GitPushReplayPlan` / `ReplayTarget` / `ingest_bundle` / `prepare_staging_repo`)
-  — constructed only by that module's own tests; the live approve path uses
-  `git_push_approve.rs::run_prepare_steps`. Confirm zero non-test callers, then
-  delete both the path and its tests.
-- Fix the `MirrorCache::get` doc-comment that still says "no eviction today"
+"Delete aggressively." Two independently-verifiable stale-comment fixes, done:
+- Fixed the `MirrorCache::get` doc-comment that still said "no eviction today"
   though `evict_to_bounds` exists (`vm_git_mirror_cache.rs`).
-- Correct `bailiff`'s docstrings that describe the writ-side strip as pending
-  ("slice G deletes writ's legacy verb", "the soon-to-leave `agent_plan::PlanId`",
-  "the legacy `RejectedRestart` naming") — the migration is complete in code;
-  only the comments lag.
+- Swept `bailiff`'s docstrings for *every* claim that described the writ-side
+  strip as still pending (`plan decide` "going away in slice G", the
+  "soon-to-leave `agent_plan::PlanId`", `agent_plan::PlanBody` as a current
+  alternative) and reworded to past tense — the strip is complete (writ has no
+  `agent_plan` module, no `plan decide` verb, no `RejectedRestart`). writ's own
+  audit-schema comments keep their accurate past-tense slice-G history.
+
+**Re-scoped.** The third item — "remove the vestigial staging-repo bring-up in
+`git_push_replay.rs`" — is larger than a dead-path delete. The `GitPushReplayPlan`
+/ `ReplayTarget` / `ingest_bundle` / `prepare_staging_repo` cluster does have zero
+external *code* callers (the live approve path reimplements bring-up in
+`git_push_approve.rs`), but it is **interleaved** in the same 1804-line module
+with the *live* `TrailerSource` / `TrailerKey` / `TrailerValue` commit-trailer
+vocabulary that `git_push_approve`, `git_push_promote`, and
+`git_push_replay_walker` all import. Removing the dead cluster therefore means
+*extracting* the trailer types (e.g. into a `git_push_trailers` module) and
+deleting the rest — a module split, not a one-shot delete. Folded into **Slice
+6** (git-pipeline extraction), where these boundaries move anyway; doing it there
+avoids a risky ~1.4k-line surgery bundled with unrelated work.
 
 ### Slice 4 — extract the guest client into its own crate (`writ-vm-client`)
 
@@ -173,7 +183,11 @@ so do it after Slices 4–5 prove the extraction pattern. Rename the
 accretion-order modules to domain names *inside* the new crate in the same pass
 (e.g. `git_push_replay_object_source` → `objects::cat_file_source`,
 `git_push_replay_object_parse` → `objects::parse`,
-`git_push_replay_walker` → `replay::walker`). Note `notes_repo` is shared with
+`git_push_replay_walker` → `replay::walker`). **Absorbs the re-scoped Slice 3
+item**: `git_push_replay.rs` is now dead except for the `TrailerSource` family,
+so extract those into `git_push_trailers` (updating the three importers) and
+delete the vestigial `GitPushReplayPlan` / `ReplayTarget` / `ingest_bundle` /
+`prepare_staging_repo` cluster and its tests. Note `notes_repo` is shared with
 `bailiff`; if the coupling is awkward, split it into a small `writ-git-notes`
 that both depend on rather than forcing `bailiff` to pull the whole pipeline.
 

@@ -32,10 +32,10 @@
 //! implementer piece. Everything here is pure data with no IO and no
 //! CLI; the write helpers live in [`crate::bailiff_plan_write`].
 //!
-//! `PlanId` is a fresh bailiff-side type — not the `agent_plan::PlanId`
-//! that's leaving writ in slice G. Keeping them distinct now means
-//! the slice-G strip can delete `agent_plan` wholesale instead of
-//! threading a renaming through bailiff at the same time.
+//! `PlanId` is a bailiff-side type, distinct from the `agent_plan::PlanId`
+//! writ used to carry (writ's `agent_plan` module has since been removed).
+//! Keeping them separate let that strip delete `agent_plan` wholesale
+//! instead of threading a rename through bailiff at the same time.
 
 use std::fmt;
 use std::str::FromStr;
@@ -62,7 +62,7 @@ pub const BAILIFF_PLAN_NOTES_REF_PREFIX: &str = "refs/notes/bailiff/v1/plans/";
 ///
 /// UUID v4 under the hood, the same shape (transparent serde, debug
 /// label, FromStr) as writ's other newtypes (`AgentRunId`,
-/// `SessionId`, the soon-to-leave `agent_plan::PlanId`). Bailiff
+/// `SessionId`, and the now-removed `agent_plan::PlanId`). Bailiff
 /// allocates the id on submit; writ never sees it.
 #[derive(Copy, Clone, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -325,8 +325,8 @@ impl DecisionNote {
     ///
     /// The bytes returned here are what gets written as the body of
     /// the git note. D1 does not sign decisions (see the type-level
-    /// docstring); the slice-G or successor follow-up that does will
-    /// sign exactly these bytes.
+    /// docstring); a future follow-up that does will sign exactly
+    /// these bytes.
     pub fn canonical_bytes(&self) -> Vec<u8> {
         serde_json::to_vec(self).expect("DecisionNote serialises to JSON without IO; cannot fail")
     }

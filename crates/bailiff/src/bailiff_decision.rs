@@ -164,8 +164,8 @@ mod tests {
     }
 
     /// `FromStr` rejects strings that aren't a known variant. The
-    /// `rejected_restart` legacy spelling from the writ-side enum is
-    /// explicitly **not** accepted: bailiff's `Decision` is a new
+    /// `rejected_restart` spelling from writ's former decision enum is
+    /// explicitly **not** accepted: bailiff's `Decision` is a distinct
     /// shape, not an alias.
     #[test]
     fn decision_from_str_rejects_unknown_and_legacy_spellings() {
