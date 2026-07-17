@@ -49,7 +49,7 @@ use crate::vm_http::{
     VmHttpRuntimeError, VmHttpRuntimeShutdownError, prepare_vm_http_session_with_agent_runs,
 };
 
-pub use crate::vm_client::{
+pub use crate::vm_git::{
     VM_BROKER_TOKEN_ENV as AGENT_VM_BROKER_TOKEN_ENV, VM_BROKER_URL_ENV as AGENT_VM_BROKER_URL_ENV,
 };
 
@@ -71,8 +71,9 @@ pub const AGENT_VM_NIX_CACHE_URL_ENV: &str = "WRIT_NIX_CACHE_URL";
 /// a `nix_prewarm_cache_dir` configured: its presence is what switches the
 /// guest's devShell warm onto the local-only `/v1/nix/prewarm` view. Absent (no
 /// pre-warming in this deployment), the warm keeps the session-default proxied
-/// substituter, exactly as before.
-pub const AGENT_VM_NIX_PREWARM_URL_ENV: &str = "WRIT_NIX_PREWARM_URL";
+/// substituter, exactly as before. Same env-var name the guest reads as
+/// [`crate::vm_git::VM_NIX_PREWARM_URL_ENV`] — this is the host-facing alias.
+pub use crate::vm_git::VM_NIX_PREWARM_URL_ENV as AGENT_VM_NIX_PREWARM_URL_ENV;
 pub const AGENT_VM_NIX_BASIC_LOGIN_ENV: &str = "WRIT_NIX_BASIC_LOGIN";
 pub const AGENT_VM_NIX_NETRC_ENV: &str = "WRIT_NIX_NETRC";
 pub const AGENT_VM_NIX_NETRC_PATH: &str = "/run/writ-agent-vm/netrc";

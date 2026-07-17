@@ -98,7 +98,9 @@ pub use writ_core::telemetry;
 pub mod ui_http;
 #[cfg(feature = "vm-client")]
 pub mod vm_client;
-#[cfg(feature = "vm-client")]
+// The shared VM-git wire types are needed by both the host (git pipeline, agent
+// VM) and the guest client, so the re-export is available under either feature.
+#[cfg(any(feature = "host", feature = "vm-client"))]
 pub use writ_vm_git as vm_git;
 #[cfg(feature = "host")]
 pub mod vm_git_bundle;

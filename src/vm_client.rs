@@ -30,13 +30,10 @@ use crate::vm_git::{
     nix_develop_command_args, nix_print_dev_env_command_args, nix_substituters_override_args,
 };
 
-pub const VM_BROKER_URL_ENV: &str = "WRIT_BROKER_URL";
-pub const VM_BROKER_TOKEN_ENV: &str = "WRIT_BROKER_TOKEN";
-/// The strict, pre-warm-only substituter URL, injected by the daemon exactly
-/// when the broker serves a pre-warm cache dir. When present, the devShell
-/// warm's nix invocations replace their substituters with this URL, so the
-/// warm never reaches the upstream-proxying cache view.
-pub const VM_NIX_PREWARM_URL_ENV: &str = "WRIT_NIX_PREWARM_URL";
+// The broker/pre-warm env-var names are a host↔guest wire contract, so they
+// live in `writ-vm-git`; re-exported here for existing `vm_client::…` callers.
+pub use crate::vm_git::{VM_BROKER_TOKEN_ENV, VM_BROKER_URL_ENV, VM_NIX_PREWARM_URL_ENV};
+
 pub const DEFAULT_VM_CLIENT_MAX_BUNDLE_BYTES: u64 = 512 * 1024 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
