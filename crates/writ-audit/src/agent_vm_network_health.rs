@@ -1,14 +1,15 @@
 //! DAO for agent-VM network-health transition events.
 //!
 //! The daemon detects, host-side, when a running agent VM has lost its path to
-//! the broker (see [`crate::agent_vm_lifecycle::network_health`]) and appends
-//! one row here on each debounced transition. Append-only: no UPDATE/DELETE.
+//! the broker (see the host `agent_vm_lifecycle::network_health` module) and
+//! appends one row here on each debounced transition. Append-only: no
+//! UPDATE/DELETE.
 
 use rusqlite::params;
+use writ_core::core::NetworkHealth;
 
 use super::{AuditError, AuditLog};
-use crate::agent_vm_lifecycle::NetworkHealth;
-use crate::core::{SessionId, UnixMillis};
+use writ_core::core::{SessionId, UnixMillis};
 
 /// One debounced host-side network-health transition for a session. Recorded
 /// only when the surfaced health value actually changes (e.g. `reachable` ->
@@ -51,7 +52,7 @@ impl AuditLog {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::audit::test_support::sample_session;
+    use crate::test_support::sample_session;
 
     fn sample(session_id: SessionId) -> AgentVmNetworkHealthEventRecord {
         AgentVmNetworkHealthEventRecord {

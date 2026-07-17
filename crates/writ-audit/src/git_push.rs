@@ -3,9 +3,9 @@
 use rusqlite::{OptionalExtension, Row, params};
 
 use super::{AuditError, AuditLog};
-use crate::agent_run::CorrelationId;
-use crate::core::{ApproveAttemptId, Jti, RequestId, SessionId, UnixMillis};
-use crate::vm_git::{GitBranchName, GitCloneRepo, GitObjectId};
+use writ_agent_run::CorrelationId;
+use writ_core::core::{ApproveAttemptId, Jti, RequestId, SessionId, UnixMillis};
+use writ_vm_git::{GitBranchName, GitCloneRepo, GitObjectId};
 
 #[derive(Debug)]
 pub struct GitPushRequestRecord {
@@ -181,8 +181,8 @@ impl UncertainAttempt {
     /// Fabricate a witness without touching an audit log. Tests of the
     /// promote layer drive the PATCH directly and have no `AuditLog` to
     /// mint one from; production code cannot reach this.
-    #[cfg(test)]
-    pub(crate) fn for_test(attempt_id: ApproveAttemptId) -> Self {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn for_test(attempt_id: ApproveAttemptId) -> Self {
         Self { attempt_id }
     }
 }

@@ -2963,6 +2963,7 @@ dependencies = [
  "uuid",
  "wiremock",
  "writ-agent-run",
+ "writ-audit",
  "writ-core",
  "writ-vm-client",
  "writ-vm-git",
@@ -2982,6 +2983,23 @@ dependencies = [
  "thiserror",
  "uuid",
  "writ-core",
+]
+
+[[package]]
+name = "writ-audit"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "time",
+ "uuid",
+ "writ-agent-run",
+ "writ-core",
+ "writ-vm-git",
 ]
 
 [[package]]

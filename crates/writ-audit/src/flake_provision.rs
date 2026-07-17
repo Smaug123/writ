@@ -12,7 +12,7 @@ use rusqlite::{OptionalExtension, Row, params};
 
 use super::validation::{labeled_invariant, u64_to_sql_i64};
 use super::{AuditError, AuditLog};
-use crate::core::{RequestId, SessionId, UnixMillis};
+use writ_core::core::{RequestId, SessionId, UnixMillis};
 
 const LABEL: &str = "Flake provision";
 
@@ -306,7 +306,7 @@ fn nonneg(value: Option<i64>, what: &'static str) -> Result<u64, AuditError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::audit::test_support::sample_session;
+    use crate::test_support::sample_session;
 
     fn request(
         request_id: RequestId,

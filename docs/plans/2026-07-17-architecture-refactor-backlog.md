@@ -203,15 +203,22 @@ daemon, CLI, protocol, and audit. Moved the enum to a new
 *produces* it) re-exports it via `pub use crate::core::NetworkHealth`, so every
 `agent_vm_lifecycle::NetworkHealth` consumer is unchanged. Three files touched.
 
-### Slice 5b — extract the audit log into `writ-audit`
+### Slice 5b — extract the audit log into `writ-audit` (implemented)
 
-`src/audit/` is a self-contained SQLite subsystem (open/migrate, the typed row
-DAOs, the two-phase write helpers). With `NetworkHealth` in `writ-core` (5a),
-its only cross-crate deps are `writ-core`, `writ-agent-run`, and `writ-vm-git`.
-Extract it to `crates/writ-audit/`, re-exported as `writ::audit` to keep call
-sites stable. **Not** part of the crate: `boot_reconcile.rs` stays in `writ`
-(it depends on `git_push_staging`, a Slice-6 module). Buys compile isolation:
-editing schema/DAOs stops recompiling the whole shell.
+Moved `src/audit/` → `crates/writ-audit/` (deps `writ-core`, `writ-agent-run`
+[host], `writ-vm-git`, `rusqlite`, `serde`, `serde_json`, `time`, `uuid`,
+`thiserror`). Rewrote `crate::{core,agent_run,vm_git}` → their crates and
+`crate::audit` → `crate`; re-exported as `pub use writ_audit as audit` under the
+`host` feature (optional dep), so all ~32 `crate::audit::…` consumers are
+unchanged. `boot_reconcile.rs` stays in `writ` — it drives the audit DAOs but
+also needs `git_push_staging` (Slice 6), so it's an orchestrator, not storage.
+
+Two mechanical wrinkles the compiler surfaced: the crate-root `AuditLog`
+`with_conn` helpers were `pub(super)` (invalid at a lib root) → `pub(crate)`; and
+the `*_for_test` DAO read-back helpers (used by `writ`'s vm_http/git_push tests)
+were `#[cfg(test)]` and don't cross crates → moved behind a `test-support`
+feature (`writ` enables it as a dev-dependency), matching the 4a pattern. Buys
+compile isolation: editing schema/DAOs stops recompiling the whole shell.
 
 ### Slice 6 — extract the git pipeline into `writ-git`
 

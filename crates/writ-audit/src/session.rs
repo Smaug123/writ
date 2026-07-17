@@ -4,7 +4,7 @@
 use rusqlite::{OptionalExtension, Row, params};
 
 use super::{AuditError, AuditLog};
-use crate::core::{AgentKind, SessionId, SessionRecord, UnixMillis};
+use writ_core::core::{AgentKind, SessionId, SessionRecord, UnixMillis};
 
 impl AuditLog {
     pub fn open_session(&self, s: &SessionRecord) -> Result<(), AuditError> {
@@ -90,7 +90,7 @@ impl rusqlite::types::FromSql for SqlAgentKind {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::audit::test_support::sample_session;
+    use crate::test_support::sample_session;
 
     #[test]
     fn session_roundtrips() {

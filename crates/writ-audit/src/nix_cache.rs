@@ -13,7 +13,7 @@ use super::proxy_table::{
 };
 use super::validation::u16_from_sql_status;
 use super::{AuditError, AuditLog};
-use crate::core::{RequestId, SessionId, UnixMillis};
+use writ_core::core::{RequestId, SessionId, UnixMillis};
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum NixCacheAuditRoute {
@@ -225,7 +225,7 @@ fn nix_cache_audit_entry_from_row(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::audit::test_support::sample_session;
+    use crate::test_support::sample_session;
 
     fn record_nix_cache_request(
         log: &AuditLog,

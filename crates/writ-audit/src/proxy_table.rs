@@ -18,7 +18,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use super::validation::labeled_invariant;
 use super::{AuditError, AuditLog};
-use crate::core::{RequestId, SessionId, UnixMillis};
+use writ_core::core::{RequestId, SessionId, UnixMillis};
 
 /// Per-backend route enum projected into the audit row's `route`
 /// column.
@@ -296,7 +296,7 @@ impl AuditLog {
     /// benign: the paths that use this coalesced writer grant no authority, the
     /// caller refuses to serve the response (fail-closed), and — because the
     /// refusal is an `AuditError` — the caller still emits an
-    /// [`AUDIT_WRITE_FAILURE_TARGET`](crate::audit::AUDIT_WRITE_FAILURE_TARGET)
+    /// [`AUDIT_WRITE_FAILURE_TARGET`](crate::AUDIT_WRITE_FAILURE_TARGET)
     /// event, so the access is logged even when it is not a structured row.
     /// Reproducing the two-phase's mid-close durability would require the second
     /// fsync this method exists to remove, so it is a conscious trade for the
@@ -336,7 +336,7 @@ impl AuditLog {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl AuditLog {
     /// Test-only helper: read back the `(http_status, response_bytes,
     /// error)` triple for a recorded outcome row. Generic over the
@@ -417,7 +417,7 @@ impl AuditLog {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::audit::test_support::sample_session;
+    use crate::test_support::sample_session;
     use proptest::prelude::*;
 
     /// Tiny scratch backend used to exercise the generic DAO without

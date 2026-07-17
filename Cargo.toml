@@ -4,11 +4,11 @@ version = "0.1.0"
 edition = "2024"
 
 [workspace]
-members = ["crates/writ-core", "crates/writ-vm-git", "crates/writ-agent-run", "crates/writ-vm-client", "crates/bailiff"]
+members = ["crates/writ-core", "crates/writ-vm-git", "crates/writ-agent-run", "crates/writ-vm-client", "crates/writ-audit", "crates/bailiff"]
 # Without this, root-level `cargo clippy/test/doc` (as run by CI) select only
 # the root `writ` package, silently skipping member crates' own test targets
 # and rustdoc. Keep every member in the default gate set.
-default-members = [".", "crates/writ-core", "crates/writ-vm-git", "crates/writ-agent-run", "crates/writ-vm-client", "crates/bailiff"]
+default-members = [".", "crates/writ-core", "crates/writ-vm-git", "crates/writ-agent-run", "crates/writ-vm-client", "crates/writ-audit", "crates/bailiff"]
 resolver = "3"
 
 [features]
@@ -20,6 +20,7 @@ default = ["host"]
 host = [
     "writ-core/host",
     "writ-agent-run/host",
+    "dep:writ-audit",
     "dep:base64",
     "dep:bytes",
     "dep:futures-util",
@@ -78,6 +79,8 @@ writ-core = { path = "crates/writ-core" }
 writ-agent-run = { path = "crates/writ-agent-run" }
 # The guest client, re-exported as `writ::vm_client` under the vm-client feature.
 writ-vm-client = { path = "crates/writ-vm-client", optional = true }
+# The audit log, re-exported as `writ::audit` under the host feature.
+writ-audit = { path = "crates/writ-audit", optional = true }
 writ-vm-git = { path = "crates/writ-vm-git", optional = true }
 clap = { version = "4", features = ["derive", "env"] }
 serde = { version = "1", features = ["derive"] }
@@ -115,3 +118,6 @@ tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "test-ut
 # `test-support` exposes `AgentPrompt::new` (a panicking test constructor) to
 # this crate's tests, which use it in ~30 places across modules.
 writ-agent-run = { path = "crates/writ-agent-run", features = ["test-support"] }
+# `test-support` exposes audit's `*_for_test` DAO read-back helpers to writ's
+# tests (vm_http proxy tests, git_push_approve tests).
+writ-audit = { path = "crates/writ-audit", features = ["test-support"] }

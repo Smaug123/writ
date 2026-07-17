@@ -12,11 +12,11 @@ use super::validation::{
     validate_agent_run_stream_path_text, validate_sha256_hex, validate_stream_summary,
 };
 use super::{AuditError, AuditLog};
-use crate::agent_run::{
+use writ_agent_run::{
     AgentPromptSummary, AgentRunId, AgentRunOutcome, AgentRunStreamSummary, AgentRunTerminalStatus,
     CorrelationId,
 };
-use crate::core::{AgentKind, SessionId, UnixMillis};
+use writ_core::core::{AgentKind, SessionId, UnixMillis};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AgentVmWorkspaceBootstrapAuditRecord {
@@ -510,9 +510,9 @@ fn agent_run_status_from_str(raw: &str) -> Result<AgentRunTerminalStatus, AuditE
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::audit::test_support::sample_session;
-    use crate::core::{AgentKind, SessionRecord};
+    use crate::test_support::sample_session;
     use rusqlite::params;
+    use writ_core::core::{AgentKind, SessionRecord};
 
     #[test]
     fn agent_vm_workspace_bootstrap_roundtrips() {
@@ -573,7 +573,7 @@ mod tests {
         let log = AuditLog::open_in_memory().unwrap();
         let s = sample_session();
         log.open_session(&s).unwrap();
-        let prompt = crate::agent_run::AgentPrompt::new("SECRET prompt body");
+        let prompt = writ_agent_run::AgentPrompt::new("SECRET prompt body");
         let run_id = AgentRunId::new();
         let record = AgentRunAuditRecord {
             run_id,
@@ -603,13 +603,13 @@ mod tests {
             stdout: AgentRunStreamSummary {
                 path: "/private/writ/runs/stdout.log".into(),
                 byte_len: 12,
-                sha256_hex: crate::agent_run::sha256_hex(b"stdout bytes"),
+                sha256_hex: writ_agent_run::sha256_hex(b"stdout bytes"),
                 truncated: false,
             },
             stderr: AgentRunStreamSummary {
                 path: "/private/writ/runs/stderr.log".into(),
                 byte_len: 4096,
-                sha256_hex: crate::agent_run::sha256_hex(b"stderr bytes"),
+                sha256_hex: writ_agent_run::sha256_hex(b"stderr bytes"),
                 truncated: true,
             },
         };
@@ -635,7 +635,7 @@ mod tests {
             session_id: s.session_id,
             requested_at: UnixMillis::from_millis(1_700_000_100),
             agent_kind: AgentKind::Codex,
-            prompt: crate::agent_run::AgentPrompt::new("prompt").summary(),
+            prompt: writ_agent_run::AgentPrompt::new("prompt").summary(),
             correlation_id: None,
         };
 
@@ -657,13 +657,13 @@ mod tests {
             stdout: AgentRunStreamSummary {
                 path: "/private/writ/runs/stdout.log".into(),
                 byte_len: 0,
-                sha256_hex: crate::agent_run::sha256_hex(b""),
+                sha256_hex: writ_agent_run::sha256_hex(b""),
                 truncated: false,
             },
             stderr: AgentRunStreamSummary {
                 path: "/private/writ/runs/stderr.log".into(),
                 byte_len: 0,
-                sha256_hex: crate::agent_run::sha256_hex(b""),
+                sha256_hex: writ_agent_run::sha256_hex(b""),
                 truncated: false,
             },
         };
@@ -721,13 +721,13 @@ mod tests {
                     stdout: AgentRunStreamSummary {
                         path: "relative/stdout.log".into(),
                         byte_len: 0,
-                        sha256_hex: crate::agent_run::sha256_hex(b""),
+                        sha256_hex: writ_agent_run::sha256_hex(b""),
                         truncated: false,
                     },
                     stderr: AgentRunStreamSummary {
                         path: "/private/writ/runs/stderr.log".into(),
                         byte_len: 0,
-                        sha256_hex: crate::agent_run::sha256_hex(b""),
+                        sha256_hex: writ_agent_run::sha256_hex(b""),
                         truncated: false,
                     },
                 },
@@ -755,7 +755,7 @@ mod tests {
             session_id: s.session_id,
             requested_at: UnixMillis::from_millis(1_700_000_100),
             agent_kind: AgentKind::Claude,
-            prompt: crate::agent_run::AgentPrompt::new("prompt").summary(),
+            prompt: writ_agent_run::AgentPrompt::new("prompt").summary(),
             correlation_id: Some(correlation.clone()),
         };
 
@@ -777,7 +777,7 @@ mod tests {
             session_id: s.session_id,
             requested_at: UnixMillis::from_millis(1_700_000_100),
             agent_kind: AgentKind::Claude,
-            prompt: crate::agent_run::AgentPrompt::new("prompt").summary(),
+            prompt: writ_agent_run::AgentPrompt::new("prompt").summary(),
             correlation_id: None,
         })
         .unwrap();
@@ -808,7 +808,7 @@ mod tests {
                         run_id.as_uuid().to_string(),
                         s.session_id.as_uuid().to_string(),
                         1_700_000_100i64,
-                        crate::agent_run::sha256_hex(b"x"),
+                        writ_agent_run::sha256_hex(b"x"),
                         "bad space",
                     ],
                 )
@@ -831,7 +831,7 @@ mod tests {
                         AgentRunId::new().as_uuid().to_string(),
                         s.session_id.as_uuid().to_string(),
                         1_700_000_101i64,
-                        crate::agent_run::sha256_hex(b"y"),
+                        writ_agent_run::sha256_hex(b"y"),
                         too_long,
                     ],
                 )
@@ -875,7 +875,7 @@ mod tests {
             session_id: untagged.session_id,
             requested_at: UnixMillis::from_millis(1_700_000_100),
             agent_kind: AgentKind::Claude,
-            prompt: crate::agent_run::AgentPrompt::new("prompt").summary(),
+            prompt: writ_agent_run::AgentPrompt::new("prompt").summary(),
             correlation_id: None,
         })
         .unwrap();
@@ -897,7 +897,7 @@ mod tests {
             session_id: tagged.session_id,
             requested_at: UnixMillis::from_millis(1_700_000_200),
             agent_kind: AgentKind::Claude,
-            prompt: crate::agent_run::AgentPrompt::new("prompt").summary(),
+            prompt: writ_agent_run::AgentPrompt::new("prompt").summary(),
             correlation_id: Some(correlation.clone()),
         })
         .unwrap();
@@ -930,7 +930,7 @@ mod tests {
             session_id: session.session_id,
             requested_at: UnixMillis::from_millis(1_700_000_100),
             agent_kind: AgentKind::Claude,
-            prompt: crate::agent_run::AgentPrompt::new("plan this").summary(),
+            prompt: writ_agent_run::AgentPrompt::new("plan this").summary(),
             correlation_id: None,
         })
         .unwrap();
@@ -940,7 +940,7 @@ mod tests {
             session_id: session.session_id,
             requested_at: UnixMillis::from_millis(1_700_000_200),
             agent_kind: AgentKind::Claude,
-            prompt: crate::agent_run::AgentPrompt::new("review the plan").summary(),
+            prompt: writ_agent_run::AgentPrompt::new("review the plan").summary(),
             correlation_id: None,
         })
         .unwrap();
@@ -982,7 +982,7 @@ mod tests {
             session_id: session.session_id,
             requested_at: UnixMillis::from_millis(1_700_000_500),
             agent_kind: AgentKind::Claude,
-            prompt: crate::agent_run::AgentPrompt::new("p").summary(),
+            prompt: writ_agent_run::AgentPrompt::new("p").summary(),
             correlation_id: None,
         })
         .unwrap();
@@ -991,7 +991,7 @@ mod tests {
             session_id: session.session_id,
             requested_at: UnixMillis::from_millis(1_700_000_100),
             agent_kind: AgentKind::Claude,
-            prompt: crate::agent_run::AgentPrompt::new("p").summary(),
+            prompt: writ_agent_run::AgentPrompt::new("p").summary(),
             correlation_id: None,
         })
         .unwrap();
