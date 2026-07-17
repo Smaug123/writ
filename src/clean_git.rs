@@ -36,6 +36,15 @@ pub(crate) const CLEAN_GIT_CONFIG_ENV: [(&str, &str); 4] = [
 // root prevents a broker-local `.git/config` from rewriting a pinned HTTPS URL.
 pub(crate) const CLEAN_GIT_CURRENT_DIR: &str = "/";
 
+/// Stdout byte cap for clean-Git commands whose output is a single short line —
+/// `cat-file -t` (a type word), `rev-parse` (one object id), or
+/// `rev-parse --is-shallow-repository` (`true`/`false`). Real output is at most
+/// ~65 bytes; 4 KiB leaves generous headroom while still bounding a
+/// malfunctioning or hostile `git` that streams unbounded stdout on one of
+/// these plumbing commands. Commands with genuinely variable-size output (a
+/// `rev-list` walk over an untrusted bundle) pass their own, larger cap.
+pub(crate) const SMALL_STDOUT_CAP: usize = 4 * 1024;
+
 /// A fully-specified Git invocation: resolved program, argv, env, and the
 /// names of any secret env variables the runtime should populate from a
 /// caller-supplied secret value.
@@ -89,6 +98,10 @@ pub(crate) enum CleanGitError {
         pgid: libc::pid_t,
         source: std::io::Error,
     },
+    #[error(
+        "Git command wrote more than the {cap}-byte stdout capture cap; the process group was killed and the output discarded"
+    )]
+    StdoutCapExceeded { cap: usize },
 }
 
 // Map the program-agnostic supervisor failures back onto the Git-flavoured
@@ -208,12 +221,28 @@ pub(crate) async fn run_clean_git(
 /// disposition. Use this when the result of the command is encoded in the
 /// child's stdout (e.g. `cat-file -t` returns the object's type), not just
 /// in the exit code.
+///
+/// `stdout_byte_cap` bounds the captured output: a child that writes more is
+/// killed (process group SIGKILLed) and the call fails with
+/// [`CleanGitError::StdoutCapExceeded`] rather than letting the host buffer
+/// unbounded bytes. Every caller must state its bound — [`SMALL_STDOUT_CAP`]
+/// for single-line plumbing commands, a larger explicit cap for commands whose
+/// output size is driven by untrusted input.
 pub(crate) async fn run_clean_git_capture_stdout(
     invocation: &CleanGitInvocation,
     timeout: Duration,
+    stdout_byte_cap: usize,
     secret: Option<&str>,
 ) -> Result<Vec<u8>, CleanGitError> {
-    run_clean_git_inner(invocation, timeout, secret, StdoutMode::Capture).await
+    run_clean_git_inner(
+        invocation,
+        timeout,
+        secret,
+        StdoutMode::Capture {
+            byte_cap: stdout_byte_cap,
+        },
+    )
+    .await
 }
 
 async fn run_clean_git_inner(
@@ -270,6 +299,9 @@ async fn run_clean_git_inner(
             }
         }
         SupervisedOutcome::TimedOut => Err(CleanGitError::TimedOut(timeout)),
+        SupervisedOutcome::StdoutCapExceeded { cap } => {
+            Err(CleanGitError::StdoutCapExceeded { cap })
+        }
     }
 }
 
@@ -409,17 +441,22 @@ mod tests {
             clean_git_config_env(),
             Vec::new(),
         );
-        let stdout = run_clean_git_capture_stdout(&invocation, Duration::from_secs(10), None)
-            .await
-            .unwrap_or_else(|err| {
-                // A `Spawn(ETXTBSY)` here means a sibling test's `fork()`
-                // held a writable fd to the just-written probe past the
-                // retry ceiling under parallel-test load; any other
-                // variant points elsewhere. Surface the exact error so a
-                // future flake is self-diagnosing rather than a bare
-                // "env probe must succeed".
-                panic!("env probe must succeed, but clean-git run failed: {err:?}");
-            });
+        let stdout = run_clean_git_capture_stdout(
+            &invocation,
+            Duration::from_secs(10),
+            SMALL_STDOUT_CAP,
+            None,
+        )
+        .await
+        .unwrap_or_else(|err| {
+            // A `Spawn(ETXTBSY)` here means a sibling test's `fork()`
+            // held a writable fd to the just-written probe past the
+            // retry ceiling under parallel-test load; any other
+            // variant points elsewhere. Surface the exact error so a
+            // future flake is self-diagnosing rather than a bare
+            // "env probe must succeed".
+            panic!("env probe must succeed, but clean-git run failed: {err:?}");
+        });
         let text = std::str::from_utf8(&stdout).expect("env output is UTF-8");
 
         let hardened: BTreeMap<&str, &str> = [
@@ -515,6 +552,34 @@ mod tests {
                 );
             }
             other => panic!("expected CleanGitError::Failed, got {other:?}"),
+        }
+    }
+
+    /// A child that streams unbounded stdout is rejected with
+    /// `StdoutCapExceeded` (not buffered to exhaustion), and the run returns
+    /// promptly — a 30s timeout against a child that never stops writing proves
+    /// the cap, not the clock, ends it.
+    #[tokio::test]
+    async fn run_clean_git_capture_rejects_unbounded_stdout() {
+        let sh = locate_on_path("sh");
+        let invocation = CleanGitInvocation::new(
+            sh,
+            [
+                OsString::from("-c"),
+                // Unbounded stdout via shell builtins only (no PATH needed under
+                // the cleared environment).
+                OsString::from("while :; do printf 'writ-overrun-padding\\n'; done"),
+            ],
+            clean_git_config_env(),
+            Vec::new(),
+        );
+        let err =
+            run_clean_git_capture_stdout(&invocation, Duration::from_secs(30), 64 * 1024, None)
+                .await
+                .expect_err("unbounded stdout must be rejected");
+        match err {
+            CleanGitError::StdoutCapExceeded { cap } => assert_eq!(cap, 64 * 1024),
+            other => panic!("expected CleanGitError::StdoutCapExceeded, got {other:?}"),
         }
     }
 
