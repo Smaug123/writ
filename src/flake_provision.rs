@@ -278,6 +278,18 @@ pub async fn provision_flake_inputs(
     };
 
     match outcome {
+        SupervisedOutcome::StdoutCapExceeded { cap } => {
+            // Unreachable under StdoutMode::Discard (stdout is never captured,
+            // so the cap is never evaluated), but fail closed rather than panic
+            // if the supervisor contract ever changes underneath us.
+            let message = format!("nix flake archive stdout exceeded the {cap}-byte capture cap");
+            write_outcome(
+                audit,
+                request_id,
+                FlakeProvisionResult::Failure { error: &message },
+            )?;
+            Err(FlakeProvisionError::Supervise(message))
+        }
         SupervisedOutcome::TimedOut => {
             let message = format!("nix flake archive timed out after {:?}", bounds.timeout());
             write_outcome(

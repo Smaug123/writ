@@ -26,7 +26,7 @@ use std::process::ExitStatus;
 use std::time::Duration;
 
 use crate::clean_git::{
-    self, CleanGitEnv, CleanGitError, CleanGitInvocation, clean_git_config_env,
+    self, CleanGitEnv, CleanGitError, CleanGitInvocation, SMALL_STDOUT_CAP, clean_git_config_env,
 };
 use crate::vm_git::{GitBranchName, GitCloneRepo, GitObjectId};
 use crate::vm_git_bundle::{GitCloneBaseUrl, GitCredentialBoundary, GitSecretValue};
@@ -226,6 +226,13 @@ pub enum GitPushReplayRunError {
         step: GitPushReplayCommandStep,
         pgid: libc::pid_t,
         source: std::io::Error,
+    },
+    #[error(
+        "{step} command wrote more than the {cap}-byte stdout cap; the process group was killed"
+    )]
+    StdoutCapExceeded {
+        step: GitPushReplayCommandStep,
+        cap: usize,
     },
     #[error(
         "ingest_bundle was called for a fast-forward replay without the matching GitHub credential secret"
@@ -764,7 +771,7 @@ async fn run_replay_invocation_capture_stdout(
     invocation: &CleanGitInvocation,
     timeout: Duration,
 ) -> Result<Vec<u8>, GitPushReplayRunError> {
-    clean_git::run_clean_git_capture_stdout(invocation, timeout, None)
+    clean_git::run_clean_git_capture_stdout(invocation, timeout, SMALL_STDOUT_CAP, None)
         .await
         .map_err(|err| translate_clean_git_error(step, err))
 }
@@ -798,6 +805,9 @@ fn translate_clean_git_error(
         }
         CleanGitError::KillProcessGroup { pgid, source } => {
             GitPushReplayRunError::KillProcessGroup { step, pgid, source }
+        }
+        CleanGitError::StdoutCapExceeded { cap } => {
+            GitPushReplayRunError::StdoutCapExceeded { step, cap }
         }
     }
 }
