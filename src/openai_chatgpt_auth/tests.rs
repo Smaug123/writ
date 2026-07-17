@@ -462,10 +462,7 @@ fn build_authority(refresh_url: &str, clock: Arc<FakeClock>) -> (ChatgptOauthAut
     let config = ChatgptOauthAuthorityConfig {
         secret_key: key.clone(),
         refresh_url: reqwest::Url::parse(refresh_url).unwrap(),
-        http_client: reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(2))
-            .build()
-            .unwrap(),
+        http_client: build_refresh_http_client(std::time::Duration::from_secs(2)).unwrap(),
         clock,
         leeway_seconds: CHATGPT_OAUTH_REFRESH_LEEWAY_SECONDS,
     };
@@ -529,6 +526,72 @@ async fn current_headers_refreshes_when_token_is_stale_and_persists_new_bundle()
     let stored_tokens = stored.tokens.unwrap();
     assert_eq!(stored_tokens.refresh_token, "refresh-new");
     assert_eq!(stored_tokens.access_token, access_token_with_exp(50_000));
+}
+
+#[tokio::test]
+async fn refresh_does_not_follow_redirect_that_would_leak_refresh_token() {
+    // The refresh POST carries the live `refresh_token` in its JSON body.
+    // HTTP 307/308 redirects preserve the method *and* body, so a refresh
+    // endpoint that answered the POST with such a redirect could bounce that
+    // credential to an arbitrary origin. The client must refuse to follow it:
+    // the redirect target must receive no request, and the refresh must fail
+    // (transiently) rather than chase the `Location`.
+    for status in [307_u16, 308] {
+        let store = InMemStore::default();
+        let key = SecretKey::new("openai-chatgpt-auth").unwrap();
+        let bundle = make_bundle(/*exp=*/ 1_050, "refresh-old", false);
+        store
+            .put(&key, &serde_json::to_string(&bundle).unwrap())
+            .unwrap();
+        let clock = Arc::new(FakeClock::new(1_000));
+
+        // The exfiltration target. If the client (wrongly) followed the
+        // redirect, this endpoint would receive the refresh_token and hand
+        // back a rotated bundle — making the leak concrete and observable.
+        let attacker = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/oauth/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id_token": id_token_with_chatgpt_claims("acct-leaked", false, 99_999),
+                "access_token": access_token_with_exp(50_000),
+                "refresh_token": "refresh-leaked",
+            })))
+            .mount(&attacker)
+            .await;
+
+        // The legitimate refresh endpoint answers the POST with a redirect to
+        // the attacker origin.
+        let server = MockServer::start().await;
+        let location = format!("{}/oauth/token", attacker.uri());
+        Mock::given(method("POST"))
+            .and(path("/oauth/token"))
+            .respond_with(
+                ResponseTemplate::new(status).insert_header("location", location.as_str()),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let refresh_url = format!("{}/oauth/token", server.uri());
+        let (authority, _) = build_authority(&refresh_url, Arc::clone(&clock));
+
+        let err = authority.current_headers(&store).await.unwrap_err();
+        assert!(
+            matches!(err, ChatgptOauthError::RefreshTransient(_)),
+            "expected a transient failure for a {status} redirect, got {err:?}",
+        );
+
+        // The credential never reached the redirect target.
+        assert_eq!(
+            attacker.received_requests().await.unwrap().len(),
+            0,
+            "refresh_token was forwarded to the redirect target for status {status}",
+        );
+
+        // The stored bundle still holds the original, un-leaked token.
+        let stored: ChatgptAuthBundle =
+            serde_json::from_str(&store.get(&key).unwrap().unwrap()).unwrap();
+        assert_eq!(stored.tokens.unwrap().refresh_token, "refresh-old");
+    }
 }
 
 #[tokio::test]
