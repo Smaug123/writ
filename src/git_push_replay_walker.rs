@@ -180,6 +180,14 @@ pub enum GitObjectSourceError {
     ObjectTooLarge { sha: String, size: u64, max: u64 },
     #[error("git object source has been poisoned by an earlier failure and is no longer usable")]
     Poisoned,
+    /// Reading object `sha` did not complete within the per-object
+    /// deadline — the signature of a `git cat-file --batch` child that
+    /// wedged mid-response (its pipe reads are otherwise unbounded).
+    /// The source has been poisoned and its process group SIGKILLed;
+    /// like every other variant this is surfaced before any ref-moving
+    /// call, so the caller can treat it as retryable.
+    #[error("reading object {sha} timed out after {timeout:?}")]
+    ReadTimedOut { sha: String, timeout: Duration },
     #[error("object access failed: {source}")]
     Io {
         #[source]
