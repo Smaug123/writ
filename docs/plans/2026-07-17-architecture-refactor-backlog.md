@@ -169,16 +169,23 @@ it via `pub use writ_agent_run as agent_run`, so all ~40 `crate::agent_run::…`
 `writ::agent_run::…` call sites are unchanged. The crate's tests run in the
 workspace `cargo test` via feature unification (writ/host → writ-agent-run/host).
 
-### Slice 4b — extract the guest client into `writ-vm-client`
+### Slice 4b — extract the guest client into `writ-vm-client` (implemented)
 
-**The machine-enforced-invariant slice.** "The guest surface must not link host
-deps" is currently upheld only by discipline plus the `writ-vm` binary's build
-flags. With `agent_run` now in `writ-agent-run` (4a), move `vm_client.rs` into a
-crate depending only on `writ-vm-git`, `writ-agent-run`, `writ-core`, `reqwest`,
-`ring`, `base64`. After this, a host dependency creeping into the guest surface
-is a **compile error in the crate graph**, not a lint nobody runs. Keep
-`writ::vm_client` re-exporting the crate so `writ-vm` and host test references
-don't churn.
+**The machine-enforced-invariant slice.** With `agent_run` in `writ-agent-run`
+(4a), moved `src/vm_client.rs` → `crates/writ-vm-client/` (deps: `writ-core`,
+`writ-vm-git`, `writ-agent-run` [vm-client], `reqwest`, `tokio`, `base64`,
+`serde_json`, `thiserror`, `uuid` — **no host crate**). Rewrote the four
+`crate::` module prefixes (`agent_run`/`bearer`/`process_spawn`/`vm_git`) to
+their crates. `writ` re-exports `pub use writ_vm_client as vm_client` under the
+`vm-client` feature (optional dep), so the `writ-vm` binary is unchanged.
+
+Host-dep-freedom is now a crate-graph property: `--features host` does not pull
+`writ-vm-client` (verified via `cargo tree`). Two clean-ups fell out — `writ`'s
+`vm-client` feature no longer needs `reqwest`/`base64`/`ring` (only `vm_client`
+used them; host keeps its own copies), and the `writ_core::bearer` re-export is
+now `#[cfg(feature = "host")]` (its only guest user left with `vm_client`). The
+41 guest lib tests moved with the crate and run under the default `cargo test`
+(writ-vm-client is a workspace member).
 
 ### Slice 5 — extract the audit log into `writ-audit`
 

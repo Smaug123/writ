@@ -4,11 +4,11 @@ version = "0.1.0"
 edition = "2024"
 
 [workspace]
-members = ["crates/writ-core", "crates/writ-vm-git", "crates/writ-agent-run", "crates/bailiff"]
+members = ["crates/writ-core", "crates/writ-vm-git", "crates/writ-agent-run", "crates/writ-vm-client", "crates/bailiff"]
 # Without this, root-level `cargo clippy/test/doc` (as run by CI) select only
 # the root `writ` package, silently skipping member crates' own test targets
 # and rustdoc. Keep every member in the default gate set.
-default-members = [".", "crates/writ-core", "crates/writ-vm-git", "crates/writ-agent-run", "crates/bailiff"]
+default-members = [".", "crates/writ-core", "crates/writ-vm-git", "crates/writ-agent-run", "crates/writ-vm-client", "crates/bailiff"]
 resolver = "3"
 
 [features]
@@ -39,7 +39,11 @@ host = [
     "dep:xz2",
     "dep:zstd",
 ]
-vm-client = ["writ-agent-run/vm-client", "dep:base64", "dep:reqwest", "dep:ring", "dep:writ-vm-git"]
+# The guest client now lives in the `writ-vm-client` crate; `writ`'s only
+# remaining vm-client code is the `writ-vm` binary, which uses the re-exports
+# (agent_run runner, vm_git wire types) but no reqwest/base64/ring directly —
+# those moved to writ-vm-client.
+vm-client = ["dep:writ-vm-client", "writ-agent-run/vm-client", "dep:writ-vm-git"]
 
 [[bin]]
 name = "writ"
@@ -72,6 +76,8 @@ writ-core = { path = "crates/writ-core" }
 # The runtime bits (runner, hashing) come from its host/vm-client features,
 # enabled above.
 writ-agent-run = { path = "crates/writ-agent-run" }
+# The guest client, re-exported as `writ::vm_client` under the vm-client feature.
+writ-vm-client = { path = "crates/writ-vm-client", optional = true }
 writ-vm-git = { path = "crates/writ-vm-git", optional = true }
 clap = { version = "4", features = ["derive", "env"] }
 serde = { version = "1", features = ["derive"] }
