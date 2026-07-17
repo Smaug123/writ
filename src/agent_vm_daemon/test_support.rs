@@ -18,7 +18,7 @@ use crate::core::{
     BrokerPort, BrokerPortRange, BrokerPorts, Ipv4Cidr, Ipv6Cidr, RepoRef, TtlSeconds,
 };
 use crate::github::{GitHubAppConfig, GitHubAppRegistryConfig, GitHubMinter};
-use crate::nix_cache::NixTrustedPublicKeys;
+use crate::nix_binary_cache::NixTrustedPublicKeys;
 use crate::policy::PolicyConfig;
 use crate::secret::{SecretError, SecretKey};
 use crate::vm_git::VmGitPushBodyLimits;

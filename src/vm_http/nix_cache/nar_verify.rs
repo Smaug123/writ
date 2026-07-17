@@ -3,7 +3,7 @@
 //! (optionally xz-/zstd-decompressing) hash+size verification that runs on the
 //! blocking pool. Pure given its inputs apart from the `spawn_blocking` hop.
 
-use crate::nix_cache::{
+use crate::nix_binary_cache::{
     NixCacheNarFileName, NixNarBodyHashError, NixNarCompression, NixNarHash, NixNarInfo, NixNarSize,
 };
 

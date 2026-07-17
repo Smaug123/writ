@@ -3,7 +3,7 @@
 //! upstream proxy is configured. Everything here is a pure function of the
 //! request: no IO, no service state.
 
-use crate::nix_cache::{NixCacheNarFileName, NixStoreHashPart};
+use crate::nix_binary_cache::{NixCacheNarFileName, NixStoreHashPart};
 
 use super::super::{VmHttpRequest, VmHttpResponse, VmHttpStatus};
 

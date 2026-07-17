@@ -19,7 +19,7 @@ use crate::core::{AgentNetworkPool, AgentVmConfigError, BrokerPortRange, Ipv4Cid
 use crate::flake_lock::{FlakeProvisionBounds, FlakeProvisionBoundsError};
 use crate::flake_provision_from_mirror::MirrorFlakeProvisionConfig;
 use crate::github::GitHubAppRegistryConfig;
-use crate::nix_cache::{NixTrustedPublicKeys, NixTrustedPublicKeysError};
+use crate::nix_binary_cache::{NixTrustedPublicKeys, NixTrustedPublicKeysError};
 use crate::notes_repo::{NotesRepo, NotesRepoError};
 use crate::policy::PolicyConfig;
 use crate::secret::{SecretKey, SecretStore};

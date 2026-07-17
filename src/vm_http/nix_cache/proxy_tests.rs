@@ -16,7 +16,7 @@ use super::super::{VM_HTTP_READ_TIMEOUT, dispatch_vm_http_head_and_body};
 use super::test_support::*;
 use super::*;
 use crate::core::Ipv4Cidr;
-use crate::nix_cache::NixNarCompression;
+use crate::nix_binary_cache::NixNarCompression;
 
 #[tokio::test]
 async fn nix_cache_info_route_proxies_bounded_upstream_metadata() {

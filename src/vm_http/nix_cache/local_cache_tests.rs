@@ -19,7 +19,7 @@ use super::super::tests::{make_broker_state, open_audit_session, session_for_sub
 use super::test_support::*;
 use super::*;
 use crate::core::Ipv4Cidr;
-use crate::nix_cache::NixTrustedPublicKeys;
+use crate::nix_binary_cache::NixTrustedPublicKeys;
 
 #[tokio::test]
 async fn local_archive_narinfo_and_nar_are_served_without_upstream() {

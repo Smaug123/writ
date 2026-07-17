@@ -4,7 +4,7 @@
 
 use std::path::PathBuf;
 
-use crate::nix_cache::NixTrustedPublicKeys;
+use crate::nix_binary_cache::NixTrustedPublicKeys;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VmHttpNixCacheConfig {

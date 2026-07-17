@@ -16,8 +16,8 @@ this first.
 > belongs here.
 
 The current module layout has real structural debt (a flat ~40-module root
-crate, several 2.5–3.7k-line god-files, and two modules both named `nix_cache`).
-That debt is catalogued, with a sequenced remediation, in
+crate and several 2.5–3.7k-line god-files). That debt is catalogued, with a
+sequenced remediation, in
 [`../plans/2026-07-17-architecture-refactor-backlog.md`](../plans/2026-07-17-architecture-refactor-backlog.md).
 This document describes the system as it *actually behaves* today, using the
 domain subsystems it *should* be organised around, and points at the files
@@ -347,7 +347,7 @@ serves them through a substituter the guest trusts, keeping evaluation offline.
 **Lives in.** `vm_http/` (`mod.rs` [2832 lines], `claude_proxy.rs`,
 `openai_proxy.rs`, `git_clone.rs`, `git_push.rs`, `flake_provision.rs`,
 `nix_cache.rs` + `nix_cache/`, `agent_runs.rs`, `proxy_common.rs`) plus the
-Nix domain modules `nix_cache.rs` (2749), `flake_lock.rs`,
+Nix domain modules `nix_binary_cache.rs` (2749), `flake_lock.rs`,
 `flake_materialize.rs`, `flake_provision.rs`, `flake_provision_from_mirror.rs`.
 
 **Endpoint map** (dispatch `route_authenticated_vm_http_request`,
@@ -358,24 +358,23 @@ Nix domain modules `nix_cache.rs` (2749), `flake_lock.rs`,
 /v1/agent-runs/{id}/config|outcome`. Path literals are pinned in
 `crates/writ-vm-git/src/lib.rs:20`.
 
-**The two `nix_cache` modules (read this).** They are different *layers* with an
-unfortunate identical name:
-- **`src/nix_cache.rs`** is a pure host-side **domain library** — the primitive
-  types (`NixStorePath`, `NixNarInfo`), Ed25519 signature verification, NAR
-  hashing, and the admission parsers. Zero HTTP code.
+**Nix binary cache — model vs service (two modules).** Two different *layers*,
+now named apart (they were both `nix_cache` until backlog Slice 2):
+- **`src/nix_binary_cache.rs`** is a pure host-side **domain library** — the
+  primitive types (`NixStorePath`, `NixNarInfo`), Ed25519 signature
+  verification, NAR hashing, and the admission parsers. Zero HTTP code.
 - **`src/vm_http/nix_cache.rs`** is the imperative **HTTP shell** —
   `VmHttpNixCacheService` serves the binary-cache protocol, does archive IO and
   upstream proxying, and audits, importing the parsers/types from
-  `crate::nix_cache`.
+  `crate::nix_binary_cache`.
 
-  Data-model-plus-crypto vs. the network service that uses it. The refactor
-  backlog renames them to remove the collision.
+  Data-model-plus-crypto vs. the network service that uses it.
 
 **Primitives.** Proxy: `ProxyRequestFields`, `ProxyFetch`, `UpstreamAuth`
 (`proxy_common.rs`). Flake: `FlakeLock`/`FlakeProvisionPlan`
 (`flake_lock.rs:49,95`), `MaterializedFlake` (`flake_materialize.rs:46`),
 `FlakeProvisionReport` (`flake_provision.rs:76`). Nix cache: `NixNarInfo`,
-`NixTrustedPublicKeys` (`nix_cache.rs:50,68`), route enum `VmNixCacheRoute`
+`NixTrustedPublicKeys` (`nix_binary_cache.rs:50,68`), route enum `VmNixCacheRoute`
 (`vm_http/nix_cache/route.rs:28`).
 
 **Guarantees.** The guest reaches only these routes (subnet auth). Each
