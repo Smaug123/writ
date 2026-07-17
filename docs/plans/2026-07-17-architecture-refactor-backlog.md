@@ -264,14 +264,17 @@ Cheap module boundaries, interleavable with the above and each other. Each split
 is a self-contained PR that moves code without changing it; the target is that no
 single file exceeds what one reading can hold.
 
-- **`config.rs` (started):** `config.rs` (3673) → a `config/` directory. First
-  chunk extracted — the audit-directory dedication check + legacy audit-DB
-  migration (a self-contained filesystem concern with no `#[serde(default)]`
-  coupling) moved to `config/audit_dir.rs` (code + its tests), re-exported so
-  `crate::config::…` call sites are unchanged. `config/mod.rs` is now ~2960
-  lines; the large `AgentVm*` config block (structs + validators + their serde
-  defaults) is the next candidate, though its `#[serde(default = "…")]` string
-  paths make it more coupled than the audit-dir chunk.
+- **`config.rs` (3673 → `config/mod.rs` 1375):** taken in two slices into a
+  `config/` directory. First the audit-directory dedication check + legacy
+  audit-DB migration (a self-contained filesystem concern with no
+  `#[serde(default)]` coupling) moved to `config/audit_dir.rs` (code + tests),
+  re-exported so `crate::config::…` call sites are unchanged. The `AgentVm*`
+  config block was flagged as the next candidate but its `#[serde(default =
+  "…")]` string paths make a domain split churny — and it turned out unnecessary:
+  the remaining bulk was a ~1.6k-line inline `#[cfg(test)] mod tests`, so the
+  cleaner move was to relocate that to `config/tests.rs`, leaving `config/mod.rs`
+  a 1375-line single-concern file (the `DaemonConfig` tree + validators). The 75
+  tests run unchanged; the serde-default coupling was sidestepped entirely.
 - **`server.rs` (3188 → 881):** two cohesive subsystems, each reached only
   through `dispatch_message`, lifted into `pub(super)` submodules:
   - `server/staged_push.rs` (1772) — the `list`/`show`/`reject`/`approve`/
