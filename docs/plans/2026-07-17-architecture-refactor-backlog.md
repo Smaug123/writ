@@ -272,9 +272,14 @@ single file exceeds what one reading can hold.
   lines; the large `AgentVm*` config block (structs + validators + their serde
   defaults) is the next candidate, though its `#[serde(default = "…")]` string
   paths make it more coupled than the audit-dir chunk.
-- **`server.rs`** → `transport`/`dispatch` + `staged_push` + `run_agent`
-  submodules (the staged-push and run-agent orchestration is ~70% of the file
-  and is not transport).
+- **`server.rs` (started):** the staged-push approval subsystem — the
+  `list`/`show`/`reject`/`approve`/`reconcile` handlers plus their helpers, a
+  cohesive cluster reached through `dispatch_message` — moved to
+  `server/staged_push.rs` (1772 lines) as a `pub(super)` submodule; the five
+  dispatch arms delegate to it and its four dedicated test files gained explicit
+  `use super::staged_push::…` imports. `server.rs` is now ~1.4k lines. The
+  run-agent orchestration (`run_agent`/`run_agent_in_vm`, ~600 lines) is the
+  next candidate to lift out, leaving `server.rs` as pure transport + dispatch.
 - **`agent_vm_lifecycle.rs`, `protocol.rs`, `git_push_replay_walker.rs`**
   (trait + `ShaMap` + both planners + message rendering are four separable
   concerns in one 1485-line file).

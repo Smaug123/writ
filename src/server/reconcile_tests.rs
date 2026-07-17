@@ -1,5 +1,6 @@
 //! `ReconcileStagedPush` manual-reconciliation state-machine tests.
 
+use super::staged_push::MAX_OPERATOR_BYTES;
 use super::test_support::*;
 use super::*;
 use crate::audit::{GitPushApproveAttemptOutcome, GitPushApproveAttemptState};
