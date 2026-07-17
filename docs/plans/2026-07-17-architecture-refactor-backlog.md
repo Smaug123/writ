@@ -315,8 +315,8 @@ single file exceeds what one reading can hold.
   by-type inherent-impl move needed zero `pub(super)` bumps and zero call-site
   changes; the struct, its timeout/error types, the domain types it returns, and
   the wire DTOs stay in the parent, reached via `super`. (~1.6k of the original
-  lines are the inline test module — a candidate future test-file split, as with
-  `nix_binary_cache.rs` and `git_push_approve.rs`.)
+  lines are the inline test module — a candidate future test-file split, as done
+  for `nix_binary_cache.rs` below and still pending for `git_push_approve.rs`.)
 - **`broker_vm.rs` (2636 → 2422):** the `BrokerVmPlan` launch/teardown builders
   (network-create/run/inspect/logs/stop invocations — a 214-line inherent
   `impl`) moved to `broker_vm/plan.rs`. Ten of eleven methods are `pub` and the
@@ -324,6 +324,14 @@ single file exceeds what one reading can hold.
   move needed no `pub(super)` bumps or call-site changes. Broker config, secret
   export, and `container inspect` state-parsing remain in the parent as further
   candidate seams.
+- **`nix_binary_cache.rs` (2752 → 1345):** this file's production half is a
+  single coherent concern — the Nix binary-cache value types, narinfo parsing,
+  Ed25519 verification, and NAR hashing — so there was no domain seam to cut;
+  its length was the ~1.4k-line inline `#[cfg(test)] mod tests`. Relocated that
+  module verbatim to `nix_binary_cache/tests.rs` (a file submodule; `use
+  super::*` still resolves), leaving a 1345-line single-concern production file.
+  The 41 tests run unchanged in their new location. This is the template for the
+  other test-dominated single-concern files (e.g. `git_push_approve.rs`).
 
 Rule of thumb learned from the config split: extract the chunks with no
 `#[serde(default = "…")]` coupling first — moving a struct away from its default
