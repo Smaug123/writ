@@ -316,7 +316,14 @@ single file exceeds what one reading can hold.
   changes; the struct, its timeout/error types, the domain types it returns, and
   the wire DTOs stay in the parent, reached via `super`. (~1.6k of the original
   lines are the inline test module — a candidate future test-file split, as with
-  `nix_binary_cache.rs`, `broker_vm.rs`, and `git_push_approve.rs`.)
+  `nix_binary_cache.rs` and `git_push_approve.rs`.)
+- **`broker_vm.rs` (2636 → 2422):** the `BrokerVmPlan` launch/teardown builders
+  (network-create/run/inspect/logs/stop invocations — a 214-line inherent
+  `impl`) moved to `broker_vm/plan.rs`. Ten of eleven methods are `pub` and the
+  one private helper (`broker_command`) has no external caller, so the by-type
+  move needed no `pub(super)` bumps or call-site changes. Broker config, secret
+  export, and `container inspect` state-parsing remain in the parent as further
+  candidate seams.
 
 Rule of thumb learned from the config split: extract the chunks with no
 `#[serde(default = "…")]` coupling first — moving a struct away from its default
