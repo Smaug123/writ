@@ -179,7 +179,8 @@ its VM-dispatch path); `server/` also holds the test submodules. `protocol/`
 (`mod.rs` 2072 for the `ClientMessage`/`ServerMessage` DUs + `views.rs` 246 for
 the payload types they carry),
 `broker_session.rs`, `broker_protocol.rs`, `policy.rs`,
-`config/` (`mod.rs` ~2960 + `audit_dir.rs`), `bin/writd.rs`, `bin/writ.rs` (the
+`config/` (`mod.rs` 1375 + `audit_dir.rs` + `tests.rs`), `bin/writd.rs`,
+`bin/writ.rs` (the
 operator CLI verbs).
 
 **Primitives.** Wire DUs `ClientMessage` (`protocol/mod.rs:38`, tagged +
