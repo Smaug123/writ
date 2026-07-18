@@ -86,13 +86,18 @@ fn insert_git_push_outcome_row(
 /// [`EffectAuditTable`](crate::effect_table::EffectAuditTable) guard. Zero-sized;
 /// named only as a type argument. Scope is the base staging pair **only** — the
 /// approval / reconciliation / mint ledger tables in this DAO are a different
-/// shape and are deliberately out of scope (see the plan's §7). The VM-HTTP
-/// driver stage consumes this marker; until then the direct writers below remain
-/// the production path and the guard impl is exercised only by the equivalence
-/// proptest in `request_outcome_tests`.
-pub(crate) struct GitPushAuditTable;
+/// shape and are deliberately out of scope (see the plan's §7).
+///
+/// `pub` so the VM-HTTP `broker_effect` driver (in the `writ` crate) can drive
+/// the git-push VM-stage handler through this guard. It also implements
+/// [`AbandonableEffect`](crate::effect_table::AbandonableEffect): a staging-IO
+/// failure has no truthful [`GitPushOutcomeResult`] to record, so the handler
+/// deliberately leaves the request row dangling for the boot sweep — the one
+/// effect that legitimately abandons its guard.
+pub struct GitPushAuditTable;
 
 impl crate::effect_table::sealed::Sealed for GitPushAuditTable {}
+impl crate::effect_table::AbandonableEffect for GitPushAuditTable {}
 impl crate::effect_table::EffectAuditTable for GitPushAuditTable {
     // `GitPushRequestRecord` owns its fields, so the request row carries no
     // borrow; only the outcome row borrows (`message: &'a str`).

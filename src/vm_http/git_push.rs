@@ -5,20 +5,22 @@
 
 use std::sync::Arc;
 
+use crate::agent_run::CorrelationId;
 use crate::audit::{
-    AUDIT_WRITE_FAILURE_TARGET, AuditError, GitPushOutcomeRecord, GitPushOutcomeResult,
-    GitPushRequestRecord,
+    AUDIT_WRITE_FAILURE_TARGET, AuditError, AuditLog, GitPushAuditTable, GitPushOutcomeRecord,
+    GitPushOutcomeResult, GitPushRequestRecord, RecordedRequest,
 };
-use crate::core::{RequestId, UnixMillis};
+use crate::core::{RequestId, SessionId, UnixMillis};
 use crate::git_push_staging::{GitPushStagingStore, StagingError};
 use crate::secret::SecretStore;
 use crate::server::BrokerState;
 use crate::vm_git::{
     VM_GIT_PUSH_PATH, VmGitPushBodyError, VmGitPushBodyLimits, VmGitPushErrorCode,
-    VmGitPushErrorResponse, parse_vm_git_push_request_body,
+    VmGitPushErrorResponse, VmGitPushMetadata, parse_vm_git_push_request_body,
 };
 
-use super::{VmHttpRequest, VmHttpResponse, VmHttpSession, VmHttpStatus};
+use super::broker_effect::{BrokeredEffect, EffectCompletion, broker_effect};
+use super::{VmHttpDispatch, VmHttpRequest, VmHttpResponse, VmHttpSession, VmHttpStatus};
 
 pub struct VmHttpGitPushService<S: SecretStore> {
     broker_state: Arc<BrokerState<S>>,
@@ -41,6 +43,12 @@ impl<S: SecretStore> VmHttpGitPushService<S> {
 
     pub(super) fn body_limits(&self) -> VmGitPushBodyLimits {
         self.body_limits
+    }
+
+    /// The audit log this service records into — the `broker_effect` driver's
+    /// `begin_effect`/`complete` receiver.
+    pub(super) fn audit(&self) -> &Arc<AuditLog> {
+        &self.broker_state.audit
     }
 }
 
@@ -72,243 +80,307 @@ pub(super) async fn route_git_push_request<S: SecretStore + Send + Sync + 'stati
     request: &VmHttpRequest,
     body: Vec<u8>,
     service: VmHttpGitPushService<S>,
-) -> VmHttpResponse {
+) -> VmHttpDispatch {
     if request.method != "POST" {
-        return VmHttpResponse::text(VmHttpStatus::NotFound, "not found");
+        return VmHttpResponse::text(VmHttpStatus::NotFound, "not found").into();
     }
-    handle_git_push_request(session, body, service).await
+    handle_git_push_dispatch(session, body, service).await
 }
 
+/// Drive a git-push VM-stage request through the `broker_effect` guard: the
+/// driver begins the request row, [`GitPushEffect::perform`] stages the bundle,
+/// and the driver completes the `Staged`/`Denied` outcome — or, on a staging-IO
+/// failure that has no truthful outcome, the effect *abandons* the guard, leaving
+/// the request row dangling for boot recovery (`reconcile_orphaned_staged_carriers`
+/// recovers an on-disk carrier; `reconcile_unpaired_effect_rows` flags a
+/// genuinely-stuck row).
+async fn handle_git_push_dispatch<S: SecretStore + Send + Sync + 'static>(
+    session: &VmHttpSession,
+    body: Vec<u8>,
+    service: VmHttpGitPushService<S>,
+) -> VmHttpDispatch {
+    // Reject-before-begin: a malformed body or a failed correlation read returns
+    // a client response and records *no* audit row (the driver begins the request
+    // row only for a well-formed request).
+    let effect = match GitPushEffect::new(session, body, &service) {
+        Ok(effect) => effect,
+        Err(response) => return response.into(),
+    };
+    broker_effect(service.audit(), effect).await
+}
+
+/// Test-only wrapper returning the buffered response directly — a git-push
+/// response never streams — so the example-based and crash-injection tests read
+/// the `VmHttpResponse` unchanged.
+#[cfg(test)]
 async fn handle_git_push_request<S: SecretStore + Send + Sync + 'static>(
     session: &VmHttpSession,
     body: Vec<u8>,
     service: VmHttpGitPushService<S>,
 ) -> VmHttpResponse {
-    let parsed = match parse_vm_git_push_request_body(&body, service.body_limits) {
-        Ok(parsed) => parsed,
-        Err(err) => {
-            return git_push_error_response(
-                VmHttpStatus::BadRequest,
-                VmGitPushErrorCode::InvalidRequest,
-                body_error_message(&err),
-            );
-        }
-    };
-    drop(body);
+    handle_git_push_dispatch(session, body, service)
+        .await
+        .into_buffered()
+}
 
-    let push_request_id = RequestId::new();
-    let received_at = UnixMillis::now();
-    let (metadata, bundle) = parsed.into_parts();
+/// A git-push VM-stage request modelled as a [`BrokeredEffect`]. The
+/// `broker_effect` driver owns the audit sequencing (begin the request row, run
+/// `perform`, complete or abandon the outcome), so the staging effect cannot
+/// reach the guest without recording — or deliberately abandoning — its pair.
+struct GitPushEffect<'a, S: SecretStore + Send + Sync + 'static> {
+    service: &'a VmHttpGitPushService<S>,
+    push_request_id: RequestId,
+    session_id: SessionId,
+    received_at: UnixMillis,
+    metadata: VmGitPushMetadata,
+    correlation_id: Option<CorrelationId>,
+    bundle: Vec<u8>,
+}
 
-    // Inherit the run's correlation id (if any) so a push staged by a
-    // `--correlation-id`'d agent run carries the same join key. The
-    // correlation belongs to the run; the push merely participates.
-    // Untagged sessions and non-run sessions return `None` and the
-    // column stays NULL.
-    let correlation_id = match service
-        .broker_state
-        .audit
-        .correlation_id_for_session(session.session_id())
-    {
-        Ok(value) => value,
-        Err(err) => {
-            tracing::error!(
-                target: AUDIT_WRITE_FAILURE_TARGET,
-                kind = "git_push_request_correlation_lookup",
-                push_request_id = %push_request_id,
-                error = %err,
-                "audit read failed",
-            );
-            return git_push_error_response(
-                VmHttpStatus::InternalServerError,
-                VmGitPushErrorCode::PushFailed,
-                "audit read failed",
-            );
-        }
-    };
+/// Owned outcome payload for a git-push effect; [`BrokeredEffect::outcome_row`]
+/// borrows a `GitPushOutcomeRecord` out of it. Only the *resolvable* outcomes are
+/// here (`Staged` / `Denied`); a staging-IO failure has no truthful outcome and is
+/// abandoned instead.
+struct GitPushOutcomeData {
+    push_request_id: RequestId,
+    result: GitPushOutcomeResult,
+    message: &'static str,
+}
 
-    let record = GitPushRequestRecord {
-        push_request_id,
-        session_id: session.session_id(),
-        received_at,
-        repo: metadata.repo().clone(),
-        branch: metadata.branch().clone(),
-        expected_remote_head: metadata.expected_remote_head().cloned(),
-        new_head: metadata.new_head().clone(),
-        correlation_id,
-    };
-    match service.broker_state.audit.record_git_push_request(&record) {
-        Ok(()) => {}
-        Err(AuditError::Invariant("session does not exist")) => {
-            return git_push_error_response(
-                VmHttpStatus::Unauthorized,
-                VmGitPushErrorCode::Denied,
-                "session is not active",
-            );
-        }
-        Err(AuditError::Invariant("session is closed")) => {
-            return git_push_error_response(
-                VmHttpStatus::Gone,
-                VmGitPushErrorCode::Denied,
-                "session is closed",
-            );
-        }
-        Err(err) => {
-            tracing::error!(
-                target: AUDIT_WRITE_FAILURE_TARGET,
-                kind = "git_push_request",
-                push_request_id = %push_request_id,
-                error = %err,
-                "audit write failed",
-            );
-            return git_push_error_response(
-                VmHttpStatus::InternalServerError,
-                VmGitPushErrorCode::PushFailed,
-                "audit write failed",
-            );
+impl GitPushOutcomeData {
+    fn staged(push_request_id: RequestId) -> Self {
+        Self {
+            push_request_id,
+            result: GitPushOutcomeResult::Staged,
+            message: "staged for review",
         }
     }
-    // Durable effect: the request row is committed. A crash from here to
-    // the staging step below leaves a request row with no carrier and no
-    // outcome — benign (nothing to promote; the guest retries under a
-    // fresh id) and invisible to `promote list`.
-    crate::crash_point::point("git_push::request_recorded").await;
 
-    let staged_at = UnixMillis::now();
-    let staging_result = {
-        let staging_store = Arc::clone(&service.staging_store);
-        let metadata_for_staging = metadata.clone();
-        tokio::task::spawn_blocking(move || {
-            staging_store.stage(push_request_id, staged_at, metadata_for_staging, bundle)
-        })
-        .await
-    };
-
-    let staging_result = match staging_result {
-        Ok(result) => result,
-        Err(join_err) => {
-            tracing::error!(
-                push_request_id = %push_request_id,
-                error = %join_err,
-                "git push staging task panicked",
-            );
-            return git_push_error_response(
-                VmHttpStatus::InternalServerError,
-                VmGitPushErrorCode::PushFailed,
-                "staging task failed",
-            );
-        }
-    };
-
-    match staging_result {
-        Ok(receipt) => {
-            // Durable effect: the carrier is fsynced and atomically
-            // renamed into `staged/`, so any carrier visible there is
-            // complete. Until the `Staged` outcome row below commits the
-            // push is neither approvable (`check_approvable_push`) nor
-            // rejectable (`git_push_resolution_requires_staged`); a crash
-            // here is recovered by `reconcile_orphaned_staged_carriers`
-            // on the next boot.
-            crate::crash_point::point("git_push::carrier_staged").await;
-            if let Err(err) = record_unattempted_outcome(
-                &service,
-                push_request_id,
-                GitPushOutcomeResult::Staged,
-                "staged for review",
-            ) {
-                tracing::error!(
-                    target: AUDIT_WRITE_FAILURE_TARGET,
-                    kind = "git_push_outcome",
-                    push_request_id = %push_request_id,
-                    error = %err,
-                    "audit write failed; carrier left intact for boot recovery",
-                );
-                // The carrier is durably and atomically on disk but its
-                // `Staged` outcome row did not commit, so it is stuck —
-                // neither approvable nor rejectable — until recovery.
-                //
-                // We deliberately do *not* delete it here. `delete` is a
-                // non-atomic `remove_dir_all`: a crash part-way through
-                // would tear the carrier (leaving only `bundle` or only
-                // `entry.json`), and a torn carrier is unrecoverable — the
-                // boot sweep would either record `Staged` for a push whose
-                // bundle is gone, or fail to `list()` it at all. Leaving
-                // the intact carrier lets `reconcile_orphaned_staged_carriers`
-                // recover it safely and idempotently on the next boot. An
-                // outcome-write failure on a request row that just
-                // committed is almost always a transient/environmental DB
-                // fault, and the daemon is built for cheap restart.
-                return git_push_error_response(
-                    VmHttpStatus::InternalServerError,
-                    VmGitPushErrorCode::PushFailed,
-                    "audit write failed",
-                );
-            }
-            // Durable effect: the `Staged` outcome row is committed; the
-            // push is now resolvable.
-            crate::crash_point::point("git_push::outcome_recorded").await;
-            VmHttpResponse::json(VmHttpStatus::Ok, &receipt)
-        }
-        Err(StagingError::Conflict { .. }) => {
-            if let Err(err) = record_unattempted_outcome(
-                &service,
-                push_request_id,
-                GitPushOutcomeResult::Denied,
-                "staged content conflict",
-            ) {
-                tracing::error!(
-                    target: AUDIT_WRITE_FAILURE_TARGET,
-                    kind = "git_push_outcome",
-                    push_request_id = %push_request_id,
-                    error = %err,
-                    "audit write failed",
-                );
-                return git_push_error_response(
-                    VmHttpStatus::InternalServerError,
-                    VmGitPushErrorCode::PushFailed,
-                    "audit write failed",
-                );
-            }
-            git_push_error_response(
-                VmHttpStatus::Conflict,
-                VmGitPushErrorCode::Denied,
-                "different content already staged for this request id",
-            )
-        }
-        Err(err) => {
-            // Deliberately leave the request row without an outcome: a
-            // staging IO failure is the failure mode that needs human
-            // triage rather than silent reclassification.
-            tracing::error!(
-                push_request_id = %push_request_id,
-                error = %err,
-                "git push staging failed",
-            );
-            git_push_error_response(
-                VmHttpStatus::InternalServerError,
-                VmGitPushErrorCode::PushFailed,
-                "staging failed",
-            )
+    fn denied(push_request_id: RequestId, message: &'static str) -> Self {
+        Self {
+            push_request_id,
+            result: GitPushOutcomeResult::Denied,
+            message,
         }
     }
 }
 
-fn record_unattempted_outcome<S: SecretStore>(
-    service: &VmHttpGitPushService<S>,
-    push_request_id: RequestId,
-    result: GitPushOutcomeResult,
-    message: &str,
-) -> Result<(), AuditError> {
-    service
-        .broker_state
-        .audit
-        .record_git_push_outcome(&GitPushOutcomeRecord {
+impl<'a, S: SecretStore + Send + Sync + 'static> GitPushEffect<'a, S> {
+    /// Parse and preflight *before* any audit row is begun (reject-before-begin):
+    /// a malformed body (`400`) or a failed correlation-id read (`500`) returns a
+    /// client response and records nothing. The request row is begun only by the
+    /// driver, after this succeeds.
+    fn new(
+        session: &VmHttpSession,
+        body: Vec<u8>,
+        service: &'a VmHttpGitPushService<S>,
+    ) -> Result<Self, VmHttpResponse> {
+        let parsed =
+            parse_vm_git_push_request_body(&body, service.body_limits()).map_err(|err| {
+                git_push_error_response(
+                    VmHttpStatus::BadRequest,
+                    VmGitPushErrorCode::InvalidRequest,
+                    body_error_message(&err),
+                )
+            })?;
+        // Release the ~max_body_bytes encoded body as soon as `parsed` owns its
+        // copy — before the correlation lookup below, which can block on the audit
+        // mutex behind a slow SQLite write; holding both the encoded body and the
+        // bundle per blocked worker doubles peak memory under concurrent pushes.
+        drop(body);
+        let push_request_id = RequestId::new();
+        // Stamp arrival *before* the (mutex-blocking) audit lookup, so
+        // `received_at` orders pushes by when the broker received them, not by
+        // audit-write contention (`list_git_pushes_for_session` sorts by it).
+        let received_at = UnixMillis::now();
+        let (metadata, bundle) = parsed.into_parts();
+
+        // Inherit the run's correlation id (if any) so a push staged by a
+        // `--correlation-id`'d agent run carries the same join key. The
+        // correlation belongs to the run; the push merely participates. Untagged
+        // sessions and non-run sessions return `None` and the column stays NULL.
+        let correlation_id = service
+            .audit()
+            .correlation_id_for_session(session.session_id())
+            .map_err(|err| {
+                tracing::error!(
+                    target: AUDIT_WRITE_FAILURE_TARGET,
+                    kind = "git_push_request_correlation_lookup",
+                    push_request_id = %push_request_id,
+                    error = %err,
+                    "audit read failed",
+                );
+                git_push_error_response(
+                    VmHttpStatus::InternalServerError,
+                    VmGitPushErrorCode::PushFailed,
+                    "audit read failed",
+                )
+            })?;
+
+        Ok(Self {
+            service,
             push_request_id,
-            completed_at: UnixMillis::now(),
-            result,
-            github_status: None,
-            message,
+            session_id: session.session_id(),
+            received_at,
+            metadata,
+            correlation_id,
+            bundle,
         })
+    }
+}
+
+impl<'a, S: SecretStore + Send + Sync + 'static> BrokeredEffect for GitPushEffect<'a, S> {
+    type Table = GitPushAuditTable;
+    type Outcome = GitPushOutcomeData;
+    const REQUEST_AUDIT_KIND: &'static str = "git_push_request";
+    const OUTCOME_AUDIT_KIND: &'static str = "git_push_outcome";
+
+    fn request_id(&self) -> RequestId {
+        self.push_request_id
+    }
+
+    fn request_row(&self) -> GitPushRequestRecord {
+        // `GitPushRequestRecord` owns its fields and is not `Clone`, so rebuild it
+        // from the stored metadata (cheap: a repo/branch and two object ids).
+        GitPushRequestRecord {
+            push_request_id: self.push_request_id,
+            session_id: self.session_id,
+            received_at: self.received_at,
+            repo: self.metadata.repo().clone(),
+            branch: self.metadata.branch().clone(),
+            expected_remote_head: self.metadata.expected_remote_head().cloned(),
+            new_head: self.metadata.new_head().clone(),
+            correlation_id: self.correlation_id.clone(),
+        }
+    }
+
+    async fn perform(self) -> EffectCompletion<Self> {
+        let GitPushEffect {
+            service,
+            push_request_id,
+            metadata,
+            bundle,
+            ..
+        } = self;
+        let staged_at = UnixMillis::now();
+        let staging_result = {
+            let staging_store = Arc::clone(&service.staging_store);
+            tokio::task::spawn_blocking(move || {
+                staging_store.stage(push_request_id, staged_at, metadata, bundle)
+            })
+            .await
+        };
+
+        let staging_result = match staging_result {
+            Ok(result) => result,
+            Err(join_err) => {
+                // The blocking task panicked: no truthful outcome exists, so
+                // abandon (dangling row for boot recovery) rather than fabricate.
+                tracing::error!(
+                    push_request_id = %push_request_id,
+                    error = %join_err,
+                    "git push staging task panicked",
+                );
+                return abandoned_git_push(git_push_error_response(
+                    VmHttpStatus::InternalServerError,
+                    VmGitPushErrorCode::PushFailed,
+                    "staging task failed",
+                ));
+            }
+        };
+
+        match staging_result {
+            Ok(receipt) => {
+                // Durable effect: the carrier is fsynced and atomically renamed
+                // into `staged/`, so any carrier visible there is complete. The
+                // driver next commits the `Staged` outcome; if *that* write fails,
+                // the carrier is left on disk (the driver touches no filesystem)
+                // for `reconcile_orphaned_staged_carriers` to recover on the next
+                // boot — never torn by a non-atomic delete here.
+                crate::crash_point::point("git_push::carrier_staged").await;
+                EffectCompletion::Buffered {
+                    outcome: GitPushOutcomeData::staged(push_request_id),
+                    response: VmHttpResponse::json(VmHttpStatus::Ok, &receipt),
+                }
+            }
+            Err(StagingError::Conflict { .. }) => EffectCompletion::Buffered {
+                outcome: GitPushOutcomeData::denied(push_request_id, "staged content conflict"),
+                response: git_push_error_response(
+                    VmHttpStatus::Conflict,
+                    VmGitPushErrorCode::Denied,
+                    "different content already staged for this request id",
+                ),
+            },
+            Err(err) => {
+                // A staging IO failure needs human triage, not silent
+                // reclassification: abandon so the request row is left dangling.
+                tracing::error!(
+                    push_request_id = %push_request_id,
+                    error = %err,
+                    "git push staging failed",
+                );
+                abandoned_git_push(git_push_error_response(
+                    VmHttpStatus::InternalServerError,
+                    VmGitPushErrorCode::PushFailed,
+                    "staging failed",
+                ))
+            }
+        }
+    }
+
+    fn outcome_row(outcome: &GitPushOutcomeData) -> GitPushOutcomeRecord<'_> {
+        GitPushOutcomeRecord {
+            push_request_id: outcome.push_request_id,
+            completed_at: UnixMillis::now(),
+            result: outcome.result,
+            github_status: None,
+            message: outcome.message,
+        }
+    }
+
+    fn begin_error_response(err: &AuditError) -> Option<VmHttpResponse> {
+        // A closed/unknown session is a clean client error, not an audit-write
+        // failure — return the domain response and skip the 500 + tracing event.
+        match err {
+            AuditError::Invariant("session does not exist") => Some(git_push_error_response(
+                VmHttpStatus::Unauthorized,
+                VmGitPushErrorCode::Denied,
+                "session is not active",
+            )),
+            AuditError::Invariant("session is closed") => Some(git_push_error_response(
+                VmHttpStatus::Gone,
+                VmGitPushErrorCode::Denied,
+                "session is closed",
+            )),
+            _ => None,
+        }
+    }
+
+    fn audit_write_failure_response() -> VmHttpResponse {
+        // Preserve the typed envelope in the audit-fault mode: the endpoint always
+        // answered a JSON `VmGitPushErrorResponse`, so a `begin`/`complete` audit
+        // failure keeps that contract rather than the driver's plain-text 500.
+        git_push_error_response(
+            VmHttpStatus::InternalServerError,
+            VmGitPushErrorCode::PushFailed,
+            "audit write failed",
+        )
+    }
+}
+
+/// Build an [`EffectCompletion::Abandoned`] for git-push: given the live guard,
+/// [`abandon`](RecordedRequest::abandon) it (no outcome — the deliberate dangling
+/// row) and return `response`. The `abandon` call is available because
+/// `GitPushAuditTable: AbandonableEffect`.
+fn abandoned_git_push<'a, S: SecretStore + Send + Sync + 'static>(
+    response: VmHttpResponse,
+) -> EffectCompletion<GitPushEffect<'a, S>> {
+    EffectCompletion::Abandoned(Box::new(
+        move |guard: RecordedRequest<GitPushAuditTable>| {
+            guard.abandon();
+            response.into()
+        },
+    ))
 }
 
 fn git_push_error_response(
@@ -914,6 +986,12 @@ mod tests {
             "handler must instrument its three durable effects (got {n})",
         );
 
+        // A crash before the driver commits the outcome drops a *live* audit
+        // guard; modeled as an interruption (not the guard's bug backstop), it is
+        // observable on the crash outcome. Assert the modeling actually engages —
+        // otherwise a regression that silently paniced (or never held a guard)
+        // would slip past.
+        let mut saw_git_push_interruption = false;
         for k in 0..n {
             let state = make_broker_state(&github);
             let session =
@@ -921,7 +999,7 @@ mod tests {
             open_audit_session(&state, session.session_id());
             let (staging, _tmp) = open_test_staging_store();
             let plan = CrashPlan::crash_at(k);
-            let _ = run_until_crash(
+            let outcome = run_until_crash(
                 &plan,
                 handle_git_push_request(
                     &session,
@@ -930,6 +1008,7 @@ mod tests {
                 ),
             )
             .await;
+            saw_git_push_interruption |= outcome.interrupted_guards().contains(&"Git push");
 
             // Boot recovery: the sweep the daemon runs at startup.
             reconcile_orphaned_staged_carriers(
@@ -955,6 +1034,11 @@ mod tests {
                 );
             }
         }
+        assert!(
+            saw_git_push_interruption,
+            "a crash before the outcome commit must abort a live git-push guard, \
+             modeled as an interruption",
+        );
     }
 
     /// Part 1 (online repair): when the `Staged` outcome write fails while
@@ -1038,6 +1122,11 @@ mod tests {
 
         assert!(plan.acted(), "the pre-empting action must have fired");
         assert_eq!(response.status, VmHttpStatus::InternalServerError);
+        // The audit-fault mode keeps the typed Git-push envelope, not the
+        // driver's plain-text 500.
+        let parsed: VmGitPushErrorResponse = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(parsed.error(), VmGitPushErrorCode::PushFailed);
+        assert_eq!(parsed.message(), "audit write failed");
 
         // The carrier must be preserved *and complete* — both the
         // receipt and the bundle — so the boot sweep can recover it.
