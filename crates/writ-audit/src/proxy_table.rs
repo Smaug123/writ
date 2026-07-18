@@ -14,9 +14,13 @@
 //! a descriptor and re-export the generic record types under the
 //! per-backend names.
 
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, params};
+// `OptionalExtension` (`.optional()`) is now only used by the test-only read
+// helpers below; the session-open guard that used it moved to `validation`.
+#[cfg(any(test, feature = "test-support"))]
+use rusqlite::OptionalExtension;
 
-use super::validation::labeled_invariant;
+use super::validation::{check_session_open, labeled_invariant};
 use super::{AuditError, AuditLog};
 use writ_core::core::{RequestId, SessionId, UnixMillis};
 
@@ -135,23 +139,6 @@ fn validate_proxy_outcome<T: ProxyAuditTable>(
         ));
     }
     Ok(())
-}
-
-/// Fail if `session_id` is absent or already closed. Runs inside the caller's
-/// transaction so the check and the row insert(s) commit atomically.
-fn check_session_open(conn: &Connection, session_id: SessionId) -> Result<(), AuditError> {
-    let session_closed_at: Option<Option<i64>> = conn
-        .query_row(
-            "SELECT closed_at FROM session WHERE session_id = ?1",
-            params![session_id.as_uuid().to_string()],
-            |row| row.get(0),
-        )
-        .optional()?;
-    match session_closed_at {
-        None => Err(AuditError::Invariant("session does not exist")),
-        Some(Some(_)) => Err(AuditError::Invariant("session is closed")),
-        Some(None) => Ok(()),
-    }
 }
 
 /// Insert one request row into this connection/transaction. Assumes

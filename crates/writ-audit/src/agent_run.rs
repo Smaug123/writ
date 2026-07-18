@@ -75,18 +75,7 @@ impl AuditLog {
 
         self.with_conn_mut(|c| {
             let tx = c.transaction()?;
-            let session_closed_at: Option<Option<i64>> = tx
-                .query_row(
-                    "SELECT closed_at FROM session WHERE session_id = ?1",
-                    params![r.session_id.as_uuid().to_string()],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            match session_closed_at {
-                None => return Err(AuditError::Invariant("session does not exist")),
-                Some(Some(_)) => return Err(AuditError::Invariant("session is closed")),
-                Some(None) => {}
-            }
+            crate::validation::check_session_open(&tx, r.session_id)?;
 
             tx.execute(
                 "INSERT INTO agent_vm_workspace_bootstrap (
@@ -138,18 +127,7 @@ impl AuditLog {
 
         self.with_conn_mut(|c| {
             let tx = c.transaction()?;
-            let session_closed_at: Option<Option<i64>> = tx
-                .query_row(
-                    "SELECT closed_at FROM session WHERE session_id = ?1",
-                    params![r.session_id.as_uuid().to_string()],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            match session_closed_at {
-                None => return Err(AuditError::Invariant("session does not exist")),
-                Some(Some(_)) => return Err(AuditError::Invariant("session is closed")),
-                Some(None) => {}
-            }
+            crate::validation::check_session_open(&tx, r.session_id)?;
 
             tx.execute(
                 "INSERT INTO agent_run (
