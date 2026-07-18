@@ -176,8 +176,8 @@ approve/reject/reconcile and agent-run/agent-VM orchestration.
 plus `server/staged_push.rs` (1772: the list/show/reject/approve/reconcile
 approval handlers) and `server/run_agent.rs` (569: the `RunAgent` handler and
 its VM-dispatch path); `server/` also holds the test submodules. `protocol/`
-(`mod.rs` 2072 for the `ClientMessage`/`ServerMessage` DUs + `views.rs` 246 for
-the payload types they carry),
+(`mod.rs` 534 for the `ClientMessage`/`ServerMessage` DUs + `views.rs` 246 for
+the payload types they carry + `tests.rs` for the wire tests),
 `broker_session.rs`, `broker_protocol.rs`, `policy.rs`,
 `config/` (`mod.rs` 1375 + `audit_dir.rs` + `tests.rs`), `bin/writd.rs`,
 `bin/writ.rs` (the
@@ -314,8 +314,9 @@ external effects, reachable only on a whitelisted broker port/IP.
 `AgentVmSessionPlan` start-step state machine + invocation builders),
 `agent_vm_daemon.rs` (1295, with the `AgentVmDaemon` method impl in
 `agent_vm_daemon/daemon_impl.rs`) + `agent_vm_daemon/`, `agent_vm_firewall.rs`,
-`broker_vm.rs` (2422, with the `BrokerVmPlan` invocation builders in
-`broker_vm/plan.rs`), `broker_vm_runner.rs`, `broker_entrypoint.rs`,
+`broker_vm.rs` (966, with the `BrokerVmPlan` invocation builders in
+`broker_vm/plan.rs` and tests in `broker_vm/tests.rs`), `broker_vm_runner.rs`,
+`broker_entrypoint.rs`,
 `broker_session.rs`, `broker_log_forwarder.rs`, `process_supervisor.rs`,
 `bin/writ-agent-vm-runner.rs`, `bin/writ-agent-vm-pf-helper.rs`. The PF ruleset
 model itself lives in `writ-core` (`core/agent_vm.rs`).
@@ -435,7 +436,8 @@ identity via GitHub's Git Data API → move the ref. Nothing the guest claims
 **Lives in.** `git_push_staging.rs` (1503), `git_push_approve.rs` (898, with its
 test suite in `git_push_approve/tests.rs`),
 `git_push_promote.rs` (1782), `git_push_trailers.rs` (the commit-trailer
-vocabulary), `git_push_replay_object_parse.rs` (2009),
+vocabulary), `git_push_replay_object_parse.rs` (827, tests in
+`git_push_replay_object_parse/tests.rs`),
 `git_push_replay_object_source.rs`, `git_push_replay_walker.rs` (1485) +
 `git_push_replay_walker/`, `clean_git.rs` (hardened git subprocess helpers).
 
@@ -488,11 +490,12 @@ was deleted; its one live export, the commit-trailer vocabulary
 ### 5.8 Git storage & transport
 
 **Purpose.** Four host-side components under the pipeline:
-- **`github_git_db.rs`** (2146, with the `GitDataClient` request methods in
-  `github_git_db/client.rs`) — a typed client for GitHub's Git Database API
+- **`github_git_db.rs`** (524, with the `GitDataClient` request methods in
+  `github_git_db/client.rs` and tests in `github_git_db/tests.rs`) — a typed
+  client for GitHub's Git Database API
   (blobs/trees/commits/refs), used to re-create bundle commits object-by-object
   under the App identity so published commits land Verified.
-- **`notes_repo.rs`** (2060) — a shared bare-repo wrapper (used by both writ and
+- **`notes_repo.rs`** (1022, tests in `notes_repo/tests.rs`) — a shared bare-repo wrapper (used by both writ and
   bailiff) for attaching/reading git notes that carry signed run envelopes.
 - **`vm_git_bundle.rs`** (1760) — plans/executes `git clone --mirror` + `git
   bundle create` for a guest clone request.
