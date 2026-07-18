@@ -20,6 +20,16 @@
 //! (`docs/plans/2026-07-18-brokered-effect-audit-enforcement.md`); the VM-HTTP
 //! driver that makes every effect handler flow through it is a later stage.
 
+// The coalesced writer already has a production consumer (nix-cache), but the
+// two-phase guard (`begin_effect` / `RecordedRequest` / `complete`) is consumed
+// only by the equivalence proptests below until the Stage-4 driver wires it into
+// the handlers — "infrastructure before consumption". Likewise the table-name
+// consts feed the deferred boot-time unpaired-row scan. Keep it crate-internal
+// and allow the temporary dead code rather than exposing a `pub` API with no
+// reachable consumer; the driver stage promotes and consumes exactly what it
+// needs, and removes this allow.
+#![allow(dead_code)]
+
 use std::marker::PhantomData;
 use std::sync::Arc;
 
@@ -45,7 +55,14 @@ pub(crate) mod sealed {
 /// per-table row types and their column serialisers; the guard supplies the
 /// transaction sequencing and the invariants (session-open on the request,
 /// request↔outcome key agreement).
-pub trait EffectAuditTable: sealed::Sealed + 'static {
+///
+/// `pub(crate)` for now: the guard has no downstream consumer yet (all callers
+/// are in-crate — the proptests, and nix-cache via `record_effect_coalesced`).
+/// The VM-HTTP driver stage promotes exactly the surface it needs to `pub` — and
+/// exposes the marker types it names — rather than guessing that surface here.
+/// (The sealed supertrait is then already in place; today it is belt-and-braces
+/// with the `pub(crate)` visibility.)
+pub(crate) trait EffectAuditTable: sealed::Sealed + 'static {
     /// Borrow-friendly request-row payload (columns are per-table).
     type RequestRow<'a>;
     /// Borrow-friendly outcome-row payload.
@@ -83,7 +100,7 @@ pub trait EffectAuditTable: sealed::Sealed + 'static {
 /// is a bug (see the `Drop` impl) — "an effect performed without its outcome
 /// row", the exact thing this design exists to make unrepresentable.
 #[must_use = "a begun effect must be completed with an outcome row, or it is unaudited"]
-pub struct RecordedRequest<T: EffectAuditTable> {
+pub(crate) struct RecordedRequest<T: EffectAuditTable> {
     audit: Arc<AuditLog>,
     key: T::Key,
     /// Set the instant an outcome is *submitted* (see `complete`), not when the
@@ -156,7 +173,7 @@ impl AuditLog {
     /// its own committed transaction — the durability point that makes the request
     /// durable *before* the effect) and return a guard that must be completed with
     /// the matching outcome via [`RecordedRequest::complete`].
-    pub fn begin_effect<T: EffectAuditTable>(
+    pub(crate) fn begin_effect<T: EffectAuditTable>(
         self: &Arc<Self>,
         row: &T::RequestRow<'_>,
     ) -> Result<RecordedRequest<T>, AuditError> {
@@ -217,7 +234,7 @@ impl AuditLog {
     ///
     /// Refuses rows whose keys disagree (an outcome for an older request must
     /// never land beside a fresh dangling request).
-    pub fn record_effect_coalesced<T: EffectAuditTable>(
+    pub(crate) fn record_effect_coalesced<T: EffectAuditTable>(
         &self,
         request: &T::RequestRow<'_>,
         outcome: &T::OutcomeRow<'_>,

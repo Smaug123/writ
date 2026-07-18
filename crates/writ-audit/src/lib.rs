@@ -54,7 +54,6 @@ pub use claude_proxy::{
     ClaudeProxyAuditDecision, ClaudeProxyAuditRoute, ClaudeProxyOutcomeRecord,
     ClaudeProxyRequestRecord,
 };
-pub use effect_table::{EffectAuditTable, RecordedRequest};
 pub use flake_provision::{
     FlakeProvisionAuditEntry, FlakeProvisionAuditOutcome, FlakeProvisionOutcomeRecord,
     FlakeProvisionRequestRecord, FlakeProvisionResult,
