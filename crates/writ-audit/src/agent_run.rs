@@ -4,7 +4,7 @@
 //! intent recorded at session start, and the prompt/outcome pair
 //! captured for each completed agent run inside that session.
 
-use rusqlite::{OptionalExtension, Row, params};
+use rusqlite::{Connection, OptionalExtension, Row, params};
 
 use super::session::SqlAgentKind;
 use super::validation::{
@@ -45,6 +45,135 @@ pub struct AgentRunAuditRecord {
 pub struct AgentRunOutcomeAuditRecord {
     pub completed_at: UnixMillis,
     pub outcome: AgentRunOutcome,
+}
+
+/// Field validation for an agent-run request row, run before any transaction
+/// opens (mirrors the pre-tx validation the proxy/flake DAOs do). The prompt
+/// byte length is range-checked at insert time (it feeds a param), so it is not
+/// re-checked here.
+fn validate_agent_run_request(r: &AgentRunAuditRecord) -> Result<(), AuditError> {
+    validate_sha256_hex(&r.prompt.sha256_hex, "agent run prompt sha256")?;
+    if r.prompt.redacted_preview.is_empty() {
+        return Err(AuditError::Invariant(
+            "agent run prompt redacted preview must not be empty",
+        ));
+    }
+    Ok(())
+}
+
+/// Insert one agent-run request row. Assumes [`validate_agent_run_request`]
+/// passed and `check_session_open` ran.
+fn insert_agent_run_request_row(
+    conn: &Connection,
+    r: &AgentRunAuditRecord,
+) -> Result<(), AuditError> {
+    conn.execute(
+        "INSERT INTO agent_run (
+             run_id,
+             session_id,
+             requested_at,
+             agent_kind,
+             prompt_bytes,
+             prompt_sha256,
+             prompt_redacted_preview,
+             correlation_id
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            r.run_id.as_uuid().to_string(),
+            r.session_id.as_uuid().to_string(),
+            r.requested_at.as_millis(),
+            r.agent_kind.as_str(),
+            u64_to_sql_i64(r.prompt.byte_len, "agent run prompt bytes")?,
+            &r.prompt.sha256_hex,
+            &r.prompt.redacted_preview,
+            r.correlation_id.as_ref().map(CorrelationId::as_str),
+        ],
+    )?;
+    Ok(())
+}
+
+/// Validate and insert one agent-run outcome row. The stream-summary checks are
+/// the outcome's only validation, so — unlike the request — there is no separate
+/// pre-tx `validate` step to hoist.
+fn insert_agent_run_outcome_row(
+    conn: &Connection,
+    r: &AgentRunOutcomeAuditRecord,
+) -> Result<(), AuditError> {
+    validate_stream_summary(&r.outcome.stdout, "stdout")?;
+    validate_stream_summary(&r.outcome.stderr, "stderr")?;
+    conn.execute(
+        "INSERT INTO agent_run_outcome (
+             run_id,
+             completed_at,
+             status,
+             exit_code,
+             stdout_path,
+             stdout_bytes,
+             stdout_sha256,
+             stdout_truncated,
+             stderr_path,
+             stderr_bytes,
+             stderr_sha256,
+             stderr_truncated
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+        params![
+            r.outcome.run_id.as_uuid().to_string(),
+            r.completed_at.as_millis(),
+            agent_run_status_str(&r.outcome.status),
+            r.outcome.exit_code,
+            path_to_sql_text(&r.outcome.stdout.path, "stdout path")?,
+            u64_to_sql_i64(r.outcome.stdout.byte_len, "stdout bytes")?,
+            &r.outcome.stdout.sha256_hex,
+            bool_to_sql_i64(r.outcome.stdout.truncated),
+            path_to_sql_text(&r.outcome.stderr.path, "stderr path")?,
+            u64_to_sql_i64(r.outcome.stderr.byte_len, "stderr bytes")?,
+            &r.outcome.stderr.sha256_hex,
+            bool_to_sql_i64(r.outcome.stderr.truncated),
+        ],
+    )?;
+    Ok(())
+}
+
+/// Marker selecting the agent-run `(request, outcome)` pair for the generic
+/// [`EffectAuditTable`](crate::effect_table::EffectAuditTable) guard. Zero-sized;
+/// named only as a type argument.
+///
+/// Agent-runs are the *outcome-only* durability shape: the request row is minted
+/// at run launch (`record_agent_run`) and only the outcome arrives at the outcome
+/// endpoint. The guard's `resume_effect` form for that split is a driver-stage
+/// concern (see the plan's §3.5); at the DAO layer the two-phase `begin_effect` +
+/// `complete` already models launch-then-outcome, which is what the equivalence
+/// proptest exercises. Until the driver adopts it, the direct writers remain the
+/// production path and this impl is exercised only by that proptest.
+pub(crate) struct AgentRunAuditTable;
+
+impl crate::effect_table::sealed::Sealed for AgentRunAuditTable {}
+impl crate::effect_table::EffectAuditTable for AgentRunAuditTable {
+    // Both records own their fields, so neither row borrows.
+    type RequestRow<'a> = AgentRunAuditRecord;
+    type OutcomeRow<'a> = AgentRunOutcomeAuditRecord;
+    type Key = AgentRunId;
+    const REQUEST_TABLE: &'static str = "agent_run";
+    const OUTCOME_TABLE: &'static str = "agent_run_outcome";
+    const LABEL: &'static str = "Agent run";
+
+    fn insert_request(conn: &Connection, row: &Self::RequestRow<'_>) -> Result<(), AuditError> {
+        validate_agent_run_request(row)?;
+        insert_agent_run_request_row(conn, row)
+    }
+    fn insert_outcome(conn: &Connection, row: &Self::OutcomeRow<'_>) -> Result<(), AuditError> {
+        insert_agent_run_outcome_row(conn, row)
+    }
+    fn session_id(row: &Self::RequestRow<'_>) -> SessionId {
+        row.session_id
+    }
+    fn request_key(row: &Self::RequestRow<'_>) -> AgentRunId {
+        row.run_id
+    }
+    // The outcome record carries its run id nested in the `AgentRunOutcome`.
+    fn outcome_key(row: &Self::OutcomeRow<'_>) -> AgentRunId {
+        row.outcome.run_id
+    }
 }
 
 impl AuditLog {
@@ -118,39 +247,11 @@ impl AuditLog {
     }
 
     pub fn record_agent_run(&self, r: &AgentRunAuditRecord) -> Result<(), AuditError> {
-        validate_sha256_hex(&r.prompt.sha256_hex, "agent run prompt sha256")?;
-        if r.prompt.redacted_preview.is_empty() {
-            return Err(AuditError::Invariant(
-                "agent run prompt redacted preview must not be empty",
-            ));
-        }
-
+        validate_agent_run_request(r)?;
         self.with_conn_mut(|c| {
             let tx = c.transaction()?;
             crate::validation::check_session_open(&tx, r.session_id)?;
-
-            tx.execute(
-                "INSERT INTO agent_run (
-                     run_id,
-                     session_id,
-                     requested_at,
-                     agent_kind,
-                     prompt_bytes,
-                     prompt_sha256,
-                     prompt_redacted_preview,
-                     correlation_id
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                params![
-                    r.run_id.as_uuid().to_string(),
-                    r.session_id.as_uuid().to_string(),
-                    r.requested_at.as_millis(),
-                    r.agent_kind.as_str(),
-                    u64_to_sql_i64(r.prompt.byte_len, "agent run prompt bytes")?,
-                    &r.prompt.sha256_hex,
-                    &r.prompt.redacted_preview,
-                    r.correlation_id.as_ref().map(CorrelationId::as_str),
-                ],
-            )?;
+            insert_agent_run_request_row(&tx, r)?;
             tx.commit()?;
             Ok(())
         })
@@ -160,42 +261,7 @@ impl AuditLog {
         &self,
         r: &AgentRunOutcomeAuditRecord,
     ) -> Result<(), AuditError> {
-        validate_stream_summary(&r.outcome.stdout, "stdout")?;
-        validate_stream_summary(&r.outcome.stderr, "stderr")?;
-
-        self.with_conn_mut(|c| {
-            c.execute(
-                "INSERT INTO agent_run_outcome (
-                     run_id,
-                     completed_at,
-                     status,
-                     exit_code,
-                     stdout_path,
-                     stdout_bytes,
-                     stdout_sha256,
-                     stdout_truncated,
-                     stderr_path,
-                     stderr_bytes,
-                     stderr_sha256,
-                     stderr_truncated
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-                params![
-                    r.outcome.run_id.as_uuid().to_string(),
-                    r.completed_at.as_millis(),
-                    agent_run_status_str(&r.outcome.status),
-                    r.outcome.exit_code,
-                    path_to_sql_text(&r.outcome.stdout.path, "stdout path")?,
-                    u64_to_sql_i64(r.outcome.stdout.byte_len, "stdout bytes")?,
-                    &r.outcome.stdout.sha256_hex,
-                    bool_to_sql_i64(r.outcome.stdout.truncated),
-                    path_to_sql_text(&r.outcome.stderr.path, "stderr path")?,
-                    u64_to_sql_i64(r.outcome.stderr.byte_len, "stderr bytes")?,
-                    &r.outcome.stderr.sha256_hex,
-                    bool_to_sql_i64(r.outcome.stderr.truncated),
-                ],
-            )?;
-            Ok(())
-        })
+        self.with_conn_mut(|c| insert_agent_run_outcome_row(c, r))
     }
 
     pub fn get_agent_run(
@@ -489,8 +555,97 @@ fn agent_run_status_from_str(raw: &str) -> Result<AgentRunTerminalStatus, AuditE
 mod tests {
     use super::*;
     use crate::test_support::sample_session;
+    use proptest::prelude::*;
     use rusqlite::params;
     use writ_core::core::{AgentKind, SessionRecord};
+
+    /// Raw `agent_run` rows (every column, in insert order) for the guard/direct
+    /// equivalence proptest — the agent-run analogue of `proxy_table`'s
+    /// `dump_request_rows`.
+    #[allow(clippy::type_complexity)]
+    fn dump_agent_run_request_rows(
+        log: &AuditLog,
+    ) -> Vec<(
+        String,
+        String,
+        i64,
+        String,
+        i64,
+        String,
+        String,
+        Option<String>,
+    )> {
+        log.with_conn(|c| {
+            let mut stmt = c.prepare(
+                "SELECT run_id, session_id, requested_at, agent_kind, prompt_bytes, \
+                 prompt_sha256, prompt_redacted_preview, correlation_id \
+                 FROM agent_run ORDER BY rowid",
+            )?;
+            let rows = stmt
+                .query_map([], |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                        r.get(7)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+        .unwrap()
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn dump_agent_run_outcome_rows(
+        log: &AuditLog,
+    ) -> Vec<(
+        String,
+        i64,
+        String,
+        i64,
+        String,
+        i64,
+        String,
+        i64,
+        String,
+        i64,
+        String,
+        i64,
+    )> {
+        log.with_conn(|c| {
+            let mut stmt = c.prepare(
+                "SELECT run_id, completed_at, status, exit_code, \
+                 stdout_path, stdout_bytes, stdout_sha256, stdout_truncated, \
+                 stderr_path, stderr_bytes, stderr_sha256, stderr_truncated \
+                 FROM agent_run_outcome ORDER BY rowid",
+            )?;
+            let rows = stmt
+                .query_map([], |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                        r.get(7)?,
+                        r.get(8)?,
+                        r.get(9)?,
+                        r.get(10)?,
+                        r.get(11)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+        .unwrap()
+    }
 
     #[test]
     fn agent_vm_workspace_bootstrap_roundtrips() {
@@ -978,5 +1133,96 @@ mod tests {
                 .unwrap(),
             Some(later)
         );
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        /// The generic guard's two-phase path (`begin_effect` + `complete`) must be
+        /// behaviour-preserving for agent-runs: it leaves both tables byte-for-byte
+        /// identical to the direct `record_agent_run` + `record_agent_run_outcome`.
+        /// Agent-runs are the outcome-only shape at the *driver* layer, but at the
+        /// DAO layer the two-phase writers already model launch-then-outcome, so
+        /// this is the equivalence oracle — the flake/proxy analogue.
+        #[test]
+        fn begin_then_complete_matches_the_direct_agent_run_writers(
+            agent_is_claude in any::<bool>(),
+            prompt_bytes in 0u64..=1_000_000,
+            has_correlation in any::<bool>(),
+            status_succeeded in any::<bool>(),
+            exit_code in any::<i32>(),
+            stdout_bytes in 0u64..=(i64::MAX as u64),
+            stderr_bytes in 0u64..=(i64::MAX as u64),
+            stdout_truncated in any::<bool>(),
+            stderr_truncated in any::<bool>(),
+        ) {
+            let direct = AuditLog::open_in_memory().unwrap();
+            let guarded = std::sync::Arc::new(AuditLog::open_in_memory().unwrap());
+            let s = sample_session();
+            direct.open_session(&s).unwrap();
+            guarded.open_session(&s).unwrap();
+
+            let run_id = AgentRunId::new();
+            let request = AgentRunAuditRecord {
+                run_id,
+                session_id: s.session_id,
+                requested_at: UnixMillis::from_millis(1_700_000_100),
+                agent_kind: if agent_is_claude {
+                    AgentKind::Claude
+                } else {
+                    AgentKind::Codex
+                },
+                prompt: AgentPromptSummary {
+                    byte_len: prompt_bytes,
+                    sha256_hex: writ_agent_run::sha256_hex(b"prompt"),
+                    redacted_preview: "<redacted>".to_string(),
+                },
+                correlation_id: has_correlation
+                    .then(|| CorrelationId::try_new("feat-42_xyz").unwrap()),
+            };
+            // The outcome's key is nested (`outcome.run_id`); it must match the
+            // request's `run_id` for `complete` to bind the pair.
+            let outcome = AgentRunOutcomeAuditRecord {
+                completed_at: UnixMillis::from_millis(1_700_000_200),
+                outcome: AgentRunOutcome {
+                    run_id,
+                    status: if status_succeeded {
+                        AgentRunTerminalStatus::Succeeded
+                    } else {
+                        AgentRunTerminalStatus::Failed
+                    },
+                    exit_code,
+                    stdout: AgentRunStreamSummary {
+                        path: "/private/writ/runs/stdout.log".into(),
+                        byte_len: stdout_bytes,
+                        sha256_hex: writ_agent_run::sha256_hex(b"stdout"),
+                        truncated: stdout_truncated,
+                    },
+                    stderr: AgentRunStreamSummary {
+                        path: "/private/writ/runs/stderr.log".into(),
+                        byte_len: stderr_bytes,
+                        sha256_hex: writ_agent_run::sha256_hex(b"stderr"),
+                        truncated: stderr_truncated,
+                    },
+                },
+            };
+
+            direct.record_agent_run(&request).unwrap();
+            direct.record_agent_run_outcome(&outcome).unwrap();
+            guarded
+                .begin_effect::<AgentRunAuditTable>(&request)
+                .unwrap()
+                .complete(&outcome)
+                .unwrap();
+
+            prop_assert_eq!(
+                dump_agent_run_request_rows(&direct),
+                dump_agent_run_request_rows(&guarded)
+            );
+            prop_assert_eq!(
+                dump_agent_run_outcome_rows(&direct),
+                dump_agent_run_outcome_rows(&guarded)
+            );
+        }
     }
 }
