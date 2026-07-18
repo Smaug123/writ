@@ -273,7 +273,8 @@ nix-cache, flake-provision, agent runs). Complete by construction (§4).
 **Lives in.** The `writ-audit` crate (`lib.rs`, `schema.rs`, `migrations/`,
 `session.rs`, `grant.rs`, `git_push.rs` + `git_push/`, `agent_run.rs`,
 `proxy_table.rs`, `nix_binary_cache`-audit `nix_cache.rs`, `flake_provision.rs`,
-…), re-exported as `writ::audit`. Its boot-time reconciler, `boot_reconcile.rs`,
+`effect_table.rs`, `effect_scan.rs`, …), re-exported as `writ::audit`. Its
+boot-time reconciler, `boot_reconcile.rs`,
 stays in `writ` — it *drives* the audit DAOs but also needs the git pipeline
 (`git_push_staging`), so it is an orchestrator, not audit storage.
 
@@ -304,8 +305,19 @@ down-rev/mismatched DB is refused (§4). At-most-one-outcome per request is
 enforced by SQL triggers (`grant_excludes_mint_failure` /
 `mint_failure_excludes_grant`), plus forward-only triggers on the approve-attempt
 ledger. Timestamps are `UnixMillis` integers. Boot reconciliation
-(`reconcile_pending_approve_attempts`, `boot_reconcile.rs:95`) recognises
-"in-flight at crash" rows and either recovers or flags them uncertain.
+(`boot_reconcile.rs`) runs three passes at daemon startup:
+`reconcile_pending_approve_attempts` recovers or flags-uncertain "in-flight at
+crash" approve-attempt rows; `reconcile_orphaned_staged_carriers` re-pairs staged
+git-push carriers left on disk without an outcome; and
+`reconcile_unpaired_effect_rows` — the durable backstop for the audit-pair
+invariant (§4) — scans every short-lived `(request, outcome)` effect pair
+(`effect_scan::EFFECT_AUDIT_PAIRS`: the proxies, nix-cache, flake-provision, and
+git-push, but *not* outcome-only `agent_run`, whose request row legitimately
+outlives its outcome) and flags any request row left without its partner. That
+last pass is **report-only** (it never fabricates an outcome) and runs *after*
+persisted-session reconciliation (§5.5), so a broker VM that survived a host
+crash and still writes the DB over virtiofs has been torn down — leaving the DB
+quiescent — before the scan reads it.
 
 **Neighbours.** Written by the broker core and every effect handler; read by
 `ui_http`/CLI and by boot reconcile at daemon startup.

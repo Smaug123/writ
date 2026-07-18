@@ -1,9 +1,16 @@
 //! Drive state left non-terminal by a prior crash to a state the rest
-//! of the broker can act on. Two independent boot passes live here:
+//! of the broker can act on. Three independent boot passes live here:
 //! [`reconcile_pending_approve_attempts`] for the approve-attempt state
-//! machine (audit-only) and [`reconcile_orphaned_staged_carriers`] for
+//! machine (audit-only); [`reconcile_orphaned_staged_carriers`] for
 //! staged-push carriers stranded without an outcome row (filesystem-
-//! aware, because the bundle bytes live only in the staging store).
+//! aware, because the bundle bytes live only in the staging store); and
+//! [`reconcile_unpaired_effect_rows`], the durable backstop for the
+//! brokered-effect audit-pair invariant — a report-only scan that flags
+//! any `*_request` row left without its `*_outcome` partner (a crash, or
+//! an unreconciled handler failure, mid-effect). Unlike the first two it
+//! *mutates nothing*: it only alerts, so a table's own recovery sweep or
+//! an operator can resolve the row (fabricating an outcome would corrupt
+//! the log worse than a missing one).
 //!
 //! The approve state machine (see `docs/design/approve_state_machine.md`)
 //! has two non-terminal states:
