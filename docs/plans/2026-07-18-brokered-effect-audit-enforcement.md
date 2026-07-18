@@ -134,7 +134,13 @@ Generalize `proxy_table` from "three structurally-identical proxy tables" to
 
 ```rust
 // writ-audit — extends the existing ProxyAuditTable descriptor.
-pub trait EffectAuditTable: 'static {
+//
+// SEALED via the private supertrait: only writ-audit's own DAO markers implement
+// it. This matters because `insert_request`/`insert_outcome` receive the live
+// `Connection` — an external impl could otherwise run arbitrary SQL inside
+// `begin_effect`'s transaction and bypass every typed append-only DAO.
+mod sealed { pub trait Sealed {} }   // impl'd only by writ-audit's table markers
+pub trait EffectAuditTable: sealed::Sealed + 'static {
     type RequestRow<'a>;
     type OutcomeRow<'a>;
     /// The identity column both rows share — `RequestId` for the proxies and
@@ -148,6 +154,11 @@ pub trait EffectAuditTable: 'static {
     const LABEL: &'static str;
     fn insert_request(conn: &Connection, row: &Self::RequestRow<'_>) -> Result<(), AuditError>;
     fn insert_outcome(conn: &Connection, row: &Self::OutcomeRow<'_>) -> Result<(), AuditError>;
+    /// The key a request row carries. `begin_effect` reads it to populate the
+    /// guard's `key` (the `RequestRow` is otherwise opaque to generic code), and
+    /// `record_effect_coalesced` compares it against `outcome_key` to preserve
+    /// today's runtime request==outcome id check.
+    fn request_key(row: &Self::RequestRow<'_>) -> Self::Key;
     /// The key an outcome row carries, so `RecordedRequest::complete` can refuse
     /// an outcome that belongs to a *different* live guard for the same table —
     /// which FKs and the pair-count oracle would both still let pass. Cheap: it
@@ -174,7 +185,9 @@ impl AuditLog {
     pub fn begin_effect<T: EffectAuditTable>(
         self: &Arc<Self>,
         row: &T::RequestRow<'_>,
-    ) -> Result<RecordedRequest<T>, AuditError> { /* check_session_open + insert_request, commit; key taken from row */ }
+    ) -> Result<RecordedRequest<T>, AuditError> {
+        /* check_session_open + insert_request, commit; guard.key = T::request_key(row) */
+    }
 
     /// Resume a guard for a request row written by an EARLIER lifecycle event —
     /// the `OutcomeOnly` durability. `/v1/agent-runs/{id}/outcome` is the case:
@@ -188,9 +201,12 @@ impl AuditLog {
 
     /// Coalesced single-commit form for authority-free reads (nix-cache serve).
     /// Same as begin+complete but one fsync; refuses a mid-fetch session close.
+    /// Asserts `T::request_key(request) == T::outcome_key(outcome)` first, keeping
+    /// today's runtime request==outcome id check (else an outcome for an older
+    /// request could land beside a fresh dangling request).
     pub fn record_effect_coalesced<T: EffectAuditTable>(
         &self, request: &T::RequestRow<'_>, outcome: &T::OutcomeRow<'_>,
-    ) -> Result<(), AuditError> { /* one transaction */ }
+    ) -> Result<(), AuditError> { /* assert keys equal; one transaction */ }
 }
 
 impl<T: EffectAuditTable> RecordedRequest<T> {
@@ -213,13 +229,13 @@ impl<T: EffectAuditTable> RecordedRequest<T> {
 impl<T: EffectAuditTable> Drop for RecordedRequest<T> {
     fn drop(&mut self) {
         if self.discharged { return; }   // completed, or an outcome was submitted
-        // A guard dropped without discharge is a bug. We do NOT fabricate an
-        // outcome row: no table can always express a *truthful* "incomplete"
-        // outcome (`agent_run_outcome`, e.g., requires a terminal status plus
-        // concrete stream paths/hashes), and a fabricated row would corrupt the
-        // log worse than a missing one. Instead emit AUDIT_WRITE_FAILURE, which
-        // boot reconciliation already scans for, so the dangling request is
-        // caught, not fabricated over...
+        // With the driver owning completion (§3.2), a live guard is discharged on
+        // every path, so reaching here is a bug — not a routine "crash mid-effect".
+        // We do NOT fabricate an outcome row: no table can always express a
+        // *truthful* "incomplete" outcome (`agent_run_outcome`, e.g., requires a
+        // terminal status plus concrete stream paths/hashes), and a fabricated row
+        // would corrupt the log worse than a missing one. So emit AUDIT_WRITE_FAILURE
+        // for live alerting...
         tracing::error!(
             target: AUDIT_WRITE_FAILURE_TARGET, kind = "effect_guard_dropped",
             table = T::LABEL, "brokered effect guard dropped without an outcome");
@@ -232,6 +248,16 @@ impl<T: EffectAuditTable> Drop for RecordedRequest<T> {
 }
 ```
 
+The tracing event is *live alerting*, not durable detection (`boot_reconcile`
+today handles only approve-attempts and staged carriers, and does not read logs).
+The durable backstop is a generic **boot-time unpaired-row scan** — the same
+`LEFT JOIN` the Stage-0 oracle uses, run over every effect table at startup to
+flag any `*_request` with no `*_outcome`. It lands with the guard (Stage 3) and is
+listed in that stage's oracle. Because the driver now discharges on every path, a
+genuine dangling row requires a hard crash *between* the request-row commit and
+the outcome write — the two-phase window that has always existed — so the scan
+reports the same rare, real events, not routine drops.
+
 Why this shape:
 
 - **Make illegal states unrepresentable.** "Request row without a decision to
@@ -241,16 +267,16 @@ Why this shape:
   coalesced writer, which writes both). The public surface is `begin_effect`,
   `complete`, and `record_effect_coalesced` — three operations, and every one of
   them writes *both halves or refuses*.
-- **Drop is the backstop, not the mechanism.** Every begun guard is discharged
-  by `complete` (buffered) or by being moved into a streaming body (see §3.2).
-  Drop-*without-discharge* is a *bug*, and it fails loudly: it emits
-  `AUDIT_WRITE_FAILURE` (which boot reconciliation scans for) and, outside
-  unwinding, `debug_assert`-panics in tests. It does **not** fabricate an outcome
-  row — no table can always express a truthful "incomplete" outcome, so a genuine
-  dangling request is left for reconciliation rather than papered over. A
-  completion that is *attempted and rejected or fails* is not a drop either:
-  `complete` marks the guard discharged before returning, so the failure surfaces
-  as the driver's 500 + `AUDIT_WRITE_FAILURE` once, never as a second row.
+- **Drop is the backstop, not the mechanism.** The driver discharges every begun
+  guard (§3.2), so Drop-*without-discharge* is a *bug*, not routine. It fails
+  loudly — emits `AUDIT_WRITE_FAILURE` for live alerting and, outside unwinding,
+  `debug_assert`-panics in tests — but does **not** fabricate an outcome row (no
+  table can always express a truthful "incomplete" outcome). A genuine dangling
+  request is caught durably by the boot-time unpaired-row scan (added in Stage 3),
+  not by the tracing event and not papered over. A completion that is *attempted
+  and rejected or fails* is not a drop either: `complete` marks the guard
+  discharged before returning, so the failure surfaces as the driver's 500 +
+  `AUDIT_WRITE_FAILURE` once, never as a second row.
 - **Durability stays a first-class choice**, not an accident: two-phase is
   `begin_effect` + `complete`; coalesced is `record_effect_coalesced`;
   outcome-only is `resume_effect` + `complete`. Nothing else. `agent_runs`'
@@ -292,41 +318,44 @@ pub(in crate::vm_http) trait BrokeredEffect: Sized + 'static {
     // --- policy: DU-inspected, never a pluggable "decide()" object ---
     fn decide(&self, session: &VmHttpSession, req: &Self::Request) -> EffectDecision;
 
-    // --- the ONLY credential handoff. The driver calls this AFTER a live guard
-    //     exists, so a resolution failure (absent host secret, OAuth refresh
-    //     error) is still an audited outcome — as today's proxy code records it
-    //     after the request row. The error therefore carries the outcome row to
-    //     complete the guard with, plus the guest-facing response. ---
+    // --- async preparation that must run BEFORE the request row can be
+    //     described. Flake provisioning materializes its mirror and plans the lock
+    //     here to learn `flake_dir`/`cache_dir`/`input_count`; a preflight
+    //     rejection (e.g. a flake cache-miss, which grants nothing) returns
+    //     `Reject` and writes no row. `Prepared` is `()` for effects whose request
+    //     row is known from `req` alone. ---
+    type Prepared;
+    async fn prepare(&self, session: &VmHttpSession, req: &Self::Request)
+        -> Result<Self::Prepared, EffectDecision /* Reject only */>;
+
+    // --- the audit request row (pure), built from the prepared inputs ---
+    fn request_row<'a>(&'a self, ctx: &'a EffectCtx, prepared: &'a Self::Prepared,
+                       req: &'a Self::Request, d: &'a EffectDecision)
+        -> <Self::Table as EffectAuditTable>::RequestRow<'a>;
+    /// OutcomeOnly effects only: the key of the request row minted by an EARLIER
+    /// event (the `AgentRunId` written at run launch), so the driver *resumes*
+    /// that row rather than begins a new one — never double-inserting.
+    fn resume_key(&self, req: &Self::Request) -> <Self::Table as EffectAuditTable>::Key;
+
+    // --- the ONLY credential handoff. Called AFTER a live guard exists, so a
+    //     resolution failure (absent host secret, OAuth refresh error) is still an
+    //     audited outcome. The error carries the outcome row to complete the guard
+    //     with, plus the response. ---
     async fn resolve_authority<'a>(&'a self, session: &VmHttpSession, req: &'a Self::Request)
         -> Result<Self::Authority, AuthorityFailure<'a, Self::Table>>;
 
-    // --- the audit request row (pure) ---
-    fn request_row<'a>(&'a self, ctx: &'a EffectCtx, req: &'a Self::Request, d: &'a EffectDecision)
-        -> <Self::Table as EffectAuditTable>::RequestRow<'a>;
-    /// OutcomeOnly effects only: the key of the request row minted by an EARLIER
-    /// event (e.g. the `AgentRunId` written at run launch), so the driver
-    /// *resumes* that row rather than begins a new one — never double-inserting.
-    fn resume_key(&self, req: &Self::Request) -> <Self::Table as EffectAuditTable>::Key;
+    // --- the effect. Receives the authority and prepared inputs, NOT the guard and
+    //     NOT the broker state. Returns a COMPLETION that the *driver* discharges;
+    //     the guard never enters `perform`, so an impl cannot silently drop it —
+    //     which `#[must_use]` on a moved parameter does NOT catch and a
+    //     release-stripped Drop-assert would have hidden. ---
+    async fn perform(&self, authority: Self::Authority, req: Self::Request, prepared: Self::Prepared)
+        -> EffectCompletion<'_, Self::Table>;
 
-    // --- the effect. Receives the resolved authority, NOT the broker state. The
-    //     right subset of methods is implemented per DURABILITY (in Rust:
-    //     sub-traits over a shared meta trait; elided here for readability).
-
-    /// TwoPhase / OutcomeOnly. Receives the live guard and MUST discharge it:
-    ///   - buffered  → `recorded.complete(&outcome_row)`, then build the response;
-    ///   - streaming → move `recorded` into the `ProxyStream` body, which
-    ///                 completes on Drop once the byte count / error is known
-    ///                 (today's `ProxyStreamAudit`).
-    /// Completion lives here, not in the driver, precisely because a streaming
-    /// outcome is unknown until the body drains. The guard's `#[must_use]` +
-    /// Drop-bomb force the discharge; the driver guarantees a live guard first.
-    async fn perform(&self, authority: Self::Authority, req: Self::Request,
-                     recorded: RecordedRequest<Self::Table>) -> VmHttpDispatch;
-
-    /// Coalesced (authority-free reads only). No guard: returns the request+outcome
-    /// rows so the driver writes BOTH in one commit via `record_effect_coalesced`,
+    /// Coalesced (authority-free reads only). Returns the request+outcome rows so
+    /// the driver writes BOTH in one commit via `record_effect_coalesced`,
     /// preserving the nix-cache single-fsync path.
-    async fn perform_coalesced<'a>(&'a self, req: Self::Request, ctx: &'a EffectCtx)
+    async fn perform_coalesced<'a>(&'a self, req: Self::Request)
         -> (
             <Self::Table as EffectAuditTable>::RequestRow<'a>,
             <Self::Table as EffectAuditTable>::OutcomeRow<'a>,
@@ -361,6 +390,20 @@ pub(in crate::vm_http) enum EffectDecision {
     Reject(VmHttpDispatch),
 }
 
+/// What `perform` returns. The DRIVER discharges the guard from it, so an effect
+/// impl never holds — and therefore never silently drops — the guard.
+pub(in crate::vm_http) enum EffectCompletion<'a, T: EffectAuditTable> {
+    /// Outcome known now: the driver calls `recorded.complete(&outcome)` and
+    /// returns `response`.
+    Buffered { outcome: T::OutcomeRow<'a>, response: VmHttpDispatch },
+    /// Outcome known only when the body drains: the driver moves the guard into
+    /// this pending stream. `PendingStream::into_response(guard)` is the ONLY
+    /// consumer of the guard on this path and the ONLY constructor of the
+    /// guard-owning body, so the guard enters the streaming body by construction
+    /// and completes when it drops (today's `ProxyStreamAudit`).
+    Streaming(PendingStream),
+}
+
 pub(in crate::vm_http) async fn broker_effect<E: BrokeredEffect>(
     audit: &Arc<AuditLog>, session: &VmHttpSession, request: &VmHttpRequest,
     body: Vec<u8>, effect: E,
@@ -380,19 +423,26 @@ pub(in crate::vm_http) async fn broker_effect<E: BrokeredEffect>(
             return audit_write_500(e);
         }
         // ...run the effect, then write request+outcome in ONE commit (one fsync).
-        let (req_row, out_row, response) = effect.perform_coalesced(parsed, &ctx).await;
+        let (req_row, out_row, response) = effect.perform_coalesced(parsed).await;
         if let Err(e) = audit.record_effect_coalesced::<E::Table>(&req_row, &out_row) {
             return audit_write_500(e);
         }
         return response;
     }
 
-    // TwoPhase and OutcomeOnly: acquire a LIVE guard FIRST — begin the request row
-    // (TwoPhase) or resume the one minted at run launch (OutcomeOnly) — so that
-    // authority resolution and the effect both run with an open pair to complete.
+    // Preparation (mirror materialize + lock plan for flake) runs BEFORE the
+    // request row can be described; a preflight rejection writes nothing.
+    let prepared = match effect.prepare(session, &parsed).await {
+        Ok(p) => p,
+        Err(EffectDecision::Reject(response)) => return response,
+        Err(_) => unreachable!("prepare rejects only"),
+    };
+
+    // Acquire a LIVE guard — begin the request row (TwoPhase) or resume the one
+    // minted at run launch (OutcomeOnly). The guard stays in the DRIVER.
     let recorded = match match E::DURABILITY {
         Durability::TwoPhase =>
-            audit.begin_effect::<E::Table>(&effect.request_row(&ctx, &parsed, &decision)),
+            audit.begin_effect::<E::Table>(&effect.request_row(&ctx, &prepared, &parsed, &decision)),
         Durability::OutcomeOnly =>
             audit.resume_effect::<E::Table>(effect.resume_key(&parsed)), // errors if the row is absent
         Durability::Coalesced => unreachable!("handled above"),
@@ -401,7 +451,7 @@ pub(in crate::vm_http) async fn broker_effect<E: BrokeredEffect>(
     };
     // Authority is resolved AFTER the guard is live, so a failure — absent host
     // secret, OAuth refresh error — completes the pair with a failure outcome
-    // instead of escaping unaudited (which the old `resolve-then-begin` order did).
+    // instead of escaping unaudited (which a resolve-then-begin order would).
     let authority = match effect.resolve_authority(session, &parsed).await {
         Ok(a) => a,
         Err(fail) => {
@@ -409,19 +459,33 @@ pub(in crate::vm_http) async fn broker_effect<E: BrokeredEffect>(
             return fail.response;
         }
     };
-    // `perform` is unreachable without a live `recorded`, and MUST discharge it
-    // (complete, or move into a streaming body).
-    effect.perform(authority, parsed, recorded).await
+    // Run the effect, then the DRIVER discharges the guard — on EVERY branch.
+    // `perform` returned data, never the guard, so it had no way to drop it
+    // un-audited (the release-build hole a `perform`-owned guard left open).
+    match effect.perform(authority, parsed, prepared).await {
+        EffectCompletion::Buffered { outcome, response } => {
+            if let Err(e) = recorded.complete(&outcome) { return audit_write_500(e); }
+            response
+        }
+        // The ONLY consumer of `recorded` here, and the ONLY constructor of the
+        // guard-owning body: the guard cannot escape un-attached, and completes
+        // when the stream drops.
+        EffectCompletion::Streaming(pending) => pending.into_response(recorded),
+    }
 }
 ```
 
-The type-level force is the same one `route_proxy_request` already relies on and
-the reviewer asked for: **`perform` is unreachable except through `broker_effect`,
-which has already made the audit pair live, and cannot return without discharging
-the guard.** `perform`'s signature hands it `Self::Authority`, never
-`&BrokerState` — so an impl cannot reach the secret store *through its arguments*.
-Three durability paths are what let this one driver **preserve** today's semantics
-rather than regress them (each a fix from the Codex review of PR #325):
+The type-level force is what `route_proxy_request` already relies on, sharpened:
+**the guard never leaves `broker_effect`.** `perform` returns an
+`EffectCompletion` (data), and the *driver* discharges the guard — `complete` on
+the buffered branch, `PendingStream::into_response(recorded)` on the streaming
+one. So an effect impl has no guard to drop, closing the release-build hole a
+`perform`-owned guard left open (`#[must_use]` does not fire on a moved parameter,
+and the Drop `debug_assert` is compiled out in release). `perform`'s signature
+hands it `Self::Authority`, never `&BrokerState`, so an impl cannot reach the
+secret store *through its arguments* either. Three durability paths let this one
+driver **preserve** today's semantics rather than regress them (each a fix from
+the Codex review of PR #325):
 - **TwoPhase** begins the request row *before* authority resolution, so an
   authority failure (absent host secret, OAuth refresh error) completes the pair
   with a failure outcome — matching today's "request row, then the failure" —
@@ -454,13 +518,19 @@ Today three functions switch on the same target string in three places:
 // `EffectAuditTable` pair.
 enum RouteEntry {
     Brokered(Box<dyn ErasedEffect>),   // .run(..) == broker_effect::<E>(..)
-    Plain(Box<dyn PlainRoute>),        // an explicitly non-audited handler
+    Plain(PlainRoute),                 // a CLOSED set of known non-effect routes
 }
+// Closed on purpose — NOT `Box<dyn ...>`. An open extension point would let a
+// future effectful endpoint be registered as `Plain` and run IO outside
+// `broker_effect` while registry-totality still passed — the original
+// discipline gap, reintroduced. A closed enum forces every addition to be a
+// named, reviewed variant that provably does no brokered effect.
+enum PlainRoute { Session, AgentRunConfig, GitCloneUntilMintPort }
 async fn dispatch(services: &VmHttpServices<S>, session, request, body) -> VmHttpDispatch {
     match services.route_table().resolve(&request.target, &request.method) {
-        Some(RouteEntry::Brokered(e)) => e.run(audit, session, request, body).await,
-        Some(RouteEntry::Plain(h))    => h.run(session, request, body).await,
-        None                          => not_found(),
+        Some(RouteEntry::Brokered(e))    => e.run(audit, session, request, body).await,
+        Some(RouteEntry::Plain(route))   => route.run(session, request, body).await,
+        None                             => not_found(),
     }
 }
 ```
@@ -470,11 +540,11 @@ async fn dispatch(services: &VmHttpServices<S>, session, request, body) -> VmHtt
 become one. **A new *audited* capability is one `BrokeredEffect` impl + one
 `Brokered` row** — not six edit sites — and, decisively, *there is no code path
 from the dispatcher to an effect's IO that does not pass through `broker_effect`*.
-The handful of non-audited routes are `Plain` rows, explicit and enumerable
-rather than special-cased in an if/else. That is the step that turns "complete by
-discipline" into "complete by construction" at the routing boundary: audit is not
-optional for a `Brokered` entry, and a route is one kind or the other, never
-neither.
+The non-audited routes are a **closed** `PlainRoute` enum — adding one is a named,
+reviewed variant, not an open `dyn` hatch through which an effectful endpoint
+could slip unaudited. That is the step that turns "complete by discipline" into
+"complete by construction" at the routing boundary: audit is not optional for a
+`Brokered` entry, and a route is one kind or the other, never neither.
 
 Within-crate sealing is a boundary-discipline lever, not an airtight compiler
 guarantee: the effect impls and `BrokerState` live in the same crate, so Rust
@@ -609,12 +679,17 @@ hand-rolled version; all `writ-audit` tests pass.
 
 **Dependencies**: Stage 2. **Implements**: [§3.1](#31-layer-1--the-sealed-must-use-audit-pair-guard-writ-audit) (guard).
 
-Add `begin_effect` / `RecordedRequest` / `complete` / `record_effect_coalesced`
-and the Drop backstop; re-express the existing `proxy_table` two-phase and
-coalesced writers *in terms of the guard* (so proxies/nix-cache exercise it
-immediately). **Oracle**: the existing proxy roundtrip + coalesced-equivalence
-proptests pass through the guard unchanged; a new test that Drop-without-complete
-`debug_assert`-panics and emits `AUDIT_WRITE_FAILURE`.
+Add `begin_effect` / `resume_effect` / `RecordedRequest` / `complete` /
+`record_effect_coalesced` and the Drop backstop; re-express the existing
+`proxy_table` two-phase and coalesced writers *in terms of the guard* (so
+proxies/nix-cache exercise it immediately). Add the durable
+`reconcile_unpaired_effect_rows` boot scan (the Stage-0 `LEFT JOIN` over every
+effect table) that flags any `*_request` with no `*_outcome`. **Oracle**: the
+existing proxy roundtrip + coalesced-equivalence proptests pass through the guard
+unchanged; `complete` rejects an outcome whose key ≠ the guard's key; a
+Drop-without-discharge emits `AUDIT_WRITE_FAILURE` and (outside unwinding)
+`debug_assert`-panics; and a seeded dangling request row is reported by the boot
+scan, a completed pair is not.
 
 ### Stage 4 — the driver, consumed by the already-trait-shaped effects
 
@@ -631,11 +706,15 @@ through `broker_effect` and stays GREEN.
 **Dependencies**: Stage 4. **Implements**: [§3.2](#32-layer-2--the-brokeredeffect-trait--single-driver-vm_http) (remaining effects).
 
 One sub-branch per handler — `git_push` VM-stage (TwoPhase), `flake_provision`
-(TwoPhase, keeping its grant re-check in `decide`), and `agent_runs` (OutcomeOnly:
-`resume_key` returns the `AgentRunId`, so `resume_effect` completes the row minted
-at launch) — each converting the handler to a `BrokeredEffect` impl. **Oracle**:
-each handler's existing tests pass; the Stage-0 oracle now covers it through the
-driver.
+(TwoPhase; its grant re-check stays in `decide`, and its mirror-materialize +
+lock-plan preflight becomes the `prepare` phase that yields the derived
+`flake_dir`/`cache_dir`/`input_count` for the request row, with a cache-miss
+returning `Reject` so nothing is written — preserving today's ordering), and
+`agent_runs` (OutcomeOnly: `resume_key` returns the `AgentRunId`, so `resume_effect`
+completes the row minted at launch; foreign/unknown runs and idempotent retries
+are `decide → Reject`, writing nothing) — each converting the handler to a
+`BrokeredEffect` impl. **Oracle**: each handler's existing tests pass; the Stage-0
+oracle now covers it through the driver.
 
 `git_clone` is **not** ported here (see §7). Its only audit is the *host mint*:
 `resolve_authority` would call `request_capability`, which records `request` plus
