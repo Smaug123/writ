@@ -105,9 +105,10 @@ impl AuditLog {
     /// commit. The Nix cache serve path grants no authority, so — unlike a
     /// grant/mint — the request row need not be durable before the fetch; one
     /// commit instead of two takes the audit-write `fsync` tax off the agent-VM
-    /// provisioning hot path. Delegates to the shared coalesced guard writer
-    /// [`AuditLog::record_effect_coalesced`], which documents the durability
-    /// tradeoff in full and enforces request↔outcome key agreement.
+    /// provisioning hot path. Delegates to the shared crate-internal coalesced
+    /// guard writer `record_effect_coalesced` (see `effect_table`), which
+    /// documents the durability tradeoff in full and enforces request↔outcome
+    /// key agreement.
     pub fn record_nix_cache_request_and_outcome(
         &self,
         request: &NixCacheRequestRecord<'_>,
