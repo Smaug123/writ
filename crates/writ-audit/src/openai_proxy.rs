@@ -40,7 +40,10 @@ impl ProxyAuditRoute for OpenAiProxyAuditRoute {
 
 /// Zero-sized table descriptor selecting the `openai_proxy_request` /
 /// `openai_proxy_outcome` pair.
-pub(super) struct OpenAiProxyAuditTable;
+///
+/// `pub` so the VM-HTTP `broker_effect` driver can name it as its
+/// [`EffectAuditTable`](crate::EffectAuditTable); it stays sealed.
+pub struct OpenAiProxyAuditTable;
 
 impl ProxyAuditTable for OpenAiProxyAuditTable {
     type Route = OpenAiProxyAuditRoute;

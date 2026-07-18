@@ -5,6 +5,7 @@
 //! a source-subnet check, then exposes only VM-safe broker operations.
 
 mod agent_runs;
+mod broker_effect;
 mod claude_proxy;
 mod flake_provision;
 mod git_clone;
@@ -18,6 +19,7 @@ use agent_runs::{
     parse_agent_run_config_target, parse_agent_run_outcome_target, route_agent_run_config_request,
     route_agent_run_outcome_request,
 };
+use broker_effect::broker_effect;
 use claude_proxy::VmHttpClaudeProxyService;
 pub use claude_proxy::{
     DEFAULT_CLAUDE_ANTHROPIC_VERSION, VmHttpClaudeProxyAuthKind, VmHttpClaudeProxyConfig,
@@ -41,8 +43,8 @@ pub use openai_proxy::{
     VmHttpOpenAiProxyAuthKind, VmHttpOpenAiProxyConfig, VmHttpOpenAiProxyConfigError,
 };
 use proxy_common::{
-    ClaudeBackend, OpenAiBackend, ProxyAuditDecision, ProxyBackend, ProxyStream,
-    record_proxy_local_response, route_proxy_request,
+    ClaudeBackend, OpenAiBackend, ProxyBackend, ProxyEffect, ProxyStream,
+    record_proxy_local_response,
 };
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -62,7 +64,7 @@ use tokio::sync::watch;
 use tokio::task::JoinSet;
 use tracing::Instrument;
 
-use crate::audit::NixCacheAuditDecision;
+use crate::audit::{NixCacheAuditDecision, ProxyAuditDecision};
 use crate::bearer::is_bearer_token_byte;
 use crate::core::{BrokerPort, BrokerPortRange, Ipv4Cidr, SessionId};
 use crate::secret::SecretStore;
@@ -1192,7 +1194,7 @@ where
                         &request,
                         route,
                         ProxyAuditDecision::Deny {
-                            reason: vm_http_auth_error_reason(err).to_string().into(),
+                            reason: vm_http_auth_error_reason(err).to_string(),
                         },
                         response,
                         None,
@@ -1207,7 +1209,7 @@ where
                         &request,
                         route,
                         ProxyAuditDecision::Deny {
-                            reason: vm_http_auth_error_reason(err).to_string().into(),
+                            reason: vm_http_auth_error_reason(err).to_string(),
                         },
                         response,
                         None,
@@ -1364,14 +1366,16 @@ where
         let Some(service) = services.claude_proxy else {
             return VmHttpResponse::text(VmHttpStatus::NotFound, "not found").into();
         };
-        return route_proxy_request::<ClaudeBackend, _>(session, request, body, &service).await;
+        let effect = ProxyEffect::<ClaudeBackend, _>::classify(&service, session, request, body);
+        return broker_effect(service.audit(), effect).await;
     }
 
     if OpenAiBackend::is_proxy_target(&request.target) {
         let Some(service) = services.openai_proxy else {
             return VmHttpResponse::text(VmHttpStatus::NotFound, "not found").into();
         };
-        return route_proxy_request::<OpenAiBackend, _>(session, request, body, &service).await;
+        let effect = ProxyEffect::<OpenAiBackend, _>::classify(&service, session, request, body);
+        return broker_effect(service.audit(), effect).await;
     }
 
     if is_git_clone_target(&request.target) {
@@ -1611,8 +1615,8 @@ impl VmHttpDispatch {
     fn status_code(&self) -> u16 {
         match self {
             Self::Buffered(response) => response.status.code(),
-            Self::ClaudeProxyStream(stream) => stream.upstream_status,
-            Self::OpenAiProxyStream(stream) => stream.upstream_status,
+            Self::ClaudeProxyStream(stream) => stream.upstream_status(),
+            Self::OpenAiProxyStream(stream) => stream.upstream_status(),
         }
     }
 

@@ -22,14 +22,15 @@ use http_body_util::combinators::UnsyncBoxBody;
 use hyper::body::{Body as HyperBody, Frame};
 
 use crate::audit::{
-    AUDIT_WRITE_FAILURE_TARGET, AuditError, AuditLog, ClaudeProxyOutcomeRecord,
-    OpenAiProxyOutcomeRecord,
+    AUDIT_WRITE_FAILURE_TARGET, AuditError, AuditLog, EffectAuditTable, ProxyAuditDecision,
+    ProxyOutcomeRecord, ProxyRequestRecord, RecordedRequest,
 };
 use crate::core::{RequestId, SessionId, UnixMillis};
 use crate::openai_chatgpt_auth::ChatgptUpstreamHeaders;
 use crate::secret::SecretStore;
 use crate::server::BrokerState;
 
+use super::broker_effect::{BrokeredEffect, EffectCompletion};
 use super::{
     VmHttpDispatch, VmHttpHeader, VmHttpRequest, VmHttpResponse, VmHttpResponseHeader,
     VmHttpSession, VmHttpStatus,
@@ -205,62 +206,20 @@ pub(super) async fn read_upstream_body_bounded(
     Ok(body)
 }
 
-/// Selector for the audit log a streaming proxy response writes its
-/// outcome record to. Implementations are zero-sized markers; the
-/// trait is implemented at the type level so dispatch is static.
+/// Human-readable backend label for diagnostic logging on the streaming
+/// path. Implementations are zero-sized markers; the trait is implemented at
+/// the type level so dispatch is static.
 ///
-/// Outcome recording on this trait is best-effort and asymmetric with
-/// the buffered path's `ProxyBackend::record_outcome_audit`; see
-/// `record_outcome` for why.
+/// (The streaming *outcome* row is now written by completing the audit guard
+/// threaded into [`ProxyStreamBody`], not by a trait method here.)
 pub(super) trait ProxyAudit: 'static {
     /// Human-readable backend label for diagnostic logging.
     const DISPLAY_NAME: &'static str;
-    /// Persist a streaming-proxy outcome record. Infallible by design:
-    /// this is called from `ProxyStreamBody::drop` after the response
-    /// body has already started flowing to the guest, so there is no
-    /// HTTP status left to fail with. Audit-write failures are emitted
-    /// to tracing under `AUDIT_WRITE_FAILURE_TARGET` and swallowed; the
-    /// guest's response is unaffected and the request row remains in
-    /// the audit log without a paired outcome row.
-    ///
-    /// Deliberately asymmetric with the buffered path
-    /// (`ProxyBackend::record_outcome_audit`), which is fallible and
-    /// 500s the guest on audit-write failure because the response has
-    /// not yet been sent there. Reconciliation of orphaned request
-    /// rows is an audit-log concern, not a transport concern.
-    fn record_outcome(audit_log: &AuditLog, fields: ProxyOutcomeFields<'_>);
-}
-
-/// Audit decision attached to a recorded proxy request.
-/// Borrow-friendly mirror of [`crate::audit::ProxyAuditDecision`]: the
-/// orchestration code often holds a `&'static str` for the deny
-/// reason, so accepting a `Cow` here avoids forcing the call site to
-/// allocate. The conversion to the owned audit-record shape happens
-/// in [`proxy_decision_to_owned`] just before the audit write.
-#[derive(Debug)]
-pub(super) enum ProxyAuditDecision<'a> {
-    Allow,
-    Deny { reason: Cow<'a, str> },
-}
-
-/// Translate the borrow-friendly orchestration decision into the
-/// owned shape every per-backend audit-record write expects. Single
-/// implementation because the per-backend
-/// `*ProxyAuditDecision` types are all aliases of the same
-/// `crate::audit::ProxyAuditDecision`.
-pub(super) fn proxy_decision_to_owned(
-    decision: &ProxyAuditDecision<'_>,
-) -> crate::audit::ProxyAuditDecision {
-    match decision {
-        ProxyAuditDecision::Allow => crate::audit::ProxyAuditDecision::Allow,
-        ProxyAuditDecision::Deny { reason } => crate::audit::ProxyAuditDecision::Deny {
-            reason: reason.clone().into_owned(),
-        },
-    }
 }
 
 /// Fields handed to a `ProxyBackend::record_request_audit` call, mirroring
-/// the structurally-identical per-backend request records.
+/// the structurally-identical per-backend request records. Carries the owned
+/// [`ProxyAuditDecision`] the audit-record write expects.
 #[derive(Copy, Clone, Debug)]
 pub(super) struct ProxyRequestFields<'a, R> {
     pub(super) request_id: RequestId,
@@ -269,7 +228,7 @@ pub(super) struct ProxyRequestFields<'a, R> {
     pub(super) method: &'a str,
     pub(super) target: &'a str,
     pub(super) route: R,
-    pub(super) decision: &'a ProxyAuditDecision<'a>,
+    pub(super) decision: &'a ProxyAuditDecision,
 }
 
 /// Common configuration accessors the generic VM HTTP proxy service
@@ -307,6 +266,16 @@ pub(super) trait ProxyBackend: ProxyAudit + Sized {
     /// OpenAI backend and `()` for Claude.
     type Extras: Clone + Send + Sync + 'static;
 
+    /// The audit `(request, outcome)` table pair this backend records into. Tied
+    /// to `Self::Route` so the generic [`broker_effect`](super::broker_effect)
+    /// driver can begin a `ProxyRequestRecord` and complete a `ProxyOutcomeRecord`
+    /// through the shared guard.
+    type AuditTable: for<'a> EffectAuditTable<
+            RequestRow<'a> = ProxyRequestRecord<'a, Self::Route>,
+            OutcomeRow<'a> = ProxyOutcomeRecord<'a>,
+            Key = RequestId,
+        >;
+
     /// Body returned to the guest when the upstream call fails (e.g.
     /// connection error, body read failure). One per backend so the
     /// guest can tell `Claude proxy upstream failed` from
@@ -321,6 +290,12 @@ pub(super) trait ProxyBackend: ProxyAudit + Sized {
     /// `kind = …` field on the tracing record emitted when an outcome
     /// audit-write fails.
     const OUTCOME_AUDIT_KIND: &'static str;
+    /// `kind = …` field on the tracing record emitted when a *streaming*
+    /// outcome audit-write fails (from the stream body's `Drop`, after the
+    /// response head is already committed). Distinct from
+    /// [`OUTCOME_AUDIT_KIND`](Self::OUTCOME_AUDIT_KIND) so the diagnostic still
+    /// names the streaming path.
+    const STREAMING_OUTCOME_AUDIT_KIND: &'static str;
 
     /// Classify a guest-facing request target into one of this
     /// backend's audit routes, or `None` if the target is not a proxy
@@ -427,26 +402,6 @@ pub(super) struct ClaudeBackend;
 
 impl ProxyAudit for ClaudeBackend {
     const DISPLAY_NAME: &'static str = "Claude";
-
-    fn record_outcome(audit_log: &AuditLog, fields: ProxyOutcomeFields<'_>) {
-        if let Err(err) = audit_log.record_claude_proxy_outcome(&ClaudeProxyOutcomeRecord {
-            request_id: fields.request_id,
-            completed_at: fields.completed_at,
-            http_status: fields.http_status,
-            upstream_url: fields.upstream_url,
-            upstream_status: fields.upstream_status,
-            response_bytes: fields.response_bytes,
-            error: fields.error,
-        }) {
-            tracing::error!(
-                target: AUDIT_WRITE_FAILURE_TARGET,
-                kind = "claude_proxy_streaming_outcome",
-                request_id = %fields.request_id,
-                error = %err,
-                "audit write failed",
-            );
-        }
-    }
 }
 
 /// Backend marker selecting the OpenAI proxy: its routing/header
@@ -455,26 +410,6 @@ pub(super) struct OpenAiBackend;
 
 impl ProxyAudit for OpenAiBackend {
     const DISPLAY_NAME: &'static str = "OpenAI";
-
-    fn record_outcome(audit_log: &AuditLog, fields: ProxyOutcomeFields<'_>) {
-        if let Err(err) = audit_log.record_openai_proxy_outcome(&OpenAiProxyOutcomeRecord {
-            request_id: fields.request_id,
-            completed_at: fields.completed_at,
-            http_status: fields.http_status,
-            upstream_url: fields.upstream_url,
-            upstream_status: fields.upstream_status,
-            response_bytes: fields.response_bytes,
-            error: fields.error,
-        }) {
-            tracing::error!(
-                target: AUDIT_WRITE_FAILURE_TARGET,
-                kind = "openai_proxy_streaming_outcome",
-                request_id = %fields.request_id,
-                error = %err,
-                "audit write failed",
-            );
-        }
-    }
 }
 
 /// Fields handed to a `ProxyAudit::record_outcome` call. The two
@@ -501,23 +436,25 @@ pub(super) enum ProxyStreamState {
     OverMax,
 }
 
-pub(super) struct ProxyStreamAudit {
-    pub(super) audit_log: Arc<AuditLog>,
+/// The streaming response body. Holds the audit guard threaded in by the
+/// [`broker_effect`](super::broker_effect) driver: the `(request, outcome)` pair
+/// is completed from `Drop`, once the streamed byte count is known — the
+/// equivalent of the buffered path's `RecordedRequest::complete`, deferred to
+/// after the response head is already committed to the guest.
+pub(super) struct ProxyStreamBody<B: ProxyBackend> {
+    pub(super) inner: Pin<Box<dyn Stream<Item = reqwest::Result<Bytes>> + Send>>,
+    /// The live guard for this effect's request row. `take`n in `Drop` and
+    /// completed with the streaming outcome. `None` only after that discharge.
+    pub(super) guard: Option<RecordedRequest<B::AuditTable>>,
     pub(super) request_id: RequestId,
     pub(super) upstream_url: String,
     pub(super) upstream_status: u16,
-}
-
-pub(super) struct ProxyStreamBody<A: ProxyAudit> {
-    pub(super) inner: Pin<Box<dyn Stream<Item = reqwest::Result<Bytes>> + Send>>,
-    pub(super) audit: Option<ProxyStreamAudit>,
     pub(super) max_response_bytes: u64,
     pub(super) response_bytes: u64,
     pub(super) state: ProxyStreamState,
-    pub(super) _audit_kind: PhantomData<fn() -> A>,
 }
 
-impl<A: ProxyAudit> HyperBody for ProxyStreamBody<A> {
+impl<B: ProxyBackend> HyperBody for ProxyStreamBody<B> {
     type Data = Bytes;
     type Error = std::io::Error;
 
@@ -537,7 +474,7 @@ impl<A: ProxyAudit> HyperBody for ProxyStreamBody<A> {
             }
             Poll::Ready(Some(Err(err))) => {
                 tracing::warn!(
-                    proxy = A::DISPLAY_NAME,
+                    proxy = B::DISPLAY_NAME,
                     error = %err,
                     "vm http proxy streaming body read failed",
                 );
@@ -580,9 +517,9 @@ impl<A: ProxyAudit> HyperBody for ProxyStreamBody<A> {
     }
 }
 
-impl<A: ProxyAudit> Drop for ProxyStreamBody<A> {
+impl<B: ProxyBackend> Drop for ProxyStreamBody<B> {
     fn drop(&mut self) {
-        let Some(audit) = self.audit.take() else {
+        let Some(guard) = self.guard.take() else {
             return;
         };
         let error = match self.state {
@@ -591,18 +528,29 @@ impl<A: ProxyAudit> Drop for ProxyStreamBody<A> {
             ProxyStreamState::UpstreamError => Some("upstream body read failed"),
             ProxyStreamState::OverMax => Some("upstream response too large"),
         };
-        A::record_outcome(
-            &audit.audit_log,
-            ProxyOutcomeFields {
-                request_id: audit.request_id,
-                completed_at: UnixMillis::now(),
-                http_status: audit.upstream_status,
-                upstream_url: Some(audit.upstream_url.as_str()),
-                upstream_status: Some(audit.upstream_status),
-                response_bytes: self.response_bytes,
-                error,
-            },
-        );
+        // Complete the audit pair with the streamed outcome. Best-effort by
+        // design: the response head (and often most of the body) has already
+        // reached the guest, so there is no HTTP status left to fail with. An
+        // audit-write failure is emitted under `AUDIT_WRITE_FAILURE_TARGET` and
+        // swallowed, leaving an unpaired request row for reconciliation — the
+        // same asymmetry the previous `ProxyAudit::record_outcome` path had.
+        if let Err(err) = guard.complete(&ProxyOutcomeRecord {
+            request_id: self.request_id,
+            completed_at: UnixMillis::now(),
+            http_status: self.upstream_status,
+            upstream_url: Some(self.upstream_url.as_str()),
+            upstream_status: Some(self.upstream_status),
+            response_bytes: self.response_bytes,
+            error,
+        }) {
+            tracing::error!(
+                target: AUDIT_WRITE_FAILURE_TARGET,
+                kind = B::STREAMING_OUTCOME_AUDIT_KIND,
+                request_id = %self.request_id,
+                error = %err,
+                "audit write failed",
+            );
+        }
     }
 }
 
@@ -628,12 +576,11 @@ pub(super) struct ProxyFetch {
     pub(super) error: Option<&'static str>,
 }
 
-/// A streaming upstream response that has been opened but whose body
-/// has not yet been forwarded to the guest. The audit-log selector
-/// `A` is a type parameter so completion-record routing is statically
-/// dispatched.
-pub(crate) struct ProxyStream<A: ProxyAudit> {
-    pub(super) audit_log: Arc<AuditLog>,
+/// A streaming upstream response opened by `fetch_stream` but not yet paired
+/// with an audit guard. The [`broker_effect`](super::broker_effect) driver holds
+/// the guard until `perform` returns; [`into_stream`](Self::into_stream) then
+/// threads it in to produce the guest-facing [`ProxyStream`].
+pub(super) struct PendingProxyStream<B: ProxyBackend> {
     pub(super) request_id: RequestId,
     pub(super) response: reqwest::Response,
     pub(super) upstream_url: String,
@@ -641,31 +588,64 @@ pub(crate) struct ProxyStream<A: ProxyAudit> {
     pub(super) content_type: &'static str,
     pub(super) headers: Vec<VmHttpResponseHeader>,
     pub(super) max_response_bytes: u64,
-    pub(super) _audit_kind: PhantomData<fn() -> A>,
+    pub(super) _backend: PhantomData<fn() -> B>,
 }
 
-impl<A: ProxyAudit> ProxyStream<A> {
+impl<B: ProxyBackend> PendingProxyStream<B> {
+    /// Attach the live audit guard, producing the carrier the dispatcher relays.
+    /// The guard is threaded into the eventual [`ProxyStreamBody`] and completed
+    /// when it drops.
+    pub(super) fn into_stream(self, guard: RecordedRequest<B::AuditTable>) -> ProxyStream<B> {
+        ProxyStream {
+            pending: self,
+            guard,
+        }
+    }
+}
+
+/// A streaming upstream response that has been opened and paired with its audit
+/// guard, ready to relay to the guest. Built only by
+/// [`PendingProxyStream::into_stream`], so a streaming response always carries a
+/// live guard — the guard is completed from [`ProxyStreamBody`]'s `Drop` once the
+/// byte count is known.
+pub(crate) struct ProxyStream<B: ProxyBackend> {
+    pending: PendingProxyStream<B>,
+    guard: RecordedRequest<B::AuditTable>,
+}
+
+impl<B: ProxyBackend> ProxyStream<B> {
+    /// The request id of the effect this stream audits — the guard's key. Used
+    /// by the streaming proxy tests to correlate the deferred outcome row.
+    #[cfg(test)]
+    pub(super) fn request_id(&self) -> RequestId {
+        self.pending.request_id
+    }
+
+    /// The HTTP status already committed on the response head (used for
+    /// request logging before the body drains).
+    pub(super) fn upstream_status(&self) -> u16 {
+        self.pending.upstream_status
+    }
+
     pub(super) fn into_hyper_response(
         self,
     ) -> http::Response<UnsyncBoxBody<Bytes, std::io::Error>> {
-        let body = ProxyStreamBody::<A> {
-            inner: Box::pin(self.response.bytes_stream()),
-            audit: Some(ProxyStreamAudit {
-                audit_log: self.audit_log,
-                request_id: self.request_id,
-                upstream_url: self.upstream_url,
-                upstream_status: self.upstream_status,
-            }),
-            max_response_bytes: self.max_response_bytes,
+        let pending = self.pending;
+        let body = ProxyStreamBody::<B> {
+            inner: Box::pin(pending.response.bytes_stream()),
+            guard: Some(self.guard),
+            request_id: pending.request_id,
+            upstream_url: pending.upstream_url,
+            upstream_status: pending.upstream_status,
+            max_response_bytes: pending.max_response_bytes,
             response_bytes: 0,
             state: ProxyStreamState::Streaming,
-            _audit_kind: PhantomData,
         };
         let mut builder = http::Response::builder()
-            .status(self.upstream_status)
-            .header(http::header::CONTENT_TYPE, self.content_type)
+            .status(pending.upstream_status)
+            .header(http::header::CONTENT_TYPE, pending.content_type)
             .header(http::header::CONNECTION, "close");
-        for header in self.headers {
+        for header in pending.headers {
             builder = builder.header(header.name, header.value);
         }
         builder
@@ -715,6 +695,12 @@ impl<B: ProxyBackend, S: SecretStore + Send + Sync + 'static> VmHttpProxyService
             extras,
             _backend: PhantomData,
         })
+    }
+
+    /// The audit log this service records into — the driver's `begin_effect`
+    /// receiver.
+    pub(super) fn audit(&self) -> &Arc<AuditLog> {
+        &self.broker_state.audit
     }
 
     fn upstream_url(&self, target: &str) -> Option<reqwest::Url> {
@@ -854,7 +840,7 @@ impl<B: ProxyBackend, S: SecretStore + Send + Sync + 'static> VmHttpProxyService
         request: &VmHttpRequest,
         body: Vec<u8>,
         headers: Vec<ProxyForwardHeader>,
-    ) -> Result<ProxyStream<B>, ProxyFetch> {
+    ) -> Result<PendingProxyStream<B>, ProxyFetch> {
         let (upstream_url, builder) = self
             .upstream_request_builder(request, body, headers)
             .await
@@ -883,8 +869,7 @@ impl<B: ProxyBackend, S: SecretStore + Send + Sync + 'static> VmHttpProxyService
         let upstream_status = response.status().as_u16();
         let content_type = proxy_response_content_type(&response);
         let headers = collect_response_headers::<B>(response.headers());
-        Ok(ProxyStream {
-            audit_log: Arc::clone(&self.broker_state.audit),
+        Ok(PendingProxyStream {
             request_id,
             response,
             upstream_url,
@@ -892,7 +877,7 @@ impl<B: ProxyBackend, S: SecretStore + Send + Sync + 'static> VmHttpProxyService
             content_type,
             headers,
             max_response_bytes: self.config.max_response_bytes(),
-            _audit_kind: PhantomData,
+            _backend: PhantomData,
         })
     }
 }
@@ -928,130 +913,241 @@ fn collect_response_headers<B: ProxyBackend>(
     out
 }
 
-/// Generic dispatcher for an authenticated VM HTTP proxy request that
-/// targets a backend `B`. Identical to the per-backend
-/// `route_*_proxy_request` functions it replaces; the only thing that
-/// varies between providers is what the trait methods select.
-pub(super) async fn route_proxy_request<B, S>(
-    session: &VmHttpSession,
-    request: &VmHttpRequest,
+/// A pre-fetch decision computed by [`ProxyEffect::classify`]: either proceed to
+/// the upstream fetch with validated headers, or short-circuit with a local
+/// denial response whose outcome the driver still records.
+enum ProxyPlan {
+    /// Proceed to fetch upstream with these validated forward headers.
+    Fetch { headers: Vec<ProxyForwardHeader> },
+    /// Short-circuit: the effect is denied locally (unsupported route, method
+    /// mismatch, or a header-validation failure). The driver records the
+    /// `(request, outcome)` deny pair from the response.
+    Deny {
+        response: VmHttpResponse,
+        error: Option<&'static str>,
+    },
+}
+
+/// A proxy request modelled as a [`BrokeredEffect`]. The
+/// [`broker_effect`](super::broker_effect) driver begins the request row, calls
+/// [`perform`](BrokeredEffect::perform) to run (or short-circuit) the upstream
+/// call, and completes the outcome row — so a proxy response can never reach the
+/// guest without its audit pair. Replaces the former `route_proxy_request`.
+pub(super) struct ProxyEffect<'a, B: ProxyBackend, S: SecretStore + Send + Sync + 'static> {
+    service: &'a VmHttpProxyService<B, S>,
+    request: &'a VmHttpRequest,
     body: Vec<u8>,
-    service: &VmHttpProxyService<B, S>,
-) -> VmHttpDispatch
+    session_id: SessionId,
+    request_id: RequestId,
+    received_at: UnixMillis,
+    route: B::Route,
+    /// Owned decision the request row borrows (`Allow`, or `Deny` mirroring the
+    /// `plan`'s local denial).
+    decision: ProxyAuditDecision,
+    plan: ProxyPlan,
+}
+
+/// The owned outcome payload a proxy effect produces; [`to_record`](Self::to_record)
+/// borrows a `ProxyOutcomeRecord` out of it for the guard, so the row can borrow
+/// `upstream_url` after `perform`'s stack frame is gone.
+pub(super) struct ProxyOutcome {
+    request_id: RequestId,
+    http_status: u16,
+    upstream_url: Option<String>,
+    upstream_status: Option<u16>,
+    response_bytes: u64,
+    error: Option<&'static str>,
+}
+
+impl ProxyOutcome {
+    /// The outcome for a locally-produced denial response (no upstream call).
+    fn local(
+        request_id: RequestId,
+        response: &VmHttpResponse,
+        error: Option<&'static str>,
+    ) -> Self {
+        Self {
+            request_id,
+            http_status: response.status.code(),
+            upstream_url: None,
+            upstream_status: None,
+            response_bytes: response.body.len() as u64,
+            error,
+        }
+    }
+
+    /// Split a buffered fetch into its outcome payload and the guest-facing
+    /// response, moving `upstream_url` out rather than cloning it.
+    fn from_fetch(request_id: RequestId, fetch: ProxyFetch) -> (Self, VmHttpResponse) {
+        let ProxyFetch {
+            response,
+            upstream_url,
+            upstream_status,
+            response_bytes,
+            error,
+        } = fetch;
+        let outcome = Self {
+            request_id,
+            http_status: response.status.code(),
+            upstream_url,
+            upstream_status,
+            response_bytes,
+            error,
+        };
+        (outcome, response)
+    }
+
+    fn to_record(&self) -> ProxyOutcomeRecord<'_> {
+        ProxyOutcomeRecord {
+            request_id: self.request_id,
+            completed_at: UnixMillis::now(),
+            http_status: self.http_status,
+            upstream_url: self.upstream_url.as_deref(),
+            upstream_status: self.upstream_status,
+            response_bytes: self.response_bytes,
+            error: self.error,
+        }
+    }
+}
+
+impl<'a, B, S> ProxyEffect<'a, B, S>
 where
     B: ProxyBackend,
     S: SecretStore + Send + Sync + 'static,
 {
-    let route = B::classify_proxy_target(&request.target)
-        .expect("caller only routes classified proxy targets");
-    if B::route_is_unsupported(route) {
-        let response = VmHttpResponse::text(VmHttpStatus::NotFound, "not found");
-        return record_proxy_local_response::<B, S>(
-            service,
-            session,
-            request,
-            route,
-            ProxyAuditDecision::Deny {
-                reason: Cow::Borrowed(B::UNSUPPORTED_ROUTE_REASON),
-            },
-            response,
-            None,
-        )
-        .into();
-    }
-    if request.method != B::route_method(route).as_str() {
-        let response = VmHttpResponse::text(VmHttpStatus::MethodNotAllowed, "method not allowed");
-        return record_proxy_local_response::<B, S>(
-            service,
-            session,
-            request,
-            route,
-            ProxyAuditDecision::Deny {
-                reason: Cow::Borrowed("method not allowed"),
-            },
-            response,
-            None,
-        )
-        .into();
-    }
-
-    let headers = match B::forward_headers(&request.headers, &service.config) {
-        Ok(headers) => headers,
-        Err(reason) => {
-            let response = VmHttpResponse::text(VmHttpStatus::BadRequest, reason);
-            return record_proxy_local_response::<B, S>(
-                service,
-                session,
-                request,
-                route,
-                ProxyAuditDecision::Deny {
-                    reason: Cow::Borrowed(reason),
+    /// Classify a proxy request into an effect: run the same pre-fetch validation
+    /// the former `route_proxy_request` did (route support, method, header
+    /// allowlist), captured as a `(decision, plan)` the driver records and acts
+    /// on. The caller has already confirmed the target is a proxy target for `B`.
+    pub(super) fn classify(
+        service: &'a VmHttpProxyService<B, S>,
+        session: &VmHttpSession,
+        request: &'a VmHttpRequest,
+        body: Vec<u8>,
+    ) -> Self {
+        let route = B::classify_proxy_target(&request.target)
+            .expect("caller only routes classified proxy targets");
+        let (decision, plan) = if B::route_is_unsupported(route) {
+            (
+                deny_decision(B::UNSUPPORTED_ROUTE_REASON),
+                ProxyPlan::Deny {
+                    response: VmHttpResponse::text(VmHttpStatus::NotFound, "not found"),
+                    error: None,
                 },
-                response,
-                Some(reason),
             )
-            .into();
-        }
-    };
-
-    let request_id = RequestId::new();
-    if let Err(response) = record_proxy_request_or_500::<B>(
-        &service.broker_state.audit,
-        ProxyRequestFields {
-            request_id,
-            session_id: session.session_id(),
-            received_at: UnixMillis::now(),
-            method: &request.method,
-            target: &request.target,
-            route,
-            decision: &ProxyAuditDecision::Allow,
-        },
-    ) {
-        return response.into();
-    }
-
-    if proxy_request_wants_streaming(&body) {
-        match service
-            .fetch_stream(request_id, request, body, headers)
-            .await
-        {
-            Ok(stream) => return B::into_vm_http_dispatch(stream),
-            Err(fetch) => {
-                if let Err(response) = record_proxy_outcome_or_500::<B>(
-                    &service.broker_state.audit,
-                    ProxyOutcomeFields {
-                        request_id,
-                        completed_at: UnixMillis::now(),
-                        http_status: fetch.response.status.code(),
-                        upstream_url: fetch.upstream_url.as_deref(),
-                        upstream_status: fetch.upstream_status,
-                        response_bytes: fetch.response_bytes,
-                        error: fetch.error,
+        } else if request.method != B::route_method(route).as_str() {
+            (
+                deny_decision("method not allowed"),
+                ProxyPlan::Deny {
+                    response: VmHttpResponse::text(
+                        VmHttpStatus::MethodNotAllowed,
+                        "method not allowed",
+                    ),
+                    error: None,
+                },
+            )
+        } else {
+            match B::forward_headers(&request.headers, &service.config) {
+                Ok(headers) => (ProxyAuditDecision::Allow, ProxyPlan::Fetch { headers }),
+                Err(reason) => (
+                    deny_decision(reason),
+                    ProxyPlan::Deny {
+                        response: VmHttpResponse::text(VmHttpStatus::BadRequest, reason),
+                        error: Some(reason),
                     },
-                ) {
-                    return response.into();
-                }
-                return fetch.response.into();
+                ),
             }
+        };
+        Self {
+            service,
+            request,
+            body,
+            session_id: session.session_id(),
+            request_id: RequestId::new(),
+            received_at: UnixMillis::now(),
+            route,
+            decision,
+            plan,
+        }
+    }
+}
+
+impl<'a, B, S> BrokeredEffect for ProxyEffect<'a, B, S>
+where
+    B: ProxyBackend,
+    S: SecretStore + Send + Sync + 'static,
+{
+    type Table = B::AuditTable;
+    type Outcome = ProxyOutcome;
+    const REQUEST_AUDIT_KIND: &'static str = B::REQUEST_AUDIT_KIND;
+    const OUTCOME_AUDIT_KIND: &'static str = B::OUTCOME_AUDIT_KIND;
+
+    fn request_id(&self) -> RequestId {
+        self.request_id
+    }
+
+    fn request_row(&self) -> ProxyRequestRecord<'_, B::Route> {
+        ProxyRequestRecord {
+            request_id: self.request_id,
+            session_id: self.session_id,
+            received_at: self.received_at,
+            method: &self.request.method,
+            target: &self.request.target,
+            route: self.route,
+            decision: &self.decision,
         }
     }
 
-    let fetch = service.fetch(request, body, headers).await;
-    if let Err(response) = record_proxy_outcome_or_500::<B>(
-        &service.broker_state.audit,
-        ProxyOutcomeFields {
+    async fn perform(self) -> EffectCompletion<Self> {
+        let ProxyEffect {
+            service,
+            request,
+            body,
             request_id,
-            completed_at: UnixMillis::now(),
-            http_status: fetch.response.status.code(),
-            upstream_url: fetch.upstream_url.as_deref(),
-            upstream_status: fetch.upstream_status,
-            response_bytes: fetch.response_bytes,
-            error: fetch.error,
-        },
-    ) {
-        return response.into();
+            plan,
+            ..
+        } = self;
+        let headers = match plan {
+            ProxyPlan::Deny { response, error } => {
+                return EffectCompletion::Buffered {
+                    outcome: ProxyOutcome::local(request_id, &response, error),
+                    response,
+                };
+            }
+            ProxyPlan::Fetch { headers } => headers,
+        };
+
+        if proxy_request_wants_streaming(&body) {
+            match service
+                .fetch_stream(request_id, request, body, headers)
+                .await
+            {
+                // Hand the guard into the streaming body via `into_stream`; the
+                // outcome row is completed from the body's `Drop`.
+                Ok(pending) => EffectCompletion::Streaming(Box::new(move |guard| {
+                    B::into_vm_http_dispatch(pending.into_stream(guard))
+                })),
+                Err(fetch) => {
+                    let (outcome, response) = ProxyOutcome::from_fetch(request_id, fetch);
+                    EffectCompletion::Buffered { outcome, response }
+                }
+            }
+        } else {
+            let fetch = service.fetch(request, body, headers).await;
+            let (outcome, response) = ProxyOutcome::from_fetch(request_id, fetch);
+            EffectCompletion::Buffered { outcome, response }
+        }
     }
-    fetch.response.into()
+
+    fn outcome_row(outcome: &ProxyOutcome) -> ProxyOutcomeRecord<'_> {
+        outcome.to_record()
+    }
+}
+
+fn deny_decision(reason: &str) -> ProxyAuditDecision {
+    ProxyAuditDecision::Deny {
+        reason: reason.to_string(),
+    }
 }
 
 /// Generic helper for recording a locally-generated VM HTTP proxy
@@ -1062,7 +1158,7 @@ pub(super) fn record_proxy_local_response<B, S>(
     session: &VmHttpSession,
     request: &VmHttpRequest,
     route: B::Route,
-    decision: ProxyAuditDecision<'_>,
+    decision: ProxyAuditDecision,
     response: VmHttpResponse,
     error: Option<&'static str>,
 ) -> VmHttpResponse

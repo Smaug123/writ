@@ -51,9 +51,10 @@ pub use agent_run::{
 };
 pub use agent_vm_network_health::AgentVmNetworkHealthEventRecord;
 pub use claude_proxy::{
-    ClaudeProxyAuditDecision, ClaudeProxyAuditRoute, ClaudeProxyOutcomeRecord,
-    ClaudeProxyRequestRecord,
+    ClaudeProxyAuditDecision, ClaudeProxyAuditRoute, ClaudeProxyAuditTable,
+    ClaudeProxyOutcomeRecord, ClaudeProxyRequestRecord,
 };
+pub use effect_table::{EffectAuditTable, RecordedRequest};
 pub use flake_provision::{
     FlakeProvisionAuditEntry, FlakeProvisionAuditOutcome, FlakeProvisionOutcomeRecord,
     FlakeProvisionRequestRecord, FlakeProvisionResult,
@@ -70,10 +71,10 @@ pub use nix_cache::{
     NixCacheRequestRecord,
 };
 pub use openai_proxy::{
-    OpenAiProxyAuditDecision, OpenAiProxyAuditRoute, OpenAiProxyOutcomeRecord,
-    OpenAiProxyRequestRecord,
+    OpenAiProxyAuditDecision, OpenAiProxyAuditRoute, OpenAiProxyAuditTable,
+    OpenAiProxyOutcomeRecord, OpenAiProxyRequestRecord,
 };
-pub use proxy_table::ProxyAuditDecision;
+pub use proxy_table::{ProxyAuditDecision, ProxyOutcomeRecord, ProxyRequestRecord};
 
 /// `tracing` target stamped on every event emitted when an audit
 /// append, read, or referenced-artifact write fails. The audit log is
