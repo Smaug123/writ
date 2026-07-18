@@ -35,6 +35,7 @@
 use crate::audit::{
     AUDIT_WRITE_FAILURE_TARGET, AuditError, AuditLog, GitPushApproveAttemptEntry,
     GitPushApproveAttemptState, GitPushAuditEntry, GitPushOutcomeRecord, GitPushOutcomeResult,
+    UnpairedEffectRows,
 };
 use crate::core::{ApproveAttemptId, RequestId, UnixMillis};
 use crate::git_push_staging::GitPushStagingStore;
@@ -66,6 +67,41 @@ impl ReconcileReport {
     pub fn is_empty(&self) -> bool {
         self.recovered_started.is_empty() && self.flagged_uncertain.is_empty()
     }
+}
+
+/// Boot-time scan for brokered-effect request rows with no matching outcome — the
+/// durable backstop for the "complete by construction" audit-pair invariant (see
+/// [`AuditLog::scan_unpaired_effect_rows`]). A dangling row means the process
+/// stopped between the request-row commit and the outcome write: a hard crash, or
+/// a handler that deliberately left the row for reconciliation (the git-push
+/// staging-IO failure). Each affected table is flagged to
+/// [`AUDIT_WRITE_FAILURE_TARGET`] so the operator sees it on every boot until
+/// resolved, and the findings are returned for the caller's boot summary.
+///
+/// **Report-only**: the scan writes nothing. Reconciliation — or a table's own
+/// recovery sweep — resolves the rows; fabricating an outcome would corrupt the
+/// log worse than a missing one. Run this *after*
+/// [`reconcile_orphaned_staged_carriers`], so a git-push carrier that the
+/// staged-carrier sweep can still pair is recovered first, leaving only
+/// genuinely-stuck rows for this scan to flag.
+///
+/// Errors abort startup, like the other boot passes: the audit DB is the sole
+/// source of truth, so a read failure here is correctness-fatal.
+pub fn reconcile_unpaired_effect_rows(
+    audit: &AuditLog,
+) -> Result<Vec<UnpairedEffectRows>, AuditError> {
+    let findings = audit.scan_unpaired_effect_rows()?;
+    for finding in &findings {
+        tracing::error!(
+            target: AUDIT_WRITE_FAILURE_TARGET,
+            kind = "unpaired_effect_rows",
+            table = finding.request_table,
+            count = finding.count,
+            "brokered effect request rows have no matching outcome row \
+             (dangling since a crash or an unreconciled handler failure)",
+        );
+    }
+    Ok(findings)
 }
 
 /// Sweep `git_push_approve_attempt` for rows whose state would block
@@ -492,6 +528,48 @@ mod tests {
         let log = AuditLog::open_in_memory().unwrap();
         let report = reconcile_pending_approve_attempts(&log, now()).unwrap();
         assert!(report.is_empty());
+    }
+
+    /// Record only the request half of a git-push pair — the dangling row a crash
+    /// (or an unreconciled staging failure) leaves behind.
+    fn record_dangling_git_push_request(log: &AuditLog, session_id: SessionId) {
+        log.record_git_push_request(&GitPushRequestRecord {
+            push_request_id: RequestId::new(),
+            session_id,
+            received_at: UnixMillis::from_millis(1_700_000_100),
+            repo: sample_repo(),
+            branch: "main".parse().unwrap(),
+            expected_remote_head: Some(git_oid('1')),
+            new_head: git_oid('2'),
+            correlation_id: None,
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn unpaired_scan_reports_a_dangling_request_and_clears_once_paired() {
+        let (log, session_id) = open_log_with_session();
+
+        // A completed pair alone leaves nothing to flag.
+        let _paired = record_staged_push(&log, session_id);
+        assert!(reconcile_unpaired_effect_rows(&log).unwrap().is_empty());
+
+        // A request row with no outcome is flagged, keyed to its table.
+        record_dangling_git_push_request(&log, session_id);
+        assert_eq!(
+            reconcile_unpaired_effect_rows(&log).unwrap(),
+            vec![UnpairedEffectRows {
+                label: "Git push",
+                request_table: "git_push_request",
+                count: 1,
+            }],
+        );
+    }
+
+    #[test]
+    fn unpaired_scan_is_empty_on_a_fresh_log() {
+        let log = AuditLog::open_in_memory().unwrap();
+        assert!(reconcile_unpaired_effect_rows(&log).unwrap().is_empty());
     }
 
     /// A single `Started` attempt is transitioned to

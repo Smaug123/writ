@@ -14,6 +14,7 @@ use writ::agent_vm_lifecycle::BrokerPlacement;
 use writ::audit::AuditLog;
 use writ::boot_reconcile::{
     reconcile_orphaned_staged_carriers, reconcile_pending_approve_attempts,
+    reconcile_unpaired_effect_rows,
 };
 use writ::broker_entrypoint::{BrokerArgs, run_broker};
 use writ::broker_session::BrokerSessionSpec;
@@ -355,6 +356,24 @@ async fn run_host_daemon(
                 "recovered staged push carriers left without an outcome row at last shutdown",
             );
         }
+    }
+
+    // Durable backstop for the "complete by construction" audit-pair invariant:
+    // flag any brokered-effect request row left without an outcome by a crash (or
+    // an unreconciled handler failure) mid-effect. Runs *after* the staged-carrier
+    // sweep above so a git-push carrier it could still recover is paired first,
+    // leaving only genuinely-stuck rows. Unconditional — the proxy, nix-cache, and
+    // flake-provision tables exist regardless of agent-VM mode. Same ordering and
+    // fail-fast contract as the passes above.
+    let unpaired = reconcile_unpaired_effect_rows(&audit)?;
+    if !unpaired.is_empty() {
+        let total_rows: u64 = unpaired.iter().map(|finding| finding.count).sum();
+        tracing::warn!(
+            unpaired_effect_tables = unpaired.len(),
+            unpaired_effect_rows = total_rows,
+            "brokered effect request rows left without an outcome at last shutdown \
+             (see AUDIT_WRITE_FAILURE events for the affected tables)",
+        );
     }
 
     let (notes_repo, signing_key, run_agent_spawn) = match run_agent.as_ref() {
