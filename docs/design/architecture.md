@@ -283,7 +283,16 @@ stays in `writ` — it *drives* the audit DAOs but also needs the git pipeline
 + `MIGRATIONS` (`writ-audit/src/schema.rs:38,57`); generic proxy row types
 (`proxy_table.rs`); git-push state enums (`writ-audit/src/git_push.rs`);
 `ReconcileReport`
-(`boot_reconcile.rs:55`).
+(`boot_reconcile.rs:55`). The generic two-phase audit-pair guard
+(`effect_table.rs`) is the emerging spine of the "complete by construction"
+work: `EffectAuditTable` describes any `(request, outcome)` table pair, and the
+`RecordedRequest` guard makes the pair the only expressible write —
+`begin_effect` records the request row (session-open-checked) and returns a
+`#[must_use]` guard whose `complete` records the matching outcome (refusing one
+whose key disagrees); `record_effect_coalesced` writes both in one commit for the
+authority-free Nix-cache serve. The shared open-session check lives once in
+`validation::check_session_open`. The guard is crate-internal until the VM-HTTP
+driver (§5.6) adopts it; the proxy tables already implement `EffectAuditTable`.
 
 **Schema.** ~24 live tables across **7 migrations** (`audit/schema.rs`), versus
 the 4 tables `broker.md` documents. Version is tracked in a `schema_version`

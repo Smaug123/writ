@@ -216,6 +216,55 @@ fn insert_proxy_outcome_row<T: ProxyAuditTable>(
     Ok(())
 }
 
+/// Every proxy-shaped table is an [`EffectAuditTable`](crate::EffectAuditTable)
+/// (`RequestRow` = [`ProxyRequestRecord`], `OutcomeRow` = [`ProxyOutcomeRecord`],
+/// key = `RequestId`), so they flow through the generic two-phase guard and the
+/// coalesced writer. This is *not* a blanket `impl<T: ProxyAuditTable>`: that
+/// would collide with the direct impls the hand-rolled tables (flake, git-push)
+/// need, because Rust cannot prove a local type will never also implement
+/// `ProxyAuditTable`. So each marker is wired explicitly via this macro.
+macro_rules! impl_effect_table_for_proxy {
+    ($marker:ty) => {
+        impl crate::effect_table::sealed::Sealed for $marker {}
+        impl crate::effect_table::EffectAuditTable for $marker {
+            type RequestRow<'a> = ProxyRequestRecord<'a, <$marker as ProxyAuditTable>::Route>;
+            type OutcomeRow<'a> = ProxyOutcomeRecord<'a>;
+            type Key = RequestId;
+            const REQUEST_TABLE: &'static str = <$marker as ProxyAuditTable>::REQUEST_TABLE;
+            const OUTCOME_TABLE: &'static str = <$marker as ProxyAuditTable>::OUTCOME_TABLE;
+            const LABEL: &'static str = <$marker as ProxyAuditTable>::LABEL;
+
+            fn insert_request(
+                conn: &Connection,
+                row: &Self::RequestRow<'_>,
+            ) -> Result<(), AuditError> {
+                validate_proxy_request::<$marker>(row)?;
+                insert_proxy_request_row::<$marker>(conn, row)
+            }
+            fn insert_outcome(
+                conn: &Connection,
+                row: &Self::OutcomeRow<'_>,
+            ) -> Result<(), AuditError> {
+                validate_proxy_outcome::<$marker>(row)?;
+                insert_proxy_outcome_row::<$marker>(conn, row)
+            }
+            fn session_id(row: &Self::RequestRow<'_>) -> SessionId {
+                row.session_id
+            }
+            fn request_key(row: &Self::RequestRow<'_>) -> RequestId {
+                row.request_id
+            }
+            fn outcome_key(row: &Self::OutcomeRow<'_>) -> RequestId {
+                row.request_id
+            }
+        }
+    };
+}
+
+impl_effect_table_for_proxy!(crate::claude_proxy::ClaudeProxyAuditTable);
+impl_effect_table_for_proxy!(crate::openai_proxy::OpenAiProxyAuditTable);
+impl_effect_table_for_proxy!(crate::nix_cache::NixCacheAuditTable);
+
 impl AuditLog {
     /// Persist a proxy-request audit row before the upstream call is
     /// attempted. The matching outcome row is appended via
@@ -224,7 +273,7 @@ impl AuditLog {
     /// This two-phase form is what makes the request durable *before* the
     /// action — required for any write that records granted authority. The
     /// authority-free proxy/cache read paths can instead coalesce both rows in
-    /// one commit via [`AuditLog::record_proxy_request_and_outcome`].
+    /// one commit via [`AuditLog::record_effect_coalesced`].
     pub(super) fn record_proxy_request<T: ProxyAuditTable>(
         &self,
         r: &ProxyRequestRecord<'_, T::Route>,
@@ -249,65 +298,6 @@ impl AuditLog {
         self.with_conn_mut(|c| {
             let tx = c.transaction()?;
             insert_proxy_outcome_row::<T>(&tx, r)?;
-            tx.commit()?;
-            Ok(())
-        })
-    }
-
-    /// Persist a proxy request row and its outcome row in a *single*
-    /// transaction — one commit, one `fsync` — for the authority-free
-    /// proxy/cache read paths (the VM Nix cache serve path) where the request
-    /// row need not be durable *before* the action.
-    ///
-    /// This is the throughput lever for those high-volume rows. The two-phase
-    /// [`record_proxy_request`] + [`record_proxy_outcome`] pays two fsync'd
-    /// commits per request; on the broker-VM audit DB (a virtiofs mount, where
-    /// every `fsync` round-trips to the host) that serialized double-commit
-    /// dominated agent-VM provisioning. Coalescing halves it, and — because
-    /// both rows share one transaction — a request row never lands without its
-    /// outcome.
-    ///
-    /// It is deliberately *not* used for writes that record granted authority:
-    /// grants/mints keep the two-phase split so the request is durable before
-    /// the action. The durability this trades away — a request row that is not
-    /// durable until its outcome is known — is harmless for a cache read that
-    /// grants nothing: a crash mid-fetch leaves no row at all, rather than an
-    /// orphan request row.
-    ///
-    /// One consequence is explicit and accepted: if the session **closes during
-    /// the fetch**, this coalesced write is refused — the
-    /// `*_request_requires_open_session` trigger forbids a request row for a
-    /// now-closed session, and there is no earlier row to fall back on (unlike
-    /// the two-phase path, whose pre-fetch request row survives a mid-fetch
-    /// close). That cache read then goes unrecorded in the DB. It is bounded and
-    /// benign: the paths that use this coalesced writer grant no authority, the
-    /// caller refuses to serve the response (fail-closed), and — because the
-    /// refusal is an `AuditError` — the caller still emits an
-    /// [`AUDIT_WRITE_FAILURE_TARGET`](crate::AUDIT_WRITE_FAILURE_TARGET)
-    /// event, so the access is logged even when it is not a structured row.
-    /// Reproducing the two-phase's mid-close durability would require the second
-    /// fsync this method exists to remove, so it is a conscious trade for the
-    /// authority-free paths only.
-    pub(super) fn record_proxy_request_and_outcome<T: ProxyAuditTable>(
-        &self,
-        request: &ProxyRequestRecord<'_, T::Route>,
-        outcome: &ProxyOutcomeRecord<'_>,
-    ) -> Result<(), AuditError> {
-        // Enforced at runtime, not just in debug: a stripped assert could
-        // otherwise commit the outcome against the wrong request in a release
-        // build, corrupting the request↔outcome association.
-        if request.request_id != outcome.request_id {
-            return Err(AuditError::Invariant(
-                "coalesced audit rows must share a request_id",
-            ));
-        }
-        validate_proxy_request::<T>(request)?;
-        validate_proxy_outcome::<T>(outcome)?;
-        self.with_conn_mut(|c| {
-            let tx = c.transaction()?;
-            check_session_open(&tx, request.session_id)?;
-            insert_proxy_request_row::<T>(&tx, request)?;
-            insert_proxy_outcome_row::<T>(&tx, outcome)?;
             tx.commit()?;
             Ok(())
         })
@@ -439,6 +429,10 @@ mod tests {
         const OUTCOME_TABLE: &'static str = "test_proxy_outcome";
         const LABEL: &'static str = "Test proxy";
     }
+
+    // The scratch table also flows through the generic guard, so the tests below
+    // exercise `begin_effect`/`complete`/`record_effect_coalesced` on it.
+    impl_effect_table_for_proxy!(TestTable);
 
     /// Install scratch tables matching the same shape the real
     /// per-backend migrations create, so the generic DAO can exercise
@@ -586,7 +580,7 @@ END;
         let request_id = RequestId::new();
 
         let err = log
-            .record_proxy_request_and_outcome::<TestTable>(
+            .record_effect_coalesced::<TestTable>(
                 &ProxyRequestRecord {
                     request_id,
                     session_id: s.session_id,
@@ -627,7 +621,7 @@ END;
         let other_id = RequestId::new();
 
         let err = log
-            .record_proxy_request_and_outcome::<TestTable>(
+            .record_effect_coalesced::<TestTable>(
                 &ProxyRequestRecord {
                     request_id,
                     session_id: s.session_id,
@@ -643,7 +637,7 @@ END;
         assert!(
             matches!(
                 err,
-                AuditError::Invariant("coalesced audit rows must share a request_id")
+                AuditError::Invariant("coalesced audit rows must share a key")
             ),
             "got: {err:?}"
         );
@@ -1002,7 +996,7 @@ END;
 
         /// Coalescing must be behaviour-preserving: for any valid
         /// request+outcome pair, writing both in one transaction via
-        /// `record_proxy_request_and_outcome` leaves the two tables
+        /// the generic `record_effect_coalesced` leaves the two tables
         /// byte-for-byte identical to the two-phase
         /// `record_proxy_request` + `record_proxy_outcome`. Same inputs,
         /// same request_id and session — the only difference is the commit
@@ -1055,11 +1049,77 @@ END;
             two_phase.record_proxy_request::<TestTable>(&request).unwrap();
             two_phase.record_proxy_outcome::<TestTable>(&outcome).unwrap();
             combined
-                .record_proxy_request_and_outcome::<TestTable>(&request, &outcome)
+                .record_effect_coalesced::<TestTable>(&request, &outcome)
                 .unwrap();
 
             prop_assert_eq!(dump_request_rows(&two_phase), dump_request_rows(&combined));
             prop_assert_eq!(dump_outcome_rows(&two_phase), dump_outcome_rows(&combined));
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        /// The generic guard's two-phase path (`begin_effect` + `complete`) must
+        /// be behaviour-preserving: it leaves both tables byte-for-byte identical
+        /// to the direct `record_proxy_request` + `record_proxy_outcome`. This is
+        /// the equivalence that lets the VM-HTTP driver adopt the guard for the
+        /// proxies (a later stage) without changing a single persisted row.
+        #[test]
+        fn begin_then_complete_matches_the_two_phase_writers(
+            method in "[\\x01-\\x7e]{1,16}",
+            target in "/[\\x01-\\x7e&&[^\\x00]]{0,80}",
+            route_is_a in any::<bool>(),
+            deny_reason in proptest::option::of("[\\x01-\\x7e]{1,80}"),
+            http_status in 100u16..=599,
+            upstream_status in proptest::option::of(100u16..=599),
+            upstream_url in proptest::option::of("[\\x01-\\x7e]{1,80}"),
+            response_bytes in 0u64..=(i64::MAX as u64),
+            error in proptest::option::of("[\\x01-\\x7e]{1,80}"),
+        ) {
+            let direct = AuditLog::open_in_memory().unwrap();
+            install_test_tables(&direct);
+            let guarded = std::sync::Arc::new(AuditLog::open_in_memory().unwrap());
+            install_test_tables(&guarded);
+            let s = sample_session();
+            direct.open_session(&s).unwrap();
+            guarded.open_session(&s).unwrap();
+
+            let request_id = RequestId::new();
+            let route = if route_is_a { TestRoute::A } else { TestRoute::B };
+            let decision = match &deny_reason {
+                None => ProxyAuditDecision::Allow,
+                Some(reason) => ProxyAuditDecision::Deny { reason: reason.clone() },
+            };
+            let request = ProxyRequestRecord {
+                request_id,
+                session_id: s.session_id,
+                received_at: UnixMillis::from_millis(1_700_000_400),
+                method: &method,
+                target: &target,
+                route,
+                decision: &decision,
+            };
+            let outcome = ProxyOutcomeRecord {
+                request_id,
+                completed_at: UnixMillis::from_millis(1_700_000_500),
+                http_status,
+                upstream_url: upstream_url.as_deref(),
+                upstream_status,
+                response_bytes,
+                error: error.as_deref(),
+            };
+
+            direct.record_proxy_request::<TestTable>(&request).unwrap();
+            direct.record_proxy_outcome::<TestTable>(&outcome).unwrap();
+            guarded
+                .begin_effect::<TestTable>(&request)
+                .unwrap()
+                .complete(&outcome)
+                .unwrap();
+
+            prop_assert_eq!(dump_request_rows(&direct), dump_request_rows(&guarded));
+            prop_assert_eq!(dump_outcome_rows(&direct), dump_outcome_rows(&guarded));
         }
     }
 }

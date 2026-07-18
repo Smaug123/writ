@@ -33,6 +33,7 @@ mod claude_proxy;
 /// Test-support only; adds no code to production builds.
 #[cfg(any(test, feature = "test-support"))]
 mod effect_audit_oracle;
+mod effect_table;
 mod flake_provision;
 mod git_push;
 mod grant;
