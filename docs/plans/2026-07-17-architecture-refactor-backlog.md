@@ -392,13 +392,21 @@ single file exceeds what one reading can hold.
   sibling `tests.rs`; none had `include_*!` paths, so no fixups. This clears the
   last of the >2k-line files apart from `agent_vm_lifecycle.rs` (below).
 
-**Still open — `agent_vm_lifecycle.rs` (2409):** the one remaining >2k file whose
-bulk is *production*, not tests. Its residue is the session-teardown /
-`run_*_cleanup_until_absent` machinery — a free-function cluster interleaved with
-shared helpers (`derive_session_network`, `shell_quote`, …) that the already-split
-`plan`/`invocation` submodules also use, so a clean extraction has to leave those
-shared helpers at the module root. A worthwhile but fiddlier follow-up than the
-mechanical test-splits above.
+- **`agent_vm_lifecycle.rs` (2409 → 2102):** the session-teardown execution —
+  `fail_after_cleanup` and the `run_*_cleanup_until_absent` family (run the stop
+  invocations, poll `container`/network resources until provably absent, fold
+  the per-step errors into one `CleanupErrors`) — moved to
+  `agent_vm_lifecycle/cleanup.rs`. This was the fiddliest free-function cluster:
+  seven of the thirteen functions are called from outside (the start-failure
+  path, `stop`, the managed-lifecycle functions, and `cleanup_tests`), so they
+  became `pub(super)` and the parent re-imports them with `use cleanup::*` so
+  both its own calls and the sibling test module's `use super::*` still resolve.
+  The genuinely shared helpers it leans on — `resource_list_contains_exact_line`,
+  `shell_quote`, `derive_session_network`, and the start-path
+  `wait_for_guest_ipv6_inspection` — deliberately stay at the module root
+  (`plan`/`invocation` use them too), reached via `super`. That leaves
+  `agent_vm_lifecycle.rs` as the lifecycle types + small impls + start/stop/
+  managed orchestration; its residue is intrinsic domain size, not a mixed bag.
 
 Rule of thumb learned from the config split: extract the chunks with no
 `#[serde(default = "…")]` coupling first — moving a struct away from its default
