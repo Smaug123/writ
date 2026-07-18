@@ -5,6 +5,66 @@
 
 use super::test_support::*;
 use super::*;
+use proptest::prelude::*;
+
+/// Raw request-table rows (every column, in insert order) for the guard/direct
+/// equivalence proptest — the git-push analogue of `proxy_table`'s
+/// `dump_request_rows`.
+#[allow(clippy::type_complexity)]
+fn dump_git_push_request_rows(
+    log: &AuditLog,
+) -> Vec<(
+    String,
+    String,
+    i64,
+    String,
+    String,
+    Option<String>,
+    String,
+    Option<String>,
+)> {
+    log.with_conn(|c| {
+        let mut stmt = c.prepare(
+            "SELECT push_request_id, session_id, received_at, repo, branch, \
+             expected_remote_head, new_head, correlation_id \
+             FROM git_push_request ORDER BY rowid",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get(6)?,
+                    r.get(7)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    })
+    .unwrap()
+}
+
+#[allow(clippy::type_complexity)]
+fn dump_git_push_outcome_rows(log: &AuditLog) -> Vec<(String, i64, String, Option<i64>, String)> {
+    log.with_conn(|c| {
+        let mut stmt = c.prepare(
+            "SELECT push_request_id, completed_at, result, github_status, message \
+             FROM git_push_outcome ORDER BY rowid",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    })
+    .unwrap()
+}
+
 #[test]
 fn git_push_request_requires_open_session_but_outcome_can_land_after_close() {
     let log = AuditLog::open_in_memory().unwrap();
@@ -177,4 +237,69 @@ fn git_push_request_correlation_id_check_constraint_rejects_invalid_bytes() {
         })
         .unwrap_err();
     assert!(err.to_string().contains("CHECK"), "got: {err:?}");
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+
+    /// The generic guard's two-phase path (`begin_effect` + `complete`) must be
+    /// behaviour-preserving for the git-push base pair: it leaves both tables
+    /// byte-for-byte identical to the direct `record_git_push_request` +
+    /// `record_git_push_outcome`. The flake/proxy analogue; this is the
+    /// equivalence the VM-HTTP driver relies on to adopt the guard for the base
+    /// staging pair (a later stage) without changing a single persisted row.
+    #[test]
+    fn begin_then_complete_matches_the_direct_git_push_writers(
+        result_pick in 0u8..3,
+        github_status in proptest::option::of(100u16..=599),
+        message in "[\\x01-\\x7e]{1,120}",
+        has_expected_head in any::<bool>(),
+        has_correlation in any::<bool>(),
+    ) {
+        let direct = AuditLog::open_in_memory().unwrap();
+        let guarded = std::sync::Arc::new(AuditLog::open_in_memory().unwrap());
+        let s = sample_session();
+        direct.open_session(&s).unwrap();
+        guarded.open_session(&s).unwrap();
+
+        let push_request_id = RequestId::new();
+        // Vary the NULL-able columns (expected_remote_head, correlation_id) across
+        // present/absent; the fixed sample supplies the structured newtype fields
+        // (repo/branch/oids) whose own parsing is exercised elsewhere.
+        let request = GitPushRequestRecord {
+            expected_remote_head: has_expected_head.then(|| git_oid('1')),
+            correlation_id: has_correlation
+                .then(|| CorrelationId::try_new("feat-42_xyz").unwrap()),
+            ..sample_git_push_request_record(push_request_id, s.session_id)
+        };
+        let result = match result_pick {
+            0 => GitPushOutcomeResult::Denied,
+            1 => GitPushOutcomeResult::ValidationFailed,
+            _ => GitPushOutcomeResult::Staged,
+        };
+        let outcome = GitPushOutcomeRecord {
+            push_request_id,
+            completed_at: UnixMillis::from_millis(1_700_000_130),
+            result,
+            github_status,
+            message: &message,
+        };
+
+        direct.record_git_push_request(&request).unwrap();
+        direct.record_git_push_outcome(&outcome).unwrap();
+        guarded
+            .begin_effect::<super::dao::GitPushAuditTable>(&request)
+            .unwrap()
+            .complete(&outcome)
+            .unwrap();
+
+        prop_assert_eq!(
+            dump_git_push_request_rows(&direct),
+            dump_git_push_request_rows(&guarded)
+        );
+        prop_assert_eq!(
+            dump_git_push_outcome_rows(&direct),
+            dump_git_push_outcome_rows(&guarded)
+        );
+    }
 }
