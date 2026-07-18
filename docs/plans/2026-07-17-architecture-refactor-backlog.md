@@ -359,6 +359,16 @@ single file exceeds what one reading can hold.
   changes. The `UncertainAttempt` witness invariant is preserved: its field is
   still module-private (the `dao` submodule is a descendant of `git_push`, so
   external crates still cannot forge one).
+- **`agent_vm_daemon.rs` (2603 → 1295):** the biggest single seam in the tree —
+  a 1308-line `impl AgentVmDaemon` (session start/stop/reconcile orchestration
+  and its network-health/broker-VM/cleanup helpers). Moved to
+  `agent_vm_daemon/daemon_impl.rs`. Four of the ~24 private methods are called
+  from test modules — three from test *submodule files* (`agent_vm_daemon/*.rs`)
+  and one `#[cfg(test)]` helper from an inline test — and a private method in a
+  child module is invisible to *sibling* modules, so those four became
+  `pub(super)`; the rest stayed private. All the `pub` methods resolve by type,
+  so no call-site changes. (Lesson: for a big impl, scan both inline tests *and*
+  sibling test-submodule files for private-method calls before moving.)
 
 Rule of thumb learned from the config split: extract the chunks with no
 `#[serde(default = "…")]` coupling first — moving a struct away from its default
