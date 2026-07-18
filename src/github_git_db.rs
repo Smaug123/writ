@@ -6,7 +6,7 @@
 //! commits land with the Verified badge while preserving provenance back
 //! to the bundle. This module exposes typed wrappers for those endpoints;
 //! the per-commit walker that orchestrates them lives in
-//! [`crate::git_push_replay_walker`].
+//! [`crate::git_push_walker`].
 //!
 //! Three endpoint families are wrapped:
 //!
@@ -17,7 +17,7 @@
 //!   the App-side default branch tip when an agent's push creates a
 //!   new branch with no prior `expected_remote_head`. The tip is then
 //!   fetched into the staging repo and passed by SHA to
-//!   [`crate::git_push_replay_walker::plan_branch_creation_via_rev_list`].
+//!   [`crate::git_push_walker::plan_branch_creation_via_rev_list`].
 //! * PATCH `repos/{o}/{r}/git/refs/heads/{branch}` — the publish step
 //!   the promote workflow uses to fast-forward the App-side branch
 //!   to the new commit chain the walker uploaded.

@@ -146,7 +146,7 @@ external *code* callers (the live approve path reimplements bring-up in
 `git_push_approve.rs`), but it is **interleaved** in the same 1804-line module
 with the *live* `TrailerSource` / `TrailerKey` / `TrailerValue` commit-trailer
 vocabulary that `git_push_approve`, `git_push_promote`, and
-`git_push_replay_walker` all import. Removing the dead cluster therefore means
+`git_push_walker` all import. Removing the dead cluster therefore means
 *extracting* the trailer types (e.g. into a `git_push_trailers` module) and
 deleting the rest — a module split, not a one-shot delete. Folded into **Slice
 6** (git-pipeline extraction), where these boundaries move anyway; doing it there
@@ -243,11 +243,18 @@ the commit-trailer vocabulary. Extracted `TrailerSource`/`TrailerKey`/
 importers, and deleted the vestigial `GitPushReplayPlan`/`ReplayTarget`/
 `ingest_bundle`/`prepare_staging_repo` cluster and its tests — net −1.5k lines.
 
-**Remaining hygiene (optional, module-level):** rename the accretion-order
-modules to domain names (`git_push_replay_object_source` → e.g.
+**Module renames (implemented).** Renamed the three accretion-order git-push
+modules to domain names, dropping the `replay_` prefix left over from the
+now-deleted `git_push_replay.rs` god-module: `git_push_replay_object_source` →
 `git_push_objects_cat_file`, `git_push_replay_object_parse` →
-`git_push_object_parse`, `git_push_replay_walker` → `git_push_walker`) so the
-names encode layering, not commit order. Pure renames, compiler-checked.
+`git_push_object_parse`, `git_push_replay_walker` → `git_push_walker`. Pure
+renames (five `git mv`s plus a word-boundary identifier rewrite), fully
+compiler-checked; the names now encode layering, not commit order. The
+`vm_http::flake_provision` / `flake_provision` / `flake_provision_from_mirror`
+trio was left as-is: those names are domain-descriptive (the shared prefix marks
+a real subsystem, disambiguated by the `_from_mirror` suffix and the `vm_http::`
+path — the same rule that kept `vm_http::nix_cache` in Slice 2), not
+accretion-order artifacts.
 
 ### Slice 7 — extract the VM sandbox into `writ-vm-host`
 
@@ -387,7 +394,7 @@ single file exceeds what one reading can hold.
   remaining test-dominated single-concern files were relocated in one PR rather
   than one-at-a-time — `github_git_db.rs` (2150 → 524), `broker_vm.rs`
   (2422 → 966), `protocol/mod.rs` (2072 → 534), `notes_repo.rs` (2060 → 1022),
-  `writ-vm-git/src/lib.rs` (2017 → 1214), and `git_push_replay_object_parse.rs`
+  `writ-vm-git/src/lib.rs` (2017 → 1214), and `git_push_object_parse.rs`
   (2009 → 827). Each moved its single inline `#[cfg(test)] mod tests` to a
   sibling `tests.rs`; none had `include_*!` paths, so no fixups. This clears the
   last of the >2k-line files apart from `agent_vm_lifecycle.rs` (below).

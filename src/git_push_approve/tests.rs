@@ -791,7 +791,7 @@ fn write_stalling_cat_file_wrapper(dir: &Path, git: &Path, sleep: &Path) -> Path
 /// read deadline, so a wedged read surfaces as a retryable
 /// `ExecuteError::Replay` (a `ReadTimedOut` under the hood) instead
 /// of hanging. (The per-object placement — verified directly in
-/// `git_push_replay_object_source` — is what keeps a legitimate
+/// `git_push_objects_cat_file` — is what keeps a legitimate
 /// multi-object upload from being folded into one step's budget.)
 ///
 /// The outer `tokio::time::timeout` is the anti-hang guard: with the

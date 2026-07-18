@@ -41,15 +41,15 @@ use crate::clean_git::{
     self, CleanGitEnv, CleanGitInvocation, SMALL_STDOUT_CAP, clean_git_config_env,
 };
 use crate::core::{ApproveAttemptId, RepoRef};
+use crate::git_push_objects_cat_file::{CatFileObjectSource, OpenError};
 use crate::git_push_promote::{
     CommitError, ExecuteError, ExecuteOutcome, PreparedPromotion, PromoteRuntimeConfig,
     commit_prepared_promotion, prepare_fast_forward_plan,
 };
-use crate::git_push_replay_object_source::{CatFileObjectSource, OpenError};
-use crate::git_push_replay_walker::{
+use crate::git_push_trailers::TrailerSource;
+use crate::git_push_walker::{
     FastForwardPlanError, REV_LIST_STDOUT_BYTE_CAP, plan_fast_forward_via_rev_list,
 };
-use crate::git_push_trailers::TrailerSource;
 use crate::github_git_db::{GitDataClient, GitDataTimeouts};
 use crate::signing::WritSigningKey;
 use crate::vm_git::{GitBranchName, GitCloneRepo, GitObjectId};

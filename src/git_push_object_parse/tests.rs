@@ -1,4 +1,4 @@
-//! Tests for git object-graph parsing in the push-replay pipeline. Split out of `git_push_replay_object_parse.rs` (an inline `#[cfg(test)]` module); tests unchanged.
+//! Tests for git object-graph parsing in the push-replay pipeline. Split out of `git_push_object_parse.rs` (an inline `#[cfg(test)]` module); tests unchanged.
 
 use proptest::collection::vec as prop_vec;
 use proptest::prelude::*;

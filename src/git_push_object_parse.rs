@@ -2,7 +2,7 @@
 //! objects, plus their inverses.
 //!
 //! The walker that replays a staging repo onto GitHub never sees git
-//! objects directly: it asks a [`crate::git_push_replay_walker::GitObjectSource`]
+//! objects directly: it asks a [`crate::git_push_walker::GitObjectSource`]
 //! for typed `StagingCommit` / `StagingTree` values and lets the
 //! source decide how to decode the raw bytes a `git cat-file` (or
 //! similar) returns. This module contains the byte → struct half of
@@ -26,7 +26,7 @@ use std::num::ParseIntError;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
-use crate::git_push_replay_walker::{StagingCommit, StagingTree, StagingTreeEntry};
+use crate::git_push_walker::{StagingCommit, StagingTree, StagingTreeEntry};
 use crate::github_git_db::{CommitIdentity, TreeEntryKind};
 use crate::vm_git::{GitObjectId, GitObjectIdError};
 

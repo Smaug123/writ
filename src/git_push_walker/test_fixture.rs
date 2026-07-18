@@ -2,7 +2,7 @@
 //!
 //! Kept `pub(crate)` so downstream test modules (e.g.
 //! `git_push_promote`) reach it as
-//! `crate::git_push_replay_walker::test_fixture::InMemoryGitObjectSource`.
+//! `crate::git_push_walker::test_fixture::InMemoryGitObjectSource`.
 
 use super::*;
 

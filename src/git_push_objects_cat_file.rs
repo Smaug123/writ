@@ -11,7 +11,7 @@
 //! ## Functional core
 //!
 //! The bytes-to-objects translation lives in
-//! `crate::git_push_replay_object_parse` — pure functions over
+//! `crate::git_push_object_parse` — pure functions over
 //! `&[u8]` so property tests can drive them without any I/O. This
 //! module is purely the imperative shell that hands them the bytes a
 //! `git cat-file --batch` reply produced.
@@ -51,10 +51,8 @@ use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
 
 use crate::clean_git::{self, CLEAN_GIT_CONFIG_ENV, CLEAN_GIT_CURRENT_DIR, CleanGitError};
-use crate::git_push_replay_object_parse::{parse_commit_object, parse_tree_object};
-use crate::git_push_replay_walker::{
-    GitObjectSource, GitObjectSourceError, StagingCommit, StagingTree,
-};
+use crate::git_push_object_parse::{parse_commit_object, parse_tree_object};
+use crate::git_push_walker::{GitObjectSource, GitObjectSourceError, StagingCommit, StagingTree};
 use crate::process_spawn;
 use crate::vm_git::GitObjectId;
 
