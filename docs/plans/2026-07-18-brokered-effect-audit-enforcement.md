@@ -119,6 +119,13 @@ Three layers, bottom-up. Each is independently landable and independently
 testable; the invariant becomes airtight only when all three are in place, but
 each earns its keep before then.
 
+The Rust below is **contract-level pseudocode**: it pins the types, the ownership
+and the ordering that the invariant depends on (what forces the pair, what holds
+the credential, what the driver may and may not do). Mechanical specifics that do
+not change the contract — exact lifetime elision, the two-sub-traits-over-a-meta-
+trait split that expresses `DURABILITY` in real Rust, error-enum plumbing — are
+settled when the owning stage is implemented, against that stage's tests.
+
 ### 3.1 Layer 1 — the sealed, must-use audit-pair guard (`writ-audit`)
 
 Generalize `proxy_table` from "three structurally-identical proxy tables" to
@@ -134,16 +141,18 @@ pub trait EffectAuditTable: 'static {
     /// the host grant, `PushRequestId` for git-push, `AgentRunId` for
     /// agent-runs. These are distinct newtypes with no implicit conversion, so
     /// the guard is generic over the key rather than hard-coding `RequestId`.
-    type Key: Clone + Send + 'static;
+    /// `Eq` so `complete` can bind an outcome to its guard's request (below).
+    type Key: Clone + Eq + Send + 'static;
     const REQUEST_TABLE: &'static str;   // compile-time const; never runtime input (SQLi note preserved)
     const OUTCOME_TABLE: &'static str;
     const LABEL: &'static str;
     fn insert_request(conn: &Connection, row: &Self::RequestRow<'_>) -> Result<(), AuditError>;
     fn insert_outcome(conn: &Connection, row: &Self::OutcomeRow<'_>) -> Result<(), AuditError>;
-    /// What an effect that never completed looks like in the log. Lets the
-    /// guard's Drop backstop record a truthful "unattempted" outcome, and forces
-    /// each effect to *define* its incomplete-state row.
-    fn dropped_outcome(key: Self::Key) -> Self::OutcomeRow<'static>;
+    /// The key an outcome row carries, so `RecordedRequest::complete` can refuse
+    /// an outcome that belongs to a *different* live guard for the same table —
+    /// which FKs and the pair-count oracle would both still let pass. Cheap: it
+    /// reads the key field the row already holds.
+    fn outcome_key(row: &Self::OutcomeRow<'_>) -> Self::Key;
 }
 
 /// The ONLY way to obtain one is `AuditLog::begin_effect`, which writes the
@@ -187,29 +196,38 @@ impl AuditLog {
 impl<T: EffectAuditTable> RecordedRequest<T> {
     pub fn key(&self) -> &T::Key { &self.key }
     pub fn complete(mut self, outcome: &T::OutcomeRow<'_>) -> Result<(), AuditError> {
-        // Discharge BEFORE the write. An outcome write was attempted, so this is
-        // no longer an un-audited effect: if the write *fails*, the error is
-        // returned to the driver (which 500s + emits AUDIT_WRITE_FAILURE), but it
-        // must NOT also trip the Drop backstop, which would relabel an effect
-        // that already ran as "unattempted".
+        // Discharge BEFORE any early return. An outcome was submitted, so this is
+        // no longer an un-audited effect: a rejection or a write failure is
+        // surfaced to the driver (which 500s + emits AUDIT_WRITE_FAILURE) but must
+        // NOT also trip the Drop backstop as an "unattempted" effect.
         self.discharged = true;
+        // Bind the outcome to THIS request: reject an outcome keyed to a different
+        // live guard for the same table, which the FK alone would not catch.
+        if T::outcome_key(outcome) != self.key {
+            return Err(AuditError::Invariant("outcome key does not match the guard's request"));
+        }
         self.audit.record_outcome::<T>(outcome)
     }
 }
 
 impl<T: EffectAuditTable> Drop for RecordedRequest<T> {
     fn drop(&mut self) {
-        if self.discharged { return; }   // completed, or a completion write was attempted
-        // Run the backstop FIRST — record the fallback outcome and emit
-        // AUDIT_WRITE_FAILURE — so it actually executes (and the Stage-3 test can
-        // observe both the fallback row and the event) before the debug-only
-        // panic below unwinds. Never silently swallow.
-        let _ = self.audit.record_outcome::<T>(&T::dropped_outcome(self.key.clone()))
-            .inspect_err(|e| tracing::error!(
-                target: AUDIT_WRITE_FAILURE_TARGET, kind = "effect_outcome_dropped",
-                table = T::LABEL, error = %e, "audit outcome dropped"));
-        // Then fail fast in tests: a dropped-without-discharge guard is a bug.
-        debug_assert!(false, "RecordedRequest<{}> dropped without discharge", T::LABEL);
+        if self.discharged { return; }   // completed, or an outcome was submitted
+        // A guard dropped without discharge is a bug. We do NOT fabricate an
+        // outcome row: no table can always express a *truthful* "incomplete"
+        // outcome (`agent_run_outcome`, e.g., requires a terminal status plus
+        // concrete stream paths/hashes), and a fabricated row would corrupt the
+        // log worse than a missing one. Instead emit AUDIT_WRITE_FAILURE, which
+        // boot reconciliation already scans for, so the dangling request is
+        // caught, not fabricated over...
+        tracing::error!(
+            target: AUDIT_WRITE_FAILURE_TARGET, kind = "effect_guard_dropped",
+            table = T::LABEL, "brokered effect guard dropped without an outcome");
+        // ...and fail fast in tests — but NEVER while already unwinding, or the
+        // second panic would abort the process and bury the original diagnostic.
+        if !std::thread::panicking() {
+            debug_assert!(false, "RecordedRequest<{}> dropped without discharge", T::LABEL);
+        }
     }
 }
 ```
@@ -225,13 +243,14 @@ Why this shape:
   them writes *both halves or refuses*.
 - **Drop is the backstop, not the mechanism.** Every begun guard is discharged
   by `complete` (buffered) or by being moved into a streaming body (see §3.2).
-  Drop-*without-discharge* is a *bug*, and it fails loudly: `debug_assert` blows
-  up every test that hits it, and prod emits `AUDIT_WRITE_FAILURE`.
-  (`ProxyStreamBody::drop` already sets the precedent for a synchronous outcome
-  write from Drop; `proxy_common.rs:583`.) A completion write that is *attempted
-  and fails* is not a drop: `complete` marks the guard discharged before the
-  write, so the failure surfaces as the driver's 500 + `AUDIT_WRITE_FAILURE`
-  once, never as a second "unattempted" row.
+  Drop-*without-discharge* is a *bug*, and it fails loudly: it emits
+  `AUDIT_WRITE_FAILURE` (which boot reconciliation scans for) and, outside
+  unwinding, `debug_assert`-panics in tests. It does **not** fabricate an outcome
+  row — no table can always express a truthful "incomplete" outcome, so a genuine
+  dangling request is left for reconciliation rather than papered over. A
+  completion that is *attempted and rejected or fails* is not a drop either:
+  `complete` marks the guard discharged before returning, so the failure surfaces
+  as the driver's 500 + `AUDIT_WRITE_FAILURE` once, never as a second row.
 - **Durability stays a first-class choice**, not an accident: two-phase is
   `begin_effect` + `complete`; coalesced is `record_effect_coalesced`;
   outcome-only is `resume_effect` + `complete`. Nothing else. `agent_runs`'
@@ -244,8 +263,8 @@ Why this shape:
 
 This layer subsumes Problem A: `check_session_open` has one home; the
 per-effect DAOs collapse to an `EffectAuditTable` impl (the marker + the two
-`insert_*` column serializers + `dropped_outcome`), exactly as the proxy shims
-already are.
+`insert_*` column serializers + the trivial `outcome_key`), exactly as the proxy
+shims already are.
 
 ### 3.2 Layer 2 — the `BrokeredEffect` trait + single driver (`vm_http`)
 
@@ -329,13 +348,29 @@ pub(in crate::vm_http) struct AuthorityFailure<'a, T: EffectAuditTable> {
     pub response: VmHttpDispatch,
 }
 
+/// The pre-guard policy decision. `Allow` proceeds to acquire a guard and run the
+/// effect. `Deny` records a *deny pair* (request row + a denial outcome row) —
+/// only for effects whose table has a denial state (the proxies, nix-cache).
+/// `Reject` writes NOTHING and returns the response as-is: the no-audit path for
+/// rejections that must not touch the pair — a foreign/unknown agent-run (`404`,
+/// which must not become an ID oracle) or an idempotent retry after the outcome
+/// already exists (`200`). agent-runs' `decide` returns only `Allow`/`Reject`.
+pub(in crate::vm_http) enum EffectDecision {
+    Allow,
+    Deny { reason: String, status: VmHttpStatus },
+    Reject(VmHttpDispatch),
+}
+
 pub(in crate::vm_http) async fn broker_effect<E: BrokeredEffect>(
     audit: &Arc<AuditLog>, session: &VmHttpSession, request: &VmHttpRequest,
     body: Vec<u8>, effect: E,
 ) -> VmHttpDispatch {
     let parsed = /* E parses body/target into E::Request, or 400 */;
     match effect.decide(session, &parsed) {
+        // Records a deny pair; only for tables with a denial outcome (proxies/nix).
         EffectDecision::Deny { reason, status } => return record_denied::<E>(audit, session, request, reason, status),
+        // No-write rejection: 404 foreign/unknown run, idempotent 200 — no row.
+        EffectDecision::Reject(response) => return response,
         EffectDecision::Allow => {}
     }
     if let Durability::Coalesced = E::DURABILITY {
@@ -410,24 +445,36 @@ Today three functions switch on the same target string in three places:
 (`mod.rs:1350`). Collapse them into one registry the dispatcher iterates:
 
 ```rust
-// The dispatcher can do exactly ONE thing with a matched route: hand it to broker_effect.
+// Every route resolves to exactly ONE registry entry. A `Brokered` entry can
+// reach an effect's IO ONLY via `broker_effect`. A `Plain` entry is an
+// explicitly non-audited route — there are a few, and they must be modelled, not
+// dropped: the `GET /v1/session` endpoint; the agent-run *config* endpoint (it
+// grants nothing and has no (request, outcome) pair); and, until the host-mint
+// follow-up (§7), `git_clone`, whose audit is the grant flow, not an
+// `EffectAuditTable` pair.
+enum RouteEntry {
+    Brokered(Box<dyn ErasedEffect>),   // .run(..) == broker_effect::<E>(..)
+    Plain(Box<dyn PlainRoute>),        // an explicitly non-audited handler
+}
 async fn dispatch(services: &VmHttpServices<S>, session, request, body) -> VmHttpDispatch {
-    for entry in services.effects() {          // Vec<Box<dyn ErasedEffect>>, or a match that only calls broker_effect
-        if entry.matches(&request.target, &request.method) {
-            return entry.run(audit, session, request, body).await;  // == broker_effect::<E>(…)
-        }
+    match services.route_table().resolve(&request.target, &request.method) {
+        Some(RouteEntry::Brokered(e)) => e.run(audit, session, request, body).await,
+        Some(RouteEntry::Plain(h))    => h.run(session, request, body).await,
+        None                          => not_found(),
     }
-    route_session_endpoint(session, request).into()
 }
 ```
 
 `auth_scheme_for_target` and `route_request_body_limit` read `entry.auth_scheme()`
 / `entry.body_limit()` from the *same* matched entry, so the three switch sites
-become one. **A new capability is now one `BrokeredEffect` impl + one registry
-row** — not six edit sites — and, decisively, *there is no code path from the
-dispatcher to an effect's IO that does not pass through `broker_effect`*. That is
-the step that turns "complete by discipline" into "complete by construction" at
-the routing boundary.
+become one. **A new *audited* capability is one `BrokeredEffect` impl + one
+`Brokered` row** — not six edit sites — and, decisively, *there is no code path
+from the dispatcher to an effect's IO that does not pass through `broker_effect`*.
+The handful of non-audited routes are `Plain` rows, explicit and enumerable
+rather than special-cased in an if/else. That is the step that turns "complete by
+discipline" into "complete by construction" at the routing boundary: audit is not
+optional for a `Brokered` entry, and a route is one kind or the other, never
+neither.
 
 Within-crate sealing is a boundary-discipline lever, not an airtight compiler
 guarantee: the effect impls and `BrokerState` live in the same crate, so Rust
@@ -492,8 +539,9 @@ Supporting oracles:
 - **Drop backstop** test: a `RecordedRequest` dropped without `complete` panics
   under `debug_assert` and emits `AUDIT_WRITE_FAILURE`.
 - **Registry totality**: a test asserting every `Endpoint map` route in the
-  architecture doc resolves to exactly one registry entry (no route reachable
-  outside the driver).
+  architecture doc resolves to exactly one registry entry — `Brokered` or
+  `Plain` — with no `Brokered` entry's IO reachable outside `broker_effect`, and
+  the enumeration test above driving every `Brokered` entry.
 
 ---
 
@@ -601,12 +649,16 @@ follow-up, which is what teaches the guard the grant-flow shape.
 **Dependencies**: Stage 5. **Implements**: [§3.3](#33-layer-3--the-effect-registry-the-complete-by-construction-capstone).
 
 Replace `route_authenticated_vm_http_request`, `auth_scheme_for_target`, and
-`route_request_body_limit` with one registry the dispatcher iterates; move effect
-impls into `vm_http::effects` and tighten `record_outcome`/secret visibility so
-an effect cannot reach the store or the raw outcome writer. **Oracle**: registry-
-totality test (every documented route resolves to exactly one entry, none
-reachable outside `broker_effect`); the invariant oracle is now
-add-a-capability-proof; full gate suite green.
+`route_request_body_limit` with one registry the dispatcher iterates. The registry
+holds `Brokered` entries (the six `EffectAuditTable`-shaped effects) **and**
+`Plain` entries for the explicitly non-audited routes — `GET /v1/session`, the
+agent-run *config* endpoint, and `git_clone` until the host-mint follow-up ports
+it — so replacing the dispatcher does not 404 them. Move effect impls into
+`vm_http::effects` and tighten `record_outcome`/secret visibility so an effect
+cannot reach the store or the raw outcome writer. **Oracle**: registry-totality
+test (every documented route resolves to exactly one `Brokered`/`Plain` entry,
+none of a `Brokered` entry's IO reachable outside `broker_effect`); the invariant
+oracle is now add-a-capability-proof; full gate suite green.
 
 ---
 
