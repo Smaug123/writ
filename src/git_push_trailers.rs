@@ -1,7 +1,7 @@
 //! Git commit-trailer vocabulary for the push-replay pipeline.
 //!
 //! When the broker re-creates a staged push's commits under the App identity
-//! (see `git_push_replay_walker`), it appends trailers so a published commit can
+//! (see `git_push_walker`), it appends trailers so a published commit can
 //! be traced back to the broker session and the exact bundle commit it derived
 //! from. These are the validated trailer types shared by the walker, promote,
 //! and approve paths.

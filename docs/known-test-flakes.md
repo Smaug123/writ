@@ -68,7 +68,7 @@ does not by itself raise the ghost.
 
 **3. The interrogation of the killing code.** Since something sends the signal,
 the program's own signal-senders were examined: the `killpg(SIGKILL)` calls in
-`process_supervisor` and `git_push_replay_object_source`. These were found
+`process_supervisor` and `git_push_objects_cat_file`. These were found
 innocent. Each is aimed only at the supervised child's *own* process group, and
 each is careful to keep the group leader unreaped at the moment of the kill, so
 that its process-group id cannot have been recycled beneath them. Moreover the

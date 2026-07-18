@@ -438,10 +438,10 @@ identity via GitHub's Git Data API → move the ref. Nothing the guest claims
 **Lives in.** `git_push_staging.rs` (1503), `git_push_approve.rs` (898, with its
 test suite in `git_push_approve/tests.rs`),
 `git_push_promote.rs` (1782), `git_push_trailers.rs` (the commit-trailer
-vocabulary), `git_push_replay_object_parse.rs` (827, tests in
-`git_push_replay_object_parse/tests.rs`),
-`git_push_replay_object_source.rs`, `git_push_replay_walker.rs` (1485) +
-`git_push_replay_walker/`, `clean_git.rs` (hardened git subprocess helpers).
+vocabulary), `git_push_object_parse.rs` (827, tests in
+`git_push_object_parse/tests.rs`),
+`git_push_objects_cat_file.rs`, `git_push_walker.rs` (1485) +
+`git_push_walker/`, `clean_git.rs` (hardened git subprocess helpers).
 
 **Stage flow.**
 1. **Stage** (`git_push_staging.rs:151`): the guest POST persists `bundle` +
@@ -453,15 +453,15 @@ vocabulary), `git_push_replay_object_parse.rs` (827, tests in
    step that moves a GitHub branch.
 3. **Promote** (`git_push_promote.rs:432,518`): upload the closure via
    `replay_commits`, then issue the single `PATCH` under `force=false`.
-4. **Replay/walk** (`git_push_replay_walker.rs:319`): per-commit → tree closure
+4. **Replay/walk** (`git_push_walker.rs:319`): per-commit → tree closure
    → blob re-upload.
 
 **Primitives.** `StagedEntry`/`GitPushStagingStore` (`git_push_staging.rs`);
 parsed `StagingCommit`/`StagingTree` + `ParseObjectError`
-(`git_push_replay_object_parse.rs`); plan types `FastForwardPlan`,
-`BranchCreationPlan`, `ShaMap` (`git_push_replay_walker.rs`); the object-source
+(`git_push_object_parse.rs`); plan types `FastForwardPlan`,
+`BranchCreationPlan`, `ShaMap` (`git_push_walker.rs`); the object-source
 abstraction `trait GitObjectSource` with production `CatFileObjectSource`
-(`git_push_replay_object_source.rs`).
+(`git_push_objects_cat_file.rs`).
 
 **Guarantees.** The branch tip is re-checked via `get_branch_head` *before*
 replay, *after*, and once more inside `commit_prepared_promotion`, all with

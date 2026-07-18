@@ -26,7 +26,7 @@ the stray kill lands. Examples seen:
 - `clean_git::tests::run_clean_git_subprocess_sees_only_hardened_env_vars`
   (its own doc comment already anticipates an "ETXTBSY past the retry ceiling under
   parallel-test load" variant)
-- `git_push_replay_object_source::tests::cat_file_source_drop_kills_process_group`
+- `git_push_objects_cat_file::tests::cat_file_source_drop_kills_process_group`
   (times out 30s waiting for its wrapper to write a pid file — consistent with the
   wrapper being killed before it could write)
 
@@ -76,10 +76,10 @@ Each of these is backed by a reproduction, not inference:
    instrumented to log each call (pgid, caller's process group, leader liveness) and to
    assert it never targets the caller's own group:
    - `process_supervisor::kill_process_group_inner`
-   - `git_push_replay_object_source` (`Drop`, `close`, `kill_process_group_best_effort`)
+   - `git_push_objects_cat_file` (`Drop`, `close`, `kill_process_group_best_effort`)
 
    During failing runs these logged **zero calls**. The only `kill_on_drop(true)` in the
-   tree (the `cat-file --batch` child in `git_push_replay_object_source`) also never
+   tree (the `cat-file --batch` child in `git_push_objects_cat_file`) also never
    fired. So the stray `SIGKILL` does **not** originate from our process-group kill
    machinery — the careful `waitid(WNOWAIT)`-before-`killpg` dance there is not the
    problem.

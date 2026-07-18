@@ -41,10 +41,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::core::RepoRef;
-use crate::git_push_replay_walker::{
-    FastForwardPlan, GitObjectSource, ReplayError, replay_commits,
-};
 use crate::git_push_trailers::TrailerSource;
+use crate::git_push_walker::{FastForwardPlan, GitObjectSource, ReplayError, replay_commits};
 use crate::github_git_db::{GitDataClient, GitDataError};
 use crate::signing::WritSigningKey;
 use crate::vm_git::{GitBranchName, GitObjectId};
@@ -282,7 +280,7 @@ pub enum ExecuteError {
     /// commit returned non-2xx, or the walker found an unmapped
     /// parent — a structural bug in the planner output, never
     /// expected with a plan produced by
-    /// [`crate::git_push_replay_walker::plan_fast_forward_via_rev_list`]).
+    /// [`crate::git_push_walker::plan_fast_forward_via_rev_list`]).
     #[error("replay walk failed: {0}")]
     Replay(#[from] ReplayError),
     /// The post-replay `GET /git/ref/heads/<branch>` (the second lease
@@ -578,8 +576,8 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::*;
-    use crate::git_push_replay_walker::test_fixture::InMemoryGitObjectSource;
-    use crate::git_push_replay_walker::{ShaMap, StagingCommit, StagingTree};
+    use crate::git_push_walker::test_fixture::InMemoryGitObjectSource;
+    use crate::git_push_walker::{ShaMap, StagingCommit, StagingTree};
     use crate::github_git_db::{CommitIdentity, GitDataTimeouts};
 
     fn sample_repo() -> RepoRef {
