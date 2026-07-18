@@ -60,25 +60,17 @@ impl AuditLog {
 
     /// The count behind [`AuditLog::assert_effect_audit_pairs_complete`]: rows in
     /// `request_table` with no matching `outcome_table` row on `join_column`.
-    /// Zero means every begun effect is paired.
+    /// Zero means every begun effect is paired. Thin test-support wrapper over the
+    /// production [`AuditLog::count_unpaired_effect_request_rows`], sharing its one
+    /// `LEFT JOIN` query.
     pub fn unpaired_effect_request_rows(
         &self,
         request_table: &str,
         outcome_table: &str,
         join_column: &str,
     ) -> u64 {
-        // Table/column names are trusted crate-internal literals; the caller's
-        // session/row values never reach this query (it takes no bound params).
-        let sql = format!(
-            "SELECT COUNT(*) FROM {request_table} r
-             LEFT JOIN {outcome_table} o ON o.{join_column} = r.{join_column}
-             WHERE o.{join_column} IS NULL",
-        );
-        self.with_conn(|c| {
-            let count: i64 = c.query_row(&sql, [], |row| row.get(0))?;
-            Ok(count as u64)
-        })
-        .expect("audit-pair oracle count query")
+        self.count_unpaired_effect_request_rows(request_table, outcome_table, join_column)
+            .expect("audit-pair oracle count query")
     }
 
     /// Row count in an audit `table`, for the non-vacuity half of a drive

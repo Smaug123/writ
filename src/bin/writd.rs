@@ -14,6 +14,7 @@ use writ::agent_vm_lifecycle::BrokerPlacement;
 use writ::audit::AuditLog;
 use writ::boot_reconcile::{
     reconcile_orphaned_staged_carriers, reconcile_pending_approve_attempts,
+    reconcile_unpaired_effect_rows,
 };
 use writ::broker_entrypoint::{BrokerArgs, run_broker};
 use writ::broker_session::BrokerSessionSpec;
@@ -472,6 +473,30 @@ async fn run_host_daemon(
             .into());
         }
     }
+
+    // Durable backstop for the "complete by construction" audit-pair invariant:
+    // flag any brokered-effect request row left without its outcome by a crash (or
+    // an unreconciled handler failure) mid-effect. Deliberately runs *after*
+    // `reconcile_persisted_sessions` above: under `broker_placement = vm` a broker
+    // VM persisted by a previously-crashed host daemon keeps writing this audit DB
+    // (over its virtiofs mount) until that pass closes and tears it down, so a scan
+    // any earlier could miss a row inserted post-scan, or falsely flag a row that
+    // is merely in-flight. After teardown the DB is quiescent for those sessions.
+    // Still unconditional (the proxy / nix-cache / flake-provision tables exist in
+    // any mode), still fail-fast, and — because the staged-carrier sweep ran
+    // earlier — a git-push carrier that sweep could recover is already paired, so
+    // only genuinely-stuck rows are flagged.
+    let unpaired = reconcile_unpaired_effect_rows(&state.audit)?;
+    if !unpaired.is_empty() {
+        let total_rows: u64 = unpaired.iter().map(|finding| finding.count).sum();
+        tracing::warn!(
+            unpaired_effect_tables = unpaired.len(),
+            unpaired_effect_rows = total_rows,
+            "brokered effect request rows left without an outcome at last shutdown \
+             (see AUDIT_WRITE_FAILURE events for the affected tables)",
+        );
+    }
+
     if let Some(ui_http) = ui_http {
         ui_http.validate()?;
         // Inside this block we also bind the UI listener before
