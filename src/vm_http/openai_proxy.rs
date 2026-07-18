@@ -20,7 +20,7 @@ use crate::server::BrokerState;
 use super::proxy_common::{
     OpenAiBackend, ProxyBackend, ProxyBackendConfig, ProxyFetch, ProxyForwardHeader,
     ProxyOutcomeFields, ProxyRequestFields, ProxyStream, UpstreamAuth, VmHttpProxyService,
-    is_proxy_id_byte, proxy_decision_to_owned, proxy_target_path,
+    is_proxy_id_byte, proxy_target_path,
 };
 use super::{VmHttpDispatch, VmHttpHeader, VmHttpResponse, VmHttpStatus};
 
@@ -227,11 +227,13 @@ impl ProxyBackend for OpenAiBackend {
     type AuthKind = VmHttpOpenAiProxyAuthKind;
     type Config = VmHttpOpenAiProxyConfig;
     type Extras = Option<Arc<ChatgptOauthAuthority>>;
+    type AuditTable = crate::audit::OpenAiProxyAuditTable;
 
     const UPSTREAM_FAIL_BODY: &'static str = "OpenAI proxy upstream failed";
     const UNSUPPORTED_ROUTE_REASON: &'static str = "unsupported OpenAI proxy route";
     const REQUEST_AUDIT_KIND: &'static str = "openai_proxy_request";
     const OUTCOME_AUDIT_KIND: &'static str = "openai_proxy_outcome";
+    const STREAMING_OUTCOME_AUDIT_KIND: &'static str = "openai_proxy_streaming_outcome";
 
     fn classify_proxy_target(target: &str) -> Option<OpenAiProxyAuditRoute> {
         // Match on the path only. The OpenAI clients pass through query
@@ -414,7 +416,6 @@ impl ProxyBackend for OpenAiBackend {
         audit_log: &AuditLog,
         fields: ProxyRequestFields<'_, OpenAiProxyAuditRoute>,
     ) -> Result<(), AuditError> {
-        let decision = proxy_decision_to_owned(fields.decision);
         audit_log.record_openai_proxy_request(&OpenAiProxyRequestRecord {
             request_id: fields.request_id,
             session_id: fields.session_id,
@@ -422,7 +423,7 @@ impl ProxyBackend for OpenAiBackend {
             method: fields.method,
             target: fields.target,
             route: fields.route,
-            decision: &decision,
+            decision: fields.decision,
         })
     }
 
@@ -564,7 +565,8 @@ mod tests {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    use super::super::proxy_common::{proxy_request_wants_streaming, route_proxy_request};
+    use super::super::broker_effect::broker_effect;
+    use super::super::proxy_common::{ProxyEffect, proxy_request_wants_streaming};
     use super::super::tests::{
         bearer, make_broker_state, make_broker_state_with_extra_secret, open_audit_session,
         raw_http_response_with_headers, serve_raw_http_once, session_for_subnet, token,
@@ -584,7 +586,8 @@ mod tests {
         body: Vec<u8>,
         service: &VmHttpOpenAiProxyService<S>,
     ) -> VmHttpDispatch {
-        route_proxy_request::<OpenAiBackend, _>(session, request, body, service).await
+        let effect = ProxyEffect::<OpenAiBackend, _>::classify(service, session, request, body);
+        broker_effect(service.audit(), effect).await
     }
 
     fn services_with_openai_proxy(

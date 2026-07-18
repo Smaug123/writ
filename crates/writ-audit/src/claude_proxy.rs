@@ -40,7 +40,11 @@ impl ProxyAuditRoute for ClaudeProxyAuditRoute {
 
 /// Zero-sized table descriptor selecting the `claude_proxy_request` /
 /// `claude_proxy_outcome` pair.
-pub(super) struct ClaudeProxyAuditTable;
+///
+/// `pub` so the VM-HTTP `broker_effect` driver can name it as its
+/// [`EffectAuditTable`](crate::EffectAuditTable) — it stays sealed and so
+/// cannot be implemented downstream.
+pub struct ClaudeProxyAuditTable;
 
 impl ProxyAuditTable for ClaudeProxyAuditTable {
     type Route = ClaudeProxyAuditRoute;

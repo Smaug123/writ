@@ -16,7 +16,7 @@ use crate::server::BrokerState;
 use super::proxy_common::{
     ClaudeBackend, ProxyBackend, ProxyBackendConfig, ProxyFetch, ProxyForwardHeader,
     ProxyOutcomeFields, ProxyRequestFields, ProxyStream, UpstreamAuth, VmHttpProxyService,
-    is_proxy_id_byte, proxy_decision_to_owned, proxy_target_path,
+    is_proxy_id_byte, proxy_target_path,
 };
 use super::{VmHttpDispatch, VmHttpHeader, VmHttpResponse, VmHttpStatus};
 
@@ -241,11 +241,13 @@ impl ProxyBackend for ClaudeBackend {
     type AuthKind = VmHttpClaudeProxyAuthKind;
     type Config = VmHttpClaudeProxyConfig;
     type Extras = ();
+    type AuditTable = crate::audit::ClaudeProxyAuditTable;
 
     const UPSTREAM_FAIL_BODY: &'static str = "Claude proxy upstream failed";
     const UNSUPPORTED_ROUTE_REASON: &'static str = "unsupported Claude proxy route";
     const REQUEST_AUDIT_KIND: &'static str = "claude_proxy_request";
     const OUTCOME_AUDIT_KIND: &'static str = "claude_proxy_outcome";
+    const STREAMING_OUTCOME_AUDIT_KIND: &'static str = "claude_proxy_streaming_outcome";
 
     fn classify_proxy_target(target: &str) -> Option<ClaudeProxyAuditRoute> {
         // Match on the path only. Anthropic's clients pass through query
@@ -351,7 +353,6 @@ impl ProxyBackend for ClaudeBackend {
         audit_log: &AuditLog,
         fields: ProxyRequestFields<'_, ClaudeProxyAuditRoute>,
     ) -> Result<(), AuditError> {
-        let decision = proxy_decision_to_owned(fields.decision);
         audit_log.record_claude_proxy_request(&ClaudeProxyRequestRecord {
             request_id: fields.request_id,
             session_id: fields.session_id,
@@ -359,7 +360,7 @@ impl ProxyBackend for ClaudeBackend {
             method: fields.method,
             target: fields.target,
             route: fields.route,
-            decision: &decision,
+            decision: fields.decision,
         })
     }
 
@@ -498,7 +499,8 @@ mod tests {
     use wiremock::MockServer;
 
     use super::super::VmHttpSession;
-    use super::super::proxy_common::route_proxy_request;
+    use super::super::broker_effect::broker_effect;
+    use super::super::proxy_common::ProxyEffect;
     use super::super::tests::{
         bearer, make_broker_state, make_broker_state_with_extra_secret, open_audit_session,
         raw_http_response, raw_http_response_with_headers, serve_raw_http_once,
@@ -520,7 +522,8 @@ mod tests {
         body: Vec<u8>,
         service: &VmHttpClaudeProxyService<S>,
     ) -> VmHttpDispatch {
-        route_proxy_request::<ClaudeBackend, _>(session, request, body, service).await
+        let effect = ProxyEffect::<ClaudeBackend, _>::classify(service, session, request, body);
+        broker_effect(service.audit(), effect).await
     }
 
     #[test]
@@ -1373,7 +1376,7 @@ mod tests {
         )
         .await;
         let request_id = match &dispatch {
-            VmHttpDispatch::ClaudeProxyStream(stream) => stream.request_id,
+            VmHttpDispatch::ClaudeProxyStream(stream) => stream.request_id(),
             VmHttpDispatch::Buffered(response) => {
                 panic!("expected streaming response, got {response:?}")
             }
@@ -1460,7 +1463,7 @@ mod tests {
         )
         .await;
         let request_id = match &dispatch {
-            VmHttpDispatch::ClaudeProxyStream(stream) => stream.request_id,
+            VmHttpDispatch::ClaudeProxyStream(stream) => stream.request_id(),
             VmHttpDispatch::Buffered(response) => {
                 panic!("expected streaming response, got {response:?}")
             }
