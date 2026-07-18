@@ -343,6 +343,12 @@ single file exceeds what one reading can hold.
   bulk was a ~1.7k-line inline test module. Relocated to
   `crates/writ-vm-client/src/tests.rs`; the 41 tests run unchanged. (No
   `include_*!` paths this time, so no fixup.)
+- **`bailiff` binary (`src/bin/bailiff.rs`, 2428 → 1255):** the CLI command
+  surface plus a ~1.2k-line inline test module of clap-parsing/dispatch tests.
+  Relocated to `src/bin/bailiff/tests.rs`. A binary's entry file is a *crate
+  root*, so a bare `mod tests;` resolves to a sibling `src/bin/tests.rs` — which
+  cargo would auto-discover as a *second binary* — so the split needs an explicit
+  `#[path = "bailiff/tests.rs"] mod tests;`. The 36 tests run unchanged.
 
 Rule of thumb learned from the config split: extract the chunks with no
 `#[serde(default = "…")]` coupling first — moving a struct away from its default
