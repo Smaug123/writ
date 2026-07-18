@@ -8,7 +8,7 @@
 //! two-phase, append-only, open-session-gated structure is the same; the
 //! columns are this domain's own.
 
-use rusqlite::{OptionalExtension, Row, params};
+use rusqlite::{Row, params};
 
 use super::validation::{labeled_invariant, u64_to_sql_i64};
 use super::{AuditError, AuditLog};
@@ -101,18 +101,7 @@ impl AuditLog {
 
         self.with_conn_mut(|c| {
             let tx = c.transaction()?;
-            let session_closed_at: Option<Option<i64>> = tx
-                .query_row(
-                    "SELECT closed_at FROM session WHERE session_id = ?1",
-                    params![r.session_id.as_uuid().to_string()],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            match session_closed_at {
-                None => return Err(AuditError::Invariant("session does not exist")),
-                Some(Some(_)) => return Err(AuditError::Invariant("session is closed")),
-                Some(None) => {}
-            }
+            crate::validation::check_session_open(&tx, r.session_id)?;
 
             tx.execute(
                 "INSERT INTO flake_provision_request (

@@ -78,18 +78,7 @@ impl AuditLog {
             // "session exists"; it cannot express "session is open",
             // which is why this check exists at all. The BEFORE-INSERT
             // trigger on `request` is braces to this belt.
-            let session_closed_at: Option<Option<i64>> = tx
-                .query_row(
-                    "SELECT closed_at FROM session WHERE session_id = ?1",
-                    params![r.session_id.as_uuid().to_string()],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            match session_closed_at {
-                None => return Err(AuditError::Invariant("session does not exist")),
-                Some(Some(_)) => return Err(AuditError::Invariant("session is closed")),
-                Some(None) => {}
-            }
+            crate::validation::check_session_open(&tx, r.session_id)?;
 
             tx.execute(
                 "INSERT INTO request (
