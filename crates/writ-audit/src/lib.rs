@@ -29,6 +29,10 @@ use thiserror::Error;
 mod agent_run;
 mod agent_vm_network_health;
 mod claude_proxy;
+/// Stage-0 oracle for the audit-pair ("complete by construction") invariant.
+/// Test-support only; adds no code to production builds.
+#[cfg(any(test, feature = "test-support"))]
+mod effect_audit_oracle;
 mod flake_provision;
 mod git_push;
 mod grant;

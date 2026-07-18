@@ -737,6 +737,23 @@ mod tests {
             upstream_request.ends_with(r#"{"model":"test"}"#),
             "{upstream_request}"
         );
+
+        // Non-vacuity: the drive recorded exactly one request row (a fresh
+        // in-memory audit log driven once), so the oracle below cannot pass by
+        // there being no rows to pair.
+        let entries = state
+            .audit
+            .list_claude_proxy_requests_for_session_for_test(session.session_id())
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].2, Some(200));
+        // Stage-0 audit-pair oracle (writ-audit::effect_audit_oracle): a proxied
+        // request must leave a complete (request, outcome) pair.
+        state.audit.assert_effect_audit_pairs_complete(
+            "claude_proxy_request",
+            "claude_proxy_outcome",
+            "request_id",
+        );
     }
 
     #[tokio::test]

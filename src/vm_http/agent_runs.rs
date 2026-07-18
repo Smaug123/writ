@@ -480,6 +480,13 @@ mod tests {
         let retried =
             route_agent_run_outcome_request(run_id, session.session_id(), &body, &service);
         assert_eq!(retried.status, VmHttpStatus::Ok);
+
+        // Stage-0 audit-pair oracle (writ-audit::effect_audit_oracle): the run's
+        // request row (seeded at launch) and the outcome row recorded by the
+        // handler form a complete pair, joined on run_id.
+        state
+            .audit
+            .assert_effect_audit_pairs_complete("agent_run", "agent_run_outcome", "run_id");
     }
 
     #[tokio::test]

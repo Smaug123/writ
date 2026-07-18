@@ -1077,6 +1077,14 @@ mod tests {
         assert_eq!(entries[0].0, OpenAiProxyAuditRoute::Responses);
         assert_eq!(entries[0].1, OpenAiProxyAuditDecision::Allow);
         assert_eq!(entries[0].2, Some(200));
+
+        // Stage-0 audit-pair oracle (writ-audit::effect_audit_oracle): a proxied
+        // request must leave a complete (request, outcome) pair.
+        state.audit.assert_effect_audit_pairs_complete(
+            "openai_proxy_request",
+            "openai_proxy_outcome",
+            "request_id",
+        );
     }
 
     #[tokio::test]
@@ -1128,6 +1136,15 @@ mod tests {
             }
         );
         assert_eq!(entries[0].2, Some(401));
+
+        // Stage-0 audit-pair oracle on a *failure* path: an audited denial (no
+        // upstream contacted) must still record a complete (request, outcome)
+        // pair — a request row with a 401 outcome, not a dangling request.
+        state.audit.assert_effect_audit_pairs_complete(
+            "openai_proxy_request",
+            "openai_proxy_outcome",
+            "request_id",
+        );
     }
 
     #[tokio::test]

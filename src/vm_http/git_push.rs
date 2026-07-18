@@ -590,6 +590,40 @@ mod tests {
         assert_eq!(entry.message.as_deref(), Some("staged for review"));
     }
 
+    /// Stage-0 audit-pair oracle applied to a *real current handler*: driving
+    /// `handle_git_push_request` on its happy path must leave the
+    /// `(git_push_request, git_push_outcome)` pair complete — the two-phase
+    /// request-row-before-effect, outcome-row-after discipline this handler wires
+    /// by hand. See `docs/plans/2026-07-18-brokered-effect-audit-enforcement.md`
+    /// §4; the oracle primitive lives in `writ-audit::effect_audit_oracle`.
+    #[tokio::test]
+    async fn git_push_handler_satisfies_audit_pair_oracle() {
+        let github = wiremock::MockServer::start().await;
+        let state = make_broker_state(&github);
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+        open_audit_session(&state, session.session_id());
+        let (staging, _tmp) = open_test_staging_store();
+        let service = git_push_service_for_test(&state, staging);
+
+        let before = state.audit.table_row_count_for_test("git_push_outcome");
+        let body = encoded_body(sample_metadata(), b"PACK bundle bytes".to_vec());
+        let response = handle_git_push_request(&session, body, service).await;
+        assert_eq!(response.status, VmHttpStatus::Ok);
+
+        // Non-vacuity: the drive actually reached a recorded terminal state...
+        assert_eq!(
+            state.audit.table_row_count_for_test("git_push_outcome"),
+            before + 1,
+            "the staged push must record exactly one outcome row",
+        );
+        // ...and the invariant holds: no staged request lacks its outcome row.
+        state.audit.assert_effect_audit_pairs_complete(
+            "git_push_request",
+            "git_push_outcome",
+            "push_request_id",
+        );
+    }
+
     /// A push from a `--correlation-id`'d agent run inherits the run's
     /// correlation id onto the `git_push_request` audit row, so a
     /// downstream join on `correlation_id` stitches the run and its
