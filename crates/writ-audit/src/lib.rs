@@ -56,7 +56,7 @@ pub use claude_proxy::{
     ClaudeProxyOutcomeRecord, ClaudeProxyRequestRecord,
 };
 pub use effect_scan::{EFFECT_AUDIT_PAIRS, EffectAuditPair, UnpairedEffectRows};
-pub use effect_table::{EffectAuditTable, RecordedRequest};
+pub use effect_table::{AbandonableEffect, EffectAuditTable, RecordedRequest};
 pub use flake_provision::{
     FlakeProvisionAuditEntry, FlakeProvisionAuditOutcome, FlakeProvisionOutcomeRecord,
     FlakeProvisionRequestRecord, FlakeProvisionResult,
