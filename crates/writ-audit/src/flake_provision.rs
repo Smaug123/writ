@@ -8,7 +8,7 @@
 //! two-phase, append-only, open-session-gated structure is the same; the
 //! columns are this domain's own.
 
-use rusqlite::{Row, params};
+use rusqlite::{Connection, Row, params};
 
 use super::validation::{labeled_invariant, u64_to_sql_i64};
 use super::{AuditError, AuditLog};
@@ -77,6 +77,138 @@ pub enum FlakeProvisionAuditOutcome {
     },
 }
 
+/// Field validation for a provisioning request row, run before any transaction
+/// opens (mirrors the pre-tx validation the proxy DAO does). Kept separate from
+/// [`insert_flake_provision_request_row`] so the direct writer can keep checking
+/// fields *before* it opens a transaction, exactly as it did when the two steps
+/// were inline.
+fn validate_flake_provision_request(r: &FlakeProvisionRequestRecord<'_>) -> Result<(), AuditError> {
+    if r.flake_dir.is_empty() {
+        return Err(labeled_invariant(
+            LABEL,
+            "flake directory must not be empty",
+        ));
+    }
+    if r.cache_dir.is_empty() {
+        return Err(labeled_invariant(
+            LABEL,
+            "cache directory must not be empty",
+        ));
+    }
+    // Reject an out-of-range input_count here so both writers surface the same
+    // `LabeledInvariant` at the same point; the insert below re-derives the i64.
+    u64_to_sql_i64(r.input_count, LABEL)?;
+    Ok(())
+}
+
+/// Insert one request row into this connection/transaction. Assumes
+/// [`validate_flake_provision_request`] passed and `check_session_open` ran.
+fn insert_flake_provision_request_row(
+    conn: &Connection,
+    r: &FlakeProvisionRequestRecord<'_>,
+) -> Result<(), AuditError> {
+    let input_count = u64_to_sql_i64(r.input_count, LABEL)?;
+    conn.execute(
+        "INSERT INTO flake_provision_request (
+             request_id,
+             session_id,
+             received_at,
+             flake_dir,
+             cache_dir,
+             input_count
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            r.request_id.as_uuid().to_string(),
+            r.session_id.as_uuid().to_string(),
+            r.received_at.as_millis(),
+            r.flake_dir,
+            r.cache_dir,
+            input_count,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Validate and insert one outcome row into this connection/transaction. The
+/// success/failure projection is the outcome's only validation, so — unlike the
+/// request — there is no separate pre-tx `validate` step to hoist.
+fn insert_flake_provision_outcome_row(
+    conn: &Connection,
+    r: &FlakeProvisionOutcomeRecord<'_>,
+) -> Result<(), AuditError> {
+    let (status, archived_path_count, archived_bytes, error) = match &r.result {
+        FlakeProvisionResult::Success {
+            archived_path_count,
+            archived_bytes,
+        } => (
+            "success",
+            u64_to_sql_i64(*archived_path_count, LABEL)?,
+            u64_to_sql_i64(*archived_bytes, LABEL)?,
+            None,
+        ),
+        FlakeProvisionResult::Failure { error } => {
+            if error.is_empty() {
+                return Err(labeled_invariant(LABEL, "failure error must not be empty"));
+            }
+            ("failure", 0, 0, Some(*error))
+        }
+    };
+    conn.execute(
+        "INSERT INTO flake_provision_outcome (
+             request_id,
+             completed_at,
+             status,
+             archived_path_count,
+             archived_bytes,
+             error
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            r.request_id.as_uuid().to_string(),
+            r.completed_at.as_millis(),
+            status,
+            archived_path_count,
+            archived_bytes,
+            error,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Marker selecting the flake-provision `(request, outcome)` pair for the generic
+/// [`EffectAuditTable`](crate::effect_table::EffectAuditTable) guard. Zero-sized;
+/// named only as a type argument. The VM-HTTP driver stage consumes it (routing
+/// flake provisioning through `begin_effect`/`complete`); until then the direct
+/// writers above are the production path and the guard impl is exercised only by
+/// the equivalence proptest below.
+pub(crate) struct FlakeProvisionAuditTable;
+
+impl crate::effect_table::sealed::Sealed for FlakeProvisionAuditTable {}
+impl crate::effect_table::EffectAuditTable for FlakeProvisionAuditTable {
+    type RequestRow<'a> = FlakeProvisionRequestRecord<'a>;
+    type OutcomeRow<'a> = FlakeProvisionOutcomeRecord<'a>;
+    type Key = RequestId;
+    const REQUEST_TABLE: &'static str = "flake_provision_request";
+    const OUTCOME_TABLE: &'static str = "flake_provision_outcome";
+    const LABEL: &'static str = "Flake provision";
+
+    fn insert_request(conn: &Connection, row: &Self::RequestRow<'_>) -> Result<(), AuditError> {
+        validate_flake_provision_request(row)?;
+        insert_flake_provision_request_row(conn, row)
+    }
+    fn insert_outcome(conn: &Connection, row: &Self::OutcomeRow<'_>) -> Result<(), AuditError> {
+        insert_flake_provision_outcome_row(conn, row)
+    }
+    fn session_id(row: &Self::RequestRow<'_>) -> SessionId {
+        row.session_id
+    }
+    fn request_key(row: &Self::RequestRow<'_>) -> RequestId {
+        row.request_id
+    }
+    fn outcome_key(row: &Self::OutcomeRow<'_>) -> RequestId {
+        row.request_id
+    }
+}
+
 impl AuditLog {
     /// Persist a provisioning request before `nix flake archive` is run.
     /// The matching outcome is appended with
@@ -85,42 +217,11 @@ impl AuditLog {
         &self,
         r: &FlakeProvisionRequestRecord<'_>,
     ) -> Result<(), AuditError> {
-        if r.flake_dir.is_empty() {
-            return Err(labeled_invariant(
-                LABEL,
-                "flake directory must not be empty",
-            ));
-        }
-        if r.cache_dir.is_empty() {
-            return Err(labeled_invariant(
-                LABEL,
-                "cache directory must not be empty",
-            ));
-        }
-        let input_count = u64_to_sql_i64(r.input_count, LABEL)?;
-
+        validate_flake_provision_request(r)?;
         self.with_conn_mut(|c| {
             let tx = c.transaction()?;
             crate::validation::check_session_open(&tx, r.session_id)?;
-
-            tx.execute(
-                "INSERT INTO flake_provision_request (
-                     request_id,
-                     session_id,
-                     received_at,
-                     flake_dir,
-                     cache_dir,
-                     input_count
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![
-                    r.request_id.as_uuid().to_string(),
-                    r.session_id.as_uuid().to_string(),
-                    r.received_at.as_millis(),
-                    r.flake_dir,
-                    r.cache_dir,
-                    input_count,
-                ],
-            )?;
+            insert_flake_provision_request_row(&tx, r)?;
             tx.commit()?;
             Ok(())
         })
@@ -133,44 +234,9 @@ impl AuditLog {
         &self,
         r: &FlakeProvisionOutcomeRecord<'_>,
     ) -> Result<(), AuditError> {
-        let (status, archived_path_count, archived_bytes, error) = match &r.result {
-            FlakeProvisionResult::Success {
-                archived_path_count,
-                archived_bytes,
-            } => (
-                "success",
-                u64_to_sql_i64(*archived_path_count, LABEL)?,
-                u64_to_sql_i64(*archived_bytes, LABEL)?,
-                None,
-            ),
-            FlakeProvisionResult::Failure { error } => {
-                if error.is_empty() {
-                    return Err(labeled_invariant(LABEL, "failure error must not be empty"));
-                }
-                ("failure", 0, 0, Some(*error))
-            }
-        };
-
         self.with_conn_mut(|c| {
             let tx = c.transaction()?;
-            tx.execute(
-                "INSERT INTO flake_provision_outcome (
-                     request_id,
-                     completed_at,
-                     status,
-                     archived_path_count,
-                     archived_bytes,
-                     error
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![
-                    r.request_id.as_uuid().to_string(),
-                    r.completed_at.as_millis(),
-                    status,
-                    archived_path_count,
-                    archived_bytes,
-                    error,
-                ],
-            )?;
+            insert_flake_provision_outcome_row(&tx, r)?;
             tx.commit()?;
             Ok(())
         })
@@ -296,6 +362,59 @@ fn nonneg(value: Option<i64>, what: &'static str) -> Result<u64, AuditError> {
 mod tests {
     use super::*;
     use crate::test_support::sample_session;
+    use proptest::prelude::*;
+
+    /// Raw request-table rows (every column, in insert order) for equivalence
+    /// assertions — the flake analogue of `proxy_table`'s `dump_request_rows`.
+    #[allow(clippy::type_complexity)]
+    fn dump_flake_request_rows(log: &AuditLog) -> Vec<(String, String, i64, String, String, i64)> {
+        log.with_conn(|c| {
+            let mut stmt = c.prepare(
+                "SELECT request_id, session_id, received_at, flake_dir, cache_dir, input_count \
+                 FROM flake_provision_request ORDER BY rowid",
+            )?;
+            let rows = stmt
+                .query_map([], |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+        .unwrap()
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn dump_flake_outcome_rows(
+        log: &AuditLog,
+    ) -> Vec<(String, i64, String, i64, i64, Option<String>)> {
+        log.with_conn(|c| {
+            let mut stmt = c.prepare(
+                "SELECT request_id, completed_at, status, archived_path_count, archived_bytes, \
+                 error FROM flake_provision_outcome ORDER BY rowid",
+            )?;
+            let rows = stmt
+                .query_map([], |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+        .unwrap()
+    }
 
     fn request(
         request_id: RequestId,
@@ -497,5 +616,76 @@ mod tests {
             e.to_string().to_lowercase().contains("foreign key"),
             "expected FK violation, got: {e}"
         );
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        /// The generic guard's two-phase path (`begin_effect` + `complete`) must be
+        /// behaviour-preserving for flake-provision: it leaves both tables
+        /// byte-for-byte identical to the direct `record_flake_provision_request` +
+        /// `record_flake_provision_outcome`. This is the equivalence that lets the
+        /// VM-HTTP driver adopt the guard here (a later stage) without changing a
+        /// single persisted row — the flake analogue of `proxy_table`'s
+        /// `begin_then_complete_matches_the_two_phase_writers`.
+        #[test]
+        fn begin_then_complete_matches_the_direct_flake_writers(
+            // Non-empty, NUL-free paths (SQLite TEXT can't carry NUL); leading
+            // slash keeps them recognisable as directories without constraining
+            // the bytes otherwise.
+            flake_dir in "/[\\x01-\\x7e&&[^\\x00]]{0,80}",
+            cache_dir in "/[\\x01-\\x7e&&[^\\x00]]{0,80}",
+            input_count in 0u64..=100_000,
+            is_success in any::<bool>(),
+            archived_path_count in 0u64..=(i64::MAX as u64),
+            archived_bytes in 0u64..=(i64::MAX as u64),
+            error in "[\\x01-\\x7e]{1,80}",
+        ) {
+            let direct = AuditLog::open_in_memory().unwrap();
+            let guarded = std::sync::Arc::new(AuditLog::open_in_memory().unwrap());
+            let s = sample_session();
+            direct.open_session(&s).unwrap();
+            guarded.open_session(&s).unwrap();
+
+            let request_id = RequestId::new();
+            let request = FlakeProvisionRequestRecord {
+                request_id,
+                session_id: s.session_id,
+                received_at: UnixMillis::from_millis(1_700_000_100),
+                flake_dir: &flake_dir,
+                cache_dir: &cache_dir,
+                input_count,
+            };
+            let result = if is_success {
+                FlakeProvisionResult::Success {
+                    archived_path_count,
+                    archived_bytes,
+                }
+            } else {
+                FlakeProvisionResult::Failure { error: &error }
+            };
+            let outcome = FlakeProvisionOutcomeRecord {
+                request_id,
+                completed_at: UnixMillis::from_millis(1_700_000_200),
+                result,
+            };
+
+            direct.record_flake_provision_request(&request).unwrap();
+            direct.record_flake_provision_outcome(&outcome).unwrap();
+            guarded
+                .begin_effect::<FlakeProvisionAuditTable>(&request)
+                .unwrap()
+                .complete(&outcome)
+                .unwrap();
+
+            prop_assert_eq!(
+                dump_flake_request_rows(&direct),
+                dump_flake_request_rows(&guarded)
+            );
+            prop_assert_eq!(
+                dump_flake_outcome_rows(&direct),
+                dump_flake_outcome_rows(&guarded)
+            );
+        }
     }
 }
