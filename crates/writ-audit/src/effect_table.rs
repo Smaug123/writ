@@ -501,9 +501,11 @@ CREATE TABLE scratch_outcome (
         );
     }
 
-    // A guard dropped without discharge must emit the AUDIT_WRITE_FAILURE event
-    // and (in a debug build, outside unwinding) panic. `should_panic` observes the
-    // debug_assert; the tracing event is best-effort and not asserted here.
+    // A guard dropped without discharge fails fast via the `Drop` `debug_assert`.
+    // That assert is compiled out under `--release`, so this test only applies —
+    // and only runs — with debug assertions on; otherwise `#[should_panic]` would
+    // itself fail because nothing panicked.
+    #[cfg(debug_assertions)]
     #[test]
     #[should_panic(expected = "dropped without discharge")]
     fn dropping_a_guard_without_discharge_panics_in_debug() {
