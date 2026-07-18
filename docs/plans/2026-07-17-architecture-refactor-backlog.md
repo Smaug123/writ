@@ -383,6 +383,23 @@ single file exceeds what one reading can hold.
   reachable from the child `tests` module via `super`. The 30 tests run
   unchanged.
 
+- **Batch test-split (six files at once):** once the pattern was proven, the
+  remaining test-dominated single-concern files were relocated in one PR rather
+  than one-at-a-time — `github_git_db.rs` (2150 → 524), `broker_vm.rs`
+  (2422 → 966), `protocol/mod.rs` (2072 → 534), `notes_repo.rs` (2060 → 1022),
+  `writ-vm-git/src/lib.rs` (2017 → 1214), and `git_push_replay_object_parse.rs`
+  (2009 → 827). Each moved its single inline `#[cfg(test)] mod tests` to a
+  sibling `tests.rs`; none had `include_*!` paths, so no fixups. This clears the
+  last of the >2k-line files apart from `agent_vm_lifecycle.rs` (below).
+
+**Still open — `agent_vm_lifecycle.rs` (2409):** the one remaining >2k file whose
+bulk is *production*, not tests. Its residue is the session-teardown /
+`run_*_cleanup_until_absent` machinery — a free-function cluster interleaved with
+shared helpers (`derive_session_network`, `shell_quote`, …) that the already-split
+`plan`/`invocation` submodules also use, so a clean extraction has to leave those
+shared helpers at the module root. A worthwhile but fiddlier follow-up than the
+mechanical test-splits above.
+
 Rule of thumb learned from the config split: extract the chunks with no
 `#[serde(default = "…")]` coupling first — moving a struct away from its default
 fns means re-pathing each `default = "…"` attribute, which is churnier.
