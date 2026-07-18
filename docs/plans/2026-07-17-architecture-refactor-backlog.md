@@ -349,6 +349,16 @@ single file exceeds what one reading can hold.
   root*, so a bare `mod tests;` resolves to a sibling `src/bin/tests.rs` — which
   cargo would auto-discover as a *second binary* — so the split needs an explicit
   `#[path = "bailiff/tests.rs"] mod tests;`. The 36 tests run unchanged.
+- **`writ-audit/src/git_push.rs` (2236 → 1010):** unlike the files above this is
+  production-heavy — its bulk was a single 1226-line `impl AuditLog` block of
+  git-push audit DAO methods (read/write the request/outcome/resolution/
+  approve-attempt rows). Moved that impl to `git_push/dao.rs`; the record types,
+  row-mapping helpers, and row structs stay in `git_push.rs`. All 23 methods but
+  three are `pub`, and those three private helpers have no external caller, so
+  the by-type inherent-impl move needed no `pub(super)` bumps or call-site
+  changes. The `UncertainAttempt` witness invariant is preserved: its field is
+  still module-private (the `dao` submodule is a descendant of `git_push`, so
+  external crates still cannot forge one).
 
 Rule of thumb learned from the config split: extract the chunks with no
 `#[serde(default = "…")]` coupling first — moving a struct away from its default
