@@ -253,10 +253,15 @@ today handles only approve-attempts and staged carriers, and does not read logs)
 The durable backstop is a generic **boot-time unpaired-row scan** — the same
 `LEFT JOIN` the Stage-0 oracle uses, run over every effect table at startup to
 flag any `*_request` with no `*_outcome`. It lands with the guard (Stage 3) and is
-listed in that stage's oracle. Because the driver now discharges on every path, a
-genuine dangling row requires a hard crash *between* the request-row commit and
-the outcome write — the two-phase window that has always existed — so the scan
-reports the same rare, real events, not routine drops.
+listed in that stage's oracle. A dangling row can arise whenever the process stops
+between the request-row commit and the outcome write — a hard crash, *or* a
+handler future aborted when shutdown draining exceeds its grace period. That
+window is exactly today's two-phase window (a mid-fetch abort already leaves an
+unpaired proxy request row), so the scan reports the same rare, real events; the
+guard neither widens nor narrows it, and reconciliation, not a fabricated row, is
+what resolves them. (Whether a graceful shutdown should also record a truthful
+*interrupted* outcome before aborting is a reconciliation refinement, not a change
+to this contract — noted in the deferred list below.)
 
 Why this shape:
 
@@ -394,8 +399,11 @@ pub(in crate::vm_http) enum EffectDecision {
 /// impl never holds — and therefore never silently drops — the guard.
 pub(in crate::vm_http) enum EffectCompletion<'a, T: EffectAuditTable> {
     /// Outcome known now: the driver calls `recorded.complete(&outcome)` and
-    /// returns `response`.
-    Buffered { outcome: T::OutcomeRow<'a>, response: VmHttpDispatch },
+    /// returns `response`. The field is `VmHttpResponse`, NOT `VmHttpDispatch`:
+    /// admitting a stream variant here would let the driver record the outcome
+    /// before the body drained (wrong byte/error data) and leave the stream
+    /// without guard ownership. A streaming outcome must go through `Streaming`.
+    Buffered { outcome: T::OutcomeRow<'a>, response: VmHttpResponse },
     /// Outcome known only when the body drains: the driver moves the guard into
     /// this pending stream. `PendingStream::into_response(guard)` is the ONLY
     /// consumer of the guard on this path and the ONLY constructor of the
@@ -465,7 +473,7 @@ pub(in crate::vm_http) async fn broker_effect<E: BrokeredEffect>(
     match effect.perform(authority, parsed, prepared).await {
         EffectCompletion::Buffered { outcome, response } => {
             if let Err(e) = recorded.complete(&outcome) { return audit_write_500(e); }
-            response
+            response.into()   // VmHttpResponse -> VmHttpDispatch::Buffered
         }
         // The ONLY consumer of `recorded` here, and the ONLY constructor of the
         // guard-owning body: the guard cannot escape un-attached, and completes
@@ -546,6 +554,14 @@ could slip unaudited. That is the step that turns "complete by discipline" into
 "complete by construction" at the routing boundary: audit is not optional for a
 `Brokered` entry, and a route is one kind or the other, never neither.
 
+The dispatcher resolves the entry from the target **before** authentication
+(today's `serve_vm_http_request` records proxy/nix-cache *auth-denial* pairs
+pre-auth). So the matched entry, not a separate branch, owns the audited-denial
+path: a missing/invalid credential is a denial recorded through that entry's
+table, keeping auth-failure audit inside the construction-safe path rather than in
+the bespoke pre-auth branches it replaces. (The exact denial-row builder the entry
+exposes is a Stage-4 contract detail — see the deferred list.)
+
 Within-crate sealing is a boundary-discipline lever, not an airtight compiler
 guarantee: the effect impls and `BrokerState` live in the same crate, so Rust
 visibility can't fully forbid an impl from importing the store. We raise the cost
@@ -576,6 +592,35 @@ the divergence. The trait keeps each effect's IO in its own file behind a unifor
 sequence, which is exactly what `proxy_common`'s accepted `ProxyBackend` already
 does. So: DU for the *decision*, sealed trait for the *effect*. (Chosen
 2026-07-18.)
+
+### 3.5 Settled at implementation, not here
+
+The sketches above pin the contract; a few specifics are deliberately left to the
+owning stage, because they are settled correctly only against that stage's real
+types and tests. They are recorded here so they are *tracked*, not forgotten — not
+because they are open design risks:
+
+- **Concurrent outcome-only uploads** (Stage 5, agent-runs). Two `/outcome`
+  uploads for one run, both arriving before an outcome exists, can each pass
+  `decide` and get a live guard from `resume_effect`. Only one outcome insert wins
+  (the `run_id` PK), so the loser 500s after doing filesystem work — a window the
+  *current* handler already has. The port must make `resume_effect` (or `decide`)
+  atomically **claim** the key so exactly one upload proceeds; the guard contract
+  is unchanged.
+- **Typed denial-row builder** (Stage 4). `record_denied::<E>` and the pre-auth
+  denial path need a way to build `Table::{Request,Outcome}Row` for a denial
+  without `Prepared` (denial precedes `prepare`). The effect contract grows a
+  small `denial_rows(request, reason, status) -> (RequestRow, OutcomeRow)` hook;
+  the proxies/nix already have exactly these columns (`record_*_local_response`).
+- **Interrupted-outcome on graceful shutdown** (reconciliation refinement). A
+  drain-timeout abort mid-effect leaves an unpaired row that the boot scan already
+  catches (§3.1). Optionally, the shutdown path could record a truthful
+  *interrupted* outcome before aborting, tightening the window further; it is
+  additive to the contract, not a change to it.
+
+None of these alters the guard, the driver's completion ownership, or the registry
+totality established above; each is a local decision the implementing stage makes
+against real code.
 
 ---
 
