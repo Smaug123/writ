@@ -94,13 +94,43 @@ pub trait EffectAuditTable: sealed::Sealed + 'static {
     fn outcome_key(row: &Self::OutcomeRow<'_>) -> Self::Key;
 }
 
+/// Opt-in marker for effect tables whose guard may be *abandoned* — discharged
+/// with no outcome, deliberately leaving a dangling request row for
+/// reconciliation (see [`RecordedRequest::abandon`]).
+///
+/// This is a deliberately narrow escape from the "complete or fail-fast"
+/// contract. Most effects can *always* express a truthful outcome (a proxy
+/// always has an HTTP status), so their pairing must stay airtight — and it does,
+/// because `abandon` is a **compile error** unless the table opts in here. Only a
+/// table whose effect can genuinely reach a state with no truthful outcome
+/// (git-push's staging-IO failure) implements this.
+///
+/// Sealed transitively: [`EffectAuditTable`] is sealed via its crate-private
+/// `sealed::Sealed` supertrait, so only this crate's own DAO markers can satisfy
+/// this bound, and no downstream type can widen the escape hatch.
+///
+/// A proxy guard cannot be abandoned — `ClaudeProxyAuditTable` does not implement
+/// `AbandonableEffect`, so the method does not exist for it (E0599):
+///
+/// ```compile_fail,E0599
+/// fn cannot_abandon_a_proxy(
+///     guard: writ_audit::RecordedRequest<writ_audit::ClaudeProxyAuditTable>,
+/// ) {
+///     guard.abandon();
+/// }
+/// ```
+pub trait AbandonableEffect: EffectAuditTable {}
+
 /// A request row that has been durably recorded and awaits its outcome.
 ///
-/// The only way to obtain one is [`AuditLog::begin_effect`]; the only way to
-/// discharge it is [`RecordedRequest::complete`]. Dropping it without completing
-/// is a bug (see the `Drop` impl) — "an effect performed without its outcome
-/// row", the exact thing this design exists to make unrepresentable.
-#[must_use = "a begun effect must be completed with an outcome row, or it is unaudited"]
+/// The only way to obtain one is [`AuditLog::begin_effect`]. It is discharged
+/// with [`RecordedRequest::complete`] (records the paired outcome — the ordinary
+/// path) or, for the narrow case where no *truthful* outcome exists,
+/// [`RecordedRequest::abandon`] (deliberately leaves the row dangling for
+/// reconciliation). Dropping it without discharging is a bug (see the `Drop`
+/// impl) — "an effect performed without its outcome row", the exact thing this
+/// design exists to make unrepresentable.
+#[must_use = "a begun effect must be completed (or explicitly abandoned), or it is unaudited"]
 pub struct RecordedRequest<T: EffectAuditTable> {
     audit: Arc<AuditLog>,
     key: T::Key,
@@ -142,6 +172,35 @@ impl<T: EffectAuditTable> RecordedRequest<T> {
             ));
         }
         self.audit.record_effect_outcome::<T>(outcome)
+    }
+}
+
+impl<T: AbandonableEffect> RecordedRequest<T> {
+    /// Discharge the guard *without* recording an outcome, deliberately leaving
+    /// the request row dangling for reconciliation.
+    ///
+    /// Gated on [`AbandonableEffect`], so it is a *compile error* for any effect
+    /// that has not explicitly opted in — the proxies (which always have an HTTP
+    /// status to record) cannot reach this, keeping their pairing airtight.
+    ///
+    /// This is the narrow escape hatch for an effect that performed IO but cannot
+    /// express a *truthful* outcome — e.g. git-push's staging-IO failure, where no
+    /// `GitPushOutcomeResult` variant honestly describes "the host errored
+    /// mid-stage". Fabricating an outcome would corrupt the log worse than a
+    /// missing one (the same reasoning as the [`Drop`](Self::drop) backstop and
+    /// the coalesced writer), so the dangling row is left instead — to be flagged
+    /// by the boot-time unpaired-row scan
+    /// ([`AuditLog::scan_unpaired_effect_rows`]) and resolved by the table's own
+    /// recovery (or an operator).
+    ///
+    /// Marking the guard discharged is what distinguishes a *deliberate* dangling
+    /// row from the `Drop` backstop's *accidental* one: `abandon` asserts the
+    /// caller meant to leave no outcome, so it does not fail-fast. Prefer
+    /// [`complete`](Self::complete) wherever a truthful outcome exists — a handler
+    /// that abandons a path it could have completed leaves a spurious dangling row,
+    /// which the Stage-0 audit-pair oracle catches in tests.
+    pub fn abandon(mut self) {
+        self.discharged = true;
     }
 }
 
@@ -326,6 +385,10 @@ mod tests {
             row.key
         }
     }
+
+    // The scratch table opts into abandonment so the `abandon` test below can
+    // exercise the gated method; the real production opt-in is git-push.
+    impl AbandonableEffect for ScratchTable {}
 
     fn install_scratch_tables(log: &AuditLog) {
         log.with_conn_mut(|c| {
@@ -516,6 +579,45 @@ CREATE TABLE scratch_outcome (
             dump_request(&log).len(),
             1,
             "no request row for closed session"
+        );
+    }
+
+    // `abandon` is the deliberate counterpart to the panicking bare drop below: it
+    // discharges the guard *without* an outcome (no panic, no fabricated row),
+    // leaving the request row dangling for the boot-time scan to flag. This must
+    // hold in debug *and* release — abandoning is intentional, never a bug.
+    #[test]
+    fn abandon_leaves_the_request_dangling_without_an_outcome_or_panic() {
+        let (log, s) = open_log();
+        let key = RequestId::new();
+        let guard = log
+            .begin_effect::<ScratchTable>(&ScratchRequest {
+                key,
+                session_id: s.session_id,
+                note: "hello".into(),
+            })
+            .unwrap();
+        assert_eq!(dump_request(&log).len(), 1);
+
+        // Discharge with no outcome. Unlike the bare drop below this must NOT
+        // panic (even with debug assertions on): the caller asserts the dangling
+        // row is intentional.
+        guard.abandon();
+
+        assert_eq!(
+            dump_request(&log).len(),
+            1,
+            "the request row is left in place"
+        );
+        assert!(
+            dump_outcome(&log).is_empty(),
+            "abandon writes no outcome row"
+        );
+        // The dangling row is exactly what the boot-time unpaired-row scan flags.
+        assert_eq!(
+            log.count_unpaired_effect_request_rows("scratch_request", "scratch_outcome", "key")
+                .unwrap(),
+            1,
         );
     }
 
