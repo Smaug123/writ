@@ -737,6 +737,14 @@ mod tests {
             upstream_request.ends_with(r#"{"model":"test"}"#),
             "{upstream_request}"
         );
+
+        // Stage-0 audit-pair oracle (writ-audit::effect_audit_oracle): a proxied
+        // request must leave a complete (request, outcome) pair.
+        state.audit.assert_effect_audit_pairs_complete(
+            "claude_proxy_request",
+            "claude_proxy_outcome",
+            "request_id",
+        );
     }
 
     #[tokio::test]

@@ -58,6 +58,14 @@ async fn nix_cache_info_route_proxies_bounded_upstream_metadata() {
             .unwrap()
             .ends_with("/cache/nix-cache-info")
     );
+
+    // Stage-0 audit-pair oracle (writ-audit::effect_audit_oracle): the coalesced
+    // single-commit serve still records a complete (request, outcome) pair.
+    state.audit.assert_effect_audit_pairs_complete(
+        "nix_cache_request",
+        "nix_cache_outcome",
+        "request_id",
+    );
 }
 
 #[tokio::test]
