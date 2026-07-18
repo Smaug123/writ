@@ -369,6 +369,16 @@ single file exceeds what one reading can hold.
   `pub(super)`; the rest stayed private. All the `pub` methods resolve by type,
   so no call-site changes. (Lesson: for a big impl, scan both inline tests *and*
   sibling test-submodule files for private-method calls before moving.)
+- **`vm_http/mod.rs` (2832 → 1677):** the HTTP dispatch core is a coherent
+  concern (listener/session/auth/routing/framing), so the length was again a
+  ~1.15k-line inline `#[cfg(test)] mod tests`. Relocated to `vm_http/tests.rs`.
+  Two things that could have bitten but did not: the module's
+  `include_str!("../../tests/fixtures/…")` needed *no* fixup because `mod.rs` and
+  `tests.rs` are siblings in the same directory (unlike the `git_push_approve`
+  file-module case); and the `#[cfg(test)]` dispatch helpers the tests call
+  (`dispatch_vm_http_head`, `DispatchedTestResponse`) stay in `mod.rs` and remain
+  reachable from the child `tests` module via `super`. The 30 tests run
+  unchanged.
 
 Rule of thumb learned from the config split: extract the chunks with no
 `#[serde(default = "…")]` coupling first — moving a struct away from its default
