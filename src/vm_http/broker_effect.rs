@@ -63,6 +63,27 @@ pub(in crate::vm_http) trait BrokeredEffect: Sized {
 
     /// Borrow an outcome row out of an owned outcome payload.
     fn outcome_row(outcome: &Self::Outcome) -> <Self::Table as EffectAuditTable>::OutcomeRow<'_>;
+
+    /// Map a `begin_effect` failure to a domain client response, or `None` to
+    /// fall back to the generic audit-write 500. An *expected* begin failure — a
+    /// closed or unknown session — is a clean client error, not an audit-write
+    /// failure, so an effect can return its own status/body (git-push maps these
+    /// to `410 Gone` / `401 Unauthorized`) and suppress the spurious
+    /// `AUDIT_WRITE_FAILURE`. Defaulted to `None`: the proxies keep the generic
+    /// 500 for every begin failure.
+    fn begin_error_response(_err: &AuditError) -> Option<VmHttpResponse> {
+        None
+    }
+
+    /// The 500 body returned when an audit write genuinely fails (a `begin_effect`
+    /// error the effect did not map, or a `complete` failure). Defaulted to a
+    /// plain-text body; an effect whose endpoint promises a typed error envelope
+    /// overrides this so the contract holds even in the audit-fault mode (git-push
+    /// returns its JSON `VmGitPushErrorResponse`). Logging stays centralized in
+    /// [`audit_write_500`].
+    fn audit_write_failure_response() -> VmHttpResponse {
+        VmHttpResponse::text(VmHttpStatus::InternalServerError, "audit write failed")
+    }
 }
 
 /// What [`BrokeredEffect::perform`] returns.
@@ -77,13 +98,23 @@ pub(in crate::vm_http) enum EffectCompletion<E: BrokeredEffect> {
     /// ownership of the guard and threads it into the streaming body, which
     /// completes the pair on drop. It is the ONLY consumer of the guard on this
     /// path, so the guard cannot escape unrecorded.
-    Streaming(StreamCompletion<E::Table>),
+    Streaming(GuardDischarge<E::Table>),
+    /// The effect performed IO but has *no truthful outcome* to record — git-push's
+    /// staging-IO failure, where no `GitPushOutcomeResult` honestly describes "the
+    /// host errored mid-stage". The closure [`abandons`](crate::audit::RecordedRequest::abandon)
+    /// the guard (discharging it *without* an outcome, so the Drop backstop stays
+    /// silent) and returns `response`, deliberately leaving the request row
+    /// dangling for the boot sweep. The `abandon` call inside the closure requires
+    /// `E::Table: AbandonableEffect`, so only opted-in effects can build this.
+    Abandoned(GuardDischarge<E::Table>),
 }
 
-/// The guard-consuming builder carried by [`EffectCompletion::Streaming`]: given
-/// the live guard, it produces the guest-facing dispatch with the guard threaded
-/// into the stream body.
-pub(in crate::vm_http) type StreamCompletion<T> =
+/// A guard-consuming completion: given the live guard, it discharges the guard
+/// (by threading it into a streaming body, or by abandoning it) and returns the
+/// guest-facing dispatch. Erasing this as a closure is what lets an effect encode
+/// a discharge whose type bound (`AbandonableEffect` for abandon) the generic
+/// driver need not carry — the bound is resolved where the closure is built.
+pub(in crate::vm_http) type GuardDischarge<T> =
     Box<dyn FnOnce(RecordedRequest<T>) -> VmHttpDispatch + Send>;
 
 /// Drive a brokered effect: begin the request row, run the effect, complete the
@@ -97,22 +128,56 @@ pub(in crate::vm_http) async fn broker_effect<E: BrokeredEffect>(
     let request_id = effect.request_id();
     let recorded = match audit.begin_effect::<E::Table>(&effect.request_row()) {
         Ok(recorded) => recorded,
-        Err(err) => return audit_write_500(E::REQUEST_AUDIT_KIND, request_id, err),
+        // An *expected* begin failure (a closed or unknown session) is a domain
+        // client error the effect maps itself; anything else is an audit-write
+        // 500 with the failure logged.
+        Err(err) => {
+            return match E::begin_error_response(&err) {
+                Some(response) => response.into(),
+                None => audit_write_500(
+                    E::REQUEST_AUDIT_KIND,
+                    request_id,
+                    err,
+                    E::audit_write_failure_response(),
+                ),
+            };
+        }
     };
+    // Durable boundary: the request row is committed. A crash from here — through
+    // the effect and its outcome write — leaves a dangling request row the boot
+    // sweep reconciles. (Inert in production; only a test `CrashPlan` acts on it.)
+    crate::crash_point::point("broker_effect::request_recorded").await;
     match effect.perform().await {
         EffectCompletion::Buffered { outcome, response } => {
             if let Err(err) = recorded.complete(&E::outcome_row(&outcome)) {
-                return audit_write_500(E::OUTCOME_AUDIT_KIND, request_id, err);
+                return audit_write_500(
+                    E::OUTCOME_AUDIT_KIND,
+                    request_id,
+                    err,
+                    E::audit_write_failure_response(),
+                );
             }
+            // Durable boundary: the outcome row is committed; the pair is complete.
+            crate::crash_point::point("broker_effect::outcome_recorded").await;
             response.into()
         }
-        EffectCompletion::Streaming(complete) => complete(recorded),
+        // Both discharge the guard (into the stream body, or by abandoning it) and
+        // return the dispatch — the guard never escapes the driver un-discharged.
+        EffectCompletion::Streaming(discharge) | EffectCompletion::Abandoned(discharge) => {
+            discharge(recorded)
+        }
     }
 }
 
-/// Emit the [`AUDIT_WRITE_FAILURE_TARGET`] event and return a 500. Fail-closed:
-/// an audit-write failure never lets the guest-facing effect succeed silently.
-fn audit_write_500(kind: &'static str, request_id: RequestId, err: AuditError) -> VmHttpDispatch {
+/// Emit the [`AUDIT_WRITE_FAILURE_TARGET`] event (centralized) and return the
+/// effect's audit-failure `response`. Fail-closed: an audit-write failure never
+/// lets the guest-facing effect succeed silently.
+fn audit_write_500(
+    kind: &'static str,
+    request_id: RequestId,
+    err: AuditError,
+    response: VmHttpResponse,
+) -> VmHttpDispatch {
     tracing::error!(
         target: AUDIT_WRITE_FAILURE_TARGET,
         kind,
@@ -120,5 +185,5 @@ fn audit_write_500(kind: &'static str, request_id: RequestId, err: AuditError) -
         error = %err,
         "audit write failed",
     );
-    VmHttpResponse::text(VmHttpStatus::InternalServerError, "audit write failed").into()
+    response.into()
 }

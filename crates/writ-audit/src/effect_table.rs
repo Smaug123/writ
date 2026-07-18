@@ -204,20 +204,91 @@ impl<T: AbandonableEffect> RecordedRequest<T> {
     }
 }
 
+/// The modeled-*interruption* sink for the [`RecordedRequest`] `Drop` backstop.
+///
+/// An undischarged guard drop has two causes that are indistinguishable at the
+/// `Drop` site: a *bug* (a handler forgot to `complete`/`abandon` on a normal
+/// path), or an *interruption* (the handler future was aborted mid-effect — a
+/// crash, or a shutdown-drain abort). The interruption is a legitimate outcome
+/// (the request row is left dangling for the boot scan), not a bug — but it was
+/// never expressed, so the backstop conflated the two.
+///
+/// This models it: inside an [`expect_guard_interruptions`] scope, an
+/// undischarged drop records its table label here — the observable interruption —
+/// and the backstop stays silent. Outside such a scope it is a bug and still
+/// fails fast. Crash-injection harnesses (and any future shutdown-drain path)
+/// activate the scope while aborting a mid-effect future; everything else keeps
+/// the airtight "complete or fail-fast" contract.
+#[cfg(any(test, feature = "test-support"))]
+mod interruption {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static SINK: RefCell<Option<Vec<&'static str>>> = const { RefCell::new(None) };
+    }
+
+    /// Record an interruption for `label` if a scope is active; returns whether
+    /// one was (the backstop stays silent iff `true`).
+    pub(super) fn note(label: &'static str) -> bool {
+        SINK.with(|cell| match cell.borrow_mut().as_mut() {
+            Some(sink) => {
+                sink.push(label);
+                true
+            }
+            None => false,
+        })
+    }
+
+    /// Run `f` with guard-interruption recording active, returning `f`'s result
+    /// and the table labels of every guard dropped undischarged during it. Scopes
+    /// must not nest. The sink is cleared on exit even if `f` panics, so a later
+    /// bug-drop is never silently absorbed.
+    pub fn expect_guard_interruptions<R>(f: impl FnOnce() -> R) -> (R, Vec<&'static str>) {
+        struct ClearOnExit;
+        impl Drop for ClearOnExit {
+            fn drop(&mut self) {
+                SINK.with(|cell| *cell.borrow_mut() = None);
+            }
+        }
+
+        SINK.with(|cell| {
+            assert!(
+                cell.borrow().is_none(),
+                "guard-interruption scopes must not nest",
+            );
+            *cell.borrow_mut() = Some(Vec::new());
+        });
+        let _clear = ClearOnExit;
+        let result = f();
+        let recorded = SINK.with(|cell| cell.borrow_mut().take().unwrap_or_default());
+        (result, recorded)
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub use interruption::expect_guard_interruptions;
+
 impl<T: EffectAuditTable> Drop for RecordedRequest<T> {
     fn drop(&mut self) {
         if self.discharged {
             return;
         }
-        // A guard dropped without discharge is a bug: whoever holds it is meant to
-        // complete it on every path. We do NOT fabricate an outcome row — no table
-        // can always express a *truthful* "incomplete" outcome, and a fabricated
-        // row would corrupt the log worse than a missing one. A genuine dangling
-        // request is caught durably by the boot-time unpaired-row scan; here we
-        // just fail fast in tests — but never while already unwinding, or the
-        // second panic would abort the process and bury the original diagnostic.
-        // (This crate has no `tracing` dependency by design — the shell that owns
-        // completion, and emits `AUDIT_WRITE_FAILURE_TARGET`, is the `writ` crate.)
+        // An undischarged guard is a *bug* (a handler forgot to complete/abandon)
+        // or an *interruption* (the future was aborted mid-effect). Under an
+        // `expect_guard_interruptions` scope the interruption is modeled — recorded
+        // there — and the request row is left dangling for the boot-time
+        // unpaired-row scan; we do NOT fabricate an outcome (no table can always
+        // express a truthful "incomplete" one, and a fabricated row corrupts the
+        // log worse than a missing one).
+        #[cfg(any(test, feature = "test-support"))]
+        if interruption::note(T::LABEL) {
+            return;
+        }
+        // Otherwise it is a bug: fail fast in tests — but never while already
+        // unwinding, or the second panic would abort the process and bury the
+        // original diagnostic. (This crate has no `tracing` dependency by design —
+        // the shell that owns completion, and emits `AUDIT_WRITE_FAILURE_TARGET`,
+        // is the `writ` crate.)
         if !std::thread::panicking() {
             debug_assert!(
                 false,

@@ -12,6 +12,10 @@ use writ_vm_git::{GitBranchName, GitCloneRepo, GitObjectId};
 /// out to keep `git_push.rs` readable.
 mod dao;
 
+/// The base `(request, outcome)` [`EffectAuditTable`](crate::EffectAuditTable)
+/// marker, re-exported so the VM-HTTP `broker_effect` driver can name it.
+pub use dao::GitPushAuditTable;
+
 #[derive(Debug)]
 pub struct GitPushRequestRecord {
     pub push_request_id: RequestId,

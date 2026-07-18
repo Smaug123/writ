@@ -169,8 +169,16 @@ mod test_impl {
         /// future ran to completion.
         Completed(T),
         /// The future was parked at the named point and dropped —
-        /// everything after that point never ran.
-        Crashed { index: usize, name: &'static str },
+        /// everything after that point never ran. `interrupted` names any
+        /// audit-guard tables whose `RecordedRequest` was dropped undischarged
+        /// by the abort — the *modeled interruption*, recorded rather than
+        /// tripping the guard's bug backstop (see
+        /// [`writ_audit::expect_guard_interruptions`]).
+        Crashed {
+            index: usize,
+            name: &'static str,
+            interrupted: Vec<&'static str>,
+        },
     }
 
     impl<T> CrashOutcome<T> {
@@ -178,7 +186,7 @@ mod test_impl {
         pub(crate) fn expect_completed(self, msg: &str) -> T {
             match self {
                 Self::Completed(v) => v,
-                Self::Crashed { index, name } => {
+                Self::Crashed { index, name, .. } => {
                     panic!("{msg}: crashed at point {index} ({name})")
                 }
             }
@@ -191,7 +199,18 @@ mod test_impl {
         {
             match self {
                 Self::Completed(v) => panic!("{msg}: completed with {v:?}"),
-                Self::Crashed { index, name } => (index, name),
+                Self::Crashed { index, name, .. } => (index, name),
+            }
+        }
+
+        /// The tables whose guard was interrupted (dropped undischarged) by the
+        /// abort. Empty on [`Completed`](Self::Completed) or a crash that held no
+        /// live guard.
+        #[cfg(test)]
+        pub(crate) fn interrupted_guards(&self) -> &[&'static str] {
+            match self {
+                Self::Completed(_) => &[],
+                Self::Crashed { interrupted, .. } => interrupted,
             }
         }
     }
@@ -242,19 +261,25 @@ mod test_impl {
         plan: &Arc<CrashPlan>,
         fut: impl Future<Output = T>,
     ) -> CrashOutcome<T> {
-        let scoped = CRASH_PLAN.scope(Arc::clone(plan), fut);
-        tokio::pin!(scoped);
+        // Box-pin (not stack-pin) so the parked future can be dropped *explicitly*
+        // inside the interruption scope below.
+        let mut scoped = Box::pin(CRASH_PLAN.scope(Arc::clone(plan), fut));
         tokio::select! {
-            out = &mut scoped => CrashOutcome::Completed(out),
+            out = scoped.as_mut() => CrashOutcome::Completed(out),
             _ = plan.parked.notified() => {
                 let (index, name) = plan
                     .crashed_at
                     .lock()
                     .expect("crash plan crashed_at poisoned")
                     .expect("parked notification without a recorded crash point");
-                // `scoped` is dropped when this function returns: the
-                // instrumented future is abandoned mid-await.
-                CrashOutcome::Crashed { index, name }
+                // Drop the parked future — the crash abandons everything downstream
+                // of the point. If it holds a live audit guard, model that
+                // undischarged drop as an *interruption* (recorded, not the guard's
+                // bug backstop): the abort is a legitimate crash, not a forgotten
+                // discharge.
+                let ((), interrupted) =
+                    crate::audit::expect_guard_interruptions(move || drop(scoped));
+                CrashOutcome::Crashed { index, name, interrupted }
             }
         }
     }

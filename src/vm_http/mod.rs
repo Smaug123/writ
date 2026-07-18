@@ -1391,9 +1391,7 @@ where
         let Some(service) = services.git_push else {
             return VmHttpResponse::text(VmHttpStatus::NotFound, "not found").into();
         };
-        return route_git_push_request(session, request, body, service)
-            .await
-            .into();
+        return route_git_push_request(session, request, body, service).await;
     }
 
     if is_flake_provision_target(&request.target) {

@@ -56,6 +56,10 @@ pub use claude_proxy::{
     ClaudeProxyOutcomeRecord, ClaudeProxyRequestRecord,
 };
 pub use effect_scan::{EFFECT_AUDIT_PAIRS, EffectAuditPair, UnpairedEffectRows};
+/// Test-support only: model a mid-effect abort so a crash-injection harness can
+/// reinterpret an undischarged guard drop as an interruption instead of a bug.
+#[cfg(any(test, feature = "test-support"))]
+pub use effect_table::expect_guard_interruptions;
 pub use effect_table::{AbandonableEffect, EffectAuditTable, RecordedRequest};
 pub use flake_provision::{
     FlakeProvisionAuditEntry, FlakeProvisionAuditOutcome, FlakeProvisionOutcomeRecord,
@@ -63,9 +67,9 @@ pub use flake_provision::{
 };
 pub use git_push::{
     GitPushApproveAttemptEntry, GitPushApproveAttemptOutcome, GitPushApproveAttemptState,
-    GitPushAuditEntry, GitPushOutcomeRecord, GitPushOutcomeResult, GitPushRequestRecord,
-    GitPushResolution, GitPushResolutionEntry, GitPushResolutionRecord, PromoteMintAudit,
-    ReconciliationTarget, RejectBlocker, UncertainAttempt,
+    GitPushAuditEntry, GitPushAuditTable, GitPushOutcomeRecord, GitPushOutcomeResult,
+    GitPushRequestRecord, GitPushResolution, GitPushResolutionEntry, GitPushResolutionRecord,
+    PromoteMintAudit, ReconciliationTarget, RejectBlocker, UncertainAttempt,
 };
 pub use grant::{MintFailureRecord, PreMintRecord};
 pub use nix_cache::{
