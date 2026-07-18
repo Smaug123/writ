@@ -8,6 +8,117 @@
 //! `git_push` module and are reached via `super`. Behaviour is unchanged.
 
 use super::*;
+use rusqlite::Connection;
+
+/// Insert one git-push request row into this connection/transaction. Assumes
+/// `check_session_open` ran. The base pair carries no field validation of its
+/// own (the request fields are already parsed newtypes — `GitCloneRepo`,
+/// `GitBranchName`, `GitObjectId`, `CorrelationId`), so there is nothing to
+/// hoist into a separate pre-tx `validate` step.
+fn insert_git_push_request_row(
+    conn: &Connection,
+    r: &GitPushRequestRecord,
+) -> Result<(), AuditError> {
+    conn.execute(
+        "INSERT INTO git_push_request (
+             push_request_id,
+             session_id,
+             received_at,
+             repo,
+             branch,
+             expected_remote_head,
+             new_head,
+             correlation_id
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            r.push_request_id.as_uuid().to_string(),
+            r.session_id.as_uuid().to_string(),
+            r.received_at.as_millis(),
+            r.repo.to_string(),
+            r.branch.as_str(),
+            r.expected_remote_head.as_ref().map(GitObjectId::as_str),
+            r.new_head.as_str(),
+            r.correlation_id.as_ref().map(CorrelationId::as_str),
+        ],
+    )?;
+    Ok(())
+}
+
+/// Validate and insert one git-push outcome row into this connection/transaction.
+/// The message/status checks are the outcome's only validation, so — as with the
+/// request — there is no separate pre-tx `validate` step.
+fn insert_git_push_outcome_row(
+    conn: &Connection,
+    r: &GitPushOutcomeRecord<'_>,
+) -> Result<(), AuditError> {
+    if r.message.is_empty() {
+        return Err(AuditError::Invariant(
+            "git push outcome message must not be empty",
+        ));
+    }
+    if let Some(status) = r.github_status
+        && !(100..=599).contains(&status)
+    {
+        return Err(AuditError::Invariant(
+            "git push outcome GitHub status must be 100..599",
+        ));
+    }
+    conn.execute(
+        "INSERT INTO git_push_outcome (
+             push_request_id,
+             completed_at,
+             result,
+             github_status,
+             message
+         ) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            r.push_request_id.as_uuid().to_string(),
+            r.completed_at.as_millis(),
+            r.result.as_str(),
+            r.github_status.map(i64::from),
+            r.message,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Marker selecting the git-push *base* `(request, outcome)` pair for the generic
+/// [`EffectAuditTable`](crate::effect_table::EffectAuditTable) guard. Zero-sized;
+/// named only as a type argument. Scope is the base staging pair **only** — the
+/// approval / reconciliation / mint ledger tables in this DAO are a different
+/// shape and are deliberately out of scope (see the plan's §7). The VM-HTTP
+/// driver stage consumes this marker; until then the direct writers below remain
+/// the production path and the guard impl is exercised only by the equivalence
+/// proptest in `request_outcome_tests`.
+pub(crate) struct GitPushAuditTable;
+
+impl crate::effect_table::sealed::Sealed for GitPushAuditTable {}
+impl crate::effect_table::EffectAuditTable for GitPushAuditTable {
+    // `GitPushRequestRecord` owns its fields, so the request row carries no
+    // borrow; only the outcome row borrows (`message: &'a str`).
+    type RequestRow<'a> = GitPushRequestRecord;
+    type OutcomeRow<'a> = GitPushOutcomeRecord<'a>;
+    type Key = RequestId;
+    const REQUEST_TABLE: &'static str = "git_push_request";
+    const OUTCOME_TABLE: &'static str = "git_push_outcome";
+    const LABEL: &'static str = "Git push";
+
+    fn insert_request(conn: &Connection, row: &Self::RequestRow<'_>) -> Result<(), AuditError> {
+        insert_git_push_request_row(conn, row)
+    }
+    fn insert_outcome(conn: &Connection, row: &Self::OutcomeRow<'_>) -> Result<(), AuditError> {
+        insert_git_push_outcome_row(conn, row)
+    }
+    fn session_id(row: &Self::RequestRow<'_>) -> SessionId {
+        row.session_id
+    }
+    fn request_key(row: &Self::RequestRow<'_>) -> RequestId {
+        row.push_request_id
+    }
+    fn outcome_key(row: &Self::OutcomeRow<'_>) -> RequestId {
+        row.push_request_id
+    }
+}
 
 impl AuditLog {
     /// Persist a parsed VM Git push request before any credential mint,
@@ -16,29 +127,7 @@ impl AuditLog {
         self.with_conn_mut(|c| {
             let tx = c.transaction()?;
             crate::validation::check_session_open(&tx, r.session_id)?;
-
-            tx.execute(
-                "INSERT INTO git_push_request (
-                     push_request_id,
-                     session_id,
-                     received_at,
-                     repo,
-                     branch,
-                     expected_remote_head,
-                     new_head,
-                     correlation_id
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                params![
-                    r.push_request_id.as_uuid().to_string(),
-                    r.session_id.as_uuid().to_string(),
-                    r.received_at.as_millis(),
-                    r.repo.to_string(),
-                    r.branch.as_str(),
-                    r.expected_remote_head.as_ref().map(GitObjectId::as_str),
-                    r.new_head.as_str(),
-                    r.correlation_id.as_ref().map(CorrelationId::as_str),
-                ],
-            )?;
+            insert_git_push_request_row(&tx, r)?;
             tx.commit()?;
             Ok(())
         })
@@ -51,38 +140,7 @@ impl AuditLog {
     /// the post-promote terminal states are recorded against
     /// `git_push_approve_attempt` instead.
     pub fn record_git_push_outcome(&self, r: &GitPushOutcomeRecord<'_>) -> Result<(), AuditError> {
-        if r.message.is_empty() {
-            return Err(AuditError::Invariant(
-                "git push outcome message must not be empty",
-            ));
-        }
-        if let Some(status) = r.github_status
-            && !(100..=599).contains(&status)
-        {
-            return Err(AuditError::Invariant(
-                "git push outcome GitHub status must be 100..599",
-            ));
-        }
-
-        self.with_conn_mut(|c| {
-            c.execute(
-                "INSERT INTO git_push_outcome (
-                     push_request_id,
-                     completed_at,
-                     result,
-                     github_status,
-                     message
-                 ) VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![
-                    r.push_request_id.as_uuid().to_string(),
-                    r.completed_at.as_millis(),
-                    r.result.as_str(),
-                    r.github_status.map(i64::from),
-                    r.message,
-                ],
-            )?;
-            Ok(())
-        })
+        self.with_conn_mut(|c| insert_git_push_outcome_row(c, r))
     }
 
     /// Persist an operator decision on a staged push. The v13 schema's
