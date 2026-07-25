@@ -43,6 +43,8 @@ pub(crate) mod crash_point;
 pub(crate) mod fake_github;
 #[cfg(all(test, feature = "host"))]
 pub(crate) mod fake_origin;
+#[cfg(all(test, feature = "host"))]
+pub(crate) mod flake_fixtures;
 #[cfg(feature = "host")]
 pub mod flake_lock;
 #[cfg(feature = "host")]

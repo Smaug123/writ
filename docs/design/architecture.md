@@ -424,7 +424,10 @@ now named apart (they were both `nix_cache` until backlog Slice 2):
 **Primitives.** Proxy: `ProxyRequestFields`, `ProxyFetch`, `UpstreamAuth`
 (`proxy_common.rs`). Flake: `FlakeLock`/`FlakeProvisionPlan`
 (`flake_lock.rs:49,95`), `MaterializedFlake` (`flake_materialize.rs:46`),
-`FlakeProvisionReport` (`flake_provision.rs:76`). Nix cache: `NixNarInfo`,
+`AdmittedFlakeProvision`/`PerformedFlakeProvision`/`FlakeProvisionReport`
+(`flake_provision.rs`) — the admit/run split that lets the shell record the
+attempt between pre-flight and egress; the flake modules write no audit rows
+themselves. Nix cache: `NixNarInfo`,
 `NixTrustedPublicKeys` (`nix_binary_cache.rs:50,68`), route enum `VmNixCacheRoute`
 (`vm_http/nix_cache/route.rs:28`).
 
@@ -434,6 +437,21 @@ before relay; flake provision re-derives the checkout from the broker's own
 retained mirror and re-authorises the repo against this session's grants
 (`vm_http/flake_provision.rs:120`). Model credentials are injected host-side
 only: guest auth is stripped and the host key attached from the secret store.
+
+**The brokered-effect driver.** An effect's `(request, outcome)` audit pair is
+written by `vm_http/broker_effect.rs`, not by the handler: an effect declares
+`BrokeredEffect` (which `EffectAuditTable`, how to build the request row, how to
+`perform`), and the *driver* holds the `#[must_use]` `RecordedRequest` guard
+across the effect and discharges it — `complete` with a truthful outcome,
+`abandon` where no outcome is truthful (git-push staging IO only), or into a
+streaming body that completes on drop. Ported so far: both model proxies,
+git-push staging, and flake provisioning. Each handler keeps a
+*reject-before-begin* phase for everything that answers without attempting an
+effect (a malformed body, a closed session, a flake cache miss or a lock the
+classifier refuses), so those record nothing. The remaining effects —
+agent-run outcomes (whose request row is minted at run launch) and the
+authority-free nix-cache serve (already atomically paired via
+`record_effect_coalesced`) — are ported with the route registry.
 
 **Invariants.** Proxy clients refuse redirects
 (`reqwest::redirect::Policy::none()`, `proxy_common.rs:708`) so a `Location`

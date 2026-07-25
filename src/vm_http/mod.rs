@@ -1398,9 +1398,7 @@ where
         let Some(service) = services.flake_provision else {
             return VmHttpResponse::text(VmHttpStatus::NotFound, "not found").into();
         };
-        return route_flake_provision_request(session, request, body, service)
-            .await
-            .into();
+        return route_flake_provision_request(session, request, body, service).await;
     }
 
     if let Some(run_id) = parse_agent_run_config_target(&request.target) {
