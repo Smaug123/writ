@@ -1502,7 +1502,7 @@ impl VmHttpRequest {
                 .headers
                 .get_all(VM_HTTP_CONTRACT_HEADER)
                 .into_iter()
-                .filter_map(|value| std::str::from_utf8(value.as_bytes()).ok()),
+                .map(http::HeaderValue::as_bytes),
         );
 
         let headers = parts

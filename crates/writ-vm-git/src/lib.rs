@@ -150,7 +150,13 @@ impl GuestContract {
     /// Parse the header's values. More than one is [`Malformed`](Self::Malformed)
     /// rather than first-wins: a request carrying two contradictory declarations
     /// is not one the broker should have to pick a winner for.
-    pub fn parse<'a>(values: impl IntoIterator<Item = &'a str>) -> Self {
+    ///
+    /// Takes **bytes**, not `&str`, and decides for itself whether each
+    /// occurrence decodes. A header value is opaque octets, so a caller that
+    /// filtered undecodable ones out first would hand this a valid declaration
+    /// plus nothing where the guest in fact sent two — and the duplicate would
+    /// go unnoticed. The judgement of what is well-formed belongs in one place.
+    pub fn parse<'a>(values: impl IntoIterator<Item = &'a [u8]>) -> Self {
         let mut values = values.into_iter();
         let Some(first) = values.next() else {
             return Self::Absent;
@@ -158,9 +164,9 @@ impl GuestContract {
         if values.next().is_some() {
             return Self::Malformed;
         }
-        match first.trim().parse::<u32>() {
-            Ok(version) => Self::Version(version),
-            Err(_) => Self::Malformed,
+        match std::str::from_utf8(first).map(|value| value.trim().parse::<u32>()) {
+            Ok(Ok(version)) => Self::Version(version),
+            Ok(Err(_)) | Err(_) => Self::Malformed,
         }
     }
 }

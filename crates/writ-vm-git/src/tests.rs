@@ -801,3 +801,49 @@ fn nix_develop_warm_substitutes_first_but_permits_bounded_local_build() {
         .expect("max-jobs is an integer");
     assert!(max_jobs > 0, "max-jobs must be non-zero, got {max_jobs}");
 }
+
+/// Every way a guest can fail to declare a version it speaks, and the one way
+/// it can succeed.
+///
+/// Duplicates are [`GuestContract::Malformed`] rather than first-wins: a request
+/// carrying two contradictory declarations is not one the broker should pick a
+/// winner for. That is only true if *undecodable* occurrences are counted too —
+/// dropping them before counting would let a valid header plus a junk one look
+/// like a single valid declaration, which is why `parse` takes bytes and decides
+/// for itself rather than being handed pre-filtered strings.
+#[test]
+fn a_contract_declaration_is_well_formed_only_when_it_is_a_single_version() {
+    use crate::GuestContract;
+
+    assert_eq!(
+        GuestContract::parse(Vec::<&[u8]>::new()),
+        GuestContract::Absent
+    );
+    assert_eq!(
+        GuestContract::parse([b"3".as_slice()]),
+        GuestContract::Version(3)
+    );
+    assert_eq!(
+        GuestContract::parse([b" 3 ".as_slice()]),
+        GuestContract::Version(3),
+    );
+    assert_eq!(
+        GuestContract::parse([b"not-a-version".as_slice()]),
+        GuestContract::Malformed,
+    );
+    // A header value is opaque octets, so this is a request a guest can really
+    // send; it must not decode to "no declaration".
+    assert_eq!(
+        GuestContract::parse([&[0xff, 0xfe][..]]),
+        GuestContract::Malformed,
+    );
+    assert_eq!(
+        GuestContract::parse([b"3".as_slice(), b"4".as_slice()]),
+        GuestContract::Malformed,
+    );
+    assert_eq!(
+        GuestContract::parse([b"3".as_slice(), &[0xff][..]]),
+        GuestContract::Malformed,
+        "an undecodable second occurrence must not be dropped, leaving one valid declaration",
+    );
+}

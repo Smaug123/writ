@@ -918,6 +918,47 @@ async fn authorization_runs_before_the_contract_check() {
     assert_eq!(response.status, VmHttpStatus::Unauthorized);
 }
 
+/// **Two declarations are no declaration.** A request carrying the right version
+/// *and* a second occurrence is refused, whether or not that second occurrence
+/// is even text — a header value is opaque octets, so filtering the undecodable
+/// ones out before counting would let a valid header plus junk pass as a single
+/// valid declaration.
+#[tokio::test]
+async fn a_duplicated_contract_declaration_is_refused() {
+    let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::LOCALHOST, 32).unwrap());
+
+    for second in [b"3".as_slice(), b"9".as_slice(), &[0xff, 0xfe][..]] {
+        let request = http::Request::builder()
+            .method("POST")
+            .uri(VM_GIT_PUSH_PATH)
+            .header("authorization", bearer(token().as_str()))
+            .header(VM_HTTP_CONTRACT_HEADER, declared_contract())
+            .header(
+                VM_HTTP_CONTRACT_HEADER,
+                http::HeaderValue::from_bytes(second).unwrap(),
+            )
+            .body(http_body_util::Full::new(Bytes::new()))
+            .expect("test request builds with valid method/uri/headers");
+
+        let response = serve_vm_http_request(
+            &session,
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 12345)),
+            request,
+            no_services(),
+            VM_HTTP_READ_TIMEOUT,
+        )
+        .await;
+
+        assert_eq!(
+            DispatchedTestResponse::from_hyper_response(response)
+                .await
+                .status,
+            VmHttpStatus::UpgradeRequired,
+            "a second declaration of {second:?} must not be discarded",
+        );
+    }
+}
+
 /// One authenticated request, optionally declaring a contract version, through
 /// the production dispatch — services unconfigured, since these tests are about
 /// which stage answers, not what the handler would have said.
