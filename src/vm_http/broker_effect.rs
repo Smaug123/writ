@@ -1,30 +1,30 @@
 //! The generic VM-HTTP effect driver.
 //!
 //! [`broker_effect`] owns the audit sequencing for a brokered VM-HTTP effect:
-//! begin the request row (session-open-checked, durable *before* the effect),
-//! run the effect, then complete the matching outcome row — or, for a streaming
+//! acquire the guard (begin a session-open-checked request row, durable *before*
+//! the effect — or, for an outcome-only effect, resume the row an earlier
+//! lifecycle event minted), run the effect, then complete the matching outcome row — or, for a streaming
 //! response, thread the audit guard into the response body so the outcome is
 //! recorded when the body drains. Because the *driver*, not the effect impl,
 //! holds and discharges the [`RecordedRequest`] guard, no effect can perform its
 //! IO without recording the `(request, outcome)` pair: the guard is
 //! `#[must_use]`, and it never leaves this function except into a streaming body
-//! that completes it on drop.
+//! that completes it on drop. Acquisition is likewise the driver's: an effect
+//! supplies only the *description* of how to acquire (a request row, or a key to
+//! resume).
 //!
 //! Effects declare their per-effect variation through [`BrokeredEffect`] (which
-//! audit table, how to build the request row, how to run the effect); the driver
-//! owns the sequence. This is the Stage-4 shape from
-//! `docs/plans/2026-07-18-brokered-effect-audit-enforcement.md`: it drives the
-//! two proxies today, and later stages extend the trait for the remaining
-//! effects.
+//! audit table, how to build the request row or resume an earlier one, how to run
+//! the effect); the driver owns the sequence. This is the Stage-4 shape from
+//! `docs/plans/2026-07-18-brokered-effect-audit-enforcement.md`: it drives both
+//! model proxies, git-push staging, flake provisioning, and agent-run outcomes.
 
 use std::sync::Arc;
 
+use super::{VmHttpDispatch, VmHttpResponse, VmHttpStatus};
 use crate::audit::{
     AUDIT_WRITE_FAILURE_TARGET, AuditError, AuditLog, EffectAuditTable, RecordedRequest,
 };
-use crate::core::RequestId;
-
-use super::{VmHttpDispatch, VmHttpResponse, VmHttpStatus};
 
 /// A brokered VM-HTTP effect whose `(request, outcome)` audit pair is written by
 /// the [`broker_effect`] driver, not by the effect itself.
@@ -48,9 +48,14 @@ pub(in crate::vm_http) trait BrokeredEffect: Sized {
     /// outcome-row write fails.
     const OUTCOME_AUDIT_KIND: &'static str;
 
-    /// The correlation id logged on an audit-write failure. (For the proxies this
-    /// is the request row's key.)
-    fn request_id(&self) -> RequestId;
+    /// The identifier logged on an audit fault: this effect's audit key, as it
+    /// appears in the `(request, outcome)` rows. Returned as a `Display` rather
+    /// than a `RequestId` because the key type is per table — a `RequestId` for
+    /// the proxies and flake provisioning, a push request id for git-push, an
+    /// `AgentRunId` for agent runs — and labelling a run id as a request id in
+    /// the log would be a small lie in exactly the place an operator is trying to
+    /// correlate rows.
+    fn audit_key(&self) -> impl std::fmt::Display + '_;
 
     /// The request row to begin the guard with — its Allow/Deny decision baked in
     /// by the impl.
@@ -75,6 +80,34 @@ pub(in crate::vm_http) trait BrokeredEffect: Sized {
         None
     }
 
+    /// Acquire the audit guard the driver holds across the effect.
+    ///
+    /// Defaulted to the **two-phase** shape: begin a request row from
+    /// [`request_row`](BrokeredEffect::request_row), mapping an expected failure
+    /// through [`begin_error_response`](BrokeredEffect::begin_error_response).
+    /// An **outcome-only** effect — one whose request row was minted by an
+    /// earlier lifecycle event, i.e. agent runs — overrides this to call
+    /// [`resume_effect`](crate::audit::AuditLog::resume_effect) instead.
+    ///
+    /// It is an override rather than a `Durability` flag the driver branches on
+    /// because `resume_effect` is bounded on `OutcomeOnlyEffect`, which the
+    /// generic driver cannot carry: resolving the bound *where the override is
+    /// written* is the same technique [`EffectCompletion::Abandoned`] uses for
+    /// `abandon`. The driver still owns the guard from here on, and still owns
+    /// the `AUDIT_WRITE_FAILURE` logging — hence [`AcquireFailure`] distinguishes
+    /// "answer the guest this" from "an audit write genuinely failed".
+    fn acquire(
+        &self,
+        audit: &Arc<AuditLog>,
+    ) -> Result<RecordedRequest<Self::Table>, AcquireFailure> {
+        audit
+            .begin_effect::<Self::Table>(&self.request_row())
+            .map_err(|err| match Self::begin_error_response(&err) {
+                Some(response) => AcquireFailure::Answered(response),
+                None => AcquireFailure::Audit(err),
+            })
+    }
+
     /// The 500 body returned when an audit write genuinely fails (a `begin_effect`
     /// error the effect did not map, or a `complete` failure). Defaulted to a
     /// plain-text body; an effect whose endpoint promises a typed error envelope
@@ -84,6 +117,22 @@ pub(in crate::vm_http) trait BrokeredEffect: Sized {
     fn audit_write_failure_response() -> VmHttpResponse {
         VmHttpResponse::text(VmHttpStatus::InternalServerError, "audit write failed")
     }
+}
+
+/// Why [`BrokeredEffect::acquire`] produced no guard.
+///
+/// The split is what keeps the `AUDIT_WRITE_FAILURE` signal meaningful: a
+/// refusal the guest simply gets told about (a closed session, an effect that was
+/// never begun, a concurrent attempt to record the same outcome) is not an audit
+/// *fault*, and must not be logged as one.
+pub(in crate::vm_http) enum AcquireFailure {
+    /// Answer the guest this, verbatim. Nothing failed to write, so nothing is
+    /// logged and no audit row exists.
+    Answered(VmHttpResponse),
+    /// An audit write or read genuinely failed: the driver logs
+    /// [`AUDIT_WRITE_FAILURE_TARGET`] and answers
+    /// [`BrokeredEffect::audit_write_failure_response`].
+    Audit(AuditError),
 }
 
 /// What [`BrokeredEffect::perform`] returns.
@@ -125,34 +174,34 @@ pub(in crate::vm_http) async fn broker_effect<E: BrokeredEffect>(
     audit: &Arc<AuditLog>,
     effect: E,
 ) -> VmHttpDispatch {
-    let request_id = effect.request_id();
-    let recorded = match audit.begin_effect::<E::Table>(&effect.request_row()) {
+    let recorded = match effect.acquire(audit) {
         Ok(recorded) => recorded,
-        // An *expected* begin failure (a closed or unknown session) is a domain
-        // client error the effect maps itself; anything else is an audit-write
-        // 500 with the failure logged.
-        Err(err) => {
-            return match E::begin_error_response(&err) {
-                Some(response) => response.into(),
-                None => audit_write_500(
-                    E::REQUEST_AUDIT_KIND,
-                    request_id,
-                    err,
-                    E::audit_write_failure_response(),
-                ),
-            };
+        // An *expected* acquisition failure (a closed session, an unbegun or
+        // already-claimed effect) is a domain client error the effect maps
+        // itself; anything else is an audit-write 500 with the failure logged.
+        Err(AcquireFailure::Answered(response)) => return response.into(),
+        Err(AcquireFailure::Audit(err)) => {
+            return audit_write_500(
+                E::REQUEST_AUDIT_KIND,
+                &effect.audit_key(),
+                err,
+                E::audit_write_failure_response(),
+            );
         }
     };
     // Durable boundary: the request row is committed. A crash from here — through
     // the effect and its outcome write — leaves a dangling request row the boot
     // sweep reconciles. (Inert in production; only a test `CrashPlan` acts on it.)
     crate::crash_point::point("broker_effect::request_recorded").await;
+    // Rendered before `perform` consumes the effect; only the outcome-write
+    // failure path below reads it.
+    let audit_key = effect.audit_key().to_string();
     match effect.perform().await {
         EffectCompletion::Buffered { outcome, response } => {
             if let Err(err) = recorded.complete(&E::outcome_row(&outcome)) {
                 return audit_write_500(
                     E::OUTCOME_AUDIT_KIND,
-                    request_id,
+                    &audit_key,
                     err,
                     E::audit_write_failure_response(),
                 );
@@ -174,14 +223,14 @@ pub(in crate::vm_http) async fn broker_effect<E: BrokeredEffect>(
 /// lets the guest-facing effect succeed silently.
 fn audit_write_500(
     kind: &'static str,
-    request_id: RequestId,
+    audit_key: &dyn std::fmt::Display,
     err: AuditError,
     response: VmHttpResponse,
 ) -> VmHttpDispatch {
     tracing::error!(
         target: AUDIT_WRITE_FAILURE_TARGET,
         kind,
-        request_id = %request_id,
+        audit_key = %audit_key,
         error = %err,
         "audit write failed",
     );

@@ -121,6 +121,104 @@ pub trait EffectAuditTable: sealed::Sealed + 'static {
 /// ```
 pub trait AbandonableEffect: EffectAuditTable {}
 
+/// Opt-in marker for effect tables with the *outcome-only* durability shape: the
+/// request row is minted by an **earlier lifecycle event**, and only the outcome
+/// arrives at the endpoint that records it. Agent runs are the case — the
+/// `agent_run` row is written when the run is *launched*, and the guest POSTs its
+/// outcome much later — so that endpoint must [`resume`](AuditLog::resume_effect)
+/// the existing row rather than begin a second one.
+///
+/// Sealed transitively through [`EffectAuditTable`], so only this crate's own DAO
+/// markers can opt in. A two-phase effect must not be resumable: `begin_effect`
+/// is what makes its request row durable *before* the effect, and resuming would
+/// let an effect run with no request row at all. The bound is what enforces that
+/// — `resume_effect` on a proxy table does not compile:
+///
+/// ```compile_fail,E0277
+/// # use std::sync::Arc;
+/// fn cannot_resume_a_proxy(
+///     audit: &Arc<writ_audit::AuditLog>,
+///     request_id: writ_core::core::RequestId,
+/// ) {
+///     let _ = audit.resume_effect::<writ_audit::ClaudeProxyAuditTable>(request_id);
+/// }
+/// ```
+pub trait OutcomeOnlyEffect: EffectAuditTable {
+    /// Whether the request row for `key` is present. Owned by the DAO (like
+    /// `insert_request`) so the generic guard never interpolates a key column
+    /// name into SQL.
+    fn request_row_exists(conn: &Connection, key: &Self::Key) -> Result<bool, AuditError>;
+
+    /// A textual form of `key` used to claim it while a guard is live.
+    ///
+    /// **Must be injective**: two distinct keys must never produce the same
+    /// token, or one effect's claim would block another's. Implementors' keys
+    /// are UUID newtypes, whose `Display` satisfies this.
+    fn claim_token(key: &Self::Key) -> String;
+}
+
+/// Why [`AuditLog::resume_effect`] refused to hand out a guard. Three distinct
+/// dispositions, because the caller answers each differently: a client error, a
+/// concurrency conflict, and a genuine audit fault.
+#[derive(Debug)]
+pub enum ResumeEffectError {
+    /// No request row exists for this key — the effect was never begun by its
+    /// earlier lifecycle event. Recording an outcome for it would leave an
+    /// orphan, so no guard is issued.
+    NotBegun,
+    /// Another live guard already holds this key: a concurrent attempt to record
+    /// the same effect's outcome. Exactly one may proceed, so this one is
+    /// refused *before* it does any work — the loser neither duplicates the
+    /// effect's IO nor races the winner to the outcome row's primary key.
+    AlreadyClaimed,
+    /// The existence check itself failed.
+    Audit(AuditError),
+}
+
+impl std::fmt::Display for ResumeEffectError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotBegun => f.write_str("no request row exists for this effect"),
+            Self::AlreadyClaimed => {
+                f.write_str("another outcome for this effect is already in flight")
+            }
+            Self::Audit(err) => write!(f, "{err}"),
+        }
+    }
+}
+
+impl std::error::Error for ResumeEffectError {}
+
+/// The process-wide set of effect keys with a live resumed guard, held per
+/// [`AuditLog`] (the claim protects rows in *that* database).
+///
+/// Entries are `(table label, claim token)`; the token is injective per
+/// [`OutcomeOnlyEffect::claim_token`], and the label keeps two tables' keys
+/// apart. A claim is taken by [`AuditLog::resume_effect`] and released by the
+/// guard's `Drop` — so it is released on *every* path, including a completion, an
+/// abandon, a panic, and an interruption.
+#[derive(Debug, Default)]
+pub(crate) struct EffectClaims {
+    held: std::sync::Mutex<std::collections::HashSet<(&'static str, String)>>,
+}
+
+impl EffectClaims {
+    /// Take the claim, returning whether it was free.
+    fn claim(&self, label: &'static str, token: String) -> bool {
+        self.held
+            .lock()
+            .expect("effect claim lock should not be poisoned")
+            .insert((label, token))
+    }
+
+    fn release(&self, label: &'static str, token: &str) {
+        self.held
+            .lock()
+            .expect("effect claim lock should not be poisoned")
+            .remove(&(label, token.to_string()));
+    }
+}
+
 /// A request row that has been durably recorded and awaits its outcome.
 ///
 /// The only way to obtain one is [`AuditLog::begin_effect`]. It is discharged
@@ -138,6 +236,10 @@ pub struct RecordedRequest<T: EffectAuditTable> {
     /// write succeeds — so a rejected or failed completion surfaces to the caller
     /// rather than also tripping the `Drop` backstop as an un-attempted effect.
     discharged: bool,
+    /// `Some` iff this guard was [resumed](AuditLog::resume_effect): the claim
+    /// token to release when the guard goes away. Released in `Drop`, so every
+    /// path releases it — completion, abandon, panic, or interruption.
+    claim: Option<String>,
     _table: PhantomData<fn() -> T>,
 }
 
@@ -270,6 +372,12 @@ pub use interruption::expect_guard_interruptions;
 
 impl<T: EffectAuditTable> Drop for RecordedRequest<T> {
     fn drop(&mut self) {
+        // Release the key claim FIRST, before any early return: a resumed guard
+        // that is completed, abandoned, dropped by a bug, or interrupted must all
+        // free the key, or the effect's outcome could never be recorded again.
+        if let Some(token) = self.claim.take() {
+            self.audit.effect_claims.release(T::LABEL, &token);
+        }
         if self.discharged {
             return;
         }
@@ -320,6 +428,54 @@ impl AuditLog {
             audit: Arc::clone(self),
             key,
             discharged: false,
+            claim: None,
+            _table: PhantomData,
+        })
+    }
+
+    /// Resume a guard for a request row written by an **earlier lifecycle
+    /// event** — the outcome-only durability shape. `/v1/agent-runs/{id}/outcome`
+    /// is the case: the `agent_run` request row is minted at run *launch*, and
+    /// only its outcome arrives at that endpoint.
+    ///
+    /// Two things this gives that "write the outcome directly" did not:
+    ///
+    /// * **No orphan outcomes.** The request row must already exist
+    ///   ([`ResumeEffectError::NotBegun`] otherwise), and no row is inserted here
+    ///   — so the endpoint can neither record an outcome for an effect that was
+    ///   never begun nor double-insert the request row.
+    /// * **At most one live guard per key.** The key is *claimed* for the
+    ///   guard's lifetime, so two concurrent attempts to record the same
+    ///   effect's outcome cannot both proceed: the loser is refused
+    ///   ([`ResumeEffectError::AlreadyClaimed`]) *before* performing the effect's
+    ///   IO, rather than discovering the collision at the outcome row's primary
+    ///   key after the work is done. The claim is released when the guard drops,
+    ///   whatever discharged it.
+    ///
+    /// Gated on [`OutcomeOnlyEffect`]: a two-phase effect must go through
+    /// [`begin_effect`](Self::begin_effect), whose request-row insert is what
+    /// makes the attempt durable before the effect happens.
+    pub fn resume_effect<T: OutcomeOnlyEffect>(
+        self: &Arc<Self>,
+        key: T::Key,
+    ) -> Result<RecordedRequest<T>, ResumeEffectError> {
+        let exists = self
+            .with_conn(|c| T::request_row_exists(c, &key))
+            .map_err(ResumeEffectError::Audit)?;
+        if !exists {
+            return Err(ResumeEffectError::NotBegun);
+        }
+        // Claim AFTER the existence check and before returning the guard: from
+        // here the key is held until the guard drops.
+        let token = T::claim_token(&key);
+        if !self.effect_claims.claim(T::LABEL, token.clone()) {
+            return Err(ResumeEffectError::AlreadyClaimed);
+        }
+        Ok(RecordedRequest {
+            audit: Arc::clone(self),
+            key,
+            discharged: false,
+            claim: Some(token),
             _table: PhantomData,
         })
     }
@@ -461,6 +617,37 @@ mod tests {
     // exercise the gated method; the real production opt-in is git-push.
     impl AbandonableEffect for ScratchTable {}
 
+    // ...and into the outcome-only shape, so the resume/claim tests below have a
+    // table to drive; the real production opt-in is agent-runs.
+    impl OutcomeOnlyEffect for ScratchTable {
+        fn request_row_exists(conn: &Connection, key: &RequestId) -> Result<bool, AuditError> {
+            let found: Option<i64> = rusqlite::OptionalExtension::optional(conn.query_row(
+                "SELECT 1 FROM scratch_request WHERE key = ?1",
+                params![key.as_uuid().to_string()],
+                |row| row.get(0),
+            ))?;
+            Ok(found.is_some())
+        }
+
+        fn claim_token(key: &RequestId) -> String {
+            key.as_uuid().to_string()
+        }
+    }
+
+    /// Seed a request row with no outcome — what an agent run looks like between
+    /// launch and outcome upload.
+    fn seed_request_row(log: &Arc<AuditLog>, session_id: SessionId) -> RequestId {
+        let key = RequestId::new();
+        log.begin_effect::<ScratchTable>(&ScratchRequest {
+            key,
+            session_id,
+            note: "launched".into(),
+        })
+        .unwrap()
+        .abandon();
+        key
+    }
+
     fn install_scratch_tables(log: &AuditLog) {
         log.with_conn_mut(|c| {
             c.execute_batch(
@@ -532,6 +719,103 @@ CREATE TABLE scratch_outcome (
             .complete(&ScratchOutcome { key, status: 200 })
             .unwrap();
         assert_eq!(dump_outcome(&log), vec![(key.as_uuid().to_string(), 200)]);
+    }
+
+    /// The outcome-only shape: the request row was minted earlier, so resuming
+    /// completes the pair without inserting a second request row.
+    #[test]
+    fn resume_completes_the_pair_without_reinserting_the_request_row() {
+        let (log, s) = open_log();
+        let key = seed_request_row(&log, s.session_id);
+        assert_eq!(dump_request(&log).len(), 1);
+
+        let guard = log.resume_effect::<ScratchTable>(key).unwrap();
+        assert_eq!(guard.key(), &key);
+        guard
+            .complete(&ScratchOutcome { key, status: 200 })
+            .unwrap();
+
+        assert_eq!(
+            dump_request(&log).len(),
+            1,
+            "resuming must not insert a second request row"
+        );
+        assert_eq!(dump_outcome(&log), vec![(key.as_uuid().to_string(), 200)]);
+    }
+
+    /// An outcome for an effect that was never begun would be an orphan, so no
+    /// guard is issued and nothing is written.
+    #[test]
+    fn resume_refuses_a_key_with_no_request_row() {
+        let (log, _s) = open_log();
+
+        let err = log
+            .resume_effect::<ScratchTable>(RequestId::new())
+            .unwrap_err();
+
+        assert!(matches!(err, ResumeEffectError::NotBegun), "got: {err:?}");
+        assert!(dump_request(&log).is_empty());
+        assert!(dump_outcome(&log).is_empty());
+    }
+
+    /// At most one live guard per key: a second concurrent attempt to record the
+    /// same effect's outcome is refused *before* it does any work, and the claim
+    /// is released when the holder goes away — whatever discharged it.
+    #[test]
+    fn resume_claims_the_key_for_the_lifetime_of_the_guard() {
+        let (log, s) = open_log();
+        let key = seed_request_row(&log, s.session_id);
+
+        let first = log.resume_effect::<ScratchTable>(key).unwrap();
+        let contended = log.resume_effect::<ScratchTable>(key).unwrap_err();
+        assert!(
+            matches!(contended, ResumeEffectError::AlreadyClaimed),
+            "got: {contended:?}"
+        );
+
+        // A *different* key is unaffected: the claim is per key, not a lock on
+        // the table.
+        let other = seed_request_row(&log, s.session_id);
+        log.resume_effect::<ScratchTable>(other).unwrap().abandon();
+
+        // Abandoning the holder frees the key...
+        first.abandon();
+        let second = log.resume_effect::<ScratchTable>(key).unwrap();
+        // ...as does completing it.
+        second
+            .complete(&ScratchOutcome { key, status: 200 })
+            .unwrap();
+        let third = log.resume_effect::<ScratchTable>(key).unwrap();
+        // ...as does simply dropping it (a bug or an interruption).
+        let (_, interrupted) = expect_guard_interruptions(move || drop(third));
+        assert_eq!(interrupted, vec!["Scratch"]);
+        log.resume_effect::<ScratchTable>(key).unwrap().abandon();
+    }
+
+    /// Two logs are independent: a claim protects rows in *its* database, so one
+    /// log's live guard cannot block another's.
+    #[test]
+    fn claims_do_not_leak_between_audit_logs() {
+        let (first_log, first_session) = open_log();
+        let (second_log, second_session) = open_log();
+        let key = seed_request_row(&first_log, first_session.session_id);
+        let held = first_log.resume_effect::<ScratchTable>(key).unwrap();
+
+        // The same key in a different log — the claim must not be global.
+        second_log
+            .begin_effect::<ScratchTable>(&ScratchRequest {
+                key,
+                session_id: second_session.session_id,
+                note: "launched".into(),
+            })
+            .unwrap()
+            .abandon();
+        second_log
+            .resume_effect::<ScratchTable>(key)
+            .expect("a claim in another log must not block this one")
+            .abandon();
+
+        held.abandon();
     }
 
     #[test]

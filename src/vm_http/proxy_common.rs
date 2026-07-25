@@ -1082,7 +1082,7 @@ where
     const REQUEST_AUDIT_KIND: &'static str = B::REQUEST_AUDIT_KIND;
     const OUTCOME_AUDIT_KIND: &'static str = B::OUTCOME_AUDIT_KIND;
 
-    fn request_id(&self) -> RequestId {
+    fn audit_key(&self) -> impl std::fmt::Display + '_ {
         self.request_id
     }
 

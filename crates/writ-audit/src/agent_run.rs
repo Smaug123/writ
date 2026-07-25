@@ -140,12 +140,13 @@ fn insert_agent_run_outcome_row(
 ///
 /// Agent-runs are the *outcome-only* durability shape: the request row is minted
 /// at run launch (`record_agent_run`) and only the outcome arrives at the outcome
-/// endpoint. The guard's `resume_effect` form for that split is a driver-stage
-/// concern (see the plan's §3.5); at the DAO layer the two-phase `begin_effect` +
-/// `complete` already models launch-then-outcome, which is what the equivalence
-/// proptest exercises. Until the driver adopts it, the direct writers remain the
-/// production path and this impl is exercised only by that proptest.
-pub(crate) struct AgentRunAuditTable;
+/// endpoint, which therefore
+/// [resumes](crate::AuditLog::resume_effect) the launch row rather than beginning
+/// a second one — hence the [`OutcomeOnlyEffect`](crate::OutcomeOnlyEffect) impl
+/// below. The two-phase
+/// `begin_effect` + `complete` path also models launch-then-outcome, which is what
+/// the equivalence proptest exercises against the direct writers.
+pub struct AgentRunAuditTable;
 
 impl crate::effect_table::sealed::Sealed for AgentRunAuditTable {}
 impl crate::effect_table::EffectAuditTable for AgentRunAuditTable {
@@ -175,6 +176,34 @@ impl crate::effect_table::EffectAuditTable for AgentRunAuditTable {
         row.outcome.run_id
     }
 }
+
+impl crate::effect_table::OutcomeOnlyEffect for AgentRunAuditTable {
+    fn request_row_exists(conn: &Connection, key: &AgentRunId) -> Result<bool, AuditError> {
+        let found: Option<i64> = conn
+            .query_row(
+                "SELECT 1 FROM agent_run WHERE run_id = ?1",
+                params![key.as_uuid().to_string()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(found.is_some())
+    }
+
+    /// The run id's UUID text. Injective, as `claim_token` requires.
+    fn claim_token(key: &AgentRunId) -> String {
+        key.as_uuid().to_string()
+    }
+}
+
+/// An outcome upload that performed its filesystem work but cannot record a
+/// truthful outcome — a log-directory or stream write that failed — must
+/// [`abandon`](crate::RecordedRequest::abandon) rather than fabricate one. This
+/// is not merely the usual "a fabricated row corrupts the log" argument: the
+/// outcome row's primary key is the run id, so a fabricated failure row would
+/// consume the run's *only* outcome slot and permanently prevent the real
+/// outcome from ever being recorded. Leaving the launch row unpaired is exactly
+/// what a run whose outcome has not arrived looks like, and the guest can retry.
+impl crate::effect_table::AbandonableEffect for AgentRunAuditTable {}
 
 impl AuditLog {
     pub fn record_agent_vm_workspace_bootstrap(

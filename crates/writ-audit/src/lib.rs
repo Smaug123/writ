@@ -48,7 +48,8 @@ mod test_support;
 mod validation;
 
 pub use agent_run::{
-    AgentRunAuditRecord, AgentRunOutcomeAuditRecord, AgentVmWorkspaceBootstrapAuditRecord,
+    AgentRunAuditRecord, AgentRunAuditTable, AgentRunOutcomeAuditRecord,
+    AgentVmWorkspaceBootstrapAuditRecord,
 };
 pub use agent_vm_network_health::AgentVmNetworkHealthEventRecord;
 pub use claude_proxy::{
@@ -60,7 +61,9 @@ pub use effect_scan::{EFFECT_AUDIT_PAIRS, EffectAuditPair, UnpairedEffectRows};
 /// reinterpret an undischarged guard drop as an interruption instead of a bug.
 #[cfg(any(test, feature = "test-support"))]
 pub use effect_table::expect_guard_interruptions;
-pub use effect_table::{AbandonableEffect, EffectAuditTable, RecordedRequest};
+pub use effect_table::{
+    AbandonableEffect, EffectAuditTable, OutcomeOnlyEffect, RecordedRequest, ResumeEffectError,
+};
 pub use flake_provision::{
     FlakeProvisionAuditEntry, FlakeProvisionAuditOutcome, FlakeProvisionAuditTable,
     FlakeProvisionOutcomeRecord, FlakeProvisionRequestRecord, FlakeProvisionResult,
@@ -94,6 +97,10 @@ pub use proxy_table::{ProxyAuditDecision, ProxyOutcomeRecord, ProxyRequestRecord
 /// `nix_cache_request`, `agent_run_log_directory`), plus an `error`
 /// field with the underlying message and any per-site identifiers
 /// (`jti`, `request_id`, `session_id`, `run_id`) that are in scope.
+/// Events from the VM-HTTP `broker_effect` driver carry `audit_key`
+/// instead of a per-table id column: the key type differs per effect
+/// (`RequestId`, a push request id, an `AgentRunId`), and the value is
+/// the one the `(request, outcome)` rows are joined on.
 pub const AUDIT_WRITE_FAILURE_TARGET: &str = "writ.audit_write_failure";
 
 #[derive(Debug, Error)]
@@ -153,6 +160,9 @@ pub enum AuditError {
 
 pub struct AuditLog {
     conn: Mutex<Connection>,
+    /// Keys with a live *resumed* guard (see [`AuditLog::resume_effect`]). Held
+    /// per log rather than globally: a claim protects rows in this database.
+    effect_claims: effect_table::EffectClaims,
 }
 
 impl std::fmt::Debug for AuditLog {
@@ -170,6 +180,7 @@ impl AuditLog {
         Self::init(&mut conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
+            effect_claims: effect_table::EffectClaims::default(),
         })
     }
 
@@ -201,6 +212,7 @@ impl AuditLog {
         Self::init(&mut conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
+            effect_claims: effect_table::EffectClaims::default(),
         })
     }
 
@@ -210,6 +222,7 @@ impl AuditLog {
         Self::init(&mut conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
+            effect_claims: effect_table::EffectClaims::default(),
         })
     }
 

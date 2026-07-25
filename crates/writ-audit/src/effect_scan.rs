@@ -38,11 +38,13 @@ pub struct EffectAuditPair {
 ///
 /// `agent_run` is deliberately **excluded**: it is outcome-only, its request row
 /// is minted at run *launch* and its outcome arrives at run *completion*, so an
-/// unpaired `agent_run` row is a run still in flight (or abandoned), not a lost
-/// write — scanning it would false-positive on every live run. Its
-/// reconciliation is a concern of the agent-run lifecycle, handled when that
-/// effect is ported. The host mint (`request` / `grant_log`) is likewise not a
-/// simple `(request, outcome)` pair and is out of scope.
+/// unpaired `agent_run` row is a run still in flight (or one whose outcome upload
+/// was rejected and may be retried — see
+/// [`AbandonableEffect`](crate::AbandonableEffect) on that table), not a lost
+/// write; scanning it would false-positive on every live run. Its reconciliation
+/// is a concern of the agent-run lifecycle. The host mint (`request` /
+/// `grant_log`) is likewise not a simple `(request, outcome)` pair and is out of
+/// scope.
 ///
 /// Keep this list in step with the schema's `*_request` / `*_outcome` pairs; the
 /// `effect_audit_pairs_match_the_schema` test fails if a pair is added to the

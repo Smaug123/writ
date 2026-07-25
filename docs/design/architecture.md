@@ -440,18 +440,23 @@ only: guest auth is stripped and the host key attached from the secret store.
 
 **The brokered-effect driver.** An effect's `(request, outcome)` audit pair is
 written by `vm_http/broker_effect.rs`, not by the handler: an effect declares
-`BrokeredEffect` (which `EffectAuditTable`, how to build the request row, how to
+`BrokeredEffect` (which `EffectAuditTable`, how to *acquire* the guard, how to
 `perform`), and the *driver* holds the `#[must_use]` `RecordedRequest` guard
 across the effect and discharges it — `complete` with a truthful outcome,
-`abandon` where no outcome is truthful (git-push staging IO only), or into a
-streaming body that completes on drop. Ported so far: both model proxies,
-git-push staging, and flake provisioning. Each handler keeps a
+`abandon` where no outcome is truthful, or into a streaming body that completes
+on drop. Acquisition has two shapes: **two-phase** (`begin_effect` writes the
+request row before the effect — the proxies, git-push staging, flake
+provisioning) and **outcome-only** (`resume_effect` re-acquires the row an
+earlier lifecycle event minted — agent-run outcomes, whose `agent_run` row is
+written at run *launch*). `resume_effect` also *claims* the key for the guard's
+lifetime, so two concurrent uploads for one run cannot both perform the effect
+and then race for the outcome row's primary key; the loser is refused with
+`409` rather than told a `200` it cannot verify. Each handler keeps a
 *reject-before-begin* phase for everything that answers without attempting an
-effect (a malformed body, a closed session, a flake cache miss or a lock the
-classifier refuses), so those record nothing. The remaining effects —
-agent-run outcomes (whose request row is minted at run launch) and the
-authority-free nix-cache serve (already atomically paired via
-`record_effect_coalesced`) — are ported with the route registry.
+effect (a malformed body, a closed session, a foreign or unknown run, an
+idempotent retry, a flake cache miss or a lock the classifier refuses), so those
+record nothing. The authority-free nix-cache serve — already atomically paired
+via `record_effect_coalesced` — joins with the route registry.
 
 **Invariants.** Proxy clients refuse redirects
 (`reqwest::redirect::Policy::none()`, `proxy_common.rs:708`) so a `Location`
