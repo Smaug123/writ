@@ -23,6 +23,7 @@ use crate::github::{GitHubAppConfig, GitHubAppRegistryConfig, GitHubMinter};
 use crate::policy::PolicyConfig;
 use crate::secret::{SecretError, SecretKey};
 use crate::vm_git::VM_GIT_CLONE_PATH;
+use crate::vm_git::{BROKER_IMAGE_REBUILD_COMMAND, VM_FLAKE_PROVISION_PATH, VM_GIT_PUSH_PATH};
 use crate::vm_git_bundle::{GitCredentialBoundary, GitSecretEnvVar};
 use std::collections::BTreeMap;
 
@@ -391,6 +392,14 @@ fn request(source: Ipv4Addr, authorization: Option<String>) -> VmHttpRequest {
         authorization,
         SocketAddr::V4(SocketAddrV4::new(source, 34567)),
     )
+}
+
+/// The contract declaration `writ-vm` puts on every request it originates.
+/// Full-dispatch tests send it because the guest they stand in for does; a test
+/// that omits it is now asserting the *refusal* path, which is what
+/// `the_contract_header_decides_exactly_the_routes_that_require_it` is for.
+pub(super) fn declared_contract() -> String {
+    VM_HTTP_CONTRACT_VERSION.to_string()
 }
 
 pub(super) fn bearer(value: &str) -> String {
@@ -776,6 +785,164 @@ async fn disabled_agent_run_config_route_is_not_found() {
     .into_buffered();
 
     assert_eq!(response.status, VmHttpStatus::NotFound);
+}
+
+/// **The contract header is what makes the difference, and only where it should.**
+///
+/// Driven over the whole endpoint map, so totality comes from
+/// `the_endpoint_map_covers_every_route`: a new route joins this test the moment
+/// it is documented, and must then behave as its own `contract_check` says.
+///
+/// For an exempt route the header must be *inert* — a third-party client will
+/// never send one, so any difference is a client we would break. For a required
+/// route it must be decisive.
+#[tokio::test]
+async fn the_contract_header_decides_exactly_the_routes_that_require_it() {
+    let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::LOCALHOST, 32).unwrap());
+    let declared = VM_HTTP_CONTRACT_VERSION.to_string();
+
+    for (method, target, name) in crate::vm_http::route_table::tests::ENDPOINT_MAP {
+        let (method, target) = (*method, *target);
+        let with = dispatch_declaring(&session, method, target, Some(&declared)).await;
+        let without = dispatch_declaring(&session, method, target, None).await;
+
+        let route = VmHttpRoute::resolve(&VmHttpRequest::new(
+            method,
+            target,
+            None,
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 12345)),
+        ));
+        match route.contract_check() {
+            ContractCheck::Exempt(_) => {
+                assert_eq!(
+                    with.status, without.status,
+                    "`{name}` is exempt, so the contract header must make no difference to it \
+                     ({method} {target})",
+                );
+                assert_ne!(without.status, VmHttpStatus::UpgradeRequired, "{name}");
+            }
+            ContractCheck::Required => {
+                assert_eq!(
+                    without.status,
+                    VmHttpStatus::UpgradeRequired,
+                    "`{name}` requires a contract declaration and must refuse a request without \
+                     one ({method} {target})",
+                );
+                assert_ne!(
+                    with.status,
+                    VmHttpStatus::UpgradeRequired,
+                    "`{name}` refused a request that declared the matching version ({method} \
+                     {target})",
+                );
+            }
+        }
+    }
+}
+
+/// A guest declaring the *wrong* version is refused just as one declaring
+/// nothing is, and told which side is stale. A newer guest is told to restart
+/// the daemon, not to rebuild itself into the same image again.
+#[tokio::test]
+async fn a_mismatched_declaration_names_the_stale_side() {
+    let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::LOCALHOST, 32).unwrap());
+
+    for (declared, expected_remedy) in [
+        (
+            (VM_HTTP_CONTRACT_VERSION + 1).to_string(),
+            BROKER_IMAGE_REBUILD_COMMAND,
+        ),
+        (
+            VM_HTTP_CONTRACT_VERSION.saturating_sub(1).to_string(),
+            GUEST_IMAGE_REBUILD_COMMAND,
+        ),
+        ("not-a-version".to_string(), GUEST_IMAGE_REBUILD_COMMAND),
+    ] {
+        let response =
+            dispatch_declaring(&session, "POST", VM_GIT_PUSH_PATH, Some(&declared)).await;
+
+        assert_eq!(response.status, VmHttpStatus::UpgradeRequired, "{declared}");
+        let body = String::from_utf8_lossy(&response.body);
+        assert!(
+            body.contains(expected_remedy),
+            "declaring `{declared}` against broker {VM_HTTP_CONTRACT_VERSION} must name \
+             `{expected_remedy}`: {body}",
+        );
+    }
+}
+
+/// **The refusal comes before the body is read.** A stale guest's oversized push
+/// must be refused for the reason that is true of it, not buffered to the limit
+/// first and then rejected for its size — buffering work for a request already
+/// decided against is exactly the unbounded work this ordering exists to avoid.
+#[tokio::test]
+async fn the_contract_check_runs_before_the_body_is_read() {
+    let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::LOCALHOST, 32).unwrap());
+    let oversized = (MAX_VM_HTTP_BODY_BYTES + 1).to_string();
+
+    let response = dispatch_vm_http_head_and_body(
+        &session,
+        SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 12345)),
+        "POST",
+        VM_FLAKE_PROVISION_PATH,
+        &[
+            ("authorization", bearer(token().as_str()).as_str()),
+            ("content-length", oversized.as_str()),
+        ],
+        Vec::new(),
+        no_services(),
+        VM_HTTP_READ_TIMEOUT,
+    )
+    .await;
+
+    assert_eq!(response.status, VmHttpStatus::UpgradeRequired);
+}
+
+/// ...and after authentication, so an unauthenticated peer cannot learn which
+/// contract version this broker speaks by asking.
+#[tokio::test]
+async fn authorization_runs_before_the_contract_check() {
+    let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::LOCALHOST, 32).unwrap());
+
+    let response = dispatch_vm_http_head_and_body(
+        &session,
+        SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 12345)),
+        "POST",
+        VM_GIT_PUSH_PATH,
+        &[("authorization", "Bearer not-the-session-token")],
+        Vec::new(),
+        no_services(),
+        VM_HTTP_READ_TIMEOUT,
+    )
+    .await;
+
+    assert_eq!(response.status, VmHttpStatus::Unauthorized);
+}
+
+/// One authenticated request, optionally declaring a contract version, through
+/// the production dispatch — services unconfigured, since these tests are about
+/// which stage answers, not what the handler would have said.
+async fn dispatch_declaring(
+    session: &VmHttpSession,
+    method: &str,
+    target: &str,
+    declared: Option<&str>,
+) -> DispatchedTestResponse {
+    let authorization = bearer(token().as_str());
+    let mut headers = vec![("authorization", authorization.as_str())];
+    if let Some(declared) = declared {
+        headers.push((VM_HTTP_CONTRACT_HEADER, declared));
+    }
+    dispatch_vm_http_head_and_body(
+        session,
+        SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 12345)),
+        method,
+        target,
+        &headers,
+        Vec::new(),
+        no_services(),
+        VM_HTTP_READ_TIMEOUT,
+    )
+    .await
 }
 
 #[tokio::test]
@@ -1266,139 +1433,188 @@ mod brokered_route_audit_oracle {
         }
     }
 
-    #[tokio::test]
-    async fn every_brokered_route_records_a_complete_audit_pair() {
-        let git_program = required_test_tool("git");
-        let temp = tempfile::tempdir().unwrap();
+    /// The broker the audit oracles drive: every service configured, a real
+    /// bare mirror behind flake provisioning, a launched agent run for the
+    /// outcome route to resume, and mock upstreams for the two proxies.
+    ///
+    /// Shared by the pair oracle and the contract-refusal oracle below, so both
+    /// speak to the *same* broker — a refusal that recorded nothing against a
+    /// differently-configured broker would prove much less.
+    struct AuditOracleBroker {
+        state: Arc<BrokerState<Box<dyn SecretStore>>>,
+        session: VmHttpSession,
+        services: TestVmHttpServices,
+        repo: RepoRef,
+        rev: crate::vm_git_mirror_cache::GitCommitSha,
+        run_id: AgentRunId,
+        // Kept alive for the lifetime of the fixture: the mock upstreams stop
+        // serving when dropped, and the temp dir takes the staging, cache and
+        // materialisation roots with it.
+        _temp: tempfile::TempDir,
+        _upstreams: Vec<MockServer>,
+    }
 
-        // Upstreams for the two model proxies. Plain JSON, so both responses
-        // buffer rather than stream.
-        let claude_upstream = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/v1/messages"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_raw(b"{}".to_vec(), "application/json"),
-            )
-            .mount(&claude_upstream)
-            .await;
-        let openai_upstream = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/v1/responses"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_raw(b"{}".to_vec(), "application/json"),
-            )
-            .mount(&openai_upstream)
-            .await;
+    impl AuditOracleBroker {
+        async fn build() -> Self {
+            let git_program = required_test_tool("git");
+            let temp = tempfile::tempdir().unwrap();
 
-        let github = MockServer::start().await;
-        let anthropic_key = SecretKey::new("anthropic-api-key").unwrap();
-        let openai_key = SecretKey::new("openai-api-key").unwrap();
-        let state = make_broker_state_with_extra_secrets(
-            &github,
-            vec![
-                (anthropic_key.clone(), "host-anthropic-key"),
-                (openai_key.clone(), "host-openai-key"),
-            ],
-        );
-        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::LOCALHOST, 32).unwrap());
-        open_audit_session(&state, session.session_id());
-
-        // A real bare mirror plus a fake `nix` that archives, so flake
-        // provisioning runs its full audited path without needing a nix daemon.
-        let repo = RepoRef {
-            owner: "o".into(),
-            name: "n".into(),
-        };
-        let (mirror, rev) = crate::flake_fixtures::no_input_flake_mirror(
-            &git_program,
-            &temp.path().join("flake-fixture"),
-        );
-        let mirror_cache = MirrorCache::new(temp.path().join("mirror-cache"));
-        mirror_cache
-            .insert(&MirrorCacheKey::new(&repo, &rev), &mirror)
-            .unwrap();
-        record_contents_read_grant(&state, session.session_id(), repo.clone());
-
-        // The agent run whose outcome the outcome route resumes.
-        let run_id = AgentRunId::new();
-        state
-            .audit
-            .record_agent_run(&AgentRunAuditRecord {
-                run_id,
-                session_id: session.session_id(),
-                requested_at: UnixMillis::now(),
-                agent_kind: AgentKind::Claude,
-                prompt: crate::agent_run::AgentPrompt::new("prompt").summary(),
-                correlation_id: None,
-            })
-            .unwrap();
-
-        let services = TestVmHttpServices {
-            git_clone: None,
-            nix_cache: Some(VmHttpNixCacheService::new(
-                Arc::clone(&state),
-                nix_cache_config_for_test(),
-            )),
-            claude_proxy: Some(
-                VmHttpClaudeProxyService::new(
-                    Arc::clone(&state),
-                    VmHttpClaudeProxyConfig::new_with_anthropic_version(
-                        claude_upstream.uri(),
-                        anthropic_key,
-                        VmHttpClaudeProxyAuthKind::XApiKey,
-                        "2024-10-22",
-                        std::time::Duration::from_secs(5),
-                        4096,
-                        4096,
-                    )
-                    .unwrap(),
+            // Upstreams for the two model proxies. Plain JSON, so both responses
+            // buffer rather than stream.
+            let claude_upstream = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/messages"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_raw(b"{}".to_vec(), "application/json"),
                 )
-                .unwrap(),
-            ),
-            openai_proxy: Some(
-                VmHttpOpenAiProxyService::new(
-                    Arc::clone(&state),
-                    VmHttpOpenAiProxyConfig::new(
-                        openai_upstream.uri(),
-                        openai_key,
-                        VmHttpOpenAiProxyAuthKind::AuthorizationBearer,
-                        std::time::Duration::from_secs(5),
-                        4096,
-                        4096,
-                    )
-                    .unwrap(),
+                .mount(&claude_upstream)
+                .await;
+            let openai_upstream = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/responses"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_raw(b"{}".to_vec(), "application/json"),
                 )
-                .unwrap(),
-            ),
-            agent_runs: Some(VmHttpAgentRunService::new(
-                Arc::clone(&state),
-                temp.path().join("agent-runs"),
-            )),
-            git_push: Some(VmHttpGitPushService::new(
-                Arc::clone(&state),
-                Arc::new(GitPushStagingStore::open(temp.path().join("staging")).unwrap()),
-                VmGitPushBodyLimits::new(64 * 1024, 8 * 1024, 64 * 1024).unwrap(),
-            )),
-            flake_provision: Some(VmHttpFlakeProvisionService::new(
-                Arc::clone(&state),
-                VmHttpFlakeProvisionConfig::new(
-                    crate::flake_provision_from_mirror::MirrorFlakeProvisionConfig::new(
-                        git_program,
-                        crate::flake_fixtures::fake_nix_archiving(temp.path()),
-                        temp.path().join("materialize"),
-                        temp.path().join("flake-input-cache"),
-                        crate::flake_lock::FlakeProvisionBounds::new(
-                            64,
-                            1 << 30,
-                            std::time::Duration::from_secs(120),
+                .mount(&openai_upstream)
+                .await;
+
+            let github = MockServer::start().await;
+            let anthropic_key = SecretKey::new("anthropic-api-key").unwrap();
+            let openai_key = SecretKey::new("openai-api-key").unwrap();
+            let state = make_broker_state_with_extra_secrets(
+                &github,
+                vec![
+                    (anthropic_key.clone(), "host-anthropic-key"),
+                    (openai_key.clone(), "host-openai-key"),
+                ],
+            );
+            let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::LOCALHOST, 32).unwrap());
+            open_audit_session(&state, session.session_id());
+
+            // A real bare mirror plus a fake `nix` that archives, so flake
+            // provisioning runs its full audited path without needing a nix daemon.
+            let repo = RepoRef {
+                owner: "o".into(),
+                name: "n".into(),
+            };
+            let (mirror, rev) = crate::flake_fixtures::no_input_flake_mirror(
+                &git_program,
+                &temp.path().join("flake-fixture"),
+            );
+            let mirror_cache = MirrorCache::new(temp.path().join("mirror-cache"));
+            mirror_cache
+                .insert(&MirrorCacheKey::new(&repo, &rev), &mirror)
+                .unwrap();
+            record_contents_read_grant(&state, session.session_id(), repo.clone());
+
+            // The agent run whose outcome the outcome route resumes.
+            let run_id = AgentRunId::new();
+            state
+                .audit
+                .record_agent_run(&AgentRunAuditRecord {
+                    run_id,
+                    session_id: session.session_id(),
+                    requested_at: UnixMillis::now(),
+                    agent_kind: AgentKind::Claude,
+                    prompt: crate::agent_run::AgentPrompt::new("prompt").summary(),
+                    correlation_id: None,
+                })
+                .unwrap();
+
+            let services = TestVmHttpServices {
+                git_clone: None,
+                nix_cache: Some(VmHttpNixCacheService::new(
+                    Arc::clone(&state),
+                    nix_cache_config_for_test(),
+                )),
+                claude_proxy: Some(
+                    VmHttpClaudeProxyService::new(
+                        Arc::clone(&state),
+                        VmHttpClaudeProxyConfig::new_with_anthropic_version(
+                            claude_upstream.uri(),
+                            anthropic_key,
+                            VmHttpClaudeProxyAuthKind::XApiKey,
+                            "2024-10-22",
+                            std::time::Duration::from_secs(5),
+                            4096,
+                            4096,
                         )
                         .unwrap(),
-                        std::time::Duration::from_secs(120),
-                    ),
-                    mirror_cache,
+                    )
+                    .unwrap(),
                 ),
-            )),
-        };
+                openai_proxy: Some(
+                    VmHttpOpenAiProxyService::new(
+                        Arc::clone(&state),
+                        VmHttpOpenAiProxyConfig::new(
+                            openai_upstream.uri(),
+                            openai_key,
+                            VmHttpOpenAiProxyAuthKind::AuthorizationBearer,
+                            std::time::Duration::from_secs(5),
+                            4096,
+                            4096,
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap(),
+                ),
+                agent_runs: Some(VmHttpAgentRunService::new(
+                    Arc::clone(&state),
+                    temp.path().join("agent-runs"),
+                )),
+                git_push: Some(VmHttpGitPushService::new(
+                    Arc::clone(&state),
+                    Arc::new(GitPushStagingStore::open(temp.path().join("staging")).unwrap()),
+                    VmGitPushBodyLimits::new(64 * 1024, 8 * 1024, 64 * 1024).unwrap(),
+                )),
+                flake_provision: Some(VmHttpFlakeProvisionService::new(
+                    Arc::clone(&state),
+                    VmHttpFlakeProvisionConfig::new(
+                        crate::flake_provision_from_mirror::MirrorFlakeProvisionConfig::new(
+                            git_program,
+                            crate::flake_fixtures::fake_nix_archiving(temp.path()),
+                            temp.path().join("materialize"),
+                            temp.path().join("flake-input-cache"),
+                            crate::flake_lock::FlakeProvisionBounds::new(
+                                64,
+                                1 << 30,
+                                std::time::Duration::from_secs(120),
+                            )
+                            .unwrap(),
+                            std::time::Duration::from_secs(120),
+                        ),
+                        mirror_cache,
+                    ),
+                )),
+            };
+
+            Self {
+                state,
+                session,
+                services,
+                repo,
+                rev,
+                run_id,
+                _temp: temp,
+                _upstreams: vec![claude_upstream, openai_upstream, github],
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn every_brokered_route_records_a_complete_audit_pair() {
+        // Bound whole, never destructured: the fixture's `_temp` / `_upstreams`
+        // fields keep the staging dir and the mock upstreams alive, and a
+        // by-value destructure with `..` would drop them right here.
+        let broker = AuditOracleBroker::build().await;
+        let (state, session, services, repo, rev, run_id) = (
+            &broker.state,
+            &broker.session,
+            &broker.services,
+            &broker.repo,
+            &broker.rev,
+            broker.run_id,
+        );
 
         for route in BrokeredRoute::ALL_NAMES {
             let (request_table, outcome_table, join_column) = audit_pair_for(route);
@@ -1409,9 +1625,9 @@ mod brokered_route_audit_oracle {
             // rows would report no progress for it.)
             let before = state.audit.table_row_count_for_test(outcome_table);
 
-            let (request, body) = drive_for(route, &repo, &rev, run_id);
+            let (request, body) = drive_for(route, repo, rev, run_id);
             let dispatch = super::super::resolve_and_route_authenticated_vm_http_request(
-                &session,
+                session,
                 &request,
                 body,
                 services.clone(),
@@ -1434,6 +1650,58 @@ mod brokered_route_audit_oracle {
                 request_table,
                 outcome_table,
                 join_column,
+            );
+        }
+    }
+
+    /// **A refused guest reaches no effect and records nothing.**
+    ///
+    /// Drives the *same* requests as the pair oracle above, against the *same*
+    /// broker, through the production dispatch and without a contract
+    /// declaration. Reusing `drive_for` is what makes this non-vacuous: the
+    /// oracle above proves those exact drives reach the effect and record a
+    /// pair, so a run here that records nothing did so because it was refused,
+    /// not because the drive was inert.
+    #[tokio::test]
+    async fn a_guest_that_declares_no_contract_records_nothing_on_a_required_route() {
+        let broker = AuditOracleBroker::build().await;
+
+        for route in BrokeredRoute::ALL_NAMES {
+            let (request, body) = drive_for(route, &broker.repo, &broker.rev, broker.run_id);
+            if VmHttpRoute::resolve(&request).contract_check() != ContractCheck::Required {
+                continue;
+            }
+            let (request_table, outcome_table, _) = audit_pair_for(route);
+            let before = (
+                broker.state.audit.table_row_count_for_test(request_table),
+                broker.state.audit.table_row_count_for_test(outcome_table),
+            );
+
+            let response = dispatch_vm_http_head_and_body(
+                &broker.session,
+                SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 34567)),
+                &request.method,
+                &request.target,
+                &[("authorization", bearer(token().as_str()).as_str())],
+                body,
+                broker.services.clone(),
+                VM_HTTP_READ_TIMEOUT,
+            )
+            .await;
+
+            assert_eq!(
+                response.status,
+                VmHttpStatus::UpgradeRequired,
+                "`{route}` served a guest that declared no contract version",
+            );
+            assert_eq!(
+                (
+                    broker.state.audit.table_row_count_for_test(request_table),
+                    broker.state.audit.table_row_count_for_test(outcome_table),
+                ),
+                before,
+                "`{route}` was refused but still wrote to `{request_table}` / `{outcome_table}`; \
+                 a refusal happens before the effect, so it has nothing to record",
             );
         }
     }

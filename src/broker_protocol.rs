@@ -40,7 +40,7 @@ use serde::{Deserialize, Serialize};
 /// fingerprint of that contract and fails when it changes, so a contract change
 /// that forgets to bump this constant is caught at CI, before an image is built.
 /// The route surface is part of that fingerprint for exactly the reason above.
-pub const BROKER_PROTOCOL_VERSION: u32 = 4;
+pub const BROKER_PROTOCOL_VERSION: u32 = 5;
 
 /// The synthetic version assigned to a *legacy* bare-port ready file — one
 /// written by a pre-handshake broker image. It is distinct from every real

@@ -39,7 +39,7 @@ use writ_core::core::{
 /// This is the guest-side sibling of `writ::broker_protocol::BROKER_PROTOCOL_VERSION`,
 /// which guards the host↔broker-VM axis. A guest-visible change generally moves
 /// both: one forces the broker image to be rebuilt, the other the guest image.
-pub const VM_HTTP_CONTRACT_VERSION: u32 = 2;
+pub const VM_HTTP_CONTRACT_VERSION: u32 = 3;
 
 /// The command an operator runs to rebuild the guest image, quoted back to them
 /// whenever the broker refuses a stale one.
@@ -125,6 +125,86 @@ pub const WRIT_VM_ORIGINATED_TARGETS: &[(&str, &str)] = &[
         "/v1/agent-runs/00000000-0000-0000-0000-000000000501/outcome",
     ),
 ];
+
+/// What a guest declared about its contract version, parsed from
+/// [`VM_HTTP_CONTRACT_HEADER`] at the broker's boundary.
+///
+/// A DU rather than an `Option<u32>` because "said nothing" and "said something
+/// that is not a version" are different guests with the same remedy but
+/// different diagnostics, and because the broker must be able to *state* which
+/// it saw. `Malformed` deliberately carries nothing: quoting a guest-controlled
+/// string back into a response or a host log buys no diagnosis that "this guest
+/// is stale" does not already give, and costs an injection surface.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GuestContract {
+    /// A well-formed declaration.
+    Version(u32),
+    /// No declaration at all — necessarily a guest built before the version
+    /// that introduced the header.
+    Absent,
+    /// A declaration that is not a version, or more than one of them.
+    Malformed,
+}
+
+impl GuestContract {
+    /// Parse the header's values. More than one is [`Malformed`](Self::Malformed)
+    /// rather than first-wins: a request carrying two contradictory declarations
+    /// is not one the broker should have to pick a winner for.
+    pub fn parse<'a>(values: impl IntoIterator<Item = &'a str>) -> Self {
+        let mut values = values.into_iter();
+        let Some(first) = values.next() else {
+            return Self::Absent;
+        };
+        if values.next().is_some() {
+            return Self::Malformed;
+        }
+        match first.trim().parse::<u32>() {
+            Ok(version) => Self::Version(version),
+            Err(_) => Self::Malformed,
+        }
+    }
+}
+
+impl std::fmt::Display for GuestContract {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Version(version) => write!(f, "version {version}"),
+            Self::Absent => f.write_str("no version (a guest older than this header)"),
+            Self::Malformed => f.write_str("a malformed version"),
+        }
+    }
+}
+
+/// Which side is behind, and therefore what to do about it.
+///
+/// The version ordering says who is stale: telling an operator to rebuild the
+/// guest when the *broker* is the old one sends them round a loop that changes
+/// nothing (the rebuild produces the same guest, and does not restart the
+/// daemon).
+///
+/// Shared by both sides — the guest reaches it from a version mismatch it
+/// detected at startup, the broker from a header it refused — so the same skew
+/// cannot be described two ways depending on who noticed it.
+///
+/// [`GuestContract::Absent`] and [`GuestContract::Malformed`] name the guest,
+/// soundly: the header ships with the contract version that introduced it, so a
+/// guest that does not send one necessarily predates that version.
+pub fn contract_mismatch_remedy(guest: GuestContract, broker: u32) -> String {
+    let broker_is_older = match guest {
+        GuestContract::Version(guest) => broker < guest,
+        GuestContract::Absent | GuestContract::Malformed => false,
+    };
+    if broker_is_older {
+        format!(
+            "The broker is the older side: restart the `writd` daemon on the host from this \
+             build (and, for `broker_placement = vm`, rebuild its image with `{BROKER_IMAGE_REBUILD_COMMAND}`).",
+        )
+    } else {
+        format!(
+            "The guest is the older side: rebuild its image with `{GUEST_IMAGE_REBUILD_COMMAND}`."
+        )
+    }
+}
 
 /// Base path of the guest-facing Anthropic proxy. Each model vendor gets its
 /// own namespace because `/v1/models` is a real endpoint of *both* vendor APIs:
