@@ -268,7 +268,7 @@ impl BrokeredEffect for FlakeProvisionEffect {
     const REQUEST_AUDIT_KIND: &'static str = "flake_provision_request";
     const OUTCOME_AUDIT_KIND: &'static str = "flake_provision_outcome";
 
-    fn request_id(&self) -> RequestId {
+    fn audit_key(&self) -> impl std::fmt::Display + '_ {
         self.request_id
     }
 

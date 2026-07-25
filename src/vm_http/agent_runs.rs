@@ -2,7 +2,14 @@
 //! `/v1/agent-runs/{id}/outcome` endpoints. The config route delivers the
 //! one-shot prompt and model to the guest; the outcome route ingests the
 //! terminal status, exit code, and stdout/stderr stream summaries, persists
-//! the retained bytes to disk, and writes an audit record.
+//! the retained bytes to disk, and records the run's audit outcome.
+//!
+//! The outcome route is the *outcome-only* effect shape: the run's `agent_run`
+//! request row was minted when the run was **launched**, so this endpoint
+//! [resumes](crate::audit::AuditLog::resume_effect) that row through the
+//! `broker_effect` driver rather than beginning a second one. Resuming also
+//! claims the run id, so two concurrent uploads for one run cannot both write
+//! logs and then race for the outcome row's primary key.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -13,12 +20,16 @@ use crate::agent_run::{
     VM_AGENT_RUN_OUTCOME_PATH_SUFFIX, VM_AGENT_RUN_PATH_PREFIX, VmAgentRunConfigResponse,
     VmAgentRunOutcomeUpload,
 };
-use crate::audit::{AUDIT_WRITE_FAILURE_TARGET, AgentRunOutcomeAuditRecord};
+use crate::audit::{
+    AUDIT_WRITE_FAILURE_TARGET, AgentRunAuditRecord, AgentRunAuditTable,
+    AgentRunOutcomeAuditRecord, AuditLog, RecordedRequest, ResumeEffectError,
+};
 use crate::core::{SessionId, UnixMillis};
 use crate::secret::SecretStore;
 use crate::server::BrokerState;
 
-use super::{VmHttpResponse, VmHttpStatus};
+use super::broker_effect::{AcquireFailure, BrokeredEffect, EffectCompletion, broker_effect};
+use super::{VmHttpDispatch, VmHttpResponse, VmHttpStatus};
 
 // The JSON upload cap bounds retained bytes on the wire. This larger cap is a
 // defense-in-depth bound on the guest-reported full stream length, which is
@@ -133,75 +144,215 @@ pub(super) fn route_agent_run_config_request<S: SecretStore>(
     )
 }
 
-pub(super) fn route_agent_run_outcome_request<S: SecretStore>(
+/// Drive an outcome upload through the `broker_effect` guard: everything that
+/// answers *without* recording an outcome runs first
+/// ([`AgentRunOutcomeEffect::admit`]), and only an admitted upload reaches the
+/// driver, which resumes the run's launch row, materialises the streams, and
+/// completes the outcome.
+pub(super) async fn route_agent_run_outcome_request<S: SecretStore>(
     run_id: AgentRunId,
     authenticated_session_id: SessionId,
     body: &[u8],
     service: &VmHttpAgentRunService<S>,
-) -> VmHttpResponse {
-    let broker_state = service.broker_state();
-    // Bind the run to the authenticated session before any lookup or write.
-    // The run's owning session is fixed at request time; a session may only
-    // submit an outcome for a run it owns. A run belonging to another session —
-    // or one that does not exist — is reported identically as "not found", so
-    // this endpoint cannot be used as an oracle for other sessions' run IDs.
-    match broker_state.audit.get_agent_run(run_id) {
-        Ok(Some(record)) if record.session_id == authenticated_session_id => {}
-        Ok(_) => return VmHttpResponse::text(VmHttpStatus::NotFound, "not found"),
-        Err(err) => {
-            tracing::error!(
-                target: AUDIT_WRITE_FAILURE_TARGET,
-                kind = "agent_run_lookup",
-                run_id = %run_id,
-                error = %err,
-                "audit read failed",
-            );
-            return VmHttpResponse::text(VmHttpStatus::InternalServerError, "audit read failed");
+) -> VmHttpDispatch {
+    match AgentRunOutcomeEffect::admit(run_id, authenticated_session_id, body, service) {
+        AgentRunOutcomeAdmission::Answered(response) => response.into(),
+        AgentRunOutcomeAdmission::Admitted(effect) => {
+            broker_effect(&service.broker_state().audit, effect).await
         }
     }
-    match broker_state.audit.get_agent_run_outcome(run_id) {
-        Ok(Some(_)) => return VmHttpResponse::text(VmHttpStatus::Ok, "ok"),
-        Ok(None) => {}
-        Err(err) => {
-            tracing::error!(
-                target: AUDIT_WRITE_FAILURE_TARGET,
-                kind = "agent_run_outcome_lookup",
-                run_id = %run_id,
-                error = %err,
-                "audit read failed",
-            );
-            return VmHttpResponse::text(VmHttpStatus::InternalServerError, "audit read failed");
+}
+
+/// The outcome of pre-flighting an upload: either an admitted effect for the
+/// driver, or a response given without recording anything.
+enum AgentRunOutcomeAdmission {
+    Admitted(AgentRunOutcomeEffect),
+    /// A foreign or unknown run, an idempotent retry, or a malformed body — none
+    /// of which record an outcome.
+    Answered(VmHttpResponse),
+}
+
+/// An admitted outcome upload modelled as a [`BrokeredEffect`]. The effect is
+/// writing the run's retained stdout/stderr to the host filesystem; the driver
+/// owns the guard across it, so those logs cannot land without the outcome row
+/// that describes them (or, if the write fails, without the run's launch row
+/// being left honestly unpaired).
+struct AgentRunOutcomeEffect {
+    run_id: AgentRunId,
+    upload: VmAgentRunOutcomeUpload,
+    log_root: PathBuf,
+}
+
+impl AgentRunOutcomeEffect {
+    fn admit<S: SecretStore>(
+        run_id: AgentRunId,
+        authenticated_session_id: SessionId,
+        body: &[u8],
+        service: &VmHttpAgentRunService<S>,
+    ) -> AgentRunOutcomeAdmission {
+        let audit = &service.broker_state().audit;
+        // Bind the run to the authenticated session before any lookup or write.
+        // The run's owning session is fixed at request time; a session may only
+        // submit an outcome for a run it owns. A run belonging to another
+        // session — or one that does not exist — is reported identically as "not
+        // found", so this endpoint cannot be used as an oracle for other
+        // sessions' run IDs.
+        match audit.get_agent_run(run_id) {
+            Ok(Some(record)) if record.session_id == authenticated_session_id => {}
+            Ok(_) => return AgentRunOutcomeAdmission::Answered(not_found()),
+            Err(err) => {
+                return AgentRunOutcomeAdmission::Answered(audit_read_failed(
+                    "agent_run_lookup",
+                    run_id,
+                    &err,
+                ));
+            }
         }
+        // An outcome already recorded is an idempotent retry: answer as though
+        // this upload had produced it, and record nothing. This check is an
+        // early-out, not the authority — it runs outside the run's claim, so a
+        // concurrent upload can complete between here and `acquire`. The
+        // authoritative check is `resume_effect`'s, made under the claim; this
+        // one exists so a retry after completion is answered without parsing
+        // (and so a malformed retry body still gets the `200` it always did).
+        match audit.get_agent_run_outcome(run_id) {
+            Ok(Some(_)) => return AgentRunOutcomeAdmission::Answered(ok()),
+            Ok(None) => {}
+            Err(err) => {
+                return AgentRunOutcomeAdmission::Answered(audit_read_failed(
+                    "agent_run_outcome_lookup",
+                    run_id,
+                    &err,
+                ));
+            }
+        }
+        let upload = match serde_json::from_slice::<VmAgentRunOutcomeUpload>(body) {
+            Ok(upload) => upload,
+            Err(_) => {
+                return AgentRunOutcomeAdmission::Answered(VmHttpResponse::text(
+                    VmHttpStatus::BadRequest,
+                    "invalid outcome JSON",
+                ));
+            }
+        };
+        if upload.run_id != run_id {
+            return AgentRunOutcomeAdmission::Answered(VmHttpResponse::text(
+                VmHttpStatus::BadRequest,
+                "outcome run ID mismatch",
+            ));
+        }
+        AgentRunOutcomeAdmission::Admitted(AgentRunOutcomeEffect {
+            run_id,
+            upload,
+            log_root: service.log_root().to_path_buf(),
+        })
     }
-    let upload = match serde_json::from_slice::<VmAgentRunOutcomeUpload>(body) {
-        Ok(upload) => upload,
-        Err(_) => return VmHttpResponse::text(VmHttpStatus::BadRequest, "invalid outcome JSON"),
-    };
-    if upload.run_id != run_id {
-        return VmHttpResponse::text(VmHttpStatus::BadRequest, "outcome run ID mismatch");
+}
+
+impl BrokeredEffect for AgentRunOutcomeEffect {
+    type Table = AgentRunAuditTable;
+    type Outcome = AgentRunOutcome;
+    const REQUEST_AUDIT_KIND: &'static str = "agent_run_resume";
+    const OUTCOME_AUDIT_KIND: &'static str = "agent_run_outcome";
+
+    fn audit_key(&self) -> impl std::fmt::Display + '_ {
+        self.run_id
     }
 
-    let outcome = match materialize_agent_run_outcome_upload(upload, service.log_root()) {
-        Ok(outcome) => outcome,
-        Err(response) => return response,
-    };
-    if let Err(err) = broker_state
-        .audit
-        .record_agent_run_outcome(&AgentRunOutcomeAuditRecord {
-            completed_at: UnixMillis::now(),
-            outcome,
-        })
-    {
-        tracing::error!(
-            target: AUDIT_WRITE_FAILURE_TARGET,
-            kind = "agent_run_outcome",
-            run_id = %run_id,
-            error = %err,
-            "audit write failed",
-        );
-        return VmHttpResponse::text(VmHttpStatus::InternalServerError, "audit write failed");
+    /// Unreachable: [`acquire`](Self::acquire) resumes the launch row instead of
+    /// beginning a new one, so the driver never asks for a request row. Building
+    /// one here would be the double-insert `resume_effect` exists to prevent.
+    fn request_row(&self) -> AgentRunAuditRecord {
+        unreachable!("agent-run outcomes resume the launch row; they never begin one")
     }
+
+    /// Resume the `agent_run` row minted when the run was launched, claiming the
+    /// run id for the guard's lifetime.
+    fn acquire(
+        &self,
+        audit: &Arc<AuditLog>,
+    ) -> Result<RecordedRequest<AgentRunAuditTable>, AcquireFailure> {
+        audit
+            .resume_effect::<AgentRunAuditTable>(self.run_id)
+            .map_err(|err| match err {
+                // The run vanished between the ownership check and here. Same
+                // answer as an unknown run: never an ID oracle.
+                ResumeEffectError::NotBegun => AcquireFailure::Answered(not_found()),
+                // Another upload completed this run's outcome between the
+                // admission check above and this claim. That is an idempotent
+                // retry — the outcome *is* recorded — so it gets the same `200`
+                // a sequential retry gets, without performing the effect a
+                // second time. This is the authoritative check: the one in
+                // `admit` runs outside the claim and can be stale.
+                ResumeEffectError::AlreadyCompleted => AcquireFailure::Answered(ok()),
+                // Another upload for this run is in flight. Refuse rather than
+                // return the idempotent `200`: the in-flight upload may yet
+                // fail, and claiming an outcome was recorded when none was is
+                // the one answer this endpoint must never give. A retry gets
+                // either `200` (the outcome landed) or another `409`.
+                ResumeEffectError::AlreadyClaimed => {
+                    AcquireFailure::Answered(VmHttpResponse::text(
+                        VmHttpStatus::Conflict,
+                        "outcome upload already in flight",
+                    ))
+                }
+                ResumeEffectError::Audit(err) => AcquireFailure::Audit(err),
+            })
+    }
+
+    async fn perform(self) -> EffectCompletion<Self> {
+        let AgentRunOutcomeEffect {
+            upload, log_root, ..
+        } = self;
+        match materialize_agent_run_outcome_upload(upload, &log_root) {
+            Ok(outcome) => EffectCompletion::Buffered {
+                outcome,
+                response: ok(),
+            },
+            // The upload was rejected, or its logs could not be written: there is
+            // no truthful outcome for this run, so abandon rather than fabricate
+            // one. This is not merely "a fabricated row is worse than none" — the
+            // outcome row's primary key is the run id, so a fabricated failure
+            // would consume the run's only outcome slot and permanently prevent
+            // the real outcome from being recorded. An unpaired launch row is
+            // exactly what a run whose outcome has not arrived looks like, and
+            // the guest may retry.
+            Err(response) => EffectCompletion::Abandoned(Box::new(move |guard| {
+                guard.abandon();
+                response.into()
+            })),
+        }
+    }
+
+    fn outcome_row(outcome: &AgentRunOutcome) -> AgentRunOutcomeAuditRecord {
+        AgentRunOutcomeAuditRecord {
+            completed_at: UnixMillis::now(),
+            outcome: outcome.clone(),
+        }
+    }
+}
+
+fn ok() -> VmHttpResponse {
     VmHttpResponse::text(VmHttpStatus::Ok, "ok")
+}
+
+fn not_found() -> VmHttpResponse {
+    VmHttpResponse::text(VmHttpStatus::NotFound, "not found")
+}
+
+fn audit_read_failed(
+    kind: &'static str,
+    run_id: AgentRunId,
+    err: &dyn std::fmt::Display,
+) -> VmHttpResponse {
+    tracing::error!(
+        target: AUDIT_WRITE_FAILURE_TARGET,
+        kind,
+        run_id = %run_id,
+        error = %err,
+        "audit read failed",
+    );
+    VmHttpResponse::text(VmHttpStatus::InternalServerError, "audit read failed")
 }
 
 fn materialize_agent_run_outcome_upload(
@@ -463,7 +614,9 @@ mod tests {
         );
 
         let response =
-            route_agent_run_outcome_request(run_id, session.session_id(), &body, &service);
+            route_agent_run_outcome_request(run_id, session.session_id(), &body, &service)
+                .await
+                .into_buffered();
 
         assert_eq!(response.status, VmHttpStatus::Ok);
         let outcome = state.audit.get_agent_run_outcome(run_id).unwrap().unwrap();
@@ -478,7 +631,9 @@ mod tests {
         assert!(outcome.outcome.stdout.path.starts_with(temp.path()));
 
         let retried =
-            route_agent_run_outcome_request(run_id, session.session_id(), &body, &service);
+            route_agent_run_outcome_request(run_id, session.session_id(), &body, &service)
+                .await
+                .into_buffered();
         assert_eq!(retried.status, VmHttpStatus::Ok);
 
         // Stage-0 audit-pair oracle (writ-audit::effect_audit_oracle): the run's
@@ -538,7 +693,9 @@ mod tests {
         let attacker_session_id = SessionId::new();
         assert_ne!(attacker_session_id, owner.session_id());
         let response =
-            route_agent_run_outcome_request(run_id, attacker_session_id, &body, &service);
+            route_agent_run_outcome_request(run_id, attacker_session_id, &body, &service)
+                .await
+                .into_buffered();
 
         assert_eq!(response.status, VmHttpStatus::NotFound);
         // No outcome may have been written for the owner's run.
@@ -546,8 +703,232 @@ mod tests {
 
         // The rightful owner can still submit its own outcome afterwards.
         let owner_response =
-            route_agent_run_outcome_request(run_id, owner.session_id(), &body, &service);
+            route_agent_run_outcome_request(run_id, owner.session_id(), &body, &service)
+                .await
+                .into_buffered();
         assert_eq!(owner_response.status, VmHttpStatus::Ok);
+    }
+
+    /// Seed a launched run owned by `session` and return a valid upload body for
+    /// it, so the tests below differ only in what they do to that upload.
+    fn launched_run(
+        state: &Arc<crate::server::BrokerState<Box<dyn SecretStore>>>,
+        session_id: SessionId,
+        run_id: AgentRunId,
+    ) -> VmAgentRunOutcomeUpload {
+        state
+            .audit
+            .record_agent_run(&crate::audit::AgentRunAuditRecord {
+                run_id,
+                session_id,
+                requested_at: UnixMillis::now(),
+                agent_kind: crate::core::AgentKind::Claude,
+                prompt: AgentPrompt::new("prompt").summary(),
+                correlation_id: None,
+            })
+            .unwrap();
+        let empty = AgentRunStreamUpload {
+            byte_len: 0,
+            sha256_hex: crate::agent_run::sha256_hex(b""),
+            truncated: false,
+            retained_sha256_hex: crate::agent_run::sha256_hex(b""),
+            retained_base64: base64::engine::general_purpose::STANDARD.encode(b""),
+        };
+        VmAgentRunOutcomeUpload {
+            run_id,
+            status: crate::agent_run::AgentRunTerminalStatus::Succeeded,
+            exit_code: 0,
+            stdout: empty.clone(),
+            stderr: empty,
+        }
+    }
+
+    /// Exactly one upload for a run may proceed at a time. A second, arriving
+    /// while the first still holds the run's guard, is refused *before* it writes
+    /// any logs — and is told so honestly, rather than given the idempotent `200`
+    /// for an outcome that has not been recorded and might yet fail.
+    #[tokio::test]
+    async fn a_concurrent_upload_is_refused_while_one_is_in_flight() {
+        let github = MockServer::start().await;
+        let state = make_broker_state(&github);
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::LOCALHOST, 32).unwrap());
+        open_audit_session(&state, session.session_id());
+        let run_id: AgentRunId = "00000000-0000-0000-0000-000000000406".parse().unwrap();
+        let upload = launched_run(&state, session.session_id(), run_id);
+        let body = serde_json::to_vec(&upload).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let service =
+            VmHttpAgentRunService::new(Arc::clone(&state), temp.path().join("agent-runs"));
+
+        // Stand in for an upload already inside the driver: it holds the run's
+        // guard, exactly as `acquire` does for the duration of `perform`.
+        let in_flight = state
+            .audit
+            .resume_effect::<AgentRunAuditTable>(run_id)
+            .expect("the run was launched and is unclaimed");
+
+        let contended =
+            route_agent_run_outcome_request(run_id, session.session_id(), &body, &service)
+                .await
+                .into_buffered();
+
+        assert_eq!(contended.status, VmHttpStatus::Conflict);
+        assert!(
+            state.audit.get_agent_run_outcome(run_id).unwrap().is_none(),
+            "the refused upload must not have recorded anything"
+        );
+        assert!(
+            !temp
+                .path()
+                .join("agent-runs")
+                .join(run_id.to_string())
+                .exists(),
+            "the refused upload must not have written logs either"
+        );
+
+        // Once the in-flight upload is done with the run, a retry proceeds.
+        in_flight.abandon();
+        let retried =
+            route_agent_run_outcome_request(run_id, session.session_id(), &body, &service)
+                .await
+                .into_buffered();
+        assert_eq!(retried.status, VmHttpStatus::Ok);
+        assert!(state.audit.get_agent_run_outcome(run_id).unwrap().is_some());
+    }
+
+    /// The admission-time "already has an outcome?" check runs outside the run's
+    /// claim, so it can go stale: another upload may complete between it and the
+    /// claim. The upload that got the stale answer must *not* then perform the
+    /// effect and discover the collision at the outcome row's primary key — the
+    /// authoritative check inside `resume_effect` catches it and gives the same
+    /// idempotent `200` a sequential retry gets.
+    #[tokio::test]
+    async fn an_upload_admitted_before_another_completed_is_answered_idempotently() {
+        let github = MockServer::start().await;
+        let state = make_broker_state(&github);
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::LOCALHOST, 32).unwrap());
+        open_audit_session(&state, session.session_id());
+        let run_id: AgentRunId = "00000000-0000-0000-0000-000000000408".parse().unwrap();
+        let upload = launched_run(&state, session.session_id(), run_id);
+        let temp = tempfile::tempdir().unwrap();
+        let service =
+            VmHttpAgentRunService::new(Arc::clone(&state), temp.path().join("agent-runs"));
+
+        // Admit an upload while no outcome exists — the stale observation.
+        let AgentRunOutcomeAdmission::Admitted(stale) = AgentRunOutcomeEffect::admit(
+            run_id,
+            session.session_id(),
+            &serde_json::to_vec(&upload).unwrap(),
+            &service,
+        ) else {
+            panic!("a launched, unrecorded run must admit");
+        };
+
+        // ...then let another upload complete the run, exactly as a concurrent
+        // request would have between the admission and the claim.
+        let winner_service =
+            VmHttpAgentRunService::new(Arc::clone(&state), temp.path().join("winner-runs"));
+        let winner = route_agent_run_outcome_request(
+            run_id,
+            session.session_id(),
+            &serde_json::to_vec(&upload).unwrap(),
+            &winner_service,
+        )
+        .await
+        .into_buffered();
+        assert_eq!(winner.status, VmHttpStatus::Ok);
+
+        let response = broker_effect(&state.audit, stale).await.into_buffered();
+
+        assert_eq!(response.status, VmHttpStatus::Ok);
+        assert_eq!(response.body, b"ok");
+        assert!(
+            !temp
+                .path()
+                .join("agent-runs")
+                .join(run_id.to_string())
+                .exists(),
+            "the stale upload must not have performed the effect a second time"
+        );
+        // The winner's outcome stands, and the pair is complete.
+        let recorded = state.audit.get_agent_run_outcome(run_id).unwrap().unwrap();
+        assert!(
+            recorded
+                .outcome
+                .stdout
+                .path
+                .starts_with(temp.path().join("winner-runs")),
+            "got: {}",
+            recorded.outcome.stdout.path.display()
+        );
+        state
+            .audit
+            .assert_effect_audit_pairs_complete("agent_run", "agent_run_outcome", "run_id");
+    }
+
+    /// An upload the broker cannot honestly record — a rejected stream, or logs
+    /// it fails to write — must leave the run's outcome slot **free**. The
+    /// outcome row is keyed by run id, so recording a fabricated failure would
+    /// permanently prevent the run's real outcome from ever being recorded.
+    #[tokio::test]
+    async fn a_rejected_upload_leaves_the_run_free_to_report_its_real_outcome() {
+        let github = MockServer::start().await;
+        let state = make_broker_state(&github);
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::LOCALHOST, 32).unwrap());
+        open_audit_session(&state, session.session_id());
+        let run_id: AgentRunId = "00000000-0000-0000-0000-000000000407".parse().unwrap();
+        let upload = launched_run(&state, session.session_id(), run_id);
+        let temp = tempfile::tempdir().unwrap();
+
+        // (a) A stream whose retained bytes contradict their hash is rejected
+        // after the guard is live.
+        let mut bad = upload.clone();
+        bad.stdout.retained_sha256_hex = crate::agent_run::sha256_hex(b"not what was sent");
+        let service =
+            VmHttpAgentRunService::new(Arc::clone(&state), temp.path().join("agent-runs"));
+        let rejected = route_agent_run_outcome_request(
+            run_id,
+            session.session_id(),
+            &serde_json::to_vec(&bad).unwrap(),
+            &service,
+        )
+        .await
+        .into_buffered();
+        assert_eq!(rejected.status, VmHttpStatus::BadRequest);
+        assert!(state.audit.get_agent_run_outcome(run_id).unwrap().is_none());
+
+        // (b) Logs that cannot be written — the log root is a regular file, so
+        // the run directory cannot be created — are a host fault, and equally
+        // must not consume the slot.
+        let blocker = temp.path().join("blocker");
+        std::fs::write(&blocker, b"not a directory").unwrap();
+        let broken = VmHttpAgentRunService::new(Arc::clone(&state), blocker.join("agent-runs"));
+        let failed = route_agent_run_outcome_request(
+            run_id,
+            session.session_id(),
+            &serde_json::to_vec(&upload).unwrap(),
+            &broken,
+        )
+        .await
+        .into_buffered();
+        assert_eq!(failed.status, VmHttpStatus::InternalServerError);
+        assert!(state.audit.get_agent_run_outcome(run_id).unwrap().is_none());
+
+        // The run can still report its real outcome afterwards, and the pair is
+        // complete.
+        let recovered = route_agent_run_outcome_request(
+            run_id,
+            session.session_id(),
+            &serde_json::to_vec(&upload).unwrap(),
+            &service,
+        )
+        .await
+        .into_buffered();
+        assert_eq!(recovered.status, VmHttpStatus::Ok);
+        assert!(state.audit.get_agent_run_outcome(run_id).unwrap().is_some());
+        state
+            .audit
+            .assert_effect_audit_pairs_complete("agent_run", "agent_run_outcome", "run_id");
     }
 
     #[tokio::test]
@@ -582,7 +963,9 @@ mod tests {
         let body = serde_json::to_vec(&upload).unwrap();
 
         let response =
-            route_agent_run_outcome_request(run_id, session.session_id(), &body, &service);
+            route_agent_run_outcome_request(run_id, session.session_id(), &body, &service)
+                .await
+                .into_buffered();
 
         assert_eq!(response.status, VmHttpStatus::NotFound);
     }
@@ -634,7 +1017,9 @@ mod tests {
             session.session_id(),
             &serde_json::to_vec(&upload).unwrap(),
             &service,
-        );
+        )
+        .await
+        .into_buffered();
 
         assert_eq!(response.status, VmHttpStatus::BadRequest);
         let upload = VmAgentRunOutcomeUpload {
@@ -653,7 +1038,9 @@ mod tests {
             session.session_id(),
             &serde_json::to_vec(&upload).unwrap(),
             &service,
-        );
+        )
+        .await
+        .into_buffered();
         assert_eq!(response.status, VmHttpStatus::BadRequest);
 
         let upload = VmAgentRunOutcomeUpload {
@@ -672,7 +1059,9 @@ mod tests {
             session.session_id(),
             &serde_json::to_vec(&upload).unwrap(),
             &service,
-        );
+        )
+        .await
+        .into_buffered();
         assert_eq!(response.status, VmHttpStatus::Ok);
         let outcome = state.audit.get_agent_run_outcome(run_id).unwrap().unwrap();
         assert_eq!(outcome.outcome.stdout.byte_len, 1);

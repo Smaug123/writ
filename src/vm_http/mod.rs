@@ -1421,7 +1421,7 @@ where
                 .into();
         }
         return route_agent_run_outcome_request(run_id, session.session_id(), &body, &service)
-            .into();
+            .await;
     }
 
     route_session_endpoint(session, request).into()

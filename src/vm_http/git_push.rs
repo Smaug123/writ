@@ -235,7 +235,7 @@ impl<'a, S: SecretStore + Send + Sync + 'static> BrokeredEffect for GitPushEffec
     const REQUEST_AUDIT_KIND: &'static str = "git_push_request";
     const OUTCOME_AUDIT_KIND: &'static str = "git_push_outcome";
 
-    fn request_id(&self) -> RequestId {
+    fn audit_key(&self) -> impl std::fmt::Display + '_ {
         self.push_request_id
     }
 
