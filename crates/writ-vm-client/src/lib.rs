@@ -23,7 +23,8 @@ use writ_core::process_spawn;
 use writ_vm_git::{
     DEFAULT_DEVSHELL_ATTR, DEFAULT_WORKSPACE_BRANCH, GIT_BUNDLE_CONTENT_TYPE,
     GIT_PUSH_BUNDLE_CONTENT_TYPE, GitBranchName, GitCloneRef, GitCloneRepo, GitObjectId,
-    VM_FLAKE_PROVISION_PATH, VM_GIT_CLONE_PATH, VM_GIT_PUSH_PATH, VmFlakeProvisionErrorResponse,
+    VM_FLAKE_PROVISION_PATH, VM_GIT_CLONE_PATH, VM_GIT_PUSH_PATH, VM_HTTP_CONTRACT_HEADER,
+    VM_HTTP_CONTRACT_VERSION, VM_SESSION_PATH, VmFlakeProvisionErrorResponse,
     VmFlakeProvisionRequest, VmFlakeProvisionResponse, VmGitCloneErrorResponse, VmGitCloneRequest,
     VmGitPushErrorResponse, VmGitPushMetadata, VmGitPushRequest, VmGitPushStagedReceipt,
     WorkspaceWarmMode, default_workspace_destination, encode_vm_git_push_request_body,
@@ -275,6 +276,30 @@ impl VmClientConfig {
             .join(relative)
             .expect("validated broker URL must join relative VM HTTP paths")
     }
+
+    /// Begin a request to the broker, carrying both credentials this guest owes
+    /// it: the session bearer token, and the contract version it speaks.
+    ///
+    /// Every call site used to assemble these by hand, which made "does this
+    /// request declare everything it must?" a per-site question with seven
+    /// answers. The broker now *refuses* a request on one of its own routes that
+    /// omits [`VM_HTTP_CONTRACT_HEADER`], so a forgotten header is no longer a
+    /// missing check but a broken endpoint — hence one constructor, and no
+    /// public way to reach a bare [`Url`].
+    fn request(&self, method: reqwest::Method, path: &str) -> reqwest::RequestBuilder {
+        reqwest::Client::new()
+            .request(method, self.endpoint(path))
+            .bearer_auth(self.bearer_token().as_str())
+            .header(VM_HTTP_CONTRACT_HEADER, VM_HTTP_CONTRACT_VERSION)
+    }
+
+    fn get(&self, path: &str) -> reqwest::RequestBuilder {
+        self.request(reqwest::Method::GET, path)
+    }
+
+    fn post(&self, path: &str) -> reqwest::RequestBuilder {
+        self.request(reqwest::Method::POST, path)
+    }
 }
 
 impl VmBrokerToken {
@@ -439,11 +464,7 @@ impl VmWorkspaceInitCommand {
 }
 
 pub async fn get_session_json(config: &VmClientConfig) -> Result<serde_json::Value, VmClientError> {
-    let response = reqwest::Client::new()
-        .get(config.endpoint("/v1/session"))
-        .bearer_auth(config.bearer_token().as_str())
-        .send()
-        .await?;
+    let response = config.get(VM_SESSION_PATH).send().await?;
     let response = require_success(response).await?;
     response
         .json::<serde_json::Value>()
@@ -483,11 +504,7 @@ fn contract_mismatch_remedy(guest: u32, broker: u32) -> String {
 /// newer broker's extra fields cannot stop an older guest from *diagnosing* the
 /// mismatch.
 pub async fn verify_broker_contract(config: &VmClientConfig) -> Result<(), VmClientError> {
-    let response = reqwest::Client::new()
-        .get(config.endpoint("/v1/session"))
-        .bearer_auth(config.bearer_token().as_str())
-        .send()
-        .await?;
+    let response = config.get(VM_SESSION_PATH).send().await?;
     let response = require_success(response).await?;
     let contract = response.json::<writ_vm_git::VmHttpContract>().await?;
     if contract.version == writ_vm_git::VM_HTTP_CONTRACT_VERSION {
@@ -503,11 +520,7 @@ pub async fn fetch_agent_run_config(
     config: &VmClientConfig,
     run_id: AgentRunId,
 ) -> Result<(AgentPrompt, String), VmClientError> {
-    let response = reqwest::Client::new()
-        .get(config.endpoint(&vm_agent_run_config_path(run_id)))
-        .bearer_auth(config.bearer_token().as_str())
-        .send()
-        .await?;
+    let response = config.get(&vm_agent_run_config_path(run_id)).send().await?;
     let response = require_success(response).await?;
     require_content_type(&response, "application/json")?;
     response
@@ -528,9 +541,8 @@ pub async fn upload_agent_run_outcome(
         stdout: agent_run_stream_upload(&outcome.stdout)?,
         stderr: agent_run_stream_upload(&outcome.stderr)?,
     };
-    let response = reqwest::Client::new()
-        .post(config.endpoint(&vm_agent_run_outcome_path(outcome.run_id)))
-        .bearer_auth(config.bearer_token().as_str())
+    let response = config
+        .post(&vm_agent_run_outcome_path(outcome.run_id))
         .json(&upload)
         .send()
         .await?;
@@ -577,9 +589,8 @@ pub async fn push_to_broker(
     })?;
     let body = encode_vm_git_push_request_body(&request)
         .expect("encoded VmGitPushMetadata is always valid JSON");
-    let response = reqwest::Client::new()
-        .post(config.endpoint(VM_GIT_PUSH_PATH))
-        .bearer_auth(config.bearer_token().as_str())
+    let response = config
+        .post(VM_GIT_PUSH_PATH)
         .header(reqwest::header::CONTENT_TYPE, GIT_PUSH_BUNDLE_CONTENT_TYPE)
         .body(body)
         .send()
@@ -719,9 +730,8 @@ async fn post_flake_provision(
     config: &VmClientConfig,
     request: &VmFlakeProvisionRequest,
 ) -> Result<VmFlakeProvisionResponse, FlakeProvisionDegrade> {
-    let response = reqwest::Client::new()
-        .post(config.endpoint(VM_FLAKE_PROVISION_PATH))
-        .bearer_auth(config.bearer_token().as_str())
+    let response = config
+        .post(VM_FLAKE_PROVISION_PATH)
         .json(request)
         .send()
         .await
@@ -750,12 +760,7 @@ async fn fetch_git_clone_bundle(
     config: &VmClientConfig,
     request: &VmGitCloneRequest,
 ) -> Result<Vec<u8>, VmClientError> {
-    let response = reqwest::Client::new()
-        .post(config.endpoint(VM_GIT_CLONE_PATH))
-        .bearer_auth(config.bearer_token().as_str())
-        .json(request)
-        .send()
-        .await?;
+    let response = config.post(VM_GIT_CLONE_PATH).json(request).send().await?;
     let response = require_success(response).await?;
     require_content_type(&response, GIT_BUNDLE_CONTENT_TYPE)?;
     read_bounded_bundle_body(response, config.max_bundle_bytes()).await

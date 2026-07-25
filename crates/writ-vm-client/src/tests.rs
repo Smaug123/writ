@@ -5,12 +5,16 @@
 
 use super::*;
 use proptest::prelude::*;
+use std::collections::BTreeSet;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use writ_vm_git::{GUEST_IMAGE_REBUILD_COMMAND, VM_HTTP_CONTRACT_VERSION};
+use writ_vm_git::{
+    GUEST_IMAGE_REBUILD_COMMAND, VM_HTTP_CONTRACT_HEADER, VM_HTTP_CONTRACT_VERSION,
+    WRIT_VM_ORIGINATED_TARGETS,
+};
 
 fn repo() -> GitCloneRepo {
     "owner/repo".parse().unwrap()
@@ -1719,5 +1723,240 @@ proptest! {
 
         prop_assert!(!debug.contains(&token), "{debug}");
         prop_assert!(debug.contains("<redacted>"), "{debug}");
+    }
+}
+
+/// **Every request the guest originates declares its contract version.**
+///
+/// The broker will refuse a request on one of its own routes that does not
+/// (issue #342), so a call site that forgets the header does not merely lose a
+/// check — it stops working. Both halves are asserted here, and neither is worth
+/// much alone:
+///
+/// - every captured request carries the header *and* the bearer token, so a new
+///   entry point that hand-rolls its `reqwest` call is caught; and
+/// - the set of targets actually driven equals
+///   [`WRIT_VM_ORIGINATED_TARGETS`], so an entry point that exists but is never
+///   driven here cannot hide. The host side pins that same list against the
+///   routes it requires the header on, which is what keeps the guest's idea of
+///   what it originates and the broker's idea of what it demands from drifting.
+#[tokio::test]
+async fn every_broker_request_the_guest_originates_declares_its_contract_version() {
+    let dir = tempfile::tempdir().unwrap();
+    let real_git = required_test_tool("git");
+    let sample_run_id: AgentRunId = "00000000-0000-0000-0000-000000000501".parse().unwrap();
+
+    let mut observed: BTreeSet<(String, String)> = BTreeSet::new();
+
+    // `GET /v1/session` — the handshake. Exempt from the broker's check (it is
+    // how a mismatch is diagnosed), but still ours, so it still declares.
+    observed.insert(
+        capture_originated_request(
+            http_response("200 OK", "application/json", session_body().as_bytes()),
+            |config| async move {
+                verify_broker_contract(&config).await.unwrap();
+            },
+        )
+        .await,
+    );
+
+    // `POST /v1/git/clone`.
+    {
+        let git = write_fake_git(dir.path());
+        let destination = dir.path().join("checkout");
+        observed.insert(
+            capture_originated_request(
+                http_response("200 OK", GIT_BUNDLE_CONTENT_TYPE, b"bundle bytes"),
+                |config| async move {
+                    let command = VmGitCloneCommand::new(
+                        repo(),
+                        Some("refs/heads/main".parse().unwrap()),
+                        Some(destination),
+                        git,
+                    )
+                    .unwrap();
+                    clone_from_broker(&config, &command).await.unwrap();
+                },
+            )
+            .await,
+        );
+    }
+
+    // `POST /v1/git/push`.
+    {
+        let push_dir = dir.path().join("push");
+        fs::create_dir_all(&push_dir).unwrap();
+        let new_head = fake_oid('b');
+        let git = write_fake_git_push(
+            &push_dir,
+            &new_head,
+            b"PACK push bundle",
+            &list_heads_line(&new_head, "feature/x"),
+        );
+        let workdir = push_dir.join("repo");
+        fs::create_dir_all(&workdir).unwrap();
+        let body = receipt_json(
+            "owner/repo",
+            "feature/x",
+            &new_head,
+            None,
+            "00000000-0000-0000-0000-000000000601",
+            1_700_000_000_000,
+        );
+        observed.insert(
+            capture_originated_request(
+                http_response("200 OK", "application/json", body.as_bytes()),
+                |config| async move {
+                    let command = VmGitPushCommand::new(
+                        repo(),
+                        parse_branch("feature/x"),
+                        parse_oid(&new_head),
+                        None,
+                        workdir,
+                        git,
+                    )
+                    .unwrap();
+                    push_to_broker(&config, &command).await.unwrap();
+                },
+            )
+            .await,
+        );
+    }
+
+    // `POST /v1/nix/flake/provision`, driven through the best-effort wrapper
+    // that the workspace init actually uses.
+    {
+        let repo_dir = dir.path().join("provision-repo");
+        commit_one_file(&real_git, &repo_dir);
+        let body = br#"{"status":"provisioned","request_id":"00000000-0000-0000-0000-000000000001","input_count":0,"archived_path_count":0,"archived_bytes":0}"#;
+        observed.insert(
+            capture_originated_request(
+                http_response("200 OK", "application/json", body),
+                |config| async move {
+                    let command = VmWorkspaceInitCommand::new(
+                        repo(),
+                        Some(repo_dir),
+                        WorkspaceWarmMode::Sources,
+                        real_git,
+                        "nix",
+                        None,
+                    )
+                    .unwrap();
+                    provision_flake_inputs_best_effort(&config, &command).await;
+                },
+            )
+            .await,
+        );
+    }
+
+    // `GET /v1/agent-runs/{id}/config`.
+    {
+        let body = serde_json::to_vec(&VmAgentRunConfigResponse::new(
+            sample_run_id,
+            AgentPrompt::new("prompt"),
+            "gpt-5.4-mini",
+        ))
+        .unwrap();
+        observed.insert(
+            capture_originated_request(
+                http_response("200 OK", "application/json", &body),
+                |config| async move {
+                    fetch_agent_run_config(&config, sample_run_id)
+                        .await
+                        .unwrap();
+                },
+            )
+            .await,
+        );
+    }
+
+    // `POST /v1/agent-runs/{id}/outcome`.
+    {
+        let outcome = sample_agent_run_outcome(dir.path(), sample_run_id);
+        observed.insert(
+            capture_originated_request(
+                http_response("200 OK", "application/json", b"{}"),
+                |config| async move {
+                    upload_agent_run_outcome(&config, &outcome).await.unwrap();
+                },
+            )
+            .await,
+        );
+    }
+
+    let expected: BTreeSet<(String, String)> = WRIT_VM_ORIGINATED_TARGETS
+        .iter()
+        .map(|(method, target)| ((*method).to_string(), (*target).to_string()))
+        .collect();
+    assert_eq!(
+        observed, expected,
+        "the requests this test drives and WRIT_VM_ORIGINATED_TARGETS have drifted; \
+         the broker requires the contract header on exactly the latter",
+    );
+}
+
+fn session_body() -> String {
+    format!(
+        r#"{{"api":"writ-vm-http","version":{VM_HTTP_CONTRACT_VERSION},"session_id":"0198c0de-0000-7000-8000-000000000001"}}"#
+    )
+}
+
+/// Drives one client entry point against the capturing stub, asserts the request
+/// it put on the wire declares both credentials, and returns its
+/// `(method, target)` for the totality check above.
+async fn capture_originated_request<F, Fut>(response: String, drive: F) -> (String, String)
+where
+    F: FnOnce(VmClientConfig) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    let (broker_url, captured) = serve_once(response).await;
+    let config = VmClientConfig::new(broker_url, "writ-vm-secret").unwrap();
+
+    drive(config).await;
+
+    let request = captured.lock().unwrap().clone();
+    let lower = request.to_ascii_lowercase();
+    assert!(
+        lower.contains(&format!(
+            "{}: {VM_HTTP_CONTRACT_VERSION}\r\n",
+            VM_HTTP_CONTRACT_HEADER
+        )),
+        "request does not declare the guest contract version: {request}",
+    );
+    assert!(
+        lower.contains("authorization: bearer writ-vm-secret"),
+        "request does not carry the bearer token: {request}",
+    );
+    let mut parts = request
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .split_whitespace();
+    let method = parts.next().unwrap_or_default().to_string();
+    let target = parts.next().unwrap_or_default().to_string();
+    (method, target)
+}
+
+fn sample_agent_run_outcome(dir: &Path, run_id: AgentRunId) -> AgentRunOutcome {
+    let stdout_path = dir.join("stdout.log");
+    let stderr_path = dir.join("stderr.log");
+    fs::write(&stdout_path, b"out").unwrap();
+    fs::write(&stderr_path, b"err").unwrap();
+    AgentRunOutcome {
+        run_id,
+        status: writ_agent_run::AgentRunTerminalStatus::Succeeded,
+        exit_code: 0,
+        stdout: AgentRunStreamSummary {
+            path: stdout_path,
+            byte_len: 3,
+            sha256_hex: writ_agent_run::sha256_hex(b"out"),
+            truncated: false,
+        },
+        stderr: AgentRunStreamSummary {
+            path: stderr_path,
+            byte_len: 3,
+            sha256_hex: writ_agent_run::sha256_hex(b"err"),
+            truncated: false,
+        },
     }
 }
