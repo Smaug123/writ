@@ -214,7 +214,7 @@ Unix socket, as `broker.md` describes — but that doc's "add HTTP later"
 prediction has landed as *three* additional transports it never documents: the
 guest-facing `vm_http` HTTP listener (§5.6), the read-only `ui_http` JSON API
 (§5.10), and a broker-in-VM mode (`writd broker`, `broker_entrypoint.rs`) that
-binds a fixed TCP port and negotiates `BROKER_PROTOCOL_VERSION=2` via a
+binds a fixed TCP port and negotiates `BROKER_PROTOCOL_VERSION` via a
 ready-file handshake (§5.5). The staged-push approval subsystem and the
 run-agent orchestration have been split into `server/staged_push.rs` and
 `server/run_agent.rs`; `server.rs` is now ~880 lines of transport, dispatch, and
@@ -420,6 +420,30 @@ writ's alone. The pre-split proxy paths resolve to `PlainRoute::LegacyProxyPath`
 and answer `410 Gone` naming the remedy, so a guest image built before the split
 fails diagnosably rather than looking like an unknown endpoint; that shim is
 temporary (`docs/plans/2026-07-25-proxy-vendor-namespaces.md`).
+
+**Two version handshakes, one fingerprint.** The guest and the broker are built
+from the same tree and only ever meant to ship together, but both run from images
+loaded into the local container store, so a rebuilt host can launch a stale one.
+Each axis has a constant and refuses a mismatch with an actionable "rebuild the
+image":
+
+- **host ↔ broker VM** (`broker_placement = vm`): `BROKER_PROTOCOL_VERSION`
+  (`broker_protocol.rs`), stamped into the broker's ready file and checked by the
+  host at launch.
+- **guest ↔ broker**: `VM_HTTP_CONTRACT_VERSION` (`writ-vm-git`), reported in
+  `GET /v1/session` and checked by `writ-vm` at startup before any real work —
+  `writ-vm session` is exempt, being the diagnostic one needs *during* a
+  mismatch. The guest parses only the `version` field, so a newer broker's extra
+  fields cannot stop an older guest from diagnosing the skew.
+
+Both are pinned by one CI test, `broker_contract_fingerprint_is_pinned`
+(`broker_vm/tests.rs`), whose fingerprint covers the broker's CLI flags, its
+ready-doc schema, **and the guest-facing route surface** — sourced from the route
+table's endpoint map, which the totality oracle already forces to be complete. So
+moving a guest-visible path fails the build until both constants are bumped. That
+coverage was added after the model-proxy namespaces moved every guest URL without
+either bump: the mechanism existed, but a path change was not treated as a
+contract change.
 
 **The route table.** A request is classified **once**, by
 `VmHttpRoute::resolve`, into either `Brokered(BrokeredRoute)` — an effect whose

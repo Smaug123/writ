@@ -153,6 +153,13 @@ fn run_invocation_is_dual_homed_with_mounts_and_broker_command() {
 /// the model-proxy vendor namespaces changed every guest URL without bumping the
 /// version, so a stale broker VM image would have been accepted as compatible and
 /// then `404`d every model request. A path change is a contract change.
+///
+/// It pins **two** version constants, because one route surface gates two
+/// independently-rebuildable images: `BROKER_PROTOCOL_VERSION` forces the broker
+/// VM image to be rebuilt (host↔broker axis), and `VM_HTTP_CONTRACT_VERSION`
+/// forces the *guest* image to be (guest↔broker axis, checked by the guest at
+/// startup). A guest-visible change generally moves both, and this is the one
+/// place that makes forgetting either of them a build failure.
 #[test]
 fn broker_contract_fingerprint_is_pinned() {
     let args = sample_plan().run_invocation().args_lossy();
@@ -183,9 +190,10 @@ fn broker_contract_fingerprint_is_pinned() {
         .map(|(method, target, _)| format!("{method} {target}"))
         .collect();
     let fingerprint = format!(
-        "broker-cli-flags: {}\nready-doc: {}\nguest-routes: {}",
+        "broker-cli-flags: {}\nready-doc: {}\nguest-contract-version: {}\nguest-routes: {}",
         flags.join(" "),
         serde_json::to_string(&ready_doc).unwrap(),
+        crate::vm_git::VM_HTTP_CONTRACT_VERSION,
         routes.join(", "),
     );
 
@@ -193,6 +201,7 @@ fn broker_contract_fingerprint_is_pinned() {
         fingerprint,
         "broker-cli-flags: --config --session-spec --bearer-token-file\n\
          ready-doc: {\"protocol_version\":3,\"broker_port\":18080,\"writd_build\":\"pinned\"}\n\
+         guest-contract-version: 2\n\
          guest-routes: GET /v1/session, GET /v1/nix/cache/nix-cache-info, \
          GET /v1/nix/cache/abc.narinfo, GET /v1/nix/prewarm/nix-cache-info, \
          POST /anthropic/v1/messages, POST /anthropic/v1/messages/count_tokens, \
@@ -202,8 +211,10 @@ fn broker_contract_fingerprint_is_pinned() {
          POST /v1/git/clone, POST /v1/git/push, POST /v1/nix/flake/provision, \
          GET /v1/agent-runs/00000000-0000-0000-0000-000000000001/config, \
          POST /v1/agent-runs/00000000-0000-0000-0000-000000000001/outcome",
-        "the host↔broker contract changed. Update this snapshot AND bump \
-         BROKER_PROTOCOL_VERSION (and rebuild the broker image)."
+        "the guest/broker contract changed. Update this snapshot AND bump the version \
+         constant(s) the change affects: BROKER_PROTOCOL_VERSION for anything the broker \
+         VM image serves or parses, VM_HTTP_CONTRACT_VERSION for anything a guest \
+         requests (a moved path is both). Then rebuild the affected image(s)."
     );
 }
 

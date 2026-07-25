@@ -1644,7 +1644,7 @@ mod tests {
     /// message named `build-guest-image`, which does not parse.
     #[test]
     fn the_guest_image_rebuild_advice_names_a_real_command() {
-        let command = writ::vm_http::GUEST_IMAGE_REBUILD_COMMAND;
+        let command = writ::vm_git::GUEST_IMAGE_REBUILD_COMMAND;
         let mut words = command.split_whitespace();
         assert_eq!(
             words.next(),

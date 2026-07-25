@@ -64,18 +64,7 @@ use crate::bearer::is_bearer_token_byte;
 use crate::core::{BrokerPort, BrokerPortRange, Ipv4Cidr, SessionId};
 use crate::secret::SecretStore;
 use crate::server::BrokerState;
-use crate::vm_git::VmGitPushBodyLimits;
-
-/// The command a guest is told to run when its image predates a broker change —
-/// today, the model-proxy vendor namespaces.
-///
-/// A `const` rather than a literal in the message because advice naming a CLI
-/// command rots silently: the first draft named a subcommand that never
-/// existed, so a guest following it would have failed at argument parsing.
-/// `the_guest_image_rebuild_advice_names_a_real_command` (in `bin/writ.rs`)
-/// parses this against the real CLI, so renaming the subcommand breaks the
-/// build rather than the advice.
-pub const GUEST_IMAGE_REBUILD_COMMAND: &str = "writ agent-vm build-image";
+use crate::vm_git::{GUEST_IMAGE_REBUILD_COMMAND, VM_HTTP_CONTRACT_VERSION, VmGitPushBodyLimits};
 
 const MAX_VM_HTTP_BODY_BYTES: usize = 64 * 1024;
 const MAX_VM_HTTP_AGENT_RUN_OUTCOME_BODY_BYTES: usize = 4 * 1024 * 1024;
@@ -1399,7 +1388,9 @@ fn route_session_endpoint(session: &VmHttpSession, request: &VmHttpRequest) -> V
             &SessionResponse {
                 session_id: session.session_id,
                 api: "writ-vm-http",
-                version: 1,
+                // Sourced from the constant the guest compares against, so the
+                // reported version cannot drift from the compiled contract.
+                version: VM_HTTP_CONTRACT_VERSION,
             },
         ),
         ("GET", _) => VmHttpResponse::text(VmHttpStatus::NotFound, "not found"),
