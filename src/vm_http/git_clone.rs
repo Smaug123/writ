@@ -163,6 +163,13 @@ impl VmHttpGitCloneConfig {
     /// Infallible because `VmHttpGitCloneConfig::new_with_clone_base_url`
     /// already enforces every invariant `PromoteRuntimeConfig::new`
     /// checks for.
+    ///
+    /// `timeout` becomes the promote config's *step* timeout only. It
+    /// is sized for a `git fetch` over the network (`clone_timeout_secs`,
+    /// default 300 s), which is the wrong order of magnitude for a pipe
+    /// read from a local `git cat-file --batch` child — so that deadline
+    /// stays at [`crate::git_push_promote::DEFAULT_CAT_FILE_TIMEOUT`]
+    /// rather than being inherited here.
     pub fn to_promote_runtime_config(&self) -> crate::git_push_promote::PromoteRuntimeConfig {
         crate::git_push_promote::PromoteRuntimeConfig::new(
             self.git_program.clone(),
@@ -583,6 +590,52 @@ mod tests {
             owner: owner.into(),
             name: name.into(),
         }
+    }
+
+    /// The clone timeout is a *network* budget — `clone_timeout_secs`
+    /// defaults to 300 s because a `git fetch` of a large repository
+    /// legitimately takes minutes. Promote inherits it as the ceiling on
+    /// its own one-shot `git` invocations, which is right, but it must
+    /// not reach the `git cat-file --batch` deadlines: those bound a
+    /// pipe round-trip to an already-running child reading a local
+    /// object DB, where 300 s is not caution but five minutes of an
+    /// approve parked on a wedged read, attempt row and operator
+    /// approval still live.
+    #[test]
+    fn the_network_sized_clone_timeout_is_not_inherited_as_the_cat_file_deadline() {
+        let clone_timeout =
+            std::time::Duration::from_secs(crate::config::default_clone_timeout_secs());
+        let config = VmHttpGitCloneConfig::new(
+            PathBuf::from("/usr/bin/git"),
+            GitCredentialBoundary::new(
+                PathBuf::from("/usr/local/bin/fake-askpass"),
+                crate::vm_git_bundle::GitSecretEnvVar::new("WRIT_GIT_TOKEN").unwrap(),
+            )
+            .unwrap(),
+            PathBuf::from("/tmp/writ-clone"),
+            clone_timeout,
+            1 << 20,
+        )
+        .unwrap();
+
+        let promote = config.to_promote_runtime_config();
+        assert_eq!(
+            promote.step_timeout(),
+            clone_timeout,
+            "the one-shot git steps keep the configured budget",
+        );
+        assert_eq!(
+            promote.cat_file_timeout(),
+            crate::git_push_promote::DEFAULT_CAT_FILE_TIMEOUT,
+            "the cat-file deadline must be the fixed wedge detector, not the clone budget",
+        );
+        assert!(
+            promote.cat_file_timeout() < promote.step_timeout(),
+            "a local pipe read must never be given a network-sized budget: \
+             cat_file={:?} step={:?}",
+            promote.cat_file_timeout(),
+            promote.step_timeout(),
+        );
     }
 
     fn expiry_str_from_now(secs: i64) -> String {

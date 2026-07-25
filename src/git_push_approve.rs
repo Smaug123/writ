@@ -359,18 +359,19 @@ pub async fn prepare_approve_with_staging_repo(
     )
     .await?;
 
-    // `step_timeout` becomes the source's per-object read deadline: the
-    // `git cat-file --batch` traversal reads a *local* object DB, so any
-    // single read that outlives the same ceiling the one-shot git steps
-    // run under has wedged. This is where the fix for the unbounded
-    // `read_object_raw` pipe awaits lives — per object, so the walker's
-    // GitHub uploads (bounded separately by `GitDataTimeouts`, and
-    // deliberately allowed to run slower) are never folded into it.
+    // `cat_file_timeout` — *not* `step_timeout` — becomes the source's
+    // per-object read deadline: the traversal reads a *local* object DB
+    // over a pipe to an already-running child, so it wants a tight wedge
+    // detector, whereas a step timeout has to cover a whole subprocess
+    // including a network `fetch`. This is where the fix for the
+    // unbounded `read_object_raw` pipe awaits lives — per object, so the
+    // walker's GitHub uploads (bounded separately by `GitDataTimeouts`,
+    // and deliberately allowed to run slower) are never folded into it.
     let source = CatFileObjectSource::open(
         staging.path(),
         runtime.git_program(),
         STAGING_REPO_MAX_OBJECT_BYTES,
-        runtime.step_timeout(),
+        runtime.cat_file_timeout(),
     )
     .await?;
 
@@ -417,13 +418,17 @@ pub async fn prepare_approve_with_staging_repo(
     // elapse the dropped `close()` future runs its internal
     // `PgidCleanupGuard`, which SIGKILLs the process group (see
     // `cat_file_source_close_cancellation_kills_process_group`).
-    if tokio::time::timeout(runtime.step_timeout(), source.close())
+    // `cat_file_timeout` again: reaping a child that has been told to
+    // finish is the same class of local interaction as reading one
+    // object from it, and a step-sized ceiling here would leave a
+    // wedged child unreaped for minutes.
+    if tokio::time::timeout(runtime.cat_file_timeout(), source.close())
         .await
         .is_err()
     {
         tracing::warn!(
-            step_timeout = ?runtime.step_timeout(),
-            "`git cat-file --batch` did not exit within the step timeout; \
+            cat_file_timeout = ?runtime.cat_file_timeout(),
+            "`git cat-file --batch` did not exit within the cat-file timeout; \
              SIGKILLed its process group via the cancellation guard",
         );
     }

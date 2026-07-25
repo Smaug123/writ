@@ -1225,7 +1225,11 @@ fn default_flake_mirror_cache_max_bytes() -> u64 {
     10 * 1024 * 1024 * 1024
 }
 
-fn default_clone_timeout_secs() -> u64 {
+/// Crate-visible so the promote-config wiring test can assert against
+/// the real default rather than a copy of it: this value is a *network*
+/// budget, and the point of that test is that it never reaches a
+/// deadline on a local pipe read.
+pub(crate) fn default_clone_timeout_secs() -> u64 {
     300
 }
 

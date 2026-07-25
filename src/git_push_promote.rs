@@ -48,6 +48,20 @@ use crate::signing::WritSigningKey;
 use crate::vm_git::{GitBranchName, GitObjectId};
 use crate::vm_git_bundle::{GitCloneBaseUrl, GitCredentialBoundary};
 
+/// Default for [`PromoteRuntimeConfig::cat_file_timeout`].
+///
+/// Deliberately a constant rather than a deployment knob: it does not
+/// bound how much *work* the broker will tolerate, it asserts a
+/// property of a healthy machine. Every interaction it covers is a
+/// single exchange with an already-running local child over a pipe —
+/// hand it a SHA, read the object back; or close stdin and reap. On a
+/// working host these are milliseconds, and no legitimate repository
+/// makes them slow, because size is bounded separately by
+/// `STAGING_REPO_MAX_OBJECT_BYTES`. Thirty seconds is therefore not a
+/// budget but a wedge detector, and the same value
+/// [`crate::git_push_objects_cat_file`]'s own tests treat as "plenty".
+pub const DEFAULT_CAT_FILE_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Static configuration the broker needs to drive an approved staged
 /// push end-to-end: spin up a fresh bare staging repo, fetch the
 /// prerequisite commit from origin, ingest the bundle, then plan +
@@ -60,7 +74,10 @@ use crate::vm_git_bundle::{GitCloneBaseUrl, GitCredentialBoundary};
 /// prereq fetch against `https://github.com/<owner>/<name>.git`;
 /// `work_root` as the parent directory under which each promote
 /// allocates a fresh per-request staging repo; and `step_timeout` as
-/// the per-step ceiling each `git` invocation runs under.
+/// the per-step ceiling each *one-shot* `git` invocation runs under.
+///
+/// `cat_file_timeout` is deliberately *not* `step_timeout`: see its
+/// accessor for why one duration cannot serve both roles.
 ///
 /// Carried as `Option<Arc<Self>>` on
 /// [`crate::server::BrokerState`]. `None` means writd was booted
@@ -74,6 +91,7 @@ pub struct PromoteRuntimeConfig {
     credential: GitCredentialBoundary,
     work_root: PathBuf,
     step_timeout: Duration,
+    cat_file_timeout: Duration,
 }
 
 #[derive(Debug, thiserror::Error, Eq, PartialEq)]
@@ -86,6 +104,8 @@ pub enum PromoteRuntimeConfigError {
     RelativeWorkRoot(PathBuf),
     #[error("step_timeout must be nonzero")]
     ZeroStepTimeout,
+    #[error("cat_file_timeout must be nonzero")]
+    ZeroCatFileTimeout,
 }
 
 impl PromoteRuntimeConfig {
@@ -116,7 +136,28 @@ impl PromoteRuntimeConfig {
             credential,
             work_root,
             step_timeout,
+            cat_file_timeout: DEFAULT_CAT_FILE_TIMEOUT,
         })
+    }
+
+    /// Override [`Self::cat_file_timeout`], which otherwise defaults to
+    /// [`DEFAULT_CAT_FILE_TIMEOUT`].
+    ///
+    /// Exists so a test can shrink the wedge detector to milliseconds
+    /// without also shrinking `step_timeout` — which would put the
+    /// deadline under test in a race with the real `git` subprocesses
+    /// the same pipeline runs. Production does not call it: the default
+    /// is the intended value, and there is nothing an operator could
+    /// usefully tune (see the constant's doc).
+    pub fn with_cat_file_timeout(
+        mut self,
+        cat_file_timeout: Duration,
+    ) -> Result<Self, PromoteRuntimeConfigError> {
+        if cat_file_timeout.is_zero() {
+            return Err(PromoteRuntimeConfigError::ZeroCatFileTimeout);
+        }
+        self.cat_file_timeout = cat_file_timeout;
+        Ok(self)
     }
 
     pub fn git_program(&self) -> &Path {
@@ -135,8 +176,36 @@ impl PromoteRuntimeConfig {
         &self.work_root
     }
 
+    /// Ceiling on one *one-shot* `git` subprocess: `init --bare`,
+    /// `fetch`, `bundle unbundle`, `cat-file -t`, `rev-list`. Each
+    /// spawns a process that does real work — a `fetch` pulls the
+    /// prerequisite commit over the network — so this is sized for the
+    /// slowest legitimate one, and in production comes from
+    /// `clone_timeout_secs` (default 300 s).
     pub fn step_timeout(&self) -> Duration {
         self.step_timeout
+    }
+
+    /// Ceiling on one exchange with the long-lived `git cat-file
+    /// --batch` child: a single object read, and the final reap in
+    /// `close()`.
+    ///
+    /// Separate from [`Self::step_timeout`] because the two bound
+    /// different things and want opposite sizes. A step timeout covers
+    /// a whole subprocess including a network fetch, so it must be
+    /// generous; these are pipe round-trips to a child that is already
+    /// running against a *local* object DB, so a generous value is not
+    /// caution but a hole — under `step_timeout`'s production default a
+    /// wedged read would park an approve, holding the attempt row and
+    /// the operator's live approval, for five minutes per object.
+    ///
+    /// Reusing one duration also made the wedged-traversal test
+    /// unreliable: it had to set the shared value low enough to finish
+    /// quickly, which put the real `cat-file -t` subprocess in a race
+    /// with the deadline under test, and under parallel-test load the
+    /// subprocess sometimes lost.
+    pub fn cat_file_timeout(&self) -> Duration {
+        self.cat_file_timeout
     }
 }
 
@@ -718,6 +787,51 @@ mod tests {
     }
 
     #[test]
+    fn promote_runtime_config_rejects_zero_cat_file_timeout() {
+        let err = PromoteRuntimeConfig::new(
+            PathBuf::from("/usr/bin/git"),
+            GitCloneBaseUrl::github(),
+            sample_credential(),
+            PathBuf::from("/tmp/promote"),
+            Duration::from_secs(30),
+        )
+        .expect("valid promote runtime config")
+        .with_cat_file_timeout(Duration::ZERO)
+        .expect_err("zero cat-file timeout must be rejected");
+        assert_eq!(err, PromoteRuntimeConfigError::ZeroCatFileTimeout);
+    }
+
+    /// The two durations are independent by construction: overriding one
+    /// must not disturb the other, in either direction. This is the
+    /// property the wedged-traversal test relies on to set a tight read
+    /// deadline without putting the real `git` subprocesses it also runs
+    /// into a race.
+    #[test]
+    fn the_cat_file_timeout_defaults_and_overrides_independently_of_the_step_timeout() {
+        let base = PromoteRuntimeConfig::new(
+            PathBuf::from("/usr/bin/git"),
+            GitCloneBaseUrl::github(),
+            sample_credential(),
+            PathBuf::from("/tmp/promote"),
+            Duration::from_secs(300),
+        )
+        .expect("valid promote runtime config");
+        assert_eq!(base.step_timeout(), Duration::from_secs(300));
+        assert_eq!(base.cat_file_timeout(), DEFAULT_CAT_FILE_TIMEOUT);
+
+        let tightened = base
+            .clone()
+            .with_cat_file_timeout(Duration::from_millis(500))
+            .expect("nonzero cat-file timeout");
+        assert_eq!(tightened.cat_file_timeout(), Duration::from_millis(500));
+        assert_eq!(
+            tightened.step_timeout(),
+            base.step_timeout(),
+            "shrinking the cat-file deadline must not shrink the step ceiling",
+        );
+    }
+
+    #[test]
     fn promote_runtime_config_round_trips_valid_inputs() {
         let cfg = PromoteRuntimeConfig::new(
             PathBuf::from("/usr/bin/git"),
@@ -730,6 +844,7 @@ mod tests {
         assert_eq!(cfg.git_program(), Path::new("/usr/bin/git"));
         assert_eq!(cfg.work_root(), Path::new("/tmp/promote"));
         assert_eq!(cfg.step_timeout(), Duration::from_secs(60));
+        assert_eq!(cfg.cat_file_timeout(), DEFAULT_CAT_FILE_TIMEOUT);
         assert_eq!(cfg.clone_base_url(), &GitCloneBaseUrl::github());
         let _credential: &GitCredentialBoundary = cfg.credential();
     }
