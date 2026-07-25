@@ -20,6 +20,161 @@ fn parse_state_name(raw: &str) -> Result<ApproveAttemptStateName, AuditError> {
     ))
 }
 
+/// Read one attempt row back as its parsed state, inside a transaction.
+///
+/// Every write path starts here: the machine ([`approve_attempt::apply`])
+/// judges a transition against the state the attempt is *actually* in, so
+/// the write has to see the whole row (mint included), not just the
+/// `state` column. Reading inside the caller's transaction is what makes
+/// the read-decide-write sequence atomic.
+fn load_attempt_state(
+    tx: &rusqlite::Transaction<'_>,
+    attempt_id: ApproveAttemptId,
+) -> Result<(GitPushApproveAttemptState, String), AuditError> {
+    let entry = tx
+        .query_row(
+            "SELECT attempt_id, push_request_id, operator, started_at,
+                    state, outcome, completed_at,
+                    new_app_tip, failure_detail,
+                    mint_jti, mint_github_app_id, mint_issued_at, mint_expires_at
+               FROM git_push_approve_attempt
+              WHERE attempt_id = ?1",
+            params![attempt_id.as_uuid().to_string()],
+            git_push_approve_attempt_from_row,
+        )
+        .optional()?;
+    let Some(entry) = entry else {
+        return Err(AuditError::Invariant("approve attempt does not exist"));
+    };
+    let entry = entry?;
+    Ok((entry.state, entry.push_request_id.as_uuid().to_string()))
+}
+
+/// Persist a state the machine produced, writing *every* mutable column
+/// from it.
+///
+/// The columns are derived from the state rather than from the transition
+/// that produced it, so a write cannot disagree with what
+/// [`approve_attempt::apply`] decided — there is no second place where a
+/// step chooses which columns to set. The schema's forward-only,
+/// mint-immutability, and ledger-agreement triggers still judge the
+/// result; a refusal here means the Rust machine and the schema have
+/// diverged, which the `transition_agrees_with_the_schema` test exists to
+/// prevent.
+fn write_attempt_state(
+    tx: &rusqlite::Transaction<'_>,
+    attempt_id: ApproveAttemptId,
+    state: &GitPushApproveAttemptState,
+) -> Result<(), AuditError> {
+    let (new_app_tip, failure_detail) = match state {
+        GitPushApproveAttemptState::Started | GitPushApproveAttemptState::Uncertain { .. } => {
+            (None, None)
+        }
+        GitPushApproveAttemptState::Resolved { outcome, .. } => match outcome {
+            GitPushApproveAttemptOutcome::Succeeded { new_app_tip } => {
+                (Some(new_app_tip.as_str().to_string()), None)
+            }
+            GitPushApproveAttemptOutcome::PrePatchFailure { detail }
+            | GitPushApproveAttemptOutcome::PostPatchFailure { detail } => {
+                (None, Some(detail.clone()))
+            }
+        },
+    };
+    let completed_at = match state {
+        GitPushApproveAttemptState::Resolved { completed_at, .. } => Some(completed_at.as_millis()),
+        _ => None,
+    };
+    let mint = match state {
+        GitPushApproveAttemptState::Started => None,
+        GitPushApproveAttemptState::Uncertain { mint } => Some(*mint),
+        GitPushApproveAttemptState::Resolved { mint, .. } => *mint,
+    };
+    let github_app_id = match mint {
+        None => None,
+        Some(mint) => Some(i64::try_from(mint.github_app_id).map_err(|_| {
+            AuditError::Invariant("approve attempt mint github_app_id exceeds SQLite integer")
+        })?),
+    };
+    tx.execute(
+        "UPDATE git_push_approve_attempt
+            SET state = ?2,
+                outcome = ?3,
+                completed_at = ?4,
+                new_app_tip = ?5,
+                failure_detail = ?6,
+                mint_jti = ?7,
+                mint_github_app_id = ?8,
+                mint_issued_at = ?9,
+                mint_expires_at = ?10
+          WHERE attempt_id = ?1",
+        params![
+            attempt_id.as_uuid().to_string(),
+            state.name().as_wire(),
+            state.outcome_name().map(|o| o.as_wire()),
+            completed_at,
+            new_app_tip,
+            failure_detail,
+            mint.map(|m| m.jti.as_uuid().to_string()),
+            github_app_id,
+            mint.map(|m| m.issued_at.as_millis()),
+            mint.map(|m| m.expires_at.as_millis()),
+        ],
+    )?;
+    Ok(())
+}
+
+/// The v7 ledger mint recorded against an attempt, if any. Read inside
+/// the caller's transaction so a resolve copies the same value the
+/// eligibility check saw.
+fn read_attempt_ledger_mint(
+    tx: &rusqlite::Transaction<'_>,
+    attempt_id: ApproveAttemptId,
+) -> Result<Option<PromoteMintAudit>, AuditError> {
+    let row = tx
+        .query_row(
+            "SELECT mint_jti, mint_github_app_id, mint_issued_at, mint_expires_at
+               FROM git_push_approve_attempt_mint
+              WHERE attempt_id = ?1",
+            params![attempt_id.as_uuid().to_string()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((jti_str, app_id, issued_at, expires_at)) = row else {
+        return Ok(None);
+    };
+    let jti = uuid::Uuid::parse_str(&jti_str)
+        .map(Jti::from_uuid)
+        .map_err(|_| AuditError::Invariant("attempt mint ledger: jti is not a uuid"))?;
+    let github_app_id = u64::try_from(app_id)
+        .map_err(|_| AuditError::Invariant("attempt mint ledger: github_app_id is negative"))?;
+    Ok(Some(PromoteMintAudit {
+        jti,
+        github_app_id,
+        issued_at: UnixMillis::from_millis(issued_at),
+        expires_at: UnixMillis::from_millis(expires_at),
+    }))
+}
+
+/// Apply a transition to the attempt's current state and persist the
+/// result, all inside `tx`. Returns the state that was written.
+fn transition_attempt(
+    tx: &rusqlite::Transaction<'_>,
+    attempt_id: ApproveAttemptId,
+    transition: &ApproveAttemptTransition,
+) -> Result<GitPushApproveAttemptState, AuditError> {
+    let (current, _) = load_attempt_state(tx, attempt_id)?;
+    let next = approve_attempt::apply(&current, transition)?;
+    write_attempt_state(tx, attempt_id, &next)?;
+    Ok(next)
+}
+
 /// Insert one git-push request row into this connection/transaction. Assumes
 /// `check_session_open` ran. The base pair carries no field validation of its
 /// own (the request fields are already parsed newtypes — `GitCloneRepo`,
@@ -511,34 +666,14 @@ impl AuditLog {
         attempt_id: ApproveAttemptId,
         mint: PromoteMintAudit,
     ) -> Result<UncertainAttempt, AuditError> {
-        let github_app_id = i64::try_from(mint.github_app_id).map_err(|_| {
-            AuditError::Invariant("approve attempt mint github_app_id exceeds SQLite integer")
-        })?;
         self.with_conn_mut(|c| {
-            let updated = c.execute(
-                "UPDATE git_push_approve_attempt
-                    SET state = ?6,
-                        mint_jti = ?2,
-                        mint_github_app_id = ?3,
-                        mint_issued_at = ?4,
-                        mint_expires_at = ?5
-                  WHERE attempt_id = ?1
-                    AND state = ?7",
-                params![
-                    attempt_id.as_uuid().to_string(),
-                    mint.jti.as_uuid().to_string(),
-                    github_app_id,
-                    mint.issued_at.as_millis(),
-                    mint.expires_at.as_millis(),
-                    ApproveAttemptStateName::Uncertain.as_wire(),
-                    ApproveAttemptStateName::Started.as_wire(),
-                ],
+            let tx = c.transaction()?;
+            transition_attempt(
+                &tx,
+                attempt_id,
+                &ApproveAttemptTransition::MarkUncertain { mint },
             )?;
-            if updated == 0 {
-                return Err(AuditError::Invariant(
-                    "approve attempt is not in 'started' state",
-                ));
-            }
+            tx.commit()?;
             Ok(UncertainAttempt { attempt_id })
         })
     }
@@ -571,67 +706,33 @@ impl AuditLog {
 
         self.with_conn_mut(|c| {
             let tx = c.transaction()?;
-            // Load the current attempt row inside the TX so the
-            // resolution row is written from the same mint context that
-            // the attempt records.
-            let row = tx
-                .query_row(
-                    "SELECT state, push_request_id,
-                            mint_jti, mint_github_app_id, mint_issued_at, mint_expires_at
-                       FROM git_push_approve_attempt
-                      WHERE attempt_id = ?1",
-                    params![attempt_id.as_uuid().to_string()],
-                    |row| {
-                        Ok(ApproveAttemptMintRow {
-                            state: row.get(0)?,
-                            push_request_id: row.get(1)?,
-                            mint_jti: row.get(2)?,
-                            mint_app: row.get(3)?,
-                            mint_iat: row.get(4)?,
-                            mint_exp: row.get(5)?,
-                        })
-                    },
-                )
-                .optional()?;
-            let Some(ApproveAttemptMintRow {
-                state,
-                push_request_id,
-                mint_jti,
-                mint_app,
-                mint_iat,
-                mint_exp,
-            }) = row
-            else {
-                return Err(AuditError::Invariant("approve attempt does not exist"));
-            };
-            if parse_state_name(&state)? != ApproveAttemptStateName::Uncertain {
-                return Err(AuditError::Invariant(
-                    "approve attempt is not in 'uncertain' state",
-                ));
-            }
-            let (Some(mint_jti), Some(mint_app), Some(mint_iat), Some(mint_exp)) =
-                (mint_jti, mint_app, mint_iat, mint_exp)
+            // Read, decide, and write inside one transaction so the
+            // resolution row is derived from the same mint context the
+            // attempt records.
+            let (current, push_request_id) = load_attempt_state(&tx, attempt_id)?;
+            let resolved = approve_attempt::apply(
+                &current,
+                &ApproveAttemptTransition::ResolveSucceeded {
+                    new_app_tip: new_app_tip.clone(),
+                    completed_at,
+                },
+            )?;
+            write_attempt_state(&tx, attempt_id, &resolved)?;
+
+            // `apply` carries the `Uncertain` row's mint onto the
+            // resolved state, so the resolution row and the attempt row
+            // cannot name different credentials.
+            let GitPushApproveAttemptState::Resolved {
+                mint: Some(mint), ..
+            } = &resolved
             else {
                 return Err(AuditError::Invariant(
                     "approve attempt 'uncertain' row is missing mint context",
                 ));
             };
-
-            tx.execute(
-                "UPDATE git_push_approve_attempt
-                    SET state = ?4,
-                        outcome = ?5,
-                        new_app_tip = ?2,
-                        completed_at = ?3
-                  WHERE attempt_id = ?1",
-                params![
-                    attempt_id.as_uuid().to_string(),
-                    new_app_tip.as_str(),
-                    completed_at.as_millis(),
-                    ApproveAttemptStateName::Resolved.as_wire(),
-                    ApproveAttemptOutcomeName::Succeeded.as_wire(),
-                ],
-            )?;
+            let github_app_id = i64::try_from(mint.github_app_id).map_err(|_| {
+                AuditError::Invariant("approve attempt mint github_app_id exceeds SQLite integer")
+            })?;
 
             tx.execute(
                 "INSERT INTO git_push_resolution (
@@ -643,10 +744,10 @@ impl AuditLog {
                     completed_at.as_millis(),
                     operator,
                     reason,
-                    mint_jti,
-                    mint_app,
-                    mint_iat,
-                    mint_exp,
+                    mint.jti.as_uuid().to_string(),
+                    github_app_id,
+                    mint.issued_at.as_millis(),
+                    mint.expires_at.as_millis(),
                 ],
             )?;
 
@@ -679,16 +780,16 @@ impl AuditLog {
         detail: &str,
         completed_at: UnixMillis,
     ) -> Result<(), AuditError> {
-        self.complete_attempt_failure(
-            attempt_id,
-            ApproveAttemptOutcomeName::PrePatchFailure,
-            &[
-                ApproveAttemptStateName::Started,
-                ApproveAttemptStateName::Uncertain,
-            ],
-            detail,
-            completed_at,
-        )
+        self.resolve_attempt_failure(attempt_id, detail, |current| {
+            // A `Started` row may have a v7 ledger mint to carry onto the
+            // resolved row; an `Uncertain` row carries its own, so the
+            // transition supplies none and `apply` preserves it.
+            ApproveAttemptTransition::ResolvePrePatchFailure {
+                detail: detail.to_string(),
+                mint: current,
+                completed_at,
+            }
+        })
     }
 
     /// Complete a `Started` attempt as `PrePatchFailure` while
@@ -714,50 +815,16 @@ impl AuditLog {
                 "approve attempt failure detail must not be empty",
             ));
         }
-        let github_app_id = i64::try_from(mint.github_app_id).map_err(|_| {
-            AuditError::Invariant("approve attempt mint github_app_id exceeds SQLite integer")
-        })?;
-
         self.with_conn_mut(|c| {
             let tx = c.transaction()?;
-            let current_state: Option<String> = tx
-                .query_row(
-                    "SELECT state FROM git_push_approve_attempt WHERE attempt_id = ?1",
-                    params![attempt_id.as_uuid().to_string()],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            let Some(state) = current_state else {
-                return Err(AuditError::Invariant("approve attempt does not exist"));
-            };
-            if parse_state_name(&state)? != ApproveAttemptStateName::Started {
-                return Err(AuditError::Invariant(
-                    "approve attempt: capturing-mint pre_patch_failure requires 'started' state",
-                ));
-            }
-
-            tx.execute(
-                "UPDATE git_push_approve_attempt
-                    SET state = ?8,
-                        outcome = ?9,
-                        failure_detail = ?2,
-                        completed_at = ?3,
-                        mint_jti = ?4,
-                        mint_github_app_id = ?5,
-                        mint_issued_at = ?6,
-                        mint_expires_at = ?7
-                  WHERE attempt_id = ?1",
-                params![
-                    attempt_id.as_uuid().to_string(),
-                    detail,
-                    completed_at.as_millis(),
-                    mint.jti.as_uuid().to_string(),
-                    github_app_id,
-                    mint.issued_at.as_millis(),
-                    mint.expires_at.as_millis(),
-                    ApproveAttemptStateName::Resolved.as_wire(),
-                    ApproveAttemptOutcomeName::PrePatchFailure.as_wire(),
-                ],
+            transition_attempt(
+                &tx,
+                attempt_id,
+                &ApproveAttemptTransition::CapturePrePatchFailure {
+                    detail: detail.to_string(),
+                    mint,
+                    completed_at,
+                },
             )?;
             tx.commit()?;
             Ok(())
@@ -773,13 +840,12 @@ impl AuditLog {
         detail: &str,
         completed_at: UnixMillis,
     ) -> Result<(), AuditError> {
-        self.complete_attempt_failure(
-            attempt_id,
-            ApproveAttemptOutcomeName::PostPatchFailure,
-            &[ApproveAttemptStateName::Uncertain],
-            detail,
-            completed_at,
-        )
+        self.resolve_attempt_failure(attempt_id, detail, |_current| {
+            ApproveAttemptTransition::ResolvePostPatchFailure {
+                detail: detail.to_string(),
+                completed_at,
+            }
+        })
     }
 
     /// Record that boot reconcile observed an `Uncertain` attempt at
@@ -966,13 +1032,22 @@ impl AuditLog {
         })
     }
 
-    fn complete_attempt_failure(
+    /// Shared body of the two failure-resolve entry points: read the
+    /// attempt's current state (and, for a `Started` row, the v7 ledger
+    /// mint that must follow it into the resolved row), build the
+    /// caller's transition from that, apply it, and persist the result.
+    ///
+    /// `build` receives the ledger mint the resolve should carry —
+    /// `Some` only when the attempt is still `Started` *and* it minted;
+    /// an `Uncertain` row carries its mint on the row itself and
+    /// [`approve_attempt::apply`] preserves it. The caller decides
+    /// whether to use it, which is the only difference between the
+    /// pre-patch and post-patch entry points.
+    fn resolve_attempt_failure(
         &self,
         attempt_id: ApproveAttemptId,
-        outcome: ApproveAttemptOutcomeName,
-        allowed_states: &[ApproveAttemptStateName],
         detail: &str,
-        completed_at: UnixMillis,
+        build: impl FnOnce(Option<PromoteMintAudit>) -> ApproveAttemptTransition,
     ) -> Result<(), AuditError> {
         if detail.is_empty() {
             return Err(AuditError::Invariant(
@@ -987,98 +1062,17 @@ impl AuditLog {
 
         self.with_conn_mut(|c| {
             let tx = c.transaction()?;
-            let current_state: Option<String> = tx
-                .query_row(
-                    "SELECT state FROM git_push_approve_attempt WHERE attempt_id = ?1",
-                    params![attempt_id.as_uuid().to_string()],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            let Some(state) = current_state else {
-                return Err(AuditError::Invariant("approve attempt does not exist"));
+            let (current, _) = load_attempt_state(&tx, attempt_id)?;
+            // The ledger is read inside the TX so the eligibility
+            // decision and the mint copy see one snapshot. The schema's
+            // `resolve_carries_ledger_mint` trigger backs this up against
+            // paths that forget.
+            let ledger_mint = match current {
+                GitPushApproveAttemptState::Started => read_attempt_ledger_mint(&tx, attempt_id)?,
+                _ => None,
             };
-            let state = parse_state_name(&state)?;
-            if !allowed_states.contains(&state) {
-                return Err(AuditError::Invariant(
-                    "approve attempt is not in a state that admits this failure outcome",
-                ));
-            }
-
-            // A `started` attempt may carry a v7 mint-ledger row (the
-            // mint is recorded before the prepare phase; the inline
-            // columns stay NULL until `uncertain`). The resolve must
-            // copy that mint onto the row — invariant: a recorded
-            // credential's identity follows the attempt into every
-            // later state. Read it inside the TX so the copy and the
-            // eligibility check see one snapshot; the schema's
-            // `resolve_carries_ledger_mint` trigger backs this up
-            // against paths that forget. An `uncertain` attempt
-            // already carries its mint inline and the UPDATE below
-            // leaves those columns untouched.
-            let ledger_mint = if state == ApproveAttemptStateName::Started {
-                tx.query_row(
-                    "SELECT mint_jti, mint_github_app_id, mint_issued_at, mint_expires_at
-                       FROM git_push_approve_attempt_mint
-                      WHERE attempt_id = ?1",
-                    params![attempt_id.as_uuid().to_string()],
-                    |row| {
-                        Ok((
-                            row.get::<_, String>(0)?,
-                            row.get::<_, i64>(1)?,
-                            row.get::<_, i64>(2)?,
-                            row.get::<_, i64>(3)?,
-                        ))
-                    },
-                )
-                .optional()?
-            } else {
-                None
-            };
-
-            match ledger_mint {
-                Some((jti, app_id, issued_at, expires_at)) => {
-                    tx.execute(
-                        "UPDATE git_push_approve_attempt
-                            SET state = ?9,
-                                outcome = ?2,
-                                failure_detail = ?3,
-                                completed_at = ?4,
-                                mint_jti = ?5,
-                                mint_github_app_id = ?6,
-                                mint_issued_at = ?7,
-                                mint_expires_at = ?8
-                          WHERE attempt_id = ?1",
-                        params![
-                            attempt_id.as_uuid().to_string(),
-                            outcome.as_wire(),
-                            detail,
-                            completed_at.as_millis(),
-                            jti,
-                            app_id,
-                            issued_at,
-                            expires_at,
-                            ApproveAttemptStateName::Resolved.as_wire(),
-                        ],
-                    )?;
-                }
-                None => {
-                    tx.execute(
-                        "UPDATE git_push_approve_attempt
-                            SET state = ?5,
-                                outcome = ?2,
-                                failure_detail = ?3,
-                                completed_at = ?4
-                          WHERE attempt_id = ?1",
-                        params![
-                            attempt_id.as_uuid().to_string(),
-                            outcome.as_wire(),
-                            detail,
-                            completed_at.as_millis(),
-                            ApproveAttemptStateName::Resolved.as_wire(),
-                        ],
-                    )?;
-                }
-            }
+            let next = approve_attempt::apply(&current, &build(ledger_mint))?;
+            write_attempt_state(&tx, attempt_id, &next)?;
             tx.commit()?;
             Ok(())
         })

@@ -343,7 +343,11 @@ fn mark_attempt_uncertain_rejects_already_uncertain() {
     assert!(
         matches!(
             err,
-            AuditError::Invariant("approve attempt is not in 'started' state")
+            AuditError::IllegalApproveTransition(IllegalApproveTransition {
+                from: ApproveAttemptStateName::Uncertain,
+                transition: "mark-uncertain",
+                ..
+            })
         ),
         "got: {err:?}"
     );
@@ -424,7 +428,11 @@ fn complete_attempt_succeeded_rejects_when_not_uncertain() {
     assert!(
         matches!(
             err,
-            AuditError::Invariant("approve attempt is not in 'uncertain' state")
+            AuditError::IllegalApproveTransition(IllegalApproveTransition {
+                from: ApproveAttemptStateName::Started,
+                transition: "resolve-succeeded",
+                ..
+            })
         ),
         "got: {err:?}"
     );
@@ -588,9 +596,11 @@ fn complete_attempt_pre_patch_failure_capturing_mint_refuses_uncertain() {
     assert!(
         matches!(
             err,
-            AuditError::Invariant(
-                "approve attempt: capturing-mint pre_patch_failure requires 'started' state"
-            )
+            AuditError::IllegalApproveTransition(IllegalApproveTransition {
+                from: ApproveAttemptStateName::Uncertain,
+                transition: "capture-pre-patch-failure",
+                ..
+            })
         ),
         "got: {err:?}"
     );
@@ -620,9 +630,11 @@ fn complete_attempt_post_patch_failure_only_from_uncertain() {
     assert!(
         matches!(
             err,
-            AuditError::Invariant(
-                "approve attempt is not in a state that admits this failure outcome"
-            )
+            AuditError::IllegalApproveTransition(IllegalApproveTransition {
+                from: ApproveAttemptStateName::Started,
+                transition: "resolve-post-patch-failure",
+                ..
+            })
         ),
         "got: {err:?}"
     );
