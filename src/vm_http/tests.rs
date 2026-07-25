@@ -1174,6 +1174,8 @@ fn source_subnet_can_be_taken_from_agent_network_ipv4() {
 /// recorded a request row, so a silently-skipped drive cannot pass) and the
 /// pair assertion itself.
 mod brokered_route_audit_oracle {
+    use super::super::claude_proxy::VM_CLAUDE_MESSAGES_PATH;
+    use super::super::openai_proxy::VM_OPENAI_RESPONSES_PATH;
     use super::*;
     use crate::agent_run::{
         AgentRunStreamUpload, VmAgentRunOutcomeUpload, vm_agent_run_outcome_path,
@@ -1402,8 +1404,8 @@ mod brokered_route_audit_oracle {
             )
         };
         match route {
-            "ClaudeProxy" => post("/v1/messages", b"{}".to_vec()),
-            "OpenAiProxy" => post("/v1/responses", b"{}".to_vec()),
+            "ClaudeProxy" => post(VM_CLAUDE_MESSAGES_PATH, b"{}".to_vec()),
+            "OpenAiProxy" => post(VM_OPENAI_RESPONSES_PATH, b"{}".to_vec()),
             "NixCache" => (
                 VmHttpRequest::new(
                     "GET",

@@ -1350,6 +1350,13 @@ where
             }
             route_agent_run_config_request(*run_id, &service).into()
         }
+        VmHttpRoute::Plain(PlainRoute::LegacyProxyPath) => VmHttpResponse::text(
+            VmHttpStatus::Gone,
+            "this model-proxy path moved: Anthropic is served under /anthropic and OpenAI under \
+             /openai. The guest image predates the split — rebuild it with \
+             `writ agent-vm build-guest-image`.",
+        )
+        .into(),
         VmHttpRoute::Plain(PlainRoute::Session | PlainRoute::Unmatched) => {
             route_session_endpoint(session, request).into()
         }

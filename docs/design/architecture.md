@@ -401,15 +401,25 @@ Nix domain modules `nix_binary_cache.rs` (1345, with its test suite in
 `nix_binary_cache/tests.rs`), `flake_lock.rs`,
 `flake_materialize.rs`, `flake_provision.rs`, `flake_provision_from_mirror.rs`.
 
-**Endpoint map** (`vm_http/route_table.rs`): `GET /v1/session`; `/v1/nix/cache/*`
-& `/v1/nix/prewarm/*`; Claude proxy `/v1/messages`, `/v1/messages/count_tokens`,
-`/v1/models*`; OpenAI proxy `/v1/responses`, `/v1/responses/{id}/cancel`;
-`POST /v1/git/clone`; `POST /v1/git/push`; `POST /v1/nix/flake/provision`;
-`GET/POST /v1/agent-runs/{id}/config|outcome`. Path literals are pinned in
-`crates/writ-vm-git/src/lib.rs:20`. Note the **whole** `/v1/models*` space
-resolves to the *Claude* proxy, which is classified first — the OpenAI backend's
-own models routes are unreachable through the dispatcher (pinned by
-`route_table`'s `the_claude_proxy_shadows_the_whole_models_space`).
+**Endpoint map** (`vm_http/route_table.rs`). writ's own API lives under `/v1/*`:
+`GET /v1/session`; `/v1/nix/cache/*` & `/v1/nix/prewarm/*`; `POST /v1/git/clone`;
+`POST /v1/git/push`; `POST /v1/nix/flake/provision`; `GET/POST
+/v1/agent-runs/{id}/config|outcome`. Each **model vendor has its own namespace**:
+Claude proxy `/anthropic/v1/messages`, `/anthropic/v1/messages/count_tokens`,
+`/anthropic/v1/models*`; OpenAI proxy `/openai/v1/responses`,
+`/openai/v1/responses/{id}/cancel`, `/openai/v1/models*`. Path literals are
+pinned in `crates/writ-vm-git/src/lib.rs:20`.
+
+The vendor split is load-bearing, not cosmetic: `/v1/models` is a real endpoint
+of *both* vendor APIs, so while they shared one namespace the backend classified
+first (Claude) shadowed the other's models routes — answering `404` from the
+wrong proxy and recording the attempt against the wrong vendor's audit table.
+`route_table`'s `no_target_is_claimed_by_both_proxy_backends` property now makes
+that unrepresentable, and `writs_own_v1_api_is_never_a_proxy_route` keeps `/v1/*`
+writ's alone. The pre-split proxy paths resolve to `PlainRoute::LegacyProxyPath`
+and answer `410 Gone` naming the remedy, so a guest image built before the split
+fails diagnosably rather than looking like an unknown endpoint; that shim is
+temporary (`docs/plans/2026-07-25-proxy-vendor-namespaces.md`).
 
 **The route table.** A request is classified **once**, by
 `VmHttpRoute::resolve`, into either `Brokered(BrokeredRoute)` — an effect whose

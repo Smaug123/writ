@@ -17,6 +17,19 @@ use writ_core::core::{
     CapabilityRequest, GitHubAccess, GitHubRequest, RepoRef, RequestId, UnixMillis,
 };
 
+/// Base path of the guest-facing Anthropic proxy. Each model vendor gets its
+/// own namespace because `/v1/models` is a real endpoint of *both* vendor APIs:
+/// sharing one namespace made the two backends' classifications overlap, so
+/// whichever was matched first silently shadowed the other's models routes —
+/// answering from the wrong proxy and recording the attempt against the wrong
+/// vendor's audit table. `writ-vm` points Claude Code's `ANTHROPIC_BASE_URL`
+/// here; the broker's route table classifies only under this prefix.
+pub const VM_ANTHROPIC_PROXY_PREFIX: &str = "/anthropic";
+/// Base path of the guest-facing OpenAI proxy; see [`VM_ANTHROPIC_PROXY_PREFIX`].
+/// `writ-vm` points codex's `model_providers.writ-broker.base_url` at
+/// `<broker>/openai/v1`.
+pub const VM_OPENAI_PROXY_PREFIX: &str = "/openai";
+
 pub const VM_GIT_CLONE_PATH: &str = "/v1/git/clone";
 pub const VM_GIT_PUSH_PATH: &str = "/v1/git/push";
 pub const VM_FLAKE_PROVISION_PATH: &str = "/v1/nix/flake/provision";

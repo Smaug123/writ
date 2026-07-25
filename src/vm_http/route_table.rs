@@ -37,8 +37,8 @@ use super::git_clone::is_git_clone_target;
 use super::git_push::is_git_push_target;
 use super::nix_cache::is_nix_cache_target;
 use super::nix_cache::record_nix_cache_local_response;
-use super::proxy_common::ProxyBackend;
 use super::proxy_common::record_proxy_local_response;
+use super::proxy_common::{ProxyBackend, proxy_target_path};
 use super::{ClaudeBackend, OpenAiBackend};
 use super::{
     MAX_VM_HTTP_AGENT_RUN_OUTCOME_BODY_BYTES, MAX_VM_HTTP_BODY_BYTES, VmHttpAuthError,
@@ -137,6 +137,14 @@ route_enum! {
         /// the host-mint follow-up teaches the guard the grant-flow shape (see
         /// the plan's §7). It is *not* unaudited — it is audited elsewhere.
         GitClone,
+        /// A model-proxy path from before the vendor namespaces — `/v1/messages`,
+        /// `/v1/responses`, `/v1/models*`. Answered `410 Gone` naming the
+        /// remedy, because a guest asking for these is running an image built
+        /// before the split and would otherwise see an indistinguishable `404`.
+        /// Records nothing: no effect was attempted. Deleted once stale guest
+        /// images can no longer be in play (see
+        /// `docs/plans/2026-07-25-proxy-vendor-namespaces.md`, Stage 3).
+        LegacyProxyPath,
         /// No route matched: answered `404`/`405` without touching any service.
         Unmatched,
     }
@@ -179,6 +187,9 @@ impl VmHttpRoute {
         }
         if let Some(run_id) = parse_agent_run_outcome_target(target) {
             return Self::Brokered(BrokeredRoute::AgentRunOutcome(run_id));
+        }
+        if is_legacy_proxy_path(target) {
+            return Self::Plain(PlainRoute::LegacyProxyPath);
         }
         if target == SESSION_PATH {
             return Self::Plain(PlainRoute::Session);
@@ -237,6 +248,10 @@ impl VmHttpRoute {
             .then_some(MAX_VM_HTTP_BODY_BYTES),
             // Neither reads a body.
             Self::Plain(PlainRoute::Session | PlainRoute::AgentRunConfig(_)) => None,
+            // Answered without reading the body it declares: the guest is
+            // misconfigured, and buffering a model request to discard it would
+            // be pure waste.
+            Self::Plain(PlainRoute::LegacyProxyPath) => None,
             // Nothing to read a body for.
             Self::Plain(PlainRoute::Unmatched) => None,
         }
@@ -335,10 +350,24 @@ impl VmHttpRoute {
 /// the session endpoint.
 pub(super) const SESSION_PATH: &str = "/v1/session";
 
+/// Whether `target` is a model-proxy path from before the vendor namespaces.
+///
+/// These roots are disjoint from writ's own `/v1/*` API (`session`, `git`,
+/// `nix`, `agent-runs`), which is unaffected by the split — after it, `/v1/*`
+/// belongs solely to writ.
+fn is_legacy_proxy_path(target: &str) -> bool {
+    let path = proxy_target_path(target);
+    ["/v1/messages", "/v1/responses", "/v1/models"]
+        .iter()
+        .any(|root| path == *root || path.starts_with(&format!("{root}/")))
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
     use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+
+    use proptest::prelude::*;
 
     use super::*;
 
@@ -360,11 +389,19 @@ mod tests {
         ("GET", "/v1/nix/cache/nix-cache-info", "NixCache"),
         ("GET", "/v1/nix/cache/abc.narinfo", "NixCache"),
         ("GET", "/v1/nix/prewarm/nix-cache-info", "NixCache"),
-        ("POST", "/v1/messages", "ClaudeProxy"),
-        ("POST", "/v1/messages/count_tokens", "ClaudeProxy"),
-        ("GET", "/v1/models/claude-opus-4-1", "ClaudeProxy"),
-        ("POST", "/v1/responses", "OpenAiProxy"),
-        ("POST", "/v1/responses/resp_123/cancel", "OpenAiProxy"),
+        ("POST", "/anthropic/v1/messages", "ClaudeProxy"),
+        ("POST", "/anthropic/v1/messages/count_tokens", "ClaudeProxy"),
+        ("GET", "/anthropic/v1/models", "ClaudeProxy"),
+        ("GET", "/anthropic/v1/models/claude-opus-4-1", "ClaudeProxy"),
+        ("POST", "/openai/v1/responses", "OpenAiProxy"),
+        (
+            "POST",
+            "/openai/v1/responses/resp_123/cancel",
+            "OpenAiProxy",
+        ),
+        ("GET", "/openai/v1/models", "OpenAiProxy"),
+        ("GET", "/openai/v1/models/gpt-5", "OpenAiProxy"),
+        ("POST", "/v1/messages", "LegacyProxyPath"),
         ("POST", "/v1/git/clone", "GitClone"),
         ("POST", "/v1/git/push", "GitPush"),
         ("POST", "/v1/nix/flake/provision", "FlakeProvision"),
@@ -411,29 +448,131 @@ mod tests {
         );
     }
 
-    /// The **whole** `/v1/models*` space is claimed by the Claude proxy, which
-    /// is tried first — so the OpenAI backend's own models routes
-    /// (`OpenAiProxyAuditRoute::Models`) are unreachable through the dispatcher,
-    /// and an OpenAI client listing models is answered by the Claude proxy's
-    /// `Unsupported` classification.
-    ///
-    /// This predates the route table — it is the dispatcher's original if-chain
-    /// order, which `resolve` preserves byte for byte — but nothing stated it,
-    /// and `architecture.md`'s endpoint map reads as though OpenAI serves
-    /// `/v1/models`. Pinned here rather than changed: moving the endpoint would
-    /// move it between two upstreams *and* two audit tables, which is a decision
-    /// to take deliberately, not a side effect of introducing a route table.
+    /// Each vendor's models routes reach *its own* backend. Before the
+    /// namespaces this was impossible: `/v1/models` is a real endpoint of both
+    /// APIs, so the backend classified first (Claude) swallowed the other's —
+    /// answering `404` from the wrong proxy and recording the attempt against
+    /// the wrong vendor's audit table.
     #[test]
-    fn the_claude_proxy_shadows_the_whole_models_space() {
+    fn each_vendors_models_routes_reach_its_own_backend() {
         for target in [
-            "/v1/models",
-            "/v1/models/gpt-5",
-            "/v1/models/claude-opus-4-1",
+            "/anthropic/v1/models",
+            "/anthropic/v1/models/claude-opus-4-1",
         ] {
             assert_eq!(
                 VmHttpRoute::resolve(&request("GET", target)),
                 VmHttpRoute::Brokered(BrokeredRoute::ClaudeProxy),
                 "{target}",
+            );
+        }
+        for target in ["/openai/v1/models", "/openai/v1/models/gpt-5"] {
+            assert_eq!(
+                VmHttpRoute::resolve(&request("GET", target)),
+                VmHttpRoute::Brokered(BrokeredRoute::OpenAiProxy),
+                "{target}",
+            );
+        }
+    }
+
+    /// Every pre-split model-proxy path is retired together, so a stale guest
+    /// gets one consistent answer rather than a mix of `410` and `404`.
+    #[test]
+    fn the_pre_split_proxy_paths_are_all_retired() {
+        for target in [
+            "/v1/messages",
+            "/v1/messages/count_tokens",
+            "/v1/responses",
+            "/v1/responses/resp_123/cancel",
+            "/v1/models",
+            "/v1/models/gpt-5",
+            // Query strings must not smuggle a legacy path past the check.
+            "/v1/models?limit=1",
+        ] {
+            assert_eq!(
+                VmHttpRoute::resolve(&request("GET", target)),
+                VmHttpRoute::Plain(PlainRoute::LegacyProxyPath),
+                "{target}",
+            );
+        }
+    }
+
+    /// After the split, `/v1/*` belongs solely to writ's own API. Nothing there
+    /// may resolve to a vendor proxy — the collision that started this was two
+    /// vendor APIs sharing one namespace, and writ's own API shares it too.
+    #[test]
+    fn writs_own_v1_api_is_never_a_proxy_route() {
+        for target in [
+            "/v1/session",
+            "/v1/git/clone",
+            "/v1/git/push",
+            "/v1/nix/cache/nix-cache-info",
+            "/v1/nix/flake/provision",
+            "/v1/agent-runs/00000000-0000-0000-0000-000000000001/config",
+            "/v1/agent-runs/00000000-0000-0000-0000-000000000001/outcome",
+        ] {
+            let route = VmHttpRoute::resolve(&request("GET", target));
+            assert!(
+                !matches!(
+                    route,
+                    VmHttpRoute::Brokered(BrokeredRoute::ClaudeProxy | BrokeredRoute::OpenAiProxy)
+                ),
+                "{target} resolved to a model proxy: {route:?}",
+            );
+        }
+    }
+
+    /// Path segments the two vendor APIs and writ's own API are built from, so
+    /// the generator searches the space where a collision would actually live
+    /// rather than random noise.
+    fn target_strategy() -> impl Strategy<Value = String> {
+        let segment = prop::sample::select(vec![
+            "v1",
+            "anthropic",
+            "openai",
+            "messages",
+            "count_tokens",
+            "responses",
+            "models",
+            "cancel",
+            "session",
+            "git",
+            "clone",
+            "push",
+            "nix",
+            "cache",
+            "flake",
+            "provision",
+            "agent-runs",
+            "gpt-5",
+            "claude-opus-4-1",
+            "resp_123",
+        ]);
+        prop::collection::vec(segment, 1..5).prop_map(|segments| format!("/{}", segments.join("/")))
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(512))]
+
+        /// **At most one** proxy backend may claim any target.
+        ///
+        /// This is the invariant whose absence produced the bug this test was
+        /// written for: `/v1/models` is a real endpoint of *both* vendor APIs, so
+        /// whichever backend was classified first silently swallowed the other's
+        /// models routes — answering `404` from the wrong proxy and recording the
+        /// attempt against the wrong vendor's audit table. No ordering fixes
+        /// that; the ambiguity is in the address space, so each vendor gets its
+        /// own namespace and this property holds by construction.
+        ///
+        /// Run against the pre-split code it shrinks to exactly `/v1/models`.
+        #[test]
+        fn no_target_is_claimed_by_both_proxy_backends(target in target_strategy()) {
+            let claude = ClaudeBackend::classify_proxy_target(&target).is_some();
+            let openai = OpenAiBackend::classify_proxy_target(&target).is_some();
+            prop_assert!(
+                !(claude && openai),
+                "`{target}` is claimed by both proxy backends: whichever is classified first \
+                 shadows the other, and the loser's requests are answered and audited by the \
+                 wrong vendor's proxy",
             );
         }
     }

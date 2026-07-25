@@ -20,9 +20,13 @@ use super::proxy_common::{
 };
 use super::{VmHttpDispatch, VmHttpHeader, VmHttpResponse, VmHttpStatus};
 
-pub(super) const VM_CLAUDE_MESSAGES_PATH: &str = "/v1/messages";
-pub(super) const VM_CLAUDE_COUNT_TOKENS_PATH: &str = "/v1/messages/count_tokens";
-pub(super) const VM_CLAUDE_MODELS_PREFIX: &str = "/v1/models/";
+// Guest-facing paths, all under `VM_ANTHROPIC_PROXY_PREFIX`: the vendor
+// namespace is what keeps `/v1/models` from meaning two different upstreams.
+// The *upstream* paths these map to are unchanged — see `relative_upstream_path`.
+pub(super) const VM_CLAUDE_MESSAGES_PATH: &str = "/anthropic/v1/messages";
+pub(super) const VM_CLAUDE_COUNT_TOKENS_PATH: &str = "/anthropic/v1/messages/count_tokens";
+pub(super) const VM_CLAUDE_MODELS_PATH: &str = "/anthropic/v1/models";
+pub(super) const VM_CLAUDE_MODELS_PREFIX: &str = "/anthropic/v1/models/";
 pub const DEFAULT_CLAUDE_ANTHROPIC_VERSION: &str = "2023-06-01";
 const ANTHROPIC_OAUTH_TOKEN_PREFIX: &str = "sk-ant-oat01-";
 
@@ -259,10 +263,10 @@ impl ProxyBackend for ClaudeBackend {
             VM_CLAUDE_MESSAGES_PATH => Some(ClaudeProxyAuditRoute::Messages),
             VM_CLAUDE_COUNT_TOKENS_PATH => Some(ClaudeProxyAuditRoute::CountTokens),
             _ if claude_proxy_model_id(path).is_some() => Some(ClaudeProxyAuditRoute::Models),
-            _ if path.starts_with("/v1/messages/")
-                || path.starts_with("/v1/messages/count_tokens/")
+            _ if path.starts_with("/anthropic/v1/messages/")
+                || path.starts_with("/anthropic/v1/messages/count_tokens/")
                 || path.starts_with(VM_CLAUDE_MODELS_PREFIX)
-                || path == "/v1/models" =>
+                || path == VM_CLAUDE_MODELS_PATH =>
             {
                 Some(ClaudeProxyAuditRoute::Unsupported)
             }
@@ -529,15 +533,15 @@ mod tests {
     #[test]
     fn classify_claude_proxy_target_recognizes_supported_routes() {
         assert_eq!(
-            ClaudeBackend::classify_proxy_target("/v1/messages"),
+            ClaudeBackend::classify_proxy_target("/anthropic/v1/messages"),
             Some(ClaudeProxyAuditRoute::Messages),
         );
         assert_eq!(
-            ClaudeBackend::classify_proxy_target("/v1/messages/count_tokens"),
+            ClaudeBackend::classify_proxy_target("/anthropic/v1/messages/count_tokens"),
             Some(ClaudeProxyAuditRoute::CountTokens),
         );
         assert_eq!(
-            ClaudeBackend::classify_proxy_target("/v1/models/claude-haiku-4-5-20251001"),
+            ClaudeBackend::classify_proxy_target("/anthropic/v1/models/claude-haiku-4-5-20251001"),
             Some(ClaudeProxyAuditRoute::Models),
         );
     }
@@ -545,15 +549,15 @@ mod tests {
     #[test]
     fn classify_claude_proxy_target_treats_models_listing_and_empty_id_as_unsupported() {
         assert_eq!(
-            ClaudeBackend::classify_proxy_target("/v1/models"),
+            ClaudeBackend::classify_proxy_target("/anthropic/v1/models"),
             Some(ClaudeProxyAuditRoute::Unsupported),
         );
         assert_eq!(
-            ClaudeBackend::classify_proxy_target("/v1/models/"),
+            ClaudeBackend::classify_proxy_target("/anthropic/v1/models/"),
             Some(ClaudeProxyAuditRoute::Unsupported),
         );
         assert_eq!(
-            ClaudeBackend::classify_proxy_target("/v1/models/foo/bar"),
+            ClaudeBackend::classify_proxy_target("/anthropic/v1/models/foo/bar"),
             Some(ClaudeProxyAuditRoute::Unsupported),
         );
     }
@@ -568,15 +572,17 @@ mod tests {
     #[test]
     fn classify_claude_proxy_target_strips_query_string() {
         assert_eq!(
-            ClaudeBackend::classify_proxy_target("/v1/messages?beta=true"),
+            ClaudeBackend::classify_proxy_target("/anthropic/v1/messages?beta=true"),
             Some(ClaudeProxyAuditRoute::Messages),
         );
         assert_eq!(
-            ClaudeBackend::classify_proxy_target("/v1/messages/count_tokens?beta=true"),
+            ClaudeBackend::classify_proxy_target("/anthropic/v1/messages/count_tokens?beta=true"),
             Some(ClaudeProxyAuditRoute::CountTokens),
         );
         assert_eq!(
-            ClaudeBackend::classify_proxy_target("/v1/models/claude-haiku-4-5-20251001?beta=true"),
+            ClaudeBackend::classify_proxy_target(
+                "/anthropic/v1/models/claude-haiku-4-5-20251001?beta=true"
+            ),
             Some(ClaudeProxyAuditRoute::Models),
         );
     }
@@ -878,7 +884,7 @@ mod tests {
         .unwrap();
         let request = VmHttpRequest::new(
             "POST",
-            "/v1/messages?beta=true",
+            "/anthropic/v1/messages?beta=true",
             Some(bearer(token().as_str())),
             SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 34567)),
         );
@@ -941,7 +947,7 @@ mod tests {
         .unwrap();
         let request = VmHttpRequest::new(
             "GET",
-            "/v1/models/claude-haiku-4-5-20251001",
+            "/anthropic/v1/models/claude-haiku-4-5-20251001",
             Some(bearer(token().as_str())),
             SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 34567)),
         );
@@ -995,7 +1001,7 @@ mod tests {
         .unwrap();
         let request = VmHttpRequest::new(
             "POST",
-            "/v1/models/claude-haiku-4-5-20251001",
+            "/anthropic/v1/models/claude-haiku-4-5-20251001",
             Some(bearer(token().as_str())),
             SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 34567)),
         );
