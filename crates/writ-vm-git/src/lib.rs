@@ -89,11 +89,23 @@ pub const VM_HTTP_CONTRACT_HEADER: &str = "writ-contract-version";
 ///
 /// This is the boundary between "ours" and "a third-party client's" traffic, and
 /// it lives here — in the crate both the guest client and the host broker depend
-/// on — because both sides must agree on it. The guest asserts it sends
-/// [`VM_HTTP_CONTRACT_HEADER`] on exactly these; the host asserts these are
-/// exactly the routes it requires the header on. Nobody checked that the guest's
+/// on — because both sides must agree on it. Nobody checked that the guest's
 /// idea of what it originates matched the host's idea of what it serves before,
 /// which is how the proxy namespaces drifted in the first place.
+///
+/// It is *not* the same set as "the routes the broker demands the header on",
+/// and the difference is load-bearing: `GET /v1/session` is ours and still
+/// exempt, because it is the endpoint a guest reads the broker's version out of
+/// — gate it and a skew becomes undiagnosable. So the host pins two implications
+/// rather than an equality:
+///
+/// 1. every route resolved from this list demands the header, *or* is the
+///    handshake — no writ-vm route may be exempted for a reason belonging to
+///    somebody else's client; and
+/// 2. every route that demands the header appears here — so the broker cannot
+///    require a declaration on a route the guest never declares on.
+///
+/// The guest, for its part, asserts it declares on exactly these.
 ///
 /// The agent-run targets carry a sample id: the route is templated, and a fixed
 /// sample keeps this a table of literals that both sides can resolve. The guest

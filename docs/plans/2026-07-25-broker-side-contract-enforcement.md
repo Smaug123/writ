@@ -248,11 +248,15 @@ it); update `architecture.md`'s endpoint map with the per-route column.
 - **Exhaustiveness**: `contract_check` is a `match` with no wildcard, so a new
   route is a compile error until it chooses. (`ContractExemption`'s variants
   carry the reason, so "chooses" means "states why".)
-- **The cross-crate coupling, both directions**: the set of `ENDPOINT_MAP`
-  routes whose `contract_check()` is `Required` equals the set of routes that
-  `WRIT_VM_ORIGINATED_TARGETS` resolves to. This is what keeps the client's idea
-  of what it originates and the broker's idea of what it requires from drifting
-  — the exact failure mode that produced #338 and this issue.
+- **The cross-crate coupling, as two implications rather than an equality** —
+  the two sets are deliberately *not* equal, since `/v1/session` is ours and
+  still exempt (§3.3): (1) every route `WRIT_VM_ORIGINATED_TARGETS` resolves to
+  is `Required` or `Exempt(Handshake)`, so no writ-vm route can be exempted for
+  a reason belonging to somebody else's client; and (2) every `Required` route
+  appears in that list, so the broker cannot demand a declaration on a route the
+  guest never declares on. Together these keep the client's idea of what it
+  originates and the broker's idea of what it requires from drifting — the exact
+  failure mode that produced #338 and this issue.
 - **Refusal, per `Required` route** (driven from `ENDPOINT_MAP`, so totality
   comes free from `the_endpoint_map_covers_every_route`): a request with no
   header, and one with a mismatched version, each answer `426`, name the correct
