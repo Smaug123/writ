@@ -143,14 +143,19 @@ fn run_invocation_is_dual_homed_with_mounts_and_broker_command() {
 /// surface at that version, and the broker protocol version that shipped with
 /// it.
 ///
-/// **Append a row when the guest contract changes; never edit one.** The test
-/// below asserts the row at index `VM_HTTP_CONTRACT_VERSION - 1` describes the
-/// live surface, that the history has exactly that many rows, and that the
-/// recorded broker protocol versions strictly increase — so appending a row
-/// forces `BROKER_PROTOCOL_VERSION` up too. The recorded value is the *minimum*
-/// protocol that introduced that guest contract, so the broker protocol stays
-/// free to advance on its own (a new CLI flag, a ready-doc field) without
-/// dragging a guest-image rebuild along. Both matter, because one contract
+/// **Append a row on every version bump of either constant; never edit one.**
+/// The test below asserts the row at index `VM_HTTP_CONTRACT_VERSION - 1`
+/// describes the live surface, that the history has exactly that many rows, that
+/// its recorded broker protocol is the one compiled now, and that recorded
+/// protocols strictly increase.
+///
+/// The two constants therefore move together, which is the deliberate choice:
+/// letting the broker protocol advance alone would let a later guest-contract
+/// change *reuse* an already-published protocol value, and a broker image built
+/// before that change — already advertising it — would pass the host handshake
+/// while serving the old guest contract. Lockstep costs an occasional gratuitous
+/// guest-image rebuild; the alternative costs a window in which a stale broker is
+/// accepted. Both matter, because one contract
 /// gates two independently-rebuildable images: without the second, a route move
 /// could bump only the guest constant and leave a stale *broker* image
 /// advertising an unchanged protocol and serving the old routes.
@@ -176,7 +181,7 @@ const GUEST_CONTRACT_HISTORY: &[GuestContractRow] = &[
     GuestContractRow {
         // v2 — vendor namespaces (`/anthropic/v1/*`, `/openai/v1/*`), plus
         // `/v1/session` reporting the contract version.
-        route_digest: "ce7eb360ccd1ae46dd3e55f6a2879544c4fff17e863fea5093a997cd63693d39",
+        route_digest: "a52713ca476fd0219c1f7a6082ff3cf61e08e829d26e7edc2be199db65bfe759",
         broker_protocol_version: 4,
     },
 ];
@@ -221,8 +226,12 @@ fn resolved_line(method: &str, target: &str) -> String {
         None,
         std::net::SocketAddr::from(([127, 0, 0, 1], 12345)),
     );
+    // A stable identity, not `Debug`: the contract is *which handler serves this
+    // target*, not how the enum is spelled. Renaming a variant or changing an id
+    // type's debug format must not masquerade as a contract change and force two
+    // image rebuilds.
     let route = crate::vm_http::route_table::VmHttpRoute::resolve(&request);
-    format!("{method} {target} -> {route:?}")
+    format!("{method} {target} -> {}", route.identity())
 }
 
 /// Targets swept through the classifier, chosen to pin the edges that have
@@ -333,17 +342,27 @@ fn broker_contract_fingerprint_is_pinned() {
          guests refuse a stale broker) AND bump BROKER_PROTOCOL_VERSION (so the host refuses a \
          stale broker image), then rebuild both images.",
     );
-    // The recorded value is the *minimum* broker protocol that introduced this
-    // guest contract, not an equality: the host↔broker contract evolves on its
-    // own too (a new broker CLI flag, a ready-doc field), and forcing those to
-    // drag a guest-image rebuild along would be gratuitous. The bump is still
-    // compelled where it matters — appending a row demands a protocol strictly
-    // greater than the previous row's (below), which cannot be satisfied without
-    // moving the constant.
-    assert!(
-        crate::broker_protocol::BROKER_PROTOCOL_VERSION >= current.broker_protocol_version,
-        "guest contract v{version} was introduced at broker protocol {}, but the compiled \
-         BROKER_PROTOCOL_VERSION is {}: the broker protocol must never go backwards",
+    // Exact equality, deliberately, after trying the weaker `>=`.
+    //
+    // `>=` let a guest-contract change *reuse* a protocol value that an earlier
+    // broker-only bump had already published — so broker images built before the
+    // guest change, already advertising that value, would pass the host
+    // handshake while serving the old guest contract. Equality closes that: the
+    // protocol a guest contract records is the one compiled now, so any earlier
+    // image is refused.
+    //
+    // The price is that a broker-only change (a new CLI flag, a ready-doc field)
+    // must also bump `VM_HTTP_CONTRACT_VERSION` and have the guest image
+    // rebuilt. That is a gratuitous rebuild — cheap and safe — traded against a
+    // window in which a stale broker is accepted, which is neither. Correctness
+    // over availability.
+    assert_eq!(
+        current.broker_protocol_version,
+        crate::broker_protocol::BROKER_PROTOCOL_VERSION,
+        "guest contract v{version} records broker protocol {}, but {} is compiled. Every \
+         protocol bump appends a contract row (bumping VM_HTTP_CONTRACT_VERSION) so that no \
+         previously-published protocol value can be reused by a later contract — which would \
+         let a broker image built before that contract pass the host handshake.",
         current.broker_protocol_version,
         crate::broker_protocol::BROKER_PROTOCOL_VERSION,
     );

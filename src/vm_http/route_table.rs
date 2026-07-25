@@ -151,6 +151,18 @@ route_enum! {
 }
 
 impl VmHttpRoute {
+    /// A stable name for the handler a target reaches, for the contract
+    /// fingerprint. Deliberately not `Debug`: the guest-visible contract is
+    /// *which handler serves this target*, so renaming a variant or changing an
+    /// id type's formatting must not read as a contract change.
+    #[cfg(test)]
+    pub(crate) fn identity(&self) -> &'static str {
+        match self {
+            Self::Brokered(route) => route.name(),
+            Self::Plain(route) => route.name(),
+        }
+    }
+
     /// Classify a request. Total, and a pure function of the target — the same
     /// key the three switch sites this replaces all used, so the classification
     /// cannot disagree with itself across the stages of one request.
