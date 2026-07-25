@@ -334,14 +334,20 @@ impl AuditLog {
                 .query_row(
                     "SELECT 1 FROM git_push_approve_attempt a
                       WHERE a.push_request_id = ?1
-                        AND (a.state IN ('started', 'uncertain')
-                          OR (a.state = 'resolved' AND a.outcome = 'post_patch_failure'))
+                        AND (a.state IN (?2, ?3)
+                          OR (a.state = ?4 AND a.outcome = ?5))
                         AND NOT EXISTS (
                             SELECT 1 FROM git_push_approve_attempt b
                             WHERE b.supersedes_attempt_id = a.attempt_id
                         )
                       LIMIT 1",
-                    params![push_request_id.as_uuid().to_string()],
+                    params![
+                        push_request_id.as_uuid().to_string(),
+                        ApproveAttemptStateName::Started.as_wire(),
+                        ApproveAttemptStateName::Uncertain.as_wire(),
+                        ApproveAttemptStateName::Resolved.as_wire(),
+                        ApproveAttemptOutcomeName::PostPatchFailure.as_wire(),
+                    ],
                     |row| row.get(0),
                 )
                 .optional()?;
@@ -356,7 +362,7 @@ impl AuditLog {
                      attempt_id, push_request_id, operator, started_at,
                      state, outcome, completed_at, new_app_tip, failure_detail,
                      mint_jti, mint_github_app_id, mint_issued_at, mint_expires_at
-                 ) VALUES (?1, ?2, ?3, ?4, 'started',
+                 ) VALUES (?1, ?2, ?3, ?4, ?5,
                            NULL, NULL, NULL, NULL,
                            NULL, NULL, NULL, NULL)",
                 params![
@@ -364,6 +370,7 @@ impl AuditLog {
                     push_request_id.as_uuid().to_string(),
                     operator,
                     started_at.as_millis(),
+                    ApproveAttemptStateName::Started.as_wire(),
                 ],
             )?;
             tx.commit()?;
@@ -510,19 +517,21 @@ impl AuditLog {
         self.with_conn_mut(|c| {
             let updated = c.execute(
                 "UPDATE git_push_approve_attempt
-                    SET state = 'uncertain',
+                    SET state = ?6,
                         mint_jti = ?2,
                         mint_github_app_id = ?3,
                         mint_issued_at = ?4,
                         mint_expires_at = ?5
                   WHERE attempt_id = ?1
-                    AND state = 'started'",
+                    AND state = ?7",
                 params![
                     attempt_id.as_uuid().to_string(),
                     mint.jti.as_uuid().to_string(),
                     github_app_id,
                     mint.issued_at.as_millis(),
                     mint.expires_at.as_millis(),
+                    ApproveAttemptStateName::Uncertain.as_wire(),
+                    ApproveAttemptStateName::Started.as_wire(),
                 ],
             )?;
             if updated == 0 {
@@ -610,8 +619,8 @@ impl AuditLog {
 
             tx.execute(
                 "UPDATE git_push_approve_attempt
-                    SET state = 'resolved',
-                        outcome = 'succeeded',
+                    SET state = ?4,
+                        outcome = ?5,
                         new_app_tip = ?2,
                         completed_at = ?3
                   WHERE attempt_id = ?1",
@@ -619,6 +628,8 @@ impl AuditLog {
                     attempt_id.as_uuid().to_string(),
                     new_app_tip.as_str(),
                     completed_at.as_millis(),
+                    ApproveAttemptStateName::Resolved.as_wire(),
+                    ApproveAttemptOutcomeName::Succeeded.as_wire(),
                 ],
             )?;
 
@@ -727,8 +738,8 @@ impl AuditLog {
 
             tx.execute(
                 "UPDATE git_push_approve_attempt
-                    SET state = 'resolved',
-                        outcome = 'pre_patch_failure',
+                    SET state = ?8,
+                        outcome = ?9,
                         failure_detail = ?2,
                         completed_at = ?3,
                         mint_jti = ?4,
@@ -744,6 +755,8 @@ impl AuditLog {
                     github_app_id,
                     mint.issued_at.as_millis(),
                     mint.expires_at.as_millis(),
+                    ApproveAttemptStateName::Resolved.as_wire(),
+                    ApproveAttemptOutcomeName::PrePatchFailure.as_wire(),
                 ],
             )?;
             tx.commit()?;
@@ -842,7 +855,7 @@ impl AuditLog {
                      state, outcome, completed_at, new_app_tip, failure_detail,
                      mint_jti, mint_github_app_id, mint_issued_at, mint_expires_at,
                      supersedes_attempt_id
-                 ) VALUES (?1, ?2, ?3, ?4, 'resolved', 'succeeded', ?4,
+                 ) VALUES (?1, ?2, ?3, ?4, ?11, ?12, ?4,
                            ?5, NULL,
                            ?6, ?7, ?8, ?9,
                            ?10)",
@@ -857,6 +870,8 @@ impl AuditLog {
                     mint.issued_at,
                     mint.expires_at,
                     supersedes.as_uuid().to_string(),
+                    ApproveAttemptStateName::Resolved.as_wire(),
+                    ApproveAttemptOutcomeName::Succeeded.as_wire(),
                 ],
             )?;
 
@@ -926,7 +941,7 @@ impl AuditLog {
                      state, outcome, completed_at, new_app_tip, failure_detail,
                      mint_jti, mint_github_app_id, mint_issued_at, mint_expires_at,
                      supersedes_attempt_id
-                 ) VALUES (?1, ?2, ?3, ?4, 'resolved', 'pre_patch_failure', ?4,
+                 ) VALUES (?1, ?2, ?3, ?4, ?11, ?12, ?4,
                            NULL, ?5,
                            ?6, ?7, ?8, ?9,
                            ?10)",
@@ -941,6 +956,8 @@ impl AuditLog {
                     mint.issued_at,
                     mint.expires_at,
                     supersedes.as_uuid().to_string(),
+                    ApproveAttemptStateName::Resolved.as_wire(),
+                    ApproveAttemptOutcomeName::PrePatchFailure.as_wire(),
                 ],
             )?;
 
@@ -1022,7 +1039,7 @@ impl AuditLog {
                 Some((jti, app_id, issued_at, expires_at)) => {
                     tx.execute(
                         "UPDATE git_push_approve_attempt
-                            SET state = 'resolved',
+                            SET state = ?9,
                                 outcome = ?2,
                                 failure_detail = ?3,
                                 completed_at = ?4,
@@ -1040,13 +1057,14 @@ impl AuditLog {
                             app_id,
                             issued_at,
                             expires_at,
+                            ApproveAttemptStateName::Resolved.as_wire(),
                         ],
                     )?;
                 }
                 None => {
                     tx.execute(
                         "UPDATE git_push_approve_attempt
-                            SET state = 'resolved',
+                            SET state = ?5,
                                 outcome = ?2,
                                 failure_detail = ?3,
                                 completed_at = ?4
@@ -1056,6 +1074,7 @@ impl AuditLog {
                             outcome.as_wire(),
                             detail,
                             completed_at.as_millis(),
+                            ApproveAttemptStateName::Resolved.as_wire(),
                         ],
                     )?;
                 }
@@ -1287,7 +1306,7 @@ impl AuditLog {
                         a.new_app_tip, a.failure_detail,
                         a.mint_jti, a.mint_github_app_id, a.mint_issued_at, a.mint_expires_at
                    FROM git_push_approve_attempt a
-                  WHERE a.state IN ('started', 'uncertain')
+                  WHERE a.state IN (?1, ?2)
                     AND NOT EXISTS (
                         SELECT 1 FROM git_push_approve_attempt b
                         WHERE b.supersedes_attempt_id = a.attempt_id
@@ -1295,7 +1314,13 @@ impl AuditLog {
                   ORDER BY a.started_at ASC, a.attempt_id ASC",
             )?;
             let rows = stmt
-                .query_map([], git_push_approve_attempt_from_row)?
+                .query_map(
+                    params![
+                        ApproveAttemptStateName::Started.as_wire(),
+                        ApproveAttemptStateName::Uncertain.as_wire(),
+                    ],
+                    git_push_approve_attempt_from_row,
+                )?
                 .collect::<Result<Vec<_>, _>>()?;
             rows.into_iter().collect::<Result<Vec<_>, _>>()
         })
