@@ -161,21 +161,53 @@ impl GitPushApproveAttemptOutcome {
     }
 }
 
+/// The attempt as the machine sees it: the row's position in the
+/// lifecycle *plus* the credential the v7 mint ledger has recorded
+/// against it.
+///
+/// The ledger looks like a side table but it is part of the attempt's
+/// durable position, and migration 0007 says why: a distinct `minted`
+/// state would have needed a full rebuild of a table with two incoming
+/// foreign keys, so "the ledger records the same fact with a plain
+/// CREATE TABLE". Two of the schema's triggers
+/// (`mint_matches_ledger`, `resolve_carries_ledger_mint`) judge writes
+/// against it, so a machine that could not see it would permit moves the
+/// database refuses — which is exactly what it did before this type
+/// existed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ApproveAttempt {
+    /// The `git_push_approve_attempt` row's state.
+    pub state: GitPushApproveAttemptState,
+    /// The credential recorded in `git_push_approve_attempt_mint`, if the
+    /// attempt has minted. Only a `Started` attempt can gain one; the
+    /// ledger is append-only, so it never goes back to `None`.
+    pub ledger_mint: Option<PromoteMintAudit>,
+}
+
+impl ApproveAttempt {
+    /// An attempt in `state` that has not minted.
+    pub fn new(state: GitPushApproveAttemptState) -> Self {
+        Self {
+            state,
+            ledger_mint: None,
+        }
+    }
+}
+
 /// A move the broker asks the machine to make. One variant per durable
 /// step of `approve_staged_push`, carrying exactly the data that step
-/// contributes to the row.
+/// contributes.
 ///
 /// These are *requests*, not facts: [`apply`] decides whether the move is
-/// legal from the state the attempt is actually in. Construct one, apply
-/// it, and persist the state that comes back — the DAO no longer decides
-/// for itself what a given step may do.
-///
-/// The mint is supplied by the caller rather than looked up here: which
-/// credential a resolve should record is a storage question (the v7
-/// ledger, `git_push_approve_attempt_mint`, may hold one for a `Started`
-/// attempt), and this module is pure.
+/// legal from the attempt's actual position. Construct one, apply it, and
+/// persist what comes back — the DAO no longer decides for itself what a
+/// given step may do.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ApproveAttemptTransition {
+    /// Record the credential this attempt just minted, before the long
+    /// prepare phase (staging fetch, unbundle, plan, uploads) runs. From
+    /// here on the mint's identity survives a crash.
+    RecordMint { mint: PromoteMintAudit },
     /// TX2: the broker has finished the lease check and is about to issue
     /// `update_ref`. Records the mint the PATCH will use. Once this
     /// commits the broker owes the audit log a resolution, and reject is
@@ -189,20 +221,22 @@ pub enum ApproveAttemptTransition {
         completed_at: UnixMillis,
     },
     /// Resolve as "failed before `update_ref` went out", provably
-    /// retryable. `mint` is the credential the attempt already implies:
-    /// the ledger mint for a `Started` row (`None` if it never minted),
-    /// or `None` from `Uncertain`, whose own mint is carried forward.
+    /// retryable.
+    ///
+    /// The recorded mint is *derived*, not supplied: an `Uncertain` row
+    /// carries its own, and a `Started` one carries whatever the ledger
+    /// holds. That is what the schema's `resolve_carries_ledger_mint`
+    /// trigger demands, so deriving it makes the rule impossible to
+    /// forget at a call site.
     ResolvePrePatchFailure {
         detail: String,
-        mint: Option<PromoteMintAudit>,
         completed_at: UnixMillis,
     },
     /// Resolve as `PrePatchFailure` while recording a mint the caller
     /// holds that the ledger may not know (the ledger write itself
-    /// failed). Legal only from `Started`: an `Uncertain` row already
-    /// carries its mint, and the schema's mint-immutability trigger
-    /// governs it from there, so callers in that state use
-    /// [`Self::ResolvePrePatchFailure`].
+    /// failed). Legal only from `Started`, and only when it does not
+    /// contradict a ledger row: an `Uncertain` row already carries its
+    /// mint, so callers in that state use [`Self::ResolvePrePatchFailure`].
     CapturePrePatchFailure {
         detail: String,
         mint: PromoteMintAudit,
@@ -219,9 +253,10 @@ pub enum ApproveAttemptTransition {
 
 impl ApproveAttemptTransition {
     /// Short name for diagnostics. Not a wire format — nothing persists
-    /// a transition, only the state it produces.
+    /// a transition, only the position it produces.
     pub fn label(&self) -> &'static str {
         match self {
+            Self::RecordMint { .. } => "record-mint",
             Self::MarkUncertain { .. } => "mark-uncertain",
             Self::ResolveSucceeded { .. } => "resolve-succeeded",
             Self::ResolvePrePatchFailure { .. } => "resolve-pre-patch-failure",
@@ -260,53 +295,93 @@ impl std::error::Error for IllegalApproveTransition {}
 /// The transition relation, in one place.
 ///
 /// This is the Rust half of a machine whose other half is the schema's
-/// `git_push_approve_attempt_forward_only` and
-/// `git_push_approve_attempt_mint_immutable` triggers. The triggers stay
-/// — they are the unkillable layer, and correctness-over-availability
-/// says the database should refuse a contradiction even when every Rust
-/// caller is wrong. What changes is that the Rust side is no longer a
-/// scatter of `if state != "started"` preflights spread across the DAO:
-/// it is this function, and the DAO persists what it returns.
+/// `forward_only`, `mint_immutable`, `mint_matches_ledger`,
+/// `resolve_carries_ledger_mint`, and `mint_ledger_requires_started`
+/// triggers. The triggers stay — they are the unkillable layer, and
+/// correctness-over-availability says the database should refuse a
+/// contradiction even when every Rust caller is wrong. What changes is
+/// that the Rust side is no longer a scatter of `if state != "started"`
+/// preflights spread across the DAO: it is this function, and the DAO
+/// persists what it returns.
 ///
 /// `transition_agrees_with_the_schema` in the tests drives every
-/// (state, transition) pair against a real SQLite database and asserts
-/// the two halves accept the same moves, so they cannot drift apart.
+/// (position, transition) pair — including both ledger states — against a
+/// real SQLite database and asserts the two halves accept the same moves,
+/// so they cannot drift apart.
 pub fn apply(
-    state: &GitPushApproveAttemptState,
+    attempt: &ApproveAttempt,
     transition: &ApproveAttemptTransition,
-) -> Result<GitPushApproveAttemptState, IllegalApproveTransition> {
+) -> Result<ApproveAttempt, IllegalApproveTransition> {
     use ApproveAttemptTransition as T;
     use GitPushApproveAttemptState as S;
 
     let refuse = |because| {
         Err(IllegalApproveTransition {
-            from: state.name(),
+            from: attempt.state.name(),
             transition: transition.label(),
             because,
         })
     };
+    let ledger = attempt.ledger_mint;
+    // A mint the caller supplies must agree with the ledger row if there
+    // is one: the audit log answers "which credential did this attempt
+    // burn?" exactly once. (`mint_matches_ledger` enforces the same.)
+    let contradicts_ledger =
+        |supplied: PromoteMintAudit| ledger.is_some_and(|recorded| recorded != supplied);
+    let resolved = |outcome, mint, completed_at| {
+        Ok(ApproveAttempt {
+            state: S::Resolved {
+                outcome,
+                mint,
+                completed_at,
+            },
+            ledger_mint: ledger,
+        })
+    };
 
-    match (state, transition) {
+    match (&attempt.state, transition) {
+        // The ledger write. Append-only and `started`-only, so the second
+        // one is refused rather than overwriting the first.
+        (S::Started, T::RecordMint { mint }) => {
+            if ledger.is_some() {
+                return refuse("the attempt has already recorded a mint");
+            }
+            Ok(ApproveAttempt {
+                state: S::Started,
+                ledger_mint: Some(*mint),
+            })
+        }
+        (S::Uncertain { .. }, T::RecordMint { .. }) => {
+            refuse("the mint ledger is only written while the attempt is 'started'")
+        }
+
         // Started → Uncertain: the row takes on the mint of the PATCH
         // that is about to be issued.
-        (S::Started, T::MarkUncertain { mint }) => Ok(S::Uncertain { mint: *mint }),
+        (S::Started, T::MarkUncertain { mint }) => {
+            if contradicts_ledger(*mint) {
+                return refuse("the mint ledger already records a different credential");
+            }
+            Ok(ApproveAttempt {
+                state: S::Uncertain { mint: *mint },
+                ledger_mint: ledger,
+            })
+        }
 
         // Started → Resolved(PrePatchFailure): the two pre-PATCH resolve
-        // paths, differing only in where the recorded mint came from.
+        // paths, differing only in where the recorded mint comes from.
         (
             S::Started,
             T::ResolvePrePatchFailure {
                 detail,
-                mint,
                 completed_at,
             },
-        ) => Ok(S::Resolved {
-            outcome: GitPushApproveAttemptOutcome::PrePatchFailure {
+        ) => resolved(
+            GitPushApproveAttemptOutcome::PrePatchFailure {
                 detail: detail.clone(),
             },
-            mint: *mint,
-            completed_at: *completed_at,
-        }),
+            ledger,
+            *completed_at,
+        ),
         (
             S::Started,
             T::CapturePrePatchFailure {
@@ -314,63 +389,61 @@ pub fn apply(
                 mint,
                 completed_at,
             },
-        ) => Ok(S::Resolved {
-            outcome: GitPushApproveAttemptOutcome::PrePatchFailure {
-                detail: detail.clone(),
-            },
-            mint: Some(*mint),
-            completed_at: *completed_at,
-        }),
+        ) => {
+            if contradicts_ledger(*mint) {
+                return refuse("the mint ledger already records a different credential");
+            }
+            resolved(
+                GitPushApproveAttemptOutcome::PrePatchFailure {
+                    detail: detail.clone(),
+                },
+                Some(*mint),
+                *completed_at,
+            )
+        }
 
         // Uncertain → Resolved(any). The mint is carried forward verbatim
         // in every case: the audit log's promise is "this approval used
-        // credential X", and the schema's mint-immutability trigger holds
-        // us to it.
+        // credential X", and the mint-immutability trigger holds us to it.
         (
             S::Uncertain { mint },
             T::ResolveSucceeded {
                 new_app_tip,
                 completed_at,
             },
-        ) => Ok(S::Resolved {
-            outcome: GitPushApproveAttemptOutcome::Succeeded {
+        ) => resolved(
+            GitPushApproveAttemptOutcome::Succeeded {
                 new_app_tip: new_app_tip.clone(),
             },
-            mint: Some(*mint),
-            completed_at: *completed_at,
-        }),
+            Some(*mint),
+            *completed_at,
+        ),
         (
             S::Uncertain { mint },
             T::ResolvePrePatchFailure {
                 detail,
-                mint: supplied,
                 completed_at,
             },
-        ) => {
-            if supplied.is_some_and(|supplied| supplied != *mint) {
-                return refuse("the row's mint is immutable once recorded");
-            }
-            Ok(S::Resolved {
-                outcome: GitPushApproveAttemptOutcome::PrePatchFailure {
-                    detail: detail.clone(),
-                },
-                mint: Some(*mint),
-                completed_at: *completed_at,
-            })
-        }
+        ) => resolved(
+            GitPushApproveAttemptOutcome::PrePatchFailure {
+                detail: detail.clone(),
+            },
+            Some(*mint),
+            *completed_at,
+        ),
         (
             S::Uncertain { mint },
             T::ResolvePostPatchFailure {
                 detail,
                 completed_at,
             },
-        ) => Ok(S::Resolved {
-            outcome: GitPushApproveAttemptOutcome::PostPatchFailure {
+        ) => resolved(
+            GitPushApproveAttemptOutcome::PostPatchFailure {
                 detail: detail.clone(),
             },
-            mint: Some(*mint),
-            completed_at: *completed_at,
-        }),
+            Some(*mint),
+            *completed_at,
+        ),
 
         // Everything else. Spelled out rather than collapsed into a
         // wildcard so each refusal can say which invariant it protects,

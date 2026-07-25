@@ -10,27 +10,18 @@
 use super::*;
 use rusqlite::Connection;
 
-/// Parse a raw `state` column value into its discriminant. A value
-/// outside the enum is a schema-CHECK violation that should have been
-/// impossible, so it surfaces as an `Invariant` error rather than being
-/// silently treated as "some other state".
-fn parse_state_name(raw: &str) -> Result<ApproveAttemptStateName, AuditError> {
-    ApproveAttemptStateName::parse_wire(raw).ok_or(AuditError::Invariant(
-        "approve attempt row: state value is invalid",
-    ))
-}
-
-/// Read one attempt row back as its parsed state, inside a transaction.
+/// Read one attempt back as the machine sees it — the parsed row state
+/// *and* the v7 ledger mint — inside a transaction.
 ///
 /// Every write path starts here: the machine ([`approve_attempt::apply`])
-/// judges a transition against the state the attempt is *actually* in, so
-/// the write has to see the whole row (mint included), not just the
-/// `state` column. Reading inside the caller's transaction is what makes
-/// the read-decide-write sequence atomic.
-fn load_attempt_state(
+/// judges a transition against the position the attempt is *actually* in,
+/// which includes whether it has already minted (two schema triggers
+/// judge writes against the ledger row). Reading inside the caller's
+/// transaction is what makes the read-decide-write sequence atomic.
+fn load_attempt(
     tx: &rusqlite::Transaction<'_>,
     attempt_id: ApproveAttemptId,
-) -> Result<(GitPushApproveAttemptState, String), AuditError> {
+) -> Result<(ApproveAttempt, String), AuditError> {
     let entry = tx
         .query_row(
             "SELECT attempt_id, push_request_id, operator, started_at,
@@ -47,7 +38,14 @@ fn load_attempt_state(
         return Err(AuditError::Invariant("approve attempt does not exist"));
     };
     let entry = entry?;
-    Ok((entry.state, entry.push_request_id.as_uuid().to_string()))
+    let ledger_mint = read_attempt_ledger_mint(tx, attempt_id)?;
+    Ok((
+        ApproveAttempt {
+            state: entry.state,
+            ledger_mint,
+        },
+        entry.push_request_id.as_uuid().to_string(),
+    ))
 }
 
 /// Persist a state the machine produced, writing *every* mutable column
@@ -162,17 +160,29 @@ fn read_attempt_ledger_mint(
     }))
 }
 
-/// Apply a transition to the attempt's current state and persist the
-/// result, all inside `tx`. Returns the state that was written.
+/// Apply a transition to the attempt's current position and persist the
+/// resulting row state, all inside `tx`. Returns what was written.
+///
+/// Only the attempt *row* is written here. The mint ledger is append-only
+/// and carries its own `recorded_at`, so the one transition that changes
+/// it ([`ApproveAttemptTransition::RecordMint`]) is driven by
+/// [`AuditLog::record_attempt_mint`], which writes that row itself; the
+/// guard below makes a ledger change through this path a loud error
+/// rather than a silently dropped write.
 fn transition_attempt(
     tx: &rusqlite::Transaction<'_>,
     attempt_id: ApproveAttemptId,
     transition: &ApproveAttemptTransition,
 ) -> Result<GitPushApproveAttemptState, AuditError> {
-    let (current, _) = load_attempt_state(tx, attempt_id)?;
+    let (current, _) = load_attempt(tx, attempt_id)?;
     let next = approve_attempt::apply(&current, transition)?;
-    write_attempt_state(tx, attempt_id, &next)?;
-    Ok(next)
+    if next.ledger_mint != current.ledger_mint {
+        return Err(AuditError::Invariant(
+            "approve attempt: ledger writes must go through record_attempt_mint",
+        ));
+    }
+    write_attempt_state(tx, attempt_id, &next.state)?;
+    Ok(next.state)
 }
 
 /// Insert one git-push request row into this connection/transaction. Assumes
@@ -562,33 +572,13 @@ impl AuditLog {
         })?;
         self.with_conn_mut(|c| {
             let tx = c.transaction()?;
-            let state: Option<String> = tx
-                .query_row(
-                    "SELECT state FROM git_push_approve_attempt WHERE attempt_id = ?1",
-                    params![attempt_id.as_uuid().to_string()],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            let Some(state) = state else {
-                return Err(AuditError::Invariant("approve attempt does not exist"));
-            };
-            if parse_state_name(&state)? != ApproveAttemptStateName::Started {
-                return Err(AuditError::Invariant(
-                    "approve attempt mint ledger requires 'started' state",
-                ));
-            }
-            let already: Option<i64> = tx
-                .query_row(
-                    "SELECT 1 FROM git_push_approve_attempt_mint WHERE attempt_id = ?1",
-                    params![attempt_id.as_uuid().to_string()],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            if already.is_some() {
-                return Err(AuditError::Invariant(
-                    "approve attempt already has a mint ledger row",
-                ));
-            }
+            // The machine owns the legality question — "only a `started`
+            // attempt that has not already minted may record one" — and
+            // the ledger row's own INSERT is written here because it is
+            // append-only and carries a `recorded_at` the machine has no
+            // use for.
+            let (current, _) = load_attempt(&tx, attempt_id)?;
+            approve_attempt::apply(&current, &ApproveAttemptTransition::RecordMint { mint })?;
             tx.execute(
                 "INSERT INTO git_push_approve_attempt_mint (
                      attempt_id, mint_jti, mint_github_app_id,
@@ -709,14 +699,15 @@ impl AuditLog {
             // Read, decide, and write inside one transaction so the
             // resolution row is derived from the same mint context the
             // attempt records.
-            let (current, push_request_id) = load_attempt_state(&tx, attempt_id)?;
+            let (current, push_request_id) = load_attempt(&tx, attempt_id)?;
             let resolved = approve_attempt::apply(
                 &current,
                 &ApproveAttemptTransition::ResolveSucceeded {
                     new_app_tip: new_app_tip.clone(),
                     completed_at,
                 },
-            )?;
+            )?
+            .state;
             write_attempt_state(&tx, attempt_id, &resolved)?;
 
             // `apply` carries the `Uncertain` row's mint onto the
@@ -780,16 +771,14 @@ impl AuditLog {
         detail: &str,
         completed_at: UnixMillis,
     ) -> Result<(), AuditError> {
-        self.resolve_attempt_failure(attempt_id, detail, |current| {
-            // A `Started` row may have a v7 ledger mint to carry onto the
-            // resolved row; an `Uncertain` row carries its own, so the
-            // transition supplies none and `apply` preserves it.
+        self.resolve_attempt_failure(
+            attempt_id,
+            detail,
             ApproveAttemptTransition::ResolvePrePatchFailure {
                 detail: detail.to_string(),
-                mint: current,
                 completed_at,
-            }
-        })
+            },
+        )
     }
 
     /// Complete a `Started` attempt as `PrePatchFailure` while
@@ -810,25 +799,15 @@ impl AuditLog {
         detail: &str,
         completed_at: UnixMillis,
     ) -> Result<(), AuditError> {
-        if detail.is_empty() {
-            return Err(AuditError::Invariant(
-                "approve attempt failure detail must not be empty",
-            ));
-        }
-        self.with_conn_mut(|c| {
-            let tx = c.transaction()?;
-            transition_attempt(
-                &tx,
-                attempt_id,
-                &ApproveAttemptTransition::CapturePrePatchFailure {
-                    detail: detail.to_string(),
-                    mint,
-                    completed_at,
-                },
-            )?;
-            tx.commit()?;
-            Ok(())
-        })
+        self.resolve_attempt_failure(
+            attempt_id,
+            detail,
+            ApproveAttemptTransition::CapturePrePatchFailure {
+                detail: detail.to_string(),
+                mint,
+                completed_at,
+            },
+        )
     }
 
     /// Complete an `Uncertain` attempt as `PostPatchFailure`. Only
@@ -840,12 +819,14 @@ impl AuditLog {
         detail: &str,
         completed_at: UnixMillis,
     ) -> Result<(), AuditError> {
-        self.resolve_attempt_failure(attempt_id, detail, |_current| {
+        self.resolve_attempt_failure(
+            attempt_id,
+            detail,
             ApproveAttemptTransition::ResolvePostPatchFailure {
                 detail: detail.to_string(),
                 completed_at,
-            }
-        })
+            },
+        )
     }
 
     /// Record that boot reconcile observed an `Uncertain` attempt at
@@ -1032,22 +1013,17 @@ impl AuditLog {
         })
     }
 
-    /// Shared body of the two failure-resolve entry points: read the
-    /// attempt's current state (and, for a `Started` row, the v7 ledger
-    /// mint that must follow it into the resolved row), build the
-    /// caller's transition from that, apply it, and persist the result.
+    /// Shared body of the failure-resolve entry points: check the detail
+    /// is non-empty, then hand the transition to the machine.
     ///
-    /// `build` receives the ledger mint the resolve should carry —
-    /// `Some` only when the attempt is still `Started` *and* it minted;
-    /// an `Uncertain` row carries its mint on the row itself and
-    /// [`approve_attempt::apply`] preserves it. The caller decides
-    /// whether to use it, which is the only difference between the
-    /// pre-patch and post-patch entry points.
+    /// The mint a resolve records is derived by the machine from the
+    /// attempt's position — an `Uncertain` row's own mint, or a `Started`
+    /// row's ledger mint — so no entry point has to remember to carry it.
     fn resolve_attempt_failure(
         &self,
         attempt_id: ApproveAttemptId,
         detail: &str,
-        build: impl FnOnce(Option<PromoteMintAudit>) -> ApproveAttemptTransition,
+        transition: ApproveAttemptTransition,
     ) -> Result<(), AuditError> {
         if detail.is_empty() {
             return Err(AuditError::Invariant(
@@ -1062,17 +1038,7 @@ impl AuditLog {
 
         self.with_conn_mut(|c| {
             let tx = c.transaction()?;
-            let (current, _) = load_attempt_state(&tx, attempt_id)?;
-            // The ledger is read inside the TX so the eligibility
-            // decision and the mint copy see one snapshot. The schema's
-            // `resolve_carries_ledger_mint` trigger backs this up against
-            // paths that forget.
-            let ledger_mint = match current {
-                GitPushApproveAttemptState::Started => read_attempt_ledger_mint(&tx, attempt_id)?,
-                _ => None,
-            };
-            let next = approve_attempt::apply(&current, &build(ledger_mint))?;
-            write_attempt_state(&tx, attempt_id, &next)?;
+            transition_attempt(&tx, attempt_id, &transition)?;
             tx.commit()?;
             Ok(())
         })

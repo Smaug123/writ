@@ -18,7 +18,7 @@ mod approve_attempt;
 mod dao;
 
 pub use approve_attempt::{
-    ApproveAttemptOutcomeName, ApproveAttemptStateName, ApproveAttemptTransition,
+    ApproveAttempt, ApproveAttemptOutcomeName, ApproveAttemptStateName, ApproveAttemptTransition,
     IllegalApproveTransition, apply as apply_approve_transition,
 };
 

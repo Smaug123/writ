@@ -458,14 +458,17 @@ fn columns_of(state: &GitPushApproveAttemptState) -> AttemptColumns {
 }
 
 /// The row a *naive* writer would produce for `transition` applied to
-/// `from` — one that just writes the step's columns without asking
-/// whether the step is legal. This is what the schema's triggers get to
-/// judge.
-fn naive_columns(
-    from: &GitPushApproveAttemptState,
-    transition: &ApproveAttemptTransition,
-) -> AttemptColumns {
-    let carried = columns_of(from).mint;
+/// `from` — one that writes the columns the step implies without asking
+/// whether the step is *legal*. That distinction is the point: the probe
+/// knows what a step records, the schema's triggers judge whether it may.
+///
+/// "What a step records" includes the mint a resolve carries, which for a
+/// `Started` attempt comes from the ledger — a writer that skipped it
+/// would be refused by `resolve_carries_ledger_mint` on a step that is
+/// perfectly legal, and the oracle would be measuring the probe's
+/// forgetfulness rather than the transition relation.
+fn naive_columns(from: &ApproveAttempt, transition: &ApproveAttemptTransition) -> AttemptColumns {
+    let carried = columns_of(&from.state).mint.or(from.ledger_mint);
     let base = AttemptColumns {
         state: ApproveAttemptStateName::Resolved,
         outcome: None,
@@ -487,12 +490,14 @@ fn naive_columns(
             new_app_tip: Some(new_app_tip.as_str().to_string()),
             ..base
         },
-        ApproveAttemptTransition::ResolvePrePatchFailure { detail, mint, .. } => AttemptColumns {
+        ApproveAttemptTransition::ResolvePrePatchFailure { detail, .. } => AttemptColumns {
             outcome: Some(ApproveAttemptOutcomeName::PrePatchFailure),
             failure_detail: Some(detail.clone()),
-            mint: mint.or(carried),
             ..base
         },
+        // `RecordMint` writes the ledger table, not this row;
+        // `schema_accepts_transition` dispatches before reaching here.
+        ApproveAttemptTransition::RecordMint { .. } => base,
         ApproveAttemptTransition::CapturePrePatchFailure { detail, mint, .. } => AttemptColumns {
             outcome: Some(ApproveAttemptOutcomeName::PrePatchFailure),
             failure_detail: Some(detail.clone()),
@@ -507,13 +512,22 @@ fn naive_columns(
     }
 }
 
+/// Seed an attempt into `attempt`'s position by a *legal* path.
+///
+/// Not a single INSERT: the ledger trigger
+/// `mint_ledger_requires_started` only admits a ledger row while the
+/// attempt is `started`, so a position that combines a ledger mint with a
+/// later state has to be built the way production builds it — insert
+/// `started`, write the ledger row, then step forward. That the seeding
+/// itself succeeds is a small bonus check that every position in the grid
+/// is actually reachable.
 fn seed_attempt(
     log: &AuditLog,
     push_request_id: RequestId,
     attempt_id: ApproveAttemptId,
-    state: &GitPushApproveAttemptState,
+    attempt: &ApproveAttempt,
 ) {
-    let cols = columns_of(state);
+    let started = columns_of(&GitPushApproveAttemptState::Started);
     log.with_conn_mut(|c| {
         c.execute(
             "INSERT INTO git_push_approve_attempt (
@@ -521,29 +535,106 @@ fn seed_attempt(
                  state, outcome, completed_at, new_app_tip, failure_detail,
                  mint_jti, mint_github_app_id, mint_issued_at, mint_expires_at
              ) VALUES (?1, ?2, 'alice', 1700000200,
-                       ?3, ?4, ?5, ?6, ?7,
-                       ?8, ?9, ?10, ?11)",
+                       ?3, NULL, NULL, NULL, NULL,
+                       NULL, NULL, NULL, NULL)",
             params![
                 attempt_id.as_uuid().to_string(),
                 push_request_id.as_uuid().to_string(),
-                cols.state.as_wire(),
-                cols.outcome.map(|o| o.as_wire()),
-                cols.completed_at,
-                cols.new_app_tip,
-                cols.failure_detail,
-                cols.mint.map(|m| m.jti.as_uuid().to_string()),
-                cols.mint.map(|m| m.github_app_id as i64),
-                cols.mint.map(|m| m.issued_at.as_millis()),
-                cols.mint.map(|m| m.expires_at.as_millis()),
+                started.state.as_wire(),
             ],
         )
         .map(|_| ())
         .map_err(crate::AuditError::from)
     })
-    .expect("seeding a legal row must succeed");
+    .expect("seeding a started row must succeed");
+
+    if let Some(mint) = attempt.ledger_mint {
+        log.with_conn_mut(|c| {
+            c.execute(
+                "INSERT INTO git_push_approve_attempt_mint (
+                     attempt_id, mint_jti, mint_github_app_id,
+                     mint_issued_at, mint_expires_at, recorded_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, 1700000210)",
+                params![
+                    attempt_id.as_uuid().to_string(),
+                    mint.jti.as_uuid().to_string(),
+                    mint.github_app_id as i64,
+                    mint.issued_at.as_millis(),
+                    mint.expires_at.as_millis(),
+                ],
+            )
+            .map(|_| ())
+            .map_err(crate::AuditError::from)
+        })
+        .expect("seeding a ledger row must succeed");
+    }
+
+    // Walk to the target position one legal step at a time.
+    for step in path_to(&attempt.state) {
+        assert!(
+            schema_accepts(log, attempt_id, &columns_of(&step)),
+            "seeding step to {:?} was refused by the schema",
+            step.name(),
+        );
+    }
 }
 
-/// Issue the naive UPDATE and report whether the schema accepted it.
+/// The intermediate states a legal path to `target` passes through,
+/// `target` last. `Resolved(Succeeded)` and `Resolved(PostPatchFailure)`
+/// are only reachable via `Uncertain`, which is the machine's own rule.
+fn path_to(target: &GitPushApproveAttemptState) -> Vec<GitPushApproveAttemptState> {
+    match target {
+        GitPushApproveAttemptState::Started => vec![],
+        GitPushApproveAttemptState::Uncertain { .. } => vec![target.clone()],
+        GitPushApproveAttemptState::Resolved { outcome, mint, .. } => match outcome {
+            // Reachable directly from `started`.
+            GitPushApproveAttemptOutcome::PrePatchFailure { .. } => vec![target.clone()],
+            GitPushApproveAttemptOutcome::Succeeded { .. }
+            | GitPushApproveAttemptOutcome::PostPatchFailure { .. } => vec![
+                GitPushApproveAttemptState::Uncertain {
+                    mint: mint.expect("these outcomes always carry a mint"),
+                },
+                target.clone(),
+            ],
+        },
+    }
+}
+
+/// Issue the naive write for a transition and report whether the schema
+/// accepted it. `RecordMint` writes the ledger table; everything else
+/// updates the attempt row.
+fn schema_accepts_transition(
+    log: &AuditLog,
+    attempt_id: ApproveAttemptId,
+    attempt: &ApproveAttempt,
+    transition: &ApproveAttemptTransition,
+) -> bool {
+    if let ApproveAttemptTransition::RecordMint { mint } = transition {
+        return log
+            .with_conn_mut(|c| {
+                c.execute(
+                    "INSERT INTO git_push_approve_attempt_mint (
+                         attempt_id, mint_jti, mint_github_app_id,
+                         mint_issued_at, mint_expires_at, recorded_at
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, 1700000220)",
+                    params![
+                        attempt_id.as_uuid().to_string(),
+                        mint.jti.as_uuid().to_string(),
+                        mint.github_app_id as i64,
+                        mint.issued_at.as_millis(),
+                        mint.expires_at.as_millis(),
+                    ],
+                )
+                .map(|_| ())
+                .map_err(crate::AuditError::from)
+            })
+            .is_ok();
+    }
+    schema_accepts(log, attempt_id, &naive_columns(attempt, transition))
+}
+
+/// Issue the naive UPDATE of the attempt row and report whether the
+/// schema accepted it.
 fn schema_accepts(log: &AuditLog, attempt_id: ApproveAttemptId, cols: &AttemptColumns) -> bool {
     log.with_conn_mut(|c| {
         c.execute(
@@ -595,8 +686,8 @@ fn mint_a() -> PromoteMintAudit {
 }
 
 /// A second, definitely-different credential — the "caller holds a mint
-/// the row does not know about" case that the mint-immutability trigger
-/// exists to refuse.
+/// the row does not know about" case that the mint-immutability and
+/// ledger-agreement triggers exist to refuse.
 fn mint_b() -> PromoteMintAudit {
     PromoteMintAudit {
         jti: writ_core::core::Jti::from_uuid(uuid::Uuid::from_u128(0xB0B)),
@@ -605,7 +696,7 @@ fn mint_b() -> PromoteMintAudit {
     }
 }
 
-/// Every state an attempt row can be in, labelled for failure messages.
+/// Every row state an attempt can be in, labelled for failure messages.
 fn every_state() -> Vec<(&'static str, GitPushApproveAttemptState)> {
     let completed_at = writ_core::core::UnixMillis::from_millis(1_700_000_300);
     vec![
@@ -635,6 +726,16 @@ fn every_state() -> Vec<(&'static str, GitPushApproveAttemptState)> {
             },
         ),
         (
+            "resolved/pre_patch_failure+mint",
+            GitPushApproveAttemptState::Resolved {
+                outcome: GitPushApproveAttemptOutcome::PrePatchFailure {
+                    detail: "walker refused".into(),
+                },
+                mint: Some(mint_a()),
+                completed_at,
+            },
+        ),
+        (
             "resolved/post_patch_failure",
             GitPushApproveAttemptState::Resolved {
                 outcome: GitPushApproveAttemptOutcome::PostPatchFailure {
@@ -647,15 +748,57 @@ fn every_state() -> Vec<(&'static str, GitPushApproveAttemptState)> {
     ]
 }
 
-/// Every transition, including the three mint variants of the pre-patch
-/// resolve (none / same / different), which is what exercises the
-/// mint-immutability half of the machine.
+/// Every *position*: a row state crossed with whether the attempt has a
+/// v7 ledger row. The ledger is part of the machine's state — two schema
+/// triggers judge writes against it — so the grid has to sweep it, and
+/// the reviewer who spotted that it did not was right.
+///
+/// Combinations the schema cannot represent are dropped rather than
+/// papered over: a resolved row with a NULL mint alongside a ledger row
+/// is refused by `resolve_carries_ledger_mint`, so it can never exist.
+fn every_position() -> Vec<(String, ApproveAttempt)> {
+    let mut out = Vec::new();
+    for (state_label, state) in every_state() {
+        out.push((state_label.to_string(), ApproveAttempt::new(state.clone())));
+
+        let carries_no_mint = matches!(
+            &state,
+            GitPushApproveAttemptState::Resolved { mint: None, .. }
+        );
+        if carries_no_mint {
+            continue;
+        }
+        out.push((
+            format!("{state_label}+ledger"),
+            ApproveAttempt {
+                state,
+                ledger_mint: Some(mint_a()),
+            },
+        ));
+    }
+    out
+}
+
+/// Every transition, including the mint variants that exercise the
+/// immutability and ledger-agreement halves of the machine.
 fn every_transition() -> Vec<(&'static str, ApproveAttemptTransition)> {
     let completed_at = writ_core::core::UnixMillis::from_millis(COMPLETED_AT);
     vec![
         (
-            "mark-uncertain",
+            "record-mint/same",
+            ApproveAttemptTransition::RecordMint { mint: mint_a() },
+        ),
+        (
+            "record-mint/other",
+            ApproveAttemptTransition::RecordMint { mint: mint_b() },
+        ),
+        (
+            "mark-uncertain/same-mint",
             ApproveAttemptTransition::MarkUncertain { mint: mint_a() },
+        ),
+        (
+            "mark-uncertain/other-mint",
+            ApproveAttemptTransition::MarkUncertain { mint: mint_b() },
         ),
         (
             "resolve-succeeded",
@@ -665,26 +808,9 @@ fn every_transition() -> Vec<(&'static str, ApproveAttemptTransition)> {
             },
         ),
         (
-            "resolve-pre-patch/no-mint",
+            "resolve-pre-patch",
             ApproveAttemptTransition::ResolvePrePatchFailure {
                 detail: "refused".into(),
-                mint: None,
-                completed_at,
-            },
-        ),
-        (
-            "resolve-pre-patch/same-mint",
-            ApproveAttemptTransition::ResolvePrePatchFailure {
-                detail: "refused".into(),
-                mint: Some(mint_a()),
-                completed_at,
-            },
-        ),
-        (
-            "resolve-pre-patch/other-mint",
-            ApproveAttemptTransition::ResolvePrePatchFailure {
-                detail: "refused".into(),
-                mint: Some(mint_b()),
                 completed_at,
             },
         ),
@@ -714,32 +840,33 @@ fn every_transition() -> Vec<(&'static str, ApproveAttemptTransition)> {
     ]
 }
 
-/// (state, transition) pairs where the Rust machine is deliberately
+/// (position, transition) pairs where the Rust machine is deliberately
 /// *stricter* than the schema, with the reason. Enumerated rather than
 /// waved at, so that a new divergence — in either direction — fails the
 /// oracle below instead of being absorbed silently.
 fn deliberate_asymmetries() -> Vec<(&'static str, &'static str)> {
-    vec![(
+    vec![
         // `capture-pre-patch` means "resolve while recording a mint the
         // ledger may not know". From `uncertain` the row already carries
         // its mint, so the caller must use the plain resolve; the schema
         // has no way to express that caller-knowledge precondition and
         // would accept the write when the mint happens to match.
-        // `capture_from_uncertain_is_stricter_than_the_schema` pins the
-        // one case where that shows.
-        "uncertain",
-        "capture-pre-patch/same-mint",
-    )]
+        // `capture_from_uncertain_is_stricter_than_the_schema` pins it.
+        ("uncertain", "capture-pre-patch/same-mint"),
+        ("uncertain+ledger", "capture-pre-patch/same-mint"),
+    ]
 }
 
-/// **The oracle.** For every (state, transition) pair, the Rust machine
-/// and the schema's triggers must agree on whether the move is legal.
+/// **The oracle.** For every (position, transition) pair, the Rust
+/// machine and the schema's triggers must agree on whether the move is
+/// legal.
 ///
-/// The Rust side is [`apply`]; the SQL side is a naive UPDATE of the
-/// columns that step would write, judged by the `forward_only`,
-/// `mint_immutable`, and cross-column CHECK machinery. Because the probe
-/// is built by `naive_columns` — which never consults `apply` — this is a
-/// genuine comparison of two encodings rather than a tautology.
+/// The Rust side is [`apply`]; the SQL side is the naive write that step
+/// would perform, judged by the `forward_only`, `mint_immutable`,
+/// `mint_matches_ledger`, `resolve_carries_ledger_mint`, and
+/// `mint_ledger_requires_started` machinery. Because the probe is built
+/// by `naive_columns` — which never consults `apply` — this is a genuine
+/// comparison of two encodings rather than a tautology.
 ///
 /// This is what makes the duplication safe: the triggers stay as the
 /// unkillable backstop, and a change to either half that the other does
@@ -748,22 +875,24 @@ fn deliberate_asymmetries() -> Vec<(&'static str, &'static str)> {
 fn transition_agrees_with_the_schema() {
     let asymmetries = deliberate_asymmetries();
     let mut checked = 0usize;
-    for (state_label, state) in every_state() {
+    for (position_label, attempt) in every_position() {
         for (transition_label, transition) in every_transition() {
-            if asymmetries.contains(&(state_label, transition_label)) {
+            if asymmetries
+                .iter()
+                .any(|(p, t)| *p == position_label && *t == transition_label)
+            {
                 continue;
             }
             let (log, push_request_id) = staged_log();
             let attempt_id = ApproveAttemptId::new();
-            seed_attempt(&log, push_request_id, attempt_id, &state);
+            seed_attempt(&log, push_request_id, attempt_id, &attempt);
 
-            let rust_allows = apply(&state, &transition).is_ok();
-            let schema_allows =
-                schema_accepts(&log, attempt_id, &naive_columns(&state, &transition));
+            let rust_allows = apply(&attempt, &transition).is_ok();
+            let schema_allows = schema_accepts_transition(&log, attempt_id, &attempt, &transition);
 
             assert_eq!(
                 rust_allows, schema_allows,
-                "machine and schema disagree on {transition_label} from {state_label}: \
+                "machine and schema disagree on {transition_label} from {position_label}: \
                  rust_allows={rust_allows} schema_allows={schema_allows}",
             );
             checked += 1;
@@ -771,26 +900,26 @@ fn transition_agrees_with_the_schema() {
     }
     assert_eq!(
         checked,
-        every_state().len() * every_transition().len() - asymmetries.len(),
+        every_position().len() * every_transition().len() - asymmetries.len(),
         "every pair but the enumerated asymmetries must be checked",
     );
 }
 
-/// The one deliberate asymmetry, stated outright: from `uncertain`, a
+/// The deliberate asymmetry, stated outright: from `uncertain`, a
 /// capturing resolve is refused by the machine even when the mint matches
 /// and the schema would therefore accept the write. The DAO's contract is
 /// that an `uncertain` attempt resolves through the plain path, which
 /// carries the row's own mint forward.
 #[test]
 fn capture_from_uncertain_is_stricter_than_the_schema() {
-    let state = GitPushApproveAttemptState::Uncertain { mint: mint_a() };
+    let attempt = ApproveAttempt::new(GitPushApproveAttemptState::Uncertain { mint: mint_a() });
     let transition = ApproveAttemptTransition::CapturePrePatchFailure {
         detail: "refused".into(),
         mint: mint_a(),
         completed_at: writ_core::core::UnixMillis::from_millis(COMPLETED_AT),
     };
 
-    let refusal = apply(&state, &transition).unwrap_err();
+    let refusal = apply(&attempt, &transition).unwrap_err();
     assert_eq!(refusal.from, ApproveAttemptStateName::Uncertain);
     assert_eq!(refusal.transition, "capture-pre-patch-failure");
 
@@ -798,12 +927,60 @@ fn capture_from_uncertain_is_stricter_than_the_schema() {
     // machine has to be the one saying no.
     let (log, push_request_id) = staged_log();
     let attempt_id = ApproveAttemptId::new();
-    seed_attempt(&log, push_request_id, attempt_id, &state);
-    assert!(schema_accepts(
+    seed_attempt(&log, push_request_id, attempt_id, &attempt);
+    assert!(schema_accepts_transition(
         &log,
         attempt_id,
-        &naive_columns(&state, &transition)
+        &attempt,
+        &transition
     ));
+}
+
+/// A `Started` attempt that has already minted may not adopt a different
+/// credential — the case the first draft of this machine got wrong,
+/// because it could not see the ledger at all.
+#[test]
+fn a_minted_attempt_refuses_a_second_credential() {
+    let attempt = ApproveAttempt {
+        state: GitPushApproveAttemptState::Started,
+        ledger_mint: Some(mint_a()),
+    };
+    for transition in [
+        ApproveAttemptTransition::MarkUncertain { mint: mint_b() },
+        ApproveAttemptTransition::CapturePrePatchFailure {
+            detail: "refused".into(),
+            mint: mint_b(),
+            completed_at: writ_core::core::UnixMillis::from_millis(COMPLETED_AT),
+        },
+        ApproveAttemptTransition::RecordMint { mint: mint_b() },
+    ] {
+        let label = transition.label();
+        assert!(
+            apply(&attempt, &transition).is_err(),
+            "{label} was allowed to replace a recorded credential",
+        );
+    }
+}
+
+/// A resolve from `Started` carries the ledger mint onto the row without
+/// being told to — the rule `resolve_carries_ledger_mint` enforces, made
+/// impossible to forget at a call site.
+#[test]
+fn resolving_a_minted_started_attempt_carries_the_ledger_mint() {
+    let attempt = ApproveAttempt {
+        state: GitPushApproveAttemptState::Started,
+        ledger_mint: Some(mint_a()),
+    };
+    let next = apply(
+        &attempt,
+        &ApproveAttemptTransition::ResolvePrePatchFailure {
+            detail: "walker refused".into(),
+            completed_at: writ_core::core::UnixMillis::from_millis(COMPLETED_AT),
+        },
+    )
+    .unwrap();
+    assert_eq!(columns_of(&next.state).mint, Some(mint_a()));
+    assert_eq!(next.ledger_mint, Some(mint_a()));
 }
 
 /// `apply` never invents a state that contradicts the transition it was
@@ -811,12 +988,16 @@ fn capture_from_uncertain_is_stricter_than_the_schema() {
 /// `mark-uncertain` produces `Uncertain` with the mint it was handed.
 #[test]
 fn apply_produces_the_state_the_transition_names() {
-    for (_, state) in every_state() {
+    for (_, attempt) in every_position() {
         for (_, transition) in every_transition() {
-            let Ok(next) = apply(&state, &transition) else {
+            let Ok(next) = apply(&attempt, &transition) else {
                 continue;
             };
+            let next = next.state;
             match &transition {
+                ApproveAttemptTransition::RecordMint { .. } => {
+                    assert_eq!(next, GitPushApproveAttemptState::Started);
+                }
                 ApproveAttemptTransition::MarkUncertain { mint } => {
                     assert_eq!(next, GitPushApproveAttemptState::Uncertain { mint: *mint });
                 }
@@ -850,17 +1031,17 @@ fn apply_produces_the_state_the_transition_names() {
 /// backs it up.
 #[test]
 fn legal_transitions_never_rewrite_a_recorded_mint() {
-    for (state_label, state) in every_state() {
-        let before = columns_of(&state).mint;
+    for (position_label, attempt) in every_position() {
+        let before = columns_of(&attempt.state).mint.or(attempt.ledger_mint);
         let Some(before) = before else { continue };
         for (transition_label, transition) in every_transition() {
-            let Ok(next) = apply(&state, &transition) else {
+            let Ok(next) = apply(&attempt, &transition) else {
                 continue;
             };
             assert_eq!(
-                columns_of(&next).mint,
+                columns_of(&next.state).mint,
                 Some(before),
-                "{transition_label} from {state_label} rewrote the recorded mint",
+                "{transition_label} from {position_label} rewrote the recorded mint",
             );
         }
     }

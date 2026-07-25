@@ -69,12 +69,12 @@ pub use flake_provision::{
     FlakeProvisionOutcomeRecord, FlakeProvisionRequestRecord, FlakeProvisionResult,
 };
 pub use git_push::{
-    ApproveAttemptOutcomeName, ApproveAttemptStateName, ApproveAttemptTransition,
+    ApproveAttempt, ApproveAttemptOutcomeName, ApproveAttemptStateName, ApproveAttemptTransition,
     GitPushApproveAttemptEntry, GitPushApproveAttemptOutcome, GitPushApproveAttemptState,
     GitPushAuditEntry, GitPushAuditTable, GitPushOutcomeRecord, GitPushOutcomeResult,
     GitPushRequestRecord, GitPushResolution, GitPushResolutionEntry, GitPushResolutionRecord,
-    PromoteMintAudit, ReconciliationTarget, RejectBlocker, UncertainAttempt,
-    apply_approve_transition,
+    IllegalApproveTransition, PromoteMintAudit, ReconciliationTarget, RejectBlocker,
+    UncertainAttempt, apply_approve_transition,
 };
 pub use grant::{MintFailureRecord, PreMintRecord};
 pub use nix_cache::{
