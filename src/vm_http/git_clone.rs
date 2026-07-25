@@ -560,9 +560,9 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::super::tests::{
-        FAKE_GIT_REV_PARSE_SHA, bearer, git_clone_config_for_test, make_broker_state, no_services,
-        open_audit_session, required_test_tool, session_for_subnet, shell_single_quote, token,
-        write_fake_git, write_fake_git_with_bundle_epilogue,
+        FAKE_GIT_REV_PARSE_SHA, bearer, declared_contract, git_clone_config_for_test,
+        make_broker_state, no_services, open_audit_session, required_test_tool, session_for_subnet,
+        shell_single_quote, token, write_fake_git, write_fake_git_with_bundle_epilogue,
     };
     use super::super::{
         VM_HTTP_READ_TIMEOUT, VmHttpProxies, VmHttpRequest, VmHttpServices, VmHttpSession,
@@ -576,6 +576,7 @@ mod tests {
     use crate::secret::SecretStore;
     use crate::server::CapabilityOutcome;
     use crate::vm_git::GitCloneRepo;
+    use crate::vm_git::{VM_HTTP_CONTRACT_HEADER, VM_HTTP_CONTRACT_VERSION};
 
     fn repo(owner: &str, name: &str) -> RepoRef {
         RepoRef {
@@ -703,6 +704,7 @@ mod tests {
     async fn disabled_git_clone_route_does_not_read_declared_body() {
         let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(10, 1, 2, 0), 24).unwrap());
         let bearer_auth = bearer(token().as_str());
+        let declared = declared_contract();
         let response = tokio::time::timeout(
             std::time::Duration::from_millis(100),
             dispatch_vm_http_head_and_body(
@@ -712,6 +714,7 @@ mod tests {
                 VM_GIT_CLONE_PATH,
                 &[
                     ("authorization", bearer_auth.as_str()),
+                    (VM_HTTP_CONTRACT_HEADER, declared.as_str()),
                     ("content-length", "1"),
                 ],
                 Vec::new(),
@@ -733,6 +736,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let service = git_clone_service_for_test(&state, &temp, write_fake_git(temp.path()));
         let bearer_auth = bearer(token().as_str());
+        let declared = declared_contract();
         let response = tokio::time::timeout(
             std::time::Duration::from_millis(100),
             dispatch_vm_http_head_and_body(
@@ -742,6 +746,7 @@ mod tests {
                 VM_GIT_CLONE_PATH,
                 &[
                     ("authorization", bearer_auth.as_str()),
+                    (VM_HTTP_CONTRACT_HEADER, declared.as_str()),
                     ("content-length", "1"),
                 ],
                 Vec::new(),
@@ -1030,7 +1035,7 @@ work_root=${{work_dir%/*}}
         let response = request_over_tcp(
             addr,
             &format!(
-                "POST {VM_GIT_CLONE_PATH} HTTP/1.1\r\nHost: localhost\r\nAuthorization: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                "POST {VM_GIT_CLONE_PATH} HTTP/1.1\r\nHost: localhost\r\nAuthorization: {}\r\n{VM_HTTP_CONTRACT_HEADER}: {VM_HTTP_CONTRACT_VERSION}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
                 bearer(token().as_str()),
                 body.len(),
                 body
@@ -1105,7 +1110,7 @@ work_root=${{work_dir%/*}}
         let clone_repo = GitCloneRepo::new(repo("o", "n")).unwrap();
         let body = serde_json::to_string(&VmGitCloneRequest::new(clone_repo, None)).unwrap();
         let request = format!(
-            "POST {VM_GIT_CLONE_PATH} HTTP/1.1\r\nHost: localhost\r\nAuthorization: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            "POST {VM_GIT_CLONE_PATH} HTTP/1.1\r\nHost: localhost\r\nAuthorization: {}\r\n{VM_HTTP_CONTRACT_HEADER}: {VM_HTTP_CONTRACT_VERSION}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
             bearer(token().as_str()),
             body.len(),
             body

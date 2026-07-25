@@ -150,6 +150,58 @@ route_enum! {
     }
 }
 
+/// Whether a route demands [`writ_vm_git::VM_HTTP_CONTRACT_HEADER`].
+///
+/// The broker cannot demand it of everything: most guest traffic is not ours.
+/// Claude Code, codex and `nix` will never send a writ header, so requiring one
+/// universally would break both model proxies and the binary cache. What it
+/// *can* do is refuse a stale guest on the routes `writ-vm` itself originates —
+/// which is where every damaging pre-effect action lives.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ContractCheck {
+    /// Originated by `writ-vm`: refuse unless the declared version matches.
+    Required,
+    /// Exempt, and why it must be.
+    Exempt(ContractExemption),
+}
+
+/// Why a route is exempt. A DU rather than a comment because the exemption set
+/// is the part of this that can silently widen, and each variant is answerable
+/// in review on its own terms.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ContractExemption {
+    /// The handshake itself. Gating `GET /v1/session` would make a mismatch
+    /// *undiagnosable*: it is the endpoint a guest reads the broker's version
+    /// out of, `writ-vm session` is exempted guest-side as the during-mismatch
+    /// diagnostic for the same reason, and the readiness probes hand-roll it
+    /// over a raw socket.
+    Handshake,
+    /// A third-party client — Claude Code, codex, `nix` — which has never heard
+    /// of writ and will not send its headers.
+    ThirdPartyClient,
+    /// Nothing is reached and no effect is attempted, so the answer does not
+    /// depend on the contract: `LegacyProxyPath`'s `410` names the rebuild and
+    /// `Unmatched`'s `404` says there is no such endpoint, both of which tell a
+    /// stale guest more than a version refusal would.
+    NoEffect,
+}
+
+impl ContractCheck {
+    /// A stable label for the contract fingerprint. Not `Debug`: which routes
+    /// demand the header is part of the guest-facing contract, but how the enum
+    /// is spelled is not. Test-only, like `identity`, since the fingerprint is
+    /// the only thing that reads it.
+    #[cfg(test)]
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Required => "required",
+            Self::Exempt(ContractExemption::Handshake) => "exempt:handshake",
+            Self::Exempt(ContractExemption::ThirdPartyClient) => "exempt:third-party",
+            Self::Exempt(ContractExemption::NoEffect) => "exempt:no-effect",
+        }
+    }
+}
+
 impl VmHttpRoute {
     /// A stable name for the handler a target reaches, for the contract
     /// fingerprint. Deliberately not `Debug`: the guest-visible contract is
@@ -207,6 +259,32 @@ impl VmHttpRoute {
             return Self::Plain(PlainRoute::Session);
         }
         Self::Plain(PlainRoute::Unmatched)
+    }
+
+    /// Whether this route requires the guest to declare its contract version.
+    ///
+    /// The exhaustive `match` is the point: a new capability cannot be added
+    /// without stating which side of the line it is on, and — because every
+    /// exemption carries its reason — without saying why if it is exempt.
+    pub(crate) fn contract_check(&self) -> ContractCheck {
+        use ContractExemption::{Handshake, NoEffect, ThirdPartyClient};
+        match self {
+            Self::Brokered(
+                BrokeredRoute::GitPush
+                | BrokeredRoute::FlakeProvision
+                | BrokeredRoute::AgentRunOutcome(_),
+            )
+            | Self::Plain(PlainRoute::GitClone | PlainRoute::AgentRunConfig(_)) => {
+                ContractCheck::Required
+            }
+            Self::Brokered(BrokeredRoute::ClaudeProxy) => ContractCheck::Exempt(ThirdPartyClient),
+            Self::Brokered(BrokeredRoute::OpenAiProxy) => ContractCheck::Exempt(ThirdPartyClient),
+            Self::Brokered(BrokeredRoute::NixCache) => ContractCheck::Exempt(ThirdPartyClient),
+            Self::Plain(PlainRoute::Session) => ContractCheck::Exempt(Handshake),
+            Self::Plain(PlainRoute::LegacyProxyPath | PlainRoute::Unmatched) => {
+                ContractCheck::Exempt(NoEffect)
+            }
+        }
     }
 
     /// Which credential this route expects. The nix cache speaks the binary-cache
@@ -530,6 +608,48 @@ pub(crate) mod tests {
                 ),
                 "{target} resolved to a model proxy: {route:?}",
             );
+        }
+    }
+
+    /// **What the guest declares on, and what the broker demands, must agree.**
+    ///
+    /// Not an equality — `GET /v1/session` is writ-vm-originated and exempt,
+    /// because gating the endpoint a guest reads the broker's version out of
+    /// makes a skew undiagnosable. Two implications instead, and each catches a
+    /// different way this can go wrong.
+    #[test]
+    fn the_header_is_demanded_of_exactly_the_routes_the_guest_declares_on() {
+        // (1) Nothing `writ-vm` originates may be exempted for a reason that
+        // belongs to somebody else's client. `Handshake` is the one exemption a
+        // route of ours may claim, and it is named, not inferred.
+        let mut originated: BTreeSet<&str> = BTreeSet::new();
+        for (method, target) in writ_vm_git::WRIT_VM_ORIGINATED_TARGETS {
+            let route = VmHttpRoute::resolve(&request(method, target));
+            assert!(
+                matches!(
+                    route.contract_check(),
+                    ContractCheck::Required | ContractCheck::Exempt(ContractExemption::Handshake)
+                ),
+                "`{method} {target}` is originated by writ-vm but is {:?}: a route of ours may \
+                 only be exempt as the handshake",
+                route.contract_check(),
+            );
+            originated.insert(route.identity());
+        }
+
+        // (2) The broker may not demand a declaration on a route the guest never
+        // declares on — that would refuse legitimate traffic, in the VM, where
+        // it is least diagnosable.
+        for (method, target, _) in ENDPOINT_MAP {
+            let route = VmHttpRoute::resolve(&request(method, target));
+            if route.contract_check() == ContractCheck::Required {
+                assert!(
+                    originated.contains(route.identity()),
+                    "`{method} {target}` demands the contract header, but `{}` is not in \
+                     WRIT_VM_ORIGINATED_TARGETS — no guest sends one there",
+                    route.identity(),
+                );
+            }
         }
     }
 

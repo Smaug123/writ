@@ -184,6 +184,13 @@ const GUEST_CONTRACT_HISTORY: &[GuestContractRow] = &[
         route_digest: "a52713ca476fd0219c1f7a6082ff3cf61e08e829d26e7edc2be199db65bfe759",
         broker_protocol_version: 4,
     },
+    GuestContractRow {
+        // v3 — the broker refuses a guest that does not declare this version on
+        // the routes `writ-vm` originates (#342). No path moved; what changed is
+        // which routes demand a declaration, which is why that is in the digest.
+        route_digest: "0c7629a0e0df5e38fef7bfe9b7f5ead046be60688a63f10d7915980fadeb2968",
+        broker_protocol_version: 5,
+    },
 ];
 
 struct GuestContractRow {
@@ -230,8 +237,18 @@ fn resolved_line(method: &str, target: &str) -> String {
     // target*, not how the enum is spelled. Renaming a variant or changing an id
     // type's debug format must not masquerade as a contract change and force two
     // image rebuilds.
+    //
+    // Whether the route demands a contract declaration is part of the digest
+    // too. It moves no path, so without this a change to the exemption set —
+    // adding a route that refuses an undeclared guest, or dropping one that did
+    // — would leave the digest untouched and the prescribed version bump
+    // unenforced. That is precisely the miss this fingerprint exists to catch.
     let route = crate::vm_http::route_table::VmHttpRoute::resolve(&request);
-    format!("{method} {target} -> {}", route.identity())
+    format!(
+        "{method} {target} -> {} [{}]",
+        route.identity(),
+        route.contract_check().label(),
+    )
 }
 
 /// Targets swept through the classifier, chosen to pin the edges that have
@@ -317,7 +334,7 @@ fn broker_contract_fingerprint_is_pinned() {
     assert_eq!(
         fingerprint,
         "broker-cli-flags: --config --session-spec --bearer-token-file\n\
-         ready-doc: {\"protocol_version\":4,\"broker_port\":18080,\"writd_build\":\"pinned\"}",
+         ready-doc: {\"protocol_version\":5,\"broker_port\":18080,\"writd_build\":\"pinned\"}",
         "the host↔broker contract changed. Update this snapshot AND bump \
          BROKER_PROTOCOL_VERSION (and rebuild the broker image)."
     );

@@ -41,7 +41,7 @@ pub use openai_proxy::{
     VmHttpOpenAiProxyAuthKind, VmHttpOpenAiProxyConfig, VmHttpOpenAiProxyConfigError,
 };
 use proxy_common::{ClaudeBackend, OpenAiBackend, ProxyEffect, ProxyStream};
-use route_table::{BrokeredRoute, PlainRoute, VmHttpRoute};
+use route_table::{BrokeredRoute, ContractCheck, PlainRoute, VmHttpRoute};
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -64,7 +64,10 @@ use crate::bearer::is_bearer_token_byte;
 use crate::core::{BrokerPort, BrokerPortRange, Ipv4Cidr, SessionId};
 use crate::secret::SecretStore;
 use crate::server::BrokerState;
-use crate::vm_git::{GUEST_IMAGE_REBUILD_COMMAND, VM_HTTP_CONTRACT_VERSION, VmGitPushBodyLimits};
+use crate::vm_git::{
+    GUEST_IMAGE_REBUILD_COMMAND, GuestContract, VM_HTTP_CONTRACT_HEADER, VM_HTTP_CONTRACT_VERSION,
+    VmGitPushBodyLimits,
+};
 
 const MAX_VM_HTTP_BODY_BYTES: usize = 64 * 1024;
 const MAX_VM_HTTP_AGENT_RUN_OUTCOME_BODY_BYTES: usize = 4 * 1024 * 1024;
@@ -94,6 +97,11 @@ pub struct VmHttpRequest {
     target: String,
     authorization: Option<String>,
     content_length: Option<usize>,
+    /// What the guest declared about its VM-HTTP contract version, parsed once
+    /// at the boundary beside `authorization` rather than re-derived from
+    /// `headers` wherever it is wanted. Parse, don't validate: the dispatcher
+    /// matches on a value.
+    contract: GuestContract,
     headers: Vec<VmHttpHeader>,
     peer_addr: SocketAddr,
 }
@@ -237,6 +245,7 @@ pub(super) enum VmHttpStatus {
     MethodNotAllowed,
     Conflict,
     Gone,
+    UpgradeRequired,
     UnprocessableContent,
     BadGateway,
     InternalServerError,
@@ -361,6 +370,10 @@ impl VmHttpRequest {
             target: target.into(),
             authorization,
             content_length: None,
+            // A request assembled in memory declares nothing. The production
+            // path parses a declaration out of the wire in `from_hyper_parts`;
+            // a test that needs one says so with `declaring`.
+            contract: GuestContract::Absent,
             headers: Vec::new(),
             peer_addr,
         }
@@ -1167,6 +1180,21 @@ where
     let dispatch: VmHttpDispatch =
         match authorize_vm_http_request_with_scheme(session, &request, auth_scheme) {
             VmHttpAuthorization::Allow => {
+                // Before the body read, and so before anything is done for this
+                // request: a guest whose contract differs from ours must not
+                // reach an effect, and buffering up to the push limit for a
+                // request we have already decided to refuse is work we should
+                // not do. (After authentication, so an unauthenticated peer
+                // learns nothing about broker versions.)
+                if let Some(response) = refuse_contract_mismatch(&route, &request, session) {
+                    log_vm_http_request(
+                        session,
+                        &request.method,
+                        &request.target,
+                        response.status.code(),
+                    );
+                    return response.into_hyper_response();
+                }
                 let body_bytes = match route.body_limit(&request, &services) {
                     None => Vec::new(),
                     Some(max) => {
@@ -1244,6 +1272,49 @@ fn log_vm_http_request(session: &VmHttpSession, method: &str, target: &str, stat
         status,
         "vm http request",
     );
+}
+
+/// Refuse a request whose guest declares a contract this broker does not speak.
+///
+/// `None` — the overwhelmingly common answer — means "carry on": the route is
+/// exempt, or the declaration matches.
+///
+/// This is guest-*declared*, so it is skew protection between builds we control
+/// and not a security control: a compromised guest can claim any version it
+/// likes. The security boundary is unchanged — the broker re-validates every
+/// field of every request before using host authority.
+fn refuse_contract_mismatch(
+    route: &VmHttpRoute,
+    request: &VmHttpRequest,
+    session: &VmHttpSession,
+) -> Option<VmHttpResponse> {
+    match route.contract_check() {
+        ContractCheck::Exempt(_) => None,
+        ContractCheck::Required => {
+            let declared = request.contract;
+            if declared == GuestContract::Version(VM_HTTP_CONTRACT_VERSION) {
+                return None;
+            }
+            // On the host's log as well as in the response: the guest's stderr
+            // is inside a VM, and the daemon log is where an operator already
+            // is — a stale guest may have no way to surface the body at all.
+            tracing::warn!(
+                session_id = %session.session_id(),
+                target = %request.target,
+                declared = %declared,
+                broker = VM_HTTP_CONTRACT_VERSION,
+                "refusing a guest request that declares a different VM HTTP contract",
+            );
+            Some(VmHttpResponse::text(
+                VmHttpStatus::UpgradeRequired,
+                format!(
+                    "this broker speaks VM HTTP contract version {VM_HTTP_CONTRACT_VERSION}; \
+                     the guest declared {declared}. {}",
+                    crate::vm_git::contract_mismatch_remedy(declared, VM_HTTP_CONTRACT_VERSION),
+                ),
+            ))
+        }
+    }
 }
 
 fn auth_error_response(scheme: VmHttpAuthScheme, err: VmHttpAuthError) -> VmHttpResponse {
@@ -1426,6 +1497,14 @@ impl VmHttpRequest {
         .map(|s| parse_content_length(&s))
         .transpose()?;
 
+        let contract = GuestContract::parse(
+            parts
+                .headers
+                .get_all(VM_HTTP_CONTRACT_HEADER)
+                .into_iter()
+                .map(http::HeaderValue::as_bytes),
+        );
+
         let headers = parts
             .headers
             .iter()
@@ -1443,6 +1522,7 @@ impl VmHttpRequest {
             target,
             authorization,
             content_length,
+            contract,
             headers,
             peer_addr,
         })
@@ -1586,6 +1666,7 @@ impl VmHttpStatus {
             Self::MethodNotAllowed => 405,
             Self::Conflict => 409,
             Self::Gone => 410,
+            Self::UpgradeRequired => 426,
             Self::UnprocessableContent => 422,
             Self::BadGateway => 502,
             Self::InternalServerError => 500,
@@ -1605,6 +1686,7 @@ impl VmHttpStatus {
             409 => Self::Conflict,
             410 => Self::Gone,
             422 => Self::UnprocessableContent,
+            426 => Self::UpgradeRequired,
             500 => Self::InternalServerError,
             502 => Self::BadGateway,
             other => Self::Upstream(other),

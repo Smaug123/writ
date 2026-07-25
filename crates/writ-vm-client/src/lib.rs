@@ -23,12 +23,13 @@ use writ_core::process_spawn;
 use writ_vm_git::{
     DEFAULT_DEVSHELL_ATTR, DEFAULT_WORKSPACE_BRANCH, GIT_BUNDLE_CONTENT_TYPE,
     GIT_PUSH_BUNDLE_CONTENT_TYPE, GitBranchName, GitCloneRef, GitCloneRepo, GitObjectId,
-    VM_FLAKE_PROVISION_PATH, VM_GIT_CLONE_PATH, VM_GIT_PUSH_PATH, VM_HTTP_CONTRACT_HEADER,
-    VM_HTTP_CONTRACT_VERSION, VM_SESSION_PATH, VmFlakeProvisionErrorResponse,
-    VmFlakeProvisionRequest, VmFlakeProvisionResponse, VmGitCloneErrorResponse, VmGitCloneRequest,
-    VmGitPushErrorResponse, VmGitPushMetadata, VmGitPushRequest, VmGitPushStagedReceipt,
-    WorkspaceWarmMode, default_workspace_destination, encode_vm_git_push_request_body,
-    nix_develop_command_args, nix_print_dev_env_command_args, nix_substituters_override_args,
+    GuestContract, VM_FLAKE_PROVISION_PATH, VM_GIT_CLONE_PATH, VM_GIT_PUSH_PATH,
+    VM_HTTP_CONTRACT_HEADER, VM_HTTP_CONTRACT_VERSION, VM_SESSION_PATH,
+    VmFlakeProvisionErrorResponse, VmFlakeProvisionRequest, VmFlakeProvisionResponse,
+    VmGitCloneErrorResponse, VmGitCloneRequest, VmGitPushErrorResponse, VmGitPushMetadata,
+    VmGitPushRequest, VmGitPushStagedReceipt, WorkspaceWarmMode, default_workspace_destination,
+    encode_vm_git_push_request_body, nix_develop_command_args, nix_print_dev_env_command_args,
+    nix_substituters_override_args,
 };
 
 // The broker/pre-warm env-var names are a host↔guest wire contract, so they
@@ -159,7 +160,7 @@ pub enum VmClientError {
     #[error(
         "the guest and the broker disagree on the VM HTTP contract: this guest speaks version \
          {guest}, the broker speaks {broker}. {}",
-        contract_mismatch_remedy(*guest, *broker)
+        writ_vm_git::contract_mismatch_remedy(GuestContract::Version(*guest), *broker)
     )]
     ContractMismatch { guest: u32, broker: u32 },
     #[error("destination path already exists: {0:?}")]
@@ -470,27 +471,6 @@ pub async fn get_session_json(config: &VmClientConfig) -> Result<serde_json::Val
         .json::<serde_json::Value>()
         .await
         .map_err(VmClientError::from)
-}
-
-/// Which side is behind, and therefore what to do about it.
-///
-/// The version ordering says who is stale: telling an operator to rebuild the
-/// guest when the *broker* is the old one sends them round a loop that changes
-/// nothing (the rebuild produces the same guest, and does not restart the
-/// daemon).
-fn contract_mismatch_remedy(guest: u32, broker: u32) -> String {
-    if broker < guest {
-        format!(
-            "The broker is the older side: restart the `writd` daemon on the host from this \
-             build (and, for `broker_placement = vm`, rebuild its image with `{}`).",
-            writ_vm_git::BROKER_IMAGE_REBUILD_COMMAND,
-        )
-    } else {
-        format!(
-            "The guest is the older side: rebuild its image with `{}`.",
-            writ_vm_git::GUEST_IMAGE_REBUILD_COMMAND,
-        )
-    }
 }
 
 /// Refuse to talk to a broker whose contract version differs from this guest's.

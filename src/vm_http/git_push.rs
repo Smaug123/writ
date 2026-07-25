@@ -403,7 +403,8 @@ mod tests {
     use tempfile::TempDir;
 
     use super::super::tests::{
-        bearer, make_broker_state, no_services, open_audit_session, session_for_subnet, token,
+        bearer, declared_contract, make_broker_state, no_services, open_audit_session,
+        session_for_subnet, token,
     };
     use super::super::{
         VM_HTTP_READ_TIMEOUT, VmHttpRequest, VmHttpServices, VmHttpStatus,
@@ -414,6 +415,7 @@ mod tests {
     use crate::core::{Ipv4Cidr, UnixMillis};
     use crate::secret::SecretStore;
     use crate::server::BrokerState;
+    use crate::vm_git::VM_HTTP_CONTRACT_HEADER;
     use crate::vm_git::{
         GitBranchName, GitCloneRepo, GitObjectId, VmGitPushMetadata, VmGitPushRequest,
         VmGitPushStagedReceipt, encode_vm_git_push_request_body,
@@ -529,6 +531,7 @@ mod tests {
     async fn disabled_git_push_route_does_not_read_declared_body() {
         let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(10, 1, 2, 0), 24).unwrap());
         let bearer_auth = bearer(token().as_str());
+        let declared = declared_contract();
         let response = tokio::time::timeout(
             std::time::Duration::from_millis(100),
             dispatch_vm_http_head_and_body(
@@ -538,6 +541,7 @@ mod tests {
                 VM_GIT_PUSH_PATH,
                 &[
                     ("authorization", bearer_auth.as_str()),
+                    (VM_HTTP_CONTRACT_HEADER, declared.as_str()),
                     ("content-length", "1"),
                 ],
                 Vec::new(),
@@ -887,6 +891,7 @@ mod tests {
         let service = git_push_service_for_test(&state, Arc::clone(&staging));
 
         let bearer_auth = bearer(token().as_str());
+        let declared = declared_contract();
         let metadata = sample_metadata();
         let body = encoded_body(metadata.clone(), b"PACK from dispatch".to_vec());
         let content_length = body.len().to_string();
@@ -897,6 +902,7 @@ mod tests {
             VM_GIT_PUSH_PATH,
             &[
                 ("authorization", bearer_auth.as_str()),
+                (VM_HTTP_CONTRACT_HEADER, declared.as_str()),
                 ("content-length", content_length.as_str()),
             ],
             body,
@@ -923,6 +929,7 @@ mod tests {
         let service = VmHttpGitPushService::new(Arc::clone(&state), Arc::clone(&staging), tight);
 
         let bearer_auth = bearer(token().as_str());
+        let declared = declared_contract();
         let oversized = vec![0u8; 1024];
         let content_length = oversized.len().to_string();
         let response = dispatch_vm_http_head_and_body(
@@ -932,6 +939,7 @@ mod tests {
             VM_GIT_PUSH_PATH,
             &[
                 ("authorization", bearer_auth.as_str()),
+                (VM_HTTP_CONTRACT_HEADER, declared.as_str()),
                 ("content-length", content_length.as_str()),
             ],
             oversized,

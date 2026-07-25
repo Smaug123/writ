@@ -404,7 +404,8 @@ Nix domain modules `nix_binary_cache.rs` (1345, with its test suite in
 **Endpoint map** (`vm_http/route_table.rs`). writ's own API lives under `/v1/*`:
 `GET /v1/session`; `/v1/nix/cache/*` & `/v1/nix/prewarm/*`; `POST /v1/git/clone`;
 `POST /v1/git/push`; `POST /v1/nix/flake/provision`; `GET/POST
-/v1/agent-runs/{id}/config|outcome`. Each **model vendor has its own namespace**:
+/v1/agent-runs/{id}/config|outcome`. All of those but `/v1/session` and the Nix
+cache are `writ-vm`-originated, and require the contract-version header (below). Each **model vendor has its own namespace**:
 Claude proxy `/anthropic/v1/messages`, `/anthropic/v1/messages/count_tokens`,
 `/anthropic/v1/models*`; OpenAI proxy `/openai/v1/responses`,
 `/openai/v1/responses/{id}/cancel`, `/openai/v1/models*`. Path literals are
@@ -437,16 +438,39 @@ image":
   fields cannot stop an older guest from diagnosing the skew, and the version
   ordering decides which side is told to rebuild.
 
-  This check is **guest-side**, so it protects only a guest that has it: an image
-  built before the handshake makes no such call and the broker still serves it.
-  Enforcing it broker-side is issue #342, and cannot simply require a header on
-  every request — most guest traffic comes from `nix`, Claude Code, and codex,
-  which will never send one. Only the `writ-vm`-originated routes can carry it.
+  The startup check is **guest-side**, so it protects only a guest that has it.
+  The broker therefore enforces the same version from its own side: `writ-vm`
+  declares `VM_HTTP_CONTRACT_VERSION` in a `writ-contract-version` header on
+  every request it originates, and a route that requires one refuses a missing
+  or mismatched declaration with `426 Upgrade Required`, naming the stale side —
+  **after** authentication (so an unauthenticated peer learns no versions) and
+  **before** the body read (so a refused push is not buffered first), hence
+  before any effect and with no audit row written.
+
+  It cannot be demanded of every request: most guest traffic is `nix`, Claude
+  Code and codex, which will never send a writ header. So `VmHttpRoute` carries
+  an exhaustive `contract_check()` — `Required`, or `Exempt` with the reason
+  (`Handshake` / `ThirdPartyClient` / `NoEffect`) — and a new capability must
+  choose. `GET /v1/session` is writ-vm-originated and still exempt: it is where a
+  guest *reads* the broker's version, so gating it would make a skew
+  undiagnosable, and the readiness probes hand-roll it. The two sides are kept in
+  step by `WRIT_VM_ORIGINATED_TARGETS` (`writ-vm-git`), against which the route
+  table pins two implications: everything the guest originates is
+  `Required`-or-`Handshake`, and everything `Required` is originated.
+
+  What this does **not** cover, stated plainly: the exempt surface — the model
+  proxies and the binary cache — stays reachable to a stale guest, so it can burn
+  model tokens before its first clone is refused. And the header is
+  guest-controlled, so this is skew protection between builds we control, not a
+  security control; the boundary remains the broker's independent re-validation
+  of every field.
 
 Both are pinned by one CI test, `broker_contract_fingerprint_is_pinned`
 (`broker_vm/tests.rs`): it snapshots the broker's CLI flags and ready-doc schema,
 and pins a **digest of the guest-facing route surface** — sourced from the route
-table's endpoint map, which the totality oracle already forces to be complete —
+table's endpoint map, which the totality oracle already forces to be complete,
+and including each route's `contract_check`, so that changing *which* routes
+demand a declaration moves the digest even though no path moved —
 in an append-only `GUEST_ROUTE_DIGEST_HISTORY` indexed by
 `VM_HTTP_CONTRACT_VERSION`. Because the live digest must equal the row *for the
 current version*, and the history must have exactly one row per version, moving a
