@@ -401,13 +401,32 @@ Nix domain modules `nix_binary_cache.rs` (1345, with its test suite in
 `nix_binary_cache/tests.rs`), `flake_lock.rs`,
 `flake_materialize.rs`, `flake_provision.rs`, `flake_provision_from_mirror.rs`.
 
-**Endpoint map** (dispatch `route_authenticated_vm_http_request`,
-`vm_http/mod.rs:1350`): `GET /v1/session`; `/v1/nix/cache/*` &
-`/v1/nix/prewarm/*`; Claude proxy `/v1/messages`, `/v1/messages/count_tokens`,
-`/v1/models/*`; OpenAI proxy `/v1/responses`, `/v1/models`; `POST /v1/git/clone`;
-`POST /v1/git/push`; `POST /v1/nix/flake/provision`; `GET/POST
-/v1/agent-runs/{id}/config|outcome`. Path literals are pinned in
-`crates/writ-vm-git/src/lib.rs:20`.
+**Endpoint map** (`vm_http/route_table.rs`): `GET /v1/session`; `/v1/nix/cache/*`
+& `/v1/nix/prewarm/*`; Claude proxy `/v1/messages`, `/v1/messages/count_tokens`,
+`/v1/models*`; OpenAI proxy `/v1/responses`, `/v1/responses/{id}/cancel`;
+`POST /v1/git/clone`; `POST /v1/git/push`; `POST /v1/nix/flake/provision`;
+`GET/POST /v1/agent-runs/{id}/config|outcome`. Path literals are pinned in
+`crates/writ-vm-git/src/lib.rs:20`. Note the **whole** `/v1/models*` space
+resolves to the *Claude* proxy, which is classified first — the OpenAI backend's
+own models routes are unreachable through the dispatcher (pinned by
+`route_table`'s `the_claude_proxy_shadows_the_whole_models_space`).
+
+**The route table.** A request is classified **once**, by
+`VmHttpRoute::resolve`, into either `Brokered(BrokeredRoute)` — an effect whose
+`(request, outcome)` audit pair the `broker_effect` driver owns — or
+`Plain(PlainRoute)`, a *closed* set of routes that deliberately record no pair
+(the session endpoint; the agent-run *config* endpoint; `git_clone`, whose audit
+is the host mint, until that follow-up). The resolved route then answers every
+downstream question: which auth scheme applies, what body limit to read under,
+how an auth *denial* is recorded against that route's own table, and which
+handler runs. Four sites used to re-derive that from the target independently.
+
+Two oracles keep it honest, and together make the invariant
+add-a-capability-proof: adding a `BrokeredRoute` variant is a **compile error**
+until the body-limit, denial, and dispatch matches all handle it; a coverage test
+then fails until it appears in the documented endpoint map; and
+`every_brokered_route_records_a_complete_audit_pair` (`vm_http/tests.rs`) fails
+until the route is actually driven end-to-end and leaves a complete audit pair.
 
 **Nix binary cache — model vs service (two modules).** Two different *layers*,
 now named apart (they were both `nix_cache` until backlog Slice 2):

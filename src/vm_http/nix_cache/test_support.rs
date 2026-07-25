@@ -17,7 +17,7 @@ use ring::signature::KeyPair as _;
 use wiremock::MockServer;
 
 use super::super::tests::{basic, token};
-use super::super::{VmHttpServices, route_authenticated_vm_http_request};
+use super::super::{VmHttpServices, resolve_and_route_authenticated_vm_http_request};
 use super::*;
 use crate::nix_binary_cache::{NixNarCompression, NixNarHash, NixNarSize, NixTrustedPublicKeys};
 
@@ -339,7 +339,7 @@ pub(super) async fn route_nix_cache_with_service(
         Ipv4Addr::LOCALHOST,
         Some(basic(token().as_str())),
     );
-    route_authenticated_vm_http_request(
+    resolve_and_route_authenticated_vm_http_request(
         session,
         &request,
         Vec::new(),

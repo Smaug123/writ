@@ -567,8 +567,8 @@ mod tests {
     use super::super::{
         VM_HTTP_READ_TIMEOUT, VmHttpProxies, VmHttpRequest, VmHttpServices, VmHttpSession,
         VmHttpStatus, bind_ephemeral_vm_http_listener, dispatch_vm_http_head_and_body,
-        handle_vm_http_connection_with_read_timeout, route_authenticated_vm_http_request,
-        run_vm_http_with_services_until_shutdown,
+        handle_vm_http_connection_with_read_timeout,
+        resolve_and_route_authenticated_vm_http_request, run_vm_http_with_services_until_shutdown,
     };
     use super::*;
     use crate::core::{BrokerPortRange, CapabilityRequest, GitHubAccess, GitHubRequest, Ipv4Cidr};
@@ -633,10 +633,14 @@ mod tests {
                 Some(bearer(token().as_str())),
                 peer,
             );
-            let response =
-                route_authenticated_vm_http_request(&session, &request, Vec::new(), no_services())
-                    .await
-                    .into_buffered();
+            let response = resolve_and_route_authenticated_vm_http_request(
+                &session,
+                &request,
+                Vec::new(),
+                no_services(),
+            )
+            .await
+            .into_buffered();
 
             assert_eq!(response.status, VmHttpStatus::NotFound);
         }
@@ -656,7 +660,7 @@ mod tests {
             SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 12345)),
         );
 
-        let response = route_authenticated_vm_http_request(
+        let response = resolve_and_route_authenticated_vm_http_request(
             &session,
             &request,
             Vec::new(),
