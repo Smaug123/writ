@@ -24,11 +24,13 @@ use super::proxy_common::{
 };
 use super::{VmHttpDispatch, VmHttpHeader, VmHttpResponse, VmHttpStatus};
 
-pub(super) const VM_OPENAI_RESPONSES_PATH: &str = "/v1/responses";
-pub(super) const VM_OPENAI_RESPONSES_PREFIX: &str = "/v1/responses/";
+// Guest-facing paths, all under `VM_OPENAI_PROXY_PREFIX`; the upstream paths
+// these map to are unchanged (see `relative_upstream_path`).
+pub(super) const VM_OPENAI_RESPONSES_PATH: &str = "/openai/v1/responses";
+pub(super) const VM_OPENAI_RESPONSES_PREFIX: &str = "/openai/v1/responses/";
 pub(super) const VM_OPENAI_RESPONSE_CANCEL_SUFFIX: &str = "/cancel";
-pub(super) const VM_OPENAI_MODELS_PATH: &str = "/v1/models";
-pub(super) const VM_OPENAI_MODELS_PREFIX: &str = "/v1/models/";
+pub(super) const VM_OPENAI_MODELS_PATH: &str = "/openai/v1/models";
+pub(super) const VM_OPENAI_MODELS_PREFIX: &str = "/openai/v1/models/";
 
 pub(super) type VmHttpOpenAiProxyService<S> = VmHttpProxyService<OpenAiBackend, S>;
 
@@ -607,19 +609,19 @@ mod tests {
     #[test]
     fn classify_openai_proxy_target_recognizes_supported_routes() {
         assert_eq!(
-            OpenAiBackend::classify_proxy_target("/v1/responses"),
+            OpenAiBackend::classify_proxy_target("/openai/v1/responses"),
             Some(OpenAiProxyAuditRoute::Responses),
         );
         assert_eq!(
-            OpenAiBackend::classify_proxy_target("/v1/responses/resp_abc123/cancel"),
+            OpenAiBackend::classify_proxy_target("/openai/v1/responses/resp_abc123/cancel"),
             Some(OpenAiProxyAuditRoute::ResponseCancel),
         );
         assert_eq!(
-            OpenAiBackend::classify_proxy_target("/v1/models"),
+            OpenAiBackend::classify_proxy_target("/openai/v1/models"),
             Some(OpenAiProxyAuditRoute::Models),
         );
         assert_eq!(
-            OpenAiBackend::classify_proxy_target("/v1/models/gpt-5"),
+            OpenAiBackend::classify_proxy_target("/openai/v1/models/gpt-5"),
             Some(OpenAiProxyAuditRoute::Models),
         );
     }
@@ -627,23 +629,23 @@ mod tests {
     #[test]
     fn classify_openai_proxy_target_treats_unsupported_subpaths_as_unsupported() {
         assert_eq!(
-            OpenAiBackend::classify_proxy_target("/v1/responses/resp_abc123"),
+            OpenAiBackend::classify_proxy_target("/openai/v1/responses/resp_abc123"),
             Some(OpenAiProxyAuditRoute::Unsupported),
         );
         assert_eq!(
-            OpenAiBackend::classify_proxy_target("/v1/responses/"),
+            OpenAiBackend::classify_proxy_target("/openai/v1/responses/"),
             Some(OpenAiProxyAuditRoute::Unsupported),
         );
         assert_eq!(
-            OpenAiBackend::classify_proxy_target("/v1/responses/resp_abc/cancel/extra"),
+            OpenAiBackend::classify_proxy_target("/openai/v1/responses/resp_abc/cancel/extra"),
             Some(OpenAiProxyAuditRoute::Unsupported),
         );
         assert_eq!(
-            OpenAiBackend::classify_proxy_target("/v1/models/"),
+            OpenAiBackend::classify_proxy_target("/openai/v1/models/"),
             Some(OpenAiProxyAuditRoute::Unsupported),
         );
         assert_eq!(
-            OpenAiBackend::classify_proxy_target("/v1/models/foo/bar"),
+            OpenAiBackend::classify_proxy_target("/openai/v1/models/foo/bar"),
             Some(OpenAiProxyAuditRoute::Unsupported),
         );
     }
@@ -662,19 +664,19 @@ mod tests {
     #[test]
     fn classify_openai_proxy_target_strips_query_string() {
         assert_eq!(
-            OpenAiBackend::classify_proxy_target("/v1/responses?include%5B%5D=foo"),
+            OpenAiBackend::classify_proxy_target("/openai/v1/responses?include%5B%5D=foo"),
             Some(OpenAiProxyAuditRoute::Responses),
         );
         assert_eq!(
-            OpenAiBackend::classify_proxy_target("/v1/responses/resp_abc/cancel?x=1"),
+            OpenAiBackend::classify_proxy_target("/openai/v1/responses/resp_abc/cancel?x=1"),
             Some(OpenAiProxyAuditRoute::ResponseCancel),
         );
         assert_eq!(
-            OpenAiBackend::classify_proxy_target("/v1/models?x=1"),
+            OpenAiBackend::classify_proxy_target("/openai/v1/models?x=1"),
             Some(OpenAiProxyAuditRoute::Models),
         );
         assert_eq!(
-            OpenAiBackend::classify_proxy_target("/v1/models/gpt-5?x=1"),
+            OpenAiBackend::classify_proxy_target("/openai/v1/models/gpt-5?x=1"),
             Some(OpenAiProxyAuditRoute::Models),
         );
     }
@@ -1175,7 +1177,7 @@ mod tests {
         .unwrap();
         let request = VmHttpRequest::new(
             "POST",
-            "/v1/responses/resp_abc/extra",
+            "/openai/v1/responses/resp_abc/extra",
             Some(bearer(token().as_str())),
             SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 34569)),
         );

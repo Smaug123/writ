@@ -17,6 +17,48 @@ use writ_core::core::{
     CapabilityRequest, GitHubAccess, GitHubRequest, RepoRef, RequestId, UnixMillis,
 };
 
+/// Base path of the guest-facing Anthropic proxy. Each model vendor gets its
+/// own namespace because `/v1/models` is a real endpoint of *both* vendor APIs:
+/// sharing one namespace made the two backends' classifications overlap, so
+/// whichever was matched first silently shadowed the other's models routes —
+/// answering from the wrong proxy and recording the attempt against the wrong
+/// vendor's audit table. `writ-vm` points Claude Code's `ANTHROPIC_BASE_URL`
+/// here; the broker's route table classifies only under this prefix.
+pub const VM_ANTHROPIC_PROXY_PREFIX: &str = "/anthropic";
+/// Base path of the guest-facing OpenAI proxy; see [`VM_ANTHROPIC_PROXY_PREFIX`].
+/// `writ-vm` points codex's `model_providers.writ-broker.base_url` at
+/// `<broker>/openai/v1`.
+pub const VM_OPENAI_PROXY_PREFIX: &str = "/openai";
+
+/// The base URL Claude Code is pointed at (`ANTHROPIC_BASE_URL`): the broker's
+/// Anthropic namespace. The SDK appends `/v1/messages`, `/v1/models/{id}`, and
+/// so on, which is why a *prefix* — not a full path — belongs here.
+///
+/// Lives beside the prefixes, and in a crate both the guest binary and the host
+/// broker depend on, so the host's route table can be tested against the very
+/// string the guest is configured with. That the two agreed was previously
+/// nobody's job to check.
+pub fn anthropic_proxy_base_url(broker_url: &str) -> String {
+    join_broker_path(broker_url, VM_ANTHROPIC_PROXY_PREFIX)
+}
+
+/// The base URL codex is pointed at (`model_providers.writ-broker.base_url`).
+/// codex's base URL includes the API version segment — it appends bare
+/// `responses` and `models` — so unlike [`anthropic_proxy_base_url`] this
+/// carries the `/v1` itself.
+pub fn openai_proxy_base_url(broker_url: &str) -> String {
+    format!(
+        "{}/v1",
+        join_broker_path(broker_url, VM_OPENAI_PROXY_PREFIX)
+    )
+}
+
+/// Join a broker-relative path onto the broker URL, which carries a trailing
+/// slash. One place, so the two base URLs cannot drift in how they handle it.
+fn join_broker_path(broker_url: &str, path: &str) -> String {
+    format!("{}{}", broker_url.trim_end_matches('/'), path)
+}
+
 pub const VM_GIT_CLONE_PATH: &str = "/v1/git/clone";
 pub const VM_GIT_PUSH_PATH: &str = "/v1/git/push";
 pub const VM_FLAKE_PROVISION_PATH: &str = "/v1/nix/flake/provision";

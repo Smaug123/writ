@@ -20,7 +20,10 @@ use writ::vm_client::{
     clone_from_broker, fetch_agent_run_config, get_session_json, init_workspace_from_broker,
     push_to_broker, upload_agent_run_outcome,
 };
-use writ::vm_git::{GitBranchName, GitCloneRef, GitCloneRepo, GitObjectId, WorkspaceWarmMode};
+use writ::vm_git::{
+    GitBranchName, GitCloneRef, GitCloneRepo, GitObjectId, WorkspaceWarmMode,
+    anthropic_proxy_base_url, openai_proxy_base_url,
+};
 
 #[derive(Parser)]
 #[command(name = "writ-vm", about = "guest-side writ VM broker client")]
@@ -377,7 +380,13 @@ fn claude_process_plan(
     .with_env_remove(VM_BROKER_TOKEN_ENV)
     .with_env_remove("ANTHROPIC_API_KEY")
     .with_env_remove("CLAUDE_CODE_OAUTH_TOKEN")
-    .with_env("ANTHROPIC_BASE_URL", config.broker_url().as_str())
+    // The broker serves Anthropic under its own namespace: `/v1/models` is a
+    // real endpoint of both vendor APIs, so a shared namespace made one proxy
+    // shadow the other. The SDK appends `/v1/...` to this base.
+    .with_env(
+        "ANTHROPIC_BASE_URL",
+        anthropic_proxy_base_url(config.broker_url().as_str()),
+    )
     .with_env("ANTHROPIC_AUTH_TOKEN", config.bearer_token().as_str())
     .with_env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
     // The guest image installs the upstream claude binary directly, without
@@ -411,7 +420,7 @@ fn codex_process_plan(
     // We set `supports_websockets=false` because the broker exposes
     // HTTP only; letting codex try wss:// first just wastes ~50s on
     // retries.
-    let openai_base_url = format!("{}v1", config.broker_url().as_str());
+    let openai_base_url = openai_proxy_base_url(config.broker_url().as_str());
     let provider_name_arg = "model_providers.writ-broker.name=\"writ broker\"";
     let provider_base_url_arg =
         format!("model_providers.writ-broker.base_url=\"{openai_base_url}\"");
@@ -742,7 +751,7 @@ mod tests {
         assert_eq!(
             env.get(&OsString::from("ANTHROPIC_BASE_URL"))
                 .map(|v| v.to_str().unwrap()),
-            Some("http://192.168.252.1:49152/"),
+            Some("http://192.168.252.1:49152/anthropic"),
         );
         assert_eq!(
             env.get(&OsString::from("ANTHROPIC_AUTH_TOKEN"))
@@ -812,7 +821,7 @@ mod tests {
                 OsString::from("model_providers.writ-broker.name=\"writ broker\""),
                 OsString::from("--config"),
                 OsString::from(
-                    "model_providers.writ-broker.base_url=\"http://192.168.252.1:49152/v1\""
+                    "model_providers.writ-broker.base_url=\"http://192.168.252.1:49152/openai/v1\""
                 ),
                 OsString::from("--config"),
                 OsString::from("model_providers.writ-broker.wire_api=\"responses\""),

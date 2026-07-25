@@ -1638,6 +1638,24 @@ mod tests {
         }
     }
 
+    /// The broker tells a stale guest how to rebuild its image. That advice is a
+    /// string in the library, and the CLI it names lives here — so nothing but
+    /// this test stops the two from drifting. It caught the original: the
+    /// message named `build-guest-image`, which does not parse.
+    #[test]
+    fn the_guest_image_rebuild_advice_names_a_real_command() {
+        let command = writ::vm_http::GUEST_IMAGE_REBUILD_COMMAND;
+        let mut words = command.split_whitespace();
+        assert_eq!(
+            words.next(),
+            Some("writ"),
+            "the advice must invoke this binary: {command}",
+        );
+        Args::try_parse_from(std::iter::once("writ").chain(words)).unwrap_or_else(|err| {
+            panic!("the guest is told to run `{command}`, which does not parse: {err}")
+        });
+    }
+
     #[test]
     fn agent_vm_build_image_cli_defaults_flake_to_dot_and_proof_to_false() {
         let args = Args::try_parse_from(["writ", "agent-vm", "build-image"]).unwrap();
