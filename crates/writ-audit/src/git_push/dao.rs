@@ -10,6 +10,26 @@
 use super::*;
 use rusqlite::Connection;
 
+/// Turn the `git_push_resolution` INSERT's SQLite errors into typed audit
+/// errors.
+///
+/// The `git_push_resolution_refuses_active_approve` trigger is the
+/// schema-level backstop for the blocking predicate, and it reports
+/// itself as a constraint violation carrying only prose. Recognising that
+/// prose has to happen somewhere; doing it here means it happens *once*,
+/// beside the schema, and every caller downstream matches a variant.
+fn classify_resolution_insert(err: rusqlite::Error) -> AuditError {
+    if let rusqlite::Error::SqliteFailure(code, _) = &err
+        && matches!(code.code, rusqlite::ErrorCode::ConstraintViolation)
+        && err
+            .to_string()
+            .contains(approve_attempt::RESOLUTION_REFUSED_BY_ACTIVE_APPROVE)
+    {
+        return AuditError::ResolutionRefusedByActiveApprove;
+    }
+    AuditError::Sqlite(err)
+}
+
 /// The `(state, outcome)` clause matching attempts that stand in the way
 /// of a resolution, generated from
 /// [`AttemptPosition::blocks_resolution`] so the query cannot drift from
@@ -416,7 +436,8 @@ impl AuditLog {
                     mint_issued_at,
                     mint_expires_at,
                 ],
-            )?;
+            )
+            .map_err(classify_resolution_insert)?;
             Ok(())
         })
     }

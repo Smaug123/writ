@@ -356,13 +356,9 @@ fn record_resolution_refused_when_attempt_started() {
             reason: "too late",
         })
         .unwrap_err();
-    let AuditError::Sqlite(e) = err else {
-        panic!("expected sqlite trigger error, got: {err:?}");
-    };
     assert!(
-        e.to_string()
-            .contains("approve attempt is in-flight or quarantined"),
-        "unexpected error: {e}"
+        matches!(err, AuditError::ResolutionRefusedByActiveApprove),
+        "unexpected error: {err:?}"
     );
 }
 
@@ -393,13 +389,9 @@ fn record_resolution_refused_when_attempt_uncertain() {
             reason: "too late",
         })
         .unwrap_err();
-    let AuditError::Sqlite(e) = err else {
-        panic!("expected sqlite trigger error, got: {err:?}");
-    };
     assert!(
-        e.to_string()
-            .contains("approve attempt is in-flight or quarantined"),
-        "unexpected error: {e}"
+        matches!(err, AuditError::ResolutionRefusedByActiveApprove),
+        "unexpected error: {err:?}"
     );
 }
 
@@ -437,13 +429,9 @@ fn record_resolution_refused_when_attempt_post_patch_failure() {
             reason: "give up",
         })
         .unwrap_err();
-    let AuditError::Sqlite(e) = err else {
-        panic!("expected sqlite trigger error, got: {err:?}");
-    };
     assert!(
-        e.to_string()
-            .contains("approve attempt is in-flight or quarantined"),
-        "unexpected error: {e}"
+        matches!(err, AuditError::ResolutionRefusedByActiveApprove),
+        "unexpected error: {err:?}"
     );
 }
 
