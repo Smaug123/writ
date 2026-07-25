@@ -1,7 +1,7 @@
 # Promote the approve-attempt state machine to a first-class Rust type
 
 Drafted 2026-07-25. Companion to `../design/approve_state_machine.md` (the
-original design) and `../design/architecture.md` §5.5. Sibling of the structural
+original design) and `../design/architecture.md` §5.4 (the audit subsystem, where this machine lives). Sibling of the structural
 backlog in `2026-07-17-architecture-refactor-backlog.md`, which addressed *module
 shape*; this plan addresses *where a state machine's truth lives*.
 
