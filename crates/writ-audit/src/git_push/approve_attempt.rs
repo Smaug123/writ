@@ -22,78 +22,97 @@
 
 use super::{GitPushApproveAttemptOutcome, GitPushApproveAttemptState};
 
-/// The value of the `state` column: an approve attempt's position in the
-/// forward-only lifecycle, without the payload each position carries.
+/// Declare a column-discriminant enum alongside the strings its variants
+/// are stored as, and generate `ALL` / `as_wire` / `parse_wire` from that
+/// one table.
 ///
-/// Use this for column reads/writes and for talking about a state
-/// *class*; use [`GitPushApproveAttemptState`] when the payload (mint,
-/// outcome, completion time) matters.
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
-pub enum ApproveAttemptStateName {
-    Started,
-    Uncertain,
-    Resolved,
-}
-
-impl ApproveAttemptStateName {
-    /// Every discriminant the `state` column may hold. Kept exhaustive by
-    /// the `all_is_exhaustive` test below, which matches on a value of
-    /// this type so a new variant fails to compile until it is listed.
-    pub const ALL: &'static [Self] = &[Self::Started, Self::Uncertain, Self::Resolved];
-
-    /// The string stored in the `state` column. Must match the CHECK
-    /// constraint in migration 0003; `wire_names_match_schema_check`
-    /// proves it does.
-    pub fn as_wire(self) -> &'static str {
-        match self {
-            Self::Started => "started",
-            Self::Uncertain => "uncertain",
-            Self::Resolved => "resolved",
+/// The point is that the variant list and the enumeration cannot
+/// disagree: `ALL` is *generated from the same tokens as the variants*,
+/// so there is no hand-maintained list to forget to extend, and no test
+/// needed to check that it was extended. `as_wire` and `parse_wire` are
+/// likewise two directions of one mapping rather than two matches that
+/// have to be kept in step. (`parse_wire` is a `match` on the literals,
+/// so it is a jump table, not a linear scan.)
+///
+/// This is the crate's only macro-generated type. It earns that by
+/// removing an invariant from the "someone must remember" column: the
+/// alternative — three hand-written items per enum plus a test that
+/// cannot actually prove `ALL` is complete — is what the first draft of
+/// this module had, and a reviewer was right to point out that the test
+/// proved less than it claimed.
+macro_rules! wire_name_enum {
+    (
+        $(#[$meta:meta])*
+        $vis:vis enum $name:ident {
+            $(
+                $(#[$vmeta:meta])*
+                $variant:ident => $wire:literal,
+            )+
         }
-    }
-
-    /// Parse a `state` column value. `None` for anything outside the
-    /// enum — the caller turns that into an `Invariant` error, since a
-    /// row holding an unknown state is a schema-CHECK violation that
-    /// should have been impossible.
-    pub fn parse_wire(raw: &str) -> Option<Self> {
-        Self::ALL.iter().copied().find(|s| s.as_wire() == raw)
-    }
-}
-
-/// The value of the `outcome` column: how a `Resolved` attempt ended,
-/// without the payload (`new_app_tip` / `failure_detail`) the outcome
-/// carries. `NULL` in the column corresponds to a non-`Resolved` state
-/// and so has no variant here.
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
-pub enum ApproveAttemptOutcomeName {
-    Succeeded,
-    PrePatchFailure,
-    PostPatchFailure,
-}
-
-impl ApproveAttemptOutcomeName {
-    /// Every discriminant the `outcome` column may hold. See
-    /// [`ApproveAttemptStateName::ALL`] for how exhaustiveness is kept.
-    pub const ALL: &'static [Self] = &[
-        Self::Succeeded,
-        Self::PrePatchFailure,
-        Self::PostPatchFailure,
-    ];
-
-    /// The string stored in the `outcome` column.
-    pub fn as_wire(self) -> &'static str {
-        match self {
-            Self::Succeeded => "succeeded",
-            Self::PrePatchFailure => "pre_patch_failure",
-            Self::PostPatchFailure => "post_patch_failure",
+    ) => {
+        $(#[$meta])*
+        #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+        $vis enum $name {
+            $(
+                $(#[$vmeta])*
+                $variant,
+            )+
         }
-    }
 
-    /// Parse an `outcome` column value. `None` for anything outside the
-    /// enum, including the empty string.
-    pub fn parse_wire(raw: &str) -> Option<Self> {
-        Self::ALL.iter().copied().find(|o| o.as_wire() == raw)
+        impl $name {
+            /// Every discriminant this column may hold, in declaration
+            /// order. Generated from the variant list itself, so it is
+            /// exhaustive by construction.
+            pub const ALL: &'static [Self] = &[ $( Self::$variant, )+ ];
+
+            /// The string stored in the column. The set of these must
+            /// equal the column's CHECK-constraint literals; the
+            /// `rust_and_schema_admit_the_same_*` tests read the live
+            /// DDL and assert exactly that.
+            pub fn as_wire(self) -> &'static str {
+                match self {
+                    $( Self::$variant => $wire, )+
+                }
+            }
+
+            /// Parse a column value. `None` for anything outside the
+            /// enum — the caller turns that into an `Invariant` error,
+            /// since a row holding an unknown value is a schema-CHECK
+            /// violation that should have been impossible.
+            pub fn parse_wire(raw: &str) -> Option<Self> {
+                match raw {
+                    $( $wire => Some(Self::$variant), )+
+                    _ => None,
+                }
+            }
+        }
+    };
+}
+
+wire_name_enum! {
+    /// The value of the `state` column: an approve attempt's position in
+    /// the forward-only lifecycle, without the payload each position
+    /// carries.
+    ///
+    /// Use this for column reads/writes and for talking about a state
+    /// *class*; use [`GitPushApproveAttemptState`] when the payload
+    /// (mint, outcome, completion time) matters.
+    pub enum ApproveAttemptStateName {
+        Started => "started",
+        Uncertain => "uncertain",
+        Resolved => "resolved",
+    }
+}
+
+wire_name_enum! {
+    /// The value of the `outcome` column: how a `Resolved` attempt ended,
+    /// without the payload (`new_app_tip` / `failure_detail`) the outcome
+    /// carries. `NULL` in the column corresponds to a non-`Resolved`
+    /// state and so has no variant here.
+    pub enum ApproveAttemptOutcomeName {
+        Succeeded => "succeeded",
+        PrePatchFailure => "pre_patch_failure",
+        PostPatchFailure => "post_patch_failure",
     }
 }
 

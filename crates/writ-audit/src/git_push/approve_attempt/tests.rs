@@ -14,33 +14,6 @@ use super::*;
 use crate::AuditLog;
 use writ_core::core::{ApproveAttemptId, RequestId};
 
-/// `ALL` must list every variant. The match makes that mechanical: a new
-/// variant stops this compiling until it is both matched here and added
-/// to `ALL` (the length assertion catches the second half).
-#[test]
-fn state_name_all_is_exhaustive() {
-    for name in ApproveAttemptStateName::ALL {
-        match name {
-            ApproveAttemptStateName::Started
-            | ApproveAttemptStateName::Uncertain
-            | ApproveAttemptStateName::Resolved => {}
-        }
-    }
-    assert_eq!(ApproveAttemptStateName::ALL.len(), 3);
-}
-
-#[test]
-fn outcome_name_all_is_exhaustive() {
-    for name in ApproveAttemptOutcomeName::ALL {
-        match name {
-            ApproveAttemptOutcomeName::Succeeded
-            | ApproveAttemptOutcomeName::PrePatchFailure
-            | ApproveAttemptOutcomeName::PostPatchFailure => {}
-        }
-    }
-    assert_eq!(ApproveAttemptOutcomeName::ALL.len(), 3);
-}
-
 /// Distinct variants must not collide on the wire, or a row would parse
 /// back as the wrong state.
 #[test]
@@ -251,11 +224,17 @@ fn every_outcome_wire_name_is_accepted_by_the_schema() {
 }
 
 proptest! {
-    /// The other direction: the schema admits *no* state outside the
-    /// Rust enum. The probe row is the `started` shape (all terminal
-    /// columns NULL), which satisfies every cross-column CHECK for any
-    /// value of `state` — so a refusal here is attributable to the
-    /// `state IN (…)` enum CHECK alone and nothing else.
+    /// The CHECK is *enforced*, not merely declared: a row naming a state
+    /// outside the enum is refused at INSERT. The probe row is the
+    /// `started` shape (all terminal columns NULL), which satisfies every
+    /// cross-column CHECK for any value of `state` — so the refusal is
+    /// attributable to the `state IN (…)` enum CHECK alone.
+    ///
+    /// This is the runtime companion to
+    /// `rust_and_schema_admit_the_same_state_names`, which is what
+    /// actually pins the two vocabularies to each other; a random string
+    /// will essentially never collide with a name the schema has gained,
+    /// so this test alone could not detect a schema-only addition.
     #[test]
     fn schema_rejects_state_values_outside_the_enum(raw in "[a-z_]{1,16}") {
         prop_assume!(ApproveAttemptStateName::parse_wire(&raw).is_none());
@@ -275,12 +254,15 @@ proptest! {
         );
     }
 
-    /// And no outcome outside the Rust enum. The probe is a `resolved`
-    /// row carrying `failure_detail` and no `new_app_tip`: legal for
-    /// both failure outcomes, so a refusal is again attributable to the
-    /// `outcome IN (…)` CHECK. (`coalesce(outcome,'')` in the
-    /// new_app_tip / failure_detail CHECKs means an unknown outcome
-    /// behaves like a failure outcome there, not like `succeeded`.)
+    /// Same for the `outcome` column. The probe is a bare `resolved` row:
+    /// `completed_at` set, and *no* `new_app_tip`, `failure_detail`, or
+    /// mint. That shape clears every cross-column CHECK for an outcome
+    /// outside the enum — each of those CHECKs has the form
+    /// `coalesce(outcome, '') <predicate> = (<column> IS NOT NULL)`, and
+    /// an unknown outcome makes both sides false. An earlier draft set
+    /// `failure_detail`, which made the RHS true while the LHS stayed
+    /// false, so the row was refused by the *shape* CHECK and the test
+    /// proved nothing about the enum CHECK.
     #[test]
     fn schema_rejects_outcome_values_outside_the_enum(raw in "[a-z_]{1,16}") {
         prop_assume!(ApproveAttemptOutcomeName::parse_wire(&raw).is_none());
@@ -290,7 +272,7 @@ proptest! {
             outcome: Some(raw.clone()),
             completed_at: Some(1_700_000_300),
             new_app_tip: None,
-            failure_detail: Some("probe".into()),
+            failure_detail: None,
             mint: false,
         };
         let result = try_insert_row(&log, push_request_id, &shape);
@@ -299,6 +281,89 @@ proptest! {
             "schema accepted unknown outcome {raw:?}, which the Rust enum cannot represent",
         );
     }
+}
+
+/// The literals a `CHECK (<column> IN (…))` clause admits, read out of the
+/// *live* schema (`sqlite_master` holds the CREATE TABLE text the
+/// migrations actually ran). Reading the DDL is what makes the agreement
+/// test bidirectional: the Rust side can be enumerated with `ALL`, and
+/// this enumerates the SQL side, so set equality catches an addition,
+/// removal, or rename on *either* side.
+fn schema_enum_literals(log: &AuditLog, needle: &str) -> Vec<String> {
+    let ddl: String = log
+        .with_conn(|c| {
+            c.query_row(
+                "SELECT sql FROM sqlite_master
+                  WHERE type = 'table' AND name = 'git_push_approve_attempt'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(crate::AuditError::from)
+        })
+        .unwrap();
+    assert_eq!(
+        ddl.matches(needle).count(),
+        1,
+        "{needle:?} must appear exactly once in the DDL for this extraction to be \
+         unambiguous; the schema changed shape and this test needs revisiting",
+    );
+    let start = ddl.find(needle).unwrap() + needle.len();
+    let end = start
+        + ddl[start..]
+            .find(')')
+            .expect("the IN (…) list must be closed");
+    ddl[start..end]
+        .split(',')
+        .map(|literal| literal.trim().trim_matches('\'').to_string())
+        .collect()
+}
+
+fn sorted<T: Ord>(mut items: Vec<T>) -> Vec<T> {
+    items.sort();
+    items
+}
+
+/// The Rust enum and the `state` CHECK admit exactly the same strings.
+///
+/// This is the load-bearing agreement test. Both sides are enumerated —
+/// `ALL` on the Rust side, the CHECK's literal list on the SQL side — so
+/// a name added, removed, or renamed on either side fails here. In
+/// particular a *schema-only* addition (the case a random-string probe
+/// cannot realistically find) shows up as an extra literal.
+#[test]
+fn rust_and_schema_admit_the_same_state_names() {
+    let (log, _) = staged_log();
+    let from_rust = sorted(
+        ApproveAttemptStateName::ALL
+            .iter()
+            .map(|n| n.as_wire().to_string())
+            .collect(),
+    );
+    let from_schema = sorted(schema_enum_literals(&log, "state IN ("));
+    assert_eq!(
+        from_rust, from_schema,
+        "ApproveAttemptStateName and the state CHECK constraint disagree",
+    );
+}
+
+/// The same for the `outcome` column. The needle matches the column's own
+/// `outcome IS NULL OR outcome IN (…)` CHECK; the cross-column CHECKs
+/// spell it `coalesce(outcome, '') IN (…)`, which does not contain the
+/// needle — and `schema_enum_literals` asserts the single match anyway.
+#[test]
+fn rust_and_schema_admit_the_same_outcome_names() {
+    let (log, _) = staged_log();
+    let from_rust = sorted(
+        ApproveAttemptOutcomeName::ALL
+            .iter()
+            .map(|n| n.as_wire().to_string())
+            .collect(),
+    );
+    let from_schema = sorted(schema_enum_literals(&log, "outcome IN ("));
+    assert_eq!(
+        from_rust, from_schema,
+        "ApproveAttemptOutcomeName and the outcome CHECK constraint disagree",
+    );
 }
 
 /// The data-carrying DUs report the discriminant their row stores.
