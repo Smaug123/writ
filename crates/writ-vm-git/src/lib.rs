@@ -52,6 +52,11 @@ pub const VM_HTTP_CONTRACT_VERSION: u32 = 2;
 /// rather than the advice.
 pub const GUEST_IMAGE_REBUILD_COMMAND: &str = "writ agent-vm build-image";
 
+/// The command that rebuilds the *broker* VM image, quoted back when the broker
+/// is the stale side. Same rot risk, same guard as
+/// [`GUEST_IMAGE_REBUILD_COMMAND`] — both are parsed against the real CLI.
+pub const BROKER_IMAGE_REBUILD_COMMAND: &str = "writ agent-vm build-broker-image";
+
 /// The version field the guest reads out of `GET /v1/session`.
 ///
 /// Deliberately **not** `deny_unknown_fields`, and deliberately not the whole

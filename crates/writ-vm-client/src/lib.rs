@@ -157,9 +157,8 @@ pub enum VmClientError {
     BundleTooLarge { bytes: u64, max_bundle_bytes: u64 },
     #[error(
         "the guest and the broker disagree on the VM HTTP contract: this guest speaks version \
-         {guest}, the broker speaks {broker}. They are built together and must ship together — \
-         rebuild the stale image with `{}`.",
-        writ_vm_git::GUEST_IMAGE_REBUILD_COMMAND
+         {guest}, the broker speaks {broker}. {}",
+        contract_mismatch_remedy(*guest, *broker)
     )]
     ContractMismatch { guest: u32, broker: u32 },
     #[error("destination path already exists: {0:?}")]
@@ -450,6 +449,27 @@ pub async fn get_session_json(config: &VmClientConfig) -> Result<serde_json::Val
         .json::<serde_json::Value>()
         .await
         .map_err(VmClientError::from)
+}
+
+/// Which side is behind, and therefore what to do about it.
+///
+/// The version ordering says who is stale: telling an operator to rebuild the
+/// guest when the *broker* is the old one sends them round a loop that changes
+/// nothing (the rebuild produces the same guest, and does not restart the
+/// daemon).
+fn contract_mismatch_remedy(guest: u32, broker: u32) -> String {
+    if broker < guest {
+        format!(
+            "The broker is the older side: restart the `writd` daemon on the host from this \
+             build (and, for `broker_placement = vm`, rebuild its image with `{}`).",
+            writ_vm_git::BROKER_IMAGE_REBUILD_COMMAND,
+        )
+    } else {
+        format!(
+            "The guest is the older side: rebuild its image with `{}`.",
+            writ_vm_git::GUEST_IMAGE_REBUILD_COMMAND,
+        )
+    }
 }
 
 /// Refuse to talk to a broker whose contract version differs from this guest's.

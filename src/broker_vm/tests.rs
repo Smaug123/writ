@@ -139,31 +139,49 @@ fn run_invocation_is_dual_homed_with_mounts_and_broker_command() {
     );
 }
 
-/// The guest-facing route surface, digested, once per contract version.
+/// One row per guest contract version: the digest of the guest-facing route
+/// surface at that version, and the broker protocol version that shipped with
+/// it.
 ///
-/// **Append a row when the routes change; never edit one.** The test below
-/// asserts the live route digest equals the row at index
-/// `VM_HTTP_CONTRACT_VERSION - 1`, that the history has exactly that many rows,
-/// and that no digest repeats. So moving a path fails until a *new* row is
-/// appended with a bumped version — and the only way to make it pass without
-/// bumping is to overwrite a recorded historical digest, which is a conspicuous
-/// diff rather than the innocuous "update the snapshot" it used to be.
+/// **Append a row when the guest contract changes; never edit one.** The test
+/// below asserts the row at index `VM_HTTP_CONTRACT_VERSION - 1` describes the
+/// live surface, that the history has exactly that many rows, and that the
+/// recorded broker protocol versions strictly increase — so appending a row
+/// forces `BROKER_PROTOCOL_VERSION` up too. Both matter, because one contract
+/// gates two independently-rebuildable images: without the second, a route move
+/// could bump only the guest constant and leave a stale *broker* image
+/// advertising an unchanged protocol and serving the old routes.
 ///
-/// (A golden test cannot make the wrong repair *impossible* — a determined edit
-/// always can. What it can do is make the right repair the easy one and the
-/// wrong one visible in review. That distinction was worth being precise about:
-/// an earlier draft listed the version and the routes as independent fields,
-/// which let a route change be absorbed by editing the route text alone.)
-const GUEST_ROUTE_DIGEST_HISTORY: &[&str] = &[
-    // v1 — the pre-split surface, retired by the vendor namespaces. Its digest
-    // was never recorded (the history starts here), so this is a placeholder
-    // standing in for "some surface that is not any later one". It is only ever
-    // compared for distinctness; the live digest is always checked against the
-    // row for the *current* version.
-    "v1-unrecorded-pre-vendor-namespace-surface",
-    // v2 — vendor namespaces (`/anthropic/v1/*`, `/openai/v1/*`).
-    "1d9660853cccc4397d1ec7d22cb1c5331a1b9707615d01ca677d7f351d5621e1",
+/// Digests are deliberately **not** required to be distinct across rows: a
+/// contract version can change for reasons that leave the routes untouched — a
+/// response shape, an auth rule — and forbidding a repeat would make the
+/// prescribed bump impossible for exactly those changes.
+///
+/// (A golden test cannot make the wrong repair *impossible* — overwriting a
+/// recorded row still passes. What it can do is make the right repair the easy
+/// one and the wrong one a conspicuous diff: rewritten history, not an updated
+/// snapshot.)
+const GUEST_CONTRACT_HISTORY: &[GuestContractRow] = &[
+    GuestContractRow {
+        // v1 — the pre-split surface, retired by the vendor namespaces. Its
+        // digest was never recorded (the history starts here), so this stands in
+        // for "some surface that is not the current one"; only the *current*
+        // row's digest is ever compared against the live routes.
+        route_digest: "v1-unrecorded-pre-vendor-namespace-surface",
+        broker_protocol_version: 3,
+    },
+    GuestContractRow {
+        // v2 — vendor namespaces (`/anthropic/v1/*`, `/openai/v1/*`), plus
+        // `/v1/session` reporting the contract version.
+        route_digest: "1d9660853cccc4397d1ec7d22cb1c5331a1b9707615d01ca677d7f351d5621e1",
+        broker_protocol_version: 4,
+    },
 ];
+
+struct GuestContractRow {
+    route_digest: &'static str,
+    broker_protocol_version: u32,
+}
 
 fn guest_route_digest() -> String {
     let routes: Vec<String> = crate::vm_http::route_table::tests::ENDPOINT_MAP
@@ -229,29 +247,41 @@ fn broker_contract_fingerprint_is_pinned() {
          BROKER_PROTOCOL_VERSION (and rebuild the broker image)."
     );
 
-    // The guest route surface, coupled to the guest contract version: the live
-    // digest must be the row this version recorded.
+    // The guest contract history, coupled to *both* version constants: the live
+    // route surface must be what this contract version recorded, and the row
+    // must carry the broker protocol version now compiled in.
     let version = crate::vm_git::VM_HTTP_CONTRACT_VERSION as usize;
     assert_eq!(
-        GUEST_ROUTE_DIGEST_HISTORY.len(),
+        GUEST_CONTRACT_HISTORY.len(),
         version,
-        "VM_HTTP_CONTRACT_VERSION is {version} but the route-digest history has {} row(s): \
+        "VM_HTTP_CONTRACT_VERSION is {version} but the contract history has {} row(s): \
          append exactly one row per version",
-        GUEST_ROUTE_DIGEST_HISTORY.len(),
+        GUEST_CONTRACT_HISTORY.len(),
     );
+    let current = &GUEST_CONTRACT_HISTORY[version - 1];
     assert_eq!(
         guest_route_digest(),
-        GUEST_ROUTE_DIGEST_HISTORY[version - 1],
-        "the guest-facing route surface changed. Append its new digest to \
-         GUEST_ROUTE_DIGEST_HISTORY, bump VM_HTTP_CONTRACT_VERSION (so guests refuse a stale \
-         broker) AND bump BROKER_PROTOCOL_VERSION (so the host refuses a stale broker image), \
-         then rebuild both images.",
+        current.route_digest,
+        "the guest-facing route surface changed. Append a row to GUEST_CONTRACT_HISTORY with \
+         its new digest and the new broker protocol version, bump VM_HTTP_CONTRACT_VERSION (so \
+         guests refuse a stale broker) AND bump BROKER_PROTOCOL_VERSION (so the host refuses a \
+         stale broker image), then rebuild both images.",
     );
-    let unique: std::collections::BTreeSet<&&str> = GUEST_ROUTE_DIGEST_HISTORY.iter().collect();
     assert_eq!(
-        unique.len(),
-        GUEST_ROUTE_DIGEST_HISTORY.len(),
-        "a route digest is repeated: two contract versions cannot describe the same surface",
+        current.broker_protocol_version,
+        crate::broker_protocol::BROKER_PROTOCOL_VERSION,
+        "this guest contract version shipped with broker protocol {}, but the compiled \
+         BROKER_PROTOCOL_VERSION is {}: a guest-contract change must move the broker protocol \
+         too, or a stale broker image is accepted while serving the old contract",
+        current.broker_protocol_version,
+        crate::broker_protocol::BROKER_PROTOCOL_VERSION,
+    );
+    assert!(
+        GUEST_CONTRACT_HISTORY
+            .windows(2)
+            .all(|pair| pair[1].broker_protocol_version > pair[0].broker_protocol_version),
+        "recorded broker protocol versions must strictly increase: appending a contract row \
+         without bumping BROKER_PROTOCOL_VERSION would leave a stale broker image acceptable",
     );
 }
 

@@ -434,7 +434,14 @@ image":
   `GET /v1/session` and checked by `writ-vm` at startup before any real work —
   `writ-vm session` is exempt, being the diagnostic one needs *during* a
   mismatch. The guest parses only the `version` field, so a newer broker's extra
-  fields cannot stop an older guest from diagnosing the skew.
+  fields cannot stop an older guest from diagnosing the skew, and the version
+  ordering decides which side is told to rebuild.
+
+  This check is **guest-side**, so it protects only a guest that has it: an image
+  built before the handshake makes no such call and the broker still serves it.
+  Enforcing it broker-side is issue #342, and cannot simply require a header on
+  every request — most guest traffic comes from `nix`, Claude Code, and codex,
+  which will never send one. Only the `writ-vm`-originated routes can carry it.
 
 Both are pinned by one CI test, `broker_contract_fingerprint_is_pinned`
 (`broker_vm/tests.rs`): it snapshots the broker's CLI flags and ready-doc schema,

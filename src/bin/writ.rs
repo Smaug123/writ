@@ -1643,17 +1643,21 @@ mod tests {
     /// this test stops the two from drifting. It caught the original: the
     /// message named `build-guest-image`, which does not parse.
     #[test]
-    fn the_guest_image_rebuild_advice_names_a_real_command() {
-        let command = writ::vm_git::GUEST_IMAGE_REBUILD_COMMAND;
-        let mut words = command.split_whitespace();
-        assert_eq!(
-            words.next(),
-            Some("writ"),
-            "the advice must invoke this binary: {command}",
-        );
-        Args::try_parse_from(std::iter::once("writ").chain(words)).unwrap_or_else(|err| {
-            panic!("the guest is told to run `{command}`, which does not parse: {err}")
-        });
+    fn the_image_rebuild_advice_names_real_commands() {
+        for command in [
+            writ::vm_git::GUEST_IMAGE_REBUILD_COMMAND,
+            writ::vm_git::BROKER_IMAGE_REBUILD_COMMAND,
+        ] {
+            let mut words = command.split_whitespace();
+            assert_eq!(
+                words.next(),
+                Some("writ"),
+                "the advice must invoke this binary: {command}",
+            );
+            Args::try_parse_from(std::iter::once("writ").chain(words)).unwrap_or_else(|err| {
+                panic!("an operator is told to run `{command}`, which does not parse: {err}")
+            });
+        }
     }
 
     #[test]
