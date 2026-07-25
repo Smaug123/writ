@@ -22,6 +22,7 @@ use crate::core::{AgentKind, Ipv6Cidr, SessionRecord, TtlSeconds, UnixMillis};
 use crate::github::{GitHubAppConfig, GitHubAppRegistryConfig, GitHubMinter};
 use crate::policy::PolicyConfig;
 use crate::secret::{SecretError, SecretKey};
+use crate::vm_git::GUEST_IMAGE_REBUILD_COMMAND;
 use crate::vm_git::VM_GIT_CLONE_PATH;
 use crate::vm_git::{BROKER_IMAGE_REBUILD_COMMAND, VM_FLAKE_PROVISION_PATH, VM_GIT_PUSH_PATH};
 use crate::vm_git_bundle::{GitCredentialBoundary, GitSecretEnvVar};
@@ -1371,12 +1372,14 @@ fn source_subnet_can_be_taken_from_agent_network_ipv4() {
     assert_eq!(session.source_ipv4(), network.ipv4());
 }
 
-/// A guest image built before the vendor-namespace split asks for the old
-/// model-proxy paths. It must get a *diagnosable* answer — `410` naming the
-/// remedy — rather than a `404` indistinguishable from a typo, and nothing may
-/// be recorded, because no effect was attempted.
+/// The pre-split model-proxy paths are simply unknown endpoints now. The `410`
+/// shim that named the rebuild is deleted: the only client that could ask for
+/// these is a guest image built before the split, and such an image declares no
+/// contract version, so it is refused at `workspace init` with a `426` naming
+/// the same remedy — before any agent process exists to issue a model request.
+/// Nothing may be recorded, because no effect was attempted.
 #[tokio::test]
-async fn a_pre_split_proxy_path_is_gone_and_names_the_remedy() {
+async fn a_pre_split_proxy_path_is_unknown_and_records_nothing() {
     let github = MockServer::start().await;
     let state = make_broker_state(&github);
     let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::LOCALHOST, 32).unwrap());
@@ -1397,14 +1400,7 @@ async fn a_pre_split_proxy_path_is_gone_and_names_the_remedy() {
     .await
     .into_buffered();
 
-    assert_eq!(response.status, VmHttpStatus::Gone);
-    let body = String::from_utf8(response.body).unwrap();
-    assert!(body.contains("/anthropic"), "{body}");
-    assert!(body.contains("/openai"), "{body}");
-    assert!(
-        body.contains(super::GUEST_IMAGE_REBUILD_COMMAND),
-        "the answer must name the remedy: {body}",
-    );
+    assert_eq!(response.status, VmHttpStatus::NotFound);
     // A retired path attempts no effect, so it records none.
     state.audit.assert_effect_audit_pairs_complete(
         "claude_proxy_request",

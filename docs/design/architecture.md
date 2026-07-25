@@ -417,10 +417,13 @@ first (Claude) shadowed the other's models routes — answering `404` from the
 wrong proxy and recording the attempt against the wrong vendor's audit table.
 `route_table`'s `no_target_is_claimed_by_both_proxy_backends` property now makes
 that unrepresentable, and `writs_own_v1_api_is_never_a_proxy_route` keeps `/v1/*`
-writ's alone. The pre-split proxy paths resolve to `PlainRoute::LegacyProxyPath`
-and answer `410 Gone` naming the remedy, so a guest image built before the split
-fails diagnosably rather than looking like an unknown endpoint; that shim is
-temporary (`docs/plans/2026-07-25-proxy-vendor-namespaces.md`).
+writ's alone. The migration is complete: the pre-split paths are ordinary
+unknown targets, and the `410 Gone` shim that named the rebuild is deleted. It
+was there for guest images built before the split, and no such image can reach a
+model proxy any more — it declares no contract version (below), so the broker
+refuses its `workspace init` clone with `426` naming the same remedy, before an
+agent process exists to issue a model request
+(`docs/plans/2026-07-25-proxy-vendor-namespaces.md`, Stage 2).
 
 **Two version handshakes, one fingerprint.** The guest and the broker are built
 from the same tree and only ever meant to ship together, but both run from images

@@ -224,8 +224,8 @@ async fn get_session_json_gets_session_endpoint_with_bearer_token() {
 
 /// The guest refuses to proceed against a broker whose contract version differs
 /// from its own, and says what to do about it. Before this, a stale guest image
-/// simply asked for endpoints that had moved and got a `404`/`410` with no
-/// indication that the *image* was the problem.
+/// simply asked for endpoints that had moved and got a `404` with no indication
+/// that the *image* was the problem.
 #[tokio::test]
 async fn a_contract_version_mismatch_is_refused_with_both_versions_and_the_remedy() {
     let stale = VM_HTTP_CONTRACT_VERSION + 1;

@@ -200,7 +200,7 @@ Also, in the same change, point the guest at the new namespaces: `writ-vm` sets
   a crate both sides depend on (`writ-vm-git`, beside the prefixes).
 - `scripts/prove-*.sh` agent-VM runs still complete (real hardware, not CI).
 
-### Stage 2 — delete the legacy shim
+### Stage 2 — delete the legacy shim ✅ done
 
 **Dependencies**: Stage 1, plus one release in which stale guest images have
 been rebuilt. **Implements**: the migration's completion.
@@ -209,6 +209,34 @@ Remove `PlainRoute::LegacyProxyPath`; the old paths become `Unmatched` (404).
 
 **Correctness oracle**: a legacy path resolves to `Unmatched`; the route-table
 coverage test passes with the variant gone; full gate suite green.
+
+**How the dependency was actually discharged.** The "one release" clause was a
+time-based stand-in for a mechanism that did not exist when this was drafted —
+§5's first risk says so outright ("a version handshake between `writ-vm` and the
+broker would close it properly; that is a larger feature and is not proposed
+here"). That handshake now exists (#341/#343/#344), so the gate is met by
+reachability instead:
+
+- A legacy path is only ever requested by a vendor SDK pointed at an unprefixed
+  base URL, and the only thing that sets those is `writ-vm`'s process plan
+  (`src/bin/writ-vm.rs`, `ANTHROPIC_BASE_URL` and codex's `base_url`). So the
+  `410`'s audience is exactly *guest images built before Stage 1*.
+- Every such image predates the contract header, so it declares none — and every
+  route to launching an agent crosses a `Required` route first: the workspace
+  shape runs `writ-vm workspace init` → `POST /v1/git/clone`, the agent shape
+  fetches `GET /v1/agent-runs/{id}/config` before building the process plan.
+  Both answer `426`, naming `writ agent-vm build-image` — the same remedy.
+
+So the shim was unreachable by the only clients it was written for, and what
+replaces it is strictly better: the stale guest now fails at bootstrap rather
+than booting a VM, launching the agent, and failing every model call one at a
+time. The one caller left — something inside the guest hitting `/v1/messages`
+directly — was being told to rebuild an image that is not its problem; `404` is
+the honest answer.
+
+Deleting the variant moves `guest_route_digest()`, so the fingerprint test
+forced `VM_HTTP_CONTRACT_VERSION` 3→4 and `BROKER_PROTOCOL_VERSION` 5→6 and a
+rebuild of both images — the machinery working as designed.
 
 ---
 

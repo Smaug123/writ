@@ -25,8 +25,8 @@ use writ_core::core::{
 /// The guest and the broker are built from the same tree and are only ever meant
 /// to ship together — but `writ agent-vm build-image` loads an image into the
 /// local container store, so a rebuilt host can launch a *stale* guest. Before
-/// this handshake the only symptom was a `404` (or, after the model-proxy
-/// namespaces moved, a `410`) from an endpoint the guest believed in.
+/// this handshake the only symptom was a `404` from an endpoint the guest
+/// believed in.
 ///
 /// The broker reports this in its `GET /v1/session` response; the guest compares
 /// it against its own compiled value at startup and refuses to run on a
@@ -39,14 +39,14 @@ use writ_core::core::{
 /// This is the guest-side sibling of `writ::broker_protocol::BROKER_PROTOCOL_VERSION`,
 /// which guards the host↔broker-VM axis. A guest-visible change generally moves
 /// both: one forces the broker image to be rebuilt, the other the guest image.
-pub const VM_HTTP_CONTRACT_VERSION: u32 = 3;
+pub const VM_HTTP_CONTRACT_VERSION: u32 = 4;
 
 /// The command an operator runs to rebuild the guest image, quoted back to them
 /// whenever the broker refuses a stale one.
 ///
 /// A `const` rather than a literal in each message because advice naming a CLI
-/// command rots silently — the first draft of the `410` body named a subcommand
-/// that never existed, so a guest following it failed at argument parsing.
+/// command rots silently — an early draft of a refusal body named a subcommand
+/// that never existed, so an operator following it failed at argument parsing.
 /// `the_guest_image_rebuild_advice_names_a_real_command` (in `bin/writ.rs`)
 /// parses this against the real CLI, so renaming the subcommand breaks the build
 /// rather than the advice.
