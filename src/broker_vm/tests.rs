@@ -191,6 +191,15 @@ const GUEST_CONTRACT_HISTORY: &[GuestContractRow] = &[
         route_digest: "0c7629a0e0df5e38fef7bfe9b7f5ead046be60688a63f10d7915980fadeb2968",
         broker_protocol_version: 5,
     },
+    GuestContractRow {
+        // v4 — the `410 Gone` shim on the pre-split proxy paths is deleted; they
+        // are ordinary unknown targets now. Only a guest image built before the
+        // namespaces could ask for one, and such an image declares no contract
+        // version, so v3 already refuses it at `workspace init` — before any
+        // agent process exists to issue a model request.
+        route_digest: "b82730d9647e75dd51d317f8185bf00c6df1d254b65af4a500eeceb9b94dad04",
+        broker_protocol_version: 6,
+    },
 ];
 
 struct GuestContractRow {
@@ -334,7 +343,7 @@ fn broker_contract_fingerprint_is_pinned() {
     assert_eq!(
         fingerprint,
         "broker-cli-flags: --config --session-spec --bearer-token-file\n\
-         ready-doc: {\"protocol_version\":5,\"broker_port\":18080,\"writd_build\":\"pinned\"}",
+         ready-doc: {\"protocol_version\":6,\"broker_port\":18080,\"writd_build\":\"pinned\"}",
         "the host↔broker contract changed. Update this snapshot AND bump \
          BROKER_PROTOCOL_VERSION (and rebuild the broker image)."
     );

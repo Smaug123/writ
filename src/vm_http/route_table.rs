@@ -37,8 +37,8 @@ use super::git_clone::is_git_clone_target;
 use super::git_push::is_git_push_target;
 use super::nix_cache::is_nix_cache_target;
 use super::nix_cache::record_nix_cache_local_response;
+use super::proxy_common::ProxyBackend;
 use super::proxy_common::record_proxy_local_response;
-use super::proxy_common::{ProxyBackend, proxy_target_path};
 use super::{ClaudeBackend, OpenAiBackend};
 use super::{
     MAX_VM_HTTP_AGENT_RUN_OUTCOME_BODY_BYTES, MAX_VM_HTTP_BODY_BYTES, VmHttpAuthError,
@@ -99,10 +99,12 @@ route_enum! {
     /// effect and hand it to `broker_effect`.
     #[derive(Clone, Debug, Eq, PartialEq)]
     pub(crate) enum BrokeredRoute {
-        /// `/v1/messages`, `/v1/messages/count_tokens`, `/v1/models/*`.
+        /// `/anthropic/v1/messages`, `/anthropic/v1/messages/count_tokens`,
+        /// `/anthropic/v1/models/*`.
         ClaudeProxy,
-        /// `/v1/responses`, `/v1/responses/{id}/cancel`. (Its models routes are
-        /// shadowed by the Claude proxy — see the route-table tests.)
+        /// `/openai/v1/responses`, `/openai/v1/responses/{id}/cancel`,
+        /// `/openai/v1/models/*`. The vendor prefixes are what stop its models
+        /// routes being shadowed by Anthropic's, which share those path suffixes.
         OpenAiProxy,
         /// `/v1/nix/cache/*`, `/v1/nix/prewarm/*`. Authority-free, so its pair is
         /// written in one commit (`record_effect_coalesced`) rather than two.
@@ -137,14 +139,6 @@ route_enum! {
         /// the host-mint follow-up teaches the guard the grant-flow shape (see
         /// the plan's §7). It is *not* unaudited — it is audited elsewhere.
         GitClone,
-        /// A model-proxy path from before the vendor namespaces — `/v1/messages`,
-        /// `/v1/responses`, `/v1/models*`. Answered `410 Gone` naming the
-        /// remedy, because a guest asking for these is running an image built
-        /// before the split and would otherwise see an indistinguishable `404`.
-        /// Records nothing: no effect was attempted. Deleted once stale guest
-        /// images can no longer be in play (see
-        /// `docs/plans/2026-07-25-proxy-vendor-namespaces.md`, Stage 2).
-        LegacyProxyPath,
         /// No route matched: answered `404`/`405` without touching any service.
         Unmatched,
     }
@@ -180,9 +174,8 @@ pub(crate) enum ContractExemption {
     /// of writ and will not send its headers.
     ThirdPartyClient,
     /// Nothing is reached and no effect is attempted, so the answer does not
-    /// depend on the contract: `LegacyProxyPath`'s `410` names the rebuild and
-    /// `Unmatched`'s `404` says there is no such endpoint, both of which tell a
-    /// stale guest more than a version refusal would.
+    /// depend on the contract: `Unmatched`'s `404` says there is no such
+    /// endpoint, which tells a stale guest more than a version refusal would.
     NoEffect,
 }
 
@@ -252,9 +245,6 @@ impl VmHttpRoute {
         if let Some(run_id) = parse_agent_run_outcome_target(target) {
             return Self::Brokered(BrokeredRoute::AgentRunOutcome(run_id));
         }
-        if is_legacy_proxy_path(target) {
-            return Self::Plain(PlainRoute::LegacyProxyPath);
-        }
         if target == SESSION_PATH {
             return Self::Plain(PlainRoute::Session);
         }
@@ -281,9 +271,7 @@ impl VmHttpRoute {
             Self::Brokered(BrokeredRoute::OpenAiProxy) => ContractCheck::Exempt(ThirdPartyClient),
             Self::Brokered(BrokeredRoute::NixCache) => ContractCheck::Exempt(ThirdPartyClient),
             Self::Plain(PlainRoute::Session) => ContractCheck::Exempt(Handshake),
-            Self::Plain(PlainRoute::LegacyProxyPath | PlainRoute::Unmatched) => {
-                ContractCheck::Exempt(NoEffect)
-            }
+            Self::Plain(PlainRoute::Unmatched) => ContractCheck::Exempt(NoEffect),
         }
     }
 
@@ -338,11 +326,9 @@ impl VmHttpRoute {
             .then_some(MAX_VM_HTTP_BODY_BYTES),
             // Neither reads a body.
             Self::Plain(PlainRoute::Session | PlainRoute::AgentRunConfig(_)) => None,
-            // Answered without reading the body it declares: the guest is
-            // misconfigured, and buffering a model request to discard it would
-            // be pure waste.
-            Self::Plain(PlainRoute::LegacyProxyPath) => None,
-            // Nothing to read a body for.
+            // Nothing to read a body for. An unknown target is answered without
+            // reading the body it declares: buffering a request nobody will
+            // serve — a stale guest's model call, say — would be pure waste.
             Self::Plain(PlainRoute::Unmatched) => None,
         }
     }
@@ -440,18 +426,6 @@ impl VmHttpRoute {
 /// the session endpoint.
 pub(super) const SESSION_PATH: &str = "/v1/session";
 
-/// Whether `target` is a model-proxy path from before the vendor namespaces.
-///
-/// These roots are disjoint from writ's own `/v1/*` API (`session`, `git`,
-/// `nix`, `agent-runs`), which is unaffected by the split — after it, `/v1/*`
-/// belongs solely to writ.
-fn is_legacy_proxy_path(target: &str) -> bool {
-    let path = proxy_target_path(target);
-    ["/v1/messages", "/v1/responses", "/v1/models"]
-        .iter()
-        .any(|root| path == *root || path.starts_with(&format!("{root}/")))
-}
-
 #[cfg(test)]
 pub(crate) mod tests {
     use std::collections::BTreeSet;
@@ -491,7 +465,6 @@ pub(crate) mod tests {
         ),
         ("GET", "/openai/v1/models", "OpenAiProxy"),
         ("GET", "/openai/v1/models/gpt-5", "OpenAiProxy"),
-        ("POST", "/v1/messages", "LegacyProxyPath"),
         ("POST", "/v1/git/clone", "GitClone"),
         ("POST", "/v1/git/push", "GitPush"),
         ("POST", "/v1/nix/flake/provision", "FlakeProvision"),
@@ -564,8 +537,13 @@ pub(crate) mod tests {
         }
     }
 
-    /// Every pre-split model-proxy path is retired together, so a stale guest
-    /// gets one consistent answer rather than a mix of `410` and `404`.
+    /// Every pre-split model-proxy path is retired together, and the migration
+    /// leaves no residue: they are now indistinguishable from any other unknown
+    /// target. The `410 Gone` shim that stood here existed for guest images
+    /// built before the split, and no such image can reach a model proxy any
+    /// more — it declares no contract version, so the broker refuses its
+    /// `workspace init` clone (or its agent-run config fetch) with `426` long
+    /// before an agent process is launched to ask for one of these.
     #[test]
     fn the_pre_split_proxy_paths_are_all_retired() {
         for target in [
@@ -580,7 +558,7 @@ pub(crate) mod tests {
         ] {
             assert_eq!(
                 VmHttpRoute::resolve(&request("GET", target)),
-                VmHttpRoute::Plain(PlainRoute::LegacyProxyPath),
+                VmHttpRoute::Plain(PlainRoute::Unmatched),
                 "{target}",
             );
         }
@@ -650,6 +628,41 @@ pub(crate) mod tests {
                     route.identity(),
                 );
             }
+        }
+    }
+
+    /// **The bootstrap gate that makes deleting the pre-split `410` shim safe.**
+    ///
+    /// A guest image built before the vendor namespaces is the only thing that
+    /// can ask for a legacy proxy path, and it declares no contract version.
+    /// That is harmless only because it cannot get an agent process running
+    /// first: both shapes of guest bootstrap traverse one of these routes before
+    /// any model request can exist — the workspace shape runs `writ-vm workspace
+    /// init`, which clones, and the agent shape fetches its run config before
+    /// building the process plan that sets `ANTHROPIC_BASE_URL` at all.
+    ///
+    /// Exempting either would put a stale guest back in front of a model proxy,
+    /// so this is pinned rather than left as an incidental property of the
+    /// current `contract_check` arm. The general coupling test above cannot
+    /// catch it: it only forbids `Required` on a route the guest never declares
+    /// on, and is silent about a route that stops demanding one.
+    #[test]
+    fn a_guest_cannot_launch_an_agent_without_declaring_its_contract() {
+        for (method, target) in [
+            ("POST", writ_vm_git::VM_GIT_CLONE_PATH),
+            (
+                "GET",
+                "/v1/agent-runs/00000000-0000-0000-0000-000000000001/config",
+            ),
+        ] {
+            let route = VmHttpRoute::resolve(&request(method, target));
+            assert_eq!(
+                route.contract_check(),
+                ContractCheck::Required,
+                "`{method} {target}` gates every agent launch: a guest that reaches an agent \
+                 process without declaring its contract version can request a retired \
+                 model-proxy path, which is now an ordinary 404",
+            );
         }
     }
 

@@ -65,8 +65,7 @@ use crate::core::{BrokerPort, BrokerPortRange, Ipv4Cidr, SessionId};
 use crate::secret::SecretStore;
 use crate::server::BrokerState;
 use crate::vm_git::{
-    GUEST_IMAGE_REBUILD_COMMAND, GuestContract, VM_HTTP_CONTRACT_HEADER, VM_HTTP_CONTRACT_VERSION,
-    VmGitPushBodyLimits,
+    GuestContract, VM_HTTP_CONTRACT_HEADER, VM_HTTP_CONTRACT_VERSION, VmGitPushBodyLimits,
 };
 
 const MAX_VM_HTTP_BODY_BYTES: usize = 64 * 1024;
@@ -1421,15 +1420,6 @@ where
             }
             route_agent_run_config_request(*run_id, &service).into()
         }
-        VmHttpRoute::Plain(PlainRoute::LegacyProxyPath) => VmHttpResponse::text(
-            VmHttpStatus::Gone,
-            format!(
-                "this model-proxy path moved: Anthropic is served under /anthropic and OpenAI \
-                 under /openai. The guest image predates the split — rebuild it with \
-                 `{GUEST_IMAGE_REBUILD_COMMAND}`.",
-            ),
-        )
-        .into(),
         VmHttpRoute::Plain(PlainRoute::Session | PlainRoute::Unmatched) => {
             route_session_endpoint(session, request).into()
         }
