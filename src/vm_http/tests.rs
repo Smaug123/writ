@@ -92,10 +92,17 @@ pub(super) fn make_broker_state_with_extra_secret(
     server: &MockServer,
     extra_secret: Option<(SecretKey, &str)>,
 ) -> Arc<BrokerState<Box<dyn SecretStore>>> {
+    make_broker_state_with_extra_secrets(server, extra_secret.into_iter().collect())
+}
+
+pub(super) fn make_broker_state_with_extra_secrets(
+    server: &MockServer,
+    extra_secrets: Vec<(SecretKey, &str)>,
+) -> Arc<BrokerState<Box<dyn SecretStore>>> {
     let pk = SecretKey::new("gh-app-pk").unwrap();
     let store = InMemStore::default();
     store.put(&pk, TEST_PRIV).unwrap();
-    if let Some((key, value)) = extra_secret {
+    for (key, value) in extra_secrets {
         store.put(&key, value).unwrap();
     }
     let mut apps = BTreeMap::new();
@@ -755,10 +762,14 @@ async fn disabled_agent_run_config_route_is_not_found() {
         SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(10, 1, 2, 3), 12345)),
     );
 
-    let response =
-        route_authenticated_vm_http_request(&session, &request, Vec::new(), no_services())
-            .await
-            .into_buffered();
+    let response = resolve_and_route_authenticated_vm_http_request(
+        &session,
+        &request,
+        Vec::new(),
+        no_services(),
+    )
+    .await
+    .into_buffered();
 
     assert_eq!(response.status, VmHttpStatus::NotFound);
 }
@@ -1146,4 +1157,309 @@ fn source_subnet_can_be_taken_from_agent_network_ipv4() {
         token(),
     );
     assert_eq!(session.source_ipv4(), network.ipv4());
+}
+
+/// The Stage-6 capstone oracle: **every** registered brokered route, driven
+/// end to end through the dispatcher, leaves a complete `(request, outcome)`
+/// audit pair.
+///
+/// This is the executable form of "complete by construction". The loop is
+/// driven by [`BrokeredRoute::ALL_NAMES`], which the route-table macro generates
+/// from the enum definition itself — so a new capability cannot be added
+/// without appearing here, and the `_` arm below fails loudly until it is
+/// actually driven. Coverage therefore grows with the route table rather than
+/// with anyone remembering to write a test.
+///
+/// Each route is checked twice over: a non-vacuity guard (the drive really
+/// recorded a request row, so a silently-skipped drive cannot pass) and the
+/// pair assertion itself.
+mod brokered_route_audit_oracle {
+    use super::*;
+    use crate::agent_run::{
+        AgentRunStreamUpload, VmAgentRunOutcomeUpload, vm_agent_run_outcome_path,
+    };
+    use crate::audit::AgentRunAuditRecord;
+    use crate::core::RepoRef;
+    use crate::git_push_staging::GitPushStagingStore;
+    use crate::vm_git::{
+        GitBranchName, GitCloneRepo, GitObjectId, VM_FLAKE_PROVISION_PATH, VM_GIT_PUSH_PATH,
+        VmFlakeProvisionRequest, VmGitPushBodyLimits, VmGitPushMetadata, VmGitPushRequest,
+        encode_vm_git_push_request_body,
+    };
+    use crate::vm_git_mirror_cache::{MirrorCache, MirrorCacheKey};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, ResponseTemplate};
+
+    /// The `(request table, outcome table, join column)` a route records into.
+    fn audit_pair_for(route: &str) -> (&'static str, &'static str, &'static str) {
+        match route {
+            "ClaudeProxy" => ("claude_proxy_request", "claude_proxy_outcome", "request_id"),
+            "OpenAiProxy" => ("openai_proxy_request", "openai_proxy_outcome", "request_id"),
+            "NixCache" => ("nix_cache_request", "nix_cache_outcome", "request_id"),
+            "GitPush" => ("git_push_request", "git_push_outcome", "push_request_id"),
+            "FlakeProvision" => (
+                "flake_provision_request",
+                "flake_provision_outcome",
+                "request_id",
+            ),
+            "AgentRunOutcome" => ("agent_run", "agent_run_outcome", "run_id"),
+            other => panic!(
+                "brokered route `{other}` has no audit pair listed here: every brokered route \
+                 records a (request, outcome) pair, so name its tables and drive it below",
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn every_brokered_route_records_a_complete_audit_pair() {
+        let git_program = required_test_tool("git");
+        let temp = tempfile::tempdir().unwrap();
+
+        // Upstreams for the two model proxies. Plain JSON, so both responses
+        // buffer rather than stream.
+        let claude_upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(b"{}".to_vec(), "application/json"),
+            )
+            .mount(&claude_upstream)
+            .await;
+        let openai_upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(b"{}".to_vec(), "application/json"),
+            )
+            .mount(&openai_upstream)
+            .await;
+
+        let github = MockServer::start().await;
+        let anthropic_key = SecretKey::new("anthropic-api-key").unwrap();
+        let openai_key = SecretKey::new("openai-api-key").unwrap();
+        let state = make_broker_state_with_extra_secrets(
+            &github,
+            vec![
+                (anthropic_key.clone(), "host-anthropic-key"),
+                (openai_key.clone(), "host-openai-key"),
+            ],
+        );
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::LOCALHOST, 32).unwrap());
+        open_audit_session(&state, session.session_id());
+
+        // A real bare mirror plus a fake `nix` that archives, so flake
+        // provisioning runs its full audited path without needing a nix daemon.
+        let repo = RepoRef {
+            owner: "o".into(),
+            name: "n".into(),
+        };
+        let (mirror, rev) = crate::flake_fixtures::no_input_flake_mirror(
+            &git_program,
+            &temp.path().join("flake-fixture"),
+        );
+        let mirror_cache = MirrorCache::new(temp.path().join("mirror-cache"));
+        mirror_cache
+            .insert(&MirrorCacheKey::new(&repo, &rev), &mirror)
+            .unwrap();
+        record_contents_read_grant(&state, session.session_id(), repo.clone());
+
+        // The agent run whose outcome the outcome route resumes.
+        let run_id = AgentRunId::new();
+        state
+            .audit
+            .record_agent_run(&AgentRunAuditRecord {
+                run_id,
+                session_id: session.session_id(),
+                requested_at: UnixMillis::now(),
+                agent_kind: AgentKind::Claude,
+                prompt: crate::agent_run::AgentPrompt::new("prompt").summary(),
+                correlation_id: None,
+            })
+            .unwrap();
+
+        let services = TestVmHttpServices {
+            git_clone: None,
+            nix_cache: Some(VmHttpNixCacheService::new(
+                Arc::clone(&state),
+                nix_cache_config_for_test(),
+            )),
+            claude_proxy: Some(
+                VmHttpClaudeProxyService::new(
+                    Arc::clone(&state),
+                    VmHttpClaudeProxyConfig::new_with_anthropic_version(
+                        claude_upstream.uri(),
+                        anthropic_key,
+                        VmHttpClaudeProxyAuthKind::XApiKey,
+                        "2024-10-22",
+                        std::time::Duration::from_secs(5),
+                        4096,
+                        4096,
+                    )
+                    .unwrap(),
+                )
+                .unwrap(),
+            ),
+            openai_proxy: Some(
+                VmHttpOpenAiProxyService::new(
+                    Arc::clone(&state),
+                    VmHttpOpenAiProxyConfig::new(
+                        openai_upstream.uri(),
+                        openai_key,
+                        VmHttpOpenAiProxyAuthKind::AuthorizationBearer,
+                        std::time::Duration::from_secs(5),
+                        4096,
+                        4096,
+                    )
+                    .unwrap(),
+                )
+                .unwrap(),
+            ),
+            agent_runs: Some(VmHttpAgentRunService::new(
+                Arc::clone(&state),
+                temp.path().join("agent-runs"),
+            )),
+            git_push: Some(VmHttpGitPushService::new(
+                Arc::clone(&state),
+                Arc::new(GitPushStagingStore::open(temp.path().join("staging")).unwrap()),
+                VmGitPushBodyLimits::new(64 * 1024, 8 * 1024, 64 * 1024).unwrap(),
+            )),
+            flake_provision: Some(VmHttpFlakeProvisionService::new(
+                Arc::clone(&state),
+                VmHttpFlakeProvisionConfig::new(
+                    crate::flake_provision_from_mirror::MirrorFlakeProvisionConfig::new(
+                        git_program,
+                        crate::flake_fixtures::fake_nix_archiving(temp.path()),
+                        temp.path().join("materialize"),
+                        temp.path().join("flake-input-cache"),
+                        crate::flake_lock::FlakeProvisionBounds::new(
+                            64,
+                            1 << 30,
+                            std::time::Duration::from_secs(120),
+                        )
+                        .unwrap(),
+                        std::time::Duration::from_secs(120),
+                    ),
+                    mirror_cache,
+                ),
+            )),
+        };
+
+        for route in BrokeredRoute::ALL_NAMES {
+            let (request_table, outcome_table, join_column) = audit_pair_for(route);
+            // Non-vacuity is measured on the *outcome* table, uniformly: it is
+            // the half every drive must add. (A two-phase route adds both rows;
+            // an outcome-only route's request row was written by an earlier
+            // lifecycle event — the agent run's launch — so counting request
+            // rows would report no progress for it.)
+            let before = state.audit.table_row_count_for_test(outcome_table);
+
+            let (request, body) = drive_for(route, &repo, &rev, run_id);
+            let dispatch = super::super::resolve_and_route_authenticated_vm_http_request(
+                &session,
+                &request,
+                body,
+                services.clone(),
+            )
+            .await;
+            // Drop any streaming body so a `Drop`-time outcome write lands
+            // before the assertions below.
+            drop(dispatch);
+
+            assert!(
+                state.audit.table_row_count_for_test(outcome_table) > before,
+                "driving `{route}` recorded no `{outcome_table}` row — the drive did not reach \
+                 the effect, so the pair assertion below would pass vacuously",
+            );
+            assert!(
+                state.audit.table_row_count_for_test(request_table) > 0,
+                "`{route}` recorded an outcome with no `{request_table}` row behind it",
+            );
+            state.audit.assert_effect_audit_pairs_complete(
+                request_table,
+                outcome_table,
+                join_column,
+            );
+        }
+    }
+
+    /// The request that exercises each route's audited effect. Every brokered
+    /// route must appear; the panic is what a new capability trips.
+    fn drive_for(
+        route: &str,
+        repo: &RepoRef,
+        rev: &crate::vm_git_mirror_cache::GitCommitSha,
+        run_id: AgentRunId,
+    ) -> (VmHttpRequest, Vec<u8>) {
+        let post = |target: &str, body: Vec<u8>| {
+            (
+                VmHttpRequest::new(
+                    "POST",
+                    target,
+                    Some(bearer(token().as_str())),
+                    SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 34567)),
+                ),
+                body,
+            )
+        };
+        match route {
+            "ClaudeProxy" => post("/v1/messages", b"{}".to_vec()),
+            "OpenAiProxy" => post("/v1/responses", b"{}".to_vec()),
+            "NixCache" => (
+                VmHttpRequest::new(
+                    "GET",
+                    "/v1/nix/cache/nix-cache-info",
+                    Some(basic(&super::basic_authorization_value(
+                        &session_for_subnet(Ipv4Cidr::new(Ipv4Addr::LOCALHOST, 32).unwrap()),
+                    ))),
+                    SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 34567)),
+                ),
+                Vec::new(),
+            ),
+            "GitPush" => {
+                let metadata = VmGitPushMetadata::new(
+                    GitCloneRepo::new(repo.clone()).unwrap(),
+                    GitBranchName::new("feature").unwrap(),
+                    None,
+                    GitObjectId::new("a".repeat(40)).unwrap(),
+                );
+                let body = encode_vm_git_push_request_body(
+                    &VmGitPushRequest::new(metadata, b"bundle-bytes".to_vec()).unwrap(),
+                )
+                .unwrap();
+                post(VM_GIT_PUSH_PATH, body)
+            }
+            "FlakeProvision" => post(
+                VM_FLAKE_PROVISION_PATH,
+                serde_json::to_vec(&VmFlakeProvisionRequest::new(
+                    GitCloneRepo::new(repo.clone()).unwrap(),
+                    rev.as_str().parse().unwrap(),
+                ))
+                .unwrap(),
+            ),
+            "AgentRunOutcome" => {
+                let empty = AgentRunStreamUpload {
+                    byte_len: 0,
+                    sha256_hex: crate::agent_run::sha256_hex(b""),
+                    truncated: false,
+                    retained_sha256_hex: crate::agent_run::sha256_hex(b""),
+                    retained_base64: base64::engine::general_purpose::STANDARD.encode(b""),
+                };
+                post(
+                    &vm_agent_run_outcome_path(run_id),
+                    serde_json::to_vec(&VmAgentRunOutcomeUpload {
+                        run_id,
+                        status: crate::agent_run::AgentRunTerminalStatus::Succeeded,
+                        exit_code: 0,
+                        stdout: empty.clone(),
+                        stderr: empty,
+                    })
+                    .unwrap(),
+                )
+            }
+            other => panic!(
+                "brokered route `{other}` is not driven by the audit-pair oracle: add a request \
+                 that exercises its effect, or the route escapes the invariant check",
+            ),
+        }
+    }
 }

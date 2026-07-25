@@ -13,39 +13,35 @@ mod git_push;
 mod nix_cache;
 mod openai_proxy;
 mod proxy_common;
+mod route_table;
 
 pub use agent_runs::VmHttpAgentRunService;
-use agent_runs::{
-    parse_agent_run_config_target, parse_agent_run_outcome_target, route_agent_run_config_request,
-    route_agent_run_outcome_request,
-};
+use agent_runs::{route_agent_run_config_request, route_agent_run_outcome_request};
 use broker_effect::broker_effect;
 use claude_proxy::VmHttpClaudeProxyService;
 pub use claude_proxy::{
     DEFAULT_CLAUDE_ANTHROPIC_VERSION, VmHttpClaudeProxyAuthKind, VmHttpClaudeProxyConfig,
     VmHttpClaudeProxyConfigError,
 };
+use flake_provision::route_flake_provision_request;
 pub use flake_provision::{VmHttpFlakeProvisionConfig, VmHttpFlakeProvisionService};
-use flake_provision::{is_flake_provision_target, route_flake_provision_request};
+use git_clone::route_git_clone_request;
 pub use git_clone::{VmHttpGitCloneConfig, VmHttpGitCloneService};
-use git_clone::{is_git_clone_target, route_git_clone_request};
 pub use git_push::VmHttpGitPushService;
-use git_push::{is_git_push_target, route_git_push_request};
+use git_push::route_git_push_request;
+use nix_cache::route_nix_cache_request;
 #[cfg(test)]
 use nix_cache::route_nix_cache_request_without_upstream;
 pub use nix_cache::{
     VM_NIX_BASIC_LOGIN, VM_NIX_CACHE_PATH_PREFIX, VM_NIX_PREWARM_PATH_PREFIX, VmHttpNixCacheConfig,
     VmHttpNixCacheConfigError, VmHttpNixCacheService,
 };
-use nix_cache::{is_nix_cache_target, record_nix_cache_local_response, route_nix_cache_request};
 use openai_proxy::VmHttpOpenAiProxyService;
 pub use openai_proxy::{
     VmHttpOpenAiProxyAuthKind, VmHttpOpenAiProxyConfig, VmHttpOpenAiProxyConfigError,
 };
-use proxy_common::{
-    ClaudeBackend, OpenAiBackend, ProxyBackend, ProxyEffect, ProxyStream,
-    record_proxy_local_response,
-};
+use proxy_common::{ClaudeBackend, OpenAiBackend, ProxyEffect, ProxyStream};
+use route_table::{BrokeredRoute, PlainRoute, VmHttpRoute};
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -64,7 +60,6 @@ use tokio::sync::watch;
 use tokio::task::JoinSet;
 use tracing::Instrument;
 
-use crate::audit::{NixCacheAuditDecision, ProxyAuditDecision};
 use crate::bearer::is_bearer_token_byte;
 use crate::core::{BrokerPort, BrokerPortRange, Ipv4Cidr, SessionId};
 use crate::secret::SecretStore;
@@ -894,7 +889,11 @@ pub fn authorize_vm_http_request(
     session: &VmHttpSession,
     request: &VmHttpRequest,
 ) -> VmHttpAuthorization {
-    authorize_vm_http_request_with_scheme(session, request, auth_scheme_for_target(&request.target))
+    authorize_vm_http_request_with_scheme(
+        session,
+        request,
+        VmHttpRoute::resolve(request).auth_scheme(),
+    )
 }
 
 fn authorize_vm_http_request_with_scheme(
@@ -950,14 +949,6 @@ fn basic_authorization_value(session: &VmHttpSession) -> String {
     use base64::Engine as _;
     let credentials = format!("{VM_NIX_BASIC_LOGIN}:{}", session.bearer_token.as_str());
     base64::engine::general_purpose::STANDARD.encode(credentials.as_bytes())
-}
-
-fn auth_scheme_for_target(target: &str) -> VmHttpAuthScheme {
-    if is_nix_cache_target(target) {
-        VmHttpAuthScheme::Basic
-    } else {
-        VmHttpAuthScheme::Bearer
-    }
 }
 
 async fn handle_vm_http_connection<S: SecretStore + Send + Sync + 'static>(
@@ -1042,14 +1033,34 @@ fn dispatch_vm_http_head(
             value: value.to_string(),
         });
     }
-    let auth_scheme = auth_scheme_for_target(&request.target);
+    let route = VmHttpRoute::resolve(&request);
+    let auth_scheme = route.auth_scheme();
     match authorize_vm_http_request_with_scheme(session, &request, auth_scheme) {
-        VmHttpAuthorization::Allow if is_nix_cache_target(&request.target) => {
+        VmHttpAuthorization::Allow
+            if matches!(route, VmHttpRoute::Brokered(BrokeredRoute::NixCache)) =>
+        {
             route_nix_cache_request_without_upstream(&request)
         }
         VmHttpAuthorization::Allow => route_session_endpoint(session, &request),
         VmHttpAuthorization::Deny(err) => auth_error_response(auth_scheme, err),
     }
+}
+
+/// Resolve and dispatch in one step. The production path resolves *before*
+/// authentication (see [`serve_vm_http_request`]), so the two are separate
+/// there; tests that only exercise the authenticated dispatch use this.
+#[cfg(test)]
+async fn resolve_and_route_authenticated_vm_http_request<S>(
+    session: &VmHttpSession,
+    request: &VmHttpRequest,
+    body: Vec<u8>,
+    services: VmHttpServices<S>,
+) -> VmHttpDispatch
+where
+    S: SecretStore + Send + Sync + 'static,
+{
+    let route = VmHttpRoute::resolve(request);
+    route_authenticated_vm_http_request(&route, session, request, body, services).await
 }
 
 #[cfg(test)]
@@ -1148,11 +1159,15 @@ where
             return response.into_hyper_response();
         }
     };
-    let auth_scheme = auth_scheme_for_target(&request.target);
+    // Classify once, before authentication: the same route decides the auth
+    // scheme, the body limit, how a denial is recorded, and who handles the
+    // request. The four used to re-derive it from the target independently.
+    let route = VmHttpRoute::resolve(&request);
+    let auth_scheme = route.auth_scheme();
     let dispatch: VmHttpDispatch =
         match authorize_vm_http_request_with_scheme(session, &request, auth_scheme) {
             VmHttpAuthorization::Allow => {
-                let body_bytes = match route_request_body_limit(&request, &services) {
+                let body_bytes = match route.body_limit(&request, &services) {
                     None => Vec::new(),
                     Some(max) => {
                         match read_request_body_with_limit(body, max, read_timeout).await {
@@ -1169,55 +1184,12 @@ where
                         }
                     }
                 };
-                route_authenticated_vm_http_request(session, &request, body_bytes, services).await
+                route_authenticated_vm_http_request(&route, session, &request, body_bytes, services)
+                    .await
             }
             VmHttpAuthorization::Deny(err) => {
                 let response = auth_error_response(auth_scheme, err);
-                if is_nix_cache_target(&request.target) {
-                    record_nix_cache_local_response(
-                        services.nix_cache.as_ref(),
-                        session,
-                        &request,
-                        NixCacheAuditDecision::Deny {
-                            reason: vm_http_auth_error_reason(err).to_string(),
-                        },
-                        response,
-                        None,
-                    )
-                    .into()
-                } else if let Some(route) = ClaudeBackend::classify_proxy_target(&request.target)
-                    && let Some(service) = services.claude_proxy.as_ref()
-                {
-                    record_proxy_local_response::<ClaudeBackend, _>(
-                        service,
-                        session,
-                        &request,
-                        route,
-                        ProxyAuditDecision::Deny {
-                            reason: vm_http_auth_error_reason(err).to_string(),
-                        },
-                        response,
-                        None,
-                    )
-                    .into()
-                } else if let Some(route) = OpenAiBackend::classify_proxy_target(&request.target)
-                    && let Some(service) = services.openai_proxy.as_ref()
-                {
-                    record_proxy_local_response::<OpenAiBackend, _>(
-                        service,
-                        session,
-                        &request,
-                        route,
-                        ProxyAuditDecision::Deny {
-                            reason: vm_http_auth_error_reason(err).to_string(),
-                        },
-                        response,
-                        None,
-                    )
-                    .into()
-                } else {
-                    response.into()
-                }
+                route.record_auth_denial(&services, session, &request, err, response)
             }
         };
     log_vm_http_request(
@@ -1300,56 +1272,15 @@ fn auth_error_response(scheme: VmHttpAuthScheme, err: VmHttpAuthError) -> VmHttp
     }
 }
 
-/// The maximum request body bytes a route is prepared to consume; `None`
-/// means the route does not read its body, and any declared body should be
-/// left in the connection.
-fn route_request_body_limit<S: SecretStore + Send + Sync + 'static>(
-    request: &VmHttpRequest,
-    services: &VmHttpServices<S>,
-) -> Option<usize> {
-    if is_nix_cache_target(&request.target) {
-        return None;
-    }
-    if ClaudeBackend::is_proxy_target(&request.target) {
-        return services
-            .claude_proxy
-            .as_ref()
-            .map(|service| service.config.max_request_bytes());
-    }
-    if OpenAiBackend::is_proxy_target(&request.target) {
-        return services
-            .openai_proxy
-            .as_ref()
-            .map(|service| service.config.max_request_bytes());
-    }
-    if is_git_clone_target(&request.target)
-        && request.method == "POST"
-        && services.git_clone.is_some()
-    {
-        return Some(MAX_VM_HTTP_BODY_BYTES);
-    }
-    if is_git_push_target(&request.target) && request.method == "POST" {
-        return services
-            .git_push
-            .as_ref()
-            .map(|service| service.body_limits().max_body_bytes());
-    }
-    if is_flake_provision_target(&request.target)
-        && request.method == "POST"
-        && services.flake_provision.is_some()
-    {
-        return Some(MAX_VM_HTTP_BODY_BYTES);
-    }
-    if parse_agent_run_outcome_target(&request.target).is_some()
-        && request.method == "POST"
-        && services.agent_runs.is_some()
-    {
-        return Some(MAX_VM_HTTP_AGENT_RUN_OUTCOME_BODY_BYTES);
-    }
-    None
-}
-
+/// Dispatch an authenticated request to its resolved route.
+///
+/// The `match` is exhaustive over [`VmHttpRoute`], so a new route is a compile
+/// error until it is handled here — and a `Brokered` arm can only reach its
+/// effect's IO by handing the effect to `broker_effect`, which owns the audit
+/// pair. That is what makes "every effect is audited" a property of the routing
+/// table rather than of each handler remembering.
 async fn route_authenticated_vm_http_request<S>(
+    route: &VmHttpRoute,
     session: &VmHttpSession,
     request: &VmHttpRequest,
     body: Vec<u8>,
@@ -1358,73 +1289,79 @@ async fn route_authenticated_vm_http_request<S>(
 where
     S: SecretStore + Send + Sync + 'static,
 {
-    if is_nix_cache_target(&request.target) {
-        return route_nix_cache_request(session, request, services.nix_cache).await;
-    }
-
-    if ClaudeBackend::is_proxy_target(&request.target) {
-        let Some(service) = services.claude_proxy else {
-            return VmHttpResponse::text(VmHttpStatus::NotFound, "not found").into();
-        };
-        let effect = ProxyEffect::<ClaudeBackend, _>::classify(&service, session, request, body);
-        return broker_effect(service.audit(), effect).await;
-    }
-
-    if OpenAiBackend::is_proxy_target(&request.target) {
-        let Some(service) = services.openai_proxy else {
-            return VmHttpResponse::text(VmHttpStatus::NotFound, "not found").into();
-        };
-        let effect = ProxyEffect::<OpenAiBackend, _>::classify(&service, session, request, body);
-        return broker_effect(service.audit(), effect).await;
-    }
-
-    if is_git_clone_target(&request.target) {
-        let Some(service) = services.git_clone else {
-            return VmHttpResponse::text(VmHttpStatus::NotFound, "not found").into();
-        };
-        return route_git_clone_request(session, request, body, service)
-            .await
-            .into();
-    }
-
-    if is_git_push_target(&request.target) {
-        let Some(service) = services.git_push else {
-            return VmHttpResponse::text(VmHttpStatus::NotFound, "not found").into();
-        };
-        return route_git_push_request(session, request, body, service).await;
-    }
-
-    if is_flake_provision_target(&request.target) {
-        let Some(service) = services.flake_provision else {
-            return VmHttpResponse::text(VmHttpStatus::NotFound, "not found").into();
-        };
-        return route_flake_provision_request(session, request, body, service).await;
-    }
-
-    if let Some(run_id) = parse_agent_run_config_target(&request.target) {
-        let Some(service) = services.agent_runs else {
-            return VmHttpResponse::text(VmHttpStatus::NotFound, "not found").into();
-        };
-        if request.method != "GET" {
-            return VmHttpResponse::text(VmHttpStatus::MethodNotAllowed, "method not allowed")
-                .into();
+    match route {
+        VmHttpRoute::Brokered(BrokeredRoute::NixCache) => {
+            // The cache serve grants nothing, so its pair is written in one
+            // commit by the handler's `record_effect_coalesced` rather than
+            // through the two-phase driver.
+            route_nix_cache_request(session, request, services.nix_cache).await
         }
-        return route_agent_run_config_request(run_id, &service).into();
-    }
-
-    if let Some(run_id) = parse_agent_run_outcome_target(&request.target) {
-        let Some(service) = services.agent_runs else {
-            return VmHttpResponse::text(VmHttpStatus::NotFound, "not found").into();
-        };
-        if request.method != "POST" {
-            return VmHttpResponse::text(VmHttpStatus::MethodNotAllowed, "method not allowed")
-                .into();
+        VmHttpRoute::Brokered(BrokeredRoute::ClaudeProxy) => {
+            let Some(service) = services.claude_proxy else {
+                return not_found();
+            };
+            let effect =
+                ProxyEffect::<ClaudeBackend, _>::classify(&service, session, request, body);
+            broker_effect(service.audit(), effect).await
         }
-        return route_agent_run_outcome_request(run_id, session.session_id(), &body, &service)
-            .await;
+        VmHttpRoute::Brokered(BrokeredRoute::OpenAiProxy) => {
+            let Some(service) = services.openai_proxy else {
+                return not_found();
+            };
+            let effect =
+                ProxyEffect::<OpenAiBackend, _>::classify(&service, session, request, body);
+            broker_effect(service.audit(), effect).await
+        }
+        VmHttpRoute::Brokered(BrokeredRoute::GitPush) => {
+            let Some(service) = services.git_push else {
+                return not_found();
+            };
+            route_git_push_request(session, request, body, service).await
+        }
+        VmHttpRoute::Brokered(BrokeredRoute::FlakeProvision) => {
+            let Some(service) = services.flake_provision else {
+                return not_found();
+            };
+            route_flake_provision_request(session, request, body, service).await
+        }
+        VmHttpRoute::Brokered(BrokeredRoute::AgentRunOutcome(run_id)) => {
+            let Some(service) = services.agent_runs else {
+                return not_found();
+            };
+            if request.method != "POST" {
+                return method_not_allowed();
+            }
+            route_agent_run_outcome_request(*run_id, session.session_id(), &body, &service).await
+        }
+        VmHttpRoute::Plain(PlainRoute::GitClone) => {
+            let Some(service) = services.git_clone else {
+                return not_found();
+            };
+            route_git_clone_request(session, request, body, service)
+                .await
+                .into()
+        }
+        VmHttpRoute::Plain(PlainRoute::AgentRunConfig(run_id)) => {
+            let Some(service) = services.agent_runs else {
+                return not_found();
+            };
+            if request.method != "GET" {
+                return method_not_allowed();
+            }
+            route_agent_run_config_request(*run_id, &service).into()
+        }
+        VmHttpRoute::Plain(PlainRoute::Session | PlainRoute::Unmatched) => {
+            route_session_endpoint(session, request).into()
+        }
     }
+}
 
-    route_session_endpoint(session, request).into()
+fn not_found() -> VmHttpDispatch {
+    VmHttpResponse::text(VmHttpStatus::NotFound, "not found").into()
+}
+
+fn method_not_allowed() -> VmHttpDispatch {
+    VmHttpResponse::text(VmHttpStatus::MethodNotAllowed, "method not allowed").into()
 }
 
 fn vm_http_auth_error_reason(err: VmHttpAuthError) -> &'static str {

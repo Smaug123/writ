@@ -407,7 +407,7 @@ mod tests {
     };
     use super::super::{
         VM_HTTP_READ_TIMEOUT, VmHttpRequest, VmHttpServices, VmHttpStatus,
-        dispatch_vm_http_head_and_body, route_authenticated_vm_http_request,
+        dispatch_vm_http_head_and_body, resolve_and_route_authenticated_vm_http_request,
     };
     use super::*;
     use crate::audit::GitPushOutcomeResult;
@@ -486,10 +486,14 @@ mod tests {
                 Some(bearer(token().as_str())),
                 peer,
             );
-            let response =
-                route_authenticated_vm_http_request(&session, &request, Vec::new(), no_services())
-                    .await
-                    .into_buffered();
+            let response = resolve_and_route_authenticated_vm_http_request(
+                &session,
+                &request,
+                Vec::new(),
+                no_services(),
+            )
+            .await
+            .into_buffered();
 
             assert_eq!(response.status, VmHttpStatus::NotFound);
         }
@@ -509,7 +513,7 @@ mod tests {
             SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 12345)),
         );
 
-        let response = route_authenticated_vm_http_request(
+        let response = resolve_and_route_authenticated_vm_http_request(
             &session,
             &request,
             Vec::new(),

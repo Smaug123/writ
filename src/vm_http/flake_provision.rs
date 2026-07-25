@@ -494,7 +494,9 @@ mod tests {
         bearer, make_broker_state, open_audit_session, record_contents_read_grant,
         session_for_subnet, token,
     };
-    use super::super::{VmHttpRequest, VmHttpServices, route_authenticated_vm_http_request};
+    use super::super::{
+        VmHttpRequest, VmHttpServices, resolve_and_route_authenticated_vm_http_request,
+    };
     use super::*;
     use crate::audit::FlakeProvisionAuditOutcome;
     use crate::core::{Ipv4Cidr, RepoRef, UnixMillis};
@@ -742,7 +744,7 @@ mod tests {
             SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 12345)),
         );
 
-        let response = route_authenticated_vm_http_request(
+        let response = resolve_and_route_authenticated_vm_http_request(
             &session,
             &request,
             Vec::new(),
