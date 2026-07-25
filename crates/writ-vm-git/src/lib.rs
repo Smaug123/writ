@@ -68,6 +68,52 @@ pub struct VmHttpContract {
     pub version: u32,
 }
 
+/// Header through which `writ-vm` declares [`VM_HTTP_CONTRACT_VERSION`] on every
+/// request it originates.
+///
+/// The `GET /v1/session` handshake only lets the *guest* detect a skew, so it
+/// protects a guest that has the check — not a guest image built before it,
+/// which is the stale side the handshake exists for. This header is the other
+/// direction: it lets the broker refuse a guest whose contract differs, before
+/// any effect runs.
+///
+/// It cannot be demanded of every request, because most guest traffic is not
+/// ours: Claude Code, codex, and `nix` speak to the proxies and the binary cache
+/// and will never send a writ header. So the broker requires it only on the
+/// routes `writ-vm` itself originates — see [`WRIT_VM_ORIGINATED_TARGETS`].
+///
+/// No `x-` prefix, per RFC 6648.
+pub const VM_HTTP_CONTRACT_HEADER: &str = "writ-contract-version";
+
+/// Every guest-facing `(method, target)` that `writ-vm` itself requests.
+///
+/// This is the boundary between "ours" and "a third-party client's" traffic, and
+/// it lives here — in the crate both the guest client and the host broker depend
+/// on — because both sides must agree on it. The guest asserts it sends
+/// [`VM_HTTP_CONTRACT_HEADER`] on exactly these; the host asserts these are
+/// exactly the routes it requires the header on. Nobody checked that the guest's
+/// idea of what it originates matched the host's idea of what it serves before,
+/// which is how the proxy namespaces drifted in the first place.
+///
+/// The agent-run targets carry a sample id: the route is templated, and a fixed
+/// sample keeps this a table of literals that both sides can resolve. The guest
+/// test drives its client calls with this very id, so a change to
+/// `vm_agent_run_config_path`'s shape moves the observed target and fails there.
+pub const WRIT_VM_ORIGINATED_TARGETS: &[(&str, &str)] = &[
+    ("GET", VM_SESSION_PATH),
+    ("POST", VM_GIT_CLONE_PATH),
+    ("POST", VM_GIT_PUSH_PATH),
+    ("POST", VM_FLAKE_PROVISION_PATH),
+    (
+        "GET",
+        "/v1/agent-runs/00000000-0000-0000-0000-000000000501/config",
+    ),
+    (
+        "POST",
+        "/v1/agent-runs/00000000-0000-0000-0000-000000000501/outcome",
+    ),
+];
+
 /// Base path of the guest-facing Anthropic proxy. Each model vendor gets its
 /// own namespace because `/v1/models` is a real endpoint of *both* vendor APIs:
 /// sharing one namespace made the two backends' classifications overlap, so
@@ -110,6 +156,7 @@ fn join_broker_path(broker_url: &str, path: &str) -> String {
     format!("{}{}", broker_url.trim_end_matches('/'), path)
 }
 
+pub const VM_SESSION_PATH: &str = "/v1/session";
 pub const VM_GIT_CLONE_PATH: &str = "/v1/git/clone";
 pub const VM_GIT_PUSH_PATH: &str = "/v1/git/push";
 pub const VM_FLAKE_PROVISION_PATH: &str = "/v1/nix/flake/provision";
