@@ -116,8 +116,10 @@ Inside the VM, `writ-vm` runs:
 claude --bare --print --model haiku --effort low --output-format text --no-session-persistence --tools ""
 ```
 
-with the prompt on stdin. Claude is pointed at the VM HTTP broker with
-`ANTHROPIC_BASE_URL`, and uses the per-session VM bearer token as its
+with the prompt on stdin. Claude is pointed at the VM HTTP broker's Anthropic
+namespace (`ANTHROPIC_BASE_URL=<broker>/anthropic`; codex is likewise pointed at
+`<broker>/openai/v1`, so the two vendors' identically-named endpoints such as
+`/v1/models` cannot collide), and uses the per-session VM bearer token as its
 sandbox-local auth token. The broker accepts that token, strips it from the
 upstream request, and adds the host-side Anthropic credential before forwarding
 to the configured Claude API endpoint. The Anthropic credential is not copied

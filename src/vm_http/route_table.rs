@@ -577,6 +577,51 @@ mod tests {
         }
     }
 
+    /// **The guest's configuration and the host's routing must agree.**
+    ///
+    /// `writ-vm` points each agent at a base URL; its SDK then appends its own
+    /// well-known suffixes. This takes the very base URLs the guest is
+    /// configured with, appends what each vendor's SDK appends, and asserts the
+    /// *host's* route table sends the result to that vendor's proxy.
+    ///
+    /// Nothing checked this before, which is how the namespaces drifted in the
+    /// first place: the guest asked for `/v1/models` and the host answered from
+    /// whichever proxy it classified first.
+    #[test]
+    fn the_guests_configured_base_urls_route_to_their_own_vendor() {
+        const BROKER: &str = "http://192.168.252.1:49152/";
+
+        // Claude Code appends `/v1/...` to ANTHROPIC_BASE_URL.
+        let anthropic = writ_vm_git::anthropic_proxy_base_url(BROKER);
+        for suffix in ["/v1/messages", "/v1/messages/count_tokens", "/v1/models"] {
+            let target = path_of(&format!("{anthropic}{suffix}"));
+            assert_eq!(
+                VmHttpRoute::resolve(&request("POST", &target)),
+                VmHttpRoute::Brokered(BrokeredRoute::ClaudeProxy),
+                "{target}",
+            );
+        }
+
+        // codex's base_url already carries `/v1`; it appends bare names.
+        let openai = writ_vm_git::openai_proxy_base_url(BROKER);
+        for suffix in ["/responses", "/models"] {
+            let target = path_of(&format!("{openai}{suffix}"));
+            assert_eq!(
+                VmHttpRoute::resolve(&request("POST", &target)),
+                VmHttpRoute::Brokered(BrokeredRoute::OpenAiProxy),
+                "{target}",
+            );
+        }
+    }
+
+    /// The path a guest actually puts on the wire for an absolute URL.
+    fn path_of(url: &str) -> String {
+        reqwest::Url::parse(url)
+            .expect("the guest's base URL joins to a valid URL")
+            .path()
+            .to_string()
+    }
+
     #[test]
     fn an_unknown_target_is_unmatched() {
         assert_eq!(
