@@ -147,7 +147,10 @@ fn run_invocation_is_dual_homed_with_mounts_and_broker_command() {
 /// below asserts the row at index `VM_HTTP_CONTRACT_VERSION - 1` describes the
 /// live surface, that the history has exactly that many rows, and that the
 /// recorded broker protocol versions strictly increase — so appending a row
-/// forces `BROKER_PROTOCOL_VERSION` up too. Both matter, because one contract
+/// forces `BROKER_PROTOCOL_VERSION` up too. The recorded value is the *minimum*
+/// protocol that introduced that guest contract, so the broker protocol stays
+/// free to advance on its own (a new CLI flag, a ready-doc field) without
+/// dragging a guest-image rebuild along. Both matter, because one contract
 /// gates two independently-rebuildable images: without the second, a route move
 /// could bump only the guest constant and leave a stale *broker* image
 /// advertising an unchanged protocol and serving the old routes.
@@ -173,7 +176,7 @@ const GUEST_CONTRACT_HISTORY: &[GuestContractRow] = &[
     GuestContractRow {
         // v2 — vendor namespaces (`/anthropic/v1/*`, `/openai/v1/*`), plus
         // `/v1/session` reporting the contract version.
-        route_digest: "1d9660853cccc4397d1ec7d22cb1c5331a1b9707615d01ca677d7f351d5621e1",
+        route_digest: "ce7eb360ccd1ae46dd3e55f6a2879544c4fff17e863fea5093a997cd63693d39",
         broker_protocol_version: 4,
     },
 ];
@@ -183,13 +186,76 @@ struct GuestContractRow {
     broker_protocol_version: u32,
 }
 
+/// A deterministic corpus of targets, swept through the *implemented* classifier.
+///
+/// Hashing `ENDPOINT_MAP`'s text would only pin the sample someone wrote down;
+/// this pins how `VmHttpRoute::resolve` actually behaves — so a changed prefix, a
+/// changed precedence between the two proxy backends, or a retired path all move
+/// the digest even though the map is untouched.
+///
+/// **Residual, stated plainly**: the path space is infinite, so this samples it.
+/// A brand-new endpoint under an *existing* route variant (say a new
+/// `/anthropic/v1/…` path) only moves the digest once its segments are in the
+/// corpus below or in `ENDPOINT_MAP` — adding it there is the author's job, and
+/// what `ENDPOINT_MAP`'s own doc asks for. A new route *variant* is caught
+/// independently, by the route table's coverage oracle.
 fn guest_route_digest() -> String {
-    let routes: Vec<String> = crate::vm_http::route_table::tests::ENDPOINT_MAP
-        .iter()
-        .map(|(method, target, _)| format!("{method} {target}"))
-        .collect();
-    writ_agent_run::sha256_hex(routes.join("\n").as_bytes())
+    let mut lines: Vec<String> = Vec::new();
+    for (method, target, _) in crate::vm_http::route_table::tests::ENDPOINT_MAP {
+        lines.push(resolved_line(method, target));
+    }
+    for target in ROUTE_DIGEST_CORPUS {
+        for method in ["GET", "POST", "PUT", "HEAD"] {
+            lines.push(resolved_line(method, target));
+        }
+    }
+    lines.sort();
+    lines.dedup();
+    writ_agent_run::sha256_hex(lines.join("\n").as_bytes())
 }
+
+fn resolved_line(method: &str, target: &str) -> String {
+    let request = crate::vm_http::VmHttpRequest::new(
+        method,
+        target,
+        None,
+        std::net::SocketAddr::from(([127, 0, 0, 1], 12345)),
+    );
+    let route = crate::vm_http::route_table::VmHttpRoute::resolve(&request);
+    format!("{method} {target} -> {route:?}")
+}
+
+/// Targets swept through the classifier, chosen to pin the edges that have
+/// actually bitten: the two proxies' overlapping shapes, the retired pre-split
+/// paths, writ's own `/v1/*` API, and near-misses that must *not* be absorbed.
+const ROUTE_DIGEST_CORPUS: &[&str] = &[
+    "/",
+    "/v1/session",
+    "/v1/messages",
+    "/v1/messages/count_tokens",
+    "/v1/responses",
+    "/v1/models",
+    "/v1/models/gpt-5",
+    "/anthropic/v1/messages",
+    "/anthropic/v1/messages/count_tokens",
+    "/anthropic/v1/models",
+    "/anthropic/v1/models/claude-opus-4-1",
+    "/anthropic/v1/responses",
+    "/openai/v1/responses",
+    "/openai/v1/responses/resp_123/cancel",
+    "/openai/v1/models",
+    "/openai/v1/models/gpt-5",
+    "/openai/v1/messages",
+    "/v1/git/clone",
+    "/v1/git/push",
+    "/v1/git/pushed",
+    "/v1/nix/cache/nix-cache-info",
+    "/v1/nix/prewarm/nix-cache-info",
+    "/v1/nix/flake/provision",
+    "/v1/agent-runs/00000000-0000-0000-0000-000000000001/config",
+    "/v1/agent-runs/00000000-0000-0000-0000-000000000001/outcome",
+    "/v1/not-a-route",
+];
 
 /// CI pin for the guest/broker contract. It combines the broker CLI flag names
 /// the host passes, the on-disk schema of the ready document, and the
@@ -267,12 +333,17 @@ fn broker_contract_fingerprint_is_pinned() {
          guests refuse a stale broker) AND bump BROKER_PROTOCOL_VERSION (so the host refuses a \
          stale broker image), then rebuild both images.",
     );
-    assert_eq!(
-        current.broker_protocol_version,
-        crate::broker_protocol::BROKER_PROTOCOL_VERSION,
-        "this guest contract version shipped with broker protocol {}, but the compiled \
-         BROKER_PROTOCOL_VERSION is {}: a guest-contract change must move the broker protocol \
-         too, or a stale broker image is accepted while serving the old contract",
+    // The recorded value is the *minimum* broker protocol that introduced this
+    // guest contract, not an equality: the host↔broker contract evolves on its
+    // own too (a new broker CLI flag, a ready-doc field), and forcing those to
+    // drag a guest-image rebuild along would be gratuitous. The bump is still
+    // compelled where it matters — appending a row demands a protocol strictly
+    // greater than the previous row's (below), which cannot be satisfied without
+    // moving the constant.
+    assert!(
+        crate::broker_protocol::BROKER_PROTOCOL_VERSION >= current.broker_protocol_version,
+        "guest contract v{version} was introduced at broker protocol {}, but the compiled \
+         BROKER_PROTOCOL_VERSION is {}: the broker protocol must never go backwards",
         current.broker_protocol_version,
         crate::broker_protocol::BROKER_PROTOCOL_VERSION,
     );

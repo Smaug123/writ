@@ -85,7 +85,7 @@ macro_rules! route_enum {
 
 /// How a guest request is handled, resolved once from its target.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) enum VmHttpRoute {
+pub(crate) enum VmHttpRoute {
     /// Records a `(request, outcome)` audit pair through the `broker_effect`
     /// driver. Its effect's IO is unreachable except through that driver.
     Brokered(BrokeredRoute),
@@ -98,7 +98,7 @@ route_enum! {
     /// An audited effect route. Each variant's handler does one thing: build the
     /// effect and hand it to `broker_effect`.
     #[derive(Clone, Debug, Eq, PartialEq)]
-    pub(super) enum BrokeredRoute {
+    pub(crate) enum BrokeredRoute {
         /// `/v1/messages`, `/v1/messages/count_tokens`, `/v1/models/*`.
         ClaudeProxy,
         /// `/v1/responses`, `/v1/responses/{id}/cancel`. (Its models routes are
@@ -121,7 +121,7 @@ route_enum! {
     /// A route that records no audit pair. Adding one is a deliberate, reviewed
     /// act — hence the closed enum and the per-variant justification.
     #[derive(Clone, Debug, Eq, PartialEq)]
-    pub(super) enum PlainRoute {
+    pub(crate) enum PlainRoute {
         /// `GET /v1/session`: reports the session's own id. Grants nothing,
         /// reaches nothing, has no `(request, outcome)` pair to record.
         Session,
@@ -159,7 +159,7 @@ impl VmHttpRoute {
     /// rule (the nix cache answers `405` for a write, git-push `404` for a
     /// non-POST), and folding those into resolution would change which status a
     /// wrong-method request gets.
-    pub(super) fn resolve(request: &VmHttpRequest) -> Self {
+    pub(crate) fn resolve(request: &VmHttpRequest) -> Self {
         let target = request.target.as_str();
         // Order mirrors the dispatcher's original if-chain. The prefixes are
         // disjoint, but preserving the order keeps that an observation rather
