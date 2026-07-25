@@ -214,7 +214,7 @@ Unix socket, as `broker.md` describes — but that doc's "add HTTP later"
 prediction has landed as *three* additional transports it never documents: the
 guest-facing `vm_http` HTTP listener (§5.6), the read-only `ui_http` JSON API
 (§5.10), and a broker-in-VM mode (`writd broker`, `broker_entrypoint.rs`) that
-binds a fixed TCP port and negotiates `BROKER_PROTOCOL_VERSION=2` via a
+binds a fixed TCP port and negotiates `BROKER_PROTOCOL_VERSION` via a
 ready-file handshake (§5.5). The staged-push approval subsystem and the
 run-agent orchestration have been split into `server/staged_push.rs` and
 `server/run_agent.rs`; `server.rs` is now ~880 lines of transport, dispatch, and
@@ -420,6 +420,42 @@ writ's alone. The pre-split proxy paths resolve to `PlainRoute::LegacyProxyPath`
 and answer `410 Gone` naming the remedy, so a guest image built before the split
 fails diagnosably rather than looking like an unknown endpoint; that shim is
 temporary (`docs/plans/2026-07-25-proxy-vendor-namespaces.md`).
+
+**Two version handshakes, one fingerprint.** The guest and the broker are built
+from the same tree and only ever meant to ship together, but both run from images
+loaded into the local container store, so a rebuilt host can launch a stale one.
+Each axis has a constant and refuses a mismatch with an actionable "rebuild the
+image":
+
+- **host ↔ broker VM** (`broker_placement = vm`): `BROKER_PROTOCOL_VERSION`
+  (`broker_protocol.rs`), stamped into the broker's ready file and checked by the
+  host at launch.
+- **guest ↔ broker**: `VM_HTTP_CONTRACT_VERSION` (`writ-vm-git`), reported in
+  `GET /v1/session` and checked by `writ-vm` at startup before any real work —
+  `writ-vm session` is exempt, being the diagnostic one needs *during* a
+  mismatch. The guest parses only the `version` field, so a newer broker's extra
+  fields cannot stop an older guest from diagnosing the skew, and the version
+  ordering decides which side is told to rebuild.
+
+  This check is **guest-side**, so it protects only a guest that has it: an image
+  built before the handshake makes no such call and the broker still serves it.
+  Enforcing it broker-side is issue #342, and cannot simply require a header on
+  every request — most guest traffic comes from `nix`, Claude Code, and codex,
+  which will never send one. Only the `writ-vm`-originated routes can carry it.
+
+Both are pinned by one CI test, `broker_contract_fingerprint_is_pinned`
+(`broker_vm/tests.rs`): it snapshots the broker's CLI flags and ready-doc schema,
+and pins a **digest of the guest-facing route surface** — sourced from the route
+table's endpoint map, which the totality oracle already forces to be complete —
+in an append-only `GUEST_ROUTE_DIGEST_HISTORY` indexed by
+`VM_HTTP_CONTRACT_VERSION`. Because the live digest must equal the row *for the
+current version*, and the history must have exactly one row per version, moving a
+path fails until a new row is appended and the version bumped. (A golden test
+cannot make the wrong repair impossible; it can make the right one easy and the
+wrong one — overwriting recorded history — conspicuous in review.) That coverage
+exists because the mechanism was twice not applied: the model-proxy namespaces
+moved every guest URL, and `/v1/session` began reporting a contract version, both
+without a bump. A path change *is* a contract change.
 
 **The route table.** A request is classified **once**, by
 `VmHttpRoute::resolve`, into either `Brokered(BrokeredRoute)` — an effect whose

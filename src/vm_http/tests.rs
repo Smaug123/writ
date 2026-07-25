@@ -720,7 +720,11 @@ fn authenticated_session_route_returns_session_identity() {
     let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
     assert_eq!(body["session_id"], session.session_id().to_string());
     assert_eq!(body["api"], "writ-vm-http");
-    assert_eq!(body["version"], 1);
+    // The compiled contract version, not a literal: this endpoint is how a guest
+    // learns whether its image matches the broker, so what matters is that it
+    // reports the constant the guest compares against. Deliberate bumps are
+    // forced by `broker_contract_fingerprint_is_pinned`, not here.
+    assert_eq!(body["version"], crate::vm_git::VM_HTTP_CONTRACT_VERSION);
 }
 
 #[test]

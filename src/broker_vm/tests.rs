@@ -139,20 +139,152 @@ fn run_invocation_is_dual_homed_with_mounts_and_broker_command() {
     );
 }
 
-/// CI pin for the host↔broker contract. It combines the broker CLI flag names
-/// the host passes, the on-disk schema of the ready document, and **the
-/// guest-facing route surface** the in-VM broker serves. If you change any of
-/// them — add/rename a broker CLI flag, change `BrokerReadyDoc`'s shape (the
-/// exhaustive struct literal below fails to compile on a field addition), or move
-/// a guest-visible path — this test fails. When it does, update the snapshot
-/// **and** bump `BROKER_PROTOCOL_VERSION` (and rebuild the broker image). The
-/// session-spec schema is guarded independently by its own `version` field and
-/// the `broker_session` tests.
+/// One row per guest contract version: the digest of the guest-facing route
+/// surface at that version, and the broker protocol version that shipped with
+/// it.
 ///
-/// The route surface is here because leaving it out let a real defect through:
-/// the model-proxy vendor namespaces changed every guest URL without bumping the
-/// version, so a stale broker VM image would have been accepted as compatible and
-/// then `404`d every model request. A path change is a contract change.
+/// **Append a row on every version bump of either constant; never edit one.**
+/// The test below asserts the row at index `VM_HTTP_CONTRACT_VERSION - 1`
+/// describes the live surface, that the history has exactly that many rows, that
+/// its recorded broker protocol is the one compiled now, and that recorded
+/// protocols strictly increase.
+///
+/// The two constants therefore move together, which is the deliberate choice:
+/// letting the broker protocol advance alone would let a later guest-contract
+/// change *reuse* an already-published protocol value, and a broker image built
+/// before that change — already advertising it — would pass the host handshake
+/// while serving the old guest contract. Lockstep costs an occasional gratuitous
+/// guest-image rebuild; the alternative costs a window in which a stale broker is
+/// accepted. Both matter, because one contract
+/// gates two independently-rebuildable images: without the second, a route move
+/// could bump only the guest constant and leave a stale *broker* image
+/// advertising an unchanged protocol and serving the old routes.
+///
+/// Digests are deliberately **not** required to be distinct across rows: a
+/// contract version can change for reasons that leave the routes untouched — a
+/// response shape, an auth rule — and forbidding a repeat would make the
+/// prescribed bump impossible for exactly those changes.
+///
+/// (A golden test cannot make the wrong repair *impossible* — overwriting a
+/// recorded row still passes. What it can do is make the right repair the easy
+/// one and the wrong one a conspicuous diff: rewritten history, not an updated
+/// snapshot.)
+const GUEST_CONTRACT_HISTORY: &[GuestContractRow] = &[
+    GuestContractRow {
+        // v1 — the pre-split surface, retired by the vendor namespaces. Its
+        // digest was never recorded (the history starts here), so this stands in
+        // for "some surface that is not the current one"; only the *current*
+        // row's digest is ever compared against the live routes.
+        route_digest: "v1-unrecorded-pre-vendor-namespace-surface",
+        broker_protocol_version: 3,
+    },
+    GuestContractRow {
+        // v2 — vendor namespaces (`/anthropic/v1/*`, `/openai/v1/*`), plus
+        // `/v1/session` reporting the contract version.
+        route_digest: "a52713ca476fd0219c1f7a6082ff3cf61e08e829d26e7edc2be199db65bfe759",
+        broker_protocol_version: 4,
+    },
+];
+
+struct GuestContractRow {
+    route_digest: &'static str,
+    broker_protocol_version: u32,
+}
+
+/// A deterministic corpus of targets, swept through the *implemented* classifier.
+///
+/// Hashing `ENDPOINT_MAP`'s text would only pin the sample someone wrote down;
+/// this pins how `VmHttpRoute::resolve` actually behaves — so a changed prefix, a
+/// changed precedence between the two proxy backends, or a retired path all move
+/// the digest even though the map is untouched.
+///
+/// **Residual, stated plainly**: the path space is infinite, so this samples it.
+/// A brand-new endpoint under an *existing* route variant (say a new
+/// `/anthropic/v1/…` path) only moves the digest once its segments are in the
+/// corpus below or in `ENDPOINT_MAP` — adding it there is the author's job, and
+/// what `ENDPOINT_MAP`'s own doc asks for. A new route *variant* is caught
+/// independently, by the route table's coverage oracle.
+fn guest_route_digest() -> String {
+    let mut lines: Vec<String> = Vec::new();
+    for (method, target, _) in crate::vm_http::route_table::tests::ENDPOINT_MAP {
+        lines.push(resolved_line(method, target));
+    }
+    for target in ROUTE_DIGEST_CORPUS {
+        for method in ["GET", "POST", "PUT", "HEAD"] {
+            lines.push(resolved_line(method, target));
+        }
+    }
+    lines.sort();
+    lines.dedup();
+    writ_agent_run::sha256_hex(lines.join("\n").as_bytes())
+}
+
+fn resolved_line(method: &str, target: &str) -> String {
+    let request = crate::vm_http::VmHttpRequest::new(
+        method,
+        target,
+        None,
+        std::net::SocketAddr::from(([127, 0, 0, 1], 12345)),
+    );
+    // A stable identity, not `Debug`: the contract is *which handler serves this
+    // target*, not how the enum is spelled. Renaming a variant or changing an id
+    // type's debug format must not masquerade as a contract change and force two
+    // image rebuilds.
+    let route = crate::vm_http::route_table::VmHttpRoute::resolve(&request);
+    format!("{method} {target} -> {}", route.identity())
+}
+
+/// Targets swept through the classifier, chosen to pin the edges that have
+/// actually bitten: the two proxies' overlapping shapes, the retired pre-split
+/// paths, writ's own `/v1/*` API, and near-misses that must *not* be absorbed.
+const ROUTE_DIGEST_CORPUS: &[&str] = &[
+    "/",
+    "/v1/session",
+    "/v1/messages",
+    "/v1/messages/count_tokens",
+    "/v1/responses",
+    "/v1/models",
+    "/v1/models/gpt-5",
+    "/anthropic/v1/messages",
+    "/anthropic/v1/messages/count_tokens",
+    "/anthropic/v1/models",
+    "/anthropic/v1/models/claude-opus-4-1",
+    "/anthropic/v1/responses",
+    "/openai/v1/responses",
+    "/openai/v1/responses/resp_123/cancel",
+    "/openai/v1/models",
+    "/openai/v1/models/gpt-5",
+    "/openai/v1/messages",
+    "/v1/git/clone",
+    "/v1/git/push",
+    "/v1/git/pushed",
+    "/v1/nix/cache/nix-cache-info",
+    "/v1/nix/prewarm/nix-cache-info",
+    "/v1/nix/flake/provision",
+    "/v1/agent-runs/00000000-0000-0000-0000-000000000001/config",
+    "/v1/agent-runs/00000000-0000-0000-0000-000000000001/outcome",
+    "/v1/not-a-route",
+];
+
+/// CI pin for the guest/broker contract. It combines the broker CLI flag names
+/// the host passes, the on-disk schema of the ready document, and the
+/// guest-facing route surface (via [`GUEST_ROUTE_DIGEST_HISTORY`]). If you change
+/// any of them — add/rename a broker CLI flag, change `BrokerReadyDoc`'s shape
+/// (the exhaustive struct literal below fails to compile on a field addition), or
+/// move a guest-visible path — this test fails and names the constant to bump.
+///
+/// It gates **two** version constants, because one contract surface gates two
+/// independently-rebuildable images: `BROKER_PROTOCOL_VERSION` forces the broker
+/// VM image to be rebuilt (host↔broker axis) and `VM_HTTP_CONTRACT_VERSION` the
+/// guest image (guest↔broker axis, checked by the guest at startup). A
+/// guest-visible change generally moves both.
+///
+/// The route surface is covered here because leaving it out let two real defects
+/// through: the vendor namespaces changed every guest URL, and `/v1/session`
+/// began reporting a contract version — both without a bump, so a stale image
+/// would have been accepted as compatible. A path change *is* a contract change.
+/// The session-spec schema is guarded independently by its own `version` field
+/// and the `broker_session` tests.
 #[test]
 fn broker_contract_fingerprint_is_pinned() {
     let args = sample_plan().run_invocation().args_lossy();
@@ -176,34 +308,70 @@ fn broker_contract_fingerprint_is_pinned() {
         broker_port: 18080,
         writd_build: Some("pinned".to_string()),
     };
-    // The guest-facing routes, as `method target` pairs in declaration order —
-    // the same list the route table's totality oracle drives.
-    let routes: Vec<String> = crate::vm_http::route_table::tests::ENDPOINT_MAP
-        .iter()
-        .map(|(method, target, _)| format!("{method} {target}"))
-        .collect();
     let fingerprint = format!(
-        "broker-cli-flags: {}\nready-doc: {}\nguest-routes: {}",
+        "broker-cli-flags: {}\nready-doc: {}",
         flags.join(" "),
         serde_json::to_string(&ready_doc).unwrap(),
-        routes.join(", "),
     );
 
     assert_eq!(
         fingerprint,
         "broker-cli-flags: --config --session-spec --bearer-token-file\n\
-         ready-doc: {\"protocol_version\":3,\"broker_port\":18080,\"writd_build\":\"pinned\"}\n\
-         guest-routes: GET /v1/session, GET /v1/nix/cache/nix-cache-info, \
-         GET /v1/nix/cache/abc.narinfo, GET /v1/nix/prewarm/nix-cache-info, \
-         POST /anthropic/v1/messages, POST /anthropic/v1/messages/count_tokens, \
-         GET /anthropic/v1/models, GET /anthropic/v1/models/claude-opus-4-1, \
-         POST /openai/v1/responses, POST /openai/v1/responses/resp_123/cancel, \
-         GET /openai/v1/models, GET /openai/v1/models/gpt-5, POST /v1/messages, \
-         POST /v1/git/clone, POST /v1/git/push, POST /v1/nix/flake/provision, \
-         GET /v1/agent-runs/00000000-0000-0000-0000-000000000001/config, \
-         POST /v1/agent-runs/00000000-0000-0000-0000-000000000001/outcome",
+         ready-doc: {\"protocol_version\":4,\"broker_port\":18080,\"writd_build\":\"pinned\"}",
         "the host↔broker contract changed. Update this snapshot AND bump \
          BROKER_PROTOCOL_VERSION (and rebuild the broker image)."
+    );
+
+    // The guest contract history, coupled to *both* version constants: the live
+    // route surface must be what this contract version recorded, and the row
+    // must carry the broker protocol version now compiled in.
+    let version = crate::vm_git::VM_HTTP_CONTRACT_VERSION as usize;
+    assert_eq!(
+        GUEST_CONTRACT_HISTORY.len(),
+        version,
+        "VM_HTTP_CONTRACT_VERSION is {version} but the contract history has {} row(s): \
+         append exactly one row per version",
+        GUEST_CONTRACT_HISTORY.len(),
+    );
+    let current = &GUEST_CONTRACT_HISTORY[version - 1];
+    assert_eq!(
+        guest_route_digest(),
+        current.route_digest,
+        "the guest-facing route surface changed. Append a row to GUEST_CONTRACT_HISTORY with \
+         its new digest and the new broker protocol version, bump VM_HTTP_CONTRACT_VERSION (so \
+         guests refuse a stale broker) AND bump BROKER_PROTOCOL_VERSION (so the host refuses a \
+         stale broker image), then rebuild both images.",
+    );
+    // Exact equality, deliberately, after trying the weaker `>=`.
+    //
+    // `>=` let a guest-contract change *reuse* a protocol value that an earlier
+    // broker-only bump had already published — so broker images built before the
+    // guest change, already advertising that value, would pass the host
+    // handshake while serving the old guest contract. Equality closes that: the
+    // protocol a guest contract records is the one compiled now, so any earlier
+    // image is refused.
+    //
+    // The price is that a broker-only change (a new CLI flag, a ready-doc field)
+    // must also bump `VM_HTTP_CONTRACT_VERSION` and have the guest image
+    // rebuilt. That is a gratuitous rebuild — cheap and safe — traded against a
+    // window in which a stale broker is accepted, which is neither. Correctness
+    // over availability.
+    assert_eq!(
+        current.broker_protocol_version,
+        crate::broker_protocol::BROKER_PROTOCOL_VERSION,
+        "guest contract v{version} records broker protocol {}, but {} is compiled. Every \
+         protocol bump appends a contract row (bumping VM_HTTP_CONTRACT_VERSION) so that no \
+         previously-published protocol value can be reused by a later contract — which would \
+         let a broker image built before that contract pass the host handshake.",
+        current.broker_protocol_version,
+        crate::broker_protocol::BROKER_PROTOCOL_VERSION,
+    );
+    assert!(
+        GUEST_CONTRACT_HISTORY
+            .windows(2)
+            .all(|pair| pair[1].broker_protocol_version > pair[0].broker_protocol_version),
+        "recorded broker protocol versions must strictly increase: appending a contract row \
+         without bumping BROKER_PROTOCOL_VERSION would leave a stale broker image acceptable",
     );
 }
 

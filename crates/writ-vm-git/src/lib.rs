@@ -17,6 +17,57 @@ use writ_core::core::{
     CapabilityRequest, GitHubAccess, GitHubRequest, RepoRef, RequestId, UnixMillis,
 };
 
+/// The guest↔broker HTTP contract version. **Bump this** whenever the surface a
+/// guest depends on changes in a way that requires the guest image to be
+/// rebuilt: a moved or renamed endpoint, a changed request/response shape, a
+/// changed auth rule.
+///
+/// The guest and the broker are built from the same tree and are only ever meant
+/// to ship together — but `writ agent-vm build-image` loads an image into the
+/// local container store, so a rebuilt host can launch a *stale* guest. Before
+/// this handshake the only symptom was a `404` (or, after the model-proxy
+/// namespaces moved, a `410`) from an endpoint the guest believed in.
+///
+/// The broker reports this in its `GET /v1/session` response; the guest compares
+/// it against its own compiled value at startup and refuses to run on a
+/// mismatch, naming both versions and [`GUEST_IMAGE_REBUILD_COMMAND`].
+///
+/// A CI test (`broker_contract_fingerprint_is_pinned`) folds the guest-facing
+/// route surface into a pinned fingerprint alongside this constant, so a path
+/// change that forgets to bump it fails the build rather than a guest.
+///
+/// This is the guest-side sibling of `writ::broker_protocol::BROKER_PROTOCOL_VERSION`,
+/// which guards the host↔broker-VM axis. A guest-visible change generally moves
+/// both: one forces the broker image to be rebuilt, the other the guest image.
+pub const VM_HTTP_CONTRACT_VERSION: u32 = 2;
+
+/// The command an operator runs to rebuild the guest image, quoted back to them
+/// whenever the broker refuses a stale one.
+///
+/// A `const` rather than a literal in each message because advice naming a CLI
+/// command rots silently — the first draft of the `410` body named a subcommand
+/// that never existed, so a guest following it failed at argument parsing.
+/// `the_guest_image_rebuild_advice_names_a_real_command` (in `bin/writ.rs`)
+/// parses this against the real CLI, so renaming the subcommand breaks the build
+/// rather than the advice.
+pub const GUEST_IMAGE_REBUILD_COMMAND: &str = "writ agent-vm build-image";
+
+/// The command that rebuilds the *broker* VM image, quoted back when the broker
+/// is the stale side. Same rot risk, same guard as
+/// [`GUEST_IMAGE_REBUILD_COMMAND`] — both are parsed against the real CLI.
+pub const BROKER_IMAGE_REBUILD_COMMAND: &str = "writ agent-vm build-broker-image";
+
+/// The version field the guest reads out of `GET /v1/session`.
+///
+/// Deliberately **not** `deny_unknown_fields`, and deliberately not the whole
+/// session response: an older guest reading a newer broker must still recover
+/// `version` — and report the mismatch — rather than fail to parse and report
+/// nothing. Same forward-compatibility reasoning as `BrokerReadyDoc`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+pub struct VmHttpContract {
+    pub version: u32,
+}
+
 /// Base path of the guest-facing Anthropic proxy. Each model vendor gets its
 /// own namespace because `/v1/models` is a real endpoint of *both* vendor APIs:
 /// sharing one namespace made the two backends' classifications overlap, so

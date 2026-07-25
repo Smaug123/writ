@@ -155,6 +155,12 @@ pub enum VmClientError {
         "VM broker returned a {bytes}-byte Git bundle, exceeding the {max_bundle_bytes}-byte limit"
     )]
     BundleTooLarge { bytes: u64, max_bundle_bytes: u64 },
+    #[error(
+        "the guest and the broker disagree on the VM HTTP contract: this guest speaks version \
+         {guest}, the broker speaks {broker}. {}",
+        contract_mismatch_remedy(*guest, *broker)
+    )]
+    ContractMismatch { guest: u32, broker: u32 },
     #[error("destination path already exists: {0:?}")]
     DestinationAlreadyExists(PathBuf),
     #[error("{operation} {path:?}: {source}")]
@@ -443,6 +449,54 @@ pub async fn get_session_json(config: &VmClientConfig) -> Result<serde_json::Val
         .json::<serde_json::Value>()
         .await
         .map_err(VmClientError::from)
+}
+
+/// Which side is behind, and therefore what to do about it.
+///
+/// The version ordering says who is stale: telling an operator to rebuild the
+/// guest when the *broker* is the old one sends them round a loop that changes
+/// nothing (the rebuild produces the same guest, and does not restart the
+/// daemon).
+fn contract_mismatch_remedy(guest: u32, broker: u32) -> String {
+    if broker < guest {
+        format!(
+            "The broker is the older side: restart the `writd` daemon on the host from this \
+             build (and, for `broker_placement = vm`, rebuild its image with `{}`).",
+            writ_vm_git::BROKER_IMAGE_REBUILD_COMMAND,
+        )
+    } else {
+        format!(
+            "The guest is the older side: rebuild its image with `{}`.",
+            writ_vm_git::GUEST_IMAGE_REBUILD_COMMAND,
+        )
+    }
+}
+
+/// Refuse to talk to a broker whose contract version differs from this guest's.
+///
+/// Called once at startup, before any real work: a run that dies halfway through
+/// having already pushed a branch is worse than one that never starts. The guest
+/// is the side that checks because it is the side that can be stale — a rebuilt
+/// host launches whatever image is loaded in the container store.
+///
+/// Reads only [`writ_vm_git::VmHttpContract::version`] out of the session response, so a
+/// newer broker's extra fields cannot stop an older guest from *diagnosing* the
+/// mismatch.
+pub async fn verify_broker_contract(config: &VmClientConfig) -> Result<(), VmClientError> {
+    let response = reqwest::Client::new()
+        .get(config.endpoint("/v1/session"))
+        .bearer_auth(config.bearer_token().as_str())
+        .send()
+        .await?;
+    let response = require_success(response).await?;
+    let contract = response.json::<writ_vm_git::VmHttpContract>().await?;
+    if contract.version == writ_vm_git::VM_HTTP_CONTRACT_VERSION {
+        return Ok(());
+    }
+    Err(VmClientError::ContractMismatch {
+        guest: writ_vm_git::VM_HTTP_CONTRACT_VERSION,
+        broker: contract.version,
+    })
 }
 
 pub async fn fetch_agent_run_config(

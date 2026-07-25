@@ -10,6 +10,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+use writ_vm_git::{GUEST_IMAGE_REBUILD_COMMAND, VM_HTTP_CONTRACT_VERSION};
 
 fn repo() -> GitCloneRepo {
     "owner/repo".parse().unwrap()
@@ -214,6 +215,69 @@ async fn get_session_json_gets_session_endpoint_with_bearer_token() {
         request.contains("authorization: Bearer writ-vm-secret")
             || request.contains("Authorization: Bearer writ-vm-secret"),
         "{request}"
+    );
+}
+
+/// The guest refuses to proceed against a broker whose contract version differs
+/// from its own, and says what to do about it. Before this, a stale guest image
+/// simply asked for endpoints that had moved and got a `404`/`410` with no
+/// indication that the *image* was the problem.
+#[tokio::test]
+async fn a_contract_version_mismatch_is_refused_with_both_versions_and_the_remedy() {
+    let stale = VM_HTTP_CONTRACT_VERSION + 1;
+    let body = format!(
+        r#"{{"api":"writ-vm-http","version":{stale},"session_id":"0198c0de-0000-7000-8000-000000000001"}}"#
+    );
+    let (broker_url, _captured) =
+        serve_once(http_response("200 OK", "application/json", body.as_bytes())).await;
+    let config = VmClientConfig::new(broker_url, "writ-vm-secret").unwrap();
+
+    let err = verify_broker_contract(&config).await.unwrap_err();
+
+    let VmClientError::ContractMismatch { guest, broker } = err else {
+        panic!("expected a contract mismatch, got: {err:?}");
+    };
+    assert_eq!(guest, VM_HTTP_CONTRACT_VERSION);
+    assert_eq!(broker, stale);
+    let message = VmClientError::ContractMismatch { guest, broker }.to_string();
+    assert!(message.contains(&guest.to_string()), "{message}");
+    assert!(message.contains(&broker.to_string()), "{message}");
+    assert!(
+        message.contains(GUEST_IMAGE_REBUILD_COMMAND),
+        "the guest must be told how to fix it: {message}",
+    );
+}
+
+#[tokio::test]
+async fn a_matching_contract_version_is_accepted() {
+    let body = format!(
+        r#"{{"api":"writ-vm-http","version":{VM_HTTP_CONTRACT_VERSION},"session_id":"0198c0de-0000-7000-8000-000000000001"}}"#
+    );
+    let (broker_url, _captured) =
+        serve_once(http_response("200 OK", "application/json", body.as_bytes())).await;
+    let config = VmClientConfig::new(broker_url, "writ-vm-secret").unwrap();
+
+    verify_broker_contract(&config).await.unwrap();
+}
+
+/// An older guest reading a *newer* broker's response must still recover the
+/// version and report the mismatch, rather than failing to parse and reporting
+/// nothing useful — so unknown fields are tolerated by construction.
+#[tokio::test]
+async fn unknown_session_fields_do_not_hide_the_version() {
+    let stale = VM_HTTP_CONTRACT_VERSION + 7;
+    let body = format!(
+        r#"{{"api":"writ-vm-http","version":{stale},"session_id":"0198c0de-0000-7000-8000-000000000001","a_field_from_the_future":{{"nested":[1,2,3]}}}}"#
+    );
+    let (broker_url, _captured) =
+        serve_once(http_response("200 OK", "application/json", body.as_bytes())).await;
+    let config = VmClientConfig::new(broker_url, "writ-vm-secret").unwrap();
+
+    let err = verify_broker_contract(&config).await.unwrap_err();
+
+    assert!(
+        matches!(err, VmClientError::ContractMismatch { broker, .. } if broker == stale),
+        "got: {err:?}",
     );
 }
 
