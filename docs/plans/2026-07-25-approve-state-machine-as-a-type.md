@@ -146,20 +146,60 @@ that never consults it, asserting both accept the same moves.
 
 ### Slice 3 — the derived predicates, in one place
 
-`blocks_resolution()`, `reject_blocker()`, and `reconciliation_eligibility()` as
-methods on the state. `reject_blocker_for_push`, `classify_reconciliation_target`,
-`start_approve_attempt`'s preflight, and `load_reconciliation_predecessor` all
-call them instead of restating the predicate.
+Reading the six sites side by side showed that the one phrase "does this attempt
+stand in the way?" hides *three* predicates, so each is named once on
+`AttemptPosition` (the `(state, outcome)` pair a row records):
+`blocks_resolution`, `is_in_flight`, `is_reconcilable`, plus `reject_blocker` for
+the classification. The distinction that matters is that `blocks_resolution`
+excludes `Resolved(Succeeded)` — the approve path's own joint transaction writes
+the resolution row — while `reject_blocker` includes it.
 
-Test: for random attempt states, the Rust predicate agrees with the trigger — a
-resolution INSERT is refused iff `blocks_resolution()` says so.
+The SQL stops being a second encoding: `position_predicate_sql` renders a
+position set as `(state, coalesce(outcome, '')) IN (VALUES …)`, so the two
+queries that spelled the predicate out now build their clause by filtering
+`AttemptPosition::all()` through the same function the Rust folds call. The
+`Uncertain`-needs-a-boot-observed-marker rule stays in the DAO: it is a fact
+about the row, not its position.
+
+Tests: `sql_predicate_selects_what_rust_selects` (the generator renders each
+predicate faithfully) and `blocks_resolution_agrees_with_the_trigger` (the
+predicate matches the schema's own version — a resolution INSERT is refused iff
+it says so).
 
 ### Slice 4 — delete the mirrored trigger message
 
-`writ-audit` classifies the trigger's constraint violation into a typed
-`AuditError` variant; the shell matches the variant instead of the string. The
-literal then lives in exactly one Rust place, with a test asserting the embedded
-migration SQL contains it. The stale `0005_…` doc reference goes with it.
+`writ-audit` classifies the trigger's constraint violation into
+`AuditError::ResolutionRefusedByActiveApprove`; the shell matches the variant
+instead of the string, and `is_active_approve_refusal` is deleted along with the
+stale `0005_…` reference. The literal survives in exactly one place, beside the
+predicate it enforces, because SQLite gives `RAISE(ABORT, …)` no
+machine-readable identity.
+
+The pinning test reads the trigger body back from **`sqlite_master`**, not from
+the migration list. That distinction is load-bearing and was found by mutation:
+v5 created this trigger and v6 dropped and recreated it, so the old wording is
+still in the v5 migration text, and a migration-searching test went on passing
+after the live trigger was reworded — the exact failure it exists to catch.
+
+## Outcome
+
+All four slices shipped, each reviewed clean by Codex. Two defects were caught in
+review rather than by me, both worth recording because they are the same shape —
+a test asserting less than it claimed:
+
+1. The `ALL`-completeness test could not actually prove `ALL` was complete (a new
+   variant had to be *named* in the match, but not *listed*). Fixed at the root
+   by generating the enum, `ALL`, and both conversion directions from one
+   variant⇒literal table, so the list cannot disagree with the variants.
+2. `apply` could not see the v7 mint ledger, so it permitted moves
+   `mint_matches_ledger` refuses — a soundness violation of the slice's own
+   headline property, invisible because the oracle never seeded a ledger row.
+   Fixed by making the ledger part of the machine's state, which migration 0007
+   argues it always was.
+
+The lesson generalises: for each of these, writing the mutation was what exposed
+the gap. A property test that has never been watched to fail is a claim, not
+evidence.
 
 ## Non-goals
 

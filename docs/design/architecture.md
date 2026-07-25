@@ -316,6 +316,20 @@ merely persists. Three layers:
   `apply`, and writes every mutable column from the position it returns, so a
   write cannot disagree with the decision.
 
+- **Derived predicates.** `AttemptPosition` (the `(state, outcome)` pair) answers
+  the questions the queries ask — `blocks_resolution`, `is_in_flight`,
+  `is_reconcilable`, `reject_blocker` — once each. `position_predicate_sql`
+  renders a position set as a SQL `IN` clause, so the queries that ask those
+  questions *derive* their predicate from the same functions the Rust folds use
+  rather than restating it. Note `blocks_resolution` excludes
+  `Resolved(Succeeded)`: the approve path's own joint transaction writes the
+  resolution row.
+- **Refusals are typed.** The one trigger whose firing a caller must act on
+  (`git_push_resolution_refuses_active_approve`) is classified inside the crate
+  into `AuditError::ResolutionRefusedByActiveApprove`; its abort text is matched
+  in exactly one place, beside the predicate, because SQLite gives
+  `RAISE(ABORT, …)` no machine-readable identity.
+
 **Guarantee (schema-backed).** The triggers below remain the authority — the
 database refuses a contradiction even when every Rust caller is wrong — and the
 Rust machine is held to them mechanically:
@@ -323,8 +337,13 @@ Rust machine is held to them mechanically:
 (position, transition) pair against a real database, comparing `apply` against a
 naive writer that never consults it, and
 `rust_and_schema_admit_the_same_{state,outcome}_names` compares `ALL` against the
-CHECK literals read back from `sqlite_master`. Divergence in *either* direction
-fails the build. The one place the machine is deliberately stricter than the
+CHECK literals read back from `sqlite_master`;
+`blocks_resolution_agrees_with_the_trigger` and
+`trigger_message_matches_the_live_trigger` do the same for the blocking
+predicate and its abort text. Divergence in *either* direction fails the build.
+Each of these reads the **live** schema rather than the migration list — a
+superseded migration still carries the old definition, so searching history
+would let a reworded trigger pass. The one place the machine is deliberately stricter than the
 schema (a mint-capturing resolve from `Uncertain`) is enumerated in the test, not
 implicit.
 
