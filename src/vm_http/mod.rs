@@ -13,7 +13,7 @@ mod git_push;
 mod nix_cache;
 mod openai_proxy;
 mod proxy_common;
-mod route_table;
+pub(crate) mod route_table;
 
 pub use agent_runs::VmHttpAgentRunService;
 use agent_runs::{route_agent_run_config_request, route_agent_run_outcome_request};

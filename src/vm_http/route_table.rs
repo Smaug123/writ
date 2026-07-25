@@ -363,7 +363,7 @@ fn is_legacy_proxy_path(target: &str) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::collections::BTreeSet;
     use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 
@@ -384,7 +384,7 @@ mod tests {
     /// must resolve to. This is the totality oracle: a route that stops
     /// resolving — or starts resolving to the wrong kind, which would change its
     /// auth scheme, its body limit, *and* whether it is audited — fails here.
-    const ENDPOINT_MAP: &[(&str, &str, &str)] = &[
+    pub(crate) const ENDPOINT_MAP: &[(&str, &str, &str)] = &[
         ("GET", "/v1/session", "Session"),
         ("GET", "/v1/nix/cache/nix-cache-info", "NixCache"),
         ("GET", "/v1/nix/cache/abc.narinfo", "NixCache"),

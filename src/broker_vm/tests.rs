@@ -140,13 +140,19 @@ fn run_invocation_is_dual_homed_with_mounts_and_broker_command() {
 }
 
 /// CI pin for the host↔broker contract. It combines the broker CLI flag names
-/// the host passes with the on-disk schema of the ready document. If you change
-/// either — add/rename a broker CLI flag, or change `BrokerReadyDoc`'s shape
-/// (the exhaustive struct literal below fails to compile on a field addition) —
-/// this test fails. When it does, update the snapshot **and** bump
-/// `BROKER_PROTOCOL_VERSION` (and rebuild the broker image). The session-spec
-/// schema is guarded independently by its own `version` field and the
-/// `broker_session` tests.
+/// the host passes, the on-disk schema of the ready document, and **the
+/// guest-facing route surface** the in-VM broker serves. If you change any of
+/// them — add/rename a broker CLI flag, change `BrokerReadyDoc`'s shape (the
+/// exhaustive struct literal below fails to compile on a field addition), or move
+/// a guest-visible path — this test fails. When it does, update the snapshot
+/// **and** bump `BROKER_PROTOCOL_VERSION` (and rebuild the broker image). The
+/// session-spec schema is guarded independently by its own `version` field and
+/// the `broker_session` tests.
+///
+/// The route surface is here because leaving it out let a real defect through:
+/// the model-proxy vendor namespaces changed every guest URL without bumping the
+/// version, so a stale broker VM image would have been accepted as compatible and
+/// then `404`d every model request. A path change is a contract change.
 #[test]
 fn broker_contract_fingerprint_is_pinned() {
     let args = sample_plan().run_invocation().args_lossy();
@@ -170,16 +176,32 @@ fn broker_contract_fingerprint_is_pinned() {
         broker_port: 18080,
         writd_build: Some("pinned".to_string()),
     };
+    // The guest-facing routes, as `method target` pairs in declaration order —
+    // the same list the route table's totality oracle drives.
+    let routes: Vec<String> = crate::vm_http::route_table::tests::ENDPOINT_MAP
+        .iter()
+        .map(|(method, target, _)| format!("{method} {target}"))
+        .collect();
     let fingerprint = format!(
-        "broker-cli-flags: {}\nready-doc: {}",
+        "broker-cli-flags: {}\nready-doc: {}\nguest-routes: {}",
         flags.join(" "),
         serde_json::to_string(&ready_doc).unwrap(),
+        routes.join(", "),
     );
 
     assert_eq!(
         fingerprint,
         "broker-cli-flags: --config --session-spec --bearer-token-file\n\
-         ready-doc: {\"protocol_version\":2,\"broker_port\":18080,\"writd_build\":\"pinned\"}",
+         ready-doc: {\"protocol_version\":3,\"broker_port\":18080,\"writd_build\":\"pinned\"}\n\
+         guest-routes: GET /v1/session, GET /v1/nix/cache/nix-cache-info, \
+         GET /v1/nix/cache/abc.narinfo, GET /v1/nix/prewarm/nix-cache-info, \
+         POST /anthropic/v1/messages, POST /anthropic/v1/messages/count_tokens, \
+         GET /anthropic/v1/models, GET /anthropic/v1/models/claude-opus-4-1, \
+         POST /openai/v1/responses, POST /openai/v1/responses/resp_123/cancel, \
+         GET /openai/v1/models, GET /openai/v1/models/gpt-5, POST /v1/messages, \
+         POST /v1/git/clone, POST /v1/git/push, POST /v1/nix/flake/provision, \
+         GET /v1/agent-runs/00000000-0000-0000-0000-000000000001/config, \
+         POST /v1/agent-runs/00000000-0000-0000-0000-000000000001/outcome",
         "the host↔broker contract changed. Update this snapshot AND bump \
          BROKER_PROTOCOL_VERSION (and rebuild the broker image)."
     );
