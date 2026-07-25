@@ -209,10 +209,12 @@ impl AgentRunOutcomeEffect {
             }
         }
         // An outcome already recorded is an idempotent retry: answer as though
-        // this upload had produced it, and record nothing. (A *concurrent*
-        // upload — one still in flight, with no row yet — is caught later by the
-        // resume claim, which refuses rather than claiming a success it cannot
-        // verify.)
+        // this upload had produced it, and record nothing. This check is an
+        // early-out, not the authority — it runs outside the run's claim, so a
+        // concurrent upload can complete between here and `acquire`. The
+        // authoritative check is `resume_effect`'s, made under the claim; this
+        // one exists so a retry after completion is answered without parsing
+        // (and so a malformed retry body still gets the `200` it always did).
         match audit.get_agent_run_outcome(run_id) {
             Ok(Some(_)) => return AgentRunOutcomeAdmission::Answered(ok()),
             Ok(None) => {}
@@ -276,6 +278,13 @@ impl BrokeredEffect for AgentRunOutcomeEffect {
                 // The run vanished between the ownership check and here. Same
                 // answer as an unknown run: never an ID oracle.
                 ResumeEffectError::NotBegun => AcquireFailure::Answered(not_found()),
+                // Another upload completed this run's outcome between the
+                // admission check above and this claim. That is an idempotent
+                // retry — the outcome *is* recorded — so it gets the same `200`
+                // a sequential retry gets, without performing the effect a
+                // second time. This is the authoritative check: the one in
+                // `admit` runs outside the claim and can be stale.
+                ResumeEffectError::AlreadyCompleted => AcquireFailure::Answered(ok()),
                 // Another upload for this run is in flight. Refuse rather than
                 // return the idempotent `200`: the in-flight upload may yet
                 // fail, and claiming an outcome was recorded when none was is
@@ -785,6 +794,76 @@ mod tests {
                 .into_buffered();
         assert_eq!(retried.status, VmHttpStatus::Ok);
         assert!(state.audit.get_agent_run_outcome(run_id).unwrap().is_some());
+    }
+
+    /// The admission-time "already has an outcome?" check runs outside the run's
+    /// claim, so it can go stale: another upload may complete between it and the
+    /// claim. The upload that got the stale answer must *not* then perform the
+    /// effect and discover the collision at the outcome row's primary key — the
+    /// authoritative check inside `resume_effect` catches it and gives the same
+    /// idempotent `200` a sequential retry gets.
+    #[tokio::test]
+    async fn an_upload_admitted_before_another_completed_is_answered_idempotently() {
+        let github = MockServer::start().await;
+        let state = make_broker_state(&github);
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::LOCALHOST, 32).unwrap());
+        open_audit_session(&state, session.session_id());
+        let run_id: AgentRunId = "00000000-0000-0000-0000-000000000408".parse().unwrap();
+        let upload = launched_run(&state, session.session_id(), run_id);
+        let temp = tempfile::tempdir().unwrap();
+        let service =
+            VmHttpAgentRunService::new(Arc::clone(&state), temp.path().join("agent-runs"));
+
+        // Admit an upload while no outcome exists — the stale observation.
+        let AgentRunOutcomeAdmission::Admitted(stale) = AgentRunOutcomeEffect::admit(
+            run_id,
+            session.session_id(),
+            &serde_json::to_vec(&upload).unwrap(),
+            &service,
+        ) else {
+            panic!("a launched, unrecorded run must admit");
+        };
+
+        // ...then let another upload complete the run, exactly as a concurrent
+        // request would have between the admission and the claim.
+        let winner_service =
+            VmHttpAgentRunService::new(Arc::clone(&state), temp.path().join("winner-runs"));
+        let winner = route_agent_run_outcome_request(
+            run_id,
+            session.session_id(),
+            &serde_json::to_vec(&upload).unwrap(),
+            &winner_service,
+        )
+        .await
+        .into_buffered();
+        assert_eq!(winner.status, VmHttpStatus::Ok);
+
+        let response = broker_effect(&state.audit, stale).await.into_buffered();
+
+        assert_eq!(response.status, VmHttpStatus::Ok);
+        assert_eq!(response.body, b"ok");
+        assert!(
+            !temp
+                .path()
+                .join("agent-runs")
+                .join(run_id.to_string())
+                .exists(),
+            "the stale upload must not have performed the effect a second time"
+        );
+        // The winner's outcome stands, and the pair is complete.
+        let recorded = state.audit.get_agent_run_outcome(run_id).unwrap().unwrap();
+        assert!(
+            recorded
+                .outcome
+                .stdout
+                .path
+                .starts_with(temp.path().join("winner-runs")),
+            "got: {}",
+            recorded.outcome.stdout.path.display()
+        );
+        state
+            .audit
+            .assert_effect_audit_pairs_complete("agent_run", "agent_run_outcome", "run_id");
     }
 
     /// An upload the broker cannot honestly record — a rejected stream, or logs

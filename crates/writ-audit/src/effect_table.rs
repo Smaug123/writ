@@ -149,6 +149,10 @@ pub trait OutcomeOnlyEffect: EffectAuditTable {
     /// name into SQL.
     fn request_row_exists(conn: &Connection, key: &Self::Key) -> Result<bool, AuditError>;
 
+    /// Whether the outcome row for `key` is already present — i.e. the pair is
+    /// complete and there is nothing left to resume.
+    fn outcome_row_exists(conn: &Connection, key: &Self::Key) -> Result<bool, AuditError>;
+
     /// A textual form of `key` used to claim it while a guard is live.
     ///
     /// **Must be injective**: two distinct keys must never produce the same
@@ -166,6 +170,13 @@ pub enum ResumeEffectError {
     /// earlier lifecycle event. Recording an outcome for it would leave an
     /// orphan, so no guard is issued.
     NotBegun,
+    /// The pair is already complete: an outcome row exists, so there is nothing
+    /// to resume. Detected *under the claim*, which is what makes it reliable —
+    /// a caller that checked for an outcome before claiming could otherwise have
+    /// its answer invalidated by a holder completing in between, and would learn
+    /// of the collision only from the outcome row's primary key, after
+    /// performing the effect.
+    AlreadyCompleted,
     /// Another live guard already holds this key: a concurrent attempt to record
     /// the same effect's outcome. Exactly one may proceed, so this one is
     /// refused *before* it does any work — the loser neither duplicates the
@@ -179,6 +190,7 @@ impl std::fmt::Display for ResumeEffectError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NotBegun => f.write_str("no request row exists for this effect"),
+            Self::AlreadyCompleted => f.write_str("this effect's outcome is already recorded"),
             Self::AlreadyClaimed => {
                 f.write_str("another outcome for this effect is already in flight")
             }
@@ -440,10 +452,12 @@ impl AuditLog {
     ///
     /// Two things this gives that "write the outcome directly" did not:
     ///
-    /// * **No orphan outcomes.** The request row must already exist
-    ///   ([`ResumeEffectError::NotBegun`] otherwise), and no row is inserted here
-    ///   — so the endpoint can neither record an outcome for an effect that was
-    ///   never begun nor double-insert the request row.
+    /// * **No orphan or duplicate outcomes.** The request row must already exist
+    ///   ([`ResumeEffectError::NotBegun`] otherwise) and must not already be
+    ///   paired ([`ResumeEffectError::AlreadyCompleted`]), and no row is
+    ///   inserted here — so the endpoint can neither record an outcome for an
+    ///   effect that was never begun, nor double-insert the request row, nor
+    ///   perform the effect a second time for an outcome that already landed.
     /// * **At most one live guard per key.** The key is *claimed* for the
     ///   guard's lifetime, so two concurrent attempts to record the same
     ///   effect's outcome cannot both proceed: the loser is refused
@@ -452,6 +466,14 @@ impl AuditLog {
     ///   key after the work is done. The claim is released when the guard drops,
     ///   whatever discharged it.
     ///
+    /// The two checks run **under the claim**, which is what makes them
+    /// load-bearing rather than advisory: an outcome row can only appear while
+    /// some caller holds the claim, so while we hold it the observed state
+    /// cannot change beneath us. A caller that checked for an outcome *before*
+    /// claiming would race — the holder can complete and release in between —
+    /// and would learn of the collision only from the primary key, after doing
+    /// the work.
+    ///
     /// Gated on [`OutcomeOnlyEffect`]: a two-phase effect must go through
     /// [`begin_effect`](Self::begin_effect), whose request-row insert is what
     /// makes the attempt durable before the effect happens.
@@ -459,17 +481,26 @@ impl AuditLog {
         self: &Arc<Self>,
         key: T::Key,
     ) -> Result<RecordedRequest<T>, ResumeEffectError> {
-        let exists = self
-            .with_conn(|c| T::request_row_exists(c, &key))
-            .map_err(ResumeEffectError::Audit)?;
-        if !exists {
-            return Err(ResumeEffectError::NotBegun);
-        }
-        // Claim AFTER the existence check and before returning the guard: from
-        // here the key is held until the guard drops.
         let token = T::claim_token(&key);
         if !self.effect_claims.claim(T::LABEL, token.clone()) {
             return Err(ResumeEffectError::AlreadyClaimed);
+        }
+        // Claim held from here: every refusal below must release it, and every
+        // success hands it to the guard, whose `Drop` releases it.
+        let refusal = match self.with_conn(|c| {
+            Ok((
+                T::request_row_exists(c, &key)?,
+                T::outcome_row_exists(c, &key)?,
+            ))
+        }) {
+            Err(err) => Some(ResumeEffectError::Audit(err)),
+            Ok((false, _)) => Some(ResumeEffectError::NotBegun),
+            Ok((_, true)) => Some(ResumeEffectError::AlreadyCompleted),
+            Ok((true, false)) => None,
+        };
+        if let Some(err) = refusal {
+            self.effect_claims.release(T::LABEL, &token);
+            return Err(err);
         }
         Ok(RecordedRequest {
             audit: Arc::clone(self),
@@ -629,6 +660,15 @@ mod tests {
             Ok(found.is_some())
         }
 
+        fn outcome_row_exists(conn: &Connection, key: &RequestId) -> Result<bool, AuditError> {
+            let found: Option<i64> = rusqlite::OptionalExtension::optional(conn.query_row(
+                "SELECT 1 FROM scratch_outcome WHERE key = ?1",
+                params![key.as_uuid().to_string()],
+                |row| row.get(0),
+            ))?;
+            Ok(found.is_some())
+        }
+
         fn claim_token(key: &RequestId) -> String {
             key.as_uuid().to_string()
         }
@@ -781,15 +821,69 @@ CREATE TABLE scratch_outcome (
         // Abandoning the holder frees the key...
         first.abandon();
         let second = log.resume_effect::<ScratchTable>(key).unwrap();
-        // ...as does completing it.
-        second
+        // ...as does simply dropping it (a bug, or an interruption).
+        let (_, interrupted) = expect_guard_interruptions(move || drop(second));
+        assert_eq!(interrupted, vec!["Scratch"]);
+
+        // ...as does completing it — though a completed pair is then refused for
+        // a different reason (below).
+        log.resume_effect::<ScratchTable>(key)
+            .unwrap()
             .complete(&ScratchOutcome { key, status: 200 })
             .unwrap();
-        let third = log.resume_effect::<ScratchTable>(key).unwrap();
-        // ...as does simply dropping it (a bug or an interruption).
-        let (_, interrupted) = expect_guard_interruptions(move || drop(third));
-        assert_eq!(interrupted, vec!["Scratch"]);
-        log.resume_effect::<ScratchTable>(key).unwrap().abandon();
+        assert!(matches!(
+            log.resume_effect::<ScratchTable>(key),
+            Err(ResumeEffectError::AlreadyCompleted)
+        ));
+    }
+
+    /// The completed-pair check runs *under* the claim, which is what makes it
+    /// load-bearing: a caller that checked for an outcome before claiming could
+    /// have its answer invalidated by a holder completing in between, and would
+    /// then perform the effect and only discover the collision at the outcome
+    /// row's primary key. Refusing here means the effect is never performed
+    /// twice — and the refusal releases the claim, so it does not wedge the key.
+    #[test]
+    fn resume_refuses_a_pair_that_is_already_complete() {
+        let (log, s) = open_log();
+        let key = seed_request_row(&log, s.session_id);
+        log.resume_effect::<ScratchTable>(key)
+            .unwrap()
+            .complete(&ScratchOutcome { key, status: 200 })
+            .unwrap();
+
+        for _ in 0..2 {
+            let err = log.resume_effect::<ScratchTable>(key).unwrap_err();
+            assert!(
+                matches!(err, ResumeEffectError::AlreadyCompleted),
+                "got: {err:?}"
+            );
+        }
+        // Exactly one outcome, from the one guard that was ever issued.
+        assert_eq!(dump_outcome(&log), vec![(key.as_uuid().to_string(), 200)]);
+    }
+
+    /// Every refusal releases the claim it took, so a transient refusal cannot
+    /// wedge a key for the life of the process.
+    #[test]
+    fn a_refused_resume_does_not_hold_the_claim() {
+        let (log, s) = open_log();
+        let absent = RequestId::new();
+        assert!(matches!(
+            log.resume_effect::<ScratchTable>(absent),
+            Err(ResumeEffectError::NotBegun)
+        ));
+
+        // The same key, once its request row exists, is claimable — the failed
+        // attempt left nothing behind.
+        log.begin_effect::<ScratchTable>(&ScratchRequest {
+            key: absent,
+            session_id: s.session_id,
+            note: "launched".into(),
+        })
+        .unwrap()
+        .abandon();
+        log.resume_effect::<ScratchTable>(absent).unwrap().abandon();
     }
 
     /// Two logs are independent: a claim protects rows in *its* database, so one

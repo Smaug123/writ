@@ -189,6 +189,17 @@ impl crate::effect_table::OutcomeOnlyEffect for AgentRunAuditTable {
         Ok(found.is_some())
     }
 
+    fn outcome_row_exists(conn: &Connection, key: &AgentRunId) -> Result<bool, AuditError> {
+        let found: Option<i64> = conn
+            .query_row(
+                "SELECT 1 FROM agent_run_outcome WHERE run_id = ?1",
+                params![key.as_uuid().to_string()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(found.is_some())
+    }
+
     /// The run id's UUID text. Injective, as `claim_token` requires.
     fn claim_token(key: &AgentRunId) -> String {
         key.as_uuid().to_string()
