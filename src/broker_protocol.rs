@@ -27,18 +27,20 @@ use serde::{Deserialize, Serialize};
 /// - the session-spec schema ([`crate::broker_session::BrokerSessionSpec`]),
 /// - the ready-file schema ([`BrokerReadyDoc`]),
 /// - the slice of daemon config the broker reads,
-/// - **the guest-facing HTTP route surface** — the paths a guest requests. The
-///   in-VM broker is what answers them, so a stale image serves the old paths to
-///   a freshly-built guest. This was missed once: the model-proxy vendor
-///   namespaces (`/anthropic/v1/*`, `/openai/v1/*`) changed every guest's URLs
-///   while this constant stayed put, so a stale broker image would have been
-///   accepted and then `404`d every model request.
+/// - **the guest-facing HTTP route surface**, and anything else a guest reads out
+///   of a broker response — the in-VM broker is what serves them, so a stale
+///   image answers a freshly-built guest with the old contract. This has been
+///   missed twice: once when the model-proxy vendor namespaces changed every
+///   guest URL, and again when `/v1/session` began reporting
+///   [`crate::vm_git::VM_HTTP_CONTRACT_VERSION`] — a stale broker would have
+///   reported the old value, been accepted here, and left the guest telling the
+///   operator to rebuild the *guest* image, which fixes nothing.
 ///
 /// A CI test (`broker_contract_fingerprint_is_pinned`) derives a structural
 /// fingerprint of that contract and fails when it changes, so a contract change
 /// that forgets to bump this constant is caught at CI, before an image is built.
 /// The route surface is part of that fingerprint for exactly the reason above.
-pub const BROKER_PROTOCOL_VERSION: u32 = 3;
+pub const BROKER_PROTOCOL_VERSION: u32 = 4;
 
 /// The synthetic version assigned to a *legacy* bare-port ready file — one
 /// written by a pre-handshake broker image. It is distinct from every real

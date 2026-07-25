@@ -437,13 +437,18 @@ image":
   fields cannot stop an older guest from diagnosing the skew.
 
 Both are pinned by one CI test, `broker_contract_fingerprint_is_pinned`
-(`broker_vm/tests.rs`), whose fingerprint covers the broker's CLI flags, its
-ready-doc schema, **and the guest-facing route surface** — sourced from the route
-table's endpoint map, which the totality oracle already forces to be complete. So
-moving a guest-visible path fails the build until both constants are bumped. That
-coverage was added after the model-proxy namespaces moved every guest URL without
-either bump: the mechanism existed, but a path change was not treated as a
-contract change.
+(`broker_vm/tests.rs`): it snapshots the broker's CLI flags and ready-doc schema,
+and pins a **digest of the guest-facing route surface** — sourced from the route
+table's endpoint map, which the totality oracle already forces to be complete —
+in an append-only `GUEST_ROUTE_DIGEST_HISTORY` indexed by
+`VM_HTTP_CONTRACT_VERSION`. Because the live digest must equal the row *for the
+current version*, and the history must have exactly one row per version, moving a
+path fails until a new row is appended and the version bumped. (A golden test
+cannot make the wrong repair impossible; it can make the right one easy and the
+wrong one — overwriting recorded history — conspicuous in review.) That coverage
+exists because the mechanism was twice not applied: the model-proxy namespaces
+moved every guest URL, and `/v1/session` began reporting a contract version, both
+without a bump. A path change *is* a contract change.
 
 **The route table.** A request is classified **once**, by
 `VmHttpRoute::resolve`, into either `Brokered(BrokeredRoute)` — an effect whose

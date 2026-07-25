@@ -139,27 +139,59 @@ fn run_invocation_is_dual_homed_with_mounts_and_broker_command() {
     );
 }
 
-/// CI pin for the host↔broker contract. It combines the broker CLI flag names
-/// the host passes, the on-disk schema of the ready document, and **the
-/// guest-facing route surface** the in-VM broker serves. If you change any of
-/// them — add/rename a broker CLI flag, change `BrokerReadyDoc`'s shape (the
-/// exhaustive struct literal below fails to compile on a field addition), or move
-/// a guest-visible path — this test fails. When it does, update the snapshot
-/// **and** bump `BROKER_PROTOCOL_VERSION` (and rebuild the broker image). The
-/// session-spec schema is guarded independently by its own `version` field and
-/// the `broker_session` tests.
+/// The guest-facing route surface, digested, once per contract version.
 ///
-/// The route surface is here because leaving it out let a real defect through:
-/// the model-proxy vendor namespaces changed every guest URL without bumping the
-/// version, so a stale broker VM image would have been accepted as compatible and
-/// then `404`d every model request. A path change is a contract change.
+/// **Append a row when the routes change; never edit one.** The test below
+/// asserts the live route digest equals the row at index
+/// `VM_HTTP_CONTRACT_VERSION - 1`, that the history has exactly that many rows,
+/// and that no digest repeats. So moving a path fails until a *new* row is
+/// appended with a bumped version — and the only way to make it pass without
+/// bumping is to overwrite a recorded historical digest, which is a conspicuous
+/// diff rather than the innocuous "update the snapshot" it used to be.
 ///
-/// It pins **two** version constants, because one route surface gates two
+/// (A golden test cannot make the wrong repair *impossible* — a determined edit
+/// always can. What it can do is make the right repair the easy one and the
+/// wrong one visible in review. That distinction was worth being precise about:
+/// an earlier draft listed the version and the routes as independent fields,
+/// which let a route change be absorbed by editing the route text alone.)
+const GUEST_ROUTE_DIGEST_HISTORY: &[&str] = &[
+    // v1 — the pre-split surface, retired by the vendor namespaces. Its digest
+    // was never recorded (the history starts here), so this is a placeholder
+    // standing in for "some surface that is not any later one". It is only ever
+    // compared for distinctness; the live digest is always checked against the
+    // row for the *current* version.
+    "v1-unrecorded-pre-vendor-namespace-surface",
+    // v2 — vendor namespaces (`/anthropic/v1/*`, `/openai/v1/*`).
+    "1d9660853cccc4397d1ec7d22cb1c5331a1b9707615d01ca677d7f351d5621e1",
+];
+
+fn guest_route_digest() -> String {
+    let routes: Vec<String> = crate::vm_http::route_table::tests::ENDPOINT_MAP
+        .iter()
+        .map(|(method, target, _)| format!("{method} {target}"))
+        .collect();
+    writ_agent_run::sha256_hex(routes.join("\n").as_bytes())
+}
+
+/// CI pin for the guest/broker contract. It combines the broker CLI flag names
+/// the host passes, the on-disk schema of the ready document, and the
+/// guest-facing route surface (via [`GUEST_ROUTE_DIGEST_HISTORY`]). If you change
+/// any of them — add/rename a broker CLI flag, change `BrokerReadyDoc`'s shape
+/// (the exhaustive struct literal below fails to compile on a field addition), or
+/// move a guest-visible path — this test fails and names the constant to bump.
+///
+/// It gates **two** version constants, because one contract surface gates two
 /// independently-rebuildable images: `BROKER_PROTOCOL_VERSION` forces the broker
-/// VM image to be rebuilt (host↔broker axis), and `VM_HTTP_CONTRACT_VERSION`
-/// forces the *guest* image to be (guest↔broker axis, checked by the guest at
-/// startup). A guest-visible change generally moves both, and this is the one
-/// place that makes forgetting either of them a build failure.
+/// VM image to be rebuilt (host↔broker axis) and `VM_HTTP_CONTRACT_VERSION` the
+/// guest image (guest↔broker axis, checked by the guest at startup). A
+/// guest-visible change generally moves both.
+///
+/// The route surface is covered here because leaving it out let two real defects
+/// through: the vendor namespaces changed every guest URL, and `/v1/session`
+/// began reporting a contract version — both without a bump, so a stale image
+/// would have been accepted as compatible. A path change *is* a contract change.
+/// The session-spec schema is guarded independently by its own `version` field
+/// and the `broker_session` tests.
 #[test]
 fn broker_contract_fingerprint_is_pinned() {
     let args = sample_plan().run_invocation().args_lossy();
@@ -183,38 +215,43 @@ fn broker_contract_fingerprint_is_pinned() {
         broker_port: 18080,
         writd_build: Some("pinned".to_string()),
     };
-    // The guest-facing routes, as `method target` pairs in declaration order —
-    // the same list the route table's totality oracle drives.
-    let routes: Vec<String> = crate::vm_http::route_table::tests::ENDPOINT_MAP
-        .iter()
-        .map(|(method, target, _)| format!("{method} {target}"))
-        .collect();
     let fingerprint = format!(
-        "broker-cli-flags: {}\nready-doc: {}\nguest-contract-version: {}\nguest-routes: {}",
+        "broker-cli-flags: {}\nready-doc: {}",
         flags.join(" "),
         serde_json::to_string(&ready_doc).unwrap(),
-        crate::vm_git::VM_HTTP_CONTRACT_VERSION,
-        routes.join(", "),
     );
 
     assert_eq!(
         fingerprint,
         "broker-cli-flags: --config --session-spec --bearer-token-file\n\
-         ready-doc: {\"protocol_version\":3,\"broker_port\":18080,\"writd_build\":\"pinned\"}\n\
-         guest-contract-version: 2\n\
-         guest-routes: GET /v1/session, GET /v1/nix/cache/nix-cache-info, \
-         GET /v1/nix/cache/abc.narinfo, GET /v1/nix/prewarm/nix-cache-info, \
-         POST /anthropic/v1/messages, POST /anthropic/v1/messages/count_tokens, \
-         GET /anthropic/v1/models, GET /anthropic/v1/models/claude-opus-4-1, \
-         POST /openai/v1/responses, POST /openai/v1/responses/resp_123/cancel, \
-         GET /openai/v1/models, GET /openai/v1/models/gpt-5, POST /v1/messages, \
-         POST /v1/git/clone, POST /v1/git/push, POST /v1/nix/flake/provision, \
-         GET /v1/agent-runs/00000000-0000-0000-0000-000000000001/config, \
-         POST /v1/agent-runs/00000000-0000-0000-0000-000000000001/outcome",
-        "the guest/broker contract changed. Update this snapshot AND bump the version \
-         constant(s) the change affects: BROKER_PROTOCOL_VERSION for anything the broker \
-         VM image serves or parses, VM_HTTP_CONTRACT_VERSION for anything a guest \
-         requests (a moved path is both). Then rebuild the affected image(s)."
+         ready-doc: {\"protocol_version\":4,\"broker_port\":18080,\"writd_build\":\"pinned\"}",
+        "the host↔broker contract changed. Update this snapshot AND bump \
+         BROKER_PROTOCOL_VERSION (and rebuild the broker image)."
+    );
+
+    // The guest route surface, coupled to the guest contract version: the live
+    // digest must be the row this version recorded.
+    let version = crate::vm_git::VM_HTTP_CONTRACT_VERSION as usize;
+    assert_eq!(
+        GUEST_ROUTE_DIGEST_HISTORY.len(),
+        version,
+        "VM_HTTP_CONTRACT_VERSION is {version} but the route-digest history has {} row(s): \
+         append exactly one row per version",
+        GUEST_ROUTE_DIGEST_HISTORY.len(),
+    );
+    assert_eq!(
+        guest_route_digest(),
+        GUEST_ROUTE_DIGEST_HISTORY[version - 1],
+        "the guest-facing route surface changed. Append its new digest to \
+         GUEST_ROUTE_DIGEST_HISTORY, bump VM_HTTP_CONTRACT_VERSION (so guests refuse a stale \
+         broker) AND bump BROKER_PROTOCOL_VERSION (so the host refuses a stale broker image), \
+         then rebuild both images.",
+    );
+    let unique: std::collections::BTreeSet<&&str> = GUEST_ROUTE_DIGEST_HISTORY.iter().collect();
+    assert_eq!(
+        unique.len(),
+        GUEST_ROUTE_DIGEST_HISTORY.len(),
+        "a route digest is repeated: two contract versions cannot describe the same surface",
     );
 }
 
