@@ -10,19 +10,24 @@
 //! trusts, so `nix develop` evaluates the locked flake without contacting
 //! github — preserving the no-egress trust model.
 //!
-//! The heavy lifting (mirror lookup, materialise, `nix flake archive`, audit)
-//! lives in [`crate::flake_provision_from_mirror`]; this module owns only the
-//! HTTP shell: request parsing, session preflight, and mapping outcomes and
-//! errors onto VM-safe responses.
+//! The heavy lifting (mirror lookup, materialise, `nix flake archive`) lives in
+//! [`crate::flake_provision_from_mirror`]; this module owns the HTTP shell —
+//! request parsing, session preflight, grant re-check — and drives the admitted
+//! run through the [`broker_effect`] guard, which owns the audit pair.
 
 use std::sync::Arc;
 
-use crate::core::{CapabilityRequest, GitHubAccess, GitHubRequest, RepoRef};
+use crate::audit::{
+    AuditError, FlakeProvisionAuditTable, FlakeProvisionOutcomeRecord, FlakeProvisionRequestRecord,
+};
+use crate::core::{
+    CapabilityRequest, GitHubAccess, GitHubRequest, RepoRef, RequestId, SessionId, UnixMillis,
+};
 use crate::flake_lock::{FlakeLockError, FlakeProvisionPlanError};
-use crate::flake_provision::FlakeProvisionError;
+use crate::flake_provision::{FlakeProvisionError, PerformedFlakeProvision};
 use crate::flake_provision_from_mirror::{
-    MirrorFlakeProvisionConfig, MirrorFlakeProvisionError, MirrorFlakeProvisionOutcome,
-    provision_flake_from_cached_mirror,
+    AdmittedMirrorFlakeProvision, MirrorFlakeProvisionAdmission, MirrorFlakeProvisionConfig,
+    MirrorFlakeProvisionError, admit_flake_provision_from_cached_mirror,
 };
 use crate::secret::SecretStore;
 use crate::server::BrokerState;
@@ -32,7 +37,8 @@ use crate::vm_git::{
 };
 use crate::vm_git_mirror_cache::{GitCommitSha, MirrorCache};
 
-use super::{VmHttpRequest, VmHttpResponse, VmHttpSession, VmHttpStatus};
+use super::broker_effect::{BrokeredEffect, EffectCompletion, broker_effect};
+use super::{VmHttpDispatch, VmHttpRequest, VmHttpResponse, VmHttpSession, VmHttpStatus};
 
 /// The host paths, bounds, and caches a session needs to provision flake
 /// inputs from a retained mirror. The `mirror_cache` is the same `(repo, rev)`
@@ -85,90 +91,258 @@ pub(super) async fn route_flake_provision_request<S: SecretStore + Send + Sync>(
     request: &VmHttpRequest,
     body: Vec<u8>,
     service: VmHttpFlakeProvisionService<S>,
-) -> VmHttpResponse {
+) -> VmHttpDispatch {
     if request.method != "POST" {
-        return VmHttpResponse::text(VmHttpStatus::NotFound, "not found");
+        return VmHttpResponse::text(VmHttpStatus::NotFound, "not found").into();
     }
-    handle_flake_provision_request(session, &body, service).await
+    handle_flake_provision_dispatch(session, &body, service).await
 }
 
+/// Drive a provisioning request through the `broker_effect` guard: everything
+/// that can refuse *without attempting an effect* runs first
+/// ([`FlakeProvisionEffect::admit`]), and only an admitted run reaches the
+/// driver, which begins the request row, runs `nix flake archive`, and completes
+/// the outcome row.
+async fn handle_flake_provision_dispatch<S: SecretStore + Send + Sync>(
+    session: &VmHttpSession,
+    body: &[u8],
+    service: VmHttpFlakeProvisionService<S>,
+) -> VmHttpDispatch {
+    match FlakeProvisionEffect::admit(session, body, &service).await {
+        // Answered without beginning an audit row: nothing was fetched, so
+        // there is no attempt to record.
+        FlakeProvisionAdmission::Answered(response) => response.into(),
+        FlakeProvisionAdmission::Admitted(effect) => {
+            broker_effect(&service.broker_state.audit, effect).await
+        }
+    }
+}
+
+/// Test-only wrapper returning the buffered response directly — a provisioning
+/// response never streams — so the example-based tests read the
+/// [`VmHttpResponse`] unchanged.
+#[cfg(test)]
 async fn handle_flake_provision_request<S: SecretStore + Send + Sync>(
     session: &VmHttpSession,
     body: &[u8],
     service: VmHttpFlakeProvisionService<S>,
 ) -> VmHttpResponse {
-    let request = match serde_json::from_slice::<VmFlakeProvisionRequest>(body) {
-        Ok(request) => request,
-        Err(err) => {
-            return error_response(
-                VmHttpStatus::BadRequest,
-                VmFlakeProvisionErrorCode::InvalidRequest,
-                format!("invalid flake provision request: {err}"),
-            );
-        }
-    };
+    handle_flake_provision_dispatch(session, body, service)
+        .await
+        .into_buffered()
+}
 
-    // Preflight the session so a closed/unknown session returns a clean client
-    // error before any git or nix work. The authoritative check is the audit
-    // request write inside the provisioner, which refuses a closed session;
-    // this preflight only spares the materialise + lock read for the common
-    // "session is gone" case and yields a precise status.
-    if let Err(response) = preflight_session(session, &service) {
-        return response;
+/// The outcome of pre-flighting a request: either an admitted effect for the
+/// driver, or a response given *without* beginning an audit row.
+enum FlakeProvisionAdmission {
+    Admitted(FlakeProvisionEffect),
+    /// A client error, a cache miss, or a repository whose committed lock the
+    /// classifier refuses. None of these attempted an effect, so none is
+    /// audited — the reject-before-begin path.
+    Answered(VmHttpResponse),
+}
+
+/// An admitted provisioning run modelled as a [`BrokeredEffect`]. The driver
+/// owns the audit sequencing, so the `nix flake archive` run cannot reach the
+/// host without its `(request, outcome)` pair being recorded.
+///
+/// It borrows nothing: admission bakes the plan, the materialised checkout, and
+/// the derived request-row fields into the effect, so neither the service nor
+/// its `SecretStore` parameter appears here.
+struct FlakeProvisionEffect {
+    request_id: RequestId,
+    session_id: SessionId,
+    received_at: UnixMillis,
+    /// Owned because the request row borrows them as `&str`; both are the
+    /// `to_string_lossy` of the admitted plan's paths.
+    flake_dir: String,
+    cache_dir: String,
+    input_count: u64,
+    admitted: AdmittedMirrorFlakeProvision,
+}
+
+/// Owned outcome payload for a provisioning effect;
+/// [`BrokeredEffect::outcome_row`] borrows a [`FlakeProvisionOutcomeRecord`] out
+/// of it. Every run produces one — success or failure — so this effect never
+/// abandons its guard.
+struct FlakeProvisionOutcomeData {
+    request_id: RequestId,
+    performed: PerformedFlakeProvision,
+}
+
+impl FlakeProvisionEffect {
+    /// Parse and preflight *before* any audit row is begun: a malformed body,
+    /// a closed session, a repository this session was never granted, a
+    /// mirror-cache miss, or a lock the classifier refuses all answer here and
+    /// record nothing. Only an admitted run is returned.
+    async fn admit<S: SecretStore + Send + Sync>(
+        session: &VmHttpSession,
+        body: &[u8],
+        service: &VmHttpFlakeProvisionService<S>,
+    ) -> FlakeProvisionAdmission {
+        let request = match serde_json::from_slice::<VmFlakeProvisionRequest>(body) {
+            Ok(request) => request,
+            Err(err) => {
+                return FlakeProvisionAdmission::Answered(error_response(
+                    VmHttpStatus::BadRequest,
+                    VmFlakeProvisionErrorCode::InvalidRequest,
+                    format!("invalid flake provision request: {err}"),
+                ));
+            }
+        };
+
+        // Preflight the session so a closed/unknown session returns a clean
+        // client error before any git or nix work. The authoritative check is
+        // the driver's `begin_effect`, which refuses a closed session; this
+        // preflight only spares the materialise + lock read for the common
+        // "session is gone" case and yields a precise status.
+        if let Err(response) = preflight_session(session, service) {
+            return FlakeProvisionAdmission::Answered(response);
+        }
+
+        let repo = request.repo().as_repo_ref().clone();
+
+        // Authorize the repository against this session's own recorded grants.
+        // The retained mirror cache is shared across sessions and can hold
+        // private repos cloned by *other* sessions, so an open session is not
+        // enough: a session may only provision a repo it was itself granted
+        // contents-read on — i.e. one it cloned in this session.
+        // `policy::decide` grants read on any repo (the real read gate is the
+        // mint, scoped to the session's GitHub App installation), so reusing the
+        // recorded clone grant is what fences cross-session access here, and it
+        // mints nothing and adds no egress.
+        if let Err(response) = authorize_repo(session, service, &repo) {
+            return FlakeProvisionAdmission::Answered(response);
+        }
+
+        // The wire `rev` is a validated 40-hex object id; `GitCommitSha::parse`
+        // re-checks the (40|64)-hex commit shape the mirror key requires.
+        let rev = match GitCommitSha::parse(request.rev().as_str()) {
+            Ok(rev) => rev,
+            Err(err) => {
+                return FlakeProvisionAdmission::Answered(error_response(
+                    VmHttpStatus::BadRequest,
+                    VmFlakeProvisionErrorCode::InvalidRequest,
+                    format!("invalid flake provision rev: {err}"),
+                ));
+            }
+        };
+
+        let admitted = match admit_flake_provision_from_cached_mirror(
+            &service.config.provision,
+            &service.config.mirror_cache,
+            &service.broker_state.mirror_pins,
+            &repo,
+            &rev,
+        )
+        .await
+        {
+            Ok(MirrorFlakeProvisionAdmission::Admitted(admitted)) => admitted,
+            Ok(MirrorFlakeProvisionAdmission::MirrorNotCached) => {
+                return FlakeProvisionAdmission::Answered(VmHttpResponse::json(
+                    VmHttpStatus::Ok,
+                    &VmFlakeProvisionResponse::MirrorNotCached,
+                ));
+            }
+            Err(err) => {
+                return FlakeProvisionAdmission::Answered(provision_error_response(&err));
+            }
+        };
+
+        let plan = admitted.admitted();
+        FlakeProvisionAdmission::Admitted(FlakeProvisionEffect {
+            request_id: plan.request_id(),
+            session_id: session.session_id(),
+            received_at: UnixMillis::now(),
+            flake_dir: plan.flake_dir().to_string_lossy().into_owned(),
+            cache_dir: plan.cache_dir().to_string_lossy().into_owned(),
+            input_count: plan.input_count() as u64,
+            admitted,
+        })
+    }
+}
+
+impl BrokeredEffect for FlakeProvisionEffect {
+    type Table = FlakeProvisionAuditTable;
+    type Outcome = FlakeProvisionOutcomeData;
+    const REQUEST_AUDIT_KIND: &'static str = "flake_provision_request";
+    const OUTCOME_AUDIT_KIND: &'static str = "flake_provision_outcome";
+
+    fn request_id(&self) -> RequestId {
+        self.request_id
     }
 
-    let repo = request.repo().as_repo_ref().clone();
-
-    // Authorize the repository against this session's own recorded grants. The
-    // retained mirror cache is shared across sessions and can hold private
-    // repos cloned by *other* sessions, so an open session is not enough: a
-    // session may only provision a repo it was itself granted contents-read on
-    // — i.e. one it cloned in this session. `policy::decide` grants read on any
-    // repo (the real read gate is the mint, scoped to the session's GitHub App
-    // installation), so reusing the recorded clone grant is what fences
-    // cross-session access here, and it mints nothing and adds no egress.
-    if let Err(response) = authorize_repo(session, &service, &repo) {
-        return response;
+    fn request_row(&self) -> FlakeProvisionRequestRecord<'_> {
+        FlakeProvisionRequestRecord {
+            request_id: self.request_id,
+            session_id: self.session_id,
+            received_at: self.received_at,
+            flake_dir: &self.flake_dir,
+            cache_dir: &self.cache_dir,
+            input_count: self.input_count,
+        }
     }
 
-    // The wire `rev` is a validated 40-hex object id; `GitCommitSha::parse`
-    // re-checks the (40|64)-hex commit shape the mirror key requires.
-    let rev = match GitCommitSha::parse(request.rev().as_str()) {
-        Ok(rev) => rev,
-        Err(err) => {
-            return error_response(
-                VmHttpStatus::BadRequest,
-                VmFlakeProvisionErrorCode::InvalidRequest,
-                format!("invalid flake provision rev: {err}"),
-            );
-        }
-    };
-
-    let outcome = provision_flake_from_cached_mirror(
-        &service.config.provision,
-        &service.config.mirror_cache,
-        &service.broker_state.mirror_pins,
-        &repo,
-        &rev,
-        &service.broker_state.audit,
-        session.session_id(),
-    )
-    .await;
-
-    match outcome {
-        Ok(MirrorFlakeProvisionOutcome::Provisioned(report)) => VmHttpResponse::json(
-            VmHttpStatus::Ok,
-            &VmFlakeProvisionResponse::Provisioned {
-                request_id: report.request_id(),
-                input_count: report.input_count() as u64,
-                archived_path_count: report.archived_path_count(),
-                archived_bytes: report.archived_bytes(),
+    async fn perform(self) -> EffectCompletion<Self> {
+        let request_id = self.request_id;
+        let performed = self.admitted.run().await;
+        let response = match &performed {
+            PerformedFlakeProvision::Provisioned(report) => VmHttpResponse::json(
+                VmHttpStatus::Ok,
+                &VmFlakeProvisionResponse::Provisioned {
+                    request_id: report.request_id(),
+                    input_count: report.input_count() as u64,
+                    archived_path_count: report.archived_path_count(),
+                    archived_bytes: report.archived_bytes(),
+                },
+            ),
+            // A run that started and failed is a host fault, never a lock
+            // refusal (the classifier ran at admission), so this always maps to
+            // a detail-free `ProvisionFailed`.
+            PerformedFlakeProvision::Failed { error, .. } => provision_inner_error_response(error),
+        };
+        EffectCompletion::Buffered {
+            outcome: FlakeProvisionOutcomeData {
+                request_id,
+                performed,
             },
-        ),
-        Ok(MirrorFlakeProvisionOutcome::MirrorNotCached) => {
-            VmHttpResponse::json(VmHttpStatus::Ok, &VmFlakeProvisionResponse::MirrorNotCached)
+            response,
         }
-        Err(err) => provision_error_response(&err),
+    }
+
+    fn outcome_row(outcome: &FlakeProvisionOutcomeData) -> FlakeProvisionOutcomeRecord<'_> {
+        FlakeProvisionOutcomeRecord {
+            request_id: outcome.request_id,
+            completed_at: UnixMillis::now(),
+            result: outcome.performed.audit_result(),
+        }
+    }
+
+    fn begin_error_response(err: &AuditError) -> Option<VmHttpResponse> {
+        // The session closed between the preflight above and the request row: a
+        // clean client error with the same status the preflight would have
+        // given, not an audit-write failure.
+        match err {
+            AuditError::Invariant("session does not exist") => Some(error_response(
+                VmHttpStatus::Unauthorized,
+                VmFlakeProvisionErrorCode::Denied,
+                "session is not active",
+            )),
+            AuditError::Invariant("session is closed") => Some(error_response(
+                VmHttpStatus::Gone,
+                VmFlakeProvisionErrorCode::Denied,
+                "session is closed",
+            )),
+            _ => None,
+        }
+    }
+
+    fn audit_write_failure_response() -> VmHttpResponse {
+        // Preserve the typed envelope in the audit-fault mode: the endpoint
+        // always answered a JSON `VmFlakeProvisionErrorResponse`, so an audit
+        // write failure keeps that contract rather than the driver's plain-text
+        // 500.
+        provision_failed()
     }
 }
 
@@ -322,11 +496,17 @@ mod tests {
     };
     use super::super::{VmHttpRequest, VmHttpServices, route_authenticated_vm_http_request};
     use super::*;
+    use crate::audit::FlakeProvisionAuditOutcome;
     use crate::core::{Ipv4Cidr, RepoRef, UnixMillis};
+    use crate::flake_fixtures::{
+        NO_INPUT_LOCK, SSH_INPUT_LOCK, fake_nix_archiving, fake_nix_failing,
+        flake_mirror_with_lock, tool_on_path,
+    };
     use crate::flake_lock::{FlakeLockError, FlakeProvisionBounds};
     use crate::flake_materialize::MaterializeError;
     use crate::secret::SecretStore;
     use crate::vm_git::GitCloneRepo;
+    use crate::vm_git_mirror_cache::MirrorCacheKey;
 
     type TestState = std::sync::Arc<crate::server::BrokerState<Box<dyn SecretStore>>>;
 
@@ -338,10 +518,22 @@ mod tests {
     ) -> VmHttpFlakeProvisionService<Box<dyn SecretStore>> {
         // The git/nix programs are never spawned in these tests: every path
         // either short-circuits before tool use (cache miss) or fails earlier
-        // (parse, preflight). FK3c-b2 already proves the real git+nix run.
+        // (parse, preflight). The tool-running paths use
+        // `provision_service_with_tools` below.
+        provision_service_with_tools(state, root, PathBuf::from("git"), PathBuf::from("nix"))
+    }
+
+    /// A service wired to real/fake tool paths and an empty mirror cache, so a
+    /// test can seed the cache and drive the whole endpoint.
+    fn provision_service_with_tools(
+        state: &TestState,
+        root: &std::path::Path,
+        git_program: PathBuf,
+        nix_program: PathBuf,
+    ) -> VmHttpFlakeProvisionService<Box<dyn SecretStore>> {
         let provision = MirrorFlakeProvisionConfig::new(
-            PathBuf::from("git"),
-            PathBuf::from("nix"),
+            git_program,
+            nix_program,
             root.join("materialize"),
             root.join("flake-input-cache"),
             FlakeProvisionBounds::new(64, 1 << 30, Duration::from_secs(120)).unwrap(),
@@ -350,6 +542,41 @@ mod tests {
         let config =
             VmHttpFlakeProvisionConfig::new(provision, MirrorCache::new(root.join("mirror-cache")));
         VmHttpFlakeProvisionService::new(std::sync::Arc::clone(state), config)
+    }
+
+    /// Seed the service's mirror cache with a real bare mirror of a repo whose
+    /// committed lock is `lock`, as a clone in this session would have. Returns
+    /// the `(repo, rev)` the guest then asks to provision.
+    fn seed_mirror(
+        root: &std::path::Path,
+        git_program: &std::path::Path,
+        lock: &str,
+    ) -> (RepoRef, GitCommitSha) {
+        let (mirror, rev) = flake_mirror_with_lock(git_program, &root.join("fixture"), lock);
+        let repo = repo_ref("o", "n");
+        MirrorCache::new(root.join("mirror-cache"))
+            .insert(&MirrorCacheKey::new(&repo, &rev), &mirror)
+            .unwrap();
+        (repo, rev)
+    }
+
+    /// The one flake-provision audit entry this session recorded, asserting the
+    /// pair is complete (no `*_request` row without its `*_outcome` partner).
+    fn sole_audit_entry(
+        state: &TestState,
+        session: &VmHttpSession,
+    ) -> crate::audit::FlakeProvisionAuditEntry {
+        state.audit.assert_effect_audit_pairs_complete(
+            "flake_provision_request",
+            "flake_provision_outcome",
+            "request_id",
+        );
+        let mut entries = state
+            .audit
+            .list_flake_provision_requests_for_session(session.session_id())
+            .unwrap();
+        assert_eq!(entries.len(), 1, "expected exactly one provision request");
+        entries.remove(0)
     }
 
     fn provision_request_body(owner: &str, name: &str, rev: &str) -> Vec<u8> {
@@ -386,7 +613,9 @@ mod tests {
             SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 12345)),
         );
 
-        let response = route_flake_provision_request(&session, &request, Vec::new(), service).await;
+        let response = route_flake_provision_request(&session, &request, Vec::new(), service)
+            .await
+            .into_buffered();
 
         assert_eq!(response.status, VmHttpStatus::NotFound);
     }
@@ -523,6 +752,177 @@ mod tests {
         .into_buffered();
 
         assert_eq!(response.status, VmHttpStatus::NotFound);
+    }
+
+    /// The audited success path, end to end: a real bare mirror is materialised
+    /// and a fake `nix` archives into the staging cache, so the scan, the budget
+    /// check, and the cache merge all run. The endpoint must answer
+    /// `Provisioned` *and* leave a complete `(request, outcome)` audit pair —
+    /// the invariant this whole series exists to make structural.
+    #[tokio::test]
+    async fn provisioned_flake_records_a_complete_audit_pair() {
+        let Some(git_program) = tool_on_path("git") else {
+            eprintln!("skipping: git must be on PATH");
+            return;
+        };
+        let github = MockServer::start().await;
+        let state = make_broker_state(&github);
+        let session = session();
+        open_audit_session(&state, session.session_id());
+        let temp = tempfile::tempdir().unwrap();
+        let (repo, rev) = seed_mirror(temp.path(), &git_program, NO_INPUT_LOCK);
+        record_contents_read_grant(&state, session.session_id(), repo.clone());
+        let service = provision_service_with_tools(
+            &state,
+            temp.path(),
+            git_program,
+            fake_nix_archiving(temp.path()),
+        );
+        let body = provision_request_body(&repo.owner, &repo.name, rev.as_str());
+
+        let response = handle_flake_provision_request(&session, &body, service).await;
+
+        assert_eq!(response.status, VmHttpStatus::Ok);
+        let parsed: VmFlakeProvisionResponse = serde_json::from_slice(&response.body).unwrap();
+        let VmFlakeProvisionResponse::Provisioned {
+            request_id,
+            input_count,
+            archived_path_count,
+            ..
+        } = parsed
+        else {
+            panic!("a cached, provisionable mirror should provision: {parsed:?}");
+        };
+        assert_eq!(input_count, 0, "the fixture lock declares no inputs");
+        assert_eq!(archived_path_count, 1, "the fake nix archives one path");
+
+        let entry = sole_audit_entry(&state, &session);
+        assert_eq!(entry.request_id, request_id);
+        assert_eq!(entry.input_count, 0);
+        assert!(
+            matches!(
+                entry.outcome,
+                Some(FlakeProvisionAuditOutcome::Success {
+                    archived_path_count: 1,
+                    ..
+                })
+            ),
+            "got: {:?}",
+            entry.outcome
+        );
+    }
+
+    /// The audited failure path: `nix` runs and exits non-zero. The guest sees a
+    /// generic provision failure, and the pair is still complete — a failed
+    /// effect is recorded, not dropped.
+    #[tokio::test]
+    async fn failed_provision_records_a_failure_outcome() {
+        let Some(git_program) = tool_on_path("git") else {
+            eprintln!("skipping: git must be on PATH");
+            return;
+        };
+        let github = MockServer::start().await;
+        let state = make_broker_state(&github);
+        let session = session();
+        open_audit_session(&state, session.session_id());
+        let temp = tempfile::tempdir().unwrap();
+        let (repo, rev) = seed_mirror(temp.path(), &git_program, NO_INPUT_LOCK);
+        record_contents_read_grant(&state, session.session_id(), repo.clone());
+        let service = provision_service_with_tools(
+            &state,
+            temp.path(),
+            git_program,
+            fake_nix_failing(temp.path(), 3),
+        );
+        let body = provision_request_body(&repo.owner, &repo.name, rev.as_str());
+
+        let response = handle_flake_provision_request(&session, &body, service).await;
+
+        assert_eq!(response.status, VmHttpStatus::InternalServerError);
+        let parsed: VmFlakeProvisionErrorResponse = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(parsed.error(), VmFlakeProvisionErrorCode::ProvisionFailed);
+        // The host-side detail stays host-side.
+        assert_eq!(parsed.message(), "flake input provisioning failed");
+
+        let entry = sole_audit_entry(&state, &session);
+        let Some(FlakeProvisionAuditOutcome::Failure { error }) = entry.outcome else {
+            panic!(
+                "a non-zero nix exit must audit a failure: {:?}",
+                entry.outcome
+            );
+        };
+        assert!(
+            error.contains("nix flake archive exited with"),
+            "the audit row keeps the detail the guest does not see: {error}"
+        );
+    }
+
+    /// A lock the classifier refuses is a property of the repository, not an
+    /// attempted effect: the guest is told, and *nothing* is audited — the
+    /// reject-before-begin path, with real git work having already happened.
+    #[tokio::test]
+    async fn unprovisionable_lock_is_refused_before_any_audit_row() {
+        let Some(git_program) = tool_on_path("git") else {
+            eprintln!("skipping: git must be on PATH");
+            return;
+        };
+        let github = MockServer::start().await;
+        let state = make_broker_state(&github);
+        let session = session();
+        open_audit_session(&state, session.session_id());
+        let temp = tempfile::tempdir().unwrap();
+        let (repo, rev) = seed_mirror(temp.path(), &git_program, SSH_INPUT_LOCK);
+        record_contents_read_grant(&state, session.session_id(), repo.clone());
+        // `nix` would fail loudly if it were ever spawned; it must not be.
+        let service = provision_service_with_tools(
+            &state,
+            temp.path(),
+            git_program,
+            PathBuf::from("/nonexistent/nix"),
+        );
+        let body = provision_request_body(&repo.owner, &repo.name, rev.as_str());
+
+        let response = handle_flake_provision_request(&session, &body, service).await;
+
+        assert_eq!(response.status, VmHttpStatus::UnprocessableContent);
+        let parsed: VmFlakeProvisionErrorResponse = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(parsed.error(), VmFlakeProvisionErrorCode::Unprovisionable);
+        assert!(
+            state
+                .audit
+                .list_flake_provision_requests_for_session(session.session_id())
+                .unwrap()
+                .is_empty(),
+            "a refused lock attempts no effect, so it records none"
+        );
+    }
+
+    /// A session that closes between the preflight and the driver's request-row
+    /// write is still a clean client error — the same status the preflight would
+    /// have given — not an audit-write failure. Everything else keeps the
+    /// endpoint's typed 500 envelope.
+    #[test]
+    fn begin_failures_map_sessions_to_client_errors_and_the_rest_to_the_typed_500() {
+        let unauthorized = FlakeProvisionEffect::begin_error_response(&AuditError::Invariant(
+            "session does not exist",
+        ))
+        .expect("an unknown session is a client error");
+        assert_eq!(unauthorized.status, VmHttpStatus::Unauthorized);
+
+        let gone =
+            FlakeProvisionEffect::begin_error_response(&AuditError::Invariant("session is closed"))
+                .expect("a closed session is a client error");
+        assert_eq!(gone.status, VmHttpStatus::Gone);
+
+        assert!(
+            FlakeProvisionEffect::begin_error_response(&AuditError::Invariant("disk on fire"))
+                .is_none(),
+            "a genuine audit fault must fall through to the audit-write 500"
+        );
+        let fault = FlakeProvisionEffect::audit_write_failure_response();
+        assert_eq!(fault.status, VmHttpStatus::InternalServerError);
+        let body: VmFlakeProvisionErrorResponse = serde_json::from_slice(&fault.body).unwrap();
+        assert_eq!(body.error(), VmFlakeProvisionErrorCode::ProvisionFailed);
     }
 
     #[test]

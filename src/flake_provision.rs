@@ -59,11 +59,8 @@ use std::time::Duration;
 
 use tokio::process::Command;
 
-use crate::audit::{
-    AUDIT_WRITE_FAILURE_TARGET, AuditError, AuditLog, FlakeProvisionOutcomeRecord,
-    FlakeProvisionRequestRecord, FlakeProvisionResult,
-};
-use crate::core::{RequestId, SessionId, UnixMillis};
+use crate::audit::FlakeProvisionResult;
+use crate::core::RequestId;
 use crate::flake_lock::{
     FlakeLock, FlakeLockError, FlakeProvisionBounds, FlakeProvisionPlan, FlakeProvisionPlanError,
 };
@@ -142,28 +139,107 @@ pub enum FlakeProvisionError {
         archived_bytes: u64,
         max_total_bytes: u64,
     },
-    #[error("audit write failed: {0}")]
-    Audit(AuditError),
 }
 
-/// Provision the committed, locked flake inputs of the flake checked out at
-/// `flake_dir` into the binary cache at `cache_dir`, running `nix flake
-/// archive` on the host.
+/// A provisioning run that passed pre-flight: the committed lock was read,
+/// parsed, and planned (so the classifier has already refused anything local,
+/// private, credential-requiring, or unpinned), and `nix` resolved. Holding one
+/// is the proof that the run is *admissible* — which is exactly the point at
+/// which the attempted host egress becomes worth auditing.
 ///
-/// Pre-flight (read lock → parse → plan) fails closed before any audit row or
-/// egress. A refused lock is returned as [`FlakeProvisionError::ParseLock`] /
-/// [`FlakeProvisionError::Plan`] with no audit row (no fetch was attempted —
-/// the caller decides how to surface a non-provisionable repo). Once admitted,
-/// the run is audited two-phase against `session_id`, which must be open.
-pub async fn provision_flake_inputs(
+/// It carries everything the audit request row describes
+/// ([`request_id`](Self::request_id), [`flake_dir`](Self::flake_dir),
+/// [`cache_dir`](Self::cache_dir), [`input_count`](Self::input_count)), so the
+/// shell can record the attempt *before* [`run`](Self::run) performs it. This
+/// module writes no audit rows itself: it returns descriptions of what happened
+/// and the caller records them (today, the `broker_effect` driver, whose guard
+/// makes the pair structural).
+#[derive(Debug)]
+pub struct AdmittedFlakeProvision {
+    request_id: RequestId,
+    /// The resolved, canonicalised `nix` binary.
+    program: PathBuf,
+    plan: FlakeProvisionPlan,
+}
+
+impl AdmittedFlakeProvision {
+    /// The id correlating the audit rows with the returned report.
+    pub fn request_id(&self) -> RequestId {
+        self.request_id
+    }
+
+    pub fn flake_dir(&self) -> &Path {
+        self.plan.flake_dir()
+    }
+
+    pub fn cache_dir(&self) -> &Path {
+        self.plan.cache_dir()
+    }
+
+    /// Inputs the committed lock declared (from the functional core).
+    pub fn input_count(&self) -> usize {
+        self.plan.input_count()
+    }
+}
+
+/// The observed result of an admitted run. Every exit is describable as a
+/// truthful audit outcome — success carries the archive metrics, and every
+/// failure carries the message it is recorded under — so, unlike git-push
+/// staging, this effect never needs to abandon its audit guard.
+#[derive(Debug)]
+pub enum PerformedFlakeProvision {
+    Provisioned(FlakeProvisionReport),
+    Failed {
+        /// The message recorded in the audit outcome row. It is *not* the
+        /// error's `Display`: the row deliberately records what the run
+        /// observed (`nix flake archive exited with …`) rather than the
+        /// caller-facing wording.
+        message: String,
+        error: FlakeProvisionError,
+    },
+}
+
+impl PerformedFlakeProvision {
+    /// The audit outcome row this run truthfully records.
+    pub fn audit_result(&self) -> FlakeProvisionResult<'_> {
+        match self {
+            Self::Provisioned(report) => FlakeProvisionResult::Success {
+                archived_path_count: report.archived_path_count,
+                archived_bytes: report.archived_bytes,
+            },
+            Self::Failed { message, .. } => FlakeProvisionResult::Failure { error: message },
+        }
+    }
+
+    /// Collapse to the ordinary result, discarding the audit wording.
+    pub fn into_result(self) -> Result<FlakeProvisionReport, FlakeProvisionError> {
+        match self {
+            Self::Provisioned(report) => Ok(report),
+            Self::Failed { error, .. } => Err(error),
+        }
+    }
+
+    fn failed(message: String, error: FlakeProvisionError) -> Self {
+        Self::Failed { message, error }
+    }
+}
+
+/// Pre-flight the committed, locked flake checked out at `flake_dir` against
+/// the binary cache at `cache_dir`, admitting it for a `nix flake archive` run.
+///
+/// Pre-flight (read lock → parse → plan → resolve `nix`) fails closed before any
+/// egress *and before the caller has anything to audit*. A refused lock is
+/// returned as [`FlakeProvisionError::ParseLock`] / [`FlakeProvisionError::Plan`]
+/// — no fetch was attempted, so there is no attempt to record, and the caller
+/// decides how to surface a non-provisionable repo. Only the returned
+/// [`AdmittedFlakeProvision`] can be [`run`](AdmittedFlakeProvision::run), so the
+/// audited egress cannot start without the description the request row needs.
+pub async fn admit_flake_provision(
     nix_program: &Path,
     flake_dir: &Path,
     cache_dir: &Path,
     bounds: FlakeProvisionBounds,
-    audit: &AuditLog,
-    session_id: SessionId,
-) -> Result<FlakeProvisionReport, FlakeProvisionError> {
-    // --- pre-flight: refuse before any audit row or egress ---
+) -> Result<AdmittedFlakeProvision, FlakeProvisionError> {
     let lock_path = flake_dir.join(FLAKE_LOCK_FILE);
     let lock_bytes =
         tokio::fs::read(&lock_path)
@@ -182,258 +258,183 @@ pub async fn provision_flake_inputs(
     )
     .map_err(FlakeProvisionError::Plan)?;
 
-    // --- setup (still pre-fetch; failures here are not audited egress) ---
+    // Still pre-fetch: a missing `nix` is a host misconfiguration, not an
+    // attempted egress, so it is refused here rather than recorded as a failure.
     let program = process_supervisor::resolve_program(plan.nix_program(), "nix_program")
         .await
         .map_err(|err| FlakeProvisionError::ResolveNix(err.to_string()))?;
 
-    let request_id = RequestId::new();
+    Ok(AdmittedFlakeProvision {
+        request_id: RequestId::new(),
+        program,
+        plan,
+    })
+}
 
-    // --- audited run begins: the request row marks the attempted egress ---
-    let flake_dir_text = plan.flake_dir().to_string_lossy();
-    let cache_dir_text = plan.cache_dir().to_string_lossy();
-    write_request(
-        audit,
-        request_id,
-        session_id,
-        &flake_dir_text,
-        &cache_dir_text,
-        plan.input_count(),
-    )?;
+impl AdmittedFlakeProvision {
+    /// Run `nix flake archive` for this admitted plan and publish the verified
+    /// archive into the shared cache. Every exit — including a panic-free host
+    /// fault — is reported as a [`PerformedFlakeProvision`] the caller records;
+    /// this never writes an audit row itself.
+    pub async fn run(self) -> PerformedFlakeProvision {
+        let AdmittedFlakeProvision {
+            request_id,
+            program,
+            plan,
+        } = self;
+        let bounds = plan.bounds();
+        let cache_dir = plan.cache_dir().to_path_buf();
 
-    // Per-run scratch named by the unpredictable request id: a fresh HOME (so
-    // the host's user-level nix.conf / ~/.netrc / git credentials cannot reach
-    // the fetch) and a same-filesystem staging cache. nix archives into staging
-    // — never straight into the guest-visible cache_dir — so a crash, timeout,
-    // over-budget, or audit failure cannot expose partial/untrusted content;
-    // staging is published into cache_dir only after the run is verified.
-    let home_dir = match create_home_dir(request_id) {
-        Ok(home_dir) => home_dir,
-        Err(source) => {
-            let message = format!("could not create provisioning scratch: {source}");
-            write_outcome(
-                audit,
-                request_id,
-                FlakeProvisionResult::Failure { error: &message },
-            )?;
-            return Err(FlakeProvisionError::Scratch { source });
-        }
-    };
-    let staging = match create_staging(cache_dir, request_id) {
-        Ok(staging) => staging,
-        Err(source) => {
-            cleanup_home_dir(&home_dir);
-            let message = format!("could not create provisioning staging: {source}");
-            write_outcome(
-                audit,
-                request_id,
-                FlakeProvisionResult::Failure { error: &message },
-            )?;
-            return Err(FlakeProvisionError::Scratch { source });
-        }
-    };
-    // Remove the staging cache on *every* exit path below — including an early
-    // `?` return from an audit-write failure — so a failed run never leaks the
-    // (possibly disk-filling) unpublished archive. On success the merge has
-    // already copied the entries out before this drops.
-    let _staging_cleanup = StagingCleanup(staging.clone());
-
-    let mut command = Command::new(program);
-    apply_nix_env(&mut command, &home_dir);
-    command.args(nix_isolation_args());
-    command.args(plan.nix_archive_args(&staging));
-    command.stdin(Stdio::null());
-    // Run from `/` so that for a `git+https` input, the `git` nix invokes does
-    // not discover a repo-local `.git/config` (an `url.*.insteadOf` /
-    // `credential.helper`) by walking up from the broker's cwd — the
-    // `GIT_CONFIG_*` env only blocks system/global config, not repo-local.
-    command.current_dir("/");
-    // The supervisor sets stdout, stderr, and the process group, bounds the
-    // wall-clock, and SIGKILLs the group on exit or timeout. nix's stderr is
-    // discarded (`StderrMode::Discard`): a hostile flake can spew unbounded
-    // diagnostics during evaluation, so we never retain them. Failures report
-    // the exit status; an operator can re-run for detail.
-    let outcome = process_supervisor::run_supervised(
-        &mut command,
-        bounds.timeout(),
-        StdoutMode::Discard,
-        StderrMode::Discard,
-    )
-    .await;
-
-    cleanup_home_dir(&home_dir);
-
-    let outcome = match outcome {
-        Ok(outcome) => outcome,
-        Err(err) => {
-            // Spawn/wait/kill failure: record the attempt as a failure.
-            let message = format!("nix flake archive could not be run: {err}");
-            write_outcome(
-                audit,
-                request_id,
-                FlakeProvisionResult::Failure { error: &message },
-            )?;
-            return Err(FlakeProvisionError::Supervise(err.to_string()));
-        }
-    };
-
-    match outcome {
-        SupervisedOutcome::StdoutCapExceeded { cap } => {
-            // Unreachable under StdoutMode::Discard (stdout is never captured,
-            // so the cap is never evaluated), but fail closed rather than panic
-            // if the supervisor contract ever changes underneath us.
-            let message = format!("nix flake archive stdout exceeded the {cap}-byte capture cap");
-            write_outcome(
-                audit,
-                request_id,
-                FlakeProvisionResult::Failure { error: &message },
-            )?;
-            Err(FlakeProvisionError::Supervise(message))
-        }
-        SupervisedOutcome::TimedOut => {
-            let message = format!("nix flake archive timed out after {:?}", bounds.timeout());
-            write_outcome(
-                audit,
-                request_id,
-                FlakeProvisionResult::Failure { error: &message },
-            )?;
-            Err(FlakeProvisionError::TimedOut {
-                timeout: bounds.timeout(),
-            })
-        }
-        SupervisedOutcome::Exited { status, .. } if !status.success() => {
-            let message = format!("nix flake archive exited with {status}");
-            write_outcome(
-                audit,
-                request_id,
-                FlakeProvisionResult::Failure { error: &message },
-            )?;
-            Err(FlakeProvisionError::NixFailed { status })
-        }
-        SupervisedOutcome::Exited { .. } => {
-            let scan_dir = staging.clone();
-            let scan = tokio::task::spawn_blocking(move || scan_cache(&scan_dir))
-                .await
-                .expect("cache scan task panicked");
-            let (archived_path_count, archived_bytes) = match scan {
-                Ok(metrics) => metrics,
-                Err(source) => {
-                    let message = format!("could not scan provisioning cache: {source}");
-                    write_outcome(
-                        audit,
-                        request_id,
-                        FlakeProvisionResult::Failure { error: &message },
-                    )?;
-                    return Err(FlakeProvisionError::ScanCache {
-                        path: staging,
-                        source,
-                    });
-                }
-            };
-
-            if archived_bytes > bounds.max_total_bytes() {
-                let message = format!(
-                    "archived {archived_bytes} bytes exceeds the configured maximum {}",
-                    bounds.max_total_bytes()
+        // Per-run scratch named by the unpredictable request id: a fresh HOME
+        // (so the host's user-level nix.conf / ~/.netrc / git credentials cannot
+        // reach the fetch) and a same-filesystem staging cache. nix archives
+        // into staging — never straight into the guest-visible cache_dir — so a
+        // crash, timeout, over-budget, or audit failure cannot expose
+        // partial/untrusted content; staging is published into cache_dir only
+        // after the run is verified.
+        let home_dir = match create_home_dir(request_id) {
+            Ok(home_dir) => home_dir,
+            Err(source) => {
+                return PerformedFlakeProvision::failed(
+                    format!("could not create provisioning scratch: {source}"),
+                    FlakeProvisionError::Scratch { source },
                 );
-                write_outcome(
-                    audit,
-                    request_id,
-                    FlakeProvisionResult::Failure { error: &message },
-                )?;
-                return Err(FlakeProvisionError::OverBudget {
-                    archived_bytes,
-                    max_total_bytes: bounds.max_total_bytes(),
-                });
             }
+        };
+        let staging = match create_staging(&cache_dir, request_id) {
+            Ok(staging) => staging,
+            Err(source) => {
+                cleanup_home_dir(&home_dir);
+                return PerformedFlakeProvision::failed(
+                    format!("could not create provisioning staging: {source}"),
+                    FlakeProvisionError::Scratch { source },
+                );
+            }
+        };
+        // Remove the staging cache on *every* exit path below — including a
+        // panic — so a failed run never leaks the (possibly disk-filling)
+        // unpublished archive. On success the merge has already copied the
+        // entries out before this drops.
+        let _staging_cleanup = StagingCleanup(staging.clone());
 
-            // Merge the verified, within-budget archive into the shared
-            // content-addressed cache *before* recording the outcome, so the
-            // append-only audit log never claims success for a cache that a
-            // failed publish left unexposed. The merge adds this flake's
-            // entries without dropping other repos'; every merged entry is
-            // verified, so exposing it before the (immediately-following)
-            // success row is durable is not a trust regression.
-            if let Err(source) = merge_into_cache(&staging, cache_dir, request_id) {
-                let message = format!("could not publish provisioning cache: {source}");
-                write_outcome(
-                    audit,
-                    request_id,
-                    FlakeProvisionResult::Failure { error: &message },
-                )?;
-                return Err(FlakeProvisionError::PublishCache {
-                    path: cache_dir.to_path_buf(),
-                    source,
-                });
+        let mut command = Command::new(program);
+        apply_nix_env(&mut command, &home_dir);
+        command.args(nix_isolation_args());
+        command.args(plan.nix_archive_args(&staging));
+        command.stdin(Stdio::null());
+        // Run from `/` so that for a `git+https` input, the `git` nix invokes
+        // does not discover a repo-local `.git/config` (an `url.*.insteadOf` /
+        // `credential.helper`) by walking up from the broker's cwd — the
+        // `GIT_CONFIG_*` env only blocks system/global config, not repo-local.
+        command.current_dir("/");
+        // The supervisor sets stdout, stderr, and the process group, bounds the
+        // wall-clock, and SIGKILLs the group on exit or timeout. nix's stderr is
+        // discarded (`StderrMode::Discard`): a hostile flake can spew unbounded
+        // diagnostics during evaluation, so we never retain them. Failures
+        // report the exit status; an operator can re-run for detail.
+        let outcome = process_supervisor::run_supervised(
+            &mut command,
+            bounds.timeout(),
+            StdoutMode::Discard,
+            StderrMode::Discard,
+        )
+        .await;
+
+        cleanup_home_dir(&home_dir);
+
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                // Spawn/wait/kill failure: report the attempt as a failure.
+                return PerformedFlakeProvision::failed(
+                    format!("nix flake archive could not be run: {err}"),
+                    FlakeProvisionError::Supervise(err.to_string()),
+                );
             }
-            write_outcome(
-                audit,
-                request_id,
-                FlakeProvisionResult::Success {
+        };
+
+        match outcome {
+            SupervisedOutcome::StdoutCapExceeded { cap } => {
+                // Unreachable under StdoutMode::Discard (stdout is never
+                // captured, so the cap is never evaluated), but fail closed
+                // rather than panic if the supervisor contract ever changes
+                // underneath us.
+                let message =
+                    format!("nix flake archive stdout exceeded the {cap}-byte capture cap");
+                PerformedFlakeProvision::failed(
+                    message.clone(),
+                    FlakeProvisionError::Supervise(message),
+                )
+            }
+            SupervisedOutcome::TimedOut => PerformedFlakeProvision::failed(
+                format!("nix flake archive timed out after {:?}", bounds.timeout()),
+                FlakeProvisionError::TimedOut {
+                    timeout: bounds.timeout(),
+                },
+            ),
+            SupervisedOutcome::Exited { status, .. } if !status.success() => {
+                PerformedFlakeProvision::failed(
+                    format!("nix flake archive exited with {status}"),
+                    FlakeProvisionError::NixFailed { status },
+                )
+            }
+            SupervisedOutcome::Exited { .. } => {
+                let scan_dir = staging.clone();
+                let scan = tokio::task::spawn_blocking(move || scan_cache(&scan_dir))
+                    .await
+                    .expect("cache scan task panicked");
+                let (archived_path_count, archived_bytes) = match scan {
+                    Ok(metrics) => metrics,
+                    Err(source) => {
+                        return PerformedFlakeProvision::failed(
+                            format!("could not scan provisioning cache: {source}"),
+                            FlakeProvisionError::ScanCache {
+                                path: staging,
+                                source,
+                            },
+                        );
+                    }
+                };
+
+                if archived_bytes > bounds.max_total_bytes() {
+                    return PerformedFlakeProvision::failed(
+                        format!(
+                            "archived {archived_bytes} bytes exceeds the configured maximum {}",
+                            bounds.max_total_bytes()
+                        ),
+                        FlakeProvisionError::OverBudget {
+                            archived_bytes,
+                            max_total_bytes: bounds.max_total_bytes(),
+                        },
+                    );
+                }
+
+                // Merge the verified, within-budget archive into the shared
+                // content-addressed cache *before* returning the success the
+                // caller records, so the append-only audit log never claims
+                // success for a cache that a failed publish left unexposed. The
+                // merge adds this flake's entries without dropping other repos';
+                // every merged entry is verified, so exposing it before the
+                // (immediately-following) success row is durable is not a trust
+                // regression.
+                if let Err(source) = merge_into_cache(&staging, &cache_dir, request_id) {
+                    return PerformedFlakeProvision::failed(
+                        format!("could not publish provisioning cache: {source}"),
+                        FlakeProvisionError::PublishCache {
+                            path: cache_dir,
+                            source,
+                        },
+                    );
+                }
+                PerformedFlakeProvision::Provisioned(FlakeProvisionReport {
+                    request_id,
+                    input_count: plan.input_count(),
                     archived_path_count,
                     archived_bytes,
-                },
-            )?;
-            Ok(FlakeProvisionReport {
-                request_id,
-                input_count: plan.input_count(),
-                archived_path_count,
-                archived_bytes,
-            })
+                })
+            }
         }
     }
-}
-
-fn write_request(
-    audit: &AuditLog,
-    request_id: RequestId,
-    session_id: SessionId,
-    flake_dir: &str,
-    cache_dir: &str,
-    input_count: usize,
-) -> Result<(), FlakeProvisionError> {
-    audit
-        .record_flake_provision_request(&FlakeProvisionRequestRecord {
-            request_id,
-            session_id,
-            received_at: UnixMillis::now(),
-            flake_dir,
-            cache_dir,
-            input_count: input_count as u64,
-        })
-        .map_err(|err| {
-            tracing::error!(
-                target: AUDIT_WRITE_FAILURE_TARGET,
-                kind = "flake_provision_request",
-                request_id = %request_id,
-                error = %err,
-                "audit write failed",
-            );
-            FlakeProvisionError::Audit(err)
-        })
-}
-
-fn write_outcome(
-    audit: &AuditLog,
-    request_id: RequestId,
-    result: FlakeProvisionResult<'_>,
-) -> Result<(), FlakeProvisionError> {
-    audit
-        .record_flake_provision_outcome(&FlakeProvisionOutcomeRecord {
-            request_id,
-            completed_at: UnixMillis::now(),
-            result,
-        })
-        .map_err(|err| {
-            tracing::error!(
-                target: AUDIT_WRITE_FAILURE_TARGET,
-                kind = "flake_provision_outcome",
-                request_id = %request_id,
-                error = %err,
-                "audit write failed",
-            );
-            FlakeProvisionError::Audit(err)
-        })
 }
 
 /// `nix` global flags that isolate the run from credentials the committed lock
@@ -656,22 +657,17 @@ fn scan_cache(dir: &Path) -> std::io::Result<(u64, u64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::audit::FlakeProvisionAuditOutcome;
-    use crate::core::SessionRecord;
+    use crate::flake_fixtures::fake_nix_failing;
 
-    fn open_session(audit: &AuditLog) -> SessionId {
-        let session_id = SessionId::new();
-        audit
-            .open_session(&SessionRecord {
-                session_id,
-                label: Some("fk1b-test".into()),
-                agent_kind: None,
-                agent_model: None,
-                opened_at: UnixMillis::from_millis(1_700_000_000),
-                closed_at: None,
-            })
-            .unwrap();
-        session_id
+    /// The audit outcome a performed run describes, as the DAO would see it.
+    /// Every run must describe exactly one, and it must agree with the ordinary
+    /// result — that agreement is what lets the shell record the pair without
+    /// re-deriving anything.
+    fn audit_outcome(performed: &PerformedFlakeProvision) -> (bool, String) {
+        match performed.audit_result() {
+            FlakeProvisionResult::Success { .. } => (true, String::new()),
+            FlakeProvisionResult::Failure { error } => (false, error.to_string()),
+        }
     }
 
     fn bounds(max_total_bytes: u64) -> FlakeProvisionBounds {
@@ -723,29 +719,40 @@ mod tests {
         .unwrap();
     }
 
+    /// Admitting and running is one step in the tests that only care about the
+    /// run: the split exists for the *caller* to record the attempt between the
+    /// two halves.
+    async fn admit_and_run(
+        nix: &Path,
+        flake_dir: &Path,
+        cache_dir: &Path,
+        bounds: FlakeProvisionBounds,
+    ) -> Result<PerformedFlakeProvision, FlakeProvisionError> {
+        Ok(admit_flake_provision(nix, flake_dir, cache_dir, bounds)
+            .await?
+            .run()
+            .await)
+    }
+
     #[tokio::test]
-    async fn provisions_a_no_input_flake_and_audits_success() {
+    async fn provisions_a_no_input_flake_and_describes_a_success_outcome() {
         let Some(nix) = nix_program() else {
             eprintln!("skipping: nix not found on PATH");
             return;
         };
-        let audit = AuditLog::open_in_memory().unwrap();
-        let session_id = open_session(&audit);
         let flake = tempfile::tempdir().unwrap();
         let cache = tempfile::tempdir().unwrap();
         write_no_input_flake(flake.path());
 
-        let report = provision_flake_inputs(
-            &nix,
-            flake.path(),
-            cache.path(),
-            bounds(1 << 30),
-            &audit,
-            session_id,
-        )
-        .await
-        .expect("provisioning a no-input flake should succeed");
+        let performed = admit_and_run(&nix, flake.path(), cache.path(), bounds(1 << 30))
+            .await
+            .expect("a no-input flake is admissible");
 
+        let (is_success, _) = audit_outcome(&performed);
+        assert!(is_success, "got: {performed:?}");
+        let report = performed
+            .into_result()
+            .expect("provisioning a no-input flake should succeed");
         assert_eq!(report.input_count(), 0);
         assert!(
             report.archived_path_count() >= 1,
@@ -757,48 +764,28 @@ mod tests {
         // The cache really holds narinfos.
         let (narinfos, _) = scan_cache(cache.path()).unwrap();
         assert_eq!(narinfos, report.archived_path_count());
-
-        let entries = audit
-            .list_flake_provision_requests_for_session(session_id)
-            .unwrap();
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].request_id, report.request_id());
-        assert_eq!(entries[0].input_count, 0);
-        assert_eq!(
-            entries[0].outcome,
-            Some(FlakeProvisionAuditOutcome::Success {
-                archived_path_count: report.archived_path_count(),
-                archived_bytes: report.archived_bytes(),
-            })
-        );
     }
 
     #[tokio::test]
-    async fn over_budget_archive_fails_closed_and_audits_failure() {
+    async fn over_budget_archive_fails_closed_and_describes_a_failure_outcome() {
         let Some(nix) = nix_program() else {
             eprintln!("skipping: nix not found on PATH");
             return;
         };
-        let audit = AuditLog::open_in_memory().unwrap();
-        let session_id = open_session(&audit);
         let flake = tempfile::tempdir().unwrap();
         let cache = tempfile::tempdir().unwrap();
         write_no_input_flake(flake.path());
 
         // A 1-byte cap is exceeded by any real archive.
-        let err = provision_flake_inputs(
-            &nix,
-            flake.path(),
-            cache.path(),
-            bounds(1),
-            &audit,
-            session_id,
-        )
-        .await
-        .expect_err("a 1-byte budget must fail closed");
+        let performed = admit_and_run(&nix, flake.path(), cache.path(), bounds(1))
+            .await
+            .expect("the lock is admissible; the budget is what fails");
+
+        let (is_success, error) = audit_outcome(&performed);
+        assert!(!is_success, "a 1-byte budget must fail closed");
         assert!(
-            matches!(err, FlakeProvisionError::OverBudget { .. }),
-            "got: {err:?}"
+            error.contains("exceeds the configured maximum"),
+            "got: {error}"
         );
 
         // The over-budget archive must be removed, not left substitutable.
@@ -811,13 +798,37 @@ mod tests {
         };
         assert_eq!(remaining, 0, "over-budget cache must be cleaned");
 
-        let entries = audit
-            .list_flake_provision_requests_for_session(session_id)
-            .unwrap();
-        assert_eq!(entries.len(), 1);
+        assert!(
+            matches!(
+                performed.into_result(),
+                Err(FlakeProvisionError::OverBudget { .. })
+            ),
+            "the caller-facing error must agree with the audit outcome"
+        );
+    }
+
+    /// A run that fails still describes a truthful outcome, so the caller always
+    /// has a row to complete its audit pair with — no nix needed to prove it.
+    #[tokio::test]
+    async fn a_failed_run_describes_the_failure_it_is_recorded_under() {
+        let flake = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        write_no_input_flake(flake.path());
+        let nix = fake_nix_failing(flake.path(), 3);
+
+        let performed = admit_and_run(&nix, flake.path(), cache.path(), bounds(1 << 30))
+            .await
+            .expect("a no-input flake is admissible");
+
+        let (is_success, error) = audit_outcome(&performed);
+        assert!(!is_success);
+        assert!(
+            error.contains("nix flake archive exited with"),
+            "got: {error}"
+        );
         assert!(matches!(
-            entries[0].outcome,
-            Some(FlakeProvisionAuditOutcome::Failure { .. })
+            performed.into_result(),
+            Err(FlakeProvisionError::NixFailed { .. })
         ));
     }
 
@@ -827,8 +838,6 @@ mod tests {
             eprintln!("skipping: nix not found on PATH");
             return;
         };
-        let audit = AuditLog::open_in_memory().unwrap();
-        let session_id = open_session(&audit);
         let flake = tempfile::tempdir().unwrap();
         // A cache *subdir* of the tempdir, so the staging sibling lands in this
         // test's private tempdir rather than the shared system temp.
@@ -836,16 +845,11 @@ mod tests {
         let cache_dir = cache.path().join("cache");
         write_no_input_flake(flake.path());
 
-        provision_flake_inputs(
-            &nix,
-            flake.path(),
-            &cache_dir,
-            bounds(1 << 30),
-            &audit,
-            session_id,
-        )
-        .await
-        .expect("first provisioning should succeed");
+        admit_and_run(&nix, flake.path(), &cache_dir, bounds(1 << 30))
+            .await
+            .expect("a no-input flake is admissible")
+            .into_result()
+            .expect("first provisioning should succeed");
 
         // Seed a foreign content-addressed entry, as if another repo had been
         // provisioned into this shared cache.
@@ -854,16 +858,11 @@ mod tests {
 
         // Reprovision: a union merge must add this flake's entries without
         // dropping the foreign one.
-        provision_flake_inputs(
-            &nix,
-            flake.path(),
-            &cache_dir,
-            bounds(1 << 30),
-            &audit,
-            session_id,
-        )
-        .await
-        .expect("reprovisioning into a shared cache should succeed");
+        admit_and_run(&nix, flake.path(), &cache_dir, bounds(1 << 30))
+            .await
+            .expect("a no-input flake is admissible")
+            .into_result()
+            .expect("reprovisioning into a shared cache should succeed");
 
         assert!(
             foreign.exists(),
@@ -889,22 +888,20 @@ mod tests {
         assert_eq!(leftovers, 0, "no staging dirs should be left behind");
     }
 
+    /// A missing lock is refused at admission, so the caller never gets an
+    /// `AdmittedFlakeProvision` — and therefore has nothing to record.
     #[tokio::test]
-    async fn missing_lock_is_refused_before_any_audit_row() {
+    async fn missing_lock_is_refused_before_admission() {
         // No nix needed: pre-flight refusal.
-        let audit = AuditLog::open_in_memory().unwrap();
-        let session_id = open_session(&audit);
         let flake = tempfile::tempdir().unwrap();
         let cache = tempfile::tempdir().unwrap();
         // flake dir exists but has no flake.lock
 
-        let err = provision_flake_inputs(
+        let err = admit_flake_provision(
             Path::new("nix"),
             flake.path(),
             cache.path(),
             bounds(1 << 30),
-            &audit,
-            session_id,
         )
         .await
         .expect_err("a missing lock must be refused");
@@ -912,21 +909,11 @@ mod tests {
             matches!(err, FlakeProvisionError::ReadLock { .. }),
             "got: {err:?}"
         );
-
-        // No audit row: nothing was attempted.
-        assert!(
-            audit
-                .list_flake_provision_requests_for_session(session_id)
-                .unwrap()
-                .is_empty()
-        );
     }
 
     #[tokio::test]
-    async fn non_provisionable_lock_is_refused_before_any_audit_row() {
-        // An ssh input is rejected by the functional core; no audit, no nix.
-        let audit = AuditLog::open_in_memory().unwrap();
-        let session_id = open_session(&audit);
+    async fn non_provisionable_lock_is_refused_before_admission() {
+        // An ssh input is rejected by the functional core; no admission, no nix.
         let flake = tempfile::tempdir().unwrap();
         let cache = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -936,40 +923,18 @@ mod tests {
         .unwrap();
         std::fs::write(
             flake.path().join("flake.lock"),
-            r#"{
-                "version": 7,
-                "root": "root",
-                "nodes": {
-                    "root": { "inputs": { "dep": "dep" } },
-                    "dep": {
-                        "locked": {
-                            "type": "git",
-                            "url": "git+ssh://git@example.com/acme/secret",
-                            "rev": "1111111111111111111111111111111111111111",
-                            "narHash": "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
-                        }
-                    }
-                }
-            }"#,
+            crate::flake_fixtures::SSH_INPUT_LOCK,
         )
         .unwrap();
 
-        let err = provision_flake_inputs(
+        let err = admit_flake_provision(
             Path::new("nix"),
             flake.path(),
             cache.path(),
             bounds(1 << 30),
-            &audit,
-            session_id,
         )
         .await
         .expect_err("an ssh input must be refused");
         assert!(matches!(err, FlakeProvisionError::Plan(_)), "got: {err:?}");
-        assert!(
-            audit
-                .list_flake_provision_requests_for_session(session_id)
-                .unwrap()
-                .is_empty()
-        );
     }
 }

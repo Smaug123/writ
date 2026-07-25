@@ -62,8 +62,8 @@ pub use effect_scan::{EFFECT_AUDIT_PAIRS, EffectAuditPair, UnpairedEffectRows};
 pub use effect_table::expect_guard_interruptions;
 pub use effect_table::{AbandonableEffect, EffectAuditTable, RecordedRequest};
 pub use flake_provision::{
-    FlakeProvisionAuditEntry, FlakeProvisionAuditOutcome, FlakeProvisionOutcomeRecord,
-    FlakeProvisionRequestRecord, FlakeProvisionResult,
+    FlakeProvisionAuditEntry, FlakeProvisionAuditOutcome, FlakeProvisionAuditTable,
+    FlakeProvisionOutcomeRecord, FlakeProvisionRequestRecord, FlakeProvisionResult,
 };
 pub use git_push::{
     GitPushApproveAttemptEntry, GitPushApproveAttemptOutcome, GitPushApproveAttemptState,
