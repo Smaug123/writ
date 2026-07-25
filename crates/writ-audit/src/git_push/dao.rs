@@ -10,6 +10,16 @@
 use super::*;
 use rusqlite::Connection;
 
+/// Parse a raw `state` column value into its discriminant. A value
+/// outside the enum is a schema-CHECK violation that should have been
+/// impossible, so it surfaces as an `Invariant` error rather than being
+/// silently treated as "some other state".
+fn parse_state_name(raw: &str) -> Result<ApproveAttemptStateName, AuditError> {
+    ApproveAttemptStateName::parse_wire(raw).ok_or(AuditError::Invariant(
+        "approve attempt row: state value is invalid",
+    ))
+}
+
 /// Insert one git-push request row into this connection/transaction. Assumes
 /// `check_session_open` ran. The base pair carries no field validation of its
 /// own (the request fields are already parsed newtypes — `GitCloneRepo`,
@@ -400,7 +410,7 @@ impl AuditLog {
             let Some(state) = state else {
                 return Err(AuditError::Invariant("approve attempt does not exist"));
             };
-            if state != "started" {
+            if parse_state_name(&state)? != ApproveAttemptStateName::Started {
                 return Err(AuditError::Invariant(
                     "approve attempt mint ledger requires 'started' state",
                 ));
@@ -585,7 +595,7 @@ impl AuditLog {
             else {
                 return Err(AuditError::Invariant("approve attempt does not exist"));
             };
-            if state != "uncertain" {
+            if parse_state_name(&state)? != ApproveAttemptStateName::Uncertain {
                 return Err(AuditError::Invariant(
                     "approve attempt is not in 'uncertain' state",
                 ));
@@ -660,8 +670,11 @@ impl AuditLog {
     ) -> Result<(), AuditError> {
         self.complete_attempt_failure(
             attempt_id,
-            "pre_patch_failure",
-            &["started", "uncertain"],
+            ApproveAttemptOutcomeName::PrePatchFailure,
+            &[
+                ApproveAttemptStateName::Started,
+                ApproveAttemptStateName::Uncertain,
+            ],
             detail,
             completed_at,
         )
@@ -706,7 +719,7 @@ impl AuditLog {
             let Some(state) = current_state else {
                 return Err(AuditError::Invariant("approve attempt does not exist"));
             };
-            if state != "started" {
+            if parse_state_name(&state)? != ApproveAttemptStateName::Started {
                 return Err(AuditError::Invariant(
                     "approve attempt: capturing-mint pre_patch_failure requires 'started' state",
                 ));
@@ -749,8 +762,8 @@ impl AuditLog {
     ) -> Result<(), AuditError> {
         self.complete_attempt_failure(
             attempt_id,
-            "post_patch_failure",
-            &["uncertain"],
+            ApproveAttemptOutcomeName::PostPatchFailure,
+            &[ApproveAttemptStateName::Uncertain],
             detail,
             completed_at,
         )
@@ -939,8 +952,8 @@ impl AuditLog {
     fn complete_attempt_failure(
         &self,
         attempt_id: ApproveAttemptId,
-        outcome: &'static str,
-        allowed_states: &[&'static str],
+        outcome: ApproveAttemptOutcomeName,
+        allowed_states: &[ApproveAttemptStateName],
         detail: &str,
         completed_at: UnixMillis,
     ) -> Result<(), AuditError> {
@@ -967,7 +980,8 @@ impl AuditLog {
             let Some(state) = current_state else {
                 return Err(AuditError::Invariant("approve attempt does not exist"));
             };
-            if !allowed_states.contains(&state.as_str()) {
+            let state = parse_state_name(&state)?;
+            if !allowed_states.contains(&state) {
                 return Err(AuditError::Invariant(
                     "approve attempt is not in a state that admits this failure outcome",
                 ));
@@ -984,7 +998,7 @@ impl AuditLog {
             // against paths that forget. An `uncertain` attempt
             // already carries its mint inline and the UPDATE below
             // leaves those columns untouched.
-            let ledger_mint = if state == "started" {
+            let ledger_mint = if state == ApproveAttemptStateName::Started {
                 tx.query_row(
                     "SELECT mint_jti, mint_github_app_id, mint_issued_at, mint_expires_at
                        FROM git_push_approve_attempt_mint
@@ -1019,7 +1033,7 @@ impl AuditLog {
                           WHERE attempt_id = ?1",
                         params![
                             attempt_id.as_uuid().to_string(),
-                            outcome,
+                            outcome.as_wire(),
                             detail,
                             completed_at.as_millis(),
                             jti,
@@ -1039,7 +1053,7 @@ impl AuditLog {
                           WHERE attempt_id = ?1",
                         params![
                             attempt_id.as_uuid().to_string(),
-                            outcome,
+                            outcome.as_wire(),
                             detail,
                             completed_at.as_millis(),
                         ],

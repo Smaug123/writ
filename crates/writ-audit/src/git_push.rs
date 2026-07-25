@@ -7,10 +7,17 @@ use writ_agent_run::CorrelationId;
 use writ_core::core::{ApproveAttemptId, Jti, RequestId, SessionId, UnixMillis};
 use writ_vm_git::{GitBranchName, GitCloneRepo, GitObjectId};
 
+/// The approve-attempt state machine's vocabulary: the flat discriminants
+/// the `state` / `outcome` columns store, and the only conversion between
+/// those strings and the data-carrying DUs below.
+mod approve_attempt;
+
 /// The `impl AuditLog` read/write methods for the git-push audit rows live
 /// here; the record types and row-mapping helpers stay in this module. Split
 /// out to keep `git_push.rs` readable.
 mod dao;
+
+pub use approve_attempt::{ApproveAttemptOutcomeName, ApproveAttemptStateName};
 
 /// The base `(request, outcome)` [`EffectAuditTable`](crate::EffectAuditTable)
 /// marker, re-exported so the VM-HTTP `broker_effect` driver can name it.
@@ -427,9 +434,18 @@ fn load_reconciliation_predecessor(
             "reconciliation predecessor does not exist",
         ));
     };
-    let is_uncertain = state == "uncertain";
-    let is_post_patch_failure =
-        state == "resolved" && outcome.as_deref() == Some("post_patch_failure");
+    let state = ApproveAttemptStateName::parse_wire(&state).ok_or(AuditError::Invariant(
+        "approve attempt row: state value is invalid",
+    ))?;
+    let outcome_name = match outcome.as_deref() {
+        None => None,
+        Some(raw) => Some(ApproveAttemptOutcomeName::parse_wire(raw).ok_or(
+            AuditError::Invariant("approve attempt row: outcome value is invalid"),
+        )?),
+    };
+    let is_uncertain = state == ApproveAttemptStateName::Uncertain;
+    let is_post_patch_failure = state == ApproveAttemptStateName::Resolved
+        && outcome_name == Some(ApproveAttemptOutcomeName::PostPatchFailure);
     if !is_uncertain && !is_post_patch_failure {
         return Err(AuditError::Invariant(
             "reconciliation predecessor is not in an eligible state",
@@ -766,8 +782,11 @@ fn git_push_approve_attempt_from_row(
             }
         };
 
-        let state = match state_str.as_str() {
-            "started" => {
+        let state_name = ApproveAttemptStateName::parse_wire(&state_str).ok_or(
+            AuditError::Invariant("approve attempt row: state value is invalid"),
+        )?;
+        let state = match state_name {
+            ApproveAttemptStateName::Started => {
                 if outcome_str.is_some()
                     || completed_at.is_some()
                     || new_app_tip_str.is_some()
@@ -780,7 +799,7 @@ fn git_push_approve_attempt_from_row(
                 }
                 GitPushApproveAttemptState::Started
             }
-            "uncertain" => {
+            ApproveAttemptStateName::Uncertain => {
                 let mint = mint.ok_or(AuditError::Invariant(
                     "approve attempt row: 'uncertain' state requires mint context",
                 ))?;
@@ -795,15 +814,18 @@ fn git_push_approve_attempt_from_row(
                 }
                 GitPushApproveAttemptState::Uncertain { mint }
             }
-            "resolved" => {
+            ApproveAttemptStateName::Resolved => {
                 let outcome_str = outcome_str.ok_or(AuditError::Invariant(
                     "approve attempt row: 'resolved' state requires an outcome",
                 ))?;
                 let completed_at = completed_at.ok_or(AuditError::Invariant(
                     "approve attempt row: 'resolved' state requires completed_at",
                 ))?;
-                let outcome = match outcome_str.as_str() {
-                    "succeeded" => {
+                let outcome_name = ApproveAttemptOutcomeName::parse_wire(&outcome_str).ok_or(
+                    AuditError::Invariant("approve attempt row: outcome value is invalid"),
+                )?;
+                let outcome = match outcome_name {
+                    ApproveAttemptOutcomeName::Succeeded => {
                         let new_app_tip_str = new_app_tip_str.ok_or(AuditError::Invariant(
                             "approve attempt row: 'succeeded' outcome requires new_app_tip",
                         ))?;
@@ -817,7 +839,7 @@ fn git_push_approve_attempt_from_row(
                         }
                         GitPushApproveAttemptOutcome::Succeeded { new_app_tip }
                     }
-                    "pre_patch_failure" => {
+                    ApproveAttemptOutcomeName::PrePatchFailure => {
                         let detail = failure_detail.ok_or(AuditError::Invariant(
                             "approve attempt row: failure outcome requires failure_detail",
                         ))?;
@@ -828,7 +850,7 @@ fn git_push_approve_attempt_from_row(
                         }
                         GitPushApproveAttemptOutcome::PrePatchFailure { detail }
                     }
-                    "post_patch_failure" => {
+                    ApproveAttemptOutcomeName::PostPatchFailure => {
                         let detail = failure_detail.ok_or(AuditError::Invariant(
                             "approve attempt row: failure outcome requires failure_detail",
                         ))?;
@@ -839,22 +861,12 @@ fn git_push_approve_attempt_from_row(
                         }
                         GitPushApproveAttemptOutcome::PostPatchFailure { detail }
                     }
-                    _ => {
-                        return Err(AuditError::Invariant(
-                            "approve attempt row: outcome value is invalid",
-                        ));
-                    }
                 };
                 GitPushApproveAttemptState::Resolved {
                     outcome,
                     mint,
                     completed_at: UnixMillis::from_millis(completed_at),
                 }
-            }
-            _ => {
-                return Err(AuditError::Invariant(
-                    "approve attempt row: state value is invalid",
-                ));
             }
         };
 
