@@ -143,7 +143,7 @@ route_enum! {
         /// before the split and would otherwise see an indistinguishable `404`.
         /// Records nothing: no effect was attempted. Deleted once stale guest
         /// images can no longer be in play (see
-        /// `docs/plans/2026-07-25-proxy-vendor-namespaces.md`, Stage 3).
+        /// `docs/plans/2026-07-25-proxy-vendor-namespaces.md`, Stage 2).
         LegacyProxyPath,
         /// No route matched: answered `404`/`405` without touching any service.
         Unmatched,

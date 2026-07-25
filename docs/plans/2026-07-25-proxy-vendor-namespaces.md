@@ -143,9 +143,20 @@ reviewed variant, not an escape hatch — and it is deleted in Stage 3.
 
 ## 4. Implementation plan
 
-### Stage 1 — vendor namespaces on the host
+### Stage 1 — vendor namespaces, host **and** guest together
 
 **Dependencies**: none (PR #337 must have landed). **Implements**: §3.
+
+**These two halves cannot be separated**, and an earlier draft of this plan was
+wrong to try. The host and guest sides of a wire contract are not independently
+deployable: a revision that retires the old paths while its own `writ-vm` still
+requests them leaves every model request answered `410`, and the remedy the `410`
+names ("rebuild the guest image") *reproduces the break*, because the image is
+built from that same revision. Nor is the usual escape available — serving old
+and new paths side by side for one release is exactly the ambiguity the property
+test below forbids, since `/v1/models` would again be claimed by both backends.
+So there is no non-breaking intermediate, and the change is atomic by nature.
+The two commits stay separate for review; they land as one.
 
 Add the prefixes; teach both backends to classify under their own prefix only;
 add `PlainRoute::LegacyProxyPath` and resolve the old paths to it; update the
@@ -173,27 +184,25 @@ route table's endpoint map, the audit-pair drive oracle, and `architecture.md`.
 - Delete `the_claude_proxy_shadows_the_whole_models_space`; the shadowing it
   pinned no longer exists.
 
-### Stage 2 — point the guest at the new namespaces
-
-**Dependencies**: Stage 1. **Implements**: §2.1.
-
-`writ-vm` sets `ANTHROPIC_BASE_URL = "{broker_url}anthropic"` and
+Also, in the same change, point the guest at the new namespaces: `writ-vm` sets
+`ANTHROPIC_BASE_URL = "{broker_url}anthropic"` and
 `model_providers.writ-broker.base_url = "{broker_url}openai/v1"`.
 
-**Correctness oracle**:
+**Correctness oracle** (guest half):
 - The existing `claude_process_plan` / `codex_process_plan` tests assert the new
   values (they already pin the old ones).
 - **The cross-boundary oracle worth adding**: take the base URL each process
   plan configures, append the vendor SDK's own path suffix (`/v1/messages`,
-  `/v1/responses`), and assert the *host's* `VmHttpRoute::resolve` classifies the
+  `/responses`), and assert the *host's* `VmHttpRoute::resolve` classifies the
   result as that vendor's proxy. This makes guest configuration and host routing
   provably agree — the exact class of mismatch this whole plan is about, and
-  something no test covered before.
+  something no test covered before. It requires the base-URL builders to live in
+  a crate both sides depend on (`writ-vm-git`, beside the prefixes).
 - `scripts/prove-*.sh` agent-VM runs still complete (real hardware, not CI).
 
-### Stage 3 — delete the legacy shim
+### Stage 2 — delete the legacy shim
 
-**Dependencies**: Stage 2, plus one release in which stale guest images have
+**Dependencies**: Stage 1, plus one release in which stale guest images have
 been rebuilt. **Implements**: the migration's completion.
 
 Remove `PlainRoute::LegacyProxyPath`; the old paths become `Unmatched` (404).
