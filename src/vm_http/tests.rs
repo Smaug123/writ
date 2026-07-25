@@ -1159,6 +1159,56 @@ fn source_subnet_can_be_taken_from_agent_network_ipv4() {
     assert_eq!(session.source_ipv4(), network.ipv4());
 }
 
+/// A guest image built before the vendor-namespace split asks for the old
+/// model-proxy paths. It must get a *diagnosable* answer — `410` naming the
+/// remedy — rather than a `404` indistinguishable from a typo, and nothing may
+/// be recorded, because no effect was attempted.
+#[tokio::test]
+async fn a_pre_split_proxy_path_is_gone_and_names_the_remedy() {
+    let github = MockServer::start().await;
+    let state = make_broker_state(&github);
+    let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::LOCALHOST, 32).unwrap());
+    open_audit_session(&state, session.session_id());
+    let request = VmHttpRequest::new(
+        "POST",
+        "/v1/messages",
+        Some(bearer(token().as_str())),
+        SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 34567)),
+    );
+
+    let response = resolve_and_route_authenticated_vm_http_request(
+        &session,
+        &request,
+        Vec::new(),
+        no_services(),
+    )
+    .await
+    .into_buffered();
+
+    assert_eq!(response.status, VmHttpStatus::Gone);
+    let body = String::from_utf8(response.body).unwrap();
+    assert!(body.contains("/anthropic"), "{body}");
+    assert!(body.contains("/openai"), "{body}");
+    assert!(
+        body.contains(super::GUEST_IMAGE_REBUILD_COMMAND),
+        "the answer must name the remedy: {body}",
+    );
+    // A retired path attempts no effect, so it records none.
+    state.audit.assert_effect_audit_pairs_complete(
+        "claude_proxy_request",
+        "claude_proxy_outcome",
+        "request_id",
+    );
+    assert_eq!(
+        state.audit.table_row_count_for_test("claude_proxy_request"),
+        0
+    );
+    assert_eq!(
+        state.audit.table_row_count_for_test("openai_proxy_request"),
+        0
+    );
+}
+
 /// The Stage-6 capstone oracle: **every** registered brokered route, driven
 /// end to end through the dispatcher, leaves a complete `(request, outcome)`
 /// audit pair.

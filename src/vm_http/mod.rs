@@ -66,6 +66,17 @@ use crate::secret::SecretStore;
 use crate::server::BrokerState;
 use crate::vm_git::VmGitPushBodyLimits;
 
+/// The command a guest is told to run when its image predates a broker change —
+/// today, the model-proxy vendor namespaces.
+///
+/// A `const` rather than a literal in the message because advice naming a CLI
+/// command rots silently: the first draft named a subcommand that never
+/// existed, so a guest following it would have failed at argument parsing.
+/// `the_guest_image_rebuild_advice_names_a_real_command` (in `bin/writ.rs`)
+/// parses this against the real CLI, so renaming the subcommand breaks the
+/// build rather than the advice.
+pub const GUEST_IMAGE_REBUILD_COMMAND: &str = "writ agent-vm build-image";
+
 const MAX_VM_HTTP_BODY_BYTES: usize = 64 * 1024;
 const MAX_VM_HTTP_AGENT_RUN_OUTCOME_BODY_BYTES: usize = 4 * 1024 * 1024;
 const VM_HTTP_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
@@ -1352,9 +1363,11 @@ where
         }
         VmHttpRoute::Plain(PlainRoute::LegacyProxyPath) => VmHttpResponse::text(
             VmHttpStatus::Gone,
-            "this model-proxy path moved: Anthropic is served under /anthropic and OpenAI under \
-             /openai. The guest image predates the split — rebuild it with \
-             `writ agent-vm build-guest-image`.",
+            format!(
+                "this model-proxy path moved: Anthropic is served under /anthropic and OpenAI \
+                 under /openai. The guest image predates the split — rebuild it with \
+                 `{GUEST_IMAGE_REBUILD_COMMAND}`.",
+            ),
         )
         .into(),
         VmHttpRoute::Plain(PlainRoute::Session | PlainRoute::Unmatched) => {
