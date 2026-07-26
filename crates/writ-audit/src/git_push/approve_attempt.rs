@@ -194,6 +194,20 @@ impl ApproveAttempt {
     }
 }
 
+/// The abort message of the `git_push_resolution_refuses_active_approve`
+/// trigger — the schema's voice for [`AttemptPosition::blocks_resolution`].
+///
+/// SQLite reports a `RAISE(ABORT, …)` as a constraint violation carrying
+/// this text and nothing machine-readable, so recognising *which* refusal
+/// happened means matching it. That is unavoidable; what is avoidable is
+/// doing so far from the schema. It lives here, once, and
+/// [`AuditLog::record_git_push_resolution`](crate::AuditLog::record_git_push_resolution)
+/// turns the match into a typed [`AuditError`](crate::AuditError) so no
+/// caller ever sees the string. `trigger_message_matches_the_migration`
+/// pins it against the embedded migration text.
+pub(crate) const RESOLUTION_REFUSED_BY_ACTIVE_APPROVE: &str =
+    "git push resolution refused: approve attempt is in-flight or quarantined";
+
 /// A row's *position* in the machine, as the two columns record it: the
 /// state, plus the outcome a `Resolved` row carries.
 ///

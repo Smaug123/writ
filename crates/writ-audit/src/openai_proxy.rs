@@ -4,10 +4,14 @@
 //! nominates a table descriptor and re-exports the generic record
 //! types under the per-backend names.
 
+use super::AuditLog;
 use super::proxy_table::{
     ProxyAuditDecision, ProxyAuditRoute, ProxyAuditTable, ProxyOutcomeRecord, ProxyRequestRecord,
 };
-use super::{AuditError, AuditLog};
+// Test-only, for the same reason as in `claude_proxy`: the production write path
+// is the audit-pair guard, so nothing outside a test needs the error type here.
+#[cfg(any(test, feature = "test-support"))]
+use super::AuditError;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum OpenAiProxyAuditRoute {
@@ -57,19 +61,21 @@ pub type OpenAiProxyRequestRecord<'a> = ProxyRequestRecord<'a, OpenAiProxyAuditR
 pub type OpenAiProxyOutcomeRecord<'a> = ProxyOutcomeRecord<'a>;
 
 impl AuditLog {
-    /// Persist a VM OpenAI proxy request before any upstream
-    /// model-provider request is attempted. The matching outcome is
-    /// appended with [`AuditLog::record_openai_proxy_outcome`].
-    pub fn record_openai_proxy_request(
+    /// Write *only* the request row of a VM OpenAI proxy pair. Test-only: see
+    /// [`AuditLog::record_claude_proxy_request`] for why the production paths
+    /// cannot reach an unpaired write.
+    #[cfg(test)]
+    pub(crate) fn record_openai_proxy_request(
         &self,
         r: &OpenAiProxyRequestRecord<'_>,
     ) -> Result<(), AuditError> {
         self.record_proxy_request::<OpenAiProxyAuditTable>(r)
     }
 
-    /// Append the observed broker outcome for a previously-recorded VM
-    /// OpenAI proxy request.
-    pub fn record_openai_proxy_outcome(
+    /// Write *only* the outcome row of a VM OpenAI proxy pair. Test-only, for
+    /// the same reason as [`AuditLog::record_openai_proxy_request`].
+    #[cfg(test)]
+    pub(crate) fn record_openai_proxy_outcome(
         &self,
         r: &OpenAiProxyOutcomeRecord<'_>,
     ) -> Result<(), AuditError> {

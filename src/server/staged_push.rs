@@ -293,7 +293,10 @@ pub(super) async fn reject_staged_push<S: SecretStore + Send + Sync + 'static>(
                 retry_cleanup_for_rejected(state, &staging_store, request_id).await;
                 return ServerMessage::StagedPushAlreadyResolved { request_id };
             }
-            if is_active_approve_refusal(&err) {
+            if matches!(
+                err,
+                crate::audit::AuditError::ResolutionRefusedByActiveApprove
+            ) {
                 // The defence-in-depth path: an attempt row landed
                 // between our preflight blocker check and this INSERT,
                 // and the trigger refused the commit. Re-query so the
@@ -1662,35 +1665,6 @@ pub(super) fn is_unique_constraint_violation(err: &crate::audit::AuditError) -> 
     }
     let message = sql_err.to_string().to_lowercase();
     message.contains("unique") || message.contains("primary key")
-}
-
-/// Detect the `git_push_resolution_refuses_active_approve` trigger
-/// firing. The trigger is the schema-level defence-in-depth for the
-/// approve-attempt state machine: any attempted `INSERT` into
-/// `git_push_resolution` while a same-push attempt is `Started`,
-/// `Uncertain`, or `Resolved(PostPatchFailure)` is refused with the
-/// literal message below. The reject handler calls
-/// [`AuditLog::reject_blocker_for_push`] *first* to give the operator a
-/// typed diagnostic, but the SELECT-vs-INSERT window admits a racing
-/// approve that lands a fresh `Started` row in between; matching the
-/// trigger's text lets the handler translate that race back into the
-/// same typed surface instead of leaking the raw SQL refusal.
-///
-/// The matched literal is mirrored from
-/// `crates/writ-audit/src/migrations/0005_approve_attempt_state_machine.sql`.
-pub(super) fn is_active_approve_refusal(err: &crate::audit::AuditError) -> bool {
-    const TRIGGER_MESSAGE: &str =
-        "git push resolution refused: approve attempt is in-flight or quarantined";
-    let crate::audit::AuditError::Sqlite(sql_err) = err else {
-        return false;
-    };
-    let rusqlite::Error::SqliteFailure(code, _) = sql_err else {
-        return false;
-    };
-    if !matches!(code.code, rusqlite::ErrorCode::ConstraintViolation) {
-        return false;
-    }
-    sql_err.to_string().contains(TRIGGER_MESSAGE)
 }
 
 /// Query [`AuditLog::reject_blocker_for_push`] from the broker's tokio

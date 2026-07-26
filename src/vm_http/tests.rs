@@ -28,7 +28,17 @@ use crate::vm_git::{BROKER_IMAGE_REBUILD_COMMAND, VM_FLAKE_PROVISION_PATH, VM_GI
 use crate::vm_git_bundle::{GitCredentialBoundary, GitSecretEnvVar};
 use std::collections::BTreeMap;
 
-const TEST_GIT_CLONE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// The per-step timeout every clone test hands the service. No test asserts on
+/// it: the fake `git` is a shell script that returns at once, and the tests
+/// assert on the response, the audit rows, or the work-root contents.
+///
+/// It is therefore set high enough that only a genuine wedge can reach it. A
+/// bound that looks lavish beside a two-line script is not lavish at all when
+/// the harness is oversubscribed and a thousand processes are contending for
+/// eighteen cores; a 30s bound was reached there, and "clone mirror command
+/// timed out after 30s" is a spectacularly misleading way to report that the
+/// machine was busy (issue #355).
+const TEST_GIT_CLONE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
 type TestVmHttpServices = VmHttpServices<Box<dyn SecretStore>>;
 

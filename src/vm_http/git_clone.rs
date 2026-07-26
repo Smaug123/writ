@@ -1131,6 +1131,16 @@ work_root=${{work_dir%/*}}
     async fn vm_http_read_timeout_does_not_cancel_slow_git_clone_execution() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+        // The read timeout bounds *reading the request* — headers, then body —
+        // and nothing else. Both are handed to the connection already buffered
+        // below, so this budget covers only the polls that copy them out of the
+        // duplex, not any wall-clock the machine's load might insert before the
+        // connection task first runs. It was 20ms, which a loaded host could miss
+        // outright (issue #355); a quarter-second is still nowhere near the
+        // execution phase it must not cancel.
+        const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
+        const CLONE_EXECUTION_DELAY: std::time::Duration = std::time::Duration::from_secs(3);
+
         let github = MockServer::start().await;
         let state = make_broker_state(&github);
         let session = VmHttpSession::new(
@@ -1143,7 +1153,10 @@ work_root=${{work_dir%/*}}
             .and(path("/app/installations/999/access_tokens"))
             .respond_with(
                 ResponseTemplate::new(201)
-                    .set_delay(std::time::Duration::from_millis(100))
+                    // Execution outlasts the read timeout by an order of
+                    // magnitude, so a regression that let the timeout cancel it
+                    // cannot be masked by a lucky schedule.
+                    .set_delay(CLONE_EXECUTION_DELAY)
                     .set_body_json(serde_json::json!({
                         "token": "ghs_vm_token",
                         "expires_at": expiry_str_from_now(3600),
@@ -1169,15 +1182,19 @@ work_root=${{work_dir%/*}}
             body
         );
         let (mut client, server_io) = tokio::io::duplex(64 * 1024);
+        // Buffer the whole request *before* the connection task exists, so the
+        // read timeout is never racing the scheduler for bytes that have not been
+        // written yet: by the time hyper arms it, everything it has to read is
+        // already sitting in the duplex.
+        client.write_all(request.as_bytes()).await.unwrap();
         let server = tokio::spawn(handle_vm_http_connection_with_read_timeout(
             server_io,
             SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 34567)),
             session,
             services_with_git(service),
-            std::time::Duration::from_millis(20),
+            READ_TIMEOUT,
         ));
 
-        client.write_all(request.as_bytes()).await.unwrap();
         let mut response = Vec::new();
         client.read_to_end(&mut response).await.unwrap();
         server.await.unwrap().unwrap();

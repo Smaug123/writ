@@ -81,20 +81,24 @@ pub struct NixCacheAuditEntry {
 }
 
 impl AuditLog {
-    /// Persist a VM Nix cache request before any upstream cache fetch
-    /// is attempted. The matching outcome is appended with
-    /// [`AuditLog::record_nix_cache_outcome`].
-    pub fn record_nix_cache_request(
+    /// Write *only* the request row of a VM Nix cache pair. Test-only: the
+    /// serve path is authority-free, so *every* production write of this table
+    /// is the coalesced
+    /// [`record_nix_cache_request_and_outcome`](AuditLog::record_nix_cache_request_and_outcome)
+    /// below. See [`AuditLog::record_claude_proxy_request`] for what the tests
+    /// need an unpaired write for.
+    #[cfg(test)]
+    pub(crate) fn record_nix_cache_request(
         &self,
         r: &NixCacheRequestRecord<'_>,
     ) -> Result<(), AuditError> {
         self.record_proxy_request::<NixCacheAuditTable>(r)
     }
 
-    /// Append the observed broker outcome for a previously-recorded VM
-    /// Nix cache request. This is a separate row so the upstream fetch
-    /// is never attempted before the request itself is durable.
-    pub fn record_nix_cache_outcome(
+    /// Write *only* the outcome row of a VM Nix cache pair. Test-only, for the
+    /// same reason as [`AuditLog::record_nix_cache_request`].
+    #[cfg(test)]
+    pub(crate) fn record_nix_cache_outcome(
         &self,
         r: &NixCacheOutcomeRecord<'_>,
     ) -> Result<(), AuditError> {

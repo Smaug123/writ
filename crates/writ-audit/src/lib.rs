@@ -122,6 +122,14 @@ pub enum AuditError {
     #[error("invariant violated: {0}")]
     Invariant(&'static str),
 
+    /// The schema refused a `git_push_resolution` INSERT because the push
+    /// has a live approve attempt that is in flight or quarantined (see
+    /// `AttemptPosition::blocks_resolution`). Distinct from a bare
+    /// `Sqlite` error because callers act on it: the reject handler turns
+    /// it back into the operator-facing blocker diagnostic.
+    #[error("git push resolution refused: an approve attempt is in flight or quarantined")]
+    ResolutionRefusedByActiveApprove,
+
     /// The approve-attempt state machine refused a transition. Carries
     /// the state the attempt was in and the move that was asked for, so
     /// the operator-facing message can say which, rather than a bare

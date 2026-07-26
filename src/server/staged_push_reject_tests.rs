@@ -1,8 +1,6 @@
 //! `RejectStagedPush` handler tests, including in-flight blockers.
 
-use super::staged_push::{
-    MAX_OPERATOR_BYTES, is_active_approve_refusal, is_unique_constraint_violation,
-};
+use super::staged_push::{MAX_OPERATOR_BYTES, is_unique_constraint_violation};
 use super::test_support::*;
 use super::*;
 use wiremock::MockServer;
@@ -584,22 +582,17 @@ async fn reject_staged_push_with_pre_patch_failure_attempt_proceeds_normally() {
     assert_eq!(resolution.operator, "bob");
 }
 
-/// `is_active_approve_refusal` detects the
-/// `git_push_resolution_refuses_active_approve` trigger's raised
-/// message verbatim. This is the contract the handler depends on
-/// when it re-queries the blocker on INSERT failure. Verifies the
-/// match string is wired up correctly without standing up a full
-/// dispatch — the literal lives in the migration SQL.
-/// `is_active_approve_refusal` detects the
-/// `git_push_resolution_refuses_active_approve` trigger firing.
-/// This is the defence-in-depth path the handler relies on when an
-/// attempt row lands between the preflight blocker check and the
-/// resolution INSERT. Asserts both that a real trigger ABORT
-/// matches the predicate and that a sibling PK violation does
-/// *not* — keeping the existing
-/// `is_unique_constraint_violation` branch distinct.
+/// The audit log reports the `git_push_resolution_refuses_active_approve`
+/// trigger firing as a *typed* error, not as SQLite prose the shell has
+/// to recognise. This is the defence-in-depth path the handler relies on
+/// when an attempt row lands between the preflight blocker check and the
+/// resolution INSERT.
+///
+/// Also asserts a sibling PK violation still arrives as
+/// `AuditError::Sqlite` and matches `is_unique_constraint_violation`, so
+/// the handler's two failure branches stay distinct.
 #[tokio::test]
-async fn is_active_approve_refusal_matches_the_trigger_message() {
+async fn active_approve_refusal_arrives_as_a_typed_error() {
     let server = MockServer::start().await;
     let (state, _tmp) = make_state_with_staging(&server);
     let session_id = open_session(&state).await;
@@ -633,12 +626,14 @@ async fn is_active_approve_refusal_matches_the_trigger_message() {
         })
         .expect_err("trigger refuses the INSERT");
     assert!(
-        is_active_approve_refusal(&err),
-        "predicate must classify trigger ABORT, got: {err:?}",
+        matches!(
+            err,
+            crate::audit::AuditError::ResolutionRefusedByActiveApprove
+        ),
+        "trigger ABORT must arrive typed, got: {err:?}",
     );
-    // A PK violation must *not* match this predicate so the
-    // existing `is_unique_constraint_violation` branch keeps its
-    // distinct behaviour.
+    // A PK violation keeps arriving as a plain SQLite error, so the
+    // handler's `is_unique_constraint_violation` branch is unaffected.
     let fake_pk_err = crate::audit::AuditError::Sqlite(rusqlite::Error::SqliteFailure(
         rusqlite::ffi::Error {
             code: rusqlite::ErrorCode::ConstraintViolation,
@@ -647,8 +642,11 @@ async fn is_active_approve_refusal_matches_the_trigger_message() {
         Some("UNIQUE constraint failed: git_push_resolution.push_request_id".into()),
     ));
     assert!(
-        !is_active_approve_refusal(&fake_pk_err),
-        "PK violation must not match the trigger predicate",
+        !matches!(
+            fake_pk_err,
+            crate::audit::AuditError::ResolutionRefusedByActiveApprove
+        ),
+        "PK violation must not be classified as the trigger refusal",
     );
     assert!(is_unique_constraint_violation(&fake_pk_err));
 }

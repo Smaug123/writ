@@ -345,9 +345,15 @@ work: `EffectAuditTable` describes any `(request, outcome)` table pair, and the
 `begin_effect` records the request row (session-open-checked) and returns a
 `#[must_use]` guard whose `complete` records the matching outcome (refusing one
 whose key disagrees); `record_effect_coalesced` writes both in one commit for the
-authority-free Nix-cache serve. The shared open-session check lives once in
-`validation::check_session_open`. The guard is crate-internal until the VM-HTTP
-driver (§5.6) adopts it; the proxy tables already implement `EffectAuditTable`.
+authority-free Nix-cache serve and for locally-generated proxy responses (a
+denial, an unsupported route), which perform no IO. The shared open-session check
+lives once in `validation::check_session_open`. The VM-HTTP driver (§5.6) has
+adopted the guard, and for the four tables it fully owns — both model proxies,
+Nix-cache, flake-provision — the unguarded half-pair writers are now `#[cfg(test)]`,
+so **the guard is the only way production code can write those tables**. The two
+that keep public unpaired writers do so for stated reasons: `git_push` (boot
+reconciliation appends an outcome for an orphaned carrier) and `agent_run` (the
+request row is minted at run launch, the outcome arrives later).
 
 **The approve-attempt state machine.** `approve_attempt.rs` owns the vocabulary
 and the transition relation of the operator-approve lifecycle, which the DAO
@@ -369,6 +375,20 @@ merely persists. Three layers:
   `apply`, and writes every mutable column from the position it returns, so a
   write cannot disagree with the decision.
 
+- **Derived predicates.** `AttemptPosition` (the `(state, outcome)` pair) answers
+  the questions the queries ask — `blocks_resolution`, `is_in_flight`,
+  `is_reconcilable`, `reject_blocker` — once each. `position_predicate_sql`
+  renders a position set as a SQL `IN` clause, so the queries that ask those
+  questions *derive* their predicate from the same functions the Rust folds use
+  rather than restating it. Note `blocks_resolution` excludes
+  `Resolved(Succeeded)`: the approve path's own joint transaction writes the
+  resolution row.
+- **Refusals are typed.** The one trigger whose firing a caller must act on
+  (`git_push_resolution_refuses_active_approve`) is classified inside the crate
+  into `AuditError::ResolutionRefusedByActiveApprove`; its abort text is matched
+  in exactly one place, beside the predicate, because SQLite gives
+  `RAISE(ABORT, …)` no machine-readable identity.
+
 **Guarantee (schema-backed).** The triggers below remain the authority — the
 database refuses a contradiction even when every Rust caller is wrong — and the
 Rust machine is held to them mechanically:
@@ -376,8 +396,13 @@ Rust machine is held to them mechanically:
 (position, transition) pair against a real database, comparing `apply` against a
 naive writer that never consults it, and
 `rust_and_schema_admit_the_same_{state,outcome}_names` compares `ALL` against the
-CHECK literals read back from `sqlite_master`. Divergence in *either* direction
-fails the build. The one place the machine is deliberately stricter than the
+CHECK literals read back from `sqlite_master`;
+`blocks_resolution_agrees_with_the_trigger` and
+`trigger_message_matches_the_live_trigger` do the same for the blocking
+predicate and its abort text. Divergence in *either* direction fails the build.
+Each of these reads the **live** schema rather than the migration list — a
+superseded migration still carries the old definition, so searching history
+would let a reworded trigger pass. The one place the machine is deliberately stricter than the
 schema (a mint-capturing resolve from `Uncertain`) is enumerated in the test, not
 implicit.
 

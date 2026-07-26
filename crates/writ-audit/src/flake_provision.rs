@@ -210,10 +210,14 @@ impl crate::effect_table::EffectAuditTable for FlakeProvisionAuditTable {
 }
 
 impl AuditLog {
-    /// Persist a provisioning request before `nix flake archive` is run.
-    /// The matching outcome is appended with
-    /// [`AuditLog::record_flake_provision_outcome`].
-    pub fn record_flake_provision_request(
+    /// Write *only* the request row of a provisioning pair. Test-only: the
+    /// handler reaches this table through the two-phase guard
+    /// (`begin_effect` + `complete`), which is what keeps the request row
+    /// durable before `nix flake archive` runs *and* forbids leaving it
+    /// unpaired. See [`AuditLog::record_claude_proxy_request`] for what the
+    /// tests need an unpaired write for.
+    #[cfg(test)]
+    pub(crate) fn record_flake_provision_request(
         &self,
         r: &FlakeProvisionRequestRecord<'_>,
     ) -> Result<(), AuditError> {
@@ -227,10 +231,11 @@ impl AuditLog {
         })
     }
 
-    /// Append the observed outcome for a previously-recorded provisioning
-    /// request. A separate row so the fetch is never attempted before the
-    /// request itself is durable; the FK enforces that the request exists.
-    pub fn record_flake_provision_outcome(
+    /// Write *only* the outcome row of a provisioning pair. Test-only, for the
+    /// same reason as [`AuditLog::record_flake_provision_request`]; the FK
+    /// enforces that the request row exists.
+    #[cfg(test)]
+    pub(crate) fn record_flake_provision_outcome(
         &self,
         r: &FlakeProvisionOutcomeRecord<'_>,
     ) -> Result<(), AuditError> {
