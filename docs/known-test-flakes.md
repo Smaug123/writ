@@ -42,6 +42,15 @@ A colleague who meets it on his own desk may disregard it with a clear
 conscience. It is not a defect to be mended but a weather of the host to be
 waited out.
 
+> **Later.** The judgement above stands as to *whose* hand it is — the sender is
+> outside writ, and remains unnamed. It was wrong, though, in its last clause.
+> The blow is not merely weather to be endured: it leaves a mark by which it can
+> be known with certainty, and having been known it can be shrugged off without
+> hazard. The child is *born dead* — it never executes a single instruction —
+> and a command that never ran may always be run again. See
+> [The apparition named, and laid](#the-apparition-named-and-laid) at the foot
+> of this section; the suite no longer fails on it.
+
 ### The measures taken to summon it
 
 I record the experiments in the order they were made, the false road included,
@@ -125,3 +134,75 @@ desk, two remedies lie to hand, neither yet thought worth the trouble:
 
 For the present the recommended course is the quietest one: to know the thing for
 what it is, and to let it pass.
+
+### The apparition named, and laid
+
+The counsel above — to let it pass — was overtaken by a further inquiry, which
+found the mark the earlier one had not thought to look for. It is set down here
+because the finding is small, and the whole difficulty had been that nobody knew
+where to look.
+
+**The mark.** Immediately after `spawn()` returns a pid, ask the kernel what
+process group that pid belongs to. For every healthy child the answer is the
+harness's own group. For the doomed child the answer is `ESRCH`: *no such
+process*. The child is already gone, microseconds after its parent was handed
+its pid, before it has run one instruction. Hence the empty stderr that so
+puzzled us — there was never a process there to write anything. Hence, too, the
+two faces the fault was thought to wear: `unix_wait_status(9)` when `wait`
+reaches the corpse first, and `GitStdinWrite`/`BrokenPipe` when the write to
+stdin gets there first. One fault, two vantages.
+
+**The proof.** The mark was counted over whole runs of the suite. In every run
+that passed, born-dead children numbered nought, across some two-and-twenty
+hundred spawns apiece. In every run that failed, they numbered one or more. The
+correspondence is exact, and it is what licenses the remedy.
+
+**Why the earlier interrogation of our own killing code (experiment 3 above)
+could not have settled anything, though its verdict was right.** That inquiry
+instrumented the `killpg` sites with `tracing`, and reported that during failing
+runs they logged no calls at all. But the test binaries install no `tracing`
+subscriber, so a `tracing` statement in them emits nothing whatever; and the
+harness discards the output of every test that *passes*, which is what the
+killing test would have done. The instrument was incapable of speech. It was
+replaced with a direct appending `write(2)`, which neither the harness's capture
+nor a missing subscriber can silence, and with an interposition upon `kill` and
+`killpg` themselves by way of `DYLD_INTERPOSE` — this last catching senders
+anywhere in the process, tokio and every dependency included, where the earlier
+work had watched only our own call sites. So instrumented, the failing run shows
+2023 spawns, 2022 reaps, and not one signal sent from within. The old verdict of
+innocence was sound; it had merely never been demonstrated.
+
+**The remedy, and why it is safe.** The first of the two remedies proposed above
+— to retry a child that dies by a signal — was rightly held to be dangerous,
+since a retry is safe only where the operation is idempotent, and `update-ref`
+is not. The born-dead mark dissolves that objection, because it does not ask
+whether the *command* may be repeated; it establishes that the *child never ran*,
+and so there is nothing to repeat. Every synchronous git child now passes through
+one helper, which re-runs the invocation when the proof-of-life probe reported
+`ESRCH` *and* the child died by `SIGKILL`. A child that ran and was then killed
+is reported exactly as before.
+
+**A false start, recorded because it is the instructive part.** The first
+version of this remedy asked instead for `SIGKILL`, and empty stdout, and empty
+stderr — reasoning that a child which had done work would have said something.
+That is unsound, and on precisely the paths where it would have hurt most: the
+mutating callers pass `CaptureOutput::Discard`, which makes stdout empty *by
+construction*, so the test collapsed to "killed, and quiet". A `git notes add`
+struck down after it had written its ref would have satisfied it, been run a
+second time, and failed with "note already exists" — reporting a failure for
+work that had in fact been committed. The lesson is that absence of output is
+not evidence of absence of effect; only the process-table entry is. Caught in
+review, before it shipped.
+
+**And a gap of scope.** The config children spawned on every `NotesRepo::open`
+called `Command::output()` directly and so were covered by none of this — which
+mattered more than it sounds, the very first sighting in this inquiry having
+been `GitFailed { args: ["config"], status: unix_wait_status(9) }`. They now go
+through the same helper.
+
+**What remains unknown.** Which hand inside the kernel discards the process, and
+why. System Integrity Protection still forbids `dtrace`'s `proc:::signal-send`,
+and the unified log requires privileges a plain run does not have. The remedy
+above does not depend on the answer: it recognises, from evidence available
+inside the process, that the child ran nothing — and declines to guess at the
+cause.

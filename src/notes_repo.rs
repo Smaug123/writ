@@ -59,6 +59,7 @@
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::io::{self, Write};
+use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::{Mutex, MutexGuard, OnceLock};
@@ -663,6 +664,16 @@ const GIT_SPAWN_RETRY_DEADLINE: Duration = Duration::from_secs(2);
 /// Cap on the exponential backoff between spawn retries.
 const GIT_SPAWN_RETRY_MAX_BACKOFF: Duration = Duration::from_millis(50);
 
+/// Attempts allowed for a child that died before it ran anything (see
+/// [`child_was_born_dead`]).
+///
+/// An attempt count is right here, where a deadline is right for
+/// [`GIT_SPAWN_RETRY_DEADLINE`]: a transient spawn *refusal* clears on the
+/// host's schedule, so we wait it out; a born-dead child is a per-spawn
+/// lottery at roughly 1-in-2000, so what we want is another ticket, not a
+/// wait. Three attempts put the residual odds past 1-in-10^10.
+const BORN_DEAD_RETRY_ATTEMPTS: usize = 3;
+
 /// True if a failed `Command::spawn()` is a *transient* resource
 /// refusal that a retry can clear. The fork/`posix_spawn` was rejected,
 /// so the child never ran — re-running is correct (nothing
@@ -680,6 +691,140 @@ fn spawn_is_retryable(err: &io::Error) -> bool {
         err.raw_os_error(),
         Some(libc::EAGAIN) | Some(libc::ENOMEM) | Some(libc::EMFILE) | Some(libc::ENFILE)
     )
+}
+
+/// Proof-of-life probe, taken immediately after `spawn()` returns and before
+/// we touch the child: `true` when `getpgid(pid)` reports `ESRCH`.
+///
+/// This is *proof the child never ran*, not a heuristic, and the reason is the
+/// zombie rule. We have not reaped the child yet, so a process that had run
+/// and exited — however briefly, however it died — would still hold an
+/// unreaped entry in the process table, and `getpgid` on it would succeed.
+/// `ESRCH` means there is no entry at all: the pid we were handed never became
+/// a live process.
+///
+/// This is the mark left by the macOS "phantom SIGKILL" (see
+/// `docs/known-test-flakes.md`): `spawn()` succeeds and yields a pid whose
+/// process is already gone microseconds later, before it executes one
+/// instruction. Roughly 1 spawn in 2000 under the parallel test suite's load;
+/// counted per run it is 0 in every passing run and >=1 in every failing one.
+///
+/// Being a probe of a *live* condition it can only race one way: if the kernel
+/// has not yet torn the entry down we return `false` and decline to retry.
+/// That is the safe direction — a missed retry is a rare test failure, a
+/// wrongly-granted one could re-run a command that had already taken effect.
+fn child_vanished_before_running(pid: u32) -> bool {
+    // SAFETY: `getpgid` is async-signal-safe and reads no memory we own.
+    let probed = unsafe { libc::getpgid(pid as libc::pid_t) };
+    probed == -1 && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+}
+
+/// Whether a finished child provably ran nothing, and so may be re-run — the
+/// second way, after [`spawn_is_retryable`], that a git invocation can be
+/// retried without risking a repeated effect.
+///
+/// Both conjuncts are load-bearing:
+///
+/// * `vanished_before_running` — the [`child_vanished_before_running`] proof
+///   above. This is what makes the retry safe *irrespective of the command*:
+///   it does not assume `notes add` or `update-ref` may be repeated, it
+///   establishes that this child never ran, so there is nothing to repeat.
+/// * killed by `SIGKILL` — a guard against the one way the probe could lie.
+///   If some dependency ever set `SIGCHLD` to `SIG_IGN`, children would be
+///   auto-reaped and a *successful* fast child could also probe as `ESRCH`;
+///   but such a child cannot be reaped by us afterwards, so it surfaces as a
+///   `GitWait` error rather than reaching this predicate with a signal status.
+///
+/// Note what is deliberately *not* used: emptiness of stdout or stderr. That
+/// was the first formulation, and it is unsound — `CaptureOutput::Discard`
+/// makes stdout empty by construction, so for the mutating callers (`notes
+/// add`, `update-ref`) the test would have been vacuous, and a child killed
+/// *after* committing its ref would have been replayed.
+fn child_ran_nothing(vanished_before_running: bool, status: &ExitStatus) -> bool {
+    vanished_before_running && status.signal() == Some(libc::SIGKILL)
+}
+
+/// Spawn `command`, feed it `stdin_input`, and collect its output, re-running
+/// the whole invocation while the child provably ran nothing
+/// ([`child_ran_nothing`]).
+///
+/// Every synchronous git child in this module goes through here, so the
+/// born-dead absorption covers the config-validation children on the
+/// `NotesRepo::open` path too — the flake was first observed as
+/// `GitFailed { args: ["config"], status: unix_wait_status(9) }`.
+///
+/// `probe` exists so the retry loop itself is testable: forging a genuinely
+/// born-dead child is not something a test can do on demand, since the whole
+/// point is that the kernel discards it. Production passes
+/// [`child_vanished_before_running`]; a test can pass one that reports a
+/// vanish on a chosen attempt. It is an explicit argument rather than hidden
+/// indirection, and [`run_git_child`] is the only production caller.
+fn run_git_child_probed(
+    command: &mut Command,
+    stdin_input: Option<&[u8]>,
+    mut probe: impl FnMut(u32) -> bool,
+) -> Result<std::process::Output, NotesRepoError> {
+    for attempt in 0..BORN_DEAD_RETRY_ATTEMPTS {
+        // Retry transient spawn refusals (EAGAIN under fork pressure, &c.).
+        // A refused spawn ran nothing, so this is safe; a child that starts
+        // and exits non-zero is handled by the caller and never retried.
+        let mut child = spawn_with_retry(GIT_SPAWN_RETRY_DEADLINE, || command.spawn())
+            .map_err(|source| NotesRepoError::GitSpawn { source })?;
+
+        // Probe before touching the child: the zombie rule only holds while
+        // the child is unreaped.
+        let vanished = probe(child.id());
+
+        // A born-dead child shows up here first, as `EPIPE`: it is already
+        // gone, so nothing is reading the pipe. Hold the error rather than
+        // returning it — whether this is the flake or a real broken pipe is
+        // not yet decidable, and the wait below settles it.
+        let mut stdin_broken_pipe = None;
+        if let Some(bytes) = stdin_input {
+            let mut stdin = child
+                .stdin
+                .take()
+                .expect("stdin was configured as Stdio::piped()");
+            match stdin.write_all(bytes) {
+                Ok(()) => {}
+                Err(source) if source.kind() == io::ErrorKind::BrokenPipe => {
+                    stdin_broken_pipe = Some(source);
+                }
+                Err(source) => return Err(NotesRepoError::GitStdinWrite { source }),
+            }
+            drop(stdin);
+        }
+
+        // `wait_with_output` drains stdout AND stderr concurrently (std's internal
+        // read2: a non-blocking poll loop, not a helper thread) and waits for exit.
+        // This avoids the pipe-buffer deadlock a serial drain would hit on a child
+        // that floods stderr, WITHOUT spawning a per-call thread — that thread
+        // spawn was itself unguarded against the same EAGAIN that
+        // `spawn_with_retry` exists to absorb, so under fork pressure it would
+        // `panic` and become the next flake.
+        let output = child
+            .wait_with_output()
+            .map_err(|source| NotesRepoError::GitWait { source })?;
+
+        if child_ran_nothing(vanished, &output.status) && attempt + 1 < BORN_DEAD_RETRY_ATTEMPTS {
+            continue;
+        }
+
+        // The child's own outcome stands, including a genuine broken pipe.
+        if let Some(source) = stdin_broken_pipe {
+            return Err(NotesRepoError::GitStdinWrite { source });
+        }
+        return Ok(output);
+    }
+    unreachable!("the final attempt returns rather than continuing")
+}
+
+/// [`run_git_child_probed`] with the real proof-of-life probe.
+fn run_git_child(
+    command: &mut Command,
+    stdin_input: Option<&[u8]>,
+) -> Result<std::process::Output, NotesRepoError> {
+    run_git_child_probed(command, stdin_input, child_vanished_before_running)
 }
 
 /// Run `attempt`, retrying for up to `deadline` whenever it fails with a
@@ -775,33 +920,7 @@ where
     });
     command.stderr(Stdio::piped());
 
-    // Retry transient spawn refusals (EAGAIN under fork pressure, &c.).
-    // A refused spawn ran nothing, so this is safe; a child that starts
-    // and exits non-zero is handled separately below and never retried.
-    let mut child = spawn_with_retry(GIT_SPAWN_RETRY_DEADLINE, || command.spawn())
-        .map_err(|source| NotesRepoError::GitSpawn { source })?;
-
-    if let Some(bytes) = stdin_input {
-        let mut stdin = child
-            .stdin
-            .take()
-            .expect("stdin was configured as Stdio::piped()");
-        stdin
-            .write_all(bytes)
-            .map_err(|source| NotesRepoError::GitStdinWrite { source })?;
-        drop(stdin);
-    }
-
-    // `wait_with_output` drains stdout AND stderr concurrently (std's internal
-    // read2: a non-blocking poll loop, not a helper thread) and waits for exit.
-    // This avoids the pipe-buffer deadlock a serial drain would hit on a child
-    // that floods stderr, WITHOUT spawning a per-call thread — that thread
-    // spawn was itself unguarded against the same EAGAIN that
-    // `spawn_with_retry` exists to absorb, so under fork pressure it would
-    // `panic` and become the next flake.
-    let output = child
-        .wait_with_output()
-        .map_err(|source| NotesRepoError::GitWait { source })?;
+    let output = run_git_child(&mut command, stdin_input)?;
     if !output.status.success() {
         return Err(NotesRepoError::GitFailed {
             args: args.iter().map(|s| (*s).to_string()).collect(),
@@ -858,9 +977,11 @@ fn run_git_config<'a>(
     command.stdin(Stdio::null());
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
-    let output = command
-        .output()
-        .map_err(|source| NotesRepoError::GitSpawn { source })?;
+    // Through `run_git_child`, not `Command::output()`: these config children
+    // are spawned on every `NotesRepo::open`, and are as exposed to the
+    // born-dead flake as any other. It was first seen here, in fact —
+    // `GitFailed { args: ["config"], status: unix_wait_status(9) }`.
+    let output = run_git_child(&mut command, None)?;
     if output.status.success() {
         let s = String::from_utf8(output.stdout)
             .map_err(|source| NotesRepoError::ConfigNonUtf8 { source })?;
