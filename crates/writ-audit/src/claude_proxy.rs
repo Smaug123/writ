@@ -4,10 +4,15 @@
 //! nominates a table descriptor and re-exports the generic record
 //! types under the per-backend names.
 
+use super::AuditLog;
 use super::proxy_table::{
     ProxyAuditDecision, ProxyAuditRoute, ProxyAuditTable, ProxyOutcomeRecord, ProxyRequestRecord,
 };
-use super::{AuditError, AuditLog};
+// Every fallible member of this module is now test-only — the production write
+// path is the audit-pair guard, which lives in `effect_table`. So is the error
+// type's only use here.
+#[cfg(any(test, feature = "test-support"))]
+use super::AuditError;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum ClaudeProxyAuditRoute {
@@ -58,19 +63,27 @@ pub type ClaudeProxyRequestRecord<'a> = ProxyRequestRecord<'a, ClaudeProxyAuditR
 pub type ClaudeProxyOutcomeRecord<'a> = ProxyOutcomeRecord<'a>;
 
 impl AuditLog {
-    /// Persist a VM Claude proxy request before any upstream
-    /// model-provider request is attempted. The matching outcome is
-    /// appended with [`AuditLog::record_claude_proxy_outcome`].
-    pub fn record_claude_proxy_request(
+    /// Write *only* the request row of a VM Claude proxy pair.
+    ///
+    /// **Test-only, and deliberately so.** Every production write of this table
+    /// goes through the audit-pair guard — `begin_effect` + `complete` for an
+    /// upstream fetch, `record_effect_coalesced` for a locally-generated
+    /// response — so no handler can leave one half of the pair behind. What the
+    /// tests still need it for is the opposite: *seeding* an unpaired row, to
+    /// prove the boot sweep ([`crate::effect_scan`]) and the audit-pair oracle
+    /// ([`crate::effect_audit_oracle`]) actually catch one.
+    #[cfg(test)]
+    pub(crate) fn record_claude_proxy_request(
         &self,
         r: &ClaudeProxyRequestRecord<'_>,
     ) -> Result<(), AuditError> {
         self.record_proxy_request::<ClaudeProxyAuditTable>(r)
     }
 
-    /// Append the observed broker outcome for a previously-recorded VM
-    /// Claude proxy request.
-    pub fn record_claude_proxy_outcome(
+    /// Write *only* the outcome row of a VM Claude proxy pair. Test-only, for
+    /// the same reason as [`AuditLog::record_claude_proxy_request`].
+    #[cfg(test)]
+    pub(crate) fn record_claude_proxy_outcome(
         &self,
         r: &ClaudeProxyOutcomeRecord<'_>,
     ) -> Result<(), AuditError> {

@@ -19,6 +19,7 @@ use writ_agent_run::{
     vm_agent_run_outcome_path,
 };
 use writ_core::bearer::is_bearer_token_byte;
+use writ_core::git_env::apply_git_config_denials;
 use writ_core::process_spawn;
 use writ_vm_git::{
     DEFAULT_DEVSHELL_ATTR, DEFAULT_WORKSPACE_BRANCH, GIT_BUNDLE_CONTENT_TYPE,
@@ -954,6 +955,13 @@ fn run_git_command(
     cwd: &Path,
 ) -> Result<(), VmClientError> {
     let mut command = Command::new(git_program);
+    // The guest's own git must not be steerable by guest-side config either: a
+    // `~/.gitconfig` or `/etc/gitconfig` inside the image could bind a
+    // `credential.helper` or `core.fsmonitor` and get code run under this
+    // process. Denials only (not the HOME-clearing variant): these invocations
+    // authenticate to nothing — the bundle is a local file this client already
+    // fetched — so there is no reason to disturb HOME as well.
+    apply_git_config_denials(&mut command);
     command
         .args(args)
         .current_dir(cwd)
@@ -982,6 +990,13 @@ fn run_git_command_output(
     cwd: &Path,
 ) -> Result<std::process::Output, VmClientError> {
     let mut command = Command::new(git_program);
+    // The guest's own git must not be steerable by guest-side config either: a
+    // `~/.gitconfig` or `/etc/gitconfig` inside the image could bind a
+    // `credential.helper` or `core.fsmonitor` and get code run under this
+    // process. Denials only (not the HOME-clearing variant): these invocations
+    // authenticate to nothing — the bundle is a local file this client already
+    // fetched — so there is no reason to disturb HOME as well.
+    apply_git_config_denials(&mut command);
     command
         .args(args)
         .current_dir(cwd)
@@ -1156,6 +1171,7 @@ fn run_git_push_command(
 ) -> Result<(), VmClientError> {
     let mut command = Command::new(git_program);
     configure_push_git_env(&mut command);
+    apply_git_config_denials(&mut command);
     command
         .args(args)
         .stdin(Stdio::null())
@@ -1180,6 +1196,7 @@ fn run_git_push_command_output(
 ) -> Result<std::process::Output, VmClientError> {
     let mut command = Command::new(git_program);
     configure_push_git_env(&mut command);
+    apply_git_config_denials(&mut command);
     command
         .args(args)
         .stdin(Stdio::null())

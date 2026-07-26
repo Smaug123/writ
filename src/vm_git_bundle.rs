@@ -679,12 +679,7 @@ async fn reject_bundle_inside_canonical_mirror(
     plan: &GitCloneBundlePlan,
 ) -> Result<(), GitCloneBundleRunError> {
     let target = canonical_bundle_target(plan).await?;
-    validate_bundle_is_in_work_dir(plan, &target).await?;
-    let mirror = canonicalize_path("mirror_dir", plan.mirror_dir()).await?;
-    if target.starts_with(&mirror) {
-        return Err(GitCloneBundleRunError::BundleInsideMirror(target));
-    }
-    Ok(())
+    validate_bundle_location(plan, &target).await
 }
 
 async fn canonical_bundle_target(
@@ -723,11 +718,7 @@ async fn verify_bundle_output(
     }
 
     let bundle = canonicalize_path("bundle_path", plan.bundle_path()).await?;
-    validate_bundle_is_in_work_dir(plan, &bundle).await?;
-    let mirror = canonicalize_path("mirror_dir", plan.mirror_dir()).await?;
-    if bundle.starts_with(&mirror) {
-        return Err(GitCloneBundleRunError::BundleInsideMirror(bundle));
-    }
+    validate_bundle_location(plan, &bundle).await?;
 
     Ok(GitCloneBundleRunOutput {
         bundle_path: plan.bundle_path().to_path_buf(),
@@ -748,18 +739,35 @@ async fn canonicalize_path(
         })
 }
 
-async fn validate_bundle_is_in_work_dir(
+/// The one runtime boundary check on a bundle path: it must sit under the
+/// broker-owned work dir and must not sit under the mirror inside it.
+///
+/// Both assertions live here, against one pair of freshly-canonicalised
+/// directories, because they are one question — "is this path somewhere we are
+/// willing to write a bundle?" — and splitting them invited exactly the drift
+/// that used to exist: two callers each canonicalised `work_dir` and `mirror_dir`
+/// separately and repeated the comparisons, so the two checks could be updated
+/// out of step and a reader could not tell whether they still agreed.
+///
+/// `bundle` must already be canonical. It is compared against canonical
+/// directories, so a symlink cannot alias its way past either check.
+async fn validate_bundle_location(
     plan: &GitCloneBundlePlan,
     bundle: &Path,
 ) -> Result<(), GitCloneBundleRunError> {
     let work_dir = canonicalize_path("work_dir", plan.work_dir()).await?;
-    if bundle.starts_with(&work_dir) {
-        Ok(())
-    } else {
-        Err(GitCloneBundleRunError::BundleEscapedWorkDir(
+    if !bundle.starts_with(&work_dir) {
+        return Err(GitCloneBundleRunError::BundleEscapedWorkDir(
             bundle.to_path_buf(),
-        ))
+        ));
     }
+    let mirror = canonicalize_path("mirror_dir", plan.mirror_dir()).await?;
+    if bundle.starts_with(&mirror) {
+        return Err(GitCloneBundleRunError::BundleInsideMirror(
+            bundle.to_path_buf(),
+        ));
+    }
+    Ok(())
 }
 
 fn normalize_absolute_path_lexically(path: PathBuf) -> PathBuf {

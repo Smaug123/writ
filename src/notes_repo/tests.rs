@@ -10,74 +10,6 @@ fn notes_ref() -> NotesRef {
 }
 
 #[test]
-fn spawn_is_retryable_only_for_transient_resource_errors() {
-    // EAGAIN is the failure confirmed under parallel-test fork
-    // pressure (RLIMIT_NPROC); ENOMEM / EMFILE / ENFILE are the same
-    // all-or-nothing "spawn refused" class.
-    for errno in [libc::EAGAIN, libc::ENOMEM, libc::EMFILE, libc::ENFILE] {
-        assert!(
-            spawn_is_retryable(&io::Error::from_raw_os_error(errno)),
-            "errno {errno} should be retryable",
-        );
-    }
-    // Permanent failures must fail fast, not spin on a retry.
-    for errno in [libc::ENOENT, libc::EACCES] {
-        assert!(
-            !spawn_is_retryable(&io::Error::from_raw_os_error(errno)),
-            "errno {errno} must not be retryable",
-        );
-    }
-    // An error with no OS errno (e.g. a synthetic kind) is permanent.
-    assert!(!spawn_is_retryable(&io::Error::from(
-        io::ErrorKind::NotFound
-    )));
-}
-
-#[test]
-fn spawn_with_retry_succeeds_after_transient_failures() {
-    let mut attempts = 0u32;
-    let got = spawn_with_retry(Duration::from_secs(5), || {
-        attempts += 1;
-        if attempts < 3 {
-            Err(io::Error::from_raw_os_error(libc::EAGAIN))
-        } else {
-            Ok("spawned")
-        }
-    });
-    assert_eq!(got.unwrap(), "spawned");
-    assert_eq!(attempts, 3, "should retry twice, then succeed on the third");
-}
-
-#[test]
-fn spawn_with_retry_gives_up_after_the_deadline_on_persistent_transient() {
-    let mut attempts = 0u32;
-    let started = Instant::now();
-    let got: io::Result<()> = spawn_with_retry(Duration::from_millis(20), || {
-        attempts += 1;
-        Err(io::Error::from_raw_os_error(libc::EAGAIN))
-    });
-    // Bounded by time, not a fixed count: it gives up once the deadline
-    // elapses, having retried more than once.
-    assert_eq!(got.unwrap_err().raw_os_error(), Some(libc::EAGAIN));
-    assert!(attempts > 1, "should retry at least once before giving up");
-    assert!(
-        started.elapsed() >= Duration::from_millis(20),
-        "should not give up before the deadline"
-    );
-}
-
-#[test]
-fn spawn_with_retry_does_not_retry_permanent_errors() {
-    let mut attempts = 0u32;
-    let got: io::Result<()> = spawn_with_retry(Duration::from_secs(5), || {
-        attempts += 1;
-        Err(io::Error::from_raw_os_error(libc::ENOENT))
-    });
-    assert!(got.is_err());
-    assert_eq!(attempts, 1, "a permanent error must not be retried");
-}
-
-#[test]
 fn init_or_open_creates_a_bare_repo() {
     let tmp = TempDir::new().unwrap();
     let path = tmp.path().join("bailiff-repo");
@@ -1039,51 +971,219 @@ fn list_refs_under_prefix_surfaces_corruption_as_error() {
     }
 }
 
-/// The born-dead predicate is a proof, not a heuristic: it fires only when the
-/// proof-of-life probe found no process at all AND the child died by SIGKILL.
-///
-/// The negative cases are the important ones. A child that ran and was killed
-/// (probe found it alive) must never be retried, and neither must a clean
-/// exit. The earlier formulation of this predicate keyed on empty
-/// stdout/stderr instead, which is unsound: `CaptureOutput::Discard` makes
-/// stdout empty by construction, so a `notes add` killed *after* committing
-/// its ref would have been replayed.
-#[test]
-fn only_a_child_that_never_existed_counts_as_having_run_nothing() {
-    let sigkilled = ExitStatus::from_raw(9);
-    let clean_exit = ExitStatus::from_raw(0);
+// The supervision tests below drive `run_git` against a *fake* `git` on a
+// synthetic `PATH`, because the properties under test — "a wedged child is
+// killed at the deadline", "a flooding child is rejected rather than buffered" —
+// cannot be provoked from real git without an actual wedged filesystem.
+//
+// These are the protections `notes_repo` previously lacked entirely. It had a
+// spawn retry and no timeout; `clean_git` had a timeout and no spawn retry. Each
+// helper looked complete on its own, so a hung `git fetch` here hung a bailiff
+// workflow forever and a `git for-each-ref` over a corrupted ref namespace could
+// buffer without bound.
 
+/// Absolute path to a real `sleep`, located on the *test process's* PATH.
+///
+/// The fake `git` runs under a synthetic PATH containing nothing but itself, so a
+/// script that needs a long-lived child must name the binary outright rather than
+/// rely on a lookup that would silently fail (and turn "hangs forever" into
+/// "exits 127" — passing the test for the wrong reason).
+fn sleep_program() -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = std::env::var_os("PATH").expect("PATH must be set in tests");
+    for dir in std::env::split_paths(&path) {
+        let candidate = dir.join("sleep");
+        if let Ok(meta) = std::fs::metadata(&candidate)
+            && meta.is_file()
+            && (meta.permissions().mode() & 0o111) != 0
+        {
+            return candidate;
+        }
+    }
+    panic!("`sleep` must be on PATH for the notes_repo supervision tests");
+}
+
+/// Install an executable `git` in `dir` whose body is `body`, and return an
+/// `InheritedEnv` whose `PATH` finds it and nothing else.
+fn fake_git_env(dir: &Path, body: &str) -> InheritedEnv {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join("git");
+    std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+    let mut perms = std::fs::metadata(&path).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&path, perms).unwrap();
+    InheritedEnv {
+        path: Some(OsString::from(dir.as_os_str())),
+    }
+}
+
+/// A `git` that never exits must be killed at the deadline, not waited on
+/// forever. Bailiff's note fetches run through here, so an unbounded wait is a
+/// workflow that hangs with no diagnosis.
+#[test]
+fn run_git_times_out_on_a_child_that_never_exits() {
+    let tmp = TempDir::new().unwrap();
+    let bin = tmp.path().join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    // Sleep far longer than the test's timeout, writing nothing.
+    let env = fake_git_env(&bin, &format!("exec {} 600", sleep_program().display()));
+    let started = std::time::Instant::now();
+    let err = run_git_with_limits(
+        tmp.path(),
+        ["for-each-ref"],
+        None,
+        CaptureOutput::Capture,
+        &env,
+        GitLimits {
+            timeout: Duration::from_millis(300),
+            stdout_cap: 64 * 1024,
+        },
+        OnBornDead::Retry,
+    )
+    .expect_err("a child that never exits must not be waited on forever");
     assert!(
-        child_ran_nothing(true, &sigkilled),
-        "vanished before running and SIGKILLed: the flake, safe to re-run"
+        matches!(err, NotesRepoError::GitTimedOut { .. }),
+        "expected GitTimedOut, got {err:?}"
     );
     assert!(
-        !child_ran_nothing(false, &sigkilled),
-        "a child the probe found ALIVE ran, and must not be re-run even though \
-         it died by the same signal"
-    );
-    assert!(
-        !child_ran_nothing(true, &clean_exit),
-        "a clean exit is not the flake, whatever the probe saw"
-    );
-    assert!(
-        !child_ran_nothing(false, &clean_exit),
-        "an ordinary successful child is never retried"
+        started.elapsed() < Duration::from_secs(30),
+        "the call must return at the deadline, not on the child's own schedule"
     );
 }
+
+/// A `git` that floods stdout must be rejected outright. A truncated prefix is
+/// worse than an error for `for-each-ref` output, which is parsed one refname
+/// per line: a prefix reads as a complete, shorter answer.
+#[test]
+fn run_git_rejects_a_child_that_floods_stdout() {
+    let tmp = TempDir::new().unwrap();
+    let bin = tmp.path().join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    let env = fake_git_env(&bin, "while :; do printf 'refs/notes/flood\\n'; done");
+    // A small cap (rather than the 64 MiB production bound) so the property is
+    // provoked in milliseconds; the mechanism under test is identical, and
+    // spinning a shell for 30s to reach 64 MiB would only add flakiness.
+    let err = run_git_with_limits(
+        tmp.path(),
+        ["for-each-ref"],
+        None,
+        CaptureOutput::Capture,
+        &env,
+        GitLimits {
+            timeout: Duration::from_secs(30),
+            stdout_cap: 64 * 1024,
+        },
+        OnBornDead::Retry,
+    )
+    .expect_err("unbounded stdout must be rejected, not buffered");
+    assert!(
+        matches!(err, NotesRepoError::GitStdoutCapExceeded { cap, .. } if cap == 64 * 1024),
+        "expected GitStdoutCapExceeded at the 64 KiB cap, got {err:?}"
+    );
+}
+
+/// A `git` that floods *stderr* while exiting cleanly must still succeed — the
+/// drain keeps only a bounded tail — and must not deadlock on a full pipe. This
+/// is the `for-each-ref`-over-a-corrupt-namespace case the module already
+/// reasoned about, now with an actual bound.
+#[test]
+fn run_git_tail_caps_a_flooding_stderr_without_deadlocking() {
+    let tmp = TempDir::new().unwrap();
+    let bin = tmp.path().join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    let env = fake_git_env(
+        &bin,
+        "i=0; while [ $i -lt 4000 ]; do printf 'warning: ignoring ref with broken name\\n' 1>&2; \
+         i=$((i+1)); done; printf 'refs/notes/ok\\n'; exit 0",
+    );
+    let (stdout, stderr) = run_git_capturing_stderr_with_limits(
+        tmp.path(),
+        ["for-each-ref"],
+        None,
+        CaptureOutput::Capture,
+        &env,
+        GitLimits::production(),
+        OnBornDead::Retry,
+    )
+    .expect("a clean exit with verbose stderr must succeed");
+    assert_eq!(stdout, b"refs/notes/ok\n");
+    assert!(
+        !stderr.is_empty() && stderr.len() <= NOTES_GIT_STDERR_TAIL_CAP,
+        "stderr must be retained but bounded; got {} bytes",
+        stderr.len()
+    );
+}
+
+/// A helper the fake `git` forks into its own process group must not outlive the
+/// run. Without a process-group kill, a `git` that leaves a credential helper or
+/// a hook behind keeps the captured pipe open and the drain never reaches EOF.
+#[test]
+fn run_git_kills_a_lingering_helper_in_the_process_group() {
+    let tmp = TempDir::new().unwrap();
+    let bin = tmp.path().join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    let marker = tmp.path().join("helper.pid");
+    // Fork a long-lived helper that inherits the group, record its pid, then
+    // exit 0 immediately. The supervisor must SIGKILL the group on the way out.
+    let env = fake_git_env(
+        &bin,
+        &format!(
+            "{sleep} 600 & printf '%s' \"$!\" > {marker}\nexit 0",
+            sleep = sleep_program().display(),
+            marker = marker.display()
+        ),
+    );
+    run_git_with_limits(
+        tmp.path(),
+        ["for-each-ref"],
+        None,
+        CaptureOutput::Capture,
+        &env,
+        GitLimits::production(),
+        OnBornDead::Retry,
+    )
+    .expect("the fake git exits 0");
+    let pid: i32 = fs::read_to_string(&marker)
+        .expect("helper pid marker")
+        .trim()
+        .parse()
+        .expect("helper pid is numeric");
+    // The group kill is synchronous with the run's return, but reaping is the
+    // kernel's business; poll briefly for the helper to disappear.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let alive = unsafe { libc::kill(pid, 0) } == 0;
+        if !alive {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "helper pid {pid} survived the run; the process group was not killed"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+// The born-dead-child tests below come from #354 (`f36b4c0`), which diagnosed
+// the macOS "phantom SIGKILL": `spawn()` returns a pid whose process is already
+// gone before it ran one instruction, roughly 1 spawn in 2000 under parallel-test
+// load. They are preserved here across this branch's rewrite of these functions
+// onto the shared supervisor. What moved is only *where* the probe is taken —
+// the supervisor now owns the spawn, so it owns the observation — not what is
+// claimed or when a retry is allowed.
 
 /// A child that really ran is not retried, even when it dies by SIGKILL having
 /// written nothing to the captured streams — the case that makes replaying a
 /// mutating `git notes add` dangerous.
 ///
-/// This exercises the *real* probe, so it pins the production behaviour rather
-/// than the loop mechanics: the fake git records an attempt (a stand-in for
-/// committing a ref), then SIGKILLs itself.
+/// This exercises the *real* probe, so it pins production behaviour rather than
+/// the loop mechanics: the fake git records an attempt (a stand-in for committing
+/// a ref), then SIGKILLs itself.
 #[test]
 fn a_child_that_ran_is_not_retried_even_when_sigkilled() {
     use std::os::unix::fs::PermissionsExt;
 
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = TempDir::new().expect("tempdir");
     let attempts = dir.path().join("attempts");
     let fake_git = dir.path().join("git");
     std::fs::write(
@@ -1105,6 +1205,7 @@ fn a_child_that_ran_is_not_retried_even_when_sigkilled() {
         None,
         CaptureOutput::Discard,
         &env,
+        OnBornDead::Retry,
     )
     .expect_err("a child that ran and then died must be surfaced, not retried");
 
@@ -1124,16 +1225,16 @@ fn a_child_that_ran_is_not_retried_even_when_sigkilled() {
 /// The retry loop re-runs the invocation when the probe proves the child never
 /// existed, and returns the successful attempt's output.
 ///
-/// A genuinely born-dead child cannot be forged on demand — the kernel decides
-/// — so the probe is supplied here, which is what `run_git_child_probed` takes
-/// it as an argument for. The child still has to die by SIGKILL for the
-/// predicate to fire, so this drives both halves of the conjunction.
+/// A genuinely born-dead child cannot be forged on demand — the kernel decides —
+/// so the probe is supplied here, which is what `supervised_git_probed` takes it
+/// as an argument for. The child still has to die by SIGKILL for the predicate to
+/// fire, so this drives both halves of the conjunction.
 #[test]
 fn a_child_proven_never_to_have_existed_is_retried() {
     use std::cell::Cell;
     use std::os::unix::fs::PermissionsExt;
 
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = TempDir::new().expect("tempdir");
     let marker = dir.path().join("died-once-already");
     let fake_git = dir.path().join("git");
     std::fs::write(
@@ -1149,22 +1250,29 @@ fn a_child_proven_never_to_have_existed_is_retried() {
     std::fs::set_permissions(&fake_git, perms).expect("chmod");
 
     let mut command = Command::new(&fake_git);
-    command.stdin(Stdio::null());
-    command.stdout(Stdio::piped());
-    command.stderr(Stdio::piped());
 
     // Report "vanished" on the first attempt only, mimicking the kernel having
     // discarded that child.
     let probes = Cell::new(0usize);
-    let output = run_git_child_probed(&mut command, None, |_pid| {
-        probes.set(probes.get() + 1);
-        probes.get() == 1
-    })
-    .expect("a child proven never to have run is retried");
+    let (status, stdout, _stderr) = supervised_git_probed(
+        &mut command,
+        GitLimits::production(),
+        None,
+        StdoutMode::Capture {
+            byte_cap: 64 * 1024,
+        },
+        || vec!["rev-parse".to_string()],
+        OnBornDead::Retry,
+        |_pid| {
+            probes.set(probes.get() + 1);
+            probes.get() == 1
+        },
+    )
+    .expect("a replay-safe command is retried on the born-dead signature");
 
-    assert!(output.status.success(), "the retry must reach a live child");
+    assert!(status.success(), "the retry must reach a live child");
     assert_eq!(
-        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&stdout),
         "survived",
         "the retry must return the successful attempt's output"
     );

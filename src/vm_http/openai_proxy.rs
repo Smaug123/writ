@@ -7,9 +7,7 @@ use std::sync::Arc;
 
 use serde::Deserialize;
 
-use crate::audit::{
-    AuditError, AuditLog, OpenAiProxyAuditRoute, OpenAiProxyOutcomeRecord, OpenAiProxyRequestRecord,
-};
+use crate::audit::OpenAiProxyAuditRoute;
 use crate::openai_chatgpt_auth::{
     CHATGPT_OAUTH_REFRESH_LEEWAY_SECONDS, CHATGPT_OAUTH_REFRESH_URL, ChatgptOauthAuthority,
     ChatgptOauthAuthorityConfig, ChatgptOauthError, SystemClock, build_refresh_http_client,
@@ -18,9 +16,8 @@ use crate::secret::{SecretKey, SecretStore};
 use crate::server::BrokerState;
 
 use super::proxy_common::{
-    OpenAiBackend, ProxyBackend, ProxyBackendConfig, ProxyFetch, ProxyForwardHeader,
-    ProxyOutcomeFields, ProxyRequestFields, ProxyStream, UpstreamAuth, VmHttpProxyService,
-    is_proxy_id_byte, proxy_target_path,
+    OpenAiBackend, ProxyBackend, ProxyBackendConfig, ProxyFetch, ProxyForwardHeader, ProxyStream,
+    UpstreamAuth, VmHttpProxyService, is_proxy_id_byte, proxy_target_path,
 };
 use super::{VmHttpDispatch, VmHttpHeader, VmHttpResponse, VmHttpStatus};
 
@@ -236,6 +233,7 @@ impl ProxyBackend for OpenAiBackend {
     const REQUEST_AUDIT_KIND: &'static str = "openai_proxy_request";
     const OUTCOME_AUDIT_KIND: &'static str = "openai_proxy_outcome";
     const STREAMING_OUTCOME_AUDIT_KIND: &'static str = "openai_proxy_streaming_outcome";
+    const LOCAL_RESPONSE_AUDIT_KIND: &'static str = "openai_proxy_request_and_outcome";
 
     fn classify_proxy_target(target: &str) -> Option<OpenAiProxyAuditRoute> {
         // Match on the path only. The OpenAI clients pass through query
@@ -412,36 +410,6 @@ impl ProxyBackend for OpenAiBackend {
                 }
             }
         }
-    }
-
-    fn record_request_audit(
-        audit_log: &AuditLog,
-        fields: ProxyRequestFields<'_, OpenAiProxyAuditRoute>,
-    ) -> Result<(), AuditError> {
-        audit_log.record_openai_proxy_request(&OpenAiProxyRequestRecord {
-            request_id: fields.request_id,
-            session_id: fields.session_id,
-            received_at: fields.received_at,
-            method: fields.method,
-            target: fields.target,
-            route: fields.route,
-            decision: fields.decision,
-        })
-    }
-
-    fn record_outcome_audit(
-        audit_log: &AuditLog,
-        fields: ProxyOutcomeFields<'_>,
-    ) -> Result<(), AuditError> {
-        audit_log.record_openai_proxy_outcome(&OpenAiProxyOutcomeRecord {
-            request_id: fields.request_id,
-            completed_at: fields.completed_at,
-            http_status: fields.http_status,
-            upstream_url: fields.upstream_url,
-            upstream_status: fields.upstream_status,
-            response_bytes: fields.response_bytes,
-            error: fields.error,
-        })
     }
 
     fn into_vm_http_dispatch(stream: ProxyStream<Self>) -> VmHttpDispatch {

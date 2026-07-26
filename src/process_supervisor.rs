@@ -27,6 +27,10 @@ use tokio::process::Command;
 
 use crate::process_spawn;
 
+mod capture;
+
+use capture::{Absorb, CaptureBuffer, CapturePolicy};
+
 const CHILD_EXIT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 /// Upper bound on captured stderr. A [`StderrMode::Capture`] child's stderr is
@@ -34,7 +38,7 @@ const CHILD_EXIT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 /// tail of at most this many bytes is retained: a verbose or hostile child
 /// cannot make the host buffer unbounded diagnostics, and a tool's fatal
 /// message is typically its last line, so the tail is the informative part.
-const STDERR_CAPTURE_TAIL_CAP: usize = 8 * 1024;
+pub(crate) const STDERR_CAPTURE_TAIL_CAP: usize = 8 * 1024;
 
 /// Whether the supervisor should capture the child's stdout or discard it.
 ///
@@ -75,6 +79,17 @@ pub(crate) enum StderrMode {
 pub(crate) enum SupervisedOutcome {
     Exited {
         status: ExitStatus,
+        /// The child matched the phantom-SIGKILL signature — see
+        /// [`matches_born_dead_signature`], which explains why this is a
+        /// *heuristic* and not the proof of non-execution an earlier version
+        /// claimed. Only ever true on the blocking arm, which is where the
+        /// observation is taken.
+        ///
+        /// This is evidence, not a licence. It does **not** authorise replaying a
+        /// non-idempotent command: a child that ran, took effect, and was then
+        /// killed matches this signature too. Only retry on it when replaying the
+        /// command is harmless on the command's own merits.
+        born_dead_signature: bool,
         stdout: Vec<u8>,
         /// Line-aligned tail-capped stderr when the run used
         /// [`StderrMode::Capture`], empty under [`StderrMode::Discard`]. Not yet
@@ -123,6 +138,14 @@ pub(crate) enum SupervisorError {
         pgid: libc::pid_t,
         source: std::io::Error,
     },
+    #[error("writing the child's stdin failed after {written} of {total} bytes: {source}")]
+    StdinWrite {
+        written: usize,
+        total: usize,
+        source: std::io::Error,
+    },
+    #[error("reading the child's captured stdout failed: {0}")]
+    CaptureRead(std::io::Error),
 }
 
 /// Spawn `command` as a process-group leader, wait up to `timeout` for it to
@@ -157,6 +180,12 @@ pub(crate) async fn run_supervised(
     let mut child = process_spawn::spawn_async(command)
         .await
         .map_err(SupervisorError::Spawn)?;
+    // One deadline for the whole supervised call, taken once the child exists so
+    // spawn-refusal retries do not eat the caller's budget. Everything that can
+    // block afterwards — the exit poll *and* the capture drains — is bounded by
+    // it, because "wait up to `timeout`" is a promise about the call, not about
+    // one of the things the call waits on.
+    let deadline = tokio::time::Instant::now() + timeout;
     let pid = child.id().ok_or(SupervisorError::MissingProcessId)?;
     let pgid = process_group_id(pid)?;
     // Set by the stdout drain when the child exceeds `byte_cap`. It is a
@@ -180,9 +209,9 @@ pub(crate) async fn run_supervised(
                 .stdout
                 .take()
                 .expect("stdout was configured as Stdio::piped()");
-            Some(tokio::spawn(bounded_stdout_drain(
+            Some(tokio::spawn(drain_under_policy(
                 stdout,
-                byte_cap,
+                CapturePolicy::RejectOverCap { cap: byte_cap },
                 Arc::clone(&stdout_capped),
             )))
         }
@@ -194,27 +223,57 @@ pub(crate) async fn run_supervised(
                 .stderr
                 .take()
                 .expect("stderr was configured as Stdio::piped()");
-            Some(tokio::spawn(drain_to_tail_cap(
+            Some(tokio::spawn(drain_under_policy(
                 stderr,
-                STDERR_CAPTURE_TAIL_CAP,
+                CapturePolicy::TailCap {
+                    cap: STDERR_CAPTURE_TAIL_CAP,
+                },
+                // Its own flag, never read: a tail cap truncates instead of
+                // overrunning, so stderr must not be able to trip the stdout
+                // cap rejection even if the policy were changed later.
+                Arc::new(AtomicBool::new(false)),
             )))
         }
     };
     let mut cleanup_guard = ProcessGroupCleanupGuard::new(pgid);
-    match wait_for_child_exit_before_reap(pgid, timeout, &stdout_capped).await? {
+    match wait_for_child_exit_before_reap(pgid, deadline, &stdout_capped).await? {
         ChildExitObservation::Exited => {
-            cleanup_guard.mark_child_exit_observed();
+            cleanup_guard.tolerate_empty_group();
             cleanup_guard.kill_now()?;
             let status = child.wait().await;
             cleanup_guard.disarm();
             let status = status.map_err(SupervisorError::Wait)?;
-            let stdout = match stdout_drain {
-                Some(handle) => handle.await.unwrap_or_default(),
-                None => Vec::new(),
+            // Both joins are bounded by the same deadline that bounded the
+            // child: the contract is a wall-clock bound on the whole call, and
+            // the child exiting is not the last thing that can block it.
+            // Both early returns below abort the *stderr* drain on the way out.
+            // Dropping its `JoinHandle` would only detach it, leaving a task
+            // holding a pipe fd for as long as whatever is keeping the write end
+            // open lives — which, in the escaped-descendant case, is unbounded.
+            let stdout = match join_capture(stdout_drain, deadline).await {
+                CaptureJoin::NotCaptured => Vec::new(),
+                CaptureJoin::Finished(DrainOutput {
+                    read_error: Some(error),
+                    ..
+                }) => {
+                    abort_captures(None, stderr_drain);
+                    return Err(SupervisorError::CaptureRead(error));
+                }
+                CaptureJoin::Finished(DrainOutput { bytes, .. }) => bytes,
+                // The capture never reached EOF, so we cannot certify it is
+                // complete. Report the deadline rather than a short stdout that
+                // a caller would parse as the child's whole answer.
+                CaptureJoin::DeadlineExpired => {
+                    abort_captures(None, stderr_drain);
+                    return Ok(SupervisedOutcome::TimedOut);
+                }
             };
-            let stderr = match stderr_drain {
-                Some(handle) => handle.await.unwrap_or_default(),
-                None => Vec::new(),
+            // Stderr is diagnostics under a tail cap, so an incomplete capture
+            // is already an accepted outcome here: keep whatever arrived and let
+            // the run stand on stdout, which is the channel carrying data.
+            let stderr = match join_capture(stderr_drain, deadline).await {
+                CaptureJoin::Finished(DrainOutput { bytes, .. }) => bytes,
+                CaptureJoin::NotCaptured | CaptureJoin::DeadlineExpired => Vec::new(),
             };
             // Race backstop: the child may have written past the cap and exited
             // before the poll loop observed the flag. The drain has now fully
@@ -227,6 +286,9 @@ pub(crate) async fn run_supervised(
             }
             Ok(SupervisedOutcome::Exited {
                 status,
+                // The async arm takes no born-dead probe: its callers replay git
+                // against a staging repo and do not want an automatic re-run.
+                born_dead_signature: false,
                 stdout,
                 stderr,
             })
@@ -240,111 +302,729 @@ pub(crate) async fn run_supervised(
             // tolerated: we own this group (we created it with `process_group(0)`)
             // and can always signal a live member, so EPERM here can only mean
             // the group is already empty, never a real permission failure.
-            cleanup_guard.mark_child_exit_observed();
-            cleanup_guard.kill_now()?;
+            cleanup_guard.tolerate_empty_group();
+            let kill = cleanup_guard.kill_now_io();
             let _ = child.wait().await;
             cleanup_guard.disarm();
-            if let Some(handle) = stdout_drain {
-                let _ = handle.await;
-            }
-            if let Some(handle) = stderr_drain {
-                let _ = handle.await;
-            }
+            // Both outcomes below discard captured output by contract, so the
+            // drains are aborted rather than awaited. Awaiting them would
+            // reintroduce the unbounded wait this arm exists to escape: an
+            // escaped descendant can hold the write end open forever, and we
+            // have nothing to gain by listening.
+            abort_captures(stdout_drain, stderr_drain);
+            kill.map_err(|source| SupervisorError::KillProcessGroup { pgid, source })?;
             Ok(SupervisedOutcome::StdoutCapExceeded {
                 cap: stdout_byte_cap.expect("cap only set under Capture"),
             })
         }
         ChildExitObservation::TimedOut => {
-            cleanup_guard.kill_now()?;
+            // Same exposure as the blocking timeout arm: the child may exit of its
+            // own accord between the deadline and this kill, emptying the group.
+            // We have not reaped it, so an empty group is the only thing `EPERM`
+            // can mean, and a timeout must not surface as a kill failure.
+            cleanup_guard.tolerate_empty_group();
+            let kill = cleanup_guard.kill_now_io();
             let _ = child.wait().await;
             cleanup_guard.disarm();
-            if let Some(handle) = stdout_drain {
-                let _ = handle.await;
-            }
-            if let Some(handle) = stderr_drain {
-                let _ = handle.await;
-            }
+            abort_captures(stdout_drain, stderr_drain);
+            kill.map_err(|source| SupervisorError::KillProcessGroup { pgid, source })?;
             Ok(SupervisedOutcome::TimedOut)
         }
     }
 }
 
-/// Drain `reader`, retaining up to `cap` bytes. Returns the captured bytes on a
-/// clean EOF (or a read error, best-effort like the stderr drain). If the child
-/// writes more than `cap`, set `capped` and stop reading immediately: the
-/// supervisor observes the flag and SIGKILLs the group, so there is no point
-/// continuing to drain (and the returned buffer is discarded anyway). Memory is
-/// therefore bounded by `cap` plus one read chunk regardless of how much a
-/// hostile child tries to emit.
-async fn bounded_stdout_drain<R>(mut reader: R, cap: usize, capped: Arc<AtomicBool>) -> Vec<u8>
+/// Drop both capture drains without waiting for EOF.
+///
+/// For the timeout and cap-rejection outcomes the captured bytes are discarded
+/// by contract, so there is nothing to wait for — and waiting is precisely what
+/// must not happen, because the reason we are here may be a child (or an escaped
+/// descendant) that never closes the pipe.
+fn abort_captures(
+    stdout_drain: Option<tokio::task::JoinHandle<DrainOutput>>,
+    stderr_drain: Option<tokio::task::JoinHandle<DrainOutput>>,
+) {
+    for handle in [stdout_drain, stderr_drain].into_iter().flatten() {
+        handle.abort();
+    }
+}
+
+/// What a finished capture drain produced.
+///
+/// `read_error` is kept *beside* the bytes rather than replacing them because
+/// the two streams want opposite things from a failed read: a failed stdout read
+/// must sink the whole run (its bytes are parsed as data), while a failed stderr
+/// read should still yield whatever diagnostic arrived. Returning `Result` would
+/// force one of those two to be wrong.
+struct DrainOutput {
+    bytes: Vec<u8>,
+    read_error: Option<std::io::Error>,
+}
+
+/// Drain `reader` under `policy`, publishing an overrun to `capped` as soon as
+/// it happens so the supervisor's poll loop can break out and SIGKILL the group
+/// rather than waiting for the wall clock.
+///
+/// The whole stream is consumed under [`CapturePolicy::TailCap`] so the child
+/// never stalls on a full pipe; under [`CapturePolicy::RejectOverCap`] the drain
+/// stops at the overrun, because the capture is already void and the group is
+/// about to die. All byte accounting — the bound, the tail alignment, the
+/// discard-on-overrun — lives in [`CaptureBuffer`], shared with the blocking
+/// supervisor.
+///
+/// A read error ends the drain but is *reported*, never folded into EOF. An
+/// earlier version returned the bytes accumulated so far and dropped the error,
+/// which is indistinguishable at the call site from the child having closed the
+/// stream deliberately — so a truncated `rev-list` read as a complete, shorter
+/// object list.
+async fn drain_under_policy<R>(
+    mut reader: R,
+    policy: CapturePolicy,
+    capped: Arc<AtomicBool>,
+) -> DrainOutput
 where
     R: tokio::io::AsyncRead + Unpin,
 {
     use tokio::io::AsyncReadExt;
-    let mut buf = Vec::new();
+    let mut buffer = CaptureBuffer::new(policy);
     let mut chunk = [0u8; 8192];
+    let mut read_error = None;
     loop {
         match reader.read(&mut chunk).await {
-            Ok(0) | Err(_) => return buf,
+            Ok(0) => break,
+            Err(error) => {
+                read_error = Some(error);
+                break;
+            }
             Ok(n) => {
-                buf.extend_from_slice(&chunk[..n]);
-                if buf.len() > cap {
-                    capped.store(true, Ordering::Release);
-                    return buf;
+                if buffer.push(&chunk[..n]) == Absorb::Stop {
+                    if buffer.overran() {
+                        capped.store(true, Ordering::Release);
+                    }
+                    break;
                 }
             }
+        }
+    }
+    DrainOutput {
+        bytes: buffer.finish(),
+        read_error,
+    }
+}
+
+/// How a capture drain ended, once the supervisor stopped waiting for it.
+enum CaptureJoin {
+    /// The stream was not captured at all (`Discard` mode).
+    NotCaptured,
+    /// The drain ran to completion — EOF or a reported read error.
+    Finished(DrainOutput),
+    /// The deadline passed with the drain still running, so it was abandoned.
+    /// No bytes: the capture is provably incomplete.
+    DeadlineExpired,
+}
+
+/// Join a capture drain, but never past `deadline`.
+///
+/// A drain reaches EOF only once *every* fd on the pipe's write end is closed.
+/// The group SIGKILL closes the ones held by the child and by anything it forked
+/// into the group — but a descendant that called `setsid` has left the group
+/// entirely, survives the kill, and keeps the write end open. Verified on this
+/// platform: with such a helper alive, `killpg` reports `EPERM` (the group is
+/// already empty) and the pipe never reaches EOF, so an unbounded join here
+/// outlives the supervisor's advertised wall-clock bound *indefinitely* — the
+/// one failure mode a timeout exists to prevent.
+///
+/// On expiry the task is **aborted**, releasing the read end. Note the
+/// `&mut handle`: `timeout_at` would otherwise consume the `JoinHandle`, and
+/// dropping a `JoinHandle` *detaches* the task rather than cancelling it — so the
+/// drain would keep running, holding the fd, in exactly the scenario this
+/// function exists to bound. Every supervised run against such a child would leak
+/// one task and one descriptor.
+async fn join_capture(
+    handle: Option<tokio::task::JoinHandle<DrainOutput>>,
+    deadline: tokio::time::Instant,
+) -> CaptureJoin {
+    let Some(mut handle) = handle else {
+        return CaptureJoin::NotCaptured;
+    };
+    match tokio::time::timeout_at(deadline, &mut handle).await {
+        Ok(Ok(output)) => CaptureJoin::Finished(output),
+        // The drain task panicked or was cancelled. It holds the only copy of
+        // the captured bytes, so there is nothing to return and no basis for
+        // calling the capture complete.
+        Ok(Err(join_error)) => CaptureJoin::Finished(DrainOutput {
+            bytes: Vec::new(),
+            read_error: Some(std::io::Error::other(format!(
+                "capture drain task did not finish: {join_error}"
+            ))),
+        }),
+        Err(_elapsed) => {
+            handle.abort();
+            CaptureJoin::DeadlineExpired
         }
     }
 }
 
-/// Drain `reader` to EOF, retaining a line-aligned tail of at most `cap` bytes.
+/// Probe taken immediately after `spawn()` returns and before we touch the
+/// child: `true` when `getpgid(pid)` reports `ESRCH`, i.e. the kernel has no
+/// process with that pid.
 ///
-/// The whole stream is consumed so the child never stalls on a full pipe, but
-/// memory stays bounded by `cap` (plus one read chunk): a verbose or hostile
-/// child cannot make the host buffer unbounded output. The tail is kept
-/// because a tool's fatal message is typically its last output. When the cap
-/// truncates the head, the retained tail's first (partial) line is dropped so
-/// every retained line is complete — see the body for why that soundness
-/// property matters to a downstream secret redactor. Read errors end the drain
-/// with whatever was accumulated so far, matching the best-effort
-/// `read_to_end` used for stdout.
-async fn drain_to_tail_cap<R>(mut reader: R, cap: usize) -> Vec<u8>
-where
-    R: tokio::io::AsyncRead + Unpin,
-{
-    use tokio::io::AsyncReadExt;
-    let mut buf = Vec::new();
-    let mut chunk = [0u8; 8192];
-    let mut truncated = false;
+/// This is the mark left by the macOS "phantom SIGKILL" (see
+/// `docs/known-test-flakes.md`): `spawn()` succeeds and yields a pid whose
+/// process is already gone microseconds later. Roughly 1 spawn in 2000 under the
+/// parallel test suite's load.
+///
+/// # What this does *not* establish
+///
+/// It does not establish that the child never ran. `f36b4c0` introduced this
+/// probe reasoning from the zombie rule — that an exited-but-unreaped child still
+/// holds a process-table entry, so `getpgid` on it would succeed and `ESRCH`
+/// could only mean the pid never became a live process. That rule holds on Linux
+/// and **not on this platform**: XNU's pid lookup excludes zombies, so `getpgid`
+/// answers `ESRCH` for a child that ran, took effect, and exited. See
+/// `getpgid_does_not_portably_prove_a_child_never_ran`, which demonstrates it
+/// against a child that writes a file before dying.
+///
+/// So the observation is a *signature*, not a proof, and the caller — not this
+/// module — has to decide what may be replayed on the strength of it. See
+/// [`matches_born_dead_signature`].
+pub(crate) fn pid_absent_when_probed(pid: u32) -> bool {
+    // SAFETY: `getpgid` is async-signal-safe and reads no memory we own.
+    let probed = unsafe { libc::getpgid(pid as libc::pid_t) };
+    probed == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+}
+
+/// Whether a finished child matches the phantom-SIGKILL signature: its pid was
+/// already absent when probed, and it ended on `SIGKILL`.
+///
+/// **This is a heuristic, deliberately not named as a proof.** It narrows the
+/// population of children that might have been discarded before doing anything
+/// useful; it cannot certify that any particular one was, because neither
+/// conjunct excludes a child that ran:
+///
+/// * `pid_absent` — see [`pid_absent_when_probed`]: `ESRCH` does not distinguish
+///   "never existed" from "exited without being reaped" on this platform.
+/// * `SIGKILL` — narrows to a child that did not exit under its own control, so
+///   an ordinary success or failure never matches. It does not say *when* the
+///   kill landed, and a child killed after committing its ref matches too.
+///
+/// A caller may therefore only retry on this if replaying the command is harmless
+/// **on the command's own merits** — because it is idempotent, or because git
+/// refuses it outright the second time. `notes_repo::OnBornDead` is where that
+/// judgement is recorded, per invocation. What must not happen is what the
+/// previous formulation invited: treating this as a licence to replay an
+/// arbitrary non-idempotent command.
+///
+/// Note what is deliberately *not* used: emptiness of stdout or stderr. A
+/// `Discard` stdout is empty by construction, so for mutating callers that test
+/// would be vacuous.
+pub(crate) fn matches_born_dead_signature(pid_absent: bool, status: &ExitStatus) -> bool {
+    use std::os::unix::process::ExitStatusExt;
+    pid_absent && status.signal() == Some(libc::SIGKILL)
+}
+
+/// Blocking twin of [`run_supervised`], for callers that are not on an async
+/// runtime.
+///
+/// Same guarantees, same [`SupervisedOutcome`], same [`CaptureBuffer`] byte-cap
+/// policy, same process-group SIGKILL: the point of having this at all is that a
+/// synchronous caller should not have to choose between "no timeout" and "become
+/// async". `notes_repo` is the caller — it holds a `std::sync::Mutex` across the
+/// whole git invocation, which cannot be held across an `await`, so making it
+/// async would trade this problem for a worse one.
+///
+/// Unlike the async twin this also owns **stdin**, because a blocking caller
+/// cannot write stdin and drain stdout concurrently without either a thread or
+/// this loop. Writing stdin to completion *before* draining stdout deadlocks
+/// against a child that fills its stdout pipe while we are still writing, so
+/// stdin is driven non-blockingly alongside the reads.
+///
+/// One event loop does everything: `poll(2)` on whichever of stdin/stdout/stderr
+/// is still live, a `waitid(WNOWAIT)` exit probe, and a deadline check. Because
+/// every phase is inside the one deadline, this bounds the *whole* call — even
+/// the post-exit drain, where a stray process holding an inherited pipe open
+/// could otherwise stall forever.
+pub(crate) fn run_supervised_blocking(
+    command: &mut std::process::Command,
+    timeout: Duration,
+    stdin_input: Option<&[u8]>,
+    stdout_mode: StdoutMode,
+    stderr_mode: StderrMode,
+) -> Result<SupervisedOutcome, SupervisorError> {
+    run_supervised_blocking_probed(
+        command,
+        timeout,
+        stdin_input,
+        stdout_mode,
+        stderr_mode,
+        pid_absent_when_probed,
+    )
+}
+
+/// [`run_supervised_blocking`] with an injectable proof-of-life probe.
+///
+/// A genuinely born-dead child cannot be forged on demand — the kernel decides —
+/// so a test that wants to drive the born-dead path supplies its own probe.
+/// It is an explicit argument rather than hidden indirection, and
+/// [`run_supervised_blocking`] is the only production caller.
+pub(crate) fn run_supervised_blocking_probed(
+    command: &mut std::process::Command,
+    timeout: Duration,
+    stdin_input: Option<&[u8]>,
+    stdout_mode: StdoutMode,
+    stderr_mode: StderrMode,
+    probe: impl FnOnce(u32) -> bool,
+) -> Result<SupervisedOutcome, SupervisorError> {
+    use std::os::unix::process::CommandExt;
+
+    let stdout_byte_cap = match stdout_mode {
+        StdoutMode::Discard => None,
+        StdoutMode::Capture { byte_cap } => Some(byte_cap),
+    };
+    command.stdin(match stdin_input {
+        Some(_) => Stdio::piped(),
+        None => Stdio::null(),
+    });
+    command.stdout(match stdout_mode {
+        StdoutMode::Discard => Stdio::null(),
+        StdoutMode::Capture { .. } => Stdio::piped(),
+    });
+    command.stderr(match stderr_mode {
+        StderrMode::Discard => Stdio::null(),
+        StderrMode::Capture => Stdio::piped(),
+    });
+    command.process_group(0);
+
+    let mut child = process_spawn::spawn(command).map_err(SupervisorError::Spawn)?;
+
+    // Probe before touching the child: the zombie rule this relies on only holds
+    // while the child is unreaped, so it has to happen here and nowhere later.
+    let pid_absent = probe(child.id());
+
+    // Everything after the spawn runs inside `supervise_blocking_child` so that
+    // *no* error path can return while the child is still un-reaped. `?` on a
+    // post-spawn failure (an `fcntl`, a `poll`, a `waitid`) would otherwise skip
+    // the `child.wait()` below, and `std::process::Child::drop` deliberately does
+    // not reap — so each such failure would leave a zombie until the daemon
+    // exits. The failures are individually near-impossible; the leak is
+    // unbounded, which is the asymmetry that matters.
+    let pgid = match process_group_id(child.id()) {
+        Ok(pgid) => pgid,
+        Err(err) => {
+            // No pgid means no group to signal; still reap the child we made.
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(err);
+        }
+    };
+    let mut cleanup_guard = ProcessGroupCleanupGuard::new(pgid);
+    let outcome = supervise_blocking_child(
+        &mut child,
+        &mut cleanup_guard,
+        timeout,
+        stdin_input,
+        stdout_byte_cap,
+    );
+    let BlockingRunState {
+        observation,
+        stdout_buf,
+        stderr_buf,
+        child_exited,
+        retained_captures,
+        stdin_write_error,
+        stdout_read_error,
+    } = match outcome {
+        Ok(state) => state,
+        Err(err) => {
+            // Kill the group and reap before surfacing, so a supervision failure
+            // costs us an error and not a process-table entry.
+            let _ = cleanup_guard.kill_now_io();
+            let _ = child.wait();
+            cleanup_guard.disarm();
+            return Err(err);
+        }
+    };
+
+    if !child_exited {
+        // We are about to signal a group we have not reaped, so an empty group is
+        // benign here however we arrived: the child may have raced us between the
+        // deadline and this kill, and an over-cap rejection has already closed
+        // stdout and may have SIGPIPE'd it. See `kill_process_group` for why
+        // "empty" is the only thing EPERM can mean while the leader is unreaped.
+        cleanup_guard.tolerate_empty_group();
+        // Hold a kill failure rather than returning on it: we still owe the child
+        // a `wait`, and `std::process::Child::drop` does not reap. Returning here
+        // would surface the right error and leak a process — the same trap as the
+        // post-spawn paths above, one arm further on.
+        if let Err(err) = cleanup_guard.kill_now() {
+            let _ = child.wait();
+            cleanup_guard.disarm();
+            return Err(err);
+        }
+    }
+    // The group is dead; nothing is left to SIGPIPE, so the captures may close.
+    drop(retained_captures);
+    let status = child.wait();
+    cleanup_guard.disarm();
+
+    match observation {
+        ChildExitObservation::Exited => {
+            let status = status.map_err(SupervisorError::Wait)?;
+            // Settled-flag backstop, mirroring the async twin: the drain may have
+            // crossed the cap in the same iteration the child exited.
+            if stdout_buf.overran() {
+                return Ok(SupervisedOutcome::StdoutCapExceeded {
+                    cap: stdout_byte_cap.expect("cap only set under Capture"),
+                });
+            }
+            let born_dead_signature = matches_born_dead_signature(pid_absent, &status);
+            // A born-dead child may be retried by the caller, and its `EPIPE` on
+            // stdin is a symptom of that rather than a delivery failure — so the
+            // held error is discarded in exactly that case and surfaced in every
+            // other.
+            if !born_dead_signature && let Some((written, source)) = stdin_write_error {
+                return Err(SupervisorError::StdinWrite {
+                    written,
+                    total: stdin_input.map_or(0, |b| b.len()),
+                    source,
+                });
+            }
+            // A failed stdout read means the capture is a prefix, not an answer.
+            if let Some(err) = stdout_read_error {
+                return Err(SupervisorError::CaptureRead(err));
+            }
+            Ok(SupervisedOutcome::Exited {
+                born_dead_signature,
+                status,
+                stdout: stdout_buf.finish(),
+                stderr: stderr_buf.finish(),
+            })
+        }
+        ChildExitObservation::StdoutCapExceeded => Ok(SupervisedOutcome::StdoutCapExceeded {
+            cap: stdout_byte_cap.expect("cap only set under Capture"),
+        }),
+        ChildExitObservation::TimedOut => Ok(SupervisedOutcome::TimedOut),
+    }
+}
+
+/// The event loop of [`run_supervised_blocking`], factored out so its caller can
+/// guarantee the child is reaped on every error path.
+///
+/// Returns how the child left the loop plus the two capture buffers. Does not
+/// reap, kill on the way out, or interpret the exit status: those belong to the
+/// caller, which is the only place that can sequence them correctly against the
+/// cleanup guard.
+fn supervise_blocking_child(
+    child: &mut std::process::Child,
+    cleanup_guard: &mut ProcessGroupCleanupGuard,
+    timeout: Duration,
+    stdin_input: Option<&[u8]>,
+    stdout_byte_cap: Option<usize>,
+) -> Result<BlockingRunState, SupervisorError> {
+    let pgid = process_group_id(child.id())?;
+
+    // `Option` is the "still live" marker for each stream: taking a handle out
+    // closes that fd, which is exactly how we signal EOF to the child (stdin) or
+    // stop reading (an over-cap stdout).
+    let mut stdin_pipe = child.stdin.take();
+    let mut stdout_pipe = child.stdout.take();
+    let mut stderr_pipe = child.stderr.take();
+    for fd in [
+        stdin_pipe.as_ref().map(as_raw),
+        stdout_pipe.as_ref().map(as_raw),
+        stderr_pipe.as_ref().map(as_raw),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        set_nonblocking(fd).map_err(SupervisorError::Wait)?;
+    }
+
+    let mut stdout_buf = CaptureBuffer::new(CapturePolicy::RejectOverCap {
+        cap: stdout_byte_cap.unwrap_or(0),
+    });
+    let mut stderr_buf = CaptureBuffer::new(CapturePolicy::TailCap {
+        cap: STDERR_CAPTURE_TAIL_CAP,
+    });
+    let mut stdin_remaining = stdin_input.unwrap_or(&[]);
+    // Bytes written so far, plus the failure, when a stdin write did not
+    // complete. Settled after the wait, because a born-dead child surfaces here
+    // first as `EPIPE`.
+    let mut stdin_write_error: Option<(usize, std::io::Error)> = None;
+    let mut stdout_read_error: Option<std::io::Error> = None;
+
+    let deadline = std::time::Instant::now() + timeout;
+    let observation: ChildExitObservation;
+    let mut child_exited = false;
+
     loop {
-        match reader.read(&mut chunk).await {
-            Ok(0) | Err(_) => break,
+        if stdout_buf.overran() {
+            observation = ChildExitObservation::StdoutCapExceeded;
+            break;
+        }
+        // Done only when the child is gone *and* both pipes have hit EOF, so a
+        // child that exits with bytes still in flight does not lose them.
+        if child_exited && stdout_pipe.is_none() && stderr_pipe.is_none() {
+            observation = ChildExitObservation::Exited;
+            break;
+        }
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            // Reaching here means we did *not* finish: the arm above already
+            // broke out with `Exited` if the child was gone and both captures had
+            // hit EOF. So either the child is still alive, or something still
+            // holds a capture pipe open and its output is incomplete.
+            //
+            // Report a timeout in both cases. An earlier version returned
+            // `Exited` when the leader had been seen to exit, reasoning that the
+            // caller should get the command's real status — but that hands back a
+            // *truncated* stdout as a successful result, and `for-each-ref`
+            // output one refname per line is indistinguishable from a complete,
+            // shorter listing. Losing notes silently is far worse than a timeout.
+            observation = ChildExitObservation::TimedOut;
+            break;
+        }
+        let slice = std::cmp::min(CHILD_EXIT_POLL_INTERVAL, deadline - now);
+
+        let mut fds: Vec<libc::pollfd> = Vec::with_capacity(3);
+        // Index bookkeeping: `poll` returns results positionally, so remember
+        // which slot each stream took (or -1 when it is not being polled).
+        let mut stdin_slot = -1i32;
+        let mut stdout_slot = -1i32;
+        let mut stderr_slot = -1i32;
+        if let Some(pipe) = stdin_pipe.as_ref()
+            && !stdin_remaining.is_empty()
+        {
+            stdin_slot = fds.len() as i32;
+            fds.push(pollfd_for(as_raw(pipe), libc::POLLOUT));
+        }
+        if let Some(pipe) = stdout_pipe.as_ref() {
+            stdout_slot = fds.len() as i32;
+            fds.push(pollfd_for(as_raw(pipe), libc::POLLIN));
+        }
+        if let Some(pipe) = stderr_pipe.as_ref() {
+            stderr_slot = fds.len() as i32;
+            fds.push(pollfd_for(as_raw(pipe), libc::POLLIN));
+        }
+
+        if fds.is_empty() {
+            // No live stream to wait on: just pace the exit probe.
+            std::thread::sleep(slice);
+        } else {
+            poll_wait(&mut fds, slice).map_err(SupervisorError::Wait)?;
+        }
+
+        if stdin_slot >= 0
+            && fds[stdin_slot as usize].revents != 0
+            && let Some(pipe) = stdin_pipe.as_mut()
+        {
+            match write_available(pipe, stdin_remaining) {
+                // Hold the error rather than treating a short write as EOF. A
+                // child that closed stdin early (EPIPE) may still exit 0, and
+                // reporting that as success would mean `git hash-object --stdin`
+                // returning the id of a *truncated* body — silent corruption of
+                // the very data the note is meant to attest. Whether this is the
+                // born-dead flake or a real broken pipe is not decidable yet; the
+                // wait below settles it (same reasoning as f36b4c0).
+                Err(source) => {
+                    stdin_write_error = Some((
+                        stdin_input.map_or(0, |b| b.len()) - stdin_remaining.len(),
+                        source,
+                    ));
+                    stdin_remaining = &[];
+                    stdin_pipe = None;
+                }
+                Ok(written) => stdin_remaining = &stdin_remaining[written..],
+            }
+        }
+        if stdin_remaining.is_empty() {
+            // Drop the writer so a child reading to EOF is not left waiting.
+            stdin_pipe = None;
+        }
+
+        if stdout_slot >= 0 && fds[stdout_slot as usize].revents != 0 {
+            // A read failure on *captured stdout* is fatal: the caller parses
+            // these bytes, so a short buffer is a wrong answer, not a degraded
+            // one. (Before this branch, `wait_with_output` surfaced such failures
+            // as `GitWait`; preserve that rather than silently truncating.)
+            if let Some(err) = drain_available(&mut stdout_pipe, &mut stdout_buf) {
+                stdout_read_error = Some(err);
+            }
+        }
+        if stderr_slot >= 0 && fds[stderr_slot as usize].revents != 0 {
+            // Stderr stays best-effort: it is a diagnostic, and losing part of one
+            // must not fail an otherwise-successful command.
+            let _ = drain_available(&mut stderr_pipe, &mut stderr_buf);
+        }
+
+        if !child_exited && child_has_exited_without_reaping(pgid)? {
+            child_exited = true;
+            // Kill the group the moment the leader is gone: any helper it forked
+            // into the group holds a copy of the stdout/stderr write end, and
+            // until those close the pipes never reach EOF.
+            cleanup_guard.tolerate_empty_group();
+            cleanup_guard.kill_now()?;
+        }
+    }
+
+    Ok(BlockingRunState {
+        observation,
+        stdout_buf,
+        stderr_buf,
+        child_exited,
+        retained_captures: (stdout_pipe, stderr_pipe),
+        stdin_write_error,
+        stdout_read_error,
+    })
+}
+
+/// How a supervised child left [`supervise_blocking_child`]'s event loop.
+struct BlockingRunState {
+    observation: ChildExitObservation,
+    stdout_buf: CaptureBuffer,
+    stderr_buf: CaptureBuffer,
+    child_exited: bool,
+    /// The capture read ends, still open, handed back so the *caller* decides when
+    /// they close.
+    ///
+    /// They used to be locals, dropped when this function returned — which closed
+    /// them before the caller's `killpg`. A child still writing then took
+    /// `SIGPIPE` and died in that window, leaving an empty process group, and
+    /// macOS answers `EPERM` for a `killpg` on an empty group: a plain timeout was
+    /// reported as `KillProcessGroup` instead. Reproduced at roughly 1 run in 24
+    /// of `times_out_a_child_that_floods_stderr_forever`. There is no reason to
+    /// SIGPIPE a child we are about to SIGKILL.
+    retained_captures: (
+        Option<std::process::ChildStdout>,
+        Option<std::process::ChildStderr>,
+    ),
+    /// Set when stdin was not fully delivered; settled by the caller, because a
+    /// born-dead child shows up here first and must be retried, not reported.
+    stdin_write_error: Option<(usize, std::io::Error)>,
+    /// Set when reading captured stdout failed, which invalidates the capture.
+    stdout_read_error: Option<std::io::Error>,
+}
+
+fn as_raw<T: std::os::fd::AsRawFd>(handle: &T) -> libc::c_int {
+    handle.as_raw_fd()
+}
+
+fn pollfd_for(fd: libc::c_int, events: libc::c_short) -> libc::pollfd {
+    libc::pollfd {
+        fd,
+        events,
+        revents: 0,
+    }
+}
+
+/// Put `fd` in non-blocking mode so the single-threaded event loop can read and
+/// write without any one stream being able to block the others (or the deadline).
+fn set_nonblocking(fd: libc::c_int) -> std::io::Result<()> {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Wait up to `slice` for any of `fds` to become ready. `EINTR` is reported as
+/// "nothing ready": the caller's loop re-derives its state from scratch each
+/// iteration, so a spurious early return is harmless.
+fn poll_wait(fds: &mut [libc::pollfd], slice: Duration) -> std::io::Result<()> {
+    let millis = libc::c_int::try_from(slice.as_millis()).unwrap_or(libc::c_int::MAX);
+    let ready = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, millis) };
+    if ready == -1 {
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::EINTR) {
+            for fd in fds.iter_mut() {
+                fd.revents = 0;
+            }
+            return Ok(());
+        }
+        return Err(err);
+    }
+    Ok(())
+}
+
+/// Most reads one [`drain_available`] call will perform before yielding back to
+/// the supervisor loop, even if more data is waiting.
+///
+/// This is what makes the blocking supervisor's timeout **unconditional**. Without
+/// it, the drain reads until the pipe runs dry, so a child (or a group of them)
+/// refilling the pipe at least as fast as one reader empties it would keep the
+/// single-threaded loop inside the drain and starve the deadline check. In
+/// practice a lone reader out-paces a lone writer and `EAGAIN` arrives quickly —
+/// but "in practice" is a scheduling accident, not a guarantee, and a bound we
+/// cannot state is a bound we do not have. Capping the reads per call costs one
+/// extra `poll` per 512 KiB of output and makes the deadline hold by construction.
+const MAX_READS_PER_DRAIN: usize = 64;
+
+/// Read what is currently available from `pipe` into `buffer` — at most
+/// [`MAX_READS_PER_DRAIN`] reads — taking the pipe out of `pipe` on EOF, on an
+/// over-cap rejection, or on a read error.
+///
+/// Setting `pipe` to `None` closes the fd, which is what makes an over-cap
+/// rejection prompt: the child's next write takes `SIGPIPE` instead of blocking
+/// on a pipe nobody is draining.
+///
+/// Returning with data still buffered is safe: the caller's `poll` reports the fd
+/// ready again immediately, so the only effect is that the deadline and exit
+/// probes get a turn in between.
+fn drain_available<R: std::io::Read>(
+    pipe: &mut Option<R>,
+    buffer: &mut CaptureBuffer,
+) -> Option<std::io::Error> {
+    let reader = pipe.as_mut()?;
+    let mut chunk = [0u8; 8192];
+    let mut reads = 0;
+    while reads < MAX_READS_PER_DRAIN {
+        reads += 1;
+        match reader.read(&mut chunk) {
+            Ok(0) => {
+                *pipe = None;
+                return None;
+            }
             Ok(n) => {
-                buf.extend_from_slice(&chunk[..n]);
-                if buf.len() > cap {
-                    let excess = buf.len() - cap;
-                    buf.drain(..excess);
-                    truncated = true;
+                if buffer.push(&chunk[..n]) == Absorb::Stop {
+                    *pipe = None;
+                    return None;
                 }
             }
-        }
-    }
-    // On truncation the retained tail begins at an arbitrary byte, so its first
-    // line is a partial fragment of whatever preceded the cap. Drop it so every
-    // retained line is complete. This is what keeps a downstream redactor sound:
-    // a secret (a git token — no embedded newline) that straddled the cap would
-    // otherwise survive as an unredactable partial fragment at the front. The
-    // cost is one already-incomplete line. When the whole tail is one unbroken
-    // line (no newline at all), it is dropped entirely — safe over sorry.
-    if truncated {
-        match buf.iter().position(|&b| b == b'\n') {
-            Some(newline) => {
-                buf.drain(..=newline);
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => return None,
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {
+                // Retry without consuming the budget: no progress was made.
+                reads -= 1;
+                continue;
             }
-            None => buf.clear(),
+            // Report the failure and stop; the caller decides whether losing
+            // bytes on this stream invalidates the run (it does for captured
+            // stdout, which is parsed; it does not for stderr diagnostics).
+            Err(err) => {
+                *pipe = None;
+                return Some(err);
+            }
         }
     }
-    buf
+    None
+}
+
+/// Write as much of `bytes` as the pipe will currently accept, returning the
+/// count consumed. A would-block is zero bytes, not an error.
+fn write_available<W: std::io::Write>(pipe: &mut W, bytes: &[u8]) -> std::io::Result<usize> {
+    match pipe.write(bytes) {
+        Ok(n) => Ok(n),
+        Err(err)
+            if matches!(
+                err.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+            ) =>
+        {
+            Ok(0)
+        }
+        Err(err) => Err(err),
+    }
 }
 
 /// Resolve a program to an executable, canonicalised path the same way the
@@ -442,10 +1122,9 @@ enum ChildExitObservation {
 
 async fn wait_for_child_exit_before_reap(
     pid: libc::pid_t,
-    timeout: Duration,
+    deadline: tokio::time::Instant,
     stdout_capped: &AtomicBool,
 ) -> Result<ChildExitObservation, SupervisorError> {
-    let deadline = tokio::time::Instant::now() + timeout;
     loop {
         // Checked before the exit probe so an overrun that coincides with the
         // child exiting is reported as the (more specific, actionable) cap
@@ -466,6 +1145,19 @@ async fn wait_for_child_exit_before_reap(
 }
 
 fn child_has_exited_without_reaping(pid: libc::pid_t) -> Result<bool, SupervisorError> {
+    pid_has_exited_without_reaping(pid).map_err(SupervisorError::Wait)
+}
+
+/// Has `pid` exited, *without* reaping it?
+///
+/// `waitid(WNOWAIT)` is the load-bearing detail and the reason this is shared
+/// rather than re-derived: leaving the child un-reaped keeps its pid claimed, so
+/// the pid (and therefore the process group id that equals it) cannot be recycled
+/// by the kernel. A caller that reaps first and signals afterwards has a window in
+/// which its `killpg` can hit an unrelated group that inherited the pid. Every
+/// group kill in this codebase is ordered observe-then-kill-then-reap because of
+/// this, and getting that order wrong is silent and rare.
+pub(crate) fn pid_has_exited_without_reaping(pid: libc::pid_t) -> std::io::Result<bool> {
     let mut status = MaybeUninit::<libc::siginfo_t>::zeroed();
     let result = unsafe {
         libc::waitid(
@@ -476,7 +1168,7 @@ fn child_has_exited_without_reaping(pid: libc::pid_t) -> Result<bool, Supervisor
         )
     };
     if result == -1 {
-        return Err(SupervisorError::Wait(std::io::Error::last_os_error()));
+        return Err(std::io::Error::last_os_error());
     }
 
     let status = unsafe { status.assume_init() };
@@ -484,35 +1176,69 @@ fn child_has_exited_without_reaping(pid: libc::pid_t) -> Result<bool, Supervisor
     Ok(observed_pid != 0)
 }
 
+/// Poll [`pid_has_exited_without_reaping`] until the leader is observed exited.
+///
+/// Unbounded by design: the caller wants the pid held un-reaped until exit is
+/// observed so its subsequent group kill is race-free. Callers that need a
+/// deadline use [`run_supervised`] / [`run_supervised_blocking`] instead.
+pub(crate) async fn wait_for_pid_exit_no_reap(pid: libc::pid_t) -> std::io::Result<bool> {
+    loop {
+        if pid_has_exited_without_reaping(pid)? {
+            return Ok(true);
+        }
+        tokio::time::sleep(CHILD_EXIT_POLL_INTERVAL).await;
+    }
+}
+
 fn process_group_id(pid: u32) -> Result<libc::pid_t, SupervisorError> {
     pid.try_into()
         .map_err(|_| SupervisorError::InvalidProcessId(pid))
 }
 
-struct ProcessGroupCleanupGuard {
+/// Guarantees a process group is SIGKILLed on *every* exit path — including a
+/// panic or a cancelled future — until explicitly disarmed.
+///
+/// Declaration order matters when this sits alongside the `Child` it guards:
+/// locals drop in reverse declaration order, so the guard must be declared
+/// **after** the child. That way an unwind drops the guard first, and its
+/// `killpg` runs while the leader pid is still un-reaped (so the pgid is still
+/// ours). Declared before the child, the child would drop first, free the
+/// leader's pid, and the guard's `killpg` could land on a recycled group.
+pub(crate) struct ProcessGroupCleanupGuard {
     pgid: libc::pid_t,
-    child_exit_observed: bool,
+    empty_group_is_benign: bool,
     armed: bool,
 }
 
 impl ProcessGroupCleanupGuard {
-    fn new(pgid: libc::pid_t) -> Self {
+    pub(crate) fn new(pgid: libc::pid_t) -> Self {
         Self {
             pgid,
-            child_exit_observed: false,
+            empty_group_is_benign: false,
             armed: true,
         }
     }
 
-    fn mark_child_exit_observed(&mut self) {
-        self.child_exit_observed = true;
+    /// Accept an already-empty group as success for this guard's kill.
+    ///
+    /// Sound wherever the caller still holds the leader unreaped — see
+    /// [`kill_process_group`] for the argument, which does not require having
+    /// observed the exit.
+    pub(crate) fn tolerate_empty_group(&mut self) {
+        self.empty_group_is_benign = true;
     }
 
-    fn kill_now(&self) -> Result<(), SupervisorError> {
-        kill_process_group_inner(self.pgid, self.child_exit_observed)
+    pub(crate) fn kill_now(&self) -> Result<(), SupervisorError> {
+        kill_process_group_inner(self.pgid, self.empty_group_is_benign)
     }
 
-    fn disarm(&mut self) {
+    /// Kill the group, reporting failure as an `io::Error` for callers outside
+    /// the [`SupervisorError`] world.
+    pub(crate) fn kill_now_io(&self) -> std::io::Result<()> {
+        kill_process_group(self.pgid, self.empty_group_is_benign)
+    }
+
+    pub(crate) fn disarm(&mut self) {
         self.armed = false;
     }
 }
@@ -520,7 +1246,7 @@ impl ProcessGroupCleanupGuard {
 impl Drop for ProcessGroupCleanupGuard {
     fn drop(&mut self) {
         if self.armed {
-            let _ = kill_process_group_inner(self.pgid, self.child_exit_observed);
+            let _ = kill_process_group_inner(self.pgid, self.empty_group_is_benign);
         }
     }
 }
@@ -541,24 +1267,54 @@ fn current_supplementary_groups() -> Vec<libc::gid_t> {
 
 fn kill_process_group_inner(
     pgid: libc::pid_t,
-    child_exit_observed: bool,
+    empty_group_is_benign: bool,
 ) -> Result<(), SupervisorError> {
+    kill_process_group(pgid, empty_group_is_benign)
+        .map_err(|source| SupervisorError::KillProcessGroup { pgid, source })
+}
+
+/// SIGKILL a process group this process created, tolerating exactly the two
+/// benign outcomes and no others.
+///
+/// The single definition of the group kill. Both benign cases are easy to get
+/// wrong in opposite directions — swallow too much and a real permission failure
+/// becomes invisible; swallow too little and normal shutdown reports a spurious
+/// error:
+///
+/// * `ESRCH` — the group is already gone. Always fine.
+/// * `EPERM` — macOS reports this, rather than `ESRCH`, for a group with no
+///   signalable member left. Tolerated when `empty_group_is_benign`.
+///
+/// The condition that makes `EPERM` safe to accept is that the caller still holds
+/// the group's **leader unreaped**. The leader's pid is then still claimed, so the
+/// pgid — which equals it — cannot have been recycled onto a group we do not own;
+/// and since we created this group with `process_group(0)`, the only way we can
+/// fail to signal our own group is that every member has already exited. Every
+/// group kill in this codebase is ordered observe-then-kill-then-reap, so the
+/// condition holds at each of them.
+///
+/// This was previously gated on having *observed* the leader exit, which is a
+/// strictly narrower condition than the argument requires, and it left the timeout
+/// arms exposed: a child that exits between the deadline and the kill — or that
+/// takes `SIGPIPE` when a capture pipe closes — empties the group, and a plain
+/// timeout surfaced as `KillProcessGroup`. Reproduced at roughly 1 run in 24
+/// before the fix. Two earlier rounds of review each fixed one arm of this;
+/// naming the real precondition is what stops it recurring in a third.
+pub(crate) fn kill_process_group(
+    pgid: libc::pid_t,
+    empty_group_is_benign: bool,
+) -> std::io::Result<()> {
     // The child was spawned with process_group(0), making its pid the process
     // group id inherited by any ordinary helpers it starts.
-    let killed = unsafe { libc::killpg(pgid, libc::SIGKILL) };
-    if killed == 0 {
+    if unsafe { libc::killpg(pgid, libc::SIGKILL) } == 0 {
         return Ok(());
     }
     let source = std::io::Error::last_os_error();
-    if source.raw_os_error() == Some(libc::ESRCH) {
-        return Ok(());
+    match source.raw_os_error() {
+        Some(libc::ESRCH) => Ok(()),
+        Some(libc::EPERM) if empty_group_is_benign => Ok(()),
+        _ => Err(source),
     }
-    // On macOS, killpg can report EPERM after waitid(WNOWAIT) observes that
-    // the leader has exited and there are no signalable live members left.
-    if child_exit_observed && source.raw_os_error() == Some(libc::EPERM) {
-        return Ok(());
-    }
-    Err(SupervisorError::KillProcessGroup { pgid, source })
 }
 
 #[cfg(test)]
@@ -567,7 +1323,7 @@ mod tests {
 
     /// Locate an executable on `PATH`, preserving the caller-visible path so
     /// the basename survives `execve` (mirrors the clean_git test helper).
-    fn locate_on_path(name: &str) -> PathBuf {
+    pub(super) fn locate_on_path(name: &str) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
         let path = std::env::var_os("PATH").expect("PATH must be set in tests");
         for dir in std::env::split_paths(&path) {
@@ -580,34 +1336,6 @@ mod tests {
             }
         }
         panic!("required test tool {name} not found on PATH");
-    }
-
-    #[tokio::test]
-    async fn drain_to_tail_cap_keeps_all_when_under_cap() {
-        // No truncation: content passes through verbatim, even without a
-        // trailing newline and even with no newline at all.
-        let data = b"short output".to_vec();
-        let out = drain_to_tail_cap(&data[..], 4096).await;
-        assert_eq!(out, data);
-    }
-
-    #[tokio::test]
-    async fn drain_to_tail_cap_drops_partial_leading_line_on_truncation() {
-        // The last `cap` bytes of "aaaa\nbbbb\ncccc\n" are "bb\ncccc\n"; the
-        // leading "bb" is a fragment of a truncated line and must be dropped so
-        // only complete lines remain (the property a redactor relies on).
-        let data = b"aaaa\nbbbb\ncccc\n".to_vec();
-        let out = drain_to_tail_cap(&data[..], 8).await;
-        assert_eq!(out, b"cccc\n");
-    }
-
-    #[tokio::test]
-    async fn drain_to_tail_cap_clears_when_truncated_tail_has_no_newline() {
-        // A single unbroken over-cap line has no complete line to keep, so the
-        // whole (necessarily partial) tail is dropped rather than surfaced.
-        let data = b"aaaaaaaaaa".to_vec();
-        let out = drain_to_tail_cap(&data[..], 4).await;
-        assert!(out.is_empty(), "expected empty, got {out:?}");
     }
 
     #[tokio::test]
@@ -627,6 +1355,7 @@ mod tests {
                 status,
                 stdout,
                 stderr,
+                ..
             } => {
                 assert_eq!(status.code(), Some(3));
                 assert_eq!(stdout, b"out");
@@ -757,11 +1486,752 @@ mod tests {
         }
     }
 
+    /// A reader that yields some bytes and then fails.
+    ///
+    /// A genuine mid-stream pipe read failure cannot be provoked on demand, so
+    /// the drain is exercised against its `AsyncRead` contract directly. That is
+    /// where the defect lived: the read result was matched as `Ok(0) | Err(_)`,
+    /// making a failure indistinguishable from the child closing the stream.
+    struct FailsAfterFirstChunk {
+        first: Vec<u8>,
+        sent: bool,
+    }
+
+    impl tokio::io::AsyncRead for FailsAfterFirstChunk {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            if self.sent {
+                return std::task::Poll::Ready(Err(std::io::Error::other(
+                    "simulated mid-stream pipe read failure",
+                )));
+            }
+            self.sent = true;
+            let first = std::mem::take(&mut self.first);
+            buf.put_slice(&first);
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// A failed stdout read must be reported, never folded into EOF.
+    ///
+    /// The bytes read so far are a prefix of the child's answer. Returning them
+    /// as though the stream had ended is the failure mode that matters: a
+    /// truncated `rev-list` is a *shorter valid-looking object list*, so a caller
+    /// parsing it acts on a subset and never learns it was short.
+    #[tokio::test]
+    async fn a_capture_read_error_is_reported_not_folded_into_eof() {
+        let reader = FailsAfterFirstChunk {
+            first: b"refs/notes/one\n".to_vec(),
+            sent: false,
+        };
+        let output = drain_under_policy(
+            reader,
+            CapturePolicy::RejectOverCap { cap: 64 * 1024 },
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await;
+        assert!(
+            output.read_error.is_some(),
+            "a mid-stream read failure must be reported; got a clean capture of \
+             {:?}, which is indistinguishable from the child closing the stream",
+            String::from_utf8_lossy(&output.bytes)
+        );
+    }
+
+    /// A capture drain that dies must not present as an empty capture.
+    ///
+    /// `handle.await.unwrap_or_default()` turned a panicked or cancelled drain
+    /// into `Vec::new()` — i.e. "the child printed nothing", a perfectly ordinary
+    /// result that a caller has no way to distinguish from the truth.
+    #[tokio::test]
+    async fn a_dead_capture_drain_is_not_an_empty_success() {
+        let handle = tokio::spawn(async {
+            panic!("drain task failure");
+        });
+        match join_capture(
+            Some(handle),
+            tokio::time::Instant::now() + Duration::from_secs(5),
+        )
+        .await
+        {
+            CaptureJoin::Finished(DrainOutput { read_error, .. }) => assert!(
+                read_error.is_some(),
+                "a drain that never finished must not be reported as a complete, \
+                 empty capture"
+            ),
+            CaptureJoin::NotCaptured => panic!("a handle was supplied"),
+            CaptureJoin::DeadlineExpired => panic!("the deadline was five seconds away"),
+        }
+    }
+
+    /// A descendant that escapes the process group must not be able to hold the
+    /// supervisor past its deadline.
+    ///
+    /// The group SIGKILL is what normally closes every copy of the stdout write
+    /// end and lets the drain reach EOF. A descendant that calls `setsid` is no
+    /// longer in the group, so the kill misses it and the pipe stays open — and
+    /// with the leader already reaped there is nothing left to wait *on*, only a
+    /// stream that will never end. Verified out-of-band before this test was
+    /// written: with such a helper alive, `killpg` reports `EPERM` (the group is
+    /// already empty) and the read end never sees EOF.
+    ///
+    /// This is the one failure mode a timeout exists to prevent, so the assertion
+    /// is on the wall clock as much as on the outcome. That the abandoned drain is
+    /// also *cancelled* rather than left running is the subject of
+    /// [`an_abandoned_capture_drain_is_cancelled_not_detached`].
+    #[tokio::test]
+    async fn an_escaped_descendant_cannot_hold_the_supervisor_past_the_deadline() {
+        // `setsid(2)` has no shell builtin and macOS ships no `setsid(1)`, so the
+        // escape is done in perl. Skip rather than pass vacuously where it is
+        // absent (the `maybe_git` precedent).
+        let Some(perl) = ["/usr/bin/perl", "/bin/perl"]
+            .into_iter()
+            .map(PathBuf::from)
+            .find(|candidate| candidate.is_file())
+        else {
+            eprintln!("skipping: no perl to call setsid(2) with");
+            return;
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let timeout = Duration::from_secs(1);
+        {
+            let escaped = dir.path().join("escaped");
+            // The helper must confirm the escape *before* the leader exits:
+            // otherwise the supervisor's killpg races it and kills it while still
+            // in the group, which would make this test pass for the wrong reason.
+            // It outlives the deadline severalfold but not by so much that a
+            // failing run leaves long-lived strays behind.
+            let script = format!(
+                "{perl} -e 'use POSIX; POSIX::setsid() or exit 3; \
+                 open(F, \">\", \"{escaped}\") or exit 4; print F \"escaped\\n\"; close F; \
+                 sleep 8' & \
+                 i=0; while [ ! -f {escaped} ] && [ $i -lt 200 ]; do sleep 0.05; i=$((i+1)); done; \
+                 exit 0",
+                perl = perl.display(),
+                escaped = escaped.display(),
+            );
+            let mut command = Command::new(locate_on_path("sh"));
+            command.arg("-c").arg(script);
+
+            let started = std::time::Instant::now();
+            let outcome = run_supervised(
+                &mut command,
+                timeout,
+                StdoutMode::Capture {
+                    byte_cap: 64 * 1024,
+                },
+                StderrMode::Capture,
+            )
+            .await
+            .expect("supervised sh run");
+            let elapsed = started.elapsed();
+
+            if !escaped.exists() {
+                eprintln!("skipping: the helper never confirmed its setsid escape");
+                return;
+            }
+            assert!(
+                elapsed < Duration::from_secs(30),
+                "the call must return on the supervisor's schedule, not the escaped \
+                 helper's: took {elapsed:?} against a {timeout:?} timeout"
+            );
+            // The leader exits cleanly, so the exit poll observes `Exited`; the
+            // capture then cannot reach EOF, and an incomplete capture must be
+            // reported as the deadline rather than as a short but complete stdout.
+            match outcome {
+                SupervisedOutcome::TimedOut => {}
+                other => panic!(
+                    "expected TimedOut once the capture could not complete, got {}",
+                    outcome_name(&other)
+                ),
+            }
+        }
+    }
+
+    /// A drain abandoned at the deadline must be **cancelled**, not merely dropped.
+    ///
+    /// `tokio::time::timeout_at` consumes the `JoinHandle` it is given, and dropping
+    /// a `JoinHandle` *detaches* the task — it keeps running, holding the pipe
+    /// descriptor it was reading. Against a child whose capture can never reach EOF
+    /// that is one task and one descriptor retained per supervised run, unbounded
+    /// over the daemon's lifetime.
+    ///
+    /// The property is observed from inside the task: a guard whose `Drop` fires
+    /// only when the task's future is dropped, which cancellation does and
+    /// detaching does not. Measuring the process's open descriptors instead was the
+    /// first attempt and is unsound here — the test binary is one process with many
+    /// threads, so `/dev/fd` is shared with every concurrently running test.
+    #[tokio::test]
+    async fn an_abandoned_capture_drain_is_cancelled_not_detached() {
+        struct CancelFlag(Arc<AtomicBool>);
+        impl Drop for CancelFlag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&cancelled);
+        let handle: tokio::task::JoinHandle<DrainOutput> = tokio::spawn(async move {
+            let _guard = CancelFlag(flag);
+            // Stands in for a drain whose pipe never reaches EOF.
+            loop {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+
+        // A deadline already in the past, so the abandon path is taken at once.
+        let joined = join_capture(Some(handle), tokio::time::Instant::now()).await;
+        assert!(
+            matches!(joined, CaptureJoin::DeadlineExpired),
+            "an already-expired deadline must abandon the drain"
+        );
+
+        for _ in 0..200 {
+            if cancelled.load(Ordering::Acquire) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!(
+            "the abandoned drain was still running two seconds later: it was \
+             detached rather than aborted, so it keeps its pipe descriptor"
+        );
+    }
+
     fn outcome_name(outcome: &SupervisedOutcome) -> &'static str {
         match outcome {
             SupervisedOutcome::Exited { .. } => "Exited",
             SupervisedOutcome::TimedOut => "TimedOut",
             SupervisedOutcome::StdoutCapExceeded { .. } => "StdoutCapExceeded",
+        }
+    }
+}
+
+/// Parity tests for [`run_supervised_blocking`].
+///
+/// The blocking and async supervisors are two implementations of one contract,
+/// which is precisely the arrangement that drifts. These deliberately mirror the
+/// async tests above case for case, so a behavioural change to one that is not
+/// made to the other shows up as a failing test rather than as two subtly
+/// different disciplines that each look complete where they are defined.
+#[cfg(test)]
+mod blocking_tests {
+    use super::tests::locate_on_path;
+    use super::*;
+
+    fn sh(script: &str) -> std::process::Command {
+        let mut command = std::process::Command::new(locate_on_path("sh"));
+        command.arg("-c").arg(script);
+        command
+    }
+
+    fn outcome_name(outcome: &SupervisedOutcome) -> &'static str {
+        match outcome {
+            SupervisedOutcome::Exited { .. } => "Exited",
+            SupervisedOutcome::TimedOut => "TimedOut",
+            SupervisedOutcome::StdoutCapExceeded { .. } => "StdoutCapExceeded",
+        }
+    }
+
+    /// Mirrors `captures_stdout_and_stderr_on_nonzero_exit`.
+    #[test]
+    fn captures_stdout_and_stderr_on_nonzero_exit() {
+        let outcome = run_supervised_blocking(
+            &mut sh("printf out; printf err 1>&2; exit 3"),
+            Duration::from_secs(10),
+            None,
+            StdoutMode::Capture { byte_cap: 4096 },
+            StderrMode::Capture,
+        )
+        .expect("supervised sh run");
+        match outcome {
+            SupervisedOutcome::Exited {
+                status,
+                stdout,
+                stderr,
+                ..
+            } => {
+                assert_eq!(status.code(), Some(3));
+                assert_eq!(stdout, b"out");
+                assert_eq!(stderr, b"err");
+            }
+            other => panic!("expected Exited, got {}", outcome_name(&other)),
+        }
+    }
+
+    /// Mirrors `discarded_stderr_is_empty`, and additionally pins that a
+    /// `Discard` stdout can never be reported as an overrun: the cap is not
+    /// evaluated when there is no pipe to read.
+    #[test]
+    fn discarded_streams_are_empty_and_never_overrun() {
+        let outcome = run_supervised_blocking(
+            &mut sh("printf lots-of-output; printf noise 1>&2; exit 0"),
+            Duration::from_secs(10),
+            None,
+            StdoutMode::Discard,
+            StderrMode::Discard,
+        )
+        .expect("supervised sh run");
+        match outcome {
+            SupervisedOutcome::Exited {
+                status,
+                stdout,
+                stderr,
+                ..
+            } => {
+                assert!(status.success());
+                assert!(stdout.is_empty());
+                assert!(stderr.is_empty());
+            }
+            other => panic!("expected Exited, got {}", outcome_name(&other)),
+        }
+    }
+
+    /// Mirrors `stdout_capture_returns_full_output_at_the_cap_boundary`: exactly
+    /// `cap` bytes is not an overrun.
+    #[test]
+    fn stdout_capture_returns_full_output_at_the_cap_boundary() {
+        let outcome = run_supervised_blocking(
+            &mut sh("printf aaaa"),
+            Duration::from_secs(10),
+            None,
+            StdoutMode::Capture { byte_cap: 4 },
+            StderrMode::Discard,
+        )
+        .expect("supervised sh run");
+        match outcome {
+            SupervisedOutcome::Exited { stdout, .. } => assert_eq!(stdout, b"aaaa"),
+            other => panic!("expected Exited, got {}", outcome_name(&other)),
+        }
+    }
+
+    /// Mirrors `stdout_capture_rejects_and_kills_when_child_overruns_the_cap`.
+    /// The generous timeout against a child that never stops writing proves the
+    /// cap ends the run, not the clock.
+    #[test]
+    fn stdout_capture_rejects_when_child_overruns_the_cap() {
+        let outcome = run_supervised_blocking(
+            &mut sh("while :; do printf 'writ-overrun-padding\\n'; done"),
+            Duration::from_secs(30),
+            None,
+            StdoutMode::Capture {
+                byte_cap: 64 * 1024,
+            },
+            StderrMode::Discard,
+        )
+        .expect("supervised sh run");
+        match outcome {
+            SupervisedOutcome::StdoutCapExceeded { cap } => assert_eq!(cap, 64 * 1024),
+            other => panic!("expected StdoutCapExceeded, got {}", outcome_name(&other)),
+        }
+    }
+
+    /// Mirrors `captured_stderr_is_tail_capped_against_a_verbose_child`.
+    #[test]
+    fn captured_stderr_is_tail_capped_against_a_verbose_child() {
+        let outcome = run_supervised_blocking(
+            &mut sh(&format!(
+                "i=0; while [ $i -lt {n} ]; do printf 'noise-line-padding\\n' 1>&2; i=$((i+1)); done; printf 'fatal: the-tail\\n' 1>&2; exit 1",
+                n = (STDERR_CAPTURE_TAIL_CAP / 19) + 500,
+            )),
+            Duration::from_secs(30),
+            None,
+            StdoutMode::Discard,
+            StderrMode::Capture,
+        )
+        .expect("supervised sh run");
+        match outcome {
+            SupervisedOutcome::Exited { stderr, .. } => {
+                assert!(
+                    stderr.len() <= STDERR_CAPTURE_TAIL_CAP,
+                    "stderr {} exceeded cap {STDERR_CAPTURE_TAIL_CAP}",
+                    stderr.len()
+                );
+                assert!(
+                    stderr.ends_with(b"fatal: the-tail\n"),
+                    "the informative tail must be retained"
+                );
+                assert!(
+                    stderr.starts_with(b"noise-line-padding\n"),
+                    "the retained tail must begin on a line boundary"
+                );
+            }
+            other => panic!("expected Exited, got {}", outcome_name(&other)),
+        }
+    }
+
+    /// A child that never exits is killed at the deadline rather than waited on.
+    /// The assertion on elapsed time is the point: a regression to an unbounded
+    /// wait would hang the suite rather than fail it, so the bound is checked
+    /// explicitly.
+    #[test]
+    fn times_out_a_child_that_never_exits() {
+        let started = std::time::Instant::now();
+        let outcome = run_supervised_blocking(
+            &mut sh("while :; do :; done"),
+            Duration::from_millis(300),
+            None,
+            StdoutMode::Capture { byte_cap: 4096 },
+            StderrMode::Capture,
+        )
+        .expect("supervised sh run");
+        assert!(
+            matches!(outcome, SupervisedOutcome::TimedOut),
+            "expected TimedOut, got {}",
+            outcome_name(&outcome)
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the run must end at the deadline, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// stdin is delivered to the child.
+    #[test]
+    fn writes_stdin_to_the_child() {
+        let outcome = run_supervised_blocking(
+            &mut sh("cat"),
+            Duration::from_secs(10),
+            Some(b"note body bytes"),
+            StdoutMode::Capture { byte_cap: 4096 },
+            StderrMode::Capture,
+        )
+        .expect("supervised sh run");
+        match outcome {
+            SupervisedOutcome::Exited { stdout, .. } => assert_eq!(stdout, b"note body bytes"),
+            other => panic!("expected Exited, got {}", outcome_name(&other)),
+        }
+    }
+
+    /// The deadlock this supervisor's single event loop exists to prevent: a
+    /// child that echoes far more than one pipe buffer's worth while we are still
+    /// writing far more than one pipe buffer's worth to its stdin.
+    ///
+    /// Writing stdin to completion before draining stdout — the obvious
+    /// implementation, and what a blocking caller reaches for — wedges here: the
+    /// child blocks writing into a stdout pipe nobody is reading, and we block
+    /// writing into a stdin pipe the child has stopped reading. Neither side can
+    /// proceed. A generous timeout means a regression fails with `TimedOut`
+    /// rather than hanging the suite.
+    #[test]
+    fn interleaves_stdin_and_stdout_instead_of_deadlocking() {
+        // 1 MiB each way, far past any platform pipe buffer (64 KiB on Linux,
+        // 16 KiB typical on macOS).
+        let payload = vec![b'z'; 1024 * 1024];
+        let outcome = run_supervised_blocking(
+            &mut sh("cat"),
+            Duration::from_secs(30),
+            Some(&payload),
+            StdoutMode::Capture {
+                byte_cap: 4 * 1024 * 1024,
+            },
+            StderrMode::Capture,
+        )
+        .expect("supervised sh run");
+        match outcome {
+            SupervisedOutcome::Exited { status, stdout, .. } => {
+                assert!(status.success());
+                assert_eq!(
+                    stdout.len(),
+                    payload.len(),
+                    "the whole payload must round-trip"
+                );
+                assert_eq!(stdout, payload);
+            }
+            other => panic!(
+                "expected Exited; a {} here means stdin and stdout were not \
+                 interleaved",
+                outcome_name(&other)
+            ),
+        }
+    }
+
+    /// The born-dead predicate is a proof, not a heuristic: it fires only when
+    /// the proof-of-life probe found no process at all AND the child died by
+    /// SIGKILL.
+    ///
+    /// The negative cases are the important ones: a child the probe found alive,
+    /// and a clean exit, must both fail to match however they died. An earlier
+    /// formulation keyed on empty stdout/stderr instead, which is vacuous for a
+    /// caller that discards stdout.
+    ///
+    /// From #354 (`f36b4c0`); the predicate moved here when the supervisor took
+    /// ownership of the spawn. What it does *not* establish is the subject of
+    /// [`getpgid_does_not_portably_prove_a_child_never_ran`].
+    #[test]
+    fn the_born_dead_signature_needs_both_an_absent_pid_and_a_sigkill() {
+        use std::os::unix::process::ExitStatusExt;
+        let sigkilled = ExitStatus::from_raw(9);
+        let clean_exit = ExitStatus::from_raw(0);
+
+        assert!(
+            matches_born_dead_signature(true, &sigkilled),
+            "absent pid plus SIGKILL is the signature"
+        );
+        assert!(
+            !matches_born_dead_signature(false, &sigkilled),
+            "a child the probe found ALIVE had certainly started, so it does not \
+             match even though it died by the same signal"
+        );
+        assert!(
+            !matches_born_dead_signature(true, &clean_exit),
+            "a child that chose its own exit status is not this flake, whatever \
+             the probe saw"
+        );
+        assert!(
+            !matches_born_dead_signature(false, &clean_exit),
+            "an ordinary successful child never matches"
+        );
+    }
+
+    /// Killing a group whose every member has exited succeeds when the caller says
+    /// an empty group is benign, and only then.
+    ///
+    /// The soak that found the bug this guards (1 failure in 24 runs of
+    /// `times_out_a_child_that_floods_stderr_forever`) is evidence about a race;
+    /// this is the deterministic statement of the semantics underneath it. Written
+    /// to be platform-agnostic on purpose: macOS answers `EPERM` for an empty
+    /// group, Linux still counts an unreaped zombie as a member and succeeds
+    /// outright, and the property to pin is not which of those happens but that
+    /// tolerating it is what turns it into success.
+    #[test]
+    fn an_empty_process_group_is_tolerated_only_when_the_caller_says_so() {
+        use std::os::unix::process::CommandExt as _;
+        let mut child = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("exit 0")
+            // Its own group, exactly as the supervisor spawns children.
+            .process_group(0)
+            .spawn()
+            .expect("spawn");
+        let pid = child.id();
+        let pgid = pid as libc::pid_t;
+
+        // Leave it unreaped, which is the precondition that makes the tolerance
+        // sound: the pid stays claimed, so this pgid cannot be another group's.
+        loop {
+            if pid_has_exited_without_reaping(pgid).expect("waitid") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+
+        let strict = kill_process_group(pgid, false);
+        let tolerant = kill_process_group(pgid, true);
+        child.wait().expect("reap");
+
+        assert!(
+            tolerant.is_ok(),
+            "an empty group must be success when tolerated, got {tolerant:?}"
+        );
+        if let Err(error) = strict {
+            assert_eq!(
+                error.raw_os_error(),
+                Some(libc::EPERM),
+                "the only error an empty group may produce here is EPERM; anything \
+                 else means this test is measuring something other than emptiness"
+            );
+        }
+    }
+
+    /// `getpgid` answering `ESRCH` does **not** mean the child never ran.
+    ///
+    /// This is the load-bearing platform fact behind
+    /// [`matches_born_dead_signature`] being documented as a heuristic. `f36b4c0`
+    /// reasoned from the zombie rule — an exited-but-unreaped child still holds a
+    /// process-table entry, so `getpgid` would find it and `ESRCH` could only mean
+    /// the pid never became a live process. That holds on Linux. XNU's pid lookup
+    /// excludes zombies, so here a child that ran, left a side effect, and exited
+    /// answers `ESRCH` too.
+    ///
+    /// The test drives exactly that: a child that *proves* it ran by creating a
+    /// file, then dies by `SIGKILL`. If both halves of the signature can be true
+    /// after an observable effect, the signature cannot authorise replaying a
+    /// command that must not be applied twice — which is why the retry decision
+    /// lives with the caller, per invocation.
+    ///
+    /// Asserted on macOS only, because macOS is where it was measured. The zombie
+    /// rule is expected to hold on Linux, making the probe answer `false` there
+    /// and these assertions fail — but "expected" is not "verified", and the point
+    /// of this test is to record a measurement rather than to encode a belief
+    /// about a platform this developer cannot run. Either way the conclusion is
+    /// unchanged: a proof that holds on only some of the platforms the daemon runs
+    /// on is not a proof the shared supervisor can offer its callers.
+    #[test]
+    fn getpgid_does_not_portably_prove_a_child_never_ran() {
+        if !cfg!(target_os = "macos") {
+            eprintln!("skipping: documents an XNU-specific behaviour, measured there only");
+            return;
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let marker = dir.path().join("the-child-ran");
+        // Touch the marker, then die by SIGKILL — the child's own doing, so no
+        // supervisor involvement is needed to reach the signature.
+        let mut child = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(format!(": > {} && kill -9 $$", marker.display()))
+            .spawn()
+            .expect("spawn the marker child");
+        let pid = child.id();
+
+        // Wait for it *without reaping*, exactly as the supervisor does, so the
+        // probe below sees the same state the real code would.
+        loop {
+            if pid_has_exited_without_reaping(pid as libc::pid_t).expect("waitid") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+
+        let probed_absent = pid_absent_when_probed(pid);
+        let status = child.wait().expect("reap");
+
+        assert!(
+            marker.exists(),
+            "precondition: the child must have run far enough to leave its marker"
+        );
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(
+            status.signal(),
+            Some(libc::SIGKILL),
+            "precondition: the child must have died by SIGKILL"
+        );
+        assert!(
+            probed_absent,
+            "documents this platform: getpgid reported the pid PRESENT for an \
+             unreaped zombie. If this ever fails, the zombie rule holds here and \
+             the born-dead signature could be strengthened back into a proof — \
+             but check every platform the daemon runs on before doing so."
+        );
+        assert!(
+            matches_born_dead_signature(probed_absent, &status),
+            "the full signature matches a child that demonstrably ran: this is \
+             why it is evidence and not a licence to replay"
+        );
+    }
+
+    /// A child that floods stderr *forever* must still hit the deadline.
+    ///
+    /// This is where the blocking supervisor could diverge from its async twin in
+    /// a way that matters. The async version drains on separate tasks, so its
+    /// timeout fires regardless of how much the child emits. This version is
+    /// single-threaded, so a drain that read until the pipe ran dry would never
+    /// return to the deadline check against a writer that refills as fast as one
+    /// reader empties — and stderr is the bad case, because a tail cap truncates
+    /// instead of stopping the drain, so no overrun breaks the loop.
+    /// [`MAX_READS_PER_DRAIN`] is what forecloses that.
+    ///
+    /// Honest limitation: this test passed even before that bound existed, because
+    /// one reader out-paces one writer and `EAGAIN` arrives quickly. It guards the
+    /// deadline against a fast flood; it does not by itself demonstrate the bound
+    /// is load-bearing. The bound is there so the guarantee does not rest on
+    /// scheduling, which no single test can establish.
+    #[test]
+    fn times_out_a_child_that_floods_stderr_forever() {
+        let started = std::time::Instant::now();
+        let outcome = run_supervised_blocking(
+            &mut sh("while :; do printf 'endless-diagnostic-noise\n' 1>&2; done"),
+            Duration::from_millis(500),
+            None,
+            StdoutMode::Discard,
+            StderrMode::Capture,
+        )
+        .expect("supervised sh run");
+        assert!(
+            matches!(outcome, SupervisedOutcome::TimedOut),
+            "expected TimedOut, got {}",
+            outcome_name(&outcome)
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "a drain that reads until the pipe runs dry starves the deadline              check; took {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// A child that exits without reading its stdin must not be reported as a
+    /// success when we only delivered a prefix.
+    ///
+    /// This is the sharpest edge in the whole module. `notes_repo` pipes note
+    /// bodies and seed blobs into `git hash-object --stdin`, which exits 0 and
+    /// prints the id of *whatever it read*. Treating the resulting `EPIPE` as a
+    /// benign early EOF — which an earlier version of this loop did, with a
+    /// comment saying the exit status was the verdict — means persisting an object
+    /// id that attests to truncated content. Silent corruption of the audit trail,
+    /// from a write error we already held in our hand.
+    #[test]
+    fn a_partially_delivered_stdin_is_never_reported_as_success() {
+        // Far more than any pipe buffer, against a child that reads none of it.
+        let payload = vec![b'z'; 4 * 1024 * 1024];
+        let outcome = run_supervised_blocking(
+            &mut sh("exit 0"),
+            Duration::from_secs(30),
+            Some(&payload),
+            StdoutMode::Capture { byte_cap: 4096 },
+            StderrMode::Capture,
+        );
+        match outcome {
+            Err(SupervisorError::StdinWrite { written, total, .. }) => {
+                assert_eq!(total, payload.len());
+                assert!(
+                    written < total,
+                    "the failure only makes sense for a short write; wrote {written} of {total}"
+                );
+            }
+            Err(other) => panic!("expected StdinWrite, got {other:?}"),
+            Ok(SupervisedOutcome::Exited { status, .. }) => panic!(
+                "a child that read none of a {} byte payload and exited {:?} must \
+                 not be reported as success",
+                payload.len(),
+                status.code()
+            ),
+            Ok(other) => panic!("expected StdinWrite, got {}", outcome_name(&other)),
+        }
+    }
+
+    /// A helper the child forks into its own process group must not outlive the
+    /// run: it holds a copy of the stdout write end, so without the group kill
+    /// the drain never reaches EOF.
+    #[test]
+    fn kills_a_helper_left_in_the_process_group() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let marker = tmp.path().join("helper.pid");
+        let sleep = locate_on_path("sleep");
+        let outcome = run_supervised_blocking(
+            &mut sh(&format!(
+                "{sleep} 600 & printf '%s' \"$!\" > {marker}; exit 0",
+                sleep = sleep.display(),
+                marker = marker.display()
+            )),
+            Duration::from_secs(30),
+            None,
+            StdoutMode::Capture { byte_cap: 4096 },
+            StderrMode::Capture,
+        )
+        .expect("supervised sh run");
+        assert!(
+            matches!(outcome, SupervisedOutcome::Exited { .. }),
+            "expected Exited, got {}",
+            outcome_name(&outcome)
+        );
+        let pid: libc::pid_t = std::fs::read_to_string(&marker)
+            .expect("helper pid marker")
+            .trim()
+            .parse()
+            .expect("helper pid is numeric");
+        // The kill is synchronous with the return; reaping is the kernel's, so
+        // poll briefly for the helper to disappear.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while unsafe { libc::kill(pid, 0) } == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "helper pid {pid} survived; the process group was not killed"
+            );
+            std::thread::sleep(Duration::from_millis(25));
         }
     }
 }

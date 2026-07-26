@@ -20,18 +20,10 @@ use crate::process_supervisor::{self, StderrMode, StdoutMode, SupervisedOutcome,
 
 /// Environment variables prepended to every clean-Git invocation.
 ///
-/// - `GIT_CONFIG_NOSYSTEM=1` disables `/etc/gitconfig`.
-/// - `GIT_CONFIG_GLOBAL=/dev/null` disables `~/.gitconfig` and `$XDG_CONFIG_HOME/git/config`.
-/// - `GIT_CONFIG_COUNT=0` disables any inherited `GIT_CONFIG_PARAMETERS`.
-/// - `HOME=/dev/null` defends against helpers that look up dotfiles under `$HOME`
-///   regardless of the `GIT_CONFIG_*` overrides (credential helpers, hook
-///   scripts, third-party tools invoked via `core.editor`/`pre-receive`/etc).
-pub(crate) const CLEAN_GIT_CONFIG_ENV: [(&str, &str); 4] = [
-    ("GIT_CONFIG_NOSYSTEM", "1"),
-    ("GIT_CONFIG_GLOBAL", "/dev/null"),
-    ("GIT_CONFIG_COUNT", "0"),
-    ("HOME", "/dev/null"),
-];
+/// Re-exported from [`writ_core::git_env`], which is the single definition for
+/// the whole workspace and documents what each variable denies. Kept as a
+/// `clean_git` name because several call sites import it from here.
+pub(crate) use writ_core::git_env::CLEAN_GIT_CONFIG_ENV;
 // Git discovers repository-local config by walking up from cwd. Running from
 // root prevents a broker-local `.git/config` from rewriting a pinned HTTPS URL.
 pub(crate) const CLEAN_GIT_CURRENT_DIR: &str = "/";
@@ -126,6 +118,12 @@ impl From<SupervisorError> for CleanGitError {
             SupervisorError::InvalidProcessId(pid) => CleanGitError::InvalidProcessId(pid),
             SupervisorError::KillProcessGroup { pgid, source } => {
                 CleanGitError::KillProcessGroup { pgid, source }
+            }
+            // The async supervisor never writes stdin nor treats a stdout read
+            // failure as fatal, so these cannot arise on this path; map them to
+            // the nearest existing variant rather than widening the public enum.
+            SupervisorError::StdinWrite { source, .. } | SupervisorError::CaptureRead(source) => {
+                CleanGitError::Wait(source)
             }
         }
     }
@@ -259,6 +257,13 @@ async fn run_clean_git_inner(
     let program = resolve_program_for_clean_env(invocation.program()).await?;
     let mut command = Command::new(program);
     command.env_clear();
+    // `env_clear` already removes `GIT_CONFIG`, but state it through the shared
+    // helper so the recipe stays whole if the clear is ever relaxed. (The
+    // `CleanGitEnv` vec carries the *settable* half; a removal cannot be a
+    // name/value pair, which is why both are applied.)
+    for name in writ_core::git_env::GIT_CONFIG_REMOVE_ENV {
+        command.env_remove(name);
+    }
     command.args(invocation.args());
     command.stdin(Stdio::null());
     command.current_dir(CLEAN_GIT_CURRENT_DIR);
@@ -288,6 +293,7 @@ async fn run_clean_git_inner(
             status,
             stdout,
             stderr,
+            born_dead_signature: _,
         } => {
             if status.success() {
                 Ok(stdout)
@@ -381,6 +387,9 @@ mod tests {
                 ("GIT_CONFIG_NOSYSTEM", "1"),
                 ("GIT_CONFIG_GLOBAL", "/dev/null"),
                 ("GIT_CONFIG_COUNT", "0"),
+                // Not covered by `GIT_CONFIG_COUNT=0`: git parses this on an
+                // independent path, so `-c`-style injection needs its own denial.
+                ("GIT_CONFIG_PARAMETERS", ""),
                 ("HOME", "/dev/null"),
             ]
         );
@@ -417,7 +426,7 @@ mod tests {
     }
 
     /// Runtime probe: spawn a subprocess via the clean-git harness and
-    /// confirm only the four hardened env entries (plus a small allowlist
+    /// confirm only the hardened env entries (plus a small allowlist
     /// of shell-startup names) reach the child.
     ///
     /// We wrap `env` in a `sh` script rather than invoking `env` directly
@@ -432,7 +441,7 @@ mod tests {
     /// `env` basename in `argv[0]` so coreutils dispatches correctly.
     /// The cost is that `sh` adds a few startup variables (PWD, SHLVL,
     /// `_`, OLDPWD); we allowlist those and assert that anything else
-    /// observed must be one of the four hardened entries with the
+    /// observed must be one of the hardened entries with the
     /// expected value.
     #[tokio::test]
     async fn run_clean_git_subprocess_sees_only_hardened_env_vars() {
@@ -477,6 +486,7 @@ mod tests {
             ("GIT_CONFIG_NOSYSTEM", "1"),
             ("GIT_CONFIG_GLOBAL", "/dev/null"),
             ("GIT_CONFIG_COUNT", "0"),
+            ("GIT_CONFIG_PARAMETERS", ""),
             ("HOME", "/dev/null"),
         ]
         .into_iter()

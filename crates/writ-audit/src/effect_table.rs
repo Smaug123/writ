@@ -527,8 +527,11 @@ impl AuditLog {
     }
 
     /// Write a request row and its outcome row in a *single* transaction — one
-    /// commit, one `fsync` — for authority-free read paths (the Nix-cache serve)
-    /// where the request row need not be durable before the action.
+    /// commit, one `fsync` — for paths where the request row need not be durable
+    /// before the action, because the action confers no authority. Two callers:
+    /// the authority-free Nix-cache serve (below), and a locally-generated proxy
+    /// response (an auth denial, an unsupported route), which performs no action
+    /// at all and so has nothing a pre-durable request row could describe.
     ///
     /// This is the throughput lever for those high-volume rows. The two-phase
     /// [`begin_effect`](AuditLog::begin_effect) + [`complete`](RecordedRequest::complete)
