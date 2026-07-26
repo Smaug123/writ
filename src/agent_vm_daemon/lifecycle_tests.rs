@@ -1590,6 +1590,17 @@ async fn workspace_bootstrap_wait_bounds_a_hung_inspect_exec() {
     );
 }
 
+/// The bootstrap budget for the two tests below, whose subject is what the wait
+/// does with the guest's *output* — reject it as oversized, or preserve its
+/// tail. Neither is about timing, and each guest exec is a shell script that
+/// returns at once, so the budget only has to be out of the way. It was 20s,
+/// which an oversubscribed harness reached (`WorkspaceBootstrapExecTimedOut` for
+/// the trivial "release guest bootstrap" step) — see issue #355.
+const UNHURRIED_BOOTSTRAP_BUDGET: Duration = Duration::from_secs(180);
+
+/// Converts a hang into a failure, so it need only sit clear of the budget above.
+const WORKSPACE_BOOTSTRAP_ANTI_HANG_GUARD: Duration = Duration::from_secs(240);
+
 #[tokio::test]
 async fn workspace_bootstrap_wait_rejects_oversized_inspect_output() {
     let dir = tempfile::tempdir().unwrap();
@@ -1602,10 +1613,10 @@ async fn workspace_bootstrap_wait_rejects_oversized_inspect_output() {
     let daemon = AgentVmDaemon::new(config);
 
     let outcome = tokio::time::timeout(
-        Duration::from_secs(30),
+        WORKSPACE_BOOTSTRAP_ANTI_HANG_GUARD,
         daemon.release_and_wait_for_workspace_bootstrap_with_timeout(
             "writ-agent-vm-test",
-            Duration::from_secs(20),
+            UNHURRIED_BOOTSTRAP_BUDGET,
         ),
     )
     .await;
@@ -1635,10 +1646,10 @@ async fn workspace_bootstrap_wait_preserves_tail_of_large_failure() {
     let daemon = AgentVmDaemon::new(config);
 
     let outcome = tokio::time::timeout(
-        Duration::from_secs(30),
+        WORKSPACE_BOOTSTRAP_ANTI_HANG_GUARD,
         daemon.release_and_wait_for_workspace_bootstrap_with_timeout(
             "writ-agent-vm-test",
-            Duration::from_secs(20),
+            UNHURRIED_BOOTSTRAP_BUDGET,
         ),
     )
     .await;

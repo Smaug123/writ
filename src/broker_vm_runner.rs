@@ -446,14 +446,16 @@ exit 0
     /// A fake `container` whose `inspect` blocks far longer than any test's ready
     /// timeout (modelling a wedged container service) and never publishes a ready
     /// file — used to prove the ready wait is bounded by `ready_timeout` even when
-    /// the liveness probe itself stalls.
+    /// the liveness probe itself stalls. It `exec`s the sleep so that killing the
+    /// child on drop reaps it, rather than orphaning a long-lived `sleep` for
+    /// every run of the test.
     fn write_fake_container_inspect_hangs(dir: &Path, args_log: &Path, sleep_secs: u32) -> PathBuf {
         use std::os::unix::fs::PermissionsExt as _;
         let tool = dir.join("fake-container-inspect-hangs");
         let script = format!(
             r#"#!/bin/sh
 printf '%s\n' "$*" >> "{log}"
-if [ "$1" = inspect ]; then sleep {sleep_secs}; fi
+if [ "$1" = inspect ]; then exec sleep {sleep_secs}; fi
 exit 0
 "#,
             log = args_log.display(),
@@ -489,13 +491,20 @@ exit 0
         tool
     }
 
-    /// A fake `container` whose `inspect` is *slow* (sleeps `sleep_secs`) but then
-    /// answers with a healthy running-VM JSON carrying `broker_ip`. Models a
-    /// container service under load: the ready-file poll must still notice a
-    /// broker that becomes ready while an inspect call is in flight.
+    /// A fake `container` whose *first* `inspect` wedges — it touches
+    /// `started_marker` to announce that it is in flight, then blocks for
+    /// `sleep_secs` — while every later `inspect` answers immediately with a
+    /// healthy running-VM JSON carrying `broker_ip`. Models a container service
+    /// under load: the ready-file poll must still notice a broker that becomes
+    /// ready while an inspect call is in flight.
+    ///
+    /// The marker is what lets the caller publish readiness *because* the inspect
+    /// has begun rather than by racing two sleeps, and `exec` means the killed-on-
+    /// drop shell takes the `sleep` down with it instead of orphaning it.
     fn write_fake_container_slow_inspect(
         dir: &Path,
         args_log: &Path,
+        started_marker: &Path,
         broker_ip: &str,
         sleep_secs: u32,
     ) -> PathBuf {
@@ -505,7 +514,10 @@ exit 0
             r#"#!/bin/sh
 printf '%s\n' "$*" >> "{log}"
 if [ "$1" = inspect ]; then
-  sleep {sleep_secs}
+  if [ ! -e "{marker}" ]; then
+    : > "{marker}"
+    exec sleep {sleep_secs}
+  fi
   cat <<'JSON'
 [ {{ "status": {{ "networks": [
   {{ "network": "{net}", "ipv4Address": "{ip}/24", "ipv4Gateway": "192.168.252.1" }}
@@ -515,6 +527,7 @@ fi
 exit 0
 "#,
             log = args_log.display(),
+            marker = started_marker.display(),
             net = INTERNAL_NET,
             ip = broker_ip,
             sleep_secs = sleep_secs,
@@ -522,6 +535,54 @@ exit 0
         std::fs::write(&tool, script).unwrap();
         std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
         tool
+    }
+
+    /// A wall-clock bound for a launch that is supposed to return *promptly*
+    /// rather than wait out its deadline, calibrated against this machine's
+    /// current process-spawn cost.
+    ///
+    /// These launches are bounded by real `fork`/`exec` of the fake `container`
+    /// script, not by any timer: the prompt path costs roughly `spawns`
+    /// invocations. A fixed threshold therefore measures the host's scheduler as
+    /// much as the code, and on an oversubscribed machine (`--test-threads` well
+    /// above the core count, or a Nix build running alongside) it fails
+    /// near-deterministically — 6 runs out of 6, see issue #355. So measure
+    /// instead of guessing: time a few invocations of the very script the test is
+    /// about to drive, and scale the bound by what a spawn actually costs right
+    /// now.
+    ///
+    /// `slow_outcome` is how long the *failing* behaviour would take — the thing
+    /// the assertion has to stay clear of. The budget is capped at half of it, so
+    /// a wildly loaded machine cannot inflate the bound until the assertion no
+    /// longer distinguishes the two outcomes: better a loud failure on a machine
+    /// too busy to measure anything than a green tick that proves nothing.
+    fn prompt_return_budget(tool: &Path, spawns: u32, slow_outcome: Duration) -> Duration {
+        /// Enough samples to smooth out one unlucky spawn, few enough to stay
+        /// cheap when each spawn is itself slow.
+        const CALIBRATION_SPAWNS: u32 = 3;
+        /// Spawn latency under contention is noisy and the tests do a little
+        /// work besides spawning; the bound only has to sit far below
+        /// `slow_outcome`, so it can afford to be loose.
+        const SLACK: u32 = 4;
+        /// On an idle machine a spawn is a millisecond or two, which would give
+        /// an absurdly tight bound; never go below this.
+        const FLOOR: Duration = Duration::from_secs(5);
+
+        let start = std::time::Instant::now();
+        for _ in 0..CALIBRATION_SPAWNS {
+            // Every fake tool ignores an unrecognised subcommand (it only special-cases
+            // `inspect`/`logs`), so this costs exactly one spawn and nothing else.
+            std::process::Command::new(tool)
+                .arg("calibrate")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .expect("the fake container tool must be runnable");
+        }
+        let per_spawn = start.elapsed() / CALIBRATION_SPAWNS;
+        (per_spawn * spawns * SLACK)
+            .max(FLOOR)
+            .min(slow_outcome / 2)
     }
 
     fn plan_with_tool(tool: &Path, dir: &Path) -> BrokerVmPlan {
@@ -623,13 +684,20 @@ exit 0
         // The ready file is never created (the broker died first).
         let ready = dir.path().join("ready");
 
+        // A deliberately generous ready timeout: fast-fail must beat it by far.
+        // Waiting it out is also a *different* error variant, so the match below
+        // is the load-immune half of this test and the clock bound is the half
+        // that catches a detected-but-sluggish exit. Five spawns on the fast
+        // path: two networks, the run, one inspect, one `logs`.
+        let ready_timeout = Duration::from_secs(60);
+        let budget = prompt_return_budget(&tool, 5, ready_timeout);
+
         let start = std::time::Instant::now();
         let err = launch_broker_vm(
             &plan,
             &ready,
             BrokerPort::new(18080).unwrap(),
-            // A deliberately generous timeout: fast-fail must beat it by far.
-            Duration::from_secs(20),
+            ready_timeout,
             Duration::from_millis(10),
         )
         .await
@@ -647,8 +715,9 @@ exit 0
             other => panic!("expected ExitedBeforeReady, got {other}"),
         }
         assert!(
-            waited < Duration::from_secs(5),
-            "should fail fast on broker exit, not wait out the timeout; waited {waited:?}"
+            waited < budget,
+            "should fail fast on broker exit, not wait out the {ready_timeout:?} timeout; \
+             waited {waited:?} against a calibrated budget of {budget:?}"
         );
     }
 
@@ -663,10 +732,15 @@ exit 0
         // inspect, whereas an impl that let a synchronous inspect block the
         // reactor could only return once inspect finished, i.e. ~120s. The
         // assertion bound sits between them (see below).
-        let tool = write_fake_container_inspect_hangs(dir.path(), &args_log, 120);
+        const INSPECT_HANG_SECS: u32 = 120;
+        const INSPECT_HANG: Duration = Duration::from_secs(INSPECT_HANG_SECS as u64);
+        let tool = write_fake_container_inspect_hangs(dir.path(), &args_log, INSPECT_HANG_SECS);
         let plan = plan_with_tool(&tool, dir.path());
         let ready = dir.path().join("ready"); // never created
 
+        // Four spawns before the timeout fires: two networks, the run, and the
+        // one inspect that then hangs.
+        let budget = prompt_return_budget(&tool, 4, INSPECT_HANG);
         let start = std::time::Instant::now();
         let err = launch_broker_vm(
             &plan,
@@ -685,13 +759,15 @@ exit 0
         // this is a current-thread runtime whose 300ms timer can fire seconds late
         // under heavy machine load (a full Nix build in parallel has been seen to
         // push it past 5s), and a real-time assertion tuned close to ready_timeout
-        // flakes. 30s is well above any plausible scheduling slop yet far below
-        // the 120s inspect hang, so it still fails loudly if the timeout ever stops
-        // preempting a wedged inspect. `kill_on_drop` reaps the hung child the
-        // moment the timeout fires, so the passing case never actually waits 120s.
+        // flakes. The calibrated budget stays well above any plausible scheduling
+        // slop yet far below the 120s inspect hang, so it still fails loudly if the
+        // timeout ever stops preempting a wedged inspect. `kill_on_drop` reaps the
+        // hung child the moment the timeout fires, so the passing case never
+        // actually waits 120s.
         assert!(
-            waited < Duration::from_secs(30),
-            "the ready wait must be bounded by ready_timeout despite a hung inspect; waited {waited:?}"
+            waited < budget,
+            "the ready wait must be bounded by ready_timeout despite a hung inspect; \
+             waited {waited:?} against a calibrated budget of {budget:?}"
         );
     }
 
@@ -804,13 +880,18 @@ exit 0
         let plan = plan_with_tool(&tool, dir.path());
         let ready = dir.path().join("ready"); // never created
 
+        // Generous ready timeout: the log-capture bound must beat it by far.
+        let ready_timeout = Duration::from_secs(120);
+        // Five spawns: two networks, the run, the inspect that observes the exit,
+        // and the `logs` call that then wedges. The wedge itself is bounded by
+        // BROKER_LOG_CAPTURE_TIMEOUT, which is added on below.
+        let budget = BROKER_LOG_CAPTURE_TIMEOUT + prompt_return_budget(&tool, 5, ready_timeout);
         let start = std::time::Instant::now();
         let err = launch_broker_vm(
             &plan,
             &ready,
             BrokerPort::new(18080).unwrap(),
-            // Generous ready timeout: the log-capture bound must beat it by far.
-            Duration::from_secs(120),
+            ready_timeout,
             Duration::from_millis(10),
         )
         .await
@@ -828,9 +909,9 @@ exit 0
             other => panic!("expected ExitedBeforeReady, got {other}"),
         }
         assert!(
-            waited < BROKER_LOG_CAPTURE_TIMEOUT + Duration::from_secs(10),
-            "the crash path must be bounded by the log-capture timeout, not the ready timeout; \
-             waited {waited:?}"
+            waited < budget,
+            "the crash path must be bounded by the log-capture timeout, not the {ready_timeout:?} \
+             ready timeout; waited {waited:?} against a calibrated budget of {budget:?}"
         );
     }
 
@@ -892,16 +973,30 @@ exit 0
         // rather than wait out `ready_timeout` behind the slow inspect.
         let dir = tempfile::tempdir().unwrap();
         let args_log = dir.path().join("args.log");
-        // inspect sleeps ~1s then reports a running VM; the ready timeout is
-        // shorter, so an inspect-then-file loop would fire ReadyTimeout behind it.
-        let tool = write_fake_container_slow_inspect(dir.path(), &args_log, "192.168.252.3", 1);
+        // The first inspect wedges for far longer than the ready timeout below, so
+        // an inspect-then-file loop would fire ReadyTimeout behind it.
+        const INSPECT_WEDGE_SECS: u32 = 300;
+        let inspect_started = dir.path().join("inspect-started");
+        let tool = write_fake_container_slow_inspect(
+            dir.path(),
+            &args_log,
+            &inspect_started,
+            "192.168.252.3",
+            INSPECT_WEDGE_SECS,
+        );
         let plan = plan_with_tool(&tool, dir.path());
 
-        // The broker becomes ready shortly after launch begins — mid-inspect.
+        // The broker becomes ready *because* an inspect is in flight, rather than
+        // after a fixed sleep that a loaded machine could reorder: the writer waits
+        // on the marker the wedged inspect drops. That makes the ordering this test
+        // is about a fact of the fixture, not a race — and it means the timings
+        // below need only be generous, never tight.
         let ready = dir.path().join("ready");
         let ready_writer = ready.clone();
         tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            while !inspect_started.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
             std::fs::write(
                 &ready_writer,
                 BrokerReadyDoc::current(18080).to_ready_file(),
@@ -910,13 +1005,15 @@ exit 0
         });
 
         let ip = tokio::time::timeout(
-            Duration::from_secs(10),
+            Duration::from_secs(120),
             launch_broker_vm(
                 &plan,
                 &ready,
                 BrokerPort::new(18080).unwrap(),
-                // Shorter than the inspect sleep: the ready poll must win on its own.
-                Duration::from_millis(600),
+                // Far shorter than the inspect wedge: the ready poll must win on
+                // its own cadence. Generous in absolute terms so that only the
+                // regression, and not a busy scheduler, can exhaust it.
+                Duration::from_secs(30),
                 Duration::from_millis(20),
             ),
         )

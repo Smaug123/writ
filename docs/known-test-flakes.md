@@ -206,3 +206,81 @@ and the unified log requires privileges a plain run does not have. The remedy
 above does not depend on the answer: it recognises, from evidence available
 inside the process, that the child ran nothing — and declines to guess at the
 cause.
+
+## The missing of deadlines upon an oversubscribed harness
+
+### The thing as it appears
+
+Set the harness to a great many more threads than the machine has cores — forty,
+say, upon eighteen — and a second and quite different sort of failure appears,
+having no signal nine about it and no broken pipe, but complaints of this kind:
+
+```
+should fail fast on broker exit, not wait out the timeout; waited 7.59s
+expected Failed, got TimedOut(10s)
+```
+
+It is well to say at once that this is not the apparition described above, though
+the two were for a while confounded under one heading. There the child was born
+dead and ran nothing; here nothing is killed at all. Every child is born, does
+its work, and exits as it ought; it is merely *late*, and the test, having
+pledged itself to a stopwatch, calls lateness a fault. The two therefore want
+quite different remedies: the one a proof that the work never happened, the other
+the abandonment of the stopwatch.
+
+At forty threads the first of these failed six runs out of six, which is
+no flake at all but a near certainty; the load stood at sixteen to
+four-and-twenty upon eighteen cores, with some nine hundred and eighty processes
+alive at once.
+
+### What is really the matter
+
+A test which spawns a real subprocess and then asserts that the whole business
+finished inside five seconds is not, under such conditions, measuring the code.
+It is measuring the scheduler. The quantity it bounds is dominated by
+`fork`/`exec` latency, and that latency is a property of how busy the host is,
+which the test does not control and ought not to depend upon.
+
+### What has been done about it (issue #355)
+
+Three remedies, applied according to what each test actually needed to prove:
+
+1. **Where nothing but time was being consumed**, the clock was taken away
+   altogether. The egress gate's tests now run under
+   `#[tokio::test(start_paused = true)]`, so the only thing that advances time is
+   `tokio::time::sleep`; the elapsed figure they assert upon is exact, and the
+   run costs no wall-clock at all. (This required `wait_for_egress_with` to keep
+   its deadline on `tokio::time::Instant` rather than `std::time::Instant`, the
+   two being identical outside the virtual clock.)
+2. **Where a deadline was mere backstop** — a two-line shell probe whose *timing*
+   was never the point — the deadline was made unhurried (two minutes), its only
+   remaining office being to stop a genuinely wedged probe hanging the suite for
+   ever.
+3. **Where a real subprocess is unavoidable and promptness is genuinely the
+   property** — the broker launch must fail fast when the VM has already exited
+   — the bound is no longer a guessed constant but a *calibrated* one. The test
+   first times a few invocations of the very fake `container` script it is about
+   to drive, and scales its bound by what a spawn costs on this machine at this
+   moment; the budget is then capped at half the wall-clock the failing
+   behaviour would take, lest a wildly loaded host inflate the bound until the
+   assertion distinguishes nothing.
+
+A fourth measure, worth more than any of them where it can be had, is to arrange
+the *fixture* so that the ordering under test is a fact rather than a race:
+`launch_notices_readiness_even_while_inspect_is_slow` no longer publishes its
+ready file after a fixed sleep and hopes to land mid-inspect, but waits upon a
+marker which the wedged inspect itself drops. The ordering is then guaranteed by
+construction, and every remaining timing may be made as generous as one pleases.
+
+### The rule for the future
+
+Do not raise `--test-threads` (or `RUST_TEST_THREADS`) above the core count. The
+default — one thread to a core — is correct, and upon a machine otherwise
+occupied the right adjustment is downward. Oversubscription does not find bugs
+here; it manufactures failures whose whole cause is the harness.
+
+And when writing a new test: if the thing to be proved is *causality* ("it
+returned because it noticed, not because it timed out"), prefer the virtual
+clock, or an error variant that only the fast path can produce, over any figure
+in seconds. A wall-clock assertion should be the last resort, and when it is
+unavoidable it should be calibrated rather than guessed.

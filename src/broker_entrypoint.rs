@@ -25,7 +25,15 @@
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+// `tokio::time::Instant`, not `std::time::Instant`: the egress gate's deadline
+// arithmetic is then measured on the same clock as the `tokio::time::sleep`
+// between attempts. Under a real runtime the two are identical; under
+// `#[tokio::test(start_paused = true)]` both follow the virtual clock, so the
+// gate's tests can assert about causality instead of racing wall-clock against
+// a loaded machine's scheduler.
+use tokio::time::Instant;
 
 use crate::audit::{AuditError, AuditLog};
 use crate::broker_protocol::BrokerReadyDoc;
@@ -575,7 +583,10 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    // Virtual clock: the probe is a pure closure, so nothing here needs real
+    // time to pass. Pausing makes the retry cadence deterministic (and instant)
+    // rather than a 5ms-at-a-time race with the scheduler.
+    #[tokio::test(start_paused = true)]
     async fn egress_loop_retries_a_failing_probe_until_it_succeeds() {
         use std::sync::atomic::{AtomicU32, Ordering};
         // Models the production race the gate exists to fix: the first probes fail
@@ -605,7 +616,10 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    // Virtual clock (`start_paused`): the only thing that consumes time here is
+    // `tokio::time::sleep`, so the elapsed figure below is exact rather than a
+    // wall-clock measurement that inflates with machine load.
+    #[tokio::test(start_paused = true)]
     async fn egress_loop_honors_deadline_with_a_permanently_slow_probe() {
         // The probe consumes exactly the per-attempt budget it is handed, then
         // fails — a deterministic stand-in for a black hole. The loop must cap each
@@ -629,9 +643,15 @@ mod tests {
             matches!(err, BrokerRunError::EgressUnavailable { .. }),
             "{err:?}"
         );
+        // On the virtual clock the wait is exactly the deadline: the single
+        // attempt is capped at the 300ms remaining rather than at the 10s
+        // per-request timeout, and the loop-top check then ends it. The upper
+        // bound would catch an uncapped attempt (10s) or a per-attempt-deadline
+        // reading of the budget (deadline × attempts); the lower bound catches a
+        // gate that gives up early.
         assert!(
-            waited < Duration::from_secs(2),
-            "the deadline must be a hard bound; waited {waited:?}",
+            waited >= Duration::from_millis(300) && waited < Duration::from_millis(400),
+            "the deadline must be a hard bound on the total wait; waited {waited:?}",
         );
     }
 
