@@ -110,23 +110,67 @@ impl GitDataTimeouts {
     }
 }
 
-/// Build the HTTP client the Git Data endpoints are driven through.
-/// Private: [`GitDataClient::new`] is the only constructor, so every
-/// client in the codebase carries these bounds by construction.
-fn git_data_http_client(timeouts: GitDataTimeouts) -> reqwest::Client {
-    debug_assert!(
-        !timeouts.connect.is_zero() && !timeouts.small_call.is_zero() && !timeouts.total.is_zero(),
-        "a zero timeout fails every request immediately",
-    );
-    debug_assert!(
-        timeouts.total >= timeouts.small_call,
-        "a total timeout below the small-call bound makes `small_call` meaningless",
-    );
-    reqwest::Client::builder()
-        .connect_timeout(timeouts.connect)
-        .timeout(timeouts.total)
-        .build()
-        .expect("reqwest client constructs with timeouts set")
+/// The bounded HTTP transport every Git Data client is driven through:
+/// a connection pool plus the parsed TLS root store, with
+/// [`GitDataTimeouts`] already applied.
+///
+/// Separate from [`GitDataClient`] because the two halves have different
+/// lifetimes and *very* different costs. The credentials (`api_base`,
+/// installation token) are per-approve — a token is minted fresh for each
+/// one — and cost nothing to carry. The transport is per-broker and
+/// expensive: `reqwest`'s `rustls-tls-native-roots` backend reads and
+/// parses the platform root store inside every `ClientBuilder::build()`,
+/// which measures at ~7 s for a process's first build on macOS and ~80 ms
+/// steady-state, and each build also starts an empty connection pool that
+/// forfeits every established TLS session. Cloning one, by contrast, is an
+/// `Arc` bump.
+///
+/// So the broker builds one at boot ([`crate::server::BrokerState`]) and
+/// every approve borrows it. Holding this type is what makes "the transport
+/// is shared" a fact of the call graph rather than a convention: the approve
+/// pipeline is handed a client and has no way to build a transport of its
+/// own.
+///
+/// Constructing it from [`GitDataTimeouts`] (rather than accepting a
+/// prebuilt `reqwest::Client`) keeps the older invariant intact too — there
+/// is no way to reach the Git Data endpoints over an unbounded transport.
+#[derive(Clone, Debug)]
+pub struct GitDataHttp {
+    http: reqwest::Client,
+    /// Carried alongside the client because it is applied per-request
+    /// rather than at build time; see [`GitDataTimeouts`].
+    small_call: Duration,
+}
+
+impl GitDataHttp {
+    /// Build the transport. Expensive (see the type docs) — call once per
+    /// broker, not once per request.
+    pub fn new(timeouts: GitDataTimeouts) -> Self {
+        debug_assert!(
+            !timeouts.connect.is_zero()
+                && !timeouts.small_call.is_zero()
+                && !timeouts.total.is_zero(),
+            "a zero timeout fails every request immediately",
+        );
+        debug_assert!(
+            timeouts.total >= timeouts.small_call,
+            "a total timeout below the small-call bound makes `small_call` meaningless",
+        );
+        let http = reqwest::Client::builder()
+            .connect_timeout(timeouts.connect)
+            .timeout(timeouts.total)
+            .build()
+            .expect("reqwest client constructs with timeouts set");
+        Self {
+            http,
+            small_call: timeouts.small_call,
+        }
+    }
+
+    /// The transport every production Git Data client runs over.
+    pub fn production() -> Self {
+        Self::new(GitDataTimeouts::production())
+    }
 }
 
 const ACCEPT_HEADER: &str = "application/vnd.github+json";
@@ -146,6 +190,10 @@ const USER_AGENT_HEADER: &str = "writ/0.1";
 /// way to surface the token after construction is through the request
 /// path, which writes it into the `Authorization: Bearer …` header and
 /// nowhere else.
+///
+/// The transport is *borrowed* from a shared [`GitDataHttp`], not built
+/// here: constructing one of these is meant to be cheap enough to do per
+/// approve, which is exactly as often as the token changes.
 pub struct GitDataClient {
     http: reqwest::Client,
     /// Per-request override applied to the fixed-size control calls

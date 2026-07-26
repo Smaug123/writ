@@ -50,7 +50,7 @@ use crate::git_push_trailers::TrailerSource;
 use crate::git_push_walker::{
     FastForwardPlanError, REV_LIST_STDOUT_BYTE_CAP, plan_fast_forward_via_rev_list,
 };
-use crate::github_git_db::{GitDataClient, GitDataTimeouts};
+use crate::github_git_db::{GitDataClient, GitDataHttp};
 use crate::signing::WritSigningKey;
 use crate::vm_git::{GitBranchName, GitCloneRepo, GitObjectId};
 use crate::vm_git_bundle::GitSecretValue;
@@ -252,6 +252,7 @@ impl PreparedApprove {
 #[allow(clippy::too_many_arguments)]
 pub async fn prepare_approve(
     runtime: &PromoteRuntimeConfig,
+    git_data: &GitDataHttp,
     api_base: &str,
     token: &GitSecretValue,
     repo: &GitCloneRepo,
@@ -273,11 +274,17 @@ pub async fn prepare_approve(
     )
     .await?;
 
+    // Bounded on every phase: an approve runs with the attempt row in
+    // flight, so a GitHub endpoint that black-holes or withholds must
+    // fail the attempt rather than park it forever. The bounds ride on
+    // the broker-wide `git_data` transport; only the freshly-minted
+    // credentials are per-approve.
+    let client = GitDataClient::new(git_data, api_base, token.as_str());
+
     let result = prepare_approve_with_staging_repo(
         &staging,
         runtime,
-        api_base,
-        token,
+        client,
         repo.as_repo_ref(),
         branch,
         expected_remote_head,
@@ -326,12 +333,19 @@ pub async fn prepare_approve(
 /// drive it against a pre-populated staging repo without paying the
 /// full prepare cost (real `git fetch` against a real origin is out
 /// of scope for fast unit tests).
+///
+/// Takes the [`GitDataClient`] rather than the `api_base`/`token` pair it
+/// would be built from. That is deliberate: building one requires a
+/// [`GitDataHttp`], whose construction parses the platform TLS root store
+/// (~80 ms steady-state, ~7 s cold) and starts a fresh connection pool, and
+/// this function runs once per approve. Receiving the client means the
+/// per-approve path *cannot* pay that cost — the transport is built once, at
+/// broker boot, and the only thing minted per approve is the token.
 #[allow(clippy::too_many_arguments)]
 pub async fn prepare_approve_with_staging_repo(
     staging: &StagingRepo,
     runtime: &PromoteRuntimeConfig,
-    api_base: &str,
-    token: &GitSecretValue,
+    client: GitDataClient,
     repo: &RepoRef,
     branch: &GitBranchName,
     expected_remote_head: &GitObjectId,
@@ -374,15 +388,6 @@ pub async fn prepare_approve_with_staging_repo(
         runtime.cat_file_timeout(),
     )
     .await?;
-
-    // Bounded on every phase: an approve runs with the attempt row in
-    // flight, so a GitHub endpoint that black-holes or withholds must
-    // fail the attempt rather than park it forever.
-    let client = GitDataClient::new(
-        GitDataTimeouts::production(),
-        api_base.to_string(),
-        token.as_str().to_string(),
-    );
 
     // The cat-file traversal below is bounded from *inside* the object
     // source: each `read_object_raw` runs under the per-object

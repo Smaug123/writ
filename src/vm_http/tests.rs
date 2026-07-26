@@ -131,6 +131,7 @@ pub(super) fn make_broker_state_with_extra_secrets(
         signing_key: None,
         run_agent_spawn: None,
         promote_runtime: None,
+        git_data_http: crate::github_git_db::GitDataHttp::production(),
         mirror_pins: crate::vm_git_mirror_cache::MirrorPins::new(),
         chatgpt_oauth_authority: Default::default(),
     })

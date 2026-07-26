@@ -191,6 +191,7 @@ async fn run_agent_round_trip_signs_and_writes_note() {
             args: Vec::new(),
         }),
         promote_runtime: base.promote_runtime,
+        git_data_http: crate::github_git_db::GitDataHttp::production(),
         mirror_pins: base.mirror_pins,
         chatgpt_oauth_authority: base.chatgpt_oauth_authority,
     });
@@ -306,6 +307,7 @@ async fn run_agent_signs_non_zero_exit() {
             args: Vec::new(),
         }),
         promote_runtime: base.promote_runtime,
+        git_data_http: crate::github_git_db::GitDataHttp::production(),
         mirror_pins: base.mirror_pins,
         chatgpt_oauth_authority: base.chatgpt_oauth_authority,
     });
@@ -382,6 +384,7 @@ async fn run_agent_captures_stderr_in_envelope() {
             args: vec!["-c".into(), "printf out; printf err 1>&2; exit 0".into()],
         }),
         promote_runtime: base.promote_runtime,
+        git_data_http: crate::github_git_db::GitDataHttp::production(),
         mirror_pins: base.mirror_pins,
         chatgpt_oauth_authority: base.chatgpt_oauth_authority,
     });
@@ -478,6 +481,7 @@ async fn run_agent_caps_stream_capture_records_truncation() {
             ],
         }),
         promote_runtime: base.promote_runtime,
+        git_data_http: crate::github_git_db::GitDataHttp::production(),
         mirror_pins: base.mirror_pins,
         chatgpt_oauth_authority: base.chatgpt_oauth_authority,
     });
@@ -556,6 +560,7 @@ async fn run_agent_stamps_caller_supplied_session_id_into_signed_metadata() {
             args: Vec::new(),
         }),
         promote_runtime: base.promote_runtime,
+        git_data_http: crate::github_git_db::GitDataHttp::production(),
         mirror_pins: base.mirror_pins,
         chatgpt_oauth_authority: base.chatgpt_oauth_authority,
     });
@@ -629,6 +634,7 @@ async fn run_agent_rejects_unknown_session_id() {
             args: Vec::new(),
         }),
         promote_runtime: base.promote_runtime,
+        git_data_http: crate::github_git_db::GitDataHttp::production(),
         mirror_pins: base.mirror_pins,
         chatgpt_oauth_authority: base.chatgpt_oauth_authority,
     });
@@ -685,6 +691,7 @@ async fn run_agent_rejects_closed_session_id() {
             args: Vec::new(),
         }),
         promote_runtime: base.promote_runtime,
+        git_data_http: crate::github_git_db::GitDataHttp::production(),
         mirror_pins: base.mirror_pins,
         chatgpt_oauth_authority: base.chatgpt_oauth_authority,
     });

@@ -16,18 +16,20 @@ impl GitDataClient {
     /// endpoint are concatenated on. Tests pass a `wiremock` server URI
     /// in to swap the destination.
     ///
-    /// Taking [`GitDataTimeouts`] rather than a prebuilt
-    /// `reqwest::Client` makes "every Git Data client is bounded" a
-    /// fact of the constructor instead of a convention: there is no
-    /// way to build one over an unbounded transport.
-    pub fn new(
-        timeouts: GitDataTimeouts,
-        api_base: impl Into<String>,
-        token: impl Into<String>,
-    ) -> Self {
+    /// Taking a [`GitDataHttp`] rather than a bare `reqwest::Client`
+    /// makes "every Git Data client is bounded" a fact of the
+    /// constructor instead of a convention: `GitDataHttp` is itself
+    /// only constructible from [`GitDataTimeouts`], so there is no way
+    /// to build a client over an unbounded transport.
+    ///
+    /// Cheap by design — it clones an `Arc`-backed handle and copies two
+    /// strings. The expensive half is [`GitDataHttp::new`], which the
+    /// broker calls once at boot; see that type's docs for why the split
+    /// exists.
+    pub fn new(http: &GitDataHttp, api_base: impl Into<String>, token: impl Into<String>) -> Self {
         Self {
-            http: git_data_http_client(timeouts),
-            small_call: timeouts.small_call,
+            http: http.http.clone(),
+            small_call: http.small_call,
             api_base: api_base.into(),
             token: token.into(),
         }

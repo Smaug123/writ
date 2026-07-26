@@ -33,6 +33,7 @@ use crate::git_push_approve::{RunApproveError, prepare_approve};
 use crate::git_push_promote::{CommitError, PromoteRuntimeConfig};
 use crate::git_push_staging::{GitPushStagingStore, StagedEntry, StagingError};
 use crate::github::GitHubMinter;
+use crate::github_git_db::GitDataHttp;
 use crate::notes_repo::NotesRepo;
 use crate::openai_chatgpt_auth::ChatgptOauthAuthority;
 use crate::policy::{self, Decision, PolicyConfig};
@@ -101,6 +102,17 @@ pub struct BrokerState<S: SecretStore> {
     pub signing_key: Option<WritSigningKey>,
     pub run_agent_spawn: Option<RunAgentSpawnConfig>,
     pub promote_runtime: Option<Arc<PromoteRuntimeConfig>>,
+    /// The broker-wide transport every GitHub Git Data call runs over,
+    /// built once here and borrowed by each approve's short-lived
+    /// [`GitDataClient`](crate::github_git_db::GitDataClient).
+    ///
+    /// Unconditional (not `Option`) even though only the approve path uses
+    /// it: unlike `promote_runtime` it needs no configuration to build, so
+    /// a `None` arm would be an unreachable state that every caller would
+    /// still have to handle. Sharing is the point — a fresh transport per
+    /// approve re-parses the platform TLS root store and starts an empty
+    /// connection pool; see [`GitDataHttp`].
+    pub git_data_http: GitDataHttp,
     /// Broker-wide registry pinning `(repo, rev)` mirror entries that an
     /// in-flight flake-input provision is materialising, so the clone handler's
     /// opportunistic eviction never deletes a mirror out from under a running
